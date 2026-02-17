@@ -1,0 +1,160 @@
+#!/bin/bash
+# wv — Weave CLI: In-memory graph for AI coding agents
+# Fast, ephemeral task/context tracking via SQLite in tmpfs
+# See: docs/WEAVE_v1.md
+#
+# Modular architecture (v1.2):
+#   lib/wv-config.sh   — configuration, hot zone, colors
+#   lib/wv-db.sh       — database init, migrations, queries
+#   lib/wv-validate.sh — ID generation, validation, edge types
+#   lib/wv-cache.sh    — context cache management
+#   cmd/wv-cmd-core.sh — init, add, done, ready, list, show, status, update
+#   cmd/wv-cmd-graph.sh— block, link, resolve, related, edges, path, context
+#   cmd/wv-cmd-data.sh — sync, load, prune, learnings, refs, import
+#   cmd/wv-cmd-ops.sh  — health, audit-pitfalls, edge-types, help
+
+set -euo pipefail
+
+# ═══════════════════════════════════════════════════════════════════════════
+# XDG-Compliant Module Resolution (v1.3)
+# ═══════════════════════════════════════════════════════════════════════════
+# Resolution order:
+#   1. $SCRIPT_DIR/lib/ (dev mode — running from git checkout)
+#   2. ~/.local/lib/weave/ (installed mode — XDG standard)
+#
+# This allows seamless switching between development and production.
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+WV_LIB_DIR="${WV_LIB_DIR:-}"
+
+# Resolve library directory: dev (relative) or installed (XDG)
+if [ -z "$WV_LIB_DIR" ]; then
+    if [ -f "$SCRIPT_DIR/lib/wv-config.sh" ]; then
+        # Dev mode: running from source checkout
+        WV_LIB_DIR="$SCRIPT_DIR"
+    elif [ -f "${HOME}/.local/lib/weave/lib/wv-config.sh" ]; then
+        # Installed mode: XDG standard location
+        WV_LIB_DIR="${HOME}/.local/lib/weave"
+    else
+        echo "wv: cannot find library modules" >&2
+        echo "  Checked: $SCRIPT_DIR/lib/wv-config.sh" >&2
+        echo "  Checked: ${HOME}/.local/lib/weave/lib/wv-config.sh" >&2
+        exit 1
+    fi
+fi
+
+# Source library modules (order matters: config first, then db needs config vars)
+source "$WV_LIB_DIR/lib/wv-config.sh"
+source "$WV_LIB_DIR/lib/wv-db.sh"
+source "$WV_LIB_DIR/lib/wv-validate.sh"
+source "$WV_LIB_DIR/lib/wv-cache.sh"
+source "$WV_LIB_DIR/lib/wv-gh.sh"
+
+# Source command modules
+source "$WV_LIB_DIR/cmd/wv-cmd-core.sh"
+source "$WV_LIB_DIR/cmd/wv-cmd-graph.sh"
+source "$WV_LIB_DIR/cmd/wv-cmd-data.sh"
+source "$WV_LIB_DIR/cmd/wv-cmd-ops.sh"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main Dispatcher
+# ═══════════════════════════════════════════════════════════════════════════
+
+_resolve_first_id() {
+    # Usage: _resolve_first_id <cmd_func> [args...]
+    # Resolves the first non-flag argument from alias to wv-xxxx ID,
+    # then calls cmd_func with the resolved args.
+    local cmd_func="$1"
+    shift
+
+    local new_args=()
+    local resolved_one=false
+    for arg in "$@"; do
+        if [ "$resolved_one" = true ] || [[ "$arg" == -* ]]; then
+            new_args+=("$arg")
+        elif [[ "$arg" =~ ^wv-[a-f0-9]{4}$ ]]; then
+            new_args+=("$arg")
+            resolved_one=true
+        else
+            local rid
+            rid=$(resolve_id "$arg" 2>/dev/null)
+            if [ -n "$rid" ]; then
+                new_args+=("$rid")
+                resolved_one=true
+            else
+                new_args+=("$arg")
+                resolved_one=true
+            fi
+        fi
+    done
+    "$cmd_func" "${new_args[@]}"
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        # Core commands
+        init)   cmd_init "$@" ;;
+        add)    cmd_add "$@" ;;
+        done)       _resolve_first_id cmd_done "$@" ;;
+        batch-done) cmd_batch_done "$@" ;;
+        bulk-update) cmd_bulk_update "$@" ;;
+        delete)     _resolve_first_id cmd_delete "$@" ;;
+        work)   _resolve_first_id cmd_work "$@" ;;
+        ready)  cmd_ready "$@" ;;
+        list)   cmd_list "$@" ;;
+        show)   _resolve_first_id cmd_show "$@" ;;
+        status) cmd_status "$@" ;;
+        update) _resolve_first_id cmd_update "$@" ;;
+        quick)  cmd_quick "$@" ;;
+        ship)   _resolve_first_id cmd_ship "$@" ;;
+
+        # Graph commands
+        block)   _resolve_first_id cmd_block "$@" ;;
+        link)    cmd_link "$@" ;;  # link takes two IDs; resolve inside
+        resolve) _resolve_first_id cmd_resolve "$@" ;;
+        related) _resolve_first_id cmd_related "$@" ;;
+        edges)   _resolve_first_id cmd_edges "$@" ;;
+        path)    _resolve_first_id cmd_path "$@" ;;
+        tree)    cmd_tree "$@" ;;
+        context) _resolve_first_id cmd_context "$@" ;;
+        
+        # Data commands
+        batch)       cmd_batch "$@" ;;
+        plan)        cmd_plan "$@" ;;
+        sync)        cmd_sync "$@" ;;
+        load)        cmd_load "$@" ;;
+        prune)       cmd_prune "$@" ;;
+        clean-ghosts) cmd_clean_ghosts "$@" ;;
+        learnings)   cmd_learnings "$@" ;;
+        refs)        cmd_refs "$@" ;;
+        import)      cmd_import "$@" ;;
+        search)      cmd_search "$@" ;;
+        reindex)     cmd_reindex "$@" ;;
+        breadcrumbs) cmd_breadcrumbs "$@" ;;
+        
+        # Ops commands
+        doctor)          cmd_doctor "$@" ;;
+        selftest)        cmd_selftest "$@" ;;
+        mcp-status)      cmd_mcp_status "$@" ;;
+        health)          cmd_health "$@" ;;
+        preflight)       _resolve_first_id cmd_preflight "$@" ;;
+        digest)          cmd_digest "$@" ;;
+        overview)        cmd_overview "$@" ;;
+        session-summary) cmd_session_summary "$@" ;;
+        audit-pitfalls)  cmd_audit_pitfalls "$@" ;;
+        edge-types)      cmd_edge_types ;;
+        help|--help|-h)  cmd_help ;;
+        version|--version|-v) echo "wv $WV_VERSION" ;;
+        
+        *)
+            echo -e "${RED}Unknown command: $cmd${NC}" >&2
+            cmd_help
+            return 1
+            ;;
+    esac
+}
+
+main "$@"
