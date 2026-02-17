@@ -1,0 +1,536 @@
+"""Sync phases: Weave→GitHub, GitHub→Weave, and closed sync."""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+
+from weave_gh import log
+from weave_gh.body import compose_issue_body, extract_human_content, should_update_body
+from weave_gh.cli import _run, gh_cli, wv_cli
+from weave_gh.data import _resolve_db_path, get_edges_for_node
+from weave_gh.labels import (
+    get_labels_for_node,
+    parse_gh_labels_to_metadata,
+    sync_issue_labels,
+)
+from weave_gh.models import GitHubIssue, SyncStats, WeaveNode
+from weave_gh.rendering import build_close_comment, render_issue_body
+
+from weave_gh.body import parse_gh_body_description, parse_issue_template_fields
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _backfill_gh_issue(
+    node: WeaveNode,
+    gh_num: int,
+    *,
+    dry_run: bool = False,
+    all_nodes: list[WeaveNode] | None = None,
+) -> None:
+    """Update node metadata with gh_issue reference (atomic key-set + in-memory).
+
+    Includes dedup guard: if another node already claims this gh_issue number,
+    skip the backfill to prevent duplicate mappings.
+    """
+    if dry_run:
+        return
+
+    # Dedup guard: check if another node already has this gh_issue
+    if all_nodes is not None:
+        existing = [n for n in all_nodes if n.gh_issue == gh_num and n.id != node.id]
+        if existing:
+            log.warning(
+                "  ⚠️  Skipping backfill of gh_issue=%d to %s — already claimed by %s",
+                gh_num,
+                node.id,
+                existing[0].id,
+            )
+            return
+
+    # Atomic: json_set only touches the gh_issue key, no read-modify-write race
+    db = _resolve_db_path()
+    _run(
+        [
+            "sqlite3",
+            db,
+            f"UPDATE nodes SET metadata = json_set(metadata, '$.gh_issue', {int(gh_num)}) "
+            f"WHERE id = '{node.id}';",
+        ],
+        check=False,
+    )
+    # Also update in-memory so later nodes see correct cross-references
+    node.metadata["gh_issue"] = gh_num
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Weave → GitHub
+# ---------------------------------------------------------------------------
+
+
+def sync_weave_to_github(  # noqa: C901
+    nodes: list[WeaveNode],
+    issues: list[GitHubIssue],
+    repo: str,
+    repo_url: str,
+    nodes_by_id: dict[str, WeaveNode],
+    stats: SyncStats,
+    *,
+    dry_run: bool = False,
+) -> list[GitHubIssue]:
+    """Create/update/close GitHub issues from Weave nodes.
+
+    Returns updated issues list (including newly created).
+    """
+    issues_by_num: dict[int, GitHubIssue] = {i.number: i for i in issues}
+    issues_by_title: dict[str, GitHubIssue] = {i.title: i for i in issues}
+
+    # Detect duplicate gh_issue mappings (multiple nodes → same GH issue)
+    gh_to_nodes: dict[int, list[str]] = {}
+    for node in nodes:
+        if node.gh_issue:
+            gh_to_nodes.setdefault(node.gh_issue, []).append(node.id)
+    dupes = {gh: nids for gh, nids in gh_to_nodes.items() if len(nids) > 1}
+
+    # Build set of gh_issue numbers where ANY node is done (prevents phantom reopens)
+    done_gh_issues: set[int] = {
+        n.gh_issue for n in nodes if n.gh_issue is not None and n.status == "done"
+    }
+    if dupes:
+        log.warning("⚠️  Duplicate gh_issue mappings detected (last writer wins):")
+        for gh_num, nids in dupes.items():
+            log.warning("   #%d ← %s", gh_num, ", ".join(nids))
+        log.warning(
+            '   Fix with: sqlite3 $WV_DB "UPDATE nodes SET metadata'
+            " = json_set(metadata, '$.gh_issue', CORRECT_NUM)"
+            " WHERE id = 'NODE_ID'\"",
+        )
+        log.warning("")
+
+    # Track which GH issues have already been processed (prevents duplicate overwrite)
+    processed_gh: set[int] = set()
+
+    for node in nodes:
+        # Skip test nodes and no_sync nodes
+        if node.is_test or node.no_sync:
+            stats.skipped += 1
+            continue
+
+        # Find matching GH issue
+        gh_match: int | None = None
+
+        # Match by metadata.gh_issue first
+        if node.gh_issue and node.gh_issue in issues_by_num:
+            gh_match = node.gh_issue
+
+        # Fallback: search by Weave ID field in body (handles both format variants)
+        if gh_match is None:
+            marker_bold = f"**Weave ID:** `{node.id}`"
+            marker_plain = f"**Weave ID**: `{node.id}`"
+            for issue in issues:
+                if marker_bold in issue.body or marker_plain in issue.body:
+                    gh_match = issue.number
+                    break
+
+        if gh_match is None:
+            _handle_new_issue(
+                node,
+                nodes_by_id,
+                issues,
+                issues_by_num,
+                issues_by_title,
+                repo,
+                repo_url,
+                stats,
+                all_nodes=nodes,
+                dry_run=dry_run,
+            )
+        else:
+            # Skip duplicate gh_issue mappings — only process first node per GH issue
+            if gh_match in processed_gh and gh_match in dupes:
+                log.info(
+                    "  ⏭ Skipping %s — GH #%d already processed by another node",
+                    node.id,
+                    gh_match,
+                )
+                stats.skipped += 1
+                continue
+            processed_gh.add(gh_match)
+            _handle_existing_issue(
+                node,
+                gh_match,
+                issues_by_num,
+                nodes_by_id,
+                repo,
+                repo_url,
+                stats,
+                all_nodes=nodes,
+                done_gh_issues=done_gh_issues,
+                dry_run=dry_run,
+            )
+
+    return issues
+
+
+def _handle_new_issue(
+    node: WeaveNode,
+    nodes_by_id: dict[str, WeaveNode],
+    issues: list[GitHubIssue],
+    issues_by_num: dict[int, GitHubIssue],
+    issues_by_title: dict[str, GitHubIssue],
+    repo: str,
+    repo_url: str,
+    stats: SyncStats,
+    *,
+    all_nodes: list[WeaveNode] | None = None,
+    dry_run: bool = False,
+) -> None:
+    """Handle a Weave node that has no matching GH issue."""
+    if node.status not in ("todo", "active", "done"):
+        stats.skipped += 1
+        return
+
+    # Dedup guard: only backfill from title match if the GH issue has
+    # the weave-synced label (prevents false matches on coincidental titles)
+    if node.text in issues_by_title:
+        existing = issues_by_title[node.text]
+        if "weave-synced" in existing.labels:
+            log.info(
+                "  ⏭ Skipping %s — GH #%d already has same title (weave-synced)",
+                node.id,
+                existing.number,
+            )
+            _backfill_gh_issue(node, existing.number, dry_run=dry_run, all_nodes=all_nodes)
+            stats.already_synced += 1
+            return
+        log.info(
+            "  ℹ️  %s matches GH #%d by title but issue lacks weave-synced label — creating new",
+            node.id,
+            existing.number,
+        )
+
+    # Create new GH issue
+    edges = get_edges_for_node(node.id)
+    weave_body = render_issue_body(node, nodes_by_id, edges)
+    labels = get_labels_for_node(node)
+
+    if dry_run:
+        log.info("  [dry-run] Would create GH issue: %s — %s", node.id, node.text)
+        stats.created_gh += 1
+        return
+
+    log.info("  ➕ Creating GH issue: %s — %s", node.id, node.text)
+
+    label_args: list[str] = []
+    for lb in labels:
+        label_args.extend(["--label", lb])
+
+    try:
+        result = gh_cli(
+            "issue",
+            "create",
+            "--repo",
+            repo,
+            "--title",
+            node.text,
+            "--body",
+            weave_body,
+            *label_args,
+        )
+        # Extract issue number from URL
+        num_match = re.search(r"/(\d+)$", result)
+        if num_match:
+            new_num = int(num_match.group(1))
+            log.info("     ✓ Created: #%d", new_num)
+
+            # Add to tracking
+            new_issue = GitHubIssue(new_num, node.text, "OPEN", weave_body, labels)
+            issues.append(new_issue)
+            issues_by_num[new_num] = new_issue
+            issues_by_title[node.text] = new_issue
+
+            # Backfill metadata
+            _backfill_gh_issue(node, new_num, all_nodes=all_nodes)
+            stats.created_gh += 1
+
+            # If node already done, immediately close
+            if node.status == "done":
+                close_comment = build_close_comment(node, repo_url)
+                gh_cli(
+                    "issue",
+                    "close",
+                    str(new_num),
+                    "--repo",
+                    repo,
+                    "--comment",
+                    close_comment,
+                    check=False,
+                )
+                # Update in-memory state to prevent stale data in later phases
+                new_issue.state = "CLOSED"
+                log.info("     🔒 Immediately closed (node already done)")
+                stats.closed_gh += 1
+        else:
+            log.error("     ✗ Failed to parse issue number from: %s", result)
+    except subprocess.CalledProcessError as e:
+        log.error("     ✗ Failed to create issue: %s", e.stderr)
+
+
+def _handle_existing_issue(
+    node: WeaveNode,
+    gh_match: int,
+    issues_by_num: dict[int, GitHubIssue],
+    nodes_by_id: dict[str, WeaveNode],
+    repo: str,
+    repo_url: str,
+    stats: SyncStats,
+    *,
+    all_nodes: list[WeaveNode] | None = None,
+    done_gh_issues: set[int] | None = None,
+    dry_run: bool = False,
+) -> None:
+    """Handle a Weave node that already has a matching GH issue."""
+    issue = issues_by_num[gh_match]
+
+    about_to_close = node.status == "done" and issue.state == "OPEN"
+
+    # Always update body if content changed — even for already-closed issues.
+    # wv done closes GH issues directly but doesn't refresh the parent epic
+    # body, so checkboxes and Mermaid graphs go stale. By updating bodies
+    # unconditionally here, wv sync --gh catches up on any missed updates.
+    edges = get_edges_for_node(node.id)
+    new_weave_block = render_issue_body(node, nodes_by_id, edges)
+
+    if should_update_body(issue.body, new_weave_block):
+        human_content = extract_human_content(issue.body)
+        new_body = compose_issue_body(human_content, new_weave_block)
+
+        if dry_run:
+            log.info("  [dry-run] Would update body of #%d", gh_match)
+        else:
+            gh_cli(
+                "issue",
+                "edit",
+                str(gh_match),
+                "--repo",
+                repo,
+                "--body",
+                new_body,
+                check=False,
+            )
+            log.info("  📝 Updated body of #%d (%s)", gh_match, node.id)
+        stats.updated_gh += 1
+
+    # Sync labels
+    desired_labels = get_labels_for_node(node)
+    sync_issue_labels(
+        gh_match,
+        desired_labels,
+        issue.labels,
+        repo,
+        dry_run=dry_run,
+    )
+
+    # Status sync
+    if about_to_close:
+        close_comment = build_close_comment(node, repo_url)
+        if dry_run:
+            log.info("  [dry-run] Would close #%d", gh_match)
+        else:
+            gh_cli(
+                "issue",
+                "close",
+                str(gh_match),
+                "--repo",
+                repo,
+                "--comment",
+                close_comment,
+                check=False,
+            )
+            # Update in-memory state to prevent stale data in later phases
+            issue.state = "CLOSED"
+            log.info(
+                "  🔒 Closing GH #%d (node %s is done)",
+                gh_match,
+                node.id,
+            )
+        stats.closed_gh += 1
+
+    elif node.status != "done" and issue.state == "CLOSED":
+        # Guard: don't reopen if ANY node with this gh_issue is done
+        # (prevents phantom/duplicate todo nodes from reopening closed issues)
+        if done_gh_issues and gh_match in done_gh_issues:
+            log.info(
+                "  ⏭ Skipping reopen of #%d — another node with this gh_issue is done"
+                " (phantom node %s)",
+                gh_match,
+                node.id,
+            )
+            stats.skipped += 1
+        elif dry_run:
+            log.info("  [dry-run] Would reopen #%d", gh_match)
+            stats.reopened_gh += 1
+        else:
+            gh_cli(
+                "issue",
+                "reopen",
+                str(gh_match),
+                "--repo",
+                repo,
+                "--comment",
+                f"Reopening — Weave node `{node.id}` is still open.",
+                check=False,
+            )
+            # Update in-memory state so Phase 3 doesn't re-close
+            issue.state = "OPEN"
+            log.info(
+                "  🔓 Reopening GH #%d (node %s is still open)",
+                gh_match,
+                node.id,
+            )
+            stats.reopened_gh += 1
+
+    else:
+        stats.already_synced += 1
+
+    # Backfill gh_issue if matched by body search
+    if node.gh_issue is None:
+        _backfill_gh_issue(node, gh_match, dry_run=dry_run, all_nodes=all_nodes)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: GitHub → Weave
+# ---------------------------------------------------------------------------
+
+
+def sync_github_to_weave(
+    nodes: list[WeaveNode],
+    issues: list[GitHubIssue],
+    _repo: str,
+    stats: SyncStats,
+    *,
+    dry_run: bool = False,
+) -> list[WeaveNode]:
+    """Create Weave nodes from untracked GitHub issues.
+
+    Args:
+        _repo: Repository name (unused but kept for phase API consistency).
+
+    Returns updated nodes list.
+    """
+    tracked_gh_nums = {n.gh_issue for n in nodes if n.gh_issue is not None}
+    node_ids = {n.id for n in nodes}
+
+    for issue in issues:
+        # Skip test issues (labeled weave:test)
+        if "weave:test" in issue.labels:
+            stats.skipped += 1
+            continue
+
+        # Skip if already tracked by metadata.gh_issue
+        if issue.number in tracked_gh_nums:
+            continue
+
+        # Skip if issue body contains a known Weave ID marker
+        # Handle both format variants: **Weave ID:** `id` and **Weave ID**: `id`
+        if any(
+            f"**Weave ID:** `{nid}`" in issue.body
+            or f"**Weave ID**: `{nid}`" in issue.body
+            for nid in node_ids
+        ):
+            continue
+
+        # New GH issue not in Weave
+        if issue.state == "OPEN":
+            # Parse GH labels into metadata
+            meta = parse_gh_labels_to_metadata(issue.labels)
+            meta["gh_issue"] = issue.number
+            meta["source"] = "github"
+
+            # Parse issue template form fields (### Type, ### Priority, etc.)
+            form = parse_issue_template_fields(issue.body)
+            if "type" in form:
+                meta["type"] = form["type"]
+            if "priority" in form:
+                # Extract P-number: "P1 (high)" → 1
+                p_match = re.match(r"P(\d)", form["priority"])
+                if p_match:
+                    meta["priority"] = int(p_match.group(1))
+
+            # Parse description from body (template field or freeform)
+            desc = form.get("description") or parse_gh_body_description(issue.body)
+            if desc:
+                meta["description"] = desc
+
+            if dry_run:
+                log.info(
+                    "  [dry-run] Would create Weave node for GH #%d — %s",
+                    issue.number,
+                    issue.title,
+                )
+                stats.created_wv += 1
+                continue
+
+            log.info(
+                "  ➕ Creating Weave node for GH #%d — %s",
+                issue.number,
+                issue.title,
+            )
+            try:
+                result = wv_cli(
+                    "add",
+                    issue.title,
+                    f"--metadata={json.dumps(meta)}",
+                )
+                new_id = result.strip().split("\n")[-1].strip()
+                if new_id:
+                    log.info("     ✓ Created: %s", new_id)
+                    nodes.append(WeaveNode(new_id, issue.title, "todo", meta))
+                    stats.created_wv += 1
+            except subprocess.CalledProcessError as e:
+                log.error("     ✗ Failed: %s", e.stderr)
+        else:
+            # Closed GH issue with no Weave node — skip
+            stats.skipped += 1
+
+    return nodes
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Closed GH issues → mark Weave nodes done
+# ---------------------------------------------------------------------------
+
+
+def sync_closed_to_weave(
+    nodes: list[WeaveNode],
+    issues: list[GitHubIssue],
+    stats: SyncStats,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Close Weave nodes whose corresponding GH issues are closed."""
+    issues_by_num = {i.number: i for i in issues}
+
+    for node in nodes:
+        if node.gh_issue and node.status != "done":
+            issue = issues_by_num.get(node.gh_issue)
+            if issue and issue.state == "CLOSED":
+                if dry_run:
+                    log.info(
+                        "  [dry-run] Would close Weave %s (GH #%d is closed)",
+                        node.id,
+                        node.gh_issue,
+                    )
+                else:
+                    log.info(
+                        "  ✓ Closing Weave %s (GH #%d is closed)",
+                        node.id,
+                        node.gh_issue,
+                    )
+                    wv_cli("done", node.id, check=False)
+                stats.closed_wv += 1
