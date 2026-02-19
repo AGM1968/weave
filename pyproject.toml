@@ -1,0 +1,15 @@
+[project]
+name = "weave-workflow"
+version = "1.5.4"
+description = "Token-optimized memory system for agentic workflows"
+authors = [
+    {name = "AGM1968",email = "AGM1968@users.noreply.github.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
