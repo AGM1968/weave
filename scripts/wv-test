@@ -1,0 +1,40 @@
+#!/bin/bash
+# wv-test — Run wv commands in an isolated test database
+#
+# Usage: wv-test <command> [args...]
+#
+# Creates a temporary database that is automatically cleaned up on exit.
+# Use this for testing, documentation, and any exploratory work.
+#
+# Examples:
+#   wv-test add "Test node"
+#   wv-test list
+#   wv-test ready
+#
+# The test database is stored in /tmp/weave-test-$$/brain.db and removed on exit.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Create isolated test environment
+TEST_DIR="/tmp/weave-test-$$"
+mkdir -p "$TEST_DIR"
+
+# Cleanup on exit
+cleanup() {
+    rm -rf "$TEST_DIR"
+}
+trap cleanup EXIT
+
+# Run wv with isolated database
+export WV_DB="$TEST_DIR/brain.db"
+export WV_HOT_ZONE="$TEST_DIR"
+
+# Initialize if this is the first command
+if [ ! -f "$WV_DB" ]; then
+    "$SCRIPT_DIR/wv" init >/dev/null 2>&1
+fi
+
+# Run the actual command
+exec "$SCRIPT_DIR/wv" "$@"
