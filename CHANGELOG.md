@@ -1,0 +1,457 @@
+# Changelog
+
+<!-- markdownlint-disable MD024 -->
+
+## [1.7.1] - 2026-02-23
+
+### Fixed
+
+- **Quality scan performance**: Rewrote `enrich_all_git_stats()` to use a single
+  `git log --name-only` pass instead of 3 subprocess calls per file. On a 318-file repo, scan time
+  dropped from 38.3s to 2.0s (19x speedup). Falls back to per-file mode on batch failure.
+- **`wv --help` missing quality entry**: Added `quality <sub>` to the Commands section.
+- **`enrich-topology` indentation**: Was incorrectly nested under `plan` in help text.
+- **Quality help sprint labels**: Removed internal "Sprint 4" references from subcommand
+  descriptions.
+- **`promote --parent` undocumented**: Added `--parent=<id>` as required flag in quality help.
+
+### Added
+
+- **`wv quality scan --exclude=<glob>`**: Repeatable glob-based file exclusion for scans (e.g.,
+  `--exclude='venv_ee/*' --exclude='tests/*'`).
+
+## [1.7.0] - 2026-02-23
+
+### Added
+
+- **Code quality as derived cache**: New `weave_quality` Python module providing code complexity
+  metrics, git churn analysis, and hotspot detection. Zero external dependencies beyond Python
+  stdlib + git CLI. Includes:
+  - `models.py`: `FileMetrics`, `ProjectMetrics`, `ScanMeta` dataclasses
+  - `git_metrics.py`: Git churn, age, authors, co-change frequency via subprocess
+  - `python_parser.py`: AST-backed cyclomatic complexity, nesting depth, coupling (regex fallback)
+  - `bash_heuristic.py`: Regex-based metrics for shell scripts
+  - `hotspots.py`: Normalized `complexity x churn` hotspot scoring
+  - `db.py`: `quality.db` schema, lifecycle, and staleness detection (per-repo, on tmpfs)
+- **`wv quality scan [path]`**: Scans a repository for code quality metrics, populates `quality.db`
+  with incremental results (file mtime + git blob SHA tracking). Reports summary to stderr.
+- **`wv quality reset`**: Clears `quality.db` for a clean rescan.
+- **`wv quality hotspots [--top=N]`**: Ranked hotspot report from `quality.db`. Warns when scan is
+  stale (HEAD moved since last scan). Supports `--json` for programmatic consumption.
+- **`wv quality diff`**: Delta report comparing current scan vs previous scan. Shows
+  improved/degraded/new files by complexity delta. Two-scan retention model.
+- **`wv quality promote --top=N`**: Creates summary Weave nodes from top findings in `quality.db`,
+  linked via `references` edges to the active epic. Nodes include `metadata.code_ref` with
+  path/symbol/range. Idempotent (skips already-promoted files).
+- **`wv health` quality component**: Reads `quality.db` for latest scan score and hotspot count.
+  Missing or stale data shows "no scan data" rather than failing.
+- **`wv context` code quality enrichment**: When a work node has touched files (via commit history),
+  pulls hotspot scores for those files from `quality.db` into the Context Pack output. Includes
+  cyclomatic complexity, churn, and hotspot score per file.
+- **Context enrichment dual-source resolution**: `wv context` now resolves files from both
+  `git log --grep=<node-id>` (commit messages) AND `metadata.commits[]`/`metadata.commit` (hashes
+  stored during onboarding). Previously, onboarded repos got zero code files in context packs.
+
+### Fixed
+
+- **Hot zone path propagation**: `--hot-zone` flag now correctly passed to `_wv_quality_python` in
+  both `wv health` and `wv context` code paths. Previously, quality data was looked up in the wrong
+  directory on remote machines.
+- **Strict type compliance**: All `weave_quality` source and test files pass mypy strict mode,
+  pylint, and ruff checks. Pyright configured in `pyproject.toml`.
+
+## [1.6.4] - 2026-02-23
+
+### Added
+
+- **`wv enrich-topology` command**: One-command graph enrichment from a JSON spec. Supports
+  `implements`/`blocks` edges, dry-run preview, and `--sync-gh` for issue body updates. Resolves
+  nodes by Weave ID or GitHub issue number (`gh_issue`/`gh_pairs`).
+- **Consistent Mermaid rendering**: All Mermaid graphs (CLI, GitHub sync, MCP) now share a single
+  canonical source via `wv tree --mermaid [--root=<id>]`. GitHub sync uses
+  `render_mermaid_from_tree()` with automatic fallback to the in-process renderer.
+- **MCP `weave_tree` parameters**: `mermaid` (boolean) and `root` (string) parameters added to the
+  MCP `weave_tree` tool, enabling Mermaid output directly from MCP clients.
+
+### Fixed
+
+- **Mermaid label parse errors**: Labels in `wv tree --mermaid` output are now double-quoted inside
+  brackets (`["label"]`) and backticks are stripped. Prevents GitHub "Unable to render rich display"
+  errors caused by unquoted parentheses/brackets being interpreted as Mermaid shape syntax.
+
+## [1.6.3] - 2026-02-23
+
+### Fixed
+
+- **Mermaid graph rendering for parent issues**: Weave GitHub sync now renders `## Dependency Graph`
+  for any node that has child tasks, regardless of `node_type`. This restores graph rendering for
+  legacy/task-typed parent nodes that still represent epics in practice.
+- **Regression coverage for GH rendering**: Added a renderer test case that verifies task-typed
+  parents with children include Mermaid output, preventing future regressions.
+- **Two-machine sync safety guidance**: Clarified that `wv sync --gh` round-trips node fields but
+  does not round-trip edge topology, and documented the required `git pull` + `wv load` flow before
+  cross-machine sync operations.
+
+## [1.6.2] - 2026-02-22
+
+### Fixed
+
+- **SQLite cross-version dump compat**: `wv sync` now strips `unistr()` from `.dump` output via a
+  Python post-processor. SQLite ≥ 3.44 emits `unistr('\uXXXX')` for non-ASCII chars; older versions
+  (e.g. Debian 12 apt: 3.40.1) cannot parse these calls on `wv load`, causing "state.sql is corrupt"
+  errors. Applies to all three `.dump` call sites in `auto_sync()` and `cmd_sync()`. Falls back to
+  unmodified dump if python3 is unavailable.
+- **Skill frontmatter audit stability**: All `.claude/skills/*/SKILL.md` frontmatter descriptions
+  are now single-line with explicit WHAT+WHEN trigger wording to avoid parser/lint false positives
+  from wrapped YAML values.
+- **`resolve-refs` invocation path**: Updated skill guidance to use
+  `~/.local/bin/wv refs $ARGUMENTS` instead of repo-relative `./scripts/resolve-refs.sh`, removing
+  working-directory dependency.
+
+## [1.6.0] - 2026-02-20
+
+### Added
+
+- **Agent pre-launch validation**: Before spawning any weave agent (epic-planner, learning-curator,
+  weave-guide), the `/weave` skill reads the agent's `.md` file and checks for `Bash` in the `tools`
+  frontmatter. Aborts with a clear error and falls back to inline execution if missing. Prevents
+  silent ~25k-token burns from agents with no Bash access (Sprint 11 regression).
+- **`tools` frontmatter on all weave agents**: `weave-guide`, `epic-planner`, and `learning-curator`
+  now declare explicit tool lists (`Bash`, `Read`, `Grep`, `Glob`, etc.) so their access is
+  unambiguous in any permission context.
+- **Decompose pre-audit (step 1.5)**: `wv-decompose-work` and `/weave` epic-planner invocation now
+  run a targeted `git log` + `grep` search before creating task nodes. Surfaces already-implemented
+  work so it can be excluded from the breakdown (Sprint 11 T5: `seed_database.py` already existed).
+- **Overlap warning with action prompt**: `wv done --learning` overlap detection now shows an
+  interactive `[d]edup / [a]cknowledge / [s]kip` prompt when connected to a TTY, instead of a
+  passive advisory. Choosing `d` or `s` prevents the learning from being saved; `a` proceeds.
+  Non-TTY fallback preserves the original hint line.
+- **Epic commit aggregation**: `wv done` now stores related commit SHAs (via `git log --grep`) in
+  node metadata as `commits: ["abc1234", ...]`. When a task has a parent epic (via `implements`
+  edge), child commits are aggregated onto the epic node incrementally. Enables navigating from epic
+  to all implementing commits.
+- **CLOSE phase mandatory gate**: `/weave` SKILL.md Phase 4 now has an explicit
+  `⛔ Mandatory Pre-Close Gate` checklist that blocks `wv done` until the learning-curator agent has
+  been invoked and produced structured learnings. Includes an anti-pattern example from Sprint 11 (6
+  nodes with flat `--learning` strings, curator never called).
+- **`weave_plan --gh` timeout scaled**: MCP `weave_plan` handler timeout raised from 60 s to 180 s
+  when `--gh` is set, accommodating plans with 20+ tasks that require `sleep 1` between each GitHub
+  issue creation to avoid secondary rate limits.
+
+### Fixed
+
+- **`wv plan --gh` secondary rate limit**: CLI already had `sleep 1` between GH issue creates (added
+  in 067d50a); the MCP path now also has a sufficient timeout to complete large plans without
+  `ETIMEDOUT`.
+- **ShellCheck SC2015**: `_aggregate_epic_commits` call now uses `if/fi` instead of `&& ... || true`
+  to avoid the false-positive where the `|| true` arm runs when the condition is true but the
+  command fails.
+
+## [1.5.4] - 2026-02-19
+
+### Added
+
+- **`wv guide --topic=mcp`**: New MCP topic covering server setup, compound tools, full tool
+  listing, and CLI vs MCP comparison. Topics now: `workflow`, `github`, `learnings`, `context`,
+  `mcp`.
+- **`wv plan` zero-tasks diagnostic**: When a sprint section is found but no tasks are parsed, shows
+  expected format, common issues, and exits 1 instead of silently creating an empty epic.
+- **Learning format suggestion**: `wv done --learning="..."` now prints a tip to stderr when the
+  learning text lacks `decision:`, `pattern:`, or `pitfall:` structured markers.
+
+### Fixed
+
+- **Hook hard gates**: `pre-close-verification.sh`, `stop-check.sh`, and `post-edit-lint.sh` now
+  exit 1 on violations instead of advisory exit 0. JSON `"decision":"block"` output is now backed by
+  actual blocking behavior.
+- **`wv done --skip-verification`**: New flag to bypass the verification hard gate for trivial
+  tasks.
+- **`cmd_load` stderr**: Success messages redirected to stderr to prevent stdout pollution during
+  auto-restore (7846fa1).
+- **MCP server version**: Now tracks VERSION file (was stuck at 1.5.2).
+
+### Changed
+
+- **WEAVE.md**: Version 1.5.4, added `blocked-external` status, `wv guide` command reference, fixed
+  MCP tool count (23) and skills/version references.
+- **README.md**: Removed deprecated `sync-weave-gh.sh`, added `weave_guide` to MCP tools table,
+  updated hook descriptions and counts.
+
+## [1.5.3] - 2026-02-19
+
+### Added
+
+- **`wv guide`**: New command with 4 topics (`workflow`, `github`, `learnings`, `context`) — quick
+  reference for any consumer without needing to open docs. Topics print concise cheat-sheets
+  directly in the terminal.
+- **`weave_guide` MCP tool**: Exposes `wv guide` to MCP-only consumers (Copilot, Claude Desktop,
+  etc.) that cannot run CLI commands. Topic parameter is optional; defaults to full workflow
+  reference.
+
+### Fixed
+
+- **`wv ship` ancestry detection**: Recursive CTE now walks the full `implements` edge chain instead
+  of checking only the direct parent. GitHub issue now found and closed for epic → feature → task
+  hierarchies of any depth.
+- **Auto-restore after reboot**: `db_ensure` no longer conflicts with SQLite `.dump` schema output.
+  Delegates to `cmd_load` (atomic temp-DB replace), eliminating false "failed to restore" errors.
+- **`WeaveNode.priority`**: `int()` conversion now wrapped in `try/except` — non-numeric strings
+  like `HIGH`/`MEDIUM`/`LOW` fall back to `2` instead of crashing `wv sync --gh`.
+
+### Changed
+
+- **Metadata key normalized**: `wv show --json` now returns metadata under `"metadata"` (not
+  `"json(metadata)"`). Consistent with `wv list --json`. Update any `jq '.[0]."json(metadata)"'`
+  calls to `jq '.[0].metadata'`.
+- **Session-start hook**: Stale breadcrumbs (>24h old) are surfaced at session start with age and a
+  reminder to run `wv breadcrumbs show`. Prevents context loss across sessions.
+- **AGENTS.md + copilot-instructions.md**: Updated for `weave_guide`, normalized metadata key docs,
+  and `wv guide` in session-start section.
+
+## [1.5.2] - 2026-02-18
+
+### Fixed
+
+- MCP server version string now tracks package.json (was stuck at 1.5.0 in v1.5.1)
+- Pre-release checklist in DEVELOPMENT.md now lists `mcp/src/index.ts` as 4th version location
+
+### Changed
+
+- Documented `wv ship` ordering requirement: commit code before ship (ship closes the node, blocking
+  subsequent commits). Added to CLAUDE.md, AGENTS.md, copilot-instructions.md.
+
+## [1.5.1] - 2026-02-18
+
+### Added
+
+- **`wv-init-repo --update`**: Updates managed files (hooks, skills, agents,
+  copilot-instructions.md) in existing repos without overwriting user-customized files (CLAUDE.md,
+  settings.local.json, .vscode/mcp.json). Use `--force` to overwrite everything.
+- **All 16 skills shipped**: `wv-init-repo` now installs all 16 skills (was 3). Includes weave,
+  weave-audit, sanity-check, ship-it, pre-mortem, plan-agent, zero-in, wv-clarify-spec,
+  wv-decompose-work, wv-detect-loop, wv-guard-scope, wv-verify-complete, breadcrumbs, close-session,
+  fix-issue, resolve-refs.
+- **All 3 agent files shipped**: `wv-init-repo` installs weave-guide.md, epic-planner.md,
+  learning-curator.md.
+- **`pre-action.sh` hook**: Added to init-repo hook list (was missing).
+
+### Fixed
+
+- **CLAUDE.md Rules alignment**: Rules section in CLAUDE.md and templates/CLAUDE.md.template now
+  matches AGENTS.md (10 rules + violation check). Previously missing: no untracked fixes, check
+  context, bound session scope, plan mode bypass.
+- **`plan-agent` skill missing from install.sh**: Skill directory was created but SKILL.md was never
+  copied to config dir.
+
+## [1.5.0] - 2026-02-18
+
+### Added
+
+- **`wv ship --gh`**: Auto-detects GitHub-linked nodes (or parent epics) and runs `wv sync --gh`
+  after closing. No more forgotten epic body refreshes.
+- **`wv add --parent=<id>`**: Links new nodes to a parent via `implements` edge at creation time.
+  Validates parent exists before creating child. Prevents orphaned tasks.
+- **Alias warning**: `wv add` emits `⚠ No alias` to stderr when creating non-epic nodes without
+  `--alias`. Suppressed when `--force` or `--parent` is set to reduce noise on throwaway or
+  already-linked nodes.
+- **`blocked-external` status**: New status for external dependencies (third-party APIs, human
+  approvals). Supported in validate, list, health, status, and tree commands.
+- **Auto-breadcrumbs on `wv done`**: Appends completion timestamp, unblocked nodes, and next ready
+  node to `.weave/breadcrumbs.md` automatically.
+- **Learnings injection in `wv plan`**: After creating tasks from a plan file, FTS5 searches for
+  related learnings/pitfalls and stores matching IDs in task `context_learnings` metadata.
+- **`target_version` in `wv tree`**: Epic nodes with `target_version` metadata display a version
+  suffix (e.g., `[v1.5.0]`) in tree output.
+- **Pre-commit hook relaxation**: Whitespace-only changes bypass the active node requirement. Also
+  supports `WV_STYLE_COMMIT=1` env var for formatting commits.
+- **MCP server**: `blocked-external` added to all 4 status enums (search, add, list, update).
+  `parent` property on `weave_add` tool (schema + handler). `gh` property on `weave_ship` tool
+  (schema + handler). Server version bumped to 1.5.0.
+- **Agent instruction updates**: All three agent files (CLAUDE.md, AGENTS.md,
+  copilot-instructions.md) updated with `wv ship --gh`, `wv add --parent`, `blocked-external`
+  status, parallel work patterns, learning quality rules, enrichment discipline, and
+  `target_version` convention.
+- **⚠ Plan mode bypass warning**: New pitfall documented in all agent instruction files — agents
+  must not skip the Weave workflow when given a detailed spec or release plan. Each phase/task in a
+  plan requires its own node, claim, and learning capture.
+
+### Fixed
+
+- **`wv init --force` output**: Now says "Initialized Weave" consistently (was "Reinitialized").
+- **6-char ID regex**: Fixed `{4}` → `{4,6}` in `pre-close-verification.sh`, `pre-claim-skills.sh`,
+  and `test-stress.sh`. Hooks were silently skipping all v1.2+ node IDs.
+- **FTS5 dedup false positives in tests**: Added `--force` to health test node creation where
+  similar text triggered dedup (e.g., "Fix for first issue" matching "Pitfall: First issue").
+- **SQL injection surface in `wv add --parent`**: Parent validation now uses `sql_escape()` instead
+  of raw interpolation (was safe due to `validate_id()` but inconsistent with rest of codebase).
+- **`invalidate_context_cache` variable leak**: Loop variable `id` in `wv-cache.sh` was not declared
+  `local`, clobbering the caller's `$id` when `cmd_link` triggered cache invalidation inside
+  `cmd_add --parent`. Renamed to `local node_id`. This caused `wv add --parent` to return the
+  parent's ID instead of the child's, breaking `--gh` metadata linkage.
+- **`cmd_link` and `wv add --gh` stdout pollution**: Success messages from `cmd_link` ("Linked:")
+  and GH issue creation ("GitHub issue #N created") were on stdout, contaminating captured output
+  when composed inside other commands. Redirected both to stderr.
+
+## [1.4.1] - 2026-02-17
+
+### Added
+
+- Community section in README with links to Discussions and Issues
+- Discussions guidance in CONTRIBUTING.md
+
+## [1.4.0] - 2026-02-17
+
+### Fixed
+
+- **Phantom GH issue reopen prevention**: `wv sync --gh` Phase 1 no longer reopens GitHub issues
+  that were closed by Weave itself. Before reopening, sync now checks the last comment for the Weave
+  close marker (`Completed. Weave node`). This prevents the sync loop where a forgotten `wv done`
+  caused sync to reopen an issue that was already properly closed. Fails open on API errors to
+  preserve existing behavior.
+- Mypy and Pylint issues resolved in `test_weave_gh_phases.py` (generic tuple type params, missing
+  type annotations, unused arguments, line length)
+
+### Added
+
+- Edge system analysis and multi-developer limitations documented in `docs/DEVELOPMENT.md`
+- Comprehensive release cycle documentation in `docs/DEVELOPMENT.md`
+- `--tag` and `--release` flags for `build-release.sh` to automate Git tagging and GitHub Release
+  creation
+- Multi-developer workflow limitations noted in public README
+
+## [1.3.1] - 2026-02-17
+
+### Fixed
+
+- Agent files (`.claude/agents/*.md`) now include required YAML frontmatter with `name` and
+  `description` fields -- fixes Claude Code doctor parse errors on repos using Weave agents
+- `wv sync --gh` now updates parent epic issue bodies (checkboxes + Mermaid) even when child issues
+  are already closed -- previously the OPEN-only guard in `_handle_existing_issue` skipped body
+  updates for closed issues, leaving epic checkboxes stale
+- `pyproject.toml` version aligned to `1.3.x` (was `4.2.0` due to Poetry drift)
+
+### Changed
+
+- `build-release.sh` now ships `CLAUDE.md` (from template) and `.github/copilot-instructions.md` so
+  both Claude Code and Copilot users get agent configs out of the box
+- `build-release.sh` strips `[dependency-groups]` and `[tool.*]` sections from shipped
+  `pyproject.toml` -- end users don't need dev tooling config (ruff, mypy, pytest, etc.)
+
+## [1.3.0] - 2026-02-14
+
+### Added
+
+- `wv bulk-update` command -- update multiple nodes from JSON stdin with validation, dry-run, alias
+  resolution, and support for alias/status/text/metadata/remove-keys fields
+- Multi-developer workflow documentation in `docs/DEVELOPMENT.md`
+
+### Fixed
+
+- `wv-init-repo` now idempotent -- `wv init` failure on existing databases no longer kills the
+  script. All sections (hooks, skills, agent config) execute regardless of DB state
+- `wv-init-repo` exit code 1 on successful runs -- `[ ] && echo` pattern under `set -e` leaked
+  non-zero exit when test condition was false. Replaced with `if/elif/fi`
+
+## [1.2.0] - 2026-02-13
+
+### Added
+
+- `wv delete <id>` command -- permanently remove a node and its edges with `--force`, `--dry-run`,
+  `--no-gh` flags. Archives node to JSONL before deletion, cascades edge cleanup, optionally closes
+  linked GitHub issue. Warns if node has children unless `--force` (#633)
+- `wv batch [file]` command -- execute multiple wv commands from file or stdin with `--dry-run` and
+  `--stop-on-error` support. Enables bulk operations without custom scripts (#634)
+- `wv tree --mermaid` -- built-in Mermaid graph generation with status colors
+  (done/active/blocked/todo), implements and blocks edges, alias-preferred labels. Optional
+  `--root=<id>` filter (#635)
+- Plan parser: alias extraction from bold prefix (`**alias** -- description`), metadata tags
+  `(priority: N)`, `(after: alias)`, `(status: done)`, two-pass dependency wiring with alias
+  resolution (#629, #631)
+- Plan parser: tasks created with `--force` to skip dedup check during bulk import
+- `templates/PLAN.md.template` updated with new syntax documentation
+
+### Fixed
+
+- `wv init --force` now actually wipes DB + state files (previously `CREATE TABLE IF NOT EXISTS` was
+  a no-op on existing data). Preserves `.weave/archive/` (#636)
+- Dedup check on `wv add` relaxed: uses token-based AND matching (2+ significant words >4 chars)
+  instead of exact phrase match. Reduces false positives during bulk import (#637)
+- `wv plan --gh` rate limiting: 1-second throttle between GitHub API calls, errors surfaced instead
+  of suppressed with `2>/dev/null`, failure count reported (#632)
+- `_repo_hash()` newline mismatch: Python `hashlib.md5` now includes trailing `\n` to match bash
+  `echo | md5sum` behavior. Fixed Mermaid graphs not propagating to GitHub issues (#639)
+- `git pull --rebase --autostash` output leak: "Created autostash" message no longer contaminates
+  `cmd_add` stdout when captured via `$()`. Fixes selftest failures and plan import issues
+- `WV_CHECKPOINT_INTERVAL` default changed from 1800s to 0 -- auto-checkpoint now fires on every
+  sync, preventing persistent dirty `.weave/` state
+- `wv link` now resolves aliases for both from and to arguments
+- Auto-create labels on `wv add --gh` for new repos
+- Remove deprecated `sync-weave-gh.sh` from `install.sh`
+
+## [1.1.0] - 2026-02-09
+
+### Added
+
+- `wv init` auto-recovery: detects missing hot zone after reboot, restores from `state.sql`
+- `wv init --force` flag for intentional reinitialization
+- `wv init` guard against accidental overwrite of existing data
+- `install.sh --verify` runs `wv selftest` after install completes
+- Generic CLAUDE.md template for target repos (replaces project-specific copy)
+- 5-minute quickstart walkthrough in README
+- `wv doctor` command for installation health checks
+- `wv selftest` round-trip smoke test in isolated environment
+- `wv tree` epic-to-feature-to-task hierarchy view
+- `wv plan` markdown import as epic + linked tasks
+- `wv context` context packs with caching and auto-invalidation
+- `wv breadcrumbs` session context dump/restore
+- `wv session-summary` session activity statistics
+- `wv learnings` with `--category`, `--grep`, `--min-quality`, `--dedup` filters
+- `wv audit-pitfalls` with resolution tracking
+- `wv health --history` health score history log
+- `wv quick` one-shot create+close for small tasks
+- `wv ship` done+sync+push in one command
+- Human-readable aliases for nodes (`--alias=`)
+- Learning quality scoring with heuristic scores
+- Learning deduplication via FTS5 phrase matching
+- Auto-sync on write with configurable throttle (`WV_SYNC_INTERVAL`)
+- Write-time validation warnings (orphans, missing learnings)
+- Weave-ID trailers in auto-checkpoint commits
+- GitHub issue templates with Weave ID field
+- Bidirectional metadata sync with GitHub (labels, body markers)
+- Live progress comments via `gh_notify()` hooks
+- Mermaid dependency graphs in epic issue bodies
+- Python sync module (3-phase sync replacing shell script)
+- MCP server with 8+ tools for IDE integration
+- Enhanced MCP tools: `weave_quick`, `weave_work`, `weave_ship`, `weave_overview`
+- Comprehensive stress test suite (sync, concurrency, scale, fuzzing, recovery)
+- Hook test suite (26 unit + 10 integration lifecycle tests)
+- Context pack caching with automatic invalidation on graph changes
+
+### Fixed
+
+- `wv work` now sets status to `active` (was `in-progress`)
+- `wv update` validates status enum (rejects invalid values)
+- `wv prune --age=0h` rejected with error (was silently deleting all done nodes)
+- FTS5 search safe with apostrophes and special characters
+- `wv ready --json` returns `[]` when empty (was returning empty string)
+- `wv path` no longer duplicates nodes in diamond dependencies
+- Context pitfalls scoped to node ancestry (was globally broadcast)
+- Health check validates status enum (was reporting 100/100 with invalid statuses)
+- `wv done` no longer exits 141 (SIGPIPE) when closing GitHub issues
+- `wv show` returns error for non-existent nodes (was exit 0)
+- `wv prune` default age no longer produces invalid SQL
+- `wv list --json` returns `[]` when empty
+- Ghost edges removed and foreign key enforcement enabled
+
+## [1.0.0] - 2026-02-02
+
+Initial release: Weave v6.0 foundation.
+
+- SQLite graph on tmpfs with WAL mode
+- 26 CLI commands with modular `lib/` and `cmd/` split
+- FTS5 full-text search
+- XDG-compliant install layout
+- Install lifecycle (`--dev`, `--uninstall`, `--upgrade`)
+- Subagent context inheritance (`WV_ACTIVE`)
+- Universal agent rule files (AGENTS.md, copilot-instructions.md)
+- Regression test suite for all commands
