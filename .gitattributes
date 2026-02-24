@@ -1,0 +1,8 @@
+
+# Use ours merge strategy for Weave state files.
+# The hot-zone DB (/dev/shm/weave/<repo-hash>/brain.db) is the source of truth;
+# the .weave/ dump is just a serialization. Latest local dump always wins.
+# Requires: git config merge.ours.driver true (done by install.sh)
+.weave/state.sql merge=ours
+.weave/nodes.jsonl merge=ours
+.weave/edges.jsonl merge=ours
