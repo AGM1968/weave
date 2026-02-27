@@ -1074,6 +1074,8 @@ INITEOF
 chmod +x "$INSTALL_DIR/wv-init-repo"
 
 # Create wv-update command (re-runs installer)
+# Capture the install source dir at install time so wv-update can find it later
+_WV_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cat > "$INSTALL_DIR/wv-update" << UPDATEEOF
 #!/bin/bash
 # Re-run the Weave installer to update all components
@@ -1082,10 +1084,15 @@ echo "Updating Weave..."
 INSTALL_DIR="$INSTALL_DIR"
 CONFIG_DIR="$CONFIG_DIR"
 
-# Find source: local repo or download
+# Find source: CWD git repo > source repo (baked in at install time) > GitHub download
 REPO_ROOT=\$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-if [ -n "\$REPO_ROOT" ] && [ -f "\$REPO_ROOT/install.sh" ]; then
+if [ -n "\$REPO_ROOT" ] && [ -f "\$REPO_ROOT/install.sh" ] && [ -f "\$REPO_ROOT/scripts/wv" ]; then
     cd "\$REPO_ROOT"
+    bash install.sh
+elif [ -f "$_WV_SOURCE_DIR/install.sh" ] && [ -f "$_WV_SOURCE_DIR/scripts/wv" ] && git -C "$_WV_SOURCE_DIR" rev-parse --git-dir &>/dev/null; then
+    # Installed from local git repo — use it as update source
+    cd "$_WV_SOURCE_DIR"
+    git pull --ff-only 2>/dev/null || true
     bash install.sh
 else
     curl -sSL https://raw.githubusercontent.com/AGM1968/weave/main/install.sh | bash
