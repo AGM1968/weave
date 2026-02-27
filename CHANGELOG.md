@@ -2,6 +2,14 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.9.2] - 2026-02-27
+
+### Fixed
+
+- **GH sync body overwrite** — Re-imported nodes (`source=github`, no children) no longer overwrite
+  rich issue bodies with sparse re-rendered content. Tasks, checkboxes, and Mermaid graphs are
+  preserved when a node has been re-imported from GitHub without local graph context.
+
 ## [1.9.1] - 2026-02-27
 
 ### Added
