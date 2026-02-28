@@ -80,6 +80,13 @@ class TestNormalize:
 
 # ---------------------------------------------------------------------------
 # Hotspot computation
+#
+# CONVENTION (wv-07a641): compute_hotspots uses min-max normalization, so
+# absolute scores depend on the dataset. Safe assertion patterns:
+#   - 2-element fixtures: min=0.0, max=1.0 are guaranteed by the math
+#   - N>2 elements: assert relative ordering (a > b) or thresholds (x > 0.5)
+#   - Pre-set values via _stats(hotspot=X) bypass normalization — safe to ==
+# Never hardcode intermediate normalized values from _stats() in assertions.
 # ---------------------------------------------------------------------------
 
 
@@ -88,11 +95,11 @@ class TestComputeHotspots:
         entries = [_entry("a.py", complexity=30), _entry("b.py", complexity=5)]
         stats = [_stats("a.py", churn=100), _stats("b.py", churn=10)]
         result = compute_hotspots(entries, stats)
-        # a.py has max complexity AND max churn -> score = 1.0 * 1.0 = 1.0
+        # 2-element fixture: min-max guarantees max=1.0, min=0.0
         a_stats = next(s for s in result if s.path == "a.py")
         b_stats = next(s for s in result if s.path == "b.py")
         assert a_stats.hotspot == 1.0
-        assert b_stats.hotspot == 0.0  # min of both
+        assert b_stats.hotspot == 0.0
 
     def test_no_entries(self) -> None:
         result = compute_hotspots([], [])
@@ -104,6 +111,27 @@ class TestComputeHotspots:
         result = compute_hotspots(entries, stats)
         # Single file: normalized to 0 -> hotspot = 0
         assert result[0].hotspot == 0.0
+
+    def test_three_files_relative_ordering(self) -> None:
+        """With N>2 files, assert relative ordering not exact scores."""
+        entries = [
+            _entry("high.py", complexity=50),
+            _entry("mid.py", complexity=25),
+            _entry("low.py", complexity=5),
+        ]
+        stats = [
+            _stats("high.py", churn=100),
+            _stats("mid.py", churn=50),
+            _stats("low.py", churn=10),
+        ]
+        result = compute_hotspots(entries, stats)
+        by_path = {s.path: s for s in result}
+        # Relative ordering is stable regardless of fixture size
+        assert by_path["high.py"].hotspot > by_path["mid.py"].hotspot
+        assert by_path["mid.py"].hotspot > by_path["low.py"].hotspot
+        # Boundary values still hold for N>2
+        assert by_path["high.py"].hotspot == 1.0  # max is always 1.0
+        assert by_path["low.py"].hotspot == 0.0   # min is always 0.0
 
     def test_unmatched_stats_ignored(self) -> None:
         entries = [_entry("a.py", complexity=10)]

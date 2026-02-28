@@ -45,6 +45,8 @@ setup_test_env() {
     cd "$TEST_DIR"
     # Need git repo for WEAVE_DIR resolution
     git init -q
+    # Disable GPG signing for test repo (global gpgsign=true fails in CI/SSH)
+    git config commit.gpgsign false
 }
 
 # ---------------------------------------------------------------------------
@@ -718,6 +720,8 @@ test_checkpoint_trailers() {
     setup_test_env
 
     # Need an initial commit so git log works
+    # Disable GPG signing (global gpgsign=true fails in CI/SSH)
+    git config commit.gpgsign false
     git commit --allow-empty -m "init" --no-verify -q
 
     # Disable throttle for all checkpoint tests

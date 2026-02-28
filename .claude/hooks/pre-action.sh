@@ -17,7 +17,7 @@ TOOL_INPUT=$(echo "$INPUT" | jq -r '.tool_input // empty' 2>/dev/null)
 if [[ "$TOOL" =~ ^(Edit|Write)$ ]]; then
     FILE_PATH=$(echo "$TOOL_INPUT" | jq -r '.file_path // empty' 2>/dev/null)
     if [[ "$FILE_PATH" =~ \.local/(bin|lib/weave) ]]; then
-        cat <<EOF
+        cat >&2 <<EOF
 ERROR: Editing installed copy at $FILE_PATH
 Edit the SOURCE file instead:
   ~/.local/bin/wv          → scripts/wv
@@ -25,15 +25,15 @@ Edit the SOURCE file instead:
   ~/.local/lib/weave/cmd/  → scripts/cmd/
 After editing source, run: ./install.sh
 EOF
-        exit 1
+        exit 2
     fi
 fi
 
 # Check if this is an operation we should enforce
 SHOULD_CHECK=false
 
-# Edit operations (Edit, Write, NotebookEdit, create_file, edit_file)
-if [[ "$TOOL" =~ ^(Edit|Write|NotebookEdit)$ ]]; then
+# Edit operations (Edit, Write, NotebookEdit) and IDE code execution
+if [[ "$TOOL" =~ ^(Edit|Write|NotebookEdit|mcp__ide__executeCode)$ ]]; then
     SHOULD_CHECK=true
 fi
 
@@ -57,13 +57,23 @@ if [ ! -x "$WV" ]; then
     exit 0
 fi
 
+# DB health pre-flight: verify hot zone DB exists before attempting wv queries
+# Mirrors wv-config.sh hot zone resolution logic
+_PA_REPO_HASH=$(echo "$WV_PROJECT_DIR" | md5sum | cut -c1-8)
+_PA_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_PA_REPO_HASH}}"
+_PA_DB="${WV_DB:-${_PA_HOT_ZONE}/brain.db}"
+if [ ! -f "$_PA_DB" ]; then
+    # DB not loaded — allow action (session start hook will load it on next run)
+    exit 0
+fi
+
 # Get active nodes
 ACTIVE_NODES=$("$WV" list --status=active --json 2>/dev/null || echo "[]")
 ACTIVE_COUNT=$(echo "$ACTIVE_NODES" | jq 'length' 2>/dev/null || echo "0")
 
 if [ "$ACTIVE_COUNT" = "0" ]; then
     # No active nodes, suggest using /weave to start work
-    cat <<EOF
+    cat >&2 <<EOF
 ⚠️  No active Weave node found.
 
 Use \`/weave\` to select work before editing files:
@@ -73,7 +83,7 @@ Use \`/weave\` to select work before editing files:
 
 This ensures graph-first workflow with Context Pack generation.
 EOF
-    exit 1
+    exit 2
 fi
 
 if [ "$ACTIVE_COUNT" -gt "1" ]; then
@@ -90,31 +100,29 @@ if [ -z "$NODE_ID" ] || [ "$NODE_ID" = "null" ]; then
 fi
 
 # Check if Context Pack has been generated (cache exists or can be generated)
-# Per-repo hot zone namespace
-_REPO_ROOT_PA=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-_REPO_HASH_PA=$(echo "$_REPO_ROOT_PA" | md5sum | cut -c1-8)
-CACHE_DIR="${WV_HOT_ZONE:-/dev/shm/weave/${_REPO_HASH_PA}}/context_cache"
+# Re-use hot zone computed in DB pre-flight above
+CACHE_DIR="${_PA_HOT_ZONE}/context_cache"
 CACHE_FILE="$CACHE_DIR/${NODE_ID}.json"
 
 # Try to generate/retrieve Context Pack
 CONTEXT_PACK=$("$WV" context "$NODE_ID" --json 2>/dev/null || echo "")
 
 if [ -z "$CONTEXT_PACK" ]; then
-    cat <<EOF
+    cat >&2 <<EOF
 ⚠️  Context Pack generation failed for node $NODE_ID.
 
 This is required before editing files. Check:
 - Does the node exist? Run: \`wv show $NODE_ID\`
 - Is the database accessible? Run: \`wv status\`
 EOF
-    exit 1
+    exit 2
 fi
 
 # Check for contradictions
 CONTRADICTIONS=$(echo "$CONTEXT_PACK" | jq '.contradictions | length' 2>/dev/null || echo "0")
 if [ "$CONTRADICTIONS" -gt "0" ]; then
     CONTRADICTION_LIST=$(echo "$CONTEXT_PACK" | jq -r '.contradictions[] | "  - \(.id): \(.text)"' 2>/dev/null || echo "")
-    cat <<EOF
+    cat >&2 <<EOF
 🛑 HARD STOP: Contradictions detected for node $NODE_ID
 
 The following nodes contradict your current work:
@@ -127,14 +135,14 @@ Resolve contradictions before proceeding:
 
 Cannot proceed to EXECUTE phase until contradictions are resolved.
 EOF
-    exit 1
+    exit 2
 fi
 
 # Check for blockers (only non-done blockers count)
 BLOCKERS=$(echo "$CONTEXT_PACK" | jq '[.blockers[] | select(.status != "done")] | length' 2>/dev/null || echo "0")
 if [ "$BLOCKERS" -gt "0" ]; then
     BLOCKER_LIST=$(echo "$CONTEXT_PACK" | jq -r '.blockers[] | select(.status != "done") | "  - \(.id): \(.text)"' 2>/dev/null || echo "")
-    cat <<EOF
+    cat >&2 <<EOF
 🛑 BLOCKED: Cannot proceed with node $NODE_ID
 
 This node is blocked by:
@@ -143,7 +151,7 @@ $BLOCKER_LIST
 Complete the blocking work first, then retry.
 Or unblock with: \`wv update $NODE_ID --status=todo\` (removes blocked status)
 EOF
-    exit 1
+    exit 2
 fi
 
 # All checks passed - Context Pack is valid, no contradictions, no blockers

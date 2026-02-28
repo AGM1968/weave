@@ -107,6 +107,8 @@ setup_test_env() {
     # Init git repo (needed by stop-check and context-guard)
     cd "$TEST_DIR/project"
     git init -q
+    # Disable GPG signing for test repo (global gpgsign=true would fail in CI/SSH)
+    git config commit.gpgsign false
     git commit --allow-empty -m "init" -q
 
     # Init wv database
@@ -153,13 +155,13 @@ echo ""
 echo "--- pre-action.sh (no active node) ---"
 setup_test_env
 
-# No active nodes — should block Edit
+# No active nodes — should hard-block Edit (exit 2)
 set +e
-OUTPUT=$(echo '{"tool_name":"Edit","tool_input":{"file_path":"test.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>/dev/null)
+OUTPUT=$(echo '{"tool_name":"Edit","tool_input":{"file_path":"test.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
 EXIT_CODE=$?
 set -e
-assert_exit_code "1" "$EXIT_CODE" "pre-action: exits 1 when no active node"
-assert_contains "$OUTPUT" "No active Weave node" "pre-action: warns about missing active node"
+assert_exit_code "2" "$EXIT_CODE" "pre-action: exits 2 (hard block) when no active node"
+assert_contains "$OUTPUT" "No active Weave node" "pre-action: message on stderr when no active node"
 
 # --- pre-action.sh (with active node) ---
 echo ""
@@ -184,6 +186,27 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "pre-action: exits 0 for Read tool (not checked)"
 
+# --- pre-action.sh (mcp__ide__executeCode enforced) ---
+echo ""
+echo "--- pre-action.sh (mcp__ide__executeCode) ---"
+setup_test_env
+
+# No active nodes: mcp__ide__executeCode must be hard-blocked (exit 2)
+set +e
+OUTPUT=$(echo '{"tool_name":"mcp__ide__executeCode","tool_input":{"code":"print(1)"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "2" "$EXIT_CODE" "pre-action: exits 2 for mcp__ide__executeCode without active node"
+
+# With active node: mcp__ide__executeCode must be allowed (exit 0)
+setup_test_env
+"$WV" add "MCP test task" --status=active 2>/dev/null
+set +e
+OUTPUT=$(echo '{"tool_name":"mcp__ide__executeCode","tool_input":{"code":"print(1)"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-action: exits 0 for mcp__ide__executeCode with active node"
+
 # --- pre-claim-skills.sh (matching command) ---
 echo ""
 echo "--- pre-claim-skills.sh ---"
@@ -207,14 +230,14 @@ ID=$("$WV" add "Close test" --status=active 2>/dev/null | tail -1)
 
 OUTPUT=$(echo "{\"command\":\"wv done $ID\"}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "Verification evidence required" "pre-close: warns when no verification metadata"
-assert_contains "$OUTPUT" "verification_status" "pre-close: includes verification_status in output"
+assert_contains "$OUTPUT" "\"decision\": \"block\"" "pre-close: hookSpecificOutput has decision:block"
 
-# Check exit code is 1 (hard gate)
+# Check exit code is 0 (structured deny via hookSpecificOutput, not hard exit 2)
 set +e
 echo "{\"command\":\"wv done $ID\"}" | bash "$HOOKS_DIR/pre-close-verification.sh" >/dev/null 2>/dev/null
 EXIT_CODE=$?
 set -e
-assert_exit_code "1" "$EXIT_CODE" "pre-close: exits 1 (hard gate) when no verification"
+assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 (structured deny) when no verification"
 
 # With --skip-verification flag (should pass)
 set +e
@@ -354,7 +377,7 @@ OUTPUT=$(echo "{\"command\":\"wv done $TASK_ID\"}" | bash "$HOOKS_DIR/pre-close-
 EXIT_CODE=$?
 set -e
 assert_contains "$OUTPUT" "Verification evidence required" "lifecycle: close blocked without verification"
-assert_exit_code "1" "$EXIT_CODE" "lifecycle: close exits 1 without verification"
+assert_exit_code "0" "$EXIT_CODE" "lifecycle: close exits 0 (structured deny) without verification"
 
 # 6. Add verification and close (should be silent)
 "$WV" update "$TASK_ID" --metadata='{"verification":{"method":"test","command":"echo ok","result":"pass","evidence":"lifecycle test"}}' 2>/dev/null

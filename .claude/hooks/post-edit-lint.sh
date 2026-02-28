@@ -12,6 +12,13 @@ INPUT=$(cat)
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""')
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path // ""')
 
+# Skip linting if the tool call itself failed (tool_response.success = false)
+# PostToolUseFailure fires for hard failures; this guards soft/partial failures
+TOOL_SUCCESS=$(echo "$INPUT" | jq -r '.tool_response.success // true' 2>/dev/null)
+if [[ "$TOOL_SUCCESS" == "false" ]]; then
+    exit 0
+fi
+
 # Python files: run ruff
 if [[ "$FILE_PATH" =~ \.py$ ]]; then
     if command -v ruff &> /dev/null && [ -f "$FILE_PATH" ]; then

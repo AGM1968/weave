@@ -227,7 +227,9 @@ cmd_sync() {
     [ "$_sync_journaled" = true ] && journal_complete 1
 
     # Auto-checkpoint: WIP git commit after explicit sync
-    auto_checkpoint "$(date +%s)"
+    # Skip when sync is called within a parent journal op (e.g. cmd_ship)
+    # to prevent interleaving checkpoint commits during ship
+    [ "$_sync_journaled" = true ] && auto_checkpoint "$(date +%s)"
 
     # Step 2: Bidirectional GitHub sync if --gh flag or WV_GH_SYNC=1
     if [ "$gh_sync" = true ] || [ "${WV_GH_SYNC:-0}" = "1" ]; then
@@ -466,11 +468,19 @@ cmd_prune() {
 
     local sql_age="-${age_num} ${age_unit}"
     
-    # Find candidates
+    # Find candidates (skip unaddressed pitfalls — they must persist until resolved)
     local candidates=$(db_query "
-        SELECT id, text, updated_at FROM nodes 
-        WHERE status = 'done' 
-        AND updated_at < datetime('now', '$sql_age');
+        SELECT id, text, updated_at FROM nodes
+        WHERE status = 'done'
+        AND updated_at < datetime('now', '$sql_age')
+        AND id NOT IN (
+            SELECT n.id FROM nodes n
+            WHERE json_extract(n.metadata, '\$.pitfall') IS NOT NULL
+            AND n.id NOT IN (
+                SELECT e.target FROM edges e
+                WHERE e.type IN ('addresses', 'implements', 'supersedes')
+            )
+        );
     ")
     
     if [ -z "$candidates" ]; then

@@ -1,6 +1,6 @@
 [project]
 name = "weave-workflow"
-version = "1.9.2"
+version = "1.10.0"
 description = "Token-optimized memory system for agentic workflows"
 authors = [
     {name = "AGM1968",email = "AGM1968@users.noreply.github.com"}

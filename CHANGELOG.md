@@ -2,6 +2,46 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.10.0] - 2026-02-28
+
+### Added
+
+- **Exit code hard blocks** — `pre-action.sh` uses exit 2 for unconditional blocks (no active node,
+  contradictions, installed-path edits). No user override possible.
+- **Structured hookSpecificOutput JSON** — "Ask" decisions in `pre-action.sh` output JSON with
+  `decision`, `reason`, and `permissionDecisionReason` fields for model consumption.
+- **DB health pre-flight** — Hooks compute hot zone path via `md5sum` and exit 0 early if DB is
+  missing, preventing errors in non-Weave repos.
+- **PostToolUse success guard** — `post-edit-lint.sh` checks `tool_response.success` before running
+  lint, avoiding spurious errors on failed tool calls.
+- **pre-claim-skills.sh hook** — Advisory PreToolUse hook that surfaces available Weave skills
+  without blocking execution.
+- **pre-close-verification.sh hook** — Soft deny (exit 0 + JSON) on `wv done` without verification
+  evidence. Model can bypass with `--skip-verification`.
+- **MCP matcher extended** — PreToolUse hook regex now matches `mcp__ide__executeCode` alongside
+  Edit, Write, NotebookEdit, and Bash.
+- **`wv health` in session start** — `session-start-context.sh` includes health score in context
+  injection.
+- **`git push` in session end** — `session-end-sync.sh` pushes after sync for data durability.
+- **Makefile wv targets** — `wv-status`, `wv-gate`, `wv-sync` targets for CI integration and
+  discoverability.
+
+### Changed
+
+- **Hooks promoted to settings.json** — Hook definitions moved from `.claude/settings.local.json`
+  (gitignored) to `.claude/settings.json` (checked-in) for project-wide enforcement.
+- **wv-init-repo settings split** — `install.sh` now scaffolds both `settings.json` (hooks) and
+  `settings.local.json` (permissions), with separate update logic.
+- **Gitignore negation for settings.json** — `.gitignore` includes `!.claude/settings.json` to
+  ensure hook config is tracked while other `.claude/` files remain ignored.
+
+### Fixed
+
+- **Exit code correction** — Changed `pre-action.sh` from exit 1 (non-blocking warning) to exit 2
+  (hard block) for enforcement gates. Previously, the model could ignore hook denials.
+- **GPG signing in tests** — Test harness disables `commit.gpgsign` to prevent GPG passphrase
+  prompts in CI environments.
+
 ## [1.9.2] - 2026-02-27
 
 ### Fixed

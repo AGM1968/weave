@@ -43,24 +43,23 @@ if [[ "$COMMAND" =~ wv[[:space:]]done[[:space:]]wv-[0-9a-f]{4,6} ]]; then
             fi
 
             if [[ "$IS_TRIVIAL" == "false" ]]; then
-                cat <<EOF
-{
-    "warning": "Verification evidence required before closing",
-    "node": "$NODE_ID",
-    "text": "$NODE_TEXT",
-    "type": "$NODE_TYPE",
-    "verification_status": {
-        "has_verification": false
-    },
-    "action_required": "Add verification metadata before completing",
-    "options": [
-        "wv update $NODE_ID --metadata='{\"verification\":{\"method\":\"test\",\"command\":\"...\",\"result\":\"pass\",\"evidence\":\"...\"}}' && wv done $NODE_ID --learning=\"...\"",
-        "wv done $NODE_ID --skip-verification --learning=\"...\"  # Explicitly bypass for trivial tasks"
-    ],
-    "rationale": "Verification prevents 'looks right' over 'works right' - CLOSE phase requires evidence"
-}
-EOF
-                exit 1
+                # Build and self-validate JSON before output
+                JSON_OUT=$(jq -n \
+                    --arg node "$NODE_ID" \
+                    --arg reason "Verification evidence required before closing $NODE_ID. Add verification metadata or use --skip-verification for trivial tasks." \
+                    --arg pdr "Node $NODE_ID has no verification metadata. Verification enforces 'works right' over 'looks right' before the CLOSE phase." \
+                    '{
+                        "decision": "block",
+                        "reason": $reason,
+                        "permissionDecisionReason": $pdr,
+                        "node": $node,
+                        "options": [
+                            "wv update <id> --metadata='"'"'{\"verification\":{\"method\":\"test\",\"command\":\"...\",\"result\":\"pass\",\"evidence\":\"...\"}}'"'"' && wv done <id> --learning=\"...\"",
+                            "wv done <id> --skip-verification --learning=\"...\"  # Explicitly bypass for trivial tasks"
+                        ]
+                    }')
+                echo "$JSON_OUT"
+                exit 0
             fi
         fi
     fi

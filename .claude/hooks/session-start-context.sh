@@ -20,6 +20,16 @@ fi
 STATUS=$("$WV" status 2>/dev/null || echo "Work: 0 active, 0 ready, 0 blocked.")
 CONTEXT="$STATUS"
 
+# Append health score (single line, best effort)
+HEALTH_JSON=$("$WV" health --json 2>/dev/null || echo "")
+if [ -n "$HEALTH_JSON" ]; then
+    HEALTH_SCORE=$(echo "$HEALTH_JSON" | jq -r '.score // empty' 2>/dev/null || true)
+    if [ -n "$HEALTH_SCORE" ]; then
+        CONTEXT="${CONTEXT}
+Health: ${HEALTH_SCORE}/100"
+    fi
+fi
+
 # Surface stale breadcrumbs (>24h old) so they aren't silently forgotten
 WEAVE_DIR="${WV_PROJECT_DIR}/.weave"
 BC_FILE="${WEAVE_DIR}/breadcrumbs.md"

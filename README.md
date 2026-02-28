@@ -227,6 +227,19 @@ Install: `./install.sh --with-mcp` or `./install-mcp.sh`
 
 Verify: `wv mcp-status`
 
+## Hook Determinism (v1.10.0)
+
+Hooks enforce workflow rules deterministically — the AI agent cannot bypass structural constraints:
+
+- **Hard blocks (exit 2)** — No active node, contradictions, and installed-path edits are
+  unconditionally blocked. No user override possible.
+- **Structured JSON** — "Ask" decisions output machine-readable JSON for model consumption.
+- **DB pre-flight** — Hooks exit early in non-Weave repos (no spurious errors).
+- **PostToolUse guard** — Lint only runs after successful tool calls.
+- **Project-wide enforcement** — Hooks live in `.claude/settings.json` (checked-in), not
+  `.claude/settings.local.json` (gitignored).
+- **Makefile bridge** — `wv-status`, `wv-gate`, `wv-sync` targets for CI integration.
+
 ## Code Quality (v1.8.1)
 
 Built-in code quality analysis with zero dependencies beyond Python stdlib and git:

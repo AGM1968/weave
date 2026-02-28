@@ -148,7 +148,9 @@ journal_recover() {
             (map(select(.event == "end")) | length == 0)
         )) |
         if length == 0 then null
-        else last | {
+        else
+          # Sort by earliest begin timestamp, pick oldest incomplete op
+          sort_by(map(select(.event == "begin"))[0].ts) | first | {
             op_id: (map(select(.event == "begin"))[0].op_id),
             op: (map(select(.event == "begin"))[0].op),
             args: (map(select(.event == "begin"))[0].args),

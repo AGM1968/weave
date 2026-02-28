@@ -326,6 +326,8 @@ if [ -f "./scripts/wv" ]; then
     cp ./templates/PLAN.md.template "$CONFIG_DIR/PLAN.md.template" 2>/dev/null || true
     # Topology enrichment spec template for wv enrich-topology
     cp ./templates/TOPOLOGY-ENRICH.json.template "$CONFIG_DIR/TOPOLOGY-ENRICH.json.template" 2>/dev/null || true
+    # Makefile template for wv-init-repo
+    cp ./templates/Makefile.template "$CONFIG_DIR/Makefile.template" 2>/dev/null || true
 else
     echo -e "${YELLOW}Downloading from GitHub...${NC}"
     REPO="https://raw.githubusercontent.com/AGM1968/weave/main"
@@ -408,6 +410,8 @@ else
     curl -sSL "$REPO/templates/PLAN.md.template" -o "$CONFIG_DIR/PLAN.md.template" 2>/dev/null || true
     # Topology enrichment spec template for wv enrich-topology
     curl -sSL "$REPO/templates/TOPOLOGY-ENRICH.json.template" -o "$CONFIG_DIR/TOPOLOGY-ENRICH.json.template" 2>/dev/null || true
+    # Makefile template for wv-init-repo
+    curl -sSL "$REPO/templates/Makefile.template" -o "$CONFIG_DIR/Makefile.template" 2>/dev/null || true
 fi
 
 chmod +x "$INSTALL_DIR/wv"
@@ -511,6 +515,7 @@ WEAVE_PATTERNS=(
     ".weave/*.db-wal"
     ".weave/*.db-shm"
     "!.weave/state.sql"
+    "!.claude/settings.json"
 )
 if [ -f "$GITIGNORE" ]; then
     added=0
@@ -679,11 +684,11 @@ fi
 for AGENT in "${AGENTS[@]}"; do
 
 if [ "$AGENT" = "claude" ]; then
-    # Claude Code: hooks, skills, agents, CLAUDE.md, settings.local.json
+    # Claude Code: hooks, skills, agents, CLAUDE.md, settings.json, settings.local.json
     # Managed files (always overwritten in --update mode):
     #   hooks, skills, agents, copilot-instructions.md
     # User files (only overwritten with --force):
-    #   CLAUDE.md, settings.local.json
+    #   CLAUDE.md, settings.local.json (settings.json is managed/updated)
 
     # ── Hooks (managed — always update) ──
     mkdir -p "$REPO_ROOT/.claude/hooks"
@@ -764,17 +769,10 @@ AGENTSEOF
         echo -e "  ${YELLOW}⊘${NC} CLAUDE.md (user file, use --force to overwrite)"
     fi
 
-    # ── settings.local.json (user file — only create on init or with --force) ──
-    if [ ! -f "$REPO_ROOT/.claude/settings.local.json" ] || [ "$FORCE_MODE" = "1" ]; then
-        cat > "$REPO_ROOT/.claude/settings.local.json" << 'SETTINGSEOF'
+    # ── settings.json (managed file — hooks, updated on --update) ──
+    if [ ! -f "$REPO_ROOT/.claude/settings.json" ] || [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]; then
+        cat > "$REPO_ROOT/.claude/settings.json" << 'HOOKSJSONEOF'
 {
-  "permissions": {
-    "allow": [
-      "Bash(wv *)",
-      "Bash(git push:*)",
-      "Bash(gh issue *)"
-    ]
-  },
   "hooks": {
     "SessionStart": [
       {
@@ -795,9 +793,21 @@ AGENTSEOF
     ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|NotebookEdit|Bash",
+        "matcher": "Edit|Write|NotebookEdit|Bash|mcp__ide__executeCode",
         "hooks": [
           { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/pre-action.sh", "timeout": 10 }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/pre-claim-skills.sh", "timeout": 10 }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/pre-close-verification.sh", "timeout": 10 }
         ]
       }
     ],
@@ -809,14 +819,6 @@ AGENTSEOF
         ]
       }
     ],
-    "SessionEnd": [
-      {
-        "matcher": "",
-        "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-end-sync.sh" }
-        ]
-      }
-    ],
     "Stop": [
       {
         "matcher": "",
@@ -824,6 +826,32 @@ AGENTSEOF
           { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-check.sh" }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-end-sync.sh" }
+        ]
+      }
+    ]
+  }
+}
+HOOKSJSONEOF
+        echo -e "  ${GREEN}✓${NC} .claude/settings.json"
+    else
+        echo -e "  ${YELLOW}⊘${NC} .claude/settings.json (already exists, skipped)"
+    fi
+
+    # ── settings.local.json (user file — permissions only, not hooks) ──
+    if [ ! -f "$REPO_ROOT/.claude/settings.local.json" ] || [ "$FORCE_MODE" = "1" ]; then
+        cat > "$REPO_ROOT/.claude/settings.local.json" << 'SETTINGSEOF'
+{
+  "permissions": {
+    "allow": [
+      "Bash(wv *)",
+      "Bash(git push:*)",
+      "Bash(gh issue *)"
     ]
   }
 }
@@ -831,6 +859,25 @@ SETTINGSEOF
         echo -e "  ${GREEN}✓${NC} .claude/settings.local.json"
     else
         echo -e "  ${YELLOW}⊘${NC} .claude/settings.local.json (user file, use --force to overwrite)"
+    fi
+
+    # ── Makefile (create on init, append wv targets on --update if missing) ──
+    if [ -f "$CONFIG_DIR/Makefile.template" ]; then
+        if [ ! -f "$REPO_ROOT/Makefile" ]; then
+            cp "$CONFIG_DIR/Makefile.template" "$REPO_ROOT/Makefile"
+            echo -e "  ${GREEN}✓${NC} Makefile (wv targets)"
+        elif [ "$FORCE_MODE" = "1" ]; then
+            cp "$CONFIG_DIR/Makefile.template" "$REPO_ROOT/Makefile"
+            echo -e "  ${GREEN}✓${NC} Makefile (overwritten)"
+        elif [ "$UPDATE_MODE" = "1" ] && ! grep -q '^wv-status:' "$REPO_ROOT/Makefile"; then
+            echo "" >> "$REPO_ROOT/Makefile"
+            cat "$CONFIG_DIR/Makefile.template" >> "$REPO_ROOT/Makefile"
+            echo -e "  ${GREEN}✓${NC} Makefile (appended wv targets)"
+        elif grep -q '^wv-status:' "$REPO_ROOT/Makefile"; then
+            echo -e "  ${YELLOW}⊘${NC} Makefile (wv targets already present)"
+        else
+            echo -e "  ${YELLOW}⊘${NC} Makefile (exists, use --update to append wv targets)"
+        fi
     fi
 
 fi

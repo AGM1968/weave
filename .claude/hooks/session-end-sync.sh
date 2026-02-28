@@ -30,6 +30,9 @@ if ! git diff --cached --quiet 2>/dev/null; then
     git commit -m "chore(weave): auto-checkpoint $(date +%H:%M) [skip ci]" --no-verify 2>/dev/null || true
 fi
 
+# Push to remote (best effort — stop-check already validates clean state)
+git push 2>/dev/null || true
+
 # Log session end
 echo "[$(date -Iseconds)] Session ended: $REASON" >> .claude/session.log 2>/dev/null || true
 

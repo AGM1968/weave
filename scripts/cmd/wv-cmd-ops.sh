@@ -514,7 +514,12 @@ cmd_recover() {
                 ;;
         esac
 
-        # Clean completed ops from journal after successful recovery
+        # Mark recovered op as complete so journal_clean can remove it
+        _WV_CURRENT_OP_ID="$op_id"
+        _WV_CURRENT_OP_TYPE="$op"
+        journal_end
+
+        # Clean completed ops from journal
         journal_clean
         return 0
     fi
