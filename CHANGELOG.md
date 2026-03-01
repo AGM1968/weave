@@ -2,6 +2,23 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.12.0] - 2026-03-01
+
+### Fixed
+
+- **MCP `wv()` stderr capture** — switched from `execFileSync` to `spawnSync`. Quality tools no
+  longer return empty strings. Returns `stdout || stderr` (not concatenated) to preserve JSON
+  integrity.
+- **MCP quality `--json` flags** — all four quality handlers (scan, hotspots, diff, functions) now
+  pass `--json` for structured output instead of human-readable stderr text.
+- **Python < 3.10 compatibility** — `ast.Match` references in `python_parser.py` guarded with
+  `sys.version_info >= (3, 10)`. No more `AttributeError` on conda Python 3.9.
+- **Conda Python detection** — `wv-cmd-quality.sh` now checks `CONDA_PREFIX`/`CONDA_DEFAULT_ENV`
+  specifically (was `VIRTUAL_ENV` which also fires inside Poetry venvs). Only falls back to system
+  Python when conda's Python is actually < 3.10.
+- **install.sh MCP auto-rebuild** — detects existing MCP installation and rebuilds automatically on
+  `./install.sh`. No more stale MCP binaries after upstream source changes. Use `--no-mcp` to skip.
+
 ## [1.11.0] - 2026-03-01
 
 ### Added

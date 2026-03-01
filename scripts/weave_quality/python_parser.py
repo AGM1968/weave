@@ -15,6 +15,7 @@ import ast
 import logging
 import math
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -192,7 +193,7 @@ def _is_dispatch_function(
     stmt = body[0]
 
     # Match/case (Python 3.10+)
-    if isinstance(stmt, ast.Match):
+    if sys.version_info >= (3, 10) and isinstance(stmt, ast.Match):
         return True
 
     # Flat if/elif chain — no nested control flow in branches
@@ -202,10 +203,12 @@ def _is_dispatch_function(
     return False
 
 
-_CONTROL_FLOW = (
+_CONTROL_FLOW: tuple = (
     ast.If, ast.For, ast.While, ast.AsyncFor,
-    ast.Try, ast.Match, ast.With, ast.AsyncWith,
+    ast.Try, ast.With, ast.AsyncWith,
 )
+if sys.version_info >= (3, 10):
+    _CONTROL_FLOW = _CONTROL_FLOW + (ast.Match,)
 
 
 def _is_flat_if_chain(node: ast.If) -> bool:

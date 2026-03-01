@@ -30,7 +30,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, Tool } from "@modelcontextprotocol/sdk/types.js";
-import { execFileSync } from "child_process";
+import { execFileSync, spawnSync } from "child_process";
 import { accessSync, constants } from "fs";
 
 // --- Scope definitions ---
@@ -118,20 +118,26 @@ const WV_PATH = findWvPath();
 // Default timeout for wv commands (30s). Sync handlers override this.
 const WV_TIMEOUT = 30_000;
 
-// Execute wv command safely using execFileSync (no shell interpolation).
+// Execute wv command safely using spawnSync (no shell interpolation).
 // Args are passed as an array — user input never touches a shell.
+// Uses spawnSync to capture both stdout and stderr, since some wv subcommands
+// (e.g. quality scan, quality hotspots) write output to stderr.
 function wv(args: string[], timeout: number = WV_TIMEOUT): string {
-  try {
-    return execFileSync(WV_PATH, args, {
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024, // 10MB
-      timeout,
-      env: { ...process.env, WV_ACTIVE: process.env.WV_ACTIVE || "" },
-    }).trim();
-  } catch (error: unknown) {
-    const execError = error as { stderr?: string; message?: string };
-    throw new Error(execError.stderr || execError.message || "wv command failed");
+  const result = spawnSync(WV_PATH, args, {
+    encoding: "utf-8",
+    maxBuffer: 10 * 1024 * 1024, // 10MB
+    timeout,
+    env: { ...process.env, WV_ACTIVE: process.env.WV_ACTIVE || "" },
+  });
+  if (result.error) {
+    throw new Error(result.error.message || "wv command failed");
   }
+  if (result.status !== 0) {
+    throw new Error(result.stderr?.trim() || result.stdout?.trim() || `wv exited with code ${result.status}`);
+  }
+  // Prefer stdout (structured output, --json). Fall back to stderr for commands
+  // that write primary output there (legacy quality subcommands without --json).
+  return result.stdout?.trim() || result.stderr?.trim() || "";
 }
 
 // Tool definitions
@@ -1294,7 +1300,7 @@ function handleTool(
     case "weave_quality_scan": {
       const path = args.path as string | undefined;
       const exclude = args.exclude as string | undefined;
-      const cmd = ["quality", "scan"];
+      const cmd = ["quality", "scan", "--json"];
       if (path) cmd.push(path);
       if (exclude) cmd.push(`--exclude=${exclude}`);
       result = wv(cmd, 60_000); // scans can be slow on large repos
@@ -1305,7 +1311,7 @@ function handleTool(
       const path = args.path as string | undefined;
       const limit = args.limit as number | undefined;
       const threshold = args.threshold as number | undefined;
-      const cmd = ["quality", "hotspots"];
+      const cmd = ["quality", "hotspots", "--json"];
       if (path) cmd.push(path);
       if (limit) cmd.push(`--limit=${limit}`);
       if (threshold) cmd.push(`--threshold=${threshold}`);
@@ -1315,7 +1321,7 @@ function handleTool(
 
     case "weave_quality_diff": {
       const path = args.path as string | undefined;
-      const cmd = ["quality", "diff"];
+      const cmd = ["quality", "diff", "--json"];
       if (path) cmd.push(path);
       result = wv(cmd);
       break;
@@ -1324,7 +1330,7 @@ function handleTool(
     case "weave_quality_functions": {
       const path = args.path as string | undefined;
       const threshold = args.threshold as number | undefined;
-      const cmd = ["quality", "functions"];
+      const cmd = ["quality", "functions", "--json"];
       if (path) cmd.push(path);
       if (threshold !== undefined) cmd.push(`--threshold=${threshold}`);
       result = wv(cmd);
@@ -1346,7 +1352,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.11.0",
+      version: "1.12.0",
     },
     {
       capabilities: {

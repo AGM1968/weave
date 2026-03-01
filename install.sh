@@ -1280,6 +1280,7 @@ for arg in "$@"; do
     case "$arg" in
         --dev)              DEV_MODE=1 ;;
         --with-mcp)         WITH_MCP=1 ;;
+        --no-mcp)           WITH_MCP=0; NO_MCP_EXPLICIT=1 ;;
         --verify)           VERIFY=1 ;;
         --local-source=*)   LOCAL_SOURCE="${arg#*=}" ;;
         --uninstall)        action="uninstall" ;;
@@ -1293,6 +1294,14 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# Auto-detect existing MCP installation — rebuild it on every install
+# so upstream source changes (e.g. spawnSync fix) don't get stranded.
+if [ "$WITH_MCP" = "0" ] && [ "${NO_MCP_EXPLICIT:-0}" != "1" ] && [ -f "${HOME}/.local/lib/weave/mcp/dist/index.js" ]; then
+    WITH_MCP=1
+    echo -e "${YELLOW}Note: Existing MCP server detected, will rebuild automatically.${NC}"
+    echo "  (Use --no-mcp to skip. Use --with-mcp to silence this message.)"
+fi
 
 # If --local-source given, cd to that directory so relative paths work
 if [ -n "$LOCAL_SOURCE" ]; then
@@ -1312,6 +1321,7 @@ case "${action:-install}" in
         echo "  (none)             Install by copying files"
         echo "  --dev              Install by symlinking (for development)"
         echo "  --with-mcp         Also build and install the MCP server (requires Node.js)"
+        echo "  --no-mcp           Skip MCP rebuild even if already installed"
         echo "  --verify           Run wv selftest after install to verify"
         echo "  --local-source=DIR Install from DIR instead of current directory"
         echo "  --uninstall        Remove all installed files"

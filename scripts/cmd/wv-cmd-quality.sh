@@ -25,12 +25,16 @@ _wv_quality_python() {
         fi
     fi
 
-    # Bypass active virtualenv to avoid Poetry conflicts with system python
-    local _wv_python3
-    if [ -n "${VIRTUAL_ENV:-}" ] && [ -x /usr/bin/python3 ]; then
-        _wv_python3=/usr/bin/python3
-    else
-        _wv_python3=python3
+    # Bypass conda environments whose Python may be too old (< 3.10).
+    # VIRTUAL_ENV is set by both Poetry and conda — only escape conda.
+    # Only fall back to system Python if conda's Python is actually too old.
+    local _wv_python3=python3
+    if [ -n "${CONDA_PREFIX:-}" ] || [ -n "${CONDA_DEFAULT_ENV:-}" ]; then
+        if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
+            if [ -x /usr/bin/python3 ]; then
+                _wv_python3=/usr/bin/python3
+            fi
+        fi
     fi
 
     PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_quality "$@"
