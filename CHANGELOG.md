@@ -2,6 +2,20 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.11.0] - 2026-03-01
+
+### Added
+
+- **`weave_edit_guard` MCP tool** — zero-arg pre-edit gate returning `isError: true` when no active
+  Weave node exists. Closes the enforcement gap for VS Code Copilot and other MCP clients.
+- **Hardened `weave_preflight`** — now parses JSON output and returns `isError: true` for missing
+  nodes, contradictions, and unresolved blockers (was pass-through text).
+- **VS Code hook enforcement** — cross-environment path resolution (`${CLAUDE_PROJECT_DIR:-.}`) in
+  all hook commands. `wv-init-repo` enables `chat.hooks.enabled` in `.vscode/settings.json`.
+- **Expanded Makefile targets** — 10 wv targets (was 3): wv-status, wv-overview, wv-ready, wv-gate,
+  wv-health, wv-doctor, wv-sync, wv-push, wv-tree, wv-digest. Template updated to match.
+- **`wv help` additions** — `ship`, `recover`, and `preflight` commands now listed in help output.
+
 ## [1.10.0] - 2026-02-28
 
 ### Added

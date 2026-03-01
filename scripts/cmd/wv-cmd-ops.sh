@@ -1838,9 +1838,12 @@ Commands:
   add <text>        Add a node (returns ID) [--gh creates GitHub issue]
   delete <id>       Permanently remove a node + edges [--force] [--dry-run] [--no-gh]
   done <id>         Mark node complete [--learning="..."] [--no-warn] [auto-closes GH issue]
+  ship <id>         Done + sync + push in one step [--learning="..."] [--gh]
   batch-done        Close multiple nodes [--learning="..."] [--no-warn]
   bulk-update       Update multiple nodes from JSON on stdin [--dry-run]
   work <id>         Claim node & set WV_ACTIVE for subagent context [--quiet]
+  preflight <id>    Pre-action checks as JSON (blockers, contradictions, context load)
+  recover           Resume incomplete operations (ship/sync/delete) [--auto] [--json]
   ready             List unblocked work
   list              List nodes (excludes done by default)
   show <id>         Show node details
@@ -1911,7 +1914,10 @@ Examples:
   eval "\$(wv work wv-a1b2 --quiet)"          # claim and set WV_ACTIVE in one command
   wv context --json                           # uses WV_ACTIVE if set
   wv done wv-a1b2 --learning="pattern: always check X"
+  wv ship wv-a1b2 --learning="decision: ..."  # done + sync + push
   wv batch-done wv-a1b2 wv-c3d4 --learning="sprint complete"
+  wv preflight wv-a1b2                        # check blockers/contradictions
+  wv recover --auto                           # resume interrupted operations
   echo '[{"id":"wv-a1b2","alias":"my-task"},{"id":"wv-c3d4","status":"active"}]' | wv bulk-update
   wv update wv-a1b2 --metadata='{"priority":1}'  # merges, not replaces
   wv update wv-a1b2 --remove-key=old_field        # remove single key

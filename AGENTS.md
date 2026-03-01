@@ -54,7 +54,7 @@ For AI tools that support MCP (Model Context Protocol), a server is available:
 cd mcp && npm install && npm run build
 ```
 
-**Available MCP tools (30):**
+**Available MCP tools (31):**
 
 | Tool                      | Purpose                                                                |
 | ------------------------- | ---------------------------------------------------------------------- |
@@ -88,6 +88,7 @@ cd mcp && npm install && npm run build
 | `weave_quality_hotspots`  | Ranked hotspot report with ev, trend, ownership depth fields           |
 | `weave_quality_diff`      | Delta report vs previous scan with trend direction                     |
 | `weave_quality_functions` | Per-function CC report with dispatch tagging                           |
+| `weave_edit_guard`        | Pre-edit gate: returns error if no active node (call before any edit)  |
 
 Prefer compound tools (`weave_quick`, `weave_work`, `weave_ship`, `weave_overview`) over composing
 multiple basic tools — they reduce round-trips from 2-3 calls to 1.

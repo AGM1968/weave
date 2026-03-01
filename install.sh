@@ -778,8 +778,8 @@ AGENTSEOF
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/context-guard.sh" },
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start-context.sh" }
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/context-guard.sh" },
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-context.sh" }
         ]
       }
     ],
@@ -787,7 +787,7 @@ AGENTSEOF
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/pre-compact-context.sh" }
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-compact-context.sh" }
         ]
       }
     ],
@@ -795,19 +795,19 @@ AGENTSEOF
       {
         "matcher": "Edit|Write|NotebookEdit|Bash|mcp__ide__executeCode",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/pre-action.sh", "timeout": 10 }
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-action.sh", "timeout": 10 }
         ]
       },
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/pre-claim-skills.sh", "timeout": 10 }
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-claim-skills.sh", "timeout": 10 }
         ]
       },
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/pre-close-verification.sh", "timeout": 10 }
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-close-verification.sh", "timeout": 10 }
         ]
       }
     ],
@@ -815,7 +815,7 @@ AGENTSEOF
       {
         "matcher": "Edit|Write",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/post-edit-lint.sh", "timeout": 30 }
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-edit-lint.sh", "timeout": 30 }
         ]
       }
     ],
@@ -823,7 +823,7 @@ AGENTSEOF
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-check.sh" }
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-check.sh" }
         ]
       }
     ],
@@ -831,7 +831,7 @@ AGENTSEOF
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-end-sync.sh" }
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-end-sync.sh" }
         ]
       }
     ]
@@ -907,6 +907,26 @@ MCPEOF
         echo -e "  ${YELLOW}⊘${NC} .vscode/mcp.json (user file, use --force to overwrite)"
     fi
 
+    # ── .vscode/settings.json — enable hooks (merge, don't overwrite) ──
+    _VSCODE_SETTINGS="$REPO_ROOT/.vscode/settings.json"
+    if [ -f "$_VSCODE_SETTINGS" ]; then
+        # Merge: add chat.hooks.enabled if not already present
+        if ! grep -q '"chat.hooks.enabled"' "$_VSCODE_SETTINGS" 2>/dev/null; then
+            # Insert after opening brace
+            sed -i '1s/{/{\n  "chat.hooks.enabled": true,/' "$_VSCODE_SETTINGS"
+            echo -e "  ${GREEN}✓${NC} .vscode/settings.json (added chat.hooks.enabled)"
+        else
+            echo -e "  ${YELLOW}⊘${NC} .vscode/settings.json (chat.hooks.enabled already set)"
+        fi
+    else
+        cat > "$_VSCODE_SETTINGS" << 'VSETTINGSEOF'
+{
+  "chat.hooks.enabled": true
+}
+VSETTINGSEOF
+        echo -e "  ${GREEN}✓${NC} .vscode/settings.json (created with chat.hooks.enabled)"
+    fi
+
     # ── copilot-instructions.md (managed — always update) ──
     mkdir -p "$REPO_ROOT/.github"
     if [ ! -f "$REPO_ROOT/.github/copilot-instructions.md" ] || [ "$UPDATE_MODE" = "1" ]; then
@@ -914,8 +934,12 @@ MCPEOF
 # GitHub Copilot Instructions
 
 This repository uses the **Weave** graph-based workflow system. **Every code change must follow
-this workflow. No exceptions.** A git pre-commit hook enforces this -- commits are blocked if no
-Weave node is active.
+this workflow. No exceptions.** Enforcement is layered:
+
+1. **VS Code hooks** (`chat.hooks.enabled: true`) -- PreToolUse hooks fire before every tool call,
+   blocking edits when no active Weave node exists (deterministic, exit 2)
+2. **MCP edit guard** -- `weave_edit_guard` returns an error if no active node (advisory but visible)
+3. **Git pre-commit hook** -- blocks commits without an active node (last-resort safety net)
 
 ## Session Start (MANDATORY)
 
@@ -948,6 +972,22 @@ wv plan <file> --sprint=N --gh  # Import markdown plan as epic + tasks with GH i
 - Always run `wv context <id> --json` before complex work
 - Check learnings with `wv learnings --grep="<topic>"` for relevant prior decisions
 - For epics: use `wv plan <file> --sprint=N --gh` to import structured plans
+
+## BEFORE ANY FILE EDIT (mandatory gate)
+
+**Call `weave_edit_guard` (MCP) before every file modification.** This is the enforcement gate that
+ensures graph-first workflow. It returns an error if no active Weave node exists.
+
+If `weave_edit_guard` returns an error:
+1. STOP — do not edit any files
+2. Run `weave_overview` to see available work
+3. Claim work with `wv work <id>` or `wv add "<description>" --gh --status=active`
+4. Re-call `weave_edit_guard` to confirm — it should return OK
+5. Only then proceed with the file edit
+
+**Why this matters:** Without this gate, edits happen outside the graph and the audit trail is
+broken. The git pre-commit hook catches this at commit time, but by then the work is already done
+without tracking. This gate catches it at edit time.
 
 ## During Work
 
@@ -1029,6 +1069,7 @@ If your client supports MCP, prefer compound tools over CLI for multi-step opera
 | `weave_overview`   | `wv status` + `wv health` + `wv ready` | Session start        |
 | `weave_work`       | `wv work <id>` + `wv context <id>`     | Claiming tasks       |
 | `weave_ship`       | `wv ship <id>`                         | Completing tasks     |
+| `weave_edit_guard` | (no CLI equivalent)                    | **Pre-edit gate**    |
 | `weave_preflight`  | `wv preflight <id>`                    | Pre-action checks    |
 | `weave_quick`      | `wv add` + `wv done` + `wv sync`       | Trivial one-step     |
 | `weave_tree`       | `wv tree --json`                       | Epic hierarchy       |

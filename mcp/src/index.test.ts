@@ -121,17 +121,18 @@ describe("Weave MCP Server", () => {
   });
 
   describe("tools/list", () => {
-    it("should list all 30 tools (default scope=all)", async () => {
+    it("should list all 31 tools (default scope=all)", async () => {
       const response = await client.request("tools/list");
       expect(response.error).toBeUndefined();
 
       const tools = (response.result as { tools: { name: string }[] }).tools;
-      expect(tools).toHaveLength(30);
+      expect(tools).toHaveLength(31);
 
       const toolNames = tools.map((t) => t.name);
       expect(toolNames).toContain("weave_search");
       expect(toolNames).toContain("weave_add");
       expect(toolNames).toContain("weave_done");
+      expect(toolNames).toContain("weave_edit_guard");
       expect(toolNames).toContain("weave_batch_done");
       expect(toolNames).toContain("weave_context");
       expect(toolNames).toContain("weave_list");
@@ -397,6 +398,22 @@ describe("Weave MCP Server", () => {
       const result = response.result as { content: { text: string }[] };
       expect(result.content).toBeDefined();
     });
+
+    it("weave_edit_guard should return content", async () => {
+      const response = await client.request("tools/call", {
+        name: "weave_edit_guard",
+        arguments: {},
+      });
+
+      const result = response.result as {
+        content: { text: string }[];
+        isError?: boolean;
+      };
+      expect(result.content).toBeDefined();
+      expect(result.content[0].text).toBeDefined();
+      // With an active node (from the test env), should return OK or error — either is valid
+      // The key is it doesn't crash and returns structured output
+    });
   });
 });
 
@@ -478,9 +495,10 @@ describe("Weave MCP Server --scope=session", () => {
         "weave_close_session",
         "weave_breadcrumbs",
         "weave_plan",
+        "weave_edit_guard",
       ])
     );
-    expect(tools).toHaveLength(8);
+    expect(tools).toHaveLength(9);
   });
 });
 

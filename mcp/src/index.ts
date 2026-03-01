@@ -58,6 +58,7 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_close_session",
     "weave_breadcrumbs",
     "weave_plan",
+    "weave_edit_guard",
   ],
   inspect: [
     "weave_context",
@@ -431,6 +432,16 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "weave_edit_guard",
+    description:
+      "MANDATORY: Call this before ANY file edit. Returns OK if an active Weave node exists with no blockers or contradictions. Returns an error if no active node — you must claim work first. This is the MCP equivalent of the PreToolUse hook gate.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
     name: "weave_sync",
     description: "Persist graph to disk and optionally sync GitHub issues. Call periodically and before session end.",
     inputSchema: {
@@ -771,7 +782,10 @@ function getToolsForScope(scope: Scope, allTools: Tool[]): Tool[] {
 const SCOPED_TOOLS = getToolsForScope(ACTIVE_SCOPE, TOOLS);
 
 // Tool handlers
-function handleTool(name: string, args: Record<string, unknown>): { content: { type: "text"; text: string }[] } {
+function handleTool(
+  name: string,
+  args: Record<string, unknown>
+): { content: { type: "text"; text: string }[]; isError?: boolean } {
   let result: string;
 
   switch (name) {
@@ -969,7 +983,125 @@ function handleTool(name: string, args: Record<string, unknown>): { content: { t
 
     case "weave_preflight": {
       const id = args.id as string;
-      result = wv(["preflight", id]);
+      const preflightJson = wv(["preflight", id]);
+      // Parse preflight result and return isError for enforcement conditions
+      try {
+        const pf = JSON.parse(preflightJson);
+        if (!pf.node_exists) {
+          return {
+            content: [{ type: "text", text: `Error: Node ${id} not found. Run \`wv list\` to see available nodes.` }],
+            isError: true,
+          };
+        }
+        if (!pf.node_active) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Warning: Node ${id} is not active. Claim it first with \`wv work ${id}\` before editing files.`,
+              },
+            ],
+            isError: false,
+          };
+        }
+        if (Array.isArray(pf.contradictions) && pf.contradictions.length > 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: Contradictions detected on node ${id}:\n${pf.contradictions.join("\n")}\n\nResolve with \`wv resolve\` before proceeding.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (pf.has_blockers) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: Node ${id} has unresolved blockers. Complete blocking work first or run \`wv show ${id}\` to see blockers.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      } catch {
+        // JSON parse failed — fall through with raw output
+      }
+      result = preflightJson;
+      break;
+    }
+
+    case "weave_edit_guard": {
+      // Mirror pre-action.sh: check for active node, contradictions, blockers
+      // Returns isError:true if no active node — Copilot sees this as a blocking error
+      try {
+        const activeJson = wv(["list", "--status=active", "--json"]);
+        const activeNodes = JSON.parse(activeJson);
+        if (!Array.isArray(activeNodes) || activeNodes.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: [
+                  "ERROR: No active Weave node. You MUST claim work before editing files.",
+                  "",
+                  "Run one of:",
+                  "  wv work <id>                         — Claim an existing task",
+                  '  wv add "<description>" --gh --status=active  — Create + claim new task',
+                  "",
+                  "Use `wv ready` or weave_overview to find available work.",
+                ].join("\n"),
+              },
+            ],
+            isError: true,
+          };
+        }
+        // Active node exists — check for contradictions and blockers
+        const nodeId = activeNodes[0].id as string;
+        try {
+          const ctxJson = wv(["context", nodeId, "--json"]);
+          const ctx = JSON.parse(ctxJson);
+          if (Array.isArray(ctx.contradictions) && ctx.contradictions.length > 0) {
+            const contraList = ctx.contradictions
+              .map((c: { id: string; text: string }) => `  - ${c.id}: ${c.text}`)
+              .join("\n");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `ERROR: Contradictions detected on active node ${nodeId}:\n${contraList}\n\nResolve with \`wv resolve\` before editing files.`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          const unresolvedBlockers = Array.isArray(ctx.blockers)
+            ? ctx.blockers.filter((b: { status: string }) => b.status !== "done")
+            : [];
+          if (unresolvedBlockers.length > 0) {
+            const blockerList = unresolvedBlockers
+              .map((b: { id: string; text: string }) => `  - ${b.id}: ${b.text}`)
+              .join("\n");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `ERROR: Active node ${nodeId} has unresolved blockers:\n${blockerList}\n\nComplete blocking work first.`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        } catch {
+          // Context pack generation failed — warn but allow (graceful degradation)
+        }
+        result = `OK: Active node ${nodeId} — "${activeNodes[0].text}". Proceed with edit.`;
+      } catch {
+        // wv not available or DB not loaded — allow (graceful degradation)
+        result = "OK: Weave not available — edit guard skipped.";
+      }
       break;
     }
 
@@ -1214,7 +1346,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.10.0",
+      version: "1.11.0",
     },
     {
       capabilities: {

@@ -190,44 +190,46 @@ session with automatic invalidation on graph changes.
 
 ## MCP Server
 
-30 tools for IDE integration (VS Code Copilot, Claude Code):
+31 tools for IDE integration (VS Code Copilot, Claude Code):
 
-| MCP Tool                 | CLI Equivalent        | Description                           |
-| ------------------------ | --------------------- | ------------------------------------- |
-| `weave_overview`         | `wv status`           | Session start overview                |
-| `weave_work`             | `wv work`             | Claim node + return context           |
-| `weave_ship`             | `wv ship`             | Complete + sync in one step           |
-| `weave_quick`            | `wv quick`            | Create + close (trivial tasks)        |
-| `weave_add`              | `wv add`              | Create a new node                     |
-| `weave_done`             | `wv done`             | Mark complete with learnings          |
-| `weave_batch_done`       | `wv batch-done`       | Complete multiple nodes at once       |
-| `weave_update`           | `wv update`           | Modify node metadata/status/text      |
-| `weave_delete`           | `wv delete`           | Remove node permanently (force req.)  |
-| `weave_list`             | `wv list`             | List nodes with filters               |
-| `weave_show`             | `wv show`             | Single-node detail view (JSON)        |
-| `weave_search`           | `wv search`           | Full-text search                      |
-| `weave_context`          | `wv context`          | Context Pack for a node               |
-| `weave_link`             | `wv link`             | Create semantic edges                 |
-| `weave_tree`             | `wv tree`             | View hierarchy (supports `--mermaid`) |
-| `weave_learnings`        | `wv learnings`        | Query captured learnings              |
-| `weave_status`           | `wv status`           | Status summary                        |
-| `weave_health`           | `wv health`           | Graph health check                    |
-| `weave_preflight`        | `wv preflight`        | Pre-action checks for a node          |
-| `weave_sync`             | `wv sync`             | Persist graph + optional GH sync      |
-| `weave_resolve`          | `wv resolve`          | Resolve contradiction between nodes   |
-| `weave_breadcrumbs`      | `wv breadcrumbs`      | Save/show/clear session breadcrumbs   |
-| `weave_plan`             | `wv plan`             | Import markdown plan as epic+tasks    |
-| `weave_guide`            | `wv guide`            | Workflow quick reference              |
-| `weave_close_session`    | `wv sync --gh`        | End-of-session cleanup                |
-| `weave_quality_scan`     | `wv quality scan`     | Codebase quality metrics scan         |
-| `weave_quality_hotspots` | `wv quality hotspots` | Ranked hotspot report                 |
-| `weave_quality_diff`     | `wv quality diff`     | Delta report vs previous scan         |
+| MCP Tool                  | CLI Equivalent         | Description                           |
+| ------------------------- | ---------------------- | ------------------------------------- |
+| `weave_overview`          | `wv status`            | Session start overview                |
+| `weave_work`              | `wv work`              | Claim node + return context           |
+| `weave_ship`              | `wv ship`              | Complete + sync in one step           |
+| `weave_quick`             | `wv quick`             | Create + close (trivial tasks)        |
+| `weave_add`               | `wv add`               | Create a new node                     |
+| `weave_done`              | `wv done`              | Mark complete with learnings          |
+| `weave_batch_done`        | `wv batch-done`        | Complete multiple nodes at once       |
+| `weave_update`            | `wv update`            | Modify node metadata/status/text      |
+| `weave_delete`            | `wv delete`            | Remove node permanently (force req.)  |
+| `weave_list`              | `wv list`              | List nodes with filters               |
+| `weave_show`              | `wv show`              | Single-node detail view (JSON)        |
+| `weave_search`            | `wv search`            | Full-text search                      |
+| `weave_context`           | `wv context`           | Context Pack for a node               |
+| `weave_link`              | `wv link`              | Create semantic edges                 |
+| `weave_tree`              | `wv tree`              | View hierarchy (supports `--mermaid`) |
+| `weave_learnings`         | `wv learnings`         | Query captured learnings              |
+| `weave_status`            | `wv status`            | Status summary                        |
+| `weave_health`            | `wv health`            | Graph health check                    |
+| `weave_preflight`         | `wv preflight`         | Pre-action checks for a node          |
+| `weave_sync`              | `wv sync`              | Persist graph + optional GH sync      |
+| `weave_resolve`           | `wv resolve`           | Resolve contradiction between nodes   |
+| `weave_breadcrumbs`       | `wv breadcrumbs`       | Save/show/clear session breadcrumbs   |
+| `weave_plan`              | `wv plan`              | Import markdown plan as epic+tasks    |
+| `weave_guide`             | `wv guide`             | Workflow quick reference              |
+| `weave_close_session`     | `wv sync --gh`         | End-of-session cleanup                |
+| `weave_quality_scan`      | `wv quality scan`      | Codebase quality metrics scan         |
+| `weave_quality_hotspots`  | `wv quality hotspots`  | Ranked hotspot report                 |
+| `weave_quality_diff`      | `wv quality diff`      | Delta report vs previous scan         |
+| `weave_quality_functions` | `wv quality functions` | Per-function CC report                |
+| `weave_edit_guard`        | (pre-edit gate)        | Returns error if no active node       |
 
 Install: `./install.sh --with-mcp` or `./install-mcp.sh`
 
 Verify: `wv mcp-status`
 
-## Hook Determinism (v1.10.0)
+## Hook Determinism (v1.10.0+)
 
 Hooks enforce workflow rules deterministically — the AI agent cannot bypass structural constraints:
 
@@ -238,7 +240,10 @@ Hooks enforce workflow rules deterministically — the AI agent cannot bypass st
 - **PostToolUse guard** — Lint only runs after successful tool calls.
 - **Project-wide enforcement** — Hooks live in `.claude/settings.json` (checked-in), not
   `.claude/settings.local.json` (gitignored).
-- **Makefile bridge** — `wv-status`, `wv-gate`, `wv-sync` targets for CI integration.
+- **10 Makefile wv targets** — CI integration and discoverability.
+- **VS Code hook support (v1.11.0)** — Cross-environment path resolution
+  (`${CLAUDE_PROJECT_DIR:-.}`), `chat.hooks.enabled` auto-setup via `wv-init-repo`.
+- **MCP `weave_edit_guard` (v1.11.0)** — Pre-edit gate for VS Code Copilot and other MCP clients.
 
 ## Code Quality (v1.8.1)
 
@@ -292,7 +297,7 @@ Bidirectional sync between Weave nodes and GitHub issues:
 AI Agent (Copilot / Claude Code)
         |
         v
-   MCP Server (30 tools)  <-->  wv CLI
+   MCP Server (31 tools)  <-->  wv CLI
         |                          |
         v                          v
    SQLite on tmpfs           .weave/state.sql
