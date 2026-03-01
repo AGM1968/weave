@@ -483,7 +483,7 @@ def cmd_functions(args: argparse.Namespace) -> int:  # noqa: PLR0912
                     "path": fn.path,
                     "function": fn.function_name,
                     "cc": fn.complexity,
-                    "ev": getattr(fn, "essential", None),
+                    "ev": fn.essential_complexity,
                     "line_start": fn.line_start,
                     "line_end": fn.line_end,
                     "is_dispatch": fn.is_dispatch,
@@ -496,10 +496,10 @@ def cmd_functions(args: argparse.Namespace) -> int:  # noqa: PLR0912
         print(json.dumps(output, indent=2))
         return 0
 
-    # Text output
+    # Text output (stderr — stdout reserved for --json)
     header = f"Functions in {root} (CC threshold: {_CC_THRESHOLD}):"
-    print(header)
-    print()
+    print(header, file=sys.stderr)
+    print(file=sys.stderr)
 
     exceeds = [f for f in all_fns if f.complexity > _CC_THRESHOLD]
     exempt = [f for f in exceeds if f.is_dispatch]
@@ -512,19 +512,22 @@ def cmd_functions(args: argparse.Namespace) -> int:  # noqa: PLR0912
         ev_str = ""
         print(
             f"  {mark} {fn.function_name:<30} CC={int(fn.complexity):<5}"
-            f"{ev_str}  {line_range}{dispatch_tag}"
+            f"{ev_str}  {line_range}{dispatch_tag}",
+            file=sys.stderr,
         )
 
-    print()
+    print(file=sys.stderr)
     total = len(all_fns)
     n_flagged = len(flagged)
     n_exempt = len(exempt)
     exempt_note = f" ({n_exempt} dispatch-exempt)" if n_exempt else ""
-    print(f"  Summary: {n_flagged}/{total} functions exceed threshold{exempt_note}")
+    print(f"  Summary: {n_flagged}/{total} functions exceed threshold{exempt_note}",
+          file=sys.stderr)
 
     # Distribution
     hist_parts = [f"{label}:{count}" for label, count in zip(CC_HISTOGRAM_LABELS, hist)]
-    print(f"  Distribution: [{', '.join(hist_parts)}]  Gini={gini:.2f}")
+    print(f"  Distribution: [{', '.join(hist_parts)}]  Gini={gini:.2f}",
+          file=sys.stderr)
     return 0
 
 

@@ -83,6 +83,7 @@ class FunctionCC:
     line_start: int = 0
     line_end: int = 0
     complexity: float = 0.0
+    essential_complexity: float = 1.0
     is_dispatch: bool = False
 
     def to_eav_row(self) -> dict[str, Any]:
@@ -91,6 +92,7 @@ class FunctionCC:
             "line_start": self.line_start,
             "line_end": self.line_end,
             "is_dispatch": self.is_dispatch,
+            "essential_complexity": self.essential_complexity,
         })
         return {
             "path": self.path,

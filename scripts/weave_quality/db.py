@@ -434,6 +434,7 @@ def get_function_cc(conn: sqlite3.Connection, scan_id: int,
             complexity=float(d["value"]),
             line_start=detail.get("line_start", 0),
             line_end=detail.get("line_end", 0),
+            essential_complexity=detail.get("essential_complexity", 1.0),
             is_dispatch=detail.get("is_dispatch", False),
         ))
     return results

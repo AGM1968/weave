@@ -907,7 +907,7 @@ class TestCmdFunctions:
         result = cmd_functions(args)
         assert result == 0
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         fn_lines = [ln for ln in out.splitlines() if "\u2713" in ln or "\u2717" in ln]
         assert len(fn_lines) == 3
         assert "process" in fn_lines[0]
@@ -925,7 +925,7 @@ class TestCmdFunctions:
 
         args = _make_functions_args(str(tmp_path))
         cmd_functions(args)
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
 
         assert "\u2717 process" in out
         assert "\u2713 helper" in out
@@ -941,7 +941,7 @@ class TestCmdFunctions:
 
         args = _make_functions_args(str(tmp_path))
         cmd_functions(args)
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
 
         assert "[dispatch" in out
         for line in out.splitlines():
@@ -989,7 +989,7 @@ class TestCmdFunctions:
 
         args = _make_functions_args(str(tmp_path))
         cmd_functions(args)
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
 
         # process (CC=15, not dispatch) is the only non-exempt flagged function
         # dispatch_fn (CC=12, is_dispatch=True) is exempt

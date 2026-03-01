@@ -2,6 +2,20 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.12.1] - 2026-03-01
+
+### Fixed
+
+- **Quality scanner: match/case CC** — `match` statement arms now contribute +1 CC each (was 0).
+  Added `visit_match_case = _enter_branch` with Python 3.10 guard. (Issue 4)
+- **Quality scanner: ev data loss** — `essential_complexity` was dropped during FunctionDetail →
+  FunctionCC conversion. Added field to `FunctionCC`, fixed `to_eav_row()`, DB reconstruction, and
+  `cmd_functions` output. (Issue 6)
+- **Quality scanner: ast.parse exceptions** — broadened `except SyntaxError` to also catch
+  `ValueError` (null bytes) and `RecursionError` (deeply nested code). (Issue 10)
+- **Quality scanner: cmd_functions stderr** — text output now goes to stderr, consistent with
+  cmd_scan, cmd_hotspots, and cmd_diff. Keeps stdout clean for `--json`. (Issue 11)
+
 ## [1.12.0] - 2026-03-01
 
 ### Fixed

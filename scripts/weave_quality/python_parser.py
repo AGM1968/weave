@@ -17,7 +17,7 @@ import math
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Tuple
 
 from .models import ASTAnalysis, CKMetrics, FileEntry, FunctionCC, FunctionDetail
 
@@ -93,6 +93,11 @@ class _ComplexityVisitor(ast.NodeVisitor):
     visit_For = _enter_branch
     visit_While = _enter_branch
     visit_ExceptHandler = _enter_branch
+
+    # Python 3.10+: each match_case arm is a decision point (+1 CC),
+    # equivalent to elif in an if/elif chain.
+    if sys.version_info >= (3, 10):
+        visit_match_case = _enter_branch
 
     def visit_BoolOp(self, node: ast.BoolOp) -> None:  # noqa: N802  # pylint: disable=invalid-name
         """Count each and/or as a branch path."""
@@ -203,12 +208,12 @@ def _is_dispatch_function(
     return False
 
 
-_CONTROL_FLOW: tuple = (
+_control_flow: Tuple[type, ...] = (
     ast.If, ast.For, ast.While, ast.AsyncFor,
     ast.Try, ast.With, ast.AsyncWith,
 )
 if sys.version_info >= (3, 10):
-    _CONTROL_FLOW = _CONTROL_FLOW + (ast.Match,)
+    _control_flow = _control_flow + (ast.Match,)
 
 
 def _is_flat_if_chain(node: ast.If) -> bool:
@@ -227,7 +232,7 @@ def _is_flat_if_chain(node: ast.If) -> bool:
 
     for branch in branches:
         for stmt in branch:
-            if isinstance(stmt, _CONTROL_FLOW):
+            if isinstance(stmt, _control_flow):
                 return False
     return True
 
@@ -593,7 +598,7 @@ def _regex_analyze(source: str) -> dict[str, Any]:
 
 
 # Result type: (FileEntry, CKMetrics | None, list[FunctionCC])
-AnalysisResult = tuple[FileEntry, CKMetrics | None, list[FunctionCC]]
+AnalysisResult = Tuple[FileEntry, Optional[CKMetrics], list[FunctionCC]]
 
 
 def analyze_python_file(
@@ -647,6 +652,7 @@ def analyze_python_source(
                 line_start=f.line_start,
                 line_end=f.line_end,
                 complexity=f.complexity,
+                essential_complexity=f.essential_complexity,
                 is_dispatch=f.is_dispatch,
             )
             for f in analysis.functions
@@ -669,7 +675,7 @@ def analyze_python_source(
         )
         return entry, ck, fn_cc
 
-    except SyntaxError:
+    except (SyntaxError, ValueError, RecursionError):
         log.debug("ast.parse failed for %s, using regex fallback",
                   filepath)
 
