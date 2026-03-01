@@ -309,13 +309,14 @@ class _EssentialComplexityVisitor(ast.NodeVisitor):
         self._depth -= 1
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802
-        """Count bare-raise in except handler as non-reducible."""
-        # Check for bare raise in except
+        """Count bare-raise as non-reducible; track depth for return analysis."""
         for child in ast.walk(node):
             if isinstance(child, ast.Raise) and child.exc is None:
                 self._non_reducible += 1
                 break
+        self._depth += 1
         self.generic_visit(node)
+        self._depth -= 1
 
 
 def _ast_essential_complexity(
@@ -464,11 +465,11 @@ def _ast_ck_metrics(tree: ast.Module, path: str,
                     visitor.visit(item)
                     wmc += visitor.complexity
 
-    # DIT: depth of inheritance tree (max across all classes)
-    dit = 0
+    # direct_bases: max number of direct base classes across all classes
+    # (renamed from "dit" — len(bases) measures breadth, not depth)
+    direct_bases = 0
     for cls_node in classes:
-        depth = len(cls_node.bases)  # Direct base count (approximation)
-        dit = max(dit, depth)
+        direct_bases = max(direct_bases, len(cls_node.bases))
 
     # RFC: method definitions + Call nodes in all classes
     rfc = 0
@@ -488,7 +489,7 @@ def _ast_ck_metrics(tree: ast.Module, path: str,
         metrics={
             "wmc": float(wmc),
             "cbo": float(len(imports)),
-            "dit": float(dit),
+            "direct_bases": float(direct_bases),
             "rfc": float(rfc),
             "lcom": lcom,
             "noc": 0.0,  # Requires cross-file analysis

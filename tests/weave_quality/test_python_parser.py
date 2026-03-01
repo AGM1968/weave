@@ -200,7 +200,7 @@ class TestCKMetrics:
         assert ck is not None
         assert ck.metrics["cbo"] >= 3  # os, sys, pathlib
 
-    def test_dit_with_inheritance(self) -> None:
+    def test_direct_bases_with_inheritance(self) -> None:
         source = _src("""
             class Base:
                 pass
@@ -210,7 +210,7 @@ class TestCKMetrics:
         """)
         _, ck, _fn = analyze_python_source(source, "test.py")
         assert ck is not None
-        assert ck.metrics["dit"] >= 1
+        assert ck.metrics["direct_bases"] >= 1
 
 
 # ---------------------------------------------------------------------------

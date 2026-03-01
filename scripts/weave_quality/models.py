@@ -172,8 +172,8 @@ class CKMetrics:
     scan_id: int = 0
     metrics: dict[str, float] = field(default_factory=dict)
 
-    # Standard CK metric names
-    VALID_METRICS = {"wmc", "cbo", "dit", "rfc", "lcom", "noc"}
+    # Standard CK metric names (direct_bases replaces dit — see Issue 5)
+    VALID_METRICS = {"wmc", "cbo", "direct_bases", "dit", "rfc", "lcom", "noc"}
 
     def to_rows(self) -> list[dict[str, Any]]:
         """Convert to list of EAV row dicts for DB insertion."""

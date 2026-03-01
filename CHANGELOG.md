@@ -2,6 +2,18 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.12.2] - 2026-03-01
+
+### Fixed
+
+- **Quality scanner: DIT→direct_bases rename** — `len(cls.bases)` measures the number of direct base
+  classes (breadth), not inheritance chain depth. Metric renamed from `dit` to `direct_bases` for
+  semantic honesty. Old key retained in VALID_METRICS for backwards DB compatibility. (Issue 5)
+- **Quality scanner: ExceptHandler ev depth** — `visit_ExceptHandler` now increments depth in the
+  essential complexity visitor, so return statements inside `except` blocks register at a different
+  structural depth than returns in the `try` body. Fixes ev(G) under-counting for try/except
+  patterns. (Issue 8)
+
 ## [1.12.1] - 2026-03-01
 
 ### Fixed
