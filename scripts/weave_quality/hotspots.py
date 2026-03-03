@@ -182,35 +182,71 @@ def classify_hotspot(hotspot: float) -> str:
 # ---------------------------------------------------------------------------
 
 
-def compute_quality_score(entries: list[FileEntry],
-                          stats: list[GitStats]) -> int:
-    """Compute an overall quality score (0-100).
+def compute_quality_score(
+    entries: list[FileEntry],
+    stats: list[GitStats],
+    fn_cc_list: list[FunctionCC] | None = None,
+    scope: str = "production",
+) -> int:
+    """Compute quality score (0-100) using a graduated per-function model.
 
-    Score formula:
-      - Start at 100
-      - Deduct for each hotspot above threshold
-      - Deduct for each file above CC critical
-      - Deduct for each file above CC warning (smaller deduction)
+    Score components:
+      1. Per-function CC penalty — 0.5/point over CC=10, cap 8/fn
+      2. Essential complexity penalty — ev > 4 threshold, 0.5/point cap 3
+      3. Hotspot penalty — 5 points per file above hotspot threshold
+      4. Gini concentration penalty — 1 point per file with skewed CC dist
 
-    Clamped to [0, 100].
+    Scope filtering is applied to entries, stats, and fn_cc so the score
+    reflects only the requested file category.
+
+    No density normalization: penalties are applied at face value so that
+    repos with more absolute problems score lower, regardless of repo size.
     """
-    if not entries:
+    # Scope filter entries
+    scoped = [e for e in entries if _entry_in_scope(e, scope)]
+    if not scoped:
         return 100
+
+    scoped_paths = {e.path for e in scoped}
+    fns = [f for f in (fn_cc_list or []) if f.path in scoped_paths]
+    scoped_stats = [s for s in stats if s.path in scoped_paths]
 
     score = 100.0
 
-    # Hotspot deductions
-    hotspot_count = sum(1 for s in stats if s.hotspot > HOTSPOT_THRESHOLD)
-    score -= hotspot_count * 5  # 5 points per hotspot
+    # 1. Per-function CC penalty (dispatch-exempt)
+    for fn in fns:
+        if fn.is_dispatch:
+            continue
+        if fn.complexity > 10:
+            excess = fn.complexity - 10
+            score -= min(excess * 0.5, 8.0)
 
-    # Complexity deductions
-    for entry in entries:
-        if entry.complexity >= CC_CRITICAL:
-            score -= 3  # 3 points per critical file
-        elif entry.complexity >= CC_WARNING:
-            score -= 1  # 1 point per warning file
+    # 2. Essential complexity penalty (ev > 4 = McCabe "troublesome")
+    for entry in scoped:
+        if entry.essential_complexity > 4:
+            score -= min((entry.essential_complexity - 4) * 0.5, 3.0)
+
+    # 3. Hotspot penalty
+    for stat in scoped_stats:
+        if stat.hotspot > HOTSPOT_THRESHOLD:
+            score -= 5
+
+    # 4. Gini concentration penalty (per-file, threshold 0.7)
+    fns_by_path: dict[str, list[FunctionCC]] = {}
+    for fn in fns:
+        fns_by_path.setdefault(fn.path, []).append(fn)
+    for path_fns in fns_by_path.values():
+        if len(path_fns) >= 3 and cc_gini(path_fns) > 0.7:
+            score -= 1.0
 
     return max(0, min(100, int(round(score))))
+
+
+def _entry_in_scope(entry: FileEntry, scope: str) -> bool:
+    """Check if a FileEntry matches the requested scope."""
+    if scope == "all":
+        return True
+    return getattr(entry, "category", "production") == scope
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +256,7 @@ def compute_quality_score(entries: list[FileEntry],
 
 def hotspot_summary(entries: list[FileEntry],
                     stats: list[GitStats],
+                    fn_cc_list: list[FunctionCC] | None = None,
                     top_n: int = 10) -> dict[str, Any]:
     """Generate a hotspot summary report dict.
 
@@ -244,5 +281,5 @@ def hotspot_summary(entries: list[FileEntry],
         "hotspots": items,
         "total_files": len(entries),
         "hotspot_count": sum(1 for s in stats if s.hotspot > HOTSPOT_THRESHOLD),
-        "quality_score": compute_quality_score(entries, stats),
+        "quality_score": compute_quality_score(entries, stats, fn_cc_list),
     }

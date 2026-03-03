@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS files (
     functions   INTEGER,
     max_nesting INTEGER,
     avg_fn_len  REAL,
+    category    TEXT DEFAULT 'production',
     FOREIGN KEY(scan_id) REFERENCES scan_meta(id) ON DELETE CASCADE,
     PRIMARY KEY(path, scan_id)
 );
@@ -185,6 +186,21 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    """Idempotent v3 schema migration: add category column to files table.
+
+    Adds category TEXT DEFAULT 'production' to files. Safe to run on
+    v1, v2, or v3 DBs.
+    """
+    cols = {r[1] for r in conn.execute(
+        "PRAGMA table_info(files)").fetchall()}
+    if "category" not in cols:
+        conn.execute(
+            "ALTER TABLE files "
+            "ADD COLUMN category TEXT DEFAULT 'production'")
+    conn.commit()
+
+
 def init_db(hot_zone: str | None = None) -> sqlite3.Connection:
     """Initialise quality.db, creating schema if needed.
 
@@ -197,6 +213,7 @@ def init_db(hot_zone: str | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
     _migrate_v2(conn)
+    _migrate_v3(conn)
     log.debug("quality.db initialised at %s", resolved)
     return conn
 
@@ -316,10 +333,10 @@ def upsert_file_entry(conn: sqlite3.Connection, entry: FileEntry) -> None:
     conn.execute(
         """INSERT INTO files (path, scan_id, language, loc,
             complexity, functions, max_nesting, avg_fn_len,
-            essential_complexity, indent_sd)
+            essential_complexity, indent_sd, category)
         VALUES (:path, :scan_id, :language, :loc,
             :complexity, :functions, :max_nesting, :avg_fn_len,
-            :essential_complexity, :indent_sd)
+            :essential_complexity, :indent_sd, :category)
         ON CONFLICT(path, scan_id) DO UPDATE SET
             language=excluded.language, loc=excluded.loc,
             complexity=excluded.complexity,
@@ -327,7 +344,8 @@ def upsert_file_entry(conn: sqlite3.Connection, entry: FileEntry) -> None:
             max_nesting=excluded.max_nesting,
             avg_fn_len=excluded.avg_fn_len,
             essential_complexity=excluded.essential_complexity,
-            indent_sd=excluded.indent_sd
+            indent_sd=excluded.indent_sd,
+            category=excluded.category
         """,
         d,
     )
@@ -422,6 +440,22 @@ def get_function_cc(conn: sqlite3.Connection, scan_id: int,
         WHERE scan_id = ? AND path = ? AND metric LIKE 'fn_cc:%'""",
         (scan_id, path),
     ).fetchall()
+    return _rows_to_function_cc(rows)
+
+
+def get_all_function_cc(conn: sqlite3.Connection,
+                        scan_id: int) -> list[FunctionCC]:
+    """Get all per-function CC entries for a scan (all files)."""
+    rows = conn.execute(
+        """SELECT * FROM file_metrics
+        WHERE scan_id = ? AND metric LIKE 'fn_cc:%'""",
+        (scan_id,),
+    ).fetchall()
+    return _rows_to_function_cc(rows)
+
+
+def _rows_to_function_cc(rows: list[Any]) -> list[FunctionCC]:
+    """Convert DB rows to FunctionCC objects."""
     results: list[FunctionCC] = []
     for r in rows:
         d = dict(r)

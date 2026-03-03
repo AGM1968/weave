@@ -9,7 +9,9 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import sqlite3
+import subprocess
 from collections.abc import Generator
 from pathlib import Path
 from unittest.mock import patch
@@ -24,6 +26,7 @@ from weave_quality.__main__ import (
     cmd_health_info,
     cmd_hotspots,
     cmd_promote,
+    cmd_scan,
 )
 from weave_quality.db import (
     begin_scan,
@@ -31,7 +34,9 @@ from weave_quality.db import (
     bulk_upsert_function_cc,
     bulk_upsert_git_stats,
     finish_scan,
+    get_file_entries,
     init_db,
+    latest_scan,
 )
 from weave_quality.hotspots import compute_hotspots
 from weave_quality.models import FileEntry, FunctionCC, GitStats
@@ -107,6 +112,7 @@ class TestCmdHotspots:
             hot_zone=str(tmp_path / "nonexistent"),
             top=10,
             json=False,
+            scope="production",
         )
         result = cmd_hotspots(args)
         assert result == 1
@@ -118,6 +124,7 @@ class TestCmdHotspots:
             hot_zone=str(tmp_path),
             top=10,
             json=False,
+            scope="production",
         )
         result = cmd_hotspots(args)
         assert result == 1
@@ -143,6 +150,7 @@ class TestCmdHotspots:
             hot_zone=str(tmp_path),
             top=10,
             json=False,
+            scope="production",
         )
         result = cmd_hotspots(args)
         assert result == 0
@@ -170,6 +178,7 @@ class TestCmdHotspots:
             hot_zone=str(tmp_path),
             top=10,
             json=True,
+            scope="production",
         )
         result = cmd_hotspots(args)
         assert result == 0
@@ -206,6 +215,7 @@ class TestCmdHotspots:
             hot_zone=str(tmp_path),
             top=1,
             json=True,
+            scope="production",
         )
         result = cmd_hotspots(args)
         assert result == 0
@@ -224,6 +234,7 @@ class TestCmdDiff:
         args = argparse.Namespace(
             hot_zone=str(tmp_path / "nonexistent"),
             json=False,
+            scope="production",
         )
         result = cmd_diff(args)
         assert result == 1
@@ -240,6 +251,7 @@ class TestCmdDiff:
         args = argparse.Namespace(
             hot_zone=str(tmp_path),
             json=False,
+            scope="production",
         )
         result = cmd_diff(args)
         assert result == 0
@@ -258,6 +270,7 @@ class TestCmdDiff:
         args = argparse.Namespace(
             hot_zone=str(tmp_path),
             json=True,
+            scope="production",
         )
         result = cmd_diff(args)
         assert result == 0
@@ -287,6 +300,7 @@ class TestCmdDiff:
         args = argparse.Namespace(
             hot_zone=str(tmp_path),
             json=True,
+            scope="production",
         )
         result = cmd_diff(args)
         assert result == 0
@@ -318,6 +332,7 @@ class TestCmdDiff:
         args = argparse.Namespace(
             hot_zone=str(tmp_path),
             json=True,
+            scope="production",
         )
         result = cmd_diff(args)
         assert result == 0
@@ -348,6 +363,7 @@ class TestCmdDiff:
         args = argparse.Namespace(
             hot_zone=str(tmp_path),
             json=True,
+            scope="production",
         )
         result = cmd_diff(args)
         assert result == 0
@@ -381,6 +397,7 @@ class TestCmdDiff:
         args = argparse.Namespace(
             hot_zone=str(tmp_path),
             json=True,
+            scope="production",
         )
         result = cmd_diff(args)
         assert result == 0
@@ -413,6 +430,7 @@ class TestCmdDiff:
         args = argparse.Namespace(
             hot_zone=str(tmp_path),
             json=True,
+            scope="production",
         )
         result = cmd_diff(args)
         assert result == 0
@@ -441,6 +459,7 @@ class TestCmdDiff:
         args = argparse.Namespace(
             hot_zone=str(tmp_path),
             json=True,
+            scope="production",
         )
         result = cmd_diff(args)
         assert result == 0
@@ -995,3 +1014,109 @@ class TestCmdFunctions:
         # dispatch_fn (CC=12, is_dispatch=True) is exempt
         assert "1/3 functions exceed threshold" in out
         assert "dispatch-exempt" in out
+
+
+# ---------------------------------------------------------------------------
+# Tests: cmd_scan — category population
+# ---------------------------------------------------------------------------
+
+
+def _make_scan_args(hot_zone: str, path: str | None = None) -> argparse.Namespace:
+    return argparse.Namespace(
+        hot_zone=hot_zone,
+        path=path,
+        json=False,
+        exclude=[],
+    )
+
+
+class TestCmdScanCategory:
+    """Verify that cmd_scan() populates FileEntry.category via classify_file()."""
+
+    def _build_repo(self, tmp_path: Path) -> Path:
+        """Create a minimal git repo with files in different directories."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        # Initialise git repo (needed for git ls-files / rev-parse)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", "init"],
+            cwd=repo, check=True,
+            env={**os.environ,
+                 "GIT_AUTHOR_NAME": "t",
+                 "GIT_AUTHOR_EMAIL": "t@t",
+                 "GIT_COMMITTER_NAME": "t",
+                 "GIT_COMMITTER_EMAIL": "t@t"},
+        )
+
+        # tests/test_foo.py  -> category='test'
+        (repo / "tests").mkdir()
+        (repo / "tests" / "test_foo.py").write_text("x = 1\n")
+
+        # scripts/run.sh     -> category='script'
+        (repo / "scripts").mkdir()
+        (repo / "scripts" / "run.sh").write_text("#!/bin/bash\necho hi\n")
+
+        # src/app.py         -> category='production'
+        (repo / "src").mkdir()
+        (repo / "src" / "app.py").write_text("def main(): pass\n")
+
+        return repo
+
+    def test_test_files_get_test_category(self, tmp_path: Path) -> None:
+        """Files under tests/ directory get category='test' after scan."""
+        repo = self._build_repo(tmp_path)
+        args = _make_scan_args(str(tmp_path), path=str(repo))
+
+        result = cmd_scan(args)
+        assert result == 0
+
+        conn = init_db(hot_zone=str(tmp_path))
+        scan = latest_scan(conn)
+        assert scan is not None
+        entries = get_file_entries(conn, scan.id)
+        conn.close()
+
+        by_path = {e.path: e for e in entries}
+        test_entry = by_path.get("tests/test_foo.py")
+        assert test_entry is not None, "tests/test_foo.py not found in scan"
+        assert test_entry.category == "test"
+
+    def test_script_files_get_script_category(self, tmp_path: Path) -> None:
+        """Files under scripts/ directory get category='script' after scan."""
+        repo = self._build_repo(tmp_path)
+        args = _make_scan_args(str(tmp_path), path=str(repo))
+
+        result = cmd_scan(args)
+        assert result == 0
+
+        conn = init_db(hot_zone=str(tmp_path))
+        scan = latest_scan(conn)
+        assert scan is not None
+        entries = get_file_entries(conn, scan.id)
+        conn.close()
+
+        by_path = {e.path: e for e in entries}
+        script_entry = by_path.get("scripts/run.sh")
+        assert script_entry is not None, "scripts/run.sh not found in scan"
+        assert script_entry.category == "script"
+
+    def test_plain_python_gets_production_category(self, tmp_path: Path) -> None:
+        """Plain .py files outside test/script dirs get category='production'."""
+        repo = self._build_repo(tmp_path)
+        args = _make_scan_args(str(tmp_path), path=str(repo))
+
+        result = cmd_scan(args)
+        assert result == 0
+
+        conn = init_db(hot_zone=str(tmp_path))
+        scan = latest_scan(conn)
+        assert scan is not None
+        entries = get_file_entries(conn, scan.id)
+        conn.close()
+
+        by_path = {e.path: e for e in entries}
+        prod_entry = by_path.get("src/app.py")
+        assert prod_entry is not None, "src/app.py not found in scan"
+        assert prod_entry.category == "production"

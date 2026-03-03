@@ -750,3 +750,97 @@ class TestGetAllTrendDirections:
         assert result["rising.py"] == "deteriorating"
         assert result["falling.py"] == "refactored"
         assert result["flat.py"] == "stable"
+
+
+# ---------------------------------------------------------------------------
+# Schema v3 migration (category column)
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaV3:
+    def test_new_db_has_category_column(
+        self, db: sqlite3.Connection,
+    ) -> None:
+        """A freshly initialised DB has a category column in files."""
+        cols = {r[1] for r in db.execute(
+            "PRAGMA table_info(files)").fetchall()}
+        assert "category" in cols
+
+    def test_category_default_is_production(
+        self, db: sqlite3.Connection,
+    ) -> None:
+        """Inserting a file entry without specifying category gives 'production'."""
+        sid = begin_scan(db, "abc123")
+        upsert_file_entry(db, FileEntry(path="src/a.py", scan_id=sid, loc=10))
+        db.commit()
+        row = db.execute(
+            "SELECT category FROM files WHERE path = ? AND scan_id = ?",
+            ("src/a.py", sid),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "production"
+
+    def test_category_roundtrip(
+        self, db: sqlite3.Connection,
+    ) -> None:
+        """category value set on FileEntry survives upsert and get."""
+        sid = begin_scan(db, "abc123")
+        entry = FileEntry(
+            path="tests/test_foo.py", scan_id=sid,
+            loc=50, category="test",
+        )
+        upsert_file_entry(db, entry)
+        db.commit()
+        results = get_file_entries(db, sid, path="tests/test_foo.py")
+        assert len(results) == 1
+        assert results[0].category == "test"
+
+    def test_migration_adds_column_to_existing_db(
+        self, tmp_path: Path,
+    ) -> None:
+        """Running init_db on a DB that lacks category column adds it."""
+        # Bootstrap a DB without category (simulate pre-v3 DB).
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript("""
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE IF NOT EXISTS scan_meta (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scanned_at TEXT NOT NULL,
+                git_head TEXT NOT NULL,
+                files_count INTEGER,
+                duration_ms INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS files (
+                path TEXT NOT NULL,
+                scan_id INTEGER NOT NULL,
+                language TEXT,
+                loc INTEGER,
+                complexity REAL,
+                functions INTEGER,
+                max_nesting INTEGER,
+                avg_fn_len REAL,
+                PRIMARY KEY(path, scan_id)
+            );
+        """)
+        raw.commit()
+        raw.close()
+
+        # Now run init_db which should apply _migrate_v3
+        conn = init_db(hot_zone=str(tmp_path))
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(files)").fetchall()}
+        conn.close()
+        assert "category" in cols
+
+    def test_migration_idempotent(
+        self, tmp_path: Path,
+    ) -> None:
+        """Running init_db twice on the same DB doesn't raise an error."""
+        conn1 = init_db(hot_zone=str(tmp_path))
+        conn1.close()
+        conn2 = init_db(hot_zone=str(tmp_path))
+        cols = {r[1] for r in conn2.execute(
+            "PRAGMA table_info(files)").fetchall()}
+        conn2.close()
+        assert "category" in cols

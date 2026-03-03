@@ -35,6 +35,7 @@ class FileEntry:
     avg_fn_len: float = 0.0       # Average lines per function
     essential_complexity: float = 0.0  # ev(G): 1 = fully structured
     indent_sd: float = 0.0            # stddev of indentation levels
+    category: str = "production"       # File category (e.g. production, test, generated)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a flat dict suitable for DB insertion."""
@@ -49,6 +50,7 @@ class FileEntry:
             "avg_fn_len": self.avg_fn_len,
             "essential_complexity": self.essential_complexity,
             "indent_sd": self.indent_sd,
+            "category": self.category,
         }
 
     @classmethod
@@ -66,6 +68,7 @@ class FileEntry:
             essential_complexity=float(
                 d.get("essential_complexity", 0)),
             indent_sd=float(d.get("indent_sd", 0)),
+            category=d.get("category", "production"),
         )
 
 

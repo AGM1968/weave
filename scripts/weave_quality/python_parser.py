@@ -77,10 +77,18 @@ def _indent_sd(lines: list[str], indent_width: int = _PYTHON_INDENT_WIDTH) -> fl
 class _ComplexityVisitor(ast.NodeVisitor):
     """Walk AST to compute cyclomatic complexity and nesting depth."""
 
-    def __init__(self) -> None:
+    def __init__(self, per_function: bool = False) -> None:
         self.complexity = 1  # Base complexity
         self._depth = 0
         self.max_nesting = 0
+        self._per_function = per_function
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802  # pylint: disable=invalid-name
+        """Stop recursion at nested function boundaries in per_function mode."""
+        if not self._per_function:
+            self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
     def _enter_branch(self, node: ast.AST) -> None:
         self.complexity += 1
@@ -162,8 +170,9 @@ def _ast_per_function_cc(
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        visitor = _ComplexityVisitor()
-        visitor.visit(node)
+        visitor = _ComplexityVisitor(per_function=True)
+        for child in ast.iter_child_nodes(node):
+            visitor.visit(child)
         line_end = getattr(node, "end_lineno", node.lineno) or node.lineno
         results.append(FunctionCC(
             path=path,
@@ -386,8 +395,9 @@ def _single_pass_ast(tree: ast.Module) -> ASTAnalysis:
     # Per-function CC + EV
     functions: list[FunctionDetail] = []
     for fn_node in func_nodes:
-        cc_visitor = _ComplexityVisitor()
-        cc_visitor.visit(fn_node)
+        cc_visitor = _ComplexityVisitor(per_function=True)
+        for child in ast.iter_child_nodes(fn_node):
+            cc_visitor.visit(child)
 
         ev_visitor = _EssentialComplexityVisitor()
         for child in ast.iter_child_nodes(fn_node):
@@ -461,8 +471,9 @@ def _ast_ck_metrics(tree: ast.Module, path: str,
         for cls_node in classes:
             for item in ast.walk(cls_node):
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    visitor = _ComplexityVisitor()
-                    visitor.visit(item)
+                    visitor = _ComplexityVisitor(per_function=True)
+                    for child in ast.iter_child_nodes(item):
+                        visitor.visit(child)
                     wmc += visitor.complexity
 
     # direct_bases: max number of direct base classes across all classes

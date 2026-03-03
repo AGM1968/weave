@@ -37,7 +37,7 @@ class TestFileEntry:
         assert set(d.keys()) == {
             "path", "scan_id", "language", "loc", "complexity",
             "functions", "max_nesting", "avg_fn_len",
-            "essential_complexity", "indent_sd",
+            "essential_complexity", "indent_sd", "category",
         }
         assert d["path"] == "src/main.py"
         assert d["scan_id"] == 1

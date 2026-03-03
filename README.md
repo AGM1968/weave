@@ -251,7 +251,8 @@ Built-in code quality analysis with zero dependencies beyond Python stdlib and g
 
 ```bash
 wv quality scan                         # Scan repo for complexity + churn metrics
-wv quality hotspots --top=5             # Top hotspot files with ev, trend, ownership
+wv quality hotspots --top=5             # Top hotspot files (production scope by default)
+wv quality hotspots --scope=all         # Include test + script files
 wv quality diff                         # Compare current vs previous scan with trend arrows
 wv quality functions src/myfile.py      # Per-function CC with dispatch tagging
 wv quality promote --top=3              # Create Weave nodes from top findings
@@ -262,6 +263,14 @@ fully rebuildable from source. Integrated into the existing workflow:
 
 - **`wv health`** shows scan score and hotspot count
 - **`wv context`** enriches Context Packs with hotspot data for touched files
+- **Production scope by default** — the quality score and hotspot report reflect `production` files
+  only. Test files, scripts, and generated output are classified automatically by path heuristics
+  (`tests/`, `test_*.py`, `scripts/`, `dist/`) and excluded from scoring. Use `--scope=all` to
+  include everything. Override classification per-project via `.weave/quality.conf`:
+  ```ini
+  [classify]
+  production = scripts/mylib/   # promote library code living under scripts/
+  ```
 - **Hotspot scoring** uses `normalize(complexity) x normalize(churn)` — files that are both complex
   and frequently changed surface first
 - **Per-function CC** — `wv quality functions` lists every function with CC, line range, and a

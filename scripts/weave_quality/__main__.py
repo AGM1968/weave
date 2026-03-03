@@ -16,6 +16,7 @@ Invoked by the Bash wrapper: wv-cmd-quality.sh
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import logging
@@ -27,6 +28,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from weave_quality.bash_heuristic import analyze_bash_file, detect_bash
+from weave_quality.classification import classify_file, load_classify_overrides
 from weave_quality.db import (
     begin_scan,
     bulk_upsert_co_changes,
@@ -44,6 +46,7 @@ from weave_quality.db import (
     latest_scan,
     previous_scan,
     reset_db,
+    get_all_function_cc,
     get_function_cc,
     staleness_info,
     top_hotspots,
@@ -185,6 +188,48 @@ def _discover_files(repo: str, exclude_globs: list[str] | None = None) -> list[s
 
 
 # ---------------------------------------------------------------------------
+# Scope filter
+# ---------------------------------------------------------------------------
+
+
+def _in_scope(entry: FileEntry, scope: str) -> bool:
+    """Return True if entry falls within the given scope.
+
+    Args:
+        entry: A FileEntry with a ``category`` attribute (e.g. "production").
+        scope: Target scope string. Pass ``"all"`` to include every category.
+
+    Returns:
+        True when ``scope == "all"`` or ``entry.category == scope``.
+    """
+    return scope in ("all", entry.category)
+
+
+def _in_scope_path(
+    path: str,
+    scope: str,
+    overrides: dict[str, list[str]] | None = None,
+) -> bool:
+    """Return True if a file path falls within the given scope.
+
+    Classifies ``path`` via :func:`~weave_quality.classification.classify_file`
+    and delegates to :func:`_in_scope`.
+
+    Args:
+        path: Relative path from the repo root (e.g. ``src/app.py``).
+        scope: Target scope string. Pass ``"all"`` to include every category.
+        overrides: Optional classification overrides dict (see
+            :func:`~weave_quality.classification.load_classify_overrides`).
+
+    Returns:
+        True when the classified category matches ``scope``, or scope is ``"all"``.
+    """
+    category = classify_file(path, overrides)
+    entry = FileEntry(path=path, category=category)
+    return _in_scope(entry, scope)
+
+
+# ---------------------------------------------------------------------------
 # Scan command
 # ---------------------------------------------------------------------------
 
@@ -231,6 +276,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
         else:
             files_unchanged.append(rel_path)
 
+    # Load classification overrides once (reads .weave/quality.conf [classify])
+    classify_overrides = load_classify_overrides(repo)
+
     # Parse changed files
     entries: list[FileEntry] = []
     ck_metrics_list = []
@@ -254,6 +302,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 avg_fn_len=entry.avg_fn_len,
                 essential_complexity=entry.essential_complexity,
                 indent_sd=entry.indent_sd,
+                category=classify_file(rel_path, classify_overrides),
             )
             entries.append(entry)
             if ck is not None:
@@ -277,6 +326,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 max_nesting=entry.max_nesting,
                 avg_fn_len=entry.avg_fn_len,
                 indent_sd=entry.indent_sd,
+                category=classify_file(rel_path, classify_overrides),
             )
             entries.append(entry)
 
@@ -311,6 +361,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     essential_complexity=(
                         prev_e.essential_complexity),
                     indent_sd=prev_e.indent_sd,
+                    category=classify_file(
+                        prev_e.path, classify_overrides),
                 ))
         if carried:
             bulk_upsert_file_entries(conn, carried)
@@ -343,7 +395,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
         upsert_file_state(conn, fs)
 
     # Git metrics (computed globally, not scan-versioned)
-    git_stats = enrich_all_git_stats(repo, [e.path for e in entries] + files_unchanged)
+    # Deduplicate paths: entries already includes carried-forward files
+    # (same paths as files_unchanged), so concatenating both would double-count
+    # hotspot penalties for unchanged production files.
+    _all_paths = list(dict.fromkeys([e.path for e in entries] + files_unchanged))
+    git_stats = enrich_all_git_stats(repo, _all_paths)
     co_changes = compute_co_changes(repo)
 
     # Compute hotspots
@@ -355,6 +411,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
     bulk_upsert_git_stats(conn, git_stats)
     bulk_upsert_co_changes(conn, co_changes)
 
+    # Reload complete fn_cc for this scan — newly-analyzed + carried-forward
+    # (all_fn_cc only contains fn_cc for files analyzed this run; unchanged
+    # files had their metrics carried forward in the DB above)
+    all_fn_cc = get_all_function_cc(conn, scan_id)
+
     # Finish scan
     duration_ms = int((time.monotonic() - start_time) * 1000)
     finish_scan(conn, scan_id, len(entries) + len(files_unchanged), duration_ms)
@@ -363,16 +424,18 @@ def cmd_scan(args: argparse.Namespace) -> int:
     conn.commit()
     conn.close()
 
-    # Generate summary
-    summary = hotspot_summary(all_scanned_entries, git_stats)
+    # Generate summary (pass fn_cc for per-function scoring)
+    summary = hotspot_summary(all_scanned_entries, git_stats, all_fn_cc)
 
     if json_output:
+        category_counts = dict(Counter(e.category for e in all_scanned_entries))
         output = {
             "scan_id": scan_id,
             "git_head": head,
             "files_scanned": len(entries) + len(files_unchanged),
             "files_changed": len(files_to_scan),
             "languages": lang_counts,
+            "category_counts": category_counts,
             "duration_ms": duration_ms,
             "hotspots_above_threshold": summary.get("hotspot_count", 0),
             "quality_score": summary.get("quality_score", 100),
@@ -559,7 +622,16 @@ def cmd_hotspots(args: argparse.Namespace) -> int:
 
     # Fetch file entries for the latest scan (for complexity info)
     entries = get_file_entries(conn, scan.id)
+    scope: str = args.scope
+    entries = [e for e in entries if _in_scope(e, scope)]
     entry_by_path = {e.path: e for e in entries}
+
+    # Filter ranked hotspots to only paths that are in scope.
+    # When scope="all", every path passes through (including paths with no file entry).
+    # For any other scope, restrict to paths present in the scoped entry set.
+    if scope != "all":
+        scoped_paths = set(entry_by_path.keys())
+        ranked = [gs for gs in ranked if gs.path in scoped_paths]
 
     # Trend directions from complexity_trend history
     trend_dirs = get_all_trend_directions(conn)
@@ -597,6 +669,7 @@ def cmd_hotspots(args: argparse.Namespace) -> int:
             "stale": stale.get("stale", False),
             "scan_id": scan.id,
             "git_head": scan.git_head,
+            "scope": scope,
             "hotspots": items,
         }
         if stale.get("stale"):
@@ -683,6 +756,11 @@ def cmd_diff(args: argparse.Namespace) -> int:
     # Get file entries for both scans
     current_entries = get_file_entries(conn, current.id)
     prev_entries = get_file_entries(conn, prev.id)
+    scope: str = args.scope
+
+    # Get per-function CC for scoring
+    cur_fn_cc = get_all_function_cc(conn, current.id)
+    prev_fn_cc = get_all_function_cc(conn, prev.id)
 
     # Get git stats for quality score calculation
     all_git_stats = get_git_stats(conn)
@@ -692,13 +770,19 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
     conn.close()
 
-    # Index by path
-    cur_by_path = {e.path: e for e in current_entries}
-    prev_by_path = {e.path: e for e in prev_entries}
+    # Scope-filter entries for diff listing
+    scoped_cur = [e for e in current_entries if _in_scope(e, scope)]
+    scoped_prev = [e for e in prev_entries if _in_scope(e, scope)]
 
-    # Compute quality scores
-    cur_score = compute_quality_score(current_entries, all_git_stats)
-    prev_score = compute_quality_score(prev_entries, all_git_stats)
+    # Index by path
+    cur_by_path = {e.path: e for e in scoped_cur}
+    prev_by_path = {e.path: e for e in scoped_prev}
+
+    # Compute quality scores (scope filtering also done inside)
+    cur_score = compute_quality_score(
+        current_entries, all_git_stats, cur_fn_cc, scope=scope)
+    prev_score = compute_quality_score(
+        prev_entries, all_git_stats, prev_fn_cc, scope=scope)
 
     # Categorize file changes
     all_paths = sorted(set(cur_by_path.keys()) | set(prev_by_path.keys()))
@@ -743,6 +827,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
         output = {
             "scan_current": current.id,
             "scan_previous": prev.id,
+            "scope": scope,
             "improved": improved,
             "degraded": degraded,
             "new_files": new_files,
@@ -1029,9 +1114,10 @@ def cmd_health_info(args: argparse.Namespace) -> int:
 
     entries = get_file_entries(conn, scan.id)
     all_stats = get_git_stats(conn)
+    all_fn_cc = get_all_function_cc(conn, scan.id)
     conn.close()
 
-    score = compute_quality_score(entries, all_stats)
+    score = compute_quality_score(entries, all_stats, all_fn_cc)
     hotspot_count = sum(1 for s in all_stats if s.hotspot > 0.5)
 
     print(json.dumps({
@@ -1164,10 +1250,22 @@ def main() -> int:
     hotspots_parser.add_argument("--top", type=int, default=10,
                                  help="Number of results (default: 10)")
     hotspots_parser.add_argument("--json", action="store_true", help="JSON output")
+    hotspots_parser.add_argument(
+        "--scope",
+        default="production",
+        choices=["production", "all", "test", "script", "generated"],
+        help="File category scope (default: production)",
+    )
 
     # diff
     diff_parser = sub.add_parser("diff", help="Delta report vs previous scan")
     diff_parser.add_argument("--json", action="store_true", help="JSON output")
+    diff_parser.add_argument(
+        "--scope",
+        default="production",
+        choices=["production", "all", "test", "script", "generated"],
+        help="File category scope (default: production)",
+    )
 
     # promote
     promote_parser = sub.add_parser("promote", help="Promote findings to Weave nodes")

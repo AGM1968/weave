@@ -2,6 +2,99 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.13.1] - 2026-03-03
+
+### Fixed
+
+- **`poetry install` now works out of the box** — `pyproject.toml` was missing
+  `[tool.poetry] package-mode = false`. Poetry tried to install `weave-workflow` as a Python
+  package, but no matching source directory exists (the CLI is a bash/Python hybrid, not a
+  distributable package). Root cause: the Feb 2026 repo rename from `memory-system` →
+  `weave-workflow` created a name/directory mismatch. `poetry install` in `CONTRIBUTING.md` now
+  works without manual workarounds.
+
+- **Dist releases now include the `package-mode = false` fix** — `build-release.sh` was stripping
+  all `[tool.*]` sections from the distributed `pyproject.toml`, including `[tool.poetry]`. Changed
+  to an explicit allowlist (strips only `ruff`, `mypy`, `pylint`, `pyright`, `pytest` sections). All
+  prior dist releases (v1.2.0–v1.13.0) shipped a broken `pyproject.toml` for users following
+  `CONTRIBUTING.md`.
+
+---
+
+## [1.13.0] - 2026-03-02
+
+### Breaking Changes
+
+- **Quality score now defaults to `scope=production`** — the score returned by `wv quality scan`,
+  `wv quality hotspots`, and `wv quality diff` reflects production files only. Test files, scripts,
+  and generated files are excluded. Repos that previously scored 0/100 due to test-file noise will
+  see significantly higher scores. Use `--scope=all` to restore the old inclusive behaviour.
+
+- **Score values differ from v1.12.x** — the scoring formula has been redesigned. Numeric scores are
+  not comparable across this boundary. See the formula section below.
+
+### Added
+
+- **File classification** — every file is classified into `production`, `test`, `script`, or
+  `generated` based on path heuristics (`tests/`, `test_*.py`, `scripts/`, `dist/`, etc.).
+  Classification is stored in the DB and shown in `wv quality scan --json` (`category_counts`
+  field). Override defaults per-project via `.weave/quality.conf`:
+
+  ```ini
+  [classify]
+  production = scripts/mylib/   # promote library code living under scripts/
+  ```
+
+- **`--scope` flag** on `wv quality hotspots` and `wv quality diff` — accepts `production`
+  (default), `all`, `test`, `script`, `generated`.
+
+- **Category counts in scan JSON** — `wv quality scan --json` now includes:
+
+  ```json
+  { "category_counts": { "production": 69, "test": 69, "script": 48 } }
+  ```
+
+- **Scope field in hotspots/diff JSON** — `"scope": "production"` field confirms which filter was
+  active.
+
+### Changed
+
+- **Scoring formula redesigned** (graduated per-function model, no density normalization):
+  - **Per-function CC penalty**: 0.5 points per unit above CC=10, capped at 8 per function.
+    Dispatch-tagged functions are exempt.
+  - **Essential complexity penalty**: 0.5 points per unit above EV=4, capped at 3 per file.
+  - **Hotspot penalty**: −5 per file above hotspot threshold (unchanged).
+  - **Gini concentration penalty**: −1 per file with ≥3 functions and Gini >0.7.
+  - Penalties are applied at face value — no density normalization. Repos with more absolute
+    problems score lower regardless of repo size.
+  - Score clamped to [0, 100] and returned as `int`.
+
+- **Nested function CC boundary fix** — `_ComplexityVisitor` now uses a `per_function=True` guard
+  that stops recursion at nested `FunctionDef` boundaries. Nested functions are reported as separate
+  entries; their branches no longer inflate the outer function's CC. The fix mirrors the pattern
+  already used by `_EssentialComplexityVisitor`.
+
+### Fixed
+
+- **fn_cc carry-forward gap** — `cmd_scan` now reloads `all_fn_cc` from the DB after the
+  carry-forward section, ensuring unchanged files contribute their stored function CC to the quality
+  score.
+
+- **git_stats duplicate paths** — path list deduplicated before calling `enrich_all_git_stats` to
+  prevent hotspot penalties being applied twice for carried-forward files.
+
+### Calibration results
+
+| Repo                  | v1.12.2 | v1.13.0 | Target |
+| --------------------- | ------: | ------: | -----: |
+| earth-engine-analysis |   0/100 |  38/100 |  30-50 |
+| memory-system         | 100/100 |  79/100 |  50-80 |
+
+Cross-validation against radon/mccabe 0.7.0: 5/8 production library functions exact match, 3/8
+within ±2 (BoolOp counting — intentional divergence documented in `docs/CC-METHODOLOGY.md`).
+
+---
+
 ## [1.12.2] - 2026-03-01
 
 ### Fixed

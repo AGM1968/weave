@@ -27,7 +27,12 @@ from weave_quality.models import FileEntry, FunctionCC, GitStats
 # ---------------------------------------------------------------------------
 
 
-def _entry(filepath: str = "test.py", complexity: int = 10, loc: int = 100) -> FileEntry:
+def _entry(
+    filepath: str = "test.py",
+    complexity: int = 10,
+    loc: int = 100,
+    category: str = "production",
+) -> FileEntry:
     return FileEntry(
         path=filepath,
         scan_id=1,
@@ -37,6 +42,7 @@ def _entry(filepath: str = "test.py", complexity: int = 10, loc: int = 100) -> F
         complexity=complexity,
         max_nesting=3,
         avg_fn_len=10.0,
+        category=category,
     )
 
 
@@ -228,9 +234,12 @@ class TestQualityScore:
         assert score < 100
 
     def test_deductions_for_critical_complexity(self) -> None:
+        # Per-function CC via fn_cc_list triggers the graduated penalty.
         entries = [_entry("a.py", complexity=CC_CRITICAL + 1)]
         stats = [_stats("a.py", hotspot=0.0)]
-        score = compute_quality_score(entries, stats)
+        fn_cc = [FunctionCC(path="a.py", function_name="big_fn",
+                            complexity=float(CC_CRITICAL + 1))]
+        score = compute_quality_score(entries, stats, fn_cc_list=fn_cc)
         assert score < 100
 
     def test_score_floor_at_zero(self) -> None:

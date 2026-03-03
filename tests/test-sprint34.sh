@@ -312,6 +312,109 @@ PLANEOF
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Test: wv plan edge-wiring (after: on continuation lines)
+# ═══════════════════════════════════════════════════════════════════════════
+
+test_plan_edges() {
+    echo ""
+    echo "=== wv plan edge-wiring ==="
+    setup_test_env
+
+    # Plan with multi-line tasks where (after:) is on continuation lines
+    cat > "$TEST_DIR/plan-edges.md" << 'PLANEOF'
+# Edge Test Plan
+
+### Sprint 1: Edge Wiring — Test
+
+1. **task-a** -- First task with no dependencies.
+   This is a multi-line description. (priority: 1)
+
+2. **task-b** -- Second task depends on first.
+   More details here. (after: task-a)
+
+3. **task-c** -- Third task depends on second.
+   Extended description spanning
+   multiple continuation lines. (after: task-b)
+
+4. **task-d** -- Fourth task also depends on first.
+   (after: task-a)
+
+PLANEOF
+
+    # Import sprint
+    local plan_out
+    plan_out=$($WV plan "$TEST_DIR/plan-edges.md" --sprint=1 2>&1)
+    assert_contains "$plan_out" "Epic:" "plan-edges: creates epic"
+
+    # Check edge count reported
+    assert_contains "$plan_out" "dependency edge" "plan-edges: reports edge creation"
+
+    # Verify edges exist in DB: task-a blocks task-b
+    local task_a_id task_b_id task_c_id task_d_id
+    task_a_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE alias='task-a';")
+    task_b_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE alias='task-b';")
+    task_c_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE alias='task-c';")
+    task_d_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE alias='task-d';")
+
+    # task-a should block task-b
+    local ab_edge
+    ab_edge=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM edges WHERE source='$task_a_id' AND target='$task_b_id' AND type='blocks';")
+    assert_equals "1" "$ab_edge" "plan-edges: task-a blocks task-b"
+
+    # task-b should block task-c
+    local bc_edge
+    bc_edge=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM edges WHERE source='$task_b_id' AND target='$task_c_id' AND type='blocks';")
+    assert_equals "1" "$bc_edge" "plan-edges: task-b blocks task-c"
+
+    # task-a should block task-d
+    local ad_edge
+    ad_edge=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM edges WHERE source='$task_a_id' AND target='$task_d_id' AND type='blocks';")
+    assert_equals "1" "$ad_edge" "plan-edges: task-a blocks task-d"
+
+    # Verify priority extraction from continuation lines
+    local task_a_priority
+    task_a_priority=$(sqlite3 "$WV_DB" "SELECT json_extract(metadata, '$.priority') FROM nodes WHERE alias='task-a';")
+    assert_equals "1" "$task_a_priority" "plan-edges: priority on continuation line extracted"
+
+    # Total: 3 blocking edges + 4 implements edges = 7 edges
+    local total_blocks
+    total_blocks=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM edges WHERE type='blocks';")
+    assert_equals "3" "$total_blocks" "plan-edges: exactly 3 blocking edges created"
+
+    # Cross-sprint edge test: Sprint 2 references Sprint 1 alias via DB lookup
+    setup_test_env
+
+    cat > "$TEST_DIR/plan-xsprint.md" << 'PLANEOF'
+# Cross-Sprint Plan
+
+### Sprint 1: Foundation
+
+1. **base-setup** -- Create the foundation module.
+
+---
+
+### Sprint 2: Extension
+
+1. **ext-feature** -- Extend foundation with new capability.
+   Requires base to be done first. (after: base-setup)
+
+PLANEOF
+    # Import Sprint 1 first
+    $WV plan "$TEST_DIR/plan-xsprint.md" --sprint=1 >/dev/null 2>&1
+    # Import Sprint 2 — must resolve base-setup alias from DB
+    local s2_out
+    s2_out=$($WV plan "$TEST_DIR/plan-xsprint.md" --sprint=2 2>&1)
+    assert_contains "$s2_out" "dependency edge" "plan-xsprint: cross-sprint edge created"
+
+    local base_id ext_id
+    base_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE alias='base-setup';")
+    ext_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE alias='ext-feature';")
+    local xsprint_edge
+    xsprint_edge=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM edges WHERE source='$base_id' AND target='$ext_id' AND type='blocks';")
+    assert_equals "1" "$xsprint_edge" "plan-xsprint: base-setup blocks ext-feature across sprints"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Test: Human-readable aliases
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -780,6 +883,7 @@ main() {
 
     test_tree
     test_plan
+    test_plan_edges
     test_aliases
     test_learning_hygiene
     test_health_history

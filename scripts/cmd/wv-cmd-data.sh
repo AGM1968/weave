@@ -1777,6 +1777,30 @@ cmd_plan() {
         fi
     done < "$file"
 
+    # Post-process: re-extract metadata tags from full text (first line + continuations)
+    # Metadata on continuation lines is missed during initial parse (only first line is checked)
+    for i in "${!tasks[@]}"; do
+        local full_text="${tasks[$i]}"
+        # Re-extract (after:) if not found on first line
+        if [ -z "${task_deps[$i]}" ] && [[ "$full_text" =~ \(after:[[:space:]]*([a-zA-Z0-9_-]+)\) ]]; then
+            task_deps[$i]="${BASH_REMATCH[1]}"
+            tasks[$i]="${full_text//${BASH_REMATCH[0]}/}"
+        fi
+        # Re-extract (priority:) if still at default
+        if [ "${task_priorities[$i]}" = "2" ] && [[ "${tasks[$i]}" =~ \(priority:[[:space:]]*([0-9]+)\) ]]; then
+            task_priorities[$i]="${BASH_REMATCH[1]}"
+            tasks[$i]="${tasks[$i]//${BASH_REMATCH[0]}/}"
+        fi
+        # Re-extract (status:) from continuation text
+        if [[ "${tasks[$i]}" =~ \(status:[[:space:]]*(done|todo|blocked)\) ]]; then
+            task_statuses[$i]="${BASH_REMATCH[1]}"
+            tasks[$i]="${tasks[$i]//${BASH_REMATCH[0]}/}"
+        fi
+        # Clean trailing whitespace
+        tasks[$i]="${tasks[$i]%%[[:space:]]}"
+        tasks[$i]="${tasks[$i]%% }"
+    done
+
     if [ -z "$epic_title" ]; then
         echo -e "${RED}Error: Sprint $sprint section not found in $file${NC}" >&2
         echo "Expected: ### Sprint ${sprint}: <title>" >&2
