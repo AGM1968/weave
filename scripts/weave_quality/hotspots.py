@@ -24,6 +24,12 @@ log = logging.getLogger(__name__)
 # D2 decision: hardcoded thresholds (Option A)
 # ---------------------------------------------------------------------------
 
+# NOTE: hotspot scores are min-max normalised per scan, so HOTSPOT_THRESHOLD
+# is an *absolute* cutoff on a *relative* scale.  Adding or removing one
+# extreme outlier file shifts all scores and can toggle files across the
+# threshold without any code change.  This is acceptable for the two-repo
+# calibration basis but may need a percentile-based threshold for larger,
+# more heterogeneous repos.
 HOTSPOT_THRESHOLD = 0.5
 CC_CRITICAL = 30
 CC_WARNING = 15
@@ -232,11 +238,13 @@ def compute_quality_score(
             score -= 5
 
     # 4. Gini concentration penalty (per-file, threshold 0.7)
+    # Minimum N=4: max Gini for N=3 is (N-1)/N = 0.667 < 0.7, so the threshold
+    # is mathematically unreachable for 3-function files.  N=4 gives max 0.75.
     fns_by_path: dict[str, list[FunctionCC]] = {}
     for fn in fns:
         fns_by_path.setdefault(fn.path, []).append(fn)
     for path_fns in fns_by_path.values():
-        if len(path_fns) >= 3 and cc_gini(path_fns) > 0.7:
+        if len(path_fns) >= 4 and cc_gini(path_fns) > 0.7:
             score -= 1.0
 
     return max(0, min(100, int(round(score))))

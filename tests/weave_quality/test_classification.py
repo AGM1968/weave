@@ -317,6 +317,23 @@ class TestLoadClassifyOverrides:
         assert classify_file("deploy/run.py", overrides) == "script"
         assert classify_file("src/app.py", overrides) == "production"
 
+    def test_inline_comments_stripped_from_values(self, tmp_path: Path) -> None:
+        """Inline # comments in [classify] values must not become part of the path."""
+        weave_dir = tmp_path / ".weave"
+        weave_dir.mkdir()
+        (weave_dir / "quality.conf").write_text(
+            textwrap.dedent("""\
+                [classify]
+                production = scripts/mylib/   # promote library code
+                test = custom_tests/          # additional test directory
+                script = infra/               # additional script directory
+            """)
+        )
+        overrides = load_classify_overrides(str(tmp_path))
+        assert overrides["production"] == ["scripts/mylib/"]
+        assert overrides["test"] == ["custom_tests/"]
+        assert overrides["script"] == ["infra/"]
+
 
 # ---------------------------------------------------------------------------
 # _match_override

@@ -248,7 +248,7 @@ class TestFunctionCC:
             line_start=10, line_end=50, is_dispatch=False,
         )
         row = fc.to_eav_row()
-        assert row["metric"] == "fn_cc:process"
+        assert row["metric"] == "fn_cc:process@10"
         assert row["value"] == 12.0
         assert row["path"] == "a.py"
         assert row["scan_id"] == 1

@@ -2,6 +2,53 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.14.0] - 2026-03-03
+
+### Fixed
+
+- **`quality.conf` config format** — `[exclude]` parser and `[classify]` parser both now strip
+  inline `#` comments. The README incorrectly showed INI-style `patterns = \n    val` multi-line
+  syntax; corrected to one-glob-per-line.
+
+- **File classification heuristics table** — README listed `migrations/`, `vendor/`,
+  `node_modules/`, `.min.js` as generated patterns; none exist in `classification.py`. Table now
+  matches the code exactly (4 errors across 3 rows corrected).
+
+- **`ScanMeta` docstring** — said "Two scans retained" but `db.py` uses `_MAX_SCANS=5` for trend
+  data and `_FILES_SCANS=2` for raw file data. Docstring and `db.py` header updated.
+
+- **`fn_cc` EAV key collisions** — `FunctionCC.to_eav_row()` keyed on `fn_cc:<name>`, colliding on
+  `(path, scan_id, metric)` when two methods share a name in different classes within one file. Key
+  is now `fn_cc:<name>@<line_start>`. Python identifiers cannot contain `@` so the split is
+  unambiguous.
+
+- **Gini penalty dead-letter at N=3** — the concentration penalty threshold 0.7 is mathematically
+  unreachable for exactly 3 functions (max Gini = 0.667). Minimum raised to `N >= 4`, where max Gini
+  = 0.75.
+
+- **`make check` on Python-3-only systems** — `PYTHON ?= python` failed on Debian/Ubuntu after
+  Python 2 EOL (no `python` symlink). Changed to `poetry run python`. `PYLINT` aligned to
+  `$(PYTHON) -m pylint` for consistency.
+
+### Added
+
+- **`scanner_version` in `scan_meta`** — each scan now records the Weave version that produced it
+  (`_migrate_v4`). If a scan detects the previous scan used a different version, it automatically
+  forces a full re-scan so no stale metrics are carried forward. No manual `wv quality reset` needed
+  after upgrading.
+
+### Documentation
+
+- **Known Limitations** — two new entries: hotspot threshold instability (absolute cutoff on min-max
+  normalised scores) and `wv quality diff` git-stats caveat (previous score retroactively
+  recalculated with current churn data).
+
+- **Proposal docs superseded** — `PROPOSAL-wv-quality-depth.md`, `PROPOSAL-wv-quality-perf.md`, and
+  `PROPOSAL-wv-mccabe-review.md` each carry a `SUPERSEDED` banner pointing to
+  `scripts/weave_quality/README.md` as the single source of truth.
+
+---
+
 ## [1.13.1] - 2026-03-03
 
 ### Fixed

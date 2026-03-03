@@ -3,7 +3,7 @@
 SQLite DB at $WV_HOT_ZONE/quality.db -- flat sibling to brain.db.
 Never synced to git, never tracked, fully rebuildable from source + git.
 
-Schema (from PROPOSAL-wv-quality.md):
+Schema (originally from PROPOSAL-wv-quality.md; extended by migrations v2 and v3):
   - scan_meta: scan run metadata + staleness tracking
   - files: static analysis per file per scan (loc, complexity, functions, etc.)
   - file_metrics: CK-suite EAV metrics per file per scan (wmc, cbo, dit, rfc, lcom)
@@ -45,11 +45,12 @@ PRAGMA temp_store = MEMORY;
 
 -- Scan metadata + staleness tracking
 CREATE TABLE IF NOT EXISTS scan_meta (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    scanned_at  TEXT NOT NULL,
-    git_head    TEXT NOT NULL,
-    files_count INTEGER,
-    duration_ms INTEGER
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    scanned_at      TEXT NOT NULL,
+    git_head        TEXT NOT NULL,
+    files_count     INTEGER,
+    duration_ms     INTEGER,
+    scanner_version TEXT DEFAULT ''
 );
 
 -- Per-file metrics (latest scan only, previous kept for diff)
@@ -201,6 +202,21 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    """Idempotent v4 schema migration: add scanner_version to scan_meta.
+
+    Existing rows get an empty string default (treated as unknown version,
+    triggering a full re-scan on the next scan run).
+    """
+    cols = {r[1] for r in conn.execute(
+        "PRAGMA table_info(scan_meta)").fetchall()}
+    if "scanner_version" not in cols:
+        conn.execute(
+            "ALTER TABLE scan_meta "
+            "ADD COLUMN scanner_version TEXT DEFAULT ''")
+    conn.commit()
+
+
 def init_db(hot_zone: str | None = None) -> sqlite3.Connection:
     """Initialise quality.db, creating schema if needed.
 
@@ -214,6 +230,7 @@ def init_db(hot_zone: str | None = None) -> sqlite3.Connection:
     conn.executescript(_SCHEMA)
     _migrate_v2(conn)
     _migrate_v3(conn)
+    _migrate_v4(conn)
     log.debug("quality.db initialised at %s", resolved)
     return conn
 
@@ -241,14 +258,16 @@ def reset_db(hot_zone: str | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def begin_scan(conn: sqlite3.Connection, git_head: str) -> int:
+def begin_scan(conn: sqlite3.Connection, git_head: str,
+               scanner_version: str = "") -> int:
     """Record a new scan, prune old scans beyond retention limit.
 
     Returns the new scan_id.
     """
     cur = conn.execute(
-        "INSERT INTO scan_meta (scanned_at, git_head) VALUES (?, ?)",
-        (time.strftime("%Y-%m-%dT%H:%M:%S"), git_head),
+        "INSERT INTO scan_meta (scanned_at, git_head, scanner_version) "
+        "VALUES (?, ?, ?)",
+        (time.strftime("%Y-%m-%dT%H:%M:%S"), git_head, scanner_version),
     )
     scan_id = cur.lastrowid
     assert scan_id is not None
@@ -302,6 +321,7 @@ def latest_scan(conn: sqlite3.Connection) -> ScanMeta | None:
         git_head=row["git_head"],
         files_count=row["files_count"] or 0,
         duration_ms=row["duration_ms"] or 0,
+        scanner_version=row["scanner_version"] or "",
     )
 
 
@@ -319,6 +339,7 @@ def previous_scan(conn: sqlite3.Connection) -> ScanMeta | None:
         git_head=row["git_head"],
         files_count=row["files_count"] or 0,
         duration_ms=row["duration_ms"] or 0,
+        scanner_version=row["scanner_version"] or "",
     )
 
 
@@ -459,7 +480,7 @@ def _rows_to_function_cc(rows: list[Any]) -> list[FunctionCC]:
     results: list[FunctionCC] = []
     for r in rows:
         d = dict(r)
-        fn_name = d["metric"].removeprefix("fn_cc:")
+        fn_name = d["metric"].removeprefix("fn_cc:").rsplit("@", 1)[0]
         detail = json.loads(d["detail"]) if d.get("detail") else {}
         results.append(FunctionCC(
             path=d["path"],

@@ -104,11 +104,12 @@ def load_classify_overrides(repo: str) -> dict[str, list[str]]:
             continue
         if not in_section:
             continue
-        # key = value
+        # key = value  (inline comments stripped)
         if "=" not in line:
             continue
         key, _, value = line.partition("=")
         key = key.strip().lower()
+        value = value.partition("#")[0]  # strip inline comments
         parts = [p.strip() for p in value.split(",") if p.strip()]
         if key and parts:
             overrides[key] = parts

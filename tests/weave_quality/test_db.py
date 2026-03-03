@@ -495,7 +495,7 @@ class TestFunctionCCStorage:
         ck_back = get_ck_metrics(db, scan_id, "a.py")
         assert ck_back is not None
         # CK should NOT include fn_cc rows
-        assert "fn_cc:foo" not in ck_back.metrics
+        assert "fn_cc:foo@1" not in ck_back.metrics
 
 
 # ---------------------------------------------------------------------------

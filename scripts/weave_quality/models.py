@@ -76,8 +76,10 @@ class FileEntry:
 class FunctionCC:
     """Per-function cyclomatic complexity (scan-versioned, EAV).
 
-    Stored in file_metrics as metric='fn_cc:<function_name>',
-    value=complexity. Line range and dispatch flag in detail JSON.
+    Stored in file_metrics as metric='fn_cc:<function_name>@<line_start>',
+    value=complexity. Full line range and dispatch flag in detail JSON.
+    The @<line_start> suffix disambiguates same-name methods in different
+    classes within the same file.
     """
 
     path: str
@@ -100,7 +102,7 @@ class FunctionCC:
         return {
             "path": self.path,
             "scan_id": self.scan_id,
-            "metric": f"fn_cc:{self.function_name}",
+            "metric": f"fn_cc:{self.function_name}@{self.line_start}",
             "value": self.complexity,
             "detail": detail,
         }
@@ -288,8 +290,9 @@ class FileState:
 class ScanMeta:
     """Metadata for a single quality scan run.
 
-    Maps to the `scan_meta` table. Two scans retained (current + previous)
-    to enable delta reports. Older scans deleted on each new scan.
+    Maps to the `scan_meta` table. Five scans retained for trend data
+    (``_MAX_SCANS``); raw file data (``files``, ``file_metrics``) is pruned
+    to the two most recent scans (``_FILES_SCANS``) for the diff window.
     """
 
     id: int = 0
@@ -297,6 +300,7 @@ class ScanMeta:
     git_head: str = ""            # HEAD SHA at scan time
     files_count: int = 0
     duration_ms: int = 0
+    scanner_version: str = ""     # Weave version that produced this scan
 
     @classmethod
     def create(cls, git_head: str, files_count: int = 0,

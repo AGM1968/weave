@@ -242,6 +242,26 @@ class TestQualityScore:
         score = compute_quality_score(entries, stats, fn_cc_list=fn_cc)
         assert score < 100
 
+    def test_gini_penalty_requires_n4(self) -> None:
+        """N=3: max gini=0.667 < 0.7 threshold — penalty must NOT fire.
+        N=4 with extreme concentration (one fn holds all CC) — penalty fires.
+        """
+        # N=3 maximum concentration: [0, 0, 10] → gini = 0.667, below 0.7
+        entry = _entry("a.py", complexity=10.0)
+        stat = _stats("a.py", hotspot=0.0)
+        fn3 = [FunctionCC(path="a.py", function_name=f"f{i}",
+                          complexity=10.0 if i == 2 else 0.0)
+               for i in range(3)]
+        score_n3 = compute_quality_score([entry], [stat], fn_cc_list=fn3)
+
+        # N=4 maximum concentration: [0, 0, 0, 10] → gini = 0.75, above 0.7
+        fn4 = [FunctionCC(path="a.py", function_name=f"f{i}",
+                          complexity=10.0 if i == 3 else 0.0)
+               for i in range(4)]
+        score_n4 = compute_quality_score([entry], [stat], fn_cc_list=fn4)
+
+        assert score_n3 > score_n4  # N=4 took a -1 Gini penalty, N=3 did not
+
     def test_score_floor_at_zero(self) -> None:
         # Many hotspots and critical files
         entries = [_entry(f"f{i}.py", complexity=50) for i in range(30)]

@@ -76,6 +76,9 @@ from weave_quality.python_parser import analyze_python_file
 
 log = logging.getLogger(__name__)
 
+_VERSION_FILE = Path(__file__).parent.parent / "lib" / "VERSION"
+_SCANNER_VERSION = _VERSION_FILE.read_text().strip() if _VERSION_FILE.exists() else ""
+
 # ---------------------------------------------------------------------------
 # Path resolution
 # ---------------------------------------------------------------------------
@@ -100,7 +103,10 @@ def _load_config_excludes(repo: str) -> list[str]:
             in_section = line.lower() == "[exclude]"
             continue
         if in_section:
-            excludes.append(line)
+            # Strip inline comments (e.g. "dist/**  # build output" → "dist/**")
+            line = line.split("#", 1)[0].strip()
+            if line:
+                excludes.append(line)
     return excludes
 
 
@@ -255,7 +261,22 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     # Begin scan
     head = git_head_sha(repo)
-    scan_id = begin_scan(conn, head)
+    scan_id = begin_scan(conn, head, scanner_version=_SCANNER_VERSION)
+
+    # Detect scanner version change — force full re-scan if version differs
+    # so that carried-forward metrics are never from a different algorithm.
+    prev_for_version = previous_scan(conn)
+    version_changed = (
+        prev_for_version is not None
+        and _SCANNER_VERSION
+        and prev_for_version.scanner_version != _SCANNER_VERSION
+    )
+    if version_changed:
+        log.info(
+            "Scanner version changed (%s → %s); forcing full re-scan",
+            prev_for_version.scanner_version or "unknown",  # type: ignore[union-attr]
+            _SCANNER_VERSION,
+        )
 
     # Determine which files need re-scanning (incremental)
     # Single git ls-tree call replaces N per-file git_blob_sha calls
@@ -271,7 +292,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         except OSError:
             mtime = 0
         blob = blob_map.get(rel_path, "")
-        if file_changed(conn, rel_path, mtime, blob):
+        if version_changed or file_changed(conn, rel_path, mtime, blob):
             files_to_scan.append(rel_path)
         else:
             files_unchanged.append(rel_path)
@@ -762,7 +783,11 @@ def cmd_diff(args: argparse.Namespace) -> int:
     cur_fn_cc = get_all_function_cc(conn, current.id)
     prev_fn_cc = get_all_function_cc(conn, prev.id)
 
-    # Get git stats for quality score calculation
+    # Get git stats for quality score calculation.
+    # NOTE: git_stats is NOT scan-versioned — both scans use current git data.
+    # If churn or authorship changed between scans, the previous score is
+    # retroactively recalculated with new git data, making the delta partially
+    # a git-history artifact rather than a pure code change measure.
     all_git_stats = get_git_stats(conn)
 
     # Trend directions for changed files
