@@ -960,10 +960,17 @@ VSETTINGSEOF
 This repository uses the **Weave** graph-based workflow system. **Every code change must follow
 this workflow. No exceptions.** Enforcement is layered:
 
-1. **VS Code hooks** (`chat.hooks.enabled: true`) -- PreToolUse hooks fire before every tool call,
-   blocking edits when no active Weave node exists (deterministic, exit 2)
-2. **MCP edit guard** -- `weave_edit_guard` returns an error if no active node (advisory but visible)
-3. **Git pre-commit hook** -- blocks commits without an active node (last-resort safety net)
+1. **MCP edit guard** -- `weave_edit_guard` returns an error if no active node (advisory; agent must
+   invoke explicitly before every edit -- there is no automatic pre-edit hard block in VS Code)
+2. **Git pre-commit hook** -- blocks commits without an active node (deterministic, last-resort
+   safety net)
+
+> **GitHub Copilot enforcement gap:** Claude Code's `~/.claude/settings.json` PreToolUse hooks
+> (which fire deterministically with exit 2 before every file edit) fire in the Claude Code CLI and
+> Claude Code VS Code extension (`anthropic.claude-code`) but **do not fire in GitHub Copilot**
+> (this agent). GitHub Copilot agents rely entirely on the MCP `weave_edit_guard` tool (advisory,
+> agent-invoked) and the git pre-commit hook. This means the pre-edit gate is cooperative, not
+> enforced -- `weave_edit_guard` must be called correctly per these instructions.
 
 ## Session Start (MANDATORY)
 
@@ -1111,6 +1118,10 @@ wv recover --session --json      # Structured output for automation
 
 ## MCP Tools (31 total)
 
+Four MCP server instances must all be running for full tool coverage (`weave`, `weave-graph`,
+`weave-session`, `weave-inspect` -- all pre-configured in `.vscode/mcp.json`). Restart via
+Command Palette → MCP: Restart Server after any `npm run build` in `mcp/`.
+
 If your client supports MCP, prefer compound tools over CLI for multi-step operations:
 
 <!-- markdownlint-disable MD060 -->
@@ -1139,7 +1150,7 @@ If your client supports MCP, prefer compound tools over CLI for multi-step opera
 
 Other tools: `weave_add`, `weave_done`, `weave_batch_done`, `weave_link`, `weave_list`,
 `weave_context`, `weave_search`, `weave_status`, `weave_health`, `weave_sync`, `weave_resolve`,
-`weave_close_session`.
+`weave_close_session`, `weave_recover`, `weave_delete`, `weave_show`.
 
 For CLI operations via terminal: `wv` works -- but the workflow steps above are still mandatory.
 
