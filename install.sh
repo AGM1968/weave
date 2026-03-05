@@ -837,10 +837,28 @@ AGENTSEOF
         echo -e "  ${YELLOW}⊘${NC} .claude/settings.json (already exists, skipped)"
     fi
 
-    # ── settings.local.json (user file — permissions only, not hooks) ──
+    # ── settings.local.json (user file — permissions + MCP servers) ──
     if [ ! -f "$REPO_ROOT/.claude/settings.local.json" ] || [ "$FORCE_MODE" = "1" ]; then
-        cat > "$REPO_ROOT/.claude/settings.local.json" << 'SETTINGSEOF'
+        cat > "$REPO_ROOT/.claude/settings.local.json" << SETTINGSEOF
 {
+  "mcpServers": {
+    "weave": {
+      "command": "node",
+      "args": ["$MCP_SERVER"]
+    },
+    "weave-graph": {
+      "command": "node",
+      "args": ["$MCP_SERVER", "--scope=graph"]
+    },
+    "weave-session": {
+      "command": "node",
+      "args": ["$MCP_SERVER", "--scope=session"]
+    },
+    "weave-inspect": {
+      "command": "node",
+      "args": ["$MCP_SERVER", "--scope=inspect"]
+    }
+  },
   "permissions": {
     "allow": [
       "Bash(wv *)",
@@ -888,6 +906,18 @@ if [ "$AGENT" = "copilot" ]; then
     "weave": {
       "command": "node",
       "args": ["$MCP_SERVER"]
+    },
+    "weave-graph": {
+      "command": "node",
+      "args": ["$MCP_SERVER", "--scope=graph"]
+    },
+    "weave-session": {
+      "command": "node",
+      "args": ["$MCP_SERVER", "--scope=session"]
+    },
+    "weave-inspect": {
+      "command": "node",
+      "args": ["$MCP_SERVER", "--scope=inspect"]
     }
   }
 }
@@ -1052,7 +1082,34 @@ wv sync --gh && git push     # Sync graph + GitHub issues, then push
 **Not** `wv sync` -- the `--gh` flag syncs GitHub issues. Without it, nodes created with `--gh`
 won't have their status reflected on GitHub.
 
-## MCP Tools (23 total)
+## Code Quality (built-in)
+
+Zero-dependency code quality analysis using Python stdlib and git:
+
+```bash
+wv quality scan                  # Scan repo for complexity + churn
+wv quality hotspots              # Ranked hotspot report (top files by risk)
+wv quality diff                  # Delta vs previous scan (trend detection)
+wv quality functions <file>      # Per-function cyclomatic complexity + Gini
+```
+
+Use hotspots to prioritize refactoring. Use diff after changes to verify improvement. Functions
+mode shows per-function CC distribution with a Gini coefficient for complexity inequality.
+
+All quality commands support `--json` for programmatic use. Configure exclusions via
+`.weave/quality.conf`.
+
+## Crash Recovery
+
+If a session ends abruptly (crash, kill, network loss), the next session auto-detects it:
+
+```bash
+wv recover --session             # List orphaned active nodes from crashed sessions
+wv recover --session --auto      # Auto-reclaim all orphaned nodes
+wv recover --session --json      # Structured output for automation
+```
+
+## MCP Tools (31 total)
 
 If your client supports MCP, prefer compound tools over CLI for multi-step operations:
 
@@ -1072,6 +1129,13 @@ If your client supports MCP, prefer compound tools over CLI for multi-step opera
 | `weave_breadcrumbs`| `wv breadcrumbs save/show/clear`       | Session handoff      |
 | `weave_update`     | `wv update <id> --metadata=...`        | Enrich nodes         |
 | `weave_guide`      | `wv guide --topic=<topic>`             | Workflow quick ref   |
+| `weave_show`       | `wv show <id> --json`                  | Node details         |
+| `weave_delete`     | `wv delete <id>`                       | Remove nodes         |
+| `weave_recover`    | `wv recover`                           | Crash recovery       |
+| `weave_quality_scan`    | `wv quality scan`                 | Code quality scan    |
+| `weave_quality_hotspots`| `wv quality hotspots`             | Ranked hotspots      |
+| `weave_quality_diff`    | `wv quality diff`                 | Quality trend delta  |
+| `weave_quality_functions`| `wv quality functions <file>`    | Per-function CC      |
 
 Other tools: `weave_add`, `weave_done`, `weave_batch_done`, `weave_link`, `weave_list`,
 `weave_context`, `weave_search`, `weave_status`, `weave_health`, `weave_sync`, `weave_resolve`,
@@ -1103,6 +1167,11 @@ For CLI operations via terminal: `wv` works -- but the workflow steps above are 
 | `wv status`               | Compact status summary                  |                                            |
 | `wv sync`                 | Persist graph to disk                   | `--gh` (sync GitHub issues)                |
 | `wv prune`                | Archive old done nodes                  | `--age=`, `--dry-run`                      |
+| `wv recover`              | Resume incomplete operations            | `--session`, `--auto`, `--json`            |
+| `wv quality scan`         | Scan repo for complexity + churn        | `--exclude=`, `--json`                     |
+| `wv quality hotspots`     | Ranked hotspot report                   | `--top=N`, `--json`                        |
+| `wv quality diff`         | Delta vs previous scan                  | `--json`                                   |
+| `wv quality functions`    | Per-function CC for file/directory       | `--json`                                   |
 
 ## Common Pitfalls
 
