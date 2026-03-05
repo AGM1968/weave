@@ -20,35 +20,51 @@ wv sync --gh && git push          # 4. MANDATORY before session end (--gh syncs 
 
 ## Essential Commands
 
-| Command                    | Purpose                                                                   |
-| -------------------------- | ------------------------------------------------------------------------- |
-| `wv ready`                 | List unblocked tasks                                                      |
-| `wv work <id>`             | Claim task, enable subagent context                                       |
-| `wv add <text> --gh`       | Create node + GitHub issue (linked)                                       |
-| `wv add ... --parent=<id>` | Create + link to parent (implements)                                      |
-| `wv done <id>`             | Complete node                                                             |
-| `wv ship <id>`             | Done + sync + push in one step (commit code first — ship closes the node) |
-| `wv delete <id>`           | Permanently remove node + edges                                           |
-| `wv bulk-update`           | Update multiple nodes from JSON stdin                                     |
-| `wv context <id> --json`   | Get full context pack for a node                                          |
-| `wv status`                | Quick status summary                                                      |
-| `wv show <id>`             | Node details                                                              |
-| `wv search <query>`        | Full-text search                                                          |
-| `wv health`                | System health check                                                       |
-| `wv plan <file>`           | Import markdown as epic + tasks                                           |
-| `wv tree`                  | Epic hierarchy (`--mermaid`, `--json`)                                    |
-| `wv link <from> <to>`      | Create semantic edge between nodes                                        |
-| `wv prune`                 | Archive old done nodes                                                    |
-| `wv recover`               | Resume incomplete operations (`--json`, `--auto`)                         |
-| `wv sync --gh`             | Persist graph + sync GitHub issues                                        |
-| `wv quality scan`          | Scan repo for complexity + churn metrics                                  |
-| `wv quality hotspots`      | Ranked hotspot report (ev, trend, ownership, cc_gini)                     |
-| `wv quality diff`          | Delta vs previous scan with trend direction                               |
-| `wv quality functions`     | Per-function CC with dispatch tagging, histogram distribution, Gini       |
+| Command                    | Purpose                                                                     |
+| -------------------------- | --------------------------------------------------------------------------- |
+| `wv ready`                 | List unblocked tasks                                                        |
+| `wv work <id>`             | Claim task, enable subagent context                                         |
+| `wv add <text> --gh`       | Create node + GitHub issue (linked)                                         |
+| `wv add ... --parent=<id>` | Create + link to parent (implements)                                        |
+| `wv done <id>`             | Complete node                                                               |
+| `wv ship <id>`             | Done + sync + push in one step (commit code first — ship closes the node)   |
+| `wv delete <id>`           | Permanently remove node + edges                                             |
+| `wv bulk-update`           | Update multiple nodes from JSON stdin                                       |
+| `wv context <id> --json`   | Get full context pack for a node                                            |
+| `wv status`                | Quick status summary                                                        |
+| `wv show <id>`             | Node details                                                                |
+| `wv search <query>`        | Full-text search                                                            |
+| `wv health`                | System health check                                                         |
+| `wv plan <file>`           | Import markdown as epic + tasks                                             |
+| `wv tree`                  | Epic hierarchy (`--mermaid`, `--json`)                                      |
+| `wv link <from> <to>`      | Create semantic edge between nodes                                          |
+| `wv prune`                 | Archive old done nodes                                                      |
+| `wv recover`               | Resume incomplete operations (`--json`, `--auto`)                           |
+| `wv sync --gh`             | Persist graph + sync GitHub issues                                          |
+| `wv init-repo`             | Bootstrap `.claude/` for a repo (permissions-only settings.json, CLAUDE.md) |
+| `wv quality scan`          | Scan repo for complexity + churn metrics                                    |
+| `wv quality hotspots`      | Ranked hotspot report (ev, trend, ownership, cc_gini)                       |
+| `wv quality diff`          | Delta vs previous scan with trend direction                                 |
+| `wv quality functions`     | Per-function CC with dispatch tagging, histogram distribution, Gini         |
 
 ## MCP Server
 
-For AI tools that support MCP (Model Context Protocol), a server is available:
+Four scoped server instances expose Weave tools to AI agents. **All four must be started** for full
+tool coverage — each runs `mcp/dist/index.js` with a different `--scope` flag, pre-configured in
+`.vscode/mcp.json`:
+
+| Server          | Scope     | Tools covered                                                                                                     |
+| --------------- | --------- | ----------------------------------------------------------------------------------------------------------------- |
+| `weave`         | `all`     | All 31 tools — full coverage                                                                                      |
+| `weave-graph`   | `graph`   | `add`, `link`, `done`, `batch_done`, `list`, `resolve`, `update`, `delete`                                        |
+| `weave-session` | `session` | `work`, `ship`, `recover`, `quick`, `overview`, `close_session`, `breadcrumbs`, `plan`, `edit_guard`              |
+| `weave-inspect` | `inspect` | `context`, `search`, `status`, `health`, `preflight`, `sync`, `tree`, `learnings`, `guide`, `show`, quality tools |
+
+The scoped instances exist for subagents that should only access a restricted tool set. For direct
+agent use, `weave` (scope=all) covers everything; the other three add no extra tools — they restrict
+them. Start all four so subagents can inherit the right scope.
+
+Build, then restart all 4 servers in VS Code (Command Palette → **MCP: Restart Server**):
 
 ```bash
 cd mcp && npm install && npm run build
@@ -115,8 +131,14 @@ create/claim a node first.
 
 ## Development Pitfalls
 
-- **Source vs installed:** Edit files in `scripts/`, never `~/.local/bin/` or `~/.local/lib/weave/`.
-  A PreToolUse hook blocks installed-path edits. After source edits, run `./install.sh` to sync.
+- **Source vs installed:** Edit files in `scripts/`, never `~/.local/bin/` or `~/.config/weave/`. A
+  PreToolUse hook blocks installed-path edits. After source edits, run `./install.sh` to sync.
+- **Global hooks (v1.15.0+):** All 9 enforcement hooks live in `~/.claude/settings.json` (Alt-A).
+  Per-project `settings.json` has **no `hooks` key** — any hooks key shadows globals (shallow
+  spread). New repos: `wv init-repo` creates `settings.json` with permissions only. The **Claude
+  Code VS Code extension** (`anthropic.claude-code`) reads `~/.claude/settings.json` and fires all
+  hooks with full CLI parity. **GitHub Copilot** (`github.copilot-chat`) does not process Claude
+  Code hooks — it uses MCP tools (`weave_edit_guard`, `weave_close_session`) instead.
 - **GitHub sync:** Use `wv sync --gh` (Python module). The legacy `scripts/sync-weave-gh.sh` bash
   script is deprecated — it causes duplicate issues and missing metadata.
 - **Metadata key in JSON:** Both `wv show --json` and `wv list --json` return metadata under

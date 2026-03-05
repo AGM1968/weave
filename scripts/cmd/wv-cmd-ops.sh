@@ -438,13 +438,21 @@ cmd_session_summary() {
 cmd_recover() {
     local json_mode=false
     local auto_mode=false
+    local session_mode=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --json) json_mode=true ;;
             --auto) auto_mode=true ;;  # Non-interactive (for wv init/work/ship triggers)
+            --session) session_mode=true ;;  # Orphaned active node recovery
         esac
         shift
     done
+
+    # === Session recovery: orphaned active nodes from crashed sessions ===
+    if [ "$session_mode" = true ]; then
+        _recover_session "$json_mode" "$auto_mode"
+        return $?
+    fi
 
     # Source 1: Journal-based recovery (hot zone, lost on reboot)
     local journal_found=false
@@ -716,6 +724,64 @@ _recover_git_commit_push() {
             return 1
         fi
     fi
+}
+
+# _recover_session — List/reclaim orphaned active nodes from crashed sessions
+_recover_session() {
+    local json_mode="$1"
+    local auto_mode="$2"
+
+    # Get all active nodes
+    local active_nodes
+    active_nodes=$(db_query "SELECT id, text FROM nodes WHERE status='active' ORDER BY id;" 2>/dev/null || true)
+
+    local active_count=0
+    if [ -n "$active_nodes" ]; then
+        active_count=$(echo "$active_nodes" | wc -l)
+    fi
+
+    if [ "$active_count" -eq 0 ]; then
+        if [ "$json_mode" = true ]; then
+            echo '{"status":"clean","orphaned_nodes":[],"message":"No orphaned active nodes"}'
+        else
+            echo -e "${GREEN}✓${NC} No orphaned active nodes found"
+        fi
+        return 0
+    fi
+
+    if [ "$json_mode" = true ]; then
+        local json_nodes="[]"
+        json_nodes=$(echo "$active_nodes" | while IFS='|' read -r node_id node_text; do
+            [ -z "$node_id" ] && continue
+            jq -n --arg id "$node_id" --arg text "$node_text" '{id: $id, text: $text}'
+        done | jq -s '.')
+        jq -n --argjson nodes "$json_nodes" --argjson count "$active_count" \
+            '{status: "orphaned", orphaned_nodes: $nodes, count: $count}'
+        return 0
+    fi
+
+    echo -e "${YELLOW}⚠ ${active_count} node(s) marked active (possibly orphaned from a crashed session):${NC}"
+    echo "$active_nodes" | while IFS='|' read -r node_id node_text; do
+        [ -z "$node_id" ] && continue
+        echo "  $node_id: $node_text"
+    done
+    echo ""
+
+    if [ "$auto_mode" = true ]; then
+        echo -e "${CYAN}ℹ${NC} Auto-reclaiming all active nodes for this session"
+        echo "$active_nodes" | while IFS='|' read -r node_id _; do
+            [ -z "$node_id" ] && continue
+            # Nodes are already active — just confirm
+            echo -e "  ${GREEN}✓${NC} $node_id — already active"
+        done
+        return 0
+    fi
+
+    echo "  Options:"
+    echo "    wv work <id>           — Re-claim specific node"
+    echo "    wv done <id>           — Close if work was complete at crash"
+    echo "    wv update <id> --status=todo — Release back to ready queue"
+    return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1843,7 +1909,7 @@ Commands:
   bulk-update       Update multiple nodes from JSON on stdin [--dry-run]
   work <id>         Claim node & set WV_ACTIVE for subagent context [--quiet]
   preflight <id>    Pre-action checks as JSON (blockers, contradictions, context load)
-  recover           Resume incomplete operations (ship/sync/delete) [--auto] [--json]
+  recover           Resume incomplete operations (ship/sync/delete) [--auto] [--json] [--session]
   ready             List unblocked work
   list              List nodes (excludes done by default)
   show <id>         Show node details
@@ -1866,6 +1932,7 @@ Commands:
   digest            Compact one-liner health summary [--json]
   session-summary   Session activity stats (nodes created/completed, learnings)
   audit-pitfalls    Show all pitfalls with resolution status
+  init-repo         Bootstrap repo for Weave [--agent=claude|copilot|all] [--update] [--force]
   doctor            Installation health check (deps, modules, hot zone) [--json]
   selftest          Round-trip smoke test in isolated environment [--json]
   mcp-status        Verify MCP server is built and IDE-configured [--json]
@@ -1943,5 +2010,31 @@ Examples:
   wv learnings --category=pitfall --recent=5
   wv learnings --grep="testing"
   wv done wv-a1b2 --no-warn
+  wv init-repo                                # bootstrap .claude/ for current repo (claude agent)
+  wv init-repo --agent=copilot                # add VS Code Copilot config (.vscode/mcp.json + instructions)
+  wv init-repo --agent=all                    # both claude and copilot
+  wv init-repo --update                       # refresh managed files (skills, agents, instructions)
+  wv init-repo --force                        # overwrite ALL files including user-customized
 EOF
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_init_repo — Bootstrap a repo for Claude Code + Weave (Alt-A architecture)
+#
+# Creates .claude/settings.json with permissions only (no hooks key).
+# Global hooks live in ~/.claude/settings.json — installed by install.sh.
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_init_repo() {
+    # Delegate to the standalone wv-init-repo binary which handles
+    # --agent=claude|copilot|all, --update, --force, skills, agents,
+    # copilot-instructions, mcp.json, etc.
+    local init_repo_bin
+    init_repo_bin=$(command -v wv-init-repo 2>/dev/null || echo "$HOME/.local/bin/wv-init-repo")
+
+    if [ -x "$init_repo_bin" ]; then
+        "$init_repo_bin" "$@"
+    else
+        echo -e "${RED}✗${NC} wv-init-repo not found. Run install.sh first." >&2
+        return 1
+    fi
 }

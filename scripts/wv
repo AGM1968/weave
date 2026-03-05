@@ -151,7 +151,8 @@ main() {
         audit-pitfalls)  cmd_audit_pitfalls "$@" ;;
         edge-types)      cmd_edge_types ;;
         guide)           cmd_guide "$@" ;;
-        
+        init-repo)       cmd_init_repo "$@" ;;
+
         # Quality commands
         quality)         cmd_quality "$@" ;;
         help|--help|-h)  cmd_help ;;

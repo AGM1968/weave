@@ -2,6 +2,55 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.16.0] - 2026-03-05
+
+### Added
+
+- **Crash sentinel detection** — session-start hook writes a sentinel file to `$WV_HOT_ZONE`; if
+  present at next start, the previous session crashed. Auto-generates recovery breadcrumb with crash
+  timestamp and active node list. Two-phase sentinel write catches crashes during DB load.
+
+- **`wv recover --session`** — lists orphaned active nodes from crashed sessions. `--auto` re-claims
+  all, `--json` returns `{status, orphaned_nodes, count}`.
+
+- **Reboot recovery (secondary detection)** — when sentinel is lost (tmpfs cleared on reboot) but
+  active nodes exist, session-start emits a soft warning suggesting `wv recover --session`.
+
+- **`tests/test-crash-sentinel.sh`** — 38 tests covering sentinel lifecycle, crash detection,
+  auto-breadcrumb, `wv recover --session`, reboot recovery, and 5-criterion crash benchmark
+  simulation. Total test count: 568.
+
+### Fixed
+
+- **Context pack failure exit code** — changed from exit 2 (hard block) to exit 1 (soft warning) per
+  hook determinism spec. Prevents false blocks from transient DB contention.
+
+- **Secondary reboot detection** — used `[ ! -f "$SENTINEL" ]` after current session's sentinel was
+  already written (always false). Fixed with `HAD_SENTINEL` flag set before write.
+
+---
+
+## [1.15.0] - 2026-03-05
+
+### Added
+
+- **Alt-A global hooks** — all 9 hooks registered globally in `~/.claude/settings.json` via
+  `install.sh`. Per-project `settings.json` has no `hooks` key (shallow spread kills coexistence).
+
+- **`wv init-repo` delegation** — `wv init-repo` subcommand delegates to standalone `wv-init-repo`
+  binary instead of reimplementing in the main `wv` script.
+
+- **`--agent=copilot|all` support** — `wv-init-repo` scaffolds VS Code Copilot configuration
+  (`.vscode/mcp.json`, `.github/copilot-instructions.md`, `.vscode/settings.json` with
+  `chat.hooks.enabled`).
+
+### Fixed
+
+- **Installed-path edit guard** — `pre-action.sh` blocks edits to `~/.local/bin/` and
+  `~/.local/lib/weave/` with clear error directing to source files in `scripts/`.
+
+---
+
 ## [1.14.0] - 2026-03-03
 
 ### Fixed

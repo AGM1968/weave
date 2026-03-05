@@ -51,7 +51,7 @@ fi
 
 # Find active node (status=active)
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
 if [ ! -x "$WV" ]; then
     # wv not available, allow action
     exit 0
@@ -108,14 +108,13 @@ CACHE_FILE="$CACHE_DIR/${NODE_ID}.json"
 CONTEXT_PACK=$("$WV" context "$NODE_ID" --json 2>/dev/null || echo "")
 
 if [ -z "$CONTEXT_PACK" ]; then
-    cat >&2 <<EOF
+    # Soft warning (exit 1) — wv context may fail due to DB contention, missing
+    # wv binary, or transient errors. Agent is informed but not hard-blocked.
+    cat <<EOF
 ⚠️  Context Pack generation failed for node $NODE_ID.
-
-This is required before editing files. Check:
-- Does the node exist? Run: \`wv show $NODE_ID\`
-- Is the database accessible? Run: \`wv status\`
+Check: wv show $NODE_ID / wv status
 EOF
-    exit 2
+    exit 1
 fi
 
 # Check for contradictions

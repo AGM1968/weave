@@ -17,7 +17,7 @@ if [[ "$COMMAND" =~ wv[[:space:]]update[[:space:]]wv-[0-9a-f]{4,6}.*--status=act
 
     # Get node details
     HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+    source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
     if [ -x "$WV" ]; then
         NODE_TEXT=$("$WV" show "$NODE_ID" 2>/dev/null | grep "Text:" | sed 's/^[^:]*: //' || echo "")
         NODE_TYPE=$("$WV" show "$NODE_ID" --json 2>/dev/null | jq -r '.[0].type // "unknown"' || echo "unknown")

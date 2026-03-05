@@ -237,6 +237,7 @@ mkdir -p "$CONFIG_DIR"
 
 # Create config subdirectories
 mkdir -p "$CONFIG_DIR/hooks"
+mkdir -p "$CONFIG_DIR/lib"
 mkdir -p "$CONFIG_DIR/agents"
 mkdir -p "$CONFIG_DIR/skills/breadcrumbs"
 mkdir -p "$CONFIG_DIR/skills/close-session"
@@ -289,7 +290,10 @@ if [ -f "./scripts/wv" ]; then
     # Scripts
     cp ./scripts/context-guard.sh "$CONFIG_DIR/"
     cp ./scripts/resolve-refs.sh "$CONFIG_DIR/"
-    # Claude hooks
+    # Lib available to hooks from global path (~/.config/weave/hooks/../lib/)
+    cp ./scripts/lib/wv-resolve-project.sh "$CONFIG_DIR/lib/wv-resolve-project.sh"
+    # Claude hooks (all 9 — registered globally via ~/.claude/settings.json under Alt-A)
+    cp ./.claude/hooks/context-guard.sh "$CONFIG_DIR/hooks/"
     cp ./.claude/hooks/session-start-context.sh "$CONFIG_DIR/hooks/"
     cp ./.claude/hooks/session-end-sync.sh "$CONFIG_DIR/hooks/"
     cp ./.claude/hooks/stop-check.sh "$CONFIG_DIR/hooks/"
@@ -322,6 +326,8 @@ if [ -f "./scripts/wv" ]; then
     cp ./.claude/skills/plan-agent/SKILL.md "$CONFIG_DIR/skills/plan-agent/"
     # CLAUDE.md template (generic, not project-specific)
     cp ./templates/CLAUDE.md.template "$CONFIG_DIR/CLAUDE.md.template"
+    # Workflow reference (compact wv cheatsheet for new repos)
+    cp ./templates/WORKFLOW.md "$CONFIG_DIR/WORKFLOW.md"
     # Plan template for wv plan --template
     cp ./templates/PLAN.md.template "$CONFIG_DIR/PLAN.md.template" 2>/dev/null || true
     # Topology enrichment spec template for wv enrich-topology
@@ -374,6 +380,8 @@ else
     # Scripts
     curl -sSL "$REPO/scripts/context-guard.sh" -o "$CONFIG_DIR/context-guard.sh"
     curl -sSL "$REPO/scripts/resolve-refs.sh" -o "$CONFIG_DIR/resolve-refs.sh"
+    # Lib available to hooks from global path (~/.config/weave/hooks/../lib/)
+    curl -sSL "$REPO/scripts/lib/wv-resolve-project.sh" -o "$CONFIG_DIR/lib/wv-resolve-project.sh"
     # Claude hooks
     curl -sSL "$REPO/.claude/hooks/session-start-context.sh" -o "$CONFIG_DIR/hooks/session-start-context.sh"
     curl -sSL "$REPO/.claude/hooks/session-end-sync.sh" -o "$CONFIG_DIR/hooks/session-end-sync.sh"
@@ -406,6 +414,8 @@ else
     curl -sSL "$REPO/.claude/skills/weave-audit/audit-report.sh" -o "$CONFIG_DIR/skills/weave-audit/audit-report.sh"
     # CLAUDE.md template (generic, not project-specific)
     curl -sSL "$REPO/templates/CLAUDE.md.template" -o "$CONFIG_DIR/CLAUDE.md.template"
+    # Workflow reference (compact wv cheatsheet for new repos)
+    curl -sSL "$REPO/templates/WORKFLOW.md" -o "$CONFIG_DIR/WORKFLOW.md" 2>/dev/null || true
     # Plan template for wv plan --template
     curl -sSL "$REPO/templates/PLAN.md.template" -o "$CONFIG_DIR/PLAN.md.template" 2>/dev/null || true
     # Topology enrichment spec template for wv enrich-topology
@@ -420,6 +430,61 @@ chmod +x "$CONFIG_DIR/context-guard.sh"
 chmod +x "$CONFIG_DIR/resolve-refs.sh"
 chmod +x "$CONFIG_DIR/hooks/"*.sh
 chmod +x "$CONFIG_DIR/skills/weave-audit/audit-report.sh"
+
+# Alt-A: Register all hooks globally in ~/.claude/settings.json
+# Per-project settings.json should have NO hooks key (it would shadow global hooks)
+merge_global_claude_settings() {
+    local global_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+    local hooks_dir="$CONFIG_DIR/hooks"
+
+    # Backup before modifying
+    if [ -f "$global_settings" ]; then
+        cp "$global_settings" "${global_settings}.bak"
+    fi
+
+    # Build the complete hooks block with absolute paths (no $HOME — doesn't expand in Claude Code)
+    local hooks_json
+    hooks_json=$(jq -n \
+        --arg h "$hooks_dir" \
+        '{
+            "SessionStart": [{"matcher":"","hooks":[
+                {"type":"command","command":($h+"/context-guard.sh")},
+                {"type":"command","command":($h+"/session-start-context.sh")}
+            ]}],
+            "PreCompact": [{"matcher":"","hooks":[
+                {"type":"command","command":($h+"/pre-compact-context.sh")}
+            ]}],
+            "PreToolUse": [
+                {"matcher":"Edit|Write|NotebookEdit|Bash|mcp__ide__executeCode","hooks":[
+                    {"type":"command","command":($h+"/pre-action.sh"),"timeout":10}
+                ]},
+                {"matcher":"Bash","hooks":[
+                    {"type":"command","command":($h+"/pre-claim-skills.sh"),"timeout":10}
+                ]},
+                {"matcher":"Bash","hooks":[
+                    {"type":"command","command":($h+"/pre-close-verification.sh"),"timeout":10}
+                ]}
+            ],
+            "PostToolUse": [{"matcher":"Edit|Write","hooks":[
+                {"type":"command","command":($h+"/post-edit-lint.sh"),"timeout":30}
+            ]}],
+            "Stop": [{"matcher":"","hooks":[
+                {"type":"command","command":($h+"/stop-check.sh")}
+            ]}],
+            "SessionEnd": [{"matcher":"","hooks":[
+                {"type":"command","command":($h+"/session-end-sync.sh")}
+            ]}]
+        }')
+
+    # Merge into global settings (preserving enabledPlugins and other keys)
+    local existing="{}"
+    [ -f "$global_settings" ] && existing=$(cat "$global_settings")
+    echo "$existing" | jq --argjson hooks "$hooks_json" '. + {hooks: $hooks}' > "$global_settings"
+    echo -e "${GREEN}✓ Registered all hooks in $global_settings${NC}"
+    echo -e "${YELLOW}  Note: per-project .claude/settings.json must NOT have a 'hooks' key${NC}"
+    echo -e "${YELLOW}  (project hooks shadow global hooks — shallow merge limitation)${NC}"
+}
+merge_global_claude_settings
 
 echo -e "${GREEN}✓ Installed wv to $INSTALL_DIR${NC}"
 echo -e "${GREEN}✓ Installed lib modules to $LIB_DIR${NC}"
@@ -684,27 +749,11 @@ fi
 for AGENT in "${AGENTS[@]}"; do
 
 if [ "$AGENT" = "claude" ]; then
-    # Claude Code: hooks, skills, agents, CLAUDE.md, settings.json, settings.local.json
-    # Managed files (always overwritten in --update mode):
-    #   hooks, skills, agents, copilot-instructions.md
-    # User files (only overwritten with --force):
-    #   CLAUDE.md, settings.local.json (settings.json is managed/updated)
-
-    # ── Hooks (managed — always update) ──
-    mkdir -p "$REPO_ROOT/.claude/hooks"
-
-    for hook in context-guard.sh session-start-context.sh session-end-sync.sh stop-check.sh post-edit-lint.sh pre-compact-context.sh pre-claim-skills.sh pre-close-verification.sh pre-action.sh; do
-        src="$CONFIG_DIR/hooks/$hook"
-        [ ! -f "$src" ] && src="$CONFIG_DIR/$hook"
-        if [ -f "$src" ]; then
-            if [ "$UPDATE_MODE" = "1" ] || [ ! -f "$REPO_ROOT/.claude/hooks/$hook" ]; then
-                cp "$src" "$REPO_ROOT/.claude/hooks/"
-                echo -e "  ${GREEN}✓${NC} .claude/hooks/$hook"
-            else
-                echo -e "  ${YELLOW}⊘${NC} .claude/hooks/$hook (exists, use --update to overwrite)"
-            fi
-        fi
-    done
+    # Claude Code: skills, agents, CLAUDE.md, settings.json, settings.local.json
+    # Alt-A architecture (v1.15.0+): hooks fire globally from ~/.claude/settings.json.
+    # Per-project settings.json has NO hooks key — any hooks key shadows globals (shallow spread).
+    # Managed files (always overwritten in --update mode): skills, agents
+    # User files (only overwritten with --force): CLAUDE.md, settings.local.json, settings.json
 
     # ── Skills (managed — always update) ──
     SKILLS=(breadcrumbs close-session fix-issue plan-agent pre-mortem resolve-refs sanity-check ship-it weave weave-audit wv-clarify-spec wv-decompose-work wv-detect-loop wv-guard-scope wv-verify-complete zero-in)
@@ -769,76 +818,21 @@ AGENTSEOF
         echo -e "  ${YELLOW}⊘${NC} CLAUDE.md (user file, use --force to overwrite)"
     fi
 
-    # ── settings.json (managed file — hooks, updated on --update) ──
-    if [ ! -f "$REPO_ROOT/.claude/settings.json" ] || [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]; then
-        cat > "$REPO_ROOT/.claude/settings.json" << 'HOOKSJSONEOF'
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "",
-        "hooks": [
-          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/context-guard.sh" },
-          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-context.sh" }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "matcher": "",
-        "hooks": [
-          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-compact-context.sh" }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|NotebookEdit|Bash|mcp__ide__executeCode",
-        "hooks": [
-          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-action.sh", "timeout": 10 }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-claim-skills.sh", "timeout": 10 }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-close-verification.sh", "timeout": 10 }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write",
-        "hooks": [
-          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-edit-lint.sh", "timeout": 30 }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-check.sh" }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "matcher": "",
-        "hooks": [
-          { "type": "command", "command": "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-end-sync.sh" }
-        ]
-      }
-    ]
-  }
-}
-HOOKSJSONEOF
-        echo -e "  ${GREEN}✓${NC} .claude/settings.json"
+    # ── settings.json (permissions only — NO hooks key, Alt-A) ──
+    # Hooks fire globally from ~/.claude/settings.json. A per-project hooks key
+    # would shadow globals entirely (shallow spread). Only write on init or --force.
+    if [ ! -f "$REPO_ROOT/.claude/settings.json" ] || [ "$FORCE_MODE" = "1" ]; then
+        printf '{"permissions":{"allow":["Write","Edit"]}}\n' | jq . > "$REPO_ROOT/.claude/settings.json"
+        echo -e "  ${GREEN}✓${NC} .claude/settings.json (permissions only)"
+    elif [ "$UPDATE_MODE" = "1" ]; then
+        # On --update, strip any stale hooks key if present
+        existing=$(cat "$REPO_ROOT/.claude/settings.json")
+        if echo "$existing" | jq -e '.hooks' >/dev/null 2>&1; then
+            echo "$existing" | jq 'del(.hooks)' > "$REPO_ROOT/.claude/settings.json"
+            echo -e "  ${GREEN}✓${NC} .claude/settings.json (removed stale hooks key)"
+        else
+            echo -e "  ${YELLOW}⊘${NC} .claude/settings.json (already clean, skipped)"
+        fi
     else
         echo -e "  ${YELLOW}⊘${NC} .claude/settings.json (already exists, skipped)"
     fi

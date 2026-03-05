@@ -1,11 +1,11 @@
 #!/bin/bash
 # SessionEnd hook: Final sync before exit
-# Syncs Weave state to git layer
+# Syncs Weave state to git layer + clears crash sentinel (v1.16.0)
 
 set -e
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
 
 # Read input for reason
 INPUT=$(cat)
@@ -35,5 +35,11 @@ git push 2>/dev/null || true
 
 # Log session end
 echo "[$(date -Iseconds)] Session ended: $REASON" >> .claude/session.log 2>/dev/null || true
+
+# Clear crash sentinel on clean shutdown (must be LAST — if sync/push failed
+# and stop-check blocked exit, sentinel persists for next session detection)
+_SE_REPO_HASH=$(echo "$WV_PROJECT_DIR" | md5sum | cut -c1-8)
+_SE_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_SE_REPO_HASH}}"
+rm -f "${_SE_HOT_ZONE}/.session_sentinel"
 
 exit 0

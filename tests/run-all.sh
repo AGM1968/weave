@@ -53,6 +53,8 @@ declare -a SUITES=(
     "test-sprint34.sh:Sprint 3+4 Commands"
     "test-stress.sh:Stress Tests"
     "test-hooks.sh:Hook Tests"
+    "test-init-repo.sh:Init-Repo Tests"
+    "test-crash-sentinel.sh:Crash Sentinel Tests"
 )
 
 # Results tracking

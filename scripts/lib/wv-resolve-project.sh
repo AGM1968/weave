@@ -14,3 +14,8 @@ if [ -z "$WV_PROJECT_DIR" ]; then
 fi
 export WV_PROJECT_DIR
 WV="$WV_PROJECT_DIR/scripts/wv"
+# Fallback to installed binary when not in the memory-system source repo
+if [ ! -x "$WV" ]; then
+  WV="$HOME/.local/bin/wv"
+fi
+export WV

@@ -6,7 +6,7 @@
 set -e
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
 cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 [ -x "$WV" ] || exit 0
 
