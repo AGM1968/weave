@@ -238,12 +238,11 @@ Hooks enforce workflow rules deterministically — the AI agent cannot bypass st
 - **Structured JSON** — "Ask" decisions output machine-readable JSON for model consumption.
 - **DB pre-flight** — Hooks exit early in non-Weave repos (no spurious errors).
 - **PostToolUse guard** — Lint only runs after successful tool calls.
-- **Project-wide enforcement** — Hooks live in `.claude/settings.json` (checked-in), not
-  `.claude/settings.local.json` (gitignored).
+- **Global hook architecture (v1.15.0)** — All hooks are registered in `~/.claude/settings.json`
+  (global) by `install.sh`. Per-project `.claude/settings.json` contains only permissions — no
+  `hooks` key (shallow merge limitation: project hooks shadow global hooks entirely).
 - **10 Makefile wv targets** — CI integration and discoverability.
-- **VS Code hook support (v1.11.0)** — Cross-environment path resolution
-  (`${CLAUDE_PROJECT_DIR:-.}`), `chat.hooks.enabled` auto-setup via `wv-init-repo`.
-- **MCP `weave_edit_guard` (v1.11.0)** — Pre-edit gate for VS Code Copilot and other MCP clients.
+- **MCP `weave_edit_guard`** — Pre-edit gate for VS Code Copilot and other MCP clients.
 
 ## Code Quality (v1.8.1)
 
