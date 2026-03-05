@@ -1,0 +1,88 @@
+# Plan: [Epic Title]
+
+<!--
+  WEAVE PLAN TEMPLATE — Guidance for documentation & research plans
+
+  This template structures work so `wv plan` can import it into the Weave graph.
+  Each ### Sprint section becomes an epic; numbered items become linked tasks.
+
+  IMPORT:  wv plan <this-file.md> --sprint=N [--gh] [--dry-run]
+  DRY RUN: Always run --dry-run first to preview what will be created.
+  GH SYNC: Use --gh to create GitHub issues for the epic and every task.
+
+  WRITING GUIDANCE:
+  1. Start with Context — what problem are we solving and why now?
+  2. Define Done — what does success look like? Be specific and testable.
+  3. Research first — list unknowns and questions before committing to tasks.
+  4. Tasks should be atomic — each completable in one focused session (~2-4 hours).
+  5. Order tasks by dependency — earlier items should unblock later ones.
+  6. Capture constraints — what's out of scope? What are the non-goals?
+  7. One sprint = one theme — don't mix unrelated concerns.
+  8. Max 6-8 tasks per sprint — more than that signals need to decompose further.
+
+  TASK FORMAT (for wv plan parsing):
+  - Use numbered lists: "1. Task description"
+  - Bold alias prefix: "1. **build-release** — copies shipping manifest"
+    The bold word becomes the node alias (wv show build-release).
+  - Metadata tags in parentheses at end of line:
+    "1. **my-task** — description (priority: 1) (after: other-task)"
+    Supported tags: (priority: N), (after: alias), (status: done)
+  - Mark done items with [x]: "1. [x] Already completed task"
+    Equivalent to (status: done).
+  - Avoid sub-bullets under numbered items (only top-level items become nodes)
+  - Continuation lines: indent 3+ spaces to append to previous task text
+  DOCUMENTATION/RESEARCH TASKS — when a task is research or docs, be specific:
+  - BAD:  "Research packaging options"
+  - GOOD: "Evaluate pip vs pipx vs brew for distribution — write comparison in docs/"
+  - BAD:  "Write documentation"
+  - GOOD: "Write README for public repo — install, init, workflow, MCP setup sections"
+
+  VERIFICATION — each sprint should end with a verification section:
+  - What tests confirm the work is correct?
+  - What manual checks should be performed?
+  - What does "ready for next sprint" mean?
+-->
+
+**Status:** Not Started
+**Date:** YYYY-MM-DD
+**Goal:** [One sentence describing the desired outcome]
+
+## Context
+
+[What problem are we solving? Why now? What prior work exists?]
+
+## Research / Open Questions
+
+- [ ] [Question 1 — what do we need to learn before committing to an approach?]
+- [ ] [Question 2]
+
+## Constraints & Non-Goals
+
+- [What's explicitly out of scope?]
+- [What constraints must we work within?]
+
+---
+
+### Sprint N: [Sprint Title]
+
+1. **[alias]** -- [Description of what this task produces. Be specific about
+   inputs, outputs, and acceptance criteria.]
+
+2. **[alias]** -- [Description] (after: [alias-of-task-1])
+
+3. **[alias]** -- [Description] (priority: 1)
+
+**Verification:**
+- [ ] [How do we know this sprint is done?]
+- [ ] [What tests/checks confirm correctness?]
+
+---
+
+### Sprint N+1: [Next Sprint Title]
+
+1. **[alias]** -- [Description] (after: [alias-from-previous-sprint])
+
+2. **[alias]** -- [Description]
+
+**Verification:**
+- [ ] [Acceptance criteria for this sprint]
