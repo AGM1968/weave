@@ -335,6 +335,8 @@ if [ -f "./scripts/wv" ]; then
     # Makefile template for wv-init-repo
     cp ./templates/Makefile.template "$CONFIG_DIR/Makefile.template" 2>/dev/null || true
     cp ./templates/copilot-instructions.stub.md "$CONFIG_DIR/copilot-instructions.stub.md" 2>/dev/null || true
+    # AGENTS.md template (generic, not project-specific)
+    cp ./templates/AGENTS.md.template "$CONFIG_DIR/AGENTS.md.template" 2>/dev/null || true
 else
     echo -e "${YELLOW}Downloading from GitHub...${NC}"
     REPO="https://raw.githubusercontent.com/AGM1968/weave/main"
@@ -423,6 +425,8 @@ else
     curl -sSL "$REPO/templates/TOPOLOGY-ENRICH.json.template" -o "$CONFIG_DIR/TOPOLOGY-ENRICH.json.template" 2>/dev/null || true
     # Makefile template for wv-init-repo
     curl -sSL "$REPO/templates/Makefile.template" -o "$CONFIG_DIR/Makefile.template" 2>/dev/null || true
+    # AGENTS.md template (generic, not project-specific)
+    curl -sSL "$REPO/templates/AGENTS.md.template" -o "$CONFIG_DIR/AGENTS.md.template" 2>/dev/null || true
 fi
 
 chmod +x "$INSTALL_DIR/wv"
@@ -808,15 +812,32 @@ AGENTSEOF
         echo -e "  ${YELLOW}⊘${NC} .claude/agents/AGENTS.md (already exists, skipped)"
     fi
 
-    # ── CLAUDE.md (user file — only create on init or with --force) ──
-    if [ ! -f "$REPO_ROOT/CLAUDE.md" ] && [ -f "$CONFIG_DIR/CLAUDE.md.template" ]; then
-        cp "$CONFIG_DIR/CLAUDE.md.template" "$REPO_ROOT/CLAUDE.md"
-        echo -e "  ${GREEN}✓${NC} CLAUDE.md"
-    elif [ "$FORCE_MODE" = "1" ] && [ -f "$CONFIG_DIR/CLAUDE.md.template" ]; then
-        cp "$CONFIG_DIR/CLAUDE.md.template" "$REPO_ROOT/CLAUDE.md"
-        echo -e "  ${GREEN}✓${NC} CLAUDE.md (overwritten)"
-    elif [ -f "$REPO_ROOT/CLAUDE.md" ]; then
-        echo -e "  ${YELLOW}⊘${NC} CLAUDE.md (user file, use --force to overwrite)"
+    # ── CLAUDE.md (weave block — prepend/update, preserve project content) ──
+    if [ -f "$CONFIG_DIR/CLAUDE.md.template" ]; then
+        _weave_block=$(cat "$CONFIG_DIR/CLAUDE.md.template")
+        if [ ! -f "$REPO_ROOT/CLAUDE.md" ]; then
+            # New repo: create with weave block + project knowledge placeholder
+            {
+                printf '# Project Instructions\n\n'
+                printf '%s\n' "$_weave_block"
+                printf '\n## Project Knowledge\n\n'
+                printf '<!-- Add project-specific knowledge below: stack, environment, conventions, pitfalls -->\n'
+            } > "$REPO_ROOT/CLAUDE.md"
+            echo -e "  ${GREEN}✓${NC} CLAUDE.md (created with Weave block)"
+        elif grep -q 'WEAVE-BLOCK-START' "$REPO_ROOT/CLAUDE.md"; then
+            # Existing with block: replace the block, preserve everything else
+            _before=$(sed -n '1,/WEAVE-BLOCK-START/{ /WEAVE-BLOCK-START/d; p; }' "$REPO_ROOT/CLAUDE.md")
+            _after=$(sed -n '/WEAVE-BLOCK-END/,${  /WEAVE-BLOCK-END/d; p; }' "$REPO_ROOT/CLAUDE.md")
+            { printf '%s\n' "$_before"; printf '%s\n' "$_weave_block"; printf '%s' "$_after"; } > "$REPO_ROOT/CLAUDE.md"
+            echo -e "  ${GREEN}✓${NC} CLAUDE.md (Weave block updated)"
+        elif [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]; then
+            # Existing without block + --update/--force: prepend block
+            _existing=$(cat "$REPO_ROOT/CLAUDE.md")
+            { printf '%s\n\n' "$_weave_block"; printf '%s\n' "$_existing"; } > "$REPO_ROOT/CLAUDE.md"
+            echo -e "  ${GREEN}✓${NC} CLAUDE.md (Weave block prepended)"
+        else
+            echo -e "  ${YELLOW}⊘${NC} CLAUDE.md (exists without Weave block — use --update to prepend)"
+        fi
     fi
 
     # ── settings.json (permissions only — NO hooks key, Alt-A) ──

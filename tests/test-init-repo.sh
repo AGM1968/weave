@@ -264,10 +264,11 @@ if [ -d "$REPO5/.vscode" ]; then
     fi
 fi
 
-# --update should preserve user CLAUDE.md
+# --update should prepend Weave block but preserve user content
 echo "my custom content" > "$REPO5/CLAUDE.md"
 "$WV" init-repo --update 2>&1 >/dev/null
-assert_equals "my custom content" "$(cat "$REPO5/CLAUDE.md")"  "--update: preserves user CLAUDE.md"
+assert_contains "$(cat "$REPO5/CLAUDE.md")" "WEAVE-BLOCK-START"  "--update: prepends Weave block to CLAUDE.md"
+assert_contains "$(cat "$REPO5/CLAUDE.md")" "my custom content"  "--update: preserves user content in CLAUDE.md"
 
 # --- --help works ---
 echo ""

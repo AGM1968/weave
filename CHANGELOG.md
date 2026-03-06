@@ -2,6 +2,22 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.18.0] - 2026-03-06
+
+### Changed
+
+- **Documentation separation** — all agent instruction files (CLAUDE.md, AGENTS.md,
+  copilot-instructions.md) are now minimal stubs pointing to `~/.config/weave/WORKFLOW.md` as the
+  canonical reference. No workflow commands to drift in per-repo files.
+- **WORKFLOW.md expanded** (60→114 lines) — canonical reference now covers all commands, rules,
+  context packs, skills, and agents.
+- **CLAUDE.md.template** uses `WEAVE-BLOCK-START/END` markers — `wv init-repo --update` can prepend
+  or refresh the Weave block in existing CLAUDE.md files without overwriting project content.
+- **AGENTS.md.template** — new generic stub (23 lines) replaces shipping memory-system's 205-line
+  development reference to the public repo.
+- **build-release.sh** — CLAUDE.md, AGENTS.md, and .github/copilot-instructions.md all generated
+  from templates at build time (no longer ships memory-system-specific copies).
+
 ## [1.17.0] - 2026-03-06
 
 ### Added

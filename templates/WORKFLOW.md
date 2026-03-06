@@ -1,7 +1,7 @@
 # Weave Workflow Reference
 
-Quick reference for `wv` — the task graph CLI for AI coding agents. Full docs: `wv guide` | Command
-list: `wv --help`
+Canonical reference for `wv` — the task graph CLI for AI coding agents. Full docs: `wv guide` (MCP)
+| Command list: `wv --help`
 
 ## Core Workflow
 
@@ -16,22 +16,33 @@ git push                          # 5. MANDATORY before session end
 
 Never edit a file without an active node. If `wv status` shows 0 active, run `wv work <id>` first.
 
-## Key Commands
+## Commands
 
-| Command                  | What it does                                 |
-| ------------------------ | -------------------------------------------- |
-| `wv ready`               | List unblocked work                          |
-| `wv work <id>`           | Claim node (sets active)                     |
-| `wv add "<text>" --gh`   | Create node + GitHub issue                   |
-| `wv done <id>`           | Complete node (auto-closes linked GH issue)  |
-| `wv ship <id>`           | Done + sync + push in one step               |
-| `wv show <id>`           | Node details + blockers                      |
-| `wv list`                | All non-done nodes                           |
-| `wv tree`                | Epic → feature → task hierarchy              |
-| `wv context <id> --json` | Context pack (blockers, ancestors, pitfalls) |
-| `wv sync --gh`           | Persist state + sync GitHub issues           |
-| `wv status`              | Compact status (active/ready/blocked counts) |
-| `wv learnings`           | Show captured decisions, patterns, pitfalls  |
+| Command                   | What it does                                       | Key flags                                    |
+| ------------------------- | -------------------------------------------------- | -------------------------------------------- |
+| `wv ready`                | List unblocked work                                | `--json`, `--count`                          |
+| `wv work <id>`            | Claim node (sets active)                           |                                              |
+| `wv add "<text>"`         | Create node                                        | `--gh`, `--status=`, `--parent=`, `--alias=` |
+| `wv done <id>`            | Complete node (auto-closes linked GH issue)        | `--learning="..."`                           |
+| `wv ship <id>`            | Done + sync + push in one step                     | `--learning="..."`, `--gh`                   |
+| `wv update <id>`          | Modify node                                        | `--status=`, `--text=`, `--alias=`           |
+| `wv quick "<text>"`       | Track trivial work (create active → commit → done) | `--learning="..."`                           |
+| `wv show <id>`            | Node details + blockers                            | `--json`                                     |
+| `wv list`                 | All non-done nodes                                 | `--all`, `--status=`, `--json`               |
+| `wv block <id> --by=<id>` | Add dependency edge                                | Sets target to `blocked`                     |
+| `wv tree`                 | Epic → feature → task hierarchy                    | `--active`, `--depth=N`, `--mermaid`         |
+| `wv path <id>`            | Ancestry chain                                     | `--format=chain`                             |
+| `wv plan <file>`          | Import markdown as epic + tasks                    | `--sprint=N`, `--gh`, `--dry-run`            |
+| `wv context <id> --json`  | Context pack (blockers, ancestors, pitfalls)       | Cached per session                           |
+| `wv search <query>`       | Full-text search                                   | `--json`                                     |
+| `wv status`               | Compact status (active/ready/blocked counts)       |                                              |
+| `wv learnings`            | Show captured decisions/patterns/pitfalls          | `--category=`, `--grep=`, `--dedup`          |
+| `wv health`               | System health check with score                     | `--json`, `--verbose`                        |
+| `wv sync`                 | Dump to `.weave/state.sql`                         | `--gh` for GH sync, `--dry-run`              |
+| `wv load`                 | Restore from `.weave/state.sql`                    | Run by session start hook                    |
+| `wv prune`                | Archive done nodes >48h                            | `--age=`, `--dry-run`                        |
+| `wv quality scan`         | Scan repo for complexity + churn                   | `--exclude=`, `--json`                       |
+| `wv quality hotspots`     | Ranked hotspot report                              | `--top=N`, `--json`                          |
 
 ## Node Statuses
 
@@ -43,6 +54,17 @@ Never edit a file without an active node. If `wv status` shows 0 active, run `wv
 | `blocked`          | Waiting on another node              |
 | `blocked-external` | Waiting on external dep (API, human) |
 
+Lifecycle: `todo` → `active` → `done`. Set `blocked` via `wv block`.
+
+## Context Packs
+
+Run `wv context <id> --json` before starting complex work:
+
+- **Cached per session** — second call is ~40% faster
+- **Auto-invalidates** — cache clears when edges change
+- **Limited output** — top 5 related, top 3 pitfalls (prevents context explosion)
+- **Nested learnings** — ancestors include decision/pattern/pitfall from metadata
+
 ## GitHub Integration
 
 ```bash
@@ -51,10 +73,42 @@ wv done <id>                        # Closes node AND linked GH issue
 wv sync --gh                        # Sync all nodes ↔ GH issues
 ```
 
-## Learnings Format
+Always use `--gh` when work should be visible in GitHub. `wv done` auto-closes linked issues.
+
+## Learnings
 
 ```bash
-wv done <id> --learning="decision: what was chosen and why | pattern: reusable technique | pitfall: gotcha to avoid"
+wv done <id> --learning="decision: what was chosen | pattern: reusable technique | pitfall: gotcha to avoid"
 ```
 
 Good learnings are specific, actionable, and scoped to a concrete context.
+
+## Rules
+
+1. **Track ALL work** — `wv work <id>` or `wv add "<text>" --status=active` before editing files.
+   Use `--gh --parent=<epic-id>` to link. Never edit without an active node.
+2. **No untracked fixes** — even one-line changes get a node. Use `wv quick "<what>"` for trivial
+   work.
+3. **GitHub workflow** — create with `--gh`, close with `wv done` (auto-closes issue). Check
+   `gh issue list` before session end.
+4. **Sync + push mandatory** — `wv sync --gh` then `git push` before session end. Commit
+   incrementally after each logical unit, not all at the end.
+5. **Check context** — run `wv context <id> --json` before starting complex work.
+6. **IDs are `wv-xxxxxx`** (4-6 hex chars). Use exact IDs from `wv ready`.
+7. **Capture learnings** — use `--learning="..."` on `wv done` for non-trivial work.
+8. **Bound session scope** — limit to 4-5 tasks per session. Context limits kill sessions mid-task.
+9. **No hook bypass** — never use `--no-verify` or `WV_SKIP_PRECOMMIT=1`.
+
+**Violation check:** If `wv status` shows 0 active nodes, STOP and claim one first.
+
+## Skills
+
+- `/weave [<id>|<text>]` — Graph-first orchestrator (primary interface)
+- `/breadcrumbs [<id>]` — Session memory capsule
+- `/close-session` — End-of-session sync + push protocol
+
+## Agents
+
+- **weave-guide** — Workflow best practices, anti-patterns
+- **epic-planner** — Strategic planning (scope, dependencies, risks)
+- **learning-curator** — Extract learnings, retrospective analysis
