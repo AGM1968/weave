@@ -1,20 +1,23 @@
 # GitHub Copilot Instructions
 
-This repository uses the **Weave** graph-based workflow system. **Every code change must follow
-this workflow. No exceptions.** Enforcement is layered:
+> **This is the memory-system development reference** — the full workflow is appropriate here
+> because this repo IS Weave. For the minimal template used in target repos, see
+> `templates/copilot-instructions.stub.md`.
+
+This repository uses the **Weave** graph-based workflow system. **Every code change must follow this
+workflow. No exceptions.** Enforcement is layered:
 
 1. **MCP edit guard** -- `weave_edit_guard` returns an error if no active node (advisory; agent must
    invoke explicitly before every edit -- there is no automatic pre-edit hard block in VS Code)
 2. **Git pre-commit hook** -- blocks commits without an active node (deterministic, last-resort
    safety net)
 
-> **GitHub Copilot enforcement gap:** Claude Code's `~/.claude/settings.json` PreToolUse hooks
-> (which fire deterministically with `exit 2` before every file edit) fire in the **Claude Code
-> CLI and Claude Code VS Code extension** (`anthropic.claude-code`) but do **not** fire in
-> **GitHub Copilot** (this agent). GitHub Copilot agents rely entirely on the MCP
-> `weave_edit_guard` tool (advisory, agent-invoked) and the git pre-commit hook. This means the
-> pre-edit gate is cooperative, not enforced -- `weave_edit_guard` must be called correctly per
-> these instructions.
+> **Enforcement model (v1.17.0):** All agents (`claude` CLI, `@copilot`, `@claude`) read hooks from
+> `~/.claude/settings.json`. VS Code ignores matchers — hooks fire on every tool invocation. The
+> scripts handle both Claude Code tool names (`Edit`/`Write`) and VS Code tool names
+> (`create_file`/`replace_string_in_file`), including camelCase `tool_input` properties
+> (`filePath`). The MCP `weave_edit_guard` provides an additional advisory gate; the git pre-commit
+> hook is the last-resort safety net.
 
 ## Session Start (MANDATORY)
 
@@ -54,6 +57,7 @@ wv plan <file> --sprint=N --gh  # Import markdown plan as epic + tasks with GH i
 ensures graph-first workflow. It returns an error if no active Weave node exists.
 
 If `weave_edit_guard` returns an error:
+
 1. STOP — do not edit any files
 2. Run `weave_overview` to see available work
 3. Claim work with `wv work <id>` or `wv add "<description>" --gh --status=active`
@@ -68,10 +72,8 @@ without tracking. This gate catches it at edit time.
 
 - One active node at a time
 - Commit incrementally after each logical unit -- don't accumulate
-- Store commit hashes in node metadata:
-  `wv update <id> --metadata='{"commit":"<hash>"}'`
-- Save session breadcrumbs between tasks:
-  `wv breadcrumbs save --msg="<what was done, what's next>"`
+- Store commit hashes in node metadata: `wv update <id> --metadata='{"commit":"<hash>"}'`
+- Save session breadcrumbs between tasks: `wv breadcrumbs save --msg="<what was done, what's next>"`
 - View epic progress: `wv tree --active`
 
 ## Mermaid Graphs (REQUIRED for epics and features)
@@ -113,8 +115,8 @@ graph TD
     task3 -.->|blocked by| task2
 ```
 
-If your client supports `renderMermaidDiagram`, use it to display the graph inline.
-If not, include the Mermaid markup in a fenced code block in breadcrumbs or commit messages.
+If your client supports `renderMermaidDiagram`, use it to display the graph inline. If not, include
+the Mermaid markup in a fenced code block in breadcrumbs or commit messages.
 
 ## Completing Work
 
@@ -136,27 +138,27 @@ won't have their status reflected on GitHub.
 ## MCP Tools (31 total)
 
 **Four MCP server instances must all be running** for full tool coverage (`weave`, `weave-graph`,
-`weave-session`, `weave-inspect` — all pre-configured in `.vscode/mcp.json`). Restart via
-Command Palette → **MCP: Restart Server** after any `npm run build` in `mcp/`.
+`weave-session`, `weave-inspect` — all pre-configured in `.vscode/mcp.json`). Restart via Command
+Palette → **MCP: Restart Server** after any `npm run build` in `mcp/`.
 
 If your client supports MCP, prefer compound tools over CLI for multi-step operations:
 
 <!-- markdownlint-disable MD060 -->
 
-| Tool               | Equivalent CLI                         | Use for              |
-| ------------------ | -------------------------------------- | -------------------- |
-| `weave_overview`   | `wv status` + `wv health` + `wv ready` | Session start        |
-| `weave_work`       | `wv work <id>` + `wv context <id>`     | Claiming tasks       |
-| `weave_ship`       | `wv ship <id>`                         | Completing tasks     |
-| `weave_edit_guard` | (no CLI equivalent)                    | **Pre-edit gate**    |
-| `weave_preflight`  | `wv preflight <id>`                    | Pre-action checks    |
-| `weave_quick`      | `wv add` + `wv done` + `wv sync`       | Trivial one-step     |
-| `weave_tree`       | `wv tree --json`                       | Epic hierarchy       |
-| `weave_learnings`  | `wv learnings --json`                  | Check prior work     |
-| `weave_plan`       | `wv plan <file> --sprint=N`            | Import plan          |
-| `weave_breadcrumbs`| `wv breadcrumbs save/show/clear`       | Session handoff      |
-| `weave_update`     | `wv update <id> --metadata=...`        | Enrich nodes         |
-| `weave_guide`      | `wv guide --topic=<topic>`             | Workflow quick ref   |
+| Tool                | Equivalent CLI                         | Use for            |
+| ------------------- | -------------------------------------- | ------------------ |
+| `weave_overview`    | `wv status` + `wv health` + `wv ready` | Session start      |
+| `weave_work`        | `wv work <id>` + `wv context <id>`     | Claiming tasks     |
+| `weave_ship`        | `wv ship <id>`                         | Completing tasks   |
+| `weave_edit_guard`  | (no CLI equivalent)                    | **Pre-edit gate**  |
+| `weave_preflight`   | `wv preflight <id>`                    | Pre-action checks  |
+| `weave_quick`       | `wv add` + `wv done` + `wv sync`       | Trivial one-step   |
+| `weave_tree`        | `wv tree --json`                       | Epic hierarchy     |
+| `weave_learnings`   | `wv learnings --json`                  | Check prior work   |
+| `weave_plan`        | `wv plan <file> --sprint=N`            | Import plan        |
+| `weave_breadcrumbs` | `wv breadcrumbs save/show/clear`       | Session handoff    |
+| `weave_update`      | `wv update <id> --metadata=...`        | Enrich nodes       |
+| `weave_guide`       | `wv guide --topic=<topic>`             | Workflow quick ref |
 
 Other tools: `weave_add`, `weave_done`, `weave_batch_done`, `weave_link`, `weave_list`,
 `weave_context`, `weave_search`, `weave_status`, `weave_health`, `weave_sync`, `weave_resolve`,
@@ -167,28 +169,28 @@ For CLI operations via terminal: `wv` works -- but the workflow steps above are 
 
 ## Command Reference
 
-| Command                   | Usage                                   | Key Flags                                  |
-| ------------------------- | --------------------------------------- | ------------------------------------------ |
-| `wv ready`                | List unblocked tasks                    | `--json`, `--count`                        |
-| `wv add <text>`           | Create node (returns wv-xxxxxx ID)        | `--gh`, `--alias=`, `--status=`            |
-| `wv work <id>`            | Claim task (sets active)                | Exports WV_ACTIVE for subagents            |
-| `wv done <id>`            | Complete task                           | `--learning="..."` (always include)        |
-| `wv ship <id>`            | Done + sync + push in one step          | `--learning="..."`                         |
-| `wv update <id>`          | Modify node                             | `--status=`, `--text=`, `--metadata=`      |
-| `wv show <id>`            | Node details                            | `--json`                                   |
-| `wv list`                 | Non-done nodes                          | `--all`, `--status=`, `--json`             |
-| `wv tree`                 | Epic hierarchy                          | `--active`, `--depth=N`, `--json`          |
-| `wv link <from> <to>`     | Create edge between nodes               | `--type=implements\|blocks\|related`       |
-| `wv block <id> --by=<id>` | Add dependency                          | Sets target to blocked                     |
-| `wv context <id>`         | Full context pack                       | `--json` (cached per session)              |
-| `wv learnings`            | View captured patterns/decisions        | `--grep=`, `--recent=N`, `--category=`     |
-| `wv search <query>`       | Full-text search                        | `--json`                                   |
-| `wv plan <file>`          | Import markdown as epic + tasks         | `--sprint=N`, `--gh`, `--dry-run`          |
-| `wv breadcrumbs`          | Session context notes                   | `save --msg=`, `show`, `clear`             |
-| `wv health`               | System health check                     | `--json`, `--verbose`                      |
-| `wv status`               | Compact status summary                  |                                            |
-| `wv sync`                 | Persist graph to disk                   | `--gh` (sync GitHub issues)                |
-| `wv prune`                | Archive old done nodes                  | `--age=`, `--dry-run`                      |
+| Command                   | Usage                              | Key Flags                              |
+| ------------------------- | ---------------------------------- | -------------------------------------- |
+| `wv ready`                | List unblocked tasks               | `--json`, `--count`                    |
+| `wv add <text>`           | Create node (returns wv-xxxxxx ID) | `--gh`, `--alias=`, `--status=`        |
+| `wv work <id>`            | Claim task (sets active)           | Exports WV_ACTIVE for subagents        |
+| `wv done <id>`            | Complete task                      | `--learning="..."` (always include)    |
+| `wv ship <id>`            | Done + sync + push in one step     | `--learning="..."`                     |
+| `wv update <id>`          | Modify node                        | `--status=`, `--text=`, `--metadata=`  |
+| `wv show <id>`            | Node details                       | `--json`                               |
+| `wv list`                 | Non-done nodes                     | `--all`, `--status=`, `--json`         |
+| `wv tree`                 | Epic hierarchy                     | `--active`, `--depth=N`, `--json`      |
+| `wv link <from> <to>`     | Create edge between nodes          | `--type=implements\|blocks\|related`   |
+| `wv block <id> --by=<id>` | Add dependency                     | Sets target to blocked                 |
+| `wv context <id>`         | Full context pack                  | `--json` (cached per session)          |
+| `wv learnings`            | View captured patterns/decisions   | `--grep=`, `--recent=N`, `--category=` |
+| `wv search <query>`       | Full-text search                   | `--json`                               |
+| `wv plan <file>`          | Import markdown as epic + tasks    | `--sprint=N`, `--gh`, `--dry-run`      |
+| `wv breadcrumbs`          | Session context notes              | `save --msg=`, `show`, `clear`         |
+| `wv health`               | System health check                | `--json`, `--verbose`                  |
+| `wv status`               | Compact status summary             |                                        |
+| `wv sync`                 | Persist graph to disk              | `--gh` (sync GitHub issues)            |
+| `wv prune`                | Archive old done nodes             | `--age=`, `--dry-run`                  |
 
 ## Common Pitfalls
 

@@ -14,8 +14,10 @@ TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 TOOL_INPUT=$(echo "$INPUT" | jq -r '.tool_input // empty' 2>/dev/null)
 
 # Block edits to installed copies (should edit source in scripts/ instead)
-if [[ "$TOOL" =~ ^(Edit|Write)$ ]]; then
-    FILE_PATH=$(echo "$TOOL_INPUT" | jq -r '.file_path // empty' 2>/dev/null)
+# Handles both Claude Code tool names (Edit/Write) and VS Code tool names (create_file, etc.)
+if [[ "$TOOL" =~ ^(Edit|Write|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file)$ ]]; then
+    # VS Code sends camelCase (filePath), Claude Code sends snake_case (file_path)
+    FILE_PATH=$(echo "$TOOL_INPUT" | jq -r '.file_path // .filePath // empty' 2>/dev/null)
     if [[ "$FILE_PATH" =~ \.local/(bin|lib/weave) ]]; then
         cat >&2 <<EOF
 ERROR: Editing installed copy at $FILE_PATH
@@ -32,13 +34,14 @@ fi
 # Check if this is an operation we should enforce
 SHOULD_CHECK=false
 
-# Edit operations (Edit, Write, NotebookEdit) and IDE code execution
-if [[ "$TOOL" =~ ^(Edit|Write|NotebookEdit|mcp__ide__executeCode)$ ]]; then
+# Edit operations — Claude Code names + VS Code names (matchers are ignored in VS Code,
+# so all hooks fire on all tools; this filter is what actually gates enforcement)
+if [[ "$TOOL" =~ ^(Edit|Write|NotebookEdit|mcp__ide__executeCode|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file|edit_notebook_file)$ ]]; then
     SHOULD_CHECK=true
 fi
 
-# Bash commands: wv done or wv-close (but NOT wv add, wv show, wv ready, etc.)
-if [[ "$TOOL" == "Bash" ]]; then
+# Terminal commands: wv done or wv-close — Claude Code (Bash) + VS Code (run_in_terminal)
+if [[ "$TOOL" == "Bash" || "$TOOL" == "run_in_terminal" ]]; then
     CMD=$(echo "$TOOL_INPUT" | jq -r '.cmd // .command // empty' 2>/dev/null)
     if [[ "$CMD" =~ (wv[[:space:]]+done|wv-close|wv[[:space:]]done) ]]; then
         SHOULD_CHECK=true

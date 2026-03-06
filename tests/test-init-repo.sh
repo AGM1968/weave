@@ -193,22 +193,28 @@ cd "$REPO3"
 OUTPUT=$("$WV" init-repo --agent=copilot 2>&1)
 assert_file_exists "$REPO3/.vscode/mcp.json"                "copilot: creates .vscode/mcp.json"
 assert_file_exists "$REPO3/.github/copilot-instructions.md" "copilot: creates copilot-instructions.md"
-assert_file_exists "$REPO3/.vscode/settings.json"           "copilot: creates .vscode/settings.json"
+assert_file_exists "$REPO3/.github/hooks/README.md"         "copilot: scaffolds .github/hooks/"
 
 # Verify mcp.json points to MCP server
 MCP_JSON=$(cat "$REPO3/.vscode/mcp.json")
 assert_contains "$MCP_JSON" '"weave"'                       "copilot: mcp.json has weave server"
 assert_contains "$MCP_JSON" 'index.js'                      "copilot: mcp.json points to index.js"
 
-# Verify .vscode/settings.json enables hooks
-VS_SETTINGS=$(cat "$REPO3/.vscode/settings.json")
-assert_contains "$VS_SETTINGS" 'chat.hooks.enabled'         "copilot: VS Code settings enable hooks"
+# Verify ghost setting is NOT written
+if [ -f "$REPO3/.vscode/settings.json" ]; then
+    VS_SETTINGS=$(cat "$REPO3/.vscode/settings.json")
+    assert_not_contains "$VS_SETTINGS" 'chat.hooks.enabled' "copilot: NO ghost setting in .vscode/settings.json"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "${GREEN}✓${NC} copilot: .vscode/settings.json not created (ghost setting removed)"
+fi
 
-# Verify copilot-instructions has workflow content
+# Verify copilot-instructions is minimal stub (not workflow dump)
 COPILOT=$(cat "$REPO3/.github/copilot-instructions.md")
 assert_contains "$COPILOT" "Weave"                          "copilot: instructions mention Weave"
-assert_contains "$COPILOT" "wv work"                        "copilot: instructions include wv work"
 assert_contains "$COPILOT" "weave_edit_guard"               "copilot: instructions include edit guard"
+assert_contains "$COPILOT" "weave_guide"                    "copilot: instructions reference weave_guide"
+assert_not_contains "$COPILOT" "MCP Tools (31 total)"       "copilot: stub does NOT contain MCP tools dump"
+assert_not_contains "$COPILOT" "Session Start (MANDATORY)"  "copilot: stub does NOT contain workflow commands"
 
 # copilot-only should NOT create claude-specific files
 assert_file_absent "$REPO3/CLAUDE.md"                       "copilot-only: no CLAUDE.md"
@@ -245,6 +251,18 @@ echo "stale" > "$REPO5/.github/copilot-instructions.md"
 OUTPUT=$("$WV" init-repo --agent=all --update 2>&1)
 COPILOT5=$(cat "$REPO5/.github/copilot-instructions.md")
 assert_contains "$COPILOT5" "Weave"                         "--update: refreshes copilot-instructions.md"
+
+# --update should strip ghost setting from .vscode/settings.json
+if [ -d "$REPO5/.vscode" ]; then
+    echo '{"chat.hooks.enabled": true, "other.setting": 42}' > "$REPO5/.vscode/settings.json"
+    "$WV" init-repo --agent=copilot --update 2>&1 >/dev/null
+    if [ -f "$REPO5/.vscode/settings.json" ]; then
+        VS5=$(cat "$REPO5/.vscode/settings.json")
+        assert_not_contains "$VS5" 'chat.hooks.enabled'     "--update: strips ghost setting from .vscode/settings.json"
+    else
+        TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "${GREEN}✓${NC} --update: .vscode/settings.json cleaned up"
+    fi
+fi
 
 # --update should preserve user CLAUDE.md
 echo "my custom content" > "$REPO5/CLAUDE.md"

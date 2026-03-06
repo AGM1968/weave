@@ -1352,7 +1352,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.16.1",
+      version: "1.17.0",
     },
     {
       capabilities: {

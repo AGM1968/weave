@@ -207,6 +207,66 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "pre-action: exits 0 for mcp__ide__executeCode with active node"
 
+# --- pre-action.sh (VS Code tool names — SHOULD_CHECK coverage) ---
+echo ""
+echo "--- pre-action.sh (VS Code tool names) ---"
+
+# create_file without active node: must block (exit 2)
+setup_test_env
+set +e
+OUTPUT=$(echo '{"tool_name":"create_file","tool_input":{"filePath":"new.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "2" "$EXIT_CODE" "pre-action: exits 2 for create_file without active node"
+
+# replace_string_in_file without active node: must block (exit 2)
+setup_test_env
+set +e
+OUTPUT=$(echo '{"tool_name":"replace_string_in_file","tool_input":{"filePath":"src/main.ts"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "2" "$EXIT_CODE" "pre-action: exits 2 for replace_string_in_file without active node"
+
+# create_file with active node: must allow (exit 0)
+setup_test_env
+"$WV" add "VS Code test task" --status=active 2>/dev/null
+set +e
+OUTPUT=$(echo '{"tool_name":"create_file","tool_input":{"filePath":"new.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-action: exits 0 for create_file with active node"
+
+# run_in_terminal (VS Code Bash equivalent): non-wv-done command passes through
+setup_test_env
+set +e
+OUTPUT=$(echo '{"tool_name":"run_in_terminal","tool_input":{"command":"ls -la"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-action: exits 0 for run_in_terminal with non-wv command"
+
+# --- pre-action.sh (camelCase filePath — installed-path guard) ---
+echo ""
+echo "--- pre-action.sh (camelCase filePath guard) ---"
+
+# VS Code sends filePath (camelCase) — must detect installed-path edits
+setup_test_env
+"$WV" add "filePath guard test" --status=active 2>/dev/null
+set +e
+OUTPUT=$(echo '{"tool_name":"create_file","tool_input":{"filePath":"/home/user/.local/lib/weave/lib/something.sh"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "2" "$EXIT_CODE" "pre-action: blocks installed-path edit via camelCase filePath"
+assert_contains "$OUTPUT" "installed copy" "pre-action: shows installed-path error for camelCase filePath"
+
+# Claude Code sends file_path (snake_case) — existing behavior still works
+setup_test_env
+"$WV" add "file_path guard test" --status=active 2>/dev/null
+set +e
+OUTPUT=$(echo '{"tool_name":"Edit","tool_input":{"file_path":"/home/user/.local/bin/wv"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "2" "$EXIT_CODE" "pre-action: blocks installed-path edit via snake_case file_path"
+
 # --- pre-claim-skills.sh (matching command) ---
 echo ""
 echo "--- pre-claim-skills.sh ---"

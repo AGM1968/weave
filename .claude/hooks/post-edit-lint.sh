@@ -10,7 +10,8 @@ set -e
 # Read JSON input
 INPUT=$(cat)
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""')
-FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path // ""')
+# VS Code sends camelCase (filePath), Claude Code sends snake_case (file_path)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.filePath // .tool_input.path // ""')
 
 # Skip linting if the tool call itself failed (tool_response.success = false)
 # PostToolUseFailure fires for hard failures; this guards soft/partial failures

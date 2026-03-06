@@ -334,6 +334,7 @@ if [ -f "./scripts/wv" ]; then
     cp ./templates/TOPOLOGY-ENRICH.json.template "$CONFIG_DIR/TOPOLOGY-ENRICH.json.template" 2>/dev/null || true
     # Makefile template for wv-init-repo
     cp ./templates/Makefile.template "$CONFIG_DIR/Makefile.template" 2>/dev/null || true
+    cp ./templates/copilot-instructions.stub.md "$CONFIG_DIR/copilot-instructions.stub.md" 2>/dev/null || true
 else
     echo -e "${YELLOW}Downloading from GitHub...${NC}"
     REPO="https://raw.githubusercontent.com/AGM1968/weave/main"
@@ -455,7 +456,7 @@ merge_global_claude_settings() {
                 {"type":"command","command":($h+"/pre-compact-context.sh")}
             ]}],
             "PreToolUse": [
-                {"matcher":"Edit|Write|NotebookEdit|Bash|mcp__ide__executeCode","hooks":[
+                {"matcher":"Edit|Write|NotebookEdit|Bash|mcp__ide__executeCode|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file|run_in_terminal|edit_notebook_file","hooks":[
                     {"type":"command","command":($h+"/pre-action.sh"),"timeout":10}
                 ]},
                 {"matcher":"Bash","hooks":[
@@ -465,7 +466,7 @@ merge_global_claude_settings() {
                     {"type":"command","command":($h+"/pre-close-verification.sh"),"timeout":10}
                 ]}
             ],
-            "PostToolUse": [{"matcher":"Edit|Write","hooks":[
+            "PostToolUse": [{"matcher":"Edit|Write|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file","hooks":[
                 {"type":"command","command":($h+"/post-edit-lint.sh"),"timeout":30}
             ]}],
             "Stop": [{"matcher":"","hooks":[
@@ -931,269 +932,61 @@ MCPEOF
         echo -e "  ${YELLOW}⊘${NC} .vscode/mcp.json (user file, use --force to overwrite)"
     fi
 
-    # ── .vscode/settings.json — enable hooks (merge, don't overwrite) ──
+    # ── .vscode/settings.json — strip ghost setting on --update ──
     _VSCODE_SETTINGS="$REPO_ROOT/.vscode/settings.json"
-    if [ -f "$_VSCODE_SETTINGS" ]; then
-        # Merge: add chat.hooks.enabled if not already present
-        if ! grep -q '"chat.hooks.enabled"' "$_VSCODE_SETTINGS" 2>/dev/null; then
-            # Insert after opening brace
-            sed -i '1s/{/{\n  "chat.hooks.enabled": true,/' "$_VSCODE_SETTINGS"
-            echo -e "  ${GREEN}✓${NC} .vscode/settings.json (added chat.hooks.enabled)"
-        else
-            echo -e "  ${YELLOW}⊘${NC} .vscode/settings.json (chat.hooks.enabled already set)"
+    if [ "$UPDATE_MODE" = "1" ] && [ -f "$_VSCODE_SETTINGS" ]; then
+        if grep -q '"chat.hooks.enabled"' "$_VSCODE_SETTINGS" 2>/dev/null; then
+            # Remove the ghost setting line (and trailing comma if present)
+            sed -i '/"chat\.hooks\.enabled"/d' "$_VSCODE_SETTINGS"
+            # Clean up empty JSON object or trailing commas
+            if python3 -c "import json,sys; d=json.load(open('$_VSCODE_SETTINGS')); json.dump(d,open('$_VSCODE_SETTINGS','w'),indent=2)" 2>/dev/null; then
+                echo -e "  ${GREEN}✓${NC} .vscode/settings.json (stripped ghost setting chat.hooks.enabled)"
+            else
+                echo -e "  ${YELLOW}⚠${NC} .vscode/settings.json (removed chat.hooks.enabled, verify JSON)"
+            fi
         fi
-    else
-        cat > "$_VSCODE_SETTINGS" << 'VSETTINGSEOF'
-{
-  "chat.hooks.enabled": true
-}
-VSETTINGSEOF
-        echo -e "  ${GREEN}✓${NC} .vscode/settings.json (created with chat.hooks.enabled)"
     fi
 
-    # ── copilot-instructions.md (managed — always update) ──
+    # ── .github/hooks/ — VS Code native hook location (scaffold on init) ──
+    if [ ! -d "$REPO_ROOT/.github/hooks" ]; then
+        mkdir -p "$REPO_ROOT/.github/hooks"
+        cat > "$REPO_ROOT/.github/hooks/README.md" << 'GHHOOKSEOF'
+# VS Code Hooks
+
+This directory is the VS Code-native hook location (`chat.hookFilesLocations`).
+Place `*.json` hook configuration files here for team-shared VS Code hooks.
+
+Global personal hooks live in `~/.claude/settings.json` and fire for all agents.
+GHHOOKSEOF
+        echo -e "  ${GREEN}✓${NC} .github/hooks/ (VS Code hook directory scaffolded)"
+    else
+        echo -e "  ${YELLOW}⊘${NC} .github/hooks/ (already exists)"
+    fi
+
+    # ── copilot-instructions.md (managed — always update from template) ──
     mkdir -p "$REPO_ROOT/.github"
+    _STUB_TEMPLATE="$CONFIG_DIR/copilot-instructions.stub.md"
     if [ ! -f "$REPO_ROOT/.github/copilot-instructions.md" ] || [ "$UPDATE_MODE" = "1" ]; then
-        cat > "$REPO_ROOT/.github/copilot-instructions.md" << 'COPILOTEOF'
+        if [ -f "$_STUB_TEMPLATE" ]; then
+            cp "$_STUB_TEMPLATE" "$REPO_ROOT/.github/copilot-instructions.md"
+        else
+            # Fallback: inline minimal stub if template not installed
+            cat > "$REPO_ROOT/.github/copilot-instructions.md" << 'COPILOTEOF'
 # GitHub Copilot Instructions
 
-This repository uses the **Weave** graph-based workflow system. **Every code change must follow
-this workflow. No exceptions.** Enforcement is layered:
+This repository uses **Weave** for task tracking. Every code change must be tracked.
 
-1. **MCP edit guard** -- `weave_edit_guard` returns an error if no active node (advisory; agent must
-   invoke explicitly before every edit -- there is no automatic pre-edit hard block in VS Code)
-2. **Git pre-commit hook** -- blocks commits without an active node (deterministic, last-resort
-   safety net)
+## Before every file edit
 
-> **GitHub Copilot enforcement gap:** Claude Code's `~/.claude/settings.json` PreToolUse hooks
-> (which fire deterministically with exit 2 before every file edit) fire in the Claude Code CLI and
-> Claude Code VS Code extension (`anthropic.claude-code`) but **do not fire in GitHub Copilot**
-> (this agent). GitHub Copilot agents rely entirely on the MCP `weave_edit_guard` tool (advisory,
-> agent-invoked) and the git pre-commit hook. This means the pre-edit gate is cooperative, not
-> enforced -- `weave_edit_guard` must be called correctly per these instructions.
+Call `weave_edit_guard` (MCP) before any edit. If blocked, claim a task first.
 
-## Session Start (MANDATORY)
+## Reference
 
-Run these before doing any work:
+- MCP: `weave_guide` (topics: workflow, github, learnings, context)
+- CLI: `~/.config/weave/WORKFLOW.md`
 
-```bash
-wv status                    # Check active/ready/blocked counts
-wv learnings                 # Review captured patterns and pitfalls
-wv ready                     # Find unblocked work
-wv guide                     # Workflow quick reference (topics: workflow, github, learnings, context)
-```
-
-Or via MCP: call `weave_overview` which returns status + health + ready work in one call. Use
-`weave_guide` (topic: workflow|github|learnings|context) for a workflow reference without leaving
-your client.
-
-## Before Every Task
-
-```bash
-wv work <id>                 # Claim an existing task, OR:
-wv add "<description>" --gh --alias=<short-name>  # Create new node + GitHub issue
-wv context <id> --json       # Understand dependencies and blockers
-wv plan <file> --sprint=N --gh  # Import markdown plan as epic + tasks with GH issues
-```
-
-**Rules:**
-
-- Always use `--gh` when creating nodes -- every task needs a GitHub issue
-- Always use `--alias=<name>` -- short names make the graph readable
-- Always run `wv context <id> --json` before complex work
-- Check learnings with `wv learnings --grep="<topic>"` for relevant prior decisions
-- For epics: use `wv plan <file> --sprint=N --gh` to import structured plans
-
-## BEFORE ANY FILE EDIT (mandatory gate)
-
-**Call `weave_edit_guard` (MCP) before every file modification.** This is the enforcement gate that
-ensures graph-first workflow. It returns an error if no active Weave node exists.
-
-If `weave_edit_guard` returns an error:
-1. STOP — do not edit any files
-2. Run `weave_overview` to see available work
-3. Claim work with `wv work <id>` or `wv add "<description>" --gh --status=active`
-4. Re-call `weave_edit_guard` to confirm — it should return OK
-5. Only then proceed with the file edit
-
-**Why this matters:** Without this gate, edits happen outside the graph and the audit trail is
-broken. The git pre-commit hook catches this at commit time, but by then the work is already done
-without tracking. This gate catches it at edit time.
-
-## During Work
-
-- One active node at a time
-- Commit incrementally after each logical unit -- don't accumulate
-- Store commit hashes in node metadata:
-  `wv update <id> --metadata='{"commit":"<hash>"}'`
-- Save session breadcrumbs between tasks:
-  `wv breadcrumbs save --msg="<what was done, what's next>"`
-- View epic progress: `wv tree --active`
-
-## Mermaid Graphs (REQUIRED for epics and features)
-
-When working on epics or multi-task features, generate Mermaid dependency/progress graphs to
-visualize the work. This is what makes Weave a graph system, not a flat checklist.
-
-**When to generate:**
-
-- At epic creation: show the full dependency structure
-- During work: show progress (done/active/blocked status)
-- At epic completion: show the final state
-
-**How to build from `wv tree --json`:**
-
-1. Call `wv tree --json` (or MCP `weave_tree`) to get the hierarchy
-2. Build a Mermaid flowchart from the JSON:
-   - Use aliases as node labels (fall back to truncated text)
-   - Color by status: done=green, active=blue, blocked=red, todo=gray
-   - Show implements/blocks edges from the tree structure
-
-**Example pattern:**
-
-```mermaid
-graph TD
-    classDef done fill:#22c55e,color:#fff
-    classDef active fill:#3b82f6,color:#fff
-    classDef blocked fill:#ef4444,color:#fff
-    classDef todo fill:#6b7280,color:#fff
-
-    epic[my-epic]:::active
-    task1[fix-auth]:::done
-    task2[add-tests]:::active
-    task3[update-docs]:::todo
-
-    epic --> task1
-    epic --> task2
-    epic --> task3
-    task3 -.->|blocked by| task2
-```
-
-If your client supports `renderMermaidDiagram`, use it to display the graph inline.
-If not, include the Mermaid markup in a fenced code block in breadcrumbs or commit messages.
-
-## Completing Work
-
-```bash
-wv done <id> --learning="<decision/pattern/pitfall>"
-```
-
-Always capture a learning. Include what worked, what didn't, or what future sessions should know.
-
-## Session End (MANDATORY)
-
-```bash
-wv sync --gh && git push     # Sync graph + GitHub issues, then push
-```
-
-**Not** `wv sync` -- the `--gh` flag syncs GitHub issues. Without it, nodes created with `--gh`
-won't have their status reflected on GitHub.
-
-## Code Quality (built-in)
-
-Zero-dependency code quality analysis using Python stdlib and git:
-
-```bash
-wv quality scan                  # Scan repo for complexity + churn
-wv quality hotspots              # Ranked hotspot report (top files by risk)
-wv quality diff                  # Delta vs previous scan (trend detection)
-wv quality functions <file>      # Per-function cyclomatic complexity + Gini
-```
-
-Use hotspots to prioritize refactoring. Use diff after changes to verify improvement. Functions
-mode shows per-function CC distribution with a Gini coefficient for complexity inequality.
-
-All quality commands support `--json` for programmatic use. Configure exclusions via
-`.weave/quality.conf`.
-
-## Crash Recovery
-
-If a session ends abruptly (crash, kill, network loss), the next session auto-detects it:
-
-```bash
-wv recover --session             # List orphaned active nodes from crashed sessions
-wv recover --session --auto      # Auto-reclaim all orphaned nodes
-wv recover --session --json      # Structured output for automation
-```
-
-## MCP Tools (31 total)
-
-Four MCP server instances must all be running for full tool coverage (`weave`, `weave-graph`,
-`weave-session`, `weave-inspect` -- all pre-configured in `.vscode/mcp.json`). Restart via
-Command Palette → MCP: Restart Server after any `npm run build` in `mcp/`.
-
-If your client supports MCP, prefer compound tools over CLI for multi-step operations:
-
-<!-- markdownlint-disable MD060 -->
-
-| Tool               | Equivalent CLI                         | Use for              |
-| ------------------ | -------------------------------------- | -------------------- |
-| `weave_overview`   | `wv status` + `wv health` + `wv ready` | Session start        |
-| `weave_work`       | `wv work <id>` + `wv context <id>`     | Claiming tasks       |
-| `weave_ship`       | `wv ship <id>`                         | Completing tasks     |
-| `weave_edit_guard` | (no CLI equivalent)                    | **Pre-edit gate**    |
-| `weave_preflight`  | `wv preflight <id>`                    | Pre-action checks    |
-| `weave_quick`      | `wv add` + `wv done` + `wv sync`       | Trivial one-step     |
-| `weave_tree`       | `wv tree --json`                       | Epic hierarchy       |
-| `weave_learnings`  | `wv learnings --json`                  | Check prior work     |
-| `weave_plan`       | `wv plan <file> --sprint=N`            | Import plan          |
-| `weave_breadcrumbs`| `wv breadcrumbs save/show/clear`       | Session handoff      |
-| `weave_update`     | `wv update <id> --metadata=...`        | Enrich nodes         |
-| `weave_guide`      | `wv guide --topic=<topic>`             | Workflow quick ref   |
-| `weave_show`       | `wv show <id> --json`                  | Node details         |
-| `weave_delete`     | `wv delete <id>`                       | Remove nodes         |
-| `weave_recover`    | `wv recover`                           | Crash recovery       |
-| `weave_quality_scan`    | `wv quality scan`                 | Code quality scan    |
-| `weave_quality_hotspots`| `wv quality hotspots`             | Ranked hotspots      |
-| `weave_quality_diff`    | `wv quality diff`                 | Quality trend delta  |
-| `weave_quality_functions`| `wv quality functions <file>`    | Per-function CC      |
-
-Other tools: `weave_add`, `weave_done`, `weave_batch_done`, `weave_link`, `weave_list`,
-`weave_context`, `weave_search`, `weave_status`, `weave_health`, `weave_sync`, `weave_resolve`,
-`weave_close_session`, `weave_recover`, `weave_delete`, `weave_show`.
-
-For CLI operations via terminal: `wv` works -- but the workflow steps above are still mandatory.
-
-## Command Reference
-
-| Command                   | Usage                                   | Key Flags                                  |
-| ------------------------- | --------------------------------------- | ------------------------------------------ |
-| `wv ready`                | List unblocked tasks                    | `--json`, `--count`                        |
-| `wv add <text>`           | Create node (returns wv-xxxxxx ID)        | `--gh`, `--alias=`, `--status=`            |
-| `wv work <id>`            | Claim task (sets active)                | Exports WV_ACTIVE for subagents            |
-| `wv done <id>`            | Complete task                           | `--learning="..."` (always include)        |
-| `wv ship <id>`            | Done + sync + push in one step          | `--learning="..."`                         |
-| `wv update <id>`          | Modify node                             | `--status=`, `--text=`, `--metadata=`      |
-| `wv show <id>`            | Node details                            | `--json`                                   |
-| `wv list`                 | Non-done nodes                          | `--all`, `--status=`, `--json`             |
-| `wv tree`                 | Epic hierarchy                          | `--active`, `--depth=N`, `--json`          |
-| `wv link <from> <to>`     | Create edge between nodes               | `--type=implements\|blocks\|related`       |
-| `wv block <id> --by=<id>` | Add dependency                          | Sets target to blocked                     |
-| `wv context <id>`         | Full context pack                       | `--json` (cached per session)              |
-| `wv learnings`            | View captured patterns/decisions        | `--grep=`, `--recent=N`, `--category=`     |
-| `wv search <query>`       | Full-text search                        | `--json`                                   |
-| `wv plan <file>`          | Import markdown as epic + tasks         | `--sprint=N`, `--gh`, `--dry-run`          |
-| `wv breadcrumbs`          | Session context notes                   | `save --msg=`, `show`, `clear`             |
-| `wv health`               | System health check                     | `--json`, `--verbose`                      |
-| `wv status`               | Compact status summary                  |                                            |
-| `wv sync`                 | Persist graph to disk                   | `--gh` (sync GitHub issues)                |
-| `wv prune`                | Archive old done nodes                  | `--age=`, `--dry-run`                      |
-| `wv recover`              | Resume incomplete operations            | `--session`, `--auto`, `--json`            |
-| `wv quality scan`         | Scan repo for complexity + churn        | `--exclude=`, `--json`                     |
-| `wv quality hotspots`     | Ranked hotspot report                   | `--top=N`, `--json`                        |
-| `wv quality diff`         | Delta vs previous scan                  | `--json`                                   |
-| `wv quality functions`    | Per-function CC for file/directory       | `--json`                                   |
-
-## Common Pitfalls
-
-1. **Forgetting `--gh`** -- Creates orphan nodes with no GitHub issue
-2. **Skipping learnings** -- Repeating mistakes that prior sessions already documented
-3. **`wv sync` without `--gh`** -- GitHub issues don't get updated
-4. **Orphan nodes** -- Run `wv health` to detect. Fix with
-   `wv link <orphan> <epic> --type=implements` or `wv prune` for junk
-5. **No aliases** -- Makes the graph unreadable. Always `--alias=<short-name>`
-6. **Not checking learnings** -- Run `wv learnings --grep="<topic>"` before starting work
 COPILOTEOF
+        fi
         echo -e "  ${GREEN}✓${NC} .github/copilot-instructions.md"
     else
         echo -e "  ${YELLOW}⊘${NC} .github/copilot-instructions.md (exists, use --update to overwrite)"
@@ -1228,7 +1021,8 @@ for _a in "${AGENTS[@]}"; do
         echo "  CLAUDE.md        — agent instructions"
     elif [ "$_a" = "copilot" ]; then
         echo "  .vscode/mcp.json — Copilot MCP config"
-        echo "  .github/copilot-instructions.md — Workflow instructions"
+        echo "  .github/copilot-instructions.md — Minimal stub (workflow via weave_guide)"
+        echo "  .github/hooks/ — VS Code native hook location"
     fi
 done
 INITEOF

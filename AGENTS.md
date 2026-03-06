@@ -133,12 +133,21 @@ create/claim a node first.
 
 - **Source vs installed:** Edit files in `scripts/`, never `~/.local/bin/` or `~/.config/weave/`. A
   PreToolUse hook blocks installed-path edits. After source edits, run `./install.sh` to sync.
-- **Global hooks (v1.15.0+):** All 9 enforcement hooks live in `~/.claude/settings.json` (Alt-A).
-  Per-project `settings.json` has **no `hooks` key** — any hooks key shadows globals (shallow
-  spread). New repos: `wv init-repo` creates `settings.json` with permissions only. The **Claude
-  Code VS Code extension** (`anthropic.claude-code`) reads `~/.claude/settings.json` and fires all
-  hooks with full CLI parity. **GitHub Copilot** (`github.copilot-chat`) does not process Claude
-  Code hooks — it uses MCP tools (`weave_edit_guard`, `weave_close_session`) instead.
+- **Global hooks (v1.15.0+, updated v1.17.0):** All 9 enforcement hooks live in
+  `~/.claude/settings.json`. Per-project `settings.json` has **no `hooks` key** — any hooks key
+  shadows globals (shallow spread). Three agent surfaces share this config:
+
+  | Agent                 | Surface                | Enforcement                                                                                       |
+  | --------------------- | ---------------------- | ------------------------------------------------------------------------------------------------- |
+  | `claude` CLI          | Terminal               | Full: matchers applied, scripts fire on matched tools                                             |
+  | `@copilot` in VS Code | Copilot Chat (stable)  | Full: matchers ignored (all hooks fire), scripts handle VS Code tool names + camelCase properties |
+  | `@claude` in VS Code  | Copilot Chat (preview) | Full: same hooks, Claude Code tool names match existing script logic                              |
+
+  **Note:** VS Code ignores matchers — hooks fire on every tool invocation. The scripts' internal
+  `SHOULD_CHECK` filter handles both Claude Code names (`Edit`/`Write`) and VS Code names
+  (`create_file`/`replace_string_in_file`). Property extractions handle both `file_path` and
+  `filePath` (camelCase).
+
 - **GitHub sync:** Use `wv sync --gh` (Python module). The legacy `scripts/sync-weave-gh.sh` bash
   script is deprecated — it causes duplicate issues and missing metadata.
 - **Metadata key in JSON:** Both `wv show --json` and `wv list --json` return metadata under

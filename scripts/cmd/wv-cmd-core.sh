@@ -1166,7 +1166,9 @@ cmd_update() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# cmd_quick — One-shot create + close for trivial tasks
+# cmd_quick — One-shot create + commit + close for trivial tasks
+# Creates node as active, commits staged changes, then closes the node.
+# This ensures the pre-commit hook (which requires an active node) passes.
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_quick() {
@@ -1204,18 +1206,46 @@ cmd_quick() {
     metadata="${metadata//\'/\'\'}"
     learning="${learning//\'/\'\'}"
 
-    # Create + close in one step with learning
+    # Step 1: Create node as ACTIVE (so pre-commit hook passes)
     local now_meta
     now_meta=$(echo "$metadata" | jq -c --arg l "$learning" '. + {learning: $l}' 2>/dev/null || echo "{\"learning\":\"$learning\"}")
     now_meta="${now_meta//\'/\'\'}"
 
-    db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text', 'done', '$now_meta');"
+    db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text', 'active', '$now_meta');"
+    echo -e "${GREEN}✓${NC} $id: $text (active)" >&2
 
-    echo -e "${GREEN}✓${NC} $id: $text (quick-closed)" >&2
+    # Step 2: Commit staged changes if any exist
+    local committed=false
+    if command -v git >/dev/null 2>&1; then
+        local git_root
+        git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+        if [ -n "$git_root" ]; then
+            # Check for staged or unstaged tracked changes
+            local has_staged has_unstaged
+            has_staged=$(git -C "$git_root" diff --cached --quiet 2>/dev/null; echo $?)
+            has_unstaged=$(git -C "$git_root" diff --quiet 2>/dev/null; echo $?)
+
+            if [ "$has_staged" != "0" ] || [ "$has_unstaged" != "0" ]; then
+                # Stage tracked changes (not untracked files — user should add those explicitly)
+                git -C "$git_root" add -u 2>/dev/null || true
+                if git -C "$git_root" commit -m "$text"; then
+                    committed=true
+                    echo -e "${GREEN}✓${NC} Committed" >&2
+                else
+                    echo -e "${YELLOW}⚠${NC} Commit failed — closing node anyway" >&2
+                fi
+            else
+                echo -e "${YELLOW}⊘${NC} No changes to commit" >&2
+            fi
+        fi
+    fi
+
+    # Step 3: Close the node
+    db_query "UPDATE nodes SET status = 'done' WHERE id = '$id';"
+    echo -e "${GREEN}✓${NC} $id (quick-closed)" >&2
     echo "$id"
 
-    # Use cmd_sync (not auto_sync) to ensure immediate .weave/ commit.
-    # auto_sync's auto_checkpoint is throttled and may skip the commit.
+    # Step 4: Sync .weave/ state
     cmd_sync 2>/dev/null || true
 }
 

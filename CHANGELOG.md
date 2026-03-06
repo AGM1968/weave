@@ -2,6 +2,46 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.17.0] - 2026-03-06
+
+### Added
+
+- **VS Code hook enforcement** — hook scripts now handle both Claude Code tool names
+  (`Edit`/`Write`/`Bash`) and VS Code tool names (`create_file`/`replace_string_in_file`/
+  `run_in_terminal`). The `SHOULD_CHECK` filter in `pre-action.sh` and `tool_input` property
+  extraction (`.file_path // .filePath`) cover both ecosystems. VS Code ignores matchers (all hooks
+  fire on every tool), so this script-level fix closes the enforcement gap for `@copilot`.
+
+- **Minimal copilot-instructions stub** — `wv init-repo --agent=copilot` now generates a 10-line
+  stub referencing `weave_guide` (MCP) and `WORKFLOW.md`, replacing the 239-line workflow dump that
+  drifted as Weave evolved. Template lives at `templates/copilot-instructions.stub.md`.
+
+- **`.github/hooks/` scaffold** — `wv init-repo --agent=copilot` creates the VS Code-native hook
+  directory (per `chat.hookFilesLocations` setting) for team-shared hook configurations.
+
+- **`wv quick` now commits before closing** — creates node as `active`, stages tracked changes,
+  commits, then closes to `done`. Previously inserted directly as `done`, which blocked the
+  pre-commit hook.
+
+- **9 new hook tests** — VS Code tool names (`create_file`, `replace_string_in_file`), camelCase
+  `filePath` property extraction, installed-path guard for both naming conventions.
+
+### Fixed
+
+- **Ghost setting removal** — `wv init-repo --agent=copilot` no longer writes
+  `chat.hooks.enabled: true` to `.vscode/settings.json` (confirmed unregistered by any extension).
+  `--update` mode strips it from existing repos.
+
+- **Hook matchers extended** — `PreToolUse` and `PostToolUse` matchers in `~/.claude/settings.json`
+  now include VS Code tool names for Claude Code CLI correctness.
+
+### Changed
+
+- **Documentation: two-stable + one-preview agent model** — `AGENTS.md`, `DEVELOPMENT.md`,
+  `.github/copilot-instructions.md`, and `PROPOSAL-wv-hook-determinism.md` updated to reflect the
+  corrected enforcement model: `claude` CLI (stable), `@copilot` (stable, matchers ignored),
+  `@claude` (preview). Requires `./install.sh` re-run for hook script + matcher updates.
+
 ## [1.16.1] - 2026-03-05
 
 ### Fixed
