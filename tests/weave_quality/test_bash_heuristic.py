@@ -40,7 +40,7 @@ class TestComplexity:
                 echo "other"
             fi
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         assert entry.language == "bash"
         # if + elif = 2 branches minimum
         assert entry.complexity >= 2
@@ -53,7 +53,7 @@ class TestComplexity:
                 *)     echo "unknown" ;;
             esac
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         # case keyword itself is 1 branch; arms don't have separate branch keywords
         assert entry.complexity >= 2
 
@@ -69,7 +69,7 @@ class TestComplexity:
                 break
             done
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         assert entry.complexity >= 3
 
     def test_logical_operators(self) -> None:
@@ -77,7 +77,7 @@ class TestComplexity:
             [ -f file ] && echo "exists"
             [ -d dir ] || echo "missing"
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         assert entry.complexity >= 2
 
 
@@ -93,7 +93,7 @@ class TestFunctions:
                 echo "hello"
             }
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         assert entry.functions == 1
 
     def test_bash_keyword_style(self) -> None:
@@ -102,7 +102,7 @@ class TestFunctions:
                 echo "stuff"
             }
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         assert entry.functions == 1
 
     def test_multiple_functions(self) -> None:
@@ -117,7 +117,7 @@ class TestFunctions:
                 echo "c"
             }
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         assert entry.functions == 3
 
     def test_avg_fn_len(self) -> None:
@@ -134,7 +134,7 @@ class TestFunctions:
                 echo "5"
             }
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         assert entry.functions == 2
         assert entry.avg_fn_len > 0
 
@@ -151,7 +151,7 @@ class TestNesting:
                 echo "level 1"
             fi
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         assert entry.max_nesting >= 1
 
     def test_deep_nesting(self) -> None:
@@ -166,7 +166,7 @@ class TestNesting:
                 done
             fi
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         assert entry.max_nesting >= 3
 
 
@@ -210,21 +210,78 @@ class TestFileAnalysis:
         target = Path(REPO) / "scripts" / "wv"
         if not target.exists():
             pytest.skip("wv script not found")
-        entry = analyze_bash_file(str(target))
+        entry, fn_cc = analyze_bash_file(str(target))
         assert entry.language == "bash"
         assert entry.loc > 50
         assert entry.functions > 0
+        assert len(fn_cc) == entry.functions
 
     def test_analyze_missing_file(self) -> None:
-        entry = analyze_bash_file("/tmp/NO_SUCH_FILE_12345.sh")
+        entry, fn_cc = analyze_bash_file("/tmp/NO_SUCH_FILE_12345.sh")
         assert entry.loc == 0
+        assert not fn_cc
 
     def test_empty_source(self) -> None:
-        entry = analyze_bash_source("", "empty.sh")
+        entry, fn_cc = analyze_bash_source("", "empty.sh")
         assert entry.loc == 0
         assert entry.functions == 0
+        assert not fn_cc
         # Base complexity is 1 (cyclomatic convention)
         assert entry.complexity == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-function cyclomatic complexity
+# ---------------------------------------------------------------------------
+
+
+class TestFunctionCC:
+    def test_per_function_cc(self) -> None:
+        source = _src("""
+            simple_fn() {
+                echo "hello"
+            }
+
+            complex_fn() {
+                if [ -z "$1" ]; then
+                    echo "missing"
+                elif [ "$1" = "foo" ]; then
+                    for i in 1 2 3; do
+                        echo "$i"
+                    done
+                fi
+            }
+        """)
+        _, fn_cc = analyze_bash_source(source, "test.sh")
+        assert len(fn_cc) == 2
+        simple = fn_cc[0]
+        assert simple.function_name == "simple_fn"
+        assert simple.complexity == 1  # base only
+        assert simple.line_start == 1
+        complex_ = fn_cc[1]
+        assert complex_.function_name == "complex_fn"
+        assert complex_.complexity >= 4  # base + if + elif + for
+
+    def test_function_keyword_syntax(self) -> None:
+        source = _src("""
+            function my_func {
+                if [ "$1" ]; then
+                    echo "yes"
+                fi
+            }
+        """)
+        _, fn_cc = analyze_bash_source(source, "test.sh")
+        assert len(fn_cc) == 1
+        assert fn_cc[0].function_name == "my_func"
+        assert fn_cc[0].complexity >= 2  # base + if
+
+    def test_no_functions(self) -> None:
+        source = _src("""
+            echo "no functions here"
+            if [ -f foo ]; then echo "exists"; fi
+        """)
+        _, fn_cc = analyze_bash_source(source, "test.sh")
+        assert not fn_cc
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +301,7 @@ class TestCoupling:
             source ./lib/helpers.sh
             . ./lib/utils.sh
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         # Source coupling detected as complexity contributor
         assert entry.loc > 0
 
@@ -254,7 +311,7 @@ class TestCoupling:
             sqlite3 test.db "SELECT 1"
             gh issue list
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         assert entry.loc > 0
 
 
@@ -320,6 +377,6 @@ class TestIndentSD:
             }
             process "$1"
         """)
-        entry = analyze_bash_source(source, "test.sh")
+        entry, _ = analyze_bash_source(source, "test.sh")
         assert entry.indent_sd >= 0.0
         assert entry.indent_sd > 0.0  # has nesting

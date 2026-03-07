@@ -2,6 +2,30 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.19.0] - 2026-03-07
+
+### Added
+
+- **Edge context** — edges now carry auto-generated alias-based summaries (`auto: true`) or explicit
+  semantic context via `--context=` on `wv link`/`wv block` and `--rationale=` on `wv resolve`.
+  Auto-context is never overwritten by re-linking (three-condition UPSERT guard).
+- **`wv health --fix`** — backfills all empty edge context with auto-generated summaries.
+  Idempotent, safe for agent invocation. MCP `weave_health` also supports `fix` parameter.
+- **MCP `weave_link` context** — `context` property added to MCP schema so VS Code agents can
+  provide explicit edge context.
+- **`cmd_block` node existence validation** — `wv block` now validates both node IDs exist before
+  creating the edge (pre-existing silent failure fixed).
+- **Bash per-function CC** — `wv quality functions` now reports per-function cyclomatic complexity
+  for `.sh` files (was 0 for all bash files). Uses `_BRANCH_PATTERN` over each function's line
+  range.
+- **`wv context` surfaces edge context** — blockers and related nodes in context packs now include
+  parsed `context` field (was silently dropped).
+
+### Changed
+
+- **Documentation** — edge context guidance added to WORKFLOW.md, AGENTS.md, CLAUDE.md, and
+  DEVELOPMENT.md. Covers both CLI and MCP agent surfaces equally.
+
 ## [1.18.0] - 2026-03-06
 
 ### Changed

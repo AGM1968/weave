@@ -12,11 +12,14 @@
 cmd_block() {
     local id="${1:-}"
     local blocker=""
+    local context="{}"
+    local explicit_context=false
 
     shift || true
     while [ $# -gt 0 ]; do
         case "$1" in
             --by=*) blocker="${1#*=}" ;;
+            --context=*) context="${1#*=}"; explicit_context=true ;;
         esac
         shift
     done
@@ -29,6 +32,19 @@ cmd_block() {
     # Validate ID formats (SQL injection prevention)
     validate_id "$id" || return 1
     validate_id "$blocker" || return 1
+
+    # Validate nodes exist
+    local id_exists blocker_exists
+    id_exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
+    blocker_exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$blocker';")
+    if [ "$id_exists" = "0" ]; then
+        echo -e "${RED}Error: node $id not found${NC}" >&2
+        return 1
+    fi
+    if [ "$blocker_exists" = "0" ]; then
+        echo -e "${RED}Error: blocker node $blocker not found${NC}" >&2
+        return 1
+    fi
 
     # Prevent self-blocking
     if [ "$id" = "$blocker" ]; then
@@ -44,7 +60,33 @@ cmd_block() {
         return 1
     fi
 
-    db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$blocker', '$id', 'blocks', 1.0, '{}', CURRENT_TIMESTAMP);"
+    # Validate JSON context if explicit
+    if [ "$explicit_context" = "true" ]; then
+        if ! echo "$context" | jq '.' >/dev/null 2>&1; then
+            echo -e "${RED}Error: invalid JSON in --context${NC}" >&2
+            return 1
+        fi
+    fi
+
+    # Auto-context: generate alias-based summary when no explicit context
+    if [ "$context" = "{}" ]; then
+        local src_label tgt_label
+        src_label=$(db_query "SELECT COALESCE(alias, substr(text,1,40)) FROM nodes WHERE id='$blocker';")
+        tgt_label=$(db_query "SELECT COALESCE(alias, substr(text,1,40)) FROM nodes WHERE id='$id';")
+        context=$(jq -nc --arg s "$src_label" --arg t "$tgt_label" \
+            '{summary: ($s + " blocks " + $t), auto: true}')
+    fi
+
+    local ctx_escaped="${context//\'/\'\'}"
+
+    if [ "$explicit_context" = "true" ]; then
+        db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
+            VALUES ('$blocker', '$id', 'blocks', 1.0, '$ctx_escaped', CURRENT_TIMESTAMP)
+            ON CONFLICT(source, target, type) DO UPDATE SET
+                context = excluded.context, created_at = CURRENT_TIMESTAMP;"
+    else
+        db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$blocker', '$id', 'blocks', 1.0, '$ctx_escaped', CURRENT_TIMESTAMP);"
+    fi
     db_query "UPDATE nodes SET status='blocked', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
 
     # Invalidate context cache for affected nodes
@@ -131,15 +173,30 @@ cmd_link() {
         return 1
     fi
 
+    # Auto-context: generate alias-based summary when no explicit context provided
+    if [ "$context" = "{}" ]; then
+        local src_label tgt_label
+        src_label=$(db_query "SELECT COALESCE(alias, substr(text,1,40)) FROM nodes WHERE id='$from';")
+        tgt_label=$(db_query "SELECT COALESCE(alias, substr(text,1,40)) FROM nodes WHERE id='$to';")
+        context=$(jq -nc --arg s "$src_label" --arg t "$tgt_label" --arg e "$edge_type" \
+            '{summary: ($s + " " + $e + " " + $t), auto: true}')
+    fi
+
     # Escape single quotes in context JSON for SQL
     local ctx_escaped="${context//\'/\'\'}"
 
-    # Insert or update edge
+    # Insert or update edge (UPSERT guard: auto never clobbers explicit)
     db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
         VALUES ('$from', '$to', '$edge_type', $weight, '$ctx_escaped', CURRENT_TIMESTAMP)
         ON CONFLICT(source, target, type) DO UPDATE SET
             weight = excluded.weight,
-            context = excluded.context,
+            context = CASE
+                WHEN json_extract(excluded.context, '\$.auto') = 1
+                  AND edges.context != '{}'
+                  AND COALESCE(json_extract(edges.context, '\$.auto'), 0) != 1
+                THEN edges.context
+                ELSE excluded.context
+            END,
             created_at = CURRENT_TIMESTAMP;"
 
     # Invalidate context cache for affected  nodes
@@ -211,6 +268,15 @@ cmd_resolve() {
         echo "Proceeding with resolution anyway..."
     fi
 
+    # Build context from rationale if provided
+    local resolve_ctx='{}'
+    if [ -n "$rationale" ]; then
+        resolve_ctx=$(jq -nc --arg r "$rationale" '{reason: $r}')
+    fi
+    local resolve_ctx_escaped="${resolve_ctx//\'/\'\'}"
+    local has_rationale=false
+    [ -n "$rationale" ] && has_rationale=true
+
     # Execute resolution based on mode
     case "$mode" in
         winner)
@@ -231,7 +297,14 @@ cmd_resolve() {
             db_query "DELETE FROM edges WHERE type='contradicts' AND ((source='$node1' AND target='$node2') OR (source='$node2' AND target='$node1'));"
 
             # Add supersedes edge: winner supersedes loser
-            db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$winner', '$loser', 'supersedes', 1.0, '{}', CURRENT_TIMESTAMP);"
+            if [ "$has_rationale" = "true" ]; then
+                db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
+                    VALUES ('$winner', '$loser', 'supersedes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP)
+                    ON CONFLICT(source, target, type) DO UPDATE SET
+                        context = excluded.context, created_at = CURRENT_TIMESTAMP;"
+            else
+                db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$winner', '$loser', 'supersedes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
+            fi
 
             # Mark loser as done/obsolete
             db_query "UPDATE nodes SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id='$loser';"
@@ -251,8 +324,19 @@ cmd_resolve() {
             db_query "DELETE FROM edges WHERE type='contradicts' AND ((source='$node1' AND target='$node2') OR (source='$node2' AND target='$node1'));"
 
             # Add obsoletes edges: both nodes obsoleted by merger
-            db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$new_id', '$node1', 'obsoletes', 1.0, '{}', CURRENT_TIMESTAMP);"
-            db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$new_id', '$node2', 'obsoletes', 1.0, '{}', CURRENT_TIMESTAMP);"
+            if [ "$has_rationale" = "true" ]; then
+                db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
+                    VALUES ('$new_id', '$node1', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP)
+                    ON CONFLICT(source, target, type) DO UPDATE SET
+                        context = excluded.context, created_at = CURRENT_TIMESTAMP;"
+                db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
+                    VALUES ('$new_id', '$node2', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP)
+                    ON CONFLICT(source, target, type) DO UPDATE SET
+                        context = excluded.context, created_at = CURRENT_TIMESTAMP;"
+            else
+                db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$new_id', '$node1', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
+                db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$new_id', '$node2', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
+            fi
 
             # Mark both original nodes as done
             db_query "UPDATE nodes SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id IN ('$node1', '$node2');"
@@ -266,8 +350,19 @@ cmd_resolve() {
             db_query "DELETE FROM edges WHERE type='contradicts' AND ((source='$node1' AND target='$node2') OR (source='$node2' AND target='$node1'));"
 
             # Add relates_to edge instead (bidirectional)
-            db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$node1', '$node2', 'relates_to', 0.5, '{}', CURRENT_TIMESTAMP);"
-            db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$node2', '$node1', 'relates_to', 0.5, '{}', CURRENT_TIMESTAMP);"
+            if [ "$has_rationale" = "true" ]; then
+                db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
+                    VALUES ('$node1', '$node2', 'relates_to', 0.5, '$resolve_ctx_escaped', CURRENT_TIMESTAMP)
+                    ON CONFLICT(source, target, type) DO UPDATE SET
+                        context = excluded.context, created_at = CURRENT_TIMESTAMP;"
+                db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
+                    VALUES ('$node2', '$node1', 'relates_to', 0.5, '$resolve_ctx_escaped', CURRENT_TIMESTAMP)
+                    ON CONFLICT(source, target, type) DO UPDATE SET
+                        context = excluded.context, created_at = CURRENT_TIMESTAMP;"
+            else
+                db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$node1', '$node2', 'relates_to', 0.5, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
+                db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$node2', '$node1', 'relates_to', 0.5, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
+            fi
 
             echo -e "${GREEN}✓${NC} Resolved: contradiction deferred, marked as related ($node1 <-> $node2)"
             [ -n "$rationale" ] && echo "  Rationale: $rationale"
@@ -631,7 +726,7 @@ cmd_context() {
     # Get blockers (nodes that block this one, excluding completed ones)
     local blockers_json
     blockers_json=$(db_query_json "
-        SELECT n.id, n.text, n.status, json(n.metadata)
+        SELECT n.id, n.text, n.status, json(n.metadata), e.context
         FROM edges e
         JOIN nodes n ON n.id = e.source
         WHERE e.target = '$id' AND e.type = 'blocks' AND n.status != 'done';
@@ -760,7 +855,7 @@ cmd_context() {
         --argjson quality "$quality_json" \
         '{
             node: ($node[0] | {id, text, status}),
-            blockers: ($blockers | map({id, text, status})),
+            blockers: ($blockers | map({id, text, status, context: (.context | fromjson? // .context)})),
             ancestors: ($ancestors | map({
                 id,
                 text,
@@ -776,7 +871,7 @@ cmd_context() {
                     if (.decision or .pattern or .pitfall) then . else null end
                 )
             })),
-            related: ($related[0:5] | map({id, text, edge, weight})),
+            related: ($related[0:5] | map({id, text, edge, weight, context: (.context | fromjson? // .context)})),
             pitfalls: ($pitfalls[0:3] | map({
                 id,
                 text,

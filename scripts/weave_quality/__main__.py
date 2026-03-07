@@ -240,7 +240,7 @@ def _in_scope_path(
 # ---------------------------------------------------------------------------
 
 
-def cmd_scan(args: argparse.Namespace) -> int:
+def cmd_scan(args: argparse.Namespace) -> int:  # pylint: disable=too-many-statements
     """Execute wv quality scan."""
     repo = _resolve_repo(args.path)
     hot_zone = args.hot_zone
@@ -336,7 +336,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 fc.scan_id = scan_id
             all_fn_cc.extend(fn_cc)
         else:
-            entry = analyze_bash_file(abs_path, scan_id)
+            entry, fn_cc = analyze_bash_file(abs_path, scan_id)
             entry = FileEntry(
                 path=rel_path,
                 scan_id=scan_id,
@@ -350,6 +350,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 category=classify_file(rel_path, classify_overrides),
             )
             entries.append(entry)
+            # Remap fn_cc paths to relative
+            for fc in fn_cc:
+                fc.path = rel_path
+                fc.scan_id = scan_id
+            all_fn_cc.extend(fn_cc)
 
         lang = "python" if rel_path.endswith(".py") else "bash"
         lang_counts[lang] = lang_counts.get(lang, 0) + 1

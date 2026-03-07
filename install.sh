@@ -98,7 +98,7 @@ do_uninstall() {
     while IFS= read -r file; do
         if [ -e "$file" ] || [ -L "$file" ]; then
             rm -f "$file"
-            ((count++))
+            count=$((count + 1))
         fi
     done < "$MANIFEST"
     
@@ -1186,7 +1186,8 @@ done
 
 # Auto-detect existing MCP installation — rebuild it on every install
 # so upstream source changes (e.g. spawnSync fix) don't get stranded.
-if [ "$WITH_MCP" = "0" ] && [ "${NO_MCP_EXPLICIT:-0}" != "1" ] && [ -f "${HOME}/.local/lib/weave/mcp/dist/index.js" ]; then
+# Only relevant for install action (not uninstall/upgrade/check-deps).
+if [ "${action:-install}" = "install" ] && [ "$WITH_MCP" = "0" ] && [ "${NO_MCP_EXPLICIT:-0}" != "1" ] && [ -f "${HOME}/.local/lib/weave/mcp/dist/index.js" ]; then
     WITH_MCP=1
     echo -e "${YELLOW}Note: Existing MCP server detected, will rebuild automatically.${NC}"
     echo "  (Use --no-mcp to skip. Use --with-mcp to silence this message.)"
@@ -1198,9 +1199,9 @@ if [ -n "$LOCAL_SOURCE" ]; then
 fi
 
 case "${action:-install}" in
-    uninstall)  do_uninstall ;;
-    upgrade)    do_upgrade ;;
-    check-deps) check_deps ;;
+    uninstall)  do_uninstall; exit 0 ;;
+    upgrade)    do_upgrade; exit 0 ;;
+    check-deps) check_deps; exit 0 ;;
     help)
         echo "Weave Installer"
         echo ""

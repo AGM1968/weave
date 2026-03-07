@@ -29,7 +29,7 @@ Never edit a file without an active node. If `wv status` shows 0 active, run `wv
 | `wv quick "<text>"`       | Track trivial work (create active → commit → done) | `--learning="..."`                           |
 | `wv show <id>`            | Node details + blockers                            | `--json`                                     |
 | `wv list`                 | All non-done nodes                                 | `--all`, `--status=`, `--json`               |
-| `wv block <id> --by=<id>` | Add dependency edge                                | Sets target to `blocked`                     |
+| `wv block <id> --by=<id>` | Add dependency edge                                | `--context='{...}'`                          |
 | `wv tree`                 | Epic → feature → task hierarchy                    | `--active`, `--depth=N`, `--mermaid`         |
 | `wv path <id>`            | Ancestry chain                                     | `--format=chain`                             |
 | `wv plan <file>`          | Import markdown as epic + tasks                    | `--sprint=N`, `--gh`, `--dry-run`            |
@@ -37,7 +37,8 @@ Never edit a file without an active node. If `wv status` shows 0 active, run `wv
 | `wv search <query>`       | Full-text search                                   | `--json`                                     |
 | `wv status`               | Compact status (active/ready/blocked counts)       |                                              |
 | `wv learnings`            | Show captured decisions/patterns/pitfalls          | `--category=`, `--grep=`, `--dedup`          |
-| `wv health`               | System health check with score                     | `--json`, `--verbose`                        |
+| `wv link <from> <to>`     | Create semantic edge                               | `--type=`, `--context='{...}'`               |
+| `wv health`               | System health check with score                     | `--json`, `--verbose`, `--fix`               |
 | `wv sync`                 | Dump to `.weave/state.sql`                         | `--gh` for GH sync, `--dry-run`              |
 | `wv load`                 | Restore from `.weave/state.sql`                    | Run by session start hook                    |
 | `wv prune`                | Archive done nodes >48h                            | `--age=`, `--dry-run`                        |
@@ -64,6 +65,21 @@ Run `wv context <id> --json` before starting complex work:
 - **Auto-invalidates** — cache clears when edges change
 - **Limited output** — top 5 related, top 3 pitfalls (prevents context explosion)
 - **Nested learnings** — ancestors include decision/pattern/pitfall from metadata
+
+## Edge Context
+
+Edges carry a `context` JSON field. Auto-generated summaries use node aliases and are marked
+`auto: true`. For edges with semantic meaning, provide explicit context:
+
+```bash
+wv link wv-A wv-B --type=blocks --context='{"reason":"Auth API must deploy before client"}'
+wv block wv-A --by=wv-B --context='{"reason":"Depends on schema migration"}'
+wv resolve A B --winner=A --rationale="Winner has broader scope"
+```
+
+- **Auto-context** (`{"summary":"fix-auth blocks deploy","auto":true}`) — scannable at a glance
+- **Explicit context** (`{"reason":"..."}`) — semantic, non-derivable, always preserved on re-link
+- **Backfill** — `wv health --fix` enriches all empty edges with auto-context
 
 ## GitHub Integration
 

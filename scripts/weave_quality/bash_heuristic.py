@@ -15,7 +15,7 @@ import math
 import re
 from pathlib import Path
 
-from .models import FileEntry
+from .models import FileEntry, FunctionCC
 
 log = logging.getLogger(__name__)
 
@@ -125,11 +125,30 @@ def _find_function_ranges(lines: list[str]) -> list[tuple[int, int]]:
     return ranges
 
 
+def _function_cc(lines: list[str], start: int, end: int) -> int:
+    """Compute cyclomatic complexity proxy for a single function body."""
+    cc = 1  # Base
+    for line in lines[start:end + 1]:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        cc += len(_BRANCH_PATTERN.findall(line))
+    return cc
+
+
+def _function_name(line: str) -> str:
+    """Extract function name from a line matching _FUNC_PATTERN."""
+    m = _FUNC_PATTERN.match(line)
+    if not m:
+        return "<unknown>"
+    return m.group(1) or m.group(2) or "<unknown>"
+
+
 def analyze_bash_source(source: str, filepath: str,
-                        scan_id: int = 0) -> FileEntry:
+                        scan_id: int = 0) -> tuple[FileEntry, list[FunctionCC]]:
     """Analyze Bash source code string.
 
-    Returns a FileEntry with heuristic-derived metrics.
+    Returns (FileEntry, list[FunctionCC]) with heuristic-derived metrics.
     """
     lines = source.splitlines()
     non_empty = [
@@ -146,19 +165,32 @@ def analyze_bash_source(source: str, filepath: str,
             continue
         complexity += len(_BRANCH_PATTERN.findall(line))
 
-    # Function count and lengths
+    # Function count and lengths + per-function CC
     func_ranges = _find_function_ranges(lines)
     functions = len(func_ranges)
 
     avg_fn_len = 0.0
+    fn_cc_list: list[FunctionCC] = []
     if func_ranges:
         lengths = [end - start + 1 for start, end in func_ranges]
         avg_fn_len = sum(lengths) / len(lengths)
 
+        for start, end in func_ranges:
+            name = _function_name(lines[start])
+            cc = _function_cc(lines, start, end)
+            fn_cc_list.append(FunctionCC(
+                path=filepath,
+                scan_id=scan_id,
+                function_name=name,
+                line_start=start + 1,  # 1-indexed
+                line_end=end + 1,
+                complexity=float(cc),
+            ))
+
     # Max nesting
     max_nesting = _count_nesting(lines)
 
-    return FileEntry(
+    entry = FileEntry(
         path=filepath,
         scan_id=scan_id,
         language="bash",
@@ -169,20 +201,21 @@ def analyze_bash_source(source: str, filepath: str,
         avg_fn_len=avg_fn_len,
         indent_sd=_indent_sd(lines),
     )
+    return entry, fn_cc_list
 
 
 def analyze_bash_file(filepath: str | Path,
-                      scan_id: int = 0) -> FileEntry:
+                      scan_id: int = 0) -> tuple[FileEntry, list[FunctionCC]]:
     """Analyze a Bash source file.
 
-    Returns a FileEntry with heuristic metrics.
+    Returns (FileEntry, list[FunctionCC]) with heuristic metrics.
     """
     path = Path(filepath)
     try:
         source = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         log.warning("Cannot read %s: %s", filepath, exc)
-        return FileEntry(path=str(filepath), scan_id=scan_id, language="bash")
+        return FileEntry(path=str(filepath), scan_id=scan_id, language="bash"), []
 
     return analyze_bash_source(source, str(filepath), scan_id)
 

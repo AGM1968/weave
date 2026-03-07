@@ -1257,6 +1257,7 @@ cmd_health() {
     local format="text"
     local verbose=false
     local history_count=0
+    local fix=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1264,6 +1265,7 @@ cmd_health() {
             --verbose|-v) verbose=true ;;
             --history) history_count=10 ;;
             --history=*) history_count="${1#--history=}" ;;
+            --fix) fix=true ;;
         esac
         shift
     done
@@ -1351,6 +1353,10 @@ cmd_health() {
         WHERE source NOT IN (SELECT id FROM nodes)
         OR target NOT IN (SELECT id FROM nodes);
     ")
+
+    # Empty edge context
+    local empty_edge_ctx=$(db_query "SELECT COUNT(*) FROM edges WHERE context='{}';")
+    empty_edge_ctx="${empty_edge_ctx:-0}"
     
     # Stale active nodes (active for more than 7 days)
     local stale_active=$(db_query "
@@ -1429,6 +1435,32 @@ cmd_health() {
         "$health_score" "$total_nodes" "$total_edges" \
         "$orphan_nodes" "$ghost_edges" >> "$log_file"
 
+    # Backfill empty edge context if --fix
+    local fixed_edge_ctx=0
+    if [ "$fix" = "true" ] && [ "${empty_edge_ctx:-0}" -gt 0 ]; then
+        while IFS=$'\x1f' read -r src tgt etype src_label tgt_label; do
+            [ -z "$src" ] && continue
+            local ctx
+            ctx=$(jq -nc --arg s "$src_label" --arg t "$tgt_label" --arg e "$etype" \
+                '{summary: ($s + " " + $e + " " + $t), auto: true}')
+            local ctx_escaped="${ctx//\'/\'\'}"
+            db_query "UPDATE edges SET context='$ctx_escaped'
+                WHERE source='$src' AND target='$tgt' AND type='$etype'
+                AND context='{}';"
+            fixed_edge_ctx=$((fixed_edge_ctx + 1))
+        done < <(sqlite3 -batch -cmd ".timeout 5000" -separator $'\x1f' "$WV_DB" \
+            "SELECT e.source, e.target, e.type,
+                    COALESCE(s.alias, substr(s.text,1,40)),
+                    COALESCE(t.alias, substr(t.text,1,40))
+             FROM edges e
+             JOIN nodes s ON e.source = s.id
+             JOIN nodes t ON e.target = t.id
+             WHERE e.context = '{}';")
+        # Update count after fix
+        empty_edge_ctx=$(db_query "SELECT COUNT(*) FROM edges WHERE context='{}';")
+        empty_edge_ctx="${empty_edge_ctx:-0}"
+    fi
+
     # Determine status emoji/text
     local status_icon status_text
     if [ "$health_score" -ge 90 ]; then
@@ -1499,6 +1531,8 @@ cmd_health() {
             --argjson stale_active "$stale_active" \
             --argjson contradictions "$contradictions" \
             --argjson invalid_statuses "$invalid_statuses" \
+            --argjson empty_edge_context "$empty_edge_ctx" \
+            --argjson fixed_edge_context "$fixed_edge_ctx" \
             --argjson quality "$quality_obj" \
             '{
                 status: $status,
@@ -1527,7 +1561,9 @@ cmd_health() {
                     ghost_edges: $ghost_edges,
                     stale_active: $stale_active,
                     unresolved_contradictions: $contradictions,
-                    invalid_statuses: $invalid_statuses
+                    invalid_statuses: $invalid_statuses,
+                    empty_edge_context: $empty_edge_context,
+                    fixed_edge_context: $fixed_edge_context
                 },
                 code_quality: $quality
             }'
@@ -1572,6 +1608,7 @@ cmd_health() {
         echo "  Stale active (>7d): $stale_active"
         echo "  Unresolved contradictions: $contradictions"
         echo "  Invalid statuses: $invalid_statuses"
+        echo "  Empty edge context: $empty_edge_ctx"
     fi
     
     # Show issues if any
@@ -1584,6 +1621,8 @@ cmd_health() {
         [ "$ghost_edges" -gt 0 ] && echo -e "  ${YELLOW}⚠${NC} $ghost_edges ghost edge(s) referencing deleted nodes - run 'wv clean-ghosts'"
         [ "$orphan_nodes" -gt 5 ] && echo -e "  ${YELLOW}⚠${NC} $orphan_nodes orphan node(s) with no edges - consider linking or pruning"
         [ "$invalid_statuses" -gt 0 ] && echo -e "  ${RED}✗${NC} $invalid_statuses node(s) with invalid status - run 'wv update <id> --status=todo' to fix"
+        [ "$empty_edge_ctx" -gt 0 ] && echo -e "  ${YELLOW}⚠${NC} $empty_edge_ctx edge(s) missing context - run 'wv health --fix' to backfill"
+        [ "$fixed_edge_ctx" -gt 0 ] && echo -e "  ${GREEN}✓${NC} Fixed: enriched $fixed_edge_ctx edge(s) with auto-context (marked auto:true)"
     fi
 }
 

@@ -317,6 +317,10 @@ const TOOLS: Tool[] = [
           type: "number",
           description: "Edge weight 0.0-1.0 (default: 1.0)",
         },
+        context: {
+          type: "string",
+          description: 'Edge context JSON (e.g. \'{"reason": "API dependency"}\')',
+        },
       },
       required: ["from", "to", "type"],
     },
@@ -339,6 +343,10 @@ const TOOLS: Tool[] = [
         verbose: {
           type: "boolean",
           description: "Include detailed diagnostics",
+        },
+        fix: {
+          type: "boolean",
+          description: "Auto-fix issues (e.g. backfill empty edge context with auto-generated summaries)",
         },
       },
       required: [],
@@ -875,8 +883,10 @@ function handleTool(
       const to = args.to as string;
       const type = args.type as string;
       const weight = args.weight as number | undefined;
+      const context = args.context as string | undefined;
       const cmd = ["link", from, to, `--type=${type}`];
       if (weight !== undefined) cmd.push(`--weight=${weight}`);
+      if (context) cmd.push(`--context=${context}`);
       result = wv(cmd);
       break;
     }
@@ -888,7 +898,10 @@ function handleTool(
 
     case "weave_health": {
       const verbose = args.verbose as boolean | undefined;
-      const cmd = verbose ? ["health", "--verbose", "--json"] : ["health", "--json"];
+      const fix = args.fix as boolean | undefined;
+      const cmd = ["health", "--json"];
+      if (verbose) cmd.push("--verbose");
+      if (fix) cmd.push("--fix");
       result = wv(cmd);
       break;
     }
@@ -1352,7 +1365,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.18.0",
+      version: "1.19.0",
     },
     {
       capabilities: {
