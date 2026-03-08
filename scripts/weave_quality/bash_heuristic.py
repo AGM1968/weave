@@ -98,31 +98,106 @@ def _count_nesting(lines: list[str]) -> int:
     return max_depth
 
 
+# Heredoc start: <<EOF, <<'EOF', <<"EOF", <<-EOF, etc.
+_HEREDOC_START = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
+
+# Heredoc end: the delimiter alone on a line (possibly with leading tabs for <<-)
+_HEREDOC_END_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _heredoc_end_pattern(delim: str) -> re.Pattern[str]:
+    """Return a compiled regex for a heredoc end delimiter."""
+    if delim not in _HEREDOC_END_CACHE:
+        _HEREDOC_END_CACHE[delim] = re.compile(rf"^\t*{re.escape(delim)}\s*$")
+    return _HEREDOC_END_CACHE[delim]
+
+
 def _find_function_ranges(lines: list[str]) -> list[tuple[int, int]]:
     """Find (start, end) line ranges for Bash functions.
 
-    Uses brace matching to find function body boundaries.
+    Uses structural brace matching: only counts braces that appear as
+    standalone structural elements, not braces inside strings, parameter
+    expansions (``${var}``), jq expressions, or heredocs.
+
+    Rules:
+      - Opening brace: on the function definition line (``func() {``)
+        or a standalone ``{`` line immediately after.
+      - Closing brace: a line whose stripped content is just ``}``
+        (the standard Bash convention for ending a function body).
+      - One-liner functions (``func() { ...; }``) are detected when
+        the definition line ends with ``}`` or ``; }`` after the opening
+        brace — the function range is just that single line.
+      - Nested function definitions (e.g. ``_helper() {`` inside
+        ``cmd_foo() {``) increment depth so the outer function's
+        closing ``}`` is found correctly.
+      - Heredoc content (between ``<<EOF`` and ``EOF``) is skipped
+        entirely to avoid counting ``}`` in JSON/YAML/text blocks.
+
+    This avoids bugs where ``${var}``, ``"{"`` in strings, jq
+    ``'. + {key: $v}'``, heredoc JSON content, or one-liner utility
+    functions caused incorrect function boundaries.
     """
     ranges: list[tuple[int, int]] = []
-    i = 0
-    while i < len(lines):
-        if _FUNC_PATTERN.match(lines[i]):
-            start = i
-            # Find the opening brace
-            brace_depth = 0
-            found_open = False
-            for j in range(i, len(lines)):
-                brace_depth += lines[j].count("{") - lines[j].count("}")
-                if "{" in lines[j]:
-                    found_open = True
-                if found_open and brace_depth <= 0:
-                    ranges.append((start, j))
-                    break
-            else:
-                # No matching close brace found; use rest of file
-                ranges.append((start, len(lines) - 1))
-        i += 1
+    for i, line in enumerate(lines):
+        if _FUNC_PATTERN.match(line):
+            end = _find_function_end(lines, i)
+            ranges.append((i, end))
     return ranges
+
+
+def _find_function_end(lines: list[str], start: int) -> int:
+    """Find the closing line of a function starting at ``start``.
+
+    Returns the 0-indexed line number of the closing ``}``.
+    """
+    depth = 0
+    found_open = False
+    in_heredoc: str | None = None
+
+    for j in range(start, len(lines)):
+        stripped = lines[j].strip()
+
+        # Skip heredoc content — } inside heredocs is not structural
+        if in_heredoc is not None:
+            if _heredoc_end_pattern(in_heredoc).match(lines[j]):
+                in_heredoc = None
+            continue
+
+        # Check if this line starts a heredoc
+        heredoc_match = _HEREDOC_START.search(lines[j])
+        if heredoc_match:
+            in_heredoc = heredoc_match.group(1)
+
+        # Function definition line — count its opening brace
+        if j == start:
+            if "{" in stripped:
+                depth += 1
+                found_open = True
+                # One-liner: func() { ...; } — both { and } on same line
+                if stripped.endswith("}") or stripped.endswith("; }"):
+                    return j
+            continue
+
+        # Line immediately after def may have standalone "{"
+        if not found_open and stripped == "{":
+            depth += 1
+            found_open = True
+            continue
+
+        # Nested function definition — count opening brace
+        if _FUNC_PATTERN.match(lines[j]):
+            if "{" in stripped:
+                depth += 1
+            continue
+
+        # Standalone closing brace — structural function close
+        if stripped == "}":
+            depth -= 1
+            if found_open and depth <= 0:
+                return j
+
+    # No matching close brace found; use rest of file
+    return len(lines) - 1
 
 
 def _function_cc(lines: list[str], start: int, end: int) -> int:

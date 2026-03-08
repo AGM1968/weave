@@ -2,6 +2,20 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.19.1] - 2026-03-08
+
+### Fixed
+
+- **Bash CC parser: structural brace matching** — `line.count("{") - line.count("}")` counted braces
+  inside strings (`"${var}"`), parameter expansions (`${#arr[@]}`), and jq expressions as
+  structural. Fixed by only counting `{` on function-definition lines and `}` on standalone lines.
+- **Bash CC parser: one-liner functions** — `func() { ...; }` style definitions had no standalone
+  closing `}`, causing function ranges to extend to EOF. Fixed by detecting `}` at end of the
+  definition line.
+- **Bash CC parser: heredoc content** — `}` inside heredocs (e.g. JSON in `cat << EOF`) was counted
+  as structural function boundaries. Fixed by tracking heredoc start/end delimiters and skipping
+  content.
+
 ## [1.19.0] - 2026-03-07
 
 ### Added
