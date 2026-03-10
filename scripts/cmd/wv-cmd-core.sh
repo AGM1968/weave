@@ -879,10 +879,8 @@ cmd_ready() {
     done
     
     # Ready = todo status AND not blocked by any open node
-    local query="
-        SELECT n.id, n.text, n.status, n.metadata
-        FROM nodes n
-        WHERE n.status = 'todo'
+    local ready_where="
+        n.status = 'todo'
         AND NOT EXISTS (
             SELECT 1 FROM edges e
             JOIN nodes blocker ON e.source = blocker.id
@@ -890,31 +888,20 @@ cmd_ready() {
             AND e.type = 'blocks'
             AND blocker.status != 'done'
         )
-        ORDER BY n.created_at ASC;
     "
-    
+
     if [ "$count_only" = true ]; then
-        local count_query="
-            SELECT COUNT(*) FROM nodes n
-            WHERE n.status = 'todo'
-            AND NOT EXISTS (
-                SELECT 1 FROM edges e
-                JOIN nodes blocker ON e.source = blocker.id
-                WHERE e.target = n.id
-                AND e.type = 'blocks'
-                AND blocker.status != 'done'
-            );
-        "
-        db_query "$count_query"
+        db_query "SELECT COUNT(*) FROM nodes n WHERE $ready_where;"
         return
     fi
-    
+
     if [ "$format" = "json" ]; then
         local results
-        results=$(db_query_json "$query")
+        results=$(db_query_json "SELECT n.id, n.text, n.status, n.metadata FROM nodes n WHERE $ready_where ORDER BY n.created_at ASC;")
         [ -z "$results" ] && echo "[]" || echo "$results"
     else
-        db_query "$query" | while IFS='|' read -r id text status metadata; do
+        # Text mode: exclude metadata to avoid multiline JSON breaking pipe-delimited parsing
+        db_query "SELECT n.id, n.text FROM nodes n WHERE $ready_where ORDER BY n.created_at ASC;" | while IFS='|' read -r id text; do
             echo -e "${CYAN}$id${NC}: $text"
         done
     fi
@@ -1000,14 +987,13 @@ cmd_list() {
         where_clause="WHERE $filters"
     fi
 
-    local query="SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC;"
-    
     if [ "$format" = "json" ]; then
         local results
-        results=$(db_query_json "$query")
+        results=$(db_query_json "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC;")
         [ -z "$results" ] && echo "[]" || echo "$results"
     else
-        db_query "$query" | while IFS='|' read -r id text status metadata; do
+        # Text mode: exclude metadata to avoid multiline JSON breaking pipe-delimited parsing
+        db_query "SELECT id, text, status FROM nodes $where_clause ORDER BY priority DESC, created_at DESC;" | while IFS='|' read -r id text status; do
             local color="$NC"
             case "$status" in
                 active) color="$GREEN" ;;

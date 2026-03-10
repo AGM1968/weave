@@ -2,6 +2,17 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.20.1] - 2026-03-10
+
+### Fixed
+
+- **`wv ready` / `wv list` text output noise** — Multiline JSON metadata was spilling into
+  pipe-delimited text output, printing raw JSON fields as colored garbage lines. Text mode now
+  excludes metadata column; JSON mode still returns full metadata.
+- **`wv context` auto-inherit from primary node** — Falls back to `$WV_HOT_ZONE/primary` (set by
+  `wv work`) when no ID or `WV_ACTIVE` is provided. Eliminates brittle env-var propagation
+  requirement for agents and subprocesses.
+
 ## [1.20.0] - 2026-03-10
 
 ### Added

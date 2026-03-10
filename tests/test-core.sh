@@ -343,9 +343,14 @@ test_work() {
     assert_contains "$output" "\"id\": \"$id\"" "context uses WV_ACTIVE"
     unset WV_ACTIVE
 
-    # Context without WV_ACTIVE or ID shows usage
+    # Context falls back to primary node from wv work
+    output=$("$WV" context --json 2>&1)
+    assert_contains "$output" "\"id\": \"$id\"" "context falls back to primary node"
+
+    # Context without primary or WV_ACTIVE shows usage
+    rm -f "$WV_HOT_ZONE/primary" 2>/dev/null || true
     output=$("$WV" context --json 2>&1 || true)
-    assert_contains "$output" "WV_ACTIVE" "context without ID suggests WV_ACTIVE"
+    assert_contains "$output" "wv work" "context without ID suggests wv work"
 
     # Work on non-existent node fails
     assert_fails "work on non-existent node fails" "$WV" work "wv-0000"

@@ -657,17 +657,24 @@ cmd_context() {
         shift
     done
 
-    # Use WV_ACTIVE if no ID provided (subagent context inheritance)
+    # Use WV_ACTIVE or primary node if no ID provided
     if [ -z "$id" ]; then
         if [ -n "${WV_ACTIVE:-}" ]; then
             id="$WV_ACTIVE"
         else
-            echo -e "${RED}Error: node ID required${NC}" >&2
-            echo "Usage: wv context <id> --json" >&2
-            echo "" >&2
-            echo "Tip: Set WV_ACTIVE to enable automatic context inheritance:" >&2
-            echo "  export WV_ACTIVE=wv-xxxxxx  # or use: wv work <id>" >&2
-            return 1
+            # Fall back to primary node from wv work
+            local primary
+            primary=$(get_primary_node 2>/dev/null || echo "")
+            if [ -n "$primary" ]; then
+                id="$primary"
+            else
+                echo -e "${RED}Error: node ID required${NC}" >&2
+                echo "Usage: wv context <id> --json" >&2
+                echo "" >&2
+                echo "Tip: Run 'wv work <id>' to set the primary node, or:" >&2
+                echo "  export WV_ACTIVE=wv-xxxxxx" >&2
+                return 1
+            fi
         fi
     fi
 
