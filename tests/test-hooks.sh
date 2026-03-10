@@ -32,6 +32,7 @@ WV="$PROJECT_ROOT/scripts/wv"
 TEST_DIR="/tmp/wv-hooks-test-$$"
 export WV_HOT_ZONE="$TEST_DIR"
 export WV_DB="$TEST_DIR/brain.db"
+export WV_REQUIRE_LEARNING=0
 export CLAUDE_PROJECT_DIR="$TEST_DIR/project"
 export WV_PROJECT_DIR="$TEST_DIR/project"
 

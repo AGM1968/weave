@@ -90,13 +90,23 @@ EOF
 fi
 
 if [ "$ACTIVE_COUNT" -gt "1" ]; then
-    # Multiple active nodes, warn but allow
-    echo "⚠️  Warning: Multiple active nodes found. Consider completing one before starting another."
-    exit 0
+    # Multiple active nodes — use primary if set, otherwise warn
+    PRIMARY_FILE="${WV_HOT_ZONE:-/dev/shm/weave}/primary"
+    # Resolve hot zone for this repo
+    if [ -z "${WV_HOT_ZONE:-}" ]; then
+        _REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+        _REPO_HASH=$(echo "$_REPO_ROOT" | md5sum | cut -c1-8)
+        PRIMARY_FILE="/dev/shm/weave/${_REPO_HASH}/primary"
+    fi
+    if [ -f "$PRIMARY_FILE" ]; then
+        NODE_ID=$(cat "$PRIMARY_FILE" 2>/dev/null)
+    fi
 fi
 
-# Get the active node ID
-NODE_ID=$(echo "$ACTIVE_NODES" | jq -r '.[0].id' 2>/dev/null)
+# Get the active node ID (fall back to first active if no primary)
+if [ -z "${NODE_ID:-}" ]; then
+    NODE_ID=$(echo "$ACTIVE_NODES" | jq -r '.[0].id' 2>/dev/null)
+fi
 
 if [ -z "$NODE_ID" ] || [ "$NODE_ID" = "null" ]; then
     exit 0

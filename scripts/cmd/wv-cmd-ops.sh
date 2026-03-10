@@ -598,7 +598,7 @@ _recover_ship() {
                 read -r answer
                 [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 0
             fi
-            cmd_done "$id" 2>/dev/null || true
+            cmd_done "$id" --no-warn 2>/dev/null || true
             cmd_sync 2>/dev/null || true
             _recover_git_commit_push "$id"
             ;;
@@ -1258,6 +1258,7 @@ cmd_health() {
     local verbose=false
     local history_count=0
     local fix=false
+    local strict=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1266,6 +1267,7 @@ cmd_health() {
             --history) history_count=10 ;;
             --history=*) history_count="${1#--history=}" ;;
             --fix) fix=true ;;
+            --strict) strict=true ;;
         esac
         shift
     done
@@ -1567,7 +1569,14 @@ cmd_health() {
                 },
                 code_quality: $quality
             }'
-        return
+        # JSON callers parse the output — exit 0 unless --strict
+        if [ "$invalid_statuses" -gt 0 ] || [ "$contradictions" -gt 0 ]; then
+            return 1
+        fi
+        if [ "$strict" = true ] && [ "$health_score" -lt 100 ]; then
+            return 1
+        fi
+        return 0
     fi
     
     # Text output
@@ -1624,6 +1633,18 @@ cmd_health() {
         [ "$empty_edge_ctx" -gt 0 ] && echo -e "  ${YELLOW}⚠${NC} $empty_edge_ctx edge(s) missing context - run 'wv health --fix' to backfill"
         [ "$fixed_edge_ctx" -gt 0 ] && echo -e "  ${GREEN}✓${NC} Fixed: enriched $fixed_edge_ctx edge(s) with auto-context (marked auto:true)"
     fi
+
+    # Exit code logic:
+    # - Default: exit 0 (warnings are informational, not errors)
+    # - --strict: exit 1 if score < 100 (for CI fail-on-warning)
+    # - Always exit 1 for true errors: invalid statuses, contradictions
+    if [ "$invalid_statuses" -gt 0 ] || [ "$contradictions" -gt 0 ]; then
+        return 1
+    fi
+    if [ "$strict" = true ] && [ "$health_score" -lt 100 ]; then
+        return 1
+    fi
+    return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

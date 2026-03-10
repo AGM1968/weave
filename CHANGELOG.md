@@ -2,6 +2,31 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.20.0] - 2026-03-10
+
+### Added
+
+- **Primary active node binding** — `wv work` sets a primary node tracked in `$WV_HOT_ZONE/primary`.
+  `wv status` shows "Primary:" label, pre-commit trailers use primary node, and `wv done`
+  auto-clears. Multiple active nodes are still allowed but the primary provides unambiguous commit
+  attribution.
+- **Done-criteria enforcement** — `wv done` and `wv ship` now require `--learning="..."` or
+  `--skip-verification`. Bypass with `WV_REQUIRE_LEARNING=0` for tests. Strengthens closure quality.
+- **`wv health --strict` flag** — Exits non-zero when score < 100, for CI fail-on-warning pipelines.
+
+### Fixed
+
+- **Status vocabulary normalization** — MCP server used `in-progress` while CLI canonical set is
+  `active`. Changed all 4 MCP tool enums, added `normalizeStatus()` compat shim for legacy callers,
+  fixed dead `in-progress` display branch in import mapper.
+- **Health exit code bug** — `wv health` exited non-zero on informational warnings (orphan nodes,
+  stale actives) because the last `[ condition ] && echo` line returned 1. Now exits 0 for warnings,
+  1 only for true errors (invalid statuses, contradictions).
+- **Auto-checkpoint commit noise** — Rate-limited: PreCompact hook skips if <10min since last
+  checkpoint, SessionEnd amends recent checkpoint instead of creating new commit.
+- **Test suite fixes** — Health tests handle new non-zero exit on contradictions/invalid statuses,
+  checkpoint trailer tests updated for primary node semantics. All 585 tests passing.
+
 ## [1.19.1] - 2026-03-08
 
 ### Fixed

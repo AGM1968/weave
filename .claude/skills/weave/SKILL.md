@@ -233,7 +233,7 @@ When spawning subagents, pass the active node context via `WV_ACTIVE` environmen
 
 **Pattern:**
 
-1. Parent claims work with `wv work <id>` (sets node to in-progress)
+1. Parent claims work with `wv work <id>` (sets node to active)
 2. Parent exports `WV_ACTIVE=<id>` (or uses `eval "$(wv work <id> --quiet)"`)
 3. Subagent calls `wv context --json` (automatically uses WV_ACTIVE)
 4. Subagent receives full Context Pack: node + blockers + ancestors + learnings

@@ -16,6 +16,7 @@ WV="$REPO_ROOT/scripts/wv"
 TEST_WV_DIR="/tmp/wv-health-test-$$"
 export WV_HOT_ZONE="$TEST_WV_DIR"
 export WV_DB="$TEST_WV_DIR/test.db"
+export WV_REQUIRE_LEARNING=0
 
 # Colors
 RED='\033[0;31m'
@@ -246,7 +247,8 @@ node1=$($WV add "Node A")
 node2=$($WV add "Node B")
 $WV link "$node1" "$node2" --type=contradicts >/dev/null 2>&1
 
-json_output=$($WV health --json 2>&1)
+# health --json exits 1 on contradictions (true error), so capture without set -e
+json_output=$($WV health --json 2>&1) || true
 contradictions=$(echo "$json_output" | jq -r '.issues.unresolved_contradictions')
 assert_equals "1" "$contradictions" "health counts 1 contradiction"
 
@@ -257,6 +259,17 @@ if [ "$score" -lt 100 ]; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo -e "  ${RED}✗${NC} contradictions should reduce health score"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+
+# health exits non-zero for contradictions (true error)
+$WV health >/dev/null 2>&1 || health_exit=$?
+health_exit=${health_exit:-0}
+if [ "$health_exit" -ne 0 ]; then
+    echo -e "  ${GREEN}✓${NC} health exits non-zero for contradictions"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "  ${RED}✗${NC} health should exit non-zero for contradictions"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -424,8 +437,8 @@ WEAVE_DB="${WV_DB}"
 sqlite3 "$WEAVE_DB" "INSERT INTO nodes (id, text, status, created_at, updated_at) 
 VALUES ('wv-inv1', 'Invalid status node', 'banana', datetime('now'), datetime('now'));" 2>/dev/null
 
-# Health should detect invalid status and reduce score
-json_output=$($WV health --json 2>&1)
+# Health should detect invalid status and reduce score (exits non-zero for invalid statuses)
+json_output=$($WV health --json 2>&1) || true
 score=$(echo "$json_output" | jq -r '.score')
 invalid_count=$(echo "$json_output" | jq -r '.issues.invalid_statuses // 0')
 
@@ -449,8 +462,8 @@ else
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 
-# Text output should mention invalid statuses
-text_output=$($WV health 2>&1)
+# Text output should mention invalid statuses (exits non-zero for invalid statuses)
+text_output=$($WV health 2>&1) || true
 if echo "$text_output" | grep -q "invalid status"; then
     echo -e "  ${GREEN}✓${NC} health text output shows invalid status warning"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -460,11 +473,41 @@ fi
 TESTS_RUN=$((TESTS_RUN + 1))
 
 # ============================================================================
+# Test: health exit codes (warnings vs errors)
+# ============================================================================
+echo ""
+echo "Testing: health exit codes"
+
+reset_db
+
+# Clean health = exit 0
+$WV health >/dev/null 2>&1
+assert_equals "0" "$?" "health exits 0 on clean state"
+
+# Add orphan nodes (warning only) — still exit 0
+for i in $(seq 1 10); do
+    $WV add "Orphan $i" --force >/dev/null 2>&1
+done
+$WV health >/dev/null 2>&1
+assert_equals "0" "$?" "health exits 0 with orphan warnings"
+
+# --strict exits non-zero when score < 100
+strict_exit=0
+$WV health --strict >/dev/null 2>&1 || strict_exit=$?
+if [ "$strict_exit" -ne 0 ]; then
+    echo -e "  ${GREEN}✓${NC} health --strict exits non-zero when score < 100"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "  ${RED}✗${NC} health --strict should exit non-zero for warnings"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+
+# ============================================================================
 # Results
 # ============================================================================
 echo ""
 echo "═══════════════════════════════════════════════════════════════════════════"
-echo -e "Tests: ${GREEN}$TESTS_PASSED${NC}/${YELLOW}$TESTS_RUN${NC} passed"
+echo -e "Results: ${GREEN}$TESTS_PASSED${NC}/${YELLOW}$TESTS_RUN${NC} passed"
 
 if [ "$TESTS_PASSED" -eq "$TESTS_RUN" ]; then
     echo -e "${GREEN}All tests passed!${NC}"

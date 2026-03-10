@@ -65,6 +65,7 @@ setup_test_env() {
     TEST_DIR=$(mktemp -d "/tmp/wv-stress-test-XXXXXX")
     export WV_HOT_ZONE="$TEST_DIR/hot"
     export WV_DB="$TEST_DIR/hot/brain.db"
+    export WV_REQUIRE_LEARNING=0
     mkdir -p "$WV_HOT_ZONE"
     # Initialize git repo so WEAVE_DIR resolves to TEST_DIR/.weave
     cd "$TEST_DIR"
@@ -989,7 +990,7 @@ test_update_status_validation() {
     assert_fails "wv update rejects invalid status 'banana'" "$exit_code"
 
     # Valid statuses should work
-    for valid_status in todo active done blocked; do
+    for valid_status in todo active done blocked blocked-external; do
         local v_exit=0
         "$WV" update "$id" --status="$valid_status" >/dev/null 2>&1 || v_exit=$?
         assert_equals "0" "$v_exit" "wv update accepts status=$valid_status" || true
@@ -1146,7 +1147,7 @@ test_health_invalid_status() {
     sqlite3 "$WV_DB" "INSERT INTO nodes (id,text,status,metadata,created_at,updated_at) VALUES ('wv-test','bad node','banana','{}',datetime('now'),datetime('now'));"
 
     local health score
-    health=$("$WV" health 2>&1)
+    health=$("$WV" health 2>&1) || true  # exits non-zero for invalid statuses
     score=$(echo "$health" | grep -oE '[0-9]+/100' | head -1 || echo "unknown")
 
     # Fixed: wv-01e7 — health check now detects invalid statuses

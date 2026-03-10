@@ -30,6 +30,7 @@ WV="$PROJECT_ROOT/scripts/wv"
 TEST_DIR="/tmp/wv-crash-sentinel-test-$$"
 export WV_HOT_ZONE="$TEST_DIR/hot"
 export WV_DB="$TEST_DIR/hot/brain.db"
+export WV_REQUIRE_LEARNING=0
 export WV_AUTO_SYNC=0
 export WV_AUTO_CHECKPOINT=0
 

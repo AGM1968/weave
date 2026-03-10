@@ -29,6 +29,7 @@ WV="$PROJECT_ROOT/scripts/wv"
 TEST_DIR="/tmp/wv-core-test-$$"
 export WV_HOT_ZONE="$TEST_DIR"
 export WV_DB="$TEST_DIR/brain.db"
+export WV_REQUIRE_LEARNING=0
 
 # Cleanup function
 cleanup() {
@@ -294,6 +295,16 @@ test_done() {
 
     # Done on non-existent node fails
     assert_fails "done on non-existent node fails" "$WV" done "wv-0000"
+
+    # Learning gate: wv done requires --learning or --skip-verification
+    id=$("$WV" add "Task needing learning" 2>&1 | tail -1)
+    assert_fails "done rejects bare close when learning required" \
+        env WV_REQUIRE_LEARNING=1 "$WV" done "$id"
+
+    # Same node succeeds with --skip-verification
+    local sv_exit=0
+    WV_REQUIRE_LEARNING=1 "$WV" done "$id" --skip-verification >/dev/null 2>&1 || sv_exit=$?
+    assert_equals "0" "$sv_exit" "done accepts --skip-verification"
 }
 
 # ============================================================================

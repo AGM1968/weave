@@ -32,6 +32,7 @@ WV="$PROJECT_ROOT/scripts/wv"
 TEST_DIR="/tmp/wv-durability-test-$$"
 export WV_HOT_ZONE="$TEST_DIR"
 export WV_DB="$TEST_DIR/brain.db"
+export WV_REQUIRE_LEARNING=0
 export WV_AUTO_SYNC=0  # Disable auto-sync in tests
 export WV_AUTO_CHECKPOINT=0  # Disable auto-checkpoint in tests
 

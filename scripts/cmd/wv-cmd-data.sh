@@ -148,14 +148,29 @@ auto_checkpoint() {
 
     # Only commit if there are staged changes
     if ! git -C "$git_root" diff --cached --quiet 2>/dev/null; then
-        # Include active Weave IDs as trailers for commit-to-node tracing
-        local active_ids
-        active_ids=$(db_query "SELECT id FROM nodes WHERE status='active';" 2>/dev/null || echo "")
+        # Include primary Weave ID as trailer for commit-to-node tracing
+        local primary
+        primary=$(get_primary_node 2>/dev/null || echo "")
         local trailers=""
-        while IFS= read -r wid; do
-            [ -n "$wid" ] && trailers="${trailers}
-Weave-ID: $wid"
-        done <<< "$active_ids"
+        # Verify primary is still active
+        if [ -n "$primary" ]; then
+            local pstatus
+            pstatus=$(db_query "SELECT status FROM nodes WHERE id='$primary';" 2>/dev/null || echo "")
+            if [ "$pstatus" != "active" ]; then
+                clear_primary_node 2>/dev/null || true
+                primary=""
+            fi
+        fi
+        if [ -n "$primary" ]; then
+            trailers="
+Weave-ID: $primary"
+        else
+            # No primary set — fall back to first active node
+            local first_active
+            first_active=$(db_query "SELECT id FROM nodes WHERE status='active' LIMIT 1;" 2>/dev/null || echo "")
+            [ -n "$first_active" ] && trailers="
+Weave-ID: $first_active"
+        fi
 
         local ts
         ts=$(date -d "@$now" '+%H:%M' 2>/dev/null || date '+%H:%M')
@@ -1408,8 +1423,8 @@ cmd_search() {
             local status_color
             case "$status" in
                 done) status_color="${GREEN}✓${NC}" ;;
-                in-progress) status_color="${YELLOW}►${NC}" ;;
-                blocked) status_color="${RED}✗${NC}" ;;
+                active) status_color="${YELLOW}►${NC}" ;;
+                blocked|blocked-external) status_color="${RED}✗${NC}" ;;
                 *) status_color="○" ;;
             esac
             

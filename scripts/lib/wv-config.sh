@@ -102,6 +102,23 @@ else
 fi
 WV_DB_CUSTOM="${WV_DB:+1}"
 WV_DB="${WV_DB:-$WV_HOT_ZONE/brain.db}"
+WV_PRIMARY_FILE="$WV_HOT_ZONE/primary"
+
+# Primary active node helpers
+# The "primary" node is the most recently claimed via `wv work`.
+# Stored in $WV_HOT_ZONE/primary (tmpfs, session-scoped).
+set_primary_node() {
+    local id="$1"
+    echo "$id" > "$WV_PRIMARY_FILE"
+}
+
+get_primary_node() {
+    [ -f "$WV_PRIMARY_FILE" ] && cat "$WV_PRIMARY_FILE" 2>/dev/null || echo ""
+}
+
+clear_primary_node() {
+    rm -f "$WV_PRIMARY_FILE" 2>/dev/null || true
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Colors

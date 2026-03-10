@@ -315,6 +315,16 @@ cmd_done() {
     # Validate ID format (SQL injection prevention)
     validate_id "$id" || return 1
 
+    # Require --learning or --skip-verification for closure quality
+    # Bypass: WV_REQUIRE_LEARNING=0 (for tests), --no-warn (for recovery/internal)
+    if [ "${WV_REQUIRE_LEARNING:-1}" = "1" ] && [ -z "$learning" ] && [ "$skip_verification" = "0" ] && [ "$no_warn" = "0" ]; then
+        echo -e "${RED}Error: --learning=\"...\" or --skip-verification required${NC}" >&2
+        echo -e "  Capture what future sessions would get wrong without this:" >&2
+        echo -e "  wv done $id --learning=\"decision: ... | pattern: ... | pitfall: ...\"" >&2
+        echo -e "  wv done $id --skip-verification  # for trivial work" >&2
+        return 1
+    fi
+
     # Verify node exists
     local exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
     if [ "$exists" = "0" ]; then
@@ -398,6 +408,13 @@ cmd_done() {
     fi
 
     db_query "UPDATE nodes SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+
+    # Clear primary pointer if this was the primary node
+    local primary
+    primary=$(get_primary_node 2>/dev/null || echo "")
+    if [ "$primary" = "$id" ]; then
+        clear_primary_node
+    fi
 
     # Store commit SHAs in node metadata, then aggregate to parent epic
     _store_node_commits "$id" 2>/dev/null || true
@@ -795,12 +812,13 @@ cmd_work() {
         return 1
     fi
     
-    # Mark as active
+    # Mark as active and set as primary
     local cur_status
     cur_status=$(db_query "SELECT status FROM nodes WHERE id='$id';")
     if [ "$cur_status" != "active" ]; then
         db_query "UPDATE nodes SET status='active', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
     fi
+    set_primary_node "$id"
     
     if [ "$quiet" = true ]; then
         # Machine-readable output for eval
@@ -1071,12 +1089,30 @@ cmd_status() {
     local active=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active';")
     local ready=$(cmd_ready --count)
     local blocked=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='blocked';")
-    
+
     echo "Work: $active active, $ready ready, $blocked blocked."
-    
+
     if [ "$active" -gt 0 ]; then
-        local current=$(db_query "SELECT id || ': ' || text FROM nodes WHERE status='active' LIMIT 1;")
-        echo "Current: $current"
+        local primary
+        primary=$(get_primary_node)
+        if [ -n "$primary" ]; then
+            # Verify primary is still active
+            local pstatus
+            pstatus=$(db_query "SELECT status FROM nodes WHERE id='$primary';" 2>/dev/null)
+            if [ "$pstatus" = "active" ]; then
+                local ptext
+                ptext=$(db_query "SELECT text FROM nodes WHERE id='$primary';")
+                echo "Primary: $primary: $ptext"
+            else
+                # Primary is no longer active — clear and fall back
+                clear_primary_node
+                local current=$(db_query "SELECT id || ': ' || text FROM nodes WHERE status='active' LIMIT 1;")
+                echo "Current: $current"
+            fi
+        else
+            local current=$(db_query "SELECT id || ': ' || text FROM nodes WHERE status='active' LIMIT 1;")
+            echo "Current: $current"
+        fi
     fi
 }
 
@@ -1263,12 +1299,14 @@ cmd_ship() {
     local id="${1:-}"
     local learning=""
     local gh_flag=false
+    local skip_verification=false
 
     shift || true
     while [ $# -gt 0 ]; do
         case "$1" in
             --learning=*) learning="${1#*=}" ;;
             --gh) gh_flag=true ;;
+            --skip-verification) skip_verification=true ;;
         esac
         shift
     done
@@ -1313,8 +1351,13 @@ cmd_ship() {
     journal_step 1 "done" "{\"id\":\"$id\"}"
     if [ -n "$learning" ]; then
         cmd_done "$id" --learning="$learning"
+    elif [ "$skip_verification" = true ]; then
+        cmd_done "$id" --skip-verification
     else
-        cmd_done "$id"
+        echo -e "${RED}Error: --learning=\"...\" or --skip-verification required${NC}" >&2
+        echo "Usage: wv ship <id> --learning=\"decision: ... | pattern: ... | pitfall: ...\"" >&2
+        journal_abort 2>/dev/null || true
+        return 1
     fi
     journal_complete 1
 

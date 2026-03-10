@@ -158,7 +158,7 @@ const TOOLS: Tool[] = [
         },
         status: {
           type: "string",
-          enum: ["todo", "in-progress", "done", "blocked", "blocked-external"],
+          enum: ["todo", "active", "done", "blocked", "blocked-external"],
           description: "Filter by status",
         },
       },
@@ -178,7 +178,7 @@ const TOOLS: Tool[] = [
         },
         status: {
           type: "string",
-          enum: ["todo", "in-progress", "done", "blocked", "blocked-external"],
+          enum: ["todo", "active", "done", "blocked", "blocked-external"],
           description: "Initial status (default: todo)",
         },
         metadata: {
@@ -274,7 +274,7 @@ const TOOLS: Tool[] = [
       properties: {
         status: {
           type: "string",
-          enum: ["todo", "in-progress", "done", "blocked", "blocked-external"],
+          enum: ["todo", "active", "done", "blocked", "blocked-external"],
           description: "Filter by status",
         },
         all: {
@@ -583,7 +583,7 @@ const TOOLS: Tool[] = [
         },
         status: {
           type: "string",
-          enum: ["todo", "in-progress", "done", "blocked", "blocked-external"],
+          enum: ["todo", "active", "done", "blocked", "blocked-external"],
           description: "New status",
         },
         text: {
@@ -795,6 +795,16 @@ function getToolsForScope(scope: Scope, allTools: Tool[]): Tool[] {
 
 const SCOPED_TOOLS = getToolsForScope(ACTIVE_SCOPE, TOOLS);
 
+// Normalize legacy status values to canonical enum
+function normalizeStatus(status: string | undefined): string | undefined {
+  if (!status) return status;
+  const COMPAT_MAP: Record<string, string> = {
+    "in-progress": "active",
+    in_progress: "active",
+  };
+  return COMPAT_MAP[status] ?? status;
+}
+
 // Tool handlers
 function handleTool(
   name: string,
@@ -806,7 +816,7 @@ function handleTool(
     case "weave_search": {
       const query = args.query as string;
       const limit = args.limit as number | undefined;
-      const status = args.status as string | undefined;
+      const status = normalizeStatus(args.status as string | undefined);
       const cmd = ["search", query, "--json"];
       if (limit) cmd.push(`--limit=${limit}`);
       if (status) cmd.push(`--status=${status}`);
@@ -816,7 +826,7 @@ function handleTool(
 
     case "weave_add": {
       const text = args.text as string;
-      const status = args.status as string | undefined;
+      const status = normalizeStatus(args.status as string | undefined);
       const metadata = args.metadata as Record<string, unknown> | undefined;
       const gh = args.gh as boolean | undefined;
       const alias = args.alias as string | undefined;
@@ -869,7 +879,7 @@ function handleTool(
     }
 
     case "weave_list": {
-      const status = args.status as string | undefined;
+      const status = normalizeStatus(args.status as string | undefined);
       const all = args.all as boolean | undefined;
       const cmd = ["list", "--json"];
       if (status) cmd.push(`--status=${status}`);
@@ -1237,7 +1247,7 @@ function handleTool(
 
     case "weave_update": {
       const id = args.id as string;
-      const status = args.status as string | undefined;
+      const status = normalizeStatus(args.status as string | undefined);
       const text = args.text as string | undefined;
       const metadata = args.metadata as Record<string, unknown> | undefined;
       const alias = args.alias as string | undefined;
@@ -1365,7 +1375,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.19.1",
+      version: "1.20.0",
     },
     {
       capabilities: {

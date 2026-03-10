@@ -30,6 +30,7 @@ WV="$PROJECT_ROOT/scripts/wv"
 TEST_DIR="/tmp/wv-sprint34-test-$$"
 export WV_HOT_ZONE="$TEST_DIR"
 export WV_DB="$TEST_DIR/brain.db"
+export WV_REQUIRE_LEARNING=0
 
 cleanup() {
     cd /tmp
@@ -830,39 +831,40 @@ test_checkpoint_trailers() {
     # Disable throttle for all checkpoint tests
     export WV_CHECKPOINT_INTERVAL=0
 
-    # Create an active node and trigger checkpoint
+    # Create an active node via wv work (sets primary) and trigger checkpoint
     local id1
-    id1=$($WV add "Active work item" --status=active 2>/dev/null | tail -1)
+    id1=$($WV add "Active work item" 2>/dev/null | tail -1)
+    $WV work "$id1" >/dev/null 2>&1
     rm -f "$WV_HOT_ZONE/.last_checkpoint"
     $WV sync >/dev/null 2>&1
 
     # Check latest commit for Weave-ID trailer
     local commit_msg
     commit_msg=$(git log -1 --format='%B' 2>/dev/null)
-    assert_contains "$commit_msg" "Weave-ID: $id1" "checkpoint: includes active node trailer"
+    assert_contains "$commit_msg" "Weave-ID: $id1" "checkpoint: includes primary node trailer"
     assert_contains "$commit_msg" "auto-checkpoint" "checkpoint: has auto-checkpoint prefix"
 
-    # Create second active node — both should appear as trailers
+    # Create second node (todo), claim it as primary — each wv work/add changes state.sql
     local id2
-    id2=$($WV add "Second active item" --status=active 2>/dev/null | tail -1)
+    id2=$($WV add "Second active item" 2>/dev/null | tail -1)
+    $WV work "$id2" >/dev/null 2>&1
     rm -f "$WV_HOT_ZONE/.last_checkpoint"
     $WV sync >/dev/null 2>&1
 
     commit_msg=$(git log -1 --format='%B' 2>/dev/null)
-    assert_contains "$commit_msg" "Weave-ID: $id1" "checkpoint: still includes first active node"
-    assert_contains "$commit_msg" "Weave-ID: $id2" "checkpoint: includes second active node"
+    assert_contains "$commit_msg" "Weave-ID: $id2" "checkpoint: switched primary shows in trailer"
 
-    # Complete one node — its trailer should disappear
-    $WV done "$id1" >/dev/null 2>&1
+    # Complete primary — falls back to remaining active (id1)
+    $WV done "$id2" >/dev/null 2>&1
     rm -f "$WV_HOT_ZONE/.last_checkpoint"
     $WV sync >/dev/null 2>&1
 
     commit_msg=$(git log -1 --format='%B' 2>/dev/null)
-    assert_not_contains "$commit_msg" "Weave-ID: $id1" "checkpoint: completed node removed from trailers"
-    assert_contains "$commit_msg" "Weave-ID: $id2" "checkpoint: remaining active node still in trailer"
+    assert_not_contains "$commit_msg" "Weave-ID: $id2" "checkpoint: completed node removed from trailers"
+    assert_contains "$commit_msg" "Weave-ID: $id1" "checkpoint: remaining active node falls back as trailer"
 
     # No active nodes — no trailers
-    $WV done "$id2" >/dev/null 2>&1
+    $WV done "$id1" >/dev/null 2>&1
     $WV add "Just a todo" >/dev/null 2>&1  # status=todo, not active
     rm -f "$WV_HOT_ZONE/.last_checkpoint"
     $WV sync >/dev/null 2>&1

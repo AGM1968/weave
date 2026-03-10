@@ -12,6 +12,7 @@ WV="$REPO_ROOT/scripts/wv"
 TEST_DIR=$(mktemp -d)
 export WV_HOT_ZONE="$TEST_DIR/hot"
 export WV_DB="$TEST_DIR/hot/brain.db"
+export WV_REQUIRE_LEARNING=0
 export WEAVE_DIR="$TEST_DIR/.weave"
 mkdir -p "$WV_HOT_ZONE" "$WEAVE_DIR"
 

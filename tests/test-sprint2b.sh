@@ -29,6 +29,7 @@ WV="$PROJECT_ROOT/scripts/wv"
 TEST_DIR="/tmp/wv-sprint2b-test-$$"
 export WV_HOT_ZONE="$TEST_DIR"
 export WV_DB="$TEST_DIR/brain.db"
+export WV_REQUIRE_LEARNING=0
 
 cleanup() {
     if [ -d "$TEST_DIR" ]; then
