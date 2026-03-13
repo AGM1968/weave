@@ -895,18 +895,32 @@ SETTINGSEOF
         echo -e "  ${YELLOW}⊘${NC} .claude/settings.local.json (user file, use --force to overwrite)"
     fi
 
-    # ── Makefile (create on init, append wv targets on --update if missing) ──
+    # ── Makefile (create on init, section-replace on --force/--update) ──
     if [ -f "$CONFIG_DIR/Makefile.template" ]; then
         if [ ! -f "$REPO_ROOT/Makefile" ]; then
             cp "$CONFIG_DIR/Makefile.template" "$REPO_ROOT/Makefile"
             echo -e "  ${GREEN}✓${NC} Makefile (wv targets)"
-        elif [ "$FORCE_MODE" = "1" ]; then
-            cp "$CONFIG_DIR/Makefile.template" "$REPO_ROOT/Makefile"
-            echo -e "  ${GREEN}✓${NC} Makefile (overwritten)"
-        elif [ "$UPDATE_MODE" = "1" ] && ! grep -q '^wv-status:' "$REPO_ROOT/Makefile"; then
-            echo "" >> "$REPO_ROOT/Makefile"
-            cat "$CONFIG_DIR/Makefile.template" >> "$REPO_ROOT/Makefile"
-            echo -e "  ${GREEN}✓${NC} Makefile (appended wv targets)"
+        elif [ "$FORCE_MODE" = "1" ] || [ "$UPDATE_MODE" = "1" ]; then
+            if grep -q '# ── BEGIN WEAVE TARGETS ──' "$REPO_ROOT/Makefile"; then
+                # Replace existing weave section, preserve user targets
+                _tmp_mk=$(mktemp)
+                # Keep everything before BEGIN marker
+                sed '/# ── BEGIN WEAVE TARGETS ──/,$d' "$REPO_ROOT/Makefile" > "$_tmp_mk"
+                # Insert new weave section
+                cat "$CONFIG_DIR/Makefile.template" >> "$_tmp_mk"
+                # Keep everything after END marker
+                sed -n '/# ── END WEAVE TARGETS ──/,${/# ── END WEAVE TARGETS ──/d;p}' "$REPO_ROOT/Makefile" >> "$_tmp_mk"
+                mv "$_tmp_mk" "$REPO_ROOT/Makefile"
+                echo -e "  ${GREEN}✓${NC} Makefile (weave targets updated, user targets preserved)"
+            elif ! grep -q '^wv-status:' "$REPO_ROOT/Makefile"; then
+                # No markers and no wv targets — append
+                echo "" >> "$REPO_ROOT/Makefile"
+                cat "$CONFIG_DIR/Makefile.template" >> "$REPO_ROOT/Makefile"
+                echo -e "  ${GREEN}✓${NC} Makefile (appended wv targets)"
+            else
+                # Has old-style wv targets without markers — warn
+                echo -e "  ${YELLOW}⊘${NC} Makefile (has wv targets but no section markers — manually replace or delete wv-* targets first)"
+            fi
         elif grep -q '^wv-status:' "$REPO_ROOT/Makefile"; then
             echo -e "  ${YELLOW}⊘${NC} Makefile (wv targets already present)"
         else
