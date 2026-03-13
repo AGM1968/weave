@@ -72,6 +72,92 @@ cmd_init() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# cmd_add helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+# _add_dedup_check — Warn if similar non-done nodes exist. Returns 1 if dupe found.
+_add_dedup_check() {
+    local text="$1"
+    db_ensure
+    db_migrate_fts5 2>/dev/null || true
+    # Extract significant words (>4 chars) for token-based matching
+    local search_tokens
+    search_tokens=$(echo "$text" | tr -cs '[:alnum:]' ' ' | \
+        awk '{for(i=1;i<=NF;i++) if(length($i)>4) {printf "%s ", $i; c++; if(c>=5) exit}}')
+    search_tokens=$(echo "$search_tokens" | sed 's/[(){}*:^~"]//g' | xargs)
+    local similar=""
+    if [ -n "$search_tokens" ]; then
+        local token_count
+        token_count=$(echo "$search_tokens" | wc -w)
+        if [ "$token_count" -ge 2 ]; then
+            local fts_query
+            fts_query=$(echo "$search_tokens" | sed 's/ / AND /g')
+            similar=$(db_query "
+                SELECT n.id, n.text, n.status
+                FROM nodes_fts f
+                JOIN nodes n ON f.rowid = n.rowid
+                WHERE nodes_fts MATCH '$fts_query'
+                AND n.status != 'done'
+                LIMIT 3;
+            " 2>/dev/null || echo "")
+        fi
+    fi
+    if [ -n "$similar" ]; then
+        echo -e "${YELLOW}⚠ Similar active nodes exist:${NC}" >&2
+        echo "$similar" | while IFS='|' read -r sid stext sstatus; do
+            echo -e "  ${CYAN}$sid${NC} [$sstatus]: $stext" >&2
+        done
+        echo -e "${YELLOW}  Use --force to create anyway${NC}" >&2
+        return 1
+    fi
+    return 0
+}
+
+# _add_create_gh_issue — Create a GitHub issue linked to a Weave node
+_add_create_gh_issue() {
+    local id="$1" text="$2" metadata="$3" alias="$4"
+    local repo
+    repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
+    if [ -z "$repo" ]; then
+        return 0
+    fi
+    local priority type_label priority_label
+    priority=$(echo "$metadata" | jq -r '.priority // 2' 2>/dev/null || echo "2")
+    case "$(echo "$metadata" | jq -r '.type // "task"' 2>/dev/null)" in
+        bug) type_label="bug" ;; feature) type_label="enhancement" ;; *) type_label="task" ;;
+    esac
+    case "$priority" in
+        0|1) priority_label="P1" ;; 3) priority_label="P3" ;; 4) priority_label="P4" ;; *) priority_label="P2" ;;
+    esac
+    local alias_part=""
+    if [ -n "$alias" ]; then
+        alias_part=" | **Alias:** \`$alias\`"
+    fi
+    local gh_body="**Weave ID**: \`$id\`${alias_part}
+
+---
+*Synced from Weave*"
+    gh label create "$type_label" --repo "$repo" --color "1d76db" --description "Weave task type" 2>/dev/null || true
+    gh label create "$priority_label" --repo "$repo" --color "e4e669" --description "Weave priority" 2>/dev/null || true
+    gh label create "weave-synced" --repo "$repo" --color "bfdadc" --description "Synced from/to Weave" 2>/dev/null || true
+    local gh_url
+    gh_url=$(gh issue create --repo "$repo" \
+        --title "$text" --body "$gh_body" \
+        --label "$type_label" --label "$priority_label" --label "weave-synced" 2>&1) || true
+    if [[ "$gh_url" == http* ]]; then
+        local gh_num
+        gh_num=$(echo "$gh_url" | grep -oE '[0-9]+$')
+        local updated_meta
+        updated_meta=$(echo "$metadata" | jq --arg gh "$gh_num" '. + {gh_issue: ($gh | tonumber)}' 2>/dev/null || echo "$metadata")
+        updated_meta="${updated_meta//\'/\'\'}"
+        db_query "UPDATE nodes SET metadata='$updated_meta' WHERE id='$id';"
+        echo -e "${GREEN}✓${NC} GitHub issue #$gh_num created" >&2
+    else
+        echo -e "${YELLOW}Warning: GitHub issue creation failed${NC}" >&2
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # cmd_add — Add a new node
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -125,39 +211,7 @@ cmd_add() {
 
     # Dedup check: warn if similar non-done nodes exist (skip with --force)
     if [ "$force" != "true" ]; then
-        db_ensure
-        db_migrate_fts5 2>/dev/null || true
-        # Extract significant words (>4 chars) for token-based matching
-        # This is less aggressive than exact phrase match — requires multiple
-        # word overlap rather than identical text sequences
-        local search_tokens
-        search_tokens=$(echo "$text" | tr -cs '[:alnum:]' ' ' | \
-            awk '{for(i=1;i<=NF;i++) if(length($i)>4) {printf "%s ", $i; c++; if(c>=5) exit}}')
-        search_tokens=$(echo "$search_tokens" | sed 's/[(){}*:^~"]//g' | xargs)
-        local similar=""
-        if [ -n "$search_tokens" ]; then
-            # Count tokens — only check if we have 2+ significant words
-            local token_count
-            token_count=$(echo "$search_tokens" | wc -w)
-            if [ "$token_count" -ge 2 ]; then
-                local fts_query
-                fts_query=$(echo "$search_tokens" | sed 's/ / AND /g')
-                similar=$(db_query "
-                    SELECT n.id, n.text, n.status
-                    FROM nodes_fts f
-                    JOIN nodes n ON f.rowid = n.rowid
-                    WHERE nodes_fts MATCH '$fts_query'
-                    AND n.status != 'done'
-                    LIMIT 3;
-                " 2>/dev/null || echo "")
-            fi
-        fi
-        if [ -n "$similar" ]; then
-            echo -e "${YELLOW}⚠ Similar active nodes exist:${NC}" >&2
-            echo "$similar" | while IFS='|' read -r sid stext sstatus; do
-                echo -e "  ${CYAN}$sid${NC} [$sstatus]: $stext" >&2
-            done
-            echo -e "${YELLOW}  Use --force to create anyway${NC}" >&2
+        if ! _add_dedup_check "$text"; then
             return 1
         fi
     fi
@@ -197,45 +251,7 @@ cmd_add() {
 
     # Create matching GitHub issue if --gh flag is set
     if [ "$create_gh" = true ] && command -v gh >/dev/null 2>&1; then
-        local repo
-        repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
-        if [ -n "$repo" ]; then
-            local priority type_label priority_label
-            priority=$(echo "$metadata" | jq -r '.priority // 2' 2>/dev/null || echo "2")
-            case "$(echo "$metadata" | jq -r '.type // "task"' 2>/dev/null)" in
-                bug) type_label="bug" ;; feature) type_label="enhancement" ;; *) type_label="task" ;;
-            esac
-            case "$priority" in
-                0|1) priority_label="P1" ;; 3) priority_label="P3" ;; 4) priority_label="P4" ;; *) priority_label="P2" ;;
-            esac
-            local alias_part=""
-            if [ -n "$alias" ]; then
-                alias_part=" | **Alias:** \`$alias\`"
-            fi
-            local gh_body="**Weave ID**: \`$id\`${alias_part}
-
----
-*Synced from Weave*"
-            # Ensure required labels exist (idempotent, fails silently)
-            gh label create "$type_label" --repo "$repo" --color "1d76db" --description "Weave task type" 2>/dev/null || true
-            gh label create "$priority_label" --repo "$repo" --color "e4e669" --description "Weave priority" 2>/dev/null || true
-            gh label create "weave-synced" --repo "$repo" --color "bfdadc" --description "Synced from/to Weave" 2>/dev/null || true
-            local gh_url
-            gh_url=$(gh issue create --repo "$repo" \
-                --title "$text" --body "$gh_body" \
-                --label "$type_label" --label "$priority_label" --label "weave-synced" 2>&1) || true
-            if [[ "$gh_url" == http* ]]; then
-                local gh_num
-                gh_num=$(echo "$gh_url" | grep -oE '[0-9]+$')
-                local updated_meta
-                updated_meta=$(echo "$metadata" | jq --arg gh "$gh_num" '. + {gh_issue: ($gh | tonumber)}' 2>/dev/null || echo "$metadata")
-                updated_meta="${updated_meta//\'/\'\'}"
-                db_query "UPDATE nodes SET metadata='$updated_meta' WHERE id='$id';"
-                echo -e "${GREEN}✓${NC} GitHub issue #$gh_num created" >&2
-            else
-                echo -e "${YELLOW}Warning: GitHub issue creation failed${NC}" >&2
-            fi
-        fi
+        _add_create_gh_issue "$id" "$text" "$metadata" "$alias"
     fi
 
     echo "$id"
@@ -286,8 +302,211 @@ _aggregate_epic_commits() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# cmd_done — Mark node as done
+# cmd_done — Mark node as done (decomposed into helpers)
 # ═══════════════════════════════════════════════════════════════════════════
+
+# Shared state for cmd_done helpers (avoids stdout capture in subshells)
+_done_skip_learning=false
+
+# Store learning in node metadata with FTS5 dedup check and format suggestion.
+# Sets _done_skip_learning=true if user chose to skip/dedup.
+# Args: $1=id, $2=learning text (already ANSI-stripped)
+_done_store_learning() {
+    local id="$1" learning="$2"
+    _done_skip_learning=false
+
+    # FTS5 dedup check: prompt if a similar learning already exists
+    local search_terms
+    search_terms=$(echo "$learning" | tr -cs '[:alnum:]' ' ' | \
+        awk '{for(i=1;i<=NF;i++) if(length($i)>4) {print $i; c++; if(c>=3) exit}}')
+    if [ -n "$search_terms" ]; then
+        # Sanitize FTS5 operators to prevent query syntax injection
+        search_terms=$(echo "$search_terms" | sed 's/[(){}*:^~"]//g' | tr '\n' ' ')
+        local fts_match
+        fts_match=$(db_query "
+            SELECT id FROM nodes_fts
+            WHERE nodes_fts MATCH '${search_terms}'
+            AND id != '$id'
+            LIMIT 1;
+        " 2>/dev/null || true)
+        if [ -n "$fts_match" ]; then
+            echo -e "${YELLOW}⚠ Learning may overlap with $fts_match${NC}" >&2
+            if [ -t 0 ] && [ -t 2 ]; then
+                # Interactive terminal: show overlapping learning and prompt for action
+                local overlap_learning
+                overlap_learning=$(db_query_json "SELECT metadata FROM nodes WHERE id='$fts_match';" 2>/dev/null \
+                    | jq -r '.[0].metadata | if . and . != "" then (. | fromjson | .learning // "(no learning)") else "(no learning)" end' 2>/dev/null || echo "(no learning)")
+                echo -e "${CYAN}  Overlapping (${fts_match}):${NC} ${overlap_learning}" >&2
+                echo -e "${YELLOW}  [d]edup  [a]cknowledge  [s]kip learning${NC}" >&2
+                printf "  > " >&2
+                local overlap_action
+                read -r overlap_action </dev/tty
+                case "$overlap_action" in
+                    d|D|dedup)
+                        echo -e "  → Dedup: revise your --learning to reduce overlap, then re-run wv done." >&2
+                        _done_skip_learning=true
+                        ;;
+                    s|S|skip)
+                        echo -e "  → Learning skipped." >&2
+                        _done_skip_learning=true
+                        ;;
+                    *)
+                        echo -e "  → Acknowledged, proceeding with intentional overlap." >&2
+                        ;;
+                esac
+            else
+                echo -e "${YELLOW}  → check wv show $fts_match to inspect${NC}" >&2
+            fi
+        fi
+    fi
+
+    if [ "$_done_skip_learning" = true ]; then
+        return 0
+    fi
+
+    # Merge learning into node metadata
+    local cur_meta cur_meta_raw
+    cur_meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='$id';" 2>/dev/null || echo "[]")
+    cur_meta=$(echo "$cur_meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
+    if [[ "$cur_meta" != "{"* ]]; then
+        cur_meta=$(echo "$cur_meta" | jq -r '.' 2>/dev/null || echo "{}")
+    fi
+    local new_meta
+    new_meta=$(echo "$cur_meta" | jq --arg l "$learning" '. + {learning: $l}' 2>/dev/null || echo "$cur_meta")
+    new_meta="${new_meta//\'/\'\'}"
+    db_query "UPDATE nodes SET metadata='$new_meta', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+    score_learning "$id" 2>/dev/null || true
+
+    # Soft format suggestion: nudge toward structured learning format
+    local has_structured=false
+    if [[ "$learning" == *"decision:"* ]] || [[ "$learning" == *"pattern:"* ]] || [[ "$learning" == *"pitfall:"* ]]; then
+        has_structured=true
+    fi
+    if [ "$has_structured" = false ]; then
+        echo -e "${YELLOW}Tip: structured learnings are more useful for future sessions${NC}" >&2
+        echo -e "${YELLOW}  Format: --learning=\"decision: ... | pattern: ... | pitfall: ...\"${NC}" >&2
+    fi
+}
+
+# Close linked GitHub issue with learnings + commit comment.
+# Args: $1=id
+_done_close_gh_issue() {
+    local id="$1"
+
+    if ! command -v gh >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Read metadata for GH issue number
+    # Note: pipefail is set globally — use intermediate variables to avoid
+    # SIGPIPE (141) when jq closes stdin before sqlite3/gh finish writing.
+    local meta meta_raw
+    meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='$id';" 2>/dev/null || echo "[]")
+    meta=$(echo "$meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
+    if [[ "$meta" != "{"* ]]; then
+        meta=$(echo "$meta" | jq -r '.' 2>/dev/null || echo "{}")
+    fi
+    local gh_num
+    gh_num=$(echo "$meta" | jq -r '.gh_issue // empty' 2>/dev/null)
+    if [ -z "$gh_num" ] || [ "$gh_num" = "null" ]; then
+        return 0
+    fi
+
+    local repo
+    repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
+    if [ -z "$repo" ]; then
+        return 0
+    fi
+
+    # Build close comment with learnings from metadata
+    local comment="Completed. Weave node \`$id\` closed."
+    local l_decision l_pattern l_pitfall l_learning
+    l_decision=$(echo "$meta" | jq -r '.decision // empty' 2>/dev/null)
+    l_pattern=$(echo "$meta" | jq -r '.pattern // empty' 2>/dev/null)
+    l_pitfall=$(echo "$meta" | jq -r '.pitfall // empty' 2>/dev/null)
+    l_learning=$(echo "$meta" | jq -r '.learning // empty' 2>/dev/null)
+
+    if [ -n "$l_decision" ] || [ -n "$l_pattern" ] || [ -n "$l_pitfall" ] || [ -n "$l_learning" ]; then
+        comment="$comment
+
+**Learnings:**"
+        if [ -n "$l_decision" ]; then comment="$comment
+- **Decision:** $l_decision"; fi
+        if [ -n "$l_pattern" ]; then comment="$comment
+- **Pattern:** $l_pattern"; fi
+        if [ -n "$l_pitfall" ]; then comment="$comment
+- **Pitfall:** $l_pitfall"; fi
+        if [ -n "$l_learning" ]; then comment="$comment
+- **Notes:** $l_learning"; fi
+    fi
+
+    # Find related commits via Weave-ID trailer
+    local shas
+    shas=$(git log --format="%H" --grep="Weave-ID: $id" --since="90 days ago" 2>/dev/null | head -10)
+    if [ -z "$shas" ]; then
+        shas=$(git log --format="%H" --grep="$id" --since="90 days ago" 2>/dev/null | head -10)
+    fi
+    if [ -n "$shas" ]; then
+        local repo_url
+        repo_url=$(gh repo view --json url -q '.url' 2>/dev/null || echo "")
+        comment="$comment
+
+**Commits:**"
+        for sha in $shas; do
+            local short_sha subj
+            short_sha=$(echo "$sha" | cut -c1-7)
+            subj=$(git log --format="%s" -1 "$sha" 2>/dev/null)
+            if [ -n "$repo_url" ]; then
+                comment="$comment
+- [\`$short_sha\`]($repo_url/commit/$sha) $subj"
+            else
+                comment="$comment
+- \`$short_sha\` $subj"
+            fi
+        done
+    fi
+
+    # Remove stale status labels before closing
+    gh issue edit "$gh_num" --repo "$repo" --remove-label "weave:active" >/dev/null 2>&1 || true
+    gh issue edit "$gh_num" --repo "$repo" --remove-label "weave:blocked" >/dev/null 2>&1 || true
+
+    if gh issue close "$gh_num" --repo "$repo" --comment "$comment" >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_num"
+    else
+        echo -e "${YELLOW}Warning: could not close GitHub issue #$gh_num${NC}" >&2
+    fi
+
+    # Refresh parent epic body (checkboxes + Mermaid) after child close
+    _refresh_parent_gh "$id"
+}
+
+# Append completion record to breadcrumbs.md.
+# Args: $1=id
+_done_write_breadcrumb() {
+    local id="$1"
+
+    if [ -z "${WEAVE_DIR:-}" ]; then
+        return 0
+    fi
+
+    local breadcrumb_file="$WEAVE_DIR/breadcrumbs.md"
+    local node_alias
+    node_alias=$(db_query "SELECT COALESCE(alias, '') FROM nodes WHERE id='$id';" 2>/dev/null || true)
+    local label="$id"
+    if [ -n "$node_alias" ]; then
+        label="$id ($node_alias)"
+    fi
+    local unblocked
+    unblocked=$(db_query "SELECT id FROM nodes WHERE status='todo' AND id IN (SELECT target FROM edges WHERE source='$id' AND type='blocks');" 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
+    local next_ready
+    next_ready=$(cmd_ready --json 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || true)
+    {
+        echo ""
+        echo "## $(date '+%Y-%m-%d %H:%M') — Completed $label"
+        if [ -n "$unblocked" ]; then echo "- Unblocked: $unblocked"; fi
+        if [ -n "$next_ready" ]; then echo "- Next ready: $next_ready"; fi
+    } >> "$breadcrumb_file" 2>/dev/null || true
+}
 
 cmd_done() {
     local id="${1:-}"
@@ -326,7 +545,8 @@ cmd_done() {
     fi
 
     # Verify node exists
-    local exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
+    local exists
+    exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
     if [ "$exists" = "0" ]; then
         echo -e "${RED}Error: node $id not found${NC}" >&2
         return 1
@@ -336,91 +556,24 @@ cmd_done() {
     if [ -n "$learning" ]; then
         # Strip ANSI escape codes (color sequences leak from terminal output)
         learning=$(printf '%s' "$learning" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
-
-        # FTS5 dedup check: prompt if a similar learning already exists
-        local search_terms skip_learning=false
-        search_terms=$(echo "$learning" | tr -cs '[:alnum:]' ' ' | \
-            awk '{for(i=1;i<=NF;i++) if(length($i)>4) {print $i; c++; if(c>=3) exit}}')
-        if [ -n "$search_terms" ]; then
-            # Sanitize FTS5 operators to prevent query syntax injection
-            search_terms=$(echo "$search_terms" | sed 's/[(){}*:^~"]//g' | tr '\n' ' ')
-            local fts_match
-            fts_match=$(db_query "
-                SELECT id FROM nodes_fts
-                WHERE nodes_fts MATCH '${search_terms}'
-                AND id != '$id'
-                LIMIT 1;
-            " 2>/dev/null || true)
-            if [ -n "$fts_match" ]; then
-                echo -e "${YELLOW}⚠ Learning may overlap with $fts_match${NC}" >&2
-                if [ -t 0 ] && [ -t 2 ]; then
-                    # Interactive terminal: show overlapping learning and prompt for action
-                    local overlap_learning
-                    overlap_learning=$(db_query_json "SELECT metadata FROM nodes WHERE id='$fts_match';" 2>/dev/null \
-                        | jq -r '.[0].metadata | if . and . != "" then (. | fromjson | .learning // "(no learning)") else "(no learning)" end' 2>/dev/null || echo "(no learning)")
-                    echo -e "${CYAN}  Overlapping (${fts_match}):${NC} ${overlap_learning}" >&2
-                    echo -e "${YELLOW}  [d]edup  [a]cknowledge  [s]kip learning${NC}" >&2
-                    printf "  > " >&2
-                    local overlap_action
-                    read -r overlap_action </dev/tty
-                    case "$overlap_action" in
-                        d|D|dedup)
-                            echo -e "  → Dedup: revise your --learning to reduce overlap, then re-run wv done." >&2
-                            skip_learning=true
-                            ;;
-                        s|S|skip)
-                            echo -e "  → Learning skipped." >&2
-                            skip_learning=true
-                            ;;
-                        *)
-                            echo -e "  → Acknowledged, proceeding with intentional overlap." >&2
-                            ;;
-                    esac
-                else
-                    echo -e "${YELLOW}  → check wv show $fts_match to inspect${NC}" >&2
-                fi
-            fi
-        fi
-
-        if [ "$skip_learning" = false ]; then
-            local cur_meta cur_meta_raw
-            cur_meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='$id';" 2>/dev/null || echo "[]")
-            cur_meta=$(echo "$cur_meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
-            if [[ "$cur_meta" != "{"* ]]; then
-                cur_meta=$(echo "$cur_meta" | jq -r '.' 2>/dev/null || echo "{}")
-            fi
-            local new_meta
-            new_meta=$(echo "$cur_meta" | jq --arg l "$learning" '. + {learning: $l}' 2>/dev/null || echo "$cur_meta")
-            new_meta="${new_meta//\'/\'\'}"
-            db_query "UPDATE nodes SET metadata='$new_meta', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
-            score_learning "$id" 2>/dev/null || true
-
-            # Soft format suggestion: nudge toward structured learning format
-            local has_decision=false has_pattern=false has_pitfall=false
-            [[ "$learning" == *"decision:"* ]] && has_decision=true
-            [[ "$learning" == *"pattern:"* ]] && has_pattern=true
-            [[ "$learning" == *"pitfall:"* ]] && has_pitfall=true
-            if [ "$has_decision" = false ] && [ "$has_pattern" = false ] && [ "$has_pitfall" = false ]; then
-                echo -e "${YELLOW}Tip: structured learnings are more useful for future sessions${NC}" >&2
-                echo -e "${YELLOW}  Format: --learning=\"decision: ... | pattern: ... | pitfall: ...\"${NC}" >&2
-            fi
-        fi
+        _done_store_learning "$id" "$learning"
     fi
 
+    # === Close: update status, clear primary, aggregate commits ===
     db_query "UPDATE nodes SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
 
-    # Clear primary pointer if this was the primary node
     local primary
     primary=$(get_primary_node 2>/dev/null || echo "")
     if [ "$primary" = "$id" ]; then
         clear_primary_node
     fi
 
-    # Store commit SHAs in node metadata, then aggregate to parent epic
     _store_node_commits "$id" 2>/dev/null || true
     local parent_epic
     parent_epic=$(db_query "SELECT target FROM edges WHERE source='$(sql_escape "$id")' AND type='implements' LIMIT 1;" 2>/dev/null || true)
-    if [ -n "$parent_epic" ]; then _aggregate_epic_commits "$parent_epic" 2>/dev/null || true; fi
+    if [ -n "$parent_epic" ]; then
+        _aggregate_epic_commits "$parent_epic" 2>/dev/null || true
+    fi
 
     # Auto-unblock nodes that were only blocked by this one
     db_query "
@@ -445,83 +598,8 @@ cmd_done() {
         validate_on_done "$id"
     fi
 
-    # Close matching GitHub issue if linked
-    # Note: pipefail is set globally — use intermediate variables to avoid
-    # SIGPIPE (141) when jq closes stdin before sqlite3/gh finish writing.
-    if command -v gh >/dev/null 2>&1; then
-        local meta meta_raw
-        meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='$id';" 2>/dev/null || echo "[]")
-        meta=$(echo "$meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
-        if [[ "$meta" != "{"* ]]; then
-            meta=$(echo "$meta" | jq -r '.' 2>/dev/null || echo "{}")
-        fi
-        local gh_num
-        gh_num=$(echo "$meta" | jq -r '.gh_issue // empty' 2>/dev/null)
-        if [ -n "$gh_num" ] && [ "$gh_num" != "null" ]; then
-            local repo
-            repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
-            if [ -n "$repo" ]; then
-                # Build close comment with learnings from metadata
-                local comment="Completed. Weave node \`$id\` closed."
-                local l_decision l_pattern l_pitfall l_learning
-                l_decision=$(echo "$meta" | jq -r '.decision // empty' 2>/dev/null)
-                l_pattern=$(echo "$meta" | jq -r '.pattern // empty' 2>/dev/null)
-                l_pitfall=$(echo "$meta" | jq -r '.pitfall // empty' 2>/dev/null)
-                l_learning=$(echo "$meta" | jq -r '.learning // empty' 2>/dev/null)
-
-                if [ -n "$l_decision" ] || [ -n "$l_pattern" ] || [ -n "$l_pitfall" ] || [ -n "$l_learning" ]; then
-                    comment="$comment
-
-**Learnings:**"
-                    [ -n "$l_decision" ] && comment="$comment
-- **Decision:** $l_decision"
-                    [ -n "$l_pattern" ] && comment="$comment
-- **Pattern:** $l_pattern"
-                    [ -n "$l_pitfall" ] && comment="$comment
-- **Pitfall:** $l_pitfall"
-                    [ -n "$l_learning" ] && comment="$comment
-- **Notes:** $l_learning"
-                fi
-
-                # Find related commits via Weave-ID trailer
-                local shas
-                shas=$(git log --format="%H" --grep="Weave-ID: $id" --since="90 days ago" 2>/dev/null | head -10)
-                [ -z "$shas" ] && shas=$(git log --format="%H" --grep="$id" --since="90 days ago" 2>/dev/null | head -10)
-                if [ -n "$shas" ]; then
-                    local repo_url
-                    repo_url=$(gh repo view --json url -q '.url' 2>/dev/null || echo "")
-                    comment="$comment
-
-**Commits:**"
-                    for sha in $shas; do
-                        local short_sha subj
-                        short_sha=$(echo "$sha" | cut -c1-7)
-                        subj=$(git log --format="%s" -1 "$sha" 2>/dev/null)
-                        if [ -n "$repo_url" ]; then
-                            comment="$comment
-- [\`$short_sha\`]($repo_url/commit/$sha) $subj"
-                        else
-                            comment="$comment
-- \`$short_sha\` $subj"
-                        fi
-                    done
-                fi
-
-                # Remove stale status labels before closing
-                gh issue edit "$gh_num" --repo "$repo" --remove-label "weave:active" >/dev/null 2>&1 || true
-                gh issue edit "$gh_num" --repo "$repo" --remove-label "weave:blocked" >/dev/null 2>&1 || true
-
-                if gh issue close "$gh_num" --repo "$repo" --comment "$comment" >/dev/null 2>&1; then
-                    echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_num"
-                else
-                    echo -e "${YELLOW}Warning: could not close GitHub issue #$gh_num${NC}" >&2
-                fi
-
-                # Refresh parent epic body (checkboxes + Mermaid) after child close
-                _refresh_parent_gh "$id"
-            fi
-        fi
-    fi
+    # === Post-close: GH issue, cache, notifications, breadcrumbs ===
+    _done_close_gh_issue "$id"
 
     # Invalidate context cache for completed node and any nodes it was blocking
     local affected_nodes
@@ -536,25 +614,7 @@ cmd_done() {
         gh_notify "$id" "done"
     fi
 
-    # Auto-breadcrumbs: append completion record
-    if [ -n "${WEAVE_DIR:-}" ]; then
-        local breadcrumb_file="$WEAVE_DIR/breadcrumbs.md"
-        local node_alias
-        node_alias=$(db_query "SELECT COALESCE(alias, '') FROM nodes WHERE id='$id';" 2>/dev/null || true)
-        local label="$id"
-        [ -n "$node_alias" ] && label="$id ($node_alias)"
-        local unblocked
-        unblocked=$(db_query "SELECT id FROM nodes WHERE status='todo' AND id IN (SELECT target FROM edges WHERE source='$id' AND type='blocks');" 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
-        local next_ready
-        next_ready=$(cmd_ready --json 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || true)
-        {
-            echo ""
-            echo "## $(date '+%Y-%m-%d %H:%M') — Completed $label"
-            [ -n "$unblocked" ] && echo "- Unblocked: $unblocked"
-            [ -n "$next_ready" ] && echo "- Next ready: $next_ready"
-        } >> "$breadcrumb_file" 2>/dev/null || true
-    fi
-
+    _done_write_breadcrumb "$id"
     auto_sync 2>/dev/null || true
 }
 

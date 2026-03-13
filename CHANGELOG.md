@@ -2,6 +2,28 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.22.0] - 2026-03-13
+
+### Fixed
+
+- **`wv prune` closes linked GitHub issues** — Before deleting nodes, extracts `gh_issue` from
+  metadata and calls `gh issue close`. Previously left orphaned open GH issues when pruning
+  GH-linked nodes.
+- **Checkpoint commit noise** — Unified rate-limiting across all 4 commit paths (auto_checkpoint,
+  cmd_sync, PreCompact hook, SessionEnd hook). Bumped `WV_CHECKPOINT_INTERVAL` default from 0→600s.
+  SessionEnd hook now amends most recent checkpoint within session (2h window) instead of creating
+  new commits. Added `sync state` to hook grep patterns so all commit types count toward rate limit.
+
+## [1.21.0] - 2026-03-12
+
+### Changed
+
+- **Bash decomposition Sprint 2** — Extracted helpers from 6 high-CC functions across 4 command
+  modules using `_prefix` globals pattern. CC reductions: `cmd_add` 42→22, `cmd_selftest` 42→9,
+  `cmd_doctor` 37→28, `cmd_context` 41→28, `cmd_learnings` 46→25, `cmd_sync` 40→26.
+- **Proposal: warp-session** — Added `docs/PROPOSAL-warp-session.md` for SQLite change-tracking
+  triggers as Warp Phase 0.5 building block.
+
 ## [1.20.1] - 2026-03-10
 
 ### Fixed

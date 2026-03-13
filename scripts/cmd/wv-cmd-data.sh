@@ -41,11 +41,10 @@ WV_SYNC_INTERVAL="${WV_SYNC_INTERVAL:-60}"
 WV_AUTO_SYNC="${WV_AUTO_SYNC:-1}"
 # Auto-checkpoint: WIP git commit after sync. Set WV_AUTO_CHECKPOINT=0 to disable.
 WV_AUTO_CHECKPOINT="${WV_AUTO_CHECKPOINT:-1}"
-# Checkpoint interval in seconds (default 0 = commit every auto_sync).
-# Was 1800 (30 min), but the separate throttle left .weave/ files dirty between
-# auto_sync dumps and auto_checkpoint commits. Since auto_sync already throttles
-# at WV_SYNC_INTERVAL, the double throttle is unnecessary.
-WV_CHECKPOINT_INTERVAL="${WV_CHECKPOINT_INTERVAL:-0}"
+# Checkpoint interval in seconds (default 600 = 10 min).
+# Rate-limits git commits across auto_sync, explicit sync, and hook paths.
+# Set to 0 for aggressive commits (original behavior).
+WV_CHECKPOINT_INTERVAL="${WV_CHECKPOINT_INTERVAL:-600}"
 
 auto_sync() {
     # Disabled by env var
@@ -181,6 +180,48 @@ Weave-ID: $first_active"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# cmd_sync helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+# _sync_gh — Run bidirectional GitHub sync and re-dump state
+_sync_gh() {
+    local dry_run="$1"
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "${YELLOW}Warning: python3 not found — cannot run GH sync${NC}" >&2
+        return 0
+    fi
+    echo ""
+    local gh_args=()
+    [ "$dry_run" = true ] && gh_args+=("--dry-run")
+    # Resolve weave_gh location: follow symlinks to find source dir
+    local _wv_pypath="${WV_LIB_DIR:-$SCRIPT_DIR}"
+    if [ ! -d "$_wv_pypath/weave_gh" ]; then
+        local _wv_real
+        _wv_real=$(readlink -f "$_wv_pypath/lib/wv-config.sh" 2>/dev/null || echo "")
+        if [ -n "$_wv_real" ]; then
+            _wv_pypath=$(dirname "$(dirname "$_wv_real")")
+        fi
+    fi
+    # Use system python to avoid Poetry/venv conflicts with PYTHONPATH
+    local _wv_python3
+    if [ -n "${VIRTUAL_ENV:-}" ] && [ -x /usr/bin/python3 ]; then
+        _wv_python3=/usr/bin/python3
+    else
+        _wv_python3=python3
+    fi
+    PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_gh "${gh_args[@]}"
+
+    # GH sync modifies the in-memory DB — re-dump so git layer captures changes
+    local tmp_sql2 tmp_nodes2 tmp_edges2
+    tmp_sql2=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
+    tmp_nodes2=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX")
+    tmp_edges2=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX")
+    sqlite3 -cmd ".timeout 5000" "$WV_DB" ".dump" 2>/dev/null | strip_unistr > "$tmp_sql2" && [ -s "$tmp_sql2" ] && mv "$tmp_sql2" "$WEAVE_DIR/state.sql" || rm -f "$tmp_sql2"
+    db_query_json "SELECT * FROM nodes;" 2>/dev/null | jq -c '.[]' > "$tmp_nodes2" 2>/dev/null && mv "$tmp_nodes2" "$WEAVE_DIR/nodes.jsonl" || rm -f "$tmp_nodes2"
+    db_query_json "SELECT * FROM edges;" 2>/dev/null | jq -c '.[]' > "$tmp_edges2" 2>/dev/null && mv "$tmp_edges2" "$WEAVE_DIR/edges.jsonl" || rm -f "$tmp_edges2"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # cmd_sync — Persist database to git layer
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -249,41 +290,7 @@ cmd_sync() {
     # Step 2: Bidirectional GitHub sync if --gh flag or WV_GH_SYNC=1
     if [ "$gh_sync" = true ] || [ "${WV_GH_SYNC:-0}" = "1" ]; then
         [ "$_sync_journaled" = true ] && journal_step 2 "gh_sync"
-        if command -v python3 >/dev/null 2>&1; then
-            echo ""
-            local gh_args=()
-            [ "$dry_run" = true ] && gh_args+=("--dry-run")
-            # Resolve weave_gh location: follow symlinks to find source dir
-            local _wv_pypath="${WV_LIB_DIR:-$SCRIPT_DIR}"
-            if [ ! -d "$_wv_pypath/weave_gh" ]; then
-                # Dev-mode symlinks: resolve through to actual source
-                local _wv_real
-                _wv_real=$(readlink -f "$_wv_pypath/lib/wv-config.sh" 2>/dev/null || echo "")
-                if [ -n "$_wv_real" ]; then
-                    _wv_pypath=$(dirname "$(dirname "$_wv_real")")
-                fi
-            fi
-            # Use system python to avoid Poetry/venv conflicts with PYTHONPATH
-            local _wv_python3
-            if [ -n "${VIRTUAL_ENV:-}" ] && [ -x /usr/bin/python3 ]; then
-                _wv_python3=/usr/bin/python3
-            else
-                _wv_python3=python3
-            fi
-            PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_gh "${gh_args[@]}"
-
-            # GH sync modifies the in-memory DB (creates nodes, updates metadata).
-            # Re-dump state.sql so the git layer captures those changes.
-            local tmp_sql2 tmp_nodes2 tmp_edges2
-            tmp_sql2=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
-            tmp_nodes2=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX")
-            tmp_edges2=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX")
-            sqlite3 -cmd ".timeout 5000" "$WV_DB" ".dump" 2>/dev/null | strip_unistr > "$tmp_sql2" && [ -s "$tmp_sql2" ] && mv "$tmp_sql2" "$WEAVE_DIR/state.sql" || rm -f "$tmp_sql2"
-            db_query_json "SELECT * FROM nodes;" 2>/dev/null | jq -c '.[]' > "$tmp_nodes2" 2>/dev/null && mv "$tmp_nodes2" "$WEAVE_DIR/nodes.jsonl" || rm -f "$tmp_nodes2"
-            db_query_json "SELECT * FROM edges;" 2>/dev/null | jq -c '.[]' > "$tmp_edges2" 2>/dev/null && mv "$tmp_edges2" "$WEAVE_DIR/edges.jsonl" || rm -f "$tmp_edges2"
-        else
-            echo -e "${YELLOW}Warning: python3 not found — cannot run GH sync${NC}" >&2
-        fi
+        _sync_gh "$dry_run"
         [ "$_sync_journaled" = true ] && journal_complete 2
     fi
 
@@ -293,6 +300,7 @@ cmd_sync() {
     [ "$_sync_journaled" = true ] && journal_step "$_sync_commit_step" "git_commit"
 
     # Uses --no-verify to bypass pre-commit hook (no active node needed for .weave/-only commits).
+    # Only commits if .weave/ is still dirty after auto_checkpoint (e.g., GH sync changed state).
     local git_root
     git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
     if [ -n "$git_root" ] && [ -d "$git_root/.weave" ]; then
@@ -532,6 +540,25 @@ cmd_prune() {
     connected_targets=$(db_query "SELECT DISTINCT target FROM edges WHERE source IN ('${ids//,/\',\'}');" | tr '\n' ' ')
     affected_nodes="$affected_nodes $connected_sources $connected_targets"
 
+    # Close linked GitHub issues before deleting nodes
+    if command -v gh >/dev/null 2>&1; then
+        local repo
+        repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
+        if [ -n "$repo" ]; then
+            echo "$candidates" | cut -d'|' -f1 | while read -r id; do
+                local gh_num
+                gh_num=$(db_query "SELECT json_extract(metadata, '\$.gh_issue') FROM nodes WHERE id='$id';" 2>/dev/null)
+                if [ -n "$gh_num" ] && [ "$gh_num" != "null" ]; then
+                    gh issue close "$gh_num" --repo "$repo" \
+                        --comment "Pruned from Weave graph (node \`$id\` archived after ${age})." \
+                        >/dev/null 2>&1 && \
+                        echo -e "  ${GREEN}✓${NC} Closed GitHub issue #$gh_num ($id)" || \
+                        echo -e "  ${YELLOW}⚠${NC} Could not close GitHub issue #$gh_num ($id)" >&2
+                fi
+            done
+        fi
+    fi
+
     # Delete nodes and orphaned edges
     echo "$candidates" | cut -d'|' -f1 | while read -r id; do
         db_query "DELETE FROM edges WHERE source='$id' OR target='$id';"
@@ -755,91 +782,275 @@ cmd_learnings() {
 
     # Fast path: single jq call formats all output (avoids N*9 subprocess spawns)
     if [ "$show_graph" != true ]; then
-        # Convert \033[...] escape strings to actual bytes for jq output
-        local _cyan _green _yellow _nc
-        printf -v _cyan '%b' "$CYAN"
-        printf -v _green '%b' "$GREEN"
-        printf -v _yellow '%b' "$YELLOW"
-        printf -v _nc '%b' "$NC"
-        echo "$results" | jq -r --arg CYAN "$_cyan" --arg GREEN "$_green" \
-            --arg YELLOW "$_yellow" --arg NC "$_nc" '
-            .[] |
+        _learnings_format_text "$results"
+    else
+        _learnings_format_graph "$results"
+    fi
+}
+
+# _learnings_format_text — Fast output path (single jq call, no DB queries)
+_learnings_format_text() {
+    local results="$1"
+    local _cyan _green _yellow _nc
+    printf -v _cyan '%b' "$CYAN"
+    printf -v _green '%b' "$GREEN"
+    printf -v _yellow '%b' "$YELLOW"
+    printf -v _nc '%b' "$NC"
+    echo "$results" | jq -r --arg CYAN "$_cyan" --arg GREEN "$_green" \
+        --arg YELLOW "$_yellow" --arg NC "$_nc" '
+        .[] |
+        .id as $id | .text as $text | .status as $status |
+        ((.metadata // "{}") | if type == "string" then fromjson else . end) as $m |
+        ($CYAN + $id + $NC + " [" + $status + "]: " + $text),
+        (if $m.decision then "  " + $GREEN + "Decision:" + $NC + " " + $m.decision else empty end),
+        (if $m.pattern  then "  " + $GREEN + "Pattern:"  + $NC + "  " + $m.pattern  else empty end),
+        (if $m.pitfall  then "  " + $YELLOW + "Pitfall:"  + $NC + "  " + $m.pitfall  else empty end),
+        (if $m.learning then "  " + $CYAN + "Learning:" + $NC + " " + $m.learning else empty end),
+        ""
+    ' 2>/dev/null
+}
+
+# _learnings_format_graph — Slow path: per-row DB queries for --show-graph edges
+_learnings_format_graph() {
+    local results="$1"
+    echo "$results" | jq -c '.[]' | while read -r row; do
+        # Extract all fields in one jq call (1 process instead of 9)
+        eval "$(echo "$row" | jq -r '
             .id as $id | .text as $text | .status as $status |
             ((.metadata // "{}") | if type == "string" then fromjson else . end) as $m |
-            ($CYAN + $id + $NC + " [" + $status + "]: " + $text),
-            (if $m.decision then "  " + $GREEN + "Decision:" + $NC + " " + $m.decision else empty end),
-            (if $m.pattern  then "  " + $GREEN + "Pattern:"  + $NC + "  " + $m.pattern  else empty end),
-            (if $m.pitfall  then "  " + $YELLOW + "Pitfall:"  + $NC + "  " + $m.pitfall  else empty end),
-            (if $m.learning then "  " + $CYAN + "Learning:" + $NC + " " + $m.learning else empty end),
-            ""
-        ' 2>/dev/null
-    else
-        # Slow path: per-row DB queries needed for --show-graph edges
-        echo "$results" | jq -c '.[]' | while read -r row; do
-            # Extract all fields in one jq call (1 process instead of 9)
-            eval "$(echo "$row" | jq -r '
-                .id as $id | .text as $text | .status as $status |
-                ((.metadata // "{}") | if type == "string" then fromjson else . end) as $m |
-                "id=" + ($id | @sh) +
-                " text=" + ($text | @sh) +
-                " status=" + ($status | @sh) +
-                " decision=" + (($m.decision // "") | @sh) +
-                " pattern=" + (($m.pattern // "") | @sh) +
-                " pitfall=" + (($m.pitfall // "") | @sh) +
-                " learning_note=" + (($m.learning // "") | @sh)
-            ' 2>/dev/null)"
+            "id=" + ($id | @sh) +
+            " text=" + ($text | @sh) +
+            " status=" + ($status | @sh) +
+            " decision=" + (($m.decision // "") | @sh) +
+            " pattern=" + (($m.pattern // "") | @sh) +
+            " pitfall=" + (($m.pitfall // "") | @sh) +
+            " learning_note=" + (($m.learning // "") | @sh)
+        ' 2>/dev/null)"
 
-            echo -e "${CYAN}$id${NC} [$status]: $text"
-            [ -n "$decision" ] && echo -e "  ${GREEN}Decision:${NC} $decision"
-            [ -n "$pattern" ]  && echo -e "  ${GREEN}Pattern:${NC}  $pattern"
-            [ -n "$pitfall" ]  && echo -e "  ${YELLOW}Pitfall:${NC}  $pitfall"
-            [ -n "$learning_note" ] && echo -e "  ${CYAN}Learning:${NC} $learning_note"
+        echo -e "${CYAN}$id${NC} [$status]: $text"
+        [ -n "$decision" ] && echo -e "  ${GREEN}Decision:${NC} $decision"
+        [ -n "$pattern" ]  && echo -e "  ${GREEN}Pattern:${NC}  $pattern"
+        [ -n "$pitfall" ]  && echo -e "  ${YELLOW}Pitfall:${NC}  $pitfall"
+        [ -n "$learning_note" ] && echo -e "  ${CYAN}Learning:${NC} $learning_note"
 
-            # Check for addresses edges (outbound)
-            local addresses_edges
-            addresses_edges=$(db_query "
-                SELECT target FROM edges
-                WHERE source='$id' AND type='addresses'
-            " 2>/dev/null || echo "")
+        # Check for addresses edges (outbound)
+        local addresses_edges
+        addresses_edges=$(db_query "
+            SELECT target FROM edges
+            WHERE source='$id' AND type='addresses'
+        " 2>/dev/null || echo "")
 
-            if [ -n "$addresses_edges" ]; then
-                echo -e "  ${GREEN}Addresses:${NC}"
-                echo "$addresses_edges" | while IFS= read -r target_id; do
-                    [ -z "$target_id" ] && continue
-                    local target_text target_pitfall
-                    target_text=$(db_query "SELECT text FROM nodes WHERE id='$target_id';" 2>/dev/null)
-                    target_pitfall=$(db_query_json "SELECT json(metadata) as metadata FROM nodes WHERE id='$target_id';" \
-                        | jq -r '.[0].metadata | fromjson | .pitfall // empty' 2>/dev/null || echo "")
-                    echo "    - $target_id: $target_text"
-                    [ -n "$target_pitfall" ] && echo "      Pitfall: $target_pitfall"
-                done
-            fi
+        if [ -n "$addresses_edges" ]; then
+            echo -e "  ${GREEN}Addresses:${NC}"
+            echo "$addresses_edges" | while IFS= read -r target_id; do
+                [ -z "$target_id" ] && continue
+                local target_text target_pitfall
+                target_text=$(db_query "SELECT text FROM nodes WHERE id='$target_id';" 2>/dev/null)
+                target_pitfall=$(db_query_json "SELECT json(metadata) as metadata FROM nodes WHERE id='$target_id';" \
+                    | jq -r '.[0].metadata | fromjson | .pitfall // empty' 2>/dev/null || echo "")
+                echo "    - $target_id: $target_text"
+                [ -n "$target_pitfall" ] && echo "      Pitfall: $target_pitfall"
+            done
+        fi
 
-            # Check for addressed_by edges (inbound)
-            local addressed_by
-            addressed_by=$(db_query "
-                SELECT source FROM edges
-                WHERE target='$id' AND type='addresses'
-            " 2>/dev/null || echo "")
+        # Check for addressed_by edges (inbound)
+        local addressed_by
+        addressed_by=$(db_query "
+            SELECT source FROM edges
+            WHERE target='$id' AND type='addresses'
+        " 2>/dev/null || echo "")
 
-            if [ -n "$addressed_by" ]; then
-                echo -e "  ${GREEN}Addressed by:${NC}"
-                echo "$addressed_by" | while IFS= read -r source_id; do
-                    [ -z "$source_id" ] && continue
-                    local source_text
-                    source_text=$(db_query "SELECT text FROM nodes WHERE id='$source_id';" 2>/dev/null)
-                    echo "    - $source_id: $source_text"
-                done
-            fi
+        if [ -n "$addressed_by" ]; then
+            echo -e "  ${GREEN}Addressed by:${NC}"
+            echo "$addressed_by" | while IFS= read -r source_id; do
+                [ -z "$source_id" ] && continue
+                local source_text
+                source_text=$(db_query "SELECT text FROM nodes WHERE id='$source_id';" 2>/dev/null)
+                echo "    - $source_id: $source_text"
+            done
+        fi
 
-            echo ""
-        done
-    fi
+        echo ""
+    done
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_refs — Extract cross-references from text
 # ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_refs — Extract cross-references (decomposed into helpers)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Shared state for cmd_refs helpers
+_refs_count=0
+_refs_data=""
+
+# Extract all reference types from input text into _refs_data (pipe-delimited).
+# Sets _refs_count and _refs_data.
+# Args: $1=input text, $2=max_refs
+_refs_extract() {
+    local input="$1" max_refs="$2"
+    _refs_count=0
+    _refs_data=""
+
+    # 1. Weave node IDs (wv-xxxxxx) — confidence 0.9
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        [ "$_refs_count" -ge "$max_refs" ] && break
+        _refs_count=$((_refs_count + 1))
+        _refs_data="${_refs_data}${_refs_count}|${match}|wv show ${match}|weave_id|0.9\n"
+    done < <(echo "$input" | grep -oE '\bwv-[0-9a-fA-F]{4,}\b' | sort -u | head -n "$max_refs")
+
+    # 2. GitHub issue references (gh-N or #N with lookbehind) — confidence 0.6
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        [ "$_refs_count" -ge "$max_refs" ] && break
+        local num
+        num=$(echo "$match" | grep -oE '[0-9]+')
+        _refs_count=$((_refs_count + 1))
+        _refs_data="${_refs_data}${_refs_count}|${match}|gh issue view ${num}|github_issue|0.6\n"
+    done < <(echo "$input" | grep -oP '(gh-[0-9]+|(?<![a-zA-Z0-9])#[0-9]+)' | sort -u | head -n "$max_refs")
+
+    # 3. ADR/RFC references — confidence 0.6
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        [ "$_refs_count" -ge "$max_refs" ] && break
+        _refs_count=$((_refs_count + 1))
+        _refs_data="${_refs_data}${_refs_count}|${match}|rg -l \"${match}\" docs/|adr_rfc|0.6\n"
+    done < <(echo "$input" | grep -oE '\b(ADR|RFC)-[0-9]+\b' | sort -u | head -n "$max_refs")
+
+    # 4. File path references (src/..., docs/..., scripts/..., tests/...) — confidence 0.5
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        [ "$_refs_count" -ge "$max_refs" ] && break
+        local clean
+        clean=$(echo "$match" | sed 's/[,.:;)]*$//')
+        _refs_count=$((_refs_count + 1))
+        _refs_data="${_refs_data}${_refs_count}|${clean}|cat ${clean}|file_path|0.5\n"
+    done < <(echo "$input" | grep -oE '\b(src|docs|scripts|tests)/[a-zA-Z0-9_/.-]+' | sort -u | head -n "$max_refs")
+
+    # 5. Legacy bead IDs (BEAD-xxx, MEM-xxx, BD-xxx) — deprecated
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        [ "$_refs_count" -ge "$max_refs" ] && break
+        _refs_count=$((_refs_count + 1))
+        _refs_data="${_refs_data}${_refs_count}|${match}|# Legacy bead: ${match} (deprecated)|legacy_bead|0.2\n"
+    done < <(echo "$input" | grep -oE '\b(BEAD|MEM|BD)-[0-9a-zA-Z]+\b' | sort -u | head -n "$max_refs")
+
+    # 6. "See Note N" style references — deprecated
+    while IFS= read -r match; do
+        [ -z "$match" ] && continue
+        [ "$_refs_count" -ge "$max_refs" ] && break
+        local note_id
+        note_id=$(echo "$match" | grep -oE '[0-9]+')
+        _refs_count=$((_refs_count + 1))
+        _refs_data="${_refs_data}${_refs_count}|${match}|rg -n \"Note ${note_id}\" docs/|see_note|0.3\n"
+    done < <(echo "$input" | grep -oiE 'see note [0-9]+' | sort -u | head -n "$max_refs")
+}
+
+# Create edges from --from node to detected references.
+# Args: $1=from_node, $2=source_file, $3=interactive (true/false)
+_refs_link() {
+    local from_node="$1" source_file="$2" interactive="$3"
+    local detected_at
+    detected_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Collect affected nodes for cache invalidation (use temp file to escape subshell)
+    local cache_nodes_file
+    cache_nodes_file=$(mktemp)
+    echo "$from_node" > "$cache_nodes_file"
+
+    echo -e "$_refs_data" | while IFS='|' read -r num ref cmd ref_type confidence; do
+        [ -z "$num" ] && continue
+
+        # Only weave_id refs can auto-link; others need --interactive
+        local target_node=""
+        local auto_link=false
+
+        if [ "$ref_type" = "weave_id" ]; then
+            target_node=$(db_query "SELECT id FROM nodes WHERE id='$ref';" 2>/dev/null)
+            if [ -n "$target_node" ]; then
+                auto_link=true
+            fi
+        fi
+
+        if [ "$auto_link" = false ] && [ "$interactive" = false ]; then
+            echo -e "  ${YELLOW}Skip${NC} ${ref} [${ref_type}] — use --interactive to confirm"
+            continue
+        fi
+
+        # Interactive confirmation for non-auto refs
+        if [ "$auto_link" = false ] && [ "$interactive" = true ]; then
+            echo -en "  Link ${ref} [${ref_type}]? (y/n/e=edit) "
+            read -r answer </dev/tty
+            case "$answer" in
+                y|Y) ;;
+                e|E)
+                    echo -n "  Target node ID: "
+                    read -r target_node </dev/tty
+                    if [ -z "$target_node" ]; then
+                        echo -e "  ${YELLOW}Skipped${NC}"
+                        continue
+                    fi
+                    local exists
+                    exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$target_node';" 2>/dev/null)
+                    if [ "$exists" = "0" ]; then
+                        echo -e "  ${RED}Node $target_node not found, skipping${NC}"
+                        continue
+                    fi
+                    ;;
+                *)
+                    echo -e "  ${YELLOW}Skipped${NC}"
+                    continue
+                    ;;
+            esac
+
+            if [ -z "$target_node" ]; then
+                echo -e "  ${YELLOW}No target node for ${ref}, skipping${NC}"
+                continue
+            fi
+        fi
+
+        [ -z "$target_node" ] && continue
+
+        # Determine edge type and weight
+        local edge_type="references"
+        local weight="$confidence"
+        case "$ref_type" in
+            adr_rfc) edge_type="relates_to" ;;
+        esac
+
+        # Build context JSON
+        local ctx
+        ctx=$(jq -c -n \
+            --arg sf "$source_file" \
+            --arg pat "$ref_type" \
+            --arg ref "$ref" \
+            --arg det "$detected_at" \
+            '{source_file: $sf, pattern: $pat, reference: $ref, detected_at: $det}')
+        ctx="${ctx//\'/\'\'}"
+
+        db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
+            VALUES ('$from_node', '$target_node', '$edge_type', $weight, '$ctx', CURRENT_TIMESTAMP)
+            ON CONFLICT(source, target, type) DO UPDATE SET
+                weight = excluded.weight,
+                context = excluded.context,
+                created_at = CURRENT_TIMESTAMP;"
+
+        echo "$target_node" >> "$cache_nodes_file"
+        echo -e "  ${GREEN}✓${NC} ${from_node} → ${target_node} [${edge_type}, w=${weight}]"
+    done
+
+    # Invalidate context cache for all affected nodes
+    local affected_nodes
+    affected_nodes=$(cat "$cache_nodes_file" | tr '\n' ' ')
+    rm -f "$cache_nodes_file"
+    # shellcheck disable=SC2086  # word-split intentional — affected_nodes is space-delimited ID list
+    invalidate_context_cache $affected_nodes
+
+    echo -e "${GREEN}✓${NC} Link pass complete."
+}
 
 cmd_refs() {
     local input=""
@@ -897,66 +1108,11 @@ cmd_refs() {
         fi
     fi
 
-    local count=0
-    local refs=""
-
-    # 1. Weave node IDs (wv-xxxxxx) — confidence 0.9
-    while IFS= read -r match; do
-        [ -z "$match" ] && continue
-        [ "$count" -ge "$max_refs" ] && break
-        count=$((count + 1))
-        refs="${refs}${count}|${match}|wv show ${match}|weave_id|0.9\n"
-    done < <(echo "$input" | grep -oE '\bwv-[0-9a-fA-F]{4,}\b' | sort -u | head -n "$max_refs")
-
-    # 2. GitHub issue references (gh-N or #N with lookbehind) — confidence 0.6
-    while IFS= read -r match; do
-        [ -z "$match" ] && continue
-        [ "$count" -ge "$max_refs" ] && break
-        local num
-        num=$(echo "$match" | grep -oE '[0-9]+')
-        count=$((count + 1))
-        refs="${refs}${count}|${match}|gh issue view ${num}|github_issue|0.6\n"
-    done < <(echo "$input" | grep -oP '(gh-[0-9]+|(?<![a-zA-Z0-9])#[0-9]+)' | sort -u | head -n "$max_refs")
-
-    # 3. ADR/RFC references — confidence 0.6
-    while IFS= read -r match; do
-        [ -z "$match" ] && continue
-        [ "$count" -ge "$max_refs" ] && break
-        count=$((count + 1))
-        refs="${refs}${count}|${match}|rg -l \"${match}\" docs/|adr_rfc|0.6\n"
-    done < <(echo "$input" | grep -oE '\b(ADR|RFC)-[0-9]+\b' | sort -u | head -n "$max_refs")
-
-    # 4. File path references (src/..., docs/..., scripts/..., tests/...) — confidence 0.5
-    while IFS= read -r match; do
-        [ -z "$match" ] && continue
-        [ "$count" -ge "$max_refs" ] && break
-        # Clean trailing punctuation
-        local clean
-        clean=$(echo "$match" | sed 's/[,.:;)]*$//')
-        count=$((count + 1))
-        refs="${refs}${count}|${clean}|cat ${clean}|file_path|0.5\n"
-    done < <(echo "$input" | grep -oE '\b(src|docs|scripts|tests)/[a-zA-Z0-9_/.-]+' | sort -u | head -n "$max_refs")
-
-    # 5. Legacy bead IDs (BEAD-xxx, MEM-xxx, BD-xxx) — deprecated
-    while IFS= read -r match; do
-        [ -z "$match" ] && continue
-        [ "$count" -ge "$max_refs" ] && break
-        count=$((count + 1))
-        refs="${refs}${count}|${match}|# Legacy bead: ${match} (deprecated)|legacy_bead|0.2\n"
-    done < <(echo "$input" | grep -oE '\b(BEAD|MEM|BD)-[0-9a-zA-Z]+\b' | sort -u | head -n "$max_refs")
-
-    # 6. "See Note N" style references — deprecated
-    while IFS= read -r match; do
-        [ -z "$match" ] && continue
-        [ "$count" -ge "$max_refs" ] && break
-        local note_id
-        note_id=$(echo "$match" | grep -oE '[0-9]+')
-        count=$((count + 1))
-        refs="${refs}${count}|${match}|rg -n \"Note ${note_id}\" docs/|see_note|0.3\n"
-    done < <(echo "$input" | grep -oiE 'see note [0-9]+' | sort -u | head -n "$max_refs")
+    # Extract all reference types
+    _refs_extract "$input" "$max_refs"
 
     # Output results
-    if [ "$count" -eq 0 ]; then
+    if [ "$_refs_count" -eq 0 ]; then
         if [ "$output_format" = "json" ]; then
             echo "[]"
         else
@@ -966,16 +1122,12 @@ cmd_refs() {
     fi
 
     if [ "$output_format" = "json" ]; then
-        # Build JSON array using jq
-        local json_arr="[]"
-        echo -e "$refs" | while IFS='|' read -r num ref cmd ref_type confidence; do
+        echo -e "$_refs_data" | while IFS='|' read -r num ref cmd ref_type confidence; do
             [ -z "$num" ] && continue
-            # For weave_id refs, try to resolve to an existing node
             local resolved=""
             if [ "$ref_type" = "weave_id" ]; then
                 resolved=$(db_query "SELECT id FROM nodes WHERE id='$ref';" 2>/dev/null || echo "")
             fi
-            # Determine suggested edge type and weight
             local edge_type="references"
             case "$ref_type" in
                 adr_rfc) edge_type="relates_to" ;;
@@ -992,127 +1144,20 @@ cmd_refs() {
                 '{reference: $reference, type: $type, confidence: $confidence, suggested_cmd: $suggested_cmd, suggested_edge_type: $suggested_edge_type, suggested_weight: $suggested_weight, resolved_node_id: ($resolved_node_id | if . == "" then null else . end), source_file: ($source_file | if . == "" then null else . end)}'
         done | jq -s '.'
     else
-        echo -e "${CYAN}References found (${count}):${NC}"
+        echo -e "${CYAN}References found (${_refs_count}):${NC}"
         echo ""
-
-        echo -e "$refs" | while IFS='|' read -r num ref cmd ref_type confidence; do
+        echo -e "$_refs_data" | while IFS='|' read -r num ref cmd ref_type confidence; do
             [ -z "$num" ] && continue
             echo -e "  ${GREEN}${num}.${NC} ${ref}  ${YELLOW}[${ref_type}]${NC}"
             echo -e "     → ${CYAN}${cmd}${NC}"
             echo ""
         done
-
         echo -e "${CYAN}Run commands manually to follow references.${NC}"
     fi
 
     # --link mode: create edges from --from node to detected references
-    if [ "$link_mode" = true ] && [ "$count" -gt 0 ]; then
-        local linked=0
-        local skipped=0
-        local detected_at
-        detected_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-        # Collect affected nodes for cache invalidation (use temp file to escape subshell)
-        local cache_nodes_file
-        cache_nodes_file=$(mktemp)
-        echo "$from_node" > "$cache_nodes_file"
-
-        echo -e "$refs" | while IFS='|' read -r num ref cmd ref_type confidence; do
-            [ -z "$num" ] && continue
-
-            # Only weave_id refs can auto-link; others need --interactive
-            local target_node=""
-            local auto_link=false
-
-            if [ "$ref_type" = "weave_id" ]; then
-                # Check if target node exists
-                target_node=$(db_query "SELECT id FROM nodes WHERE id='$ref';" 2>/dev/null)
-                if [ -n "$target_node" ]; then
-                    auto_link=true
-                fi
-            fi
-
-            if [ "$auto_link" = false ] && [ "$interactive" = false ]; then
-                echo -e "  ${YELLOW}Skip${NC} ${ref} [${ref_type}] — use --interactive to confirm"
-                continue
-            fi
-
-            # Interactive confirmation for non-auto refs
-            if [ "$auto_link" = false ] && [ "$interactive" = true ]; then
-                echo -en "  Link ${ref} [${ref_type}]? (y/n/e=edit) "
-                read -r answer </dev/tty
-                case "$answer" in
-                    y|Y) ;;
-                    e|E)
-                        echo -n "  Target node ID: "
-                        read -r target_node </dev/tty
-                        if [ -z "$target_node" ]; then
-                            echo -e "  ${YELLOW}Skipped${NC}"
-                            continue
-                        fi
-                        # Verify target exists
-                        local exists
-                        exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$target_node';" 2>/dev/null)
-                        if [ "$exists" = "0" ]; then
-                            echo -e "  ${RED}Node $target_node not found, skipping${NC}"
-                            continue
-                        fi
-                        ;;
-                    *)
-                        echo -e "  ${YELLOW}Skipped${NC}"
-                        continue
-                        ;;
-                esac
-
-                # For non-weave refs without explicit target, skip (no node to link to)
-                if [ -z "$target_node" ]; then
-                    echo -e "  ${YELLOW}No target node for ${ref}, skipping${NC}"
-                    continue
-                fi
-            fi
-
-            # Skip if no valid target
-            [ -z "$target_node" ] && continue
-
-            # Determine edge type and weight
-            local edge_type="references"
-            local weight="$confidence"
-            case "$ref_type" in
-                adr_rfc) edge_type="relates_to" ;;
-            esac
-
-            # Build context JSON
-            local ctx
-            ctx=$(jq -c -n \
-                --arg sf "$source_file" \
-                --arg pat "$ref_type" \
-                --arg ref "$ref" \
-                --arg det "$detected_at" \
-                '{source_file: $sf, pattern: $pat, reference: $ref, detected_at: $det}')
-            ctx="${ctx//\'/\'\'}"
-
-            # Insert or update edge
-            db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
-                VALUES ('$from_node', '$target_node', '$edge_type', $weight, '$ctx', CURRENT_TIMESTAMP)
-                ON CONFLICT(source, target, type) DO UPDATE SET
-                    weight = excluded.weight,
-                    context = excluded.context,
-                    created_at = CURRENT_TIMESTAMP;"
-
-            # Track target node for cache invalidation
-            echo "$target_node" >> "$cache_nodes_file"
-
-            echo -e "  ${GREEN}✓${NC} ${from_node} → ${target_node} [${edge_type}, w=${weight}]"
-        done
-
-        # Invalidate context cache for all affected nodes
-        local affected_nodes
-        affected_nodes=$(cat "$cache_nodes_file" | tr '\n' ' ')
-        rm -f "$cache_nodes_file"
-        # shellcheck disable=SC2086  # word-split intentional — affected_nodes is space-delimited ID list
-        invalidate_context_cache $affected_nodes
-
-        echo -e "${GREEN}✓${NC} Link pass complete."
+    if [ "$link_mode" = true ] && [ "$_refs_count" -gt 0 ]; then
+        _refs_link "$from_node" "$source_file" "$interactive"
     fi
 }
 
@@ -1651,7 +1696,264 @@ _breadcrumbs_save() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_plan — Import structured markdown into graph as epic + tasks
+#
+# Decomposed into:
+#   _plan_show_template    — locate and output PLAN.md.template
+#   _plan_parse_markdown   — extract epic title + task arrays from markdown
+#   _plan_create_nodes     — create epic + task nodes, link to epic
+#   _plan_inject_learnings — FTS5 lookup of related learnings for each task
+#   _plan_wire_deps        — resolve (after: alias) into blocks edges
 # ═══════════════════════════════════════════════════════════════════════════
+
+# _plan_show_template — locate and print the plan template
+_plan_show_template() {
+    local template_path=""
+    local config_dir="${WV_CONFIG_DIR:-$HOME/.config/weave}"
+    if [ -f "$config_dir/PLAN.md.template" ]; then
+        template_path="$config_dir/PLAN.md.template"
+    elif [ -f "$WV_LIB_DIR/../templates/PLAN.md.template" ]; then
+        template_path="$WV_LIB_DIR/../templates/PLAN.md.template"
+    elif [ -f "$SCRIPT_DIR/../templates/PLAN.md.template" ]; then
+        template_path="$SCRIPT_DIR/../templates/PLAN.md.template"
+    fi
+    if [ -n "$template_path" ] && [ -f "$template_path" ]; then
+        cat "$template_path"
+    else
+        echo -e "${RED}Error: PLAN.md.template not found${NC}" >&2
+        echo "  Checked: $config_dir/PLAN.md.template" >&2
+        echo "  Checked: $WV_LIB_DIR/../templates/PLAN.md.template" >&2
+        return 1
+    fi
+}
+
+# _plan_parse_markdown — parse sprint section into parallel arrays
+# Sets via nameref: _epic_title, _tasks, _task_aliases, _task_deps,
+#                    _task_priorities, _task_statuses
+_plan_parse_markdown() {
+    local file="$1"
+    local sprint="$2"
+
+    _epic_title=""
+    _tasks=()
+    _task_aliases=()
+    _task_deps=()
+    _task_priorities=()
+    _task_statuses=()
+
+    local in_section=false
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^###[[:space:]]+Sprint[[:space:]]+${sprint}[[:space:]]*[:—–-][[:space:]]*(.*) ]]; then
+            in_section=true
+            _epic_title="Sprint ${sprint}: ${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        if [ "$in_section" = true ]; then
+            if [[ "$line" =~ ^#{2,3}[[:space:]] ]] || [[ "$line" =~ ^---+$ ]]; then
+                break
+            fi
+        fi
+
+        # Collect numbered items as tasks (with multi-line continuation)
+        if [ "$in_section" = true ] && [[ "$line" =~ ^[0-9]+\.[[:space:]]+(.*) ]]; then
+            local task_text="${BASH_REMATCH[1]}"
+            local task_status="todo"
+            if [[ "$task_text" == "[x] "* ]] || [[ "$task_text" == "[X] "* ]]; then
+                task_text="${task_text#\[[xX]\] }"
+                task_status="done"
+            else
+                task_text="${task_text#\[ \] }"
+            fi
+            local task_alias=""
+            if [[ "$task_text" =~ ^\*\*([a-zA-Z0-9][a-zA-Z0-9_-]*)\*\*[[:space:]]*[—–:-][[:space:]]*(.*) ]]; then
+                task_alias="${BASH_REMATCH[1]}"
+                task_text="${BASH_REMATCH[2]}"
+            fi
+            task_text="${task_text//\*\*/}"
+            local task_priority="2"
+            local task_dep=""
+            if [[ "$task_text" =~ \(priority:[[:space:]]*([0-9]+)\) ]]; then
+                task_priority="${BASH_REMATCH[1]}"
+                task_text="${task_text//${BASH_REMATCH[0]}/}"
+            fi
+            if [[ "$task_text" =~ \(after:[[:space:]]*([a-zA-Z0-9_-]+)\) ]]; then
+                task_dep="${BASH_REMATCH[1]}"
+                task_text="${task_text//${BASH_REMATCH[0]}/}"
+            fi
+            if [[ "$task_text" =~ \(status:[[:space:]]*(done|todo|blocked)\) ]]; then
+                task_status="${BASH_REMATCH[1]}"
+                task_text="${task_text//${BASH_REMATCH[0]}/}"
+            fi
+            task_text="${task_text%%[[:space:]]}"
+            task_text="${task_text%% }"
+            _tasks+=("$task_text")
+            _task_aliases+=("$task_alias")
+            _task_deps+=("$task_dep")
+            _task_priorities+=("$task_priority")
+            _task_statuses+=("$task_status")
+        elif [ "$in_section" = true ] && [ ${#_tasks[@]} -gt 0 ] && [[ "$line" =~ ^[[:space:]]{3,}(.*) ]]; then
+            local cont_text="${BASH_REMATCH[1]}"
+            cont_text="${cont_text//\*\*/}"
+            cont_text="${cont_text%%[[:space:]]}"
+            if [ -n "$cont_text" ]; then
+                local last_idx=$(( ${#_tasks[@]} - 1 ))
+                _tasks[$last_idx]="${_tasks[$last_idx]} $cont_text"
+            fi
+        fi
+    done < "$file"
+
+    # Post-process: re-extract metadata tags from continuation lines
+    for i in "${!_tasks[@]}"; do
+        local full_text="${_tasks[$i]}"
+        if [ -z "${_task_deps[$i]}" ] && [[ "$full_text" =~ \(after:[[:space:]]*([a-zA-Z0-9_-]+)\) ]]; then
+            _task_deps[$i]="${BASH_REMATCH[1]}"
+            _tasks[$i]="${full_text//${BASH_REMATCH[0]}/}"
+        fi
+        if [ "${_task_priorities[$i]}" = "2" ] && [[ "${_tasks[$i]}" =~ \(priority:[[:space:]]*([0-9]+)\) ]]; then
+            _task_priorities[$i]="${BASH_REMATCH[1]}"
+            _tasks[$i]="${_tasks[$i]//${BASH_REMATCH[0]}/}"
+        fi
+        if [[ "${_tasks[$i]}" =~ \(status:[[:space:]]*(done|todo|blocked)\) ]]; then
+            _task_statuses[$i]="${BASH_REMATCH[1]}"
+            _tasks[$i]="${_tasks[$i]//${BASH_REMATCH[0]}/}"
+        fi
+        _tasks[$i]="${_tasks[$i]%%[[:space:]]}"
+        _tasks[$i]="${_tasks[$i]%% }"
+    done
+}
+
+# _plan_create_nodes — create epic + task nodes, link tasks to epic
+# Args: epic_title, create_gh, sprint
+# Uses: _tasks, _task_aliases, _task_statuses, _task_priorities (from parse)
+# Sets: _task_ids, _alias_to_id, _task_count, _fail_count, _epic_id
+_plan_create_nodes() {
+    local epic_title="$1"
+    local create_gh="$2"
+    local sprint="$3"
+
+    local gh_flag=""
+    [ "$create_gh" = true ] && gh_flag="--gh"
+
+    local epic_output
+    epic_output=$(cmd_add "Epic: $epic_title" --metadata="{\"type\":\"epic\",\"sprint\":$sprint}" $gh_flag --force 2>&1 || true)
+    _epic_id=$(echo "$epic_output" | tail -1)
+    if [ -z "$_epic_id" ] || [[ "$_epic_id" != wv-* ]]; then
+        echo -e "${RED}Error: Failed to create epic node${NC}" >&2
+        echo "$epic_output" >&2
+        return 1
+    fi
+    echo -e "${GREEN}✓${NC} Epic: $_epic_id -- $epic_title"
+
+    declare -gA _alias_to_id
+    _task_ids=()
+    _task_count=0
+    _fail_count=0
+
+    for i in "${!_tasks[@]}"; do
+        local task="${_tasks[$i]}"
+        local alias_flag=""
+        [ -n "${_task_aliases[$i]}" ] && alias_flag="--alias=${_task_aliases[$i]}"
+        local status_flag="--status=${_task_statuses[$i]}"
+        local meta="{\"type\":\"task\",\"priority\":${_task_priorities[$i]}}"
+        local task_id task_output
+        task_output=$(cmd_add "$task" --metadata="$meta" $alias_flag $status_flag $gh_flag --force 2>&1 || true)
+        task_id=$(echo "$task_output" | tail -1)
+        if [ -z "$task_id" ] || [[ "$task_id" != wv-* ]]; then
+            echo -e "${RED}✗ Failed:${NC} $task" >&2
+            echo "$task_output" >&2
+            _fail_count=$((_fail_count + 1))
+            _task_ids+=("")
+            continue
+        fi
+        cmd_link "$task_id" "$_epic_id" --type=implements 2>/dev/null
+        _task_ids+=("$task_id")
+        [ -n "${_task_aliases[$i]}" ] && _alias_to_id["${_task_aliases[$i]}"]="$task_id"
+        local label="$task_id"
+        [ -n "${_task_aliases[$i]}" ] && label="$task_id (${_task_aliases[$i]})"
+        echo -e "${GREEN}✓${NC} Task: $label -- $task"
+        _task_count=$((_task_count + 1))
+        if [ "$create_gh" = true ]; then
+            sleep 1
+        fi
+    done
+}
+
+# _plan_inject_learnings — FTS5 lookup of related learnings for each task
+# Uses: _tasks, _task_ids (from create_nodes)
+_plan_inject_learnings() {
+    db_migrate_fts5 2>/dev/null || true
+    local learnings_count=0
+
+    for i in "${!_tasks[@]}"; do
+        [ -z "${_task_ids[$i]}" ] && continue
+        local keywords
+        keywords=$(echo "${_tasks[$i]}" | tr -cs '[:alnum:]' ' ' | \
+            awk '{for(j=1;j<=NF;j++) if(length($j)>4) {printf "%s ", $j; c++; if(c>=5) exit}}')
+        keywords=$(echo "$keywords" | sed 's/[(){}*:^~"]//g' | xargs)
+        [ -z "$keywords" ] && continue
+        local kw_count
+        kw_count=$(echo "$keywords" | wc -w)
+        [ "$kw_count" -lt 2 ] && continue
+        local fts_query
+        fts_query=$(echo "$keywords" | sed 's/ / OR /g')
+        local learning_ids
+        learning_ids=$(db_query "
+            SELECT n.id FROM nodes_fts f
+            JOIN nodes n ON f.rowid = n.rowid
+            WHERE nodes_fts MATCH '$fts_query'
+            AND (json_extract(n.metadata, '\$.learning') IS NOT NULL
+                 OR json_extract(n.metadata, '\$.pitfall') IS NOT NULL
+                 OR json_extract(n.metadata, '\$.decision') IS NOT NULL)
+            AND n.id != '${_task_ids[$i]}'
+            LIMIT 3;
+        " 2>/dev/null || true)
+        if [ -n "$learning_ids" ]; then
+            local ids_json
+            ids_json=$(echo "$learning_ids" | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null || echo "[]")
+            local cur_meta_raw cur_meta
+            cur_meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='${_task_ids[$i]}';" 2>/dev/null || echo "[]")
+            cur_meta=$(echo "$cur_meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
+            if [[ "$cur_meta" != "{"* ]]; then
+                cur_meta=$(echo "$cur_meta" | jq -r '.' 2>/dev/null || echo "{}")
+            fi
+            local new_meta
+            new_meta=$(echo "$cur_meta" | jq --argjson cl "$ids_json" '. + {context_learnings: $cl}' 2>/dev/null || echo "$cur_meta")
+            new_meta="${new_meta//\'/\'\'}"
+            db_query "UPDATE nodes SET metadata='$new_meta' WHERE id='${_task_ids[$i]}';" 2>/dev/null
+            local match_count
+            match_count=$(echo "$learning_ids" | wc -l)
+            learnings_count=$((learnings_count + match_count))
+        fi
+    done
+    if [ "$learnings_count" -gt 0 ]; then
+        echo -e "${CYAN}ℹ Found $learnings_count related learning(s)${NC}" >&2
+    fi
+}
+
+# _plan_wire_deps — resolve (after: alias) dependencies into blocks edges
+# Uses: _task_deps, _task_ids, _task_aliases, _alias_to_id (from create_nodes)
+# Sets: _dep_count
+_plan_wire_deps() {
+    _dep_count=0
+
+    for i in "${!_tasks[@]}"; do
+        local dep="${_task_deps[$i]}"
+        if [ -n "$dep" ] && [ -n "${_task_ids[$i]}" ]; then
+            local dep_id="${_alias_to_id[$dep]:-}"
+            if [ -z "$dep_id" ]; then
+                dep_id=$(db_query "SELECT id FROM nodes WHERE alias='$(sql_escape "$dep")' LIMIT 1;" 2>/dev/null)
+            fi
+            if [ -n "$dep_id" ]; then
+                cmd_link "$dep_id" "${_task_ids[$i]}" --type=blocks 2>/dev/null
+                echo -e "${CYAN}  ->  ${dep} blocks ${_task_aliases[$i]:-${_task_ids[$i]}}${NC}"
+                _dep_count=$((_dep_count + 1))
+            else
+                echo -e "${YELLOW}Warning: dependency '${dep}' not found for task ${_task_aliases[$i]:-${_task_ids[$i]}}${NC}" >&2
+            fi
+        fi
+    done
+}
 
 cmd_plan() {
     local file=""
@@ -1672,27 +1974,9 @@ cmd_plan() {
         shift
     done
 
-    # --template: output the plan template and exit
     if [ "$show_template" = true ]; then
-        local template_path=""
-        local config_dir="${WV_CONFIG_DIR:-$HOME/.config/weave}"
-        # Search order: config dir (installed), then project templates/ (dev mode)
-        if [ -f "$config_dir/PLAN.md.template" ]; then
-            template_path="$config_dir/PLAN.md.template"
-        elif [ -f "$WV_LIB_DIR/../templates/PLAN.md.template" ]; then
-            template_path="$WV_LIB_DIR/../templates/PLAN.md.template"
-        elif [ -f "$SCRIPT_DIR/../templates/PLAN.md.template" ]; then
-            template_path="$SCRIPT_DIR/../templates/PLAN.md.template"
-        fi
-        if [ -n "$template_path" ] && [ -f "$template_path" ]; then
-            cat "$template_path"
-        else
-            echo -e "${RED}Error: PLAN.md.template not found${NC}" >&2
-            echo "  Checked: $config_dir/PLAN.md.template" >&2
-            echo "  Checked: $WV_LIB_DIR/../templates/PLAN.md.template" >&2
-            return 1
-        fi
-        return 0
+        _plan_show_template
+        return $?
     fi
 
     if [ -z "$file" ]; then
@@ -1714,115 +1998,16 @@ cmd_plan() {
 
     db_ensure
 
-    # Find the sprint section: ### Sprint N: Title
-    local section_pattern="^### Sprint ${sprint}[^#]"
-    local in_section=false
-    local epic_title=""
-    local tasks=()
-    local task_aliases=()
-    local task_deps=()
-    local task_priorities=()
-    local task_statuses=()
+    # Parse markdown into arrays
+    _plan_parse_markdown "$file" "$sprint"
 
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^###[[:space:]]+Sprint[[:space:]]+${sprint}[[:space:]]*[:—–-][[:space:]]*(.*) ]]; then
-            in_section=true
-            epic_title="Sprint ${sprint}: ${BASH_REMATCH[1]}"
-            continue
-        fi
-
-        # Exit section on next header (### or higher) or horizontal rule
-        if [ "$in_section" = true ]; then
-            if [[ "$line" =~ ^#{2,3}[[:space:]] ]] || [[ "$line" =~ ^---+$ ]]; then
-                break
-            fi
-        fi
-
-        # Collect numbered items as tasks (with multi-line continuation)
-        if [ "$in_section" = true ] && [[ "$line" =~ ^[0-9]+\.[[:space:]]+(.*) ]]; then
-            local task_text="${BASH_REMATCH[1]}"
-            # Strip markdown checkbox markers and detect done status
-            local task_status="todo"
-            if [[ "$task_text" == "[x] "* ]] || [[ "$task_text" == "[X] "* ]]; then
-                task_text="${task_text#\[[xX]\] }"
-                task_status="done"
-            else
-                task_text="${task_text#\[ \] }"
-            fi
-            # Extract alias from bold prefix: **alias** — description
-            local task_alias=""
-            if [[ "$task_text" =~ ^\*\*([a-zA-Z0-9][a-zA-Z0-9_-]*)\*\*[[:space:]]*[—–:-][[:space:]]*(.*) ]]; then
-                task_alias="${BASH_REMATCH[1]}"
-                task_text="${BASH_REMATCH[2]}"
-            fi
-            # Strip remaining bold markers
-            task_text="${task_text//\*\*/}"
-            # Extract metadata tags: (priority: N), (after: alias), (status: done)
-            local task_priority="2"
-            local task_dep=""
-            if [[ "$task_text" =~ \(priority:[[:space:]]*([0-9]+)\) ]]; then
-                task_priority="${BASH_REMATCH[1]}"
-                task_text="${task_text//${BASH_REMATCH[0]}/}"
-            fi
-            if [[ "$task_text" =~ \(after:[[:space:]]*([a-zA-Z0-9_-]+)\) ]]; then
-                task_dep="${BASH_REMATCH[1]}"
-                task_text="${task_text//${BASH_REMATCH[0]}/}"
-            fi
-            if [[ "$task_text" =~ \(status:[[:space:]]*(done|todo|blocked)\) ]]; then
-                task_status="${BASH_REMATCH[1]}"
-                task_text="${task_text//${BASH_REMATCH[0]}/}"
-            fi
-            # Strip trailing whitespace
-            task_text="${task_text%%[[:space:]]}"
-            task_text="${task_text%% }"
-            tasks+=("$task_text")
-            task_aliases+=("$task_alias")
-            task_deps+=("$task_dep")
-            task_priorities+=("$task_priority")
-            task_statuses+=("$task_status")
-        elif [ "$in_section" = true ] && [ ${#tasks[@]} -gt 0 ] && [[ "$line" =~ ^[[:space:]]{3,}(.*) ]]; then
-            # Continuation line (indented) — append to last task
-            local cont_text="${BASH_REMATCH[1]}"
-            cont_text="${cont_text//\*\*/}"
-            cont_text="${cont_text%%[[:space:]]}"
-            if [ -n "$cont_text" ]; then
-                local last_idx=$(( ${#tasks[@]} - 1 ))
-                tasks[$last_idx]="${tasks[$last_idx]} $cont_text"
-            fi
-        fi
-    done < "$file"
-
-    # Post-process: re-extract metadata tags from full text (first line + continuations)
-    # Metadata on continuation lines is missed during initial parse (only first line is checked)
-    for i in "${!tasks[@]}"; do
-        local full_text="${tasks[$i]}"
-        # Re-extract (after:) if not found on first line
-        if [ -z "${task_deps[$i]}" ] && [[ "$full_text" =~ \(after:[[:space:]]*([a-zA-Z0-9_-]+)\) ]]; then
-            task_deps[$i]="${BASH_REMATCH[1]}"
-            tasks[$i]="${full_text//${BASH_REMATCH[0]}/}"
-        fi
-        # Re-extract (priority:) if still at default
-        if [ "${task_priorities[$i]}" = "2" ] && [[ "${tasks[$i]}" =~ \(priority:[[:space:]]*([0-9]+)\) ]]; then
-            task_priorities[$i]="${BASH_REMATCH[1]}"
-            tasks[$i]="${tasks[$i]//${BASH_REMATCH[0]}/}"
-        fi
-        # Re-extract (status:) from continuation text
-        if [[ "${tasks[$i]}" =~ \(status:[[:space:]]*(done|todo|blocked)\) ]]; then
-            task_statuses[$i]="${BASH_REMATCH[1]}"
-            tasks[$i]="${tasks[$i]//${BASH_REMATCH[0]}/}"
-        fi
-        # Clean trailing whitespace
-        tasks[$i]="${tasks[$i]%%[[:space:]]}"
-        tasks[$i]="${tasks[$i]%% }"
-    done
-
-    if [ -z "$epic_title" ]; then
+    if [ -z "$_epic_title" ]; then
         echo -e "${RED}Error: Sprint $sprint section not found in $file${NC}" >&2
         echo "Expected: ### Sprint ${sprint}: <title>" >&2
         return 1
     fi
 
-    if [ ${#tasks[@]} -eq 0 ]; then
+    if [ ${#_tasks[@]} -eq 0 ]; then
         echo -e "${YELLOW}Warning: Sprint $sprint section found but no tasks parsed${NC}" >&2
         echo "" >&2
         echo "Expected numbered list format:" >&2
@@ -1837,14 +2022,15 @@ cmd_plan() {
         return 1
     fi
 
-    echo -e "${CYAN}Epic:${NC} $epic_title"
-    echo -e "${CYAN}Tasks:${NC} ${#tasks[@]}"
-    for i in "${!tasks[@]}"; do
-        local display="${tasks[$i]}"
-        [ -n "${task_aliases[$i]}" ] && display="[${task_aliases[$i]}] $display"
-        [ "${task_statuses[$i]}" = "done" ] && display="$display (done)"
-        [ -n "${task_deps[$i]}" ] && display="$display (after: ${task_deps[$i]})"
-        [ "${task_priorities[$i]}" != "2" ] && display="$display (P${task_priorities[$i]})"
+    # Display parsed plan
+    echo -e "${CYAN}Epic:${NC} $_epic_title"
+    echo -e "${CYAN}Tasks:${NC} ${#_tasks[@]}"
+    for i in "${!_tasks[@]}"; do
+        local display="${_tasks[$i]}"
+        [ -n "${_task_aliases[$i]}" ] && display="[${_task_aliases[$i]}] $display"
+        [ "${_task_statuses[$i]}" = "done" ] && display="$display (done)"
+        [ -n "${_task_deps[$i]}" ] && display="$display (after: ${_task_deps[$i]})"
+        [ "${_task_priorities[$i]}" != "2" ] && display="$display (P${_task_priorities[$i]})"
         echo "  - $display"
     done
 
@@ -1853,126 +2039,20 @@ cmd_plan() {
         return 0
     fi
 
-    # Create epic
-    local gh_flag=""
-    [ "$create_gh" = true ] && gh_flag="--gh"
-    local epic_id epic_output
-    epic_output=$(cmd_add "Epic: $epic_title" --metadata="{\"type\":\"epic\",\"sprint\":$sprint}" $gh_flag --force 2>&1)
-    epic_id=$(echo "$epic_output" | tail -1)
-    if [ -z "$epic_id" ] || [[ "$epic_id" != wv-* ]]; then
-        echo -e "${RED}Error: Failed to create epic node${NC}" >&2
-        echo "$epic_output" >&2
-        return 1
-    fi
-    echo -e "${GREEN}✓${NC} Epic: $epic_id -- $epic_title"
+    # Create nodes, inject learnings, wire dependencies
+    _plan_create_nodes "$_epic_title" "$create_gh" "$sprint" || return 1
+    _plan_inject_learnings
 
-    # Pass 1: Create tasks and link to epic (collect alias→ID map)
-    declare -A alias_to_id
-    local task_ids=()
-    local task_count=0
-    local fail_count=0
-    for i in "${!tasks[@]}"; do
-        local task="${tasks[$i]}"
-        local alias_flag=""
-        [ -n "${task_aliases[$i]}" ] && alias_flag="--alias=${task_aliases[$i]}"
-        local status_flag="--status=${task_statuses[$i]}"
-        local meta="{\"type\":\"task\",\"priority\":${task_priorities[$i]}}"
-        local task_id task_output
-        task_output=$(cmd_add "$task" --metadata="$meta" $alias_flag $status_flag $gh_flag --force 2>&1)
-        task_id=$(echo "$task_output" | tail -1)
-        if [ -z "$task_id" ] || [[ "$task_id" != wv-* ]]; then
-            echo -e "${RED}✗ Failed:${NC} $task" >&2
-            echo "$task_output" >&2
-            fail_count=$((fail_count + 1))
-            task_ids+=("")
-            continue
-        fi
-        cmd_link "$task_id" "$epic_id" --type=implements 2>/dev/null
-        task_ids+=("$task_id")
-        [ -n "${task_aliases[$i]}" ] && alias_to_id["${task_aliases[$i]}"]="$task_id"
-        local label="$task_id"
-        [ -n "${task_aliases[$i]}" ] && label="$task_id (${task_aliases[$i]})"
-        echo -e "${GREEN}✓${NC} Task: $label -- $task"
-        task_count=$((task_count + 1))
-        # Throttle GH API calls to avoid secondary rate limits
-        if [ "$create_gh" = true ]; then
-            sleep 1
-        fi
-    done
-
-    # Pass 1.5: Inject related learnings into task metadata
-    db_migrate_fts5 2>/dev/null || true
-    local learnings_count=0
-    for i in "${!tasks[@]}"; do
-        [ -z "${task_ids[$i]}" ] && continue
-        # Extract 3-5 keywords (>4 chars) from task text
-        local keywords
-        keywords=$(echo "${tasks[$i]}" | tr -cs '[:alnum:]' ' ' | \
-            awk '{for(j=1;j<=NF;j++) if(length($j)>4) {printf "%s ", $j; c++; if(c>=5) exit}}')
-        keywords=$(echo "$keywords" | sed 's/[(){}*:^~"]//g' | xargs)
-        [ -z "$keywords" ] && continue
-        local kw_count
-        kw_count=$(echo "$keywords" | wc -w)
-        [ "$kw_count" -lt 2 ] && continue
-        # FTS5 query for matching learnings/pitfalls
-        local fts_query
-        fts_query=$(echo "$keywords" | sed 's/ / OR /g')
-        local learning_ids
-        learning_ids=$(db_query "
-            SELECT n.id FROM nodes_fts f
-            JOIN nodes n ON f.rowid = n.rowid
-            WHERE nodes_fts MATCH '$fts_query'
-            AND (json_extract(n.metadata, '\$.learning') IS NOT NULL
-                 OR json_extract(n.metadata, '\$.pitfall') IS NOT NULL
-                 OR json_extract(n.metadata, '\$.decision') IS NOT NULL)
-            AND n.id != '${task_ids[$i]}'
-            LIMIT 3;
-        " 2>/dev/null || true)
-        if [ -n "$learning_ids" ]; then
-            # Store as context_learnings in task metadata
-            local ids_json
-            ids_json=$(echo "$learning_ids" | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null || echo "[]")
-            local cur_meta_raw cur_meta
-            cur_meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='${task_ids[$i]}';" 2>/dev/null || echo "[]")
-            cur_meta=$(echo "$cur_meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
-            if [[ "$cur_meta" != "{"* ]]; then
-                cur_meta=$(echo "$cur_meta" | jq -r '.' 2>/dev/null || echo "{}")
-            fi
-            local new_meta
-            new_meta=$(echo "$cur_meta" | jq --argjson cl "$ids_json" '. + {context_learnings: $cl}' 2>/dev/null || echo "$cur_meta")
-            new_meta="${new_meta//\'/\'\'}"
-            db_query "UPDATE nodes SET metadata='$new_meta' WHERE id='${task_ids[$i]}';" 2>/dev/null
-            local match_count
-            match_count=$(echo "$learning_ids" | wc -l)
-            learnings_count=$((learnings_count + match_count))
-        fi
-    done
-    [ "$learnings_count" -gt 0 ] && echo -e "${CYAN}ℹ Found $learnings_count related learning(s)${NC}" >&2
-
-    # Pass 2: Wire dependency edges (after: alias)
-    local dep_count=0
-    for i in "${!tasks[@]}"; do
-        local dep="${task_deps[$i]}"
-        if [ -n "$dep" ] && [ -n "${task_ids[$i]}" ]; then
-            # Resolve dep alias to ID — check local map first, then DB
-            local dep_id="${alias_to_id[$dep]:-}"
-            if [ -z "$dep_id" ]; then
-                dep_id=$(db_query "SELECT id FROM nodes WHERE alias='$(sql_escape "$dep")' LIMIT 1;" 2>/dev/null)
-            fi
-            if [ -n "$dep_id" ]; then
-                cmd_link "$dep_id" "${task_ids[$i]}" --type=blocks 2>/dev/null
-                echo -e "${CYAN}  ->  ${dep} blocks ${task_aliases[$i]:-${task_ids[$i]}}${NC}"
-                dep_count=$((dep_count + 1))
-            else
-                echo -e "${YELLOW}Warning: dependency '${dep}' not found for task ${task_aliases[$i]:-${task_ids[$i]}}${NC}" >&2
-            fi
-        fi
-    done
+    _plan_wire_deps
 
     echo ""
-    echo -e "${GREEN}Created $task_count task(s) linked to epic $epic_id${NC}"
-    [ "$dep_count" -gt 0 ] && echo -e "${GREEN}Created $dep_count dependency edge(s)${NC}"
-    [ "$fail_count" -gt 0 ] && echo -e "${RED}$fail_count task(s) failed -- re-run without --gh and use 'wv sync --gh' to batch-create issues${NC}" >&2
+    echo -e "${GREEN}Created $_task_count task(s) linked to epic $_epic_id${NC}"
+    if [ "$_dep_count" -gt 0 ]; then
+        echo -e "${GREEN}Created $_dep_count dependency edge(s)${NC}"
+    fi
+    if [ "$_fail_count" -gt 0 ]; then
+        echo -e "${RED}$_fail_count task(s) failed -- re-run without --gh and use 'wv sync --gh' to batch-create issues${NC}" >&2
+    fi
 
     auto_sync 2>/dev/null || true
 }

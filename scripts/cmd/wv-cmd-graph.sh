@@ -641,6 +641,68 @@ cmd_path() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# cmd_context helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+# _context_resolve_id — Resolve node ID from WV_ACTIVE or primary node
+_context_resolve_id() {
+    if [ -n "${WV_ACTIVE:-}" ]; then
+        echo "$WV_ACTIVE"
+        return 0
+    fi
+    local primary
+    primary=$(get_primary_node 2>/dev/null || echo "")
+    if [ -n "$primary" ]; then
+        echo "$primary"
+        return 0
+    fi
+    echo -e "${RED}Error: node ID required${NC}" >&2
+    echo "Usage: wv context <id> --json" >&2
+    echo "" >&2
+    echo "Tip: Run 'wv work <id>' to set the primary node, or:" >&2
+    echo "  export WV_ACTIVE=wv-xxxxxx" >&2
+    return 1
+}
+
+# _context_gather_quality — Get code quality data for files touched by a node
+_context_gather_quality() {
+    local id="$1"
+    local quality_json='{"code_quality":[],"quality_as_of":null}'
+
+    # Source 1: commits whose message references this node ID
+    local touched_files
+    touched_files=$(git log --all --grep="$id" --name-only --format="" 2>/dev/null | sort -u)
+
+    # Source 2: commits stored in node metadata (from onboarding / plan-agent enrichment)
+    local meta_commits
+    meta_commits=$(db_query "SELECT json_extract(metadata, '$.commits') FROM nodes WHERE id='$id';" 2>/dev/null)
+    # Fall back to singular "commit" key (older onboarding format)
+    if [ -z "$meta_commits" ] || [ "$meta_commits" = "null" ]; then
+        local single_commit
+        single_commit=$(db_query "SELECT json_extract(metadata, '$.commit') FROM nodes WHERE id='$id';" 2>/dev/null)
+        if [ -n "$single_commit" ] && [ "$single_commit" != "null" ]; then
+            meta_commits="[\"$single_commit\"]"
+        fi
+    fi
+    if [ -n "$meta_commits" ] && [ "$meta_commits" != "null" ]; then
+        local commit_files
+        commit_files=$(echo "$meta_commits" | jq -r '.[]' 2>/dev/null | while IFS= read -r sha; do
+            git show --name-only --format="" "$sha" 2>/dev/null
+        done | sort -u)
+        if [ -n "$commit_files" ]; then
+            touched_files=$(printf '%s\n%s' "$touched_files" "$commit_files" | sort -u | grep -v '^$')
+        fi
+    fi
+
+    if [ -n "$touched_files" ]; then
+        local _hz_args=()
+        [ -n "$WV_HOT_ZONE" ] && _hz_args=("--hot-zone" "$WV_HOT_ZONE")
+        quality_json=$(echo "$touched_files" | _wv_quality_python "${_hz_args[@]}" context-files 2>/dev/null || echo '{"code_quality":[],"quality_as_of":null}')
+    fi
+    echo "$quality_json"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # cmd_context — Build Context Pack for a node
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -659,22 +721,9 @@ cmd_context() {
 
     # Use WV_ACTIVE or primary node if no ID provided
     if [ -z "$id" ]; then
-        if [ -n "${WV_ACTIVE:-}" ]; then
-            id="$WV_ACTIVE"
-        else
-            # Fall back to primary node from wv work
-            local primary
-            primary=$(get_primary_node 2>/dev/null || echo "")
-            if [ -n "$primary" ]; then
-                id="$primary"
-            else
-                echo -e "${RED}Error: node ID required${NC}" >&2
-                echo "Usage: wv context <id> --json" >&2
-                echo "" >&2
-                echo "Tip: Run 'wv work <id>' to set the primary node, or:" >&2
-                echo "  export WV_ACTIVE=wv-xxxxxx" >&2
-                return 1
-            fi
+        id=$(_context_resolve_id)
+        if [ -z "$id" ]; then
+            return 1
         fi
     fi
 
@@ -817,39 +866,9 @@ cmd_context() {
     ")
     contradictions_json="${contradictions_json:-[]}"
 
-    # Get code quality data for files touched by this node (D-B decision: best-effort)
-    # Two sources: 1) git log --grep for commits mentioning node ID in message
-    #              2) metadata.commits[] / metadata.commit for onboarded repos
-    local quality_json='{"code_quality":[],"quality_as_of":null}'
-    local touched_files
-    # Source 1: commits whose message references this node ID
-    touched_files=$(git log --all --grep="$id" --name-only --format="" 2>/dev/null | sort -u)
-    # Source 2: commits stored in node metadata (from onboarding / plan-agent enrichment)
-    local meta_commits
-    meta_commits=$(db_query "SELECT json_extract(metadata, '$.commits') FROM nodes WHERE id='$id';" 2>/dev/null)
-    # Fall back to singular "commit" key (older onboarding format)
-    if [ -z "$meta_commits" ] || [ "$meta_commits" = "null" ]; then
-        local single_commit
-        single_commit=$(db_query "SELECT json_extract(metadata, '$.commit') FROM nodes WHERE id='$id';" 2>/dev/null)
-        if [ -n "$single_commit" ] && [ "$single_commit" != "null" ]; then
-            meta_commits="[\"$single_commit\"]"
-        fi
-    fi
-    if [ -n "$meta_commits" ] && [ "$meta_commits" != "null" ]; then
-        local commit_files
-        commit_files=$(echo "$meta_commits" | jq -r '.[]' 2>/dev/null | while IFS= read -r sha; do
-            git show --name-only --format="" "$sha" 2>/dev/null
-        done | sort -u)
-        if [ -n "$commit_files" ]; then
-            # Merge both sources, deduplicate
-            touched_files=$(printf '%s\n%s' "$touched_files" "$commit_files" | sort -u | grep -v '^$')
-        fi
-    fi
-    if [ -n "$touched_files" ]; then
-        local _hz_args=()
-        [ -n "$WV_HOT_ZONE" ] && _hz_args=("--hot-zone" "$WV_HOT_ZONE")
-        quality_json=$(echo "$touched_files" | _wv_quality_python "${_hz_args[@]}" context-files 2>/dev/null || echo '{"code_quality":[],"quality_as_of":null}')
-    fi
+    # Get code quality data for files touched by this node
+    local quality_json
+    quality_json=$(_context_gather_quality "$id")
 
     # Compose Context Pack with field cleanup and limits (per proposal lines 222-237)
     jq -n \

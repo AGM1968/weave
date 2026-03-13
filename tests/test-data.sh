@@ -263,6 +263,17 @@ $WV add "New active task" >/dev/null 2>&1
 output=$($WV prune --dry-run 2>&1)
 assert_contains "$output" "No nodes to prune" "prune reports nothing to prune"
 
+# Test prune extracts gh_issue metadata for GH closure
+# (Can't call real gh CLI in tests, but verify the SQL extraction works)
+reset_db
+gh_node=$($WV add "GH-linked task" | tail -1)
+$WV update "$gh_node" --metadata='{"gh_issue":9999}'
+$WV done "$gh_node" >/dev/null 2>&1
+sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-72 hours') WHERE id='$gh_node';"
+# Verify metadata is readable before prune
+gh_num=$(sqlite3 "$WV_DB" "SELECT json_extract(metadata, '\$.gh_issue') FROM nodes WHERE id='$gh_node';")
+assert_equals "9999" "$gh_num" "prune can extract gh_issue from metadata before delete"
+
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════

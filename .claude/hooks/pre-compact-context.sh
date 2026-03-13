@@ -15,8 +15,8 @@ cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 "$WV" sync 2>/dev/null || true
 # Stage only .weave/ state — code changes belong in intentional feature commits.
 # Using 'git add -A' here caused race conditions with state.sql across sessions.
-# Rate-limit: skip commit if last auto-checkpoint was < 10 minutes ago
-_LAST_CP=$(git log -1 --format=%ct --grep='auto-checkpoint\|pre-compact checkpoint' 2>/dev/null || echo 0)
+# Rate-limit: skip commit if last checkpoint/sync commit was < 10 minutes ago
+_LAST_CP=$(git log -1 --format=%ct --grep='auto-checkpoint\|pre-compact checkpoint\|sync state' 2>/dev/null || echo 0)
 _NOW=$(date +%s)
 _ELAPSED=$((_NOW - _LAST_CP))
 if [ "$_ELAPSED" -lt 600 ]; then

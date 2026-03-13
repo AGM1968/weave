@@ -788,40 +788,62 @@ _recover_session() {
 # cmd_doctor — Installation health check
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Shared state for _doctor_record (avoids nested function dynamic scoping)
+_dr_pass=0 _dr_fail=0 _dr_warn=0 _dr_total=0 _dr_results="" _dr_format="text"
+
+_doctor_record() {
+    local name="$1" status="$2" detail="$3"
+    _dr_total=$((_dr_total + 1))
+    case "$status" in
+        pass) _dr_pass=$((_dr_pass + 1)) ;;
+        fail) _dr_fail=$((_dr_fail + 1)) ;;
+        warn) _dr_warn=$((_dr_warn + 1)) ;;
+    esac
+    if [ "$_dr_format" = "json" ]; then
+        _dr_results="${_dr_results:+$_dr_results,}$(printf '{"check":"%s","status":"%s","detail":"%s"}' "$name" "$status" "$detail")"
+    else
+        local icon
+        case "$status" in
+            pass) icon="${GREEN}✓${NC}" ;;
+            fail) icon="${RED}✗${NC}" ;;
+            warn) icon="${YELLOW}⊘${NC}" ;;
+        esac
+        echo -e "  $icon $name: $detail"
+    fi
+}
+
+# _doctor_check_modules — Check a directory for expected module files
+_doctor_check_modules() {
+    local label="$1" dir="$2" expected="$3"
+    local found=0 missing=""
+    for mod in $expected; do
+        if [ -f "$dir/$mod" ]; then
+            found=$((found + 1))
+        else
+            missing="${missing:+$missing, }$mod"
+        fi
+    done
+    local total_expected
+    total_expected=$(echo "$expected" | wc -w | tr -d ' ')
+    if [ "$found" -eq "$total_expected" ]; then
+        _doctor_record "$label" "pass" "$found/$total_expected"
+    else
+        _doctor_record "$label" "fail" "$found/$total_expected (missing: $missing)"
+    fi
+}
+
 cmd_doctor() {
-    local format="text"
+    _dr_format="text"
     while [ $# -gt 0 ]; do
         case "$1" in
-            --json) format="json" ;;
+            --json) _dr_format="json" ;;
         esac
         shift
     done
 
-    local pass=0 fail=0 warn=0 total=0
-    local results=""
+    _dr_pass=0 _dr_fail=0 _dr_warn=0 _dr_total=0 _dr_results=""
 
-    _doctor_record() {
-        local name="$1" status="$2" detail="$3"
-        total=$((total + 1))
-        case "$status" in
-            pass) pass=$((pass + 1)) ;;
-            fail) fail=$((fail + 1)) ;;
-            warn) warn=$((warn + 1)) ;;
-        esac
-        if [ "$format" = "json" ]; then
-            results="${results:+$results,}$(printf '{"check":"%s","status":"%s","detail":"%s"}' "$name" "$status" "$detail")"
-        else
-            local icon
-            case "$status" in
-                pass) icon="${GREEN}✓${NC}" ;;
-                fail) icon="${RED}✗${NC}" ;;
-                warn) icon="${YELLOW}⊘${NC}" ;;
-            esac
-            echo -e "  $icon $name: $detail"
-        fi
-    }
-
-    [ "$format" = "text" ] && echo "Weave Doctor — Installation Health"
+    [ "$_dr_format" = "text" ] && echo "Weave Doctor — Installation Health"
 
     # 1. sqlite3 present
     if command -v sqlite3 >/dev/null 2>&1; then
@@ -908,43 +930,11 @@ cmd_doctor() {
         _doctor_record "database" "warn" "no active database"
     fi
 
-    # 11. Lib modules
-    local lib_dir="$WV_LIB_DIR/lib"
-    local lib_expected="wv-config.sh wv-db.sh wv-validate.sh wv-cache.sh wv-journal.sh wv-gh.sh wv-resolve-project.sh"
-    local lib_found=0 lib_missing=""
-    for mod in $lib_expected; do
-        if [ -f "$lib_dir/$mod" ]; then
-            lib_found=$((lib_found + 1))
-        else
-            lib_missing="${lib_missing:+$lib_missing, }$mod"
-        fi
-    done
-    local lib_total
-    lib_total=$(echo "$lib_expected" | wc -w | tr -d ' ')
-    if [ "$lib_found" -eq "$lib_total" ]; then
-        _doctor_record "lib modules" "pass" "$lib_found/$lib_total"
-    else
-        _doctor_record "lib modules" "fail" "$lib_found/$lib_total (missing: $lib_missing)"
-    fi
-
-    # 12. Cmd modules
-    local cmd_dir="$WV_LIB_DIR/cmd"
-    local cmd_expected="wv-cmd-core.sh wv-cmd-graph.sh wv-cmd-data.sh wv-cmd-ops.sh wv-cmd-quality.sh"
-    local cmd_found=0 cmd_missing=""
-    for mod in $cmd_expected; do
-        if [ -f "$cmd_dir/$mod" ]; then
-            cmd_found=$((cmd_found + 1))
-        else
-            cmd_missing="${cmd_missing:+$cmd_missing, }$mod"
-        fi
-    done
-    local cmd_total
-    cmd_total=$(echo "$cmd_expected" | wc -w | tr -d ' ')
-    if [ "$cmd_found" -eq "$cmd_total" ]; then
-        _doctor_record "cmd modules" "pass" "$cmd_found/$cmd_total"
-    else
-        _doctor_record "cmd modules" "fail" "$cmd_found/$cmd_total (missing: $cmd_missing)"
-    fi
+    # 11-12. Module checks
+    _doctor_check_modules "lib modules" "$WV_LIB_DIR/lib" \
+        "wv-config.sh wv-db.sh wv-validate.sh wv-cache.sh wv-journal.sh wv-gh.sh wv-resolve-project.sh"
+    _doctor_check_modules "cmd modules" "$WV_LIB_DIR/cmd" \
+        "wv-cmd-core.sh wv-cmd-graph.sh wv-cmd-data.sh wv-cmd-ops.sh wv-cmd-quality.sh"
 
     # 13. .weave dir
     if [ -d "${WEAVE_DIR:-}" ]; then
@@ -965,23 +955,23 @@ cmd_doctor() {
     fi
 
     # Summary
-    if [ "$format" = "json" ]; then
+    if [ "$_dr_format" = "json" ]; then
         local overall="pass"
-        [ "$fail" -gt 0 ] && overall="fail"
+        [ "$_dr_fail" -gt 0 ] && overall="fail"
         printf '{"overall":"%s","passed":%d,"failed":%d,"warnings":%d,"total":%d,"checks":[%s]}\n' \
-            "$overall" "$pass" "$fail" "$warn" "$total" "$results"
+            "$overall" "$_dr_pass" "$_dr_fail" "$_dr_warn" "$_dr_total" "$_dr_results"
     else
         echo ""
-        if [ "$fail" -gt 0 ]; then
-            echo -e "Result: ${RED}${pass}/${total} passed${NC} (${fail} failed, ${warn} warnings)"
-        elif [ "$warn" -gt 0 ]; then
-            echo -e "Result: ${GREEN}${pass}/${total} passed${NC} (${warn} warnings)"
+        if [ "$_dr_fail" -gt 0 ]; then
+            echo -e "Result: ${RED}${_dr_pass}/${_dr_total} passed${NC} (${_dr_fail} failed, ${_dr_warn} warnings)"
+        elif [ "$_dr_warn" -gt 0 ]; then
+            echo -e "Result: ${GREEN}${_dr_pass}/${_dr_total} passed${NC} (${_dr_warn} warnings)"
         else
-            echo -e "Result: ${GREEN}${pass}/${total} passed${NC}"
+            echo -e "Result: ${GREEN}${_dr_pass}/${_dr_total} passed${NC}"
         fi
     fi
 
-    [ "$fail" -gt 0 ] && return 1
+    [ "$_dr_fail" -gt 0 ] && return 1
     return 0
 }
 
@@ -1100,59 +1090,30 @@ cmd_mcp_status() {
 # cmd_selftest — Round-trip smoke test in isolated environment
 # ═══════════════════════════════════════════════════════════════════════════
 
-cmd_selftest() {
-    local format="text"
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --json) format="json" ;;
-        esac
-        shift
-    done
+# Shared state for _selftest_check (avoids subshell capture issues)
+_st_pass=0 _st_fail=0 _st_total=0 _st_results="" _st_format="text"
 
-    local pass=0 fail=0 total=0
-    local results=""
-    local test_dir
-    test_dir=$(mktemp -d "${TMPDIR:-/tmp}/wv-selftest-XXXXXX")
+_selftest_check() {
+    local name="$1" ok="$2" detail="$3"
+    _st_total=$((_st_total + 1))
+    if [ "$ok" = "1" ]; then
+        _st_pass=$((_st_pass + 1))
+        local status="pass"
+    else
+        _st_fail=$((_st_fail + 1))
+        local status="fail"
+    fi
+    if [ "$_st_format" = "json" ]; then
+        _st_results="${_st_results:+$_st_results,}$(printf '{"test":"%s","status":"%s","detail":"%s"}' "$name" "$status" "$detail")"
+    else
+        local icon
+        [ "$status" = "pass" ] && icon="${GREEN}✓${NC}" || icon="${RED}✗${NC}"
+        echo -e "  $icon $name: $detail"
+    fi
+}
 
-    # Isolated environment — override hot zone and DB
-    local orig_db="${WV_DB:-}"
-    local orig_hz="${WV_HOT_ZONE:-}"
-    export WV_HOT_ZONE="$test_dir"
-    export WV_DB="$test_dir/brain.db"
-    # Reset db_ensure guard so init works in new location
-    _WV_DB_READY=""
-    _WV_SIZE_CHECKED=""
-
-    _selftest_cleanup() {
-        export WV_DB="$orig_db"
-        export WV_HOT_ZONE="$orig_hz"
-        _WV_DB_READY=""
-        _WV_SIZE_CHECKED=""
-        cd /tmp || return
-        rm -rf "$test_dir"
-    }
-
-    _selftest_check() {
-        local name="$1" ok="$2" detail="$3"
-        total=$((total + 1))
-        if [ "$ok" = "1" ]; then
-            pass=$((pass + 1))
-            local status="pass"
-        else
-            fail=$((fail + 1))
-            local status="fail"
-        fi
-        if [ "$format" = "json" ]; then
-            results="${results:+$results,}$(printf '{"test":"%s","status":"%s","detail":"%s"}' "$name" "$status" "$detail")"
-        else
-            local icon
-            [ "$status" = "pass" ] && icon="${GREEN}✓${NC}" || icon="${RED}✗${NC}"
-            echo -e "  $icon $name: $detail"
-        fi
-    }
-
-    [ "$format" = "text" ] && echo "Weave Selftest — Round-trip Smoke Test"
-
+# _selftest_run_tests — Execute the 9 smoke tests (uses _selftest_check for recording)
+_selftest_run_tests() {
     # 1. Init
     local init_out
     init_out=$(db_init 2>&1) && _selftest_check "init" "1" "database created" \
@@ -1226,32 +1187,434 @@ cmd_selftest() {
     health_score=$(echo "$health_out" | jq -r '.score' 2>/dev/null || echo "0")
     [ "$health_score" -gt 0 ] 2>/dev/null && _selftest_check "health" "1" "score $health_score" \
         || _selftest_check "health" "0" "score=$health_score"
+}
+
+cmd_selftest() {
+    _st_format="text"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) _st_format="json" ;;
+        esac
+        shift
+    done
+
+    _st_pass=0 _st_fail=0 _st_total=0 _st_results=""
+    local test_dir
+    test_dir=$(mktemp -d "${TMPDIR:-/tmp}/wv-selftest-XXXXXX")
+
+    # Isolated environment — override hot zone and DB
+    local orig_db="${WV_DB:-}"
+    local orig_hz="${WV_HOT_ZONE:-}"
+    export WV_HOT_ZONE="$test_dir"
+    export WV_DB="$test_dir/brain.db"
+    _WV_DB_READY=""
+    _WV_SIZE_CHECKED=""
+
+    [ "$_st_format" = "text" ] && echo "Weave Selftest — Round-trip Smoke Test"
+
+    _selftest_run_tests
 
     # Cleanup
-    _selftest_cleanup
+    export WV_DB="$orig_db"
+    export WV_HOT_ZONE="$orig_hz"
+    _WV_DB_READY=""
+    _WV_SIZE_CHECKED=""
+    cd /tmp || true
+    rm -rf "$test_dir"
 
     # Summary
-    if [ "$format" = "json" ]; then
+    if [ "$_st_format" = "json" ]; then
         local overall="pass"
-        [ "$fail" -gt 0 ] && overall="fail"
+        [ "$_st_fail" -gt 0 ] && overall="fail"
         printf '{"overall":"%s","passed":%d,"failed":%d,"total":%d,"tests":[%s]}\n' \
-            "$overall" "$pass" "$fail" "$total" "$results"
+            "$overall" "$_st_pass" "$_st_fail" "$_st_total" "$_st_results"
     else
         echo ""
-        if [ "$fail" -gt 0 ]; then
-            echo -e "Result: ${RED}${pass}/${total} passed${NC} (${fail} failed)"
+        if [ "$_st_fail" -gt 0 ]; then
+            echo -e "Result: ${RED}${_st_pass}/${_st_total} passed${NC} (${_st_fail} failed)"
         else
-            echo -e "Result: ${GREEN}${pass}/${total} passed${NC}"
+            echo -e "Result: ${GREEN}${_st_pass}/${_st_total} passed${NC}"
         fi
     fi
 
-    [ "$fail" -gt 0 ] && return 1
+    [ "$_st_fail" -gt 0 ] && return 1
     return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_health — System health check
 # ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_health — Health check with score (decomposed into helpers)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Shared state for cmd_health helpers
+_h_total_nodes=0 _h_active=0 _h_ready=0 _h_blocked=0 _h_blocked_ext=0
+_h_done_count=0 _h_pending=0 _h_total_edges=0 _h_blocking_edges=0
+_h_total_pitfalls=0 _h_addressed_pitfalls=0 _h_unaddressed_pitfalls=0
+_h_orphan_nodes=0 _h_orphan_ids="[]" _h_ghost_edges=0 _h_empty_edge_ctx=0
+_h_stale_active=0 _h_contradictions=0 _h_invalid_statuses=0
+_h_health_score=100 _h_issues="" _h_fixed_edge_ctx=0
+_h_status_icon="" _h_status_text=""
+_h_quality_available="false" _h_quality_score=0 _h_quality_hotspots=0
+_h_quality_files=0 _h_quality_head="" _h_quality_scanned=""
+
+# Show health history log and exit. Args: $1=count, $2=format
+_health_show_history() {
+    local count="$1" format="$2"
+    local log_file="$WEAVE_DIR/health.log"
+    if [ ! -f "$log_file" ]; then
+        echo "No health history yet. Run 'wv health' to start logging."
+        return 0
+    fi
+    local total
+    total=$(wc -l < "$log_file")
+    if [ "$format" = "json" ]; then
+        tail -n "$count" "$log_file" | awk -F'\t' '{
+            printf "{\"timestamp\":\"%s\",\"score\":%s,\"nodes\":%s,\"edges\":%s,\"orphans\":%s,\"ghost_edges\":%s}\n", $1, $2, $3, $4, $5, $6
+        }' | jq -s '.'
+    else
+        echo -e "${CYAN}Health History${NC} (last $count of $total entries)"
+        echo ""
+        printf "  %-25s %5s %5s %5s %7s %11s\n" "Timestamp" "Score" "Nodes" "Edges" "Orphans" "Ghost Edges"
+        printf "  %-25s %5s %5s %5s %7s %11s\n" "─────────────────────────" "─────" "─────" "─────" "───────" "───────────"
+        tail -n "$count" "$log_file" | while IFS=$'\t' read -r ts score nodes edges orphans ghosts; do
+            local icon="✅"
+            [ "$score" -lt 90 ] 2>/dev/null && icon="⚠️"
+            [ "$score" -lt 70 ] 2>/dev/null && icon="❌"
+            printf "  %-25s %3s %s %5s %5s %7s %11s\n" "$ts" "$score" "$icon" "$nodes" "$edges" "$orphans" "$ghosts"
+        done
+    fi
+}
+
+# Collect all health metrics from DB into _h_* shared variables.
+_health_collect_metrics() {
+    # Node counts
+    _h_total_nodes=$(db_query "SELECT COUNT(*) FROM nodes;" 2>/dev/null)
+    _h_total_nodes="${_h_total_nodes:-0}"
+    _h_active=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active';" 2>/dev/null)
+    _h_active="${_h_active:-0}"
+    _h_ready=$(cmd_ready --count 2>/dev/null)
+    _h_ready="${_h_ready:-0}"
+    _h_blocked=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='blocked';" 2>/dev/null)
+    _h_blocked="${_h_blocked:-0}"
+    _h_blocked_ext=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='blocked-external';" 2>/dev/null)
+    _h_blocked_ext="${_h_blocked_ext:-0}"
+    _h_done_count=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='done';" 2>/dev/null)
+    _h_done_count="${_h_done_count:-0}"
+    _h_pending=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='pending';" 2>/dev/null)
+    _h_pending="${_h_pending:-0}"
+
+    # Edge stats
+    _h_total_edges=$(db_query "SELECT COUNT(*) FROM edges;" 2>/dev/null)
+    _h_total_edges="${_h_total_edges:-0}"
+    _h_blocking_edges=$(db_query "SELECT COUNT(*) FROM edges WHERE type='blocks';" 2>/dev/null)
+    _h_blocking_edges="${_h_blocking_edges:-0}"
+
+    # Pitfall stats
+    _h_total_pitfalls=$(db_query "
+        SELECT COUNT(*) FROM nodes
+        WHERE json_extract(metadata, '\$.pitfall') IS NOT NULL;
+    ")
+    _h_addressed_pitfalls=$(db_query "
+        SELECT COUNT(DISTINCT n.id) FROM nodes n
+        JOIN edges e ON e.target = n.id
+        WHERE json_extract(n.metadata, '\$.pitfall') IS NOT NULL
+        AND e.type IN ('addresses', 'implements', 'supersedes');
+    ")
+    _h_unaddressed_pitfalls=$((_h_total_pitfalls - _h_addressed_pitfalls))
+
+    # Orphan nodes (no edges at all)
+    _h_orphan_nodes=$(db_query "
+        SELECT COUNT(*) FROM nodes n
+        WHERE n.id NOT IN (SELECT source FROM edges)
+        AND n.id NOT IN (SELECT target FROM edges);
+    ")
+    _h_orphan_ids=$(db_query "
+        SELECT json_group_array(n.id) FROM nodes n
+        WHERE n.id NOT IN (SELECT source FROM edges)
+        AND n.id NOT IN (SELECT target FROM edges);
+    ")
+    _h_orphan_ids="${_h_orphan_ids:-[]}"
+
+    # Ghost edges (referencing non-existent nodes)
+    _h_ghost_edges=$(db_query "
+        SELECT COUNT(*) FROM edges
+        WHERE source NOT IN (SELECT id FROM nodes)
+        OR target NOT IN (SELECT id FROM nodes);
+    ")
+
+    # Empty edge context
+    _h_empty_edge_ctx=$(db_query "SELECT COUNT(*) FROM edges WHERE context='{}';")
+    _h_empty_edge_ctx="${_h_empty_edge_ctx:-0}"
+
+    # Stale active nodes (active for more than 7 days)
+    _h_stale_active=$(db_query "
+        SELECT COUNT(*) FROM nodes
+        WHERE status='active'
+        AND datetime(updated_at) < datetime('now', '-7 days');
+    ")
+
+    # Unresolved contradictions
+    _h_contradictions=$(db_query "
+        SELECT COUNT(*) FROM edges
+        WHERE type='contradicts';
+    ")
+
+    # Invalid statuses (wv-01e7 fix)
+    _h_invalid_statuses=$(db_query "
+        SELECT COUNT(*) FROM nodes
+        WHERE status NOT IN ('todo', 'active', 'done', 'blocked', 'blocked-external');
+    ")
+}
+
+# Compute health score from collected metrics. Sets _h_health_score, _h_issues,
+# _h_status_icon, _h_status_text.
+_health_compute_score() {
+    _h_health_score=100
+    _h_issues=""
+
+    if [ "$_h_invalid_statuses" -gt 0 ]; then
+        _h_health_score=$((_h_health_score - _h_invalid_statuses * 20))
+        _h_issues="${_h_issues}invalid_statuses:$_h_invalid_statuses,"
+    fi
+    if [ "$_h_unaddressed_pitfalls" -gt 0 ]; then
+        _h_health_score=$((_h_health_score - _h_unaddressed_pitfalls * 10))
+        _h_issues="${_h_issues}unaddressed_pitfalls:$_h_unaddressed_pitfalls,"
+    fi
+    if [ "$_h_stale_active" -gt 0 ]; then
+        _h_health_score=$((_h_health_score - _h_stale_active * 5))
+        _h_issues="${_h_issues}stale_active:$_h_stale_active,"
+    fi
+    if [ "$_h_contradictions" -gt 0 ]; then
+        _h_health_score=$((_h_health_score - _h_contradictions * 15))
+        _h_issues="${_h_issues}unresolved_contradictions:$_h_contradictions,"
+    fi
+    if [ "$_h_ghost_edges" -gt 0 ]; then
+        local ghost_penalty=30
+        if [ "$_h_total_edges" -gt 0 ]; then
+            ghost_penalty=$(( _h_ghost_edges * 30 / _h_total_edges ))
+            if [ "$ghost_penalty" -gt 30 ]; then ghost_penalty=30; fi
+        fi
+        if [ "$ghost_penalty" -lt 5 ]; then ghost_penalty=5; fi
+        _h_health_score=$((_h_health_score - ghost_penalty))
+        _h_issues="${_h_issues}ghost_edges:$_h_ghost_edges,"
+    fi
+    if [ "$_h_orphan_nodes" -gt 5 ]; then
+        local orphan_penalty=5
+        if [ "$_h_total_nodes" -gt 0 ]; then
+            orphan_penalty=$(( _h_orphan_nodes * 15 / _h_total_nodes ))
+            if [ "$orphan_penalty" -gt 15 ]; then orphan_penalty=15; fi
+        fi
+        if [ "$orphan_penalty" -lt 3 ]; then orphan_penalty=3; fi
+        _h_health_score=$((_h_health_score - orphan_penalty))
+        _h_issues="${_h_issues}orphan_nodes:$_h_orphan_nodes,"
+    fi
+
+    # Clamp to 0-100
+    if [ "$_h_health_score" -lt 0 ]; then _h_health_score=0; fi
+    if [ "$_h_health_score" -gt 100 ]; then _h_health_score=100; fi
+
+    # Status icon/text
+    if [ "$_h_health_score" -ge 90 ]; then
+        _h_status_icon="✅"; _h_status_text="healthy"
+    elif [ "$_h_health_score" -ge 70 ]; then
+        _h_status_icon="⚠️"; _h_status_text="warning"
+    else
+        _h_status_icon="❌"; _h_status_text="unhealthy"
+    fi
+}
+
+# Collect code quality info (informational, does NOT affect main score).
+# Sets _h_quality_* shared variables.
+_health_collect_quality() {
+    _h_quality_available="false"
+    _h_quality_score=0
+    _h_quality_hotspots=0
+    _h_quality_files=0
+    _h_quality_head=""
+    _h_quality_scanned=""
+    local quality_json
+    local _hz_args=()
+    if [ -n "$WV_HOT_ZONE" ]; then _hz_args=("--hot-zone" "$WV_HOT_ZONE"); fi
+    quality_json=$(_wv_quality_python "${_hz_args[@]}" health-info 2>/dev/null || echo '{"available":false}')
+    if echo "$quality_json" | jq -e '.available' >/dev/null 2>&1; then
+        _h_quality_available=$(echo "$quality_json" | jq -r '.available')
+        if [ "$_h_quality_available" = "true" ]; then
+            _h_quality_score=$(echo "$quality_json" | jq -r '.score')
+            _h_quality_hotspots=$(echo "$quality_json" | jq -r '.hotspot_count')
+            _h_quality_files=$(echo "$quality_json" | jq -r '.total_files')
+            _h_quality_head=$(echo "$quality_json" | jq -r '.git_head')
+            _h_quality_scanned=$(echo "$quality_json" | jq -r '.scanned_at')
+        fi
+    fi
+}
+
+# Backfill empty edge context. Sets _h_fixed_edge_ctx count.
+_health_fix_edges() {
+    _h_fixed_edge_ctx=0
+    if [ "${_h_empty_edge_ctx:-0}" -eq 0 ]; then
+        return 0
+    fi
+    while IFS=$'\x1f' read -r src tgt etype src_label tgt_label; do
+        [ -z "$src" ] && continue
+        local ctx
+        ctx=$(jq -nc --arg s "$src_label" --arg t "$tgt_label" --arg e "$etype" \
+            '{summary: ($s + " " + $e + " " + $t), auto: true}')
+        local ctx_escaped="${ctx//\'/\'\'}"
+        db_query "UPDATE edges SET context='$ctx_escaped'
+            WHERE source='$src' AND target='$tgt' AND type='$etype'
+            AND context='{}';"
+        _h_fixed_edge_ctx=$((_h_fixed_edge_ctx + 1))
+    done < <(sqlite3 -batch -cmd ".timeout 5000" -separator $'\x1f' "$WV_DB" \
+        "SELECT e.source, e.target, e.type,
+                COALESCE(s.alias, substr(s.text,1,40)),
+                COALESCE(t.alias, substr(t.text,1,40))
+         FROM edges e
+         JOIN nodes s ON e.source = s.id
+         JOIN nodes t ON e.target = t.id
+         WHERE e.context = '{}';")
+    # Update count after fix
+    _h_empty_edge_ctx=$(db_query "SELECT COUNT(*) FROM edges WHERE context='{}';")
+    _h_empty_edge_ctx="${_h_empty_edge_ctx:-0}"
+}
+
+# Emit health report as JSON. Args: $1=strict flag
+_health_format_json() {
+    local strict="$1"
+    local quality_obj
+    if [ "$_h_quality_available" = "true" ]; then
+        quality_obj=$(jq -n \
+            --argjson score "$_h_quality_score" \
+            --argjson hotspots "$_h_quality_hotspots" \
+            --argjson files "$_h_quality_files" \
+            --arg git_head "$_h_quality_head" \
+            --arg scanned_at "$_h_quality_scanned" \
+            '{available: true, score: $score, hotspot_count: $hotspots, total_files: $files, git_head: $git_head, scanned_at: $scanned_at}')
+    else
+        quality_obj='{"available":false}'
+    fi
+    # shellcheck disable=SC1010  # 'done' is a jq arg name, not the bash keyword
+    jq -n \
+        --arg status "$_h_status_text" \
+        --argjson score "$_h_health_score" \
+        --argjson total_nodes "$_h_total_nodes" \
+        --argjson active "$_h_active" \
+        --argjson ready "$_h_ready" \
+        --argjson blocked "$_h_blocked" \
+        --argjson blocked_external "$_h_blocked_ext" \
+        --argjson done "$_h_done_count" \
+        --argjson pending "$_h_pending" \
+        --argjson total_edges "$_h_total_edges" \
+        --argjson blocking_edges "$_h_blocking_edges" \
+        --argjson total_pitfalls "$_h_total_pitfalls" \
+        --argjson addressed_pitfalls "$_h_addressed_pitfalls" \
+        --argjson unaddressed_pitfalls "$_h_unaddressed_pitfalls" \
+        --argjson orphan_nodes "$_h_orphan_nodes" \
+        --argjson orphan_ids "$_h_orphan_ids" \
+        --argjson ghost_edges "$_h_ghost_edges" \
+        --argjson stale_active "$_h_stale_active" \
+        --argjson contradictions "$_h_contradictions" \
+        --argjson invalid_statuses "$_h_invalid_statuses" \
+        --argjson empty_edge_context "$_h_empty_edge_ctx" \
+        --argjson fixed_edge_context "$_h_fixed_edge_ctx" \
+        --argjson quality "$quality_obj" \
+        '{
+            status: $status,
+            score: $score,
+            nodes: {
+                total: $total_nodes,
+                active: $active,
+                ready: $ready,
+                blocked: $blocked,
+                blocked_external: $blocked_external,
+                done: $done,
+                pending: $pending
+            },
+            edges: {
+                total: $total_edges,
+                blocking: $blocking_edges
+            },
+            pitfalls: {
+                total: $total_pitfalls,
+                addressed: $addressed_pitfalls,
+                unaddressed: $unaddressed_pitfalls
+            },
+            issues: {
+                orphan_nodes: $orphan_nodes,
+                orphan_ids: $orphan_ids,
+                ghost_edges: $ghost_edges,
+                stale_active: $stale_active,
+                unresolved_contradictions: $contradictions,
+                invalid_statuses: $invalid_statuses,
+                empty_edge_context: $empty_edge_context,
+                fixed_edge_context: $fixed_edge_context
+            },
+            code_quality: $quality
+        }'
+}
+
+# Emit health report as text. Args: $1=verbose flag
+_health_format_text() {
+    local verbose="$1"
+
+    echo -e "${CYAN}Weave Health Check${NC} $_h_status_icon"
+    echo ""
+    echo -e "${CYAN}Score:${NC} $_h_health_score/100 ($_h_status_text)"
+    echo ""
+    echo -e "${CYAN}Nodes:${NC}"
+    echo "  Total: $_h_total_nodes"
+    local blocked_line="Active: $_h_active | Ready: $_h_ready | Blocked: $_h_blocked"
+    if [ "$_h_blocked_ext" -gt 0 ]; then
+        blocked_line="${blocked_line} | Blocked-Ext: $_h_blocked_ext"
+    fi
+    echo "  ${blocked_line} | Done: $_h_done_count | Pending: $_h_pending"
+    echo ""
+    echo -e "${CYAN}Edges:${NC}"
+    echo "  Total: $_h_total_edges (blocking: $_h_blocking_edges)"
+    echo ""
+    echo -e "${CYAN}Pitfalls:${NC}"
+    if [ "$_h_unaddressed_pitfalls" -gt 0 ]; then
+        echo -e "  Total: $_h_total_pitfalls | Addressed: $_h_addressed_pitfalls | ${RED}Unaddressed: $_h_unaddressed_pitfalls${NC}"
+    else
+        echo -e "  Total: $_h_total_pitfalls | Addressed: $_h_addressed_pitfalls | ${GREEN}Unaddressed: $_h_unaddressed_pitfalls${NC}"
+    fi
+    echo ""
+    echo -e "${CYAN}Quality:${NC}"
+    if [ "$_h_quality_available" = "true" ]; then
+        echo "  Score: $_h_quality_score/100"
+        echo "  Hotspots: $_h_quality_hotspots files above threshold"
+        echo "  Last scan: $_h_quality_scanned (${_h_quality_head:0:7})"
+    else
+        echo "  no scan data"
+    fi
+
+    if [ "$verbose" = true ]; then
+        echo ""
+        echo -e "${CYAN}Diagnostics:${NC}"
+        echo "  Orphan nodes: $_h_orphan_nodes"
+        echo "  Ghost edges: $_h_ghost_edges"
+        echo "  Stale active (>7d): $_h_stale_active"
+        echo "  Unresolved contradictions: $_h_contradictions"
+        echo "  Invalid statuses: $_h_invalid_statuses"
+        echo "  Empty edge context: $_h_empty_edge_ctx"
+    fi
+
+    # Show issues if any
+    if [ -n "$_h_issues" ] && [ "$_h_health_score" -lt 100 ]; then
+        echo ""
+        echo -e "${YELLOW}Issues:${NC}"
+        if [ "$_h_unaddressed_pitfalls" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_unaddressed_pitfalls unaddressed pitfall(s) - run 'wv audit-pitfalls'"; fi
+        if [ "$_h_stale_active" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_stale_active node(s) active >7 days - consider completing or closing"; fi
+        if [ "$_h_contradictions" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_contradictions unresolved contradiction(s) - run 'wv edges <id>' to inspect"; fi
+        if [ "$_h_ghost_edges" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_ghost_edges ghost edge(s) referencing deleted nodes - run 'wv clean-ghosts'"; fi
+        if [ "$_h_orphan_nodes" -gt 5 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_orphan_nodes orphan node(s) with no edges - consider linking or pruning"; fi
+        if [ "$_h_invalid_statuses" -gt 0 ]; then echo -e "  ${RED}✗${NC} $_h_invalid_statuses node(s) with invalid status - run 'wv update <id> --status=todo' to fix"; fi
+        if [ "$_h_empty_edge_ctx" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_empty_edge_ctx edge(s) missing context - run 'wv health --fix' to backfill"; fi
+        if [ "$_h_fixed_edge_ctx" -gt 0 ]; then echo -e "  ${GREEN}✓${NC} Fixed: enriched $_h_fixed_edge_ctx edge(s) with auto-context (marked auto:true)"; fi
+    fi
+}
 
 cmd_health() {
     local format="text"
@@ -1274,374 +1637,51 @@ cmd_health() {
 
     # Handle --history: show log and exit
     if [ "$history_count" -gt 0 ] 2>/dev/null; then
-        local log_file="$WEAVE_DIR/health.log"
-        if [ ! -f "$log_file" ]; then
-            echo "No health history yet. Run 'wv health' to start logging."
-            return 0
-        fi
-        local total
-        total=$(wc -l < "$log_file")
-        if [ "$format" = "json" ]; then
-            tail -n "$history_count" "$log_file" | awk -F'\t' '{
-                printf "{\"timestamp\":\"%s\",\"score\":%s,\"nodes\":%s,\"edges\":%s,\"orphans\":%s,\"ghost_edges\":%s}\n", $1, $2, $3, $4, $5, $6
-            }' | jq -s '.'
-        else
-            echo -e "${CYAN}Health History${NC} (last $history_count of $total entries)"
-            echo ""
-            printf "  %-25s %5s %5s %5s %7s %11s\n" "Timestamp" "Score" "Nodes" "Edges" "Orphans" "Ghost Edges"
-            printf "  %-25s %5s %5s %5s %7s %11s\n" "─────────────────────────" "─────" "─────" "─────" "───────" "───────────"
-            tail -n "$history_count" "$log_file" | while IFS=$'\t' read -r ts score nodes edges orphans ghosts; do
-                local icon="✅"
-                [ "$score" -lt 90 ] 2>/dev/null && icon="⚠️"
-                [ "$score" -lt 70 ] 2>/dev/null && icon="❌"
-                printf "  %-25s %3s %s %5s %5s %7s %11s\n" "$ts" "$score" "$icon" "$nodes" "$edges" "$orphans" "$ghosts"
-            done
-        fi
+        _health_show_history "$history_count" "$format"
         return 0
     fi
-    
-    # Collect metrics (with fallbacks for empty results)
-    local total_nodes=$(db_query "SELECT COUNT(*) FROM nodes;" 2>/dev/null)
-    total_nodes="${total_nodes:-0}"
-    local active=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active';" 2>/dev/null)
-    active="${active:-0}"
-    local ready=$(cmd_ready --count 2>/dev/null)
-    ready="${ready:-0}"
-    local blocked=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='blocked';" 2>/dev/null)
-    blocked="${blocked:-0}"
-    local blocked_ext=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='blocked-external';" 2>/dev/null)
-    blocked_ext="${blocked_ext:-0}"
-    local done_count=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='done';" 2>/dev/null)
-    done_count="${done_count:-0}"
-    local pending=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='pending';" 2>/dev/null)
-    pending="${pending:-0}"
-    
-    # Edge stats
-    local total_edges=$(db_query "SELECT COUNT(*) FROM edges;" 2>/dev/null)
-    total_edges="${total_edges:-0}"
-    local blocking_edges=$(db_query "SELECT COUNT(*) FROM edges WHERE type='blocks';" 2>/dev/null)
-    blocking_edges="${blocking_edges:-0}"
-    
-    # Pitfall stats
-    local total_pitfalls=$(db_query "
-        SELECT COUNT(*) FROM nodes 
-        WHERE json_extract(metadata, '\$.pitfall') IS NOT NULL;
-    ")
-    local addressed_pitfalls=$(db_query "
-        SELECT COUNT(DISTINCT n.id) FROM nodes n
-        JOIN edges e ON e.target = n.id
-        WHERE json_extract(n.metadata, '\$.pitfall') IS NOT NULL
-        AND e.type IN ('addresses', 'implements', 'supersedes');
-    ")
-    local unaddressed_pitfalls=$((total_pitfalls - addressed_pitfalls))
-    
-    # Orphan nodes (no edges at all)
-    local orphan_nodes=$(db_query "
-        SELECT COUNT(*) FROM nodes n
-        WHERE n.id NOT IN (SELECT source FROM edges)
-        AND n.id NOT IN (SELECT target FROM edges);
-    ")
-    local orphan_ids
-    orphan_ids=$(db_query "
-        SELECT json_group_array(n.id) FROM nodes n
-        WHERE n.id NOT IN (SELECT source FROM edges)
-        AND n.id NOT IN (SELECT target FROM edges);
-    ")
-    orphan_ids="${orphan_ids:-[]}"
-    
-    # Ghost edges (referencing non-existent nodes)
-    local ghost_edges=$(db_query "
-        SELECT COUNT(*) FROM edges
-        WHERE source NOT IN (SELECT id FROM nodes)
-        OR target NOT IN (SELECT id FROM nodes);
-    ")
 
-    # Empty edge context
-    local empty_edge_ctx=$(db_query "SELECT COUNT(*) FROM edges WHERE context='{}';")
-    empty_edge_ctx="${empty_edge_ctx:-0}"
-    
-    # Stale active nodes (active for more than 7 days)
-    local stale_active=$(db_query "
-        SELECT COUNT(*) FROM nodes 
-        WHERE status='active' 
-        AND datetime(updated_at) < datetime('now', '-7 days');
-    ")
-    
-    # Unresolved contradictions
-    local contradictions=$(db_query "
-        SELECT COUNT(*) FROM edges 
-        WHERE type='contradicts';
-    ")
-    
-    # Check for invalid statuses (wv-01e7 fix)
-    local invalid_statuses
-    invalid_statuses=$(db_query "
-        SELECT COUNT(*) FROM nodes
-        WHERE status NOT IN ('todo', 'active', 'done', 'blocked', 'blocked-external');
-    ")
-    
-    # Health score calculation (0-100)
-    local health_score=100
-    local issues=""
-    
-    # Deduct points for issues
-    if [ "$invalid_statuses" -gt 0 ]; then
-        health_score=$((health_score - invalid_statuses * 20))
-        issues="${issues}invalid_statuses:$invalid_statuses,"
-    fi
-    if [ "$unaddressed_pitfalls" -gt 0 ]; then
-        health_score=$((health_score - unaddressed_pitfalls * 10))
-        issues="${issues}unaddressed_pitfalls:$unaddressed_pitfalls,"
-    fi
-    if [ "$stale_active" -gt 0 ]; then
-        health_score=$((health_score - stale_active * 5))
-        issues="${issues}stale_active:$stale_active,"
-    fi
-    if [ "$contradictions" -gt 0 ]; then
-        health_score=$((health_score - contradictions * 15))
-        issues="${issues}unresolved_contradictions:$contradictions,"
-    fi
-    if [ "$ghost_edges" -gt 0 ]; then
-        # Proportional penalty: ghost_ratio * 30, capped at 30
-        # e.g. 50 ghosts / 134 total = 37% → penalty = min(11, 30) = 11
-        local ghost_penalty=30
-        if [ "$total_edges" -gt 0 ]; then
-            ghost_penalty=$(( ghost_edges * 30 / total_edges ))
-            [ "$ghost_penalty" -gt 30 ] && ghost_penalty=30
-        fi
-        [ "$ghost_penalty" -lt 5 ] && ghost_penalty=5  # minimum 5 if any ghosts exist
-        health_score=$((health_score - ghost_penalty))
-        issues="${issues}ghost_edges:$ghost_edges,"
-    fi
-    if [ "$orphan_nodes" -gt 5 ]; then
-        # Proportional penalty: orphan_ratio * 15, capped at 15
-        local orphan_penalty=5
-        if [ "$total_nodes" -gt 0 ]; then
-            orphan_penalty=$(( orphan_nodes * 15 / total_nodes ))
-            [ "$orphan_penalty" -gt 15 ] && orphan_penalty=15
-        fi
-        [ "$orphan_penalty" -lt 3 ] && orphan_penalty=3  # minimum 3 if threshold exceeded
-        health_score=$((health_score - orphan_penalty))
-        issues="${issues}orphan_nodes:$orphan_nodes,"
-    fi
-    
-    # Clamp to 0-100
-    [ "$health_score" -lt 0 ] && health_score=0
-    [ "$health_score" -gt 100 ] && health_score=100
+    # Collect all metrics, compute score, gather quality info
+    _health_collect_metrics
+    _health_compute_score
+    _health_collect_quality
 
     # Append to health history log (TSV: timestamp, score, nodes, edges, orphans, ghost_edges)
     local log_file="$WEAVE_DIR/health.log"
     mkdir -p "$WEAVE_DIR"
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%S)" \
-        "$health_score" "$total_nodes" "$total_edges" \
-        "$orphan_nodes" "$ghost_edges" >> "$log_file"
+        "$_h_health_score" "$_h_total_nodes" "$_h_total_edges" \
+        "$_h_orphan_nodes" "$_h_ghost_edges" >> "$log_file"
 
     # Backfill empty edge context if --fix
-    local fixed_edge_ctx=0
-    if [ "$fix" = "true" ] && [ "${empty_edge_ctx:-0}" -gt 0 ]; then
-        while IFS=$'\x1f' read -r src tgt etype src_label tgt_label; do
-            [ -z "$src" ] && continue
-            local ctx
-            ctx=$(jq -nc --arg s "$src_label" --arg t "$tgt_label" --arg e "$etype" \
-                '{summary: ($s + " " + $e + " " + $t), auto: true}')
-            local ctx_escaped="${ctx//\'/\'\'}"
-            db_query "UPDATE edges SET context='$ctx_escaped'
-                WHERE source='$src' AND target='$tgt' AND type='$etype'
-                AND context='{}';"
-            fixed_edge_ctx=$((fixed_edge_ctx + 1))
-        done < <(sqlite3 -batch -cmd ".timeout 5000" -separator $'\x1f' "$WV_DB" \
-            "SELECT e.source, e.target, e.type,
-                    COALESCE(s.alias, substr(s.text,1,40)),
-                    COALESCE(t.alias, substr(t.text,1,40))
-             FROM edges e
-             JOIN nodes s ON e.source = s.id
-             JOIN nodes t ON e.target = t.id
-             WHERE e.context = '{}';")
-        # Update count after fix
-        empty_edge_ctx=$(db_query "SELECT COUNT(*) FROM edges WHERE context='{}';")
-        empty_edge_ctx="${empty_edge_ctx:-0}"
+    if [ "$fix" = "true" ]; then
+        _health_fix_edges
     fi
 
-    # Determine status emoji/text
-    local status_icon status_text
-    if [ "$health_score" -ge 90 ]; then
-        status_icon="✅"
-        status_text="healthy"
-    elif [ "$health_score" -ge 70 ]; then
-        status_icon="⚠️"
-        status_text="warning"
-    else
-        status_icon="❌"
-        status_text="unhealthy"
-    fi
-    
-    # Collect code quality info (informational, does NOT affect main score)
-    local quality_available="false"
-    local quality_score=0
-    local quality_hotspots=0
-    local quality_files=0
-    local quality_head=""
-    local quality_scanned=""
-    local quality_json
-    local _hz_args=()
-    [ -n "$WV_HOT_ZONE" ] && _hz_args=("--hot-zone" "$WV_HOT_ZONE")
-    quality_json=$(_wv_quality_python "${_hz_args[@]}" health-info 2>/dev/null || echo '{"available":false}')
-    if echo "$quality_json" | jq -e '.available' >/dev/null 2>&1; then
-        quality_available=$(echo "$quality_json" | jq -r '.available')
-        if [ "$quality_available" = "true" ]; then
-            quality_score=$(echo "$quality_json" | jq -r '.score')
-            quality_hotspots=$(echo "$quality_json" | jq -r '.hotspot_count')
-            quality_files=$(echo "$quality_json" | jq -r '.total_files')
-            quality_head=$(echo "$quality_json" | jq -r '.git_head')
-            quality_scanned=$(echo "$quality_json" | jq -r '.scanned_at')
-        fi
-    fi
-
+    # Format output
     if [ "$format" = "json" ]; then
-        local quality_obj
-        if [ "$quality_available" = "true" ]; then
-            quality_obj=$(jq -n \
-                --argjson score "$quality_score" \
-                --argjson hotspots "$quality_hotspots" \
-                --argjson files "$quality_files" \
-                --arg git_head "$quality_head" \
-                --arg scanned_at "$quality_scanned" \
-                '{available: true, score: $score, hotspot_count: $hotspots, total_files: $files, git_head: $git_head, scanned_at: $scanned_at}')
-        else
-            quality_obj='{"available":false}'
-        fi
-        # shellcheck disable=SC1010  # 'done' is a jq arg name, not the bash keyword
-        jq -n \
-            --arg status "$status_text" \
-            --argjson score "$health_score" \
-            --argjson total_nodes "$total_nodes" \
-            --argjson active "$active" \
-            --argjson ready "$ready" \
-            --argjson blocked "$blocked" \
-            --argjson blocked_external "$blocked_ext" \
-            --argjson done "$done_count" \
-            --argjson pending "$pending" \
-            --argjson total_edges "$total_edges" \
-            --argjson blocking_edges "$blocking_edges" \
-            --argjson total_pitfalls "$total_pitfalls" \
-            --argjson addressed_pitfalls "$addressed_pitfalls" \
-            --argjson unaddressed_pitfalls "$unaddressed_pitfalls" \
-            --argjson orphan_nodes "$orphan_nodes" \
-            --argjson orphan_ids "$orphan_ids" \
-            --argjson ghost_edges "$ghost_edges" \
-            --argjson stale_active "$stale_active" \
-            --argjson contradictions "$contradictions" \
-            --argjson invalid_statuses "$invalid_statuses" \
-            --argjson empty_edge_context "$empty_edge_ctx" \
-            --argjson fixed_edge_context "$fixed_edge_ctx" \
-            --argjson quality "$quality_obj" \
-            '{
-                status: $status,
-                score: $score,
-                nodes: {
-                    total: $total_nodes,
-                    active: $active,
-                    ready: $ready,
-                    blocked: $blocked,
-                    blocked_external: $blocked_external,
-                    done: $done,
-                    pending: $pending
-                },
-                edges: {
-                    total: $total_edges,
-                    blocking: $blocking_edges
-                },
-                pitfalls: {
-                    total: $total_pitfalls,
-                    addressed: $addressed_pitfalls,
-                    unaddressed: $unaddressed_pitfalls
-                },
-                issues: {
-                    orphan_nodes: $orphan_nodes,
-                    orphan_ids: $orphan_ids,
-                    ghost_edges: $ghost_edges,
-                    stale_active: $stale_active,
-                    unresolved_contradictions: $contradictions,
-                    invalid_statuses: $invalid_statuses,
-                    empty_edge_context: $empty_edge_context,
-                    fixed_edge_context: $fixed_edge_context
-                },
-                code_quality: $quality
-            }'
+        _health_format_json "$strict"
         # JSON callers parse the output — exit 0 unless --strict
-        if [ "$invalid_statuses" -gt 0 ] || [ "$contradictions" -gt 0 ]; then
+        if [ "$_h_invalid_statuses" -gt 0 ] || [ "$_h_contradictions" -gt 0 ]; then
             return 1
         fi
-        if [ "$strict" = true ] && [ "$health_score" -lt 100 ]; then
+        if [ "$strict" = true ] && [ "$_h_health_score" -lt 100 ]; then
             return 1
         fi
         return 0
     fi
-    
-    # Text output
-    echo -e "${CYAN}Weave Health Check${NC} $status_icon"
-    echo ""
-    echo -e "${CYAN}Score:${NC} $health_score/100 ($status_text)"
-    echo ""
-    echo -e "${CYAN}Nodes:${NC}"
-    echo "  Total: $total_nodes"
-    local blocked_line="Active: $active | Ready: $ready | Blocked: $blocked"
-    [ "$blocked_ext" -gt 0 ] && blocked_line="${blocked_line} | Blocked-Ext: $blocked_ext"
-    echo "  ${blocked_line} | Done: $done_count | Pending: $pending"
-    echo ""
-    echo -e "${CYAN}Edges:${NC}"
-    echo "  Total: $total_edges (blocking: $blocking_edges)"
-    echo ""
-    echo -e "${CYAN}Pitfalls:${NC}"
-    if [ "$unaddressed_pitfalls" -gt 0 ]; then
-        echo -e "  Total: $total_pitfalls | Addressed: $addressed_pitfalls | ${RED}Unaddressed: $unaddressed_pitfalls${NC}"
-    else
-        echo -e "  Total: $total_pitfalls | Addressed: $addressed_pitfalls | ${GREEN}Unaddressed: $unaddressed_pitfalls${NC}"
-    fi
-    echo ""
-    echo -e "${CYAN}Quality:${NC}"
-    if [ "$quality_available" = "true" ]; then
-        echo "  Score: $quality_score/100"
-        echo "  Hotspots: $quality_hotspots files above threshold"
-        echo "  Last scan: $quality_scanned (${quality_head:0:7})"
-    else
-        echo "  no scan data"
-    fi
-    
-    if [ "$verbose" = true ]; then
-        echo ""
-        echo -e "${CYAN}Diagnostics:${NC}"
-        echo "  Orphan nodes: $orphan_nodes"
-        echo "  Ghost edges: $ghost_edges"
-        echo "  Stale active (>7d): $stale_active"
-        echo "  Unresolved contradictions: $contradictions"
-        echo "  Invalid statuses: $invalid_statuses"
-        echo "  Empty edge context: $empty_edge_ctx"
-    fi
-    
-    # Show issues if any
-    if [ -n "$issues" ] && [ "$health_score" -lt 100 ]; then
-        echo ""
-        echo -e "${YELLOW}Issues:${NC}"
-        [ "$unaddressed_pitfalls" -gt 0 ] && echo -e "  ${YELLOW}⚠${NC} $unaddressed_pitfalls unaddressed pitfall(s) - run 'wv audit-pitfalls'"
-        [ "$stale_active" -gt 0 ] && echo -e "  ${YELLOW}⚠${NC} $stale_active node(s) active >7 days - consider completing or closing"
-        [ "$contradictions" -gt 0 ] && echo -e "  ${YELLOW}⚠${NC} $contradictions unresolved contradiction(s) - run 'wv edges <id>' to inspect"
-        [ "$ghost_edges" -gt 0 ] && echo -e "  ${YELLOW}⚠${NC} $ghost_edges ghost edge(s) referencing deleted nodes - run 'wv clean-ghosts'"
-        [ "$orphan_nodes" -gt 5 ] && echo -e "  ${YELLOW}⚠${NC} $orphan_nodes orphan node(s) with no edges - consider linking or pruning"
-        [ "$invalid_statuses" -gt 0 ] && echo -e "  ${RED}✗${NC} $invalid_statuses node(s) with invalid status - run 'wv update <id> --status=todo' to fix"
-        [ "$empty_edge_ctx" -gt 0 ] && echo -e "  ${YELLOW}⚠${NC} $empty_edge_ctx edge(s) missing context - run 'wv health --fix' to backfill"
-        [ "$fixed_edge_ctx" -gt 0 ] && echo -e "  ${GREEN}✓${NC} Fixed: enriched $fixed_edge_ctx edge(s) with auto-context (marked auto:true)"
-    fi
+
+    _health_format_text "$verbose"
 
     # Exit code logic:
     # - Default: exit 0 (warnings are informational, not errors)
     # - --strict: exit 1 if score < 100 (for CI fail-on-warning)
     # - Always exit 1 for true errors: invalid statuses, contradictions
-    if [ "$invalid_statuses" -gt 0 ] || [ "$contradictions" -gt 0 ]; then
+    if [ "$_h_invalid_statuses" -gt 0 ] || [ "$_h_contradictions" -gt 0 ]; then
         return 1
     fi
-    if [ "$strict" = true ] && [ "$health_score" -lt 100 ]; then
+    if [ "$strict" = true ] && [ "$_h_health_score" -lt 100 ]; then
         return 1
     fi
     return 0

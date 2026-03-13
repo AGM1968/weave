@@ -25,14 +25,15 @@ fi
 
 # Auto-commit .weave/ state to break drift cycle
 # (prevents stop-check blocking on dirty .weave/ from sync/prune above)
-# Rate-limit: skip if last checkpoint was < 5 minutes ago (session-end is always committed)
-_LAST_CP=$(git log -1 --format=%ct --grep='auto-checkpoint\|pre-compact checkpoint' 2>/dev/null || echo 0)
+# Always amend the most recent checkpoint if one exists in this session (within 2h).
+# This collapses all session-end state into a single checkpoint commit.
+_LAST_CP=$(git log -1 --format=%ct --grep='auto-checkpoint\|pre-compact checkpoint\|sync state' 2>/dev/null || echo 0)
 _NOW=$(date +%s)
 _ELAPSED=$((_NOW - _LAST_CP))
 git add .weave/ 2>/dev/null || true
 if ! git diff --cached --quiet 2>/dev/null; then
-    if [ "$_ELAPSED" -lt 300 ]; then
-        # Recent checkpoint exists — amend it instead of creating new commit
+    if [ "$_ELAPSED" -lt 7200 ]; then
+        # Recent checkpoint exists within session window — amend it
         git commit --amend --no-edit --no-verify 2>/dev/null || \
             git commit -m "chore(weave): auto-checkpoint $(date +%H:%M) [skip ci]" --no-verify 2>/dev/null || true
     else
