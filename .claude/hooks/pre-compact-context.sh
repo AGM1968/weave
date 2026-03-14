@@ -24,7 +24,8 @@ WV_DB="${WV_DB:-/dev/shm/weave/${_REPO_HASH}/brain.db}"
 _LAST_CP=$(git log -1 --format=%ct --grep='auto-checkpoint\|pre-compact checkpoint\|sync state' 2>/dev/null || echo 0)
 _NOW=$(date +%s)
 _ELAPSED=$((_NOW - _LAST_CP))
-if [ "$_ELAPSED" -lt 600 ]; then
+_PC_INTERVAL="${WV_CHECKPOINT_INTERVAL:-600}"
+if [ "$_ELAPSED" -lt "$_PC_INTERVAL" ]; then
     # Skip checkpoint — too recent
     :
 else

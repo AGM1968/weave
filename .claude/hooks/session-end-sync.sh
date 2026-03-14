@@ -36,8 +36,11 @@ _NOW=$(date +%s)
 _ELAPSED=$((_NOW - _LAST_CP))
 git add .weave/ 2>/dev/null || true
 if ! git diff --cached --quiet 2>/dev/null; then
-    if [ "$_ELAPSED" -lt 7200 ]; then
-        # Recent checkpoint exists within session window — amend it
+    _SE_BRANCH=$(git branch --show-current 2>/dev/null || echo "main")
+    _SE_LOCAL_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+    _SE_REMOTE_HEAD=$(git rev-parse "origin/$_SE_BRANCH" 2>/dev/null || echo "none")
+    if [ "$_ELAPSED" -lt 7200 ] && [ "$_SE_LOCAL_HEAD" != "$_SE_REMOTE_HEAD" ]; then
+        # Recent checkpoint exists and hasn't been pushed — safe to amend
         git commit --amend --no-edit --no-verify 2>/dev/null || \
             git commit -m "chore(weave): auto-checkpoint $(date +%H:%M) [skip ci]" --no-verify 2>/dev/null || true
     else

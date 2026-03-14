@@ -92,6 +92,16 @@ auto_sync() {
 
     sqlite3 -cmd ".timeout 5000" "$WV_DB" ".dump" 2>/dev/null | strip_unistr > "$tmp_sql"
     [ -s "$tmp_sql" ] || { rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; return 0; }
+
+    # No-op detection: skip jsonl generation + checkpoint if state unchanged.
+    # Works without warp-session — pure file compare after dump.
+    if [ -f "$WEAVE_DIR/state.sql" ] && cmp -s "$tmp_sql" "$WEAVE_DIR/state.sql"; then
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        warp-session reset "$WV_DB" 2>/dev/null || true
+        echo "$now" > "$stamp_file"
+        return 0
+    fi
+
     db_query_json "SELECT * FROM nodes;" 2>/dev/null | jq -c '.[]' > "$tmp_nodes" 2>/dev/null || true
     db_query_json "SELECT * FROM edges;" 2>/dev/null | jq -c '.[]' > "$tmp_edges" 2>/dev/null || true
 
@@ -340,8 +350,14 @@ cmd_sync() {
             _sync_now=$(date +%s)
             _sync_last_cp=$(git -C "$git_root" log -1 --format=%ct --grep='auto-checkpoint\|pre-compact checkpoint\|sync state' 2>/dev/null || echo 0)
             _sync_elapsed=$((_sync_now - _sync_last_cp))
-            if [ "$_sync_elapsed" -lt "$WV_CHECKPOINT_INTERVAL" ] && [ "$WV_CHECKPOINT_INTERVAL" -gt 0 ]; then
-                # Recent checkpoint exists — amend instead of creating new commit
+            # Safe amend: only if recent checkpoint exists AND hasn't been pushed
+            local _sync_branch _sync_local_head _sync_remote_head
+            _sync_branch=$(git -C "$git_root" branch --show-current 2>/dev/null || echo "main")
+            _sync_local_head=$(git -C "$git_root" rev-parse HEAD 2>/dev/null || echo "")
+            _sync_remote_head=$(git -C "$git_root" rev-parse "origin/$_sync_branch" 2>/dev/null || echo "none")
+            if [ "$_sync_elapsed" -lt "$WV_CHECKPOINT_INTERVAL" ] && [ "$WV_CHECKPOINT_INTERVAL" -gt 0 ] \
+               && [ "$_sync_local_head" != "$_sync_remote_head" ]; then
+                # Recent unpushed checkpoint — safe to amend
                 git -C "$git_root" commit --amend --no-edit \
                     --no-verify --quiet 2>/dev/null || \
                 git -C "$git_root" commit \

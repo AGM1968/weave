@@ -2,6 +2,20 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.22.2] - 2026-03-14
+
+### Fixed
+
+- **No-op sync detection without warp-session** — `auto_sync()` now compares dump output against
+  existing `state.sql` via `cmp -s` before proceeding. When state is unchanged, skips jsonl
+  generation and `auto_checkpoint` entirely. Gives public Weave users (no `warp-session` binary)
+  elimination of noise commits from unchanged state.
+- **Safe amend guards** — `cmd_sync` final commit and `session-end-sync.sh` now check if HEAD has
+  been pushed before amending. If `HEAD == origin/<branch>`, creates a new commit instead of
+  amending, preventing non-fast-forward divergence after `git push`.
+- **PreCompact respects `WV_CHECKPOINT_INTERVAL`** — Replaced hardcoded 600s throttle with
+  `${WV_CHECKPOINT_INTERVAL:-600}`, consistent with `auto_checkpoint()` and `cmd_sync`.
+
 ## [1.22.1] - 2026-03-14
 
 ### Fixed
