@@ -68,7 +68,22 @@ auto_sync() {
         fi
     fi
 
-    # Perform silent sync
+    # O(1) change detection: skip entirely if nothing changed (warp-session)
+    if command -v warp-session >/dev/null 2>&1; then
+        if ! warp-session has-changes "$WV_DB" 2>/dev/null; then
+            return 0  # Nothing changed — no dump, no commit, no noise
+        fi
+    fi
+
+    # Persist delta changeset (O(changes) — only what changed)
+    if command -v warp-session >/dev/null 2>&1; then
+        mkdir -p "$WEAVE_DIR/deltas"
+        warp-session changeset "$WV_DB" > "$WEAVE_DIR/deltas/${now}.sql" 2>/dev/null || true
+        # Remove empty delta files
+        [ -s "$WEAVE_DIR/deltas/${now}.sql" ] || rm -f "$WEAVE_DIR/deltas/${now}.sql"
+    fi
+
+    # Perform silent sync (full dump — kept for audit trail)
     mkdir -p "$WEAVE_DIR"
     local tmp_sql tmp_nodes tmp_edges
     tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
@@ -83,6 +98,9 @@ auto_sync() {
     mv "$tmp_sql" "$WEAVE_DIR/state.sql"
     mv "$tmp_nodes" "$WEAVE_DIR/nodes.jsonl"
     mv "$tmp_edges" "$WEAVE_DIR/edges.jsonl"
+
+    # Reset change tracking after successful persist
+    warp-session reset "$WV_DB" 2>/dev/null || true
 
     echo "$now" > "$stamp_file"
 
@@ -104,11 +122,21 @@ auto_checkpoint() {
     local now="${1:-$(date +%s)}"
     local cp_stamp="$WV_HOT_ZONE/.last_checkpoint"
 
-    # Throttle: checkpoint at most once per WV_CHECKPOINT_INTERVAL
+    # Throttle: checkpoint at most once per WV_CHECKPOINT_INTERVAL.
+    # Primary: stamp file (fast, O(1)). Fallback: git log (survives reboot/new session).
     if [ -f "$cp_stamp" ]; then
         local last_cp
         last_cp=$(cat "$cp_stamp" 2>/dev/null || echo "0")
         if [ $(( now - last_cp )) -lt "$WV_CHECKPOINT_INTERVAL" ]; then
+            return 0
+        fi
+    else
+        # No stamp file (first call in session / after reboot) — check git history
+        local last_git_cp
+        last_git_cp=$(git log -1 --format=%ct --grep='auto-checkpoint\|pre-compact checkpoint\|sync state' 2>/dev/null || echo 0)
+        if [ $(( now - last_git_cp )) -lt "$WV_CHECKPOINT_INTERVAL" ]; then
+            # Recent checkpoint in git — seed stamp and skip
+            echo "$last_git_cp" > "$cp_stamp"
             return 0
         fi
     fi
@@ -301,14 +329,31 @@ cmd_sync() {
 
     # Uses --no-verify to bypass pre-commit hook (no active node needed for .weave/-only commits).
     # Only commits if .weave/ is still dirty after auto_checkpoint (e.g., GH sync changed state).
+    # Throttled: skip if auto_checkpoint already committed recently (prevents double-commit).
     local git_root
     git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
     if [ -n "$git_root" ] && [ -d "$git_root/.weave" ]; then
         git -C "$git_root" add .weave/ >/dev/null 2>&1 || true
         if ! git -C "$git_root" diff --cached --quiet 2>/dev/null; then
-            git -C "$git_root" commit \
-                -m "chore(weave): sync state [skip ci]" \
-                --no-verify --quiet 2>/dev/null || true
+            # Check if auto_checkpoint just committed (within throttle window)
+            local _sync_now _sync_last_cp _sync_elapsed
+            _sync_now=$(date +%s)
+            _sync_last_cp=$(git -C "$git_root" log -1 --format=%ct --grep='auto-checkpoint\|pre-compact checkpoint\|sync state' 2>/dev/null || echo 0)
+            _sync_elapsed=$((_sync_now - _sync_last_cp))
+            if [ "$_sync_elapsed" -lt "$WV_CHECKPOINT_INTERVAL" ] && [ "$WV_CHECKPOINT_INTERVAL" -gt 0 ]; then
+                # Recent checkpoint exists — amend instead of creating new commit
+                git -C "$git_root" commit --amend --no-edit \
+                    --no-verify --quiet 2>/dev/null || \
+                git -C "$git_root" commit \
+                    -m "chore(weave): sync state [skip ci]" \
+                    --no-verify --quiet 2>/dev/null || true
+            else
+                git -C "$git_root" commit \
+                    -m "chore(weave): sync state [skip ci]" \
+                    --no-verify --quiet 2>/dev/null || true
+            fi
+            # Update checkpoint stamp so auto_checkpoint respects this commit
+            echo "$_sync_now" > "$WV_HOT_ZONE/.last_checkpoint" 2>/dev/null || true
         fi
     fi
 
@@ -389,9 +434,17 @@ EOF
         db_migrate_alias
         # Migrate to virtual columns (Tier 1)
         db_migrate_virtual_columns
+        # Initialize warp-session change tracking (idempotent)
+        if command -v warp-session >/dev/null 2>&1; then
+            warp-session init "$WV_DB" 2>/dev/null || true
+        fi
         echo -e "${GREEN}✓${NC} Loaded from $WEAVE_DIR/state.sql" >&2
     else
         db_init
+        # Initialize warp-session change tracking (idempotent)
+        if command -v warp-session >/dev/null 2>&1; then
+            warp-session init "$WV_DB" 2>/dev/null || true
+        fi
         echo -e "${YELLOW}No state.sql found, initialized empty database${NC}" >&2
     fi
 

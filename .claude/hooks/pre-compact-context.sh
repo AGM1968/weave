@@ -10,6 +10,11 @@ source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR
 cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 [ -x "$WV" ] || exit 0
 
+# Per-repo DB namespace: derive from git root hash (needed for stamp file + DB path)
+_REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+_REPO_HASH=$(echo "$_REPO_ROOT" | md5sum | cut -c1-8)
+WV_DB="${WV_DB:-/dev/shm/weave/${_REPO_HASH}/brain.db}"
+
 # Safety commit: save in-progress code before context compaction
 # Prevents work loss if session hits limits after compact
 "$WV" sync 2>/dev/null || true
@@ -26,6 +31,8 @@ else
     git add .weave/ 2>/dev/null || true
     if ! git diff --cached --quiet 2>/dev/null; then
         git commit -m "wip: pre-compact checkpoint $(date +%H:%M) [skip ci]" --no-verify 2>/dev/null || true
+        # Update checkpoint stamp so auto_checkpoint sees this commit
+        echo "$_NOW" > "/dev/shm/weave/${_REPO_HASH}/.last_checkpoint" 2>/dev/null || true
     fi
 fi
 
@@ -33,10 +40,6 @@ fi
 STATUS=$("$WV" status 2>/dev/null) || exit 0
 
 # Active nodes with full text (these are what we're working on right now)
-# Per-repo DB namespace: derive from git root hash
-_REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-_REPO_HASH=$(echo "$_REPO_ROOT" | md5sum | cut -c1-8)
-WV_DB="${WV_DB:-/dev/shm/weave/${_REPO_HASH}/brain.db}"
 
 ACTIVE=$(sqlite3 -json "$WV_DB" "
     SELECT id, text, json_extract(metadata, '$.type') as type

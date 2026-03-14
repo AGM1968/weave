@@ -23,6 +23,10 @@ if [ -x "$WV" ]; then
     "$WV" prune --age=48h 2>/dev/null || true
 fi
 
+# Derive hot zone path (shared across checkpoint stamp + sentinel cleanup)
+_SE_REPO_HASH=$(echo "$WV_PROJECT_DIR" | md5sum | cut -c1-8)
+_SE_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_SE_REPO_HASH}}"
+
 # Auto-commit .weave/ state to break drift cycle
 # (prevents stop-check blocking on dirty .weave/ from sync/prune above)
 # Always amend the most recent checkpoint if one exists in this session (within 2h).
@@ -39,6 +43,8 @@ if ! git diff --cached --quiet 2>/dev/null; then
     else
         git commit -m "chore(weave): auto-checkpoint $(date +%H:%M) [skip ci]" --no-verify 2>/dev/null || true
     fi
+    # Update checkpoint stamp so auto_checkpoint sees this commit
+    echo "$_NOW" > "${_SE_HOT_ZONE}/.last_checkpoint" 2>/dev/null || true
 fi
 
 # Push to remote (best effort — stop-check already validates clean state)
@@ -49,8 +55,6 @@ echo "[$(date -Iseconds)] Session ended: $REASON" >> .claude/session.log 2>/dev/
 
 # Clear crash sentinel on clean shutdown (must be LAST — if sync/push failed
 # and stop-check blocked exit, sentinel persists for next session detection)
-_SE_REPO_HASH=$(echo "$WV_PROJECT_DIR" | md5sum | cut -c1-8)
-_SE_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_SE_REPO_HASH}}"
 rm -f "${_SE_HOT_ZONE}/.session_sentinel"
 
 exit 0

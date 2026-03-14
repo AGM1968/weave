@@ -2,6 +2,27 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.22.1] - 2026-03-14
+
+### Fixed
+
+- **Checkpoint rate-limiting fully unified** — `auto_checkpoint()` now falls back to
+  `git log --grep` when stamp file is missing (first call in session / after reboot), preventing the
+  first checkpoint from always firing. `cmd_sync` final commit now checks throttle window and amends
+  instead of creating a new commit. All hooks (SessionEnd, PreCompact) now update the stamp file
+  after committing, so `auto_checkpoint()` sees them.
+- **`wv-init-repo --force` preserves user Makefile targets** — Previously overwrote the entire
+  Makefile; now only replaces the `BEGIN WEAVE TARGETS` block and preserves user-added targets.
+
+### Added
+
+- **warp-session integration** — `auto_sync()` uses `warp-session has-changes` for O(1) change
+  detection (skips dump entirely if nothing changed) and `warp-session reset` after persist.
+  `cmd_load()` calls `warp-session init` after migrations. All calls gracefully fall back if
+  `warp-session` is not on PATH.
+- **Delta persistence** — `auto_sync()` writes SQL changesets to `.weave/deltas/<epoch>.sql` before
+  the full dump. Delta files are gitignored (operational, not audit).
+
 ## [1.22.0] - 2026-03-13
 
 ### Fixed
@@ -9,10 +30,9 @@
 - **`wv prune` closes linked GitHub issues** — Before deleting nodes, extracts `gh_issue` from
   metadata and calls `gh issue close`. Previously left orphaned open GH issues when pruning
   GH-linked nodes.
-- **Checkpoint commit noise** — Unified rate-limiting across all 4 commit paths (auto_checkpoint,
-  cmd_sync, PreCompact hook, SessionEnd hook). Bumped `WV_CHECKPOINT_INTERVAL` default from 0→600s.
-  SessionEnd hook now amends most recent checkpoint within session (2h window) instead of creating
-  new commits. Added `sync state` to hook grep patterns so all commit types count toward rate limit.
+- **Checkpoint commit noise** — Initial rate-limiting across commit paths. Bumped
+  `WV_CHECKPOINT_INTERVAL` default from 0→600s. SessionEnd hook amends recent checkpoint within
+  session (2h window). Added `sync state` to hook grep patterns.
 
 ## [1.21.0] - 2026-03-12
 
