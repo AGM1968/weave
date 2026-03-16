@@ -58,8 +58,9 @@ auto_sync() {
 
     # Check throttle: sync at most once per interval
     local stamp_file="$WV_HOT_ZONE/.last_sync"
-    local now
+    local now agent_id
     now=$(date +%s)
+    agent_id="${WV_AGENT_ID:-$(hostname)-$(whoami)}"
     if [ -f "$stamp_file" ]; then
         local last_sync
         last_sync=$(cat "$stamp_file" 2>/dev/null || echo "0")
@@ -68,20 +69,18 @@ auto_sync() {
         fi
     fi
 
-    # O(1) change detection: skip entirely if nothing changed (warp-session)
-    if command -v warp-session >/dev/null 2>&1; then
-        if ! warp-session has-changes "$WV_DB" 2>/dev/null; then
-            return 0  # Nothing changed — no dump, no commit, no noise
-        fi
+    # O(1) change detection: skip entirely if nothing changed
+    if ! wv_delta_has_changes "$WV_DB"; then
+        return 0  # Nothing changed — no dump, no commit, no noise
     fi
 
     # Persist delta changeset (O(changes) — only what changed)
-    if command -v warp-session >/dev/null 2>&1; then
-        mkdir -p "$WEAVE_DIR/deltas"
-        warp-session changeset "$WV_DB" > "$WEAVE_DIR/deltas/${now}.sql" 2>/dev/null || true
-        # Remove empty delta files
-        [ -s "$WEAVE_DIR/deltas/${now}.sql" ] || rm -f "$WEAVE_DIR/deltas/${now}.sql"
-    fi
+    # Subdirectory per day prevents single-dir bloat at scale
+    local delta_dir="$WEAVE_DIR/deltas/$(date +%Y-%m-%d)"
+    mkdir -p "$delta_dir"
+    wv_delta_changeset "$WV_DB" > "$delta_dir/${now}-${agent_id}.sql" 2>/dev/null || true
+    # Remove empty delta files
+    [ -s "$delta_dir/${now}-${agent_id}.sql" ] || rm -f "$delta_dir/${now}-${agent_id}.sql"
 
     # Perform silent sync (full dump — kept for audit trail)
     mkdir -p "$WEAVE_DIR"
@@ -94,10 +93,10 @@ auto_sync() {
     [ -s "$tmp_sql" ] || { rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; return 0; }
 
     # No-op detection: skip jsonl generation + checkpoint if state unchanged.
-    # Works without warp-session — pure file compare after dump.
+    # Pure file compare after dump — catches edge cases where triggers fire but output is same.
     if [ -f "$WEAVE_DIR/state.sql" ] && cmp -s "$tmp_sql" "$WEAVE_DIR/state.sql"; then
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
-        warp-session reset "$WV_DB" 2>/dev/null || true
+        wv_delta_reset "$WV_DB"
         echo "$now" > "$stamp_file"
         return 0
     fi
@@ -110,7 +109,7 @@ auto_sync() {
     mv "$tmp_edges" "$WEAVE_DIR/edges.jsonl"
 
     # Reset change tracking after successful persist
-    warp-session reset "$WV_DB" 2>/dev/null || true
+    wv_delta_reset "$WV_DB"
 
     echo "$now" > "$stamp_file"
 
@@ -165,13 +164,22 @@ auto_checkpoint() {
     # state makes all subsequent git operations fail cryptically.
     # Set WV_CHECKPOINT_PULL=0 to disable pull entirely (for team repos).
     if [ "${WV_CHECKPOINT_PULL:-1}" = "1" ]; then
-        if ! git -C "$git_root" pull --rebase --autostash --quiet >/dev/null 2>&1; then
-            # Check if we're stuck in a rebase
-            if [ -d "$git_root/.git/rebase-merge" ] || [ -d "$git_root/.git/rebase-apply" ]; then
-                git -C "$git_root" rebase --abort 2>/dev/null || true
-                echo "wv: auto-checkpoint pull had conflicts, aborted rebase" >&2
-            fi
-            # Non-fatal — continue without pulling. User can pull manually.
+        # Only attempt pull if a remote is configured (avoids backoff in test envs)
+        if git -C "$git_root" rev-parse --verify '@{u}' >/dev/null 2>&1; then
+            local attempt
+            for attempt in 1 2 3 4 5; do
+                if git -C "$git_root" pull --rebase --autostash --quiet >/dev/null 2>&1; then
+                    break
+                fi
+                # Check if we're stuck in a rebase
+                if [ -d "$git_root/.git/rebase-merge" ] || [ -d "$git_root/.git/rebase-apply" ]; then
+                    git -C "$git_root" rebase --abort 2>/dev/null || true
+                    echo "wv: auto-checkpoint pull had conflicts, aborted rebase" >&2
+                    break  # Don't retry rebase conflicts — they won't self-resolve
+                fi
+                # Exponential backoff with jitter for contention
+                [ "$attempt" -lt 5 ] && sleep $(( (2 ** attempt) + RANDOM % 3 ))
+            done
         fi
     fi
 
@@ -450,17 +458,40 @@ EOF
         db_migrate_alias
         # Migrate to virtual columns (Tier 1)
         db_migrate_virtual_columns
-        # Initialize warp-session change tracking (idempotent)
-        if command -v warp-session >/dev/null 2>&1; then
-            warp-session init "$WV_DB" 2>/dev/null || true
+        # Initialize delta change tracking (idempotent)
+        wv_delta_init "$WV_DB"
+
+        # Replay delta changesets from other agents (multi-agent merge)
+        # FKs OFF: cross-agent deltas may reference nodes in later-sorted files
+        # No transaction: PRAGMA foreign_keys is no-op inside transactions
+        if [ -d "$WEAVE_DIR/deltas" ]; then
+            local delta_files delta_count=0
+            delta_files=$(find "$WEAVE_DIR/deltas" -name '*.sql' -printf '%f\t%p\n' 2>/dev/null | sort | cut -f2)
+            if [ -n "$delta_files" ]; then
+                sqlite3 "$WV_DB" "PRAGMA foreign_keys = OFF;" 2>/dev/null
+                while IFS= read -r delta; do
+                    if [ -s "$delta" ]; then
+                        if sqlite3 "$WV_DB" < "$delta" 2>/dev/null; then
+                            delta_count=$((delta_count + 1))
+                        else
+                            echo -e "${YELLOW}⚠ Skipped corrupt delta: ${delta##*/}${NC}" >&2
+                        fi
+                    fi
+                done <<< "$delta_files"
+                sqlite3 "$WV_DB" "PRAGMA foreign_keys = ON;" 2>/dev/null
+                if [ "$delta_count" -gt 0 ]; then
+                    # Clear change log so replayed ops don't snowball as new deltas
+                    wv_delta_reset "$WV_DB"
+                    echo -e "${GREEN}✓${NC} Replayed $delta_count delta(s)" >&2
+                fi
+            fi
         fi
+
         echo -e "${GREEN}✓${NC} Loaded from $WEAVE_DIR/state.sql" >&2
     else
         db_init
-        # Initialize warp-session change tracking (idempotent)
-        if command -v warp-session >/dev/null 2>&1; then
-            warp-session init "$WV_DB" 2>/dev/null || true
-        fi
+        # Initialize delta change tracking (idempotent)
+        wv_delta_init "$WV_DB"
         echo -e "${YELLOW}No state.sql found, initialized empty database${NC}" >&2
     fi
 
@@ -629,10 +660,14 @@ cmd_prune() {
     fi
 
     # Delete nodes and orphaned edges
+    # DELETEs must NOT leak into delta files — other agents would lose nodes
+    # that may not be pruning-eligible on their timeline.
     echo "$candidates" | cut -d'|' -f1 | while read -r id; do
         db_query "DELETE FROM edges WHERE source='$id' OR target='$id';"
         db_query "DELETE FROM nodes WHERE id='$id';"
     done
+    # Clear change log so DELETEs don't propagate via auto_sync deltas
+    wv_delta_reset "$WV_DB"
 
     # Invalidate context cache for all affected nodes
     # shellcheck disable=SC2086  # word-split intentional — affected_nodes is space-delimited ID list

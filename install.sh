@@ -269,6 +269,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-cache.sh "$LIB_DIR/lib/wv-cache.sh"
     install_file ./scripts/lib/wv-journal.sh "$LIB_DIR/lib/wv-journal.sh"
     install_file ./scripts/lib/wv-gh.sh "$LIB_DIR/lib/wv-gh.sh"
+    install_file ./scripts/lib/wv-delta.sh "$LIB_DIR/lib/wv-delta.sh"
     install_file ./scripts/lib/wv-resolve-project.sh "$LIB_DIR/lib/wv-resolve-project.sh"
     install_file ./scripts/lib/VERSION "$LIB_DIR/lib/VERSION"
     # Command modules (XDG: ~/.local/lib/weave/cmd/)
@@ -349,6 +350,7 @@ else
     download_file "$REPO/scripts/lib/wv-validate.sh" "$LIB_DIR/lib/wv-validate.sh"
     download_file "$REPO/scripts/lib/wv-cache.sh" "$LIB_DIR/lib/wv-cache.sh"
     download_file "$REPO/scripts/lib/wv-gh.sh" "$LIB_DIR/lib/wv-gh.sh"
+    download_file "$REPO/scripts/lib/wv-delta.sh" "$LIB_DIR/lib/wv-delta.sh"
     download_file "$REPO/scripts/lib/wv-resolve-project.sh" "$LIB_DIR/lib/wv-resolve-project.sh"
     download_file "$REPO/scripts/lib/VERSION" "$LIB_DIR/lib/VERSION"
     # Command modules (XDG: ~/.local/lib/weave/cmd/)
@@ -741,6 +743,11 @@ fi
 # Register 'ours' merge driver (required for .gitattributes merge=ours)
 git config merge.ours.driver true 2>/dev/null || true
 echo -e "  ${GREEN}✓${NC} git merge.ours.driver configured"
+
+# Register 'theirs' merge driver (required for .gitattributes merge=theirs)
+# Used by .weave/deltas/**/*.sql — on conflict, accept remote version
+git config merge.theirs.driver "cp %B %A" 2>/dev/null || true
+echo -e "  ${GREEN}✓${NC} git merge.theirs.driver configured"
 
 # Initialize wv database (idempotent — skip if already running)
 if wv init 2>/dev/null; then

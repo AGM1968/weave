@@ -36,6 +36,7 @@ cmd_init() {
         rm -f "$WEAVE_DIR/health.log" 2>/dev/null || true
         rm -rf "$WEAVE_DIR/cache" 2>/dev/null || true
         db_init
+        wv_delta_init "$WV_DB"
         echo -e "${GREEN}✓ Initialized Weave at $WEAVE_DIR (clean slate)${NC}"
         echo "  Hot zone: $WV_HOT_ZONE"
         return
@@ -67,6 +68,7 @@ cmd_init() {
     fi
 
     db_init
+    wv_delta_init "$WV_DB"
     echo -e "${GREEN}✓ Initialized Weave at $WEAVE_DIR${NC}"
     echo "  Hot zone: $WV_HOT_ZONE"
 }

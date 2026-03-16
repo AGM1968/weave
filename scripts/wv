@@ -50,6 +50,7 @@ source "$WV_LIB_DIR/lib/wv-validate.sh"
 source "$WV_LIB_DIR/lib/wv-cache.sh"
 source "$WV_LIB_DIR/lib/wv-journal.sh"
 source "$WV_LIB_DIR/lib/wv-gh.sh"
+source "$WV_LIB_DIR/lib/wv-delta.sh"
 
 # Source command modules
 source "$WV_LIB_DIR/cmd/wv-cmd-core.sh"

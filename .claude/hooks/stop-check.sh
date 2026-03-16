@@ -17,8 +17,9 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
 cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 
-# Check for uncommitted changes
-UNCOMMITTED=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+# Check for uncommitted changes (exclude .weave/deltas/ — infrastructure
+# files auto-committed by auto_checkpoint/session-end-sync, not user work)
+UNCOMMITTED=$(git status --porcelain 2>/dev/null | grep -v '\.weave/deltas/' | wc -l | tr -d ' ')
 
 if [ "$UNCOMMITTED" -gt 0 ]; then
     cat << EOF

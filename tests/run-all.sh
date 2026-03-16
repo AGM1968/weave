@@ -55,6 +55,7 @@ declare -a SUITES=(
     "test-hooks.sh:Hook Tests"
     "test-init-repo.sh:Init-Repo Tests"
     "test-crash-sentinel.sh:Crash Sentinel Tests"
+    "test-multi-agent.sh:Multi-Agent Tests"
 )
 
 # Results tracking

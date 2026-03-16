@@ -7,3 +7,9 @@
 .weave/state.sql.txt-dump -diff linguist-generated
 .weave/nodes.jsonl merge=ours -diff linguist-generated
 .weave/edges.jsonl merge=ours -diff linguist-generated
+
+# Delta files use unique filenames (<epoch>-<agent>.sql) so content conflicts
+# can't occur in practice. merge=theirs is a safety net — if a conflict somehow
+# happens, accept the remote version (deltas are idempotent via INSERT OR REPLACE).
+# Requires: git config merge.theirs.driver "cp %B %A" (done by install.sh)
+.weave/deltas/**/*.sql merge=theirs

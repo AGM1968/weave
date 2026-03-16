@@ -2,6 +2,35 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.23.0] - 2026-03-16
+
+### Added
+
+- **Pure-bash delta tracking (`wv-delta.sh`)** — Replaces the `warp-session` Rust binary for all
+  delta tracking operations. Five functions (`wv_delta_init`, `wv_delta_has_changes`,
+  `wv_delta_reset`, `wv_delta_changeset`, `wv_delta_apply`) using `sqlite3` `json_extract()` and
+  `quote()`. Same `_warp_changes` trigger schema, zero binary dependency. All public Weave users now
+  get O(1) change detection, delta files, and multi-agent merge capability out of the box.
+- **Self-healing delta init** — `wv_delta_has_changes()` auto-initializes triggers if
+  `_warp_changes` table is missing, with shell variable cache to skip the probe after first init.
+- **Delta subdirectories** — Deltas written to `deltas/YYYY-MM-DD/` subdirectories instead of flat
+  `deltas/` to prevent single-directory bloat at scale.
+- **GitHub diff suppression** — `.gitattributes` `-diff linguist-generated` on `.weave/` files
+  prevents GitHub web UI and VS Code from stalling on large state.sql diffs.
+
+### Removed
+
+- **`warp-session` binary dependency** — All `command -v warp-session` guards removed from
+  `scripts/`. The Rust binary remains in the warp repo as a research artifact. Zero `warp-session`
+  references in production code paths.
+
+### Fixed
+
+- **NULL weight edge data loss** — `json_extract` returning NULL for edge weight caused string
+  concatenation to produce NULL, silently dropping the entire changeset row. Fixed with `COALESCE`.
+- **Edge DELETE defensive guard** — Unparseable edge `row_id` (missing colons) now emits a SQL
+  warning comment instead of producing garbage SQL.
+
 ## [1.22.2] - 2026-03-14
 
 ### Fixed

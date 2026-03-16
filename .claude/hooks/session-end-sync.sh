@@ -13,14 +13,16 @@ REASON=$(echo "$INPUT" | jq -r '.reason // "unknown"')
 
 cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 
-# Try to sync Weave (best effort)
-if [ -x "$WV" ]; then
-    "$WV" sync 2>/dev/null || true
-fi
-
-# Try to prune old nodes (best effort)
+# Prune before sync so baseline captures prune state.
+# Without this ordering, pruned nodes reappear on next load (state.sql
+# is dumped pre-prune, and prune DELETEs are suppressed from deltas).
 if [ -x "$WV" ]; then
     "$WV" prune --age=48h 2>/dev/null || true
+fi
+
+# Sync Weave state to git layer (best effort)
+if [ -x "$WV" ]; then
+    "$WV" sync 2>/dev/null || true
 fi
 
 # Derive hot zone path (shared across checkpoint stamp + sentinel cleanup)
@@ -50,8 +52,12 @@ if ! git diff --cached --quiet 2>/dev/null; then
     echo "$_NOW" > "${_SE_HOT_ZONE}/.last_checkpoint" 2>/dev/null || true
 fi
 
-# Push to remote (best effort — stop-check already validates clean state)
-git push 2>/dev/null || true
+# Push to remote with exponential backoff (multi-agent contention)
+for _se_attempt in 1 2 3 4 5; do
+    git push 2>/dev/null && break
+    [ "$_se_attempt" -lt 5 ] && sleep $(( (2 ** _se_attempt) + RANDOM % 3 ))
+    git pull --rebase --autostash --quiet 2>/dev/null || true
+done
 
 # Log session end
 echo "[$(date -Iseconds)] Session ended: $REASON" >> .claude/session.log 2>/dev/null || true
