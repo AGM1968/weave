@@ -3,6 +3,7 @@
 # The hot-zone DB (/dev/shm/weave/<repo-hash>/brain.db) is the source of truth;
 # the .weave/ dump is just a serialization. Latest local dump always wins.
 # Requires: git config merge.ours.driver true (done by install.sh)
-.weave/state.sql merge=ours
-.weave/nodes.jsonl merge=ours
-.weave/edges.jsonl merge=ours
+.weave/state.sql merge=ours -diff linguist-generated
+.weave/state.sql.txt-dump -diff linguist-generated
+.weave/nodes.jsonl merge=ours -diff linguist-generated
+.weave/edges.jsonl merge=ours -diff linguist-generated
