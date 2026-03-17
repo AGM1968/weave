@@ -342,7 +342,18 @@ Known limitations for multi-developer teams:
 - `.weave/state.sql` merge conflicts resolve via `merge=ours` (local wins)
 - No `wv unlink` command yet
 
-These are tracked for a future release.
+### Roadmap
+
+Multi-developer support is planned in three progressive levels:
+
+| Level | Capability             | What it solves                              |
+| ----- | ---------------------- | ------------------------------------------- |
+| 1     | Delta merge via git    | `merge=ours` drops changes; deltas preserve |
+| 2     | Agent identity + claim | Two agents claiming the same node           |
+| 3     | Per-field merge        | Same-field conflicts on shared nodes        |
+
+Levels 1-2 are pure Bash and build on existing delta tracking infrastructure. Level 3 targets 2-3
+concurrent agents with per-field conflict resolution.
 
 ## Community
 
