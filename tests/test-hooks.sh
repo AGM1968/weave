@@ -358,16 +358,37 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "stop-check: exits 0 with clean git state"
 
-# Dirty state (uncommitted changes)
+# Dirty state (uncommitted changes) — soft warn, does NOT block
 echo "dirty" > "$TEST_DIR/project/dirty.txt"
 git -C "$TEST_DIR/project" add dirty.txt
+
+set +e
+STDERR_OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>&1 1>/dev/null)
+OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "stop-check: exits 0 (soft warn) with uncommitted changes"
+assert_contains "$STDERR_OUTPUT" "uncommitted" "stop-check: stderr warns about uncommitted changes"
+
+# Unpushed commits — hard block
+# Commit the dirty file, but don't push (no remote, so rev-list check is mocked)
+git -C "$TEST_DIR/project" commit -m "unpushed work" -q 2>/dev/null
+# Create a fake remote so git rev-list @{u}..HEAD works
+git -C "$TEST_DIR/project" remote add origin "$TEST_DIR/project/.git" 2>/dev/null || true
+git -C "$TEST_DIR/project" fetch origin -q 2>/dev/null || true
+git -C "$TEST_DIR/project" branch --set-upstream-to=origin/main main 2>/dev/null || \
+    git -C "$TEST_DIR/project" branch --set-upstream-to=origin/master master 2>/dev/null || true
+# Make a new commit so we're ahead of "upstream"
+echo "ahead" > "$TEST_DIR/project/ahead.txt"
+git -C "$TEST_DIR/project" add ahead.txt
+git -C "$TEST_DIR/project" commit -m "ahead of upstream" -q 2>/dev/null
 
 set +e
 OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
-assert_exit_code "1" "$EXIT_CODE" "stop-check: exits 1 (hard gate) with uncommitted changes"
-assert_contains "$OUTPUT" "uncommitted" "stop-check: warns about uncommitted changes"
+assert_exit_code "1" "$EXIT_CODE" "stop-check: exits 1 (hard block) with unpushed commits"
+assert_contains "$OUTPUT" "unpushed" "stop-check: warns about unpushed commits"
 assert_contains "$OUTPUT" "block" "stop-check: decision is block"
 
 # --- session-end-sync.sh ---

@@ -717,26 +717,66 @@ elif [ -f "$HOOK_DIR/pre-commit" ]; then
     echo -e "  ${YELLOW}⊘${NC} .git/hooks/pre-commit (already exists, skipped)"
 fi
 
-# .gitattributes: merge strategy for Weave state files
+# .gitattributes: merge strategy + diff suppression for Weave state files
+# Uses BEGIN/END markers (like Makefile template) for reliable idempotent updates
 GITATTR="$REPO_ROOT/.gitattributes"
-ATTR_ENTRIES=(
-    '.weave/state.sql merge=ours'
-    '.weave/nodes.jsonl merge=ours'
-    '.weave/edges.jsonl merge=ours'
-)
+ATTR_MARKER_BEGIN="# ── BEGIN WEAVE GITATTRIBUTES ──"
+ATTR_MARKER_END="# ── END WEAVE GITATTRIBUTES ──"
+ATTR_BLOCK="${ATTR_MARKER_BEGIN}
+# Weave state files: latest local dump always wins (DB is source of truth).
+# Requires: git config merge.ours.driver true (done by wv-init-repo)
+.weave/state.sql merge=ours -diff linguist-generated
+.weave/state.sql.txt-dump -diff linguist-generated
+.weave/nodes.jsonl merge=ours -diff linguist-generated
+.weave/edges.jsonl merge=ours -diff linguist-generated
+
+# Delta files: unique filenames mean no real conflicts; merge=theirs is a safety net.
+# Requires: git config merge.theirs.driver \"cp %B %A\" (done by wv-init-repo)
+.weave/deltas/**/*.sql merge=theirs
+${ATTR_MARKER_END}"
+
 if [ -f "$GITATTR" ]; then
-    added=0
-    for entry in "${ATTR_ENTRIES[@]}"; do
-        if ! grep -qxF "$entry" "$GITATTR"; then
-            [ "$added" -eq 0 ] && echo "" >> "$GITATTR"
-            echo "$entry" >> "$GITATTR"
-            added=1
-        fi
-    done
-    [ "$added" -eq 1 ] && echo -e "  ${GREEN}✓${NC} .gitattributes (updated)"
+    if grep -qF "$ATTR_MARKER_BEGIN" "$GITATTR"; then
+        # Markers present — replace between them + strip orphaned weave comments
+        tmpattr=$(mktemp)
+        awk -v begin="$ATTR_MARKER_BEGIN" -v end="$ATTR_MARKER_END" -v block="$ATTR_BLOCK" '
+            $0 == begin { print block; skip=1; next }
+            skip && $0 == end { skip=0; next }
+            skip { next }
+            /^# .*(merge=ours|merge=theirs|merge driver|ours merge|theirs merge)/ { next }
+            /^# .*(hot-zone|source of truth|serialization|linguist-generated)/ { next }
+            /^# .*(Weave|weave|\.weave).*(state|dump|delta|merge|file)/ { next }
+            /^# .*(delta|Delta).*(idempotent|INSERT OR REPLACE|unique|safety)/ { next }
+            /^# Requires:.*merge/ { next }
+            /^# Weave:/ { next }
+            { print }
+        ' "$GITATTR" > "$tmpattr"
+        # Remove trailing blank lines
+        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmpattr"
+        mv "$tmpattr" "$GITATTR"
+        echo -e "  ${GREEN}✓${NC} .gitattributes (updated)"
+    else
+        # No markers — strip old .weave/ entries + associated comments, append marked block
+        # This path runs once per repo (upgrade from pre-v1.23.1 format)
+        tmpattr=$(mktemp)
+        awk '
+            /^\.weave\// { next }
+            /^# .*(merge=ours|merge=theirs|merge driver|ours merge|theirs merge)/ { next }
+            /^# .*(hot-zone|source of truth|serialization|linguist-generated)/ { next }
+            /^# .*(Weave|weave|\.weave).*(state|dump|delta|merge|file)/ { next }
+            /^# .*(delta|Delta).*(idempotent|INSERT OR REPLACE|unique|safety)/ { next }
+            /^# Requires:.*merge/ { next }
+            /^# Weave:/ { next }
+            { print }
+        ' "$GITATTR" > "$tmpattr"
+        # Remove trailing blank lines
+        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmpattr"
+        { echo ""; echo "$ATTR_BLOCK"; } >> "$tmpattr"
+        mv "$tmpattr" "$GITATTR"
+        echo -e "  ${GREEN}✓${NC} .gitattributes (upgraded to managed block)"
+    fi
 else
-    echo '# Weave: latest local dump always wins (DB is source of truth)' > "$GITATTR"
-    printf '%s\n' "${ATTR_ENTRIES[@]}" >> "$GITATTR"
+    echo "$ATTR_BLOCK" > "$GITATTR"
     echo -e "  ${GREEN}✓${NC} .gitattributes (created)"
 fi
 
@@ -831,10 +871,10 @@ AGENTSEOF
                 printf '<!-- Add project-specific knowledge below: stack, environment, conventions, pitfalls -->\n'
             } > "$REPO_ROOT/CLAUDE.md"
             echo -e "  ${GREEN}✓${NC} CLAUDE.md (created with Weave block)"
-        elif grep -q 'WEAVE-BLOCK-START' "$REPO_ROOT/CLAUDE.md"; then
-            # Existing with block: replace the block, preserve everything else
-            _before=$(sed -n '1,/WEAVE-BLOCK-START/{ /WEAVE-BLOCK-START/d; p; }' "$REPO_ROOT/CLAUDE.md")
-            _after=$(sed -n '/WEAVE-BLOCK-END/,${  /WEAVE-BLOCK-END/d; p; }' "$REPO_ROOT/CLAUDE.md")
+        elif grep -q 'BEGIN WEAVE CLAUDE\.MD\|WEAVE-BLOCK-START' "$REPO_ROOT/CLAUDE.md"; then
+            # Existing with block (new or old marker): replace the block, preserve everything else
+            _before=$(sed -n '1,/BEGIN WEAVE CLAUDE\.MD\|WEAVE-BLOCK-START/{ /BEGIN WEAVE CLAUDE\.MD\|WEAVE-BLOCK-START/d; p; }' "$REPO_ROOT/CLAUDE.md")
+            _after=$(sed -n '/END WEAVE CLAUDE\.MD\|WEAVE-BLOCK-END/,${  /END WEAVE CLAUDE\.MD\|WEAVE-BLOCK-END/d; p; }' "$REPO_ROOT/CLAUDE.md")
             { printf '%s\n' "$_before"; printf '%s\n' "$_weave_block"; printf '%s' "$_after"; } > "$REPO_ROOT/CLAUDE.md"
             echo -e "  ${GREEN}✓${NC} CLAUDE.md (Weave block updated)"
         elif [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]; then

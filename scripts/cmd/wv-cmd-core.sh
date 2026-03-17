@@ -143,8 +143,13 @@ _add_create_gh_issue() {
     gh label create "$priority_label" --repo "$repo" --color "e4e669" --description "Weave priority" 2>/dev/null || true
     gh label create "weave-synced" --repo "$repo" --color "bfdadc" --description "Synced from/to Weave" 2>/dev/null || true
     local gh_url
+    # GitHub titles max 256 chars — truncate with ellipsis
+    local gh_title="$text"
+    if [ "${#gh_title}" -gt 256 ]; then
+        gh_title="${gh_title:0:253}..."
+    fi
     gh_url=$(gh issue create --repo "$repo" \
-        --title "$text" --body "$gh_body" \
+        --title "$gh_title" --body "$gh_body" \
         --label "$type_label" --label "$priority_label" --label "weave-synced" 2>&1) || true
     if [[ "$gh_url" == http* ]]; then
         local gh_num

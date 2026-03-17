@@ -117,6 +117,16 @@ Good learnings are specific, actionable, and scoped to a concrete context.
 
 **Violation check:** If `wv status` shows 0 active nodes, STOP and claim one first.
 
+## Session End Behavior
+
+The stop hook enforces git hygiene with two severity levels:
+
+- **Uncommitted changes** → soft warning (does not block). You may still be working.
+- **Unpushed commits** → hard block. You committed but forgot to push — run `git push`.
+
+The `/close-session` skill handles the full protocol (sync, commit, push). Only invoke it when
+you're actually done — the soft warning is not a signal to stop working.
+
 ## Skills
 
 - `/weave [<id>|<text>]` — Graph-first orchestrator (primary interface)

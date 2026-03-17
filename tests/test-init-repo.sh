@@ -68,7 +68,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF "$needle"; then
+    if echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -84,7 +84,7 @@ assert_not_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if ! echo "$haystack" | grep -qF "$needle"; then
+    if ! echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -267,7 +267,7 @@ fi
 # --update should prepend Weave block but preserve user content
 echo "my custom content" > "$REPO5/CLAUDE.md"
 "$WV" init-repo --update 2>&1 >/dev/null
-assert_contains "$(cat "$REPO5/CLAUDE.md")" "WEAVE-BLOCK-START"  "--update: prepends Weave block to CLAUDE.md"
+assert_contains "$(cat "$REPO5/CLAUDE.md")" "BEGIN WEAVE CLAUDE.MD"  "--update: prepends Weave block to CLAUDE.md"
 assert_contains "$(cat "$REPO5/CLAUDE.md")" "my custom content"  "--update: preserves user content in CLAUDE.md"
 
 # --- --help works ---
@@ -283,6 +283,77 @@ echo ""
 echo "--- help registration ---"
 HELP=$("$WV" --help 2>&1 || true)
 assert_contains "$HELP" "init-repo"                         "wv --help lists init-repo command"
+
+# --- .gitattributes: fresh repo gets marker block ---
+echo ""
+echo "--- gitattributes: fresh ---"
+REPO6=$(make_test_repo "gitattr-fresh")
+cd "$REPO6"
+"$WV" init-repo --agent=claude >/dev/null 2>&1
+assert_file_exists "$REPO6/.gitattributes"                                "gitattr: creates .gitattributes"
+assert_contains "$(cat "$REPO6/.gitattributes")" "BEGIN WEAVE GITATTRIBUTES" "gitattr: has BEGIN marker"
+assert_contains "$(cat "$REPO6/.gitattributes")" "END WEAVE GITATTRIBUTES"   "gitattr: has END marker"
+assert_contains "$(cat "$REPO6/.gitattributes")" "-diff linguist-generated"  "gitattr: has -diff flag"
+assert_contains "$(cat "$REPO6/.gitattributes")" "state.sql.txt-dump"        "gitattr: has txt-dump entry"
+assert_contains "$(cat "$REPO6/.gitattributes")" "deltas/**/*.sql merge=theirs" "gitattr: has deltas merge=theirs"
+
+# --- .gitattributes: upgrade bare entries to marker block ---
+echo ""
+echo "--- gitattributes: upgrade ---"
+REPO7=$(make_test_repo "gitattr-upgrade")
+cd "$REPO7"
+# Write old-style bare entries (what wv-init-repo <v1.23.0 generated)
+cat > "$REPO7/.gitattributes" << 'GITEOF'
+# Weave: latest local dump always wins (DB is source of truth)
+.weave/state.sql merge=ours
+.weave/nodes.jsonl merge=ours
+.weave/edges.jsonl merge=ours
+GITEOF
+"$WV" init-repo --update --agent=claude >/dev/null 2>&1
+GA7=$(cat "$REPO7/.gitattributes")
+assert_contains "$GA7" "BEGIN WEAVE GITATTRIBUTES"    "gitattr upgrade: has BEGIN marker"
+assert_contains "$GA7" "-diff linguist-generated"      "gitattr upgrade: has -diff flag"
+assert_contains "$GA7" "deltas/**/*.sql merge=theirs"  "gitattr upgrade: has deltas entry"
+# Check no line is exactly the bare form (without -diff)
+if echo "$GA7" | grep -qxF '.weave/state.sql merge=ours'; then
+    TESTS_RUN=$((TESTS_RUN + 1))
+    echo -e "${RED}✗${NC} gitattr upgrade: bare entry stripped"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+else
+    TESTS_RUN=$((TESTS_RUN + 1))
+    echo -e "${GREEN}✓${NC} gitattr upgrade: bare entry stripped"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+fi
+
+# --- .gitattributes: preserves user entries ---
+echo ""
+echo "--- gitattributes: user entries preserved ---"
+REPO8=$(make_test_repo "gitattr-user")
+cd "$REPO8"
+cat > "$REPO8/.gitattributes" << 'GITEOF'
+*.pbf filter=lfs diff=lfs merge=lfs -text
+*.tif filter=lfs diff=lfs merge=lfs -text
+
+.weave/state.sql merge=ours
+.weave/nodes.jsonl merge=ours
+.weave/edges.jsonl merge=ours
+GITEOF
+"$WV" init-repo --update --agent=claude >/dev/null 2>&1
+GA8=$(cat "$REPO8/.gitattributes")
+assert_contains "$GA8" "*.pbf filter=lfs"              "gitattr user: preserves LFS entries"
+assert_contains "$GA8" "*.tif filter=lfs"              "gitattr user: preserves tif entry"
+assert_contains "$GA8" "BEGIN WEAVE GITATTRIBUTES"     "gitattr user: has marker block"
+
+# --- .gitattributes: idempotent (marker block already present) ---
+echo ""
+echo "--- gitattributes: idempotent ---"
+REPO9=$(make_test_repo "gitattr-idem")
+cd "$REPO9"
+"$WV" init-repo --agent=claude >/dev/null 2>&1
+FIRST=$(cat "$REPO9/.gitattributes")
+"$WV" init-repo --update --agent=claude >/dev/null 2>&1
+SECOND=$(cat "$REPO9/.gitattributes")
+assert_equals "$FIRST" "$SECOND" "gitattr idempotent: second run produces identical output"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""

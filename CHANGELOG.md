@@ -2,6 +2,29 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.24.0] - 2026-03-17
+
+### Added
+
+- **RAM/system health metrics** — `wv health` now reports available RAM, tmpfs usage, and hot zone
+  DB size. Score penalized at <1GB available (-5) and <500MB critical (-15). Visible in `--verbose`
+  text and `--json` output under `system` object.
+- **WORKFLOW.md "Session End Behavior" section** — Documents the two-level stop hook for both Claude
+  Code and VS Code agents.
+
+### Changed
+
+- **Stop hook redesign** — Uncommitted changes now produce a soft warning (stderr, `exit 0`) instead
+  of blocking. Only unpushed commits hard-block (`exit 1`). Prevents forced `/close-session` when
+  the user is still working. 50/50 hook tests passing.
+
+### Fixed
+
+- **GH title truncation** — GitHub issue titles now truncated correctly.
+- **Stop hook `.weave/` exclusion** — Broadened to exclude all `.weave/` files, not just deltas.
+- **`wv-init-repo` .gitattributes** — Uses marker block with full template; strips orphaned comments
+  from partial upgrades.
+
 ## [1.23.0] - 2026-03-16
 
 ### Added

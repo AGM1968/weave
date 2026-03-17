@@ -252,7 +252,9 @@ def _handle_new_issue(
         stats.created_gh += 1
         return
 
-    log.info("  ➕ Creating GH issue: %s — %s", node.id, node.text)
+    # GitHub titles max 256 chars — truncate with ellipsis, full text goes in body
+    gh_title = node.text if len(node.text) <= 256 else node.text[:253] + "..."
+    log.info("  ➕ Creating GH issue: %s — %s", node.id, gh_title)
 
     label_args: list[str] = []
     for lb in labels:
@@ -265,7 +267,7 @@ def _handle_new_issue(
             "--repo",
             repo,
             "--title",
-            node.text,
+            gh_title,
             "--body",
             weave_body,
             *label_args,

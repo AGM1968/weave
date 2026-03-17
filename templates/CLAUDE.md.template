@@ -1,4 +1,4 @@
-<!-- WEAVE-BLOCK-START — managed by wv init-repo, do not edit manually -->
+<!-- ── BEGIN WEAVE CLAUDE.MD ── managed by wv init-repo, do not edit manually -->
 ## Weave Workflow
 
 > Task tracking active. See `~/.config/weave/WORKFLOW.md` or `wv guide` (MCP) for the full reference.
@@ -12,4 +12,4 @@ wv sync && git push               # 4. Persist + push (mandatory)
 ```
 
 **No edits without an active node.** If `wv status` shows 0 active, claim one first.
-<!-- WEAVE-BLOCK-END -->
+<!-- ── END WEAVE CLAUDE.MD ── -->

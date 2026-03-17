@@ -1367,6 +1367,28 @@ _health_collect_metrics() {
         SELECT COUNT(*) FROM nodes
         WHERE status NOT IN ('todo', 'active', 'done', 'blocked', 'blocked-external');
     ")
+
+    # System metrics: RAM and tmpfs (hot zone)
+    _h_ram_total_mb=0
+    _h_ram_available_mb=0
+    _h_shm_used_mb=0
+    _h_shm_total_mb=0
+    _h_db_size_kb=0
+    if [ -f /proc/meminfo ]; then
+        local ram_total_kb ram_avail_kb
+        ram_total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+        ram_avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+        _h_ram_total_mb=$((ram_total_kb / 1024))
+        _h_ram_available_mb=$((ram_avail_kb / 1024))
+    fi
+    if df /dev/shm >/dev/null 2>&1; then
+        _h_shm_total_mb=$(df -BM /dev/shm | awk 'NR==2 {gsub(/M/,"",$2); print $2}')
+        _h_shm_used_mb=$(df -BM /dev/shm | awk 'NR==2 {gsub(/M/,"",$3); print $3}')
+    fi
+    if [ -n "$WV_DB" ] && [ -f "$WV_DB" ]; then
+        _h_db_size_kb=$(du -k "$WV_DB" 2>/dev/null | cut -f1)
+        _h_db_size_kb="${_h_db_size_kb:-0}"
+    fi
 }
 
 # Compute health score from collected metrics. Sets _h_health_score, _h_issues,
@@ -1410,6 +1432,20 @@ _health_compute_score() {
         if [ "$orphan_penalty" -lt 3 ]; then orphan_penalty=3; fi
         _h_health_score=$((_h_health_score - orphan_penalty))
         _h_issues="${_h_issues}orphan_nodes:$_h_orphan_nodes,"
+    fi
+    # RAM pressure: warn at <1GB available, critical at <500MB
+    _h_ram_warning=false
+    _h_ram_critical=false
+    if [ "$_h_ram_available_mb" -gt 0 ]; then
+        if [ "$_h_ram_available_mb" -lt 500 ]; then
+            _h_ram_critical=true
+            _h_health_score=$((_h_health_score - 15))
+            _h_issues="${_h_issues}ram_critical:${_h_ram_available_mb}MB,"
+        elif [ "$_h_ram_available_mb" -lt 1024 ]; then
+            _h_ram_warning=true
+            _h_health_score=$((_h_health_score - 5))
+            _h_issues="${_h_issues}ram_low:${_h_ram_available_mb}MB,"
+        fi
     fi
 
     # Clamp to 0-100
@@ -1520,6 +1556,11 @@ _health_format_json() {
         --argjson empty_edge_context "$_h_empty_edge_ctx" \
         --argjson fixed_edge_context "$_h_fixed_edge_ctx" \
         --argjson quality "$quality_obj" \
+        --argjson ram_total_mb "$_h_ram_total_mb" \
+        --argjson ram_available_mb "$_h_ram_available_mb" \
+        --argjson shm_used_mb "$_h_shm_used_mb" \
+        --argjson shm_total_mb "$_h_shm_total_mb" \
+        --argjson db_size_kb "$_h_db_size_kb" \
         '{
             status: $status,
             score: $score,
@@ -1551,7 +1592,14 @@ _health_format_json() {
                 empty_edge_context: $empty_edge_context,
                 fixed_edge_context: $fixed_edge_context
             },
-            code_quality: $quality
+            code_quality: $quality,
+            system: {
+                ram_total_mb: $ram_total_mb,
+                ram_available_mb: $ram_available_mb,
+                shm_used_mb: $shm_used_mb,
+                shm_total_mb: $shm_total_mb,
+                db_size_kb: $db_size_kb
+            }
         }'
 }
 
@@ -1599,6 +1647,13 @@ _health_format_text() {
         echo "  Unresolved contradictions: $_h_contradictions"
         echo "  Invalid statuses: $_h_invalid_statuses"
         echo "  Empty edge context: $_h_empty_edge_ctx"
+        echo ""
+        echo -e "${CYAN}System:${NC}"
+        echo "  RAM: ${_h_ram_available_mb}MB available / ${_h_ram_total_mb}MB total"
+        echo "  tmpfs (/dev/shm): ${_h_shm_used_mb}MB used / ${_h_shm_total_mb}MB total"
+        if [ "$_h_db_size_kb" -gt 0 ]; then
+            echo "  Hot zone DB: ${_h_db_size_kb}KB"
+        fi
     fi
 
     # Show issues if any
@@ -1613,6 +1668,8 @@ _health_format_text() {
         if [ "$_h_invalid_statuses" -gt 0 ]; then echo -e "  ${RED}✗${NC} $_h_invalid_statuses node(s) with invalid status - run 'wv update <id> --status=todo' to fix"; fi
         if [ "$_h_empty_edge_ctx" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_empty_edge_ctx edge(s) missing context - run 'wv health --fix' to backfill"; fi
         if [ "$_h_fixed_edge_ctx" -gt 0 ]; then echo -e "  ${GREEN}✓${NC} Fixed: enriched $_h_fixed_edge_ctx edge(s) with auto-context (marked auto:true)"; fi
+        if [ "$_h_ram_critical" = true ]; then echo -e "  ${RED}✗${NC} RAM critically low: ${_h_ram_available_mb}MB available — system may OOM kill processes"; fi
+        if [ "$_h_ram_warning" = true ]; then echo -e "  ${YELLOW}⚠${NC} RAM low: ${_h_ram_available_mb}MB available — avoid heavy builds (cargo, npm)"; fi
     fi
 }
 
