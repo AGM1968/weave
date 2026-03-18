@@ -36,7 +36,7 @@ import { accessSync, constants } from "fs";
 // --- Scope definitions ---
 // Each scope exposes a subset of tools for context-silo'd subagents.
 // "all" (default) exposes everything for backward compatibility.
-export type Scope = "graph" | "session" | "inspect" | "all";
+export type Scope = "graph" | "session" | "inspect" | "lite" | "all";
 
 export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
   graph: [
@@ -60,6 +60,14 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_plan",
     "weave_edit_guard",
   ],
+  lite: [
+    "weave_overview",
+    "weave_guide",
+    "weave_edit_guard",
+    "weave_status",
+    "weave_work",
+    "weave_done",
+  ],
   inspect: [
     "weave_context",
     "weave_search",
@@ -82,8 +90,8 @@ function parseScope(): Scope {
   const arg = process.argv.find((a) => a.startsWith("--scope="));
   if (!arg) return "all";
   const value = arg.split("=")[1] as Scope;
-  if (!["graph", "session", "inspect", "all"].includes(value)) {
-    console.error(`Invalid scope "${value}". Valid: graph, session, inspect, all`);
+  if (!["graph", "session", "inspect", "lite", "all"].includes(value)) {
+    console.error(`Invalid scope "${value}". Valid: graph, session, inspect, lite, all`);
     process.exit(1);
   }
   return value;
@@ -795,6 +803,27 @@ function getToolsForScope(scope: Scope, allTools: Tool[]): Tool[] {
 
 const SCOPED_TOOLS = getToolsForScope(ACTIVE_SCOPE, TOOLS);
 
+// --- Instrumentation ---
+// Logs payload sizes and per-tool call counts to stderr for baseline measurement.
+// Enable with --instrument flag; disable in production.
+const INSTRUMENT = process.argv.includes("--instrument");
+const toolCallCounts = new Map<string, number>();
+
+function logInstrumentation(msg: string): void {
+  if (INSTRUMENT) console.error(`[weave-mcp-instrument] ${msg}`);
+}
+
+if (INSTRUMENT) {
+  process.on("exit", () => {
+    if (toolCallCounts.size === 0) return;
+    const sorted = [...toolCallCounts.entries()].sort((a, b) => b[1] - a[1]);
+    console.error(`[weave-mcp-instrument] === Call summary (scope=${ACTIVE_SCOPE}) ===`);
+    for (const [tool, count] of sorted) {
+      console.error(`[weave-mcp-instrument]   ${tool}: ${count}`);
+    }
+  });
+}
+
 // Normalize legacy status values to canonical enum
 function normalizeStatus(status: string | undefined): string | undefined {
   if (!status) return status;
@@ -1375,7 +1404,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.24.0",
+      version: "1.25.0",
     },
     {
       capabilities: {
@@ -1385,9 +1414,14 @@ async function main() {
   );
 
   // List available tools (filtered by scope)
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: SCOPED_TOOLS,
-  }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const payload = { tools: SCOPED_TOOLS };
+    if (INSTRUMENT) {
+      const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+      logInstrumentation(`tools/list scope=${ACTIVE_SCOPE} tools=${SCOPED_TOOLS.length} payload_bytes=${bytes}`);
+    }
+    return payload;
+  });
 
   // Handle tool calls (enforce scope)
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -1404,6 +1438,13 @@ async function main() {
         ],
         isError: true,
       };
+    }
+
+    // Instrumentation: count per-tool calls
+    if (INSTRUMENT) {
+      const count = (toolCallCounts.get(name) || 0) + 1;
+      toolCallCounts.set(name, count);
+      logInstrumentation(`call scope=${ACTIVE_SCOPE} tool=${name} count=${count}`);
     }
 
     try {

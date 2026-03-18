@@ -9,19 +9,19 @@ tools: ["Bash", "Read", "Grep", "Glob"]
 **Purpose:** Extract, structure, and capture learnings from completed work. Helps retrospectively
 add learnings to nodes and identifies patterns across multiple tasks.
 
-## MCP Scope: `inspect`
+## MCP Server
 
-This agent pairs with the **`--scope=inspect`** MCP server, which exposes 13 read-only query tools:
-`weave_context`, `weave_search`, `weave_tree`, `weave_learnings`, `weave_status`, `weave_health`,
-`weave_preflight`, `weave_sync`, `weave_guide`, `weave_show`, `weave_quality_scan`,
-`weave_quality_hotspots`, `weave_quality_diff`.
+This agent uses the **`weave`** MCP server (all 31 tools available). Its primary tools are the
+read-only query operations: `weave_context`, `weave_search`, `weave_tree`, `weave_learnings`,
+`weave_status`, `weave_health`, `weave_preflight`, `weave_sync`, `weave_guide`, `weave_show`,
+`weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`.
 
 ```jsonc
-// .vscode/mcp.json — recommended server for this agent
-"weave-inspect": {
+// .vscode/mcp.json — server for this agent
+"weave": {
   "type": "stdio",
   "command": "node",
-  "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=inspect"]
+  "args": ["${workspaceFolder}/mcp/dist/index.js"]
 }
 ```
 

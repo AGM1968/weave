@@ -158,46 +158,12 @@ This skill is called by:
 
 # Task: Add OAuth2 provider
 
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Risks:
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   1. Breaks existing email/password login (critical/low)
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   2. OAuth tokens stored insecurely (critical/medium)
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   3. Callback URL misconfiguration (high/medium)
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Blast radius: All users, login flow, session management
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Rollback: Feature flag to disable OAuth, revert to password-only
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 ### Example 2: Database Migration
@@ -206,53 +172,13 @@ This skill is called by:
 /pre-mortem wv-d4e5
 
 # Task: Add indexes to users table
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Risks:
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   1. Table lock during index creation (high/high)
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   2. Disk space exhaustion (medium/low)
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   3. Query planner changes break existing queries (medium/medium)
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Blast radius: users table, all user-related queries
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Rollback: DROP INDEX, restore query performance
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Mitigation: Use CONCURRENTLY, run during low traffic
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 ### Example 3: Refactor
@@ -261,53 +187,13 @@ This skill is called by:
 /pre-mortem wv-f6g7
 
 # Task: Extract shared utilities to new package
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Risks:
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   1. Import path changes break consumers (high/high)
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   2. Circular dependency introduced (medium/medium)
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   3. Build time increases significantly (low/medium)
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Blast radius: All packages importing utilities
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Rollback: Revert package extraction, inline utilities
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Mitigation: Update all imports in same PR, test full build
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 ## Metadata Schema

@@ -113,17 +113,8 @@ If during implementation you discover:
 ```bash
 # Discovered new work during implementation
 
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv add "Handle edge case: expired session" --metadata='{"type":"task","priority":2}'
 # Don't add to current task's done_criteria
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 ## Integration
@@ -142,59 +133,14 @@ This skill is called by:
 /ship-it wv-b2c3
 
 # Task: Fix login timeout issue
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Done criteria:
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   1. Session timeout extended to 30 minutes
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   2. Activity refreshes session expiry
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   3. Existing tests pass
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Non-goals:
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   - Remember me functionality
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   - Session analytics
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Acceptance: Login, wait 25 min with activity, still logged in
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 ### Example 2: Feature
@@ -203,71 +149,16 @@ This skill is called by:
 /ship-it wv-d4e5
 
 # Task: Add CSV export to dashboard
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Done criteria:
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   1. Export button visible on dashboard
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   2. Click downloads CSV file
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   3. CSV contains all visible columns
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   4. Filename includes date
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Non-goals:
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   - PDF export
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   - Email delivery
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   - Custom column selection
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Acceptance: Click export, verify CSV opens in spreadsheet
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 ### Example 3: Refactor
@@ -276,71 +167,16 @@ This skill is called by:
 /ship-it wv-f6g7
 
 # Task: Extract auth middleware
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Done criteria:
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   1. Auth logic moved to middleware/auth.ts
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   2. All routes use middleware instead of inline checks
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   3. Existing tests pass unchanged
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   4. No new dependencies added
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Non-goals:
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   - New auth features
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   - Performance optimization
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 #   - Additional test coverage
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Acceptance: All auth tests green, manual login works
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 ## Metadata Schema
@@ -364,44 +200,13 @@ Before closing a task, verify against done criteria:
 
 ```bash
 # Review criteria
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv show <id>
 
 # Check each criterion
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Criterion 1: done
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Criterion 2: done
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Criterion 3: done
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
-
 # All criteria met → proceed to /wv-verify-complete → wv done
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 ## Related Skills

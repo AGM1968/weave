@@ -153,92 +153,23 @@ The procedural skills are enforced through:
 ```bash
 # 1. Understand
 
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 gh issue view 42
 # Requirements vague? Run: /wv-clarify-spec
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
-
 # 2. Claim with gates
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv update wv-abc1 --status=active
 # Hook suggests: /ship-it wv-abc1 && /pre-mortem wv-abc1
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
-
 # 3. Locate with focus
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Use /zero-in: "Find the authentication middleware"
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 grep -r "auth.*middleware" src/
 
 # 4. Plan and validate
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Use /sanity-check: "Verify Express middleware pattern"
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
-
 # 5. Implement
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # Use /wv-guard-scope: Match existing patterns, defer refactors
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
-
 # 6. Verify
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 npm test -- auth.test.js
 # Capture evidence: /wv-verify-complete wv-abc1
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
-
 # 7. Close with learnings
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 git commit -m "fix: handle null user in auth middleware"
 wv done wv-abc1 --learning="pattern: ..."
 ```

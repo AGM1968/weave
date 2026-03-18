@@ -117,6 +117,13 @@ fi
 CACHE_DIR="${_PA_HOT_ZONE}/context_cache"
 CACHE_FILE="$CACHE_DIR/${NODE_ID}.json"
 
+# First-call-only: skip context check on repeat calls within a session (D2 Option C)
+# The stamp is cleared by invalidate_context_cache() when edges change (block/link/done/resolve)
+CHECKED_STAMP="${_PA_HOT_ZONE}/.context_checked_${NODE_ID}"
+if [ -f "$CHECKED_STAMP" ]; then
+    exit 0
+fi
+
 # Try to generate/retrieve Context Pack
 CONTEXT_PACK=$("$WV" context "$NODE_ID" --json 2>/dev/null || echo "")
 
@@ -167,5 +174,7 @@ EOF
 fi
 
 # All checks passed - Context Pack is valid, no contradictions, no blockers
+# Stamp this node as checked for the session (first-call-only optimization)
+touch "$CHECKED_STAMP" 2>/dev/null || true
 # Allow the edit to proceed
 exit 0

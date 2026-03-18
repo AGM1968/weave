@@ -9,18 +9,18 @@ tools: ["Bash", "Read", "Grep", "Glob", "Write", "WebSearch"]
 **Purpose:** Guide users through proper Weave workflow, ensuring best practices for task tracking,
 dependency management, and knowledge capture.
 
-## MCP Scope: `session`
+## MCP Server
 
-This agent pairs with the **`--scope=session`** MCP server, which exposes 7 workflow lifecycle
-tools: `weave_work`, `weave_ship`, `weave_quick`, `weave_overview`, `weave_close_session`,
-`weave_breadcrumbs`, `weave_plan`.
+This agent uses the **`weave`** MCP server (all 31 tools available). Its primary tools are the
+workflow lifecycle operations: `weave_work`, `weave_ship`, `weave_quick`, `weave_overview`,
+`weave_close_session`, `weave_breadcrumbs`, `weave_plan`, `weave_edit_guard`.
 
 ```jsonc
-// .vscode/mcp.json — recommended server for this agent
-"weave-session": {
+// .vscode/mcp.json — server for this agent
+"weave": {
   "type": "stdio",
   "command": "node",
-  "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=session"]
+  "args": ["${workspaceFolder}/mcp/dist/index.js"]
 }
 ```
 

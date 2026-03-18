@@ -20,18 +20,9 @@ Find nodes that are `todo` but never claimed:
 ```bash
 # Check for old unclaimed work
 
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --json | jq -r '.[] | select(.status=="todo") | "\(.id): \(.text) (created: \(.created_at))"'
 
 # Find nodes older than 7 days still in todo
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --json | jq -r --arg date "$(date -d '7 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-7d '+%Y-%m-%d')" \
   '.[] | select(.status=="todo" and .created_at < $date) | "\(.id): \(.text)"'
 ```
@@ -44,19 +35,9 @@ Find nodes stuck in `active` status:
 
 ```bash
 # List all active nodes
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --status=active
 
 # Check which have been active for >2 days
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --json | jq -r --arg date "$(date -d '2 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-2d '+%Y-%m-%d')" \
   '.[] | select(.status=="active" and .updated_at < $date) | "\(.id): \(.text) (active since: \(.updated_at))"'
 ```
@@ -69,11 +50,6 @@ Find potential circular dependencies:
 
 ```bash
 # For each blocked node, check if its blocker is also blocked by it
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 for node in $(wv list --status=blocked --json | jq -r '.[].id'); do
   wv show $node --json | jq -r '
     .[] |
@@ -92,27 +68,12 @@ Find nodes missing useful metadata:
 
 ```bash
 # Find nodes with empty metadata
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --json | jq -r '.[] | select(.metadata == "{}") | "\(.id): \(.text)"'
 
 # Find nodes missing 'type' field
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --json | jq -r '.[] | select(.type == null) | "\(.id): \(.text) (no type)"'
 
 # Find nodes missing 'priority' field
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --json | jq -r '.[] | select(.priority == null) | "\(.id): \(.text) (no priority)"'
 ```
 
@@ -124,11 +85,6 @@ Find nodes that should be unblocked:
 
 ```bash
 # Check if any blocked nodes have all blockers completed
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --status=blocked | while read -r line; do
   id=$(echo "$line" | awk '{print $1}' | tr -d '[]')
   if wv show "$id" 2>/dev/null | grep -q "Blocked by:"; then
@@ -145,11 +101,6 @@ Find completed nodes missing learnings:
 
 ```bash
 # List done nodes without learnings
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --all --json | jq -r '.[] | select(.status=="done") |
   select(.metadata | fromjson |
     has("decision") == false and
@@ -166,19 +117,9 @@ Find potentially duplicate work:
 
 ```bash
 # Find nodes with very similar text
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --json | jq -r '.[].text' | sort | uniq -d
 
 # Find nodes with same type and similar priority
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --json | jq -r 'group_by(.type, .priority) | .[] |
   select(length > 3) |
   "Multiple \(.[0].type) nodes at priority \(.[0].priority): \(length) found"'
@@ -257,19 +198,9 @@ bash .claude/skills/weave-audit/audit-report.sh
 
 ```bash
 # Preview what would be archived
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv prune --age=168 --dry-run  # 7 days
 
 # Archive nodes completed >7 days ago
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv prune --age=168
 ```
 
@@ -277,11 +208,6 @@ wv prune --age=168
 
 ```bash
 # Add default type to nodes without one
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 for id in $(wv list --json | jq -r '.[] | select(.type == null) | .id'); do
   wv update $id --metadata='{"type":"task","priority":3}'
   echo "Added default metadata to $id"
@@ -294,11 +220,6 @@ For nodes blocked by completed work, manually verify then unblock:
 
 ```bash
 # This requires manual verification - don't automate blindly
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv update wv-XXXXXX --status=todo  # If blockers are confirmed done
 ```
 
@@ -308,35 +229,15 @@ After making fixes, verify:
 
 ```bash
 # Check no circular dependencies (manual inspection)
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --status=blocked
 
 # Verify ready queue has work
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv ready
 
 # Ensure graph is consistent
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv status
 
 # Verify sync is clean
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv sync
 git status
 ```
@@ -416,11 +317,6 @@ git status
 
 ```bash
 # In pre-commit hook
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 if wv list --status=active --json | jq -e 'length > 0' > /dev/null; then
   echo "Warning: You have active Weave nodes. Consider completing them."
 fi
@@ -430,11 +326,6 @@ fi
 
 ```yaml
 # .github/workflows/weave-audit.yml
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 name: Weave Audit
 
 on:
@@ -458,22 +349,12 @@ The `/close-session` skill should run a quick audit:
 
 ```bash
 # Check for active nodes
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 if [ "$(wv list --status=active --json | jq 'length')" -gt 0 ]; then
   echo " Active nodes found - review before ending session"
   wv list --status=active
 fi
 
 # Check for uncommitted learnings
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv learnings --json | jq -e 'length' > /dev/null || echo " No recent learnings captured"
 ```
 
@@ -483,10 +364,6 @@ When running `/weave-audit`, provide:
 
 ```markdown
 # Weave Graph Audit Results
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator. Use `/weave` instead
-> for the full graph-first workflow. Direct invocation is deprecated and may be removed in a future
-> release.
 
 ## Summary
 
@@ -532,36 +409,16 @@ When running `/weave-audit`, provide:
 
 ```bash
 # Quick health check
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv status && wv ready --count
 
 # Find immediate issues
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --status=active | head -5
 wv list --status=blocked | head -5
 
 # Count nodes by type
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --json | jq -r '.[].type' | sort | uniq -c
 
 # List high-priority work
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --json | jq -r '.[] | select(.priority <= 2) | "\(.id): \(.text) (P\(.priority))"'
 ```
 

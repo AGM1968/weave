@@ -9,18 +9,18 @@ tools: ["Bash", "Read", "Grep", "Glob", "Write"]
 **Purpose:** Help plan epic structure, scope, and breakdown strategy before creating Weave nodes.
 Acts as a planning consultant to clarify requirements and design the work hierarchy.
 
-## MCP Scope: `graph`
+## MCP Server
 
-This agent pairs with the **`--scope=graph`** MCP server, which exposes 8 graph mutation tools:
-`weave_add`, `weave_link`, `weave_done`, `weave_batch_done`, `weave_update`, `weave_list`,
-`weave_resolve`, `weave_delete`.
+This agent uses the **`weave`** MCP server (all 31 tools available). Its primary tools are the
+8 graph mutation operations: `weave_add`, `weave_link`, `weave_done`, `weave_batch_done`,
+`weave_update`, `weave_list`, `weave_resolve`, `weave_delete`.
 
 ```jsonc
-// .vscode/mcp.json — recommended server for this agent
-"weave-graph": {
+// .vscode/mcp.json — server for this agent
+"weave": {
   "type": "stdio",
   "command": "node",
-  "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=graph"]
+  "args": ["${workspaceFolder}/mcp/dist/index.js"]
 }
 ```
 

@@ -30,36 +30,12 @@ Review the original task definition:
 ```bash
 # Review done criteria
 
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv show <current-task-id>
 
 # Questions to ask:
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # - Does this change relate to the task text?
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # - Is it in the done_criteria list?
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # - Was it explicitly excluded in non_goals?
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 **If outside scope:** Create new task, don't expand current one.

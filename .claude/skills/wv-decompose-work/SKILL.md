@@ -75,89 +75,31 @@ For each feature, create 3-10 tasks:
 ```bash
 # Create epic
 
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 EPIC=$(wv add "Epic: $ARGUMENTS" --metadata='{"type":"epic","priority":1}')
 
 # Create features
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 FEAT1=$(wv add "Feature: [first major capability]" --metadata='{"type":"feature","priority":1}')
 FEAT2=$(wv add "Feature: [second major capability]" --metadata='{"type":"feature","priority":2}')
 # ... more features
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
-
 # Create tasks for feature 1
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 TASK1=$(wv add "Task: [specific implementation]" --metadata='{"type":"task","priority":1}')
 TASK2=$(wv add "Task: [specific implementation]" --metadata='{"type":"task","priority":2}')
 # ... more tasks
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
-
 # Repeat for other features
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 ### 5. Set Up Dependencies
 
 ```bash
 # Epic blocked by all features
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv block $EPIC --by=$FEAT1
 wv block $EPIC --by=$FEAT2
 # ... for all features
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
-
 # Each feature blocked by its tasks
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv block $FEAT1 --by=$TASK1
 wv block $FEAT1 --by=$TASK2
 # ... for all tasks
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
-
 # If tasks depend on each other
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv block $TASK2 --by=$TASK1  # Task 2 depends on Task 1
 ```
 
@@ -165,19 +107,9 @@ wv block $TASK2 --by=$TASK1  # Task 2 depends on Task 1
 
 ```bash
 # Show the full dependency tree
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv path $EPIC --format=chain
 
 # List all nodes in the hierarchy
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv list --status=todo
 ```
 
@@ -232,10 +164,6 @@ Provide a structured breakdown:
 
 ```markdown
 # Epic Breakdown: [Epic Name]
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator. Use `/weave` instead for
-> the full graph-first workflow. Direct invocation is deprecated and may be removed in a future
-> release.
 
 ## Epic Node
 
@@ -365,11 +293,6 @@ When tasks must be done in order:
 wv block $TASK3 --by=$TASK2
 wv block $TASK2 --by=$TASK1
 # Work flows: Task1 → Task2 → Task3
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 ### Parallel Work
@@ -378,17 +301,7 @@ When tasks can be done independently:
 
 ```bash
 # No blocking between tasks
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 # All tasks in feature can be worked on simultaneously
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 wv block $FEATURE --by=$TASK1
 wv block $FEATURE --by=$TASK2
 wv block $FEATURE --by=$TASK3
@@ -405,11 +318,6 @@ wv block $FEAT1 --by=$FOUNDATION
 wv block $FEAT2 --by=$FOUNDATION
 wv block $FEAT3 --by=$FOUNDATION
 # All features wait for foundation
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 ### Feature Ordering
@@ -420,11 +328,6 @@ When features build on each other:
 wv block $FEAT3 --by=$FEAT2
 wv block $FEAT2 --by=$FEAT1
 # Feature order: F1 → F2 → F3
-
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator.
-> Use `/weave` instead for the full graph-first workflow.
-> Direct invocation is deprecated and may be removed in a future release.
-
 ```
 
 ## Validation

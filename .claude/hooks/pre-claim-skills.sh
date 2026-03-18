@@ -7,6 +7,13 @@ set -e
 # Read stdin (JSON payload from Claude Code)
 INPUT=$(cat)
 
+# Fast path: skip jq if stdin doesn't contain our trigger pattern
+case "$INPUT" in
+    *"wv update"*"--status=active"*) ;;
+    *"wv work"*) ;;
+    *) exit 0 ;;
+esac
+
 # Extract the command from Bash tool use
 COMMAND=$(echo "$INPUT" | jq -r '.command // empty' 2>/dev/null)
 

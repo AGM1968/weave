@@ -2,6 +2,37 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.25.0] - 2026-03-18
+
+### Added
+
+- **MCP instrumentation** — `--instrument` flag logs `tools/list` payload bytes, per-tool call
+  counts, and exit summary to stderr. All output prefixed `[weave-mcp-instrument]`.
+- **`--scope=lite` MCP profile** — 6 essential tools (overview, guide, edit_guard, status, work,
+  done) at 2,147 bytes — 85% smaller than the full 14,509-byte `all` scope.
+
+### Changed
+
+- **MCP server consolidation** — Reduced from 4 servers to 2 (`weave` + `weave-inspect`). Removed
+  `weave-graph` and `weave-session` scoped servers (zero token savings, only process overhead).
+- **Agent definitions updated** — All 3 agents (epic-planner, learning-curator, weave-guide) now
+  reference the consolidated `weave` server instead of scoped servers.
+- **copilot-instructions.md** — Documents that Claude Code uses hooks+CLI, not MCP. MCP section
+  updated for 2-server architecture.
+- **SKILL.md trimmed** — `/weave` skill reduced from 25KB to 7KB (73%). Delegation design extracted
+  to `docs/DESIGN-weave-delegation.md`.
+- **Skill audit** — Removed 9 duplicate deprecation notices from 7 skills (AI paste bug from commit
+  94ec383). Fixed `dev-guide` multiline YAML frontmatter.
+
+### Fixed
+
+- **Hook fast-paths** — `pre-action.sh`, `context-guard.sh`, and `post-edit-lint.sh` exit early for
+  non-edit tools. PostToolUse hooks skip non-Write/Edit invocations in <1ms.
+- **Context pack caching** — Stamp-file cache with automatic invalidation on edge changes
+  (`wv link`, `wv block`, `wv resolve`). Second `wv context` call returns instantly.
+- **`context-guard.sh` optimization** — Uses `git ls-files` instead of `find`, caches policy in
+  `$WV_HOT_ZONE/context_policy`.
+
 ## [1.24.0] - 2026-03-17
 
 ### Added

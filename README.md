@@ -185,12 +185,22 @@ Before starting work, get comprehensive context:
 wv context wv-xxxxxx --json
 ```
 
-Returns blockers, ancestors with learnings, related nodes, pitfalls, and contradictions. Cached per
-session with automatic invalidation on graph changes.
+Returns blockers, ancestors with learnings, related nodes, pitfalls, and contradictions.
+
+- **Session-cached** — second call returns instantly from stamp-file cache
+- **Auto-invalidates** — cache clears when edges change (`wv link`, `wv block`, `wv resolve`)
+- **Bounded output** — top 5 related, top 3 pitfalls (prevents context explosion)
 
 ## MCP Server
 
-31 tools for IDE integration (VS Code Copilot, Claude Code):
+31 tools for IDE integration via 2 server instances:
+
+- **`weave`** (scope=all, 31 tools) — full tool set for Copilot Chat
+- **`weave-inspect`** (scope=inspect, 14 tools) — read-only subset for analysis subagents
+- **`--scope=lite`** (6 tools, ~2KB payload) — lightweight profile for constrained contexts
+
+> **Claude Code** does not use MCP — it interacts with Weave via `wv` CLI and enforcement hooks. MCP
+> servers are consumed by VS Code Copilot Chat only.
 
 | MCP Tool                  | CLI Equivalent         | Description                           |
 | ------------------------- | ---------------------- | ------------------------------------- |
@@ -302,17 +312,19 @@ Bidirectional sync between Weave nodes and GitHub issues:
 ## Architecture
 
 ```text
-AI Agent (Copilot / Claude Code)
-        |
-        v
-   MCP Server (31 tools)  <-->  wv CLI
-        |                          |
-        v                          v
-   SQLite on tmpfs           .weave/state.sql
-   (/dev/shm/weave/<hash>)   (git-persisted)
-        |
-        v
-   GitHub Issues (bidirectional sync)
+Copilot Chat (@copilot)           Claude Code (@claude / CLI)
+        |                                 |
+        v                                 v
+   MCP Server (2 instances)          wv CLI + hooks
+        |                                 |
+        +------------+--------------------+
+                     |
+                     v
+              SQLite on tmpfs           .weave/state.sql
+              (/dev/shm/weave/<hash>)   (git-persisted)
+                     |
+                     v
+              GitHub Issues (bidirectional sync)
 ```
 
 - **Hot zone:** SQLite database on tmpfs for sub-millisecond queries

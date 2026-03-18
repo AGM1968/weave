@@ -7,6 +7,13 @@ set -e
 # Read stdin (JSON payload from Claude Code)
 INPUT=$(cat)
 
+# Fast path: skip jq if stdin doesn't contain our trigger pattern
+case "$INPUT" in
+    *"wv done"*) ;;
+    *"wv ship"*) ;;
+    *) exit 0 ;;
+esac
+
 # Extract the command from Bash tool use
 COMMAND=$(echo "$INPUT" | jq -r '.command // empty' 2>/dev/null)
 
@@ -43,23 +50,18 @@ if [[ "$COMMAND" =~ wv[[:space:]]done[[:space:]]wv-[0-9a-f]{4,6} ]]; then
             fi
 
             if [[ "$IS_TRIVIAL" == "false" ]]; then
-                # Build and self-validate JSON before output
+                # PreToolUse blocking: exit 2 + permissionDecision DENY
                 JSON_OUT=$(jq -n \
                     --arg node "$NODE_ID" \
-                    --arg reason "Verification evidence required before closing $NODE_ID. Add verification metadata or use --skip-verification for trivial tasks." \
-                    --arg pdr "Node $NODE_ID has no verification metadata. Verification enforces 'works right' over 'looks right' before the CLOSE phase." \
+                    --arg msg "Verification evidence required before closing $NODE_ID. Add verification metadata with wv update or use --skip-verification for trivial tasks." \
                     '{
-                        "decision": "block",
-                        "reason": $reason,
-                        "permissionDecisionReason": $pdr,
-                        "node": $node,
-                        "options": [
-                            "wv update <id> --metadata='"'"'{\"verification\":{\"method\":\"test\",\"command\":\"...\",\"result\":\"pass\",\"evidence\":\"...\"}}'"'"' && wv done <id> --learning=\"...\"",
-                            "wv done <id> --skip-verification --learning=\"...\"  # Explicitly bypass for trivial tasks"
-                        ]
+                        "hookSpecificOutput": {
+                            "permissionDecision": "DENY",
+                            "message": $msg
+                        }
                     }')
                 echo "$JSON_OUT"
-                exit 0
+                exit 2
             fi
         fi
     fi

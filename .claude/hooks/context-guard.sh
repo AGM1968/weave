@@ -19,14 +19,19 @@ NC='\033[0m'
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 WEAVE_DIR="$REPO_ROOT/.weave"
 
+# Policy cache (1-hour TTL)
+_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave}"
+POLICY_CACHE="${POLICY_CACHE:-${_HOT_ZONE}/.context_policy}"
+POLICY_TTL=3600
+
 # Heuristics for policy decision
 determine_policy() {
     local policy="MEDIUM"
     local reasons=()
     
-    # Check for large files in common locations
-    large_files=$(find "$REPO_ROOT" -type f \( -name "*.py" -o -name "*.ts" -o -name "*.js" -o -name "*.go" \) \
-        -size +50k 2>/dev/null | wc -l)
+    # Check for large files in common locations (git ls-files reads index, no disk walk)
+    large_files=$(cd "$REPO_ROOT" && git ls-files -z '*.py' '*.ts' '*.js' '*.go' 2>/dev/null | \
+        xargs -0 -r stat -c %s 2>/dev/null | awk '$1 > 51200 {c++} END {print c+0}')
     
     if [ "$large_files" -gt 10 ]; then
         policy="LOW"
@@ -42,8 +47,8 @@ determine_policy() {
         fi
     fi
     
-    # Check if we're in a known large repo
-    total_files=$(find "$REPO_ROOT" -type f -name "*.py" -o -name "*.ts" -o -name "*.js" 2>/dev/null | wc -l)
+    # Check if we're in a known large repo (git ls-files reads index, no disk walk)
+    total_files=$(git -C "$REPO_ROOT" ls-files '*.py' '*.ts' '*.js' 2>/dev/null | wc -l)
     if [ "$total_files" -gt 500 ]; then
         if [ "$policy" = "MEDIUM" ]; then
             policy="MEDIUM"  # Don't downgrade further, just note it
@@ -68,11 +73,20 @@ if [ -x "$WV" ]; then
     "$WV" status 2>/dev/null || true
 fi
 
-# Determine and display policy
+# Determine and display policy (with 1-hour TTL cache)
 echo ""
-_policy_output=$(determine_policy)
-policy=$(echo "$_policy_output" | head -1)
-mapfile -t reasons < <(echo "$_policy_output" | tail -n +2)
+if [ -f "$POLICY_CACHE" ] && [ "$(( $(date +%s) - $(stat -c %Y "$POLICY_CACHE" 2>/dev/null || echo 0) ))" -lt "$POLICY_TTL" ]; then
+    # Cache hit — read stored policy
+    policy=$(head -1 "$POLICY_CACHE")
+    mapfile -t reasons < <(tail -n +2 "$POLICY_CACHE")
+else
+    # Cache miss — compute and store
+    _policy_output=$(determine_policy)
+    policy=$(echo "$_policy_output" | head -1)
+    mapfile -t reasons < <(echo "$_policy_output" | tail -n +2)
+    mkdir -p "$(dirname "$POLICY_CACHE")"
+    printf '%s\n' "$policy" "${reasons[@]}" > "$POLICY_CACHE" 2>/dev/null || true
+fi
 
 case $policy in
     HIGH)

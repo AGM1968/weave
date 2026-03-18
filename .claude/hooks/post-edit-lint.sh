@@ -25,8 +25,8 @@ if [[ "$FILE_PATH" =~ \.py$ ]]; then
     if command -v ruff &> /dev/null && [ -f "$FILE_PATH" ]; then
         ISSUES=$(ruff check "$FILE_PATH" 2>&1 || true)
         if [ -n "$ISSUES" ] && [ "$ISSUES" != "All checks passed!" ]; then
-            echo "{\"decision\": \"block\", \"reason\": \"Python lint issues found:\\n$ISSUES\"}"
-            exit 1
+            echo "{\"additionalContext\": \"Ruff lint issues in $FILE_PATH:\\n$ISSUES\"}"
+            exit 0
         fi
     fi
     # Also run mypy on the containing module directory
@@ -42,8 +42,8 @@ if [[ "$FILE_PATH" =~ \.py$ ]]; then
             REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "$(pwd)")
             MYPY_OUT=$(cd "$REPO_ROOT" && python3 -m mypy "$MODULE_DIR" --ignore-missing-imports --no-error-summary 2>&1 || true)
             if echo "$MYPY_OUT" | grep -q "error:"; then
-                echo "{\"decision\": \"block\", \"reason\": \"mypy type errors found:\\n$MYPY_OUT\"}"
-                exit 1
+                echo "{\"additionalContext\": \"mypy type errors in $MODULE_DIR:\\n$MYPY_OUT\"}"
+                exit 0
             fi
         fi
     fi
@@ -55,9 +55,8 @@ if [[ "$FILE_PATH" =~ \.(md|json|yaml|yml|js|ts|css|html)$ ]]; then
     if command -v prettier &> /dev/null && [ -f "$FILE_PATH" ]; then
         # Check if file needs formatting
         if ! prettier --check "$FILE_PATH" &> /dev/null; then
-            # Auto-format the file
+            # Auto-format the file — silent success (no output needed)
             prettier --write "$FILE_PATH" &> /dev/null || true
-            echo "{\"decision\": \"allow\", \"message\": \"File auto-formatted with prettier\"}"
         fi
     fi
     exit 0

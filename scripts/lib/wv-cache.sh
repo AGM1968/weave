@@ -21,4 +21,9 @@ invalidate_context_cache() {
             rm -f "$cache_dir/${node_id}.json" 2>/dev/null
         done
     fi
+
+    # Also clear pre-action.sh first-call-only stamps so context is re-checked
+    for node_id in $affected_ids; do
+        rm -f "$WV_HOT_ZONE/.context_checked_${node_id}" 2>/dev/null
+    done
 }

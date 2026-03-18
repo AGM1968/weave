@@ -268,6 +268,66 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "2" "$EXIT_CODE" "pre-action: blocks installed-path edit via snake_case file_path"
 
+# --- pre-action.sh (first-call-only cache: hit, miss, invalidation) ---
+echo ""
+echo "--- pre-action.sh (context cache S2.1-S2.3) ---"
+
+# Cache miss: first call creates stamp file
+setup_test_env
+TASK_ID=$("$WV" add "Cache test" --status=active 2>/dev/null | tail -1)
+# Clear any existing stamp
+rm -f "$WV_HOT_ZONE/.context_checked_"* 2>/dev/null || true
+set +e
+OUTPUT=$(echo '{"tool_name":"Edit","tool_input":{"file_path":"test.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "cache: first call passes (cache miss)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ -f "$WV_HOT_ZONE/.context_checked_${TASK_ID}" ]; then
+    echo -e "${GREEN}✓${NC} cache: stamp file created after first call"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} cache: stamp file created after first call"
+    echo "  Expected $WV_HOT_ZONE/.context_checked_${TASK_ID} to exist"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# Cache hit: second call exits 0 immediately (stamp exists)
+set +e
+OUTPUT=$(echo '{"tool_name":"Edit","tool_input":{"file_path":"test.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "cache: second call passes (cache hit)"
+
+# Invalidation: invalidate_context_cache clears stamp
+source "$PROJECT_ROOT/scripts/lib/wv-cache.sh"
+invalidate_context_cache "$TASK_ID"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ ! -f "$WV_HOT_ZONE/.context_checked_${TASK_ID}" ]; then
+    echo -e "${GREEN}✓${NC} cache: stamp cleared by invalidate_context_cache"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} cache: stamp cleared by invalidate_context_cache"
+    echo "  Expected stamp to be removed"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# After invalidation: next call re-checks (cache miss again) and re-creates stamp
+set +e
+OUTPUT=$(echo '{"tool_name":"Edit","tool_input":{"file_path":"test.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "cache: call after invalidation passes (re-check)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ -f "$WV_HOT_ZONE/.context_checked_${TASK_ID}" ]; then
+    echo -e "${GREEN}✓${NC} cache: stamp re-created after invalidation"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} cache: stamp re-created after invalidation"
+    echo "  Expected $WV_HOT_ZONE/.context_checked_${TASK_ID} to exist"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 # --- pre-claim-skills.sh (matching command) ---
 echo ""
 echo "--- pre-claim-skills.sh ---"
@@ -289,16 +349,13 @@ echo "--- pre-close-verification.sh ---"
 setup_test_env
 ID=$("$WV" add "Close test" --status=active 2>/dev/null | tail -1)
 
-OUTPUT=$(echo "{\"command\":\"wv done $ID\"}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
-assert_contains "$OUTPUT" "Verification evidence required" "pre-close: warns when no verification metadata"
-assert_contains "$OUTPUT" "\"decision\": \"block\"" "pre-close: hookSpecificOutput has decision:block"
-
-# Check exit code is 0 (structured deny via hookSpecificOutput, not hard exit 2)
 set +e
-echo "{\"command\":\"wv done $ID\"}" | bash "$HOOKS_DIR/pre-close-verification.sh" >/dev/null 2>/dev/null
+OUTPUT=$(echo "{\"command\":\"wv done $ID\"}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
-assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 (structured deny) when no verification"
+assert_contains "$OUTPUT" "Verification evidence required" "pre-close: warns when no verification metadata"
+assert_contains "$OUTPUT" "\"permissionDecision\": \"DENY\"" "pre-close: uses permissionDecision DENY schema"
+assert_exit_code "2" "$EXIT_CODE" "pre-close: exits 2 (hard block) when no verification"
 
 # With --skip-verification flag (should pass)
 set +e
@@ -453,13 +510,13 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "lifecycle: post-edit-lint passes"
 
-# 5. Try to close without verification (should block with exit 1)
+# 5. Try to close without verification (should hard-block with exit 2)
 set +e
 OUTPUT=$(echo "{\"command\":\"wv done $TASK_ID\"}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
 assert_contains "$OUTPUT" "Verification evidence required" "lifecycle: close blocked without verification"
-assert_exit_code "0" "$EXIT_CODE" "lifecycle: close exits 0 (structured deny) without verification"
+assert_exit_code "2" "$EXIT_CODE" "lifecycle: close exits 2 (hard block) without verification"
 
 # 6. Add verification and close (should be silent)
 "$WV" update "$TASK_ID" --metadata='{"verification":{"method":"test","command":"echo ok","result":"pass","evidence":"lifecycle test"}}' 2>/dev/null
@@ -500,6 +557,65 @@ assert_exit_code "0" "$EXIT_CODE" "lifecycle: session ends cleanly"
 "$WV" add "Another active task" --status=active 2>/dev/null
 OUTPUT=$(bash "$HOOKS_DIR/pre-compact-context.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "Active:" "lifecycle: pre-compact reports active work during session"
+
+# ============================================================
+# Context-guard tests (S1.5 + S1.6)
+# ============================================================
+echo ""
+echo "=== Context Guard ==="
+
+# Reset to test project
+cd "$TEST_DIR/project"
+export POLICY_CACHE="$TEST_DIR/.context_policy"
+rm -f "$POLICY_CACHE" 2>/dev/null || true
+
+# Create some tracked files so git ls-files has something
+for i in $(seq 1 5); do echo "x=1" > "mod${i}.py"; done
+git add -A && git commit -m "add test files" -q
+
+# 1. Fresh run → should produce a policy (small repo = HIGH)
+set +e
+OUTPUT=$(bash "$HOOKS_DIR/context-guard.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "context-guard: exits 0"
+assert_contains "$OUTPUT" "policy:" "context-guard: emits policy line"
+
+# 2. Cache file should exist after first run
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ -f "$POLICY_CACHE" ]; then
+    echo -e "${GREEN}✓${NC} context-guard: cache file created"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} context-guard: cache file created"
+    echo "  Expected $POLICY_CACHE to exist"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# 3. Cached policy matches first run
+CACHED_POLICY=$(head -1 "$POLICY_CACHE" 2>/dev/null || echo "")
+assert_equals "HIGH" "$CACHED_POLICY" "context-guard: small repo yields HIGH policy"
+
+# 4. Cache TTL expiry — backdate cache mtime, should recompute
+touch -d "2 hours ago" "$POLICY_CACHE" 2>/dev/null || touch -t 202001010000 "$POLICY_CACHE"
+set +e
+OUTPUT2=$(bash "$HOOKS_DIR/context-guard.sh" 2>/dev/null)
+EXIT_CODE2=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE2" "context-guard: exits 0 after stale cache"
+# Cache should be refreshed (mtime within last minute)
+MTIME=$(stat -c %Y "$POLICY_CACHE" 2>/dev/null || echo 0)
+NOW=$(date +%s)
+AGE=$(( NOW - MTIME ))
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ "$AGE" -lt 60 ]; then
+    echo -e "${GREEN}✓${NC} context-guard: stale cache was refreshed"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} context-guard: stale cache was refreshed"
+    echo "  Cache age: ${AGE}s (expected < 60s)"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
 
 # ============================================================
 echo ""

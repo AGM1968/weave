@@ -133,8 +133,33 @@ you're actually done — the soft warning is not a signal to stop working.
 - `/breadcrumbs [<id>]` — Session memory capsule
 - `/close-session` — End-of-session sync + push protocol
 
+### Local Skills
+
+Create project-specific skills by adding a `SKILL.md` file in `.claude/skills/<name>/`:
+
+```bash
+mkdir -p .claude/skills/my-skill
+cat > .claude/skills/my-skill/SKILL.md << 'EOF'
+---
+name: my-skill
+description: "What it does. Use when <trigger condition>."
+---
+
+# My Skill
+
+Instructions here. Claude Code discovers this automatically.
+EOF
+```
+
+- **Claude Code** auto-discovers skills from `.claude/skills/` — no registration needed
+- **VS Code Copilot** does not see skills (use MCP tools or `copilot-instructions.md` instead)
+- Local skills are committed to git and shared with your team
+- `wv init-repo --update` preserves user-created skills (only updates Weave-shipped ones)
+
 ## Agents
 
-- **weave-guide** — Workflow best practices, anti-patterns
-- **epic-planner** — Strategic planning (scope, dependencies, risks)
-- **learning-curator** — Extract learnings, retrospective analysis
+All agents use the main `weave` MCP server (all 31 tools). Each specializes in a subset:
+
+- **weave-guide** — Workflow best practices, anti-patterns (session lifecycle tools)
+- **epic-planner** — Strategic planning, scope, dependencies, risks (graph mutation tools)
+- **learning-curator** — Extract learnings, retrospective analysis (read-only inspect tools)
