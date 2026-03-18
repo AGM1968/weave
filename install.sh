@@ -915,14 +915,6 @@ AGENTSEOF
       "command": "node",
       "args": ["$MCP_SERVER"]
     },
-    "weave-graph": {
-      "command": "node",
-      "args": ["$MCP_SERVER", "--scope=graph"]
-    },
-    "weave-session": {
-      "command": "node",
-      "args": ["$MCP_SERVER", "--scope=session"]
-    },
     "weave-inspect": {
       "command": "node",
       "args": ["$MCP_SERVER", "--scope=inspect"]
@@ -989,14 +981,6 @@ if [ "$AGENT" = "copilot" ]; then
     "weave": {
       "command": "node",
       "args": ["$MCP_SERVER"]
-    },
-    "weave-graph": {
-      "command": "node",
-      "args": ["$MCP_SERVER", "--scope=graph"]
-    },
-    "weave-session": {
-      "command": "node",
-      "args": ["$MCP_SERVER", "--scope=session"]
     },
     "weave-inspect": {
       "command": "node",
