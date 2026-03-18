@@ -789,7 +789,9 @@ cmd_context() {
     ")
     blockers_json="${blockers_json:-[]}"
 
-    # Get ancestors (recursive blocking chain with cycle detection and depth limit)
+    # Get ancestors (walk blocks + implements chains with cycle detection and depth limit)
+    # blocks: source=blocker → target=blocked (walk from blocked to blocker)
+    # implements: source=child → target=parent (walk from child to parent)
     # Uses ',id,' delimited path to prevent substring false-matches (wv-77cd fix)
     local ancestors_json
     ancestors_json=$(db_query_json "
@@ -797,6 +799,7 @@ cmd_context() {
             SELECT id, text, status, metadata, 0 as depth, ',' || id || ',' as path
             FROM nodes WHERE id = '$id'
             UNION
+            -- Walk blocks edges: blocker (source) → blocked (target)
             SELECT n.id, n.text, n.status, n.metadata, a.depth + 1, a.path || n.id || ','
             FROM nodes n
             JOIN edges e ON e.source = n.id
@@ -804,8 +807,17 @@ cmd_context() {
             WHERE e.type = 'blocks'
               AND a.depth < 100
               AND instr(a.path, ',' || n.id || ',') = 0
+            UNION
+            -- Walk implements edges: child (source) → parent (target)
+            SELECT n.id, n.text, n.status, n.metadata, a.depth + 1, a.path || n.id || ','
+            FROM nodes n
+            JOIN edges e ON e.target = n.id
+            JOIN ancestry a ON e.source = a.id
+            WHERE e.type = 'implements'
+              AND a.depth < 100
+              AND instr(a.path, ',' || n.id || ',') = 0
         )
-        SELECT DISTINCT id, text, status, json(metadata) FROM ancestry WHERE depth > 0 ORDER BY depth DESC;
+        SELECT DISTINCT id, text, status, json(metadata) as metadata FROM ancestry WHERE depth > 0 ORDER BY depth DESC;
     ")
     ancestors_json="${ancestors_json:-[]}"
 
@@ -888,13 +900,28 @@ cmd_context() {
                 status,
                 learnings: (
                     (.metadata | if type == "string" then fromjson else . end) as $meta |
+                    # Parse structured "decision: ... | pattern: ... | pitfall: ..." from learning string
+                    (if $meta.learning then
+                        ($meta.learning | split(" | ") | reduce .[] as $part (
+                            {};
+                            if ($part | startswith("decision: ")) then .decision = ($part | ltrimstr("decision: "))
+                            elif ($part | startswith("pattern: ")) then .pattern = ($part | ltrimstr("pattern: "))
+                            elif ($part | startswith("pitfall: ")) then .pitfall = ($part | ltrimstr("pitfall: "))
+                            else .raw = ((.raw // "") + $part)
+                            end
+                        ) |
+                        # If no structured fields were parsed, put the whole string in raw
+                        if (.decision or .pattern or .pitfall) then . else {raw: $meta.learning} end)
+                    else {} end) as $parsed |
                     {
-                        decision: ($meta.decision // null),
-                        pattern: ($meta.pattern // null),
-                        pitfall: ($meta.pitfall // null)
+                        decision: ($meta.decision // $parsed.decision // null),
+                        pattern: ($meta.pattern // $parsed.pattern // null),
+                        pitfall: ($meta.pitfall // $parsed.pitfall // null),
+                        raw: ($parsed.raw // null)
                     } |
-                    # Only include learnings object if at least one field is present
-                    if (.decision or .pattern or .pitfall) then . else null end
+                    # Strip null fields, only include if at least one field is present
+                    with_entries(select(.value != null)) |
+                    if length > 0 then . else null end
                 )
             })),
             related: ($related[0:5] | map({id, text, edge, weight, context: (.context | fromjson? // .context)})),
