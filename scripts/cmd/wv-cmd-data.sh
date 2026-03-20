@@ -466,11 +466,25 @@ EOF
         # No transaction: PRAGMA foreign_keys is no-op inside transactions
         if [ -d "$WEAVE_DIR/deltas" ]; then
             local delta_files delta_count=0
+            # Prune epoch: skip deltas older than the last prune to prevent
+            # resurrecting pruned nodes from stale INSERT OR REPLACE statements.
+            local prune_epoch=0
+            if [ -f "$WEAVE_DIR/.prune_epoch" ]; then
+                prune_epoch=$(cat "$WEAVE_DIR/.prune_epoch" 2>/dev/null || echo "0")
+            fi
             delta_files=$(find "$WEAVE_DIR/deltas" -name '*.sql' -printf '%f\t%p\n' 2>/dev/null | sort | cut -f2)
             if [ -n "$delta_files" ]; then
                 sqlite3 "$WV_DB" "PRAGMA foreign_keys = OFF;" 2>/dev/null
+                local skipped=0
                 while IFS= read -r delta; do
                     if [ -s "$delta" ]; then
+                        # Extract timestamp from filename (format: <epoch>-<agent>.sql)
+                        local delta_ts
+                        delta_ts=$(basename "$delta" | grep -oP '^\d+' 2>/dev/null || echo "0")
+                        if [ "$delta_ts" -le "$prune_epoch" ] 2>/dev/null; then
+                            skipped=$((skipped + 1))
+                            continue  # Skip pre-prune delta
+                        fi
                         if sqlite3 "$WV_DB" < "$delta" 2>/dev/null; then
                             delta_count=$((delta_count + 1))
                         else
@@ -483,6 +497,9 @@ EOF
                     # Clear change log so replayed ops don't snowball as new deltas
                     wv_delta_reset "$WV_DB"
                     echo -e "${GREEN}✓${NC} Replayed $delta_count delta(s)" >&2
+                fi
+                if [ "$skipped" -gt 0 ]; then
+                    echo -e "${YELLOW}ℹ${NC} Skipped $skipped pre-prune delta(s)" >&2
                 fi
             fi
         fi
@@ -668,6 +685,20 @@ cmd_prune() {
     done
     # Clear change log so DELETEs don't propagate via auto_sync deltas
     wv_delta_reset "$WV_DB"
+
+    # Record prune epoch — on next wv load, delta files older than this
+    # timestamp are skipped so pruned nodes don't resurrect from stale INSERTs.
+    date +%s > "$WEAVE_DIR/.prune_epoch"
+
+    # Re-dump state.sql so it no longer contains pruned nodes.
+    # Without this, wv load would resurrect them from the stale snapshot.
+    local tmp_sql
+    tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
+    if sqlite3 -cmd ".timeout 5000" "$WV_DB" ".dump" 2>/dev/null | strip_unistr > "$tmp_sql" && [ -s "$tmp_sql" ]; then
+        mv "$tmp_sql" "$WEAVE_DIR/state.sql"
+    else
+        rm -f "$tmp_sql"
+    fi
 
     # Invalidate context cache for all affected nodes
     # shellcheck disable=SC2086  # word-split intentional — affected_nodes is space-delimited ID list

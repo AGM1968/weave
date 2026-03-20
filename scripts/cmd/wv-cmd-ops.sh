@@ -1202,11 +1202,16 @@ cmd_selftest() {
     local test_dir
     test_dir=$(mktemp -d "${TMPDIR:-/tmp}/wv-selftest-XXXXXX")
 
-    # Isolated environment — override hot zone and DB
+    # Isolated environment — override hot zone, DB, AND WEAVE_DIR
+    # Without WEAVE_DIR override, auto_sync writes state.sql/deltas to the
+    # real .weave/ directory, corrupting the live graph on next load.
     local orig_db="${WV_DB:-}"
     local orig_hz="${WV_HOT_ZONE:-}"
+    local orig_wd="${WEAVE_DIR:-}"
     export WV_HOT_ZONE="$test_dir"
     export WV_DB="$test_dir/brain.db"
+    export WEAVE_DIR="$test_dir/.weave"
+    mkdir -p "$WEAVE_DIR/deltas"
     _WV_DB_READY=""
     _WV_SIZE_CHECKED=""
 
@@ -1217,6 +1222,7 @@ cmd_selftest() {
     # Cleanup
     export WV_DB="$orig_db"
     export WV_HOT_ZONE="$orig_hz"
+    export WEAVE_DIR="$orig_wd"
     _WV_DB_READY=""
     _WV_SIZE_CHECKED=""
     cd /tmp || true
