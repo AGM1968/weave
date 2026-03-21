@@ -1,6 +1,6 @@
 # Weave Agents
 
-Specialized subagents for Weave workflow. Use via the Task tool with the appropriate
+Specialized subagents for Weave workflow. Use via the Agent tool with the appropriate
 `subagent_type`.
 
 | Agent            | Purpose                        | Trigger                          |

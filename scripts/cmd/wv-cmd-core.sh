@@ -566,8 +566,12 @@ cmd_done() {
         _done_store_learning "$id" "$learning"
     fi
 
-    # === Close: update status, clear primary, aggregate commits ===
-    db_query "UPDATE nodes SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+    # === Close: update status, release claim, clear primary, aggregate commits ===
+    db_query "UPDATE nodes
+        SET status='done',
+            metadata = json_remove(COALESCE(metadata,'{}'), '$.claimed_by'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id='$id';"
 
     local primary
     primary=$(get_primary_node 2>/dev/null || echo "")
@@ -849,28 +853,31 @@ cmd_work() {
 
     local id="${1:-}"
     local quiet=false
+    local force=false
 
     shift || true
     while [ $# -gt 0 ]; do
         case "$1" in
             --quiet|-q) quiet=true ;;
+            --force|-f) force=true ;;
         esac
         shift
     done
 
     if [ -z "$id" ]; then
         echo -e "${RED}Error: node ID required${NC}" >&2
-        echo "Usage: wv work <id> [--quiet]" >&2
+        echo "Usage: wv work <id> [--quiet] [--force]" >&2
         echo "" >&2
         echo "Claims a node and sets WV_ACTIVE for subagent context inheritance." >&2
+        echo "Use --force to override a stale claim from another agent." >&2
         echo "Run the export command to enable subagent context:" >&2
         echo "  eval \"\$(wv work <id> --quiet)\"" >&2
         return 1
     fi
-    
+
     # Validate ID format
     validate_id "$id" || return 1
-    
+
     # Verify node exists
     local exists
     exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
@@ -878,13 +885,42 @@ cmd_work() {
         echo -e "${RED}Error: node $id not found${NC}" >&2
         return 1
     fi
-    
-    # Mark as active and set as primary
-    local cur_status
-    cur_status=$(db_query "SELECT status FROM nodes WHERE id='$id';")
-    if [ "$cur_status" != "active" ]; then
-        db_query "UPDATE nodes SET status='active', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+
+    # Resolve agent identity (strip quotes for SQL safety)
+    local agent_id
+    agent_id="$(sql_escape "${WV_AGENT_ID:-$(hostname)-$(whoami)}")"
+
+    # Atomic CAS claim: succeeds only if unclaimed or already claimed by this agent
+    local claim_changes
+    claim_changes=$(db_query "
+        UPDATE nodes
+        SET metadata = json_set(COALESCE(metadata,'{}'), '$.claimed_by', '$agent_id'),
+            status = 'active',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = '$id'
+          AND (json_extract(metadata, '$.claimed_by') IS NULL
+               OR json_extract(metadata, '$.claimed_by') = '$agent_id');
+        SELECT changes();
+    ")
+
+    if [ "$claim_changes" = "0" ]; then
+        # Claim lost — another agent holds it
+        local holder
+        holder=$(db_query "SELECT json_extract(metadata, '$.claimed_by') FROM nodes WHERE id='$id';")
+        if [ "$force" = true ]; then
+            echo -e "${YELLOW}⚠ Overriding stale claim held by: $holder${NC}" >&2
+            db_query "UPDATE nodes
+                SET metadata = json_set(COALESCE(metadata,'{}'), '$.claimed_by', '$agent_id'),
+                    status = 'active',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = '$id';"
+        else
+            echo -e "${RED}✗ $id is claimed by $holder${NC}" >&2
+            echo "  Use --force to override a stale claim." >&2
+            return 1
+        fi
     fi
+
     set_primary_node "$id"
     
     if [ "$quiet" = true ]; then
@@ -936,15 +972,44 @@ cmd_work() {
 cmd_ready() {
     local format="text"
     local count_only=false
-    
+    local show_all=false
+    local subtree_id=""
+
     while [ $# -gt 0 ]; do
         case "$1" in
-            --json) format="json" ;;
-            --count) count_only=true ;;
+            --json)      format="json" ;;
+            --count)     count_only=true ;;
+            --all)       show_all=true ;;
+            --subtree=*) subtree_id="${1#--subtree=}" ;;
+            --subtree)   shift; subtree_id="${1:-}" ;;
         esac
         shift
     done
-    
+
+    # Agent identity for claim filtering (same default as cmd_work)
+    local agent_id
+    agent_id="$(sql_escape "${WV_AGENT_ID:-$(hostname)-$(whoami)}")"
+
+    # Validate subtree epic and build recursive CTE (walks implements edges downward)
+    local subtree_cte="" subtree_join=""
+    if [ -n "$subtree_id" ]; then
+        subtree_id="$(sql_escape "$subtree_id")"
+        local epic_exists
+        epic_exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$subtree_id';" 2>/dev/null || echo "0")
+        if [ "$epic_exists" = "0" ]; then
+            echo -e "${RED}Error: node $subtree_id not found${NC}" >&2
+            return 1
+        fi
+        subtree_cte="WITH RECURSIVE _subtree(id) AS (
+            SELECT '$subtree_id'
+            UNION ALL
+            SELECT e.source FROM edges e
+            JOIN _subtree s ON e.target = s.id
+            WHERE e.type = 'implements'
+        )"
+        subtree_join="JOIN _subtree st ON n.id = st.id"
+    fi
+
     # Ready = todo status AND not blocked by any open node
     local ready_where="
         n.status = 'todo'
@@ -957,19 +1022,30 @@ cmd_ready() {
         )
     "
 
+    # Default: hide nodes claimed by other agents; --all shows everything
+    local claim_filter=""
+    if [ "$show_all" = false ]; then
+        claim_filter="AND (json_extract(n.metadata, '$.claimed_by') IS NULL
+                          OR json_extract(n.metadata, '$.claimed_by') = '$agent_id')"
+    fi
+
     if [ "$count_only" = true ]; then
-        db_query "SELECT COUNT(*) FROM nodes n WHERE $ready_where;"
+        db_query "$subtree_cte SELECT COUNT(*) FROM nodes n $subtree_join WHERE $ready_where $claim_filter;"
         return
     fi
 
     if [ "$format" = "json" ]; then
         local results
-        results=$(db_query_json "SELECT n.id, n.text, n.status, n.metadata FROM nodes n WHERE $ready_where ORDER BY n.created_at ASC;")
+        results=$(db_query_json "$subtree_cte SELECT n.id, n.text, n.status, n.metadata FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY n.created_at ASC, n.id ASC;")
         [ -z "$results" ] && echo "[]" || echo "$results"
     else
-        # Text mode: exclude metadata to avoid multiline JSON breaking pipe-delimited parsing
-        db_query "SELECT n.id, n.text FROM nodes n WHERE $ready_where ORDER BY n.created_at ASC;" | while IFS='|' read -r id text; do
-            echo -e "${CYAN}$id${NC}: $text"
+        db_query "$subtree_cte SELECT n.id, n.text, json_extract(n.metadata, '$.claimed_by') FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY n.created_at ASC, n.id ASC;" \
+        | while IFS='|' read -r id text claimed_by; do
+            if [ -n "$claimed_by" ]; then
+                echo -e "${CYAN}$id${NC}: $text ${YELLOW}(claimed: $claimed_by)${NC}"
+            else
+                echo -e "${CYAN}$id${NC}: $text"
+            fi
         done
     fi
 }
@@ -1056,11 +1132,11 @@ cmd_list() {
 
     if [ "$format" = "json" ]; then
         local results
-        results=$(db_query_json "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC;")
+        results=$(db_query_json "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC;")
         [ -z "$results" ] && echo "[]" || echo "$results"
     else
         # Text mode: exclude metadata to avoid multiline JSON breaking pipe-delimited parsing
-        db_query "SELECT id, text, status FROM nodes $where_clause ORDER BY priority DESC, created_at DESC;" | while IFS='|' read -r id text status; do
+        db_query "SELECT id, text, status FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC;" | while IFS='|' read -r id text status; do
             local color="$NC"
             case "$status" in
                 active) color="$GREEN" ;;

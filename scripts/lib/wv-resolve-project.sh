@@ -10,7 +10,11 @@ if [ -z "$WV_PROJECT_DIR" ] && [ -n "$CLAUDE_PROJECT_DIR" ]; then
 fi
 if [ -z "$WV_PROJECT_DIR" ]; then
   # Last resort: derive from hook location (.claude/hooks/ → project root)
-  WV_PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[1]}")/../.." && pwd)"
+  # Only use if that derived path has been explicitly initialised with wv-init-repo
+  _DERIVED="$(cd "$(dirname "${BASH_SOURCE[1]}")/../.." && pwd)"
+  if [ -d "$_DERIVED/.weave" ]; then
+    WV_PROJECT_DIR="$_DERIVED"
+  fi
 fi
 export WV_PROJECT_DIR
 WV="$WV_PROJECT_DIR/scripts/wv"

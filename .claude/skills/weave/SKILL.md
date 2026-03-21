@@ -36,21 +36,14 @@ node_text=$(echo "$context" | jq -r '.node.text')
 blockers=$(echo "$context" | jq -r '.blockers | length')
 ```
 
-**When spawning via runSubagent:**
+**When spawning subagents:**
 
-Include WV_ACTIVE in the prompt for subagents that need graph context:
+Include WV_ACTIVE in the prompt for subagents that need graph context. In Claude Code, use the
+Agent tool (`subagent_type: "learning-curator"` etc.). The subagent inherits `WV_ACTIVE` from the
+environment automatically.
 
-```text
-runSubagent(
-  description: "Analyze blockers for current node",
-  prompt: "Current work context:
-           WV_ACTIVE: $WV_ACTIVE
-
-           Run: wv context --json
-
-           Analyze the blockers array and report which must be resolved first."
-)
-```
+> **Agent SDK (future):** MCP-based clients will invoke subagents via `weave_work` / `weave_context`
+> tools instead of the Agent tool.
 
 **Benefits:**
 
@@ -156,7 +149,8 @@ Before spawning any weave agent (`epic-planner`, `learning-curator`, `weave-guid
 **DO NOT call `wv done` until:**
 
 1. **Learning-curator invoked** (non-trivial work):
-   - `runSubagent(learning-curator)` with node text + files changed + work summary
+   - Invoke via Agent tool (`subagent_type: "learning-curator"`) with node text + files changed + work summary
+   - _(Agent SDK / MCP clients: use `weave_learnings` tool instead)_
    - Learnings must contain: `decision:` | `pattern:` | `pitfall:`
    - Trivial only (doc typo, breadcrumbs): `--skip-learnings`
 
@@ -166,7 +160,7 @@ Before spawning any weave agent (`epic-planner`, `learning-curator`, `weave-guid
 
 ```text
 ✗ WRONG:  wv done wv-XXXX --learning="fixed the bug"
-✓ RIGHT:  runSubagent(learning-curator) → structured learnings
+✓ RIGHT:  Invoke learning-curator (Agent tool) → structured learnings
           wv done wv-XXXX --learning="decision: ... | pattern: ... | pitfall: ..."
 ```
 

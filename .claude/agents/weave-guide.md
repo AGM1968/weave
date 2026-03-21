@@ -11,6 +11,10 @@ dependency management, and knowledge capture.
 
 ## MCP Server
 
+> **Context-dependent tool access:**
+> - **Claude Code subagents:** Use `wv` CLI via Bash tool (tools listed in frontmatter above)
+> - **Copilot Chat / Agent SDK:** MCP tools below are available
+
 This agent uses the **`weave`** MCP server (all 31 tools available). Its primary tools are the
 workflow lifecycle operations: `weave_work`, `weave_ship`, `weave_quick`, `weave_overview`,
 `weave_close_session`, `weave_breadcrumbs`, `weave_plan`, `weave_edit_guard`.

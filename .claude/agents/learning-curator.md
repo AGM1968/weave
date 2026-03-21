@@ -11,17 +11,21 @@ add learnings to nodes and identifies patterns across multiple tasks.
 
 ## MCP Server
 
-This agent uses the **`weave`** MCP server (all 31 tools available). Its primary tools are the
-read-only query operations: `weave_context`, `weave_search`, `weave_tree`, `weave_learnings`,
+> **Context-dependent tool access:**
+> - **Claude Code subagents:** Use `wv` CLI via Bash tool (tools listed in frontmatter above)
+> - **Copilot Chat / Agent SDK:** MCP tools below are available
+
+This agent uses the **`weave-inspect`** MCP server (14 read-only tools). Its primary tools are
+the query operations: `weave_context`, `weave_search`, `weave_tree`, `weave_learnings`,
 `weave_status`, `weave_health`, `weave_preflight`, `weave_sync`, `weave_guide`, `weave_show`,
 `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`.
 
 ```jsonc
 // .vscode/mcp.json — server for this agent
-"weave": {
+"weave-inspect": {
   "type": "stdio",
   "command": "node",
-  "args": ["${workspaceFolder}/mcp/dist/index.js"]
+  "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=inspect"]
 }
 ```
 

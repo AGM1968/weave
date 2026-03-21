@@ -2,6 +2,36 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.26.0] - 2026-03-21
+
+### Added
+
+- **`wv work` atomic CAS claim** — race-free node claiming for multi-agent concurrency;
+  `WV_AGENT_ID` stamps ownership; `--force` overrides a stale claim.
+- **`wv ready --subtree=<epic>`** — topological partitioning (Algorithm C) scopes the ready queue to
+  an epic's dependency tree.
+- **`wv ready` claimed-by filter** — nodes claimed by other agents are hidden by default; `--all`
+  shows them; `claimed_by` displayed in output.
+
+### Fixed
+
+- **Hook enforcement scope** — pre-action hook now only fires inside projects explicitly initialised
+  with `wv-init-repo` (`.weave/` present). Editing personal notes, plain git repos, or `/tmp` no
+  longer triggers the no-active-node block.
+- **`journal_end` guaranteed** — interrupted `wv sync` no longer leaves the journal open, preventing
+  DB lock contention on the next run.
+- **`ORDER BY` determinism** — all multi-row queries now include an `id` tiebreaker; previously
+  non-deterministic ordering caused flaky tests.
+- **`metadata=null` after `json_remove`** — `wv list --json` / `wv show --json` no longer return
+  `null` metadata for nodes with empty `{}`; fixes downstream `jq fromjson` failures.
+- **Agent infrastructure** — hooks, `SKILL.md`, and agent definition files hardened for multi-agent
+  operation (#1308).
+- **Selftest isolation + prune-delta resurrection** (#1306, #1307).
+- **Context pack ancestry** — `wv context` now walks `implements` edges (not only `blocks`) when
+  collecting pitfalls from ancestor nodes; parses structured `decision/pattern/pitfall` learnings.
+- **MCP server count** — `install.sh` now generates a 2-server config (drops `weave-graph` and
+  `weave-session` scoped servers removed in v1.25.0).
+
 ## [1.25.0] - 2026-03-18
 
 ### Added

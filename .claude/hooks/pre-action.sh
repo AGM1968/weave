@@ -55,6 +55,13 @@ fi
 # Find active node (status=active)
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+
+# Only enforce in projects explicitly initialised with wv-init-repo (.weave/ present)
+# This prevents the hook from blocking edits in personal notes, /tmp, plain git repos, etc.
+if [ -z "${WV_PROJECT_DIR:-}" ] || [ ! -d "${WV_PROJECT_DIR}/.weave" ]; then
+    exit 0
+fi
+
 if [ ! -x "$WV" ]; then
     # wv not available, allow action
     exit 0
@@ -130,7 +137,7 @@ CONTEXT_PACK=$("$WV" context "$NODE_ID" --json 2>/dev/null || echo "")
 if [ -z "$CONTEXT_PACK" ]; then
     # Soft warning (exit 1) — wv context may fail due to DB contention, missing
     # wv binary, or transient errors. Agent is informed but not hard-blocked.
-    cat <<EOF
+    cat >&2 <<EOF
 ⚠️  Context Pack generation failed for node $NODE_ID.
 Check: wv show $NODE_ID / wv status
 EOF

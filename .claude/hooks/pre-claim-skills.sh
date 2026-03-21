@@ -35,28 +35,24 @@ if [[ "$COMMAND" =~ wv[[:space:]]update[[:space:]]wv-[0-9a-f]{4,6}.*--status=act
 
         # Only suggest if not already done
         if [[ "$HAS_SHIP_IT" == "false" || "$HAS_PRE_MORTEM" == "false" ]]; then
+            # Build suggestion parts
+            skills_needed=""
+            if [ "$HAS_SHIP_IT" == "false" ]; then
+                skills_needed="/ship-it (done criteria)"
+            fi
+            if [ "$HAS_PRE_MORTEM" == "false" ]; then
+                [ -n "$skills_needed" ] && skills_needed="$skills_needed and "
+                skills_needed="${skills_needed}/pre-mortem (risks)"
+            fi
+
+            # Soft deny: model sees the reason and can choose to proceed
             cat <<EOF
-{
-    "suggestion": "Consider running procedural skills before claiming work",
-    "node": "$NODE_ID",
-    "text": "$NODE_TEXT",
-    "type": "$NODE_TYPE",
-    "skills": {
-        "ship_it": {
-            "needed": $([ "$HAS_SHIP_IT" == "false" ] && echo "true" || echo "false"),
-            "purpose": "Define done criteria upfront to prevent scope creep"
-        },
-        "pre_mortem": {
-            "needed": $([ "$HAS_PRE_MORTEM" == "false" ] && echo "true" || echo "false"),
-            "purpose": "Identify risks and define rollback plan before starting"
-        }
-    },
-    "recommendation": "Run: /ship-it $NODE_ID && /pre-mortem $NODE_ID before proceeding"
-}
+{"decision": "block", "reason": "Consider running $skills_needed before claiming $NODE_ID ($NODE_TEXT). Proceed with wv update if already done."}
 EOF
+            exit 0
         fi
     fi
 fi
 
-# Always allow the command to proceed (return success)
+# No suggestion needed — allow silently
 exit 0

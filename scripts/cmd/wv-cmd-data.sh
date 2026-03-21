@@ -324,6 +324,12 @@ cmd_sync() {
     mv "$tmp_edges" "$WEAVE_DIR/edges.jsonl"
     trap - EXIT
 
+    # Guard: if anything after this point (auto_checkpoint, git, gh_sync) is
+    # interrupted/killed, ensure journal_end still fires so the op isn't left
+    # stuck. Cleared on normal exit before explicit journal_end call below.
+    [ "$_sync_journaled" = true ] && \
+        trap 'journal_end 2>/dev/null; journal_clean 2>/dev/null' EXIT
+
     echo -e "${GREEN}✓${NC} Synced to $WEAVE_DIR"
 
     [ "$_sync_journaled" = true ] && journal_complete 1
@@ -381,8 +387,12 @@ cmd_sync() {
         fi
     fi
 
-    if [ "$_sync_journaled" = true ]; then journal_complete "$_sync_commit_step"; fi
-    if [ "$_sync_journaled" = true ]; then journal_end; journal_clean; fi
+    if [ "$_sync_journaled" = true ]; then
+        trap - EXIT  # normal path — clear the safety trap before explicit call
+        journal_complete "$_sync_commit_step"
+        journal_end
+        journal_clean
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -882,7 +892,7 @@ cmd_learnings() {
     local query="
         SELECT id, text, status, metadata FROM nodes
         WHERE $where_parts
-        ORDER BY updated_at DESC $limit_clause;
+        ORDER BY updated_at DESC, id ASC $limit_clause;
     "
 
     local results
@@ -1708,7 +1718,7 @@ _breadcrumbs_save() {
         local active_nodes
         active_nodes=$(db_query_json "
             SELECT id, text, metadata FROM nodes WHERE status='active'
-            ORDER BY updated_at DESC;
+            ORDER BY updated_at DESC, id ASC;
         " 2>/dev/null)
         local active_count
         active_count=$(echo "$active_nodes" | jq 'length' 2>/dev/null || echo "0")
@@ -1751,7 +1761,7 @@ _breadcrumbs_save() {
         local blocked_nodes
         blocked_nodes=$(db_query_json "
             SELECT n.id, n.text FROM nodes n WHERE n.status='blocked'
-            ORDER BY n.updated_at DESC;
+            ORDER BY n.updated_at DESC, n.id ASC;
         " 2>/dev/null)
         local blocked_count
         blocked_count=$(echo "$blocked_nodes" | jq 'length' 2>/dev/null || echo "0")
@@ -1787,7 +1797,7 @@ _breadcrumbs_save() {
                 OR json_extract(metadata, '$.pattern') IS NOT NULL
                 OR json_extract(metadata, '$.pitfall') IS NOT NULL
                 OR json_extract(metadata, '$.learning') IS NOT NULL)
-            ORDER BY updated_at DESC LIMIT 5;
+            ORDER BY updated_at DESC, id ASC LIMIT 5;
         " 2>/dev/null)
         local learn_count
         learn_count=$(echo "$recent_learnings" | jq 'length' 2>/dev/null || echo "0")
@@ -2265,7 +2275,7 @@ EOF
         db_query "
             SELECT id FROM nodes
             WHERE CAST(json_extract(metadata, '$.gh_issue') AS INTEGER) = $gh_num
-            ORDER BY updated_at DESC
+            ORDER BY updated_at DESC, id ASC
             LIMIT 1;
         " | head -n1
     }
