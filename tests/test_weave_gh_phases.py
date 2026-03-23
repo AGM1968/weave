@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from typing import Any
 from unittest.mock import patch
 
 from weave_gh.models import GitHubIssue, SyncStats, WeaveNode
@@ -52,18 +53,6 @@ def _issue(
     )
 
 
-# Patches to prevent real CLI calls in _handle_existing_issue
-_PHASE_PATCHES = [
-    "weave_gh.phases.get_edges_for_node",
-    "weave_gh.phases.render_issue_body",
-    "weave_gh.phases.should_update_body",
-    "weave_gh.phases.get_labels_for_node",
-    "weave_gh.phases.sync_issue_labels",
-    "weave_gh.phases.gh_cli",
-    "weave_gh.phases.build_close_comment",
-    "weave_gh.phases._backfill_gh_issue",
-]
-
 
 # ---------------------------------------------------------------------------
 # _was_closed_by_weave — Weave close marker detection
@@ -111,6 +100,22 @@ class TestWasClosedByWeave:
 class TestReopenGuard:
     """The done_gh_issues guard should block reopens when another node is done."""
 
+    def _with_patches(self, **overrides: Any) -> Any:
+        """Return a patch.multiple context with sensible defaults, overridable per-test."""
+        base: dict[str, Any] = dict(
+            get_edges_for_node=lambda _: [],
+            render_issue_body=lambda *_a, **_k: "",
+            should_update_body=lambda *_a: False,
+            get_labels_for_node=lambda _: [],
+            sync_issue_labels=lambda *_a, **_k: None,
+            gh_cli=lambda *_a, **_k: "",
+            build_close_comment=lambda *_a, **_k: "close",
+            _backfill_gh_issue=lambda *_a, **_k: None,
+            _was_closed_by_weave=lambda *_a: False,
+        )
+        base.update(overrides)
+        return patch.multiple("weave_gh.phases", **base)
+
     def _call(
         self,
         node: WeaveNode,
@@ -121,16 +126,7 @@ class TestReopenGuard:
     ) -> None:
         issues_by_num = {issue.number: issue}
         nodes_by_id = {node.id: node}
-        with patch.multiple(
-            "weave_gh.phases",
-            get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *_a, **_k: "",
-            should_update_body=lambda *_a: False,
-            get_labels_for_node=lambda _: [],
-            sync_issue_labels=lambda *_a, **_k: None,
-            gh_cli=lambda *_a, **_k: "",
-            build_close_comment=lambda *_a, **_k: "close",
-            _backfill_gh_issue=lambda *_a, **_k: None,
+        with self._with_patches(
             _was_closed_by_weave=lambda *_a: was_closed_by_weave,
         ):
             _handle_existing_issue(
@@ -261,21 +257,14 @@ class TestReopenGuard:
             gh_calls.append(args)
             return ""
 
-        with patch.multiple(
-            "weave_gh.phases",
-            get_edges_for_node=lambda _: [],
+        with self._with_patches(
             render_issue_body=(
                 lambda *_a, **_k: "<!-- WEAVE:BEGIN hash=abc123 -->\nnew\n<!-- WEAVE:END -->"
             ),
             should_update_body=lambda *_a: True,  # body changed
             extract_human_content=lambda _: "",
             compose_issue_body=lambda h, w: w,
-            get_labels_for_node=lambda _: [],
-            sync_issue_labels=lambda *_a, **_k: None,
             gh_cli=mock_gh_cli,
-            build_close_comment=lambda *_a, **_k: "close",
-            _backfill_gh_issue=lambda *_a, **_k: None,
-            _was_closed_by_weave=lambda *_a: False,
         ):
             _handle_existing_issue(
                 node,
