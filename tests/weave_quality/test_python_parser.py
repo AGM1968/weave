@@ -11,8 +11,15 @@ from pathlib import Path
 import pytest
 
 from weave_quality.python_parser import (
+    _ast_ck_metrics,
+    _ast_complexity,
     _ast_essential_complexity,
+    _ast_file_essential_complexity,
+    _ast_function_count,
+    _ast_function_lengths,
+    _ast_nesting_depth,
     _ast_per_function_cc,
+    _compute_lcom,
     _indent_sd,
     _is_dispatch_function,
     _single_pass_ast,
@@ -783,3 +790,159 @@ class TestSinglePassAST:
         result = _single_pass_ast(tree)
         assert len(result.functions) == 1
         assert result.functions[0].is_dispatch
+
+
+# ---------------------------------------------------------------------------
+# Private AST helpers (called indirectly via _single_pass_ast, but also
+# available as standalone functions — test them directly to hit those lines)
+# ---------------------------------------------------------------------------
+
+
+class TestPrivateAstHelpers:
+    def test_ast_function_lengths(self) -> None:
+        source = _src("""
+            def short():
+                pass
+
+            def longer():
+                x = 1
+                y = 2
+                return x + y
+        """)
+        tree = ast.parse(source)
+        lengths = _ast_function_lengths(tree)
+        assert len(lengths) == 2
+        assert all(n > 0 for n in lengths)
+
+    def test_ast_nesting_depth(self) -> None:
+        source = _src("""
+            def f():
+                if True:
+                    for x in []:
+                        pass
+        """)
+        tree = ast.parse(source)
+        assert _ast_nesting_depth(tree) >= 2
+
+    def test_ast_complexity(self) -> None:
+        source = _src("""
+            def f(x):
+                if x > 0:
+                    return x
+                return -x
+        """)
+        tree = ast.parse(source)
+        # base(1) + if(1) = 2
+        assert _ast_complexity(tree) >= 2.0
+
+    def test_ast_function_count(self) -> None:
+        source = "def a(): pass\ndef b(): pass\n"
+        tree = ast.parse(source)
+        assert _ast_function_count(tree) == 2
+
+    def test_ast_file_essential_complexity_with_functions(self) -> None:
+        source = _src("""
+            def messy(items):
+                for item in items:
+                    if item:
+                        break
+        """)
+        tree = ast.parse(source)
+        ev = _ast_file_essential_complexity(tree)
+        assert ev > 1.0
+
+    def test_ast_file_essential_complexity_no_functions(self) -> None:
+        tree = ast.parse("x = 1\n")
+        assert _ast_file_essential_complexity(tree) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# _ast_ck_metrics — standalone (analysis=None) path
+# ---------------------------------------------------------------------------
+
+
+class TestAstCkMetricsStandalone:
+    def test_imports_only_no_classes_returns_cbo(self) -> None:
+        """No classes but has imports → returns CKMetrics with only cbo."""
+        source = "import os\nimport sys\n"
+        tree = ast.parse(source)
+        ck = _ast_ck_metrics(tree, "test.py")
+        assert ck is not None
+        assert "cbo" in ck.metrics
+        assert "wmc" not in ck.metrics
+
+    def test_no_classes_no_imports_returns_none(self) -> None:
+        source = "x = 1\n"
+        tree = ast.parse(source)
+        assert _ast_ck_metrics(tree, "test.py") is None
+
+    def test_with_class_computes_wmc_without_analysis(self) -> None:
+        """analysis=None forces the manual wmc walk path."""
+        source = _src("""
+            import os
+
+            class MyClass:
+                def method_a(self):
+                    if True:
+                        return 1
+                    return 0
+
+                def method_b(self):
+                    pass
+        """)
+        tree = ast.parse(source)
+        ck = _ast_ck_metrics(tree, "test.py", analysis=None)
+        assert ck is not None
+        assert "wmc" in ck.metrics
+        assert ck.metrics["wmc"] >= 2.0  # method_a CC=2, method_b CC=1
+
+    def test_from_import_counted_as_cbo(self) -> None:
+        source = "from pathlib import Path\nfrom os import getcwd\n"
+        tree = ast.parse(source)
+        ck = _ast_ck_metrics(tree, "test.py")
+        assert ck is not None
+        assert ck.metrics["cbo"] >= 2.0
+
+
+# ---------------------------------------------------------------------------
+# _compute_lcom — edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestComputeLcom:
+    def test_empty_classes_returns_zero(self) -> None:
+        assert _compute_lcom([]) == 0.0
+
+    def test_single_method_class_returns_zero(self) -> None:
+        source = _src("""
+            class Solo:
+                def only_method(self):
+                    return self.x
+        """)
+        tree = ast.parse(source)
+        classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+        result = _compute_lcom(classes)
+        assert result == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Regex fallback — import lines coverage
+# ---------------------------------------------------------------------------
+
+
+class TestRegexFallbackImports:
+    def test_import_lines_counted_in_fallback(self) -> None:
+        """Broken syntax with imports hits the import-parsing branch."""
+        broken = "import os\nfrom pathlib import Path\ndef foo(:\n    pass"
+        entry, ck, fn_cc = analyze_python_source(broken, "broken.py")
+        # regex path — no CK, no fn_cc
+        assert ck is None
+        assert not fn_cc
+        assert entry.language == "python"
+
+    def test_from_import_module_extracted(self) -> None:
+        """from x.y import z → only 'x' counted as module coupling."""
+        broken = "from os.path import join\ndef foo(:\n    pass"
+        entry, ck, _ = analyze_python_source(broken, "broken.py")
+        assert ck is None  # regex fallback, no CK
+        assert entry.language == "python"
