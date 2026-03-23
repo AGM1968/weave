@@ -43,7 +43,7 @@ def _git(args: list[str], cwd: str | Path) -> str:
         if result.returncode != 0:
             return ""
         return result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except (subprocess.TimeoutExpired, OSError):
         return ""
 
 
@@ -114,7 +114,7 @@ def file_authors(repo: str | Path, filepath: str) -> int:
     out = _git(["log", "--format=%aN", "--", filepath], cwd=repo)
     if not out:
         return 0
-    authors = set(line.strip() for line in out.split("\n") if line.strip())
+    authors = {line.strip() for line in out.split("\n") if line.strip()}
     return len(authors)
 
 

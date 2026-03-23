@@ -33,6 +33,8 @@ from .models import (
 
 log = logging.getLogger(__name__)
 
+_QUALITY_DB_NAME = "quality.db"
+
 # ---------------------------------------------------------------------------
 # Schema -- matches PROPOSAL-wv-quality.md exactly
 # ---------------------------------------------------------------------------
@@ -123,15 +125,15 @@ _FILES_SCANS = 2  # how many scans to retain raw files + file_metrics (diff wind
 def _resolve_db_path(hot_zone: str | None = None) -> Path:
     """Resolve quality.db path from WV_HOT_ZONE or explicit path."""
     if hot_zone:
-        return Path(hot_zone) / "quality.db"
+        return Path(hot_zone) / _QUALITY_DB_NAME
 
     env_hz = os.environ.get("WV_HOT_ZONE", "")
     if env_hz:
-        return Path(env_hz) / "quality.db"
+        return Path(env_hz) / _QUALITY_DB_NAME
 
     # Fallback: /dev/shm/weave or /tmp/weave
     base = "/dev/shm/weave" if Path("/dev/shm").exists() else "/tmp/weave"
-    return Path(base) / "quality.db"
+    return Path(base) / _QUALITY_DB_NAME
 
 
 def _migrate_v2(conn: sqlite3.Connection) -> None:

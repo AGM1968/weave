@@ -384,9 +384,8 @@ def _single_pass_ast(tree: ast.Module) -> ASTAnalysis:
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 imports.add(alias.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imports.add(node.module.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(node.module.split(".")[0])
 
     # Full-tree CC + nesting (one visitor run — matches _ast_complexity/_ast_nesting_depth)
     full_visitor = _ComplexityVisitor()
@@ -450,9 +449,8 @@ def _ast_ck_metrics(tree: ast.Module, path: str,
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     imports.add(alias.name.split(".")[0])
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    imports.add(node.module.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.add(node.module.split(".")[0])
 
     if not classes:
         # No classes, but still report cbo for coupling analysis
@@ -486,9 +484,7 @@ def _ast_ck_metrics(tree: ast.Module, path: str,
     rfc = 0
     for cls_node in classes:
         for item in ast.walk(cls_node):
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                rfc += 1
-            elif isinstance(item, ast.Call):
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Call)):
                 rfc += 1
 
     # LCOM: Lack of Cohesion in Methods

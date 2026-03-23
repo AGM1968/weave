@@ -147,10 +147,9 @@ def cc_histogram(functions: list[FunctionCC]) -> list[int]:
     for f in functions:
         cc = int(f.complexity)
         for i, (lo, hi) in enumerate(CC_HISTOGRAM_BUCKETS):
-            if hi is None or cc <= hi:
-                if cc >= lo:
-                    counts[i] += 1
-                    break
+            if (hi is None or cc <= hi) and cc >= lo:
+                counts[i] += 1
+                break
     return counts
 
 

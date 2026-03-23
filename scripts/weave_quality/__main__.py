@@ -78,6 +78,8 @@ log = logging.getLogger(__name__)
 
 _VERSION_FILE = Path(__file__).parent.parent / "lib" / "VERSION"
 _SCANNER_VERSION = _VERSION_FILE.read_text().strip() if _VERSION_FILE.exists() else ""
+_MSG_NO_DB = "No quality.db found. Run 'wv quality scan' first."
+_MSG_NO_SCAN = "No scan data. Run 'wv quality scan' first."
 
 # ---------------------------------------------------------------------------
 # Path resolution
@@ -182,12 +184,9 @@ def _discover_files(repo: str, exclude_globs: list[str] | None = None) -> list[s
         if not os.path.isfile(abs_path):
             continue
         # Apply exclude globs
-        if exclude_globs:
-            if any(fnmatch(rel_path, g) for g in exclude_globs):
-                continue
-        if rel_path.endswith(".py"):
-            files.append(rel_path)
-        elif detect_bash(abs_path):
+        if exclude_globs and any(fnmatch(rel_path, g) for g in exclude_globs):
+            continue
+        if rel_path.endswith(".py") or detect_bash(abs_path):
             files.append(rel_path)
 
     return sorted(files)
@@ -627,7 +626,7 @@ def cmd_hotspots(args: argparse.Namespace) -> int:
     json_output: bool = args.json
 
     if not db_exists(hot_zone):
-        print("No quality.db found. Run 'wv quality scan' first.", file=sys.stderr)
+        print(_MSG_NO_DB, file=sys.stderr)
         return 1
 
     conn = init_db(hot_zone)
@@ -640,7 +639,7 @@ def cmd_hotspots(args: argparse.Namespace) -> int:
     scan = latest_scan(conn)
     if scan is None:
         conn.close()
-        print("No scan data. Run 'wv quality scan' first.", file=sys.stderr)
+        print(_MSG_NO_SCAN, file=sys.stderr)
         return 1
 
     # Fetch hotspots from git_stats
@@ -746,7 +745,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
     json_output: bool = args.json
 
     if not db_exists(hot_zone):
-        print("No quality.db found. Run 'wv quality scan' first.", file=sys.stderr)
+        print(_MSG_NO_DB, file=sys.stderr)
         return 1
 
     conn = init_db(hot_zone)
@@ -754,7 +753,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
     current = latest_scan(conn)
     if current is None:
         conn.close()
-        print("No scan data. Run 'wv quality scan' first.", file=sys.stderr)
+        print(_MSG_NO_SCAN, file=sys.stderr)
         return 1
 
     prev = previous_scan(conn)
@@ -964,14 +963,14 @@ def cmd_promote(args: argparse.Namespace) -> int:
         return 1
 
     if not db_exists(hot_zone):
-        print("No quality.db found. Run 'wv quality scan' first.", file=sys.stderr)
+        print(_MSG_NO_DB, file=sys.stderr)
         return 1
 
     conn = init_db(hot_zone)
     scan = latest_scan(conn)
     if scan is None:
         conn.close()
-        print("No scan data. Run 'wv quality scan' first.", file=sys.stderr)
+        print(_MSG_NO_SCAN, file=sys.stderr)
         return 1
 
     ranked = top_hotspots(conn, top_n)
@@ -1165,7 +1164,7 @@ def cmd_health_info(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def cmd_context_files(args: argparse.Namespace) -> int:
+def cmd_context_files(args: argparse.Namespace) -> None:
     """Return quality data for specific files, for wv context enrichment.
 
     Reads file paths from stdin (one per line).  For each file that has
@@ -1188,14 +1187,14 @@ def cmd_context_files(args: argparse.Namespace) -> int:
 
     if not paths or not db_exists(hot_zone):
         print(json.dumps({"code_quality": [], "quality_as_of": None}))
-        return 0
+        return
 
     conn = init_db(hot_zone)
     scan = latest_scan(conn)
     if scan is None:
         conn.close()
         print(json.dumps({"code_quality": [], "quality_as_of": None}))
-        return 0
+        return
 
     results: list[dict[str, object]] = []
     for p in paths:
@@ -1223,7 +1222,6 @@ def cmd_context_files(args: argparse.Namespace) -> int:
         "code_quality": results,
         "quality_as_of": scan.git_head,
     }))
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1349,7 +1347,8 @@ def main() -> int:
         cmd_health_info(args)
         return 0
     if args.command == "context-files":
-        return cmd_context_files(args)
+        cmd_context_files(args)
+        return 0
     if args.command == "functions":
         return cmd_functions(args)
     if args.command == "reset":

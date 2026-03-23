@@ -41,7 +41,7 @@ def get_weave_nodes() -> list[WeaveNode]:
         if isinstance(meta_raw, str):
             try:
                 meta = json.loads(meta_raw)
-            except (json.JSONDecodeError, ValueError):
+            except json.JSONDecodeError:
                 meta = {}
         else:
             meta = meta_raw if isinstance(meta_raw, dict) else {}

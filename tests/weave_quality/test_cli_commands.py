@@ -727,8 +727,7 @@ class TestCmdContextFiles:
         no_db_path = str(tmp_path / "nonexistent")
         args = _make_context_files_args(no_db_path)
         with patch("sys.stdin", io.StringIO("a.py\nb.py\n")):
-            result = cmd_context_files(args)
-        assert result == 0
+            cmd_context_files(args)
         data = json.loads(capsys.readouterr().out)
         assert data["code_quality"] == []
         assert data["quality_as_of"] is None
@@ -741,8 +740,7 @@ class TestCmdContextFiles:
         _ = db
         args = _make_context_files_args(str(tmp_path))
         with patch("sys.stdin", io.StringIO("a.py\n")):
-            result = cmd_context_files(args)
-        assert result == 0
+            cmd_context_files(args)
         data = json.loads(capsys.readouterr().out)
         assert data["code_quality"] == []
         assert data["quality_as_of"] is None
@@ -761,8 +759,7 @@ class TestCmdContextFiles:
         args = _make_context_files_args(str(tmp_path))
         # Simulate tty (no piped stdin) - empty StringIO with isatty=True
         with patch("sys.stdin", io.StringIO("")):
-            result = cmd_context_files(args)
-        assert result == 0
+            cmd_context_files(args)
         data = json.loads(capsys.readouterr().out)
         assert data["code_quality"] == []
 
@@ -785,8 +782,7 @@ class TestCmdContextFiles:
 
         args = _make_context_files_args(str(tmp_path))
         with patch("sys.stdin", io.StringIO("a.py\nb.py\nunknown.py\n")):
-            result = cmd_context_files(args)
-        assert result == 0
+            cmd_context_files(args)
         data = json.loads(capsys.readouterr().out)
 
         assert data["quality_as_of"] is not None
@@ -821,8 +817,7 @@ class TestCmdContextFiles:
 
         args = _make_context_files_args(str(tmp_path))
         with patch("sys.stdin", io.StringIO("c.py\n")):
-            result = cmd_context_files(args)
-        assert result == 0
+            cmd_context_files(args)
         data = json.loads(capsys.readouterr().out)
         assert len(data["code_quality"]) == 1
         assert data["code_quality"][0]["path"] == "c.py"
