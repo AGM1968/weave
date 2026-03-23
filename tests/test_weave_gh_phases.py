@@ -10,13 +10,16 @@ from unittest.mock import patch
 from weave_gh.models import GitHubIssue, SyncStats, WeaveNode
 from weave_gh.models import Edge
 from weave_gh.phases import (
+    _backfill_gh_issue,
     _handle_existing_issue,
     _handle_new_issue,
     _sync_assignee,
     _was_closed_by_weave,
     _WEAVE_CLOSE_MARKER,
     refresh_parent_body,
+    sync_closed_to_weave,
     sync_github_to_weave,
+    sync_weave_to_github,
 )
 
 
@@ -686,3 +689,558 @@ class TestHandleNewIssueBlockedStatus:
 
         assert stats.skipped == 1
         assert stats.created_gh == 0
+
+
+# ---------------------------------------------------------------------------
+# _backfill_gh_issue — dedup guard + in-memory update (lines 74-101)
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillGhIssue:
+    """_backfill_gh_issue updates metadata atomically with dedup guard."""
+
+    def test_dry_run_is_noop(self) -> None:
+        """In dry-run mode the function returns immediately without any side effects."""
+        node = _node("wv-aaa1", gh_issue=None)
+        with patch("weave_gh.phases._run") as mock_run:
+            _backfill_gh_issue(node, 42, dry_run=True)
+        mock_run.assert_not_called()
+        assert node.metadata.get("gh_issue") is None
+
+    def test_dedup_guard_skips_when_already_claimed(self) -> None:
+        """Skips backfill when another node already claims the same gh_issue."""
+        node = _node("wv-new1")
+        other = _node("wv-old1", gh_issue=99)
+        with patch("weave_gh.phases._run") as mock_run:
+            _backfill_gh_issue(node, 99, all_nodes=[node, other])
+        mock_run.assert_not_called()
+        assert node.metadata.get("gh_issue") is None
+
+    def test_backfill_updates_in_memory(self) -> None:
+        """Successful backfill updates node.metadata['gh_issue'] in-memory."""
+        node = _node("wv-new2")
+        with patch("weave_gh.phases._run"), patch(
+            "weave_gh.phases._resolve_db_path", return_value="/tmp/test.db"
+        ):
+            _backfill_gh_issue(node, 77, all_nodes=[node])
+        assert node.metadata["gh_issue"] == 77
+
+    def test_backfill_no_all_nodes(self) -> None:
+        """When all_nodes is None, dedup guard is skipped and backfill proceeds."""
+        node = _node("wv-new3")
+        with patch("weave_gh.phases._run"), patch(
+            "weave_gh.phases._resolve_db_path", return_value="/tmp/test.db"
+        ):
+            _backfill_gh_issue(node, 55, all_nodes=None)
+        assert node.metadata["gh_issue"] == 55
+
+
+# ---------------------------------------------------------------------------
+# sync_weave_to_github — Phase 1 main loop (lines 147-234)
+# ---------------------------------------------------------------------------
+
+
+class TestSyncWeaveToGithub:
+    """sync_weave_to_github drives Phase 1: Weave→GitHub issue creation/update."""
+
+    def _patches(self, **overrides: Any) -> Any:
+        base: dict[str, Any] = {
+            "get_edges_for_node": lambda _: [],
+            "render_issue_body": lambda *_a, **_k: "",
+            "should_update_body": lambda *_a: False,
+            "get_labels_for_node": lambda _: [],
+            "sync_issue_labels": lambda *_a, **_k: None,
+            "gh_cli": lambda *_a, **_k: "",
+            "build_close_comment": lambda *_a, **_k: "close",
+            "_backfill_gh_issue": lambda *_a, **_k: None,
+            "_was_closed_by_weave": lambda *_a: False,
+            "extract_human_content": lambda _: "",
+            "compose_issue_body": lambda h, w: w,
+        }
+        base.update(overrides)
+        return patch.multiple("weave_gh.phases", **base)
+
+    def test_duplicate_gh_issue_dedup_logs_skip(self) -> None:
+        """When two nodes share a gh_issue, the second is skipped."""
+        n1 = _node("wv-dup1", gh_issue=10)
+        n2 = _node("wv-dup2", gh_issue=10)
+        issue = _issue(10, state="OPEN")
+        stats = SyncStats()
+
+        with self._patches():
+            sync_weave_to_github(
+                [n1, n2], [issue],
+                "owner/repo", "https://github.com/owner/repo",
+                {n1.id: n1, n2.id: n2},
+                stats,
+            )
+
+        assert stats.skipped >= 1
+
+    def test_no_gh_match_routes_to_handle_new(self) -> None:
+        """Nodes without a GH issue are routed to _handle_new_issue (dry-run)."""
+        node = _node("wv-newo", status="todo")
+        stats = SyncStats()
+
+        with self._patches():
+            sync_weave_to_github(
+                [node], [],
+                "owner/repo", "https://github.com/owner/repo",
+                {node.id: node},
+                stats, dry_run=True,
+            )
+
+        assert stats.created_gh == 1
+
+    def test_test_nodes_are_skipped(self) -> None:
+        """Nodes with node_type='test' are always skipped."""
+        node = WeaveNode(
+            id="wv-test", text="Test", status="todo",
+            metadata={"type": "test"},
+        )
+        stats = SyncStats()
+
+        with self._patches():
+            sync_weave_to_github(
+                [node], [],
+                "owner/repo", "https://github.com/owner/repo",
+                {node.id: node},
+                stats,
+            )
+
+        assert stats.skipped == 1
+
+    def test_gh_match_via_body_marker_routes_to_handle_existing(self) -> None:
+        """Nodes matched via body marker are routed to _handle_existing_issue."""
+        node = _node("wv-mark", status="active")
+        issue = _issue(55, body=f"**Weave ID:** `{node.id}`")
+        stats = SyncStats()
+
+        with self._patches():
+            sync_weave_to_github(
+                [node], [issue],
+                "owner/repo", "https://github.com/owner/repo",
+                {node.id: node},
+                stats,
+            )
+
+        assert stats.skipped == 0
+
+
+# ---------------------------------------------------------------------------
+# _handle_new_issue — dry-run + weave-synced skip + label/assignee args
+# ---------------------------------------------------------------------------
+
+
+class TestHandleNewIssuePaths:
+    """Cover dry-run, weave-synced skip, label_args and assignee_args building."""
+
+    def _call(
+        self,
+        node: WeaveNode,
+        stats: SyncStats,
+        issues_by_title: dict[str, GitHubIssue] | None = None,
+        dry_run: bool = False,
+        **gh_override: Any,
+    ) -> None:
+        defaults: dict[str, Any] = {
+            "get_edges_for_node": lambda _: [],
+            "render_issue_body": lambda *_a, **_k: "",
+            "get_labels_for_node": lambda _: [],
+            "sync_issue_labels": lambda *_a, **_k: None,
+            "_backfill_gh_issue": lambda *_a, **_k: None,
+            "gh_cli": lambda *_a, **_k: "",
+        }
+        defaults.update(gh_override)
+        with patch.multiple("weave_gh.phases", **defaults):
+            _handle_new_issue(
+                node,
+                nodes_by_id={},
+                issues=[],
+                issues_by_num={},
+                issues_by_title=issues_by_title or {},
+                repo="owner/repo",
+                repo_url="https://github.com/owner/repo",
+                stats=stats,
+                dry_run=dry_run,
+            )
+
+    def test_dry_run_increments_count_without_gh_call(self) -> None:
+        """Dry-run logs intent and increments created_gh without calling gh_cli."""
+        node = _node("wv-dryy", status="todo")
+        stats = SyncStats()
+        gh_calls: list[object] = []
+        self._call(
+            node, stats, dry_run=True,
+            gh_cli=lambda *_a, **_k: gh_calls.append(_a) or "",
+        )
+        assert stats.created_gh == 1
+        assert not gh_calls
+
+    def test_weave_synced_title_match_backfills_and_returns(self) -> None:
+        """If title matches a weave-synced issue, backfills gh_issue and skips creation."""
+        node = _node("wv-titl", text="Existing task", status="todo")
+        existing = _issue(77, title="Existing task", labels=["weave-synced"])
+        stats = SyncStats()
+        backfill_calls: list[object] = []
+
+        with patch.multiple(
+            "weave_gh.phases",
+            get_edges_for_node=lambda _: [],
+            render_issue_body=lambda *_a, **_k: "",
+            get_labels_for_node=lambda _: [],
+            sync_issue_labels=lambda *_a, **_k: None,
+            gh_cli=lambda *_a, **_k: "",
+            _backfill_gh_issue=lambda *_a, **_k: backfill_calls.append(_a),
+        ):
+            _handle_new_issue(
+                node,
+                nodes_by_id={},
+                issues=[existing],
+                issues_by_num={existing.number: existing},
+                issues_by_title={"Existing task": existing},
+                repo="owner/repo",
+                repo_url="https://github.com/owner/repo",
+                stats=stats,
+                dry_run=False,
+            )
+
+        assert stats.already_synced == 1
+        assert stats.created_gh == 0
+        assert len(backfill_calls) == 1
+
+    def test_labels_and_assignee_passed_to_gh_cli(self) -> None:
+        """Labels and assignee args are forwarded to gh issue create."""
+        node = WeaveNode(
+            id="wv-labl", text="Labelled", status="todo",
+            metadata={"claimed_by": "alice"},
+        )
+        gh_args: list[tuple[object, ...]] = []
+        stats = SyncStats()
+
+        with patch.multiple(
+            "weave_gh.phases",
+            get_edges_for_node=lambda _: [],
+            render_issue_body=lambda *_a, **_k: "",
+            get_labels_for_node=lambda _: ["bug", "enhancement"],
+            sync_issue_labels=lambda *_a, **_k: None,
+            _backfill_gh_issue=lambda *_a, **_k: None,
+            gh_cli=lambda *_a, **_k: (gh_args.append(_a), "https://github.com/o/r/issues/1")[1],
+        ):
+            _handle_new_issue(
+                node,
+                nodes_by_id={},
+                issues=[],
+                issues_by_num={},
+                issues_by_title={},
+                repo="owner/repo",
+                repo_url="https://github.com/owner/repo",
+                stats=stats,
+                dry_run=False,
+            )
+
+        assert gh_args
+        all_args = " ".join(str(a) for a in gh_args[0])
+        assert "--label" in all_args
+        assert "--assignee" in all_args
+
+    def test_done_node_closes_issue_after_create(self) -> None:
+        """If node is done, the newly created issue is immediately closed."""
+        node = _node("wv-done", status="done")
+        gh_calls: list[tuple[object, ...]] = []
+        stats = SyncStats()
+
+        with patch.multiple(
+            "weave_gh.phases",
+            get_edges_for_node=lambda _: [],
+            render_issue_body=lambda *_a, **_k: "",
+            get_labels_for_node=lambda _: [],
+            sync_issue_labels=lambda *_a, **_k: None,
+            _backfill_gh_issue=lambda *_a, **_k: None,
+            build_close_comment=lambda *_a, **_k: "closed",
+            gh_cli=lambda *_a, **_k: (
+                gh_calls.append(_a),
+                "https://github.com/owner/repo/issues/42",
+            )[1],
+        ):
+            _handle_new_issue(
+                node,
+                nodes_by_id={},
+                issues=[],
+                issues_by_num={},
+                issues_by_title={},
+                repo="owner/repo",
+                repo_url="https://github.com/owner/repo",
+                stats=stats,
+                dry_run=False,
+            )
+
+        close_calls = [c for c in gh_calls if "close" in c]
+        assert close_calls, "Expected a gh issue close call"
+        assert stats.created_gh == 1
+
+
+# ---------------------------------------------------------------------------
+# _handle_existing_issue — reimported node skip + dry-run close + assignee sync
+# ---------------------------------------------------------------------------
+
+
+class TestHandleExistingIssuePaths:
+    """Cover reimported node body skip, dry-run close, and assignee sync."""
+
+    def _call(
+        self,
+        node: WeaveNode,
+        issue: GitHubIssue,
+        stats: SyncStats,
+        dry_run: bool = False,
+        **overrides: Any,
+    ) -> None:
+        base: dict[str, Any] = {
+            "get_edges_for_node": lambda _: [],
+            "render_issue_body": lambda *_a, **_k: "",
+            "should_update_body": lambda *_a: False,
+            "get_labels_for_node": lambda _: [],
+            "sync_issue_labels": lambda *_a, **_k: None,
+            "gh_cli": lambda *_a, **_k: "",
+            "build_close_comment": lambda *_a, **_k: "close",
+            "_backfill_gh_issue": lambda *_a, **_k: None,
+            "_was_closed_by_weave": lambda *_a: False,
+            "extract_human_content": lambda _: "",
+            "compose_issue_body": lambda h, w: w,
+        }
+        base.update(overrides)
+        with patch.multiple("weave_gh.phases", **base):
+            _handle_existing_issue(
+                node,
+                issue.number,
+                {issue.number: issue},
+                {node.id: node},
+                "owner/repo",
+                "https://github.com/owner/repo",
+                stats,
+                dry_run=dry_run,
+            )
+
+    def test_reimported_node_skips_body_update(self) -> None:
+        """Nodes with source=github and no children skip body rendering."""
+        node = WeaveNode(
+            id="wv-reimp", text="Re-imported", status="active",
+            metadata={"source": "github", "gh_issue": 10},
+        )
+        issue = _issue(10, state="OPEN")
+        stats = SyncStats()
+        render_calls: list[object] = []
+
+        self._call(
+            node, issue, stats,
+            render_issue_body=lambda *_a, **_k: render_calls.append(_a) or "",
+        )
+        assert not render_calls
+
+    def test_dry_run_close_increments_count(self) -> None:
+        """Dry-run close increments closed_gh without calling gh_cli."""
+        node = _node("wv-dryc", status="done", gh_issue=20)
+        issue = _issue(20, state="OPEN")
+        stats = SyncStats()
+        gh_calls: list[object] = []
+
+        self._call(
+            node, issue, stats, dry_run=True,
+            gh_cli=lambda *_a, **_k: (gh_calls.append(_a), "")[1],
+        )
+
+        assert stats.closed_gh == 1
+        close_calls = [c for c in gh_calls if "close" in str(c)]
+        assert not close_calls
+
+    def test_assignee_sync_called_when_claimed_by(self) -> None:
+        """When node has claimed_by, _sync_assignee is called."""
+        node = WeaveNode(
+            id="wv-asgn", text="Assigned", status="active",
+            metadata={"claimed_by": "alice", "gh_issue": 30},
+        )
+        issue = _issue(30, state="OPEN")
+        stats = SyncStats()
+        sync_calls: list[object] = []
+
+        self._call(
+            node, issue, stats,
+            _sync_assignee=lambda *_a, **_k: (sync_calls.append(_a), False)[1],
+        )
+
+        assert len(sync_calls) == 1
+
+    def test_dry_run_body_update_increments_stats(self) -> None:
+        """Dry-run body update increments updated_gh without gh_cli call."""
+        node = _node("wv-bdyu", status="active", gh_issue=40)
+        issue = _issue(40, state="OPEN", body="<!-- WEAVE:BEGIN hash=old -->\nold\n<!-- WEAVE:END -->")
+        stats = SyncStats()
+        gh_calls: list[object] = []
+
+        self._call(
+            node, issue, stats, dry_run=True,
+            render_issue_body=lambda *_a, **_k: "<!-- WEAVE:BEGIN hash=new -->\nnew\n<!-- WEAVE:END -->",
+            should_update_body=lambda *_a: True,
+            extract_human_content=lambda _: "",
+            compose_issue_body=lambda h, w: w,
+            gh_cli=lambda *_a, **_k: (gh_calls.append(_a), "")[1],
+        )
+
+        assert stats.updated_gh == 1
+        edit_calls = [c for c in gh_calls if "edit" in str(c)]
+        assert not edit_calls
+
+
+# ---------------------------------------------------------------------------
+# sync_github_to_weave — weave:test skip + type/priority parsing + error
+# ---------------------------------------------------------------------------
+
+
+class TestSyncGithubToWeavePaths:
+    """Cover weave:test skip, type/priority template parsing, and wv_cli error."""
+
+    def test_weave_test_label_skips_issue(self) -> None:
+        """Issues labeled weave:test are skipped."""
+        issue = GitHubIssue(
+            number=11, title="Internal test", state="OPEN", body="",
+            labels=["weave:test"],
+        )
+        stats = SyncStats()
+        sync_github_to_weave([], [issue], "owner/repo", stats, dry_run=True)
+        assert stats.created_wv == 0
+        assert stats.skipped == 1
+
+    def test_type_and_priority_parsed_from_template(self) -> None:
+        """Type and priority from issue template form are added to metadata."""
+        body = "### Type\n\nfeature\n\n### Priority\n\nP2 (medium)\n"
+        issue = GitHubIssue(
+            number=22, title="Feature request", state="OPEN",
+            body=body, labels=["weave-synced"],
+        )
+        stats = SyncStats()
+        created_meta: list[dict[str, object]] = []
+
+        import json as _json
+
+        def mock_wv(*args: object, **_kw: object) -> str:
+            for arg in args:
+                if isinstance(arg, str) and arg.startswith("--metadata="):
+                    created_meta.append(_json.loads(arg[len("--metadata="):]))
+            return "wv-new"
+
+        with patch("weave_gh.phases.wv_cli", side_effect=mock_wv):
+            sync_github_to_weave([], [issue], "owner/repo", stats)
+
+        assert stats.created_wv == 1
+        assert created_meta
+        assert created_meta[0].get("type") == "feature"
+        assert created_meta[0].get("priority") == 2
+
+    def test_wv_cli_error_is_caught(self) -> None:
+        """CalledProcessError from wv_cli is caught and node is not counted."""
+        issue = GitHubIssue(
+            number=33, title="Failing", state="OPEN", body="",
+            labels=["weave-synced"],
+        )
+        stats = SyncStats()
+
+        with patch(
+            "weave_gh.phases.wv_cli",
+            side_effect=subprocess.CalledProcessError(1, "wv", stderr="err"),
+        ):
+            sync_github_to_weave([], [issue], "owner/repo", stats)
+
+        assert stats.created_wv == 0
+
+
+# ---------------------------------------------------------------------------
+# sync_closed_to_weave — Phase 3: close Weave nodes for closed GH issues
+# ---------------------------------------------------------------------------
+
+
+class TestSyncClosedToWeave:
+    """sync_closed_to_weave marks Weave nodes done when GH issues are closed."""
+
+    def test_closes_open_weave_node_for_closed_gh_issue(self) -> None:
+        """Node with non-done status and closed GH issue gets closed."""
+        node = _node("wv-todc", status="active", gh_issue=50)
+        issue = _issue(50, state="CLOSED")
+        stats = SyncStats()
+
+        with patch("weave_gh.phases.wv_cli") as mock_wv:
+            mock_wv.return_value = ""
+            sync_closed_to_weave([node], [issue], stats)
+
+        assert stats.closed_wv == 1
+        mock_wv.assert_called_once()
+
+    def test_dry_run_increments_without_wv_call(self) -> None:
+        """Dry-run increments closed_wv but does not call wv_cli."""
+        node = _node("wv-dcdr", status="todo", gh_issue=51)
+        issue = _issue(51, state="CLOSED")
+        stats = SyncStats()
+
+        with patch("weave_gh.phases.wv_cli") as mock_wv:
+            sync_closed_to_weave([node], [issue], stats, dry_run=True)
+
+        assert stats.closed_wv == 1
+        mock_wv.assert_not_called()
+
+    def test_already_done_node_not_closed_again(self) -> None:
+        """Nodes already done are not closed again."""
+        node = _node("wv-alrd", status="done", gh_issue=52)
+        issue = _issue(52, state="CLOSED")
+        stats = SyncStats()
+
+        with patch("weave_gh.phases.wv_cli") as mock_wv:
+            sync_closed_to_weave([node], [issue], stats)
+
+        assert stats.closed_wv == 0
+        mock_wv.assert_not_called()
+
+    def test_open_gh_issue_not_closed(self) -> None:
+        """Nodes linked to open GH issues are not closed."""
+        node = _node("wv-open", status="active", gh_issue=53)
+        issue = _issue(53, state="OPEN")
+        stats = SyncStats()
+
+        with patch("weave_gh.phases.wv_cli") as mock_wv:
+            sync_closed_to_weave([node], [issue], stats)
+
+        assert stats.closed_wv == 0
+        mock_wv.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# refresh_parent_body — error paths (lines 665-666, 677)
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshParentBodyErrorPaths:
+    """Cover get_repo exception and empty raw body paths."""
+
+    def test_get_repo_exception_returns_false(self) -> None:
+        """Returns False when get_repo raises CalledProcessError."""
+        parent = _node("wv-repoerr", text="Epic", status="active", gh_issue=100)
+        with patch("weave_gh.phases.get_parent", return_value="wv-repoerr"), patch(
+            "weave_gh.data.get_weave_nodes", return_value=[parent]
+        ), patch(
+            "weave_gh.phases.get_repo",
+            side_effect=subprocess.CalledProcessError(1, "gh"),
+        ):
+            result = refresh_parent_body("wv-child")
+        assert result is False
+
+    def test_empty_raw_body_returns_false(self) -> None:
+        """Returns False when gh issue view returns empty body."""
+        parent = _node("wv-emptbod", text="Epic", status="active", gh_issue=200)
+        with patch("weave_gh.phases.get_parent", return_value="wv-emptbod"), patch(
+            "weave_gh.data.get_weave_nodes", return_value=[parent]
+        ), patch(
+            "weave_gh.phases.get_repo", return_value="owner/repo"
+        ), patch(
+            "weave_gh.phases.gh_cli", return_value=""
+        ):
+            result = refresh_parent_body("wv-child")
+        assert result is False
