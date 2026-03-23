@@ -165,7 +165,7 @@ def _discover_files(repo: str, exclude_globs: list[str] | None = None) -> list[s
             cwd=repo,
         )
         candidates = result.stdout.strip().splitlines()
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError):  # pragma: no cover
         # Fallback: walk filesystem
         candidates = []
         for root, dirs, filenames in os.walk(repo):
@@ -1246,7 +1246,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
+def main() -> int:  # pragma: no cover
     """CLI entry point for weave_quality scanner."""
     parser = argparse.ArgumentParser(
         prog="weave_quality",
@@ -1357,5 +1357,5 @@ def main() -> int:
     return 1
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     sys.exit(main())

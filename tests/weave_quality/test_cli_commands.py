@@ -19,6 +19,7 @@ from unittest.mock import patch
 import pytest
 
 from weave_quality.__main__ import (
+    _discover_files,
     _finding_id,
     cmd_context_files,
     cmd_diff,
@@ -1112,3 +1113,33 @@ class TestCmdScanCategory:
         prod_entry = by_path.get("src/app.py")
         assert prod_entry is not None, "src/app.py not found in scan"
         assert prod_entry.category == "production"
+
+
+class TestDiscoverFiles:
+    """Tests for _discover_files file discovery and filtering."""
+
+    def _make_git_repo(self, tmp_path: Path) -> Path:
+        """Create a minimal git repo with Python and non-Python files."""
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t.com"], check=True)
+        subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "T"], check=True)
+        (tmp_path / "main.py").write_text("x = 1\n")
+        (tmp_path / "util.py").write_text("y = 2\n")
+        (tmp_path / "skip_me.py").write_text("z = 3\n")
+        subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "-m", "init"], check=True)
+        return tmp_path
+
+    def test_discovers_python_files(self, tmp_path: Path) -> None:
+        """Python files are discovered without exclusions."""
+        repo = self._make_git_repo(tmp_path)
+        files = _discover_files(str(repo))
+        assert "main.py" in files
+        assert "util.py" in files
+
+    def test_exclude_globs_filters_files(self, tmp_path: Path) -> None:
+        """Files matching exclude_globs are skipped."""
+        repo = self._make_git_repo(tmp_path)
+        files = _discover_files(str(repo), exclude_globs=["skip_me.py"])
+        assert "skip_me.py" not in files
+        assert "main.py" in files
