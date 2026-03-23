@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 
+from unittest.mock import patch
+from typing import Any
+
 from weave_gh.labels import (
     ENSURE_LABELS,
     PRIORITY_LABELS,
     STATUS_LABELS,
     TYPE_LABELS,
+    ensure_labels,
     get_labels_for_node,
     parse_gh_labels_to_metadata,
+    sync_issue_labels,
 )
 from weave_gh.models import WeaveNode
 
@@ -184,3 +189,106 @@ class TestParseGhLabelsToMetadata:
         """If multiple priority labels, the first one should win."""
         meta = parse_gh_labels_to_metadata(["P3", "P1"])
         assert meta["priority"] == 3
+
+
+# ---------------------------------------------------------------------------
+# ensure_labels
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureLabels:
+    @patch("weave_gh.labels.gh_cli", return_value="")
+    def test_calls_gh_for_each_label(self, mock_gh: Any) -> None:
+        ensure_labels("owner/repo")
+        assert mock_gh.call_count == len(ENSURE_LABELS)
+
+    @patch("weave_gh.labels.gh_cli", return_value="")
+    def test_creates_weave_synced(self, mock_gh: Any) -> None:
+        ensure_labels("owner/repo")
+        calls_str = str(mock_gh.call_args_list)
+        assert "weave-synced" in calls_str
+
+    @patch("weave_gh.labels.gh_cli", return_value="")
+    def test_passes_repo_flag(self, mock_gh: Any) -> None:
+        ensure_labels("my-org/my-repo")
+        for c in mock_gh.call_args_list:
+            args = c[0]
+            assert "--repo" in args
+            repo_idx = list(args).index("--repo")
+            assert args[repo_idx + 1] == "my-org/my-repo"
+
+
+# ---------------------------------------------------------------------------
+# sync_issue_labels
+# ---------------------------------------------------------------------------
+
+
+class TestSyncIssueLabels:
+    @patch("weave_gh.labels.gh_cli", return_value="")
+    def test_adds_missing_labels(self, mock_gh: Any) -> None:
+        changed = sync_issue_labels(
+            issue_num=1,
+            desired_labels=["bug", "P2"],
+            current_labels=[],
+            repo="owner/repo",
+        )
+        assert changed is True
+        assert mock_gh.call_count == 2
+
+    @patch("weave_gh.labels.gh_cli", return_value="")
+    def test_no_changes_when_labels_match(self, mock_gh: Any) -> None:
+        changed = sync_issue_labels(
+            issue_num=1,
+            desired_labels=["bug"],
+            current_labels=["bug"],
+            repo="owner/repo",
+        )
+        assert changed is False
+        mock_gh.assert_not_called()
+
+    @patch("weave_gh.labels.gh_cli", return_value="")
+    def test_removes_stale_status_labels(self, mock_gh: Any) -> None:
+        changed = sync_issue_labels(
+            issue_num=1,
+            desired_labels=["bug"],
+            current_labels=["bug", "weave:active"],
+            repo="owner/repo",
+        )
+        assert changed is True
+        calls_str = str(mock_gh.call_args_list)
+        assert "remove-label" in calls_str
+
+    @patch("weave_gh.labels.gh_cli", return_value="")
+    def test_does_not_remove_non_status_labels(self, mock_gh: Any) -> None:
+        changed = sync_issue_labels(
+            issue_num=1,
+            desired_labels=["bug"],
+            current_labels=["bug", "custom-label"],
+            repo="owner/repo",
+        )
+        assert changed is False
+        mock_gh.assert_not_called()
+
+    def test_dry_run_does_not_call_gh(self) -> None:
+        with patch("weave_gh.labels.gh_cli") as mock_gh:
+            changed = sync_issue_labels(
+                issue_num=1,
+                desired_labels=["bug", "P2"],
+                current_labels=[],
+                repo="owner/repo",
+                dry_run=True,
+            )
+        assert changed is True
+        mock_gh.assert_not_called()
+
+    def test_dry_run_remove_does_not_call_gh(self) -> None:
+        with patch("weave_gh.labels.gh_cli") as mock_gh:
+            changed = sync_issue_labels(
+                issue_num=1,
+                desired_labels=["bug"],
+                current_labels=["bug", "weave:blocked"],
+                repo="owner/repo",
+                dry_run=True,
+            )
+        assert changed is True
+        mock_gh.assert_not_called()

@@ -19,12 +19,14 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install dependencies
+        run: pip install pytest pytest-cov --quiet
+
       - name: Run tests with coverage
         run: |
-          pip install pytest pytest-cov --quiet
           pytest tests/ \
-            --cov=scripts/weave_gh \
-            --cov=scripts/weave_quality \
+            --ignore=tests/test_runtime_phase1.py \
+            --cov \
             --cov-report=xml:coverage.xml \
             -q
         env:

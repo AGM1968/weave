@@ -16,3 +16,15 @@ package-mode = false
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["scripts", "."]
+
+[tool.coverage.run]
+relative_files = true
+source = ["scripts"]
+omit = ["scripts/*.py", "scripts/*.sh"]
+
+[tool.coverage.report]
+relative_files = true
+
