@@ -665,8 +665,7 @@ class TestCmdHealthInfo:
     ) -> None:
         """health-info with no quality.db returns available=false."""
         args = _make_health_args(str(tmp_path / "nonexistent"))
-        result = cmd_health_info(args)
-        assert result == 0
+        cmd_health_info(args)
         data = json.loads(capsys.readouterr().out)
         assert data["available"] is False
 
@@ -677,8 +676,7 @@ class TestCmdHealthInfo:
         """health-info with empty db returns available=false."""
         _ = db
         args = _make_health_args(str(tmp_path))
-        result = cmd_health_info(args)
-        assert result == 0
+        cmd_health_info(args)
         data = json.loads(capsys.readouterr().out)
         assert data["available"] is False
 
@@ -700,8 +698,7 @@ class TestCmdHealthInfo:
         finish_scan(db, scan_id, 2, 100)
 
         args = _make_health_args(str(tmp_path))
-        result = cmd_health_info(args)
-        assert result == 0
+        cmd_health_info(args)
         data = json.loads(capsys.readouterr().out)
         assert data["available"] is True
         assert isinstance(data["score"], int)

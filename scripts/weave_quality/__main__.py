@@ -1123,7 +1123,7 @@ def cmd_promote(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def cmd_health_info(args: argparse.Namespace) -> int:
+def cmd_health_info(args: argparse.Namespace) -> None:
     """Output compact quality summary for wv health integration.
 
     Always outputs JSON to stdout.  If quality.db is missing or empty,
@@ -1133,14 +1133,14 @@ def cmd_health_info(args: argparse.Namespace) -> int:
 
     if not db_exists(hot_zone):
         print(json.dumps({"available": False}))
-        return 0
+        return
 
     conn = init_db(hot_zone)
     scan = latest_scan(conn)
     if scan is None:
         conn.close()
         print(json.dumps({"available": False}))
-        return 0
+        return
 
     entries = get_file_entries(conn, scan.id)
     all_stats = get_git_stats(conn)
@@ -1158,7 +1158,6 @@ def cmd_health_info(args: argparse.Namespace) -> int:
         "git_head": scan.git_head,
         "scanned_at": scan.scanned_at,
     }))
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1347,7 +1346,8 @@ def main() -> int:
     if args.command == "promote":
         return cmd_promote(args)
     if args.command == "health-info":
-        return cmd_health_info(args)
+        cmd_health_info(args)
+        return 0
     if args.command == "context-files":
         return cmd_context_files(args)
     if args.command == "functions":
