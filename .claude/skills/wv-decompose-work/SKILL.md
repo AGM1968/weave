@@ -1,6 +1,8 @@
 ---
 name: wv-decompose-work
-description: "Breaks down an epic into feature and task nodes with proper dependencies. Use when starting a new epic that needs task decomposition before work can begin."
+description:
+  "Breaks down an epic into feature and task nodes with proper dependencies. Use when starting a new
+  epic that needs task decomposition before work can begin."
 ---
 
 # wv-decompose-work — Epic Breakdown Workflow
@@ -72,26 +74,30 @@ For each feature, create 3-10 tasks:
 
 ### 4. Create Weave Nodes
 
-```bash
-# Create epic
+> **CRITICAL**: Always use `--parent=` when creating features and tasks. This creates the
+> `implements` edge that powers `wv context`, `wv path`, and `_aggregate_epic_commits`. Without it,
+> the graph is a flat list and navigation breaks entirely.
 
+```bash
+# Create epic first — all features and tasks must link back to it
 EPIC=$(wv add "Epic: $ARGUMENTS" --metadata='{"type":"epic","priority":1}')
 
-# Create features
-FEAT1=$(wv add "Feature: [first major capability]" --metadata='{"type":"feature","priority":1}')
-FEAT2=$(wv add "Feature: [second major capability]" --metadata='{"type":"feature","priority":2}')
+# Create features — each linked to the epic via --parent
+FEAT1=$(wv add "Feature: [first major capability]" --metadata='{"type":"feature","priority":1}' --parent=$EPIC)
+FEAT2=$(wv add "Feature: [second major capability]" --metadata='{"type":"feature","priority":2}' --parent=$EPIC)
 # ... more features
-# Create tasks for feature 1
-TASK1=$(wv add "Task: [specific implementation]" --metadata='{"type":"task","priority":1}')
-TASK2=$(wv add "Task: [specific implementation]" --metadata='{"type":"task","priority":2}')
+
+# Create tasks for feature 1 — each linked to its feature via --parent
+TASK1=$(wv add "Task: [specific implementation]" --metadata='{"type":"task","priority":1}' --parent=$FEAT1)
+TASK2=$(wv add "Task: [specific implementation]" --metadata='{"type":"task","priority":2}' --parent=$FEAT1)
 # ... more tasks
-# Repeat for other features
+# Repeat for other features, linking to $FEAT2, $FEAT3, etc.
 ```
 
 ### 5. Set Up Dependencies
 
 ```bash
-# Epic blocked by all features
+# Epic blocked by all features (prevents closing epic before features are done)
 wv block $EPIC --by=$FEAT1
 wv block $EPIC --by=$FEAT2
 # ... for all features

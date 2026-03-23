@@ -629,7 +629,11 @@ def sync_closed_to_weave(
                         node.id,
                         node.gh_issue,
                     )
-                    wv_cli("done", node.id, check=False)
+                    wv_cli(
+                        "done", node.id, "--skip-verification",
+                        "--learning=closed via GH issue sync (Phase 3)",
+                        check=False,
+                    )
                 stats.closed_wv += 1
 
 

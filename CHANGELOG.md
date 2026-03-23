@@ -2,6 +2,40 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.26.3] - 2026-03-23
+
+### Fixed
+
+- **`sync --gh` Phase 3 silent failure** — `sync_closed_to_weave()` called `wv done` without
+  `--skip-verification`, causing every GH→Weave close to silently fail (exit 1 swallowed by
+  `check=False`). Nodes kept resurrecting as active on every sync. Now passes `--skip-verification`
+  and `--learning` flags (#1483).
+- **Test lint cleanup** — fixed 10 mypy `func-returns-value` errors, 2 pylint
+  `use-implicit-booleaness-not-comparison` warnings, and 3 pylint `import-outside-toplevel` warnings
+  in `test_weave_gh_phases.py`.
+
+## [1.26.2] - 2026-03-23
+
+### Fixed
+
+- **`wv add` epic hint** — when active epics exist, displays their IDs after node creation to remind
+  agents to use `--parent=<id>` and avoid orphan nodes.
+- **`wv done` epic closure guard** — warns when closing an epic with no `implements` edges (no
+  children linked via `--parent`), preventing silent flat-graph failures.
+- **`wv load` status regression guard** — detects when `state.sql` has fewer `done` nodes than the
+  current DB (un-synced closures), warns before overwriting, and backs up the live DB.
+- **`pre-action.sh` bootstrapping catch-22** — `wv add`, `wv work`, `wv ready`, `wv status`,
+  `wv list`, `wv show`, `wv sync`, `wv load`, and `wv doctor` are now whitelisted so the hook cannot
+  block graph setup commands when 0 active nodes exist.
+- **`stop-check.sh` idle node warning** — warns on active nodes with no update in >30 min (possible
+  abandoned/crashed work) before the uncommitted-changes check.
+- **`weave-audit` epic hierarchy check** — audit report now detects epics with no tracked children
+  and deducts 15 points per childless epic from the health score.
+- **`wv-decompose-work` skill** — all `wv add` examples now include mandatory `--parent=<id>` to
+  prevent agents from creating flat graphs.
+- **`WORKFLOW.md` Epic Decomposition section** — canonical reference updated with hierarchy rules,
+  `--parent=` requirement, blocking setup, and cross-reference in Rule 1.
+
 ## [1.26.1] - 2026-03-23
 
 ### Fixed

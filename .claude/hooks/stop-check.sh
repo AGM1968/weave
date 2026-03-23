@@ -24,6 +24,19 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
 cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 
+# Warn on active nodes that haven't been updated recently (crash/abandon signal).
+# Nodes active for >30 min with no update suggest a crashed or abandoned session.
+if [ -x "${WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
+    _WV="${WV:-wv}"
+    IDLE_NODES=$("$_WV" list --json 2>/dev/null | jq -r --argjson cutoff "$(date -d '30 minutes ago' +%s 2>/dev/null || date -v-30M +%s 2>/dev/null || echo 0)" \
+        '.[] | select(.status=="active") | select((.updated_at | strptime("%Y-%m-%d %H:%M:%S") | mktime) < $cutoff) | "  \(.id): \(.text[:60])"' 2>/dev/null || true)
+    if [ -n "$IDLE_NODES" ]; then
+        echo "Note: active node(s) with no update in >30 min — possible abandoned work:" >&2
+        echo "$IDLE_NODES" >&2
+        echo "  Close with: wv done <id> --skip-verification" >&2
+    fi
+fi
+
 # Check for uncommitted changes (exclude .weave/ — infrastructure files
 # auto-committed by auto_checkpoint/session-end-sync, not user work)
 UNCOMMITTED=$(git status --porcelain 2>/dev/null | grep -v '\.weave/' | wc -l | tr -d ' ')

@@ -1,6 +1,6 @@
 [project]
 name = "weave-workflow"
-version = "1.26.1"
+version = "1.26.3"
 description = "Token-optimized memory system for agentic workflows"
 authors = [
     {name = "AGM1968",email = "AGM1968@users.noreply.github.com"}
@@ -15,10 +15,6 @@ package-mode = false
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["scripts", "."]
 
 [tool.coverage.run]
 relative_files = true

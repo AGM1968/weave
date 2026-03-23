@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from contextlib import contextmanager
 from typing import Any, Generator
@@ -533,12 +534,17 @@ class TestSyncAssignee:
         with patch("weave_gh.phases.gh_cli", side_effect=lambda *_a, **_k: calls.append(_a)):
             changed = _sync_assignee(1, "alice", ["alice"], "owner/repo")
         assert changed is False
-        assert calls == []
+        assert not calls
 
     def test_add_assignee(self) -> None:
         """Should call gh issue edit --add-assignee when desired != current."""
         calls: list[tuple[object, ...]] = []
-        with patch("weave_gh.phases.gh_cli", side_effect=lambda *_a, **_k: calls.append(_a) or ""):
+
+        def _capture(*_a: object, **_k: object) -> str:
+            calls.append(_a)
+            return ""
+
+        with patch("weave_gh.phases.gh_cli", side_effect=_capture):
             changed = _sync_assignee(1, "alice", [], "owner/repo")
         assert changed is True
         assert any("--add-assignee" in str(c) for c in calls[0])
@@ -546,7 +552,12 @@ class TestSyncAssignee:
     def test_remove_assignee(self) -> None:
         """Should call gh issue edit --remove-assignee when desired is None."""
         calls: list[tuple[object, ...]] = []
-        with patch("weave_gh.phases.gh_cli", side_effect=lambda *_a, **_k: calls.append(_a) or ""):
+
+        def _capture(*_a: object, **_k: object) -> str:
+            calls.append(_a)
+            return ""
+
+        with patch("weave_gh.phases.gh_cli", side_effect=_capture):
             changed = _sync_assignee(1, None, ["alice"], "owner/repo")
         assert changed is True
         assert any("--remove-assignee" in str(c) for c in calls[0])
@@ -557,7 +568,7 @@ class TestSyncAssignee:
         with patch("weave_gh.phases.gh_cli", side_effect=lambda *_a, **_k: calls.append(_a)):
             changed = _sync_assignee(1, "alice", [], "owner/repo", dry_run=True)
         assert changed is True
-        assert calls == []
+        assert not calls
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +598,6 @@ class TestPhase2ClaimedBy:
             args_list = list(args)
             for arg in args_list:
                 if isinstance(arg, str) and arg.startswith("--metadata="):
-                    import json
                     created_meta.append(json.loads(arg[len("--metadata="):]))
             return "wv-test"
 
@@ -611,7 +621,6 @@ class TestPhase2ClaimedBy:
             args_list = list(args)
             for arg in args_list:
                 if isinstance(arg, str) and arg.startswith("--metadata="):
-                    import json
                     created_meta.append(json.loads(arg[len("--metadata="):]))
             return "wv-test"
 
@@ -645,7 +654,10 @@ class TestHandleNewIssueBlockedStatus:
             get_labels_for_node=lambda _: [],
             sync_issue_labels=lambda *_a, **_k: None,
             _backfill_gh_issue=lambda *_a, **_k: None,
-            gh_cli=lambda *_a, **_k: (gh_calls.append("create"), "https://github.com/owner/repo/issues/999")[1],
+            gh_cli=lambda *_a, **_k: (
+                gh_calls.append("create"),  # type: ignore[func-returns-value]
+                "https://github.com/owner/repo/issues/999",
+            )[1],
         ):
             _handle_new_issue(
                 node,
@@ -872,7 +884,7 @@ class TestHandleNewIssuePaths:
         gh_calls: list[object] = []
         self._call(
             node, stats, dry_run=True,
-            gh_cli=lambda *_a, **_k: gh_calls.append(_a) or "",
+            gh_cli=lambda *_a, **_k: gh_calls.append(_a) or "",  # type: ignore[func-returns-value]
         )
         assert stats.created_gh == 1
         assert not gh_calls
@@ -925,7 +937,10 @@ class TestHandleNewIssuePaths:
             get_labels_for_node=lambda _: ["bug", "enhancement"],
             sync_issue_labels=lambda *_a, **_k: None,
             _backfill_gh_issue=lambda *_a, **_k: None,
-            gh_cli=lambda *_a, **_k: (gh_args.append(_a), "https://github.com/o/r/issues/1")[1],
+            gh_cli=lambda *_a, **_k: (
+                gh_args.append(_a),  # type: ignore[func-returns-value]
+                "https://github.com/o/r/issues/1",
+            )[1],
         ):
             _handle_new_issue(
                 node,
@@ -959,7 +974,7 @@ class TestHandleNewIssuePaths:
             _backfill_gh_issue=lambda *_a, **_k: None,
             build_close_comment=lambda *_a, **_k: "closed",
             gh_cli=lambda *_a, **_k: (
-                gh_calls.append(_a),
+                gh_calls.append(_a),  # type: ignore[func-returns-value]
                 "https://github.com/owner/repo/issues/42",
             )[1],
         ):
@@ -1034,7 +1049,7 @@ class TestHandleExistingIssuePaths:
 
         self._call(
             node, issue, stats,
-            render_issue_body=lambda *_a, **_k: render_calls.append(_a) or "",
+            render_issue_body=lambda *_a, **_k: render_calls.append(_a) or "",  # type: ignore[func-returns-value]
         )
         assert not render_calls
 
@@ -1047,7 +1062,7 @@ class TestHandleExistingIssuePaths:
 
         self._call(
             node, issue, stats, dry_run=True,
-            gh_cli=lambda *_a, **_k: (gh_calls.append(_a), "")[1],
+            gh_cli=lambda *_a, **_k: (gh_calls.append(_a), "")[1],  # type: ignore[func-returns-value]
         )
 
         assert stats.closed_gh == 1
@@ -1066,7 +1081,7 @@ class TestHandleExistingIssuePaths:
 
         self._call(
             node, issue, stats,
-            _sync_assignee=lambda *_a, **_k: (sync_calls.append(_a), False)[1],
+            _sync_assignee=lambda *_a, **_k: (sync_calls.append(_a), False)[1],  # type: ignore[func-returns-value]
         )
 
         assert len(sync_calls) == 1
@@ -1084,7 +1099,7 @@ class TestHandleExistingIssuePaths:
             should_update_body=lambda *_a: True,
             extract_human_content=lambda _: "",
             compose_issue_body=lambda h, w: w,
-            gh_cli=lambda *_a, **_k: (gh_calls.append(_a), "")[1],
+            gh_cli=lambda *_a, **_k: (gh_calls.append(_a), "")[1],  # type: ignore[func-returns-value]
         )
 
         assert stats.updated_gh == 1
@@ -1121,12 +1136,10 @@ class TestSyncGithubToWeavePaths:
         stats = SyncStats()
         created_meta: list[dict[str, object]] = []
 
-        import json as _json
-
         def mock_wv(*args: object, **_kw: object) -> str:
             for arg in args:
                 if isinstance(arg, str) and arg.startswith("--metadata="):
-                    created_meta.append(_json.loads(arg[len("--metadata="):]))
+                    created_meta.append(json.loads(arg[len("--metadata="):]))
             return "wv-new"
 
         with patch("weave_gh.phases.wv_cli", side_effect=mock_wv):
@@ -1173,7 +1186,11 @@ class TestSyncClosedToWeave:
             sync_closed_to_weave([node], [issue], stats)
 
         assert stats.closed_wv == 1
-        mock_wv.assert_called_once()
+        mock_wv.assert_called_once_with(
+            "done", "wv-todc", "--skip-verification",
+            "--learning=closed via GH issue sync (Phase 3)",
+            check=False,
+        )
 
     def test_dry_run_increments_without_wv_call(self) -> None:
         """Dry-run increments closed_wv but does not call wv_cli."""

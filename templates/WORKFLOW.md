@@ -81,6 +81,32 @@ wv resolve A B --winner=A --rationale="Winner has broader scope"
 - **Explicit context** (`{"reason":"..."}`) — semantic, non-derivable, always preserved on re-link
 - **Backfill** — `wv health --fix` enriches all empty edges with auto-context
 
+## Epic Decomposition
+
+Epics with no child edges produce a **flat graph** — `wv context`, `wv path`, and commit aggregation
+all break silently. Always link sub-tasks at creation time:
+
+```bash
+# 1. Create the epic
+EPIC=$(wv add "Epic: big feature" --metadata='{"type":"epic","priority":1}')
+
+# 2. Create features linked to the epic — --parent creates the implements edge
+FEAT=$(wv add "Feature: sub-capability" --metadata='{"type":"feature"}' --parent=$EPIC)
+
+# 3. Create tasks linked to their feature
+TASK=$(wv add "Task: specific work" --metadata='{"type":"task"}' --parent=$FEAT)
+
+# 4. Set blocking order (epic unblocked only when features done)
+wv block $EPIC --by=$FEAT
+wv block $FEAT --by=$TASK
+```
+
+**Rules:**
+
+- `--parent=` is **mandatory** for every feature and task — never optional
+- Use `/wv-decompose-work` skill for structured breakdowns
+- Run `/weave-audit` — reports epics with no children and deducts score
+
 ## GitHub Integration
 
 ```bash
@@ -102,7 +128,8 @@ Good learnings are specific, actionable, and scoped to a concrete context.
 ## Rules
 
 1. **Track ALL work** — `wv work <id>` or `wv add "<text>" --status=active` before editing files.
-   Use `--gh --parent=<epic-id>` to link. Never edit without an active node.
+   Use `--gh` for GitHub-linked work. Use `--parent=<epic-id>` for sub-tasks — this is
+   **mandatory**, not optional (see Epic Decomposition). Never edit without an active node.
 2. **No untracked fixes** — even one-line changes get a node. Use `wv quick "<what>"` for trivial
    work.
 3. **GitHub workflow** — create with `--gh`, close with `wv done` (auto-closes issue). Check

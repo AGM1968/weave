@@ -46,6 +46,12 @@ if [[ "$TOOL" == "Bash" || "$TOOL" == "run_in_terminal" ]]; then
     if [[ "$CMD" =~ (wv[[:space:]]+done|wv-close|wv[[:space:]]done) ]]; then
         SHOULD_CHECK=true
     fi
+    # Bootstrapping commands: always allow even with 0 active nodes.
+    # wv add/work/ready/status/list/show/sync are graph reads or node creation —
+    # they cannot proceed without being allowed first (catch-22 prevention).
+    if [[ "$CMD" =~ ^[[:space:]]*(wv[[:space:]]+(add|work|ready|status|list|show|sync|load|doctor)|wv-init-repo|wv[[:space:]]+--help) ]]; then
+        exit 0
+    fi
 fi
 
 if [ "$SHOULD_CHECK" = "false" ]; then

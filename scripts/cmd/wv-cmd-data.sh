@@ -274,10 +274,12 @@ _sync_gh() {
 cmd_sync() {
     local gh_sync=false
     local dry_run=false
+    local format="text"
     while [ $# -gt 0 ]; do
         case "$1" in
             --gh) gh_sync=true ;;
             --dry-run) dry_run=true ;;
+            --json) format="json" ;;
         esac
         shift
     done
@@ -330,7 +332,11 @@ cmd_sync() {
     [ "$_sync_journaled" = true ] && \
         trap 'journal_end 2>/dev/null; journal_clean 2>/dev/null' EXIT
 
-    echo -e "${GREEN}✓${NC} Synced to $WEAVE_DIR"
+    if [ "$format" = "json" ]; then
+        echo -e "${GREEN}✓${NC} Synced to $WEAVE_DIR" >&2
+    else
+        echo -e "${GREEN}✓${NC} Synced to $WEAVE_DIR"
+    fi
 
     [ "$_sync_journaled" = true ] && journal_complete 1
 
@@ -393,6 +399,11 @@ cmd_sync() {
         journal_end
         journal_clean
     fi
+
+    if [ "$format" = "json" ]; then
+        jq -n --arg path "$WEAVE_DIR" --argjson gh "$gh_sync" \
+            '{"ok": true, "synced_to": $path, "gh_synced": $gh}'
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -434,6 +445,19 @@ cmd_load() {
                     echo -e "${YELLOW}  state.sql may be stale. Existing DB kept as backup: ${WV_DB}.bak${NC}" >&2
                     cp "$WV_DB" "${WV_DB}.bak" 2>/dev/null || true
                 fi
+            fi
+            # Status regression guard: warn if state.sql has more active nodes than current DB
+            # This catches the case where wv done closures happened after the last wv sync
+            local new_active old_done new_done
+            new_active=$(sqlite3 "$tmp_db" "SELECT COUNT(*) FROM nodes WHERE status='active';" 2>/dev/null || echo "0")
+            old_done=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE status='done';" 2>/dev/null || echo "0")
+            new_done=$(sqlite3 "$tmp_db" "SELECT COUNT(*) FROM nodes WHERE status='done';" 2>/dev/null || echo "0")
+            if [ "$old_done" -gt "$new_done" ]; then
+                local lost=$(( old_done - new_done ))
+                echo -e "${YELLOW}⚠ Warning: state.sql has ${lost} fewer 'done' node(s) than current DB${NC}" >&2
+                echo -e "${YELLOW}  Recent wv done closures may not have been synced — run wv sync before wv load${NC}" >&2
+                echo -e "${YELLOW}  Current DB backed up: ${WV_DB}.bak${NC}" >&2
+                cp "$WV_DB" "${WV_DB}.bak" 2>/dev/null || true
             fi
 
             # Validation passed, replace existing DB

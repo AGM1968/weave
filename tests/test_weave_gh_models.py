@@ -93,6 +93,20 @@ class TestWeaveNodeIsTest:
         assert node.is_test is True
 
 
+class TestWeaveNodeClaimedBy:
+    def test_missing(self) -> None:
+        node = WeaveNode(id="n1", text="t", status="todo")
+        assert node.claimed_by is None
+
+    def test_present(self) -> None:
+        node = WeaveNode(id="n1", text="t", status="active", metadata={"claimed_by": "alice"})
+        assert node.claimed_by == "alice"
+
+    def test_coerced_to_str(self) -> None:
+        node = WeaveNode(id="n1", text="t", status="todo", metadata={"claimed_by": 42})
+        assert node.claimed_by == "42"
+
+
 class TestWeaveNodeLearningParts:
     def test_empty(self) -> None:
         node = WeaveNode(id="n1", text="t", status="done")
@@ -147,6 +161,7 @@ class TestGitHubIssue:
         issue = GitHubIssue(number=1, title="Bug", state="OPEN")
         assert issue.body == ""
         assert issue.labels == []
+        assert issue.assignees == []
 
     def test_full(self) -> None:
         issue = GitHubIssue(
@@ -155,10 +170,12 @@ class TestGitHubIssue:
             state="CLOSED",
             body="description",
             labels=["bug", "P1"],
+            assignees=["alice"],
         )
         assert issue.number == 42
         assert issue.state == "CLOSED"
         assert "bug" in issue.labels
+        assert issue.assignees == ["alice"]
 
 
 # ---------------------------------------------------------------------------

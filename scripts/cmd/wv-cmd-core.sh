@@ -256,6 +256,20 @@ cmd_add() {
         node_type=$(echo "$metadata" | jq -r '.type // "task"' 2>/dev/null || echo "task")
         if [ "$node_type" != "epic" ]; then
             echo -e "${YELLOW}⚠ No alias — use --alias=<name>${NC}" >&2
+            # Hint: active epics exist — suggest --parent to avoid orphan
+            local active_epics
+            active_epics=$(db_query "
+                SELECT id FROM nodes
+                WHERE status IN ('todo','active')
+                AND json_extract(metadata,'$.type') = 'epic'
+                ORDER BY created_at DESC LIMIT 3;
+            " 2>/dev/null || true)
+            if [ -n "$active_epics" ]; then
+                local epic_list
+                epic_list=$(echo "$active_epics" | tr '\n' ' ' | sed 's/ $//')
+                echo -e "${CYAN}  Tip: active epic(s) found — use --parent=<id> to link:${NC}" >&2
+                echo -e "${CYAN}  $epic_list${NC}" >&2
+            fi
         fi
     fi
 
@@ -567,6 +581,18 @@ cmd_done() {
     if [ "$exists" = "0" ]; then
         echo -e "${RED}Error: node $id not found${NC}" >&2
         return 1
+    fi
+
+    # Warn if closing an epic with no tracked children (implements edges)
+    local node_type
+    node_type=$(db_query "SELECT json_extract(metadata,'$.type') FROM nodes WHERE id='$id';" 2>/dev/null || true)
+    if [ "$node_type" = "epic" ]; then
+        local child_count
+        child_count=$(db_query "SELECT COUNT(*) FROM edges WHERE target='$id' AND type='implements';" 2>/dev/null || echo "0")
+        if [ "$child_count" = "0" ]; then
+            echo -e "${YELLOW}⚠ Epic closed with no tracked children — sub-tasks were never linked via --parent or wv link${NC}" >&2
+            echo -e "${YELLOW}  Future sessions cannot use wv context or wv path to navigate this epic's work${NC}" >&2
+        fi
     fi
 
     # Store learning in metadata if provided

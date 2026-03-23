@@ -85,6 +85,29 @@ else
 fi
 echo ""
 
+echo "### Epics With No Tracked Children"
+epics_no_children=$(wv list --json 2>/dev/null | jq -r '
+  .[] | select(
+    .status != "done" and
+    ((.metadata // "{}") | try fromjson catch {} | .type) == "epic"
+  ) | .id' 2>/dev/null | while read -r eid; do
+    child_count=$(wv list --json 2>/dev/null | jq --arg eid "$eid" \
+      '[.[] | select(.metadata != null) | select((.metadata | try fromjson catch {}) | .parent == $eid)] | length' 2>/dev/null || echo "0")
+    # Check via edges (implements edges pointing to this epic)
+    edge_count=$(sqlite3 "${WV_DB:-/dev/null}" \
+      "SELECT COUNT(*) FROM edges WHERE target='$eid' AND type='implements';" 2>/dev/null || echo "0")
+    if [ "$edge_count" = "0" ] && [ "${child_count:-0}" = "0" ]; then
+      wv show "$eid" 2>/dev/null | grep "Text:" | sed "s/Text:/- $eid:/"
+    fi
+  done)
+
+if [ -n "$epics_no_children" ]; then
+  echo "$epics_no_children"
+else
+  echo "All open epics have tracked children ✓"
+fi
+echo ""
+
 echo "## Health Score"
 echo ""
 
@@ -116,6 +139,18 @@ no_learnings_count=$(wv list --all --json 2>/dev/null | jq '[.[] | select(.statu
     (.metadata | fromjson | has("pitfall")) == false
   )] | length' || echo "0")
 score=$((score - no_learnings_count * 3))
+
+# Deduct for epics with no tracked children (flat graph, navigation broken)
+epics_no_children_count=0
+while IFS= read -r eid; do
+  [ -z "$eid" ] && continue
+  edge_count=$(sqlite3 "${WV_DB:-/dev/null}" \
+    "SELECT COUNT(*) FROM edges WHERE target='$eid' AND type='implements';" 2>/dev/null || echo "0")
+  if [ "$edge_count" = "0" ]; then
+    epics_no_children_count=$((epics_no_children_count + 1))
+  fi
+done < <(wv list --json 2>/dev/null | jq -r '.[] | select(.status != "done") | select(((.metadata // "{}") | try fromjson catch {} | .type) == "epic") | .id' 2>/dev/null || true)
+score=$((score - epics_no_children_count * 15))
 
 # Ensure score doesn't go below 0
 [ "$score" -lt 0 ] && score=0
@@ -155,6 +190,10 @@ fi
 
 if [ "$no_learnings_count" -gt 0 ]; then
   echo "5. Capture learnings for $no_learnings_count completed nodes (if non-trivial)"
+fi
+
+if [ "$epics_no_children_count" -gt 0 ]; then
+  echo "6. Link sub-tasks to $epics_no_children_count epic(s) with no children — use 'wv add ... --parent=<epic-id>' or 'wv link <child> <epic> --type=implements'"
 fi
 
 # Check if pruning is recommended
