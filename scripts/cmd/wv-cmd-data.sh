@@ -606,11 +606,13 @@ cmd_clean_ghosts() {
 cmd_prune() {
     local age="48 hours"
     local dry_run=false
+    local orphans_only=false
     
     while [ $# -gt 0 ]; do
         case "$1" in
             --age=*) age="${1#*=}" ;;
             --dry-run) dry_run=true ;;
+            --orphans-only) orphans_only=true ;;
         esac
         shift
     done
@@ -642,11 +644,18 @@ cmd_prune() {
 
     local sql_age="-${age_num} ${age_unit}"
     
+    # Build orphan filter clause
+    local orphan_clause=""
+    if [ "$orphans_only" = true ]; then
+        orphan_clause="AND id NOT IN (SELECT source FROM edges) AND id NOT IN (SELECT target FROM edges)"
+    fi
+
     # Find candidates (skip unaddressed pitfalls — they must persist until resolved)
     local candidates=$(db_query "
         SELECT id, text, updated_at FROM nodes
         WHERE status = 'done'
         AND updated_at < datetime('now', '$sql_age')
+        $orphan_clause
         AND id NOT IN (
             SELECT n.id FROM nodes n
             WHERE json_extract(n.metadata, '\$.pitfall') IS NOT NULL
@@ -2213,6 +2222,10 @@ cmd_plan() {
     _plan_inject_learnings
 
     _plan_wire_deps
+
+    # Unblock sweep: nodes imported as done (via [x]) may have blocks edges
+    # that were wired after creation — run a full sweep to fix stale blocked status
+    _do_unblock_cascade
 
     echo ""
     echo -e "${GREEN}Created $_task_count task(s) linked to epic $_epic_id${NC}"

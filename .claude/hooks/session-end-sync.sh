@@ -53,11 +53,14 @@ if ! git diff --cached --quiet 2>/dev/null; then
 fi
 
 # Push to remote with exponential backoff (multi-agent contention)
-for _se_attempt in 1 2 3 4 5; do
-    git push 2>/dev/null && break
-    [ "$_se_attempt" -lt 5 ] && sleep $(( (2 ** _se_attempt) + RANDOM % 3 ))
-    git pull --rebase --autostash --quiet 2>/dev/null || true
-done
+# Skip if no remote configured (e.g. test environments, local-only repos)
+if git remote get-url origin >/dev/null 2>&1; then
+    for _se_attempt in 1 2 3 4 5; do
+        git push 2>/dev/null && break
+        [ "$_se_attempt" -lt 5 ] && sleep $(( (2 ** _se_attempt) + RANDOM % 3 ))
+        git pull --rebase --autostash --quiet 2>/dev/null || true
+    done
+fi
 
 # Log session end
 echo "[$(date -Iseconds)] Session ended: $REASON" >> .claude/session.log 2>/dev/null || true

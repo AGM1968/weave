@@ -74,6 +74,47 @@ cmd_init() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# _do_unblock_cascade — Unblock nodes whose blockers are all done
+# Shared by cmd_done, cmd_add, cmd_update, cmd_quick, and wv plan.
+# Args: $1 = node ID that was just set to done (optional — if empty, sweeps all)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_do_unblock_cascade() {
+    local id="${1:-}"
+    if [ -n "$id" ]; then
+        # Targeted: unblock nodes blocked only by this specific node
+        db_query "
+            UPDATE nodes SET status='todo', updated_at=CURRENT_TIMESTAMP
+            WHERE status='blocked'
+            AND id IN (
+                SELECT target FROM edges WHERE source='$(sql_escape "$id")' AND type='blocks'
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM edges e
+                JOIN nodes blocker ON e.source = blocker.id
+                WHERE e.target = nodes.id
+                AND e.type = 'blocks'
+                AND blocker.status != 'done'
+            );
+        "
+    else
+        # Sweep: unblock ALL blocked nodes whose blockers are all done
+        # Used after bulk imports (wv plan) where multiple done nodes were created at once
+        db_query "
+            UPDATE nodes SET status='todo', updated_at=CURRENT_TIMESTAMP
+            WHERE status='blocked'
+            AND NOT EXISTS (
+                SELECT 1 FROM edges e
+                JOIN nodes blocker ON e.source = blocker.id
+                WHERE e.target = nodes.id
+                AND e.type = 'blocks'
+                AND blocker.status != 'done'
+            );
+        "
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # cmd_add helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -250,27 +291,38 @@ cmd_add() {
         echo -e "${GREEN}✓${NC} Linked to parent $parent" >&2
     fi
 
-    # Alias warning for non-epic, non-trivial nodes (skip if --force or --parent set)
-    if [ -z "$alias" ] && [ "$force" != "true" ] && [ -z "$parent" ]; then
+    # Orphan prevention: require --parent when active epics exist (skip with --force)
+    if [ -z "$parent" ] && [ "$force" != "true" ]; then
         local node_type
         node_type=$(echo "$metadata" | jq -r '.type // "task"' 2>/dev/null || echo "task")
         if [ "$node_type" != "epic" ]; then
-            echo -e "${YELLOW}⚠ No alias — use --alias=<name>${NC}" >&2
-            # Hint: active epics exist — suggest --parent to avoid orphan
             local active_epics
             active_epics=$(db_query "
                 SELECT id FROM nodes
                 WHERE status IN ('todo','active')
-                AND json_extract(metadata,'$.type') = 'epic'
+                AND json_extract(metadata,'\$.type') = 'epic'
                 ORDER BY created_at DESC LIMIT 3;
             " 2>/dev/null || true)
             if [ -n "$active_epics" ]; then
                 local epic_list
                 epic_list=$(echo "$active_epics" | tr '\n' ' ' | sed 's/ $//')
-                echo -e "${CYAN}  Tip: active epic(s) found — use --parent=<id> to link:${NC}" >&2
-                echo -e "${CYAN}  $epic_list${NC}" >&2
+                echo -e "${RED}Error: --parent required when active epics exist (use --force to override)${NC}" >&2
+                echo -e "${CYAN}  Active epic(s): $epic_list${NC}" >&2
+                echo -e "${CYAN}  Usage: wv add \"...\" --parent=<epic-id>${NC}" >&2
+                # Remove the orphan node we just created
+                db_query "DELETE FROM nodes WHERE id='$id';" 2>/dev/null || true
+                return 1
+            fi
+            # No active epics — just warn about missing alias
+            if [ -z "$alias" ]; then
+                echo -e "${YELLOW}⚠ No alias — use --alias=<name>${NC}" >&2
             fi
         fi
+    fi
+
+    # Auto-unblock cascade when created with --status=done
+    if [ "$status" = "done" ]; then
+        _do_unblock_cascade "$id"
     fi
 
     # Create matching GitHub issue if --gh flag is set
@@ -623,20 +675,7 @@ cmd_done() {
     fi
 
     # Auto-unblock nodes that were only blocked by this one
-    db_query "
-        UPDATE nodes SET status='todo', updated_at=CURRENT_TIMESTAMP
-        WHERE status='blocked'
-        AND id IN (
-            SELECT target FROM edges WHERE source='$id' AND type='blocks'
-        )
-        AND NOT EXISTS (
-            SELECT 1 FROM edges e
-            JOIN nodes blocker ON e.source = blocker.id
-            WHERE e.target = nodes.id
-            AND e.type = 'blocks'
-            AND blocker.status != 'done'
-        );
-    "
+    _do_unblock_cascade "$id"
 
     if [ "$format" = "json" ]; then
         local text
@@ -1386,6 +1425,11 @@ cmd_update() {
     db_query "UPDATE nodes SET $updates WHERE id='$id';"
     echo -e "${GREEN}✓${NC} Updated: $id"
 
+    # Auto-unblock cascade when status changed to done
+    if [[ "$updates" == *"status='done'"* ]]; then
+        _do_unblock_cascade "$id"
+    fi
+
     auto_sync 2>/dev/null || true
 }
 
@@ -1464,8 +1508,9 @@ cmd_quick() {
         fi
     fi
 
-    # Step 3: Close the node
+    # Step 3: Close the node + unblock cascade
     db_query "UPDATE nodes SET status = 'done' WHERE id = '$id';"
+    _do_unblock_cascade "$id"
     echo -e "${GREEN}✓${NC} $id (quick-closed)" >&2
     echo "$id"
 

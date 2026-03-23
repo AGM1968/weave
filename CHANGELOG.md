@@ -2,6 +2,21 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.26.4] - 2026-03-23
+
+### Fixed
+
+- **Unblock cascade bypass** — six code paths could set a node to `done` without triggering the
+  unblock cascade for blocked dependents: `cmd_done` (inline SQL), `cmd_add --status=done`,
+  `cmd_update --status=done`, `cmd_quick`, `wv plan` (bulk import), and `wv prune` (no orphan
+  filter). Extracted shared `_do_unblock_cascade()` function and wired it into all paths.
+- **`wv prune --orphans-only`** — new flag restricts pruning to done nodes with no edges, preventing
+  collateral deletion of done nodes that are part of the graph topology.
+- **`wv add --parent` enforcement** — blocks orphan node creation when active epics exist unless
+  `--parent` or `--force` is specified, preventing the orphan accumulation pattern.
+- **`session-end-sync.sh` git push hang** — push retry loop (5 attempts, exponential backoff) now
+  skipped when no git remote is configured, fixing ~30s hang in test repos.
+
 ## [1.26.3] - 2026-03-23
 
 ### Fixed

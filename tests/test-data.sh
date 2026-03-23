@@ -505,10 +505,10 @@ reset_db
 node1=$($WV add "Epic: Test project" | tail -1)
 $WV update "$node1" --metadata='{"type":"epic"}'
 
-node2=$($WV add "Feature: Core functionality" | tail -1)
+node2=$($WV add "Feature: Core functionality" --force | tail -1)
 $WV update "$node2" --metadata='{"type":"feature"}'
 
-node3=$($WV add "Task: Implement handler" | tail -1)
+node3=$($WV add "Task: Implement handler" --force | tail -1)
 $WV update "$node3" --metadata='{"type":"task"}'
 
 # Add edges (correct syntax: wv block <blocked> --by=<blocker>)
