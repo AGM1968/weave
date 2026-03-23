@@ -2,6 +2,19 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.26.1] - 2026-03-23
+
+### Fixed
+
+- **`wv tree`** — `--root` now correctly anchors CTE in text and JSON modes (regression from
+  v1.24.0). Root cause: `$([ cond ] && echo ...)` inside assignment returns exit 1 under `set -e`,
+  silently killing `cmd_tree`. Fixed with `if/fi` guard.
+- **`wv ready --subtree`** — CTE uses `UNION` instead of `UNION ALL` to prevent duplicate node IDs
+  from diamond dependencies.
+- **`wv sync --gh`** — blocked nodes are now included when creating GitHub issues. Previously the
+  status filter excluded `'blocked'`, leaving epics and features with unresolved deps without GH
+  issues.
+
 ## [1.26.0] - 2026-03-21
 
 ### Added

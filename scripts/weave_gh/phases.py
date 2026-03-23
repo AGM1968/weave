@@ -24,6 +24,35 @@ from weave_gh.body import parse_gh_body_description, parse_issue_template_fields
 # Used to detect Weave-closed issues and prevent phantom reopens.
 _WEAVE_CLOSE_MARKER = "Completed. Weave node"
 
+def _sync_assignee(
+    gh_num: int,
+    desired: str | None,
+    current_assignees: list[str],
+    repo: str,
+    *,
+    dry_run: bool = False,
+) -> bool:
+    """Sync a single assignee to a GH issue. Returns True if changed."""
+    current = current_assignees[0] if current_assignees else None
+    if desired == current:
+        return False
+    if dry_run:
+        log.info("  [dry-run] Would set assignee of #%d to %s", gh_num, desired or "(none)")
+        return True
+    if desired:
+        gh_cli(
+            "issue", "edit", str(gh_num), "--repo", repo,
+            "--add-assignee", desired, check=False,
+        )
+        log.info("  👤 Assigned #%d to %s", gh_num, desired)
+    elif current:
+        gh_cli(
+            "issue", "edit", str(gh_num), "--repo", repo,
+            "--remove-assignee", current, check=False,
+        )
+        log.info("  👤 Removed assignee %s from #%d", current, gh_num)
+    return True
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -219,7 +248,7 @@ def _handle_new_issue(
     dry_run: bool = False,
 ) -> None:
     """Handle a Weave node that has no matching GH issue."""
-    if node.status not in ("todo", "active", "done"):
+    if node.status not in ("todo", "active", "done", "blocked"):
         stats.skipped += 1
         return
 
@@ -260,6 +289,10 @@ def _handle_new_issue(
     for lb in labels:
         label_args.extend(["--label", lb])
 
+    assignee_args: list[str] = []
+    if node.claimed_by:
+        assignee_args = ["--assignee", node.claimed_by]
+
     try:
         result = gh_cli(
             "issue",
@@ -271,6 +304,7 @@ def _handle_new_issue(
             "--body",
             weave_body,
             *label_args,
+            *assignee_args,
         )
         # Extract issue number from URL
         num_match = re.search(r"/(\d+)$", result)
@@ -379,6 +413,10 @@ def _handle_existing_issue(
         repo,
         dry_run=dry_run,
     )
+
+    # Sync assignee: Weave claimed_by → GH assignee
+    if node.claimed_by:
+        _sync_assignee(gh_match, node.claimed_by, issue.assignees, repo, dry_run=dry_run)
 
     # Status sync
     if about_to_close:
@@ -521,6 +559,10 @@ def sync_github_to_weave(
             desc = form.get("description") or parse_gh_body_description(issue.body)
             if desc:
                 meta["description"] = desc
+
+            # Set claimed_by from first GH assignee
+            if issue.assignees:
+                meta["claimed_by"] = issue.assignees[0]
 
             if dry_run:
                 log.info(

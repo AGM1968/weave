@@ -9,6 +9,8 @@ from weave_gh.models import GitHubIssue, SyncStats, WeaveNode
 from weave_gh.models import Edge
 from weave_gh.phases import (
     _handle_existing_issue,
+    _handle_new_issue,
+    _sync_assignee,
     _was_closed_by_weave,
     _WEAVE_CLOSE_MARKER,
     refresh_parent_body,
@@ -122,14 +124,14 @@ class TestReopenGuard:
         with patch.multiple(
             "weave_gh.phases",
             get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *a, **k: "",
-            should_update_body=lambda *a: False,
+            render_issue_body=lambda *_a, **_k: "",
+            should_update_body=lambda *_a: False,
             get_labels_for_node=lambda _: [],
-            sync_issue_labels=lambda *a, **k: None,
-            gh_cli=lambda *a, **k: "",
-            build_close_comment=lambda *a, **k: "close",
-            _backfill_gh_issue=lambda *a, **k: None,
-            _was_closed_by_weave=lambda *a: was_closed_by_weave,
+            sync_issue_labels=lambda *_a, **_k: None,
+            gh_cli=lambda *_a, **_k: "",
+            build_close_comment=lambda *_a, **_k: "close",
+            _backfill_gh_issue=lambda *_a, **_k: None,
+            _was_closed_by_weave=lambda *_a: was_closed_by_weave,
         ):
             _handle_existing_issue(
                 node,
@@ -263,17 +265,17 @@ class TestReopenGuard:
             "weave_gh.phases",
             get_edges_for_node=lambda _: [],
             render_issue_body=(
-                lambda *a, **k: "<!-- WEAVE:BEGIN hash=abc123 -->\nnew\n<!-- WEAVE:END -->"
+                lambda *_a, **_k: "<!-- WEAVE:BEGIN hash=abc123 -->\nnew\n<!-- WEAVE:END -->"
             ),
-            should_update_body=lambda *a: True,  # body changed
+            should_update_body=lambda *_a: True,  # body changed
             extract_human_content=lambda _: "",
             compose_issue_body=lambda h, w: w,
             get_labels_for_node=lambda _: [],
-            sync_issue_labels=lambda *a, **k: None,
+            sync_issue_labels=lambda *_a, **_k: None,
             gh_cli=mock_gh_cli,
-            build_close_comment=lambda *a, **k: "close",
-            _backfill_gh_issue=lambda *a, **k: None,
-            _was_closed_by_weave=lambda *a: False,
+            build_close_comment=lambda *_a, **_k: "close",
+            _backfill_gh_issue=lambda *_a, **_k: None,
+            _was_closed_by_weave=lambda *_a: False,
         ):
             _handle_existing_issue(
                 node,
@@ -304,14 +306,14 @@ class TestReopenGuard:
         with patch.multiple(
             "weave_gh.phases",
             get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *a, **k: "",
-            should_update_body=lambda *a: False,
+            render_issue_body=lambda *_a, **_k: "",
+            should_update_body=lambda *_a: False,
             get_labels_for_node=lambda _: [],
-            sync_issue_labels=lambda *a, **k: None,
-            gh_cli=lambda *a, **k: "",
-            build_close_comment=lambda *a, **k: "close",
-            _backfill_gh_issue=lambda *a, **k: None,
-            _was_closed_by_weave=lambda *a: False,
+            sync_issue_labels=lambda *_a, **_k: None,
+            gh_cli=lambda *_a, **_k: "",
+            build_close_comment=lambda *_a, **_k: "close",
+            _backfill_gh_issue=lambda *_a, **_k: None,
+            _was_closed_by_weave=lambda *_a: False,
         ):
             _handle_existing_issue(
                 node,
@@ -557,3 +559,175 @@ class TestRefreshParentBody:
         assert result is True
         edit_calls = [c for c in gh_calls if "edit" in c]
         assert len(edit_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# _sync_assignee — helper for Weave→GH assignee sync
+# ---------------------------------------------------------------------------
+
+
+class TestSyncAssignee:
+    """_sync_assignee should add/remove/noop GH issue assignees."""
+
+    def test_noop_when_unchanged(self) -> None:
+        """Should return False and not call gh when assignee already correct."""
+        calls: list[object] = []
+        with patch("weave_gh.phases.gh_cli", side_effect=lambda *_a, **_k: calls.append(_a)):
+            changed = _sync_assignee(1, "alice", ["alice"], "owner/repo")
+        assert changed is False
+        assert calls == []
+
+    def test_add_assignee(self) -> None:
+        """Should call gh issue edit --add-assignee when desired != current."""
+        calls: list[tuple[object, ...]] = []
+        with patch("weave_gh.phases.gh_cli", side_effect=lambda *_a, **_k: calls.append(_a) or ""):
+            changed = _sync_assignee(1, "alice", [], "owner/repo")
+        assert changed is True
+        assert any("--add-assignee" in str(c) for c in calls[0])
+
+    def test_remove_assignee(self) -> None:
+        """Should call gh issue edit --remove-assignee when desired is None."""
+        calls: list[tuple[object, ...]] = []
+        with patch("weave_gh.phases.gh_cli", side_effect=lambda *_a, **_k: calls.append(_a) or ""):
+            changed = _sync_assignee(1, None, ["alice"], "owner/repo")
+        assert changed is True
+        assert any("--remove-assignee" in str(c) for c in calls[0])
+
+    def test_dry_run_no_call(self) -> None:
+        """Dry run should return True but not call gh_cli."""
+        calls: list[object] = []
+        with patch("weave_gh.phases.gh_cli", side_effect=lambda *_a, **_k: calls.append(_a)):
+            changed = _sync_assignee(1, "alice", [], "owner/repo", dry_run=True)
+        assert changed is True
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: GH→Weave sets claimed_by from assignees
+# ---------------------------------------------------------------------------
+
+
+class TestPhase2ClaimedBy:
+    """Phase 2 should set claimed_by in metadata from GH issue assignees."""
+
+    def test_sets_claimed_by_from_assignee(self) -> None:
+        """A GH issue with an assignee should set claimed_by in the new node."""
+        nodes: list[WeaveNode] = []
+        issue = GitHubIssue(
+            number=42,
+            title="Assigned task",
+            state="OPEN",
+            body="",
+            labels=["weave-synced"],
+            assignees=["alice"],
+        )
+        stats = SyncStats()
+        created_meta: list[dict[str, object]] = []
+
+        def mock_wv_cli(*args: object, **_kw: object) -> str:
+            # Capture --metadata arg to verify claimed_by is set
+            args_list = list(args)
+            for arg in args_list:
+                if isinstance(arg, str) and arg.startswith("--metadata="):
+                    import json
+                    created_meta.append(json.loads(arg[len("--metadata="):]))
+            return "wv-test"
+
+        with patch("weave_gh.phases.wv_cli", side_effect=mock_wv_cli):
+            sync_github_to_weave(nodes, [issue], "owner/repo", stats)
+
+        assert stats.created_wv == 1
+        assert created_meta
+        assert created_meta[0].get("claimed_by") == "alice"
+
+    def test_no_claimed_by_when_no_assignee(self) -> None:
+        """A GH issue with no assignees should not set claimed_by."""
+        nodes: list[WeaveNode] = []
+        issue = GitHubIssue(
+            number=43, title="Unassigned", state="OPEN", body="", labels=["weave-synced"]
+        )
+        stats = SyncStats()
+        created_meta: list[dict[str, object]] = []
+
+        def mock_wv_cli(*args: object, **_kw: object) -> str:
+            args_list = list(args)
+            for arg in args_list:
+                if isinstance(arg, str) and arg.startswith("--metadata="):
+                    import json
+                    created_meta.append(json.loads(arg[len("--metadata="):]))
+            return "wv-test"
+
+        with patch("weave_gh.phases.wv_cli", side_effect=mock_wv_cli):
+            sync_github_to_weave(nodes, [issue], "owner/repo", stats)
+
+        assert stats.created_wv == 1
+        assert created_meta
+        assert "claimed_by" not in created_meta[0]
+
+
+# ---------------------------------------------------------------------------
+# _handle_new_issue — blocked status regression (phases.py:251)
+# ---------------------------------------------------------------------------
+
+
+class TestHandleNewIssueBlockedStatus:
+    """Regression: blocked nodes must get GH issues created, not silently skipped."""
+
+    def _call(
+        self,
+        node: WeaveNode,
+        stats: SyncStats,
+        created_gh_issues: list[str] | None = None,
+    ) -> None:
+        gh_calls: list[str] = created_gh_issues if created_gh_issues is not None else []
+        with patch.multiple(
+            "weave_gh.phases",
+            get_edges_for_node=lambda _: [],
+            render_issue_body=lambda *_a, **_k: "",
+            get_labels_for_node=lambda _: [],
+            sync_issue_labels=lambda *_a, **_k: None,
+            _backfill_gh_issue=lambda *_a, **_k: None,
+            gh_cli=lambda *_a, **_k: (gh_calls.append("create"), "https://github.com/owner/repo/issues/999")[1],
+        ):
+            _handle_new_issue(
+                node,
+                nodes_by_id={},
+                issues=[],
+                issues_by_num={},
+                issues_by_title={},
+                repo="owner/repo",
+                repo_url="https://github.com/owner/repo",
+                stats=stats,
+                dry_run=False,
+            )
+
+    def test_blocked_node_creates_gh_issue(self) -> None:
+        """A blocked node with no GH issue should have one created (regression #1392)."""
+        node = _node("wv-blck", status="blocked")
+        stats = SyncStats()
+        calls: list[str] = []
+
+        self._call(node, stats, created_gh_issues=calls)
+
+        assert stats.skipped == 0
+        assert stats.created_gh == 1
+
+    def test_todo_node_creates_gh_issue(self) -> None:
+        """todo nodes should continue to create GH issues."""
+        node = _node("wv-todo", status="todo")
+        stats = SyncStats()
+
+        self._call(node, stats)
+
+        assert stats.skipped == 0
+        assert stats.created_gh == 1
+
+    def test_unknown_status_still_skipped(self) -> None:
+        """Unknown status values should still be skipped."""
+        node = _node("wv-unkn", status="archived")
+        stats = SyncStats()
+
+        self._call(node, stats)
+
+        assert stats.skipped == 1
+        assert stats.created_gh == 0

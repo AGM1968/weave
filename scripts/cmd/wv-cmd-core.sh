@@ -176,6 +176,7 @@ cmd_add() {
     local alias=""
     local force=false
     local parent=""
+    local format="text"
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -186,6 +187,7 @@ cmd_add() {
             --parent=*) parent="${1#*=}" ;;
             --gh) create_gh=true ;;
             --force) force=true ;;
+            --json) format="json" ;;
             --*) ;; # skip unrecognized flags
             *) text="$text $1" ;;
         esac
@@ -224,6 +226,7 @@ cmd_add() {
     fi
 
     local id=$(generate_id)
+    local original_text="$text"
 
     # Escape single quotes in text and metadata
     text="${text//\'/\'\'}"
@@ -261,7 +264,12 @@ cmd_add() {
         _add_create_gh_issue "$id" "$text" "$metadata" "$alias"
     fi
 
-    echo "$id"
+    if [ "$format" = "json" ]; then
+        jq -n --arg id "$id" --arg text "$original_text" --arg status "$status" \
+            '{"id": $id, "text": $text, "status": $status}'
+    else
+        echo "$id"
+    fi
 
     auto_sync 2>/dev/null || true
 }
@@ -521,6 +529,7 @@ cmd_done() {
     local learning=""
     local no_warn=0
     local skip_verification=0
+    local format="text"
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -529,6 +538,7 @@ cmd_done() {
             --learning=*) learning="${1#*=}" ;;
             --no-warn) no_warn=1 ;;
             --skip-verification) skip_verification=1 ;;
+            --json) format="json" ;;
         esac
         shift
     done
@@ -602,9 +612,16 @@ cmd_done() {
         );
     "
 
-    echo -e "${GREEN}✓${NC} Closed: $id"
+    if [ "$format" = "json" ]; then
+        local text
+        text=$(db_query "SELECT text FROM nodes WHERE id='$id';")
+        jq -n --arg id "$id" --arg text "$text" --arg status "done" \
+            '{"id": $id, "text": $text, "status": $status}'
+    else
+        echo -e "${GREEN}✓${NC} Closed: $id"
+    fi
 
-    # Write-time validation warnings
+    # Write-time validation warnings (always to stderr — safe in json mode)
     if [ "$no_warn" != "1" ] && [ "${WV_NO_WARN:-0}" != "1" ]; then
         validate_on_done "$id"
     fi
@@ -854,19 +871,21 @@ cmd_work() {
     local id="${1:-}"
     local quiet=false
     local force=false
+    local format="text"
 
     shift || true
     while [ $# -gt 0 ]; do
         case "$1" in
             --quiet|-q) quiet=true ;;
             --force|-f) force=true ;;
+            --json)     format="json" ;;
         esac
         shift
     done
 
     if [ -z "$id" ]; then
         echo -e "${RED}Error: node ID required${NC}" >&2
-        echo "Usage: wv work <id> [--quiet] [--force]" >&2
+        echo "Usage: wv work <id> [--quiet] [--force] [--json]" >&2
         echo "" >&2
         echo "Claims a node and sets WV_ACTIVE for subagent context inheritance." >&2
         echo "Use --force to override a stale claim from another agent." >&2
@@ -908,21 +927,35 @@ cmd_work() {
         local holder
         holder=$(db_query "SELECT json_extract(metadata, '$.claimed_by') FROM nodes WHERE id='$id';")
         if [ "$force" = true ]; then
-            echo -e "${YELLOW}⚠ Overriding stale claim held by: $holder${NC}" >&2
+            [ "$format" != "json" ] && echo -e "${YELLOW}⚠ Overriding stale claim held by: $holder${NC}" >&2
             db_query "UPDATE nodes
                 SET metadata = json_set(COALESCE(metadata,'{}'), '$.claimed_by', '$agent_id'),
                     status = 'active',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = '$id';"
         else
-            echo -e "${RED}✗ $id is claimed by $holder${NC}" >&2
-            echo "  Use --force to override a stale claim." >&2
+            if [ "$format" = "json" ]; then
+                jq -n --arg id "$id" --arg holder "$holder" \
+                    '{"ok": false, "error": "claimed_by_other", "holder": $holder, "id": $id}' >&2
+            else
+                echo -e "${RED}✗ $id is claimed by $holder${NC}" >&2
+                echo "  Use --force to override a stale claim." >&2
+            fi
             return 1
         fi
     fi
 
     set_primary_node "$id"
-    
+
+    if [ "$format" = "json" ]; then
+        # Structured output for runtime consumption
+        local text
+        text=$(db_query "SELECT text FROM nodes WHERE id='$id';")
+        jq -n --arg id "$id" --arg text "$text" --arg status "active" \
+            '{"id": $id, "text": $text, "status": $status}'
+        return 0
+    fi
+
     if [ "$quiet" = true ]; then
         # Machine-readable output for eval
         echo "export WV_ACTIVE=$id"
@@ -1002,7 +1035,7 @@ cmd_ready() {
         fi
         subtree_cte="WITH RECURSIVE _subtree(id) AS (
             SELECT '$subtree_id'
-            UNION ALL
+            UNION
             SELECT e.source FROM edges e
             JOIN _subtree s ON e.target = s.id
             WHERE e.type = 'implements'

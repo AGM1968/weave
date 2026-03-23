@@ -962,26 +962,42 @@ cmd_tree() {
 
     db_ensure
 
-    # Build the full tree using a recursive CTE on implements edges.
-    # Roots are nodes that are NOT the source of any implements edge
-    # (i.e., nothing implements them FROM this node — they have no parent).
+    # Resolve root filter before building any queries — same pattern as the mermaid path.
+    # When --root is specified, CTE anchors at that node instead of the top-level heuristic.
+    # This fixes the post-filter-on-root_id bug for text and JSON modes (mirrors 043ebf7 fix).
+    local filter_root=""
+    if [ -n "$root_filter" ]; then
+        filter_root=$(db_query "SELECT id FROM nodes WHERE id='$(sql_escape "$root_filter")' OR alias='$(sql_escape "$root_filter")' LIMIT 1;" 2>/dev/null)
+    fi
+    local status_filter=""
+    if [ "$show_active_only" = "true" ]; then
+        status_filter="AND n.status != 'done'"
+    fi
+    local cte_anchor
+    if [ -n "$filter_root" ]; then
+        cte_anchor="WHERE n.id = '$(sql_escape "$filter_root")'"
+    else
+        cte_anchor="WHERE NOT EXISTS (
+                SELECT 1 FROM edges e
+                WHERE e.source = n.id AND e.type = 'implements'
+            )
+            $status_filter"
+    fi
+
+    # Build tree query using the resolved CTE anchor.
+    # cte_anchor handles --root (explicit node), --active (heuristic + done filter), and default.
     local query="
         WITH RECURSIVE tree AS (
-            -- Roots: nodes that don't implement any other node
             SELECT n.id, n.text, n.status,
                    json_extract(n.metadata, '\$.type') as node_type,
                    0 as depth,
                    n.id as root_id
             FROM nodes n
-            WHERE NOT EXISTS (
-                SELECT 1 FROM edges e
-                WHERE e.source = n.id AND e.type = 'implements'
-            )
-            AND n.status != 'done'
+            $cte_anchor
 
             UNION ALL
 
-            -- Children: nodes that implement a parent
+            -- Children: nodes that implement a parent already in the tree
             SELECT n.id, n.text, n.status,
                    json_extract(n.metadata, '\$.type') as node_type,
                    t.depth + 1,
@@ -996,37 +1012,6 @@ cmd_tree() {
         ORDER BY root_id, depth, id;
     "
 
-    # Also get done roots if not --active
-    if [ "$show_active_only" = "false" ]; then
-        query="
-            WITH RECURSIVE tree AS (
-                SELECT n.id, n.text, n.status,
-                       json_extract(n.metadata, '\$.type') as node_type,
-                       0 as depth,
-                       n.id as root_id
-                FROM nodes n
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM edges e
-                    WHERE e.source = n.id AND e.type = 'implements'
-                )
-
-                UNION ALL
-
-                SELECT n.id, n.text, n.status,
-                       json_extract(n.metadata, '\$.type') as node_type,
-                       t.depth + 1,
-                       t.root_id
-                FROM nodes n
-                JOIN edges e ON e.source = n.id AND e.type = 'implements'
-                JOIN tree t ON e.target = t.id
-                WHERE t.depth < $max_depth
-            )
-            SELECT id, text, status, node_type, depth, root_id
-            FROM tree
-            ORDER BY root_id, depth, id;
-        "
-    fi
-
     if [ "$json_output" = "true" ]; then
         local results
         results=$(db_query_json "
@@ -1036,11 +1021,7 @@ cmd_tree() {
                        0 as depth,
                        n.id as root_id
                 FROM nodes n
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM edges e
-                    WHERE e.source = n.id AND e.type = 'implements'
-                )
-                $([ "$show_active_only" = "true" ] && echo "AND n.status != 'done'")
+                $cte_anchor
 
                 UNION ALL
 
@@ -1062,7 +1043,9 @@ cmd_tree() {
     fi
 
     # Mermaid output: dependency graph with status colors
+    # filter_root and cte_anchor already resolved above — shared with text/JSON paths.
     if [ "$mermaid_output" = "true" ]; then
+
         local mermaid_query="
             WITH RECURSIVE tree AS (
                 SELECT n.id, n.text, n.status, n.alias,
@@ -1070,11 +1053,7 @@ cmd_tree() {
                        0 as depth,
                        n.id as root_id
                 FROM nodes n
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM edges e
-                    WHERE e.source = n.id AND e.type = 'implements'
-                )
-                $([ "$show_active_only" = "true" ] && echo "AND n.status != 'done'")
+                $cte_anchor
 
                 UNION ALL
 
@@ -1091,11 +1070,6 @@ cmd_tree() {
             FROM tree
             ORDER BY root_id, depth, id;
         "
-        # Resolve root filter if provided
-        local filter_root=""
-        if [ -n "$root_filter" ]; then
-            filter_root=$(db_query "SELECT id FROM nodes WHERE id='$(sql_escape "$root_filter")' OR alias='$(sql_escape "$root_filter")' LIMIT 1;" 2>/dev/null)
-        fi
 
         echo "graph TD"
         echo "    classDef done fill:#2da44e,stroke:#1a7f37,color:white"
