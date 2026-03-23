@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Generator
 from unittest.mock import patch
 
 from weave_gh.models import GitHubIssue, SyncStats, WeaveNode
@@ -365,69 +366,41 @@ class TestBodyMarkerMatching:
 class TestPhase2BodyMarkerDedup:
     """Phase 2 should skip creating nodes when body contains known Weave IDs."""
 
+    def _run(self, nodes: list[WeaveNode], issue: GitHubIssue) -> SyncStats:
+        stats = SyncStats()
+        sync_github_to_weave(nodes, [issue], "repo", stats, dry_run=True)
+        return stats
+
     def test_skips_bold_colon_marker(self) -> None:
         """Issue with bold-colon Weave ID marker should not create a node."""
         nodes = [_node("wv-aaaa", gh_issue=10)]
-        issue = _issue(
-            99,
-            title="Untracked issue",
-            state="OPEN",
-            body="**Weave ID:** `wv-aaaa`",
-        )
-        stats = SyncStats()
-
-        sync_github_to_weave(nodes, [issue], "repo", stats, dry_run=True)
-
-        assert stats.created_wv == 0
+        issue = _issue(99, title="Untracked issue", state="OPEN",
+                       body="**Weave ID:** `wv-aaaa`")
+        assert self._run(nodes, issue).created_wv == 0
 
     def test_skips_plain_colon_marker(self) -> None:
         """Issue with plain-colon Weave ID marker should not create a node."""
         nodes = [_node("wv-bbbb", gh_issue=20)]
-        issue = _issue(
-            99,
-            title="Untracked issue",
-            state="OPEN",
-            body="**Weave ID**: `wv-bbbb`",
-        )
-        stats = SyncStats()
-
-        sync_github_to_weave(nodes, [issue], "repo", stats, dry_run=True)
-
-        assert stats.created_wv == 0
+        issue = _issue(99, title="Untracked issue", state="OPEN",
+                       body="**Weave ID**: `wv-bbbb`")
+        assert self._run(nodes, issue).created_wv == 0
 
     def test_creates_when_no_marker(self) -> None:
         """Issue without any Weave ID marker should create a new node."""
         nodes = [_node("wv-cccc", gh_issue=30)]
-        issue = _issue(
-            99,
-            title="Brand new issue",
-            state="OPEN",
-            body="No weave references here",
-        )
-        stats = SyncStats()
-
-        sync_github_to_weave(nodes, [issue], "repo", stats, dry_run=True)
-
-        assert stats.created_wv == 1
+        issue = _issue(99, title="Brand new issue", state="OPEN",
+                       body="No weave references here")
+        assert self._run(nodes, issue).created_wv == 1
 
     def test_skips_tracked_by_gh_issue(self) -> None:
         """Issues already tracked by metadata.gh_issue should be skipped."""
         nodes = [_node("wv-dddd", gh_issue=99)]
         issue = _issue(99, title="Already tracked", state="OPEN")
-        stats = SyncStats()
-
-        sync_github_to_weave(nodes, [issue], "repo", stats, dry_run=True)
-
-        assert stats.created_wv == 0
+        assert self._run(nodes, issue).created_wv == 0
 
     def test_skips_closed_untracked(self) -> None:
         """Closed GH issues with no Weave node should be skipped."""
-        nodes: list[WeaveNode] = []
-        issue = _issue(99, title="Old closed", state="CLOSED")
-        stats = SyncStats()
-
-        sync_github_to_weave(nodes, [issue], "repo", stats, dry_run=True)
-
+        stats = self._run([], _issue(99, title="Old closed", state="CLOSED"))
         assert stats.created_wv == 0
         assert stats.skipped == 1
 
@@ -439,6 +412,17 @@ class TestPhase2BodyMarkerDedup:
 
 class TestRefreshParentBody:
     """refresh_parent_body updates the parent epic GH issue after child close."""
+
+    @contextmanager
+    def _with_repo(
+        self, nodes: list[WeaveNode], **phase_overrides: Any
+    ) -> Generator[None, None, None]:
+        """Context manager: patch get_weave_nodes + get_repo plus any phases overrides."""
+        patches: Any = phase_overrides
+        with patch.multiple("weave_gh.phases", **patches), patch(
+            "weave_gh.data.get_weave_nodes", return_value=nodes
+        ), patch("weave_gh.phases.get_repo", return_value="owner/repo"):
+            yield
 
     def test_updates_parent_body_when_hash_changed(self) -> None:
         """Should update parent GH issue when child status changes content hash."""
@@ -455,20 +439,14 @@ class TestRefreshParentBody:
                 return "<!-- WEAVE:BEGIN hash=aabb00112233 -->\nold\n<!-- WEAVE:END -->"
             return ""
 
-        with patch.multiple(
-            "weave_gh.phases",
+        with self._with_repo(
+            [parent, child],
             get_parent=lambda _child_id: "wv-epic",
             get_edges_for_node=lambda _nid: [edge],
             render_issue_body=lambda *_a, **_k: (
                 "<!-- WEAVE:BEGIN hash=ccdd44556677 -->\nnew\n<!-- WEAVE:END -->"
             ),
             gh_cli=mock_gh_cli,
-        ), patch(
-            "weave_gh.data.get_weave_nodes",
-            return_value=[parent, child],
-        ), patch(
-            "weave_gh.phases.get_repo",
-            return_value="owner/repo",
         ):
             result = refresh_parent_body("wv-task")
 
@@ -500,18 +478,12 @@ class TestRefreshParentBody:
 
         body = "<!-- WEAVE:BEGIN hash=aabb11223344 -->\nsame\n<!-- WEAVE:END -->"
 
-        with patch.multiple(
-            "weave_gh.phases",
+        with self._with_repo(
+            [parent],
             get_parent=lambda _: "wv-epic",
             get_edges_for_node=lambda _: [],
             render_issue_body=lambda *_a, **_k: body,
             gh_cli=lambda *_a, **_kw: body,
-        ), patch(
-            "weave_gh.data.get_weave_nodes",
-            return_value=[parent],
-        ), patch(
-            "weave_gh.phases.get_repo",
-            return_value="owner/repo",
         ):
             assert refresh_parent_body("wv-task") is False
 
@@ -528,20 +500,14 @@ class TestRefreshParentBody:
                 return "<!-- WEAVE:BEGIN hash=aa0011223344 -->\nold\n<!-- WEAVE:END -->"
             return ""
 
-        with patch.multiple(
-            "weave_gh.phases",
+        with self._with_repo(
+            [parent, child],
             get_parent=lambda _: "wv-epic",
             get_edges_for_node=lambda _: [],
             render_issue_body=lambda *_a, **_k: (
                 "<!-- WEAVE:BEGIN hash=bb0099887766 -->\nnew\n<!-- WEAVE:END -->"
             ),
             gh_cli=mock_gh_cli,
-        ), patch(
-            "weave_gh.data.get_weave_nodes",
-            return_value=[parent, child],
-        ), patch(
-            "weave_gh.phases.get_repo",
-            return_value="owner/repo",
         ):
             result = refresh_parent_body("wv-task", dry_run=True)
 
