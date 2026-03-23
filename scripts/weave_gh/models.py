@@ -53,6 +53,12 @@ class WeaveNode:
         return self.metadata.get("no_sync", False) is True
 
     @property
+    def claimed_by(self) -> str | None:
+        """Agent/user that claimed this node (WV_AGENT_ID or GH login)."""
+        v = self.metadata.get("claimed_by")
+        return str(v) if v is not None else None
+
+    @property
     def is_test(self) -> bool:
         """Whether this is a test artifact node."""
         return self.node_type == "test"
@@ -76,6 +82,7 @@ class GitHubIssue:
     state: str  # "OPEN" or "CLOSED"
     body: str = ""
     labels: list[str] = field(default_factory=list)
+    assignees: list[str] = field(default_factory=list)  # GH login names
 
 
 @dataclass

@@ -156,7 +156,19 @@ def render_mermaid_from_tree(root_id: str) -> str:
     if start_idx is None:
         return ""
 
-    return "\n".join(lines[start_idx:]).strip()
+    mermaid = "\n".join(lines[start_idx:]).strip()
+    # Reject graphs that only contain header/classDef lines with no actual node definitions.
+    # This happens when wv tree --mermaid --root=<id> finds no descendants (e.g. the root is
+    # itself a non-top-level node with the old CTE anchor bug).
+    has_nodes = any(
+        ln.strip()
+        and not ln.strip().startswith("classDef")
+        and not ln.strip().startswith("graph ")
+        for ln in mermaid.splitlines()
+    )
+    if not has_nodes:
+        return ""
+    return mermaid
 
 
 def render_mermaid_graph(

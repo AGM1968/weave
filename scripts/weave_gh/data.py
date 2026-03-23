@@ -72,7 +72,7 @@ def get_github_issues(repo: str) -> list[GitHubIssue]:
         "--limit",
         str(_GH_ISSUE_LIMIT),
         "--json",
-        "number,title,state,body,labels",
+        "number,title,state,body,labels,assignees",
         check=False,
     )
     if not raw or raw == "[]":
@@ -96,6 +96,7 @@ def get_github_issues(repo: str) -> list[GitHubIssue]:
             state=i["state"],
             body=i.get("body") or "",
             labels=[lb["name"] for lb in i.get("labels", [])],
+            assignees=[a["login"] for a in i.get("assignees", [])],
         )
         for i in data
     ]
