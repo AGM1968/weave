@@ -65,8 +65,9 @@ def parse_gh_body_description(body: str) -> str:
 
 
 # Regex for GitHub issue template form sections: ### Header\n\nvalue
+# [^\n]+ matches exactly one header line — avoids backtracking from (.+?)\s* with DOTALL.
 _FORM_SECTION_RE = re.compile(
-    r"^### (.+?)\s*\n\n(.*?)(?=\n### |\Z)", re.DOTALL | re.MULTILINE
+    r"^### ([^\n]+)\n\n(.*?)(?=\n### |\Z)", re.DOTALL | re.MULTILINE
 )
 
 
