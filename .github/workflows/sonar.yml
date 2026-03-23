@@ -22,8 +22,9 @@ jobs:
       - name: Run tests with coverage
         run: |
           pip install pytest pytest-cov --quiet
-          pytest tests/ --ignore=tests/weave_quality \
+          pytest tests/ \
             --cov=scripts/weave_gh \
+            --cov=scripts/weave_quality \
             --cov-report=xml:coverage.xml \
             -q
         env:
