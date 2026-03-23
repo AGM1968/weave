@@ -10,6 +10,10 @@ from pathlib import Path
 import pytest
 
 from weave_quality.bash_heuristic import (
+    _count_nesting,
+    _find_function_end,
+    _function_name,
+    _heredoc_end_pattern,
     analyze_bash_file,
     analyze_bash_source,
     detect_bash,
@@ -380,3 +384,158 @@ class TestIndentSD:
         entry, _ = analyze_bash_source(source, "test.sh")
         assert entry.indent_sd >= 0.0
         assert entry.indent_sd > 0.0  # has nesting
+
+
+# ---------------------------------------------------------------------------
+# _count_nesting — tab indentation branch (line 93)
+# ---------------------------------------------------------------------------
+
+
+class TestCountNesting:
+    def test_tab_indented_lines(self) -> None:
+        lines = [
+            "func() {",
+            "\tif true; then",
+            "\t\techo ok",
+            "\tfi",
+            "}",
+        ]
+        depth = _count_nesting(lines)
+        assert depth >= 2
+
+    def test_space_indented_lines(self) -> None:
+        lines = ["echo a", "  echo b", "    echo c"]
+        assert _count_nesting(lines) >= 1
+
+    def test_empty_and_comment_lines_ignored(self) -> None:
+        lines = ["", "# comment", "echo hi"]
+        assert _count_nesting(lines) == 0
+
+
+# ---------------------------------------------------------------------------
+# _heredoc_end_pattern — cache miss path (lines 110-112)
+# ---------------------------------------------------------------------------
+
+
+class TestHeredocEndPattern:
+    def test_compiles_and_caches(self) -> None:
+        p1 = _heredoc_end_pattern("EOF")
+        p2 = _heredoc_end_pattern("EOF")
+        assert p1 is p2  # same object from cache
+
+    def test_different_delimiters(self) -> None:
+        p_eof = _heredoc_end_pattern("MYDELIM")
+        p_end = _heredoc_end_pattern("END")
+        assert p_eof is not p_end
+
+    def test_matches_delimiter_line(self) -> None:
+        p = _heredoc_end_pattern("EOF")
+        assert p.match("EOF")
+        assert p.match("\tEOF")  # <<- style with leading tab
+        assert not p.match("not-eof")
+
+
+# ---------------------------------------------------------------------------
+# _find_function_end — structural edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestFindFunctionEnd:
+    def test_one_liner_function(self) -> None:
+        """func() { echo "hi"; } — both braces on same line."""
+        lines = ['oneliner() { echo "hi"; }', "x=1"]
+        end = _find_function_end(lines, 0)
+        assert end == 0
+
+    def test_brace_on_next_line(self) -> None:
+        """POSIX style: signature then { on its own line."""
+        lines = [
+            "func()",
+            "{",
+            "    echo hello",
+            "}",
+        ]
+        end = _find_function_end(lines, 0)
+        assert end == 3
+
+    def test_nested_function_inside(self) -> None:
+        """Nested function definition — depth tracks correctly."""
+        lines = [
+            "outer() {",
+            "    inner() {",
+            "        echo inner",
+            "    }",
+            "    echo outer",
+            "}",
+        ]
+        end = _find_function_end(lines, 0)
+        assert end == 5
+
+    def test_heredoc_inside_function(self) -> None:
+        """} inside heredoc content is not structural."""
+        lines = [
+            "deploy() {",
+            "    cat <<EOF",
+            '    { "key": "value" }',
+            "EOF",
+            "    echo done",
+            "}",
+        ]
+        end = _find_function_end(lines, 0)
+        assert end == 5
+
+    def test_no_closing_brace(self) -> None:
+        """Unclosed function returns last line index."""
+        lines = [
+            "broken() {",
+            "    echo no close",
+        ]
+        end = _find_function_end(lines, 0)
+        assert end == len(lines) - 1
+
+
+# ---------------------------------------------------------------------------
+# _function_name — unknown fallback (line 218)
+# ---------------------------------------------------------------------------
+
+
+class TestFunctionName:
+    def test_known_posix_style(self) -> None:
+        assert _function_name("my_func() {") == "my_func"
+
+    def test_known_function_keyword(self) -> None:
+        assert _function_name("function do_stuff {") == "do_stuff"
+
+    def test_unknown_returns_fallback(self) -> None:
+        assert _function_name("not a function def") == "<unknown>"
+
+
+# ---------------------------------------------------------------------------
+# Integration: heredoc + one-liner via analyze_bash_source
+# ---------------------------------------------------------------------------
+
+
+class TestStructuralIntegration:
+    def test_function_with_heredoc(self) -> None:
+        source = _src("""
+            deploy() {
+                cat <<EOF
+            { "key": "value" }
+            EOF
+                echo "done"
+            }
+        """)
+        entry, fn_cc = analyze_bash_source(source, "test.sh")
+        assert entry.functions == 1
+        assert fn_cc[0].function_name == "deploy"
+
+    def test_one_liner_function_detected(self) -> None:
+        source = 'greet() { echo "hello"; }\n'
+        entry, fn_cc = analyze_bash_source(source, "test.sh")
+        assert entry.functions == 1
+        assert fn_cc[0].function_name == "greet"
+
+    def test_tab_indented_source_nesting(self) -> None:
+        source = "func() {\n\tif true; then\n\t\techo ok\n\tfi\n}\n"
+        entry, _ = analyze_bash_source(source, "test.sh")
+        assert entry.max_nesting >= 2
