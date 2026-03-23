@@ -15,6 +15,20 @@ jobs:
         with:
           fetch-depth: 0 # shallow clones break blame + new-code detection
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run tests with coverage
+        run: |
+          pip install pytest pytest-cov --quiet
+          pytest tests/ --ignore=tests/weave_quality \
+            --cov=scripts/weave_gh \
+            --cov-report=xml:coverage.xml \
+            -q
+        env:
+          PYTHONPATH: scripts
+
       - uses: SonarSource/sonarqube-scan-action@v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
