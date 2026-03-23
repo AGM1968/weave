@@ -11,20 +11,26 @@ from __future__ import annotations
 import subprocess
 from collections import Counter
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from weave_quality.git_metrics import (
+    _batch_git_stats,
+    _co_change_cache,
+    _compute_ownership_from_counts,
+    _git,
+    batch_blob_shas,
     build_file_state,
     build_git_stats,
     compute_co_changes,
+    enrich_all_git_stats,
     file_age_days,
     file_authors,
     file_churn,
     file_co_changes,
     git_blob_sha,
     git_head_sha,
-    _compute_ownership_from_counts,
 )
 from weave_quality.models import FileState, GitStats
 
@@ -217,3 +223,191 @@ class TestComputeOwnership:
         gs3 = GitStats.from_dict(d)
         assert gs3.ownership_fraction == 0.75
         assert gs3.minor_contributors == 1
+
+
+# ---------------------------------------------------------------------------
+# _git — error branches
+# ---------------------------------------------------------------------------
+
+
+class TestGitHelper:
+    def test_timeout_returns_empty(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics.subprocess.run",
+                   side_effect=subprocess.TimeoutExpired("git", 30)):
+            assert _git(["log"], cwd=tmp_path) == ""
+
+    def test_oserror_returns_empty(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics.subprocess.run",
+                   side_effect=OSError("no git")):
+            assert _git(["log"], cwd=tmp_path) == ""
+
+    def test_nonzero_returncode_returns_empty(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="error", stderr=""
+            )
+            assert _git(["log"], cwd=tmp_path) == ""
+
+
+# ---------------------------------------------------------------------------
+# batch_blob_shas — parsing loop
+# ---------------------------------------------------------------------------
+
+
+class TestBatchBlobShas:
+    def test_empty_output_returns_empty_dict(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics._git", return_value=""):
+            assert not batch_blob_shas(tmp_path)
+
+    def test_parses_ls_tree_output(self, tmp_path: Path) -> None:
+        ls_tree = (
+            "100644 blob abc123def456abc123def456abc123def456abc123\tscripts/foo.py\n"
+            "100644 blob 111222333444555666777888999aaabbbcccdddee\tscripts/bar.py\n"
+            "040000 tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\tscripts"
+        )
+        with patch("weave_quality.git_metrics._git", return_value=ls_tree):
+            result = batch_blob_shas(tmp_path)
+        assert "scripts/foo.py" in result
+        assert result["scripts/foo.py"] == "abc123def456abc123def456abc123def456abc123"
+        assert "scripts/bar.py" in result
+
+    def test_skips_lines_without_tab(self, tmp_path: Path) -> None:
+        ls_tree = "100644 blob abc123\nno-tab-here\n100644 blob def456\tother.py"
+        with patch("weave_quality.git_metrics._git", return_value=ls_tree):
+            result = batch_blob_shas(tmp_path)
+        assert "other.py" in result
+        assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# file_churn / file_age_days — error branches
+# ---------------------------------------------------------------------------
+
+
+class TestPerFileErrorBranches:
+    def test_file_churn_non_integer_returns_zero(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics._git", return_value="not-a-number"):
+            assert file_churn(tmp_path, "foo.py") == 0
+
+    def test_file_age_days_invalid_date_returns_zero(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics._git", return_value="not-a-date"):
+            assert file_age_days(tmp_path, "foo.py") == 0
+
+    def test_file_age_days_empty_returns_zero(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics._git", return_value=""):
+            assert file_age_days(tmp_path, "foo.py") == 0
+
+
+# ---------------------------------------------------------------------------
+# compute_co_changes — early return
+# ---------------------------------------------------------------------------
+
+
+class TestComputeCoChanges:
+    def test_empty_git_output_returns_empty(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics._git", return_value=""):
+            assert compute_co_changes(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# file_co_changes — fallback branch (no cache)
+# ---------------------------------------------------------------------------
+
+
+class TestFileCoChangesFallback:
+    def test_fallback_returns_empty_when_no_git_output(self, tmp_path: Path) -> None:
+        _co_change_cache.clear()
+        with patch("weave_quality.git_metrics._git", return_value=""):
+            result = file_co_changes(tmp_path, "foo.py")
+        assert result == []
+
+    def test_fallback_parses_git_output(self, tmp_path: Path) -> None:
+        _co_change_cache.clear()
+        log_out = (
+            "COMMIT_SEP\n"
+            "foo.py\n"
+            "bar.py\n"
+            "COMMIT_SEP\n"
+            "foo.py\n"
+            "baz.py\n"
+        )
+        with patch("weave_quality.git_metrics._git", return_value=log_out):
+            result = file_co_changes(tmp_path, "foo.py", top_n=5)
+        assert "bar.py" in result
+        assert "baz.py" in result
+        assert "foo.py" not in result
+
+
+# ---------------------------------------------------------------------------
+# _batch_git_stats — empty output + parse loop
+# ---------------------------------------------------------------------------
+
+
+_BATCH_LOG = (
+    "COMMIT_SEP\tAlice\t2024-06-01T10:00:00+00:00\n"
+    "\n"
+    "scripts/foo.py\n"
+    "scripts/bar.py\n"
+    "COMMIT_SEP\tBob\t2024-07-01T10:00:00+00:00\n"
+    "\n"
+    "scripts/foo.py\n"
+)
+
+
+class TestBatchGitStats:
+    def test_empty_git_output_returns_zero_stats(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics._git", return_value=""):
+            result = _batch_git_stats(tmp_path, ["foo.py", "bar.py"])
+        assert result["foo.py"].churn == 0
+        assert result["bar.py"].churn == 0
+
+    def test_parses_churn_and_authors(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics._git", return_value=_BATCH_LOG):
+            result = _batch_git_stats(tmp_path, ["scripts/foo.py", "scripts/bar.py"])
+        assert result["scripts/foo.py"].churn == 2
+        assert result["scripts/foo.py"].authors == 2
+        assert result["scripts/bar.py"].churn == 1
+        assert result["scripts/bar.py"].authors == 1
+
+    def test_computes_age_days(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics._git", return_value=_BATCH_LOG):
+            result = _batch_git_stats(tmp_path, ["scripts/foo.py"])
+        assert result["scripts/foo.py"].age_days > 0
+
+    def test_skips_files_not_in_target_set(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics._git", return_value=_BATCH_LOG):
+            result = _batch_git_stats(tmp_path, ["scripts/foo.py"])
+        assert "scripts/bar.py" not in result
+
+    def test_invalid_date_line_does_not_crash(self, tmp_path: Path) -> None:
+        log = "COMMIT_SEP\tAlice\tnot-a-date\n\nscripts/foo.py\n"
+        with patch("weave_quality.git_metrics._git", return_value=log):
+            result = _batch_git_stats(tmp_path, ["scripts/foo.py"])
+        assert result["scripts/foo.py"].churn == 1
+        assert result["scripts/foo.py"].age_days == 0
+
+
+# ---------------------------------------------------------------------------
+# enrich_all_git_stats — empty list + exception fallback
+# ---------------------------------------------------------------------------
+
+
+class TestEnrichAllGitStats:
+    def test_empty_file_paths_returns_empty(self, tmp_path: Path) -> None:
+        assert enrich_all_git_stats(tmp_path, []) == []
+
+    def test_exception_falls_back_to_per_file(self, tmp_path: Path) -> None:
+        with patch("weave_quality.git_metrics._batch_git_stats",
+                   side_effect=OSError("batch failed")), \
+             patch("weave_quality.git_metrics.build_git_stats") as mock_bgs:
+            mock_bgs.return_value = GitStats(path="foo.py")
+            result = enrich_all_git_stats(tmp_path, ["foo.py"])
+        assert len(result) == 1
+        mock_bgs.assert_called_once_with(tmp_path, "foo.py")
+
+    @need_git
+    def test_returns_stats_for_real_file(self) -> None:
+        result = enrich_all_git_stats(REPO, ["install.sh"])
+        assert len(result) == 1
+        assert result[0].path == "install.sh"
+        assert result[0].churn > 0
