@@ -102,17 +102,17 @@ class TestReopenGuard:
 
     def _with_patches(self, **overrides: Any) -> Any:
         """Return a patch.multiple context with sensible defaults, overridable per-test."""
-        base: dict[str, Any] = dict(
-            get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *_a, **_k: "",
-            should_update_body=lambda *_a: False,
-            get_labels_for_node=lambda _: [],
-            sync_issue_labels=lambda *_a, **_k: None,
-            gh_cli=lambda *_a, **_k: "",
-            build_close_comment=lambda *_a, **_k: "close",
-            _backfill_gh_issue=lambda *_a, **_k: None,
-            _was_closed_by_weave=lambda *_a: False,
-        )
+        base: dict[str, Any] = {
+            "get_edges_for_node": lambda _: [],
+            "render_issue_body": lambda *_a, **_k: "",
+            "should_update_body": lambda *_a: False,
+            "get_labels_for_node": lambda _: [],
+            "sync_issue_labels": lambda *_a, **_k: None,
+            "gh_cli": lambda *_a, **_k: "",
+            "build_close_comment": lambda *_a, **_k: "close",
+            "_backfill_gh_issue": lambda *_a, **_k: None,
+            "_was_closed_by_weave": lambda *_a: False,
+        }
         base.update(overrides)
         return patch.multiple("weave_gh.phases", **base)
 
