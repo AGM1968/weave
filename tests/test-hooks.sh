@@ -110,6 +110,8 @@ setup_test_env() {
     git init -q
     # Disable GPG signing for test repo (global gpgsign=true would fail in CI/SSH)
     git config commit.gpgsign false
+    git config user.name "Hook Test"
+    git config user.email "hook-test@example.com"
     git commit --allow-empty -m "init" -q
 
     # Init wv database
@@ -334,10 +336,19 @@ echo "--- pre-claim-skills.sh ---"
 setup_test_env
 ID=$("$WV" add "Claim test" 2>/dev/null | tail -1)
 
-OUTPUT=$(echo "{\"command\":\"wv update $ID --status=active\"}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null || true)
-# May or may not output suggestion depending on metadata state
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
 EXIT_CODE=$?
-assert_exit_code "0" "0" "pre-claim: exits 0 (advisory, never blocks)"
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-claim: exits 0 (advisory, never blocks) for real Bash payload"
+assert_contains "$OUTPUT" "/ship-it" "pre-claim: suggests ship-it on wv work payload"
+
+# Back-compat: older test payload shape still accepted
+set +e
+OUTPUT=$(echo "{\"command\":\"wv update $ID --status=active\"}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-claim: exits 0 for legacy root command payload"
 
 # Non-matching command
 OUTPUT=$(echo '{"command":"wv list --json"}' | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null || true)
@@ -350,32 +361,39 @@ setup_test_env
 ID=$("$WV" add "Close test" --status=active 2>/dev/null | tail -1)
 
 set +e
-OUTPUT=$(echo "{\"command\":\"wv done $ID\"}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
-assert_contains "$OUTPUT" "Verification evidence required" "pre-close: warns when no verification metadata"
+assert_contains "$OUTPUT" "Verification evidence required" "pre-close: warns when no verification metadata for real Bash payload"
 assert_contains "$OUTPUT" "\"permissionDecision\": \"DENY\"" "pre-close: uses permissionDecision DENY schema"
 assert_exit_code "2" "$EXIT_CODE" "pre-close: exits 2 (hard block) when no verification"
 
 # With --skip-verification flag (should pass)
 set +e
-OUTPUT=$(echo "{\"command\":\"wv done $ID --skip-verification\"}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
-assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 with --skip-verification bypass"
+assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 with --skip-verification bypass on real Bash payload"
 
 # With verification metadata
 "$WV" update "$ID" --metadata='{"verification":{"method":"test","result":"pass"}}' 2>/dev/null
-OUTPUT=$(echo "{\"command\":\"wv done $ID\"}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 # Should NOT warn when verification exists
 TESTS_RUN=$((TESTS_RUN + 1))
 if ! echo "$OUTPUT" | grep -q "Verification evidence required"; then
-    echo -e "${GREEN}✓${NC} pre-close: silent when verification metadata present"
+    echo -e "${GREEN}✓${NC} pre-close: silent when verification metadata present for real Bash payload"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
-    echo -e "${RED}✗${NC} pre-close: should be silent when verification metadata present"
+    echo -e "${RED}✗${NC} pre-close: should be silent when verification metadata present for real Bash payload"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
+
+# Back-compat: older test payload shape still accepted
+set +e
+OUTPUT=$(echo "{\"command\":\"wv done $ID\"}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 for legacy root command payload when verification exists"
 
 # Non-matching command
 OUTPUT=$(echo '{"command":"wv list"}' | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
@@ -477,6 +495,42 @@ else
     fi
 fi
 
+# Verify session-end uses `wv sync --gh` and commit automation via
+# WV_AUTO_CHECKPOINT_ACTIVE rather than a blanket --no-verify bypass.
+setup_test_env
+SPY_HOME="$TEST_DIR/home"
+mkdir -p "$SPY_HOME/.local/bin"
+WV_LOG="$TEST_DIR/wv-calls.log"
+cat > "$SPY_HOME/.local/bin/wv" <<EOF
+#!/bin/sh
+echo "\$*" >> "$WV_LOG"
+exit 0
+EOF
+chmod +x "$SPY_HOME/.local/bin/wv"
+
+# Force the commit path and require the automation env var in pre-commit.
+# Remove the source-repo symlink so the hook falls back to HOME/.local/bin/wv.
+rm -f "$TEST_DIR/project/scripts/wv"
+echo "checkpoint" >> "$TEST_DIR/project/.weave/breadcrumbs.md"
+cat > "$TEST_DIR/project/.git/hooks/pre-commit" <<'EOF'
+#!/bin/sh
+[ "${WV_AUTO_CHECKPOINT_ACTIVE:-0}" = "1" ] && exit 0
+echo "missing WV_AUTO_CHECKPOINT_ACTIVE" >&2
+exit 1
+EOF
+chmod +x "$TEST_DIR/project/.git/hooks/pre-commit"
+
+set +e
+OUTPUT=$(HOME="$SPY_HOME" CLAUDE_PROJECT_DIR="$TEST_DIR/project" \
+    bash "$HOOKS_DIR/session-end-sync.sh" <<< '{"reason":"stubbed_session_end"}' 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "session-end: exits 0 with sync --gh stub + automation pre-commit"
+WV_CALLS=$(cat "$WV_LOG")
+assert_contains "$WV_CALLS" "sync --gh" "session-end: calls wv sync --gh"
+LAST_MSG=$(git -C "$TEST_DIR/project" log -1 --pretty=%s 2>/dev/null || true)
+assert_contains "$LAST_MSG" "auto-checkpoint" "session-end: auto-checkpoint commit succeeds without blanket bypass"
+
 # ============================================================
 # INTEGRATION TEST: Full session lifecycle
 # ============================================================
@@ -490,7 +544,7 @@ assert_contains "$OUTPUT" "SessionStart" "lifecycle: session starts successfully
 
 # 2. Create and claim a node (triggers pre-claim-skills)
 TASK_ID=$("$WV" add "Lifecycle test task" 2>/dev/null | tail -1)
-OUTPUT=$(echo "{\"command\":\"wv update $TASK_ID --status=active\"}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null || true)
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $TASK_ID\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null || true)
 "$WV" update "$TASK_ID" --status=active 2>/dev/null
 TASK_STATUS=$("$WV" show "$TASK_ID" --json 2>/dev/null | jq -r '.[0].status')
 assert_equals "active" "$TASK_STATUS" "lifecycle: node claimed successfully"
@@ -512,7 +566,7 @@ assert_exit_code "0" "$EXIT_CODE" "lifecycle: post-edit-lint passes"
 
 # 5. Try to close without verification (should hard-block with exit 2)
 set +e
-OUTPUT=$(echo "{\"command\":\"wv done $TASK_ID\"}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $TASK_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
 assert_contains "$OUTPUT" "Verification evidence required" "lifecycle: close blocked without verification"
@@ -520,7 +574,7 @@ assert_exit_code "2" "$EXIT_CODE" "lifecycle: close exits 2 (hard block) without
 
 # 6. Add verification and close (should be silent)
 "$WV" update "$TASK_ID" --metadata='{"verification":{"method":"test","command":"echo ok","result":"pass","evidence":"lifecycle test"}}' 2>/dev/null
-OUTPUT=$(echo "{\"command\":\"wv done $TASK_ID\"}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $TASK_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 TESTS_RUN=$((TESTS_RUN + 1))
 if ! echo "$OUTPUT" | grep -q "Verification evidence required"; then
     echo -e "${GREEN}✓${NC} lifecycle: close allowed with verification"
@@ -547,8 +601,17 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "lifecycle: stop-check passes with clean state"
 
 # 10. Session end
+LIFECYCLE_HOME="$TEST_DIR/lifecycle-home"
+mkdir -p "$LIFECYCLE_HOME/.local/bin"
+cat > "$LIFECYCLE_HOME/.local/bin/wv" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$LIFECYCLE_HOME/.local/bin/wv"
+rm -f "$TEST_DIR/project/scripts/wv"
 set +e
-OUTPUT=$(echo '{"reason":"lifecycle_test"}' | bash "$HOOKS_DIR/session-end-sync.sh" 2>/dev/null)
+OUTPUT=$(HOME="$LIFECYCLE_HOME" CLAUDE_PROJECT_DIR="$TEST_DIR/project" \
+    bash "$HOOKS_DIR/session-end-sync.sh" <<< '{"reason":"lifecycle_test"}' 2>/dev/null)
 EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "lifecycle: session ends cleanly"

@@ -101,12 +101,12 @@ node remains blocked until child completes.
 
 | Mode | Command | Steps |
 |------|---------|-------|
-| Node ID | `/weave wv-xxxxxx` | Validate → claim (`wv update <id> --status=active`) → CONTEXT |
+| Node ID | `/weave wv-xxxxxx` | Validate → claim (`wv work <id>`) → CONTEXT |
 | Text | `/weave "Fix bug"` | Create (`wv add "<text>" --status=active`) → CONTEXT |
 | None | `/weave` | Show `wv ready --json` → user picks → Mode 1 or 2 |
 
 **Claimable:** `todo` or `blocked`. `active` = warn but allow. `done` = block.
-**Vague text** (<5 words, no action verb): invoke `/wv-clarify-spec` first.
+**Vague text** (<5 words, no action verb): clarify it inside `/weave` before proceeding.
 
 ### Agent Pre-Launch Validation
 
@@ -142,6 +142,16 @@ Before spawning any weave agent (`epic-planner`, `learning-curator`, `weave-guid
 **Scope control:** If editing unrelated files → create child node (iteration trigger).
 **Stuck detection:** Same approach fails 2× → pivot strategy or create blocker node.
 
+### Repair Loop for Detected Issues
+
+When execution reveals a real workflow problem (broken hook behavior, stale prompt/doc guidance,
+close-time friction, missing guardrail):
+
+1. Fix it in the current node only if it directly blocks safe completion.
+2. Otherwise create a tracked repair node with `wv add "Task: ..." --gh --parent=<feature-or-epic>`.
+3. If the current node depends on that fix, block current work on the new node.
+4. Save breadcrumbs describing what was detected and the next action.
+
 ## Phase 4: CLOSE — Complete with Learnings
 
 ### ⛔ Mandatory Pre-Close Gate
@@ -167,10 +177,14 @@ Before spawning any weave agent (`epic-planner`, `learning-curator`, `weave-guid
 ### Close and Sync
 
 ```bash
-wv done <id> --learning="pattern: ..."
+wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..."
 wv sync --gh && git push
 ```
 
 ### Recovery (v1.9.0)
 
 If `wv ship` or `wv sync` is interrupted, `wv recover` resumes from the journal.
+
+For non-interactive agent flows, do not leave the system hanging on close-time prompts. Prefer
+capturing pending-close state, surfacing `needs_human_verification`, and resuming with explicit human
+approval.

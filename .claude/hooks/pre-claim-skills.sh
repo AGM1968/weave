@@ -14,11 +14,14 @@ case "$INPUT" in
     *) exit 0 ;;
 esac
 
-# Extract the command from Bash tool use
-COMMAND=$(echo "$INPUT" | jq -r '.command // empty' 2>/dev/null)
+# Extract the command from Bash tool use.
+# Real PreToolUse payloads nest terminal commands under tool_input.{cmd,command},
+# while older tests used a top-level .command field.
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.cmd // .tool_input.command // .command // empty' 2>/dev/null)
 
-# Check if this is a wv update command setting status to active
-if [[ "$COMMAND" =~ wv[[:space:]]update[[:space:]]wv-[0-9a-f]{4,6}.*--status=active ]]; then
+# Check if this is a claim command in either the old or current workflow.
+if [[ "$COMMAND" =~ wv[[:space:]]update[[:space:]]wv-[0-9a-f]{4,6}.*--status=active ]] || \
+   [[ "$COMMAND" =~ wv[[:space:]]work[[:space:]]wv-[0-9a-f]{4,6} ]]; then
     # Extract the node ID
     NODE_ID=$(echo "$COMMAND" | grep -oP 'wv-[0-9a-f]{4,6}')
 

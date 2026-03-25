@@ -54,6 +54,7 @@ declare -a SUITES=(
     "test-stress.sh:Stress Tests"
     "test-hooks.sh:Hook Tests"
     "test-init-repo.sh:Init-Repo Tests"
+    "test-workflow-surfaces.sh:Workflow Surface Tests"
     "test-crash-sentinel.sh:Crash Sentinel Tests"
     "test-multi-agent.sh:Multi-Agent Tests"
 )

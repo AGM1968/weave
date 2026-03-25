@@ -355,9 +355,9 @@ After breakdown is complete:
 
 1. Review with stakeholders if needed
 2. Identify first task to claim: `wv ready`
-3. Claim and start work: `wv update wv-XXXXXX --status=active`
+3. Claim and start work: `wv work wv-XXXXXX`
 4. Follow weave workflow for each task
-5. Use `/fix-issue <id>` for structured implementation
+5. Use `/weave <id>` for structured implementation
 
 ## Related Skills
 

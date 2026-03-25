@@ -108,7 +108,7 @@ For each node:
 2. **Add learning** when closing done nodes:
 
    ```bash
-   wv done <id> --learning="pattern: pyproj.Geod replaces manual trig for geodesic accuracy"
+   wv done <id> --learning="decision: use pyproj.Geod for geodesic calculations | pattern: prefer vetted geospatial libraries over manual trig for accuracy | pitfall: manual trig shortcuts drift on longer routes"
    ```
 
 3. **Link to parent epic:**

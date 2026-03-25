@@ -37,9 +37,9 @@ git status  # MUST show "up to date with origin"
 For significant work:
 
 ```bash
-wv done <id> --learning="Brief learning note"
-# Or with structured learnings (captured in metadata):
-wv update <id> --metadata='{"learning":{"decision":"...","pattern":"...","pitfall":"..."}}'
+wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..."
+# Or pre-structure the same fields in metadata first:
+wv update <id> --metadata='{"decision":"...","pattern":"...","pitfall":"..."}'
 wv done <id>
 ```
 

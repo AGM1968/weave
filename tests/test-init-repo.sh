@@ -198,7 +198,12 @@ assert_file_exists "$REPO3/.github/hooks/README.md"         "copilot: scaffolds 
 # Verify mcp.json points to MCP server
 MCP_JSON=$(cat "$REPO3/.vscode/mcp.json")
 assert_contains "$MCP_JSON" '"weave"'                       "copilot: mcp.json has weave server"
+assert_contains "$MCP_JSON" '"weave-inspect"'               "copilot: mcp.json has weave-inspect server"
+assert_not_contains "$MCP_JSON" '"weave-graph"'             "copilot: mcp.json does not ship weave-graph"
+assert_not_contains "$MCP_JSON" '"weave-session"'           "copilot: mcp.json does not ship weave-session"
 assert_contains "$MCP_JSON" 'index.js'                      "copilot: mcp.json points to index.js"
+SERVER_COUNT=$(jq '.servers | keys | length' "$REPO3/.vscode/mcp.json")
+assert_equals "2" "$SERVER_COUNT"                           "copilot: mcp.json ships exactly two servers"
 
 # Verify ghost setting is NOT written
 if [ -f "$REPO3/.vscode/settings.json" ]; then

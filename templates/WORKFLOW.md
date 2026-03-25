@@ -125,6 +125,25 @@ wv done <id> --learning="decision: what was chosen | pattern: reusable technique
 
 Good learnings are specific, actionable, and scoped to a concrete context.
 
+## Repair Workflow
+
+When you detect a real workflow issue during execution (drift, missing guardrail, broken prompt/doc,
+close-time friction), turn it into tracked remediation immediately:
+
+1. **Decide whether it belongs in the current node**
+   - Fix it in the current node only if it is required to complete the current task safely.
+   - Otherwise create follow-up work instead of expanding scope silently.
+2. **Create remediation work in the graph**
+   - Use `wv add "Task: ..." --gh --parent=<feature-or-epic>` for discovered repair work.
+   - If the current task cannot finish without the repair, block it: `wv block <current> --by=<new>`.
+   - If the repair is related but not blocking, link it with `wv link <new> <current> --type=relates_to`.
+3. **Leave breadcrumbs for the next step**
+   - Save what was detected, what was created, and what should happen next with `wv breadcrumbs save`.
+4. **Avoid unattended close-time stalls**
+   - For non-interactive agent flows, prefer recording pending-close state and surfacing
+     `needs_human_verification` rather than blocking indefinitely on stdin prompts.
+   - Humans can resume and approve explicitly; agents should stop in a resumable state, not hang.
+
 ## Rules
 
 1. **Track ALL work** — `wv work <id>` or `wv add "<text>" --status=active` before editing files.

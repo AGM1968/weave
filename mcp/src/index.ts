@@ -60,14 +60,7 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_plan",
     "weave_edit_guard",
   ],
-  lite: [
-    "weave_overview",
-    "weave_guide",
-    "weave_edit_guard",
-    "weave_status",
-    "weave_work",
-    "weave_done",
-  ],
+  lite: ["weave_overview", "weave_guide", "weave_edit_guard", "weave_status", "weave_work", "weave_done"],
   inspect: [
     "weave_context",
     "weave_search",
@@ -1404,7 +1397,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.26.4",
+      version: "1.26.5",
     },
     {
       capabilities: {

@@ -33,7 +33,7 @@ Questions to ask:
 
 ### 2. Claim the Work
 
-For Weave nodes: `wv update $ARGUMENTS --status=active`
+For Weave nodes: `wv work $ARGUMENTS`
 
 **Gates:**
 
@@ -112,7 +112,7 @@ EOF
 Close the node with learnings:
 
 ```bash
-wv done $ARGUMENTS --learning="pattern: ..."
+wv done $ARGUMENTS --learning="decision: ... | pattern: ... | pitfall: ..."
 ```
 
 **Gate: /wv-verify-complete** - PreToolUse hook will suggest this if no verification captured.
@@ -122,8 +122,8 @@ wv done $ARGUMENTS --learning="pattern: ..."
 | Phase         | Skill               | Purpose                          | When                      |
 | ------------- | ------------------- | -------------------------------- | ------------------------- |
 | Understand    | /wv-clarify-spec    | Clarify vague requirements       | If requirements unclear   |
-| Claim         | /ship-it            | Define done criteria             | Before setting to active  |
-| Claim         | /pre-mortem         | Identify risks and rollback      | Before setting to active  |
+| Claim         | /ship-it            | Define done criteria             | Before claiming work      |
+| Claim         | /pre-mortem         | Identify risks and rollback      | Before claiming work      |
 | Locate        | /zero-in            | Focused search without waste     | During code exploration   |
 | Plan          | /sanity-check       | Validate assumptions             | Before implementation     |
 | Implement     | /wv-guard-scope     | Match conventions, respect scope | During coding             |
@@ -156,7 +156,7 @@ The procedural skills are enforced through:
 gh issue view 42
 # Requirements vague? Run: /wv-clarify-spec
 # 2. Claim with gates
-wv update wv-abc1 --status=active
+wv work wv-abc1
 # Hook suggests: /ship-it wv-abc1 && /pre-mortem wv-abc1
 # 3. Locate with focus
 # Use /zero-in: "Find the authentication middleware"
@@ -171,5 +171,5 @@ npm test -- auth.test.js
 # Capture evidence: /wv-verify-complete wv-abc1
 # 7. Close with learnings
 git commit -m "fix: handle null user in auth middleware"
-wv done wv-abc1 --learning="pattern: ..."
+wv done wv-abc1 --learning="decision: keep middleware null-safe because auth can run before user hydration | pattern: verify auth middleware with focused tests before closing | pitfall: null user paths can look impossible until middleware order changes"
 ```

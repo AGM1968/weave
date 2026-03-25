@@ -303,6 +303,37 @@ class TestRenderIssueBody:
         assert "#5" in body
 
     @patch("weave_gh.rendering.get_children", return_value=[])
+    @patch("weave_gh.rendering.get_blockers", return_value=["b1", "b2"])
+    @patch("weave_gh.rendering.get_parent", return_value=None)
+    def test_filters_done_blockers_from_body(
+        self, _mock_parent: Any, _mock_blockers: Any, _mock_children: Any
+    ) -> None:
+        node = _node(node_id="n1", text="Blocked task")
+        done_blocker = _node(node_id="b1", text="Done dependency", status="done", gh_issue=5)
+        active_blocker = _node(
+            node_id="b2", text="Open dependency", status="active", gh_issue=6
+        )
+        nodes = {"n1": node, "b1": done_blocker, "b2": active_blocker}
+
+        body = render_issue_body(node, nodes, [])
+        assert "Blocked by" in body
+        assert "#6" in body
+        assert "#5" not in body
+
+    @patch("weave_gh.rendering.get_children", return_value=[])
+    @patch("weave_gh.rendering.get_blockers", return_value=["b1"])
+    @patch("weave_gh.rendering.get_parent", return_value=None)
+    def test_omits_blocked_by_when_all_blockers_are_done(
+        self, _mock_parent: Any, _mock_blockers: Any, _mock_children: Any
+    ) -> None:
+        node = _node(node_id="n1", text="Previously blocked task")
+        done_blocker = _node(node_id="b1", text="Done dependency", status="done", gh_issue=5)
+        nodes = {"n1": node, "b1": done_blocker}
+
+        body = render_issue_body(node, nodes, [])
+        assert "Blocked by" not in body
+
+    @patch("weave_gh.rendering.get_children", return_value=[])
     @patch("weave_gh.rendering.get_blockers", return_value=[])
     @patch("weave_gh.rendering.get_parent", return_value=None)
     def test_with_description(

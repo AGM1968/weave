@@ -55,7 +55,7 @@ This agent specializes in:
 wv ready
 
 # Claim a node
-wv update wv-XXXXXX --status=active
+wv work wv-XXXXXX
 
 # Understand context
 wv show wv-XXXXXX
@@ -93,7 +93,7 @@ Think about:
 
 ```bash
 # Close with learnings
-wv done wv-XXXXXX --learning="pattern: Reusable technique or approach that worked"
+wv done wv-XXXXXX --learning="decision: what was chosen | pattern: reusable technique | pitfall: gotcha to avoid"
 ```
 
 ### 4. After Completing
@@ -207,6 +207,25 @@ wv path wv-XXXXXX --format=chain
 # Output: Task → Feature → Epic
 ```
 
+## Repair Workflow for Detected Issues
+
+When an audit, hook, test, or close step reveals a real workflow issue:
+
+```bash
+# If the current task cannot finish safely without the fix, create repair work and block current
+FIX=$(wv add "Task: repair detected workflow issue" --gh --parent=<feature-or-epic>)
+wv block wv-CURRENT --by=$FIX
+
+# If it is related but not blocking, still track it explicitly
+wv link $FIX wv-CURRENT --type=relates_to
+
+# Preserve the handoff state
+wv breadcrumbs save --msg="Detected workflow issue, created repair node, next step is ..."
+```
+
+For unattended agent paths, avoid waiting forever on close-time prompts. Record a resumable
+pending-close state, surface `needs_human_verification`, and let a human resume explicitly.
+
 ## Learnings Best Practices
 
 ### Decision
@@ -242,7 +261,7 @@ wv path wv-XXXXXX --format=chain
 ### Example: Well-Structured Learning
 
 ```bash
-wv done wv-XXXXXX --learning="pattern: Delegate exploratory searches to specialized agents to reduce context usage"
+wv done wv-XXXXXX --learning="decision: delegate exploratory searches to specialized agents when context is tight | pattern: use focused agents to reduce primary context usage | pitfall: broad inline exploration can waste tokens before implementation starts"
 ```
 
 ## Common Anti-Patterns
@@ -279,7 +298,7 @@ wv done wv-XXXXXX  # No learnings captured
 
 ```bash
 # Always capture learnings for non-trivial work
-wv done wv-XXXXXX --learning="pattern: ..."
+wv done wv-XXXXXX --learning="decision: ... | pattern: ... | pitfall: ..."
 ```
 
 ### Anti-Pattern: Orphaned Nodes
@@ -322,14 +341,14 @@ wv block wv-A --by=wv-B  # A depends on B only
 
 ## Integration with Skills
 
-### Use with /fix-issue
+### Use with /weave
 
 ```bash
-# 1. Invoke fix-issue skill
-/fix-issue wv-XXXXXX
+# 1. Invoke the weave orchestrator
+/weave wv-XXXXXX
 
-# 2. Skill automatically:
-#    - Claims the node (status=active)
+# 2. Orchestrator automatically:
+#    - Claims the node via `wv work`
 #    - Implements the fix
 #    - Runs validation
 #    - Closes with learnings
@@ -372,7 +391,7 @@ wv block wv-A --by=wv-B  # A depends on B only
 | `wv block <id> --by=<id>`       | Create dependency       | New work depends on other work     |
 | `wv done <id> --learning="..."` | Complete with learnings | After finishing work               |
 | `wv sync`                       | Persist to disk         | Before git commit                  |
-| `/fix-issue <id>`               | End-to-end fix workflow | Structured issue resolution        |
+| `/weave <id>`                   | End-to-end fix workflow | Structured issue resolution        |
 | `/close-session`                | Session end protocol    | End of coding session              |
 
 ## Checklist for Quality Work

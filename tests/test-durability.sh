@@ -222,6 +222,26 @@ rm -f "$WV_HOT_ZONE/ops.journal"
 recovery=$("$WV" recover --json 2>/dev/null)
 assert_contains "$recovery" '"ship_pending"' "recover finds ship_pending via metadata"
 
+# ─── pending_close metadata fallback ────────────────────────────────────
+
+echo ""
+echo -e "${CYAN}--- pending_close metadata fallback ---${NC}"
+setup_test_env
+
+seed_id=$("$WV" add "seed pending-close learning" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+overlap_learning="decision: keep overlap prompts resumable | pattern: store pending close state | pitfall: tty prompts hang unattended flows"
+WV_REQUIRE_LEARNING=1 "$WV" done "$seed_id" --learning="$overlap_learning" >/dev/null 2>&1
+
+node_id=$("$WV" add "pending close test" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+pending_close_exit=0
+WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$node_id" --learning="$overlap_learning" >/dev/null 2>&1 || pending_close_exit=$?
+assert_equals "2" "$pending_close_exit" "done exits 2 when pending-close human verification is required"
+
+recovery=$("$WV" recover --json 2>/dev/null)
+assert_contains "$recovery" '"needs_human_verification"' "recover finds pending-close nodes via metadata"
+assert_contains "$recovery" "$node_id" "recover includes pending-close node id"
+assert_contains "$recovery" 'acknowledge-overlap' "recover includes explicit resume command"
+
 # ─── _WV_IN_JOURNAL guard on auto_sync ─────────────────────────────────
 
 echo ""

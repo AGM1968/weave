@@ -305,6 +305,25 @@ test_done() {
     local sv_exit=0
     WV_REQUIRE_LEARNING=1 "$WV" done "$id" --skip-verification >/dev/null 2>&1 || sv_exit=$?
     assert_equals "0" "$sv_exit" "done accepts --skip-verification"
+
+    # Non-interactive overlap stores pending-close state instead of hanging
+    local seed_id overlap_id overlap_learning overlap_exit overlap_output overlap_meta
+    overlap_learning="decision: keep overlap prompts resumable | pattern: store pending close state | pitfall: tty prompts hang unattended flows"
+    seed_id=$("$WV" add "Seed overlap learning" 2>&1 | tail -1)
+    WV_REQUIRE_LEARNING=1 "$WV" done "$seed_id" --learning="$overlap_learning" >/dev/null 2>&1
+
+    overlap_id=$("$WV" add "Overlap pending close" 2>&1 | tail -1)
+    overlap_exit=0
+    overlap_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$overlap_id" --learning="$overlap_learning" 2>&1) || overlap_exit=$?
+    assert_equals "2" "$overlap_exit" "done returns 2 when overlap needs human acknowledgement"
+    assert_contains "$overlap_output" "Pending close recorded for human verification" "done records pending-close guidance"
+
+    overlap_meta=$("$WV" show "$overlap_id" --json 2>&1)
+    assert_contains "$overlap_meta" "needs_human_verification" "done stores needs_human_verification metadata"
+    assert_contains "$overlap_meta" "acknowledge-overlap" "done stores resume command for pending close"
+
+    overlap_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$overlap_id" --acknowledge-overlap 2>&1)
+    assert_contains "$overlap_output" "Closed" "done resumes pending close with acknowledge flag"
 }
 
 # ============================================================================

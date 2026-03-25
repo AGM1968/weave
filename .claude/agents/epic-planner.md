@@ -416,7 +416,7 @@ Once plan is approved:
 
 # Then start work:
 wv ready  # See first unblocked task
-wv update wv-AAAAAA --status=active  # Claim it
+wv work wv-AAAAAA  # Claim it
 # ... implement
 ```
 ````

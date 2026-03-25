@@ -20,9 +20,9 @@ if [ -x "$WV" ]; then
     "$WV" prune --age=48h 2>/dev/null || true
 fi
 
-# Sync Weave state to git layer (best effort)
+# Sync Weave state to git layer + GitHub issue state (best effort)
 if [ -x "$WV" ]; then
-    "$WV" sync 2>/dev/null || true
+    "$WV" sync --gh 2>/dev/null || true
 fi
 
 # Derive hot zone path (shared across checkpoint stamp + sentinel cleanup)
@@ -43,10 +43,10 @@ if ! git diff --cached --quiet 2>/dev/null; then
     _SE_REMOTE_HEAD=$(git rev-parse "origin/$_SE_BRANCH" 2>/dev/null || echo "none")
     if [ "$_ELAPSED" -lt 7200 ] && [ "$_SE_LOCAL_HEAD" != "$_SE_REMOTE_HEAD" ]; then
         # Recent checkpoint exists and hasn't been pushed — safe to amend
-        git commit --amend --no-edit --no-verify 2>/dev/null || \
-            git commit -m "chore(weave): auto-checkpoint $(date +%H:%M) [skip ci]" --no-verify 2>/dev/null || true
+        WV_AUTO_CHECKPOINT_ACTIVE=1 git commit --amend --no-edit 2>/dev/null || \
+            WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): auto-checkpoint $(date +%H:%M) [skip ci]" 2>/dev/null || true
     else
-        git commit -m "chore(weave): auto-checkpoint $(date +%H:%M) [skip ci]" --no-verify 2>/dev/null || true
+        WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): auto-checkpoint $(date +%H:%M) [skip ci]" 2>/dev/null || true
     fi
     # Update checkpoint stamp so auto_checkpoint sees this commit
     echo "$_NOW" > "${_SE_HOT_ZONE}/.last_checkpoint" 2>/dev/null || true

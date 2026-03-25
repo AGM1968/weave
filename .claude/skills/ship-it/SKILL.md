@@ -9,7 +9,7 @@ description: "Defines done criteria upfront. Use when starting implementation on
 > for the full graph-first workflow. Direct invocation is deprecated and may be removed in a future
 > release.
 
-**Trigger:** When setting a node to `active` status (`wv update <id> --status=active`).
+**Trigger:** When claiming a node for active work (`wv work <id>`).
 
 **Purpose:** Address failure mode #5 (no definition of done). Establishes clear, testable completion
 criteria before implementation begins.

@@ -391,10 +391,52 @@ _done_skip_learning=false
 
 # Store learning in node metadata with FTS5 dedup check and format suggestion.
 # Sets _done_skip_learning=true if user chose to skip/dedup.
-# Args: $1=id, $2=learning text (already ANSI-stripped)
+# Sets _done_pending_close=true if overlap needs explicit human acknowledgement.
+# Args: $1=id, $2=learning text (already ANSI-stripped), $3=acknowledge overlap (0/1)
+_done_read_metadata() {
+    local id="$1"
+    local cur_meta cur_meta_raw
+    cur_meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='$id';" 2>/dev/null || echo "[]")
+    cur_meta=$(echo "$cur_meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
+    if [[ "$cur_meta" != "{"* ]]; then
+        cur_meta=$(echo "$cur_meta" | jq -r '.' 2>/dev/null || echo "{}")
+    fi
+    echo "$cur_meta"
+}
+
+_done_can_prompt_overlap() {
+    [ "${WV_NONINTERACTIVE:-0}" != "1" ] && [ -z "${CI:-}" ] && [ -t 0 ] && [ -t 2 ]
+}
+
+_done_mark_pending_close() {
+    local id="$1" learning="$2" overlap_id="$3"
+    local cur_meta new_meta created_at resume_cmd
+    cur_meta=$(_done_read_metadata "$id")
+    created_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    resume_cmd="wv done $id --acknowledge-overlap"
+    new_meta=$(echo "$cur_meta" | jq \
+        --arg learning "$learning" \
+        --arg overlap_id "$overlap_id" \
+        --arg created_at "$created_at" \
+        --arg resume_cmd "$resume_cmd" \
+        '. + {
+            needs_human_verification: true,
+            pending_close: {
+                reason: "learning_overlap",
+                overlap_with: $overlap_id,
+                learning: $learning,
+                created_at: $created_at,
+                resume_command: $resume_cmd
+            }
+        }' 2>/dev/null || echo "$cur_meta")
+    new_meta="${new_meta//\'/\'\'}"
+    db_query "UPDATE nodes SET metadata='$new_meta', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+}
+
 _done_store_learning() {
-    local id="$1" learning="$2"
+    local id="$1" learning="$2" acknowledge_overlap="${3:-0}"
     _done_skip_learning=false
+    _done_pending_close=false
 
     # FTS5 dedup check: prompt if a similar learning already exists
     local search_terms
@@ -412,7 +454,9 @@ _done_store_learning() {
         " 2>/dev/null || true)
         if [ -n "$fts_match" ]; then
             echo -e "${YELLOW}⚠ Learning may overlap with $fts_match${NC}" >&2
-            if [ -t 0 ] && [ -t 2 ]; then
+            if [ "$acknowledge_overlap" = "1" ]; then
+                echo -e "  → Acknowledged via --acknowledge-overlap, proceeding." >&2
+            elif _done_can_prompt_overlap; then
                 # Interactive terminal: show overlapping learning and prompt for action
                 local overlap_learning
                 overlap_learning=$(db_query_json "SELECT metadata FROM nodes WHERE id='$fts_match';" 2>/dev/null \
@@ -436,22 +480,22 @@ _done_store_learning() {
                         ;;
                 esac
             else
-                echo -e "${YELLOW}  → check wv show $fts_match to inspect${NC}" >&2
+                _done_mark_pending_close "$id" "$learning" "$fts_match"
+                _done_pending_close=true
+                echo -e "${YELLOW}  → Pending close recorded for human verification${NC}" >&2
+                echo -e "${YELLOW}  → inspect overlap: wv show $fts_match${NC}" >&2
+                echo -e "${YELLOW}  → resume with: wv done $id --acknowledge-overlap${NC}" >&2
             fi
         fi
     fi
 
-    if [ "$_done_skip_learning" = true ]; then
+    if [ "$_done_skip_learning" = true ] || [ "$_done_pending_close" = true ]; then
         return 0
     fi
 
     # Merge learning into node metadata
-    local cur_meta cur_meta_raw
-    cur_meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='$id';" 2>/dev/null || echo "[]")
-    cur_meta=$(echo "$cur_meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
-    if [[ "$cur_meta" != "{"* ]]; then
-        cur_meta=$(echo "$cur_meta" | jq -r '.' 2>/dev/null || echo "{}")
-    fi
+    local cur_meta
+    cur_meta=$(_done_read_metadata "$id")
     local new_meta
     new_meta=$(echo "$cur_meta" | jq --arg l "$learning" '. + {learning: $l}' 2>/dev/null || echo "$cur_meta")
     new_meta="${new_meta//\'/\'\'}"
@@ -595,6 +639,7 @@ cmd_done() {
     local learning=""
     local no_warn=0
     local skip_verification=0
+    local acknowledge_overlap=0
     local format="text"
 
     shift || true
@@ -604,6 +649,7 @@ cmd_done() {
             --learning=*) learning="${1#*=}" ;;
             --no-warn) no_warn=1 ;;
             --skip-verification) skip_verification=1 ;;
+            --acknowledge-overlap) acknowledge_overlap=1 ;;
             --json) format="json" ;;
         esac
         shift
@@ -617,6 +663,29 @@ cmd_done() {
     # Validate ID format (SQL injection prevention)
     validate_id "$id" || return 1
 
+    # Verify node exists
+    local exists
+    exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
+    if [ "$exists" = "0" ]; then
+        echo -e "${RED}Error: node $id not found${NC}" >&2
+        return 1
+    fi
+
+    local node_meta pending_reason pending_resume_cmd
+    node_meta=$(_done_read_metadata "$id")
+    pending_reason=$(echo "$node_meta" | jq -r '.pending_close.reason // empty' 2>/dev/null || echo "")
+    pending_resume_cmd=$(echo "$node_meta" | jq -r '.pending_close.resume_command // empty' 2>/dev/null || echo "")
+    if [ -n "$pending_reason" ] && [ "$acknowledge_overlap" = "0" ]; then
+        echo -e "${YELLOW}⚠ Node $id is waiting for human verification before close${NC}" >&2
+        if [ -n "$pending_resume_cmd" ]; then
+            echo -e "${YELLOW}  Resume with: $pending_resume_cmd${NC}" >&2
+        fi
+        return 2
+    fi
+    if [ "$acknowledge_overlap" = "1" ] && [ -z "$learning" ]; then
+        learning=$(echo "$node_meta" | jq -r '.pending_close.learning // empty' 2>/dev/null || echo "")
+    fi
+
     # Require --learning or --skip-verification for closure quality
     # Bypass: WV_REQUIRE_LEARNING=0 (for tests), --no-warn (for recovery/internal)
     if [ "${WV_REQUIRE_LEARNING:-1}" = "1" ] && [ -z "$learning" ] && [ "$skip_verification" = "0" ] && [ "$no_warn" = "0" ]; then
@@ -624,14 +693,6 @@ cmd_done() {
         echo -e "  Capture what future sessions would get wrong without this:" >&2
         echo -e "  wv done $id --learning=\"decision: ... | pattern: ... | pitfall: ...\"" >&2
         echo -e "  wv done $id --skip-verification  # for trivial work" >&2
-        return 1
-    fi
-
-    # Verify node exists
-    local exists
-    exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
-    if [ "$exists" = "0" ]; then
-        echo -e "${RED}Error: node $id not found${NC}" >&2
         return 1
     fi
 
@@ -651,13 +712,16 @@ cmd_done() {
     if [ -n "$learning" ]; then
         # Strip ANSI escape codes (color sequences leak from terminal output)
         learning=$(printf '%s' "$learning" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
-        _done_store_learning "$id" "$learning"
+        _done_store_learning "$id" "$learning" "$acknowledge_overlap"
+        if [ "$_done_pending_close" = true ]; then
+            return 2
+        fi
     fi
 
     # === Close: update status, release claim, clear primary, aggregate commits ===
     db_query "UPDATE nodes
         SET status='done',
-            metadata = json_remove(COALESCE(metadata,'{}'), '$.claimed_by'),
+            metadata = json_remove(COALESCE(metadata,'{}'), '$.claimed_by', '$.pending_close', '$.needs_human_verification'),
             updated_at = CURRENT_TIMESTAMP
         WHERE id='$id';"
 
@@ -1582,15 +1646,24 @@ cmd_ship() {
 
     # Step 1: Close the node
     journal_step 1 "done" "{\"id\":\"$id\"}"
+    local done_rc=0
     if [ -n "$learning" ]; then
-        cmd_done "$id" --learning="$learning"
+        cmd_done "$id" --learning="$learning" || done_rc=$?
     elif [ "$skip_verification" = true ]; then
-        cmd_done "$id" --skip-verification
+        cmd_done "$id" --skip-verification || done_rc=$?
     else
         echo -e "${RED}Error: --learning=\"...\" or --skip-verification required${NC}" >&2
         echo "Usage: wv ship <id> --learning=\"decision: ... | pattern: ... | pitfall: ...\"" >&2
         journal_abort 2>/dev/null || true
         return 1
+    fi
+    if [ "$done_rc" -eq 2 ]; then
+        db_query "UPDATE nodes SET metadata = json_remove(COALESCE(metadata,'{}'), '$.ship_pending') WHERE id = '$id';" 2>/dev/null || true
+        journal_end
+        journal_clean
+        return 2
+    elif [ "$done_rc" -ne 0 ]; then
+        return "$done_rc"
     fi
     journal_complete 1
 

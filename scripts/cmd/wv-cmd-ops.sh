@@ -473,8 +473,21 @@ cmd_recover() {
         " 2>/dev/null || true)
     fi
 
-    # Nothing to recover
+    # Source 3: pending_close markers that need explicit human acknowledgement
+    local pending_close_nodes=""
     if [ "$journal_found" = false ] && [ -z "$pending_nodes" ]; then
+        pending_close_nodes=$(db_query "
+            SELECT id || '|' || text || '|' ||
+                   COALESCE(json_extract(metadata, '$.pending_close.reason'), '') || '|' ||
+                   COALESCE(json_extract(metadata, '$.pending_close.resume_command'), '')
+            FROM nodes
+            WHERE json_extract(metadata, '$.needs_human_verification') = 1
+                AND json_extract(metadata, '$.pending_close.reason') IS NOT NULL;
+        " 2>/dev/null || true)
+    fi
+
+    # Nothing to recover
+    if [ "$journal_found" = false ] && [ -z "$pending_nodes" ] && [ -z "$pending_close_nodes" ]; then
         if [ "$json_mode" = true ]; then
             echo '{"status":"clean","message":"No incomplete operations"}'
         elif [ "$auto_mode" != true ]; then
@@ -578,6 +591,37 @@ cmd_recover() {
             db_query "UPDATE nodes SET metadata = json_remove(metadata, '$.ship_pending') WHERE id = '$node_id';" 2>/dev/null || true
         done
         echo -e "${GREEN}✓${NC} Recovery complete"
+    fi
+
+    # === pending_close fallback (human verification required) ===
+    if [ -n "$pending_close_nodes" ]; then
+        if [ "$json_mode" = true ]; then
+            local pending_close_json
+            pending_close_json=$(echo "$pending_close_nodes" | jq -R -s '
+                split("\n") |
+                map(select(length > 0) | split("|") | {
+                    id: .[0],
+                    text: .[1],
+                    reason: .[2],
+                    resume_command: .[3]
+                })')
+            echo "{\"status\":\"needs_human_verification\",\"nodes\":$pending_close_json}"
+            return 0
+        fi
+
+        echo -e "${YELLOW}⚠ Node(s) waiting for human verification before close${NC}"
+        echo "$pending_close_nodes" | while IFS='|' read -r node_id node_text pending_reason resume_cmd; do
+            [ -z "$node_id" ] && continue
+            echo "  $node_id: $node_text"
+            echo "    Reason: $pending_reason"
+            if [ -n "$resume_cmd" ]; then
+                echo "    Resume: $resume_cmd"
+            fi
+        done
+        if [ "$auto_mode" = true ]; then
+            echo -e "${CYAN}ℹ${NC} Leaving pending-close state for explicit human approval"
+        fi
+        return 0
     fi
 }
 

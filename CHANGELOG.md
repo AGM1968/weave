@@ -2,6 +2,29 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.26.5] - 2026-03-25
+
+### Fixed
+
+- **`wv done` pending-close for non-interactive flows** — learning overlap that requires human
+  acknowledgement now persists `needs_human_verification` + `pending_close` metadata instead of
+  blocking on stdin. Agents resume with `wv done <id> --acknowledge-overlap` rather than hanging.
+- **GH issue blocker rendering** — synced GitHub issues now show only unresolved blockers in the
+  "Blocked by" section; previously all blockers (including resolved deps) were listed.
+- **Hook payload parsing** — `pre-claim-skills.sh` and `pre-close-verification.sh` now parse real
+  Bash hook payloads (`tool_input.cmd`/`.command`), fixing false-positive blocks on `wv work`.
+- **Session-end workflow alignment** — `session-end-sync.sh` updated to match documented protocol
+  (automation exceptions, CI bypass policy).
+- **Skills and agents drift** — `close-session`, `fix-issue`, `plan-agent`, `ship-it`, `weave`, and
+  `wv-decompose-work` updated for current claim flow and epic hierarchy rules; `weave-guide` and
+  `epic-planner` agents updated with repair workflow and decomposition guardrails.
+
+### Documentation
+
+- **`WORKFLOW.md` Repair Workflow section** — canonical guidance for turning detected workflow
+  issues into tracked graph nodes during execution: detect → create node → breadcrumbs →
+  pending-close for non-interactive resumption.
+
 ## [1.26.4] - 2026-03-23
 
 ### Fixed

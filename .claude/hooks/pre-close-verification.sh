@@ -14,8 +14,10 @@ case "$INPUT" in
     *) exit 0 ;;
 esac
 
-# Extract the command from Bash tool use
-COMMAND=$(echo "$INPUT" | jq -r '.command // empty' 2>/dev/null)
+# Extract the command from Bash tool use.
+# Real PreToolUse payloads nest terminal commands under tool_input.{cmd,command},
+# while older tests used a top-level .command field.
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.cmd // .tool_input.command // .command // empty' 2>/dev/null)
 
 # Check if this is a wv done command
 if [[ "$COMMAND" =~ wv[[:space:]]done[[:space:]]wv-[0-9a-f]{4,6} ]]; then

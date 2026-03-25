@@ -73,6 +73,8 @@ def render_issue_body(
         for bid in blocker_ids:
             if bid in nodes_by_id:
                 b = nodes_by_id[bid]
+                if b.status == "done":
+                    continue
                 if b.gh_issue:
                     blocker_parts.append(f"#{b.gh_issue} ({b.text})")
                 else:
