@@ -52,18 +52,14 @@ if [[ "$COMMAND" =~ wv[[:space:]]done[[:space:]]wv-[0-9a-f]{4,6} ]]; then
             fi
 
             if [[ "$IS_TRIVIAL" == "false" ]]; then
-                # PreToolUse blocking: exit 2 + permissionDecision DENY
-                JSON_OUT=$(jq -n \
+                # PreToolUse soft deny (exit 0 + hookSpecificOutput JSON)
+                # Schema: hookSpecificOutput.permissionDecision (current API, not deprecated top-level)
+                # "deny" is lowercase — "DENY" silently fails (original bug)
+                jq -n \
                     --arg node "$NODE_ID" \
-                    --arg msg "Verification evidence required before closing $NODE_ID. Add verification metadata with wv update or use --skip-verification for trivial tasks." \
-                    '{
-                        "hookSpecificOutput": {
-                            "permissionDecision": "DENY",
-                            "message": $msg
-                        }
-                    }')
-                echo "$JSON_OUT"
-                exit 2
+                    --arg detail "Run: wv update $NODE_ID --metadata='{\"verification_method\":\"make check\",\"verification_evidence\":\"all tests pass\"}' — or append --skip-verification for trivial tasks." \
+                    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
+                exit 0
             fi
         fi
     fi

@@ -19,6 +19,39 @@ _SS_REPO_HASH=$(echo "$WV_PROJECT_DIR" | md5sum | cut -c1-8)
 _SS_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_SS_REPO_HASH}}"
 SENTINEL="${_SS_HOT_ZONE}/.session_sentinel"
 
+# ── Harvest last prompt from most recent Claude JSONL (best-effort) ──
+# Used to enrich crash/reboot recovery context with conversation intent.
+_SS_LAST_PROMPT=""
+_SS_CLAUDE_SLUG=$(echo "$WV_PROJECT_DIR" | tr '/' '-')
+_SS_CLAUDE_DIR="$HOME/.claude/projects/${_SS_CLAUDE_SLUG}"
+if [ -d "$_SS_CLAUDE_DIR" ]; then
+    _SS_RECENT_JSONL=$(ls -t "$_SS_CLAUDE_DIR"/*.jsonl 2>/dev/null | head -1)
+    if [ -n "$_SS_RECENT_JSONL" ]; then
+        _SS_LAST_PROMPT=$(python3 - "$_SS_RECENT_JSONL" 2>/dev/null <<'PYEOF'
+import json, sys
+last_prompt = ""
+last_user = ""
+for line in open(sys.argv[1]):
+    try:
+        d = json.loads(line)
+        if d.get("type") == "last-prompt":
+            last_prompt = d.get("lastPrompt", "")
+        elif d.get("role") == "user":
+            content = d.get("message", {}).get("content", "")
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        t = c.get("text", "").strip()
+                        if t and not t.startswith("<"):
+                            last_user = t[:120]
+    except Exception:
+        pass
+print((last_prompt or last_user)[:120])
+PYEOF
+        ) || _SS_LAST_PROMPT=""
+    fi
+fi
+
 # ── Crash detection: check for previous session's sentinel ──
 # Sentinel present = previous session did not call session-end-sync.sh
 CRASH_WARNING=""
@@ -29,12 +62,16 @@ if [ -f "$SENTINEL" ]; then
     CRASH_TS=$(echo "$CRASH_DATA" | jq -r '.ts // "unknown"' 2>/dev/null || echo "unknown")
     CRASH_ACTIVE=$(echo "$CRASH_DATA" | jq -r '.active | join(", ")' 2>/dev/null || echo "unknown")
 
-    # Auto-generate recovery breadcrumb
-    "$WV" breadcrumbs save \
-        --message="CRASH RECOVERY: Session killed at ${CRASH_TS}. Active nodes at crash: ${CRASH_ACTIVE}. Review and re-claim or close these nodes." \
-        >/dev/null 2>&1 || true
+    _CRASH_MSG="CRASH RECOVERY: Session killed at ${CRASH_TS}. Active nodes at crash: ${CRASH_ACTIVE}."
+    [ -n "$_SS_LAST_PROMPT" ] && _CRASH_MSG="${_CRASH_MSG} Last prompt: '${_SS_LAST_PROMPT}'"
+    _CRASH_MSG="${_CRASH_MSG} Review and re-claim or close active nodes."
 
-    CRASH_WARNING="CRASH DETECTED: previous session ended abruptly at ${CRASH_TS}. Active at crash: ${CRASH_ACTIVE}. Recovery breadcrumb saved."
+    # Auto-generate recovery breadcrumb
+    "$WV" breadcrumbs save --message="$_CRASH_MSG" >/dev/null 2>&1 || true
+
+    CRASH_WARNING="CRASH DETECTED: previous session ended abruptly at ${CRASH_TS}. Active at crash: ${CRASH_ACTIVE}."
+    [ -n "$_SS_LAST_PROMPT" ] && CRASH_WARNING="${CRASH_WARNING} Last prompt: '${_SS_LAST_PROMPT}'"
+    CRASH_WARNING="${CRASH_WARNING} Recovery breadcrumb saved."
 fi
 
 # ── Write minimal sentinel BEFORE wv load (crash-during-load detectable) ──
@@ -70,7 +107,10 @@ fi
 # Secondary detection: active nodes but no sentinel at session start (reboot recovery)
 ACTIVE_COUNT=$(echo "$ACTIVE_IDS" | jq 'length' 2>/dev/null || echo "0")
 if [ "$ACTIVE_COUNT" -gt 0 ] && [ -z "$CRASH_WARNING" ] && [ "$HAD_SENTINEL" = false ]; then
-    CONTEXT="Note: ${ACTIVE_COUNT} nodes marked active from a previous session. Run 'wv recover --session' to review.
+    _REBOOT_NOTE="Note: ${ACTIVE_COUNT} nodes marked active from a previous session."
+    [ -n "$_SS_LAST_PROMPT" ] && _REBOOT_NOTE="${_REBOOT_NOTE} Last prompt: '${_SS_LAST_PROMPT}'"
+    _REBOOT_NOTE="${_REBOOT_NOTE} Run 'wv recover --session' to review."
+    CONTEXT="${_REBOOT_NOTE}
 ${CONTEXT}"
 fi
 

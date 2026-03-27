@@ -14,6 +14,8 @@ from weave_gh.phases import (
     _backfill_gh_issue,
     _handle_existing_issue,
     _handle_new_issue,
+    _invalid_assignees,
+    _is_valid_assignee,
     _sync_assignee,
     _was_closed_by_weave,
     _WEAVE_CLOSE_MARKER,
@@ -528,46 +530,109 @@ class TestRefreshParentBody:
 class TestSyncAssignee:
     """_sync_assignee should add/remove/noop GH issue assignees."""
 
+    def _ok_run(self, cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        """Stub _run that always succeeds."""
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    def _fail_run(self, cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        """Stub _run that always fails."""
+        return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="Not a collaborator")
+
     def test_noop_when_unchanged(self) -> None:
-        """Should return False and not call gh when assignee already correct."""
-        calls: list[object] = []
-        with patch("weave_gh.phases.gh_cli", side_effect=lambda *_a, **_k: calls.append(_a)):
+        """Should return False and not call _run when assignee already correct."""
+        _invalid_assignees.discard("alice")
+        calls: list[list[str]] = []
+        with patch("weave_gh.phases._run", side_effect=lambda cmd, **_k: (calls.append(cmd), self._ok_run(cmd))[1]):
             changed = _sync_assignee(1, "alice", ["alice"], "owner/repo")
         assert changed is False
         assert not calls
 
     def test_add_assignee(self) -> None:
-        """Should call gh issue edit --add-assignee when desired != current."""
-        calls: list[tuple[object, ...]] = []
-
-        def _capture(*_a: object, **_k: object) -> str:
-            calls.append(_a)
-            return ""
-
-        with patch("weave_gh.phases.gh_cli", side_effect=_capture):
+        """Should call gh issue edit --add-assignee when desired != current and user is valid."""
+        _invalid_assignees.discard("alice")
+        calls: list[list[str]] = []
+        with patch("weave_gh.phases._run", side_effect=lambda cmd, **_k: (calls.append(cmd), self._ok_run(cmd))[1]):
             changed = _sync_assignee(1, "alice", [], "owner/repo")
         assert changed is True
-        assert any("--add-assignee" in str(c) for c in calls[0])
+        edit_call = next(c for c in calls if "edit" in c)
+        assert "--add-assignee" in edit_call
+
+    def test_add_assignee_invalid_user(self) -> None:
+        """Should return False and not call edit when the user is not a valid collaborator."""
+        _invalid_assignees.discard("ghost")
+        calls: list[list[str]] = []
+        with patch("weave_gh.phases._run", side_effect=lambda cmd, **_k: (calls.append(cmd), self._fail_run(cmd))[1]):
+            changed = _sync_assignee(1, "ghost", [], "owner/repo")
+        assert changed is False
+        assert "ghost" in _invalid_assignees
+        assert not any("edit" in c for c in calls)
+
+    def test_add_assignee_edit_fails(self) -> None:
+        """Should return False when user is valid but edit call fails."""
+        _invalid_assignees.discard("alice")
+        call_count = 0
+
+        def _side_effect(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+            nonlocal call_count
+            call_count += 1
+            # First call: _is_valid_assignee succeeds; second call: edit fails
+            if call_count == 1:
+                return self._ok_run(cmd)
+            return self._fail_run(cmd)
+
+        with patch("weave_gh.phases._run", side_effect=_side_effect):
+            changed = _sync_assignee(1, "alice", [], "owner/repo")
+        assert changed is False
 
     def test_remove_assignee(self) -> None:
         """Should call gh issue edit --remove-assignee when desired is None."""
-        calls: list[tuple[object, ...]] = []
-
-        def _capture(*_a: object, **_k: object) -> str:
-            calls.append(_a)
-            return ""
-
-        with patch("weave_gh.phases.gh_cli", side_effect=_capture):
+        calls: list[list[str]] = []
+        with patch("weave_gh.phases._run", side_effect=lambda cmd, **_k: (calls.append(cmd), self._ok_run(cmd))[1]):
             changed = _sync_assignee(1, None, ["alice"], "owner/repo")
         assert changed is True
-        assert any("--remove-assignee" in str(c) for c in calls[0])
+        assert any("--remove-assignee" in c for c in calls[0])
+
+    def test_remove_assignee_fails(self) -> None:
+        """Should return False when remove-assignee call fails."""
+        with patch("weave_gh.phases._run", side_effect=lambda cmd, **_k: self._fail_run(cmd)):
+            changed = _sync_assignee(1, None, ["alice"], "owner/repo")
+        assert changed is False
 
     def test_dry_run_no_call(self) -> None:
-        """Dry run should return True but not call gh_cli."""
-        calls: list[object] = []
-        with patch("weave_gh.phases.gh_cli", side_effect=lambda *_a, **_k: calls.append(_a)):
+        """Dry run should return True but not call _run."""
+        calls: list[list[str]] = []
+        with patch("weave_gh.phases._run", side_effect=lambda cmd, **_k: (calls.append(cmd), self._ok_run(cmd))[1]):
             changed = _sync_assignee(1, "alice", [], "owner/repo", dry_run=True)
         assert changed is True
+        assert not calls
+
+
+class TestIsValidAssignee:
+    """_is_valid_assignee should check GH API and cache failures."""
+
+    def test_valid_user_returns_true(self) -> None:
+        """Returns True when gh api returns 0."""
+        _invalid_assignees.discard("validuser")
+        ok = subprocess.CompletedProcess([], returncode=0, stdout="", stderr="")
+        with patch("weave_gh.phases._run", return_value=ok):
+            assert _is_valid_assignee("validuser", "owner/repo") is True
+        assert "validuser" not in _invalid_assignees
+
+    def test_invalid_user_returns_false_and_caches(self) -> None:
+        """Returns False when gh api returns non-zero, caches the login."""
+        _invalid_assignees.discard("noone")
+        fail = subprocess.CompletedProcess([], returncode=1, stdout="", stderr="Not Found")
+        with patch("weave_gh.phases._run", return_value=fail):
+            assert _is_valid_assignee("noone", "owner/repo") is False
+        assert "noone" in _invalid_assignees
+
+    def test_cached_invalid_skips_api_call(self) -> None:
+        """Second call for a known-invalid user skips the API call."""
+        _invalid_assignees.add("cached-bad")
+        calls: list[object] = []
+        with patch("weave_gh.phases._run", side_effect=lambda *a, **k: calls.append(a)):
+            result = _is_valid_assignee("cached-bad", "owner/repo")
+        assert result is False
         assert not calls
 
 
@@ -921,13 +986,14 @@ class TestHandleNewIssuePaths:
         assert stats.created_gh == 0
         assert len(backfill_calls) == 1
 
-    def test_labels_and_assignee_passed_to_gh_cli(self) -> None:
-        """Labels and assignee args are forwarded to gh issue create."""
+    def test_labels_passed_to_gh_cli_assignee_via_sync(self) -> None:
+        """Labels are in gh issue create; assignee is synced post-creation, not in create args."""
         node = WeaveNode(
             id="wv-labl", text="Labelled", status="todo",
             metadata={"claimed_by": "alice"},
         )
         gh_args: list[tuple[object, ...]] = []
+        sync_calls: list[tuple[object, ...]] = []
         stats = SyncStats()
 
         with patch.multiple(
@@ -937,6 +1003,7 @@ class TestHandleNewIssuePaths:
             get_labels_for_node=lambda _: ["bug", "enhancement"],
             sync_issue_labels=lambda *_a, **_k: None,
             _backfill_gh_issue=lambda *_a, **_k: None,
+            _sync_assignee=lambda *_a, **_k: sync_calls.append(_a),
             gh_cli=lambda *_a, **_k: (
                 gh_args.append(_a),  # type: ignore[func-returns-value]
                 "https://github.com/o/r/issues/1",
@@ -955,9 +1022,10 @@ class TestHandleNewIssuePaths:
             )
 
         assert gh_args
-        all_args = " ".join(str(a) for a in gh_args[0])
-        assert "--label" in all_args
-        assert "--assignee" in all_args
+        create_args = " ".join(str(a) for a in gh_args[0])
+        assert "--label" in create_args
+        assert "--assignee" not in create_args  # assignee not in create call
+        assert len(sync_calls) == 1             # assignee synced post-creation
 
     def test_done_node_closes_issue_after_create(self) -> None:
         """If node is done, the newly created issue is immediately closed."""
@@ -1187,7 +1255,7 @@ class TestSyncClosedToWeave:
 
         assert stats.closed_wv == 1
         mock_wv.assert_called_once_with(
-            "done", "wv-todc", "--skip-verification",
+            "done", "wv-todc", "--skip-verification", "--acknowledge-overlap",
             "--learning=closed via GH issue sync (Phase 3)",
             check=False,
         )

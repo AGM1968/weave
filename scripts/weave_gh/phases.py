@@ -24,6 +24,22 @@ from weave_gh.body import parse_gh_body_description, parse_issue_template_fields
 # Used to detect Weave-closed issues and prevent phantom reopens.
 _WEAVE_CLOSE_MARKER = "Completed. Weave node"
 
+# Cache of known-invalid assignee logins to avoid repeated failed API calls.
+_invalid_assignees: set[str] = set()
+
+
+def _is_valid_assignee(login: str, repo: str) -> bool:
+    """Return True if login is a valid assignee for repo (cached)."""
+    if login in _invalid_assignees:
+        return False
+    result = _run(["gh", "api", f"repos/{repo}/assignees/{login}"], check=False)
+    if result.returncode == 0:
+        return True
+    _invalid_assignees.add(login)
+    log.warning("  ⚠ %r is not a valid assignee for %s — skipping assignment", login, repo)
+    return False
+
+
 def _sync_assignee(
     gh_num: int,
     desired: str | None,
@@ -40,16 +56,24 @@ def _sync_assignee(
         log.info("  [dry-run] Would set assignee of #%d to %s", gh_num, desired or "(none)")
         return True
     if desired:
-        gh_cli(
-            "issue", "edit", str(gh_num), "--repo", repo,
-            "--add-assignee", desired, check=False,
+        if not _is_valid_assignee(desired, repo):
+            return False
+        result = _run(
+            ["gh", "issue", "edit", str(gh_num), "--repo", repo, "--add-assignee", desired],
+            check=False,
         )
+        if result.returncode != 0:
+            log.warning("  ⚠ Failed to assign #%d to %r: %s", gh_num, desired, result.stderr.strip())
+            return False
         log.info("  👤 Assigned #%d to %s", gh_num, desired)
     elif current:
-        gh_cli(
-            "issue", "edit", str(gh_num), "--repo", repo,
-            "--remove-assignee", current, check=False,
+        result = _run(
+            ["gh", "issue", "edit", str(gh_num), "--repo", repo, "--remove-assignee", current],
+            check=False,
         )
+        if result.returncode != 0:
+            log.warning("  ⚠ Failed to remove assignee %r from #%d: %s", current, gh_num, result.stderr.strip())
+            return False
         log.info("  👤 Removed assignee %s from #%d", current, gh_num)
     return True
 
@@ -289,10 +313,6 @@ def _handle_new_issue(
     for lb in labels:
         label_args.extend(["--label", lb])
 
-    assignee_args: list[str] = []
-    if node.claimed_by:
-        assignee_args = ["--assignee", node.claimed_by]
-
     try:
         result = gh_cli(
             "issue",
@@ -304,7 +324,6 @@ def _handle_new_issue(
             "--body",
             weave_body,
             *label_args,
-            *assignee_args,
         )
         # Extract issue number from URL
         num_match = re.search(r"/(\d+)$", result)
@@ -321,6 +340,10 @@ def _handle_new_issue(
             # Backfill metadata
             _backfill_gh_issue(node, new_num, all_nodes=all_nodes)
             stats.created_gh += 1
+
+            # Best-effort assignee — silently skipped if login is not a repo collaborator
+            if node.claimed_by:
+                _sync_assignee(new_num, node.claimed_by, [], repo)
 
             # If node already done, immediately close
             if node.status == "done":
@@ -630,7 +653,7 @@ def sync_closed_to_weave(
                         node.gh_issue,
                     )
                     wv_cli(
-                        "done", node.id, "--skip-verification",
+                        "done", node.id, "--skip-verification", "--acknowledge-overlap",
                         "--learning=closed via GH issue sync (Phase 3)",
                         check=False,
                     )

@@ -235,11 +235,16 @@ WV_REQUIRE_LEARNING=1 "$WV" done "$seed_id" --learning="$overlap_learning" >/dev
 node_id=$("$WV" add "pending close test" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
 pending_close_exit=0
 WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$node_id" --learning="$overlap_learning" >/dev/null 2>&1 || pending_close_exit=$?
-assert_equals "2" "$pending_close_exit" "done exits 2 when pending-close human verification is required"
+assert_equals "0" "$pending_close_exit" "done succeeds non-interactively when overlap detected (advisory only)"
 
+# Recovery of legacy pending_close nodes (nodes stuck under old blocking behavior)
+legacy_stuck=$("$WV" add "legacy stuck node" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+legacy_stuck_meta=$(jq -n --arg node "$legacy_stuck" \
+    '{"needs_human_verification": true, "pending_close": {"reason": "learning_overlap", "overlap_with": "wv-fake", "learning": "test", "resume_command": ("wv done " + $node + " --acknowledge-overlap")}}')
+"$WV" update "$legacy_stuck" --metadata="$legacy_stuck_meta" >/dev/null 2>&1
 recovery=$("$WV" recover --json 2>/dev/null)
-assert_contains "$recovery" '"needs_human_verification"' "recover finds pending-close nodes via metadata"
-assert_contains "$recovery" "$node_id" "recover includes pending-close node id"
+assert_contains "$recovery" '"needs_human_verification"' "recover finds legacy pending-close nodes via metadata"
+assert_contains "$recovery" "$legacy_stuck" "recover includes legacy pending-close node id"
 assert_contains "$recovery" 'acknowledge-overlap' "recover includes explicit resume command"
 
 # ─── _WV_IN_JOURNAL guard on auto_sync ─────────────────────────────────

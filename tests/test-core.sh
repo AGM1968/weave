@@ -306,24 +306,32 @@ test_done() {
     WV_REQUIRE_LEARNING=1 "$WV" done "$id" --skip-verification >/dev/null 2>&1 || sv_exit=$?
     assert_equals "0" "$sv_exit" "done accepts --skip-verification"
 
-    # Non-interactive overlap stores pending-close state instead of hanging
+    # Non-interactive overlap: advisory metadata written, close proceeds (does NOT block)
     local seed_id overlap_id overlap_learning overlap_exit overlap_output overlap_meta
     overlap_learning="decision: keep overlap prompts resumable | pattern: store pending close state | pitfall: tty prompts hang unattended flows"
     seed_id=$("$WV" add "Seed overlap learning" 2>&1 | tail -1)
     WV_REQUIRE_LEARNING=1 "$WV" done "$seed_id" --learning="$overlap_learning" >/dev/null 2>&1
 
-    overlap_id=$("$WV" add "Overlap pending close" 2>&1 | tail -1)
+    overlap_id=$("$WV" add "Overlap advisory" 2>&1 | tail -1)
     overlap_exit=0
     overlap_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$overlap_id" --learning="$overlap_learning" 2>&1) || overlap_exit=$?
-    assert_equals "2" "$overlap_exit" "done returns 2 when overlap needs human acknowledgement"
-    assert_contains "$overlap_output" "Pending close recorded for human verification" "done records pending-close guidance"
+    assert_equals "0" "$overlap_exit" "done succeeds non-interactively when overlap detected"
+    assert_contains "$overlap_output" "Overlap noted in metadata" "done reports overlap as advisory not blocking"
 
     overlap_meta=$("$WV" show "$overlap_id" --json 2>&1)
-    assert_contains "$overlap_meta" "needs_human_verification" "done stores needs_human_verification metadata"
-    assert_contains "$overlap_meta" "acknowledge-overlap" "done stores resume command for pending close"
+    assert_contains "$overlap_meta" "learning_overlap_noted" "done stores learning_overlap_noted in closed node metadata"
+    assert_contains "$overlap_meta" '"status": "done"' "node is closed despite overlap"
 
-    overlap_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$overlap_id" --acknowledge-overlap 2>&1)
-    assert_contains "$overlap_output" "Closed" "done resumes pending close with acknowledge flag"
+    # --acknowledge-overlap still clears legacy pending_close state (backward compat)
+    local legacy_id legacy_meta legacy_exit legacy_output
+    legacy_id=$("$WV" add "Legacy stuck node" 2>&1 | tail -1)
+    legacy_meta=$(jq -n --arg node "$legacy_id" \
+        '{"needs_human_verification": true, "pending_close": {"reason": "learning_overlap", "overlap_with": "wv-fake", "learning": "test", "created_at": "2026-01-01T00:00:00Z", "resume_command": ("wv done " + $node + " --acknowledge-overlap")}}')
+    "$WV" update "$legacy_id" --metadata="$legacy_meta" >/dev/null 2>&1
+    legacy_exit=0
+    legacy_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$legacy_id" --acknowledge-overlap 2>&1) || legacy_exit=$?
+    assert_equals "0" "$legacy_exit" "done clears legacy pending_close with --acknowledge-overlap"
+    assert_contains "$legacy_output" "Closed" "acknowledge-overlap closes legacy stuck node"
 }
 
 # ============================================================================

@@ -390,8 +390,8 @@ _aggregate_epic_commits() {
 _done_skip_learning=false
 
 # Store learning in node metadata with FTS5 dedup check and format suggestion.
-# Sets _done_skip_learning=true if user chose to skip/dedup.
-# Sets _done_pending_close=true if overlap needs explicit human acknowledgement.
+# Sets _done_skip_learning=true if user chose to skip/dedup (interactive only).
+# Non-interactive: records learning_overlap_noted in metadata as advisory; does NOT block.
 # Args: $1=id, $2=learning text (already ANSI-stripped), $3=acknowledge overlap (0/1)
 _done_read_metadata() {
     local id="$1"
@@ -408,6 +408,8 @@ _done_can_prompt_overlap() {
     [ "${WV_NONINTERACTIVE:-0}" != "1" ] && [ -z "${CI:-}" ] && [ -t 0 ] && [ -t 2 ]
 }
 
+# Reserved for future genuinely-blocking close conditions (not learning overlap).
+# Currently only called by --acknowledge-overlap recovery path in cmd_done.
 _done_mark_pending_close() {
     local id="$1" learning="$2" overlap_id="$3"
     local cur_meta new_meta created_at resume_cmd
@@ -480,11 +482,19 @@ _done_store_learning() {
                         ;;
                 esac
             else
-                _done_mark_pending_close "$id" "$learning" "$fts_match"
-                _done_pending_close=true
-                echo -e "${YELLOW}  → Pending close recorded for human verification${NC}" >&2
-                echo -e "${YELLOW}  → inspect overlap: wv show $fts_match${NC}" >&2
-                echo -e "${YELLOW}  → resume with: wv done $id --acknowledge-overlap${NC}" >&2
+                # Non-interactive: record overlap as advisory audit trail and proceed.
+                # Overlap is a quality heuristic, not a data integrity constraint —
+                # blocking automated callers (agents, CI, sync) causes stuck nodes.
+                # Note: _done_read_metadata is called again below to store the learning
+                # key; it does a fresh SELECT so learning_overlap_noted is preserved.
+                local cur_meta new_meta
+                cur_meta=$(_done_read_metadata "$id")
+                new_meta=$(echo "$cur_meta" | jq \
+                    --arg overlap_id "$fts_match" \
+                    '. + {learning_overlap_noted: $overlap_id}' 2>/dev/null || echo "$cur_meta")
+                new_meta="${new_meta//\'/\'\'}"
+                db_query "UPDATE nodes SET metadata='$new_meta', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+                echo -e "${YELLOW}  → Overlap noted in metadata (learning_overlap_noted: $fts_match), proceeding.${NC}" >&2
             fi
         fi
     fi
@@ -1354,6 +1364,9 @@ cmd_show() {
             [ -n "$node_alias" ] && echo -e "${CYAN}Alias:${NC}    $node_alias"
             echo -e "${CYAN}Text:${NC}     $text"
             echo -e "${CYAN}Status:${NC}   $status"
+            local _intent
+            _intent=$(echo "$metadata" | jq -r '.current_intent // empty' 2>/dev/null)
+            [ -n "$_intent" ] && echo -e "${CYAN}Intent:${NC}   $_intent"
             echo -e "${CYAN}Metadata:${NC} $metadata"
             echo -e "${CYAN}Created:${NC}  $created"
             echo -e "${CYAN}Updated:${NC}  $updated"
@@ -1380,8 +1393,13 @@ cmd_status() {
     local active=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active';")
     local ready=$(cmd_ready --count)
     local blocked=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='blocked';")
+    local pending_close=$(db_query "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '$.needs_human_verification') = 1;")
 
-    echo "Work: $active active, $ready ready, $blocked blocked."
+    if [ "${pending_close:-0}" -gt 0 ] 2>/dev/null; then
+        echo "Work: $active active, $ready ready, $blocked blocked. $pending_close pending-close."
+    else
+        echo "Work: $active active, $ready ready, $blocked blocked."
+    fi
 
     if [ "$active" -gt 0 ]; then
         local primary
@@ -1405,6 +1423,68 @@ cmd_status() {
             echo "Current: $current"
         fi
     fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_pending_close — List nodes awaiting human verification before close
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_pending_close() {
+    local json_mode=false count_only=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json)  json_mode=true ;;
+            --count) count_only=true ;;
+            *) echo -e "${RED}Unknown option: $1${NC}" >&2; return 1 ;;
+        esac
+        shift
+    done
+
+    if [ "$count_only" = true ]; then
+        db_query "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '$.needs_human_verification') = 1;"
+        return 0
+    fi
+
+    local nodes
+    nodes=$(db_query "
+        SELECT id || '|' ||
+               COALESCE(text,'') || '|' ||
+               COALESCE(json_extract(metadata, '$.pending_close.reason'), '') || '|' ||
+               COALESCE(json_extract(metadata, '$.pending_close.resume_command'), '')
+        FROM nodes
+        WHERE json_extract(metadata, '$.needs_human_verification') = 1
+        ORDER BY updated_at DESC;")
+
+    if [ -z "$nodes" ]; then
+        if [ "$json_mode" = true ]; then
+            echo "[]"
+        else
+            echo "No pending-close nodes."
+        fi
+        return 0
+    fi
+
+    if [ "$json_mode" = true ]; then
+        echo "$nodes" | jq -R -s '
+            split("\n") | map(select(. != "")) |
+            map(split("|") | {id: .[0], text: .[1], reason: .[2], resume_command: .[3]})
+        '
+        return 0
+    fi
+
+    local count
+    count=$(echo "$nodes" | grep -c .)
+    echo "Pending-close: $count node(s) awaiting human verification."
+    while IFS='|' read -r nid ntext reason resume_cmd; do
+        [ -z "$nid" ] && continue
+        echo "  $nid: $ntext"
+        [ -n "$reason" ]     && echo "    Reason:  $reason"
+        if [ -n "$resume_cmd" ]; then
+            echo "    Resume:  $resume_cmd"
+        else
+            echo "    Resume:  wv update $nid --metadata='{\"verification\":{\"method\":\"...\",\"result\":\"pass\"}}' && wv done $nid"
+        fi
+    done <<< "$nodes"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

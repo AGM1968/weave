@@ -110,6 +110,7 @@ main() {
         list)   cmd_list "$@" ;;
         show)   _resolve_first_id cmd_show "$@" ;;
         status) cmd_status "$@" ;;
+        pending-close) cmd_pending_close "$@" ;;
         update) _resolve_first_id cmd_update "$@" ;;
         quick)  cmd_quick "$@" ;;
         ship)   _resolve_first_id cmd_ship "$@" ;;

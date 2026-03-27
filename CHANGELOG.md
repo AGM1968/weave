@@ -2,6 +2,43 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.27.0] - 2026-03-27
+
+### Added
+
+- **Session continuity** — `session-start-context.sh` harvests the last user prompt from the Claude
+  JSONL transcript on session start, injecting it as context so agents can recover their intent
+  after a crash or restart. `wv show` displays `current_intent` when present in node metadata.
+  Graph-first discipline rule added to CLAUDE.md: intent not in the graph does not survive a crash.
+- **`wv done --acknowledge-overlap` flag** — when `wv done` detects a learning overlap that requires
+  human acknowledgement, it now sets `pending_close` + `needs_human_verification` metadata
+  (advisory) instead of blocking on stdin. Non-interactive callers (agents, CI) resume with
+  `wv done <id> --acknowledge-overlap` rather than hanging. Human-interactive sessions still receive
+  the advisory prompt.
+- **`pending_close` visibility** — `wv show`, `wv status`, and `wv list` surface nodes in
+  `pending_close` state with a distinct indicator so agents and humans can identify work awaiting
+  acknowledgement.
+
+### Fixed
+
+- **`pre-close-verification.sh` hook schema** — the hook was emitting `"DENY"` (uppercase) in the
+  `permissionDecision` field, which Claude silently ignores (case-sensitive: must be `"deny"`). Also
+  corrected the exit code (was exit 2 hard-block; soft-deny requires exit 0 + JSON body). This fix
+  restores the pre-close verification advisory for agents using `wv done`.
+- **`wv done` non-interactive overlap** — learning overlap that required human acknowledgement
+  previously blocked on `read` (stdin), hanging agentic callers indefinitely. Now emits an advisory
+  and stores `learning_overlap_noted` in metadata without blocking.
+- **GH sync assignee hardening** — `claimed_by` is a local hostname, not a GitHub login. The sync
+  now validates assignees via `gh api repos/{repo}/assignees/{login}` before use, caches invalid
+  logins per-session, and never includes `--assignee` in `gh issue create` (best-effort post-create
+  only). Prevents repeated failed API calls on every sync cycle.
+
+### Tests
+
+- **JSONL bridge tests** — `tests/test-hooks.sh` gains 4 tests covering the session-continuity JSONL
+  bridge: context injection on session start, graceful handling of missing/malformed JSONL, and
+  current_intent round-trip via `wv show --json`.
+
 ## [1.26.5] - 2026-03-25
 
 ### Fixed

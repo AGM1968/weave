@@ -364,9 +364,9 @@ set +e
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
-assert_contains "$OUTPUT" "Verification evidence required" "pre-close: warns when no verification metadata for real Bash payload"
-assert_contains "$OUTPUT" "\"permissionDecision\": \"DENY\"" "pre-close: uses permissionDecision DENY schema"
-assert_exit_code "2" "$EXIT_CODE" "pre-close: exits 2 (hard block) when no verification"
+assert_contains "$OUTPUT" "permissionDecisionReason" "pre-close: warns when no verification metadata for real Bash payload"
+assert_contains "$OUTPUT" "\"permissionDecision\": \"deny\"" "pre-close: uses hookSpecificOutput permissionDecision deny schema (lowercase)"
+assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 (soft deny) when no verification"
 
 # With --skip-verification flag (should pass)
 set +e
@@ -569,8 +569,8 @@ set +e
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $TASK_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
-assert_contains "$OUTPUT" "Verification evidence required" "lifecycle: close blocked without verification"
-assert_exit_code "2" "$EXIT_CODE" "lifecycle: close exits 2 (hard block) without verification"
+assert_contains "$OUTPUT" "permissionDecision" "lifecycle: close blocked without verification"
+assert_exit_code "0" "$EXIT_CODE" "lifecycle: close soft-denied without verification"
 
 # 6. Add verification and close (should be silent)
 "$WV" update "$TASK_ID" --metadata='{"verification":{"method":"test","command":"echo ok","result":"pass","evidence":"lifecycle test"}}' 2>/dev/null
@@ -678,6 +678,77 @@ else
     echo -e "${RED}✗${NC} context-guard: stale cache was refreshed"
     echo "  Cache age: ${AGE}s (expected < 60s)"
     TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# ============================================================
+# --- JSONL bridge: crash path includes last-prompt ---
+echo ""
+echo "--- session-start: JSONL bridge (crash path) ---"
+setup_test_env
+
+# Plant a crash sentinel
+echo '{"ts":"2026-03-27T00:00:00Z","active":["wv-aabbcc"]}' > "$WV_HOT_ZONE/.session_sentinel"
+
+# Create Claude JSONL in real HOME at the slug derived from the (unique) test project dir.
+# Using real HOME avoids breaking wv lib resolution inside the hook.
+_BRIDGE_SLUG=$(echo "$WV_PROJECT_DIR" | tr '/' '-')
+_BRIDGE_JSONL_DIR="$HOME/.claude/projects/${_BRIDGE_SLUG}"
+mkdir -p "$_BRIDGE_JSONL_DIR"
+printf '%s\n' \
+    '{"type":"summary","summary":"prev session"}' \
+    '{"type":"last-prompt","lastPrompt":"okay whats next on the list"}' \
+    > "$_BRIDGE_JSONL_DIR/session.jsonl"
+
+OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
+rm -rf "$_BRIDGE_JSONL_DIR"
+
+assert_contains "$OUTPUT" "CRASH DETECTED" "JSONL bridge: crash path emits CRASH DETECTED"
+assert_contains "$OUTPUT" "Last prompt:" "JSONL bridge: crash output includes Last prompt field"
+assert_contains "$OUTPUT" "okay whats next on the list" "JSONL bridge: crash output includes last-prompt text"
+
+# ============================================================
+# --- JSONL bridge: secondary detection path (no sentinel, active node) ---
+echo ""
+echo "--- session-start: JSONL bridge (secondary detection path) ---"
+setup_test_env
+
+# Active node but no sentinel (reboot recovery)
+# Must sync so wv load inside the hook restores this node from state.sql
+"$WV" add "Orphaned after reboot" --status=active 2>/dev/null
+"$WV" sync 2>/dev/null || true
+
+_BRIDGE2_JSONL_DIR="$HOME/.claude/projects/${_BRIDGE_SLUG}"
+mkdir -p "$_BRIDGE2_JSONL_DIR"
+printf '%s\n' \
+    '{"type":"last-prompt","lastPrompt":"sync state visibility"}' \
+    > "$_BRIDGE2_JSONL_DIR/session.jsonl"
+
+OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
+rm -rf "$_BRIDGE2_JSONL_DIR"
+
+assert_contains "$OUTPUT" "Last prompt:" "JSONL bridge: secondary detection includes Last prompt field"
+assert_contains "$OUTPUT" "sync state visibility" "JSONL bridge: secondary detection includes last-prompt text"
+
+# ============================================================
+# --- JSONL bridge: graceful degradation (no JSONL dir) ---
+echo ""
+echo "--- session-start: JSONL bridge (degradation, no JSONL) ---"
+setup_test_env
+
+# Crash sentinel with no JSONL for this (unique temp) project path — bridge must degrade
+echo '{"ts":"2026-03-27T00:01:00Z","active":["wv-ccddee"]}' > "$WV_HOT_ZONE/.session_sentinel"
+# _BRIDGE_SLUG dir was deleted above; real HOME has no JSONL for this slug
+
+OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
+assert_contains "$OUTPUT" "CRASH DETECTED" "JSONL bridge: crash detected even without JSONL"
+# Must not contain "Last prompt:" when no JSONL available
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$OUTPUT" | grep -qF "Last prompt:"; then
+    echo -e "${RED}✗${NC} JSONL bridge: degrades gracefully when no JSONL (unexpected Last prompt: found)"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+else
+    echo -e "${GREEN}✓${NC} JSONL bridge: degrades gracefully when no JSONL"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
 fi
 
 # ============================================================

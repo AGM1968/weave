@@ -135,10 +135,13 @@ close-time friction), turn it into tracked remediation immediately:
    - Otherwise create follow-up work instead of expanding scope silently.
 2. **Create remediation work in the graph**
    - Use `wv add "Task: ..." --gh --parent=<feature-or-epic>` for discovered repair work.
-   - If the current task cannot finish without the repair, block it: `wv block <current> --by=<new>`.
-   - If the repair is related but not blocking, link it with `wv link <new> <current> --type=relates_to`.
+   - If the current task cannot finish without the repair, block it:
+     `wv block <current> --by=<new>`.
+   - If the repair is related but not blocking, link it with
+     `wv link <new> <current> --type=relates_to`.
 3. **Leave breadcrumbs for the next step**
-   - Save what was detected, what was created, and what should happen next with `wv breadcrumbs save`.
+   - Save what was detected, what was created, and what should happen next with
+     `wv breadcrumbs save`.
 4. **Avoid unattended close-time stalls**
    - For non-interactive agent flows, prefer recording pending-close state and surfacing
      `needs_human_verification` rather than blocking indefinitely on stdin prompts.
@@ -160,6 +163,16 @@ close-time friction), turn it into tracked remediation immediately:
 7. **Capture learnings** — use `--learning="..."` on `wv done` for non-trivial work.
 8. **Bound session scope** — limit to 4-5 tasks per session. Context limits kill sessions mid-task.
 9. **No hook bypass** — never use `--no-verify` or `WV_SKIP_PRECOMMIT=1`.
+10. **Graph records intent, conversation implements it** — before discussing what to do next, create
+    the node. Intent not in the graph does not survive a crash or reboot.
+
+    ```
+    # Correct: node first, then discuss
+    wv add "sync-state visibility" --parent=<epic>  →  then plan and implement
+
+    # Wrong: intent lives only in chat
+    "Item 2 is sync-state visibility — here's the plan..."  [session ends — intent lost]
+    ```
 
 **Violation check:** If `wv status` shows 0 active nodes, STOP and claim one first.
 
