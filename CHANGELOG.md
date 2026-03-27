@@ -10,24 +10,20 @@
   JSONL transcript on session start, injecting it as context so agents can recover their intent
   after a crash or restart. `wv show` displays `current_intent` when present in node metadata.
   Graph-first discipline rule added to CLAUDE.md: intent not in the graph does not survive a crash.
-- **`wv done --acknowledge-overlap` flag** — when `wv done` detects a learning overlap that requires
-  human acknowledgement, it now sets `pending_close` + `needs_human_verification` metadata
-  (advisory) instead of blocking on stdin. Non-interactive callers (agents, CI) resume with
-  `wv done <id> --acknowledge-overlap` rather than hanging. Human-interactive sessions still receive
-  the advisory prompt.
-- **`pending_close` visibility** — `wv show`, `wv status`, and `wv list` surface nodes in
-  `pending_close` state with a distinct indicator so agents and humans can identify work awaiting
-  acknowledgement.
 
 ### Fixed
 
+- **`wv done` learning-overlap non-interactive fix** — v1.26.5 fixed the `needs_human_verification`
+  trigger path; this release fixes a second path: FTS5 similarity detecting a duplicate learning.
+  Both paths previously blocked on `read` (stdin), hanging agentic callers indefinitely. Now stores
+  `learning_overlap_noted` in metadata and exits cleanly. Resume with
+  `wv done <id> --acknowledge-overlap`. `pending_close` state is now visible in `wv show`,
+  `wv status`, and `wv list`.
 - **`pre-close-verification.sh` hook schema** — the hook was emitting `"DENY"` (uppercase) in the
   `permissionDecision` field, which Claude silently ignores (case-sensitive: must be `"deny"`). Also
-  corrected the exit code (was exit 2 hard-block; soft-deny requires exit 0 + JSON body). This fix
-  restores the pre-close verification advisory for agents using `wv done`.
-- **`wv done` non-interactive overlap** — learning overlap that required human acknowledgement
-  previously blocked on `read` (stdin), hanging agentic callers indefinitely. Now emits an advisory
-  and stores `learning_overlap_noted` in metadata without blocking.
+  corrected the exit code (was exit 2 hard-block; soft-deny requires exit 0 + JSON body). Distinct
+  from the v1.26.5 fix to the same file, which addressed payload parsing (false-positive blocks on
+  `wv work`).
 - **GH sync assignee hardening** — `claimed_by` is a local hostname, not a GitHub login. The sync
   now validates assignees via `gh api repos/{repo}/assignees/{login}` before use, caches invalid
   logins per-session, and never includes `--assignee` in `gh issue create` (best-effort post-create
