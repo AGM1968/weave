@@ -259,8 +259,9 @@ cmd_add() {
         return 1
     fi
 
-    # Dedup check: warn if similar non-done nodes exist (skip with --force)
-    if [ "$force" != "true" ]; then
+    # Dedup check: warn if similar non-done nodes exist (skip with --force or --parent)
+    # Child nodes naturally share vocabulary with their parent — skip for decomposition.
+    if [ "$force" != "true" ] && [ -z "$parent" ]; then
         if ! _add_dedup_check "$text"; then
             return 1
         fi
@@ -606,7 +607,7 @@ _done_close_gh_issue() {
     gh issue edit "$gh_num" --repo "$repo" --remove-label "weave:blocked" >/dev/null 2>&1 || true
 
     if gh issue close "$gh_num" --repo "$repo" --comment "$comment" >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_num"
+        echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_num" >&2
     else
         echo -e "${YELLOW}Warning: could not close GitHub issue #$gh_num${NC}" >&2
     fi
@@ -1901,7 +1902,7 @@ cmd_delete() {
             repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
             if [ -n "$repo" ]; then
                 gh issue close "$gh_num" --repo "$repo" --comment "Deleted from Weave graph (node \`$id\`)" 2>/dev/null && \
-                    echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_num" || \
+                    echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_num" >&2 || \
                     echo -e "${YELLOW}Warning: Could not close GitHub issue #$gh_num${NC}" >&2
             fi
         fi

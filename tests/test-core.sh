@@ -74,7 +74,7 @@ assert_contains() {
 
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    if echo "$haystack" | grep -qF "$needle"; then
+    if echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -94,7 +94,7 @@ assert_not_contains() {
 
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    if ! echo "$haystack" | grep -qF "$needle"; then
+    if ! echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -320,7 +320,7 @@ test_done() {
 
     overlap_meta=$("$WV" show "$overlap_id" --json 2>&1)
     assert_contains "$overlap_meta" "learning_overlap_noted" "done stores learning_overlap_noted in closed node metadata"
-    assert_contains "$overlap_meta" '"status": "done"' "node is closed despite overlap"
+    assert_contains "$overlap_meta" '"status":"done"' "node is closed despite overlap"
 
     # --acknowledge-overlap still clears legacy pending_close state (backward compat)
     local legacy_id legacy_meta legacy_exit legacy_output
@@ -529,6 +529,53 @@ test_status() {
 }
 
 # ============================================================================
+# Test: orphan prevention
+# ============================================================================
+test_orphan_prevention() {
+    echo ""
+    echo "Test: orphan prevention"
+    echo "======================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # Create an epic (type=epic in metadata) as root
+    local epic_id
+    epic_id=$("$WV" add "Root epic" --metadata='{"type":"epic"}' 2>&1 | tail -1)
+    assert_contains "$epic_id" "wv-" "epic created successfully"
+
+    # With an active epic, adding a task without --parent must fail
+    local output
+    output=$("$WV" add "Orphan task attempt" 2>&1 || true)
+    assert_contains "$output" "--parent" "orphan guard fires when active epic exists"
+    assert_contains "$output" "Error" "orphan guard prints error message"
+
+    # Verify the node was rolled back (guard deletes node on error)
+    # Note: the add output WILL contain wv-XXXX from the creation step before rollback.
+    # The correct check is that the node doesn't appear in the list after the failed add.
+    local list_output
+    list_output=$("$WV" list 2>&1)
+    assert_not_contains "$list_output" "Orphan task attempt" "orphan guard rolls back the node"
+
+    # With --parent specified, add succeeds
+    local child_id
+    child_id=$("$WV" add "Linked child task" --parent="$epic_id" 2>&1 | tail -1)
+    assert_contains "$child_id" "wv-" "add with --parent succeeds"
+
+    # With --force, add succeeds even without --parent
+    local forced_id
+    forced_id=$("$WV" add "Force-created task" --force 2>&1 | tail -1)
+    assert_contains "$forced_id" "wv-" "add with --force bypasses orphan guard"
+
+    # No active epics — task allowed without --parent (the gap that let wv-2efef5 exist)
+    # Mark the epic done so no active epics remain
+    "$WV" done "$epic_id" >/dev/null 2>&1
+    local free_id
+    free_id=$("$WV" add "No-parent task when no active epics" 2>&1 | tail -1)
+    assert_contains "$free_id" "wv-" "add without --parent allowed when no active epics exist"
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 main() {
@@ -539,6 +586,7 @@ main() {
     test_init
     test_init_recovery
     test_add
+    test_orphan_prevention
     test_done
     test_work
     test_list

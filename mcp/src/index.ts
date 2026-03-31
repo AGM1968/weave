@@ -138,7 +138,10 @@ function wv(args: string[], timeout: number = WV_TIMEOUT): string {
   }
   // Prefer stdout (structured output, --json). Fall back to stderr for commands
   // that write primary output there (legacy quality subcommands without --json).
-  return result.stdout?.trim() || result.stderr?.trim() || "";
+  const raw = result.stdout?.trim() || result.stderr?.trim() || "";
+  // Strip ANSI color codes — wv CLI uses colors for terminal output but MCP
+  // consumers (agents) receive plain text tool results.
+  return raw.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
 // Tool definitions
@@ -200,6 +203,10 @@ const TOOLS: Tool[] = [
           type: "string",
           description:
             "Parent node ID to link via 'implements' edge (e.g., 'wv-a1b2'). Prevents orphan tasks -- always set for non-epic nodes.",
+        },
+        force: {
+          type: "boolean",
+          description: "Skip similarity check and create node even if similar nodes exist.",
         },
       },
       required: ["text"],
@@ -292,13 +299,13 @@ const TOOLS: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        from: {
+        from_id: {
           type: "string",
-          description: "Source node ID",
+          description: "Source node ID (e.g. 'wv-a1b2')",
         },
-        to: {
+        to_id: {
           type: "string",
-          description: "Target node ID",
+          description: "Target node ID (e.g. 'wv-c3d4')",
         },
         type: {
           type: "string",
@@ -323,7 +330,7 @@ const TOOLS: Tool[] = [
           description: 'Edge context JSON (e.g. \'{"reason": "API dependency"}\')',
         },
       },
-      required: ["from", "to", "type"],
+      required: ["from_id", "to_id", "type"],
     },
   },
   {
@@ -520,7 +527,7 @@ const TOOLS: Tool[] = [
   {
     name: "weave_tree",
     description:
-      "View epic hierarchy as a tree. Returns JSON array (default) or Mermaid graph with status colors, implements/blocks edges, and aliases. Use mermaid=true for consistent dependency graphs.",
+      "View epic hierarchy as a tree. Returns readable text tree by default. Use mermaid=true for a Mermaid dependency graph, or json=true for raw JSON.",
     inputSchema: {
       type: "object",
       properties: {
@@ -534,7 +541,11 @@ const TOOLS: Tool[] = [
         },
         mermaid: {
           type: "boolean",
-          description: "Return Mermaid graph instead of JSON (default: false)",
+          description: "Return Mermaid graph instead of text tree (default: false)",
+        },
+        json: {
+          type: "boolean",
+          description: "Return raw JSON array instead of text tree (default: false)",
         },
         root: {
           type: "string",
@@ -853,16 +864,19 @@ function handleTool(
       const gh = args.gh as boolean | undefined;
       const alias = args.alias as string | undefined;
       const parent = args.parent as string | undefined;
+      const force = args.force as boolean | undefined;
       const cmd = ["add", text];
       if (status) cmd.push(`--status=${status}`);
       if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
       if (gh) cmd.push("--gh");
       if (alias) cmd.push(`--alias=${alias}`);
       if (parent) cmd.push(`--parent=${parent}`);
+      if (force) cmd.push("--force");
       result = wv(cmd);
-      // Enforcement warnings
+      // Enforcement warnings — suppress --gh nudge for child nodes (only epic needs a GH issue)
       const warnings: string[] = [];
-      if (!gh) warnings.push("WARNING: No --gh flag. Node has no GitHub issue. Use gh=true for traceability.");
+      if (!gh && !parent)
+        warnings.push("WARNING: No --gh flag. Node has no GitHub issue. Use gh=true for traceability.");
       if (!alias) warnings.push("WARNING: No alias set. Use alias parameter for readable node names.");
       if (warnings.length) result += "\n\n" + warnings.join("\n");
       break;
@@ -911,8 +925,8 @@ function handleTool(
     }
 
     case "weave_link": {
-      const from = args.from as string;
-      const to = args.to as string;
+      const from = args.from_id as string;
+      const to = args.to_id as string;
       const type = args.type as string;
       const weight = args.weight as number | undefined;
       const context = args.context as string | undefined;
@@ -1244,8 +1258,11 @@ function handleTool(
       const active = args.active as boolean | undefined;
       const depth = args.depth as number | undefined;
       const mermaid = args.mermaid as boolean | undefined;
+      const json = args.json as boolean | undefined;
       const root = args.root as string | undefined;
-      const cmd = ["tree", mermaid ? "--mermaid" : "--json"];
+      const cmd = ["tree"];
+      if (mermaid) cmd.push("--mermaid");
+      else if (json) cmd.push("--json");
       if (active) cmd.push("--active");
       if (depth !== undefined) cmd.push(`--depth=${depth}`);
       if (root) cmd.push(`--root=${root}`);
@@ -1397,7 +1414,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.27.0",
+      version: "1.28.4",
     },
     {
       capabilities: {

@@ -712,7 +712,7 @@ cmd_prune() {
                     gh issue close "$gh_num" --repo "$repo" \
                         --comment "Pruned from Weave graph (node \`$id\` archived after ${age})." \
                         >/dev/null 2>&1 && \
-                        echo -e "  ${GREEN}✓${NC} Closed GitHub issue #$gh_num ($id)" || \
+                        echo -e "  ${GREEN}✓${NC} Closed GitHub issue #$gh_num ($id)" >&2 || \
                         echo -e "  ${YELLOW}⚠${NC} Could not close GitHub issue #$gh_num ($id)" >&2
                 fi
             done
@@ -1579,10 +1579,16 @@ cmd_search() {
     fi
     
     db_ensure
-    
+
     # Ensure FTS5 table exists (migration for existing DBs)
     db_migrate_fts5
-    
+
+    # Auto-repair FTS5 if the index is corrupt (probe query to detect before use)
+    if ! sqlite3 "$WV_DB" "SELECT 1 FROM nodes_fts WHERE nodes_fts MATCH 'test' LIMIT 1;" \
+            >/dev/null 2>&1; then
+        db_reindex_fts5 >/dev/null 2>&1 || true
+    fi
+
     # Escape for FTS5: wrap in double quotes for safe phrase matching.
     # This prevents apostrophes and special FTS5 operators from causing syntax errors.
     # Internal double quotes are escaped by doubling them.

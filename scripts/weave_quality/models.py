@@ -12,10 +12,55 @@ Architecture matches the proposal's table separation:
   - ProjectMetrics: aggregate view (computed, not stored)
 """
 
+import ast
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
-from typing import Any
+from typing import Any, NotRequired, TypedDict
+
+
+# ── Database row TypedDicts ───────────────────────────────────────────────────
+
+class FileEntryRow(TypedDict):
+    """Row in the 'files' table (maps to FileEntry)."""
+    path: str
+    scan_id: int
+    language: str
+    loc: int
+    complexity: float
+    functions: int
+    max_nesting: int
+    avg_fn_len: float
+    essential_complexity: float
+    indent_sd: float
+    category: str
+
+
+class FileMetricRow(TypedDict):
+    """Row in the 'file_metrics' EAV table (maps to FunctionCC / CKMetrics)."""
+    path: str
+    scan_id: int
+    metric: str
+    value: float
+    detail: NotRequired[str]  # JSON string; present for FunctionCC rows
+
+
+class GitStatsRow(TypedDict):
+    """Row in the 'git_stats' table (maps to GitStats)."""
+    path: str
+    churn: int
+    authors: int
+    age_days: int
+    hotspot: float
+    ownership_fraction: float
+    minor_contributors: int
+
+
+class FileStateRow(TypedDict):
+    """Row in the 'file_state' table (maps to FileState)."""
+    path: str
+    mtime: int
+    git_blob: str
 
 
 @dataclass
@@ -37,21 +82,21 @@ class FileEntry:
     indent_sd: float = 0.0            # stddev of indentation levels
     category: str = "production"       # File category (e.g. production, test, generated)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> FileEntryRow:
         """Serialise to a flat dict suitable for DB insertion."""
-        return {
-            "path": self.path,
-            "scan_id": self.scan_id,
-            "language": self.language,
-            "loc": self.loc,
-            "complexity": self.complexity,
-            "functions": self.functions,
-            "max_nesting": self.max_nesting,
-            "avg_fn_len": self.avg_fn_len,
-            "essential_complexity": self.essential_complexity,
-            "indent_sd": self.indent_sd,
-            "category": self.category,
-        }
+        return FileEntryRow(
+            path=self.path,
+            scan_id=self.scan_id,
+            language=self.language,
+            loc=self.loc,
+            complexity=self.complexity,
+            functions=self.functions,
+            max_nesting=self.max_nesting,
+            avg_fn_len=self.avg_fn_len,
+            essential_complexity=self.essential_complexity,
+            indent_sd=self.indent_sd,
+            category=self.category,
+        )
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "FileEntry":
@@ -91,7 +136,7 @@ class FunctionCC:
     essential_complexity: float = 1.0
     is_dispatch: bool = False
 
-    def to_eav_row(self) -> dict[str, Any]:
+    def to_eav_row(self) -> FileMetricRow:
         """Convert to file_metrics EAV row dict."""
         detail = json.dumps({
             "line_start": self.line_start,
@@ -99,13 +144,13 @@ class FunctionCC:
             "is_dispatch": self.is_dispatch,
             "essential_complexity": self.essential_complexity,
         })
-        return {
-            "path": self.path,
-            "scan_id": self.scan_id,
-            "metric": f"fn_cc:{self.function_name}@{self.line_start}",
-            "value": self.complexity,
-            "detail": detail,
-        }
+        return FileMetricRow(
+            path=self.path,
+            scan_id=self.scan_id,
+            metric=f"fn_cc:{self.function_name}@{self.line_start}",
+            value=self.complexity,
+            detail=detail,
+        )
 
 
 @dataclass
@@ -139,7 +184,7 @@ class ASTAnalysis:
     max_nesting: int = 0
     functions: list[FunctionDetail] = field(default_factory=list)
     imports: set[str] = field(default_factory=set)
-    class_nodes: list[Any] = field(default_factory=list)
+    class_nodes: list[ast.ClassDef] = field(default_factory=list)
 
     @property
     def function_count(self) -> int:
@@ -180,10 +225,10 @@ class CKMetrics:
     # Standard CK metric names (direct_bases replaces dit — see Issue 5)
     VALID_METRICS = {"wmc", "cbo", "direct_bases", "dit", "rfc", "lcom", "noc"}
 
-    def to_rows(self) -> list[dict[str, Any]]:
+    def to_rows(self) -> list[FileMetricRow]:
         """Convert to list of EAV row dicts for DB insertion."""
         return [
-            {"path": self.path, "scan_id": self.scan_id, "metric": k, "value": v}
+            FileMetricRow(path=self.path, scan_id=self.scan_id, metric=k, value=v)
             for k, v in self.metrics.items()
             if k in self.VALID_METRICS
         ]
@@ -218,17 +263,17 @@ class GitStats:
     ownership_fraction: float = 0.0  # top-author commits / total commits
     minor_contributors: int = 0       # authors with < 5% of commits
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> GitStatsRow:
         """Serialise to a flat dict suitable for DB insertion."""
-        return {
-            "path": self.path,
-            "churn": self.churn,
-            "authors": self.authors,
-            "age_days": self.age_days,
-            "hotspot": self.hotspot,
-            "ownership_fraction": self.ownership_fraction,
-            "minor_contributors": self.minor_contributors,
-        }
+        return GitStatsRow(
+            path=self.path,
+            churn=self.churn,
+            authors=self.authors,
+            age_days=self.age_days,
+            hotspot=self.hotspot,
+            ownership_fraction=self.ownership_fraction,
+            minor_contributors=self.minor_contributors,
+        )
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "GitStats":
@@ -268,13 +313,13 @@ class FileState:
     mtime: int = 0                # File modification time (epoch seconds)
     git_blob: str = ""            # git hash-object result (blob SHA)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> FileStateRow:
         """Serialize to plain dict."""
-        return {
-            "path": self.path,
-            "mtime": self.mtime,
-            "git_blob": self.git_blob,
-        }
+        return FileStateRow(
+            path=self.path,
+            mtime=self.mtime,
+            git_blob=self.git_blob,
+        )
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "FileState":

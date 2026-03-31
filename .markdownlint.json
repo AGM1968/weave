@@ -9,5 +9,6 @@
   "MD033": {
     "allowed_elements": ["antml:function_calls", "antml:invoke", "antml:parameter"]
   },
-  "MD041": false
+  "MD041": false,
+  "MD060": false
 }

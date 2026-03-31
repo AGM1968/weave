@@ -2,6 +2,74 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.28.4] - 2026-03-31
+
+### Documentation
+
+- **No duplicate background commands rule** — `WORKFLOW.md` rule 10 and runtime system prompt rule
+  12 now explicitly prohibit re-issuing long-running commands (`make check`, `wv sync --gh`,
+  `npm run build`, `git push`) before their background completion notification arrives. Prevents
+  double syncs, wasted build time, and conflicting writes.
+
+## [1.28.3] - 2026-03-31
+
+### Fixed
+
+- **Similarity check for decomposition** — `wv add --parent` now skips the FTS5 similarity check.
+  Child nodes naturally share vocabulary with their parent; the check was blocking most
+  decomposition tasks and requiring `--force` on every node.
+- **`weave_tree` MCP default** — returns a readable text tree by default instead of a raw JSON blob.
+  Agents can opt into `json=true` or `mermaid=true` when those formats are needed.
+- **Graph sidebar "Issues" header** — dimmed the static "Issues" prefix so the active filter tab
+  carries the visual weight rather than the label.
+
+## [1.28.2] - 2026-03-31
+
+### Fixed
+
+- **MCP ANSI stripping** — all 31 MCP tools were returning raw ANSI color codes (e.g. `\x1b[0;32m`)
+  to agent consumers. Fixed in the `wv()` helper so the strip applies once for all tools.
+- **`weave_add` force param** — passing `force: true` via MCP was silently ignored; the `--force`
+  flag was never forwarded to the CLI. Now wired through correctly.
+- **`weave_link` param names** — schema used `from`/`to` but agents consistently inferred
+  `from_id`/`to_id` from the "Source node ID" description, causing schema validation errors. Renamed
+  to `from_id`/`to_id` throughout schema and handler.
+- **`weave_add` --gh warning noise** — the "No --gh flag" enforcement warning fired on every child
+  node created with `--parent`. Suppressed for child nodes; only orphan epics need a GitHub issue.
+
+## [1.28.1] - 2026-03-31
+
+### Fixed
+
+- **Workflow sequence** — `WORKFLOW.md` Core Workflow now shows the correct 8-step sequence:
+  pre-flight (`git status && wv status`), commit work files before `wv done`, `wv sync --gh`, commit
+  `.weave/` state if dirty, then push. Previously showed `wv sync` (no `--gh`) with no pre-flight or
+  `.weave/` commit step. Runtime agent fallback updated to match.
+
+## [1.28.0] - 2026-03-31
+
+### Added
+
+- **`wv_list` MCP tool** — new MCP tool enumerates nodes by status, enabling agents to query the
+  graph without a shell. Adds `status` filter parameter; returns `[]` on empty result.
+
+### Fixed
+
+- **FTS5 auto-repair** — `wv search` now detects and repairs a corrupted FTS5 index automatically
+  before returning results. Added `wv_search` synonym guidance for MCP callers.
+- **E2 gate tightening** — pre-action hook now blocks stale active nodes that were not claimed in
+  the current session, preventing ghost-active nodes from bypassing the no-edit guard.
+- **Dynamic context-load-policy** — system prompt now injects the current context load policy
+  (HIGH/MEDIUM/LOW) at runtime rather than a static default; adds small-file exemption so files
+  under 200 lines are always readable regardless of policy level.
+- **Review-epic-fidelity skill** — widened trigger pattern and made step 0 unconditional so the
+  skill fires reliably on all epic review requests.
+
+### CI
+
+- **Bandit static analysis** — `make check` now runs `bandit` (Python security linter) as part of
+  the full quality gate.
+
 ## [1.27.0] - 2026-03-27
 
 ### Added

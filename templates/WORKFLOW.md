@@ -6,12 +6,15 @@ Canonical reference for `wv` — the task graph CLI for AI coding agents. Full d
 ## Core Workflow
 
 ```txt
+git status && wv status           # 0. Pre-flight — check state before acting
 wv ready                          # 1. Find unblocked work
 wv work <id>                      # 2. Claim it (sets active)
 # ... do the work ...
-wv done <id> --learning="..."     # 3. Complete with learnings
-wv sync                           # 4. Persist to .weave/
-git push                          # 5. MANDATORY before session end
+git commit                        # 3. Commit work files (before wv done)
+wv done <id> --learning="..."     # 4. Complete with learnings
+wv sync --gh                      # 5. Sync graph + GH (may dirty .weave/)
+git add .weave/ && git commit     # 6. Commit graph state if dirty
+git push                          # 7. MANDATORY before session end
 ```
 
 Never edit a file without an active node. If `wv status` shows 0 active, run `wv work <id>` first.
@@ -163,7 +166,11 @@ close-time friction), turn it into tracked remediation immediately:
 7. **Capture learnings** — use `--learning="..."` on `wv done` for non-trivial work.
 8. **Bound session scope** — limit to 4-5 tasks per session. Context limits kill sessions mid-task.
 9. **No hook bypass** — never use `--no-verify` or `WV_SKIP_PRECOMMIT=1`.
-10. **Graph records intent, conversation implements it** — before discussing what to do next, create
+10. **No duplicate background commands** — before issuing any long-running command (`make check`,
+    `wv sync --gh`, `npm run build`, `git push`), verify it is not already running. If a command
+    goes to background, wait for its completion notification before re-issuing. Running the same
+    command twice causes double syncs, wasted CI time, and conflicting writes.
+11. **Graph records intent, conversation implements it** — before discussing what to do next, create
     the node. Intent not in the graph does not survive a crash or reboot.
 
     ```

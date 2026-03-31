@@ -1,12 +1,12 @@
 [project]
 name = "weave-workflow"
-version = "1.27.0"
+version = "1.28.4"
 description = "Token-optimized memory system for agentic workflows"
 authors = [
     {name = "AGM1968",email = "AGM1968@users.noreply.github.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<4.0"
 dependencies = []
 
 [tool.poetry]
@@ -23,4 +23,11 @@ omit = ["scripts/*.py", "scripts/*.sh"]
 
 [tool.coverage.report]
 relative_files = true
+
+[tool.bandit]
+# B101: assert_used — safe in tests; B404: subprocess import warning — too noisy.
+# B602: shell=True subprocess — hard-fail if regressed (we fixed CWE-78 in Sprint 2a).
+# B603: subprocess without shell=True — expected for intentional CLI wrappers.
+# B607: partial executable path — expected for "wv" binary name.
+skips = ["B101", "B404"]
 

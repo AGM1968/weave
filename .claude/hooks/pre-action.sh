@@ -102,6 +102,33 @@ EOF
     exit 2
 fi
 
+# Stale-node check: active node must have been claimed in the current session.
+# Prevents silently inheriting a node from a prior session without explicit re-claim.
+SESSION_EPOCH_FILE="${_PA_HOT_ZONE}/.session_epoch"
+if [ -f "$SESSION_EPOCH_FILE" ]; then
+    SESSION_EPOCH=$(cat "$SESSION_EPOCH_FILE" 2>/dev/null || echo "0")
+    NODE_UPDATED=$(echo "$ACTIVE_NODES" | jq -r '.[0].updated_at // empty' 2>/dev/null || echo "")
+    if [ -n "$NODE_UPDATED" ] && [ -n "$SESSION_EPOCH" ] && [ "$SESSION_EPOCH" != "0" ]; then
+        NODE_EPOCH=$(date -d "$NODE_UPDATED" +%s 2>/dev/null || echo "0")
+        STALE_ID=$(echo "$ACTIVE_NODES" | jq -r '.[0].id' 2>/dev/null || echo "?")
+        STALE_TEXT=$(echo "$ACTIVE_NODES" | jq -r '.[0].text // "[unknown]"' 2>/dev/null || echo "[unknown]")
+        if [ "$NODE_EPOCH" -gt 0 ] && [ "$NODE_EPOCH" -lt "$SESSION_EPOCH" ]; then
+            cat >&2 <<EOF
+⚠️  Stale active node not claimed this session: $STALE_ID
+"$STALE_TEXT"
+
+This node was active before the current session started. Explicitly re-claim
+it before editing to confirm this is the work you intend to do:
+  wv work $STALE_ID
+
+Or create a new node if this is different work:
+  wv add "<description>" --status=active
+EOF
+            exit 2
+        fi
+    fi
+fi
+
 if [ "$ACTIVE_COUNT" -gt "1" ]; then
     # Multiple active nodes — use primary if set, otherwise warn
     PRIMARY_FILE="${WV_HOT_ZONE:-/dev/shm/weave}/primary"

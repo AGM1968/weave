@@ -742,7 +742,7 @@ _recover_delete() {
             repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
             if [ -n "$repo" ]; then
                 gh issue close "$gh_issue" --repo "$repo" 2>/dev/null && \
-                    echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_issue" || \
+                    echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_issue" >&2 || \
                     echo -e "${YELLOW}Warning: Could not close issue${NC}" >&2
             fi
         fi
