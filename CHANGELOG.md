@@ -2,6 +2,15 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.28.9] - 2026-03-31
+
+### Improved
+
+- **Copilot instructions template** — expanded from minimal stub to full workflow guide: pre-flight
+  check (`git status && wv status`), core 4-step loop with order warning, `wv quick`/`wv ship`
+  shortcuts, terminal discipline (`echo "s" | wv done` pipe for VS Code), and structured learnings
+  format. Applied on `wv-init-repo --agent=copilot` and `--update`.
+
 ## [1.28.8] - 2026-03-31
 
 ### Added
