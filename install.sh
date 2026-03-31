@@ -1156,6 +1156,7 @@ if [ "$WITH_MCP" = "1" ]; then
             cp -r ./mcp/src "$mcp_dir/" 2>/dev/null || true
             (cd "$mcp_dir" && npm install --production=false --silent 2>&1 | tail -1 && npm run build --silent 2>&1) && {
                 echo -e "${GREEN}✓ MCP server built${NC}"
+                echo -e "${YELLOW}  ↻ Restart your Claude session for MCP changes to take effect${NC}"
                 echo "$mcp_dir" >> "$MANIFEST"
             } || {
                 echo -e "${RED}✗ MCP server build failed${NC}"
@@ -1169,6 +1170,7 @@ if [ "$WITH_MCP" = "1" ]; then
             curl -sSL "$mcp_repo/src/index.ts" -o "$mcp_dir/src/index.ts"
             (cd "$mcp_dir" && npm install --production=false --silent 2>&1 | tail -1 && npm run build --silent 2>&1) && {
                 echo -e "${GREEN}✓ MCP server built${NC}"
+                echo -e "${YELLOW}  ↻ Restart your Claude session for MCP changes to take effect${NC}"
                 echo "$mcp_dir" >> "$MANIFEST"
             } || {
                 echo -e "${RED}✗ MCP server build failed${NC}"

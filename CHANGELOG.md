@@ -2,6 +2,14 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.28.5] - 2026-03-31
+
+### Fixed
+
+- **Session restart notice** — `install.sh` now prints a restart reminder after every successful MCP
+  rebuild. The MCP server process caches the old binary in memory; changes are not live until the
+  session is restarted. Also added as step 8 in the dev-guide release sequence.
+
 ## [1.28.4] - 2026-03-31
 
 ### Documentation
