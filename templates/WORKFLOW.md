@@ -149,6 +149,15 @@ close-time friction), turn it into tracked remediation immediately:
    - For non-interactive agent flows, prefer recording pending-close state and surfacing
      `needs_human_verification` rather than blocking indefinitely on stdin prompts.
    - Humans can resume and approve explicitly; agents should stop in a resumable state, not hang.
+5. **Classify errors before retrying**
+   - Transient (network blip, lock contention, flaky test): retry once with brief backoff; if it
+     fails again, escalate rather than loop.
+   - Blocker (missing dependency, broken invariant, unresolved conflict): create a recovery node
+     with `wv add "Fix: ..." --parent=<current>`, block current work with `wv block`, and surface
+     the blocker clearly.
+   - User-required (ambiguous spec, insufficient permissions, policy decision): stop and surface the
+     gap explicitly. Do not guess or paper over it — unresolved ambiguity compounds into larger
+     failures downstream.
 
 ## Rules
 
@@ -180,6 +189,11 @@ close-time friction), turn it into tracked remediation immediately:
     # Wrong: intent lives only in chat
     "Item 2 is sync-state visibility — here's the plan..."  [session ends — intent lost]
     ```
+
+12. **Verify assumptions before acting** — before relying on a file path, function name, API, or
+    structure that has not been read in this session, grep or read to confirm it exists and matches
+    expectations. Do not propagate unvalidated beliefs across multiple steps. If prior context was
+    summarised or compacted, treat named artefacts as unverified until re-read.
 
 **Violation check:** If `wv status` shows 0 active nodes, STOP and claim one first.
 

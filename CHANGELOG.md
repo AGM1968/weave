@@ -2,6 +2,16 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.28.6] - 2026-03-31
+
+### Added
+
+- **WORKFLOW.md — Repair Workflow step 5**: Error classification tiers — transient/retry,
+  blocker/recovery-node, user-required/stop. Prevents blind retry loops and ambiguity
+  being papered over.
+- **WORKFLOW.md — Rule 12**: Verify assumptions before acting — confirm file paths, function
+  names, and APIs before relying on them; treat compacted session context as unverified.
+
 ## [1.28.5] - 2026-03-31
 
 ### Fixed
