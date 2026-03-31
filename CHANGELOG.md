@@ -2,6 +2,15 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.28.7] - 2026-03-31
+
+### Fixed
+
+- **`wv-bootstrap` state guard** — skips `git pull` if `state.sql` has uncommitted changes,
+  preventing the pull from clobbering local graph state loaded into the hot zone.
+- **`wv-close` auto-commit** — automatically commits `.weave/` after `wv sync --gh` when there are
+  staged changes, so session-end state persists without a manual commit step.
+
 ## [1.28.6] - 2026-03-31
 
 ### Added
