@@ -2,6 +2,13 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.28.8] - 2026-03-31
+
+### Added
+
+- **`wv list --limit=N`** — cap node output at N rows (SQL-level, default uncapped). Prevents
+  context overflow when listing large done/todo sets. Valid range: 1–200.
+
 ## [1.28.7] - 2026-03-31
 
 ### Fixed

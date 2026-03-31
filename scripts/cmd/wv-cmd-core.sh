@@ -1233,17 +1233,27 @@ cmd_list() {
     local type_filter=""
     local format="text"
     local all=false
+    local limit_val=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --status=*) status_filter="${1#*=}" ;;
             --priority=*) priority_filter="${1#*=}" ;;
             --type=*) type_filter="${1#*=}" ;;
+            --limit=*) limit_val="${1#*=}" ;;
             --json) format="json" ;;
             --all) all=true ;;
         esac
         shift
     done
+
+    # Validate limit (must be a positive integer)
+    if [ -n "$limit_val" ]; then
+        if ! [[ "$limit_val" =~ ^[0-9]+$ ]] || [ "$limit_val" -lt 1 ]; then
+            echo -e "${RED}Error: --limit must be a positive integer${NC}" >&2
+            return 1
+        fi
+    fi
 
     # Validate status filter (prevent SQL injection)
     if [ -n "$status_filter" ]; then
@@ -1303,13 +1313,16 @@ cmd_list() {
         where_clause="WHERE $filters"
     fi
 
+    local limit_clause=""
+    [ -n "$limit_val" ] && limit_clause="LIMIT $limit_val"
+
     if [ "$format" = "json" ]; then
         local results
-        results=$(db_query_json "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC;")
+        results=$(db_query_json "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
         [ -z "$results" ] && echo "[]" || echo "$results"
     else
         # Text mode: exclude metadata to avoid multiline JSON breaking pipe-delimited parsing
-        db_query "SELECT id, text, status FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC;" | while IFS='|' read -r id text status; do
+        db_query "SELECT id, text, status FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;" | while IFS='|' read -r id text status; do
             local color="$NC"
             case "$status" in
                 active) color="$GREEN" ;;
