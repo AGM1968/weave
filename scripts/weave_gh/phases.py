@@ -606,6 +606,7 @@ def sync_github_to_weave(
                     "add",
                     issue.title,
                     f"--metadata={json.dumps(meta)}",
+                    "--standalone",
                 )
                 new_id = result.strip().split("\n")[-1].strip()
                 if new_id:
