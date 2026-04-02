@@ -2,6 +2,22 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.29.1] - 2026-04-02
+
+### Fixed
+
+- **`wv prune --orphans-only` now skips the age filter** — previously the age clause was always
+  applied, so done orphans touched by `wv sync --gh` today were silently excluded. `--orphans-only`
+  now targets all unlinked done nodes regardless of age; the orphan filter is its own safety
+  constraint.
+
+### Docs
+
+- **Graph Hygiene section** added to `templates/WORKFLOW.md` — `--orphans-only` vs `--age=`
+  distinction, classify-before-prune checklist.
+- **Orphan nodes pitfall** in `.github/copilot-instructions.md` expanded with classify-first
+  workflow and `--orphans-only` guidance.
+
 ## [1.29.0] - 2026-04-02
 
 ### Added

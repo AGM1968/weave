@@ -637,13 +637,18 @@ cmd_prune() {
     fi
 
     # Minimum age guard: reject 0h/0d to prevent accidental mass deletion
-    if [ "$age_num" -eq 0 ]; then
+    # (bypassed when --orphans-only: the orphan filter is its own safety constraint)
+    if [ "$age_num" -eq 0 ] && [ "$orphans_only" = false ]; then
         echo -e "${RED}Error: age=0 would delete all done nodes — use a positive value${NC}" >&2
         return 1
     fi
 
-    local sql_age="-${age_num} ${age_unit}"
-    
+    # Build age clause — skipped entirely for --orphans-only (no age gate needed)
+    local age_clause=""
+    if [ "$orphans_only" = false ]; then
+        age_clause="AND updated_at < datetime('now', '-${age_num} ${age_unit}')"
+    fi
+
     # Build orphan filter clause
     local orphan_clause=""
     if [ "$orphans_only" = true ]; then
@@ -654,7 +659,7 @@ cmd_prune() {
     local candidates=$(db_query "
         SELECT id, text, updated_at FROM nodes
         WHERE status = 'done'
-        AND updated_at < datetime('now', '$sql_age')
+        $age_clause
         $orphan_clause
         AND id NOT IN (
             SELECT n.id FROM nodes n

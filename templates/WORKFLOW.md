@@ -44,7 +44,7 @@ Never edit a file without an active node. If `wv status` shows 0 active, run `wv
 | `wv health`               | System health check with score                     | `--json`, `--verbose`, `--fix`                               |
 | `wv sync`                 | Dump to `.weave/state.sql`                         | `--gh` for GH sync, `--dry-run`                              |
 | `wv load`                 | Restore from `.weave/state.sql`                    | Run by session start hook                                    |
-| `wv prune`                | Archive done nodes >48h                            | `--age=`, `--dry-run`                                        |
+| `wv prune`                | Archive done nodes >48h                            | `--age=`, `--orphans-only`, `--dry-run`                      |
 | `wv quality scan`         | Scan repo for complexity + churn                   | `--exclude=`, `--json`                                       |
 | `wv quality hotspots`     | Ranked hotspot report                              | `--top=N`, `--json`                                          |
 
@@ -196,6 +196,29 @@ close-time friction), turn it into tracked remediation immediately:
     summarised or compacted, treat named artefacts as unverified until re-read.
 
 **Violation check:** If `wv status` shows 0 active nodes, STOP and claim one first.
+
+## Graph Hygiene
+
+Run `wv health` periodically to catch drift. Key maintenance commands:
+
+```bash
+wv health                        # score + orphan/ghost-edge counts
+wv prune --age=7d --dry-run      # preview stale done nodes
+wv prune --age=7d                # archive done nodes not updated in 7 days
+wv prune --orphans-only          # archive done nodes with no edges (ignores age)
+```
+
+**`--orphans-only` vs `--age=`:**
+
+- `--age=Nd` uses `updated_at` — misses nodes touched today by `wv sync --gh`
+- `--orphans-only` targets unlinked done nodes regardless of age — use this after a sync that
+  bulk-closed nodes, or after a graph repair session
+
+**Before pruning, classify orphans first:**
+
+1. Garbage/test fixtures → `wv delete <id>`
+2. Real work without a parent → `wv link <id> <epic> --type=implements`
+3. Legitimate standalones (releases, chores) → `wv prune --orphans-only`
 
 ## Session End Behavior
 
