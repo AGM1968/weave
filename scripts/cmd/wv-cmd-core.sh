@@ -227,7 +227,7 @@ cmd_add() {
             --alias=*) alias="${1#*=}" ;;
             --parent=*) parent="${1#*=}" ;;
             --gh) create_gh=true ;;
-            --force) force=true ;;
+            --force|--standalone) force=true ;;
             --json) format="json" ;;
             --*) ;; # skip unrecognized flags
             *) text="$text $1" ;;
@@ -237,7 +237,7 @@ cmd_add() {
 
     if [ -z "$text" ]; then
         echo -e "${RED}Error: text required${NC}" >&2
-        echo "Usage: wv add \"task description\" [--status=todo|active|done|blocked] [--parent=<id>] [--gh] [--force]" >&2
+        echo "Usage: wv add \"task description\" [--status=todo|active|done|blocked] [--parent=<id>] [--gh] [--force] [--standalone]" >&2
         return 1
     fi
 
@@ -307,7 +307,7 @@ cmd_add() {
             if [ -n "$active_epics" ]; then
                 local epic_list
                 epic_list=$(echo "$active_epics" | tr '\n' ' ' | sed 's/ $//')
-                echo -e "${RED}Error: --parent required when active epics exist (use --force to override)${NC}" >&2
+                echo -e "${RED}Error: --parent required when active epics exist (use --force or --standalone to override)${NC}" >&2
                 echo -e "${CYAN}  Active epic(s): $epic_list${NC}" >&2
                 echo -e "${CYAN}  Usage: wv add \"...\" --parent=<epic-id>${NC}" >&2
                 # Remove the orphan node we just created
@@ -437,15 +437,16 @@ _done_mark_pending_close() {
 }
 
 _done_store_learning() {
-    local id="$1" learning="$2" acknowledge_overlap="${3:-0}"
+    local id="$1" learning="$2" acknowledge_overlap="${3:-0}" no_overlap_check="${4:-0}"
     _done_skip_learning=false
     _done_pending_close=false
 
     # FTS5 dedup check: prompt if a similar learning already exists
+    # Skipped when --no-overlap-check is set (agentic callers) or WV_NONINTERACTIVE=1
     local search_terms
     search_terms=$(echo "$learning" | tr -cs '[:alnum:]' ' ' | \
         awk '{for(i=1;i<=NF;i++) if(length($i)>4) {print $i; c++; if(c>=3) exit}}')
-    if [ -n "$search_terms" ]; then
+    if [ "$no_overlap_check" = "0" ] && [ -n "$search_terms" ]; then
         # Sanitize FTS5 operators to prevent query syntax injection
         search_terms=$(echo "$search_terms" | sed 's/[(){}*:^~"]//g' | tr '\n' ' ')
         local fts_match
@@ -651,6 +652,7 @@ cmd_done() {
     local no_warn=0
     local skip_verification=0
     local acknowledge_overlap=0
+    local no_overlap_check=0
     local format="text"
 
     shift || true
@@ -661,6 +663,7 @@ cmd_done() {
             --no-warn) no_warn=1 ;;
             --skip-verification) skip_verification=1 ;;
             --acknowledge-overlap) acknowledge_overlap=1 ;;
+            --no-overlap-check) no_overlap_check=1 ;;
             --json) format="json" ;;
         esac
         shift
@@ -723,7 +726,7 @@ cmd_done() {
     if [ -n "$learning" ]; then
         # Strip ANSI escape codes (color sequences leak from terminal output)
         learning=$(printf '%s' "$learning" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
-        _done_store_learning "$id" "$learning" "$acknowledge_overlap"
+        _done_store_learning "$id" "$learning" "$acknowledge_overlap" "$no_overlap_check"
         if [ "$_done_pending_close" = true ]; then
             return 2
         fi
@@ -1004,8 +1007,13 @@ USAGE
 
 cmd_work() {
     # Check for incomplete operations before claiming new work
+    # Auto-clear if the stale operation is >30 minutes old (likely a failed sync from a prior session)
     if journal_has_incomplete 2>/dev/null; then
-        echo -e "${YELLOW}⚠ Incomplete operation detected — run 'wv recover' first${NC}" >&2
+        if journal_clear_stale 2>/dev/null; then
+            echo -e "${CYAN}ℹ Cleared stale operation marker (>30 min old)${NC}" >&2
+        else
+            echo -e "${YELLOW}⚠ Incomplete operation detected — run 'wv recover' first${NC}" >&2
+        fi
     fi
 
     local id="${1:-}"
@@ -1122,15 +1130,29 @@ cmd_work() {
         echo "  eval \"\$(wv work $id --quiet)\""
 
         # Nudge: check for done_criteria in metadata
+        # Suppressed when node text already contains actionable verbs — well-specified tasks
+        # don't need this hint because the description IS the acceptance criteria.
         local has_criteria
         has_criteria=$(db_query "
             SELECT COUNT(*) FROM nodes WHERE id='$id'
             AND json_extract(metadata, '\$.done_criteria') IS NOT NULL;
         " 2>/dev/null || echo "0")
         if [ "$has_criteria" = "0" ]; then
-            echo ""
-            echo -e "${YELLOW}  Hint: No done_criteria set. Define acceptance criteria:${NC}" >&2
-            echo -e "${YELLOW}    wv update $id --metadata='{\"done_criteria\":\"tests pass, docs updated\"}'${NC}" >&2
+            local node_text node_text_lower has_verb verb
+            node_text=$(db_query "SELECT text FROM nodes WHERE id='$id';" 2>/dev/null || echo "")
+            node_text_lower=$(echo "$node_text" | tr '[:upper:]' '[:lower:]')
+            has_verb=false
+            for verb in add implement test wire extend fix update create build remove delete refactor extract migrate resolve write setup; do
+                if [[ "$node_text_lower" == *"$verb"* ]]; then
+                    has_verb=true
+                    break
+                fi
+            done
+            if [ "$has_verb" = false ]; then
+                echo ""
+                echo -e "${YELLOW}  Hint: No done_criteria set. Define acceptance criteria:${NC}" >&2
+                echo -e "${YELLOW}    wv update $id --metadata='{\"done_criteria\":\"tests pass, docs updated\"}'${NC}" >&2
+            fi
         fi
     fi
 

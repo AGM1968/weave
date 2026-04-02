@@ -284,13 +284,29 @@ validate_on_done() {
     fi
 
     # Check: no verification evidence
+    # Suppressed when: (a) verification_method metadata is set, or (b) learning string
+    # contains implicit verification keywords (test, passed, verified, lint, etc.)
     local has_verification
     has_verification=$(db_query "
         SELECT COUNT(*) FROM nodes WHERE id='$id'
         AND json_extract(metadata, '\$.verification_method') IS NOT NULL;
     " 2>/dev/null || echo "0")
     if [ "$has_verification" = "0" ]; then
-        warnings="${warnings}\n  ⚠ No verification evidence — consider: wv update $id --metadata='{\"verification_method\":\"tests passed\"}'"
+        local learning_text has_implicit kw
+        learning_text=$(db_query "
+            SELECT LOWER(COALESCE(json_extract(metadata, '\$.learning'), ''))
+            FROM nodes WHERE id='$id';
+        " 2>/dev/null || echo "")
+        has_implicit=false
+        for kw in "test" "passed" "verified" "lint" "clean" "make check" "pytest" "ruff" "mypy" "shellcheck"; do
+            if [[ "$learning_text" == *"$kw"* ]]; then
+                has_implicit=true
+                break
+            fi
+        done
+        if [ "$has_implicit" = false ]; then
+            warnings="${warnings}\n  ⚠ No verification evidence — consider: wv update $id --metadata='{\"verification_method\":\"tests passed\"}'"
+        fi
     fi
 
     # Check: orphan node (no edges)
@@ -301,6 +317,15 @@ validate_on_done() {
     " 2>/dev/null || echo "0")
     if [ "$edge_count" = "0" ]; then
         warnings="${warnings}\n  ⚠ Orphan node — no edges. Consider: wv link $id <parent> --type=implements"
+    fi
+
+    # Check: metadata size guard — large metadata (>50KB) causes sqlite3 -json to hang during sync
+    local meta_size
+    meta_size=$(db_query "
+        SELECT LENGTH(COALESCE(metadata, '{}')) FROM nodes WHERE id='$id';
+    " 2>/dev/null || echo "0")
+    if [ "$meta_size" -gt 51200 ] 2>/dev/null; then
+        warnings="${warnings}\n  ⚠ Metadata is ${meta_size} bytes (>50KB) — may cause wv sync to hang. Check for escape accumulation in learning strings."
     fi
 
     # Print warnings if any

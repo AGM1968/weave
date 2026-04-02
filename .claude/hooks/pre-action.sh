@@ -13,6 +13,20 @@ INPUT=$(cat)
 TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 TOOL_INPUT=$(echo "$INPUT" | jq -r '.tool_input // empty' 2>/dev/null)
 
+# Guard: block Read calls on large files without a limit (context load policy enforcement)
+if [[ "$TOOL" == "Read" ]]; then
+    FILE_PATH=$(echo "$TOOL_INPUT" | jq -r '.file_path // empty' 2>/dev/null)
+    LIMIT=$(echo "$TOOL_INPUT" | jq -r '.limit // empty' 2>/dev/null)
+    if [[ -n "$FILE_PATH" && -z "$LIMIT" && -f "$FILE_PATH" ]]; then
+        LINE_COUNT=$(wc -l < "$FILE_PATH" 2>/dev/null || echo "0")
+        if [[ "$LINE_COUNT" -gt 500 ]]; then
+            jq -n --arg path "$FILE_PATH" --arg lines "$LINE_COUNT" \
+                '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("File \($path) has \($lines) lines — too large to read whole. Grep for structure first, then read with offset+limit (e.g. limit=200). Context load policy: always grep first on files >500 lines.")}}'
+            exit 0
+        fi
+    fi
+fi
+
 # Block edits to installed copies (should edit source in scripts/ instead)
 # Handles both Claude Code tool names (Edit/Write) and VS Code tool names (create_file, etc.)
 if [[ "$TOOL" =~ ^(Edit|Write|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file)$ ]]; then

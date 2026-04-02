@@ -1107,17 +1107,19 @@ test_context_pitfall_scoping() {
     setup_test_env
 
     # Create two separate epics with their own pitfalls
+    # Use --force/--standalone for non-epic nodes: this test is about context scoping,
+    # not orphan prevention (epics in the test DB would otherwise block node creation).
     local epic1 task1 pit1 epic2 task2 pit2
     epic1=$(get_id "$("$WV" add "Epic One" --metadata='{"type":"epic"}' 2>&1)")
-    task1=$(get_id "$("$WV" add "Task under epic 1" 2>&1)")
+    task1=$(get_id "$("$WV" add "Task under epic 1" --standalone 2>&1)")
     "$WV" link "$task1" "$epic1" --type=implements >/dev/null 2>&1
-    pit1=$(get_id "$("$WV" add "Pitfall for epic 1" --metadata='{"pitfall":"watch out epic1"}' 2>&1)")
+    pit1=$(get_id "$("$WV" add "Pitfall for epic 1" --metadata='{"pitfall":"watch out epic1"}' --standalone 2>&1)")
     "$WV" link "$pit1" "$epic1" --type=addresses >/dev/null 2>&1
 
     epic2=$(get_id "$("$WV" add "Epic Two" --metadata='{"type":"epic"}' 2>&1)")
-    task2=$(get_id "$("$WV" add "Task under epic 2" 2>&1)")
+    task2=$(get_id "$("$WV" add "Task under epic 2" --standalone 2>&1)")
     "$WV" link "$task2" "$epic2" --type=implements >/dev/null 2>&1
-    pit2=$(get_id "$("$WV" add "Pitfall for epic 2" --metadata='{"pitfall":"watch out epic2"}' 2>&1)")
+    pit2=$(get_id "$("$WV" add "Pitfall for epic 2" --metadata='{"pitfall":"watch out epic2"}' --standalone 2>&1)")
     "$WV" link "$pit2" "$epic2" --type=addresses >/dev/null 2>&1
 
     # Context pack for TASK1 should include PIT1 but NOT PIT2

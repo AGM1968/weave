@@ -2,40 +2,64 @@
 
 <!-- markdownlint-disable MD024 -->
 
-## [1.28.9] - 2026-03-31
-
-### Improved
-
-- **Copilot instructions template** — expanded from minimal stub to full workflow guide: pre-flight
-  check (`git status && wv status`), core 4-step loop with order warning, `wv quick`/`wv ship`
-  shortcuts, terminal discipline (`echo "s" | wv done` pipe for VS Code), and structured learnings
-  format. Applied on `wv-init-repo --agent=copilot` and `--update`.
-
-## [1.28.8] - 2026-03-31
+## [1.29.0] - 2026-04-02
 
 ### Added
 
-- **`wv list --limit=N`** — cap node output at N rows (SQL-level, default uncapped). Prevents
-  context overflow when listing large done/todo sets. Valid range: 1–200.
+- **`wv done --no-overlap-check`** — skip FTS5 learning-similarity check entirely for agentic
+  callers. Replaces the `echo "s" | wv done` workaround. No prompt, no advisory.
+- **`wv add --standalone`** — semantic alias for `--force`; makes deliberate orphan intent explicit
+  for chore/doc nodes created outside an epic.
+- **`weave_add` MCP: `standalone` parameter** — pass `--standalone` to CLI from MCP clients.
+- **`weave_done` MCP: `no_overlap_check` parameter** — pass `--no-overlap-check` to CLI from MCP
+  clients.
+- **`done_criteria` hint suppression** — `wv work` omits the done-criteria advisory when node text
+  already contains an actionable verb (add, implement, fix, test, etc.).
+- **Implicit verification keyword suppression** — `wv done` suppresses the "no verification
+  evidence" hint when `--learning` contains test/passed/verified/lint/make check/pytest/ruff/mypy.
+- **Stale ops auto-clear** — `wv work` silently clears incomplete journal ops older than 30 minutes
+  (left by failed syncs in prior sessions), preventing spurious recovery prompts.
+- **Metadata size guard** — `wv done` warns if node metadata exceeds 50 KB; bloated metadata was
+  root cause of `sqlite3 -json` hang during `wv sync`.
+- **Templates updated** — `templates/WORKFLOW.md`, `templates/copilot-instructions.stub.md`, and
+  `.github/copilot-instructions.md` now document the new flags and drop the `echo "s" | wv done`
+  workaround.
 
 ## [1.28.7] - 2026-03-31
 
+### Added
+
+- **Static system prompt** — graph context (Weave node, blockers, learnings) moved from per-turn
+  system prompt rebuild to a one-time turn-0 bootstrap message. Eliminates 4-6 `wv` subprocess calls
+  per turn; system prompt is now stable across all turns enabling prompt caching.
+- **Anthropic prompt caching** — system block now passed as a content object with
+  `cache_control: {type: ephemeral}` for automatic cache hits on repeated calls. Estimated 7x
+  reduction in billed system+tools tokens per multi-turn session.
+
 ### Fixed
 
-- **`wv-bootstrap` state guard** — skips `git pull` if `state.sql` has uncommitted changes,
-  preventing the pull from clobbering local graph state loaded into the hot zone.
-- **`wv-close` auto-commit** — automatically commits `.weave/` after `wv sync --gh` when there are
-  staged changes, so session-end state persists without a manual commit step.
+- **Stale active nodes across TUI sessions** — three-layer defense: (1) `wv-close` auto-commits
+  `.weave/` so state persists before hot zone is cleared, (2) `wv-bootstrap` guards against
+  `git pull` clobbering uncommitted `state.sql`, (3) TUI startup auto-resets inherited active nodes
+  to `todo` status with a user-visible message.
+- **Compliance scores not committed** — `_run_compliance()` now runs before `make wv-close` so the
+  `.weave/compliance-scores.tsv` row is written to disk before the session-end git commit step.
 
 ## [1.28.6] - 2026-03-31
 
 ### Added
 
-- **WORKFLOW.md — Repair Workflow step 5**: Error classification tiers — transient/retry,
-  blocker/recovery-node, user-required/stop. Prevents blind retry loops and ambiguity
-  being papered over.
-- **WORKFLOW.md — Rule 12**: Verify assumptions before acting — confirm file paths, function
-  names, and APIs before relying on them; treat compacted session context as unverified.
+- **WORKFLOW.md — Repair Workflow step 5**: Error classification tiers (transient/retry,
+  blocker/recovery-node, user-required/stop) to prevent blind retry loops and ambiguity being
+  papered over.
+- **WORKFLOW.md — Rule 12**: Verify assumptions before acting — grep/read to confirm file paths,
+  function names, and APIs before relying on them; treat compacted session context as unverified
+  until re-read.
+- **runtime/context.py — Rule 9**: Tool batching mandate — independent reads, searches, and graph
+  queries must be issued in a single parallel response; never serialise parallel calls.
+- **runtime/context.py — Rule 10**: Assumption validation, always injected into runtime system
+  prompt — mirrors WORKFLOW.md rule 12 for universal coverage.
+- Context-load policy renumbered from rule 9 → 11; suffix rules renumbered 10-12 → 12-14.
 
 ## [1.28.5] - 2026-03-31
 

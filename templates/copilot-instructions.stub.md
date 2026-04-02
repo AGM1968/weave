@@ -22,11 +22,11 @@ Call `weave_edit_guard` (MCP) before any edit. If blocked, claim a task first.
 ## Core loop
 
 ```bash
-wv work <id>                               # 1. claim
+wv work <id>                                             # 1. claim
 # ... edit files ...
-git add <files> && git commit -m "..."     # 2. commit BEFORE wv done
-echo "s" | wv done <id> --learning="..."  # 3. close (pipe to skip similarity prompt)
-wv sync --gh && git push                   # 4. MANDATORY — sync graph + push
+git add <files> && git commit -m "..."                   # 2. commit BEFORE wv done
+wv done <id> --learning="..." --no-overlap-check         # 3. close (no prompts)
+wv sync --gh && git push                                 # 4. MANDATORY — sync graph + push
 ```
 
 > **Order matters**: commit first, then `wv done`, then sync+push. Never reverse steps 2–4.
@@ -38,17 +38,10 @@ wv sync --gh && git push                   # 4. MANDATORY — sync graph + push
 wv quick "<description>" --learning="..."
 
 # Done + sync + push in one step:
-echo "s" | wv ship <id> --learning="..."
-```
+wv ship <id> --learning="..." --no-overlap-check
 
-## Terminal discipline
-
-`wv done` and `wv ship` have an interactive similarity-checker that **blocks VS Code terminals**.
-Always pipe input:
-
-```bash
-echo "s" | wv done <id> --learning="..."   # correct
-wv done <id> --learning="..."              # will hang in VS Code terminal
+# Create a standalone node without a parent (explicit orphan intent):
+wv add "<description>" --standalone
 ```
 
 ## Code quality — run before every commit

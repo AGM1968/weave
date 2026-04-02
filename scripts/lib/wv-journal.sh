@@ -249,3 +249,46 @@ journal_has_incomplete() {
     ends=$(grep -c '"event":"end"' "$_WV_JOURNAL_FILE" 2>/dev/null) || ends=0
     [ "$begins" -gt "$ends" ] 2>/dev/null
 }
+
+# journal_clear_stale [<age_seconds>]
+# Clear the journal if the oldest incomplete operation is older than age_seconds (default: 1800 = 30min).
+# Agentic use: called by cmd_work to auto-clear stale ops left by failed syncs in prior sessions,
+# without forcing the agent to run wv recover manually.
+#
+# Exit codes:
+#   0 - Journal cleared (stale op was old enough)
+#   1 - Not cleared (op is recent, or no incomplete ops, or journal missing)
+#
+journal_clear_stale() {
+    local max_age="${1:-1800}"
+    [[ "$max_age" == --age=* ]] && max_age="${max_age#*=}"
+
+    [ ! -f "$_WV_JOURNAL_FILE" ] || [ ! -s "$_WV_JOURNAL_FILE" ] && return 1
+
+    local stale_ts
+    stale_ts=$(jq -rs '
+        group_by(.op_id) |
+        map(select(
+            (map(select(.event == "begin")) | length > 0) and
+            (map(select(.event == "end")) | length == 0)
+        )) |
+        if length == 0 then empty
+        else
+          sort_by(map(select(.event == "begin"))[0].ts) | first |
+          map(select(.event == "begin"))[0].ts
+        end
+    ' "$_WV_JOURNAL_FILE" 2>/dev/null || echo "")
+
+    [ -z "$stale_ts" ] && return 1
+
+    local now op_ts age_seconds
+    now=$(date -u +%s 2>/dev/null || echo "0")
+    op_ts=$(date -u -d "$stale_ts" +%s 2>/dev/null || echo "0")
+    age_seconds=$(( now - op_ts ))
+
+    if [ "$age_seconds" -gt "$max_age" ] 2>/dev/null; then
+        : > "$_WV_JOURNAL_FILE"
+        return 0
+    fi
+    return 1
+}

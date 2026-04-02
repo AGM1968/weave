@@ -208,6 +208,11 @@ const TOOLS: Tool[] = [
           type: "boolean",
           description: "Skip similarity check and create node even if similar nodes exist.",
         },
+        standalone: {
+          type: "boolean",
+          description:
+            "Create node without a parent even when epics exist. Semantic alias for force=true — use this when orphan intent is deliberate (chore/doc nodes, standalone fixes).",
+        },
       },
       required: ["text"],
     },
@@ -231,6 +236,11 @@ const TOOLS: Tool[] = [
         no_warn: {
           type: "boolean",
           description: "Suppress validation hints (useful on machines without test env)",
+        },
+        no_overlap_check: {
+          type: "boolean",
+          description:
+            "Skip FTS5 learning-similarity check entirely — no prompt, no advisory. Use in agent/script contexts where stdin is unavailable.",
         },
       },
       required: ["id"],
@@ -865,13 +875,15 @@ function handleTool(
       const alias = args.alias as string | undefined;
       const parent = args.parent as string | undefined;
       const force = args.force as boolean | undefined;
+      const standalone = args.standalone as boolean | undefined;
       const cmd = ["add", text];
       if (status) cmd.push(`--status=${status}`);
       if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
       if (gh) cmd.push("--gh");
       if (alias) cmd.push(`--alias=${alias}`);
       if (parent) cmd.push(`--parent=${parent}`);
-      if (force) cmd.push("--force");
+      if (standalone) cmd.push("--standalone");
+      else if (force) cmd.push("--force");
       result = wv(cmd);
       // Enforcement warnings — suppress --gh nudge for child nodes (only epic needs a GH issue)
       const warnings: string[] = [];
@@ -886,9 +898,11 @@ function handleTool(
       const id = args.id as string;
       const learning = args.learning as string | undefined;
       const noWarn = args.no_warn as boolean | undefined;
+      const noOverlapCheck = args.no_overlap_check as boolean | undefined;
       const cmd = ["done", id];
       if (learning) cmd.push(`--learning=${learning}`);
       if (noWarn) cmd.push("--no-warn");
+      if (noOverlapCheck) cmd.push("--no-overlap-check");
       result = wv(cmd);
       if (!learning)
         result +=
@@ -1414,7 +1428,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.28.9",
+      version: "1.29.0",
     },
     {
       capabilities: {
