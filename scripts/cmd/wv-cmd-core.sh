@@ -786,7 +786,7 @@ cmd_done() {
     fi
 
     _done_write_breadcrumb "$id"
-    auto_sync 2>/dev/null || true
+    auto_sync --force 2>/dev/null || true
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -904,12 +904,11 @@ USAGE
         # Resolve alias to ID if needed
         if [[ "$item_id" != wv-* ]]; then
             local resolved
-            resolved=$(db_query "SELECT id FROM nodes WHERE alias='$(sql_escape "$item_id")' LIMIT 1;")
+            resolved=$(db_query "SELECT id FROM nodes WHERE alias='$(sql_escape "$item_id")' ORDER BY CASE WHEN status='done' THEN 1 ELSE 0 END LIMIT 1;")
             if [ -n "$resolved" ]; then
                 item_id="$resolved"
             fi
         fi
-
         validate_id "$item_id" 2>/dev/null || true
         local exists
         exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$item_id';")
@@ -947,7 +946,7 @@ USAGE
         # Resolve alias to ID
         if [[ "$item_id" != wv-* ]]; then
             local resolved
-            resolved=$(db_query "SELECT id FROM nodes WHERE alias='$(sql_escape "$item_id")' LIMIT 1;")
+            resolved=$(db_query "SELECT id FROM nodes WHERE alias='$(sql_escape "$item_id")' ORDER BY CASE WHEN status='done' THEN 1 ELSE 0 END LIMIT 1;")
             [ -n "$resolved" ] && item_id="$resolved"
         fi
 

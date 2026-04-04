@@ -2,6 +2,27 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.29.3] - 2026-04-04
+
+### Fixed
+
+- **`cmd_load` sync regression**: developer reload (`wv load`) now pre-flushes live DB to
+  `state.sql` via `auto_sync --force` before importing, preventing in-session `wv done` closures
+  from reappearing as active after reload.
+- **`auto_sync --force`**: new flag bypasses the stamp-file throttle, used internally by `wv done`
+  and `wv load` to guarantee flush on critical operations.
+
+## [1.29.2] - 2026-04-02
+
+### Fixed
+
+- **`wv sync --gh` Phase 2 (GH→Weave) now passes `--standalone`** when creating nodes from GitHub
+  issues. Previously, importing an open GH issue with no Weave parent failed with "Error: --parent
+  required when active epics exist" and silently discarded the node. GH-sourced nodes are orphans by
+  nature; `--standalone` bypasses the orphan-prevention guard correctly.
+- **`scripts/sync-weave-gh.sh`** (legacy bash sync): same fix — `--standalone` added to the `wv add`
+  call in Phase 2.
+
 ## [1.29.1] - 2026-04-02
 
 ### Fixed

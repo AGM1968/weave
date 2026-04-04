@@ -47,6 +47,9 @@ WV_AUTO_CHECKPOINT="${WV_AUTO_CHECKPOINT:-1}"
 WV_CHECKPOINT_INTERVAL="${WV_CHECKPOINT_INTERVAL:-600}"
 
 auto_sync() {
+    local _force=false
+    for _arg in "$@"; do [ "$_arg" = "--force" ] && _force=true; done
+
     # Disabled by env var
     [ "$WV_AUTO_SYNC" = "0" ] && return 0
 
@@ -56,12 +59,12 @@ auto_sync() {
     # Skip for custom DB paths (test isolation)
     [ -n "$WV_DB_CUSTOM" ] && return 0
 
-    # Check throttle: sync at most once per interval
+    # Check throttle: sync at most once per interval (bypassed by --force)
     local stamp_file="$WV_HOT_ZONE/.last_sync"
     local now agent_id
     now=$(date +%s)
     agent_id="${WV_AGENT_ID:-$(hostname)-$(whoami)}"
-    if [ -f "$stamp_file" ]; then
+    if [ "$_force" = false ] && [ -f "$stamp_file" ]; then
         local last_sync
         last_sync=$(cat "$stamp_file" 2>/dev/null || echo "0")
         if [ $(( now - last_sync )) -lt "$WV_SYNC_INTERVAL" ]; then
@@ -412,7 +415,11 @@ cmd_sync() {
 
 cmd_load() {
     mkdir -p "$WV_HOT_ZONE"
-    
+
+    # Pre-flight: flush live DB → state.sql before loading to prevent status
+    # regression when in-session wv done closures were throttled and not yet synced.
+    auto_sync --force 2>/dev/null || true
+
     if [ -f "$WEAVE_DIR/state.sql" ]; then
         # Atomic load: import to temp DB first, validate, then replace
         local tmp_db=$(mktemp "$WV_HOT_ZONE/.brain.db.XXXXXX")
@@ -2131,7 +2138,7 @@ _plan_wire_deps() {
         if [ -n "$dep" ] && [ -n "${_task_ids[$i]}" ]; then
             local dep_id="${_alias_to_id[$dep]:-}"
             if [ -z "$dep_id" ]; then
-                dep_id=$(db_query "SELECT id FROM nodes WHERE alias='$(sql_escape "$dep")' LIMIT 1;" 2>/dev/null)
+                dep_id=$(db_query "SELECT id FROM nodes WHERE alias='$(sql_escape "$dep")' ORDER BY CASE WHEN status='done' THEN 1 ELSE 0 END LIMIT 1;" 2>/dev/null)
             fi
             if [ -n "$dep_id" ]; then
                 cmd_link "$dep_id" "${_task_ids[$i]}" --type=blocks 2>/dev/null
