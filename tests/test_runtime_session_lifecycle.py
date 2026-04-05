@@ -100,6 +100,54 @@ def test_quit_hygiene_warns_on_dirty_graph(tmp_path: Path) -> None:
     assert "wv sync --gh" in state[1]
 
 
+def test_quit_hygiene_ahead_with_dirty_weave_instructs_full_sequence(tmp_path: Path) -> None:
+    """ahead > 0 + dirty .weave/ must instruct the full sync→commit→push sequence, not just git push."""
+    lifecycle = RuntimeSessionLifecycle(
+        cast(SessionLifecycleWvClient, _FakeWv()),
+        workspace=tmp_path,
+        record_session_start=lambda _session: None,
+    )
+
+    def _git_output(args: list[str]) -> str | None:
+        mapping = {
+            ("rev-parse", "--show-toplevel"): str(tmp_path),
+            ("status", "--porcelain"): " M .weave/state.sql",
+            ("rev-list", "--count", "@{u}..HEAD"): "2",
+        }
+        return mapping.get(tuple(args))
+
+    state = lifecycle.quit_hygiene_state(_git_output)
+    assert state is not None
+    assert state[0] == "block"
+    assert "wv sync --gh" in state[1]
+    assert "git add .weave/" in state[1]
+    assert "git commit" in state[1]
+    assert "git push" in state[1]
+
+
+def test_quit_hygiene_ahead_only_instructs_git_push(tmp_path: Path) -> None:
+    """ahead > 0 with clean .weave/ only needs git push."""
+    lifecycle = RuntimeSessionLifecycle(
+        cast(SessionLifecycleWvClient, _FakeWv()),
+        workspace=tmp_path,
+        record_session_start=lambda _session: None,
+    )
+
+    def _git_output(args: list[str]) -> str | None:
+        mapping = {
+            ("rev-parse", "--show-toplevel"): str(tmp_path),
+            ("status", "--porcelain"): "",
+            ("rev-list", "--count", "@{u}..HEAD"): "1",
+        }
+        return mapping.get(tuple(args))
+
+    state = lifecycle.quit_hygiene_state(_git_output)
+    assert state is not None
+    assert state[0] == "block"
+    assert "git push" in state[1]
+    assert "wv sync" not in state[1]
+
+
 def test_decide_quit_blocks_or_warns_then_exits(tmp_path: Path) -> None:
     lifecycle = RuntimeSessionLifecycle(
         cast(SessionLifecycleWvClient, _FakeWv()),

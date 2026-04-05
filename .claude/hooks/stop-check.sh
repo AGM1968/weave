@@ -25,6 +25,22 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
 cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 
+# Cooldown lock: after emitting a block, suppress re-blocking for 120s.
+# The dirty-state checks still run; only the hard block (exit 1) is suppressed.
+# This lets the agent make progress on sync commands without being blocked on
+# every response, while still enforcing a clean state after cooldown expires.
+_SC_REPO_HASH=$(echo "$WV_PROJECT_DIR" | md5sum | cut -c1-8)
+_SC_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_SC_REPO_HASH}}"
+_SC_LOCK="${_SC_HOT_ZONE}/.stop_check_lock"
+_SC_IN_COOLDOWN=false
+if [ -f "$_SC_LOCK" ]; then
+    _sc_lock_ts=$(cat "$_SC_LOCK" 2>/dev/null || echo 0)
+    _sc_now=$(date +%s)
+    if [ $((_sc_now - _sc_lock_ts)) -lt 120 ]; then
+        _SC_IN_COOLDOWN=true
+    fi
+fi
+
 # Warn on active nodes that haven't been updated recently (crash/abandon signal).
 # Nodes active for >30 min with no update suggest a crashed or abandoned session.
 if [ -x "${WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
@@ -69,6 +85,15 @@ if [ "$WEAVE_DIRTY" -gt 0 ] || [ "$AHEAD" -gt 0 ]; then
     else
         SYNC_CMD="git push"
     fi
+    if [ "$_SC_IN_COOLDOWN" = true ]; then
+        # Within cooldown window: warn on stderr but do not hard-block.
+        # Agent is expected to be executing the sync commands already.
+        echo "Note: $PARTS (sync in progress — cooldown active)." >&2
+        exit 0
+    fi
+    # Set cooldown lock so subsequent hard-blocks are suppressed while agent syncs
+    mkdir -p "$_SC_HOT_ZONE" 2>/dev/null || true
+    date +%s > "$_SC_LOCK" 2>/dev/null || true
     cat << EOF
 {
     "decision": "block",
@@ -78,4 +103,6 @@ EOF
     exit 1
 fi
 
+# State is clean — clear any stale cooldown lock so the next session isn't skipped
+rm -f "$_SC_LOCK" 2>/dev/null || true
 exit 0

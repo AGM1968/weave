@@ -2,6 +2,20 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.29.5] - 2026-04-05
+
+### Fixed
+
+- **`stop-check.sh` cooldown lock**: after emitting a hard block, subsequent responses within 120s
+  emit a soft stderr warning instead of re-blocking — allows agent to execute sync commands without
+  being blocked on every response. Lock is cleared on clean state; checks still run during cooldown.
+- **`stop-check.sh` cooldown enforcement (P2)**: cooldown now suppresses the hard-block only, not
+  the dirty-state checks — state detection still runs every response during the window.
+- **`session-start-context.sh` session-start auto-commit**: `.weave/` writes during session start
+  (crash-recovery breadcrumbs, migrations) are committed immediately before the first response,
+  preventing the stop-hook from firing spuriously. Scoped to `.weave/` only to avoid capturing
+  unrelated staged developer files (P1 fix).
+
 ## [1.29.4] - 2026-04-05
 
 ### Fixed
@@ -18,6 +32,13 @@
 - **16 normative docs and templates** corrected: `CLAUDE.md`, `AGENTS.md`, `install.sh`,
   `CONTRIBUTING.md`, `docs/DEVELOPMENT.md`, `docs/WEAVE.md`, `README.md`, `README.public.md`,
   `scripts/cmd/wv-cmd-ops.sh`, `.github/copilot-instructions.md`, and all four repo templates.
+- **`stop-check.sh` cooldown lock**: after emitting a hard block, subsequent responses within 120s
+  emit a soft stderr warning instead of re-blocking — allows agent to execute sync commands without
+  being blocked on every response. Lock is cleared on clean state; checks still run during cooldown.
+- **`session-start-context.sh` session-start auto-commit**: `.weave/` writes during session start
+  (crash-recovery breadcrumbs, migrations) are committed immediately before the first response,
+  preventing the stop-hook from firing spuriously with "unsaved weave state" on state the agent did
+  not cause. Scoped to `.weave/` only — does not capture unrelated staged developer files.
 
 ## [1.29.3] - 2026-04-04
 

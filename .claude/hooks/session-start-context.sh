@@ -87,6 +87,18 @@ jq -n \
 # Ensure DB is loaded
 "$WV" load >/dev/null 2>&1 || true
 
+# Commit any .weave/ state written during session-start (crash-recovery breadcrumbs,
+# migrations). Without this, the stop-hook fires on the first response with
+# "unsaved weave state" for changes the agent didn't cause.
+(
+    set +e
+    cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
+    git add .weave/ 2>/dev/null
+    if ! git diff --cached --quiet -- .weave/ 2>/dev/null; then
+        WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): session-start state [skip ci]" 2>/dev/null
+    fi
+) || true
+
 # ── Overwrite sentinel with full active node list ──
 ACTIVE_IDS=$("$WV" list --status=active --json 2>/dev/null | jq -c '[.[].id]' 2>/dev/null || echo "[]")
 jq -n \
