@@ -6,9 +6,16 @@
 # a per-repo lock file to detect and deny duplicates.
 #
 # Lock lifecycle:
-#   PreToolUse  (this hook) — creates lock, denies if already locked
+#   PreToolUse  (this hook) — creates lock atomically, denies if already locked
 #   PostToolUse (bash-dedup-post.sh) — clears lock on foreground completion
-#   TTL expiry  — auto-clears stale locks for background commands
+#   Liveness check — clears lock when recorded start time exceeds TTL (background)
+#
+# Concurrency safety: lock is acquired with set -o noclobber (atomic O_EXCL
+# semantics). Two simultaneous PreToolUse calls cannot both succeed.
+#
+# Background limitation: background subprocess PID is not available at hook time.
+# TTL is the only expiry mechanism for background commands. TTLs are deliberately
+# generous — foreground commands are always cleared by bash-dedup-post.sh.
 
 set -e
 
@@ -27,49 +34,77 @@ TTL=0
 
 if [[ "$CMD" =~ (^|[;[:space:]])(make[[:space:]]+(check|test|build)|make[[:space:]]*$) ]]; then
     LOCK_KEY="make-build"
-    TTL=600
+    TTL=1800     # 30 min — generous for slow CI machines / large test suites
 elif [[ "$CMD" =~ wv[[:space:]]+sync ]]; then
     LOCK_KEY="wv-sync"
-    TTL=180
+    TTL=300
 elif [[ "$CMD" =~ git[[:space:]]+push ]]; then
     LOCK_KEY="git-push"
-    TTL=90
+    TTL=120
 elif [[ "$CMD" =~ (^|[[:space:]])\.\/install\.sh ]]; then
     LOCK_KEY="install"
-    TTL=180
+    TTL=300
 elif [[ "$CMD" =~ npm[[:space:]]+(run|test|build|install) ]]; then
     LOCK_KEY="npm-build"
-    TTL=300
+    TTL=600
 elif [[ "$CMD" =~ poetry[[:space:]]+run[[:space:]]+pytest ]]; then
     LOCK_KEY="pytest"
-    TTL=180
+    TTL=300
 fi
 
 [[ -z "$LOCK_KEY" ]] && exit 0
 
-# ── Scope lock per repo to avoid cross-project interference ──────────────────
+# ── Portable repo hash (md5sum → md5 → sha256sum → fallback) ─────────────────
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-REPO_HASH=$(echo "$REPO_ROOT" | md5sum | cut -c1-8)
+_hash_input="$REPO_ROOT"
+REPO_HASH=$(
+    printf '%s' "$_hash_input" | md5sum 2>/dev/null |  cut -c1-8 ||
+    printf '%s' "$_hash_input" | md5    2>/dev/null |  cut -c1-8 ||
+    printf '%s' "$_hash_input" | sha256sum 2>/dev/null | cut -c1-8 ||
+    echo "default"
+)
 LOCK_DIR="/tmp/weave-bash-locks/${REPO_HASH}"
 mkdir -p "$LOCK_DIR"
 LOCK_FILE="${LOCK_DIR}/${LOCK_KEY}.lock"
 
-# ── Check for existing lock ────────────────────────────────────────────────────
+# ── Check for existing lock (liveness: timestamp-based, TTL is fallback) ──────
 
 if [[ -f "$LOCK_FILE" ]]; then
-    LOCK_AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
+    # Read the start timestamp written when lock was acquired
+    LOCK_START=$(head -1 "$LOCK_FILE" 2>/dev/null || echo "0")
+    NOW=$(date +%s)
+    # Guard: if LOCK_START is not a valid integer, treat as stale
+    if [[ "$LOCK_START" =~ ^[0-9]+$ ]]; then
+        LOCK_AGE=$(( NOW - LOCK_START ))
+    else
+        LOCK_AGE=$TTL  # force stale
+    fi
+
     if [[ "$LOCK_AGE" -lt "$TTL" ]]; then
-        PREV_CMD=$(head -1 "$LOCK_FILE" 2>/dev/null || echo "(unknown)")
-        jq -n --arg key "$LOCK_KEY" --arg prev "$PREV_CMD" \
-            '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("Duplicate command blocked [\($key)]: already running — wait for the task-notification before re-issuing. Previous: \($prev)")}}'
+        PREV_CMD=$(tail -n +2 "$LOCK_FILE" 2>/dev/null | head -1 || echo "(unknown)")
+        jq -n --arg key "$LOCK_KEY" --arg prev "$PREV_CMD" --argjson age "$LOCK_AGE" \
+            '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("Duplicate command blocked [\($key), \($age)s old]: already running — wait for the task-notification before re-issuing. Previous: \($prev)")}}'
         exit 0
     fi
-    # Stale lock — clear it and continue
+    # Lock expired — clear stale lock before atomic acquisition
     rm -f "$LOCK_FILE"
 fi
 
-# ── Acquire lock ───────────────────────────────────────────────────────────────
+# ── Atomic lock acquisition (O_EXCL via noclobber — no TOCTOU) ────────────────
+# set -o noclobber makes '>' fail if the file already exists. Two concurrent
+# invocations racing here will have exactly one succeed and one fall through to
+# the "already locked" denial path.
 
-printf '%s' "$CMD" > "$LOCK_FILE"
+LOCK_CONTENT="$(date +%s)
+${CMD}"
+
+if (set -o noclobber; printf '%s\n' "$LOCK_CONTENT" > "$LOCK_FILE") 2>/dev/null; then
+    exit 0  # Lock acquired — allow command
+fi
+
+# Race: another invocation just acquired the lock between our check and write
+PREV_CMD=$(tail -n +2 "$LOCK_FILE" 2>/dev/null | head -1 || echo "(unknown)")
+jq -n --arg key "$LOCK_KEY" --arg prev "$PREV_CMD" \
+    '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("Duplicate command blocked [\($key)]: just acquired by concurrent call — wait for the task-notification. Previous: \($prev)")}}'
 exit 0

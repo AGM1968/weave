@@ -35,8 +35,15 @@ fi
 
 [[ -z "$LOCK_KEY" ]] && exit 0
 
+# ── Portable repo hash (md5sum → md5 → sha256sum → fallback) ─────────────────
+
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-REPO_HASH=$(echo "$REPO_ROOT" | md5sum | cut -c1-8)
+REPO_HASH=$(
+    printf '%s' "$REPO_ROOT" | md5sum    2>/dev/null | cut -c1-8 ||
+    printf '%s' "$REPO_ROOT" | md5       2>/dev/null | cut -c1-8 ||
+    printf '%s' "$REPO_ROOT" | sha256sum 2>/dev/null | cut -c1-8 ||
+    echo "default"
+)
 LOCK_FILE="/tmp/weave-bash-locks/${REPO_HASH}/${LOCK_KEY}.lock"
 
 rm -f "$LOCK_FILE" 2>/dev/null || true

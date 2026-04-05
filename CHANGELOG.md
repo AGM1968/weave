@@ -2,6 +2,18 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.29.8] - 2026-04-05
+
+### Fixed
+
+- **`bash-dedup.sh` atomic lock**: replaced check-then-write with `set -o noclobber` redirect —
+  eliminates TOCTOU race between simultaneous PreToolUse invocations.
+- **`bash-dedup.sh` timestamp-based TTL**: lock now stores explicit epoch on line 1; stale check
+  reads that value instead of relying on file mtime. TTLs raised to 30 min (make), 5 min
+  (sync/install/pytest), 2 min (push).
+- **`bash-dedup.sh` portable hash**: hash command chain `md5sum → md5 → sha256sum → "default"`
+  prevents hook failure on macOS and other systems without GNU `md5sum`.
+
 ## [1.29.7] - 2026-04-05
 
 ### Added
@@ -9,17 +21,6 @@
 - **`bash-dedup.sh` / `bash-dedup-post.sh` hooks**: PreToolUse/PostToolUse pair that prevents
   duplicate long-running Bash commands (make check, wv sync --gh, git push, ./install.sh, npm,
   pytest). Uses per-repo lock files with TTL-based expiry for background commands.
-
-### Fixed
-
-- **`wv_add --force` tool gap**: `WvClient.add()` and the `wv_add` tool schema/handler now expose
-  the `--force` flag to bypass "similar active nodes exist" CLI warning.
-- **R2 compliance score cap per rule**: `_score()` previously deducted per-violation, causing a
-  single root-cause (no wv_work) to cascade to 0/100. Now capped at one deduction per rule.
-- **Stale preflight test**: `test_runtime_phase1.py` assertion updated to match app behaviour after
-  multi-active-node check was downgraded to warning in v1.29.6.
-- **`wv_add` R1/R2 gate**: requires explicit `status=active` to satisfy discovery/claim phases —
-  default-status adds do not silently satisfy compliance gates.
 
 ## [1.29.6] - 2026-04-05
 
