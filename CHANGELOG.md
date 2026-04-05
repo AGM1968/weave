@@ -2,6 +2,23 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.29.4] - 2026-04-05
+
+### Fixed
+
+- **Sync sequence correctness**: `wv sync --gh` writes to `.weave/`, so `git push` without an
+  intervening `git add .weave/ && git commit` left graph state uncommitted after push — causing the
+  stop-hook to re-fire on every subsequent response.
+- **`stop-check.sh`**: blocking message now instructs the full 3-step sequence
+  (`wv sync --gh && git add .weave/ && git commit → git push`) when `.weave/` is dirty; AHEAD-only
+  case simplified to `git push`.
+- **`Makefile.template` `wv-push` target**: added conditional commit before `git push`.
+- **`session_lifecycle.py` `quit_hygiene_state`**: `ahead > 0` early return now checks
+  `dirty_weave`; combined state instructs full sequence instead of just `git push`.
+- **16 normative docs and templates** corrected: `CLAUDE.md`, `AGENTS.md`, `install.sh`,
+  `CONTRIBUTING.md`, `docs/DEVELOPMENT.md`, `docs/WEAVE.md`, `README.md`, `README.public.md`,
+  `scripts/cmd/wv-cmd-ops.sh`, `.github/copilot-instructions.md`, and all four repo templates.
+
 ## [1.29.3] - 2026-04-04
 
 ### Fixed

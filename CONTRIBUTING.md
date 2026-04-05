@@ -51,7 +51,9 @@ wv add "Your contribution" --gh       # Create a tracked task
 wv work <id>                          # Claim it
 # ... make changes ...
 wv done <id> --learning="..."         # Complete with learning
-wv sync --gh && git push              # Sync and push
+wv sync --gh && git add .weave/       # Sync graph (may dirty .weave/)
+git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"
+git push                              # Push to remote
 ```
 
 The pre-commit hook enforces that an active Weave node exists before committing. Use

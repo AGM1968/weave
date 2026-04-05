@@ -1999,7 +1999,9 @@ Weave Workflow Quick Reference
   2. Claim it:     wv work <id>
   3. Do the work   (edit files, run tests)
   4. Complete:     wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..."
-  5. Persist:      wv sync --gh && git push
+  5. Sync:         wv sync --gh
+  6. Commit state:  git add .weave/ && git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"
+  7. Push:          git push
 
 Create new work:
   wv add "Description"               # standalone node

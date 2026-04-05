@@ -13,11 +13,14 @@ Run `wv work <id>` to claim a task, or `wv add "<text>" --status=active` to crea
 wv ready                          # Find unblocked work
 wv work <id>                      # Claim it
 wv done <id> --learning="..."     # Complete with learnings
-wv sync && git push               # Persist + push (mandatory)
+wv sync --gh && git add .weave/   # Sync (may dirty .weave/)
+git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"
+git push                          # mandatory
 ```
 
 ## Full documentation
 
+- **CLI:** `wv --help` or `~/.config/weave/WORKFLOW.md`
 - **MCP:** `weave_guide` (topics: workflow, github, learnings, context)
-- **CLI:** `~/.config/weave/WORKFLOW.md`
 - **Claude Code:** See [CLAUDE.md](CLAUDE.md) for Claude-specific instructions
+- **Development:** `/dev-guide` skill for testing, hooks, releases

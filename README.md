@@ -82,6 +82,8 @@ wv tree                                # View the hierarchy
 
 ```bash
 wv sync --gh                           # Persist graph + sync GitHub issues
+git add .weave/                        # Stage graph state
+git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"
 git push
 ```
 
@@ -94,6 +96,7 @@ wv ready          Find unblocked work
 wv work <id>      Claim a task (one active at a time)
 wv done <id>      Complete with --learning="..."
 wv sync --gh      Persist graph + sync GitHub issues
+                  Commit .weave/ if changed
 git push          Push state to remote
 ```
 

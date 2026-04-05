@@ -132,7 +132,9 @@ contexts where stdin is not available. In human sessions you can omit it to see 
 ## Session End (MANDATORY)
 
 ```bash
-wv sync --gh && git push     # Sync graph + GitHub issues, then push
+wv sync --gh && git add .weave/   # Sync graph + GitHub issues (may dirty .weave/)
+git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"
+git push
 ```
 
 **Not** `wv sync` -- the `--gh` flag syncs GitHub issues. Without it, nodes created with `--gh`

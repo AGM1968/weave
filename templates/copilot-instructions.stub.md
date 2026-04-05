@@ -26,7 +26,9 @@ wv work <id>                                             # 1. claim
 # ... edit files ...
 git add <files> && git commit -m "..."                   # 2. commit BEFORE wv done
 wv done <id> --learning="..." --no-overlap-check         # 3. close (no prompts)
-wv sync --gh && git push                                 # 4. MANDATORY — sync graph + push
+wv sync --gh && git add .weave/                          # 4a. sync graph (may dirty .weave/)
+git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"  # 4b. commit if dirty
+git push                                                 # 4c. MANDATORY
 ```
 
 > **Order matters**: commit first, then `wv done`, then sync+push. Never reverse steps 2–4.
