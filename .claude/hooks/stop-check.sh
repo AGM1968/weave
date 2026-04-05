@@ -70,28 +70,25 @@ WEAVE_DIRTY=$(git status --porcelain 2>/dev/null | grep -c '\.weave/' || true)
 # shellcheck disable=SC1083  # @{u} is a git refspec, not a literal brace
 AHEAD=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
 
-if [ "$WEAVE_DIRTY" -gt 0 ] || [ "$AHEAD" -gt 0 ]; then
-    PARTS=""
-    [ "$AHEAD" -gt 0 ] && PARTS="$AHEAD unpushed commit(s)"
+# Soft warn on unsaved weave state (does not block — auto-checkpoint handles this)
+if [ "$WEAVE_DIRTY" -gt 0 ] && [ "$AHEAD" -eq 0 ]; then
+    echo "Note: unsaved weave state. Run: wv sync --gh && git add .weave/ && git commit -m 'chore(weave): sync state [skip ci]' && git push" >&2
+    exit 0
+fi
+
+# Hard block only on unpushed commits — real work loss risk
+if [ "$AHEAD" -gt 0 ]; then
+    PARTS="$AHEAD unpushed commit(s)"
     if [ "$WEAVE_DIRTY" -gt 0 ]; then
-        PARTS="${PARTS:+$PARTS, }unsaved weave state"
-    fi
-    # Dirty .weave/ requires the full sync sequence: sync → stage → commit → push.
-    # Clean .weave/ with unpushed commits only needs: git push.
-    # (Skipping the commit step when dirty leaves .weave/ in an uncommitted state
-    #  after git push, causing the hook to re-fire on the next response.)
-    if [ "$WEAVE_DIRTY" -gt 0 ]; then
+        PARTS="$PARTS, unsaved weave state"
         SYNC_CMD="wv sync --gh && git add .weave/ && git commit -m 'chore(weave): sync state [skip ci]' && git push"
     else
         SYNC_CMD="git push"
     fi
     if [ "$_SC_IN_COOLDOWN" = true ]; then
-        # Within cooldown window: warn on stderr but do not hard-block.
-        # Agent is expected to be executing the sync commands already.
         echo "Note: $PARTS (sync in progress — cooldown active)." >&2
         exit 0
     fi
-    # Set cooldown lock so subsequent hard-blocks are suppressed while agent syncs
     mkdir -p "$_SC_HOT_ZONE" 2>/dev/null || true
     date +%s > "$_SC_LOCK" 2>/dev/null || true
     cat << EOF

@@ -2,6 +2,18 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.29.6] - 2026-04-05
+
+### Fixed
+
+- **`stop-check.sh` dirty weave state downgraded to soft warn**: hard block now fires only on
+  unpushed commits (real work loss risk). Dirty `.weave/` with no unpushed commits exits 0 with a
+  stderr note — auto-checkpoint handles the sync, no session interruption.
+- **TUI multi-active-node check downgraded to warning**: `_agent_start_blocker` no longer
+  hard-blocks when multiple nodes are active. A 4-second notification is shown and the agent
+  proceeds — dev workflow legitimately keeps multiple nodes active; agent selects work via
+  `wv_status`.
+
 ## [1.29.5] - 2026-04-05
 
 ### Fixed
