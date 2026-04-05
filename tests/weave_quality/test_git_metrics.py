@@ -48,7 +48,9 @@ def _in_git_repo() -> bool:
     try:
         subprocess.run(
             ["git", "rev-parse", "--git-dir"],
-            cwd=REPO, capture_output=True, check=True,
+            cwd=REPO,
+            capture_output=True,
+            check=True,
         )
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -181,22 +183,21 @@ class TestComputeOwnership:
 
     def test_d5_two_authors_no_minor_flagged(self) -> None:
         """D5: only flag minor contributors when authors >= 3."""
-        frac, minor = _compute_ownership_from_counts(
-            Counter({"Alice": 2, "Bob": 2}))
+        frac, minor = _compute_ownership_from_counts(Counter({"Alice": 2, "Bob": 2}))
         assert minor == 0  # D5: < 3 authors → no flag
         assert 0.4 <= frac <= 0.6  # roughly equal split
 
     def test_three_authors_95_5_ownership(self) -> None:
         """95/5 split with 2 actual authors: no minor flag (< 3 authors)."""
-        frac, minor = _compute_ownership_from_counts(
-            Counter({"Alice": 19, "Bob": 1}))
+        frac, minor = _compute_ownership_from_counts(Counter({"Alice": 19, "Bob": 1}))
         assert frac == pytest.approx(19 / 20)
         assert minor == 0  # authors < 3 → no flag
 
     def test_three_authors_genuine_minor(self) -> None:
         """3 authors, one with < 5%: should flag as minor contributor."""
         frac, minor = _compute_ownership_from_counts(
-            Counter({"Alice": 90, "Bob": 9, "Carol": 1}))
+            Counter({"Alice": 90, "Bob": 9, "Carol": 1})
+        )
         # Carol: 1/100 = 1% < 5% threshold → minor
         assert frac == pytest.approx(0.90)
         assert minor == 1  # Carol is the minor contributor
@@ -213,8 +214,11 @@ class TestComputeOwnership:
         assert gs.minor_contributors == 0
 
         gs2 = GitStats(
-            path="y.py", churn=10, authors=3,
-            ownership_fraction=0.75, minor_contributors=1,
+            path="y.py",
+            churn=10,
+            authors=3,
+            ownership_fraction=0.75,
+            minor_contributors=1,
         )
         d = gs2.to_dict()
         assert d["ownership_fraction"] == 0.75
@@ -232,13 +236,16 @@ class TestComputeOwnership:
 
 class TestGitHelper:
     def test_timeout_returns_empty(self, tmp_path: Path) -> None:
-        with patch("weave_quality.git_metrics.subprocess.run",
-                   side_effect=subprocess.TimeoutExpired("git", 30)):
+        with patch(
+            "weave_quality.git_metrics.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("git", 30),
+        ):
             assert _git(["log"], cwd=tmp_path) == ""
 
     def test_oserror_returns_empty(self, tmp_path: Path) -> None:
-        with patch("weave_quality.git_metrics.subprocess.run",
-                   side_effect=OSError("no git")):
+        with patch(
+            "weave_quality.git_metrics.subprocess.run", side_effect=OSError("no git")
+        ):
             assert _git(["log"], cwd=tmp_path) == ""
 
     def test_nonzero_returncode_returns_empty(self, tmp_path: Path) -> None:
@@ -323,14 +330,7 @@ class TestFileCoChangesFallback:
 
     def test_fallback_parses_git_output(self, tmp_path: Path) -> None:
         _co_change_cache.clear()
-        log_out = (
-            "COMMIT_SEP\n"
-            "foo.py\n"
-            "bar.py\n"
-            "COMMIT_SEP\n"
-            "foo.py\n"
-            "baz.py\n"
-        )
+        log_out = "COMMIT_SEP\nfoo.py\nbar.py\nCOMMIT_SEP\nfoo.py\nbaz.py\n"
         with patch("weave_quality.git_metrics._git", return_value=log_out):
             result = file_co_changes(tmp_path, "foo.py", top_n=5)
         assert "bar.py" in result
@@ -397,9 +397,13 @@ class TestEnrichAllGitStats:
         assert enrich_all_git_stats(tmp_path, []) == []
 
     def test_exception_falls_back_to_per_file(self, tmp_path: Path) -> None:
-        with patch("weave_quality.git_metrics._batch_git_stats",
-                   side_effect=OSError("batch failed")), \
-             patch("weave_quality.git_metrics.build_git_stats") as mock_bgs:
+        with (
+            patch(
+                "weave_quality.git_metrics._batch_git_stats",
+                side_effect=OSError("batch failed"),
+            ),
+            patch("weave_quality.git_metrics.build_git_stats") as mock_bgs,
+        ):
             mock_bgs.return_value = GitStats(path="foo.py")
             result = enrich_all_git_stats(tmp_path, ["foo.py"])
         assert len(result) == 1

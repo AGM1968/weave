@@ -35,9 +35,17 @@ class TestFileEntry:
         fe = FileEntry(path="src/main.py", scan_id=1, language="python")
         d = fe.to_dict()
         assert set(d.keys()) == {
-            "path", "scan_id", "language", "loc", "complexity",
-            "functions", "max_nesting", "avg_fn_len",
-            "essential_complexity", "indent_sd", "category",
+            "path",
+            "scan_id",
+            "language",
+            "loc",
+            "complexity",
+            "functions",
+            "max_nesting",
+            "avg_fn_len",
+            "essential_complexity",
+            "indent_sd",
+            "category",
         }
         assert d["path"] == "src/main.py"
         assert d["scan_id"] == 1
@@ -74,7 +82,8 @@ class TestFileEntry:
 class TestCKMetrics:
     def test_to_rows(self) -> None:
         ck = CKMetrics(
-            path="a.py", scan_id=1,
+            path="a.py",
+            scan_id=1,
             metrics={"wmc": 5.0, "cbo": 3.0, "bogus": 99.0},
         )
         rows = ck.to_rows()
@@ -90,7 +99,8 @@ class TestCKMetrics:
 
     def test_round_trip(self) -> None:
         ck = CKMetrics(
-            path="b.py", scan_id=3,
+            path="b.py",
+            scan_id=3,
             metrics={"wmc": 12.0, "rfc": 4.0, "lcom": 0.5},
         )
         rows = ck.to_rows()
@@ -101,7 +111,8 @@ class TestCKMetrics:
 
     def test_valid_metrics_filter(self) -> None:
         ck = CKMetrics(
-            path="c.py", scan_id=1,
+            path="c.py",
+            scan_id=1,
             metrics={"wmc": 1.0, "invalid_metric": 2.0},
         )
         rows = ck.to_rows()
@@ -217,7 +228,9 @@ class TestProjectMetrics:
     def test_hotspot_threshold(self) -> None:
         entries = [FileEntry(path="a.py", complexity=5.0)]
         stats = [GitStats(path="a.py", hotspot=0.3)]
-        pm = ProjectMetrics.from_entries_and_stats(entries, stats, hotspot_threshold=0.5)
+        pm = ProjectMetrics.from_entries_and_stats(
+            entries, stats, hotspot_threshold=0.5
+        )
         assert pm.hotspot_count == 0
 
     def test_entries_without_stats(self) -> None:
@@ -243,9 +256,13 @@ class TestFunctionCC:
 
     def test_to_eav_row_metric_key(self) -> None:
         fc = FunctionCC(
-            path="a.py", scan_id=1,
-            function_name="process", complexity=12.0,
-            line_start=10, line_end=50, is_dispatch=False,
+            path="a.py",
+            scan_id=1,
+            function_name="process",
+            complexity=12.0,
+            line_start=10,
+            line_end=50,
+            is_dispatch=False,
         )
         row = fc.to_eav_row()
         assert row["metric"] == "fn_cc:process@10"
@@ -255,10 +272,13 @@ class TestFunctionCC:
 
     def test_to_eav_row_detail_json(self) -> None:
         fc = FunctionCC(
-            path="a.py", scan_id=1,
+            path="a.py",
+            scan_id=1,
             function_name="dispatch",
-            line_start=5, line_end=30,
-            complexity=15.0, is_dispatch=True,
+            line_start=5,
+            line_end=30,
+            complexity=15.0,
+            is_dispatch=True,
         )
         row = fc.to_eav_row()
         detail = json.loads(row["detail"])
@@ -280,8 +300,10 @@ class TestFileEntryDepth:
 
     def test_round_trip_with_depth_fields(self) -> None:
         fe = FileEntry(
-            path="a.py", scan_id=1,
-            essential_complexity=3.0, indent_sd=1.5,
+            path="a.py",
+            scan_id=1,
+            essential_complexity=3.0,
+            indent_sd=1.5,
         )
         d = fe.to_dict()
         assert d["essential_complexity"] == 3.0

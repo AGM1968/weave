@@ -59,8 +59,7 @@ def _normalize_values(values: list[float]) -> list[float]:
 # ---------------------------------------------------------------------------
 
 
-def compute_hotspots(entries: list[FileEntry],
-                     stats: list[GitStats]) -> list[GitStats]:
+def compute_hotspots(entries: list[FileEntry], stats: list[GitStats]) -> list[GitStats]:
     """Compute hotspot scores and update GitStats in place.
 
     Formula: hotspot = normalize(complexity) x normalize(churn)
@@ -100,9 +99,9 @@ def compute_hotspots(entries: list[FileEntry],
     return stats
 
 
-def rank_hotspots(stats: list[GitStats],
-                  threshold: float = HOTSPOT_THRESHOLD,
-                  top_n: int = 10) -> list[GitStats]:
+def rank_hotspots(
+    stats: list[GitStats], threshold: float = HOTSPOT_THRESHOLD, top_n: int = 10
+) -> list[GitStats]:
     """Return top N hotspots above threshold, ranked by score descending."""
     above = [s for s in stats if s.hotspot > threshold]
     above.sort(key=lambda s: s.hotspot, reverse=True)
@@ -261,10 +260,12 @@ def _entry_in_scope(entry: FileEntry, scope: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def hotspot_summary(entries: list[FileEntry],
-                    stats: list[GitStats],
-                    fn_cc_list: list[FunctionCC] | None = None,
-                    top_n: int = 10) -> dict[str, Any]:
+def hotspot_summary(
+    entries: list[FileEntry],
+    stats: list[GitStats],
+    fn_cc_list: list[FunctionCC] | None = None,
+    top_n: int = 10,
+) -> dict[str, Any]:
     """Generate a hotspot summary report dict.
 
     Used by both CLI output and --json mode.
@@ -275,14 +276,16 @@ def hotspot_summary(entries: list[FileEntry],
     items = []
     for gs in ranked:
         entry = entry_by_path.get(gs.path)
-        items.append({
-            "path": gs.path,
-            "hotspot": gs.hotspot,
-            "complexity": entry.complexity if entry else 0.0,
-            "churn": gs.churn,
-            "authors": gs.authors,
-            "severity": classify_hotspot(gs.hotspot),
-        })
+        items.append(
+            {
+                "path": gs.path,
+                "hotspot": gs.hotspot,
+                "complexity": entry.complexity if entry else 0.0,
+                "churn": gs.churn,
+                "authors": gs.authors,
+                "severity": classify_hotspot(gs.hotspot),
+            }
+        )
 
     return {
         "hotspots": items,

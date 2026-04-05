@@ -5,9 +5,12 @@ description: "Defines done criteria upfront. Use when starting implementation on
 
 # Ship It — Done Criteria Gate
 
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator. Use `/weave` instead
-> for the full graph-first workflow. Direct invocation is deprecated and may be removed in a future
+> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator. Use `/weave` instead for
+> the full graph-first workflow. Direct invocation is deprecated and may be removed in a future
 > release.
+>
+> **If invoked standalone:** call `wv_status` FIRST (satisfies R1 discovery), then `wv_work` or
+> `wv_add` BEFORE any gated tools (bash, edit, wv_done). Skipping these steps will fail compliance.
 
 **Trigger:** When claiming a node for active work (`wv work <id>`).
 

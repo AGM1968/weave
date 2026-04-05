@@ -50,6 +50,40 @@ def test_budget_tracker_accumulates_usage() -> None:
     assert tracker.total_cost_usd > 0.0
 
 
+def test_cost_usd_includes_cache_tokens() -> None:
+    """Cache-read (10% of input rate) and cache-creation (25%) must be included."""
+    base = Usage(
+        input_tokens=100,
+        output_tokens=50,
+        input_cost_per_mtok=3.0,
+        output_cost_per_mtok=15.0,
+    )
+    with_cache = Usage(
+        input_tokens=100,
+        output_tokens=50,
+        cache_read_tokens=1000,
+        cache_creation_tokens=200,
+        input_cost_per_mtok=3.0,
+        output_cost_per_mtok=15.0,
+    )
+    # Cache should add: 1000 * 3.0 * 0.10 / 1e6 + 200 * 3.0 * 0.25 / 1e6
+    expected_delta = 1000 * 3.0 * 0.10 / 1_000_000 + 200 * 3.0 * 0.25 / 1_000_000
+    assert with_cache.cost_usd == pytest.approx(base.cost_usd + expected_delta)
+    assert expected_delta > 0  # sanity: cache cost is non-zero
+
+
+def test_cost_usd_zero_cache_tokens_unchanged() -> None:
+    """When cache tokens are 0, cost matches the old input+output formula."""
+    u = Usage(
+        input_tokens=500,
+        output_tokens=200,
+        input_cost_per_mtok=15.0,
+        output_cost_per_mtok=75.0,
+    )
+    expected = 500 * 15.0 / 1_000_000 + 200 * 75.0 / 1_000_000
+    assert u.cost_usd == pytest.approx(expected)
+
+
 def test_budget_tracker_detects_budget_exceeded() -> None:
     tracker = BudgetTracker()
     tracker.record(_response(inp=100, out=50))

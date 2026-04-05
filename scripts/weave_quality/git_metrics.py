@@ -157,7 +157,7 @@ def _parse_co_change_log(
     def _flush() -> None:
         files = sorted(set(current_files))
         for i, file_a in enumerate(files):
-            for file_b in files[i + 1:]:
+            for file_b in files[i + 1 :]:
                 pair_counts[(file_a, file_b)] += 1
         # Build per-file co-change map
         for f in files:
@@ -189,8 +189,14 @@ def compute_co_changes(repo: str | Path, top_n: int = 5) -> list[CoChange]:
     (was ~500 subprocess spawns, now 1).
     """
     out = _git(
-        ["log", f"-{_CO_CHANGE_MAX_COMMITS}", "--since=6 months ago",
-         "--no-merges", "--format=COMMIT_SEP%n", "--name-only"],
+        [
+            "log",
+            f"-{_CO_CHANGE_MAX_COMMITS}",
+            "--since=6 months ago",
+            "--no-merges",
+            "--format=COMMIT_SEP%n",
+            "--name-only",
+        ],
         cwd=repo,
     )
     if not out:
@@ -230,8 +236,14 @@ def file_co_changes(repo: str | Path, filepath: str, top_n: int = 5) -> list[str
 
     # Fallback: single git log call for this file's commits
     out = _git(
-        ["log", f"-{_CO_CHANGE_MAX_COMMITS}", "--since=6 months ago",
-         "--no-merges", "--format=COMMIT_SEP%n", "--name-only"],
+        [
+            "log",
+            f"-{_CO_CHANGE_MAX_COMMITS}",
+            "--since=6 months ago",
+            "--no-merges",
+            "--format=COMMIT_SEP%n",
+            "--name-only",
+        ],
         cwd=repo,
     )
     if not out:
@@ -267,8 +279,7 @@ def build_file_state(
 # ---------------------------------------------------------------------------
 
 
-def _batch_git_stats(repo: str | Path,
-                     file_paths: list[str]) -> dict[str, GitStats]:
+def _batch_git_stats(repo: str | Path, file_paths: list[str]) -> dict[str, GitStats]:
     """Build GitStats for all files in a single git log pass.
 
     Instead of 3 subprocess calls per file (N*3 total), uses ONE
@@ -369,15 +380,15 @@ def _compute_ownership_from_counts(
         minor_count = 0
     else:
         minor_count = sum(
-            1 for cnt in author_counts.values()
+            1
+            for cnt in author_counts.values()
             if (cnt / actual_total) < _MINOR_THRESHOLD
         )
 
     return ownership_frac, minor_count
 
 
-def enrich_all_git_stats(repo: str | Path,
-                         file_paths: list[str]) -> list[GitStats]:
+def enrich_all_git_stats(repo: str | Path, file_paths: list[str]) -> list[GitStats]:
     """Build GitStats for a list of file paths.
 
     Uses a single-pass batch strategy (1 subprocess call) instead of

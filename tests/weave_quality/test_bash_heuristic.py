@@ -335,9 +335,9 @@ class TestIndentSD:
         lines = [
             "#!/bin/bash",
             "do_thing() {",
-            "  if [ -z \"$1\" ]; then",
+            '  if [ -z "$1" ]; then',
             "    for f in *.txt; do",
-            "      echo \"$f\"",
+            '      echo "$f"',
             "    done",
             "  fi",
             "}",

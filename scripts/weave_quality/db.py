@@ -27,8 +27,13 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
-    CKMetrics, CoChange, FileEntry, FileState,
-    FunctionCC, GitStats, ScanMeta,
+    CKMetrics,
+    CoChange,
+    FileEntry,
+    FileState,
+    FunctionCC,
+    GitStats,
+    ScanMeta,
 )
 
 log = logging.getLogger(__name__)
@@ -113,7 +118,7 @@ CREATE INDEX IF NOT EXISTS idx_gs_hotspot ON git_stats(hotspot DESC);
 """
 
 # Maximum number of scans to retain (current + previous)
-_MAX_SCANS = 5    # how many scans to retain in scan_meta / complexity_trend
+_MAX_SCANS = 5  # how many scans to retain in scan_meta / complexity_trend
 _FILES_SCANS = 2  # how many scans to retain raw files + file_metrics (diff window)
 
 
@@ -143,36 +148,29 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
     and the complexity_trend table. Safe to run on v1 or v2 DBs.
     """
     # Check which columns already exist in files table
-    cols = {r[1] for r in conn.execute(
-        "PRAGMA table_info(files)").fetchall()}
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(files)").fetchall()}
     if "essential_complexity" not in cols:
         conn.execute(
-            "ALTER TABLE files "
-            "ADD COLUMN essential_complexity REAL DEFAULT 0.0")
+            "ALTER TABLE files ADD COLUMN essential_complexity REAL DEFAULT 0.0"
+        )
     if "indent_sd" not in cols:
-        conn.execute(
-            "ALTER TABLE files "
-            "ADD COLUMN indent_sd REAL DEFAULT 0.0")
+        conn.execute("ALTER TABLE files ADD COLUMN indent_sd REAL DEFAULT 0.0")
 
     # Add detail column to file_metrics for fn_cc metadata
-    fm_cols = {r[1] for r in conn.execute(
-        "PRAGMA table_info(file_metrics)").fetchall()}
+    fm_cols = {r[1] for r in conn.execute("PRAGMA table_info(file_metrics)").fetchall()}
     if "detail" not in fm_cols:
-        conn.execute(
-            "ALTER TABLE file_metrics "
-            "ADD COLUMN detail TEXT")
+        conn.execute("ALTER TABLE file_metrics ADD COLUMN detail TEXT")
 
     # Ownership fields in git_stats (Sprint 2)
-    gs_cols = {r[1] for r in conn.execute(
-        "PRAGMA table_info(git_stats)").fetchall()}
+    gs_cols = {r[1] for r in conn.execute("PRAGMA table_info(git_stats)").fetchall()}
     if "ownership_fraction" not in gs_cols:
         conn.execute(
-            "ALTER TABLE git_stats "
-            "ADD COLUMN ownership_fraction REAL DEFAULT 0.0")
+            "ALTER TABLE git_stats ADD COLUMN ownership_fraction REAL DEFAULT 0.0"
+        )
     if "minor_contributors" not in gs_cols:
         conn.execute(
-            "ALTER TABLE git_stats "
-            "ADD COLUMN minor_contributors INTEGER DEFAULT 0")
+            "ALTER TABLE git_stats ADD COLUMN minor_contributors INTEGER DEFAULT 0"
+        )
 
     # Complexity trend table (one row per file per scan)
     conn.executescript("""
@@ -195,12 +193,9 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
     Adds category TEXT DEFAULT 'production' to files. Safe to run on
     v1, v2, or v3 DBs.
     """
-    cols = {r[1] for r in conn.execute(
-        "PRAGMA table_info(files)").fetchall()}
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(files)").fetchall()}
     if "category" not in cols:
-        conn.execute(
-            "ALTER TABLE files "
-            "ADD COLUMN category TEXT DEFAULT 'production'")
+        conn.execute("ALTER TABLE files ADD COLUMN category TEXT DEFAULT 'production'")
     conn.commit()
 
 
@@ -210,12 +205,9 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
     Existing rows get an empty string default (treated as unknown version,
     triggering a full re-scan on the next scan run).
     """
-    cols = {r[1] for r in conn.execute(
-        "PRAGMA table_info(scan_meta)").fetchall()}
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(scan_meta)").fetchall()}
     if "scanner_version" not in cols:
-        conn.execute(
-            "ALTER TABLE scan_meta "
-            "ADD COLUMN scanner_version TEXT DEFAULT ''")
+        conn.execute("ALTER TABLE scan_meta ADD COLUMN scanner_version TEXT DEFAULT ''")
     conn.commit()
 
 
@@ -260,8 +252,9 @@ def reset_db(hot_zone: str | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def begin_scan(conn: sqlite3.Connection, git_head: str,
-               scanner_version: str = "") -> int:
+def begin_scan(
+    conn: sqlite3.Connection, git_head: str, scanner_version: str = ""
+) -> int:
     """Record a new scan, prune old scans beyond retention limit.
 
     Returns the new scan_id.
@@ -301,8 +294,9 @@ def begin_scan(conn: sqlite3.Connection, git_head: str,
     return scan_id
 
 
-def finish_scan(conn: sqlite3.Connection, scan_id: int,
-                files_count: int, duration_ms: int) -> None:
+def finish_scan(
+    conn: sqlite3.Connection, scan_id: int, files_count: int, duration_ms: int
+) -> None:
     """Finalise a scan with counts and duration."""
     conn.execute(
         "UPDATE scan_meta SET files_count = ?, duration_ms = ? WHERE id = ?",
@@ -312,9 +306,7 @@ def finish_scan(conn: sqlite3.Connection, scan_id: int,
 
 def latest_scan(conn: sqlite3.Connection) -> ScanMeta | None:
     """Get the most recent scan metadata, or None."""
-    row = conn.execute(
-        "SELECT * FROM scan_meta ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    row = conn.execute("SELECT * FROM scan_meta ORDER BY id DESC LIMIT 1").fetchone()
     if not row:
         return None
     return ScanMeta(
@@ -329,9 +321,7 @@ def latest_scan(conn: sqlite3.Connection) -> ScanMeta | None:
 
 def previous_scan(conn: sqlite3.Connection) -> ScanMeta | None:
     """Get the second-most-recent scan (for delta reports), or None."""
-    rows = conn.execute(
-        "SELECT * FROM scan_meta ORDER BY id DESC LIMIT 2"
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM scan_meta ORDER BY id DESC LIMIT 2").fetchall()
     if len(rows) < 2:
         return None
     row = rows[1]
@@ -374,15 +364,17 @@ def upsert_file_entry(conn: sqlite3.Connection, entry: FileEntry) -> None:
     )
 
 
-def bulk_upsert_file_entries(conn: sqlite3.Connection,
-                             entries: list[FileEntry]) -> None:
+def bulk_upsert_file_entries(
+    conn: sqlite3.Connection, entries: list[FileEntry]
+) -> None:
     """Insert/update a batch of file entries."""
     for entry in entries:
         upsert_file_entry(conn, entry)
 
 
-def get_file_entries(conn: sqlite3.Connection, scan_id: int,
-                     path: str | None = None) -> list[FileEntry]:
+def get_file_entries(
+    conn: sqlite3.Connection, scan_id: int, path: str | None = None
+) -> list[FileEntry]:
     """Retrieve file entries for a scan, optionally filtered by path."""
     if path:
         rows = conn.execute(
@@ -391,7 +383,8 @@ def get_file_entries(conn: sqlite3.Connection, scan_id: int,
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM files WHERE scan_id = ?", (scan_id,),
+            "SELECT * FROM files WHERE scan_id = ?",
+            (scan_id,),
         ).fetchall()
     return [FileEntry.from_dict(dict(r)) for r in rows]
 
@@ -413,8 +406,9 @@ def upsert_ck_metrics(conn: sqlite3.Connection, ck: CKMetrics) -> None:
         )
 
 
-def get_ck_metrics(conn: sqlite3.Connection, scan_id: int,
-                   path: str) -> CKMetrics | None:
+def get_ck_metrics(
+    conn: sqlite3.Connection, scan_id: int, path: str
+) -> CKMetrics | None:
     """Get CK metrics for a file in a scan.
 
     Excludes per-function CC rows (fn_cc:*) which share the same
@@ -433,8 +427,7 @@ def get_ck_metrics(conn: sqlite3.Connection, scan_id: int,
 # ---------------------------------------------------------------------------
 
 
-def upsert_function_cc(conn: sqlite3.Connection,
-                       fn: FunctionCC) -> None:
+def upsert_function_cc(conn: sqlite3.Connection, fn: FunctionCC) -> None:
     """Insert or update per-function CC in file_metrics EAV."""
     row = fn.to_eav_row()
     conn.execute(
@@ -448,15 +441,15 @@ def upsert_function_cc(conn: sqlite3.Connection,
     )
 
 
-def bulk_upsert_function_cc(conn: sqlite3.Connection,
-                            fns: list[FunctionCC]) -> None:
+def bulk_upsert_function_cc(conn: sqlite3.Connection, fns: list[FunctionCC]) -> None:
     """Batch insert per-function CC rows."""
     for fn in fns:
         upsert_function_cc(conn, fn)
 
 
-def get_function_cc(conn: sqlite3.Connection, scan_id: int,
-                    path: str) -> list[FunctionCC]:
+def get_function_cc(
+    conn: sqlite3.Connection, scan_id: int, path: str
+) -> list[FunctionCC]:
     """Get per-function CC entries for a file in a scan."""
     rows = conn.execute(
         """SELECT * FROM file_metrics
@@ -466,8 +459,7 @@ def get_function_cc(conn: sqlite3.Connection, scan_id: int,
     return _rows_to_function_cc(rows)
 
 
-def get_all_function_cc(conn: sqlite3.Connection,
-                        scan_id: int) -> list[FunctionCC]:
+def get_all_function_cc(conn: sqlite3.Connection, scan_id: int) -> list[FunctionCC]:
     """Get all per-function CC entries for a scan (all files)."""
     rows = conn.execute(
         """SELECT * FROM file_metrics
@@ -484,16 +476,18 @@ def _rows_to_function_cc(rows: list[Any]) -> list[FunctionCC]:
         d = dict(r)
         fn_name = d["metric"].removeprefix("fn_cc:").rsplit("@", 1)[0]
         detail = json.loads(d["detail"]) if d.get("detail") else {}
-        results.append(FunctionCC(
-            path=d["path"],
-            scan_id=d["scan_id"],
-            function_name=fn_name,
-            complexity=float(d["value"]),
-            line_start=detail.get("line_start", 0),
-            line_end=detail.get("line_end", 0),
-            essential_complexity=detail.get("essential_complexity", 1.0),
-            is_dispatch=detail.get("is_dispatch", False),
-        ))
+        results.append(
+            FunctionCC(
+                path=d["path"],
+                scan_id=d["scan_id"],
+                function_name=fn_name,
+                complexity=float(d["value"]),
+                line_start=detail.get("line_start", 0),
+                line_end=detail.get("line_end", 0),
+                essential_complexity=detail.get("essential_complexity", 1.0),
+                is_dispatch=detail.get("is_dispatch", False),
+            )
+        )
     return results
 
 
@@ -502,10 +496,13 @@ def _rows_to_function_cc(rows: list[Any]) -> list[FunctionCC]:
 # ---------------------------------------------------------------------------
 
 
-def upsert_complexity_trend(conn: sqlite3.Connection,
-                            path: str, scan_id: int,
-                            complexity: float,
-                            essential: float) -> None:
+def upsert_complexity_trend(
+    conn: sqlite3.Connection,
+    path: str,
+    scan_id: int,
+    complexity: float,
+    essential: float,
+) -> None:
     """Record complexity snapshot for trend analysis."""
     conn.execute(
         """INSERT INTO complexity_trend
@@ -535,8 +532,7 @@ def compute_trend_direction(values: list[float]) -> str:
         return "stable"
     x_mean = (n - 1) / 2.0
     y_mean = sum(values) / n
-    numerator = sum((i - x_mean) * (v - y_mean)
-                    for i, v in enumerate(values))
+    numerator = sum((i - x_mean) * (v - y_mean) for i, v in enumerate(values))
     denominator = sum((i - x_mean) ** 2 for i in range(n))
     if denominator == 0 or y_mean == 0:
         return "stable"
@@ -562,8 +558,7 @@ def get_all_trend_directions(conn: sqlite3.Connection) -> dict[str, str]:
     for row in rows:
         path, complexity = row[0], float(row[1] or 0.0)
         history.setdefault(path, []).append(complexity)
-    return {path: compute_trend_direction(vals)
-            for path, vals in history.items()}
+    return {path: compute_trend_direction(vals) for path, vals in history.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -591,19 +586,18 @@ def upsert_git_stats(conn: sqlite3.Connection, stats: GitStats) -> None:
     )
 
 
-def bulk_upsert_git_stats(conn: sqlite3.Connection,
-                          stats_list: list[GitStats]) -> None:
+def bulk_upsert_git_stats(conn: sqlite3.Connection, stats_list: list[GitStats]) -> None:
     """Insert/update a batch of git stats."""
     for stats in stats_list:
         upsert_git_stats(conn, stats)
 
 
-def get_git_stats(conn: sqlite3.Connection,
-                  path: str | None = None) -> list[GitStats]:
+def get_git_stats(conn: sqlite3.Connection, path: str | None = None) -> list[GitStats]:
     """Get git stats, optionally for a single file."""
     if path:
         rows = conn.execute(
-            "SELECT * FROM git_stats WHERE path = ?", (path,),
+            "SELECT * FROM git_stats WHERE path = ?",
+            (path,),
         ).fetchall()
     else:
         rows = conn.execute("SELECT * FROM git_stats").fetchall()
@@ -637,17 +631,16 @@ def upsert_co_change(conn: sqlite3.Connection, cc: CoChange) -> None:
     )
 
 
-def bulk_upsert_co_changes(conn: sqlite3.Connection,
-                           pairs: list[CoChange]) -> None:
+def bulk_upsert_co_changes(conn: sqlite3.Connection, pairs: list[CoChange]) -> None:
     """Replace all co-change pairs. Clears old data first."""
     conn.execute("DELETE FROM co_change")
     for cc in pairs:
         upsert_co_change(conn, cc)
 
 
-def get_co_changes(conn: sqlite3.Connection,
-                   path: str | None = None,
-                   top_n: int = 10) -> list[CoChange]:
+def get_co_changes(
+    conn: sqlite3.Connection, path: str | None = None, top_n: int = 10
+) -> list[CoChange]:
     """Get co-change pairs, optionally involving a specific file."""
     if path:
         rows = conn.execute(
@@ -661,8 +654,9 @@ def get_co_changes(conn: sqlite3.Connection,
             "SELECT * FROM co_change ORDER BY count DESC LIMIT ?",
             (top_n,),
         ).fetchall()
-    return [CoChange(path_a=r["path_a"], path_b=r["path_b"], count=r["count"])
-            for r in rows]
+    return [
+        CoChange(path_a=r["path_a"], path_b=r["path_b"], count=r["count"]) for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -683,8 +677,7 @@ def upsert_file_state(conn: sqlite3.Connection, fs: FileState) -> None:
     )
 
 
-def bulk_upsert_file_state(conn: sqlite3.Connection,
-                           states: list[FileState]) -> None:
+def bulk_upsert_file_state(conn: sqlite3.Connection, states: list[FileState]) -> None:
     """Insert/update a batch of file states."""
     for fs in states:
         upsert_file_state(conn, fs)
@@ -693,15 +686,17 @@ def bulk_upsert_file_state(conn: sqlite3.Connection,
 def get_file_state(conn: sqlite3.Connection, path: str) -> FileState | None:
     """Get file state for a path, or None if not tracked."""
     row = conn.execute(
-        "SELECT * FROM file_state WHERE path = ?", (path,),
+        "SELECT * FROM file_state WHERE path = ?",
+        (path,),
     ).fetchone()
     if not row:
         return None
     return FileState.from_dict(dict(row))
 
 
-def file_changed(conn: sqlite3.Connection, path: str,
-                 current_mtime: int, current_blob: str) -> bool:
+def file_changed(
+    conn: sqlite3.Connection, path: str, current_mtime: int, current_blob: str
+) -> bool:
     """Check if a file has changed since last scan.
 
     Returns True if the file should be re-scanned.
@@ -728,8 +723,7 @@ def is_stale(conn: sqlite3.Connection, current_head: str) -> bool:
     return scan.is_stale(current_head)
 
 
-def staleness_info(conn: sqlite3.Connection,
-                   current_head: str) -> dict[str, Any]:
+def staleness_info(conn: sqlite3.Connection, current_head: str) -> dict[str, Any]:
     """Return staleness details for reporting."""
     scan = latest_scan(conn)
     if scan is None:

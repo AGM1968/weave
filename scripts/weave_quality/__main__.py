@@ -171,7 +171,8 @@ def _discover_files(repo: str, exclude_globs: list[str] | None = None) -> list[s
         for root, dirs, filenames in os.walk(repo):
             # Skip hidden dirs and common non-source dirs
             dirs[:] = [
-                d for d in dirs
+                d
+                for d in dirs
                 if not d.startswith(".")
                 and d not in ("node_modules", "__pycache__", ".git", "venv", ".venv")
             ]
@@ -251,7 +252,7 @@ def cmd_scan(args: argparse.Namespace) -> int:  # pylint: disable=too-many-state
     start_time = time.monotonic()
 
     # Merge config + CLI excludes
-    cli_excludes: list[str] = getattr(args, 'exclude', [])
+    cli_excludes: list[str] = getattr(args, "exclude", [])
     config_excludes = _load_config_excludes(repo)
     all_excludes = config_excludes + cli_excludes
 
@@ -309,8 +310,7 @@ def cmd_scan(args: argparse.Namespace) -> int:  # pylint: disable=too-many-state
     for rel_path in files_to_scan:
         abs_path = os.path.join(repo, rel_path)
         if rel_path.endswith(".py"):
-            entry, ck, fn_cc = analyze_python_file(
-                abs_path, scan_id)
+            entry, ck, fn_cc = analyze_python_file(abs_path, scan_id)
             entry = FileEntry(
                 path=rel_path,
                 scan_id=scan_id,
@@ -374,21 +374,21 @@ def cmd_scan(args: argparse.Namespace) -> int:  # pylint: disable=too-many-state
         for rel_path in files_unchanged:
             prev_e = prev_by_path.get(rel_path)
             if prev_e:
-                carried.append(FileEntry(
-                    path=prev_e.path,
-                    scan_id=scan_id,
-                    language=prev_e.language,
-                    loc=prev_e.loc,
-                    complexity=prev_e.complexity,
-                    functions=prev_e.functions,
-                    max_nesting=prev_e.max_nesting,
-                    avg_fn_len=prev_e.avg_fn_len,
-                    essential_complexity=(
-                        prev_e.essential_complexity),
-                    indent_sd=prev_e.indent_sd,
-                    category=classify_file(
-                        prev_e.path, classify_overrides),
-                ))
+                carried.append(
+                    FileEntry(
+                        path=prev_e.path,
+                        scan_id=scan_id,
+                        language=prev_e.language,
+                        loc=prev_e.loc,
+                        complexity=prev_e.complexity,
+                        functions=prev_e.functions,
+                        max_nesting=prev_e.max_nesting,
+                        avg_fn_len=prev_e.avg_fn_len,
+                        essential_complexity=(prev_e.essential_complexity),
+                        indent_sd=prev_e.indent_sd,
+                        category=classify_file(prev_e.path, classify_overrides),
+                    )
+                )
         if carried:
             bulk_upsert_file_entries(conn, carried)
             entries.extend(carried)
@@ -411,8 +411,8 @@ def cmd_scan(args: argparse.Namespace) -> int:  # pylint: disable=too-many-state
     # Record complexity trend for all entries (for trend analysis)
     for e in entries:
         upsert_complexity_trend(
-            conn, e.path, scan_id,
-            e.complexity, e.essential_complexity)
+            conn, e.path, scan_id, e.complexity, e.essential_complexity
+        )
 
     # Update file state for incremental tracking
     for rel_path in files_to_scan:
@@ -470,7 +470,8 @@ def cmd_scan(args: argparse.Namespace) -> int:  # pylint: disable=too-many-state
         print(f"Scanning {repo}...", file=sys.stderr)
         for lang, count in sorted(lang_counts.items()):
             changed = sum(
-                1 for f in files_to_scan
+                1
+                for f in files_to_scan
                 if (f.endswith(".py") and lang == "python")
                 or (not f.endswith(".py") and lang == "bash")
             )
@@ -483,7 +484,9 @@ def cmd_scan(args: argparse.Namespace) -> int:  # pylint: disable=too-many-state
             f"  Hotspots: {summary.get('hotspot_count', 0)} files above threshold",
             file=sys.stderr,
         )
-        print(f"\nQuality score: {summary.get('quality_score', 100)}/100", file=sys.stderr)
+        print(
+            f"\nQuality score: {summary.get('quality_score', 100)}/100", file=sys.stderr
+        )
 
     return 0
 
@@ -498,7 +501,9 @@ def _get_current_head() -> str:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         )
         return result.stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -609,13 +614,16 @@ def cmd_functions(args: argparse.Namespace) -> int:  # noqa: PLR0912
     n_flagged = len(flagged)
     n_exempt = len(exempt)
     exempt_note = f" ({n_exempt} dispatch-exempt)" if n_exempt else ""
-    print(f"  Summary: {n_flagged}/{total} functions exceed threshold{exempt_note}",
-          file=sys.stderr)
+    print(
+        f"  Summary: {n_flagged}/{total} functions exceed threshold{exempt_note}",
+        file=sys.stderr,
+    )
 
     # Distribution
     hist_parts = [f"{label}:{count}" for label, count in zip(CC_HISTOGRAM_LABELS, hist)]
-    print(f"  Distribution: [{', '.join(hist_parts)}]  Gini={gini:.2f}",
-          file=sys.stderr)
+    print(
+        f"  Distribution: [{', '.join(hist_parts)}]  Gini={gini:.2f}", file=sys.stderr
+    )
     return 0
 
 
@@ -676,20 +684,22 @@ def cmd_hotspots(args: argparse.Namespace) -> int:
             cc = entry.complexity if entry else 0.0
             ev = entry.essential_complexity if entry else 0.0
             isd = round(entry.indent_sd, 2) if entry else 0.0
-            items.append({
-                "path": gs.path,
-                "hotspot": gs.hotspot,
-                "complexity": cc,
-                "essential_complexity": ev,
-                "indent_sd": isd,
-                "cc_gini": gini_by_path.get(gs.path, 0.0),
-                "churn": gs.churn,
-                "authors": gs.authors,
-                "ownership_fraction": round(gs.ownership_fraction, 2),
-                "minor_contributors": gs.minor_contributors,
-                "trend_direction": trend_dirs.get(gs.path, "stable"),
-                "severity": classify_hotspot(gs.hotspot),
-            })
+            items.append(
+                {
+                    "path": gs.path,
+                    "hotspot": gs.hotspot,
+                    "complexity": cc,
+                    "essential_complexity": ev,
+                    "indent_sd": isd,
+                    "cc_gini": gini_by_path.get(gs.path, 0.0),
+                    "churn": gs.churn,
+                    "authors": gs.authors,
+                    "ownership_fraction": round(gs.ownership_fraction, 2),
+                    "minor_contributors": gs.minor_contributors,
+                    "trend_direction": trend_dirs.get(gs.path, "stable"),
+                    "severity": classify_hotspot(gs.hotspot),
+                }
+            )
         output = {
             "stale": stale.get("stale", False),
             "scan_id": scan.id,
@@ -718,8 +728,7 @@ def cmd_hotspots(args: argparse.Namespace) -> int:
                 cc = entry.complexity if entry else 0.0
                 ev = entry.essential_complexity if entry else 0.0
                 trend = trend_dirs.get(gs.path, "stable")
-                trend_sym = {"deteriorating": "↑", "refactored": "↓"
-                             }.get(trend, "~")
+                trend_sym = {"deteriorating": "↑", "refactored": "↓"}.get(trend, "~")
                 ev_str = f"  ev={ev:.0f}" if ev > 0 else ""
                 gini = gini_by_path.get(gs.path, 0.0)
                 gini_str = f"  gini={gini:.2f}" if gini > 0 else ""
@@ -760,16 +769,20 @@ def cmd_diff(args: argparse.Namespace) -> int:
     if prev is None:
         conn.close()
         if json_output:
-            print(json.dumps({
-                "scan_current": current.id,
-                "scan_previous": None,
-                "improved": [],
-                "degraded": [],
-                "new_files": [],
-                "removed_files": [],
-                "quality_score_current": 0,
-                "quality_score_previous": None,
-            }))
+            print(
+                json.dumps(
+                    {
+                        "scan_current": current.id,
+                        "scan_previous": None,
+                        "improved": [],
+                        "degraded": [],
+                        "new_files": [],
+                        "removed_files": [],
+                        "quality_score_current": 0,
+                        "quality_score_previous": None,
+                    }
+                )
+            )
         else:
             print(
                 "No previous scan to diff against. "
@@ -809,9 +822,11 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
     # Compute quality scores (scope filtering also done inside)
     cur_score = compute_quality_score(
-        current_entries, all_git_stats, cur_fn_cc, scope=scope)
+        current_entries, all_git_stats, cur_fn_cc, scope=scope
+    )
     prev_score = compute_quality_score(
-        prev_entries, all_git_stats, prev_fn_cc, scope=scope)
+        prev_entries, all_git_stats, prev_fn_cc, scope=scope
+    )
 
     # Categorize file changes
     all_paths = sorted(set(cur_by_path.keys()) | set(prev_by_path.keys()))
@@ -825,11 +840,13 @@ def cmd_diff(args: argparse.Namespace) -> int:
         prev_e = prev_by_path.get(path)
 
         if cur_e and not prev_e:
-            new_files.append({
-                "path": path,
-                "complexity": cur_e.complexity,
-                "severity": classify_complexity(cur_e.complexity),
-            })
+            new_files.append(
+                {
+                    "path": path,
+                    "complexity": cur_e.complexity,
+                    "severity": classify_complexity(cur_e.complexity),
+                }
+            )
         elif prev_e and not cur_e:
             removed_files.append(path)
         elif cur_e and prev_e:
@@ -875,8 +892,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
             print("Degraded:", file=sys.stderr)
             for item in degraded:
                 trend = str(item.get("trend_direction", "stable"))
-                trend_sym = {"deteriorating": " ↑", "refactored": " ↓"}.get(
-                    trend, "")
+                trend_sym = {"deteriorating": " ↑", "refactored": " ↓"}.get(trend, "")
                 print(
                     f"  {item['path']}: complexity "
                     f"{item['complexity_previous']} -> {item['complexity_current']} "
@@ -888,8 +904,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
             print("Improved:", file=sys.stderr)
             for item in improved:
                 trend = str(item.get("trend_direction", "stable"))
-                trend_sym = {"deteriorating": " ↑", "refactored": " ↓"}.get(
-                    trend, "")
+                trend_sym = {"deteriorating": " ↑", "refactored": " ↓"}.get(trend, "")
                 print(
                     f"  {item['path']}: complexity "
                     f"{item['complexity_previous']} -> {item['complexity_current']} "
@@ -943,7 +958,9 @@ def _wv_cmd(*cmd_args: str) -> tuple[int, str]:
     try:
         result = subprocess.run(
             ["wv", *cmd_args],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         return result.returncode, result.stdout.strip()
     except FileNotFoundError:
@@ -1024,23 +1041,35 @@ def cmd_promote(args: argparse.Namespace) -> int:
                 "severity": severity,
             }
             new_text = f"Hotspot: {gs.path} (CC={cc:.0f}, churn={gs.churn})"
-            new_meta = json.dumps({
-                "quality_finding_id": fid,
-                "code_ref": code_ref,
-                "type": "quality-finding",
-            })
+            new_meta = json.dumps(
+                {
+                    "quality_finding_id": fid,
+                    "code_ref": code_ref,
+                    "type": "quality-finding",
+                }
+            )
             if dry_run:
-                print(f"[DRY-RUN] Would update {existing_id}: {new_text}", file=sys.stderr)
-                upd = {"node_id": existing_id, "text": new_text,
-                       "finding_id": fid, **code_ref}
+                print(
+                    f"[DRY-RUN] Would update {existing_id}: {new_text}", file=sys.stderr
+                )
+                upd = {
+                    "node_id": existing_id,
+                    "text": new_text,
+                    "finding_id": fid,
+                    **code_ref,
+                }
                 updated.append(upd)
                 continue
-            _wv_cmd("update", existing_id,
-                    f"--text={new_text}", f"--metadata={new_meta}")
-            print(f"Updated {existing_id}: \"{new_text}\"",
-                  file=sys.stderr)
-            upd = {"node_id": existing_id, "text": new_text,
-                   "finding_id": fid, **code_ref}
+            _wv_cmd(
+                "update", existing_id, f"--text={new_text}", f"--metadata={new_meta}"
+            )
+            print(f'Updated {existing_id}: "{new_text}"', file=sys.stderr)
+            upd = {
+                "node_id": existing_id,
+                "text": new_text,
+                "finding_id": fid,
+                **code_ref,
+            }
             updated.append(upd)
             continue
 
@@ -1072,7 +1101,8 @@ def cmd_promote(args: argparse.Namespace) -> int:
         # Create the node via wv add (no --parent: avoids implements edge)
         meta_json = json.dumps(metadata)
         rc, out = _wv_cmd(
-            "add", text,
+            "add",
+            text,
             f"--metadata={meta_json}",
             "--force",
         )
@@ -1090,12 +1120,16 @@ def cmd_promote(args: argparse.Namespace) -> int:
         if node_id:
             # Create references edge only (informational, per proposal §6)
             _wv_cmd("link", node_id, parent, "--type=references")
-            print(f"Created {node_id}: \"{text}\"", file=sys.stderr)
+            print(f'Created {node_id}: "{text}"', file=sys.stderr)
             print(f"  -> references {parent}", file=sys.stderr)
-            promoted.append({
-                "node_id": node_id, "text": text,
-                "finding_id": fid, **code_ref,
-            })
+            promoted.append(
+                {
+                    "node_id": node_id,
+                    "text": text,
+                    "finding_id": fid,
+                    **code_ref,
+                }
+            )
 
     if json_output:
         result: dict[str, object] = {
@@ -1108,7 +1142,10 @@ def cmd_promote(args: argparse.Namespace) -> int:
         print(json.dumps(result))
     else:
         if updated:
-            print(f"Updated {len(updated)} existing findings with fresh data.", file=sys.stderr)
+            print(
+                f"Updated {len(updated)} existing findings with fresh data.",
+                file=sys.stderr,
+            )
         if skipped > 0:
             print(f"Skipped {skipped} already-promoted findings.", file=sys.stderr)
         if not promoted and not updated and not dry_run:
@@ -1149,14 +1186,18 @@ def cmd_health_info(args: argparse.Namespace) -> None:
     score = compute_quality_score(entries, all_stats, all_fn_cc)
     hotspot_count = sum(1 for s in all_stats if s.hotspot > 0.5)
 
-    print(json.dumps({
-        "available": True,
-        "score": score,
-        "hotspot_count": hotspot_count,
-        "total_files": len(entries),
-        "git_head": scan.git_head,
-        "scanned_at": scan.scanned_at,
-    }))
+    print(
+        json.dumps(
+            {
+                "available": True,
+                "score": score,
+                "hotspot_count": hotspot_count,
+                "total_files": len(entries),
+                "git_head": scan.git_head,
+                "scanned_at": scan.scanned_at,
+            }
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1218,10 +1259,14 @@ def cmd_context_files(args: argparse.Namespace) -> None:
 
     conn.close()
 
-    print(json.dumps({
-        "code_quality": results,
-        "quality_as_of": scan.git_head,
-    }))
+    print(
+        json.dumps(
+            {
+                "code_quality": results,
+                "quality_as_of": scan.git_head,
+            }
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1258,7 +1303,8 @@ def main() -> int:  # pragma: no cover
         help="WV_HOT_ZONE directory (default: from env or /dev/shm/weave)",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable debug logging",
     )
@@ -1267,15 +1313,22 @@ def main() -> int:  # pragma: no cover
 
     # scan
     scan_parser = sub.add_parser("scan", help="Scan codebase for quality metrics")
-    scan_parser.add_argument("path", nargs="?", help="Path to scan (default: repo root)")
+    scan_parser.add_argument(
+        "path", nargs="?", help="Path to scan (default: repo root)"
+    )
     scan_parser.add_argument("--json", action="store_true", help="JSON output")
-    scan_parser.add_argument("--exclude", action="append", default=[],
-                             help="Exclude files matching glob (repeatable)")
+    scan_parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Exclude files matching glob (repeatable)",
+    )
 
     # hotspots
     hotspots_parser = sub.add_parser("hotspots", help="Ranked hotspot report")
-    hotspots_parser.add_argument("--top", type=int, default=10,
-                                 help="Number of results (default: 10)")
+    hotspots_parser.add_argument(
+        "--top", type=int, default=10, help="Number of results (default: 10)"
+    )
     hotspots_parser.add_argument("--json", action="store_true", help="JSON output")
     hotspots_parser.add_argument(
         "--scope",
@@ -1296,21 +1349,27 @@ def main() -> int:  # pragma: no cover
 
     # promote
     promote_parser = sub.add_parser("promote", help="Promote findings to Weave nodes")
-    promote_parser.add_argument("--top", type=int, default=5,
-                                help="Number of findings (default: 5)")
-    promote_parser.add_argument("--parent", required=True,
-                                help="Parent node ID to link via references")
-    promote_parser.add_argument("--json", action="store_true",
-                                help="JSON output")
-    promote_parser.add_argument("--upsert", action="store_true",
-                                help="Update existing findings with fresh data")
-    promote_parser.add_argument("--dry-run", action="store_true", help="Show what would be created")
+    promote_parser.add_argument(
+        "--top", type=int, default=5, help="Number of findings (default: 5)"
+    )
+    promote_parser.add_argument(
+        "--parent", required=True, help="Parent node ID to link via references"
+    )
+    promote_parser.add_argument("--json", action="store_true", help="JSON output")
+    promote_parser.add_argument(
+        "--upsert", action="store_true", help="Update existing findings with fresh data"
+    )
+    promote_parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would be created"
+    )
 
     # health-info (for wv health integration)
     sub.add_parser("health-info", help="Compact quality summary for wv health")
 
     # context-files (for wv context integration)
-    sub.add_parser("context-files", help="Quality data for files (reads paths from stdin)")
+    sub.add_parser(
+        "context-files", help="Quality data for files (reads paths from stdin)"
+    )
 
     # functions
     functions_parser = sub.add_parser(

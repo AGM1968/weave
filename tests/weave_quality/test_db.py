@@ -74,8 +74,14 @@ class TestSchema:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        expected = {"scan_meta", "files", "file_metrics", "git_stats",
-                    "co_change", "file_state"}
+        expected = {
+            "scan_meta",
+            "files",
+            "file_metrics",
+            "git_stats",
+            "co_change",
+            "file_state",
+        }
         assert expected.issubset(tables)
 
     def test_init_idempotent(self, db: sqlite3.Connection, tmp_path: Path) -> None:
@@ -148,9 +154,7 @@ class TestScanLifecycle:
         begin_scan(db, "head2")
         begin_scan(db, "head3")
         # scan1 pruned, its files should be gone
-        rows = db.execute(
-            "SELECT * FROM files WHERE scan_id = ?", (sid1,)
-        ).fetchall()
+        rows = db.execute("SELECT * FROM files WHERE scan_id = ?", (sid1,)).fetchall()
         assert len(rows) == 0
 
 
@@ -162,8 +166,15 @@ class TestScanLifecycle:
 class TestFileEntries:
     def test_upsert_and_get(self, db: sqlite3.Connection) -> None:
         sid = begin_scan(db, "abc123")
-        fe = FileEntry(path="src/a.py", scan_id=sid, language="python",
-                       loc=100, complexity=5.0, functions=3, avg_fn_len=12.0)
+        fe = FileEntry(
+            path="src/a.py",
+            scan_id=sid,
+            language="python",
+            loc=100,
+            complexity=5.0,
+            functions=3,
+            avg_fn_len=12.0,
+        )
         upsert_file_entry(db, fe)
         db.commit()
         results = get_file_entries(db, sid)
@@ -210,8 +221,7 @@ class TestFileEntries:
 class TestCKMetrics:
     def test_upsert_and_get(self, db: sqlite3.Connection) -> None:
         sid = begin_scan(db, "abc123")
-        ck = CKMetrics(path="a.py", scan_id=sid,
-                       metrics={"wmc": 5.0, "cbo": 3.0})
+        ck = CKMetrics(path="a.py", scan_id=sid, metrics={"wmc": 5.0, "cbo": 3.0})
         upsert_ck_metrics(db, ck)
         db.commit()
         got = get_ck_metrics(db, sid, "a.py")
@@ -304,16 +314,22 @@ class TestFileState:
         assert file_changed(db, "new.py", 100, "blob") is True
 
     def test_file_changed_by_blob(self, db: sqlite3.Connection) -> None:
-        bulk_upsert_file_state(db, [
-            FileState(path="a.py", mtime=100, git_blob="aaa"),
-        ])
+        bulk_upsert_file_state(
+            db,
+            [
+                FileState(path="a.py", mtime=100, git_blob="aaa"),
+            ],
+        )
         assert file_changed(db, "a.py", 100, "aaa") is False
         assert file_changed(db, "a.py", 100, "bbb") is True
 
     def test_file_changed_by_mtime(self, db: sqlite3.Connection) -> None:
-        bulk_upsert_file_state(db, [
-            FileState(path="a.py", mtime=100, git_blob=""),
-        ])
+        bulk_upsert_file_state(
+            db,
+            [
+                FileState(path="a.py", mtime=100, git_blob=""),
+            ],
+        )
         assert file_changed(db, "a.py", 100, "") is False
         assert file_changed(db, "a.py", 200, "") is True
 
@@ -359,51 +375,56 @@ class TestStaleness:
 
 class TestSchemaV2:
     def test_files_has_depth_columns(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
-        cols = {r[1] for r in db.execute(
-            "PRAGMA table_info(files)").fetchall()}
+        cols = {r[1] for r in db.execute("PRAGMA table_info(files)").fetchall()}
         assert "essential_complexity" in cols
         assert "indent_sd" in cols
 
     def test_file_metrics_has_detail(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
-        cols = {r[1] for r in db.execute(
-            "PRAGMA table_info(file_metrics)").fetchall()}
+        cols = {r[1] for r in db.execute("PRAGMA table_info(file_metrics)").fetchall()}
         assert "detail" in cols
 
     def test_complexity_trend_table_exists(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         tables = {
-            r[0] for r in db.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table'"
+            r[0]
+            for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
         assert "complexity_trend" in tables
 
     def test_migration_idempotent(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         """Running init_db twice on same DB doesn't fail."""
         conn1 = init_db(hot_zone=str(tmp_path))
         conn1.close()
         conn2 = init_db(hot_zone=str(tmp_path))
-        cols = {r[1] for r in conn2.execute(
-            "PRAGMA table_info(files)").fetchall()}
+        cols = {r[1] for r in conn2.execute("PRAGMA table_info(files)").fetchall()}
         assert "essential_complexity" in cols
         conn2.close()
 
     def test_depth_fields_in_upsert(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         scan_id = begin_scan(db, "abc")
         entry = FileEntry(
-            path="a.py", scan_id=scan_id,
-            language="python", complexity=10.0,
-            essential_complexity=3.0, indent_sd=1.5,
+            path="a.py",
+            scan_id=scan_id,
+            language="python",
+            complexity=10.0,
+            essential_complexity=3.0,
+            indent_sd=1.5,
         )
         upsert_file_entry(db, entry)
         db.commit()
@@ -420,20 +441,27 @@ class TestSchemaV2:
 
 class TestFunctionCCStorage:
     def test_upsert_and_get(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         scan_id = begin_scan(db, "abc")
         fns = [
             FunctionCC(
-                path="a.py", scan_id=scan_id,
-                function_name="foo", complexity=5.0,
-                line_start=1, line_end=10,
+                path="a.py",
+                scan_id=scan_id,
+                function_name="foo",
+                complexity=5.0,
+                line_start=1,
+                line_end=10,
                 is_dispatch=False,
             ),
             FunctionCC(
-                path="a.py", scan_id=scan_id,
-                function_name="bar", complexity=12.0,
-                line_start=15, line_end=40,
+                path="a.py",
+                scan_id=scan_id,
+                function_name="bar",
+                complexity=12.0,
+                line_start=15,
+                line_end=40,
                 is_dispatch=True,
             ),
         ]
@@ -448,26 +476,34 @@ class TestFunctionCCStorage:
         assert by_name["bar"].is_dispatch is True
 
     def test_get_empty(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         scan_id = begin_scan(db, "abc")
         result = get_function_cc(db, scan_id, "nope.py")
         assert not result
 
     def test_upsert_updates_existing(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         scan_id = begin_scan(db, "abc")
         fn1 = FunctionCC(
-            path="a.py", scan_id=scan_id,
-            function_name="foo", complexity=5.0,
-            line_start=1, line_end=10,
+            path="a.py",
+            scan_id=scan_id,
+            function_name="foo",
+            complexity=5.0,
+            line_start=1,
+            line_end=10,
         )
         bulk_upsert_function_cc(db, [fn1])
         fn2 = FunctionCC(
-            path="a.py", scan_id=scan_id,
-            function_name="foo", complexity=8.0,
-            line_start=1, line_end=15,
+            path="a.py",
+            scan_id=scan_id,
+            function_name="foo",
+            complexity=8.0,
+            line_start=1,
+            line_end=15,
         )
         bulk_upsert_function_cc(db, [fn2])
         result = get_function_cc(db, scan_id, "a.py")
@@ -476,19 +512,24 @@ class TestFunctionCCStorage:
         assert result[0].line_end == 15
 
     def test_fn_cc_isolated_from_ck(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         """fn_cc rows don't interfere with CK metric reads."""
         scan_id = begin_scan(db, "abc")
         ck = CKMetrics(
-            path="a.py", scan_id=scan_id,
+            path="a.py",
+            scan_id=scan_id,
             metrics={"wmc": 10.0},
         )
         upsert_ck_metrics(db, ck)
         fn = FunctionCC(
-            path="a.py", scan_id=scan_id,
-            function_name="foo", complexity=5.0,
-            line_start=1, line_end=10,
+            path="a.py",
+            scan_id=scan_id,
+            function_name="foo",
+            complexity=5.0,
+            line_start=1,
+            line_end=10,
         )
         bulk_upsert_function_cc(db, [fn])
         db.commit()
@@ -505,15 +546,14 @@ class TestFunctionCCStorage:
 
 class TestComplexityTrend:
     def test_upsert_and_query(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         scan_id = begin_scan(db, "abc")
-        upsert_complexity_trend(
-            db, "a.py", scan_id, 15.0, 3.0)
+        upsert_complexity_trend(db, "a.py", scan_id, 15.0, 3.0)
         db.commit()
         row = db.execute(
-            "SELECT * FROM complexity_trend "
-            "WHERE path = ? AND scan_id = ?",
+            "SELECT * FROM complexity_trend WHERE path = ? AND scan_id = ?",
             ("a.py", scan_id),
         ).fetchone()
         assert row is not None
@@ -521,24 +561,23 @@ class TestComplexityTrend:
         assert dict(row)["essential"] == 3.0
 
     def test_upsert_updates_existing(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         scan_id = begin_scan(db, "abc")
-        upsert_complexity_trend(
-            db, "a.py", scan_id, 10.0, 2.0)
-        upsert_complexity_trend(
-            db, "a.py", scan_id, 15.0, 3.0)
+        upsert_complexity_trend(db, "a.py", scan_id, 10.0, 2.0)
+        upsert_complexity_trend(db, "a.py", scan_id, 15.0, 3.0)
         db.commit()
         rows = db.execute(
-            "SELECT * FROM complexity_trend "
-            "WHERE path = ? AND scan_id = ?",
+            "SELECT * FROM complexity_trend WHERE path = ? AND scan_id = ?",
             ("a.py", scan_id),
         ).fetchall()
         assert len(rows) == 1
         assert dict(rows[0])["complexity"] == 15.0
 
     def test_multiple_scans(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         s1 = begin_scan(db, "aaa")
         upsert_complexity_trend(db, "a.py", s1, 20.0, 5.0)
@@ -547,8 +586,7 @@ class TestComplexityTrend:
         upsert_complexity_trend(db, "a.py", s2, 15.0, 3.0)
         db.commit()
         rows = db.execute(
-            "SELECT complexity FROM complexity_trend "
-            "WHERE path = ? ORDER BY scan_id",
+            "SELECT complexity FROM complexity_trend WHERE path = ? ORDER BY scan_id",
             ("a.py",),
         ).fetchall()
         assert len(rows) == 2
@@ -556,7 +594,8 @@ class TestComplexityTrend:
         assert rows[1][0] == 15.0  # scan 2
 
     def test_cascade_delete(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         """Pruning old scans cascades to complexity_trend."""
         s1 = begin_scan(db, "aaa")
@@ -569,8 +608,7 @@ class TestComplexityTrend:
         for h in ["ccc", "ddd", "eee", "fff"]:
             begin_scan(db, h)
         rows = db.execute(
-            "SELECT scan_id FROM complexity_trend "
-            "WHERE path = ?",
+            "SELECT scan_id FROM complexity_trend WHERE path = ?",
             ("a.py",),
         ).fetchall()
         # s1 should be pruned (CASCADE via scan_meta), s2 remains
@@ -596,14 +634,10 @@ class TestSplitRetention:
         begin_scan(db, "s2")
         begin_scan(db, "s3")
 
-        rows = db.execute(
-            "SELECT * FROM files WHERE scan_id = ?", (s1,)
-        ).fetchall()
+        rows = db.execute("SELECT * FROM files WHERE scan_id = ?", (s1,)).fetchall()
         assert len(rows) == 0, "scan-1 file row should be pruned after 3 scans"
 
-    def test_complexity_trend_retains_five_scans(
-        self, db: sqlite3.Connection
-    ) -> None:
+    def test_complexity_trend_retains_five_scans(self, db: sqlite3.Connection) -> None:
         """complexity_trend keeps up to _MAX_SCANS=5 even when files are pruned."""
         scans = []
         for i, h in enumerate(["a", "b", "c", "d", "e"]):
@@ -619,23 +653,17 @@ class TestSplitRetention:
         # All 5 scans should be retained in complexity_trend
         assert len(rows) == 5, f"expected 5 trend rows, got {len(rows)}"
 
-    def test_scan_meta_retains_five_then_prunes(
-        self, db: sqlite3.Connection
-    ) -> None:
+    def test_scan_meta_retains_five_then_prunes(self, db: sqlite3.Connection) -> None:
         """Six scans: scan_meta should keep exactly 5 (oldest dropped)."""
         first = None
         for _, h in enumerate(["h1", "h2", "h3", "h4", "h5", "h6"]):
             sid = begin_scan(db, h)
             if first is None:
                 first = sid
-        count = db.execute(
-            "SELECT COUNT(*) FROM scan_meta"
-        ).fetchone()[0]
+        count = db.execute("SELECT COUNT(*) FROM scan_meta").fetchone()[0]
         assert count == 5
         # Oldest scan should be gone
-        gone = db.execute(
-            "SELECT * FROM scan_meta WHERE id = ?", (first,)
-        ).fetchall()
+        gone = db.execute("SELECT * FROM scan_meta WHERE id = ?", (first,)).fetchall()
         assert len(gone) == 0
 
     def test_files_for_second_scan_survive(self, db: sqlite3.Connection) -> None:
@@ -646,14 +674,16 @@ class TestSplitRetention:
         db.commit()
         begin_scan(db, "s3")
 
-        rows = db.execute(
-            "SELECT * FROM files WHERE scan_id = ?", (s2,)
-        ).fetchall()
-        assert len(rows) == 1, "scan-2 files should survive (within _FILES_SCANS=2 window)"
+        rows = db.execute("SELECT * FROM files WHERE scan_id = ?", (s2,)).fetchall()
+        assert len(rows) == 1, (
+            "scan-2 files should survive (within _FILES_SCANS=2 window)"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Trend direction computation
 # ---------------------------------------------------------------------------
+
 
 class TestComputeTrendDirection:
     """Unit tests for compute_trend_direction slope classification."""
@@ -759,15 +789,16 @@ class TestGetAllTrendDirections:
 
 class TestSchemaV3:
     def test_new_db_has_category_column(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         """A freshly initialised DB has a category column in files."""
-        cols = {r[1] for r in db.execute(
-            "PRAGMA table_info(files)").fetchall()}
+        cols = {r[1] for r in db.execute("PRAGMA table_info(files)").fetchall()}
         assert "category" in cols
 
     def test_category_default_is_production(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         """Inserting a file entry without specifying category gives 'production'."""
         sid = begin_scan(db, "abc123")
@@ -781,13 +812,16 @@ class TestSchemaV3:
         assert row[0] == "production"
 
     def test_category_roundtrip(
-        self, db: sqlite3.Connection,
+        self,
+        db: sqlite3.Connection,
     ) -> None:
         """category value set on FileEntry survives upsert and get."""
         sid = begin_scan(db, "abc123")
         entry = FileEntry(
-            path="tests/test_foo.py", scan_id=sid,
-            loc=50, category="test",
+            path="tests/test_foo.py",
+            scan_id=sid,
+            loc=50,
+            category="test",
         )
         upsert_file_entry(db, entry)
         db.commit()
@@ -796,7 +830,8 @@ class TestSchemaV3:
         assert results[0].category == "test"
 
     def test_migration_adds_column_to_existing_db(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         """Running init_db on a DB that lacks category column adds it."""
         # Bootstrap a DB without category (simulate pre-v3 DB).
@@ -828,19 +863,18 @@ class TestSchemaV3:
 
         # Now run init_db which should apply _migrate_v3
         conn = init_db(hot_zone=str(tmp_path))
-        cols = {r[1] for r in conn.execute(
-            "PRAGMA table_info(files)").fetchall()}
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(files)").fetchall()}
         conn.close()
         assert "category" in cols
 
     def test_migration_idempotent(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         """Running init_db twice on the same DB doesn't raise an error."""
         conn1 = init_db(hot_zone=str(tmp_path))
         conn1.close()
         conn2 = init_db(hot_zone=str(tmp_path))
-        cols = {r[1] for r in conn2.execute(
-            "PRAGMA table_info(files)").fetchall()}
+        cols = {r[1] for r in conn2.execute("PRAGMA table_info(files)").fetchall()}
         conn2.close()
         assert "category" in cols

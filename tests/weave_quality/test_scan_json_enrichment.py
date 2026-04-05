@@ -78,7 +78,10 @@ def _populate(
 
 class TestHotspotsJsonScope:
     def test_scope_field_present_default(
-        self, db: sqlite3.Connection, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         """hotspots --json output includes 'scope' field with default value."""
         scan_id = begin_scan(db, "abc123")
@@ -88,14 +91,19 @@ class TestHotspotsJsonScope:
         finish_scan(db, scan_id, 1, 50)
         db.close()
 
-        args = argparse.Namespace(hot_zone=str(tmp_path), top=10, json=True, scope="production")
+        args = argparse.Namespace(
+            hot_zone=str(tmp_path), top=10, json=True, scope="production"
+        )
         result = cmd_hotspots(args)
         assert result == 0
         data = json.loads(capsys.readouterr().out)
         assert data["scope"] == "production"
 
     def test_scope_field_reflects_all(
-        self, db: sqlite3.Connection, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         """hotspots --json output reflects scope=all when passed."""
         scan_id = begin_scan(db, "abc123")
@@ -105,7 +113,9 @@ class TestHotspotsJsonScope:
         finish_scan(db, scan_id, 1, 50)
         db.close()
 
-        args = argparse.Namespace(hot_zone=str(tmp_path), top=10, json=True, scope="all")
+        args = argparse.Namespace(
+            hot_zone=str(tmp_path), top=10, json=True, scope="all"
+        )
         result = cmd_hotspots(args)
         assert result == 0
         data = json.loads(capsys.readouterr().out)
@@ -119,7 +129,10 @@ class TestHotspotsJsonScope:
 
 class TestDiffJsonScope:
     def test_scope_field_present(
-        self, db: sqlite3.Connection, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         """diff --json output includes 'scope' field."""
         scan_id1 = begin_scan(db, "aaa111")
@@ -142,7 +155,10 @@ class TestDiffJsonScope:
         assert data["scope"] == "production"
 
     def test_scope_all_in_diff(
-        self, db: sqlite3.Connection, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         """diff --json scope=all is reflected in output."""
         scan_id1 = begin_scan(db, "aaa111")
@@ -180,15 +196,39 @@ class TestScanJsonCategoryCounts:
     def test_category_counts_schema(self) -> None:
         """category_counts value must be a dict mapping str->int."""
         entries = [
-            FileEntry(path="src/a.py", scan_id=1, language="python", loc=10,
-                      complexity=5.0, functions=1, max_nesting=1, avg_fn_len=10.0,
-                      category="production"),
-            FileEntry(path="tests/test_a.py", scan_id=1, language="python", loc=10,
-                      complexity=3.0, functions=1, max_nesting=1, avg_fn_len=10.0,
-                      category="test"),
-            FileEntry(path="tests/test_b.py", scan_id=1, language="python", loc=10,
-                      complexity=3.0, functions=1, max_nesting=1, avg_fn_len=10.0,
-                      category="test"),
+            FileEntry(
+                path="src/a.py",
+                scan_id=1,
+                language="python",
+                loc=10,
+                complexity=5.0,
+                functions=1,
+                max_nesting=1,
+                avg_fn_len=10.0,
+                category="production",
+            ),
+            FileEntry(
+                path="tests/test_a.py",
+                scan_id=1,
+                language="python",
+                loc=10,
+                complexity=3.0,
+                functions=1,
+                max_nesting=1,
+                avg_fn_len=10.0,
+                category="test",
+            ),
+            FileEntry(
+                path="tests/test_b.py",
+                scan_id=1,
+                language="python",
+                loc=10,
+                complexity=3.0,
+                functions=1,
+                max_nesting=1,
+                avg_fn_len=10.0,
+                category="test",
+            ),
         ]
         counts = dict(Counter(e.category for e in entries))
         assert counts == {"production": 1, "test": 2}

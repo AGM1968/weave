@@ -28,7 +28,6 @@ from weave_quality.python_parser import (
 )
 
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -362,8 +361,7 @@ class TestEssentialComplexity:
                 return y
         """)
         tree = ast.parse(source)
-        fn = [n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef)][0]
+        fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)][0]
         ev = _ast_essential_complexity(fn)
         assert ev == 1.0
 
@@ -376,8 +374,7 @@ class TestEssentialComplexity:
                     print(item)
         """)
         tree = ast.parse(source)
-        fn = [n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef)][0]
+        fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)][0]
         ev = _ast_essential_complexity(fn)
         assert ev > 1.0
 
@@ -389,8 +386,7 @@ class TestEssentialComplexity:
                 return "non-positive"
         """)
         tree = ast.parse(source)
-        fn = [n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef)][0]
+        fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)][0]
         ev = _ast_essential_complexity(fn)
         # Returns at depth 1 (inside if) and depth 0 (top level)
         assert ev > 1.0
@@ -404,8 +400,7 @@ class TestEssentialComplexity:
                     return "b"
         """)
         tree = ast.parse(source)
-        fn = [n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef)][0]
+        fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)][0]
         ev = _ast_essential_complexity(fn)
         # Both returns at depth 1 — same depth, no penalty
         assert ev == 1.0
@@ -419,8 +414,7 @@ class TestEssentialComplexity:
                     raise
         """)
         tree = ast.parse(source)
-        fn = [n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef)][0]
+        fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)][0]
         ev = _ast_essential_complexity(fn)
         assert ev > 1.0
 
@@ -467,8 +461,7 @@ class TestDispatchDetection:
                     unknown()
         """)
         tree = ast.parse(source)
-        fn = [n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef)][0]
+        fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)][0]
         assert _is_dispatch_function(fn) is True
 
     def test_nested_control_not_dispatch(self) -> None:
@@ -481,8 +474,7 @@ class TestDispatchDetection:
                     stop()
         """)
         tree = ast.parse(source)
-        fn = [n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef)][0]
+        fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)][0]
         assert _is_dispatch_function(fn) is False
 
     def test_match_case_is_dispatch(self) -> None:
@@ -500,8 +492,7 @@ class TestDispatchDetection:
             tree = ast.parse(source)
         except SyntaxError:
             pytest.skip("match/case requires Python 3.10+")
-        fn = [n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef)][0]
+        fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)][0]
         assert _is_dispatch_function(fn) is True
 
     def test_multi_statement_body_not_dispatch(self) -> None:
@@ -513,8 +504,7 @@ class TestDispatchDetection:
                 return False
         """)
         tree = ast.parse(source)
-        fn = [n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef)][0]
+        fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)][0]
         assert _is_dispatch_function(fn) is False
 
     def test_dispatch_with_docstring(self) -> None:
@@ -527,8 +517,7 @@ class TestDispatchDetection:
                     do_b()
         """)
         tree = ast.parse(source)
-        fn = [n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef)][0]
+        fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)][0]
         assert _is_dispatch_function(fn) is True
 
     def test_fn_cc_marks_dispatch(self) -> None:

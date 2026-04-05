@@ -126,7 +126,7 @@ CREATE INDEX idx_nodes_status ON nodes(status);
 CREATE INDEX idx_nodes_priority ON nodes(priority);
 CREATE INDEX idx_nodes_type ON nodes(type);
 CREATE INDEX idx_nodes_type_priority ON nodes(type, priority);
-CREATE UNIQUE INDEX idx_nodes_alias ON nodes(alias) WHERE alias IS NOT NULL;
+CREATE UNIQUE INDEX idx_nodes_alias ON nodes(alias) WHERE alias IS NOT NULL AND status != 'done';
 CREATE INDEX idx_edges_target ON edges(target);
 CREATE INDEX idx_edges_type ON edges(type);
 CREATE INDEX idx_edges_source_type ON edges(source, type);

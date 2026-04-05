@@ -46,7 +46,9 @@ def _entry(
     )
 
 
-def _stats(filepath: str = "test.py", churn: int = 50, hotspot: float = 0.0) -> GitStats:
+def _stats(
+    filepath: str = "test.py", churn: int = 50, hotspot: float = 0.0
+) -> GitStats:
     return GitStats(
         path=filepath,
         churn=churn,
@@ -137,7 +139,7 @@ class TestComputeHotspots:
         assert by_path["mid.py"].hotspot > by_path["low.py"].hotspot
         # Boundary values still hold for N>2
         assert by_path["high.py"].hotspot == 1.0  # max is always 1.0
-        assert by_path["low.py"].hotspot == 0.0   # min is always 0.0
+        assert by_path["low.py"].hotspot == 0.0  # min is always 0.0
 
     def test_unmatched_stats_ignored(self) -> None:
         entries = [_entry("a.py", complexity=10)]
@@ -237,8 +239,11 @@ class TestQualityScore:
         # Per-function CC via fn_cc_list triggers the graduated penalty.
         entries = [_entry("a.py", complexity=CC_CRITICAL + 1)]
         stats = [_stats("a.py", hotspot=0.0)]
-        fn_cc = [FunctionCC(path="a.py", function_name="big_fn",
-                            complexity=float(CC_CRITICAL + 1))]
+        fn_cc = [
+            FunctionCC(
+                path="a.py", function_name="big_fn", complexity=float(CC_CRITICAL + 1)
+            )
+        ]
         score = compute_quality_score(entries, stats, fn_cc_list=fn_cc)
         assert score < 100
 
@@ -249,15 +254,21 @@ class TestQualityScore:
         # N=3 maximum concentration: [0, 0, 10] → gini = 0.667, below 0.7
         entry = _entry("a.py", complexity=10.0)
         stat = _stats("a.py", hotspot=0.0)
-        fn3 = [FunctionCC(path="a.py", function_name=f"f{i}",
-                          complexity=10.0 if i == 2 else 0.0)
-               for i in range(3)]
+        fn3 = [
+            FunctionCC(
+                path="a.py", function_name=f"f{i}", complexity=10.0 if i == 2 else 0.0
+            )
+            for i in range(3)
+        ]
         score_n3 = compute_quality_score([entry], [stat], fn_cc_list=fn3)
 
         # N=4 maximum concentration: [0, 0, 0, 10] → gini = 0.75, above 0.7
-        fn4 = [FunctionCC(path="a.py", function_name=f"f{i}",
-                          complexity=10.0 if i == 3 else 0.0)
-               for i in range(4)]
+        fn4 = [
+            FunctionCC(
+                path="a.py", function_name=f"f{i}", complexity=10.0 if i == 3 else 0.0
+            )
+            for i in range(4)
+        ]
         score_n4 = compute_quality_score([entry], [stat], fn_cc_list=fn4)
 
         assert score_n3 > score_n4  # N=4 took a -1 Gini penalty, N=3 did not
@@ -282,7 +293,10 @@ class TestQualityScore:
 class TestHotspotSummary:
     def test_summary_structure(self) -> None:
         entries = [_entry("a.py", complexity=20), _entry("b.py", complexity=5)]
-        stats = [_stats("a.py", churn=100, hotspot=0.8), _stats("b.py", churn=10, hotspot=0.1)]
+        stats = [
+            _stats("a.py", churn=100, hotspot=0.8),
+            _stats("b.py", churn=10, hotspot=0.1),
+        ]
         result = hotspot_summary(entries, stats)
         assert "quality_score" in result
         assert "total_files" in result

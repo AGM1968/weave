@@ -159,7 +159,9 @@ def _ast_function_count(tree: ast.Module) -> int:
 
 
 def _ast_per_function_cc(
-    tree: ast.Module, path: str, scan_id: int = 0,
+    tree: ast.Module,
+    path: str,
+    scan_id: int = 0,
 ) -> list[FunctionCC]:
     """Extract per-function cyclomatic complexity from AST.
 
@@ -174,15 +176,17 @@ def _ast_per_function_cc(
         for child in ast.iter_child_nodes(node):
             visitor.visit(child)
         line_end = getattr(node, "end_lineno", node.lineno) or node.lineno
-        results.append(FunctionCC(
-            path=path,
-            scan_id=scan_id,
-            function_name=node.name,
-            line_start=node.lineno,
-            line_end=line_end,
-            complexity=float(visitor.complexity),
-            is_dispatch=_is_dispatch_function(node),
-        ))
+        results.append(
+            FunctionCC(
+                path=path,
+                scan_id=scan_id,
+                function_name=node.name,
+                line_start=node.lineno,
+                line_end=line_end,
+                complexity=float(visitor.complexity),
+                is_dispatch=_is_dispatch_function(node),
+            )
+        )
     return results
 
 
@@ -197,9 +201,12 @@ def _is_dispatch_function(
     """
     body = node.body
     # Skip docstring
-    if (body and isinstance(body[0], ast.Expr)
-            and isinstance(body[0].value, ast.Constant)
-            and isinstance(body[0].value.value, str)):
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
         body = body[1:]
     if len(body) != 1:
         return False
@@ -218,8 +225,13 @@ def _is_dispatch_function(
 
 
 _control_flow: Tuple[type, ...] = (
-    ast.If, ast.For, ast.While, ast.AsyncFor,
-    ast.Try, ast.With, ast.AsyncWith,
+    ast.If,
+    ast.For,
+    ast.While,
+    ast.AsyncFor,
+    ast.Try,
+    ast.With,
+    ast.AsyncWith,
 )
 if sys.version_info >= (3, 10):
     _control_flow = _control_flow + (ast.Match,)
@@ -231,8 +243,7 @@ def _is_flat_if_chain(node: ast.If) -> bool:
     branches: list[list[ast.stmt]] = [node.body]
     current = node
     while current.orelse:
-        if (len(current.orelse) == 1
-                and isinstance(current.orelse[0], ast.If)):
+        if len(current.orelse) == 1 and isinstance(current.orelse[0], ast.If):
             current = current.orelse[0]
             branches.append(current.body)
         else:
@@ -403,15 +414,17 @@ def _single_pass_ast(tree: ast.Module) -> ASTAnalysis:
             ev_visitor.visit(child)
 
         line_end = getattr(fn_node, "end_lineno", fn_node.lineno) or fn_node.lineno
-        functions.append(FunctionDetail(
-            name=fn_node.name,
-            line_start=fn_node.lineno,
-            line_end=line_end,
-            complexity=float(cc_visitor.complexity),
-            essential_complexity=ev_visitor.essential_complexity,
-            is_dispatch=_is_dispatch_function(fn_node),
-            parent_is_class=id(fn_node) in class_children,
-        ))
+        functions.append(
+            FunctionDetail(
+                name=fn_node.name,
+                line_start=fn_node.lineno,
+                line_end=line_end,
+                complexity=float(cc_visitor.complexity),
+                essential_complexity=ev_visitor.essential_complexity,
+                is_dispatch=_is_dispatch_function(fn_node),
+                parent_is_class=id(fn_node) in class_children,
+            )
+        )
 
     return ASTAnalysis(
         total_complexity=float(full_visitor.complexity),
@@ -422,9 +435,9 @@ def _single_pass_ast(tree: ast.Module) -> ASTAnalysis:
     )
 
 
-def _ast_ck_metrics(tree: ast.Module, path: str,
-                    scan_id: int = 0,
-                    analysis: ASTAnalysis | None = None) -> CKMetrics | None:
+def _ast_ck_metrics(
+    tree: ast.Module, path: str, scan_id: int = 0, analysis: ASTAnalysis | None = None
+) -> CKMetrics | None:
     """Compute CK-suite metrics from AST.
 
     When analysis is provided (from _single_pass_ast), derives WMC, imports,
@@ -456,7 +469,8 @@ def _ast_ck_metrics(tree: ast.Module, path: str,
         # No classes, but still report cbo for coupling analysis
         if imports:
             return CKMetrics(
-                path=path, scan_id=scan_id,
+                path=path,
+                scan_id=scan_id,
                 metrics={"cbo": float(len(imports))},
             )
         return None
@@ -492,7 +506,8 @@ def _ast_ck_metrics(tree: ast.Module, path: str,
     lcom = _compute_lcom(classes)
 
     return CKMetrics(
-        path=path, scan_id=scan_id,
+        path=path,
+        scan_id=scan_id,
         metrics={
             "wmc": float(wmc),
             "cbo": float(len(imports)),
@@ -521,9 +536,11 @@ def _compute_lcom(classes: list[ast.ClassDef]) -> float:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 attrs: set[str] = set()
                 for node in ast.walk(item):
-                    if (isinstance(node, ast.Attribute)
-                            and isinstance(node.value, ast.Name)
-                            and node.value.id == "self"):
+                    if (
+                        isinstance(node, ast.Attribute)
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id == "self"
+                    ):
                         attrs.add(node.attr)
                 methods.append(attrs)
 
@@ -535,7 +552,7 @@ def _compute_lcom(classes: list[ast.ClassDef]) -> float:
         total_pairs = 0
         sharing_pairs = 0
         for i, method_i in enumerate(methods):
-            for method_j in methods[i + 1:]:
+            for method_j in methods[i + 1 :]:
                 total_pairs += 1
                 if method_i & method_j:
                     sharing_pairs += 1
@@ -610,7 +627,8 @@ AnalysisResult = Tuple[FileEntry, Optional[CKMetrics], list[FunctionCC]]
 
 
 def analyze_python_file(
-    filepath: str | Path, scan_id: int = 0,
+    filepath: str | Path,
+    scan_id: int = 0,
 ) -> AnalysisResult:
     """Analyze a Python source file.
 
@@ -623,16 +641,18 @@ def analyze_python_file(
     except OSError as exc:
         log.warning("Cannot read %s: %s", filepath, exc)
         return (
-            FileEntry(path=str(filepath), scan_id=scan_id,
-                      language="python"),
-            None, [],
+            FileEntry(path=str(filepath), scan_id=scan_id, language="python"),
+            None,
+            [],
         )
 
     return analyze_python_source(source, str(filepath), scan_id)
 
 
 def analyze_python_source(
-    source: str, filepath: str, scan_id: int = 0,
+    source: str,
+    filepath: str,
+    scan_id: int = 0,
 ) -> AnalysisResult:
     """Analyze Python source code (string).
 
@@ -640,10 +660,7 @@ def analyze_python_source(
     Fallback: regex heuristics if ast fails (no CK/ev in fallback).
     """
     lines = source.splitlines()
-    non_empty = [
-        ln for ln in lines
-        if ln.strip() and not ln.strip().startswith("#")
-    ]
+    non_empty = [ln for ln in lines if ln.strip() and not ln.strip().startswith("#")]
     loc = len(non_empty)
 
     # Try ast path first (D1=Option B)
@@ -684,8 +701,7 @@ def analyze_python_source(
         return entry, ck, fn_cc
 
     except (SyntaxError, ValueError, RecursionError):
-        log.debug("ast.parse failed for %s, using regex fallback",
-                  filepath)
+        log.debug("ast.parse failed for %s, using regex fallback", filepath)
 
     # Regex fallback
     result = _regex_analyze(source)

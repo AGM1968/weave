@@ -319,6 +319,8 @@ RUNTIME_SCRIPT
     cp ./.claude/hooks/pre-action.sh "$CONFIG_DIR/hooks/"
     cp ./.claude/hooks/pre-claim-skills.sh "$CONFIG_DIR/hooks/"
     cp ./.claude/hooks/pre-close-verification.sh "$CONFIG_DIR/hooks/"
+    cp ./.claude/hooks/bash-dedup.sh "$CONFIG_DIR/hooks/"
+    cp ./.claude/hooks/bash-dedup-post.sh "$CONFIG_DIR/hooks/"
     # Agents
     cp ./.claude/agents/weave-guide.md "$CONFIG_DIR/agents/"
     cp ./.claude/agents/epic-planner.md "$CONFIG_DIR/agents/"

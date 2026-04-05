@@ -30,9 +30,9 @@ validate_id() {
     fi
     # Check if it's a valid alias (alphanumeric + hyphens, 2-50 chars)
     if [[ "$id" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{1,49}$ ]]; then
-        # Verify alias exists in DB
+        # Verify alias exists in DB — prefer non-done nodes
         local resolved
-        resolved=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE alias='$(sql_escape "$id")' LIMIT 1;" 2>/dev/null)
+        resolved=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE alias='$(sql_escape "$id")' ORDER BY CASE WHEN status='done' THEN 1 ELSE 0 END LIMIT 1;" 2>/dev/null)
         if [ -n "$resolved" ]; then
             return 0
         fi
@@ -50,8 +50,9 @@ resolve_id() {
         echo "$id"
         return 0
     fi
+    # Resolve alias — prefer non-done nodes when duplicates exist
     local resolved
-    resolved=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE alias='$(sql_escape "$id")' LIMIT 1;" 2>/dev/null)
+    resolved=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE alias='$(sql_escape "$id")' ORDER BY CASE WHEN status='done' THEN 1 ELSE 0 END LIMIT 1;" 2>/dev/null)
     if [ -n "$resolved" ]; then
         echo "$resolved"
         return 0

@@ -5,7 +5,7 @@ import json
 
 from runtime.hooks import LintAfterEditHook
 from runtime.services.tools import ToolExecutor
-from runtime.services.tools.tool_execution import _cap_tool_output
+from runtime.services.tools.budget import cap_tool_output
 from runtime.tools.base import Tool, ToolRegistry
 from runtime.types import ToolCall
 
@@ -68,7 +68,7 @@ def test_cap_tool_output_preserves_json_array_shape_when_truncated() -> None:
         indent=2,
     )
 
-    capped = _cap_tool_output(content, 400)
+    capped = cap_tool_output(content, 400)
     parsed = json.loads(capped)
 
     assert isinstance(parsed, list)

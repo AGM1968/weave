@@ -25,8 +25,9 @@ from weave_quality.models import FileEntry, FunctionCC, GitStats
 # ---------------------------------------------------------------------------
 
 
-def _entry(path: str = "f.py", ev: float = 0.0,
-           category: str = "production") -> FileEntry:
+def _entry(
+    path: str = "f.py", ev: float = 0.0, category: str = "production"
+) -> FileEntry:
     return FileEntry(path=path, essential_complexity=ev, category=category)
 
 
@@ -34,10 +35,12 @@ def _stats(path: str = "f.py", hotspot: float = 0.0) -> GitStats:
     return GitStats(path=path, hotspot=hotspot)
 
 
-def _fn(path: str = "f.py", name: str = "fn", cc: float = 5.0,
-        is_dispatch: bool = False) -> FunctionCC:
-    return FunctionCC(path=path, function_name=name, complexity=cc,
-                      is_dispatch=is_dispatch)
+def _fn(
+    path: str = "f.py", name: str = "fn", cc: float = 5.0, is_dispatch: bool = False
+) -> FunctionCC:
+    return FunctionCC(
+        path=path, function_name=name, complexity=cc, is_dispatch=is_dispatch
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -209,32 +212,39 @@ class TestGiniPenalty:
 
 class TestScopeFiltering:
     def test_production_scope_excludes_test_files(self) -> None:
-        entries = [_entry("src/app.py", ev=6.0, category="production"),
-                   _entry("tests/test_app.py", ev=8.0, category="test")]
+        entries = [
+            _entry("src/app.py", ev=6.0, category="production"),
+            _entry("tests/test_app.py", ev=8.0, category="test"),
+        ]
         score_prod = compute_quality_score(entries, [], scope="production")
         score_all = compute_quality_score(entries, [], scope="all")
         # Production scope should have higher score (fewer penalties)
         assert score_prod > score_all
 
     def test_scope_all_includes_everything(self) -> None:
-        entries = [_entry("src/app.py", ev=6.0, category="production"),
-                   _entry("tests/test_app.py", ev=8.0, category="test")]
+        entries = [
+            _entry("src/app.py", ev=6.0, category="production"),
+            _entry("tests/test_app.py", ev=8.0, category="test"),
+        ]
         score_all = compute_quality_score(entries, [], scope="all")
         assert score_all < 100
 
     def test_scope_filters_fn_cc(self) -> None:
         """fn_cc for test files should not affect production score."""
-        entries = [_entry("src/app.py", category="production"),
-                   _entry("tests/test.py", category="test")]
+        entries = [
+            _entry("src/app.py", category="production"),
+            _entry("tests/test.py", category="test"),
+        ]
         fn_cc = [_fn("tests/test.py", "test_fn", cc=30.0)]
-        score = compute_quality_score(entries, [], fn_cc_list=fn_cc,
-                                      scope="production")
+        score = compute_quality_score(entries, [], fn_cc_list=fn_cc, scope="production")
         assert score == 100  # Test file CC doesn't affect production score
 
     def test_scope_filters_stats(self) -> None:
         """Hotspots in test files should not affect production score."""
-        entries = [_entry("src/app.py", category="production"),
-                   _entry("tests/test.py", category="test")]
+        entries = [
+            _entry("src/app.py", category="production"),
+            _entry("tests/test.py", category="test"),
+        ]
         stats = [_stats("tests/test.py", hotspot=0.9)]
         score = compute_quality_score(entries, stats, scope="production")
         assert score == 100

@@ -21,8 +21,10 @@ from typing import Any, NotRequired, TypedDict
 
 # ── Database row TypedDicts ───────────────────────────────────────────────────
 
+
 class FileEntryRow(TypedDict):
     """Row in the 'files' table (maps to FileEntry)."""
+
     path: str
     scan_id: int
     language: str
@@ -38,6 +40,7 @@ class FileEntryRow(TypedDict):
 
 class FileMetricRow(TypedDict):
     """Row in the 'file_metrics' EAV table (maps to FunctionCC / CKMetrics)."""
+
     path: str
     scan_id: int
     metric: str
@@ -47,6 +50,7 @@ class FileMetricRow(TypedDict):
 
 class GitStatsRow(TypedDict):
     """Row in the 'git_stats' table (maps to GitStats)."""
+
     path: str
     churn: int
     authors: int
@@ -58,6 +62,7 @@ class GitStatsRow(TypedDict):
 
 class FileStateRow(TypedDict):
     """Row in the 'file_state' table (maps to FileState)."""
+
     path: str
     mtime: int
     git_blob: str
@@ -73,14 +78,14 @@ class FileEntry:
     path: str
     scan_id: int = 0
     language: str = "unknown"
-    loc: int = 0                  # Total lines of code
-    complexity: float = 0.0       # Cyclomatic complexity proxy or ast CC
-    functions: int = 0            # Number of functions/methods
-    max_nesting: int = 0          # Deepest nesting level
-    avg_fn_len: float = 0.0       # Average lines per function
+    loc: int = 0  # Total lines of code
+    complexity: float = 0.0  # Cyclomatic complexity proxy or ast CC
+    functions: int = 0  # Number of functions/methods
+    max_nesting: int = 0  # Deepest nesting level
+    avg_fn_len: float = 0.0  # Average lines per function
     essential_complexity: float = 0.0  # ev(G): 1 = fully structured
-    indent_sd: float = 0.0            # stddev of indentation levels
-    category: str = "production"       # File category (e.g. production, test, generated)
+    indent_sd: float = 0.0  # stddev of indentation levels
+    category: str = "production"  # File category (e.g. production, test, generated)
 
     def to_dict(self) -> FileEntryRow:
         """Serialise to a flat dict suitable for DB insertion."""
@@ -110,8 +115,7 @@ class FileEntry:
             functions=int(d.get("functions", 0)),
             max_nesting=int(d.get("max_nesting", 0)),
             avg_fn_len=float(d.get("avg_fn_len", 0)),
-            essential_complexity=float(
-                d.get("essential_complexity", 0)),
+            essential_complexity=float(d.get("essential_complexity", 0)),
             indent_sd=float(d.get("indent_sd", 0)),
             category=d.get("category", "production"),
         )
@@ -138,12 +142,14 @@ class FunctionCC:
 
     def to_eav_row(self) -> FileMetricRow:
         """Convert to file_metrics EAV row dict."""
-        detail = json.dumps({
-            "line_start": self.line_start,
-            "line_end": self.line_end,
-            "is_dispatch": self.is_dispatch,
-            "essential_complexity": self.essential_complexity,
-        })
+        detail = json.dumps(
+            {
+                "line_start": self.line_start,
+                "line_end": self.line_end,
+                "is_dispatch": self.is_dispatch,
+                "essential_complexity": self.essential_complexity,
+            }
+        )
         return FileMetricRow(
             path=self.path,
             scan_id=self.scan_id,
@@ -194,8 +200,11 @@ class ASTAnalysis:
     @property
     def avg_fn_len(self) -> float:
         """Average function length in lines."""
-        lengths = [f.line_end - f.line_start + 1
-                   for f in self.functions if f.line_end > f.line_start]
+        lengths = [
+            f.line_end - f.line_start + 1
+            for f in self.functions
+            if f.line_end > f.line_start
+        ]
         return sum(lengths) / len(lengths) if lengths else 0.0
 
     @property
@@ -256,12 +265,12 @@ class GitStats:
     """
 
     path: str
-    churn: int = 0                # Total commit count touching this file
-    authors: int = 0              # Distinct author count
-    age_days: int = 0             # Days since last modification
-    hotspot: float = 0.0          # normalize(complexity) x normalize(churn)
+    churn: int = 0  # Total commit count touching this file
+    authors: int = 0  # Distinct author count
+    age_days: int = 0  # Days since last modification
+    hotspot: float = 0.0  # normalize(complexity) x normalize(churn)
     ownership_fraction: float = 0.0  # top-author commits / total commits
-    minor_contributors: int = 0       # authors with < 5% of commits
+    minor_contributors: int = 0  # authors with < 5% of commits
 
     def to_dict(self) -> GitStatsRow:
         """Serialise to a flat dict suitable for DB insertion."""
@@ -310,8 +319,8 @@ class FileState:
     """
 
     path: str
-    mtime: int = 0                # File modification time (epoch seconds)
-    git_blob: str = ""            # git hash-object result (blob SHA)
+    mtime: int = 0  # File modification time (epoch seconds)
+    git_blob: str = ""  # git hash-object result (blob SHA)
 
     def to_dict(self) -> FileStateRow:
         """Serialize to plain dict."""
@@ -341,15 +350,16 @@ class ScanMeta:
     """
 
     id: int = 0
-    scanned_at: str = ""          # ISO 8601 timestamp
-    git_head: str = ""            # HEAD SHA at scan time
+    scanned_at: str = ""  # ISO 8601 timestamp
+    git_head: str = ""  # HEAD SHA at scan time
     files_count: int = 0
     duration_ms: int = 0
-    scanner_version: str = ""     # Weave version that produced this scan
+    scanner_version: str = ""  # Weave version that produced this scan
 
     @classmethod
-    def create(cls, git_head: str, files_count: int = 0,
-               duration_ms: int = 0) -> "ScanMeta":
+    def create(
+        cls, git_head: str, files_count: int = 0, duration_ms: int = 0
+    ) -> "ScanMeta":
         """Create a new ScanMeta with current timestamp."""
         return cls(
             git_head=git_head,
@@ -375,7 +385,7 @@ class ProjectMetrics:
     avg_complexity: float = 0.0
     max_complexity: float = 0.0
     avg_churn: float = 0.0
-    hotspot_count: int = 0        # Files with hotspot > threshold
+    hotspot_count: int = 0  # Files with hotspot > threshold
     top_hotspots: list[tuple[str, float]] = field(default_factory=list)
 
     @classmethod
@@ -392,7 +402,9 @@ class ProjectMetrics:
 
         complexities = [e.complexity for e in entries]
         stats_by_path = {s.path: s for s in stats}
-        churns = [stats_by_path[e.path].churn for e in entries if e.path in stats_by_path]
+        churns = [
+            stats_by_path[e.path].churn for e in entries if e.path in stats_by_path
+        ]
 
         sorted_hotspots = sorted(stats, key=lambda s: s.hotspot, reverse=True)
         above_threshold = [s for s in sorted_hotspots if s.hotspot > hotspot_threshold]

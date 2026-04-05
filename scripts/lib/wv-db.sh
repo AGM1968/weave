@@ -60,7 +60,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
 CREATE INDEX IF NOT EXISTS idx_nodes_priority ON nodes(priority);
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
 CREATE INDEX IF NOT EXISTS idx_nodes_type_priority ON nodes(type, priority);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_alias ON nodes(alias) WHERE alias IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_alias ON nodes(alias) WHERE alias IS NOT NULL AND status != 'done';
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
 CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);
 CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(source, type);
@@ -118,8 +118,13 @@ MIGRATE
 db_migrate_alias() {
     sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
 ALTER TABLE nodes ADD COLUMN alias TEXT;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_alias ON nodes(alias) WHERE alias IS NOT NULL;
 MIGRATE
+    # Relax alias uniqueness: allow reuse when prior node is done.
+    # DROP the old strict index, then create the relaxed one.
+    sqlite3 "$WV_DB" <<'MIGRATE_ALIAS_IDX' 2>/dev/null || true
+DROP INDEX IF EXISTS idx_nodes_alias;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_alias ON nodes(alias) WHERE alias IS NOT NULL AND status != 'done';
+MIGRATE_ALIAS_IDX
 }
 
 # Migrate nodes table to add virtual columns for JSON metadata (Tier 1).

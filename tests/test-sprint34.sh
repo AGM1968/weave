@@ -472,11 +472,23 @@ test_aliases() {
     # Non-existent alias fails gracefully (exit 1, no crash)
     assert_fails "alias: non-existent alias fails gracefully" "$WV" show nonexistent-alias
 
-    # Alias uniqueness — duplicate alias rejected
+    # Alias uniqueness — duplicate alias rejected for non-done nodes
     $WV add "Duplicate task" --alias=tests 2>/dev/null || true
     local alias_count
     alias_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE alias='tests';" 2>/dev/null)
-    assert_equals "1" "$alias_count" "alias: uniqueness enforced"
+    assert_equals "1" "$alias_count" "alias: uniqueness enforced for active nodes"
+
+    # Alias reuse — allowed when prior node is done
+    $WV done "$id4" --learning="test" --no-overlap-check 2>/dev/null || true
+    local id4_reuse
+    id4_reuse=$($WV add "Reuse after done" --alias=tests 2>/dev/null | tail -1)
+    local reuse_count
+    reuse_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE alias='tests';" 2>/dev/null)
+    assert_equals "2" "$reuse_count" "alias: reuse allowed after done"
+    # Resolve prefers the non-done node
+    local resolved_id
+    resolved_id=$($WV show tests --json 2>&1 | jq -r '.[0].id' 2>/dev/null)
+    assert_equals "$id4_reuse" "$resolved_id" "alias: resolve prefers non-done"
 
     # Block via alias
     local id5 id6

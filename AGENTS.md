@@ -20,7 +20,6 @@ git push                          # mandatory
 
 ## Full documentation
 
-- **CLI:** `wv --help` or `~/.config/weave/WORKFLOW.md`
 - **MCP:** `weave_guide` (topics: workflow, github, learnings, context)
+- **CLI:** `~/.config/weave/WORKFLOW.md`
 - **Claude Code:** See [CLAUDE.md](CLAUDE.md) for Claude-specific instructions
-- **Development:** `/dev-guide` skill for testing, hooks, releases

@@ -116,7 +116,9 @@ def _diff_args(
 
 class TestCmdHotspotsScope:
     def test_scope_production_filters_out_test_entries(
-        self, db: sqlite3.Connection, tmp_path: Path,
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """scope=production excludes test-category entries from hotspot ranking.
@@ -150,7 +152,9 @@ class TestCmdHotspotsScope:
         assert "tests/test_app.py" not in paths
 
     def test_scope_all_includes_all_categories(
-        self, db: sqlite3.Connection, tmp_path: Path,
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """scope=all keeps entries from every category."""
@@ -181,7 +185,9 @@ class TestCmdHotspotsScope:
         assert "tests/test_app.py" in paths
 
     def test_scope_test_includes_only_test_entries(
-        self, db: sqlite3.Connection, tmp_path: Path,
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """scope=test keeps only test-category entries.
@@ -212,7 +218,9 @@ class TestCmdHotspotsScope:
         assert "src/app.py" not in paths
 
     def test_scope_production_default(
-        self, db: sqlite3.Connection, tmp_path: Path,
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """Default scope (production) filters test-category entries."""
@@ -251,7 +259,9 @@ class TestCmdHotspotsScope:
 
 class TestCmdDiffScope:
     def test_scope_production_filters_test_entries(
-        self, db: sqlite3.Connection, tmp_path: Path,
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """scope=production causes diff to ignore test-category files."""
@@ -293,7 +303,9 @@ class TestCmdDiffScope:
         assert data["improved"] == []
 
     def test_scope_all_includes_test_entries_in_diff(
-        self, db: sqlite3.Connection, tmp_path: Path,
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """scope=all includes test-category files in the diff report."""
@@ -333,7 +345,9 @@ class TestCmdDiffScope:
         assert "tests/test_app.py" in degraded_paths
 
     def test_scope_production_quality_score_excludes_test_files(
-        self, db: sqlite3.Connection, tmp_path: Path,
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """quality_score in diff output reflects only the scoped entries."""
