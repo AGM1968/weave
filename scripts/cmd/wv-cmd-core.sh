@@ -654,6 +654,8 @@ cmd_done() {
     local acknowledge_overlap=0
     local no_overlap_check=0
     local format="text"
+    local verification_method=""
+    local verification_evidence=""
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -665,6 +667,8 @@ cmd_done() {
             --acknowledge-overlap) acknowledge_overlap=1 ;;
             --no-overlap-check) no_overlap_check=1 ;;
             --json) format="json" ;;
+            --verification-method=*) verification_method="${1#*=}" ;;
+            --verification-evidence=*) verification_evidence="${1#*=}" ;;
         esac
         shift
     done
@@ -683,6 +687,19 @@ cmd_done() {
     if [ "$exists" = "0" ]; then
         echo -e "${RED}Error: node $id not found${NC}" >&2
         return 1
+    fi
+
+    # Write inline verification metadata immediately so the pre-close hook
+    # sees it on any subsequent re-check (and for auditability).
+    if [ -n "$verification_method" ] || [ -n "$verification_evidence" ]; then
+        local ver_json
+        ver_json=$(jq -n \
+            --arg m "$verification_method" \
+            --arg e "$verification_evidence" \
+            '{verification_method: $m, verification_evidence: $e} | with_entries(select(.value != ""))')
+        db_query "UPDATE nodes
+            SET metadata = json_patch(COALESCE(metadata,'{}'), json('$ver_json'))
+            WHERE id='$id';"
     fi
 
     local node_meta pending_reason pending_resume_cmd
@@ -705,7 +722,7 @@ cmd_done() {
     if [ "${WV_REQUIRE_LEARNING:-1}" = "1" ] && [ -z "$learning" ] && [ "$skip_verification" = "0" ] && [ "$no_warn" = "0" ]; then
         echo -e "${RED}Error: --learning=\"...\" or --skip-verification required${NC}" >&2
         echo -e "  Capture what future sessions would get wrong without this:" >&2
-        echo -e "  wv done $id --learning=\"decision: ... | pattern: ... | pitfall: ...\"" >&2
+        echo -e "  wv done $id --learning=\"...\" --verification-method=\"make check\" --verification-evidence=\"N passed\"" >&2
         echo -e "  wv done $id --skip-verification  # for trivial work" >&2
         return 1
     fi

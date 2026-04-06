@@ -84,6 +84,78 @@ def test_cost_usd_zero_cache_tokens_unchanged() -> None:
     assert u.cost_usd == pytest.approx(expected)
 
 
+def _cached_response(
+    inp: int = 1, out: int = 100,
+    cache_read: int = 10000, cache_create: int = 500,
+) -> Response:
+    """Response with Anthropic-style prompt caching."""
+    return Response(
+        content="ok",
+        tool_calls=[],
+        stop_reason=StopReason.END_TURN,
+        usage=Usage(
+            input_tokens=inp,
+            output_tokens=out,
+            cache_read_tokens=cache_read,
+            cache_creation_tokens=cache_create,
+            input_cost_per_mtok=3.0,
+            output_cost_per_mtok=15.0,
+        ),
+    )
+
+
+def test_cache_creation_prevents_false_diminishing() -> None:
+    """cache_creation_tokens should count as new material in the delta.
+
+    With Anthropic caching, input_tokens is often 1-3 (cache misses only).
+    Without counting cache_creation, small-output editing turns falsely
+    trigger diminishing returns.
+    """
+    tracker = BudgetTracker()
+    # First turn: large setup to exceed min total
+    tracker.record(_cached_response(out=2000, cache_create=2000))
+    # Two turns with small output but meaningful cache_creation (>500)
+    tracker.record(_cached_response(out=150, cache_create=600))
+    tracker.record(_cached_response(out=150, cache_create=600))
+    # input+output delta would be ~151 (below 500), but cache_creation
+    # pushes it to ~751 — should NOT fire diminishing.
+    assert not tracker.is_diminishing()
+
+
+def test_cache_read_does_not_affect_diminishing() -> None:
+    """cache_read_tokens (reused context) should NOT prevent diminishing.
+
+    Only new material matters — huge cache reads with tiny output and
+    no cache creation should still trigger diminishing.
+    """
+    tracker = BudgetTracker()
+    # First turn: enough to exceed min total
+    tracker.record(_cached_response(out=2000, cache_create=2000))
+    # 9 more turns (need pass_count=10): huge cache_read but tiny output
+    for _ in range(9):
+        tracker.record(_cached_response(out=100, cache_read=20000, cache_create=0))
+    # delta ≈ 101, well below 500 — diminishing should fire
+    assert tracker.is_diminishing()
+
+
+def test_zero_cache_diminishing_unchanged() -> None:
+    """When cache tokens are 0 (non-Anthropic providers), behavior is unchanged."""
+    tracker = BudgetTracker()
+    for _ in range(10):
+        tracker.record(_response(inp=1000, out=1000))
+    # Large deltas — not diminishing
+    assert not tracker.is_diminishing()
+
+    tracker2 = BudgetTracker()
+    # 8 large turns to build up count, then 2 small
+    for _ in range(8):
+        tracker2.record(_response(inp=500, out=500))
+    tracker2.record(_response(inp=10, out=100))
+    tracker2.record(_response(inp=10, out=100))
+    # delta ≈ 110, below 500 — should fire
+    assert tracker2.is_diminishing()
+
+
 def test_budget_tracker_detects_budget_exceeded() -> None:
     tracker = BudgetTracker()
     tracker.record(_response(inp=100, out=50))

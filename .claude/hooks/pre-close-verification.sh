@@ -26,6 +26,11 @@ if [[ "$COMMAND" =~ wv[[:space:]]done[[:space:]]wv-[0-9a-f]{4,6} ]]; then
         exit 0
     fi
 
+    # Inline verification flags satisfy the requirement without a prior wv update
+    if [[ "$COMMAND" =~ --verification-method= ]] || [[ "$COMMAND" =~ --verification-evidence= ]]; then
+        exit 0
+    fi
+
     # Extract the node ID
     NODE_ID=$(echo "$COMMAND" | grep -oP 'wv-[0-9a-f]{4,6}')
 
@@ -57,7 +62,7 @@ if [[ "$COMMAND" =~ wv[[:space:]]done[[:space:]]wv-[0-9a-f]{4,6} ]]; then
                 # "deny" is lowercase — "DENY" silently fails (original bug)
                 jq -n \
                     --arg node "$NODE_ID" \
-                    --arg detail "Run: wv update $NODE_ID --metadata='{\"verification_method\":\"make check\",\"verification_evidence\":\"all tests pass\"}' — or append --skip-verification for trivial tasks." \
+                    --arg detail "Run: wv done $NODE_ID --verification-method=\"make check\" --verification-evidence=\"all tests pass\" ... — or wv update $NODE_ID --metadata='{\"verification_method\":\"...\"}' first — or --skip-verification for trivial tasks." \
                     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
                 exit 0
             fi

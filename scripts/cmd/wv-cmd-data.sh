@@ -33,6 +33,27 @@ sys.stdout.write(pat.sub(fix, sys.stdin.read()))
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# dump_state_sql — Selective dump excluding FTS index (nodes + edges + meta)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# FTS5 index is derived data rebuilt from node content in ~18ms.  The full
+# .dump includes FTS internal tables (nodes_fts_data, _idx, _docsize, _config)
+# which are binary BLOBs that serialize differently on every dump, defeating
+# git delta compression.  At 270 nodes the FTS tables are 52MB vs 300KB for
+# the actual data — a 99.5% overhead committed on every sync.
+#
+# This function dumps only the data tables and the schema preamble needed
+# to reconstruct the database.  FTS is rebuilt on load via db_rebuild_fts.
+dump_state_sql() {
+    local db="$1" outfile="$2"
+    {
+        sqlite3 -cmd ".timeout 5000" "$db" ".dump nodes" 2>/dev/null
+        sqlite3 -cmd ".timeout 5000" "$db" ".dump edges" 2>/dev/null
+        sqlite3 -cmd ".timeout 5000" "$db" ".dump _warp_changes" 2>/dev/null
+    } | strip_unistr > "$outfile"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # auto_sync — Throttled auto-persist after mutating commands
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -92,7 +113,7 @@ auto_sync() {
     tmp_nodes=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX")
     tmp_edges=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX")
 
-    sqlite3 -cmd ".timeout 5000" "$WV_DB" ".dump" 2>/dev/null | strip_unistr > "$tmp_sql"
+    dump_state_sql "$WV_DB" "$tmp_sql"
     [ -s "$tmp_sql" ] || { rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; return 0; }
 
     # No-op detection: skip jsonl generation + checkpoint if state unchanged.
@@ -265,7 +286,7 @@ _sync_gh() {
     tmp_sql2=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
     tmp_nodes2=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX")
     tmp_edges2=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX")
-    sqlite3 -cmd ".timeout 5000" "$WV_DB" ".dump" 2>/dev/null | strip_unistr > "$tmp_sql2" && [ -s "$tmp_sql2" ] && mv "$tmp_sql2" "$WEAVE_DIR/state.sql" || rm -f "$tmp_sql2"
+    dump_state_sql "$WV_DB" "$tmp_sql2" && [ -s "$tmp_sql2" ] && mv "$tmp_sql2" "$WEAVE_DIR/state.sql" || rm -f "$tmp_sql2"
     db_query_json "SELECT * FROM nodes;" 2>/dev/null | jq -c '.[]' > "$tmp_nodes2" 2>/dev/null && mv "$tmp_nodes2" "$WEAVE_DIR/nodes.jsonl" || rm -f "$tmp_nodes2"
     db_query_json "SELECT * FROM edges;" 2>/dev/null | jq -c '.[]' > "$tmp_edges2" 2>/dev/null && mv "$tmp_edges2" "$WEAVE_DIR/edges.jsonl" || rm -f "$tmp_edges2"
 }
@@ -306,9 +327,8 @@ cmd_sync() {
     local tmp_edges=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX")
     trap 'rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" 2>/dev/null' EXIT
 
-    # Dump to SQL text (git-friendly); strip unistr() for cross-version compat
-    # Use .timeout to avoid empty dump when another process holds a write lock
-    sqlite3 -cmd ".timeout 5000" "$WV_DB" ".dump" | strip_unistr > "$tmp_sql"
+    # Selective dump: data tables only, excluding FTS index (rebuilt on load)
+    dump_state_sql "$WV_DB" "$tmp_sql"
 
     # Guard: refuse to overwrite state.sql with an empty dump (data loss prevention)
     if [ ! -s "$tmp_sql" ]; then
@@ -499,6 +519,8 @@ EOF
         db_migrate_alias
         # Migrate to virtual columns (Tier 1)
         db_migrate_virtual_columns
+        # Rebuild FTS index from node data (selective dump excludes FTS tables)
+        db_rebuild_fts
         # Initialize delta change tracking (idempotent)
         wv_delta_init "$WV_DB"
 
@@ -749,7 +771,7 @@ cmd_prune() {
     # Without this, wv load would resurrect them from the stale snapshot.
     local tmp_sql
     tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
-    if sqlite3 -cmd ".timeout 5000" "$WV_DB" ".dump" 2>/dev/null | strip_unistr > "$tmp_sql" && [ -s "$tmp_sql" ]; then
+    if dump_state_sql "$WV_DB" "$tmp_sql" && [ -s "$tmp_sql" ]; then
         mv "$tmp_sql" "$WEAVE_DIR/state.sql"
     else
         rm -f "$tmp_sql"

@@ -581,6 +581,40 @@ class TestP7R5EnforcementBlock:
         assert r5[0].severity == "error"
         assert r5[0].turn == 1
 
+    def test_r5_enforcement_block_flag_set_on_tool_event(
+        self, tmp_path: Path
+    ) -> None:
+        """When a tool result triggers an enforcement block (is_error=True + block
+        phrase), the parsed ToolEvent must have is_enforcement_block=True, and R5
+        must fire exactly once with severity 'error' on the correct turn."""
+        from runtime.compliance import evaluate, _parse_session
+
+        entries = [
+            _session_start(graph_active=1),
+            _assistant(2, _tool_call("t2", "edit", {"path": "/tmp/f.py", "old_string": "a", "new_string": "b"})),
+            _results(2, _tool_result(
+                "t2",
+                "no active weave node — claim one with wv_work before editing files.",
+                is_error=True,
+            )),
+        ]
+        path = _write(tmp_path / "r5-flag.jsonl", entries)
+
+        # Verify ToolEvent.is_enforcement_block is set
+        events, _, _ = _parse_session(path)
+        assert len(events) == 1
+        assert events[0].is_enforcement_block is True, (
+            "ToolEvent.is_enforcement_block must be True when is_error=True "
+            "and result text matches an enforcement-block phrase"
+        )
+
+        # Verify R5 violation is emitted with correct metadata
+        report = evaluate(path)
+        r5 = [v for v in report.violations if v.rule == "R5:enforcement_block"]
+        assert len(r5) == 1
+        assert r5[0].severity == "error"
+        assert r5[0].turn == 2
+
     def test_r5_silent_when_tool_succeeds(self, tmp_path: Path) -> None:
         """A successful tool call must not trigger R5 even if the result text
         happens to contain partial enforcement-like language."""
@@ -672,6 +706,29 @@ class TestP7R7ReviewEvidence:
 
         r7 = [v for v in report.violations if v.rule == "R7:review_evidence"]
         assert r7 == []
+
+    def test_r7_fires_when_wv_context_called_and_only_errored_grep_present(
+        self, tmp_path: Path
+    ) -> None:
+        """R7 must fire when wv_context is called but the only grep/read in the
+        session errored out — errored evidence tools do not satisfy R7."""
+        from runtime.compliance import evaluate
+
+        entries = [
+            _session_start(graph_active=1),
+            _assistant(1, _tool_call("t1", "wv_context", {"node_id": "wv-abc123"})),
+            _results(1, _tool_result("t1", "Context pack...")),
+            # grep called but returns an error — should NOT count as evidence
+            _assistant(2, _tool_call("t2", "grep", {"pattern": "foo", "path": "/tmp/missing.py"})),
+            _results(2, _tool_result("t2", "No such file or directory", True)),
+        ]
+        report = evaluate(_write(tmp_path / "r7-errored-grep.jsonl", entries))
+
+        r7 = [v for v in report.violations if v.rule == "R7:review_evidence"]
+        assert len(r7) == 1, (
+            "R7 should fire when wv_context is called but all evidence-tool "
+            "calls errored — errored reads/greps do not count as source evidence"
+        )
 
 
 # ── R8 search efficiency ──────────────────────────────────────────────────────
@@ -840,3 +897,169 @@ class TestP7ContextPolicy:
 
         ctx = [v for v in report.violations if "context_policy" in v.rule]
         assert ctx == [], f"Grep-first read under LOW must not fire: {ctx}"
+
+
+class TestP7R9UnclaimedDone:
+    """R9: wv_done must only be called for nodes claimed via wv_work this session."""
+
+    def test_claimed_then_done_is_clean(self, tmp_path: Path) -> None:
+        from runtime.compliance import evaluate
+
+        entries = [
+            _session_start(graph_active=1),
+            _assistant(1, _tool_call("t1", "wv_work", {"node_id": "wv-abc1"})),
+            _results(1, _tool_result("t1", "ok")),
+            _assistant(2, _tool_call("t2", "wv_done", {
+                "node_id": "wv-abc1",
+                "learning": "decision: done | pattern: x | pitfall: y",
+            })),
+            _results(2, _tool_result("t2", "closed")),
+        ]
+        report = evaluate(_write(tmp_path / "r9-clean.jsonl", entries))
+        r9 = [v for v in report.violations if "R9" in v.rule]
+        assert r9 == [], f"Claimed+done must not fire R9: {r9}"
+
+    def test_done_without_work_fires_r9(self, tmp_path: Path) -> None:
+        from runtime.compliance import evaluate
+
+        entries = [
+            _session_start(graph_active=0),  # no active node — no pre-session credit
+            _assistant(1, _tool_call("t1", "wv_done", {
+                "node_id": "wv-xyz9",
+                "learning": "decision: done | pattern: x | pitfall: y",
+            })),
+            _results(1, _tool_result("t1", "closed")),
+        ]
+        report = evaluate(_write(tmp_path / "r9-fire.jsonl", entries))
+        r9 = [v for v in report.violations if "R9" in v.rule]
+        assert len(r9) == 1, f"Expected 1 R9 violation, got {r9}"
+        assert "wv-xyz9" in r9[0].message
+
+    def test_pre_claimed_node_gets_one_credit(self, tmp_path: Path) -> None:
+        from runtime.compliance import evaluate
+
+        # pre_claimed=True (graph_active>0, no wv_work before wv_done)
+        entries = [
+            _session_start(graph_active=1),
+            _assistant(1, _tool_call("t1", "wv_done", {
+                "node_id": "wv-pre1",
+                "learning": "decision: done | pattern: x | pitfall: y",
+            })),
+            _results(1, _tool_result("t1", "closed")),
+        ]
+        report = evaluate(_write(tmp_path / "r9-preclaimed.jsonl", entries))
+        r9 = [v for v in report.violations if "R9" in v.rule]
+        assert r9 == [], f"Pre-claimed node should consume credit, not fire R9: {r9}"
+
+    def test_second_unclaimed_done_fires_r9(self, tmp_path: Path) -> None:
+        from runtime.compliance import evaluate
+
+        # First done consumes the pre-session credit; second is a violation
+        entries = [
+            _session_start(graph_active=1),
+            _assistant(1, _tool_call("t1", "wv_done", {
+                "node_id": "wv-pre1",
+                "learning": "decision: done | pattern: x | pitfall: y",
+            })),
+            _results(1, _tool_result("t1", "closed")),
+            _assistant(2, _tool_call("t2", "wv_done", {
+                "node_id": "wv-extra",
+                "learning": "decision: done | pattern: x | pitfall: y",
+            })),
+            _results(2, _tool_result("t2", "closed")),
+        ]
+        report = evaluate(_write(tmp_path / "r9-second-unclaimed.jsonl", entries))
+        r9 = [v for v in report.violations if "R9" in v.rule]
+        assert len(r9) == 1, f"Second unclaimed done must fire R9: {r9}"
+        assert "wv-extra" in r9[0].message
+
+    def test_errored_wv_done_not_checked(self, tmp_path: Path) -> None:
+        from runtime.compliance import evaluate
+
+        entries = [
+            _session_start(graph_active=0),
+            _assistant(1, _tool_call("t1", "wv_done", {"node_id": "wv-err1",
+                "learning": "decision: done | pattern: x | pitfall: y"})),
+            _results(1, _tool_result("t1", "error: not found", is_error=True)),
+        ]
+        report = evaluate(_write(tmp_path / "r9-error.jsonl", entries))
+        r9 = [v for v in report.violations if "R9" in v.rule]
+        assert r9 == [], f"Errored wv_done must not fire R9: {r9}"
+
+
+class TestP7R10OpenNodeAtEnd:
+    """R10: every node claimed via wv_work must be closed with wv_done by session end."""
+
+    def test_claimed_and_closed_is_clean(self, tmp_path: Path) -> None:
+        from runtime.compliance import evaluate
+
+        entries = [
+            _session_start(graph_active=1),
+            _assistant(1, _tool_call("t1", "wv_work", {"node_id": "wv-abc1"})),
+            _results(1, _tool_result("t1", "ok")),
+            _assistant(2, _tool_call("t2", "wv_done", {
+                "node_id": "wv-abc1",
+                "learning": "decision: done | pattern: x | pitfall: y",
+            })),
+            _results(2, _tool_result("t2", "closed")),
+        ]
+        report = evaluate(_write(tmp_path / "r10-clean.jsonl", entries))
+        r10 = [v for v in report.violations if "R10" in v.rule]
+        assert r10 == [], f"Claimed+closed must not fire R10: {r10}"
+
+    def test_claimed_not_closed_fires_r10(self, tmp_path: Path) -> None:
+        from runtime.compliance import evaluate
+
+        entries = [
+            _session_start(graph_active=0),
+            _assistant(1, _tool_call("t1", "wv_work", {"node_id": "wv-open1"})),
+            _results(1, _tool_result("t1", "ok")),
+            _assistant(2, _tool_call("t2", "bash", {"command": "make check"})),
+            _results(2, _tool_result("t2", "all tests pass")),
+        ]
+        report = evaluate(_write(tmp_path / "r10-fire.jsonl", entries))
+        r10 = [v for v in report.violations if "R10" in v.rule]
+        assert len(r10) == 1, f"Unclosed node must fire R10: {r10}"
+        assert "wv-open1" in r10[0].message
+
+    def test_errored_wv_work_not_counted(self, tmp_path: Path) -> None:
+        from runtime.compliance import evaluate
+
+        entries = [
+            _session_start(graph_active=0),
+            _assistant(1, _tool_call("t1", "wv_work", {"node_id": "wv-err1"})),
+            _results(1, _tool_result("t1", "error: not found", is_error=True)),
+        ]
+        report = evaluate(_write(tmp_path / "r10-error.jsonl", entries))
+        r10 = [v for v in report.violations if "R10" in v.rule]
+        assert r10 == [], f"Errored wv_work must not count as claim: {r10}"
+
+    def test_batch_done_closes_node(self, tmp_path: Path) -> None:
+        from runtime.compliance import evaluate
+
+        entries = [
+            _session_start(graph_active=0),
+            _assistant(1, _tool_call("t1", "wv_work", {"node_id": "wv-batch1"})),
+            _results(1, _tool_result("t1", "ok")),
+            _assistant(2, _tool_call("t2", "wv_batch_done", {
+                "ids": ["wv-batch1"],
+                "learning": "decision: done | pattern: x | pitfall: y",
+            })),
+            _results(2, _tool_result("t2", "closed")),
+        ]
+        report = evaluate(_write(tmp_path / "r10-batch.jsonl", entries))
+        r10 = [v for v in report.violations if "R10" in v.rule]
+        assert r10 == [], f"wv_batch_done must close node: {r10}"
+
+    def test_r10_is_warning_not_error(self, tmp_path: Path) -> None:
+        from runtime.compliance import evaluate
+
+        entries = [
+            _session_start(graph_active=0),
+            _assistant(1, _tool_call("t1", "wv_work", {"node_id": "wv-warn1"})),
+            _results(1, _tool_result("t1", "ok")),
+        ]
+        report = evaluate(_write(tmp_path / "r10-severity.jsonl", entries))
+        r10 = [v for v in report.violations if "R10" in v.rule]
+        assert len(r10) == 1
+        assert r10[0].severity == "warning", f"R10 must be warning, got {r10[0].severity!r}"

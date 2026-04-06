@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from runtime.context import _build_environment_block
-from runtime.hooks import SearchEfficiencyHook
+from runtime.hooks import OpenNodeHook, SearchEfficiencyHook
 from runtime.compliance import ToolEvent, _r8_search_efficiency
 
 
@@ -285,3 +285,85 @@ class TestEnvironmentBlock:
             block = _build_environment_block(tmp_path)
         assert "<environment>" in block
         assert str(tmp_path) in block
+
+
+# ── OpenNodeHook tests ───────────────────────────────────────────────────────
+
+
+class TestOpenNodeHook:
+    """Verify OpenNodeHook redirects when a claimed node is not closed."""
+
+    def _make_hook(self) -> OpenNodeHook:
+        hook = OpenNodeHook()
+        hook.on_prompt("test task")
+        return hook
+
+    def test_no_redirect_when_no_nodes_claimed(self) -> None:
+        hook = self._make_hook()
+        assert hook.before_answer() is None
+
+    def test_redirect_fires_when_node_open(self) -> None:
+        hook = self._make_hook()
+        hook.before_tool("wv_work", {"node_id": "wv-abcd"})
+        msg = hook.before_answer()
+        assert msg is not None
+        assert "wv-abcd" in msg
+
+    def test_redirect_is_one_shot(self) -> None:
+        hook = self._make_hook()
+        hook.before_tool("wv_work", {"node_id": "wv-abcd"})
+        first = hook.before_answer()
+        second = hook.before_answer()
+        assert first is not None
+        assert second is None  # one-shot prevents infinite loops
+
+    def test_no_redirect_after_wv_done(self) -> None:
+        hook = self._make_hook()
+        hook.before_tool("wv_work", {"node_id": "wv-abcd"})
+        hook.after_tool("wv_done", {"node_id": "wv-abcd"}, "done", False)
+        assert hook.before_answer() is None
+
+    def test_wv_batch_done_clears_nodes(self) -> None:
+        hook = self._make_hook()
+        hook.before_tool("wv_work", {"node_id": "wv-aaaa"})
+        hook.before_tool("wv_work", {"node_id": "wv-bbbb"})
+        hook.after_tool("wv_batch_done", {"ids": ["wv-aaaa", "wv-bbbb"]}, "done", False)
+        assert hook.before_answer() is None
+
+    def test_errored_wv_work_still_tracked(self) -> None:
+        # before_tool fires before we know if the tool errored;
+        # track the claim even on error — safer than missing an open node
+        hook = self._make_hook()
+        hook.before_tool("wv_work", {"node_id": "wv-abcd"})
+        # simulate tool error: after_tool with is_error=True, wv_done not called
+        hook.after_tool("wv_work", {"node_id": "wv-abcd"}, "", True)
+        msg = hook.before_answer()
+        assert msg is not None
+        assert "wv-abcd" in msg
+
+    def test_errored_wv_done_leaves_node_open(self) -> None:
+        hook = self._make_hook()
+        hook.before_tool("wv_work", {"node_id": "wv-abcd"})
+        hook.after_tool("wv_done", {"node_id": "wv-abcd"}, "", True)  # error
+        msg = hook.before_answer()
+        assert msg is not None  # node should still be considered open
+
+    def test_seed_active_nodes_fires_redirect_for_continuation_session(self) -> None:
+        # Simulate a node claimed in a previous session — seed without wv_work
+        hook = self._make_hook()
+        hook.seed_active_nodes(["wv-prev1", "wv-prev2"])
+        msg = hook.before_answer()
+        assert msg is not None
+        assert "wv-prev1" in msg
+
+    def test_seed_active_nodes_does_not_duplicate(self) -> None:
+        hook = self._make_hook()
+        hook.seed_active_nodes(["wv-abcd"])
+        hook.before_tool("wv_work", {"node_id": "wv-abcd"})  # same node via wv_work
+        assert len(hook._claimed) == 1  # no duplicate entry
+
+    def test_seed_active_nodes_cleared_by_wv_done(self) -> None:
+        hook = self._make_hook()
+        hook.seed_active_nodes(["wv-abcd"])
+        hook.after_tool("wv_done", {"node_id": "wv-abcd"}, "done", False)
+        assert hook.before_answer() is None

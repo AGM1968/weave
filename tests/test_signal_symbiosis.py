@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
-from runtime.compliance import _parse_event_message, _SessionMeta
+from runtime.compliance import _parse_event_message, _SessionMeta, evaluate
 from runtime.hooks import SearchEfficiencyHook
 from runtime.services.compaction_dispatcher import CompactionDispatcher, CompactionStrategy
 from runtime.services.compaction_policy import CompactionConfig
@@ -113,6 +114,28 @@ class TestEfficiencyEventJSONL:
         assert meta.efficiency_snapshots[0]["is_thrashing"] is True
         assert meta.efficiency_snapshots[0]["turn"] == 3
 
+    def test_efficiency_event_round_trips_through_evaluate(self, tmp_path: Path) -> None:
+        """Efficiency event written to JSONL surfaces in ComplianceReport.efficiency_snapshots."""
+        session_file = tmp_path / "session.jsonl"
+        entries = [
+            {"role": "event", "turn": 0, "metadata": {
+                "event_type": "session_start", "model": "claude-sonnet-4-6",
+                "graph_active": 1, "graph_ready": 2,
+            }},
+            {"role": "event", "turn": 1, "metadata": {
+                "event_type": "efficiency",
+                "turn": 1, "is_thrashing": True,
+                "bash_search_count": 5, "empty_streak": 3,
+            }},
+        ]
+        session_file.write_text("\n".join(json.dumps(e) for e in entries))
+        report = evaluate(session_file)
+        assert len(report.efficiency_snapshots) == 1
+        snapshot = report.efficiency_snapshots[0]
+        assert snapshot["is_thrashing"] is True
+        assert snapshot["turn"] == 1
+        assert snapshot["bash_search_count"] == 5
+
     def test_legacy_jsonl_without_efficiency_events_parses_cleanly(self) -> None:
         """JSONL produced before Sprint 3 has no efficiency events — must not break."""
         meta = _SessionMeta()
@@ -183,3 +206,50 @@ class TestDispatcherThrashingEscalation:
             turn=3, is_thrashing=True,
         )
         assert disp.should_compact(messages, thrashing) is True
+
+
+# ── Time-based microcompact trigger ───────────────────────────────────────────
+
+
+class TestDispatcherTimeTrigger:
+    def test_idle_below_threshold_returns_none(self) -> None:
+        """No compaction when tokens are low and gap is within threshold."""
+        disp = _make_dispatcher(soft=100_000, hard=200_000)
+        disp.idle_threshold_secs = 600.0
+        # Just called record_turn — gap ~0s
+        disp.record_turn()
+        messages = _make_messages(5)  # well under soft threshold
+        strategy = disp.select_strategy(messages)
+        assert strategy is CompactionStrategy.NONE
+
+    def test_idle_above_threshold_forces_micro(self) -> None:
+        """When cache is cold (gap > threshold) and tokens are low, force MICRO."""
+        disp = _make_dispatcher(soft=100_000, hard=200_000)
+        disp.idle_threshold_secs = 0.0  # always expired
+        messages = _make_messages(5)  # well under soft threshold
+        strategy = disp.select_strategy(messages)
+        assert strategy is CompactionStrategy.MICRO
+
+    def test_record_turn_resets_gap(self) -> None:
+        """record_turn() resets the gap so the idle trigger no longer fires."""
+        disp = _make_dispatcher(soft=100_000, hard=200_000)
+        disp.idle_threshold_secs = 0.0  # would fire without record_turn
+        # Simulate: time passes, then a turn is recorded
+        time.sleep(0.01)
+        disp.record_turn()
+        # After record_turn with threshold=0, gap is effectively 0 — still fires
+        # but immediately after record_turn the gap is sub-millisecond.
+        # Set threshold to a very large value to verify the reset works.
+        disp.idle_threshold_secs = 3600.0  # 1 hour — won't fire after fresh record
+        messages = _make_messages(5)
+        strategy = disp.select_strategy(messages)
+        assert strategy is CompactionStrategy.NONE
+
+    def test_idle_trigger_skipped_when_tokens_above_soft(self) -> None:
+        """When tokens > soft threshold, reactive logic runs instead of idle trigger."""
+        disp = _make_dispatcher(soft=1, hard=100_000)
+        disp.idle_threshold_secs = 0.0  # would fire if tokens were low
+        messages = _make_messages(5)  # above soft=1
+        strategy = disp.select_strategy(messages)
+        # Tokens above soft: normal MICRO selected by reactive logic, not idle trigger
+        assert strategy is CompactionStrategy.MICRO

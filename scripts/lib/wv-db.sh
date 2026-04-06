@@ -216,6 +216,14 @@ REINDEX
     echo "Indexed $count nodes" >&2
 }
 
+# Rebuild FTS silently on load (called after importing selective state.sql
+# which excludes FTS tables).  Uses the existing migrate + rebuild path.
+db_rebuild_fts() {
+    db_migrate_fts5
+    sqlite3 -cmd ".timeout 5000" "$WV_DB" \
+        "INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');" 2>/dev/null || true
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Database Ensure (with auto-prune)
 # ═══════════════════════════════════════════════════════════════════════════
