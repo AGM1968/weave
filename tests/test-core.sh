@@ -607,6 +607,39 @@ test_orphan_prevention() {
 }
 
 # ============================================================================
+# Test: findings promote
+# ============================================================================
+test_findings_promote() {
+    echo ""
+    echo "Test: wv findings promote"
+    echo "========================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    local source_id parent_id output all_nodes
+    source_id=$("$WV" add "Investigate install hook drift" 2>&1 | tail -1)
+    "$WV" done "$source_id" \
+        --learning="pitfall: hooks copied by install.sh but not wired into settings.json; add settings wiring in install.sh" \
+        >/dev/null 2>&1
+
+    output=$(WV_CLI="$WV" PATH="$PROJECT_ROOT/scripts:$PATH" "$WV" findings promote --json 2>&1)
+    assert_contains "$output" '"candidates"' "findings promote defaults to dry-run candidates"
+    assert_contains "$output" "$source_id" "findings promote reports source node"
+    assert_fails "findings promote --apply requires parent" "$WV" findings promote --apply
+
+    parent_id=$("$WV" add "Review promoted historical findings" 2>&1 | tail -1)
+    output=$(WV_CLI="$WV" PATH="$PROJECT_ROOT/scripts:$PATH" \
+        "$WV" findings promote --apply --parent="$parent_id" --json 2>&1)
+    assert_contains "$output" '"promoted"' "findings promote apply returns promoted nodes"
+    assert_contains "$output" "$parent_id" "findings promote apply reports parent"
+
+    all_nodes=$("$WV" list --all --json 2>&1)
+    assert_contains "$all_nodes" 'historical_finding_id' "promoted finding stores idempotency metadata"
+    assert_contains "$all_nodes" '"type\": \"finding\"' "promoted finding is stored as finding node"
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 main() {
@@ -619,6 +652,7 @@ main() {
     test_add
     test_orphan_prevention
     test_done
+    test_findings_promote
     test_work
     test_list
     test_show

@@ -27,6 +27,7 @@ from weave_quality.__main__ import (
     _wv_cmd,
     cmd_context_files,
     cmd_diff,
+    cmd_findings_promote,
     cmd_functions,
     cmd_health_info,
     cmd_hotspots,
@@ -537,6 +538,29 @@ def _make_promote_args(
     )
 
 
+def _make_findings_promote_args(
+    parent: str = "",
+    top: int = 5,
+    json_out: bool = False,
+    dry_run: bool = False,
+    apply: bool = False,
+    include_guardrails: bool = False,
+    include_root_causes: bool = False,
+    include_tooling: bool = False,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        hot_zone="unused",
+        parent=parent,
+        top=top,
+        json=json_out,
+        dry_run=dry_run,
+        apply=apply,
+        include_guardrails=include_guardrails,
+        include_root_causes=include_root_causes,
+        include_tooling=include_tooling,
+    )
+
+
 class TestCmdPromote:
     def test_no_db_returns_error(self, tmp_path: Path) -> None:
         """promote with no quality.db returns error."""
@@ -710,6 +734,1562 @@ class TestCmdPromote:
         assert "skipped" in data
         assert "parent" in data
         assert isinstance(data["promoted"], list)
+
+
+class TestCmdFindingsPromote:  # pylint: disable=too-many-public-methods
+    def test_apply_requires_parent(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Applying historical promotions requires an explicit parent."""
+        args = _make_findings_promote_args(apply=True)
+        result = cmd_findings_promote(args)
+        assert result == 1
+        assert "--parent" in capsys.readouterr().err
+
+    def test_dry_run_extracts_candidate(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Dry-run surfaces pitfall learnings as historical finding candidates."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-source",
+                    "text": "Investigate hook regression",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: hooks copied by install.sh but not wired into "
+                                "settings.json"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)) as mock_wv:
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert len(data["candidates"]) == 1
+        assert data["candidates"][0]["source_node"] == "wv-source"
+        assert data["candidates"][0]["metadata"]["type"] == "finding"
+        mock_wv.assert_called_once_with("list", "--json", "--all")
+
+    def test_skips_existing_promoted_finding(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Existing promotions stay in the reviewed window and are reported as skipped."""
+        existing_id = "abc123def456"
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-source",
+                    "text": "Investigate hook regression",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: hooks copied by install.sh but not wired into "
+                                "settings.json"
+                            ),
+                            "historical_finding_id": existing_id,
+                        }
+                    ),
+                },
+                {
+                    "id": "wv-existing",
+                    "text": "Finding: hooks copied by install.sh but not wired into settings.json",
+                    "status": "todo",
+                    "metadata": json.dumps(
+                        {
+                            "type": "finding",
+                            "historical_finding_id": existing_id,
+                            "finding": {
+                                "root_cause": (
+                                    "hooks copied by install.sh but not wired into settings.json"
+                                )
+                            },
+                            "source_node": "wv-source",
+                        }
+                    ),
+                },
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["reviewed_candidates"] == 1
+        assert data["skipped"] == 1
+        assert len(data["candidates"]) == 1
+        assert (
+            data["candidates"][0]["text"]
+            == "Finding: hooks copied by install.sh but not wired into settings.json"
+        )
+        assert data["candidates"][0]["eligible_for_apply"] is False
+        assert data["candidates"][0]["skipped_reason"] == "already_promoted"
+        assert data["candidates"][0]["metadata"]["promotion_batch_window"] == {
+            "top": 5,
+            "signal_types": ["defect"],
+            "backfill": False,
+        }
+
+    def test_apply_creates_node_and_links_parent_and_source(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Apply mode creates a finding node and references both parent and source."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-source",
+                    "text": "Investigate hook regression",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: hooks copied by install.sh but not wired into "
+                                "settings.json"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(
+            parent="wv-parent", json_out=True, apply=True
+        )
+
+        def fake_wv(*cmd_args: str) -> tuple[int, str]:
+            if cmd_args == ("list", "--json", "--all"):
+                return 0, nodes
+            if cmd_args[0] == "add":
+                return 0, "wv-new123: Finding: hooks copied by install.sh ..."
+            if cmd_args[0] == "link":
+                return 0, ""
+            return 1, "unexpected"
+
+        with patch("weave_quality.findings._wv_cmd", side_effect=fake_wv) as mock_wv:
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert len(data["promoted"]) == 1
+        assert data["promoted"][0]["node_id"] == "wv-new123"
+        link_calls = [call.args for call in mock_wv.call_args_list if call.args[0] == "link"]
+        assert ("link", "wv-new123", "wv-parent", "--type=references") in link_calls
+        assert ("link", "wv-new123", "wv-source", "--type=references") in link_calls
+        assert data["reviewed_candidates"] == 1
+        assert data["created"] == 1
+        assert data["backfilled_beyond_reviewed_set"] == 0
+        assert data["reviewed"][0]["metadata"]["promotion_batch_window"] == {
+            "top": 5,
+            "signal_types": ["defect"],
+            "backfill": False,
+        }
+
+    def test_apply_does_not_backfill_beyond_reviewed_defect_window(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Apply must only create from the reviewed defect slice."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-source-a",
+                    "text": "Finding #1 (HIGH): No-detection inflated metric to 1000.0 and was fixed.",
+                    "status": "done",
+                    "metadata": json.dumps({}),
+                },
+                {
+                    "id": "wv-source-b",
+                    "text": "Investigate factory config regression",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: factory silently dropped water_detection config and "
+                                "caused false negatives"
+                            )
+                        }
+                    ),
+                },
+                {
+                    "id": "wv-source-c",
+                    "text": "Investigate deeper defect",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: fallback shoreline path masked classifier failure and "
+                                "produced wrong output"
+                            )
+                        }
+                    ),
+                },
+                {
+                    "id": "wv-existing",
+                    "text": "Finding: Finding #1 (HIGH): No-detection inflated metric to 1000.0 and was fixed.",
+                    "status": "todo",
+                    "metadata": json.dumps(
+                        {
+                            "type": "finding",
+                            "historical_finding_id": "hist-a",
+                            "finding": {
+                                "root_cause": (
+                                    "Finding #1 (HIGH): No-detection inflated metric to 1000.0 "
+                                    "and was fixed."
+                                )
+                            },
+                            "source_node": "wv-source-a",
+                        }
+                    ),
+                },
+            ]
+        )
+        args = _make_findings_promote_args(parent="wv-parent", json_out=True, apply=True, top=2)
+
+        def fake_wv(*cmd_args: str) -> tuple[int, str]:
+            if cmd_args == ("list", "--json", "--all"):
+                return 0, nodes
+            if cmd_args[0] == "add":
+                return 0, "wv-new222: Finding: second reviewed defect."
+            if cmd_args[0] == "link":
+                return 0, ""
+            return 1, "unexpected"
+
+        with patch("weave_quality.findings._wv_cmd", side_effect=fake_wv) as mock_wv:
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["reviewed_candidates"] == 2
+        assert data["created"] == 1
+        assert data["skipped_already_promoted"] == 1
+        assert data["backfilled_beyond_reviewed_set"] == 0
+        assert [item["text"] for item in data["reviewed"]] == [
+            "Finding: Finding #1 (HIGH): No-detection inflated metric to 1000.0 and was fixed.",
+            "Finding: factory silently dropped water_detection config and caused false negatives",
+        ]
+        assert len(data["promoted"]) == 1
+        assert (
+            data["promoted"][0]["text"]
+            == "Finding: factory silently dropped water_detection config and caused false negatives"
+        )
+        add_calls = [call.args for call in mock_wv.call_args_list if call.args[0] == "add"]
+        assert len(add_calls) == 1
+        assert "factory silently dropped water_detection config" in add_calls[0][1]
+        assert all(
+            "fallback shoreline path masked classifier failure" not in item["text"]
+            for item in data["reviewed"] + data["promoted"]
+        )
+
+    def test_additive_apply_matches_dry_run_reviewed_slice(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Dry-run and apply must use the same additive reviewed window."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-defect",
+                    "text": "Finding #1 (HIGH): No-detection inflated metric to 1000.0 and was fixed.",
+                    "status": "done",
+                    "metadata": json.dumps({}),
+                },
+                {
+                    "id": "wv-guardrail",
+                    "text": "Guardrail note",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: reports must surface quality_flag to avoid downstream misuse"
+                            )
+                        }
+                    ),
+                },
+                {
+                    "id": "wv-root",
+                    "text": "Explain threshold behavior",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "decision: root cause confirmed because calibration revealed "
+                                "triple-AND failure on turbid water."
+                            )
+                        }
+                    ),
+                },
+                {
+                    "id": "wv-existing",
+                    "text": "Finding: Finding #1 (HIGH): No-detection inflated metric to 1000.0 and was fixed.",
+                    "status": "todo",
+                    "metadata": json.dumps(
+                        {
+                            "type": "finding",
+                            "historical_finding_id": "hist-defect",
+                            "finding": {
+                                "root_cause": (
+                                    "Finding #1 (HIGH): No-detection inflated metric to 1000.0 "
+                                    "and was fixed."
+                                )
+                            },
+                            "source_node": "wv-defect",
+                        }
+                    ),
+                },
+            ]
+        )
+        dry_run_args = _make_findings_promote_args(
+            json_out=True, top=2, include_guardrails=True, include_root_causes=True
+        )
+        apply_args = _make_findings_promote_args(
+            parent="wv-parent",
+            json_out=True,
+            apply=True,
+            top=2,
+            include_guardrails=True,
+            include_root_causes=True,
+        )
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            dry_run_result = cmd_findings_promote(dry_run_args)
+
+        assert dry_run_result == 0
+        dry_run_data = json.loads(capsys.readouterr().out)
+
+        def fake_wv(*cmd_args: str) -> tuple[int, str]:
+            if cmd_args == ("list", "--json", "--all"):
+                return 0, nodes
+            if cmd_args[0] == "add":
+                return 0, "wv-new333: Finding: reports must surface quality_flag ..."
+            if cmd_args[0] == "link":
+                return 0, ""
+            return 1, "unexpected"
+
+        with patch("weave_quality.findings._wv_cmd", side_effect=fake_wv):
+            apply_result = cmd_findings_promote(apply_args)
+
+        assert apply_result == 0
+        apply_data = json.loads(capsys.readouterr().out)
+        assert [
+            item["historical_finding_id"] for item in dry_run_data["candidates"]
+        ] == [item["historical_finding_id"] for item in apply_data["reviewed"]]
+        assert [item["signal_type"] for item in apply_data["reviewed"]] == [
+            "defect",
+            "guardrail",
+        ]
+        assert apply_data["created"] == 1
+        assert apply_data["skipped_already_promoted"] == 1
+        assert apply_data["backfilled_beyond_reviewed_set"] == 0
+        assert len(apply_data["promoted"]) == 1
+        assert apply_data["promoted"][0]["signal_type"] == "guardrail"
+
+    def test_filters_sprint_summary_noise(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Sprint recap learnings should not be promoted as findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-sprint",
+                    "text": "Epic: Sprint 15",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "Sprint 15 completed 10/11 tasks. Key outcomes: shipped "
+                                "adaptive thresholds and toolkit."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_keeps_bugfix_finding_text(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Bugfix-style finding text remains promotable."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-fix7",
+                    "text": (
+                        "Finding #7 (MED-HIGH): Error results report primary_metric=0.0. "
+                        "Fix: Changed to float('nan')."
+                    ),
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "type": "bugfix",
+                            "severity": "MED-HIGH",
+                            "files": ["src/monitoring/system.py"],
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert len(data["candidates"]) == 1
+        assert data["candidates"][0]["source_node"] == "wv-fix7"
+
+    def test_filters_task_stub_text(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Raw task titles should not be promoted as historical findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-task",
+                    "text": (
+                        "Task: Catoca YAML slope config — Add slope section to "
+                        "config/sites/catoca.yaml."
+                    ),
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "type": "task",
+                            "learning": (
+                                "pattern: slope section nested under strategy.config.slope "
+                                "in catoca.yaml"
+                            ),
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_tooling_baseline_noise(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Version and MCP verification notes should not be promoted."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-mcp",
+                    "text": "Verify upstream MCP fixes",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pattern: Weave 1.12.0 fixed both MCP bugs. "
+                                "VIRTUAL_ENV=1 workaround is no longer needed in mcp.json. "
+                                "All 4 MCP quality tools now return proper JSON."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_version_scan_quality_chatter_by_default(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Weave version-scan quality chatter should stay tooling-only."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-version-scan",
+                    "text": "Verify upstream MCP/quality fixes from Weave 1.12.0",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pattern: Weave 1.12.0 fixed both MCP bugs. "
+                                "Quality score dropped from 6-7 to 2/100 because 1.12.0 "
+                                "scans 272 files (vs ~175 before) — likely scanning more "
+                                "file types. All 4 MCP quality tools now return proper JSON."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_internal_tooling_noise_by_default(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Weave/runtime tooling notes stay hidden unless explicitly requested."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-tooling",
+                    "text": "Fix sync behavior",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: wv sync hangs silently on metadata >100KB — "
+                                "always pre-check sizes before sync"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["include_tooling"] is False
+        assert data["candidates"] == []
+
+    def test_include_tooling_allows_internal_runtime_findings(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Explicit tooling mode should surface internal runtime/tooling findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-tooling",
+                    "text": "Fix sync behavior",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: wv sync hangs silently on metadata >100KB — "
+                                "always pre-check sizes before sync"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True, include_tooling=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["include_tooling"] is True
+        assert len(data["candidates"]) == 1
+        assert data["candidates"][0]["source_node"] == "wv-tooling"
+        assert data["candidates"][0]["signal_type"] == "tooling"
+
+    def test_filters_typing_only_learnings_from_default_defects(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Typing-only mypy guidance should not appear in the default defect view."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-typing",
+                    "text": "fix mypy type errors",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: dict.get() returns Any not float even with default — "
+                                "must cast explicitly. pattern: composite.bandNames().getInfo() "
+                                "returns Any|None, guard with ''or []''."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_include_tooling_surfaces_typing_hygiene_notes(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Typing-only mypy guidance can still be inspected in tooling mode."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-typing",
+                    "text": "fix mypy type errors",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: dict.get() returns Any not float even with default — "
+                                "must cast explicitly. pattern: composite.bandNames().getInfo() "
+                                "returns Any|None, guard with ''or []''."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True, include_tooling=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert len(data["candidates"]) >= 1
+        assert all(item["signal_type"] == "tooling" for item in data["candidates"])
+
+    def test_default_mode_keeps_only_defects_from_mixed_clauses(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Default promotion should keep defects and suppress other signal types."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-mixed",
+                    "text": "Review historical learnings",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "finding: Error results default to 0.0 on failure. | "
+                                "pitfall: timeline reports must surface quality_flag to avoid "
+                                "downstream misuse. | "
+                                "decision: Root cause confirmed because zone-wide histogram is "
+                                "unimodal."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["signal_types"] == ["defect"]
+        assert len(data["candidates"]) == 1
+        assert data["candidates"][0]["signal_type"] == "defect"
+
+    def test_include_guardrails_surfaces_guardrail_candidates(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Guardrails should only appear when explicitly requested."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-guardrail",
+                    "text": "Guardrail note",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: timeline reports must surface quality_flag to avoid "
+                                "downstream misuse"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True, include_guardrails=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["include_guardrails"] is True
+        assert len(data["candidates"]) == 1
+        assert data["candidates"][0]["signal_type"] == "guardrail"
+
+    def test_finding_clause_with_operational_rule_stays_guardrail(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Finding segments with operational-suitability rules should not leak into defects."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-operational",
+                    "text": "Beachlength quality recap",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "finding: AOI cloud is the quality-gate source of truth; "
+                                "finite distances can still appear due to local openings and "
+                                "must remain not_for_monitoring."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        default_args = _make_findings_promote_args(json_out=True)
+        guardrail_args = _make_findings_promote_args(
+            json_out=True, include_guardrails=True
+        )
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(default_args)
+
+        assert result == 0
+        default_data = json.loads(capsys.readouterr().out)
+        assert default_data["candidates"] == []
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(guardrail_args)
+
+        assert result == 0
+        guardrail_data = json.loads(capsys.readouterr().out)
+        assert len(guardrail_data["candidates"]) == 1
+        assert guardrail_data["candidates"][0]["signal_type"] == "guardrail"
+
+    def test_include_root_causes_surfaces_root_cause_candidates(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Root-cause insights should only appear when explicitly requested."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-root",
+                    "text": "Explain Otsu failure",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "decision: Root cause confirmed because zone-wide histogram is "
+                                "unimodal with bimodality 0.42."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True, include_root_causes=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["include_root_causes"] is True
+        assert len(data["candidates"]) == 1
+        assert data["candidates"][0]["signal_type"] == "root_cause"
+
+    def test_defect_beats_guardrail_when_clause_has_explicit_bug_semantics(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Explicit bug semantics should stay defect even with guardrail wording."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-nodefect",
+                    "text": (
+                        "Finding #8 (MEDIUM): No-detection inflates metric with "
+                        "max_transect_distance; keep uncertain confidence."
+                    ),
+                    "status": "done",
+                    "metadata": json.dumps({}),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert len(data["candidates"]) == 1
+        assert data["candidates"][0]["signal_type"] == "defect"
+
+    def test_collapses_duplicate_same_bug_promotions(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Known same-bug variants should not consume multiple default slots."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-dup-a",
+                    "text": "Gradient epic",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: _convert_sampled_features hardcoded field list dropped "
+                                "new bands — must update when adding any band to the pipeline"
+                            )
+                        }
+                    ),
+                },
+                {
+                    "id": "wv-dup-b",
+                    "text": "Gradient baseline run",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: _convert_sampled_features had hardcoded field list "
+                                "that dropped MNDWI_GRAD_MAG — band present in composite but "
+                                "lost in profile dict"
+                            )
+                        }
+                    ),
+                },
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        root_causes = [item["finding"]["root_cause"] for item in data["candidates"]]
+        assert len(root_causes) == 1
+        assert "_convert_sampled_features" in root_causes[0]
+
+    def test_additive_window_reserves_slot_for_root_cause(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Small additive windows should still surface the requested class."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-defect-a",
+                    "text": "Finding #1: water_detection config silently dropped in factory.",
+                    "status": "done",
+                    "metadata": json.dumps({}),
+                },
+                {
+                    "id": "wv-defect-b",
+                    "text": "Finding #2: Unparseable cloud cover defaults to 0.0 (clear sky).",
+                    "status": "done",
+                    "metadata": json.dumps({}),
+                },
+                {
+                    "id": "wv-root-a",
+                    "text": "Explain threshold behavior",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "decision: calibration revealed triple-AND failure on turbid "
+                                "water, leading to redesign proposal."
+                            )
+                        }
+                    ),
+                },
+            ]
+        )
+        args = _make_findings_promote_args(
+            json_out=True, include_root_causes=True, top=2
+        )
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert len(data["candidates"]) == 2
+        assert {item["signal_type"] for item in data["candidates"]} == {
+            "defect",
+            "root_cause",
+        }
+
+    def test_filters_quality_methodology_notes_by_default(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Code-quality methodology notes should stay internal by default."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-method",
+                    "text": "Explain quality hotspot",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: ev(G) measures max essential complexity across "
+                                "functions — non-reducible flow needs targeted refactoring"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_ops_journal_tooling_note_by_default(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """ops.journal cleanup guidance should stay internal by default."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-journal",
+                    "text": "Document sync discipline",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: stale ops.journal accumulates from killed syncs, "
+                                "clear with > redirect"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_trivial_test_assertion_fix(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Trivial follow-up test assertion fixes should not become findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-assert",
+                    "text": "Fix 2 test assertions for edge_otsu config change",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "Trivial fix: 2 tests asserted method=='otsu' but config "
+                                "changed to 'edge_otsu'. Updated assertions to match."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_removed_symbol_test_cleanup(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Test-symbol cleanup notes should not become findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-testsymbols",
+                    "text": "Remove legacy fallback",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "Three other test files referenced removed symbols. "
+                                "Always grep tests/ for removed symbols before committing."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_test_expectation_drift_after_behavior_change(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Test expectation updates after behavior changes should not become findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-seasonal",
+                    "text": "15-C: Port seasonal models",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "Pitfall: test_adaptive.py had a test expecting 'fixed' fallback "
+                                "when no histogram — now that seasonal works, it returns "
+                                "'seasonal_blend' instead."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_mock_exception_test_harness_noise(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Mock exception advice for patched tests should not become findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-ee-test",
+                    "text": "15-E: Create PondAreaSampler",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: ee.EEException cannot be caught in tests when ee module "
+                                "is patched — must create real Exception subclass via type() in "
+                                "mock_ee.EEException"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_test_setup_mechanics_noise(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Test setup mechanics should not become defects."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-calibrate-test",
+                    "text": "Debug calibrate fallback tests",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "Testing calibrate() all-methods-fail fallback requires BOTH: "
+                                "empty image_stats {} and mocked failures."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_mypy_cache_maintenance_noise(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Local cache cleanup advice should not become findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-cache-noise",
+                    "text": "Task: add gradient fields",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: mypy cache corruption (AssertionError on "
+                                "_frozen_importlib) — fix with rm -rf .mypy_cache"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_adc_scope_setup_noise(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Cloud auth scope setup notes should not become findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-adc-noise",
+                    "text": "ADC auth requires EE scope for Earth Engine access",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: gcloud auth application-default login without --scopes "
+                                "gives cloud-platform only — EE rejects with USER_PROJECT_DENIED"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_include_tooling_surfaces_adc_scope_setup_notes(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Environment setup notes should reappear in tooling mode."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-adc-noise",
+                    "text": "ADC auth requires EE scope for Earth Engine access",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: gcloud auth application-default login without --scopes "
+                                "gives cloud-platform only — EE rejects with USER_PROJECT_DENIED"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True, include_tooling=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert len(data["candidates"]) == 1
+        assert data["candidates"][0]["signal_type"] == "tooling"
+
+    def test_filters_operator_workflow_notes_by_default(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Operator workflow and wv-link guidance should stay tooling-only."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-workflow",
+                    "text": "Fix graph workflow notes",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "regression_source: stale operator muscle memory; "
+                                "wv link --context now expects JSON, so plain-text "
+                                "--context strings fail with invalid JSON in --context."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_internal_quality_scanner_audit_by_default(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Internal quality-scanner audit notes should stay hidden by default."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-scanner",
+                    "text": "Audit scanner improvements",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "decision: quality scanner has 8 unfixed issues. "
+                                "Top 3: match/case CC under-counting, DIT metric wrong, "
+                                "ev always None in functions JSON."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_internal_workflow_rollout_guidance_by_default(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Workflow/policy rollout guidance should stay hidden by default."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-rollout",
+                    "text": "Roll out advisory policy",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: mixing policy design and implementation execution "
+                                "in one active node leads to long-lived stale tasks."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_short_decontextualized_pitfall(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Short pitfall fragments without their own context should not be promoted."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-short",
+                    "text": "Implement helper",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: must guard mid_mean > 0 to avoid divide-by-zero"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_style_only_lint_pitfall(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Style-only markdown lint learnings should not become findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-style",
+                    "text": "Update audit doc",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: markdown emphasis must use underscores not "
+                                "asterisks per MD049"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_quality_cache_maintenance_noise(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Quality DB cache maintenance notes should not become findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-cache",
+                    "text": "Port seasonal models",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "Quality DB cache at /dev/shm/weave/ must be deleted after "
+                                "adding new functions — incremental scan shows stale count."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_recap_style_quality_review_text(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Recap-style quality review summaries should not become findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-recap",
+                    "text": (
+                        "17-B-QR: Production quality review fixes — pond_area.py null-safety + "
+                        "voting dedup guard, monitoring_runner.py skip observability"
+                    ),
+                    "status": "done",
+                    "metadata": json.dumps({}),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_filters_test_coverage_pitfall(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Test-coverage notes should not be promoted as findings."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-tests",
+                    "text": "Extend payload",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: no existing tests covered slope block either — "
+                                "added 5 tests for gradient"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert data["candidates"] == []
+
+    def test_splits_unstructured_learning_into_atomic_clauses(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Long unstructured learnings should promote concrete clauses, not the whole blob."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-blob",
+                    "text": "Production review fixes",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "Three production hardening fixes touched code. "
+                                "water_detection config silently dropped in factory. "
+                                "monitoring runner now skips invalid scenes."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        assert len(data["candidates"]) >= 1
+        root_causes = [item["finding"]["root_cause"] for item in data["candidates"]]
+        assert "water_detection config silently dropped in factory." in root_causes
+        assert all("Three production hardening fixes touched code." != item for item in root_causes)
+
+    def test_splits_numbered_compound_findings_into_atomic_candidates(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Numbered multi-bug findings should split into separate promotable defects."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-compound",
+                    "text": "Production EE fixes",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "finding: Three EE bugs fixed: "
+                                "(1) band name '+' invalid and must use '_AND_' mapping, "
+                                "(2) ee.ImageCollection input invalid unless wrapped in a list, "
+                                "(3) cloud_cover defaults to 0.0 on parse failure."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        root_causes = [item["finding"]["root_cause"] for item in data["candidates"]]
+        assert len(root_causes) >= 3
+        assert any("band name '+' invalid" in item for item in root_causes)
+        assert any("ee.ImageCollection input invalid unless wrapped in a list" in item for item in root_causes)
+        assert any("cloud_cover defaults to 0.0 on parse failure" in item for item in root_causes)
+        assert all("Three EE bugs fixed:" not in item for item in root_causes)
+
+    def test_numbered_ee_bug_prefix_keeps_split_items_as_defects(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Shared EE-bug prefixes should preserve defect classification for split items."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-ee-bugs",
+                    "text": "Voting mode fixes",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "finding: Three EE bugs fixed: "
+                                "(1) ee.ImageCollection requires homogeneous band names "
+                                "→ rename to 'vote' before sum(), "
+                                "(2) condition_masks dict values have different names → normalize before merge."
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(json_out=True)
+
+        with patch("weave_quality.findings._wv_cmd", return_value=(0, nodes)):
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        data = json.loads(capsys.readouterr().out)
+        root_causes = [item["finding"]["root_cause"] for item in data["candidates"]]
+        assert any(
+            "EE bug: ee.ImageCollection requires homogeneous band names" in item
+            for item in root_causes
+        )
+        assert any(
+            "EE bug: condition_masks dict values have different names" in item
+            for item in root_causes
+        )
 
 
 # ---------------------------------------------------------------------------

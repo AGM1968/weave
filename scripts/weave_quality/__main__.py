@@ -71,16 +71,18 @@ from weave_quality.hotspots import (
     compute_quality_score,
     hotspot_summary,
 )
+from weave_quality.findings import cmd_findings_promote
 from weave_quality.models import FileEntry, FunctionCC
 from weave_quality.python_parser import analyze_python_file
 
 log = logging.getLogger(__name__)
 
+__all__ = ["cmd_findings_promote"]
+
 _VERSION_FILE = Path(__file__).parent.parent / "lib" / "VERSION"
 _SCANNER_VERSION = _VERSION_FILE.read_text().strip() if _VERSION_FILE.exists() else ""
 _MSG_NO_DB = "No quality.db found. Run 'wv quality scan' first."
 _MSG_NO_SCAN = "No scan data. Run 'wv quality scan' first."
-
 # ---------------------------------------------------------------------------
 # Path resolution
 # ---------------------------------------------------------------------------
@@ -957,7 +959,7 @@ def _wv_cmd(*cmd_args: str) -> tuple[int, str]:
     """Run a wv CLI command, return (returncode, stdout)."""
     try:
         result = subprocess.run(
-            ["wv", *cmd_args],
+            [os.environ.get("WV_CLI", "wv"), *cmd_args],
             capture_output=True,
             text=True,
             check=False,
@@ -1363,6 +1365,46 @@ def main() -> int:  # pragma: no cover
         "--dry-run", action="store_true", help="Show what would be created"
     )
 
+    findings_promote_parser = sub.add_parser(
+        "findings-promote",
+        help="Promote historical learnings to Weave finding nodes",
+    )
+    findings_promote_parser.add_argument(
+        "--top",
+        type=int,
+        default=5,
+        help="Reviewed candidate window size (default: 5)",
+    )
+    findings_promote_parser.add_argument(
+        "--parent", default="", help="Parent node ID to link via references"
+    )
+    findings_promote_parser.add_argument(
+        "--json", action="store_true", help="JSON output"
+    )
+    findings_promote_parser.add_argument(
+        "--dry-run", action="store_true", help="Show the reviewed candidate window"
+    )
+    findings_promote_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Create finding nodes from the reviewed window only",
+    )
+    findings_promote_parser.add_argument(
+        "--include-guardrails",
+        action="store_true",
+        help="Include operational/reporting guardrails",
+    )
+    findings_promote_parser.add_argument(
+        "--include-root-causes",
+        action="store_true",
+        help="Include validated explanatory root-cause insights",
+    )
+    findings_promote_parser.add_argument(
+        "--include-tooling",
+        action="store_true",
+        help="Include Weave/runtime/tooling findings (internal use)",
+    )
+
     # health-info (for wv health integration)
     sub.add_parser("health-info", help="Compact quality summary for wv health")
 
@@ -1402,6 +1444,8 @@ def main() -> int:  # pragma: no cover
         return cmd_diff(args)
     if args.command == "promote":
         return cmd_promote(args)
+    if args.command == "findings-promote":
+        return cmd_findings_promote(args)
     if args.command == "health-info":
         cmd_health_info(args)
         return 0

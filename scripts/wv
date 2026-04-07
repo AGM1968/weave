@@ -25,6 +25,7 @@ set -euo pipefail
 # This allows seamless switching between development and production.
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+export WV_CLI="${WV_CLI:-$SCRIPT_DIR/wv}"
 WV_LIB_DIR="${WV_LIB_DIR:-}"
 
 # Resolve library directory: dev (relative) or installed (XDG)
@@ -58,6 +59,7 @@ source "$WV_LIB_DIR/cmd/wv-cmd-graph.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-data.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-ops.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-quality.sh"
+source "$WV_LIB_DIR/cmd/wv-cmd-findings.sh"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Dispatcher
@@ -157,6 +159,7 @@ main() {
 
         # Quality commands
         quality)         cmd_quality "$@" ;;
+        findings)        cmd_findings "$@" ;;
         help|--help|-h)  cmd_help ;;
         version|--version|-v) echo "wv $WV_VERSION" ;;
         

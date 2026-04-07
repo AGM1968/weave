@@ -2,6 +2,29 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.32.0] - 2026-04-07
+
+### Added
+
+- **Historical findings promotion**: `wv findings promote` now mines completed-node learnings and
+  historical finding/pitfall text into dry-run or applyable finding candidates.
+- **Signal-class filtering**: historical promotions are typed as `defect`, `guardrail`,
+  `root_cause`, or `tooling`, with additive flags to expose non-defect classes when requested.
+
+### Fixed
+
+- **Default findings noise**: tooling/version-scan chatter, operator workflow notes, and typing-only
+  mypy guidance are suppressed from the default defect-only view unless tooling is explicitly
+  included.
+- **Historical findings ranking**: additive small windows now reserve visibility for requested
+  classes, and operational guardrails no longer fall back into the default defect bucket.
+- **Historical findings apply safety**: `--top` now defines the reviewed candidate window for both
+  dry-run and apply, and `--apply` no longer backfills deeper-ranked items when reviewed candidates
+  are skipped as already promoted.
+- **Historical findings atomicity**: numbered multi-bug learnings split into separate candidates
+  instead of shipping one bundled promotion, and known same-bug `_convert_sampled_features`
+  variants no longer consume duplicate top-window slots.
+
 ## [1.31.0] - 2026-04-07
 
 ### Added
@@ -26,6 +49,11 @@
   `tool_input.run_in_background` and `tool_response.output` pattern to preserve the dedup lock for
   background commands.
 
+### Runtime (internal — not in public release)
+
+- **Finding phase workflow (runtime)**: `wv_client.py` finding support; compliance and bootstrap
+  context updated for finding node tracking.
+
 ## [1.30.0] - 2026-04-06
 
 ### Added
@@ -40,6 +68,20 @@
 - **`wv sync` state.sql size**: FTS5 index was included in `sqlite3 .dump` output, inflating
   state.sql from ~300KB to 55MB. The dump now excludes FTS shadow tables (`nodes_fts*`,
   `edges_fts*`), reducing state.sql by ~99%.
+
+### Runtime (internal — not in public release)
+
+- **OpenNodeHook**: `before_answer()` redirect fires when the agent reaches `done=True` with an
+  unclosed wv_work node. One-shot to prevent loops; seeds pre-existing active nodes on turn-0 for
+  continuation sessions.
+- **Compliance R9/R10**: R9 flags `wv_done` for nodes never claimed via `wv_work`; R10 flags nodes
+  left open at session end. Both support pre-claimed credit for continuation sessions.
+- **Diminishing-returns fix**: `BudgetTracker` now includes `cache_creation_tokens` in the delta
+  calculation; `_DIMINISHING_PASS_COUNT` raised 3→10. Prevents false session termination under
+  Anthropic prompt caching.
+- **Compliance bootstrap fallback**: `_parse_session` now parses `graph_active` from the turn-0 user
+  message (`Work: N active`) when no `session_start` event is present — fixes spurious R10
+  violations on all continuation sessions.
 
 ## [1.29.8] - 2026-04-05
 
