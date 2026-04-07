@@ -53,6 +53,20 @@ class _ContextWv:
         }]
 
 
+class _FindingContextWv(_ContextWv):
+    def context(self, node_id: str) -> dict[str, object]:
+        ctx = super().context(node_id)
+        ctx["finding"] = {
+            "id": "wv-find01",
+            "violation_type": "R10:open_node_at_end",
+            "root_cause": "bootstrap text omitted active-node type",
+            "proposed_fix": "record active_node_type in session_start metadata",
+            "confidence": "high",
+            "fixable": True,
+        }
+        return ctx
+
+
 def test_bootstrap_context_service_builds_graph_snapshot() -> None:
     """BootstrapContextService preserves the existing graph snapshot contract."""
     service = BootstrapContextService(cast(WvClient, _ContextWv()))
@@ -64,3 +78,13 @@ def test_bootstrap_context_service_builds_graph_snapshot() -> None:
     assert "**Done when:** tests and docs updated" in bootstrap
     assert "## Ready Work (1 unblocked)" in bootstrap
     assert "decision: keep runtime aligned" in bootstrap
+
+
+def test_bootstrap_context_service_includes_finding_handoff() -> None:
+    service = BootstrapContextService(cast(WvClient, _FindingContextWv()))
+
+    bootstrap = service.build_bootstrap_message()
+
+    assert "**Finding handoff (wv-find01):**" in bootstrap
+    assert "R10:open_node_at_end" in bootstrap
+    assert "record active_node_type in session_start metadata" in bootstrap

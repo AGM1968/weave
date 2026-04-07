@@ -375,6 +375,23 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 with --skip-verification bypass on real Bash payload"
 
+# Finding nodes still require structured finding metadata even with --skip-verification
+FINDING_ID=$("$WV" add "Finding close test" --status=active --metadata='{"type":"finding"}' 2>/dev/null | tail -1)
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_contains "$OUTPUT" "Finding nodes require structured metadata before close" "pre-close: finding schema enforced before close"
+assert_exit_code "0" "$EXIT_CODE" "pre-close: finding schema denial is soft"
+
+"$WV" update "$FINDING_ID" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end","root_cause":"bootstrap omitted active-node type","proposed_fix":"record active_node_type in session_start metadata","confidence":"high","fixable":true}}' 2>/dev/null
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
+assert_equals "" "$OUTPUT" "pre-close: complete finding metadata passes with skip-verification"
+
+"$WV" update "$FINDING_ID" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end","root_cause":"bootstrap omitted active-node type","proposed_fix":"record active_node_type in session_start metadata","confidence":0.92,"fixable":"yes"}}' 2>/dev/null
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
+assert_contains "$OUTPUT" "Missing or invalid: finding.confidence, finding.fixable" "pre-close: invalid finding field types are denied"
+
 # With verification metadata
 "$WV" update "$ID" --metadata='{"verification":{"method":"test","result":"pass"}}' 2>/dev/null
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
@@ -398,6 +415,82 @@ assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 for legacy root command pa
 # Non-matching command
 OUTPUT=$(echo '{"command":"wv list"}' | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 assert_equals "" "$OUTPUT" "pre-close: silent for non-matching commands"
+
+# --- bash-dedup.sh / bash-dedup-post.sh ---
+echo ""
+echo "--- bash-dedup.sh / bash-dedup-post.sh ---"
+setup_test_env
+
+DEDUP_LOCK_DIR="/tmp/weave-bash-locks/$(printf '%s' "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | md5sum 2>/dev/null | cut -c1-8 || echo default)"
+mkdir -p "$DEDUP_LOCK_DIR"
+
+# First call: lock is absent — should allow (exit 0, no denial output)
+rm -f "$DEDUP_LOCK_DIR/wv-sync.lock"
+set +e
+OUTPUT=$(echo '{"tool_name":"Bash","tool_input":{"command":"wv sync --gh"}}' | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "bash-dedup: first call exits 0 (allow)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$OUTPUT" | grep -q '"deny"'; then
+    echo -e "${RED}✗${NC} bash-dedup: first call must not deny"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+else
+    echo -e "${GREEN}✓${NC} bash-dedup: first call does not deny"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+fi
+
+# Second call while lock is fresh — should deny
+set +e
+OUTPUT=$(echo '{"tool_name":"Bash","tool_input":{"command":"wv sync --gh"}}' | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "bash-dedup: second call exits 0 (deny via JSON)"
+assert_contains "$OUTPUT" '"deny"' "bash-dedup: second call emits deny decision"
+
+# Post hook: foreground completion clears lock
+echo '{"tool_name":"Bash","tool_input":{"command":"wv sync --gh","run_in_background":false},"tool_response":{"output":"done","success":true}}' \
+    | bash "$HOOKS_DIR/bash-dedup-post.sh" 2>/dev/null
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$DEDUP_LOCK_DIR/wv-sync.lock" ]]; then
+    echo -e "${RED}✗${NC} bash-dedup-post: foreground completion must clear lock"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+else
+    echo -e "${GREEN}✓${NC} bash-dedup-post: foreground completion clears lock"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+fi
+
+# Post hook: background command (via tool_input flag) does NOT clear lock
+echo '{"tool_name":"Bash","tool_input":{"command":"wv sync --gh","run_in_background":true},"tool_response":{"output":"Command running in background with ID: abc123.","success":true}}' \
+    | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null || true  # re-acquire lock
+set +e
+echo '{"tool_name":"Bash","tool_input":{"command":"wv sync --gh","run_in_background":true},"tool_response":{"output":"Command running in background with ID: abc123.","success":true}}' \
+    | bash "$HOOKS_DIR/bash-dedup-post.sh" 2>/dev/null
+set -e
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$DEDUP_LOCK_DIR/wv-sync.lock" ]]; then
+    echo -e "${GREEN}✓${NC} bash-dedup-post: background command preserves lock (tool_input flag)"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} bash-dedup-post: background command must preserve lock"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# Post hook: background command (via tool_response output pattern) does NOT clear lock
+set +e
+echo '{"tool_name":"Bash","tool_input":{"command":"wv sync --gh","run_in_background":false},"tool_response":{"output":"Command running in background with ID: xyz999. Output is being written to: /tmp/foo","success":true}}' \
+    | bash "$HOOKS_DIR/bash-dedup-post.sh" 2>/dev/null
+set -e
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$DEDUP_LOCK_DIR/wv-sync.lock" ]]; then
+    echo -e "${GREEN}✓${NC} bash-dedup-post: background command preserves lock (response output pattern)"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} bash-dedup-post: background command must preserve lock (response output pattern)"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+rm -f "$DEDUP_LOCK_DIR/wv-sync.lock"
 
 # --- post-edit-lint.sh ---
 echo ""

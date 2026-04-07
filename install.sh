@@ -488,11 +488,19 @@ merge_global_claude_settings() {
                 ]},
                 {"matcher":"Bash","hooks":[
                     {"type":"command","command":($h+"/pre-close-verification.sh"),"timeout":10}
+                ]},
+                {"matcher":"Bash","hooks":[
+                    {"type":"command","command":($h+"/bash-dedup.sh"),"timeout":5}
                 ]}
             ],
-            "PostToolUse": [{"matcher":"Edit|Write|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file","hooks":[
-                {"type":"command","command":($h+"/post-edit-lint.sh"),"timeout":30}
-            ]}],
+            "PostToolUse": [
+                {"matcher":"Edit|Write|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file","hooks":[
+                    {"type":"command","command":($h+"/post-edit-lint.sh"),"timeout":30}
+                ]},
+                {"matcher":"Bash","hooks":[
+                    {"type":"command","command":($h+"/bash-dedup-post.sh"),"timeout":5}
+                ]}
+            ],
             "Stop": [{"matcher":"","hooks":[
                 {"type":"command","command":($h+"/stop-check.sh")}
             ]}],

@@ -306,6 +306,20 @@ test_done() {
     WV_REQUIRE_LEARNING=1 "$WV" done "$id" --skip-verification >/dev/null 2>&1 || sv_exit=$?
     assert_equals "0" "$sv_exit" "done accepts --skip-verification"
 
+    # Finding nodes require structured finding metadata before close
+    local finding_id finding_output
+    finding_id=$("$WV" add "Finding needing schema" --metadata='{"type":"finding"}' 2>&1 | tail -1)
+    assert_fails "done rejects incomplete finding metadata" \
+        env WV_REQUIRE_LEARNING=1 "$WV" done "$finding_id" --skip-verification
+
+    "$WV" update "$finding_id" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end","root_cause":"bootstrap omitted active-node type","proposed_fix":"record active_node_type in session_start metadata","confidence":0.92,"fixable":"yes"}}' >/dev/null 2>&1
+    assert_fails "done rejects invalid finding metadata types" \
+        env WV_REQUIRE_LEARNING=1 "$WV" done "$finding_id" --skip-verification
+
+    "$WV" update "$finding_id" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end","root_cause":"bootstrap omitted active-node type","proposed_fix":"record active_node_type in session_start metadata","confidence":"high","fixable":true}}' >/dev/null 2>&1
+    finding_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$finding_id" --skip-verification 2>&1)
+    assert_contains "$finding_output" "Closed" "done accepts complete finding metadata"
+
     # Non-interactive overlap: advisory metadata written, close proceeds (does NOT block)
     local seed_id overlap_id overlap_learning overlap_exit overlap_output overlap_meta
     overlap_learning="decision: keep overlap prompts resumable | pattern: store pending close state | pitfall: tty prompts hang unattended flows"
@@ -321,6 +335,15 @@ test_done() {
     overlap_meta=$("$WV" show "$overlap_id" --json 2>&1)
     assert_contains "$overlap_meta" "learning_overlap_noted" "done stores learning_overlap_noted in closed node metadata"
     assert_contains "$overlap_meta" '"status":"done"' "node is closed despite overlap"
+
+    local finding_overlap_id finding_overlap_exit finding_overlap_output finding_overlap_meta
+    finding_overlap_id=$("$WV" add "Finding overlap advisory" --metadata='{"type":"finding","verification":{"method":"test","result":"pass"},"finding":{"violation_type":"schema_enforcement_test","root_cause":"runtime wv_done wrapper validates finding metadata types and presence before allowing close","proposed_fix":"agents must set confidence as one of high|medium|low (string) and fixable as boolean before closing a finding node","confidence":"high","fixable":true}}' 2>&1 | tail -1)
+    finding_overlap_exit=0
+    finding_overlap_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$finding_overlap_id" --learning="$overlap_learning" 2>&1) || finding_overlap_exit=$?
+    assert_equals "0" "$finding_overlap_exit" "done succeeds for finding nodes when overlap is advisory"
+    assert_contains "$finding_overlap_output" "Closed" "finding overlap advisory still closes the node"
+    finding_overlap_meta=$("$WV" show "$finding_overlap_id" --json 2>&1)
+    assert_contains "$finding_overlap_meta" '"status":"done"' "finding node is closed despite overlap"
 
     # --acknowledge-overlap still clears legacy pending_close state (backward compat)
     local legacy_id legacy_meta legacy_exit legacy_output
@@ -369,6 +392,14 @@ test_work() {
     output=$("$WV" context --json 2>&1)
     assert_contains "$output" "\"id\": \"$id\"" "context uses WV_ACTIVE"
     unset WV_ACTIVE
+
+    # Context surfaces linked finding metadata via resolves edge
+    local finding_id
+    finding_id=$("$WV" add "Investigate open-node false positive" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end","root_cause":"bootstrap omitted active-node type","proposed_fix":"record active_node_type in session_start metadata","confidence":"high","fixable":true}}' 2>&1 | tail -1)
+    "$WV" link "$id" "$finding_id" --type=resolves >/dev/null 2>&1
+    output=$("$WV" context "$id" --json 2>&1)
+    assert_contains "$output" "\"finding\"" "context includes finding block when resolves edge exists"
+    assert_contains "$output" "\"violation_type\": \"R10:open_node_at_end\"" "context finding includes violation type"
 
     # Context falls back to primary node from wv work
     output=$("$WV" context --json 2>&1)

@@ -19,18 +19,8 @@ esac
 # while older tests used a top-level .command field.
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.cmd // .tool_input.command // .command // empty' 2>/dev/null)
 
-# Check if this is a wv done command
-if [[ "$COMMAND" =~ wv[[:space:]]done[[:space:]]wv-[0-9a-f]{4,6} ]]; then
-    # Check for --skip-verification flag
-    if [[ "$COMMAND" =~ --skip-verification ]]; then
-        exit 0
-    fi
-
-    # Inline verification flags satisfy the requirement without a prior wv update
-    if [[ "$COMMAND" =~ --verification-method= ]] || [[ "$COMMAND" =~ --verification-evidence= ]]; then
-        exit 0
-    fi
-
+# Check if this is a wv done/ship command
+if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
     # Extract the node ID
     NODE_ID=$(echo "$COMMAND" | grep -oP 'wv-[0-9a-f]{4,6}')
 
@@ -42,9 +32,39 @@ if [[ "$COMMAND" =~ wv[[:space:]]done[[:space:]]wv-[0-9a-f]{4,6} ]]; then
         NODE_META=$("$WV" show "$NODE_ID" --json 2>/dev/null | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
         NODE_TYPE=$(echo "$NODE_META" | jq -r '.type // "unknown"' 2>/dev/null || echo "unknown")
 
+        if [[ "$NODE_TYPE" == "finding" ]]; then
+            MISSING_FINDING=$(echo "$NODE_META" | jq -r '
+                (.finding // {}) as $finding |
+                [
+                    (if (($finding.violation_type // null) | type) == "string" and (($finding.violation_type | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.violation_type" end),
+                    (if (($finding.root_cause // null) | type) == "string" and (($finding.root_cause | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.root_cause" end),
+                    (if (($finding.proposed_fix // null) | type) == "string" and (($finding.proposed_fix | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.proposed_fix" end),
+                    (if (["high", "medium", "low"] | index(($finding.confidence // "") | tostring)) != null then empty else "finding.confidence" end),
+                    (if (($finding.fixable // null) | type) == "boolean" then empty else "finding.fixable" end),
+                    (if (($finding | has("evidence_sessions")) | not) or ((($finding.evidence_sessions // null) | type) == "array" and ([$finding.evidence_sessions[]? | select((type != "string") or ((gsub("^\\s+|\\s+$"; "")) | length == 0))] | length) == 0) then empty else "finding.evidence_sessions" end)
+                ] | join(", ")
+            ' 2>/dev/null || echo "")
+            if [[ -n "$MISSING_FINDING" ]]; then
+                jq -n \
+                    --arg detail "Finding nodes require structured metadata before close. Missing or invalid: $MISSING_FINDING. Run: wv update $NODE_ID --metadata='{\"finding\":{\"violation_type\":\"...\",\"root_cause\":\"...\",\"proposed_fix\":\"...\",\"confidence\":\"high\",\"fixable\":true}}' first." \
+                    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
+                exit 0
+            fi
+        fi
+
+        # Check for --skip-verification flag
+        if [[ "$COMMAND" =~ --skip-verification ]]; then
+            exit 0
+        fi
+
+        # Inline verification flags satisfy the requirement without a prior wv update
+        if [[ "$COMMAND" =~ --verification-method= ]] || [[ "$COMMAND" =~ --verification-evidence= ]]; then
+            exit 0
+        fi
+
         # Check if verification metadata already exists
         HAS_VERIFICATION=$(echo "$NODE_META" | jq -r 'has("verification")' 2>/dev/null || echo "false")
-        
+
         # Also check old schema for backward compatibility
         HAS_LEGACY_VERIFICATION=$(echo "$NODE_META" | jq -r '(has("verification_method") or has("verification_evidence"))' 2>/dev/null || echo "false")
 

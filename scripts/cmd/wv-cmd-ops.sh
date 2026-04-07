@@ -309,6 +309,16 @@ validate_on_done() {
         fi
     fi
 
+    local node_meta node_type finding_missing
+    node_meta=$(_done_read_metadata "$id")
+    node_type=$(echo "$node_meta" | jq -r '.type // "task"' 2>/dev/null || echo "task")
+    if [ "$node_type" = "finding" ]; then
+        finding_missing=$(_finding_missing_fields "$node_meta" | paste -sd ', ' - || true)
+        if [ -n "$finding_missing" ]; then
+            warnings="${warnings}\n  ⚠ Incomplete finding schema — missing or invalid ${finding_missing}"
+        fi
+    fi
+
     # Check: orphan node (no edges)
     local edge_count
     edge_count=$(db_query "
@@ -1972,6 +1982,7 @@ cmd_edge_types() {
             references) echo -e "  ${GREEN}$type${NC} - Target references/mentions source" ;;
             obsoletes) echo -e "  ${GREEN}$type${NC} - Target makes source obsolete" ;;
             addresses) echo -e "  ${GREEN}$type${NC} - Source addresses/fixes pitfall in target" ;;
+            resolves) echo -e "  ${GREEN}$type${NC} - Links a task or fix with its finding handoff" ;;
         esac
     done
 }

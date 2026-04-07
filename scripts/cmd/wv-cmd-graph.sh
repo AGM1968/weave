@@ -837,6 +837,23 @@ cmd_context() {
     ")
     related_json="${related_json:-[]}"
 
+    local finding_json
+    finding_json=$(db_query_json "
+        SELECT n.id, n.text, n.status, json(n.metadata) as metadata, e.type as edge
+        FROM edges e
+        JOIN nodes n
+          ON (
+              (e.source = '$id' AND n.id = e.target)
+              OR (e.target = '$id' AND n.id = e.source)
+          )
+        WHERE e.type = 'resolves'
+          AND n.id != '$id'
+          AND json_extract(n.metadata, '$.type') = 'finding'
+        ORDER BY n.updated_at DESC
+        LIMIT 1;
+    ")
+    finding_json="${finding_json:-[]}"
+
     # Get pitfalls scoped to node's neighborhood (wv-517f fix)
     # Walk all edge types (blocks, implements, addresses, references) in both
     # directions to build the reachable set, then filter for pitfall nodes.
@@ -888,6 +905,7 @@ cmd_context() {
         --argjson blockers "$blockers_json" \
         --argjson ancestors "$ancestors_json" \
         --argjson related "$related_json" \
+        --argjson finding "$finding_json" \
         --argjson pitfalls "$pitfalls_json" \
         --argjson contradictions "$contradictions_json" \
         --argjson quality "$quality_json" \
@@ -924,6 +942,23 @@ cmd_context() {
                     if length > 0 then . else null end
                 )
             })),
+            finding: (
+                ($finding[0]? | (.metadata | if type == "string" then fromjson else . end) as $meta |
+                    ($meta.finding // {}) as $f |
+                    {
+                        id,
+                        text,
+                        status,
+                        edge,
+                        violation_type: ($f.violation_type // null),
+                        root_cause: ($f.root_cause // null),
+                        proposed_fix: ($f.proposed_fix // null),
+                        confidence: ($f.confidence // null),
+                        fixable: ($f.fixable // null),
+                        evidence_sessions: ($f.evidence_sessions // null)
+                    } | with_entries(select(.value != null))
+                ) // null
+            ),
             related: ($related[0:5] | map({id, text, edge, weight, context: (.context | fromjson? // .context)})),
             pitfalls: ($pitfalls[0:3] | map({
                 id,

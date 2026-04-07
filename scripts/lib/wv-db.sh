@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE TABLE IF NOT EXISTS edges (
     source TEXT NOT NULL,
     target TEXT NOT NULL,
-    type TEXT NOT NULL CHECK(type IN ('blocks', 'relates_to', 'implements', 'contradicts', 'supersedes', 'references', 'obsoletes', 'addresses')),
+    type TEXT NOT NULL CHECK(type IN ('blocks', 'relates_to', 'implements', 'contradicts', 'supersedes', 'references', 'obsoletes', 'addresses', 'resolves')),
     weight REAL DEFAULT 1.0,
     context JSON DEFAULT '{}',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -110,6 +110,45 @@ ALTER TABLE edges ADD COLUMN context JSON DEFAULT '{}';
 ALTER TABLE edges ADD COLUMN created_at DATETIME;
 CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(source, type);
 CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(target, type);
+MIGRATE
+}
+
+# Migrate edges table CHECK constraint to allow newer edge types like resolves.
+# SQLite cannot ALTER an existing CHECK constraint, so rebuild the table in place.
+db_migrate_edge_type_enum() {
+    db_migrate_edges
+
+    local edges_sql
+    edges_sql=$(sqlite3 "$WV_DB" "SELECT sql FROM sqlite_master WHERE type='table' AND name='edges';" 2>/dev/null || true)
+    if [[ "$edges_sql" == *"'resolves'"* ]]; then
+        return 0
+    fi
+
+    sqlite3 "$WV_DB" <<'MIGRATE'
+PRAGMA foreign_keys = OFF;
+BEGIN;
+ALTER TABLE edges RENAME TO edges_old;
+CREATE TABLE edges (
+    source TEXT NOT NULL,
+    target TEXT NOT NULL,
+    type TEXT NOT NULL CHECK(type IN ('blocks', 'relates_to', 'implements', 'contradicts', 'supersedes', 'references', 'obsoletes', 'addresses', 'resolves')),
+    weight REAL DEFAULT 1.0,
+    context JSON DEFAULT '{}',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(source, target, type),
+    FOREIGN KEY(source) REFERENCES nodes(id),
+    FOREIGN KEY(target) REFERENCES nodes(id)
+);
+INSERT INTO edges (source, target, type, weight, context, created_at)
+SELECT source, target, type, weight, context, created_at
+FROM edges_old;
+DROP TABLE edges_old;
+CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
+CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);
+CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(source, type);
+CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(target, type);
+COMMIT;
+PRAGMA foreign_keys = ON;
 MIGRATE
 }
 
@@ -246,6 +285,7 @@ db_ensure() {
                     echo -e "${YELLOW}Old database kept at $old_global_db — remove manually when ready${NC}" >&2
                     # Run schema migrations on the copied DB
                     db_migrate_edges
+                    db_migrate_edge_type_enum
                     db_migrate_alias
                     db_migrate_virtual_columns
                     db_migrate_fts5
@@ -290,6 +330,9 @@ db_ensure() {
             fi
         fi
     fi
+
+    db_migrate_edge_type_enum
+
     # Check DB size once per invocation — auto-prune if over limit
     # WV_DISABLE_AUTOPRUNE=1 skips this (used during sync to prevent mid-sync data loss)
     if [ -z "${_WV_SIZE_CHECKED:-}" ] && [ -f "$WV_DB" ] && [ -z "${WV_DISABLE_AUTOPRUNE:-}" ]; then

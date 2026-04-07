@@ -53,16 +53,20 @@ def _session_start(
     graph_active: int = 1,
     graph_ready: int = 2,
     policy: str = "HIGH",
+    active_node_type: str | None = None,
 ) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "event_type": "session_start",
+        "model": "claude-sonnet-4-6",
+        "context_load_policy": policy,
+        "graph_active": graph_active,
+        "graph_ready": graph_ready,
+    }
+    if active_node_type is not None:
+        metadata["active_node_type"] = active_node_type
     return {
         "role": "event", "turn": 0, "content": "",
-        "metadata": {
-            "event_type": "session_start",
-            "model": "claude-sonnet-4-6",
-            "context_load_policy": policy,
-            "graph_active": graph_active,
-            "graph_ready": graph_ready,
-        },
+        "metadata": metadata,
     }
 
 
@@ -780,6 +784,18 @@ class TestP7R8SearchCascade:
         r8 = [v for v in report.violations if v.rule == "R8:search_efficiency"]
         assert len(r8) == 1
         assert "read the file directly" not in r8[0].message   # LOW-policy message
+
+    def test_r8_is_advisory_for_finding_sessions(self, tmp_path: Path) -> None:
+        from runtime.compliance import evaluate
+
+        entries = self._grep_entries("src/foo.py", 4)
+        entries[0] = _session_start(graph_active=1, active_node_type="finding")
+        report = evaluate(_write(tmp_path / "r8-finding.jsonl", entries))
+
+        r8 = [v for v in report.violations if v.rule == "R8:search_efficiency"]
+        assert len(r8) == 1
+        assert r8[0].severity == "info"
+        assert report.score == 100
 
 
 # ── Scoring arithmetic ────────────────────────────────────────────────────────

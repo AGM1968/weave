@@ -11,8 +11,14 @@ TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 
 [[ "$TOOL" != "Bash" && "$TOOL" != "run_in_terminal" ]] && exit 0
 
-# Do not clear lock for background commands — they are still running
+# Do not clear lock for background commands — they are still running.
+# Primary signal: tool_input.run_in_background (present in PreToolUse and PostToolUse).
+# Fallback: tool_response output contains Claude Code's background task header.
 RUN_IN_BG=$(echo "$INPUT" | jq -r '.tool_input.run_in_background // false' 2>/dev/null)
+if [[ "$RUN_IN_BG" != "true" ]]; then
+    RESPONSE_OUT=$(echo "$INPUT" | jq -r '.tool_response.output // ""' 2>/dev/null)
+    [[ "$RESPONSE_OUT" == *"Command running in background with ID:"* ]] && RUN_IN_BG="true"
+fi
 [[ "$RUN_IN_BG" == "true" ]] && exit 0
 
 CMD=$(echo "$INPUT" | jq -r '.tool_input.command // .tool_input.cmd // empty' 2>/dev/null)

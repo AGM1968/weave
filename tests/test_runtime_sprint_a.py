@@ -21,6 +21,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from runtime.engine import QueryEngine, TurnOutcome
+from runtime.hooks import OpenNodeHook
 from runtime.query import DefaultQueryPolicy, QueryConfig
 from runtime.query.policy import QueryPolicy
 from runtime.services.compaction_dispatcher import CompactionDispatcher, CompactionStrategy
@@ -30,7 +31,7 @@ from runtime.services.compaction_policy import (
     CompactionResult,
 )
 from runtime.services.full_compaction import estimate_tokens
-from runtime.tools.base import ToolRegistry
+from runtime.tools.base import Tool, ToolRegistry
 from runtime.types import Message, Response, StopReason, ToolCall, ToolResult, Usage
 
 
@@ -196,6 +197,44 @@ def test_query_engine_picks_up_policy_changes_between_turns() -> None:
     msgs.append(Message(role="user", content="turn2"))
     _run(engine.run_turn(system="sys", messages=msgs, turn_number=2))
     assert len(provider2.calls) == 1
+
+
+def test_query_engine_stops_after_successful_wv_done() -> None:
+    """A successful close-only tool turn should end without a follow-up LLM turn."""
+    provider = _StubProvider([
+        Response(
+            content="closing",
+            tool_calls=[ToolCall(id="1", name="wv_done", input={"node_id": "wv-abcd"})],
+            stop_reason=StopReason.TOOL_USE,
+            usage=_usage(),
+        )
+    ])
+    hook = OpenNodeHook()
+    hook.on_prompt("close node")
+    hook.seed_active_nodes(["wv-abcd"])
+    policy = DefaultQueryPolicy(
+        provider=provider,
+        tools=ToolRegistry([
+            Tool(
+                name="wv_done",
+                description="close node",
+                parameters={"type": "object"},
+                handler=lambda _inp: '{"id":"wv-abcd"}',
+            )
+        ]),
+        surface=_CaptureSurface(),
+        hooks=[hook],
+        config=QueryConfig(max_tokens=256, max_turns=5),
+    )
+    engine = QueryEngine(policy)
+
+    outcome = _run(engine.run_turn(
+        system="sys",
+        messages=[Message(role="user", content="close it")],
+        turn_number=1,
+    ))
+
+    assert outcome.done is True
 
 
 # ── T3: dispatch_tools reads policy ─────────────────────────────────────────

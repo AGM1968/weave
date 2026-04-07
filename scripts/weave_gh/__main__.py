@@ -93,18 +93,56 @@ def main() -> None:
 def _acquire_sync_lock() -> object:
     """Acquire an exclusive lock to prevent concurrent syncs.
 
+    Writes the current PID to the lock file so stale locks (from dead
+    processes) can be detected and recovered automatically.
+
     Returns the open file handle (keeps lock alive until process exits).
     """
     lock_dir = Path(tempfile.gettempdir()) / "weave"
     lock_dir.mkdir(exist_ok=True)
     lock_path = lock_dir / "sync.lock"
-    fh = open(lock_path, "w", encoding="utf-8")  # noqa: SIM115  # pylint: disable=consider-using-with
+
+    def _try_acquire(path: Path) -> object:
+        fh = open(path, "w", encoding="utf-8")  # noqa: SIM115  # pylint: disable=consider-using-with
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return None
+        fh.write(str(os.getpid()))
+        fh.flush()
+        return fh
+
+    fh = _try_acquire(lock_path)
+    if fh is not None:
+        return fh
+
+    # Lock held — check if the holder is still alive
+    holder_pid: int | None = None
     try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+        holder_pid = int(lock_path.read_text(encoding="utf-8").strip())
+        os.kill(holder_pid, 0)  # signal 0: existence check only
+        log.error("Another sync is already running (pid %d, lock: %s)", holder_pid, lock_path)
+        sys.exit(1)
+    except (ValueError, FileNotFoundError):
+        log.warning("Stale lock file (unreadable pid), recovering...")
+    except ProcessLookupError:
+        log.warning("Stale lock detected (pid %d no longer running), recovering...", holder_pid)
+    except PermissionError:
+        # Process exists but owned by another user — treat as live
         log.error("Another sync is already running (lock: %s)", lock_path)
         sys.exit(1)
-    return fh
+
+    # Stale — unlink and retry once (safe: flock released when holder died)
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    fh = _try_acquire(lock_path)
+    if fh is not None:
+        return fh
+    log.error("Could not acquire sync lock after stale recovery (lock: %s)", lock_path)
+    sys.exit(1)
 
 
 def _run_full_sync(*, dry_run: bool = False) -> None:

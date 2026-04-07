@@ -317,6 +317,16 @@ class TestOpenNodeHook:
         assert first is not None
         assert second is None  # one-shot prevents infinite loops
 
+    def test_redirect_rearms_after_additional_tool_activity(self) -> None:
+        hook = self._make_hook()
+        hook.before_tool("wv_work", {"node_id": "wv-abcd"})
+        first = hook.before_answer()
+        hook.before_tool("read", {"path": "runtime/agent.py"})
+        second = hook.before_answer()
+        assert first is not None
+        assert second is not None
+        assert "wv-abcd" in second
+
     def test_no_redirect_after_wv_done(self) -> None:
         hook = self._make_hook()
         hook.before_tool("wv_work", {"node_id": "wv-abcd"})

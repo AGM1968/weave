@@ -16,7 +16,7 @@ CREATE TABLE nodes (
 CREATE TABLE edges (
     source TEXT NOT NULL,
     target TEXT NOT NULL,
-    type TEXT NOT NULL CHECK(type IN ('blocks', 'relates_to', 'implements', 'contradicts', 'supersedes', 'references', 'obsoletes', 'addresses')),
+    type TEXT NOT NULL CHECK(type IN ('blocks', 'relates_to', 'implements', 'contradicts', 'supersedes', 'references', 'obsoletes', 'addresses', 'resolves')),
     weight REAL DEFAULT 1.0,
     context JSON DEFAULT '{}',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,

@@ -97,7 +97,7 @@ validate_status() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Valid edge types (tight enum to prevent sprawl)
-VALID_EDGE_TYPES="blocks relates_to implements contradicts supersedes references obsoletes addresses"
+VALID_EDGE_TYPES="blocks relates_to implements contradicts supersedes references obsoletes addresses resolves"
 
 # Validate edge type against allowed enum
 # Usage: validate_edge_type "implements" || return 1

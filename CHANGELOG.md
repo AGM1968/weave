@@ -2,6 +2,30 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.31.0] - 2026-04-07
+
+### Added
+
+- **Finding phase workflow**: `wv finding <text>` creates a finding node linked to the current
+  audit/work node. `pre-close-verification` enforces strict finding schema (summary, severity,
+  location fields) before close. Graph and context commands include finding nodes in output.
+
+### Fixed
+
+- **Finding schema validation**: strict validation in `pre-close-verification` rejects malformed
+  finding nodes at close time rather than at sync time.
+- **`wv done` overlap advisory**: no longer errors when the learning similarity check returns an
+  advisory-only result; close proceeds normally.
+- **`wv sync --gh` stale lock recovery**: if the flock holder process is dead, the lock file is
+  unlinked and acquisition retried automatically. Live holder logs its PID. Eliminates need for
+  manual `rm -f /tmp/weave/sync.lock`.
+- **`bash-dedup` hooks not registered**: `bash-dedup.sh` (PreToolUse) and `bash-dedup-post.sh`
+  (PostToolUse) were copied by `install.sh` but never wired into `~/.claude/settings.json` —
+  duplicate long-running commands (make check, wv sync --gh, git push) were not blocked.
+- **`bash-dedup-post.sh` background detection**: belt-and-suspenders check reads both
+  `tool_input.run_in_background` and `tool_response.output` pattern to preserve the dedup lock for
+  background commands.
+
 ## [1.30.0] - 2026-04-06
 
 ### Added

@@ -405,6 +405,37 @@ _done_read_metadata() {
     echo "$cur_meta"
 }
 
+_finding_missing_fields() {
+    local meta_json="${1:-{}}"
+    echo "$meta_json" | jq -r '
+        (.finding // {}) as $finding |
+        [
+            (if (($finding.violation_type // null) | type) == "string" and (($finding.violation_type | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.violation_type" end),
+            (if (($finding.root_cause // null) | type) == "string" and (($finding.root_cause | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.root_cause" end),
+            (if (($finding.proposed_fix // null) | type) == "string" and (($finding.proposed_fix | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.proposed_fix" end),
+            (if (["high", "medium", "low"] | index(($finding.confidence // "") | tostring)) != null then empty else "finding.confidence" end),
+            (if (($finding.fixable // null) | type) == "boolean" then empty else "finding.fixable" end),
+            (if (($finding | has("evidence_sessions")) | not) or ((($finding.evidence_sessions // null) | type) == "array" and ([$finding.evidence_sessions[]? | select((type != "string") or ((gsub("^\\s+|\\s+$"; "")) | length == 0))] | length) == 0) then empty else "finding.evidence_sessions" end)
+        ] | .[]?
+    ' 2>/dev/null
+}
+
+_done_require_finding_metadata() {
+    local id="$1" meta_json="$2"
+    local node_type
+    node_type=$(echo "$meta_json" | jq -r '.type // "task"' 2>/dev/null || echo "task")
+    [ "$node_type" != "finding" ] && return 0
+
+    local missing_fields
+    missing_fields=$(_finding_missing_fields "$meta_json" | paste -sd ', ' - || true)
+    [ -z "$missing_fields" ] && return 0
+
+    echo -e "${RED}Error: finding nodes require structured metadata before close${NC}" >&2
+    echo -e "  Missing or invalid: $missing_fields" >&2
+    echo -e "  Run: wv update $id --metadata='{\"finding\":{\"violation_type\":\"...\",\"root_cause\":\"...\",\"proposed_fix\":\"...\",\"confidence\":\"high\",\"fixable\":true}}'" >&2
+    return 1
+}
+
 _done_can_prompt_overlap() {
     [ "${WV_NONINTERACTIVE:-0}" != "1" ] && [ -z "${CI:-}" ] && [ -t 0 ] && [ -t 2 ]
 }
@@ -716,6 +747,8 @@ cmd_done() {
     if [ "$acknowledge_overlap" = "1" ] && [ -z "$learning" ]; then
         learning=$(echo "$node_meta" | jq -r '.pending_close.learning // empty' 2>/dev/null || echo "")
     fi
+
+    _done_require_finding_metadata "$id" "$node_meta" || return 1
 
     # Require --learning or --skip-verification for closure quality
     # Bypass: WV_REQUIRE_LEARNING=0 (for tests), --no-warn (for recovery/internal)

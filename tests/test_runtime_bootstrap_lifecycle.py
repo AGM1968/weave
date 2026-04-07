@@ -20,7 +20,12 @@ class _FakeWv:
         return {"active": 2, "ready": 5, "blocked": 1, "pending_close": 0}
 
     def list_active(self) -> list[dict[str, str]]:
-        return [{"id": "wv-123abc", "text": "carryover task", "status": "active"}]
+        return [{
+            "id": "wv-123abc",
+            "text": "carryover task",
+            "status": "active",
+            "metadata": '{"type":"finding"}',
+        }]
 
     def update(self, node_id: str, **kwargs: object) -> dict[str, str]:
         self.updated.append((node_id, dict(kwargs)))
@@ -56,6 +61,7 @@ def test_record_session_start_writes_event(tmp_path: Path) -> None:
     assert metadata["graph_ready"] == 5
     assert metadata["graph_blocked"] == 1
     assert metadata["context_load_policy"] == "LOW"
+    assert metadata["active_node_type"] == "finding"
 
 
 def test_bootstrap_graph_prefers_make_target_and_resets_stale_nodes(tmp_path: Path) -> None:
