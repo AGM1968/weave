@@ -1,7 +1,7 @@
 #!/bin/bash
-# wv-cmd-findings.sh -- Historical finding promotion commands
+# wv-cmd-findings.sh -- Finding node commands
 #
-# Commands: findings promote
+# Commands: findings list, findings promote
 # Sourced by: wv entry point (after lib modules)
 # Dependencies: wv-config.sh, wv-db.sh, wv-validate.sh
 
@@ -32,15 +32,21 @@ cmd_findings() {
     shift 2>/dev/null || true
 
     case "$subcmd" in
+        list)    cmd_findings_list "$@" ;;
         promote) cmd_findings_promote "$@" ;;
         ""|help|-h|--help)
             cat >&2 <<'EOF'
 Usage: wv findings <subcommand> [options]
 
 Subcommands:
+  list           List finding nodes with fixable/confidence summary
   promote        Promote historical learnings into finding nodes
 
-Options:
+list options:
+  --fixable      Only show fixable findings
+  --json         JSON output
+
+promote options:
   --top=N        Limit results (default: 5)
   --json         JSON output
   --dry-run      Review candidates without creating nodes (default)
@@ -58,6 +64,98 @@ EOF
             return 1
             ;;
     esac
+}
+
+cmd_findings_list() {
+    local format="text"
+    local fixable_only=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json)    format="json" ;;
+            --fixable) fixable_only=true ;;
+            --help|-h)
+                echo "Usage: wv findings list [--fixable] [--json]" >&2
+                return 0
+                ;;
+            *)
+                echo -e "${RED}Unexpected argument: $1${NC}" >&2
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    local fixable_clause=""
+    if [ "$fixable_only" = true ]; then
+        fixable_clause="AND json_extract(n.metadata, '$.finding.fixable') = 1"
+    fi
+
+    local query="
+        SELECT
+            n.id,
+            n.status,
+            json_extract(n.metadata, '$.finding.fixable')    AS fixable,
+            json_extract(n.metadata, '$.finding.confidence') AS confidence,
+            json_extract(n.metadata, '$.finding.violation_type') AS violation_type,
+            n.text,
+            CASE WHEN EXISTS (
+                SELECT 1 FROM edges e
+                JOIN nodes t ON e.source = t.id
+                WHERE e.target = n.id AND e.type = 'resolves' AND t.status != 'done'
+            ) THEN 1 ELSE 0 END AS has_fix
+        FROM nodes n
+        WHERE json_extract(n.metadata, '$.type') = 'finding'
+        $fixable_clause
+        ORDER BY n.created_at DESC;
+    "
+
+    if [ "$format" = "json" ]; then
+        local results
+        results=$(db_query_json "SELECT n.id, n.text, n.status, n.metadata FROM nodes n
+            WHERE json_extract(n.metadata, '$.type') = 'finding'
+            $fixable_clause
+            ORDER BY n.created_at DESC;")
+        [ -z "$results" ] && echo "[]" || echo "$results"
+        return
+    fi
+
+    local rows
+    rows=$(db_query "$query")
+
+    if [ -z "$rows" ]; then
+        echo "No finding nodes found." >&2
+        return 0
+    fi
+
+    local count=0
+    while IFS='|' read -r id status fixable confidence violation_type text has_fix; do
+        count=$((count + 1))
+        # Badge for fixable/not-fixable
+        local fix_badge
+        if [ "$fixable" = "1" ]; then
+            fix_badge="${GREEN}fixable${NC}"
+        else
+            fix_badge="${YELLOW}not-fixable${NC}"
+        fi
+        # Badge for has-fix in progress
+        local fix_status=""
+        [ "$has_fix" = "1" ] && fix_status=" ${CYAN}[fix in progress]${NC}"
+        # Confidence colouring
+        local conf_str="${confidence:-?}"
+        [ "$conf_str" = "high" ]   && conf_str="${GREEN}high${NC}"
+        [ "$conf_str" = "medium" ] && conf_str="${YELLOW}medium${NC}"
+        [ "$conf_str" = "low" ]    && conf_str="${RED}low${NC}"
+        local vtype="${violation_type:-unknown}"
+        # Truncate text after "Finding: " prefix
+        local display_text
+        display_text=$(echo "$text" | sed 's/^Finding: //' | cut -c1-72)
+        echo -e "${CYAN}$id${NC} [$status] $fix_badge conf=$conf_str  ${vtype}${fix_status}"
+        echo -e "  $display_text"
+    done <<< "$rows"
+
+    echo ""
+    echo "$count finding(s) total."
 }
 
 cmd_findings_promote() {

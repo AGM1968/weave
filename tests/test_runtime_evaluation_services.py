@@ -167,3 +167,82 @@ def test_analyse_session_reads_unified_evaluation_event_score(tmp_path: Path) ->
     metrics = analyse_session(session)
 
     assert metrics["evaluation_score"] == 91
+
+
+def test_analyse_session_supports_claude_transcript_cache_metrics(tmp_path: Path) -> None:
+    """Observability parser should support Claude CLI/VSCode transcript JSONL format."""
+    session = tmp_path / "claude-session.jsonl"
+    session.write_text(
+        "\n".join([
+            json.dumps({
+                "type": "assistant",
+                "entrypoint": "cli",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "tu-1", "name": "Read"}],
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 40,
+                        "cache_read_input_tokens": 600,
+                        "cache_creation_input_tokens": 200,
+                    },
+                },
+            }),
+            json.dumps({
+                "type": "assistant",
+                "entrypoint": "cli",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "done"}],
+                    "usage": {
+                        "input_tokens": 120,
+                        "output_tokens": 30,
+                        "cache_read_input_tokens": 300,
+                        "cache_creation_input_tokens": 300,
+                    },
+                },
+            }),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    metrics = analyse_session(session)
+
+    assert metrics["source_format"] == "claude"
+    assert metrics["entrypoints"] == {"cli": 2}
+    assert metrics["tool_calls"] == 1
+    assert metrics["total_cache_read"] == 900
+    assert metrics["total_cache_create"] == 500
+    assert round(float(metrics["cache_read_ratio"]), 3) == 0.643
+    assert metrics["cache_health"] == "warning"
+
+
+def test_analyse_session_flags_recent_cache_stall(tmp_path: Path) -> None:
+    """Recent turns with zero read + high creation should be flagged as likely broken cache."""
+    session = tmp_path / "claude-stalled.jsonl"
+    session.write_text(
+        "\n".join([
+            json.dumps({
+                "type": "assistant",
+                "entrypoint": "vscode",
+                "message": {"role": "assistant", "usage": {
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 2500,
+                }},
+            }),
+            json.dumps({
+                "type": "assistant",
+                "entrypoint": "vscode",
+                "message": {"role": "assistant", "usage": {
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 2600,
+                }},
+            }),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    metrics = analyse_session(session, recent_window=2)
+
+    assert metrics["cache_stalled"] is True
+    assert metrics["cache_health"] == "broken-likely"

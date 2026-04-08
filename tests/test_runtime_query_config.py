@@ -161,3 +161,19 @@ def test_budget_tracker_detects_budget_exceeded() -> None:
     tracker.record(_response(inp=100, out=50))
 
     assert tracker.exceeded(BudgetPolicy(budget_usd=0.0001))
+
+
+def test_openai_prompt_growth_triggers_diminishing() -> None:
+    tracker = BudgetTracker()
+    tracker.record(_response(inp=1300, out=200), provider_name="openai")
+    tracker.record(_response(inp=1500, out=220), provider_name="openai")
+    tracker.record(_response(inp=1700, out=240), provider_name="openai")
+    tracker.record(_response(inp=2000, out=260), provider_name="openai")
+    assert tracker.is_diminishing()
+
+
+def test_openai_overrun_turns_trigger_diminishing() -> None:
+    tracker = BudgetTracker()
+    for _ in range(14):
+        tracker.record(_response(inp=400, out=120), provider_name="openai")
+    assert tracker.is_diminishing()

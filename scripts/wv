@@ -148,6 +148,7 @@ main() {
         selftest)        cmd_selftest "$@" ;;
         mcp-status)      cmd_mcp_status "$@" ;;
         health)          cmd_health "$@" ;;
+        cache)           cmd_cache "$@" ;;
         preflight)       _resolve_first_id cmd_preflight "$@" ;;
         digest)          cmd_digest "$@" ;;
         overview)        cmd_overview "$@" ;;

@@ -2,6 +2,23 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.33.0] - 2026-04-08
+
+### Added
+
+- **`wv findings list`**: new subcommand showing all finding-type nodes with fixable/confidence/
+  violation_type summary. Accepts `--fixable` to filter to actionable items and `--json` for
+  machine-readable output.
+- **`wv ready` findings section**: fixable finding nodes (with no active fix task) are surfaced as a
+  separate "Findings to implement" section below the regular ready list. Finding nodes are excluded
+  from the main ready list to avoid duplication.
+- **`wv cache`**: new command reporting Claude Code prompt-cache health from recent session JSONLs.
+  Shows per-session and aggregate `cache_read` vs `cache_creation` ratios, detects standalone Bun
+  binary (sentinel bug risk), and flags `deferred_tools_delta` presence (session resume regression).
+  Accepts `--sessions=N`, `--all` (all projects), and `--json`.
+- **`wv health` cache summary**: `wv health` now includes a one-line Cache: entry showing the latest
+  session's read ratio and status, with a pointer to `wv cache` for full detail.
+
 ## [1.32.0] - 2026-04-07
 
 ### Added
@@ -22,8 +39,8 @@
   dry-run and apply, and `--apply` no longer backfills deeper-ranked items when reviewed candidates
   are skipped as already promoted.
 - **Historical findings atomicity**: numbered multi-bug learnings split into separate candidates
-  instead of shipping one bundled promotion, and known same-bug `_convert_sampled_features`
-  variants no longer consume duplicate top-window slots.
+  instead of shipping one bundled promotion, and known same-bug `_convert_sampled_features` variants
+  no longer consume duplicate top-window slots.
 
 ## [1.31.0] - 2026-04-07
 

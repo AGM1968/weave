@@ -1,7 +1,7 @@
 #!/bin/bash
 # wv-cmd-ops.sh — Operations and diagnostic commands
 #
-# Commands: health, audit-pitfalls, edge-types, help
+# Commands: health, cache, audit-pitfalls, edge-types, help
 # Sourced by: wv entry point (after lib modules)
 # Dependencies: wv-config.sh, wv-db.sh, wv-validate.sh, wv-cache.sh, wv-cmd-core.sh
 
@@ -1572,6 +1572,51 @@ _health_collect_quality() {
     fi
 }
 
+# One-line cache health summary for wv health output
+_health_cache_summary() {
+    local proj_slug projects_dir jsonl
+    proj_slug=$(pwd | tr '/' '-')
+    projects_dir="$HOME/.claude/projects"
+    # Pick most recent JSONL for this project
+    jsonl=$(ls -t "$projects_dir/${proj_slug}"/*.jsonl 2>/dev/null | head -1)
+    if [ -z "$jsonl" ]; then
+        echo "  no session data (run 'wv cache' to diagnose)"
+        return
+    fi
+    python3 - "$jsonl" <<'PYEOF'
+import sys, json, os
+path = sys.argv[1]
+total_read = total_create = turns = 0
+try:
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try: e = json.loads(line)
+            except: continue
+            usage = e.get("usage")
+            if usage is None:
+                msg = e.get("message", {})
+                if isinstance(msg, dict): usage = msg.get("usage")
+            if isinstance(usage, dict):
+                total_read  += usage.get("cache_read_input_tokens", 0) or 0
+                total_create += usage.get("cache_creation_input_tokens", 0) or 0
+                turns += 1
+except Exception:
+    pass
+total = total_read + total_create
+if total == 0:
+    print("  no usage data in latest session")
+    sys.exit(0)
+ratio = total_read / total
+status = "OK" if ratio > 0.65 else "LOW" if ratio > 0.35 else "BAD"
+GREEN = "\033[0;32m"; YELLOW = "\033[1;33m"; RED = "\033[0;31m"; NC = "\033[0m"
+colour = GREEN if status == "OK" else (YELLOW if status == "LOW" else RED)
+sid = os.path.basename(path)[:8]
+print(f"  {sid}  {turns} turns  {ratio:.1%} read  {colour}{status}{NC}  (run 'wv cache' for full report)")
+PYEOF
+}
+
 # Backfill empty edge context. Sets _h_fixed_edge_ctx count.
 _health_fix_edges() {
     _h_fixed_edge_ctx=0
@@ -1722,6 +1767,9 @@ _health_format_text() {
     else
         echo "  no scan data"
     fi
+    echo ""
+    echo -e "${CYAN}Cache:${NC}"
+    _health_cache_summary
 
     if [ "$verbose" = true ]; then
         echo ""
@@ -1827,6 +1875,263 @@ cmd_health() {
         return 1
     fi
     return 0
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_cache — Claude Code session cache health
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_cache() {
+    local format="text"
+    local sessions_n=3
+    local all_projects=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json)          format="json" ;;
+            --sessions=*)    sessions_n="${1#--sessions=}" ;;
+            --sessions)      shift; sessions_n="${1:-3}" ;;
+            --all)           all_projects=true ;;
+            --help|-h)
+                cat >&2 <<'EOF'
+Usage: wv cache [options]
+
+Check Claude Code prompt-cache health for the current project.
+
+Options:
+  --sessions=N   Number of recent sessions to analyse (default: 3)
+  --all          Include sessions from all projects, not just current
+  --json         JSON output
+
+Ratios:
+  >65%  OK      — cache is working
+  35-65% LOW    — possible warm-up or light bug impact
+  <35%  BAD     — likely affected by a cache bug
+
+Bugs:
+  Sentinel (Bug 1): standalone Bun binary; every turn re-creates cache
+  Resume (Bug 2):   deferred_tools_delta stripped on session save/resume
+EOF
+                return 0
+                ;;
+        esac
+        shift
+    done
+
+    # Detect Claude Code install type
+    local claude_bin claude_type="unknown"
+    claude_bin=$(command -v claude 2>/dev/null || echo "")
+    if [ -n "$claude_bin" ]; then
+        local real_bin
+        real_bin=$(readlink -f "$claude_bin" 2>/dev/null || echo "$claude_bin")
+        if file "$real_bin" 2>/dev/null | grep -q "ELF"; then
+            claude_type="standalone-bun"
+        elif file "$real_bin" 2>/dev/null | grep -q "script"; then
+            claude_type="npx-script"
+        fi
+    fi
+
+    # Resolve project session directories
+    local projects_dir="$HOME/.claude/projects"
+    local session_dirs=()
+    if [ "$all_projects" = true ]; then
+        while IFS= read -r d; do session_dirs+=("$d"); done < <(
+            find "$projects_dir" -maxdepth 1 -mindepth 1 -type d 2>/dev/null
+        )
+    else
+        local proj_slug
+        proj_slug=$(pwd | tr '/' '-')
+        local proj_dir="$projects_dir/${proj_slug}"
+        [ -d "$proj_dir" ] && session_dirs=("$proj_dir")
+    fi
+
+    if [ ${#session_dirs[@]} -eq 0 ]; then
+        echo "No Claude Code session data found for this project." >&2
+        echo "Run 'wv cache --all' to check all projects." >&2
+        return 0
+    fi
+
+    # Collect JSONL paths (most recent N per dir, sorted by mtime)
+    local jsonl_list=""
+    for dir in "${session_dirs[@]}"; do
+        local found
+        found=$(find "$dir" -maxdepth 1 -name "*.jsonl" -printf "%T@ %p\n" 2>/dev/null \
+            | sort -rn | head -"$sessions_n" | awk '{print $2}')
+        [ -n "$found" ] && jsonl_list="$jsonl_list"$'\n'"$found"
+    done
+    jsonl_list=$(printf '%s' "$jsonl_list" | grep -v '^$')
+
+    if [ -z "$jsonl_list" ]; then
+        echo "No session JSONL files found." >&2
+        return 0
+    fi
+
+    # Write path list to a temp file so the Python heredoc can use stdin cleanly
+    local _cache_tmp
+    _cache_tmp=$(mktemp /tmp/wv-cache-XXXXXX.txt)
+    echo "$jsonl_list" > "$_cache_tmp"
+    # shellcheck disable=SC2064
+    trap "rm -f '$_cache_tmp'" RETURN
+
+    python3 - "$format" "$claude_type" "$_cache_tmp" <<'PYEOF'
+import sys, json, os
+
+format_out  = sys.argv[1]
+claude_type = sys.argv[2]
+paths_file  = sys.argv[3]
+
+with open(paths_file) as pf:
+    paths_raw = pf.read().strip().split('\n')
+paths = [p for p in paths_raw if p and os.path.exists(p)]
+paths.sort(key=os.path.getmtime, reverse=True)
+
+def analyse(path):
+    total_read = total_create = turns = 0
+    has_deferred = False
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            usage = e.get("usage")
+            if usage is None:
+                msg = e.get("message", {})
+                if isinstance(msg, dict):
+                    usage = msg.get("usage")
+            if isinstance(usage, dict):
+                total_read  += usage.get("cache_read_input_tokens", 0) or 0
+                total_create += usage.get("cache_creation_input_tokens", 0) or 0
+                turns += 1
+            if "deferred_tools_delta" in str(e.get("content", "")):
+                has_deferred = True
+    total = total_read + total_create
+    ratio = total_read / total if total > 0 else None
+    return {
+        "session_id": os.path.basename(path).replace(".jsonl", "")[:8],
+        "path": path,
+        "turns": turns,
+        "cache_read": total_read,
+        "cache_create": total_create,
+        "ratio": ratio,
+        "has_deferred_tools_delta": has_deferred,
+        "status": (
+            "ok"  if ratio is not None and ratio > 0.65 else
+            "low" if ratio is not None and ratio > 0.35 else
+            "bad" if ratio is not None else
+            "no_data"
+        ),
+    }
+
+results = []
+for p in paths:
+    try:
+        results.append(analyse(p))
+    except Exception as e:
+        pass
+
+if format_out == "json":
+    out = {
+        "claude_type": claude_type,
+        "sessions": results,
+    }
+    if results:
+        reads  = [r["cache_read"]   for r in results if r["ratio"] is not None]
+        writes = [r["cache_create"] for r in results if r["ratio"] is not None]
+        total  = sum(reads) + sum(writes)
+        out["aggregate_ratio"] = sum(reads) / total if total > 0 else None
+    print(json.dumps(out, indent=2))
+    sys.exit(0)
+
+# ── text output ──────────────────────────────────────────────────────────
+CYAN  = "\033[0;36m"
+GREEN = "\033[0;32m"
+YELLOW= "\033[1;33m"
+RED   = "\033[0;31m"
+NC    = "\033[0m"
+
+def status_colour(s):
+    if s == "ok":      return f"{GREEN}OK{NC}"
+    if s == "low":     return f"{YELLOW}LOW{NC}"
+    if s == "bad":     return f"{RED}BAD{NC}"
+    return f"{YELLOW}no data{NC}"
+
+def ratio_str(r):
+    if r is None:
+        return "   n/a"
+    return f"{r:5.1%}"
+
+type_label = {
+    "standalone-bun": f"{YELLOW}standalone (Bun){NC}",
+    "npx-script":     f"{GREEN}npx/script{NC}",
+}.get(claude_type, claude_type)
+
+print(f"\nClaude Code install: {type_label}")
+if claude_type == "standalone-bun":
+    print(f"  {YELLOW}Sentinel bug (Bug 1) risk — consider alias to npx version{NC}")
+
+# Filter to sessions that actually have usage data
+data_sessions = [r for r in results if r["ratio"] is not None]
+empty_sessions = [r for r in results if r["ratio"] is None]
+
+if not data_sessions:
+    print("\nNo cache data found in recent sessions.")
+    if empty_sessions:
+        print(f"({len(empty_sessions)} session(s) had no usage entries — may be too short to measure)")
+    sys.exit(0)
+
+print(f"\n{'Session':<12} {'Turns':>6}  {'Read':>12}  {'Create':>10}  {'Ratio':>7}  Status")
+print("─" * 68)
+for r in data_sessions:
+    deferred = "  [deferred_tools_delta]" if r["has_deferred_tools_delta"] else ""
+    print(
+        f"{CYAN}{r['session_id']}{NC}  "
+        f"{r['turns']:>6}  "
+        f"{r['cache_read']:>12,}  "
+        f"{r['cache_create']:>10,}  "
+        f"{ratio_str(r['ratio'])}  "
+        f"{status_colour(r['status'])}"
+        f"{deferred}"
+    )
+
+# Aggregate
+total_read  = sum(r["cache_read"]   for r in data_sessions)
+total_write = sum(r["cache_create"] for r in data_sessions)
+total       = total_read + total_write
+agg_ratio   = total_read / total if total > 0 else None
+agg_status  = (
+    "ok"  if agg_ratio is not None and agg_ratio > 0.65 else
+    "low" if agg_ratio is not None and agg_ratio > 0.35 else
+    "bad"
+)
+
+print("─" * 68)
+print(
+    f"{'Aggregate':<12}  "
+    f"{'':>6}  "
+    f"{total_read:>12,}  "
+    f"{total_write:>10,}  "
+    f"{ratio_str(agg_ratio)}  "
+    f"{status_colour(agg_status)}"
+)
+
+if empty_sessions:
+    print(f"\n({len(empty_sessions)} short session(s) excluded — no usage data)")
+
+# Advisory
+if any(r["has_deferred_tools_delta"] for r in data_sessions):
+    print(f"\n{YELLOW}deferred_tools_delta found — monitor for Bug 2 (session resume regression){NC}")
+
+if agg_status in ("low", "bad"):
+    print(f"\n{YELLOW}Cache health is degraded. Possible causes:{NC}")
+    if claude_type == "standalone-bun":
+        print("  - Bug 1 (sentinel): switch to 'npx @anthropic-ai/claude-code'")
+    print("  - Bug 2 (resume): check for deferred_tools_delta in sessions")
+    print("  - Short/fresh sessions (normal for <5 turns)")
+PYEOF
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

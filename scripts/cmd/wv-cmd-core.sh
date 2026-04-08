@@ -1254,9 +1254,10 @@ cmd_ready() {
         subtree_join="JOIN _subtree st ON n.id = st.id"
     fi
 
-    # Ready = todo status AND not blocked by any open node
+    # Ready = todo status AND not blocked AND not a finding node (surfaced separately)
     local ready_where="
         n.status = 'todo'
+        AND json_extract(n.metadata, '$.type') IS NOT 'finding'
         AND NOT EXISTS (
             SELECT 1 FROM edges e
             JOIN nodes blocker ON e.source = blocker.id
@@ -1291,6 +1292,39 @@ cmd_ready() {
                 echo -e "${CYAN}$id${NC}: $text"
             fi
         done
+
+        # Findings to implement: fixable finding nodes with no active/todo fix task
+        local finding_rows
+        finding_rows=$(db_query "
+            SELECT n.id,
+                   json_extract(n.metadata, '$.finding.confidence') AS confidence,
+                   json_extract(n.metadata, '$.finding.violation_type') AS violation_type,
+                   n.text,
+                   n.status
+            FROM nodes n
+            WHERE json_extract(n.metadata, '$.type') = 'finding'
+              AND json_extract(n.metadata, '$.finding.fixable') = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM edges e
+                  JOIN nodes t ON e.source = t.id
+                  WHERE e.target = n.id AND e.type = 'resolves' AND t.status != 'done'
+              )
+            ORDER BY n.created_at ASC;
+        ")
+        if [ -n "$finding_rows" ]; then
+            echo ""
+            echo -e "${YELLOW}── Findings to implement ──────────────────────────────────────${NC}"
+            while IFS='|' read -r fid confidence violation_type ftext fstatus; do
+                local conf_label="${confidence:-?}"
+                local vtype="${violation_type:-unknown}"
+                local display
+                display=$(echo "$ftext" | sed 's/^Finding: //' | cut -c1-68)
+                echo -e "  ${CYAN}$fid${NC} [${fstatus}] conf=${conf_label}  ${vtype}"
+                echo -e "    $display"
+            done <<< "$finding_rows"
+            echo -e "${YELLOW}───────────────────────────────────────────────────────────────${NC}"
+            echo -e "  Use ${CYAN}wv findings list${NC} for full details."
+        fi
     fi
 }
 
