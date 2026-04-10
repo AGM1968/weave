@@ -1578,7 +1578,7 @@ _health_cache_summary() {
     proj_slug=$(pwd | tr '/' '-')
     projects_dir="$HOME/.claude/projects"
     # Pick most recent JSONL for this project
-    jsonl=$(ls -t "$projects_dir/${proj_slug}"/*.jsonl 2>/dev/null | head -1)
+    jsonl=$(ls -t "$projects_dir/${proj_slug}"/*.jsonl 2>/dev/null | head -1 || true)
     if [ -z "$jsonl" ]; then
         echo "  no session data (run 'wv cache' to diagnose)"
         return
@@ -2489,6 +2489,7 @@ Commands:
   health            System health check with score and diagnostics [--history[=N]]
   guide             Workflow quick reference [--topic=workflow|github|learnings|context|mcp]
   prune             Archive old done nodes
+  clean-ghosts      Delete ghost edges referencing deleted nodes [--dry-run] [legacy compatibility]
   refs <file|text>  Extract cross-references (dry-run, no edges)
   import <file>     Import from beads JSONL or JSON
   quality <sub>     Code quality scanner (scan, hotspots, diff, promote, reset)

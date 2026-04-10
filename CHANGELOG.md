@@ -2,6 +2,35 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.34.0] - 2026-04-10
+
+### Added
+
+- **Applied-deltas manifest** (`.weave/.applied_deltas`): `wv load` now records each successfully
+  applied delta file and skips re-applying it on subsequent loads when `state.sql` has been updated
+  since. Prevents double-replay of delta changesets when `wv load` is called multiple times between
+  syncs. Guard condition: manifest is trusted only when `state.sql` mtime > manifest mtime (a sync
+  ran after the last load, so `state.sql` incorporates those changes).
+
+### Fixed
+
+- **Delta changeset correctness — INSERT/UPDATE split**: `wv_delta_changeset` previously emitted
+  `INSERT OR REPLACE` for both INSERT and UPDATE trigger events, silently overwriting all fields on
+  any update. UPDATE events now emit `UPDATE nodes SET <changed-fields>` using field-level diff.
+  Only fields that actually changed appear in the SET clause (NULL-safe `IS NOT` comparison via
+  `rtrim` for trailing commas, no-op guard for identical writes). This is the primary correctness
+  fix for concurrent multi-agent field edits where two agents modify different fields on the same
+  node.
+- **`_warp_changes` excluded from `dump_state_sql`**: the trigger-tracking table was previously
+  included in `state.sql` dumps, causing `wv_delta_has_changes` to return true immediately after
+  every fresh `wv load` (phantom change detection). `state.sql` now dumps `nodes` and `edges` only.
+- **`wv init` test hang** (`#`-comment in SQL string): bash `#` is not a valid SQL comment token.
+  The `_WV_DELTA_TRIGGERS_EDGES` shell variable contained a `#` comment that sqlite3 rejected,
+  causing `wv init` to exit 1 under `set -e` in test environments. Converted to `--` SQL comments.
+- **`wv health` exit 2 in test environments**: `ls *.jsonl` with no match exits 2; `set -o pipefail`
+  propagated this through `_health_cache_summary`'s command substitution, making `wv health` exit 2
+  in any directory with no Claude session JSONL. Fixed with `|| true` inside the subshell.
+
 ## [1.33.0] - 2026-04-08
 
 ### Added

@@ -55,6 +55,10 @@ promote options:
   --include-root-causes Include validated explanatory root-cause insights
   --include-tooling  Include Weave/runtime/tooling findings (internal use)
   --parent=<id>  Parent node ID to link via references when applying
+
+Promoted findings use metadata.type="finding" and nested
+  finding.{violation_type, root_cause, proposed_fix, confidence, fixable};
+  confidence must be high|medium|low and evidence_sessions is optional.
 EOF
             return 0
             ;;

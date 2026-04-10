@@ -1,17 +1,19 @@
 #!/bin/bash
 # wv — Weave CLI: In-memory graph for AI coding agents
 # Fast, ephemeral task/context tracking via SQLite in tmpfs
-# See: docs/WEAVE_v1.md
+# See: docs/WEAVE.md
 #
 # Modular architecture (v1.2):
 #   lib/wv-config.sh   — configuration, hot zone, colors
 #   lib/wv-db.sh       — database init, migrations, queries
 #   lib/wv-validate.sh — ID generation, validation, edge types
 #   lib/wv-cache.sh    — context cache management
-#   cmd/wv-cmd-core.sh — init, add, done, ready, list, show, status, update
+#   cmd/wv-cmd-core.sh — init, add, done, ready, list, show, status, update, quick, ship
 #   cmd/wv-cmd-graph.sh— block, link, resolve, related, edges, path, context
-#   cmd/wv-cmd-data.sh — sync, load, prune, learnings, refs, import
-#   cmd/wv-cmd-ops.sh  — health, audit-pitfalls, edge-types, help
+#   cmd/wv-cmd-data.sh — batch, plan, enrich-topology, sync, load, prune, clean-ghosts, learnings, refs, import, search, reindex, breadcrumbs
+#   cmd/wv-cmd-ops.sh  — doctor, recover, selftest, mcp-status, health, cache, preflight, digest, overview, session-summary, audit-pitfalls, edge-types, guide, init-repo, help
+#   cmd/wv-cmd-quality.sh — quality
+#   cmd/wv-cmd-findings.sh — findings
 
 set -euo pipefail
 

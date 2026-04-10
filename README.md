@@ -2,6 +2,9 @@
 
 Token-optimized task tracking for agentic workflows. SQLite on tmpfs, managed by the `wv` CLI.
 
+This is the `weave(public)` README produced by `build-release.sh`; it omits the in-repo runtime and
+other local-only paths from the full memory-system tree.
+
 ## Why Weave
 
 | Aspect           | Traditional RAG               | Weave                               |
@@ -138,6 +141,12 @@ git push          Push state to remote
 | `wv learnings --grep="topic"`          | Search learnings by keyword     |
 | `wv audit-pitfalls`                    | Track resolved vs open pitfalls |
 | `wv audit-pitfalls --only-unaddressed` | Show unresolved pitfalls only   |
+| `wv findings list`                     | List finding nodes with summary |
+| `wv findings promote`                  | Promote learnings into findings |
+
+Finding nodes use `metadata.type="finding"` plus nested
+`finding.{violation_type, root_cause, proposed_fix, confidence, fixable}` data.
+`confidence` is `high|medium|low`.
 
 ### System
 
@@ -149,6 +158,7 @@ git push          Push state to remote
 | `wv quality diff`           | Delta report vs previous scan              |
 | `wv quality functions`      | Per-function CC with histogram + Gini      |
 | `wv quality promote`        | Create nodes from top findings             |
+| `wv clean-ghosts`           | Delete ghost edges (legacy compatibility)  |
 | `wv doctor`                 | Installation health check                  |
 | `wv mcp-status`             | MCP server health check                    |
 | `wv selftest`               | End-to-end smoke test                      |

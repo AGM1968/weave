@@ -189,7 +189,7 @@ test_cmd_done_invalidation() {
     "$WV" done "$blocker" >/dev/null 2>&1
 
     # Get context again - done blockers are filtered out by design
-    # (see WEAVE_v1.md: "blockers (done nodes filtered out)")
+    # (see docs/WEAVE.md: "blockers (done nodes filtered out)")
     local after_count
     after_count=$("$WV" context "$blocked" --json | jq -r '.blockers | length')
     assert_equals "0" "$after_count" "Done blocker is filtered from context"

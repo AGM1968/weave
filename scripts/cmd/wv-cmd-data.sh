@@ -1,7 +1,7 @@
 #!/bin/bash
 # wv-cmd-data.sh — Data management commands
 #
-# Commands: sync, load, prune, learnings, refs, import
+# Commands: batch, plan, enrich-topology, sync, load, prune, clean-ghosts, learnings, refs, import, search, reindex, breadcrumbs
 # Sourced by: wv entry point (after lib modules)
 # Dependencies: wv-config.sh, wv-db.sh, wv-validate.sh, wv-cache.sh
 
@@ -42,14 +42,21 @@ sys.stdout.write(pat.sub(fix, sys.stdin.read()))
 # git delta compression.  At 270 nodes the FTS tables are 52MB vs 300KB for
 # the actual data — a 99.5% overhead committed on every sync.
 #
+# _warp_changes is also excluded: it is a transient tracker table populated by
+# triggers and cleared after every successful sync. Including it in state.sql
+# caused stale tracker rows to be reimported on wv load, which made
+# wv_delta_has_changes return true immediately after a fresh load even though
+# no local changes had been made. The table is recreated empty by wv_delta_init
+# on every load; triggers are reinstalled at the same time.
+#
 # This function dumps only the data tables and the schema preamble needed
-# to reconstruct the database.  FTS is rebuilt on load via db_rebuild_fts.
+# to reconstruct the database. FTS is rebuilt on load via db_rebuild_fts.
+# Delta tracking is reinstalled on load via wv_delta_init.
 dump_state_sql() {
     local db="$1" outfile="$2"
     {
         sqlite3 -cmd ".timeout 5000" "$db" ".dump nodes" 2>/dev/null
         sqlite3 -cmd ".timeout 5000" "$db" ".dump edges" 2>/dev/null
-        sqlite3 -cmd ".timeout 5000" "$db" ".dump _warp_changes" 2>/dev/null
     } | strip_unistr > "$outfile"
 }
 
@@ -93,20 +100,26 @@ auto_sync() {
         fi
     fi
 
-    # O(1) change detection: skip entirely if nothing changed
+    # O(1) change detection: if _warp_changes is empty, nothing happened since
+    # the last sync — skip the dump entirely. No I/O, no git noise.
     if ! wv_delta_has_changes "$WV_DB"; then
-        return 0  # Nothing changed — no dump, no commit, no noise
+        return 0
     fi
 
-    # Persist delta changeset (O(changes) — only what changed)
-    # Subdirectory per day prevents single-dir bloat at scale
+    # Emit delta changeset before the full dump. The changeset captures exactly
+    # what changed since the last wv_delta_reset, in causal order (by _warp_changes.id).
+    # Stored as .weave/deltas/<YYYY-MM-DD>/<epoch>-<agent_id>.sql — one file per sync
+    # cycle per agent. Day-subdirectory prevents single-dir inode bloat over time.
+    # These files are committed to git and replayed by other agents on wv load
+    # (multi-agent merge). Empty files (no-op cycles) are removed immediately.
     local delta_dir="$WEAVE_DIR/deltas/$(date +%Y-%m-%d)"
     mkdir -p "$delta_dir"
     wv_delta_changeset "$WV_DB" > "$delta_dir/${now}-${agent_id}.sql" 2>/dev/null || true
-    # Remove empty delta files
     [ -s "$delta_dir/${now}-${agent_id}.sql" ] || rm -f "$delta_dir/${now}-${agent_id}.sql"
 
-    # Perform silent sync (full dump — kept for audit trail)
+    # Full dump to state.sql — kept as the authoritative snapshot and audit trail.
+    # Deltas complement the dump; they are not a replacement. state.sql is what
+    # cmd_load uses to reconstruct the DB from scratch; deltas patch it forward.
     mkdir -p "$WEAVE_DIR"
     local tmp_sql tmp_nodes tmp_edges
     tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
@@ -116,8 +129,10 @@ auto_sync() {
     dump_state_sql "$WV_DB" "$tmp_sql"
     [ -s "$tmp_sql" ] || { rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; return 0; }
 
-    # No-op detection: skip jsonl generation + checkpoint if state unchanged.
-    # Pure file compare after dump — catches edge cases where triggers fire but output is same.
+    # Second-level no-op guard: triggers can fire on no-net-change operations
+    # (e.g. UPDATE that writes the same value). cmp catches these by comparing
+    # the dump output directly — if state.sql is byte-identical, skip the jsonl
+    # regeneration and checkpoint entirely.
     if [ -f "$WEAVE_DIR/state.sql" ] && cmp -s "$tmp_sql" "$WEAVE_DIR/state.sql"; then
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
         wv_delta_reset "$WV_DB"
@@ -521,43 +536,96 @@ EOF
         db_migrate_virtual_columns
         # Rebuild FTS index from node data (selective dump excludes FTS tables)
         db_rebuild_fts
-        # Initialize delta change tracking (idempotent)
+        # Initialize delta change tracking on the freshly loaded DB (idempotent).
+        # Triggers are not stored in state.sql (selective dump excludes them),
+        # so they must be reinstalled after every load.
         wv_delta_init "$WV_DB"
 
-        # Replay delta changesets from other agents (multi-agent merge)
-        # FKs OFF: cross-agent deltas may reference nodes in later-sorted files
-        # No transaction: PRAGMA foreign_keys is no-op inside transactions
+        # Delta replay — multi-agent merge
+        #
+        # After loading state.sql (the last full snapshot from any agent), apply
+        # all delta files from .weave/deltas/ in chronological order. Each delta
+        # file contains INSERT OR REPLACE / DELETE statements emitted by
+        # wv_delta_changeset on a previous sync cycle (by this or another agent).
+        # Replaying them brings the DB forward to the union of all agents' changes.
+        #
+        # Ordering: files are sorted by filename (<epoch>-<agent>.sql), which
+        # sorts by Unix timestamp — causal order within each agent, approximate
+        # causal order across agents (clock skew is acceptable; last-writer-wins
+        # semantics handle conflicts at the row level).
+        #
+        # FK OFF during replay: a delta from agent B may INSERT an edge that
+        # references a node only present in a later-sorted delta from agent A.
+        # Disabling FK constraints for the replay batch avoids false rejections.
+        # PRAGMA foreign_keys is a no-op inside a transaction, so it must be
+        # applied outside any transaction wrapper.
+        #
+        # Prune epoch filter: cmd_prune writes .weave/.prune_epoch (Unix timestamp)
+        # after deleting nodes. Deltas older than that epoch contain INSERT OR REPLACE
+        # statements for now-pruned nodes — replaying them would resurrect deleted
+        # nodes. Skip any delta file whose epoch prefix predates the prune epoch.
         if [ -d "$WEAVE_DIR/deltas" ]; then
             local delta_files delta_count=0
-            # Prune epoch: skip deltas older than the last prune to prevent
-            # resurrecting pruned nodes from stale INSERT OR REPLACE statements.
             local prune_epoch=0
             if [ -f "$WEAVE_DIR/.prune_epoch" ]; then
                 prune_epoch=$(cat "$WEAVE_DIR/.prune_epoch" 2>/dev/null || echo "0")
             fi
+            # Applied-deltas manifest (.weave/.applied_deltas): one basename per line,
+            # written after each successfully-applied delta. Prevents double-replay
+            # when wv load is called multiple times without an intervening wv sync.
+            #
+            # Guard condition: the manifest is only trusted when state.sql is NEWER
+            # than the manifest (i.e., a wv sync ran after the last load, so state.sql
+            # incorporates the manifest's deltas). If state.sql predates the manifest,
+            # the load is starting fresh from a snapshot that may not include those
+            # changes, so all deltas are replayed and the manifest is rebuilt.
+            # Local-only — not committed to git.
+            local manifest="$WEAVE_DIR/.applied_deltas"
+            local applied_set=""
+            local state_mtime manifest_mtime
+            state_mtime=$(stat -c %Y "$WEAVE_DIR/state.sql" 2>/dev/null || echo "0")
+            manifest_mtime=$(stat -c %Y "$manifest" 2>/dev/null || echo "0")
+            if [ -f "$manifest" ] && [ "$state_mtime" -gt "$manifest_mtime" ]; then
+                # state.sql updated after last load — its changes incorporate manifest deltas
+                applied_set=$(cat "$manifest" 2>/dev/null || true)
+            fi
+            # Rebuild manifest for this load cycle
+            : > "$manifest"
+            # Sort by filename (epoch prefix) for causal ordering across agents
             delta_files=$(find "$WEAVE_DIR/deltas" -name '*.sql' -printf '%f\t%p\n' 2>/dev/null | sort | cut -f2)
             if [ -n "$delta_files" ]; then
                 sqlite3 "$WV_DB" "PRAGMA foreign_keys = OFF;" 2>/dev/null
                 local skipped=0
                 while IFS= read -r delta; do
                     if [ -s "$delta" ]; then
-                        # Extract timestamp from filename (format: <epoch>-<agent>.sql)
+                        local delta_name
+                        delta_name=$(basename "$delta")
+                        # Skip if already recorded in the manifest (double-replay guard)
+                        if echo "$applied_set" | grep -qxF "$delta_name" 2>/dev/null; then
+                            continue
+                        fi
+                        # Filename format: <epoch>-<agent_id>.sql — prune epoch filter
                         local delta_ts
-                        delta_ts=$(basename "$delta" | grep -oP '^\d+' 2>/dev/null || echo "0")
+                        delta_ts=$(echo "$delta_name" | grep -oP '^\d+' 2>/dev/null || echo "0")
                         if [ "$delta_ts" -le "$prune_epoch" ] 2>/dev/null; then
                             skipped=$((skipped + 1))
-                            continue  # Skip pre-prune delta
+                            continue
                         fi
                         if sqlite3 "$WV_DB" < "$delta" 2>/dev/null; then
                             delta_count=$((delta_count + 1))
+                            echo "$delta_name" >> "$manifest"
                         else
-                            echo -e "${YELLOW}⚠ Skipped corrupt delta: ${delta##*/}${NC}" >&2
+                            echo -e "${YELLOW}⚠ Skipped corrupt delta: ${delta_name}${NC}" >&2
                         fi
                     fi
                 done <<< "$delta_files"
                 sqlite3 "$WV_DB" "PRAGMA foreign_keys = ON;" 2>/dev/null
                 if [ "$delta_count" -gt 0 ]; then
-                    # Clear change log so replayed ops don't snowball as new deltas
+                    # Reset the change log after replay: the INSERT OR REPLACE
+                    # statements fired the triggers, so _warp_changes now contains
+                    # every replayed operation. Without this reset, the next
+                    # auto_sync would emit a delta containing all of them —
+                    # snowballing the same changes across all agents indefinitely.
                     wv_delta_reset "$WV_DB"
                     echo -e "${GREEN}✓${NC} Replayed $delta_count delta(s)" >&2
                 fi
@@ -754,17 +822,20 @@ cmd_prune() {
     fi
 
     # Delete nodes and orphaned edges
-    # DELETEs must NOT leak into delta files — other agents would lose nodes
-    # that may not be pruning-eligible on their timeline.
+    # DELETEs must NOT leak into delta files. Prune decisions are local:
+    # a node pruned on this agent may still be active on another agent's timeline.
+    # If the DELETEs were emitted as a delta and replayed on that agent, it would
+    # lose nodes it is still working with. Prune is intentionally non-propagating.
     echo "$candidates" | cut -d'|' -f1 | while read -r id; do
         db_query "DELETE FROM edges WHERE source='$id' OR target='$id';"
         db_query "DELETE FROM nodes WHERE id='$id';"
     done
-    # Clear change log so DELETEs don't propagate via auto_sync deltas
+    # Clear _warp_changes so the DELETEs above are not emitted by the next auto_sync.
     wv_delta_reset "$WV_DB"
 
-    # Record prune epoch — on next wv load, delta files older than this
-    # timestamp are skipped so pruned nodes don't resurrect from stale INSERTs.
+    # Write prune epoch: the Unix timestamp of this prune run.
+    # cmd_load reads this and skips any delta file whose epoch prefix is <= prune_epoch,
+    # preventing old INSERT OR REPLACE deltas from resurrecting pruned nodes on reload.
     date +%s > "$WEAVE_DIR/.prune_epoch"
 
     # Re-dump state.sql so it no longer contains pruned nodes.
