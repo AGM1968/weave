@@ -412,6 +412,25 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 for legacy root command payload when verification exists"
 
+# Inline --verification-method flag satisfies hook without prior wv update
+ID2="$("$WV" add "inline-flag test node" --status=active 2>/dev/null | grep -oP 'wv-[0-9a-f]{4,6}')"
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID2 --verification-method=\\\"make check\\\" --learning=\\\"test\\\"\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 when --verification-method inline flag present"
+assert_equals "" "$OUTPUT" "pre-close: silent (no deny) when --verification-method inline flag present"
+
+# Inline --verification-evidence flag also satisfies hook
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID2 --verification-evidence=\\\"5 passed\\\" --learning=\\\"test\\\"\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 when --verification-evidence inline flag present"
+assert_equals "" "$OUTPUT" "pre-close: silent (no deny) when --verification-evidence inline flag present"
+
+"$WV" done "$ID2" --skip-verification 2>/dev/null || true  # cleanup
+
 # Non-matching command
 OUTPUT=$(echo '{"command":"wv list"}' | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 assert_equals "" "$OUTPUT" "pre-close: silent for non-matching commands"
@@ -421,7 +440,7 @@ echo ""
 echo "--- bash-dedup.sh / bash-dedup-post.sh ---"
 setup_test_env
 
-DEDUP_LOCK_DIR="/tmp/weave-bash-locks/$(printf '%s' "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | md5sum 2>/dev/null | cut -c1-8 || echo default)"
+DEDUP_LOCK_DIR="/tmp/weave-bash-locks/$(echo "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | md5sum 2>/dev/null | cut -c1-8 || echo default)"
 mkdir -p "$DEDUP_LOCK_DIR"
 
 # First call: lock is absent — should allow (exit 0, no denial output)
@@ -491,6 +510,25 @@ else
 fi
 
 rm -f "$DEDUP_LOCK_DIR/wv-sync.lock"
+
+# False-positive guard: "wv sync" inside a quoted argument must NOT create a lock
+FP_INPUT=$(jq -n --arg cmd 'wv done wv-abc1 --verification-evidence="wv sync --gh ran fine" --learning="x"' \
+    '{"tool_name":"Bash","tool_input":{"command":$cmd}}')
+set +e
+OUTPUT=$(echo "$FP_INPUT" | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "bash-dedup: wv sync inside quoted arg does not create lock"
+assert_equals "" "$OUTPUT" "bash-dedup: wv sync inside quoted arg is not denied"
+if [[ -f "$DEDUP_LOCK_DIR/wv-sync.lock" ]]; then
+    echo -e "${RED}✗${NC} bash-dedup: false-positive lock created for wv sync in quoted arg"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    rm -f "$DEDUP_LOCK_DIR/wv-sync.lock"
+else
+    echo -e "${GREEN}✓${NC} bash-dedup: no false-positive lock for wv sync in quoted arg"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
 
 # --- post-edit-lint.sh ---
 echo ""

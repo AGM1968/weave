@@ -414,7 +414,7 @@ _finding_missing_fields() {
             (if (($finding.root_cause // null) | type) == "string" and (($finding.root_cause | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.root_cause" end),
             (if (($finding.proposed_fix // null) | type) == "string" and (($finding.proposed_fix | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.proposed_fix" end),
             (if (["high", "medium", "low"] | index(($finding.confidence // "") | tostring)) != null then empty else "finding.confidence" end),
-            (if (($finding.fixable // null) | type) == "boolean" then empty else "finding.fixable" end),
+            (if ($finding.fixable | type) == "boolean" then empty else "finding.fixable" end),
             (if (($finding | has("evidence_sessions")) | not) or ((($finding.evidence_sessions // null) | type) == "array" and ([$finding.evidence_sessions[]? | select((type != "string") or ((gsub("^\\s+|\\s+$"; "")) | length == 0))] | length) == 0) then empty else "finding.evidence_sessions" end)
         ] | .[]?
     ' 2>/dev/null
@@ -1317,8 +1317,9 @@ cmd_ready() {
             while IFS='|' read -r fid confidence violation_type ftext fstatus; do
                 local conf_label="${confidence:-?}"
                 local vtype="${violation_type:-unknown}"
-                local display
-                display=$(echo "$ftext" | sed 's/^Finding: //' | cut -c1-68)
+                local display _tw
+                _tw=$(tput cols 2>/dev/null || echo 120)
+                display=$(echo "$ftext" | sed 's/^Finding: //' | cut -c1-$((_tw - 6)))
                 echo -e "  ${CYAN}$fid${NC} [${fstatus}] conf=${conf_label}  ${vtype}"
                 echo -e "    $display"
             done <<< "$finding_rows"

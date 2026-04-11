@@ -35,10 +35,10 @@ TTL=0
 if [[ "$CMD" =~ (^|[;[:space:]])(make[[:space:]]+(check|test|build)|make[[:space:]]*$) ]]; then
     LOCK_KEY="make-build"
     TTL=1800     # 30 min — generous for slow CI machines / large test suites
-elif [[ "$CMD" =~ wv[[:space:]]+sync ]]; then
+elif [[ "$CMD" =~ (^|[[:space:]]*[;&|]+[[:space:]]*)wv[[:space:]]+sync ]]; then
     LOCK_KEY="wv-sync"
     TTL=300
-elif [[ "$CMD" =~ git[[:space:]]+push ]]; then
+elif [[ "$CMD" =~ (^|[[:space:]]*[;&|]+[[:space:]]*)git[[:space:]]+push ]]; then
     LOCK_KEY="git-push"
     TTL=120
 elif [[ "$CMD" =~ (^|[[:space:]])\.\/install\.sh ]]; then
@@ -57,11 +57,13 @@ fi
 # ── Portable repo hash (md5sum → md5 → sha256sum → fallback) ─────────────────
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-_hash_input="$REPO_ROOT"
+# Use echo (not printf) to match the newline convention used by all other hooks
+# and wv-config.sh — they all hash "$REPO_ROOT\n". Diverging here causes a
+# different hash and a different lock directory from the rest of the system.
 REPO_HASH=$(
-    printf '%s' "$_hash_input" | md5sum 2>/dev/null |  cut -c1-8 ||
-    printf '%s' "$_hash_input" | md5    2>/dev/null |  cut -c1-8 ||
-    printf '%s' "$_hash_input" | sha256sum 2>/dev/null | cut -c1-8 ||
+    echo "$REPO_ROOT" | md5sum    2>/dev/null | cut -c1-8 ||
+    echo "$REPO_ROOT" | md5       2>/dev/null | cut -c1-8 ||
+    echo "$REPO_ROOT" | sha256sum 2>/dev/null | cut -c1-8 ||
     echo "default"
 )
 LOCK_DIR="/tmp/weave-bash-locks/${REPO_HASH}"

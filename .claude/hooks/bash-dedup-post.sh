@@ -44,10 +44,11 @@ fi
 # ── Portable repo hash (md5sum → md5 → sha256sum → fallback) ─────────────────
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+# Use echo to match hash convention in bash-dedup.sh and all other hooks
 REPO_HASH=$(
-    printf '%s' "$REPO_ROOT" | md5sum    2>/dev/null | cut -c1-8 ||
-    printf '%s' "$REPO_ROOT" | md5       2>/dev/null | cut -c1-8 ||
-    printf '%s' "$REPO_ROOT" | sha256sum 2>/dev/null | cut -c1-8 ||
+    echo "$REPO_ROOT" | md5sum    2>/dev/null | cut -c1-8 ||
+    echo "$REPO_ROOT" | md5       2>/dev/null | cut -c1-8 ||
+    echo "$REPO_ROOT" | sha256sum 2>/dev/null | cut -c1-8 ||
     echo "default"
 )
 LOCK_FILE="/tmp/weave-bash-locks/${REPO_HASH}/${LOCK_KEY}.lock"

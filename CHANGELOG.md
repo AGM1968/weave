@@ -2,6 +2,29 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.35.0] - 2026-04-11
+
+### Fixed
+
+- **pre-close-verification hook + wv done**: jq `//` alternative operator treats `false` as falsy,
+  causing `finding.fixable = false` to be rejected as missing. Fixed both the hook and CLI to use
+  `($field | type) == "boolean"` instead of `($field // null | type) == "boolean"`.
+- **bash-dedup hook**: `wv sync` pattern matched anywhere in the command string, including inside
+  quoted argument values (e.g. `--verification-evidence="...wv sync --gh..."`). Tightened regex to
+  require command-segment boundary (start of string or after shell operator `[;&|]+`). Same fix
+  applied to `git push` pattern.
+- **bash-dedup hash inconsistency**: `bash-dedup.sh` and `bash-dedup-post.sh` used `printf '%s'` for
+  repo hash (giving `9127bf5c`), diverging from the `echo` convention used by all other hooks and
+  `wv-config.sh` (giving `175b8f29`). Standardised to `echo` across both files.
+- **wv findings list / wv ready**: Finding text hard-truncated at 72/68 characters. Now uses
+  `tput cols` with 120-char fallback so full sentences are visible in standard terminals.
+
+### Tests
+
+- Hook tests: 4 new cases covering inline `--verification-method` and `--verification-evidence`
+  flags in pre-close-verification (previously untested branch).
+- Hook tests: 3 new cases verifying `wv sync` inside quoted arguments does not create a dedup lock.
+
 ## [1.34.0] - 2026-04-10
 
 ### Added

@@ -151,9 +151,11 @@ cmd_findings_list() {
         [ "$conf_str" = "medium" ] && conf_str="${YELLOW}medium${NC}"
         [ "$conf_str" = "low" ]    && conf_str="${RED}low${NC}"
         local vtype="${violation_type:-unknown}"
-        # Truncate text after "Finding: " prefix
+        # Truncate text after "Finding: " prefix, respecting terminal width
         local display_text
-        display_text=$(echo "$text" | sed 's/^Finding: //' | cut -c1-72)
+        local _term_w
+        _term_w=$(tput cols 2>/dev/null || echo 120)
+        display_text=$(echo "$text" | sed 's/^Finding: //' | cut -c1-$((_term_w - 4)))
         echo -e "${CYAN}$id${NC} [$status] $fix_badge conf=$conf_str  ${vtype}${fix_status}"
         echo -e "  $display_text"
     done <<< "$rows"
