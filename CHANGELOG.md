@@ -25,6 +25,39 @@
   flags in pre-close-verification (previously untested branch).
 - Hook tests: 3 new cases verifying `wv sync` inside quoted arguments does not create a dedup lock.
 
+## [1.35.1] - 2026-04-11
+
+### Fixed
+
+- **Multi-agent delta replay — manifest written before replay**: Applied-deltas manifest
+  (`.weave/.applied_deltas`) was updated before the sqlite3 replay call. A silent failure left
+  deltas marked as applied but never replayed, causing permanent data loss on the receiving agent.
+  Manifest is now written only after a successful replay.
+- **Multi-agent delta replay — fail-fast mode**: Replay errors were swallowed
+  (`2>/dev/null || warn`) and sqlite3 exited 0 after partial execution. Now uses `.bail on` so the
+  first failing statement aborts sqlite3 non-zero, rolls back the transaction, and causes `cmd_load`
+  to return non-zero without updating the manifest.
+- **Multi-agent delta replay — INSERT OR REPLACE alias collision**: `wv_delta_changeset` emitted
+  `INSERT OR REPLACE INTO nodes(...)` for delta INSERTs. SQLite OR REPLACE deletes the conflicting
+  row before inserting, so a node sharing a unique alias with the incoming row would be silently
+  deleted. Changed to `INSERT INTO ... ON CONFLICT(id) DO UPDATE` targeting the primary key only.
+- **Multi-agent delta replay — FTS shadow table filter removed**: Line-based grep filter for
+  `nodes_fts`/`sqlite_sequence` rows was unsafe against multi-line SQL literals. Removed —
+  `wv_delta_changeset` never emits FTS shadow tables so the filter was dead code and a risk.
+- **Delta filename uniqueness**: Filenames used `<epoch_s>-<agent_id>.sql` with one-second
+  resolution; two concurrent sync cycles on the same host overwrote each other. Now includes PID and
+  random component: `<epoch_s>-<agent_id>-<pid>-<rand>.sql`.
+- **Trigger schema upgrade**: `wv_delta_init` used `CREATE TRIGGER IF NOT EXISTS`, silently skipping
+  trigger recreations after payload schema changes. Now drops and recreates all 6 triggers so
+  existing DBs pick up new payload fields (`created_at`, `updated_at`).
+- **Timestamp propagation in delta payloads**: Node INSERT and UPDATE triggers now capture
+  `created_at` and `updated_at`. Changeset emits timestamps in INSERT statements and tracks
+  `updated_at` changes in UPDATE diffs, preserving node chronology on receiving agents.
+
+### Tests
+
+- Multi-agent tests: all 12 passing (730/730 bash tests clean).
+
 ## [1.34.0] - 2026-04-10
 
 ### Added

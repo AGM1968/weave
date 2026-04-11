@@ -29,10 +29,13 @@
 # on every auto_sync cycle (~60s). Saves one sqlite3 round-trip per cycle.
 _WV_DELTA_INITED=""
 
-# --- DDL (identical schema to warp/crates/warp-session/src/schema.rs) ---
-# Keeping schema identical means delta files produced by either implementation
-# are interchangeable. Do not change column names or trigger DDL without
-# also updating the warp crate.
+# --- DDL ---
+# This schema originated from warp/crates/warp-session/src/schema.rs (the Rust
+# research prototype). The two implementations have since diverged: trigger
+# payloads were extended here (created_at/updated_at on nodes) without updating
+# the Rust crate. warp-session is a research artifact in a separate project and
+# is not used in production. Delta files from different wv versions are compatible
+# as long as they only reference columns that exist in the target DB schema.
 
 _WV_DELTA_CREATE_TABLE="
 CREATE TABLE IF NOT EXISTS _warp_changes (
@@ -52,7 +55,8 @@ BEGIN
     INSERT INTO _warp_changes(table_name, operation, row_id, new_data)
     VALUES ('nodes', 'INSERT', NEW.id, json_object(
         'id', NEW.id, 'text', NEW.text, 'status', NEW.status,
-        'metadata', NEW.metadata, 'alias', NEW.alias
+        'metadata', NEW.metadata, 'alias', NEW.alias,
+        'created_at', NEW.created_at, 'updated_at', NEW.updated_at
     ));
 END;
 
@@ -62,11 +66,13 @@ BEGIN
     VALUES ('nodes', 'UPDATE', NEW.id,
         json_object(
             'id', OLD.id, 'text', OLD.text, 'status', OLD.status,
-            'metadata', OLD.metadata, 'alias', OLD.alias
+            'metadata', OLD.metadata, 'alias', OLD.alias,
+            'updated_at', OLD.updated_at
         ),
         json_object(
             'id', NEW.id, 'text', NEW.text, 'status', NEW.status,
-            'metadata', NEW.metadata, 'alias', NEW.alias
+            'metadata', NEW.metadata, 'alias', NEW.alias,
+            'updated_at', NEW.updated_at
         )
     );
 END;
@@ -76,7 +82,8 @@ BEGIN
     INSERT INTO _warp_changes(table_name, operation, row_id, old_data)
     VALUES ('nodes', 'DELETE', OLD.id, json_object(
         'id', OLD.id, 'text', OLD.text, 'status', OLD.status,
-        'metadata', OLD.metadata, 'alias', OLD.alias
+        'metadata', OLD.metadata, 'alias', OLD.alias,
+        'created_at', OLD.created_at, 'updated_at', OLD.updated_at
     ));
 END;
 "
@@ -91,7 +98,8 @@ BEGIN
     INSERT INTO _warp_changes(table_name, operation, row_id, new_data)
     VALUES ('edges', 'INSERT', NEW.source || ':' || NEW.target || ':' || NEW.type, json_object(
         'source', NEW.source, 'target', NEW.target, 'type', NEW.type,
-        'weight', NEW.weight, 'context', NEW.context
+        'weight', NEW.weight, 'context', NEW.context,
+        'created_at', NEW.created_at
     ));
 END;
 
@@ -123,12 +131,22 @@ END;
 # --- Functions ---
 
 # wv_delta_init — install _warp_changes table and 6 triggers on a DB.
-# Idempotent (CREATE TABLE IF NOT EXISTS / CREATE TRIGGER IF NOT EXISTS).
+# Always drops and recreates triggers so existing DBs pick up payload schema
+# changes (e.g. new columns added to trigger JSON objects). The table itself
+# uses CREATE TABLE IF NOT EXISTS (preserving in-flight changes).
 # Called by: cmd_init, cmd_load (after state.sql import and after db_init),
 # and wv_delta_has_changes (self-healing path).
 wv_delta_init() {
     local db="$1"
-    sqlite3 "$db" "${_WV_DELTA_CREATE_TABLE}${_WV_DELTA_TRIGGERS_NODES}${_WV_DELTA_TRIGGERS_EDGES}"
+    sqlite3 "$db" "
+${_WV_DELTA_CREATE_TABLE}
+DROP TRIGGER IF EXISTS _warp_nodes_insert;
+DROP TRIGGER IF EXISTS _warp_nodes_update;
+DROP TRIGGER IF EXISTS _warp_nodes_delete;
+DROP TRIGGER IF EXISTS _warp_edges_insert;
+DROP TRIGGER IF EXISTS _warp_edges_update;
+DROP TRIGGER IF EXISTS _warp_edges_delete;
+${_WV_DELTA_TRIGGERS_NODES}${_WV_DELTA_TRIGGERS_EDGES}"
     _WV_DELTA_INITED=1
 }
 
@@ -172,7 +190,7 @@ wv_delta_reset() {
 # (insertion order = causal order). No external tools — sqlite3's quote()
 # handles all SQL escaping correctly.
 #
-# INSERT rows  → INSERT OR REPLACE (creates or replaces the full row)
+# INSERT rows  → pre-clear alias conflict (nodes only) + INSERT ... ON CONFLICT DO UPDATE
 # UPDATE rows  → UPDATE ... SET <changed-fields> WHERE id=... (field-level,
 #                IS NOT used for NULL-safe comparison; only changed fields
 #                appear in the SET clause — safe for concurrent field edits)
@@ -196,18 +214,45 @@ wv_delta_changeset() {
     sqlite3 "$db" "
 SELECT
   CASE
-    -- INSERT: create the full row (idempotent via OR REPLACE)
+    -- INSERT: upsert by PK. ON CONFLICT(id) handles the existing-row case.
+    -- Alias UNIQUE index conflict: SQLite 3.24 UPSERT only accepts one ON CONFLICT
+    -- clause, so a conflict on the alias UNIQUE index is unhandled and throws.
+    -- Fix: emit a pre-clear UPDATE that nullifies the alias on any other node that
+    -- holds the same alias before the INSERT. Last-writer-wins: the incoming node
+    -- keeps the alias; the conflicting node on the receiving agent loses it (NULL).
+    -- The CASE emits the pre-clear only when alias is non-NULL (NULL is never indexed).
+    -- created_at is preserved from the originating agent; updated_at is LWW.
+    --
+    -- DO UPDATE is unconditional (no CASE WHEN excluded.updated_at > nodes.updated_at).
+    -- Correctness relies on cmd_load replaying all pending deltas in a single
+    -- transaction sorted by filename (epoch prefix). A stale INSERT at epoch 10 is
+    -- always applied before a fresher INSERT at epoch 20 — so the unconditional
+    -- overwrite gives the right final state. A per-field timestamp guard would be
+    -- redundant here and would add significant SQL complexity for no gain.
     WHEN operation = 'INSERT' AND table_name = 'nodes' THEN
-      'INSERT OR REPLACE INTO nodes(id,text,status,metadata,alias) VALUES('
+      CASE WHEN json_extract(new_data,'\$.alias') IS NOT NULL
+        THEN 'UPDATE nodes SET alias=NULL WHERE alias='
+             || quote(json_extract(new_data,'\$.alias'))
+             || ' AND id!=' || quote(json_extract(new_data,'\$.id')) || ';' || char(10)
+        ELSE ''
+      END
+      || 'INSERT INTO nodes(id,text,status,metadata,alias,created_at,updated_at) VALUES('
       || quote(json_extract(new_data,'\$.id')) || ','
       || quote(json_extract(new_data,'\$.text')) || ','
       || quote(json_extract(new_data,'\$.status')) || ','
       || quote(json_extract(new_data,'\$.metadata')) || ','
-      || quote(json_extract(new_data,'\$.alias')) || ');'
+      || quote(json_extract(new_data,'\$.alias')) || ','
+      || quote(json_extract(new_data,'\$.created_at')) || ','
+      || quote(json_extract(new_data,'\$.updated_at')) || ')'
+      || ' ON CONFLICT(id) DO UPDATE SET'
+      || ' text=excluded.text, status=excluded.status,'
+      || ' metadata=excluded.metadata, alias=excluded.alias,'
+      || ' updated_at=excluded.updated_at;'
 
     -- UPDATE nodes: field-level diff via IS NOT (NULL-safe).
-    -- Only changed fields appear in the SET clause.
-    -- Outer CASE guards against no-op UPDATEs producing invalid SQL.
+    -- Only changed meaningful fields appear in the SET clause; updated_at is
+    -- always included unconditionally (it changes on every write by design and
+    -- including it in the outer guard made the no-op path dead code).
     WHEN operation = 'UPDATE' AND table_name = 'nodes' THEN
       CASE WHEN
         (json_extract(old_data,'\$.text')     IS NOT json_extract(new_data,'\$.text'))     OR
@@ -224,7 +269,8 @@ SELECT
              || CASE WHEN json_extract(old_data,'\$.metadata') IS NOT json_extract(new_data,'\$.metadata')
                      THEN 'metadata=' || quote(json_extract(new_data,'\$.metadata')) || ',' ELSE '' END
              || CASE WHEN json_extract(old_data,'\$.alias') IS NOT json_extract(new_data,'\$.alias')
-                     THEN 'alias='    || quote(json_extract(new_data,'\$.alias'))    || ',' ELSE '' END,
+                     THEN 'alias='    || quote(json_extract(new_data,'\$.alias'))    || ',' ELSE '' END
+             || 'updated_at=' || quote(json_extract(new_data,'\$.updated_at')) || ',',
              ','
            )
         || ' WHERE id=' || quote(json_extract(new_data,'\$.id')) || ';'
@@ -232,14 +278,21 @@ SELECT
         '-- no-op UPDATE on node ' || quote(json_extract(new_data,'\$.id'))
       END
 
-    -- INSERT edge: create the full row (idempotent via OR REPLACE)
+    -- INSERT edge: upsert by composite PK (source, target, type).
+    -- No secondary UNIQUE indexes on edges so no pre-clear needed.
+    -- ON CONFLICT(source,target,type) consistent with the node INSERT pattern.
+    -- created_at preserved from originating agent (nodes carry both timestamps;
+    -- edges carry only created_at — no updated_at column in edge schema).
     WHEN operation = 'INSERT' AND table_name = 'edges' THEN
-      'INSERT OR REPLACE INTO edges(source,target,type,weight,context) VALUES('
+      'INSERT INTO edges(source,target,type,weight,context,created_at) VALUES('
       || quote(json_extract(new_data,'\$.source')) || ','
       || quote(json_extract(new_data,'\$.target')) || ','
       || quote(json_extract(new_data,'\$.type')) || ','
       || COALESCE(json_extract(new_data,'\$.weight'), 'NULL') || ','
-      || quote(json_extract(new_data,'\$.context')) || ');'
+      || quote(json_extract(new_data,'\$.context')) || ','
+      || quote(json_extract(new_data,'\$.created_at')) || ')'
+      || ' ON CONFLICT(source,target,type) DO UPDATE SET'
+      || ' weight=excluded.weight, context=excluded.context;'
 
     -- UPDATE edge: only weight and context are mutable (source/target/type are PK)
     WHEN operation = 'UPDATE' AND table_name = 'edges' THEN

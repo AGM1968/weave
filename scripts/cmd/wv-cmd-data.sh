@@ -114,8 +114,13 @@ auto_sync() {
     # (multi-agent merge). Empty files (no-op cycles) are removed immediately.
     local delta_dir="$WEAVE_DIR/deltas/$(date +%Y-%m-%d)"
     mkdir -p "$delta_dir"
-    wv_delta_changeset "$WV_DB" > "$delta_dir/${now}-${agent_id}.sql" 2>/dev/null || true
-    [ -s "$delta_dir/${now}-${agent_id}.sql" ] || rm -f "$delta_dir/${now}-${agent_id}.sql"
+    # Include PID + random to guarantee uniqueness within the same second on
+    # the same host — two concurrent agents with the same epoch and agent_id
+    # would otherwise overwrite each other's delta file.
+    local _rand=$(( RANDOM % 9999 ))
+    local delta_file="$delta_dir/${now}-${agent_id}-$$-${_rand}.sql"
+    wv_delta_changeset "$WV_DB" > "$delta_file" 2>/dev/null || true
+    [ -s "$delta_file" ] || rm -f "$delta_file"
 
     # Full dump to state.sql — kept as the authoritative snapshot and audit trail.
     # Deltas complement the dump; they are not a replacement. state.sql is what
@@ -304,6 +309,9 @@ _sync_gh() {
     dump_state_sql "$WV_DB" "$tmp_sql2" && [ -s "$tmp_sql2" ] && mv "$tmp_sql2" "$WEAVE_DIR/state.sql" || rm -f "$tmp_sql2"
     db_query_json "SELECT * FROM nodes;" 2>/dev/null | jq -c '.[]' > "$tmp_nodes2" 2>/dev/null && mv "$tmp_nodes2" "$WEAVE_DIR/nodes.jsonl" || rm -f "$tmp_nodes2"
     db_query_json "SELECT * FROM edges;" 2>/dev/null | jq -c '.[]' > "$tmp_edges2" 2>/dev/null && mv "$tmp_edges2" "$WEAVE_DIR/edges.jsonl" || rm -f "$tmp_edges2"
+
+    # Record GH sync timestamp for visibility in `wv status --json`
+    date +%s > "$WV_HOT_ZONE/.last_gh_sync" 2>/dev/null || true
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -589,46 +597,99 @@ EOF
                 # state.sql updated after last load — its changes incorporate manifest deltas
                 applied_set=$(cat "$manifest" 2>/dev/null || true)
             fi
-            # Rebuild manifest for this load cycle
+            # Truncate manifest before replay. If replay fails, the manifest stays
+            # empty — guaranteeing all deltas are retried on the next wv load.
+            # On success, the manifest is written post-replay with exactly the set
+            # of deltas that were applied. Truncate-before is correct: the window
+            # where the manifest is empty (between truncation and successful write)
+            # only matters if the process is killed mid-replay, in which case we
+            # want a retry anyway.
             : > "$manifest"
             # Sort by filename (epoch prefix) for causal ordering across agents
             delta_files=$(find "$WEAVE_DIR/deltas" -name '*.sql' -printf '%f\t%p\n' 2>/dev/null | sort | cut -f2)
             if [ -n "$delta_files" ]; then
-                sqlite3 "$WV_DB" "PRAGMA foreign_keys = OFF;" 2>/dev/null
+                # Load manifest into associative array for O(1) lookups — avoids one
+                # grep subprocess per file (8s → 0.06s on 1768 files).
+                local -A applied_map=()
+                if [ -n "$applied_set" ]; then
+                    while IFS= read -r _am_line; do
+                        [ -n "$_am_line" ] && applied_map["$_am_line"]=1
+                    done <<< "$applied_set"
+                fi
                 local skipped=0
+                # Collect new (non-manifest, non-prune-skipped) delta paths into an array,
+                # then replay in a single batched sqlite3 call instead of N subprocesses.
+                local -a new_deltas=()
+                local -a new_names=()
                 while IFS= read -r delta; do
                     if [ -s "$delta" ]; then
-                        local delta_name
-                        delta_name=$(basename "$delta")
-                        # Skip if already recorded in the manifest (double-replay guard)
-                        if echo "$applied_set" | grep -qxF "$delta_name" 2>/dev/null; then
+                        # bash builtins replace basename + grep -oP subprocesses
+                        local delta_name delta_ts
+                        delta_name="${delta##*/}"
+                        delta_ts="${delta_name%%-*}"
+                        # Skip if already in manifest (double-replay guard)
+                        if [ "${applied_map[$delta_name]+set}" ]; then
                             continue
                         fi
-                        # Filename format: <epoch>-<agent_id>.sql — prune epoch filter
-                        local delta_ts
-                        delta_ts=$(echo "$delta_name" | grep -oP '^\d+' 2>/dev/null || echo "0")
+                        # Prune epoch filter
                         if [ "$delta_ts" -le "$prune_epoch" ] 2>/dev/null; then
                             skipped=$((skipped + 1))
                             continue
                         fi
-                        if sqlite3 "$WV_DB" < "$delta" 2>/dev/null; then
-                            delta_count=$((delta_count + 1))
-                            echo "$delta_name" >> "$manifest"
-                        else
+                        # Pre-validate: a valid delta has at least one SQL keyword.
+                        # Files without any SQL are corrupt (e.g. written mid-fsync).
+                        if ! grep -qiE "^(INSERT|UPDATE|REPLACE|DELETE|BEGIN|PRAGMA)" "$delta" 2>/dev/null; then
                             echo -e "${YELLOW}⚠ Skipped corrupt delta: ${delta_name}${NC}" >&2
+                            continue
                         fi
+                        new_deltas+=("$delta")
+                        new_names+=("$delta_name")
+                        delta_count=$((delta_count + 1))
                     fi
                 done <<< "$delta_files"
-                sqlite3 "$WV_DB" "PRAGMA foreign_keys = ON;" 2>/dev/null
                 if [ "$delta_count" -gt 0 ]; then
-                    # Reset the change log after replay: the INSERT OR REPLACE
-                    # statements fired the triggers, so _warp_changes now contains
-                    # every replayed operation. Without this reset, the next
-                    # auto_sync would emit a delta containing all of them —
-                    # snowballing the same changes across all agents indefinitely.
-                    wv_delta_reset "$WV_DB"
-                    echo -e "${GREEN}✓${NC} Replayed $delta_count delta(s)" >&2
+                    # Single batched sqlite3 call: wrap FK toggle + all deltas in one
+                    # transaction — per-statement auto-commit costs ~1 fsync each;
+                    # a single transaction reduces N commits to 1.
+                    #
+                    # .bail on: abort on first error and return non-zero exit code,
+                    # which rolls back the transaction and prevents partial replay.
+                    # Manifest is only written after this succeeds.
+                    #
+                    # No FTS filter: wv_delta_changeset never emits nodes_fts or
+                    # sqlite_sequence rows. Filtering multiline SQL by line prefix
+                    # is unsafe against data values that start with those strings.
+                    local replay_rc=0
+                    {
+                        echo ".bail on"
+                        echo "PRAGMA foreign_keys = OFF;"
+                        echo "BEGIN;"
+                        cat "${new_deltas[@]}"
+                        echo "COMMIT;"
+                        echo "PRAGMA foreign_keys = ON;"
+                    } | sqlite3 "$WV_DB" || replay_rc=$?
+                    if [ "$replay_rc" -ne 0 ]; then
+                        # state.sql was already imported and the DB is valid.
+                        # Warn but continue — returning non-zero here would cause
+                        # callers that check $? to treat a successful load as failed.
+                        # Don't update manifest: failed deltas will be retried on the
+                        # next wv load (manifest was truncated to empty at line 601,
+                        # so all deltas re-qualify if this load fails).
+                        echo -e "${YELLOW}⚠ Delta replay failed (rc=$replay_rc) — will retry on next load${NC}" >&2
+                        sqlite3 "$WV_DB" "PRAGMA foreign_keys = ON;" 2>/dev/null || true
+                    else
+                        # Manifest written only after successful replay
+                        printf '%s\n' "${new_names[@]}" >> "$manifest"
+                        # Reset the change log after replay: the INSERT/UPDATE statements
+                        # fired the triggers, so _warp_changes now contains every
+                        # replayed operation. Without this reset, the next auto_sync
+                        # would emit a delta containing all of them — snowballing the
+                        # same changes across all agents indefinitely.
+                        wv_delta_reset "$WV_DB"
+                        echo -e "${GREEN}✓${NC} Replayed $delta_count delta(s)" >&2
+                    fi
                 fi
+                sqlite3 "$WV_DB" "PRAGMA foreign_keys = ON;" 2>/dev/null || true
                 if [ "$skipped" -gt 0 ]; then
                     echo -e "${YELLOW}ℹ${NC} Skipped $skipped pre-prune delta(s)" >&2
                 fi

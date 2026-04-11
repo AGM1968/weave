@@ -64,8 +64,10 @@ if [ "$UNCOMMITTED" -gt 0 ]; then
     exit 0
 fi
 
-# Check for dirty .weave/ state (sync not yet run — breadcrumbs/nodes still local)
-WEAVE_DIRTY=$(git status --porcelain 2>/dev/null | grep -c '\.weave/' || true)
+# Check for dirty .weave/ state (sync not yet run — breadcrumbs/nodes still local).
+# Exclude .weave/deltas/ — delta files are auto-committed by auto_checkpoint and
+# should not trigger the weave-dirty warning on every response.
+WEAVE_DIRTY=$(git status --porcelain 2>/dev/null | grep '\.weave/' | grep -vc '\.weave/deltas/' || true)
 # Check if we're ahead of origin
 # shellcheck disable=SC1083  # @{u} is a git refspec, not a literal brace
 AHEAD=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo "0")

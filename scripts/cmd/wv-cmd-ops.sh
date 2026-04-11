@@ -1033,6 +1033,90 @@ cmd_doctor() {
         _doctor_record "journal" "pass" "clean (no incomplete operations)"
     fi
 
+    # ── Surface-contract checks ──────────────────────────────────────────────
+
+    # 15. Hook source vs installed drift: compare .claude/hooks/ with ~/.config/weave/hooks/
+    local source_hooks_dir="${WEAVE_DIR:+$(dirname "$WEAVE_DIR")}/.claude/hooks"
+    # Fallback: walk up from WV_LIB_DIR to find .claude/hooks
+    if [ ! -d "$source_hooks_dir" ] && [ -n "${WV_LIB_DIR:-}" ]; then
+        local candidate
+        candidate=$(dirname "$WV_LIB_DIR")
+        [ -d "$candidate/.claude/hooks" ] && source_hooks_dir="$candidate/.claude/hooks"
+    fi
+    local installed_hooks_dir="$HOME/.config/weave/hooks"
+    if [ -d "$source_hooks_dir" ] && [ -d "$installed_hooks_dir" ]; then
+        local drifted=""
+        for src in "$source_hooks_dir"/*.sh; do
+            local fname
+            fname=$(basename "$src")
+            local dst="$installed_hooks_dir/$fname"
+            if [ ! -f "$dst" ]; then
+                drifted="${drifted:+$drifted, }$fname (missing)"
+            elif [ "$(md5sum "$src" 2>/dev/null | awk '{print $1}')" != "$(md5sum "$dst" 2>/dev/null | awk '{print $1}')" ]; then
+                drifted="${drifted:+$drifted, }$fname (stale)"
+            fi
+        done
+        if [ -z "$drifted" ]; then
+            _doctor_record "hook drift" "pass" "source and installed hooks match"
+        else
+            _doctor_record "hook drift" "warn" "run ./install.sh — drifted: $drifted"
+        fi
+    else
+        _doctor_record "hook drift" "warn" "cannot compare — source or installed hooks dir missing"
+    fi
+
+    # 16. wv-runtime wrapper present
+    if command -v wv-runtime >/dev/null 2>&1; then
+        _doctor_record "wv-runtime" "pass" "$(command -v wv-runtime)"
+    else
+        _doctor_record "wv-runtime" "warn" "not found — install with ./install.sh"
+    fi
+
+    # 17. Pre-commit hook installed and is the Weave version
+    local git_root
+    git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    if [ -n "$git_root" ]; then
+        local pre_commit="$git_root/.git/hooks/pre-commit"
+        if [ -f "$pre_commit" ]; then
+            if grep -q "Weave pre-commit" "$pre_commit" 2>/dev/null; then
+                _doctor_record "pre-commit hook" "pass" "Weave hook installed"
+            else
+                _doctor_record "pre-commit hook" "warn" "exists but not the Weave version — cp scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
+            fi
+        else
+            _doctor_record "pre-commit hook" "warn" "not installed — cp scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
+        fi
+    fi
+
+    # 18. Ghost settings: check for chat.hooks.enabled in .vscode/settings.json
+    if [ -n "$git_root" ] && [ -f "$git_root/.vscode/settings.json" ]; then
+        if grep -q '"chat.hooks.enabled"' "$git_root/.vscode/settings.json" 2>/dev/null; then
+            _doctor_record "ghost settings" "warn" '.vscode/settings.json contains chat.hooks.enabled — may interfere with Claude Code hooks'
+        else
+            _doctor_record "ghost settings" "pass" "no known ghost settings detected"
+        fi
+    fi
+
+    # 19. Claude settings hook matcher coverage (PreToolUse covers Edit/Write/Bash)
+    local claude_settings="$HOME/.claude/settings.json"
+    if [ -f "$claude_settings" ]; then
+        local matcher
+        matcher=$(jq -r '.hooks.PreToolUse[]? | select(.hooks[]?.command | contains("pre-action")) | .matcher // ""' "$claude_settings" 2>/dev/null | head -1)
+        if [ -n "$matcher" ]; then
+            local missing_tools=""
+            for tool in Edit Write Bash; do
+                echo "$matcher" | grep -q "$tool" || missing_tools="${missing_tools:+$missing_tools, }$tool"
+            done
+            if [ -z "$missing_tools" ]; then
+                _doctor_record "hook matchers" "pass" "Edit, Write, Bash covered"
+            else
+                _doctor_record "hook matchers" "warn" "missing: $missing_tools — run ./install.sh"
+            fi
+        else
+            _doctor_record "hook matchers" "warn" "pre-action hook not registered in ~/.claude/settings.json — run ./install.sh"
+        fi
+    fi
+
     # Summary
     if [ "$_dr_format" = "json" ]; then
         local overall="pass"
@@ -1339,6 +1423,7 @@ _h_total_nodes=0 _h_active=0 _h_ready=0 _h_blocked=0 _h_blocked_ext=0
 _h_done_count=0 _h_pending=0 _h_total_edges=0 _h_blocking_edges=0
 _h_total_pitfalls=0 _h_addressed_pitfalls=0 _h_unaddressed_pitfalls=0
 _h_orphan_nodes=0 _h_orphan_ids="[]" _h_ghost_edges=0 _h_empty_edge_ctx=0
+_h_gh_duplicates=0 _h_gh_duplicate_issues="[]"
 _h_stale_active=0 _h_contradictions=0 _h_invalid_statuses=0
 _h_health_score=100 _h_issues="" _h_fixed_edge_ctx=0
 _h_status_icon="" _h_status_text=""
@@ -1422,6 +1507,40 @@ _health_collect_metrics() {
         AND n.id NOT IN (SELECT target FROM edges);
     ")
     _h_orphan_ids="${_h_orphan_ids:-[]}"
+
+    # GH issue duplicates: non-done nodes sharing the same gh_issue number
+    _h_gh_duplicates=$(db_query "
+        SELECT COUNT(DISTINCT json_extract(metadata, '\$.gh_issue'))
+        FROM nodes
+        WHERE json_extract(metadata, '\$.gh_issue') IS NOT NULL
+        AND status != 'done'
+        GROUP BY json_extract(metadata, '\$.gh_issue')
+        HAVING COUNT(*) > 1;
+    " 2>/dev/null | wc -l | tr -d ' ')
+    _h_gh_duplicates="${_h_gh_duplicates:-0}"
+    if [ "${_h_gh_duplicates:-0}" -gt 0 ] 2>/dev/null; then
+        local _dup_raw
+        _dup_raw=$(db_query "
+            SELECT json_group_array(json_object(
+                'gh_issue', gi,
+                'nodes', (
+                    SELECT json_group_array(id)
+                    FROM nodes n2
+                    WHERE json_extract(n2.metadata, '\$.gh_issue') = gi
+                    AND n2.status != 'done'
+                )
+            ))
+            FROM (
+                SELECT DISTINCT json_extract(metadata, '\$.gh_issue') as gi
+                FROM nodes
+                WHERE json_extract(metadata, '\$.gh_issue') IS NOT NULL
+                AND status != 'done'
+                GROUP BY gi
+                HAVING COUNT(*) > 1
+            );
+        " 2>/dev/null)
+        _h_gh_duplicate_issues="${_dup_raw:-[]}"
+    fi
 
     # Ghost edges (referencing non-existent nodes)
     _h_ghost_edges=$(db_query "
@@ -1517,6 +1636,12 @@ _health_compute_score() {
         if [ "$orphan_penalty" -lt 3 ]; then orphan_penalty=3; fi
         _h_health_score=$((_h_health_score - orphan_penalty))
         _h_issues="${_h_issues}orphan_nodes:$_h_orphan_nodes,"
+    fi
+    if [ "${_h_gh_duplicates:-0}" -gt 0 ] 2>/dev/null; then
+        local dup_penalty=$(( _h_gh_duplicates * 5 ))
+        if [ "$dup_penalty" -gt 15 ]; then dup_penalty=15; fi
+        _h_health_score=$((_h_health_score - dup_penalty))
+        _h_issues="${_h_issues}gh_duplicates:$_h_gh_duplicates,"
     fi
     # RAM pressure: warn at <1GB available, critical at <500MB
     _h_ram_warning=false
@@ -1691,6 +1816,8 @@ _health_format_json() {
         --argjson shm_used_mb "$_h_shm_used_mb" \
         --argjson shm_total_mb "$_h_shm_total_mb" \
         --argjson db_size_kb "$_h_db_size_kb" \
+        --argjson gh_duplicates "$_h_gh_duplicates" \
+        --argjson gh_duplicate_issues "$_h_gh_duplicate_issues" \
         '{
             status: $status,
             score: $score,
@@ -1720,7 +1847,9 @@ _health_format_json() {
                 unresolved_contradictions: $contradictions,
                 invalid_statuses: $invalid_statuses,
                 empty_edge_context: $empty_edge_context,
-                fixed_edge_context: $fixed_edge_context
+                fixed_edge_context: $fixed_edge_context,
+                gh_duplicates: $gh_duplicates,
+                gh_duplicate_issues: $gh_duplicate_issues
             },
             code_quality: $quality,
             system: {
@@ -1798,6 +1927,7 @@ _health_format_text() {
         if [ "$_h_contradictions" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_contradictions unresolved contradiction(s) - run 'wv edges <id>' to inspect"; fi
         if [ "$_h_ghost_edges" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_ghost_edges ghost edge(s) referencing deleted nodes - run 'wv clean-ghosts'"; fi
         if [ "$_h_orphan_nodes" -gt 5 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_orphan_nodes orphan node(s) with no edges - consider linking or pruning"; fi
+        if [ "${_h_gh_duplicates:-0}" -gt 0 ] 2>/dev/null; then echo -e "  ${YELLOW}⚠${NC} $_h_gh_duplicates GH issue(s) mapped to multiple open nodes - run 'wv health --json | jq .issues.gh_duplicate_issues' to inspect, then 'wv delete <id> --dry-run'"; fi
         if [ "$_h_invalid_statuses" -gt 0 ]; then echo -e "  ${RED}✗${NC} $_h_invalid_statuses node(s) with invalid status - run 'wv update <id> --status=todo' to fix"; fi
         if [ "$_h_empty_edge_ctx" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_empty_edge_ctx edge(s) missing context - run 'wv health --fix' to backfill"; fi
         if [ "$_h_fixed_edge_ctx" -gt 0 ]; then echo -e "  ${GREEN}✓${NC} Fixed: enriched $_h_fixed_edge_ctx edge(s) with auto-context (marked auto:true)"; fi
@@ -2460,6 +2590,7 @@ Commands:
   work <id>         Claim node & set WV_ACTIVE for subagent context [--quiet]
   preflight <id>    Pre-action checks as JSON (blockers, contradictions, context load)
   recover           Resume incomplete operations (ship/sync/delete) [--auto] [--json] [--session]
+  pending-close     List nodes awaiting human acknowledgement after learning overlap [--json]
   ready             List unblocked work
   list              List nodes (excludes done by default)
   show <id>         Show node details
@@ -2483,7 +2614,7 @@ Commands:
   session-summary   Session activity stats (nodes created/completed, learnings)
   audit-pitfalls    Show all pitfalls with resolution status
   init-repo         Bootstrap repo for Weave [--agent=claude|copilot|all] [--update] [--force]
-  doctor            Installation health check (deps, modules, hot zone) [--json]
+  doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]
   selftest          Round-trip smoke test in isolated environment [--json]
   mcp-status        Verify MCP server is built and IDE-configured [--json]
   health            System health check with score and diagnostics [--history[=N]]

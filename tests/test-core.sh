@@ -487,6 +487,18 @@ test_show() {
 
     # Show without ID fails
     assert_fails "show without ID fails" "$WV" show
+
+    # current_intent round-trip: set via wv update, visible in wv show, survives wv load
+    local intent_id
+    intent_id=$("$WV" add "Intent test node" 2>&1 | tail -1)
+    "$WV" update "$intent_id" --metadata='{"current_intent":"testing intent persistence"}' >/dev/null 2>&1
+    output=$("$WV" show "$intent_id" 2>&1)
+    assert_contains "$output" "Intent:" "current_intent appears as Intent: in wv show"
+    assert_contains "$output" "testing intent persistence" "current_intent value shown in wv show"
+    # Simulate wv load round-trip (dump + reload from state.sql)
+    "$WV" sync >/dev/null 2>&1 || true
+    output=$("$WV" show "$intent_id" 2>&1)
+    assert_contains "$output" "testing intent persistence" "current_intent survives sync/load round-trip"
 }
 
 # ============================================================================

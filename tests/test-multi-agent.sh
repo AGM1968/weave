@@ -47,19 +47,69 @@ trap teardown EXIT
 BARE_REPO="$TEST_DIR/remote.git"
 git init --bare "$BARE_REPO" -q
 
+# Initial commit: add .gitattributes so merge drivers apply to all future pushes.
+# Without this, git pull --rebase conflicts on state.sql/nodes.jsonl and aborts.
+_INIT_DIR="$TEST_DIR/init-setup"
+mkdir "$_INIT_DIR"
+cd "$_INIT_DIR"
+git init -q
+git remote add origin "$BARE_REPO"
+cat > .gitattributes << 'GITATTR'
+.weave/state.sql merge=ours -diff
+.weave/nodes.jsonl merge=ours -diff
+.weave/deltas/**/*.sql merge=theirs
+GITATTR
+git -c user.email=test@test.com -c user.name=test add .gitattributes
+git -c user.email=test@test.com -c user.name=test commit -m "init" -q --no-verify
+git push -q origin master
+cd "$TEST_DIR"
+rm -rf "$_INIT_DIR"
+
+# Helper: register merge drivers in a cloned repo
+_reg_drivers() {
+    git -C "$1" config merge.ours.driver true
+    git -C "$1" config merge.theirs.driver "cp %B %A"
+    git -C "$1" config user.email test@test.com
+    git -C "$1" config user.name test
+}
+
+# Helper: generate a production-format delta from _warp_changes using
+# wv_delta_changeset (the same code path as auto_sync). This ensures tests
+# exercise the real changeset SQL rather than a manually-crafted dump.
+# Calls wv_delta_reset after generation to clear the change log.
+# Removes empty output files (no-op delta — nothing changed since last reset).
+#
+# Note: $WV commands run as subprocesses — their sourced functions (wv-delta.sh)
+# are not exported to this test script's shell. The source below is the only way
+# to call wv_delta_changeset / wv_delta_reset directly from the test. Resetting
+# _WV_DELTA_INITED="" on source is harmless here since gen_delta never calls
+# wv_delta_has_changes.
+gen_delta() {
+    local dest="$1"
+    mkdir -p "$(dirname "$dest")"
+    # shellcheck source=/dev/null
+    source "$REPO_ROOT/scripts/lib/wv-delta.sh"
+    wv_delta_changeset "$WV_DB" > "$dest" 2>/dev/null || true
+    wv_delta_reset "$WV_DB" 2>/dev/null || true
+    [ -s "$dest" ] || rm -f "$dest"
+}
+
 # Agent A workspace
 AGENT_A_DIR="$TEST_DIR/agent-a"
 git clone "$BARE_REPO" "$AGENT_A_DIR" -q 2>/dev/null
+_reg_drivers "$AGENT_A_DIR"
 mkdir -p "$AGENT_A_DIR/.weave/deltas"
 
 # Agent B workspace
 AGENT_B_DIR="$TEST_DIR/agent-b"
 git clone "$BARE_REPO" "$AGENT_B_DIR" -q 2>/dev/null
+_reg_drivers "$AGENT_B_DIR"
 mkdir -p "$AGENT_B_DIR/.weave/deltas"
 
 # Observer workspace (loads and verifies merged state)
 OBSERVER_DIR="$TEST_DIR/observer"
 git clone "$BARE_REPO" "$OBSERVER_DIR" -q 2>/dev/null
+_reg_drivers "$OBSERVER_DIR"
 mkdir -p "$OBSERVER_DIR/.weave/deltas"
 
 # Helper: init a wv database for an agent
@@ -86,6 +136,9 @@ sync_and_push() {
     $WV sync 2>/dev/null || true
     git add .weave/ 2>/dev/null || true
     git commit -m "sync from $agent" --no-verify -q 2>/dev/null || true
+    # Pull --rebase before push: with delta files now committed, multiple agents
+    # can diverge. Rebase onto origin before pushing to ensure fast-forward.
+    git pull --rebase -q 2>/dev/null || true
     git push -q 2>/dev/null || true
 }
 
@@ -105,9 +158,8 @@ init_agent_db "$AGENT_A_DIR"
 $WV add "Agent A task" 2>/dev/null
 AGENT_A_NODE=$($WV list --json 2>/dev/null | python3 -c "import sys,json; nodes=json.load(sys.stdin); print([n['id'] for n in nodes if 'Agent A' in n['text']][0])")
 
-# Write Agent A's delta manually (simulating auto_sync with agent ID)
-mkdir -p "$AGENT_A_DIR/.weave/deltas/2026-03-15"
-sqlite3 "$WV_DB" ".dump" | grep -E "INSERT|REPLACE" > "$AGENT_A_DIR/.weave/deltas/2026-03-15/0000000001-agentA.sql" 2>/dev/null || true
+# Write Agent A's delta via wv_delta_changeset (production code path).
+gen_delta "$AGENT_A_DIR/.weave/deltas/2026-03-15/0000000001-agentA.sql"
 sync_and_push "$AGENT_A_DIR" "agentA"
 
 # Agent B pulls, creates its own node
@@ -119,9 +171,8 @@ $WV load 2>/dev/null || true
 $WV add "Agent B task" 2>/dev/null
 AGENT_B_NODE=$($WV list --json 2>/dev/null | python3 -c "import sys,json; nodes=json.load(sys.stdin); print([n['id'] for n in nodes if 'Agent B' in n['text']][0])")
 
-# Write Agent B's delta
-mkdir -p "$AGENT_B_DIR/.weave/deltas/2026-03-15"
-sqlite3 "$WV_DB" ".dump" | grep -E "INSERT|REPLACE" > "$AGENT_B_DIR/.weave/deltas/2026-03-15/0000000002-agentB.sql" 2>/dev/null || true
+# Write Agent B's delta via wv_delta_changeset (production code path).
+gen_delta "$AGENT_B_DIR/.weave/deltas/2026-03-15/0000000002-agentB.sql"
 sync_and_push "$AGENT_B_DIR" "agentB"
 
 # Observer pulls both and loads
@@ -147,6 +198,11 @@ assert "Observer has delta files from both agents" '[ "$obs_delta_count" -ge 2 ]
 echo ""
 echo "--- Same-node LWW: last-writer-wins per row ---"
 
+# LWW test: write both agents' deltas directly into the observer's delta
+# directory to avoid git push/pull timing issues. This directly tests
+# cmd_load's epoch-sorted replay (the actual LWW mechanism). Git propagation
+# is already covered by Test 1.
+
 # Agent A updates the shared node
 export WV_HOT_ZONE="$AGENT_A_DIR/hot"
 export WV_DB="$AGENT_A_DIR/hot/brain.db"
@@ -154,31 +210,25 @@ export WEAVE_DIR="$AGENT_A_DIR/.weave"
 cd "$AGENT_A_DIR"
 $WV update "$AGENT_A_NODE" --text="Agent A updated this" 2>/dev/null
 
-# Write delta with earlier epoch
-mkdir -p "$AGENT_A_DIR/.weave/deltas/2026-03-15"
-sqlite3 "$WV_DB" ".dump" | grep -E "INSERT|REPLACE" > "$AGENT_A_DIR/.weave/deltas/2026-03-15/0000000010-agentA.sql" 2>/dev/null || true
-sync_and_push "$AGENT_A_DIR" "agentA"
+# Write earlier-epoch delta (Agent A loses LWW) directly to observer's delta dir.
+gen_delta "$OBSERVER_DIR/.weave/deltas/2026-03-15/0000000010-agentA.sql"
 
-# Agent B pulls, updates the SAME node
-cd "$AGENT_B_DIR"
-git pull -q 2>/dev/null || true
+# Agent B loads agent-a's state, updates the SAME node
 export WV_HOT_ZONE="$AGENT_B_DIR/hot"
 export WV_DB="$AGENT_B_DIR/hot/brain.db"
 export WEAVE_DIR="$AGENT_B_DIR/.weave"
+cd "$AGENT_B_DIR"
 $WV load 2>/dev/null || true
 $WV update "$AGENT_A_NODE" --text="Agent B wins this" 2>/dev/null
 
-# Write delta with later epoch (Agent B is the last writer)
-mkdir -p "$AGENT_B_DIR/.weave/deltas/2026-03-15"
-sqlite3 "$WV_DB" ".dump" | grep -E "INSERT|REPLACE" > "$AGENT_B_DIR/.weave/deltas/2026-03-15/0000000020-agentB.sql" 2>/dev/null || true
-sync_and_push "$AGENT_B_DIR" "agentB"
+# Write later-epoch delta (Agent B wins LWW) directly to observer.
+gen_delta "$OBSERVER_DIR/.weave/deltas/2026-03-15/0000000020-agentB.sql"
 
-# Observer loads merged state
-cd "$OBSERVER_DIR"
-git pull -q 2>/dev/null || true
+# Observer loads merged state: replays epoch-sorted deltas → Agent B wins
 export WV_HOT_ZONE="$OBSERVER_DIR/hot"
 export WV_DB="$OBSERVER_DIR/hot/brain.db"
 export WEAVE_DIR="$OBSERVER_DIR/.weave"
+cd "$OBSERVER_DIR"
 $WV load 2>/dev/null || true
 
 # Check the node text — Agent B should win (later epoch)
@@ -225,20 +275,31 @@ assert "Corrupt delta produces warning" 'echo "$corrupt_output" | grep -q "Skipp
 rm -f "$OBSERVER_DIR/.weave/deltas/2026-03-15/9999999999-corrupt.sql"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Test 6: Empty delta directory is no-op
+# Test 6: Delta load is idempotent after manifest-covered sync
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
-echo "--- Empty delta dir ---"
+echo "--- Manifest-covered load (no new deltas) ---"
 
 EMPTY_DIR="$TEST_DIR/empty-agent"
 git clone "$BARE_REPO" "$EMPTY_DIR" -q 2>/dev/null
+_reg_drivers "$EMPTY_DIR"
 mkdir -p "$EMPTY_DIR/.weave/deltas" "$EMPTY_DIR/hot"
 init_agent_db "$EMPTY_DIR"
-# Create baseline with no deltas
-$WV sync 2>/dev/null || true
+# First load: populate the manifest with all current deltas
+$WV load 2>/dev/null || true
+# Simulate a sync that updated state.sql. The manifest guard uses second-precision
+# mtime (stat -c %Y), so a plain `touch` landing in the same second as the
+# manifest write would produce equal mtimes and fail the state_mtime > manifest_mtime
+# guard — causing all deltas to be replayed again (safe but defeats the test).
+# touch -d '+1 second' forces a strictly later mtime regardless of wall-clock timing.
+# This is a test artifact: in production, wv sync always writes state.sql during
+# auto_sync, which takes at least one sqlite3 round-trip after the manifest write.
+# Same-second precision loss degrades silently to full re-replay (idempotent, not wrong).
+touch -d '+1 second' "$EMPTY_DIR/.weave/state.sql" 2>/dev/null || true
+# Second load: all deltas covered by manifest → nothing new to replay
 empty_output=$($WV load 2>&1)
 
-assert "No 'Replayed' message when no deltas exist" '! echo "$empty_output" | grep -q "Replayed"' "no replay message"
+assert "No 'Replayed' message when all deltas already in manifest" '! echo "$empty_output" | grep -q "Replayed"' "no replay message after manifest-covered sync"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Test 7: Prune produces zero DELETE statements in delta files
@@ -248,6 +309,7 @@ echo "--- Prune delta isolation ---"
 
 PRUNE_DIR="$TEST_DIR/prune-agent"
 git clone "$BARE_REPO" "$PRUNE_DIR" -q 2>/dev/null
+_reg_drivers "$PRUNE_DIR"
 mkdir -p "$PRUNE_DIR/.weave/deltas/2026-03-15" "$PRUNE_DIR/hot"
 init_agent_db "$PRUNE_DIR"
 
@@ -288,6 +350,7 @@ cd "$PRUNE_DIR" && git add .weave/ && git commit -m "post-prune" -q --no-verify 
 
 VERIFY_DIR="$TEST_DIR/verify-prune"
 git clone "$BARE_REPO" "$VERIFY_DIR" -q 2>/dev/null
+_reg_drivers "$VERIFY_DIR"
 mkdir -p "$VERIFY_DIR/hot"
 init_agent_db "$VERIFY_DIR"
 $WV load 2>/dev/null || true

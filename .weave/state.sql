@@ -67,7 +67,8 @@ BEGIN
     INSERT INTO _warp_changes(table_name, operation, row_id, new_data)
     VALUES ('nodes', 'INSERT', NEW.id, json_object(
         'id', NEW.id, 'text', NEW.text, 'status', NEW.status,
-        'metadata', NEW.metadata, 'alias', NEW.alias
+        'metadata', NEW.metadata, 'alias', NEW.alias,
+        'created_at', NEW.created_at, 'updated_at', NEW.updated_at
     ));
 END;
 CREATE TRIGGER _warp_nodes_update AFTER UPDATE ON nodes
@@ -76,11 +77,13 @@ BEGIN
     VALUES ('nodes', 'UPDATE', NEW.id,
         json_object(
             'id', OLD.id, 'text', OLD.text, 'status', OLD.status,
-            'metadata', OLD.metadata, 'alias', OLD.alias
+            'metadata', OLD.metadata, 'alias', OLD.alias,
+            'updated_at', OLD.updated_at
         ),
         json_object(
             'id', NEW.id, 'text', NEW.text, 'status', NEW.status,
-            'metadata', NEW.metadata, 'alias', NEW.alias
+            'metadata', NEW.metadata, 'alias', NEW.alias,
+            'updated_at', NEW.updated_at
         )
     );
 END;
@@ -89,7 +92,8 @@ BEGIN
     INSERT INTO _warp_changes(table_name, operation, row_id, old_data)
     VALUES ('nodes', 'DELETE', OLD.id, json_object(
         'id', OLD.id, 'text', OLD.text, 'status', OLD.status,
-        'metadata', OLD.metadata, 'alias', OLD.alias
+        'metadata', OLD.metadata, 'alias', OLD.alias,
+        'created_at', OLD.created_at, 'updated_at', OLD.updated_at
     ));
 END;
 CREATE TRIGGER _warp_edges_insert AFTER INSERT ON edges
@@ -97,7 +101,8 @@ BEGIN
     INSERT INTO _warp_changes(table_name, operation, row_id, new_data)
     VALUES ('edges', 'INSERT', NEW.source || ':' || NEW.target || ':' || NEW.type, json_object(
         'source', NEW.source, 'target', NEW.target, 'type', NEW.type,
-        'weight', NEW.weight, 'context', NEW.context
+        'weight', NEW.weight, 'context', NEW.context,
+        'created_at', NEW.created_at
     ));
 END;
 CREATE TRIGGER _warp_edges_update AFTER UPDATE ON edges

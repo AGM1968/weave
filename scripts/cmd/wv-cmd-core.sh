@@ -1509,11 +1509,68 @@ cmd_show() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_status() {
+    local format="text"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) format="json" ;;
+        esac
+        shift
+    done
+
     # Compact status for context injection (~50 tokens)
     local active=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active';")
     local ready=$(cmd_ready --count)
     local blocked=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='blocked';")
     local pending_close=$(db_query "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '$.needs_human_verification') = 1;")
+
+    # Sync-state: compare DB mtime vs last successful `wv sync --gh` timestamp
+    local needs_sync="false"
+    local last_sync_at=0
+    local stamp_file="$WV_HOT_ZONE/.last_gh_sync"
+    if [ -f "$stamp_file" ]; then
+        last_sync_at=$(cat "$stamp_file" 2>/dev/null || echo "0")
+        local db_mtime
+        db_mtime=$(stat -c %Y "$WV_DB" 2>/dev/null || echo "0")
+        if [ "$db_mtime" -gt "$last_sync_at" ] 2>/dev/null; then
+            needs_sync="true"
+        fi
+    else
+        needs_sync="true"
+    fi
+
+    if [ "$format" = "json" ]; then
+        local primary_id="" primary_text=""
+        if [ "${active:-0}" -gt 0 ]; then
+            primary_id=$(get_primary_node 2>/dev/null || true)
+            if [ -n "$primary_id" ]; then
+                local pstatus
+                pstatus=$(db_query "SELECT status FROM nodes WHERE id='$primary_id';" 2>/dev/null)
+                if [ "$pstatus" = "active" ]; then
+                    primary_text=$(db_query "SELECT text FROM nodes WHERE id='$primary_id';")
+                else
+                    primary_id=""
+                fi
+            fi
+            if [ -z "$primary_id" ]; then
+                primary_id=$(db_query "SELECT id FROM nodes WHERE status='active' LIMIT 1;")
+                primary_text=$(db_query "SELECT text FROM nodes WHERE status='active' LIMIT 1;")
+            fi
+        fi
+        jq -n \
+            --argjson active "${active:-0}" \
+            --argjson ready "${ready:-0}" \
+            --argjson blocked "${blocked:-0}" \
+            --argjson pending_close "${pending_close:-0}" \
+            --argjson needs_sync "$needs_sync" \
+            --argjson last_sync_at "$last_sync_at" \
+            --arg primary_id "$primary_id" \
+            --arg primary_text "$primary_text" \
+            '{active:$active, ready:$ready, blocked:$blocked,
+              pending_close:$pending_close, needs_sync:$needs_sync,
+              last_sync_at:$last_sync_at,
+              current: (if $primary_id != "" then {id:$primary_id, text:$primary_text} else null end)}'
+        return 0
+    fi
 
     if [ "${pending_close:-0}" -gt 0 ] 2>/dev/null; then
         echo "Work: $active active, $ready ready, $blocked blocked. $pending_close pending-close."
