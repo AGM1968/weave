@@ -2,6 +2,40 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.36.0] - 2026-04-12
+
+### Added
+
+- **`wv compact` command**: Merges accumulated delta files into a single compacted snapshot.
+  Includes coordination gate that refuses to compact while other agents hold active claims
+  (`--force` to override). Emits warnings about agent sync state before proceeding.
+
+### Fixed
+
+- **Multi-agent: sqlite3 busy_timeout on all delta operations**: All 6 sqlite3 calls in
+  `wv-delta.sh` now use `-cmd ".timeout 5000"` to retry under WAL contention instead of failing
+  immediately with SQLITE_BUSY.
+- **Multi-agent: prune SQL injection prevention**: All node ID interpolations in `cmd_prune` now use
+  `sql_escape()` to prevent SQL injection from malformed node IDs.
+- **Multi-agent: atomic prune transaction**: Prune DELETEs and `_warp_changes` reset are now wrapped
+  in a single `BEGIN TRANSACTION..COMMIT` — no window for a concurrent `auto_sync` to snapshot
+  partial deletes as a delta.
+- **Multi-agent: compact coordination gate**: `wv compact` refuses to run while agents hold active
+  claimed nodes, preventing silent delta loss for agents that haven't replayed yet.
+- **Multi-agent: manifest mtime subsecond guard**: Changed manifest freshness comparison from `-ge`
+  to `-gt` so same-second ties (second-granularity `stat -c %Y`) force safe full delta replay
+  instead of trusting a potentially stale manifest.
+- **Multi-agent: removed dead `wv_delta_apply` function**: Unreachable function reserved for Sprint
+  2 removed from `wv-delta.sh`.
+- **Auto-compact removed from `auto_sync`**: Automatic compaction during sync was unsafe in
+  multi-agent topologies — agents that haven't replayed yet would permanently lose compacted deltas.
+
+### Tests
+
+- 15 new delta unit tests (`tests/test-delta-unit.sh`) covering changeset generation, alias conflict
+  resolution, timestamp propagation, fail-fast replay, and reset.
+- All 12 multi-agent integration tests passing.
+
 ## [1.35.1] - 2026-04-11
 
 ### Fixed

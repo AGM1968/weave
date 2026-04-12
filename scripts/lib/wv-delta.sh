@@ -23,7 +23,6 @@
 #   wv_delta_has_changes  O(1) check → exit 0 if changes exist, exit 1 if not
 #   wv_delta_reset        Clear all tracked changes
 #   wv_delta_changeset    Emit SQL changeset to stdout
-#   wv_delta_apply        Apply SQL from stdin to a database (Sprint 2 merge path)
 
 # Shell cache: once _warp_changes is confirmed to exist, skip the probe SELECT
 # on every auto_sync cycle (~60s). Saves one sqlite3 round-trip per cycle.
@@ -138,7 +137,7 @@ END;
 # and wv_delta_has_changes (self-healing path).
 wv_delta_init() {
     local db="$1"
-    sqlite3 "$db" "
+    sqlite3 -cmd ".timeout 5000" "$db" "
 ${_WV_DELTA_CREATE_TABLE}
 DROP TRIGGER IF EXISTS _warp_nodes_insert;
 DROP TRIGGER IF EXISTS _warp_nodes_update;
@@ -162,16 +161,16 @@ ${_WV_DELTA_TRIGGERS_NODES}${_WV_DELTA_TRIGGERS_EDGES}"
 wv_delta_has_changes() {
     local db="$1"
     if [ -z "$_WV_DELTA_INITED" ]; then
-        if ! sqlite3 "$db" "SELECT 1 FROM _warp_changes LIMIT 0;" 2>/dev/null; then
+        if ! sqlite3 -cmd ".timeout 5000" "$db" "SELECT 1 FROM _warp_changes LIMIT 0;" 2>/dev/null; then
             # Self-heal: init only if nodes table already exists
-            sqlite3 "$db" "SELECT 1 FROM nodes LIMIT 0;" 2>/dev/null || return 1
+            sqlite3 -cmd ".timeout 5000" "$db" "SELECT 1 FROM nodes LIMIT 0;" 2>/dev/null || return 1
             wv_delta_init "$db"
             return 1  # No changes yet — just initialized
         fi
         _WV_DELTA_INITED=1
     fi
     local result
-    result=$(sqlite3 "$db" "SELECT EXISTS(SELECT 1 FROM _warp_changes);")
+    result=$(sqlite3 -cmd ".timeout 5000" "$db" "SELECT EXISTS(SELECT 1 FROM _warp_changes);")
     [ "$result" = "1" ]
 }
 
@@ -180,7 +179,7 @@ wv_delta_has_changes() {
 # and cmd_prune (prevents pruned-node DELETEs from leaking into delta files).
 wv_delta_reset() {
     local db="$1"
-    sqlite3 "$db" "DELETE FROM _warp_changes;" 2>/dev/null || true
+    sqlite3 -cmd ".timeout 5000" "$db" "DELETE FROM _warp_changes;" 2>/dev/null || true
 }
 
 # wv_delta_changeset — emit an executable SQL changeset to stdout.
@@ -208,10 +207,10 @@ wv_delta_reset() {
 # comment rather than silently dropping the delete.
 #
 # Output is written to .weave/deltas/<date>/<epoch>-<agent>.sql by auto_sync
-# and replayed on other agents via cmd_load. See wv_delta_apply for replay.
+# and replayed on other agents via cmd_load.
 wv_delta_changeset() {
     local db="$1"
-    sqlite3 "$db" "
+    sqlite3 -cmd ".timeout 5000" "$db" "
 SELECT
   CASE
     -- INSERT: upsert by PK. ON CONFLICT(id) handles the existing-row case.
@@ -337,14 +336,3 @@ FROM _warp_changes ORDER BY id;
 "
 }
 
-# wv_delta_apply — apply a SQL changeset from stdin to a target database.
-# Thin wrapper around sqlite3 with a 5s busy timeout.
-#
-# Not yet called in production — reserved for Sprint 2 multi-agent merge path
-# where cmd_load will pipe individual delta files through this function rather
-# than shelling out to sqlite3 directly. The current cmd_load replay loop calls
-# sqlite3 directly for now.
-wv_delta_apply() {
-    local db="$1"
-    sqlite3 -cmd ".timeout 5000" "$db"
-}

@@ -57,6 +57,7 @@ declare -a SUITES=(
     "test-workflow-surfaces.sh:Workflow Surface Tests"
     "test-crash-sentinel.sh:Crash Sentinel Tests"
     "test-multi-agent.sh:Multi-Agent Tests"
+    "test-delta-unit.sh:Delta Unit Tests"
 )
 
 # Results tracking

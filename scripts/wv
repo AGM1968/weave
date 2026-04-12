@@ -10,7 +10,7 @@
 #   lib/wv-cache.sh    — context cache management
 #   cmd/wv-cmd-core.sh — init, add, done, ready, list, show, status, update, quick, ship
 #   cmd/wv-cmd-graph.sh— block, link, resolve, related, edges, path, context
-#   cmd/wv-cmd-data.sh — batch, plan, enrich-topology, sync, load, prune, clean-ghosts, learnings, refs, import, search, reindex, breadcrumbs
+#   cmd/wv-cmd-data.sh — batch, plan, enrich-topology, sync, load, compact, prune, clean-ghosts, learnings, refs, import, search, reindex, breadcrumbs
 #   cmd/wv-cmd-ops.sh  — doctor, recover, selftest, mcp-status, health, cache, preflight, digest, overview, session-summary, audit-pitfalls, edge-types, guide, init-repo, help
 #   cmd/wv-cmd-quality.sh — quality
 #   cmd/wv-cmd-findings.sh — findings
@@ -135,6 +135,7 @@ main() {
         enrich-topology) cmd_enrich_topology "$@" ;;
         sync)        cmd_sync "$@" ;;
         load)        cmd_load "$@" ;;
+        compact)     cmd_compact "$@" ;;
         prune)       cmd_prune "$@" ;;
         clean-ghosts) cmd_clean_ghosts "$@" ;;
         learnings)   cmd_learnings "$@" ;;

@@ -74,6 +74,34 @@ WV_AUTO_CHECKPOINT="${WV_AUTO_CHECKPOINT:-1}"
 # Set to 0 for aggressive commits (original behavior).
 WV_CHECKPOINT_INTERVAL="${WV_CHECKPOINT_INTERVAL:-600}"
 
+# _delta_compact — delete delta files older than WV_DELTA_RETAIN_DAYS (default 30).
+# SAFETY: only call manually (via `wv compact`) when all agents have loaded the
+# latest state. Auto-running after auto_sync is unsafe: state.sql uses merge=ours,
+# so a remote agent with an older state.sql can no longer replay compacted deltas.
+# Returns count of deleted files via echo (so callers can log it).
+_delta_compact() {
+    local weave_dir="$1"
+    local now="${2:-$(date +%s)}"
+    local retain_days="${WV_DELTA_RETAIN_DAYS:-30}"
+    [ "$retain_days" -eq 0 ] 2>/dev/null && return 0
+    local delta_root="$weave_dir/deltas"
+    [ -d "$delta_root" ] || return 0
+    local cutoff=$(( now - retain_days * 86400 ))
+    local deleted=0
+    while IFS= read -r delta; do
+        local delta_name delta_ts
+        delta_name="${delta##*/}"
+        delta_ts="${delta_name%%-*}"
+        if [ "$delta_ts" -lt "$cutoff" ] 2>/dev/null; then
+            rm -f "$delta"
+            deleted=$(( deleted + 1 ))
+        fi
+    done < <(find "$delta_root" -name '*.sql' 2>/dev/null)
+    # Remove empty date subdirectories left behind
+    find "$delta_root" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null || true
+    echo "$deleted"
+}
+
 auto_sync() {
     local _force=false
     for _arg in "$@"; do [ "$_arg" = "--force" ] && _force=true; done
@@ -154,6 +182,13 @@ auto_sync() {
 
     # Reset change tracking after successful persist
     wv_delta_reset "$WV_DB"
+
+    # NOTE: _delta_compact is NOT called here. Auto-compaction is unsafe in a
+    # multi-agent topology: state.sql uses merge=ours, so Agent B keeps its own
+    # (older) state.sql after a pull. If Agent A compacted + committed delta
+    # deletions, Agent B can no longer replay those deltas and silently loses
+    # Agent A's changes. Use `wv compact` manually only when all agents have
+    # loaded the latest state.
 
     echo "$now" > "$stamp_file"
 
@@ -582,11 +617,12 @@ EOF
             # written after each successfully-applied delta. Prevents double-replay
             # when wv load is called multiple times without an intervening wv sync.
             #
-            # Guard condition: the manifest is only trusted when state.sql is NEWER
-            # than the manifest (i.e., a wv sync ran after the last load, so state.sql
-            # incorporates the manifest's deltas). If state.sql predates the manifest,
-            # the load is starting fresh from a snapshot that may not include those
-            # changes, so all deltas are replayed and the manifest is rebuilt.
+            # Guard condition: the manifest is only trusted when state.sql is STRICTLY
+            # newer than the manifest (i.e., a wv sync ran after the last load, so
+            # state.sql incorporates the manifest's deltas). Uses -gt (not -ge)
+            # because stat -c %Y has only second granularity — same-second ties
+            # could mean state.sql was replaced without incorporating manifest
+            # deltas, so we force full replay on ties (safe, idempotent).
             # Local-only — not committed to git.
             local manifest="$WEAVE_DIR/.applied_deltas"
             local applied_set=""
@@ -758,6 +794,93 @@ cmd_clean_ghosts() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# cmd_compact — Prune old delta files already incorporated into state.sql
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_compact() {
+    local older_than="${WV_DELTA_RETAIN_DAYS:-30}"
+    local dry_run=false
+    local force=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --older-than=*) older_than="${1#*=}" ;;
+            --dry-run) dry_run=true ;;
+            --force) force=true ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+        shift
+    done
+
+    # Strip trailing 'd' if present (e.g. --older-than=14d → 14)
+    older_than="${older_than%d}"
+    if ! [[ "$older_than" =~ ^[0-9]+$ ]] || [ "$older_than" -eq 0 ]; then
+        echo "error: --older-than must be a positive integer (days)" >&2
+        return 1
+    fi
+
+    # Coordination gate: refuse to compact while other agents hold active claims.
+    # Deleting delta files that a concurrent agent hasn't replayed causes silent
+    # divergence — those changes are permanently lost for that agent.
+    local active_claims
+    active_claims=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND json_extract(metadata, '\$.claimed_by') IS NOT NULL;" 2>/dev/null || echo "0")
+    if [ "$active_claims" -gt 0 ] && [ "$force" != true ]; then
+        echo -e "${RED}✗${NC} $active_claims node(s) currently claimed by agents." >&2
+        echo "  Active agents may not have replayed all deltas yet." >&2
+        echo "  Use --force to compact anyway, or wait until all agents finish." >&2
+        return 1
+    fi
+
+    echo -e "${YELLOW}⚠${NC} Only run compact when all agents have loaded the latest state." \
+         "Compacted deltas cannot be replayed by agents with older state.sql." >&2
+
+    local delta_root="$WEAVE_DIR/deltas"
+    if [ ! -d "$delta_root" ]; then
+        echo "No deltas directory found; nothing to compact."
+        return 0
+    fi
+
+    local now
+    now=$(date +%s)
+    local cutoff=$(( now - older_than * 86400 ))
+    local deleted=0
+    local dry_list=()
+
+    while IFS= read -r delta; do
+        local delta_name delta_ts
+        delta_name="${delta##*/}"
+        delta_ts="${delta_name%%-*}"
+        if [[ "$delta_ts" =~ ^[0-9]+$ ]] && [ "$delta_ts" -lt "$cutoff" ]; then
+            if $dry_run; then
+                dry_list+=("$delta")
+            else
+                rm -f "$delta"
+                deleted=$(( deleted + 1 ))
+            fi
+        fi
+    done < <(find "$delta_root" -name '*.sql' 2>/dev/null | sort)
+
+    if $dry_run; then
+        if [ "${#dry_list[@]}" -eq 0 ]; then
+            echo "Dry run: no delta files older than ${older_than}d."
+        else
+            echo "Dry run: would delete ${#dry_list[@]} delta file(s) older than ${older_than}d:"
+            printf '  %s\n' "${dry_list[@]}"
+        fi
+        return 0
+    fi
+
+    # Remove empty date subdirectories
+    find "$delta_root" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null || true
+
+    if [ "$deleted" -eq 0 ]; then
+        echo "No delta files older than ${older_than}d found."
+    else
+        echo -e "${GREEN}✓${NC} Compacted ${deleted} delta file(s) older than ${older_than}d."
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # cmd_prune — Archive old done nodes
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -850,7 +973,7 @@ cmd_prune() {
     mkdir -p "$archive_dir"
     
     # Export to archive
-    local ids=$(echo "$candidates" | cut -d'|' -f1 | tr '\n' ',' | sed 's/,$//')
+    local ids=$(echo "$candidates" | cut -d'|' -f1 | while read -r _id; do printf '%s,' "$(sql_escape "$_id")"; done | sed 's/,$//')
     db_query_json "SELECT * FROM nodes WHERE id IN ('${ids//,/\',\'}')" | jq -c '.[]' >> "$archive_file"
 
     # Collect nodes affected by edge deletion for cache invalidation
@@ -870,7 +993,7 @@ cmd_prune() {
         if [ -n "$repo" ]; then
             echo "$candidates" | cut -d'|' -f1 | while read -r id; do
                 local gh_num
-                gh_num=$(db_query "SELECT json_extract(metadata, '\$.gh_issue') FROM nodes WHERE id='$id';" 2>/dev/null)
+                gh_num=$(db_query "SELECT json_extract(metadata, '\$.gh_issue') FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null)
                 if [ -n "$gh_num" ] && [ "$gh_num" != "null" ]; then
                     gh issue close "$gh_num" --repo "$repo" \
                         --comment "Pruned from Weave graph (node \`$id\` archived after ${age})." \
@@ -882,17 +1005,24 @@ cmd_prune() {
         fi
     fi
 
-    # Delete nodes and orphaned edges
+    # Delete nodes and orphaned edges in a single atomic transaction.
     # DELETEs must NOT leak into delta files. Prune decisions are local:
     # a node pruned on this agent may still be active on another agent's timeline.
     # If the DELETEs were emitted as a delta and replayed on that agent, it would
     # lose nodes it is still working with. Prune is intentionally non-propagating.
-    echo "$candidates" | cut -d'|' -f1 | while read -r id; do
-        db_query "DELETE FROM edges WHERE source='$id' OR target='$id';"
-        db_query "DELETE FROM nodes WHERE id='$id';"
-    done
-    # Clear _warp_changes so the DELETEs above are not emitted by the next auto_sync.
-    wv_delta_reset "$WV_DB"
+    #
+    # The transaction wraps both the DELETEs and the _warp_changes reset in one
+    # sqlite3 invocation — no window for a concurrent auto_sync to snapshot the
+    # trigger-generated rows between DELETE and reset.
+    local prune_sql="BEGIN TRANSACTION;"
+    while read -r id; do
+        local esc_id
+        esc_id="$(sql_escape "$id")"
+        prune_sql+="DELETE FROM edges WHERE source='$esc_id' OR target='$esc_id';"
+        prune_sql+="DELETE FROM nodes WHERE id='$esc_id';"
+    done < <(echo "$candidates" | cut -d'|' -f1)
+    prune_sql+="DELETE FROM _warp_changes;COMMIT;"
+    db_query "$prune_sql"
 
     # Write prune epoch: the Unix timestamp of this prune run.
     # cmd_load reads this and skips any delta file whose epoch prefix is <= prune_epoch,
