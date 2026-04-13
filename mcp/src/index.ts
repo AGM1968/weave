@@ -118,18 +118,41 @@ const WV_PATH = findWvPath();
 
 // Default timeout for wv commands (30s). Sync handlers override this.
 const WV_TIMEOUT = 30_000;
+const STATUS_SCHEMA_VALUES = ["todo", "active", "done", "blocked", "blocked-external", "in-progress", "in_progress"] as const;
+const READ_MODES = ["bootstrap", "discover", "execute", "full"] as const;
+const LEARNING_CATEGORIES = ["decision", "pattern", "pitfall", "learning"] as const;
+type ReadMode = (typeof READ_MODES)[number];
+const MCP_READ_MODE: ReadMode = "discover";
+
+function wvEnv(extraEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    NO_COLOR: "1",
+    WV_AGENT: "1",
+    WV_ACTIVE: process.env.WV_ACTIVE || "",
+    ...extraEnv,
+  };
+}
+
+function stripAnsi(raw: string): string {
+  return raw.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function spawnWv(args: string[], timeout: number = WV_TIMEOUT) {
+  return spawnSync(WV_PATH, args, {
+    encoding: "utf-8",
+    maxBuffer: 10 * 1024 * 1024, // 10MB
+    timeout,
+    env: wvEnv(),
+  });
+}
 
 // Execute wv command safely using spawnSync (no shell interpolation).
 // Args are passed as an array — user input never touches a shell.
 // Uses spawnSync to capture both stdout and stderr, since some wv subcommands
 // (e.g. quality scan, quality hotspots) write output to stderr.
 function wv(args: string[], timeout: number = WV_TIMEOUT): string {
-  const result = spawnSync(WV_PATH, args, {
-    encoding: "utf-8",
-    maxBuffer: 10 * 1024 * 1024, // 10MB
-    timeout,
-    env: { ...process.env, WV_ACTIVE: process.env.WV_ACTIVE || "" },
-  });
+  const result = spawnWv(args, timeout);
   if (result.error) {
     throw new Error(result.error.message || "wv command failed");
   }
@@ -139,9 +162,23 @@ function wv(args: string[], timeout: number = WV_TIMEOUT): string {
   // Prefer stdout (structured output, --json). Fall back to stderr for commands
   // that write primary output there (legacy quality subcommands without --json).
   const raw = result.stdout?.trim() || result.stderr?.trim() || "";
-  // Strip ANSI color codes — wv CLI uses colors for terminal output but MCP
-  // consumers (agents) receive plain text tool results.
-  return raw.replace(/\x1b\[[0-9;]*m/g, "");
+  return stripAnsi(raw);
+}
+
+function wvHealthJson(timeout: number = WV_TIMEOUT): string {
+  const result = spawnWv(["health", "--json"], timeout);
+  if (result.error) {
+    throw new Error(result.error.message || "wv command failed");
+  }
+  const stdout = result.stdout?.trim() || "";
+  if (stdout) {
+    return stripAnsi(stdout);
+  }
+  throw new Error(result.stderr?.trim() || `wv health --json exited with code ${result.status}`);
+}
+
+function wvRead(args: string[], timeout: number = WV_TIMEOUT, mode?: ReadMode): string {
+  return wv([...args, `--mode=${mode ?? MCP_READ_MODE}`], timeout);
 }
 
 // Tool definitions
@@ -162,8 +199,8 @@ const TOOLS: Tool[] = [
         },
         status: {
           type: "string",
-          enum: ["todo", "active", "done", "blocked", "blocked-external"],
-          description: "Filter by status",
+          enum: [...STATUS_SCHEMA_VALUES],
+          description: "Filter by status (legacy in-progress/in_progress map to active)",
         },
       },
       required: ["query"],
@@ -182,8 +219,8 @@ const TOOLS: Tool[] = [
         },
         status: {
           type: "string",
-          enum: ["todo", "active", "done", "blocked", "blocked-external"],
-          description: "Initial status (default: todo)",
+          enum: [...STATUS_SCHEMA_VALUES],
+          description: "Initial status (default: todo; legacy in-progress/in_progress map to active)",
         },
         metadata: {
           type: "object",
@@ -272,7 +309,8 @@ const TOOLS: Tool[] = [
   },
   {
     name: "weave_context",
-    description: "Get full Context Pack for a node: node details, blockers, ancestors, related nodes, and learnings.",
+    description:
+      "Get a node Context Pack as JSON: node details, blockers, ancestors, related nodes, and learnings. Defaults to lean discover-mode output for agent callers.",
     inputSchema: {
       type: "object",
       properties: {
@@ -280,20 +318,26 @@ const TOOLS: Tool[] = [
           type: "string",
           description: "Node ID (optional if WV_ACTIVE is set)",
         },
+        mode: {
+          type: "string",
+          enum: [...READ_MODES],
+          description: "Optional output mode override (default: discover for MCP/agent callers)",
+        },
       },
       required: [],
     },
   },
   {
     name: "weave_list",
-    description: "List Weave nodes with optional filters.",
+    description:
+      "List Weave nodes as compact json-v2 records. Metadata is a nested object and created_at/updated_at are omitted.",
     inputSchema: {
       type: "object",
       properties: {
         status: {
           type: "string",
-          enum: ["todo", "active", "done", "blocked", "blocked-external"],
-          description: "Filter by status",
+          enum: [...STATUS_SCHEMA_VALUES],
+          description: "Filter by status (legacy in-progress/in_progress map to active)",
         },
         all: {
           type: "boolean",
@@ -345,10 +389,17 @@ const TOOLS: Tool[] = [
   },
   {
     name: "weave_status",
-    description: "Get compact status summary: active work, ready count, blocked count.",
+    description:
+      "Get compact status text for agent callers: active work, ready count, blocked count, and pending-close state. Defaults to discover mode.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        mode: {
+          type: "string",
+          enum: [...READ_MODES],
+          description: "Optional output mode override (default: discover for MCP/agent callers)",
+        },
+      },
       required: [],
     },
   },
@@ -441,10 +492,16 @@ const TOOLS: Tool[] = [
   {
     name: "weave_overview",
     description:
-      "Get a comprehensive overview: status summary, health digest, context load policy, and breadcrumbs. Ideal for session start.",
+      "Get a session-start overview: status summary, health digest, context policy, breadcrumbs, and ready work. Status and ready sections default to discover mode for agent callers.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        mode: {
+          type: "string",
+          enum: [...READ_MODES],
+          description: "Optional output mode override for the status and ready sections (default: discover)",
+        },
+      },
       required: [],
     },
   },
@@ -568,7 +625,7 @@ const TOOLS: Tool[] = [
   {
     name: "weave_learnings",
     description:
-      "Query captured learnings (patterns, decisions, pitfalls). Returns JSON array. Use before starting work to check prior decisions.",
+      "Query captured learnings as JSON. Defaults to discover-mode bounded output for agent callers; use recent or mode to widen or narrow the result set explicitly.",
     inputSchema: {
       type: "object",
       properties: {
@@ -582,11 +639,17 @@ const TOOLS: Tool[] = [
         },
         category: {
           type: "string",
-          description: "Filter by category",
+          enum: [...LEARNING_CATEGORIES],
+          description: "Filter by learning type",
         },
         node: {
           type: "string",
           description: "Filter to learnings from a specific node",
+        },
+        mode: {
+          type: "string",
+          enum: [...READ_MODES],
+          description: "Optional output mode override (default: discover for MCP/agent callers)",
         },
       },
       required: [],
@@ -605,8 +668,8 @@ const TOOLS: Tool[] = [
         },
         status: {
           type: "string",
-          enum: ["todo", "active", "done", "blocked", "blocked-external"],
-          description: "New status",
+          enum: [...STATUS_SCHEMA_VALUES],
+          description: "New status (legacy in-progress/in_progress map to active)",
         },
         text: {
           type: "string",
@@ -695,7 +758,7 @@ const TOOLS: Tool[] = [
   {
     name: "weave_show",
     description:
-      "Show detailed information about a single Weave node including metadata, edges, blockers, and learnings. Use this to inspect a specific node before or during work.",
+      "Show a single node as compact json-v2. Metadata is promoted to a nested object and heavy timestamps are omitted for lean agent use.",
     inputSchema: {
       type: "object",
       properties: {
@@ -822,13 +885,36 @@ const SCOPED_TOOLS = getToolsForScope(ACTIVE_SCOPE, TOOLS);
 // Enable with --instrument flag; disable in production.
 const INSTRUMENT = process.argv.includes("--instrument");
 const toolCallCounts = new Map<string, number>();
+const toolPayloadStats = new Map<string, { calls: number; totalBytes: number; maxBytes: number }>();
 
 function logInstrumentation(msg: string): void {
   if (INSTRUMENT) console.error(`[weave-mcp-instrument] ${msg}`);
 }
 
+function recordPayloadInstrumentation(tool: string, payload: unknown, extra: string[] = []): void {
+  if (!INSTRUMENT) return;
+  const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+  const stats = toolPayloadStats.get(tool) ?? { calls: 0, totalBytes: 0, maxBytes: 0 };
+  stats.calls += 1;
+  stats.totalBytes += bytes;
+  stats.maxBytes = Math.max(stats.maxBytes, bytes);
+  toolPayloadStats.set(tool, stats);
+  const suffix = extra.length > 0 ? ` ${extra.join(" ")}` : "";
+  logInstrumentation(`payload scope=${ACTIVE_SCOPE} tool=${tool} payload_bytes=${bytes}${suffix}`);
+}
+
 if (INSTRUMENT) {
   process.on("exit", () => {
+    if (toolPayloadStats.size > 0) {
+      const sortedPayloads = [...toolPayloadStats.entries()].sort((a, b) => b[1].totalBytes - a[1].totalBytes);
+      console.error(`[weave-mcp-instrument] === Payload summary (scope=${ACTIVE_SCOPE}) ===`);
+      for (const [tool, stats] of sortedPayloads) {
+        const avgBytes = Math.round(stats.totalBytes / stats.calls);
+        console.error(
+          `[weave-mcp-instrument]   ${tool}: calls=${stats.calls} total_bytes=${stats.totalBytes} avg_bytes=${avgBytes} max_bytes=${stats.maxBytes}`
+        );
+      }
+    }
     if (toolCallCounts.size === 0) return;
     const sorted = [...toolCallCounts.entries()].sort((a, b) => b[1] - a[1]);
     console.error(`[weave-mcp-instrument] === Call summary (scope=${ACTIVE_SCOPE}) ===`);
@@ -923,15 +1009,16 @@ function handleTool(
 
     case "weave_context": {
       const id = args.id as string | undefined;
+      const mode = args.mode as ReadMode | undefined;
       const cmd = id ? ["context", id, "--json"] : ["context", "--json"];
-      result = wv(cmd);
+      result = wvRead(cmd, WV_TIMEOUT, mode);
       break;
     }
 
     case "weave_list": {
       const status = normalizeStatus(args.status as string | undefined);
       const all = args.all as boolean | undefined;
-      const cmd = ["list", "--json"];
+      const cmd = ["list", "--json-v2"];
       if (status) cmd.push(`--status=${status}`);
       if (all) cmd.push("--all");
       result = wv(cmd);
@@ -952,13 +1039,18 @@ function handleTool(
     }
 
     case "weave_status": {
-      result = wv(["status"]);
+      const mode = args.mode as ReadMode | undefined;
+      result = wvRead(["status"], WV_TIMEOUT, mode);
       break;
     }
 
     case "weave_health": {
       const verbose = args.verbose as boolean | undefined;
       const fix = args.fix as boolean | undefined;
+      if (!verbose && !fix) {
+        result = wvHealthJson();
+        break;
+      }
       const cmd = ["health", "--json"];
       if (verbose) cmd.push("--verbose");
       if (fix) cmd.push("--fix");
@@ -1001,9 +1093,10 @@ function handleTool(
     }
 
     case "weave_overview": {
+      const mode = args.mode as ReadMode | undefined;
       const parts: string[] = [];
       try {
-        parts.push("=== Status ===\n" + wv(["status"]));
+        parts.push("=== Status ===\n" + wvRead(["status"], WV_TIMEOUT, mode));
       } catch {
         /* skip */
       }
@@ -1018,7 +1111,7 @@ function handleTool(
         /* skip */
       }
       try {
-        parts.push("\n=== Ready Work ===\n" + wv(["ready"]));
+        parts.push("\n=== Ready Work ===\n" + wvRead(["ready"], WV_TIMEOUT, mode));
       } catch {
         /* skip */
       }
@@ -1046,7 +1139,7 @@ function handleTool(
           const policy = execFileSync("bash", [scriptPath], {
             encoding: "utf-8",
             timeout: 5000,
-            env: { ...process.env },
+            env: { ...process.env, NO_COLOR: "1", WV_AGENT: "1" },
           }).trim();
           const policyLine = policy.split("\n").find((l) => l.startsWith("policy:"));
           if (policyLine) parts.push("\n=== Context Policy ===\n" + policyLine);
@@ -1140,7 +1233,7 @@ function handleTool(
         // Active node exists — check for contradictions and blockers
         const nodeId = activeNodes[0].id as string;
         try {
-          const ctxJson = wv(["context", nodeId, "--json"]);
+          const ctxJson = wvRead(["context", nodeId, "--json"]);
           const ctx = JSON.parse(ctxJson);
           if (Array.isArray(ctx.contradictions) && ctx.contradictions.length > 0) {
             const contraList = ctx.contradictions
@@ -1254,7 +1347,7 @@ function handleTool(
 
       // 4. Active nodes warning
       try {
-        const status = wv(["status"]);
+        const status = wvRead(["status"]);
         if (status.includes("active") && !status.includes("0 active")) {
           parts.push(
             "\n=== Warning ===\n" + "Active nodes still open — consider closing with weave_done or weave_ship"
@@ -1289,11 +1382,13 @@ function handleTool(
       const recent = args.recent as number | undefined;
       const category = args.category as string | undefined;
       const node = args.node as string | undefined;
+      const mode = args.mode as ReadMode | undefined;
       const cmd = ["learnings", "--json"];
       if (grep) cmd.push(`--grep=${grep}`);
       if (recent !== undefined) cmd.push(`--recent=${recent}`);
       if (category) cmd.push(`--category=${category}`);
       if (node) cmd.push(`--node=${node}`);
+      if (mode) cmd.push(`--mode=${mode}`);
       result = wv(cmd);
       break;
     }
@@ -1354,7 +1449,7 @@ function handleTool(
 
     case "weave_show": {
       const id = args.id as string;
-      result = wv(["show", id, "--json"]);
+      result = wv(["show", id, "--json-v2"]);
       break;
     }
 
@@ -1428,7 +1523,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.36.0",
+      version: "1.37.0",
     },
     {
       capabilities: {
@@ -1440,10 +1535,7 @@ async function main() {
   // List available tools (filtered by scope)
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const payload = { tools: SCOPED_TOOLS };
-    if (INSTRUMENT) {
-      const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
-      logInstrumentation(`tools/list scope=${ACTIVE_SCOPE} tools=${SCOPED_TOOLS.length} payload_bytes=${bytes}`);
-    }
+    recordPayloadInstrumentation("tools/list", payload, [`tools=${SCOPED_TOOLS.length}`]);
     return payload;
   });
 
@@ -1472,13 +1564,17 @@ async function main() {
     }
 
     try {
-      return handleTool(name, (args as Record<string, unknown>) || {});
+      const response = handleTool(name, (args as Record<string, unknown>) || {});
+      recordPayloadInstrumentation(name, response, [`is_error=${response.isError ? "true" : "false"}`]);
+      return response;
     } catch (error: unknown) {
       const err = error as Error;
-      return {
+      const response = {
         content: [{ type: "text", text: `Error: ${err.message}` }],
         isError: true,
       };
+      recordPayloadInstrumentation(name, response, ["is_error=true"]);
+      return response;
     }
   });
 

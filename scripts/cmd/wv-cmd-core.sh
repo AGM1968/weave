@@ -218,6 +218,8 @@ cmd_add() {
     local force=false
     local parent=""
     local format="text"
+    local criteria=""
+    local risks_flag=""
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -229,6 +231,8 @@ cmd_add() {
             --gh) create_gh=true ;;
             --force|--standalone) force=true ;;
             --json) format="json" ;;
+            --criteria=*) criteria="${1#*=}" ;;
+            --risks=*) risks_flag="${1#*=}" ;;
             --*) ;; # skip unrecognized flags
             *) text="$text $1" ;;
         esac
@@ -237,8 +241,28 @@ cmd_add() {
 
     if [ -z "$text" ]; then
         echo -e "${RED}Error: text required${NC}" >&2
-        echo "Usage: wv add \"task description\" [--status=todo|active|done|blocked] [--parent=<id>] [--gh] [--force] [--standalone]" >&2
+        echo "Usage: wv add \"task description\" [--status=todo|active|done|blocked] [--parent=<id>] [--gh] [--force] [--standalone] [--criteria=\"c1|c2\"] [--risks=low|medium|high|none]" >&2
         return 1
+    fi
+
+    # Merge --criteria and --risks into metadata before JSON validation.
+    # --criteria="c1|c2|c3"  → done_criteria: ["c1","c2","c3"]
+    # --risks=low|none        → risk_level + risks: []
+    if [ -n "$criteria" ]; then
+        local criteria_json
+        criteria_json=$(printf '%s' "$criteria" | python3 -c "
+import sys, json
+raw = sys.stdin.read()
+items = [s.strip() for s in raw.split('|') if s.strip()]
+print(json.dumps(items))
+" 2>/dev/null || echo "[]")
+        metadata=$(echo "$metadata" | jq --argjson c "$criteria_json" '. + {done_criteria: $c}' 2>/dev/null || echo "$metadata")
+    fi
+    if [ -n "$risks_flag" ]; then
+        case "$risks_flag" in
+            none|low) metadata=$(echo "$metadata" | jq --arg r "$risks_flag" '. + {risks: [], risk_level: $r}' 2>/dev/null || echo "$metadata") ;;
+            medium|high|critical) metadata=$(echo "$metadata" | jq --arg r "$risks_flag" '. + {risk_level: $r}' 2>/dev/null || echo "$metadata") ;;
+        esac
     fi
 
     # Validate parent if provided
@@ -687,6 +711,7 @@ cmd_done() {
     local format="text"
     local verification_method=""
     local verification_evidence=""
+    local no_gh=0
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -700,6 +725,7 @@ cmd_done() {
             --json) format="json" ;;
             --verification-method=*) verification_method="${1#*=}" ;;
             --verification-evidence=*) verification_evidence="${1#*=}" ;;
+            --no-gh) no_gh=1 ;;
         esac
         shift
     done
@@ -814,13 +840,13 @@ cmd_done() {
         echo -e "${GREEN}✓${NC} Closed: $id"
     fi
 
-    # Write-time validation warnings (always to stderr — safe in json mode)
-    if [ "$no_warn" != "1" ] && [ "${WV_NO_WARN:-0}" != "1" ]; then
+    # Write-time validation warnings (stderr; suppress for --skip-verification / --json / --no-warn)
+    if [ "$no_warn" != "1" ] && [ "${WV_NO_WARN:-0}" != "1" ] && [ "$skip_verification" != "1" ] && [ "$format" != "json" ]; then
         validate_on_done "$id"
     fi
 
     # === Post-close: GH issue, cache, notifications, breadcrumbs ===
-    _done_close_gh_issue "$id"
+    [ "$no_gh" = "0" ] && _done_close_gh_issue "$id"
 
     # Invalidate context cache for completed node and any nodes it was blocking
     local affected_nodes
@@ -1218,17 +1244,29 @@ cmd_ready() {
     local count_only=false
     local show_all=false
     local subtree_id=""
+    local show_findings=false
+    local mode_arg=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --json)      format="json" ;;
+            --json-v2)   format="json-v2" ;;
             --count)     count_only=true ;;
             --all)       show_all=true ;;
             --subtree=*) subtree_id="${1#--subtree=}" ;;
             --subtree)   shift; subtree_id="${1:-}" ;;
+            --findings)  show_findings=true ;;
+            --mode=*)    mode_arg="${1#--mode=}" ;;
         esac
         shift
     done
+    local mode
+    mode=$(wv_resolve_mode "$mode_arg")
+
+    # Auto-suppress findings digest in agent/non-tty contexts unless explicitly requested
+    if [ "$format" = "json" ] || { [ ! -t 1 ] && [ "$show_findings" = false ]; } || { [ "${WV_AGENT:-0}" = "1" ] && [ "$show_findings" = false ]; }; then
+        show_findings=false
+    fi
 
     # Agent identity for claim filtering (same default as cmd_work)
     local agent_id
@@ -1279,12 +1317,25 @@ cmd_ready() {
         return
     fi
 
-    if [ "$format" = "json" ]; then
+    # Mode-based row limit for text output (json always returns full set)
+    local _mode_limit=""
+    case "$mode" in
+        bootstrap) _mode_limit="LIMIT 5" ;;
+        discover)  _mode_limit="LIMIT 5" ;;
+        execute)   _mode_limit="" ;;
+        full)      _mode_limit="" ;;
+    esac
+
+    if [ "$format" = "json-v2" ]; then
+        local results
+        results=$(db_query_json_v2 "$subtree_cte SELECT n.id, n.text, n.status, n.metadata FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY n.created_at ASC, n.id ASC;")
+        [ -z "$results" ] && echo "[]" || echo "$results"
+    elif [ "$format" = "json" ]; then
         local results
         results=$(db_query_json "$subtree_cte SELECT n.id, n.text, n.status, n.metadata FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY n.created_at ASC, n.id ASC;")
         [ -z "$results" ] && echo "[]" || echo "$results"
     else
-        db_query "$subtree_cte SELECT n.id, n.text, json_extract(n.metadata, '$.claimed_by') FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY n.created_at ASC, n.id ASC;" \
+        db_query "$subtree_cte SELECT n.id, n.text, json_extract(n.metadata, '$.claimed_by') FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY n.created_at ASC, n.id ASC $_mode_limit;" \
         | while IFS='|' read -r id text claimed_by; do
             if [ -n "$claimed_by" ]; then
                 echo -e "${CYAN}$id${NC}: $text ${YELLOW}(claimed: $claimed_by)${NC}"
@@ -1293,38 +1344,41 @@ cmd_ready() {
             fi
         done
 
-        # Findings to implement: fixable finding nodes with no active/todo fix task
-        local finding_rows
-        finding_rows=$(db_query "
-            SELECT n.id,
-                   json_extract(n.metadata, '$.finding.confidence') AS confidence,
-                   json_extract(n.metadata, '$.finding.violation_type') AS violation_type,
-                   n.text,
-                   n.status
-            FROM nodes n
-            WHERE json_extract(n.metadata, '$.type') = 'finding'
-              AND json_extract(n.metadata, '$.finding.fixable') = 1
-              AND NOT EXISTS (
-                  SELECT 1 FROM edges e
-                  JOIN nodes t ON e.source = t.id
-                  WHERE e.target = n.id AND e.type = 'resolves' AND t.status != 'done'
-              )
-            ORDER BY n.created_at ASC;
-        ")
-        if [ -n "$finding_rows" ]; then
-            echo ""
-            echo -e "${YELLOW}── Findings to implement ──────────────────────────────────────${NC}"
-            while IFS='|' read -r fid confidence violation_type ftext fstatus; do
-                local conf_label="${confidence:-?}"
-                local vtype="${violation_type:-unknown}"
-                local display _tw
-                _tw=$(tput cols 2>/dev/null || echo 120)
-                display=$(echo "$ftext" | sed 's/^Finding: //' | cut -c1-$((_tw - 6)))
-                echo -e "  ${CYAN}$fid${NC} [${fstatus}] conf=${conf_label}  ${vtype}"
-                echo -e "    $display"
-            done <<< "$finding_rows"
-            echo -e "${YELLOW}───────────────────────────────────────────────────────────────${NC}"
-            echo -e "  Use ${CYAN}wv findings list${NC} for full details."
+        # Findings to implement: opt-in via --findings flag (or tty default)
+        if [ "$show_findings" = true ]; then
+            local finding_rows
+            finding_rows=$(db_query "
+                SELECT n.id,
+                       json_extract(n.metadata, '$.finding.confidence') AS confidence,
+                       json_extract(n.metadata, '$.finding.violation_type') AS violation_type,
+                       n.text,
+                       n.status
+                FROM nodes n
+                WHERE json_extract(n.metadata, '$.type') = 'finding'
+                  AND json_extract(n.metadata, '$.finding.fixable') = 1
+                  AND n.status != 'done'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM edges e
+                      JOIN nodes t ON e.source = t.id
+                      WHERE e.target = n.id AND e.type = 'resolves' AND t.status != 'done'
+                  )
+                ORDER BY n.created_at ASC;
+            ")
+            if [ -n "$finding_rows" ]; then
+                echo ""
+                echo -e "${YELLOW}── Findings to implement ──────────────────────────────────────${NC}"
+                while IFS='|' read -r fid confidence violation_type ftext fstatus; do
+                    local conf_label="${confidence:-?}"
+                    local vtype="${violation_type:-unknown}"
+                    local display _tw
+                    _tw=$(tput cols 2>/dev/null || echo 120)
+                    display=$(echo "$ftext" | sed 's/^Finding: //' | cut -c1-$((_tw - 6)))
+                    echo -e "  ${CYAN}$fid${NC} [${fstatus}] conf=${conf_label}  ${vtype}"
+                    echo -e "    $display"
+                done <<< "$finding_rows"
+                echo -e "${YELLOW}───────────────────────────────────────────────────────────────${NC}"
+                echo -e "  Use ${CYAN}wv findings list${NC} for full details."
+            fi
         fi
     fi
 }
@@ -1347,7 +1401,8 @@ cmd_list() {
             --priority=*) priority_filter="${1#*=}" ;;
             --type=*) type_filter="${1#*=}" ;;
             --limit=*) limit_val="${1#*=}" ;;
-            --json) format="json" ;;
+            --json)    format="json" ;;
+            --json-v2) format="json-v2" ;;
             --all) all=true ;;
         esac
         shift
@@ -1422,7 +1477,11 @@ cmd_list() {
     local limit_clause=""
     [ -n "$limit_val" ] && limit_clause="LIMIT $limit_val"
 
-    if [ "$format" = "json" ]; then
+    if [ "$format" = "json-v2" ]; then
+        local results
+        results=$(db_query_json_v2 "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
+        [ -z "$results" ] && echo "[]" || echo "$results"
+    elif [ "$format" = "json" ]; then
         local results
         results=$(db_query_json "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
         [ -z "$results" ] && echo "[]" || echo "$results"
@@ -1448,14 +1507,19 @@ cmd_list() {
 cmd_show() {
     local id="${1:-}"
     local format="text"
-    
+    local mode_arg=""
+
     shift || true
     while [ $# -gt 0 ]; do
         case "$1" in
-            --json) format="json" ;;
+            --json)    format="json" ;;
+            --json-v2) format="json-v2" ;;
+            --mode=*)  mode_arg="${1#--mode=}" ;;
         esac
         shift
     done
+    local mode
+    mode=$(wv_resolve_mode "$mode_arg")
     
     if [ -z "$id" ]; then
         echo -e "${RED}Error: node ID required${NC}" >&2
@@ -1474,7 +1538,9 @@ cmd_show() {
         return 1
     fi
 
-    if [ "$format" = "json" ]; then
+    if [ "$format" = "json-v2" ]; then
+        db_query_json_v2 "$query"
+    elif [ "$format" = "json" ]; then
         db_query_json "$query"
     else
         # Use unit separator — node text can contain '|'
@@ -1484,12 +1550,26 @@ cmd_show() {
             [ -n "$node_alias" ] && echo -e "${CYAN}Alias:${NC}    $node_alias"
             echo -e "${CYAN}Text:${NC}     $text"
             echo -e "${CYAN}Status:${NC}   $status"
-            local _intent
-            _intent=$(echo "$metadata" | jq -r '.current_intent // empty' 2>/dev/null)
-            [ -n "$_intent" ] && echo -e "${CYAN}Intent:${NC}   $_intent"
-            echo -e "${CYAN}Metadata:${NC} $metadata"
-            echo -e "${CYAN}Created:${NC}  $created"
-            echo -e "${CYAN}Updated:${NC}  $updated"
+
+            if [ "$mode" = "bootstrap" ]; then
+                # bootstrap: id + text + status only (already printed above)
+                true
+            elif [ "$mode" = "discover" ]; then
+                # discover: + alias (done) + learning if present
+                local _learning
+                _learning=$(echo "$metadata" | jq -r '.learning // empty' 2>/dev/null)
+                if [ -n "$_learning" ]; then
+                    echo -e "${CYAN}Learning:${NC} $_learning"
+                fi
+            else
+                # execute / full: full metadata + timestamps
+                local _intent
+                _intent=$(echo "$metadata" | jq -r '.current_intent // empty' 2>/dev/null)
+                [ -n "$_intent" ] && echo -e "${CYAN}Intent:${NC}   $_intent"
+                echo -e "${CYAN}Metadata:${NC} $metadata"
+                echo -e "${CYAN}Created:${NC}  $created"
+                echo -e "${CYAN}Updated:${NC}  $updated"
+            fi
         done
         
         # Show blocking relationships
@@ -1501,6 +1581,7 @@ cmd_show() {
                 echo "  - $blocker_id: $blocker_text"
             done
         fi
+        return 0
     fi
 }
 
@@ -1510,12 +1591,16 @@ cmd_show() {
 
 cmd_status() {
     local format="text"
+    local mode_arg=""
     while [ $# -gt 0 ]; do
         case "$1" in
-            --json) format="json" ;;
+            --json)    format="json" ;;
+            --mode=*)  mode_arg="${1#--mode=}" ;;
         esac
         shift
     done
+    local mode
+    mode=$(wv_resolve_mode "$mode_arg")
 
     # Compact status for context injection (~50 tokens)
     local active=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active';")
@@ -1572,6 +1657,12 @@ cmd_status() {
         return 0
     fi
 
+    # bootstrap: counts only — no current node
+    if [ "$mode" = "bootstrap" ]; then
+        echo "Work: $active active, $ready ready, $blocked blocked."
+        return 0
+    fi
+
     if [ "${pending_close:-0}" -gt 0 ] 2>/dev/null; then
         echo "Work: $active active, $ready ready, $blocked blocked. $pending_close pending-close."
     else
@@ -1599,6 +1690,11 @@ cmd_status() {
             local current=$(db_query "SELECT id || ': ' || text FROM nodes WHERE status='active' LIMIT 1;")
             echo "Current: $current"
         fi
+    fi
+
+    # full: append sync state
+    if [ "$mode" = "full" ]; then
+        echo "needs_sync: $needs_sync | last_sync_at: $last_sync_at"
     fi
 }
 

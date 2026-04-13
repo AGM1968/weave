@@ -26,7 +26,7 @@ def get_repo_url() -> str:
 
 def get_weave_nodes() -> list[WeaveNode]:
     """Fetch all Weave nodes."""
-    raw = wv_cli("list", "--all", "--json", check=False)
+    raw = wv_cli("list", "--all", "--json-v2", check=False)
     if not raw or raw == "[]":
         return []
     try:
@@ -37,14 +37,8 @@ def get_weave_nodes() -> list[WeaveNode]:
 
     nodes = []
     for item in data:
-        meta_raw = item.get("metadata", "{}")
-        if isinstance(meta_raw, str):
-            try:
-                meta = json.loads(meta_raw)
-            except json.JSONDecodeError:
-                meta = {}
-        else:
-            meta = meta_raw if isinstance(meta_raw, dict) else {}
+        meta_raw = item.get("metadata") or {}
+        meta = meta_raw if isinstance(meta_raw, dict) else {}
         nodes.append(
             WeaveNode(
                 id=item["id"],

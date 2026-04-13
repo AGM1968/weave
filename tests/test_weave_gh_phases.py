@@ -12,6 +12,8 @@ from weave_gh.models import GitHubIssue, SyncStats, WeaveNode
 from weave_gh.models import Edge
 from weave_gh.phases import (
     _backfill_gh_issue,
+    _current_gh_login,
+    _desired_assignee_for_node,
     _handle_existing_issue,
     _handle_new_issue,
     _invalid_assignees,
@@ -636,6 +638,33 @@ class TestIsValidAssignee:
         assert not calls
 
 
+class TestDesiredAssigneeForNode:
+    """Local claim IDs should resolve to a real GH login before sync."""
+
+    def teardown_method(self) -> None:
+        _current_gh_login.cache_clear()
+
+    def test_done_node_skips_assignee_sync(self) -> None:
+        """Done nodes should not drive assignee changes."""
+        node = _node("wv-done", status="done", claimed_by="alice")
+        assert _desired_assignee_for_node(node) is None
+
+    def test_non_local_claim_is_used_verbatim(self) -> None:
+        """Explicit collaborator logins should pass through unchanged."""
+        node = _node("wv-active", status="active", claimed_by="alice")
+        assert _desired_assignee_for_node(node) == "alice"
+
+    def test_local_default_claim_maps_to_authenticated_login(self) -> None:
+        """Default hostname-user claims should resolve to the current GH login."""
+        _current_gh_login.cache_clear()
+        ok = subprocess.CompletedProcess([], returncode=0, stdout="octocat\n", stderr="")
+        with patch("weave_gh.phases.socket.gethostname", return_value="host"), patch(
+            "weave_gh.phases.getpass.getuser", return_value="user"
+        ), patch("weave_gh.phases._run", return_value=ok):
+            node = _node("wv-local", status="active", claimed_by="host-user")
+            assert _desired_assignee_for_node(node) == "octocat"
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: GH→Weave sets claimed_by from assignees
 # ---------------------------------------------------------------------------
@@ -844,7 +873,7 @@ class TestSyncWeaveToGithub:
         issue = _issue(10, state="OPEN")
         stats = SyncStats()
 
-        with self._patches():
+        with self._patches(), patch("weave_gh.phases.log.warning") as warn:
             sync_weave_to_github(
                 [n1, n2], [issue],
                 "owner/repo", "https://github.com/owner/repo",
@@ -853,6 +882,31 @@ class TestSyncWeaveToGithub:
             )
 
         assert stats.skipped >= 1
+        assert any(
+            "Duplicate gh_issue mappings detected" in str(call.args[0])
+            for call in warn.call_args_list
+        )
+
+    def test_done_only_duplicate_gh_issue_is_silent(self) -> None:
+        """Historical done-only duplicates should still dedup processing without warning."""
+        n1 = _node("wv-done1", status="done", gh_issue=10)
+        n2 = _node("wv-done2", status="done", gh_issue=10)
+        issue = _issue(10, state="CLOSED")
+        stats = SyncStats()
+
+        with self._patches(), patch("weave_gh.phases.log.warning") as warn:
+            sync_weave_to_github(
+                [n1, n2], [issue],
+                "owner/repo", "https://github.com/owner/repo",
+                {n1.id: n1, n2.id: n2},
+                stats,
+            )
+
+        assert stats.skipped >= 1
+        assert not any(
+            "Duplicate gh_issue mappings detected" in str(call.args[0])
+            for call in warn.call_args_list
+        )
 
     def test_no_gh_match_routes_to_handle_new(self) -> None:
         """Nodes without a GH issue are routed to _handle_new_issue (dry-run)."""
@@ -1153,6 +1207,23 @@ class TestHandleExistingIssuePaths:
         )
 
         assert len(sync_calls) == 1
+
+    def test_done_node_skips_assignee_sync_even_with_claimed_by(self) -> None:
+        """Done nodes should not try to sync a GH assignee from stale claims."""
+        node = WeaveNode(
+            id="wv-doneasgn", text="Assigned", status="done",
+            metadata={"claimed_by": "alice", "gh_issue": 31},
+        )
+        issue = _issue(31, state="OPEN")
+        stats = SyncStats()
+        sync_calls: list[object] = []
+
+        self._call(
+            node, issue, stats,
+            _sync_assignee=lambda *_a, **_k: (sync_calls.append(_a), False)[1],  # type: ignore[func-returns-value]
+        )
+
+        assert not sync_calls
 
     def test_dry_run_body_update_increments_stats(self) -> None:
         """Dry-run body update increments updated_gh without gh_cli call."""

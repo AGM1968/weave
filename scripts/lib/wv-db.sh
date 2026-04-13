@@ -375,3 +375,21 @@ db_query_json() {
     db_ensure
     sqlite3 -json -cmd ".timeout 5000" "$WV_DB" "$1"
 }
+
+# db_query_json_v2 — lean JSON shape for --json-v2 flag:
+#   - metadata promoted from escaped string to nested object
+#   - created_at / updated_at omitted
+#   - null/empty fields omitted
+db_query_json_v2() {
+    db_ensure
+    local raw
+    raw=$(sqlite3 -json -cmd ".timeout 5000" "$WV_DB" "$1") || return $?
+    [ -z "$raw" ] && echo "[]" && return
+    echo "$raw" | jq '[.[] | . + (
+        if .metadata and (.metadata | type) == "string"
+        then {metadata: (.metadata | fromjson? // {})}
+        else {}
+        end
+    ) | del(.created_at, .updated_at)
+      | with_entries(select(.value != null and .value != ""))]'
+}

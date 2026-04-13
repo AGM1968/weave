@@ -29,29 +29,25 @@ if [[ "$COMMAND" =~ wv[[:space:]]update[[:space:]]wv-[0-9a-f]{4,6}.*--status=act
     HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
     if [ -x "$WV" ]; then
-        NODE_TEXT=$("$WV" show "$NODE_ID" 2>/dev/null | grep "Text:" | sed 's/^[^:]*: //' || echo "")
-        NODE_TYPE=$("$WV" show "$NODE_ID" --json 2>/dev/null | jq -r '.[0].type // "unknown"' || echo "unknown")
+        NODE_JSON=$("$WV" show "$NODE_ID" --json 2>/dev/null || echo "[]")
+        NODE_TEXT=$(echo "$NODE_JSON" | jq -r '.[0].text // ""' 2>/dev/null || echo "")
+        HAS_SHIP_IT=$(echo "$NODE_JSON" | jq -r '.[0].metadata | fromjson | has("done_criteria")' 2>/dev/null || echo "false")
+        HAS_PRE_MORTEM=$(echo "$NODE_JSON" | jq -r '.[0].metadata | fromjson | has("risks")' 2>/dev/null || echo "false")
 
-        # Check if ship-it or pre-mortem metadata already exists
-        HAS_SHIP_IT=$("$WV" show "$NODE_ID" --json 2>/dev/null | jq -r '.[0].metadata | fromjson | has("done_criteria")' 2>/dev/null || echo "false")
-        HAS_PRE_MORTEM=$("$WV" show "$NODE_ID" --json 2>/dev/null | jq -r '.[0].metadata | fromjson | has("risks")' 2>/dev/null || echo "false")
-
-        # Only suggest if not already done
-        if [[ "$HAS_SHIP_IT" == "false" || "$HAS_PRE_MORTEM" == "false" ]]; then
-            # Build suggestion parts
-            skills_needed=""
-            if [ "$HAS_SHIP_IT" == "false" ]; then
-                skills_needed="/ship-it (done criteria)"
-            fi
-            if [ "$HAS_PRE_MORTEM" == "false" ]; then
-                [ -n "$skills_needed" ] && skills_needed="$skills_needed and "
-                skills_needed="${skills_needed}/pre-mortem (risks)"
-            fi
-
-            # Soft deny: model sees the reason and can choose to proceed
-            cat <<EOF
-{"decision": "block", "reason": "Consider running $skills_needed before claiming $NODE_ID ($NODE_TEXT). Proceed with wv update if already done."}
-EOF
+        # Only suggest if not already done.
+        # Tiers:
+        #   - done_criteria missing → hard gate (node is unplanned)
+        #   - done_criteria present, risks missing → advisory only (planned but no risk assessment)
+        #   - both present → silent pass
+        if [[ "$HAS_SHIP_IT" == "false" ]]; then
+            reason="Run /ship-it before claiming $NODE_ID ($NODE_TEXT) — done_criteria not set. Use --criteria= on wv add, or: wv update $NODE_ID --metadata='{\"done_criteria\":[...]}'"
+            jq -n --arg reason "$reason" \
+                '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$reason}}'
+            exit 0
+        elif [[ "$HAS_PRE_MORTEM" == "false" ]]; then
+            reason="Consider running /pre-mortem (risks) before claiming $NODE_ID ($NODE_TEXT). Proceed with wv update if already done."
+            jq -n --arg reason "$reason" \
+                '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$reason}}'
             exit 0
         fi
     fi

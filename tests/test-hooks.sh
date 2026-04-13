@@ -334,14 +334,35 @@ fi
 echo ""
 echo "--- pre-claim-skills.sh ---"
 setup_test_env
-ID=$("$WV" add "Claim test" 2>/dev/null | tail -1)
 
+# Node without done_criteria → hard gate (missing planning)
+ID=$("$WV" add "Claim test" 2>/dev/null | tail -1)
 set +e
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
-assert_exit_code "0" "$EXIT_CODE" "pre-claim: exits 0 (advisory, never blocks) for real Bash payload"
-assert_contains "$OUTPUT" "/ship-it" "pre-claim: suggests ship-it on wv work payload"
+assert_exit_code "0" "$EXIT_CODE" "pre-claim: exits 0 (soft deny) for real Bash payload"
+assert_contains "$OUTPUT" "hookSpecificOutput" "pre-claim: uses canonical hookSpecificOutput schema"
+assert_contains "$OUTPUT" "permissionDecision" "pre-claim: contains permissionDecision field"
+assert_contains "$OUTPUT" "/ship-it" "pre-claim: suggests ship-it when done_criteria absent"
+
+# Node with done_criteria but no risks → tiered advisory
+ID2=$("$WV" add "Claim test criteria-only" --metadata='{"done_criteria":["c1"]}' 2>/dev/null | tail -1)
+set +e
+OUTPUT2=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID2\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
+EXIT_CODE2=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE2" "pre-claim: exits 0 when criteria set but risks absent"
+assert_contains "$OUTPUT2" "pre-mortem" "pre-claim: suggests pre-mortem when done_criteria present but risks absent"
+
+# Node with both done_criteria and risks → silent pass
+ID3=$("$WV" add "Claim test both" --metadata='{"done_criteria":["c1"],"risks":[]}' 2>/dev/null | tail -1)
+set +e
+OUTPUT3=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID3\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
+EXIT_CODE3=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE3" "pre-claim: exits 0 when both done_criteria and risks present"
+assert_equals "" "$OUTPUT3" "pre-claim: silent when planning metadata complete"
 
 # Back-compat: older test payload shape still accepted
 set +e

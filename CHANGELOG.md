@@ -2,6 +2,35 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.37.0] - 2026-04-13
+
+### Added
+
+- **`wv unlink` command**: Removes a directed edge between two nodes
+  (`wv unlink <from> <to> --type=<type>`). Validates the edge exists before deletion and evicts the
+  context cache for both nodes on success.
+- **`wv done --no-gh` flag**: Suppresses GitHub issue close when completing a node. Useful for
+  recovery/cleanup nodes that track internal work without a corresponding GH issue.
+- **`wv learnings` mode-aware output bounds**: Bootstrap callers default to 5 learnings; agent/MCP
+  callers (`WV_AGENT=1`) default to 10. Explicit `--recent=N` always wins. Grep/category filtering
+  applied before the cap. MCP `weave_learnings` inherits the agent cap via `WV_AGENT=1` — VS Code
+  Copilot gets bounded output without adapter changes.
+- **MCP `--instrument` flag**: Records per-tool payload bytes and emits total/avg/max summary on
+  stderr. Useful for diagnosing which MCP tool calls dominate token usage.
+
+### Fixed
+
+- **`wv load` delta replay**: Removed manifest-based skip list. All non-pruned deltas are now always
+  replayed on load. Fixes stale-node resurrection and test-node leakage caused by the manifest
+  drifting from actual applied state. Delta replay is idempotent by design.
+- **`wv show` non-tty exit code**: `wv show` was returning exit 1 when a node had no learning, even
+  when output was otherwise valid. Now exits 0 on success regardless of learning presence.
+- **Pre-claim hook: collapse 4 `wv show` calls to 1**: `pre-claim-skills.sh` now captures node JSON
+  once and extracts `text`, `done_criteria`, and `risks` from the single result. Removes dead
+  `NODE_TYPE` variable that was read but never used.
+- **Pre-claim hook: `local` outside function (SC2168)**: Removed `local` keyword from two variables
+  in the top-level script body of `pre-claim-skills.sh`.
+
 ## [1.36.0] - 2026-04-12
 
 ### Added
@@ -22,9 +51,14 @@
   partial deletes as a delta.
 - **Multi-agent: compact coordination gate**: `wv compact` refuses to run while agents hold active
   claimed nodes, preventing silent delta loss for agents that haven't replayed yet.
+- **Multi-agent: bootstrap staleness guard**: `SharedBootstrap.is_stale` property (5-minute
+  `MAX_AGE`) replaces hardcoded 900s check in agent bootstrap resolution. Stale snapshots fall
+  through to fresh graph queries.
 - **Multi-agent: manifest mtime subsecond guard**: Changed manifest freshness comparison from `-ge`
   to `-gt` so same-second ties (second-granularity `stat -c %Y`) force safe full delta replay
   instead of trusting a potentially stale manifest.
+- **Multi-agent: hive hot-zone cleanup**: Orchestrator now cleans up parent `/tmp/weave-hive/`
+  directory after all agents complete (safe `rmdir` — only succeeds when empty).
 - **Multi-agent: removed dead `wv_delta_apply` function**: Unreachable function reserved for Sprint
   2 removed from `wv-delta.sh`.
 - **Auto-compact removed from `auto_sync`**: Automatic compaction during sync was unsafe in
@@ -35,6 +69,14 @@
 - 15 new delta unit tests (`tests/test-delta-unit.sh`) covering changeset generation, alias conflict
   resolution, timestamp propagation, fail-fast replay, and reset.
 - All 12 multi-agent integration tests passing.
+- 572 Python tests passing.
+
+### Docs
+
+- Audited and corrected `docs/INDEX-PROPOSALS.md` — 39 shipped/superseded documents archived to
+  `archive/docs/`. Only multi-agent proposal remains active.
+- Updated `docs/ARCHITECTURE.md` with 4 completed subsections (multi-agent delta merge, TUI
+  lifecycle, workflow hardening, session continuity bridge).
 
 ## [1.35.1] - 2026-04-11
 

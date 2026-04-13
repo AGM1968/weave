@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import getpass
 import json
+import os
 import re
+import socket
 import subprocess
+from functools import lru_cache
 
 from weave_gh import log
 from weave_gh.body import compose_issue_body, extract_human_content, should_update_body
@@ -26,6 +30,39 @@ _WEAVE_CLOSE_MARKER = "Completed. Weave node"
 
 # Cache of known-invalid assignee logins to avoid repeated failed API calls.
 _invalid_assignees: set[str] = set()
+
+
+@lru_cache(maxsize=1)
+def _current_gh_login() -> str | None:
+    """Return the authenticated GH login for this sync process, if available."""
+    result = _run(["gh", "api", "user", "--jq", ".login"], check=False)
+    if result.returncode != 0:
+        return None
+    login = result.stdout.strip()
+    return login or None
+
+
+def _desired_assignee_for_node(node: WeaveNode) -> str | None:
+    """Resolve the GH assignee login to sync for a node.
+
+    `claimed_by` is primarily a local lock identity (WV_AGENT_ID or hostname-user),
+    not necessarily a GitHub login. For active local claims, map back to the
+    authenticated GH user; for done nodes, skip assignee sync entirely.
+    """
+    if node.status == "done" or not node.claimed_by:
+        return None
+
+    local_agent_ids = {
+        value
+        for value in (
+            os.getenv("WV_AGENT_ID"),
+            f"{socket.gethostname()}-{getpass.getuser()}",
+        )
+        if value
+    }
+    if node.claimed_by in local_agent_ids:
+        return _current_gh_login()
+    return node.claimed_by
 
 
 def _is_valid_assignee(login: str, repo: str) -> bool:
@@ -208,21 +245,28 @@ def sync_weave_to_github(  # noqa: C901
     issues_by_num: dict[int, GitHubIssue] = {i.number: i for i in issues}
     issues_by_title: dict[str, GitHubIssue] = {i.title: i for i in issues}
 
-    # Detect duplicate gh_issue mappings (multiple nodes → same GH issue)
-    gh_to_nodes: dict[int, list[str]] = {}
+    # Detect duplicate gh_issue mappings (multiple nodes → same GH issue).
+    # Keep the processing guard for all duplicate groups, but only warn when at
+    # least one node is still live; done-only duplicates are historical noise.
+    gh_to_nodes: dict[int, list[WeaveNode]] = {}
     for node in nodes:
         if node.gh_issue:
-            gh_to_nodes.setdefault(node.gh_issue, []).append(node.id)
-    dupes = {gh: nids for gh, nids in gh_to_nodes.items() if len(nids) > 1}
+            gh_to_nodes.setdefault(node.gh_issue, []).append(node)
+    duplicate_groups = {gh: dup_nodes for gh, dup_nodes in gh_to_nodes.items() if len(dup_nodes) > 1}
+    warn_dupes = {
+        gh: dup_nodes
+        for gh, dup_nodes in duplicate_groups.items()
+        if any(node.status != "done" for node in dup_nodes)
+    }
 
     # Build set of gh_issue numbers where ANY node is done (prevents phantom reopens)
     done_gh_issues: set[int] = {
         n.gh_issue for n in nodes if n.gh_issue is not None and n.status == "done"
     }
-    if dupes:
+    if warn_dupes:
         log.warning("⚠️  Duplicate gh_issue mappings detected (last writer wins):")
-        for gh_num, nids in dupes.items():
-            log.warning("   #%d ← %s", gh_num, ", ".join(nids))
+        for gh_num, dup_nodes in warn_dupes.items():
+            log.warning("   #%d ← %s", gh_num, ", ".join(node.id for node in dup_nodes))
         log.warning(
             '   Fix with: sqlite3 $WV_DB "UPDATE nodes SET metadata'
             " = json_set(metadata, '$.gh_issue', CORRECT_NUM)"
@@ -270,7 +314,7 @@ def sync_weave_to_github(  # noqa: C901
             )
         else:
             # Skip duplicate gh_issue mappings — only process first node per GH issue
-            if gh_match in processed_gh and gh_match in dupes:
+            if gh_match in processed_gh and gh_match in duplicate_groups:
                 log.info(
                     "  ⏭ Skipping %s — GH #%d already processed by another node",
                     node.id,
@@ -380,9 +424,9 @@ def _handle_new_issue(
             _backfill_gh_issue(node, new_num, all_nodes=all_nodes)
             stats.created_gh += 1
 
-            # Best-effort assignee — silently skipped if login is not a repo collaborator
-            if node.claimed_by:
-                _sync_assignee(new_num, node.claimed_by, [], repo)
+            desired_assignee = _desired_assignee_for_node(node)
+            if desired_assignee:
+                _sync_assignee(new_num, desired_assignee, [], repo)
 
             # If node already done, immediately close
             if node.status == "done":
@@ -478,10 +522,11 @@ def _handle_existing_issue(
         dry_run=dry_run,
     )
 
-    # Sync assignee: Weave claimed_by → GH assignee
-    if node.claimed_by:
+    # Sync assignee: local claims map to the authenticated GH user.
+    desired_assignee = _desired_assignee_for_node(node)
+    if desired_assignee:
         _sync_assignee(
-            gh_match, node.claimed_by, issue.assignees, repo, dry_run=dry_run
+            gh_match, desired_assignee, issue.assignees, repo, dry_run=dry_run
         )
 
     # Status sync

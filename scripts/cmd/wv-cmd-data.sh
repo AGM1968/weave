@@ -613,30 +613,19 @@ EOF
             if [ -f "$WEAVE_DIR/.prune_epoch" ]; then
                 prune_epoch=$(cat "$WEAVE_DIR/.prune_epoch" 2>/dev/null || echo "0")
             fi
-            # Applied-deltas manifest (.weave/.applied_deltas): one basename per line,
-            # written after each successfully-applied delta. Prevents double-replay
-            # when wv load is called multiple times without an intervening wv sync.
+            # Applied-deltas manifest (.weave/.applied_deltas): one basename per line.
+            # Keep writing it for observability, but do NOT trust it to skip replay.
             #
-            # Guard condition: the manifest is only trusted when state.sql is STRICTLY
-            # newer than the manifest (i.e., a wv sync ran after the last load, so
-            # state.sql incorporates the manifest's deltas). Uses -gt (not -ge)
-            # because stat -c %Y has only second granularity — same-second ties
-            # could mean state.sql was replaced without incorporating manifest
-            # deltas, so we force full replay on ties (safe, idempotent).
-            # Local-only — not committed to git.
+            # We have observed real graph regressions where state.sql and the live DB
+            # fell behind deltas that the manifest effectively treated as already
+            # incorporated. Full replay is idempotent by design, so correctness wins:
+            # always replay every non-pruned delta on load until a stronger trust model
+            # exists than mtime comparisons plus a local manifest.
             local manifest="$WEAVE_DIR/.applied_deltas"
-            local applied_set=""
-            local state_mtime manifest_mtime
-            state_mtime=$(stat -c %Y "$WEAVE_DIR/state.sql" 2>/dev/null || echo "0")
-            manifest_mtime=$(stat -c %Y "$manifest" 2>/dev/null || echo "0")
-            if [ -f "$manifest" ] && [ "$state_mtime" -gt "$manifest_mtime" ]; then
-                # state.sql updated after last load — its changes incorporate manifest deltas
-                applied_set=$(cat "$manifest" 2>/dev/null || true)
-            fi
             # Truncate manifest before replay. If replay fails, the manifest stays
             # empty — guaranteeing all deltas are retried on the next wv load.
-            # On success, the manifest is written post-replay with exactly the set
-            # of deltas that were applied. Truncate-before is correct: the window
+            # On success, the manifest is written post-replay with the exact delta
+            # basenames replayed during this load. Truncate-before is correct: the window
             # where the manifest is empty (between truncation and successful write)
             # only matters if the process is killed mid-replay, in which case we
             # want a retry anyway.
@@ -644,17 +633,9 @@ EOF
             # Sort by filename (epoch prefix) for causal ordering across agents
             delta_files=$(find "$WEAVE_DIR/deltas" -name '*.sql' -printf '%f\t%p\n' 2>/dev/null | sort | cut -f2)
             if [ -n "$delta_files" ]; then
-                # Load manifest into associative array for O(1) lookups — avoids one
-                # grep subprocess per file (8s → 0.06s on 1768 files).
-                local -A applied_map=()
-                if [ -n "$applied_set" ]; then
-                    while IFS= read -r _am_line; do
-                        [ -n "$_am_line" ] && applied_map["$_am_line"]=1
-                    done <<< "$applied_set"
-                fi
                 local skipped=0
-                # Collect new (non-manifest, non-prune-skipped) delta paths into an array,
-                # then replay in a single batched sqlite3 call instead of N subprocesses.
+                # Collect replayable delta paths into an array, then replay in a
+                # single batched sqlite3 call instead of N subprocesses.
                 local -a new_deltas=()
                 local -a new_names=()
                 while IFS= read -r delta; do
@@ -663,10 +644,6 @@ EOF
                         local delta_name delta_ts
                         delta_name="${delta##*/}"
                         delta_ts="${delta_name%%-*}"
-                        # Skip if already in manifest (double-replay guard)
-                        if [ "${applied_map[$delta_name]+set}" ]; then
-                            continue
-                        fi
                         # Prune epoch filter
                         if [ "$delta_ts" -le "$prune_epoch" ] 2>/dev/null; then
                             skipped=$((skipped + 1))
@@ -1159,6 +1136,7 @@ cmd_learnings() {
     local recent_limit=""
     local min_quality=""
     local dedup=false
+    local mode_arg=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1170,9 +1148,12 @@ cmd_learnings() {
             --recent=*) recent_limit="${1#*=}" ;;
             --min-quality=*) min_quality="${1#*=}" ;;
             --dedup) dedup=true ;;
+            --mode=*) mode_arg="${1#*=}" ;;
         esac
         shift
     done
+    local mode
+    mode=$(wv_resolve_mode "$mode_arg")
 
     # Validate category filter
     if [ -n "$category_filter" ]; then
@@ -1239,6 +1220,21 @@ cmd_learnings() {
     if [ "$dedup" = true ]; then
         _learnings_dedup "$results" "$format"
         return
+    fi
+
+    # Agent/non-tty callers default to discover mode. Only apply an automatic
+    # cap when the caller did not already request --recent, so explicit filters
+    # keep their full search behavior before we trim the final result set.
+    local mode_limit=""
+    if [ -z "$recent_limit" ]; then
+        case "$mode" in
+            bootstrap) mode_limit="5" ;;
+            discover)  mode_limit="10" ;;
+        esac
+    fi
+    if [ -n "$mode_limit" ] && [ -n "$results" ] && [ "$results" != "[]" ]; then
+        results=$(echo "$results" | jq --argjson lim "$mode_limit" '.[0:$lim]' \
+            2>/dev/null || echo "$results")
     fi
 
     if [ "$format" = "json" ]; then

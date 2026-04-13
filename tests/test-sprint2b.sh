@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test-sprint2b.sh — Test Sprint 2b: Agent Orientation features
 #
-# Tests: breadcrumbs, digest, learnings filters, write-time validation
+# Tests: breadcrumbs, digest, learnings filters/modes, write-time validation
 #
 # Exit codes:
 #   0 - All tests passed
@@ -310,6 +310,44 @@ test_learnings_filters() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Test: Learnings mode-aware limits
+# ═══════════════════════════════════════════════════════════════════════════
+
+test_learnings_modes() {
+    echo ""
+    echo "=== Learnings Modes ==="
+
+    setup_test_env
+    $WV init >/dev/null 2>&1
+
+    local id i json_output count
+    for i in $(seq 1 12); do
+        id=$($WV add "Learning node $i" --metadata="{\"learning\":\"Learning $i\"}" 2>&1 | tail -1)
+        $WV done "$id" --no-warn >/dev/null 2>&1
+    done
+
+    json_output=$($WV learnings --json --mode=bootstrap 2>/dev/null)
+    count=$(echo "$json_output" | jq 'length')
+    assert_equals "5" "$count" "bootstrap mode caps learnings at 5"
+
+    json_output=$($WV learnings --json --mode=discover 2>/dev/null)
+    count=$(echo "$json_output" | jq 'length')
+    assert_equals "10" "$count" "discover mode caps learnings at 10"
+
+    json_output=$(WV_AGENT=1 $WV learnings --json 2>/dev/null)
+    count=$(echo "$json_output" | jq 'length')
+    assert_equals "10" "$count" "agent mode auto-detect caps learnings at 10"
+
+    json_output=$($WV learnings --json --mode=bootstrap --recent=7 2>/dev/null)
+    count=$(echo "$json_output" | jq 'length')
+    assert_equals "7" "$count" "explicit --recent overrides mode cap"
+
+    json_output=$($WV learnings --json --mode=discover --grep='Learning node 1$' 2>/dev/null)
+    count=$(echo "$json_output" | jq 'length')
+    assert_equals "1" "$count" "discover mode applies grep before the cap"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Test: Write-time validation on done
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -431,6 +469,7 @@ main() {
     test_digest
     test_breadcrumbs
     test_learnings_filters
+    test_learnings_modes
     test_validation_on_done
     test_breadcrumbs_rich
     test_digest_alerts

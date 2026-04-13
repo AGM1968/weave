@@ -4,10 +4,13 @@
  * Tests the MCP server by spawning it and sending JSON-RPC requests over stdio.
  */
 
-import { spawn, ChildProcess } from "child_process";
-import { resolve } from "path";
+import { spawn, spawnSync, ChildProcess } from "child_process";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join, resolve } from "path";
 
 const SERVER_PATH = resolve(__dirname, "../dist/index.js");
+const REQUEST_TIMEOUT_MS = 15_000;
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -27,17 +30,19 @@ class MCPTestClient {
   private server: ChildProcess;
   private requestId = 0;
   private buffer = "";
+  private stderrBuffer = "";
   private pending: Map<
     number,
     { resolve: (v: JsonRpcResponse) => void; reject: (e: Error) => void; timeout: NodeJS.Timeout }
   > = new Map();
 
-  constructor(extraArgs: string[] = []) {
+  constructor(extraArgs: string[] = [], extraEnv: NodeJS.ProcessEnv = {}) {
     this.server = spawn("node", [SERVER_PATH, ...extraArgs], {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
         WV_PATH: resolve(__dirname, "../../scripts/wv"),
+        ...extraEnv,
       },
     });
 
@@ -47,7 +52,7 @@ class MCPTestClient {
     });
 
     this.server.stderr!.on("data", (data: Buffer) => {
-      // Server logs to stderr, ignore for tests
+      this.stderrBuffer += data.toString();
     });
   }
 
@@ -86,7 +91,7 @@ class MCPTestClient {
           this.pending.delete(id);
           reject(new Error(`Request ${method} timed out`));
         }
-      }, 5000);
+      }, REQUEST_TIMEOUT_MS);
 
       this.pending.set(id, { resolve, reject, timeout });
       this.server.stdin!.write(JSON.stringify(request) + "\n");
@@ -101,16 +106,103 @@ class MCPTestClient {
     this.pending.clear();
 
     this.server.stdin?.end();
-    this.server.kill("SIGKILL");
     await new Promise<void>((resolve) => {
-      this.server.on("close", () => resolve());
-      setTimeout(resolve, 1000); // Force resolve after 1s
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      this.server.on("close", finish);
+      setTimeout(() => {
+        if (settled) return;
+        this.server.kill("SIGKILL");
+        setTimeout(finish, 1000); // Force resolve after kill if needed
+      }, 1000);
     });
   }
+
+  getStderr(): string {
+    return this.stderrBuffer;
+  }
+}
+
+function extractNodeId(text: string): string {
+  const idMatch = text.match(/wv-[a-f0-9]+/);
+  if (!idMatch) {
+    throw new Error(`Expected Weave node id in: ${text}`);
+  }
+  return idMatch[0];
+}
+
+interface LoggedWvWrapper {
+  logPath: string;
+  wvPath: string;
+  cleanup: () => void;
+}
+
+function createLoggedWvWrapper(): LoggedWvWrapper {
+  const dir = mkdtempSync(join(tmpdir(), "weave-mcp-wv-"));
+  const logPath = join(dir, "wv-args.log");
+  const wvPath = join(dir, "wv-wrapper.sh");
+  const realWvPath = resolve(__dirname, "../../scripts/wv");
+  const script = `#!/bin/sh
+LOG_PATH=${JSON.stringify(logPath)}
+REAL_WV=${JSON.stringify(realWvPath)}
+printf '%s\n' "$*" >> "$LOG_PATH"
+exec "$REAL_WV" "$@"
+`;
+  writeFileSync(wvPath, script, "utf-8");
+  chmodSync(wvPath, 0o755);
+  return {
+    logPath,
+    wvPath,
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+function readLoggedCommands(logPath: string): string[] {
+  try {
+    return readFileSync(logPath, "utf-8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function deleteNodeDirect(id: string): void {
+  spawnSync(resolve(__dirname, "../../scripts/wv"), ["delete", id, "--force"], {
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      NO_COLOR: "1",
+      WV_AGENT: "1",
+    },
+  });
 }
 
 describe("Weave MCP Server", () => {
   let client: MCPTestClient;
+  const createdNodeIds: string[] = [];
+
+  async function createTrackedNode(text: string, metadata?: Record<string, unknown>): Promise<string> {
+    const addResponse = await client.request("tools/call", {
+      name: "weave_add",
+      arguments: { text },
+    });
+    const addResult = addResponse.result as { content: { text: string }[] };
+    const id = extractNodeId(addResult.content[0].text);
+    createdNodeIds.push(id);
+    if (metadata) {
+      await client.request("tools/call", {
+        name: "weave_update",
+        arguments: { id, metadata },
+      });
+    }
+    return id;
+  }
 
   beforeAll(() => {
     client = new MCPTestClient();
@@ -118,6 +210,9 @@ describe("Weave MCP Server", () => {
 
   afterAll(async () => {
     await client.close();
+    for (const id of [...createdNodeIds].reverse()) {
+      deleteNodeDirect(id);
+    }
   });
 
   describe("tools/list", () => {
@@ -159,6 +254,66 @@ describe("Weave MCP Server", () => {
       expect(toolNames).toContain("weave_quality_diff");
       expect(toolNames).toContain("weave_quality_functions");
     });
+
+    it("should advertise phased read defaults and schema compatibility", async () => {
+      const response = await client.request("tools/list");
+      expect(response.error).toBeUndefined();
+
+      const tools = (response.result as {
+        tools: Array<{
+          name: string;
+          description: string;
+          inputSchema: { properties?: Record<string, { enum?: string[] }> };
+        }>;
+      }).tools;
+      const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
+
+      expect(byName.weave_list.description).toContain("json-v2");
+      expect(byName.weave_show.description).toContain("json-v2");
+      expect(byName.weave_status.description).toContain("discover mode");
+      expect(byName.weave_overview.description).toContain("discover mode");
+      expect(byName.weave_learnings.description).toContain("discover-mode bounded");
+
+      expect(byName.weave_context.inputSchema.properties?.mode?.enum).toEqual([
+        "bootstrap",
+        "discover",
+        "execute",
+        "full",
+      ]);
+      expect(byName.weave_status.inputSchema.properties?.mode?.enum).toEqual([
+        "bootstrap",
+        "discover",
+        "execute",
+        "full",
+      ]);
+      expect(byName.weave_overview.inputSchema.properties?.mode?.enum).toEqual([
+        "bootstrap",
+        "discover",
+        "execute",
+        "full",
+      ]);
+      expect(byName.weave_learnings.inputSchema.properties?.mode?.enum).toEqual([
+        "bootstrap",
+        "discover",
+        "execute",
+        "full",
+      ]);
+      expect(byName.weave_learnings.inputSchema.properties?.category?.enum).toEqual([
+        "decision",
+        "pattern",
+        "pitfall",
+        "learning",
+      ]);
+      expect(byName.weave_add.inputSchema.properties?.status?.enum).toEqual(
+        expect.arrayContaining(["active", "in-progress", "in_progress"])
+      );
+      expect(byName.weave_list.inputSchema.properties?.status?.enum).toEqual(
+        expect.arrayContaining(["active", "in-progress", "in_progress"])
+      );
+      expect(byName.weave_update.inputSchema.properties?.status?.enum).toEqual(
+        expect.arrayContaining(["active", "in-progress", "in_progress"])
+      );
+    });
   });
 
   describe("tools/call", () => {
@@ -172,6 +327,34 @@ describe("Weave MCP Server", () => {
       const result = response.result as { content: { text: string }[] };
       expect(result.content).toBeDefined();
       expect(result.content[0].text).toBeTruthy();
+    });
+
+    it("weave_overview should return composed overview sections", async () => {
+      const response = await client.request("tools/call", {
+        name: "weave_overview",
+        arguments: {},
+      });
+
+      expect(response.error).toBeUndefined();
+      const result = response.result as { content: { text: string }[] };
+      expect(result.content).toBeDefined();
+      expect(result.content[0].text).toContain("=== Status ===");
+      expect(result.content[0].text).toContain("=== Ready Work ===");
+    });
+
+    it("weave_context should return JSON context for a node", async () => {
+      const nodeId = await createTrackedNode("test-context-node");
+      const response = await client.request("tools/call", {
+        name: "weave_context",
+        arguments: { id: nodeId },
+      });
+
+      expect(response.error).toBeUndefined();
+      const result = response.result as { content: { text: string }[] };
+      expect(result.content).toBeDefined();
+      const context = JSON.parse(result.content[0].text);
+      expect(context.node.id).toBe(nodeId);
+      expect(Array.isArray(context.blockers)).toBe(true);
     });
 
     it("weave_health should return health info", async () => {
@@ -188,7 +371,8 @@ describe("Weave MCP Server", () => {
       expect(health).toHaveProperty("score");
     });
 
-    it("weave_list should return node list", async () => {
+    it("weave_list should return json-v2 node list", async () => {
+      const nodeId = await createTrackedNode("test-list-node", { probe: "list-json-v2" });
       const response = await client.request("tools/call", {
         name: "weave_list",
         arguments: {},
@@ -200,6 +384,11 @@ describe("Weave MCP Server", () => {
       // Should be valid JSON array
       const nodes = JSON.parse(result.content[0].text);
       expect(Array.isArray(nodes)).toBe(true);
+      const node = nodes.find((entry: { id: string }) => entry.id === nodeId);
+      expect(node).toBeDefined();
+      expect(node.metadata).toEqual(expect.objectContaining({ probe: "list-json-v2" }));
+      expect(node).not.toHaveProperty("created_at");
+      expect(node).not.toHaveProperty("updated_at");
     });
 
     it("weave_search should search nodes", async () => {
@@ -213,10 +402,22 @@ describe("Weave MCP Server", () => {
       expect(result.content).toBeDefined();
     });
 
-    it("weave_tree should return JSON tree", async () => {
+    it("weave_tree should return text tree by default", async () => {
       const response = await client.request("tools/call", {
         name: "weave_tree",
         arguments: {},
+      });
+
+      expect(response.error).toBeUndefined();
+      const result = response.result as { content: { text: string }[] };
+      expect(result.content).toBeDefined();
+      expect(result.content[0].text).toBeTruthy();
+    });
+
+    it("weave_tree with json=true should return JSON tree", async () => {
+      const response = await client.request("tools/call", {
+        name: "weave_tree",
+        arguments: { json: true },
       });
 
       expect(response.error).toBeUndefined();
@@ -327,23 +528,16 @@ describe("Weave MCP Server", () => {
       });
       // The node text should be the literal backtick string, not file contents
       const result = response.result as { content: { text: string }[] };
+      createdNodeIds.push(extractNodeId(result.content[0].text));
       expect(result.content[0].text).not.toContain("root:");
     });
 
     // --- New tool tests (wv-5c5e0f) ---
-    it("weave_show should return content for valid node", async () => {
-      // First add a node to show
-      const addResponse = await client.request("tools/call", {
-        name: "weave_add",
-        arguments: { text: "test-show-node" },
-      });
-      const addResult = addResponse.result as { content: { text: string }[] };
-      const idMatch = addResult.content[0].text.match(/wv-[a-f0-9]+/);
-      expect(idMatch).toBeTruthy();
-
+    it("weave_show should return json-v2 content for valid node", async () => {
+      const nodeId = await createTrackedNode("test-show-node", { probe: "show-json-v2" });
       const response = await client.request("tools/call", {
         name: "weave_show",
-        arguments: { id: idMatch![0] },
+        arguments: { id: nodeId },
       });
 
       expect(response.error).toBeUndefined();
@@ -352,7 +546,10 @@ describe("Weave MCP Server", () => {
       const nodes = JSON.parse(result.content[0].text);
       expect(Array.isArray(nodes)).toBe(true);
       expect(nodes[0]).toHaveProperty("id");
-      expect(nodes[0].id).toBe(idMatch![0]);
+      expect(nodes[0].id).toBe(nodeId);
+      expect(nodes[0].metadata).toEqual(expect.objectContaining({ probe: "show-json-v2" }));
+      expect(nodes[0]).not.toHaveProperty("created_at");
+      expect(nodes[0]).not.toHaveProperty("updated_at");
     });
 
     it("weave_delete without force should error", async () => {
@@ -413,6 +610,149 @@ describe("Weave MCP Server", () => {
       expect(result.content[0].text).toBeDefined();
       // With an active node (from the test env), should return OK or error — either is valid
       // The key is it doesn't crash and returns structured output
+    });
+
+    it("forwards --json-v2 for show and list", async () => {
+      const nodeId = await createTrackedNode("test-forward-json-v2");
+      const wrapper = createLoggedWvWrapper();
+      const loggedClient = new MCPTestClient([], { WV_PATH: wrapper.wvPath });
+      let commands: string[] = [];
+      try {
+        await loggedClient.request("tools/call", {
+          name: "weave_show",
+          arguments: { id: nodeId },
+        });
+        await loggedClient.request("tools/call", {
+          name: "weave_list",
+          arguments: {},
+        });
+        commands = readLoggedCommands(wrapper.logPath);
+      } finally {
+        await loggedClient.close();
+        wrapper.cleanup();
+      }
+      expect(commands).toEqual(expect.arrayContaining([
+        expect.stringContaining(`show ${nodeId} --json-v2`),
+        expect.stringContaining("list --json-v2"),
+      ]));
+    });
+
+    it("forwards discover mode for status, context, and overview reads", async () => {
+      const nodeId = await createTrackedNode("test-forward-mode");
+      const wrapper = createLoggedWvWrapper();
+      const loggedClient = new MCPTestClient([], { WV_PATH: wrapper.wvPath });
+      let commands: string[] = [];
+      try {
+        await loggedClient.request("tools/call", {
+          name: "weave_status",
+          arguments: {},
+        });
+        await loggedClient.request("tools/call", {
+          name: "weave_context",
+          arguments: { id: nodeId },
+        });
+        await loggedClient.request("tools/call", {
+          name: "weave_overview",
+          arguments: {},
+        });
+        commands = readLoggedCommands(wrapper.logPath);
+      } finally {
+        await loggedClient.close();
+        wrapper.cleanup();
+      }
+      expect(commands).toEqual(expect.arrayContaining([
+        expect.stringContaining("status --mode=discover"),
+        expect.stringContaining(`context ${nodeId} --json --mode=discover`),
+        expect.stringContaining("ready --mode=discover"),
+      ]));
+      expect(commands.filter((cmd) => cmd.includes("status --mode=discover")).length).toBeGreaterThanOrEqual(2);
+    });
+
+    it("forwards explicit mode overrides and legacy status aliases", async () => {
+      const nodeId = await createTrackedNode("test-forward-explicit-mode");
+      const wrapper = createLoggedWvWrapper();
+      const loggedClient = new MCPTestClient([], { WV_PATH: wrapper.wvPath });
+      let commands: string[] = [];
+      try {
+        const addResponse = await loggedClient.request("tools/call", {
+          name: "weave_add",
+          arguments: { text: "status alias add", status: "in_progress" },
+        });
+        createdNodeIds.push(extractNodeId((addResponse.result as { content: { text: string }[] }).content[0].text));
+
+        await loggedClient.request("tools/call", {
+          name: "weave_status",
+          arguments: { mode: "full" },
+        });
+        await loggedClient.request("tools/call", {
+          name: "weave_context",
+          arguments: { id: nodeId, mode: "bootstrap" },
+        });
+        await loggedClient.request("tools/call", {
+          name: "weave_overview",
+          arguments: { mode: "full" },
+        });
+        await loggedClient.request("tools/call", {
+          name: "weave_learnings",
+          arguments: { mode: "bootstrap" },
+        });
+        await loggedClient.request("tools/call", {
+          name: "weave_list",
+          arguments: { status: "in-progress" },
+        });
+        await loggedClient.request("tools/call", {
+          name: "weave_search",
+          arguments: { query: "sync", status: "in_progress" },
+        });
+        await loggedClient.request("tools/call", {
+          name: "weave_update",
+          arguments: { id: nodeId, status: "in-progress" },
+        });
+        commands = readLoggedCommands(wrapper.logPath);
+      } finally {
+        await loggedClient.close();
+        wrapper.cleanup();
+      }
+
+      expect(commands).toEqual(expect.arrayContaining([
+        expect.stringContaining("add status alias add --status=active"),
+        expect.stringContaining("status --mode=full"),
+        expect.stringContaining(`context ${nodeId} --json --mode=bootstrap`),
+        expect.stringContaining("ready --mode=full"),
+        expect.stringContaining("learnings --json --mode=bootstrap"),
+        expect.stringContaining("list --json-v2 --status=active"),
+        expect.stringContaining("search sync --json --status=active"),
+        expect.stringContaining(`update ${nodeId} --status=active`),
+      ]));
+    });
+
+    it("emits payload-byte instrumentation for tool responses", async () => {
+      const nodeId = await createTrackedNode("test-instrument-payload");
+      const instrumentedClient = new MCPTestClient(["--instrument"]);
+      try {
+        await instrumentedClient.request("tools/list");
+        await instrumentedClient.request("tools/call", {
+          name: "weave_status",
+          arguments: {},
+        });
+        await instrumentedClient.request("tools/call", {
+          name: "weave_show",
+          arguments: { id: nodeId },
+        });
+      } finally {
+        await instrumentedClient.close();
+      }
+
+      const stderr = instrumentedClient.getStderr();
+      expect(stderr).toMatch(/\[weave-mcp-instrument\] payload scope=all tool=tools\/list payload_bytes=\d+ tools=\d+/);
+      expect(stderr).toMatch(/\[weave-mcp-instrument\] payload scope=all tool=weave_status payload_bytes=\d+ is_error=false/);
+      expect(stderr).toMatch(/\[weave-mcp-instrument\] payload scope=all tool=weave_show payload_bytes=\d+ is_error=false/);
+      expect(stderr).toContain("[weave-mcp-instrument] === Payload summary (scope=all) ===");
+      expect(stderr).toMatch(/\[weave-mcp-instrument\]\s+tools\/list: calls=1 total_bytes=\d+ avg_bytes=\d+ max_bytes=\d+/);
+      expect(stderr).toMatch(/\[weave-mcp-instrument\]\s+weave_status: calls=1 total_bytes=\d+ avg_bytes=\d+ max_bytes=\d+/);
+      expect(stderr).toContain("[weave-mcp-instrument] === Call summary (scope=all) ===");
+      expect(stderr).toContain("[weave-mcp-instrument]   weave_status: 1");
+      expect(stderr).toContain("[weave-mcp-instrument]   weave_show: 1");
     });
   });
 });

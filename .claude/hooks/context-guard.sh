@@ -66,21 +66,11 @@ determine_policy() {
     printf '%s\n' "${reasons[@]}"
 }
 
-# Load Weave and show status
-echo -e "${CYAN}━━━ Memory System v5.0 (Weave) ━━━${NC}"
-if [ -x "$WV" ]; then
-    "$WV" load 2>/dev/null || true
-    "$WV" status 2>/dev/null || true
-fi
-
-# Determine and display policy (with 1-hour TTL cache)
-echo ""
+# Determine policy (shared by both output modes)
 if [ -f "$POLICY_CACHE" ] && [ "$(( $(date +%s) - $(stat -c %Y "$POLICY_CACHE" 2>/dev/null || echo 0) ))" -lt "$POLICY_TTL" ]; then
-    # Cache hit — read stored policy
     policy=$(head -1 "$POLICY_CACHE")
     mapfile -t reasons < <(tail -n +2 "$POLICY_CACHE")
 else
-    # Cache miss — compute and store
     _policy_output=$(determine_policy)
     policy=$(echo "$_policy_output" | head -1)
     mapfile -t reasons < <(echo "$_policy_output" | tail -n +2)
@@ -88,30 +78,56 @@ else
     printf '%s\n' "$policy" "${reasons[@]}" > "$POLICY_CACHE" 2>/dev/null || true
 fi
 
-case $policy in
-    HIGH)
-        echo -e "policy: ${GREEN}HIGH${NC}"
-        echo "├─ Can read medium files whole (<500 lines)"
-        echo "├─ Grep first for large files"
-        echo "└─ Avoid known megafiles"
-        ;;
-    MEDIUM)
-        echo -e "policy: ${YELLOW}MEDIUM${NC}"
-        echo "├─ Prefer grep before read"
-        echo "├─ Avoid full-file reads >500 lines"
-        echo "└─ Use read_range for large files"
-        ;;
-    LOW)
-        echo -e "policy: ${YELLOW}LOW${NC}"
-        echo "├─ Always grep first"
-        echo "├─ Only read small slices (<200 lines)"
-        echo "└─ Summarize rather than quote"
-        ;;
-esac
+if [ -t 1 ] && [ "${WV_AGENT:-0}" != "1" ]; then
+    # Human tty — full banner
+    echo -e "${CYAN}━━━ Memory System v5.0 (Weave) ━━━${NC}"
+    if [ -x "$WV" ]; then
+        "$WV" load 2>/dev/null || true
+        "$WV" status 2>/dev/null || true
+    fi
 
-if [ ${#reasons[@]} -gt 0 ]; then
     echo ""
-    echo "reason: ${reasons[0]}"
-fi
+    case $policy in
+        HIGH)
+            echo -e "policy: ${GREEN}HIGH${NC}"
+            echo "├─ Can read medium files whole (<500 lines)"
+            echo "├─ Grep first for large files"
+            echo "└─ Avoid known megafiles"
+            ;;
+        MEDIUM)
+            echo -e "policy: ${YELLOW}MEDIUM${NC}"
+            echo "├─ Prefer grep before read"
+            echo "├─ Avoid full-file reads >500 lines"
+            echo "└─ Use read_range for large files"
+            ;;
+        LOW)
+            echo -e "policy: ${YELLOW}LOW${NC}"
+            echo "├─ Always grep first"
+            echo "├─ Only read small slices (<200 lines)"
+            echo "└─ Summarize rather than quote"
+            ;;
+    esac
 
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    if [ ${#reasons[@]} -gt 0 ]; then
+        echo ""
+        echo "reason: ${reasons[0]}"
+    fi
+
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+else
+    # Agent/captured — compact single line
+    if [ -x "$WV" ]; then
+        "$WV" load 2>/dev/null || true
+    fi
+    _status_line=""
+    if [ -x "$WV" ]; then
+        _status_line=$("$WV" status 2>/dev/null || true)
+    fi
+    # Extract counts from status line (format: "Work: N active, M ready, K blocked.")
+    _active=$(echo "$_status_line" | grep -oP '\d+(?= active)' || echo "0")
+    _ready=$(echo "$_status_line"  | grep -oP '\d+(?= ready)'  || echo "0")
+    _blocked=$(echo "$_status_line" | grep -oP '\d+(?= blocked)' || echo "0")
+    # Extract current node if present (format: "Primary: wv-XXXX: ...")
+    _current=$(echo "$_status_line" | grep -oP '(?<=Primary: )wv-[a-f0-9]+' || echo "none")
+    echo "Weave: ${_active} active, ${_ready} ready, ${_blocked} blocked | policy=${policy} | current=${_current}"
+fi

@@ -131,9 +131,9 @@ CYAN='\033[0;36m'
 DIM='\033[2m'
 NC='\033[0m'
 
-# NO_COLOR support (https://no-color.org/)
-# If NO_COLOR env var is set (to any value), disable all colors
-if [ -n "${NO_COLOR:-}" ]; then
+# NO_COLOR support (https://no-color.org/) + auto-detect non-tty
+# Disable colors when: NO_COLOR is set, or stdout is not a terminal (pipes, captures, CI)
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
     RED=''
     GREEN=''
     YELLOW=''
@@ -141,6 +141,36 @@ if [ -n "${NO_COLOR:-}" ]; then
     DIM=''
     NC=''
 fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Output mode resolution
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# wv_resolve_mode [--mode=ARG]
+#   Resolves the effective output mode for a command. Priority:
+#     1. Explicit --mode= flag from caller (ARG, already extracted)
+#     2. WV_MODE env var
+#     3. Auto-detect: non-tty or WV_AGENT=1 → discover; tty → execute
+#   Echoes: bootstrap | discover | execute | full
+#
+wv_resolve_mode() {
+    local explicit="${1:-}"
+    if [ -n "$explicit" ]; then
+        case "$explicit" in
+            bootstrap|discover|execute|full) echo "$explicit"; return ;;
+        esac
+    fi
+    if [ -n "${WV_MODE:-}" ]; then
+        case "$WV_MODE" in
+            bootstrap|discover|execute|full) echo "$WV_MODE"; return ;;
+        esac
+    fi
+    if [ ! -t 1 ] || [ "${WV_AGENT:-0}" = "1" ]; then
+        echo "discover"
+    else
+        echo "execute"
+    fi
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # RAM Detection and Pragma Selection

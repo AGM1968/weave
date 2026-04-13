@@ -62,6 +62,7 @@ source "$WV_LIB_DIR/cmd/wv-cmd-data.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-ops.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-quality.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-findings.sh"
+source "$WV_LIB_DIR/cmd/wv-cmd-analyze.sh"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Dispatcher
@@ -121,7 +122,8 @@ main() {
 
         # Graph commands
         block)   _resolve_first_id cmd_block "$@" ;;
-        link)    cmd_link "$@" ;;  # link takes two IDs; resolve inside
+        link)    cmd_link "$@" ;;    # link takes two IDs; resolve inside
+        unlink)  cmd_unlink "$@" ;; # unlink takes two IDs; resolve inside
         resolve) _resolve_first_id cmd_resolve "$@" ;;
         related) _resolve_first_id cmd_related "$@" ;;
         edges)   _resolve_first_id cmd_edges "$@" ;;
@@ -161,9 +163,10 @@ main() {
         guide)           cmd_guide "$@" ;;
         init-repo)       cmd_init_repo "$@" ;;
 
-        # Quality commands
+        # Quality / analysis commands
         quality)         cmd_quality "$@" ;;
         findings)        cmd_findings "$@" ;;
+        analyze)         cmd_analyze "$@" ;;
         help|--help|-h)  cmd_help ;;
         version|--version|-v) echo "wv $WV_VERSION" ;;
         

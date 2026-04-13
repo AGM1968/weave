@@ -1,7 +1,7 @@
 #!/bin/bash
 # wv-cmd-graph.sh — Graph traversal and edge commands
 #
-# Commands: block, link, resolve, related, edges, path, context
+# Commands: block, link, unlink, resolve, related, edges, path, context
 # Sourced by: wv entry point (after lib modules)
 # Dependencies: wv-config.sh, wv-db.sh, wv-validate.sh, wv-cache.sh
 
@@ -203,6 +203,60 @@ cmd_link() {
     invalidate_context_cache "$from" "$to"
 
     echo -e "${GREEN}✓${NC} Linked: $from --[$edge_type]--> $to (weight: $weight)" >&2
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_unlink — Remove an edge between nodes and evict context cache
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_unlink() {
+    local from="${1:-}"
+    local to="${2:-}"
+    local edge_type=""
+
+    shift 2 || {
+        echo -e "${RED}Error: usage: wv unlink <from-id> <to-id> --type=<type>${NC}" >&2
+        return 1
+    }
+
+    # Resolve aliases to IDs
+    from=$(resolve_id "$from") || return 1
+    to=$(resolve_id "$to") || return 1
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --type=*) edge_type="${1#*=}" ;;
+        esac
+        shift
+    done
+
+    if [ -z "$from" ] || [ -z "$to" ] || [ -z "$edge_type" ]; then
+        echo -e "${RED}Error: from, to, and --type are required${NC}" >&2
+        echo -e "Usage: wv unlink <from-id> <to-id> --type=<type>" >&2
+        return 1
+    fi
+
+    # Validate ID formats (SQL injection prevention)
+    validate_id "$from" || return 1
+    validate_id "$to" || return 1
+
+    # Validate edge type
+    validate_edge_type "$edge_type" || return 1
+
+    # Check edge exists
+    local count
+    count=$(db_query "SELECT COUNT(*) FROM edges WHERE source='$from' AND target='$to' AND type='$edge_type';")
+    if [ "$count" = "0" ]; then
+        echo -e "${RED}Error: edge $from --[$edge_type]--> $to not found${NC}" >&2
+        return 1
+    fi
+
+    db_query "DELETE FROM edges WHERE source='$from' AND target='$to' AND type='$edge_type';"
+
+    # Evict context cache for both nodes
+    invalidate_context_cache "$from" "$to"
+
+    echo -e "${GREEN}✓${NC} Unlinked: $from --[$edge_type]--> $to" >&2
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -709,15 +763,19 @@ _context_gather_quality() {
 cmd_context() {
     local id=""
     local format="text"
+    local mode_arg=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --json) format="json" ;;
+            --json)   format="json" ;;
+            --mode=*) mode_arg="${1#--mode=}" ;;
             --*) ;; # skip other flags
             *) [ -z "$id" ] && id="$1" ;; # first non-flag arg is ID
         esac
         shift
     done
+    local mode
+    mode=$(wv_resolve_mode "$mode_arg")
 
     # Use WV_ACTIVE or primary node if no ID provided
     if [ -z "$id" ]; then
@@ -743,10 +801,10 @@ cmd_context() {
         return 1
     fi
 
-    # Cache setup (per session in tmpfs)
+    # Cache setup (per session in tmpfs) — keyed by id+mode so different modes don't collide
     local cache_dir="$WV_HOT_ZONE/context_cache"
     mkdir -p "$cache_dir"
-    local cache_file="$cache_dir/${id}.json"
+    local cache_file="$cache_dir/${id}-${mode}.json"
 
     # Check cache validity (invalidate on edge changes or node updates)
     if [ -f "$cache_file" ]; then
@@ -788,6 +846,15 @@ cmd_context() {
         WHERE e.target = '$id' AND e.type = 'blocks' AND n.status != 'done';
     ")
     blockers_json="${blockers_json:-[]}"
+
+    # bootstrap mode: blockers only — skip all expensive traversals
+    if [ "$mode" = "bootstrap" ]; then
+        jq -n \
+            --argjson node "$node_json" \
+            --argjson blockers "$blockers_json" \
+            '{node: ($node[0] | {id, text, status}), blockers: ($blockers | map({id, text, status}))}'
+        return 0
+    fi
 
     # Get ancestors (walk blocks + implements chains with cycle detection and depth limit)
     # blocks: source=blocker → target=blocked (walk from blocked to blocker)
@@ -895,11 +962,21 @@ cmd_context() {
     ")
     contradictions_json="${contradictions_json:-[]}"
 
-    # Get code quality data for files touched by this node
-    local quality_json
-    quality_json=$(_context_gather_quality "$id")
+    # discover mode: skip quality (expensive; rarely needed for planning)
+    local quality_json='{"code_quality":[],"quality_as_of":null}'
+    local skip_quality=false
+    [ "$mode" = "discover" ] && skip_quality=true
+
+    # Get code quality data for files touched by this node (execute/full only)
+    if [ "$skip_quality" = false ]; then
+        quality_json=$(_context_gather_quality "$id")
+    fi
 
     # Compose Context Pack with field cleanup and limits (per proposal lines 222-237)
+    # discover: cap ancestors at 5
+    local _discover_mode="false"
+    [ "$mode" = "discover" ] && _discover_mode="true"
+
     jq -n \
         --argjson node "$node_json" \
         --argjson blockers "$blockers_json" \
@@ -909,10 +986,11 @@ cmd_context() {
         --argjson pitfalls "$pitfalls_json" \
         --argjson contradictions "$contradictions_json" \
         --argjson quality "$quality_json" \
+        --argjson discover_mode "$_discover_mode" \
         '{
             node: ($node[0] | {id, text, status}),
             blockers: ($blockers | map({id, text, status, context: (.context | fromjson? // .context)})),
-            ancestors: ($ancestors | map({
+            ancestors: (($ancestors | if $discover_mode then .[0:5] else . end) | map({
                 id,
                 text,
                 status,
@@ -968,8 +1046,9 @@ cmd_context() {
             contradictions: ($contradictions | map({id, text, status})),
             code_quality: $quality.code_quality,
             quality_as_of: $quality.quality_as_of
-        }' | tee "$cache_file"
+        }' | tee "$cache_file.tmp" && mv "$cache_file.tmp" "$cache_file" || rm -f "$cache_file.tmp"
 }
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_tree — Show epic-to-feature-to-task hierarchy via implements edges

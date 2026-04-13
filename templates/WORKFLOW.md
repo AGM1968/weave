@@ -96,8 +96,9 @@ EPIC=$(wv add "Epic: big feature" --metadata='{"type":"epic","priority":1}')
 # 2. Create features linked to the epic — --parent creates the implements edge
 FEAT=$(wv add "Feature: sub-capability" --metadata='{"type":"feature"}' --parent=$EPIC)
 
-# 3. Create tasks linked to their feature
-TASK=$(wv add "Task: specific work" --metadata='{"type":"task"}' --parent=$FEAT)
+# 3. Create tasks linked to their feature — set criteria at creation time
+TASK=$(wv add "task(S1): specific work" --parent=$FEAT \
+  --criteria="criterion 1|criterion 2|make check passes" --risks=low)
 
 # 4. Set blocking order (epic unblocked only when features done)
 wv block $EPIC --by=$FEAT
@@ -107,6 +108,9 @@ wv block $FEAT --by=$TASK
 **Rules:**
 
 - `--parent=` is **mandatory** for every feature and task — never optional
+- `--criteria=` and `--risks=` at creation time makes nodes claim-ready immediately (hook silent
+  pass)
+- Use the proposal's sprint labels verbatim in node text — drift causes audit mismatches
 - Use `/wv-decompose-work` skill for structured breakdowns
 - Run `/weave-audit` — reports epics with no children and deducts score
 
@@ -194,6 +198,21 @@ close-time friction), turn it into tracked remediation immediately:
     structure that has not been read in this session, grep or read to confirm it exists and matches
     expectations. Do not propagate unvalidated beliefs across multiple steps. If prior context was
     summarised or compacted, treat named artefacts as unverified until re-read.
+13. **Sprint decomposition discipline** — when breaking a proposal into graph nodes:
+    - Use the **proposal's sprint labels verbatim** in node text (`task(S2): ...` not `task(S3):`).
+    - Set `done_criteria` and `risks` on **all nodes before claiming any** — use `--criteria=` /
+      `--risks=` on `wv add` or batch-update immediately after creation.
+    - The pre-claim hook passes silently when `done_criteria` is set at creation time. Leaving it
+      unset turns every `wv work` call into a multi-turn planning interrupt.
+
+    ```bash
+    # Good: claim-ready nodes, set at decomposition time
+    wv add "task(S2): --mode= flag on wv show" --parent=$FEAT \
+      --criteria="--mode= parsed|bootstrap=id+text+status|make check passes" --risks=low
+
+    # Bad: metadata deferred to claim time (triggers hook on every wv work)
+    wv add "task(S2): --mode= flag on wv show" --parent=$FEAT
+    ```
 
 **Violation check:** If `wv status` shows 0 active nodes, STOP and claim one first.
 

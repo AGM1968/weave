@@ -2608,7 +2608,7 @@ Commands:
   context [id]      Generate Context Pack [--json required] (uses WV_ACTIVE if no id)
   search <query>    Full-text search nodes [--limit=N] [--status=] [--json]
   reindex           Rebuild full-text search index
-  learnings         Show captured learnings [--category=] [--grep=] [--recent=N]
+  learnings         Show captured learnings [--category=] [--grep=] [--recent=N] [--mode=]
   breadcrumbs       Session breadcrumbs [save|show|clear] [--message="..."]
   digest            Compact one-liner health summary [--json]
   session-summary   Session activity stats (nodes created/completed, learnings)
@@ -2654,6 +2654,7 @@ Options:
   --category=<cat>  Filter by type: decision/pattern/pitfall/learning (learnings)
   --grep=<pattern>  Search text and metadata (learnings)
   --recent=<N>      Show only last N learnings (learnings)
+  --mode=<mode>     Output mode: bootstrap|discover|execute|full (read surfaces)
   --message="..."   Custom note for breadcrumbs (breadcrumbs save)
 
 Examples:

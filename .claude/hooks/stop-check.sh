@@ -1,13 +1,20 @@
 #!/bin/bash
-# Stop hook: Soft-warn on uncommitted changes, hard-block on unpushed commits.
+# Stop hook: Two-tier session-end guard.
 #
-# Design rationale (wv-2291e6):
-#   Uncommitted changes → user is probably still working → warn via stderr, exit 0
-#   Unpushed commits    → user committed but forgot to push → block, exit 1
+# Tier 1 — hard block (genuine in-flight risk):
+#   Active node exists → push would snapshot partial work
+#   Push/sync failure  → can't guarantee durability
 #
-# The stop hook fires every time Claude finishes a response, not just at session
-# end. Blocking on uncommitted changes forces close-session protocol even when
-# the user wants to keep working. Soft warnings let the conversation continue.
+# Tier 2 — auto-push (clean close, just needs durability):
+#   Unpushed commits, no active node, no uncommitted changes →
+#   run wv sync + git push automatically; block only on failure
+#
+# Soft warn (does not block):
+#   Uncommitted changes → user still working, let conversation continue
+#   Unsaved weave state only → auto-checkpoint handles it
+#
+# Design rationale (wv-9d556d): replaced single hard-block with two-tier
+# model to eliminate friction on clean session end.
 
 set -e
 
@@ -78,25 +85,61 @@ if [ "$WEAVE_DIRTY" -gt 0 ] && [ "$AHEAD" -eq 0 ]; then
     exit 0
 fi
 
-# Hard block only on unpushed commits — real work loss risk
-if [ "$AHEAD" -gt 0 ]; then
-    PARTS="$AHEAD unpushed commit(s)"
-    if [ "$WEAVE_DIRTY" -gt 0 ]; then
-        PARTS="$PARTS, unsaved weave state"
-        SYNC_CMD="wv sync --gh && git add .weave/ && git commit -m 'chore(weave): sync state [skip ci]' && git push"
-    else
-        SYNC_CMD="git push"
+# Check for active nodes — genuine in-flight work, hard block regardless
+if [ -x "${_WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
+    _WV="${_WV:-wv}"
+    ACTIVE_COUNT=$("$_WV" list --json 2>/dev/null | jq '[.[] | select(.status=="active")] | length' 2>/dev/null || echo "0")
+    if [ "$ACTIVE_COUNT" -gt 0 ]; then
+        if [ "$_SC_IN_COOLDOWN" = true ]; then
+            echo "Note: $ACTIVE_COUNT active node(s) — close with wv done before ending session (cooldown active)." >&2
+            exit 0
+        fi
+        mkdir -p "$_SC_HOT_ZONE" 2>/dev/null || true
+        date +%s > "$_SC_LOCK" 2>/dev/null || true
+        cat << EOF
+{
+    "decision": "block",
+    "reason": "$ACTIVE_COUNT active node(s) still open — close with: wv done <id> --learning=\"...\" before ending session"
+}
+EOF
+        exit 1
     fi
+fi
+
+# Unpushed commits with clean state — auto-push rather than block
+if [ "$AHEAD" -gt 0 ]; then
     if [ "$_SC_IN_COOLDOWN" = true ]; then
-        echo "Note: $PARTS (sync in progress — cooldown active)." >&2
+        echo "Note: $AHEAD unpushed commit(s) (auto-push in progress — cooldown active)." >&2
         exit 0
     fi
+
+    # Attempt auto sync + push
+    _PUSH_LOG=$(mktemp)
+    _PUSH_OK=false
+    {
+        if [ "$WEAVE_DIRTY" -gt 0 ]; then
+            "${_WV:-wv}" sync --gh 2>&1 && \
+            git add .weave/ 2>&1 && \
+            git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]" 2>&1
+        fi
+        git push 2>&1
+    } > "$_PUSH_LOG" 2>&1 && _PUSH_OK=true
+
+    if [ "$_PUSH_OK" = true ]; then
+        rm -f "$_SC_LOCK" "$_PUSH_LOG" 2>/dev/null || true
+        echo "Note: auto-pushed $AHEAD commit(s) — session end clean." >&2
+        exit 0
+    fi
+
+    # Push failed — hard block with log excerpt
+    _PUSH_ERR=$(tail -5 "$_PUSH_LOG" 2>/dev/null || echo "see git push output")
+    rm -f "$_PUSH_LOG" 2>/dev/null || true
     mkdir -p "$_SC_HOT_ZONE" 2>/dev/null || true
     date +%s > "$_SC_LOCK" 2>/dev/null || true
     cat << EOF
 {
     "decision": "block",
-    "reason": "$PARTS. Run: $SYNC_CMD"
+    "reason": "auto-push failed ($AHEAD commits). Fix and push manually. Last error: $_PUSH_ERR"
 }
 EOF
     exit 1
