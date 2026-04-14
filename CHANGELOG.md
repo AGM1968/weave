@@ -2,6 +2,20 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.37.1] - 2026-04-14
+
+### Fixed
+
+- **`wv show --json-v2` mode trimming**: `current_intent` (session bootstrap blob, ~600 bytes) is
+  now stripped from metadata in bootstrap and discover modes. Execute/full mode retains it.
+  Non-tty and `WV_AGENT=1` callers automatically get the trimmed output without `--mode=` flag.
+- **`wv doctor` FTS5 integrity check**: `PRAGMA integrity_check` does not probe FTS5 shadow tables,
+  so a corrupt FTS5 index could block all node writes while doctor reported healthy. Added a
+  dedicated FTS5 probe (`integrity-check` special command) as check 10b. Added `wv doctor --repair`
+  flag to auto-rebuild the index when corruption is detected.
+
+---
+
 ## [1.37.0] - 2026-04-13
 
 ### Added

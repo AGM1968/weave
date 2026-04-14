@@ -1539,7 +1539,13 @@ cmd_show() {
     fi
 
     if [ "$format" = "json-v2" ]; then
-        db_query_json_v2 "$query"
+        local _result
+        _result=$(db_query_json_v2 "$query")
+        if [ "$mode" = "bootstrap" ] || [ "$mode" = "discover" ]; then
+            echo "$_result" | jq '[.[] | del(.metadata.current_intent)]'
+        else
+            echo "$_result"
+        fi
     elif [ "$format" = "json" ]; then
         db_query_json "$query"
     else

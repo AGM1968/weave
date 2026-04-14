@@ -913,9 +913,11 @@ _doctor_check_modules() {
 
 cmd_doctor() {
     _dr_format="text"
+    local _dr_repair=false
     while [ $# -gt 0 ]; do
         case "$1" in
-            --json) _dr_format="json" ;;
+            --json)   _dr_format="json" ;;
+            --repair) _dr_repair=true ;;
         esac
         shift
     done
@@ -1007,6 +1009,31 @@ cmd_doctor() {
         fi
     else
         _doctor_record "database" "warn" "no active database"
+    fi
+
+    # 10b. FTS5 index integrity (PRAGMA integrity_check misses FTS5 shadow tables)
+    if [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ]; then
+        local fts5_ok
+        fts5_ok=$(sqlite3 "$WV_DB" \
+            "INSERT INTO nodes_fts(nodes_fts) VALUES('integrity-check');" 2>&1)
+        if [ -z "$fts5_ok" ]; then
+            _doctor_record "FTS5 index" "pass" "integrity OK"
+        else
+            if [ "$_dr_repair" = "true" ]; then
+                sqlite3 "$WV_DB" \
+                    "INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');" 2>/dev/null
+                local fts5_recheck
+                fts5_recheck=$(sqlite3 "$WV_DB" \
+                    "INSERT INTO nodes_fts(nodes_fts) VALUES('integrity-check');" 2>&1)
+                if [ -z "$fts5_recheck" ]; then
+                    _doctor_record "FTS5 index" "pass" "repaired (rebuilt)"
+                else
+                    _doctor_record "FTS5 index" "fail" "repair failed — manual: wv reindex"
+                fi
+            else
+                _doctor_record "FTS5 index" "fail" "corrupt — run: wv doctor --repair"
+            fi
+        fi
     fi
 
     # 11-12. Module checks

@@ -118,7 +118,15 @@ const WV_PATH = findWvPath();
 
 // Default timeout for wv commands (30s). Sync handlers override this.
 const WV_TIMEOUT = 30_000;
-const STATUS_SCHEMA_VALUES = ["todo", "active", "done", "blocked", "blocked-external", "in-progress", "in_progress"] as const;
+const STATUS_SCHEMA_VALUES = [
+  "todo",
+  "active",
+  "done",
+  "blocked",
+  "blocked-external",
+  "in-progress",
+  "in_progress",
+] as const;
 const READ_MODES = ["bootstrap", "discover", "execute", "full"] as const;
 const LEARNING_CATEGORIES = ["decision", "pattern", "pitfall", "learning"] as const;
 type ReadMode = (typeof READ_MODES)[number];
@@ -1523,7 +1531,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.37.0",
+      version: "1.37.1",
     },
     {
       capabilities: {
