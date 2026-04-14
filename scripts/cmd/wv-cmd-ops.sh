@@ -1086,7 +1086,18 @@ cmd_doctor() {
         if [ -z "$drifted" ]; then
             _doctor_record "hook drift" "pass" "source and installed hooks match"
         else
-            _doctor_record "hook drift" "warn" "run ./install.sh — drifted: $drifted"
+            if [ "$_dr_repair" = "true" ]; then
+                local _repaired=0
+                for src in "$installed_hooks_dir"/*.sh; do
+                    [ -f "$src" ] || continue
+                    local _fname
+                    _fname=$(basename "$src")
+                    cp "$src" "$source_hooks_dir/$_fname" && _repaired=$((_repaired + 1))
+                done
+                _doctor_record "hook drift" "pass" "repaired ($_repaired hooks synced from ~/.config/weave/hooks/)"
+            else
+                _doctor_record "hook drift" "warn" "run: wv init-repo --update — drifted: $drifted"
+            fi
         fi
     else
         _doctor_record "hook drift" "warn" "cannot compare — source or installed hooks dir missing"

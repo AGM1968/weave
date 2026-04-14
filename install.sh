@@ -997,6 +997,36 @@ SETTINGSEOF
         fi
     fi
 
+    # ── .claude/hooks/ (managed — update from installed hooks on --update) ──
+    # Hooks fire globally from ~/.config/weave/hooks/ (Alt-A architecture).
+    # Consumer repos may have a local .claude/hooks/ copy from before this change
+    # or from wv-init-repo itself.  On --update, sync stale hooks from the
+    # installed source so `wv doctor` hook drift passes without a manual cp.
+    CLAUDE_HOOKS_DIR="$REPO_ROOT/.claude/hooks"
+    INSTALLED_HOOKS_DIR="$HOME/.config/weave/hooks"
+    if [ -d "$CLAUDE_HOOKS_DIR" ] && [ -d "$INSTALLED_HOOKS_DIR" ]; then
+        _hooks_updated=0
+        _hooks_skipped=0
+        for src in "$INSTALLED_HOOKS_DIR"/*.sh; do
+            [ -f "$src" ] || continue
+            fname=$(basename "$src")
+            dst="$CLAUDE_HOOKS_DIR/$fname"
+            if [ ! -f "$dst" ] || \
+               [ "$(md5sum "$src" 2>/dev/null | awk '{print $1}')" != \
+                 "$(md5sum "$dst" 2>/dev/null | awk '{print $1}')" ]; then
+                cp "$src" "$dst"
+                _hooks_updated=$((_hooks_updated + 1))
+            else
+                _hooks_skipped=$((_hooks_skipped + 1))
+            fi
+        done
+        if [ "$_hooks_updated" -gt 0 ]; then
+            echo -e "  ${GREEN}✓${NC} .claude/hooks/ ($_hooks_updated updated, $_hooks_skipped already current)"
+        else
+            echo -e "  ${YELLOW}⊘${NC} .claude/hooks/ (all $_hooks_skipped hooks already current)"
+        fi
+    fi
+
 fi
 
 if [ "$AGENT" = "copilot" ]; then

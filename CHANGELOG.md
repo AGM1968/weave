@@ -2,6 +2,20 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.37.2] - 2026-04-14
+
+### Fixed
+
+- **`wv init-repo --update` now syncs `.claude/hooks/`**: Consumer repos with a local hooks
+  directory are brought up to date from `~/.config/weave/hooks/` in a single command. Reports how
+  many hooks were updated vs already current.
+- **`wv doctor` hook drift message**: Now says `run: wv init-repo --update` instead of
+  `run ./install.sh` — the correct command for repos without `install.sh` on PATH.
+- **`wv doctor --repair` handles hook drift**: Copies stale hooks from `~/.config/weave/hooks/`
+  into the project `.claude/hooks/` (pull direction). Clears drift in one step.
+
+---
+
 ## [1.37.1] - 2026-04-14
 
 ### Fixed
