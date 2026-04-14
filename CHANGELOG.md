@@ -2,6 +2,21 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.37.4] - 2026-04-14
+
+### Fixed
+
+- bash-dedup: two-phase lock (pending/running) prevents orphaned locks when
+  a PreToolUse hook hard-blocks a tool call (hooks run in parallel; PostToolUse
+  never fires for blocked tools)
+- bash-dedup: background task locks now auto-clear via fuser/lsof when the
+  subprocess completes, using `tool_response.backgroundTaskId` to locate the
+  task output file — no manual lock clearing or TTL wait required
+- bash-dedup: PostToolUse clears ALL matching lock keys for compound commands
+- bash-dedup: SessionStart hook clears all stale locks from prior sessions
+- bash-dedup: reduced TTLs (wv-sync 300→60s, git-push 120→60s,
+  make-build 1800→600s, pytest 300→120s)
+
 ## [1.37.3] - 2026-04-14
 
 ### Fixed

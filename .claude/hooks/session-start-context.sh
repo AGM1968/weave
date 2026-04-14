@@ -19,6 +19,15 @@ _SS_REPO_HASH=$(echo "$WV_PROJECT_DIR" | md5sum | cut -c1-8)
 _SS_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_SS_REPO_HASH}}"
 SENTINEL="${_SS_HOT_ZONE}/.session_sentinel"
 
+# ── Clear stale bash-dedup locks from the previous session ────────────────────
+# bash-dedup.sh uses the same repo hash to locate lock files. Any lock still
+# present at SessionStart is orphaned (crash, hard-block with no PostToolUse,
+# or session killed). Clear them all so this session starts with a clean slate.
+_SS_DEDUP_DIR="/tmp/weave-bash-locks/${_SS_REPO_HASH}"
+if [[ -d "$_SS_DEDUP_DIR" ]]; then
+    rm -f "${_SS_DEDUP_DIR}"/*.lock 2>/dev/null || true
+fi
+
 # ── Harvest last prompt from most recent Claude JSONL (best-effort) ──
 # Used to enrich crash/reboot recovery context with conversation intent.
 _SS_LAST_PROMPT=""
