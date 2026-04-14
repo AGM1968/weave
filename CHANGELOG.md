@@ -2,6 +2,16 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.37.3] - 2026-04-14
+
+### Fixed
+
+- **`install.sh` registers `PostToolUseFailure` for bash-dedup**: Commands that exit non-zero (e.g.
+  `git push` with a bad upstream, exit 128) now clear the dedup lock. Previously the lock persisted
+  until the 120s TTL, blocking all retry attempts with "Duplicate command blocked".
+
+---
+
 ## [1.37.2] - 2026-04-14
 
 ### Fixed

@@ -505,6 +505,11 @@ merge_global_claude_settings() {
                     {"type":"command","command":($h+"/bash-dedup-post.sh"),"timeout":5}
                 ]}
             ],
+            "PostToolUseFailure": [
+                {"matcher":"Bash","hooks":[
+                    {"type":"command","command":($h+"/bash-dedup-post.sh"),"timeout":5}
+                ]}
+            ],
             "Stop": [{"matcher":"","hooks":[
                 {"type":"command","command":($h+"/stop-check.sh")}
             ]}],
