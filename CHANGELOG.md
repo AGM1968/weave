@@ -2,6 +2,25 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.38.0] - 2026-04-15
+
+### Added
+
+- **WV_CALL_LOG instrumentation**: Set `export WV_CALL_LOG=~/.local/share/weave/wv_calls.jsonl` to
+  record every `wv` invocation with `{ts, cmd, stdout_bytes, stderr_bytes, elapsed_ms}`. Zero
+  overhead when unset.
+- **`wv analyze sessions --token-hogs`**: Reads the call log and ranks commands by byte output —
+  surfaces which `wv` commands inject the most tokens into agent context.
+- **WEAVE.md §8.3 Call Instrumentation**: Docs covering enable, log format, and analyze usage.
+
+### Fixed
+
+- **Context cache invalidation**: `invalidate_context_cache` deleted `${id}.json` but cache files
+  are named `${id}-${mode}.json` — stale cache was served after `wv link`, causing `wv context`
+  to return an empty finding block.
+- **`wv show` in discover mode**: `Intent:` field now renders in discover (non-tty/agentic) mode,
+  not only in execute/full mode.
+
 ## [1.37.4] - 2026-04-14
 
 ### Fixed

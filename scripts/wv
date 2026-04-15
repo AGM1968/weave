@@ -178,4 +178,36 @@ main() {
     esac
 }
 
-main "$@"
+# ═══════════════════════════════════════════════════════════════════════════
+# Call Instrumentation (opt-in via WV_CALL_LOG)
+# ═══════════════════════════════════════════════════════════════════════════
+# When WV_CALL_LOG is set, each invocation appends one JSONL line:
+#   {"ts":<epoch>,"cmd":"wv <subcmd>","stdout_bytes":<n>,"stderr_bytes":0,"elapsed_ms":<n>}
+#
+# Enable:  export WV_CALL_LOG=~/.local/share/weave/wv_calls.jsonl
+# Analyse: wv analyze sessions --token-hogs
+#
+# The runtime sets WV_CALL_LOG automatically when call_log_path= is passed to
+# WvClient. Public CLI users who want session analysis add the export to their
+# shell profile. Zero overhead when unset.
+
+if [[ -n "${WV_CALL_LOG:-}" ]]; then
+    _wv_ts_start=$(date +%s%3N)
+    _wv_ts_epoch=$(date +%s.%6N)
+    _wv_out=$(mktemp -t wv-calllog-XXXXXX)
+    _wv_exit=0
+    set +e
+    main "$@" | tee "$_wv_out"
+    _wv_exit=${PIPESTATUS[0]}
+    set -e
+    _wv_ts_end=$(date +%s%3N)
+    _wv_elapsed=$((_wv_ts_end - _wv_ts_start))
+    _wv_stdout_bytes=$(wc -c < "$_wv_out")
+    rm -f "$_wv_out"
+    printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":0,"elapsed_ms":%d}\n' \
+        "$_wv_ts_epoch" "${1:-help}" "$_wv_stdout_bytes" "$_wv_elapsed" \
+        >> "$WV_CALL_LOG" 2>/dev/null || true
+    exit "$_wv_exit"
+else
+    main "$@"
+fi

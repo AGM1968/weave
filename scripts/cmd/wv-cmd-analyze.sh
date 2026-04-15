@@ -45,6 +45,9 @@ cmd_analyze_sessions() {
                 echo ""
                 echo "  --log=<path>   JSONL call log (default: ~/.local/share/weave/wv_calls.jsonl)"
                 echo "  --top=N        Show top N commands (default: 10)"
+                echo ""
+                echo "Enable logging:"
+                echo "  export WV_CALL_LOG=~/.local/share/weave/wv_calls.jsonl"
                 return 0
                 ;;
         esac
@@ -55,7 +58,9 @@ cmd_analyze_sessions() {
             echo '{"token_hogs":[],"message":"no call log found","log_path":"'"$log_path"'"}'
         else
             echo "No call log found at: $log_path"
-            echo "Enable instrumentation by passing call_log_path= to WvClient."
+            echo "Enable instrumentation:"
+            echo "  CLI:     export WV_CALL_LOG=~/.local/share/weave/wv_calls.jsonl"
+            echo "  Runtime: pass call_log_path= to WvClient"
         fi
         return 0
     fi

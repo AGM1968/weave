@@ -210,7 +210,7 @@ if [ -f "$REPO3/.vscode/settings.json" ]; then
     VS_SETTINGS=$(cat "$REPO3/.vscode/settings.json")
     assert_not_contains "$VS_SETTINGS" 'chat.hooks.enabled' "copilot: NO ghost setting in .vscode/settings.json"
 else
-    TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "${GREEN}✓${NC} copilot: .vscode/settings.json not created (ghost setting removed)"
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "${GREEN}✓${NC} copilot: .vscode/settings.json not created (ghost setting removed)"
 fi
 
 # Verify copilot-instructions is minimal stub (not workflow dump)
@@ -265,7 +265,7 @@ if [ -d "$REPO5/.vscode" ]; then
         VS5=$(cat "$REPO5/.vscode/settings.json")
         assert_not_contains "$VS5" 'chat.hooks.enabled'     "--update: strips ghost setting from .vscode/settings.json"
     else
-        TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "${GREEN}✓${NC} --update: .vscode/settings.json cleaned up"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "${GREEN}✓${NC} --update: .vscode/settings.json cleaned up"
     fi
 fi
 

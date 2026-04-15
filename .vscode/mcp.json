@@ -1,0 +1,26 @@
+{
+	"servers": {
+		"weave": {
+			"type": "stdio",
+			"command": "node",
+			"args": [
+				"${workspaceFolder}/mcp/dist/index.js"
+			],
+			"env": {
+				"WV_PATH": "${workspaceFolder}/scripts/wv"
+			}
+		},
+		"weave-inspect": {
+			"type": "stdio",
+			"command": "node",
+			"args": [
+				"${workspaceFolder}/mcp/dist/index.js",
+				"--scope=inspect"
+			],
+			"env": {
+				"WV_PATH": "${workspaceFolder}/scripts/wv"
+			}
+		}
+	},
+	"inputs": []
+}

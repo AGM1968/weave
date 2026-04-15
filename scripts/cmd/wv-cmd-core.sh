@@ -1561,8 +1561,10 @@ cmd_show() {
                 # bootstrap: id + text + status only (already printed above)
                 true
             elif [ "$mode" = "discover" ]; then
-                # discover: + alias (done) + learning if present
-                local _learning
+                # discover: + intent (if set) + learning if present
+                local _intent _learning
+                _intent=$(echo "$metadata" | jq -r '.current_intent // empty' 2>/dev/null)
+                [ -n "$_intent" ] && echo -e "${CYAN}Intent:${NC}   $_intent"
                 _learning=$(echo "$metadata" | jq -r '.learning // empty' 2>/dev/null)
                 if [ -n "$_learning" ]; then
                     echo -e "${CYAN}Learning:${NC} $_learning"

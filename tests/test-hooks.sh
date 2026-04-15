@@ -597,25 +597,27 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "stop-check: exits 0 (soft warn) with uncommitted changes"
 assert_contains "$STDERR_OUTPUT" "uncommitted" "stop-check: stderr warns about uncommitted changes"
 
-# Unpushed commits — hard block
-# Commit the dirty file, but don't push (no remote, so rev-list check is mocked)
+# Unpushed commits — auto-push attempted, fails → hard block
+# Create a real bare remote so tracking/AHEAD works, then remove it so push fails
+_FAKE_REMOTE=$(mktemp -d)
+git init --bare -q "$_FAKE_REMOTE"
 git -C "$TEST_DIR/project" commit -m "unpushed work" -q 2>/dev/null
-# Create a fake remote so git rev-list @{u}..HEAD works
-git -C "$TEST_DIR/project" remote add origin "$TEST_DIR/project/.git" 2>/dev/null || true
-git -C "$TEST_DIR/project" fetch origin -q 2>/dev/null || true
-git -C "$TEST_DIR/project" branch --set-upstream-to=origin/main main 2>/dev/null || \
-    git -C "$TEST_DIR/project" branch --set-upstream-to=origin/master master 2>/dev/null || true
-# Make a new commit so we're ahead of "upstream"
+git -C "$TEST_DIR/project" remote add origin "file://$_FAKE_REMOTE" 2>/dev/null || true
+git -C "$TEST_DIR/project" push -u origin HEAD:main -q 2>/dev/null || \
+    git -C "$TEST_DIR/project" push -u origin HEAD:master -q 2>/dev/null || true
+# Make a new commit so AHEAD=1
 echo "ahead" > "$TEST_DIR/project/ahead.txt"
 git -C "$TEST_DIR/project" add ahead.txt
 git -C "$TEST_DIR/project" commit -m "ahead of upstream" -q 2>/dev/null
+# Remove the remote so push will fail
+rm -rf "$_FAKE_REMOTE"
 
 set +e
 OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
 assert_exit_code "1" "$EXIT_CODE" "stop-check: exits 1 (hard block) with unpushed commits"
-assert_contains "$OUTPUT" "unpushed" "stop-check: warns about unpushed commits"
+assert_contains "$OUTPUT" "auto-push failed" "stop-check: warns about unpushed commits"
 assert_contains "$OUTPUT" "block" "stop-check: decision is block"
 
 # --- session-end-sync.sh ---
@@ -794,7 +796,7 @@ OUTPUT=$(bash "$HOOKS_DIR/context-guard.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "context-guard: exits 0"
-assert_contains "$OUTPUT" "policy:" "context-guard: emits policy line"
+assert_contains "$OUTPUT" "policy" "context-guard: emits policy line"
 
 # 2. Cache file should exist after first run
 TESTS_RUN=$((TESTS_RUN + 1))

@@ -58,6 +58,7 @@ declare -a SUITES=(
     "test-crash-sentinel.sh:Crash Sentinel Tests"
     "test-multi-agent.sh:Multi-Agent Tests"
     "test-delta-unit.sh:Delta Unit Tests"
+    "test-analyze.sh:Analyze Command Tests"
 )
 
 # Results tracking

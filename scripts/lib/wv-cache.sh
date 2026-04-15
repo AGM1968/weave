@@ -18,7 +18,7 @@ invalidate_context_cache() {
     if [ -d "$cache_dir" ]; then
         local node_id
         for node_id in $affected_ids; do
-            rm -f "$cache_dir/${node_id}.json" 2>/dev/null
+            rm -f "$cache_dir/${node_id}"-*.json 2>/dev/null
         done
     fi
 

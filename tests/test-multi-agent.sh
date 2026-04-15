@@ -275,31 +275,27 @@ assert "Corrupt delta produces warning" 'echo "$corrupt_output" | grep -q "Skipp
 rm -f "$OBSERVER_DIR/.weave/deltas/2026-03-15/9999999999-corrupt.sql"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Test 6: Delta load is idempotent after manifest-covered sync
+# Test 6: Delta load is idempotent — second load produces same node count
+# Note: as of v1.20.0 the manifest is written for observability only; all deltas
+# are always replayed (full replay is idempotent by design, so the Replayed message
+# is expected on every load that finds delta files).
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
-echo "--- Manifest-covered load (no new deltas) ---"
+echo "--- Idempotent load (second run) ---"
 
 EMPTY_DIR="$TEST_DIR/empty-agent"
 git clone "$BARE_REPO" "$EMPTY_DIR" -q 2>/dev/null
 _reg_drivers "$EMPTY_DIR"
 mkdir -p "$EMPTY_DIR/.weave/deltas" "$EMPTY_DIR/hot"
 init_agent_db "$EMPTY_DIR"
-# First load: populate the manifest with all current deltas
+# First load: replay all deltas
 $WV load 2>/dev/null || true
-# Simulate a sync that updated state.sql. The manifest guard uses second-precision
-# mtime (stat -c %Y), so a plain `touch` landing in the same second as the
-# manifest write would produce equal mtimes and fail the state_mtime > manifest_mtime
-# guard — causing all deltas to be replayed again (safe but defeats the test).
-# touch -d '+1 second' forces a strictly later mtime regardless of wall-clock timing.
-# This is a test artifact: in production, wv sync always writes state.sql during
-# auto_sync, which takes at least one sqlite3 round-trip after the manifest write.
-# Same-second precision loss degrades silently to full re-replay (idempotent, not wrong).
-touch -d '+1 second' "$EMPTY_DIR/.weave/state.sql" 2>/dev/null || true
-# Second load: all deltas covered by manifest → nothing new to replay
-empty_output=$($WV load 2>&1)
+first_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes;" 2>/dev/null || echo "-1")
+# Second load: same deltas replayed again — node count must be unchanged (idempotent)
+$WV load 2>/dev/null || true
+second_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes;" 2>/dev/null || echo "-2")
 
-assert "No 'Replayed' message when all deltas already in manifest" '! echo "$empty_output" | grep -q "Replayed"' "no replay message after manifest-covered sync"
+assert "Second load is idempotent (node count unchanged)" '[ "$first_count" = "$second_count" ]' "node count: first=$first_count second=$second_count"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Test 7: Prune produces zero DELETE statements in delta files
