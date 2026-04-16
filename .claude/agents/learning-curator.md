@@ -21,7 +21,7 @@ the query operations: `weave_context`, `weave_search`, `weave_tree`, `weave_lear
 `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`.
 
 ```jsonc
-// .vscode/mcp.json — server for this agent
+// .mcp.json — server for this agent
 "weave-inspect": {
   "type": "stdio",
   "command": "node",

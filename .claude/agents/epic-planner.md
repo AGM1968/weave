@@ -20,7 +20,7 @@ This agent uses the **`weave`** MCP server (all 31 tools available). Its primary
 `weave_update`, `weave_list`, `weave_resolve`, `weave_delete`.
 
 ```jsonc
-// .vscode/mcp.json — server for this agent
+// .mcp.json — server for this agent
 "weave": {
   "type": "stdio",
   "command": "node",

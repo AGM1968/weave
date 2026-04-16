@@ -1103,12 +1103,8 @@ cmd_doctor() {
         _doctor_record "hook drift" "warn" "cannot compare — source or installed hooks dir missing"
     fi
 
-    # 16. wv-runtime wrapper present
-    if command -v wv-runtime >/dev/null 2>&1; then
-        _doctor_record "wv-runtime" "pass" "$(command -v wv-runtime)"
-    else
-        _doctor_record "wv-runtime" "warn" "not found — install with ./install.sh"
-    fi
+    # 16. wv-runtime wrapper retired (S2) — standalone repo uses python -m weave_runtime
+    _doctor_record "wv-runtime" "pass" "retired — use python -m weave_runtime (standalone repo)"
 
     # 17. Pre-commit hook installed and is the Weave version
     local git_root
@@ -1252,8 +1248,8 @@ cmd_mcp_status() {
     # 4. Check for IDE configs (supports both agents in same repo)
     local repo_root="$REPO_ROOT"
     local has_vscode=false has_claude=false
-    if [ -f "$repo_root/.vscode/mcp.json" ]; then
-        _mcp_record "VS Code config" "pass" ".vscode/mcp.json"
+    if [ -f "$repo_root/.mcp.json" ]; then
+        _mcp_record "VS Code config" "pass" ".mcp.json"
         has_vscode=true
     fi
     if [ -f "$repo_root/.claude/settings.local.json" ]; then
@@ -2733,7 +2729,7 @@ Examples:
   wv learnings --grep="testing"
   wv done wv-a1b2 --no-warn
   wv init-repo                                # bootstrap .claude/ for current repo (claude agent)
-  wv init-repo --agent=copilot                # add VS Code Copilot config (.vscode/mcp.json + instructions)
+  wv init-repo --agent=copilot                # add VS Code Copilot config (.mcp.json + instructions)
   wv init-repo --agent=all                    # both claude and copilot
   wv init-repo --update                       # refresh managed files (skills, agents, instructions)
   wv init-repo --force                        # overwrite ALL files including user-customized

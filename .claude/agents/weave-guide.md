@@ -20,7 +20,7 @@ workflow lifecycle operations: `weave_work`, `weave_ship`, `weave_quick`, `weave
 `weave_close_session`, `weave_breadcrumbs`, `weave_plan`, `weave_edit_guard`.
 
 ```jsonc
-// .vscode/mcp.json — server for this agent
+// .mcp.json — server for this agent
 "weave": {
   "type": "stdio",
   "command": "node",

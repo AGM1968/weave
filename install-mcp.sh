@@ -86,7 +86,7 @@ fi
 # Show IDE config instructions
 echo ""
 echo "To register with your IDE:"
-echo "  wv-init-repo --agent=copilot   # VS Code → .vscode/mcp.json + copilot-instructions.md"
+echo "  wv-init-repo --agent=copilot   # VS Code → .mcp.json + copilot-instructions.md"
 echo "  wv-init-repo --agent=claude    # Claude Code → .claude/settings.local.json"
 echo "  wv-init-repo --agent=all       # Both agents in same repo"
 echo ""
