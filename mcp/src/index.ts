@@ -276,7 +276,22 @@ const TOOLS: Tool[] = [
         learning: {
           type: "string",
           description:
-            "Learning to capture (decision/pattern/pitfall). IMPORTANT: Always provide for non-trivial work.",
+            "Learning to capture. Use pipe-delimited format: 'decision: X | pattern: Y | pitfall: Z'. Or use the typed fields below instead.",
+        },
+        decision: {
+          type: "string",
+          description:
+            "What was decided and why (stored as top-level metadata key).",
+        },
+        pattern: {
+          type: "string",
+          description:
+            "Reusable pattern or technique discovered (stored as top-level metadata key).",
+        },
+        pitfall: {
+          type: "string",
+          description:
+            "What went wrong or what to avoid (stored as top-level metadata key).",
         },
         no_warn: {
           type: "boolean",
@@ -305,7 +320,20 @@ const TOOLS: Tool[] = [
         },
         learning: {
           type: "string",
-          description: "Learning to capture for all nodes",
+          description:
+            "Learning to capture for all nodes. Use pipe-delimited format or typed fields below.",
+        },
+        decision: {
+          type: "string",
+          description: "What was decided and why.",
+        },
+        pattern: {
+          type: "string",
+          description: "Reusable pattern or technique discovered.",
+        },
+        pitfall: {
+          type: "string",
+          description: "What went wrong or what to avoid.",
         },
         no_warn: {
           type: "boolean",
@@ -472,7 +500,22 @@ const TOOLS: Tool[] = [
         learning: {
           type: "string",
           description:
-            "Learning to capture (decision/pattern/pitfall). IMPORTANT: Always provide for non-trivial work.",
+            "Learning to capture. Use pipe-delimited format: 'decision: X | pattern: Y | pitfall: Z'. Or use the typed fields below instead.",
+        },
+        decision: {
+          type: "string",
+          description:
+            "What was decided and why (stored as top-level metadata key).",
+        },
+        pattern: {
+          type: "string",
+          description:
+            "Reusable pattern or technique discovered (stored as top-level metadata key).",
+        },
+        pitfall: {
+          type: "string",
+          description:
+            "What went wrong or what to avoid (stored as top-level metadata key).",
         },
         gh: {
           type: "boolean",
@@ -990,15 +1033,28 @@ function handleTool(
 
     case "weave_done": {
       const id = args.id as string;
-      const learning = args.learning as string | undefined;
+      let learning = args.learning as string | undefined;
+      const decision = args.decision as string | undefined;
+      const pattern = args.pattern as string | undefined;
+      const pitfall = args.pitfall as string | undefined;
       const noWarn = args.no_warn as boolean | undefined;
       const noOverlapCheck = args.no_overlap_check as boolean | undefined;
+
+      // Compose pipe-delimited learning string from typed params if no raw learning
+      if (!learning && (decision || pattern || pitfall)) {
+        const parts: string[] = [];
+        if (decision) parts.push(`decision: ${decision}`);
+        if (pattern) parts.push(`pattern: ${pattern}`);
+        if (pitfall) parts.push(`pitfall: ${pitfall}`);
+        learning = parts.join(" | ");
+      }
+
       const cmd = ["done", id];
       if (learning) cmd.push(`--learning=${learning}`);
       if (noWarn) cmd.push("--no-warn");
       if (noOverlapCheck) cmd.push("--no-overlap-check");
       result = wv(cmd);
-      if (!learning)
+      if (!learning && !decision && !pattern && !pitfall)
         result +=
           "\n\nWARNING: No learning captured. Consider: what decision, pattern, or pitfall should future sessions know?";
       break;
@@ -1006,8 +1062,20 @@ function handleTool(
 
     case "weave_batch_done": {
       const ids = args.ids as string[];
-      const learning = args.learning as string | undefined;
+      let learning = args.learning as string | undefined;
+      const decision = args.decision as string | undefined;
+      const pattern = args.pattern as string | undefined;
+      const pitfall = args.pitfall as string | undefined;
       const noWarn = args.no_warn as boolean | undefined;
+
+      if (!learning && (decision || pattern || pitfall)) {
+        const parts: string[] = [];
+        if (decision) parts.push(`decision: ${decision}`);
+        if (pattern) parts.push(`pattern: ${pattern}`);
+        if (pitfall) parts.push(`pitfall: ${pitfall}`);
+        learning = parts.join(" | ");
+      }
+
       const cmd = ["batch-done", ...ids];
       if (learning) cmd.push(`--learning=${learning}`);
       if (noWarn) cmd.push("--no-warn");
@@ -1080,13 +1148,26 @@ function handleTool(
 
     case "weave_ship": {
       const id = args.id as string;
-      const learning = args.learning as string | undefined;
+      let learning = args.learning as string | undefined;
+      const decision = args.decision as string | undefined;
+      const pattern = args.pattern as string | undefined;
+      const pitfall = args.pitfall as string | undefined;
       const gh = args.gh as boolean | undefined;
+
+      // Compose pipe-delimited learning string from typed params if no raw learning
+      if (!learning && (decision || pattern || pitfall)) {
+        const parts: string[] = [];
+        if (decision) parts.push(`decision: ${decision}`);
+        if (pattern) parts.push(`pattern: ${pattern}`);
+        if (pitfall) parts.push(`pitfall: ${pitfall}`);
+        learning = parts.join(" | ");
+      }
+
       const cmd = ["ship", id];
       if (learning) cmd.push(`--learning=${learning}`);
       if (gh) cmd.push("--gh");
       result = wv(cmd, 60_000); // sync may be slow
-      if (!learning)
+      if (!learning && !decision && !pattern && !pitfall)
         result +=
           "\n\nWARNING: No learning captured. Consider: what decision, pattern, or pitfall should future sessions know?";
       break;

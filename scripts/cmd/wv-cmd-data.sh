@@ -1137,6 +1137,7 @@ cmd_learnings() {
     local min_quality=""
     local dedup=false
     local mode_arg=""
+    local show_all=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1149,6 +1150,7 @@ cmd_learnings() {
             --min-quality=*) min_quality="${1#*=}" ;;
             --dedup) dedup=true ;;
             --mode=*) mode_arg="${1#*=}" ;;
+            --all) show_all=true ;;
         esac
         shift
     done
@@ -1216,6 +1218,19 @@ cmd_learnings() {
             2>/dev/null || echo "$results")
     fi
 
+    # Filter junk/template learnings unless --all is specified
+    if [ "$show_all" != true ] && [ -n "$results" ] && [ "$results" != "[]" ]; then
+        results=$(echo "$results" | jq '
+            [.[] | select(
+                ((.metadata // "{}") | if type == "string" then fromjson else . end) as $m |
+                ($m.learning // "") |
+                (test("^closed via (gh|github) issue"; "i")
+                 or test("^knowledge captured"; "i")
+                 or test("^trivial fix$"; "i")
+                 or test("^$")) | not
+            )]' 2>/dev/null || echo "$results")
+    fi
+
     # Handle --dedup mode: find similar learnings
     if [ "$dedup" = true ]; then
         _learnings_dedup "$results" "$format"
@@ -1258,24 +1273,55 @@ cmd_learnings() {
     fi
 }
 
-# _learnings_format_text — Fast output path (single jq call, no DB queries)
+# _learnings_format_text — Compact token-optimised output (single jq call)
+# Parses inline markers (decision:/pattern:/pitfall:) from the learning field.
+# Uses top-level metadata keys if present, falls back to inline parsing.
 _learnings_format_text() {
     local results="$1"
-    local _cyan _green _yellow _nc
-    printf -v _cyan '%b' "$CYAN"
+    local _green _yellow _cyan _nc
     printf -v _green '%b' "$GREEN"
     printf -v _yellow '%b' "$YELLOW"
+    printf -v _cyan '%b' "$CYAN"
     printf -v _nc '%b' "$NC"
-    echo "$results" | jq -r --arg CYAN "$_cyan" --arg GREEN "$_green" \
-        --arg YELLOW "$_yellow" --arg NC "$_nc" '
+    echo "$results" | jq -r --arg G "$_green" --arg Y "$_yellow" \
+        --arg C "$_cyan" --arg N "$_nc" '
         .[] |
-        .id as $id | .text as $text | .status as $status |
+        .id as $id | .text as $text |
         ((.metadata // "{}") | if type == "string" then fromjson else . end) as $m |
-        ($CYAN + $id + $NC + " [" + $status + "]: " + $text),
-        (if $m.decision then "  " + $GREEN + "Decision:" + $NC + " " + $m.decision else empty end),
-        (if $m.pattern  then "  " + $GREEN + "Pattern:"  + $NC + "  " + $m.pattern  else empty end),
-        (if $m.pitfall  then "  " + $YELLOW + "Pitfall:"  + $NC + "  " + $m.pitfall  else empty end),
-        (if $m.learning then "  " + $CYAN + "Learning:" + $NC + " " + $m.learning else empty end),
+
+        # Use top-level keys if present, else parse inline markers from learning
+        ($m.decision // null) as $td |
+        ($m.pattern // null) as $tp |
+        ($m.pitfall // null) as $tpi |
+        ($m.learning // "") as $raw |
+
+        (if ($td or $tp or $tpi) then
+          {decision: $td, pattern: $tp, pitfall: $tpi, note: null}
+        elif ($raw | test("^(decision|pattern|pitfall):"; "i")) then
+          ($raw | split(" | ") | reduce .[] as $seg (
+            {};
+            if ($seg | test("^decision:"; "i")) then .decision = ($seg | sub("^decision:\\s*"; ""; "i"))
+            elif ($seg | test("^pattern:"; "i")) then .pattern = ($seg | sub("^pattern:\\s*"; ""; "i"))
+            elif ($seg | test("^pitfall:"; "i")) then .pitfall = ($seg | sub("^pitfall:\\s*"; ""; "i"))
+            else
+              if .pitfall then .pitfall = .pitfall + " | " + $seg
+              elif .pattern then .pattern = .pattern + " | " + $seg
+              elif .decision then .decision = .decision + " | " + $seg
+              else .note = ((.note // "") + (if .note then " | " else "" end) + $seg)
+              end
+            end
+          ))
+        elif ($raw | length > 0) then
+          {note: $raw}
+        else
+          {}
+        end) as $p |
+
+        ($C + $id + $N + ": " + ($text | .[0:72])),
+        (if $p.decision then "  " + $G + "Decision:" + $N + " " + $p.decision else empty end),
+        (if $p.pattern  then "  " + $G + "Pattern:"  + $N + "  " + $p.pattern  else empty end),
+        (if $p.pitfall  then "  " + $Y + "Pitfall:"  + $N + "  " + $p.pitfall  else empty end),
+        (if $p.note     then "  Note: " + $p.note else empty end),
         ""
     ' 2>/dev/null
 }
@@ -1284,24 +1330,47 @@ _learnings_format_text() {
 _learnings_format_graph() {
     local results="$1"
     echo "$results" | jq -c '.[]' | while read -r row; do
-        # Extract all fields in one jq call (1 process instead of 9)
+        # Extract all fields in one jq call, parsing inline markers from learning
         eval "$(echo "$row" | jq -r '
             .id as $id | .text as $text | .status as $status |
             ((.metadata // "{}") | if type == "string" then fromjson else . end) as $m |
+            ($m.decision // null) as $td |
+            ($m.pattern // null) as $tp |
+            ($m.pitfall // null) as $tpi |
+            ($m.learning // "") as $raw |
+            (if ($td or $tp or $tpi) then
+              {d: ($td // ""), p: ($tp // ""), pi: ($tpi // ""), n: ""}
+            elif ($raw | test("^(decision|pattern|pitfall):"; "i")) then
+              ($raw | split(" | ") | reduce .[] as $seg (
+                {d:"",p:"",pi:"",n:""};
+                if ($seg | test("^decision:"; "i")) then .d = ($seg | sub("^decision:\\s*"; ""; "i"))
+                elif ($seg | test("^pattern:"; "i")) then .p = ($seg | sub("^pattern:\\s*"; ""; "i"))
+                elif ($seg | test("^pitfall:"; "i")) then .pi = ($seg | sub("^pitfall:\\s*"; ""; "i"))
+                else
+                  if (.pi | length > 0) then .pi = .pi + " | " + $seg
+                  elif (.p | length > 0) then .p = .p + " | " + $seg
+                  elif (.d | length > 0) then .d = .d + " | " + $seg
+                  else .n = (if (.n | length > 0) then .n + " | " else "" end) + $seg
+                  end
+                end
+              ))
+            else
+              {d:"",p:"",pi:"",n:$raw}
+            end) as $parsed |
             "id=" + ($id | @sh) +
             " text=" + ($text | @sh) +
             " status=" + ($status | @sh) +
-            " decision=" + (($m.decision // "") | @sh) +
-            " pattern=" + (($m.pattern // "") | @sh) +
-            " pitfall=" + (($m.pitfall // "") | @sh) +
-            " learning_note=" + (($m.learning // "") | @sh)
+            " decision=" + ($parsed.d | @sh) +
+            " pattern=" + ($parsed.p | @sh) +
+            " pitfall=" + ($parsed.pi | @sh) +
+            " learning_note=" + ($parsed.n | @sh)
         ' 2>/dev/null)"
 
-        echo -e "${CYAN}$id${NC} [$status]: $text"
+        echo -e "${CYAN}$id${NC}: $text"
         [ -n "$decision" ] && echo -e "  ${GREEN}Decision:${NC} $decision"
         [ -n "$pattern" ]  && echo -e "  ${GREEN}Pattern:${NC}  $pattern"
         [ -n "$pitfall" ]  && echo -e "  ${YELLOW}Pitfall:${NC}  $pitfall"
-        [ -n "$learning_note" ] && echo -e "  ${CYAN}Learning:${NC} $learning_note"
+        [ -n "$learning_note" ] && echo -e "  Note: $learning_note"
 
         # Check for addresses edges (outbound)
         local addresses_edges

@@ -560,11 +560,31 @@ _done_store_learning() {
         return 0
     fi
 
-    # Merge learning into node metadata
+    # Merge learning into node metadata, parsing inline markers into top-level keys
     local cur_meta
     cur_meta=$(_done_read_metadata "$id")
     local new_meta
-    new_meta=$(echo "$cur_meta" | jq --arg l "$learning" '. + {learning: $l}' 2>/dev/null || echo "$cur_meta")
+    new_meta=$(echo "$cur_meta" | jq --arg l "$learning" '
+        # Store raw learning string
+        . + {learning: $l} |
+        # Parse inline markers (decision:/pattern:/pitfall:) into top-level keys
+        if ($l | test("^(decision|pattern|pitfall):"; "i")) then
+          ($l | split(" | ") | reduce .[] as $seg (
+            {};
+            if ($seg | test("^decision:"; "i")) then .decision = ($seg | sub("^decision:\\s*"; ""; "i"))
+            elif ($seg | test("^pattern:"; "i")) then .pattern = ($seg | sub("^pattern:\\s*"; ""; "i"))
+            elif ($seg | test("^pitfall:"; "i")) then .pitfall = ($seg | sub("^pitfall:\\s*"; ""; "i"))
+            else
+              if .pitfall then .pitfall = .pitfall + " | " + $seg
+              elif .pattern then .pattern = .pattern + " | " + $seg
+              elif .decision then .decision = .decision + " | " + $seg
+              else .
+              end
+            end
+          )) as $parsed |
+          . + ($parsed | to_entries | map(select(.value != null and .value != "")) | from_entries)
+        else . end
+    ' 2>/dev/null || echo "$cur_meta")
     new_meta="${new_meta//\'/\'\'}"
     db_query "UPDATE nodes SET metadata='$new_meta', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
     score_learning "$id" 2>/dev/null || true

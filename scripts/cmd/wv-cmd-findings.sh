@@ -135,28 +135,26 @@ cmd_findings_list() {
     local count=0
     while IFS='|' read -r id status fixable confidence violation_type text has_fix; do
         count=$((count + 1))
-        # Badge for fixable/not-fixable
+        # Fixable badge (compact)
         local fix_badge
         if [ "$fixable" = "1" ]; then
-            fix_badge="${GREEN}fixable${NC}"
+            fix_badge="fixable"
         else
-            fix_badge="${YELLOW}not-fixable${NC}"
+            fix_badge="not-fixable"
         fi
-        # Badge for has-fix in progress
+        # Fix-in-progress indicator
         local fix_status=""
-        [ "$has_fix" = "1" ] && fix_status=" ${CYAN}[fix in progress]${NC}"
-        # Confidence colouring
+        [ "$has_fix" = "1" ] && fix_status=" [FIX]"
+        # Confidence (compact)
         local conf_str="${confidence:-?}"
-        [ "$conf_str" = "high" ]   && conf_str="${GREEN}high${NC}"
-        [ "$conf_str" = "medium" ] && conf_str="${YELLOW}medium${NC}"
-        [ "$conf_str" = "low" ]    && conf_str="${RED}low${NC}"
         local vtype="${violation_type:-unknown}"
-        # Truncate text after "Finding: " prefix, respecting terminal width
+        # Strip "Finding: " prefix and truncate to 72 chars
         local display_text
-        local _term_w
-        _term_w=$(tput cols 2>/dev/null || echo 120)
-        display_text=$(echo "$text" | sed 's/^Finding: //' | cut -c1-$((_term_w - 4)))
-        echo -e "${CYAN}$id${NC} [$status] $fix_badge conf=$conf_str  ${vtype}${fix_status}"
+        display_text=$(echo "$text" | sed 's/^[Ff]inding: //' | cut -c1-72)
+        # Status only shown if not done
+        local status_tag=""
+        [ "$status" != "done" ] && status_tag=" [$status]"
+        echo -e "${CYAN}$id${NC}${status_tag} $fix_badge conf=$conf_str $vtype${fix_status}"
         echo -e "  $display_text"
     done <<< "$rows"
 

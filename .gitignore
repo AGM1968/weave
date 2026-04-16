@@ -26,3 +26,4 @@ Thumbs.db
 !.weave/nodes.jsonl
 !.weave/edges.jsonl
 .weave/
+node_modules/
