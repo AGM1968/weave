@@ -2,6 +2,19 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.38.1] - 2026-04-16
+
+### Fixed
+
+- **Learnings duplicate storage**: Structured learnings (`decision:`/`pattern:`/`pitfall:`) no longer
+  store a redundant raw `learning` key — halves token cost in JSON output.
+- **MCP merge logic**: When both raw learning and typed params are provided via MCP tools
+  (`weave_done`/`weave_batch_done`/`weave_ship`), raw learning is now appended as context instead of
+  silently dropped.
+- **Empty pipe segments**: Consecutive pipes (`| | |`) in learning strings are collapsed via
+  `until()` loop before splitting, and all segments are trimmed — prevents ghost entries in parsed
+  metadata.
+
 ## [1.38.0] - 2026-04-15
 
 ### Added

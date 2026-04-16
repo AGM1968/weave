@@ -565,13 +565,12 @@ _done_store_learning() {
     cur_meta=$(_done_read_metadata "$id")
     local new_meta
     new_meta=$(echo "$cur_meta" | jq --arg l "$learning" '
-        # Store raw learning string
-        . + {learning: $l} |
         # Parse inline markers (decision:/pattern:/pitfall:) into top-level keys
         # Normalize semicolons before markers to pipes for consistent splitting
-        ($l | gsub(";\\s*(?<m>(decision|pattern|pitfall):)"; " | \(.m)"; "i")) as $norm |
+        ($l | gsub(";\\s*(?<m>(decision|pattern|pitfall):)"; " | \(.m)"; "i")
+            | until(test("\\|\\s*\\|") | not; gsub("\\|\\s*\\|"; "|"))) as $norm |
         if ($norm | test("^(decision|pattern|pitfall):"; "i")) then
-          ($norm | split(" | ") | map(select(length > 0)) | reduce .[] as $seg (
+          ($norm | split(" | ") | map(select(length > 0) | gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | reduce .[] as $seg (
             {};
             if ($seg | test("^decision:"; "i")) then .decision = ($seg | sub("^decision:\\s*"; ""; "i"))
             elif ($seg | test("^pattern:"; "i")) then .pattern = ($seg | sub("^pattern:\\s*"; ""; "i"))
@@ -584,8 +583,12 @@ _done_store_learning() {
               end
             end
           )) as $parsed |
+          # When structured keys are extracted, omit the raw learning to avoid duplication
           . + ($parsed | to_entries | map(select(.value != null and .value != "")) | from_entries)
-        else . end
+        else
+          # No structured markers — store as raw learning
+          . + {learning: $l}
+        end
     ' 2>/dev/null || echo "$cur_meta")
     new_meta="${new_meta//\'/\'\'}"
     db_query "UPDATE nodes SET metadata='$new_meta', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"

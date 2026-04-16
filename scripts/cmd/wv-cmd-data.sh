@@ -1298,8 +1298,9 @@ _learnings_format_text() {
         (if ($td or $tp or $tpi) then
           {decision: $td, pattern: $tp, pitfall: $tpi, note: null}
         elif ($raw | test("^(decision|pattern|pitfall):"; "i")) then
-          ($raw | gsub(";\\s*(?<m>(decision|pattern|pitfall):)"; " | \(.m)"; "i")) as $norm |
-          ($norm | split(" | ") | map(select(length > 0)) | reduce .[] as $seg (
+          ($raw | gsub(";\\s*(?<m>(decision|pattern|pitfall):)"; " | \(.m)"; "i")
+               | until(test("\\|\\s*\\|") | not; gsub("\\|\\s*\\|"; "|"))) as $norm |
+          ($norm | split(" | ") | map(select(length > 0) | gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | reduce .[] as $seg (
             {};
             if ($seg | test("^decision:"; "i")) then .decision = ($seg | sub("^decision:\\s*"; ""; "i"))
             elif ($seg | test("^pattern:"; "i")) then .pattern = ($seg | sub("^pattern:\\s*"; ""; "i"))
@@ -1342,8 +1343,9 @@ _learnings_format_graph() {
             (if ($td or $tp or $tpi) then
               {d: ($td // ""), p: ($tp // ""), pi: ($tpi // ""), n: ""}
             elif ($raw | test("^(decision|pattern|pitfall):"; "i")) then
-              ($raw | gsub(";\\s*(?<m>(decision|pattern|pitfall):)"; " | \(.m)"; "i")) as $norm |
-              ($norm | split(" | ") | map(select(length > 0)) | reduce .[] as $seg (
+              ($raw | gsub(";\\s*(?<m>(decision|pattern|pitfall):)"; " | \(.m)"; "i")
+                   | until(test("\\|\\s*\\|") | not; gsub("\\|\\s*\\|"; "|"))) as $norm |
+              ($norm | split(" | ") | map(select(length > 0) | gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | reduce .[] as $seg (
                 {d:"",p:"",pi:"",n:""};
                 if ($seg | test("^decision:"; "i")) then .d = ($seg | sub("^decision:\\s*"; ""; "i"))
                 elif ($seg | test("^pattern:"; "i")) then .p = ($seg | sub("^pattern:\\s*"; ""; "i"))

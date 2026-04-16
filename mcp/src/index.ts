@@ -1041,13 +1041,14 @@ function handleTool(
       const noOverlapCheck = args.no_overlap_check as boolean | undefined;
 
       // Compose pipe-delimited learning string from typed params
-      // Typed params take precedence; raw learning used as fallback
+      // Merge: typed params compose structured prefix; raw learning appended as context
       if (decision || pattern || pitfall) {
         const parts: string[] = [];
         if (decision) parts.push(`decision: ${decision}`);
         if (pattern) parts.push(`pattern: ${pattern}`);
         if (pitfall) parts.push(`pitfall: ${pitfall}`);
-        learning = parts.join(" | ");
+        const structured = parts.join(" | ");
+        learning = learning ? `${structured} | ${learning}` : structured;
       }
 
       const cmd = ["done", id];
@@ -1074,7 +1075,8 @@ function handleTool(
         if (decision) parts.push(`decision: ${decision}`);
         if (pattern) parts.push(`pattern: ${pattern}`);
         if (pitfall) parts.push(`pitfall: ${pitfall}`);
-        learning = parts.join(" | ");
+        const structured = parts.join(" | ");
+        learning = learning ? `${structured} | ${learning}` : structured;
       }
 
       const cmd = ["batch-done", ...ids];
@@ -1156,13 +1158,14 @@ function handleTool(
       const gh = args.gh as boolean | undefined;
 
       // Compose pipe-delimited learning string from typed params
-      // Typed params take precedence; raw learning used as fallback
+      // Merge: typed params compose structured prefix; raw learning appended as context
       if (decision || pattern || pitfall) {
         const parts: string[] = [];
         if (decision) parts.push(`decision: ${decision}`);
         if (pattern) parts.push(`pattern: ${pattern}`);
         if (pitfall) parts.push(`pitfall: ${pitfall}`);
-        learning = parts.join(" | ");
+        const structured = parts.join(" | ");
+        learning = learning ? `${structured} | ${learning}` : structured;
       }
 
       const cmd = ["ship", id];
@@ -1614,7 +1617,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.38.0",
+      version: "1.38.1",
     },
     {
       capabilities: {
