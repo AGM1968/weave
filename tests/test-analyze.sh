@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-analyze.sh — Tests for wv analyze sessions --token-hogs
+# test-analyze.sh — Tests for wv analyze sessions --call-stats
 # Weave-ID: wv-ad7df8
 
 set -e
@@ -56,7 +56,7 @@ trap 'rm -f "$LOG"' EXIT
 
 # Write 3 synthetic entries: wv show (largest), wv status, wv ready
 cat >"$LOG" <<'EOF'
-{"ts":1000000000.0,"cmd":"wv show","stdout_bytes":9000,"stderr_bytes":0,"elapsed_ms":80}
+{"ts":1000000000.0,"cmd":"wv show","stdout_bytes":9000,"stderr_bytes":500,"elapsed_ms":80}
 {"ts":1000000001.0,"cmd":"wv status","stdout_bytes":100,"stderr_bytes":0,"elapsed_ms":15}
 {"ts":1000000002.0,"cmd":"wv ready","stdout_bytes":4500,"stderr_bytes":0,"elapsed_ms":30}
 {"ts":1000000003.0,"cmd":"wv show","stdout_bytes":8000,"stderr_bytes":0,"elapsed_ms":75}
@@ -64,24 +64,24 @@ EOF
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════════════════"
-echo "  wv analyze sessions -- token-hogs"
+echo "  wv analyze sessions --call-stats"
 echo "═══════════════════════════════════════════════════════════════════════════"
 echo ""
 
 # ───────────────────────────────────────────────────────────────────────────
 # Test 1: basic output contains top command
 # ───────────────────────────────────────────────────────────────────────────
-output=$($WV analyze sessions --token-hogs --log="$LOG" 2>&1)
+output=$($WV analyze sessions --call-stats --log="$LOG" 2>&1)
 assert_contains "$output" "wv show" "top command 'wv show' appears in output"
 
 # ───────────────────────────────────────────────────────────────────────────
-# Test 2: aggregation — wv show has 2 calls totalling 17000 bytes
+# Test 2: aggregation — wv show has 2 calls totalling 17500 bytes
 # ───────────────────────────────────────────────────────────────────────────
-output=$($WV analyze sessions --token-hogs --log="$LOG" 2>&1)
-assert_contains "$output" "17000" "wv show bytes aggregated correctly (2 calls * ~8500 avg = 17000)"
+output=$($WV analyze sessions --call-stats --log="$LOG" 2>&1)
+assert_contains "$output" "17500" "wv show bytes aggregated correctly (9000+500+8000 = 17500)"
 
 # ───────────────────────────────────────────────────────────────────────────
-# Test 3: ordering — wv show before wv ready (17000 > 4500)
+# Test 3: ordering — wv show before wv ready (17500 > 4500)
 # Output may be single-line JSON, so check string position within line
 # ───────────────────────────────────────────────────────────────────────────
 show_pos=$(echo "$output" | tr ',' '\n' | grep -n '"wv show"' | head -1 | cut -d: -f1)
@@ -98,7 +98,7 @@ TESTS_RUN=$((TESTS_RUN + 1))
 # ───────────────────────────────────────────────────────────────────────────
 # Test 4: --top=1 limits output to single entry
 # ───────────────────────────────────────────────────────────────────────────
-output=$($WV analyze sessions --token-hogs --log="$LOG" --top=1 2>&1)
+output=$($WV analyze sessions --call-stats --log="$LOG" --top=1 2>&1)
 assert_contains "$output" "wv show" "--top=1 includes top entry"
 assert_not_contains "$output" "wv status" "--top=1 excludes lower entries"
 
@@ -107,14 +107,26 @@ assert_not_contains "$output" "wv status" "--top=1 excludes lower entries"
 # Output varies by mode (JSON in discover/bootstrap, human text otherwise),
 # but both paths include "no call log found".
 # ───────────────────────────────────────────────────────────────────────────
-output=$($WV analyze sessions --token-hogs --log=/nonexistent/path.jsonl 2>&1 || true)
+output=$($WV analyze sessions --call-stats --log=/nonexistent/path.jsonl 2>&1 || true)
 assert_contains "$output" "no call log found" "missing log shows informative message"
 
 # ───────────────────────────────────────────────────────────────────────────
 # Test 6: WV_CALL_LOG env var picked up as default log path
 # ───────────────────────────────────────────────────────────────────────────
-output=$(WV_CALL_LOG="$LOG" $WV analyze sessions --token-hogs 2>&1)
+output=$(WV_CALL_LOG="$LOG" $WV analyze sessions --call-stats 2>&1)
 assert_contains "$output" "wv show" "WV_CALL_LOG env var used as default log"
+
+# ───────────────────────────────────────────────────────────────────────────
+# Test 7: --token-hogs still accepted as backwards-compat alias
+# ───────────────────────────────────────────────────────────────────────────
+output=$($WV analyze sessions --token-hogs --log="$LOG" 2>&1)
+assert_contains "$output" "wv show" "--token-hogs alias still works"
+
+# ───────────────────────────────────────────────────────────────────────────
+# Test 8: approx_tokens field present in JSON output
+# ───────────────────────────────────────────────────────────────────────────
+output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$LOG" 2>&1)
+assert_contains "$output" "approx_tokens" "approx_tokens field in JSON output"
 
 echo ""
 

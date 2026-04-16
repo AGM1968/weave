@@ -9,8 +9,8 @@
 - **WV_CALL_LOG instrumentation**: Set `export WV_CALL_LOG=~/.local/share/weave/wv_calls.jsonl` to
   record every `wv` invocation with `{ts, cmd, stdout_bytes, stderr_bytes, elapsed_ms}`. Zero
   overhead when unset.
-- **`wv analyze sessions --token-hogs`**: Reads the call log and ranks commands by byte output —
-  surfaces which `wv` commands inject the most tokens into agent context.
+- **`wv analyze sessions --call-stats`**: Reads the call log and ranks commands by output volume —
+  surfaces which `wv` commands consume the most context. `--token-hogs` kept as backwards-compat alias.
 - **WEAVE.md §8.3 Call Instrumentation**: Docs covering enable, log format, and analyze usage.
 
 ### Fixed

@@ -25,3 +25,4 @@ Thumbs.db
 !.weave/state.sql
 !.weave/nodes.jsonl
 !.weave/edges.jsonl
+.weave/

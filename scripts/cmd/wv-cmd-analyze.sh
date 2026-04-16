@@ -2,7 +2,7 @@
 # wv-cmd-analyze.sh — wv analyze subcommand
 #
 # Usage:
-#   wv analyze sessions --token-hogs [--log=<path>] [--top=N]
+#   wv analyze sessions --call-stats [--log=<path>] [--top=N]
 #
 # Reads a JSONL call log produced by WvClient(call_log_path=...) and surfaces
 # the wv subcommands consuming the most stdout+stderr bytes.
@@ -19,7 +19,7 @@ cmd_analyze() {
             echo "Usage: wv analyze <subcommand> [options]"
             echo ""
             echo "Subcommands:"
-            echo "  sessions --token-hogs   Show top wv commands by byte output"
+            echo "  sessions --call-stats   Show top wv commands by byte output"
             ;;
         *)
             echo "wv analyze: unknown subcommand: $sub" >&2
@@ -37,11 +37,11 @@ cmd_analyze_sessions() {
 
     for arg in "$@"; do
         case "$arg" in
-            --token-hogs) ;;   # primary mode flag — accepted, no-op (only mode for now)
+            --call-stats|--token-hogs) ;;   # primary mode flag — accepted, no-op (only mode for now)
             --log=*)      log_path="${arg#--log=}" ;;
             --top=*)      top_n="${arg#--top=}" ;;
             --help|-h)
-                echo "Usage: wv analyze sessions --token-hogs [--log=<path>] [--top=N]"
+                echo "Usage: wv analyze sessions --call-stats [--log=<path>] [--top=N]"
                 echo ""
                 echo "  --log=<path>   JSONL call log (default: ~/.local/share/weave/wv_calls.jsonl)"
                 echo "  --top=N        Show top N commands (default: 10)"
@@ -55,7 +55,7 @@ cmd_analyze_sessions() {
 
     if [ ! -f "$log_path" ]; then
         if [ "$mode" = "discover" ] || [ "$mode" = "bootstrap" ]; then
-            echo '{"token_hogs":[],"message":"no call log found","log_path":"'"$log_path"'"}'
+            echo '{"call_stats":[],"message":"no call log found","log_path":"'"$log_path"'"}'
         else
             echo "No call log found at: $log_path"
             echo "Enable instrumentation:"
@@ -96,7 +96,7 @@ except OSError as exc:
     sys.exit(1)
 
 ranked = sorted(totals.items(), key=lambda x: x[1]["total_bytes"], reverse=True)[:top_n]
-print(json.dumps([{"cmd": cmd, **stats} for cmd, stats in ranked]))
+print(json.dumps([{"cmd": cmd, "approx_tokens": stats["total_bytes"] // 4, **stats} for cmd, stats in ranked]))
 PYEOF
     ) || return 1
 
@@ -113,16 +113,17 @@ PYEOF
         return 0
     fi
 
-    printf "\n${CYAN}Top %s wv commands by byte output${NC}\n" "$top_n"
-    printf "${DIM}%-28s %10s %8s %10s${NC}\n" "COMMAND" "BYTES" "CALLS" "AVG_MS"
-    echo "$(printf '%0.s─' {1..60})"
+    printf "\n${CYAN}Top %s wv commands by output volume${NC}\n" "$top_n"
+    printf "${DIM}%-24s %10s %10s %8s %10s${NC}\n" "COMMAND" "BYTES" "~TOKENS" "CALLS" "AVG_MS"
+    echo "$(printf '%0.s─' {1..66})"
 
     echo "$result" | python3 -c "
 import json, sys
 rows = json.load(sys.stdin)
 for r in rows:
     avg_ms = r['total_ms'] // r['calls'] if r['calls'] else 0
-    print(f\"{r['cmd']:<28} {r['total_bytes']:>10,} {r['calls']:>8} {avg_ms:>10}\")
+    tokens = r.get('approx_tokens', r['total_bytes'] // 4)
+    print(f\"{r['cmd']:<24} {r['total_bytes']:>10,} {tokens:>10,} {r['calls']:>8} {avg_ms:>10}\")
 "
     printf "\nLog: %s\n" "$log_path"
 }
