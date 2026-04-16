@@ -1218,16 +1218,23 @@ cmd_learnings() {
             2>/dev/null || echo "$results")
     fi
 
-    # Filter junk/template learnings unless --all is specified
+    # Filter junk/template learnings unless --all is specified.
+    # Nodes with structured keys (decision/pattern/pitfall) but no raw learning
+    # key are always kept — the junk filter only applies to the raw learning string.
     if [ "$show_all" != true ] && [ -n "$results" ] && [ "$results" != "[]" ]; then
         results=$(echo "$results" | jq '
             [.[] | select(
                 ((.metadata // "{}") | if type == "string" then fromjson else . end) as $m |
-                ($m.learning // "") |
-                (test("^closed via (gh|github) issue"; "i")
-                 or test("^knowledge captured"; "i")
-                 or test("^trivial fix$"; "i")
-                 or test("^$")) | not
+                if (($m.decision // "") != "" or ($m.pattern // "") != "" or ($m.pitfall // "") != "")
+                   and ($m.learning // "") == ""
+                then true  # structured-only: always keep
+                else
+                    ($m.learning // "") |
+                    (test("^closed via (gh|github) issue"; "i")
+                     or test("^knowledge captured"; "i")
+                     or test("^trivial fix$"; "i")
+                     or test("^$")) | not
+                end
             )]' 2>/dev/null || echo "$results")
     fi
 
@@ -1916,6 +1923,61 @@ cmd_import() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# _build_fts_expr — Build FTS5 MATCH expression from a query string
+# ═══════════════════════════════════════════════════════════════════════════
+# Single-word: text:"word"  (phrase match)
+# Multi-word:  text:word1 OR text:word2 OR ...  (token match, BM25 ranked)
+# Strips punctuation, stopwords, and short tokens for better recall.
+
+_build_fts_expr() {
+    local raw="$1"
+    # Strip characters that break FTS5 syntax (dots, parens, colons, slashes, quotes, etc.)
+    local cleaned
+    cleaned=$(printf '%s' "$raw" | sed 's/[^a-zA-Z0-9 ]/ /g; s/  */ /g; s/^ //; s/ $//')
+
+    # Split into words, filter stopwords and short tokens (<3 chars)
+    local words=()
+    local w
+    for w in $cleaned; do
+        # Lowercase for matching
+        local lw
+        lw=$(printf '%s' "$w" | tr '[:upper:]' '[:lower:]')
+        # Skip stopwords and tokens < 3 chars
+        case "$lw" in
+            the|and|for|with|from|into|that|this|are|was|has|have|not|but|all|can|will|its) continue ;;
+        esac
+        if [ ${#lw} -lt 3 ]; then continue; fi
+        words+=("$lw")
+    done
+
+    if [ ${#words[@]} -eq 0 ]; then
+        # Fallback: use raw query as phrase match
+        local safe="${raw//\"/\"\"}"
+        safe="${safe//\'/\'\'}"
+        printf 'text:"%s"' "$safe"
+        return
+    fi
+
+    if [ ${#words[@]} -eq 1 ]; then
+        # Single word: phrase match (exact)
+        printf 'text:"%s"' "${words[0]}"
+        return
+    fi
+
+    # Multi-word: OR-separated token match, cap at 12 tokens to keep query fast
+    local expr="" i=0
+    for w in "${words[@]}"; do
+        if [ $i -ge 12 ]; then break; fi
+        if [ -n "$expr" ]; then expr="$expr OR "; fi
+        expr="${expr}text:${w}"
+        i=$((i + 1))
+    done
+    # Escape single quotes for SQL embedding
+    expr="${expr//\'/\'\'}"
+    printf '%s' "$expr"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # cmd_search — Full-text search nodes using FTS5
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1954,27 +2016,28 @@ cmd_search() {
         db_reindex_fts5 >/dev/null 2>&1 || true
     fi
 
-    # Escape for FTS5: wrap in double quotes for safe phrase matching.
-    # This prevents apostrophes and special FTS5 operators from causing syntax errors.
-    # Internal double quotes are escaped by doubling them.
-    local safe_query="${query//\"/\"\"}"
-    # Also escape single quotes for the outer SQL string
-    safe_query="${safe_query//\'/\'\'}"
+    # Build FTS5 match expression from query.
+    # Single-word queries use phrase match; multi-word queries use OR-separated
+    # tokens so that "define Middleware protocol" matches nodes containing any
+    # of those words (ranked by BM25 relevance).  This is critical for
+    # programmatic callers like _related_learnings that pass full node text.
+    local fts_expr
+    fts_expr=$(_build_fts_expr "$query")
 
     # Build status filter clause
     local status_clause=""
     if [ -n "$status_filter" ]; then
-        status_clause="AND n.status = '$status_filter'"
+        local safe_status="${status_filter//\'/\'\'}"
+        status_clause="AND n.status = '$safe_status'"
     fi
 
     # FTS5 search with BM25 ranking (search text column only)
-    # Query wrapped in double quotes for safe phrase matching
     local sql="
         SELECT n.id, n.text, n.status,
                bm25(nodes_fts, 0.0, 1.0, 0.0) AS rank
         FROM nodes_fts f
         JOIN nodes n ON f.rowid = n.rowid
-        WHERE nodes_fts MATCH 'text:\"$safe_query\"'
+        WHERE nodes_fts MATCH '$fts_expr'
         $status_clause
         ORDER BY rank
         LIMIT $limit;
@@ -1987,7 +2050,7 @@ cmd_search() {
                    bm25(nodes_fts, 0.0, 1.0, 0.0) AS rank
             FROM nodes_fts f
             JOIN nodes n ON f.rowid = n.rowid
-            WHERE nodes_fts MATCH 'text:\"$safe_query\"'
+            WHERE nodes_fts MATCH '$fts_expr'
             $status_clause
             ORDER BY rank
             LIMIT $limit;

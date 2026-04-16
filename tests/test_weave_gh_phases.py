@@ -822,6 +822,18 @@ class TestBackfillGhIssue:
         mock_run.assert_not_called()
         assert node.metadata.get("gh_issue") is None
 
+    def test_done_only_duplicate_is_silent(self) -> None:
+        """Historical done-only duplicates should skip backfill without warning."""
+        node = _node("wv-newdone", status="done")
+        other = _node("wv-olddone", status="done", gh_issue=99)
+        with patch("weave_gh.phases._run") as mock_run, patch(
+            "weave_gh.phases.log.warning"
+        ) as warn:
+            _backfill_gh_issue(node, 99, all_nodes=[node, other])
+        mock_run.assert_not_called()
+        warn.assert_not_called()
+        assert node.metadata.get("gh_issue") is None
+
     def test_backfill_updates_in_memory(self) -> None:
         """Successful backfill updates node.metadata['gh_issue'] in-memory."""
         node = _node("wv-new2")
@@ -1039,6 +1051,42 @@ class TestHandleNewIssuePaths:
         assert stats.already_synced == 1
         assert stats.created_gh == 0
         assert len(backfill_calls) == 1
+
+    def test_done_only_title_match_duplicate_skips_silently(self) -> None:
+        """Historical done-only title duplicates should not emit title-match/backfill chatter."""
+        node = _node("wv-titl2", text="Existing task", status="done")
+        claimant = _node("wv-claim", text="Existing task", status="done", gh_issue=77)
+        existing = _issue(77, title="Existing task", labels=["weave-synced"])
+        stats = SyncStats()
+        backfill_calls: list[object] = []
+
+        with patch.multiple(
+            "weave_gh.phases",
+            get_edges_for_node=lambda _: [],
+            render_issue_body=lambda *_a, **_k: "",
+            get_labels_for_node=lambda _: [],
+            sync_issue_labels=lambda *_a, **_k: None,
+            gh_cli=lambda *_a, **_k: "",
+            _backfill_gh_issue=lambda *_a, **_k: backfill_calls.append(_a),
+        ), patch("weave_gh.phases.log.info") as info:
+            _handle_new_issue(
+                node,
+                nodes_by_id={},
+                issues=[existing],
+                issues_by_num={existing.number: existing},
+                issues_by_title={"Existing task": existing},
+                repo="owner/repo",
+                repo_url="https://github.com/owner/repo",
+                stats=stats,
+                all_nodes=[node, claimant],
+                dry_run=False,
+            )
+
+        assert stats.skipped == 1
+        assert stats.already_synced == 0
+        assert stats.created_gh == 0
+        assert not backfill_calls
+        assert not any("same title (weave-synced)" in str(call.args[0]) for call in info.call_args_list)
 
     def test_labels_passed_to_gh_cli_assignee_via_sync(self) -> None:
         """Labels are in gh issue create; assignee is synced post-creation, not in create args."""

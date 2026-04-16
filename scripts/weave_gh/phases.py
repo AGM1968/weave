@@ -152,6 +152,18 @@ def _sync_assignee(
 # ---------------------------------------------------------------------------
 
 
+def _existing_gh_issue_claimants(
+    node: WeaveNode,
+    gh_num: int,
+    *,
+    all_nodes: list[WeaveNode] | None = None,
+) -> list[WeaveNode]:
+    """Return other nodes that already claim a GH issue number."""
+    if all_nodes is None:
+        return []
+    return [n for n in all_nodes if n.gh_issue == gh_num and n.id != node.id]
+
+
 def _backfill_gh_issue(
     node: WeaveNode,
     gh_num: int,
@@ -169,8 +181,10 @@ def _backfill_gh_issue(
 
     # Dedup guard: check if another node already has this gh_issue
     if all_nodes is not None:
-        existing = [n for n in all_nodes if n.gh_issue == gh_num and n.id != node.id]
+        existing = _existing_gh_issue_claimants(node, gh_num, all_nodes=all_nodes)
         if existing:
+            if node.status == "done" and all(n.status == "done" for n in existing):
+                return
             log.warning(
                 "  ⚠️  Skipping backfill of gh_issue=%d to %s — already claimed by %s",
                 gh_num,
@@ -362,6 +376,14 @@ def _handle_new_issue(
     if node.text in issues_by_title:
         existing = issues_by_title[node.text]
         if "weave-synced" in existing.labels:
+            claimants = _existing_gh_issue_claimants(
+                node, existing.number, all_nodes=all_nodes
+            )
+            if node.status == "done" and claimants and all(
+                n.status == "done" for n in claimants
+            ):
+                stats.skipped += 1
+                return
             log.info(
                 "  ⏭ Skipping %s — GH #%d already has same title (weave-synced)",
                 node.id,

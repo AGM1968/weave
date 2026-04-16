@@ -2,6 +2,15 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.39.0] - 2026-04-16
+
+### Fixed
+
+- **Learnings junk filter**: Structured-only nodes (containing `decision:`/`pattern:`/`pitfall:` but
+  no raw `learning` key) no longer filtered as junk.
+- **FTS5 search**: Multi-word queries now use OR-token matching instead of phrase match, improving
+  recall for `wv search` and related learnings lookup.
+
 ## [1.38.1] - 2026-04-16
 
 ### Fixed
@@ -21,33 +30,42 @@
 
 - **WV_CALL_LOG instrumentation**: Set `export WV_CALL_LOG=~/.local/share/weave/wv_calls.jsonl` to
   record every `wv` invocation with `{ts, cmd, stdout_bytes, stderr_bytes, elapsed_ms}`. Zero
-  overhead when unset.
+  overhead when unset. Works alongside the Python runtime path (identical JSONL schema).
 - **`wv analyze sessions --call-stats`**: Reads the call log and ranks commands by output volume —
-  surfaces which `wv` commands consume the most context. `--token-hogs` kept as backwards-compat alias.
-- **WEAVE.md §8.3 Call Instrumentation**: Docs covering enable, log format, and analyze usage.
+  surfaces which `wv` commands inject the most tokens into agent context.
+- **WEAVE.md §8.3 Call Instrumentation**: Public docs covering enable/log format/analyze usage.
+- **`tests/test-analyze.sh`**: 7-test regression suite for `wv analyze sessions`.
 
 ### Fixed
 
 - **Context cache invalidation**: `invalidate_context_cache` deleted `${id}.json` but cache files
-  are named `${id}-${mode}.json` — stale cache was served after `wv link`, causing `wv context`
-  to return an empty finding block.
-- **`wv show` in discover mode**: `Intent:` field now renders in discover (non-tty/agentic) mode,
-  not only in execute/full mode.
+  are named `${id}-${mode}.json` — stale cache was served after `wv link` within the same second,
+  causing `wv context` to return an empty finding block.
+- **`wv show` in discover mode**: `Intent:` field now renders in `discover` (non-tty/agentic) mode,
+  not only in `execute`/full mode.
+- **Stop-hook test**: Updated for auto-push behavior (uses a deletable bare remote so push fails and
+  hard-block path is exercised).
+- **Context-guard test**: Relaxed assertion from `policy:` to `policy` — agent path emits
+  `policy=HIGH` (no colon), tty path emits `policy: HIGH`.
+- **Multi-agent replay test**: Manifest-skip behavior was removed in v1.20.0; test now asserts
+  idempotency (node count unchanged after double-load) rather than absence of "Replayed" message.
+- **`test-init-repo.sh` counter**: Two `else` branches incremented `TESTS_PASSED` without
+  `TESTS_RUN`, producing a spurious 58/57 summary; both now balanced.
 
 ## [1.37.4] - 2026-04-14
 
 ### Fixed
 
-- bash-dedup: two-phase lock (pending/running) prevents orphaned locks when
-  a PreToolUse hook hard-blocks a tool call (hooks run in parallel; PostToolUse
-  never fires for blocked tools)
-- bash-dedup: background task locks now auto-clear via fuser/lsof when the
-  subprocess completes, using `tool_response.backgroundTaskId` to locate the
-  task output file — no manual lock clearing or TTL wait required
-- bash-dedup: PostToolUse clears ALL matching lock keys for compound commands
+- bash-dedup: two-phase lock (pending/running) prevents orphaned locks when a PreToolUse hook
+  hard-blocks a tool call (hooks run in parallel; PostToolUse never fires for blocked tools)
+- bash-dedup: background task locks now auto-clear via fuser/lsof when the subprocess completes,
+  using `tool_response.backgroundTaskId` to locate the task output file — no manual lock clearing or
+  TTL wait required
+- bash-dedup: PostToolUse clears ALL matching lock keys (not just first match) for compound commands
+  matching multiple patterns
 - bash-dedup: SessionStart hook clears all stale locks from prior sessions
-- bash-dedup: reduced TTLs (wv-sync 300→60s, git-push 120→60s,
-  make-build 1800→600s, pytest 300→120s)
+- bash-dedup: reduced TTLs to realistic values (wv-sync 300→60s, git-push 120→60s, make-build
+  1800→600s, pytest 300→120s)
 
 ## [1.37.3] - 2026-04-14
 
@@ -68,8 +86,8 @@
   many hooks were updated vs already current.
 - **`wv doctor` hook drift message**: Now says `run: wv init-repo --update` instead of
   `run ./install.sh` — the correct command for repos without `install.sh` on PATH.
-- **`wv doctor --repair` handles hook drift**: Copies stale hooks from `~/.config/weave/hooks/`
-  into the project `.claude/hooks/` (pull direction). Clears drift in one step.
+- **`wv doctor --repair` handles hook drift**: Copies stale hooks from `~/.config/weave/hooks/` into
+  the project `.claude/hooks/` (pull direction). Clears drift in one step.
 
 ---
 
@@ -78,8 +96,8 @@
 ### Fixed
 
 - **`wv show --json-v2` mode trimming**: `current_intent` (session bootstrap blob, ~600 bytes) is
-  now stripped from metadata in bootstrap and discover modes. Execute/full mode retains it.
-  Non-tty and `WV_AGENT=1` callers automatically get the trimmed output without `--mode=` flag.
+  now stripped from metadata in bootstrap and discover modes. Execute/full mode retains it. Non-tty
+  and `WV_AGENT=1` callers automatically get the trimmed output without `--mode=` flag.
 - **`wv doctor` FTS5 integrity check**: `PRAGMA integrity_check` does not probe FTS5 shadow tables,
   so a corrupt FTS5 index could block all node writes while doctor reported healthy. Added a
   dedicated FTS5 probe (`integrity-check` special command) as check 10b. Added `wv doctor --repair`
@@ -110,6 +128,9 @@
   drifting from actual applied state. Delta replay is idempotent by design.
 - **`wv show` non-tty exit code**: `wv show` was returning exit 1 when a node had no learning, even
   when output was otherwise valid. Now exits 0 on success regardless of learning presence.
+- **`runtime/agent.py`: wire `call_log_path`**: `WvClient` now constructed with
+  `call_log_path=~/.local/share/weave/wv_calls.jsonl` so `wv analyze sessions --call-stats` has data
+  after an agent run.
 - **Pre-claim hook: collapse 4 `wv show` calls to 1**: `pre-claim-skills.sh` now captures node JSON
   once and extracts `text`, `done_criteria`, and `risks` from the single result. Removes dead
   `NODE_TYPE` variable that was read but never used.

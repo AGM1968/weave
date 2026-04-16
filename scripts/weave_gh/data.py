@@ -38,7 +38,15 @@ def get_weave_nodes() -> list[WeaveNode]:
     nodes = []
     for item in data:
         meta_raw = item.get("metadata") or {}
-        meta = meta_raw if isinstance(meta_raw, dict) else {}
+        if isinstance(meta_raw, dict):
+            meta = meta_raw
+        elif isinstance(meta_raw, str) and meta_raw.strip().startswith("{"):
+            try:
+                meta = json.loads(meta_raw)
+            except (json.JSONDecodeError, ValueError):
+                meta = {}
+        else:
+            meta = {}
         nodes.append(
             WeaveNode(
                 id=item["id"],
