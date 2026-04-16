@@ -88,7 +88,7 @@ Invalid scope "bogus". Valid: graph, session, lite, inspect, all
 
 ## Client Configuration
 
-### VS Code Copilot (`.vscode/mcp.json`)
+### VS Code Copilot (`.mcp.json`)
 
 The committed repo configuration currently registers **two servers**:
 - `weave` — full access (default, backward-compatible)
@@ -96,7 +96,7 @@ The committed repo configuration currently registers **two servers**:
 
 Additional scoped servers (`graph`, `session`, `lite`) are supported by the binary. `graph` and
 `session` remain the intended narrower surfaces for upcoming runtime-agent specialisation, but they
-are not part of the checked-in `.vscode/mcp.json` yet.
+are not part of the checked-in `.mcp.json` yet.
 
 ```jsonc
 {
@@ -173,8 +173,8 @@ Optional local additions if you want stricter scope isolation:
 | ------------------ | ------------------------------------------------------- | -------------------- |
 | `weave_add`        | Create a new node, returns generated ID                 | `text`               |
 | `weave_link`       | Create a semantic edge between two nodes                | `from`, `to`, `type` |
-| `weave_done`       | Mark a node as complete, optionally record a learning   | `id`                 |
-| `weave_batch_done` | Complete multiple nodes at once                         | `ids`                |
+| `weave_done`       | Mark a node as complete, optionally record a learning. Accepts `learning` (raw string) and/or typed `decision`/`pattern`/`pitfall` params — when both are provided, raw is appended after structured params   | `id`                 |
+| `weave_batch_done` | Complete multiple nodes at once. Same learning merge behavior as `weave_done` | `ids`                |
 | `weave_update`     | Modify node metadata, status, text, or alias            | `id`                 |
 | `weave_list`       | List nodes with optional status/all filters             | —                    |
 | `weave_resolve`    | Resolve conflicting nodes (winner/merge/defer strategy) | `ids`, `strategy`    |
@@ -185,7 +185,7 @@ Optional local additions if you want stricter scope isolation:
 | Tool                  | Description                                           | Required params |
 | --------------------- | ----------------------------------------------------- | --------------- |
 | `weave_work`          | Claim a node, sets WV_ACTIVE for subagent inheritance | `id`            |
-| `weave_ship`          | Complete node + sync to git layer in one step         | `id`            |
+| `weave_ship`          | Complete node + sync in one step. Same learning merge as `weave_done` | `id`            |
 | `weave_recover`       | Resume incomplete ship/sync/delete operations         | —               |
 | `weave_quick`         | Quick-add a node and immediately start working on it  | `text`          |
 | `weave_overview`      | Status + health + context policy + ready work         | —               |
