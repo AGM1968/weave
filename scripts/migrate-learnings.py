@@ -30,7 +30,9 @@ def parse_learning(text: str) -> dict:
     if not text:
         return parts
 
-    segments = re.split(r"\s*\|\s*", text)
+    # Normalize semicolons before marker keywords to pipes
+    normalized = re.sub(r";\s*(decision|pattern|pitfall):", r" | \1:", text, flags=re.I)
+    segments = re.split(r"\s*\|\s*", normalized)
     last_key = None
 
     for seg in segments:

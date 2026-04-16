@@ -1040,8 +1040,9 @@ function handleTool(
       const noWarn = args.no_warn as boolean | undefined;
       const noOverlapCheck = args.no_overlap_check as boolean | undefined;
 
-      // Compose pipe-delimited learning string from typed params if no raw learning
-      if (!learning && (decision || pattern || pitfall)) {
+      // Compose pipe-delimited learning string from typed params
+      // Typed params take precedence; raw learning used as fallback
+      if (decision || pattern || pitfall) {
         const parts: string[] = [];
         if (decision) parts.push(`decision: ${decision}`);
         if (pattern) parts.push(`pattern: ${pattern}`);
@@ -1068,7 +1069,7 @@ function handleTool(
       const pitfall = args.pitfall as string | undefined;
       const noWarn = args.no_warn as boolean | undefined;
 
-      if (!learning && (decision || pattern || pitfall)) {
+      if (decision || pattern || pitfall) {
         const parts: string[] = [];
         if (decision) parts.push(`decision: ${decision}`);
         if (pattern) parts.push(`pattern: ${pattern}`);
@@ -1154,8 +1155,9 @@ function handleTool(
       const pitfall = args.pitfall as string | undefined;
       const gh = args.gh as boolean | undefined;
 
-      // Compose pipe-delimited learning string from typed params if no raw learning
-      if (!learning && (decision || pattern || pitfall)) {
+      // Compose pipe-delimited learning string from typed params
+      // Typed params take precedence; raw learning used as fallback
+      if (decision || pattern || pitfall) {
         const parts: string[] = [];
         if (decision) parts.push(`decision: ${decision}`);
         if (pattern) parts.push(`pattern: ${pattern}`);

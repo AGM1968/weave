@@ -568,8 +568,10 @@ _done_store_learning() {
         # Store raw learning string
         . + {learning: $l} |
         # Parse inline markers (decision:/pattern:/pitfall:) into top-level keys
-        if ($l | test("^(decision|pattern|pitfall):"; "i")) then
-          ($l | split(" | ") | reduce .[] as $seg (
+        # Normalize semicolons before markers to pipes for consistent splitting
+        ($l | gsub(";\\s*(?<m>(decision|pattern|pitfall):)"; " | \(.m)"; "i")) as $norm |
+        if ($norm | test("^(decision|pattern|pitfall):"; "i")) then
+          ($norm | split(" | ") | map(select(length > 0)) | reduce .[] as $seg (
             {};
             if ($seg | test("^decision:"; "i")) then .decision = ($seg | sub("^decision:\\s*"; ""; "i"))
             elif ($seg | test("^pattern:"; "i")) then .pattern = ($seg | sub("^pattern:\\s*"; ""; "i"))
