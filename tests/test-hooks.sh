@@ -375,6 +375,18 @@ assert_exit_code "0" "$EXIT_CODE" "pre-claim: exits 0 for legacy root command pa
 OUTPUT=$(echo '{"command":"wv list --json"}' | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null || true)
 assert_equals "" "$OUTPUT" "pre-claim: silent for non-matching commands"
 
+# Fail-open: unknown node ID (or transient empty read) must not block.
+# Previously: wv show returned [], hook interpreted missing done_criteria as a
+# claim-on-unplanned-node and soft-denied. New behavior: empty read → allow,
+# let wv work itself surface the clearer "node not found" error.
+set +e
+OUTPUT=$(echo '{"tool_name":"Bash","tool_input":{"cmd":"wv work wv-deadbe"}}' \
+    | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-claim: exits 0 for unknown node (fail-open)"
+assert_equals "" "$OUTPUT" "pre-claim: silent on unreadable / missing node"
+
 # --- pre-close-verification.sh (no verification) ---
 echo ""
 echo "--- pre-close-verification.sh ---"
@@ -548,6 +560,52 @@ if [[ -f "$DEDUP_LOCK_DIR/wv-sync.lock" ]]; then
 else
     echo -e "${GREEN}✓${NC} bash-dedup: no false-positive lock for wv sync in quoted arg"
     TESTS_PASSED=$((TESTS_PASSED + 1))
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+
+# False-positive guard table: structural keywords inside quoted args must not
+# classify. Pairs of (cmd, lock-key-that-must-not-exist).
+declare -a FP_CASES=(
+    'wv done wv-abc1 --learning="bash tests/test-core.sh 109/109, make check 572/572"|make-build'
+    "wv done wv-abc1 --learning='pattern: run make check after every change'|make-build"
+    'wv done wv-abc1 --learning="after git push the release is live"|git-push'
+    'wv done wv-abc1 --learning="poetry run pytest tests/ covers weave_gh"|pytest'
+    'wv done wv-abc1 --learning="npm install refreshes the MCP bundle"|npm-build'
+)
+for entry in "${FP_CASES[@]}"; do
+    fp_cmd="${entry%|*}"
+    fp_key="${entry##*|}"
+    FP_INPUT=$(jq -n --arg cmd "$fp_cmd" '{"tool_name":"Bash","tool_input":{"command":$cmd}}')
+    set +e
+    OUTPUT=$(echo "$FP_INPUT" | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null)
+    EXIT_CODE=$?
+    set -e
+    assert_exit_code "0" "$EXIT_CODE" "bash-dedup: '$fp_key' keyword in quoted arg exits 0"
+    if [[ -f "$DEDUP_LOCK_DIR/$fp_key.lock" ]]; then
+        echo -e "${RED}✗${NC} bash-dedup: false-positive $fp_key lock for quoted keyword"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        rm -f "$DEDUP_LOCK_DIR/$fp_key.lock"
+    else
+        echo -e "${GREEN}✓${NC} bash-dedup: no false-positive $fp_key lock for quoted keyword"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    fi
+    TESTS_RUN=$((TESTS_RUN + 1))
+done
+
+# True-positive: an actual `make check` invocation must still create the lock.
+TP_INPUT='{"tool_name":"Bash","tool_input":{"command":"make check"}}'
+set +e
+OUTPUT=$(echo "$TP_INPUT" | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "bash-dedup: real 'make check' first call exits 0"
+if [[ -f "$DEDUP_LOCK_DIR/make-build.lock" ]]; then
+    echo -e "${GREEN}✓${NC} bash-dedup: real 'make check' creates make-build lock"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    rm -f "$DEDUP_LOCK_DIR/make-build.lock"
+else
+    echo -e "${RED}✗${NC} bash-dedup: real 'make check' must create make-build lock"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -904,6 +962,116 @@ else
     echo -e "${GREEN}✓${NC} JSONL bridge: degrades gracefully when no JSONL"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 fi
+
+# ============================================================
+# --- Hook JSON schema audit (H2.T3) ---
+# For each hook, assert it emits the right JSON schema for its event type:
+#   PreToolUse  → hookSpecificOutput.permissionDecision (current API)
+#   PostToolUse → flat {"decision":"block","reason":"..."}
+#   Stop        → flat {"decision":"block","reason":"..."}
+#   SessionStart→ hookSpecificOutput.additionalContext (no permissionDecision)
+# The common regression is using the wrong event's schema (e.g. permissionDecision
+# inside a Stop hook) — the CLI silently ignores such output.
+echo ""
+echo "--- Hook JSON schema audit ---"
+
+# Static hook → event-type map. Keep in sync with ~/.claude/settings.json hooks.
+declare -A HOOK_EVENTS=(
+    [pre-action.sh]=PreToolUse
+    [pre-claim-skills.sh]=PreToolUse
+    [pre-close-verification.sh]=PreToolUse
+    [bash-dedup.sh]=PreToolUse
+    [post-edit-lint.sh]=PostToolUse
+    [bash-dedup-post.sh]=PostToolUse
+    [stop-check.sh]=Stop
+    [session-start-context.sh]=SessionStart
+    [context-guard.sh]=SessionStart
+    [session-end-sync.sh]=SessionEnd
+    [pre-compact-context.sh]=PreCompact
+)
+
+schema_check() {
+    local label="$1"
+    local ok="$2"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [ "$ok" = "0" ]; then
+        echo -e "${GREEN}✓${NC} $label"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo -e "${RED}✗${NC} $label"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+}
+
+for hook in "${!HOOK_EVENTS[@]}"; do
+    event="${HOOK_EVENTS[$hook]}"
+    path="$HOOKS_DIR/$hook"
+    if [ ! -f "$path" ]; then
+        schema_check "$hook ($event): file exists" 1
+        continue
+    fi
+
+    case "$event" in
+        PreToolUse)
+            if grep -qE '"decision"[[:space:]]*:[[:space:]]*"block"|decision:[[:space:]]*"block"' "$path"; then
+                schema_check "$hook ($event): no deprecated flat decision schema" 1
+            else
+                schema_check "$hook ($event): no deprecated flat decision schema" 0
+            fi
+
+            if grep -q 'hookSpecificOutput' "$path"; then
+                if grep -q 'PreToolUse' "$path" && grep -q 'permissionDecision' "$path"; then
+                    schema_check "$hook ($event): uses hookSpecificOutput.permissionDecision" 0
+                else
+                    schema_check "$hook ($event): hookSpecificOutput missing PreToolUse+permissionDecision" 1
+                fi
+                if grep -qE 'permissionDecision[^"]*"DENY"' "$path"; then
+                    schema_check "$hook ($event): permissionDecision value is lowercase 'deny'" 1
+                else
+                    schema_check "$hook ($event): permissionDecision value is lowercase 'deny'" 0
+                fi
+            else
+                schema_check "$hook ($event): no JSON emission (exit-code-only is acceptable)" 0
+            fi
+            ;;
+        PostToolUse|Stop)
+            if grep -q 'permissionDecision' "$path"; then
+                schema_check "$hook ($event): does not use permissionDecision (PreToolUse-only)" 1
+            else
+                schema_check "$hook ($event): does not use permissionDecision (PreToolUse-only)" 0
+            fi
+            if grep -q 'hookSpecificOutput' "$path"; then
+                schema_check "$hook ($event): does not use hookSpecificOutput" 1
+            else
+                schema_check "$hook ($event): does not use hookSpecificOutput" 0
+            fi
+            ;;
+        SessionStart)
+            if grep -q 'permissionDecision' "$path"; then
+                schema_check "$hook ($event): does not use permissionDecision" 1
+            else
+                schema_check "$hook ($event): does not use permissionDecision" 0
+            fi
+            if grep -qE '"decision"[[:space:]]*:[[:space:]]*"block"' "$path"; then
+                schema_check "$hook ($event): does not use flat decision (PostToolUse/Stop-only)" 1
+            else
+                schema_check "$hook ($event): does not use flat decision (PostToolUse/Stop-only)" 0
+            fi
+            ;;
+        SessionEnd|PreCompact)
+            if grep -q 'permissionDecision' "$path"; then
+                schema_check "$hook ($event): does not use permissionDecision" 1
+            else
+                schema_check "$hook ($event): does not use permissionDecision" 0
+            fi
+            if grep -qE '"decision"[[:space:]]*:[[:space:]]*"block"' "$path"; then
+                schema_check "$hook ($event): does not use flat decision schema" 1
+            else
+                schema_check "$hook ($event): does not use flat decision schema" 0
+            fi
+            ;;
+    esac
+done
 
 # ============================================================
 echo ""

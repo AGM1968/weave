@@ -608,6 +608,65 @@ assert_contains "$output" "Usage" "search without query shows usage"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
+# auto_checkpoint / sync-commit hijack guard (H1.T3)
+# ═══════════════════════════════════════════════════════════════════════════
+# Regression: if the user pre-stages a non-.weave/ file and a wv mutation
+# runs, neither auto_checkpoint nor cmd_sync's final commit path should
+# absorb that file under a generic "auto-checkpoint" / "sync state" message.
+echo "Testing auto_checkpoint hijack guard..."
+CP_DIR=$(mktemp -d)
+(
+    cd "$CP_DIR"
+    git init -q
+    git config user.email t@t && git config user.name t
+    export WV_HOT_ZONE="$CP_DIR/hz" \
+           WV_DB="$CP_DIR/hz/brain.db" \
+           WV_CHECKPOINT_INTERVAL=0 \
+           WV_CHECKPOINT_PULL=0 \
+           WV_SYNC_INTERVAL=0
+    mkdir -p "$WV_HOT_ZONE"
+    touch README.md && git add README.md && git commit -q -m "init"
+    "$WV" init >/dev/null 2>&1
+    "$WV" add "seed" >/dev/null 2>&1
+
+    # Track deltas inside subshell (parent counters can't be mutated).
+    _p=0 _r=0
+
+    # Stage a user file; it must NOT be absorbed by wv sync.
+    echo "user work" > feature.txt && git add feature.txt
+    "$WV" sync 2>/dev/null >/dev/null || true
+    _log=$(git log --oneline | head -5)
+    _still_staged=$(git diff --cached --name-only | grep '^feature.txt$' || true)
+    _absorbed=$(echo "$_log" | grep -E "auto-checkpoint|sync state" || true)
+    if [ -z "$_absorbed" ] && [ -n "$_still_staged" ]; then
+        echo -e "  ${GREEN}✓${NC} guard: user-staged feature.txt not absorbed by sync"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} guard failed: log=<$_log> still_staged=<$_still_staged>"
+    fi
+    _r=$((_r + 1))
+
+    # Override test: WV_CHECKPOINT_ALL=1 allows the commit through.
+    WV_CHECKPOINT_ALL=1 "$WV" sync 2>/dev/null >/dev/null || true
+    if git log --oneline | head -5 | grep -qE "auto-checkpoint|sync state"; then
+        echo -e "  ${GREEN}✓${NC} override: WV_CHECKPOINT_ALL=1 commits through"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} override: WV_CHECKPOINT_ALL=1 did not commit"
+    fi
+    _r=$((_r + 1))
+
+    echo "$_p $_r" > "$CP_DIR/.delta"
+)
+if [ -f "$CP_DIR/.delta" ]; then
+    read -r _cp_p _cp_r < "$CP_DIR/.delta"
+    TESTS_PASSED=$((TESTS_PASSED + _cp_p))
+    TESTS_RUN=$((TESTS_RUN + _cp_r))
+fi
+rm -rf "$CP_DIR"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 echo "═══════════════════════════════════════════════════════════════════════════"

@@ -2,6 +2,52 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.40.0] - 2026-04-17
+
+### Fixed
+
+- **`wv update --metadata` silent overwrite (H1.T1+T2)**: `cmd_update` merged new metadata into
+  existing via a jq roundtrip with a trailing `|| echo "$metadata"` fallback. Any jq failure
+  silently replaced the stored metadata with only the new keys, wiping `done_criteria`,
+  `risk_level`, and siblings. Ported the merge to `json_patch(COALESCE(metadata, '{}'), '<new>')` in
+  a single UPDATE — atomic, SQL-native, no silent fallback. Matches the `--remove-key` path (already
+  `json_remove`-based). Regression tests cover empty→new, preserve+add, apostrophe round-trip,
+  unicode + literal `||`, invalid-JSON rejection, and immediate update-then-claim readiness.
+- **`auto_checkpoint` + `wv sync` commit hijack (H1.T3)**: both paths ran `git add .weave/` then
+  committed whatever was staged — absorbing user-prestaged files into a generic
+  `chore(weave): auto-checkpoint HH:MM` or `sync state` commit, silently rewriting named work. Both
+  paths now enumerate staged files first and skip the commit (with a stderr warning) if any
+  non-`.weave/` paths are present. Overridable via `WV_CHECKPOINT_ALL=1`. Regression tests in
+  `tests/test-data.sh`.
+- **`wv add --risks=medium|high|critical` missing `risks` key**: only `--risks=none|low` seeded both
+  `risk_level` and `risks: []`; higher levels set just `risk_level`, so the pre-claim hook's
+  `has("risks")` check emitted the "Consider /pre-mortem" advisory even when risk had been
+  explicitly classified at add-time. Unified all five levels to seed both keys. Regression test in
+  `test-core.sh` asserts both keys for every level. Surfaced during H1 sprint claim friction.
+- **`pre-claim-skills.sh` false-block on unreadable state**: the hook read the target node via
+  `wv show --json` and interpreted a jq failure on the empty result as "done_criteria missing",
+  soft-denying the claim with `Run /ship-it before claiming wv-<id> () — done_criteria not set`
+  (note the empty parens — the read returned no rows so NODE_TEXT was blank and HAS_SHIP_IT
+  defaulted to false). The read hits transient windows (auto_sync rewriting state, DB lock
+  contention, hot-zone hash mismatch between parent shell and hook process) that return `[]` on
+  nodes that exist and are properly planned. Retrying passes immediately; each false block costs one
+  model turn. Hook now fails open: if `wv show` returns zero rows, exit 0 silently and let `wv work`
+  itself surface the clearer "node not found" error. Regression test in `test-hooks.sh` covers an
+  unknown-ID payload. Closes wv-cc197a (H1.T1b).
+- **`bash-dedup.sh` false-positive classification**: the hook classified long-running commands via
+  substring regex over the raw `tool_input.command`. Anchors like
+  `(^|[;[:space:]])make[[:space:]]+check` matched real invocations but also matched inside quoted
+  argument text — e.g. a `wv done --learning="... ran make check 572/572 ..."` would acquire the
+  `make-build` lock and hard-block the next unrelated command for up to 10 minutes. Hook now strips
+  `"..."` / `'...'` regions before classifying, so structural anchors see only outer shell syntax.
+  Npm/poetry patterns gained the same command-start anchor the others already had. Regression table
+  in `test-hooks.sh` covers make/git push/pytest/npm keywords inside quoted `--learning` values plus
+  a true-positive check that a bare `make check` still acquires the lock. Discovered when the hook
+  blocked the `wv done` for the `--risks=` fix above.
+- **`pre-action.sh` path guard hardened**: replaced string matching with `realpath -m` + canonical
+  prefix check so edit guards apply regardless of symlinks or `..` traversal. JSON schema audit test
+  added to verify every hook event type in `test-hooks.sh`.
+
 ## [1.39.0] - 2026-04-16
 
 ### Fixed
@@ -9,14 +55,14 @@
 - **Learnings junk filter**: Structured-only nodes (containing `decision:`/`pattern:`/`pitfall:` but
   no raw `learning` key) no longer filtered as junk.
 - **FTS5 search**: Multi-word queries now use OR-token matching instead of phrase match, improving
-  recall for `wv search` and related learnings lookup.
+  recall for `wv search` and `_related_learnings`.
 
 ## [1.38.1] - 2026-04-16
 
 ### Fixed
 
-- **Learnings duplicate storage**: Structured learnings (`decision:`/`pattern:`/`pitfall:`) no longer
-  store a redundant raw `learning` key — halves token cost in JSON output.
+- **Learnings duplicate storage**: Structured learnings (`decision:`/`pattern:`/`pitfall:`) no
+  longer store a redundant raw `learning` key — halves token cost in JSON output.
 - **MCP merge logic**: When both raw learning and typed params are provided via MCP tools
   (`weave_done`/`weave_batch_done`/`weave_ship`), raw learning is now appended as context instead of
   silently dropped.

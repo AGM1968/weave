@@ -256,6 +256,16 @@ test_add() {
 
     # Add fails with invalid metadata JSON
     assert_fails "add rejects invalid JSON metadata" "$WV" add "Bad metadata" --metadata='not-json'
+
+    # --risks=<level> must always seed both risk_level AND risks:[] so the
+    # pre-claim hook's has("risks") check passes on immediate claim.
+    local risk_id risk_meta
+    for level in none low medium high critical; do
+        risk_id=$("$WV" add "risks=$level" --risks="$level" 2>&1 | tail -1)
+        risk_meta=$("$WV" show "$risk_id" --json | jq -r '.[0].metadata')
+        assert_contains "$risk_meta" "\"risk_level\":\"$level\"" "--risks=$level sets risk_level"
+        assert_contains "$risk_meta" '"risks":[]' "--risks=$level seeds empty risks list"
+    done
 }
 
 # ============================================================================
@@ -572,6 +582,70 @@ test_status() {
 }
 
 # ============================================================================
+# Test: update --metadata merge (SQL json_patch port; H1.T2)
+# ============================================================================
+# Regression for the silent-fallback bug where jq merge failure caused the new
+# metadata to overwrite the stored value, wiping existing keys. Exercises the
+# conditions listed in PROPOSAL-wv-post-split-hardening Target 3.
+test_update_metadata_merge() {
+    echo ""
+    echo "Test: wv update --metadata merge"
+    echo "================================"
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    local id1 id2 id3 meta
+    # Case A — node with no initial metadata: first update stores the new blob.
+    id1=$("$WV" add "no initial meta" 2>&1 | tail -1)
+    "$WV" update "$id1" --metadata='{"k":"v"}' >/dev/null 2>&1
+    meta=$("$WV" show "$id1" --json | jq -r '.[0].metadata')
+    assert_contains "$meta" '"k":"v"' "merge: empty → new key stored"
+
+    # Case B — existing key preserved, new key added.
+    id2=$("$WV" add "existing meta" --criteria="c1" 2>&1 | tail -1)
+    "$WV" update "$id2" --metadata='{"extra":"z"}' >/dev/null 2>&1
+    meta=$("$WV" show "$id2" --json | jq -r '.[0].metadata')
+    assert_contains "$meta" 'done_criteria' "merge: existing key preserved"
+    assert_contains "$meta" '"extra":"z"' "merge: new key added"
+
+    # Case C — payload with unicode, apostrophe, and literal '||' does not trip
+    # a silent fallback (the old code's jq || echo fallback would have nuked
+    # done_criteria on any jq failure).
+    id3=$("$WV" add "stress payload" --criteria="c1" 2>&1 | tail -1)
+    "$WV" update "$id3" --metadata='{"note":"O'\''Donovan → test || foo"}' >/dev/null 2>&1
+    meta=$("$WV" show "$id3" --json | jq -r '.[0].metadata')
+    assert_contains "$meta" 'done_criteria' "merge: stress payload preserves existing key"
+    assert_contains "$meta" "O'Donovan" "merge: apostrophe round-trips"
+    assert_contains "$meta" '||' "merge: literal || survives"
+
+    # Case D — invalid JSON is rejected loudly; stored metadata is unchanged.
+    local id4 before after
+    id4=$("$WV" add "invalid json rejected" --criteria="c1" 2>&1 | tail -1)
+    before=$("$WV" show "$id4" --json | jq -r '.[0].metadata')
+    if "$WV" update "$id4" --metadata='{"bad": syntax}' >/dev/null 2>&1; then
+        echo -e "${RED}✗${NC} invalid JSON should have been rejected"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        TESTS_RUN=$((TESTS_RUN + 1))
+    else
+        echo -e "${GREEN}✓${NC} invalid JSON rejected with non-zero exit"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        TESTS_RUN=$((TESTS_RUN + 1))
+    fi
+    after=$("$WV" show "$id4" --json | jq -r '.[0].metadata')
+    assert_equals "$before" "$after" "rejected update leaves metadata untouched"
+
+    # Case E — immediate update-then-claim sequence (the primary Target 1
+    # friction). After setting done_criteria via --metadata, wv work must pass
+    # the pre-claim readiness check on the very next invocation.
+    local id5
+    id5=$("$WV" add "claim readiness" 2>&1 | tail -1)
+    "$WV" update "$id5" --metadata='{"done_criteria":"c","risks":[],"risk_level":"low"}' >/dev/null 2>&1
+    meta=$("$WV" show "$id5" --json | jq -r '.[0].metadata')
+    assert_contains "$meta" '"done_criteria":"c"' "update-then-claim: done_criteria visible immediately"
+}
+
+# ============================================================================
 # Test: orphan prevention
 # ============================================================================
 test_orphan_prevention() {
@@ -670,6 +744,7 @@ main() {
     test_show
     test_ready
     test_status
+    test_update_metadata_merge
 
     echo ""
     echo "========================================"

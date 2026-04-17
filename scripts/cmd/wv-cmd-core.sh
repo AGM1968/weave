@@ -247,7 +247,7 @@ cmd_add() {
 
     # Merge --criteria and --risks into metadata before JSON validation.
     # --criteria="c1|c2|c3"  → done_criteria: ["c1","c2","c3"]
-    # --risks=low|none        → risk_level + risks: []
+    # --risks=<level>         → risk_level + risks: [] (all levels seed empty list so pre-claim hook's has("risks") check passes)
     if [ -n "$criteria" ]; then
         local criteria_json
         criteria_json=$(printf '%s' "$criteria" | python3 -c "
@@ -260,8 +260,7 @@ print(json.dumps(items))
     fi
     if [ -n "$risks_flag" ]; then
         case "$risks_flag" in
-            none|low) metadata=$(echo "$metadata" | jq --arg r "$risks_flag" '. + {risks: [], risk_level: $r}' 2>/dev/null || echo "$metadata") ;;
-            medium|high|critical) metadata=$(echo "$metadata" | jq --arg r "$risks_flag" '. + {risk_level: $r}' 2>/dev/null || echo "$metadata") ;;
+            none|low|medium|high|critical) metadata=$(echo "$metadata" | jq --arg r "$risks_flag" '. + {risks: [], risk_level: $r}' 2>/dev/null || echo "$metadata") ;;
         esac
     fi
 
@@ -1824,21 +1823,20 @@ cmd_update() {
                 ;;
             --metadata=*)
                 local metadata="${1#*=}"
-                # Validate JSON before storing
+                # Validate JSON before storing. jq '.' either parses cleanly or errors —
+                # we fail loudly here rather than silently falling back downstream.
                 if ! echo "$metadata" | jq '.' >/dev/null 2>&1; then
                     echo -e "${RED}Error: invalid JSON in --metadata${NC}" >&2
                     return 1
                 fi
-                # Merge into existing metadata (not replace)
-                local cur_meta_raw cur_meta
-                cur_meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='$id';" 2>/dev/null || echo "[]")
-                cur_meta=$(echo "$cur_meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
-                if [[ "$cur_meta" != "{"* ]]; then
-                    cur_meta=$(echo "$cur_meta" | jq -r '.' 2>/dev/null || echo "{}")
-                fi
-                metadata=$(echo "$cur_meta" | jq --argjson new "$metadata" '. * $new' 2>/dev/null || echo "$metadata")
-                metadata="${metadata//\'/\'\'}"
-                updates="${updates}metadata='$metadata',"
+                # Merge atomically via SQL json_patch (RFC 7396) — applies the new
+                # JSON as a merge patch to the row's current metadata in a single
+                # UPDATE. COALESCE handles NULL. Parity with the --remove-key path
+                # above (which uses json_remove). Previous implementation shelled out
+                # to jq with a silent "|| echo $metadata" fallback that overwrote the
+                # stored metadata when jq failed for any reason.
+                local metadata_esc="${metadata//\'/\'\'}"
+                updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
                 ;;
             --alias=*)
                 local alias="${1#*=}"

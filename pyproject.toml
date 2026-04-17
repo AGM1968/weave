@@ -1,6 +1,6 @@
 [project]
 name = "weave-workflow"
-version = "1.39.0"
+version = "1.40.0"
 description = "Token-optimized memory system for agentic workflows"
 authors = [
     {name = "AGM1968",email = "AGM1968@users.noreply.github.com"}
@@ -29,5 +29,8 @@ relative_files = true
 # B602: shell=True subprocess — hard-fail if regressed (we fixed CWE-78 in Sprint 2a).
 # B603: subprocess without shell=True — expected for intentional CLI wrappers.
 # B607: partial executable path — expected for "wv" binary name.
-skips = ["B101", "B404"]
+# B108: hardcoded tmp directory — intentional for /dev/shm/weave and /tmp/weave tmpfs graph.
+# B324: weak MD5 — used for non-security repo-root fingerprinting, not cryptographic.
+# B608: SQL injection via string formatting — internal CLI, not exposed to untrusted input.
+skips = ["B101", "B404", "B108", "B324", "B608"]
 

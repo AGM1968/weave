@@ -43,6 +43,48 @@ After editing source, run: ./install.sh
 EOF
         exit 2
     fi
+    # Block edits under the archived runtime/ tree — canonical source is weave-runtime.
+    # Uses realpath + prefix comparison rather than regex to resist case-folding filesystems
+    # and symlink-based bypasses. Allow runtime/README.md (archive banner maintenance).
+    if [ -n "$FILE_PATH" ]; then
+        # Walk up to the nearest existing directory so git rev-parse works
+        # even when writing a new file under a not-yet-created subdir.
+        _PA_FILE_DIR=$(dirname "$FILE_PATH" 2>/dev/null)
+        while [ -n "$_PA_FILE_DIR" ] && [ "$_PA_FILE_DIR" != "/" ] && [ ! -d "$_PA_FILE_DIR" ]; do
+            _PA_FILE_DIR=$(dirname "$_PA_FILE_DIR")
+        done
+        _PA_REPO_ROOT=$(git -C "$_PA_FILE_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+        # Scope the block to the memory-system repo (by basename) so edits in
+        # other repos that happen to contain a runtime/ dir aren't affected.
+        if [ -n "$_PA_REPO_ROOT" ] && [ "$(basename "$_PA_REPO_ROOT")" = "memory-system" ]; then
+            for _PA_RT_REL in runtime archive/runtime; do
+                _PA_RT_ABS="$_PA_REPO_ROOT/$_PA_RT_REL"
+                [ -d "$_PA_RT_ABS" ] || continue
+                _PA_REAL_RT=$(realpath "$_PA_RT_ABS" 2>/dev/null) || continue
+                _PA_REAL_FILE=$(realpath -m "$FILE_PATH" 2>/dev/null) || continue
+                _PA_REAL_README=$(realpath -m "$_PA_RT_ABS/README.md" 2>/dev/null)
+                if [ "$_PA_REAL_FILE" = "$_PA_REAL_README" ]; then
+                    continue
+                fi
+                if [ "$_PA_REAL_FILE" = "$_PA_REAL_RT" ] || [[ "$_PA_REAL_FILE" == "$_PA_REAL_RT"/* ]]; then
+                    cat >&2 <<EOF
+ERROR: memory-system/$_PA_RT_REL/ is ARCHIVED (Weave node wv-63ca4f).
+Path: $FILE_PATH
+Resolved: $_PA_REAL_FILE
+
+Canonical source: AGM1968/weave-runtime (local: ~/Projects/weave-runtime).
+Make the change there instead:
+  cd ~/Projects/weave-runtime
+  # edit weave_runtime/<same-relative-path>
+
+If this edit is genuinely needed here (e.g. amending the archive banner),
+edit $_PA_RT_REL/README.md which is allowed.
+EOF
+                    exit 2
+                fi
+            done
+        fi
+    fi
 fi
 
 # Check if this is an operation we should enforce

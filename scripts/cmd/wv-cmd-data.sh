@@ -266,6 +266,21 @@ auto_checkpoint() {
         # Legacy mode: stage everything (breaks intentional commits)
         git -C "$git_root" add -A >/dev/null 2>&1 || return 0
     else
+        # Hijack guard: if the caller pre-staged anything outside .weave/,
+        # our checkpoint would absorb their intentional commit's payload
+        # under a generic auto-checkpoint message. Refuse (exit 0, no commit)
+        # and warn to stderr. Escape hatch: WV_CHECKPOINT_ALL=1.
+        local prestaged
+        prestaged=$(git -C "$git_root" diff --cached --name-only 2>/dev/null \
+            | grep -v '^\.weave/' || true)
+        if [ -n "$prestaged" ]; then
+            {
+                echo "wv: auto-checkpoint skipped — non-.weave/ files already staged by caller:"
+                echo "$prestaged" | sed 's/^/  /'
+                echo "wv: finish your commit first, or set WV_CHECKPOINT_ALL=1 to override."
+            } >&2
+            return 0
+        fi
         # Safe mode: only stage .weave/ graph state
         git -C "$git_root" add .weave/ >/dev/null 2>&1 || return 0
     fi
@@ -444,6 +459,26 @@ cmd_sync() {
     local git_root
     git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
     if [ -n "$git_root" ] && [ -d "$git_root/.weave" ]; then
+        # Hijack guard: same rule as auto_checkpoint — if the caller pre-staged
+        # anything outside .weave/, absorbing it into a generic "sync state"
+        # commit would silently rewrite their intentional commit. Skip the
+        # final commit and warn; .weave/ will be committed on the next sync
+        # after the caller finishes their commit. Override: WV_CHECKPOINT_ALL=1.
+        if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
+            local _sync_prestaged
+            _sync_prestaged=$(git -C "$git_root" diff --cached --name-only 2>/dev/null \
+                | grep -v '^\.weave/' || true)
+            if [ -n "$_sync_prestaged" ]; then
+                {
+                    echo "wv: sync-state commit skipped — non-.weave/ files already staged by caller:"
+                    echo "$_sync_prestaged" | sed 's/^/  /'
+                    echo "wv: finish your commit first, or set WV_CHECKPOINT_ALL=1 to override."
+                } >&2
+                [ "$_sync_journaled" = true ] && journal_complete "$_sync_commit_step"
+                [ "$_sync_journaled" = true ] && journal_end
+                return 0
+            fi
+        fi
         git -C "$git_root" add .weave/ >/dev/null 2>&1 || true
         if ! git -C "$git_root" diff --cached --quiet 2>/dev/null; then
             # Check if auto_checkpoint just committed (within throttle window)

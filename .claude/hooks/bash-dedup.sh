@@ -44,29 +44,39 @@ TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 CMD=$(echo "$INPUT" | jq -r '.tool_input.command // .tool_input.cmd // empty' 2>/dev/null)
 [[ -z "$CMD" ]] && exit 0
 
+# ── Strip quoted argument regions before classifying ───────────────────────────
+# A substring like `make check` inside `--learning="... make check passes ..."`
+# must NOT trigger the make-build lock — the user is writing prose into a
+# quoted argument, not invoking make. sed removes "..." and '...' regions so
+# the regexes only see the outer shell syntax. Escaped quotes are rare in the
+# commands we match; failing-closed (not matching) is safe.
+CMD_STRIPPED=$(printf '%s' "$CMD" | sed -E 's/"[^"]*"//g; s/'"'"'[^'"'"']*'"'"'//g')
+
 # ── Classify command and assign TTL (seconds) ──────────────────────────────────
 # TTL applies to phase=running (background commands). Must reflect realistic
-# worst-case completion time for each command type.
+# worst-case completion time for each command type. All anchors use structural
+# shell separators (^, ;, &, |, whitespace) — they are evaluated against
+# CMD_STRIPPED, so substrings inside quoted arguments cannot match.
 
 LOCK_KEY=""
 TTL=0
 
-if [[ "$CMD" =~ (^|[;[:space:]])(make[[:space:]]+(check|test|build)|make[[:space:]]*$) ]]; then
+if [[ "$CMD_STRIPPED" =~ (^|[;[:space:]])(make[[:space:]]+(check|test|build)|make[[:space:]]*$) ]]; then
     LOCK_KEY="make-build"
     TTL=600      # 10 min — covers slow CI machines (local suite runs ~90s)
-elif [[ "$CMD" =~ (^|[[:space:]]*[;&|]+[[:space:]]*)wv[[:space:]]+sync ]]; then
+elif [[ "$CMD_STRIPPED" =~ (^|[[:space:]]*[;&|]+[[:space:]]*)wv[[:space:]]+sync ]]; then
     LOCK_KEY="wv-sync"
     TTL=60       # sync completes in <15s under normal conditions
-elif [[ "$CMD" =~ (^|[[:space:]]*[;&|]+[[:space:]]*)git[[:space:]]+push ]]; then
+elif [[ "$CMD_STRIPPED" =~ (^|[[:space:]]*[;&|]+[[:space:]]*)git[[:space:]]+push ]]; then
     LOCK_KEY="git-push"
     TTL=60       # push to remote; allow up to 60s for slow connections
-elif [[ "$CMD" =~ (^|[[:space:]])\.\/install\.sh ]]; then
+elif [[ "$CMD_STRIPPED" =~ (^|[[:space:]])\.\/install\.sh ]]; then
     LOCK_KEY="install"
     TTL=120      # first-run install can be slow; <2min in practice
-elif [[ "$CMD" =~ npm[[:space:]]+(run|test|build|install) ]]; then
+elif [[ "$CMD_STRIPPED" =~ (^|[;[:space:]])npm[[:space:]]+(run|test|build|install) ]]; then
     LOCK_KEY="npm-build"
     TTL=300      # npm install can be slow on cold cache
-elif [[ "$CMD" =~ poetry[[:space:]]+run[[:space:]]+pytest ]]; then
+elif [[ "$CMD_STRIPPED" =~ (^|[;[:space:]])poetry[[:space:]]+run[[:space:]]+pytest ]]; then
     LOCK_KEY="pytest"
     TTL=120      # test suite runs in <90s
 fi

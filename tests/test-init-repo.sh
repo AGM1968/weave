@@ -191,18 +191,20 @@ REPO3=$(make_test_repo "copilot")
 cd "$REPO3"
 
 OUTPUT=$("$WV" init-repo --agent=copilot 2>&1)
-assert_file_exists "$REPO3/.vscode/mcp.json"                "copilot: creates .vscode/mcp.json"
+assert_file_exists "$REPO3/.mcp.json"                       "copilot: creates .mcp.json"
 assert_file_exists "$REPO3/.github/copilot-instructions.md" "copilot: creates copilot-instructions.md"
 assert_file_exists "$REPO3/.github/hooks/README.md"         "copilot: scaffolds .github/hooks/"
 
-# Verify mcp.json points to MCP server
-MCP_JSON=$(cat "$REPO3/.vscode/mcp.json")
+# Verify mcp.json points to MCP server and uses VS Code 'servers' key (not 'mcpServers')
+MCP_JSON=$(cat "$REPO3/.mcp.json")
 assert_contains "$MCP_JSON" '"weave"'                       "copilot: mcp.json has weave server"
 assert_contains "$MCP_JSON" '"weave-inspect"'               "copilot: mcp.json has weave-inspect server"
 assert_not_contains "$MCP_JSON" '"weave-graph"'             "copilot: mcp.json does not ship weave-graph"
 assert_not_contains "$MCP_JSON" '"weave-session"'           "copilot: mcp.json does not ship weave-session"
 assert_contains "$MCP_JSON" 'index.js'                      "copilot: mcp.json points to index.js"
-SERVER_COUNT=$(jq '.servers | keys | length' "$REPO3/.vscode/mcp.json")
+assert_not_contains "$MCP_JSON" '"mcpServers"'              "copilot: mcp.json uses 'servers' not 'mcpServers'"
+assert_not_contains "$MCP_JSON" '"inputs"'                  "copilot: mcp.json has no 'inputs' key"
+SERVER_COUNT=$(jq '.servers | keys | length' "$REPO3/.mcp.json")
 assert_equals "2" "$SERVER_COUNT"                           "copilot: mcp.json ships exactly two servers"
 
 # Verify ghost setting is NOT written
@@ -234,7 +236,7 @@ cd "$REPO4"
 OUTPUT=$("$WV" init-repo --agent=all 2>&1)
 assert_file_exists "$REPO4/.claude/settings.json"           "all: creates .claude/settings.json"
 assert_file_exists "$REPO4/CLAUDE.md"                       "all: creates CLAUDE.md"
-assert_file_exists "$REPO4/.vscode/mcp.json"                "all: creates .vscode/mcp.json"
+assert_file_exists "$REPO4/.mcp.json"                       "all: creates .mcp.json"
 assert_file_exists "$REPO4/.github/copilot-instructions.md" "all: creates copilot-instructions.md"
 
 # settings.json still has no hooks key
