@@ -12,7 +12,7 @@ CREATE TABLE nodes (
     priority INTEGER GENERATED ALWAYS AS (json_extract(metadata, '$.priority')) VIRTUAL,
     type TEXT GENERATED ALWAYS AS (json_extract(metadata, '$.type')) VIRTUAL
 );
-INSERT INTO nodes VALUES('wv-7b1fe0','release: v1.41.0 public weave repo','todo',replace('{\n  "done_criteria": [\n    "commit, tag, push, GH release"\n  ],\n  "risks": [],\n  "risk_level": "low"\n}','\n',char(10)),NULL,'2026-04-18 18:25:10','2026-04-18 18:25:10');
+INSERT INTO nodes VALUES('wv-7b1fe0','release: v1.41.0 public weave repo','done','{"done_criteria":["commit, tag, push, GH release"],"risks":[],"risk_level":"low","decision":"split commit into 2 (initial wv-state + full bundle) due to wv work auto-sync clobbering staged state; both pushed cleanly. pattern: build-release.sh outputs to public repo; commit/tag/push/release in that working dir not memory-system. pitfall: pre-action hook checks active node in cwd, not source — must claim a node in the public repo too.","learning_hygiene":4}',NULL,'2026-04-18 18:25:10','2026-04-18 18:26:53');
 COMMIT;
 PRAGMA foreign_keys=OFF;
 BEGIN TRANSACTION;
