@@ -495,12 +495,12 @@ _done_store_learning() {
     _done_skip_learning=false
     _done_pending_close=false
 
-    # FTS5 dedup check: prompt if a similar learning already exists
-    # Skipped when --no-overlap-check is set (agentic callers) or WV_NONINTERACTIVE=1
+    # FTS5 dedup check: prompt if a similar learning already exists.
+    # Skip entirely for explicit opt-out and non-interactive agent/script flows.
     local search_terms
     search_terms=$(echo "$learning" | tr -cs '[:alnum:]' ' ' | \
         awk '{for(i=1;i<=NF;i++) if(length($i)>4) {print $i; c++; if(c>=3) exit}}')
-    if [ "$no_overlap_check" = "0" ] && [ -n "$search_terms" ]; then
+    if [ "$no_overlap_check" = "0" ] && [ "${WV_NONINTERACTIVE:-0}" != "1" ] && [ -n "$search_terms" ]; then
         # Sanitize FTS5 operators to prevent query syntax injection
         search_terms=$(echo "$search_terms" | sed 's/[(){}*:^~"]//g' | tr '\n' ' ')
         local fts_match
@@ -1981,6 +1981,7 @@ cmd_ship() {
     local learning=""
     local gh_flag=false
     local skip_verification=false
+    local no_overlap_check=false
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -1988,13 +1989,14 @@ cmd_ship() {
             --learning=*) learning="${1#*=}" ;;
             --gh) gh_flag=true ;;
             --skip-verification) skip_verification=true ;;
+            --no-overlap-check) no_overlap_check=true ;;
         esac
         shift
     done
 
     if [ -z "$id" ]; then
         echo -e "${RED}Error: node ID required${NC}" >&2
-        echo "Usage: wv ship <id> [--learning=\"...\"] [--gh]" >&2
+        echo "Usage: wv ship <id> [--learning=\"...\"] [--gh] [--no-overlap-check]" >&2
         return 1
     fi
 
@@ -2032,9 +2034,17 @@ cmd_ship() {
     journal_step 1 "done" "{\"id\":\"$id\"}"
     local done_rc=0
     if [ -n "$learning" ]; then
-        cmd_done "$id" --learning="$learning" || done_rc=$?
+        if [ "$no_overlap_check" = true ]; then
+            cmd_done "$id" --learning="$learning" --no-overlap-check || done_rc=$?
+        else
+            cmd_done "$id" --learning="$learning" || done_rc=$?
+        fi
     elif [ "$skip_verification" = true ]; then
-        cmd_done "$id" --skip-verification || done_rc=$?
+        if [ "$no_overlap_check" = true ]; then
+            cmd_done "$id" --skip-verification --no-overlap-check || done_rc=$?
+        else
+            cmd_done "$id" --skip-verification || done_rc=$?
+        fi
     else
         echo -e "${RED}Error: --learning=\"...\" or --skip-verification required${NC}" >&2
         echo "Usage: wv ship <id> --learning=\"decision: ... | pattern: ... | pitfall: ...\"" >&2

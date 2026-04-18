@@ -2,6 +2,22 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.40.1] - 2026-04-18
+
+### Fixed
+
+- **Agentic overlap suppression parity**: `WV_NONINTERACTIVE=1` now skips the FTS5
+  learning-overlap check entirely instead of only suppressing the tty prompt. This prevents
+  unattended callers from emitting advisory `learning_overlap_noted` metadata for intentionally
+  repetitive structured learnings.
+- **`wv ship --no-overlap-check` parity**: `cmd_ship` now accepts and forwards
+  `--no-overlap-check` to `cmd_done`, matching `wv done`.
+- **MCP `weave_ship` parity**: added `no_overlap_check` to the MCP schema and command builder so
+  MCP callers have the same overlap-control surface as `weave_done`.
+- **Runtime archive hint portability**: `pre-action.sh` no longer hardcodes
+  `~/Projects/weave-runtime`; it uses `WV_RUNTIME_REPO` when set and otherwise emits a
+  repo-agnostic guidance message.
+
 ## [1.40.0] - 2026-04-17
 
 ### Fixed

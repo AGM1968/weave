@@ -67,14 +67,26 @@ EOF
                     continue
                 fi
                 if [ "$_PA_REAL_FILE" = "$_PA_REAL_RT" ] || [[ "$_PA_REAL_FILE" == "$_PA_REAL_RT"/* ]]; then
+                    _PA_RUNTIME_LOCAL="${WV_RUNTIME_REPO:-}"
+                    if [ -z "$_PA_RUNTIME_LOCAL" ] && [ -d "$HOME/Projects/weave-runtime" ]; then
+                        _PA_RUNTIME_LOCAL="$HOME/Projects/weave-runtime"
+                    fi
+                    if [ -n "$_PA_RUNTIME_LOCAL" ]; then
+                        _PA_RUNTIME_HINT="Local clone: $_PA_RUNTIME_LOCAL"
+                        _PA_RUNTIME_CD="  cd $_PA_RUNTIME_LOCAL"
+                    else
+                        _PA_RUNTIME_HINT="Set WV_RUNTIME_REPO to your local weave-runtime checkout, or clone AGM1968/weave-runtime."
+                        _PA_RUNTIME_CD="  # edit weave_runtime/<same-relative-path> in that clone"
+                    fi
                     cat >&2 <<EOF
 ERROR: memory-system/$_PA_RT_REL/ is ARCHIVED (Weave node wv-63ca4f).
 Path: $FILE_PATH
 Resolved: $_PA_REAL_FILE
 
-Canonical source: AGM1968/weave-runtime (local: ~/Projects/weave-runtime).
+Canonical source: AGM1968/weave-runtime
+$_PA_RUNTIME_HINT
 Make the change there instead:
-  cd ~/Projects/weave-runtime
+$_PA_RUNTIME_CD
   # edit weave_runtime/<same-relative-path>
 
 If this edit is genuinely needed here (e.g. amending the archive banner),

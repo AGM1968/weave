@@ -637,6 +637,33 @@ describe("Weave MCP Server", () => {
       ]));
     });
 
+    it("forwards --no-overlap-check for weave_ship", async () => {
+      const nodeId = "wv-0000";
+      const wrapper = createLoggedWvWrapper();
+      const loggedClient = new MCPTestClient([], { WV_PATH: wrapper.wvPath });
+      let commands: string[] = [];
+      try {
+        await loggedClient.request("tools/call", {
+          name: "weave_ship",
+          arguments: {
+            id: nodeId,
+            learning:
+              "decision: keep ship parity with done | pattern: expose overlap opt-out through all agent paths | pitfall: wrappers drift when flags are added only to one close surface",
+            no_overlap_check: true,
+          },
+        });
+
+        commands = readLoggedCommands(wrapper.logPath);
+      } finally {
+        await loggedClient.close();
+        wrapper.cleanup();
+      }
+      expect(commands).toEqual(expect.arrayContaining([
+        expect.stringContaining(`ship ${nodeId} --learning=`),
+        expect.stringContaining("--no-overlap-check"),
+      ]));
+    });
+
     it("forwards discover mode for status, context, and overview reads", async () => {
       const nodeId = await createTrackedNode("test-forward-mode");
       const wrapper = createLoggedWvWrapper();

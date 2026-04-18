@@ -280,18 +280,15 @@ const TOOLS: Tool[] = [
         },
         decision: {
           type: "string",
-          description:
-            "What was decided and why (stored as top-level metadata key).",
+          description: "What was decided and why (stored as top-level metadata key).",
         },
         pattern: {
           type: "string",
-          description:
-            "Reusable pattern or technique discovered (stored as top-level metadata key).",
+          description: "Reusable pattern or technique discovered (stored as top-level metadata key).",
         },
         pitfall: {
           type: "string",
-          description:
-            "What went wrong or what to avoid (stored as top-level metadata key).",
+          description: "What went wrong or what to avoid (stored as top-level metadata key).",
         },
         no_warn: {
           type: "boolean",
@@ -320,8 +317,7 @@ const TOOLS: Tool[] = [
         },
         learning: {
           type: "string",
-          description:
-            "Learning to capture for all nodes. Use pipe-delimited format or typed fields below.",
+          description: "Learning to capture for all nodes. Use pipe-delimited format or typed fields below.",
         },
         decision: {
           type: "string",
@@ -504,22 +500,24 @@ const TOOLS: Tool[] = [
         },
         decision: {
           type: "string",
-          description:
-            "What was decided and why (stored as top-level metadata key).",
+          description: "What was decided and why (stored as top-level metadata key).",
         },
         pattern: {
           type: "string",
-          description:
-            "Reusable pattern or technique discovered (stored as top-level metadata key).",
+          description: "Reusable pattern or technique discovered (stored as top-level metadata key).",
         },
         pitfall: {
           type: "string",
-          description:
-            "What went wrong or what to avoid (stored as top-level metadata key).",
+          description: "What went wrong or what to avoid (stored as top-level metadata key).",
         },
         gh: {
           type: "boolean",
           description: "Force GitHub sync (auto-detected if node or parent epic has gh_issue metadata)",
+        },
+        no_overlap_check: {
+          type: "boolean",
+          description:
+            "Skip FTS5 learning-similarity check entirely — no prompt, no advisory. Use in agent/script contexts where stdin is unavailable.",
         },
       },
       required: ["id"],
@@ -1156,6 +1154,7 @@ function handleTool(
       const pattern = args.pattern as string | undefined;
       const pitfall = args.pitfall as string | undefined;
       const gh = args.gh as boolean | undefined;
+      const noOverlapCheck = args.no_overlap_check as boolean | undefined;
 
       // Compose pipe-delimited learning string from typed params
       // Merge: typed params compose structured prefix; raw learning appended as context
@@ -1171,6 +1170,7 @@ function handleTool(
       const cmd = ["ship", id];
       if (learning) cmd.push(`--learning=${learning}`);
       if (gh) cmd.push("--gh");
+      if (noOverlapCheck) cmd.push("--no-overlap-check");
       result = wv(cmd, 60_000); // sync may be slow
       if (!learning && !decision && !pattern && !pitfall)
         result +=
@@ -1617,7 +1617,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.40.0",
+      version: "1.40.1",
     },
     {
       capabilities: {

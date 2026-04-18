@@ -330,7 +330,7 @@ test_done() {
     finding_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$finding_id" --skip-verification 2>&1)
     assert_contains "$finding_output" "Closed" "done accepts complete finding metadata"
 
-    # Non-interactive overlap: advisory metadata written, close proceeds (does NOT block)
+    # Non-interactive overlap: close proceeds and skips overlap advisory writes entirely
     local seed_id overlap_id overlap_learning overlap_exit overlap_output overlap_meta
     overlap_learning="decision: keep overlap prompts resumable | pattern: store pending close state | pitfall: tty prompts hang unattended flows"
     seed_id=$("$WV" add "Seed overlap learning" 2>&1 | tail -1)
@@ -340,10 +340,10 @@ test_done() {
     overlap_exit=0
     overlap_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$overlap_id" --learning="$overlap_learning" 2>&1) || overlap_exit=$?
     assert_equals "0" "$overlap_exit" "done succeeds non-interactively when overlap detected"
-    assert_contains "$overlap_output" "Overlap noted in metadata" "done reports overlap as advisory not blocking"
+    assert_not_contains "$overlap_output" "Overlap noted in metadata" "done skips overlap advisory output in non-interactive mode"
 
     overlap_meta=$("$WV" show "$overlap_id" --json 2>&1)
-    assert_contains "$overlap_meta" "learning_overlap_noted" "done stores learning_overlap_noted in closed node metadata"
+    assert_not_contains "$overlap_meta" "learning_overlap_noted" "done skips learning_overlap_noted metadata in non-interactive mode"
     assert_contains "$overlap_meta" '"status":"done"' "node is closed despite overlap"
 
     local finding_overlap_id finding_overlap_exit finding_overlap_output finding_overlap_meta
@@ -354,6 +354,25 @@ test_done() {
     assert_contains "$finding_overlap_output" "Closed" "finding overlap advisory still closes the node"
     finding_overlap_meta=$("$WV" show "$finding_overlap_id" --json 2>&1)
     assert_contains "$finding_overlap_meta" '"status":"done"' "finding node is closed despite overlap"
+    assert_not_contains "$finding_overlap_meta" "learning_overlap_noted" "finding close also skips overlap advisory metadata in non-interactive mode"
+
+    local ship_id ship_exit ship_output ship_meta ship_remote
+    ship_remote="$TEST_DIR/ship-remote.git"
+    git config user.email "test@example.com"
+    git config user.name "Weave Test"
+    git init --bare -q "$ship_remote"
+    git remote add origin "$ship_remote"
+    git add . >/dev/null 2>&1 || true
+    git commit -m "test baseline" --allow-empty >/dev/null 2>&1 || true
+    git push -u origin HEAD >/dev/null 2>&1
+
+    ship_id=$("$WV" add "Ship overlap parity" 2>&1 | tail -1)
+    ship_exit=0
+    ship_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" ship "$ship_id" --learning="$overlap_learning" --no-overlap-check 2>&1) || ship_exit=$?
+    assert_equals "0" "$ship_exit" "ship accepts --no-overlap-check"
+    ship_meta=$("$WV" show "$ship_id" --json 2>&1)
+    assert_contains "$ship_meta" '"status":"done"' "ship still closes the node with --no-overlap-check"
+    assert_not_contains "$ship_meta" "learning_overlap_noted" "ship forwards no-overlap-check to done"
 
     # --acknowledge-overlap still clears legacy pending_close state (backward compat)
     local legacy_id legacy_meta legacy_exit legacy_output
