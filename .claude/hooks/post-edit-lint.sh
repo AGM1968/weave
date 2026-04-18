@@ -13,10 +13,11 @@ TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""')
 # VS Code sends camelCase (filePath), Claude Code sends snake_case (file_path)
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.filePath // .tool_input.path // ""')
 
-# Skip linting if the tool call itself failed (tool_response.success = false)
-# PostToolUseFailure fires for hard failures; this guards soft/partial failures
-TOOL_SUCCESS=$(echo "$INPUT" | jq -r '.tool_response.success // true' 2>/dev/null)
-if [[ "$TOOL_SUCCESS" == "false" ]]; then
+# Skip linting if the tool call itself failed (tool_response.success = false).
+# PostToolUseFailure fires for hard failures; this guards soft/partial failures.
+# Use jq -e equality: 'jq -r ".x // true"' collapses explicit boolean false to
+# true (alternative-operator semantics on falsey values).
+if echo "$INPUT" | jq -e '.tool_response.success == false' >/dev/null 2>&1; then
     exit 0
 fi
 

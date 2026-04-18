@@ -392,14 +392,17 @@ score_learning() {
 _save_session_snapshot() {
     local snapshot="$WV_HOT_ZONE/.session_snapshot"
     local total done_count learnings
-    total=$(db_query "SELECT COUNT(*) FROM nodes;" 2>/dev/null || echo 0)
-    done_count=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='done';" 2>/dev/null || echo 0)
+    # Exclude internal session_history singleton from counts so cross-session
+    # delta math (cmd_session_summary) is not skewed by the hygiene record.
+    total=$(db_query "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '\$.type') IS NOT 'session_history';" 2>/dev/null || echo 0)
+    done_count=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='done' AND json_extract(metadata, '\$.type') IS NOT 'session_history';" 2>/dev/null || echo 0)
     learnings=$(db_query "
         SELECT COUNT(*) FROM nodes
-        WHERE json_extract(metadata, '\$.learning') IS NOT NULL
+        WHERE (json_extract(metadata, '\$.learning') IS NOT NULL
            OR json_extract(metadata, '\$.decision') IS NOT NULL
            OR json_extract(metadata, '\$.pattern') IS NOT NULL
-           OR json_extract(metadata, '\$.pitfall') IS NOT NULL;
+           OR json_extract(metadata, '\$.pitfall') IS NOT NULL)
+          AND json_extract(metadata, '\$.type') IS NOT 'session_history';
     " 2>/dev/null || echo 0)
     printf '%s\t%s\t%s\t%s\n' "$(date -u +%s)" "$total" "$done_count" "$learnings" > "$snapshot"
 }
@@ -422,14 +425,16 @@ cmd_session_summary() {
 
     local now_ts now_total now_done now_learnings
     now_ts=$(date -u +%s)
-    now_total=$(db_query "SELECT COUNT(*) FROM nodes;" 2>/dev/null || echo 0)
-    now_done=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='done';" 2>/dev/null || echo 0)
+    # Exclude internal session_history singleton; matches _save_session_snapshot.
+    now_total=$(db_query "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '\$.type') IS NOT 'session_history';" 2>/dev/null || echo 0)
+    now_done=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='done' AND json_extract(metadata, '\$.type') IS NOT 'session_history';" 2>/dev/null || echo 0)
     now_learnings=$(db_query "
         SELECT COUNT(*) FROM nodes
-        WHERE json_extract(metadata, '\$.learning') IS NOT NULL
+        WHERE (json_extract(metadata, '\$.learning') IS NOT NULL
            OR json_extract(metadata, '\$.decision') IS NOT NULL
            OR json_extract(metadata, '\$.pattern') IS NOT NULL
-           OR json_extract(metadata, '\$.pitfall') IS NOT NULL;
+           OR json_extract(metadata, '\$.pitfall') IS NOT NULL)
+          AND json_extract(metadata, '\$.type') IS NOT 'session_history';
     " 2>/dev/null || echo 0)
 
     local elapsed=$(( now_ts - start_ts ))
@@ -447,6 +452,15 @@ cmd_session_summary() {
         duration="${mins}m"
     fi
 
+    # Hygiene score (C1): four 25pt components covering edit-discipline,
+    # decomposition-discipline, learning-discipline, and call-discipline.
+    # Each component degrades gracefully when its denominator is zero
+    # (no penalty for sessions without that activity).
+    _hygiene_score "$start_ts" "$now_ts"
+
+    # Append score to history graph node so trend can be queried cross-session.
+    _hygiene_record_history "$now_ts" "$_h_total" "$_h_edit" "$_h_criteria" "$_h_learning" "$_h_budget"
+
     if [ "$format" = "json" ]; then
         jq -n \
             --arg duration "$duration" \
@@ -454,16 +468,142 @@ cmd_session_summary() {
             --argjson created "$created" \
             --argjson completed "$completed" \
             --argjson learnings "$new_learnings" \
+            --argjson score "$_h_total" \
+            --argjson edit "$_h_edit" \
+            --argjson criteria "$_h_criteria" \
+            --argjson learning_disc "$_h_learning" \
+            --argjson budget "$_h_budget" \
+            --argjson edits_total "$_h_edit_total" \
+            --argjson edits_with_active "$_h_edit_with" \
+            --argjson wv_calls "$_h_wv_calls" \
             '{
                 duration: $duration,
                 elapsed_seconds: $elapsed,
                 nodes_created: $created,
                 nodes_completed: $completed,
-                learnings_captured: $learnings
+                learnings_captured: $learnings,
+                hygiene: {
+                    score: $score,
+                    edit_discipline: $edit,
+                    criteria_discipline: $criteria,
+                    learning_discipline: $learning_disc,
+                    call_discipline: $budget,
+                    edits_total: $edits_total,
+                    edits_with_active: $edits_with_active,
+                    wv_calls: $wv_calls
+                }
             }'
     else
         echo -e "Session: ${CYAN}${duration}${NC} | Nodes: ${GREEN}+${created}${NC} created, ${GREEN}${completed}${NC} completed | Learnings: ${GREEN}${new_learnings}${NC} captured"
+        local _h_color="$GREEN"
+        [ "$_h_total" -lt 60 ] && _h_color="$YELLOW"
+        [ "$_h_total" -lt 30 ] && _h_color="$RED"
+        echo -e "Hygiene:  ${_h_color}${_h_total}/100${NC}  edit:${_h_edit}/25  criteria:${_h_criteria}/25  learning:${_h_learning}/25  calls:${_h_budget}/25"
     fi
+}
+
+# Compute the four 25pt hygiene components plus the total. Returns via the
+# global `_h_*` variables (decomposition-pattern documented in MEMORY.md
+# under "Bash Decomposition Patterns").
+_hygiene_score() {
+    local start_ts="$1" now_ts="$2"
+    local start_iso
+    start_iso=$(date -u -d "@$start_ts" +"%Y-%m-%d %H:%M:%S" 2>/dev/null \
+        || date -u -r "$start_ts" +"%Y-%m-%d %H:%M:%S" 2>/dev/null \
+        || echo "1970-01-01 00:00:00")
+    start_iso=$(sql_escape "$start_iso")
+
+    # Component 1: edit discipline = % Edit/Write attempts that had an active node.
+    local edits_file="$WV_HOT_ZONE/session-edits.json"
+    _h_edit_total=0
+    _h_edit_with=0
+    if [ -f "$edits_file" ]; then
+        _h_edit_total=$(jq -r '.total // 0' "$edits_file" 2>/dev/null || echo 0)
+        _h_edit_with=$(jq -r '.with_active // 0' "$edits_file" 2>/dev/null || echo 0)
+    fi
+    if [ "$_h_edit_total" -gt 0 ]; then
+        _h_edit=$(( 25 * _h_edit_with / _h_edit_total ))
+    else
+        _h_edit=25
+    fi
+
+    # Component 2: decomp discipline = % nodes created this session with done_criteria set.
+    # Exclude internal session_history singleton from denominator.
+    local created_session with_criteria
+    created_session=$(db_query "SELECT COUNT(*) FROM nodes WHERE created_at >= '$start_iso' AND json_extract(metadata, '\$.type') IS NOT 'session_history';" 2>/dev/null || echo 0)
+    with_criteria=$(db_query "SELECT COUNT(*) FROM nodes WHERE created_at >= '$start_iso' AND json_extract(metadata, '\$.done_criteria') IS NOT NULL AND json_extract(metadata, '\$.type') IS NOT 'session_history';" 2>/dev/null || echo 0)
+    : "${created_session:=0}"
+    : "${with_criteria:=0}"
+    if [ "$created_session" -gt 0 ]; then
+        _h_criteria=$(( 25 * with_criteria / created_session ))
+    else
+        _h_criteria=25
+    fi
+
+    # Component 3: learning discipline = % nodes closed this session with structured learning.
+    # Exclude internal session_history singleton.
+    local closed_session with_learning
+    closed_session=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='done' AND updated_at >= '$start_iso' AND json_extract(metadata, '\$.type') IS NOT 'session_history';" 2>/dev/null || echo 0)
+    with_learning=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='done' AND updated_at >= '$start_iso' AND (json_extract(metadata, '\$.decision') IS NOT NULL OR json_extract(metadata, '\$.pattern') IS NOT NULL OR json_extract(metadata, '\$.pitfall') IS NOT NULL OR json_extract(metadata, '\$.learning') IS NOT NULL) AND json_extract(metadata, '\$.type') IS NOT 'session_history';" 2>/dev/null || echo 0)
+    : "${closed_session:=0}"
+    : "${with_learning:=0}"
+    if [ "$closed_session" -gt 0 ]; then
+        _h_learning=$(( 25 * with_learning / closed_session ))
+    else
+        _h_learning=25
+    fi
+
+    # Component 4: call discipline = inverse of broad-call count from budget-tally.
+    # Threshold matches WV_BUDGET_THRESHOLD default (20). Each call beyond it
+    # costs 1 point; floored at 0 for runaway sessions.
+    local budget_file="$WV_HOT_ZONE/session-budget.json"
+    _h_wv_calls=0
+    [ -f "$budget_file" ] && _h_wv_calls=$(jq -r '.calls // 0' "$budget_file" 2>/dev/null || echo 0)
+    local threshold="${WV_BUDGET_THRESHOLD:-20}"
+    if [ "$_h_wv_calls" -le "$threshold" ]; then
+        _h_budget=25
+    else
+        _h_budget=$(( 25 - (_h_wv_calls - threshold) ))
+        [ "$_h_budget" -lt 0 ] && _h_budget=0
+    fi
+
+    _h_total=$(( _h_edit + _h_criteria + _h_learning + _h_budget ))
+}
+
+# Append a score record to a singleton session_history graph node so trend
+# data syncs across machines via state.sql. Caps history at 20 entries.
+_hygiene_record_history() {
+    local ts="$1" total="$2" edit="$3" criteria="$4" learning="$5" budget="$6"
+    local hist_id
+    hist_id=$(db_query "SELECT id FROM nodes WHERE json_extract(metadata, '\$.type') = 'session_history' LIMIT 1;" 2>/dev/null)
+    if [ -z "$hist_id" ]; then
+        hist_id="wv-$(printf '%06x' $((RANDOM * RANDOM)) | head -c6)"
+        local seed_meta
+        seed_meta=$(jq -n \
+            --argjson ts "$ts" \
+            --argjson total "$total" \
+            --argjson edit "$edit" \
+            --argjson criteria "$criteria" \
+            --argjson learning "$learning" \
+            --argjson budget "$budget" \
+            '{type:"session_history", history:[{ts:$ts, score:$total, edit:$edit, criteria:$criteria, learning:$learning, budget:$budget}]}')
+        seed_meta_esc=$(sql_escape "$seed_meta")
+        db_query "INSERT INTO nodes (id, text, status, metadata, created_at, updated_at) VALUES ('$hist_id', 'session-hygiene-history', 'done', '$seed_meta_esc', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);" 2>/dev/null || true
+        return 0
+    fi
+    local cur_meta new_meta new_meta_esc
+    cur_meta=$(db_query "SELECT COALESCE(metadata, '{}') FROM nodes WHERE id='$hist_id';" 2>/dev/null)
+    [ -z "$cur_meta" ] && cur_meta='{}'
+    new_meta=$(echo "$cur_meta" | jq \
+        --argjson ts "$ts" \
+        --argjson total "$total" \
+        --argjson edit "$edit" \
+        --argjson criteria "$criteria" \
+        --argjson learning "$learning" \
+        --argjson budget "$budget" \
+        '.history = ((.history // []) + [{ts:$ts, score:$total, edit:$edit, criteria:$criteria, learning:$learning, budget:$budget}] | .[-20:])' 2>/dev/null || echo "$cur_meta")
+    new_meta_esc=$(sql_escape "$new_meta")
+    db_query "UPDATE nodes SET metadata='$new_meta_esc', updated_at=CURRENT_TIMESTAMP WHERE id='$hist_id';" 2>/dev/null || true
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

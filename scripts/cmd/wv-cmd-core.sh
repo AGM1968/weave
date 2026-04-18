@@ -463,6 +463,21 @@ _done_can_prompt_overlap() {
     [ "${WV_NONINTERACTIVE:-0}" != "1" ] && [ -z "${CI:-}" ] && [ -t 0 ] && [ -t 2 ]
 }
 
+# Polarity = sign(positive_verbs - negative_verbs).
+# Returns: 1 (mostly positive recommendation), -1 (mostly negative/avoidance), 0 (mixed/neutral).
+# Used to detect contradictions between an FTS5-matched pair of learnings: same topic
+# (FTS5 already validated overlap) but opposite polarity = candidate contradiction.
+_done_polarity() {
+    local text="$1"
+    local pos neg
+    pos=$(echo "$text" | grep -oiE '\b(use|prefer|enable|require|always|must|should|adopt|keep|do)\b' | wc -l)
+    neg=$(echo "$text" | grep -oiE '\b(avoid|never|disable|forbid|don.?t|do not|must not|should not|cannot|stop|drop|remove|deprecate)\b' | wc -l)
+    if [ "$pos" -gt "$neg" ]; then echo 1
+    elif [ "$neg" -gt "$pos" ]; then echo -1
+    else echo 0
+    fi
+}
+
 # Reserved for future genuinely-blocking close conditions (not learning overlap).
 # Currently only called by --acknowledge-overlap recovery path in cmd_done.
 _done_mark_pending_close() {
@@ -511,7 +526,22 @@ _done_store_learning() {
             LIMIT 1;
         " 2>/dev/null || true)
         if [ -n "$fts_match" ]; then
-            echo -e "${YELLOW}⚠ Learning may overlap with $fts_match${NC}" >&2
+            # Contradiction check: pull matched learning, compare polarity.
+            local matched_learning new_pol old_pol contradiction
+            matched_learning=$(db_query_json "SELECT metadata FROM nodes WHERE id='$fts_match';" 2>/dev/null \
+                | jq -r '.[0].metadata | if . and . != "" then (. | fromjson | .learning // "") else "" end' 2>/dev/null || echo "")
+            new_pol=$(_done_polarity "$learning")
+            old_pol=$(_done_polarity "$matched_learning")
+            contradiction=false
+            if [ "$new_pol" != "0" ] && [ "$old_pol" != "0" ] && [ "$new_pol" != "$old_pol" ]; then
+                contradiction=true
+            fi
+
+            if [ "$contradiction" = true ]; then
+                echo -e "${RED}⚠ Learning may CONTRADICT $fts_match (opposite polarity)${NC}" >&2
+            else
+                echo -e "${YELLOW}⚠ Learning may overlap with $fts_match${NC}" >&2
+            fi
             if [ "$acknowledge_overlap" = "1" ]; then
                 echo -e "  → Acknowledged via --acknowledge-overlap, proceeding." >&2
             elif _done_can_prompt_overlap; then
@@ -543,14 +573,23 @@ _done_store_learning() {
                 # blocking automated callers (agents, CI, sync) causes stuck nodes.
                 # Note: _done_read_metadata is called again below to store the learning
                 # key; it does a fresh SELECT so learning_overlap_noted is preserved.
-                local cur_meta new_meta
+                local cur_meta new_meta jq_filter
                 cur_meta=$(_done_read_metadata "$id")
+                if [ "$contradiction" = true ]; then
+                    jq_filter='. + {learning_overlap_noted: $overlap_id, learning_contradiction_noted: $overlap_id}'
+                else
+                    jq_filter='. + {learning_overlap_noted: $overlap_id}'
+                fi
                 new_meta=$(echo "$cur_meta" | jq \
                     --arg overlap_id "$fts_match" \
-                    '. + {learning_overlap_noted: $overlap_id}' 2>/dev/null || echo "$cur_meta")
+                    "$jq_filter" 2>/dev/null || echo "$cur_meta")
                 new_meta="${new_meta//\'/\'\'}"
                 db_query "UPDATE nodes SET metadata='$new_meta', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
-                echo -e "${YELLOW}  → Overlap noted in metadata (learning_overlap_noted: $fts_match), proceeding.${NC}" >&2
+                if [ "$contradiction" = true ]; then
+                    echo -e "${RED}  → Contradiction noted in metadata (learning_contradiction_noted: $fts_match), proceeding.${NC}" >&2
+                else
+                    echo -e "${YELLOW}  → Overlap noted in metadata (learning_overlap_noted: $fts_match), proceeding.${NC}" >&2
+                fi
             fi
         fi
     fi
@@ -1341,6 +1380,32 @@ cmd_ready() {
         return
     fi
 
+    # Relevance boost (B1): re-rank ready nodes whose metadata.touched_files
+    # overlaps the per-session recent-edits ring. Boosted nodes float to top.
+    # Falls back to default ordering when ring is empty or unreadable.
+    local _rel_expr="0"
+    local _rel_order="n.created_at ASC, n.id ASC"
+    local _ring_file
+    local _repo_root _repo_hash
+    _repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    _repo_hash=$(echo "$_repo_root" | md5sum 2>/dev/null | cut -c1-8 || echo "default")
+    [ -z "$_repo_hash" ] && _repo_hash="default"
+    _ring_file="${WV_TOUCHED_DIR:-/dev/shm/weave/${_repo_hash}}/recent-edits.txt"
+    if [ -f "$_ring_file" ]; then
+        local _items=() _line _esc
+        while IFS= read -r _line; do
+            [ -z "$_line" ] && continue
+            _esc="${_line//\'/\'\'}"
+            _items+=("'${_esc}'")
+        done < "$_ring_file"
+        if [ ${#_items[@]} -gt 0 ]; then
+            local _in_clause
+            _in_clause=$(IFS=,; echo "${_items[*]}")
+            _rel_expr="(SELECT COUNT(*) FROM json_each(COALESCE(json_extract(n.metadata, '\$.touched_files'), '[]')) WHERE value IN ($_in_clause))"
+            _rel_order="$_rel_expr DESC, n.created_at ASC, n.id ASC"
+        fi
+    fi
+
     # Mode-based row limit for text output (json always returns full set)
     local _mode_limit=""
     case "$mode" in
@@ -1352,19 +1417,23 @@ cmd_ready() {
 
     if [ "$format" = "json-v2" ]; then
         local results
-        results=$(db_query_json_v2 "$subtree_cte SELECT n.id, n.text, n.status, n.metadata FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY n.created_at ASC, n.id ASC;")
+        results=$(db_query_json_v2 "$subtree_cte SELECT n.id, n.text, n.status, n.metadata FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY $_rel_order;")
         [ -z "$results" ] && echo "[]" || echo "$results"
     elif [ "$format" = "json" ]; then
         local results
-        results=$(db_query_json "$subtree_cte SELECT n.id, n.text, n.status, n.metadata FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY n.created_at ASC, n.id ASC;")
+        results=$(db_query_json "$subtree_cte SELECT n.id, n.text, n.status, n.metadata FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY $_rel_order;")
         [ -z "$results" ] && echo "[]" || echo "$results"
     else
-        db_query "$subtree_cte SELECT n.id, n.text, json_extract(n.metadata, '$.claimed_by') FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY n.created_at ASC, n.id ASC $_mode_limit;" \
-        | while IFS='|' read -r id text claimed_by; do
+        db_query "$subtree_cte SELECT n.id, n.text, json_extract(n.metadata, '$.claimed_by'), $_rel_expr AS rel FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY $_rel_order $_mode_limit;" \
+        | while IFS='|' read -r id text claimed_by rel; do
+            local rel_marker=""
+            if [ -n "$rel" ] && [ "$rel" -gt 0 ] 2>/dev/null; then
+                rel_marker=" ${GREEN}[touched ${rel}]${NC}"
+            fi
             if [ -n "$claimed_by" ]; then
-                echo -e "${CYAN}$id${NC}: $text ${YELLOW}(claimed: $claimed_by)${NC}"
+                echo -e "${CYAN}$id${NC}: $text${rel_marker} ${YELLOW}(claimed: $claimed_by)${NC}"
             else
-                echo -e "${CYAN}$id${NC}: $text"
+                echo -e "${CYAN}$id${NC}: $text${rel_marker}"
             fi
         done
 
@@ -1404,6 +1473,29 @@ cmd_ready() {
                 echo -e "  Use ${CYAN}wv findings list${NC} for full details."
             fi
         fi
+
+        # Stale active marker: nodes claimed >24h ago and never closed.
+        # Suppressed in bootstrap mode (counts only); shown in discover/execute/full.
+        if [ "$mode" != "bootstrap" ]; then
+            local stale_rows
+            stale_rows=$(db_query "
+                SELECT n.id,
+                       n.text,
+                       CAST((julianday('now') - julianday(n.updated_at)) AS INTEGER) AS days_old
+                FROM nodes n
+                WHERE n.status = 'active'
+                  AND datetime(n.updated_at) < datetime('now', '-24 hours')
+                ORDER BY n.updated_at ASC;
+            " 2>/dev/null)
+            if [ -n "$stale_rows" ]; then
+                echo ""
+                echo -e "${YELLOW}── Stale active (>24h) ────────────────────────────────────────${NC}"
+                while IFS='|' read -r sid stext sdays; do
+                    [ -z "$sid" ] && continue
+                    echo -e "  ${CYAN}$sid${NC} ${YELLOW}[stale ${sdays}d]${NC} $stext"
+                done <<< "$stale_rows"
+            fi
+        fi
     fi
 }
 
@@ -1418,6 +1510,7 @@ cmd_list() {
     local format="text"
     local all=false
     local limit_val=""
+    local mode_arg=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1428,9 +1521,12 @@ cmd_list() {
             --json)    format="json" ;;
             --json-v2) format="json-v2" ;;
             --all) all=true ;;
+            --mode=*) mode_arg="${1#*=}" ;;
         esac
         shift
     done
+    local mode
+    mode=$(wv_resolve_mode "$mode_arg")
 
     # Validate limit (must be a positive integer)
     if [ -n "$limit_val" ]; then
@@ -1498,8 +1594,17 @@ cmd_list() {
         where_clause="WHERE $filters"
     fi
 
+    # Default cap for agent/non-tty callers: prevents unfiltered dumps.
+    # Explicit --limit, --all, or --status=done bypass the cap.
+    # Tty (interactive) callers also bypass — they can re-run with --all if needed.
     local limit_clause=""
-    [ -n "$limit_val" ] && limit_clause="LIMIT $limit_val"
+    if [ -n "$limit_val" ]; then
+        limit_clause="LIMIT $limit_val"
+    elif [ "$all" != true ] && [ "$status_filter" != "done" ]; then
+        case "$mode" in
+            bootstrap|discover) limit_clause="LIMIT 20" ;;
+        esac
+    fi
 
     if [ "$format" = "json-v2" ]; then
         local results
@@ -1639,6 +1744,8 @@ cmd_status() {
     local ready=$(cmd_ready --count)
     local blocked=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='blocked';")
     local pending_close=$(db_query "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '$.needs_human_verification') = 1;")
+    local stale=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND datetime(updated_at) < datetime('now', '-24 hours');")
+    : "${stale:=0}"
 
     # Sync-state: compare DB mtime vs last successful `wv sync --gh` timestamp
     local needs_sync="false"
@@ -1678,27 +1785,34 @@ cmd_status() {
             --argjson ready "${ready:-0}" \
             --argjson blocked "${blocked:-0}" \
             --argjson pending_close "${pending_close:-0}" \
+            --argjson stale "${stale:-0}" \
             --argjson needs_sync "$needs_sync" \
             --argjson last_sync_at "$last_sync_at" \
             --arg primary_id "$primary_id" \
             --arg primary_text "$primary_text" \
             '{active:$active, ready:$ready, blocked:$blocked,
-              pending_close:$pending_close, needs_sync:$needs_sync,
+              pending_close:$pending_close, stale:$stale,
+              needs_sync:$needs_sync,
               last_sync_at:$last_sync_at,
               current: (if $primary_id != "" then {id:$primary_id, text:$primary_text} else null end)}'
         return 0
     fi
 
+    local active_label="$active active"
+    if [ "${stale:-0}" -gt 0 ] 2>/dev/null; then
+        active_label="$active active ($stale stale)"
+    fi
+
     # bootstrap: counts only — no current node
     if [ "$mode" = "bootstrap" ]; then
-        echo "Work: $active active, $ready ready, $blocked blocked."
+        echo "Work: $active_label, $ready ready, $blocked blocked."
         return 0
     fi
 
     if [ "${pending_close:-0}" -gt 0 ] 2>/dev/null; then
-        echo "Work: $active active, $ready ready, $blocked blocked. $pending_close pending-close."
+        echo "Work: $active_label, $ready ready, $blocked blocked. $pending_close pending-close."
     else
-        echo "Work: $active active, $ready ready, $blocked blocked."
+        echo "Work: $active_label, $ready ready, $blocked blocked."
     fi
 
     if [ "$active" -gt 0 ]; then

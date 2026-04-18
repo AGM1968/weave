@@ -606,6 +606,147 @@ test_status() {
 # Regression for the silent-fallback bug where jq merge failure caused the new
 # metadata to overwrite the stored value, wiping existing keys. Exercises the
 # conditions listed in PROPOSAL-wv-post-split-hardening Target 3.
+test_stale_active_marker() {
+    echo ""
+    echo "Test: stale-active marker (A1)"
+    echo "=============================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    local fresh_id stale_id
+    fresh_id=$("$WV" add "fresh active task" --status=active 2>&1 | tail -1)
+    stale_id=$("$WV" add "stale active task" --status=active 2>&1 | tail -1)
+
+    # Backdate the stale node 25 hours via direct sqlite3
+    sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-25 hours') WHERE id='$stale_id';"
+
+    local status_out ready_out
+    status_out=$("$WV" status 2>&1)
+    assert_contains "$status_out" "1 stale" "status reports 1 stale active node"
+
+    ready_out=$("$WV" ready 2>&1)
+    assert_contains "$ready_out" "Stale active" "ready output includes stale-active section"
+    assert_contains "$ready_out" "$stale_id" "stale section lists the stale node id"
+    assert_contains "$ready_out" "[stale" "stale entry carries [stale Nd] marker"
+    assert_not_contains "$ready_out" "$fresh_id" "fresh active node not listed in stale section"
+
+    # JSON status carries the field
+    local status_json
+    status_json=$("$WV" status --json 2>&1)
+    local stale_json
+    stale_json=$(echo "$status_json" | jq -r '.stale')
+    assert_equals "1" "$stale_json" "status --json includes stale count"
+
+    # Bootstrap mode suppresses the listing but keeps the count
+    local boot_out
+    boot_out=$("$WV" status --mode=bootstrap 2>&1)
+    assert_contains "$boot_out" "1 stale" "bootstrap mode keeps stale count in status"
+    local ready_boot
+    ready_boot=$("$WV" ready --mode=bootstrap 2>&1)
+    assert_not_contains "$ready_boot" "Stale active" "bootstrap mode suppresses stale listing in ready"
+}
+
+test_ready_relevance_boost() {
+    echo ""
+    echo "Test: ready relevance boost via touched_files (B1)"
+    echo "=================================================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    local _repo_root _repo_hash ring_dir ring_file
+    _repo_root=$(git rev-parse --show-toplevel)
+    _repo_hash=$(echo "$_repo_root" | md5sum | cut -c1-8)
+    ring_dir="/dev/shm/weave/${_repo_hash}"
+    ring_file="$ring_dir/recent-edits.txt"
+    mkdir -p "$ring_dir"
+    rm -f "$ring_file"
+
+    # Two ready nodes: B has touched_files matching what we'll edit, A does not.
+    local node_a node_b
+    node_a=$("$WV" add "Task A no overlap" 2>&1 | tail -1)
+    node_b=$("$WV" add "Task B with overlap" 2>&1 | tail -1)
+    "$WV" update "$node_b" --metadata='{"touched_files":["scripts/foo.sh"]}' >/dev/null 2>&1
+
+    # Without ring: default ordering (A created first).
+    local default_first
+    default_first=$("$WV" ready --json 2>&1 | jq -r '.[0].id')
+    assert_equals "$node_a" "$default_first" "ready uses created_at order without ring"
+
+    # With ring containing scripts/foo.sh: B floats to top.
+    echo "scripts/foo.sh" > "$ring_file"
+    local boosted_first
+    boosted_first=$("$WV" ready --json 2>&1 | jq -r '.[0].id')
+    assert_equals "$node_b" "$boosted_first" "ready boosts node whose touched_files overlaps ring"
+
+    # Text output shows [touched N] marker on boosted node.
+    local text_out
+    text_out=$("$WV" ready 2>&1)
+    assert_contains "$text_out" "[touched 1]" "ready text output marks relevance count"
+
+    # Empty ring file: behaves as if no ring (default order).
+    : > "$ring_file"
+    default_first=$("$WV" ready --json 2>&1 | jq -r '.[0].id')
+    assert_equals "$node_a" "$default_first" "ready falls back to default order with empty ring"
+
+    rm -f "$ring_file"
+}
+
+test_done_contradiction() {
+    echo ""
+    echo "Test: done contradiction detection (A3)"
+    echo "======================================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # FTS5 search uses first 3 words of length >4 with AND semantics.
+    # Both learnings must share those terms; polarity is computed across the full text.
+    # Shared search terms: "decision Poetry Python" (both nodes); polarities differ.
+    local seed_id
+    seed_id=$("$WV" add "Seed Poetry decision" 2>&1 | tail -1)
+    WV_REQUIRE_LEARNING=1 "$WV" done "$seed_id" \
+        --learning="decision Poetry Python projects always prefer use it" \
+        >/dev/null 2>&1
+
+    # Same-polarity follow-up (positive vs positive) should NOT trigger contradiction.
+    local same_id same_meta
+    same_id=$("$WV" add "Same direction Poetry note" 2>&1 | tail -1)
+    WV_REQUIRE_LEARNING=1 "$WV" done "$same_id" \
+        --learning="decision Poetry Python projects always keep using it should" \
+        >/dev/null 2>&1
+    same_meta=$("$WV" show "$same_id" --json 2>&1)
+    assert_contains "$same_meta" "learning_overlap_noted" \
+        "same-direction overlap is recorded as overlap (FTS5 match fired)"
+    assert_not_contains "$same_meta" "learning_contradiction_noted" \
+        "same-polarity overlap does not flag contradiction"
+
+    # Opposite-polarity (negative: avoid/never/do not) SHOULD trigger contradiction.
+    local opp_id opp_out opp_meta
+    opp_id=$("$WV" add "Opposite Poetry pitfall" 2>&1 | tail -1)
+    opp_out=$(WV_REQUIRE_LEARNING=1 "$WV" done "$opp_id" \
+        --learning="decision Poetry Python projects avoid never adopt do not" 2>&1)
+    assert_contains "$opp_out" "Closed" "opposite-polarity learning still closes node (advisory not blocking)"
+    opp_meta=$("$WV" show "$opp_id" --json 2>&1)
+    assert_contains "$opp_meta" "learning_contradiction_noted" \
+        "opposite-polarity overlap records learning_contradiction_noted in metadata"
+    assert_contains "$opp_meta" "learning_overlap_noted" \
+        "contradiction also keeps learning_overlap_noted (overlap is the basis)"
+
+    # --no-overlap-check bypasses entirely (no metadata field written)
+    local skip_id skip_meta
+    skip_id=$("$WV" add "Skip overlap check" 2>&1 | tail -1)
+    WV_REQUIRE_LEARNING=1 "$WV" done "$skip_id" \
+        --learning="decision Poetry Python projects avoid never adopt" \
+        --no-overlap-check >/dev/null 2>&1
+    skip_meta=$("$WV" show "$skip_id" --json 2>&1)
+    assert_not_contains "$skip_meta" "learning_contradiction_noted" \
+        "--no-overlap-check skips contradiction detection entirely"
+    assert_not_contains "$skip_meta" "learning_overlap_noted" \
+        "--no-overlap-check skips overlap detection entirely"
+}
+
 test_update_metadata_merge() {
     echo ""
     echo "Test: wv update --metadata merge"
@@ -763,6 +904,9 @@ main() {
     test_show
     test_ready
     test_status
+    test_stale_active_marker
+    test_ready_relevance_boost
+    test_done_contradiction
     test_update_metadata_merge
 
     echo ""

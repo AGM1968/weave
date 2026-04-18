@@ -1282,11 +1282,14 @@ cmd_learnings() {
     # Agent/non-tty callers default to discover mode. Only apply an automatic
     # cap when the caller did not already request --recent, so explicit filters
     # keep their full search behavior before we trim the final result set.
+    # Execute/full also get a (looser) safety cap so an interactive `wv learnings`
+    # without filters cannot dump the whole corpus into the agent's context.
     local mode_limit=""
     if [ -z "$recent_limit" ]; then
         case "$mode" in
             bootstrap) mode_limit="5" ;;
             discover)  mode_limit="10" ;;
+            execute|full) mode_limit="20" ;;
         esac
     fi
     if [ -n "$mode_limit" ] && [ -n "$results" ] && [ "$results" != "[]" ]; then

@@ -375,6 +375,12 @@ const TOOLS: Tool[] = [
           type: "boolean",
           description: "Include done nodes (default: false)",
         },
+        mode: {
+          type: "string",
+          enum: ["bootstrap", "discover", "execute", "full"],
+          description:
+            "Output mode controlling default row cap. discover (default for agents) caps at 20 rows; full has no cap. Use --all or status='done' to bypass entirely.",
+        },
       },
       required: [],
     },
@@ -1095,10 +1101,11 @@ function handleTool(
     case "weave_list": {
       const status = normalizeStatus(args.status as string | undefined);
       const all = args.all as boolean | undefined;
+      const mode = args.mode as ReadMode | undefined;
       const cmd = ["list", "--json-v2"];
       if (status) cmd.push(`--status=${status}`);
       if (all) cmd.push("--all");
-      result = wv(cmd);
+      result = wvRead(cmd, WV_TIMEOUT, mode);
       break;
     }
 
@@ -1617,7 +1624,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.40.1",
+      version: "1.41.0",
     },
     {
       capabilities: {

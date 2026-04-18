@@ -2,21 +2,56 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [Unreleased]
+
+## [1.41.0] - 2026-04-18
+
+### Added
+
+- **Active counter-weight Sprint A — stale-active marker (A1)**: `wv ready` and `wv status` now flag
+  any active node older than the staleness threshold (`WV_STALE_HOURS`, default 4h) with a
+  `[stale Nh]` indicator so callers notice abandoned work before claiming new tasks.
+- **Active counter-weight Sprint A — wv-call budget tally (A2)**: per-session `wv` invocations are
+  tallied in `/dev/shm/weave/<hash>/session-budget.json`; one-shot advisory printed via the
+  `bash-dedup-post.sh` PostToolUse hook when a budget threshold is crossed.
+- **Active counter-weight Sprint A — contradiction detection (A3)**: `wv done --learning=` now runs
+  an FTS5 overlap probe against prior learnings on the same node and flags polarity contradictions
+  (positive vs negative verbs) by writing `learning_contradiction_noted` to metadata. Hard blocks
+  are reserved for invariant violations; this is an advisory only.
+- **Active counter-weight Sprint B1 — relevance boost in `wv ready`**: a new
+  `.claude/hooks/wv-touched-files.sh` PostToolUse hook records each Edit/Write/NotebookEdit target
+  into a per-session ring at `/dev/shm/weave/<hash>/recent-edits.txt` (cap 20, FIFO dedup) and into
+  the active node's `metadata.touched_files` (cap 50, dedup). `wv ready` re-ranks rows whose
+  `touched_files` intersect the ring and shows a `[touched N]` marker on boosted entries. Falls back
+  to `created_at` ordering when the ring is empty or unreadable.
+- **Active counter-weight Sprint C1 — per-session hygiene score in `wv session-summary`**: 0-100
+  rubric across four 25-pt components (edit/active discipline, criteria coverage, learning coverage,
+  call-discipline budget). Edit instrumentation lives in `pre-action.sh`. Trend history persists in
+  a singleton graph node (`metadata.type=session_history`, capped at 20 entries) that is excluded
+  from snapshot/delta queries.
+
+### Fixed
+
+- **`post-edit-lint.sh` honours `tool_response.success=false`**: replaced the
+  `jq -r '.tool_response.success // true'` pattern (jq's alternative operator collapses explicit
+  boolean false to its RHS) with `jq -e '.tool_response.success == false'`. Failing tool calls no
+  longer trigger a lint pass on a never-written file. Same fix applied in `wv-touched-files.sh`.
+
 ## [1.40.1] - 2026-04-18
 
 ### Fixed
 
-- **Agentic overlap suppression parity**: `WV_NONINTERACTIVE=1` now skips the FTS5
-  learning-overlap check entirely instead of only suppressing the tty prompt. This prevents
-  unattended callers from emitting advisory `learning_overlap_noted` metadata for intentionally
-  repetitive structured learnings.
-- **`wv ship --no-overlap-check` parity**: `cmd_ship` now accepts and forwards
-  `--no-overlap-check` to `cmd_done`, matching `wv done`.
-- **MCP `weave_ship` parity**: added `no_overlap_check` to the MCP schema and command builder so
-  MCP callers have the same overlap-control surface as `weave_done`.
+- **Agentic overlap suppression parity**: `WV_NONINTERACTIVE=1` now skips the FTS5 learning-overlap
+  check entirely instead of only suppressing the tty prompt. This prevents unattended callers from
+  emitting advisory `learning_overlap_noted` metadata for intentionally repetitive structured
+  learnings.
+- **`wv ship --no-overlap-check` parity**: `cmd_ship` now accepts and forwards `--no-overlap-check`
+  to `cmd_done`, matching `wv done`.
+- **MCP `weave_ship` parity**: added `no_overlap_check` to the MCP schema and command builder so MCP
+  callers have the same overlap-control surface as `weave_done`.
 - **Runtime archive hint portability**: `pre-action.sh` no longer hardcodes
-  `~/Projects/weave-runtime`; it uses `WV_RUNTIME_REPO` when set and otherwise emits a
-  repo-agnostic guidance message.
+  `~/Projects/weave-runtime`; it uses `WV_RUNTIME_REPO` when set and otherwise emits a repo-agnostic
+  guidance message.
 
 ## [1.40.0] - 2026-04-17
 
@@ -60,11 +95,36 @@
   in `test-hooks.sh` covers make/git push/pytest/npm keywords inside quoted `--learning` values plus
   a true-positive check that a bare `make check` still acquires the lock. Discovered when the hook
   blocked the `wv done` for the `--risks=` fix above.
-- **`pre-action.sh` path guard hardened**: replaced string matching with `realpath -m` + canonical
-  prefix check so edit guards apply regardless of symlinks or `..` traversal. JSON schema audit test
-  added to verify every hook event type in `test-hooks.sh`.
+- **`pre-action.sh` runtime guard bypass via symlinks (H2.T1)**: the hook blocked edits to paths
+  containing literal `runtime/` or `archive/runtime/` but resolved the path with simple string
+  matching. A symlink or `..` traversal could bypass the guard. Replaced with `realpath -m` +
+  canonical prefix check so the block applies regardless of how the path is spelled. JSON schema
+  audit test added to verify every hook event type in `test-hooks.sh`.
+
+### Changed
+
+- **Runtime archived to `archive/runtime/` (H3.T1)**: moved 88 source files and 39 test files from
+  `runtime/` to `archive/runtime/` and `archive/tests/` respectively. Removed the `runtime`
+  dependency group from `pyproject.toml` (anthropic, rich, textual, openai, keyring). Retargeted
+  pyright, mypy, and pytest config to exclude `archive/`. Updated `build-release.sh` strip paths,
+  `docs/ARCHITECTURE.md` §2 (marked archived), and `README.md` boundaries section. Bandit retargeted
+  to `scripts/weave_gh` + `scripts/weave_quality` with `--skip B108,B324,B608` for intentional false
+  positives (tmpfs paths, non-security MD5, internal SQL formatting). Runtime continues development
+  in the separate `weave-runtime` repo.
 
 ## [1.39.0] - 2026-04-16
+
+### Added
+
+- **Runtime middleware protocol**: `MiddlewareProtocol` base class with `before_query`,
+  `after_query`, `on_tool_result`, `on_turn_end` lifecycle hooks and `StackExecutor` for ordered
+  dispatch.
+- **Five middleware extractions (S3)**: `EnforcementMiddleware`, `CompactionMiddleware`,
+  `BudgetMiddleware`, `WeaveGraphMiddleware`, `LintAfterEditMiddleware` /
+  `SearchEfficiencyMiddleware` — all previously inline hooks now composable and independently
+  testable.
+- **Test parity gate**: Full parity audit of bash hook → middleware behavior, with gap-fill tests
+  for error handling, seeding guard, after_query no-op, and aged_results propagation.
 
 ### Fixed
 
@@ -72,6 +132,11 @@
   no raw `learning` key) no longer filtered as junk.
 - **FTS5 search**: Multi-word queries now use OR-token matching instead of phrase match, improving
   recall for `wv search` and `_related_learnings`.
+
+### Changed
+
+- **Runtime split epic**: Updated done criteria — deferred `runtime/` removal behind stabilisation
+  gate (3 clean standalone sessions). Crash-recovery metadata patched (6 missing commits added).
 
 ## [1.38.1] - 2026-04-16
 

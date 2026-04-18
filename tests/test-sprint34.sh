@@ -705,6 +705,103 @@ test_session_summary() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Test: wv session-summary hygiene score (C1)
+# ═══════════════════════════════════════════════════════════════════════════
+
+test_session_summary_hygiene() {
+    echo ""
+    echo "=== Session Summary Hygiene Score (C1) ==="
+
+    setup_test_env
+    $WV init >/dev/null 2>&1
+
+    # Snapshot at session start (zero baseline).
+    local snapshot="$WV_HOT_ZONE/.session_snapshot"
+    local now_ts
+    now_ts=$(date -u +%s)
+    printf '%s\t%s\t%s\t%s\n' "$((now_ts - 60))" "0" "0" "0" > "$snapshot"
+
+    # --- Component 1: edit discipline (no edit data → defaults to 25) ---
+    local json_out
+    json_out=$($WV session-summary --json 2>&1)
+    assert_json_field "$json_out" ".hygiene.edit_discipline" "25" "edit defaults to 25 when no edits recorded"
+
+    # Seed edit counter: 4 of 5 edits had active node = 80% = 20pts.
+    echo '{"total":5,"with_active":4}' > "$WV_HOT_ZONE/session-edits.json"
+    json_out=$($WV session-summary --json 2>&1)
+    assert_json_field "$json_out" ".hygiene.edit_discipline" "20" "edit_discipline = 25 * 4/5 = 20"
+    assert_json_field "$json_out" ".hygiene.edits_total" "5" "edits_total surfaces in JSON"
+
+    # 0% with active → 0 pts.
+    echo '{"total":3,"with_active":0}' > "$WV_HOT_ZONE/session-edits.json"
+    json_out=$($WV session-summary --json 2>&1)
+    assert_json_field "$json_out" ".hygiene.edit_discipline" "0" "edit_discipline = 0 when no edits had active node"
+
+    # --- Component 2: criteria discipline ---
+    # Create 2 nodes: one with done_criteria, one without.
+    rm -f "$WV_HOT_ZONE/session-edits.json"
+    local id1 id2
+    id1=$($WV add "with criteria" --criteria="must do X" 2>/dev/null | tail -1)
+    id2=$($WV add "without criteria" 2>/dev/null | tail -1)
+    json_out=$($WV session-summary --json 2>&1)
+    assert_json_field "$json_out" ".hygiene.criteria_discipline" "12" "criteria_discipline = 25 * 1/2 = 12 (truncated)"
+
+    # --- Component 3: learning discipline ---
+    # Close one with structured learning, one without.
+    $WV done "$id1" --learning="decision: do X | pattern: pattern" >/dev/null 2>&1
+    $WV done "$id2" >/dev/null 2>&1
+    json_out=$($WV session-summary --json 2>&1)
+    assert_json_field "$json_out" ".hygiene.learning_discipline" "12" "learning_discipline = 25 * 1/2 = 12"
+
+    # --- Component 4: call discipline ---
+    # Below threshold = full 25 pts.
+    echo '{"calls":15,"bytes":0,"advised":false}' > "$WV_HOT_ZONE/session-budget.json"
+    json_out=$($WV session-summary --json 2>&1)
+    assert_json_field "$json_out" ".hygiene.call_discipline" "25" "call_discipline = 25 below threshold"
+
+    # 5 over threshold (default 20) → 25 - 5 = 20.
+    echo '{"calls":25,"bytes":0,"advised":false}' > "$WV_HOT_ZONE/session-budget.json"
+    json_out=$($WV session-summary --json 2>&1)
+    assert_json_field "$json_out" ".hygiene.call_discipline" "20" "call_discipline drops 1pt per call past threshold"
+
+    # Floors at 0 for runaway calls.
+    echo '{"calls":100,"bytes":0,"advised":false}' > "$WV_HOT_ZONE/session-budget.json"
+    json_out=$($WV session-summary --json 2>&1)
+    assert_json_field "$json_out" ".hygiene.call_discipline" "0" "call_discipline floors at 0"
+
+    # --- Total score sums components ---
+    rm -f "$WV_HOT_ZONE/session-budget.json" "$WV_HOT_ZONE/session-edits.json"
+    json_out=$($WV session-summary --json 2>&1)
+    local total
+    total=$(echo "$json_out" | jq -r '.hygiene.score')
+    local edit_v crit_v learn_v call_v
+    edit_v=$(echo "$json_out" | jq -r '.hygiene.edit_discipline')
+    crit_v=$(echo "$json_out" | jq -r '.hygiene.criteria_discipline')
+    learn_v=$(echo "$json_out" | jq -r '.hygiene.learning_discipline')
+    call_v=$(echo "$json_out" | jq -r '.hygiene.call_discipline')
+    local expected=$((edit_v + crit_v + learn_v + call_v))
+    assert_equals "$expected" "$total" "hygiene.score = sum of four components"
+
+    # --- Trend storage: history node grows on each call, capped at 20 ---
+    local hist_count
+    hist_count=$(sqlite3 "$WV_DB" "SELECT json_array_length(json_extract(metadata, '\$.history')) FROM nodes WHERE json_extract(metadata, '\$.type') = 'session_history';" 2>/dev/null)
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [ -n "$hist_count" ] && [ "$hist_count" -gt 0 ]; then
+        echo -e "${GREEN}✓${NC} hygiene history node persists (entries: $hist_count)"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo -e "${RED}✗${NC} hygiene history node should exist after session-summary calls"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+
+    # Text output renders the score line.
+    local text_out
+    text_out=$($WV session-summary 2>&1)
+    assert_contains "$text_out" "Hygiene:" "text output includes Hygiene line"
+    assert_contains "$text_out" "/100" "text output shows score over 100"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Test: wv learnings --dedup
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -902,6 +999,7 @@ main() {
     test_learning_hygiene
     test_health_history
     test_session_summary
+    test_session_summary_hygiene
     test_learnings_dedup
     test_resolve_first_id
     test_checkpoint_trailers

@@ -628,6 +628,26 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "post-edit-lint: exits 0 for Python file"
 
+# Regression: tool_response.success=false must short-circuit (jq '.x // true'
+# previously collapsed explicit boolean false to true). Write a syntactically
+# broken Python file; if the success=false guard is honored, ruff is never
+# invoked and no additionalContext is emitted.
+echo 'def broken(' > "$TEST_DIR/project/broken.py"
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project/broken.py\"},\"tool_response\":{\"success\":false}}" \
+    | bash "$HOOKS_DIR/post-edit-lint.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "post-edit-lint: exits 0 when tool reported failure"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -z "$OUTPUT" ]]; then
+    echo -e "${GREEN}✓${NC} post-edit-lint: emits nothing when tool_response.success=false"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} post-edit-lint: should skip lint on tool failure (got: $OUTPUT)"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 # --- stop-check.sh (clean state) ---
 echo ""
 echo "--- stop-check.sh ---"
@@ -972,6 +992,171 @@ fi
 #   SessionStart→ hookSpecificOutput.additionalContext (no permissionDecision)
 # The common regression is using the wrong event's schema (e.g. permissionDecision
 # inside a Stop hook) — the CLI silently ignores such output.
+# ============================================================
+# Test: wv-budget-tally.sh — A2 in-session token tally hook
+# ============================================================
+echo ""
+echo "Test: wv-budget-tally"
+echo "====================="
+setup_test_env
+
+export WV_BUDGET_DIR="$TEST_DIR/budget"
+BUDGET_FILE="$WV_BUDGET_DIR/session-budget.json"
+rm -rf "$WV_BUDGET_DIR"
+unset WV_NONINTERACTIVE WV_BUDGET_DISABLE
+export WV_BUDGET_THRESHOLD=3
+
+# 1) Non-Bash tool: ignored
+OUTPUT=$(echo '{"tool_name":"Edit","tool_input":{"file_path":"x.py"},"tool_response":{"output":"ok"}}' \
+    | bash "$HOOKS_DIR/wv-budget-tally.sh" 2>&1 || true)
+assert_equals "" "$OUTPUT" "budget-tally: non-Bash tool produces no output"
+
+# 2) Bash but non-wv command: ignored, no budget file
+OUTPUT=$(echo '{"tool_name":"Bash","tool_input":{"command":"git status"},"tool_response":{"output":"clean"}}' \
+    | bash "$HOOKS_DIR/wv-budget-tally.sh" 2>&1 || true)
+assert_equals "" "$OUTPUT" "budget-tally: non-wv Bash produces no output"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -f "$BUDGET_FILE" ]]; then
+    echo -e "${GREEN}✓${NC} budget-tally: non-wv Bash does not create budget file"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} budget-tally: budget file should not exist for non-wv calls"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# 3) wv call below threshold: tallied, no advisory
+OUTPUT=$(echo '{"tool_name":"Bash","tool_input":{"command":"wv status"},"tool_response":{"output":"some output"}}' \
+    | bash "$HOOKS_DIR/wv-budget-tally.sh" 2>&1 || true)
+assert_equals "" "$OUTPUT" "budget-tally: 1st wv call below threshold = no advisory"
+CALLS=$(jq -r '.calls' "$BUDGET_FILE" 2>/dev/null || echo "")
+assert_equals "1" "$CALLS" "budget-tally: 1st call increments counter to 1"
+
+# 4) Reach threshold (call #3) — advisory fires
+echo '{"tool_name":"Bash","tool_input":{"command":"wv ready"},"tool_response":{"output":"ab"}}' \
+    | bash "$HOOKS_DIR/wv-budget-tally.sh" >/dev/null 2>&1 || true
+OUTPUT=$(echo '{"tool_name":"Bash","tool_input":{"command":"./scripts/wv learnings"},"tool_response":{"output":"longer output text"}}' \
+    | bash "$HOOKS_DIR/wv-budget-tally.sh" 2>&1 || true)
+assert_contains "$OUTPUT" "additionalContext" "budget-tally: threshold call emits additionalContext"
+assert_contains "$OUTPUT" "wv called 3x" "budget-tally: advisory mentions call count"
+assert_contains "$OUTPUT" "narrower queries" "budget-tally: advisory suggests narrower queries"
+
+# 5) Advisory only fires once per session
+OUTPUT=$(echo '{"tool_name":"Bash","tool_input":{"command":"wv show wv-abc"},"tool_response":{"output":"x"}}' \
+    | bash "$HOOKS_DIR/wv-budget-tally.sh" 2>&1 || true)
+assert_equals "" "$OUTPUT" "budget-tally: advisory fires only once per session"
+CALLS=$(jq -r '.calls' "$BUDGET_FILE")
+assert_equals "4" "$CALLS" "budget-tally: 4th call still counted after advisory"
+
+# 6) WV_NONINTERACTIVE suppresses advisory across the threshold
+rm -f "$BUDGET_FILE"
+export WV_NONINTERACTIVE=1
+for _ in 1 2 3 4; do
+    echo '{"tool_name":"Bash","tool_input":{"command":"wv status"},"tool_response":{"output":"x"}}' \
+        | bash "$HOOKS_DIR/wv-budget-tally.sh" >/dev/null 2>&1 || true
+done
+OUTPUT=$(echo '{"tool_name":"Bash","tool_input":{"command":"wv status"},"tool_response":{"output":"x"}}' \
+    | bash "$HOOKS_DIR/wv-budget-tally.sh" 2>&1 || true)
+assert_equals "" "$OUTPUT" "budget-tally: WV_NONINTERACTIVE suppresses advisory"
+CALLS=$(jq -r '.calls' "$BUDGET_FILE")
+assert_equals "5" "$CALLS" "budget-tally: WV_NONINTERACTIVE still tallies calls"
+unset WV_NONINTERACTIVE
+unset WV_BUDGET_THRESHOLD
+unset WV_BUDGET_DIR
+
+# ============================================================
+# Test: wv-touched-files.sh — B1 relevance signal hook
+# ============================================================
+echo ""
+echo "Test: wv-touched-files"
+echo "======================"
+setup_test_env
+
+export WV_TOUCHED_DIR="$TEST_DIR/touched"
+RING_FILE="$WV_TOUCHED_DIR/recent-edits.txt"
+rm -rf "$WV_TOUCHED_DIR"
+export WV_TOUCHED_NODE_CAP=50
+export WV_TOUCHED_RING_CAP=20
+
+# Set up a fake DB with one active node so the hook has something to write to.
+TF_DB="$TEST_DIR/touched-brain.db"
+rm -f "$TF_DB"
+sqlite3 "$TF_DB" "CREATE TABLE nodes (id TEXT PRIMARY KEY, status TEXT, metadata TEXT, updated_at DATETIME);"
+sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-active1', 'active', '{}', datetime('now'));"
+sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-todo1', 'todo', '{}', datetime('now'));"
+export WV_DB="$TF_DB"
+
+# 1) Non-edit tool: ignored
+OUTPUT=$(echo '{"tool_name":"Bash","tool_input":{"command":"ls"},"tool_response":{"success":true}}' \
+    | bash "$HOOKS_DIR/wv-touched-files.sh" 2>&1 || true)
+assert_equals "" "$OUTPUT" "touched-files: non-edit tool produces no output"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -f "$RING_FILE" ]]; then
+    echo -e "${GREEN}✓${NC} touched-files: non-edit tool does not create ring"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} touched-files: ring should not exist for non-edit calls"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# 2) Edit on a file: writes to ring AND updates active node metadata
+echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/foo.py\"},\"tool_response\":{\"success\":true}}" \
+    | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
+RING_CONTENT=$(cat "$RING_FILE" 2>/dev/null || echo "")
+assert_contains "$RING_CONTENT" "foo.py" "touched-files: ring records edited file"
+META_FILES=$(sqlite3 "$TF_DB" "SELECT json_extract(metadata, '\$.touched_files') FROM nodes WHERE id='wv-active1';" 2>/dev/null)
+assert_contains "$META_FILES" "foo.py" "touched-files: active node metadata.touched_files updated"
+
+# 3) Failed tool call: skipped
+echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/never.py\"},\"tool_response\":{\"success\":false}}" \
+    | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
+RING_CONTENT=$(cat "$RING_FILE" 2>/dev/null || echo "")
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$RING_CONTENT" | grep -qF "never.py"; then
+    echo -e "${GREEN}✓${NC} touched-files: failed tool call is skipped"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} touched-files: failed tool call should not write ring"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# 4) Dedup: same file edited twice appears once in ring
+echo "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$TEST_DIR/foo.py\"},\"tool_response\":{\"success\":true}}" \
+    | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
+FOO_COUNT=$(grep -c "foo.py" "$RING_FILE" 2>/dev/null || echo 0)
+assert_equals "1" "$FOO_COUNT" "touched-files: ring deduplicates repeated paths"
+
+# 5) Ring cap: only last N paths retained
+export WV_TOUCHED_RING_CAP=3
+rm -f "$RING_FILE"
+for i in 1 2 3 4 5; do
+    echo "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$TEST_DIR/file${i}.py\"},\"tool_response\":{\"success\":true}}" \
+        | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
+done
+RING_LINES=$(wc -l < "$RING_FILE" 2>/dev/null || echo 0)
+assert_equals "3" "$RING_LINES" "touched-files: ring respects cap (last 3 of 5)"
+RING_CONTENT=$(cat "$RING_FILE" 2>/dev/null || echo "")
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$RING_CONTENT" | grep -qF "file1.py"; then
+    echo -e "${GREEN}✓${NC} touched-files: oldest path evicted"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} touched-files: oldest path should have been evicted"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+assert_contains "$RING_CONTENT" "file5.py" "touched-files: newest path retained"
+
+# 6) Node cap on metadata.touched_files
+export WV_TOUCHED_NODE_CAP=2
+sqlite3 "$TF_DB" "UPDATE nodes SET metadata='{}' WHERE id='wv-active1';"
+for i in a b c d; do
+    echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/${i}.py\"},\"tool_response\":{\"success\":true}}" \
+        | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
+done
+NODE_COUNT=$(sqlite3 "$TF_DB" "SELECT json_array_length(json_extract(metadata, '\$.touched_files')) FROM nodes WHERE id='wv-active1';" 2>/dev/null)
+assert_equals "2" "$NODE_COUNT" "touched-files: active node touched_files capped"
+
+unset WV_TOUCHED_DIR WV_TOUCHED_NODE_CAP WV_TOUCHED_RING_CAP WV_DB
+
 echo ""
 echo "--- Hook JSON schema audit ---"
 
@@ -983,6 +1168,8 @@ declare -A HOOK_EVENTS=(
     [bash-dedup.sh]=PreToolUse
     [post-edit-lint.sh]=PostToolUse
     [bash-dedup-post.sh]=PostToolUse
+    [wv-budget-tally.sh]=PostToolUse
+    [wv-touched-files.sh]=PostToolUse
     [stop-check.sh]=Stop
     [session-start-context.sh]=SessionStart
     [context-guard.sh]=SessionStart

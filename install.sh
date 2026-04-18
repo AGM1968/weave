@@ -310,6 +310,8 @@ if [ -f "./scripts/wv" ]; then
     cp ./.claude/hooks/pre-close-verification.sh "$CONFIG_DIR/hooks/"
     cp ./.claude/hooks/bash-dedup.sh "$CONFIG_DIR/hooks/"
     cp ./.claude/hooks/bash-dedup-post.sh "$CONFIG_DIR/hooks/"
+    cp ./.claude/hooks/wv-budget-tally.sh "$CONFIG_DIR/hooks/"
+    cp ./.claude/hooks/wv-touched-files.sh "$CONFIG_DIR/hooks/"
     # Agents
     cp ./.claude/agents/weave-guide.md "$CONFIG_DIR/agents/"
     cp ./.claude/agents/epic-planner.md "$CONFIG_DIR/agents/"
@@ -405,6 +407,8 @@ else
     curl -sSL "$REPO/.claude/hooks/pre-action.sh" -o "$CONFIG_DIR/hooks/pre-action.sh"
     curl -sSL "$REPO/.claude/hooks/pre-claim-skills.sh" -o "$CONFIG_DIR/hooks/pre-claim-skills.sh"
     curl -sSL "$REPO/.claude/hooks/pre-close-verification.sh" -o "$CONFIG_DIR/hooks/pre-close-verification.sh"
+    curl -sSL "$REPO/.claude/hooks/wv-budget-tally.sh" -o "$CONFIG_DIR/hooks/wv-budget-tally.sh"
+    curl -sSL "$REPO/.claude/hooks/wv-touched-files.sh" -o "$CONFIG_DIR/hooks/wv-touched-files.sh"
     # Agents
     curl -sSL "$REPO/.claude/agents/weave-guide.md" -o "$CONFIG_DIR/agents/weave-guide.md"
     curl -sSL "$REPO/.claude/agents/epic-planner.md" -o "$CONFIG_DIR/agents/epic-planner.md"
@@ -490,6 +494,12 @@ merge_global_claude_settings() {
                 ]},
                 {"matcher":"Bash","hooks":[
                     {"type":"command","command":($h+"/bash-dedup-post.sh"),"timeout":5}
+                ]},
+                {"matcher":"Bash","hooks":[
+                    {"type":"command","command":($h+"/wv-budget-tally.sh"),"timeout":5}
+                ]},
+                {"matcher":"Edit|Write|NotebookEdit|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file","hooks":[
+                    {"type":"command","command":($h+"/wv-touched-files.sh"),"timeout":5}
                 ]}
             ],
             "PostToolUseFailure": [

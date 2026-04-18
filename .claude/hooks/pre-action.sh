@@ -43,60 +43,6 @@ After editing source, run: ./install.sh
 EOF
         exit 2
     fi
-    # Block edits under the archived runtime/ tree — canonical source is weave-runtime.
-    # Uses realpath + prefix comparison rather than regex to resist case-folding filesystems
-    # and symlink-based bypasses. Allow runtime/README.md (archive banner maintenance).
-    if [ -n "$FILE_PATH" ]; then
-        # Walk up to the nearest existing directory so git rev-parse works
-        # even when writing a new file under a not-yet-created subdir.
-        _PA_FILE_DIR=$(dirname "$FILE_PATH" 2>/dev/null)
-        while [ -n "$_PA_FILE_DIR" ] && [ "$_PA_FILE_DIR" != "/" ] && [ ! -d "$_PA_FILE_DIR" ]; do
-            _PA_FILE_DIR=$(dirname "$_PA_FILE_DIR")
-        done
-        _PA_REPO_ROOT=$(git -C "$_PA_FILE_DIR" rev-parse --show-toplevel 2>/dev/null || true)
-        # Scope the block to the memory-system repo (by basename) so edits in
-        # other repos that happen to contain a runtime/ dir aren't affected.
-        if [ -n "$_PA_REPO_ROOT" ] && [ "$(basename "$_PA_REPO_ROOT")" = "memory-system" ]; then
-            for _PA_RT_REL in runtime archive/runtime; do
-                _PA_RT_ABS="$_PA_REPO_ROOT/$_PA_RT_REL"
-                [ -d "$_PA_RT_ABS" ] || continue
-                _PA_REAL_RT=$(realpath "$_PA_RT_ABS" 2>/dev/null) || continue
-                _PA_REAL_FILE=$(realpath -m "$FILE_PATH" 2>/dev/null) || continue
-                _PA_REAL_README=$(realpath -m "$_PA_RT_ABS/README.md" 2>/dev/null)
-                if [ "$_PA_REAL_FILE" = "$_PA_REAL_README" ]; then
-                    continue
-                fi
-                if [ "$_PA_REAL_FILE" = "$_PA_REAL_RT" ] || [[ "$_PA_REAL_FILE" == "$_PA_REAL_RT"/* ]]; then
-                    _PA_RUNTIME_LOCAL="${WV_RUNTIME_REPO:-}"
-                    if [ -z "$_PA_RUNTIME_LOCAL" ] && [ -d "$HOME/Projects/weave-runtime" ]; then
-                        _PA_RUNTIME_LOCAL="$HOME/Projects/weave-runtime"
-                    fi
-                    if [ -n "$_PA_RUNTIME_LOCAL" ]; then
-                        _PA_RUNTIME_HINT="Local clone: $_PA_RUNTIME_LOCAL"
-                        _PA_RUNTIME_CD="  cd $_PA_RUNTIME_LOCAL"
-                    else
-                        _PA_RUNTIME_HINT="Set WV_RUNTIME_REPO to your local weave-runtime checkout, or clone AGM1968/weave-runtime."
-                        _PA_RUNTIME_CD="  # edit weave_runtime/<same-relative-path> in that clone"
-                    fi
-                    cat >&2 <<EOF
-ERROR: memory-system/$_PA_RT_REL/ is ARCHIVED (Weave node wv-63ca4f).
-Path: $FILE_PATH
-Resolved: $_PA_REAL_FILE
-
-Canonical source: AGM1968/weave-runtime
-$_PA_RUNTIME_HINT
-Make the change there instead:
-$_PA_RUNTIME_CD
-  # edit weave_runtime/<same-relative-path>
-
-If this edit is genuinely needed here (e.g. amending the archive banner),
-edit $_PA_RT_REL/README.md which is allowed.
-EOF
-                    exit 2
-                fi
-            done
-        fi
-    fi
 fi
 
 # Check if this is an operation we should enforce
@@ -151,9 +97,32 @@ if [ ! -f "$_PA_DB" ]; then
     exit 0
 fi
 
+# Hygiene tally (C1): track Edit/Write attempts in this repo and how many had
+# an active node at the gate. Read by `wv session-summary` to compute score.
+# Only count true Edit-class operations (not the wv done Bash variant).
+if [[ "$TOOL" =~ ^(Edit|Write|NotebookEdit|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file|edit_notebook_file)$ ]]; then
+    _PA_EDITS_FILE="${_PA_HOT_ZONE}/session-edits.json"
+    _PA_PRIOR=$(cat "$_PA_EDITS_FILE" 2>/dev/null || echo '{}')
+    _PA_TOTAL=$(echo "$_PA_PRIOR" | jq -r '.total // 0' 2>/dev/null || echo 0)
+    _PA_WITH=$(echo "$_PA_PRIOR" | jq -r '.with_active // 0' 2>/dev/null || echo 0)
+    _PA_NEW_TOTAL=$((_PA_TOTAL + 1))
+    # Compute with_active increment after the active check below; persist totals now.
+fi
+
 # Get active nodes
 ACTIVE_NODES=$("$WV" list --status=active --json 2>/dev/null || echo "[]")
 ACTIVE_COUNT=$(echo "$ACTIVE_NODES" | jq 'length' 2>/dev/null || echo "0")
+
+# Persist hygiene tally now that ACTIVE_COUNT is known.
+if [ -n "${_PA_NEW_TOTAL:-}" ]; then
+    _PA_NEW_WITH="$_PA_WITH"
+    [ "$ACTIVE_COUNT" != "0" ] && _PA_NEW_WITH=$((_PA_WITH + 1))
+    jq -n \
+        --argjson total "$_PA_NEW_TOTAL" \
+        --argjson with_active "$_PA_NEW_WITH" \
+        '{total:$total, with_active:$with_active}' \
+        > "$_PA_EDITS_FILE" 2>/dev/null || true
+fi
 
 if [ "$ACTIVE_COUNT" = "0" ]; then
     # No active nodes, suggest using /weave to start work

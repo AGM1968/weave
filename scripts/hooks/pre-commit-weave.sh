@@ -38,8 +38,8 @@ if [ -z "$WS_DIFF" ] && [ -n "$FULL_DIFF" ]; then
     exit 0
 fi
 
-# Run ruff linter on staged Python files
-STAGED_PY_FILES=$(echo "$NON_WEAVE_FILES" | grep '\.py$' || true)
+# Run ruff linter on staged Python files (added/modified only — skip deletions)
+STAGED_PY_FILES=$(git diff --cached --name-only --diff-filter=AM 2>/dev/null | grep '\.py$' | grep -v '^\.weave/' || true)
 if [ -n "$STAGED_PY_FILES" ]; then
     if command -v ruff > /dev/null 2>&1; then
         # shellcheck disable=SC2086

@@ -12,6 +12,7 @@ CREATE TABLE nodes (
     priority INTEGER GENERATED ALWAYS AS (json_extract(metadata, '$.priority')) VIRTUAL,
     type TEXT GENERATED ALWAYS AS (json_extract(metadata, '$.type')) VIRTUAL
 );
+INSERT INTO nodes VALUES('wv-7b1fe0','release: v1.41.0 public weave repo','todo',replace('{\n  "done_criteria": [\n    "commit, tag, push, GH release"\n  ],\n  "risks": [],\n  "risk_level": "low"\n}','\n',char(10)),NULL,'2026-04-18 18:25:10','2026-04-18 18:25:10');
 COMMIT;
 PRAGMA foreign_keys=OFF;
 BEGIN TRANSACTION;
