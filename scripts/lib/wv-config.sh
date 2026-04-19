@@ -65,24 +65,30 @@ detect_hot_zone() {
         return
     fi
 
+    # Per-UID fallback dirs avoid shared-parent /tmp/weave races on multi-user
+    # hosts (security review L1, 2026-04-19). /dev/shm/weave still uses the
+    # classic name because /dev/shm is already 1777 and weave creates its own
+    # 700-mode subdir there.
+    local uid
+    uid=$(id -u 2>/dev/null || echo "$UID")
     case "$(uname -s)" in
         Linux*)
             if is_container; then
                 echo "wv: container detected, using /tmp (safe default)" >&2
-                echo "/tmp/weave"
+                echo "/tmp/weave-${uid}"
             elif [ -d "/dev/shm" ] && [ -w "/dev/shm" ] && check_free_space "/dev/shm"; then
                 echo "/dev/shm/weave"
             else
                 [ -d "/dev/shm" ] && [ -w "/dev/shm" ] && \
                     echo "wv: /dev/shm has <${WV_MIN_SHM}KB free, falling back to /tmp" >&2
-                echo "/tmp/weave"
+                echo "/tmp/weave-${uid}"
             fi
             ;;
         Darwin*)
-            echo "${TMPDIR:-/tmp}/weave"
+            echo "${TMPDIR:-/tmp}/weave-${uid}"
             ;;
         MINGW*|CYGWIN*|MSYS*)
-            echo "${TEMP:-/tmp}/weave"
+            echo "${TEMP:-/tmp}/weave-${uid}"
             ;;
         *)
             echo "$WEAVE_DIR"

@@ -999,6 +999,59 @@ test_update_status_validation() {
     teardown_test_env
 }
 
+test_add_status_validation() {
+    echo ""
+    echo -e "${CYAN}Test: wv add Rejects Invalid Status — M1 (v1.41.3)${NC}"
+    echo "=========================================================="
+    setup_test_env
+
+    # M1 regression: cmd_add now calls validate_status before INSERT
+    local exit_code=0
+    "$WV" add "m1 test" --status=banana >/dev/null 2>&1 || exit_code=$?
+    assert_fails "wv add rejects invalid status 'banana'" "$exit_code"
+
+    # Classic SQL-injection payload must be rejected before reaching SQL.
+    exit_code=0
+    "$WV" add "m1 injection" --status="todo', alias='admin'--" >/dev/null 2>&1 || exit_code=$?
+    assert_fails "wv add rejects status with quote-breakout payload" "$exit_code"
+
+    # Valid statuses still work.
+    for valid_status in todo active done blocked blocked-external; do
+        local v_exit=0
+        "$WV" add "m1 valid $valid_status" --status="$valid_status" >/dev/null 2>&1 || v_exit=$?
+        assert_equals "0" "$v_exit" "wv add accepts status=$valid_status" || true
+    done
+
+    teardown_test_env
+}
+
+test_remove_key_validation() {
+    echo ""
+    echo -e "${CYAN}Test: wv update --remove-key Validates Key — M2 (v1.41.3)${NC}"
+    echo "=========================================================="
+    setup_test_env
+
+    local id
+    id=$(get_id "$("$WV" add "m2 test" --metadata='{"foo":"bar"}' 2>&1)")
+
+    # M2 regression: --remove-key must reject SQL-injection payloads.
+    local exit_code=0
+    "$WV" update "$id" "--remove-key=foo'); DROP TABLE nodes; --" >/dev/null 2>&1 || exit_code=$?
+    assert_fails "wv update rejects --remove-key with SQL-injection payload" "$exit_code"
+
+    # Table must still exist after rejected payload.
+    local node_count
+    node_count=$("$WV" list --json 2>/dev/null | jq 'length')
+    [ "$node_count" -gt 0 ] && assert_equals "1" "1" "nodes table survived rejected --remove-key"
+
+    # Valid key name still works.
+    exit_code=0
+    "$WV" update "$id" --remove-key=foo >/dev/null 2>&1 || exit_code=$?
+    assert_equals "0" "$exit_code" "wv update accepts valid --remove-key=foo"
+
+    teardown_test_env
+}
+
 test_prune_age_zero_guard() {
     echo ""
     echo -e "${CYAN}Test: wv prune --age=0h Safety — wv-bea8 (4.7.3)${NC}"
@@ -1247,6 +1300,8 @@ echo ""
 echo -e "${YELLOW}── Section 4.7: Known Bug Regression Tests (P0) ──${NC}"
 test_work_status_model
 test_update_status_validation
+test_add_status_validation
+test_remove_key_validation
 test_prune_age_zero_guard
 test_search_apostrophe
 test_ready_json_empty

@@ -9,8 +9,17 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 db_init() {
+    # Security: hot zone may be under /dev/shm or /tmp (shared-mount parents).
+    # Create 700/600 so other local users cannot read the graph. `umask 077`
+    # covers the DB file; explicit chmod covers existing dirs that predate
+    # this change. See security review L5 (2026-04-19).
+    local prev_umask
+    prev_umask=$(umask)
+    umask 077
     mkdir -p "$WV_HOT_ZONE"
+    chmod 700 "$WV_HOT_ZONE" 2>/dev/null || true
     mkdir -p "$WEAVE_DIR"
+    umask "$prev_umask"
     validate_hot_size
 
     local pragmas
@@ -93,6 +102,8 @@ CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
     VALUES (new.rowid, new.id, new.text, new.metadata);
 END;
 EOF
+    # Tighten perms on the DB file in case it predates the umask change.
+    [ -f "$WV_DB" ] && chmod 600 "$WV_DB" 2>/dev/null || true
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -527,7 +527,14 @@ cmd_sync() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_load() {
+    # Security: create hot zone 0700 so sibling users cannot read state
+    # (see wv-db.sh db_init; same rationale).
+    local prev_umask
+    prev_umask=$(umask)
+    umask 077
     mkdir -p "$WV_HOT_ZONE"
+    chmod 700 "$WV_HOT_ZONE" 2>/dev/null || true
+    umask "$prev_umask"
 
     # Pre-flight: flush live DB → state.sql before loading to prevent status
     # regression when in-session wv done closures were throttled and not yet synced.

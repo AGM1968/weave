@@ -71,6 +71,19 @@ sql_escape() {
     echo "${text//\'/\'\'}"
 }
 
+# Validate a metadata key name (callers splice these into SQLite JSON-path
+# literals like '$.${key}' where escape-doubling would not help — the value
+# must contain no quote or path-breaking chars).
+# Usage: validate_metadata_key "$key" || return 1
+validate_metadata_key() {
+    local key="$1"
+    if [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]]; then
+        return 0
+    fi
+    echo -e "${RED}Error: invalid metadata key '$key' (must match [A-Za-z_][A-Za-z0-9_.-]*)${NC}" >&2
+    return 1
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Status Validation
 # ═══════════════════════════════════════════════════════════════════════════

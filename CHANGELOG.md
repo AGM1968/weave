@@ -4,6 +4,38 @@
 
 ## [Unreleased]
 
+## [1.41.3] - 2026-04-19
+
+### Security
+
+- **M1 — SQL injection in `wv add --status=`**: `cmd_add` now calls `validate_status` before the
+  `INSERT`, matching `cmd_update`. Without the guard, a crafted `--status=` value could splice past
+  the status literal and rewrite sibling columns.
+- **M2 — SQL injection in `--remove-key=`**: a new `validate_metadata_key` helper
+  (`^[A-Za-z_][A-Za-z0-9_.-]*$`) blocks injection payloads at both sinks (`cmd_update` and
+  `cmd_bulk_update`). Keys splice into SQLite JSON-path literals without escape-doubling, so
+  enum/regex validation was mandatory.
+- **L1+L5 — hot zone hardening**: `/tmp/weave` fallback is now `/tmp/weave-$(id -u)` (eliminates
+  shared-parent races on multi-user hosts). `db_init` and `cmd_load` set `umask 077` around mkdir
+  and `chmod 700` the hot zone; `db_init` `chmod 600` on `brain.db`. `/dev/shm` default unchanged
+  (its parent is already 1777 and we create per-repo subdir 0700).
+- **L2 — explicit `usedforsecurity=False`** on `hashlib.md5` in `weave_gh.data` with inline comment.
+  The hash is a filesystem namespace, not a security primitive; the flag documents intent and
+  silences bandit B324.
+- **L4 — bash-dedup liveness glob scoped to own UID**: `/tmp/claude-$(id -u)/…` so cross-user
+  TASK_ID collisions cannot leak another user's output file.
+
+### Tests
+
+- `test_add_status_validation` and `test_remove_key_validation` added to `test-stress.sh`. Cover
+  banana status, quote-breakout payload, `DROP TABLE` via `--remove-key`, and positive enum/regex
+  coverage.
+
+### Deferred
+
+- **M3 — signed install manifest**: proposal-scope (GPG vs cosign + build-release.sh changes).
+  Tracked as `wv-fecd7c`.
+
 ## [1.41.2] - 2026-04-19
 
 ### Fixed

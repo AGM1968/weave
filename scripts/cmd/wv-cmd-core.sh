@@ -245,6 +245,8 @@ cmd_add() {
         return 1
     fi
 
+    validate_status "$status" || return 1
+
     # Merge --criteria and --risks into metadata before JSON validation.
     # --criteria="c1|c2|c3"  → done_criteria: ["c1","c2","c3"]
     # --risks=<level>         → risk_level + risks: [] (all levels seed empty list so pre-claim hook's has("risks") check passes)
@@ -1112,6 +1114,10 @@ USAGE
         remove_keys=$(echo "$item" | jq -r '.["remove-keys"]? // empty | .[]?' 2>/dev/null)
         if [ -n "$remove_keys" ]; then
             while IFS= read -r key; do
+                if ! validate_metadata_key "$key"; then
+                    echo -e "${RED}Skipping invalid key '$key' for $item_id${NC}" >&2
+                    continue
+                fi
                 # Direct SQL remove (cmd_update --remove-key returns early after first key)
                 db_query "UPDATE nodes SET metadata = json_remove(metadata, '\$.${key}'), updated_at=CURRENT_TIMESTAMP WHERE id='$item_id';"
             done <<< "$remove_keys"
@@ -1966,6 +1972,7 @@ cmd_update() {
                     echo -e "${RED}Error: key name required for --remove-key${NC}" >&2
                     return 1
                 fi
+                validate_metadata_key "$remove_key" || return 1
                 # Use json_remove to atomically remove a single metadata key
                 db_query "UPDATE nodes SET metadata = json_remove(metadata, '\$.${remove_key}'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
                 echo -e "${GREEN}✓${NC} Removed metadata key '${remove_key}' from $id"

@@ -118,8 +118,11 @@ def _repo_hash() -> str:
         ).strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return ""
-    # echo adds trailing newline — match bash behavior exactly
-    return hashlib.md5((repo_root + "\n").encode()).hexdigest()[:8]
+    # echo adds trailing newline — match bash behavior exactly.
+    # MD5 here is a filesystem namespace, not a security primitive.
+    return hashlib.md5(  # noqa: S324
+        (repo_root + "\n").encode(), usedforsecurity=False
+    ).hexdigest()[:8]
 
 
 def _resolve_db_path() -> str:

@@ -136,7 +136,10 @@ if [[ -f "$LOCK_FILE" ]]; then
     # Falls back to TTL if task ID unknown or fuser/lsof unavailable.
     if [[ "$LOCK_PHASE" == "running" && "$TASK_ID" =~ ^[a-z0-9]+$ ]]; then
         # Glob for the task output file — path is /tmp/claude-<uid>/<repo-slug>/<session>/tasks/<id>.output
-        OUTPUT_FILE=$(ls /tmp/claude-*/*/*/tasks/"${TASK_ID}".output 2>/dev/null | head -1 || echo "")
+        # Restrict to our own UID so cross-user TASK_ID collisions cannot
+        # trick us into reading another user's output file (security L4).
+        CLAUDE_UID=$(id -u 2>/dev/null || echo "$UID")
+        OUTPUT_FILE=$(ls "/tmp/claude-${CLAUDE_UID}"/*/*/tasks/"${TASK_ID}".output 2>/dev/null | head -1 || echo "")
         if [[ -n "$OUTPUT_FILE" ]]; then
             if command -v fuser >/dev/null 2>&1; then
                 # fuser exits 1 when no process has the file open
