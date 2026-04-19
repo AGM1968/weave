@@ -528,10 +528,10 @@ _hygiene_score() {
     fi
 
     # Component 2: decomp discipline = % nodes created this session with done_criteria set.
-    # Exclude internal session_history singleton from denominator.
+    # Exclude internal session_history singleton and finding nodes (audit records, not work items).
     local created_session with_criteria
-    created_session=$(db_query "SELECT COUNT(*) FROM nodes WHERE created_at >= '$start_iso' AND json_extract(metadata, '\$.type') IS NOT 'session_history';" 2>/dev/null || echo 0)
-    with_criteria=$(db_query "SELECT COUNT(*) FROM nodes WHERE created_at >= '$start_iso' AND json_extract(metadata, '\$.done_criteria') IS NOT NULL AND json_extract(metadata, '\$.type') IS NOT 'session_history';" 2>/dev/null || echo 0)
+    created_session=$(db_query "SELECT COUNT(*) FROM nodes WHERE created_at >= '$start_iso' AND json_extract(metadata, '\$.type') IS NOT 'session_history' AND json_extract(metadata, '\$.type') IS NOT 'finding';" 2>/dev/null || echo 0)
+    with_criteria=$(db_query "SELECT COUNT(*) FROM nodes WHERE created_at >= '$start_iso' AND json_extract(metadata, '\$.done_criteria') IS NOT NULL AND json_extract(metadata, '\$.type') IS NOT 'session_history' AND json_extract(metadata, '\$.type') IS NOT 'finding';" 2>/dev/null || echo 0)
     : "${created_session:=0}"
     : "${with_criteria:=0}"
     if [ "$created_session" -gt 0 ]; then

@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+## [1.41.2] - 2026-04-19
+
+### Fixed
+
+- **Hygiene score penalises finding nodes**: the C1 session-summary rubric counted every node
+  created in the session as a work item; bulk `wv findings promote --apply` therefore dragged the
+  score from 100 to 65 because 168 new finding nodes had no `done_criteria`. Findings are audit
+  records, not tasks, and never carry `done_criteria`. `_hygiene_score` now excludes
+  `type == finding` from both the numerator and denominator of the criteria component (alongside the
+  existing `session_history` exclusion). Surfaced during the v1.41.1 consolidation pass.
+- **`wv findings list` unbounded output**: the list command emitted every finding with no default
+  cap. After historical-pitfall promotion the same command that previously produced ~3 KB of output
+  grew to ~26 KB (203 findings), re-introducing the exact token-spend class `wv learnings --cap` was
+  designed to prevent. Default is now `--limit=20`; `--limit=N` and `--all` override. Footer reports
+  "N of M finding(s) shown" when truncated.
+
+### Docs
+
+- CHANGELOG + CLI help updated for the new `--limit` / `--all` flags on `wv findings list`.
+
 ## [1.41.1] - 2026-04-19
 
 ### Fixed

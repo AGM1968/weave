@@ -75,13 +75,18 @@ EOF
 cmd_findings_list() {
     local format="text"
     local fixable_only=false
+    local limit=20
+    local show_all=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --json)    format="json" ;;
             --fixable) fixable_only=true ;;
+            --all)     show_all=true ;;
+            --limit=*) limit="${1#--limit=}" ;;
             --help|-h)
-                echo "Usage: wv findings list [--fixable] [--json]" >&2
+                echo "Usage: wv findings list [--fixable] [--json] [--limit=N | --all]" >&2
+                echo "  Default: shows most recent 20. Use --all for full list (can be large)." >&2
                 return 0
                 ;;
             *)
@@ -96,6 +101,15 @@ cmd_findings_list() {
     if [ "$fixable_only" = true ]; then
         fixable_clause="AND json_extract(n.metadata, '$.finding.fixable') = 1"
     fi
+
+    local limit_clause=""
+    if [ "$show_all" != true ]; then
+        limit_clause="LIMIT $limit"
+    fi
+
+    local total
+    total=$(db_query "SELECT COUNT(*) FROM nodes n WHERE json_extract(n.metadata, '\$.type') = 'finding' $fixable_clause;" 2>/dev/null || echo 0)
+    : "${total:=0}"
 
     local query="
         SELECT
@@ -113,7 +127,8 @@ cmd_findings_list() {
         FROM nodes n
         WHERE json_extract(n.metadata, '$.type') = 'finding'
         $fixable_clause
-        ORDER BY n.created_at DESC;
+        ORDER BY n.created_at DESC
+        $limit_clause;
     "
 
     if [ "$format" = "json" ]; then
@@ -121,7 +136,8 @@ cmd_findings_list() {
         results=$(db_query_json "SELECT n.id, n.text, n.status, n.metadata FROM nodes n
             WHERE json_extract(n.metadata, '$.type') = 'finding'
             $fixable_clause
-            ORDER BY n.created_at DESC;")
+            ORDER BY n.created_at DESC
+            $limit_clause;")
         [ -z "$results" ] && echo "[]" || echo "$results"
         return
     fi
@@ -161,7 +177,11 @@ cmd_findings_list() {
     done <<< "$rows"
 
     echo ""
-    echo "$count finding(s) total."
+    if [ "$show_all" != true ] && [ "$count" -lt "$total" ]; then
+        echo "$count of $total finding(s) shown. Use --all or --limit=N for more."
+    else
+        echo "$count finding(s) total."
+    fi
 }
 
 cmd_findings_promote() {
