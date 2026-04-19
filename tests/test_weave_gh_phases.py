@@ -953,6 +953,30 @@ class TestSyncWeaveToGithub:
 
         assert stats.skipped == 1
 
+    def test_finding_nodes_are_skipped(self) -> None:
+        """Nodes with node_type='finding' are skipped from GH sync.
+
+        Findings are internal audit records. Bulk `wv findings promote`
+        used to flood GH with hundreds of issues; the filter prevents
+        recurrence.
+        """
+        node = WeaveNode(
+            id="wv-finding", text="Finding: example", status="todo",
+            metadata={"type": "finding", "finding": {"fixable": False}},
+        )
+        stats = SyncStats()
+
+        with self._patches():
+            sync_weave_to_github(
+                [node], [],
+                "owner/repo", "https://github.com/owner/repo",
+                {node.id: node},
+                stats,
+            )
+
+        assert stats.skipped == 1
+        assert stats.created_gh == 0
+
     def test_gh_match_via_body_marker_routes_to_handle_existing(self) -> None:
         """Nodes matched via body marker are routed to _handle_existing_issue."""
         node = _node("wv-mark", status="active")

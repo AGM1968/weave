@@ -821,7 +821,7 @@ def _print_historical_review_event(
 ) -> None:
     """Emit a reviewed-candidate status line."""
     print(f"{label}: {candidate['text']}", file=sys.stderr)
-    print(f"  -> source {candidate['source_node']}", file=sys.stderr)
+    print(f"  -> addresses {candidate['source_node']}", file=sys.stderr)
     if parent:
         print(f"  -> references {parent}", file=sys.stderr)
 
@@ -859,7 +859,7 @@ def _apply_historical_candidate(
         _wv_cmd("link", node_id, parent, "--type=references")
     source_node = str(candidate["source_node"])
     if source_node != parent:
-        _wv_cmd("link", node_id, source_node, "--type=references")
+        _wv_cmd("link", node_id, source_node, "--type=addresses")
     print(f"Created {node_id}: {candidate['text']}", file=sys.stderr)
     return {"node_id": node_id, "created": True, "eligible_for_apply": True}, None
 

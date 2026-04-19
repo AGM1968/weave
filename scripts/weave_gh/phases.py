@@ -292,8 +292,11 @@ def sync_weave_to_github(  # noqa: C901
     processed_gh: set[int] = set()
 
     for node in nodes:
-        # Skip test nodes and no_sync nodes
-        if node.is_test or node.no_sync:
+        # Skip test nodes, no_sync nodes, and finding nodes.
+        # Findings are internal audit records — not external work items — and
+        # bulk promotion of historical learnings would otherwise flood GH
+        # issues.
+        if node.is_test or node.no_sync or node.node_type == "finding":
             stats.skipped += 1
             continue
 

@@ -884,7 +884,7 @@ class TestCmdFindingsPromote:  # pylint: disable=too-many-public-methods
         assert data["promoted"][0]["node_id"] == "wv-new123"
         link_calls = [call.args for call in mock_wv.call_args_list if call.args[0] == "link"]
         assert ("link", "wv-new123", "wv-parent", "--type=references") in link_calls
-        assert ("link", "wv-new123", "wv-source", "--type=references") in link_calls
+        assert ("link", "wv-new123", "wv-source", "--type=addresses") in link_calls
         assert data["reviewed_candidates"] == 1
         assert data["created"] == 1
         assert data["backfilled_beyond_reviewed_set"] == 0

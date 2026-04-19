@@ -2798,7 +2798,7 @@ Commands:
   refs <file|text>  Extract cross-references (dry-run, no edges)
   import <file>     Import from beads JSONL or JSON
   quality <sub>     Code quality scanner (scan, hotspots, diff, promote, reset)
-  findings <sub>    Historical finding promotion (promote)
+  findings <sub>    Historical finding promotion (list, promote)
   batch [file]      Execute multiple wv commands from file or stdin [--dry-run] [--stop-on-error]
   sync              Persist to git layer (.weave/) [--gh GH sync] [--dry-run]
   load              Load from git layer

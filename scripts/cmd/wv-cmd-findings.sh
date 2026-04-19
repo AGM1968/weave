@@ -55,6 +55,8 @@ promote options:
   --include-root-causes Include validated explanatory root-cause insights
   --include-tooling  Include Weave/runtime/tooling findings (internal use)
   --parent=<id>  Parent node ID to link via references when applying
+                 (finding->source_pitfall uses addresses edge so
+                  wv audit-pitfalls marks the source as [ADDRESSED])
 
 Promoted findings use metadata.type="finding" and nested
   finding.{violation_type, root_cause, proposed_fix, confidence, fixable};

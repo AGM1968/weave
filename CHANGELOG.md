@@ -4,6 +4,38 @@
 
 ## [Unreleased]
 
+## [1.41.1] - 2026-04-19
+
+### Fixed
+
+- **`wv findings promote` edge semantic**: the `--apply` path emitted a `references` edge from the
+  new finding to its source pitfall, but `wv audit-pitfalls` only counts
+  `addresses | implements | supersedes` as resolvers. Promoted findings therefore never flipped
+  their source pitfalls to `[ADDRESSED]` — the consolidation loop between the two features was
+  silently broken. The edge type is now `addresses`; the finding-to-parent edge remains `references`
+  (the parent is a grouping epic, not the thing being addressed). Surfaced and backfilled during a
+  bulk consolidation run (229 pitfalls promoted + 29-row backfill of pre-existing edges).
+- **`wv sync --gh` floods on bulk finding promotion**: every node type went through the same GH sync
+  door, so `wv findings promote --apply` at scale created one GitHub issue per finding — ~180 issues
+  in a single batch during consolidation. `sync_weave_to_github` now extends its existing skip
+  predicate (`is_test`, `no_sync`) to include `node_type == "finding"`. Findings are internal audit
+  records and should stay inside the graph. Regression test in
+  `tests/test_weave_gh_phases.py::test_finding_nodes_are_skipped`.
+- **`.claude/scheduled_tasks.lock` tracked in git**: the Claude Code scheduler creates and removes
+  this transient lock file each session; it was committed once and every session opened with a
+  `D .claude/scheduled_tasks.lock` entry in `git status`, masking real changes. Added to
+  `.gitignore` (plus `.claude/*.lock` glob) and removed from the index via `git rm --cached`.
+
+### Docs
+
+- **`INDEX-PROPOSALS.md` drift**: `PROPOSAL-wv-active-counterweight.md` (Sprint A+B1+C1 shipped in
+  v1.41.0) and `PROPOSAL-wv-post-split-hardening.md` were on disk but unlisted; added both under
+  Active proposals with current lifecycle state. Baseline date bumped.
+- **`wv --help` top-level findings line**: advertised only `(promote)`; the subcommand supports
+  `list` too. Fixed to `(list, promote)`.
+- **`wv findings promote --help`**: now notes that the finding → source_pitfall edge uses
+  `addresses` so `wv audit-pitfalls` marks the source as `[ADDRESSED]`.
+
 ## [1.41.0] - 2026-04-18
 
 ### Added
