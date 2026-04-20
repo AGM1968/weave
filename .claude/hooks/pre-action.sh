@@ -109,7 +109,26 @@ if [[ "$TOOL" =~ ^(Edit|Write|NotebookEdit|create_file|replace_string_in_file|in
     # Compute with_active increment after the active check below; persist totals now.
 fi
 
-# Get active nodes
+# Phase-aware enforcement: skip active-node check in discover/closing phases.
+# discover = session just started, agent is exploring before claiming work.
+# closing  = node just closed via wv done; allow the follow-up commit.
+# execute  = node claimed, substantive work in progress (enforce active node).
+# No sentinel = fall back to execute behaviour (safe default).
+_PA_PHASE=$(cat "${_PA_HOT_ZONE}/.session_phase" 2>/dev/null || echo "execute")
+
+if [ "$_PA_PHASE" = "discover" ] || [ "$_PA_PHASE" = "closing" ]; then
+    # Still record the untracked edit in hygiene tally (count it, but with_active stays 0).
+    if [ -n "${_PA_NEW_TOTAL:-}" ]; then
+        jq -n \
+            --argjson total "$_PA_NEW_TOTAL" \
+            --argjson with_active "$_PA_WITH" \
+            '{total:$total, with_active:$with_active}' \
+            > "$_PA_EDITS_FILE" 2>/dev/null || true
+    fi
+    exit 0
+fi
+
+# Get active nodes (execute phase only — saves subprocess in discover/closing)
 ACTIVE_NODES=$("$WV" list --status=active --json 2>/dev/null || echo "[]")
 ACTIVE_COUNT=$(echo "$ACTIVE_NODES" | jq 'length' 2>/dev/null || echo "0")
 
@@ -127,7 +146,7 @@ fi
 if [ "$ACTIVE_COUNT" = "0" ]; then
     # No active nodes, suggest using /weave to start work
     cat >&2 <<EOF
-⚠️  No active Weave node found.
+⚠️  No active Weave node found (phase: execute).
 
 Use \`/weave\` to select work before editing files:
 - \`/weave\` — Show ready work

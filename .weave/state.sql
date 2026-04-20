@@ -1,3 +1,4 @@
+/* WARNING: Script requires that SQLITE_DBCONFIG_DEFENSIVE be disabled */
 PRAGMA foreign_keys=OFF;
 BEGIN TRANSACTION;
 CREATE TABLE nodes (
@@ -12,10 +13,6 @@ CREATE TABLE nodes (
     priority INTEGER GENERATED ALWAYS AS (json_extract(metadata, '$.priority')) VIRTUAL,
     type TEXT GENERATED ALWAYS AS (json_extract(metadata, '$.type')) VIRTUAL
 );
-INSERT INTO nodes VALUES('wv-7b1fe0','release: v1.41.0 public weave repo','done','{"done_criteria":["commit, tag, push, GH release"],"risks":[],"risk_level":"low","decision":"split commit into 2 (initial wv-state + full bundle) due to wv work auto-sync clobbering staged state; both pushed cleanly. pattern: build-release.sh outputs to public repo; commit/tag/push/release in that working dir not memory-system. pitfall: pre-action hook checks active node in cwd, not source — must claim a node in the public repo too.","learning_hygiene":4}',NULL,'2026-04-18 18:25:10','2026-04-18 18:26:53');
-COMMIT;
-PRAGMA foreign_keys=OFF;
-BEGIN TRANSACTION;
 CREATE TABLE edges (
     source TEXT NOT NULL,
     target TEXT NOT NULL,
@@ -27,4 +24,117 @@ CREATE TABLE edges (
     FOREIGN KEY(source) REFERENCES nodes(id),
     FOREIGN KEY(target) REFERENCES nodes(id)
 );
+PRAGMA writable_schema=ON;
+INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)VALUES('table','nodes_fts','nodes_fts',0,'CREATE VIRTUAL TABLE nodes_fts USING fts5(
+    id, text, metadata,
+    content=nodes,
+    content_rowid=rowid,
+    tokenize=''porter unicode61''
+)');
+CREATE TABLE IF NOT EXISTS 'nodes_fts_data'(id INTEGER PRIMARY KEY, block BLOB);
+INSERT INTO nodes_fts_data VALUES(1,X'');
+INSERT INTO nodes_fts_data VALUES(10,X'00000000000000');
+CREATE TABLE IF NOT EXISTS 'nodes_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS 'nodes_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB);
+CREATE TABLE IF NOT EXISTS 'nodes_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID;
+INSERT INTO nodes_fts_config VALUES('version',4);
+CREATE TABLE _warp_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    table_name TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK(operation IN ('INSERT','UPDATE','DELETE')),
+    row_id TEXT NOT NULL,
+    old_data JSON,
+    new_data JSON,
+    ts DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+DELETE FROM sqlite_sequence;
+CREATE TRIGGER nodes_ai AFTER INSERT ON nodes BEGIN
+    INSERT INTO nodes_fts(rowid, id, text, metadata)
+    VALUES (new.rowid, new.id, new.text, new.metadata);
+END;
+CREATE TRIGGER nodes_ad AFTER DELETE ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, id, text, metadata)
+    VALUES ('delete', old.rowid, old.id, old.text, old.metadata);
+END;
+CREATE TRIGGER nodes_au AFTER UPDATE ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, id, text, metadata)
+    VALUES ('delete', old.rowid, old.id, old.text, old.metadata);
+    INSERT INTO nodes_fts(rowid, id, text, metadata)
+    VALUES (new.rowid, new.id, new.text, new.metadata);
+END;
+CREATE TRIGGER _warp_nodes_insert AFTER INSERT ON nodes
+BEGIN
+    INSERT INTO _warp_changes(table_name, operation, row_id, new_data)
+    VALUES ('nodes', 'INSERT', NEW.id, json_object(
+        'id', NEW.id, 'text', NEW.text, 'status', NEW.status,
+        'metadata', NEW.metadata, 'alias', NEW.alias,
+        'created_at', NEW.created_at, 'updated_at', NEW.updated_at
+    ));
+END;
+CREATE TRIGGER _warp_nodes_update AFTER UPDATE ON nodes
+BEGIN
+    INSERT INTO _warp_changes(table_name, operation, row_id, old_data, new_data)
+    VALUES ('nodes', 'UPDATE', NEW.id,
+        json_object(
+            'id', OLD.id, 'text', OLD.text, 'status', OLD.status,
+            'metadata', OLD.metadata, 'alias', OLD.alias,
+            'updated_at', OLD.updated_at
+        ),
+        json_object(
+            'id', NEW.id, 'text', NEW.text, 'status', NEW.status,
+            'metadata', NEW.metadata, 'alias', NEW.alias,
+            'updated_at', NEW.updated_at
+        )
+    );
+END;
+CREATE TRIGGER _warp_nodes_delete AFTER DELETE ON nodes
+BEGIN
+    INSERT INTO _warp_changes(table_name, operation, row_id, old_data)
+    VALUES ('nodes', 'DELETE', OLD.id, json_object(
+        'id', OLD.id, 'text', OLD.text, 'status', OLD.status,
+        'metadata', OLD.metadata, 'alias', OLD.alias,
+        'created_at', OLD.created_at, 'updated_at', OLD.updated_at
+    ));
+END;
+CREATE TRIGGER _warp_edges_insert AFTER INSERT ON edges
+BEGIN
+    INSERT INTO _warp_changes(table_name, operation, row_id, new_data)
+    VALUES ('edges', 'INSERT', NEW.source || ':' || NEW.target || ':' || NEW.type, json_object(
+        'source', NEW.source, 'target', NEW.target, 'type', NEW.type,
+        'weight', NEW.weight, 'context', NEW.context,
+        'created_at', NEW.created_at
+    ));
+END;
+CREATE TRIGGER _warp_edges_update AFTER UPDATE ON edges
+BEGIN
+    INSERT INTO _warp_changes(table_name, operation, row_id, old_data, new_data)
+    VALUES ('edges', 'UPDATE', NEW.source || ':' || NEW.target || ':' || NEW.type,
+        json_object(
+            'source', OLD.source, 'target', OLD.target, 'type', OLD.type,
+            'weight', OLD.weight, 'context', OLD.context
+        ),
+        json_object(
+            'source', NEW.source, 'target', NEW.target, 'type', NEW.type,
+            'weight', NEW.weight, 'context', NEW.context
+        )
+    );
+END;
+CREATE TRIGGER _warp_edges_delete AFTER DELETE ON edges
+BEGIN
+    INSERT INTO _warp_changes(table_name, operation, row_id, old_data)
+    VALUES ('edges', 'DELETE', OLD.source || ':' || OLD.target || ':' || OLD.type, json_object(
+        'source', OLD.source, 'target', OLD.target, 'type', OLD.type,
+        'weight', OLD.weight, 'context', OLD.context
+    ));
+END;
+CREATE INDEX idx_nodes_status ON nodes(status);
+CREATE INDEX idx_nodes_priority ON nodes(priority);
+CREATE INDEX idx_nodes_type ON nodes(type);
+CREATE INDEX idx_nodes_type_priority ON nodes(type, priority);
+CREATE UNIQUE INDEX idx_nodes_alias ON nodes(alias) WHERE alias IS NOT NULL AND status != 'done';
+CREATE INDEX idx_edges_target ON edges(target);
+CREATE INDEX idx_edges_type ON edges(type);
+CREATE INDEX idx_edges_source_type ON edges(source, type);
+CREATE INDEX idx_edges_target_type ON edges(target, type);
+PRAGMA writable_schema=OFF;
 COMMIT;

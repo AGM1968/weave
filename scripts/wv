@@ -98,7 +98,7 @@ _resolve_first_id() {
     "$cmd_func" "${new_args[@]}"
 }
 
-main() {
+_wv_dispatch() {
     local cmd="${1:-help}"
     shift || true
 
@@ -117,6 +117,7 @@ main() {
         status) cmd_status "$@" ;;
         pending-close) cmd_pending_close "$@" ;;
         update) _resolve_first_id cmd_update "$@" ;;
+        touch)  _resolve_first_id cmd_touch "$@" ;;
         quick)  cmd_quick "$@" ;;
         ship)   _resolve_first_id cmd_ship "$@" ;;
 
@@ -148,6 +149,7 @@ main() {
         breadcrumbs) cmd_breadcrumbs "$@" ;;
         
         # Ops commands
+        bootstrap)       cmd_bootstrap "$@" ;;
         doctor)          cmd_doctor "$@" ;;
         recover)         cmd_recover "$@" ;;
         selftest)        cmd_selftest "$@" ;;
@@ -176,6 +178,27 @@ main() {
             return 1
             ;;
     esac
+}
+
+main() {
+    local cmd="${1:-help}"
+
+    # Run cache: serve cached stdout for pure-read commands (status, ready, list)
+    # Disable with WV_RUN_CACHE=0
+    if [ "${WV_RUN_CACHE:-1}" = "1" ] && _wv_run_cache_is_read_cmd "$cmd"; then
+        wv_run_cache_wrap _wv_dispatch "$@"
+        return $?
+    fi
+
+    local rc=0
+    _wv_dispatch "$@" || rc=$?
+
+    # Invalidate run cache after successful writes
+    if [ "$rc" -eq 0 ] && _wv_run_cache_is_write_cmd "$cmd"; then
+        wv_run_cache_invalidate
+    fi
+
+    return "$rc"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

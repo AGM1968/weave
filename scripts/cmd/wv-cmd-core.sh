@@ -910,6 +910,8 @@ cmd_done() {
         validate_on_done "$id"
     fi
 
+    echo "closing" > "$WV_HOT_ZONE/.session_phase" 2>/dev/null || true
+
     # === Post-close: GH issue, cache, notifications, breadcrumbs ===
     [ "$no_gh" = "0" ] && _done_close_gh_issue "$id"
 
@@ -1238,6 +1240,7 @@ cmd_work() {
     fi
 
     set_primary_node "$id"
+    echo "execute" > "$WV_HOT_ZONE/.session_phase" 2>/dev/null || true
 
     if [ "$format" = "json" ]; then
         # Structured output for runtime consumption
@@ -1929,8 +1932,10 @@ cmd_update() {
     validate_id "$id" || return 1
     
     local updates=""
+    local echo_mode=false
     while [ $# -gt 0 ]; do
         case "$1" in
+            --echo) echo_mode=true ;;
             --status=*)
                 local status="${1#*=}"
                 validate_status "$status" || return 1
@@ -1992,14 +1997,74 @@ cmd_update() {
     updates="${updates%,},updated_at=CURRENT_TIMESTAMP"
     
     db_query "UPDATE nodes SET $updates WHERE id='$id';"
-    echo -e "${GREEN}✓${NC} Updated: $id"
 
     # Auto-unblock cascade when status changed to done
     if [[ "$updates" == *"status='done'"* ]]; then
         _do_unblock_cascade "$id"
     fi
 
+    # --echo: return updated node as JSON (eliminates need for a follow-up show call)
+    if [ "$echo_mode" = true ]; then
+        db_query_json_v2 "SELECT id, text, status, metadata FROM nodes WHERE id='$id';"
+    else
+        echo -e "${GREEN}✓${NC} Updated: $id"
+    fi
+
     auto_sync 2>/dev/null || true
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_touch — Fire-and-forget metadata write (silent on success)
+# Like cmd_update but produces NO stdout. Designed for per-turn intent-setting.
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_touch() {
+    local id="${1:-}"
+    shift || true
+    
+    if [ -z "$id" ]; then
+        echo "Error: node ID required" >&2
+        return 1
+    fi
+
+    validate_id "$id" || return 1
+    
+    local metadata=""
+    local intent=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --metadata=*) metadata="${1#--metadata=}" ;;
+            --intent=*)   intent="${1#--intent=}" ;;
+        esac
+        shift
+    done
+
+    # --intent is sugar for --metadata='{"current_intent":"..."}'
+    if [ -n "$intent" ]; then
+        local intent_esc="${intent//\"/\\\"}"
+        if [ -n "$metadata" ]; then
+            # Merge intent into provided metadata
+            metadata=$(echo "$metadata" | jq --arg i "$intent_esc" '. + {current_intent: $i}' 2>/dev/null || echo "{\"current_intent\":\"$intent_esc\"}")
+        else
+            metadata="{\"current_intent\":\"$intent_esc\"}"
+        fi
+    fi
+
+    if [ -z "$metadata" ]; then
+        echo "Error: --metadata=JSON or --intent=TEXT required" >&2
+        return 1
+    fi
+
+    # Validate JSON
+    if ! echo "$metadata" | jq '.' >/dev/null 2>&1; then
+        echo "Error: invalid JSON in --metadata" >&2
+        return 1
+    fi
+
+    local metadata_esc="${metadata//\'/\'\'}"
+    db_query "UPDATE nodes SET metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+    
+    # No stdout — fire-and-forget. Zero token cost.
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

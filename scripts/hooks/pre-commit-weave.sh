@@ -56,7 +56,18 @@ if [ -n "$STAGED_PY_FILES" ]; then
     fi
 fi
 
-# Check for active Weave nodes
+# Phase-aware enforcement: allow commits in discover and closing phases.
+# discover = exploring before claiming; closing = recording just-closed work.
+# execute  = substantive work in progress (enforce active node).
+_PC_REPO_HASH=$(echo "$REPO_ROOT" | md5sum | cut -c1-8)
+_PC_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_PC_REPO_HASH}}"
+_PC_PHASE=$(cat "${_PC_HOT_ZONE}/.session_phase" 2>/dev/null || echo "execute")
+
+if [ "$_PC_PHASE" = "discover" ] || [ "$_PC_PHASE" = "closing" ]; then
+    exit 0
+fi
+
+# Check for active Weave nodes (execute phase only)
 ACTIVE_COUNT=$("$WV" list --status=active --json 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
 
 if [ "$ACTIVE_COUNT" = "0" ] || [ -z "$ACTIVE_COUNT" ]; then

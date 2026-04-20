@@ -19,7 +19,9 @@
  *   weave_work     - Claim a node to work on
  *   weave_ship     - Complete + sync in one step
  *   weave_overview - Session start overview (status + digest + breadcrumbs)
+ *   weave_bootstrap - Single-call session context (status + context + ready + learnings)
  *   weave_show     - Single-node detail view
+ *   weave_touch   - Fire-and-forget metadata write (zero token cost)
  *   weave_delete   - Permanently remove a node (requires force)
  *   weave_quality_scan - Scan codebase for quality metrics
  *   weave_quality_hotspots - Ranked hotspot report
@@ -47,6 +49,7 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_list",
     "weave_resolve",
     "weave_update",
+    "weave_touch",
     "weave_delete",
   ],
   session: [
@@ -55,18 +58,20 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_recover",
     "weave_quick",
     "weave_overview",
+    "weave_bootstrap",
     "weave_close_session",
     "weave_breadcrumbs",
     "weave_plan",
     "weave_edit_guard",
   ],
-  lite: ["weave_overview", "weave_guide", "weave_edit_guard", "weave_status", "weave_work", "weave_done"],
+  lite: ["weave_overview", "weave_bootstrap", "weave_guide", "weave_edit_guard", "weave_status", "weave_work", "weave_done"],
   inspect: [
     "weave_context",
     "weave_search",
     "weave_status",
     "weave_health",
     "weave_preflight",
+    "weave_bootstrap",
     "weave_sync",
     "weave_tree",
     "weave_learnings",
@@ -561,6 +566,25 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "weave_bootstrap",
+    description:
+      "Single-call session context for agents. Returns status, active node with full context pack, ready work, and recent learnings in one JSON blob. Use this instead of calling status+list+show+context+ready+learnings separately.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        learnings: {
+          type: "number",
+          description: "Number of recent learnings to include (default: 5)",
+        },
+        ready: {
+          type: "number",
+          description: "Number of ready nodes to include (default: 10)",
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "weave_preflight",
     description:
       "Pre-action checks for a node: existence, blockers, done_criteria, contradictions, context load. Returns structured JSON. Call before starting work.",
@@ -742,6 +766,29 @@ const TOOLS: Tool[] = [
         remove_key: {
           type: "string",
           description: "Remove a single metadata key by name (e.g., 'gh_issue')",
+        },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "weave_touch",
+    description:
+      "Fire-and-forget metadata write. Updates node metadata silently with zero token cost — no output returned. Use for per-turn intent setting or lightweight metadata updates where confirmation is not needed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          description: "Node ID (e.g., wv-a1b2)",
+        },
+        metadata: {
+          type: "object",
+          description: "JSON metadata to merge into existing keys",
+        },
+        intent: {
+          type: "string",
+          description: "Shorthand for setting current_intent metadata (alternative to metadata param)",
         },
       },
       required: ["id"],
@@ -1254,6 +1301,16 @@ function handleTool(
       break;
     }
 
+    case "weave_bootstrap": {
+      const learnings = args.learnings as number | undefined;
+      const ready = args.ready as number | undefined;
+      const cmd = ["bootstrap", "--json"];
+      if (learnings) cmd.push(`--learnings=${learnings}`);
+      if (ready) cmd.push(`--ready=${ready}`);
+      result = wv(cmd);
+      break;
+    }
+
     case "weave_preflight": {
       const id = args.id as string;
       const preflightJson = wv(["preflight", id]);
@@ -1517,6 +1574,18 @@ function handleTool(
       break;
     }
 
+    case "weave_touch": {
+      const id = args.id as string;
+      const metadata = args.metadata as Record<string, unknown> | undefined;
+      const intent = args.intent as string | undefined;
+      const cmd = ["touch", id];
+      if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
+      if (intent) cmd.push(`--intent=${intent}`);
+      wv(cmd);
+      result = "ok";
+      break;
+    }
+
     case "weave_breadcrumbs": {
       const action = (args.action as string) || "show";
       const message = args.message as string | undefined;
@@ -1624,7 +1693,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.41.3",
+      version: "1.42.0",
     },
     {
       capabilities: {

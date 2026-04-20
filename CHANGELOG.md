@@ -4,6 +4,50 @@
 
 ## [Unreleased]
 
+## [1.42.0] - 2026-04-19
+
+### Added
+
+- **`wv bootstrap --json`**: single composite command replacing the 8-call session-start sequence
+  (status + list_active + show + context + ready + learnings). Returns status counts, active node
+  with full context pack, ready work, recent learnings, and breadcrumb in one JSON blob. Covered by
+  run-cache (45s TTL, sentinel invalidation on writes). Measured: 3,346 bytes vs 6,325 bytes (8
+  calls) — 47% data reduction, 7 fewer process spawns per session start.
+
+- **`wv update --echo`**: returns the updated node as inline JSON, eliminating the separate
+  `wv show` call that callers used to verify writes. Cuts the update-verify round-trip from 2 calls
+  to 1.
+
+- **`wv touch --intent=TEXT`**: fire-and-forget metadata write with zero stdout. Designed for
+  per-turn intent tracking — no process output means no token spend. Falls back to `wv update`
+  silently when the node does not exist.
+
+- **MCP `weave_bootstrap` and `weave_touch`**: MCP tool equivalents of the two new primitives.
+  `weave_bootstrap` accepts `scope=session|lite|inspect`. `weave_touch` is available in
+  `scope=graph`. Non-runtime MCP clients (Copilot, SDK agents) get the same token savings without
+  WvClient changes.
+
+- **Run-cache (Category F)**: amortises expensive read commands across agent turns. `wv context`,
+  `wv show`, `wv list`, `wv ready`, `wv learnings`, `wv status`, and `wv bootstrap` are all cached
+  with a 45s TTL. Write commands (`wv work`, `wv done`, `wv update`, `wv add`, `wv touch`) act as
+  sentinels and invalidate the cache. Expected reduction: ~60% of read subprocess calls in
+  multi-turn sessions.
+
+- **Phase-aware enforcement (S6)**: session phase sentinel at `$WV_HOT_ZONE/.session_phase`
+  eliminates the `WV_SKIP_PRECOMMIT=1` workaround in the normal `wv done -> git commit` flow. Three
+  phases:
+  - `discover` (session start) — edits allowed without active node; hooks skip the `wv list`
+    subprocess entirely.
+  - `execute` (after `wv work`) — active node required; current enforcement behaviour.
+  - `closing` (after `wv done`) — commits allowed for recording the closed work. Written by
+    `session-start-context.sh`, `cmd_work`, and `cmd_done`. Read by `pre-action.sh` and
+    `pre-commit-weave.sh`. Missing sentinel falls back to `execute` (safe default).
+
+### Fixed
+
+- **selftest cascade**: `cmd_done` in selftest now passes `--skip-verification` to avoid the
+  learning-required gate firing on synthetic test nodes, fixing 2/10 cascade failures.
+
 ## [1.41.3] - 2026-04-19
 
 ### Security

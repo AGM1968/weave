@@ -87,6 +87,7 @@ fi
 mkdir -p "$_SS_HOT_ZONE" 2>/dev/null || true
 # Write session epoch for stale-node detection in pre-action.sh
 date +%s > "${_SS_HOT_ZONE}/.session_epoch" 2>/dev/null || true
+echo "discover" > "${_SS_HOT_ZONE}/.session_phase" 2>/dev/null || true
 jq -n \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson pid $$ \

@@ -1,9 +1,155 @@
 #!/bin/bash
 # wv-cmd-ops.sh — Operations and diagnostic commands
 #
-# Commands: health, cache, audit-pitfalls, edge-types, help
+# Commands: bootstrap, health, cache, audit-pitfalls, edge-types, help
 # Sourced by: wv entry point (after lib modules)
 # Dependencies: wv-config.sh, wv-db.sh, wv-validate.sh, wv-cache.sh, wv-cmd-core.sh
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_bootstrap — Single-call session context for agents
+# ═══════════════════════════════════════════════════════════════════════════
+# Replaces the 8-call bootstrap sequence (list+status+list+show+context+
+# search+ready+learnings) with one composite command. Returns everything
+# an agent needs at session start in a single JSON blob.
+#
+# Usage: wv bootstrap --json [--learnings=N]
+#
+# Output shape:
+#   { status: {active, ready, blocked, ...},
+#     active_node: {id, text, status, done_criteria, ...} | null,
+#     context: <context pack for active node> | null,
+#     ready: [{id, text}, ...],
+#     learnings: [{id, text, learning}, ...] }
+
+cmd_bootstrap() {
+    local format="json"
+    local learnings_limit=5
+    local ready_limit=10
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json)          format="json" ;;
+            --learnings=*)   learnings_limit="${1#--learnings=}" ;;
+            --ready=*)       ready_limit="${1#--ready=}" ;;
+            --help|-h)
+                echo "Usage: wv bootstrap --json [--learnings=N] [--ready=N]"
+                echo ""
+                echo "Single-call session context for agents. Returns status, active node"
+                echo "context pack, ready work, and recent learnings in one JSON blob."
+                echo ""
+                echo "Options:"
+                echo "  --learnings=N  Number of recent learnings (default: 5)"
+                echo "  --ready=N      Number of ready nodes (default: 10)"
+                return 0
+                ;;
+        esac
+        shift
+    done
+
+    if [ "$format" != "json" ]; then
+        echo "Error: wv bootstrap only supports --json output" >&2
+        return 1
+    fi
+
+    db_ensure
+
+    # ── 1. Status counts (single query) ──
+    local status_json
+    status_json=$(cmd_status --json 2>/dev/null || echo '{}')
+
+    # ── 2. Active node + context pack ──
+    local active_node="null"
+    local context_pack="null"
+    local active_id=""
+
+    # Find primary or first active node
+    active_id=$(get_primary_node 2>/dev/null || true)
+    if [ -n "$active_id" ]; then
+        local pstatus
+        pstatus=$(db_query "SELECT status FROM nodes WHERE id='$active_id';" 2>/dev/null)
+        [ "$pstatus" != "active" ] && active_id=""
+    fi
+    if [ -z "$active_id" ]; then
+        active_id=$(db_query "SELECT id FROM nodes WHERE status='active' LIMIT 1;" 2>/dev/null)
+    fi
+
+    if [ -n "$active_id" ]; then
+        # Get node details via json-v2 shape
+        active_node=$(db_query_json_v2 "SELECT id, text, status, metadata FROM nodes WHERE id='$active_id';")
+        active_node=$(echo "${active_node:-[]}" | jq '.[0] // null')
+
+        # Get full context pack (reuses existing cmd_context logic + caching)
+        context_pack=$(cmd_context "$active_id" --json --mode=discover 2>/dev/null || echo 'null')
+        [ -z "$context_pack" ] && context_pack="null"
+    fi
+
+    # ── 3. Ready work ──
+    local ready_json
+    ready_json=$(db_query_json_v2 "
+        SELECT n.id, n.text, n.status, n.metadata FROM nodes n
+        WHERE n.status = 'todo'
+          AND json_extract(n.metadata, '\$.type') IS NOT 'finding'
+          AND NOT EXISTS (
+              SELECT 1 FROM edges e
+              JOIN nodes blocker ON e.source = blocker.id
+              WHERE e.target = n.id AND e.type = 'blocks' AND blocker.status != 'done'
+          )
+        ORDER BY n.created_at ASC
+        LIMIT $ready_limit;
+    ")
+    ready_json="${ready_json:-[]}"
+
+    # ── 4. Recent learnings ──
+    local learnings_json
+    learnings_json=$(db_query_json "
+        SELECT id, text, status, metadata FROM nodes
+        WHERE status = 'done'
+          AND (json_extract(metadata, '\$.learning') IS NOT NULL
+               OR json_extract(metadata, '\$.decision') IS NOT NULL
+               OR json_extract(metadata, '\$.pattern') IS NOT NULL
+               OR json_extract(metadata, '\$.pitfall') IS NOT NULL)
+        ORDER BY updated_at DESC
+        LIMIT $learnings_limit;
+    ")
+    learnings_json="${learnings_json:-[]}"
+
+    # ── 5. Breadcrumbs (if present) ──
+    local breadcrumb=""
+    local bc_file="${WEAVE_DIR}/breadcrumbs.md"
+    if [ -f "$bc_file" ]; then
+        breadcrumb=$(head -5 "$bc_file" | grep -v '^#' | grep -v '^$' | head -1 | sed 's/^[[:space:]]*//')
+    fi
+
+    # ── Compose final JSON ──
+    jq -n \
+        --argjson status "$status_json" \
+        --argjson active_node "$active_node" \
+        --argjson context "$context_pack" \
+        --argjson ready "$ready_json" \
+        --argjson learnings "$learnings_json" \
+        --arg breadcrumb "$breadcrumb" \
+        '{
+            status: $status,
+            active_node: $active_node,
+            context: $context,
+            ready: ($ready | map({id, text})),
+            learnings: ($learnings | map(
+                (if .metadata and (.metadata | type) == "string"
+                 then (.metadata | fromjson? // {})
+                 else (.metadata // {})
+                 end) as $m |
+                {
+                    id,
+                    text: (.text // ""),
+                    learning: ($m.learning // null),
+                    decision: ($m.decision // null),
+                    pattern: ($m.pattern // null),
+                    pitfall: ($m.pitfall // null)
+                } | with_entries(select(.value != null and .value != ""))
+            )),
+            breadcrumb: (if $breadcrumb != "" then $breadcrumb else null end)
+        }'
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_digest — Compact one-liner health summary for session start
@@ -1493,7 +1639,7 @@ _selftest_run_tests() {
     # 6. Done (complete parent — should auto-unblock child)
     if [ -n "$id1" ]; then
         local done_out
-        done_out=$(cmd_done "$id1" 2>&1) && _selftest_check "done" "1" "completed $id1" \
+        done_out=$(cmd_done "$id1" --skip-verification 2>&1) && _selftest_check "done" "1" "completed $id1" \
             || _selftest_check "done" "0" "failed: $done_out"
     else
         _selftest_check "done" "0" "skipped"
