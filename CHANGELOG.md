@@ -2,8 +2,6 @@
 
 <!-- markdownlint-disable MD024 -->
 
-## [Unreleased]
-
 ## [1.42.0] - 2026-04-19
 
 ### Added
