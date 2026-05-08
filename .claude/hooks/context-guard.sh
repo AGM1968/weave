@@ -80,7 +80,7 @@ fi
 
 if [ -t 1 ] && [ "${WV_AGENT:-0}" != "1" ]; then
     # Human tty — full banner
-    echo -e "${CYAN}━━━ Memory System v5.0 (Weave) ━━━${NC}"
+    echo -e "${CYAN}━━━ Weave Context Policy ━━━${NC}"
     if [ -x "$WV" ]; then
         "$WV" load 2>/dev/null || true
         "$WV" status 2>/dev/null || true
@@ -98,7 +98,7 @@ if [ -t 1 ] && [ "${WV_AGENT:-0}" != "1" ]; then
             echo -e "policy: ${YELLOW}MEDIUM${NC}"
             echo "├─ Prefer grep before read"
             echo "├─ Avoid full-file reads >500 lines"
-            echo "└─ Use read_range for large files"
+            echo "└─ Use line ranges for large files"
             ;;
         LOW)
             echo -e "policy: ${YELLOW}LOW${NC}"

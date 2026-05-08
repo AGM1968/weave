@@ -33,7 +33,9 @@ cd weave
 This installs:
 
 - `wv` CLI and helper commands to `~/.local/bin/`
-- MCP server for VS Code Copilot and Claude Code (optional, with `--with-mcp`)
+- MCP server for VS Code Copilot and other MCP clients (optional, with `--with-mcp`)
+
+Claude Code uses `wv` CLI + hooks rather than MCP.
 
 **Requirements:** `sqlite3` (>= 3.35), `jq`, `git`. Optional: `gh` (for GitHub sync), `node` (for
 MCP server).
@@ -48,12 +50,15 @@ Run `wv doctor` to verify your installation.
 
 ```bash
 cd /path/to/your/project
-wv-init-repo --agent=copilot     # VS Code: .mcp.json + copilot-instructions.md
-# Or: wv-init-repo --agent=claude   # Claude Code: hooks, skills, settings
-# Or: wv-init-repo --agent=all      # Both agents in same repo
-wv-init-repo --update            # Update existing repo to latest skills/hooks/agents
+wv init-repo --agent=copilot     # VS Code: .vscode/mcp.json (+ legacy .mcp.json) + instructions
+# Or: wv init-repo --agent=claude   # Claude Code: hooks, skills, settings
+# Or: wv init-repo --agent=all      # Both agents in same repo
+wv init-repo --update            # Update existing repo to latest skills/hooks/agents
 wv selftest                      # Verify everything works
 ```
+
+The standalone wrapper `wv-init-repo` is still installed for compatibility, but `wv init-repo` is
+the canonical form used in help and workflow docs.
 
 This creates `.weave/` (graph storage), git hooks (commit enforcement), and agent-specific config.
 Each repo gets its own isolated database on tmpfs.
@@ -69,6 +74,7 @@ wv add "Fix login timeout bug" --gh    # Creates node + linked GitHub issue
 ```bash
 wv work wv-a1b2                        # Claim the task (sets active)
 # ... make your code changes ...
+git add <files> && git commit -m "fix: login timeout"
 wv done wv-a1b2 --learning="Session cookie expires before JWT — add refresh logic"
 ```
 
@@ -95,16 +101,20 @@ Your AI coding agent follows the workflow automatically via generated instructio
 ## Core Workflow
 
 ```text
-wv ready          Find unblocked work
-wv work <id>      Claim a task (one active at a time)
-wv done <id>      Complete with --learning="..."
-wv sync --gh      Persist graph + sync GitHub issues
-                  Commit .weave/ if changed
-git push          Push state to remote
+git status && wv status                 Check repo + graph state
+wv ready                                Find unblocked work
+wv work <id>                            Claim a task (one active at a time)
+git add <files> && git commit -m "..." Commit work files before closing
+wv done <id> --learning="..."          Complete with captured learning
+wv sync --gh                            Persist graph + sync GitHub issues
+git add .weave/ && git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"
+git push                                Push state to remote
 ```
 
-**Commit enforcement:** A pre-commit hook blocks commits without an active Weave node. Override with
-`git commit --no-verify` when needed.
+Focused CLI help: `wv help <command>` or `wv <command> --help`.
+
+**Commit enforcement:** A pre-commit hook blocks commits without an active Weave node. Use
+`wv quick` for trivial one-step work instead of bypassing the hook during normal workflow.
 
 ## Command Reference
 
@@ -115,7 +125,12 @@ git push          Push state to remote
 | `wv add "text" --gh`               | Create node + GitHub issue      |
 | `wv work <id>`                     | Claim task (sets active)        |
 | `wv done <id> --learning="..."`    | Complete with captured learning |
+| `wv ship <id> --learning="..."`    | Complete + sync in one step     |
 | `wv quick "text" --learning="..."` | Create + close in one step      |
+| `wv bootstrap --json`              | Single-call session snapshot    |
+| `wv overview --json`               | Compact graph/session snapshot  |
+| `wv touch <id> --intent="..."`     | Zero-output intent update       |
+| `wv help <command>`                | Focused help for one command    |
 | `wv show <id>`                     | View node details               |
 | `wv list --status=todo`            | List nodes by status            |
 | `wv ready`                         | Show unblocked work             |
@@ -130,7 +145,7 @@ git push          Push state to remote
 | `wv tree`                               | View hierarchy              |
 | `wv context <id> --json`                | Get full Context Pack       |
 | `wv related <id>`                       | Show semantic relationships |
-| `wv path <from> <to>`                   | Find path between nodes     |
+| `wv path <id>`                          | Show ancestry path          |
 | `wv edge-types`                         | List valid edge types       |
 
 ### Knowledge Capture
@@ -195,6 +210,7 @@ wv plan plan.md --sprint=1 --gh        # Import as epic + tasks with GitHub issu
 Before starting work, get comprehensive context:
 
 ```bash
+wv bootstrap --json
 wv context wv-xxxxxx --json
 ```
 
@@ -203,21 +219,24 @@ Returns blockers, ancestors with learnings, related nodes, pitfalls, and contrad
 - **Session-cached** — second call returns instantly from stamp-file cache
 - **Auto-invalidates** — cache clears when edges change (`wv link`, `wv block`, `wv resolve`)
 - **Bounded output** — top 5 related, top 3 pitfalls (prevents context explosion)
+- **Low-cost progress writes** — use `wv touch <id> --intent="..."` between larger steps without
+  emitting extra output
 
 ## MCP Server
 
-31 tools for IDE integration via 2 server instances:
+33 tools for IDE integration via 2 server instances:
 
-- **`weave`** (scope=all, 31 tools) — full tool set for Copilot Chat
-- **`weave-inspect`** (scope=inspect, 14 tools) — read-only subset for analysis subagents
-- **`--scope=lite`** (6 tools, ~2KB payload) — lightweight profile for constrained contexts
+- **`weave`** (scope=all, 33 tools) — full tool set for Copilot Chat
+- **`weave-inspect`** (scope=inspect, 15 tools) — read-only subset for analysis subagents
+- **`--scope=lite`** (7 tools) — lightweight profile for constrained contexts
 
 > **Claude Code** does not use MCP — it interacts with Weave via `wv` CLI and enforcement hooks. MCP
 > servers are consumed by VS Code Copilot Chat only.
 
 | MCP Tool                  | CLI Equivalent         | Description                           |
 | ------------------------- | ---------------------- | ------------------------------------- |
-| `weave_overview`          | `wv status`            | Session start overview                |
+| `weave_overview`          | `wv status` + `wv health` + `wv ready` | Session start overview    |
+| `weave_bootstrap`         | `wv bootstrap --json`  | Single-call session context           |
 | `weave_work`              | `wv work`              | Claim node + return context           |
 | `weave_ship`              | `wv ship`              | Complete + sync in one step           |
 | `weave_quick`             | `wv quick`             | Create + close (trivial tasks)        |
@@ -225,6 +244,7 @@ Returns blockers, ancestors with learnings, related nodes, pitfalls, and contrad
 | `weave_done`              | `wv done`              | Mark complete with learnings          |
 | `weave_batch_done`        | `wv batch-done`        | Complete multiple nodes at once       |
 | `weave_update`            | `wv update`            | Modify node metadata/status/text      |
+| `weave_touch`             | `wv touch`             | Fire-and-forget metadata or intent    |
 | `weave_delete`            | `wv delete`            | Remove node permanently (force req.)  |
 | `weave_list`              | `wv list`              | List nodes with filters               |
 | `weave_show`              | `wv show`              | Single-node detail view (JSON)        |

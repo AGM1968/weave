@@ -153,6 +153,10 @@ Use \`/weave\` to select work before editing files:
 - \`/weave wv-xxxxxx\` — Claim specific node
 - \`/weave "description"\` — Create new node
 
+Useful compound helpers:
+- \`wv bootstrap --json\` — Session snapshot (status + context + ready + learnings)
+- \`wv quick "description"\` — Track trivial one-step work
+
 This ensures graph-first workflow with Context Pack generation.
 EOF
     exit 2
@@ -179,6 +183,9 @@ it before editing to confirm this is the work you intend to do:
 
 Or create a new node if this is different work:
   wv add "<description>" --status=active
+
+For a fresh session snapshot before picking work:
+    wv bootstrap --json
 EOF
             exit 2
         fi

@@ -1379,9 +1379,10 @@ function handleTool(
                   "",
                   "Run one of:",
                   "  wv work <id>                         — Claim an existing task",
-                  '  wv add "<description>" --gh --status=active  — Create + claim new task',
+                  '  wv add "<description>" --gh --alias=<short-name> --status=active  — Create + claim new task',
+                  '  wv quick "<description>"             — Track trivial one-step work',
                   "",
-                  "Use `wv ready` or weave_overview to find available work.",
+                  "Use `wv ready`, `wv bootstrap --json`, weave_overview, or weave_bootstrap to find available work.",
                 ].join("\n"),
               },
             ],
@@ -1693,7 +1694,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.42.0",
+      version: "1.43.0",
     },
     {
       capabilities: {

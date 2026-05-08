@@ -358,6 +358,7 @@ else
     download_file "$REPO/scripts/lib/wv-db.sh" "$LIB_DIR/lib/wv-db.sh"
     download_file "$REPO/scripts/lib/wv-validate.sh" "$LIB_DIR/lib/wv-validate.sh"
     download_file "$REPO/scripts/lib/wv-cache.sh" "$LIB_DIR/lib/wv-cache.sh"
+    download_file "$REPO/scripts/lib/wv-journal.sh" "$LIB_DIR/lib/wv-journal.sh"
     download_file "$REPO/scripts/lib/wv-gh.sh" "$LIB_DIR/lib/wv-gh.sh"
     download_file "$REPO/scripts/lib/wv-delta.sh" "$LIB_DIR/lib/wv-delta.sh"
     download_file "$REPO/scripts/lib/wv-resolve-project.sh" "$LIB_DIR/lib/wv-resolve-project.sh"
@@ -399,6 +400,7 @@ else
     # Lib available to hooks from global path (~/.config/weave/hooks/../lib/)
     curl -sSL "$REPO/scripts/lib/wv-resolve-project.sh" -o "$CONFIG_DIR/lib/wv-resolve-project.sh"
     # Claude hooks
+    curl -sSL "$REPO/.claude/hooks/context-guard.sh" -o "$CONFIG_DIR/hooks/context-guard.sh"
     curl -sSL "$REPO/.claude/hooks/session-start-context.sh" -o "$CONFIG_DIR/hooks/session-start-context.sh"
     curl -sSL "$REPO/.claude/hooks/session-end-sync.sh" -o "$CONFIG_DIR/hooks/session-end-sync.sh"
     curl -sSL "$REPO/.claude/hooks/stop-check.sh" -o "$CONFIG_DIR/hooks/stop-check.sh"
@@ -407,6 +409,8 @@ else
     curl -sSL "$REPO/.claude/hooks/pre-action.sh" -o "$CONFIG_DIR/hooks/pre-action.sh"
     curl -sSL "$REPO/.claude/hooks/pre-claim-skills.sh" -o "$CONFIG_DIR/hooks/pre-claim-skills.sh"
     curl -sSL "$REPO/.claude/hooks/pre-close-verification.sh" -o "$CONFIG_DIR/hooks/pre-close-verification.sh"
+    curl -sSL "$REPO/.claude/hooks/bash-dedup.sh" -o "$CONFIG_DIR/hooks/bash-dedup.sh"
+    curl -sSL "$REPO/.claude/hooks/bash-dedup-post.sh" -o "$CONFIG_DIR/hooks/bash-dedup-post.sh"
     curl -sSL "$REPO/.claude/hooks/wv-budget-tally.sh" -o "$CONFIG_DIR/hooks/wv-budget-tally.sh"
     curl -sSL "$REPO/.claude/hooks/wv-touched-files.sh" -o "$CONFIG_DIR/hooks/wv-touched-files.sh"
     # Agents
@@ -429,6 +433,7 @@ else
     curl -sSL "$REPO/.claude/skills/weave-audit/SKILL.md" -o "$CONFIG_DIR/skills/weave-audit/SKILL.md"
     curl -sSL "$REPO/.claude/skills/weave/SKILL.md" -o "$CONFIG_DIR/skills/weave/SKILL.md"
     curl -sSL "$REPO/.claude/skills/zero-in/SKILL.md" -o "$CONFIG_DIR/skills/zero-in/SKILL.md"
+    curl -sSL "$REPO/.claude/skills/plan-agent/SKILL.md" -o "$CONFIG_DIR/skills/plan-agent/SKILL.md"
     curl -sSL "$REPO/.claude/skills/weave-audit/audit-report.sh" -o "$CONFIG_DIR/skills/weave-audit/audit-report.sh"
     # CLAUDE.md template (generic, not project-specific)
     curl -sSL "$REPO/templates/CLAUDE.md.template" -o "$CONFIG_DIR/CLAUDE.md.template"
@@ -440,6 +445,7 @@ else
     curl -sSL "$REPO/templates/TOPOLOGY-ENRICH.json.template" -o "$CONFIG_DIR/TOPOLOGY-ENRICH.json.template" 2>/dev/null || true
     # Makefile template for wv-init-repo
     curl -sSL "$REPO/templates/Makefile.template" -o "$CONFIG_DIR/Makefile.template" 2>/dev/null || true
+    curl -sSL "$REPO/templates/copilot-instructions.stub.md" -o "$CONFIG_DIR/copilot-instructions.stub.md" 2>/dev/null || true
     # AGENTS.md template (generic, not project-specific)
     curl -sSL "$REPO/templates/AGENTS.md.template" -o "$CONFIG_DIR/AGENTS.md.template" 2>/dev/null || true
 fi
@@ -565,7 +571,7 @@ for arg in "$@"; do
             echo "Usage: wv-init-repo [--agent=claude|copilot|all] [--update] [--force]"
             echo ""
             echo "  claude   (default) Claude Code hooks, skills, settings.local.json"
-            echo "  copilot  VS Code Copilot .mcp.json + copilot-instructions.md"
+            echo "  copilot  VS Code Copilot .vscode/mcp.json (+ legacy .mcp.json) + copilot-instructions.md"
             echo "  all      Both Claude Code and VS Code Copilot"
             echo ""
             echo "  --update  Update managed files (hooks, skills, agents, copilot-instructions)"
@@ -1032,9 +1038,31 @@ SETTINGSEOF
 fi
 
 if [ "$AGENT" = "copilot" ]; then
-    # VS Code Copilot: .mcp.json + .github/copilot-instructions.md
+        # VS Code Copilot: .vscode/mcp.json + .mcp.json + .github/copilot-instructions.md
 
-    # ── mcp.json (user file — only create on init or with --force) ──
+        # ── .vscode/mcp.json (VS Code workspace MCP config; user file) ──
+        if [ ! -f "$REPO_ROOT/.vscode/mcp.json" ] || [ "$FORCE_MODE" = "1" ]; then
+                mkdir -p "$REPO_ROOT/.vscode"
+                cat > "$REPO_ROOT/.vscode/mcp.json" << MCPEOF
+{
+    "servers": {
+        "weave": {
+            "command": "node",
+            "args": ["$MCP_SERVER"]
+        },
+        "weave-inspect": {
+            "command": "node",
+            "args": ["$MCP_SERVER", "--scope=inspect"]
+        }
+    }
+}
+MCPEOF
+                echo -e "  ${GREEN}✓${NC} .vscode/mcp.json"
+        else
+                echo -e "  ${YELLOW}⊘${NC} .vscode/mcp.json (user file, use --force to overwrite)"
+        fi
+
+        # ── .mcp.json (legacy root MCP config; user file) ──
     if [ ! -f "$REPO_ROOT/.mcp.json" ] || [ "$FORCE_MODE" = "1" ]; then
         cat > "$REPO_ROOT/.mcp.json" << MCPEOF
 {
@@ -1201,7 +1229,8 @@ for _a in "${AGENTS[@]}"; do
         echo "  .claude/skills/  — on-demand skills"
         echo "  CLAUDE.md        — agent instructions"
     elif [ "$_a" = "copilot" ]; then
-        echo "  .mcp.json — Copilot MCP config"
+        echo "  .vscode/mcp.json — VS Code workspace MCP config"
+        echo "  .mcp.json — Copilot MCP config (legacy/root)"
         echo "  .github/copilot-instructions.md — Minimal stub (workflow via weave_guide)"
         echo "  .github/hooks/ — VS Code native hook location"
     fi

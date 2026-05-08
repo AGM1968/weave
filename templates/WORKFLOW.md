@@ -1,7 +1,7 @@
 # Weave Workflow Reference
 
 Canonical reference for `wv` — the task graph CLI for AI coding agents. Full docs: `wv guide` (MCP)
-| Command list: `wv --help`
+| Command list: `wv --help` | Focused help: `wv help <command>` or `wv <command> --help`
 
 ## Core Workflow
 
@@ -17,36 +17,42 @@ git add .weave/ && git commit     # 6. Commit graph state if dirty
 git push                          # 7. MANDATORY before session end
 ```
 
-Never edit a file without an active node. If `wv status` shows 0 active, run `wv work <id>` first.
+Never edit a file without an active node. If `wv status` shows 0 active, run `wv work <id>` or
+create a node first.
 
 ## Commands
 
-| Command                   | What it does                                       | Key flags                                                    |
-| ------------------------- | -------------------------------------------------- | ------------------------------------------------------------ |
-| `wv ready`                | List unblocked work                                | `--json`, `--count`                                          |
-| `wv work <id>`            | Claim node (sets active)                           |                                                              |
-| `wv add "<text>"`         | Create node                                        | `--gh`, `--status=`, `--parent=`, `--alias=`, `--standalone` |
-| `wv done <id>`            | Complete node (auto-closes linked GH issue)        | `--learning="..."`, `--no-overlap-check`                     |
-| `wv ship <id>`            | Done + sync + push in one step                     | `--learning="..."`, `--gh`, `--no-overlap-check`             |
-| `wv update <id>`          | Modify node                                        | `--status=`, `--text=`, `--alias=`                           |
-| `wv quick "<text>"`       | Track trivial work (create active → commit → done) | `--learning="..."`                                           |
-| `wv show <id>`            | Node details + blockers                            | `--json`                                                     |
-| `wv list`                 | All non-done nodes                                 | `--all`, `--status=`, `--json`                               |
-| `wv block <id> --by=<id>` | Add dependency edge                                | `--context='{...}'`                                          |
-| `wv tree`                 | Epic → feature → task hierarchy                    | `--active`, `--depth=N`, `--mermaid`                         |
-| `wv path <id>`            | Ancestry chain                                     | `--format=chain`                                             |
-| `wv plan <file>`          | Import markdown as epic + tasks                    | `--sprint=N`, `--gh`, `--dry-run`                            |
-| `wv context <id> --json`  | Context pack (blockers, ancestors, pitfalls)       | Cached per session                                           |
-| `wv search <query>`       | Full-text search                                   | `--json`                                                     |
-| `wv status`               | Compact status (active/ready/blocked counts)       |                                                              |
-| `wv learnings`            | Show captured decisions/patterns/pitfalls          | `--category=`, `--grep=`, `--dedup`                          |
-| `wv link <from> <to>`     | Create semantic edge                               | `--type=`, `--context='{...}'`                               |
-| `wv health`               | System health check with score                     | `--json`, `--verbose`, `--fix`                               |
-| `wv sync`                 | Dump to `.weave/state.sql`                         | `--gh` for GH sync, `--dry-run`                              |
-| `wv load`                 | Restore from `.weave/state.sql`                    | Run by session start hook                                    |
-| `wv prune`                | Archive done nodes >48h                            | `--age=`, `--orphans-only`, `--dry-run`                      |
-| `wv quality scan`         | Scan repo for complexity + churn                   | `--exclude=`, `--json`                                       |
-| `wv quality hotspots`     | Ranked hotspot report                              | `--top=N`, `--json`                                          |
+| Command                   | What it does                                                           | Key flags                                                                  |
+| ------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `wv ready`                | List unblocked work                                                    | `--json`, `--count`                                                        |
+| `wv work <id>`            | Claim node (sets active)                                               |                                                                            |
+| `wv add "<text>"`         | Create node                                                            | `--gh`, `--status=`, `--parent=`, `--alias=`, `--standalone`               |
+| `wv done <id>`            | Complete node (auto-closes linked GH issue)                            | `--learning="..."`, `--no-overlap-check`                                   |
+| `wv ship <id>`            | Done + sync + push in one step                                         | `--learning="..."`, `--gh`, `--no-overlap-check`                           |
+| `wv update <id>`          | Modify node                                                            | `--status=`, `--text=`, `--alias=`, `--metadata=`, `--metadata-file=`, `--echo` |
+| `wv overview`             | Compact graph/session snapshot                                         | `--json`                                                                   |
+| `wv help <command>`       | Focused help for one command                                           | Also available as `wv <command> --help`                                     |
+| `wv bootstrap`            | Session-start composite: status + active + context + ready + learnings | `--json` (run-cached, 45s TTL)                                             |
+| `wv touch`                | Fire-and-forget intent write (zero stdout)                             | `--intent="TEXT"`                                                          |
+| `wv quick "<text>"`       | Track trivial work (create active → commit → done)                     | `--learning="..."`                                                         |
+| `wv show <id>`            | Node details + blockers                                                | `--json`                                                                   |
+| `wv list`                 | All non-done nodes                                                     | `--all`, `--status=`, `--json`                                             |
+| `wv block <id> --by=<id>` | Add dependency edge                                                    | `--context='{...}'`                                                        |
+| `wv tree`                 | Epic → feature → task hierarchy                                        | `--active`, `--depth=N`, `--mermaid`                                       |
+| `wv path <id>`            | Ancestry chain                                                         | `--format=chain`                                                           |
+| `wv plan <file>`          | Import markdown as epic + tasks                                        | `--sprint=N`, `--gh`, `--dry-run`                                          |
+| `wv context <id> --json`  | Context pack (blockers, ancestors, pitfalls)                           | Cached per session                                                         |
+| `wv search <query>`       | Full-text search                                                       | `--json`                                                                   |
+| `wv status`               | Compact status (active/ready/blocked counts)                           |                                                                            |
+| `wv learnings`            | Show captured decisions/patterns/pitfalls                              | `--category=`, `--grep=`, `--dedup`                                        |
+| `wv link <from> <to>`     | Create semantic edge                                                   | `--type=`, `--context='{...}'`                                             |
+| `wv health`               | System health check with score                                         | `--json`, `--verbose`, `--fix`                                             |
+| `wv sync`                 | Dump to `.weave/state.sql`                                             | `--gh` for GH sync, `--dry-run`                                            |
+| `wv load`                 | Restore from `.weave/state.sql`                                        | Run by session start hook                                                  |
+| `wv prune`                | Archive done nodes >48h                                                | `--age=`, `--orphans-only`, `--dry-run`                                    |
+| `wv quality scan`         | Scan repo for complexity + churn                                       | `--exclude=`, `--json`                                                     |
+| `wv quality hotspots`     | Ranked hotspot report                                                  | `--top=N`, `--json`                                                        |
+| `wv findings <sub>`       | Historical finding promotion/list workflow                             | `list`, `promote`                                                          |
 
 ## Node Statuses
 
@@ -223,13 +229,13 @@ around 300-400k tokens. Make deliberate choices:
 
 ### The 5-Option Framework
 
-| Option | When to use | Weave action |
-| --- | --- | --- |
-| **Continue** | Current approach is working, context is fresh | Keep going |
-| **Rewind** | Failed approach — tool errors, wrong path, dead end | Rewind to before the attempt (see below) |
-| **Compact** | Context growing but direction is clear | `/compact focus on <current task>, drop <completed work>` |
-| **/clear** | Task complete, starting unrelated work | `wv breadcrumbs save` → `/clear` → reload |
-| **Subagent** | Work produces intermediate output you won't need | Delegate, keep only the conclusion |
+| Option       | When to use                                         | Weave action                                              |
+| ------------ | --------------------------------------------------- | --------------------------------------------------------- |
+| **Continue** | Current approach is working, context is fresh       | Keep going                                                |
+| **Rewind**   | Failed approach — tool errors, wrong path, dead end | Rewind to before the attempt (see below)                  |
+| **Compact**  | Context growing but direction is clear              | `/compact focus on <current task>, drop <completed work>` |
+| **/clear**   | Task complete, starting unrelated work              | `wv breadcrumbs save` → `/clear` → reload                 |
+| **Subagent** | Work produces intermediate output you won't need    | Delegate, keep only the conclusion                        |
 
 ### Rewind — The Most Important Habit
 
@@ -247,7 +253,8 @@ compaction cannot reliably clean.
 
 1. Before the risky attempt: `wv breadcrumbs save --message="About to try X, current state is Y"`
 2. After failure: use your client's rewind/undo feature to roll back to before the attempt
-3. After rewinding: capture what you learned: `wv done <id> --learning="pitfall: X failed because Y"`
+3. After rewinding: capture what you learned:
+   `wv done <id> --learning="pitfall: X failed because Y"`
 4. Start the fresh approach with clean context
 
 If your client does not support rewind, use `/clear` with breadcrumbs instead — a fresh session with
@@ -273,15 +280,15 @@ wv context <id> --json  # reload context pack (rule 12: treat as unverified)
 
 ### Subagent Delegation
 
-Delegate when the work produces intermediate output you won't need again. Mental test: *"Will I need
-this tool output, or just the conclusion?"*
+Delegate when the work produces intermediate output you won't need again. Mental test: _"Will I need
+this tool output, or just the conclusion?"_
 
-| Delegate | Keep in context |
-| --- | --- |
-| Verification runs (test suites, linters) | Architecture decisions being made now |
-| Research into unfamiliar code | Active debugging with iterative fixes |
-| Documentation generation | Code changes requiring cross-file consistency |
-| Bulk file operations | Conversations requiring user feedback |
+| Delegate                                 | Keep in context                               |
+| ---------------------------------------- | --------------------------------------------- |
+| Verification runs (test suites, linters) | Architecture decisions being made now         |
+| Research into unfamiliar code            | Active debugging with iterative fixes         |
+| Documentation generation                 | Code changes requiring cross-file consistency |
+| Bulk file operations                     | Conversations requiring user feedback         |
 
 ### Session Scope
 
@@ -311,17 +318,19 @@ wv analyze sessions --call-stats --top=5  # limit results
 
 **Known token costs** (measured values):
 
-| Command | Avg output | Purpose |
-| --- | --- | --- |
-| `wv status` | ~125 B (~31 tok) | Status check — cheapest read |
-| `wv show` | ~540 B (~135 tok) | Node detail |
-| `wv list` | ~700 B (~175 tok) | Active node list |
-| `wv context` | ~850 B (~212 tok) | Context pack |
-| `wv ready` | ~1.2 KB (~300 tok) | Unblocked work |
-| `wv learnings` | ~4.5 KB (~1,138 tok) | Captured knowledge (heaviest per-call) |
+| Command        | Avg output           | Purpose                                    |
+| -------------- | -------------------- | ------------------------------------------ |
+| `wv touch`     | 0 B                  | Intent write — zero tokens                 |
+| `wv status`    | ~125 B (~31 tok)     | Status check — cheapest read               |
+| `wv show`      | ~540 B (~135 tok)    | Node detail                                |
+| `wv list`      | ~700 B (~175 tok)    | Active node list                           |
+| `wv context`   | ~850 B (~212 tok)    | Context pack                               |
+| `wv ready`     | ~1.2 KB (~300 tok)   | Unblocked work                             |
+| `wv bootstrap` | ~2.2 KB (~547 tok)   | Session-start composite — replaces 7 calls |
+| `wv learnings` | ~4.5 KB (~1,138 tok) | Captured knowledge (heaviest per-call)     |
 
-Use `wv status` (not `wv list`) for routine checks. Reserve `wv learnings` for session start and
-targeted `--grep=` queries.
+Use `wv bootstrap --json` at session start (run-cached, single call). Use `wv status` for routine
+checks. Reserve `wv learnings` for targeted `--grep=` queries.
 
 ## Graph Hygiene
 
@@ -387,7 +396,8 @@ EOF
 
 ## Agents
 
-All agents use the main `weave` MCP server (all 31 tools). Each specializes in a subset:
+The default `weave` MCP server exposes all 33 tools. When `weave-inspect` is also registered,
+read-only agents can use its 15-tool inspect subset.
 
 - **weave-guide** — Workflow best practices, anti-patterns (session lifecycle tools)
 - **epic-planner** — Strategic planning, scope, dependencies, risks (graph mutation tools)

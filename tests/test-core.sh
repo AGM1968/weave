@@ -30,6 +30,7 @@ TEST_DIR="/tmp/wv-core-test-$$"
 export WV_HOT_ZONE="$TEST_DIR"
 export WV_DB="$TEST_DIR/brain.db"
 export WV_REQUIRE_LEARNING=0
+export WV_RUN_CACHE=0
 
 # Cleanup function
 cleanup() {
@@ -664,8 +665,11 @@ test_ready_relevance_boost() {
     rm -f "$ring_file"
 
     # Two ready nodes: B has touched_files matching what we'll edit, A does not.
+    # Sleep 1s between adds so created_at timestamps differ — SQLite has 1-second
+    # granularity; same-second nodes fall back to id ASC tiebreaker which is non-deterministic.
     local node_a node_b
     node_a=$("$WV" add "Task A no overlap" 2>&1 | tail -1)
+    sleep 1
     node_b=$("$WV" add "Task B with overlap" 2>&1 | tail -1)
     "$WV" update "$node_b" --metadata='{"touched_files":["scripts/foo.sh"]}' >/dev/null 2>&1
 
@@ -803,6 +807,95 @@ test_update_metadata_merge() {
     "$WV" update "$id5" --metadata='{"done_criteria":"c","risks":[],"risk_level":"low"}' >/dev/null 2>&1
     meta=$("$WV" show "$id5" --json | jq -r '.[0].metadata')
     assert_contains "$meta" '"done_criteria":"c"' "update-then-claim: done_criteria visible immediately"
+
+    # Case F — split-form metadata is accepted instead of falling through to
+    # "no updates specified".
+    local id6
+    id6=$("$WV" add "split-form metadata" 2>&1 | tail -1)
+    "$WV" update "$id6" --metadata '{"split":true}' >/dev/null 2>&1
+    meta=$("$WV" show "$id6" --json | jq -r '.[0].metadata')
+    assert_contains "$meta" '"split":true' "split-form --metadata merges JSON"
+
+    # Case G — file-backed metadata avoids shell-quoting hazards for larger JSON.
+    local id7 meta_file
+    id7=$("$WV" add "file metadata" 2>&1 | tail -1)
+    meta_file=$(mktemp)
+    printf '%s\n' '{"from_file":{"path":"ok","count":2}}' > "$meta_file"
+    "$WV" update "$id7" --metadata-file "$meta_file" >/dev/null 2>&1
+    rm -f "$meta_file"
+    meta=$("$WV" show "$id7" --json | jq -r '.[0].metadata')
+    assert_contains "$meta" '"from_file"' "--metadata-file merges JSON from file"
+    assert_contains "$meta" '"count":2' "--metadata-file preserves nested values"
+
+    # Case H — missing split-form value should produce an actionable diagnostic.
+    local id8 missing_value_output
+    id8=$("$WV" add "missing metadata value" 2>&1 | tail -1)
+    if missing_value_output=$("$WV" update "$id8" --metadata 2>&1); then
+        echo -e "${RED}✗${NC} missing split-form metadata value should fail"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        TESTS_RUN=$((TESTS_RUN + 1))
+    else
+        echo -e "${GREEN}✓${NC} missing split-form metadata value rejected"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        TESTS_RUN=$((TESTS_RUN + 1))
+        assert_contains "$missing_value_output" "--metadata requires a JSON argument" "missing split-form metadata shows actionable error"
+        assert_contains "$missing_value_output" "--metadata-file <path>" "missing split-form metadata suggests safer input"
+    fi
+
+    # Case I — subcommand help is reachable from `wv update --help` and advertises
+    # both metadata forms.
+    local update_help
+    update_help=$("$WV" update --help 2>&1)
+    assert_contains "$update_help" "Usage: wv update <id>" "wv update --help shows subcommand usage"
+    assert_contains "$update_help" "--metadata <json>" "wv update --help documents split-form metadata"
+    assert_contains "$update_help" "--metadata-file <path>" "wv update --help documents safer file-backed metadata"
+}
+
+test_help_surfaces() {
+    echo ""
+    echo "Test: CLI help surfaces"
+    echo "======================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    local root_help
+    root_help=$("$WV" --help 2>&1)
+
+    local expected_commands=(
+        init add delete done ship batch-done bulk-update work preflight recover bootstrap
+        overview cache pending-close ready list show status update touch allowed-tools quick
+        block link unlink resolve related edges path tree plan enrich-topology context search
+        reindex learnings breadcrumbs digest session-summary audit-pitfalls edge-types init-repo
+        doctor selftest mcp-status health guide prune clean-ghosts compact refs import quality
+        findings analyze batch sync load
+    )
+
+    local cmd
+    for cmd in "${expected_commands[@]}"; do
+        assert_contains "$root_help" "$cmd" "root help lists $cmd"
+    done
+    assert_contains "$root_help" "wv help <command>" "root help documents focused help entrypoint"
+    assert_contains "$root_help" "wv <command> --help" "root help documents per-command help flag"
+
+    local show_help
+    show_help=$("$WV" show --help 2>&1)
+    assert_contains "$show_help" "Usage: wv show <id>" "show --help prints focused usage"
+    assert_not_contains "$show_help" "invalid node ID or alias" "show --help bypasses ID validation errors"
+
+    local link_help
+    link_help=$("$WV" link --help 2>&1)
+    assert_contains "$link_help" "Usage: wv link <from-id> <to-id>" "link --help prints focused usage"
+    assert_not_contains "$link_help" "Error: usage" "link --help no longer falls through to validation error text"
+
+    local work_help
+    work_help=$("$WV" help work 2>&1)
+    assert_contains "$work_help" "Usage: wv work <id>" "wv help work prints focused usage"
+    assert_contains "$work_help" "allowed tool list" "wv help work includes command summary"
+
+    local quality_scan_help
+    quality_scan_help=$("$WV" help quality scan 2>&1)
+    assert_contains "$quality_scan_help" "Usage: wv quality scan" "nested help delegates to quality scan help"
 }
 
 # ============================================================================
@@ -886,6 +979,201 @@ test_findings_promote() {
 }
 
 # ============================================================================
+# Test: policy trigger — done gate on mccabe_max breach
+# ============================================================================
+test_policy_trigger() {
+    echo ""
+    echo "Test: policy trigger — done gate on mccabe_max breach"
+    echo "======================================================"
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # Seed a file_metrics fixture table (owned by weave_quality in production;
+    # created here as a minimal stub so the trigger join has data to read).
+    sqlite3 "$WV_DB" <<'SQL'
+CREATE TABLE IF NOT EXISTS file_metrics (
+    path        TEXT PRIMARY KEY,
+    mccabe_max  INTEGER NOT NULL DEFAULT 0,
+    gini        REAL    NOT NULL DEFAULT 0.0
+);
+SQL
+
+    # --- Case 1: node with a breaching file should NOT be closeable ---
+    local breach_id
+    breach_id=$("$WV" add "Node with complex file" 2>&1 | tail -1)
+    "$WV" work "$breach_id" >/dev/null 2>&1
+
+    # WV_REQUIRE_QUALITY=0 bypasses P2 refresh so we can seed file_metrics directly.
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_metrics(path, mccabe_max) VALUES ('src/complex.py', 20);
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$breach_id', 'src/complex.py');
+SQL
+
+    local breach_out
+    breach_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$breach_id" 2>&1 || true)
+    assert_contains "$breach_out" "GraphPolicyViolation" \
+        "done is blocked when mccabe_max exceeds threshold"
+
+    local breach_status
+    breach_status=$(sqlite3 "$WV_DB" "SELECT status FROM nodes WHERE id='$breach_id';")
+    assert_equals "active" "$breach_status" \
+        "node remains active after trigger abort"
+
+    # --- Case 2: node whose file is within threshold closes normally ---
+    local clean_id
+    clean_id=$("$WV" add "Node with clean file" 2>&1 | tail -1)
+    "$WV" work "$clean_id" >/dev/null 2>&1
+
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_metrics(path, mccabe_max) VALUES ('src/simple.py', 5);
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$clean_id', 'src/simple.py');
+SQL
+
+    local clean_out
+    clean_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$clean_id" 2>&1)
+    assert_contains "$clean_out" "Closed" \
+        "done succeeds when mccabe_max is within threshold"
+
+    # --- Case 3: FTS search still works after trigger addition (no regression) ---
+    local search_id
+    search_id=$("$WV" add "Policy trigger regression check node" 2>&1 | tail -1)
+    WV_REQUIRE_QUALITY=0 "$WV" done "$search_id" >/dev/null 2>&1
+    local search_out
+    search_out=$("$WV" search "regression check" 2>&1)
+    assert_contains "$search_out" "regression" \
+        "FTS search unaffected by policy trigger (no AFTER UPDATE regression)"
+}
+
+test_p2_quality_refresh() {
+    echo ""
+    echo "Test: P2 — file_metrics refresh on wv done"
+    echo "==========================================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # --- Case 1: quality.db absent + node_files pre-seeded → loud failure ---
+    local noq_id
+    noq_id=$("$WV" add "Node needing quality check" 2>&1 | tail -1)
+    "$WV" work "$noq_id" >/dev/null 2>&1
+
+    # Seed node_files directly so P2 has paths to check but no quality.db exists.
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$noq_id', 'src/feature.py');
+SQL
+
+    local noq_out noq_rc
+    noq_out=$("$WV" done "$noq_id" 2>&1 || true)
+    noq_rc=$("$WV" show "$noq_id" --json 2>/dev/null | jq -r '.status' 2>/dev/null || echo "active")
+    assert_contains "$noq_out" "quality.db not found" \
+        "wv done fails loudly when quality.db is absent and node_files is non-empty"
+    assert_equals "active" "$noq_rc" \
+        "node stays active when quality.db is absent"
+
+    # --- Case 2: quality.db with no scans → loud failure ---
+    local noscan_id
+    noscan_id=$("$WV" add "Node needing scan data" 2>&1 | tail -1)
+    "$WV" work "$noscan_id" >/dev/null 2>&1
+
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$noscan_id', 'src/feature.py');
+SQL
+
+    # Create quality.db with schema but no scan rows.
+    local quality_db="$WV_HOT_ZONE/quality.db"
+    sqlite3 "$quality_db" "CREATE TABLE IF NOT EXISTS scan_meta (id INTEGER PRIMARY KEY, scanned_at TEXT, git_head TEXT, files_count INTEGER, duration_ms INTEGER, scanner_version TEXT);"
+    sqlite3 "$quality_db" "CREATE TABLE IF NOT EXISTS files (path TEXT, scan_id INTEGER, complexity REAL, PRIMARY KEY(path, scan_id));"
+
+    local noscan_out noscan_rc
+    noscan_out=$("$WV" done "$noscan_id" 2>&1 || true)
+    noscan_rc=$("$WV" show "$noscan_id" --json 2>/dev/null | jq -r '.status' 2>/dev/null || echo "active")
+    assert_contains "$noscan_out" "no scan data" \
+        "wv done fails loudly when quality.db exists but has no scans"
+    assert_equals "active" "$noscan_rc" \
+        "node stays active when quality.db has no scan data"
+
+    # --- Case 3: quality.db present + mccabe within threshold → close succeeds and
+    #             file_metrics in brain.db is populated from quality.db ---
+    sqlite3 "$quality_db" "INSERT INTO scan_meta(id, scanned_at, git_head) VALUES(1, '2026-01-01T00:00:00', 'abc1234');"
+    sqlite3 "$quality_db" "INSERT INTO files(path, scan_id, complexity) VALUES('src/feature.py', 1, 8.0);"
+
+    local ok_id
+    ok_id=$("$WV" add "Node with quality data" 2>&1 | tail -1)
+    "$WV" work "$ok_id" >/dev/null 2>&1
+
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$ok_id', 'src/feature.py');
+SQL
+
+    local ok_out
+    ok_out=$("$WV" done "$ok_id" 2>&1)
+    assert_contains "$ok_out" "Closed" \
+        "wv done succeeds when quality.db has scan data within threshold"
+
+    local refreshed_max
+    refreshed_max=$(sqlite3 "$WV_DB" "SELECT mccabe_max FROM file_metrics WHERE path='src/feature.py';")
+    assert_equals "8" "$refreshed_max" \
+        "file_metrics in brain.db populated from quality.db complexity"
+}
+
+test_allowed_tools() {
+    echo ""
+    echo "Test: wv allowed-tools command and work/done flag support"
+    echo "=========================================================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # --- Case 1: node with no allowed_tools ---
+    local node_id
+    node_id=$("$WV" add "Test allowed-tools node" 2>&1 | tail -1)
+
+    local text_out json_out
+    text_out=$("$WV" allowed-tools "$node_id" 2>&1)
+    assert_contains "$text_out" "no allowed_tools" \
+        "allowed-tools text output: reports no tools set"
+
+    json_out=$("$WV" allowed-tools "$node_id" --json 2>&1)
+    assert_equals "null" "$json_out" \
+        "allowed-tools --json: null when unset"
+
+    # --- Case 2: wv work --allowed-tools sets metadata ---
+    "$WV" work "$node_id" --allowed-tools=read,grep,bash >/dev/null 2>&1
+
+    local work_tools
+    work_tools=$("$WV" allowed-tools "$node_id" --json 2>&1)
+    assert_equals '["read","grep","bash"]' "$work_tools" \
+        "wv work --allowed-tools persists tool list as JSON array"
+
+    # --- Case 3: wv done --allowed-tools updates the list at close time ---
+    WV_REQUIRE_QUALITY=0 "$WV" done "$node_id" --allowed-tools=read,write >/dev/null 2>&1
+
+    local done_tools
+    done_tools=$(sqlite3 "$WV_DB" "SELECT json_extract(metadata, '\$.allowed_tools') FROM nodes WHERE id='$node_id';")
+    assert_equals '["read","write"]' "$done_tools" \
+        "wv done --allowed-tools overwrites tool list at close time"
+
+    # --- Case 4: allowed-tools on missing node exits non-zero ---
+    local bad_out bad_rc
+    bad_rc=0
+    bad_out=$("$WV" allowed-tools "wv-000000" 2>&1) || bad_rc=$?
+    assert_equals "1" "$bad_rc" \
+        "allowed-tools on missing node exits 1"
+    assert_contains "$bad_out" "not found" \
+        "allowed-tools on missing node prints error"
+
+    # --- Case 5: node with no --allowed-tools on wv work stays null ---
+    local clean_id
+    clean_id=$("$WV" add "Clean node no tools" 2>&1 | tail -1)
+    "$WV" work "$clean_id" >/dev/null 2>&1
+    local clean_tools
+    clean_tools=$("$WV" allowed-tools "$clean_id" --json 2>&1)
+    assert_equals "null" "$clean_tools" \
+        "wv work without --allowed-tools leaves allowed_tools unset"
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 main() {
@@ -905,9 +1193,13 @@ main() {
     test_ready
     test_status
     test_stale_active_marker
+    test_policy_trigger
+    test_p2_quality_refresh
+    test_allowed_tools
     test_ready_relevance_boost
     test_done_contradiction
     test_update_metadata_merge
+    test_help_surfaces
 
     echo ""
     echo "========================================"

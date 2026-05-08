@@ -8,6 +8,7 @@ import { spawn, spawnSync, ChildProcess } from "child_process";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const SERVER_PATH = resolve(__dirname, "../dist/index.js");
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -190,9 +191,11 @@ describe("Weave MCP Server", () => {
   async function createTrackedNode(text: string, metadata?: Record<string, unknown>): Promise<string> {
     const addResponse = await client.request("tools/call", {
       name: "weave_add",
-      arguments: { text },
+      arguments: { text, standalone: true },
     });
-    const addResult = addResponse.result as { content: { text: string }[] };
+    expect(addResponse.error).toBeUndefined();
+    const addResult = addResponse.result as { isError?: boolean; content: { text: string }[] };
+    expect(addResult.isError).not.toBe(true);
     const id = extractNodeId(addResult.content[0].text);
     createdNodeIds.push(id);
     if (metadata) {
@@ -216,12 +219,12 @@ describe("Weave MCP Server", () => {
   });
 
   describe("tools/list", () => {
-    it("should list all 31 tools (default scope=all)", async () => {
+    it("should list all 33 tools (default scope=all)", async () => {
       const response = await client.request("tools/list");
       expect(response.error).toBeUndefined();
 
       const tools = (response.result as { tools: { name: string }[] }).tools;
-      expect(tools).toHaveLength(31);
+      expect(tools).toHaveLength(33);
 
       const toolNames = tools.map((t) => t.name);
       expect(toolNames).toContain("weave_search");
@@ -238,6 +241,7 @@ describe("Weave MCP Server", () => {
       expect(toolNames).toContain("weave_work");
       expect(toolNames).toContain("weave_ship");
       expect(toolNames).toContain("weave_overview");
+      expect(toolNames).toContain("weave_bootstrap");
       expect(toolNames).toContain("weave_preflight");
       expect(toolNames).toContain("weave_sync");
       expect(toolNames).toContain("weave_resolve");
@@ -245,6 +249,7 @@ describe("Weave MCP Server", () => {
       expect(toolNames).toContain("weave_tree");
       expect(toolNames).toContain("weave_learnings");
       expect(toolNames).toContain("weave_update");
+      expect(toolNames).toContain("weave_touch");
       expect(toolNames).toContain("weave_breadcrumbs");
       expect(toolNames).toContain("weave_plan");
       expect(toolNames).toContain("weave_show");
@@ -524,7 +529,7 @@ describe("Weave MCP Server", () => {
     it("weave_add with backtick injection should not execute", async () => {
       const response = await client.request("tools/call", {
         name: "weave_add",
-        arguments: { text: "`cat /etc/passwd`" },
+        arguments: { text: "`cat /etc/passwd`", standalone: true },
       });
       // The node text should be the literal backtick string, not file contents
       const result = response.result as { content: { text: string }[] };
@@ -703,7 +708,7 @@ describe("Weave MCP Server", () => {
       try {
         const addResponse = await loggedClient.request("tools/call", {
           name: "weave_add",
-          arguments: { text: "status alias add", status: "in_progress" },
+          arguments: { text: "status alias add", status: "in_progress", standalone: true },
         });
         createdNodeIds.push(extractNodeId((addResponse.result as { content: { text: string }[] }).content[0].text));
 
@@ -811,10 +816,11 @@ describe("Weave MCP Server --scope=graph", () => {
         "weave_list",
         "weave_resolve",
         "weave_update",
+        "weave_touch",
         "weave_delete",
       ])
     );
-    expect(tools).toHaveLength(8);
+    expect(tools).toHaveLength(9);
 
     // Should NOT include inspect or session tools
     expect(toolNames).not.toContain("weave_search");
@@ -859,13 +865,14 @@ describe("Weave MCP Server --scope=session", () => {
         "weave_recover",
         "weave_quick",
         "weave_overview",
+        "weave_bootstrap",
         "weave_close_session",
         "weave_breadcrumbs",
         "weave_plan",
         "weave_edit_guard",
       ])
     );
-    expect(tools).toHaveLength(9);
+    expect(tools).toHaveLength(10);
   });
 });
 
@@ -893,6 +900,7 @@ describe("Weave MCP Server --scope=inspect", () => {
         "weave_status",
         "weave_health",
         "weave_preflight",
+        "weave_bootstrap",
         "weave_sync",
         "weave_tree",
         "weave_learnings",
@@ -904,6 +912,6 @@ describe("Weave MCP Server --scope=inspect", () => {
         "weave_quality_functions",
       ])
     );
-    expect(tools).toHaveLength(14);
+    expect(tools).toHaveLength(15);
   });
 });

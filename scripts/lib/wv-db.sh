@@ -101,6 +101,50 @@ CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
     INSERT INTO nodes_fts(rowid, id, text, metadata)
     VALUES (new.rowid, new.id, new.text, new.metadata);
 END;
+
+-- node_files: files touched by a node (populated by wv work/done via git diff)
+CREATE TABLE IF NOT EXISTS node_files (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    path    TEXT NOT NULL,
+    PRIMARY KEY (node_id, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_files_node ON node_files(node_id);
+
+-- file_metrics: per-file quality metrics, flat schema (populated by wv done in P2).
+-- Stub is always present so the policy trigger can be compiled; starts empty.
+-- Populated by wv done querying quality.db (weave_quality/db.py) before the UPDATE.
+CREATE TABLE IF NOT EXISTS file_metrics (
+    path       TEXT PRIMARY KEY,
+    mccabe_max INTEGER NOT NULL DEFAULT 0
+);
+
+-- policy_thresholds: configurable quality gates consulted by the done trigger
+CREATE TABLE IF NOT EXISTS policy_thresholds (
+    key   TEXT PRIMARY KEY,
+    value REAL NOT NULL
+);
+
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max', 15);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('gini_max', 0.85);
+
+-- Trigger: gate active→done transitions on file quality metrics.
+-- Fires BEFORE the UPDATE so the FTS AFTER UPDATE trigger never sees a
+-- violating state. The WHEN clause checks node_files → file_metrics; RAISE
+-- uses a literal message (SQLite RAISE does not accept expressions) parseable
+-- by WvClient as a GraphPolicyViolation.
+CREATE TRIGGER IF NOT EXISTS nodes_policy_check
+BEFORE UPDATE OF status ON nodes
+WHEN NEW.status = 'done' AND OLD.status = 'active'
+  AND EXISTS (
+    SELECT 1 FROM node_files nf
+    JOIN file_metrics fm ON fm.path = nf.path
+    WHERE nf.node_id = NEW.id
+      AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded');
+END;
 EOF
     # Tighten perms on the DB file in case it predates the umask change.
     [ -f "$WV_DB" ] && chmod 600 "$WV_DB" 2>/dev/null || true
@@ -233,6 +277,47 @@ END;
 MIGRATE
 }
 
+# Migrate to add node_files, policy_thresholds, and the done-gate trigger.
+# Safe to run repeatedly — CREATE IF NOT EXISTS + INSERT OR IGNORE.
+db_migrate_policy_tables() {
+    sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
+CREATE TABLE IF NOT EXISTS node_files (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    path    TEXT NOT NULL,
+    PRIMARY KEY (node_id, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_files_node ON node_files(node_id);
+
+CREATE TABLE IF NOT EXISTS policy_thresholds (
+    key   TEXT PRIMARY KEY,
+    value REAL NOT NULL
+);
+
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max', 15);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('gini_max', 0.85);
+
+CREATE TRIGGER IF NOT EXISTS nodes_policy_check
+BEFORE UPDATE OF status ON nodes
+WHEN NEW.status = 'done' AND OLD.status = 'active'
+BEGIN
+    SELECT RAISE(ABORT, json_object(
+        'error', 'GraphPolicyViolation',
+        'node_id', NEW.id,
+        'threshold', 'mccabe_max',
+        'limit', (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max'),
+        'actual', fm.mccabe_max,
+        'path', nf.path
+    ))
+    FROM node_files nf
+    JOIN file_metrics fm ON fm.path = nf.path
+    WHERE nf.node_id = NEW.id
+      AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
+    LIMIT 1;
+END;
+MIGRATE
+}
+
 # Rebuild FTS5 index from existing nodes (for migration or repair)
 db_reindex_fts5() {
     db_ensure
@@ -343,6 +428,7 @@ db_ensure() {
     fi
 
     db_migrate_edge_type_enum
+    db_migrate_policy_tables
 
     # Check DB size once per invocation — auto-prune if over limit
     # WV_DISABLE_AUTOPRUNE=1 skips this (used during sync to prevent mid-sync data loss)

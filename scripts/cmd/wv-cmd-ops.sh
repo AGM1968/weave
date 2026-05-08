@@ -1534,7 +1534,10 @@ cmd_mcp_status() {
     # 4. Check for IDE configs (supports both agents in same repo)
     local repo_root="$REPO_ROOT"
     local has_vscode=false has_claude=false
-    if [ -f "$repo_root/.mcp.json" ]; then
+    if [ -f "$repo_root/.vscode/mcp.json" ]; then
+        _mcp_record "VS Code config" "pass" ".vscode/mcp.json"
+        has_vscode=true
+    elif [ -f "$repo_root/.mcp.json" ]; then
         _mcp_record "VS Code config" "pass" ".mcp.json"
         has_vscode=true
     fi
@@ -2893,11 +2896,232 @@ EOF
 # cmd_help — Show help
 # ═══════════════════════════════════════════════════════════════════════════
 
+print_command_help() {
+    local usage="$1"
+    local summary="$2"
+
+    printf 'Usage: %s\n\n%s\n' "$usage" "$summary"
+}
+
+cmd_help_topic() {
+    local topic="${1:-}"
+    shift || true
+
+    case "$topic" in
+        bootstrap)
+            cmd_bootstrap --help
+            ;;
+        bulk-update)
+            cmd_bulk_update --help
+            ;;
+        cache)
+            cmd_cache --help
+            ;;
+        enrich-topology)
+            cmd_enrich_topology --help
+            ;;
+        quality)
+            if [ $# -gt 0 ]; then
+                cmd_quality "$1" --help
+            else
+                cmd_quality --help
+            fi
+            ;;
+        findings)
+            if [ $# -gt 0 ]; then
+                cmd_findings "$1" --help
+            else
+                cmd_findings --help
+            fi
+            ;;
+        analyze)
+            if [ $# -gt 0 ]; then
+                cmd_analyze "$1" --help
+            else
+                cmd_analyze --help
+            fi
+            ;;
+        init-repo)
+            cmd_init_repo --help
+            ;;
+        update)
+            cmd_update_help
+            ;;
+        help)
+            print_command_help "wv help <command> [subcommand]" "Show focused help for one command. Nested subcommand families like quality/findings/analyze can take an extra subcommand argument."
+            ;;
+        init)
+            print_command_help "wv init [--force]" "Initialize the Weave database in the current hot zone, recovering synced state when available."
+            ;;
+        add)
+            print_command_help "wv add <text> [--status=STATUS] [--parent=<id>] [--gh] [--alias=<name>] [--metadata=<json>] [--force] [--standalone] [--criteria=<text>] [--risks=<level>]" "Create a node and print its id. Use --parent when an active epic exists, or --standalone for repo-level chores."
+            ;;
+        delete)
+            print_command_help "wv delete <id> [--force] [--dry-run] [--no-gh]" "Delete a node and its edges. Use --dry-run to preview deletions and --force to execute them."
+            ;;
+        done)
+            print_command_help "wv done <id> [--learning=\"...\"] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--no-warn] [--acknowledge-overlap] [--skip-verification] [--no-overlap-check]" "Close a node and optionally store structured learnings or bypass flags when policy allows it."
+            ;;
+        ship)
+            print_command_help "wv ship <id> [--learning=\"...\"] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--gh] [--no-overlap-check]" "Close a node and immediately sync/push the graph state in one step."
+            ;;
+        batch-done)
+            print_command_help "wv batch-done <id1> <id2> ... [--learning=\"...\"] [--no-warn]" "Close multiple nodes with a shared learning note."
+            ;;
+        work)
+            print_command_help "wv work <id> [--quiet] [--force] [--json] [--allowed-tools=t1,t2,...]" "Claim a node, set WV_ACTIVE for agent context, and optionally persist an allowed tool list."
+            ;;
+        preflight)
+            print_command_help "wv preflight <id>" "Return machine-readable blockers, contradictions, and readiness checks for a node."
+            ;;
+        recover)
+            print_command_help "wv recover [--auto] [--json] [--session]" "Resume interrupted ship/sync/delete flows or inspect orphaned active work for the current session."
+            ;;
+        overview)
+            print_command_help "wv overview [--json]" "Show a compact operational snapshot: counts, health indicators, breadcrumb, and top ready work."
+            ;;
+        pending-close)
+            print_command_help "wv pending-close [--json]" "List nodes waiting for explicit overlap acknowledgement before close."
+            ;;
+        ready)
+            print_command_help "wv ready [--json] [--count] [--mode=bootstrap|discover|execute|full]" "List unblocked work, optionally as JSON or a count-only response."
+            ;;
+        list)
+            print_command_help "wv list [--all] [--status=<status>] [--json | --json-v2] [--mode=bootstrap|discover|execute|full]" "List nodes, excluding done by default. Use --json-v2 for the lean parsed-metadata shape."
+            ;;
+        show)
+            print_command_help "wv show <id> [--json | --json-v2] [--mode=bootstrap|discover|execute|full]" "Show node details in text or JSON. --json-v2 returns the lean parsed-metadata shape."
+            ;;
+        status)
+            print_command_help "wv status [--json] [--mode=bootstrap|discover|execute|full]" "Show compact status counts for the current graph."
+            ;;
+        touch)
+            print_command_help "wv touch <id> (--metadata=<json> | --intent=<text>)" "Silently merge metadata for low-friction intent tracking or fire-and-forget updates."
+            ;;
+        allowed-tools)
+            print_command_help "wv allowed-tools <id> [--json]" "Inspect the metadata.allowed_tools list stored on a node."
+            ;;
+        quick)
+            print_command_help "wv quick <text> [--learning=\"...\"]" "Create and close a trivial one-step node in a single command."
+            ;;
+        block)
+            print_command_help "wv block <id> --by=<blocker-id>" "Add a workflow dependency edge so the target is blocked by another node."
+            ;;
+        link)
+            print_command_help "wv link <from-id> <to-id> --type=<type> [--weight=<weight>] [--context=<json>]" "Create a semantic edge between two nodes. Use 'wv edge-types' to inspect valid edge types."
+            ;;
+        unlink)
+            print_command_help "wv unlink <from-id> <to-id> --type=<type>" "Remove a semantic edge between two nodes."
+            ;;
+        resolve)
+            print_command_help "wv resolve <node1> <node2> (--winner=<id> | --merge | --defer) [--rationale=<text>]" "Resolve a contradiction edge by selecting a winner, merging, or deferring with rationale."
+            ;;
+        related)
+            print_command_help "wv related <id> [--type=<type>] [--direction=outbound|inbound|both] [--json]" "Inspect a node's semantic relationships."
+            ;;
+        edges)
+            print_command_help "wv edges <id> [--type=<type>] [--json]" "Inspect all edges touching a node."
+            ;;
+        path)
+            print_command_help "wv path <id> [--format=chain]" "Show the ancestry path for a node."
+            ;;
+        tree)
+            print_command_help "wv tree [root] [--active] [--depth=N] [--json] [--mermaid]" "Render epic/task hierarchy as text, JSON, or Mermaid."
+            ;;
+        plan)
+            print_command_help "wv plan <file.md> --sprint=N [--dry-run] [--gh] [--template]" "Import a markdown plan into epic/task nodes, or emit a template with --template."
+            ;;
+        context)
+            print_command_help "wv context [id] --json [--mode=bootstrap|discover|execute|full]" "Generate a JSON context pack for a node. If <id> is omitted, wv uses WV_ACTIVE."
+            ;;
+        search)
+            print_command_help "wv search <query> [--limit=N] [--status=<status>] [--json]" "Run full-text search across node text and metadata."
+            ;;
+        reindex)
+            print_command_help "wv reindex" "Rebuild the full-text search index."
+            ;;
+        learnings)
+            print_command_help "wv learnings [--category=<cat>] [--grep=<pattern>] [--recent=N] [--mode=<mode>] [--node=<id>] [--show-graph]" "Show captured learnings, optionally filtered by category, text, node, or output mode."
+            ;;
+        breadcrumbs)
+            print_command_help "wv breadcrumbs [save|show|clear] [--message=\"...\"]" "Persist or inspect session breadcrumbs for handoff and continuity."
+            ;;
+        digest)
+            print_command_help "wv digest [--json]" "Show a compact one-line health summary."
+            ;;
+        session-summary)
+            print_command_help "wv session-summary" "Show session activity statistics such as nodes created, completed, and learnings captured."
+            ;;
+        audit-pitfalls)
+            print_command_help "wv audit-pitfalls" "List pitfall learnings and their resolution status."
+            ;;
+        edge-types)
+            print_command_help "wv edge-types" "List valid semantic edge types and what each one means."
+            ;;
+        doctor)
+            print_command_help "wv doctor [--json]" "Run installation and surface-contract diagnostics for the CLI, hooks, and repo wiring."
+            ;;
+        selftest)
+            print_command_help "wv selftest [--json]" "Run a round-trip smoke test in an isolated environment."
+            ;;
+        mcp-status)
+            print_command_help "wv mcp-status [--json]" "Check whether the local MCP server is built and IDE-configured."
+            ;;
+        health)
+            print_command_help "wv health [--history[=N]] [--verbose] [--json]" "Run system health checks and optionally include recent health history."
+            ;;
+        guide)
+            print_command_help "wv guide [--topic=workflow|github|learnings|context|mcp]" "Show a quick reference for common Weave workflows and integrations."
+            ;;
+        prune)
+            print_command_help "wv prune [--age=48h] [--dry-run] [--orphans-only]" "Archive old done nodes, optionally targeting only orphaned ones."
+            ;;
+        clean-ghosts)
+            print_command_help "wv clean-ghosts [--dry-run]" "Remove edges that reference deleted nodes."
+            ;;
+        compact)
+            print_command_help "wv compact [--older-than=Nd] [--dry-run] [--force]" "Delete replayed delta files after age and active-claim safety checks."
+            ;;
+        refs)
+            print_command_help "wv refs <file> | wv refs -t <text> | echo <text> | wv refs [--link --from=<id>] [--json] [--max=N]" "Extract Weave node references from text and optionally create edges."
+            ;;
+        import)
+            print_command_help "wv import <file.jsonl> [--filter=\"id=...\"] [--dry-run]" "Import nodes from JSONL/JSON exports."
+            ;;
+        batch)
+            print_command_help "wv batch [file] [--dry-run] [--stop-on-error]" "Execute multiple wv commands from a file or stdin."
+            ;;
+        sync)
+            print_command_help "wv sync [--gh] [--dry-run]" "Persist in-memory graph state to the git-backed .weave layer and optionally sync GitHub issues."
+            ;;
+        load)
+            print_command_help "wv load" "Load the graph from the git-backed .weave layer."
+            ;;
+        version)
+            print_command_help "wv version" "Print the installed Weave CLI version."
+            ;;
+        *)
+            echo "Unknown help topic: $topic" >&2
+            echo "Try 'wv --help' to list available commands." >&2
+            return 1
+            ;;
+    esac
+}
+
 cmd_help() {
+    local topic="${1:-}"
+    if [ -n "$topic" ]; then
+        shift || true
+        cmd_help_topic "$topic" "$@"
+        return $?
+    fi
+
     cat <<EOF
 wv — Weave CLI: In-memory graph for AI coding agents
 
 Usage: wv <command> [args]
+       wv help <command>
+       wv <command> --help
 
 Commands:
   init              Initialize database
@@ -2910,14 +3134,21 @@ Commands:
   work <id>         Claim node & set WV_ACTIVE for subagent context [--quiet]
   preflight <id>    Pre-action checks as JSON (blockers, contradictions, context load)
   recover           Resume incomplete operations (ship/sync/delete) [--auto] [--json] [--session]
+  bootstrap         Single-call JSON bootstrap context for agents [--json]
+  overview          Compact graph summary [--json]
+  cache             Claude prompt-cache diagnostics [--json]
   pending-close     List nodes awaiting human acknowledgement after learning overlap [--json]
   ready             List unblocked work
   list              List nodes (excludes done by default)
   show <id>         Show node details
   status            Compact status for context injection
-  update <id>       Update node (--status=, --text=, --metadata=, --remove-key=)
+  update <id>       Update node (run 'wv update --help' for metadata forms and safer input)
+  touch <id>        Silent metadata merge for per-turn intent updates
+  allowed-tools     Read metadata.allowed_tools for a node [--json]
+  quick             Create and close a trivial one-step node
   block <id>        Add blocking edge (--by=<blocker>)
   link <from> <to>  Create semantic edge (--type=<type> [--weight=] [--context=])
+  unlink <from> <to> Remove a semantic edge (--type=<type>)
   resolve <n1> <n2> Resolve contradiction (--winner=<id> | --merge | --defer [--rationale=])
   related <id>      Show semantic relationships ([--type=] [--direction=] [--json])
   edges <id>        Inspect all edges for a node ([--type=] [--json])
@@ -2933,6 +3164,7 @@ Commands:
   digest            Compact one-liner health summary [--json]
   session-summary   Session activity stats (nodes created/completed, learnings)
   audit-pitfalls    Show all pitfalls with resolution status
+  edge-types        List valid semantic edge types
   init-repo         Bootstrap repo for Weave [--agent=claude|copilot|all] [--update] [--force]
   doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]
   selftest          Round-trip smoke test in isolated environment [--json]
@@ -2941,10 +3173,12 @@ Commands:
   guide             Workflow quick reference [--topic=workflow|github|learnings|context|mcp]
   prune             Archive old done nodes
   clean-ghosts      Delete ghost edges referencing deleted nodes [--dry-run] [legacy compatibility]
+  compact           Delete replayed deltas after safety checks [--older-than=Nd]
   refs <file|text>  Extract cross-references (dry-run, no edges)
   import <file>     Import from beads JSONL or JSON
   quality <sub>     Code quality scanner (scan, hotspots, diff, promote, reset)
   findings <sub>    Historical finding promotion (list, promote)
+  analyze <sub>     Analyze agent session traces and instrumentation data
   batch [file]      Execute multiple wv commands from file or stdin [--dry-run] [--stop-on-error]
   sync              Persist to git layer (.weave/) [--gh GH sync] [--dry-run]
   load              Load from git layer
@@ -2955,7 +3189,7 @@ Options:
   --count           Return count only (ready)
   --verbose, -v     Show diagnostics (health)
   --history[=N]     Show last N health checks (default 10)
-  --format=chain    Show as "A → B → C" (path)
+  --format=chain    Show as "A -> B -> C" (path)
   --node=<id>       Filter to one node (learnings)
   --show-graph      Show pitfall resolution graph (learnings)
   --age=48h         Prune age threshold (prune)
@@ -2971,6 +3205,7 @@ Options:
   --no-warn         Suppress validation warnings (done) [also: WV_NO_WARN=1]
   --remove-key=<k>  Remove a single metadata key (update)
   --metadata=<json> Merge JSON into existing metadata (update)
+  --metadata-file=<path> Read metadata JSON from a file or stdin (update)
   --category=<cat>  Filter by type: decision/pattern/pitfall/learning (learnings)
   --grep=<pattern>  Search text and metadata (learnings)
   --recent=<N>      Show only last N learnings (learnings)
@@ -2984,6 +3219,8 @@ Examples:
   wv work wv-a1b2                             # claim node, show WV_ACTIVE export
   eval "\$(wv work wv-a1b2 --quiet)"          # claim and set WV_ACTIVE in one command
   wv context --json                           # uses WV_ACTIVE if set
+  wv help update                              # focused help for one command
+  wv show --help                              # alternate focused help form
   wv done wv-a1b2 --learning="pattern: always check X"
   wv ship wv-a1b2 --learning="decision: ..."  # done + sync + push
   wv batch-done wv-a1b2 wv-c3d4 --learning="sprint complete"
@@ -2991,6 +3228,7 @@ Examples:
   wv recover --auto                           # resume interrupted operations
   echo '[{"id":"wv-a1b2","alias":"my-task"},{"id":"wv-c3d4","status":"active"}]' | wv bulk-update
   wv update wv-a1b2 --metadata='{"priority":1}'  # merges, not replaces
+  wv update wv-a1b2 --metadata-file meta.json     # safer metadata input
   wv update wv-a1b2 --remove-key=old_field        # remove single key
   wv block wv-c3d4 --by=wv-a1b2
   wv link wv-a1b2 wv-c3d4 --type=implements --weight=0.8
@@ -3015,7 +3253,7 @@ Examples:
   wv learnings --grep="testing"
   wv done wv-a1b2 --no-warn
   wv init-repo                                # bootstrap .claude/ for current repo (claude agent)
-  wv init-repo --agent=copilot                # add VS Code Copilot config (.mcp.json + instructions)
+  wv init-repo --agent=copilot                # add VS Code Copilot config (.vscode/mcp.json + instructions)
   wv init-repo --agent=all                    # both claude and copilot
   wv init-repo --update                       # refresh managed files (skills, agents, instructions)
   wv init-repo --force                        # overwrite ALL files including user-customized
@@ -3031,7 +3269,7 @@ EOF
 cmd_init_repo() {
     # Delegate to the standalone wv-init-repo binary which handles
     # --agent=claude|copilot|all, --update, --force, skills, agents,
-    # copilot-instructions, mcp.json, etc.
+    # copilot-instructions, .vscode/mcp.json, etc.
     local init_repo_bin
     init_repo_bin=$(command -v wv-init-repo 2>/dev/null || echo "$HOME/.local/bin/wv-init-repo")
 

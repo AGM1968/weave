@@ -29,7 +29,7 @@ node mcp/dist/index.js --scope=inspect  # read-only operations only
 
 ## Scope System
 
-The `--scope` flag partitions the 31 available tools into focused subsets. This is designed for **VS
+The `--scope` flag partitions the 33 available tools into focused subsets. This is designed for **VS
 Code's multi-server MCP architecture**, where each Copilot subagent can be given a different server
 with only the tools it needs — reducing context window usage and preventing cross-concern tool
 confusion.
@@ -38,18 +38,18 @@ confusion.
 
 | Scope       | Tools                                                                                                                                                                                                                                                                | Purpose                                    |
 | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| **graph**   | `weave_add`, `weave_link`, `weave_done`, `weave_batch_done`, `weave_list`, `weave_resolve`, `weave_update`, `weave_delete` (8)                                                                                                                                     | Create/modify/delete nodes and edges       |
-| **session** | `weave_work`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_close_session`, `weave_breadcrumbs`, `weave_plan`, `weave_edit_guard` (9)                                                                                                    | Workflow lifecycle management              |
-| **lite**    | `weave_overview`, `weave_guide`, `weave_edit_guard`, `weave_status`, `weave_work`, `weave_done` (6)                                                                                                                                                                | Minimal task-tracking surface              |
-| **inspect** | `weave_context`, `weave_search`, `weave_status`, `weave_health`, `weave_preflight`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions` (14) | Read-only observation and query            |
-| **all**     | All 31 tools                                                                                                                                                                                                                                                         | Full access (default, backward-compatible) |
+| **graph**   | `weave_add`, `weave_link`, `weave_done`, `weave_batch_done`, `weave_list`, `weave_resolve`, `weave_update`, `weave_touch`, `weave_delete` (9)                                                                                                                     | Create/modify/delete nodes and edges       |
+| **session** | `weave_work`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_close_session`, `weave_breadcrumbs`, `weave_plan`, `weave_edit_guard` (10)                                                                              | Workflow lifecycle management              |
+| **lite**    | `weave_overview`, `weave_bootstrap`, `weave_guide`, `weave_edit_guard`, `weave_status`, `weave_work`, `weave_done` (7)                                                                                                                                            | Minimal task-tracking surface              |
+| **inspect** | `weave_context`, `weave_search`, `weave_status`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions` (15) | Read-only observation and query            |
+| **all**     | All 33 tools                                                                                                                                                                                                                                                         | Full access (default, backward-compatible) |
 
 ### Design rationale
 
 When an AI agent spawns subagents (e.g., a research subagent, a coding subagent, a review subagent),
 each subagent inherits the full MCP tool set. This creates problems:
 
-1. **Context bloat** — 31 tool definitions (~7K tokens) compete for limited context window
+1. **Context bloat** — 33 tool definitions compete for limited context window
 2. **Tool confusion** — a read-only research subagent shouldn't see `weave_ship`
 3. **Accidental mutations** — an inspect-only subagent could accidentally call `weave_done`
 
@@ -167,7 +167,7 @@ Optional local additions if you want stricter scope isolation:
 
 ## Available Tools
 
-### Graph scope — write operations (8 tools)
+### Graph scope — write operations (9 tools)
 
 | Tool               | Description                                             | Required params      |
 | ------------------ | ------------------------------------------------------- | -------------------- |
@@ -176,11 +176,12 @@ Optional local additions if you want stricter scope isolation:
 | `weave_done`       | Mark a node as complete, optionally record a learning. Accepts `learning` (raw string) and/or typed `decision`/`pattern`/`pitfall` params — when both are provided, raw is appended after structured params   | `id`                 |
 | `weave_batch_done` | Complete multiple nodes at once. Same learning merge behavior as `weave_done` | `ids`                |
 | `weave_update`     | Modify node metadata, status, text, or alias            | `id`                 |
+| `weave_touch`      | Fire-and-forget metadata or intent update               | `id`                 |
 | `weave_list`       | List nodes with optional status/all filters             | —                    |
 | `weave_resolve`    | Resolve conflicting nodes (winner/merge/defer strategy) | `ids`, `strategy`    |
 | `weave_delete`     | Permanently remove a node (requires `force=true`)       | `id`, `force`        |
 
-### Session scope — workflow lifecycle (9 tools)
+### Session scope — workflow lifecycle (10 tools)
 
 | Tool                  | Description                                           | Required params |
 | --------------------- | ----------------------------------------------------- | --------------- |
@@ -189,12 +190,13 @@ Optional local additions if you want stricter scope isolation:
 | `weave_recover`       | Resume incomplete ship/sync/delete operations         | —               |
 | `weave_quick`         | Quick-add a node and immediately start working on it  | `text`          |
 | `weave_overview`      | Status + health + context policy + ready work         | —               |
+| `weave_bootstrap`     | Single-call session snapshot: status + context + ready + learnings | —      |
 | `weave_breadcrumbs`   | Save, show, or clear session breadcrumbs              | —               |
 | `weave_plan`          | Import markdown plan as epic + tasks with GH issues   | `file`          |
 | `weave_close_session` | Sync + git status + unpushed commits + active warning | —               |
 | `weave_edit_guard`    | Pre-edit guard: require an active node before edits   | —               |
 
-### Inspect scope — read-only queries (14 tools)
+### Inspect scope — read-only queries (15 tools)
 
 | Tool                      | Description                                            | Required params |
 | ------------------------- | ------------------------------------------------------ | --------------- |
@@ -205,6 +207,7 @@ Optional local additions if you want stricter scope isolation:
 | `weave_status`            | Compact summary: active work, ready count, blocked     | —               |
 | `weave_health`            | Graph health check with score and issues               | —               |
 | `weave_preflight`         | Pre-work validation: blockers, context, readiness      | `id`            |
+| `weave_bootstrap`         | Single-call session snapshot for read-only clients     | —               |
 | `weave_sync`              | Persist graph to disk, optionally sync GitHub issues   | —               |
 | `weave_guide`             | Quick reference by workflow topic                      | —               |
 | `weave_show`              | Single-node detail view (JSON output)                  | `id`            |
@@ -219,7 +222,7 @@ Optional local additions if you want stricter scope isolation:
 # Build
 npm run build
 
-# Run tests (24 tests: tool calls, scope filtering, error handling)
+# Run tests (34 tests: tool calls, scope filtering, error handling)
 npm test
 
 # Watch mode
@@ -230,10 +233,10 @@ npm run dev
 
 The test suite verifies:
 
-- **Default scope (`all`)** — all 31 tools listed, tool calls work, unknown tools rejected
-- **`--scope=graph`** — only 8 graph tools listed, out-of-scope calls rejected
-- **`--scope=session`** — only 9 session tools listed
-- **`--scope=inspect`** — only 14 inspect tools listed
+- **Default scope (`all`)** — all 33 tools listed, tool calls work, unknown tools rejected
+- **`--scope=graph`** — only 9 graph tools listed, out-of-scope calls rejected
+- **`--scope=session`** — only 10 session tools listed
+- **`--scope=inspect`** — only 15 inspect tools listed
 - **New tool handlers** — weave_show, weave_delete (with force guard), quality tools
 
 ### Adding new tools
@@ -259,8 +262,8 @@ while `learning-curator` already uses `weave-inspect`.
 | Agent file                           | Role                          | MCP scope | Tools available                                                                                                                                                                                                                                                 |
 | ------------------------------------ | ----------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `.claude/agents/epic-planner.md`     | Planning & graph construction | `weave-graph` (planned) / `weave` (current) | Primary tools are `weave_add`, `weave_link`, `weave_done`, `weave_batch_done`, `weave_update`, `weave_list`, `weave_resolve`, `weave_delete`                                                                        |
-| `.claude/agents/weave-guide.md`      | Workflow lifecycle guidance   | `weave-session` (planned) / `weave` (current) | Primary tools are `weave_work`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_breadcrumbs`, `weave_plan`, `weave_close_session`, `weave_edit_guard`                                      |
-| `.claude/agents/learning-curator.md` | Read-only analysis & curation | `weave-inspect` | `weave_context`, `weave_search`, `weave_tree`, `weave_learnings`, `weave_status`, `weave_health`, `weave_preflight`, `weave_sync`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions` |
+| `.claude/agents/weave-guide.md`      | Workflow lifecycle guidance   | `weave-session` (planned) / `weave` (current) | Primary tools are `weave_work`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_breadcrumbs`, `weave_plan`, `weave_close_session`, `weave_edit_guard`                   |
+| `.claude/agents/learning-curator.md` | Read-only analysis & curation | `weave-inspect` | `weave_context`, `weave_search`, `weave_tree`, `weave_learnings`, `weave_status`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions` |
 
 This keeps the roadmap visible without pretending the extra scoped servers are already wired into the
 checked-in VS Code config. The learning curator gets the narrower read-only server today; the other

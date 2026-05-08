@@ -103,7 +103,10 @@ node remains blocked until child completes.
 |------|---------|-------|
 | Node ID | `/weave wv-xxxxxx` | Validate → claim (`wv work <id>`) → CONTEXT |
 | Text | `/weave "Fix bug"` | Create (`wv add "<text>" --status=active`) → CONTEXT |
-| None | `/weave` | Show `wv ready --json` → user picks → Mode 1 or 2 |
+| None | `/weave` | Prefer `wv bootstrap --json` for session snapshot; fall back to `wv ready --json` → user picks → Mode 1 or 2 |
+
+**Compound helpers:** prefer `wv bootstrap --json` for session-start context, `wv quick` for trivial
+one-step work, and `wv ship` when the close+sync path should stay coupled.
 
 **Claimable:** `todo` or `blocked`. `active` = warn but allow. `done` = block.
 **Vague text** (<5 words, no action verb): clarify it inside `/weave` before proceeding.
@@ -142,6 +145,9 @@ Before spawning any weave agent (`epic-planner`, `learning-curator`, `weave-guid
 **Scope control:** If editing unrelated files → create child node (iteration trigger).
 **Stuck detection:** Same approach fails 2× → pivot strategy or create blocker node.
 
+Use `wv touch <id> --intent="..."` for low-token intent/progress checkpoints between larger
+execution steps instead of repeatedly emitting full context.
+
 ### Repair Loop for Detected Issues
 
 When execution reveals a real workflow problem (broken hook behavior, stale prompt/doc guidance,
@@ -177,7 +183,7 @@ close-time friction, missing guardrail):
 ### Close and Sync
 
 ```bash
-wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..."
+wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..." --no-overlap-check
 wv sync --gh && git push
 ```
 
@@ -187,4 +193,5 @@ If `wv ship` or `wv sync` is interrupted, `wv recover` resumes from the journal.
 
 For non-interactive agent flows, do not leave the system hanging on close-time prompts. Prefer
 capturing pending-close state, surfacing `needs_human_verification`, and resuming with explicit human
-approval.
+approval. Use `--no-overlap-check` when the agent already has the verification evidence and
+structured learnings needed to close without overlap prompts.

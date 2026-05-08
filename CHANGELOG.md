@@ -2,6 +2,35 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.43.0] - 2026-05-08
+
+### Added
+
+- **Focused CLI help routing**: `wv help <command>` and `wv <command> --help` now expose direct,
+  command-scoped help across core commands and nested families such as `quality`, `findings`, and
+  `analyze`.
+
+- **Safer `wv update` metadata inputs**: `--metadata <json>` and `--metadata-file <path>` now
+  support split-form and file-backed metadata merges with clearer diagnostics for invalid JSON or
+  missing arguments.
+
+### Changed
+
+- **Canonical workflow/help surfaces aligned**: templates, hooks, MCP guidance, repo docs, and
+  agent instructions now consistently present `wv init-repo` as the canonical bootstrap entrypoint,
+  while retaining `wv-init-repo` as a compatibility wrapper.
+
+- **MCP toolchain modernised**: MCP tests now run on Vitest, and the shipped public release
+  manifest includes `mcp/vitest.config.ts` instead of the removed Jest config.
+
+### Fixed
+
+- **Remote installer parity**: `install.sh` now fetches the same journal library, Claude hooks,
+  skills, and Copilot stub assets in remote-download mode as it does from a local source checkout.
+
+- **Help flag handling**: command-specific `--help` no longer falls through into positional
+  validation errors for commands like `show` and `link`.
+
 ## [1.42.0] - 2026-04-19
 
 ### Added

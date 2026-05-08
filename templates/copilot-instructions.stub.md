@@ -61,8 +61,11 @@ confirm.
 Before starting non-trivial work, load the context pack:
 
 ```bash
+wv bootstrap --json        # preferred session-start snapshot (single call)
 wv context <id> --json    # ancestors, blockers, pitfalls — cached per session
 ```
+
+Use `wv touch <id> --intent="..."` for low-cost intent/progress updates between larger steps.
 
 ## Learnings format
 
@@ -72,7 +75,10 @@ Structured learnings are more useful for future sessions:
 --learning="decision: X | pattern: Y | pitfall: Z"
 ```
 
+For non-interactive agent flows, prefer `--no-overlap-check` on `wv done`/`wv ship` once
+verification and learnings are ready.
+
 ## Reference
 
 - MCP: `weave_guide` (topics: workflow, github, learnings, context)
-- CLI: `~/.config/weave/WORKFLOW.md`
+- CLI: `wv --help`, `wv help <command>`, or `~/.config/weave/WORKFLOW.md`

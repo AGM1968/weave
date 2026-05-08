@@ -38,6 +38,21 @@ CREATE TABLE IF NOT EXISTS 'nodes_fts_idx'(segid, term, pgno, PRIMARY KEY(segid,
 CREATE TABLE IF NOT EXISTS 'nodes_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB);
 CREATE TABLE IF NOT EXISTS 'nodes_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID;
 INSERT INTO nodes_fts_config VALUES('version',4);
+CREATE TABLE node_files (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    path    TEXT NOT NULL,
+    PRIMARY KEY (node_id, path)
+);
+CREATE TABLE file_metrics (
+    path       TEXT PRIMARY KEY,
+    mccabe_max INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE policy_thresholds (
+    key   TEXT PRIMARY KEY,
+    value REAL NOT NULL
+);
+INSERT INTO policy_thresholds VALUES('mccabe_max',15.0);
+INSERT INTO policy_thresholds VALUES('gini_max',0.849999999999999977);
 CREATE TABLE _warp_changes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     table_name TEXT NOT NULL,
@@ -61,6 +76,18 @@ CREATE TRIGGER nodes_au AFTER UPDATE ON nodes BEGIN
     VALUES ('delete', old.rowid, old.id, old.text, old.metadata);
     INSERT INTO nodes_fts(rowid, id, text, metadata)
     VALUES (new.rowid, new.id, new.text, new.metadata);
+END;
+CREATE TRIGGER nodes_policy_check
+BEFORE UPDATE OF status ON nodes
+WHEN NEW.status = 'done' AND OLD.status = 'active'
+  AND EXISTS (
+    SELECT 1 FROM node_files nf
+    JOIN file_metrics fm ON fm.path = nf.path
+    WHERE nf.node_id = NEW.id
+      AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded');
 END;
 CREATE TRIGGER _warp_nodes_insert AFTER INSERT ON nodes
 BEGIN
@@ -136,5 +163,6 @@ CREATE INDEX idx_edges_target ON edges(target);
 CREATE INDEX idx_edges_type ON edges(type);
 CREATE INDEX idx_edges_source_type ON edges(source, type);
 CREATE INDEX idx_edges_target_type ON edges(target, type);
+CREATE INDEX idx_node_files_node ON node_files(node_id);
 PRAGMA writable_schema=OFF;
 COMMIT;

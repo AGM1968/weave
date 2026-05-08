@@ -98,9 +98,33 @@ _resolve_first_id() {
     "$cmd_func" "${new_args[@]}"
 }
 
+_route_command_help_if_requested() {
+    local cmd="$1"
+    shift || true
+
+    if [ $# -eq 0 ]; then
+        return 1
+    fi
+
+    case "$1" in
+        --help|-h)
+            cmd_help "$cmd" "${@:2}"
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
 _wv_dispatch() {
     local cmd="${1:-help}"
     shift || true
+
+    if [ "$cmd" != "help" ] && [ "$cmd" != "--help" ] && [ "$cmd" != "-h" ]; then
+        if _route_command_help_if_requested "$cmd" "$@"; then
+            return 0
+        fi
+    fi
 
     case "$cmd" in
         # Core commands
@@ -117,7 +141,8 @@ _wv_dispatch() {
         status) cmd_status "$@" ;;
         pending-close) cmd_pending_close "$@" ;;
         update) _resolve_first_id cmd_update "$@" ;;
-        touch)  _resolve_first_id cmd_touch "$@" ;;
+        touch)         _resolve_first_id cmd_touch "$@" ;;
+        allowed-tools) _resolve_first_id cmd_allowed_tools "$@" ;;
         quick)  cmd_quick "$@" ;;
         ship)   _resolve_first_id cmd_ship "$@" ;;
 
@@ -169,7 +194,7 @@ _wv_dispatch() {
         quality)         cmd_quality "$@" ;;
         findings)        cmd_findings "$@" ;;
         analyze)         cmd_analyze "$@" ;;
-        help|--help|-h)  cmd_help ;;
+        help|--help|-h)  cmd_help "$@" ;;
         version|--version|-v) echo "wv $WV_VERSION" ;;
         
         *)

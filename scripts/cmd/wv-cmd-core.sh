@@ -412,6 +412,63 @@ _aggregate_epic_commits() {
 # cmd_done — Mark node as done (decomposed into helpers)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# _done_refresh_file_metrics — Sync brain.db file_metrics from quality.db for
+# paths already tracked in node_files before the status UPDATE.
+#
+# node_files is populated via explicit 'wv touch <path>' calls (or direct
+# sqlite3 inserts in tests). The proposal's auto-population-via-git-diff is
+# deferred — diff attribution proved noisy in mixed hot-zone environments.
+#
+# Skipped when WV_REQUIRE_QUALITY=0 (test/legacy bypass).
+# Fails loudly if node_files is non-empty and quality.db is unavailable.
+_done_refresh_file_metrics() {
+    local id="$1"
+
+    [ "${WV_REQUIRE_QUALITY:-1}" = "0" ] && return 0
+
+    # Read paths tracked for this node
+    local paths_raw
+    paths_raw=$(db_query "SELECT path FROM node_files WHERE node_id='$(sql_escape "$id")';" 2>/dev/null || echo "")
+    [ -z "$paths_raw" ] && return 0
+
+    # quality.db must exist when node_files is non-empty
+    local quality_db="$WV_HOT_ZONE/quality.db"
+    if [ ! -f "$quality_db" ]; then
+        echo -e "${RED}Error: quality.db not found at $quality_db${NC}" >&2
+        echo -e "  Run 'wv quality scan' before closing nodes that touch tracked files." >&2
+        echo -e "  Set WV_REQUIRE_QUALITY=0 to bypass (test/legacy environments only)." >&2
+        return 1
+    fi
+
+    # Must have at least one scan
+    local latest_scan
+    latest_scan=$(sqlite3 -batch -cmd ".timeout 3000" "$quality_db" \
+        "SELECT id FROM scan_meta ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
+    if [ -z "$latest_scan" ]; then
+        echo -e "${RED}Error: quality.db has no scan data — run 'wv quality scan' first${NC}" >&2
+        echo -e "  Set WV_REQUIRE_QUALITY=0 to bypass (test/legacy environments only)." >&2
+        return 1
+    fi
+
+    # Upsert mccabe_max from quality.db into brain.db for each tracked path
+    local path
+    while IFS= read -r path; do
+        [ -z "$path" ] && continue
+        local path_esc mccabe_val upsert_err upsert_rc
+        path_esc=$(echo "$path" | sed "s/'/''/g")
+        mccabe_val=$(sqlite3 -batch -cmd ".timeout 3000" "$quality_db" \
+            "SELECT COALESCE(CAST(complexity AS INTEGER), 0) FROM files WHERE path='$path_esc' AND scan_id=$latest_scan LIMIT 1;" 2>/dev/null || echo "")
+        [ -z "$mccabe_val" ] && mccabe_val=0
+        upsert_err=$(db_query "INSERT INTO file_metrics(path, mccabe_max) VALUES('$path_esc', $mccabe_val)
+            ON CONFLICT(path) DO UPDATE SET mccabe_max = excluded.mccabe_max;" 2>&1)
+        upsert_rc=$?
+        if [ $upsert_rc -ne 0 ]; then
+            echo -e "${RED}Error: failed to refresh file_metrics for '$path': $upsert_err${NC}" >&2
+            return 1
+        fi
+    done <<< "$paths_raw"
+}
+
 # Shared state for cmd_done helpers (avoids stdout capture in subshells)
 _done_skip_learning=false
 
@@ -777,6 +834,7 @@ cmd_done() {
     local verification_method=""
     local verification_evidence=""
     local no_gh=0
+    local allowed_tools_raw=""
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -791,6 +849,7 @@ cmd_done() {
             --verification-method=*) verification_method="${1#*=}" ;;
             --verification-evidence=*) verification_evidence="${1#*=}" ;;
             --no-gh) no_gh=1 ;;
+            --allowed-tools=*) allowed_tools_raw="${1#--allowed-tools=}" ;;
         esac
         shift
     done
@@ -873,12 +932,31 @@ cmd_done() {
         fi
     fi
 
+    # Write allowed_tools to metadata if supplied at close time
+    if [ -n "$allowed_tools_raw" ]; then
+        local tools_json
+        tools_json=$(_parse_allowed_tools "$allowed_tools_raw")
+        if [ -n "$tools_json" ]; then
+            local tools_esc="${tools_json//\'/\'\'}"
+            db_query "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'), '\$.allowed_tools', json('$tools_esc')), updated_at=CURRENT_TIMESTAMP WHERE id='$(sql_escape "$id")';" 2>/dev/null || true
+        fi
+    fi
+
+    # Refresh file_metrics from quality.db for node_files paths before the gate UPDATE.
+    _done_refresh_file_metrics "$id" || return 1
+
     # === Close: update status, release claim, clear primary, aggregate commits ===
-    db_query "UPDATE nodes
+    local _done_err _done_rc
+    _done_err=$(db_query "UPDATE nodes
         SET status='done',
             metadata = json_remove(COALESCE(metadata,'{}'), '$.claimed_by', '$.pending_close', '$.needs_human_verification'),
             updated_at = CURRENT_TIMESTAMP
-        WHERE id='$id';"
+        WHERE id='$id';" 2>&1)
+    _done_rc=$?
+    if [ "$_done_rc" -ne 0 ]; then
+        echo "$_done_err" >&2
+        return 1
+    fi
 
     local primary
     primary=$(get_primary_node 2>/dev/null || echo "")
@@ -1166,6 +1244,7 @@ cmd_work() {
     local quiet=false
     local force=false
     local format="text"
+    local allowed_tools_raw=""
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -1173,13 +1252,14 @@ cmd_work() {
             --quiet|-q) quiet=true ;;
             --force|-f) force=true ;;
             --json)     format="json" ;;
+            --allowed-tools=*) allowed_tools_raw="${1#--allowed-tools=}" ;;
         esac
         shift
     done
 
     if [ -z "$id" ]; then
         echo -e "${RED}Error: node ID required${NC}" >&2
-        echo "Usage: wv work <id> [--quiet] [--force] [--json]" >&2
+        echo "Usage: wv work <id> [--quiet] [--force] [--json] [--allowed-tools=t1,t2,...]" >&2
         echo "" >&2
         echo "Claims a node and sets WV_ACTIVE for subagent context inheritance." >&2
         echo "Use --force to override a stale claim from another agent." >&2
@@ -1241,6 +1321,16 @@ cmd_work() {
 
     set_primary_node "$id"
     echo "execute" > "$WV_HOT_ZONE/.session_phase" 2>/dev/null || true
+
+    # Write allowed_tools to metadata if supplied
+    if [ -n "$allowed_tools_raw" ]; then
+        local tools_json
+        tools_json=$(_parse_allowed_tools "$allowed_tools_raw")
+        if [ -n "$tools_json" ]; then
+            local tools_esc="${tools_json//\'/\'\'}"
+            db_query "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'), '\$.allowed_tools', json('$tools_esc')), updated_at=CURRENT_TIMESTAMP WHERE id='$(sql_escape "$id")';" 2>/dev/null || true
+        fi
+    fi
 
     if [ "$format" = "json" ]; then
         # Structured output for runtime consumption
@@ -1919,13 +2009,76 @@ cmd_pending_close() {
 # cmd_update — Update node fields
 # ═══════════════════════════════════════════════════════════════════════════
 
+cmd_update_help() {
+    cat <<EOF
+Usage: wv update <id> [options]
+
+Update fields on an existing node.
+
+Options:
+  --status=<status>          Set status
+  --text=<text>              Replace node text
+  --alias=<alias>            Set alias (empty string clears it)
+  --metadata=<json>          Merge JSON into metadata
+  --metadata <json>          Merge JSON into metadata
+  --metadata-file=<path>     Read metadata JSON from file ('-' reads stdin)
+  --metadata-file <path>     Read metadata JSON from file ('-' reads stdin)
+  --remove-key=<key>         Remove one metadata key
+  --echo                     Print the updated node as JSON
+
+Examples:
+  wv update wv-a1b2 --status=active
+  wv update wv-a1b2 --metadata '{"priority":1}'
+  wv update wv-a1b2 --metadata-file /tmp/node-meta.json
+  cat /tmp/node-meta.json | wv update wv-a1b2 --metadata-file -
+EOF
+}
+
+read_update_metadata_source() {
+    local source_path="$1"
+
+    if [ "$source_path" = "-" ]; then
+        cat
+        return $?
+    fi
+
+    if [ ! -f "$source_path" ]; then
+        echo -e "${RED}Error: metadata file not found: $source_path${NC}" >&2
+        echo "Hint: use --metadata '{\"key\":\"value\"}' for inline JSON or point --metadata-file at an existing file." >&2
+        return 1
+    fi
+
+    cat -- "$source_path"
+}
+
+validate_update_metadata_json() {
+    local metadata_payload="$1"
+    local metadata_source="$2"
+    local jq_error=""
+
+    if ! jq_error=$(printf '%s' "$metadata_payload" | jq -e '.' 2>&1 >/dev/null); then
+        echo -e "${RED}Error: invalid JSON in ${metadata_source}${NC}" >&2
+        if [ -n "$jq_error" ]; then
+            echo "$jq_error" >&2
+        fi
+        echo "Hint: use --metadata '{\"key\":\"value\"}' for inline JSON or --metadata-file <path> to avoid shell quoting issues." >&2
+        return 1
+    fi
+}
+
 cmd_update() {
     local id="${1:-}"
     shift || true
     
     if [ -z "$id" ]; then
         echo -e "${RED}Error: node ID required${NC}" >&2
+        echo "Run 'wv update --help' for usage." >&2
         return 1
+    fi
+
+    if [ "$id" = "--help" ] || [ "$id" = "-h" ]; then
+        cmd_update_help
+        return 0
     fi
 
     # Validate ID format (SQL injection prevention)
@@ -1933,8 +2086,13 @@ cmd_update() {
     
     local updates=""
     local echo_mode=false
+    local metadata_supplied=false
     while [ $# -gt 0 ]; do
         case "$1" in
+            --help|-h)
+                cmd_update_help
+                return 0
+                ;;
             --echo) echo_mode=true ;;
             --status=*)
                 local status="${1#*=}"
@@ -1948,12 +2106,12 @@ cmd_update() {
                 ;;
             --metadata=*)
                 local metadata="${1#*=}"
-                # Validate JSON before storing. jq '.' either parses cleanly or errors —
-                # we fail loudly here rather than silently falling back downstream.
-                if ! echo "$metadata" | jq '.' >/dev/null 2>&1; then
-                    echo -e "${RED}Error: invalid JSON in --metadata${NC}" >&2
+                if [ "$metadata_supplied" = true ]; then
+                    echo -e "${RED}Error: metadata specified more than once${NC}" >&2
+                    echo "Use exactly one of --metadata or --metadata-file." >&2
                     return 1
                 fi
+                validate_update_metadata_json "$metadata" "--metadata" || return 1
                 # Merge atomically via SQL json_patch (RFC 7396) — applies the new
                 # JSON as a merge patch to the row's current metadata in a single
                 # UPDATE. COALESCE handles NULL. Parity with the --remove-key path
@@ -1962,6 +2120,59 @@ cmd_update() {
                 # stored metadata when jq failed for any reason.
                 local metadata_esc="${metadata//\'/\'\'}"
                 updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
+                metadata_supplied=true
+                ;;
+            --metadata)
+                if [ "$metadata_supplied" = true ]; then
+                    echo -e "${RED}Error: metadata specified more than once${NC}" >&2
+                    echo "Use exactly one of --metadata or --metadata-file." >&2
+                    return 1
+                fi
+                shift
+                if [ $# -eq 0 ]; then
+                    echo -e "${RED}Error: --metadata requires a JSON argument${NC}" >&2
+                    echo "Hint: use --metadata '{\"key\":\"value\"}' or --metadata-file <path>." >&2
+                    return 1
+                fi
+                local metadata="$1"
+                validate_update_metadata_json "$metadata" "--metadata" || return 1
+                local metadata_esc="${metadata//\'/\'\'}"
+                updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
+                metadata_supplied=true
+                ;;
+            --metadata-file=*)
+                if [ "$metadata_supplied" = true ]; then
+                    echo -e "${RED}Error: metadata specified more than once${NC}" >&2
+                    echo "Use exactly one of --metadata or --metadata-file." >&2
+                    return 1
+                fi
+                local metadata_file="${1#*=}"
+                local metadata=""
+                metadata=$(read_update_metadata_source "$metadata_file") || return 1
+                validate_update_metadata_json "$metadata" "--metadata-file" || return 1
+                local metadata_esc="${metadata//\'/\'\'}"
+                updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
+                metadata_supplied=true
+                ;;
+            --metadata-file)
+                if [ "$metadata_supplied" = true ]; then
+                    echo -e "${RED}Error: metadata specified more than once${NC}" >&2
+                    echo "Use exactly one of --metadata or --metadata-file." >&2
+                    return 1
+                fi
+                shift
+                if [ $# -eq 0 ]; then
+                    echo -e "${RED}Error: --metadata-file requires a path${NC}" >&2
+                    echo "Hint: use --metadata-file /path/to/metadata.json or --metadata-file - for stdin." >&2
+                    return 1
+                fi
+                local metadata_file="$1"
+                local metadata=""
+                metadata=$(read_update_metadata_source "$metadata_file") || return 1
+                validate_update_metadata_json "$metadata" "--metadata-file" || return 1
+                local metadata_esc="${metadata//\'/\'\'}"
+                updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
+                metadata_supplied=true
                 ;;
             --alias=*)
                 local alias="${1#*=}"
@@ -2065,6 +2276,63 @@ cmd_touch() {
     db_query "UPDATE nodes SET metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
     
     # No stdout — fire-and-forget. Zero token cost.
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_allowed_tools — Read metadata.allowed_tools for a node
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_allowed_tools() {
+    local id="${1:-}"
+    local format="text"
+
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) format="json" ;;
+        esac
+        shift
+    done
+
+    if [ -z "$id" ]; then
+        echo "Error: node ID required" >&2
+        echo "Usage: wv allowed-tools <node_id> [--json]" >&2
+        return 1
+    fi
+
+    validate_id "$id" || return 1
+
+    local exists
+    exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null || echo "0")
+    if [ "$exists" = "0" ]; then
+        echo -e "${RED}Error: node $id not found${NC}" >&2
+        return 1
+    fi
+
+    local tools_raw
+    tools_raw=$(db_query "SELECT json_extract(metadata, '\$.allowed_tools') FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null || echo "")
+
+    if [ "$format" = "json" ]; then
+        if [ -z "$tools_raw" ] || [ "$tools_raw" = "null" ]; then
+            echo "null"
+        else
+            echo "$tools_raw"
+        fi
+    else
+        if [ -z "$tools_raw" ] || [ "$tools_raw" = "null" ]; then
+            echo "(no allowed_tools set — all gated tools permitted)"
+        else
+            echo "$tools_raw" | jq -r '.[]?' 2>/dev/null || echo "$tools_raw"
+        fi
+    fi
+}
+
+# _parse_allowed_tools — Convert comma-separated tool list to JSON array string.
+# Returns "" if input is empty, so callers can skip the update.
+_parse_allowed_tools() {
+    local raw="${1:-}"
+    [ -z "$raw" ] && return 0
+    echo "$raw" | tr ',' '\n' | jq -Rc . | jq -sc .
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
