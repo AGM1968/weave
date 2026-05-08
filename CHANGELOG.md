@@ -23,6 +23,10 @@
 - **MCP toolchain modernised**: MCP tests now run on Vitest, and the shipped public release
   manifest includes `mcp/vitest.config.ts` instead of the removed Jest config.
 
+- **Multi-developer status docs corrected**: public and internal docs now reflect that delta merge
+  (v1.24.0), CAS claim enforcement (v1.26.0), and `wv unlink` (v1.37.0) are shipped, while
+  per-field merge and contradiction tooling remain future work.
+
 ### Fixed
 
 - **Remote installer parity**: `install.sh` now fetches the same journal library, Claude hooks,

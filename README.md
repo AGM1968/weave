@@ -377,28 +377,39 @@ To update: `wv-update` or re-run `./install.sh`.
 
 ## Multi-Developer Support
 
-Weave is designed and tested for **single-developer + AI agent** workflows. Multiple developers can
-work on the same repo using GitHub issues as the shared coordination layer (`wv sync --gh`), but the
-local graph uses a last-writer-wins merge strategy.
+Weave is still optimized for **single-developer + AI agent** workflows, but the local graph now
+ships the core primitives needed for small multi-developer or multi-agent teams sharing one repo.
 
-Known limitations for multi-developer teams:
+Current multi-developer baseline:
 
-- No ownership/assignment model in the graph (use GitHub issue assignees)
-- `.weave/state.sql` merge conflicts resolve via `merge=ours` (local wins)
-- No `wv unlink` command yet
+- **Level 1 is shipped** — `wv sync` writes per-agent delta SQL into `.weave/deltas/`, `wv load`
+  replays those deltas after the baseline, and same-row conflicts resolve last-writer-wins per row
+  instead of whole-file loss.
+- **Level 2 is shipped** — `wv work` stamps `metadata.claimed_by` using `WV_AGENT_ID` with atomic
+  compare-and-swap, and `wv ready` hides nodes claimed by other agents unless `--all` is used.
+- **Graph maintenance is no longer blocked on missing unlink support** — `wv unlink` shipped in
+  v1.37.0 for removing edges without deleting nodes.
 
-### Roadmap
+Remaining limitations for multi-developer teams:
 
-Multi-developer support is planned in three progressive levels:
+- Same-row or same-field concurrent edits are still last-writer-wins; there is no per-field merge
+  yet.
+- Claim recovery is still manual (`--force`, `wv recover`, or GitHub coordination); there is no
+  heartbeat or stale-claim reaper yet.
+- GitHub remains the main cross-machine human coordination surface.
 
-| Level | Capability             | What it solves                              |
-| ----- | ---------------------- | ------------------------------------------- |
-| 1     | Delta merge via git    | `merge=ours` drops changes; deltas preserve |
-| 2     | Agent identity + claim | Two agents claiming the same node           |
-| 3     | Per-field merge        | Same-field conflicts on shared nodes        |
+### Current Status
 
-Levels 1-2 are pure Bash and build on existing delta tracking infrastructure. Level 3 targets 2-3
-concurrent agents with per-field conflict resolution.
+Multi-developer support now breaks down into three progressive levels:
+
+| Level | Capability                         | Status  | Notes                                                      |
+| ----- | ---------------------------------- | ------- | ---------------------------------------------------------- |
+| 1     | Delta merge via git                | Shipped | v1.24.0; hardened in v1.36.0                               |
+| 2     | Agent identity + claim enforcement | Shipped | v1.26.0; CAS claims in `wv work`, claim-aware `wv ready`   |
+| 3     | Per-field merge + conflicts        | Future  | Requires warp-core and later contradiction/conflict tooling |
+
+Levels 1-2 are pure Bash and already build on the shipped delta tracking and metadata
+infrastructure. Level 3 remains the open design frontier for same-field conflict resolution.
 
 ## Community
 
