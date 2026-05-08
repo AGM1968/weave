@@ -2,6 +2,15 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.43.1] - 2026-05-08
+
+### Fixed
+
+- **Help/workflow surface alignment**: corrected `wv-init-repo` → `wv init-repo` in post-install
+  summary (`install.sh`) and MCP status warning (`wv guide --topic=mcp`); added `wv bootstrap --json`
+  as step 1 in `wv guide --topic=workflow`; added `weave_bootstrap` to MCP compound-tool listing and
+  removed stale "23 total" tool count. Internal skill docs (dev-guide, plan-agent) updated to match.
+
 ## [1.43.0] - 2026-05-08
 
 ### Added

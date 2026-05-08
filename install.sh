@@ -1324,14 +1324,14 @@ echo "Commands installed:"
 echo "  wv            — Core CLI ($("$INSTALL_DIR/wv" --version 2>/dev/null || echo "unknown version"))"
 echo "  wv-test       — Isolated test runner"
 echo "  (wv-runtime retired — use python -m weave_runtime from standalone repo)"
-echo "  wv-init-repo  — Initialize Weave in a new repo"
+echo "  wv init-repo  — Initialize Weave in a new repo"
 echo "  wv-update     — Update Weave to latest version"
 [ "$WITH_MCP" = "1" ] && [ -f "$LIB_DIR/mcp/dist/index.js" ] && \
     echo "  weave-mcp     — MCP server ($LIB_DIR/mcp/dist/index.js)"
 echo ""
 echo "To set up a new repo:"
 echo "  cd /path/to/your/repo"
-echo "  wv-init-repo"
+echo "  wv init-repo"
 
 # Run verification if requested
 if [ "$VERIFY" = "1" ]; then

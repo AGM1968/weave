@@ -1548,7 +1548,7 @@ cmd_mcp_status() {
         fi
     fi
     if ! $has_vscode && ! $has_claude; then
-        _mcp_record "IDE config" "warn" "no IDE config found — run wv-init-repo --agent=copilot or --agent=all"
+        _mcp_record "IDE config" "warn" "no IDE config found — run wv init-repo --agent=copilot or --agent=all"
     fi
 
     # Summary
@@ -2764,13 +2764,14 @@ cmd_guide() {
             cat <<'EOF'
 Weave Workflow Quick Reference
 
-  1. Find work:    wv ready
-  2. Claim it:     wv work <id>
-  3. Do the work   (edit files, run tests)
-  4. Complete:     wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..."
-  5. Sync:         wv sync --gh
-  6. Commit state:  git add .weave/ && git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"
-  7. Push:          git push
+  1. Snapshot:     wv bootstrap --json
+  2. Find work:    wv ready
+  3. Claim it:     wv work <id>
+  4. Do the work   (edit files, run tests)
+  5. Complete:     wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..."
+  6. Sync:         wv sync --gh
+  7. Commit state: git add .weave/ && git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"
+  8. Push:         git push
 
 Create new work:
   wv add "Description"               # standalone node
@@ -2865,14 +2866,15 @@ Configure in your MCP client (e.g. Claude Desktop, VS Code):
   Env: WV_PROJECT_ROOT=/path/to/your/repo
 
 Key compound tools (prefer over multiple CLI calls):
-  weave_overview  — status + health + ready work (session start)
+  weave_overview  — status + health + ready work (session start overview)
+  weave_bootstrap — single-call session context (wv bootstrap --json)
   weave_work      — claim node + return context pack
   weave_ship      — done + sync + push in one step
   weave_quick     — create + close trivial task in one call
   weave_preflight — pre-action checks before starting work
   weave_plan      — import markdown plan as epic + tasks
 
-Other tools (23 total):
+Other tools:
   weave_add, weave_done, weave_batch_done, weave_update, weave_list,
   weave_link, weave_tree, weave_context, weave_search, weave_resolve,
   weave_learnings, weave_guide, weave_status, weave_health, weave_sync,
