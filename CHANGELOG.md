@@ -2,6 +2,23 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.44.0] - 2026-05-08
+
+### Added
+
+- **Runtime context policy fitting point**: `context-guard.sh` now writes the computed
+  HIGH/MEDIUM/LOW policy to `.weave/.context_policy` on session start. `wv init-repo` generates
+  `.weave/runtime.md` with the policy and workflow summary so weave-runtime agents receive
+  project-specific instructions without an extra graph call.
+
+- **`wv guide --topic=routing`**: new guide topic documenting phase-based token routing —
+  READ_ONLY_TOOLS (cheap/local), EXECUTE_TRIGGERS (expensive), SYNTHESIZE_TRIGGERS, and
+  BootstrapMode DISCOVERY vs EXECUTION — so CLI agents cooperate with the PhaseRouter.
+
+- **Single-source context policy**: `_detect_load_policy` in weave-runtime now reads
+  `.weave/.context_policy` first (written by `context-guard.sh`) before falling back to
+  heuristics, eliminating divergence between the two independent implementations.
+
 ## [1.43.1] - 2026-05-08
 
 ### Fixed

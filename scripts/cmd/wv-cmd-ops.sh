@@ -2778,7 +2778,7 @@ Create new work:
   wv add "Description" --gh          # node + GitHub issue (linked)
   wv add "Task" --parent=<epic-id>   # child of an epic
 
-Topics: wv guide --topic=github | learnings | context | mcp
+Topics: wv guide --topic=github | learnings | context | routing | mcp
 EOF
             ;;
         github)
@@ -2852,6 +2852,38 @@ Scope rules:
   - Run wv context before starting complex work to see pitfalls + ancestors
 EOF
             ;;
+        routing)
+            cat <<'EOF'
+Weave Routing Model
+
+Runtime phase loop:
+    BOOTSTRAP / DISCOVER → EXECUTE → SYNTHESIZE → BOOTSTRAP
+
+DISCOVER quality floor:
+    Before DISCOVER can advance to EXECUTE, gather discovery evidence with local read tools:
+    read, grep, glob
+
+Tool classes:
+    READ_ONLY_TOOLS     — read, grep, glob, ls, wv_show, wv_context, wv_search, wv_tree, wv_learnings
+    EXECUTE_TRIGGERS    — edit/write/bash or any mutation request that makes the next step unavoidable
+    SYNTHESIZE_TRIGGERS — wv_done, wv_ship, close/handoff work after execution
+
+Bootstrap depth:
+    DISCOVERY mode — status line only (~50 tokens), best when no active node exists
+    EXECUTION mode — full context pack, truncated to runtime budget (~3000 chars)
+
+Practical CLI guidance:
+    - Stay cheap first: read/grep/glob before bash or edit when you're still locating the control path
+    - Claim work before mutation: wv ready → wv work <id> → wv context <id> --json
+    - Use wv touch <id> --intent="..." for low-token progress checkpoints between larger steps
+    - Close with structure: wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..."
+
+Token-saving pattern:
+    Discovery turn   — wv bootstrap --json, grep, read small slices
+    Execution turn   — edit the local slice, run one focused validation
+    Synthesis turn   — wv update verification metadata, then wv done / wv ship
+EOF
+            ;;
         mcp)
             cat <<'EOF'
 Weave MCP Server
@@ -2888,7 +2920,7 @@ EOF
             ;;
         *)
             echo "Unknown topic: $topic" >&2
-            echo "Topics: workflow (default), github, learnings, context, mcp" >&2
+            echo "Topics: workflow (default), github, learnings, context, routing, mcp" >&2
             return 1
             ;;
     esac
@@ -3073,7 +3105,7 @@ cmd_help_topic() {
             print_command_help "wv health [--history[=N]] [--verbose] [--json]" "Run system health checks and optionally include recent health history."
             ;;
         guide)
-            print_command_help "wv guide [--topic=workflow|github|learnings|context|mcp]" "Show a quick reference for common Weave workflows and integrations."
+            print_command_help "wv guide [--topic=workflow|github|learnings|context|routing|mcp]" "Show a quick reference for common Weave workflows, routing rules, and integrations."
             ;;
         prune)
             print_command_help "wv prune [--age=48h] [--dry-run] [--orphans-only]" "Archive old done nodes, optionally targeting only orphaned ones."
@@ -3172,7 +3204,7 @@ Commands:
   selftest          Round-trip smoke test in isolated environment [--json]
   mcp-status        Verify MCP server is built and IDE-configured [--json]
   health            System health check with score and diagnostics [--history[=N]]
-  guide             Workflow quick reference [--topic=workflow|github|learnings|context|mcp]
+    guide             Workflow quick reference [--topic=workflow|github|learnings|context|routing|mcp]
   prune             Archive old done nodes
   clean-ghosts      Delete ghost edges referencing deleted nodes [--dry-run] [legacy compatibility]
   compact           Delete replayed deltas after safety checks [--older-than=Nd]

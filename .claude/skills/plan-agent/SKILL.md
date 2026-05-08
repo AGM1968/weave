@@ -16,7 +16,7 @@ enriching a graph from commit history.
 - Weave installed (`wv health` returns OK)
 - Git repo with commit history
 - GitHub CLI (`gh`) authenticated
-- Repository initialized with `wv-init-repo`
+- Repository initialized with `wv init-repo`
 
 ## Phases
 

@@ -147,6 +147,7 @@ OUTPUT=$("$WV" init-repo 2>&1)
 assert_file_exists "$REPO/.claude/settings.json"            "creates .claude/settings.json"
 assert_file_exists "$REPO/CLAUDE.md"                        "copies CLAUDE.md from template"
 assert_file_exists "$REPO/.claude/settings.local.json"      "creates settings.local.json"
+assert_file_exists "$REPO/.weave/runtime.md"                "creates .weave/runtime.md scaffold"
 assert_contains "$OUTPUT" "Weave"                           "output mentions Weave"
 
 # --- settings.json content: no hooks key ---
@@ -194,6 +195,7 @@ OUTPUT=$("$WV" init-repo --agent=copilot 2>&1)
 assert_file_exists "$REPO3/.mcp.json"                       "copilot: creates .mcp.json"
 assert_file_exists "$REPO3/.github/copilot-instructions.md" "copilot: creates copilot-instructions.md"
 assert_file_exists "$REPO3/.github/hooks/README.md"         "copilot: scaffolds .github/hooks/"
+assert_file_exists "$REPO3/.weave/runtime.md"               "copilot: creates .weave/runtime.md scaffold"
 
 # Verify mcp.json points to MCP server and uses VS Code 'servers' key (not 'mcpServers')
 MCP_JSON=$(cat "$REPO3/.mcp.json")

@@ -617,6 +617,37 @@ fi
 # ── Core setup (all agents) ──────────────────────────────────────────────
 mkdir -p "$REPO_ROOT/.weave"
 
+# .weave/runtime.md scaffold (shared by weave-runtime system prompt injection)
+RUNTIME_MD="$REPO_ROOT/.weave/runtime.md"
+RUNTIME_MD_MARKER_BEGIN="<!-- BEGIN WEAVE RUNTIME CONTEXT -->"
+RUNTIME_MD_BLOCK="${RUNTIME_MD_MARKER_BEGIN}
+Current context policy: unknown (refresh on session start)
+Policy source: .weave/.context_policy
+This file is loaded into weave-runtime system prompts. Keep repo-specific instructions below this block.
+<!-- END WEAVE RUNTIME CONTEXT -->"
+if [ ! -f "$RUNTIME_MD" ]; then
+    cat > "$RUNTIME_MD" << 'RUNTIMEMDEOF'
+<!-- BEGIN WEAVE RUNTIME CONTEXT -->
+Current context policy: unknown (refresh on session start)
+Policy source: .weave/.context_policy
+This file is loaded into weave-runtime system prompts. Keep repo-specific instructions below this block.
+<!-- END WEAVE RUNTIME CONTEXT -->
+
+Add project-specific instructions below this line.
+RUNTIMEMDEOF
+    echo -e "  ${GREEN}✓${NC} .weave/runtime.md"
+elif [ "$UPDATE_MODE" = "1" ] && ! grep -qF "$RUNTIME_MD_MARKER_BEGIN" "$RUNTIME_MD"; then
+    _tmp_runtime=$(mktemp)
+    {
+        printf '%s\n\n' "$RUNTIME_MD_BLOCK"
+        cat "$RUNTIME_MD"
+    } > "$_tmp_runtime"
+    mv "$_tmp_runtime" "$RUNTIME_MD"
+    echo -e "  ${GREEN}✓${NC} .weave/runtime.md (managed block prepended)"
+else
+    echo -e "  ${YELLOW}⊘${NC} .weave/runtime.md (already exists, skipped)"
+fi
+
 # .gitignore management (idempotent)
 GITIGNORE="$REPO_ROOT/.gitignore"
 WEAVE_PATTERNS=(
