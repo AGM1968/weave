@@ -118,9 +118,11 @@ _do_unblock_cascade() {
 # cmd_add helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-# _add_dedup_check — Warn if similar non-done nodes exist. Returns 1 if dupe found.
+# _add_dedup_check — Warn if similar non-done nodes or exact recent done nodes exist.
+# Returns 1 if a likely duplicate is found.
 _add_dedup_check() {
     local text="$1"
+    local duplicate_hint="${2:-Use --force to create anyway}"
     db_ensure
     db_migrate_fts5 2>/dev/null || true
     # Extract significant words (>4 chars) for token-based matching
@@ -150,9 +152,31 @@ _add_dedup_check() {
         echo "$similar" | while IFS='|' read -r sid stext sstatus; do
             echo -e "  ${CYAN}$sid${NC} [$sstatus]: $stext" >&2
         done
-        echo -e "${YELLOW}  Use --force to create anyway${NC}" >&2
+        echo -e "${YELLOW}  ${duplicate_hint}${NC}" >&2
         return 1
     fi
+
+    local exact_done=""
+    local escaped_text
+    escaped_text=$(sql_escape "$text")
+    exact_done=$(db_query "
+        SELECT id, text, status
+        FROM nodes
+        WHERE status = 'done'
+        AND lower(trim(text)) = lower(trim('$escaped_text'))
+        AND created_at >= datetime('now', '-30 days')
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 3;
+    " 2>/dev/null || echo "")
+    if [ -n "$exact_done" ]; then
+        echo -e "${YELLOW}⚠ Matching completed nodes exist:${NC}" >&2
+        echo "$exact_done" | while IFS='|' read -r sid stext sstatus; do
+            echo -e "  ${CYAN}$sid${NC} [$sstatus]: $stext" >&2
+        done
+        echo -e "${YELLOW}  ${duplicate_hint}${NC}" >&2
+        return 1
+    fi
+
     return 0
 }
 
@@ -216,6 +240,7 @@ cmd_add() {
     local create_gh=false
     local alias=""
     local force=false
+    local standalone=false
     local parent=""
     local format="text"
     local criteria=""
@@ -229,7 +254,8 @@ cmd_add() {
             --alias=*) alias="${1#*=}" ;;
             --parent=*) parent="${1#*=}" ;;
             --gh) create_gh=true ;;
-            --force|--standalone) force=true ;;
+            --force) force=true ;;
+            --standalone) force=true; standalone=true ;;
             --json) format="json" ;;
             --criteria=*) criteria="${1#*=}" ;;
             --risks=*) risks_flag="${1#*=}" ;;
@@ -265,6 +291,9 @@ print(json.dumps(items))
             none|low|medium|high|critical) metadata=$(echo "$metadata" | jq --arg r "$risks_flag" '. + {risks: [], risk_level: $r}' 2>/dev/null || echo "$metadata") ;;
         esac
     fi
+    if [ "$standalone" = true ]; then
+        metadata=$(echo "$metadata" | jq '. + {standalone: true}' 2>/dev/null || echo "$metadata")
+    fi
 
     # Validate parent if provided
     if [ -n "$parent" ]; then
@@ -282,6 +311,35 @@ print(json.dumps(items))
     if ! echo "$metadata" | jq '.' >/dev/null 2>&1; then
         echo -e "${RED}Error: invalid JSON in --metadata${NC}" >&2
         return 1
+    fi
+
+    # Guard the direct create-and-claim path. `wv work` and the pre-claim hook
+    # already require claim-ready metadata; direct `wv add --status=active`
+    # should not bypass that gate unless the caller explicitly forces it.
+    if [ "$status" = "active" ] && [ "$force" != "true" ]; then
+        local has_done_criteria has_risks
+        has_done_criteria=$(echo "$metadata" | jq -r '
+            if has("done_criteria") | not then "false"
+            elif (.done_criteria | type) == "array" then (if (.done_criteria | length) > 0 then "true" else "false" end)
+            elif (.done_criteria | type) == "string" then (if ((.done_criteria | gsub("^\\s+|\\s+$"; "")) | length) > 0 then "true" else "false" end)
+            else "false"
+            end
+        ' 2>/dev/null || echo "false")
+        has_risks=$(echo "$metadata" | jq -r 'has("risks")' 2>/dev/null || echo "false")
+
+        if [ "$has_done_criteria" != "true" ] || [ "$has_risks" != "true" ]; then
+            echo -e "${RED}Error: direct active add requires claim-ready metadata${NC}" >&2
+            if [ "$has_done_criteria" != "true" ]; then
+                echo -e "${CYAN}  Missing: done_criteria${NC}" >&2
+            fi
+            if [ "$has_risks" != "true" ]; then
+                echo -e "${CYAN}  Missing: risks${NC}" >&2
+            fi
+            echo -e "${CYAN}  Use: wv add \"...\" --status=active --criteria=\"c1|c2\" --risks=low${NC}" >&2
+            echo -e "${CYAN}  Or:  wv add \"...\" && wv work <id>${NC}" >&2
+            echo -e "${CYAN}  Use --force only for intentional low-level setup or tests${NC}" >&2
+            return 1
+        fi
     fi
 
     # Dedup check: warn if similar non-done nodes exist (skip with --force or --parent)
@@ -367,24 +425,61 @@ print(json.dumps(items))
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# _store_node_commits — Find commits referencing $id and store in metadata
+# _node_commit_shas — Find recent commits attributed to a node ID
+# _store_node_commits — Persist attributed commits onto node metadata
 # _aggregate_epic_commits — Collect child commits onto an epic node
 # ═══════════════════════════════════════════════════════════════════════════
 
+_node_commit_shas() {
+    local id="$1"
+    local raw_shas
+    raw_shas=$(git log --format="%H" --grep="Weave-ID: $id" --since="90 days ago" 2>/dev/null | head -20)
+    if [ -z "$raw_shas" ]; then
+        raw_shas=$(git log --format="%H" --grep="$id" --since="90 days ago" 2>/dev/null | head -20)
+    fi
+    [ -z "$raw_shas" ] && return 0
+
+    local sha subject regular_shas="" checkpoint_shas=""
+    while IFS= read -r sha; do
+        [ -z "$sha" ] && continue
+        subject=$(git log -1 --format="%s" "$sha" 2>/dev/null || echo "")
+        case "$subject" in
+            chore\(weave\):\ auto-checkpoint*|chore\(weave\):\ sync\ state*|chore\(weave\):\ session-start\ state*)
+                checkpoint_shas="${checkpoint_shas}${sha}\n"
+                ;;
+            *)
+                regular_shas="${regular_shas}${sha}\n"
+                ;;
+        esac
+    done <<< "$raw_shas"
+
+    printf '%b%b' "$regular_shas" "$checkpoint_shas" | sed '/^$/d'
+}
+
 _store_node_commits() {
     local id="$1"
-    local shas shas_json
-    shas=$(git log --format="%h" --grep="$id" --since="90 days ago" 2>/dev/null | head -10 | tr '\n' ' ' | sed 's/ $//')
+    local shas shas_json primary_sha
+    shas=$(_node_commit_shas "$id")
     [ -z "$shas" ] && return 0
-    shas_json=$(echo "$shas" | tr ' ' '\n' | jq -R . | jq -s . 2>/dev/null || echo "[]")
+    local cur_meta
+    cur_meta=$(_done_read_metadata "$id")
+
+    local existing_primary
+    existing_primary=$(echo "$cur_meta" | jq -r '.commit // empty' 2>/dev/null || echo "")
+    if [ -n "$existing_primary" ] && printf '%s\n' "$shas" | grep -qx "$existing_primary"; then
+        primary_sha="$existing_primary"
+    else
+        primary_sha=$(printf '%s\n' "$shas" | head -1)
+    fi
+    shas=$(printf '%s\n%s\n' "$primary_sha" "$shas" | awk 'NF && !seen[$0]++')
+    shas_json=$(printf '%s\n' "$shas" | jq -R . | jq -s . 2>/dev/null || echo "[]")
     [ "$shas_json" = "[]" ] && return 0
-    local cur_meta_raw cur_meta updated
-    cur_meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null || echo "[]")
-    cur_meta=$(echo "$cur_meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
-    [[ "$cur_meta" != "{"* ]] && cur_meta="{}"
-    updated=$(echo "$cur_meta" | jq --argjson s "$shas_json" '. + {commits: $s}' 2>/dev/null || echo "$cur_meta")
-    updated="${updated//\'/\'\'}"
-    db_query "UPDATE nodes SET metadata='$updated' WHERE id='$(sql_escape "$id")';"
+
+    local patch_json
+    patch_json=$(jq -cn --arg primary "$primary_sha" --argjson s "$shas_json" '{commit: $primary, commits: $s}' 2>/dev/null || echo "")
+    [ -z "$patch_json" ] && return 0
+    patch_json="${patch_json//\'/\'\'}"
+    db_query "UPDATE nodes SET metadata=json_patch(COALESCE(metadata, '{}'), '$patch_json') WHERE id='$(sql_escape "$id")';"
 }
 
 _aggregate_epic_commits() {
@@ -464,6 +559,53 @@ _done_refresh_file_metrics() {
         upsert_rc=$?
         if [ $upsert_rc -ne 0 ]; then
             echo -e "${RED}Error: failed to refresh file_metrics for '$path': $upsert_err${NC}" >&2
+            return 1
+        fi
+    done <<< "$paths_raw"
+}
+
+# _done_refresh_trend_signals — Sync brain.db file_trend from quality.db for
+# paths tracked in node_files. Reads complexity_trend history and writes
+# 'deteriorating'/'stable'/'refactored' direction per path.
+#
+# Called after _done_refresh_file_metrics (quality.db existence already verified).
+# Skipped when WV_REQUIRE_QUALITY=0 or node_files is empty.
+# Non-blocking: missing trend data defaults to 'stable' rather than failing.
+_done_refresh_trend_signals() {
+    local id="$1"
+
+    [ "${WV_REQUIRE_QUALITY:-1}" = "0" ] && return 0
+
+    local paths_raw
+    paths_raw=$(db_query "SELECT path FROM node_files WHERE node_id='$(sql_escape "$id")';" 2>/dev/null || echo "")
+    [ -z "$paths_raw" ] && return 0
+
+    local quality_db="$WV_HOT_ZONE/quality.db"
+    [ ! -f "$quality_db" ] && return 0
+
+    local path
+    while IFS= read -r path; do
+        [ -z "$path" ] && continue
+        local path_esc direction upsert_err upsert_rc
+        path_esc=$(echo "$path" | sed "s/'/''/g")
+        direction=$(sqlite3 -batch -cmd ".timeout 3000" "$quality_db" \
+            "SELECT complexity FROM complexity_trend WHERE path='$path_esc' ORDER BY scan_id ASC;" \
+            2>/dev/null | python3 -c "
+import sys
+vals=[float(l.strip()) for l in sys.stdin if l.strip()]
+if len(vals)<2: print('stable'); exit()
+n=len(vals); xm=(n-1)/2.0; ym=sum(vals)/n
+num=sum((i-xm)*(v-ym) for i,v in enumerate(vals))
+den=sum((i-xm)**2 for i in range(n))
+if den==0 or ym==0: print('stable'); exit()
+s=(num/den)/ym
+print('deteriorating' if s>0.03 else ('refactored' if s<-0.03 else 'stable'))
+" 2>/dev/null || echo "stable")
+        upsert_err=$(db_query "INSERT INTO file_trend(path, direction) VALUES('$path_esc', '$direction')
+            ON CONFLICT(path) DO UPDATE SET direction = excluded.direction;" 2>&1)
+        upsert_rc=$?
+        if [ $upsert_rc -ne 0 ]; then
+            echo -e "${RED}Error: failed to refresh file_trend for '$path': $upsert_err${NC}" >&2
             return 1
         fi
     done <<< "$paths_raw"
@@ -942,8 +1084,9 @@ cmd_done() {
         fi
     fi
 
-    # Refresh file_metrics from quality.db for node_files paths before the gate UPDATE.
+    # Refresh file_metrics and trend signals from quality.db before the gate UPDATE.
     _done_refresh_file_metrics "$id" || return 1
+    _done_refresh_trend_signals "$id" || return 1
 
     # === Close: update status, release claim, clear primary, aggregate commits ===
     local _done_err _done_rc
@@ -954,7 +1097,25 @@ cmd_done() {
         WHERE id='$id';" 2>&1)
     _done_rc=$?
     if [ "$_done_rc" -ne 0 ]; then
-        echo "$_done_err" >&2
+        if echo "$_done_err" | grep -q "GraphPolicyViolation"; then
+            local v_path v_actual v_limit v_threshold v_direction
+            v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key='mccabe_max') LIMIT 1;" 2>/dev/null || echo "")
+            if [ -n "$v_path" ]; then
+                v_actual=$(db_query "SELECT fm.mccabe_max FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key='mccabe_max') LIMIT 1;" 2>/dev/null || echo "0")
+                v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='mccabe_max';" 2>/dev/null || echo "15")
+                v_threshold="mccabe_max"
+                echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\"}" >&2
+            else
+                v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' AND (SELECT value FROM policy_thresholds WHERE key='trend_deteriorating') >= 1 LIMIT 1;" 2>/dev/null || echo "unknown")
+                v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='trend_deteriorating';" 2>/dev/null || echo "1")
+                v_actual=1
+                v_direction=$(db_query "SELECT ft.direction FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' LIMIT 1;" 2>/dev/null || echo "deteriorating")
+                v_threshold="trend_deteriorating"
+                echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\",\"direction\":\"$v_direction\"}" >&2
+            fi
+        else
+            echo "$_done_err" >&2
+        fi
         return 1
     fi
 
@@ -1861,6 +2022,14 @@ cmd_status() {
         needs_sync="true"
     fi
 
+    local git_pending_json git_sync_pending git_sync_state git_sync_action git_sync_reason git_sync_hint
+    git_pending_json=$(_detect_git_pending 2>/dev/null || echo '{}')
+    git_sync_pending=$(echo "$git_pending_json" | jq -r '.pending // false' 2>/dev/null || echo "false")
+    git_sync_state=$(echo "$git_pending_json" | jq -r '.state // "clean"' 2>/dev/null || echo "clean")
+    git_sync_action=$(echo "$git_pending_json" | jq -r '.action // "none"' 2>/dev/null || echo "none")
+    git_sync_reason=$(echo "$git_pending_json" | jq -r '.reason // "clean"' 2>/dev/null || echo "clean")
+    git_sync_hint=$(echo "$git_pending_json" | jq -r '.hint // "no action required"' 2>/dev/null || echo "no action required")
+
     if [ "$format" = "json" ]; then
         local primary_id="" primary_text=""
         if [ "${active:-0}" -gt 0 ]; then
@@ -1887,12 +2056,22 @@ cmd_status() {
             --argjson stale "${stale:-0}" \
             --argjson needs_sync "$needs_sync" \
             --argjson last_sync_at "$last_sync_at" \
+                        --argjson git_sync_pending "$git_sync_pending" \
+                        --arg git_sync_state "$git_sync_state" \
+                        --arg git_sync_action "$git_sync_action" \
+                        --arg git_sync_reason "$git_sync_reason" \
+                        --arg git_sync_hint "$git_sync_hint" \
             --arg primary_id "$primary_id" \
             --arg primary_text "$primary_text" \
             '{active:$active, ready:$ready, blocked:$blocked,
               pending_close:$pending_close, stale:$stale,
               needs_sync:$needs_sync,
               last_sync_at:$last_sync_at,
+                            git_sync_pending:$git_sync_pending,
+                            git_sync_state:$git_sync_state,
+                            git_sync_action:$git_sync_action,
+                            git_sync_reason:$git_sync_reason,
+                            git_sync_hint:$git_sync_hint,
               current: (if $primary_id != "" then {id:$primary_id, text:$primary_text} else null end)}'
         return 0
     fi
@@ -1940,6 +2119,12 @@ cmd_status() {
     # full: append sync state
     if [ "$mode" = "full" ]; then
         echo "needs_sync: $needs_sync | last_sync_at: $last_sync_at"
+        if [ "$git_sync_pending" = "true" ]; then
+            echo "git_sync: $git_sync_state | action: $git_sync_action | reason: $git_sync_reason"
+            echo "git_hint: $git_sync_hint"
+        fi
+    elif [ "$git_sync_pending" = "true" ]; then
+        echo "git_sync: $git_sync_state | action: $git_sync_action | reason: $git_sync_reason"
     fi
 }
 
@@ -2369,6 +2554,10 @@ cmd_quick() {
         return 1
     fi
 
+    if ! _add_dedup_check "$text" "Use 'wv add \"...\" --force' for intentional repeat work"; then
+        return 1
+    fi
+
     local id=$(generate_id)
 
     # Escape single quotes
@@ -2421,7 +2610,7 @@ cmd_quick() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# cmd_ship — Done + sync + push in one command
+# cmd_ship — Done + sync in one command (local completion)
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_ship() {
@@ -2517,41 +2706,23 @@ cmd_ship() {
 
     # Step 2: Sync to disk (with GH if needed)
     journal_step 2 "sync" "{\"gh\":$needs_gh}"
+    local _ship_prev_skip_sync_commit="${_WV_SKIP_SYNC_COMMIT:-}"
+    export _WV_SKIP_SYNC_COMMIT=1
     if [ "$needs_gh" = true ]; then
         echo -e "${CYAN}ℹ${NC} GitHub-linked node detected — syncing with --gh"
         cmd_sync --gh
     else
         cmd_sync
     fi
+    if [ -n "$_ship_prev_skip_sync_commit" ]; then
+        export _WV_SKIP_SYNC_COMMIT="$_ship_prev_skip_sync_commit"
+    else
+        unset _WV_SKIP_SYNC_COMMIT
+    fi
     journal_complete 2
 
-    # Step 3: Git commit
-    journal_step 3 "git_commit"
-    if command -v git >/dev/null 2>&1; then
-        local git_root
-        git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-        if [ -n "$git_root" ]; then
-            git -C "$git_root" add .weave/ 2>/dev/null || true
-            git -C "$git_root" commit -m "chore: sync Weave after completing $id [skip ci]" --allow-empty 2>/dev/null || true
-        fi
-    fi
-    journal_complete 3
-
-    # Step 4: Git push
-    journal_step 4 "git_push"
-    if command -v git >/dev/null 2>&1 && [ -n "${git_root:-}" ]; then
-        if git -C "$git_root" push 2>/dev/null; then
-            echo -e "${GREEN}✓${NC} Pushed to remote"
-        else
-            echo -e "${RED}✗ PUSH FAILED — work is NOT on remote${NC}" >&2
-            echo -e "${YELLOW}  Run 'git push' manually or 'wv recover' to retry${NC}" >&2
-            journal_end
-            return 1
-        fi
-    fi
-    journal_complete 4
-
-    # Clear ship_pending marker and complete journal
+    # Clear ship_pending marker and complete journal. Remote sync may still be
+    # pending — surfaced explicitly via wv status / wv doctor / wv recover.
     db_query "UPDATE nodes SET metadata = json_remove(metadata, '$.ship_pending') WHERE id = '$id';" 2>/dev/null || true
     journal_end
     journal_clean

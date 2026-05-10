@@ -90,13 +90,14 @@ Invalid scope "bogus". Valid: graph, session, lite, inspect, all
 
 ### VS Code Copilot (`.mcp.json`)
 
-The committed repo configuration currently registers **two servers**:
+The committed repo configuration currently registers **four servers**:
 - `weave` — full access (default, backward-compatible)
+- `weave-session` — workflow lifecycle tools only
+- `weave-lite` — minimal task-tracking surface
 - `weave-inspect` — read-only queries for audit and analysis work
 
-Additional scoped servers (`graph`, `session`, `lite`) are supported by the binary. `graph` and
-`session` remain the intended narrower surfaces for upcoming runtime-agent specialisation, but they
-are not part of the checked-in `.mcp.json` yet.
+The `graph` scoped server remains an optional local addition when you want a write-only MCP surface
+for specialised subagents.
 
 ```jsonc
 {
@@ -106,18 +107,47 @@ are not part of the checked-in `.mcp.json` yet.
       "type": "stdio",
       "command": "node",
       "args": ["${workspaceFolder}/mcp/dist/index.js"],
-      "env": { "WV_PATH": "${workspaceFolder}/scripts/wv" },
+      "env": {
+        "WV_PATH": "${workspaceFolder}/scripts/wv",
+        "WV_PROJECT_ROOT": "${workspaceFolder}"
+      },
+    },
+    // Workflow lifecycle only — claim/ship/close-session/edit-guard surfaces
+    "weave-session": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=session"],
+      "env": {
+        "WV_PATH": "${workspaceFolder}/scripts/wv",
+        "WV_PROJECT_ROOT": "${workspaceFolder}"
+      },
+    },
+    // Minimal task-tracking surface for lighter-weight Copilot subagents
+    "weave-lite": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=lite"],
+      "env": {
+        "WV_PATH": "${workspaceFolder}/scripts/wv",
+        "WV_PROJECT_ROOT": "${workspaceFolder}"
+      },
     },
     // Read-only queries — for research/review subagents
     "weave-inspect": {
       "type": "stdio",
       "command": "node",
       "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=inspect"],
-      "env": { "WV_PATH": "${workspaceFolder}/scripts/wv" },
+      "env": {
+        "WV_PATH": "${workspaceFolder}/scripts/wv",
+        "WV_PROJECT_ROOT": "${workspaceFolder}"
+      },
     },
   },
 }
 ```
+
+`WV_PROJECT_ROOT` pins all `wv` subprocess calls to the intended repository, so edit guards and
+other workflow checks do not depend on the MCP server's inherited cwd.
 
 Optional local additions if you want stricter scope isolation:
 
@@ -126,19 +156,28 @@ Optional local additions if you want stricter scope isolation:
   "type": "stdio",
   "command": "node",
   "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=graph"],
-  "env": { "WV_PATH": "${workspaceFolder}/scripts/wv" }
+  "env": {
+    "WV_PATH": "${workspaceFolder}/scripts/wv",
+    "WV_PROJECT_ROOT": "${workspaceFolder}"
+  }
 },
 "weave-session": {
   "type": "stdio",
   "command": "node",
   "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=session"],
-  "env": { "WV_PATH": "${workspaceFolder}/scripts/wv" }
+  "env": {
+    "WV_PATH": "${workspaceFolder}/scripts/wv",
+    "WV_PROJECT_ROOT": "${workspaceFolder}"
+  }
 },
 "weave-lite": {
   "type": "stdio",
   "command": "node",
   "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=lite"],
-  "env": { "WV_PATH": "${workspaceFolder}/scripts/wv" }
+  "env": {
+    "WV_PATH": "${workspaceFolder}/scripts/wv",
+    "WV_PROJECT_ROOT": "${workspaceFolder}"
+  }
 }
 ```
 
@@ -151,14 +190,16 @@ Optional local additions if you want stricter scope isolation:
       "command": "node",
       "args": ["/path/to/memory-system/mcp/dist/index.js"],
       "env": {
-        "WV_PATH": "/path/to/memory-system/scripts/wv"
+        "WV_PATH": "/path/to/memory-system/scripts/wv",
+        "WV_PROJECT_ROOT": "/path/to/your/repo"
       }
     },
     "weave-inspect": {
       "command": "node",
       "args": ["/path/to/memory-system/mcp/dist/index.js", "--scope=inspect"],
       "env": {
-        "WV_PATH": "/path/to/memory-system/scripts/wv"
+        "WV_PATH": "/path/to/memory-system/scripts/wv",
+        "WV_PROJECT_ROOT": "/path/to/your/repo"
       }
     }
   }
@@ -186,14 +227,14 @@ Optional local additions if you want stricter scope isolation:
 | Tool                  | Description                                           | Required params |
 | --------------------- | ----------------------------------------------------- | --------------- |
 | `weave_work`          | Claim a node, sets WV_ACTIVE for subagent inheritance | `id`            |
-| `weave_ship`          | Complete node + sync in one step. Same learning merge as `weave_done` | `id`            |
+| `weave_ship`          | Complete node + sync in one step. Any remaining Git sync is surfaced separately. Same learning merge as `weave_done` | `id`            |
 | `weave_recover`       | Resume incomplete ship/sync/delete operations         | —               |
 | `weave_quick`         | Quick-add a node and immediately start working on it  | `text`          |
 | `weave_overview`      | Status + health + context policy + ready work         | —               |
 | `weave_bootstrap`     | Single-call session snapshot: status + context + ready + learnings | —      |
 | `weave_breadcrumbs`   | Save, show, or clear session breadcrumbs              | —               |
 | `weave_plan`          | Import markdown plan as epic + tasks with GH issues   | `file`          |
-| `weave_close_session` | Sync + git status + unpushed commits + active warning | —               |
+| `weave_close_session` | Sync + repo-status check + unpushed commit/active-node warnings | —               |
 | `weave_edit_guard`    | Pre-edit guard: require an active node before edits   | —               |
 
 ### Inspect scope — read-only queries (15 tools)
@@ -251,6 +292,7 @@ The test suite verifies:
 | Variable    | Description                         | Default       |
 | ----------- | ----------------------------------- | ------------- |
 | `WV_PATH`   | Path to wv CLI binary               | Auto-detected |
+| `WV_PROJECT_ROOT` | Repo root passed to MCP-spawned `wv` commands | Current process cwd |
 | `WV_ACTIVE` | Active node ID (inherited by tools) | —             |
 
 ## Agent Pairing

@@ -42,6 +42,9 @@ cleanup() {
     if [ -d "$TEST_DIR" ]; then
         rm -rf "$TEST_DIR"
     fi
+    if [ -d "${TEST_DIR}-remote.git" ]; then
+        rm -rf "${TEST_DIR}-remote.git"
+    fi
 }
 trap cleanup EXIT
 
@@ -57,6 +60,38 @@ setup_test_env() {
     mkdir -p .weave
     # Initialize the database
     "$WV" init 2>/dev/null || true
+}
+
+setup_source4_env() {
+    rm -rf "$TEST_DIR"
+    mkdir -p "$TEST_DIR/repo" "$TEST_DIR/hot"
+    cd "$TEST_DIR/repo"
+    git init -q
+    mkdir -p .weave
+    export WV_HOT_ZONE="$TEST_DIR/hot"
+    export WV_DB="$TEST_DIR/hot/brain.db"
+    export WV_REQUIRE_LEARNING=0
+    export WV_AUTO_SYNC=0
+    export WV_AUTO_CHECKPOINT=0
+    "$WV" init 2>/dev/null || true
+}
+
+setup_remote_tracking() {
+    local remote_dir="${TEST_DIR}-remote.git"
+    local branch_name
+
+    rm -rf "$remote_dir"
+    git init --bare "$remote_dir" -q
+    git config user.email test@test.com
+    git config user.name test
+    git remote remove origin >/dev/null 2>&1 || true
+    git remote add origin "$remote_dir"
+
+    echo "seed" > README.md
+    git add README.md .weave/ >/dev/null 2>&1 || true
+    git commit -m "init" -q --no-verify >/dev/null 2>&1 || true
+    branch_name=$(git branch --show-current 2>/dev/null || echo "master")
+    git push -u origin "$branch_name" -q >/dev/null 2>&1 || true
 }
 
 assert_equals() {
@@ -323,6 +358,73 @@ setup_test_env
 
 result=$("$WV" recover --json 2>/dev/null)
 assert_contains "$result" '"clean"' "recover reports clean on fresh state"
+
+# ─── source-4 dirty .weave surfacing ────────────────────────────────────
+
+echo ""
+echo -e "${CYAN}--- source-4 dirty .weave surfacing ---${NC}"
+setup_source4_env
+setup_remote_tracking
+
+echo "dirty" > .weave/source4-dirty
+
+status_json=$("$WV" status --json 2>/dev/null)
+assert_contains "$status_json" '"git_sync_pending": true' "status surfaces git pending for dirty .weave"
+assert_contains "$status_json" '"git_sync_action": "commit_push"' "status reports commit+push for dirty .weave"
+assert_contains "$status_json" '"git_sync_reason": "dirty_weave"' "status reports dirty_weave reason"
+
+recover_json=$("$WV" recover --json 2>/dev/null)
+assert_contains "$recover_json" '"status": "git_pending"' "recover surfaces recoverable source-4 state"
+assert_contains "$recover_json" '"action": "commit_push"' "recover reports commit_push action"
+
+git add .weave/source4-dirty >/dev/null 2>&1
+git commit -m "dirty weave synced" -q --no-verify >/dev/null 2>&1
+git push -q >/dev/null 2>&1
+
+status_json=$("$WV" status --json 2>/dev/null)
+assert_contains "$status_json" '"git_sync_pending": false' "status clears dirty .weave once it is committed and pushed"
+assert_contains "$status_json" '"git_sync_reason": "clean"' "status reports clean after dirty .weave commit+push"
+
+# ─── source-4 ahead .weave surfacing ────────────────────────────────────
+
+echo ""
+echo -e "${CYAN}--- source-4 ahead .weave surfacing ---${NC}"
+setup_source4_env
+setup_remote_tracking
+
+echo "ahead" > .weave/source4-ahead
+git add .weave/source4-ahead >/dev/null 2>&1
+git commit -m "ahead weave" -q --no-verify >/dev/null 2>&1
+
+status_json=$("$WV" status --json 2>/dev/null)
+assert_contains "$status_json" '"git_sync_action": "push_only"' "status reports push_only for ahead .weave commit"
+assert_contains "$status_json" '"git_sync_reason": "ahead_weave"' "status reports ahead_weave reason"
+
+doctor_out=$("$WV" doctor 2>&1)
+assert_contains "$doctor_out" "git sync" "doctor checks git sync state"
+assert_contains "$doctor_out" "ahead_weave" "doctor reports recoverable ahead state"
+
+git push -q >/dev/null 2>&1
+
+status_json=$("$WV" status --json 2>/dev/null)
+assert_contains "$status_json" '"git_sync_pending": false' "status clears ahead .weave once the commit is pushed"
+assert_contains "$status_json" '"git_sync_reason": "clean"' "status reports clean after ahead .weave push"
+
+# ─── source-4 no-upstream surfacing ─────────────────────────────────────
+
+echo ""
+echo -e "${CYAN}--- source-4 no-upstream surfacing ---${NC}"
+setup_source4_env
+
+echo "dirty" > .weave/source4-no-upstream
+
+status_json=$("$WV" status --json 2>/dev/null)
+assert_contains "$status_json" '"git_sync_state": "unresolvable"' "status marks no-upstream source-4 state unresolvable"
+assert_contains "$status_json" '"git_sync_reason": "no_upstream"' "status reports no_upstream reason"
+
+recover_json=$("$WV" recover --json 2>/dev/null)
+assert_contains "$recover_json" '"status": "git_unresolvable"' "recover surfaces unresolvable source-4 state"
+assert_contains "$recover_json" '"reason": "no_upstream"' "recover reports no_upstream reason"
 
 # ─── wv doctor journal check ───────────────────────────────────────────
 

@@ -104,6 +104,7 @@ setup_test_env() {
     ln -sf "$WV" "$TEST_DIR/project/scripts/wv"
     mkdir -p "$TEST_DIR/project/scripts/lib"
     ln -sf "$PROJECT_ROOT/scripts/lib/wv-resolve-project.sh" "$TEST_DIR/project/scripts/lib/wv-resolve-project.sh"
+    ln -sf "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" "$TEST_DIR/project/scripts/lib/wv-resolve-runtime.sh"
 
     # Init git repo (needed by stop-check and context-guard)
     cd "$TEST_DIR/project"
@@ -120,6 +121,14 @@ setup_test_env() {
     # Set CLAUDE_PROJECT_DIR to test project
     export CLAUDE_PROJECT_DIR="$TEST_DIR/project"
 export WV_PROJECT_DIR="$TEST_DIR/project"
+}
+
+add_active_node() {
+    local text="$1"
+    shift || true
+    "$WV" add "$text" --status=active \
+        --criteria="hook test setup works|active node available for hook checks" \
+        --risks=low "$@"
 }
 
 # ============================================================
@@ -141,7 +150,7 @@ echo "--- pre-compact-context.sh ---"
 setup_test_env
 
 # Add a node so there's data to report
-"$WV" add "Test compact node" --status=active 2>/dev/null
+add_active_node "Test compact node" 2>/dev/null
 
 OUTPUT=$(bash "$HOOKS_DIR/pre-compact-context.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "Weave state" "pre-compact: outputs Weave state header"
@@ -170,7 +179,7 @@ assert_contains "$OUTPUT" "No active Weave node" "pre-action: message on stderr 
 echo ""
 echo "--- pre-action.sh (active node, no blockers) ---"
 setup_test_env
-"$WV" add "Active test task" --status=active 2>/dev/null
+add_active_node "Active test task" 2>/dev/null
 
 set +e
 OUTPUT=$(echo '{"tool_name":"Edit","tool_input":{"file_path":"test.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>/dev/null)
@@ -203,7 +212,7 @@ assert_exit_code "2" "$EXIT_CODE" "pre-action: exits 2 for mcp__ide__executeCode
 
 # With active node: mcp__ide__executeCode must be allowed (exit 0)
 setup_test_env
-"$WV" add "MCP test task" --status=active 2>/dev/null
+add_active_node "MCP test task" 2>/dev/null
 set +e
 OUTPUT=$(echo '{"tool_name":"mcp__ide__executeCode","tool_input":{"code":"print(1)"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>/dev/null)
 EXIT_CODE=$?
@@ -232,7 +241,7 @@ assert_exit_code "2" "$EXIT_CODE" "pre-action: exits 2 for replace_string_in_fil
 
 # create_file with active node: must allow (exit 0)
 setup_test_env
-"$WV" add "VS Code test task" --status=active 2>/dev/null
+add_active_node "VS Code test task" 2>/dev/null
 set +e
 OUTPUT=$(echo '{"tool_name":"create_file","tool_input":{"filePath":"new.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>/dev/null)
 EXIT_CODE=$?
@@ -253,7 +262,7 @@ echo "--- pre-action.sh (camelCase filePath guard) ---"
 
 # VS Code sends filePath (camelCase) — must detect installed-path edits
 setup_test_env
-"$WV" add "filePath guard test" --status=active 2>/dev/null
+add_active_node "filePath guard test" 2>/dev/null
 set +e
 OUTPUT=$(echo '{"tool_name":"create_file","tool_input":{"filePath":"/home/user/.local/lib/weave/lib/something.sh"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
 EXIT_CODE=$?
@@ -263,7 +272,7 @@ assert_contains "$OUTPUT" "installed copy" "pre-action: shows installed-path err
 
 # Claude Code sends file_path (snake_case) — existing behavior still works
 setup_test_env
-"$WV" add "file_path guard test" --status=active 2>/dev/null
+add_active_node "file_path guard test" 2>/dev/null
 set +e
 OUTPUT=$(echo '{"tool_name":"Edit","tool_input":{"file_path":"/home/user/.local/bin/wv"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
 EXIT_CODE=$?
@@ -276,7 +285,7 @@ echo "--- pre-action.sh (context cache S2.1-S2.3) ---"
 
 # Cache miss: first call creates stamp file
 setup_test_env
-TASK_ID=$("$WV" add "Cache test" --status=active 2>/dev/null | tail -1)
+TASK_ID=$(add_active_node "Cache test" 2>/dev/null | tail -1)
 # Clear any existing stamp
 rm -f "$WV_HOT_ZONE/.context_checked_"* 2>/dev/null || true
 set +e
@@ -391,7 +400,7 @@ assert_equals "" "$OUTPUT" "pre-claim: silent on unreadable / missing node"
 echo ""
 echo "--- pre-close-verification.sh ---"
 setup_test_env
-ID=$("$WV" add "Close test" --status=active 2>/dev/null | tail -1)
+ID=$(add_active_node "Close test" 2>/dev/null | tail -1)
 
 set +e
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
@@ -402,14 +411,15 @@ assert_contains "$OUTPUT" "\"permissionDecision\": \"deny\"" "pre-close: uses ho
 assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 (soft deny) when no verification"
 
 # With --skip-verification flag (should pass)
+SKIP_ID=$(add_active_node "Skip verification close test" --metadata='{"commit":"deadbeef"}' 2>/dev/null | tail -1)
 set +e
-OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $SKIP_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 with --skip-verification bypass on real Bash payload"
 
 # Finding nodes still require structured finding metadata even with --skip-verification
-FINDING_ID=$("$WV" add "Finding close test" --status=active --metadata='{"type":"finding"}' 2>/dev/null | tail -1)
+FINDING_ID=$(add_active_node "Finding close test" --metadata='{"type":"finding"}' 2>/dev/null | tail -1)
 set +e
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 EXIT_CODE=$?
@@ -417,7 +427,7 @@ set -e
 assert_contains "$OUTPUT" "Finding nodes require structured metadata before close" "pre-close: finding schema enforced before close"
 assert_exit_code "0" "$EXIT_CODE" "pre-close: finding schema denial is soft"
 
-"$WV" update "$FINDING_ID" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end","root_cause":"bootstrap omitted active-node type","proposed_fix":"record active_node_type in session_start metadata","confidence":"high","fixable":true}}' 2>/dev/null
+"$WV" update "$FINDING_ID" --metadata='{"type":"finding","commit":"deadbeef","finding":{"violation_type":"R10:open_node_at_end","root_cause":"bootstrap omitted active-node type","proposed_fix":"record active_node_type in session_start metadata","confidence":"high","fixable":true}}' 2>/dev/null
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 assert_equals "" "$OUTPUT" "pre-close: complete finding metadata passes with skip-verification"
 
@@ -426,7 +436,7 @@ OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDIN
 assert_contains "$OUTPUT" "Missing or invalid: finding.confidence, finding.fixable" "pre-close: invalid finding field types are denied"
 
 # With verification metadata
-"$WV" update "$ID" --metadata='{"verification":{"method":"test","result":"pass"}}' 2>/dev/null
+"$WV" update "$ID" --metadata='{"verification":{"method":"test","result":"pass"},"commit":"deadbeef"}' 2>/dev/null
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 # Should NOT warn when verification exists
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -446,7 +456,7 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 for legacy root command payload when verification exists"
 
 # Inline --verification-method flag satisfies hook without prior wv update
-ID2="$("$WV" add "inline-flag test node" --status=active 2>/dev/null | grep -oP 'wv-[0-9a-f]{4,6}')"
+ID2="$(add_active_node "inline-flag test node" --metadata='{"commit":"deadbeef"}' 2>/dev/null | grep -oP 'wv-[0-9a-f]{4,6}')"
 set +e
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID2 --verification-method=\\\"make check\\\" --learning=\\\"test\\\"\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 EXIT_CODE=$?
@@ -461,6 +471,27 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 when --verification-evidence inline flag present"
 assert_equals "" "$OUTPUT" "pre-close: silent (no deny) when --verification-evidence inline flag present"
+
+git -C "$TEST_DIR/project" add -A 2>/dev/null
+git -C "$TEST_DIR/project" commit -m "hook hygiene baseline" -q 2>/dev/null || true
+
+COMMIT_ID=$(add_active_node "commit hygiene test node" --metadata='{"verification":{"method":"test","result":"pass"}}' 2>/dev/null | tail -1)
+echo "dirty" > "$TEST_DIR/project/commit-hygiene.txt"
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $COMMIT_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_contains "$OUTPUT" "Commit work before close" "pre-close: denies close when non-.weave changes are still uncommitted"
+assert_exit_code "0" "$EXIT_CODE" "pre-close: uncommitted-change denial is soft"
+
+git -C "$TEST_DIR/project" add commit-hygiene.txt
+git -C "$TEST_DIR/project" commit -m "feat: unattributed commit hygiene" -q 2>/dev/null
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $COMMIT_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
+assert_contains "$OUTPUT" "No commit attributed to $COMMIT_ID" "pre-close: denies close when the work commit is not attributed to the node"
+
+git -C "$TEST_DIR/project" commit --amend -m "feat: attributed commit hygiene" -m "Weave-ID: $COMMIT_ID" -q 2>/dev/null
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $COMMIT_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
+assert_equals "" "$OUTPUT" "pre-close: silent when an attributed work commit exists"
 
 "$WV" done "$ID2" --skip-verification 2>/dev/null || true  # cleanup
 
@@ -677,7 +708,7 @@ assert_contains "$STDERR_OUTPUT" "uncommitted" "stop-check: stderr warns about u
 
 # Unpushed commits — auto-push attempted, fails → hard block
 # Create a real bare remote so tracking/AHEAD works, then remove it so push fails
-_FAKE_REMOTE=$(mktemp -d)
+_FAKE_REMOTE=$(mktemp -d "$TEST_DIR/fake-remote.XXXXXX")
 git init --bare -q "$_FAKE_REMOTE"
 git -C "$TEST_DIR/project" commit -m "unpushed work" -q 2>/dev/null
 git -C "$TEST_DIR/project" remote add origin "file://$_FAKE_REMOTE" 2>/dev/null || true
@@ -762,6 +793,38 @@ WV_CALLS=$(cat "$WV_LOG")
 assert_contains "$WV_CALLS" "sync --gh" "session-end: calls wv sync --gh"
 LAST_MSG=$(git -C "$TEST_DIR/project" log -1 --pretty=%s 2>/dev/null || true)
 assert_contains "$LAST_MSG" "auto-checkpoint" "session-end: auto-checkpoint commit succeeds without blanket bypass"
+
+# --- repo-managed git hooks ---
+echo ""
+echo "--- repo-managed git hooks ---"
+setup_test_env
+mkdir -p "$TEST_DIR/project/tests"
+cat > "$TEST_DIR/project/tests/test-core.sh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$TEST_DIR/project/tests/test-core.sh"
+git -C "$TEST_DIR/project" add tests/test-core.sh
+add_active_node "Git hook progress task" --criteria="hook prints progress|smoke repo stays green" --risks=low >/dev/null 2>&1
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && sh "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: exits 0 with active node and passing shell smoke"
+assert_contains "$OUTPUT" "running tests/test-core.sh" "git pre-commit: streams shell-test progress"
+assert_contains "$OUTPUT" "checking for an active Weave node" "git pre-commit: streams active-node check"
+
+setup_test_env
+HOOK_ID=$(add_active_node "Prepare hook task" --criteria="hook adds trailer|smoke passes" --risks=low 2>/dev/null | tail -1)
+MSG_FILE="$TEST_DIR/project/COMMIT_EDITMSG"
+printf 'hook smoke\n' > "$MSG_FILE"
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && sh "$PROJECT_ROOT/scripts/hooks/prepare-commit-msg-weave.sh" "$MSG_FILE" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "prepare-commit-msg hook exits 0"
+MSG_CONTENT=$(cat "$MSG_FILE")
+assert_contains "$MSG_CONTENT" "Weave-ID: $HOOK_ID" "prepare-commit-msg hook appends active Weave-ID"
 
 # ============================================================
 # INTEGRATION TEST: Full session lifecycle
@@ -849,7 +912,7 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "lifecycle: session ends cleanly"
 
 # 11. Pre-compact preserves context during lifecycle
-"$WV" add "Another active task" --status=active 2>/dev/null
+add_active_node "Another active task" 2>/dev/null
 OUTPUT=$(bash "$HOOKS_DIR/pre-compact-context.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "Active:" "lifecycle: pre-compact reports active work during session"
 
@@ -946,7 +1009,7 @@ setup_test_env
 
 # Active node but no sentinel (reboot recovery)
 # Must sync so wv load inside the hook restores this node from state.sql
-"$WV" add "Orphaned after reboot" --status=active 2>/dev/null
+add_active_node "Orphaned after reboot" 2>/dev/null
 "$WV" sync 2>/dev/null || true
 
 _BRIDGE2_JSONL_DIR="$HOME/.claude/projects/${_BRIDGE_SLUG}"
@@ -1081,6 +1144,7 @@ export WV_TOUCHED_RING_CAP=20
 TF_DB="$TEST_DIR/touched-brain.db"
 rm -f "$TF_DB"
 sqlite3 "$TF_DB" "CREATE TABLE nodes (id TEXT PRIMARY KEY, status TEXT, metadata TEXT, updated_at DATETIME);"
+sqlite3 "$TF_DB" "CREATE TABLE node_files (node_id TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (node_id, path));"
 sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-active1', 'active', '{}', datetime('now'));"
 sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-todo1', 'todo', '{}', datetime('now'));"
 export WV_DB="$TF_DB"
@@ -1099,12 +1163,14 @@ else
 fi
 
 # 2) Edit on a file: writes to ring AND updates active node metadata
-echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/foo.py\"},\"tool_response\":{\"success\":true}}" \
+echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project/foo.py\"},\"tool_response\":{\"success\":true}}" \
     | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
 RING_CONTENT=$(cat "$RING_FILE" 2>/dev/null || echo "")
 assert_contains "$RING_CONTENT" "foo.py" "touched-files: ring records edited file"
 META_FILES=$(sqlite3 "$TF_DB" "SELECT json_extract(metadata, '\$.touched_files') FROM nodes WHERE id='wv-active1';" 2>/dev/null)
 assert_contains "$META_FILES" "foo.py" "touched-files: active node metadata.touched_files updated"
+NODE_FILE_PATH=$(sqlite3 "$TF_DB" "SELECT path FROM node_files WHERE node_id='wv-active1' AND path='foo.py';" 2>/dev/null)
+assert_equals "foo.py" "$NODE_FILE_PATH" "touched-files: node_files row written for active node"
 
 # 3) Failed tool call: skipped
 echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/never.py\"},\"tool_response\":{\"success\":false}}" \
@@ -1120,10 +1186,12 @@ else
 fi
 
 # 4) Dedup: same file edited twice appears once in ring
-echo "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$TEST_DIR/foo.py\"},\"tool_response\":{\"success\":true}}" \
+echo "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project/foo.py\"},\"tool_response\":{\"success\":true}}" \
     | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
 FOO_COUNT=$(grep -c "foo.py" "$RING_FILE" 2>/dev/null || echo 0)
 assert_equals "1" "$FOO_COUNT" "touched-files: ring deduplicates repeated paths"
+NODE_FILE_COUNT=$(sqlite3 "$TF_DB" "SELECT COUNT(*) FROM node_files WHERE node_id='wv-active1' AND path='foo.py';" 2>/dev/null)
+assert_equals "1" "$NODE_FILE_COUNT" "touched-files: node_files deduplicates repeated paths"
 
 # 5) Ring cap: only last N paths retained
 export WV_TOUCHED_RING_CAP=3
@@ -1154,6 +1222,73 @@ for i in a b c d; do
 done
 NODE_COUNT=$(sqlite3 "$TF_DB" "SELECT json_array_length(json_extract(metadata, '\$.touched_files')) FROM nodes WHERE id='wv-active1';" 2>/dev/null)
 assert_equals "2" "$NODE_COUNT" "touched-files: active node touched_files capped"
+
+# 7) Full attribution matcher coverage: every supported write tool is attributed
+assert_touched_files_tool() {
+    local tool_name="$1"
+    local input_key="$2"
+    local file_path="$3"
+    local expected_path="$4"
+    local tool_meta
+
+    sqlite3 "$TF_DB" "UPDATE nodes SET metadata='{}' WHERE id='wv-active1';"
+    jq -nc \
+        --arg tool_name "$tool_name" \
+        --arg input_key "$input_key" \
+        --arg file_path "$file_path" \
+        '{tool_name:$tool_name, tool_input:{($input_key):$file_path}, tool_response:{success:true}}' \
+        | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
+    tool_meta=$(sqlite3 "$TF_DB" "SELECT json_extract(metadata, '\$.touched_files') FROM nodes WHERE id='wv-active1';" 2>/dev/null)
+    assert_contains "$tool_meta" "$expected_path" "touched-files: ${tool_name} participates in attribution"
+}
+
+assert_touched_files_tool "create_file" "filePath" "$TEST_DIR/vscode.py" "vscode.py"
+assert_touched_files_tool "replace_string_in_file" "filePath" "$TEST_DIR/replace.py" "replace.py"
+assert_touched_files_tool "insert_edit_into_file" "filePath" "$TEST_DIR/insert.py" "insert.py"
+assert_touched_files_tool "multi_replace_string_in_file" "filePath" "$TEST_DIR/multi.py" "multi.py"
+assert_touched_files_tool "NotebookEdit" "path" "$TEST_DIR/notebook.ipynb" "notebook.ipynb"
+assert_touched_files_tool "edit_notebook_file" "filePath" "$TEST_DIR/edit-notebook.ipynb" "edit-notebook.ipynb"
+
+# 8) Stale primary falls back to an active node and clears the stale stamp
+PRIMARY_FILE="$WV_HOT_ZONE/primary"
+sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-old-primary', 'done', '{}', datetime('now', '-1 hour'));"
+sqlite3 "$TF_DB" "UPDATE nodes SET updated_at=datetime('now', '-1 hour') WHERE id='wv-active1';"
+sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-active2', 'active', '{}', datetime('now'));"
+echo "wv-old-primary" > "$PRIMARY_FILE"
+sqlite3 "$TF_DB" "UPDATE nodes SET metadata='{}' WHERE id='wv-active2';"
+echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/fallback.py\"},\"tool_response\":{\"success\":true}}" \
+    | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
+FALLBACK_META=$(sqlite3 "$TF_DB" "SELECT json_extract(metadata, '\$.touched_files') FROM nodes WHERE id='wv-active2';" 2>/dev/null)
+assert_contains "$FALLBACK_META" "fallback.py" "touched-files: stale primary falls back to an active node"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ ! -f "$PRIMARY_FILE" ]; then
+    echo -e "${GREEN}✓${NC} touched-files: stale primary stamp cleared during fallback"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} touched-files: stale primary stamp should be cleared"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# 9) Canonical runtime resolver path: no WV_TOUCHED_DIR/WV_DB overrides needed
+unset WV_TOUCHED_DIR WV_DB
+CANON_HOT="$TEST_DIR/canonical-hot"
+export WV_HOT_ZONE="$CANON_HOT"
+mkdir -p "$CANON_HOT"
+CANON_DB="$CANON_HOT/brain.db"
+rm -f "$CANON_DB"
+sqlite3 "$CANON_DB" "CREATE TABLE nodes (id TEXT PRIMARY KEY, status TEXT, metadata TEXT, updated_at DATETIME);"
+sqlite3 "$CANON_DB" "CREATE TABLE node_files (node_id TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (node_id, path));"
+sqlite3 "$CANON_DB" "INSERT INTO nodes VALUES ('wv-canon1', 'active', '{}', datetime('now'));"
+echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project/canon.py\"},\"tool_response\":{\"success\":true}}" \
+    | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
+CANON_RING_CONTENT=$(cat "$CANON_HOT/recent-edits.txt" 2>/dev/null || echo "")
+assert_contains "$CANON_RING_CONTENT" "canon.py" "touched-files: canonical resolver writes ring without overrides"
+CANON_META=$(sqlite3 "$CANON_DB" "SELECT json_extract(metadata, '\$.touched_files') FROM nodes WHERE id='wv-canon1';" 2>/dev/null)
+assert_contains "$CANON_META" "canon.py" "touched-files: canonical resolver writes metadata without overrides"
+CANON_NODE_FILE=$(sqlite3 "$CANON_DB" "SELECT path FROM node_files WHERE node_id='wv-canon1' AND path='canon.py';" 2>/dev/null)
+assert_equals "canon.py" "$CANON_NODE_FILE" "touched-files: canonical resolver writes node_files without overrides"
+export WV_HOT_ZONE="$TEST_DIR"
+export WV_DB="$TF_DB"
 
 unset WV_TOUCHED_DIR WV_TOUCHED_NODE_CAP WV_TOUCHED_RING_CAP WV_DB
 

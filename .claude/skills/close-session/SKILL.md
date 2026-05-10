@@ -20,14 +20,19 @@ wv add "..." --status=todo  # For anything needing follow-up
 # 2. Run quality gates (if code changed)
 # Tests, linters, builds as appropriate
 
-# 3. Close completed nodes
-wv done <id1> <id2> ...
-
-# 4. Sync and push
+# 3. Commit completed work while nodes are still active
+#    prepare-commit-msg appends Weave-ID trailers during this step
 git add <files>
+git commit -m "descriptive work message"
+
+# 4. Close completed nodes
+wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..."
+# Or: wv batch-done <id1> <id2> ... --learning="shared sprint learning"
+
+# 5. Sync and push
 wv sync --gh              # Persist state AND sync to GitHub issues
 git add .weave/           # Stage any GH metadata changes from sync
-git commit -m "descriptive message"
+git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"
 git push
 git status  # MUST show "up to date with origin"
 ```
@@ -37,7 +42,7 @@ git status  # MUST show "up to date with origin"
 For significant work:
 
 ```bash
-wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..."
+wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..." --no-overlap-check
 # Or pre-structure the same fields in metadata first:
 wv update <id> --metadata='{"decision":"...","pattern":"...","pitfall":"..."}'
 wv done <id>

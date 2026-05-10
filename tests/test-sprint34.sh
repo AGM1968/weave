@@ -46,8 +46,10 @@ setup_test_env() {
     cd "$TEST_DIR"
     # Need git repo for WEAVE_DIR resolution
     git init -q
-    # Disable GPG signing for test repo (global gpgsign=true fails in CI/SSH)
+    # Disable GPG signing and set identity (global config may lack user.email in CI/SSH)
     git config commit.gpgsign false
+    git config user.email "test@weave.local"
+    git config user.name "Weave Test"
 }
 
 # ---------------------------------------------------------------------------
@@ -501,6 +503,47 @@ test_aliases() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Test: duplicate task guards
+# ═══════════════════════════════════════════════════════════════════════════
+
+test_duplicate_task_guards() {
+    echo ""
+    echo "=== duplicate task guards ==="
+
+    setup_test_env
+    $WV init >/dev/null 2>&1
+
+    local first_id
+    first_id=$($WV add "Task: document DISCOVERY_TOOLS constant" 2>/dev/null | tail -1)
+    $WV done "$first_id" --learning="already documented" --no-overlap-check >/dev/null 2>&1
+
+    local dup_add_out
+    dup_add_out=$($WV add "Task: document DISCOVERY_TOOLS constant" 2>&1 || true)
+    assert_contains "$dup_add_out" "Matching completed nodes exist" "dedup: add blocks exact recent done duplicate"
+
+    local add_count
+    add_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE text='Task: document DISCOVERY_TOOLS constant';" 2>/dev/null)
+    assert_equals "1" "$add_count" "dedup: add does not create duplicate node"
+
+    local forced_id
+    forced_id=$($WV add "Task: document DISCOVERY_TOOLS constant" --force 2>/dev/null | tail -1)
+    local forced_count
+    forced_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE text='Task: document DISCOVERY_TOOLS constant';" 2>/dev/null)
+    assert_equals "2" "$forced_count" "dedup: add --force still allows intentional duplicate"
+    $WV done "$forced_id" --learning="forced duplicate for test" --no-overlap-check >/dev/null 2>&1
+
+    local quick_before
+    quick_before=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE text='Task: document DISCOVERY_TOOLS constant';" 2>/dev/null)
+    local quick_out
+    quick_out=$($WV quick "Task: document DISCOVERY_TOOLS constant" 2>&1 || true)
+    assert_contains "$quick_out" "Matching completed nodes exist" "dedup: quick blocks exact recent done duplicate"
+
+    local quick_after
+    quick_after=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE text='Task: document DISCOVERY_TOOLS constant';" 2>/dev/null)
+    assert_equals "$quick_before" "$quick_after" "dedup: quick does not create duplicate node"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Test: Learning quality scoring
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -903,10 +946,10 @@ test_resolve_first_id() {
     id1=$($WV add "Learning test node" --alias=learn-test 2>/dev/null | tail -1)
     $WV done learn-test --learning="pattern: always test your code thoroughly" >/dev/null 2>&1
 
-    # Verify the full learning was captured (not truncated by word splitting)
+    # Verify the learning was captured — "pattern: ..." is parsed into the .pattern field
     local learning
-    learning=$($WV show "$id1" --json 2>&1 | jq -r '.[0].metadata | fromjson | .learning' 2>/dev/null)
-    assert_equals "pattern: always test your code thoroughly" "$learning" "resolve: --learning flag preserved through alias resolution"
+    learning=$($WV show "$id1" --json 2>&1 | jq -r '.[0].metadata | fromjson | .pattern' 2>/dev/null)
+    assert_equals "always test your code thoroughly" "$learning" "resolve: --learning flag preserved through alias resolution"
 
     # Alias with flags after
     local id2
@@ -996,6 +1039,7 @@ main() {
     test_plan
     test_plan_edges
     test_aliases
+    test_duplicate_task_guards
     test_learning_hygiene
     test_health_history
     test_session_summary

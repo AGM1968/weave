@@ -39,6 +39,30 @@ teardown() {
 }
 trap teardown EXIT
 
+echo ""
+echo "═══════════════════════════════════════════════════════════════════════════"
+echo -e "${YELLOW}Delta Prefix Helper Tests${NC}"
+echo "═══════════════════════════════════════════════════════════════════════════"
+echo ""
+
+# Same-timestamp helper calls must stay lexicographically ordered.
+# shellcheck source=/dev/null
+source "$REPO_ROOT/scripts/lib/wv-resolve-runtime.sh"
+date() {
+    echo "1778349970123456789"
+}
+resolve_delta_filename_prefix prefix_a
+resolve_delta_filename_prefix prefix_b
+unset -f date
+unset _WV_DELTA_STAMP_KEY _WV_DELTA_STAMP_SEQ
+
+assert "Delta prefix encodes seconds, nanos, and zero sequence" \
+    '[ "$prefix_a" = "1778349970-123456789-000000" ]' \
+    "1778349970-123456789-000000 (got: $prefix_a)"
+assert "Delta prefix increments sequence within same timestamp" \
+    '[ "$prefix_b" = "1778349970-123456789-000001" ]' \
+    "1778349970-123456789-000001 (got: $prefix_b)"
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Setup: three separate agent environments sharing a git repo
 # ═══════════════════════════════════════════════════════════════════════════
@@ -237,7 +261,48 @@ node_text=$($WV show "$AGENT_A_NODE" --json 2>/dev/null | python3 -c "import sys
 assert "Last-writer-wins: Agent B's text present" '[ "$node_text" = "Agent B wins this" ]' "Agent B wins this (got: $node_text)"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Test 3: Delta replay is idempotent
+# Test 3: Same-second replay order is deterministic
+# ═══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "--- Same-second replay order ---"
+
+SAME_SOURCE_DIR="$TEST_DIR/same-second-source"
+git clone "$BARE_REPO" "$SAME_SOURCE_DIR" -q 2>/dev/null
+_reg_drivers "$SAME_SOURCE_DIR"
+mkdir -p "$SAME_SOURCE_DIR/.weave/deltas"
+init_agent_db "$SAME_SOURCE_DIR"
+
+SAME_LOAD_DIR="$TEST_DIR/same-second-load"
+git clone "$BARE_REPO" "$SAME_LOAD_DIR" -q 2>/dev/null
+_reg_drivers "$SAME_LOAD_DIR"
+mkdir -p "$SAME_LOAD_DIR/.weave/deltas/2026-03-15"
+
+export WV_HOT_ZONE="$SAME_SOURCE_DIR/hot"
+export WV_DB="$SAME_SOURCE_DIR/hot/brain.db"
+export WEAVE_DIR="$SAME_SOURCE_DIR/.weave"
+cd "$SAME_SOURCE_DIR"
+
+$WV add "Same-second base" 2>/dev/null
+SAME_NODE=$($WV list --json 2>/dev/null | python3 -c "import sys,json; nodes=json.load(sys.stdin); print([n['id'] for n in nodes if 'Same-second base' in n['text']][0])")
+gen_delta "$SAME_LOAD_DIR/.weave/deltas/2026-03-15/1778349970-123456789-000000-agentSeq-111.sql"
+
+$WV update "$SAME_NODE" --text="Second sequence wins" 2>/dev/null
+gen_delta "$SAME_LOAD_DIR/.weave/deltas/2026-03-15/1778349970-123456789-000001-agentSeq-111.sql"
+
+init_agent_db "$SAME_LOAD_DIR"
+$WV load 2>/dev/null || true
+same_text=$($WV show "$SAME_NODE" --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['text'])" 2>/dev/null || echo "MISSING")
+
+assert "Same-second replay applies higher sequence last" '[ "$same_text" = "Second sequence wins" ]' "Second sequence wins (got: $same_text)"
+
+# Restore observer env for the remaining tests in this suite.
+export WV_HOT_ZONE="$OBSERVER_DIR/hot"
+export WV_DB="$OBSERVER_DIR/hot/brain.db"
+export WEAVE_DIR="$OBSERVER_DIR/.weave"
+cd "$OBSERVER_DIR"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Test 4: Delta replay is idempotent
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "--- Idempotent replay ---"
@@ -249,7 +314,7 @@ node_count_after=$($WV list --all --json 2>/dev/null | python3 -c "import sys,js
 assert "Idempotent: node count unchanged after re-load" '[ "$node_count_before" = "$node_count_after" ]' "$node_count_before = $node_count_after"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Test 4: Agent ID in delta filenames
+# Test 5: Agent ID in delta filenames
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "--- Agent ID in filenames ---"
@@ -261,7 +326,7 @@ assert "Agent A deltas have agentA suffix" '[ "$a_deltas" -gt 0 ]' "at least 1 a
 assert "Agent B deltas have agentB suffix" '[ "$b_deltas" -gt 0 ]' "at least 1 agentB delta"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Test 5: Corrupt delta skipped with warning
+# Test 6: Corrupt delta skipped with warning
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "--- Corrupt delta handling ---"
@@ -275,7 +340,7 @@ assert "Corrupt delta produces warning" 'echo "$corrupt_output" | grep -q "Skipp
 rm -f "$OBSERVER_DIR/.weave/deltas/2026-03-15/9999999999-corrupt.sql"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Test 6: Delta load is idempotent — second load produces same node count
+# Test 7: Delta load is idempotent — second load produces same node count
 # Note: as of v1.20.0 the manifest is written for observability only; all deltas
 # are always replayed (full replay is idempotent by design, so the Replayed message
 # is expected on every load that finds delta files).
@@ -298,7 +363,7 @@ second_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes;" 2>/dev/null || ech
 assert "Second load is idempotent (node count unchanged)" '[ "$first_count" = "$second_count" ]' "node count: first=$first_count second=$second_count"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Test 7: Prune produces zero DELETE statements in delta files
+# Test 8: Prune produces zero DELETE statements in delta files
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "--- Prune delta isolation ---"

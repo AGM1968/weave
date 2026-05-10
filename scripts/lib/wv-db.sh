@@ -8,6 +8,20 @@
 # Database Initialization
 # ═══════════════════════════════════════════════════════════════════════════
 
+db_stamp_repo_owner() {
+    [ -n "${REPO_ROOT:-}" ] || return 0
+    [ -n "${WV_HOT_ZONE:-}" ] || return 0
+
+    local owner_file canonical_repo_root
+    owner_file=$(resolve_hot_zone_owner_file "$WV_HOT_ZONE")
+    [ -n "$owner_file" ] || return 0
+
+    canonical_repo_root=$(canonicalize_runtime_path "$REPO_ROOT")
+    mkdir -p "$WV_HOT_ZONE" 2>/dev/null || true
+    printf '%s\n' "$canonical_repo_root" > "$owner_file" 2>/dev/null || true
+    chmod 600 "$owner_file" 2>/dev/null || true
+}
+
 db_init() {
     # Security: hot zone may be under /dev/shm or /tmp (shared-mount parents).
     # Create 700/600 so other local users cannot read the graph. `umask 077`
@@ -102,7 +116,7 @@ CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
     VALUES (new.rowid, new.id, new.text, new.metadata);
 END;
 
--- node_files: files touched by a node (populated by wv work/done via git diff)
+-- node_files: repo-relative files attributed by the touched-files hook.
 CREATE TABLE IF NOT EXISTS node_files (
     node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     path    TEXT NOT NULL,
@@ -127,23 +141,83 @@ CREATE TABLE IF NOT EXISTS policy_thresholds (
 
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max', 15);
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('gini_max', 0.85);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('trend_deteriorating', 0);
+
+-- file_trend: per-file trend direction, refreshed by wv done from quality.db.
+-- Values: 'deteriorating' | 'stable' | 'refactored'. Consumed by wv-67a870 soft
+-- warning and wv-44cbc5 hard gate; stored here so the trigger can query it.
+CREATE TABLE IF NOT EXISTS file_trend (
+    path      TEXT PRIMARY KEY,
+    direction TEXT NOT NULL DEFAULT 'stable'
+);
+
+-- chunks: file content slices with embeddings for semantic search.
+-- embedding is a raw float32 BLOB (N * 4 bytes); NULL until wv index runs.
+CREATE TABLE IF NOT EXISTS chunks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    file       TEXT    NOT NULL,
+    line_start INTEGER NOT NULL,
+    line_end   INTEGER NOT NULL,
+    content    TEXT    NOT NULL,
+    embedding  BLOB,
+    indexed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file);
+
+-- FTS5 over chunk content enables BM25 keyword fallback when no embedding.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    content,
+    file UNINDEXED,
+    line_start UNINDEXED,
+    line_end UNINDEXED,
+    content=chunks,
+    content_rowid=id
+);
+
+-- Trigger: keep chunks_fts in sync on insert
+CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, content, file, line_start, line_end)
+    VALUES (new.id, new.content, new.file, new.line_start, new.line_end);
+END;
+
+-- Trigger: keep chunks_fts in sync on delete
+CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, content, file, line_start, line_end)
+    VALUES ('delete', old.id, old.content, old.file, old.line_start, old.line_end);
+END;
+
+-- Trigger: keep chunks_fts in sync on update
+CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, content, file, line_start, line_end)
+    VALUES ('delete', old.id, old.content, old.file, old.line_start, old.line_end);
+    INSERT INTO chunks_fts(rowid, content, file, line_start, line_end)
+    VALUES (new.id, new.content, new.file, new.line_start, new.line_end);
+END;
 
 -- Trigger: gate active→done transitions on file quality metrics.
 -- Fires BEFORE the UPDATE so the FTS AFTER UPDATE trigger never sees a
--- violating state. The WHEN clause checks node_files → file_metrics; RAISE
--- uses a literal message (SQLite RAISE does not accept expressions) parseable
--- by WvClient as a GraphPolicyViolation.
+-- violating state. RAISE(ABORT, ...) requires a string literal — structured
+-- JSON payload is built by cmd_done after catch.
 CREATE TRIGGER IF NOT EXISTS nodes_policy_check
 BEFORE UPDATE OF status ON nodes
 WHEN NEW.status = 'done' AND OLD.status = 'active'
-  AND EXISTS (
-    SELECT 1 FROM node_files nf
-    JOIN file_metrics fm ON fm.path = nf.path
-    WHERE nf.node_id = NEW.id
-      AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
-  )
 BEGIN
-    SELECT RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded');
+        SELECT CASE
+                WHEN EXISTS (
+                        SELECT 1 FROM node_files nf
+                        JOIN file_metrics fm ON fm.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
+                ) THEN RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded')
+                WHEN EXISTS (
+                        SELECT 1 FROM node_files nf
+                        JOIN file_trend ft ON ft.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND ft.direction = 'deteriorating'
+                            AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
+                ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
+        END;
 END;
 EOF
     # Tighten perms on the DB file in case it predates the umask change.
@@ -296,26 +370,90 @@ CREATE TABLE IF NOT EXISTS policy_thresholds (
 
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max', 15);
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('gini_max', 0.85);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('trend_deteriorating', 0);
+
+CREATE TABLE IF NOT EXISTS file_metrics (
+    path       TEXT PRIMARY KEY,
+    mccabe_max INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS file_trend (
+    path      TEXT PRIMARY KEY,
+    direction TEXT NOT NULL DEFAULT 'stable'
+);
 
 CREATE TRIGGER IF NOT EXISTS nodes_policy_check
 BEFORE UPDATE OF status ON nodes
 WHEN NEW.status = 'done' AND OLD.status = 'active'
 BEGIN
-    SELECT RAISE(ABORT, json_object(
-        'error', 'GraphPolicyViolation',
-        'node_id', NEW.id,
-        'threshold', 'mccabe_max',
-        'limit', (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max'),
-        'actual', fm.mccabe_max,
-        'path', nf.path
-    ))
-    FROM node_files nf
-    JOIN file_metrics fm ON fm.path = nf.path
-    WHERE nf.node_id = NEW.id
-      AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
-    LIMIT 1;
+        SELECT CASE
+                WHEN EXISTS (
+                        SELECT 1 FROM node_files nf
+                        JOIN file_metrics fm ON fm.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
+                ) THEN RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded')
+                WHEN EXISTS (
+                        SELECT 1 FROM node_files nf
+                        JOIN file_trend ft ON ft.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND ft.direction = 'deteriorating'
+                            AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
+                ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
+        END;
 END;
 MIGRATE
+}
+
+# Migrate to add chunks table + FTS5 + sync triggers for semantic search.
+# Safe to run repeatedly — CREATE IF NOT EXISTS throughout.
+db_migrate_chunks() {
+    local fts5_available
+    fts5_available=$(sqlite3 "$WV_DB" "SELECT sqlite_compileoption_used('ENABLE_FTS5');" 2>/dev/null || echo "0")
+
+    sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
+CREATE TABLE IF NOT EXISTS chunks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    file       TEXT    NOT NULL,
+    line_start INTEGER NOT NULL,
+    line_end   INTEGER NOT NULL,
+    content    TEXT    NOT NULL,
+    embedding  BLOB,
+    indexed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file);
+MIGRATE
+
+    if [ "$fts5_available" = "1" ]; then
+        sqlite3 "$WV_DB" <<'MIGRATE_FTS' 2>/dev/null || true
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    content,
+    file UNINDEXED,
+    line_start UNINDEXED,
+    line_end UNINDEXED,
+    content=chunks,
+    content_rowid=id
+);
+
+CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, content, file, line_start, line_end)
+    VALUES (new.id, new.content, new.file, new.line_start, new.line_end);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, content, file, line_start, line_end)
+    VALUES ('delete', old.id, old.content, old.file, old.line_start, old.line_end);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, content, file, line_start, line_end)
+    VALUES ('delete', old.id, old.content, old.file, old.line_start, old.line_end);
+    INSERT INTO chunks_fts(rowid, content, file, line_start, line_end)
+    VALUES (new.id, new.content, new.file, new.line_start, new.line_end);
+END;
+MIGRATE_FTS
+    fi
 }
 
 # Rebuild FTS5 index from existing nodes (for migration or repair)
@@ -427,8 +565,11 @@ db_ensure() {
         fi
     fi
 
+    db_stamp_repo_owner
+
     db_migrate_edge_type_enum
     db_migrate_policy_tables
+    db_migrate_chunks
 
     # Check DB size once per invocation — auto-prune if over limit
     # WV_DISABLE_AUTOPRUNE=1 skips this (used during sync to prevent mid-sync data loss)

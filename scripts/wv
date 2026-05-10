@@ -63,6 +63,7 @@ source "$WV_LIB_DIR/cmd/wv-cmd-ops.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-quality.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-findings.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-analyze.sh"
+source "$WV_LIB_DIR/cmd/wv-cmd-indexer.sh"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Dispatcher
@@ -194,6 +195,7 @@ _wv_dispatch() {
         quality)         cmd_quality "$@" ;;
         findings)        cmd_findings "$@" ;;
         analyze)         cmd_analyze "$@" ;;
+        index)           cmd_index "$@" ;;
         help|--help|-h)  cmd_help "$@" ;;
         version|--version|-v) echo "wv $WV_VERSION" ;;
         

@@ -259,15 +259,15 @@ assert_contains "$OUTPUT" "No orphaned active nodes" "recover --session clean wh
 
 # Test: Active nodes listed
 setup_test_env
-"$WV" add "Task alpha" --status=active >/dev/null 2>&1
+"$WV" add "Task alpha" --status=active --criteria="recover session fixture" --risks=low >/dev/null 2>&1
 OUTPUT=$("$WV" recover --session 2>/dev/null)
 assert_contains "$OUTPUT" "Task alpha" "recover --session lists active node text"
 assert_contains "$OUTPUT" "1 node" "recover --session shows count"
 
 # Test: Multiple active nodes listed
 setup_test_env
-"$WV" add "Task alpha" --status=active >/dev/null 2>&1
-"$WV" add "Task beta" --status=active >/dev/null 2>&1
+"$WV" add "Task alpha" --status=active --criteria="recover session fixture" --risks=low >/dev/null 2>&1
+"$WV" add "Task beta" --status=active --criteria="recover session fixture" --risks=low >/dev/null 2>&1
 OUTPUT=$("$WV" recover --session 2>/dev/null)
 assert_contains "$OUTPUT" "2 node" "recover --session shows 2 nodes"
 assert_contains "$OUTPUT" "Task alpha" "recover --session lists first node"
@@ -275,7 +275,7 @@ assert_contains "$OUTPUT" "Task beta" "recover --session lists second node"
 
 # Test: --json output
 setup_test_env
-"$WV" add "JSON test task" --status=active >/dev/null 2>&1
+"$WV" add "JSON test task" --status=active --criteria="recover session fixture" --risks=low >/dev/null 2>&1
 OUTPUT=$("$WV" recover --session --json 2>/dev/null)
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$OUTPUT" | jq empty 2>/dev/null; then
@@ -299,14 +299,14 @@ assert_equals "clean" "$STATUS" "recover --session --json clean when no active n
 
 # Test: --auto reclaims nodes
 setup_test_env
-"$WV" add "Auto reclaim task" --status=active >/dev/null 2>&1
+"$WV" add "Auto reclaim task" --status=active --criteria="recover session fixture" --risks=low >/dev/null 2>&1
 OUTPUT=$("$WV" recover --session --auto 2>/dev/null)
 assert_contains "$OUTPUT" "Auto-reclaiming" "recover --session --auto reclaims"
 
 # Test: todo nodes not listed (only active)
 setup_test_env
 "$WV" add "Todo task" >/dev/null 2>&1
-"$WV" add "Active task" --status=active >/dev/null 2>&1
+"$WV" add "Active task" --status=active --criteria="recover session fixture" --risks=low >/dev/null 2>&1
 OUTPUT=$("$WV" recover --session 2>/dev/null)
 assert_contains "$OUTPUT" "Active task" "recover --session shows active"
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -320,7 +320,7 @@ fi
 
 # Test: done nodes not listed
 setup_test_env
-ID=$("$WV" add "Done task" --status=active 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+ID=$("$WV" add "Done task" --status=active --criteria="recover session fixture" --risks=low 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
 "$WV" done "$ID" --skip-verification 2>/dev/null || true
 OUTPUT=$("$WV" recover --session 2>/dev/null)
 assert_contains "$OUTPUT" "No orphaned active nodes" "recover --session excludes done nodes"
@@ -334,7 +334,7 @@ echo "═══ Reboot Recovery (Secondary Detection) ═══"
 
 # Test: Active nodes + no sentinel triggers soft warning
 setup_test_env
-"$WV" add "Orphaned from reboot" --status=active >/dev/null 2>&1
+"$WV" add "Orphaned from reboot" --status=active --criteria="recover session fixture" --risks=low >/dev/null 2>&1
 rm -f "$SENTINEL"  # Simulate reboot (sentinel lost from tmpfs)
 OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 # Output is JSON-wrapped in hookSpecificOutput.additionalContext — extract it
@@ -372,7 +372,7 @@ echo "═══ Crash Benchmark (5 Criteria) ═══"
 setup_test_env
 
 # Phase 1: "First session" — create work and write sentinel
-"$WV" add "Benchmark task A" --status=active >/dev/null 2>&1
+"$WV" add "Benchmark task A" --status=active --criteria="recover session fixture" --risks=low >/dev/null 2>&1
 NODE_A=$("$WV" list --status=active --json 2>/dev/null | jq -r '.[0].id')
 echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" >/dev/null 2>&1 || true
 

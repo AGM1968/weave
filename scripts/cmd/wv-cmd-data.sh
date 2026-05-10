@@ -136,17 +136,17 @@ auto_sync() {
 
     # Emit delta changeset before the full dump. The changeset captures exactly
     # what changed since the last wv_delta_reset, in causal order (by _warp_changes.id).
-    # Stored as .weave/deltas/<YYYY-MM-DD>/<epoch>-<agent_id>.sql — one file per sync
-    # cycle per agent. Day-subdirectory prevents single-dir inode bloat over time.
-    # These files are committed to git and replayed by other agents on wv load
-    # (multi-agent merge). Empty files (no-op cycles) are removed immediately.
+    # Stored as .weave/deltas/<YYYY-MM-DD>/<epoch>-<subsec>-<seq>-<agent_id>-<pid>.sql.
+    # The first field stays epoch-seconds for prune compatibility; fixed-width
+    # subsecond and sequence fields make same-second emissions replay deterministically.
+    # Day-subdirectory prevents single-dir inode bloat over time. These files are
+    # committed to git and replayed by other agents on wv load (multi-agent merge).
+    # Empty files (no-op cycles) are removed immediately.
     local delta_dir="$WEAVE_DIR/deltas/$(date +%Y-%m-%d)"
     mkdir -p "$delta_dir"
-    # Include PID + random to guarantee uniqueness within the same second on
-    # the same host — two concurrent agents with the same epoch and agent_id
-    # would otherwise overwrite each other's delta file.
-    local _rand=$(( RANDOM % 9999 ))
-    local delta_file="$delta_dir/${now}-${agent_id}-$$-${_rand}.sql"
+    local delta_prefix
+    resolve_delta_filename_prefix delta_prefix
+    local delta_file="$delta_dir/${delta_prefix}-${agent_id}-$$.sql"
     wv_delta_changeset "$WV_DB" > "$delta_file" 2>/dev/null || true
     [ -s "$delta_file" ] || rm -f "$delta_file"
 
@@ -453,6 +453,23 @@ cmd_sync() {
     [ "$gh_sync" != true ] && [ "${WV_GH_SYNC:-0}" != "1" ] && _sync_commit_step=2
     [ "$_sync_journaled" = true ] && journal_step "$_sync_commit_step" "git_commit"
 
+    # Some higher-level operations (notably D3/H3 ship) only want sync to
+    # disk, not an additional local .weave commit. Keep standalone wv sync
+    # behavior unchanged unless the caller opts out explicitly.
+    if [ "${_WV_SKIP_SYNC_COMMIT:-0}" = "1" ]; then
+        [ "$_sync_journaled" = true ] && journal_complete "$_sync_commit_step"
+        if [ "$_sync_journaled" = true ]; then
+            trap - EXIT
+            journal_end
+            journal_clean
+        fi
+        if [ "$format" = "json" ]; then
+            jq -n --arg path "$WEAVE_DIR" --argjson gh "$gh_sync" \
+                '{"ok": true, "synced_to": $path, "gh_synced": $gh}'
+        fi
+        return 0
+    fi
+
     # Uses --no-verify to bypass pre-commit hook (no active node needed for .weave/-only commits).
     # Only commits if .weave/ is still dirty after auto_checkpoint (e.g., GH sync changed state).
     # Throttled: skip if auto_checkpoint already committed recently (prevents double-commit).
@@ -634,10 +651,11 @@ EOF
         # wv_delta_changeset on a previous sync cycle (by this or another agent).
         # Replaying them brings the DB forward to the union of all agents' changes.
         #
-        # Ordering: files are sorted by filename (<epoch>-<agent>.sql), which
-        # sorts by Unix timestamp — causal order within each agent, approximate
-        # causal order across agents (clock skew is acceptable; last-writer-wins
-        # semantics handle conflicts at the row level).
+        # Ordering: files are sorted by filename. The prefix format is
+        # <epoch>-<subsec>-<seq>-..., so lexical sort preserves epoch-seconds,
+        # then subsecond order, then per-process same-timestamp emission order.
+        # This gives deterministic same-second replay while keeping the first
+        # field compatible with the prune-epoch filter below.
         #
         # FK OFF during replay: a delta from agent B may INSERT an edge that
         # references a node only present in a later-sorted delta from agent A.
@@ -2023,7 +2041,37 @@ _build_fts_expr() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# cmd_search — Full-text search nodes using FTS5
+# _wv_search_python — Invoke the weave_search Python module (hybrid code search)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_wv_search_python() {
+    local _wv_pypath="${WV_LIB_DIR:-$SCRIPT_DIR}"
+    if [ ! -d "$_wv_pypath/weave_search" ]; then
+        local _wv_real
+        _wv_real=$(readlink -f "$_wv_pypath/lib/wv-config.sh" 2>/dev/null || echo "")
+        if [ -n "$_wv_real" ]; then
+            _wv_pypath=$(dirname "$(dirname "$_wv_real")")
+        fi
+    fi
+
+    local _wv_python3=python3
+    local _scripts_parent
+    _scripts_parent=$(dirname "$_wv_pypath")
+    if [ -x "$_scripts_parent/.venv/bin/python3" ]; then
+        _wv_python3="$_scripts_parent/.venv/bin/python3"
+    elif [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -x "${CLAUDE_PROJECT_DIR}/.venv/bin/python3" ]; then
+        _wv_python3="${CLAUDE_PROJECT_DIR}/.venv/bin/python3"
+    elif [ -n "${CONDA_PREFIX:-}" ] || [ -n "${CONDA_DEFAULT_ENV:-}" ]; then
+        if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
+            [ -x /usr/bin/python3 ] && _wv_python3=/usr/bin/python3
+        fi
+    fi
+
+    PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_search "$@"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_search — Full-text search nodes using FTS5; --code for chunk/code search
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_search() {
@@ -2031,20 +2079,51 @@ cmd_search() {
     local limit=10
     local format="text"
     local status_filter=""
-    
+    local code_search=0
+    local extra_args=()
+
     while [ $# -gt 0 ]; do
         case "$1" in
-            --limit=*) limit="${1#*=}" ;;
-            --json) format="json" ;;
+            --code) code_search=1 ;;
+            --limit=*) limit="${1#*=}"; extra_args+=("$1") ;;
+            --json) format="json"; extra_args+=("--json") ;;
             --status=*) status_filter="${1#*=}" ;;
+            --mode=*|--model=*|--graph|--quality-db=*) extra_args+=("$1") ;;
+            --help|-h)
+                echo "Usage: wv search <query> [--limit=N] [--json] [--status=STATUS]"
+                echo "       wv search --code <query> [--limit=N] [--json] [--mode=hybrid|fts|vector] [--graph]"
+                echo ""
+                echo "  Without --code: searches Weave graph nodes (FTS5 BM25)"
+                echo "  With --code:    searches indexed code chunks (RRF hybrid BM25+cosine)"
+                echo "  --graph:        attach active Weave nodes + quality churn to results"
+                return 0
+                ;;
             -*) echo "Unknown option: $1" >&2; return 1 ;;
             *) query="$query $1" ;;
         esac
         shift
     done
-    
+
     query="${query# }"  # trim leading space
-    
+
+    if [ -z "$query" ]; then
+        echo "Usage: wv search <query> [--limit=N] [--json] [--status=STATUS]" >&2
+        echo "       wv search --code <query> [--limit=N] [--mode=hybrid|fts|vector]" >&2
+        return 1
+    fi
+
+    # Route --code to the Python hybrid search module
+    if [ "$code_search" = "1" ]; then
+        # Custom WV_DB overrides may point at a minimal or foreign SQLite file.
+        # Skip graph migrations in that case so code search stays read-only.
+        if [ -z "$WV_DB_CUSTOM" ]; then
+            db_ensure
+        fi
+        WV_HOT_ZONE="${WV_HOT_ZONE:-}" _wv_search_python "$query" \
+            --db="${WV_DB}" --limit="$limit" "${extra_args[@]+"${extra_args[@]}"}"
+        return $?
+    fi
+
     if [ -z "$query" ]; then
         echo "Usage: wv search <query> [--limit=N] [--json] [--status=STATUS]" >&2
         return 1
@@ -2130,7 +2209,7 @@ cmd_search() {
                 *) status_color="○" ;;
             esac
             
-            printf "%2d. %s %s %s\n" "$i" "$status_color" "${CYAN}$id${NC}" "$display_text"
+            printf "%2d. %b %b %s\n" "$i" "$status_color" "${CYAN}$id${NC}" "$display_text"
             i=$((i + 1))
         done <<< "$results"
     fi

@@ -11,6 +11,7 @@ git status && wv status   # check for uncommitted work + active node count
 If `wv status` shows 0 active nodes, claim one before touching files:
 
 ```bash
+wv search "<topic>"        # check for existing related work before claiming/creating
 wv ready                  # list unblocked work
 wv work <id>              # claim it
 ```
@@ -39,11 +40,12 @@ git push                                                 # 4c. MANDATORY
 # Trivial one-file work (no open GH issue needed):
 wv quick "<description>" --learning="..."
 
-# Done + sync + push in one step:
+# Done + sync in one step (check `wv status` for pending Git sync):
 wv ship <id> --learning="..." --no-overlap-check
 
-# Create a standalone node without a parent (explicit orphan intent):
+# Create a standalone node without a parent (persists intentional standalone metadata):
 wv add "<description>" --standalone
+# `wv health` reports these as intentional_standalones, not orphan_nodes.
 ```
 
 ## Code quality — run before every commit
@@ -77,6 +79,17 @@ Structured learnings are more useful for future sessions:
 
 For non-interactive agent flows, prefer `--no-overlap-check` on `wv done`/`wv ship` once
 verification and learnings are ready.
+
+## Code search
+
+If `wv index` has been run, use hybrid code search instead of file browsing:
+
+```bash
+wv search --code "query"             # hybrid BM25 + cosine (CLI)
+wv search --code "query" --mode=fts  # exact tokens / function names
+```
+
+MCP equivalent: `weave_code_search` (parameters: `query`, `mode`, `limit`, `graph`).
 
 ## Reference
 

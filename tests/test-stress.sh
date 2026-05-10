@@ -1018,7 +1018,12 @@ test_add_status_validation() {
     # Valid statuses still work.
     for valid_status in todo active done blocked blocked-external; do
         local v_exit=0
-        "$WV" add "m1 valid $valid_status" --status="$valid_status" >/dev/null 2>&1 || v_exit=$?
+        if [ "$valid_status" = "active" ]; then
+            "$WV" add "m1 valid $valid_status" --status="$valid_status" \
+                --criteria="stress fixture active add" --risks=low >/dev/null 2>&1 || v_exit=$?
+        else
+            "$WV" add "m1 valid $valid_status" --status="$valid_status" >/dev/null 2>&1 || v_exit=$?
+        fi
         assert_equals "0" "$v_exit" "wv add accepts status=$valid_status" || true
     done
 

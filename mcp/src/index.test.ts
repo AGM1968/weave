@@ -37,9 +37,10 @@ class MCPTestClient {
     { resolve: (v: JsonRpcResponse) => void; reject: (e: Error) => void; timeout: NodeJS.Timeout }
   > = new Map();
 
-  constructor(extraArgs: string[] = [], extraEnv: NodeJS.ProcessEnv = {}) {
+  constructor(extraArgs: string[] = [], extraEnv: NodeJS.ProcessEnv = {}, cwd?: string) {
     this.server = spawn("node", [SERVER_PATH, ...extraArgs], {
       stdio: ["pipe", "pipe", "pipe"],
+      cwd,
       env: {
         ...process.env,
         WV_PATH: resolve(__dirname, "../../scripts/wv"),
@@ -182,6 +183,62 @@ function deleteNodeDirect(id: string): void {
       WV_AGENT: "1",
     },
   });
+}
+
+function createCodeSearchFixtureDb(): { dbPath: string; hotZone: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "weave-mcp-search-"));
+  const dbPath = join(dir, "brain.db");
+  spawnSync("sqlite3", [dbPath, "CREATE TABLE chunks (id INTEGER PRIMARY KEY); CREATE TABLE node_files (node_id TEXT, path TEXT);"] , {
+    stdio: "ignore",
+  });
+  return {
+    dbPath,
+    hotZone: dir,
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+function createActiveNodeDirectWithEnv(text: string, extraEnv: NodeJS.ProcessEnv): string {
+  const result = spawnSync(
+    resolve(__dirname, "../../scripts/wv"),
+    ["add", text, "--status=active", "--standalone", "--criteria=guard ok", "--risks=low"],
+    {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        ...extraEnv,
+        NO_COLOR: "1",
+        WV_AGENT: "1",
+      },
+    },
+  );
+
+  if (result.status !== 0) {
+    throw new Error(result.stderr?.trim() || result.stdout?.trim() || "failed to create active node");
+  }
+
+  return extractNodeId(`${result.stdout || ""}\n${result.stderr || ""}`);
+}
+
+function createActiveNodeDirect(text: string): string {
+  const result = spawnSync(
+    resolve(__dirname, "../../scripts/wv"),
+    ["add", text, "--status=active", "--standalone", "--criteria=guard ok", "--risks=low"],
+    {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        NO_COLOR: "1",
+        WV_AGENT: "1",
+      },
+    },
+  );
+
+  if (result.status !== 0) {
+    throw new Error(result.stderr?.trim() || result.stdout?.trim() || "failed to create active node");
+  }
+
+  return extractNodeId(`${result.stdout || ""}\n${result.stderr || ""}`);
 }
 
 describe("Weave MCP Server", () => {
@@ -601,6 +658,66 @@ describe("Weave MCP Server", () => {
       expect(result.content).toBeDefined();
     });
 
+    it("weave_code_search reports readiness when chunks or graph context are missing", async () => {
+      const fixture = createCodeSearchFixtureDb();
+      const searchClient = new MCPTestClient([], { WV_DB: fixture.dbPath, WV_HOT_ZONE: fixture.hotZone });
+
+      try {
+        const response = await searchClient.request("tools/call", {
+          name: "weave_code_search",
+          arguments: { query: "nosuchterm", mode: "fts", graph: true },
+        });
+
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as {
+          results: unknown[];
+          readiness: {
+            chunks: { ready: boolean; status: string };
+            node_files: { ready: boolean; status: string };
+            quality_db: { ready: boolean; status: string };
+          };
+        };
+
+        expect(Array.isArray(payload.results)).toBe(true);
+        expect(payload.results).toHaveLength(0);
+        expect(payload.readiness.chunks.ready).toBe(false);
+        expect(payload.readiness.chunks.status).toBe("empty");
+        expect(payload.readiness.node_files.ready).toBe(false);
+        expect(payload.readiness.quality_db.ready).toBe(false);
+      } finally {
+        await searchClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_preflight blocks policy-sensitive nodes when quality prerequisites are missing", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "weave-mcp-preflight-"));
+      const dbPath = join(dir, "brain.db");
+      const env = { WV_DB: dbPath, WV_HOT_ZONE: dir };
+      const nodeId = createActiveNodeDirectWithEnv("test-policy-preflight", env);
+      const preflightClient = new MCPTestClient([], env);
+
+      spawnSync("sqlite3", [dbPath, `INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('${nodeId}', 'src/policy.py');`], {
+        stdio: "ignore",
+      });
+
+      try {
+        const response = await preflightClient.request("tools/call", {
+          name: "weave_preflight",
+          arguments: { id: nodeId },
+        });
+
+        const result = response.result as { content: { text: string }[]; isError?: boolean };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("not policy-ready");
+        expect(result.content[0].text).toContain("wv quality scan");
+      } finally {
+        await preflightClient.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it("weave_edit_guard should return content", async () => {
       const response = await client.request("tools/call", {
         name: "weave_edit_guard",
@@ -615,6 +732,32 @@ describe("Weave MCP Server", () => {
       expect(result.content[0].text).toBeDefined();
       // With an active node (from the test env), should return OK or error — either is valid
       // The key is it doesn't crash and returns structured output
+    });
+
+    it("weave_edit_guard honors WV_PROJECT_ROOT outside repo cwd", async () => {
+      const nodeId = createActiveNodeDirect("test-edit-guard-project-root");
+      createdNodeIds.push(nodeId);
+
+      const outsideRepoCwd = mkdtempSync(join(tmpdir(), "weave-mcp-cwd-"));
+      const rootAwareClient = new MCPTestClient([], { WV_PROJECT_ROOT: resolve(__dirname, "../..") }, outsideRepoCwd);
+
+      try {
+        const response = await rootAwareClient.request("tools/call", {
+          name: "weave_edit_guard",
+          arguments: {},
+        });
+
+        const result = response.result as {
+          content: { text: string }[];
+          isError?: boolean;
+        };
+
+        expect(result.isError).not.toBe(true);
+        expect(result.content[0].text).toContain("OK");
+      } finally {
+        await rootAwareClient.close();
+        rmSync(outsideRepoCwd, { recursive: true, force: true });
+      }
     });
 
     it("forwards --json-v2 for show and list", async () => {

@@ -148,6 +148,7 @@ assert_file_exists "$REPO/.claude/settings.json"            "creates .claude/set
 assert_file_exists "$REPO/CLAUDE.md"                        "copies CLAUDE.md from template"
 assert_file_exists "$REPO/.claude/settings.local.json"      "creates settings.local.json"
 assert_file_exists "$REPO/.weave/runtime.md"                "creates .weave/runtime.md scaffold"
+assert_contains "$(cat "$REPO/.gitignore")" ".weave/.context_policy" "adds .weave/.context_policy to .gitignore"
 assert_contains "$OUTPUT" "Weave"                           "output mentions Weave"
 
 # --- settings.json content: no hooks key ---
@@ -200,14 +201,15 @@ assert_file_exists "$REPO3/.weave/runtime.md"               "copilot: creates .w
 # Verify mcp.json points to MCP server and uses VS Code 'servers' key (not 'mcpServers')
 MCP_JSON=$(cat "$REPO3/.mcp.json")
 assert_contains "$MCP_JSON" '"weave"'                       "copilot: mcp.json has weave server"
+assert_contains "$MCP_JSON" '"weave-session"'               "copilot: mcp.json has weave-session server"
+assert_contains "$MCP_JSON" '"weave-lite"'                  "copilot: mcp.json has weave-lite server"
 assert_contains "$MCP_JSON" '"weave-inspect"'               "copilot: mcp.json has weave-inspect server"
 assert_not_contains "$MCP_JSON" '"weave-graph"'             "copilot: mcp.json does not ship weave-graph"
-assert_not_contains "$MCP_JSON" '"weave-session"'           "copilot: mcp.json does not ship weave-session"
 assert_contains "$MCP_JSON" 'index.js'                      "copilot: mcp.json points to index.js"
 assert_not_contains "$MCP_JSON" '"mcpServers"'              "copilot: mcp.json uses 'servers' not 'mcpServers'"
 assert_not_contains "$MCP_JSON" '"inputs"'                  "copilot: mcp.json has no 'inputs' key"
 SERVER_COUNT=$(jq '.servers | keys | length' "$REPO3/.mcp.json")
-assert_equals "2" "$SERVER_COUNT"                           "copilot: mcp.json ships exactly two servers"
+assert_equals "4" "$SERVER_COUNT"                           "copilot: mcp.json ships exactly four servers"
 
 # Verify ghost setting is NOT written
 if [ -f "$REPO3/.vscode/settings.json" ]; then

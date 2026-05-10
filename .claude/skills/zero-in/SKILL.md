@@ -56,7 +56,25 @@ HOW MANY results are useful?
 
 Use tools in order of specificity:
 
-**1. Grep first** (most targeted)
+**1. Code search first** (semantic + keyword, returns ranked chunks)
+
+```bash
+# Hybrid: natural language or code terms
+wv search --code "JWT token validation" 
+
+# FTS only: exact function names, flags, tokens
+wv search --code "validateJWT" --mode=fts
+
+# With Weave node context: see what work already touches these files
+wv search --code "authentication middleware" --graph
+```
+
+MCP equivalent: `weave_code_search` with `query`, optional `mode`, `graph`.
+
+> Run `wv index` once before using. Results include file, line range, and snippet — read only
+> the specific lines returned, not whole files.
+
+**2. Grep if code search misses** (exact pattern, unindexed files)
 
 ```bash
 # Find specific pattern
@@ -66,18 +84,18 @@ grep "validateJWT" --output_mode=files_with_matches
 grep "handleLogin" --type=ts
 ```
 
-**2. Glob if needed** (structure search)
+**3. Glob if needed** (structure search)
 
 ```bash
 # Find files by name pattern
 glob "**/auth/**/*.ts"
 ```
 
-**3. Read strategically** (limited files)
+**4. Read strategically** (limited files, specific lines from search results)
 
 ```bash
-# Read only what's needed
-read src/auth/validate.ts --limit=100
+# Read only the lines code search returned
+read src/auth/validate.ts --offset=40 --limit=20
 ```
 
 **Set boundaries:**

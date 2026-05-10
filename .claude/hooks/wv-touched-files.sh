@@ -10,14 +10,15 @@
 # Sprint B1 from PROPOSAL-wv-active-counterweight (relevance signal in the
 # in-source layer; the runtime tracked similar via session edit history).
 
-set -e
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+source "$WV_PROJECT_DIR/scripts/lib/wv-resolve-runtime.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-runtime.sh" || exit 0
 
 INPUT=$(cat)
 TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
-case "$TOOL" in
-    Edit|Write|NotebookEdit) ;;
-    *) exit 0 ;;
-esac
+is_attribution_tool "$TOOL" || exit 0
 
 # Skip on tool failure. jq's `// true` collapses explicit false → true (boolean
 # alternative semantics), so check explicit equality instead.
@@ -29,16 +30,15 @@ FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.filePath
 [ -z "$FILE_PATH" ] && exit 0
 
 # Normalize to repo-relative path when possible (stable comparison key).
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+REPO_ROOT="${WV_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 REL_PATH="$FILE_PATH"
 case "$FILE_PATH" in
     "$REPO_ROOT"/*) REL_PATH="${FILE_PATH#$REPO_ROOT/}" ;;
 esac
 
 # Per-repo session ring on tmpfs (matches budget-tally hot-zone naming).
-REPO_HASH=$(echo "$REPO_ROOT" | md5sum 2>/dev/null | cut -c1-8 || echo "default")
-[[ -z "$REPO_HASH" ]] && REPO_HASH="default"
-RING_DIR="${WV_TOUCHED_DIR:-/dev/shm/weave/${REPO_HASH}}"
+_TF_HOT_ZONE=$(resolve_repo_hot_zone "" "$REPO_ROOT")
+RING_DIR="${WV_TOUCHED_DIR:-$_TF_HOT_ZONE}"
 RING_FILE="${RING_DIR}/recent-edits.txt"
 mkdir -p "$RING_DIR" 2>/dev/null || exit 0
 
@@ -52,13 +52,13 @@ RING_CAP="${WV_TOUCHED_RING_CAP:-20}"
 } | tail -n "$RING_CAP" > "${RING_FILE}.new" 2>/dev/null && mv "${RING_FILE}.new" "$RING_FILE" 2>/dev/null || true
 
 # Locate active node and append to its metadata.touched_files (cap 50).
-WV_DB="${WV_DB:-/dev/shm/weave/${REPO_HASH}/brain.db}"
-[ ! -f "$WV_DB" ] && exit 0
+_TF_DB="${WV_DB:-$(resolve_db "$_TF_HOT_ZONE")}"
+[ ! -f "$_TF_DB" ] && exit 0
 
-ACTIVE_ID=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE status='active' ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null || echo "")
+ACTIVE_ID=$(resolve_active_primary "$_TF_DB" "$_TF_HOT_ZONE")
 [ -z "$ACTIVE_ID" ] && exit 0
 
-CUR_META=$(sqlite3 "$WV_DB" "SELECT COALESCE(metadata, '{}') FROM nodes WHERE id='$ACTIVE_ID';" 2>/dev/null)
+CUR_META=$(sqlite3 "$_TF_DB" "SELECT COALESCE(metadata, '{}') FROM nodes WHERE id='$ACTIVE_ID';" 2>/dev/null)
 [ -z "$CUR_META" ] && CUR_META='{}'
 
 NODE_CAP="${WV_TOUCHED_NODE_CAP:-50}"
@@ -68,7 +68,10 @@ NEW_META=$(echo "$CUR_META" | jq \
     '.touched_files = (((.touched_files // []) - [$path]) + [$path] | .[-$cap:])' 2>/dev/null || echo "$CUR_META")
 
 # SQL-escape single quotes by doubling them.
+ACTIVE_ID_ESC="${ACTIVE_ID//\'/\'\'}"
+REL_PATH_ESC="${REL_PATH//\'/\'\'}"
 NEW_META_ESC="${NEW_META//\'/\'\'}"
-sqlite3 "$WV_DB" "UPDATE nodes SET metadata='$NEW_META_ESC', updated_at=CURRENT_TIMESTAMP WHERE id='$ACTIVE_ID';" 2>/dev/null || true
+sqlite3 "$_TF_DB" "UPDATE nodes SET metadata='$NEW_META_ESC', updated_at=CURRENT_TIMESTAMP WHERE id='$ACTIVE_ID';" 2>/dev/null || true
+sqlite3 "$_TF_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$ACTIVE_ID_ESC', '$REL_PATH_ESC');" 2>/dev/null || true
 
 exit 0

@@ -6,6 +6,11 @@
 #
 # Skip with: git commit --no-verify (or WV_SKIP_PRECOMMIT=1)
 
+hook_progress() {
+    [ "${WV_HOOK_PROGRESS:-1}" = "0" ] && return 0
+    printf '%s\n' "Weave pre-commit: $1" >&2
+}
+
 # Allow explicit bypass
 [ "${WV_SKIP_PRECOMMIT:-0}" = "1" ] && exit 0
 
@@ -42,6 +47,7 @@ fi
 STAGED_PY_FILES=$(git diff --cached --name-only --diff-filter=AM 2>/dev/null | grep '\.py$' | grep -v '^\.weave/' || true)
 if [ -n "$STAGED_PY_FILES" ]; then
     if command -v ruff > /dev/null 2>&1; then
+        hook_progress "running ruff on staged Python files..."
         # shellcheck disable=SC2086
         RUFF_OUT=$(ruff check $STAGED_PY_FILES 2>&1 || true)
         if [ -n "$RUFF_OUT" ] && [ "$RUFF_OUT" != "All checks passed!" ]; then
@@ -53,6 +59,34 @@ if [ -n "$STAGED_PY_FILES" ]; then
             echo "" >&2
             exit 1
         fi
+    fi
+
+    if [ -f "$REPO_ROOT/.venv/bin/python3" ]; then
+        PYTHON3="$REPO_ROOT/.venv/bin/python3"
+    else
+        PYTHON3=$(command -v python3 2>/dev/null || echo "")
+    fi
+    if [ -n "$PYTHON3" ] && "$PYTHON3" -c "import pytest" >/dev/null 2>&1; then
+        hook_progress "running focused pytest checks for staged Python changes..."
+        if ! "$PYTHON3" -m pytest "$REPO_ROOT/tests/weave_quality" "$REPO_ROOT/tests/weave_indexer" -q --tb=short 2>&1; then
+            echo "" >&2
+            echo "✗ pytest tests failed — fix before committing." >&2
+            exit 1
+        fi
+    fi
+fi
+
+# Run shell test suite when cmd scripts or core shell tests are staged.
+# This is the slowest common pre-commit path, so emit progress before it starts.
+STAGED_SH=$(echo "$NON_WEAVE_FILES" | grep -E '^scripts/cmd/|^tests/test-core\.sh' || true)
+if [ -n "$STAGED_SH" ]; then
+    hook_progress "running tests/test-core.sh for staged shell workflow changes..."
+    if ! bash "$REPO_ROOT/tests/test-core.sh" >/dev/null 2>&1; then
+        echo "" >&2
+        echo "✗ tests/test-core.sh failed — run manually to see details:" >&2
+        echo "  bash tests/test-core.sh" >&2
+        echo "" >&2
+        exit 1
     fi
 fi
 
@@ -68,6 +102,7 @@ if [ "$_PC_PHASE" = "discover" ] || [ "$_PC_PHASE" = "closing" ]; then
 fi
 
 # Check for active Weave nodes (execute phase only)
+hook_progress "checking for an active Weave node..."
 ACTIVE_COUNT=$("$WV" list --status=active --json 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
 
 if [ "$ACTIVE_COUNT" = "0" ] || [ -z "$ACTIVE_COUNT" ]; then

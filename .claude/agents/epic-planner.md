@@ -12,8 +12,8 @@ Acts as a planning consultant to clarify requirements and design the work hierar
 ## MCP Server
 
 > **Context-dependent tool access:**
-> - **Claude Code subagents:** Use `wv` CLI via Bash tool (tools listed in frontmatter above)
-> - **Copilot Chat / Agent SDK:** MCP tools below are available
+> - **Agents with Bash tool** (e.g. Claude Code, shell-capable SDK agents): Use `wv` CLI via Bash (tools listed in frontmatter above)
+> - **Agents without Bash** (e.g. Copilot Chat, MCP-only clients): Use MCP tools below
 
 This agent uses the **`weave`** MCP server (all 31 tools available). Its primary tools are the
 8 graph mutation operations: `weave_add`, `weave_link`, `weave_done`, `weave_batch_done`,

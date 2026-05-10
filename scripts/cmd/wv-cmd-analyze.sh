@@ -30,7 +30,7 @@ cmd_analyze() {
 }
 
 cmd_analyze_sessions() {
-    local log_path="${HOME}/.local/share/weave/wv_calls.jsonl"
+    local log_path="${WV_CALL_LOG:-${HOME}/.local/share/weave/wv_calls.jsonl}"
     local top_n=10
     local mode
     mode=$(wv_resolve_mode)

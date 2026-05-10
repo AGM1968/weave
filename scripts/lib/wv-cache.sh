@@ -43,7 +43,7 @@ WV_RUN_CACHE_SENTINEL="${WV_HOT_ZONE}/.run_cache.invalidate"
 
 _wv_run_cache_is_read_cmd() {
     case "${1:-}" in
-        status|ready|list|bootstrap) return 0 ;;
+        ready|list|bootstrap) return 0 ;;
         *) return 1 ;;
     esac
 }

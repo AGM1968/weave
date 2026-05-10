@@ -31,6 +31,10 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
         NODE_TEXT=$("$WV" show "$NODE_ID" 2>/dev/null | grep "Text:" | sed 's/^[^:]*: //' || echo "")
         NODE_META=$("$WV" show "$NODE_ID" --json 2>/dev/null | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
         NODE_TYPE=$(echo "$NODE_META" | jq -r '.type // "unknown"' 2>/dev/null || echo "unknown")
+        IS_TRIVIAL=false
+        if [[ "$NODE_TYPE" == "breadcrumbs" ]] || [[ "$NODE_TEXT" =~ ^Test ]]; then
+            IS_TRIVIAL=true
+        fi
 
         if [[ "$NODE_TYPE" == "finding" ]]; then
             MISSING_FINDING=$(echo "$NODE_META" | jq -r '
@@ -47,6 +51,36 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
             if [[ -n "$MISSING_FINDING" ]]; then
                 jq -n \
                     --arg detail "Finding nodes require structured metadata before close. Missing or invalid: $MISSING_FINDING. Run: wv update $NODE_ID --metadata='{\"finding\":{\"violation_type\":\"...\",\"root_cause\":\"...\",\"proposed_fix\":\"...\",\"confidence\":\"high\",\"fixable\":true}}' first." \
+                    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
+                exit 0
+            fi
+        fi
+
+        HAS_COMMIT_METADATA=$(echo "$NODE_META" | jq -r '((.commit // "") != "" or ((.commits // []) | length > 0))' 2>/dev/null || echo "false")
+        if [[ "$HAS_COMMIT_METADATA" != "true" && "$IS_TRIVIAL" == "false" ]] \
+            && git -C "$WV_PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            DIRTY_FILES=$(
+                {
+                    git -C "$WV_PROJECT_DIR" diff --name-only 2>/dev/null
+                    git -C "$WV_PROJECT_DIR" diff --cached --name-only 2>/dev/null
+                    git -C "$WV_PROJECT_DIR" ls-files --others --exclude-standard 2>/dev/null
+                } | sort -u | grep -v '^$' | grep -v '^\.weave/' || true
+            )
+            if [[ -n "$DIRTY_FILES" ]]; then
+                DIRTY_SAMPLE=$(echo "$DIRTY_FILES" | head -3 | paste -sd ', ' -)
+                jq -n \
+                    --arg detail "Commit work before close. Non-.weave changes are still uncommitted: $DIRTY_SAMPLE. Run git add <files> && git commit while $NODE_ID is active, then retry wv done." \
+                    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
+                exit 0
+            fi
+
+            ATTRIBUTED_COMMITS=$(git -C "$WV_PROJECT_DIR" log --format="%H" --grep="Weave-ID: $NODE_ID" --since="90 days ago" 2>/dev/null | head -10)
+            if [[ -z "$ATTRIBUTED_COMMITS" ]]; then
+                ATTRIBUTED_COMMITS=$(git -C "$WV_PROJECT_DIR" log --format="%H" --grep="$NODE_ID" --since="90 days ago" 2>/dev/null | head -10)
+            fi
+            if [[ -z "$ATTRIBUTED_COMMITS" ]]; then
+                jq -n \
+                    --arg detail "No commit attributed to $NODE_ID. Commit before close so prepare-commit-msg can add Weave-ID: $NODE_ID, or amend the latest work commit, then retry wv done." \
                     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
                 exit 0
             fi
@@ -70,12 +104,6 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
 
         # Require verification for non-trivial work
         if [[ "$HAS_VERIFICATION" == "false" && "$HAS_LEGACY_VERIFICATION" == "false" ]]; then
-            # Check if this is trivial (breadcrumbs, test nodes, etc.)
-            IS_TRIVIAL=false
-            if [[ "$NODE_TYPE" == "breadcrumbs" ]] || [[ "$NODE_TEXT" =~ ^Test ]]; then
-                IS_TRIVIAL=true
-            fi
-
             if [[ "$IS_TRIVIAL" == "false" ]]; then
                 # PreToolUse soft deny (exit 0 + hookSpecificOutput JSON)
                 # Schema: hookSpecificOutput.permissionDecision (current API, not deprecated top-level)

@@ -75,6 +75,7 @@ fi
 # Find active node (status=active)
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+source "$WV_PROJECT_DIR/scripts/lib/wv-resolve-runtime.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-runtime.sh" || exit 0
 
 # Only enforce in projects explicitly initialised with wv-init-repo (.weave/ present)
 # This prevents the hook from blocking edits in personal notes, /tmp, plain git repos, etc.
@@ -88,10 +89,9 @@ if [ ! -x "$WV" ]; then
 fi
 
 # DB health pre-flight: verify hot zone DB exists before attempting wv queries
-# Mirrors wv-config.sh hot zone resolution logic
-_PA_REPO_HASH=$(echo "$WV_PROJECT_DIR" | md5sum | cut -c1-8)
-_PA_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_PA_REPO_HASH}}"
-_PA_DB="${WV_DB:-${_PA_HOT_ZONE}/brain.db}"
+# Reuse the canonical runtime resolver shared with the CLI.
+_PA_HOT_ZONE=$(resolve_repo_hot_zone "" "$WV_PROJECT_DIR")
+_PA_DB=$(resolve_db "$_PA_HOT_ZONE")
 if [ ! -f "$_PA_DB" ]; then
     # DB not loaded — allow action (session start hook will load it on next run)
     exit 0
@@ -194,13 +194,7 @@ fi
 
 if [ "$ACTIVE_COUNT" -gt "1" ]; then
     # Multiple active nodes — use primary if set, otherwise warn
-    PRIMARY_FILE="${WV_HOT_ZONE:-/dev/shm/weave}/primary"
-    # Resolve hot zone for this repo
-    if [ -z "${WV_HOT_ZONE:-}" ]; then
-        _REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-        _REPO_HASH=$(echo "$_REPO_ROOT" | md5sum | cut -c1-8)
-        PRIMARY_FILE="/dev/shm/weave/${_REPO_HASH}/primary"
-    fi
+    PRIMARY_FILE="${_PA_HOT_ZONE}/primary"
     if [ -f "$PRIMARY_FILE" ]; then
         NODE_ID=$(cat "$PRIMARY_FILE" 2>/dev/null)
     fi

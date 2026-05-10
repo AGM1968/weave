@@ -12,8 +12,8 @@ add learnings to nodes and identifies patterns across multiple tasks.
 ## MCP Server
 
 > **Context-dependent tool access:**
-> - **Claude Code subagents:** Use `wv` CLI via Bash tool (tools listed in frontmatter above)
-> - **Copilot Chat / Agent SDK:** MCP tools below are available
+> - **Agents with Bash tool** (e.g. Claude Code, shell-capable SDK agents): Use `wv` CLI via Bash (tools listed in frontmatter above)
+> - **Agents without Bash** (e.g. Copilot Chat, MCP-only clients): Use MCP tools below
 
 This agent uses the **`weave-inspect`** MCP server (14 read-only tools). Its primary tools are
 the query operations: `weave_context`, `weave_search`, `weave_tree`, `weave_learnings`,

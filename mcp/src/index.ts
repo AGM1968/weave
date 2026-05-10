@@ -17,7 +17,7 @@
  *   weave_health   - Graph health check
  *   weave_quick    - Quick-add and start working
  *   weave_work     - Claim a node to work on
- *   weave_ship     - Complete + sync in one step
+ *   weave_ship     - Complete + sync in one step; pending Git sync is surfaced separately
  *   weave_overview - Session start overview (status + digest + breadcrumbs)
  *   weave_bootstrap - Single-call session context (status + context + ready + learnings)
  *   weave_show     - Single-node detail view
@@ -27,6 +27,8 @@
  *   weave_quality_hotspots - Ranked hotspot report
  *   weave_quality_diff - Delta report vs previous scan
  *   weave_quality_functions - Per-function CC report with dispatch tagging
+ *   weave_code_search - Hybrid code search over indexed chunks (FTS5 BM25 + cosine RRF)
+ *   weave_index     - Index code files into brain.db for semantic search
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -81,6 +83,8 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_quality_hotspots",
     "weave_quality_diff",
     "weave_quality_functions",
+    "weave_code_search",
+    "weave_index",
   ],
 };
 
@@ -137,12 +141,18 @@ const LEARNING_CATEGORIES = ["decision", "pattern", "pitfall", "learning"] as co
 type ReadMode = (typeof READ_MODES)[number];
 const MCP_READ_MODE: ReadMode = "discover";
 
+function resolveProjectRoot(): string {
+  return process.env.WV_PROJECT_ROOT || process.env.WV_PROJECT_DIR || process.cwd();
+}
+
 function wvEnv(extraEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const projectRoot = process.env.WV_PROJECT_ROOT || process.env.WV_PROJECT_DIR || "";
   return {
     ...process.env,
     NO_COLOR: "1",
     WV_AGENT: "1",
     WV_ACTIVE: process.env.WV_ACTIVE || "",
+    ...(projectRoot ? { WV_PROJECT_DIR: projectRoot } : {}),
     ...extraEnv,
   };
 }
@@ -156,6 +166,7 @@ function spawnWv(args: string[], timeout: number = WV_TIMEOUT) {
     encoding: "utf-8",
     maxBuffer: 10 * 1024 * 1024, // 10MB
     timeout,
+    cwd: resolveProjectRoot(),
     env: wvEnv(),
   });
 }
@@ -496,7 +507,7 @@ const TOOLS: Tool[] = [
   {
     name: "weave_ship",
     description:
-      "Complete current work: mark node done with learning, then sync to git layer. Auto-detects GitHub-linked nodes and syncs GH issues. Always include a learning for non-trivial work.",
+      "Complete current work: mark node done with learning and sync graph/GitHub state. Any remaining Git sync is surfaced separately via status, doctor, or recover. Auto-detects GitHub-linked nodes and syncs GH issues. Always include a learning for non-trivial work.",
     inputSchema: {
       type: "object",
       properties: {
@@ -658,7 +669,7 @@ const TOOLS: Tool[] = [
   {
     name: "weave_close_session",
     description:
-      "End-of-session cleanup: sync graph, check for uncommitted files and unpushed commits. Replaces session-end hook for MCP clients.",
+      "End-of-session checkup: sync graph, then report uncommitted files, active nodes, and unpushed commits for MCP clients.",
     inputSchema: {
       type: "object",
       properties: {
@@ -967,6 +978,56 @@ const TOOLS: Tool[] = [
         threshold: {
           type: "number",
           description: "CC threshold — only show functions at or above this value (default: 10)",
+        },
+      },
+    },
+  },
+  {
+    name: "weave_code_search",
+    description:
+      "Hybrid code search over indexed chunks (FTS5 BM25 + cosine RRF blend). Run weave_index first. Returns file locations with relevance scores and optional Weave node context. Use instead of semble for project-local code search.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Natural-language or code query",
+        },
+        limit: {
+          type: "number",
+          description: "Max results (default: 10)",
+        },
+        mode: {
+          type: "string",
+          enum: ["hybrid", "fts", "vector"],
+          description: "Search mode (default: hybrid)",
+        },
+        graph: {
+          type: "boolean",
+          description: "Attach active Weave nodes and quality churn to results",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "weave_index",
+    description:
+      "Index code files into brain.db chunks table for semantic search. Must be run before weave_code_search. Stores FTS5 content and float32 embeddings.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Root directory to index (default: project root)",
+        },
+        no_embed: {
+          type: "boolean",
+          description: "Skip embeddings, index FTS content only",
+        },
+        ext: {
+          type: "string",
+          description: "Comma-separated extensions (default: .py .ts .js .sh .go .rs .md)",
         },
       },
     },
@@ -1356,6 +1417,19 @@ function handleTool(
             isError: true,
           };
         }
+        if (pf.policy_readiness?.blocking) {
+          const detail = pf.policy_readiness.detail || "Policy-sensitive completion is not ready.";
+          const hint = pf.policy_readiness.hint ? `\n\n${pf.policy_readiness.hint}` : "";
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: Node ${id} is not policy-ready.\n${detail}${hint}`,
+              },
+            ],
+            isError: true,
+          };
+        }
       } catch {
         // JSON parse failed — fall through with raw output
       }
@@ -1379,10 +1453,10 @@ function handleTool(
                   "",
                   "Run one of:",
                   "  wv work <id>                         — Claim an existing task",
-                  '  wv add "<description>" --gh --alias=<short-name> --status=active  — Create + claim new task',
+                  '  wv add "<description>" --gh --alias=<short-name> --status=active --criteria="c1|c2" --risks=low  — Create + claim new task',
                   '  wv quick "<description>"             — Track trivial one-step work',
                   "",
-                  "Use `wv ready`, `wv bootstrap --json`, weave_overview, or weave_bootstrap to find available work.",
+                  "Use `wv search \"<topic>\"`, `wv ready`, `wv bootstrap --json`, weave_overview, or weave_bootstrap to find available work.",
                 ].join("\n"),
               },
             ],
@@ -1679,6 +1753,31 @@ function handleTool(
       break;
     }
 
+    case "weave_code_search": {
+      const query = args.query as string;
+      const limit = args.limit as number | undefined;
+      const mode = args.mode as string | undefined;
+      const graph = args.graph as boolean | undefined;
+      const cmd = ["search", "--code", query, "--json"];
+      if (limit) cmd.push(`--limit=${limit}`);
+      if (mode) cmd.push(`--mode=${mode}`);
+      if (graph) cmd.push("--graph");
+      result = wv(cmd, 120_000);
+      break;
+    }
+
+    case "weave_index": {
+      const path = args.path as string | undefined;
+      const noEmbed = args.no_embed as boolean | undefined;
+      const ext = args.ext as string | undefined;
+      const cmd = ["index", "--json"];
+      if (path) cmd.push(path);
+      if (noEmbed) cmd.push("--no-embed");
+      if (ext) cmd.push(`--ext=${ext}`);
+      result = wv(cmd, 300_000);
+      break;
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -1694,7 +1793,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.44.0",
+      version: "1.45.0",
     },
     {
       capabilities: {

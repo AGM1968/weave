@@ -182,7 +182,7 @@ echo "Testing: health command (with data)"
 reset_db
 
 # Create test nodes of different statuses
-$WV add "Active task" --status=active >/dev/null
+$WV add "Active task" --status=active --criteria="health fixture active node" --risks=low >/dev/null
 $WV add "Blocked task" --status=blocked >/dev/null
 $WV add "Done task" --status=done >/dev/null
 node1=$($WV add "Todo task 1")
@@ -199,6 +199,31 @@ assert_json_field "$json_output" ".nodes.blocked" "1" "health counts 1 blocked n
 assert_json_field "$json_output" ".nodes.done" "1" "health counts 1 done node"
 assert_json_field "$json_output" ".edges.total" "1" "health counts 1 edge"
 assert_json_field "$json_output" ".edges.blocking" "1" "health counts 1 blocking edge"
+
+# ============================================================================
+# Test: health excludes intentional standalones from orphan debt
+# ============================================================================
+echo ""
+echo "Testing: health excludes intentional standalones from orphan debt"
+
+reset_db
+
+regular=$($WV add "Regular orphan" --force)
+standalone_node=$($WV add "Standalone orphan" --standalone)
+annotated_node=$($WV add "Annotated retained orphan" --force)
+$WV update "$annotated_node" --metadata='{"standalone":true}' >/dev/null 2>&1
+
+json_output=$($WV health --json 2>&1)
+assert_json_field "$json_output" ".issues.orphan_nodes" "1" "health excludes intentional standalones from orphan count"
+assert_json_field "$json_output" ".issues.intentional_standalones" "2" "health counts intentional standalones separately"
+
+orphan_ids=$(echo "$json_output" | jq -r '.issues.orphan_ids | join(",")')
+assert_contains "$orphan_ids" "$regular" "regular orphan remains in orphan_ids"
+assert_not_contains "$orphan_ids" "$standalone_node" "standalone node excluded from orphan_ids"
+assert_not_contains "$orphan_ids" "$annotated_node" "retroactively annotated standalone excluded from orphan_ids"
+
+text_output=$($WV health --verbose 2>&1)
+assert_contains "$text_output" "Intentional standalones: 2" "health --verbose reports intentional standalones"
 
 # ============================================================================
 # Test: health score with pitfalls

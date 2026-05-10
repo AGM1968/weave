@@ -303,6 +303,187 @@ cmd_overview() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# _preflight_policy_readiness — Evaluate whether a node can satisfy policy
+# gates if it currently has attributed files.
+#
+# Nodes with no tracked files are not yet policy-sensitive, so preflight
+# should expose that state without blocking. Once node_files exist, quality
+# scan prerequisites become blocking unless explicitly bypassed.
+_preflight_policy_readiness() {
+    local id="$1"
+    local tracked_files
+    tracked_files=$(db_query "SELECT COUNT(*) FROM node_files WHERE node_id='$(sql_escape "$id")';" 2>/dev/null || echo "")
+
+    if [ -z "$tracked_files" ]; then
+        jq -cn \
+            --arg detail "node_files attribution data is unavailable" \
+            --arg hint "Run wv init or repair the graph DB before relying on policy readiness." \
+            '{
+                policy_sensitive: false,
+                ready: false,
+                blocking: true,
+                status: "unavailable",
+                detail: $detail,
+                hint: $hint,
+                tracked_files: 0,
+                attribution: {
+                    ready: false,
+                    status: "missing",
+                    detail: "node_files table or attribution data is unavailable"
+                },
+                quality: {
+                    ready: false,
+                    status: "unknown",
+                    detail: "Quality prerequisites could not be evaluated because attribution data is unavailable."
+                }
+            }'
+        return 0
+    fi
+
+    if [ "$tracked_files" = "0" ]; then
+        jq -cn \
+            --arg detail "No tracked files are attributed to this node yet, so policy gating is not active." \
+            --arg hint "Policy readiness will become blocking after touched files are written to node_files." \
+            '{
+                policy_sensitive: false,
+                ready: true,
+                blocking: false,
+                status: "not_applicable",
+                detail: $detail,
+                hint: $hint,
+                tracked_files: 0,
+                attribution: {
+                    ready: false,
+                    status: "pending",
+                    detail: "No tracked files attributed to this node."
+                },
+                quality: {
+                    ready: true,
+                    status: "not_applicable",
+                    detail: "Quality prerequisites are only required once tracked files exist."
+                }
+            }'
+        return 0
+    fi
+
+    if [ "${WV_REQUIRE_QUALITY:-1}" = "0" ]; then
+        jq -cn \
+            --argjson tracked_files "$tracked_files" \
+            --arg detail "Policy-sensitive completion is currently bypassing quality prerequisites because WV_REQUIRE_QUALITY=0." \
+            --arg hint "Unset WV_REQUIRE_QUALITY=0 to enforce quality-backed policy readiness." \
+            '{
+                policy_sensitive: true,
+                ready: true,
+                blocking: false,
+                status: "bypassed",
+                detail: $detail,
+                hint: $hint,
+                tracked_files: $tracked_files,
+                attribution: {
+                    ready: true,
+                    status: "ready",
+                    detail: "Tracked files are attributed to this node."
+                },
+                quality: {
+                    ready: true,
+                    status: "bypassed",
+                    detail: "Quality prerequisites are bypassed by WV_REQUIRE_QUALITY=0."
+                }
+            }'
+        return 0
+    fi
+
+    local quality_db="$WV_HOT_ZONE/quality.db"
+    if [ ! -f "$quality_db" ]; then
+        jq -cn \
+            --argjson tracked_files "$tracked_files" \
+            --arg quality_db "$quality_db" \
+            --arg detail "Tracked files make this node policy-sensitive, but quality.db is missing." \
+            --arg hint "Run wv quality scan before closing nodes that touch tracked files." \
+            '{
+                policy_sensitive: true,
+                ready: false,
+                blocking: true,
+                status: "blocked",
+                detail: $detail,
+                hint: $hint,
+                tracked_files: $tracked_files,
+                attribution: {
+                    ready: true,
+                    status: "ready",
+                    detail: "Tracked files are attributed to this node."
+                },
+                quality: {
+                    ready: false,
+                    status: "missing",
+                    detail: "quality.db not found",
+                    path: $quality_db
+                }
+            }'
+        return 0
+    fi
+
+    local latest_scan
+    latest_scan=$(sqlite3 -batch -cmd ".timeout 3000" "$quality_db" \
+        "SELECT id FROM scan_meta ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
+    if [ -z "$latest_scan" ]; then
+        jq -cn \
+            --argjson tracked_files "$tracked_files" \
+            --arg quality_db "$quality_db" \
+            --arg detail "Tracked files make this node policy-sensitive, but quality.db has no scan data." \
+            --arg hint "Run wv quality scan before closing nodes that touch tracked files." \
+            '{
+                policy_sensitive: true,
+                ready: false,
+                blocking: true,
+                status: "blocked",
+                detail: $detail,
+                hint: $hint,
+                tracked_files: $tracked_files,
+                attribution: {
+                    ready: true,
+                    status: "ready",
+                    detail: "Tracked files are attributed to this node."
+                },
+                quality: {
+                    ready: false,
+                    status: "stale",
+                    detail: "quality.db has no scan_meta rows",
+                    path: $quality_db
+                }
+            }'
+        return 0
+    fi
+
+    jq -cn \
+        --argjson tracked_files "$tracked_files" \
+        --arg quality_db "$quality_db" \
+        --arg latest_scan "$latest_scan" \
+        --arg detail "Policy prerequisites are satisfied for this node's tracked files." \
+        --arg hint "Policy-sensitive completion can proceed with the current attribution and quality scan data." \
+        '{
+            policy_sensitive: true,
+            ready: true,
+            blocking: false,
+            status: "ready",
+            detail: $detail,
+            hint: $hint,
+            tracked_files: $tracked_files,
+            attribution: {
+                ready: true,
+                status: "ready",
+                detail: "Tracked files are attributed to this node."
+            },
+            quality: {
+                ready: true,
+                status: "ready",
+                detail: "quality.db has scan data for policy-backed completion.",
+                path: $quality_db,
+                latest_scan: $latest_scan
+            }
+        }'
+}
+
 # cmd_preflight — Pre-action checks as JSON for MCP clients
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -321,7 +502,7 @@ cmd_preflight() {
     exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
     if [ "$exists" = "0" ]; then
         cat <<EOF
-{"node_exists":false,"node_active":false,"has_done_criteria":false,"has_blockers":false,"contradictions":[],"context_load":"NONE","warnings":["Node $id not found"]}
+{"node_exists":false,"node_active":false,"has_done_criteria":false,"has_blockers":false,"contradictions":[],"context_load":"NONE","warnings":["Node $id not found"],"policy_readiness":{"policy_sensitive":false,"ready":false,"blocking":false,"status":"unavailable","detail":"Node $id not found","hint":"Claim or create the node before evaluating policy readiness.","tracked_files":0,"attribution":{"ready":false,"status":"missing","detail":"Node not found"},"quality":{"ready":false,"status":"unknown","detail":"Node not found"}}}
 EOF
         return 0
     fi
@@ -397,9 +578,12 @@ EOF
 
     [ -n "$warn_items" ] && warnings="[$warn_items]"
 
+    local policy_readiness
+    policy_readiness=$(_preflight_policy_readiness "$id")
+
     # Output JSON
     cat <<EOF
-{"node_exists":true,"node_active":$node_active,"has_done_criteria":$has_done_criteria,"has_blockers":$has_blockers,"contradictions":$contradictions,"context_load":"$context_load","warnings":$warnings}
+{"node_exists":true,"node_active":$node_active,"has_done_criteria":$has_done_criteria,"has_blockers":$has_blockers,"contradictions":$contradictions,"context_load":"$context_load","warnings":$warnings,"policy_readiness":$policy_readiness}
 EOF
 }
 
@@ -475,6 +659,22 @@ validate_on_done() {
         warnings="${warnings}\n  ⚠ Orphan node — no edges. Consider: wv link $id <parent> --type=implements"
     fi
 
+    # Check: touched files with deteriorating complexity trend
+    local trend_rows trend_path trend_direction
+    trend_rows=$(db_query "
+        SELECT nf.path || '|' || ft.direction
+        FROM node_files nf
+        JOIN file_trend ft ON ft.path = nf.path
+        WHERE nf.node_id='$id' AND ft.direction='deteriorating'
+        ORDER BY nf.path;
+    " 2>/dev/null || true)
+    if [ -n "$trend_rows" ]; then
+        while IFS='|' read -r trend_path trend_direction; do
+            [ -z "$trend_path" ] && continue
+            warnings="${warnings}\n  ⚠ Complexity trend ${trend_direction}: ${trend_path}"
+        done <<< "$trend_rows"
+    fi
+
     # Check: metadata size guard — large metadata (>50KB) causes sqlite3 -json to hang during sync
     local meta_size
     meta_size=$(db_query "
@@ -512,8 +712,10 @@ score_learning() {
         score=$((score + 1))
     fi
 
-    # +2: Contains a categorized prefix (pattern:/pitfall:/decision:/technique:)
-    if echo "$all_text" | grep -qiE '(pattern:|pitfall:|decision:|technique:)'; then
+    # +2: Has categorized structure — either typed fields present or prefix in raw learning
+    local has_typed
+    has_typed=$(echo "$meta" | jq -r 'if (.decision != null or .pattern != null or .pitfall != null) then "yes" else "no" end' 2>/dev/null)
+    if [ "$has_typed" = "yes" ] || echo "$all_text" | grep -qiE '(pattern:|pitfall:|decision:|technique:)'; then
         score=$((score + 2))
     fi
 
@@ -756,6 +958,172 @@ _hygiene_record_history() {
 # cmd_recover — Resume incomplete operations from journal or ship_pending
 # ═══════════════════════════════════════════════════════════════════════════
 
+_git_status_has_outside_weave_changes() {
+    local status_lines="$1"
+    local raw_path old_path new_path
+
+    while IFS= read -r raw_path; do
+        [ -z "$raw_path" ] && continue
+        raw_path="${raw_path:3}"
+        if [[ "$raw_path" == *" -> "* ]]; then
+            old_path="${raw_path%% -> *}"
+            new_path="${raw_path##* -> }"
+            if [[ "$old_path" != .weave/* ]] || [[ "$new_path" != .weave/* ]]; then
+                return 0
+            fi
+        elif [[ "$raw_path" != .weave/* ]]; then
+            return 0
+        fi
+    done <<< "$status_lines"
+
+    return 1
+}
+
+_git_commit_weave_ownership() {
+    local git_root="$1"
+    local sha="$2"
+    local paths path
+
+    paths=$(git -C "$git_root" diff-tree --no-commit-id --name-only -r -m "$sha" 2>/dev/null || true)
+    [ -n "$paths" ] || return 2
+
+    while IFS= read -r path; do
+        [ -z "$path" ] && continue
+        if [[ "$path" != .weave/* ]]; then
+            return 1
+        fi
+    done <<< "$paths"
+
+    return 0
+}
+
+_git_pending_hint() {
+    case "$1" in
+        dirty_weave)
+            echo "run: git add .weave/ && git commit -m \"chore: sync Weave [skip ci]\" && git push"
+            ;;
+        dirty_weave_and_ahead_weave)
+            echo "run: git add .weave/ && git commit -m \"chore: sync Weave [skip ci]\" && git push"
+            ;;
+        ahead_weave)
+            echo "run: git push"
+            ;;
+        no_upstream)
+            echo "configure an upstream before retrying recovery"
+            ;;
+        dirty_outside_weave)
+            echo "commit or stash non-.weave changes before retrying recovery"
+            ;;
+        ahead_non_weave)
+            echo "separate or push non-.weave commits manually before retrying recovery"
+            ;;
+        ahead_empty_commit)
+            echo "legacy or ambiguous empty commit ahead — manual remediation required"
+            ;;
+        *)
+            echo "no action required"
+            ;;
+    esac
+}
+
+_detect_git_pending() {
+    local git_root upstream="" weave_dirty="" all_status="" ahead_shas=""
+    local pending=false weave_dirty_bool=false outside_dirty=false
+    local state="clean" action="none" reason="clean" hint="no action required"
+    local ahead_count=0 has_non_weave=false has_ambiguous_empty=false sha
+
+    git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    if [ -z "$git_root" ] || [ ! -d "$git_root/.git" ]; then
+        jq -n \
+            --argjson pending false \
+            --arg state "clean" \
+            --arg action "none" \
+            --arg reason "not_repo" \
+            --arg hint "no action required" \
+            --arg upstream "" \
+            --argjson ahead_count 0 \
+            --argjson weave_dirty false \
+            --argjson outside_dirty false \
+            '{pending:$pending, state:$state, action:$action, reason:$reason, hint:$hint,
+              upstream:$upstream, ahead_count:$ahead_count,
+              weave_dirty:$weave_dirty, outside_dirty:$outside_dirty}'
+        return 0
+    fi
+
+    weave_dirty=$(git -C "$git_root" status --porcelain -- .weave/ 2>/dev/null || true)
+    [ -n "$weave_dirty" ] && weave_dirty_bool=true
+
+    all_status=$(git -C "$git_root" status --porcelain 2>/dev/null || true)
+    if [ -n "$all_status" ] && _git_status_has_outside_weave_changes "$all_status"; then
+        outside_dirty=true
+    fi
+
+    upstream=$(git -C "$git_root" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo "")
+    if [ -n "$upstream" ]; then
+        ahead_shas=$(git -C "$git_root" rev-list "${upstream}..HEAD" 2>/dev/null || true)
+        if [ -n "$ahead_shas" ]; then
+            ahead_count=$(printf '%s\n' "$ahead_shas" | sed '/^$/d' | wc -l | tr -d ' ')
+        fi
+    fi
+
+    if [ "$ahead_count" -gt 0 ] 2>/dev/null; then
+        while IFS= read -r sha; do
+            [ -z "$sha" ] && continue
+            _git_commit_weave_ownership "$git_root" "$sha"
+            case $? in
+                1) has_non_weave=true ;;
+                2) has_ambiguous_empty=true ;;
+            esac
+        done <<< "$ahead_shas"
+    fi
+
+    if [ "$weave_dirty_bool" = true ] || [ "$ahead_count" -gt 0 ] 2>/dev/null; then
+        pending=true
+    fi
+
+    if [ "$pending" = true ]; then
+        if [ -z "$upstream" ]; then
+            state="unresolvable"
+            reason="no_upstream"
+        elif [ "$outside_dirty" = true ]; then
+            state="unresolvable"
+            reason="dirty_outside_weave"
+        elif [ "$has_non_weave" = true ]; then
+            state="unresolvable"
+            reason="ahead_non_weave"
+        elif [ "$has_ambiguous_empty" = true ]; then
+            state="unresolvable"
+            reason="ahead_empty_commit"
+        elif [ "$weave_dirty_bool" = true ]; then
+            state="recoverable"
+            action="commit_push"
+            reason="dirty_weave"
+            if [ "$ahead_count" -gt 0 ] 2>/dev/null; then
+                reason="dirty_weave_and_ahead_weave"
+            fi
+        else
+            state="recoverable"
+            action="push_only"
+            reason="ahead_weave"
+        fi
+    fi
+
+    hint=$(_git_pending_hint "$reason")
+    jq -n \
+        --argjson pending "$pending" \
+        --arg state "$state" \
+        --arg action "$action" \
+        --arg reason "$reason" \
+        --arg hint "$hint" \
+        --arg upstream "$upstream" \
+        --argjson ahead_count "$ahead_count" \
+        --argjson weave_dirty "$weave_dirty_bool" \
+        --argjson outside_dirty "$outside_dirty" \
+        '{pending:$pending, state:$state, action:$action, reason:$reason, hint:$hint,
+          upstream:$upstream, ahead_count:$ahead_count,
+          weave_dirty:$weave_dirty, outside_dirty:$outside_dirty}'
+}
+
 cmd_recover() {
     local json_mode=false
     local auto_mode=false
@@ -807,8 +1175,26 @@ cmd_recover() {
         " 2>/dev/null || true)
     fi
 
+    # Source 4: explicit git-state surfacing for dirty/ahead .weave windows.
+    # Intentionally disabled in --auto mode so init/work/ship do not perform
+    # implicit git probing on read-path-triggered recovery checks.
+    local git_pending_json=""
+    local git_sync_pending=false
+    local git_sync_state="clean"
+    local git_sync_action="none"
+    local git_sync_reason="clean"
+    local git_sync_hint="no action required"
+    if [ "$auto_mode" != true ] && [ "$journal_found" = false ] && [ -z "$pending_nodes" ] && [ -z "$pending_close_nodes" ]; then
+        git_pending_json=$(_detect_git_pending 2>/dev/null || echo '{}')
+        git_sync_pending=$(echo "$git_pending_json" | jq -r '.pending // false' 2>/dev/null || echo "false")
+        git_sync_state=$(echo "$git_pending_json" | jq -r '.state // "clean"' 2>/dev/null || echo "clean")
+        git_sync_action=$(echo "$git_pending_json" | jq -r '.action // "none"' 2>/dev/null || echo "none")
+        git_sync_reason=$(echo "$git_pending_json" | jq -r '.reason // "clean"' 2>/dev/null || echo "clean")
+        git_sync_hint=$(echo "$git_pending_json" | jq -r '.hint // "no action required"' 2>/dev/null || echo "no action required")
+    fi
+
     # Nothing to recover
-    if [ "$journal_found" = false ] && [ -z "$pending_nodes" ] && [ -z "$pending_close_nodes" ]; then
+    if [ "$journal_found" = false ] && [ -z "$pending_nodes" ] && [ -z "$pending_close_nodes" ] && [ "$git_sync_pending" != true ]; then
         if [ "$json_mode" = true ]; then
             echo '{"status":"clean","message":"No incomplete operations"}'
         elif [ "$auto_mode" != true ]; then
@@ -881,7 +1267,7 @@ cmd_recover() {
         echo ""
 
         if [ "$auto_mode" = true ]; then
-            echo -e "${CYAN}ℹ${NC} Auto-recovering: running sync + push for pending nodes"
+            echo -e "${CYAN}ℹ${NC} Auto-recovering: running sync for pending nodes"
         else
             echo -n "  Resume shipping these nodes? [Y/n] "
             read -r answer
@@ -891,19 +1277,14 @@ cmd_recover() {
             fi
         fi
 
-        # Recovery: sync + push (node is already done, just need to persist)
+        # Recovery: sync local graph state (node is already done, just need to persist)
+        local _recover_prev_skip_sync_commit="${_WV_SKIP_SYNC_COMMIT:-}"
+        export _WV_SKIP_SYNC_COMMIT=1
         cmd_sync 2>/dev/null || true
-        local git_root
-        git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-        if [ -n "$git_root" ]; then
-            git -C "$git_root" add .weave/ 2>/dev/null || true
-            git -C "$git_root" commit -m "chore: recover ship-pending nodes [skip ci]" --allow-empty 2>/dev/null || true
-            if git -C "$git_root" push 2>/dev/null; then
-                echo -e "${GREEN}✓${NC} Push successful"
-            else
-                echo -e "${RED}✗ Push failed${NC}" >&2
-                return 1
-            fi
+        if [ -n "$_recover_prev_skip_sync_commit" ]; then
+            export _WV_SKIP_SYNC_COMMIT="$_recover_prev_skip_sync_commit"
+        else
+            unset _WV_SKIP_SYNC_COMMIT
         fi
 
         # Clear ship_pending markers
@@ -944,6 +1325,27 @@ cmd_recover() {
         fi
         return 0
     fi
+
+    # === source-4 git-state fallback (explicit surfaces only) ===
+    if [ "$git_sync_pending" = true ]; then
+        if [ "$json_mode" = true ]; then
+            if [ "$git_sync_state" = "recoverable" ]; then
+                echo "$git_pending_json" | jq '. + {status:"git_pending"}'
+            else
+                echo "$git_pending_json" | jq '. + {status:"git_unresolvable"}'
+            fi
+            return 0
+        fi
+
+        echo -e "${YELLOW}⚠ Git-state pending detected${NC}"
+        echo "  State: $git_sync_state"
+        if [ "$git_sync_action" != "none" ]; then
+            echo "  Action: $git_sync_action"
+        fi
+        echo "  Reason: $git_sync_reason"
+        echo "  Hint: $git_sync_hint"
+        return 0
+    fi
 }
 
 # Recovery helpers for specific operation types
@@ -957,52 +1359,61 @@ _recover_ship() {
 
     case "$stuck_action" in
         done)
-            echo "  Recovery: re-run cmd_done + sync + commit + push"
+            echo "  Recovery: re-run cmd_done + sync"
             if [ "$auto" != true ]; then
                 echo -n "  Proceed? [Y/n] "
                 read -r answer
                 [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 0
             fi
             cmd_done "$id" --no-warn 2>/dev/null || true
+            local _recover_prev_skip_sync_commit="${_WV_SKIP_SYNC_COMMIT:-}"
+            export _WV_SKIP_SYNC_COMMIT=1
             cmd_sync 2>/dev/null || true
-            _recover_git_commit_push "$id"
+            if [ -n "$_recover_prev_skip_sync_commit" ]; then
+                export _WV_SKIP_SYNC_COMMIT="$_recover_prev_skip_sync_commit"
+            else
+                unset _WV_SKIP_SYNC_COMMIT
+            fi
             ;;
         sync)
-            echo "  Recovery: re-run sync + commit + push"
+            echo "  Recovery: re-run sync"
             if [ "$auto" != true ]; then
                 echo -n "  Proceed? [Y/n] "
                 read -r answer
                 [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 0
             fi
+            local _recover_prev_skip_sync_commit="${_WV_SKIP_SYNC_COMMIT:-}"
+            export _WV_SKIP_SYNC_COMMIT=1
             cmd_sync 2>/dev/null || true
-            _recover_git_commit_push "$id"
+            if [ -n "$_recover_prev_skip_sync_commit" ]; then
+                export _WV_SKIP_SYNC_COMMIT="$_recover_prev_skip_sync_commit"
+            else
+                unset _WV_SKIP_SYNC_COMMIT
+            fi
             ;;
         git_commit)
-            echo "  Recovery: re-run git commit + push"
+            echo "  Recovery: legacy push-complete ship detected; local graph is already synced"
             if [ "$auto" != true ]; then
                 echo -n "  Proceed? [Y/n] "
                 read -r answer
                 [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 0
             fi
-            _recover_git_commit_push "$id"
+            local git_pending_json git_sync_hint
+            git_pending_json=$(_detect_git_pending 2>/dev/null || echo '{}')
+            git_sync_hint=$(echo "$git_pending_json" | jq -r '.hint // "no action required"' 2>/dev/null || echo "no action required")
+            echo "  Hint: $git_sync_hint"
             ;;
         git_push)
-            echo "  Recovery: re-run git push"
+            echo "  Recovery: legacy push-complete ship detected; local graph is already synced"
             if [ "$auto" != true ]; then
                 echo -n "  Proceed? [Y/n] "
                 read -r answer
                 [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 0
             fi
-            local git_root
-            git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-            if [ -n "$git_root" ]; then
-                if git -C "$git_root" push 2>/dev/null; then
-                    echo -e "${GREEN}✓${NC} Push successful"
-                else
-                    echo -e "${RED}✗ Push failed${NC}" >&2
-                    return 1
-                fi
-            fi
+            local git_pending_json git_sync_hint
+            git_pending_json=$(_detect_git_pending 2>/dev/null || echo '{}')
+            git_sync_hint=$(echo "$git_pending_json" | jq -r '.hint // "no action required"' 2>/dev/null || echo "no action required")
+            echo "  Hint: $git_sync_hint"
             ;;
     esac
 
@@ -1071,24 +1482,6 @@ _recover_delete() {
         echo "  SQLite delete already completed. No further recovery needed."
     fi
     echo -e "${GREEN}✓${NC} Recovery complete"
-}
-
-_recover_git_commit_push() {
-    local id="${1:-}"
-    local git_root
-    git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-    if [ -n "$git_root" ]; then
-        git -C "$git_root" add .weave/ 2>/dev/null || true
-        local msg="chore: sync Weave [skip ci]"
-        [ -n "$id" ] && msg="chore: sync Weave after completing $id [skip ci]"
-        git -C "$git_root" commit -m "$msg" --allow-empty 2>/dev/null || true
-        if git -C "$git_root" push 2>/dev/null; then
-            echo -e "${GREEN}✓${NC} Pushed to remote"
-        else
-            echo -e "${RED}✗ Push failed${NC}" >&2
-            return 1
-        fi
-    fi
 }
 
 # _recover_session — List/reclaim orphaned active nodes from crashed sessions
@@ -1346,6 +1739,24 @@ cmd_doctor() {
         _doctor_record "journal" "pass" "clean (no incomplete operations)"
     fi
 
+    # 14b. Explicit git-state pending windows (.weave dirty / ahead of upstream)
+    local git_pending_json git_sync_pending git_sync_state git_sync_action git_sync_reason git_sync_hint
+    git_pending_json=$(_detect_git_pending 2>/dev/null || echo '{}')
+    git_sync_pending=$(echo "$git_pending_json" | jq -r '.pending // false' 2>/dev/null || echo "false")
+    git_sync_state=$(echo "$git_pending_json" | jq -r '.state // "clean"' 2>/dev/null || echo "clean")
+    git_sync_action=$(echo "$git_pending_json" | jq -r '.action // "none"' 2>/dev/null || echo "none")
+    git_sync_reason=$(echo "$git_pending_json" | jq -r '.reason // "clean"' 2>/dev/null || echo "clean")
+    git_sync_hint=$(echo "$git_pending_json" | jq -r '.hint // "no action required"' 2>/dev/null || echo "no action required")
+    if [ "$git_sync_pending" = "true" ]; then
+        if [ "$git_sync_state" = "recoverable" ]; then
+            _doctor_record "git sync" "warn" "$git_sync_action ($git_sync_reason) — $git_sync_hint"
+        else
+            _doctor_record "git sync" "warn" "$git_sync_state ($git_sync_reason) — $git_sync_hint"
+        fi
+    else
+        _doctor_record "git sync" "pass" "clean"
+    fi
+
     # ── Surface-contract checks ──────────────────────────────────────────────
 
     # 15. Hook source vs installed drift: compare .claude/hooks/ with ~/.config/weave/hooks/
@@ -1392,19 +1803,36 @@ cmd_doctor() {
     # 16. wv-runtime wrapper retired (S2) — standalone repo uses python -m weave_runtime
     _doctor_record "wv-runtime" "pass" "retired — use python -m weave_runtime (standalone repo)"
 
-    # 17. Pre-commit hook installed and is the Weave version
+    # 17. Git commit hooks installed and match the repo-managed Weave versions
     local git_root
     git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
     if [ -n "$git_root" ]; then
+        local pre_commit_src="$git_root/scripts/hooks/pre-commit-weave.sh"
         local pre_commit="$git_root/.git/hooks/pre-commit"
         if [ -f "$pre_commit" ]; then
-            if grep -q "Weave pre-commit" "$pre_commit" 2>/dev/null; then
-                _doctor_record "pre-commit hook" "pass" "Weave hook installed"
+            if [ -f "$pre_commit_src" ] && cmp -s "$pre_commit_src" "$pre_commit" 2>/dev/null; then
+                _doctor_record "pre-commit hook" "pass" "Weave hook installed and current"
+            elif grep -q "Weave pre-commit" "$pre_commit" 2>/dev/null; then
+                _doctor_record "pre-commit hook" "warn" "stale — install -m 755 scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
             else
-                _doctor_record "pre-commit hook" "warn" "exists but not the Weave version — cp scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
+                _doctor_record "pre-commit hook" "warn" "exists but not the Weave version — install -m 755 scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
             fi
         else
-            _doctor_record "pre-commit hook" "warn" "not installed — cp scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
+            _doctor_record "pre-commit hook" "warn" "not installed — install -m 755 scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
+        fi
+
+        local prepare_hook_src="$git_root/scripts/hooks/prepare-commit-msg-weave.sh"
+        local prepare_hook="$git_root/.git/hooks/prepare-commit-msg"
+        if [ -f "$prepare_hook" ]; then
+            if [ -f "$prepare_hook_src" ] && cmp -s "$prepare_hook_src" "$prepare_hook" 2>/dev/null; then
+                _doctor_record "prepare-commit-msg hook" "pass" "Weave trailer hook installed and current"
+            elif grep -q "Weave: append Weave-ID trailers" "$prepare_hook" 2>/dev/null; then
+                _doctor_record "prepare-commit-msg hook" "warn" "stale — install -m 755 scripts/hooks/prepare-commit-msg-weave.sh .git/hooks/prepare-commit-msg"
+            else
+                _doctor_record "prepare-commit-msg hook" "warn" "exists but not the Weave version — install -m 755 scripts/hooks/prepare-commit-msg-weave.sh .git/hooks/prepare-commit-msg"
+            fi
+        else
+            _doctor_record "prepare-commit-msg hook" "warn" "not installed — install -m 755 scripts/hooks/prepare-commit-msg-weave.sh .git/hooks/prepare-commit-msg"
         fi
     fi
 
@@ -1495,6 +1923,26 @@ cmd_mcp_status() {
         fi
     }
 
+    _mcp_check_vscode_config() {
+        local config_path="$1"
+        local config_label="$2"
+        local missing=()
+
+        grep -q '"weave"' "$config_path" 2>/dev/null || missing+=("weave")
+        grep -q '"weave-session"' "$config_path" 2>/dev/null || missing+=("weave-session")
+        grep -q '"weave-lite"' "$config_path" 2>/dev/null || missing+=("weave-lite")
+        grep -q '"weave-inspect"' "$config_path" 2>/dev/null || missing+=("weave-inspect")
+        grep -q 'WV_PATH' "$config_path" 2>/dev/null || missing+=("WV_PATH")
+        grep -q 'WV_PROJECT_ROOT' "$config_path" 2>/dev/null || missing+=("WV_PROJECT_ROOT")
+
+        if [ "${#missing[@]}" -eq 0 ]; then
+            _mcp_record "VS Code config" "pass" "$config_label"
+            return
+        fi
+
+        _mcp_record "VS Code config" "warn" "$config_label missing $(IFS=', '; echo "${missing[*]}") — run wv init-repo --agent=copilot --force"
+    }
+
     [ "$format" = "text" ] && echo "Weave MCP Status"
 
     # 1. Node.js
@@ -1535,10 +1983,10 @@ cmd_mcp_status() {
     local repo_root="$REPO_ROOT"
     local has_vscode=false has_claude=false
     if [ -f "$repo_root/.vscode/mcp.json" ]; then
-        _mcp_record "VS Code config" "pass" ".vscode/mcp.json"
+        _mcp_check_vscode_config "$repo_root/.vscode/mcp.json" ".vscode/mcp.json"
         has_vscode=true
     elif [ -f "$repo_root/.mcp.json" ]; then
-        _mcp_record "VS Code config" "pass" ".mcp.json"
+        _mcp_check_vscode_config "$repo_root/.mcp.json" ".mcp.json"
         has_vscode=true
     fi
     if [ -f "$repo_root/.claude/settings.local.json" ]; then
@@ -1745,7 +2193,8 @@ cmd_selftest() {
 _h_total_nodes=0 _h_active=0 _h_ready=0 _h_blocked=0 _h_blocked_ext=0
 _h_done_count=0 _h_pending=0 _h_total_edges=0 _h_blocking_edges=0
 _h_total_pitfalls=0 _h_addressed_pitfalls=0 _h_unaddressed_pitfalls=0
-_h_orphan_nodes=0 _h_orphan_ids="[]" _h_ghost_edges=0 _h_empty_edge_ctx=0
+_h_orphan_nodes=0 _h_orphan_ids="[]" _h_intentional_standalones=0
+_h_intentional_standalone_ids="[]" _h_ghost_edges=0 _h_empty_edge_ctx=0
 _h_gh_duplicates=0 _h_gh_duplicate_issues="[]"
 _h_stale_active=0 _h_contradictions=0 _h_invalid_statuses=0
 _h_health_score=100 _h_issues="" _h_fixed_edge_ctx=0
@@ -1818,15 +2267,33 @@ _health_collect_metrics() {
     ")
     _h_unaddressed_pitfalls=$((_h_total_pitfalls - _h_addressed_pitfalls))
 
-    # Orphan nodes (no edges at all)
+    # Intentional standalone nodes (no edges, but explicitly marked standalone=true)
+    _h_intentional_standalones=$(db_query "
+        SELECT COUNT(*) FROM nodes n
+        WHERE COALESCE(json_extract(n.metadata, '\$.standalone'), 0) = 1
+        AND n.id NOT IN (SELECT source FROM edges)
+        AND n.id NOT IN (SELECT target FROM edges);
+    ")
+    _h_intentional_standalones="${_h_intentional_standalones:-0}"
+    _h_intentional_standalone_ids=$(db_query "
+        SELECT json_group_array(n.id) FROM nodes n
+        WHERE COALESCE(json_extract(n.metadata, '\$.standalone'), 0) = 1
+        AND n.id NOT IN (SELECT source FROM edges)
+        AND n.id NOT IN (SELECT target FROM edges);
+    ")
+    _h_intentional_standalone_ids="${_h_intentional_standalone_ids:-[]}"
+
+    # Orphan nodes (no edges at all, excluding intentional standalones)
     _h_orphan_nodes=$(db_query "
         SELECT COUNT(*) FROM nodes n
-        WHERE n.id NOT IN (SELECT source FROM edges)
+        WHERE COALESCE(json_extract(n.metadata, '\$.standalone'), 0) != 1
+        AND n.id NOT IN (SELECT source FROM edges)
         AND n.id NOT IN (SELECT target FROM edges);
     ")
     _h_orphan_ids=$(db_query "
         SELECT json_group_array(n.id) FROM nodes n
-        WHERE n.id NOT IN (SELECT source FROM edges)
+        WHERE COALESCE(json_extract(n.metadata, '\$.standalone'), 0) != 1
+        AND n.id NOT IN (SELECT source FROM edges)
         AND n.id NOT IN (SELECT target FROM edges);
     ")
     _h_orphan_ids="${_h_orphan_ids:-[]}"
@@ -2127,6 +2594,8 @@ _health_format_json() {
         --argjson unaddressed_pitfalls "$_h_unaddressed_pitfalls" \
         --argjson orphan_nodes "$_h_orphan_nodes" \
         --argjson orphan_ids "$_h_orphan_ids" \
+        --argjson intentional_standalones "$_h_intentional_standalones" \
+        --argjson intentional_standalone_ids "$_h_intentional_standalone_ids" \
         --argjson ghost_edges "$_h_ghost_edges" \
         --argjson stale_active "$_h_stale_active" \
         --argjson contradictions "$_h_contradictions" \
@@ -2165,6 +2634,8 @@ _health_format_json() {
             issues: {
                 orphan_nodes: $orphan_nodes,
                 orphan_ids: $orphan_ids,
+                intentional_standalones: $intentional_standalones,
+                intentional_standalone_ids: $intentional_standalone_ids,
                 ghost_edges: $ghost_edges,
                 stale_active: $stale_active,
                 unresolved_contradictions: $contradictions,
@@ -2227,6 +2698,7 @@ _health_format_text() {
         echo ""
         echo -e "${CYAN}Diagnostics:${NC}"
         echo "  Orphan nodes: $_h_orphan_nodes"
+        echo "  Intentional standalones: $_h_intentional_standalones (excluded from orphan count)"
         echo "  Ghost edges: $_h_ghost_edges"
         echo "  Stale active (>7d): $_h_stale_active"
         echo "  Unresolved contradictions: $_h_contradictions"
@@ -2791,9 +3263,9 @@ Create with a linked issue (atomic):
 Close (auto-closes linked GH issue):
   wv done <id> --learning="..."      # closes node + linked GH issue
 
-Ship (done + sync + push in one):
+Ship (done + sync in one; pending Git sync is surfaced separately):
   git add <files> && git commit -m "..."   # commit code first
-  wv ship <id> --learning="..."            # close + sync + push
+    wv ship <id> --learning="..."            # close + sync; check status for Git sync
 
 Sync epic bodies / Mermaid diagrams:
   wv sync --gh                       # full bidirectional sync
@@ -2901,7 +3373,7 @@ Key compound tools (prefer over multiple CLI calls):
   weave_overview  — status + health + ready work (session start overview)
   weave_bootstrap — single-call session context (wv bootstrap --json)
   weave_work      — claim node + return context pack
-  weave_ship      — done + sync + push in one step
+    weave_ship      — done + sync in one step; Git sync is surfaced separately
   weave_quick     — create + close trivial task in one call
   weave_preflight — pre-action checks before starting work
   weave_plan      — import markdown plan as epic + tasks
@@ -2975,6 +3447,9 @@ cmd_help_topic() {
                 cmd_analyze --help
             fi
             ;;
+        index)
+            cmd_index --help
+            ;;
         init-repo)
             cmd_init_repo --help
             ;;
@@ -2997,7 +3472,7 @@ cmd_help_topic() {
             print_command_help "wv done <id> [--learning=\"...\"] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--no-warn] [--acknowledge-overlap] [--skip-verification] [--no-overlap-check]" "Close a node and optionally store structured learnings or bypass flags when policy allows it."
             ;;
         ship)
-            print_command_help "wv ship <id> [--learning=\"...\"] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--gh] [--no-overlap-check]" "Close a node and immediately sync/push the graph state in one step."
+            print_command_help "wv ship <id> [--learning=\"...\"] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--gh] [--no-overlap-check]" "Close a node and sync graph state in one step; any remaining Git sync is surfaced separately."
             ;;
         batch-done)
             print_command_help "wv batch-done <id1> <id2> ... [--learning=\"...\"] [--no-warn]" "Close multiple nodes with a shared learning note."
@@ -3099,7 +3574,7 @@ cmd_help_topic() {
             print_command_help "wv selftest [--json]" "Run a round-trip smoke test in an isolated environment."
             ;;
         mcp-status)
-            print_command_help "wv mcp-status [--json]" "Check whether the local MCP server is built and IDE-configured."
+            print_command_help "wv mcp-status [--json]" "Check whether the local MCP server is built and whether the IDE config contains the current Weave server/env entries."
             ;;
         health)
             print_command_help "wv health [--history[=N]] [--verbose] [--json]" "Run system health checks and optionally include recent health history."
@@ -3162,7 +3637,7 @@ Commands:
   add <text>        Add a node (returns ID) [--gh creates GitHub issue]
   delete <id>       Permanently remove a node + edges [--force] [--dry-run] [--no-gh]
   done <id>         Mark node complete [--learning="..."] [--no-warn] [auto-closes GH issue]
-  ship <id>         Done + sync + push in one step [--learning="..."] [--gh]
+    ship <id>         Done + sync in one step; Git sync surfaced separately [--learning="..."] [--gh]
   batch-done        Close multiple nodes [--learning="..."] [--no-warn]
   bulk-update       Update multiple nodes from JSON on stdin [--dry-run]
   work <id>         Claim node & set WV_ACTIVE for subagent context [--quiet]
@@ -3202,7 +3677,7 @@ Commands:
   init-repo         Bootstrap repo for Weave [--agent=claude|copilot|all] [--update] [--force]
   doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]
   selftest          Round-trip smoke test in isolated environment [--json]
-  mcp-status        Verify MCP server is built and IDE-configured [--json]
+    mcp-status        Verify MCP server is built and IDE config shape is current [--json]
   health            System health check with score and diagnostics [--history[=N]]
     guide             Workflow quick reference [--topic=workflow|github|learnings|context|routing|mcp]
   prune             Archive old done nodes
@@ -3248,7 +3723,7 @@ Options:
 
 Examples:
   wv add "Fix authentication bug"
-  wv add "Refactor API" --status=active --gh
+    wv add "Refactor API" --status=active --criteria="make check passes|docs updated" --risks=low --gh
   wv ready
   wv work wv-a1b2                             # claim node, show WV_ACTIVE export
   eval "\$(wv work wv-a1b2 --quiet)"          # claim and set WV_ACTIVE in one command
@@ -3256,7 +3731,7 @@ Examples:
   wv help update                              # focused help for one command
   wv show --help                              # alternate focused help form
   wv done wv-a1b2 --learning="pattern: always check X"
-  wv ship wv-a1b2 --learning="decision: ..."  # done + sync + push
+    wv ship wv-a1b2 --learning="decision: ..."  # done + sync; check status for Git sync
   wv batch-done wv-a1b2 wv-c3d4 --learning="sprint complete"
   wv preflight wv-a1b2                        # check blockers/contradictions
   wv recover --auto                           # resume interrupted operations

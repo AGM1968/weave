@@ -217,6 +217,59 @@ test_init_recovery() {
     rm -rf "$INIT_TEST_DIR"
 }
 
+test_leaked_env_overrides_are_ignored_across_repos() {
+    echo ""
+    echo "Test: leaked WV_HOT_ZONE/WV_DB overrides are ignored across repos"
+    echo "==============================================================="
+
+    local source_repo target_repo old_hot old_db old_project
+    source_repo=$(mktemp -d)
+    target_repo=$(mktemp -d)
+    old_hot="${WV_HOT_ZONE:-}"
+    old_db="${WV_DB:-}"
+    old_project="${WV_PROJECT_DIR:-}"
+
+    cd "$source_repo"
+    git init -q
+    export WV_HOT_ZONE="$source_repo/hot"
+    export WV_DB="$WV_HOT_ZONE/brain.db"
+    export WV_PROJECT_DIR="$source_repo"
+
+    "$WV" init >/dev/null 2>&1
+    "$WV" add "Source repo node" >/dev/null 2>&1
+    assert_success "custom hot zone records owning repo" test -f "$source_repo/hot/.repo_root"
+
+    cd "$target_repo"
+    git init -q
+
+    local target_hot target_db output source_target_count target_target_count
+    target_hot=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR WEAVE_DIR="$target_repo/.weave" \
+        bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_repo_hot_zone \"\$(resolve_hot_zone)\" '$target_repo'" 2>/dev/null)
+    target_db="$target_hot/brain.db"
+
+    output=$("$WV" add "Target repo node" 2>&1)
+    assert_contains "$output" "ignoring leaked WV_HOT_ZONE/WV_DB override" \
+        "foreign repo warns when leaked WV overrides are ignored"
+
+    source_target_count=$(sqlite3 "$source_repo/hot/brain.db" "SELECT COUNT(*) FROM nodes WHERE text='Target repo node';" 2>/dev/null || echo "0")
+    target_target_count=$(sqlite3 "$target_db" "SELECT COUNT(*) FROM nodes WHERE text='Target repo node';" 2>/dev/null || echo "0")
+    assert_equals "0" "$source_target_count" \
+        "leaked overrides do not write into the source repo DB"
+    assert_equals "1" "$target_target_count" \
+        "leaked overrides fall back to the target repo DB"
+
+    export WV_HOT_ZONE="$old_hot"
+    export WV_DB="$old_db"
+    if [ -n "$old_project" ]; then
+        export WV_PROJECT_DIR="$old_project"
+    else
+        unset WV_PROJECT_DIR
+    fi
+
+    cd /tmp
+    rm -rf "$source_repo" "$target_repo"
+}
+
 # ============================================================================
 # Test: add
 # ============================================================================
@@ -237,8 +290,12 @@ test_add() {
     id=$(echo "$output" | tail -1)
     assert_contains "$id" "wv-" "add returns bare ID on last line"
 
-    # Add with status
-    output=$("$WV" add "Active task" --status=active 2>&1)
+    # Direct add-to-active must carry the same planning metadata that wv work
+    # would require on the claim path.
+    assert_fails "add --status=active requires claim-ready metadata" "$WV" add "Active task" --status=active
+
+    # Add with active status + claim-ready metadata
+    output=$("$WV" add "Active task" --status=active --criteria="tests pass|docs updated" --risks=low 2>&1)
     id=$(echo "$output" | tail -1)
     local show_output
     show_output=$("$WV" show "$id" 2>&1)
@@ -251,6 +308,14 @@ test_add() {
     # Metadata is JSON-encoded in the output, so quotes are escaped
     assert_contains "$show_output" 'priority' "add --metadata stores JSON"
     assert_contains "$show_output" 'bug' "add --metadata stores all fields"
+
+    # Add with --standalone persists durable standalone intent
+    output=$("$WV" add "Standalone task" --standalone 2>&1)
+    id=$(echo "$output" | tail -1)
+    show_output=$("$WV" show "$id" --json 2>&1)
+    local standalone_meta
+    standalone_meta=$(echo "$show_output" | jq -r '.[0].metadata | fromjson | .standalone' 2>/dev/null)
+    assert_equals "true" "$standalone_meta" "add --standalone stores standalone intent"
 
     # Add fails without text
     assert_fails "add requires text" "$WV" add
@@ -357,8 +422,23 @@ test_done() {
     assert_contains "$finding_overlap_meta" '"status":"done"' "finding node is closed despite overlap"
     assert_not_contains "$finding_overlap_meta" "learning_overlap_noted" "finding close also skips overlap advisory metadata in non-interactive mode"
 
-    local ship_id ship_exit ship_output ship_meta ship_remote
+    local ship_id ship_exit ship_output ship_meta ship_remote ship_status
+    local ship_repo ship_hot old_hot old_db old_pwd
+    ship_repo="$TEST_DIR/ship-repo"
+    ship_hot="$TEST_DIR/ship-hot"
     ship_remote="$TEST_DIR/ship-remote.git"
+    old_hot="$WV_HOT_ZONE"
+    old_db="$WV_DB"
+    old_pwd="$PWD"
+
+    rm -rf "$ship_repo" "$ship_hot" "$ship_remote"
+    mkdir -p "$ship_repo" "$ship_hot"
+    cd "$ship_repo"
+    git init -q
+    export WV_HOT_ZONE="$ship_hot"
+    export WV_DB="$ship_hot/brain.db"
+    "$WV" init >/dev/null 2>&1
+
     git config user.email "test@example.com"
     git config user.name "Weave Test"
     git init --bare -q "$ship_remote"
@@ -375,6 +455,26 @@ test_done() {
     assert_contains "$ship_meta" '"status":"done"' "ship still closes the node with --no-overlap-check"
     assert_not_contains "$ship_meta" "learning_overlap_noted" "ship forwards no-overlap-check to done"
 
+    ship_status=$("$WV" status --json 2>&1)
+    assert_contains "$ship_status" '"git_sync_pending": true' "ship leaves pending remote sync surfaced in status"
+    assert_contains "$ship_status" '"git_sync_reason": "dirty_weave"' "ship status reports dirty_weave after local-only completion"
+
+    git remote remove origin >/dev/null 2>&1 || true
+    local ship_local_id ship_local_exit ship_local_meta ship_local_status
+    ship_local_id=$("$WV" add "Ship local complete" 2>&1 | tail -1)
+    ship_local_exit=0
+    WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" ship "$ship_local_id" --learning="$overlap_learning" --no-overlap-check >/dev/null 2>&1 || ship_local_exit=$?
+    assert_equals "0" "$ship_local_exit" "ship succeeds without an upstream"
+    ship_local_meta=$("$WV" show "$ship_local_id" --json 2>&1)
+    assert_contains "$ship_local_meta" '"status":"done"' "ship still closes the node without an upstream"
+    ship_local_status=$("$WV" status --json 2>&1)
+    assert_contains "$ship_local_status" '"git_sync_pending": true' "status surfaces pending git sync without an upstream"
+    assert_contains "$ship_local_status" '"git_sync_reason": "no_upstream"' "status reports no_upstream after local-only ship"
+
+    cd "$old_pwd"
+    export WV_HOT_ZONE="$old_hot"
+    export WV_DB="$old_db"
+
     # --acknowledge-overlap still clears legacy pending_close state (backward compat)
     local legacy_id legacy_meta legacy_exit legacy_output
     legacy_id=$("$WV" add "Legacy stuck node" 2>&1 | tail -1)
@@ -385,6 +485,69 @@ test_done() {
     legacy_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$legacy_id" --acknowledge-overlap 2>&1) || legacy_exit=$?
     assert_equals "0" "$legacy_exit" "done clears legacy pending_close with --acknowledge-overlap"
     assert_contains "$legacy_output" "Closed" "acknowledge-overlap closes legacy stuck node"
+}
+
+test_done_stores_commit_hashes() {
+    echo ""
+    echo "Test: wv done stores attributed commit hashes"
+    echo "==========================================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+    git config user.name "Weave Test"
+    git config user.email "weave-test@example.com"
+
+    local id output node_json stored_commit stored_first head_sha
+    id=$("$WV" add "Commit-linked close" 2>&1 | tail -1)
+    "$WV" work "$id" >/dev/null 2>&1
+
+    echo "tracked" > commit-linked.txt
+    git add commit-linked.txt
+    git commit -m "feat: commit-linked close" -m "Weave-ID: $id" -q
+
+    output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$id" --learning="decision: commit before done | pattern: use Weave-ID trailers for commit attribution | pitfall: unattributed commits never reach node metadata" 2>&1)
+    assert_contains "$output" "Closed" "done succeeds when the work commit is attributed"
+
+    head_sha=$(git rev-parse HEAD)
+    node_json=$("$WV" show "$id" --json 2>&1)
+    stored_commit=$(echo "$node_json" | jq -r '.[0].metadata | fromjson | .commit // empty' 2>/dev/null || echo "")
+    stored_first=$(echo "$node_json" | jq -r '.[0].metadata | fromjson | .commits[0] // empty' 2>/dev/null || echo "")
+    assert_equals "$head_sha" "$stored_commit" "done stores the primary commit hash in metadata"
+    assert_equals "$head_sha" "$stored_first" "done stores the commit hash array in metadata"
+}
+
+test_done_prefers_implementation_commit_over_checkpoint() {
+    echo ""
+    echo "Test: wv done prefers implementation commit over checkpoint"
+    echo "========================================================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+    git config user.name "Weave Test"
+    git config user.email "weave-test@example.com"
+
+    local id output node_json stored_commit stored_first stored_second impl_sha checkpoint_sha
+    id=$("$WV" add "Commit precedence close" 2>&1 | tail -1)
+    "$WV" work "$id" >/dev/null 2>&1
+
+    echo "tracked" > commit-precedence.txt
+    git add commit-precedence.txt
+    git commit -m "feat: implementation commit" -m "Weave-ID: $id" -q
+    impl_sha=$(git rev-parse HEAD)
+
+    git commit --allow-empty -m "chore(weave): auto-checkpoint 15:32 [skip ci]" -m "Weave-ID: $id" -q
+    checkpoint_sha=$(git rev-parse HEAD)
+
+    output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$id" --learning="decision: keep work commits primary | pattern: relegate auto-checkpoints behind implementation commits | pitfall: raw git log order can promote checkpoint noise" 2>&1)
+    assert_contains "$output" "Closed" "done succeeds when checkpoint and implementation commits are both attributed"
+
+    node_json=$("$WV" show "$id" --json 2>&1)
+    stored_commit=$(echo "$node_json" | jq -r '.[0].metadata | fromjson | .commit // empty' 2>/dev/null || echo "")
+    stored_first=$(echo "$node_json" | jq -r '.[0].metadata | fromjson | .commits[0] // empty' 2>/dev/null || echo "")
+    stored_second=$(echo "$node_json" | jq -r '.[0].metadata | fromjson | .commits[1] // empty' 2>/dev/null || echo "")
+    assert_equals "$impl_sha" "$stored_commit" "done keeps the implementation commit as primary metadata"
+    assert_equals "$impl_sha" "$stored_first" "done orders implementation commit first in commits metadata"
+    assert_equals "$checkpoint_sha" "$stored_second" "done retains checkpoint commit as secondary attribution"
 }
 
 # ============================================================================
@@ -458,7 +621,7 @@ test_list() {
     # Create nodes with different statuses
     local id1 id2 id3
     id1=$("$WV" add "Todo task" --status=todo 2>&1 | tail -1)
-    id2=$("$WV" add "Active task" --status=active 2>&1 | tail -1)
+    id2=$("$WV" add "Active task" --status=active --criteria="tests pass" --risks=low 2>&1 | tail -1)
     id3=$("$WV" add "Done task" --status=done 2>&1 | tail -1)
 
     # Default list excludes done
@@ -585,7 +748,7 @@ test_status() {
 
     # Create some nodes
     "$WV" add "Task 1" --status=todo >/dev/null 2>&1
-    "$WV" add "Task 2" --status=active >/dev/null 2>&1
+    "$WV" add "Task 2" --status=active --criteria="status shows active work" --risks=low >/dev/null 2>&1
     local id3
     id3=$("$WV" add "Task 3" 2>&1 | tail -1)
     "$WV" done "$id3" >/dev/null 2>&1
@@ -616,8 +779,8 @@ test_stale_active_marker() {
     "$WV" init >/dev/null 2>&1
 
     local fresh_id stale_id
-    fresh_id=$("$WV" add "fresh active task" --status=active 2>&1 | tail -1)
-    stale_id=$("$WV" add "stale active task" --status=active 2>&1 | tail -1)
+    fresh_id=$("$WV" add "fresh active task" --status=active --criteria="fresh node visible in status" --risks=low 2>&1 | tail -1)
+    stale_id=$("$WV" add "stale active task" --status=active --criteria="stale node visible in status" --risks=low 2>&1 | tail -1)
 
     # Backdate the stale node 25 hours via direct sqlite3
     sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-25 hours') WHERE id='$stale_id';"
@@ -983,8 +1146,8 @@ test_findings_promote() {
 # ============================================================================
 test_policy_trigger() {
     echo ""
-    echo "Test: policy trigger — done gate on mccabe_max breach"
-    echo "======================================================"
+    echo "Test: policy trigger — done gate on metric and trend breaches"
+    echo "============================================================"
 
     setup_test_env
     "$WV" init >/dev/null 2>&1
@@ -1020,6 +1183,25 @@ SQL
     assert_equals "active" "$breach_status" \
         "node remains active after trigger abort"
 
+    # --- Case 4: trigger payload is JSON with required keys ---
+    local payload_valid
+    payload_valid=$(echo "$breach_out" | grep -o '{[^}]*}' | head -1 | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read().strip())
+    keys = {'error','threshold','actual','path'}
+    print('True' if keys.issubset(d.keys()) else 'False: missing '+str(keys-d.keys()))
+except Exception as e:
+    print('False: '+str(e))
+" 2>/dev/null || echo "False: python3 unavailable")
+    assert_equals "True" "$payload_valid" \
+        "trigger abort payload is JSON with error/threshold/actual/path keys"
+
+    local breach_threshold
+    breach_threshold=$(echo "$breach_out" | grep -o '"threshold":"[^"]*"' | head -1 | cut -d '"' -f4)
+    assert_equals "mccabe_max" "$breach_threshold" \
+        "mccabe policy violation payload names the breached threshold"
+
     # --- Case 2: node whose file is within threshold closes normally ---
     local clean_id
     clean_id=$("$WV" add "Node with clean file" 2>&1 | tail -1)
@@ -1043,6 +1225,300 @@ SQL
     search_out=$("$WV" search "regression check" 2>&1)
     assert_contains "$search_out" "regression" \
         "FTS search unaffected by policy trigger (no AFTER UPDATE regression)"
+
+    # --- Case 5: deteriorating trend can be promoted to a hard gate ---
+    sqlite3 "$WV_DB" <<'SQL'
+INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES ('trend_deteriorating', 1);
+SQL
+
+    local trend_id
+    trend_id=$("$WV" add "Node with deteriorating trend" 2>&1 | tail -1)
+    "$WV" work "$trend_id" >/dev/null 2>&1
+
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_metrics(path, mccabe_max) VALUES ('src/trending.py', 5);
+INSERT OR REPLACE INTO file_trend(path, direction) VALUES ('src/trending.py', 'deteriorating');
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$trend_id', 'src/trending.py');
+SQL
+
+    local trend_out
+    trend_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$trend_id" 2>&1 || true)
+    assert_contains "$trend_out" "GraphPolicyViolation" \
+        "done is blocked when deteriorating trend gate is enabled"
+    assert_contains "$trend_out" '"path":"src/trending.py"' \
+        "trend policy violation payload includes the blocking path"
+    assert_contains "$trend_out" '"direction":"deteriorating"' \
+        "trend policy violation payload includes the trend direction"
+
+    local trend_threshold
+    trend_threshold=$(echo "$trend_out" | grep -o '"threshold":"[^"]*"' | head -1 | cut -d '"' -f4)
+    assert_equals "trend_deteriorating" "$trend_threshold" \
+        "trend policy violation payload names the breached threshold"
+
+    local trend_status
+    trend_status=$(sqlite3 "$WV_DB" "SELECT status FROM nodes WHERE id='$trend_id';")
+    assert_equals "active" "$trend_status" \
+        "node remains active after trend trigger abort"
+}
+
+test_trend_signal_wiring() {
+    echo ""
+    echo "Test: P5b — file_trend table and _done_refresh_trend_signals"
+    echo "============================================================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # --- Case 1: file_trend table exists after wv init ---
+    local table_exists
+    table_exists=$(sqlite3 "$WV_DB" \
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='file_trend';" 2>/dev/null)
+    assert_equals "file_trend" "$table_exists" \
+        "file_trend table exists after wv init"
+
+    # --- Case 2: WV_REQUIRE_QUALITY=0 skips trend refresh silently ---
+    local skip_id
+    skip_id=$("$WV" add "Trend skip test node" 2>&1 | tail -1)
+    "$WV" work "$skip_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$skip_id', 'src/trend_file.py');
+SQL
+    local skip_out
+    skip_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$skip_id" --skip-verification 2>&1)
+    assert_contains "$skip_out" "Closed" \
+        "wv done succeeds with trend refresh skipped (WV_REQUIRE_QUALITY=0)"
+
+    local trend_count
+    trend_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM file_trend;" 2>/dev/null)
+    assert_equals "0" "$trend_count" \
+        "file_trend remains empty when WV_REQUIRE_QUALITY=0"
+
+    # --- Case 3: migration path also creates file_trend ---
+    local migrated_db
+    migrated_db=$(mktemp /tmp/wv-migtest-XXXXXX.db)
+    sqlite3 "$migrated_db" <<'SQL'
+CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, text TEXT, status TEXT,
+    metadata TEXT DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS edges (source TEXT, target TEXT, type TEXT);
+SQL
+    WV_DB="$migrated_db" bash -c "
+        source '$PROJECT_ROOT/scripts/lib/wv-db.sh'
+        db_migrate_policy_tables
+    " 2>/dev/null
+    local mig_table
+    mig_table=$(sqlite3 "$migrated_db" \
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='file_trend';" 2>/dev/null)
+    rm -f "$migrated_db"
+    assert_equals "file_trend" "$mig_table" \
+        "file_trend table created by db_migrate_policy_tables on existing DB"
+}
+
+test_chunk_store_schema() {
+    echo ""
+    echo "Test: chunk store — schema and migration"
+    echo "========================================"
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # --- Case 1: chunks table exists after wv init ---
+    local table_exists
+    table_exists=$(sqlite3 "$WV_DB" \
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='chunks';" 2>/dev/null)
+    assert_equals "chunks" "$table_exists" \
+        "chunks table exists after wv init"
+
+    # --- Case 2: chunks_fts virtual table exists ---
+    local fts_exists
+    fts_exists=$(sqlite3 "$WV_DB" \
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='chunks_fts';" 2>/dev/null)
+    assert_equals "chunks_fts" "$fts_exists" \
+        "chunks_fts virtual table exists after wv init"
+
+    # --- Case 3: insert + FTS trigger fires ---
+    sqlite3 "$WV_DB" <<'SQL'
+INSERT INTO chunks(file, line_start, line_end, content)
+VALUES ('src/foo.py', 1, 10, 'def compute_trend_direction(values):');
+SQL
+    local fts_hit
+    fts_hit=$(sqlite3 "$WV_DB" \
+        "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'compute_trend_direction';" 2>/dev/null)
+    assert_equals "1" "$fts_hit" \
+        "chunks_fts FTS5 trigger indexes inserted chunk content"
+
+    # --- Case 4: migration creates chunks table on existing DB ---
+    local migrated_db
+    migrated_db=$(mktemp /tmp/wv-chunktest-XXXXXX.db)
+    sqlite3 "$migrated_db" <<'SQL'
+CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, text TEXT, status TEXT,
+    metadata TEXT DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS edges (source TEXT, target TEXT, type TEXT);
+SQL
+    WV_DB="$migrated_db" bash -c "
+        source '$PROJECT_ROOT/scripts/lib/wv-db.sh'
+        db_migrate_chunks
+    " 2>/dev/null
+    local mig_table
+    mig_table=$(sqlite3 "$migrated_db" \
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='chunks';" 2>/dev/null)
+    rm -f "$migrated_db"
+    assert_equals "chunks" "$mig_table" \
+        "chunks table created by db_migrate_chunks on existing DB"
+}
+
+test_wv_index_command() {
+    echo ""
+    echo "Test: wv index — file walker, chunking, FTS population"
+    echo "========================================================"
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # --- Case 1: basic indexing produces chunks ---
+    mkdir -p "$TEST_DIR/src"
+    printf '%s\n' $(seq 1 60 | awk '{print "x = " $1}') > "$TEST_DIR/src/sample.py"
+    local idx_out
+    idx_out=$("$WV" index "$TEST_DIR/src" --no-embed --ext=.py 2>&1)
+    local chunk_count
+    chunk_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM chunks;" 2>/dev/null)
+    assert_success "wv index populates chunks table" test "$chunk_count" -gt 0
+
+    # --- Case 2: JSON output has expected keys ---
+    "$WV" index "$TEST_DIR/src" --no-embed --ext=.py --json > "$TEST_DIR/idx.json" 2>&1
+    local has_files has_chunks
+    has_files=$(jq -r 'has("files")' "$TEST_DIR/idx.json" 2>/dev/null || echo "false")
+    has_chunks=$(jq -r 'has("chunks")' "$TEST_DIR/idx.json" 2>/dev/null || echo "false")
+    assert_equals "true" "$has_files" \
+        "wv index --json output has 'files' key"
+    assert_equals "true" "$has_chunks" \
+        "wv index --json output has 'chunks' key"
+
+    # --- Case 3: indexed content is FTS searchable ---
+    sqlite3 "$WV_DB" "DELETE FROM chunks;" 2>/dev/null
+    printf 'def unique_sentinel_function_abc():\n    pass\n' > "$TEST_DIR/src/sentinel.py"
+    "$WV" index "$TEST_DIR/src" --no-embed --ext=.py >/dev/null 2>&1
+    local fts_hit
+    fts_hit=$(sqlite3 "$WV_DB" \
+        "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'unique_sentinel_function_abc';" 2>/dev/null)
+    assert_equals "1" "$fts_hit" \
+        "wv index content is FTS5 searchable via chunks_fts"
+
+    # --- Case 4: re-indexing same file replaces chunks (no duplicates) ---
+    local before_count after_count
+    before_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM chunks WHERE file LIKE '%sentinel.py';" 2>/dev/null)
+    "$WV" index "$TEST_DIR/src" --no-embed --ext=.py >/dev/null 2>&1
+    after_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM chunks WHERE file LIKE '%sentinel.py';" 2>/dev/null)
+    assert_equals "$before_count" "$after_count" \
+        "re-indexing same file replaces chunks (no duplicates)"
+}
+
+test_wv_search_code() {
+    echo ""
+    echo "Test: wv search --code — hybrid code search via weave_search"
+    echo "=============================================================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # Seed a sentinel function so FTS can find it
+    mkdir -p "$TEST_DIR/src"
+    printf 'def sentinel_hybrid_search_fn():\n    """Return cosine embedding distance.\"\"\"\n    pass\n' \
+        > "$TEST_DIR/src/sentinel.py"
+    "$WV" index "$TEST_DIR/src" --no-embed --ext=.py >/dev/null 2>&1
+
+    # --- Case 1: --code routes to Python and returns JSON results ---
+    local search_json
+    search_json=$("$WV" search --code sentinel_hybrid_search_fn --json --mode=fts 2>/dev/null)
+    local result_count
+    result_count=$(echo "$search_json" | jq '.results | length' 2>/dev/null || echo "0")
+    assert_success "wv search --code finds indexed content" test "$result_count" -gt 0
+
+    # --- Case 2: JSON result contains required fields ---
+    local has_file has_score has_snippet has_source
+    has_file=$(echo "$search_json" | jq -r '.results[0] | has("file")' 2>/dev/null || echo "false")
+    has_score=$(echo "$search_json" | jq -r '.results[0] | has("score")' 2>/dev/null || echo "false")
+    has_snippet=$(echo "$search_json" | jq -r '.results[0] | has("snippet")' 2>/dev/null || echo "false")
+    has_source=$(echo "$search_json" | jq -r '.results[0] | has("source")' 2>/dev/null || echo "false")
+    assert_equals "true" "$has_file"    "wv search --code JSON has 'file' field"
+    assert_equals "true" "$has_score"   "wv search --code JSON has 'score' field"
+    assert_equals "true" "$has_snippet" "wv search --code JSON has 'snippet' field"
+    assert_equals "true" "$has_source"  "wv search --code JSON has 'source' field"
+
+    # --- Case 3: JSON output reports readiness diagnostics ---
+    local chunks_ready readiness_has_quality readiness_has_node_files
+    chunks_ready=$(echo "$search_json" | jq -r '.readiness.chunks.ready' 2>/dev/null || echo "false")
+    readiness_has_quality=$(echo "$search_json" | jq -r '.readiness | has("quality_db")' 2>/dev/null || echo "false")
+    readiness_has_node_files=$(echo "$search_json" | jq -r '.readiness | has("node_files")' 2>/dev/null || echo "false")
+    assert_equals "true" "$chunks_ready" "wv search --code readiness marks indexed chunks ready"
+    assert_equals "true" "$readiness_has_quality" "wv search --code JSON has quality_db readiness"
+    assert_equals "true" "$readiness_has_node_files" "wv search --code JSON has node_files readiness"
+
+    # --- Case 4: empty chunks report readiness instead of silent [] ---
+    local empty_db="$TEST_DIR/empty.db"
+    sqlite3 "$empty_db" "CREATE TABLE chunks (id INTEGER PRIMARY KEY); CREATE TABLE node_files (node_id TEXT, path TEXT);" 2>/dev/null
+    local empty_out
+    empty_out=$(WV_DB="$empty_db" "$WV" search --code nosuchterm --json --mode=fts 2>/dev/null || echo '{}')
+    assert_equals "0" "$(echo "$empty_out" | jq -r '.results | length' 2>/dev/null || echo 1)" \
+        "wv search --code with empty db returns zero results"
+    assert_equals "false" "$(echo "$empty_out" | jq -r '.readiness.chunks.ready' 2>/dev/null || echo true)" \
+        "wv search --code with empty db reports chunks not ready"
+    assert_equals "empty" "$(echo "$empty_out" | jq -r '.readiness.chunks.status' 2>/dev/null || echo unknown)" \
+        "wv search --code with empty db reports empty chunk readiness"
+
+    # --- Case 5: custom WV_DB stays quiet and avoids graph-table pollution ---
+    local custom_db="$TEST_DIR/custom-search.db"
+    sqlite3 "$custom_db" "CREATE TABLE chunks (id INTEGER PRIMARY KEY); CREATE TABLE node_files (node_id TEXT, path TEXT);" 2>/dev/null
+    local custom_out custom_edges
+    custom_out=$(WV_DB="$custom_db" "$WV" search --code nosuchterm --json --mode=fts 2>&1 || true)
+    custom_edges=$(sqlite3 "$custom_db" \
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='edges';" 2>/dev/null || echo "0")
+    assert_not_contains "$custom_out" "Parse error near line" \
+        "wv search --code with custom WV_DB skips graph migration noise"
+    assert_equals "0" "$custom_edges" \
+        "wv search --code with custom WV_DB does not create graph tables"
+}
+
+test_preflight_policy_readiness() {
+    echo ""
+    echo "Test: wv preflight policy_readiness"
+    echo "==================================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # --- Case 1: node without tracked files is not policy-sensitive ---
+    local idle_id idle_json
+    idle_id=$("$WV" add "Idle policy preflight node" 2>&1 | tail -1)
+    "$WV" work "$idle_id" >/dev/null 2>&1
+    idle_json=$("$WV" preflight "$idle_id" 2>/dev/null)
+    assert_equals "false" "$(echo "$idle_json" | jq -r '.policy_readiness.policy_sensitive' 2>/dev/null || echo true)" \
+        "wv preflight reports nodes without tracked files as not policy-sensitive"
+    assert_equals "false" "$(echo "$idle_json" | jq -r '.policy_readiness.blocking' 2>/dev/null || echo true)" \
+        "wv preflight does not block when no tracked files exist"
+
+    # --- Case 2: tracked files without quality.db block policy-sensitive completion ---
+    local blocked_id blocked_json
+    blocked_id=$("$WV" add "Blocked policy preflight node" 2>&1 | tail -1)
+    "$WV" work "$blocked_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$blocked_id', 'src/policy.py');"
+    blocked_json=$("$WV" preflight "$blocked_id" 2>/dev/null)
+    assert_equals "true" "$(echo "$blocked_json" | jq -r '.policy_readiness.policy_sensitive' 2>/dev/null || echo false)" \
+        "wv preflight marks tracked-file nodes as policy-sensitive"
+    assert_equals "true" "$(echo "$blocked_json" | jq -r '.policy_readiness.blocking' 2>/dev/null || echo false)" \
+        "wv preflight blocks policy-sensitive completion when quality.db is missing"
+    assert_equals "missing" "$(echo "$blocked_json" | jq -r '.policy_readiness.quality.status' 2>/dev/null || echo unknown)" \
+        "wv preflight reports missing quality prerequisites"
+
+    # --- Case 3: quality scan data clears the policy_readiness block ---
+    sqlite3 "$WV_HOT_ZONE/quality.db" "CREATE TABLE scan_meta (id INTEGER PRIMARY KEY); INSERT INTO scan_meta(id) VALUES (1);" 2>/dev/null
+    local ready_json
+    ready_json=$("$WV" preflight "$blocked_id" 2>/dev/null)
+    assert_equals "true" "$(echo "$ready_json" | jq -r '.policy_readiness.ready' 2>/dev/null || echo false)" \
+        "wv preflight marks policy readiness ready once quality scan data exists"
+    assert_equals "false" "$(echo "$ready_json" | jq -r '.policy_readiness.blocking' 2>/dev/null || echo true)" \
+        "wv preflight clears the policy block once quality scan data exists"
 }
 
 test_p2_quality_refresh() {
@@ -1117,6 +1593,94 @@ SQL
         "file_metrics in brain.db populated from quality.db complexity"
 }
 
+test_trend_soft_warning() {
+    echo ""
+    echo "Test: P5c — soft warning on deteriorating complexity trend"
+    echo "=========================================================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    local quality_db="$WV_HOT_ZONE/quality.db"
+    sqlite3 "$quality_db" <<'SQL'
+CREATE TABLE IF NOT EXISTS scan_meta (
+    id INTEGER PRIMARY KEY,
+    scanned_at TEXT,
+    git_head TEXT,
+    files_count INTEGER,
+    duration_ms INTEGER,
+    scanner_version TEXT
+);
+CREATE TABLE IF NOT EXISTS files (
+    path TEXT,
+    scan_id INTEGER,
+    complexity REAL,
+    PRIMARY KEY(path, scan_id)
+);
+CREATE TABLE IF NOT EXISTS complexity_trend (
+    path TEXT NOT NULL,
+    scan_id INTEGER NOT NULL,
+    complexity REAL,
+    essential REAL,
+    PRIMARY KEY(path, scan_id)
+);
+INSERT INTO scan_meta(id, scanned_at, git_head) VALUES
+    (1, '2026-01-01T00:00:00', 'abc1234'),
+    (2, '2026-01-02T00:00:00', 'def5678');
+INSERT INTO files(path, scan_id, complexity) VALUES
+    ('src/deteriorating.py', 2, 12.0),
+    ('src/stable.py', 2, 12.0),
+    ('src/refactored.py', 2, 10.0);
+INSERT INTO complexity_trend(path, scan_id, complexity, essential) VALUES
+    ('src/deteriorating.py', 1, 10.0, 1.0),
+    ('src/deteriorating.py', 2, 12.0, 2.0),
+    ('src/stable.py', 1, 12.0, 1.0),
+    ('src/stable.py', 2, 12.0, 1.0),
+    ('src/refactored.py', 1, 14.0, 3.0),
+    ('src/refactored.py', 2, 10.0, 1.0);
+SQL
+
+    local parent warning_learning
+    parent=$("$WV" add "Trend parent" 2>&1 | tail -1)
+    warning_learning="decision: run make check | pattern: make check covers trend warnings | pitfall: watch deteriorating files before close"
+
+    local det_id det_out det_trend
+    det_id=$("$WV" add "Deteriorating trend node" 2>&1 | tail -1)
+    "$WV" link "$det_id" "$parent" --type=implements >/dev/null 2>&1
+    "$WV" work "$det_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$det_id', 'src/deteriorating.py');"
+    det_out=$("$WV" done "$det_id" --learning="$warning_learning" 2>&1)
+    assert_contains "$det_out" "Complexity trend deteriorating: src/deteriorating.py" \
+        "wv done warns when a touched file trend is deteriorating"
+    det_trend=$(sqlite3 "$WV_DB" "SELECT direction FROM file_trend WHERE path='src/deteriorating.py';" 2>/dev/null)
+    assert_equals "deteriorating" "$det_trend" \
+        "file_trend stores deteriorating direction for warned path"
+
+    local stable_id stable_out stable_trend
+    stable_id=$("$WV" add "Stable trend node" 2>&1 | tail -1)
+    "$WV" link "$stable_id" "$parent" --type=implements >/dev/null 2>&1
+    "$WV" work "$stable_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$stable_id', 'src/stable.py');"
+    stable_out=$("$WV" done "$stable_id" --learning="$warning_learning" 2>&1)
+    assert_not_contains "$stable_out" "Complexity trend" \
+        "wv done stays quiet for stable trend paths"
+    stable_trend=$(sqlite3 "$WV_DB" "SELECT direction FROM file_trend WHERE path='src/stable.py';" 2>/dev/null)
+    assert_equals "stable" "$stable_trend" \
+        "file_trend stores stable direction without warning"
+
+    local ref_id ref_out ref_trend
+    ref_id=$("$WV" add "Refactored trend node" 2>&1 | tail -1)
+    "$WV" link "$ref_id" "$parent" --type=implements >/dev/null 2>&1
+    "$WV" work "$ref_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$ref_id', 'src/refactored.py');"
+    ref_out=$("$WV" done "$ref_id" --learning="$warning_learning" 2>&1)
+    assert_not_contains "$ref_out" "Complexity trend" \
+        "wv done stays quiet for refactored trend paths"
+    ref_trend=$(sqlite3 "$WV_DB" "SELECT direction FROM file_trend WHERE path='src/refactored.py';" 2>/dev/null)
+    assert_equals "refactored" "$ref_trend" \
+        "file_trend stores refactored direction without warning"
+}
+
 test_allowed_tools() {
     echo ""
     echo "Test: wv allowed-tools command and work/done flag support"
@@ -1183,9 +1747,11 @@ main() {
 
     test_init
     test_init_recovery
+    test_leaked_env_overrides_are_ignored_across_repos
     test_add
     test_orphan_prevention
     test_done
+    test_done_stores_commit_hashes
     test_findings_promote
     test_work
     test_list
@@ -1194,7 +1760,13 @@ main() {
     test_status
     test_stale_active_marker
     test_policy_trigger
+    test_trend_signal_wiring
+    test_chunk_store_schema
+    test_wv_index_command
+    test_wv_search_code
+    test_preflight_policy_readiness
     test_p2_quality_refresh
+    test_trend_soft_warning
     test_allowed_tools
     test_ready_relevance_boost
     test_done_contradiction

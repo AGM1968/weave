@@ -2,6 +2,40 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.45.0] - 2026-05-10
+
+### Added
+
+- **Weave-native code search**: shipped `wv index`, `wv search --code`, `weave_index`, and
+  `weave_code_search` with hybrid FTS5 + cosine retrieval, graph-enriched result context, and a
+  dedicated migration/reference guide in `docs/weave-search.md`.
+
+- **Policy readiness in preflight**: `wv preflight` now exposes structured `policy_readiness`, and
+  MCP `weave_preflight` blocks policy-sensitive nodes only when tracked files make attribution and
+  quality prerequisites real.
+
+- **Canonical attribution substrate**: runtime resolution, primary-aware attribution helpers, and
+  touched-files hook writes to `node_files` now align CLI, hooks, and MCP surfaces around the same
+  tracked-file policy/search state.
+
+### Changed
+
+- **Search and preflight diagnostics**: readiness surfaces now report actionable prerequisite state
+  in-band instead of collapsing missing setup into silent empty results or generic preflight JSON.
+
+- **Visible MCP/workflow surfaces**: init, status, help, and docs were aligned with the live
+  runtime behavior so CLI, MCP, templates, and workflow guidance describe the same operational
+  surfaces.
+
+### Fixed
+
+- **Custom `WV_DB` code search hardening**: explicit `WV_DB` overrides no longer pollute foreign
+  SQLite files with graph migrations, and hybrid/vector search now skips model bootstrap when the
+  chunk store is malformed or not vector-ready.
+
+- **Release and sync hardening**: ship/source-4 sync state, close-time commit hygiene, and
+  source-head-before-tag release discipline now reduce tag/main drift and stale status surfacing.
+
 ## [1.44.0] - 2026-05-08
 
 ### Added

@@ -108,16 +108,17 @@ MCP_README=$(cat "$PROJECT_ROOT/mcp/README.md")
 WORKFLOW_DOC=$(cat "$PROJECT_ROOT/templates/WORKFLOW.md")
 
 SERVER_COUNT=$(jq '.servers | keys | length' "$PROJECT_ROOT/.vscode/mcp.json")
-assert_equals "2" "$SERVER_COUNT" "mcp.json: shipped config has exactly two servers"
+assert_equals "4" "$SERVER_COUNT" "mcp.json: shipped config has exactly four servers"
 assert_contains "$MCP_JSON" '"weave"' "mcp.json: includes weave server"
+assert_contains "$MCP_JSON" '"weave-session"' "mcp.json: includes weave-session server"
+assert_contains "$MCP_JSON" '"weave-lite"' "mcp.json: includes weave-lite server"
 assert_contains "$MCP_JSON" '"weave-inspect"' "mcp.json: includes weave-inspect server"
 assert_not_contains "$MCP_JSON" '"weave-graph"' "mcp.json: does not ship weave-graph server"
-assert_not_contains "$MCP_JSON" '"weave-session"' "mcp.json: does not ship weave-session server"
 
-assert_contains "$MCP_README" 'currently registers **two servers**' "mcp README: documents shipped two-server config"
-assert_contains "$MCP_README" 'upcoming runtime-agent specialisation' "mcp README: preserves aspirational scoped-server roadmap"
-assert_contains "$MCP_README" '### Session scope — workflow lifecycle (9 tools)' "mcp README: session scope count is current"
-assert_contains "$MCP_README" '### Inspect scope — read-only queries (14 tools)' "mcp README: inspect scope count is current"
+assert_contains "$MCP_README" 'currently registers **four servers**' "mcp README: documents shipped four-server config"
+assert_contains "$MCP_README" 'optional local addition' "mcp README: preserves scoped-server roadmap"
+assert_contains "$MCP_README" '### Session scope — workflow lifecycle (10 tools)' "mcp README: session scope count is current"
+assert_contains "$MCP_README" '### Inspect scope — read-only queries (15 tools)' "mcp README: inspect scope count is current"
 assert_contains "$MCP_README" '`weave_recover`' "mcp README: session tool inventory includes weave_recover"
 assert_contains "$MCP_README" '`weave_edit_guard`' "mcp README: session tool inventory includes weave_edit_guard"
 assert_contains "$MCP_README" '`weave-graph` (planned) / `weave` (current)' "mcp README: agent pairing distinguishes planned vs current graph server"

@@ -15,6 +15,8 @@ export WV_DB="$TEST_DIR/hot/brain.db"
 export WV_REQUIRE_LEARNING=0
 export WEAVE_DIR="$TEST_DIR/.weave"
 mkdir -p "$WV_HOT_ZONE" "$WEAVE_DIR"
+cd "$TEST_DIR"
+git init -q 2>/dev/null || true
 
 # Counter for tests
 TESTS_RUN=0
@@ -144,11 +146,6 @@ echo "Testing: sync command"
 reset_db
 node1=$($WV add "Test node for sync" | tail -1)
 node2=$($WV add "Another node for sync" | tail -1)
-
-# Point wv to our test weave dir by temporarily changing REPO_ROOT
-# We need to run sync with WEAVE_DIR pointing to test location
-cd "$TEST_DIR"
-git init -q 2>/dev/null || true  # wv needs git root
 
 # Run sync - it will use TEST_DIR/.weave because git root is TEST_DIR
 output=$($WV sync 2>&1)
@@ -573,6 +570,12 @@ assert_contains "$output" "4 nodes" "reindex counted all nodes"
 output=$($WV search "authentication" 2>&1)
 assert_contains "$output" "$node1" "search finds first auth node"
 assert_contains "$output" "$node2" "search finds second auth node"
+assert_not_contains "$output" '\033[' "search non-tty output avoids literal ANSI escapes"
+
+# Test interactive search output does not leak literal escape sequences
+tty_output=$(script -qec "$WV search authentication" /dev/null 2>&1 | tr -d '\r')
+assert_contains "$tty_output" "$node1" "search tty output still shows first auth node"
+assert_not_contains "$tty_output" '\033[' "search tty output avoids literal ANSI escapes"
 
 # Test search respects limit
 output=$($WV search "authentication" --limit=1 2>&1)

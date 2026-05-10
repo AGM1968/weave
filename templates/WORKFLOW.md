@@ -7,14 +7,15 @@ Canonical reference for `wv` — the task graph CLI for AI coding agents. Full d
 
 ```txt
 git status && wv status           # 0. Pre-flight — check state before acting
-wv ready                          # 1. Find unblocked work
-wv work <id>                      # 2. Claim it (sets active)
+wv search "<topic>"               # 1. Check for existing related work before claiming/creating
+wv ready                          # 2. Find unblocked work
+wv work <id>                      # 3. Claim it (sets active)
 # ... do the work ...
-git commit                        # 3. Commit work files (before wv done)
-wv done <id> --learning="..."     # 4. Complete with learnings
-wv sync --gh                      # 5. Sync graph + GH (may dirty .weave/)
-git add .weave/ && git commit     # 6. Commit graph state if dirty
-git push                          # 7. MANDATORY before session end
+git commit                        # 4. Commit work files (before wv done)
+wv done <id> --learning="..."     # 5. Complete with learnings
+wv sync --gh                      # 6. Sync graph + GH (may dirty .weave/)
+git add .weave/ && git commit     # 7. Commit graph state if dirty
+git push                          # 8. MANDATORY before session end
 ```
 
 Never edit a file without an active node. If `wv status` shows 0 active, run `wv work <id>` or
@@ -28,7 +29,7 @@ create a node first.
 | `wv work <id>`            | Claim node (sets active)                                               |                                                                            |
 | `wv add "<text>"`         | Create node                                                            | `--gh`, `--status=`, `--parent=`, `--alias=`, `--standalone`               |
 | `wv done <id>`            | Complete node (auto-closes linked GH issue)                            | `--learning="..."`, `--no-overlap-check`                                   |
-| `wv ship <id>`            | Done + sync + push in one step                                         | `--learning="..."`, `--gh`, `--no-overlap-check`                           |
+| `wv ship <id>`            | Done + sync in one step; pending Git sync is surfaced separately       | `--learning="..."`, `--gh`, `--no-overlap-check`                           |
 | `wv update <id>`          | Modify node                                                            | `--status=`, `--text=`, `--alias=`, `--metadata=`, `--metadata-file=`, `--echo` |
 | `wv overview`             | Compact graph/session snapshot                                         | `--json`                                                                   |
 | `wv help <command>`       | Focused help for one command                                           | Also available as `wv <command> --help`                                     |
@@ -42,7 +43,9 @@ create a node first.
 | `wv path <id>`            | Ancestry chain                                                         | `--format=chain`                                                           |
 | `wv plan <file>`          | Import markdown as epic + tasks                                        | `--sprint=N`, `--gh`, `--dry-run`                                          |
 | `wv context <id> --json`  | Context pack (blockers, ancestors, pitfalls)                           | Cached per session                                                         |
-| `wv search <query>`       | Full-text search                                                       | `--json`                                                                   |
+| `wv search <query>`       | Full-text search across graph nodes                                    | `--json`, `--status=`                                                      |
+| `wv index [path]`         | Index code files into brain.db for hybrid search                       | `--ext=`, `--no-embed`, `--json`                                           |
+| `wv search --code <query>`| Hybrid code search (BM25 + cosine RRF) over indexed chunks             | `--mode=hybrid\|fts\|vector`, `--graph`, `--json`                          |
 | `wv status`               | Compact status (active/ready/blocked counts)                           |                                                                            |
 | `wv learnings`            | Show captured decisions/patterns/pitfalls                              | `--category=`, `--grep=`, `--dedup`                                        |
 | `wv link <from> <to>`     | Create semantic edge                                                   | `--type=`, `--context='{...}'`                                             |
@@ -53,6 +56,8 @@ create a node first.
 | `wv quality scan`         | Scan repo for complexity + churn                                       | `--exclude=`, `--json`                                                     |
 | `wv quality hotspots`     | Ranked hotspot report                                                  | `--top=N`, `--json`                                                        |
 | `wv findings <sub>`       | Historical finding promotion/list workflow                             | `list`, `promote`                                                          |
+
+`--standalone` persists `metadata.standalone=true`. `wv health` excludes intentional standalones from `orphan_nodes` and reports them separately as `intentional_standalones`.
 
 ## Node Statuses
 
@@ -171,9 +176,10 @@ close-time friction), turn it into tracked remediation immediately:
 
 ## Rules
 
-1. **Track ALL work** — `wv work <id>` or `wv add "<text>" --status=active` before editing files.
-   Use `--gh` for GitHub-linked work. Use `--parent=<epic-id>` for sub-tasks — this is
-   **mandatory**, not optional (see Epic Decomposition). Never edit without an active node.
+1. **Track ALL work** — `wv work <id>` or `wv add "<text>" --status=active --criteria="c1|c2" --risks=low`
+  before editing files. Use `--gh` for GitHub-linked work. Use `--parent=<epic-id>` for sub-tasks
+  — this is **mandatory**, not optional (see Epic Decomposition). Never edit without an active
+  node.
 2. **No untracked fixes** — even one-line changes get a node. Use `wv quick "<what>"` for trivial
    work.
 3. **GitHub workflow** — create with `--gh`, close with `wv done` (auto-closes issue). Check
@@ -353,7 +359,8 @@ wv prune --orphans-only          # archive done nodes with no edges (ignores age
 
 1. Garbage/test fixtures → `wv delete <id>`
 2. Real work without a parent → `wv link <id> <epic> --type=implements`
-3. Legitimate standalones (releases, chores) → `wv prune --orphans-only`
+3. Legitimate standalones (releases, chores) → create them with `--standalone`, or annotate retained history with `wv update <id> --metadata='{"standalone":true}'`; `wv health` reports these as `intentional_standalones`, not `orphan_nodes`
+4. Archive intentional standalones only when you actually want them removed from the live graph → `wv prune --orphans-only`
 
 ## Session End Behavior
 
@@ -385,12 +392,12 @@ description: "What it does. Use when <trigger condition>."
 
 # My Skill
 
-Instructions here. Claude Code discovers this automatically.
+Instructions here. Agents that support .claude/skills/ discover this automatically.
 EOF
 ```
 
-- **Claude Code** auto-discovers skills from `.claude/skills/` — no registration needed
-- **VS Code Copilot** does not see skills (use MCP tools or `copilot-instructions.md` instead)
+- **Skills** are auto-discovered from `.claude/skills/` by supporting agents (Claude Code, etc.) — no registration needed
+- **Agents without skill support** (e.g. VS Code Copilot) use MCP tools or `copilot-instructions.md` instead
 - Local skills are committed to git and shared with your team
 - `wv init-repo --update` preserves user-created skills (only updates Weave-shipped ones)
 

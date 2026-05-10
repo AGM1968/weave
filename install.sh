@@ -214,6 +214,38 @@ download_file() {
     echo "$dst" >> "$MANIFEST"
 }
 
+install_git_hook_from_repo() {
+    local hook_path="$1"
+    local marker="$2"
+    local label="$3"
+    local hook_name
+    local action="installed"
+    hook_name=$(basename "$hook_path")
+
+    if [ ! -d "$HOOK_DIR" ]; then
+        return 0
+    fi
+
+    local hook_dst="$HOOK_DIR/$hook_name"
+    if [ -f "$hook_dst" ]; then
+        if grep -q "$marker" "$hook_dst" 2>/dev/null; then
+            action="updated"
+        else
+            echo -e "  ${YELLOW}⊘${NC} $label (custom hook exists, skipped)"
+            return 0
+        fi
+    fi
+
+    if [ -f "$hook_path" ]; then
+        cp "$hook_path" "$hook_dst"
+    else
+        local repo_base="${REPO:-https://raw.githubusercontent.com/AGM1968/weave/main}"
+        curl -sSL "$repo_base/scripts/hooks/$hook_name" -o "$hook_dst"
+    fi
+    chmod +x "$hook_dst"
+    echo -e "  ${GREEN}✓${NC} .git/hooks/$hook_name ($action)"
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Install
 # ═══════════════════════════════════════════════════════════════════════════
@@ -274,6 +306,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-gh.sh "$LIB_DIR/lib/wv-gh.sh"
     install_file ./scripts/lib/wv-delta.sh "$LIB_DIR/lib/wv-delta.sh"
     install_file ./scripts/lib/wv-resolve-project.sh "$LIB_DIR/lib/wv-resolve-project.sh"
+    install_file ./scripts/lib/wv-resolve-runtime.sh "$LIB_DIR/lib/wv-resolve-runtime.sh"
     install_file ./scripts/lib/VERSION "$LIB_DIR/lib/VERSION"
     # Command modules (XDG: ~/.local/lib/weave/cmd/)
     install_file ./scripts/cmd/wv-cmd-core.sh "$LIB_DIR/cmd/wv-cmd-core.sh"
@@ -283,6 +316,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/cmd/wv-cmd-quality.sh "$LIB_DIR/cmd/wv-cmd-quality.sh"
     install_file ./scripts/cmd/wv-cmd-findings.sh "$LIB_DIR/cmd/wv-cmd-findings.sh"
     install_file ./scripts/cmd/wv-cmd-analyze.sh "$LIB_DIR/cmd/wv-cmd-analyze.sh"
+    install_file ./scripts/cmd/wv-cmd-indexer.sh "$LIB_DIR/cmd/wv-cmd-indexer.sh"
     # Python sync package
     mkdir -p "$LIB_DIR/weave_gh"
     for pyf in ./scripts/weave_gh/*.py; do
@@ -293,11 +327,20 @@ if [ -f "./scripts/wv" ]; then
     for pyf in ./scripts/weave_quality/*.py; do
         install_file "$pyf" "$LIB_DIR/weave_quality/$(basename "$pyf")"
     done
+    mkdir -p "$LIB_DIR/weave_indexer"
+    for pyf in ./scripts/weave_indexer/*.py; do
+        install_file "$pyf" "$LIB_DIR/weave_indexer/$(basename "$pyf")"
+    done
+    mkdir -p "$LIB_DIR/weave_search"
+    for pyf in ./scripts/weave_search/*.py; do
+        install_file "$pyf" "$LIB_DIR/weave_search/$(basename "$pyf")"
+    done
     # Scripts
     cp ./scripts/context-guard.sh "$CONFIG_DIR/"
     cp ./scripts/resolve-refs.sh "$CONFIG_DIR/"
     # Lib available to hooks from global path (~/.config/weave/hooks/../lib/)
     cp ./scripts/lib/wv-resolve-project.sh "$CONFIG_DIR/lib/wv-resolve-project.sh"
+    cp ./scripts/lib/wv-resolve-runtime.sh "$CONFIG_DIR/lib/wv-resolve-runtime.sh"
     # Claude hooks (all 9 — registered globally via ~/.claude/settings.json under Alt-A)
     cp ./.claude/hooks/context-guard.sh "$CONFIG_DIR/hooks/"
     cp ./.claude/hooks/session-start-context.sh "$CONFIG_DIR/hooks/"
@@ -362,6 +405,7 @@ else
     download_file "$REPO/scripts/lib/wv-gh.sh" "$LIB_DIR/lib/wv-gh.sh"
     download_file "$REPO/scripts/lib/wv-delta.sh" "$LIB_DIR/lib/wv-delta.sh"
     download_file "$REPO/scripts/lib/wv-resolve-project.sh" "$LIB_DIR/lib/wv-resolve-project.sh"
+    download_file "$REPO/scripts/lib/wv-resolve-runtime.sh" "$LIB_DIR/lib/wv-resolve-runtime.sh"
     download_file "$REPO/scripts/lib/VERSION" "$LIB_DIR/lib/VERSION"
     # Command modules (XDG: ~/.local/lib/weave/cmd/)
     download_file "$REPO/scripts/cmd/wv-cmd-core.sh" "$LIB_DIR/cmd/wv-cmd-core.sh"
@@ -371,6 +415,7 @@ else
     download_file "$REPO/scripts/cmd/wv-cmd-quality.sh" "$LIB_DIR/cmd/wv-cmd-quality.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-findings.sh" "$LIB_DIR/cmd/wv-cmd-findings.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-analyze.sh" "$LIB_DIR/cmd/wv-cmd-analyze.sh"
+    download_file "$REPO/scripts/cmd/wv-cmd-indexer.sh" "$LIB_DIR/cmd/wv-cmd-indexer.sh"
     # Python sync package (auto-discover modules from GitHub API)
     mkdir -p "$LIB_DIR/weave_gh"
     local py_modules
@@ -394,11 +439,21 @@ else
     for pyfile in $quality_modules; do
         download_file "$REPO/scripts/weave_quality/${pyfile}" "$LIB_DIR/weave_quality/${pyfile}"
     done
+    # Python indexer package
+    mkdir -p "$LIB_DIR/weave_indexer"
+    download_file "$REPO/scripts/weave_indexer/__init__.py" "$LIB_DIR/weave_indexer/__init__.py"
+    download_file "$REPO/scripts/weave_indexer/__main__.py" "$LIB_DIR/weave_indexer/__main__.py"
+    # Python search package
+    mkdir -p "$LIB_DIR/weave_search"
+    download_file "$REPO/scripts/weave_search/__init__.py" "$LIB_DIR/weave_search/__init__.py"
+    download_file "$REPO/scripts/weave_search/__main__.py" "$LIB_DIR/weave_search/__main__.py"
+    download_file "$REPO/scripts/weave_search/graph.py" "$LIB_DIR/weave_search/graph.py"
     # Scripts
     curl -sSL "$REPO/scripts/context-guard.sh" -o "$CONFIG_DIR/context-guard.sh"
     curl -sSL "$REPO/scripts/resolve-refs.sh" -o "$CONFIG_DIR/resolve-refs.sh"
     # Lib available to hooks from global path (~/.config/weave/hooks/../lib/)
     curl -sSL "$REPO/scripts/lib/wv-resolve-project.sh" -o "$CONFIG_DIR/lib/wv-resolve-project.sh"
+    curl -sSL "$REPO/scripts/lib/wv-resolve-runtime.sh" -o "$CONFIG_DIR/lib/wv-resolve-runtime.sh"
     # Claude hooks
     curl -sSL "$REPO/.claude/hooks/context-guard.sh" -o "$CONFIG_DIR/hooks/context-guard.sh"
     curl -sSL "$REPO/.claude/hooks/session-start-context.sh" -o "$CONFIG_DIR/hooks/session-start-context.sh"
@@ -462,6 +517,8 @@ chmod +x "$CONFIG_DIR/skills/weave-audit/audit-report.sh"
 merge_global_claude_settings() {
     local global_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
     local hooks_dir="$CONFIG_DIR/hooks"
+
+    mkdir -p "$(dirname "$global_settings")"
 
     # Backup before modifying
     if [ -f "$global_settings" ]; then
@@ -571,12 +628,12 @@ for arg in "$@"; do
             echo "Usage: wv-init-repo [--agent=claude|copilot|all] [--update] [--force]"
             echo ""
             echo "  claude   (default) Claude Code hooks, skills, settings.local.json"
-            echo "  copilot  VS Code Copilot .vscode/mcp.json (+ legacy .mcp.json) + copilot-instructions.md"
+            echo "  copilot  VS Code Copilot MCP config (.vscode/mcp.json + legacy .mcp.json) + copilot-instructions.md"
             echo "  all      Both Claude Code and VS Code Copilot"
             echo ""
             echo "  --update  Update managed files (hooks, skills, agents, copilot-instructions)"
-            echo "            Preserves user-customized files (CLAUDE.md, settings.local.json)"
-            echo "  --force   Like --update but overwrites ALL files including user-customized"
+            echo "            Preserves user-customized files (CLAUDE.md, settings.local.json, MCP config)"
+            echo "  --force   Like --update but also rewrites MCP config files (.vscode/mcp.json, .mcp.json)"
             echo ""
             echo "  Comma-separated: --agent=claude,copilot"
             exit 0
@@ -604,6 +661,40 @@ done
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 CONFIG_DIR="${WV_CONFIG_DIR:-$HOME/.config/weave}"
 MCP_SERVER="${WV_LIB_DIR:-$HOME/.local/lib/weave}/mcp/dist/index.js"
+WV_BIN_DIR=$(cd "$(dirname "$0")" && pwd)
+WV_BIN="$WV_BIN_DIR/wv"
+
+install_git_hook_from_repo() {
+    local hook_path="$1"
+    local marker="$2"
+    local label="$3"
+    local hook_name
+    local action="installed"
+    hook_name=$(basename "$hook_path")
+
+    if [ ! -d "$HOOK_DIR" ]; then
+        return 0
+    fi
+
+    local hook_dst="$HOOK_DIR/$hook_name"
+    if [ -f "$hook_dst" ]; then
+        if grep -q "$marker" "$hook_dst" 2>/dev/null; then
+            action="updated"
+        else
+            echo -e "  ${YELLOW}⊘${NC} $label (custom hook exists, skipped)"
+            return 0
+        fi
+    fi
+
+    if [ -f "$hook_path" ]; then
+        cp "$hook_path" "$hook_dst"
+    else
+        local repo_base="${REPO:-https://raw.githubusercontent.com/AGM1968/weave/main}"
+        curl -sSL "$repo_base/scripts/hooks/$hook_name" -o "$hook_dst"
+    fi
+    chmod +x "$hook_dst"
+    echo -e "  ${GREEN}✓${NC} .git/hooks/$hook_name ($action)"
+}
 
 AGENT_LABEL=$(IFS=','; echo "${AGENTS[*]}")
 if [ "$FORCE_MODE" = "1" ]; then
@@ -655,6 +746,7 @@ WEAVE_PATTERNS=(
     ".weave/*.db"
     ".weave/*.db-wal"
     ".weave/*.db-shm"
+    ".weave/.context_policy"
     "!.weave/state.sql"
     "!.claude/settings.json"
 )
@@ -683,108 +775,10 @@ fi
 
 # Git hook: prepare-commit-msg (portable, awk-based)
 HOOK_DIR="$REPO_ROOT/.git/hooks"
-if [ -d "$HOOK_DIR" ] && [ ! -f "$HOOK_DIR/prepare-commit-msg" ]; then
-    cat > "$HOOK_DIR/prepare-commit-msg" << 'HOOKEOF'
-#!/usr/bin/env sh
-# Weave: append Weave-ID trailers to commit messages
-COMMIT_MSG_FILE="$1"
-COMMIT_SOURCE="$2"
-case "$COMMIT_SOURCE" in merge|squash) exit 0 ;; esac
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || exit 0)
-WV="$(command -v wv 2>/dev/null || echo "$REPO_ROOT/scripts/wv")"
-[ ! -x "$WV" ] && exit 0
-ACTIVE_IDS=$("$WV" list --status=active --json 2>/dev/null | jq -r '.[].id' 2>/dev/null)
-[ -z "$ACTIVE_IDS" ] && exit 0
-grep -q "^Weave-ID:" "$COMMIT_MSG_FILE" 2>/dev/null && exit 0
-for id in $ACTIVE_IDS; do
-    if grep -q "^Co-Authored-By:" "$COMMIT_MSG_FILE" 2>/dev/null; then
-        tmp="${COMMIT_MSG_FILE}.wv$$"
-        awk -v wid="Weave-ID: $id" '/^Co-Authored-By:/ && !done {print wid; done=1} {print}' \
-            "$COMMIT_MSG_FILE" > "$tmp" && mv "$tmp" "$COMMIT_MSG_FILE"
-    else
-        printf '\nWeave-ID: %s\n' "$id" >> "$COMMIT_MSG_FILE"
-    fi
-done
-exit 0
-HOOKEOF
-    chmod +x "$HOOK_DIR/prepare-commit-msg"
-    echo -e "  ${GREEN}✓${NC} .git/hooks/prepare-commit-msg"
-elif [ -f "$HOOK_DIR/prepare-commit-msg" ]; then
-    echo -e "  ${YELLOW}⊘${NC} .git/hooks/prepare-commit-msg (already exists, skipped)"
-fi
+install_git_hook_from_repo "./scripts/hooks/prepare-commit-msg-weave.sh" "Weave: append Weave-ID trailers" "prepare-commit-msg"
 
 # Git hook: pre-commit (enforce active Weave node)
-if [ -d "$HOOK_DIR" ] && [ ! -f "$HOOK_DIR/pre-commit" ]; then
-    cat > "$HOOK_DIR/pre-commit" << 'HOOKEOF'
-#!/usr/bin/env sh
-# Weave pre-commit hook: require active node before committing code changes
-#
-# Enforces the "track ALL work in Weave" rule.
-# Allows .weave/-only commits and WIP checkpoints through.
-#
-# Skip with: git commit --no-verify (or WV_SKIP_PRECOMMIT=1)
-
-# Allow explicit bypass
-[ "${WV_SKIP_PRECOMMIT:-0}" = "1" ] && exit 0
-
-# Find wv
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || exit 0)
-WV="$(command -v wv 2>/dev/null || echo "$REPO_ROOT/scripts/wv")"
-[ ! -x "$WV" ] && exit 0
-
-# Check what's being committed — if only .weave/ files, always allow
-STAGED_FILES=$(git diff --cached --name-only 2>/dev/null)
-[ -z "$STAGED_FILES" ] && exit 0
-
-NON_WEAVE_FILES=$(echo "$STAGED_FILES" | grep -v '^\.weave/' || true)
-[ -z "$NON_WEAVE_FILES" ] && exit 0
-
-# Allow auto-checkpoint WIP commits
-[ "${WV_AUTO_CHECKPOINT_ACTIVE:-0}" = "1" ] && exit 0
-
-# Run ruff linter on staged Python files (fast — blocks on lint errors)
-STAGED_PY=$(echo "$NON_WEAVE_FILES" | grep '\.py$' || true)
-if [ -n "$STAGED_PY" ] && command -v ruff > /dev/null 2>&1; then
-    RUFF_OUT=$(ruff check $STAGED_PY 2>&1 || true)
-    if [ -n "$RUFF_OUT" ] && [ "$RUFF_OUT" != "All checks passed!" ]; then
-        echo "" >&2
-        echo "✗ ruff lint errors in staged files:" >&2
-        echo "$RUFF_OUT" >&2
-        echo "" >&2
-        echo "  Fix with: ruff check --fix <file>  (then re-stage)" >&2
-        echo "" >&2
-        exit 1
-    fi
-fi
-
-# Check for active Weave nodes
-ACTIVE_COUNT=$("$WV" list --status=active --json 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
-
-if [ "$ACTIVE_COUNT" = "0" ] || [ -z "$ACTIVE_COUNT" ]; then
-    cat >&2 << 'EOF'
-
-  No active Weave node -- commit blocked.
-
-  Every code change must be tracked. Either:
-    wv work <id>         # claim an existing task
-    wv add "..." --gh    # create + track new work
-
-  Then retry your commit.
-
-  Bypass: git commit --no-verify
-          WV_SKIP_PRECOMMIT=1 git commit
-
-EOF
-    exit 1
-fi
-
-exit 0
-HOOKEOF
-    chmod +x "$HOOK_DIR/pre-commit"
-    echo -e "  ${GREEN}✓${NC} .git/hooks/pre-commit (Weave node enforcement)"
-elif [ -f "$HOOK_DIR/pre-commit" ]; then
-    echo -e "  ${YELLOW}⊘${NC} .git/hooks/pre-commit (already exists, skipped)"
-fi
+install_git_hook_from_repo "./scripts/hooks/pre-commit-weave.sh" "Weave pre-commit" "pre-commit"
 
 # .gitattributes: merge strategy + diff suppression for Weave state files
 # Uses BEGIN/END markers (like Makefile template) for reliable idempotent updates
@@ -914,14 +908,26 @@ if [ "$AGENT" = "claude" ]; then
         cat > "$REPO_ROOT/.claude/agents/AGENTS.md" << 'AGENTSEOF'
 # Weave Agents
 
-Specialized subagents for Weave workflow. Use via the Task tool with the appropriate
-`subagent_type`.
+Specialized subagents for Weave workflow. Spawn via whatever agent-spawning mechanism your
+host supports (Agent tool, MCP client subagent, shell subprocess, etc.).
 
 | Agent            | Purpose                        | Trigger                          |
 | ---------------- | ------------------------------ | -------------------------------- |
 | weave-guide      | Workflow guidance               | Unsure how to use Weave          |
 | epic-planner     | Strategic planning              | Starting a new epic or sprint    |
 | learning-curator | Knowledge capture               | After completing significant work|
+
+## Code search
+
+If `wv index` has been run, prefer hybrid code search over grep/glob for discovery:
+
+```bash
+wv search --code "query"                  # hybrid BM25 + cosine (CLI)
+wv search --code "query" --mode=fts       # exact tokens / function names
+wv search --code "query" --graph          # include active Weave nodes per file
+```
+
+MCP equivalent: `weave_code_search` (parameters: `query`, `mode`, `limit`, `graph`).
 AGENTSEOF
         echo -e "  ${GREEN}✓${NC} .claude/agents/AGENTS.md"
     elif [ -f "$REPO_ROOT/.claude/agents/AGENTS.md" ]; then
@@ -1079,11 +1085,35 @@ if [ "$AGENT" = "copilot" ]; then
     "servers": {
         "weave": {
             "command": "node",
-            "args": ["$MCP_SERVER"]
+            "args": ["$MCP_SERVER"],
+            "env": {
+                "WV_PATH": "$WV_BIN",
+                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+            }
+        },
+        "weave-session": {
+            "command": "node",
+            "args": ["$MCP_SERVER", "--scope=session"],
+            "env": {
+                "WV_PATH": "$WV_BIN",
+                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+            }
+        },
+        "weave-lite": {
+            "command": "node",
+            "args": ["$MCP_SERVER", "--scope=lite"],
+            "env": {
+                "WV_PATH": "$WV_BIN",
+                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+            }
         },
         "weave-inspect": {
             "command": "node",
-            "args": ["$MCP_SERVER", "--scope=inspect"]
+            "args": ["$MCP_SERVER", "--scope=inspect"],
+            "env": {
+                "WV_PATH": "$WV_BIN",
+                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+            }
         }
     }
 }
@@ -1097,16 +1127,40 @@ MCPEOF
     if [ ! -f "$REPO_ROOT/.mcp.json" ] || [ "$FORCE_MODE" = "1" ]; then
         cat > "$REPO_ROOT/.mcp.json" << MCPEOF
 {
-  "servers": {
-    "weave": {
-      "command": "node",
-      "args": ["$MCP_SERVER"]
-    },
-    "weave-inspect": {
-      "command": "node",
-      "args": ["$MCP_SERVER", "--scope=inspect"]
+    "servers": {
+        "weave": {
+            "command": "node",
+            "args": ["$MCP_SERVER"],
+            "env": {
+                "WV_PATH": "$WV_BIN",
+                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+            }
+        },
+        "weave-session": {
+            "command": "node",
+            "args": ["$MCP_SERVER", "--scope=session"],
+            "env": {
+                "WV_PATH": "$WV_BIN",
+                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+            }
+        },
+        "weave-lite": {
+            "command": "node",
+            "args": ["$MCP_SERVER", "--scope=lite"],
+            "env": {
+                "WV_PATH": "$WV_BIN",
+                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+            }
+        },
+        "weave-inspect": {
+            "command": "node",
+            "args": ["$MCP_SERVER", "--scope=inspect"],
+            "env": {
+                "WV_PATH": "$WV_BIN",
+                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+            }
+        }
     }
-  }
 }
 MCPEOF
         echo -e "  ${GREEN}✓${NC} .mcp.json"
@@ -1199,8 +1253,8 @@ git push                                   # 4c. MANDATORY
 # Trivial one-file work (no open GH issue needed):
 wv quick "<description>" --learning="..."
 
-# Done + sync + push in one step:
-echo "s" | wv ship <id> --learning="..."
+# Done + sync in one step (check `wv status` for pending Git sync):
+wv ship <id> --learning="..." --no-overlap-check
 ```
 
 ## Terminal discipline
@@ -1220,6 +1274,17 @@ Structured learnings are more useful for future sessions:
 ```
 --learning="decision: X | pattern: Y | pitfall: Z"
 ```
+
+## Code search
+
+If `wv index` has been run, use hybrid code search instead of file browsing:
+
+```bash
+wv search --code "query"             # hybrid BM25 + cosine (CLI)
+wv search --code "query" --mode=fts  # exact tokens / function names
+```
+
+MCP equivalent: `weave_code_search` (parameters: `query`, `mode`, `limit`, `graph`).
 
 ## Reference
 

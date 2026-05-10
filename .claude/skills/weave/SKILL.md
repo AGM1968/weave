@@ -38,12 +38,12 @@ blockers=$(echo "$context" | jq -r '.blockers | length')
 
 **When spawning subagents:**
 
-Include WV_ACTIVE in the prompt for subagents that need graph context. In Claude Code, use the
-Agent tool (`subagent_type: "learning-curator"` etc.). The subagent inherits `WV_ACTIVE` from the
-environment automatically.
+Include WV_ACTIVE in the prompt for subagents that need graph context. The subagent inherits
+`WV_ACTIVE` from the environment automatically. Spawn via whatever agent-spawning mechanism your
+host supports (Agent tool, MCP client subagent, shell subprocess, etc.).
 
-> **Agent SDK (future):** MCP-based clients will invoke subagents via `weave_work` / `weave_context`
-> tools instead of the Agent tool.
+> **MCP clients:** Invoke subagents via `weave_work` / `weave_context` tools instead of a
+> host-specific agent spawning API.
 
 **Benefits:**
 
@@ -102,7 +102,7 @@ node remains blocked until child completes.
 | Mode | Command | Steps |
 |------|---------|-------|
 | Node ID | `/weave wv-xxxxxx` | Validate → claim (`wv work <id>`) → CONTEXT |
-| Text | `/weave "Fix bug"` | Create (`wv add "<text>" --status=active`) → CONTEXT |
+| Text | `/weave "Fix bug"` | Create claim-ready node (`wv add "<text>" --status=active --criteria="c1|c2" --risks=low`) when the task is already specific, otherwise create then claim (`wv add "<text>"` → `wv work <id>`) → CONTEXT |
 | None | `/weave` | Prefer `wv bootstrap --json` for session snapshot; fall back to `wv ready --json` → user picks → Mode 1 or 2 |
 
 **Compound helpers:** prefer `wv bootstrap --json` for session-start context, `wv quick` for trivial
@@ -168,11 +168,15 @@ close-time friction, missing guardrail):
    - Invoke via Agent tool (`subagent_type: "learning-curator"`) with node text + files changed + work summary
    - _(Agent SDK / MCP clients: use `weave_learnings` tool instead)_
    - Learnings must contain: `decision:` | `pattern:` | `pitfall:`
-   - Trivial only (doc typo, breadcrumbs): `--skip-learnings`
+   - Trivial work still needs a concise structured learning; there is no `--skip-learnings` flag
 
 2. **Verification evidence captured** (enforced by `pre-close-verification.sh` hook):
    - Tests pass / build succeeds / manual verification
    - Trivial only: `--skip-verification`
+
+3. **Work committed while the node is active** (enforced by `pre-close-verification.sh` hook):
+   - Commit code changes before `wv done` so `prepare-commit-msg` can add `Weave-ID:` attribution
+   - Close is denied when non-`.weave/` changes are still uncommitted or no commit can be attributed to the node
 
 ```text
 ✗ WRONG:  wv done wv-XXXX --learning="fixed the bug"
@@ -183,8 +187,11 @@ close-time friction, missing guardrail):
 ### Close and Sync
 
 ```bash
+git add <files> && git commit -m "..."
 wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..." --no-overlap-check
-wv sync --gh && git push
+wv sync --gh
+git add .weave/ && git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"
+git push
 ```
 
 ### Recovery (v1.9.0)

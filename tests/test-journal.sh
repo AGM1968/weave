@@ -173,13 +173,9 @@ line=$(tail -1 "$_WV_JOURNAL_FILE")
 assert_contains "$line" '"status":"done"' \
     "journal_complete marks step done"
 
-# --- Test 5: Full lifecycle (4-step ship) ---
+# --- Test 5: Full lifecycle (2-step ship) ---
 journal_step 2 "sync" '{"gh":true}'
 journal_complete 2
-journal_step 3 "git_commit"
-journal_complete 3
-journal_step 4 "git_push"
-journal_complete 4
 journal_end
 
 assert_equals "" "${_WV_IN_JOURNAL:-}" \
@@ -190,8 +186,8 @@ assert_contains "$line" '"event":"end"' \
     "journal_end records end event"
 
 total_lines=$(wc -l < "$_WV_JOURNAL_FILE")
-assert_equals "10" "$total_lines" \
-    "Complete ship op = 10 lines (begin + 4×step/complete + end)"
+assert_equals "6" "$total_lines" \
+    "Complete ship op = 6 lines (begin + 2×step/complete + end)"
 
 echo ""
 echo -e "${CYAN}--- Recovery detection ---${NC}"

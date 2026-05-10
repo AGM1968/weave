@@ -4,14 +4,32 @@
       "command": "node",
       "args": ["${workspaceFolder}/mcp/dist/index.js"],
       "env": {
-        "WV_PATH": "${workspaceFolder}/scripts/wv"
+        "WV_PATH": "${workspaceFolder}/scripts/wv",
+        "WV_PROJECT_ROOT": "${workspaceFolder}"
+      }
+    },
+    "weave-session": {
+      "command": "node",
+      "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=session"],
+      "env": {
+        "WV_PATH": "${workspaceFolder}/scripts/wv",
+        "WV_PROJECT_ROOT": "${workspaceFolder}"
+      }
+    },
+    "weave-lite": {
+      "command": "node",
+      "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=lite"],
+      "env": {
+        "WV_PATH": "${workspaceFolder}/scripts/wv",
+        "WV_PROJECT_ROOT": "${workspaceFolder}"
       }
     },
     "weave-inspect": {
       "command": "node",
       "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=inspect"],
       "env": {
-        "WV_PATH": "${workspaceFolder}/scripts/wv"
+        "WV_PATH": "${workspaceFolder}/scripts/wv",
+        "WV_PROJECT_ROOT": "${workspaceFolder}"
       }
     }
   }

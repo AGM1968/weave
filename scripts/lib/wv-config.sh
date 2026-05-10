@@ -21,12 +21,13 @@ SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 WEAVE_DIR="${WEAVE_DIR:-$REPO_ROOT/.weave}"
 
+# Side-effect-free runtime resolution helpers shared with hooks.
+source "$_WV_LIB_DIR/lib/wv-resolve-runtime.sh"
+REPO_ROOT=$(canonicalize_runtime_path "$REPO_ROOT")
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Hot Zone Configuration
 # ═══════════════════════════════════════════════════════════════════════════
-
-# Minimum free space required in hot zone (KB). Default 100MB.
-WV_MIN_SHM=${WV_MIN_SHM:-102400}
 
 # Maximum hot zone usage in MB. Default 512MB.
 WV_HOT_SIZE=${WV_HOT_SIZE:-512}
@@ -34,81 +35,22 @@ WV_HOT_SIZE=${WV_HOT_SIZE:-512}
 # Maximum database size in bytes. Default 50MB.
 WV_MAX_DB_SIZE=${WV_MAX_DB_SIZE:-52428800}
 
-# Check if a path has enough free space (in KB)
-check_free_space() {
-    local path="$1"
-    local min_kb="${2:-$WV_MIN_SHM}"
-    local avail_kb
-    avail_kb=$(df -k "$path" 2>/dev/null | awk 'NR==2 {print $4}')
-    [ -n "$avail_kb" ] && [ "$avail_kb" -ge "$min_kb" ] 2>/dev/null
-}
-
-# Detect if running inside a container
-_WV_CONTAINER=""
-is_container() {
-    if [ -z "$_WV_CONTAINER" ]; then
-        if [ -f /.dockerenv ] || [ -f /run/.containerenv ] \
-            || grep -qE 'docker|containerd|podman' /proc/1/cgroup 2>/dev/null \
-            || [ -n "${CI:-}" ]; then
-            _WV_CONTAINER=yes
-        else
-            _WV_CONTAINER=no
-        fi
-    fi
-    [ "$_WV_CONTAINER" = "yes" ]
-}
-
-# Cross-platform hot zone detection
-detect_hot_zone() {
-    if [ -n "${WV_HOT_ZONE:-}" ]; then
-        echo "${WV_HOT_ZONE}"
-        return
-    fi
-
-    # Per-UID fallback dirs avoid shared-parent /tmp/weave races on multi-user
-    # hosts (security review L1, 2026-04-19). /dev/shm/weave still uses the
-    # classic name because /dev/shm is already 1777 and weave creates its own
-    # 700-mode subdir there.
-    local uid
-    uid=$(id -u 2>/dev/null || echo "$UID")
-    case "$(uname -s)" in
-        Linux*)
-            if is_container; then
-                echo "wv: container detected, using /tmp (safe default)" >&2
-                echo "/tmp/weave-${uid}"
-            elif [ -d "/dev/shm" ] && [ -w "/dev/shm" ] && check_free_space "/dev/shm"; then
-                echo "/dev/shm/weave"
-            else
-                [ -d "/dev/shm" ] && [ -w "/dev/shm" ] && \
-                    echo "wv: /dev/shm has <${WV_MIN_SHM}KB free, falling back to /tmp" >&2
-                echo "/tmp/weave-${uid}"
-            fi
-            ;;
-        Darwin*)
-            echo "${TMPDIR:-/tmp}/weave-${uid}"
-            ;;
-        MINGW*|CYGWIN*|MSYS*)
-            echo "${TEMP:-/tmp}/weave-${uid}"
-            ;;
-        *)
-            echo "$WEAVE_DIR"
-            ;;
-    esac
-}
+_WV_ENV_OVERRIDE_HOT_ZONE=$(resolve_env_override_hot_zone)
+if [ -n "$_WV_ENV_OVERRIDE_HOT_ZONE" ] && ! hot_zone_matches_repo "$_WV_ENV_OVERRIDE_HOT_ZONE" "$REPO_ROOT"; then
+    _WV_ENV_OVERRIDE_OWNER=$(read_hot_zone_owner "$_WV_ENV_OVERRIDE_HOT_ZONE")
+    [ -z "$_WV_ENV_OVERRIDE_OWNER" ] && [ -n "${WV_PROJECT_DIR:-}" ] && _WV_ENV_OVERRIDE_OWNER="$WV_PROJECT_DIR"
+    echo "wv: ignoring leaked WV_HOT_ZONE/WV_DB override from ${_WV_ENV_OVERRIDE_OWNER:-another repo} (current repo: $REPO_ROOT)" >&2
+    unset WV_HOT_ZONE WV_DB WV_PRIMARY_FILE
+fi
 
 # Set up hot zone and database paths
 # Per-repo namespace: hash the repo root to isolate each repo's hot zone.
 # This prevents multiple repos from sharing a single brain.db on tmpfs.
-_WV_BASE_HOT_ZONE=$(detect_hot_zone)
-if [ -n "$REPO_ROOT" ] && [ "$REPO_ROOT" != "/" ]; then
-    _WV_REPO_HASH=$(echo "$REPO_ROOT" | md5sum | cut -c1-8)
-    WV_HOT_ZONE="${WV_HOT_ZONE:-${_WV_BASE_HOT_ZONE}/${_WV_REPO_HASH}}"
-else
-    WV_HOT_ZONE="${WV_HOT_ZONE:-${_WV_BASE_HOT_ZONE}}"
-fi
+_WV_BASE_HOT_ZONE=$(resolve_hot_zone)
+WV_HOT_ZONE="${WV_HOT_ZONE:-$(resolve_repo_hot_zone "$_WV_BASE_HOT_ZONE" "$REPO_ROOT")}"
 WV_DB_CUSTOM="${WV_DB:+1}"
-WV_DB="${WV_DB:-$WV_HOT_ZONE/brain.db}"
-WV_PRIMARY_FILE="$WV_HOT_ZONE/primary"
+WV_DB="${WV_DB:-$(resolve_db "$WV_HOT_ZONE")}"
+WV_PRIMARY_FILE="${WV_PRIMARY_FILE:-$(resolve_primary_file "$WV_HOT_ZONE")}"
 
 # Primary active node helpers
 # The "primary" node is the most recently claimed via `wv work`.
