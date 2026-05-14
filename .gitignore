@@ -8,11 +8,8 @@ __pycache__/
 dist/
 build/
 
-# Weave runtime (state.sql is the git-tracked dump)
-.weave/*.db
-.weave/*.db-wal
-.weave/*.db-shm
-.weave/archive/
+# Weave runtime (local repo state only; never shipped from the public release repo)
+.weave/
 
 # Editors & OS
 .DS_Store
@@ -21,7 +18,3 @@ Thumbs.db
 *~
 .idea/
 
-# Weave — git-tracked graph exports
-!.weave/state.sql
-!.weave/nodes.jsonl
-!.weave/edges.jsonl
