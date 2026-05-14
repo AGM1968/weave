@@ -17,6 +17,7 @@ TEST_WV_DIR="/tmp/wv-health-test-$$"
 export WV_HOT_ZONE="$TEST_WV_DIR"
 export WV_DB="$TEST_WV_DIR/test.db"
 export WV_REQUIRE_LEARNING=0
+export WV_PROJECT_DIR="$REPO_ROOT"
 
 # Colors
 RED='\033[0;31m'
@@ -167,11 +168,26 @@ assert_contains "$output" "Nodes:" "health shows nodes section"
 assert_contains "$output" "Edges:" "health shows edges section"
 
 # health --json works on empty database
-json_output=$($WV health --json 2>&1)
+json_output=$($WV health --json 2>/dev/null)
 assert_json_field "$json_output" ".status" "healthy" "health --json shows healthy status"
 assert_json_field "$json_output" ".score" "100" "health --json shows 100 score on empty db"
 assert_json_field "$json_output" ".nodes.total" "0" "health --json shows 0 total nodes"
 assert_json_field "$json_output" ".edges.total" "0" "health --json shows 0 total edges"
+
+# health/load in an uninitialized git repo must not auto-create .weave/
+fresh_repo="$TEST_WV_DIR/uninitialized-repo"
+fresh_hot="$TEST_WV_DIR/uninitialized-hot"
+mkdir -p "$fresh_repo"
+git -C "$fresh_repo" init -q
+
+output=$(cd "$fresh_repo" && WV_HOT_ZONE="$fresh_hot" WV_DB="$fresh_hot/brain.db" WV_PROJECT_DIR="$fresh_repo" WV_REQUIRE_LEARNING=0 "$WV" health --json 2>/dev/null)
+assert_json_field "$output" ".status" "healthy" "health --json works in uninitialized git repo"
+assert_equals "absent" "$(if [ -d "$fresh_repo/.weave" ]; then echo present; else echo absent; fi)" "health --json does not create .weave in uninitialized repo"
+
+rm -rf "$fresh_hot"
+output=$(cd "$fresh_repo" && WV_HOT_ZONE="$fresh_hot" WV_DB="$fresh_hot/brain.db" WV_PROJECT_DIR="$fresh_repo" WV_REQUIRE_LEARNING=0 "$WV" load 2>&1)
+assert_contains "$output" "initialized empty database" "load still initializes an empty hot-zone database"
+assert_equals "absent" "$(if [ -d "$fresh_repo/.weave" ]; then echo present; else echo absent; fi)" "load does not create .weave in uninitialized repo"
 
 # ============================================================================
 # Test: health command (with data)
@@ -192,7 +208,7 @@ node2=$($WV add "Todo task 2")
 $WV link "$node1" "$node2" --type=blocks >/dev/null 2>&1
 
 # health shows correct counts
-json_output=$($WV health --json 2>&1)
+json_output=$($WV health --json 2>/dev/null)
 assert_json_field "$json_output" ".nodes.total" "5" "health counts 5 total nodes"
 assert_json_field "$json_output" ".nodes.active" "1" "health counts 1 active node"
 assert_json_field "$json_output" ".nodes.blocked" "1" "health counts 1 blocked node"
@@ -213,7 +229,7 @@ standalone_node=$($WV add "Standalone orphan" --standalone)
 annotated_node=$($WV add "Annotated retained orphan" --force)
 $WV update "$annotated_node" --metadata='{"standalone":true}' >/dev/null 2>&1
 
-json_output=$($WV health --json 2>&1)
+json_output=$($WV health --json 2>/dev/null)
 assert_json_field "$json_output" ".issues.orphan_nodes" "1" "health excludes intentional standalones from orphan count"
 assert_json_field "$json_output" ".issues.intentional_standalones" "2" "health counts intentional standalones separately"
 
@@ -236,7 +252,7 @@ reset_db
 # Add unaddressed pitfall - should reduce health score
 pitfall=$($WV add "Pitfall: Something is wrong" --metadata='{"pitfall":"This is a pitfall"}')
 
-json_output=$($WV health --json 2>&1)
+json_output=$($WV health --json 2>/dev/null)
 assert_json_field "$json_output" ".pitfalls.total" "1" "health counts 1 pitfall"
 assert_json_field "$json_output" ".pitfalls.unaddressed" "1" "health counts 1 unaddressed"
 
@@ -254,7 +270,7 @@ TESTS_RUN=$((TESTS_RUN + 1))
 fix=$($WV add "Fix for pitfall" --status=done --force)
 $WV link "$fix" "$pitfall" --type=addresses >/dev/null 2>&1
 
-json_output=$($WV health --json 2>&1)
+json_output=$($WV health --json 2>/dev/null)
 assert_json_field "$json_output" ".pitfalls.addressed" "1" "health counts 1 addressed"
 assert_json_field "$json_output" ".pitfalls.unaddressed" "0" "health counts 0 unaddressed"
 assert_json_field "$json_output" ".score" "100" "health score restored to 100"
@@ -412,14 +428,14 @@ echo "Testing: health status thresholds"
 reset_db
 
 # Perfect health (score >= 90) = healthy
-json_output=$($WV health --json 2>&1)
+json_output=$($WV health --json 2>/dev/null)
 assert_json_field "$json_output" ".status" "healthy" "score 100 = healthy"
 
 # Add 2 unaddressed pitfalls (-20) = warning (80)
 $WV add "Pitfall: Issue 1" --metadata='{"pitfall":"p1"}' --force >/dev/null
 $WV add "Pitfall: Issue 2" --metadata='{"pitfall":"p2"}' --force >/dev/null
 
-json_output=$($WV health --json 2>&1)
+json_output=$($WV health --json 2>/dev/null)
 score=$(echo "$json_output" | jq -r '.score')
 status=$(echo "$json_output" | jq -r '.status')
 if [ "$score" -ge 70 ] && [ "$score" -lt 90 ]; then
@@ -435,7 +451,7 @@ $WV add "Pitfall: Issue 3" --metadata='{"pitfall":"p3"}' --force >/dev/null
 $WV add "Pitfall: Issue 4" --metadata='{"pitfall":"p4"}' --force >/dev/null
 $WV add "Pitfall: Issue 5" --metadata='{"pitfall":"p5"}' --force >/dev/null
 
-json_output=$($WV health --json 2>&1)
+json_output=$($WV health --json 2>/dev/null)
 score=$(echo "$json_output" | jq -r '.score')
 status=$(echo "$json_output" | jq -r '.status')
 if [ "$score" -lt 70 ]; then

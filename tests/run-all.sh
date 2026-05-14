@@ -47,6 +47,7 @@ done
 declare -a SUITES=(
     "test-core.sh:Core Commands"
     "test-graph.sh:Graph Commands"
+    "test-release.sh:Release Tests"
     "test-data.sh:Data Commands"
     "test-health.sh:Health Commands"
     "test-sprint2b.sh:Sprint 2b Commands"

@@ -30,6 +30,7 @@ TEST_DIR="/tmp/wv-graph-test-$$"
 export WV_HOT_ZONE="$TEST_DIR"
 export WV_DB="$TEST_DIR/brain.db"
 export WV_REQUIRE_LEARNING=0
+export WV_PROJECT_DIR="$TEST_DIR"
 
 # Cleanup function
 cleanup() {
@@ -43,6 +44,7 @@ trap cleanup EXIT
 setup_test_env() {
     rm -rf "$TEST_DIR"
     mkdir -p "$TEST_DIR"
+    export WV_PROJECT_DIR="$TEST_DIR"
     cd "$TEST_DIR"
     "$WV" init >/dev/null 2>&1
 }

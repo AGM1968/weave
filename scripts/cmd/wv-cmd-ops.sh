@@ -2761,13 +2761,15 @@ cmd_health() {
     _health_compute_score
     _health_collect_quality
 
-    # Append to health history log (TSV: timestamp, score, nodes, edges, orphans, ghost_edges)
+    # Append to health history log only if this project has been initialised with wv-init-repo.
+    # Guard prevents auto-creating .weave/ in repos that never opted in.
     local log_file="$WEAVE_DIR/health.log"
-    mkdir -p "$WEAVE_DIR"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$(date -u +%Y-%m-%dT%H:%M:%S)" \
-        "$_h_health_score" "$_h_total_nodes" "$_h_total_edges" \
-        "$_h_orphan_nodes" "$_h_ghost_edges" >> "$log_file"
+    if [ -d "$WEAVE_DIR" ]; then
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%S)" \
+            "$_h_health_score" "$_h_total_nodes" "$_h_total_edges" \
+            "$_h_orphan_nodes" "$_h_ghost_edges" >> "$log_file"
+    fi
 
     # Backfill empty edge context if --fix
     if [ "$fix" = "true" ]; then

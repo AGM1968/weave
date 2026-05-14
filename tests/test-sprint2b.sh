@@ -30,6 +30,7 @@ TEST_DIR="/tmp/wv-sprint2b-test-$$"
 export WV_HOT_ZONE="$TEST_DIR"
 export WV_DB="$TEST_DIR/brain.db"
 export WV_REQUIRE_LEARNING=0
+export WV_PROJECT_DIR="$TEST_DIR"
 
 cleanup() {
     if [ -d "$TEST_DIR" ]; then
@@ -41,6 +42,7 @@ trap cleanup EXIT
 setup_test_env() {
     rm -rf "$TEST_DIR"
     mkdir -p "$TEST_DIR"
+    export WV_PROJECT_DIR="$TEST_DIR"
     cd "$TEST_DIR"
 }
 

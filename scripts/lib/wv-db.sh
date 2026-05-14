@@ -27,12 +27,16 @@ db_init() {
     # Create 700/600 so other local users cannot read the graph. `umask 077`
     # covers the DB file; explicit chmod covers existing dirs that predate
     # this change. See security review L5 (2026-04-19).
+    #
+    # Do not create $WEAVE_DIR here. db_init backs both explicit initialization
+    # and read-ish paths like `wv health`, `wv status`, and session-start
+    # hooks. Auto-creating the repo's .weave directory here would opt
+    # uninitialized repositories into Weave just by inspecting them.
     local prev_umask
     prev_umask=$(umask)
     umask 077
     mkdir -p "$WV_HOT_ZONE"
     chmod 700 "$WV_HOT_ZONE" 2>/dev/null || true
-    mkdir -p "$WEAVE_DIR"
     umask "$prev_umask"
     validate_hot_size
 

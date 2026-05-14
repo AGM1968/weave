@@ -31,6 +31,7 @@ export WV_HOT_ZONE="$TEST_DIR"
 export WV_DB="$TEST_DIR/brain.db"
 export WV_REQUIRE_LEARNING=0
 export WV_RUN_CACHE=0
+export WV_PROJECT_DIR="$TEST_DIR"
 
 # Cleanup function
 cleanup() {
@@ -44,6 +45,7 @@ trap cleanup EXIT
 setup_test_env() {
     rm -rf "$TEST_DIR"
     mkdir -p "$TEST_DIR"
+    export WV_PROJECT_DIR="$TEST_DIR"
     cd "$TEST_DIR"
     git init -q
 }
@@ -175,8 +177,10 @@ test_init_recovery() {
     INIT_TEST_DIR=$(mktemp -d)
     local OLD_HOT="$WV_HOT_ZONE"
     local OLD_DB="$WV_DB"
+    local OLD_PROJECT="${WV_PROJECT_DIR:-}"
     export WV_HOT_ZONE="$INIT_TEST_DIR/hot"
     export WV_DB="$WV_HOT_ZONE/brain.db"
+    export WV_PROJECT_DIR="$INIT_TEST_DIR"
 
     cd "$INIT_TEST_DIR"
     git init -q
@@ -213,6 +217,11 @@ test_init_recovery() {
     # Restore original env
     export WV_HOT_ZONE="$OLD_HOT"
     export WV_DB="$OLD_DB"
+    if [ -n "$OLD_PROJECT" ]; then
+        export WV_PROJECT_DIR="$OLD_PROJECT"
+    else
+        unset WV_PROJECT_DIR
+    fi
     cd /tmp
     rm -rf "$INIT_TEST_DIR"
 }
@@ -423,12 +432,13 @@ test_done() {
     assert_not_contains "$finding_overlap_meta" "learning_overlap_noted" "finding close also skips overlap advisory metadata in non-interactive mode"
 
     local ship_id ship_exit ship_output ship_meta ship_remote ship_status
-    local ship_repo ship_hot old_hot old_db old_pwd
+    local ship_repo ship_hot old_hot old_db old_project old_pwd
     ship_repo="$TEST_DIR/ship-repo"
     ship_hot="$TEST_DIR/ship-hot"
     ship_remote="$TEST_DIR/ship-remote.git"
     old_hot="$WV_HOT_ZONE"
     old_db="$WV_DB"
+    old_project="${WV_PROJECT_DIR:-}"
     old_pwd="$PWD"
 
     rm -rf "$ship_repo" "$ship_hot" "$ship_remote"
@@ -437,6 +447,7 @@ test_done() {
     git init -q
     export WV_HOT_ZONE="$ship_hot"
     export WV_DB="$ship_hot/brain.db"
+    export WV_PROJECT_DIR="$ship_repo"
     "$WV" init >/dev/null 2>&1
 
     git config user.email "test@example.com"
@@ -474,6 +485,11 @@ test_done() {
     cd "$old_pwd"
     export WV_HOT_ZONE="$old_hot"
     export WV_DB="$old_db"
+    if [ -n "$old_project" ]; then
+        export WV_PROJECT_DIR="$old_project"
+    else
+        unset WV_PROJECT_DIR
+    fi
 
     # --acknowledge-overlap still clears legacy pending_close state (backward compat)
     local legacy_id legacy_meta legacy_exit legacy_output

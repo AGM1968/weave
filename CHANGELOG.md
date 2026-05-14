@@ -2,6 +2,15 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.45.1] - 2026-05-13
+
+### Fixed
+
+- **Uninitialized repo opt-in boundary**: `db_init` no longer auto-creates `.weave/` on shared
+  read/startup paths. Fresh git repos no longer gain `.weave/` from `wv health --json`, `wv load`,
+  `context-guard.sh`, or `session-start-context.sh` until explicitly initialized. Targeted health
+  and hook regressions now cover the boundary.
+
 ## [1.45.0] - 2026-05-10
 
 ### Added

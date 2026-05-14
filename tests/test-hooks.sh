@@ -27,6 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 HOOKS_DIR="$PROJECT_ROOT/.claude/hooks"
 WV="$PROJECT_ROOT/scripts/wv"
+export WV_LIB_DIR="$PROJECT_ROOT/scripts"
 
 # Test environment
 TEST_DIR="/tmp/wv-hooks-test-$$"
@@ -123,6 +124,28 @@ setup_test_env() {
 export WV_PROJECT_DIR="$TEST_DIR/project"
 }
 
+setup_uninitialized_project() {
+    rm -rf "$TEST_DIR"
+    mkdir -p "$TEST_DIR/project/.claude/hooks"
+    mkdir -p "$TEST_DIR/project/scripts"
+
+    # Create symlinks so hooks can find wv and lib
+    ln -sf "$WV" "$TEST_DIR/project/scripts/wv"
+    mkdir -p "$TEST_DIR/project/scripts/lib"
+    ln -sf "$PROJECT_ROOT/scripts/lib/wv-resolve-project.sh" "$TEST_DIR/project/scripts/lib/wv-resolve-project.sh"
+    ln -sf "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" "$TEST_DIR/project/scripts/lib/wv-resolve-runtime.sh"
+
+    cd "$TEST_DIR/project"
+    git init -q
+    git config commit.gpgsign false
+    git config user.name "Hook Test"
+    git config user.email "hook-test@example.com"
+    git commit --allow-empty -m "init" -q
+
+    export CLAUDE_PROJECT_DIR="$TEST_DIR/project"
+    export WV_PROJECT_DIR="$TEST_DIR/project"
+}
+
 add_active_node() {
     local text="$1"
     shift || true
@@ -143,6 +166,11 @@ OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "hookSpecificOutput" "session-start: outputs hookSpecificOutput JSON"
 assert_contains "$OUTPUT" "SessionStart" "session-start: identifies as SessionStart event"
 assert_contains "$OUTPUT" "additionalContext" "session-start: includes additionalContext field"
+
+setup_uninitialized_project
+OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
+assert_contains "$OUTPUT" "hookSpecificOutput" "session-start: still returns hook output in uninitialized repo"
+assert_equals "absent" "$(if [ -d "$TEST_DIR/project/.weave" ]; then echo present; else echo absent; fi)" "session-start: does not create .weave in uninitialized repo"
 
 # --- pre-compact-context.sh ---
 echo ""
@@ -974,6 +1002,15 @@ else
     echo "  Cache age: ${AGE}s (expected < 60s)"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
+
+setup_uninitialized_project
+set +e
+OUTPUT=$(bash "$HOOKS_DIR/context-guard.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "context-guard: exits 0 in uninitialized repo"
+assert_contains "$OUTPUT" "policy" "context-guard: emits policy line in uninitialized repo"
+assert_equals "absent" "$(if [ -d "$TEST_DIR/project/.weave" ]; then echo present; else echo absent; fi)" "context-guard: does not create .weave in uninitialized repo"
 
 # ============================================================
 # --- JSONL bridge: crash path includes last-prompt ---

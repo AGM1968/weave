@@ -14,6 +14,7 @@ export WV_HOT_ZONE="$TEST_DIR/hot"
 export WV_DB="$TEST_DIR/hot/brain.db"
 export WV_REQUIRE_LEARNING=0
 export WEAVE_DIR="$TEST_DIR/.weave"
+export WV_PROJECT_DIR="$TEST_DIR"
 mkdir -p "$WV_HOT_ZONE" "$WEAVE_DIR"
 cd "$TEST_DIR"
 git init -q 2>/dev/null || true
@@ -624,6 +625,7 @@ CP_DIR=$(mktemp -d)
     git config user.email t@t && git config user.name t
     export WV_HOT_ZONE="$CP_DIR/hz" \
            WV_DB="$CP_DIR/hz/brain.db" \
+            WV_PROJECT_DIR="$CP_DIR" \
            WV_CHECKPOINT_INTERVAL=0 \
            WV_CHECKPOINT_PULL=0 \
            WV_SYNC_INTERVAL=0

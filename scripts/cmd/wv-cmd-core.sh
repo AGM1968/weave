@@ -35,6 +35,7 @@ cmd_init() {
         rm -f "$WEAVE_DIR/edges.jsonl" 2>/dev/null || true
         rm -f "$WEAVE_DIR/health.log" 2>/dev/null || true
         rm -rf "$WEAVE_DIR/cache" 2>/dev/null || true
+        mkdir -p "$WEAVE_DIR"
         db_init
         wv_delta_init "$WV_DB"
         echo -e "${GREEN}✓ Initialized Weave at $WEAVE_DIR (clean slate)${NC}"
@@ -67,6 +68,7 @@ cmd_init() {
         fi
     fi
 
+    mkdir -p "$WEAVE_DIR"
     db_init
     wv_delta_init "$WV_DB"
     echo -e "${GREEN}✓ Initialized Weave at $WEAVE_DIR${NC}"
