@@ -102,6 +102,20 @@ _delta_compact() {
     echo "$deleted"
 }
 
+_should_persist_weave_state() {
+    # Keep existing initialized repos durable, but do not materialize .weave/
+    # for empty hot-zone-only sessions in non-initialized directories.
+    if [ -d "$WEAVE_DIR" ]; then
+        return 0
+    fi
+
+    local node_count edge_count
+    node_count=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '\$.type') IS NOT 'session_history';" 2>/dev/null || echo "0")
+    edge_count=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COUNT(*) FROM edges;" 2>/dev/null || echo "0")
+
+    [ "$node_count" -gt 0 ] || [ "$edge_count" -gt 0 ]
+}
+
 auto_sync() {
     local _force=false
     for _arg in "$@"; do [ "$_arg" = "--force" ] && _force=true; done
@@ -131,6 +145,12 @@ auto_sync() {
     # O(1) change detection: if _warp_changes is empty, nothing happened since
     # the last sync — skip the dump entirely. No I/O, no git noise.
     if ! wv_delta_has_changes "$WV_DB"; then
+        return 0
+    fi
+
+    if ! _should_persist_weave_state; then
+        wv_delta_reset "$WV_DB"
+        echo "$now" > "$stamp_file"
         return 0
     fi
 
@@ -389,6 +409,19 @@ cmd_sync() {
     fi
 
     db_ensure
+    if ! _should_persist_weave_state; then
+        wv_delta_reset "$WV_DB"
+        if [ "$format" = "json" ]; then
+            jq -n '{"ok": true, "skipped": true, "reason": "empty_uninitialized"}'
+        else
+            echo -e "${YELLOW}Nothing to sync: graph is empty and .weave is not initialized${NC}" >&2
+        fi
+        if [ "$_sync_journaled" = true ]; then
+            journal_end
+            journal_clean
+        fi
+        return 0
+    fi
     mkdir -p "$WEAVE_DIR"
 
     # Step 1: Dump to disk

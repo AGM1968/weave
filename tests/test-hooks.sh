@@ -768,6 +768,14 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "session-end: exits 0"
 
+setup_uninitialized_project
+set +e
+OUTPUT=$(echo '{"reason":"user_exit"}' | bash "$HOOKS_DIR/session-end-sync.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "session-end: exits 0 in uninitialized repo"
+assert_equals "absent" "$(if [ -d "$TEST_DIR/project/.weave" ]; then echo present; else echo absent; fi)" "session-end: does not create .weave in uninitialized repo"
+
 # Check session log was written
 if [ -f "$TEST_DIR/project/.claude/session.log" ]; then
     LOG_CONTENT=$(cat "$TEST_DIR/project/.claude/session.log")

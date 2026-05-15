@@ -2,6 +2,16 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.45.2] - 2026-05-15
+
+### Fixed
+
+- **Persistence boundary widening**: empty hot-zone sessions in uninitialized directories no longer
+  materialize `.weave/` during `wv sync`, `session-end-sync.sh`, or Claude open/exit lifecycles.
+  The persistence boundary now stays hot-zone-only until the graph has non-session state or the
+  repo is explicitly initialized, with targeted regressions covering both direct sync and
+  installed-hook session end behavior.
+
 ## [1.45.1] - 2026-05-13
 
 ### Fixed

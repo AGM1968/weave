@@ -189,6 +189,11 @@ output=$(cd "$fresh_repo" && WV_HOT_ZONE="$fresh_hot" WV_DB="$fresh_hot/brain.db
 assert_contains "$output" "initialized empty database" "load still initializes an empty hot-zone database"
 assert_equals "absent" "$(if [ -d "$fresh_repo/.weave" ]; then echo present; else echo absent; fi)" "load does not create .weave in uninitialized repo"
 
+rm -rf "$fresh_hot"
+output=$(cd "$fresh_repo" && WV_HOT_ZONE="$fresh_hot" WV_DB="$fresh_hot/brain.db" WV_PROJECT_DIR="$fresh_repo" WV_REQUIRE_LEARNING=0 "$WV" sync 2>&1)
+assert_contains "$output" "Nothing to sync" "sync reports skip in uninitialized repo"
+assert_equals "absent" "$(if [ -d "$fresh_repo/.weave" ]; then echo present; else echo absent; fi)" "sync does not create .weave in uninitialized repo"
+
 # ============================================================================
 # Test: health command (with data)
 # ============================================================================
