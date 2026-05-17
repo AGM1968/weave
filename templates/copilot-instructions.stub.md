@@ -48,6 +48,15 @@ wv add "<description>" --standalone
 # `wv health` reports these as intentional_standalones, not orphan_nodes.
 ```
 
+## Sync modes
+
+`wv sync --gh` accepts `--mode=fast|full|repair` (and an optional `--node=<id>` focus):
+
+- `fast` — default for `wv ship` and session-end; bounded to focus + impacted set.
+- `full` — explicit default for plain `wv sync --gh`; exhaustive reconcile.
+- `repair` — resumes from `.weave/repair-checkpoint.json` after an interrupted/crashed sync.
+  `wv recover` and the stop-hook recommend this when the checkpoint exists.
+
 ## Code quality — run before every commit
 
 ```bash

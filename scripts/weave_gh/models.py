@@ -3,7 +3,38 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
+
+
+class Mode(str, Enum):
+    """Sync execution mode.
+
+    - ``FAST``: scoped reconciliation for routine close paths (wv ship,
+      session-end hooks). Phase A treats this as an alias of ``FULL``; the
+      semantic split lands in Phase B.
+    - ``FULL``: exhaustive Phase 1 reconciliation across the whole graph
+      (current default, release-safe).
+    - ``REPAIR``: operator-facing recovery surface. Phase A aliases ``FULL``;
+      Phase D adds resume checkpoints.
+    """
+
+    FAST = "fast"
+    FULL = "full"
+    REPAIR = "repair"
+
+    @classmethod
+    def parse(cls, value: str | None) -> "Mode":
+        """Return the Mode for ``value``, defaulting to FULL."""
+        if value is None:
+            return cls.FULL
+        try:
+            return cls(value)
+        except ValueError as exc:
+            valid = ", ".join(m.value for m in cls)
+            raise ValueError(
+                f"invalid sync mode {value!r}; expected one of: {valid}"
+            ) from exc
 
 
 @dataclass
@@ -96,7 +127,7 @@ class Edge:
 
 
 @dataclass
-class SyncStats:
+class SyncStats:  # pylint: disable=too-many-instance-attributes
     """Counters for sync operations."""
 
     created_gh: int = 0
@@ -107,6 +138,34 @@ class SyncStats:
     closed_wv: int = 0
     already_synced: int = 0
     skipped: int = 0
+    # Phase C: count of nodes whose body render was skipped due to a
+    # structural-digest cache hit (the rendered body would be identical).
+    digest_skipped: int = 0
+    # Phase D: count of nodes skipped on resume because a prior repair-mode
+    # run already processed them (checkpoint hit).
+    resumed_from: int = 0
+
+    # Phase A progress counters — populated by the sync entrypoint so users
+    # can see scope and progress even when no writes happen.
+    mode: Mode = Mode.FULL
+    total_nodes: int = 0
+    candidates: int = 0
+    processed: int = 0
+    current_phase: str = ""
+
+    def progress(self) -> str:
+        """Return a compact progress line: mode, scope, processed counts."""
+        return (
+            f"mode={self.mode.value} "
+            f"total={self.total_nodes} "
+            f"candidates={self.candidates} "
+            f"processed={self.processed} "
+            f"updated={self.updated_gh} "
+            f"skipped={self.skipped} "
+            f"digest_hits={self.digest_skipped}"
+            + (f" resumed_from={self.resumed_from}" if self.resumed_from else "")
+            + (f" phase={self.current_phase}" if self.current_phase else "")
+        )
 
     def summary(self) -> str:
         """Return a compact summary of all sync operations."""
@@ -125,6 +184,11 @@ class SyncStats:
             parts.append(f"Weave closed: {self.closed_wv}")
         if self.already_synced:
             parts.append(f"already synced: {self.already_synced}")
+        if self.digest_skipped:
+            parts.append(f"digest cache hits: {self.digest_skipped}")
+        if self.resumed_from:
+            parts.append(f"resumed from checkpoint: {self.resumed_from}")
         if self.skipped:
             parts.append(f"skipped: {self.skipped}")
-        return " | ".join(parts) if parts else "no changes"
+        body = " | ".join(parts) if parts else "no changes"
+        return f"[{self.mode.value}] {body}"

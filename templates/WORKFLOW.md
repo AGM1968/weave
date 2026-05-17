@@ -50,7 +50,7 @@ create a node first.
 | `wv learnings`            | Show captured decisions/patterns/pitfalls                              | `--category=`, `--grep=`, `--dedup`                                        |
 | `wv link <from> <to>`     | Create semantic edge                                                   | `--type=`, `--context='{...}'`                                             |
 | `wv health`               | System health check with score                                         | `--json`, `--verbose`, `--fix`                                             |
-| `wv sync`                 | Dump to `.weave/state.sql`                                             | `--gh` for GH sync, `--dry-run`                                            |
+| `wv sync`                 | Dump to `.weave/state.sql`                                             | `--gh` for GH sync, `--mode=fast\|full\|repair`, `--node=<id>`, `--dry-run` |
 | `wv load`                 | Restore from `.weave/state.sql`                                        | Run by session start hook                                                  |
 | `wv prune`                | Archive done nodes >48h                                                | `--age=`, `--orphans-only`, `--dry-run`                                    |
 | `wv quality scan`         | Scan repo for complexity + churn                                       | `--exclude=`, `--json`                                                     |
@@ -134,6 +134,23 @@ wv sync --gh                        # Sync all nodes ↔ GH issues
 ```
 
 Always use `--gh` when work should be visible in GitHub. `wv done` auto-closes linked issues.
+
+### Sync modes (`--mode=fast|full|repair`)
+
+`wv sync --gh` accepts a mode flag that controls scope and recovery behaviour:
+
+| Mode     | When                                                                 | Behaviour                                                           |
+| -------- | -------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `fast`   | Default for `wv ship` and `session-end-sync.sh`                      | Bounded to focus node + parent + children + blockers; skips Phase 2/3 |
+| `full`   | Manual exhaustive reconcile; suspected drift; bulk import            | Walks every node and issue (slowest, most thorough)                 |
+| `repair` | After a timeout/Ctrl-C/crash mid-sync — `wv recover` recommends this | Same scope as `full` but resumes from `.weave/repair-checkpoint.json`; SIGINT/SIGTERM print the resume hint to stderr |
+
+The checkpoint is removed on clean completion. To reset it manually:
+
+```bash
+rm -f .weave/repair-checkpoint.json
+wv sync --gh --mode=full
+```
 
 ## Learnings
 
@@ -403,7 +420,7 @@ EOF
 
 ## Agents
 
-The default `weave` MCP server exposes all 33 tools. When `weave-inspect` is also registered,
+The default `weave` MCP server exposes all 35 tools. When `weave-inspect` is also registered,
 read-only agents can use its 15-tool inspect subset.
 
 - **weave-guide** — Workflow best practices, anti-patterns (session lifecycle tools)

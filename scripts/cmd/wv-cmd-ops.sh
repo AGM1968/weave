@@ -1429,10 +1429,10 @@ _recover_sync() {
 
     case "$stuck_action" in
         dump)
-            echo "  Recovery: re-run full sync"
+            echo "  Recovery: re-run sync in --mode=repair (resumable from last checkpoint)"
             ;;
         gh_sync)
-            echo "  Recovery: re-run GH sync + commit"
+            echo "  Recovery: re-run GH sync + commit (uses --mode=repair to resume from last checkpoint)"
             ;;
         git_commit)
             echo "  Recovery: re-run git commit"
@@ -1448,7 +1448,9 @@ _recover_sync() {
     local gh_flag
     gh_flag=$(echo "$args" | jq -r '.gh // false')
     if [ "$gh_flag" = "true" ]; then
-        cmd_sync --gh 2>/dev/null || true
+        # Phase D: prefer --mode=repair so an interrupted sync resumes from
+        # its checkpoint instead of redoing the entire walk.
+        cmd_sync --gh --mode=repair 2>/dev/null || true
     else
         cmd_sync 2>/dev/null || true
     fi
@@ -3603,7 +3605,7 @@ cmd_help_topic() {
             print_command_help "wv batch [file] [--dry-run] [--stop-on-error]" "Execute multiple wv commands from a file or stdin."
             ;;
         sync)
-            print_command_help "wv sync [--gh] [--dry-run]" "Persist in-memory graph state to the git-backed .weave layer and optionally sync GitHub issues."
+            print_command_help "wv sync [--gh] [--dry-run] [--mode=fast|full|repair] [--node=<id>]" "Persist in-memory graph state to the git-backed .weave layer and optionally sync GitHub issues. Modes: fast (bounded to focus + impacted set, default for wv ship/session-end), full (exhaustive reconcile), repair (resumable from .weave/repair-checkpoint.json after timeout/interrupt — use after wv recover or stop-hook recommendation)."
             ;;
         load)
             print_command_help "wv load" "Load the graph from the git-backed .weave layer."

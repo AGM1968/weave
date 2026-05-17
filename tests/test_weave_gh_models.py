@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-from weave_gh.models import Edge, GitHubIssue, SyncStats, WeaveNode
+from weave_gh.models import Edge, GitHubIssue, Mode, SyncStats, WeaveNode
 
 
 # ---------------------------------------------------------------------------
@@ -201,11 +201,11 @@ class TestEdge:
 class TestSyncStats:
     def test_no_changes(self) -> None:
         stats = SyncStats()
-        assert stats.summary() == "no changes"
+        assert stats.summary() == "[full] no changes"
 
     def test_single_operation(self) -> None:
         stats = SyncStats(created_gh=3)
-        assert stats.summary() == "GH created: 3"
+        assert stats.summary() == "[full] GH created: 3"
 
     def test_multiple_operations(self) -> None:
         stats = SyncStats(created_gh=2, closed_gh=1, updated_gh=5)
@@ -236,3 +236,46 @@ class TestSyncStats:
         assert "GH closed" not in summary
         assert "GH created: 1" in summary
         assert "skipped: 2" in summary
+
+    def test_mode_prefix_reflects_mode(self) -> None:
+        stats = SyncStats(mode=Mode.FAST)
+        assert stats.summary().startswith("[fast]")
+
+    def test_progress_line_includes_counts(self) -> None:
+        stats = SyncStats(
+            mode=Mode.REPAIR,
+            total_nodes=820,
+            candidates=820,
+            processed=120,
+            updated_gh=4,
+            skipped=2,
+            current_phase="phase-1-weave-to-github",
+        )
+        progress = stats.progress()
+        assert "mode=repair" in progress
+        assert "total=820" in progress
+        assert "candidates=820" in progress
+        assert "processed=120" in progress
+        assert "updated=4" in progress
+        assert "skipped=2" in progress
+        assert "phase=phase-1-weave-to-github" in progress
+
+    def test_progress_line_omits_empty_phase(self) -> None:
+        stats = SyncStats(mode=Mode.FULL, total_nodes=10, candidates=10)
+        assert "phase=" not in stats.progress()
+
+
+class TestMode:
+    def test_default_parse_returns_full(self) -> None:
+        assert Mode.parse(None) is Mode.FULL
+
+    def test_parse_each_valid_value(self) -> None:
+        assert Mode.parse("fast") is Mode.FAST
+        assert Mode.parse("full") is Mode.FULL
+        assert Mode.parse("repair") is Mode.REPAIR
+
+    def test_parse_invalid_raises(self) -> None:
+        import pytest
+
+        with pytest.raises(ValueError, match="invalid sync mode"):
+            Mode.parse("turbo")

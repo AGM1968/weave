@@ -247,3 +247,36 @@ def get_parent(node_id: str, all_edges: list[Edge] | None = None) -> str | None:
         if e.source == node_id and e.edge_type == "implements":
             return e.target
     return None
+
+
+def compute_impacted_node_ids(
+    focus_id: str,
+    *,
+    all_edges: list[Edge] | None = None,
+) -> set[str]:
+    """Return the set of node IDs whose rendered GH body may depend on focus_id.
+
+    The fast-path candidate selector uses this to bound Phase 1 to:
+
+    - the focus node itself,
+    - its direct parent (checklist + Mermaid),
+    - its direct children (status rolls up into focus body),
+    - blockers that point at the focus and blockers the focus points at
+      (both directions affect the rendered "Blocked by" / "Blocks" lines).
+
+    Sibling nodes are excluded — the parent re-render pulls their statuses
+    via its own edge lookup, so we do not need to touch them individually.
+    """
+    edges = all_edges if all_edges is not None else get_edges_for_node(focus_id)
+    impacted: set[str] = {focus_id}
+    for e in edges:
+        if e.edge_type == "implements":
+            if e.source == focus_id:
+                impacted.add(e.target)  # parent
+            elif e.target == focus_id:
+                impacted.add(e.source)  # child
+        elif e.edge_type == "blocks":
+            if focus_id in (e.source, e.target):
+                impacted.add(e.source)
+                impacted.add(e.target)
+    return impacted

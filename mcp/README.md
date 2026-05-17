@@ -42,7 +42,7 @@ confusion.
 | **session** | `weave_work`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_close_session`, `weave_breadcrumbs`, `weave_plan`, `weave_edit_guard` (10)                                                                              | Workflow lifecycle management              |
 | **lite**    | `weave_overview`, `weave_bootstrap`, `weave_guide`, `weave_edit_guard`, `weave_status`, `weave_work`, `weave_done` (7)                                                                                                                                            | Minimal task-tracking surface              |
 | **inspect** | `weave_context`, `weave_search`, `weave_status`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions` (15) | Read-only observation and query            |
-| **all**     | All 33 tools                                                                                                                                                                                                                                                         | Full access (default, backward-compatible) |
+| **all**     | All 35 tools                                                                                                                                                                                                                                                         | Full access (default, backward-compatible) |
 
 ### Design rationale
 
@@ -274,7 +274,7 @@ npm run dev
 
 The test suite verifies:
 
-- **Default scope (`all`)** — all 33 tools listed, tool calls work, unknown tools rejected
+- **Default scope (`all`)** — all 35 tools listed, tool calls work, unknown tools rejected
 - **`--scope=graph`** — only 9 graph tools listed, out-of-scope calls rejected
 - **`--scope=session`** — only 10 session tools listed
 - **`--scope=inspect`** — only 15 inspect tools listed

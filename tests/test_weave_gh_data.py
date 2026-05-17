@@ -16,6 +16,7 @@ from weave_gh.data import (
     _is_valid_node_id,
     _repo_hash,
     _resolve_db_path,
+    compute_impacted_node_ids,
     get_blockers,
     get_children,
     get_edges_for_node,
@@ -565,3 +566,61 @@ class TestGetParent:
         result = get_parent("wv-abc1")
         mock_get.assert_called_once_with("wv-abc1")
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# compute_impacted_node_ids (Phase B fast-path helper)
+# ---------------------------------------------------------------------------
+
+
+class TestComputeImpactedNodeIds:
+    def test_focus_alone_with_no_edges(self) -> None:
+        assert compute_impacted_node_ids("wv-solo", all_edges=[]) == {"wv-solo"}
+
+    def test_includes_parent(self) -> None:
+        edges = [
+            Edge(source="wv-focus", target="wv-parent",
+                 edge_type="implements", weight=1.0),
+        ]
+        assert compute_impacted_node_ids("wv-focus", all_edges=edges) == {
+            "wv-focus",
+            "wv-parent",
+        }
+
+    def test_includes_children(self) -> None:
+        edges = [
+            Edge(source="wv-c1", target="wv-focus",
+                 edge_type="implements", weight=1.0),
+            Edge(source="wv-c2", target="wv-focus",
+                 edge_type="implements", weight=1.0),
+        ]
+        assert compute_impacted_node_ids("wv-focus", all_edges=edges) == {
+            "wv-focus",
+            "wv-c1",
+            "wv-c2",
+        }
+
+    def test_includes_blockers_both_directions(self) -> None:
+        edges = [
+            Edge(source="wv-bk", target="wv-focus",
+                 edge_type="blocks", weight=1.0),
+            Edge(source="wv-focus", target="wv-blocked",
+                 edge_type="blocks", weight=1.0),
+        ]
+        assert compute_impacted_node_ids("wv-focus", all_edges=edges) == {
+            "wv-focus",
+            "wv-bk",
+            "wv-blocked",
+        }
+
+    def test_excludes_siblings(self) -> None:
+        # focus + sibling share a parent but sibling is not in impacted set
+        edges = [
+            Edge(source="wv-focus", target="wv-parent",
+                 edge_type="implements", weight=1.0),
+            Edge(source="wv-sibling", target="wv-parent",
+                 edge_type="implements", weight=1.0),
+        ]
+        impacted = compute_impacted_node_ids("wv-focus", all_edges=edges)
+        assert impacted == {"wv-focus", "wv-parent"}
+        assert "wv-sibling" not in impacted

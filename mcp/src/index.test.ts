@@ -276,12 +276,12 @@ describe("Weave MCP Server", () => {
   });
 
   describe("tools/list", () => {
-    it("should list all 33 tools (default scope=all)", async () => {
+    it("should list all 35 tools (default scope=all)", async () => {
       const response = await client.request("tools/list");
       expect(response.error).toBeUndefined();
 
       const tools = (response.result as { tools: { name: string }[] }).tools;
-      expect(tools).toHaveLength(33);
+      expect(tools).toHaveLength(35);
 
       const toolNames = tools.map((t) => t.name);
       expect(toolNames).toContain("weave_search");
@@ -1053,8 +1053,10 @@ describe("Weave MCP Server --scope=inspect", () => {
         "weave_quality_hotspots",
         "weave_quality_diff",
         "weave_quality_functions",
+        "weave_code_search",
+        "weave_index",
       ])
     );
-    expect(tools).toHaveLength(15);
+    expect(tools).toHaveLength(17);
   });
 });

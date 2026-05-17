@@ -346,6 +346,8 @@ Weave-ID: $first_active"
 # _sync_gh — Run bidirectional GitHub sync and re-dump state
 _sync_gh() {
     local dry_run="$1"
+    local mode="${2:-}"
+    local focus_node="${3:-}"
     if ! command -v python3 >/dev/null 2>&1; then
         echo -e "${YELLOW}Warning: python3 not found — cannot run GH sync${NC}" >&2
         return 0
@@ -353,6 +355,8 @@ _sync_gh() {
     echo ""
     local gh_args=()
     [ "$dry_run" = true ] && gh_args+=("--dry-run")
+    [ -n "$mode" ] && gh_args+=("--mode=$mode")
+    [ -n "$focus_node" ] && gh_args+=("--node=$focus_node")
     # Resolve weave_gh location: follow symlinks to find source dir
     local _wv_pypath="${WV_LIB_DIR:-$SCRIPT_DIR}"
     if [ ! -d "$_wv_pypath/weave_gh" ]; then
@@ -392,11 +396,17 @@ cmd_sync() {
     local gh_sync=false
     local dry_run=false
     local format="text"
+    local gh_mode=""
+    local gh_node=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --gh) gh_sync=true ;;
             --dry-run) dry_run=true ;;
             --json) format="json" ;;
+            --mode=*) gh_mode="${1#*=}" ;;
+            --mode) shift; gh_mode="${1:-}" ;;
+            --node=*) gh_node="${1#*=}" ;;
+            --node) shift; gh_node="${1:-}" ;;
         esac
         shift
     done
@@ -477,7 +487,7 @@ cmd_sync() {
     # Step 2: Bidirectional GitHub sync if --gh flag or WV_GH_SYNC=1
     if [ "$gh_sync" = true ] || [ "${WV_GH_SYNC:-0}" = "1" ]; then
         [ "$_sync_journaled" = true ] && journal_step 2 "gh_sync"
-        _sync_gh "$dry_run"
+        _sync_gh "$dry_run" "$gh_mode" "$gh_node"
         [ "$_sync_journaled" = true ] && journal_complete 2
     fi
 

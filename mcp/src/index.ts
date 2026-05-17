@@ -622,13 +622,22 @@ const TOOLS: Tool[] = [
   },
   {
     name: "weave_sync",
-    description: "Persist graph to disk and optionally sync GitHub issues. Call periodically and before session end.",
+    description: "Persist graph to disk and optionally sync GitHub issues. Call periodically and before session end. Use mode='fast' for routine close paths (bounded to focus + impacted set), mode='full' for exhaustive reconcile, mode='repair' to resume from .weave/repair-checkpoint.json after a timeout/interrupt (recommended by wv recover and stop-hook).",
     inputSchema: {
       type: "object",
       properties: {
         gh: {
           type: "boolean",
           description: "Also sync GitHub issues (default: false)",
+        },
+        mode: {
+          type: "string",
+          enum: ["fast", "full", "repair"],
+          description: "Sync mode (default: full). 'fast' bounds work to the focus node and its impacted set; 'repair' resumes from .weave/repair-checkpoint.json after an interrupted run.",
+        },
+        node: {
+          type: "string",
+          description: "Focus node id (required for mode='fast' when called outside ship/session-end).",
         },
       },
       required: [],
@@ -669,13 +678,18 @@ const TOOLS: Tool[] = [
   {
     name: "weave_close_session",
     description:
-      "End-of-session checkup: sync graph, then report uncommitted files, active nodes, and unpushed commits for MCP clients.",
+      "End-of-session checkup: sync graph, then report uncommitted files, active nodes, and unpushed commits for MCP clients. Pass mode='repair' if the previous sync was interrupted (.weave/repair-checkpoint.json present).",
     inputSchema: {
       type: "object",
       properties: {
         gh: {
           type: "boolean",
           description: "Also sync GitHub issues (default: true)",
+        },
+        mode: {
+          type: "string",
+          enum: ["fast", "full", "repair"],
+          description: "Sync mode (default: full). Use 'repair' to resume from .weave/repair-checkpoint.json after an interrupted run.",
         },
       },
       required: [],
@@ -1512,7 +1526,11 @@ function handleTool(
 
     case "weave_sync": {
       const gh = args.gh as boolean | undefined;
+      const mode = args.mode as string | undefined;
+      const node = args.node as string | undefined;
       const cmd = gh ? ["sync", "--gh"] : ["sync"];
+      if (mode) cmd.push(`--mode=${mode}`);
+      if (node) cmd.push(`--node=${node}`);
       result = wv(cmd, 60_000); // sync may be slow
       break;
     }
@@ -1538,11 +1556,13 @@ function handleTool(
 
     case "weave_close_session": {
       const gh = (args.gh as boolean) ?? true;
+      const mode = args.mode as string | undefined;
       const parts: string[] = [];
 
       // 1. Sync graph (+ optional GH)
       try {
         const syncCmd = gh ? ["sync", "--gh"] : ["sync"];
+        if (mode) syncCmd.push(`--mode=${mode}`);
         parts.push("=== Sync ===\n" + wv(syncCmd, 60_000));
       } catch (e) {
         parts.push("=== Sync ===\nError: " + (e as Error).message);
@@ -1793,7 +1813,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.45.2",
+      version: "1.46.0",
     },
     {
       capabilities: {

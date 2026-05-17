@@ -20,9 +20,12 @@ if [ -x "$WV" ]; then
     "$WV" prune --age=48h 2>/dev/null || true
 fi
 
-# Sync Weave state to git layer + GitHub issue state (best effort)
+# Sync Weave state to git layer + GitHub issue state (best effort).
+# Phase B: session-end uses fast mode — bounded to the union of impacted sets
+# for currently active nodes. Run `wv sync --gh --mode=full` for an exhaustive
+# reconcile when GitHub state has drifted.
 if [ -x "$WV" ]; then
-    "$WV" sync --gh 2>/dev/null || true
+    "$WV" sync --gh --mode=fast 2>/dev/null || true
 fi
 
 # Derive hot zone path (shared across checkpoint stamp + sentinel cleanup)

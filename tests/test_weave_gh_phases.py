@@ -8,12 +8,14 @@ from contextlib import contextmanager
 from typing import Any, Generator
 from unittest.mock import patch
 
-from weave_gh.models import GitHubIssue, SyncStats, WeaveNode
+from weave_gh.models import GitHubIssue, Mode, SyncStats, WeaveNode
 from weave_gh.models import Edge
 from weave_gh.phases import (
     _backfill_gh_issue,
     _current_gh_login,
     _desired_assignee_for_node,
+    _fast_traversal,
+    _full_traversal,
     _handle_existing_issue,
     _handle_new_issue,
     _invalid_assignees,
@@ -22,6 +24,7 @@ from weave_gh.phases import (
     _was_closed_by_weave,
     _WEAVE_CLOSE_MARKER,
     refresh_parent_body,
+    select_candidates,
     sync_closed_to_weave,
     sync_github_to_weave,
     sync_weave_to_github,
@@ -1472,3 +1475,278 @@ class TestRefreshParentBodyErrorPaths:
         ):
             result = refresh_parent_body("wv-child")
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Phase B: select_candidates — mode-aware candidate selection
+# ---------------------------------------------------------------------------
+
+
+class TestSelectCandidates:
+    """select_candidates determines which nodes Phase 1 traverses per mode."""
+
+    def test_full_mode_returns_all_nodes(self) -> None:
+        nodes = [_node("wv-a"), _node("wv-b"), _node("wv-c")]
+        result = select_candidates(nodes, mode=Mode.FULL)
+        assert [n.id for n in result] == ["wv-a", "wv-b", "wv-c"]
+
+    def test_repair_mode_returns_all_nodes(self) -> None:
+        nodes = [_node("wv-a"), _node("wv-b")]
+        result = select_candidates(nodes, mode=Mode.REPAIR)
+        assert [n.id for n in result] == ["wv-a", "wv-b"]
+
+    def test_fast_mode_with_focus_returns_impacted_subset(self) -> None:
+        focus = _node("wv-focus")
+        parent = _node("wv-parent")
+        sibling = _node("wv-sibling")
+        unrelated = _node("wv-other")
+        nodes = [focus, parent, sibling, unrelated]
+        edges = [
+            Edge(source="wv-focus", target="wv-parent",
+                 edge_type="implements", weight=1.0),
+            Edge(source="wv-sibling", target="wv-parent",
+                 edge_type="implements", weight=1.0),
+        ]
+        with patch("weave_gh.data.get_edges_for_node", return_value=edges):
+            result = select_candidates(
+                nodes, mode=Mode.FAST, focus_node_id="wv-focus"
+            )
+        ids = {n.id for n in result}
+        assert ids == {"wv-focus", "wv-parent"}
+        assert "wv-sibling" not in ids
+        assert "wv-other" not in ids
+
+    def test_fast_mode_without_focus_uses_active_nodes(self) -> None:
+        active1 = _node("wv-act1", status="active")
+        active2 = _node("wv-act2", status="active")
+        todo = _node("wv-todo", status="todo")
+        nodes = [active1, active2, todo]
+        with patch("weave_gh.data.get_edges_for_node", return_value=[]):
+            result = select_candidates(nodes, mode=Mode.FAST, focus_node_id=None)
+        ids = {n.id for n in result}
+        assert "wv-act1" in ids
+        assert "wv-act2" in ids
+        assert "wv-todo" not in ids
+
+    def test_fast_mode_no_focus_no_active_returns_empty(self) -> None:
+        nodes = [_node("wv-a", status="todo"), _node("wv-b", status="todo")]
+        with patch("weave_gh.data.get_edges_for_node", return_value=[]):
+            result = select_candidates(nodes, mode=Mode.FAST, focus_node_id=None)
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Phase B: sync_weave_to_github — fast vs full traversal parity
+# ---------------------------------------------------------------------------
+
+
+class TestFastVsFullTraversal:
+    """FAST and FULL traversal share the same loop body; verify parity."""
+
+    def test_fast_mode_records_candidate_count(self) -> None:
+        focus = _node("wv-focus", status="active")
+        other = _node("wv-other", status="todo")
+        nodes = [focus, other]
+        stats = SyncStats()
+        with patch("weave_gh.data.get_edges_for_node", return_value=[]), patch(
+            "weave_gh.phases._handle_new_issue", return_value=None
+        ), patch(
+            "weave_gh.phases._handle_existing_issue", return_value=None
+        ):
+            sync_weave_to_github(
+                nodes, [], "owner/repo", "https://github.com/owner/repo",
+                {n.id: n for n in nodes}, stats,
+                mode=Mode.FAST, focus_node_id="wv-focus",
+            )
+        # FAST candidate count is bounded; total_nodes is set by _run_full_sync, not here.
+        assert stats.candidates == 1
+        assert stats.processed == 1
+
+    def test_full_mode_processes_all_nodes(self) -> None:
+        nodes = [_node("wv-a"), _node("wv-b"), _node("wv-c")]
+        stats = SyncStats()
+        with patch("weave_gh.phases._handle_new_issue", return_value=None), patch(
+            "weave_gh.phases._handle_existing_issue", return_value=None
+        ):
+            sync_weave_to_github(
+                nodes, [], "owner/repo", "https://github.com/owner/repo",
+                {n.id: n for n in nodes}, stats,
+                mode=Mode.FULL,
+            )
+        assert stats.candidates == 3
+        assert stats.processed == 3
+
+
+# ---------------------------------------------------------------------------
+# Phase C: Structural digest cache wiring in _handle_existing_issue
+# ---------------------------------------------------------------------------
+
+
+class TestPhaseCDigestCache:
+    """_handle_existing_issue must honour the digest cache when provided."""
+
+    def _patches(self, **overrides: Any) -> Any:
+        base: dict[str, Any] = {
+            "get_edges_for_node": lambda _: [],
+            "render_issue_body": lambda *_a, **_k: "<!-- rendered -->",
+            "should_update_body": lambda *_a: True,
+            "get_labels_for_node": lambda _: [],
+            "sync_issue_labels": lambda *_a, **_k: None,
+            "gh_cli": lambda *_a, **_k: "",
+            "build_close_comment": lambda *_a, **_k: "close",
+            "_backfill_gh_issue": lambda *_a, **_k: None,
+            "_was_closed_by_weave": lambda *_a: False,
+            "extract_human_content": lambda _: "",
+            "compose_issue_body": lambda h, w: w,
+        }
+        base.update(overrides)
+        return patch.multiple("weave_gh.phases", **base)
+
+    def test_cache_hit_skips_body_render(self) -> None:
+        """When cache contains a matching digest, render_issue_body must not run."""
+        node = _node("wv-c1", status="todo", gh_issue=42)
+        issue = _issue(42, state="OPEN", body="old")
+        stats = SyncStats()
+
+        render_called: list[bool] = []
+
+        def fake_render(*_a: Any, **_k: Any) -> str:
+            render_called.append(True)
+            return "x"
+
+        # Pre-seed cache with the digest that compute_structural_digest will produce.
+        from weave_gh.digest_cache import compute_structural_digest
+        digest = compute_structural_digest(node, {node.id: node}, [])
+        cache: dict = {"schema": 1, "entries": {"42": {"node_id": "wv-c1", "digest": digest}}}
+
+        with self._patches(render_issue_body=fake_render):
+            _handle_existing_issue(
+                node, 42, {42: issue}, {node.id: node},
+                "owner/repo", "https://github.com/owner/repo",
+                stats, cache=cache,
+            )
+
+        assert render_called == []
+        assert stats.digest_skipped == 1
+        assert stats.updated_gh == 0
+
+    def test_cache_miss_renders_and_updates_cache(self) -> None:
+        """On miss, body is rendered and cache is populated with new digest."""
+        node = _node("wv-c2", status="todo", gh_issue=43)
+        issue = _issue(43, state="OPEN", body="old")
+        stats = SyncStats()
+        cache: dict = {"schema": 1, "entries": {}}
+
+        with self._patches():
+            _handle_existing_issue(
+                node, 43, {43: issue}, {node.id: node},
+                "owner/repo", "https://github.com/owner/repo",
+                stats, cache=cache,
+            )
+
+        assert stats.digest_skipped == 0
+        assert stats.updated_gh == 1
+        assert "43" in cache["entries"]
+        assert cache["entries"]["43"]["node_id"] == "wv-c2"
+
+    def test_dry_run_does_not_update_cache(self) -> None:
+        """In dry-run, cache should remain untouched even after render."""
+        node = _node("wv-c3", status="todo", gh_issue=44)
+        issue = _issue(44, state="OPEN", body="old")
+        stats = SyncStats()
+        cache: dict = {"schema": 1, "entries": {}}
+
+        with self._patches():
+            _handle_existing_issue(
+                node, 44, {44: issue}, {node.id: node},
+                "owner/repo", "https://github.com/owner/repo",
+                stats, cache=cache, dry_run=True,
+            )
+
+        assert cache["entries"] == {}
+
+    def test_no_cache_passed_preserves_legacy_behaviour(self) -> None:
+        """cache=None keeps the pre-Phase-C path (always render, no digest_skipped)."""
+        node = _node("wv-c4", status="todo", gh_issue=45)
+        issue = _issue(45, state="OPEN", body="old")
+        stats = SyncStats()
+
+        with self._patches():
+            _handle_existing_issue(
+                node, 45, {45: issue}, {node.id: node},
+                "owner/repo", "https://github.com/owner/repo",
+                stats, cache=None,
+            )
+
+        assert stats.digest_skipped == 0
+        assert stats.updated_gh == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase D: Repair-mode resume checkpoint wiring in sync_weave_to_github
+# ---------------------------------------------------------------------------
+
+
+class TestPhaseDRepairCheckpoint:
+    """sync_weave_to_github must skip nodes already recorded in the checkpoint
+    and append every processed node back to the checkpoint so an interrupted
+    run can resume."""
+
+    def _patches(self, **overrides: Any) -> Any:
+        base: dict[str, Any] = {
+            "get_edges_for_node": lambda _: [],
+            "render_issue_body": lambda *_a, **_k: "",
+            "should_update_body": lambda *_a: False,
+            "get_labels_for_node": lambda _: [],
+            "sync_issue_labels": lambda *_a, **_k: None,
+            "gh_cli": lambda *_a, **_k: "",
+            "build_close_comment": lambda *_a, **_k: "close",
+            "_backfill_gh_issue": lambda *_a, **_k: None,
+            "_was_closed_by_weave": lambda *_a: False,
+            "extract_human_content": lambda _: "",
+            "compose_issue_body": lambda h, w: w,
+            "save_checkpoint": lambda *_a, **_k: None,  # avoid touching disk in tests
+        }
+        base.update(overrides)
+        return patch.multiple("weave_gh.phases", **base)
+
+    def test_processed_nodes_in_checkpoint_are_skipped(self) -> None:
+        """A node id already in checkpoint['processed'] is skipped and counted as resumed."""
+        n1 = _node("wv-d001", status="todo", gh_issue=10)
+        n2 = _node("wv-d002", status="todo", gh_issue=11)
+        i1 = _issue(10, state="OPEN")
+        i2 = _issue(11, state="OPEN")
+        stats = SyncStats()
+        checkpoint = {"schema": 1, "started_at": 0.0, "processed": ["wv-d001"]}
+
+        with self._patches():
+            sync_weave_to_github(
+                [n1, n2], [i1, i2],
+                "owner/repo", "https://github.com/owner/repo",
+                {n1.id: n1, n2.id: n2},
+                stats,
+                checkpoint=checkpoint,
+            )
+
+        assert stats.resumed_from == 1
+        # n2 still processed, recorded in checkpoint
+        assert "wv-d002" in checkpoint["processed"]
+        # n1 was not re-processed
+        assert checkpoint["processed"].count("wv-d001") == 1
+
+    def test_no_checkpoint_preserves_legacy_behaviour(self) -> None:
+        """checkpoint=None keeps stats.resumed_from at 0."""
+        node = _node("wv-d003", status="todo", gh_issue=12)
+        issue = _issue(12, state="OPEN")
+        stats = SyncStats()
+
+        with self._patches():
+            sync_weave_to_github(
+                [node], [issue],
+                "owner/repo", "https://github.com/owner/repo",
+                {node.id: node},
+                stats,
+                checkpoint=None,
+            )
+
+        assert stats.resumed_from == 0

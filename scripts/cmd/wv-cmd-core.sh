@@ -2711,8 +2711,12 @@ cmd_ship() {
     local _ship_prev_skip_sync_commit="${_WV_SKIP_SYNC_COMMIT:-}"
     export _WV_SKIP_SYNC_COMMIT=1
     if [ "$needs_gh" = true ]; then
-        echo -e "${CYAN}ℹ${NC} GitHub-linked node detected — syncing with --gh"
-        cmd_sync --gh
+        echo -e "${CYAN}ℹ${NC} GitHub-linked node detected — syncing with --gh --mode=fast"
+        # Phase B: routine close paths use fast mode bounded to this node's
+        # impacted set (focus + parent + children + blockers). Falls back to
+        # repair mode for interrupted/recovery flows via
+        # wv sync --gh --mode=repair (resumable from checkpoint).
+        cmd_sync --gh --mode=fast --node="$id"
     else
         cmd_sync
     fi

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
 import subprocess
 import sys
 from typing import Any
@@ -11,9 +13,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from weave_gh.models import GitHubIssue, WeaveNode
+from weave_gh.models import GitHubIssue, Mode, WeaveNode
 from weave_gh.__main__ import (
     _acquire_sync_lock,
+    _log_mode_banner,
     _run_full_sync,
     main,
 )
@@ -68,6 +71,26 @@ class TestAcquireSyncLock:
             fh = _acquire_sync_lock()
         assert fh is not None
         fh.close()  # type: ignore[union-attr]
+
+    def test_contender_does_not_truncate_live_holder_pid(self, tmp_path: Any) -> None:
+        """A losing contender must not blank the live holder PID file."""
+        lock_dir = tmp_path / "weave"
+        lock_dir.mkdir()
+        lock_path = lock_dir / "sync.lock"
+
+        holder = open(lock_path, "w", encoding="utf-8")
+        try:
+            holder.write(str(os.getpid()))
+            holder.flush()
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            with patch("weave_gh.__main__.tempfile.gettempdir", return_value=str(tmp_path)):
+                with pytest.raises(SystemExit):
+                    _acquire_sync_lock()
+
+            assert lock_path.read_text(encoding="utf-8") == str(os.getpid())
+        finally:
+            holder.close()
 
     def test_exits_when_lock_already_held(self, tmp_path: Any) -> None:
         """Exits with SystemExit when the lock is already held."""
@@ -138,6 +161,66 @@ class TestRunFullSync:
             with pytest.raises(SystemExit):
                 _run_full_sync()
 
+    def test_fast_mode_skips_phase2_and_phase3(self) -> None:
+        """FAST mode runs only Phase 1; Phases 2 and 3 are bypassed."""
+        calls: list[str] = []
+        nodes = [_node("wv-a")]
+        issues = [_issue(1)]
+        with _full_sync_patches(
+            get_weave_nodes=lambda: nodes,
+            get_github_issues=lambda *_a: issues,
+            sync_weave_to_github=(
+                lambda *_a, **_k: (calls.append("phase1"), issues)[1]
+            ),
+            sync_github_to_weave=(
+                lambda *_a, **_k: (calls.append("phase2"), nodes)[1]
+            ),
+            sync_closed_to_weave=(
+                lambda *_a, **_k: calls.append("phase3")
+            ),
+        ):
+            _run_full_sync(mode=Mode.FAST, focus_node_id="wv-a")
+
+        assert calls == ["phase1"]
+
+    def test_fast_mode_forwards_focus_node_to_phase1(self) -> None:
+        """FAST mode passes mode + focus_node_id into sync_weave_to_github."""
+        captured: dict[str, object] = {}
+
+        def _capture(*_a: Any, **kw: Any) -> list[Any]:
+            captured.update(kw)
+            return []
+
+        with _full_sync_patches(
+            get_weave_nodes=lambda: [_node("wv-a")],
+            get_github_issues=lambda *_a: [],
+            sync_weave_to_github=_capture,
+        ):
+            _run_full_sync(mode=Mode.FAST, focus_node_id="wv-a")
+
+        assert captured.get("mode") is Mode.FAST
+        assert captured.get("focus_node_id") == "wv-a"
+
+    def test_repair_mode_runs_all_phases(self) -> None:
+        """REPAIR mode runs all three phases like FULL."""
+        calls: list[str] = []
+        with _full_sync_patches(
+            get_weave_nodes=lambda: [_node("wv-a")],
+            get_github_issues=lambda *_a: [_issue(1)],
+            sync_weave_to_github=(
+                lambda *_a, **_k: (calls.append("phase1"), [_issue(1)])[1]
+            ),
+            sync_github_to_weave=(
+                lambda *_a, **_k: (calls.append("phase2"), [_node("wv-a")])[1]
+            ),
+            sync_closed_to_weave=(
+                lambda *_a, **_k: calls.append("phase3")
+            ),
+        ):
+            _run_full_sync(mode=Mode.REPAIR)
+
+        assert calls == ["phase1", "phase2", "phase3"]
+
 
 # ---------------------------------------------------------------------------
 # main() — CLI arg dispatch
@@ -202,8 +285,86 @@ class TestMain:
         sync_calls: list[dict[str, object]] = []
         with patch.object(sys, "argv", ["weave_gh", "--dry-run"]), patch(
             "weave_gh.__main__._run_full_sync",
-            side_effect=lambda *, dry_run=False: sync_calls.append({"dry_run": dry_run}),
+            side_effect=lambda **k: sync_calls.append(k),
         ):
             main()
 
         assert sync_calls[0]["dry_run"] is True
+        assert sync_calls[0]["mode"] is Mode.FULL
+
+    def test_mode_flag_parsed(self) -> None:
+        """--mode=fast|full|repair is parsed and forwarded to _run_full_sync."""
+        for value, expected in [
+            ("fast", Mode.FAST),
+            ("full", Mode.FULL),
+            ("repair", Mode.REPAIR),
+        ]:
+            sync_calls: list[Mode] = []
+            with patch.object(sys, "argv", ["weave_gh", "--mode", value]), patch(
+                "weave_gh.__main__._run_full_sync",
+                side_effect=lambda **k: sync_calls.append(k["mode"]),
+            ):
+                main()
+            assert sync_calls == [expected]
+
+    def test_mode_invalid_value_rejected(self) -> None:
+        """Invalid --mode values are rejected by argparse with SystemExit."""
+        with patch.object(sys, "argv", ["weave_gh", "--mode", "turbo"]):
+            with pytest.raises(SystemExit):
+                main()
+
+    def test_default_mode_is_full(self) -> None:
+        """Omitting --mode passes Mode.FULL to _run_full_sync."""
+        sync_calls: list[Mode] = []
+        with patch.object(sys, "argv", ["weave_gh"]), patch(
+            "weave_gh.__main__._run_full_sync",
+            side_effect=lambda **k: sync_calls.append(k["mode"]),
+        ):
+            main()
+        assert sync_calls == [Mode.FULL]
+
+    def test_node_flag_forwarded(self) -> None:
+        """--node=<id> is forwarded as focus_node_id to _run_full_sync."""
+        sync_calls: list[dict[str, object]] = []
+        with patch.object(sys, "argv", ["weave_gh", "--mode", "fast", "--node", "wv-abcd12"]), patch(
+            "weave_gh.__main__._run_full_sync",
+            side_effect=lambda **k: sync_calls.append(k),
+        ):
+            main()
+        assert sync_calls[0]["focus_node_id"] == "wv-abcd12"
+        assert sync_calls[0]["mode"] is Mode.FAST
+
+    def test_focus_node_falls_back_to_wv_active_env(self) -> None:
+        """With no --node flag, $WV_ACTIVE supplies the focus."""
+        sync_calls: list[dict[str, object]] = []
+        with patch.object(sys, "argv", ["weave_gh", "--mode", "fast"]), patch.dict(
+            os.environ, {"WV_ACTIVE": "wv-deadbe"}, clear=False
+        ), patch(
+            "weave_gh.__main__._run_full_sync",
+            side_effect=lambda **k: sync_calls.append(k),
+        ):
+            main()
+        assert sync_calls[0]["focus_node_id"] == "wv-deadbe"
+
+
+# ---------------------------------------------------------------------------
+# _log_mode_banner
+# ---------------------------------------------------------------------------
+
+
+class TestLogModeBanner:
+    def test_fast_emits_no_banner(self, caplog: Any) -> None:
+        caplog.set_level("INFO", logger="weave-sync")
+        _log_mode_banner(Mode.FAST)
+        assert caplog.text == ""
+
+    def test_full_emits_banner(self, caplog: Any) -> None:
+        caplog.set_level("INFO", logger="weave-sync")
+        _log_mode_banner(Mode.FULL)
+        assert "FULL sync" in caplog.text
+        assert "--mode=fast" in caplog.text
+
+    def test_repair_emits_banner(self, caplog: Any) -> None:
+        caplog.set_level("INFO", logger="weave-sync")
+        _log_mode_banner(Mode.REPAIR)
+        assert "REPAIR sync" in caplog.text

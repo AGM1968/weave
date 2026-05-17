@@ -224,9 +224,9 @@ Returns blockers, ancestors with learnings, related nodes, pitfalls, and contrad
 
 ## MCP Server
 
-33 tools for IDE integration via 2 server instances:
+35 tools for IDE integration via 2 server instances:
 
-- **`weave`** (scope=all, 33 tools) — full tool set for Copilot Chat
+- **`weave`** (scope=all, 35 tools) — full tool set for Copilot Chat
 - **`weave-inspect`** (scope=inspect, 15 tools) — read-only subset for analysis subagents
 - **`--scope=lite`** (7 tools) — lightweight profile for constrained contexts
 

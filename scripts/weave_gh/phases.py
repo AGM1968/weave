@@ -9,17 +9,34 @@ import re
 import socket
 import subprocess
 from functools import lru_cache
+from typing import Any
 
 from weave_gh import log
 from weave_gh.body import compose_issue_body, extract_human_content, should_update_body
 from weave_gh.cli import _run, gh_cli, wv_cli
-from weave_gh.data import _resolve_db_path, get_edges_for_node, get_parent, get_repo
+from weave_gh.data import (
+    _resolve_db_path,
+    compute_impacted_node_ids,
+    get_edges_for_node,
+    get_parent,
+    get_repo,
+)
+from weave_gh.digest_cache import (
+    compute_structural_digest,
+    is_cache_hit,
+    update_cache,
+)
+from weave_gh.repair_checkpoint import (
+    mark_processed,
+    processed_ids,
+    save_checkpoint,
+)
 from weave_gh.labels import (
     get_labels_for_node,
     parse_gh_labels_to_metadata,
     sync_issue_labels,
 )
-from weave_gh.models import GitHubIssue, SyncStats, WeaveNode
+from weave_gh.models import GitHubIssue, Mode, SyncStats, WeaveNode
 from weave_gh.rendering import build_close_comment, render_issue_body
 
 from weave_gh.body import parse_gh_body_description, parse_issue_template_fields
@@ -242,7 +259,39 @@ def _was_closed_by_weave(issue_number: int, repo: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def sync_weave_to_github(  # noqa: C901
+def select_candidates(
+    nodes: list[WeaveNode],
+    *,
+    mode: Mode = Mode.FULL,
+    focus_node_id: str | None = None,
+) -> list[WeaveNode]:
+    """Pick the subset of nodes Phase 1 should walk for ``mode``.
+
+    - ``FULL`` and ``REPAIR`` return every node (current exhaustive behaviour).
+    - ``FAST`` returns the impacted set around ``focus_node_id``:
+      the focus itself, its parent, children, and direct blockers.
+    - ``FAST`` without ``focus_node_id`` degrades to the union of impacted
+      sets for every currently ``active`` node, so the session-end hook still
+      converges body state for in-flight work without scanning the whole graph.
+    - Order from the input list is preserved so downstream duplicate detection
+      keeps deterministic behaviour.
+    """
+    if mode is not Mode.FAST:
+        return nodes
+
+    nodes_by_id = {n.id: n for n in nodes}
+    impacted: set[str] = set()
+    if focus_node_id and focus_node_id in nodes_by_id:
+        impacted |= compute_impacted_node_ids(focus_node_id)
+    else:
+        for n in nodes:
+            if n.status == "active":
+                impacted |= compute_impacted_node_ids(n.id)
+
+    return [n for n in nodes if n.id in impacted]
+
+
+def sync_weave_to_github(
     nodes: list[WeaveNode],
     issues: list[GitHubIssue],
     repo: str,
@@ -251,10 +300,118 @@ def sync_weave_to_github(  # noqa: C901
     stats: SyncStats,
     *,
     dry_run: bool = False,
+    mode: Mode = Mode.FULL,
+    focus_node_id: str | None = None,
+    cache: dict[str, Any] | None = None,
+    checkpoint: dict[str, Any] | None = None,
 ) -> list[GitHubIssue]:
     """Create/update/close GitHub issues from Weave nodes.
 
-    Returns updated issues list (including newly created).
+    Dispatches between :func:`_full_traversal` and :func:`_fast_traversal`
+    based on ``mode``; both share :func:`_traverse_candidates` for the loop
+    body so behaviour stays identical per-node.
+
+    ``cache`` is the structural-digest cache (Phase C). When provided, body
+    rendering is skipped for nodes whose digest matches the cached entry.
+
+    Returns the updated issues list (including newly created).
+    """
+    candidates = select_candidates(nodes, mode=mode, focus_node_id=focus_node_id)
+    stats.candidates = len(candidates)
+    if mode is Mode.FAST:
+        return _fast_traversal(
+            nodes,
+            candidates,
+            issues,
+            repo,
+            repo_url,
+            nodes_by_id,
+            stats,
+            dry_run=dry_run,
+            cache=cache,
+        )
+    return _full_traversal(
+        nodes,
+        issues,
+        repo,
+        repo_url,
+        nodes_by_id,
+        stats,
+        dry_run=dry_run,
+        cache=cache,
+        checkpoint=checkpoint,
+    )
+
+
+def _full_traversal(
+    nodes: list[WeaveNode],
+    issues: list[GitHubIssue],
+    repo: str,
+    repo_url: str,
+    nodes_by_id: dict[str, WeaveNode],
+    stats: SyncStats,
+    *,
+    dry_run: bool = False,
+    cache: dict[str, Any] | None = None,
+    checkpoint: dict[str, Any] | None = None,
+) -> list[GitHubIssue]:
+    """Walk every node (legacy exhaustive traversal)."""
+    return _traverse_candidates(
+        nodes,
+        nodes,
+        issues,
+        repo,
+        repo_url,
+        nodes_by_id,
+        stats,
+        dry_run=dry_run,
+        cache=cache,
+        checkpoint=checkpoint,
+    )
+
+
+def _fast_traversal(
+    all_nodes: list[WeaveNode],
+    candidates: list[WeaveNode],
+    issues: list[GitHubIssue],
+    repo: str,
+    repo_url: str,
+    nodes_by_id: dict[str, WeaveNode],
+    stats: SyncStats,
+    *,
+    dry_run: bool = False,
+    cache: dict[str, Any] | None = None,
+) -> list[GitHubIssue]:
+    """Walk only the bounded ``candidates`` list, but use ``all_nodes`` for cross-reference lookups."""
+    return _traverse_candidates(
+        all_nodes,
+        candidates,
+        issues,
+        repo,
+        repo_url,
+        nodes_by_id,
+        stats,
+        dry_run=dry_run,
+        cache=cache,
+    )
+
+
+def _traverse_candidates(  # noqa: C901  # pylint: disable=too-many-arguments,too-many-locals,too-many-branches
+    all_nodes: list[WeaveNode],
+    candidates: list[WeaveNode],
+    issues: list[GitHubIssue],
+    repo: str,
+    repo_url: str,
+    nodes_by_id: dict[str, WeaveNode],
+    stats: SyncStats,
+    *,
+    dry_run: bool = False,
+    cache: dict[str, Any] | None = None,
+    checkpoint: dict[str, Any] | None = None,
+) -> list[GitHubIssue]:
+    """Shared Phase 1 loop body. ``candidates`` is the bounded set we walk;
+    ``all_nodes`` is the full graph used for duplicate detection, reopen
+    guards, and gh_issue dedup cross-references.
     """
     issues_by_num: dict[int, GitHubIssue] = {i.number: i for i in issues}
     issues_by_title: dict[str, GitHubIssue] = {i.title: i for i in issues}
@@ -263,7 +420,7 @@ def sync_weave_to_github(  # noqa: C901
     # Keep the processing guard for all duplicate groups, but only warn when at
     # least one node is still live; done-only duplicates are historical noise.
     gh_to_nodes: dict[int, list[WeaveNode]] = {}
-    for node in nodes:
+    for node in all_nodes:
         if node.gh_issue:
             gh_to_nodes.setdefault(node.gh_issue, []).append(node)
     duplicate_groups = {gh: dup_nodes for gh, dup_nodes in gh_to_nodes.items() if len(dup_nodes) > 1}
@@ -275,7 +432,7 @@ def sync_weave_to_github(  # noqa: C901
 
     # Build set of gh_issue numbers where ANY node is done (prevents phantom reopens)
     done_gh_issues: set[int] = {
-        n.gh_issue for n in nodes if n.gh_issue is not None and n.status == "done"
+        n.gh_issue for n in all_nodes if n.gh_issue is not None and n.status == "done"
     }
     if warn_dupes:
         log.warning("⚠️  Duplicate gh_issue mappings detected (last writer wins):")
@@ -291,13 +448,23 @@ def sync_weave_to_github(  # noqa: C901
     # Track which GH issues have already been processed (prevents duplicate overwrite)
     processed_gh: set[int] = set()
 
-    for node in nodes:
+    # Repair-mode resume: skip nodes recorded by an earlier interrupted run.
+    already_processed_ids: set[str] = (
+        processed_ids(checkpoint) if checkpoint is not None else set()
+    )
+
+    for node in candidates:
         # Skip test nodes, no_sync nodes, and finding nodes.
         # Findings are internal audit records — not external work items — and
         # bulk promotion of historical learnings would otherwise flood GH
         # issues.
         if node.is_test or node.no_sync or node.node_type == "finding":
             stats.skipped += 1
+            continue
+
+        if checkpoint is not None and node.id in already_processed_ids:
+            stats.skipped += 1
+            stats.resumed_from += 1
             continue
 
         # Find matching GH issue
@@ -326,7 +493,7 @@ def sync_weave_to_github(  # noqa: C901
                 repo,
                 repo_url,
                 stats,
-                all_nodes=nodes,
+                all_nodes=all_nodes,
                 dry_run=dry_run,
             )
         else:
@@ -348,10 +515,16 @@ def sync_weave_to_github(  # noqa: C901
                 repo,
                 repo_url,
                 stats,
-                all_nodes=nodes,
+                all_nodes=all_nodes,
                 done_gh_issues=done_gh_issues,
                 dry_run=dry_run,
+                cache=cache,
             )
+        stats.processed += 1
+        if checkpoint is not None:
+            mark_processed(checkpoint, node.id)
+            # Persist incrementally so a crash mid-loop loses ≤1 node of progress.
+            save_checkpoint(checkpoint)
 
     return issues
 
@@ -476,7 +649,7 @@ def _handle_new_issue(
         log.error("     ✗ Failed to create issue: %s", e.stderr)
 
 
-def _handle_existing_issue(
+def _handle_existing_issue(  # pylint: disable=too-many-arguments,too-many-locals
     node: WeaveNode,
     gh_match: int,
     issues_by_num: dict[int, GitHubIssue],
@@ -488,6 +661,7 @@ def _handle_existing_issue(
     all_nodes: list[WeaveNode] | None = None,
     done_gh_issues: set[int] | None = None,
     dry_run: bool = False,
+    cache: dict[str, Any] | None = None,
 ) -> None:
     """Handle a Weave node that already has a matching GH issue."""
     issue = issues_by_num[gh_match]
@@ -515,27 +689,42 @@ def _handle_existing_issue(
             node.id,
         )
     else:
-        new_weave_block = render_issue_body(node, nodes_by_id, edges)
+        # Phase C: structural-digest cache. The rendered body is a pure
+        # function of (node, parent, blockers, children); if none of those
+        # changed since the last sync, skip the (expensive) render — which
+        # includes a `wv tree` subprocess for the Mermaid graph.
+        digest = compute_structural_digest(node, nodes_by_id, edges)
+        if cache is not None and is_cache_hit(cache, gh_match, node.id, digest):
+            log.info(
+                "  ⏭ Cache hit for #%d (%s) — skipping body render",
+                gh_match,
+                node.id,
+            )
+            stats.digest_skipped += 1
+        else:
+            new_weave_block = render_issue_body(node, nodes_by_id, edges)
 
-        if should_update_body(issue.body, new_weave_block):
-            human_content = extract_human_content(issue.body)
-            new_body = compose_issue_body(human_content, new_weave_block)
+            if should_update_body(issue.body, new_weave_block):
+                human_content = extract_human_content(issue.body)
+                new_body = compose_issue_body(human_content, new_weave_block)
 
-            if dry_run:
-                log.info("  [dry-run] Would update body of #%d", gh_match)
-            else:
-                gh_cli(
-                    "issue",
-                    "edit",
-                    str(gh_match),
-                    "--repo",
-                    repo,
-                    "--body",
-                    new_body,
-                    check=False,
-                )
-                log.info("  📝 Updated body of #%d (%s)", gh_match, node.id)
-            stats.updated_gh += 1
+                if dry_run:
+                    log.info("  [dry-run] Would update body of #%d", gh_match)
+                else:
+                    gh_cli(
+                        "issue",
+                        "edit",
+                        str(gh_match),
+                        "--repo",
+                        repo,
+                        "--body",
+                        new_body,
+                        check=False,
+                    )
+                    log.info("  📝 Updated body of #%d (%s)", gh_match, node.id)
+                stats.updated_gh += 1
+            if cache is not None and not dry_run:
+                update_cache(cache, gh_match, node.id, digest)
 
     # Sync labels
     desired_labels = get_labels_for_node(node)

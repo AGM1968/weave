@@ -2,6 +2,50 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.46.0] - 2026-05-17
+
+### Added
+
+- **`wv sync --gh --mode=fast|full|repair`** — sync now has three explicit modes:
+  - `fast` (default for `wv ship` and session-end): bounded to the focus node plus its parent,
+    children, and blockers; skips the broad GH→Weave reconcile phases.
+  - `full` (explicit default for plain `wv sync --gh`): exhaustive bidirectional reconcile,
+    backed by a structural digest cache (`.weave/sync-digest-cache.json`) that skips body-render
+    work when neither the node nor its impacted set has changed.
+  - `repair`: resumes an interrupted sync from `.weave/repair-checkpoint.json`. The checkpoint is
+    persisted per-node so at most one node is lost on SIGINT/SIGTERM/crash. The handler prints
+    the exact resume command (`wv sync --gh --mode=repair`) to stderr before exiting.
+- **`wv sync --gh --node=<id>`** — focus a fast-mode sync on a specific node and its impacted set.
+- **`wv recover` and `stop-hook` surface repair-mode** — when `.weave/repair-checkpoint.json` is
+  present, both surfaces recommend `wv sync --gh --mode=repair` so the next session resumes
+  instead of restarting the reconcile.
+- **MCP `weave_sync` and `weave_close_session`** now expose `mode` (enum: `fast|full|repair`) and
+  `weave_sync` additionally exposes `node` (focus id), forwarded to the underlying `wv sync`.
+- **`wv help sync`** — now documents `--mode=` and `--node=` with usage hints per mode.
+
+### Changed
+
+- `wv sync` reports the active mode in its banner and final summary (`mode=<m> total=… candidates=…
+  processed=… updated=… skipped=… digest_hits=… [resumed_from=N]`).
+- Templates and root agent docs (`templates/WORKFLOW.md`, `templates/AGENTS.md.template`,
+  `templates/CLAUDE.md.template`, `templates/copilot-instructions.stub.md`, `AGENTS.md`,
+  `CLAUDE.md`, `.github/copilot-instructions.md`) document the new modes; the command-table
+  row for `wv sync` lists `--mode=fast|full|repair` and `--node=<id>`.
+- MCP tool counts updated: `weave` scope ships 35 tools, `weave-inspect` scope ships 17.
+
+### Fixed
+
+- MCP `vitest` count assertions in `mcp/src/index.test.ts` (all-scope: 33→35, inspect-scope: 15→17)
+  to match the actual registered tool set, including `weave_code_search` and `weave_index`.
+
+### Internal
+
+- `scripts/weave_gh/repair_checkpoint.py` — checkpoint persistence layer (schema=1, atomic
+  tmp+rename, graceful empty-on-corrupt).
+- `scripts/weave_gh/phases.py` — `_traverse_candidates` accepts and writes a `checkpoint` dict,
+  marks nodes processed idempotently, and reports `resumed_from` via `SyncStats`.
+- `.gitignore` — adds `.weave/repair-checkpoint.json` and `.weave/sync-digest-cache.json`.
+
 ## [1.45.2] - 2026-05-15
 
 ### Fixed

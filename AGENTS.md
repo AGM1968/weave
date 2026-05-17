@@ -26,6 +26,11 @@ git push                          # mandatory
 `wv ship <id>` is the close + sync shortcut for finishing a node. It does not push; if `wv status`
 still reports pending Git sync, handle that separately or inspect it with `wv doctor` / `wv recover`.
 
+`wv sync --gh` accepts `--mode=fast|full|repair` (and an optional `--node=<id>` focus). `fast` is
+the default for `wv ship` and session-end (bounded scope); `full` is the explicit default for plain
+`wv sync --gh`; use `--mode=repair` to resume from `.weave/repair-checkpoint.json` after an
+interrupted sync — `wv recover` and the stop-hook recommend it when the checkpoint exists.
+
 ## Code search
 
 If `wv index` has been run, prefer hybrid code search over grep/glob for discovery:

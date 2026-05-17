@@ -81,7 +81,13 @@ AHEAD=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
 
 # Soft warn on unsaved weave state (does not block — auto-checkpoint handles this)
 if [ "$WEAVE_DIRTY" -gt 0 ] && [ "$AHEAD" -eq 0 ]; then
-    echo "Note: unsaved weave state. Run: wv sync --gh && git add .weave/ && git commit -m 'chore(weave): sync state [skip ci]' && git push" >&2
+    # If an earlier sync was interrupted, .weave/repair-checkpoint.json exists;
+    # recommend --mode=repair so the resume picks up from the last node.
+    if [ -f .weave/repair-checkpoint.json ]; then
+        echo "Note: unsaved weave state and prior sync interrupted. Run: wv sync --gh --mode=repair && git add .weave/ && git commit -m 'chore(weave): sync state [skip ci]' && git push" >&2
+    else
+        echo "Note: unsaved weave state. Run: wv sync --gh && git add .weave/ && git commit -m 'chore(weave): sync state [skip ci]' && git push" >&2
+    fi
     exit 0
 fi
 
