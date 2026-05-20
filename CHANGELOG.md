@@ -41,6 +41,20 @@
 - **`build-release.sh` tilde expansion** — `OUTPUT_DIR` is now expanded via
   `${OUTPUT_DIR/#\~/$HOME}` before use, preventing a stray `~/Projects/weave/` directory inside the
   project root when `--output=~/…` was passed.
+- **Health score** — done nodes with pitfall learnings are no longer counted as unaddressed pitfall
+  debt or actionable orphans; captured history, not open issues.
+- **`wv tree --active`** — now filters `status='active'` only (was `status!='done'`, which let todo
+  nodes appear when no active work existed).
+- **`wv search --limit N`** — space form now accepted alongside `--limit=N`.
+- **`wv doctor`** — consumer repos without a local `scripts/hooks/` directory no longer trigger a
+  false hook-drift warning; `wv init-repo --update` keeps hooks current without a source dir to diff
+  against.
+- **`wv init-repo --update` (copilot-instructions)** — marker-aware surgical update: wraps
+  `copilot-instructions.stub.md` in `BEGIN/END WEAVE` markers so repo-specific content is preserved
+  across updates. `awk` replaces `sed` in both `CLAUDE.md` and `copilot-instructions.md` marker
+  handlers, fixing a `sed 1,/REGEX/` first-line edge case where `BEGIN` at line 1 caused the
+  before-block to capture the full file and prepend on every update. Pre-marker stub upgrade now
+  detects and replaces the old Weave fingerprint rather than prepending a duplicate heading.
 
 ## [1.46.0] - 2026-05-17
 
