@@ -2,6 +2,25 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.47.2] - 2026-05-20
+
+### Fixed
+
+- **`wv ship` / `wv done` deadlocks on wv-self-managed files** — `pre-close-verification.sh` blocked
+  every close attempt when `.claude/hooks/`, `.claude/skills/`, or `.claude/agents/` files appeared
+  dirty. These files are wv infrastructure updated by `install.sh` / `wv init-repo --update`; they
+  are not work product and should never gate a close. Fixed by: (a) calling
+  `git update-index --refresh` before the dirty scan to clear stat-only mtime changes caused by
+  hooks touching themselves on invocation, and (b) excluding `.claude/hooks/`, `.claude/skills/`,
+  and `.claude/agents/` from the dirty-file scope entirely. The deadlock was self-defeating: the
+  very `wv ship` invocation that should close the node re-triggered the hooks that dirtied the
+  files. Filed as `docs/findings/ship-clean-tree-gate-self-defeating.md` (wv-4ab15e).
+- **`wv load` fails when state.sql contains benign SQLite runtime errors** — `sqlite3` exits 1 on
+  non-fatal errors during import (e.g. malformed JSON in a generated column check) even when all
+  rows were imported successfully. The load guard treated any non-zero exit as a corrupt dump and
+  kept the stale database. Fixed to run the import unconditionally and validate the result via
+  `SELECT COUNT(*) FROM nodes` instead of relying on the exit code.
+
 ## [1.47.1] - 2026-05-20
 
 ### Added

@@ -630,8 +630,11 @@ cmd_load() {
         local tmp_db=$(mktemp "$WV_HOT_ZONE/.brain.db.XXXXXX")
         trap 'rm -f "$tmp_db" 2>/dev/null' EXIT
 
-        if strip_unistr < "$WEAVE_DIR/state.sql" | sqlite3 "$tmp_db" 2>/dev/null && \
-           sqlite3 "$tmp_db" "SELECT COUNT(*) FROM nodes;" >/dev/null 2>&1; then
+        # Import ignoring non-zero exit: sqlite3 exits 1 on benign runtime errors
+        # (e.g. malformed JSON in a generated column during INSERT) even when all
+        # rows are imported. Validate the DB state instead of trusting the exit code.
+        strip_unistr < "$WEAVE_DIR/state.sql" | sqlite3 "$tmp_db" 2>/dev/null; true
+        if sqlite3 "$tmp_db" "SELECT COUNT(*) FROM nodes;" >/dev/null 2>&1; then
             # Validate edges table exists and has data
             local edge_count
             edge_count=$(sqlite3 "$tmp_db" "SELECT COUNT(*) FROM edges;" 2>/dev/null || echo "-1")

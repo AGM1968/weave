@@ -77,12 +77,18 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
         HAS_COMMIT_METADATA=$(echo "$NODE_META" | jq -r '((.commit // "") != "" or ((.commits // []) | length > 0))' 2>/dev/null || echo "false")
         if [[ "$HAS_COMMIT_METADATA" != "true" && "$IS_TRIVIAL" == "false" ]] \
             && git -C "$WV_PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            # Refresh index to clear stat-only mtime changes (hooks touch themselves on invocation)
+            git -C "$WV_PROJECT_DIR" update-index --refresh >/dev/null 2>&1 || true
             DIRTY_FILES=$(
                 {
                     git -C "$WV_PROJECT_DIR" diff --name-only 2>/dev/null
                     git -C "$WV_PROJECT_DIR" diff --cached --name-only 2>/dev/null
                     git -C "$WV_PROJECT_DIR" ls-files --others --exclude-standard 2>/dev/null
-                } | sort -u | grep -v '^$' | grep -v '^\.weave/' || true
+                } | sort -u | grep -v '^$' \
+                  | grep -v '^\.weave/' \
+                  | grep -v '^\.claude/hooks/' \
+                  | grep -v '^\.claude/skills/' \
+                  | grep -v '^\.claude/agents/' || true
             )
             if [[ -n "$DIRTY_FILES" ]]; then
                 DIRTY_SAMPLE=$(echo "$DIRTY_FILES" | head -3 | paste -sd ', ' -)
