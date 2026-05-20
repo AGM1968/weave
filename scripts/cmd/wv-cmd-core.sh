@@ -365,6 +365,13 @@ print(json.dumps(items))
     fi
     db_query "INSERT INTO nodes (id, text, status, metadata, alias) VALUES ('$id', '$text', '$status', '$metadata', $alias_sql);"
 
+    # Stamp promoted_at on finding nodes (cannot use SQL trigger — virtual column +
+    # warp session trigger interaction crashes SQLite 3.46)
+    db_query "UPDATE nodes SET metadata = json_patch(COALESCE(metadata,'{}'), json_object('promoted_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')))
+              WHERE id = '$id'
+                AND json_extract(metadata, '$.type') = 'finding'
+                AND json_extract(metadata, '$.promoted_at') IS NULL;" 2>/dev/null || true
+
     if [ -n "$alias" ]; then
         echo -e "${GREEN}✓${NC} $id ($alias): $text" >&2
     else
@@ -825,18 +832,25 @@ _done_store_learning() {
     # Merge learning into node metadata, parsing inline markers into top-level keys
     local cur_meta
     cur_meta=$(_done_read_metadata "$id")
+    # Pre-normalize: lowercase structured markers and convert ; separators → | for jq 1.5 compat
+    # (jq 1.6 named captures and case-insensitive flags not available on all platforms)
+    local norm_learning
+    norm_learning=$(printf '%s\n' "$learning" \
+        | sed -e 's/;[[:space:]]*[Dd][Ee][Cc][Ii][Ss][Ii][Oo][Nn]:/| decision:/g' \
+              -e 's/;[[:space:]]*[Pp][Aa][Tt][Tt][Ee][Rr][Nn]:/| pattern:/g' \
+              -e 's/;[[:space:]]*[Pp][Ii][Tt][Ff][Aa][Ll][Ll]:/| pitfall:/g' \
+              -e 's/[Dd][Ee][Cc][Ii][Ss][Ii][Oo][Nn]:/decision:/g' \
+              -e 's/[Pp][Aa][Tt][Tt][Ee][Rr][Nn]:/pattern:/g' \
+              -e 's/[Pp][Ii][Tt][Ff][Aa][Ll][Ll]:/pitfall:/g' 2>/dev/null) || norm_learning="$learning"
     local new_meta
-    new_meta=$(echo "$cur_meta" | jq --arg l "$learning" '
-        # Parse inline markers (decision:/pattern:/pitfall:) into top-level keys
-        # Normalize semicolons before markers to pipes for consistent splitting
-        ($l | gsub(";\\s*(?<m>(decision|pattern|pitfall):)"; " | \(.m)"; "i")
-            | until(test("\\|\\s*\\|") | not; gsub("\\|\\s*\\|"; "|"))) as $norm |
-        if ($norm | test("^(decision|pattern|pitfall):"; "i")) then
+    new_meta=$(echo "$cur_meta" | jq --arg l "$norm_learning" --arg raw "$learning" '
+        ($l | until(test("\\|\\s*\\|") | not; gsub("\\|\\s*\\|"; "|"))) as $norm |
+        if ($norm | test("^(decision|pattern|pitfall):")) then
           ($norm | split(" | ") | map(select(length > 0) | gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | reduce .[] as $seg (
             {};
-            if ($seg | test("^decision:"; "i")) then .decision = ($seg | sub("^decision:\\s*"; ""; "i"))
-            elif ($seg | test("^pattern:"; "i")) then .pattern = ($seg | sub("^pattern:\\s*"; ""; "i"))
-            elif ($seg | test("^pitfall:"; "i")) then .pitfall = ($seg | sub("^pitfall:\\s*"; ""; "i"))
+            if ($seg | test("^decision:")) then .decision = ($seg | sub("^decision:\\s*"; ""))
+            elif ($seg | test("^pattern:")) then .pattern = ($seg | sub("^pattern:\\s*"; ""))
+            elif ($seg | test("^pitfall:")) then .pitfall = ($seg | sub("^pitfall:\\s*"; ""))
             else
               if .pitfall then .pitfall = .pitfall + " | " + $seg
               elif .pattern then .pattern = .pattern + " | " + $seg
@@ -845,13 +859,11 @@ _done_store_learning() {
               end
             end
           )) as $parsed |
-          # When structured keys are extracted, omit the raw learning to avoid duplication
           . + ($parsed | to_entries | map(select(.value != null and .value != "")) | from_entries)
         else
-          # No structured markers — store as raw learning
-          . + {learning: $l}
+          . + {learning: $raw}
         end
-    ' 2>/dev/null || echo "$cur_meta")
+    ') || new_meta=$(echo "$cur_meta" | jq --arg l "$learning" '. + {learning: $l}' 2>/dev/null) || new_meta="$cur_meta"
     new_meta="${new_meta//\'/\'\'}"
     db_query "UPDATE nodes SET metadata='$new_meta', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
     score_learning "$id" 2>/dev/null || true
@@ -1165,6 +1177,28 @@ cmd_done() {
             '{"id": $id, "text": $text, "status": $status}'
     else
         echo -e "${GREEN}✓${NC} Closed: $id"
+        # Show what learning was actually stored — makes silent loss immediately visible
+        if [ -n "$learning" ]; then
+            local _l_meta _l_keys _l_hygiene
+            _l_meta=$(db_query "SELECT metadata FROM nodes WHERE id='$id';" 2>/dev/null || echo "{}")
+            _l_keys=$(echo "$_l_meta" | jq -r '
+                [ (if .decision then "decision" else empty end),
+                  (if .pattern  then "pattern"  else empty end),
+                  (if .pitfall  then "pitfall"  else empty end),
+                  (if .learning then "learning" else empty end)
+                ] | join(", ")
+            ' 2>/dev/null || echo "")
+            _l_hygiene=$(echo "$_l_meta" | jq -r '.learning_hygiene // empty' 2>/dev/null || echo "")
+            if [ -n "$_l_keys" ]; then
+                if [ -n "$_l_hygiene" ]; then
+                    echo "  Learning saved: $_l_keys (hygiene: $_l_hygiene)"
+                else
+                    echo "  Learning saved: $_l_keys"
+                fi
+            else
+                echo -e "${YELLOW}  ⚠ Learning was not saved${NC}" >&2
+            fi
+        fi
     fi
 
     # Write-time validation warnings (stderr; suppress for --skip-verification / --json / --no-warn)
@@ -2439,6 +2473,15 @@ cmd_update() {
     # Auto-unblock cascade when status changed to done
     if [[ "$updates" == *"status='done'"* ]]; then
         _do_unblock_cascade "$id"
+    fi
+
+    # Stamp promoted_at on finding nodes that lack it (cannot use a SQL trigger —
+    # virtual column + warp session trigger interaction crashes SQLite 3.46)
+    if [ "$metadata_supplied" = true ]; then
+        db_query "UPDATE nodes SET metadata = json_patch(COALESCE(metadata,'{}'), json_object('promoted_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')))
+                  WHERE id = '$id'
+                    AND json_extract(metadata, '$.type') = 'finding'
+                    AND json_extract(metadata, '$.promoted_at') IS NULL;" 2>/dev/null || true
     fi
 
     # --echo: return updated node as JSON (eliminates need for a follow-up show call)

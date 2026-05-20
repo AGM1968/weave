@@ -624,7 +624,12 @@ validate_on_done() {
     if [ "$has_verification" = "0" ]; then
         local learning_text has_implicit kw
         learning_text=$(db_query "
-            SELECT LOWER(COALESCE(json_extract(metadata, '\$.learning'), ''))
+            SELECT LOWER(
+                COALESCE(json_extract(metadata, '\$.learning'), '') || ' ' ||
+                COALESCE(json_extract(metadata, '\$.decision'), '') || ' ' ||
+                COALESCE(json_extract(metadata, '\$.pattern'),  '') || ' ' ||
+                COALESCE(json_extract(metadata, '\$.pitfall'),  '')
+            )
             FROM nodes WHERE id='$id';
         " 2>/dev/null || echo "")
         has_implicit=false
@@ -650,13 +655,16 @@ validate_on_done() {
     fi
 
     # Check: orphan node (no edges)
-    local edge_count
-    edge_count=$(db_query "
-        SELECT COUNT(*) FROM edges
-        WHERE source='$id' OR target='$id';
-    " 2>/dev/null || echo "0")
-    if [ "$edge_count" = "0" ]; then
-        warnings="${warnings}\n  ⚠ Orphan node — no edges. Consider: wv link $id <parent> --type=implements"
+    # Findings are capture-and-park by design — orphan warning is noise for them.
+    if [ "$node_type" != "finding" ]; then
+        local edge_count
+        edge_count=$(db_query "
+            SELECT COUNT(*) FROM edges
+            WHERE source='$id' OR target='$id';
+        " 2>/dev/null || echo "0")
+        if [ "$edge_count" = "0" ]; then
+            warnings="${warnings}\n  ⚠ Orphan node — no edges. Consider: wv link $id <parent> --type=implements"
+        fi
     fi
 
     # Check: touched files with deteriorating complexity trend

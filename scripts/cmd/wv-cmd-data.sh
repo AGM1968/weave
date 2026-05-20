@@ -1279,6 +1279,16 @@ cmd_learnings() {
             --dedup) dedup=true ;;
             --mode=*) mode_arg="${1#*=}" ;;
             --all) show_all=true ;;
+            --stale=*)
+                echo -e "${RED}Error: --stale is not supported by 'wv learnings'${NC}" >&2
+                echo "Did you mean: wv findings list --stale=${1#--stale=} ?" >&2
+                return 1
+                ;;
+            --*)
+                echo -e "${RED}Error: unknown option: $1${NC}" >&2
+                echo "Run 'wv help learnings' for usage." >&2
+                return 1
+                ;;
         esac
         shift
     done
@@ -1332,7 +1342,7 @@ cmd_learnings() {
     local query="
         SELECT id, text, status, metadata FROM nodes
         WHERE $where_parts
-        ORDER BY updated_at DESC, id ASC $limit_clause;
+        ORDER BY updated_at DESC, rowid DESC $limit_clause;
     "
 
     local results

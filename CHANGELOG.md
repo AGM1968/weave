@@ -2,6 +2,48 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.47.1] - 2026-05-20
+
+### Added
+
+- **`wv done` / `wv ship` learning summary** — close output now shows which learning fields were
+  actually saved and the hygiene score: `Learning saved: decision, pattern (hygiene: 3)`. If
+  `--learning` was supplied but nothing was stored (jq failure), emits a warning instead. Makes
+  silent learning loss immediately visible.
+
+### Fixed
+
+- **`wv ship --learning` silently dropped on jq 1.5 hosts** — `_done_store_learning` used named
+  capture groups and case-insensitive regex flags requiring jq 1.6+; on jq 1.5 the entire jq
+  invocation failed and the `|| echo "$cur_meta"` fallback silently discarded the learning. Fixed by
+  pre-normalising marker case in bash (`sed` lowercase on `Decision:` / `Pattern:` / `Pitfall:`)
+  before passing to jq, removing all `"i"` and named-capture patterns from the jq filter. The
+  fallback is also hardened: failed complex parse now falls back to `jq '. + {learning: $l}'`
+  instead of discarding the learning entirely.
+- **`promoted_at` never set on manually created finding nodes** — nodes created via `wv add` /
+  `wv update --metadata='{"type":"finding",...}'` never received a `promoted_at` timestamp because
+  only the `wv findings promote` code path wrote it. Both `cmd_add` and `cmd_update` now stamp
+  `promoted_at` immediately after the row write when `metadata.type = 'finding'` and `promoted_at`
+  is not already set. Existing finding nodes are backfilled at DB migration time. (A SQLite trigger
+  approach was attempted and rejected: `AFTER UPDATE OF metadata` triggers cause SIGSEGV on SQLite
+  3.46 when virtual generated columns and warp session triggers coexist on the same table.)
+- **`wv learnings --stale=N` silently ignored** — unknown flags passed to `wv learnings` were
+  silently dropped; `--stale` in particular is only meaningful for `wv findings list`. The command
+  now rejects `--stale=*` with a helpful redirect (`Did you mean: wv findings list --stale=N ?`) and
+  rejects all other unknown `--*` flags with a usage hint.
+- **Orphan warning suppressed for `type=finding`** — `validate_on_done` was emitting
+  `⚠ Orphan node — no edges` on every finding close. Findings are capture-and-park nodes by design
+  (no parent edge is expected); the warning is now suppressed when `metadata.type = 'finding'`.
+- **`validate_on_done` verification-evidence check missed new-schema learning** — the implicit
+  verification keyword scan only read `metadata.learning` (old schema). New-schema nodes that store
+  content under `metadata.decision` / `.pattern` / `.pitfall` would false-positive the "No
+  verification evidence" warning. Fixed to concatenate all four learning fields before scanning.
+- **`wv learnings --recent=N` returned alphabetical ID order, not recency order** — when multiple
+  nodes share the same `updated_at` timestamp (e.g. all shipped in the same second), the secondary
+  sort `id ASC` produced alphabetical ordering, causing recently-shipped nodes with later IDs to
+  appear last. Changed tiebreaker to `rowid DESC` so insertion order is used when timestamps are
+  equal, matching expected recency semantics.
+
 ## [1.47.0] - 2026-05-20
 
 ### Added

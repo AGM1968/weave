@@ -422,6 +422,19 @@ AND n.rowid NOT IN (SELECT rowid FROM nodes_learning_fts);
 BACKFILL
 }
 
+# Backfill promoted_at on existing finding nodes that predate the bash-level stamp.
+# Pure UPDATE — no triggers (SQLite virtual column + warp trigger interaction crashes).
+# Safe to run repeatedly — WHERE clause filters to nodes that still lack the field.
+db_migrate_finding_promoted_at() {
+    sqlite3 "$WV_DB" <<'BACKFILL' 2>/dev/null || true
+UPDATE nodes
+SET metadata = json_patch(COALESCE(metadata, '{}'),
+      json_object('promoted_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')))
+WHERE json_extract(metadata, '$.type') = 'finding'
+  AND json_extract(metadata, '$.promoted_at') IS NULL;
+BACKFILL
+}
+
 # Migrate to add node_files, policy_thresholds, and the done-gate trigger.
 # Safe to run repeatedly — CREATE IF NOT EXISTS + INSERT OR IGNORE.
 db_migrate_policy_tables() {
@@ -642,6 +655,7 @@ db_ensure() {
     db_migrate_policy_tables
     db_migrate_chunks
     db_migrate_fts5_learning
+    db_migrate_finding_promoted_at
 
     # Check DB size once per invocation — auto-prune if over limit
     # WV_DISABLE_AUTOPRUNE=1 skips this (used during sync to prevent mid-sync data loss)
