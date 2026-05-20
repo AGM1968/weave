@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 _HISTORICAL_PATH_RE = re.compile(
@@ -813,6 +814,7 @@ def _historical_promotion_metadata(
         "files": candidate["files"],
         "signal_type": candidate["signal_type"],
         "promotion_batch_window": review_window,
+        "promoted_at": datetime.now(timezone.utc).isoformat(),
     }
 
 

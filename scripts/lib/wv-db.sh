@@ -355,6 +355,73 @@ END;
 MIGRATE
 }
 
+# Migrate to add nodes_learning_fts — separate FTS5 table over extracted learning text.
+# Indexed: decision, pattern, pitfall, learning fields from metadata JSON.
+# Weighted 2× in cmd_search relative to node title (text) matches.
+# Safe to run repeatedly — CREATE IF NOT EXISTS guards + backfill skips existing rows.
+db_migrate_fts5_learning() {
+    local fts5_available
+    fts5_available=$(sqlite3 "$WV_DB" "SELECT sqlite_compileoption_used('ENABLE_FTS5');" 2>/dev/null || echo "0")
+    [ "$fts5_available" != "1" ] && return 0
+
+    sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
+CREATE VIRTUAL TABLE IF NOT EXISTS nodes_learning_fts USING fts5(
+    id, learning_text,
+    tokenize='porter unicode61'
+);
+
+-- Keep learning FTS in sync with nodes table
+CREATE TRIGGER IF NOT EXISTS nodes_learning_ai AFTER INSERT ON nodes BEGIN
+    INSERT INTO nodes_learning_fts(rowid, id, learning_text)
+    VALUES (new.rowid, new.id,
+        TRIM(
+            COALESCE(json_extract(new.metadata, '$.decision'), '') || ' ' ||
+            COALESCE(json_extract(new.metadata, '$.pattern'),  '') || ' ' ||
+            COALESCE(json_extract(new.metadata, '$.pitfall'),  '') || ' ' ||
+            COALESCE(json_extract(new.metadata, '$.learning'), '')
+        )
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS nodes_learning_ad AFTER DELETE ON nodes BEGIN
+    DELETE FROM nodes_learning_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS nodes_learning_au AFTER UPDATE ON nodes BEGIN
+    DELETE FROM nodes_learning_fts WHERE rowid = old.rowid;
+    INSERT INTO nodes_learning_fts(rowid, id, learning_text)
+    VALUES (new.rowid, new.id,
+        TRIM(
+            COALESCE(json_extract(new.metadata, '$.decision'), '') || ' ' ||
+            COALESCE(json_extract(new.metadata, '$.pattern'),  '') || ' ' ||
+            COALESCE(json_extract(new.metadata, '$.pitfall'),  '') || ' ' ||
+            COALESCE(json_extract(new.metadata, '$.learning'), '')
+        )
+    );
+END;
+MIGRATE
+
+    # Backfill existing nodes that have learning content but no FTS row yet.
+    sqlite3 "$WV_DB" <<'BACKFILL' 2>/dev/null || true
+INSERT OR IGNORE INTO nodes_learning_fts(rowid, id, learning_text)
+SELECT n.rowid, n.id,
+    TRIM(
+        COALESCE(json_extract(n.metadata, '$.decision'), '') || ' ' ||
+        COALESCE(json_extract(n.metadata, '$.pattern'),  '') || ' ' ||
+        COALESCE(json_extract(n.metadata, '$.pitfall'),  '') || ' ' ||
+        COALESCE(json_extract(n.metadata, '$.learning'), '')
+    )
+FROM nodes n
+WHERE TRIM(
+    COALESCE(json_extract(n.metadata, '$.decision'), '') || ' ' ||
+    COALESCE(json_extract(n.metadata, '$.pattern'),  '') || ' ' ||
+    COALESCE(json_extract(n.metadata, '$.pitfall'),  '') || ' ' ||
+    COALESCE(json_extract(n.metadata, '$.learning'), '')
+) != ''
+AND n.rowid NOT IN (SELECT rowid FROM nodes_learning_fts);
+BACKFILL
+}
+
 # Migrate to add node_files, policy_thresholds, and the done-gate trigger.
 # Safe to run repeatedly — CREATE IF NOT EXISTS + INSERT OR IGNORE.
 db_migrate_policy_tables() {
@@ -574,6 +641,7 @@ db_ensure() {
     db_migrate_edge_type_enum
     db_migrate_policy_tables
     db_migrate_chunks
+    db_migrate_fts5_learning
 
     # Check DB size once per invocation — auto-prune if over limit
     # WV_DISABLE_AUTOPRUNE=1 skips this (used during sync to prevent mid-sync data loss)

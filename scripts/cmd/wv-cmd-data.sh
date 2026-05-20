@@ -333,9 +333,33 @@ Weave-ID: $first_active"
 
         local ts
         ts=$(date -d "@$now" '+%H:%M' 2>/dev/null || date '+%H:%M')
-        git -C "$git_root" commit \
-            -m "chore(weave): auto-checkpoint $ts [skip ci]${trailers}" \
-            --no-verify --quiet 2>/dev/null || true
+
+        # Collapse consecutive weave-auto commits: amend the previous commit when
+        # it's (a) an unpushed, (b) .weave/-only checkpoint. This keeps each
+        # push boundary to exactly one weave commit instead of N per session.
+        local _cp_branch _cp_local _cp_remote _cp_last_msg _cp_last_nw_files
+        _cp_branch=$(git -C "$git_root" branch --show-current 2>/dev/null || echo "main")
+        _cp_local=$(git -C "$git_root" rev-parse HEAD 2>/dev/null || echo "")
+        _cp_remote=$(git -C "$git_root" rev-parse "origin/$_cp_branch" 2>/dev/null || echo "none")
+        _cp_last_msg=$(git -C "$git_root" log -1 --format='%s' 2>/dev/null || echo "")
+        _cp_last_nw_files=$(git -C "$git_root" diff HEAD~1 HEAD --name-only 2>/dev/null \
+            | grep -v '^\.weave/' | grep -v '^$' || true)
+
+        if [ "$_cp_local" != "$_cp_remote" ] \
+           && [[ "$_cp_last_msg" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] \
+           && [ -z "$_cp_last_nw_files" ]; then
+            # Amend with fresh timestamp + trailers so Weave-ID stays current
+            git -C "$git_root" commit --amend \
+                -m "chore(weave): auto-checkpoint $ts [skip ci]${trailers}" \
+                --no-verify --quiet 2>/dev/null || \
+            git -C "$git_root" commit \
+                -m "chore(weave): auto-checkpoint $ts [skip ci]${trailers}" \
+                --no-verify --quiet 2>/dev/null || true
+        else
+            git -C "$git_root" commit \
+                -m "chore(weave): auto-checkpoint $ts [skip ci]${trailers}" \
+                --no-verify --quiet 2>/dev/null || true
+        fi
     fi
 }
 
@@ -541,19 +565,20 @@ cmd_sync() {
         fi
         git -C "$git_root" add .weave/ >/dev/null 2>&1 || true
         if ! git -C "$git_root" diff --cached --quiet 2>/dev/null; then
-            # Check if auto_checkpoint just committed (within throttle window)
-            local _sync_now _sync_last_cp _sync_elapsed
+            local _sync_now _sync_branch _sync_local_head _sync_remote_head
+            local _sync_last_msg _sync_last_nw_files
             _sync_now=$(date +%s)
-            _sync_last_cp=$(git -C "$git_root" log -1 --format=%ct --grep='auto-checkpoint\|pre-compact checkpoint\|sync state' 2>/dev/null || echo 0)
-            _sync_elapsed=$((_sync_now - _sync_last_cp))
-            # Safe amend: only if recent checkpoint exists AND hasn't been pushed
-            local _sync_branch _sync_local_head _sync_remote_head
             _sync_branch=$(git -C "$git_root" branch --show-current 2>/dev/null || echo "main")
             _sync_local_head=$(git -C "$git_root" rev-parse HEAD 2>/dev/null || echo "")
             _sync_remote_head=$(git -C "$git_root" rev-parse "origin/$_sync_branch" 2>/dev/null || echo "none")
-            if [ "$_sync_elapsed" -lt "$WV_CHECKPOINT_INTERVAL" ] && [ "$WV_CHECKPOINT_INTERVAL" -gt 0 ] \
-               && [ "$_sync_local_head" != "$_sync_remote_head" ]; then
-                # Recent unpushed checkpoint — safe to amend
+            _sync_last_msg=$(git -C "$git_root" log -1 --format='%s' 2>/dev/null || echo "")
+            _sync_last_nw_files=$(git -C "$git_root" diff HEAD~1 HEAD --name-only 2>/dev/null \
+                | grep -v '^\.weave/' | grep -v '^$' || true)
+
+            # Amend if last commit is an unpushed weave-only checkpoint (same rule as auto_checkpoint).
+            if [ "$_sync_local_head" != "$_sync_remote_head" ] \
+               && [[ "$_sync_last_msg" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] \
+               && [ -z "$_sync_last_nw_files" ]; then
                 git -C "$git_root" commit --amend --no-edit \
                     --no-verify --quiet 2>/dev/null || \
                 git -C "$git_root" commit \
@@ -2122,6 +2147,8 @@ cmd_search() {
     local limit=10
     local format="text"
     local status_filter=""
+    local type_filter=""
+    local learning_only=0
     local code_search=0
     local extra_args=()
 
@@ -2129,15 +2156,20 @@ cmd_search() {
         case "$1" in
             --code) code_search=1 ;;
             --limit=*) limit="${1#*=}"; extra_args+=("$1") ;;
+            --limit) shift; limit="$1"; extra_args+=("--limit=$limit") ;;
             --json) format="json"; extra_args+=("--json") ;;
             --status=*) status_filter="${1#*=}" ;;
+            --type=*) type_filter="${1#*=}" ;;
+            --learning) learning_only=1 ;;
             --mode=*|--model=*|--graph|--quality-db=*) extra_args+=("$1") ;;
             --help|-h)
-                echo "Usage: wv search <query> [--limit=N] [--json] [--status=STATUS]"
+                echo "Usage: wv search <query> [--limit=N] [--json] [--status=STATUS] [--type=TYPE] [--learning]"
                 echo "       wv search --code <query> [--limit=N] [--json] [--mode=hybrid|fts|vector] [--graph]"
                 echo ""
                 echo "  Without --code: searches Weave graph nodes (FTS5 BM25)"
                 echo "  With --code:    searches indexed code chunks (RRF hybrid BM25+cosine)"
+                echo "  --type=TYPE:    filter by metadata.type (finding, task, epic, ...)"
+                echo "  --learning:     only nodes that have captured learning content"
                 echo "  --graph:        attach active Weave nodes + quality churn to results"
                 return 0
                 ;;
@@ -2190,38 +2222,108 @@ cmd_search() {
     # programmatic callers like _related_learnings that pass full node text.
     local fts_expr
     fts_expr=$(_build_fts_expr "$query")
+    # nodes_learning_fts uses column `learning_text`, not `text` — rewrite prefix
+    local learning_fts_expr
+    learning_fts_expr="${fts_expr//text:/learning_text:}"
 
-    # Build status filter clause
+    # Build filter clauses
     local status_clause=""
     if [ -n "$status_filter" ]; then
         local safe_status="${status_filter//\'/\'\'}"
         status_clause="AND n.status = '$safe_status'"
     fi
 
-    # FTS5 search with BM25 ranking (search text column only)
-    local sql="
-        SELECT n.id, n.text, n.status,
-               bm25(nodes_fts, 0.0, 1.0, 0.0) AS rank
-        FROM nodes_fts f
-        JOIN nodes n ON f.rowid = n.rowid
-        WHERE nodes_fts MATCH '$fts_expr'
-        $status_clause
-        ORDER BY rank
-        LIMIT $limit;
-    "
+    local type_clause=""
+    if [ -n "$type_filter" ]; then
+        local safe_type="${type_filter//\'/\'\'}"
+        type_clause="AND json_extract(n.metadata, '\$.type') = '$safe_type'"
+    fi
 
-    if [ "$format" = "json" ]; then
-        # For JSON, include full metadata
-        local json_sql="
-            SELECT n.id, n.text, n.status, n.metadata,
-                   bm25(nodes_fts, 0.0, 1.0, 0.0) AS rank
-            FROM nodes_fts f
-            JOIN nodes n ON f.rowid = n.rowid
-            WHERE nodes_fts MATCH '$fts_expr'
-            $status_clause
+    local learning_clause=""
+    if [ "$learning_only" = "1" ]; then
+        learning_clause="AND (
+            json_extract(n.metadata, '\$.decision') IS NOT NULL OR
+            json_extract(n.metadata, '\$.pattern') IS NOT NULL OR
+            json_extract(n.metadata, '\$.pitfall') IS NOT NULL OR
+            json_extract(n.metadata, '\$.learning') IS NOT NULL
+        )"
+    fi
+
+    # FTS5 search: UNION nodes_fts (title/text) and nodes_learning_fts (decision/pattern/pitfall/learning).
+    # Learning matches get 2× weight (BM25 returns negative; multiply by 2.0 makes them more negative = higher rank).
+    # Deduplicate by id, keeping the best (lowest) rank per node.
+    local has_learning_fts
+    has_learning_fts=$(sqlite3 "$WV_DB" \
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='nodes_learning_fts';" 2>/dev/null || echo "0")
+
+    # FTS5 bm25() is an auxiliary function and cannot be called inside subqueries
+    # that participate in a UNION. Use the built-in `rank` hidden column instead
+    # (equivalent to bm25, accessible anywhere). 2× weight for learning matches:
+    # BM25 scores are negative; multiplying by 2.0 makes them more negative (higher rank).
+    local sql
+    if [ "${has_learning_fts:-0}" = "1" ]; then
+        sql="
+            SELECT id, text, status, MIN(rank) AS rank FROM (
+                SELECT n.id, n.text, n.status, f.rank AS rank
+                FROM nodes_fts f
+                JOIN nodes n ON f.rowid = n.rowid
+                WHERE nodes_fts MATCH '$fts_expr'
+                $status_clause $type_clause $learning_clause
+                UNION ALL
+                SELECT n.id, n.text, n.status, lf.rank * 2.0 AS rank
+                FROM nodes_learning_fts lf
+                JOIN nodes n ON lf.rowid = n.rowid
+                WHERE nodes_learning_fts MATCH '$learning_fts_expr'
+                $status_clause $type_clause $learning_clause
+            )
+            GROUP BY id
             ORDER BY rank
             LIMIT $limit;
         "
+    else
+        sql="
+            SELECT n.id, n.text, n.status, f.rank AS rank
+            FROM nodes_fts f
+            JOIN nodes n ON f.rowid = n.rowid
+            WHERE nodes_fts MATCH '$fts_expr'
+            $status_clause $type_clause $learning_clause
+            ORDER BY rank
+            LIMIT $limit;
+        "
+    fi
+
+    if [ "$format" = "json" ]; then
+        local json_sql
+        if [ "${has_learning_fts:-0}" = "1" ]; then
+            json_sql="
+                SELECT id, text, status, metadata, MIN(rank) AS rank FROM (
+                    SELECT n.id, n.text, n.status, n.metadata, f.rank AS rank
+                    FROM nodes_fts f
+                    JOIN nodes n ON f.rowid = n.rowid
+                    WHERE nodes_fts MATCH '$fts_expr'
+                    $status_clause $type_clause $learning_clause
+                    UNION ALL
+                    SELECT n.id, n.text, n.status, n.metadata, lf.rank * 2.0 AS rank
+                    FROM nodes_learning_fts lf
+                    JOIN nodes n ON lf.rowid = n.rowid
+                    WHERE nodes_learning_fts MATCH '$learning_fts_expr'
+                    $status_clause $type_clause $learning_clause
+                )
+                GROUP BY id
+                ORDER BY rank
+                LIMIT $limit;
+            "
+        else
+            json_sql="
+                SELECT n.id, n.text, n.status, n.metadata, f.rank AS rank
+                FROM nodes_fts f
+                JOIN nodes n ON f.rowid = n.rowid
+                WHERE nodes_fts MATCH '$fts_expr'
+                $status_clause $type_clause $learning_clause
+                ORDER BY rank
+                LIMIT $limit;
+            "
+        fi
         db_query_json "$json_sql"
     else
         local results
@@ -2331,6 +2433,12 @@ cmd_breadcrumbs() {
 _breadcrumbs_save() {
     local breadcrumb_file="$1"
     local message="$2"
+
+    # Guard: don't materialize WEAVE_DIR for empty/uninitialized repos — same
+    # boundary rule as cmd_sync. Without this, hooks running from ~ create ~/.weave/.
+    if ! _should_persist_weave_state; then
+        return 0
+    fi
 
     mkdir -p "$(dirname "$breadcrumb_file")"
 

@@ -622,7 +622,7 @@ test_large_metadata() {
 
     # Verify storage
     local retrieved_len
-    retrieved_len=$("$WV" show "$id" --json 2>/dev/null | jq -r '.[0].metadata | fromjson | .learning' | wc -c)
+    retrieved_len=$("$WV" show "$id" --json 2>/dev/null | jq -r '.metadata | fromjson | .learning' | wc -c)
     # wc -c counts bytes including trailing newline
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$retrieved_len" -ge 50000 ]; then
@@ -640,7 +640,7 @@ test_large_metadata() {
     "$WV" load >/dev/null 2>&1
 
     local after_len
-    after_len=$("$WV" show "$id" --json 2>/dev/null | jq -r '.[0].metadata | fromjson | .learning' | wc -c)
+    after_len=$("$WV" show "$id" --json 2>/dev/null | jq -r '.metadata | fromjson | .learning' | wc -c)
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$after_len" -ge 50000 ]; then
         echo -e "  ${GREEN}✓${NC} 50KB metadata survives round-trip ($after_len bytes)"
@@ -814,7 +814,7 @@ test_unicode_text() {
     rm -f "$WV_DB" "$WV_DB-wal" "$WV_DB-shm"
     "$WV" load >/dev/null 2>&1
     local retrieved
-    retrieved=$("$WV" show "$id_emoji" --json 2>/dev/null | jq -r '.[0].text' 2>/dev/null || echo "")
+    retrieved=$("$WV" show "$id_emoji" --json 2>/dev/null | jq -r '.text' 2>/dev/null || echo "")
     assert_contains "$retrieved" "🎉" "Emoji survives round-trip" || true
 
     teardown_test_env
@@ -888,7 +888,7 @@ test_long_text() {
 
     # Verify storage
     local len
-    len=$("$WV" show "$id" --json 2>/dev/null | jq -r '.[0].text' | wc -c)
+    len=$("$WV" show "$id" --json 2>/dev/null | jq -r '.text' | wc -c)
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$len" -ge 10000 ]; then
         echo -e "  ${GREEN}✓${NC} 10K character text stored ($len bytes)"
@@ -904,7 +904,7 @@ test_long_text() {
     rm -f "$WV_DB" "$WV_DB-wal" "$WV_DB-shm"
     "$WV" load >/dev/null 2>&1
     local after_len
-    after_len=$("$WV" show "$id" --json 2>/dev/null | jq -r '.[0].text' | wc -c)
+    after_len=$("$WV" show "$id" --json 2>/dev/null | jq -r '.text' | wc -c)
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$after_len" -ge 10000 ]; then
         echo -e "  ${GREEN}✓${NC} 10K text survives round-trip ($after_len bytes)"
@@ -942,7 +942,7 @@ test_metadata_injection() {
     local id2
     id2=$(get_id "$("$WV" add "deep nesting" --metadata="$nested" 2>&1)")
     local deep_val
-    deep_val=$("$WV" show "$id2" --json 2>/dev/null | jq -r '.[0].metadata | fromjson | .a.b.c.d.e.f' 2>/dev/null || echo "")
+    deep_val=$("$WV" show "$id2" --json 2>/dev/null | jq -r '.metadata | fromjson | .a.b.c.d.e.f' 2>/dev/null || echo "")
     assert_equals "deep" "$deep_val" "Deeply nested JSON metadata preserved" || true
 
     teardown_test_env
@@ -964,7 +964,7 @@ test_work_status_model() {
 
     # Fixed: wv-d03c — wv work now sets 'active'
     local status
-    status=$("$WV" show "$id" --json 2>/dev/null | jq -r '.[0].status')
+    status=$("$WV" show "$id" --json 2>/dev/null | jq -r '.status')
     assert_equals "active" "$status" "wv work sets status to active"
 
     # Verify visibility in wv list --status=active
@@ -1268,7 +1268,7 @@ test_gh_metadata_roundtrip() {
     "$WV" load >/dev/null 2>&1
 
     local gh_issue
-    gh_issue=$("$WV" show "$id" --json 2>/dev/null | jq -r '.[0].metadata | fromjson | .gh_issue' 2>/dev/null || echo "null")
+    gh_issue=$("$WV" show "$id" --json 2>/dev/null | jq -r '.metadata | fromjson | .gh_issue' 2>/dev/null || echo "null")
     assert_equals "42" "$gh_issue" "gh_issue metadata survives round-trip" || true
 
     teardown_test_env

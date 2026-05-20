@@ -1085,7 +1085,7 @@ cmd_tree() {
     fi
     local status_filter=""
     if [ "$show_active_only" = "true" ]; then
-        status_filter="AND n.status != 'done'"
+        status_filter="AND n.status = 'active'"
     fi
     local cte_anchor
     if [ -n "$filter_root" ]; then

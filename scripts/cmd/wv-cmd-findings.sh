@@ -77,15 +77,18 @@ cmd_findings_list() {
     local fixable_only=false
     local limit=20
     local show_all=false
+    local stale_days=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --json)    format="json" ;;
-            --fixable) fixable_only=true ;;
-            --all)     show_all=true ;;
-            --limit=*) limit="${1#--limit=}" ;;
+            --json)     format="json" ;;
+            --fixable)  fixable_only=true ;;
+            --all)      show_all=true ;;
+            --limit=*)  limit="${1#--limit=}" ;;
+            --stale=*)  stale_days="${1#--stale=}" ;;
             --help|-h)
-                echo "Usage: wv findings list [--fixable] [--json] [--limit=N | --all]" >&2
+                echo "Usage: wv findings list [--fixable] [--json] [--limit=N | --all] [--stale=N]" >&2
+                echo "  --stale=N   show only findings promoted more than N days ago" >&2
                 echo "  Default: shows most recent 20. Use --all for full list (can be large)." >&2
                 return 0
                 ;;
@@ -100,6 +103,14 @@ cmd_findings_list() {
     local fixable_clause=""
     if [ "$fixable_only" = true ]; then
         fixable_clause="AND json_extract(n.metadata, '$.finding.fixable') = 1"
+    fi
+
+    local stale_clause=""
+    if [ -n "$stale_days" ]; then
+        stale_clause="AND (
+            json_extract(n.metadata, '\$.promoted_at') IS NOT NULL
+            AND CAST((julianday('now') - julianday(json_extract(n.metadata, '\$.promoted_at'))) AS INTEGER) >= $stale_days
+        )"
     fi
 
     local limit_clause=""
@@ -123,10 +134,16 @@ cmd_findings_list() {
                 SELECT 1 FROM edges e
                 JOIN nodes t ON e.source = t.id
                 WHERE e.target = n.id AND e.type = 'resolves' AND t.status != 'done'
-            ) THEN 1 ELSE 0 END AS has_fix
+            ) THEN 1 ELSE 0 END AS has_fix,
+            CASE
+                WHEN json_extract(n.metadata, '\$.promoted_at') IS NOT NULL
+                THEN CAST((julianday('now') - julianday(json_extract(n.metadata, '\$.promoted_at'))) AS INTEGER)
+                ELSE NULL
+            END AS age_days
         FROM nodes n
         WHERE json_extract(n.metadata, '$.type') = 'finding'
         $fixable_clause
+        $stale_clause
         ORDER BY n.created_at DESC
         $limit_clause;
     "
@@ -136,6 +153,7 @@ cmd_findings_list() {
         results=$(db_query_json "SELECT n.id, n.text, n.status, n.metadata FROM nodes n
             WHERE json_extract(n.metadata, '$.type') = 'finding'
             $fixable_clause
+            $stale_clause
             ORDER BY n.created_at DESC
             $limit_clause;")
         [ -z "$results" ] && echo "[]" || echo "$results"
@@ -151,7 +169,7 @@ cmd_findings_list() {
     fi
 
     local count=0
-    while IFS='|' read -r id status fixable confidence violation_type text has_fix; do
+    while IFS='|' read -r id status fixable confidence violation_type text has_fix age_days; do
         count=$((count + 1))
         # Fixable badge (compact)
         local fix_badge
@@ -172,7 +190,16 @@ cmd_findings_list() {
         # Status only shown if not done
         local status_tag=""
         [ "$status" != "done" ] && status_tag=" [$status]"
-        echo -e "${CYAN}$id${NC}${status_tag} $fix_badge conf=$conf_str $vtype${fix_status}"
+        # Age — only shown when promoted_at is set
+        local age_tag=""
+        if [ -n "$age_days" ] && [ "$age_days" != "NULL" ]; then
+            if [ "$age_days" -ge 14 ]; then
+                age_tag=" ${YELLOW}${age_days}d${NC}"
+            else
+                age_tag=" ${age_days}d"
+            fi
+        fi
+        echo -e "${CYAN}$id${NC}${status_tag} $fix_badge conf=$conf_str $vtype${fix_status}${age_tag}"
         echo -e "  $display_text"
     done <<< "$rows"
 

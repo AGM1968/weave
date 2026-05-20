@@ -138,7 +138,11 @@ def _resolve_repo(path: str | None) -> str:
         )
         return result.stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return os.getcwd()
+        cwd = os.getcwd()
+        # Reject home dir — same boundary as wv-config.sh; scanner from ~ is meaningless.
+        if cwd == os.path.expanduser("~") or cwd in ("/root",):
+            return ""
+        return cwd
 
 
 # ---------------------------------------------------------------------------

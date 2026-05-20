@@ -31,6 +31,8 @@ FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.filePath
 
 # Normalize to repo-relative path when possible (stable comparison key).
 REPO_ROOT="${WV_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+# Reject home dir — hook firing from ~ must not treat home as project root.
+if [ "$REPO_ROOT" = "$HOME" ] || [ "$REPO_ROOT" = "/root" ]; then REPO_ROOT=""; fi
 REL_PATH="$FILE_PATH"
 case "$FILE_PATH" in
     "$REPO_ROOT"/*) REL_PATH="${FILE_PATH#$REPO_ROOT/}" ;;

@@ -256,7 +256,7 @@ cd "$OBSERVER_DIR"
 $WV load 2>/dev/null || true
 
 # Check the node text — Agent B should win (later epoch)
-node_text=$($WV show "$AGENT_A_NODE" --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['text'])" 2>/dev/null || echo "MISSING")
+node_text=$($WV show "$AGENT_A_NODE" --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['text'])" 2>/dev/null || echo "MISSING")
 
 assert "Last-writer-wins: Agent B's text present" '[ "$node_text" = "Agent B wins this" ]' "Agent B wins this (got: $node_text)"
 
@@ -291,7 +291,7 @@ gen_delta "$SAME_LOAD_DIR/.weave/deltas/2026-03-15/1778349970-123456789-000001-a
 
 init_agent_db "$SAME_LOAD_DIR"
 $WV load 2>/dev/null || true
-same_text=$($WV show "$SAME_NODE" --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['text'])" 2>/dev/null || echo "MISSING")
+same_text=$($WV show "$SAME_NODE" --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['text'])" 2>/dev/null || echo "MISSING")
 
 assert "Same-second replay applies higher sequence last" '[ "$same_text" = "Second sequence wins" ]' "Second sequence wins (got: $same_text)"
 

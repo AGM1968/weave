@@ -29,23 +29,16 @@ if [[ "$COMMAND" =~ wv[[:space:]]update[[:space:]]wv-[0-9a-f]{4,6}.*--status=act
     HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
     if [ -x "$WV" ]; then
-        NODE_JSON=$("$WV" show "$NODE_ID" --json 2>/dev/null || echo "[]")
-
-        # Fail-open on unreadable state.
-        # If `wv show` returned [] (node missing, DB unreadable, or a transient
-        # auto_sync window where the dumped state is being rewritten), we cannot
-        # confidently assess done_criteria/risks — so silently allow the claim
-        # and let wv work itself surface a clearer error if the node truly
-        # doesn't exist. Blocking on an empty read forces the model to burn a
-        # turn on a diagnostic wv show just to recover.
-        NODE_COUNT=$(echo "$NODE_JSON" | jq -r 'length // 0' 2>/dev/null || echo "0")
-        if [[ "$NODE_COUNT" == "0" || -z "$NODE_COUNT" ]]; then
+        # wv show --json returns a compact object (not array) for single-ID queries.
+        # Fail-open when node is missing or DB is unreadable — let wv work surface errors.
+        NODE_JSON=$("$WV" show "$NODE_ID" --json 2>/dev/null || true)
+        if [[ -z "$NODE_JSON" ]] || [[ "$NODE_JSON" = "[]" ]]; then
             exit 0
         fi
 
-        NODE_TEXT=$(echo "$NODE_JSON" | jq -r '.[0].text // ""' 2>/dev/null || echo "")
-        HAS_SHIP_IT=$(echo "$NODE_JSON" | jq -r '.[0].metadata | fromjson | has("done_criteria")' 2>/dev/null || echo "false")
-        HAS_PRE_MORTEM=$(echo "$NODE_JSON" | jq -r '.[0].metadata | fromjson | has("risks")' 2>/dev/null || echo "false")
+        NODE_TEXT=$(echo "$NODE_JSON" | jq -r '.text // ""' 2>/dev/null || echo "")
+        HAS_SHIP_IT=$(echo "$NODE_JSON" | jq -r '.metadata | fromjson | has("done_criteria")' 2>/dev/null || echo "false")
+        HAS_PRE_MORTEM=$(echo "$NODE_JSON" | jq -r '.metadata | fromjson | has("risks")' 2>/dev/null || echo "false")
 
         # Only suggest if not already done.
         # Tiers:

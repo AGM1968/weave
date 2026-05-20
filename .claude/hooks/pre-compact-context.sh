@@ -20,21 +20,23 @@ WV_DB="${WV_DB:-/dev/shm/weave/${_REPO_HASH}/brain.db}"
 "$WV" sync 2>/dev/null || true
 # Stage only .weave/ state — code changes belong in intentional feature commits.
 # Using 'git add -A' here caused race conditions with state.sql across sessions.
-# Rate-limit: skip commit if last checkpoint/sync commit was < 10 minutes ago
-_LAST_CP=$(git log -1 --format=%ct --grep='auto-checkpoint\|pre-compact checkpoint\|sync state' 2>/dev/null || echo 0)
 _NOW=$(date +%s)
-_ELAPSED=$((_NOW - _LAST_CP))
-_PC_INTERVAL="${WV_CHECKPOINT_INTERVAL:-600}"
-if [ "$_ELAPSED" -lt "$_PC_INTERVAL" ]; then
-    # Skip checkpoint — too recent
-    :
-else
-    git add .weave/ 2>/dev/null || true
-    if ! git diff --cached --quiet 2>/dev/null; then
+git add .weave/ 2>/dev/null || true
+if ! git diff --cached --quiet 2>/dev/null; then
+    _PC_BRANCH=$(git branch --show-current 2>/dev/null || echo "main")
+    _PC_LOCAL=$(git rev-parse HEAD 2>/dev/null || echo "")
+    _PC_REMOTE=$(git rev-parse "origin/$_PC_BRANCH" 2>/dev/null || echo "none")
+    _PC_LAST_MSG=$(git log -1 --format='%s' 2>/dev/null || echo "")
+    _PC_LAST_NW=$(git diff HEAD~1 HEAD --name-only 2>/dev/null | grep -v '^\.weave/' | grep -v '^$' || true)
+    if [ "$_PC_LOCAL" != "$_PC_REMOTE" ] \
+       && [[ "$_PC_LAST_MSG" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] \
+       && [ -z "$_PC_LAST_NW" ]; then
+        git commit --amend --no-edit --no-verify 2>/dev/null || \
         git commit -m "wip: pre-compact checkpoint $(date +%H:%M) [skip ci]" --no-verify 2>/dev/null || true
-        # Update checkpoint stamp so auto_checkpoint sees this commit
-        echo "$_NOW" > "/dev/shm/weave/${_REPO_HASH}/.last_checkpoint" 2>/dev/null || true
+    else
+        git commit -m "wip: pre-compact checkpoint $(date +%H:%M) [skip ci]" --no-verify 2>/dev/null || true
     fi
+    echo "$_NOW" > "/dev/shm/weave/${_REPO_HASH}/.last_checkpoint" 2>/dev/null || true
 fi
 
 # Compact status line

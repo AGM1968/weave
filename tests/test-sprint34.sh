@@ -186,15 +186,16 @@ test_tree() {
     assert_contains "$tree_depth1" "Feature: Login flow" "tree --depth=1: shows depth 1"
     assert_not_contains "$tree_depth1" "Task: Create login form" "tree --depth=1: hides depth 2"
 
-    # Active filter — mark epic done, create a second active root
+    # Active filter — mark epic done, create and claim a second active root
     $WV done "$epic_id" >/dev/null 2>&1
     local active_epic
     active_epic=$($WV add "Epic: Active project" 2>/dev/null | tail -1)
+    $WV work "$active_epic" >/dev/null 2>&1
 
     local tree_active
     tree_active=$($WV tree --active 2>&1)
     assert_not_contains "$tree_active" "Epic: Build auth system" "tree --active: hides done epics"
-    assert_contains "$tree_active" "Epic: Active project" "tree --active: shows non-done roots"
+    assert_contains "$tree_active" "Epic: Active project" "tree --active: shows active roots"
 
     # Orphan nodes (no implements edges) become roots
     local orphan_id
@@ -448,7 +449,7 @@ test_aliases() {
     id2=$($WV add "Deploy hotfix" --alias=deploy 2>/dev/null | tail -1)
     $WV done deploy >/dev/null 2>&1
     local status
-    status=$($WV show "$id2" --json 2>&1 | jq -r '.[0].status' 2>/dev/null)
+    status=$($WV show "$id2" --json 2>&1 | jq -r '.status' 2>/dev/null)
     assert_equals "done" "$status" "alias: done resolves alias"
 
     # Update via alias
@@ -456,7 +457,7 @@ test_aliases() {
     id3=$($WV add "Refactor DB" --alias=refactor-db 2>/dev/null | tail -1)
     $WV update refactor-db --text="Refactor database layer" >/dev/null 2>&1
     local updated_text
-    updated_text=$($WV show "$id3" --json 2>&1 | jq -r '.[0].text' 2>/dev/null)
+    updated_text=$($WV show "$id3" --json 2>&1 | jq -r '.text' 2>/dev/null)
     assert_equals "Refactor database layer" "$updated_text" "alias: update resolves alias"
 
     # Change alias
@@ -468,7 +469,7 @@ test_aliases() {
     local id4
     id4=$($WV add "Write tests" --alias=tests 2>/dev/null | tail -1)
     $WV work tests >/dev/null 2>&1
-    status=$($WV show "$id4" --json 2>&1 | jq -r '.[0].status' 2>/dev/null)
+    status=$($WV show "$id4" --json 2>&1 | jq -r '.status' 2>/dev/null)
     assert_equals "active" "$status" "alias: work resolves alias"
 
     # Non-existent alias fails gracefully (exit 1, no crash)
@@ -489,7 +490,7 @@ test_aliases() {
     assert_equals "2" "$reuse_count" "alias: reuse allowed after done"
     # Resolve prefers the non-done node
     local resolved_id
-    resolved_id=$($WV show tests --json 2>&1 | jq -r '.[0].id' 2>/dev/null)
+    resolved_id=$($WV show tests --json 2>&1 | jq -r '.id' 2>/dev/null)
     assert_equals "$id4_reuse" "$resolved_id" "alias: resolve prefers non-done"
 
     # Block via alias
@@ -498,7 +499,7 @@ test_aliases() {
     id6=$($WV add "Blocked task" --alias=blocked 2>/dev/null | tail -1)
     $WV block blocked --by="$id5" >/dev/null 2>&1
     local blocked_status
-    blocked_status=$($WV show "$id6" --json 2>&1 | jq -r '.[0].status' 2>/dev/null)
+    blocked_status=$($WV show "$id6" --json 2>&1 | jq -r '.status' 2>/dev/null)
     assert_equals "blocked" "$blocked_status" "alias: block resolves alias"
 }
 
@@ -559,7 +560,7 @@ test_learning_hygiene() {
     id1=$($WV add "Simple task" 2>/dev/null | tail -1)
     $WV done "$id1" >/dev/null 2>&1
     local score1
-    score1=$($WV show "$id1" --json 2>&1 | jq -r '.[0].metadata | fromjson | .learning_hygiene // "null"' 2>/dev/null)
+    score1=$($WV show "$id1" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene // "null"' 2>/dev/null)
     assert_equals "null" "$score1" "quality: no learning = no score"
 
     # Short learning (>20 chars, no prefix, no code ref) = 1 point
@@ -567,7 +568,7 @@ test_learning_hygiene() {
     id2=$($WV add "Task with short learning" 2>/dev/null | tail -1)
     $WV done "$id2" --learning="always check the edge cases first" >/dev/null 2>&1
     local score2
-    score2=$($WV show "$id2" --json 2>&1 | jq -r '.[0].metadata | fromjson | .learning_hygiene' 2>/dev/null)
+    score2=$($WV show "$id2" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene' 2>/dev/null)
     assert_equals "1" "$score2" "quality: length >20 chars = 1 point"
 
     # Categorized prefix (pattern:) = +2, plus length >20 = +1 = 3
@@ -575,7 +576,7 @@ test_learning_hygiene() {
     id3=$($WV add "Task with pattern learning" 2>/dev/null | tail -1)
     $WV done "$id3" --learning="pattern: Use recursive CTE for tree traversal in SQLite" >/dev/null 2>&1
     local score3
-    score3=$($WV show "$id3" --json 2>&1 | jq -r '.[0].metadata | fromjson | .learning_hygiene' 2>/dev/null)
+    score3=$($WV show "$id3" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene' 2>/dev/null)
     assert_equals "3" "$score3" "quality: length + categorized prefix = 3"
 
     # All bonuses: prefix + length + code reference = 4
@@ -583,7 +584,7 @@ test_learning_hygiene() {
     id4=$($WV add "Task with full quality" 2>/dev/null | tail -1)
     $WV done "$id4" --learning="pattern: Use validate_status() from wv-validate.sh for enum checking" >/dev/null 2>&1
     local score4
-    score4=$($WV show "$id4" --json 2>&1 | jq -r '.[0].metadata | fromjson | .learning_hygiene' 2>/dev/null)
+    score4=$($WV show "$id4" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene' 2>/dev/null)
     assert_equals "4" "$score4" "quality: length + prefix + code ref = 4"
 
     # Pitfall prefix also scores +2
@@ -591,7 +592,7 @@ test_learning_hygiene() {
     id5=$($WV add "Task with pitfall" 2>/dev/null | tail -1)
     $WV done "$id5" --learning="pitfall: Never use echo with arrays, causes word splitting" >/dev/null 2>&1
     local score5
-    score5=$($WV show "$id5" --json 2>&1 | jq -r '.[0].metadata | fromjson | .learning_hygiene' 2>/dev/null)
+    score5=$($WV show "$id5" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene' 2>/dev/null)
     assert_equals "3" "$score5" "quality: pitfall prefix scores same as pattern"
 
     # --min-quality filter works
@@ -948,7 +949,7 @@ test_resolve_first_id() {
 
     # Verify the learning was captured — "pattern: ..." is parsed into the .pattern field
     local learning
-    learning=$($WV show "$id1" --json 2>&1 | jq -r '.[0].metadata | fromjson | .pattern' 2>/dev/null)
+    learning=$($WV show "$id1" --json 2>&1 | jq -r '.metadata | fromjson | .pattern' 2>/dev/null)
     assert_equals "always test your code thoroughly" "$learning" "resolve: --learning flag preserved through alias resolution"
 
     # Alias with flags after
@@ -1023,6 +1024,21 @@ test_checkpoint_trailers() {
 
     commit_msg=$(git log -1 --format='%B' 2>/dev/null)
     assert_not_contains "$commit_msg" "Weave-ID:" "checkpoint: no trailers when no active nodes"
+
+    # Verify consecutive checkpoints amend (collapse) rather than creating N commits.
+    # After 3 syncs, commit count should still be 2 (init + one weave commit).
+    local id3
+    id3=$($WV add "Collapse test" 2>/dev/null | tail -1)
+    $WV work "$id3" >/dev/null 2>&1
+    rm -f "$WV_HOT_ZONE/.last_checkpoint"
+    $WV sync >/dev/null 2>&1  # creates new weave commit (C1) — HEAD was init/done
+    rm -f "$WV_HOT_ZONE/.last_checkpoint"
+    $WV sync >/dev/null 2>&1  # should amend C1 (last commit is weave-only)
+    rm -f "$WV_HOT_ZONE/.last_checkpoint"
+    $WV sync >/dev/null 2>&1  # should amend again
+    local commit_count
+    commit_count=$(git log --oneline | wc -l | tr -d ' ')
+    assert_equals "2" "$commit_count" "checkpoint: consecutive checkpoints collapse to single commit"
 
     unset WV_CHECKPOINT_INTERVAL
 }

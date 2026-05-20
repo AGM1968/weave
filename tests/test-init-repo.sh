@@ -281,6 +281,24 @@ echo "my custom content" > "$REPO5/CLAUDE.md"
 assert_contains "$(cat "$REPO5/CLAUDE.md")" "BEGIN WEAVE CLAUDE.MD"  "--update: prepends Weave block to CLAUDE.md"
 assert_contains "$(cat "$REPO5/CLAUDE.md")" "my custom content"  "--update: preserves user content in CLAUDE.md"
 
+# Pre-marker Weave stub: --update should replace entirely (no orphan duplicate)
+# Simulates upgrading a repo that has an old-style Weave stub without BEGIN/END markers.
+PRE_MARKER_STUB='# GitHub Copilot Instructions
+
+git status && wv status
+wv work <id>
+If 0 active nodes, use wv status to find active node first.'
+printf '%s\n' "$PRE_MARKER_STUB" > "$REPO5/.github/copilot-instructions.md"
+"$WV" init-repo --agent=copilot --update 2>&1 >/dev/null
+COPILOT_PM=$(cat "$REPO5/.github/copilot-instructions.md")
+assert_contains "$COPILOT_PM" "BEGIN WEAVE COPILOT.MD"      "--update pre-marker: adds markers"
+# Old orphan content should not appear after replacement (pre-marker fingerprint line)
+assert_not_contains "$COPILOT_PM" "If 0 active nodes, use wv status to find active node first." \
+    "--update pre-marker: orphan content removed"
+# Title H1 should appear exactly once (new stub has it; doubled if old content was prepended)
+GH_H1_COUNT=$(grep -c '^# GitHub Copilot Instructions$' "$REPO5/.github/copilot-instructions.md" 2>/dev/null || echo 0)
+assert_equals "1" "$GH_H1_COUNT"                             "--update pre-marker: no duplicate title H1"
+
 # --- --help works ---
 echo ""
 echo "--- help ---"

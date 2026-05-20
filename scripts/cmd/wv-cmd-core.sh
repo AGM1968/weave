@@ -631,17 +631,36 @@ _done_read_metadata() {
     echo "$cur_meta"
 }
 
+_FINDING_VIOLATION_TYPES="historical:defect upstream:management-gap upstream:logic-bug upstream:schema-drift repo:hygiene repo:regression test:gap design:flaw"
+
 _finding_missing_fields() {
     local meta_json="${1:-{}}"
-    echo "$meta_json" | jq -r '
+    echo "$meta_json" | jq -r --arg valid_types "$_FINDING_VIOLATION_TYPES" '
         (.finding // {}) as $finding |
+        ($valid_types | split(" ")) as $enum |
         [
-            (if (($finding.violation_type // null) | type) == "string" and (($finding.violation_type | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.violation_type" end),
-            (if (($finding.root_cause // null) | type) == "string" and (($finding.root_cause | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.root_cause" end),
-            (if (($finding.proposed_fix // null) | type) == "string" and (($finding.proposed_fix | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.proposed_fix" end),
-            (if (["high", "medium", "low"] | index(($finding.confidence // "") | tostring)) != null then empty else "finding.confidence" end),
-            (if ($finding.fixable | type) == "boolean" then empty else "finding.fixable" end),
-            (if (($finding | has("evidence_sessions")) | not) or ((($finding.evidence_sessions // null) | type) == "array" and ([$finding.evidence_sessions[]? | select((type != "string") or ((gsub("^\\s+|\\s+$"; "")) | length == 0))] | length) == 0) then empty else "finding.evidence_sessions" end)
+            # violation_type: required + enum-validated
+            (if (($finding.violation_type // null) | type) == "string"
+                and (($finding.violation_type | gsub("^\\s+|\\s+$"; "")) | length) > 0
+                and ($enum | index($finding.violation_type)) != null
+             then empty
+             elif (($finding.violation_type // null) | type) == "string"
+                and (($finding.violation_type | gsub("^\\s+|\\s+$"; "")) | length) > 0
+             then "finding.violation_type (invalid enum: \($finding.violation_type))"
+             else "finding.violation_type"
+             end),
+            # root_cause, proposed_fix, confidence, fixable: optional — validate only if present
+            (if ($finding | has("root_cause")) and
+                ((($finding.root_cause // null) | type) != "string" or (($finding.root_cause | gsub("^\\s+|\\s+$"; "")) | length) == 0)
+             then "finding.root_cause (present but empty/invalid)" else empty end),
+            (if ($finding | has("proposed_fix")) and
+                ((($finding.proposed_fix // null) | type) != "string" or (($finding.proposed_fix | gsub("^\\s+|\\s+$"; "")) | length) == 0)
+             then "finding.proposed_fix (present but empty/invalid)" else empty end),
+            (if ($finding | has("confidence")) and
+                (["high", "medium", "low"] | index(($finding.confidence // "") | tostring)) == null
+             then "finding.confidence (must be high|medium|low)" else empty end),
+            (if ($finding | has("fixable")) and ($finding.fixable | type) != "boolean"
+             then "finding.fixable (must be boolean)" else empty end)
         ] | .[]?
     ' 2>/dev/null
 }
@@ -656,9 +675,11 @@ _done_require_finding_metadata() {
     missing_fields=$(_finding_missing_fields "$meta_json" | paste -sd ', ' - || true)
     [ -z "$missing_fields" ] && return 0
 
-    echo -e "${RED}Error: finding nodes require structured metadata before close${NC}" >&2
+    echo -e "${RED}Error: finding node requires violation_type before close${NC}" >&2
     echo -e "  Missing or invalid: $missing_fields" >&2
-    echo -e "  Run: wv update $id --metadata='{\"finding\":{\"violation_type\":\"...\",\"root_cause\":\"...\",\"proposed_fix\":\"...\",\"confidence\":\"high\",\"fixable\":true}}'" >&2
+    echo -e "  Enum values: $_FINDING_VIOLATION_TYPES" >&2
+    echo -e "  Minimal: wv update $id --metadata='{\"finding\":{\"violation_type\":\"repo:hygiene\"}}'" >&2
+    echo -e "  Full:    wv update $id --metadata='{\"finding\":{\"violation_type\":\"repo:hygiene\",\"root_cause\":\"...\",\"proposed_fix\":\"...\",\"confidence\":\"high\",\"fixable\":true}}'" >&2
     return 1
 }
 
@@ -1152,6 +1173,25 @@ cmd_done() {
     fi
 
     echo "closing" > "$WV_HOT_ZONE/.session_phase" 2>/dev/null || true
+
+    # Advisory: open finding nodes that reference this node as source_node.
+    # Emitted on close so the author can triage while context is fresh.
+    if [ "$format" != "json" ] && [ "${WV_NO_WARN:-0}" != "1" ]; then
+        local _open_findings
+        _open_findings=$(db_query "
+            SELECT id || ' — ' || substr(text, 1, 60)
+            FROM nodes
+            WHERE json_extract(metadata, '\$.source_node') = '$id'
+              AND json_extract(metadata, '\$.type') = 'finding'
+              AND status != 'done';
+        " 2>/dev/null || true)
+        if [ -n "$_open_findings" ]; then
+            echo -e "${YELLOW}  ⚠ Open findings referencing this node — review or close:${NC}" >&2
+            while IFS= read -r _f; do
+                echo -e "    ${YELLOW}·${NC} $_f" >&2
+            done <<< "$_open_findings"
+        fi
+    fi
 
     # === Post-close: GH issue, cache, notifications, breadcrumbs ===
     [ "$no_gh" = "0" ] && _done_close_gh_issue "$id"
@@ -1938,7 +1978,7 @@ cmd_show() {
             echo "$_result"
         fi
     elif [ "$format" = "json" ]; then
-        db_query_json "$query"
+        db_query_json "$query" | jq -c '.[0] // empty'
     else
         # Use unit separator — node text can contain '|'
         db_ensure

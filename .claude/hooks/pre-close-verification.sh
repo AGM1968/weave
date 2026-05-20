@@ -29,7 +29,7 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
     source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
     if [ -x "$WV" ]; then
         NODE_TEXT=$("$WV" show "$NODE_ID" 2>/dev/null | grep "Text:" | sed 's/^[^:]*: //' || echo "")
-        NODE_META=$("$WV" show "$NODE_ID" --json 2>/dev/null | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
+        NODE_META=$("$WV" show "$NODE_ID" --json 2>/dev/null | jq -r '.metadata // "{}"' 2>/dev/null || echo "{}")
         NODE_TYPE=$(echo "$NODE_META" | jq -r '.type // "unknown"' 2>/dev/null || echo "unknown")
         IS_TRIVIAL=false
         if [[ "$NODE_TYPE" == "breadcrumbs" ]] || [[ "$NODE_TEXT" =~ ^Test ]]; then
@@ -37,20 +37,38 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
         fi
 
         if [[ "$NODE_TYPE" == "finding" ]]; then
-            MISSING_FINDING=$(echo "$NODE_META" | jq -r '
+            _FINDING_VT_ENUM="historical:defect upstream:management-gap upstream:logic-bug upstream:schema-drift repo:hygiene repo:regression test:gap design:flaw"
+            MISSING_FINDING=$(echo "$NODE_META" | jq -r --arg valid_types "$_FINDING_VT_ENUM" '
                 (.finding // {}) as $finding |
+                ($valid_types | split(" ")) as $enum |
                 [
-                    (if (($finding.violation_type // null) | type) == "string" and (($finding.violation_type | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.violation_type" end),
-                    (if (($finding.root_cause // null) | type) == "string" and (($finding.root_cause | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.root_cause" end),
-                    (if (($finding.proposed_fix // null) | type) == "string" and (($finding.proposed_fix | gsub("^\\s+|\\s+$"; "")) | length) > 0 then empty else "finding.proposed_fix" end),
-                    (if (["high", "medium", "low"] | index(($finding.confidence // "") | tostring)) != null then empty else "finding.confidence" end),
-                    (if ($finding.fixable | type) == "boolean" then empty else "finding.fixable" end),
-                    (if (($finding | has("evidence_sessions")) | not) or ((($finding.evidence_sessions // null) | type) == "array" and ([$finding.evidence_sessions[]? | select((type != "string") or ((gsub("^\\s+|\\s+$"; "")) | length == 0))] | length) == 0) then empty else "finding.evidence_sessions" end)
+                    # violation_type: required + enum-validated
+                    (if (($finding.violation_type // null) | type) == "string"
+                        and (($finding.violation_type | gsub("^\\s+|\\s+$"; "")) | length) > 0
+                        and ($enum | index($finding.violation_type)) != null
+                     then empty
+                     elif (($finding.violation_type // null) | type) == "string"
+                        and (($finding.violation_type | gsub("^\\s+|\\s+$"; "")) | length) > 0
+                     then "finding.violation_type (invalid enum: \($finding.violation_type))"
+                     else "finding.violation_type"
+                     end),
+                    # optional fields: validate only if present
+                    (if ($finding | has("root_cause")) and
+                        ((($finding.root_cause // null) | type) != "string" or (($finding.root_cause | gsub("^\\s+|\\s+$"; "")) | length) == 0)
+                     then "finding.root_cause (present but empty/invalid)" else empty end),
+                    (if ($finding | has("proposed_fix")) and
+                        ((($finding.proposed_fix // null) | type) != "string" or (($finding.proposed_fix | gsub("^\\s+|\\s+$"; "")) | length) == 0)
+                     then "finding.proposed_fix (present but empty/invalid)" else empty end),
+                    (if ($finding | has("confidence")) and
+                        (["high", "medium", "low"] | index(($finding.confidence // "") | tostring)) == null
+                     then "finding.confidence (must be high|medium|low)" else empty end),
+                    (if ($finding | has("fixable")) and ($finding.fixable | type) != "boolean"
+                     then "finding.fixable (must be boolean)" else empty end)
                 ] | join(", ")
             ' 2>/dev/null || echo "")
             if [[ -n "$MISSING_FINDING" ]]; then
                 jq -n \
-                    --arg detail "Finding nodes require structured metadata before close. Missing or invalid: $MISSING_FINDING. Run: wv update $NODE_ID --metadata='{\"finding\":{\"violation_type\":\"...\",\"root_cause\":\"...\",\"proposed_fix\":\"...\",\"confidence\":\"high\",\"fixable\":true}}' first." \
+                    --arg detail "finding node requires violation_type before close. Missing or invalid: $MISSING_FINDING. Enum: $_FINDING_VT_ENUM. Minimal: wv update $NODE_ID --metadata='{\"finding\":{\"violation_type\":\"repo:hygiene\"}}'" \
                     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
                 exit 0
             fi

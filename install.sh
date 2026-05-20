@@ -335,6 +335,11 @@ if [ -f "./scripts/wv" ]; then
     for pyf in ./scripts/weave_search/*.py; do
         install_file "$pyf" "$LIB_DIR/weave_search/$(basename "$pyf")"
     done
+    # Git hook sources — stored in LIB_DIR/hooks/ so wv-init-repo --update
+    # can refresh vendored scripts/hooks/ in consumer repos without network access
+    mkdir -p "$LIB_DIR/hooks"
+    install_file ./scripts/hooks/pre-commit-weave.sh "$LIB_DIR/hooks/pre-commit-weave.sh"
+    install_file ./scripts/hooks/prepare-commit-msg-weave.sh "$LIB_DIR/hooks/prepare-commit-msg-weave.sh"
     # Scripts
     cp ./scripts/context-guard.sh "$CONFIG_DIR/"
     cp ./scripts/resolve-refs.sh "$CONFIG_DIR/"
@@ -780,6 +785,24 @@ install_git_hook_from_repo "./scripts/hooks/prepare-commit-msg-weave.sh" "Weave:
 # Git hook: pre-commit (enforce active Weave node)
 install_git_hook_from_repo "./scripts/hooks/pre-commit-weave.sh" "Weave pre-commit" "pre-commit"
 
+# scripts/hooks/ vendor refresh — if a consumer repo has vendored hook sources,
+# keep them current from LIB_DIR so wv doctor --source-compare keeps passing
+_LIB_HOOKS="${LIB_DIR:-$HOME/.local/lib/weave}/hooks"
+if [ -d "$REPO_ROOT/scripts/hooks" ] && [ -d "$_LIB_HOOKS" ]; then
+    _updated_vendor=0
+    for _hf in pre-commit-weave.sh prepare-commit-msg-weave.sh; do
+        if [ -f "$REPO_ROOT/scripts/hooks/$_hf" ] && [ -f "$_LIB_HOOKS/$_hf" ]; then
+            if ! cmp -s "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf" 2>/dev/null; then
+                cp "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf"
+                chmod +x "$REPO_ROOT/scripts/hooks/$_hf"
+                echo -e "  ${GREEN}✓${NC} scripts/hooks/$_hf (updated)"
+                _updated_vendor=1
+            fi
+        fi
+    done
+    [ "$_updated_vendor" -eq 0 ] && true
+fi
+
 # .gitattributes: merge strategy + diff suppression for Weave state files
 # Uses BEGIN/END markers (like Makefile template) for reliable idempotent updates
 GITATTR="$REPO_ROOT/.gitattributes"
@@ -947,10 +970,14 @@ AGENTSEOF
             } > "$REPO_ROOT/CLAUDE.md"
             echo -e "  ${GREEN}✓${NC} CLAUDE.md (created with Weave block)"
         elif grep -q 'BEGIN WEAVE CLAUDE\.MD\|WEAVE-BLOCK-START' "$REPO_ROOT/CLAUDE.md"; then
-            # Existing with block (new or old marker): replace the block, preserve everything else
-            _before=$(sed -n '1,/BEGIN WEAVE CLAUDE\.MD\|WEAVE-BLOCK-START/{ /BEGIN WEAVE CLAUDE\.MD\|WEAVE-BLOCK-START/d; p; }' "$REPO_ROOT/CLAUDE.md")
-            _after=$(sed -n '/END WEAVE CLAUDE\.MD\|WEAVE-BLOCK-END/,${  /END WEAVE CLAUDE\.MD\|WEAVE-BLOCK-END/d; p; }' "$REPO_ROOT/CLAUDE.md")
-            { printf '%s\n' "$_before"; printf '%s\n' "$_weave_block"; printf '%s' "$_after"; } > "$REPO_ROOT/CLAUDE.md"
+            # Existing with block: surgical replace using awk (no sed 1,/REGEX/ first-line gotcha)
+            _before=$(awk '/BEGIN WEAVE CLAUDE\.MD|WEAVE-BLOCK-START/{exit} {print}' "$REPO_ROOT/CLAUDE.md")
+            _after=$(awk '/END WEAVE CLAUDE\.MD|WEAVE-BLOCK-END/{found=1; next} found{print}' "$REPO_ROOT/CLAUDE.md")
+            {
+                [ -n "$_before" ] && printf '%s\n' "$_before"
+                printf '%s\n' "$_weave_block"
+                [ -n "$_after" ] && printf '%s\n' "$_after"
+            } > "$REPO_ROOT/CLAUDE.md"
             echo -e "  ${GREEN}✓${NC} CLAUDE.md (Weave block updated)"
         elif [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]; then
             # Existing without block + --update/--force: prepend block
@@ -1203,15 +1230,16 @@ GHHOOKSEOF
         echo -e "  ${YELLOW}⊘${NC} .github/hooks/ (already exists)"
     fi
 
-    # ── copilot-instructions.md (managed — always update from template) ──
+    # ── copilot-instructions.md (marker-aware — preserves repo content outside markers) ──
     mkdir -p "$REPO_ROOT/.github"
     _STUB_TEMPLATE="$CONFIG_DIR/copilot-instructions.stub.md"
-    if [ ! -f "$REPO_ROOT/.github/copilot-instructions.md" ] || [ "$UPDATE_MODE" = "1" ]; then
-        if [ -f "$_STUB_TEMPLATE" ]; then
-            cp "$_STUB_TEMPLATE" "$REPO_ROOT/.github/copilot-instructions.md"
-        else
-            # Fallback: inline minimal stub if template not installed
-            cat > "$REPO_ROOT/.github/copilot-instructions.md" << 'COPILOTEOF'
+
+    # Build managed block from installed template or inline fallback
+    if [ -f "$_STUB_TEMPLATE" ]; then
+        _copilot_block=$(cat "$_STUB_TEMPLATE")
+    else
+        _copilot_block=$(cat << 'COPILOTEOF'
+<!-- ── BEGIN WEAVE COPILOT.MD ── managed by wv init-repo, do not edit manually -->
 # GitHub Copilot Instructions
 
 This repository uses **Weave** for task tracking. Every code change must be tracked.
@@ -1225,6 +1253,7 @@ git status && wv status   # check for uncommitted work + active node count
 If `wv status` shows 0 active nodes, claim one before touching files:
 
 ```bash
+wv search "<topic>"        # check for existing related work before claiming/creating
 wv ready                  # list unblocked work
 wv work <id>              # claim it
 ```
@@ -1236,13 +1265,13 @@ Call `weave_edit_guard` (MCP) before any edit. If blocked, claim a task first.
 ## Core loop
 
 ```bash
-wv work <id>                               # 1. claim
+wv work <id>                                             # 1. claim
 # ... edit files ...
-git add <files> && git commit -m "..."     # 2. commit BEFORE wv done
-echo "s" | wv done <id> --learning="..."  # 3. close (pipe to skip similarity prompt)
-wv sync --gh && git add .weave/            # 4a. sync graph (may dirty .weave/)
+git add <files> && git commit -m "..."                   # 2. commit BEFORE wv done
+wv done <id> --learning="..." --no-overlap-check         # 3. close (no prompts)
+wv sync --gh && git add .weave/                          # 4a. sync graph (may dirty .weave/)
 git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"  # 4b. commit if dirty
-git push                                   # 4c. MANDATORY
+git push                                                 # 4c. MANDATORY
 ```
 
 > **Order matters**: commit first, then `wv done`, then sync+push. Never reverse steps 2–4.
@@ -1255,16 +1284,6 @@ wv quick "<description>" --learning="..."
 
 # Done + sync in one step (check `wv status` for pending Git sync):
 wv ship <id> --learning="..." --no-overlap-check
-```
-
-## Terminal discipline
-
-`wv done` and `wv ship` have an interactive similarity-checker that **blocks VS Code terminals**.
-Always pipe input:
-
-```bash
-echo "s" | wv done <id> --learning="..."   # correct
-wv done <id> --learning="..."              # will hang in VS Code terminal
 ```
 
 ## Learnings format
@@ -1289,12 +1308,38 @@ MCP equivalent: `weave_code_search` (parameters: `query`, `mode`, `limit`, `grap
 ## Reference
 
 - MCP: `weave_guide` (topics: workflow, github, learnings, context)
-- CLI: `~/.config/weave/WORKFLOW.md`
+- CLI: `wv --help`, `wv help <command>`, or `~/.config/weave/WORKFLOW.md`
+<!-- ── END WEAVE COPILOT.MD ── -->
 COPILOTEOF
-        fi
-        echo -e "  ${GREEN}✓${NC} .github/copilot-instructions.md"
+)
+    fi
+
+    _cop_dst="$REPO_ROOT/.github/copilot-instructions.md"
+    if [ ! -f "$_cop_dst" ]; then
+        printf '%s\n' "$_copilot_block" > "$_cop_dst"
+        echo -e "  ${GREEN}✓${NC} .github/copilot-instructions.md (created)"
+    elif grep -q 'BEGIN WEAVE COPILOT\.MD' "$_cop_dst"; then
+        # Existing with markers: surgical replace using awk (no sed 1,/REGEX/ first-line gotcha)
+        _cop_before=$(awk '/BEGIN WEAVE COPILOT\.MD/{exit} {print}' "$_cop_dst")
+        _cop_after=$(awk '/END WEAVE COPILOT\.MD/{found=1; next} found{print}' "$_cop_dst")
+        {
+            [ -n "$_cop_before" ] && printf '%s\n' "$_cop_before"
+            printf '%s\n' "$_copilot_block"
+            [ -n "$_cop_after" ] && printf '%s\n' "$_cop_after"
+        } > "$_cop_dst"
+        echo -e "  ${GREEN}✓${NC} .github/copilot-instructions.md (Weave block updated)"
+    elif grep -qE 'weave_edit_guard|wv status.*active node|git status.*&&.*wv status' "$_cop_dst" \
+         && [ "$UPDATE_MODE" = "1" ]; then
+        # Pre-marker Weave stub (Weave workflow fingerprint, no markers yet): replace entirely
+        printf '%s\n' "$_copilot_block" > "$_cop_dst"
+        echo -e "  ${GREEN}✓${NC} .github/copilot-instructions.md (pre-marker Weave stub replaced)"
+    elif [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]; then
+        # User-written file without markers + --update/--force: prepend block
+        _cop_existing=$(cat "$_cop_dst")
+        { printf '%s\n\n' "$_copilot_block"; printf '%s\n' "$_cop_existing"; } > "$_cop_dst"
+        echo -e "  ${GREEN}✓${NC} .github/copilot-instructions.md (Weave block prepended)"
     else
-        echo -e "  ${YELLOW}⊘${NC} .github/copilot-instructions.md (exists, use --update to overwrite)"
+        echo -e "  ${YELLOW}⊘${NC} .github/copilot-instructions.md (exists without Weave block — use --update to prepend)"
     fi
 
 fi

@@ -446,22 +446,34 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 with --skip-verification bypass on real Bash payload"
 
-# Finding nodes still require structured finding metadata even with --skip-verification
+# Finding nodes require violation_type (enum) even with --skip-verification
 FINDING_ID=$(add_active_node "Finding close test" --metadata='{"type":"finding"}' 2>/dev/null | tail -1)
 set +e
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
-assert_contains "$OUTPUT" "Finding nodes require structured metadata before close" "pre-close: finding schema enforced before close"
+assert_contains "$OUTPUT" "finding node requires violation_type" "pre-close: finding schema enforced before close"
 assert_exit_code "0" "$EXIT_CODE" "pre-close: finding schema denial is soft"
 
-"$WV" update "$FINDING_ID" --metadata='{"type":"finding","commit":"deadbeef","finding":{"violation_type":"R10:open_node_at_end","root_cause":"bootstrap omitted active-node type","proposed_fix":"record active_node_type in session_start metadata","confidence":"high","fixable":true}}' 2>/dev/null
+# Minimal shape (violation_type only) passes — commit:"deadbeef" bypasses commit-check
+"$WV" update "$FINDING_ID" --metadata='{"type":"finding","commit":"deadbeef","finding":{"violation_type":"repo:hygiene"}}' 2>/dev/null
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
-assert_equals "" "$OUTPUT" "pre-close: complete finding metadata passes with skip-verification"
+assert_equals "" "$OUTPUT" "pre-close: minimal finding (violation_type only) passes"
 
-"$WV" update "$FINDING_ID" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end","root_cause":"bootstrap omitted active-node type","proposed_fix":"record active_node_type in session_start metadata","confidence":0.92,"fixable":"yes"}}' 2>/dev/null
+# Full shape also passes
+"$WV" update "$FINDING_ID" --metadata='{"type":"finding","commit":"deadbeef","finding":{"violation_type":"test:gap","root_cause":"bootstrap omitted active-node type","proposed_fix":"record active_node_type in session_start metadata","confidence":"high","fixable":true}}' 2>/dev/null
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
-assert_contains "$OUTPUT" "Missing or invalid: finding.confidence, finding.fixable" "pre-close: invalid finding field types are denied"
+assert_equals "" "$OUTPUT" "pre-close: full finding metadata passes with skip-verification"
+
+# Free-text violation_type (not in enum) rejected
+"$WV" update "$FINDING_ID" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end"}}' 2>/dev/null
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
+assert_contains "$OUTPUT" "invalid enum" "pre-close: free-text violation_type rejected with enum hint"
+
+# Optional fields present but invalid are rejected
+"$WV" update "$FINDING_ID" --metadata='{"type":"finding","finding":{"violation_type":"repo:regression","confidence":0.92,"fixable":"yes"}}' 2>/dev/null
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
+assert_contains "$OUTPUT" "finding.confidence" "pre-close: invalid optional field types are denied"
 
 # With verification metadata
 "$WV" update "$ID" --metadata='{"verification":{"method":"test","result":"pass"},"commit":"deadbeef"}' 2>/dev/null
@@ -877,7 +889,7 @@ assert_contains "$OUTPUT" "SessionStart" "lifecycle: session starts successfully
 TASK_ID=$("$WV" add "Lifecycle test task" 2>/dev/null | tail -1)
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $TASK_ID\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null || true)
 "$WV" update "$TASK_ID" --status=active 2>/dev/null
-TASK_STATUS=$("$WV" show "$TASK_ID" --json 2>/dev/null | jq -r '.[0].status')
+TASK_STATUS=$("$WV" show "$TASK_ID" --json 2>/dev/null | jq -r '.status')
 assert_equals "active" "$TASK_STATUS" "lifecycle: node claimed successfully"
 
 # 3. Pre-action gate allows edit (active node exists)
@@ -917,7 +929,7 @@ fi
 
 # 7. Complete the node
 "$WV" done "$TASK_ID" 2>/dev/null
-TASK_STATUS=$("$WV" show "$TASK_ID" --json 2>/dev/null | jq -r '.[0].status')
+TASK_STATUS=$("$WV" show "$TASK_ID" --json 2>/dev/null | jq -r '.status')
 assert_equals "done" "$TASK_STATUS" "lifecycle: node completed"
 
 # 8. Commit so stop-check passes

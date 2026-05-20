@@ -1814,6 +1814,8 @@ cmd_doctor() {
         if [ -f "$pre_commit" ]; then
             if [ -f "$pre_commit_src" ] && cmp -s "$pre_commit_src" "$pre_commit" 2>/dev/null; then
                 _doctor_record "pre-commit hook" "pass" "Weave hook installed and current"
+            elif [ ! -f "$pre_commit_src" ] && grep -q "Weave pre-commit" "$pre_commit" 2>/dev/null; then
+                _doctor_record "pre-commit hook" "pass" "Weave hook installed (managed by wv init-repo)"
             elif grep -q "Weave pre-commit" "$pre_commit" 2>/dev/null; then
                 _doctor_record "pre-commit hook" "warn" "stale — install -m 755 scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
             else
@@ -1828,6 +1830,8 @@ cmd_doctor() {
         if [ -f "$prepare_hook" ]; then
             if [ -f "$prepare_hook_src" ] && cmp -s "$prepare_hook_src" "$prepare_hook" 2>/dev/null; then
                 _doctor_record "prepare-commit-msg hook" "pass" "Weave trailer hook installed and current"
+            elif [ ! -f "$prepare_hook_src" ] && grep -q "Weave: append Weave-ID trailers" "$prepare_hook" 2>/dev/null; then
+                _doctor_record "prepare-commit-msg hook" "pass" "Weave trailer hook installed (managed by wv init-repo)"
             elif grep -q "Weave: append Weave-ID trailers" "$prepare_hook" 2>/dev/null; then
                 _doctor_record "prepare-commit-msg hook" "warn" "stale — install -m 755 scripts/hooks/prepare-commit-msg-weave.sh .git/hooks/prepare-commit-msg"
             else
@@ -2256,15 +2260,17 @@ _health_collect_metrics() {
     _h_blocking_edges=$(db_query "SELECT COUNT(*) FROM edges WHERE type='blocks';" 2>/dev/null)
     _h_blocking_edges="${_h_blocking_edges:-0}"
 
-    # Pitfall stats
+    # Pitfall stats — only count open (non-done) nodes; done-node pitfalls are captured learnings
     _h_total_pitfalls=$(db_query "
         SELECT COUNT(*) FROM nodes
-        WHERE json_extract(metadata, '\$.pitfall') IS NOT NULL;
+        WHERE json_extract(metadata, '\$.pitfall') IS NOT NULL
+        AND status != 'done';
     ")
     _h_addressed_pitfalls=$(db_query "
         SELECT COUNT(DISTINCT n.id) FROM nodes n
         JOIN edges e ON e.target = n.id
         WHERE json_extract(n.metadata, '\$.pitfall') IS NOT NULL
+        AND n.status != 'done'
         AND e.type IN ('addresses', 'implements', 'supersedes');
     ")
     _h_unaddressed_pitfalls=$((_h_total_pitfalls - _h_addressed_pitfalls))
@@ -2285,16 +2291,18 @@ _health_collect_metrics() {
     ")
     _h_intentional_standalone_ids="${_h_intentional_standalone_ids:-[]}"
 
-    # Orphan nodes (no edges at all, excluding intentional standalones)
+    # Orphan nodes (no edges at all, excluding intentional standalones and done nodes)
     _h_orphan_nodes=$(db_query "
         SELECT COUNT(*) FROM nodes n
         WHERE COALESCE(json_extract(n.metadata, '\$.standalone'), 0) != 1
+        AND n.status != 'done'
         AND n.id NOT IN (SELECT source FROM edges)
         AND n.id NOT IN (SELECT target FROM edges);
     ")
     _h_orphan_ids=$(db_query "
         SELECT json_group_array(n.id) FROM nodes n
         WHERE COALESCE(json_extract(n.metadata, '\$.standalone'), 0) != 1
+        AND n.status != 'done'
         AND n.id NOT IN (SELECT source FROM edges)
         AND n.id NOT IN (SELECT target FROM edges);
     ")

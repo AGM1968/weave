@@ -323,7 +323,7 @@ test_add() {
     id=$(echo "$output" | tail -1)
     show_output=$("$WV" show "$id" --json 2>&1)
     local standalone_meta
-    standalone_meta=$(echo "$show_output" | jq -r '.[0].metadata | fromjson | .standalone' 2>/dev/null)
+    standalone_meta=$(echo "$show_output" | jq -r '.metadata | fromjson | .standalone' 2>/dev/null)
     assert_equals "true" "$standalone_meta" "add --standalone stores standalone intent"
 
     # Add fails without text
@@ -337,7 +337,7 @@ test_add() {
     local risk_id risk_meta
     for level in none low medium high critical; do
         risk_id=$("$WV" add "risks=$level" --risks="$level" 2>&1 | tail -1)
-        risk_meta=$("$WV" show "$risk_id" --json | jq -r '.[0].metadata')
+        risk_meta=$("$WV" show "$risk_id" --json | jq -r '.metadata')
         assert_contains "$risk_meta" "\"risk_level\":\"$level\"" "--risks=$level sets risk_level"
         assert_contains "$risk_meta" '"risks":[]' "--risks=$level seeds empty risks list"
     done
@@ -391,19 +391,33 @@ test_done() {
     WV_REQUIRE_LEARNING=1 "$WV" done "$id" --skip-verification >/dev/null 2>&1 || sv_exit=$?
     assert_equals "0" "$sv_exit" "done accepts --skip-verification"
 
-    # Finding nodes require structured finding metadata before close
+    # Finding nodes: only violation_type (enum) required; rest optional
     local finding_id finding_output
     finding_id=$("$WV" add "Finding needing schema" --metadata='{"type":"finding"}' 2>&1 | tail -1)
-    assert_fails "done rejects incomplete finding metadata" \
+    assert_fails "done rejects finding with no violation_type" \
         env WV_REQUIRE_LEARNING=1 "$WV" done "$finding_id" --skip-verification
 
-    "$WV" update "$finding_id" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end","root_cause":"bootstrap omitted active-node type","proposed_fix":"record active_node_type in session_start metadata","confidence":0.92,"fixable":"yes"}}' >/dev/null 2>&1
-    assert_fails "done rejects invalid finding metadata types" \
+    # Invalid enum value rejected
+    "$WV" update "$finding_id" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end"}}' >/dev/null 2>&1
+    assert_fails "done rejects finding with free-text violation_type" \
         env WV_REQUIRE_LEARNING=1 "$WV" done "$finding_id" --skip-verification
 
-    "$WV" update "$finding_id" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end","root_cause":"bootstrap omitted active-node type","proposed_fix":"record active_node_type in session_start metadata","confidence":"high","fixable":true}}' >/dev/null 2>&1
+    # Minimal shape (violation_type only) accepted
+    "$WV" update "$finding_id" --metadata='{"type":"finding","finding":{"violation_type":"repo:hygiene"}}' >/dev/null 2>&1
     finding_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$finding_id" --skip-verification 2>&1)
-    assert_contains "$finding_output" "Closed" "done accepts complete finding metadata"
+    assert_contains "$finding_output" "Closed" "done accepts finding with only violation_type (minimal shape)"
+
+    # Full shape still accepted
+    local finding_full_id finding_full_output
+    finding_full_id=$("$WV" add "Finding full schema" --metadata='{"type":"finding","finding":{"violation_type":"test:gap","root_cause":"missing coverage","proposed_fix":"add test","confidence":"high","fixable":true}}' 2>&1 | tail -1)
+    finding_full_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$finding_full_id" --skip-verification 2>&1)
+    assert_contains "$finding_full_output" "Closed" "done accepts finding with full 5-field schema (backward compat)"
+
+    # Optional fields present but invalid are still rejected
+    local finding_bad_id
+    finding_bad_id=$("$WV" add "Finding bad optional" --metadata='{"type":"finding","finding":{"violation_type":"repo:regression","confidence":0.92,"fixable":"yes"}}' 2>&1 | tail -1)
+    assert_fails "done rejects finding with invalid optional field types" \
+        env WV_REQUIRE_LEARNING=1 "$WV" done "$finding_bad_id" --skip-verification
 
     # Non-interactive overlap: close proceeds and skips overlap advisory writes entirely
     local seed_id overlap_id overlap_learning overlap_exit overlap_output overlap_meta
@@ -422,7 +436,7 @@ test_done() {
     assert_contains "$overlap_meta" '"status":"done"' "node is closed despite overlap"
 
     local finding_overlap_id finding_overlap_exit finding_overlap_output finding_overlap_meta
-    finding_overlap_id=$("$WV" add "Finding overlap advisory" --metadata='{"type":"finding","verification":{"method":"test","result":"pass"},"finding":{"violation_type":"schema_enforcement_test","root_cause":"runtime wv_done wrapper validates finding metadata types and presence before allowing close","proposed_fix":"agents must set confidence as one of high|medium|low (string) and fixable as boolean before closing a finding node","confidence":"high","fixable":true}}' 2>&1 | tail -1)
+    finding_overlap_id=$("$WV" add "Finding overlap advisory" --metadata='{"type":"finding","verification":{"method":"test","result":"pass"},"finding":{"violation_type":"design:flaw","root_cause":"runtime wv_done wrapper validates finding metadata types and presence before allowing close","proposed_fix":"agents must set confidence as one of high|medium|low (string) and fixable as boolean before closing a finding node","confidence":"high","fixable":true}}' 2>&1 | tail -1)
     finding_overlap_exit=0
     finding_overlap_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$finding_overlap_id" --learning="$overlap_learning" 2>&1) || finding_overlap_exit=$?
     assert_equals "0" "$finding_overlap_exit" "done succeeds for finding nodes when overlap is advisory"
@@ -430,6 +444,30 @@ test_done() {
     finding_overlap_meta=$("$WV" show "$finding_overlap_id" --json 2>&1)
     assert_contains "$finding_overlap_meta" '"status":"done"' "finding node is closed despite overlap"
     assert_not_contains "$finding_overlap_meta" "learning_overlap_noted" "finding close also skips overlap advisory metadata in non-interactive mode"
+
+    # source_node advisory: closing a node with open findings emits advisory
+    local src_adv_id src_adv_finding src_adv_output
+    src_adv_id=$("$WV" add "Source node with finding" 2>&1 | tail -1)
+    "$WV" work "$src_adv_id" >/dev/null 2>&1
+    src_adv_finding=$("$WV" add "Finding refs source" --standalone \
+        --metadata="{\"type\":\"finding\",\"source_node\":\"$src_adv_id\",\"finding\":{\"violation_type\":\"repo:hygiene\"}}" \
+        2>&1 | tail -1)
+    src_adv_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$src_adv_id" --skip-verification 2>&1)
+    assert_contains "$src_adv_output" "Open findings referencing this node" "done: advisory fires when open findings reference source_node"
+    assert_contains "$src_adv_output" "$src_adv_finding" "done: advisory names the finding ID"
+    assert_contains "$src_adv_output" "Closed" "done: still closes despite advisory"
+
+    # No advisory when findings already closed
+    local src_clean_id src_clean_finding src_clean_output
+    src_clean_id=$("$WV" add "Source node no open findings" --standalone 2>&1 | tail -1)
+    "$WV" work "$src_clean_id" >/dev/null 2>&1
+    src_clean_finding=$("$WV" add "Closed finding refs source" --standalone \
+        --metadata="{\"type\":\"finding\",\"source_node\":\"$src_clean_id\",\"finding\":{\"violation_type\":\"repo:hygiene\"}}" \
+        2>&1 | tail -1)
+    "$WV" work "$src_clean_finding" >/dev/null 2>&1
+    WV_REQUIRE_LEARNING=1 "$WV" done "$src_clean_finding" --skip-verification >/dev/null 2>&1
+    src_clean_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$src_clean_id" --skip-verification 2>&1)
+    assert_not_contains "$src_clean_output" "Open findings" "done: no advisory when all referencing findings are closed"
 
     local ship_id ship_exit ship_output ship_meta ship_remote ship_status
     local ship_repo ship_hot old_hot old_db old_project old_pwd
@@ -526,8 +564,8 @@ test_done_stores_commit_hashes() {
 
     head_sha=$(git rev-parse HEAD)
     node_json=$("$WV" show "$id" --json 2>&1)
-    stored_commit=$(echo "$node_json" | jq -r '.[0].metadata | fromjson | .commit // empty' 2>/dev/null || echo "")
-    stored_first=$(echo "$node_json" | jq -r '.[0].metadata | fromjson | .commits[0] // empty' 2>/dev/null || echo "")
+    stored_commit=$(echo "$node_json" | jq -r '.metadata | fromjson | .commit // empty' 2>/dev/null || echo "")
+    stored_first=$(echo "$node_json" | jq -r '.metadata | fromjson | .commits[0] // empty' 2>/dev/null || echo "")
     assert_equals "$head_sha" "$stored_commit" "done stores the primary commit hash in metadata"
     assert_equals "$head_sha" "$stored_first" "done stores the commit hash array in metadata"
 }
@@ -558,9 +596,9 @@ test_done_prefers_implementation_commit_over_checkpoint() {
     assert_contains "$output" "Closed" "done succeeds when checkpoint and implementation commits are both attributed"
 
     node_json=$("$WV" show "$id" --json 2>&1)
-    stored_commit=$(echo "$node_json" | jq -r '.[0].metadata | fromjson | .commit // empty' 2>/dev/null || echo "")
-    stored_first=$(echo "$node_json" | jq -r '.[0].metadata | fromjson | .commits[0] // empty' 2>/dev/null || echo "")
-    stored_second=$(echo "$node_json" | jq -r '.[0].metadata | fromjson | .commits[1] // empty' 2>/dev/null || echo "")
+    stored_commit=$(echo "$node_json" | jq -r '.metadata | fromjson | .commit // empty' 2>/dev/null || echo "")
+    stored_first=$(echo "$node_json" | jq -r '.metadata | fromjson | .commits[0] // empty' 2>/dev/null || echo "")
+    stored_second=$(echo "$node_json" | jq -r '.metadata | fromjson | .commits[1] // empty' 2>/dev/null || echo "")
     assert_equals "$impl_sha" "$stored_commit" "done keeps the implementation commit as primary metadata"
     assert_equals "$impl_sha" "$stored_first" "done orders implementation commit first in commits metadata"
     assert_equals "$checkpoint_sha" "$stored_second" "done retains checkpoint commit as secondary attribution"
@@ -942,13 +980,13 @@ test_update_metadata_merge() {
     # Case A — node with no initial metadata: first update stores the new blob.
     id1=$("$WV" add "no initial meta" 2>&1 | tail -1)
     "$WV" update "$id1" --metadata='{"k":"v"}' >/dev/null 2>&1
-    meta=$("$WV" show "$id1" --json | jq -r '.[0].metadata')
+    meta=$("$WV" show "$id1" --json | jq -r '.metadata')
     assert_contains "$meta" '"k":"v"' "merge: empty → new key stored"
 
     # Case B — existing key preserved, new key added.
     id2=$("$WV" add "existing meta" --criteria="c1" 2>&1 | tail -1)
     "$WV" update "$id2" --metadata='{"extra":"z"}' >/dev/null 2>&1
-    meta=$("$WV" show "$id2" --json | jq -r '.[0].metadata')
+    meta=$("$WV" show "$id2" --json | jq -r '.metadata')
     assert_contains "$meta" 'done_criteria' "merge: existing key preserved"
     assert_contains "$meta" '"extra":"z"' "merge: new key added"
 
@@ -957,7 +995,7 @@ test_update_metadata_merge() {
     # done_criteria on any jq failure).
     id3=$("$WV" add "stress payload" --criteria="c1" 2>&1 | tail -1)
     "$WV" update "$id3" --metadata='{"note":"O'\''Donovan → test || foo"}' >/dev/null 2>&1
-    meta=$("$WV" show "$id3" --json | jq -r '.[0].metadata')
+    meta=$("$WV" show "$id3" --json | jq -r '.metadata')
     assert_contains "$meta" 'done_criteria' "merge: stress payload preserves existing key"
     assert_contains "$meta" "O'Donovan" "merge: apostrophe round-trips"
     assert_contains "$meta" '||' "merge: literal || survives"
@@ -965,7 +1003,7 @@ test_update_metadata_merge() {
     # Case D — invalid JSON is rejected loudly; stored metadata is unchanged.
     local id4 before after
     id4=$("$WV" add "invalid json rejected" --criteria="c1" 2>&1 | tail -1)
-    before=$("$WV" show "$id4" --json | jq -r '.[0].metadata')
+    before=$("$WV" show "$id4" --json | jq -r '.metadata')
     if "$WV" update "$id4" --metadata='{"bad": syntax}' >/dev/null 2>&1; then
         echo -e "${RED}✗${NC} invalid JSON should have been rejected"
         TESTS_FAILED=$((TESTS_FAILED + 1))
@@ -975,7 +1013,7 @@ test_update_metadata_merge() {
         TESTS_PASSED=$((TESTS_PASSED + 1))
         TESTS_RUN=$((TESTS_RUN + 1))
     fi
-    after=$("$WV" show "$id4" --json | jq -r '.[0].metadata')
+    after=$("$WV" show "$id4" --json | jq -r '.metadata')
     assert_equals "$before" "$after" "rejected update leaves metadata untouched"
 
     # Case E — immediate update-then-claim sequence (the primary Target 1
@@ -984,7 +1022,7 @@ test_update_metadata_merge() {
     local id5
     id5=$("$WV" add "claim readiness" 2>&1 | tail -1)
     "$WV" update "$id5" --metadata='{"done_criteria":"c","risks":[],"risk_level":"low"}' >/dev/null 2>&1
-    meta=$("$WV" show "$id5" --json | jq -r '.[0].metadata')
+    meta=$("$WV" show "$id5" --json | jq -r '.metadata')
     assert_contains "$meta" '"done_criteria":"c"' "update-then-claim: done_criteria visible immediately"
 
     # Case F — split-form metadata is accepted instead of falling through to
@@ -992,7 +1030,7 @@ test_update_metadata_merge() {
     local id6
     id6=$("$WV" add "split-form metadata" 2>&1 | tail -1)
     "$WV" update "$id6" --metadata '{"split":true}' >/dev/null 2>&1
-    meta=$("$WV" show "$id6" --json | jq -r '.[0].metadata')
+    meta=$("$WV" show "$id6" --json | jq -r '.metadata')
     assert_contains "$meta" '"split":true' "split-form --metadata merges JSON"
 
     # Case G — file-backed metadata avoids shell-quoting hazards for larger JSON.
@@ -1002,7 +1040,7 @@ test_update_metadata_merge() {
     printf '%s\n' '{"from_file":{"path":"ok","count":2}}' > "$meta_file"
     "$WV" update "$id7" --metadata-file "$meta_file" >/dev/null 2>&1
     rm -f "$meta_file"
-    meta=$("$WV" show "$id7" --json | jq -r '.[0].metadata')
+    meta=$("$WV" show "$id7" --json | jq -r '.metadata')
     assert_contains "$meta" '"from_file"' "--metadata-file merges JSON from file"
     assert_contains "$meta" '"count":2' "--metadata-file preserves nested values"
 
@@ -1430,6 +1468,64 @@ test_wv_index_command() {
         "re-indexing same file replaces chunks (no duplicates)"
 }
 
+test_wv_search_learning_fts() {
+    echo ""
+    echo "Test: wv search — FTS5 learning content indexing"
+    echo "================================================="
+
+    setup_test_env
+
+    # Add a node with no learning content
+    local plain_id
+    plain_id=$("$WV" add "task: implement login form" --standalone 2>/dev/null | tail -1)
+
+    # Add a node with learning content in metadata
+    local learning_id
+    learning_id=$("$WV" add "task: auth middleware refactor" --standalone 2>/dev/null | tail -1)
+    "$WV" update "$learning_id" --metadata='{"decision":"chose JWT over session cookies for stateless auth","pattern":"middleware wraps all protected routes","pitfall":"forgetting to validate expiry","learning":"stateless auth reduces db roundtrips"}' 2>/dev/null || true
+
+    # Give triggers a moment then reindex to backfill
+    "$WV" reindex 2>/dev/null || true
+
+    # Query for term that appears only in learning content (not in node text)
+    local search_out
+    search_out=$("$WV" search "stateless auth" 2>/dev/null || echo "")
+    local found_learning
+    found_learning=$(echo "$search_out" | grep -c "$learning_id" || true)
+    assert_success "wv search finds nodes via learning content" \
+        test "${found_learning:-0}" -gt 0
+
+    # Query for term in node text — still works
+    local text_out
+    text_out=$("$WV" search "login form" 2>/dev/null || echo "")
+    local found_plain
+    found_plain=$(echo "$text_out" | grep -c "$plain_id" || true)
+    assert_success "wv search still finds nodes via node text" \
+        test "${found_plain:-0}" -gt 0
+
+    # --learning filter returns only nodes with learning content
+    local learning_filter_out
+    learning_filter_out=$("$WV" search "middleware" --learning 2>/dev/null || echo "")
+    local found_learning_filter
+    found_learning_filter=$(echo "$learning_filter_out" | grep -c "$learning_id" || true)
+    assert_success "wv search --learning finds node with learning content" \
+        test "${found_learning_filter:-0}" -gt 0
+
+    # --type filter runs without error
+    local type_out
+    type_out=$("$WV" search "auth" --type=task 2>/dev/null || echo "")
+    assert_success "wv search --type=task runs without error" \
+        test -n "$type_out"
+
+    # --json output includes results from both tables
+    local json_out
+    json_out=$("$WV" search "JWT stateless" --json 2>/dev/null || echo "[]")
+    local json_count
+    json_count=$(echo "$json_out" | jq '. | length' 2>/dev/null || echo "0")
+    assert_success "wv search --json with learning term returns results" \
+        test "${json_count:-0}" -gt 0
+}
+
 test_wv_search_code() {
     echo ""
     echo "Test: wv search --code — hybrid code search via weave_search"
@@ -1779,6 +1875,7 @@ main() {
     test_trend_signal_wiring
     test_chunk_store_schema
     test_wv_index_command
+    test_wv_search_learning_fts
     test_wv_search_code
     test_preflight_policy_readiness
     test_p2_quality_refresh

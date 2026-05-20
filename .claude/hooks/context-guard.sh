@@ -177,6 +177,20 @@ if [ -t 1 ] && [ "${WV_AGENT:-0}" != "1" ]; then
         echo "reason: ${reasons[0]}"
     fi
 
+    # Stale findings advisory: findings promoted >14 days ago with no fix
+    if [ -n "$WV_DB" ] && [ -f "$WV_DB" ]; then
+        _stale_count=$(sqlite3 "$WV_DB" "
+            SELECT COUNT(*) FROM nodes
+            WHERE json_extract(metadata, '\$.type') = 'finding'
+              AND status != 'done'
+              AND json_extract(metadata, '\$.promoted_at') IS NOT NULL
+              AND CAST((julianday('now') - julianday(json_extract(metadata, '\$.promoted_at'))) AS INTEGER) >= 14;
+        " 2>/dev/null || echo 0)
+        if [ "${_stale_count:-0}" -gt 0 ]; then
+            echo -e "${YELLOW}⚠ $_stale_count finding(s) unreviewed for 14+ days — run: wv findings list --stale=14${NC}"
+        fi
+    fi
+
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 else
     # Agent/captured — compact single line

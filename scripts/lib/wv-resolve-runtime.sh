@@ -131,6 +131,7 @@ resolve_hot_zone() {
     esac
 }
 
+# shellcheck disable=SC2120  # optional positional override args; callers use env-var defaults
 resolve_repo_hot_zone() {
     if [ -n "${WV_HOT_ZONE:-}" ]; then
         echo "$WV_HOT_ZONE"
@@ -145,6 +146,10 @@ resolve_repo_hot_zone() {
     fi
     if [ -z "$repo_root" ]; then
         repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+        # Reject home dir — same boundary as wv-config.sh.
+        if [ "$repo_root" = "$HOME" ] || [ "$repo_root" = "/root" ]; then
+            repo_root=""
+        fi
     fi
 
     if [ -n "$repo_root" ] && [ "$repo_root" != "/" ]; then

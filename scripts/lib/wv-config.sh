@@ -19,7 +19,13 @@ fi
 # SCRIPT_DIR is set by entry point, fall back if sourced directly
 SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-WEAVE_DIR="${WEAVE_DIR:-$REPO_ROOT/.weave}"
+# Reject home/root as REPO_ROOT — same boundary rule as wv-resolve-project.sh.
+# git failing from ~ produces REPO_ROOT=$HOME → WEAVE_DIR=~/.weave → source_hooks_dir=~/.claude/hooks
+# (caveman plugin), causing false hook-drift warnings in wv doctor.
+if [ "$REPO_ROOT" = "$HOME" ] || [ "$REPO_ROOT" = "/root" ]; then
+    REPO_ROOT=""
+fi
+WEAVE_DIR="${WEAVE_DIR:-${REPO_ROOT:+$REPO_ROOT/.weave}}"
 
 # Side-effect-free runtime resolution helpers shared with hooks.
 source "$_WV_LIB_DIR/lib/wv-resolve-runtime.sh"

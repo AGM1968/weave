@@ -28,6 +28,14 @@ if [ -x "$WV" ]; then
     "$WV" sync --gh --mode=fast 2>/dev/null || true
 fi
 
+# Local state flush: ensure state.sql reflects current DB regardless of GH sync
+# outcome. wv sync --gh may skip nodes outside the fast-mode impacted set; a
+# plain wv sync (no --gh) force-dumps the full DB so wv load on the next session
+# (including post-reboot) does not restore stale active-node status.
+if [ -x "$WV" ]; then
+    "$WV" sync 2>/dev/null || true
+fi
+
 # Derive hot zone path (shared across checkpoint stamp + sentinel cleanup)
 _SE_REPO_HASH=$(echo "$WV_PROJECT_DIR" | md5sum | cut -c1-8)
 _SE_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_SE_REPO_HASH}}"

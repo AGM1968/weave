@@ -2,6 +2,46 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.47.0] - 2026-05-20
+
+### Added
+
+- **`wv search --learning`** — filter search results to nodes that have captured learning content
+  (decision, pattern, pitfall, or learning fields in metadata).
+- **`wv search --type=TYPE`** — filter search results by `metadata.type` (e.g. `finding`, `task`,
+  `epic`).
+- **FTS5 learning index (`nodes_learning_fts`)** — `decision`, `pattern`, `pitfall`, and `learning`
+  fields in node metadata are now indexed and searchable via `wv search`. Learning matches receive
+  2× BM25 weight relative to title matches so captured knowledge surfaces higher in results. The
+  index is populated by triggers on insert/update and backfilled at migration time for existing
+  nodes.
+- **`wv findings list --stale=N`** — filter findings promoted more than N days ago with no fix. Age
+  in days is shown inline; findings ≥14 days old are highlighted yellow.
+- **Staleness advisory in `context-guard.sh`** — session banner now warns when any finding node has
+  been unreviewed for 14+ days (`⚠ N finding(s) unreviewed for 14+ days`).
+- **`wv done` source-node advisory** — closing a node now emits a stderr advisory listing any open
+  finding nodes whose `metadata.source_node` references the closed node.
+
+### Changed
+
+- **Finding schema** — `violation_type` is now required and enum-validated (8 values:
+  `historical:defect`, `upstream:management-gap`, `upstream:logic-bug`, `upstream:schema-drift`,
+  `repo:hygiene`, `repo:regression`, `test:gap`, `design:flaw`). The other four fields
+  (`root_cause`, `proposed_fix`, `confidence`, `fixable`) are optional-when-present: omitting them
+  is valid; supplying them triggers type validation. Both `wv done` and the pre-close verification
+  hook enforce the same schema.
+- **`wv findings promote`** — promoted findings now record `metadata.promoted_at` (ISO-8601 UTC) for
+  use by staleness signals.
+
+### Fixed
+
+- **Home-dir rejection guard** — `wv-config.sh`, `wv-resolve-runtime.sh`, `wv-touched-files.sh`, and
+  `weave_quality/__main__.py` now reject `$HOME` / `/root` as `REPO_ROOT` fallbacks. Fixes false
+  hook-drift warnings on the dev machine when `wv doctor` was run outside a git repo.
+- **`build-release.sh` tilde expansion** — `OUTPUT_DIR` is now expanded via
+  `${OUTPUT_DIR/#\~/$HOME}` before use, preventing a stray `~/Projects/weave/` directory inside the
+  project root when `--output=~/…` was passed.
+
 ## [1.46.0] - 2026-05-17
 
 ### Added
@@ -9,28 +49,28 @@
 - **`wv sync --gh --mode=fast|full|repair`** — sync now has three explicit modes:
   - `fast` (default for `wv ship` and session-end): bounded to the focus node plus its parent,
     children, and blockers; skips the broad GH→Weave reconcile phases.
-  - `full` (explicit default for plain `wv sync --gh`): exhaustive bidirectional reconcile,
-    backed by a structural digest cache (`.weave/sync-digest-cache.json`) that skips body-render
-    work when neither the node nor its impacted set has changed.
+  - `full` (explicit default for plain `wv sync --gh`): exhaustive bidirectional reconcile, backed
+    by a structural digest cache (`.weave/sync-digest-cache.json`) that skips body-render work when
+    neither the node nor its impacted set has changed.
   - `repair`: resumes an interrupted sync from `.weave/repair-checkpoint.json`. The checkpoint is
-    persisted per-node so at most one node is lost on SIGINT/SIGTERM/crash. The handler prints
-    the exact resume command (`wv sync --gh --mode=repair`) to stderr before exiting.
+    persisted per-node so at most one node is lost on SIGINT/SIGTERM/crash. The handler prints the
+    exact resume command (`wv sync --gh --mode=repair`) to stderr before exiting.
 - **`wv sync --gh --node=<id>`** — focus a fast-mode sync on a specific node and its impacted set.
 - **`wv recover` and `stop-hook` surface repair-mode** — when `.weave/repair-checkpoint.json` is
-  present, both surfaces recommend `wv sync --gh --mode=repair` so the next session resumes
-  instead of restarting the reconcile.
+  present, both surfaces recommend `wv sync --gh --mode=repair` so the next session resumes instead
+  of restarting the reconcile.
 - **MCP `weave_sync` and `weave_close_session`** now expose `mode` (enum: `fast|full|repair`) and
   `weave_sync` additionally exposes `node` (focus id), forwarded to the underlying `wv sync`.
 - **`wv help sync`** — now documents `--mode=` and `--node=` with usage hints per mode.
 
 ### Changed
 
-- `wv sync` reports the active mode in its banner and final summary (`mode=<m> total=… candidates=…
-  processed=… updated=… skipped=… digest_hits=… [resumed_from=N]`).
+- `wv sync` reports the active mode in its banner and final summary
+  (`mode=<m> total=… candidates=… processed=… updated=… skipped=… digest_hits=… [resumed_from=N]`).
 - Templates and root agent docs (`templates/WORKFLOW.md`, `templates/AGENTS.md.template`,
   `templates/CLAUDE.md.template`, `templates/copilot-instructions.stub.md`, `AGENTS.md`,
-  `CLAUDE.md`, `.github/copilot-instructions.md`) document the new modes; the command-table
-  row for `wv sync` lists `--mode=fast|full|repair` and `--node=<id>`.
+  `CLAUDE.md`, `.github/copilot-instructions.md`) document the new modes; the command-table row for
+  `wv sync` lists `--mode=fast|full|repair` and `--node=<id>`.
 - MCP tool counts updated: `weave` scope ships 35 tools, `weave-inspect` scope ships 17.
 
 ### Fixed
@@ -51,10 +91,10 @@
 ### Fixed
 
 - **Persistence boundary widening**: empty hot-zone sessions in uninitialized directories no longer
-  materialize `.weave/` during `wv sync`, `session-end-sync.sh`, or Claude open/exit lifecycles.
-  The persistence boundary now stays hot-zone-only until the graph has non-session state or the
-  repo is explicitly initialized, with targeted regressions covering both direct sync and
-  installed-hook session end behavior.
+  materialize `.weave/` during `wv sync`, `session-end-sync.sh`, or Claude open/exit lifecycles. The
+  persistence boundary now stays hot-zone-only until the graph has non-session state or the repo is
+  explicitly initialized, with targeted regressions covering both direct sync and installed-hook
+  session end behavior.
 
 ## [1.45.1] - 2026-05-13
 
@@ -86,9 +126,8 @@
 - **Search and preflight diagnostics**: readiness surfaces now report actionable prerequisite state
   in-band instead of collapsing missing setup into silent empty results or generic preflight JSON.
 
-- **Visible MCP/workflow surfaces**: init, status, help, and docs were aligned with the live
-  runtime behavior so CLI, MCP, templates, and workflow guidance describe the same operational
-  surfaces.
+- **Visible MCP/workflow surfaces**: init, status, help, and docs were aligned with the live runtime
+  behavior so CLI, MCP, templates, and workflow guidance describe the same operational surfaces.
 
 ### Fixed
 
@@ -113,17 +152,18 @@
   BootstrapMode DISCOVERY vs EXECUTION — so CLI agents cooperate with the PhaseRouter.
 
 - **Single-source context policy**: `_detect_load_policy` in weave-runtime now reads
-  `.weave/.context_policy` first (written by `context-guard.sh`) before falling back to
-  heuristics, eliminating divergence between the two independent implementations.
+  `.weave/.context_policy` first (written by `context-guard.sh`) before falling back to heuristics,
+  eliminating divergence between the two independent implementations.
 
 ## [1.43.1] - 2026-05-08
 
 ### Fixed
 
 - **Help/workflow surface alignment**: corrected `wv-init-repo` → `wv init-repo` in post-install
-  summary (`install.sh`) and MCP status warning (`wv guide --topic=mcp`); added `wv bootstrap --json`
-  as step 1 in `wv guide --topic=workflow`; added `weave_bootstrap` to MCP compound-tool listing and
-  removed stale "23 total" tool count. Internal skill docs (dev-guide, plan-agent) updated to match.
+  summary (`install.sh`) and MCP status warning (`wv guide --topic=mcp`); added
+  `wv bootstrap --json` as step 1 in `wv guide --topic=workflow`; added `weave_bootstrap` to MCP
+  compound-tool listing and removed stale "23 total" tool count. Internal skill docs (dev-guide,
+  plan-agent) updated to match.
 
 ## [1.43.0] - 2026-05-08
 
@@ -139,16 +179,16 @@
 
 ### Changed
 
-- **Canonical workflow/help surfaces aligned**: templates, hooks, MCP guidance, repo docs, and
-  agent instructions now consistently present `wv init-repo` as the canonical bootstrap entrypoint,
-  while retaining `wv-init-repo` as a compatibility wrapper.
+- **Canonical workflow/help surfaces aligned**: templates, hooks, MCP guidance, repo docs, and agent
+  instructions now consistently present `wv init-repo` as the canonical bootstrap entrypoint, while
+  retaining `wv-init-repo` as a compatibility wrapper.
 
-- **MCP toolchain modernised**: MCP tests now run on Vitest, and the shipped public release
-  manifest includes `mcp/vitest.config.ts` instead of the removed Jest config.
+- **MCP toolchain modernised**: MCP tests now run on Vitest, and the shipped public release manifest
+  includes `mcp/vitest.config.ts` instead of the removed Jest config.
 
 - **Multi-developer status docs corrected**: public and internal docs now reflect that delta merge
-  (v1.24.0), CAS claim enforcement (v1.26.0), and `wv unlink` (v1.37.0) are shipped, while
-  per-field merge and contradiction tooling remain future work.
+  (v1.24.0), CAS claim enforcement (v1.26.0), and `wv unlink` (v1.37.0) are shipped, while per-field
+  merge and contradiction tooling remain future work.
 
 ### Fixed
 

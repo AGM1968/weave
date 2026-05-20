@@ -8,6 +8,11 @@ fi
 if [ -z "$WV_PROJECT_DIR" ] && [ -n "$CLAUDE_PROJECT_DIR" ]; then
   WV_PROJECT_DIR="$CLAUDE_PROJECT_DIR"
 fi
+# Safety: reject home directory as project root — it has no .git and any .weave/
+# there is a materialization bug. Hooks firing from ~ must not pollute ~/.weave/.
+if [ "$WV_PROJECT_DIR" = "$HOME" ] || [ "$WV_PROJECT_DIR" = "/root" ]; then
+  WV_PROJECT_DIR=""
+fi
 if [ -z "$WV_PROJECT_DIR" ]; then
   # Last resort: derive from hook location (.claude/hooks/ → project root)
   # Only use if that derived path has been explicitly initialised with wv-init-repo

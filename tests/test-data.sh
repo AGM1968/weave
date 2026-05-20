@@ -541,7 +541,7 @@ assert_contains "$learnings" "check for null" "roundtrip preserves learnings"
 
 # Verify status preserved
 json=$($WV show "$node3" --json 2>&1)
-status=$(echo "$json" | jq -r '.[0].status')
+status=$(echo "$json" | jq -r '.status')
 assert_equals "done" "$status" "roundtrip preserves status"
 
 echo ""

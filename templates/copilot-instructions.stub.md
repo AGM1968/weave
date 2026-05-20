@@ -1,3 +1,5 @@
+<!-- ── BEGIN WEAVE COPILOT.MD ── managed by wv init-repo, do not edit manually -->
+
 # GitHub Copilot Instructions
 
 This repository uses **Weave** for task tracking. Every code change must be tracked.
@@ -104,3 +106,4 @@ MCP equivalent: `weave_code_search` (parameters: `query`, `mode`, `limit`, `grap
 
 - MCP: `weave_guide` (topics: workflow, github, learnings, context)
 - CLI: `wv --help`, `wv help <command>`, or `~/.config/weave/WORKFLOW.md`
+<!-- ── END WEAVE COPILOT.MD ── -->

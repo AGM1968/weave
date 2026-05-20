@@ -222,6 +222,38 @@ test_breadcrumbs() {
 
     # Invalid action
     assert_fails "breadcrumbs with invalid action fails" "$WV" breadcrumbs invalid_action
+
+    # Persistence guard: breadcrumbs save must NOT create .weave/ in uninitialized dir
+    local uninitialized_dir
+    uninitialized_dir=$(mktemp -d)
+    (
+        cd "$uninitialized_dir"
+        git init -q
+        git config user.email "t@t.com"
+        git config user.name "T"
+        export WV_HOT_ZONE="$uninitialized_dir"
+        export WV_DB="$uninitialized_dir/brain.db"
+        export WEAVE_DIR="$uninitialized_dir/.weave"
+        "$WV" breadcrumbs save --message="should not persist" 2>/dev/null || true
+        # .weave/ must NOT exist — hot zone is empty and repo is uninitialized
+        if [ -d "$uninitialized_dir/.weave" ]; then
+            exit 1
+        fi
+        exit 0
+    )
+    local bc_guard_result=$?
+    rm -rf "$uninitialized_dir"
+    assert_equals "0" "$bc_guard_result" "breadcrumbs save: no .weave/ created in uninitialized repo"
+
+    # wv doctor from outside any git repo must not produce false hook-drift warning
+    # (REPO_ROOT==$HOME guard in wv-config.sh prevents WEAVE_DIR=~/.weave → source_hooks_dir=~/.claude/hooks)
+    local outside_dir
+    outside_dir=$(mktemp -d)
+    local drift_out
+    drift_out=$(cd "$outside_dir" && "$WV" doctor 2>&1 | grep "hook drift" || true)
+    rm -rf "$outside_dir"
+    assert_not_contains "$drift_out" "drifted:" "doctor from outside git repo: no false hook-drift warning"
+    assert_contains "$drift_out" "hook drift" "doctor from outside git repo: hook drift check still runs"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
