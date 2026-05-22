@@ -762,12 +762,13 @@ git -C "$TEST_DIR/project" commit -m "ahead of upstream" -q 2>/dev/null
 rm -rf "$_FAKE_REMOTE"
 
 set +e
-OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>/dev/null)
+STDERR_TMP=$(mktemp)
+OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>"$STDERR_TMP")
 EXIT_CODE=$?
+STDERR_OUT=$(cat "$STDERR_TMP"); rm -f "$STDERR_TMP"
 set -e
-assert_exit_code "1" "$EXIT_CODE" "stop-check: exits 1 (hard block) with unpushed commits"
-assert_contains "$OUTPUT" "auto-push failed" "stop-check: warns about unpushed commits"
-assert_contains "$OUTPUT" "block" "stop-check: decision is block"
+assert_exit_code "0" "$EXIT_CODE" "stop-check: exits 0 (soft warn) with unpushed commits"
+assert_contains "$STDERR_OUT" "unpushed" "stop-check: warns about unpushed commits on stderr"
 
 # --- session-end-sync.sh ---
 echo ""

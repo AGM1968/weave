@@ -42,18 +42,21 @@ _SE_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_SE_REPO_HASH}}"
 
 # Auto-commit .weave/ state to break drift cycle
 # (prevents stop-check blocking on dirty .weave/ from sync/prune above)
-# Always amend the most recent checkpoint if one exists in this session (within 2h).
-# This collapses all session-end state into a single checkpoint commit.
-_LAST_CP=$(git log -1 --format=%ct --grep='auto-checkpoint\|pre-compact checkpoint\|sync state' 2>/dev/null || echo 0)
-_NOW=$(date +%s)
-_ELAPSED=$((_NOW - _LAST_CP))
+# Amend only when HEAD is itself an unpushed weave-only checkpoint commit —
+# same three-guard rule as auto_checkpoint in wv-cmd-data.sh:
+#   (a) unpushed  (b) subject matches checkpoint patterns  (c) no non-.weave files
 git add .weave/ 2>/dev/null || true
 if ! git diff --cached --quiet 2>/dev/null; then
     _SE_BRANCH=$(git branch --show-current 2>/dev/null || echo "main")
     _SE_LOCAL_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
     _SE_REMOTE_HEAD=$(git rev-parse "origin/$_SE_BRANCH" 2>/dev/null || echo "none")
-    if [ "$_ELAPSED" -lt 7200 ] && [ "$_SE_LOCAL_HEAD" != "$_SE_REMOTE_HEAD" ]; then
-        # Recent checkpoint exists and hasn't been pushed — safe to amend
+    _SE_LAST_MSG=$(git log -1 --format='%s' 2>/dev/null || echo "")
+    _SE_LAST_NW=$(git diff HEAD~1 HEAD --name-only 2>/dev/null | grep -v '^\.weave/' | grep -v '^$' || true)
+    _NOW=$(date +%s)
+    if [ "$_SE_LOCAL_HEAD" != "$_SE_REMOTE_HEAD" ] \
+       && [[ "$_SE_LAST_MSG" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] \
+       && [ -z "$_SE_LAST_NW" ]; then
+        # HEAD is an unpushed weave-only checkpoint — safe to amend
         WV_AUTO_CHECKPOINT_ACTIVE=1 git commit --amend --no-edit 2>/dev/null || \
             WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): auto-checkpoint $(date +%H:%M) [skip ci]" 2>/dev/null || true
     else

@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -72,7 +73,7 @@ from weave_quality.hotspots import (
     hotspot_summary,
 )
 from weave_quality.findings import cmd_findings_promote
-from weave_quality.models import FileEntry, FunctionCC
+from weave_quality.models import CKMetrics, FileEntry, FunctionCC, GitStats
 from weave_quality.python_parser import analyze_python_file
 
 log = logging.getLogger(__name__)
@@ -242,76 +243,21 @@ def _in_scope_path(
 
 
 # ---------------------------------------------------------------------------
-# Scan command
+# Scan helpers
 # ---------------------------------------------------------------------------
 
 
-def cmd_scan(args: argparse.Namespace) -> int:  # pylint: disable=too-many-statements
-    """Execute wv quality scan."""
-    repo = _resolve_repo(args.path)
-    hot_zone = args.hot_zone
-    json_output = args.json
-
-    # Initialize DB (uses WV_HOT_ZONE env or explicit --hot-zone)
-    conn = init_db(hot_zone)
-
-    start_time = time.monotonic()
-
-    # Merge config + CLI excludes
-    cli_excludes: list[str] = getattr(args, "exclude", [])
-    config_excludes = _load_config_excludes(repo)
-    all_excludes = config_excludes + cli_excludes
-
-    # Discover files
-    all_files = _discover_files(repo, exclude_globs=all_excludes)
-
-    # Begin scan
-    head = git_head_sha(repo)
-    scan_id = begin_scan(conn, head, scanner_version=_SCANNER_VERSION)
-
-    # Detect scanner version change — force full re-scan if version differs
-    # so that carried-forward metrics are never from a different algorithm.
-    prev_for_version = previous_scan(conn)
-    version_changed = (
-        prev_for_version is not None
-        and _SCANNER_VERSION
-        and prev_for_version.scanner_version != _SCANNER_VERSION
-    )
-    if version_changed:
-        log.info(
-            "Scanner version changed (%s → %s); forcing full re-scan",
-            prev_for_version.scanner_version or "unknown",  # type: ignore[union-attr]
-            _SCANNER_VERSION,
-        )
-
-    # Determine which files need re-scanning (incremental)
-    # Single git ls-tree call replaces N per-file git_blob_sha calls
-    blob_map = batch_blob_shas(repo)
-    files_to_scan: list[str] = []
-    files_unchanged: list[str] = []
-
-    for rel_path in all_files:
-        abs_path = os.path.join(repo, rel_path)
-        # Get mtime and blob for staleness check
-        try:
-            mtime = int(os.path.getmtime(abs_path))
-        except OSError:
-            mtime = 0
-        blob = blob_map.get(rel_path, "")
-        if version_changed or file_changed(conn, rel_path, mtime, blob):
-            files_to_scan.append(rel_path)
-        else:
-            files_unchanged.append(rel_path)
-
-    # Load classification overrides once (reads .weave/quality.conf [classify])
-    classify_overrides = load_classify_overrides(repo)
-
-    # Parse changed files
+def _scan_files(
+    repo: str,
+    files_to_scan: list[str],
+    scan_id: int,
+    classify_overrides: dict[str, list[str]] | None,
+) -> tuple[list[FileEntry], list[CKMetrics], list[FunctionCC], dict[str, int]]:
+    """Analyze each file and return (entries, ck_metrics_list, fn_cc_list, lang_counts)."""
     entries: list[FileEntry] = []
-    ck_metrics_list = []
-    lang_counts: dict[str, int] = {}
-
+    ck_metrics_list: list[CKMetrics] = []
     all_fn_cc: list[FunctionCC] = []
+    lang_counts: dict[str, int] = {}
 
     for rel_path in files_to_scan:
         abs_path = os.path.join(repo, rel_path)
@@ -330,16 +276,15 @@ def cmd_scan(args: argparse.Namespace) -> int:  # pylint: disable=too-many-state
                 indent_sd=entry.indent_sd,
                 category=classify_file(rel_path, classify_overrides),
             )
-            entries.append(entry)
             if ck is not None:
                 ck.path = rel_path
                 ck.scan_id = scan_id
                 ck_metrics_list.append(ck)
-            # Remap fn_cc paths to relative
             for fc in fn_cc:
                 fc.path = rel_path
                 fc.scan_id = scan_id
             all_fn_cc.extend(fn_cc)
+            lang_counts["python"] = lang_counts.get("python", 0) + 1
         else:
             entry, fn_cc = analyze_bash_file(abs_path, scan_id)
             entry = FileEntry(
@@ -354,113 +299,183 @@ def cmd_scan(args: argparse.Namespace) -> int:  # pylint: disable=too-many-state
                 indent_sd=entry.indent_sd,
                 category=classify_file(rel_path, classify_overrides),
             )
-            entries.append(entry)
-            # Remap fn_cc paths to relative
             for fc in fn_cc:
                 fc.path = rel_path
                 fc.scan_id = scan_id
             all_fn_cc.extend(fn_cc)
+            lang_counts["bash"] = lang_counts.get("bash", 0) + 1
+        entries.append(entry)
 
-        lang = "python" if rel_path.endswith(".py") else "bash"
-        lang_counts[lang] = lang_counts.get(lang, 0) + 1
+    return entries, ck_metrics_list, all_fn_cc, lang_counts
 
-    # Save static analysis results
+
+def _carry_forward_unchanged(
+    conn: sqlite3.Connection,
+    scan_id: int,
+    prev_scan: object,
+    files_unchanged: list[str],
+    classify_overrides: dict[str, list[str]] | None,
+) -> list[FileEntry]:
+    """Carry FileEntry and file_metrics rows forward from prev_scan for unchanged files."""
+    prev_entries = get_file_entries(conn, prev_scan.id)  # type: ignore[attr-defined]
+    prev_by_path = {e.path: e for e in prev_entries}
+    carried: list[FileEntry] = []
+
+    for rel_path in files_unchanged:
+        prev_e = prev_by_path.get(rel_path)
+        if not prev_e:
+            continue
+        carried.append(
+            FileEntry(
+                path=prev_e.path,
+                scan_id=scan_id,
+                language=prev_e.language,
+                loc=prev_e.loc,
+                complexity=prev_e.complexity,
+                functions=prev_e.functions,
+                max_nesting=prev_e.max_nesting,
+                avg_fn_len=prev_e.avg_fn_len,
+                essential_complexity=prev_e.essential_complexity,
+                indent_sd=prev_e.indent_sd,
+                category=classify_file(prev_e.path, classify_overrides),
+            )
+        )
+
+    if carried:
+        bulk_upsert_file_entries(conn, carried)
+        carried_paths = [c.path for c in carried]
+        for rel_path in carried_paths:
+            fm_rows = conn.execute(
+                "SELECT path, metric, value, detail FROM file_metrics"
+                " WHERE scan_id = ? AND path = ?",
+                (prev_scan.id, rel_path),  # type: ignore[attr-defined]
+            ).fetchall()
+            for row in fm_rows:
+                conn.execute(
+                    "INSERT OR IGNORE INTO file_metrics"
+                    " (path, scan_id, metric, value, detail)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (row[0], scan_id, row[1], row[2], row[3]),
+                )
+
+    return carried
+
+
+def _print_scan_result(
+    lang_counts: dict[str, int],
+    files_to_scan: list[str],
+    duration_ms: int,
+    summary: dict[str, object],
+) -> None:
+    """Print human-readable scan summary to stderr."""
+    for lang, count in sorted(lang_counts.items()):
+        changed = sum(
+            1
+            for f in files_to_scan
+            if (f.endswith(".py") and lang == "python")
+            or (not f.endswith(".py") and lang == "bash")
+        )
+        print(
+            f"  {lang.title()}: {count} files ({changed} changed since last scan)",
+            file=sys.stderr,
+        )
+    print(f"  Duration: {duration_ms / 1000:.1f}s", file=sys.stderr)
+    print(
+        f"  Hotspots: {summary.get('hotspot_count', 0)} files above threshold",
+        file=sys.stderr,
+    )
+    print(f"\nQuality score: {summary.get('quality_score', 100)}/100", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Scan command
+# ---------------------------------------------------------------------------
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    """Execute wv quality scan."""
+    repo = _resolve_repo(args.path)
+    conn = init_db(args.hot_zone)
+    start_time = time.monotonic()
+
+    cli_excludes: list[str] = getattr(args, "exclude", [])
+    all_files = _discover_files(repo, exclude_globs=_load_config_excludes(repo) + cli_excludes)
+
+    head = git_head_sha(repo)
+    scan_id = begin_scan(conn, head, scanner_version=_SCANNER_VERSION)
+
+    prev_for_version = previous_scan(conn)
+    version_changed = (
+        prev_for_version is not None
+        and _SCANNER_VERSION
+        and prev_for_version.scanner_version != _SCANNER_VERSION
+    )
+    if version_changed:
+        log.info(
+            "Scanner version changed (%s → %s); forcing full re-scan",
+            prev_for_version.scanner_version or "unknown",  # type: ignore[union-attr]
+            _SCANNER_VERSION,
+        )
+
+    blob_map = batch_blob_shas(repo)
+    files_to_scan: list[str] = []
+    files_unchanged: list[str] = []
+    for rel_path in all_files:
+        abs_path = os.path.join(repo, rel_path)
+        try:
+            mtime = int(os.path.getmtime(abs_path))
+        except OSError:
+            mtime = 0
+        if version_changed or file_changed(conn, rel_path, mtime, blob_map.get(rel_path, "")):
+            files_to_scan.append(rel_path)
+        else:
+            files_unchanged.append(rel_path)
+
+    classify_overrides = load_classify_overrides(repo)
+    entries, ck_metrics_list, all_fn_cc, lang_counts = _scan_files(
+        repo, files_to_scan, scan_id, classify_overrides
+    )
+
     bulk_upsert_file_entries(conn, entries)
     for ck in ck_metrics_list:
         upsert_ck_metrics(conn, ck)
     if all_fn_cc:
         bulk_upsert_function_cc(conn, all_fn_cc)
 
-    # Carry forward unchanged file entries from previous scan
     prev = previous_scan(conn)
     if prev is not None and files_unchanged:
-        prev_entries = get_file_entries(conn, prev.id)
-        prev_by_path = {e.path: e for e in prev_entries}
-        carried: list[FileEntry] = []
-        for rel_path in files_unchanged:
-            prev_e = prev_by_path.get(rel_path)
-            if prev_e:
-                carried.append(
-                    FileEntry(
-                        path=prev_e.path,
-                        scan_id=scan_id,
-                        language=prev_e.language,
-                        loc=prev_e.loc,
-                        complexity=prev_e.complexity,
-                        functions=prev_e.functions,
-                        max_nesting=prev_e.max_nesting,
-                        avg_fn_len=prev_e.avg_fn_len,
-                        essential_complexity=(prev_e.essential_complexity),
-                        indent_sd=prev_e.indent_sd,
-                        category=classify_file(prev_e.path, classify_overrides),
-                    )
-                )
-        if carried:
-            bulk_upsert_file_entries(conn, carried)
-            entries.extend(carried)
-            # Carry forward file_metrics (fn_cc + CK rows) for unchanged files
-            carried_paths = [c.path for c in carried]
-            for rel_path in carried_paths:
-                fm_rows = conn.execute(
-                    "SELECT path, metric, value, detail FROM file_metrics"
-                    " WHERE scan_id = ? AND path = ?",
-                    (prev.id, rel_path),
-                ).fetchall()
-                for row in fm_rows:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO file_metrics"
-                        " (path, scan_id, metric, value, detail)"
-                        " VALUES (?, ?, ?, ?, ?)",
-                        (row[0], scan_id, row[1], row[2], row[3]),
-                    )
-
-    # Record complexity trend for all entries (for trend analysis)
-    for e in entries:
-        upsert_complexity_trend(
-            conn, e.path, scan_id, e.complexity, e.essential_complexity
+        carried = _carry_forward_unchanged(
+            conn, scan_id, prev, files_unchanged, classify_overrides
         )
+        entries.extend(carried)
 
-    # Update file state for incremental tracking
+    for e in entries:
+        upsert_complexity_trend(conn, e.path, scan_id, e.complexity, e.essential_complexity)
     for rel_path in files_to_scan:
-        fs = build_file_state(repo, rel_path, blob_map=blob_map)
-        upsert_file_state(conn, fs)
+        upsert_file_state(conn, build_file_state(repo, rel_path, blob_map=blob_map))
 
-    # Git metrics (computed globally, not scan-versioned)
-    # Deduplicate paths: entries already includes carried-forward files
-    # (same paths as files_unchanged), so concatenating both would double-count
-    # hotspot penalties for unchanged production files.
+    # Deduplicate: entries already includes carry-forward paths from files_unchanged
     _all_paths = list(dict.fromkeys([e.path for e in entries] + files_unchanged))
     git_stats = enrich_all_git_stats(repo, _all_paths)
     co_changes = compute_co_changes(repo)
-
-    # Compute hotspots
-    all_scanned_entries = entries
     if git_stats:
-        compute_hotspots(all_scanned_entries, git_stats)
-
-    # Save git-derived data
+        compute_hotspots(entries, git_stats)
     bulk_upsert_git_stats(conn, git_stats)
     bulk_upsert_co_changes(conn, co_changes)
 
-    # Reload complete fn_cc for this scan — newly-analyzed + carried-forward
-    # (all_fn_cc only contains fn_cc for files analyzed this run; unchanged
-    # files had their metrics carried forward in the DB above)
+    # Reload fn_cc — includes carried-forward rows not in all_fn_cc
     all_fn_cc = get_all_function_cc(conn, scan_id)
 
-    # Finish scan
     duration_ms = int((time.monotonic() - start_time) * 1000)
     finish_scan(conn, scan_id, len(entries) + len(files_unchanged), duration_ms)
-
-    # Single commit point — entire scan is atomic
     conn.commit()
     conn.close()
 
-    # Generate summary (pass fn_cc for per-function scoring)
-    summary = hotspot_summary(all_scanned_entries, git_stats, all_fn_cc)
+    summary = hotspot_summary(entries, git_stats, all_fn_cc)
 
-    if json_output:
-        category_counts = dict(Counter(e.category for e in all_scanned_entries))
-        output = {
+    if args.json:
+        category_counts = dict(Counter(e.category for e in entries))
+        print(json.dumps({
             "scan_id": scan_id,
             "git_head": head,
             "files_scanned": len(entries) + len(files_unchanged),
@@ -470,29 +485,10 @@ def cmd_scan(args: argparse.Namespace) -> int:  # pylint: disable=too-many-state
             "duration_ms": duration_ms,
             "hotspots_above_threshold": summary.get("hotspot_count", 0),
             "quality_score": summary.get("quality_score", 100),
-        }
-        print(json.dumps(output))
+        }))
     else:
         print(f"Scanning {repo}...", file=sys.stderr)
-        for lang, count in sorted(lang_counts.items()):
-            changed = sum(
-                1
-                for f in files_to_scan
-                if (f.endswith(".py") and lang == "python")
-                or (not f.endswith(".py") and lang == "bash")
-            )
-            print(
-                f"  {lang.title()}: {count} files ({changed} changed since last scan)",
-                file=sys.stderr,
-            )
-        print(f"  Duration: {duration_ms / 1000:.1f}s", file=sys.stderr)
-        print(
-            f"  Hotspots: {summary.get('hotspot_count', 0)} files above threshold",
-            file=sys.stderr,
-        )
-        print(
-            f"\nQuality score: {summary.get('quality_score', 100)}/100", file=sys.stderr
-        )
+        _print_scan_result(lang_counts, files_to_scan, duration_ms, summary)
 
     return 0
 
@@ -750,116 +746,42 @@ def cmd_hotspots(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Diff command
+# Diff helpers
 # ---------------------------------------------------------------------------
 
 
-def cmd_diff(args: argparse.Namespace) -> int:
-    """Execute wv quality diff -- delta report vs previous scan."""
-    hot_zone = args.hot_zone
-    json_output: bool = args.json
-
-    if not db_exists(hot_zone):
-        print(_MSG_NO_DB, file=sys.stderr)
-        return 1
-
-    conn = init_db(hot_zone)
-
-    current = latest_scan(conn)
-    if current is None:
-        conn.close()
-        print(_MSG_NO_SCAN, file=sys.stderr)
-        return 1
-
-    prev = previous_scan(conn)
-    if prev is None:
-        conn.close()
-        if json_output:
-            print(
-                json.dumps(
-                    {
-                        "scan_current": current.id,
-                        "scan_previous": None,
-                        "improved": [],
-                        "degraded": [],
-                        "new_files": [],
-                        "removed_files": [],
-                        "quality_score_current": 0,
-                        "quality_score_previous": None,
-                    }
-                )
-            )
-        else:
-            print(
-                "No previous scan to diff against. "
-                "Run 'wv quality scan' again after making changes.",
-                file=sys.stderr,
-            )
-        return 0
-
-    # Get file entries for both scans
-    current_entries = get_file_entries(conn, current.id)
-    prev_entries = get_file_entries(conn, prev.id)
-    scope: str = args.scope
-
-    # Get per-function CC for scoring
-    cur_fn_cc = get_all_function_cc(conn, current.id)
-    prev_fn_cc = get_all_function_cc(conn, prev.id)
-
-    # Get git stats for quality score calculation.
-    # NOTE: git_stats is NOT scan-versioned — both scans use current git data.
-    # If churn or authorship changed between scans, the previous score is
-    # retroactively recalculated with new git data, making the delta partially
-    # a git-history artifact rather than a pure code change measure.
-    all_git_stats = get_git_stats(conn)
-
-    # Trend directions for changed files
-    trend_dirs = get_all_trend_directions(conn)
-
-    conn.close()
-
-    # Scope-filter entries for diff listing
-    scoped_cur = [e for e in current_entries if _in_scope(e, scope)]
-    scoped_prev = [e for e in prev_entries if _in_scope(e, scope)]
-
-    # Index by path
-    cur_by_path = {e.path: e for e in scoped_cur}
-    prev_by_path = {e.path: e for e in scoped_prev}
-
-    # Compute quality scores (scope filtering also done inside)
-    cur_score = compute_quality_score(
-        current_entries, all_git_stats, cur_fn_cc, scope=scope
-    )
-    prev_score = compute_quality_score(
-        prev_entries, all_git_stats, prev_fn_cc, scope=scope
-    )
-
-    # Categorize file changes
-    all_paths = sorted(set(cur_by_path.keys()) | set(prev_by_path.keys()))
+def _categorize_file_changes(
+    cur_by_path: dict[str, FileEntry],
+    prev_by_path: dict[str, FileEntry],
+    trend_dirs: dict[str, str],
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[str],
+]:
+    """Categorize file changes into improved, degraded, new_files, removed_files."""
     improved: list[dict[str, object]] = []
     degraded: list[dict[str, object]] = []
     new_files: list[dict[str, object]] = []
     removed_files: list[str] = []
 
-    for path in all_paths:
+    for path in sorted(set(cur_by_path.keys()) | set(prev_by_path.keys())):
         cur_e = cur_by_path.get(path)
         prev_e = prev_by_path.get(path)
-
         if cur_e and not prev_e:
-            new_files.append(
-                {
-                    "path": path,
-                    "complexity": cur_e.complexity,
-                    "severity": classify_complexity(cur_e.complexity),
-                }
-            )
+            new_files.append({
+                "path": path,
+                "complexity": cur_e.complexity,
+                "severity": classify_complexity(cur_e.complexity),
+            })
         elif prev_e and not cur_e:
             removed_files.append(path)
         elif cur_e and prev_e:
             delta = cur_e.complexity - prev_e.complexity
             if abs(delta) < 0.5:
-                continue  # No significant change
-            item = {
+                continue
+            item: dict[str, object] = {
                 "path": path,
                 "complexity_current": cur_e.complexity,
                 "complexity_previous": prev_e.complexity,
@@ -871,12 +793,116 @@ def cmd_diff(args: argparse.Namespace) -> int:
             else:
                 degraded.append(item)
 
-    # Sort by magnitude of change
     improved.sort(key=lambda x: x["delta"])  # type: ignore[arg-type,return-value]
     degraded.sort(key=lambda x: x["delta"], reverse=True)  # type: ignore[arg-type,return-value]
+    return improved, degraded, new_files, removed_files
 
-    if json_output:
-        output = {
+
+def _print_diff_result(
+    degraded: list[dict[str, object]],
+    improved: list[dict[str, object]],
+    new_files: list[dict[str, object]],
+    removed_files: list[str],
+    cur_score: float,
+    prev_score: float,
+    scan_current_id: int,
+    scan_prev_id: int,
+) -> None:
+    """Print human-readable diff summary to stderr."""
+    print(f"Quality delta (scan #{scan_current_id} vs #{scan_prev_id}):\n", file=sys.stderr)
+    trend_sym_map = {"deteriorating": " ↑", "refactored": " ↓"}
+
+    if degraded:
+        print("Degraded:", file=sys.stderr)
+        for item in degraded:
+            trend_sym = trend_sym_map.get(str(item.get("trend_direction", "stable")), "")
+            print(
+                f"  {item['path']}: complexity "
+                f"{item['complexity_previous']} -> {item['complexity_current']} "
+                f"(+{item['delta']}){trend_sym}",
+                file=sys.stderr,
+            )
+    if improved:
+        print("Improved:", file=sys.stderr)
+        for item in improved:
+            trend_sym = trend_sym_map.get(str(item.get("trend_direction", "stable")), "")
+            print(
+                f"  {item['path']}: complexity "
+                f"{item['complexity_previous']} -> {item['complexity_current']} "
+                f"({item['delta']}){trend_sym}",
+                file=sys.stderr,
+            )
+    if new_files:
+        print("New files:", file=sys.stderr)
+        for item in new_files:
+            print(f"  {item['path']}: complexity={item['complexity']} ({item['severity']})", file=sys.stderr)
+    if removed_files:
+        print("Removed files:", file=sys.stderr)
+        for path in removed_files:
+            print(f"  {path}", file=sys.stderr)
+    if not (degraded or improved or new_files or removed_files):
+        print("No significant changes.", file=sys.stderr)
+
+    score_delta = cur_score - prev_score
+    sign = "+" if score_delta > 0 else ""
+    print(f"\nNet quality change: {sign}{score_delta} points ({prev_score} -> {cur_score})", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Diff command
+# ---------------------------------------------------------------------------
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    """Execute wv quality diff -- delta report vs previous scan."""
+    if not db_exists(args.hot_zone):
+        print(_MSG_NO_DB, file=sys.stderr)
+        return 1
+
+    conn = init_db(args.hot_zone)
+    current = latest_scan(conn)
+    if current is None:
+        conn.close()
+        print(_MSG_NO_SCAN, file=sys.stderr)
+        return 1
+
+    prev = previous_scan(conn)
+    if prev is None:
+        conn.close()
+        if args.json:
+            print(json.dumps({
+                "scan_current": current.id, "scan_previous": None,
+                "improved": [], "degraded": [], "new_files": [], "removed_files": [],
+                "quality_score_current": 0, "quality_score_previous": None,
+            }))
+        else:
+            print(
+                "No previous scan to diff against. "
+                "Run 'wv quality scan' again after making changes.",
+                file=sys.stderr,
+            )
+        return 0
+
+    scope: str = args.scope
+    current_entries = get_file_entries(conn, current.id)
+    prev_entries = get_file_entries(conn, prev.id)
+    cur_fn_cc = get_all_function_cc(conn, current.id)
+    prev_fn_cc = get_all_function_cc(conn, prev.id)
+    all_git_stats = get_git_stats(conn)
+    trend_dirs = get_all_trend_directions(conn)
+    conn.close()
+
+    cur_by_path = {e.path: e for e in current_entries if _in_scope(e, scope)}
+    prev_by_path = {e.path: e for e in prev_entries if _in_scope(e, scope)}
+    cur_score = compute_quality_score(current_entries, all_git_stats, cur_fn_cc, scope=scope)
+    prev_score = compute_quality_score(prev_entries, all_git_stats, prev_fn_cc, scope=scope)
+
+    improved, degraded, new_files, removed_files = _categorize_file_changes(
+        cur_by_path, prev_by_path, trend_dirs
+    )
+
+    if args.json:
+        print(json.dumps({
             "scan_current": current.id,
             "scan_previous": prev.id,
             "scope": scope,
@@ -886,61 +912,11 @@ def cmd_diff(args: argparse.Namespace) -> int:
             "removed_files": removed_files,
             "quality_score_current": cur_score,
             "quality_score_previous": prev_score,
-        }
-        print(json.dumps(output))
+        }))
     else:
-        print(
-            f"Quality delta (scan #{current.id} vs #{prev.id}):\n",
-            file=sys.stderr,
-        )
-
-        if degraded:
-            print("Degraded:", file=sys.stderr)
-            for item in degraded:
-                trend = str(item.get("trend_direction", "stable"))
-                trend_sym = {"deteriorating": " ↑", "refactored": " ↓"}.get(trend, "")
-                print(
-                    f"  {item['path']}: complexity "
-                    f"{item['complexity_previous']} -> {item['complexity_current']} "
-                    f"(+{item['delta']}){trend_sym}",
-                    file=sys.stderr,
-                )
-
-        if improved:
-            print("Improved:", file=sys.stderr)
-            for item in improved:
-                trend = str(item.get("trend_direction", "stable"))
-                trend_sym = {"deteriorating": " ↑", "refactored": " ↓"}.get(trend, "")
-                print(
-                    f"  {item['path']}: complexity "
-                    f"{item['complexity_previous']} -> {item['complexity_current']} "
-                    f"({item['delta']}){trend_sym}",
-                    file=sys.stderr,
-                )
-
-        if new_files:
-            print("New files:", file=sys.stderr)
-            for item in new_files:
-                print(
-                    f"  {item['path']}: complexity={item['complexity']} "
-                    f"({item['severity']})",
-                    file=sys.stderr,
-                )
-
-        if removed_files:
-            print("Removed files:", file=sys.stderr)
-            for path in removed_files:
-                print(f"  {path}", file=sys.stderr)
-
-        if not (degraded or improved or new_files or removed_files):
-            print("No significant changes.", file=sys.stderr)
-
-        score_delta = cur_score - prev_score
-        sign = "+" if score_delta > 0 else ""
-        print(
-            f"\nNet quality change: {sign}{score_delta} points "
-            f"({prev_score} -> {cur_score})",
-            file=sys.stderr,
+        _print_diff_result(
+            degraded, improved, new_files, removed_files,
+            cur_score, prev_score, current.id, prev.id,
         )
 
     return 0
@@ -973,56 +949,114 @@ def _wv_cmd(*cmd_args: str) -> tuple[int, str]:
         return 1, "wv command not found"
 
 
+def _load_existing_findings() -> dict[str, str]:
+    """Return {quality_finding_id: node_id} for all existing promoted nodes."""
+    rc, existing_json = _wv_cmd("list", "--json", "--all")
+    findings: dict[str, str] = {}
+    if rc != 0 or not existing_json:
+        return findings
+    try:
+        for node in json.loads(existing_json):
+            meta_str = node.get("metadata", "{}")
+            meta = json.loads(meta_str) if isinstance(meta_str, str) else meta_str
+            fid = meta.get("quality_finding_id", "")
+            if fid:
+                findings[fid] = node["id"]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return findings
+
+
+def _promote_upsert(
+    existing_id: str,
+    gs: GitStats,
+    entry_by_path: dict[str, FileEntry],
+    dry_run: bool,
+) -> dict[str, object]:
+    """Upsert an existing finding node with fresh scan data. Returns updated-entry dict."""
+    entry = entry_by_path.get(gs.path)
+    cc = entry.complexity if entry else 0.0
+    severity = classify_hotspot(gs.hotspot)
+    code_ref: dict[str, object] = {
+        "path": gs.path, "hotspot": gs.hotspot, "complexity": cc,
+        "churn": gs.churn, "authors": gs.authors, "severity": severity,
+    }
+    new_text = f"Hotspot: {gs.path} (CC={cc:.0f}, churn={gs.churn})"
+    upd: dict[str, object] = {"node_id": existing_id, "text": new_text,
+                               "finding_id": _finding_id(gs.path), **code_ref}
+    if dry_run:
+        print(f"[DRY-RUN] Would update {existing_id}: {new_text}", file=sys.stderr)
+        return upd
+    new_meta = json.dumps({"quality_finding_id": _finding_id(gs.path),
+                           "code_ref": code_ref, "type": "quality-finding"})
+    _wv_cmd("update", existing_id, f"--text={new_text}", f"--metadata={new_meta}")
+    print(f'Updated {existing_id}: "{new_text}"', file=sys.stderr)
+    return upd
+
+
+def _promote_create(
+    gs: GitStats,
+    entry_by_path: dict[str, FileEntry],
+    parent: str,
+    dry_run: bool,
+) -> dict[str, object] | None:
+    """Create a new finding node. Returns promoted-entry dict, or None on failure."""
+    entry = entry_by_path.get(gs.path)
+    cc = entry.complexity if entry else 0.0
+    severity = classify_hotspot(gs.hotspot)
+    text = f"Hotspot: {gs.path} (CC={cc:.0f}, churn={gs.churn})"
+    code_ref: dict[str, object] = {
+        "path": gs.path, "hotspot": gs.hotspot, "complexity": cc,
+        "churn": gs.churn, "authors": gs.authors, "severity": severity,
+    }
+    fid = _finding_id(gs.path)
+    result: dict[str, object] = {"text": text, "finding_id": fid, **code_ref}
+    if dry_run:
+        print(f"[DRY-RUN] Would create: {text}", file=sys.stderr)
+        print(f"  -> references {parent}", file=sys.stderr)
+        return result
+    create_meta = json.dumps({"quality_finding_id": fid, "code_ref": code_ref, "type": "quality-finding"})
+    rc, out = _wv_cmd("add", text, f"--metadata={create_meta}", "--force")
+    if rc != 0:
+        print(f"Error creating node for {gs.path}: {out}", file=sys.stderr)
+        return None
+    node_id = next((w.rstrip(":") for w in out.split() if w.startswith("wv-")), "")
+    if not node_id:
+        return None
+    _wv_cmd("link", node_id, parent, "--type=references")
+    print(f'Created {node_id}: "{text}"', file=sys.stderr)
+    print(f"  -> references {parent}", file=sys.stderr)
+    return {"node_id": node_id, **result}
+
+
 def cmd_promote(args: argparse.Namespace) -> int:
     """Execute wv quality promote -- create Weave nodes from top findings."""
-    hot_zone = args.hot_zone
-    top_n: int = args.top
     parent: str = args.parent
-    json_output: bool = args.json
-    dry_run: bool = args.dry_run
-
     if not parent:
         print("Error: --parent=<node-id> is required.", file=sys.stderr)
         return 1
-
-    if not db_exists(hot_zone):
+    if not db_exists(args.hot_zone):
         print(_MSG_NO_DB, file=sys.stderr)
         return 1
 
-    conn = init_db(hot_zone)
+    conn = init_db(args.hot_zone)
     scan = latest_scan(conn)
     if scan is None:
         conn.close()
         print(_MSG_NO_SCAN, file=sys.stderr)
         return 1
 
-    ranked = top_hotspots(conn, top_n)
-    entries = get_file_entries(conn, scan.id)
-    entry_by_path = {e.path: e for e in entries}
+    ranked = top_hotspots(conn, args.top)
+    entry_by_path = {e.path: e for e in get_file_entries(conn, scan.id)}
     conn.close()
 
     if not ranked:
         print("No hotspots above threshold to promote.", file=sys.stderr)
         return 0
 
-    # Check for existing promoted nodes (idempotency / upsert)
     upsert: bool = getattr(args, "upsert", False)
-    rc, existing_json = _wv_cmd("list", "--json", "--all")
-    existing_findings: dict[str, str] = {}  # fid -> node_id
-    if rc == 0 and existing_json:
-        try:
-            for node in json.loads(existing_json):
-                meta_str = node.get("metadata", "{}")
-                if isinstance(meta_str, str):
-                    meta = json.loads(meta_str)
-                else:
-                    meta = meta_str
-                fid = meta.get("quality_finding_id", "")
-                if fid:
-                    existing_findings[fid] = node["id"]
-        except (json.JSONDecodeError, TypeError):
-            pass
-
+    dry_run: bool = args.dry_run
+    existing_findings = _load_existing_findings()
     promoted: list[dict[str, object]] = []
     updated: list[dict[str, object]] = []
     skipped = 0
@@ -1033,125 +1067,20 @@ def cmd_promote(args: argparse.Namespace) -> int:
             if not upsert:
                 skipped += 1
                 continue
-            # Upsert: update existing node with fresh scan data
-            existing_id = existing_findings[fid]
-            entry = entry_by_path.get(gs.path)
-            cc = entry.complexity if entry else 0.0
-            severity = classify_hotspot(gs.hotspot)
-            code_ref = {
-                "path": gs.path,
-                "hotspot": gs.hotspot,
-                "complexity": cc,
-                "churn": gs.churn,
-                "authors": gs.authors,
-                "severity": severity,
-            }
-            new_text = f"Hotspot: {gs.path} (CC={cc:.0f}, churn={gs.churn})"
-            new_meta = json.dumps(
-                {
-                    "quality_finding_id": fid,
-                    "code_ref": code_ref,
-                    "type": "quality-finding",
-                }
-            )
-            if dry_run:
-                print(
-                    f"[DRY-RUN] Would update {existing_id}: {new_text}", file=sys.stderr
-                )
-                upd = {
-                    "node_id": existing_id,
-                    "text": new_text,
-                    "finding_id": fid,
-                    **code_ref,
-                }
-                updated.append(upd)
-                continue
-            _wv_cmd(
-                "update", existing_id, f"--text={new_text}", f"--metadata={new_meta}"
-            )
-            print(f'Updated {existing_id}: "{new_text}"', file=sys.stderr)
-            upd = {
-                "node_id": existing_id,
-                "text": new_text,
-                "finding_id": fid,
-                **code_ref,
-            }
-            updated.append(upd)
+            updated.append(_promote_upsert(existing_findings[fid], gs, entry_by_path, dry_run))
             continue
+        result = _promote_create(gs, entry_by_path, parent, dry_run)
+        if result is not None:
+            promoted.append(result)
 
-        entry = entry_by_path.get(gs.path)
-        cc = entry.complexity if entry else 0.0
-        severity = classify_hotspot(gs.hotspot)
-        text = f"Hotspot: {gs.path} (CC={cc:.0f}, churn={gs.churn})"
-
-        code_ref = {
-            "path": gs.path,
-            "hotspot": gs.hotspot,
-            "complexity": cc,
-            "churn": gs.churn,
-            "authors": gs.authors,
-            "severity": severity,
-        }
-        metadata = {
-            "quality_finding_id": fid,
-            "code_ref": code_ref,
-            "type": "quality-finding",
-        }
-
-        if dry_run:
-            print(f"[DRY-RUN] Would create: {text}", file=sys.stderr)
-            print(f"  -> references {parent}", file=sys.stderr)
-            promoted.append({"text": text, "finding_id": fid, **code_ref})
-            continue
-
-        # Create the node via wv add (no --parent: avoids implements edge)
-        meta_json = json.dumps(metadata)
-        rc, out = _wv_cmd(
-            "add",
-            text,
-            f"--metadata={meta_json}",
-            "--force",
-        )
-        if rc != 0:
-            print(f"Error creating node for {gs.path}: {out}", file=sys.stderr)
-            continue
-
-        # Extract node ID from output (format: "wv-XXXXXX: text")
-        node_id = ""
-        for word in out.split():
-            if word.startswith("wv-"):
-                node_id = word.rstrip(":")
-                break
-
-        if node_id:
-            # Create references edge only (informational, per proposal §6)
-            _wv_cmd("link", node_id, parent, "--type=references")
-            print(f'Created {node_id}: "{text}"', file=sys.stderr)
-            print(f"  -> references {parent}", file=sys.stderr)
-            promoted.append(
-                {
-                    "node_id": node_id,
-                    "text": text,
-                    "finding_id": fid,
-                    **code_ref,
-                }
-            )
-
-    if json_output:
-        result: dict[str, object] = {
-            "promoted": promoted,
-            "skipped": skipped,
-            "parent": parent,
-        }
+    if args.json:
+        out: dict[str, object] = {"promoted": promoted, "skipped": skipped, "parent": parent}
         if updated:
-            result["updated"] = updated
-        print(json.dumps(result))
+            out["updated"] = updated
+        print(json.dumps(out))
     else:
         if updated:
-            print(
-                f"Updated {len(updated)} existing findings with fresh data.",
-                file=sys.stderr,
-            )
+            print(f"Updated {len(updated)} existing findings with fresh data.", file=sys.stderr)
         if skipped > 0:
             print(f"Skipped {skipped} already-promoted findings.", file=sys.stderr)
         if not promoted and not updated and not dry_run:

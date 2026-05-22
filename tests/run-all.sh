@@ -60,6 +60,7 @@ declare -a SUITES=(
     "test-multi-agent.sh:Multi-Agent Tests"
     "test-delta-unit.sh:Delta Unit Tests"
     "test-analyze.sh:Analyze Command Tests"
+    "test-query.sh:Query Command Tests"
 )
 
 # Results tracking

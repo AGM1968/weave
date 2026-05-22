@@ -607,6 +607,43 @@ cmd_sync() {
     fi
 }
 
+# _load_quality_config — Populate quality_exempt table from .weave/quality.conf [exempt] section.
+# Reads the [exempt] section: each non-comment, non-blank line is a path pattern.
+# Trailing '/' patterns match directory prefixes (handled in _is_quality_exempt via LIKE).
+# Also DELETEs stale file_metrics rows that match current exempt patterns.
+# Safe to call on empty/missing config — clears table and returns 0.
+_load_quality_config() {
+    local config_file="$WEAVE_DIR/quality.conf"
+
+    # Always clear and repopulate so removed exemptions take effect on next load.
+    sqlite3 "$WV_DB" "DELETE FROM quality_exempt;" 2>/dev/null || true
+
+    [ ! -f "$config_file" ] && return 0
+
+    local in_exempt=0 pattern
+    while IFS= read -r line; do
+        # Section header
+        if [[ "$line" =~ ^\[([a-z_]+)\] ]]; then
+            [[ "${BASH_REMATCH[1]}" == "exempt" ]] && in_exempt=1 || in_exempt=0
+            continue
+        fi
+        [ "$in_exempt" -eq 0 ] && continue
+        # Strip inline comments and whitespace
+        pattern="${line%%#*}"
+        pattern="${pattern// /}"
+        [ -z "$pattern" ] && continue
+        local pat_esc
+        pat_esc=$(echo "$pattern" | sed "s/'/''/g")
+        sqlite3 "$WV_DB" "INSERT OR IGNORE INTO quality_exempt(path_pattern) VALUES('$pat_esc');" 2>/dev/null || true
+        # Remove stale file_metrics entries matching this exemption
+        if [[ "$pattern" == */ ]]; then
+            sqlite3 "$WV_DB" "DELETE FROM file_metrics WHERE path LIKE '${pat_esc}%';" 2>/dev/null || true
+        else
+            sqlite3 "$WV_DB" "DELETE FROM file_metrics WHERE path = '$pat_esc';" 2>/dev/null || true
+        fi
+    done < "$config_file"
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_load — Load database from git layer
 # ═══════════════════════════════════════════════════════════════════════════
@@ -707,6 +744,11 @@ EOF
         db_migrate_alias
         # Migrate to virtual columns (Tier 1)
         db_migrate_virtual_columns
+        # Migrate quality policy tables + trigger (language-aware thresholds, exempt paths).
+        # Triggers are excluded from state.sql selective dump and must be reinstalled on load.
+        db_migrate_policy_tables
+        db_migrate_language_trigger
+        db_migrate_quality_exempt
         # Rebuild FTS index from node data (selective dump excludes FTS tables)
         db_rebuild_fts
         # Initialize delta change tracking on the freshly loaded DB (idempotent).
@@ -847,6 +889,9 @@ EOF
         wv_delta_init "$WV_DB"
         echo -e "${YELLOW}No state.sql found, initialized empty database${NC}" >&2
     fi
+
+    # Load quality exemptions from .weave/quality.toml (if present) into brain.db.
+    _load_quality_config
 
     # Save session start snapshot for activity summary
     _save_session_snapshot

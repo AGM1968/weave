@@ -64,6 +64,7 @@ source "$WV_LIB_DIR/cmd/wv-cmd-quality.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-findings.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-analyze.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-indexer.sh"
+source "$WV_LIB_DIR/cmd/wv-cmd-query.sh"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Dispatcher
@@ -177,6 +178,7 @@ _wv_dispatch() {
         # Ops commands
         bootstrap)       cmd_bootstrap "$@" ;;
         doctor)          cmd_doctor "$@" ;;
+        self-update)     cmd_self_update "$@" ;;
         recover)         cmd_recover "$@" ;;
         selftest)        cmd_selftest "$@" ;;
         mcp-status)      cmd_mcp_status "$@" ;;
@@ -191,11 +193,12 @@ _wv_dispatch() {
         guide)           cmd_guide "$@" ;;
         init-repo)       cmd_init_repo "$@" ;;
 
-        # Quality / analysis commands
+        # Quality / analysis / query commands
         quality)         cmd_quality "$@" ;;
         findings)        cmd_findings "$@" ;;
         analyze)         cmd_analyze "$@" ;;
         index)           cmd_index "$@" ;;
+        query)           cmd_query "$@" ;;
         help|--help|-h)  cmd_help "$@" ;;
         version|--version|-v) echo "wv $WV_VERSION" ;;
         

@@ -1,20 +1,15 @@
 #!/bin/bash
-# Stop hook: Two-tier session-end guard.
+# Stop hook: session-end guard.
 #
-# Tier 1 — hard block (genuine in-flight risk):
-#   Active node exists → push would snapshot partial work
-#   Push/sync failure  → can't guarantee durability
-#
-# Tier 2 — auto-push (clean close, just needs durability):
-#   Unpushed commits, no active node, no uncommitted changes →
-#   run wv sync + git push automatically; block only on failure
+# Hard block:
+#   Active node exists → genuine in-flight work
 #
 # Soft warn (does not block):
-#   Uncommitted changes → user still working, let conversation continue
-#   Unsaved weave state only → auto-checkpoint handles it
+#   Uncommitted changes, unpushed commits, unsaved weave state
 #
-# Design rationale (wv-9d556d): replaced single hard-block with two-tier
-# model to eliminate friction on clean session end.
+# No network calls — wv sync / git push run in session-end-sync or manually.
+# Auto-push was removed (wv-52bf05): wv sync --gh has no timeout, causing
+# indefinite stalls on every response when network is slow.
 
 set -e
 
@@ -112,43 +107,14 @@ EOF
     fi
 fi
 
-# Unpushed commits with clean state — auto-push rather than block
+# Unpushed commits — soft warn only, no network calls in hook
 if [ "$AHEAD" -gt 0 ]; then
-    if [ "$_SC_IN_COOLDOWN" = true ]; then
-        echo "Note: $AHEAD unpushed commit(s) (auto-push in progress — cooldown active)." >&2
-        exit 0
+    if [ "$WEAVE_DIRTY" -gt 0 ]; then
+        echo "Note: $AHEAD unpushed commit(s) + unsaved weave state. Run: /close-session (or wv sync --gh && git add .weave/ && git commit && git push)" >&2
+    else
+        echo "Note: $AHEAD unpushed commit(s). Run: git push (or /close-session)" >&2
     fi
-
-    # Attempt auto sync + push
-    _PUSH_LOG=$(mktemp)
-    _PUSH_OK=false
-    {
-        if [ "$WEAVE_DIRTY" -gt 0 ]; then
-            "${_WV:-wv}" sync --gh 2>&1 && \
-            git add .weave/ 2>&1 && \
-            git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]" 2>&1
-        fi
-        git push 2>&1
-    } > "$_PUSH_LOG" 2>&1 && _PUSH_OK=true
-
-    if [ "$_PUSH_OK" = true ]; then
-        rm -f "$_SC_LOCK" "$_PUSH_LOG" 2>/dev/null || true
-        echo "Note: auto-pushed $AHEAD commit(s) — session end clean." >&2
-        exit 0
-    fi
-
-    # Push failed — hard block with log excerpt
-    _PUSH_ERR=$(tail -5 "$_PUSH_LOG" 2>/dev/null || echo "see git push output")
-    rm -f "$_PUSH_LOG" 2>/dev/null || true
-    mkdir -p "$_SC_HOT_ZONE" 2>/dev/null || true
-    date +%s > "$_SC_LOCK" 2>/dev/null || true
-    cat << EOF
-{
-    "decision": "block",
-    "reason": "auto-push failed ($AHEAD commits). Fix and push manually. Last error: $_PUSH_ERR"
-}
-EOF
-    exit 1
+    exit 0
 fi
 
 # State is clean — clear any stale cooldown lock so the next session isn't skipped

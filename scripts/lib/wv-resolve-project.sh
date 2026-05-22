@@ -2,15 +2,15 @@
 # Resolve WV_PROJECT_DIR portably. Source this from hooks.
 # Fallback chain: $WV_PROJECT_DIR → git → $CLAUDE_PROJECT_DIR → BASH_SOURCE caller
 
-if [ -z "$WV_PROJECT_DIR" ]; then
+if [ -z "${WV_PROJECT_DIR:-}" ]; then
   WV_PROJECT_DIR=$(git rev-parse --show-toplevel 2>/dev/null) || true
 fi
-if [ -z "$WV_PROJECT_DIR" ] && [ -n "$CLAUDE_PROJECT_DIR" ]; then
+if [ -z "${WV_PROJECT_DIR:-}" ] && [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
   WV_PROJECT_DIR="$CLAUDE_PROJECT_DIR"
 fi
 # Safety: reject home directory as project root — it has no .git and any .weave/
 # there is a materialization bug. Hooks firing from ~ must not pollute ~/.weave/.
-if [ "$WV_PROJECT_DIR" = "$HOME" ] || [ "$WV_PROJECT_DIR" = "/root" ]; then
+if [ "${WV_PROJECT_DIR:-}" = "$HOME" ] || [ "${WV_PROJECT_DIR:-}" = "/root" ]; then
   WV_PROJECT_DIR=""
 fi
 if [ -z "$WV_PROJECT_DIR" ]; then

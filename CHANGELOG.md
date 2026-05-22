@@ -2,6 +2,62 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.48.0] - 2026-05-21
+
+### Added
+
+- **Quality gate on `wv done`** — closing a node now checks that no file linked to the node has a
+  function above the language-specific CC threshold: Python=25, Bash=100, TypeScript=15. The gate
+  checks per-function CC (not file-level aggregate), so only oversized individual functions block
+  the close. Exempt paths (monolithic scripts, archived code) via `.weave/quality.conf`:
+
+  ```ini
+  [exempt]
+  install.sh   # full path match
+  archive/     # directory prefix (trailing / required)
+  ```
+
+  Run `wv load` after editing the file to apply in an existing session. Full reference:
+  `wv quality help` and `scripts/weave_quality/README.md` § Quality Gate.
+
+- **`wv query` — unified predicate-based graph reader** — new command with full predicate parser
+  supporting `key=value`, `key!=value`, `key>=N`, `key IN (a,b,c)`, `HAS key` (dual-schema aware for
+  `learning`), and `MATCH "expr"` (FTS5 phrase search). Supports `--order` (recent/oldest/
+  relevance/hygiene/stale), `--limit`, `--format` (table/json/short), and `--include`
+  (learning/finding/hygiene). Phase 1 ships the backend; wrapper parity (replacing individual
+  `wv list`, `wv learnings`, `wv search` flags) is Phase 2.
+
+### Fixed
+
+- **`wv-touched-files.sh` hook exits 1 silently** — `wv-resolve-project.sh` used bare
+  `$WV_PROJECT_DIR` under `set -u` (unbound variable error), causing the PostToolUse hook to exit 1
+  with no stderr output on every file edit when `WV_PROJECT_DIR` was not already exported. Fixed by
+  using `${WV_PROJECT_DIR:-}` throughout the resolver. Also fixed `resolve_active_primary` returning
+  exit 1 when no active node exists — added explicit `return 0`. Both bugs co-introduced May 9 in
+  `b717fe97` + `169611e6`; shipped in v1.45.0–v1.47.2.
+- **`stop-check.sh` auto-push stalls every response** — Tier 2 auto-push path added in v1.41.x
+  called `wv sync --gh` (unbounded network call) with no timeout. On slow network or large graphs
+  (900+ nodes) blocked every Claude Code response. Removed entirely; push responsibility stays in
+  `session-end-sync.sh`. Added `"timeout": 15` to Stop hook entry in `settings.json`.
+- **`post-edit-lint.sh` prettier rewrites files outside repo root** — hook matched any `.json` file
+  by extension with no path guard, causing `~/.claude/settings.json` to be reformatted and fields
+  stripped (the `timeout` fix above was being erased on every edit). Added
+  `git rev-parse --show-toplevel` guard — prettier only runs within the project root.
+- **`session-end-sync.sh` amend could corrupt work commits** — the amend-within-push-boundary logic
+  introduced in v1.47.0 (`3b71ebff`) used only an elapsed-time proxy and unpushed check. Missing:
+  (a) subject-line match verifying HEAD is a checkpoint commit, (b) no-non-.weave-files guard. Could
+  amend a real work commit with `.weave/` state when a checkpoint had run within 2h and HEAD was not
+  yet pushed. Now uses identical three-guard rule as `auto_checkpoint` in `wv-cmd-data.sh`.
+
+### Refactored
+
+- **`weave_quality/__main__.py`** — `cmd_scan` (CC 37→19), `cmd_diff` (CC 33→10), `cmd_promote` (CC
+  28→17) decomposed into focused helpers to clear the repo's own py=25 quality gate. No behaviour
+  change.
+- **`weave_gh/phases.py`** — `_traverse_candidates` (CC 32→19) decomposed via
+  `_build_candidate_dedup_context` and `_find_gh_match_by_body` helpers. Removes all `# noqa: C901`
+  and `too-many-branches` suppressors.
+
 ## [1.47.2] - 2026-05-20
 
 ### Fixed
@@ -116,6 +172,12 @@
   handlers, fixing a `sed 1,/REGEX/` first-line edge case where `BEGIN` at line 1 caused the
   before-block to capture the full file and prepend on every update. Pre-marker stub upgrade now
   detects and replaces the old Weave fingerprint rather than prepending a duplicate heading.
+- **Checkpoint commit collapse** — `auto_checkpoint`, `cmd_sync`, and `pre-compact-context.sh` now
+  amend the previous commit when it is an unpushed `.weave/`-only checkpoint, reducing per-session
+  checkpoint noise from N commits to 1 per push boundary. Guard: subject matches checkpoint pattern
+  AND no non-`.weave/` files in HEAD AND HEAD not yet pushed. Note: `session-end-sync.sh` received
+  only a partial guard in this release (unpushed check only, missing subject + file-scope guards) —
+  fully corrected in v1.48.0.
 
 ## [1.46.0] - 2026-05-17
 

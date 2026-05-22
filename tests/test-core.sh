@@ -1212,18 +1212,20 @@ test_policy_trigger() {
 CREATE TABLE IF NOT EXISTS file_metrics (
     path        TEXT PRIMARY KEY,
     mccabe_max  INTEGER NOT NULL DEFAULT 0,
+    language    TEXT    NOT NULL DEFAULT '',
     gini        REAL    NOT NULL DEFAULT 0.0
 );
 SQL
 
     # --- Case 1: node with a breaching file should NOT be closeable ---
+    # mccabe_max=30 > mccabe_max_py=25 → blocks
     local breach_id
     breach_id=$("$WV" add "Node with complex file" 2>&1 | tail -1)
     "$WV" work "$breach_id" >/dev/null 2>&1
 
     # WV_REQUIRE_QUALITY=0 bypasses P2 refresh so we can seed file_metrics directly.
     sqlite3 "$WV_DB" <<SQL
-INSERT OR REPLACE INTO file_metrics(path, mccabe_max) VALUES ('src/complex.py', 20);
+INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('src/complex.py', 30, 'py');
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$breach_id', 'src/complex.py');
 SQL
 
@@ -1253,23 +1255,49 @@ except Exception as e:
 
     local breach_threshold
     breach_threshold=$(echo "$breach_out" | grep -o '"threshold":"[^"]*"' | head -1 | cut -d '"' -f4)
-    assert_equals "mccabe_max" "$breach_threshold" \
+    assert_equals "mccabe_max_py" "$breach_threshold" \
         "mccabe policy violation payload names the breached threshold"
 
-    # --- Case 2: node whose file is within threshold closes normally ---
+    # --- Case 2: node within threshold closes normally ---
     local clean_id
     clean_id=$("$WV" add "Node with clean file" 2>&1 | tail -1)
     "$WV" work "$clean_id" >/dev/null 2>&1
 
     sqlite3 "$WV_DB" <<SQL
-INSERT OR REPLACE INTO file_metrics(path, mccabe_max) VALUES ('src/simple.py', 5);
+INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('src/simple.py', 5, 'py');
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$clean_id', 'src/simple.py');
 SQL
 
     local clean_out
     clean_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$clean_id" 2>&1)
     assert_contains "$clean_out" "Closed" \
-        "done succeeds when mccabe_max is within threshold"
+        "done succeeds when per-language mccabe_max is within threshold"
+
+    # --- Case 2b: bash file with CC=80 < mccabe_max_sh=100 → allowed ---
+    local bash_id
+    bash_id=$("$WV" add "Node with complex bash file within bash threshold" 2>&1 | tail -1)
+    "$WV" work "$bash_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('scripts/run.sh', 80, 'sh');
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$bash_id', 'scripts/run.sh');
+SQL
+    local bash_ok_out
+    bash_ok_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$bash_id" 2>&1)
+    assert_contains "$bash_ok_out" "Closed" \
+        "done succeeds for bash file with CC=80 < mccabe_max_sh=100"
+
+    # --- Case 2c: bash file with CC=120 > mccabe_max_sh=100 → blocked ---
+    local bash_breach_id
+    bash_breach_id=$("$WV" add "Node with egregious bash file" 2>&1 | tail -1)
+    "$WV" work "$bash_breach_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('install.sh', 120, 'sh');
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$bash_breach_id', 'install.sh');
+SQL
+    local bash_breach_out
+    bash_breach_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$bash_breach_id" 2>&1 || true)
+    assert_contains "$bash_breach_out" "GraphPolicyViolation" \
+        "done is blocked for bash file with CC=120 > mccabe_max_sh=100"
 
     # --- Case 3: FTS search still works after trigger addition (no regression) ---
     local search_id
@@ -1290,7 +1318,7 @@ SQL
     "$WV" work "$trend_id" >/dev/null 2>&1
 
     sqlite3 "$WV_DB" <<SQL
-INSERT OR REPLACE INTO file_metrics(path, mccabe_max) VALUES ('src/trending.py', 5);
+INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('src/trending.py', 5, 'py');
 INSERT OR REPLACE INTO file_trend(path, direction) VALUES ('src/trending.py', 'deteriorating');
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$trend_id', 'src/trending.py');
 SQL
@@ -1313,6 +1341,44 @@ SQL
     trend_status=$(sqlite3 "$WV_DB" "SELECT status FROM nodes WHERE id='$trend_id';")
     assert_equals "active" "$trend_status" \
         "node remains active after trend trigger abort"
+
+    # --- Case 6: exempt path is skipped by _done_refresh_file_metrics ---
+    # Seed quality_exempt; then call _done_refresh via a real node + quality.db stub.
+    sqlite3 "$WV_DB" "INSERT OR IGNORE INTO quality_exempt(path_pattern) VALUES('install.sh');" 2>/dev/null
+    sqlite3 "$WV_DB" "INSERT OR IGNORE INTO quality_exempt(path_pattern) VALUES('archive/');" 2>/dev/null
+
+    local exempt_in_table
+    exempt_in_table=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM quality_exempt;")
+    assert_equals "2" "$exempt_in_table" \
+        "quality_exempt table populated with 2 patterns"
+
+    # File_metrics should NOT have install.sh after seeding + checking (gate skips it).
+    # We seed file_metrics with a breaching value and confirm _is_quality_exempt logic:
+    # gate won't block on exempt path even if file_metrics has a high value.
+    local exempt_id
+    exempt_id=$("$WV" add "Node touching exempt file" 2>&1 | tail -1)
+    "$WV" work "$exempt_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('install.sh', 168, 'sh');
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$exempt_id', 'install.sh');
+SQL
+    local exempt_out
+    exempt_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$exempt_id" 2>&1)
+    assert_contains "$exempt_out" "Closed" \
+        "done succeeds for exempt path (install.sh) even when file_metrics has CC=168 > sh=100"
+
+    # --- Case 7: directory prefix exemption (archive/) blocks subtree ---
+    local arch_id
+    arch_id=$("$WV" add "Node touching archived test file" 2>&1 | tail -1)
+    "$WV" work "$arch_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('archive/tests/old_test.py', 89, 'py');
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$arch_id', 'archive/tests/old_test.py');
+SQL
+    local arch_out
+    arch_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$arch_id" 2>&1)
+    assert_contains "$arch_out" "Closed" \
+        "done succeeds for file under exempt directory prefix (archive/)"
 }
 
 test_trend_signal_wiring() {
@@ -1671,7 +1737,7 @@ SQL
     # Create quality.db with schema but no scan rows.
     local quality_db="$WV_HOT_ZONE/quality.db"
     sqlite3 "$quality_db" "CREATE TABLE IF NOT EXISTS scan_meta (id INTEGER PRIMARY KEY, scanned_at TEXT, git_head TEXT, files_count INTEGER, duration_ms INTEGER, scanner_version TEXT);"
-    sqlite3 "$quality_db" "CREATE TABLE IF NOT EXISTS files (path TEXT, scan_id INTEGER, complexity REAL, PRIMARY KEY(path, scan_id));"
+    sqlite3 "$quality_db" "CREATE TABLE IF NOT EXISTS file_metrics (path TEXT NOT NULL, scan_id INTEGER NOT NULL, metric TEXT NOT NULL, value REAL, detail TEXT, PRIMARY KEY(path, scan_id, metric));"
 
     local noscan_out noscan_rc
     noscan_out=$("$WV" done "$noscan_id" 2>&1 || true)
@@ -1681,10 +1747,14 @@ SQL
     assert_equals "active" "$noscan_rc" \
         "node stays active when quality.db has no scan data"
 
-    # --- Case 3: quality.db present + mccabe within threshold → close succeeds and
-    #             file_metrics in brain.db is populated from quality.db ---
+    # --- Case 3: quality.db with fn_cc:* rows → mccabe_max = MAX per-function CC ---
     sqlite3 "$quality_db" "INSERT INTO scan_meta(id, scanned_at, git_head) VALUES(1, '2026-01-01T00:00:00', 'abc1234');"
-    sqlite3 "$quality_db" "INSERT INTO files(path, scan_id, complexity) VALUES('src/feature.py', 1, 8.0);"
+    sqlite3 "$quality_db" <<'SQL'
+INSERT INTO file_metrics(path, scan_id, metric, value) VALUES
+    ('src/feature.py', 1, 'fn_cc:parse@10', 8.0),
+    ('src/feature.py', 1, 'fn_cc:render@40', 5.0),
+    ('src/feature.py', 1, 'fn_cc:validate@70', 3.0);
+SQL
 
     local ok_id
     ok_id=$("$WV" add "Node with quality data" 2>&1 | tail -1)
@@ -1697,12 +1767,32 @@ SQL
     local ok_out
     ok_out=$("$WV" done "$ok_id" 2>&1)
     assert_contains "$ok_out" "Closed" \
-        "wv done succeeds when quality.db has scan data within threshold"
+        "wv done succeeds when per-function CC max is within threshold"
 
-    local refreshed_max
+    local refreshed_max refreshed_lang
     refreshed_max=$(sqlite3 "$WV_DB" "SELECT mccabe_max FROM file_metrics WHERE path='src/feature.py';")
+    refreshed_lang=$(sqlite3 "$WV_DB" "SELECT language FROM file_metrics WHERE path='src/feature.py';")
     assert_equals "8" "$refreshed_max" \
-        "file_metrics in brain.db populated from quality.db complexity"
+        "file_metrics in brain.db populated with MAX(fn_cc:*) per-function CC"
+    assert_equals "py" "$refreshed_lang" \
+        "file_metrics language set to 'py' for .py file"
+
+    # --- Case 4: bash file (no fn_cc:* rows) gets mccabe_max=0, language='sh' ---
+    local bash_id
+    bash_id=$("$WV" add "Node touching bash file" 2>&1 | tail -1)
+    "$WV" work "$bash_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$bash_id', 'scripts/run.sh');"
+    local bash_out
+    bash_out=$("$WV" done "$bash_id" 2>&1)
+    assert_contains "$bash_out" "Closed" \
+        "wv done succeeds for bash file with no fn_cc:* entries (mccabe_max=0)"
+    local bash_max bash_lang
+    bash_max=$(sqlite3 "$WV_DB" "SELECT mccabe_max FROM file_metrics WHERE path='scripts/run.sh';")
+    bash_lang=$(sqlite3 "$WV_DB" "SELECT language FROM file_metrics WHERE path='scripts/run.sh';")
+    assert_equals "0" "$bash_max" \
+        "bash file gets mccabe_max=0 when no fn_cc:* metrics exist"
+    assert_equals "sh" "$bash_lang" \
+        "bash file language set to 'sh'"
 }
 
 test_trend_soft_warning() {

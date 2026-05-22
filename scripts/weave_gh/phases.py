@@ -396,7 +396,46 @@ def _fast_traversal(
     )
 
 
-def _traverse_candidates(  # noqa: C901  # pylint: disable=too-many-arguments,too-many-locals,too-many-branches
+def _build_candidate_dedup_context(
+    all_nodes: list[WeaveNode],
+) -> tuple[
+    dict[int, list[WeaveNode]],
+    dict[int, list[WeaveNode]],
+    set[int],
+]:
+    """Build duplicate-detection maps and done-issue guard set from the full node list.
+
+    Returns (duplicate_groups, warn_dupes, done_gh_issues).
+    """
+    gh_to_nodes: dict[int, list[WeaveNode]] = {}
+    for node in all_nodes:
+        if node.gh_issue:
+            gh_to_nodes.setdefault(node.gh_issue, []).append(node)
+    duplicate_groups = {
+        gh: dup_nodes for gh, dup_nodes in gh_to_nodes.items() if len(dup_nodes) > 1
+    }
+    warn_dupes = {
+        gh: dup_nodes
+        for gh, dup_nodes in duplicate_groups.items()
+        if any(node.status != "done" for node in dup_nodes)
+    }
+    done_gh_issues: set[int] = {
+        n.gh_issue for n in all_nodes if n.gh_issue is not None and n.status == "done"
+    }
+    return duplicate_groups, warn_dupes, done_gh_issues
+
+
+def _find_gh_match_by_body(node_id: str, issues: list[GitHubIssue]) -> int | None:
+    """Search issues for one whose body contains the Weave ID marker for node_id."""
+    marker_bold = f"**Weave ID:** `{node_id}`"
+    marker_plain = f"**Weave ID**: `{node_id}`"
+    for issue in issues:
+        if marker_bold in issue.body or marker_plain in issue.body:
+            return issue.number
+    return None
+
+
+def _traverse_candidates(  # pylint: disable=too-many-arguments,too-many-locals
     all_nodes: list[WeaveNode],
     candidates: list[WeaveNode],
     issues: list[GitHubIssue],
@@ -416,24 +455,8 @@ def _traverse_candidates(  # noqa: C901  # pylint: disable=too-many-arguments,to
     issues_by_num: dict[int, GitHubIssue] = {i.number: i for i in issues}
     issues_by_title: dict[str, GitHubIssue] = {i.title: i for i in issues}
 
-    # Detect duplicate gh_issue mappings (multiple nodes → same GH issue).
-    # Keep the processing guard for all duplicate groups, but only warn when at
-    # least one node is still live; done-only duplicates are historical noise.
-    gh_to_nodes: dict[int, list[WeaveNode]] = {}
-    for node in all_nodes:
-        if node.gh_issue:
-            gh_to_nodes.setdefault(node.gh_issue, []).append(node)
-    duplicate_groups = {gh: dup_nodes for gh, dup_nodes in gh_to_nodes.items() if len(dup_nodes) > 1}
-    warn_dupes = {
-        gh: dup_nodes
-        for gh, dup_nodes in duplicate_groups.items()
-        if any(node.status != "done" for node in dup_nodes)
-    }
+    duplicate_groups, warn_dupes, done_gh_issues = _build_candidate_dedup_context(all_nodes)
 
-    # Build set of gh_issue numbers where ANY node is done (prevents phantom reopens)
-    done_gh_issues: set[int] = {
-        n.gh_issue for n in all_nodes if n.gh_issue is not None and n.status == "done"
-    }
     if warn_dupes:
         log.warning("⚠️  Duplicate gh_issue mappings detected (last writer wins):")
         for gh_num, dup_nodes in warn_dupes.items():
@@ -445,19 +468,12 @@ def _traverse_candidates(  # noqa: C901  # pylint: disable=too-many-arguments,to
         )
         log.warning("")
 
-    # Track which GH issues have already been processed (prevents duplicate overwrite)
     processed_gh: set[int] = set()
-
-    # Repair-mode resume: skip nodes recorded by an earlier interrupted run.
     already_processed_ids: set[str] = (
         processed_ids(checkpoint) if checkpoint is not None else set()
     )
 
     for node in candidates:
-        # Skip test nodes, no_sync nodes, and finding nodes.
-        # Findings are internal audit records — not external work items — and
-        # bulk promotion of historical learnings would otherwise flood GH
-        # issues.
         if node.is_test or node.no_sync or node.node_type == "finding":
             stats.skipped += 1
             continue
@@ -467,21 +483,11 @@ def _traverse_candidates(  # noqa: C901  # pylint: disable=too-many-arguments,to
             stats.resumed_from += 1
             continue
 
-        # Find matching GH issue
         gh_match: int | None = None
-
-        # Match by metadata.gh_issue first
         if node.gh_issue and node.gh_issue in issues_by_num:
             gh_match = node.gh_issue
-
-        # Fallback: search by Weave ID field in body (handles both format variants)
         if gh_match is None:
-            marker_bold = f"**Weave ID:** `{node.id}`"
-            marker_plain = f"**Weave ID**: `{node.id}`"
-            for issue in issues:
-                if marker_bold in issue.body or marker_plain in issue.body:
-                    gh_match = issue.number
-                    break
+            gh_match = _find_gh_match_by_body(node.id, issues)
 
         if gh_match is None:
             _handle_new_issue(

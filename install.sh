@@ -288,6 +288,12 @@ mkdir -p "$CONFIG_DIR/skills/weave"
 mkdir -p "$CONFIG_DIR/skills/zero-in"
 mkdir -p "$CONFIG_DIR/skills/plan-agent"
 
+# Record source path so wv self-update can find the dev clone later
+_WV_INSTALL_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if git -C "$_WV_INSTALL_SOURCE" rev-parse --git-dir &>/dev/null 2>&1; then
+    echo "$_WV_INSTALL_SOURCE" > "$CONFIG_DIR/source-path"
+fi
+
 # Download or copy wv CLI + config
 if [ -f "./scripts/wv" ]; then
     echo -e "${YELLOW}Installing from local source...${NC}"
@@ -317,6 +323,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/cmd/wv-cmd-findings.sh "$LIB_DIR/cmd/wv-cmd-findings.sh"
     install_file ./scripts/cmd/wv-cmd-analyze.sh "$LIB_DIR/cmd/wv-cmd-analyze.sh"
     install_file ./scripts/cmd/wv-cmd-indexer.sh "$LIB_DIR/cmd/wv-cmd-indexer.sh"
+    install_file ./scripts/cmd/wv-cmd-query.sh "$LIB_DIR/cmd/wv-cmd-query.sh"
     # Python sync package
     mkdir -p "$LIB_DIR/weave_gh"
     for pyf in ./scripts/weave_gh/*.py; do
@@ -421,6 +428,7 @@ else
     download_file "$REPO/scripts/cmd/wv-cmd-findings.sh" "$LIB_DIR/cmd/wv-cmd-findings.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-analyze.sh" "$LIB_DIR/cmd/wv-cmd-analyze.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-indexer.sh" "$LIB_DIR/cmd/wv-cmd-indexer.sh"
+    download_file "$REPO/scripts/cmd/wv-cmd-query.sh" "$LIB_DIR/cmd/wv-cmd-query.sh"
     # Python sync package (auto-discover modules from GitHub API)
     mkdir -p "$LIB_DIR/weave_gh"
     local py_modules

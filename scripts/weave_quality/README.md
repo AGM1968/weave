@@ -20,8 +20,9 @@ cyclomatic complexity, essential complexity, git-derived churn, CK metrics, and 
 7. [Performance](#performance)
 8. [Data Storage](#data-storage)
 9. [Module Guide](#module-guide)
-10. [Configuration](#configuration)
-11. [Known Limitations](#known-limitations)
+10. [Quality Gate](#quality-gate)
+11. [Configuration](#configuration)
+12. [Known Limitations](#known-limitations)
 
 ---
 
@@ -423,6 +424,46 @@ fallback produces CC and function count but no CK metrics or per-function CC.
 
 ---
 
+## Quality Gate
+
+`wv done <id>` enforces a per-function CC gate before a node can be closed. If any file linked to
+the node contains a function above the language threshold, the close is blocked until the violation
+is fixed or the path is exempted.
+
+**Per-function CC thresholds:**
+
+| Language   | Max CC | Rationale                                                         |
+| ---------- | ------ | ----------------------------------------------------------------- |
+| Python     | 25     | 2.5× McCabe's recommended limit; allows complex but bounded logic |
+| Bash       | 100    | Bash is harder to decompose; threshold blocks only extreme cases  |
+| TypeScript | 15     | 1.5× McCabe's limit; aligns with stricter TS tooling expectations |
+
+The gate checks **maximum per-function CC** per file — not file-level aggregate CC. A file with one
+oversized function is flagged; the same file with that function split into helpers is not.
+
+**Workflow when blocked:**
+
+```bash
+wv quality functions <file>    # identify which functions exceed the threshold
+# refactor, or add path to [exempt] in .weave/quality.conf
+wv quality scan                # rescan after changes
+wv done <id>                   # retry close
+```
+
+**Exempt paths** bypass the gate entirely. Add them to `.weave/quality.conf`:
+
+```ini
+[exempt]
+# Full path match or directory prefix (trailing / = prefix match).
+install.sh              # monolithic install script, not application logic
+archive/                # archived code, not active
+scripts/migrate-learnings.py  # one-off migration utility
+```
+
+Exempt entries are loaded on `wv load` and stored in the `quality_exempt` table in `brain.db`.
+
+---
+
 ## Configuration
 
 **`.weave/quality.conf`** (optional, per-repo):
@@ -438,6 +479,11 @@ build/**
 production = scripts/mylib/   # promote library code in scripts/
 test = custom_tests/          # additional test directory
 script = infra/               # additional script directory
+
+[exempt]
+# Paths exempt from the wv done quality gate. Full path or directory prefix (trailing /).
+install.sh              # monolithic entry point, not application logic
+archive/                # archived code
 ```
 
 **Environment variables** (inherited from `wv-config.sh`):

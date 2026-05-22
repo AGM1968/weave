@@ -525,6 +525,21 @@ _aggregate_epic_commits() {
 #
 # Skipped when WV_REQUIRE_QUALITY=0 (test/legacy bypass).
 # Fails loudly if node_files is non-empty and quality.db is unavailable.
+# _is_quality_exempt — returns 0 (true) if path matches any quality_exempt pattern.
+# Patterns with trailing '/' match directory prefix; others match exactly (LIKE without wildcards).
+_is_quality_exempt() {
+    local path="$1"
+    local result
+    result=$(db_query "SELECT 1 FROM quality_exempt WHERE
+        ('$( echo "$path" | sed "s/'/''/g" )' LIKE
+            CASE WHEN path_pattern LIKE '%/'
+                 THEN path_pattern || '%'
+                 ELSE path_pattern
+            END
+        ) LIMIT 1;" 2>/dev/null || echo "")
+    [ -n "$result" ]
+}
+
 _done_refresh_file_metrics() {
     local id="$1"
 
@@ -554,17 +569,26 @@ _done_refresh_file_metrics() {
         return 1
     fi
 
-    # Upsert mccabe_max from quality.db into brain.db for each tracked path
+    # Upsert mccabe_max + language from quality.db into brain.db for each tracked path.
+    # Source: MAX(fn_cc:*) per-function CC from file_metrics (Python AST / bash heuristic).
+    # language derived from extension: py/sh/ts → per-language threshold; '' → fallback.
     local path
     while IFS= read -r path; do
         [ -z "$path" ] && continue
-        local path_esc mccabe_val upsert_err upsert_rc
+        _is_quality_exempt "$path" && continue
+        local path_esc mccabe_val lang upsert_err upsert_rc
         path_esc=$(echo "$path" | sed "s/'/''/g")
+        case "$path" in
+            *.py)       lang="py" ;;
+            *.sh)       lang="sh" ;;
+            *.ts|*.tsx) lang="ts" ;;
+            *)          lang=""   ;;
+        esac
         mccabe_val=$(sqlite3 -batch -cmd ".timeout 3000" "$quality_db" \
-            "SELECT COALESCE(CAST(complexity AS INTEGER), 0) FROM files WHERE path='$path_esc' AND scan_id=$latest_scan LIMIT 1;" 2>/dev/null || echo "")
+            "SELECT COALESCE(CAST(MAX(value) AS INTEGER), 0) FROM file_metrics WHERE path='$path_esc' AND scan_id=$latest_scan AND metric LIKE 'fn_cc:%';" 2>/dev/null || echo "")
         [ -z "$mccabe_val" ] && mccabe_val=0
-        upsert_err=$(db_query "INSERT INTO file_metrics(path, mccabe_max) VALUES('$path_esc', $mccabe_val)
-            ON CONFLICT(path) DO UPDATE SET mccabe_max = excluded.mccabe_max;" 2>&1)
+        upsert_err=$(db_query "INSERT INTO file_metrics(path, mccabe_max, language) VALUES('$path_esc', $mccabe_val, '$lang')
+            ON CONFLICT(path) DO UPDATE SET mccabe_max = excluded.mccabe_max, language = excluded.language;" 2>&1)
         upsert_rc=$?
         if [ $upsert_rc -ne 0 ]; then
             echo -e "${RED}Error: failed to refresh file_metrics for '$path': $upsert_err${NC}" >&2
@@ -1134,11 +1158,15 @@ cmd_done() {
     if [ "$_done_rc" -ne 0 ]; then
         if echo "$_done_err" | grep -q "GraphPolicyViolation"; then
             local v_path v_actual v_limit v_threshold v_direction
-            v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key='mccabe_max') LIMIT 1;" 2>/dev/null || echo "")
+            local _lang_coalesce="COALESCE((SELECT value FROM policy_thresholds WHERE key='mccabe_max_'||fm.language),(SELECT value FROM policy_thresholds WHERE key='mccabe_max'))"
+            v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fm.mccabe_max > $_lang_coalesce LIMIT 1;" 2>/dev/null || echo "")
             if [ -n "$v_path" ]; then
-                v_actual=$(db_query "SELECT fm.mccabe_max FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key='mccabe_max') LIMIT 1;" 2>/dev/null || echo "0")
-                v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='mccabe_max';" 2>/dev/null || echo "15")
-                v_threshold="mccabe_max"
+                v_actual=$(db_query "SELECT fm.mccabe_max FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fm.mccabe_max > $_lang_coalesce LIMIT 1;" 2>/dev/null || echo "0")
+                local v_lang
+                v_lang=$(db_query "SELECT fm.language FROM file_metrics fm WHERE fm.path='$(sql_escape "$v_path")';" 2>/dev/null || echo "")
+                local _threshold_key="mccabe_max"; [ -n "$v_lang" ] && _threshold_key="mccabe_max_${v_lang}"
+                v_limit=$(db_query "SELECT COALESCE((SELECT value FROM policy_thresholds WHERE key='${_threshold_key}'),(SELECT value FROM policy_thresholds WHERE key='mccabe_max'));" 2>/dev/null || echo "15")
+                v_threshold="$_threshold_key"
                 echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\"}" >&2
             else
                 v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' AND (SELECT value FROM policy_thresholds WHERE key='trend_deteriorating') >= 1 LIMIT 1;" 2>/dev/null || echo "unknown")

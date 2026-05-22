@@ -66,7 +66,15 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_plan",
     "weave_edit_guard",
   ],
-  lite: ["weave_overview", "weave_bootstrap", "weave_guide", "weave_edit_guard", "weave_status", "weave_work", "weave_done"],
+  lite: [
+    "weave_overview",
+    "weave_bootstrap",
+    "weave_guide",
+    "weave_edit_guard",
+    "weave_status",
+    "weave_work",
+    "weave_done",
+  ],
   inspect: [
     "weave_context",
     "weave_search",
@@ -622,7 +630,8 @@ const TOOLS: Tool[] = [
   },
   {
     name: "weave_sync",
-    description: "Persist graph to disk and optionally sync GitHub issues. Call periodically and before session end. Use mode='fast' for routine close paths (bounded to focus + impacted set), mode='full' for exhaustive reconcile, mode='repair' to resume from .weave/repair-checkpoint.json after a timeout/interrupt (recommended by wv recover and stop-hook).",
+    description:
+      "Persist graph to disk and optionally sync GitHub issues. Call periodically and before session end. Use mode='fast' for routine close paths (bounded to focus + impacted set), mode='full' for exhaustive reconcile, mode='repair' to resume from .weave/repair-checkpoint.json after a timeout/interrupt (recommended by wv recover and stop-hook).",
     inputSchema: {
       type: "object",
       properties: {
@@ -633,7 +642,8 @@ const TOOLS: Tool[] = [
         mode: {
           type: "string",
           enum: ["fast", "full", "repair"],
-          description: "Sync mode (default: full). 'fast' bounds work to the focus node and its impacted set; 'repair' resumes from .weave/repair-checkpoint.json after an interrupted run.",
+          description:
+            "Sync mode (default: full). 'fast' bounds work to the focus node and its impacted set; 'repair' resumes from .weave/repair-checkpoint.json after an interrupted run.",
         },
         node: {
           type: "string",
@@ -689,7 +699,8 @@ const TOOLS: Tool[] = [
         mode: {
           type: "string",
           enum: ["fast", "full", "repair"],
-          description: "Sync mode (default: full). Use 'repair' to resume from .weave/repair-checkpoint.json after an interrupted run.",
+          description:
+            "Sync mode (default: full). Use 'repair' to resume from .weave/repair-checkpoint.json after an interrupted run.",
         },
       },
       required: [],
@@ -1470,7 +1481,7 @@ function handleTool(
                   '  wv add "<description>" --gh --alias=<short-name> --status=active --criteria="c1|c2" --risks=low  — Create + claim new task',
                   '  wv quick "<description>"             — Track trivial one-step work',
                   "",
-                  "Use `wv search \"<topic>\"`, `wv ready`, `wv bootstrap --json`, weave_overview, or weave_bootstrap to find available work.",
+                  'Use `wv search "<topic>"`, `wv ready`, `wv bootstrap --json`, weave_overview, or weave_bootstrap to find available work.',
                 ].join("\n"),
               },
             ],
@@ -1813,7 +1824,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.47.2",
+      version: "1.48.0",
     },
     {
       capabilities: {

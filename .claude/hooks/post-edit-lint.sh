@@ -51,13 +51,16 @@ if [[ "$FILE_PATH" =~ \.py$ ]]; then
     exit 0
 fi
 
-# Markdown and other supported files: run prettier
+# Markdown and other supported files: run prettier — only within repo root
+# Guard prevents prettier from silently rewriting files outside the project
+# (e.g. ~/.claude/settings.json) which could strip fields it doesn't recognise.
 if [[ "$FILE_PATH" =~ \.(md|json|yaml|yml|js|ts|css|html)$ ]]; then
-    if command -v prettier &> /dev/null && [ -f "$FILE_PATH" ]; then
-        # Check if file needs formatting
-        if ! prettier --check "$FILE_PATH" &> /dev/null; then
-            # Auto-format the file — silent success (no output needed)
-            prettier --write "$FILE_PATH" &> /dev/null || true
+    REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    if [ -n "$REPO_ROOT" ] && [[ "$FILE_PATH" == "$REPO_ROOT"/* ]]; then
+        if command -v prettier &> /dev/null && [ -f "$FILE_PATH" ]; then
+            if ! prettier --check "$FILE_PATH" &> /dev/null; then
+                prettier --write "$FILE_PATH" &> /dev/null || true
+            fi
         fi
     fi
     exit 0

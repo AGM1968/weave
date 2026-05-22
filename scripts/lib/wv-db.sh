@@ -132,9 +132,11 @@ CREATE INDEX IF NOT EXISTS idx_node_files_node ON node_files(node_id);
 -- file_metrics: per-file quality metrics, flat schema (populated by wv done in P2).
 -- Stub is always present so the policy trigger can be compiled; starts empty.
 -- Populated by wv done querying quality.db (weave_quality/db.py) before the UPDATE.
+-- language: file extension ('py', 'sh', 'ts', '') — drives per-language threshold lookup.
 CREATE TABLE IF NOT EXISTS file_metrics (
     path       TEXT PRIMARY KEY,
-    mccabe_max INTEGER NOT NULL DEFAULT 0
+    mccabe_max INTEGER NOT NULL DEFAULT 0,
+    language   TEXT    NOT NULL DEFAULT ''
 );
 
 -- policy_thresholds: configurable quality gates consulted by the done trigger
@@ -143,9 +145,20 @@ CREATE TABLE IF NOT EXISTS policy_thresholds (
     value REAL NOT NULL
 );
 
-INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max', 15);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max',    15);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_py', 25);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_sh', 100);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_ts', 15);
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('gini_max', 0.85);
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('trend_deteriorating', 0);
+
+-- quality_exempt: path patterns excluded from quality gate enforcement.
+-- Patterns use SQLite LIKE syntax; trailing '/' matches directory prefix (appended as '%').
+-- Populated by wv load from .weave/quality.conf [exempt] section.
+CREATE TABLE IF NOT EXISTS quality_exempt (
+    path_pattern TEXT PRIMARY KEY,
+    reason       TEXT NOT NULL DEFAULT ''
+);
 
 -- file_trend: per-file trend direction, refreshed by wv done from quality.db.
 -- Values: 'deteriorating' | 'stable' | 'refactored'. Consumed by wv-67a870 soft
@@ -203,6 +216,7 @@ END;
 -- Fires BEFORE the UPDATE so the FTS AFTER UPDATE trigger never sees a
 -- violating state. RAISE(ABORT, ...) requires a string literal — structured
 -- JSON payload is built by cmd_done after catch.
+-- quality_exempt patterns (trailing '/' = directory prefix) are excluded from the gate.
 CREATE TRIGGER IF NOT EXISTS nodes_policy_check
 BEFORE UPDATE OF status ON nodes
 WHEN NEW.status = 'done' AND OLD.status = 'active'
@@ -212,7 +226,18 @@ BEGIN
                         SELECT 1 FROM node_files nf
                         JOIN file_metrics fm ON fm.path = nf.path
                         WHERE nf.node_id = NEW.id
-                            AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
+                            AND fm.mccabe_max > COALESCE(
+                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
+                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM quality_exempt qe
+                                WHERE nf.path LIKE
+                                    CASE WHEN qe.path_pattern LIKE '%/'
+                                         THEN qe.path_pattern || '%'
+                                         ELSE qe.path_pattern
+                                    END
+                            )
                 ) THEN RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded')
                 WHEN EXISTS (
                         SELECT 1 FROM node_files nf
@@ -220,6 +245,14 @@ BEGIN
                         WHERE nf.node_id = NEW.id
                             AND ft.direction = 'deteriorating'
                             AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
+                            AND NOT EXISTS (
+                                SELECT 1 FROM quality_exempt qe
+                                WHERE nf.path LIKE
+                                    CASE WHEN qe.path_pattern LIKE '%/'
+                                         THEN qe.path_pattern || '%'
+                                         ELSE qe.path_pattern
+                                    END
+                            )
                 ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
         END;
 END;
@@ -452,13 +485,17 @@ CREATE TABLE IF NOT EXISTS policy_thresholds (
     value REAL NOT NULL
 );
 
-INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max', 15);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max',    15);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_py', 25);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_sh', 100);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_ts', 15);
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('gini_max', 0.85);
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('trend_deteriorating', 0);
 
 CREATE TABLE IF NOT EXISTS file_metrics (
     path       TEXT PRIMARY KEY,
-    mccabe_max INTEGER NOT NULL DEFAULT 0
+    mccabe_max INTEGER NOT NULL DEFAULT 0,
+    language   TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS file_trend (
@@ -475,7 +512,10 @@ BEGIN
                         SELECT 1 FROM node_files nf
                         JOIN file_metrics fm ON fm.path = nf.path
                         WHERE nf.node_id = NEW.id
-                            AND fm.mccabe_max > (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
+                            AND fm.mccabe_max > COALESCE(
+                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
+                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
+                            )
                 ) THEN RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded')
                 WHEN EXISTS (
                         SELECT 1 FROM node_files nf
@@ -483,6 +523,101 @@ BEGIN
                         WHERE nf.node_id = NEW.id
                             AND ft.direction = 'deteriorating'
                             AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
+                ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
+        END;
+END;
+
+MIGRATE
+    # Add language column to existing DBs — fails silently on new DBs (already in schema).
+    sqlite3 "$WV_DB" "ALTER TABLE file_metrics ADD COLUMN language TEXT NOT NULL DEFAULT '';" 2>/dev/null || true
+}
+
+# Migrate policy trigger to language-aware COALESCE threshold lookup.
+# DROP + CREATE is required — CREATE TRIGGER IF NOT EXISTS does not replace
+# existing triggers, so existing DBs loaded before this code landed keep the
+# old single-threshold version until this migration runs.
+# Also seeds per-language threshold rows (INSERT OR IGNORE — idempotent).
+db_migrate_language_trigger() {
+    sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_py', 25);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_sh', 100);
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_ts', 15);
+
+DROP TRIGGER IF EXISTS nodes_policy_check;
+
+CREATE TRIGGER nodes_policy_check
+BEFORE UPDATE OF status ON nodes
+WHEN NEW.status = 'done' AND OLD.status = 'active'
+BEGIN
+        SELECT CASE
+                WHEN EXISTS (
+                        SELECT 1 FROM node_files nf
+                        JOIN file_metrics fm ON fm.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND fm.mccabe_max > COALESCE(
+                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
+                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
+                            )
+                ) THEN RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded')
+                WHEN EXISTS (
+                        SELECT 1 FROM node_files nf
+                        JOIN file_trend ft ON ft.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND ft.direction = 'deteriorating'
+                            AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
+                ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
+        END;
+END;
+MIGRATE
+}
+
+# Migrate to add quality_exempt table and update nodes_policy_check trigger to
+# respect exempt path patterns. DROP + CREATE required — IF NOT EXISTS does not replace.
+db_migrate_quality_exempt() {
+    sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
+CREATE TABLE IF NOT EXISTS quality_exempt (
+    path_pattern TEXT PRIMARY KEY,
+    reason       TEXT NOT NULL DEFAULT ''
+);
+
+DROP TRIGGER IF EXISTS nodes_policy_check;
+
+CREATE TRIGGER nodes_policy_check
+BEFORE UPDATE OF status ON nodes
+WHEN NEW.status = 'done' AND OLD.status = 'active'
+BEGIN
+        SELECT CASE
+                WHEN EXISTS (
+                        SELECT 1 FROM node_files nf
+                        JOIN file_metrics fm ON fm.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND fm.mccabe_max > COALESCE(
+                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
+                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM quality_exempt qe
+                                WHERE nf.path LIKE
+                                    CASE WHEN qe.path_pattern LIKE '%/'
+                                         THEN qe.path_pattern || '%'
+                                         ELSE qe.path_pattern
+                                    END
+                            )
+                ) THEN RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded')
+                WHEN EXISTS (
+                        SELECT 1 FROM node_files nf
+                        JOIN file_trend ft ON ft.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND ft.direction = 'deteriorating'
+                            AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
+                            AND NOT EXISTS (
+                                SELECT 1 FROM quality_exempt qe
+                                WHERE nf.path LIKE
+                                    CASE WHEN qe.path_pattern LIKE '%/'
+                                         THEN qe.path_pattern || '%'
+                                         ELSE qe.path_pattern
+                                    END
+                            )
                 ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
         END;
 END;
@@ -653,6 +788,8 @@ db_ensure() {
 
     db_migrate_edge_type_enum
     db_migrate_policy_tables
+    db_migrate_language_trigger
+    db_migrate_quality_exempt
     db_migrate_chunks
     db_migrate_fts5_learning
     db_migrate_finding_promoted_at

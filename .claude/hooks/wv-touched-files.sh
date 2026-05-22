@@ -57,7 +57,7 @@ RING_CAP="${WV_TOUCHED_RING_CAP:-20}"
 _TF_DB="${WV_DB:-$(resolve_db "$_TF_HOT_ZONE")}"
 [ ! -f "$_TF_DB" ] && exit 0
 
-ACTIVE_ID=$(resolve_active_primary "$_TF_DB" "$_TF_HOT_ZONE")
+ACTIVE_ID=$(resolve_active_primary "$_TF_DB" "$_TF_HOT_ZONE") || true
 [ -z "$ACTIVE_ID" ] && exit 0
 
 CUR_META=$(sqlite3 "$_TF_DB" "SELECT COALESCE(metadata, '{}') FROM nodes WHERE id='$ACTIVE_ID';" 2>/dev/null)

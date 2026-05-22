@@ -26,11 +26,23 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
 
     # Get node details
     HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # Anchor project resolution to the session cwd — prevents hot zone race when
+    # the hook subshell's cwd doesn't match the project dir.
+    _PAYLOAD_CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || echo "")
+    if [[ -n "$_PAYLOAD_CWD" ]] && [[ -d "$_PAYLOAD_CWD" ]]; then
+        export CLAUDE_PROJECT_DIR="$_PAYLOAD_CWD"
+        cd "$_PAYLOAD_CWD" 2>/dev/null || true
+    fi
     source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
     if [ -x "$WV" ]; then
         NODE_TEXT=$("$WV" show "$NODE_ID" 2>/dev/null | grep "Text:" | sed 's/^[^:]*: //' || echo "")
         NODE_META=$("$WV" show "$NODE_ID" --json 2>/dev/null | jq -r '.metadata // "{}"' 2>/dev/null || echo "{}")
         NODE_TYPE=$(echo "$NODE_META" | jq -r '.type // "unknown"' 2>/dev/null || echo "unknown")
+        # Node not in local DB (e.g. command targets a remote machine via SSH) — allow passthrough.
+        NODE_EXISTS=$("$WV" show "$NODE_ID" --json 2>/dev/null | jq -r '.id // empty' 2>/dev/null || echo "")
+        if [[ -z "$NODE_EXISTS" ]]; then
+            exit 0
+        fi
         IS_TRIVIAL=false
         if [[ "$NODE_TYPE" == "breadcrumbs" ]] || [[ "$NODE_TEXT" =~ ^Test ]]; then
             IS_TRIVIAL=true

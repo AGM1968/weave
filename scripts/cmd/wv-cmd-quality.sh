@@ -72,6 +72,20 @@ Options:
   --top=N        Limit results (hotspots, promote)
   --exclude=G    Exclude files matching glob (scan, repeatable)
   --parent=<id>  Parent node ID for promote (required)
+
+Quality gate (enforced on wv done):
+  wv done blocks if a file linked to the node has a function above the
+  language CC threshold: Python=25, Bash=100, TypeScript=15.
+
+  To identify violations:    wv quality functions <file>
+  To rescan after a fix:     wv quality scan   (commit first — uses git blob SHAs)
+  To exempt a path, add to .weave/quality.conf:
+    [exempt]
+    install.sh       # full path
+    archive/         # directory prefix (trailing / required)
+  Then run: wv load
+
+  Full reference: scripts/weave_quality/README.md § Quality Gate
 EOF
             return 0
             ;;

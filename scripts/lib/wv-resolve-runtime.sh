@@ -57,7 +57,7 @@ resolve_env_override_hot_zone() {
 
 resolve_hot_zone_owner_file() {
     local hot_zone="$1"
-    [ -n "$hot_zone" ] && echo "${hot_zone}/.repo_root"
+    [ -n "$hot_zone" ] && echo "${hot_zone}/.repo_root" || true
 }
 
 read_hot_zone_owner() {
@@ -276,6 +276,7 @@ resolve_active_primary() {
 
     fallback_id=$(sqlite3 "$db_path" "SELECT id FROM nodes WHERE status='active' ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null || echo "")
     [ -n "$fallback_id" ] && echo "$fallback_id"
+    return 0
 }
 
 is_attribution_tool() {

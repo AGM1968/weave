@@ -23,41 +23,42 @@ create a node first.
 
 ## Commands
 
-| Command                   | What it does                                                           | Key flags                                                                  |
-| ------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `wv ready`                | List unblocked work                                                    | `--json`, `--count`                                                        |
-| `wv work <id>`            | Claim node (sets active)                                               |                                                                            |
-| `wv add "<text>"`         | Create node                                                            | `--gh`, `--status=`, `--parent=`, `--alias=`, `--standalone`               |
-| `wv done <id>`            | Complete node (auto-closes linked GH issue)                            | `--learning="..."`, `--no-overlap-check`                                   |
-| `wv ship <id>`            | Done + sync in one step; pending Git sync is surfaced separately       | `--learning="..."`, `--gh`, `--no-overlap-check`                           |
-| `wv update <id>`          | Modify node                                                            | `--status=`, `--text=`, `--alias=`, `--metadata=`, `--metadata-file=`, `--echo` |
-| `wv overview`             | Compact graph/session snapshot                                         | `--json`                                                                   |
-| `wv help <command>`       | Focused help for one command                                           | Also available as `wv <command> --help`                                     |
-| `wv bootstrap`            | Session-start composite: status + active + context + ready + learnings | `--json` (run-cached, 45s TTL)                                             |
-| `wv touch`                | Fire-and-forget intent write (zero stdout)                             | `--intent="TEXT"`                                                          |
-| `wv quick "<text>"`       | Track trivial work (create active → commit → done)                     | `--learning="..."`                                                         |
-| `wv show <id>`            | Node details + blockers                                                | `--json`                                                                   |
-| `wv list`                 | All non-done nodes                                                     | `--all`, `--status=`, `--json`                                             |
-| `wv block <id> --by=<id>` | Add dependency edge                                                    | `--context='{...}'`                                                        |
-| `wv tree`                 | Epic → feature → task hierarchy                                        | `--active`, `--depth=N`, `--mermaid`                                       |
-| `wv path <id>`            | Ancestry chain                                                         | `--format=chain`                                                           |
-| `wv plan <file>`          | Import markdown as epic + tasks                                        | `--sprint=N`, `--gh`, `--dry-run`                                          |
-| `wv context <id> --json`  | Context pack (blockers, ancestors, pitfalls)                           | Cached per session                                                         |
-| `wv search <query>`       | Full-text search across graph nodes                                    | `--json`, `--status=`                                                      |
-| `wv index [path]`         | Index code files into brain.db for hybrid search                       | `--ext=`, `--no-embed`, `--json`                                           |
-| `wv search --code <query>`| Hybrid code search (BM25 + cosine RRF) over indexed chunks             | `--mode=hybrid\|fts\|vector`, `--graph`, `--json`                          |
-| `wv status`               | Compact status (active/ready/blocked counts)                           |                                                                            |
-| `wv learnings`            | Show captured decisions/patterns/pitfalls                              | `--category=`, `--grep=`, `--dedup`                                        |
-| `wv link <from> <to>`     | Create semantic edge                                                   | `--type=`, `--context='{...}'`                                             |
-| `wv health`               | System health check with score                                         | `--json`, `--verbose`, `--fix`                                             |
-| `wv sync`                 | Dump to `.weave/state.sql`                                             | `--gh` for GH sync, `--mode=fast\|full\|repair`, `--node=<id>`, `--dry-run` |
-| `wv load`                 | Restore from `.weave/state.sql`                                        | Run by session start hook                                                  |
-| `wv prune`                | Archive done nodes >48h                                                | `--age=`, `--orphans-only`, `--dry-run`                                    |
-| `wv quality scan`         | Scan repo for complexity + churn                                       | `--exclude=`, `--json`                                                     |
-| `wv quality hotspots`     | Ranked hotspot report                                                  | `--top=N`, `--json`                                                        |
-| `wv findings <sub>`       | Historical finding promotion/list workflow                             | `list`, `promote`                                                          |
+| Command                    | What it does                                                           | Key flags                                                                       |
+| -------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `wv ready`                 | List unblocked work                                                    | `--json`, `--count`                                                             |
+| `wv work <id>`             | Claim node (sets active)                                               |                                                                                 |
+| `wv add "<text>"`          | Create node                                                            | `--gh`, `--status=`, `--parent=`, `--alias=`, `--standalone`                    |
+| `wv done <id>`             | Complete node (auto-closes linked GH issue)                            | `--learning="..."`, `--no-overlap-check`                                        |
+| `wv ship <id>`             | Done + sync in one step; pending Git sync is surfaced separately       | `--learning="..."`, `--gh`, `--no-overlap-check`                                |
+| `wv update <id>`           | Modify node                                                            | `--status=`, `--text=`, `--alias=`, `--metadata=`, `--metadata-file=`, `--echo` |
+| `wv overview`              | Compact graph/session snapshot                                         | `--json`                                                                        |
+| `wv help <command>`        | Focused help for one command                                           | Also available as `wv <command> --help`                                         |
+| `wv bootstrap`             | Session-start composite: status + active + context + ready + learnings | `--json` (run-cached, 45s TTL)                                                  |
+| `wv touch`                 | Fire-and-forget intent write (zero stdout)                             | `--intent="TEXT"`                                                               |
+| `wv quick "<text>"`        | Track trivial work (create active → commit → done)                     | `--learning="..."`                                                              |
+| `wv show <id>`             | Node details + blockers                                                | `--json`                                                                        |
+| `wv list`                  | All non-done nodes                                                     | `--all`, `--status=`, `--json`                                                  |
+| `wv block <id> --by=<id>`  | Add dependency edge                                                    | `--context='{...}'`                                                             |
+| `wv tree`                  | Epic → feature → task hierarchy                                        | `--active`, `--depth=N`, `--mermaid`                                            |
+| `wv path <id>`             | Ancestry chain                                                         | `--format=chain`                                                                |
+| `wv plan <file>`           | Import markdown as epic + tasks                                        | `--sprint=N`, `--gh`, `--dry-run`                                               |
+| `wv context <id> --json`   | Context pack (blockers, ancestors, pitfalls)                           | Cached per session                                                              |
+| `wv search <query>`        | Full-text search across graph nodes                                    | `--json`, `--status=`                                                           |
+| `wv index [path]`          | Index code files into brain.db for hybrid search                       | `--ext=`, `--no-embed`, `--json`                                                |
+| `wv search --code <query>` | Hybrid code search (BM25 + cosine RRF) over indexed chunks             | `--mode=hybrid\|fts\|vector`, `--graph`, `--json`                               |
+| `wv status`                | Compact status (active/ready/blocked counts)                           |                                                                                 |
+| `wv learnings`             | Show captured decisions/patterns/pitfalls                              | `--category=`, `--grep=`, `--dedup`                                             |
+| `wv link <from> <to>`      | Create semantic edge                                                   | `--type=`, `--context='{...}'`                                                  |
+| `wv health`                | System health check with score                                         | `--json`, `--verbose`, `--fix`                                                  |
+| `wv sync`                  | Dump to `.weave/state.sql`                                             | `--gh` for GH sync, `--mode=fast\|full\|repair`, `--node=<id>`, `--dry-run`     |
+| `wv load`                  | Restore from `.weave/state.sql`                                        | Run by session start hook                                                       |
+| `wv prune`                 | Archive done nodes >48h                                                | `--age=`, `--orphans-only`, `--dry-run`                                         |
+| `wv quality scan`          | Scan repo for complexity + churn                                       | `--exclude=`, `--json`                                                          |
+| `wv quality hotspots`      | Ranked hotspot report                                                  | `--top=N`, `--json`                                                             |
+| `wv findings <sub>`        | Historical finding promotion/list workflow                             | `list`, `promote`                                                               |
 
-`--standalone` persists `metadata.standalone=true`. `wv health` excludes intentional standalones from `orphan_nodes` and reports them separately as `intentional_standalones`.
+`--standalone` persists `metadata.standalone=true`. `wv health` excludes intentional standalones
+from `orphan_nodes` and reports them separately as `intentional_standalones`.
 
 ## Node Statuses
 
@@ -139,10 +140,10 @@ Always use `--gh` when work should be visible in GitHub. `wv done` auto-closes l
 
 `wv sync --gh` accepts a mode flag that controls scope and recovery behaviour:
 
-| Mode     | When                                                                 | Behaviour                                                           |
-| -------- | -------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| `fast`   | Default for `wv ship` and `session-end-sync.sh`                      | Bounded to focus node + parent + children + blockers; skips Phase 2/3 |
-| `full`   | Manual exhaustive reconcile; suspected drift; bulk import            | Walks every node and issue (slowest, most thorough)                 |
+| Mode     | When                                                                 | Behaviour                                                                                                             |
+| -------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `fast`   | Default for `wv ship` and `session-end-sync.sh`                      | Bounded to focus node + parent + children + blockers; skips Phase 2/3                                                 |
+| `full`   | Manual exhaustive reconcile; suspected drift; bulk import            | Walks every node and issue (slowest, most thorough)                                                                   |
 | `repair` | After a timeout/Ctrl-C/crash mid-sync — `wv recover` recommends this | Same scope as `full` but resumes from `.weave/repair-checkpoint.json`; SIGINT/SIGTERM print the resume hint to stderr |
 
 The checkpoint is removed on clean completion. To reset it manually:
@@ -193,10 +194,10 @@ close-time friction), turn it into tracked remediation immediately:
 
 ## Rules
 
-1. **Track ALL work** — `wv work <id>` or `wv add "<text>" --status=active --criteria="c1|c2" --risks=low`
-  before editing files. Use `--gh` for GitHub-linked work. Use `--parent=<epic-id>` for sub-tasks
-  — this is **mandatory**, not optional (see Epic Decomposition). Never edit without an active
-  node.
+1. **Track ALL work** — `wv work <id>` or
+   `wv add "<text>" --status=active --criteria="c1|c2" --risks=low` before editing files. Use `--gh`
+   for GitHub-linked work. Use `--parent=<epic-id>` for sub-tasks — this is **mandatory**, not
+   optional (see Epic Decomposition). Never edit without an active node.
 2. **No untracked fixes** — even one-line changes get a node. Use `wv quick "<what>"` for trivial
    work.
 3. **GitHub workflow** — create with `--gh`, close with `wv done` (auto-closes issue). Check
@@ -376,18 +377,23 @@ wv prune --orphans-only          # archive done nodes with no edges (ignores age
 
 1. Garbage/test fixtures → `wv delete <id>`
 2. Real work without a parent → `wv link <id> <epic> --type=implements`
-3. Legitimate standalones (releases, chores) → create them with `--standalone`, or annotate retained history with `wv update <id> --metadata='{"standalone":true}'`; `wv health` reports these as `intentional_standalones`, not `orphan_nodes`
-4. Archive intentional standalones only when you actually want them removed from the live graph → `wv prune --orphans-only`
+3. Legitimate standalones (releases, chores) → create them with `--standalone`, or annotate retained
+   history with `wv update <id> --metadata='{"standalone":true}'`; `wv health` reports these as
+   `intentional_standalones`, not `orphan_nodes`
+4. Archive intentional standalones only when you actually want them removed from the live graph →
+   `wv prune --orphans-only`
 
 ## Session End Behavior
 
-The stop hook enforces git hygiene with two severity levels:
+The stop hook has one hard block; everything else soft-warns:
 
-- **Uncommitted changes** → soft warning (does not block). You may still be working.
-- **Unpushed commits** → hard block. You committed but forgot to push — run `git push`.
+- **Active node open** → hard block. Close with `wv done <id> --learning="..."` first.
+- **Uncommitted changes** → soft warning, does not block.
+- **Unpushed commits / dirty .weave/** → soft warning. Run `git push` or `/close-session`.
 
-The `/close-session` skill handles the full protocol (sync, commit, push). Only invoke it when
-you're actually done — the soft warning is not a signal to stop working.
+No network calls in the hook (wv sync / git push belong in `/close-session`, not stop hook). The
+`/close-session` skill handles the full protocol (sync, commit, push). Only invoke it when you're
+actually done — a soft warning is not a signal to stop working.
 
 ## Skills
 
@@ -413,8 +419,10 @@ Instructions here. Agents that support .claude/skills/ discover this automatical
 EOF
 ```
 
-- **Skills** are auto-discovered from `.claude/skills/` by supporting agents (Claude Code, etc.) — no registration needed
-- **Agents without skill support** (e.g. VS Code Copilot) use MCP tools or `copilot-instructions.md` instead
+- **Skills** are auto-discovered from `.claude/skills/` by supporting agents (Claude Code, etc.) —
+  no registration needed
+- **Agents without skill support** (e.g. VS Code Copilot) use MCP tools or `copilot-instructions.md`
+  instead
 - Local skills are committed to git and shared with your team
 - `wv init-repo --update` preserves user-created skills (only updates Weave-shipped ones)
 

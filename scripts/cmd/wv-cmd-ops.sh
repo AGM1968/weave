@@ -1879,6 +1879,33 @@ cmd_doctor() {
         fi
     fi
 
+    # 20. Installed lib vs source drift (only when installed from a local git clone)
+    local _source_path_file="$HOME/.config/weave/source-path"
+    if [ -f "$_source_path_file" ]; then
+        local _src_root; _src_root=$(cat "$_source_path_file" 2>/dev/null || echo "")
+        if [ -n "$_src_root" ] && [ -d "$_src_root/scripts/cmd" ]; then
+            local _lib_dir="$HOME/.local/lib/weave"
+            local _drifted_lib=0
+            for src_file in "$_src_root/scripts/cmd/"*.sh "$_src_root/scripts/lib/"*.sh "$_src_root/scripts/wv"; do
+                [ -f "$src_file" ] || continue
+                local rel; rel="${src_file#"$_src_root/scripts/"}"
+                local installed_file; installed_file="$_lib_dir/$rel"
+                # wv main entry point is installed to bin/, not lib/
+                [ "$rel" = "wv" ] && installed_file="$HOME/.local/bin/wv"
+                if [ ! -f "$installed_file" ]; then
+                    _drifted_lib=$((_drifted_lib + 1))
+                elif [ "$(md5sum "$src_file" 2>/dev/null | awk '{print $1}')" != "$(md5sum "$installed_file" 2>/dev/null | awk '{print $1}')" ]; then
+                    _drifted_lib=$((_drifted_lib + 1))
+                fi
+            done
+            if [ "$_drifted_lib" -eq 0 ]; then
+                _doctor_record "install drift" "pass" "source and installed lib match"
+            else
+                _doctor_record "install drift" "warn" "$_drifted_lib file(s) differ — run: wv self-update"
+            fi
+        fi
+    fi
+
     # Summary
     if [ "$_dr_format" = "json" ]; then
         local overall="pass"
@@ -3470,6 +3497,9 @@ cmd_help_topic() {
         index)
             cmd_index --help
             ;;
+        query)
+            cmd_query --help
+            ;;
         init-repo)
             cmd_init_repo --help
             ;;
@@ -3590,6 +3620,9 @@ cmd_help_topic() {
         doctor)
             print_command_help "wv doctor [--json]" "Run installation and surface-contract diagnostics for the CLI, hooks, and repo wiring."
             ;;
+        self-update)
+            print_command_help "wv self-update" "Refresh installed wv from the dev clone recorded at install time. Equivalent to re-running install.sh from the source directory."
+            ;;
         selftest)
             print_command_help "wv selftest [--json]" "Run a round-trip smoke test in an isolated environment."
             ;;
@@ -3695,6 +3728,7 @@ Commands:
   audit-pitfalls    Show all pitfalls with resolution status
   edge-types        List valid semantic edge types
   init-repo         Bootstrap repo for Weave [--agent=claude|copilot|all] [--update] [--force]
+  self-update       Refresh installed wv from the dev clone recorded at install time
   doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]
   selftest          Round-trip smoke test in isolated environment [--json]
     mcp-status        Verify MCP server is built and IDE config shape is current [--json]
@@ -3708,6 +3742,7 @@ Commands:
   quality <sub>     Code quality scanner (scan, hotspots, diff, promote, reset)
   findings <sub>    Historical finding promotion (list, promote)
   analyze <sub>     Analyze agent session traces and instrumentation data
+  query [pred...]   Predicate-based graph reader (status=, HAS, MATCH, IN)
   batch [file]      Execute multiple wv commands from file or stdin [--dry-run] [--stop-on-error]
   sync              Persist to git layer (.weave/) [--gh GH sync] [--dry-run]
   load              Load from git layer
@@ -3806,6 +3841,35 @@ cmd_init_repo() {
         "$init_repo_bin" "$@"
     else
         echo -e "${RED}✗${NC} wv-init-repo not found. Run install.sh first." >&2
+        return 1
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_self_update — Refresh installed wv from the dev clone
+# Reads source path written by install.sh to ~/.config/weave/source-path.
+# Falls back to wv-update for release-binary users (no local clone).
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_self_update() {
+    local source_path_file="$HOME/.config/weave/source-path"
+    local wv_update_bin
+    wv_update_bin=$(command -v wv-update 2>/dev/null || echo "$HOME/.local/bin/wv-update")
+
+    if [ -f "$source_path_file" ]; then
+        local src_root; src_root=$(cat "$source_path_file" 2>/dev/null || echo "")
+        if [ -n "$src_root" ] && [ -f "$src_root/install.sh" ] && \
+           git -C "$src_root" rev-parse --git-dir &>/dev/null 2>&1; then
+            echo "Updating Weave from $src_root..."
+            cd "$src_root" && bash install.sh "$@"
+            return $?
+        fi
+    fi
+
+    # Fallback: use the standalone wv-update binary
+    if [ -x "$wv_update_bin" ]; then
+        "$wv_update_bin" "$@"
+    else
+        echo -e "${RED}✗${NC} No install source found. Re-run install.sh from the dev clone." >&2
         return 1
     fi
 }
