@@ -351,20 +351,35 @@ def vector_search(
     if q_norm == 0:
         return []
 
-    scored: list[SearchResult] = []
-    for chunk_id, file, ls, le, content, blob in rows:
-        n = len(blob) // 4
-        if n != dim:
-            continue
-        emb = np.frombuffer(blob, dtype=np.float32)
-        e_norm = float(np.linalg.norm(emb))
-        if e_norm == 0:
-            continue
-        score = float(np.dot(q_vec, emb) / (q_norm * e_norm))
-        scored.append(SearchResult(chunk_id, file, ls, le, content, score, "vector"))
+    valid = [r for r in rows if len(r[5]) // 4 == dim]
+    if not valid:
+        return []
 
-    scored.sort(key=lambda r: r.score, reverse=True)
-    return scored[:limit]
+    matrix = np.stack([np.frombuffer(r[5], dtype=np.float32) for r in valid])  # (N, dim)
+    e_norms = np.linalg.norm(matrix, axis=1)  # (N,)
+    nonzero = e_norms > 0
+    if not np.any(nonzero):
+        return []
+
+    valid_rows = [r for r, ok in zip(valid, nonzero) if ok]
+    scores = (matrix[nonzero] @ q_vec) / (e_norms[nonzero] * q_norm)  # (M,)
+
+    k = min(limit, len(valid_rows))
+    if k == 0:
+        return []
+    if k < len(valid_rows):
+        top = np.argpartition(scores, -k)[-k:]
+        order = top[np.argsort(scores[top])[::-1]]
+    else:
+        order = np.argsort(scores)[::-1]
+
+    return [
+        SearchResult(
+            valid_rows[i][0], valid_rows[i][1], valid_rows[i][2],
+            valid_rows[i][3], valid_rows[i][4], float(scores[i]), "vector",
+        )
+        for i in order
+    ]
 
 
 def hybrid_search(

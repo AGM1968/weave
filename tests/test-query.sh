@@ -291,6 +291,7 @@ assert_contains "$out" "Predicates:" "wv help query delegates to --help"
 
 echo ""
 echo -e "${YELLOW}=== Results ===${NC}"
+echo "Results: $TESTS_PASSED/$TESTS_RUN passed"
 echo -e "Tests: $TESTS_RUN | Passed: ${GREEN}$TESTS_PASSED${NC} | Failed: ${RED}$TESTS_FAILED${NC}"
 
 if [ "$TESTS_FAILED" -eq 0 ]; then

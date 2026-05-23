@@ -85,7 +85,7 @@ cat > .gitattributes << 'GITATTR'
 GITATTR
 git -c user.email=test@test.com -c user.name=test add .gitattributes
 git -c user.email=test@test.com -c user.name=test commit -m "init" -q --no-verify
-git push -q origin master
+git push -q origin HEAD
 cd "$TEST_DIR"
 rm -rf "$_INIT_DIR"
 

@@ -794,31 +794,69 @@ db_ensure() {
     db_migrate_fts5_learning
     db_migrate_finding_promoted_at
 
-    # Check DB size once per invocation — auto-prune if over limit
-    # WV_DISABLE_AUTOPRUNE=1 skips this (used during sync to prevent mid-sync data loss)
+    # Check DB size once per process-tree — export so pipe subshells inherit the flag.
+    # Destructive prune requires explicit opt-in: WV_AUTO_PRUNE=1.
+    # WV_DISABLE_AUTOPRUNE=1 kept for backward compat (sync uses it).
     if [ -z "${_WV_SIZE_CHECKED:-}" ] && [ -f "$WV_DB" ] && [ -z "${WV_DISABLE_AUTOPRUNE:-}" ]; then
-        _WV_SIZE_CHECKED=1
+        export _WV_SIZE_CHECKED=1
         local db_size
         db_size=$(stat -c%s "$WV_DB" 2>/dev/null || stat -f%z "$WV_DB" 2>/dev/null || echo 0)
         if [ "$db_size" -gt "$WV_MAX_DB_SIZE" ] 2>/dev/null; then
-            echo "wv: database is $(( db_size / 1048576 ))MB (limit $(( WV_MAX_DB_SIZE / 1048576 ))MB), auto-pruning..." >&2
-            # Inline aggressive prune — archive done nodes >24h
-            local archive_dir="$WEAVE_DIR/archive"
-            mkdir -p "$archive_dir"
-            sqlite3 -json "$WV_DB" "SELECT * FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours')" 2>/dev/null \
-                | jq -c '.[]' >> "$archive_dir/$(date +%Y-%m-%d).jsonl" 2>/dev/null || true
-            sqlite3 "$WV_DB" "
-                DELETE FROM edges WHERE source IN (SELECT id FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours'))
-                   OR target IN (SELECT id FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours'));
-                DELETE FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours');
-                VACUUM;
-            " 2>/dev/null
-            if [ $? -ne 0 ]; then
-                echo "wv: auto-prune failed (database locked or disk full?)" >&2
+            if [ "${WV_AUTO_PRUNE:-0}" != "1" ]; then
+                # Warn only — no destructive action without opt-in.
+                echo "wv: database is $(( db_size / 1048576 ))MB (limit $(( WV_MAX_DB_SIZE / 1048576 ))MB) — run 'wv prune --age=7d' or set WV_AUTO_PRUNE=1 to auto-prune" >&2
+            else
+                echo "wv: database is $(( db_size / 1048576 ))MB (limit $(( WV_MAX_DB_SIZE / 1048576 ))MB), auto-pruning..." >&2
+                # Inline aggressive prune — archive done nodes >24h.
+                # Dedup: skip IDs already in today's archive file.
+                local archive_dir="$WEAVE_DIR/archive"
+                mkdir -p "$archive_dir"
+                local archive_file="$archive_dir/$(date +%Y-%m-%d).jsonl"
+                local already_archived=""
+                if [ -f "$archive_file" ]; then
+                    already_archived=$(jq -r '.id' "$archive_file" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+                fi
+                local exclude_clause=""
+                if [ -n "$already_archived" ]; then
+                    exclude_clause=" AND id NOT IN ($(echo "$already_archived" | sed "s/,/','/g; s/^/'/; s/$/'/"  ))"
+                fi
+                sqlite3 -json "$WV_DB" "SELECT * FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours')${exclude_clause}" 2>/dev/null \
+                    | jq -c '.[]' >> "$archive_file" 2>/dev/null || true
+                sqlite3 "$WV_DB" ".timeout 5000
+                    DELETE FROM edges WHERE source IN (SELECT id FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours'))
+                       OR target IN (SELECT id FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours'));
+                    DELETE FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours');
+                    VACUUM;
+                " 2>/dev/null
+                local _prune_rc=$?
+                if [ "$_prune_rc" -ne 0 ]; then
+                    echo "wv: auto-prune failed (database locked?)" >&2
+                fi
+                # If DB still over cap, only evict chunks if doing so would actually bring it under limit.
+                # Chunks are a re-creatable index but evicting them when graph itself is the bloat is
+                # pointless — it destroys search without freeing enough space.
+                local db_size_after
+                db_size_after=$(stat -c%s "$WV_DB" 2>/dev/null || stat -f%z "$WV_DB" 2>/dev/null || echo 0)
+                if [ "$db_size_after" -gt "$WV_MAX_DB_SIZE" ] 2>/dev/null; then
+                    local chunks_bytes
+                    chunks_bytes=$(sqlite3 "$WV_DB" ".timeout 5000
+                        SELECT COALESCE(SUM(length(content) + COALESCE(length(embedding), 0) + 50), 0) FROM chunks;" 2>/dev/null || echo 0)
+                    if [ "$(( db_size_after - chunks_bytes ))" -le "$WV_MAX_DB_SIZE" ] 2>/dev/null; then
+                        echo "wv: node prune insufficient ($(( db_size_after / 1048576 ))MB), evicting chunks index..." >&2
+                        sqlite3 "$WV_DB" ".timeout 5000
+                            DELETE FROM chunks;
+                            INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');
+                            VACUUM;
+                        " 2>/dev/null || echo "wv: chunks eviction failed (database locked?)" >&2
+                        echo "wv: chunks index evicted — re-run wv index to restore search" >&2
+                    else
+                        echo "wv: database over limit ($(( db_size_after / 1048576 ))MB) — run 'wv prune --age=7d' to free space" >&2
+                    fi
+                fi
+                # Clear entire context cache after auto-prune (can't track specific affected nodes)
+                rm -rf "$WV_HOT_ZONE/context_cache" 2>/dev/null || true
+                echo "wv: context cache cleared after auto-prune" >&2
             fi
-            # Clear entire context cache after auto-prune (can't track specific affected nodes)
-            rm -rf "$WV_HOT_ZONE/context_cache" 2>/dev/null || true
-            echo "wv: context cache cleared after auto-prune" >&2
         fi
     fi
 }

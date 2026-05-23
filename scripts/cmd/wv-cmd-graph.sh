@@ -436,20 +436,22 @@ cmd_related() {
     local edge_type=""
     local direction="both"
     local output_format="text"
+    local depth=1
 
     shift || true
     while [ $# -gt 0 ]; do
         case "$1" in
-            --type=*) edge_type="${1#*=}" ;;
+            --type=*)      edge_type="${1#*=}" ;;
             --direction=*) direction="${1#*=}" ;;
-            --json) output_format="json" ;;
+            --depth=*)     depth="${1#*=}" ;;
+            --json)        output_format="json" ;;
         esac
         shift
     done
 
     if [ -z "$id" ]; then
         echo -e "${RED}Error: node ID required${NC}" >&2
-        echo "Usage: wv related <id> [--type=<type>] [--direction=outbound|inbound|both] [--json]" >&2
+        echo "Usage: wv related <id> [--type=<type>] [--direction=outbound|inbound|both] [--depth=N] [--json]" >&2
         return 1
     fi
 
@@ -511,6 +513,49 @@ cmd_related() {
             return 1
             ;;
     esac
+
+    # N-hop traversal for depth > 1 (undirected BFS via recursive CTE)
+    if [ "$depth" -gt 1 ] 2>/dev/null; then
+        local type_cte_filter=""
+        [ -n "$edge_type" ] && type_cte_filter="AND e.type = '$edge_type'"
+        local cte_query="WITH RECURSIVE neighborhood(node_id, depth) AS (
+            SELECT '$id', 0
+            UNION
+            SELECT
+                CASE WHEN e.source = n.node_id THEN e.target ELSE e.source END,
+                n.depth + 1
+            FROM neighborhood n
+            JOIN edges e ON (e.source = n.node_id OR e.target = n.node_id) $type_cte_filter
+            WHERE n.depth < $depth
+        )
+        SELECT nd.node_id, MIN(nd.depth) as hop, nodes.text, nodes.status
+        FROM neighborhood nd
+        JOIN nodes ON nodes.id = nd.node_id
+        WHERE nd.node_id != '$id'
+        GROUP BY nd.node_id
+        ORDER BY hop, nd.node_id;"
+
+        if [ "$output_format" = "json" ]; then
+            db_query_json "$cte_query"
+            return $?
+        fi
+
+        local count=0
+        local cur_hop=-1
+        while IFS=$'\x1f' read -r node_id hop text status; do
+            count=$((count + 1))
+            if [ "$hop" != "$cur_hop" ]; then
+                echo -e "${CYAN}── hop $hop ──${NC}"
+                cur_hop="$hop"
+            fi
+            echo -e "  ${GREEN}$node_id${NC} [$status]: $text"
+        done < <(db_ensure; sqlite3 -batch -cmd ".timeout 5000" -separator $'\x1f' "$WV_DB" "$cte_query")
+
+        if [ "$count" = "0" ]; then
+            echo "No related nodes found within $depth hops."
+        fi
+        return 0
+    fi
 
     if [ "$output_format" = "json" ]; then
         db_query_json "$query"
@@ -797,8 +842,8 @@ cmd_context() {
     fi
 
     if [ "$format" != "json" ]; then
-        echo -e "${RED}Error: context command only supports --json output${NC}" >&2
-        return 1
+        cmd_context "$id" --json ${mode_arg:+"--mode=$mode_arg"} | jq .
+        return $?
     fi
 
     # Cache setup (per session in tmpfs) — keyed by id+mode so different modes don't collide

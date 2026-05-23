@@ -1110,8 +1110,29 @@ cmd_prune() {
         return
     fi
     
-    local count=$(echo "$candidates" | wc -l)
-    
+    # Dedup against today's archive BEFORE dry-run so --dry-run reflects actual
+    # candidates (F6 fix). Read-only here; mkdir deferred until after dry-run gate.
+    local archive_dir="$WEAVE_DIR/archive"
+    local archive_file="$archive_dir/$(date +%Y-%m-%d).jsonl"
+    if [ -f "$archive_file" ]; then
+        local already_archived
+        already_archived=$(jq -r '.id' "$archive_file" 2>/dev/null | sort -u)
+        if [ -n "$already_archived" ]; then
+            candidates=$(echo "$candidates" | awk -F'|' -v skip="$already_archived" '
+                BEGIN { n = split(skip, arr, "\n"); for (i=1;i<=n;i++) seen[arr[i]]=1 }
+                { if (!seen[$1]) print }
+            ')
+        fi
+    fi
+
+    if [ -z "$candidates" ]; then
+        echo "No new nodes to prune (all candidates already archived today)."
+        return
+    fi
+
+    local count
+    count=$(echo "$candidates" | wc -l)
+
     if [ "$dry_run" = true ]; then
         echo -e "${YELLOW}Would prune $count nodes:${NC}"
         echo "$candidates" | while IFS='|' read -r id text updated; do
@@ -1119,14 +1140,12 @@ cmd_prune() {
         done
         return
     fi
-    
-    # Create archive directory
-    local archive_dir="$WEAVE_DIR/archive"
-    local archive_file="$archive_dir/$(date +%Y-%m-%d).jsonl"
+
     mkdir -p "$archive_dir"
-    
+
     # Export to archive
-    local ids=$(echo "$candidates" | cut -d'|' -f1 | while read -r _id; do printf '%s,' "$(sql_escape "$_id")"; done | sed 's/,$//')
+    local ids
+    ids=$(echo "$candidates" | cut -d'|' -f1 | while read -r _id; do printf '%s,' "$(sql_escape "$_id")"; done | sed 's/,$//')
     db_query_json "SELECT * FROM nodes WHERE id IN ('${ids//,/\',\'}')" | jq -c '.[]' >> "$archive_file"
 
     # Collect nodes affected by edge deletion for cache invalidation
@@ -1139,7 +1158,8 @@ cmd_prune() {
     connected_targets=$(db_query "SELECT DISTINCT target FROM edges WHERE source IN ('${ids//,/\',\'}');" | tr '\n' ' ')
     affected_nodes="$affected_nodes $connected_sources $connected_targets"
 
-    # Close linked GitHub issues before deleting nodes
+    # Close linked GitHub issues before deleting nodes.
+    # Pre-state-check guards against spam-commenting already-closed issues (F2 fix).
     if command -v gh >/dev/null 2>&1; then
         local repo
         repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
@@ -1148,11 +1168,15 @@ cmd_prune() {
                 local gh_num
                 gh_num=$(db_query "SELECT json_extract(metadata, '\$.gh_issue') FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null)
                 if [ -n "$gh_num" ] && [ "$gh_num" != "null" ]; then
-                    gh issue close "$gh_num" --repo "$repo" \
-                        --comment "Pruned from Weave graph (node \`$id\` archived after ${age})." \
-                        >/dev/null 2>&1 && \
-                        echo -e "  ${GREEN}✓${NC} Closed GitHub issue #$gh_num ($id)" >&2 || \
-                        echo -e "  ${YELLOW}⚠${NC} Could not close GitHub issue #$gh_num ($id)" >&2
+                    local gh_state
+                    gh_state=$(gh issue view "$gh_num" --repo "$repo" --json state -q '.state' 2>/dev/null || echo "")
+                    if [ "$gh_state" = "OPEN" ]; then
+                        gh issue close "$gh_num" --repo "$repo" \
+                            --comment "Pruned from Weave graph (node \`$id\` archived after ${age})." \
+                            >/dev/null 2>&1 && \
+                            echo -e "  ${GREEN}✓${NC} Closed GitHub issue #$gh_num ($id)" >&2 || \
+                            echo -e "  ${YELLOW}⚠${NC} Could not close GitHub issue #$gh_num ($id)" >&2
+                    fi
                 fi
             done
         fi

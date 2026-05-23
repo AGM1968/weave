@@ -189,7 +189,7 @@ _wv_dispatch() {
         overview)        cmd_overview "$@" ;;
         session-summary) cmd_session_summary "$@" ;;
         audit-pitfalls)  cmd_audit_pitfalls "$@" ;;
-        edge-types)      cmd_edge_types ;;
+        edge-types)      cmd_edge_types "$@" ;;
         guide)           cmd_guide "$@" ;;
         init-repo)       cmd_init_repo "$@" ;;
 

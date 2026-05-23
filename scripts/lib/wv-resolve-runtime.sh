@@ -81,9 +81,10 @@ hot_zone_matches_repo() {
     repo_root=$(canonicalize_runtime_path "$repo_root")
 
     owner=$(read_hot_zone_owner "$hot_zone")
-    if [ -z "$owner" ] && [ -n "${WV_PROJECT_DIR:-}" ]; then
-        owner="$WV_PROJECT_DIR"
-    fi
+    # No owner file → unknown; treat as matching (new or test hot zone).
+    # Do NOT fall back to WV_PROJECT_DIR here — that made every ownerless hot zone
+    # appear to match the current repo, preventing leaked-override detection when the
+    # hot zone had an owner file pointing to a different repo but WV_PROJECT_DIR was set.
     [ -z "$owner" ] && return 0
 
     owner=$(canonicalize_runtime_path "$owner")

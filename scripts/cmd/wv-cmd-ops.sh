@@ -3247,20 +3247,64 @@ cmd_audit_pitfalls() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_edge_types() {
+    local show_stats=0
+    local json_out=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --stats) show_stats=1 ;;
+            --json)  json_out=1 ;;
+            --help|-h)
+                echo "Usage: wv edge-types [--stats] [--json]"
+                echo "  --stats  Include live edge counts per type from the graph"
+                echo "  --json   Machine-readable output (implies --stats)"
+                return 0 ;;
+        esac
+        shift
+    done
+
+    [ "$json_out" -eq 1 ] && show_stats=1
+
+    local -A counts=()
+    if [ "$show_stats" -eq 1 ] && [ -f "$WV_DB" ]; then
+        while IFS='|' read -r type cnt; do
+            counts["$type"]="$cnt"
+        done < <(sqlite3 "$WV_DB" "SELECT type, COUNT(*) FROM edges GROUP BY type ORDER BY COUNT(*) DESC;" 2>/dev/null)
+    fi
+
+    if [ "$json_out" -eq 1 ]; then
+        local first=1
+        printf '['
+        for type in $VALID_EDGE_TYPES; do
+            local cnt="${counts[$type]:-0}"
+            [ "$first" -eq 0 ] && printf ','
+            printf '{"type":"%s","count":%s}' "$type" "$cnt"
+            first=0
+        done
+        printf ']\n'
+        return 0
+    fi
+
     echo -e "${CYAN}Valid edge types:${NC}"
     echo ""
     for type in $VALID_EDGE_TYPES; do
+        local desc=""
         case "$type" in
-            blocks) echo -e "  ${GREEN}$type${NC} - Workflow dependency (target blocked by source)" ;;
-            relates_to) echo -e "  ${GREEN}$type${NC} - General semantic relationship" ;;
-            implements) echo -e "  ${GREEN}$type${NC} - Target implements source concept/spec" ;;
-            contradicts) echo -e "  ${GREEN}$type${NC} - Target contradicts source" ;;
-            supersedes) echo -e "  ${GREEN}$type${NC} - Target supersedes/replaces source" ;;
-            references) echo -e "  ${GREEN}$type${NC} - Target references/mentions source" ;;
-            obsoletes) echo -e "  ${GREEN}$type${NC} - Target makes source obsolete" ;;
-            addresses) echo -e "  ${GREEN}$type${NC} - Source addresses/fixes pitfall in target" ;;
-            resolves) echo -e "  ${GREEN}$type${NC} - Links a task or fix with its finding handoff" ;;
+            blocks)     desc="Workflow dependency (target blocked by source)" ;;
+            relates_to) desc="General semantic relationship" ;;
+            implements) desc="Target implements source concept/spec" ;;
+            contradicts) desc="Target contradicts source" ;;
+            supersedes) desc="Target supersedes/replaces source" ;;
+            references) desc="Target references/mentions source" ;;
+            obsoletes)  desc="Target makes source obsolete" ;;
+            addresses)  desc="Source addresses/fixes pitfall in target" ;;
+            resolves)   desc="Links a task or fix with its finding handoff" ;;
         esac
+        if [ "$show_stats" -eq 1 ]; then
+            local cnt="${counts[$type]:-0}"
+            printf "  ${GREEN}%-12s${NC} %4s  %s\n" "$type" "$cnt" "$desc"
+        else
+            echo -e "  ${GREEN}$type${NC} - $desc"
+        fi
     done
 }
 
@@ -3576,7 +3620,7 @@ cmd_help_topic() {
             print_command_help "wv resolve <node1> <node2> (--winner=<id> | --merge | --defer) [--rationale=<text>]" "Resolve a contradiction edge by selecting a winner, merging, or deferring with rationale."
             ;;
         related)
-            print_command_help "wv related <id> [--type=<type>] [--direction=outbound|inbound|both] [--json]" "Inspect a node's semantic relationships."
+            print_command_help "wv related <id> [--type=<type>] [--direction=outbound|inbound|both] [--depth=N] [--json]" "Inspect a node's semantic relationships. --depth=N expands to N-hop neighborhood (default 1)."
             ;;
         edges)
             print_command_help "wv edges <id> [--type=<type>] [--json]" "Inspect all edges touching a node."
@@ -3615,7 +3659,7 @@ cmd_help_topic() {
             print_command_help "wv audit-pitfalls" "List pitfall learnings and their resolution status."
             ;;
         edge-types)
-            print_command_help "wv edge-types" "List valid semantic edge types and what each one means."
+            print_command_help "wv edge-types [--stats] [--json]" "List valid semantic edge types and what each one means. --stats adds live edge counts from the graph."
             ;;
         doctor)
             print_command_help "wv doctor [--json]" "Run installation and surface-contract diagnostics for the CLI, hooks, and repo wiring."
@@ -3718,7 +3762,7 @@ Commands:
   tree              Show epic -> task hierarchy [--active] [--depth=N] [--json] [--mermaid] [root]
   plan <file>       Import markdown section as epic + tasks [--sprint=N] [--gh] [--dry-run] [--template]
   enrich-topology   Apply epic/task topology from JSON spec [--dry-run] [--sync-gh]
-  context [id]      Generate Context Pack [--json required] (uses WV_ACTIVE if no id)
+  context [id]      Generate Context Pack [--json | pretty-print] (uses WV_ACTIVE if no id)
   search <query>    Full-text search nodes [--limit=N] [--status=] [--json]
   reindex           Rebuild full-text search index
   learnings         Show captured learnings [--category=] [--grep=] [--recent=N] [--mode=]
@@ -3726,7 +3770,7 @@ Commands:
   digest            Compact one-liner health summary [--json]
   session-summary   Session activity stats (nodes created/completed, learnings)
   audit-pitfalls    Show all pitfalls with resolution status
-  edge-types        List valid semantic edge types
+  edge-types        List valid semantic edge types [--stats] [--json]
   init-repo         Bootstrap repo for Weave [--agent=claude|copilot|all] [--update] [--force]
   self-update       Refresh installed wv from the dev clone recorded at install time
   doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]

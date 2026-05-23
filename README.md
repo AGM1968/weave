@@ -138,15 +138,19 @@ Focused CLI help: `wv help <command>` or `wv <command> --help`.
 
 ### Graph Operations
 
-| Command                                 | Description                 |
-| --------------------------------------- | --------------------------- |
-| `wv link <from> <to> --type=implements` | Create semantic edge        |
-| `wv block <id> --by=<blocker>`          | Set dependency              |
-| `wv tree`                               | View hierarchy              |
-| `wv context <id> --json`                | Get full Context Pack       |
-| `wv related <id>`                       | Show semantic relationships |
-| `wv path <id>`                          | Show ancestry path          |
-| `wv edge-types`                         | List valid edge types       |
+| Command                                 | Description                  |
+| --------------------------------------- | ---------------------------- |
+| `wv link <from> <to> --type=implements` | Create semantic edge         |
+| `wv block <id> --by=<blocker>`          | Set dependency               |
+| `wv tree`                               | View hierarchy               |
+| `wv context <id> --json`                | Get full Context Pack        |
+| `wv related <id>`                       | Show semantic relationships  |
+| `wv related <id> --depth=2`             | N-hop neighborhood traversal |
+| `wv path <id>`                          | Show ancestry path           |
+| `wv edge-types`                         | List valid edge types        |
+| `wv edge-types --stats`                 | Edge counts per type         |
+| `wv query edge-type=blocks`             | Nodes with blocking edges    |
+| `wv query --order=connections`          | Most-connected nodes first   |
 
 ### Knowledge Capture
 
@@ -165,22 +169,22 @@ Finding nodes use `metadata.type="finding"` plus nested
 
 ### System
 
-| Command                     | Description                                |
-| --------------------------- | ------------------------------------------ |
-| `wv health`                 | Graph health check (0-100 score)           |
-| `wv quality scan`           | Scan repo for code quality metrics         |
-| `wv quality hotspots`       | Ranked hotspot report (ev, trend, cc_gini) |
-| `wv quality diff`           | Delta report vs previous scan              |
-| `wv quality functions`      | Per-function CC with histogram + Gini      |
-| `wv quality promote`        | Create nodes from top findings             |
-| `wv clean-ghosts`           | Delete ghost edges (legacy compatibility)  |
-| `wv doctor`                 | Installation health check                  |
-| `wv mcp-status`             | MCP server health check                    |
-| `wv selftest`               | End-to-end smoke test                      |
-| `wv sync --gh`              | Persist graph + sync GitHub issues         |
-| `wv plan <file>`            | Import markdown plan as tasks              |
-| `wv enrich-topology <spec>` | Apply graph topology from JSON spec        |
-| `wv prune`                  | Archive old completed nodes                |
+| Command                     | Description                                                                                            |
+| --------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `wv health`                 | Graph health check (0-100 score)                                                                       |
+| `wv quality scan`           | Scan repo for code quality metrics                                                                     |
+| `wv quality hotspots`       | Ranked hotspot report (ev, trend, cc_gini)                                                             |
+| `wv quality diff`           | Delta report vs previous scan                                                                          |
+| `wv quality functions`      | Per-function CC with histogram + Gini                                                                  |
+| `wv quality promote`        | Create nodes from top findings                                                                         |
+| `wv clean-ghosts`           | Delete ghost edges (legacy compatibility)                                                              |
+| `wv doctor`                 | Installation health check                                                                              |
+| `wv mcp-status`             | MCP server health check                                                                                |
+| `wv selftest`               | End-to-end smoke test                                                                                  |
+| `wv sync --gh`              | Persist graph + sync GitHub issues                                                                     |
+| `wv plan <file>`            | Import markdown plan as tasks                                                                          |
+| `wv enrich-topology <spec>` | Apply graph topology from JSON spec                                                                    |
+| `wv prune [--age=Nd]`       | Archive old completed nodes (deduplicates against today's archive; `--dry-run` shows accurate preview) |
 
 ### Sprint Planning
 

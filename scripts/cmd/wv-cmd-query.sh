@@ -35,6 +35,19 @@ _query_resolve_key() {
 _query_parse_predicate() {
     local raw="$1"
 
+    # edge-type=<type> / edge-type!=<type> — nodes that have (or lack) edges of a given type
+    if [[ "$raw" == edge-type=* ]] || [[ "$raw" == edge-type!=* ]]; then
+        local _et_op _et_val
+        if [[ "$raw" == edge-type!=* ]]; then
+            _et_op="NOT EXISTS"; _et_val="${raw#edge-type!=}"
+        else
+            _et_op="EXISTS"; _et_val="${raw#edge-type=}"
+        fi
+        [[ "$_et_val" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || { echo "Error: invalid edge type: $_et_val" >&2; return 1; }
+        echo "$_et_op (SELECT 1 FROM edges WHERE (source=n.id OR target=n.id) AND type='$_et_val')"
+        return 0
+    fi
+
     # HAS <key> — dual-schema aware for "learning"
     if [[ "$raw" == HAS\ * ]]; then
         local k="${raw#HAS }"
@@ -116,12 +129,13 @@ _query_build_sql() {
 
     local order_sql
     case "$order" in
-        recent)    order_sql="n.created_at DESC" ;;
-        oldest)    order_sql="n.created_at ASC" ;;
-        relevance) order_sql="rank" ;;
-        hygiene)   order_sql="json_extract(n.metadata, '\$.learning_hygiene') DESC" ;;
-        stale)     order_sql="json_extract(n.metadata, '\$.promoted_at') ASC" ;;
-        *)         order_sql="n.created_at DESC" ;;
+        recent)      order_sql="n.created_at DESC" ;;
+        oldest)      order_sql="n.created_at ASC" ;;
+        relevance)   order_sql="rank" ;;
+        hygiene)     order_sql="json_extract(n.metadata, '\$.learning_hygiene') DESC" ;;
+        stale)       order_sql="json_extract(n.metadata, '\$.promoted_at') ASC" ;;
+        connections) order_sql="(SELECT COUNT(*) FROM edges WHERE source=n.id OR target=n.id) DESC" ;;
+        *)           order_sql="n.created_at DESC" ;;
     esac
 
     # Empty or "0" limit means unbounded (no LIMIT clause)
@@ -275,7 +289,7 @@ _query_render() {
             # db_query_json_v2 expands metadata string → nested object
             db_query_json_v2 "$sql" ;;
         short)
-            db_query "$sql" | awk -F'|' '{print $1}' ;;
+            db_query_json "$sql" | jq -r '.[].id' 2>/dev/null ;;
         table|*)
             local rows
             rows=$(db_query_json "$sql") || return 1
@@ -302,13 +316,17 @@ Predicates:
 
 Keys: id, text, status, type, priority, alias, created_at, updated_at,
       stale (days since promoted_at — findings only), hygiene, or any metadata field
+      edge-type=<type>   nodes that have edges of a given type (e.g. edge-type=blocks)
+      edge-type!=<type>  nodes that lack edges of a given type
 
-Order: recent (default), oldest, relevance (MATCH only), hygiene, stale
+Order: recent (default), oldest, relevance (MATCH only), hygiene, stale, connections
 Include: text (default), learning, finding, hygiene
 Format: table (default), json (nested metadata), short (ids only)
 
 Examples:
   wv query status=active
+  wv query edge-type=blocks                        # nodes with blocking edges
+  wv query edge-type=blocks --order=connections    # hub blockers first
   wv query type=finding stale>=7 --include=finding
   wv query HAS learning --order=recent --limit=20 --include=learning
   wv query MATCH "sqlite" status=done --order=relevance --limit=10

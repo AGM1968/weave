@@ -28,17 +28,24 @@ _DEFAULT_EXTS = frozenset({
     ".md",
 })
 
-_EXCLUDE_DIRS = frozenset({".git", ".weave", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"})
+_EXCLUDE_DIRS = frozenset({
+    ".git", ".weave", "__pycache__", "node_modules",
+    ".venv", "venv", "dist", "build", "archive",
+})
 
 _DEFAULT_CHUNK_LINES = 50
 _DEFAULT_OVERLAP_LINES = 10
 _DEFAULT_MODEL = "minishlab/potion-code-16M"
 
 
+def _is_excluded(part: str) -> bool:
+    return part in _EXCLUDE_DIRS or part.startswith("venv")
+
+
 def _walk_files(root: Path, exts: frozenset[str]) -> Iterator[Path]:
     for p in root.rglob("*"):
         if p.is_file() and p.suffix in exts:
-            if not any(part in _EXCLUDE_DIRS for part in p.parts):
+            if not any(_is_excluded(part) for part in p.parts):
                 yield p
 
 
@@ -76,9 +83,14 @@ def _upsert_chunks(
     db_path: str,
     chunks: list[tuple[str, int, int, str]],
     blobs: list[bytes | None],
-) -> None:
-    """Clear existing chunks for each file, then insert new ones."""
+    root: Path | None = None,
+) -> int:
+    """Clear existing chunks for each file, insert new ones, evict stale files under root.
+
+    Returns the number of stale files evicted.
+    """
     conn = sqlite3.connect(db_path)
+    evicted = 0
     try:
         files = {c[0] for c in chunks}
         for f in files:
@@ -88,9 +100,18 @@ def _upsert_chunks(
             " VALUES (?, ?, ?, ?, ?)",
             [(c[0], c[1], c[2], c[3], blobs[i]) for i, c in enumerate(chunks)],
         )
+        # Evict chunks not in this walk: covers deleted files, excluded dirs, and ext changes.
+        if root is not None:
+            walked = {c[0] for c in chunks}
+            rows = conn.execute("SELECT DISTINCT file FROM chunks").fetchall()
+            stale = [r[0] for r in rows if r[0] not in walked]
+            for f in stale:
+                conn.execute("DELETE FROM chunks WHERE file = ?", (f,))
+            evicted = len(stale)
         conn.commit()
     finally:
         conn.close()
+    return evicted
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -141,16 +162,17 @@ def main(argv: list[str] | None = None) -> int:
         blobs = _try_encode(texts, args.model)
         embedded = blobs[0] is not None
 
-    _upsert_chunks(db_path, all_chunks, blobs)
+    evicted = _upsert_chunks(db_path, all_chunks, blobs, root=root)
 
     file_count = len({c[0] for c in all_chunks})
-    msg = {"files": file_count, "chunks": len(all_chunks), "embedded": embedded}
+    msg = {"files": file_count, "chunks": len(all_chunks), "embedded": embedded, "evicted": evicted}
 
     if args.json_out:
         print(json.dumps(msg))
     else:
         embed_note = "with embeddings" if embedded else "no embeddings (model unavailable)"
-        print(f"Indexed {file_count} file(s), {len(all_chunks)} chunk(s) — {embed_note}")
+        evict_note = f", evicted {evicted} stale file(s)" if evicted else ""
+        print(f"Indexed {file_count} file(s), {len(all_chunks)} chunk(s) — {embed_note}{evict_note}")
 
     return 0
 

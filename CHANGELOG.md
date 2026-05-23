@@ -2,6 +2,63 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.49.0] - 2026-05-23
+
+### Fixed
+
+- **CRITICAL: Auto-prune is now opt-in (`WV_AUTO_PRUNE=1`)** — `db_ensure` previously fired a
+  destructive DELETE of all done nodes older than 24 hours whenever the database exceeded 50 MB,
+  without user awareness or consent. On one test machine this silently deleted 121 of 252 nodes.
+  Default behavior is now warn-only: prints the DB size and suggests `wv prune --age=7d` or
+  `WV_AUTO_PRUNE=1`. Destructive path is unchanged but requires explicit opt-in.
+
+- **CRITICAL: Manual `wv prune` now deduplicates against today's archive** — `cmd_prune` appended to
+  the daily JSONL unconditionally, producing exactly 2× duplication on back-to-back runs (verified
+  690 → 1380 lines). Ported the dedup pattern from the auto-prune path: reads existing IDs from
+  today's archive and excludes them from candidates before appending or deleting.
+
+- **CRITICAL: `wv prune` no longer spam-comments closed GitHub issues** — every prune call ran
+  `gh issue close --comment` on all candidates regardless of current issue state, adding a fresh
+  "Pruned from Weave graph" comment to issues that had been closed for months. Added a pre-state
+  check (`gh issue view --json state`); close + comment only fires when state is `OPEN`.
+
+- **`wv prune --dry-run` now shows post-dedup candidates** — `--dry-run` returned before the dedup
+  filter ran, showing inflated counts and IDs that would not actually be pruned on the live path.
+  Moved dedup (read-only archive check) before the dry-run gate; `mkdir -p` deferred until after so
+  dry-run remains side-effect-free. Verified: seeded 5 IDs into today's archive, dry-run count
+  dropped from 42 → 37, all 5 seeded IDs excluded.
+
+- **Hot-zone drift: `WV_PROJECT_DIR` fallback removed from `hot_zone_matches_repo`** — the function
+  fell back to `WV_PROJECT_DIR` when no `.repo_root` owner file existed, causing every ownerless hot
+  zone to appear to match the current repo. This suppressed leaked-override detection when
+  `WV_HOT_ZONE` pointed to a foreign repo's zone. Unknown-owner zones now return 0 (accept) without
+  the fallback — correct for new and test zones; only explicit wrong-owner files trigger rejection.
+
+- **Size-check subshell export guard** — `_WV_SIZE_CHECKED` was set but not exported, so pipe
+  subshells (e.g. `cmd_context "$id" --json | jq .`) inherited an empty value and re-fired the
+  auto-prune check. Changed to `export _WV_SIZE_CHECKED=1`.
+
+- **`wv context` pretty-prints without `--json`** — previously errored when called without `--json`.
+  Now self-calls with `--json` and pipes through `jq .` for human-readable output.
+
+- **Code indexer excludes `archive/` directory and `venv_*` prefixes** — `wv search --code` was
+  indexing archived proposal docs (dominating code search results) and virtual-environment
+  directories matched by prefix (e.g. `venv_ee`, 990 MB). Added `archive` to `_EXCLUDE_DIRS` and an
+  `_is_excluded()` helper that also matches any path part starting with `venv`.
+
+- **Code indexer skips futile chunks eviction** — auto-prune evicted the indexed-chunks cache even
+  when the chunks table was smaller than the DB overhead, making the DB larger after eviction. Now
+  checks `db_size - chunks_bytes <= WV_MAX_DB_SIZE` before evicting.
+
+- **`test-multi-agent.sh` uses `HEAD` not hardcoded `master`** — `git push origin master` failed on
+  machines with `defaultBranch=main`. Changed to `git push origin HEAD`.
+
+### Performance
+
+- **Vectorized cosine similarity in `wv search --code`** — replaced a per-blob `np.dot` loop with a
+  single BLAS matrix multiply (`np.stack → matrix @ q_vec → np.argpartition`). 10–100× faster on
+  large indexes with no change in result quality.
+
 ## [1.48.0] - 2026-05-21
 
 ### Added
