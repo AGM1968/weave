@@ -277,6 +277,8 @@ test_leaked_env_overrides_are_ignored_across_repos() {
 
     cd /tmp
     rm -rf "$source_repo" "$target_repo"
+    # target_hot resolves to /dev/shm/weave/<hash> (outside temp dirs) — clean explicitly
+    [ -n "${target_hot:-}" ] && rm -rf "$target_hot" 2>/dev/null || true
 }
 
 # ============================================================================

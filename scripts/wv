@@ -178,6 +178,7 @@ _wv_dispatch() {
         # Ops commands
         bootstrap)       cmd_bootstrap "$@" ;;
         doctor)          cmd_doctor "$@" ;;
+        hotzone)         cmd_hotzone "$@" ;;
         self-update)     cmd_self_update "$@" ;;
         recover)         cmd_recover "$@" ;;
         selftest)        cmd_selftest "$@" ;;

@@ -1600,6 +1600,103 @@ _doctor_check_modules() {
     fi
 }
 
+cmd_hotzone() {
+    local subcmd="${1:-}"
+    shift || true
+
+    case "$subcmd" in
+        gc)
+            local dry_run=false
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --dry-run) dry_run=true ;;
+                esac
+                shift
+            done
+
+            local hot_zone hz_parent removed=0 skipped=0
+            hot_zone=$(resolve_repo_hot_zone)
+            hz_parent=$(dirname "$hot_zone")
+
+            if [ ! -d "$hz_parent" ]; then
+                echo "Hot-zone parent $hz_parent not found — nothing to gc."
+                return 0
+            fi
+
+            local now
+            now=$(date +%s)
+            local d eligible=0
+            for d in "$hz_parent"/*/; do
+                [ -f "${d}brain.db" ] || continue
+                local canon_d
+                canon_d=$(canonicalize_runtime_path "${d%/}")
+                local canon_hot
+                canon_hot=$(canonicalize_runtime_path "$hot_zone")
+                [ "$canon_d" = "$canon_hot" ] && continue
+
+                # Orphan: no owner file, or owner dir no longer exists
+                local owner=""
+                owner=$(cat "${d}.repo_root" 2>/dev/null || echo "")
+                local is_orphan=false
+                if [ -z "$owner" ]; then
+                    is_orphan=true
+                elif [ ! -d "$owner" ]; then
+                    is_orphan=true
+                fi
+                "$is_orphan" || continue
+
+                # Age guard: skip dirs with recent writes (< 1 hour) — may be active test
+                local mtime
+                mtime=$(stat -c%Y "${d}brain.db" 2>/dev/null || stat -f%m "${d}brain.db" 2>/dev/null || echo 0)
+                local age=$(( now - mtime ))
+                if [ "$age" -lt 3600 ]; then
+                    skipped=$((skipped + 1))
+                    continue
+                fi
+
+                eligible=$((eligible + 1))
+                if [ "$dry_run" = true ]; then
+                    echo "  would remove: ${d} (owner=${owner:-none}, age=${age}s)"
+                else
+                    rm -rf "$d" 2>/dev/null && removed=$((removed + 1)) || true
+                fi
+            done
+
+            if [ "$dry_run" = true ]; then
+                echo "wv hotzone gc --dry-run: $eligible eligible orphan(s); $skipped skipped (< 1h old)"
+            else
+                echo "wv hotzone gc: removed $removed orphan(s), skipped $skipped (< 1h old)"
+            fi
+            ;;
+        list)
+            local hot_zone hz_parent
+            hot_zone=$(resolve_repo_hot_zone)
+            hz_parent=$(dirname "$hot_zone")
+            [ -d "$hz_parent" ] || { echo "Hot-zone parent $hz_parent not found."; return 0; }
+            local d
+            for d in "$hz_parent"/*/; do
+                [ -f "${d}brain.db" ] || continue
+                local owner=""
+                owner=$(cat "${d}.repo_root" 2>/dev/null || echo "")
+                local nodes=0
+                nodes=$(sqlite3 "${d}brain.db" "SELECT COUNT(*) FROM nodes;" 2>/dev/null || echo "?")
+                local label="live"
+                if [ -z "$owner" ] || [ ! -d "$owner" ]; then
+                    label="orphan"
+                fi
+                printf '  %-10s  %s  nodes=%-4s  owner=%s\n' "$label" "${d%/}" "$nodes" "${owner:-none}"
+            done
+            ;;
+        *)
+            echo "Usage: wv hotzone <subcommand>"
+            echo ""
+            echo "Subcommands:"
+            echo "  gc [--dry-run]   Remove orphan hot-zone dirs (no .repo_root or dead owner)"
+            echo "  list             Show all hot-zone dirs with owner + node count"
+            ;;
+    esac
+}
+
 cmd_doctor() {
     _dr_format="text"
     local _dr_repair=false
@@ -1676,6 +1773,28 @@ cmd_doctor() {
             _doctor_record "hot zone" "pass" "$hot_zone (${avail_mb}MB free)"
         else
             _doctor_record "hot zone" "warn" "$hot_zone (${avail_mb}MB free — low)"
+        fi
+        # 8b. Orphan hot-zone count (dirs with no matching .repo_root owner)
+        local hz_parent
+        hz_parent=$(dirname "$hot_zone")
+        if [ -d "$hz_parent" ]; then
+            local orphan_count=0
+            local d
+            for d in "$hz_parent"/*/; do
+                [ -f "${d}brain.db" ] || continue
+                local owner=""
+                owner=$(cat "${d}.repo_root" 2>/dev/null || echo "")
+                if [ -n "$owner" ] && [ ! -d "$owner" ]; then
+                    orphan_count=$((orphan_count + 1))
+                elif [ -z "$owner" ]; then
+                    # No owner file — ownerless dirs from test fixtures
+                    [ "${d%/}" != "$hot_zone" ] && orphan_count=$((orphan_count + 1))
+                fi
+            done
+            if [ "$orphan_count" -gt 0 ]; then
+                _doctor_record "orphan hot-zones" "warn" \
+                    "$orphan_count unmatched dir(s) under $hz_parent — run: wv hotzone gc"
+            fi
         fi
     else
         _doctor_record "hot zone" "fail" "not found: $hot_zone"
@@ -1780,6 +1899,7 @@ cmd_doctor() {
     local installed_hooks_dir="$HOME/.config/weave/hooks"
     if [ -d "$source_hooks_dir" ] && [ -d "$installed_hooks_dir" ]; then
         local drifted=""
+        # Forward: repo-local hooks stale vs installed (catches wv self-update without init-repo --update)
         for src in "$source_hooks_dir"/*.sh; do
             local fname
             fname=$(basename "$src")
@@ -1789,6 +1909,13 @@ cmd_doctor() {
             elif [ "$(md5sum "$src" 2>/dev/null | awk '{print $1}')" != "$(md5sum "$dst" 2>/dev/null | awk '{print $1}')" ]; then
                 drifted="${drifted:+$drifted, }$fname (stale)"
             fi
+        done
+        # Reverse: new hooks in installed not yet in repo (added in a newer release)
+        for dst in "$installed_hooks_dir"/*.sh; do
+            local fname
+            fname=$(basename "$dst")
+            [ -f "$source_hooks_dir/$fname" ] || \
+                drifted="${drifted:+$drifted, }$fname (new — not in repo)"
         done
         if [ -z "$drifted" ]; then
             _doctor_record "hook drift" "pass" "source and installed hooks match"
