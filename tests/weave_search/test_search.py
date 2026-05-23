@@ -16,6 +16,7 @@ from weave_search.__main__ import (
     fts_search,
     hybrid_search,
     main,
+    resolve_filter_scope,
     vector_search,
 )
 
@@ -59,6 +60,52 @@ def _fake_embedding(value: float, dim: int = 8) -> bytes:
     norm = sum(x * x for x in vec) ** 0.5
     vec = [x / norm for x in vec]
     return struct.pack(f"{dim}f", *vec)
+
+
+def _add_graph_tables(path: str) -> None:
+    """Add minimal graph tables (nodes/edges/node_files) to an existing test DB."""
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS nodes (
+            id TEXT PRIMARY KEY,
+            text TEXT,
+            status TEXT,
+            metadata TEXT
+        );
+        CREATE TABLE IF NOT EXISTS edges (
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            type TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS node_files (
+            node_id TEXT NOT NULL,
+            path TEXT NOT NULL
+        );
+    """)
+    conn.executemany(
+        "INSERT INTO nodes(id, text, status, metadata) VALUES (?, ?, ?, ?)",
+        [
+            ("wv-a111", "A", "todo", "{}"),
+            ("wv-b222", "B", "todo", "{}"),
+            ("wv-c333", "C", "todo", "{}"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO edges(source, target, type) VALUES (?, ?, ?)",
+        [
+            ("wv-a111", "wv-b222", "blocks"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO node_files(node_id, path) VALUES (?, ?)",
+        [
+            ("wv-a111", "src/foo.py"),
+            ("wv-b222", "./src/bar.py"),
+            ("wv-c333", "src/baz.sh"),
+        ],
+    )
+    conn.commit()
+    conn.close()
 
 
 @pytest.fixture()
@@ -137,6 +184,11 @@ class TestFtsSearch:
         results = fts_search("sqlite", db_path, limit=1)
         assert len(results) <= 1
 
+    def test_allowlist_restricts_files(self, db_path: str) -> None:
+        results = fts_search("def class sqlite", db_path, allowed_files={"src/foo.py"})
+        assert results
+        assert all(r.file == "src/foo.py" for r in results)
+
 
 # ── vector_search ─────────────────────────────────────────────────────────────
 
@@ -181,6 +233,10 @@ class TestVectorSearch:
 
         assert not results
         assert not imports
+
+    def test_empty_allowlist_short_circuits(self, db_path: str) -> None:
+        results = vector_search("cosine", db_path, allowed_files=set())
+        assert results == []
 
 
 # ── hybrid_search ─────────────────────────────────────────────────────────────
@@ -237,6 +293,30 @@ class TestHybridSearch:
         assert not results
         assert not imports
 
+    def test_allowlist_restricts_files(self, db_path: str) -> None:
+        results = hybrid_search("def class sqlite", db_path, allowed_files={"src/bar.py"})
+        assert results
+        assert all(r.file == "src/bar.py" for r in results)
+
+
+class TestResolveFilterScope:
+    def test_edge_type_filter_resolves_nodes_and_files(self, db_path: str) -> None:
+        _add_graph_tables(db_path)
+        resolved = resolve_filter_scope("edge-type=blocks", db_path)
+        assert set(resolved.node_ids) == {"wv-a111", "wv-b222"}
+        assert set(resolved.files) == {"src/foo.py", "src/bar.py"}
+
+    def test_edge_type_not_equal_filter(self, db_path: str) -> None:
+        _add_graph_tables(db_path)
+        resolved = resolve_filter_scope("edge-type!=blocks", db_path)
+        assert set(resolved.node_ids) == {"wv-c333"}
+        assert set(resolved.files) == {"src/baz.sh"}
+
+    def test_bad_filter_raises(self, db_path: str) -> None:
+        _add_graph_tables(db_path)
+        with pytest.raises(ValueError, match="unsupported filter"):
+            resolve_filter_scope("badexpr", db_path)
+
 
 # ── main CLI ──────────────────────────────────────────────────────────────────
 
@@ -275,3 +355,27 @@ class TestMain:
         data = json.loads(output)
         assert isinstance(data, dict)
         assert isinstance(data["results"], list)
+
+    def test_filter_in_json_output(self, db_path: str) -> None:
+        _add_graph_tables(db_path)
+        old = sys.stdout
+        sys.stdout = io.StringIO()
+        rc = main(["cosine", f"--db={db_path}", "--mode=fts", "--filter=edge-type=blocks", "--json"])
+        output = sys.stdout.getvalue()
+        sys.stdout = old
+        assert rc == 0
+        data = json.loads(output)
+        assert "filter" in data
+        assert data["filter"]["expr"] == "edge-type=blocks"
+        assert data["filter"]["matched_files"] >= 1
+
+    def test_bad_filter_returns_error(self, db_path: str) -> None:
+        _add_graph_tables(db_path)
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
+        rc = main(["cosine", f"--db={db_path}", "--mode=fts", "--filter=badexpr", "--json"])
+        err = sys.stderr.getvalue()
+        sys.stdout, sys.stderr = old_out, old_err
+        assert rc == 1
+        assert "unsupported filter" in err

@@ -21,6 +21,141 @@
 #     ready: [{id, text}, ...],
 #     learnings: [{id, text, learning}, ...] }
 
+_bootstrap_repo_wv_path() {
+    [ -n "${REPO_ROOT:-}" ] || return 0
+    canonicalize_runtime_path "$REPO_ROOT/scripts/wv"
+}
+
+_bootstrap_invoked_wv_path() {
+    if [ -n "${WV_CLI:-}" ]; then
+        canonicalize_runtime_path "$WV_CLI"
+        return 0
+    fi
+    local resolved
+    resolved=$(command -v wv 2>/dev/null || true)
+    [ -n "$resolved" ] && canonicalize_runtime_path "$resolved"
+}
+
+_bootstrap_canonical_wv_path() {
+    local repo_wv
+    repo_wv=$(_bootstrap_repo_wv_path)
+    if [ -n "$repo_wv" ] && [ -x "$repo_wv" ]; then
+        echo "$repo_wv"
+        return 0
+    fi
+
+    local invoked_wv
+    invoked_wv=$(_bootstrap_invoked_wv_path)
+    [ -n "$invoked_wv" ] && echo "$invoked_wv"
+}
+
+_bootstrap_wv_provenance() {
+    local path="$1"
+    local repo_wv
+    repo_wv=$(_bootstrap_repo_wv_path)
+    local dev_wv=""
+    if [ -n "${WV_LIB_DIR:-}" ]; then
+        dev_wv=$(canonicalize_runtime_path "$WV_LIB_DIR/wv")
+    fi
+    local installed_wv
+    installed_wv=$(canonicalize_runtime_path "$HOME/.local/bin/wv")
+
+    if [ -n "$repo_wv" ] && [ "$path" = "$repo_wv" ]; then
+        echo "repo-local"
+    elif [ -n "$dev_wv" ] && [ "$path" = "$dev_wv" ]; then
+        echo "repo-local"
+    elif [ "$path" = "$installed_wv" ]; then
+        echo "installed"
+    elif [ -n "$path" ]; then
+        echo "path"
+    else
+        echo "missing"
+    fi
+}
+
+_bootstrap_python_command() {
+    local repo_root="${REPO_ROOT:-}"
+
+    if [ -n "$repo_root" ] && [ -f "$repo_root/pyproject.toml" ] && command -v poetry >/dev/null 2>&1; then
+        echo "poetry run python"
+        return 0
+    fi
+    if [ -n "$repo_root" ] && [ -x "$repo_root/.venv/bin/python3" ]; then
+        canonicalize_runtime_path "$repo_root/.venv/bin/python3"
+        return 0
+    fi
+    if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -x "${CLAUDE_PROJECT_DIR}/.venv/bin/python3" ]; then
+        canonicalize_runtime_path "${CLAUDE_PROJECT_DIR}/.venv/bin/python3"
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        canonicalize_runtime_path "$(command -v python3)"
+        return 0
+    fi
+    if command -v python >/dev/null 2>&1; then
+        canonicalize_runtime_path "$(command -v python)"
+    fi
+}
+
+_bootstrap_agent_info_json() {
+    local wv_command invoked_wv repo_wv db_path python_command wv_provenance readiness_state
+    local wv_ready=false db_ready=false python_ready=false command_mismatch=false
+
+    wv_command=$(_bootstrap_canonical_wv_path)
+    invoked_wv=$(_bootstrap_invoked_wv_path)
+    repo_wv=$(_bootstrap_repo_wv_path)
+    db_path=$(canonicalize_runtime_path "${WV_DB:-}")
+    python_command=$(_bootstrap_python_command)
+    wv_provenance=$(_bootstrap_wv_provenance "$invoked_wv")
+
+    [ -n "$wv_command" ] && [ -x "$wv_command" ] && wv_ready=true
+    [ -n "$db_path" ] && [ -f "$db_path" ] && db_ready=true
+    if [ -n "$python_command" ]; then
+        case "$python_command" in
+            "poetry run python") command -v poetry >/dev/null 2>&1 && python_ready=true ;;
+            *) [ -x "$python_command" ] && python_ready=true ;;
+        esac
+    fi
+    if [ -n "$wv_command" ] && [ -n "$invoked_wv" ] && [ "$wv_command" != "$invoked_wv" ]; then
+        command_mismatch=true
+    fi
+
+    readiness_state="ready"
+    if [ "$wv_ready" != "true" ] || [ "$db_ready" != "true" ] || [ "$python_ready" != "true" ]; then
+        readiness_state="degraded"
+    fi
+
+    jq -n \
+        --arg wv_command "$wv_command" \
+        --arg invoked_wv "$invoked_wv" \
+        --arg repo_wv "$repo_wv" \
+        --arg wv_provenance "$wv_provenance" \
+        --arg wv_lib_dir "$(canonicalize_runtime_path "${WV_LIB_DIR:-}")" \
+        --arg db_path "$db_path" \
+        --arg python_command "$python_command" \
+        --arg readiness_state "$readiness_state" \
+        --argjson wv_ready "$wv_ready" \
+        --argjson db_ready "$db_ready" \
+        --argjson python_ready "$python_ready" \
+        --argjson command_mismatch "$command_mismatch" \
+        '{
+            wv_command: (if $wv_command != "" then $wv_command else null end),
+            invoked_wv: (if $invoked_wv != "" then $invoked_wv else null end),
+            repo_local_wv: (if $repo_wv != "" then $repo_wv else null end),
+            wv_provenance: $wv_provenance,
+            command_mismatch: $command_mismatch,
+            wv_lib_dir: (if $wv_lib_dir != "" then $wv_lib_dir else null end),
+            db_path: (if $db_path != "" then $db_path else null end),
+            python_command: (if $python_command != "" then $python_command else null end),
+            readiness: {
+                state: $readiness_state,
+                wv_command: $wv_ready,
+                db_path: $db_ready,
+                python_command: $python_ready
+            }
+        } | with_entries(select(.value != null))'
+}
+
 cmd_bootstrap() {
     local format="json"
     local learnings_limit=5
@@ -149,6 +284,46 @@ cmd_bootstrap() {
             )),
             breadcrumb: (if $breadcrumb != "" then $breadcrumb else null end)
         }'
+}
+
+cmd_bootstrap_agent() {
+    local format="json"
+    local learnings_limit=5
+    local ready_limit=10
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) format="json" ;;
+            --learnings=*) learnings_limit="${1#--learnings=}" ;;
+            --ready=*) ready_limit="${1#--ready=}" ;;
+            --help|-h)
+                echo "Usage: wv bootstrap-agent --json [--learnings=N] [--ready=N]"
+                echo ""
+                echo "Agent-safe bootstrap contract with canonical wv path, provenance, DB path,"
+                echo "python command, readiness state, plus the standard bootstrap payload."
+                echo ""
+                echo "Options:"
+                echo "  --learnings=N  Number of recent learnings (default: 5)"
+                echo "  --ready=N      Number of ready nodes (default: 10)"
+                return 0
+                ;;
+        esac
+        shift
+    done
+
+    if [ "$format" != "json" ]; then
+        echo "Error: wv bootstrap-agent only supports --json output" >&2
+        return 1
+    fi
+
+    local base_json agent_json
+    base_json=$(cmd_bootstrap --json "--learnings=$learnings_limit" "--ready=$ready_limit") || return 1
+    agent_json=$(_bootstrap_agent_info_json)
+
+    jq -n \
+        --argjson base "$base_json" \
+        --argjson agent "$agent_json" \
+        '$base + {agent: $agent}'
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -399,7 +574,7 @@ _preflight_policy_readiness() {
             --argjson tracked_files "$tracked_files" \
             --arg quality_db "$quality_db" \
             --arg detail "Tracked files make this node policy-sensitive, but quality.db is missing." \
-            --arg hint "Run wv quality scan before closing nodes that touch tracked files." \
+            --arg hint 'Run `wv quality scan .` before closing nodes that touch tracked files. Example: `wv quality scan . --json`.' \
             '{
                 policy_sensitive: true,
                 ready: false,
@@ -431,7 +606,7 @@ _preflight_policy_readiness() {
             --argjson tracked_files "$tracked_files" \
             --arg quality_db "$quality_db" \
             --arg detail "Tracked files make this node policy-sensitive, but quality.db has no scan data." \
-            --arg hint "Run wv quality scan before closing nodes that touch tracked files." \
+            --arg hint 'Run `wv quality scan .` before closing nodes that touch tracked files. Example: `wv quality scan . --json`.' \
             '{
                 policy_sensitive: true,
                 ready: false,
@@ -1600,6 +1775,69 @@ _doctor_check_modules() {
     fi
 }
 
+_doctor_agent_python_exec() {
+    local python_command="$1"
+    shift
+
+    case "$python_command" in
+        "poetry run python")
+            PYTHONPATH="${WV_LIB_DIR:-}" poetry run python "$@"
+            ;;
+        "")
+            return 127
+            ;;
+        *)
+            PYTHONPATH="${WV_LIB_DIR:-}" "$python_command" "$@"
+            ;;
+    esac
+}
+
+_doctor_check_agent_env() {
+    local python_command
+    python_command=$(_bootstrap_python_command)
+
+    if [ -z "$python_command" ]; then
+        _doctor_record "agent python" "fail" "no python command resolved for agent flows"
+        _doctor_record "agent pytest" "fail" "cannot verify pytest without an agent python command"
+        _doctor_record "agent imports" "fail" "cannot verify imports without an agent python command"
+        return
+    fi
+
+    local python_detail="$python_command"
+    case "$python_command" in
+        "poetry run python")
+            if command -v poetry >/dev/null 2>&1; then
+                _doctor_record "agent python" "pass" "$python_detail"
+            else
+                _doctor_record "agent python" "fail" "poetry required for agent python command but not found"
+            fi
+            ;;
+        *)
+            if [ -x "$python_command" ]; then
+                _doctor_record "agent python" "pass" "$python_detail"
+            else
+                _doctor_record "agent python" "fail" "$python_detail not executable"
+            fi
+            ;;
+    esac
+
+    local pytest_version
+    pytest_version=$(_doctor_agent_python_exec "$python_command" -m pytest --version 2>/dev/null | head -1 || true)
+    if [ -n "$pytest_version" ]; then
+        _doctor_record "agent pytest" "pass" "$pytest_version"
+    else
+        _doctor_record "agent pytest" "warn" "pytest missing for $python_detail — install project dev dependencies"
+    fi
+
+    local import_status
+    import_status=$(_doctor_agent_python_exec "$python_command" -c 'import weave_gh, weave_indexer, weave_quality, weave_search; print("imports ok")' 2>/dev/null || true)
+    if [ "$import_status" = "imports ok" ]; then
+        _doctor_record "agent imports" "pass" "weave_gh weave_indexer weave_quality weave_search"
+    else
+        _doctor_record "agent imports" "warn" "PYTHONPATH/WV_LIB_DIR import path not ready for agent modules"
+    fi
+}
+
 cmd_hotzone() {
     local subcmd="${1:-}"
     shift || true
@@ -1700,10 +1938,12 @@ cmd_hotzone() {
 cmd_doctor() {
     _dr_format="text"
     local _dr_repair=false
+    local _dr_agent=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --json)   _dr_format="json" ;;
             --repair) _dr_repair=true ;;
+            --agent)  _dr_agent=true ;;
         esac
         shift
     done
@@ -2031,6 +2271,24 @@ cmd_doctor() {
                 _doctor_record "install drift" "warn" "$_drifted_lib file(s) differ — run: wv self-update"
             fi
         fi
+    fi
+
+    # 21. Active wv provenance vs recommended repo-local wrapper
+    local _dr_repo_wv _dr_invoked_wv _dr_provenance _dr_canonical_wv
+    _dr_repo_wv=$(_bootstrap_repo_wv_path)
+    _dr_invoked_wv=$(_bootstrap_invoked_wv_path)
+    _dr_canonical_wv=$(_bootstrap_canonical_wv_path)
+    _dr_provenance=$(_bootstrap_wv_provenance "$_dr_invoked_wv")
+    if [ -z "$_dr_canonical_wv" ]; then
+        _doctor_record "wv provenance" "warn" "unable to resolve active wv command"
+    elif [ -n "$_dr_repo_wv" ] && [ -x "$_dr_repo_wv" ] && [ -n "$_dr_invoked_wv" ] && [ "$_dr_repo_wv" != "$_dr_invoked_wv" ]; then
+        _doctor_record "wv provenance" "warn" "invoked $_dr_invoked_wv ($_dr_provenance); repo-local wrapper available at $_dr_repo_wv"
+    else
+        _doctor_record "wv provenance" "pass" "$_dr_canonical_wv ($_dr_provenance)"
+    fi
+
+    if [ "$_dr_agent" = true ]; then
+        _doctor_check_agent_env
     fi
 
     # Summary
@@ -3635,6 +3893,9 @@ cmd_help_topic() {
         bootstrap)
             cmd_bootstrap --help
             ;;
+        bootstrap-agent)
+            cmd_bootstrap_agent --help
+            ;;
         bulk-update)
             cmd_bulk_update --help
             ;;
@@ -3690,10 +3951,13 @@ cmd_help_topic() {
             print_command_help "wv delete <id> [--force] [--dry-run] [--no-gh]" "Delete a node and its edges. Use --dry-run to preview deletions and --force to execute them."
             ;;
         done)
-            print_command_help "wv done <id> [--learning=\"...\"] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--no-warn] [--acknowledge-overlap] [--skip-verification] [--no-overlap-check]" "Close a node and optionally store structured learnings or bypass flags when policy allows it."
+            print_command_help "wv done <id> [--learning=\"...\"|--learning-file=PATH] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--verification-evidence=\"...\"|--verification-evidence-file=PATH] [--no-warn] [--acknowledge-overlap] [--skip-verification] [--no-overlap-check]" "Close a node and optionally store structured learnings or bypass flags when policy allows it."
             ;;
         ship)
-            print_command_help "wv ship <id> [--learning=\"...\"] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--gh] [--no-overlap-check]" "Close a node and sync graph state in one step; any remaining Git sync is surfaced separately."
+            print_command_help "wv ship <id> [--learning=\"...\"|--learning-file=PATH] [--verification-method=\"...\"] [--verification-evidence=\"...\"|--verification-evidence-file=PATH] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--gh] [--skip-verification] [--no-overlap-check]" "Close a node and sync graph state in one step; any remaining Git sync is surfaced separately."
+            ;;
+        ship-agent)
+            print_command_help "wv ship-agent <id> [--learning=\"...\"|--learning-file=PATH] [--verification-method=\"...\"|--verify-method=\"...\"] [--verification-evidence=\"...\"|--verify-evidence=\"...\"|--verification-evidence-file=PATH] [--gh] [--skip-verification] [--no-overlap-check] [--json]" "Run an agent-safe non-interactive ship flow with doctor --agent precheck and JSON output."
             ;;
         batch-done)
             print_command_help "wv batch-done <id1> <id2> ... [--learning=\"...\"] [--no-warn]" "Close multiple nodes with a shared learning note."
@@ -3765,7 +4029,20 @@ cmd_help_topic() {
             print_command_help "wv context [id] --json [--mode=bootstrap|discover|execute|full]" "Generate a JSON context pack for a node. If <id> is omitted, wv uses WV_ACTIVE."
             ;;
         search)
-            print_command_help "wv search <query> [--limit=N] [--status=<status>] [--json]" "Run full-text search across node text and metadata."
+            cat <<'SEARCHHELP'
+Usage: wv search <query> [--limit=N] [--json] [--status=STATUS] [--type=TYPE] [--learning]
+       wv search --code <query> [--limit=N] [--json] [--mode=hybrid|fts|vector] [--graph] [--filter=<expr>]
+
+  Without --code: searches Weave graph nodes (FTS5 BM25)
+  With --code:    searches indexed code chunks (RRF hybrid BM25+cosine)
+  --type=TYPE:    filter by metadata.type (finding, task, epic, ...)
+  --learning:     only nodes that have captured learning content
+  --graph:        attach active Weave nodes + quality churn to results
+  --filter=EXPR:  constrain code chunks by graph edge type
+                  Supported: edge-type=<type>, edge-type!=<type>
+                  Types: blocks, implements, relates_to, addresses, contradicts, resolves
+                  Example: wv search --code "auth" --filter=edge-type=blocks
+SEARCHHELP
             ;;
         reindex)
             print_command_help "wv reindex" "Rebuild the full-text search index."
@@ -3789,7 +4066,7 @@ cmd_help_topic() {
             print_command_help "wv edge-types [--stats] [--json]" "List valid semantic edge types and what each one means. --stats adds live edge counts from the graph."
             ;;
         doctor)
-            print_command_help "wv doctor [--json]" "Run installation and surface-contract diagnostics for the CLI, hooks, and repo wiring."
+            print_command_help "wv doctor [--json] [--repair] [--agent]" "Run installation and surface-contract diagnostics for the CLI, hooks, and repo wiring. --agent adds python, pytest, import-path, and provenance checks for agent flows."
             ;;
         self-update)
             print_command_help "wv self-update" "Refresh installed wv from the dev clone recorded at install time. Equivalent to re-running install.sh from the source directory."
@@ -3833,6 +4110,10 @@ cmd_help_topic() {
         version)
             print_command_help "wv version" "Print the installed Weave CLI version."
             ;;
+        hotzone)
+            print_command_help "wv hotzone list [--json]" "List all hot-zones (active graph DB directories) with status, node count, and owner."
+            print_command_help "wv hotzone gc [--dry-run]" "Remove orphan hot-zone directories (no matching live repo). Skips dirs newer than 1h."
+            ;;
         *)
             echo "Unknown help topic: $topic" >&2
             echo "Try 'wv --help' to list available commands." >&2
@@ -3868,6 +4149,8 @@ Commands:
   preflight <id>    Pre-action checks as JSON (blockers, contradictions, context load)
   recover           Resume incomplete operations (ship/sync/delete) [--auto] [--json] [--session]
   bootstrap         Single-call JSON bootstrap context for agents [--json]
+    bootstrap-agent   Agent bootstrap contract with command/provenance/readiness [--json]
+    ship-agent        Agent-safe non-interactive close + sync wrapper [--json]
   overview          Compact graph summary [--json]
   cache             Claude prompt-cache diagnostics [--json]
   pending-close     List nodes awaiting human acknowledgement after learning overlap [--json]

@@ -1307,14 +1307,11 @@ function handleTool(
         learning = learning ? `${structured} | ${learning}` : structured;
       }
 
-      const cmd = ["ship", id];
+      const cmd = ["ship-agent", id, "--json"];
       if (learning) cmd.push(`--learning=${learning}`);
       if (gh) cmd.push("--gh");
       if (noOverlapCheck) cmd.push("--no-overlap-check");
       result = wv(cmd, 60_000); // sync may be slow
-      if (!learning && !decision && !pattern && !pitfall)
-        result +=
-          "\n\nWARNING: No learning captured. Consider: what decision, pattern, or pitfall should future sessions know?";
       break;
     }
 
@@ -1824,7 +1821,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.49.1",
+      version: "1.50.1",
     },
     {
       capabilities: {

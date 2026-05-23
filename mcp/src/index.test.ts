@@ -711,7 +711,7 @@ describe("Weave MCP Server", () => {
         const result = response.result as { content: { text: string }[]; isError?: boolean };
         expect(result.isError).toBe(true);
         expect(result.content[0].text).toContain("not policy-ready");
-        expect(result.content[0].text).toContain("wv quality scan");
+        expect(result.content[0].text).toContain("wv quality scan . --json");
       } finally {
         await preflightClient.close();
         rmSync(dir, { recursive: true, force: true });
@@ -807,7 +807,7 @@ describe("Weave MCP Server", () => {
         wrapper.cleanup();
       }
       expect(commands).toEqual(expect.arrayContaining([
-        expect.stringContaining(`ship ${nodeId} --learning=`),
+        expect.stringContaining(`ship-agent ${nodeId} --json --learning=`),
         expect.stringContaining("--no-overlap-check"),
       ]));
     });

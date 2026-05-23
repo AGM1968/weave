@@ -380,6 +380,21 @@ test_done() {
     show_meta=$("$WV" show "$id" --json 2>&1)
     assert_contains "$show_meta" "always test your code" "done --learning stores in metadata"
 
+    # Done with learning/evidence file inputs for agent-safe large text
+    local learning_file evidence_file file_done_id file_done_output file_done_meta
+    learning_file="$TEST_DIR/done-learning.txt"
+    evidence_file="$TEST_DIR/done-evidence.txt"
+    printf '%s\n' 'pattern: prefer file inputs for long agent learnings' > "$learning_file"
+    printf '%s\n' '12 passed in agent-safe close flow' > "$evidence_file"
+
+    file_done_id=$("$WV" add "Task with file inputs" 2>&1 | tail -1)
+    file_done_output=$("$WV" done "$file_done_id" --learning-file="$learning_file" --verification-method="make check" --verification-evidence-file="$evidence_file" 2>&1)
+    assert_contains "$file_done_output" "Closed" "done accepts file-based learning/evidence inputs"
+
+    file_done_meta=$("$WV" show "$file_done_id" --json 2>&1)
+    assert_contains "$file_done_meta" "prefer file inputs for long agent learnings" "done --learning-file stores learning metadata"
+    assert_contains "$file_done_meta" "12 passed in agent-safe close flow" "done --verification-evidence-file stores verification evidence"
+
     # Done on non-existent node fails
     assert_fails "done on non-existent node fails" "$WV" done "wv-0000"
 
@@ -509,6 +524,26 @@ test_done() {
     ship_status=$("$WV" status --json 2>&1)
     assert_contains "$ship_status" '"git_sync_pending": true' "ship leaves pending remote sync surfaced in status"
     assert_contains "$ship_status" '"git_sync_reason": "dirty_weave"' "ship status reports dirty_weave after local-only completion"
+
+    local ship_agent_id ship_agent_learning ship_agent_evidence ship_agent_exit ship_agent_output ship_agent_status ship_agent_doctor
+    ship_agent_learning="$ship_repo/ship-agent-learning.txt"
+    ship_agent_evidence="$ship_repo/ship-agent-evidence.txt"
+    printf '%s\n' 'decision: keep ship-agent non-interactive | pattern: reuse cmd_ship internals | pitfall: wrappers drift when verification flags diverge' > "$ship_agent_learning"
+    printf '%s\n' 'agent close verification passed' > "$ship_agent_evidence"
+
+    ship_agent_id=$("$WV" add "Ship agent complete" 2>&1 | tail -1)
+    ship_agent_exit=0
+    ship_agent_output=$("$WV" ship-agent "$ship_agent_id" --learning-file="$ship_agent_learning" --verification-method="make check" --verification-evidence-file="$ship_agent_evidence" --no-overlap-check --json 2>&1) || ship_agent_exit=$?
+    assert_equals "0" "$ship_agent_exit" "ship-agent succeeds with file-backed learning and verification inputs"
+    ship_agent_status=$(echo "$ship_agent_output" | jq -r '.status // empty')
+    assert_equals "shipped" "$ship_agent_status" "ship-agent returns shipped status"
+    ship_agent_doctor=$(echo "$ship_agent_output" | jq -r '.doctor.overall // empty')
+    assert_equals "pass" "$ship_agent_doctor" "ship-agent includes passing doctor --agent result"
+    assert_contains "$ship_agent_output" '"noninteractive": true' "ship-agent reports noninteractive mode in JSON"
+
+    local ship_agent_meta
+    ship_agent_meta=$("$WV" show "$ship_agent_id" --json 2>&1)
+    assert_contains "$ship_agent_meta" '"status":"done"' "ship-agent closes the node"
 
     git remote remove origin >/dev/null 2>&1 || true
     local ship_local_id ship_local_exit ship_local_meta ship_local_status
@@ -820,6 +855,35 @@ test_status() {
     assert_contains "$output" "Task 2" "status highlights active work"
 }
 
+test_bootstrap_agent() {
+    echo ""
+    echo "Test: wv bootstrap-agent"
+    echo "========================"
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    local active_id bootstrap_json agent_wv agent_db readiness_state provenance
+    active_id=$("$WV" add "Bootstrap agent task" 2>&1 | tail -1)
+    "$WV" work "$active_id" >/dev/null 2>&1
+
+    bootstrap_json=$("$WV" bootstrap-agent --json 2>&1)
+    assert_contains "$bootstrap_json" '"agent"' "bootstrap-agent returns agent block"
+    assert_contains "$bootstrap_json" '"python_command":' "bootstrap-agent reports python command"
+
+    agent_wv=$(echo "$bootstrap_json" | jq -r '.agent.wv_command // empty')
+    assert_equals "$PROJECT_ROOT/scripts/wv" "$agent_wv" "bootstrap-agent prefers repo-local wv wrapper"
+
+    agent_db=$(echo "$bootstrap_json" | jq -r '.agent.db_path // empty')
+    assert_equals "$WV_DB" "$agent_db" "bootstrap-agent reports active db path"
+
+    readiness_state=$(echo "$bootstrap_json" | jq -r '.agent.readiness.state // empty')
+    assert_equals "ready" "$readiness_state" "bootstrap-agent reports ready state when command/db/python resolve"
+
+    provenance=$(echo "$bootstrap_json" | jq -r '.agent.wv_provenance // empty')
+    assert_equals "repo-local" "$provenance" "bootstrap-agent reports repo-local provenance when using scripts/wv"
+}
+
 # ============================================================================
 # Test: update --metadata merge (SQL json_patch port; H1.T2)
 # ============================================================================
@@ -1082,7 +1146,7 @@ test_help_surfaces() {
     root_help=$("$WV" --help 2>&1)
 
     local expected_commands=(
-        init add delete done ship batch-done bulk-update work preflight recover bootstrap
+        init add delete done ship ship-agent batch-done bulk-update work preflight recover bootstrap bootstrap-agent
         overview cache pending-close ready list show status update touch allowed-tools quick
         block link unlink resolve related edges path tree plan enrich-topology context search
         reindex learnings breadcrumbs digest session-summary audit-pitfalls edge-types init-repo
@@ -1646,6 +1710,12 @@ test_wv_search_code() {
         "wv search --code with empty db reports chunks not ready"
     assert_equals "empty" "$(echo "$empty_out" | jq -r '.readiness.chunks.status' 2>/dev/null || echo unknown)" \
         "wv search --code with empty db reports empty chunk readiness"
+    assert_contains "$(echo "$empty_out" | jq -r '.readiness.chunks.hint' 2>/dev/null || echo '')" "wv index . --json" \
+        "wv search --code with empty db suggests a copy-pasteable index command"
+    assert_contains "$(echo "$empty_out" | jq -r '.readiness.node_files.hint' 2>/dev/null || echo '')" "wv touch <id> --files=src/file.py" \
+        "wv search --code with empty db suggests a copy-pasteable file attribution command"
+    assert_contains "$(echo "$empty_out" | jq -r '.readiness.quality_db.hint' 2>/dev/null || echo '')" "wv quality scan . --json" \
+        "wv search --code with empty db suggests a copy-pasteable quality scan command"
 
     # --- Case 5: custom WV_DB stays quiet and avoids graph-table pollution ---
     local custom_db="$TEST_DIR/custom-search.db"
@@ -1690,6 +1760,8 @@ test_preflight_policy_readiness() {
         "wv preflight blocks policy-sensitive completion when quality.db is missing"
     assert_equals "missing" "$(echo "$blocked_json" | jq -r '.policy_readiness.quality.status' 2>/dev/null || echo unknown)" \
         "wv preflight reports missing quality prerequisites"
+    assert_contains "$(echo "$blocked_json" | jq -r '.policy_readiness.hint' 2>/dev/null || echo '')" "wv quality scan . --json" \
+        "wv preflight suggests a copy-pasteable quality scan command when policy readiness blocks"
 
     # --- Case 3: quality scan data clears the policy_readiness block ---
     sqlite3 "$WV_HOT_ZONE/quality.db" "CREATE TABLE scan_meta (id INTEGER PRIMARY KEY); INSERT INTO scan_meta(id) VALUES (1);" 2>/dev/null
@@ -1962,6 +2034,7 @@ main() {
     test_show
     test_ready
     test_status
+    test_bootstrap_agent
     test_stale_active_marker
     test_policy_trigger
     test_trend_signal_wiring

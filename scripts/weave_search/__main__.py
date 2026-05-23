@@ -75,6 +75,118 @@ class ReadinessSignal:
         return payload
 
 
+@dataclass
+class FilterResolution:
+    """Resolved graph filter scope used to constrain code-search candidates."""
+
+    expr: str
+    node_ids: list[str]
+    files: list[str]
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize filter diagnostics for JSON output."""
+        return {
+            "expr": self.expr,
+            "matched_nodes": len(self.node_ids),
+            "matched_files": len(self.files),
+        }
+
+
+def _normalize_repo_path(path: str) -> str:
+    """Canonicalize repository-relative paths for chunks.file/node_files.path joins."""
+    normalized = path.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if normalized.startswith("/"):
+        normalized = normalized[1:]
+    return normalized
+
+
+def resolve_filter_scope(filter_expr: str, db_path: str) -> FilterResolution:
+    """Resolve supported graph filter expressions into node IDs and node_files allowlist."""
+    if not filter_expr:
+        raise ValueError("empty filter expression")
+
+    expr = filter_expr.strip()
+    op = "exists"
+    edge_type = ""
+    if expr.startswith("edge-type!="):
+        op = "not-exists"
+        edge_type = expr[len("edge-type!="):].strip()
+    elif expr.startswith("edge-type="):
+        op = "exists"
+        edge_type = expr[len("edge-type="):].strip()
+    else:
+        raise ValueError(
+            f"unsupported filter '{filter_expr}'. Supported: edge-type=<type>, edge-type!=<type>"
+        )
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", edge_type):
+        raise ValueError(f"invalid edge type in filter: {edge_type}")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        if op == "exists":
+            node_rows = conn.execute(
+                """
+                SELECT n.id
+                FROM nodes n
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM edges e
+                    WHERE (e.source = n.id OR e.target = n.id) AND e.type = ?
+                )
+                """,
+                (edge_type,),
+            ).fetchall()
+        else:
+            node_rows = conn.execute(
+                """
+                SELECT n.id
+                FROM nodes n
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM edges e
+                    WHERE (e.source = n.id OR e.target = n.id) AND e.type = ?
+                )
+                """,
+                (edge_type,),
+            ).fetchall()
+    except sqlite3.OperationalError as exc:
+        raise ValueError(
+            "graph tables unavailable in current DB; ensure nodes/edges/node_files are present"
+        ) from exc
+    finally:
+        conn.close()
+
+    node_ids = [str(row[0]) for row in node_rows if row and row[0]]
+    if not node_ids:
+        return FilterResolution(expr=expr, node_ids=[], files=[])
+
+    conn = sqlite3.connect(db_path)
+    try:
+        placeholders = ",".join("?" for _ in node_ids)
+        file_rows = conn.execute(
+            f"""
+            SELECT DISTINCT path
+            FROM node_files
+            WHERE node_id IN ({placeholders})
+              AND path IS NOT NULL
+              AND path != ''
+            """,
+            tuple(node_ids),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        raise ValueError(
+            "node_files table unavailable in current DB; cannot build file allowlist"
+        ) from exc
+    finally:
+        conn.close()
+
+    files = sorted({_normalize_repo_path(str(row[0])) for row in file_rows if row and row[0]})
+    return FilterResolution(expr=expr, node_ids=node_ids, files=files)
+
+
 def _safe_scalar(conn: sqlite3.Connection, query: str) -> int | None:
     """Execute a scalar query and return the first column, or None on schema/runtime errors."""
     try:
@@ -98,7 +210,7 @@ def collect_readiness(db_path: str, quality_db: str | None = None) -> dict[str, 
             ready=False,
             status="missing",
             detail="brain.db not found",
-            hint="Run `wv index` first to create and populate the chunks table.",
+            hint="Run `wv index .` from the repo root to build code-search chunks. Example: `wv index . --json`.",
             path=db_path,
         )
         readiness["chunks"] = missing
@@ -107,8 +219,8 @@ def collect_readiness(db_path: str, quality_db: str | None = None) -> dict[str, 
             status="missing",
             detail="brain.db not found, so node_files cannot be inspected",
             hint=(
-                "Run work through the touched-files hook or use "
-                "`wv touch <id> --files=...` after the graph DB exists."
+                "After indexing, attribute files through the touched-files hook or run "
+                "`wv touch <id> --files=src/file.py`."
             ),
             path=db_path,
         )
@@ -121,7 +233,7 @@ def collect_readiness(db_path: str, quality_db: str | None = None) -> dict[str, 
                     ready=False,
                     status="missing",
                     detail="chunks table is missing from brain.db",
-                    hint="Run `wv index` to create and populate chunks for code search.",
+                    hint="Run `wv index .` to create and populate code-search chunks. Example: `wv index . --json`.",
                     path=db_path,
                 )
             elif chunk_count == 0:
@@ -129,7 +241,7 @@ def collect_readiness(db_path: str, quality_db: str | None = None) -> dict[str, 
                     ready=False,
                     status="empty",
                     detail="chunks table exists but has no indexed code",
-                    hint="Run `wv index` to populate code-search chunks.",
+                    hint="Run `wv index .` to populate code-search chunks. Example: `wv index . --json`.",
                     count=0,
                     path=db_path,
                 )
@@ -149,8 +261,8 @@ def collect_readiness(db_path: str, quality_db: str | None = None) -> dict[str, 
                     status="missing",
                     detail="node_files table is missing from brain.db",
                     hint=(
-                        "Populate file attribution through touched-files hooks or "
-                        "`wv touch <id> --files=...` so --graph can attach Weave nodes."
+                        "Populate file attribution through touched-files hooks or run "
+                        "`wv touch <id> --files=src/file.py` so --graph can attach Weave nodes."
                     ),
                     path=db_path,
                 )
@@ -160,7 +272,7 @@ def collect_readiness(db_path: str, quality_db: str | None = None) -> dict[str, 
                     status="empty",
                     detail="node_files has no tracked file attributions",
                     hint=(
-                        "Run edits through the touched-files hook or `wv touch <id> --files=...` "
+                        "Run edits through the touched-files hook or `wv touch <id> --files=src/file.py` "
                         "so --graph can attach Weave nodes."
                     ),
                     count=0,
@@ -183,7 +295,7 @@ def collect_readiness(db_path: str, quality_db: str | None = None) -> dict[str, 
             ready=False,
             status="missing",
             detail="quality.db path not configured",
-            hint="Run `wv quality scan` to produce churn and hotspot data for --graph search context.",
+            hint="Run `wv quality scan .` for --graph context. Example: `wv quality scan . --json`.",
         )
         return readiness
 
@@ -193,7 +305,7 @@ def collect_readiness(db_path: str, quality_db: str | None = None) -> dict[str, 
             ready=False,
             status="missing",
             detail="quality.db not found",
-            hint="Run `wv quality scan` to produce churn and hotspot data for --graph search context.",
+            hint="Run `wv quality scan .` for --graph context. Example: `wv quality scan . --json`.",
             path=quality_path,
         )
         return readiness
@@ -209,7 +321,7 @@ def collect_readiness(db_path: str, quality_db: str | None = None) -> dict[str, 
             ready=False,
             status="missing",
             detail="quality.db exists but git_stats is unavailable",
-            hint="Run `wv quality scan` to populate churn and hotspot data for --graph search context.",
+            hint="Run `wv quality scan .` for --graph context. Example: `wv quality scan . --json`.",
             path=quality_path,
         )
     elif git_stats_count == 0:
@@ -217,7 +329,7 @@ def collect_readiness(db_path: str, quality_db: str | None = None) -> dict[str, 
             ready=False,
             status="empty",
             detail="quality.db exists but has no git_stats rows",
-            hint="Run `wv quality scan` to populate churn and hotspot data for --graph search context.",
+            hint="Run `wv quality scan .` for --graph context. Example: `wv quality scan . --json`.",
             count=0,
             path=quality_path,
         )
@@ -258,25 +370,49 @@ def _build_fts_expr(query: str) -> str:
     return " OR ".join(f'"{t}"' for t in tokens[:12])
 
 
-def fts_search(query: str, db_path: str, limit: int = 10) -> list[SearchResult]:
+def fts_search(
+    query: str,
+    db_path: str,
+    limit: int = 10,
+    allowed_files: set[str] | None = None,
+) -> list[SearchResult]:
     """BM25 full-text search over chunks_fts. Returns results sorted best-first."""
     if not Path(db_path).exists():
+        return []
+    if allowed_files is not None and len(allowed_files) == 0:
         return []
     fts_expr = _build_fts_expr(query)
     conn = sqlite3.connect(db_path)
     try:
-        rows = conn.execute(
-            """
-            SELECT c.id, c.file, c.line_start, c.line_end, c.content,
-                   bm25(chunks_fts) AS rank
-            FROM chunks_fts f
-            JOIN chunks c ON f.rowid = c.id
-            WHERE chunks_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-            """,
-            (fts_expr, limit),
-        ).fetchall()
+        if allowed_files:
+            file_list = sorted(allowed_files)
+            placeholders = ",".join("?" for _ in file_list)
+            rows = conn.execute(
+                f"""
+                SELECT c.id, c.file, c.line_start, c.line_end, c.content,
+                       bm25(chunks_fts) AS rank
+                FROM chunks_fts f
+                JOIN chunks c ON f.rowid = c.id
+                WHERE chunks_fts MATCH ?
+                  AND c.file IN ({placeholders})
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (fts_expr, *file_list, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT c.id, c.file, c.line_start, c.line_end, c.content,
+                       bm25(chunks_fts) AS rank
+                FROM chunks_fts f
+                JOIN chunks c ON f.rowid = c.id
+                WHERE chunks_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (fts_expr, limit),
+            ).fetchall()
     except sqlite3.OperationalError:
         return []
     finally:
@@ -329,14 +465,21 @@ def vector_search(
     db_path: str,
     limit: int = 10,
     model_name: str = _DEFAULT_MODEL,
+    allowed_files: set[str] | None = None,
 ) -> list[SearchResult]:
     """Cosine similarity search over stored chunk embeddings."""
     if not Path(db_path).exists():
+        return []
+    if allowed_files is not None and len(allowed_files) == 0:
         return []
 
     rows = _load_vector_rows(db_path)
     if not rows:
         return []
+    if allowed_files:
+        rows = [row for row in rows if _normalize_repo_path(row[1]) in allowed_files]
+        if not rows:
+            return []
 
     try:
         import numpy as np  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
@@ -388,11 +531,14 @@ def hybrid_search(
     limit: int = 10,
     model_name: str = _DEFAULT_MODEL,
     rrf_k: int = 60,
+    allowed_files: set[str] | None = None,
 ) -> list[SearchResult]:
     """RRF blend of FTS BM25 and cosine similarity — best of both retrieval modes."""
     fetch = limit * 3
-    fts = fts_search(query, db_path, limit=fetch)
-    vec = vector_search(query, db_path, limit=fetch, model_name=model_name)
+    fts = fts_search(query, db_path, limit=fetch, allowed_files=allowed_files)
+    vec = vector_search(
+        query, db_path, limit=fetch, model_name=model_name, allowed_files=allowed_files
+    )
 
     fts_rank = {r.chunk_id: i + 1 for i, r in enumerate(fts)}
     vec_rank = {r.chunk_id: i + 1 for i, r in enumerate(vec)}
@@ -436,6 +582,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--mode", choices=["hybrid", "fts", "vector"], default="hybrid")
     parser.add_argument("--model", default=_DEFAULT_MODEL)
+    parser.add_argument(
+        "--filter",
+        default=None,
+        help="Graph filter expression for candidate scoping (e.g. edge-type=blocks)",
+    )
     parser.add_argument("--graph", action="store_true",
                         help="Attach Weave node context and quality churn to results")
     parser.add_argument("--quality-db", default=None,
@@ -448,12 +599,28 @@ def main(argv: list[str] | None = None) -> int:
         print("error: brain.db not found (set WV_DB or pass --db)", file=sys.stderr)
         return 1
 
+    allowed_files: set[str] | None = None
+    filter_resolution: FilterResolution | None = None
+    if args.filter:
+        try:
+            # Phase 1 for --filter: parse + resolve to node/file scope.
+            # Candidate enforcement is applied to all retrieval modes.
+            filter_resolution = resolve_filter_scope(args.filter, db_path)
+            allowed_files = set(filter_resolution.files)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
     if args.mode == "fts":
-        results = fts_search(args.query, db_path, args.limit)
+        results = fts_search(args.query, db_path, args.limit, allowed_files=allowed_files)
     elif args.mode == "vector":
-        results = vector_search(args.query, db_path, args.limit, args.model)
+        results = vector_search(
+            args.query, db_path, args.limit, args.model, allowed_files=allowed_files
+        )
     else:
-        results = hybrid_search(args.query, db_path, args.limit, args.model)
+        results = hybrid_search(
+            args.query, db_path, args.limit, args.model, allowed_files=allowed_files
+        )
 
     hot_zone = os.environ.get("WV_HOT_ZONE", "")
     quality_db = args.quality_db or (f"{hot_zone}/quality.db" if hot_zone else None)
@@ -483,17 +650,35 @@ def main(argv: list[str] | None = None) -> int:
             out.append(entry)
         print(json.dumps({
             "results": out,
+            **({"filter": filter_resolution.to_dict()} if filter_resolution else {}),
             "readiness": {key: signal.to_dict() for key, signal in readiness.items()},
         }))
         return 0
 
     if not results:
-        print(f"No code matches found for: {args.query}")
+        if filter_resolution and not filter_resolution.files:
+            print(
+                "No code matches found: filter resolved to 0 allowlisted files "
+                f"({filter_resolution.expr})"
+            )
+        else:
+            print(f"No code matches found for: {args.query}")
+        if filter_resolution:
+            print(
+                f"Filter: {filter_resolution.expr}  "
+                f"[nodes={len(filter_resolution.node_ids)} files={len(filter_resolution.files)}]"
+            )
         _print_readiness(readiness)
         return 0
 
     print(f"Code search: {args.query}  [{args.mode}]")
     print()
+    if filter_resolution:
+        print(
+            f"Filter: {filter_resolution.expr}  "
+            f"[nodes={len(filter_resolution.node_ids)} files={len(filter_resolution.files)}]"
+        )
+        print()
     if args.graph or any(not signal.ready for signal in readiness.values()):
         _print_readiness(readiness)
     for i, r in enumerate(results, 1):

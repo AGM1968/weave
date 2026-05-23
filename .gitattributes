@@ -5,6 +5,7 @@
 .weave/state.sql.txt-dump -diff linguist-generated
 .weave/nodes.jsonl merge=ours -diff linguist-generated
 .weave/edges.jsonl merge=ours -diff linguist-generated
+.weave/breadcrumbs.md merge=ours
 
 # Delta files: unique filenames mean no real conflicts; merge=theirs is a safety net.
 # Requires: git config merge.theirs.driver "cp %B %A" (done by wv-init-repo)

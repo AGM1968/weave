@@ -2,6 +2,26 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.50.1] - 2026-05-23
+
+### Fixed
+
+- **Completed the post-`v1.50.0` version bump** — the MCP package surfaces, public design doc,
+  changelog, and generated Makefile template now all advertise `1.50.1`, keeping the tagged source
+  release internally consistent.
+
+- **`wv done`/`wv ship` file-backed learning parsing now matches shell form** — newline-delimited
+  `decision:`, `pattern:`, and `pitfall:` entries from `--learning-file` are parsed into the same
+  structured metadata keys and hygiene score as inline `--learning="..."` input.
+
+- **`wv search` help is discoverable again** — the topic help stub now matches the richer internal
+  `wv search --help` surface, so `--code`, `--filter`, `--type`, and `--learning` guidance is shown
+  through normal help entry points.
+
+- **Weave breadcrumbs now inherit `merge=ours`** — generated `.gitattributes` blocks now include
+  `.weave/breadcrumbs.md`, aligning it with the other locally authoritative Weave state files and
+  suppressing noisy PR diffs via `linguist-generated` on the state dumps.
+
 ## [1.49.1] - 2026-05-23
 
 ### Fixed

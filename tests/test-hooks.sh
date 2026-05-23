@@ -512,6 +512,39 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 when --verification-evidence inline flag present"
 assert_equals "" "$OUTPUT" "pre-close: silent (no deny) when --verification-evidence inline flag present"
 
+# File-based --verification-evidence flag also satisfies hook
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID2 --verification-evidence-file=/tmp/evidence.txt --learning=\\\"test\\\"\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 when --verification-evidence-file flag present"
+assert_equals "" "$OUTPUT" "pre-close: silent (no deny) when --verification-evidence-file flag present"
+
+# ship-agent uses the same close-time gate and must honor inline verification flags
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv ship-agent $ID2 --verification-method=\\\"make check\\\" --learning=\\\"test\\\" --json\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 for ship-agent when inline verification flag present"
+assert_equals "" "$OUTPUT" "pre-close: silent (no deny) for ship-agent when verification flag present"
+
+# Agent mode emits progress markers to stderr for close-time hook checks
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID2 --verification-method=\\\"make check\\\" --learning=\\\"test\\\"\"}}" | env WV_AGENT_MODE=1 bash "$HOOKS_DIR/pre-close-verification.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-close: agent mode progress markers still allow the command"
+assert_contains "$OUTPUT" "[wv-agent-mode] pre-close: load node metadata" "pre-close: agent mode reports node metadata progress"
+assert_contains "$OUTPUT" "[wv-agent-mode] pre-close: check verification inputs" "pre-close: agent mode reports verification progress"
+
+# Agent mode surfaces strict timeout messages when a hook stage exceeds its timeout
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID2 --verification-method=\\\"make check\\\" --learning=\\\"test\\\"\"}}" | env WV_AGENT_MODE=1 WV_AGENT_TEST_TIMEOUT_STAGE=node-json bash "$HOOKS_DIR/pre-close-verification.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-close: timeout denial remains a soft deny in agent mode"
+assert_contains "$OUTPUT" "timed out during node metadata lookup" "pre-close: agent mode timeout explains which stage timed out"
+
 git -C "$TEST_DIR/project" add -A 2>/dev/null
 git -C "$TEST_DIR/project" commit -m "hook hygiene baseline" -q 2>/dev/null || true
 

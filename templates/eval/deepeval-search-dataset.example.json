@@ -1,0 +1,20 @@
+{
+  "cases": [
+    {
+      "id": "blocks_auth",
+      "query": "authentication middleware",
+      "mode": "hybrid",
+      "filter": "edge-type=blocks",
+      "k": 10,
+      "expected_files": ["src/auth.py", "src/session.py"]
+    },
+    {
+      "id": "non_blocks_cache",
+      "query": "cache invalidation",
+      "mode": "fts",
+      "filter": "edge-type!=blocks",
+      "k": 10,
+      "expected_files": ["src/cache.py"]
+    }
+  ]
+}

@@ -2243,16 +2243,21 @@ cmd_search() {
             --status=*) status_filter="${1#*=}" ;;
             --type=*) type_filter="${1#*=}" ;;
             --learning) learning_only=1 ;;
-            --mode=*|--model=*|--graph|--quality-db=*) extra_args+=("$1") ;;
+            --mode=*|--model=*|--graph|--quality-db=*|--filter=*) extra_args+=("$1") ;;
+            --filter) shift; extra_args+=("--filter=$1") ;;
             --help|-h)
                 echo "Usage: wv search <query> [--limit=N] [--json] [--status=STATUS] [--type=TYPE] [--learning]"
-                echo "       wv search --code <query> [--limit=N] [--json] [--mode=hybrid|fts|vector] [--graph]"
+                echo "       wv search --code <query> [--limit=N] [--json] [--mode=hybrid|fts|vector] [--graph] [--filter=<expr>]"
                 echo ""
                 echo "  Without --code: searches Weave graph nodes (FTS5 BM25)"
                 echo "  With --code:    searches indexed code chunks (RRF hybrid BM25+cosine)"
                 echo "  --type=TYPE:    filter by metadata.type (finding, task, epic, ...)"
                 echo "  --learning:     only nodes that have captured learning content"
                 echo "  --graph:        attach active Weave nodes + quality churn to results"
+                echo "  --filter=EXPR:  constrain code chunks by graph edge type"
+                echo "                  Supported: edge-type=<type>, edge-type!=<type>"
+                echo "                  Types: blocks, implements, relates_to, addresses, contradicts, resolves"
+                echo '                  Example: wv search --code "auth" --filter=edge-type=blocks'
                 return 0
                 ;;
             -*) echo "Unknown option: $1" >&2; return 1 ;;
@@ -2265,7 +2270,7 @@ cmd_search() {
 
     if [ -z "$query" ]; then
         echo "Usage: wv search <query> [--limit=N] [--json] [--status=STATUS]" >&2
-        echo "       wv search --code <query> [--limit=N] [--mode=hybrid|fts|vector]" >&2
+        echo "       wv search --code <query> [--limit=N] [--mode=hybrid|fts|vector] [--filter=<expr>]" >&2
         return 1
     fi
 

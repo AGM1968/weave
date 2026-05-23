@@ -435,6 +435,13 @@ setup_test_env
 doctor_out=$("$WV" doctor 2>&1)
 assert_contains "$doctor_out" "journal" "doctor checks journal health"
 assert_contains "$doctor_out" "clean" "doctor reports clean journal"
+assert_contains "$doctor_out" "wv provenance" "doctor checks wv provenance"
+assert_contains "$doctor_out" "repo-local" "doctor reports repo-local wv provenance when using scripts/wv"
+
+doctor_agent_out=$("$WV" doctor --agent 2>&1)
+assert_contains "$doctor_agent_out" "agent python" "doctor --agent checks python command resolution"
+assert_contains "$doctor_agent_out" "agent pytest" "doctor --agent checks pytest availability"
+assert_contains "$doctor_agent_out" "agent imports" "doctor --agent checks import visibility"
 
 # Create incomplete journal entry
 source "$PROJECT_ROOT/scripts/lib/wv-config.sh"

@@ -714,6 +714,22 @@ _done_require_finding_metadata() {
     return 1
 }
 
+_done_read_option_file() {
+    local flag_name="$1"
+    local file_path="$2"
+
+    if [ -z "$file_path" ]; then
+        echo -e "${RED}Error: $flag_name requires a file path${NC}" >&2
+        return 1
+    fi
+    if [ ! -r "$file_path" ]; then
+        echo -e "${RED}Error: cannot read $flag_name file: $file_path${NC}" >&2
+        return 1
+    fi
+
+    cat -- "$file_path"
+}
+
 _done_can_prompt_overlap() {
     [ "${WV_NONINTERACTIVE:-0}" != "1" ] && [ -z "${CI:-}" ] && [ -t 0 ] && [ -t 2 ]
 }
@@ -1027,6 +1043,7 @@ cmd_done() {
     local id="${1:-}"
     local reason=""
     local learning=""
+    local learning_file=""
     local no_warn=0
     local skip_verification=0
     local acknowledge_overlap=0
@@ -1034,6 +1051,7 @@ cmd_done() {
     local format="text"
     local verification_method=""
     local verification_evidence=""
+    local verification_evidence_file=""
     local no_gh=0
     local allowed_tools_raw=""
 
@@ -1042,6 +1060,7 @@ cmd_done() {
         case "$1" in
             --reason=*) reason="${1#*=}" ;;
             --learning=*) learning="${1#*=}" ;;
+            --learning-file=*) learning_file="${1#*=}" ;;
             --no-warn) no_warn=1 ;;
             --skip-verification) skip_verification=1 ;;
             --acknowledge-overlap) acknowledge_overlap=1 ;;
@@ -1049,11 +1068,33 @@ cmd_done() {
             --json) format="json" ;;
             --verification-method=*) verification_method="${1#*=}" ;;
             --verification-evidence=*) verification_evidence="${1#*=}" ;;
+            --verification-evidence-file=*) verification_evidence_file="${1#*=}" ;;
             --no-gh) no_gh=1 ;;
             --allowed-tools=*) allowed_tools_raw="${1#--allowed-tools=}" ;;
         esac
         shift
     done
+
+    if [ -n "$learning_file" ]; then
+        local _raw_learning
+        _raw_learning=$(_done_read_option_file "--learning-file" "$learning_file") || return 1
+        # Newline-delimited structured form → pipe-delimited for existing parser
+        if echo "$_raw_learning" | grep -qE '^(decision|pattern|pitfall):'; then
+            local _ld _lp _lf
+            _ld=$(echo "$_raw_learning" | grep '^decision:' | head -1 | sed 's/^decision:[[:space:]]*//')
+            _lp=$(echo "$_raw_learning" | grep '^pattern:'  | head -1 | sed 's/^pattern:[[:space:]]*//')
+            _lf=$(echo "$_raw_learning" | grep '^pitfall:'  | head -1 | sed 's/^pitfall:[[:space:]]*//')
+            learning=""
+            [ -n "$_ld" ] && learning="decision: $_ld"
+            [ -n "$_lp" ] && learning="${learning:+$learning | }pattern: $_lp"
+            [ -n "$_lf" ] && learning="${learning:+$learning | }pitfall: $_lf"
+        else
+            learning="$_raw_learning"
+        fi
+    fi
+    if [ -n "$verification_evidence_file" ]; then
+        verification_evidence=$(_done_read_option_file "--verification-evidence-file" "$verification_evidence_file") || return 1
+    fi
 
     if [ -z "$id" ]; then
         echo -e "${RED}Error: node ID required${NC}" >&2
@@ -2726,58 +2767,46 @@ cmd_quick() {
 # cmd_ship — Done + sync in one command (local completion)
 # ═══════════════════════════════════════════════════════════════════════════
 
-cmd_ship() {
-    # Check for incomplete operations before starting a new ship
-    if journal_has_incomplete 2>/dev/null; then
-        echo -e "${YELLOW}⚠ Recovering incomplete operation before shipping...${NC}" >&2
-        cmd_recover --auto 2>/dev/null || true
+_ship_needs_gh() {
+    local id="$1"
+    local gh_flag="$2"
+
+    if [ "$gh_flag" = true ]; then
+        return 0
     fi
 
-    local id="${1:-}"
-    local learning=""
-    local gh_flag=false
-    local skip_verification=false
-    local no_overlap_check=false
+    local gh_found
+    gh_found=$(db_query "
+        WITH RECURSIVE ancestry(id) AS (
+            SELECT '$id'
+            UNION ALL
+            SELECT e.target FROM edges e JOIN ancestry a ON e.source = a.id WHERE e.type = 'implements'
+        )
+        SELECT 1 FROM nodes n JOIN ancestry a ON n.id = a.id
+        WHERE json_extract(n.metadata, '$.gh_issue') IS NOT NULL
+        LIMIT 1;
+    " 2>/dev/null || true)
+    [ -n "$gh_found" ]
+}
 
-    shift || true
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --learning=*) learning="${1#*=}" ;;
-            --gh) gh_flag=true ;;
-            --skip-verification) skip_verification=true ;;
-            --no-overlap-check) no_overlap_check=true ;;
-        esac
-        shift
-    done
-
-    if [ -z "$id" ]; then
-        echo -e "${RED}Error: node ID required${NC}" >&2
-        echo "Usage: wv ship <id> [--learning=\"...\"] [--gh] [--no-overlap-check]" >&2
-        return 1
-    fi
+_ship_run() {
+    local id="$1"
+    local learning="$2"
+    local learning_file="$3"
+    local gh_flag="$4"
+    local skip_verification="$5"
+    local no_overlap_check="$6"
+    local verification_method="$7"
+    local verification_evidence="$8"
+    local verification_evidence_file="$9"
 
     # Validate ID format
     validate_id "$id" || return 1
 
     # Auto-detect GH sync need before journaling
     local needs_gh=false
-    if [ "$gh_flag" = true ]; then
+    if _ship_needs_gh "$id" "$gh_flag"; then
         needs_gh=true
-    else
-        local gh_found
-        gh_found=$(db_query "
-            WITH RECURSIVE ancestry(id) AS (
-                SELECT '$id'
-                UNION ALL
-                SELECT e.target FROM edges e JOIN ancestry a ON e.source = a.id WHERE e.type = 'implements'
-            )
-            SELECT 1 FROM nodes n JOIN ancestry a ON n.id = a.id
-            WHERE json_extract(n.metadata, '$.gh_issue') IS NOT NULL
-            LIMIT 1;
-        " 2>/dev/null || true)
-        if [ -n "$gh_found" ]; then
-            needs_gh=true
-        fi
     fi
 
     # Set ship_pending metadata marker (survives reboot for fallback recovery)
@@ -2789,20 +2818,33 @@ cmd_ship() {
     # Step 1: Close the node
     journal_step 1 "done" "{\"id\":\"$id\"}"
     local done_rc=0
+    local done_args=("$id")
     if [ -n "$learning" ]; then
-        if [ "$no_overlap_check" = true ]; then
-            cmd_done "$id" --learning="$learning" --no-overlap-check || done_rc=$?
-        else
-            cmd_done "$id" --learning="$learning" || done_rc=$?
-        fi
+        done_args+=("--learning=$learning")
+    fi
+    if [ -n "$learning_file" ]; then
+        done_args+=("--learning-file=$learning_file")
+    fi
+    if [ -n "$verification_method" ]; then
+        done_args+=("--verification-method=$verification_method")
+    fi
+    if [ -n "$verification_evidence" ]; then
+        done_args+=("--verification-evidence=$verification_evidence")
+    fi
+    if [ -n "$verification_evidence_file" ]; then
+        done_args+=("--verification-evidence-file=$verification_evidence_file")
+    fi
+    if [ "$no_overlap_check" = true ]; then
+        done_args+=("--no-overlap-check")
+    fi
+
+    if [ -n "$learning" ] || [ -n "$learning_file" ]; then
+        cmd_done "${done_args[@]}" || done_rc=$?
     elif [ "$skip_verification" = true ]; then
-        if [ "$no_overlap_check" = true ]; then
-            cmd_done "$id" --skip-verification --no-overlap-check || done_rc=$?
-        else
-            cmd_done "$id" --skip-verification || done_rc=$?
-        fi
+        done_args+=("--skip-verification")
+        cmd_done "${done_args[@]}" || done_rc=$?
     else
-        echo -e "${RED}Error: --learning=\"...\" or --skip-verification required${NC}" >&2
+        echo -e "${RED}Error: --learning=\"...\", --learning-file=PATH, or --skip-verification required${NC}" >&2
         echo "Usage: wv ship <id> --learning=\"decision: ... | pattern: ... | pitfall: ...\"" >&2
         journal_abort 2>/dev/null || true
         return 1
@@ -2823,10 +2865,6 @@ cmd_ship() {
     export _WV_SKIP_SYNC_COMMIT=1
     if [ "$needs_gh" = true ]; then
         echo -e "${CYAN}ℹ${NC} GitHub-linked node detected — syncing with --gh --mode=fast"
-        # Phase B: routine close paths use fast mode bounded to this node's
-        # impacted set (focus + parent + children + blockers). Falls back to
-        # repair mode for interrupted/recovery flows via
-        # wv sync --gh --mode=repair (resumable from checkpoint).
         cmd_sync --gh --mode=fast --node="$id"
     else
         cmd_sync
@@ -2843,6 +2881,153 @@ cmd_ship() {
     db_query "UPDATE nodes SET metadata = json_remove(metadata, '$.ship_pending') WHERE id = '$id';" 2>/dev/null || true
     journal_end
     journal_clean
+}
+
+cmd_ship() {
+    # Check for incomplete operations before starting a new ship
+    if journal_has_incomplete 2>/dev/null; then
+        echo -e "${YELLOW}⚠ Recovering incomplete operation before shipping...${NC}" >&2
+        cmd_recover --auto 2>/dev/null || true
+    fi
+
+    local id="${1:-}"
+    local learning=""
+    local learning_file=""
+    local gh_flag=false
+    local skip_verification=false
+    local no_overlap_check=false
+    local verification_method=""
+    local verification_evidence=""
+    local verification_evidence_file=""
+
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --learning=*) learning="${1#*=}" ;;
+            --learning-file=*) learning_file="${1#*=}" ;;
+            --gh) gh_flag=true ;;
+            --skip-verification) skip_verification=true ;;
+            --no-overlap-check) no_overlap_check=true ;;
+            --verification-method=*) verification_method="${1#*=}" ;;
+            --verification-evidence=*) verification_evidence="${1#*=}" ;;
+            --verification-evidence-file=*) verification_evidence_file="${1#*=}" ;;
+        esac
+        shift
+    done
+
+    if [ -z "$id" ]; then
+        echo -e "${RED}Error: node ID required${NC}" >&2
+        echo "Usage: wv ship <id> [--learning=\"...\"] [--gh] [--no-overlap-check]" >&2
+        return 1
+    fi
+
+    _ship_run "$id" "$learning" "$learning_file" "$gh_flag" "$skip_verification" "$no_overlap_check" "$verification_method" "$verification_evidence" "$verification_evidence_file"
+}
+
+cmd_ship_agent() {
+    local id="${1:-}"
+    local learning=""
+    local learning_file=""
+    local gh_flag=false
+    local skip_verification=false
+    local no_overlap_check=false
+    local verification_method=""
+    local verification_evidence=""
+    local verification_evidence_file=""
+    local format="json"
+
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --learning=*) learning="${1#*=}" ;;
+            --learning-file=*) learning_file="${1#*=}" ;;
+            --gh) gh_flag=true ;;
+            --skip-verification) skip_verification=true ;;
+            --no-overlap-check) no_overlap_check=true ;;
+            --verification-method=*|--verify-method=*) verification_method="${1#*=}" ;;
+            --verification-evidence=*|--verify-evidence=*) verification_evidence="${1#*=}" ;;
+            --verification-evidence-file=*|--verify-evidence-file=*) verification_evidence_file="${1#*=}" ;;
+            --json) format="json" ;;
+            --help|-h)
+                echo "Usage: wv ship-agent <id> [--learning=\"...\"|--learning-file=PATH] [--verification-method=\"...\"|--verify-method=\"...\"] [--verification-evidence=\"...\"|--verify-evidence=\"...\"|--verification-evidence-file=PATH] [--gh] [--skip-verification] [--no-overlap-check] [--json]" >&2
+                return 0
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$id" ]; then
+        echo -e "${RED}Error: node ID required${NC}" >&2
+        echo "Usage: wv ship-agent <id> [--learning=\"...\"|--learning-file=PATH] [--json]" >&2
+        return 1
+    fi
+
+    local doctor_json doctor_rc=0
+    doctor_json=$(cmd_doctor --agent --json 2>/dev/null) || doctor_rc=$?
+
+    local prev_noninteractive="${WV_NONINTERACTIVE:-}"
+    local prev_agent_mode="${WV_AGENT_MODE:-}"
+    export WV_NONINTERACTIVE=1
+    export WV_AGENT_MODE=1
+
+    local ship_output ship_rc=0
+    ship_output=$(_ship_run "$id" "$learning" "$learning_file" "$gh_flag" "$skip_verification" "$no_overlap_check" "$verification_method" "$verification_evidence" "$verification_evidence_file" 2>&1) || ship_rc=$?
+
+    if [ -n "$prev_noninteractive" ]; then
+        export WV_NONINTERACTIVE="$prev_noninteractive"
+    else
+        unset WV_NONINTERACTIVE
+    fi
+    if [ -n "$prev_agent_mode" ]; then
+        export WV_AGENT_MODE="$prev_agent_mode"
+    else
+        unset WV_AGENT_MODE
+    fi
+
+    local node_json="null"
+    node_json=$(db_query_json_v2 "SELECT id, text, status, metadata FROM nodes WHERE id='$id';" 2>/dev/null | jq '.[0] // null' 2>/dev/null || echo 'null')
+
+    if [ "$format" = "json" ]; then
+        local result_status="shipped"
+        if [ "$doctor_rc" -ne 0 ]; then
+            result_status="doctor_failed"
+        elif [ "$ship_rc" -eq 2 ]; then
+            result_status="pending_close"
+        elif [ "$ship_rc" -ne 0 ]; then
+            result_status="ship_failed"
+        fi
+
+        jq -n \
+            --arg status "$result_status" \
+            --arg node_id "$id" \
+            --arg ship_output "$ship_output" \
+            --argjson doctor "$doctor_json" \
+            --argjson ship_rc "$ship_rc" \
+            --argjson doctor_rc "$doctor_rc" \
+            --argjson node "$node_json" \
+            '{
+                status: $status,
+                node_id: $node_id,
+                noninteractive: true,
+                agent_mode: true,
+                doctor: $doctor,
+                ship_exit_code: $ship_rc,
+                doctor_exit_code: $doctor_rc,
+                node: $node,
+                ship_output: $ship_output
+            }'
+        if [ "$doctor_rc" -ne 0 ]; then
+            return "$doctor_rc"
+        fi
+        return "$ship_rc"
+    fi
+
+    if [ "$doctor_rc" -ne 0 ]; then
+        echo "$doctor_json"
+        return "$doctor_rc"
+    fi
+    printf '%s\n' "$ship_output"
+    return "$ship_rc"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

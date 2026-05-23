@@ -147,6 +147,7 @@ _wv_dispatch() {
         allowed-tools) _resolve_first_id cmd_allowed_tools "$@" ;;
         quick)  cmd_quick "$@" ;;
         ship)   _resolve_first_id cmd_ship "$@" ;;
+        ship-agent) _resolve_first_id cmd_ship_agent "$@" ;;
 
         # Graph commands
         block)   _resolve_first_id cmd_block "$@" ;;
@@ -177,6 +178,7 @@ _wv_dispatch() {
         
         # Ops commands
         bootstrap)       cmd_bootstrap "$@" ;;
+        bootstrap-agent) cmd_bootstrap_agent "$@" ;;
         doctor)          cmd_doctor "$@" ;;
         hotzone)         cmd_hotzone "$@" ;;
         self-update)     cmd_self_update "$@" ;;

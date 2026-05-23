@@ -4,12 +4,46 @@
 
 set -e
 
+_agent_hook_mode() {
+    [ "${WV_AGENT_MODE:-0}" = "1" ]
+}
+
+_agent_hook_progress() {
+    _agent_hook_mode || return 0
+    echo "[wv-agent-mode] pre-close: $1" >&2
+}
+
+_agent_hook_timeout_deny() {
+    local stage="$1"
+    local timeout_s="${WV_AGENT_HOOK_TIMEOUT:-15s}"
+    jq -n \
+        --arg detail "pre-close verification timed out during $stage after $timeout_s. Retry the close command, or run wv doctor --agent to inspect the agent environment." \
+        '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
+    exit 0
+}
+
+_agent_hook_run() {
+    local stage="$1"
+    shift
+
+    _agent_hook_progress "$stage"
+    if _agent_hook_mode && [ "${WV_AGENT_TEST_TIMEOUT_STAGE:-}" = "$stage" ]; then
+        return 124
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --foreground "${WV_AGENT_HOOK_TIMEOUT:-15s}" "$@"
+    else
+        "$@"
+    fi
+}
+
 # Read stdin (JSON payload from Claude Code)
 INPUT=$(cat)
 
 # Fast path: skip jq if stdin doesn't contain our trigger pattern
 case "$INPUT" in
     *"wv done"*) ;;
+    *"wv ship-agent"*) ;;
     *"wv ship"*) ;;
     *) exit 0 ;;
 esac
@@ -19,8 +53,8 @@ esac
 # while older tests used a top-level .command field.
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.cmd // .tool_input.command // .command // empty' 2>/dev/null)
 
-# Check if this is a wv done/ship command
-if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
+# Check if this is a wv done/ship/ship-agent command
+if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
     # Extract the node ID
     NODE_ID=$(echo "$COMMAND" | grep -oP 'wv-[0-9a-f]{4,6}')
 
@@ -35,11 +69,19 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
     fi
     source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
     if [ -x "$WV" ]; then
-        NODE_TEXT=$("$WV" show "$NODE_ID" 2>/dev/null | grep "Text:" | sed 's/^[^:]*: //' || echo "")
-        NODE_META=$("$WV" show "$NODE_ID" --json 2>/dev/null | jq -r '.metadata // "{}"' 2>/dev/null || echo "{}")
+        _agent_hook_progress "load node metadata"
+        NODE_JSON=$(_agent_hook_run "node-json" "$WV" show "$NODE_ID" --json 2>/dev/null) || {
+            rc=$?
+            if [ "$rc" -eq 124 ]; then
+                _agent_hook_timeout_deny "node metadata lookup"
+            fi
+            exit 0
+        }
+        NODE_TEXT=$(echo "$NODE_JSON" | jq -r '.text // empty' 2>/dev/null || echo "")
+        NODE_META=$(echo "$NODE_JSON" | jq -r '.metadata // "{}"' 2>/dev/null || echo "{}")
         NODE_TYPE=$(echo "$NODE_META" | jq -r '.type // "unknown"' 2>/dev/null || echo "unknown")
         # Node not in local DB (e.g. command targets a remote machine via SSH) — allow passthrough.
-        NODE_EXISTS=$("$WV" show "$NODE_ID" --json 2>/dev/null | jq -r '.id // empty' 2>/dev/null || echo "")
+        NODE_EXISTS=$(echo "$NODE_JSON" | jq -r '.id // empty' 2>/dev/null || echo "")
         if [[ -z "$NODE_EXISTS" ]]; then
             exit 0
         fi
@@ -89,13 +131,23 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
         HAS_COMMIT_METADATA=$(echo "$NODE_META" | jq -r '((.commit // "") != "" or ((.commits // []) | length > 0))' 2>/dev/null || echo "false")
         if [[ "$HAS_COMMIT_METADATA" != "true" && "$IS_TRIVIAL" == "false" ]] \
             && git -C "$WV_PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            _agent_hook_progress "check commit hygiene"
             # Refresh index to clear stat-only mtime changes (hooks touch themselves on invocation)
             git -C "$WV_PROJECT_DIR" update-index --refresh >/dev/null 2>&1 || true
             DIRTY_FILES=$(
                 {
-                    git -C "$WV_PROJECT_DIR" diff --name-only 2>/dev/null
-                    git -C "$WV_PROJECT_DIR" diff --cached --name-only 2>/dev/null
-                    git -C "$WV_PROJECT_DIR" ls-files --others --exclude-standard 2>/dev/null
+                    _agent_hook_run "git diff" git -C "$WV_PROJECT_DIR" diff --name-only 2>/dev/null || {
+                        rc=$?
+                        [ "$rc" -eq 124 ] && _agent_hook_timeout_deny "git diff"
+                    }
+                    _agent_hook_run "git diff --cached" git -C "$WV_PROJECT_DIR" diff --cached --name-only 2>/dev/null || {
+                        rc=$?
+                        [ "$rc" -eq 124 ] && _agent_hook_timeout_deny "git diff --cached"
+                    }
+                    _agent_hook_run "git ls-files" git -C "$WV_PROJECT_DIR" ls-files --others --exclude-standard 2>/dev/null || {
+                        rc=$?
+                        [ "$rc" -eq 124 ] && _agent_hook_timeout_deny "git ls-files"
+                    }
                 } | sort -u | grep -v '^$' \
                   | grep -v '^\.weave/' \
                   | grep -v '^\.claude/hooks/' \
@@ -110,9 +162,15 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
                 exit 0
             fi
 
-            ATTRIBUTED_COMMITS=$(git -C "$WV_PROJECT_DIR" log --format="%H" --grep="Weave-ID: $NODE_ID" --since="90 days ago" 2>/dev/null | head -10)
+            ATTRIBUTED_COMMITS=$(_agent_hook_run "git log Weave-ID" git -C "$WV_PROJECT_DIR" log --format="%H" --grep="Weave-ID: $NODE_ID" --since="90 days ago" 2>/dev/null | head -10) || {
+                rc=$?
+                [ "$rc" -eq 124 ] && _agent_hook_timeout_deny "git log Weave-ID"
+            }
             if [[ -z "$ATTRIBUTED_COMMITS" ]]; then
-                ATTRIBUTED_COMMITS=$(git -C "$WV_PROJECT_DIR" log --format="%H" --grep="$NODE_ID" --since="90 days ago" 2>/dev/null | head -10)
+                ATTRIBUTED_COMMITS=$(_agent_hook_run "git log node-id" git -C "$WV_PROJECT_DIR" log --format="%H" --grep="$NODE_ID" --since="90 days ago" 2>/dev/null | head -10) || {
+                    rc=$?
+                    [ "$rc" -eq 124 ] && _agent_hook_timeout_deny "git log node-id"
+                }
             fi
             if [[ -z "$ATTRIBUTED_COMMITS" ]]; then
                 jq -n \
@@ -123,12 +181,13 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
         fi
 
         # Check for --skip-verification flag
+        _agent_hook_progress "check verification inputs"
         if [[ "$COMMAND" =~ --skip-verification ]]; then
             exit 0
         fi
 
         # Inline verification flags satisfy the requirement without a prior wv update
-        if [[ "$COMMAND" =~ --verification-method= ]] || [[ "$COMMAND" =~ --verification-evidence= ]]; then
+        if [[ "$COMMAND" =~ --verification-method= ]] || [[ "$COMMAND" =~ --verification-evidence= ]] || [[ "$COMMAND" =~ --verification-evidence-file= ]]; then
             exit 0
         fi
 
