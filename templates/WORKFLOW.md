@@ -6,13 +6,13 @@ Canonical reference for `wv` — the task graph CLI for AI coding agents. Full d
 ## Core Workflow
 
 ```txt
-git status && wv status           # 0. Pre-flight — check state before acting
+wv bootstrap --json               # 0. Session snapshot — status + active + context + ready + learnings
 wv search "<topic>"               # 1. Check for existing related work before claiming/creating
 wv ready                          # 2. Find unblocked work
-wv work <id>                      # 3. Claim it (sets active)
+wv work <id>                      # 3. Claim it (sets active, enters execute phase)
 # ... do the work ...
-git commit                        # 4. Commit work files (before wv done)
-wv done <id> --learning="..."     # 5. Complete with learnings
+git commit                        # 4. Commit work files — prepare-commit-msg appends Weave-ID: <id>
+wv done <id> --learning="..."     # 5. Complete with learnings (requires attributed commit + evidence)
 wv sync --gh                      # 6. Sync graph + GH (may dirty .weave/)
 git add .weave/ && git commit     # 7. Commit graph state if dirty
 git push                          # 8. MANDATORY before session end
@@ -21,6 +21,15 @@ git push                          # 8. MANDATORY before session end
 Never edit a file without an active node. If `wv status` shows 0 active, run `wv work <id>` or
 create a node first.
 
+`wv bootstrap --json` replaces 7 separate calls at session start (see Token Awareness). For a quick
+mid-session check, use `wv status` (~31 tokens). `git status && wv status` is the manual fallback
+when bootstrap is unavailable.
+
+**Step 4 — commit attribution:** The `prepare-commit-msg` git hook (installed by `wv-init-repo`)
+appends `Weave-ID: <id>` to every commit message automatically. `wv done` verifies this attribution
+exists; if the hook was not installed, add the trailer manually or run
+`git commit --amend -m "$(git log -1 --format=%B) Weave-ID: <id>"` before closing.
+
 ## Commands
 
 | Command                    | What it does                                                           | Key flags                                                                       |
@@ -28,7 +37,7 @@ create a node first.
 | `wv ready`                 | List unblocked work                                                    | `--json`, `--count`                                                             |
 | `wv work <id>`             | Claim node (sets active)                                               |                                                                                 |
 | `wv add "<text>"`          | Create node                                                            | `--gh`, `--status=`, `--parent=`, `--alias=`, `--standalone`                    |
-| `wv done <id>`             | Complete node (auto-closes linked GH issue)                            | `--learning="..."`, `--no-overlap-check`                                        |
+| `wv done <id>`             | Complete node (auto-closes linked GH issue)                            | `--learning="..."`, `--no-overlap-check`, `--no-gh`                             |
 | `wv ship <id>`             | Done + sync in one step; pending Git sync is surfaced separately       | `--learning="..."`, `--gh`, `--no-overlap-check`                                |
 | `wv update <id>`           | Modify node                                                            | `--status=`, `--text=`, `--alias=`, `--metadata=`, `--metadata-file=`, `--echo` |
 | `wv overview`              | Compact graph/session snapshot                                         | `--json`                                                                        |
@@ -49,13 +58,35 @@ create a node first.
 | `wv status`                | Compact status (active/ready/blocked counts)                           |                                                                                 |
 | `wv learnings`             | Show captured decisions/patterns/pitfalls                              | `--category=`, `--grep=`, `--dedup`                                             |
 | `wv link <from> <to>`      | Create semantic edge                                                   | `--type=`, `--context='{...}'`                                                  |
-| `wv health`                | System health check with score                                         | `--json`, `--verbose`, `--fix`                                                  |
+| `wv unlink <from> <to>`    | Remove a semantic edge                                                 | `--type=`                                                                       |
+| `wv edges <id>`            | Inspect all edges touching a node                                      | `--type=`, `--json`                                                             |
+| `wv related <id>`          | Explore N-hop neighborhood of a node                                   | `--type=`, `--direction=`, `--depth=N`, `--json`                                |
+| `wv refs <file\|-t text>`  | Extract Weave node references from text; optionally create edges       | `--link`, `--from=<id>`, `--json`, `--max=N`                                    |
+| `wv health`                | System health check with score                                         | `--json`, `--verbose`, `--fix`, `--history[=N]`                                 |
+| `wv audit-pitfalls`        | List all pitfall learnings with resolution status                      |                                                                                 |
+| `wv guide`                 | Workflow quick reference (in-terminal cheat sheet)                     | `--topic=workflow\|github\|learnings\|context\|routing\|mcp`                    |
+| `wv reindex`               | Rebuild the full-text search index                                     |                                                                                 |
 | `wv sync`                  | Dump to `.weave/state.sql`                                             | `--gh` for GH sync, `--mode=fast\|full\|repair`, `--node=<id>`, `--dry-run`     |
 | `wv load`                  | Restore from `.weave/state.sql`                                        | Run by session start hook                                                       |
 | `wv prune`                 | Archive done nodes >48h                                                | `--age=`, `--orphans-only`, `--dry-run`                                         |
+| `wv unarchive <id>`        | Restore a pruned node from `.weave/archive/` to live graph             | `--dry-run`                                                                     |
 | `wv quality scan`          | Scan repo for complexity + churn                                       | `--exclude=`, `--json`                                                          |
 | `wv quality hotspots`      | Ranked hotspot report                                                  | `--top=N`, `--json`                                                             |
 | `wv findings <sub>`        | Historical finding promotion/list workflow                             | `list`, `promote`                                                               |
+| `wv query [pred...]`       | Predicate-based graph reader (key=val, HAS, MATCH, IN, edge-type=)     | `--format=table\|json\|short`, `--limit=N`, `--order=recent\|hygiene`           |
+| `wv session-summary`       | Session hygiene score (0-100) + nodes created/completed/learnings      |                                                                                 |
+| `wv digest`                | One-line health summary (cheaper than `wv health`)                     | `--json`                                                                        |
+| `wv cache`                 | Claude prompt-cache diagnostics (read vs creation ratio per session)   | `--sessions=N`, `--all`, `--json`                                               |
+| `wv hotzone list`          | List all active graph DB directories with node count and owner         | `--json`                                                                        |
+| `wv hotzone gc`            | Remove orphan hot-zone directories (no matching live repo)             | `--dry-run`                                                                     |
+| `wv compact`               | Delete replayed delta files after safety checks                        | `--older-than=Nd`, `--dry-run`                                                  |
+| `wv doctor`                | Installation health check (deps, hooks, ghost settings, matchers)      | `--json`, `--repair`                                                            |
+| `wv recover`               | Resume interrupted ship/sync flows; list orphaned active nodes         | `--auto`, `--session`, `--json`                                                 |
+| `wv delete <id>`           | Permanently remove a node (closes linked GH issue)                     | `--force`, `--dry-run`, `--no-gh`                                               |
+| `wv preflight <id>`        | Machine-readable blockers, contradictions, readiness check for a node  | returns JSON                                                                    |
+| `wv clean-ghosts`          | Remove edges that reference deleted nodes                              | `--dry-run`                                                                     |
+| `wv edge-types`            | List valid semantic edge types with live edge counts                   | `--stats`, `--json`                                                             |
+| `wv self-update`           | Refresh installed wv from source clone recorded at install time        |                                                                                 |
 
 `--standalone` persists `metadata.standalone=true`. `wv health` excludes intentional standalones
 from `orphan_nodes` and reports them separately as `intentional_standalones`.
@@ -302,6 +333,32 @@ wv status               # confirm active node is still known
 wv context <id> --json  # reload context pack (rule 12: treat as unverified)
 ```
 
+### Session Phases
+
+The enforcement layer uses a three-phase state machine. Understanding phases explains why some edits
+are blocked and others are not.
+
+| Phase      | Set by             | Active-node check                 | Triggered by                               |
+| ---------- | ------------------ | --------------------------------- | ------------------------------------------ |
+| `discover` | session-start hook | skipped                           | Session start — exploring before claiming  |
+| `execute`  | `wv work <id>`     | enforced (hard block if 0 active) | Node claimed, substantive work in progress |
+| `closing`  | `wv done <id>`     | skipped                           | Node just closed — allows follow-up commit |
+
+The phase is stored in `.session_phase` in the hot zone and survives across tool calls within a
+session. Default when no sentinel exists: `execute` (safe, enforcing).
+
+**Common surprises explained by phases:**
+
+- Edits immediately after session start are allowed — you are in `discover`, the hook allows
+  exploration before you claim work.
+- After `wv done`, you can commit the changes without a new active node — you are in `closing`.
+- If you see "No active Weave node found (phase: execute)", you skipped `wv work` or the session
+  epoch check blocked a stale inherited node — run `wv work <id>` to re-claim.
+
+**Stale node detection:** `pre-action.sh` compares the active node's `updated_at` against the
+session epoch. A node active from a prior session (crashed or abandoned) blocks edits until
+explicitly re-claimed: `wv work <id>`. This prevents silently inheriting in-flight work.
+
 ### Subagent Delegation
 
 Delegate when the work produces intermediate output you won't need again. Mental test: _"Will I need
@@ -356,6 +413,44 @@ wv analyze sessions --call-stats --top=5  # limit results
 Use `wv bootstrap --json` at session start (run-cached, single call). Use `wv status` for routine
 checks. Reserve `wv learnings` for targeted `--grep=` queries.
 
+### Code Search
+
+Two search surfaces, different signals:
+
+| Command                      | Searches     | Use for                                             |
+| ---------------------------- | ------------ | --------------------------------------------------- |
+| `wv search "<topic>"`        | Graph nodes  | Prior decisions, findings, learnings, task history  |
+| `wv search --code "<query>"` | Source files | Implementation location, function names, call sites |
+| `mcp__semble__search` (MCP)  | Source files | Same as `--code`, available to Copilot agents       |
+
+Hybrid hunt pattern (highest signal):
+
+```bash
+wv search "auth"             # 1. What decisions/findings exist about auth?
+wv search --code "auth"      # 2. Where is auth implemented?
+wv learnings --grep="auth"   # 3. What pitfalls were hit?
+```
+
+Run `wv index` once per repo to enable `--code` mode (builds BM25 + vector index).
+`mcp__semble__search` needs no setup; pass `repo` param as the project root.
+
+### Ready Re-ranking
+
+`wv ready` re-ranks unblocked nodes by overlap between `metadata.touched_files` and the per-session
+recent-edits ring (last 20 edited paths, stored on tmpfs by `wv-touched-files` hook). Boosted nodes
+show a green `[touched N]` marker in text output; JSON output re-orders silently.
+
+After editing `scripts/cmd/wv-cmd-data.sh`, nodes whose `touched_files` include that path float to
+the top — work already warm in file context surfaces first. Falls back to `created_at ASC` when no
+edits have been made yet.
+
+This signal is passive: it updates automatically as you edit files. No configuration needed.
+
+**When markers appear:** `[touched N]` fires only after the first `PostToolUse` hook in the session
+populates the recent-edits ring (Edit/Write tool calls; Bash reads do not count). Cold sessions and
+the first `wv ready` invocation show nodes in `created_at` order with no markers. JSON output
+silently sorts by overlap when present; falls back to `created_at` order otherwise.
+
 ## Graph Hygiene
 
 Run `wv health` periodically to catch drift. Key maintenance commands:
@@ -365,6 +460,8 @@ wv health                        # score + orphan/ghost-edge counts
 wv prune --age=7d --dry-run      # preview stale done nodes
 wv prune --age=7d                # archive done nodes not updated in 7 days
 wv prune --orphans-only          # archive done nodes with no edges (ignores age)
+wv unarchive <id> --dry-run      # preview restoring a pruned node
+wv unarchive <id>                # restore a pruned node to the live graph
 ```
 
 **`--orphans-only` vs `--age=`:**
@@ -382,6 +479,15 @@ wv prune --orphans-only          # archive done nodes with no edges (ignores age
    `intentional_standalones`, not `orphan_nodes`
 4. Archive intentional standalones only when you actually want them removed from the live graph →
    `wv prune --orphans-only`
+
+**Stale test/smoke nodes** pollute `wv ready` and the ready-work signal. Audit periodically:
+
+```bash
+wv list --status=todo --json \
+    | jq -r '.[] | select(.text | test("^(smoke|Bench|Test)"; "i")) | .id + ": " + .text'
+```
+
+Delete with `wv delete <id> --force`.
 
 ## Session End Behavior
 
@@ -428,8 +534,8 @@ EOF
 
 ## Agents
 
-The default `weave` MCP server exposes all 35 tools. When `weave-inspect` is also registered,
-read-only agents can use its 15-tool inspect subset.
+The default `weave` MCP server exposes all 40 tools. When `weave-inspect` is also registered,
+read-only agents can use its 17-tool inspect subset.
 
 - **weave-guide** — Workflow best practices, anti-patterns (session lifecycle tools)
 - **epic-planner** — Strategic planning, scope, dependencies, risks (graph mutation tools)

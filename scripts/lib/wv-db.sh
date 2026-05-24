@@ -825,6 +825,7 @@ db_ensure() {
                 sqlite3 "$WV_DB" ".timeout 5000
                     DELETE FROM edges WHERE source IN (SELECT id FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours'))
                        OR target IN (SELECT id FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours'));
+                    DELETE FROM node_files WHERE node_id IN (SELECT id FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours'));
                     DELETE FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours');
                     VACUUM;
                 " 2>/dev/null

@@ -193,6 +193,23 @@ out=$("$WV" query "MATCH nonexistent_xyz_term_abc" 2>&1)
 assert_contains "$out" "No results" "MATCH nonexistent term returns no results"
 
 echo ""
+echo -e "${YELLOW}=== wv query: MATCH dual-FTS learning recall ===${NC}"
+
+# A node whose match phrase appears only in learning/decision, not in the text field.
+# nodes_fts indexes metadata so both tables cover the same phrases — this test verifies
+# that learning-content nodes are returned and not silently dropped.
+LEARNING_ONLY_ID=$("$WV" add "wq-test: node with generic title" --status=done \
+    --metadata='{"decision":"prefer unique sentinel phrase zxqvfoo for testing","pattern":"sentinel only in learning"}' \
+    2>/dev/null | head -1)
+export LEARNING_ONLY_ID
+
+out=$("$WV" query "MATCH zxqvfoo" 2>&1)
+assert_contains "$out" "wq-test: node with generic title" "MATCH phrase-in-learning-only returns the node"
+
+out=$("$WV" query "MATCH unique sentinel phrase" 2>&1)
+assert_contains "$out" "wq-test: node with generic title" "MATCH multi-word phrase-in-learning returns the node"
+
+echo ""
 echo -e "${YELLOW}=== wv query: IN predicate ===${NC}"
 
 out=$("$WV" query "status IN (active,todo)" 2>&1)

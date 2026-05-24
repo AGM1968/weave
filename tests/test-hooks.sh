@@ -392,13 +392,22 @@ set -e
 assert_exit_code "0" "$EXIT_CODE2" "pre-claim: exits 0 when criteria set but risks absent"
 assert_contains "$OUTPUT2" "pre-mortem" "pre-claim: suggests pre-mortem when done_criteria present but risks absent"
 
-# Node with both done_criteria and risks → silent pass
-ID3=$("$WV" add "Claim test both" --metadata='{"done_criteria":["c1"],"risks":[]}' 2>/dev/null | tail -1)
+# Node with done_criteria + risks but no alias → tier 3 deny
+ID3_NOALIAS=$("$WV" add "Claim test no alias" --metadata='{"done_criteria":["c1"],"risks":[]}' 2>/dev/null | tail -1)
+set +e
+OUTPUT3_NOALIAS=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID3_NOALIAS\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
+EXIT_CODE3_NOALIAS=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE3_NOALIAS" "pre-claim: exits 0 (soft deny) when alias absent"
+assert_contains "$OUTPUT3_NOALIAS" "alias" "pre-claim: suggests alias when done_criteria+risks present but alias absent"
+
+# Node with done_criteria, risks, and alias → silent pass
+ID3=$("$WV" add "Claim test both" --alias=claim-test --metadata='{"done_criteria":["c1"],"risks":[]}' 2>/dev/null | tail -1)
 set +e
 OUTPUT3=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID3\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
 EXIT_CODE3=$?
 set -e
-assert_exit_code "0" "$EXIT_CODE3" "pre-claim: exits 0 when both done_criteria and risks present"
+assert_exit_code "0" "$EXIT_CODE3" "pre-claim: exits 0 when done_criteria, risks, and alias present"
 assert_equals "" "$OUTPUT3" "pre-claim: silent when planning metadata complete"
 
 # Back-compat: older test payload shape still accepted

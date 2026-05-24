@@ -2,6 +2,57 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.51.0] - 2026-05-24
+
+### Added
+
+- **`wv unarchive <id>`** — Restore a pruned node from `.weave/archive/` to the live graph. Searches
+  JSONL archive files newest-first, previews with `--dry-run`. Covered by 10 new assertions in
+  `tests/test-data.sh`. MCP `weave_unarchive` tool added.
+- **MCP tools: `weave_unlink`, `weave_block`, `weave_ready`, `weave_query`, `weave_unarchive`** —
+  Five new MCP tools bringing total to 40 (was 35). All tools verified against CLI parity.
+- **`docs/wv-query.md`** — Phase 1 ship artifact documenting predicate syntax, examples, and JSON
+  schema for `wv query`.
+
+### Changed
+
+- **Workflow reference completeness** — `templates/WORKFLOW.md` and
+  `.github/copilot-instructions.md` commands tables updated with 25+ commands missing since
+  v1.1–v1.49: `wv query`, `wv session-summary`, `wv digest`, `wv cache`, `wv hotzone list/gc`,
+  `wv compact`, `wv doctor`, `wv recover`, `wv delete`, `wv unlink`, `wv edges`, `wv related`,
+  `wv refs`, `wv audit-pitfalls`, `wv guide`, `wv reindex`, `wv preflight`, `wv clean-ghosts`,
+  `wv edge-types`, `wv self-update`. `wv done` table entry gains `--no-gh` flag. `wv health` entry
+  gains `--history[=N]`.
+- **`wv done` help string** — `--no-gh` flag now visible in `wv done --help` (was implemented since
+  v1.33 but missing from the usage string).
+- **Session phases documentation** (D1) — Session phase table (`discover`/`execute`/`closing`) added
+  to `templates/WORKFLOW.md` with phase transitions, active-node enforcement rules, and stale-node
+  detection behavior.
+- **Commit attribution documentation** (D2) — `prepare-commit-msg` hook attribution and manual
+  amendment instructions added to workflow step 4.
+- **Bootstrap-first session start** (D4) — Step 0 changed to `wv bootstrap --json` with token-cost
+  annotation explaining it replaces 7 separate calls.
+- **Code search guidance** (D5) — New "Code Search" subsection distinguishing graph FTS
+  (`wv search`) from source code search (`wv search --code` / `mcp__semble__search`).
+- **Ready re-ranking documentation** (D6) — `[touched N]` marker, 20-path `recent-edits.txt` ring,
+  and tmpfs path documented in `templates/WORKFLOW.md`.
+- **MCP tool count corrected** (D7) — `templates/WORKFLOW.md` and `copilot-instructions.md` updated
+  from "35 tools" to "40 tools", "15-tool inspect subset" to "17-tool inspect subset".
+
+### Fixed
+
+- **`wv unarchive` INSERT into generated columns** — `priority` and `type` in the nodes table are
+  `GENERATED ALWAYS AS ... VIRTUAL`; SQLite rejects INSERTs that name them. Removed from INSERT
+  column list.
+- **`wv unarchive` set-e last-statement trap** — Two `[ -n "$r_alias" ] && echo` patterns at
+  function boundaries returned exit 1 when alias was empty. Replaced with `if/fi` guards.
+- **`pre-claim-skills.sh` alias gate (D3)** — Three-tier claim gate now enforces `done_criteria` →
+  `risks` → `alias` in order. Missing alias produces a soft deny with repair instruction before any
+  claim is allowed.
+- **`cmd_doctor` CC 103→91** — Extracted `_doctor_check_git_hook` helper from two identical git
+  commit hook check blocks in `cmd_doctor`. Resolves quality gate block at close time
+  (`mccabe_max_sh` limit=100).
+
 ## [1.50.1] - 2026-05-23
 
 ### Fixed

@@ -275,6 +275,57 @@ assert_equals "9999" "$gh_num" "prune can extract gh_issue from metadata before 
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Test: unarchive command
+# ═══════════════════════════════════════════════════════════════════════════
+echo "Testing: unarchive command"
+
+reset_db
+prune_node=$($WV add "Old task for unarchive test" | tail -1)
+$WV done "$prune_node" >/dev/null 2>&1
+sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-72 hours') WHERE id='$prune_node';"
+$WV prune --age=48h >/dev/null 2>&1
+
+# Verify node is gone from live DB after prune
+gone=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE id='$prune_node';" 2>/dev/null)
+assert_equals "" "$gone" "node absent from live DB after prune"
+
+# Verify archive file was written
+archive_dir="$TEST_DIR/.weave/archive"
+archive_count=$(ls "$archive_dir"/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
+[ "$archive_count" -gt 0 ] && echo -e "  ${GREEN}✓${NC} archive file exists" || { echo -e "  ${RED}✗${NC} no archive file found"; FAILURES=$((FAILURES+1)); }
+
+# Test dry-run — should preview without inserting
+output=$($WV unarchive "$prune_node" --dry-run 2>&1)
+assert_contains "$output" "dry-run" "unarchive --dry-run shows preview"
+assert_contains "$output" "$prune_node" "unarchive --dry-run shows node ID"
+
+# Verify node still absent after dry-run
+still_gone=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE id='$prune_node';" 2>/dev/null)
+assert_equals "" "$still_gone" "dry-run does not restore node"
+
+# Test actual restore
+output=$($WV unarchive "$prune_node" 2>&1)
+assert_contains "$output" "Restored" "unarchive reports success"
+
+# Verify node is back in live DB
+restored=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE id='$prune_node';" 2>/dev/null)
+assert_equals "$prune_node" "$restored" "node restored to live DB"
+
+# Test idempotent — restoring already-live node should warn but not fail
+output=$($WV unarchive "$prune_node" 2>&1)
+assert_contains "$output" "already exists" "second unarchive warns about existing node"
+
+# Test not-found error
+output=$($WV unarchive wv-000000 2>&1) && true  # allow failure exit
+assert_contains "$output" "not found" "unarchive missing node returns error"
+
+# Test --help
+output=$($WV unarchive --help 2>&1)
+assert_contains "$output" "Usage: wv unarchive" "unarchive --help shows usage"
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Test: learnings command
 # ═══════════════════════════════════════════════════════════════════════════
 echo "Testing: learnings command"

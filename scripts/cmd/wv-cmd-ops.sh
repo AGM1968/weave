@@ -1935,6 +1935,25 @@ cmd_hotzone() {
     esac
 }
 
+# _doctor_check_git_hook label src_path installed_path grep_pattern install_cmd
+# Records pass/warn via _doctor_record. Shared by pre-commit and prepare-commit-msg checks.
+_doctor_check_git_hook() {
+    local label="$1" src="$2" installed="$3" grep_pattern="$4" install_cmd="$5"
+    if [ -f "$installed" ]; then
+        if [ -f "$src" ] && cmp -s "$src" "$installed" 2>/dev/null; then
+            _doctor_record "$label" "pass" "Weave hook installed and current"
+        elif [ ! -f "$src" ] && grep -q "$grep_pattern" "$installed" 2>/dev/null; then
+            _doctor_record "$label" "pass" "Weave hook installed (managed by wv init-repo)"
+        elif grep -q "$grep_pattern" "$installed" 2>/dev/null; then
+            _doctor_record "$label" "warn" "stale — $install_cmd"
+        else
+            _doctor_record "$label" "warn" "exists but not the Weave version — $install_cmd"
+        fi
+    else
+        _doctor_record "$label" "warn" "not installed — $install_cmd"
+    fi
+}
+
 cmd_doctor() {
     _dr_format="text"
     local _dr_repair=false
@@ -2184,37 +2203,18 @@ cmd_doctor() {
     local git_root
     git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
     if [ -n "$git_root" ]; then
-        local pre_commit_src="$git_root/scripts/hooks/pre-commit-weave.sh"
-        local pre_commit="$git_root/.git/hooks/pre-commit"
-        if [ -f "$pre_commit" ]; then
-            if [ -f "$pre_commit_src" ] && cmp -s "$pre_commit_src" "$pre_commit" 2>/dev/null; then
-                _doctor_record "pre-commit hook" "pass" "Weave hook installed and current"
-            elif [ ! -f "$pre_commit_src" ] && grep -q "Weave pre-commit" "$pre_commit" 2>/dev/null; then
-                _doctor_record "pre-commit hook" "pass" "Weave hook installed (managed by wv init-repo)"
-            elif grep -q "Weave pre-commit" "$pre_commit" 2>/dev/null; then
-                _doctor_record "pre-commit hook" "warn" "stale — install -m 755 scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
-            else
-                _doctor_record "pre-commit hook" "warn" "exists but not the Weave version — install -m 755 scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
-            fi
-        else
-            _doctor_record "pre-commit hook" "warn" "not installed — install -m 755 scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
-        fi
-
-        local prepare_hook_src="$git_root/scripts/hooks/prepare-commit-msg-weave.sh"
-        local prepare_hook="$git_root/.git/hooks/prepare-commit-msg"
-        if [ -f "$prepare_hook" ]; then
-            if [ -f "$prepare_hook_src" ] && cmp -s "$prepare_hook_src" "$prepare_hook" 2>/dev/null; then
-                _doctor_record "prepare-commit-msg hook" "pass" "Weave trailer hook installed and current"
-            elif [ ! -f "$prepare_hook_src" ] && grep -q "Weave: append Weave-ID trailers" "$prepare_hook" 2>/dev/null; then
-                _doctor_record "prepare-commit-msg hook" "pass" "Weave trailer hook installed (managed by wv init-repo)"
-            elif grep -q "Weave: append Weave-ID trailers" "$prepare_hook" 2>/dev/null; then
-                _doctor_record "prepare-commit-msg hook" "warn" "stale — install -m 755 scripts/hooks/prepare-commit-msg-weave.sh .git/hooks/prepare-commit-msg"
-            else
-                _doctor_record "prepare-commit-msg hook" "warn" "exists but not the Weave version — install -m 755 scripts/hooks/prepare-commit-msg-weave.sh .git/hooks/prepare-commit-msg"
-            fi
-        else
-            _doctor_record "prepare-commit-msg hook" "warn" "not installed — install -m 755 scripts/hooks/prepare-commit-msg-weave.sh .git/hooks/prepare-commit-msg"
-        fi
+        _doctor_check_git_hook \
+            "pre-commit hook" \
+            "$git_root/scripts/hooks/pre-commit-weave.sh" \
+            "$git_root/.git/hooks/pre-commit" \
+            "Weave pre-commit" \
+            "install -m 755 scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
+        _doctor_check_git_hook \
+            "prepare-commit-msg hook" \
+            "$git_root/scripts/hooks/prepare-commit-msg-weave.sh" \
+            "$git_root/.git/hooks/prepare-commit-msg" \
+            "Weave: append Weave-ID trailers" \
+            "install -m 755 scripts/hooks/prepare-commit-msg-weave.sh .git/hooks/prepare-commit-msg"
     fi
 
     # 18. Ghost settings: check for chat.hooks.enabled in .vscode/settings.json
@@ -3951,7 +3951,7 @@ cmd_help_topic() {
             print_command_help "wv delete <id> [--force] [--dry-run] [--no-gh]" "Delete a node and its edges. Use --dry-run to preview deletions and --force to execute them."
             ;;
         done)
-            print_command_help "wv done <id> [--learning=\"...\"|--learning-file=PATH] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--verification-evidence=\"...\"|--verification-evidence-file=PATH] [--no-warn] [--acknowledge-overlap] [--skip-verification] [--no-overlap-check]" "Close a node and optionally store structured learnings or bypass flags when policy allows it."
+            print_command_help "wv done <id> [--learning=\"...\"|--learning-file=PATH] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--verification-evidence=\"...\"|--verification-evidence-file=PATH] [--no-warn] [--acknowledge-overlap] [--skip-verification] [--no-overlap-check] [--no-gh]" "Close a node and optionally store structured learnings or bypass flags when policy allows it."
             ;;
         ship)
             print_command_help "wv ship <id> [--learning=\"...\"|--learning-file=PATH] [--verification-method=\"...\"] [--verification-evidence=\"...\"|--verification-evidence-file=PATH] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--gh] [--skip-verification] [--no-overlap-check]" "Close a node and sync graph state in one step; any remaining Git sync is surfaced separately."
@@ -4086,6 +4086,9 @@ SEARCHHELP
         prune)
             print_command_help "wv prune [--age=48h] [--dry-run] [--orphans-only]" "Archive old done nodes, optionally targeting only orphaned ones."
             ;;
+        unarchive)
+            print_command_help "wv unarchive <id> [--dry-run] [--with-edges]" "Restore a pruned node from .weave/archive/ back into the live graph."
+            ;;
         clean-ghosts)
             print_command_help "wv clean-ghosts [--dry-run]" "Remove edges that reference deleted nodes."
             ;;
@@ -4189,6 +4192,7 @@ Commands:
   health            System health check with score and diagnostics [--history[=N]]
     guide             Workflow quick reference [--topic=workflow|github|learnings|context|routing|mcp]
   prune             Archive old done nodes
+  unarchive <id>    Restore a pruned node from .weave/archive/ [--dry-run] [--with-edges]
   clean-ghosts      Delete ghost edges referencing deleted nodes [--dry-run] [legacy compatibility]
   compact           Delete replayed deltas after safety checks [--older-than=Nd]
   refs <file|text>  Extract cross-references (dry-run, no edges)

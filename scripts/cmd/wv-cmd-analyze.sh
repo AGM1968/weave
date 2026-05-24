@@ -4,7 +4,7 @@
 # Usage:
 #   wv analyze sessions --call-stats [--log=<path>] [--top=N]
 #
-# Reads a JSONL call log produced by WvClient(call_log_path=...) and surfaces
+# Reads a JSONL call log (enabled via export WV_CALL_LOG=<path>) and surfaces
 # the wv subcommands consuming the most stdout+stderr bytes.
 #
 # Default log path: ~/.local/share/weave/wv_calls.jsonl
@@ -59,8 +59,7 @@ cmd_analyze_sessions() {
         else
             echo "No call log found at: $log_path"
             echo "Enable instrumentation:"
-            echo "  CLI:     export WV_CALL_LOG=~/.local/share/weave/wv_calls.jsonl"
-            echo "  Runtime: pass call_log_path= to WvClient"
+            echo "  export WV_CALL_LOG=~/.local/share/weave/wv_calls.jsonl"
         fi
         return 0
     fi

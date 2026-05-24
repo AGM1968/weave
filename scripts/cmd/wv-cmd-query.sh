@@ -101,7 +101,7 @@ _query_parse_predicate() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 _query_build_sql() {
-    local from_source="$1" order="$2" limit="$3"; shift 3
+    local from_source="$1" order="$2" limit="$3" has_learning_fts="$4"; shift 4
     local -a preds=("$@")
 
     # Pre-scan for MATCH before parse loop (subshell cannot set globals)
@@ -145,16 +145,42 @@ _query_build_sql() {
     if [ "$needs_fts" = "1" ]; then
         # Double-quote phrase: neutralises operator injection, searches any FTS column
         local safe; safe=$(printf '%s' "$fts_expr" | sed 's/"/""/g')
-        printf 'SELECT n.id, n.text, n.status, n.metadata, f.rank AS rank
-              FROM nodes_fts f
-              JOIN nodes n ON f.rowid = n.rowid
-              WHERE nodes_fts MATCH '"'"'"%s"'"'"'
-              %s
-              ORDER BY rank
-              %s;\n' \
-            "$safe" \
-            "${where_sql:+AND ${where_sql#WHERE }}" \
-            "$limit_clause"
+        if [ "${has_learning_fts:-0}" = "1" ]; then
+            # UNION nodes_fts + nodes_learning_fts; 2× weight on learning matches.
+            # Outer GROUP BY deduplicates by id, keeping best (lowest) rank.
+            printf 'SELECT id, text, status, metadata, MIN(rank) AS rank FROM (
+                  SELECT n.id AS id, n.text AS text, n.status AS status, n.metadata AS metadata, f.rank AS rank
+                  FROM nodes_fts f
+                  JOIN nodes n ON f.rowid = n.rowid
+                  WHERE nodes_fts MATCH '"'"'"%s"'"'"'
+                  %s
+                  UNION ALL
+                  SELECT n.id, n.text, n.status, n.metadata, lf.rank * 2.0 AS rank
+                  FROM nodes_learning_fts lf
+                  JOIN nodes n ON lf.rowid = n.rowid
+                  WHERE nodes_learning_fts MATCH '"'"'"%s"'"'"'
+                  %s
+                )
+                GROUP BY id
+                ORDER BY rank
+                %s;\n' \
+                "$safe" \
+                "${where_sql:+AND ${where_sql#WHERE }}" \
+                "$safe" \
+                "${where_sql:+AND ${where_sql#WHERE }}" \
+                "$limit_clause"
+        else
+            printf 'SELECT n.id, n.text, n.status, n.metadata, f.rank AS rank
+                  FROM nodes_fts f
+                  JOIN nodes n ON f.rowid = n.rowid
+                  WHERE nodes_fts MATCH '"'"'"%s"'"'"'
+                  %s
+                  ORDER BY rank
+                  %s;\n' \
+                "$safe" \
+                "${where_sql:+AND ${where_sql#WHERE }}" \
+                "$limit_clause"
+        fi
     else
         printf 'SELECT n.id, n.text, n.status, n.metadata
               FROM %s n
@@ -371,7 +397,17 @@ cmd_query() {
 
     db_ensure
 
+    local has_learning_fts=0
+    for p in "${predicates[@]}"; do
+        if [[ "$p" == MATCH\ * ]]; then
+            has_learning_fts=$(sqlite3 "$WV_DB" \
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='nodes_learning_fts';" \
+                2>/dev/null || echo "0")
+            break
+        fi
+    done
+
     local sql
-    sql=$(_query_build_sql "nodes" "$order" "$limit" "${predicates[@]}") || return 1
+    sql=$(_query_build_sql "nodes" "$order" "$limit" "$has_learning_fts" "${predicates[@]}") || return 1
     _query_render "$format" "$include_str" "$sql"
 }

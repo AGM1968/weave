@@ -13,7 +13,12 @@
  *   weave_context  - Get Context Pack for a node
  *   weave_list     - List nodes with filters
  *   weave_link     - Create semantic edges
+ *   weave_unlink   - Remove a semantic edge between two nodes
+ *   weave_block    - Create a blocking edge (shorthand for weave_link with type=blocks)
+ *   weave_unarchive - Restore a pruned node from .weave/archive/ to the live graph
  *   weave_status   - Compact status summary
+ *   weave_ready    - List unblocked nodes ready to claim
+ *   weave_query    - Flexible predicate query over nodes
  *   weave_health   - Graph health check
  *   weave_quick    - Quick-add and start working
  *   weave_work     - Claim a node to work on
@@ -46,6 +51,9 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
   graph: [
     "weave_add",
     "weave_link",
+    "weave_unlink",
+    "weave_block",
+    "weave_unarchive",
     "weave_done",
     "weave_batch_done",
     "weave_list",
@@ -56,6 +64,7 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
   ],
   session: [
     "weave_work",
+    "weave_ready",
     "weave_ship",
     "weave_recover",
     "weave_quick",
@@ -78,7 +87,9 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
   inspect: [
     "weave_context",
     "weave_search",
+    "weave_query",
     "weave_status",
+    "weave_ready",
     "weave_health",
     "weave_preflight",
     "weave_bootstrap",
@@ -450,6 +461,83 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "weave_unlink",
+    description: "Remove a semantic edge between two nodes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from_id: {
+          type: "string",
+          description: "Source node ID (e.g. 'wv-a1b2')",
+        },
+        to_id: {
+          type: "string",
+          description: "Target node ID (e.g. 'wv-c3d4')",
+        },
+        type: {
+          type: "string",
+          enum: [
+            "blocks",
+            "relates_to",
+            "implements",
+            "contradicts",
+            "supersedes",
+            "references",
+            "obsoletes",
+            "addresses",
+          ],
+          description: "Edge type to remove",
+        },
+      },
+      required: ["from_id", "to_id", "type"],
+    },
+  },
+  {
+    name: "weave_block",
+    description: "Create a blocking edge from one node to another. Shorthand for weave_link with type=blocks.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from_id: {
+          type: "string",
+          description: "Blocking node ID — the node that blocks (e.g. 'wv-a1b2')",
+        },
+        to_id: {
+          type: "string",
+          description: "Blocked node ID — the node being blocked (e.g. 'wv-c3d4')",
+        },
+        context: {
+          type: "string",
+          description: "Optional reason for the block",
+        },
+      },
+      required: ["from_id", "to_id"],
+    },
+  },
+  {
+    name: "weave_unarchive",
+    description:
+      "Restore a pruned node from .weave/archive/ back into the live graph. Searches archive JSONL files newest-first.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          description: "Node ID to restore (e.g. 'wv-a1b2')",
+        },
+        dry_run: {
+          type: "boolean",
+          description: "Preview what would be restored without writing",
+        },
+        with_edges: {
+          type: "boolean",
+          description: "Also reconstruct edges where both endpoints are live (skips dangling edges)",
+        },
+      },
+      required: ["id"],
+    },
+  },
+  {
     name: "weave_status",
     description:
       "Get compact status text for agent callers: active work, ready count, blocked count, and pending-close state. Defaults to discover mode.",
@@ -460,6 +548,64 @@ const TOOLS: Tool[] = [
           type: "string",
           enum: [...READ_MODES],
           description: "Optional output mode override (default: discover for MCP/agent callers)",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "weave_ready",
+    description:
+      "List unblocked, unclaimed nodes ready to work on. Equivalent to 'wv ready'. Returns JSON array by default for agent callers.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subtree: {
+          type: "string",
+          description: "Restrict to descendants of this node ID",
+        },
+        all: {
+          type: "boolean",
+          description: "Include all statuses, not just ready",
+        },
+        count: {
+          type: "boolean",
+          description: "Return count only",
+        },
+        mode: {
+          type: "string",
+          enum: [...READ_MODES],
+          description: "Optional output mode override",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "weave_query",
+    description:
+      "Flexible predicate query over nodes. Supports status/tag/HAS/MATCH predicates. Example predicates: 'status=todo', 'tag=auth', 'HAS learning', 'MATCH auth middleware'. Multiple predicates are ANDed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        predicates: {
+          type: "array",
+          items: { type: "string" },
+          description: "Query predicates (e.g. ['status=todo', 'HAS learning', 'MATCH auth'])",
+        },
+        format: {
+          type: "string",
+          enum: ["table", "json", "ids", "text"],
+          description: "Output format (default: json for MCP callers)",
+        },
+        order: {
+          type: "string",
+          enum: ["recent", "alpha", "priority"],
+          description: "Sort order (default: recent)",
+        },
+        limit: {
+          type: "number",
+          description: "Max results (default: 20)",
         },
       },
       required: [],
@@ -765,6 +911,18 @@ const TOOLS: Tool[] = [
           type: "string",
           enum: [...READ_MODES],
           description: "Optional output mode override (default: discover for MCP/agent callers)",
+        },
+        min_quality: {
+          type: "number",
+          description: "Minimum hygiene score (0-5); filters out low-quality learnings",
+        },
+        dedup: {
+          type: "boolean",
+          description: "Find and surface duplicate/redundant learnings via token overlap",
+        },
+        all: {
+          type: "boolean",
+          description: "Include all learnings (bypasses the junk/template filter)",
         },
       },
       required: [],
@@ -1255,9 +1413,71 @@ function handleTool(
       break;
     }
 
+    case "weave_unlink": {
+      const from = args.from_id as string;
+      const to = args.to_id as string;
+      const type = args.type as string;
+      result = wv(["unlink", from, to, `--type=${type}`]);
+      break;
+    }
+
+    case "weave_block": {
+      const from = args.from_id as string;
+      const to = args.to_id as string;
+      const context = args.context as string | undefined;
+      const cmd = ["block", from, to];
+      if (context) cmd.push(`--context=${context}`);
+      result = wv(cmd);
+      break;
+    }
+
+    case "weave_unarchive": {
+      const id = args.id as string;
+      const dryRun = args.dry_run as boolean | undefined;
+      const withEdges = args.with_edges as boolean | undefined;
+      const cmd = ["unarchive", id];
+      if (dryRun) cmd.push("--dry-run");
+      if (withEdges) cmd.push("--with-edges");
+      result = wv(cmd);
+      break;
+    }
+
     case "weave_status": {
       const mode = args.mode as ReadMode | undefined;
       result = wvRead(["status"], WV_TIMEOUT, mode);
+      break;
+    }
+
+    case "weave_ready": {
+      const subtree = args.subtree as string | undefined;
+      const all = args.all as boolean | undefined;
+      const count = args.count as boolean | undefined;
+      const mode = args.mode as ReadMode | undefined;
+      const cmd = ["ready", "--json"];
+      if (subtree) cmd.push(`--subtree=${subtree}`);
+      if (all) cmd.push("--all");
+      if (count) cmd.push("--count");
+      result = wvRead(cmd, WV_TIMEOUT, mode);
+      break;
+    }
+
+    case "weave_query": {
+      const predicates = (args.predicates as string[] | undefined) ?? [];
+      const format = (args.format as string | undefined) ?? "json";
+      const order = args.order as string | undefined;
+      const limit = args.limit as number | undefined;
+      const cmd = ["query", `--format=${format}`];
+      if (order) cmd.push(`--order=${order}`);
+      if (limit !== undefined) cmd.push(`--limit=${limit}`);
+      for (const p of predicates) {
+        if (p.startsWith("HAS ") || p.startsWith("MATCH ")) {
+          const [kw, ...rest] = p.split(" ");
+          cmd.push(kw, rest.join(" "));
+        } else {
+          cmd.push(p);
+        }
+      }
+      result = wvRead(cmd, WV_TIMEOUT);
       break;
     }
 
@@ -1644,12 +1864,18 @@ function handleTool(
       const category = args.category as string | undefined;
       const node = args.node as string | undefined;
       const mode = args.mode as ReadMode | undefined;
+      const minQuality = args.min_quality as number | undefined;
+      const dedup = args.dedup as boolean | undefined;
+      const all = args.all as boolean | undefined;
       const cmd = ["learnings", "--json"];
       if (grep) cmd.push(`--grep=${grep}`);
       if (recent !== undefined) cmd.push(`--recent=${recent}`);
       if (category) cmd.push(`--category=${category}`);
       if (node) cmd.push(`--node=${node}`);
       if (mode) cmd.push(`--mode=${mode}`);
+      if (minQuality !== undefined) cmd.push(`--min-quality=${minQuality}`);
+      if (dedup) cmd.push("--dedup");
+      if (all) cmd.push("--all");
       result = wv(cmd);
       break;
     }
@@ -1821,7 +2047,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.50.1",
+      version: "1.51.0",
     },
     {
       capabilities: {

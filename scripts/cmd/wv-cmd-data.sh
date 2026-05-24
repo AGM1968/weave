@@ -1196,6 +1196,7 @@ cmd_prune() {
         local esc_id
         esc_id="$(sql_escape "$id")"
         prune_sql+="DELETE FROM edges WHERE source='$esc_id' OR target='$esc_id';"
+        prune_sql+="DELETE FROM node_files WHERE node_id='$esc_id';"
         prune_sql+="DELETE FROM nodes WHERE id='$esc_id';"
     done < <(echo "$candidates" | cut -d'|' -f1)
     prune_sql+="DELETE FROM _warp_changes;COMMIT;"
@@ -1321,6 +1322,132 @@ _learnings_dedup() {
         echo ""
         echo "Review with: wv show <id>"
     fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_unarchive — Restore a pruned node from .weave/archive/ JSONL
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_unarchive() {
+    local node_id=""
+    local dry_run=false
+    local with_edges=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run)     dry_run=true ;;
+            --with-edges)  with_edges=true ;;
+            --help|-h)
+                echo "Usage: wv unarchive <id> [--dry-run] [--with-edges]"
+                echo ""
+                echo "  Restore a pruned node from .weave/archive/ back into the live graph."
+                echo "  The most recent archive entry is used when duplicates exist."
+                echo ""
+                echo "  --dry-run      Show what would be restored without writing"
+                echo "  --with-edges   Also reconstruct edges whose other endpoint is live"
+                return 0
+                ;;
+            wv-*) node_id="$1" ;;
+            *)
+                echo -e "${RED}Error: unknown argument: $1${NC}" >&2
+                echo "Usage: wv unarchive <id> [--dry-run] [--with-edges]" >&2
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$node_id" ]; then
+        echo -e "${RED}Error: node ID required (e.g. wv-a1b2c3)${NC}" >&2
+        echo "Usage: wv unarchive <id> [--dry-run] [--with-edges]" >&2
+        return 1
+    fi
+
+    local archive_dir="$WEAVE_DIR/archive"
+    if [ ! -d "$archive_dir" ]; then
+        echo -e "${RED}Error: no archive directory at $archive_dir${NC}" >&2
+        return 1
+    fi
+
+    # Search all archive files newest-first, take the latest record for this ID
+    local record
+    record=$(ls -r "$archive_dir"/*.jsonl 2>/dev/null | while read -r f; do
+        grep "\"id\":\"$node_id\"" "$f" 2>/dev/null | tail -1 && break
+    done)
+
+    if [ -z "$record" ]; then
+        echo -e "${RED}Error: node $node_id not found in archive${NC}" >&2
+        echo "  Archive: $archive_dir" >&2
+        echo "  Available: $(ls "$archive_dir"/*.jsonl 2>/dev/null | wc -l) file(s)" >&2
+        return 1
+    fi
+
+    # Parse fields from the archive record
+    local r_text r_status r_metadata r_alias r_created r_updated
+    r_text=$(     echo "$record" | jq -r '.text     // ""' 2>/dev/null)
+    r_status=$(   echo "$record" | jq -r '.status   // "done"' 2>/dev/null)
+    r_metadata=$( echo "$record" | jq -c '.metadata // {}' 2>/dev/null)
+    r_alias=$(    echo "$record" | jq -r '.alias    // ""' 2>/dev/null)
+    r_created=$(  echo "$record" | jq -r '.created_at // ""' 2>/dev/null)
+    r_updated=$(  echo "$record" | jq -r '.updated_at // ""' 2>/dev/null)
+
+    # Check if node already exists in live DB
+    local existing
+    existing=$(db_query "SELECT id FROM nodes WHERE id='$(sql_escape "$node_id")';" 2>/dev/null || echo "")
+    if [ -n "$existing" ]; then
+        echo -e "${YELLOW}Warning: node $node_id already exists in live graph — skipping${NC}" >&2
+        return 0
+    fi
+
+    if [ "$dry_run" = true ]; then
+        echo -e "${CYAN}[dry-run] Would restore:${NC}"
+        echo "  ID:     $node_id"
+        echo "  Text:   $r_text"
+        echo "  Status: $r_status"
+        if [ -n "$r_alias" ]; then echo "  Alias:  $r_alias"; fi
+        if [ "$with_edges" = true ]; then
+            local edges_count
+            edges_count=$(echo "$record" | jq '.edges // [] | length' 2>/dev/null || echo "0")
+            echo "  Edges:  --with-edges (live-endpoint check at restore time)"
+        fi
+        return 0
+    fi
+
+    # Insert the node
+    local alias_val="NULL"
+    [ -n "$r_alias" ] && alias_val="'$(sql_escape "$r_alias")'"
+    local created_val="CURRENT_TIMESTAMP"
+    [ -n "$r_created" ] && created_val="'$(sql_escape "$r_created")'"
+    local updated_val="CURRENT_TIMESTAMP"
+    [ -n "$r_updated" ] && updated_val="'$(sql_escape "$r_updated")'"
+
+    local insert_sql
+    insert_sql="INSERT INTO nodes (id, text, status, metadata, alias, created_at, updated_at)
+        VALUES (
+            '$(sql_escape "$node_id")',
+            '$(sql_escape "$r_text")',
+            '$(sql_escape "$r_status")',
+            '$(sql_escape "$r_metadata")',
+            $alias_val,
+            $created_val,
+            $updated_val
+        );"
+
+    if ! db_query "$insert_sql" 2>/dev/null; then
+        echo -e "${RED}Error: failed to insert node $node_id${NC}" >&2
+        return 1
+    fi
+
+    echo -e "${GREEN}✓${NC} Restored: $node_id — $r_text"
+
+    if [ "$with_edges" = true ]; then
+        # edges are NOT stored in the archive (archive only stores nodes)
+        # this flag is reserved for future use when edge data is available
+        echo -e "  ${DIM}Note: --with-edges has no effect — edge data is not stored in the archive${NC}" >&2
+    fi
+
+    echo -e "  ${DIM}Status: $r_status${NC}"
+    if [ -n "$r_alias" ]; then echo -e "  ${DIM}Alias: $r_alias${NC}"; fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

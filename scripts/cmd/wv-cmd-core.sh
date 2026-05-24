@@ -1001,10 +1001,14 @@ _done_close_gh_issue() {
     gh issue edit "$gh_num" --repo "$repo" --remove-label "weave:active" >/dev/null 2>&1 || true
     gh issue edit "$gh_num" --repo "$repo" --remove-label "weave:blocked" >/dev/null 2>&1 || true
 
-    if gh issue close "$gh_num" --repo "$repo" --comment "$comment" >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_num" >&2
-    else
-        echo -e "${YELLOW}Warning: could not close GitHub issue #$gh_num${NC}" >&2
+    local gh_state
+    gh_state=$(gh issue view "$gh_num" --repo "$repo" --json state -q '.state' 2>/dev/null || echo "")
+    if [ "$gh_state" = "OPEN" ]; then
+        if gh issue close "$gh_num" --repo "$repo" --comment "$comment" >/dev/null 2>&1; then
+            echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_num" >&2
+        else
+            echo -e "${YELLOW}Warning: could not close GitHub issue #$gh_num${NC}" >&2
+        fi
     fi
 
     # Refresh parent epic body (checkboxes + Mermaid) after child close
@@ -3126,6 +3130,7 @@ cmd_delete() {
 
     # Delete edges first (no ON DELETE CASCADE)
     db_query "DELETE FROM edges WHERE source='$id' OR target='$id';"
+    db_query "DELETE FROM node_files WHERE node_id='$id';"
     # Delete node
     db_query "DELETE FROM nodes WHERE id='$id';"
 
@@ -3141,9 +3146,13 @@ cmd_delete() {
             local repo
             repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
             if [ -n "$repo" ]; then
-                gh issue close "$gh_num" --repo "$repo" --comment "Deleted from Weave graph (node \`$id\`)" 2>/dev/null && \
-                    echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_num" >&2 || \
-                    echo -e "${YELLOW}Warning: Could not close GitHub issue #$gh_num${NC}" >&2
+                local _del_gh_state
+                _del_gh_state=$(gh issue view "$gh_num" --repo "$repo" --json state -q '.state' 2>/dev/null || echo "")
+                if [ "$_del_gh_state" = "OPEN" ]; then
+                    gh issue close "$gh_num" --repo "$repo" --comment "Deleted from Weave graph (node \`$id\`)" 2>/dev/null && \
+                        echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_num" >&2 || \
+                        echo -e "${YELLOW}Warning: Could not close GitHub issue #$gh_num${NC}" >&2
+                fi
             fi
         fi
         journal_complete 2
