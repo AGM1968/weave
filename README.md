@@ -7,13 +7,18 @@ other local-only paths from the full memory-system tree.
 
 ## Why Weave
 
-| Aspect           | Traditional RAG               | Weave                               |
-| ---------------- | ----------------------------- | ----------------------------------- |
-| Retrieval        | Vector search + reranking     | Native grep/read (trail-following)  |
-| Infrastructure   | Vector DB + embeddings + APIs | None (SQLite + tmpfs)               |
-| Relationships    | Implicit (embeddings)         | Explicit (8 typed edge types)       |
-| Token efficiency | Moderate (irrelevant chunks)  | High (context packs, not full dump) |
-| Cross-references | Often missed                  | Semantic edges + graph traversal    |
+| Aspect           | Traditional RAG                | Weave                                                 |
+| ---------------- | ------------------------------ | ----------------------------------------------------- |
+| Retrieval        | Vector search + reranking      | Explicit graph traversal + earned local hybrid search |
+| Infrastructure   | Vector DB + embeddings + APIs  | SQLite + tmpfs; optional local index (no cloud APIs)  |
+| Relationships    | Implicit (embeddings)          | Explicit (8 typed edge types)                         |
+| Token efficiency | Moderate (irrelevant chunks)   | High (context packs, not full dump)                   |
+| Cross-references | Often missed                   | Semantic edges + graph traversal                      |
+| Code search      | External RAG pipeline required | Built-in (`wv search --code`); extend with any tool   |
+
+Code search was added as the codebase matured — BM25+cosine RRF locally, no cloud API required.
+External tools (semble, ripgrep, semgrep, ast-grep) are additive; consumers extend with whatever
+fits their stack.
 
 ## Installation
 
@@ -120,21 +125,46 @@ Focused CLI help: `wv help <command>` or `wv <command> --help`.
 
 ### Task Management
 
-| Command                            | Description                     |
-| ---------------------------------- | ------------------------------- |
-| `wv add "text" --gh`               | Create node + GitHub issue      |
-| `wv work <id>`                     | Claim task (sets active)        |
-| `wv done <id> --learning="..."`    | Complete with captured learning |
-| `wv ship <id> --learning="..."`    | Complete + sync in one step     |
-| `wv quick "text" --learning="..."` | Create + close in one step      |
-| `wv bootstrap --json`              | Single-call session snapshot    |
-| `wv overview --json`               | Compact graph/session snapshot  |
-| `wv touch <id> --intent="..."`     | Zero-output intent update       |
-| `wv help <command>`                | Focused help for one command    |
-| `wv show <id>`                     | View node details               |
-| `wv list --status=todo`            | List nodes by status            |
-| `wv ready`                         | Show unblocked work             |
-| `wv search "query"`                | Full-text search across nodes   |
+| Command                            | Description                        |
+| ---------------------------------- | ---------------------------------- |
+| `wv add "text" --gh`               | Create node + GitHub issue         |
+| `wv work <id>`                     | Claim task (sets active)           |
+| `wv done <id> --learning="..."`    | Complete with captured learning    |
+| `wv ship <id> --learning="..."`    | Complete + sync in one step        |
+| `wv quick "text" --learning="..."` | Create + close in one step         |
+| `wv bootstrap --json`              | Single-call session snapshot       |
+| `wv overview --json`               | Compact graph/session snapshot     |
+| `wv touch <id> --intent="..."`     | Zero-output intent update          |
+| `wv help <command>`                | Focused help for one command       |
+| `wv show <id>`                     | View node details                  |
+| `wv list --status=todo`            | List nodes by status               |
+| `wv ready`                         | Show unblocked work                |
+| `wv search "query"`                | Full-text search across nodes      |
+| `wv search --code "query"`         | Hybrid code search (source files)  |
+| `wv index`                         | Index source files for code search |
+
+### Search
+
+Two tools serve different sources — use both before filing work:
+
+| Tool                       | Source       | When to use                                         |
+| -------------------------- | ------------ | --------------------------------------------------- |
+| `wv search "query"`        | Graph nodes  | Prior decisions, findings, learnings, task history  |
+| `wv search --code "query"` | Source files | Implementation location, function names, call sites |
+
+```bash
+wv index                              # Index source files once (enables --code mode)
+wv search "auth"                      # What decisions/learnings exist about auth?
+wv search --code "auth_middleware"    # Where is auth implemented in source?
+wv search --code "query" --graph      # Include active Weave nodes per matched file
+```
+
+**No-index alternatives** — consumer's choice, no `wv index` required:
+
+- `weave_code_search` (Weave MCP tool) — same hybrid ranking, no external dep
+- **Semble** — dedicated code search: `semble search "<query>" <dir>` (CLI) or `mcp__semble__search`
+  (MCP, pass `repo` param)
+- Any other tool: ripgrep, semgrep, ast-grep, language server search — Weave has no opinion
 
 ### Graph Operations
 
@@ -284,7 +314,7 @@ Install: `./install.sh --with-mcp` or `./install-mcp.sh`
 
 Verify: `wv mcp-status`
 
-## Hook Determinism (v1.10.0+)
+## Hook Determinism
 
 Hooks enforce workflow rules deterministically — the AI agent cannot bypass structural constraints:
 
@@ -299,7 +329,7 @@ Hooks enforce workflow rules deterministically — the AI agent cannot bypass st
 - **10 Makefile wv targets** — CI integration and discoverability.
 - **MCP `weave_edit_guard`** — Pre-edit gate for VS Code Copilot and other MCP clients.
 
-## Code Quality (v1.8.1)
+## Code Quality
 
 Built-in code quality analysis with zero dependencies beyond Python stdlib and git:
 

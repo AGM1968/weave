@@ -447,7 +447,6 @@ Two search surfaces, different signals:
 | ---------------------------- | ------------ | --------------------------------------------------- |
 | `wv search "<topic>"`        | Graph nodes  | Prior decisions, findings, learnings, task history  |
 | `wv search --code "<query>"` | Source files | Implementation location, function names, call sites |
-| `mcp__semble__search` (MCP)  | Source files | Same as `--code`, available to Copilot agents       |
 
 Hybrid hunt pattern (highest signal):
 
@@ -458,7 +457,12 @@ wv learnings --grep="auth"   # 3. What pitfalls were hit?
 ```
 
 Run `wv index` once per repo to enable `--code` mode (builds BM25 + vector index).
-`mcp__semble__search` needs no setup; pass `repo` param as the project root.
+
+**No-index code search** — consumer's choice:
+
+- `weave_code_search` (MCP) — Weave built-in, same hybrid ranking
+- Semble: `semble search "<query>" <dir>` (CLI) or `mcp__semble__search` (MCP, pass `repo` param)
+- Any tool works: ripgrep, semgrep, ast-grep, language server — Weave has no opinion here
 
 ### Ready Re-ranking
 

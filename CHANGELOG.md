@@ -2,6 +2,22 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.51.5] - 2026-05-25
+
+### Fixed
+
+- **`lint-file` target consumer-owned** — moved outside `BEGIN/END WEAVE TARGETS` managed block;
+  `init-repo` writes it once via `_lint_file_stub()` and never overwrites on `--update`. Migration
+  guard appends stub to old repos where `lint-file` was inside the block. Consumers supply their own
+  per-file linter recipe (ruff, eslint, rubocop, etc.).
+- **Two-tool search pattern documented** — `README.md`, `README.public.md`, `WORKFLOW.md` updated
+  with `wv search` (graph nodes) vs `wv search --code` / semble / any external tool (source files).
+  Consumer's choice framing: Weave provides the built-in; semble, ripgrep, ast-grep are additive.
+- **Why Weave tables updated** — Code search row added, Retrieval and Infrastructure rows reflect
+  current state. Added maturation note: BM25+cosine RRF local, no cloud API required.
+- **Version headings stripped from `README.public.md`** — `## Hook Determinism (v1.10.0+)` and
+  `## Code Quality (v1.8.1)` cleaned to plain headings.
+
 ## [1.51.4] - 2026-05-25
 
 ### Fixed
