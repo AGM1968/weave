@@ -2,6 +2,16 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.51.2] - 2026-05-25
+
+### Fixed
+
+- **`install.sh` AGENTS.md stub** — session-start (`wv bootstrap --json`), session-close sequence,
+  and operating rules added to the heredoc written to `.claude/agents/AGENTS.md` in consumer repos.
+  Step 0 corrected from `git status && wv status` to `wv bootstrap --json`.
+- **`templates/AGENTS.md.template`** — same step 0 fix and workflow prose update, matching canonical
+  `WORKFLOW.md`. This file ships as root-level `AGENTS.md` in the public weave repo.
+
 ## [1.51.1] - 2026-05-25
 
 ### Fixed
