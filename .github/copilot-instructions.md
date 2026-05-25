@@ -7,10 +7,10 @@ This repository uses **Weave** for task tracking. Every code change must be trac
 ## Pre-flight (run before anything else)
 
 ```bash
-git status && wv status   # check for uncommitted work + active node count
+wv bootstrap --json   # single call: active/ready/blocked + learnings + context policy
 ```
 
-If `wv status` shows 0 active nodes, claim one before touching files:
+If 0 active nodes, claim one before touching files:
 
 ```bash
 wv search "<topic>"        # check for existing related work before claiming/creating
@@ -58,16 +58,6 @@ wv add "<description>" --standalone
 - `full` — explicit default for plain `wv sync --gh`; exhaustive reconcile.
 - `repair` — resumes from `.weave/repair-checkpoint.json` after an interrupted/crashed sync.
   `wv recover` and the stop-hook recommend this when the checkpoint exists.
-
-## Code quality — run before every commit
-
-```bash
-make format   # auto-fix formatting in place
-make lint     # check for errors (must be clean before committing)
-```
-
-CI will fail if lint is not clean. Always run `make format` after edits, then `make lint` to
-confirm.
 
 ## Context pack for complex nodes
 

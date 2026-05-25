@@ -722,32 +722,92 @@ fi
 mkdir -p "$REPO_ROOT/.weave"
 
 # .weave/runtime.md scaffold (shared by weave-runtime system prompt injection)
+# Two-block architecture:
+#   Block 1: BEGIN/END WEAVE RUNTIME CONTEXT  — context policy, managed by context-guard.sh
+#   Block 2: BEGIN/END WEAVE RUNTIME CONTENT  — generic Weave guidance, updatable by --update
+#   Below block 2: repo-specific content, never touched by init-repo
 RUNTIME_MD="$REPO_ROOT/.weave/runtime.md"
 RUNTIME_MD_MARKER_BEGIN="<!-- BEGIN WEAVE RUNTIME CONTEXT -->"
+RUNTIME_MD_CONTENT_BEGIN="<!-- BEGIN WEAVE RUNTIME CONTENT -->"
+RUNTIME_MD_CONTENT_END="<!-- END WEAVE RUNTIME CONTENT -->"
 RUNTIME_MD_BLOCK="${RUNTIME_MD_MARKER_BEGIN}
 Current context policy: unknown (refresh on session start)
 Policy source: .weave/.context_policy
 This file is loaded into weave-runtime system prompts. Keep repo-specific instructions below this block.
 <!-- END WEAVE RUNTIME CONTEXT -->"
-if [ ! -f "$RUNTIME_MD" ]; then
-    cat > "$RUNTIME_MD" << 'RUNTIMEMDEOF'
-<!-- BEGIN WEAVE RUNTIME CONTEXT -->
-Current context policy: unknown (refresh on session start)
-Policy source: .weave/.context_policy
-This file is loaded into weave-runtime system prompts. Keep repo-specific instructions below this block.
-<!-- END WEAVE RUNTIME CONTEXT -->
+_runtime_content_block() {
+cat << 'RUNTIMECONTENTEOF'
+<!-- BEGIN WEAVE RUNTIME CONTENT -->
+## Session Start
 
-Add project-specific instructions below this line.
-RUNTIMEMDEOF
+```bash
+wv bootstrap --json   # single call: active/ready/blocked + learnings + context policy
+```
+
+Key signals: `active` count (must claim before editing), `git_sync` status, `ready` list,
+`context_policy` (HIGH/MEDIUM/LOW — governs file read depth), recent `learnings`.
+
+## Session Close
+
+```bash
+git add <files> && git commit -m "..."
+wv done <id> --learning="decision: ... | pattern: ... | pitfall: ..."
+wv sync --gh && git add .weave/
+git diff --cached --quiet || git commit -m "chore(weave): sync state [skip ci]"
+git push
+```
+
+Shortcut: `wv ship <id> --learning="..."` (done + sync; still requires push after).
+
+## GraphPolicyViolation (wv done blocked)
+
+```bash
+wv quality functions <file>    # identify functions over CC limit
+# Option A: refactor, commit, wv quality scan, retry wv done
+# Option B: add to .weave/quality.conf [exempt] then wv load, retry wv done
+```
+<!-- END WEAVE RUNTIME CONTENT -->
+RUNTIMECONTENTEOF
+}
+if [ ! -f "$RUNTIME_MD" ]; then
+    {
+        printf '%s\n\n' "$RUNTIME_MD_BLOCK"
+        _runtime_content_block
+        printf '\nAdd repo-specific instructions below this line.\n'
+    } > "$RUNTIME_MD"
     echo -e "  ${GREEN}✓${NC} .weave/runtime.md"
-elif [ "$UPDATE_MODE" = "1" ] && ! grep -qF "$RUNTIME_MD_MARKER_BEGIN" "$RUNTIME_MD"; then
+elif ! grep -qF "$RUNTIME_MD_MARKER_BEGIN" "$RUNTIME_MD"; then
+    # No context block at all — prepend both blocks
     _tmp_runtime=$(mktemp)
     {
         printf '%s\n\n' "$RUNTIME_MD_BLOCK"
+        _runtime_content_block
+        printf '\n'
         cat "$RUNTIME_MD"
     } > "$_tmp_runtime"
     mv "$_tmp_runtime" "$RUNTIME_MD"
-    echo -e "  ${GREEN}✓${NC} .weave/runtime.md (managed block prepended)"
+    echo -e "  ${GREEN}✓${NC} .weave/runtime.md (managed blocks prepended)"
+elif ([ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]) && ! grep -qF "$RUNTIME_MD_CONTENT_BEGIN" "$RUNTIME_MD"; then
+    # Has context block but no content block — inject content block after context block
+    _tmp_runtime=$(mktemp)
+    awk -v content="$(_runtime_content_block)" '
+        /END WEAVE RUNTIME CONTEXT/ { print; print ""; print content; next }
+        { print }
+    ' "$RUNTIME_MD" > "$_tmp_runtime"
+    mv "$_tmp_runtime" "$RUNTIME_MD"
+    echo -e "  ${GREEN}✓${NC} .weave/runtime.md (content block injected)"
+elif [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]; then
+    # Has both blocks — surgical swap of content block, preserve everything outside
+    _before=$(awk '/BEGIN WEAVE RUNTIME CONTENT/{exit} {print}' "$RUNTIME_MD")
+    _after=$(awk '/END WEAVE RUNTIME CONTENT/{found=1; next} found{print}' "$RUNTIME_MD")
+    _tmp_runtime=$(mktemp)
+    {
+        [ -n "$_before" ] && printf '%s\n\n' "$_before"
+        _runtime_content_block
+        [ -n "$_after" ] && printf '%s\n' "$_after"
+    } > "$_tmp_runtime"
+    mv "$_tmp_runtime" "$RUNTIME_MD"
+    echo -e "  ${GREEN}✓${NC} .weave/runtime.md (content block updated)"
 else
     echo -e "  ${YELLOW}⊘${NC} .weave/runtime.md (already exists, skipped)"
 fi
@@ -1295,10 +1355,10 @@ This repository uses **Weave** for task tracking. Every code change must be trac
 ## Pre-flight (run before anything else)
 
 ```bash
-git status && wv status   # check for uncommitted work + active node count
+wv bootstrap --json   # single call: active/ready/blocked + learnings + context policy
 ```
 
-If `wv status` shows 0 active nodes, claim one before touching files:
+If 0 active nodes, claim one before touching files:
 
 ```bash
 wv search "<topic>"        # check for existing related work before claiming/creating
@@ -1332,7 +1392,31 @@ wv quick "<description>" --learning="..."
 
 # Done + sync in one step (check `wv status` for pending Git sync):
 wv ship <id> --learning="..." --no-overlap-check
+
+# Create a standalone node without a parent (persists intentional standalone metadata):
+wv add "<description>" --standalone
+# `wv health` reports these as intentional_standalones, not orphan_nodes.
 ```
+
+## Sync modes
+
+`wv sync --gh` accepts `--mode=fast|full|repair` (and an optional `--node=<id>` focus):
+
+- `fast` — default for `wv ship` and session-end; bounded to focus + impacted set.
+- `full` — explicit default for plain `wv sync --gh`; exhaustive reconcile.
+- `repair` — resumes from `.weave/repair-checkpoint.json` after an interrupted/crashed sync.
+  `wv recover` and the stop-hook recommend this when the checkpoint exists.
+
+## Context pack for complex nodes
+
+Before starting non-trivial work, load the context pack:
+
+```bash
+wv bootstrap --json        # preferred session-start snapshot (single call)
+wv context <id> --json    # ancestors, blockers, pitfalls — cached per session
+```
+
+Use `wv touch <id> --intent="..."` for low-cost intent/progress updates between larger steps.
 
 ## Learnings format
 
@@ -1341,6 +1425,9 @@ Structured learnings are more useful for future sessions:
 ```
 --learning="decision: X | pattern: Y | pitfall: Z"
 ```
+
+For non-interactive agent flows, prefer `--no-overlap-check` on `wv done`/`wv ship` once
+verification and learnings are ready.
 
 ## Code search
 

@@ -2,6 +2,23 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.51.4] - 2026-05-25
+
+### Fixed
+
+- **GraphPolicyViolation resolution** surfaced in `WORKFLOW.md`, `dev-guide/SKILL.md` — agents now
+  have the `.weave/quality.conf [exempt]` + `wv load` path documented in agent-facing templates.
+- **runtime.md two-block architecture** in `install.sh` — `BEGIN/END WEAVE RUNTIME CONTENT` markers
+  enable surgical `--update` without clobbering repo-specific content below.
+- **Copilot pre-flight parity** — `templates/copilot-instructions.stub.md` and `install.sh` heredoc
+  updated from `git status && wv status` to `wv bootstrap --json`.
+- **Copilot stub `make format/lint` removed** — project-specific quality gates do not belong in
+  Weave templates; only Weave-enforced invariants documented.
+- **`Makefile.template` `lint-file` target** — changed from hardcoded `ruff check` (Python-only) to
+  a no-op guidance block with examples for Python, JS/TS, Ruby. Consumers override for their stack.
+- **install.sh copilot heredoc synced to stub** — missing sections (Sync modes, Context pack,
+  `--standalone` shortcut, `wv touch`) propagated from stub to fallback heredoc.
+
 ## [1.51.3] - 2026-05-25
 
 ### Fixed

@@ -192,6 +192,32 @@ wv done <id> --learning="decision: what was chosen | pattern: reusable technique
 
 Good learnings are specific, actionable, and scoped to a concrete context.
 
+## Quality Gate — GraphPolicyViolation
+
+`wv done` enforces CC thresholds (Bash: 100, Python: 25, TypeScript: 15). If a node touches a file
+over the limit, closure is blocked with `GraphPolicyViolation`.
+
+**Resolution path:**
+
+```bash
+wv quality functions <file>    # see which functions are over the limit
+# Option A: refactor the file, commit, wv quality scan, retry wv done
+# Option B: exempt the path in .weave/quality.conf then wv load
+```
+
+**Exempting a path** (monolithic scripts, archived code, one-off utilities):
+
+```ini
+# .weave/quality.conf
+[exempt]
+install.sh          # full path match — monolithic, not application logic
+archive/            # directory prefix (trailing / required)
+```
+
+After editing `.weave/quality.conf`, run `wv load` to sync exemptions into the live DB, then retry
+`wv done`. The `WV_REQUIRE_QUALITY=0` env var bypasses the refresh functions only — the DB
+constraint still fires; use the conf file instead.
+
 ## Repair Workflow
 
 When you detect a real workflow issue during execution (drift, missing guardrail, broken prompt/doc,
