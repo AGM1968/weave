@@ -2,6 +2,20 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.51.7] - 2026-05-25
+
+### Fixed
+
+- **`deepeval_runner` readiness check** — replaced bare `_check_chunks_indexed` with
+  `collect_readiness`; now surfaces `node_files` empty and `quality_db` state alongside chunk count.
+  Warnings emitted to stderr when filtered cases will return 0 results.
+- **`deepeval_runner` quality enrichment** — added `--quality-db` arg; per-file `churn`, `hotspot`,
+  and `weave_nodes` count attached to case output via `enrich_results` when results are non-empty.
+  Auto-resolved from `$WV_HOT_ZONE/quality.db`.
+- **`deepeval_runner` docs** — `PYTHONPATH=scripts` added to all usage examples (module not on
+  default Poetry path); quality-db usage example added; semble MCP-only limitation and AST-chunking
+  gap documented.
+
 ## [1.51.6] - 2026-05-25
 
 ### Added
