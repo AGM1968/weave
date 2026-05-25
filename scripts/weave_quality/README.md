@@ -3,9 +3,10 @@
 Static analysis and hotspot tracking for the Weave CLI. Produces a per-repo `quality.db` with
 cyclomatic complexity, essential complexity, git-derived churn, CK metrics, and hotspot scores.
 
-- **Version:** v1.13.1
 - **Academic foundations:** McCabe (1976), Tornhill (2018), Chidamber & Kemerer (1994)
-- **Zero external dependencies** — Python stdlib (`ast`, `re`, `subprocess`, `pathlib`) + git
+- **Core dependencies** — Python stdlib (`ast`, `re`, `subprocess`, `pathlib`) + git
+- **Optional:** `ast-grep` — enables AST-accurate CC for Bash and TypeScript scanning. Falls back
+  gracefully when absent (Bash uses regex heuristic; TypeScript files are skipped).
 
 ---
 
@@ -31,18 +32,22 @@ cyclomatic complexity, essential complexity, git-derived churn, CK metrics, and 
 ```txt
 wv quality scan [path]
   │
-  ├── classification.py   — production / test / script / generated
-  ├── python_parser.py    — AST: CC, ev, CK metrics, per-function CC
-  ├── bash_heuristic.py   — regex: complexity proxy for Bash
-  ├── git_metrics.py      — churn, authors, ownership, co-change (batched)
-  ├── hotspots.py         — normalize(complexity) × normalize(churn), scoring
-  └── db.py               — quality.db schema, incremental scan state
+  ├── classification.py      — production / test / script / generated
+  ├── python_parser.py       — AST: CC, ev, CK metrics, per-function CC
+  ├── bash_ast_grep.py       — ast-grep: AST-accurate CC for Bash (primary)
+  ├── bash_heuristic.py      — regex: CC fallback when ast-grep absent
+  ├── typescript_parser.py   — ast-grep: CC + function detection for .ts/.tsx
+  ├── rules/                 — ast-grep YAML rule files (bash_cc, typescript_cc,
+  │                            typescript_functions, structural patterns)
+  ├── git_metrics.py         — churn, authors, ownership, co-change (batched)
+  ├── hotspots.py            — normalize(complexity) × normalize(churn), scoring
+  └── db.py                  — quality.db schema, incremental scan state
         │
         ▼
   quality.db  (hot zone: /dev/shm/weave/<repo-hash>/quality.db)
   Never synced. Never git-tracked. Rebuildable via `wv quality scan`.
         │
-  wv quality hotspots / diff / functions / promote / health-info
+  wv quality hotspots / diff / functions / promote / patterns / health-info
 ```
 
 ### Data Flow
@@ -53,7 +58,9 @@ The scan pipeline runs in this order:
 2. **Classify** — each file gets a category (`production`, `test`, `script`, `generated`)
 3. **Incremental check** — compare `mtime` + git blob SHA against `file_state` table; skip unchanged
    files
-4. **Parse** — Python files via AST; Bash/shell via regex heuristic
+4. **Parse** — Python via AST (`python_parser.py`); Bash via ast-grep AST with regex fallback
+   (`bash_ast_grep.py` → `bash_heuristic.py`); TypeScript via ast-grep (`typescript_parser.py`,
+   skipped gracefully when ast-grep absent)
 5. **Git metrics** — single batched `git log` call for churn/authors/ownership; single `git ls-tree`
    call for blob SHAs; single `git log --name-only` for co-change pairs
 6. **Hotspot scoring** — `normalize(complexity) × normalize(churn)` per file
@@ -140,6 +147,25 @@ wv quality reset
 
 **Note:** After any Weave upgrade that changes metric computation, delete the DB and rescan from
 scratch. Incremental scans will not recompute metrics for unchanged files.
+
+### `wv quality patterns`
+
+Structural pattern scanning using ast-grep rules. Finds recurring anti-patterns across the codebase
+(bare `except: pass`, `subprocess(shell=True)`, unquoted shell variables, etc.) and optionally
+promotes findings to Weave nodes.
+
+Requires `ast-grep` on PATH. Pattern rules live in `scripts/weave_quality/default_patterns/` and
+project-local rules in `.weave/patterns/`.
+
+```bash
+wv quality patterns scan              # scan with all known rules, print findings table
+wv quality patterns scan --json       # machine-readable output
+wv quality patterns list              # list loaded rule IDs and their descriptions
+wv quality patterns promote --top=N --parent=wv-xxxxxx   # create nodes from top findings
+```
+
+Findings are stored in the `pattern_findings` table and retained for 2 scans (pruned automatically
+on the next `wv quality scan`).
 
 ---
 
@@ -255,12 +281,12 @@ v1.13.0 scope filter excludes test/script files by default.
 
 Every file is classified into one of four categories before scoring:
 
-| Category     | Heuristics                                                                            |
-| ------------ | ------------------------------------------------------------------------------------- |
-| `generated`  | `dist/`, `build/`, `generated/`, `*.pb2.py`, `*_pb2.py`                               |
-| `test`       | `test/`, `tests/`, `test_*.py`, `*_test.py`                                           |
-| `script`     | `scripts/`, `Makefile`, `setup.py`, `conftest.py`, `*.sh`, `*.toml`, `*.cfg`, `*.ini` |
-| `production` | Everything else                                                                       |
+| Category     | Heuristics                                                                                        |
+| ------------ | ------------------------------------------------------------------------------------------------- |
+| `generated`  | `dist/`, `build/`, `generated/`, `*.pb2.py`, `*_pb2.py`                                           |
+| `test`       | `test/`, `tests/`, `test_*.py`, `*_test.py`, `*.test.ts`, `*.spec.ts`, `*.test.tsx`, `*.spec.tsx` |
+| `script`     | `scripts/`, `Makefile`, `setup.py`, `conftest.py`, `*.sh`, `*.toml`, `*.cfg`, `*.ini`             |
+| `production` | Everything else                                                                                   |
 
 Priority order: `generated` > `test` > `script` > `production`.
 
@@ -322,6 +348,62 @@ when Weave reports unexpectedly high CC.
 
 McCabe found `ev > 4` disproportionately identifies "troublesome" modules, independent of CC.
 
+### Bash CC (ast-grep backend)
+
+Bash CC uses `ast-grep` with `rules/bash_cc.yaml` as the primary backend. When ast-grep is absent,
+`bash_heuristic.py` (regex branch counting) runs as fallback. The `scan_meta.bash_cc_backend` column
+records the actual backend used: `ast-grep`, `regex`, or `ast-grep+fallback` (mixed within one
+scan).
+
+**Constructs that add to CC (AST node kinds):**
+
+| Construct       | Node kind               | Notes                                       |
+| --------------- | ----------------------- | ------------------------------------------- |
+| `if`            | `if_statement`          |                                             |
+| `elif`          | `elif_clause`           | Counted separately from `if`                |
+| `case` arm      | `case_item`             | All arms +1, including the default `*)` arm |
+| `for ... in`    | `for_statement`         | Also covers `select` (tree-sitter alias)    |
+| `for ((...))` C | `c_style_for_statement` |                                             |
+| `while`         | `while_statement`       | Also covers `until` (tree-sitter alias)     |
+| `&&`            | pattern `$A && $B`      |                                             |
+| `\|\|`          | pattern `$A \|\| $B`    |                                             |
+
+Note: `until` and `select` have no distinct kinds in tree-sitter-bash — they alias to
+`while_statement` and `for_statement` respectively. Both are correctly counted.
+
+The regex fallback counts `if`/`elif`/`for`/`while`/`until`/`&&`/`||`/`case` but misses `select` and
+can produce false positives from `&&`/`||` inside strings. The AST backend eliminates both biases.
+
+### TypeScript CC (ast-grep backend)
+
+TypeScript CC uses `ast-grep` with `rules/typescript_cc.yaml` and `rules/typescript_functions.yaml`.
+TypeScript files are **skipped entirely** when ast-grep is absent (recorded as `unavailable` in
+`scan_meta.ts_cc_backend`). No regex fallback exists for TypeScript.
+
+**Constructs that add to CC:**
+
+| Construct             | Rule mechanism            | Notes                                  |
+| --------------------- | ------------------------- | -------------------------------------- |
+| `if`                  | `if_statement` kind       |                                        |
+| `? :` ternary         | `ternary_expression` kind |                                        |
+| `for`                 | `for_statement` kind      |                                        |
+| `for...of` / `in`     | `for_in_statement` kind   | Single kind covers both in tree-sitter |
+| `while`               | `while_statement` kind    |                                        |
+| `do...while`          | `do_statement` kind       |                                        |
+| `catch`               | `catch_clause` kind       |                                        |
+| `switch case` arm     | `switch_case` kind        | Default arm also counted               |
+| `&&`                  | pattern `$A && $B`        |                                        |
+| `\|\|`                | pattern `$A \|\| $B`      |                                        |
+| `??` nullish coalesce | pattern `$A ?? $B`        |                                        |
+
+CC is assigned to functions by line range. Nested functions receive CC from their own range only
+(innermost-first assignment prevents double-counting).
+
+**Function detection:** `function_declaration`, `function_expression`, `generator_function`,
+`arrow_function` (multi-line only — single-line arrows excluded), and `method_definition`. Function
+names are extracted via regex cascade from match text; `constructor` is preserved as a real function
+name.
+
 ---
 
 ## Performance
@@ -369,14 +451,17 @@ Accounts for ~1s at 175-file scale.
 **Schema summary:**
 
 ```sql
-scan_meta    -- scan_id, git_head, files_count, duration_ms, scanned_at
-files        -- path, scan_id, language, loc, complexity, essential_complexity,
-             --   indent_sd, functions, max_nesting, avg_fn_len, category
-file_metrics -- path, scan_id, metric, value, detail  (CK suite + fn_cc EAV)
-git_stats    -- path, churn, authors, age_days, hotspot,
-             --   ownership_fraction, minor_contributors
-file_state   -- path, mtime, git_blob  (incremental scan state)
-co_change    -- path_a, path_b, count
+scan_meta        -- scan_id, git_head, files_count, duration_ms, scanned_at,
+                 --   bash_cc_backend, ts_cc_backend  (actual backend used per scan)
+files            -- path, scan_id, language, loc, complexity, essential_complexity,
+                 --   indent_sd, functions, max_nesting, avg_fn_len, category
+file_metrics     -- path, scan_id, metric, value, detail  (CK suite + fn_cc EAV)
+git_stats        -- path, churn, authors, age_days, hotspot,
+                 --   ownership_fraction, minor_contributors
+file_state       -- path, mtime, git_blob  (incremental scan state)
+co_change        -- path_a, path_b, count
+pattern_findings -- scan_id, rule_id, path, line, col, match_text, severity
+                 --   (retained for 2 scans; pruned on next scan)
 ```
 
 Per-function CC is stored in `file_metrics` using EAV pattern:
@@ -387,20 +472,30 @@ Per-function CC is stored in `file_metrics` using EAV pattern:
 
 ## Module Guide
 
-| Module              | Responsibility                                                     |
-| ------------------- | ------------------------------------------------------------------ |
-| `__main__.py`       | CLI entry point — argument parsing, subcommand dispatch, scope     |
-|                     | filtering, JSON output schemas                                     |
-| `models.py`         | Dataclasses: `FileEntry`, `FunctionCC`, `ASTAnalysis`,             |
-|                     | `CKMetrics`, `GitStats`, `CoChange`, `ScanMeta`, `ProjectMetrics`  |
-| `python_parser.py`  | AST visitors: `_ComplexityVisitor`, `_EssentialComplexityVisitor`, |
-|                     | `_single_pass_ast()`, CK metrics, regex fallback                   |
-| `bash_heuristic.py` | Regex-based CC proxy and indent_sd for Bash/shell files            |
-| `classification.py` | File category classifier with `.weave/quality.conf` overrides      |
-| `git_metrics.py`    | Batched git subprocess calls: `_batch_git_stats()`,                |
-|                     | `batch_blob_shas()`, `compute_co_changes()`                        |
-| `hotspots.py`       | Hotspot scoring, quality score formula, Gini, CC histogram         |
-| `db.py`             | SQLite schema creation, reads/writes, 5-scan retention policy      |
+| Module                 | Responsibility                                                        |
+| ---------------------- | --------------------------------------------------------------------- |
+| `__main__.py`          | CLI entry point — argument parsing, subcommand dispatch, scope        |
+|                        | filtering, JSON output schemas                                        |
+| `models.py`            | Dataclasses: `FileEntry`, `FunctionCC`, `FunctionDetail`,             |
+|                        | `ASTAnalysis`, `CKMetrics`, `GitStats`, `CoChange`, `ScanMeta`,       |
+|                        | `PatternFinding`, `ProjectMetrics`                                    |
+| `python_parser.py`     | AST visitors: `_ComplexityVisitor`, `_EssentialComplexityVisitor`,    |
+|                        | `_single_pass_ast()`, CK metrics, regex fallback                      |
+| `bash_ast_grep.py`     | ast-grep CC backend for Bash — `analyze_bash_file_best()` selects     |
+|                        | ast-grep or regex fallback; `_cc_lines_from_ast_grep()` runs rule     |
+| `bash_heuristic.py`    | Regex CC proxy + `indent_sd` for Bash; fallback when ast-grep absent  |
+| `typescript_parser.py` | ast-grep CC + function detection for `.ts`/`.tsx` files; returns None |
+|                        | gracefully when ast-grep absent                                       |
+| `classification.py`    | File category classifier with `.weave/quality.conf` overrides;        |
+|                        | includes `.test.ts`/`.spec.ts`/`.test.tsx`/`.spec.tsx` patterns       |
+| `git_metrics.py`       | Batched git subprocess calls: `_batch_git_stats()`,                   |
+|                        | `batch_blob_shas()`, `compute_co_changes()`                           |
+| `hotspots.py`          | Hotspot scoring, quality score formula, Gini, CC histogram            |
+| `db.py`                | SQLite schema creation, reads/writes, 5-scan retention policy;        |
+|                        | `pattern_findings` table with 2-scan retention                        |
+| `rules/`               | ast-grep YAML rules: `bash_cc.yaml`, `typescript_cc.yaml`,            |
+|                        | `typescript_functions.yaml`; structural pattern rules in              |
+|                        | `default_patterns/`                                                   |
 
 ### Key internal patterns
 
@@ -534,3 +629,18 @@ commit signing is globally enforced (`commit.gpgsign=true`) and the GPG agent is
 large-repo acceleration. At current scale (300 files ≈ 5.5s), the Python path is fast enough.
 Implement if a >1000-file monorepo demands it — the CST/AST gap makes it a reimplementation, not a
 port (see `docs/PROPOSAL-wv-mccabe-review.md`).
+
+**ast-grep optional — TypeScript files silently skipped when absent:** If `ast-grep` is not on PATH,
+TypeScript `.ts`/`.tsx` files are skipped entirely (a warning is logged per file). Bash falls back
+to regex heuristic. Install ast-grep (`cargo install ast-grep` or OS package) to enable full
+coverage. The `scan_meta.ts_cc_backend` and `scan_meta.bash_cc_backend` columns record the actual
+backend used (`ast-grep`, `regex`, `unavailable`, or `ast-grep+fallback`) so you can verify coverage
+after a scan.
+
+**TypeScript CC excludes single-line arrow functions:** Arrow functions whose body is an expression
+(not a block) span a single AST line and are filtered out of function tracking. They contribute to
+file-level CC but do not appear in `wv quality functions` output or per-function CC records.
+
+**`wv quality patterns` requires ast-grep:** The `patterns` subcommand has no fallback. If ast-grep
+is absent, `patterns scan` exits with an error. CC scanning degrades gracefully; pattern scanning
+does not.

@@ -54,6 +54,8 @@ _TEST_PATTERNS: list[re.Pattern[str]] = [
     _segment_pattern("tests"),
     re.compile(r"(?:^|/)test_[^/]+\.py$"),
     re.compile(r"(?:^|/)[^/]+_test\.py$"),
+    re.compile(r"(?:^|/)[^/]+\.test\.tsx?$"),
+    re.compile(r"(?:^|/)[^/]+\.spec\.tsx?$"),
 ]
 
 _SCRIPT_PATTERNS: list[re.Pattern[str]] = [

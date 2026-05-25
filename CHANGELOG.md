@@ -2,6 +2,36 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.51.6] - 2026-05-25
+
+### Added
+
+- **Bash ast-grep CC backend** (`scripts/weave_quality/bash_ast_grep.py`,
+  `scripts/weave_quality/rules/bash_cc.yaml`) — structural AST-based cyclomatic complexity for Bash
+  files using ast-grep + tree-sitter-bash. Counts `if`, `elif`, `case_item`, `for_statement`,
+  `c_style_for_statement`, `while_statement` (covers `until` via aliasing), `&&`, `||`. Falls back
+  to regex backend when ast-grep is unavailable; graceful degradation at file granularity. Backend
+  aggregate recorded in `scan_meta.bash_cc_backend` (`"regex"` / `"ast-grep"` /
+  `"ast-grep+fallback"`).
+- **TypeScript ast-grep CC backend** (`scripts/weave_quality/typescript_parser.py`) — constructor
+  detection fixed (removed `"constructor"` from method-keyword skip list; now captured by name
+  pattern). CC assignment corrected to single-pass innermost-first enumeration using an `assigned`
+  set to prevent double-counting across overlapping function ranges. Backend aggregate recorded in
+  `scan_meta.ts_cc_backend`.
+- **`wv quality patterns`** — list, scan, and promote structural pattern findings; store and query
+  results from `pattern_findings` table. Requires ast-grep. See `wv quality patterns --help`.
+
+### Fixed
+
+- **`finish_scan()` backend metadata** — `bash_cc_backend` and `ts_cc_backend` now reflect actual
+  per-file backend usage aggregated across `_scan_files()`, not binary presence at scan start.
+  Prevents scan_meta from recording `"ast-grep"` on files that silently fell back to regex.
+- **ast-grep YAML rules ASCII-only** — `rules/bash_cc.yaml` comments use ASCII only; em-dash
+  characters in YAML comments caused ast-grep rule parse failures.
+- **tree-sitter-bash kind aliasing documented** — `until_statement` and `select_statement` do not
+  exist as distinct kinds; `until` maps to `while_statement`, `select` maps to `for_statement`.
+  Invalid kind names removed; aliasing documented in rule comment.
+
 ## [1.51.5] - 2026-05-25
 
 ### Fixed

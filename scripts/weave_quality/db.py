@@ -33,6 +33,7 @@ from .models import (
     FileState,
     FunctionCC,
     GitStats,
+    PatternFinding,
     ScanMeta,
 )
 
@@ -57,7 +58,9 @@ CREATE TABLE IF NOT EXISTS scan_meta (
     git_head        TEXT NOT NULL,
     files_count     INTEGER,
     duration_ms     INTEGER,
-    scanner_version TEXT DEFAULT ''
+    scanner_version TEXT DEFAULT '',
+    bash_cc_backend TEXT DEFAULT 'regex',
+    ts_cc_backend   TEXT DEFAULT 'unavailable'
 );
 
 -- Per-file metrics (latest scan only, previous kept for diff)
@@ -110,10 +113,26 @@ CREATE TABLE IF NOT EXISTS file_state (
     git_blob    TEXT
 );
 
+-- Structural pattern match findings (ast-grep based)
+-- Pruned at _FILES_SCANS boundary (same as files/file_metrics); point-in-time data.
+CREATE TABLE IF NOT EXISTS pattern_findings (
+    id          INTEGER PRIMARY KEY,
+    scan_id     INTEGER NOT NULL,
+    path        TEXT NOT NULL,
+    rule_id     TEXT NOT NULL,
+    line        INTEGER NOT NULL,
+    col         INTEGER DEFAULT 0,
+    match_text  TEXT,
+    severity    TEXT DEFAULT 'warning',
+    FOREIGN KEY(scan_id) REFERENCES scan_meta(id) ON DELETE CASCADE
+);
+
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_files_scan ON files(scan_id);
 CREATE INDEX IF NOT EXISTS idx_files_complexity ON files(complexity DESC);
 CREATE INDEX IF NOT EXISTS idx_fm_scan ON file_metrics(scan_id);
+CREATE INDEX IF NOT EXISTS idx_pf_scan ON pattern_findings(scan_id);
+CREATE INDEX IF NOT EXISTS idx_pf_rule ON pattern_findings(rule_id);
 CREATE INDEX IF NOT EXISTS idx_gs_hotspot ON git_stats(hotspot DESC);
 """
 
@@ -211,6 +230,60 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_v5(conn: sqlite3.Connection) -> None:
+    """Idempotent v5 schema migration: add bash_cc_backend to scan_meta.
+
+    Existing rows default to 'regex' (pre-ast-grep baseline).
+    Kept separate from scanner_version to avoid colliding with the version
+    equality check in cmd_scan() that triggers re-scans on version change.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(scan_meta)").fetchall()}
+    if "bash_cc_backend" not in cols:
+        conn.execute(
+            "ALTER TABLE scan_meta ADD COLUMN bash_cc_backend TEXT DEFAULT 'regex'"
+        )
+    conn.commit()
+
+
+def _migrate_v6(conn: sqlite3.Connection) -> None:
+    """Idempotent v6 schema migration: add pattern_findings table.
+
+    The table is also in the base _SCHEMA CREATE TABLE IF NOT EXISTS, so on
+    fresh DBs the migration is a no-op. On existing DBs it creates the table.
+    """
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "pattern_findings" not in tables:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pattern_findings (
+                id          INTEGER PRIMARY KEY,
+                scan_id     INTEGER NOT NULL,
+                path        TEXT NOT NULL,
+                rule_id     TEXT NOT NULL,
+                line        INTEGER NOT NULL,
+                col         INTEGER DEFAULT 0,
+                match_text  TEXT,
+                severity    TEXT DEFAULT 'warning',
+                FOREIGN KEY(scan_id) REFERENCES scan_meta(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pf_scan ON pattern_findings(scan_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pf_rule ON pattern_findings(rule_id)")
+    conn.commit()
+
+
+def _migrate_v7(conn: sqlite3.Connection) -> None:
+    """Idempotent v7 schema migration: add ts_cc_backend to scan_meta.
+
+    Existing rows default to 'unavailable' (TypeScript scanning added in v1.52).
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(scan_meta)").fetchall()}
+    if "ts_cc_backend" not in cols:
+        conn.execute(
+            "ALTER TABLE scan_meta ADD COLUMN ts_cc_backend TEXT DEFAULT 'unavailable'"
+        )
+    conn.commit()
+
+
 def init_db(hot_zone: str | None = None) -> sqlite3.Connection:
     """Initialise quality.db, creating schema if needed.
 
@@ -225,6 +298,9 @@ def init_db(hot_zone: str | None = None) -> sqlite3.Connection:
     _migrate_v2(conn)
     _migrate_v3(conn)
     _migrate_v4(conn)
+    _migrate_v5(conn)
+    _migrate_v6(conn)
+    _migrate_v7(conn)
     log.debug("quality.db initialised at %s", resolved)
     return conn
 
@@ -253,16 +329,20 @@ def reset_db(hot_zone: str | None = None) -> None:
 
 
 def begin_scan(
-    conn: sqlite3.Connection, git_head: str, scanner_version: str = ""
+    conn: sqlite3.Connection,
+    git_head: str,
+    scanner_version: str = "",
+    bash_cc_backend: str = "regex",
+    ts_cc_backend: str = "unavailable",
 ) -> int:
     """Record a new scan, prune old scans beyond retention limit.
 
     Returns the new scan_id.
     """
     cur = conn.execute(
-        "INSERT INTO scan_meta (scanned_at, git_head, scanner_version) "
-        "VALUES (?, ?, ?)",
-        (time.strftime("%Y-%m-%dT%H:%M:%S"), git_head, scanner_version),
+        "INSERT INTO scan_meta (scanned_at, git_head, scanner_version, bash_cc_backend, ts_cc_backend) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (time.strftime("%Y-%m-%dT%H:%M:%S"), git_head, scanner_version, bash_cc_backend, ts_cc_backend),
     )
     scan_id = cur.lastrowid
     assert scan_id is not None
@@ -282,6 +362,12 @@ def begin_scan(
         )""",
         (_FILES_SCANS,),
     )
+    conn.execute(
+        """DELETE FROM pattern_findings WHERE scan_id NOT IN (
+            SELECT id FROM scan_meta ORDER BY id DESC LIMIT ?
+        )""",
+        (_FILES_SCANS,),
+    )
     # Step 2: Prune scan_meta to trend window (_MAX_SCANS).
     # CASCADE will drop any complexity_trend rows for the removed scans.
     conn.execute(
@@ -295,13 +381,28 @@ def begin_scan(
 
 
 def finish_scan(
-    conn: sqlite3.Connection, scan_id: int, files_count: int, duration_ms: int
+    conn: sqlite3.Connection,
+    scan_id: int,
+    files_count: int,
+    duration_ms: int,
+    bash_cc_backend: str | None = None,
+    ts_cc_backend: str | None = None,
 ) -> None:
-    """Finalise a scan with counts and duration."""
-    conn.execute(
-        "UPDATE scan_meta SET files_count = ?, duration_ms = ? WHERE id = ?",
-        (files_count, duration_ms, scan_id),
-    )
+    """Finalise a scan with counts and duration.
+
+    bash_cc_backend / ts_cc_backend, if provided, overwrite the placeholder set at
+    begin_scan time with the actual aggregate backend used across all files.
+    """
+    sets = ["files_count = ?", "duration_ms = ?"]
+    params: list[object] = [files_count, duration_ms]
+    if bash_cc_backend is not None:
+        sets.append("bash_cc_backend = ?")
+        params.append(bash_cc_backend)
+    if ts_cc_backend is not None:
+        sets.append("ts_cc_backend = ?")
+        params.append(ts_cc_backend)
+    params.append(scan_id)
+    conn.execute(f"UPDATE scan_meta SET {', '.join(sets)} WHERE id = ?", params)
 
 
 def latest_scan(conn: sqlite3.Connection) -> ScanMeta | None:
@@ -316,6 +417,8 @@ def latest_scan(conn: sqlite3.Connection) -> ScanMeta | None:
         files_count=row["files_count"] or 0,
         duration_ms=row["duration_ms"] or 0,
         scanner_version=row["scanner_version"] or "",
+        bash_cc_backend=row["bash_cc_backend"] or "regex",
+        ts_cc_backend=row["ts_cc_backend"] or "unavailable",
     )
 
 
@@ -332,6 +435,8 @@ def previous_scan(conn: sqlite3.Connection) -> ScanMeta | None:
         files_count=row["files_count"] or 0,
         duration_ms=row["duration_ms"] or 0,
         scanner_version=row["scanner_version"] or "",
+        bash_cc_backend=row["bash_cc_backend"] or "regex",
+        ts_cc_backend=row["ts_cc_backend"] or "unavailable",
     )
 
 
@@ -742,3 +847,59 @@ def staleness_info(conn: sqlite3.Connection, current_head: str) -> dict[str, Any
         "scan_time": scan.scanned_at,
         "files_count": scan.files_count,
     }
+
+
+# ---------------------------------------------------------------------------
+# pattern_findings CRUD
+# ---------------------------------------------------------------------------
+
+
+def bulk_insert_pattern_findings(
+    conn: sqlite3.Connection, findings: list[PatternFinding]
+) -> None:
+    """Insert a batch of PatternFinding rows."""
+    conn.executemany(
+        "INSERT INTO pattern_findings (scan_id, path, rule_id, line, col, match_text, severity) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            (f.scan_id, f.path, f.rule_id, f.line, f.col, f.match_text, f.severity)
+            for f in findings
+        ],
+    )
+    conn.commit()
+
+
+def query_pattern_findings(
+    conn: sqlite3.Connection,
+    scan_id: int | None = None,
+    rule_id: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, object]]:
+    """Return pattern findings as list of dicts, optionally filtered."""
+    clauses: list[str] = []
+    params: list[object] = []
+    if scan_id is not None:
+        clauses.append("scan_id = ?")
+        params.append(scan_id)
+    if rule_id is not None:
+        clauses.append("rule_id = ?")
+        params.append(rule_id)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"SELECT * FROM pattern_findings {where} ORDER BY rule_id, path, line LIMIT ?",
+        params + [limit],
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def pattern_findings_summary(
+    conn: sqlite3.Connection, scan_id: int
+) -> list[dict[str, object]]:
+    """Return per-rule hit counts for a scan."""
+    rows = conn.execute(
+        "SELECT rule_id, COUNT(*) AS hits, MAX(severity) AS severity "
+        "FROM pattern_findings WHERE scan_id = ? "
+        "GROUP BY rule_id ORDER BY hits DESC",
+        (scan_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]

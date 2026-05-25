@@ -12,6 +12,7 @@ import pytest
 
 from weave_quality.db import (
     begin_scan,
+    bulk_insert_pattern_findings,
     bulk_upsert_co_changes,
     bulk_upsert_file_entries,
     bulk_upsert_file_state,
@@ -30,7 +31,9 @@ from weave_quality.db import (
     compute_trend_direction,
     get_all_trend_directions,
     latest_scan,
+    pattern_findings_summary,
     previous_scan,
+    query_pattern_findings,
     staleness_info,
     top_hotspots,
     upsert_ck_metrics,
@@ -45,6 +48,7 @@ from weave_quality.models import (
     FileState,
     FunctionCC,
     GitStats,
+    PatternFinding,
 )
 
 
@@ -878,3 +882,199 @@ class TestSchemaV3:
         cols = {r[1] for r in conn2.execute("PRAGMA table_info(files)").fetchall()}
         conn2.close()
         assert "category" in cols
+
+
+# ---------------------------------------------------------------------------
+# Schema v5/v6/v7 migrations (bash_cc_backend, pattern_findings, ts_cc_backend)
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaV5:
+    def test_new_db_has_bash_cc_backend(self, db: sqlite3.Connection) -> None:
+        cols = {r[1] for r in db.execute("PRAGMA table_info(scan_meta)").fetchall()}
+        assert "bash_cc_backend" in cols
+
+    def test_begin_scan_stores_backend(self, db: sqlite3.Connection) -> None:
+        sid = begin_scan(db, "abc", bash_cc_backend="ast-grep")
+        row = db.execute("SELECT bash_cc_backend FROM scan_meta WHERE id=?", (sid,)).fetchone()
+        assert row[0] == "ast-grep"
+
+    def test_latest_scan_returns_backend(self, db: sqlite3.Connection) -> None:
+        begin_scan(db, "abc", bash_cc_backend="ast-grep")
+        scan = latest_scan(db)
+        assert scan is not None
+        assert scan.bash_cc_backend == "ast-grep"
+
+    def test_migration_adds_column_to_existing_db(self, tmp_path: Path) -> None:
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript("""
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE IF NOT EXISTS scan_meta (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scanned_at TEXT NOT NULL,
+                git_head TEXT NOT NULL
+            );
+        """)
+        raw.commit()
+        raw.close()
+        conn = init_db(hot_zone=str(tmp_path))
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(scan_meta)").fetchall()}
+        conn.close()
+        assert "bash_cc_backend" in cols
+
+
+class TestSchemaV6:
+    def test_new_db_has_pattern_findings_table(self, db: sqlite3.Connection) -> None:
+        tables = {
+            r[0]
+            for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        assert "pattern_findings" in tables
+
+    def test_bulk_insert_and_query(self, db: sqlite3.Connection) -> None:
+        sid = begin_scan(db, "abc")
+        findings = [
+            PatternFinding(path="a.py", scan_id=sid, rule_id="bare-except-pass",
+                           line=10, col=0, match_text="except: pass", severity="warning"),
+            PatternFinding(path="b.py", scan_id=sid, rule_id="subprocess-shell-true",
+                           line=5, col=4, match_text="subprocess.run(x, shell=True)", severity="warning"),
+        ]
+        bulk_insert_pattern_findings(db, findings)
+        db.commit()
+        rows = query_pattern_findings(db, sid)
+        assert len(rows) == 2
+        paths = {r["path"] for r in rows}
+        assert "a.py" in paths and "b.py" in paths
+
+    def test_query_filter_by_rule(self, db: sqlite3.Connection) -> None:
+        sid = begin_scan(db, "abc")
+        findings = [
+            PatternFinding(path="a.py", scan_id=sid, rule_id="rule-A", line=1),
+            PatternFinding(path="b.py", scan_id=sid, rule_id="rule-B", line=2),
+        ]
+        bulk_insert_pattern_findings(db, findings)
+        db.commit()
+        rows = query_pattern_findings(db, sid, rule_id="rule-A")
+        assert len(rows) == 1
+        assert rows[0]["rule_id"] == "rule-A"
+
+    def test_summary_groups_by_rule(self, db: sqlite3.Connection) -> None:
+        sid = begin_scan(db, "abc")
+        findings = [
+            PatternFinding(path="a.py", scan_id=sid, rule_id="rule-A", line=1),
+            PatternFinding(path="b.py", scan_id=sid, rule_id="rule-A", line=2),
+            PatternFinding(path="c.py", scan_id=sid, rule_id="rule-B", line=3),
+        ]
+        bulk_insert_pattern_findings(db, findings)
+        db.commit()
+        summary = pattern_findings_summary(db, sid)
+        by_rule = {r["rule_id"]: r["hits"] for r in summary}
+        assert by_rule["rule-A"] == 2
+        assert by_rule["rule-B"] == 1
+
+    def test_migration_creates_table_on_existing_db(self, tmp_path: Path) -> None:
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript("""
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE IF NOT EXISTS scan_meta (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scanned_at TEXT NOT NULL,
+                git_head TEXT NOT NULL
+            );
+        """)
+        raw.commit()
+        raw.close()
+        conn = init_db(hot_zone=str(tmp_path))
+        tables = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        conn.close()
+        assert "pattern_findings" in tables
+
+    def test_retention_prunes_pattern_findings(self, db: sqlite3.Connection) -> None:
+        sid1 = begin_scan(db, "aaa")
+        bulk_insert_pattern_findings(db, [
+            PatternFinding(path="a.py", scan_id=sid1, rule_id="r", line=1)
+        ])
+        db.commit()
+        sid2 = begin_scan(db, "bbb")
+        bulk_insert_pattern_findings(db, [
+            PatternFinding(path="b.py", scan_id=sid2, rule_id="r", line=2)
+        ])
+        db.commit()
+        # begin_scan for a 3rd scan prunes pattern_findings at _FILES_SCANS=2
+        begin_scan(db, "ccc")
+        db.commit()
+        remaining = db.execute("SELECT scan_id FROM pattern_findings").fetchall()
+        scan_ids = {r[0] for r in remaining}
+        assert sid1 not in scan_ids
+
+
+class TestSchemaV7:
+    def test_new_db_has_ts_cc_backend(self, db: sqlite3.Connection) -> None:
+        cols = {r[1] for r in db.execute("PRAGMA table_info(scan_meta)").fetchall()}
+        assert "ts_cc_backend" in cols
+
+    def test_begin_scan_stores_ts_backend(self, db: sqlite3.Connection) -> None:
+        sid = begin_scan(db, "abc", ts_cc_backend="ast-grep")
+        row = db.execute("SELECT ts_cc_backend FROM scan_meta WHERE id=?", (sid,)).fetchone()
+        assert row[0] == "ast-grep"
+
+    def test_latest_scan_returns_ts_backend(self, db: sqlite3.Connection) -> None:
+        begin_scan(db, "abc", ts_cc_backend="ast-grep")
+        scan = latest_scan(db)
+        assert scan is not None
+        assert scan.ts_cc_backend == "ast-grep"
+
+    def test_previous_scan_returns_ts_backend(self, db: sqlite3.Connection) -> None:
+        begin_scan(db, "aaa", ts_cc_backend="ast-grep")
+        begin_scan(db, "bbb", ts_cc_backend="unavailable")
+        prev = previous_scan(db)
+        assert prev is not None
+        assert prev.ts_cc_backend == "ast-grep"
+
+    def test_default_ts_backend_is_unavailable(self, db: sqlite3.Connection) -> None:
+        begin_scan(db, "abc")
+        scan = latest_scan(db)
+        assert scan is not None
+        assert scan.ts_cc_backend == "unavailable"
+
+    def test_finish_scan_overwrites_ts_backend(self, db: sqlite3.Connection) -> None:
+        """finish_scan ts_cc_backend param updates the placeholder set at begin_scan."""
+        sid = begin_scan(db, "abc")  # default: 'unavailable'
+        finish_scan(db, sid, files_count=5, duration_ms=100, ts_cc_backend="ast-grep")
+        db.commit()
+        scan = latest_scan(db)
+        assert scan is not None
+        assert scan.ts_cc_backend == "ast-grep"
+
+    def test_finish_scan_ts_fallback_aggregate(self, db: sqlite3.Connection) -> None:
+        """ast-grep+fallback written when some TS files succeeded, some did not."""
+        sid = begin_scan(db, "abc")
+        finish_scan(db, sid, files_count=3, duration_ms=50, ts_cc_backend="ast-grep+fallback")
+        db.commit()
+        scan = latest_scan(db)
+        assert scan is not None
+        assert scan.ts_cc_backend == "ast-grep+fallback"
+
+    def test_migration_adds_column_to_existing_db(self, tmp_path: Path) -> None:
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript("""
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE IF NOT EXISTS scan_meta (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scanned_at TEXT NOT NULL,
+                git_head TEXT NOT NULL,
+                bash_cc_backend TEXT DEFAULT 'regex'
+            );
+        """)
+        raw.commit()
+        raw.close()
+        conn = init_db(hot_zone=str(tmp_path))
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(scan_meta)").fetchall()}
+        conn.close()
+        assert "ts_cc_backend" in cols

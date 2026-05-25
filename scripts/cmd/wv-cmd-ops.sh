@@ -2018,6 +2018,15 @@ cmd_doctor() {
         _doctor_record "gh" "warn" "not found (optional)"
     fi
 
+    # 6b. ast-grep present (optional — enables structural_scan)
+    if command -v ast-grep >/dev/null 2>&1; then
+        local ag_ver
+        ag_ver=$(ast-grep --version 2>/dev/null | awk '{print $NF}')
+        _doctor_record "structural_scan" "pass" "enabled (ast-grep $ag_ver)"
+    else
+        _doctor_record "structural_scan" "warn" "disabled (ast-grep not found — run ./install.sh)"
+    fi
+
     # 7. Hot zone exists
     local hot_zone="${WV_HOT_ZONE:-}"
     if [ -z "$hot_zone" ]; then

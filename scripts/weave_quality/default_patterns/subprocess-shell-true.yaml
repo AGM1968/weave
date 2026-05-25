@@ -1,0 +1,14 @@
+id: subprocess-shell-true
+language: python
+message: "subprocess called with shell=True enables shell injection. Prefer list args without shell=True."
+severity: warning
+rule:
+  any:
+    - pattern: subprocess.run($$$ARGS, shell=True)
+    - pattern: subprocess.run($$$ARGS, shell=True, $$$REST)
+    - pattern: subprocess.Popen($$$ARGS, shell=True)
+    - pattern: subprocess.Popen($$$ARGS, shell=True, $$$REST)
+    - pattern: subprocess.call($$$ARGS, shell=True)
+    - pattern: subprocess.call($$$ARGS, shell=True, $$$REST)
+    - pattern: subprocess.check_output($$$ARGS, shell=True)
+    - pattern: subprocess.check_output($$$ARGS, shell=True, $$$REST)

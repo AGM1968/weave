@@ -1,0 +1,170 @@
+"""Bash CC analysis using ast-grep (tree-sitter AST).
+
+Replaces the regex branch-counting in bash_heuristic._function_cc with
+accurate AST-level node counting. Eliminates two known heuristic biases:
+  - case arms: regex counted +1 for 'case' keyword; AST counts each case_item arm
+  - &&/|| in strings: regex had 18.6% false-positive rate; AST ignores string content
+
+Falls back to bash_heuristic when ast-grep binary is absent.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import shutil
+import subprocess
+from pathlib import Path
+
+from .bash_heuristic import (
+    _count_nesting,
+    _find_function_ranges,
+    _function_name,
+    _indent_sd,
+    analyze_bash_source,
+)
+from .models import FileEntry, FunctionCC
+
+log = logging.getLogger(__name__)
+
+_RULE_FILE = Path(__file__).parent / "rules" / "bash_cc.yaml"
+
+
+def _cc_lines_from_ast_grep(filepath: str) -> list[int] | None:
+    """Run ast-grep on a bash file; return sorted 0-indexed line numbers of CC nodes.
+
+    Returns None if ast-grep is absent, errors, or times out.
+    Exit 1 from ast-grep means no matches (not an error).
+    """
+    if not shutil.which("ast-grep"):
+        return None
+    cmd = [
+        "ast-grep",
+        "scan",
+        "--rule",
+        str(_RULE_FILE),
+        "--json",
+        filepath,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+    except subprocess.TimeoutExpired:
+        log.warning("ast-grep timed out on %s", filepath)
+        return None
+
+    # Exit 2 = ast-grep error; exit 1 with no stdout = no matches (valid)
+    if proc.returncode == 2 or (proc.returncode not in (0, 1) and not proc.stdout.strip()):
+        log.warning("ast-grep error on %s: %s", filepath, proc.stderr.strip()[:200])
+        return None
+
+    if not proc.stdout.strip():
+        return []
+
+    try:
+        matches = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        log.warning("ast-grep JSON parse error on %s", filepath)
+        return None
+
+    if not isinstance(matches, list):
+        return None
+
+    lines = []
+    for m in matches:
+        rng = m.get("range", {})
+        start = rng.get("start", {})
+        line = start.get("line")
+        if isinstance(line, int):
+            lines.append(line)  # ast-grep is 0-indexed
+    return sorted(lines)
+
+
+def analyze_bash_source_ast_grep(
+    source: str, filepath: str, scan_id: int = 0
+) -> tuple[FileEntry, list[FunctionCC]] | None:
+    """Analyze Bash source using ast-grep for CC.
+
+    Returns (FileEntry, list[FunctionCC]) or None when ast-grep is unavailable.
+    Caller should fall back to analyze_bash_source from bash_heuristic.
+
+    All non-CC metrics (nesting, indent_sd, loc, avg_fn_len) keep the
+    existing heuristic — they are not biased by the branch-counting issue.
+    Function boundary detection also reuses _find_function_ranges from
+    bash_heuristic; only the per-branch count inside each function changes.
+    """
+    cc_lines = _cc_lines_from_ast_grep(filepath)
+    if cc_lines is None:
+        return None
+
+    lines = source.splitlines()
+    non_empty = [ln for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+    loc = len(non_empty)
+
+    # File-level CC: base 1 + all branch nodes in file
+    complexity = 1 + len(cc_lines)
+
+    # Per-function CC
+    func_ranges = _find_function_ranges(lines)
+    functions = len(func_ranges)
+
+    avg_fn_len = 0.0
+    fn_cc_list: list[FunctionCC] = []
+    if func_ranges:
+        lengths = [end - start + 1 for start, end in func_ranges]
+        avg_fn_len = sum(lengths) / len(lengths)
+
+        for start, end in func_ranges:
+            # Branch nodes whose start line falls within this function (0-indexed)
+            fn_branches = sum(1 for ln in cc_lines if start <= ln <= end)
+            name = _function_name(lines[start])
+            fn_cc_list.append(
+                FunctionCC(
+                    path=filepath,
+                    scan_id=scan_id,
+                    function_name=name,
+                    line_start=start + 1,  # 1-indexed for display
+                    line_end=end + 1,
+                    complexity=float(1 + fn_branches),
+                )
+            )
+
+    entry = FileEntry(
+        path=filepath,
+        scan_id=scan_id,
+        language="bash",
+        loc=loc,
+        complexity=float(complexity),
+        functions=functions,
+        max_nesting=_count_nesting(lines),
+        avg_fn_len=avg_fn_len,
+        indent_sd=_indent_sd(lines),
+    )
+    return entry, fn_cc_list
+
+
+def ast_grep_available() -> bool:
+    """Return True if the ast-grep binary is on PATH."""
+    return shutil.which("ast-grep") is not None
+
+
+def analyze_bash_file_best(
+    filepath: str, scan_id: int = 0
+) -> tuple[FileEntry, list[FunctionCC], str]:
+    """Analyze a bash file using the best available backend.
+
+    Returns (FileEntry, list[FunctionCC], backend_name).
+    backend_name is 'ast-grep' or 'regex'.
+    """
+    try:
+        source = Path(filepath).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        log.warning("Could not read %s: %s", filepath, exc)
+        source = ""
+
+    result = analyze_bash_source_ast_grep(source, filepath, scan_id)
+    if result is not None:
+        entry, fn_cc = result
+        return entry, fn_cc, "ast-grep"
+
+    entry, fn_cc = analyze_bash_source(source, filepath, scan_id)
+    return entry, fn_cc, "regex"

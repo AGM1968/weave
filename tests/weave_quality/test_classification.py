@@ -72,6 +72,27 @@ class TestClassifyFileTest:
     def test_leading_slash_stripped(self) -> None:
         assert classify_file("/tests/foo.py") == "test"
 
+    def test_ts_test_dot_notation(self) -> None:
+        assert classify_file("src/app.test.ts") == "test"
+
+    def test_ts_spec_dot_notation(self) -> None:
+        assert classify_file("src/app.spec.ts") == "test"
+
+    def test_tsx_test_dot_notation(self) -> None:
+        assert classify_file("src/App.test.tsx") == "test"
+
+    def test_tsx_spec_dot_notation(self) -> None:
+        assert classify_file("src/App.spec.tsx") == "test"
+
+    def test_ts_test_in_nested_path(self) -> None:
+        assert classify_file("packages/core/src/utils.test.ts") == "test"
+
+    def test_ts_production_is_not_test(self) -> None:
+        assert classify_file("src/app.ts") == "production"
+
+    def test_tsx_production_is_not_test(self) -> None:
+        assert classify_file("src/App.tsx") == "production"
+
 
 # ---------------------------------------------------------------------------
 # classify_file -- built-in script patterns

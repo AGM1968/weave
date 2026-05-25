@@ -207,6 +207,7 @@ Finding nodes use `metadata.type="finding"` plus nested
 | `wv quality diff`           | Delta report vs previous scan                                                                          |
 | `wv quality functions`      | Per-function CC with histogram + Gini                                                                  |
 | `wv quality promote`        | Create nodes from top findings                                                                         |
+| `wv quality patterns`       | Structural pattern scan/list/promote (requires ast-grep)                                               |
 | `wv clean-ghosts`           | Delete ghost edges (legacy compatibility)                                                              |
 | `wv doctor`                 | Installation health check                                                                              |
 | `wv mcp-status`             | MCP server health check                                                                                |
@@ -308,6 +309,7 @@ Returns blockers, ancestors with learnings, related nodes, pitfalls, and contrad
 | `weave_quality_hotspots`  | `wv quality hotspots`                  | Ranked hotspot report                 |
 | `weave_quality_diff`      | `wv quality diff`                      | Delta report vs previous scan         |
 | `weave_quality_functions` | `wv quality functions`                 | Per-function CC report                |
+| `weave_quality_patterns`  | `wv quality patterns scan/list`        | Structural pattern findings           |
 | `weave_edit_guard`        | (pre-edit gate)                        | Returns error if no active node       |
 
 Install: `./install.sh --with-mcp` or `./install-mcp.sh`
@@ -370,7 +372,13 @@ fully rebuildable from source. Integrated into the existing workflow:
 - **Complexity trend direction** — least-squares slope over up to 5 scans classifies each file as
   `deteriorating ↑`, `stable ~`, or `refactored ↓`
 - **Python files** use AST-backed cyclomatic complexity (regex fallback if parse fails)
-- **Bash files** use regex heuristic metrics (nesting depth, function count) + indentation SD
+- **Bash files** use `ast-grep` AST-accurate CC as the primary backend, with regex heuristic
+  fallback when `ast-grep` is absent. The active backend is recorded in `scan_meta`
+- **TypeScript/TSX files** use `ast-grep` for CC and function detection. Files are skipped
+  gracefully when `ast-grep` is absent — install via `cargo install ast-grep` or OS package
+- **Structural patterns** — `wv quality patterns scan` runs ast-grep rules against the codebase to
+  surface recurring anti-patterns (bare except, shell=True, unquoted variables). Findings are stored
+  for 2 scans and can be promoted to Weave nodes
 - **Quality gate** — `wv done` blocks if any file linked to the node has a function above the
   language CC threshold (py=25, sh=100, ts=15). Run `wv quality functions <file>` to identify
   violations. Exempt paths (monolithic scripts, archived code) via `.weave/quality.conf`:

@@ -36,13 +36,13 @@ confusion.
 
 ### Scope definitions
 
-| Scope       | Tools                                                                                                                                                                                                                                                                | Purpose                                    |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| **graph**   | `weave_add`, `weave_link`, `weave_done`, `weave_batch_done`, `weave_list`, `weave_resolve`, `weave_update`, `weave_touch`, `weave_delete` (9)                                                                                                                     | Create/modify/delete nodes and edges       |
-| **session** | `weave_work`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_close_session`, `weave_breadcrumbs`, `weave_plan`, `weave_edit_guard` (10)                                                                              | Workflow lifecycle management              |
-| **lite**    | `weave_overview`, `weave_bootstrap`, `weave_guide`, `weave_edit_guard`, `weave_status`, `weave_work`, `weave_done` (7)                                                                                                                                            | Minimal task-tracking surface              |
-| **inspect** | `weave_context`, `weave_search`, `weave_status`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions` (15) | Read-only observation and query            |
-| **all**     | All 35 tools                                                                                                                                                                                                                                                         | Full access (default, backward-compatible) |
+| Scope       | Tools                                                                                                                                                                                                                                                                                                                                                                                                          | Purpose                                    |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| **graph**   | `weave_add`, `weave_link`, `weave_done`, `weave_batch_done`, `weave_list`, `weave_resolve`, `weave_update`, `weave_touch`, `weave_delete` (9)                                                                                                                                                                                                                                                                  | Create/modify/delete nodes and edges       |
+| **session** | `weave_work`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_close_session`, `weave_breadcrumbs`, `weave_plan`, `weave_edit_guard` (10)                                                                                                                                                                                                                             | Workflow lifecycle management              |
+| **lite**    | `weave_overview`, `weave_bootstrap`, `weave_guide`, `weave_edit_guard`, `weave_status`, `weave_work`, `weave_done` (7)                                                                                                                                                                                                                                                                                         | Minimal task-tracking surface              |
+| **inspect** | `weave_context`, `weave_search`, `weave_query`, `weave_status`, `weave_ready`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`, `weave_quality_patterns`, `weave_structural_search`, `weave_code_search`, `weave_index` (21) | Read-only observation and query            |
+| **all**     | All 42 tools                                                                                                                                                                                                                                                                                                                                                                                                   | Full access (default, backward-compatible) |
 
 ### Design rationale
 
@@ -91,6 +91,7 @@ Invalid scope "bogus". Valid: graph, session, lite, inspect, all
 ### VS Code Copilot (`.mcp.json`)
 
 The committed repo configuration currently registers **four servers**:
+
 - `weave` — full access (default, backward-compatible)
 - `weave-session` — workflow lifecycle tools only
 - `weave-lite` — minimal task-tracking surface
@@ -109,7 +110,7 @@ for specialised subagents.
       "args": ["${workspaceFolder}/mcp/dist/index.js"],
       "env": {
         "WV_PATH": "${workspaceFolder}/scripts/wv",
-        "WV_PROJECT_ROOT": "${workspaceFolder}"
+        "WV_PROJECT_ROOT": "${workspaceFolder}",
       },
     },
     // Workflow lifecycle only — claim/ship/close-session/edit-guard surfaces
@@ -119,7 +120,7 @@ for specialised subagents.
       "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=session"],
       "env": {
         "WV_PATH": "${workspaceFolder}/scripts/wv",
-        "WV_PROJECT_ROOT": "${workspaceFolder}"
+        "WV_PROJECT_ROOT": "${workspaceFolder}",
       },
     },
     // Minimal task-tracking surface for lighter-weight Copilot subagents
@@ -129,7 +130,7 @@ for specialised subagents.
       "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=lite"],
       "env": {
         "WV_PATH": "${workspaceFolder}/scripts/wv",
-        "WV_PROJECT_ROOT": "${workspaceFolder}"
+        "WV_PROJECT_ROOT": "${workspaceFolder}",
       },
     },
     // Read-only queries — for research/review subagents
@@ -139,7 +140,7 @@ for specialised subagents.
       "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=inspect"],
       "env": {
         "WV_PATH": "${workspaceFolder}/scripts/wv",
-        "WV_PROJECT_ROOT": "${workspaceFolder}"
+        "WV_PROJECT_ROOT": "${workspaceFolder}",
       },
     },
   },
@@ -210,42 +211,44 @@ Optional local additions if you want stricter scope isolation:
 
 ### Graph scope — write operations (9 tools)
 
-| Tool               | Description                                             | Required params      |
-| ------------------ | ------------------------------------------------------- | -------------------- |
-| `weave_add`        | Create a new node, returns generated ID                 | `text`               |
-| `weave_link`       | Create a semantic edge between two nodes                | `from`, `to`, `type` |
-| `weave_done`       | Mark a node as complete, optionally record a learning. Accepts `learning` (raw string) and/or typed `decision`/`pattern`/`pitfall` params — when both are provided, raw is appended after structured params   | `id`                 |
-| `weave_batch_done` | Complete multiple nodes at once. Same learning merge behavior as `weave_done` | `ids`                |
-| `weave_update`     | Modify node metadata, status, text, or alias            | `id`                 |
-| `weave_touch`      | Fire-and-forget metadata or intent update               | `id`                 |
-| `weave_list`       | List nodes with optional status/all filters             | —                    |
-| `weave_resolve`    | Resolve conflicting nodes (winner/merge/defer strategy) | `ids`, `strategy`    |
-| `weave_delete`     | Permanently remove a node (requires `force=true`)       | `id`, `force`        |
+| Tool               | Description                                                                                                                                                                                                 | Required params      |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `weave_add`        | Create a new node, returns generated ID                                                                                                                                                                     | `text`               |
+| `weave_link`       | Create a semantic edge between two nodes                                                                                                                                                                    | `from`, `to`, `type` |
+| `weave_done`       | Mark a node as complete, optionally record a learning. Accepts `learning` (raw string) and/or typed `decision`/`pattern`/`pitfall` params — when both are provided, raw is appended after structured params | `id`                 |
+| `weave_batch_done` | Complete multiple nodes at once. Same learning merge behavior as `weave_done`                                                                                                                               | `ids`                |
+| `weave_update`     | Modify node metadata, status, text, or alias                                                                                                                                                                | `id`                 |
+| `weave_touch`      | Fire-and-forget metadata or intent update                                                                                                                                                                   | `id`                 |
+| `weave_list`       | List nodes with optional status/all filters                                                                                                                                                                 | —                    |
+| `weave_resolve`    | Resolve conflicting nodes (winner/merge/defer strategy)                                                                                                                                                     | `ids`, `strategy`    |
+| `weave_delete`     | Permanently remove a node (requires `force=true`)                                                                                                                                                           | `id`, `force`        |
 
 ### Session scope — workflow lifecycle (10 tools)
 
-| Tool                  | Description                                           | Required params |
-| --------------------- | ----------------------------------------------------- | --------------- |
-| `weave_work`          | Claim a node, sets WV_ACTIVE for subagent inheritance | `id`            |
+| Tool                  | Description                                                                                                          | Required params |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------- | --------------- |
+| `weave_work`          | Claim a node, sets WV_ACTIVE for subagent inheritance                                                                | `id`            |
 | `weave_ship`          | Complete node + sync in one step. Any remaining Git sync is surfaced separately. Same learning merge as `weave_done` | `id`            |
-| `weave_recover`       | Resume incomplete ship/sync/delete operations         | —               |
-| `weave_quick`         | Quick-add a node and immediately start working on it  | `text`          |
-| `weave_overview`      | Status + health + context policy + ready work         | —               |
-| `weave_bootstrap`     | Single-call session snapshot: status + context + ready + learnings | —      |
-| `weave_breadcrumbs`   | Save, show, or clear session breadcrumbs              | —               |
-| `weave_plan`          | Import markdown plan as epic + tasks with GH issues   | `file`          |
-| `weave_close_session` | Sync + repo-status check + unpushed commit/active-node warnings | —               |
-| `weave_edit_guard`    | Pre-edit guard: require an active node before edits   | —               |
+| `weave_recover`       | Resume incomplete ship/sync/delete operations                                                                        | —               |
+| `weave_quick`         | Quick-add a node and immediately start working on it                                                                 | `text`          |
+| `weave_overview`      | Status + health + context policy + ready work                                                                        | —               |
+| `weave_bootstrap`     | Single-call session snapshot: status + context + ready + learnings                                                   | —               |
+| `weave_breadcrumbs`   | Save, show, or clear session breadcrumbs                                                                             | —               |
+| `weave_plan`          | Import markdown plan as epic + tasks with GH issues                                                                  | `file`          |
+| `weave_close_session` | Sync + repo-status check + unpushed commit/active-node warnings                                                      | —               |
+| `weave_edit_guard`    | Pre-edit guard: require an active node before edits                                                                  | —               |
 
-### Inspect scope — read-only queries (15 tools)
+### Inspect scope — read-only queries (21 tools)
 
 | Tool                      | Description                                            | Required params |
 | ------------------------- | ------------------------------------------------------ | --------------- |
 | `weave_context`           | Full Context Pack: node details, blockers, ancestors   | —               |
 | `weave_search`            | Full-text search across nodes (supports stemming)      | `query`         |
+| `weave_query`             | Structured node query by status, type, or metadata     | —               |
 | `weave_tree`              | View epic hierarchy as a tree (JSON output)            | —               |
 | `weave_learnings`         | Query captured learnings (patterns/decisions/pitfalls) | —               |
 | `weave_status`            | Compact summary: active work, ready count, blocked     | —               |
+| `weave_ready`             | List unblocked nodes ready to claim                    | —               |
 | `weave_health`            | Graph health check with score and issues               | —               |
 | `weave_preflight`         | Pre-work validation: blockers, context, readiness      | `id`            |
 | `weave_bootstrap`         | Single-call session snapshot for read-only clients     | —               |
@@ -256,6 +259,10 @@ Optional local additions if you want stricter scope isolation:
 | `weave_quality_hotspots`  | Ranked hotspot report with limit and threshold         | —               |
 | `weave_quality_diff`      | Delta report vs previous scan                          | —               |
 | `weave_quality_functions` | Per-function CC report with dispatch tagging           | —               |
+| `weave_quality_patterns`  | Structural pattern scan/list (requires ast-grep)       | —               |
+| `weave_structural_search` | Structural code search via ast-grep patterns           | `pattern`       |
+| `weave_code_search`       | Semantic code search via local index                   | `query`         |
+| `weave_index`             | Build or update the local code search index            | —               |
 
 ## Development
 
@@ -289,11 +296,11 @@ The test suite verifies:
 
 ## Environment Variables
 
-| Variable    | Description                         | Default       |
-| ----------- | ----------------------------------- | ------------- |
-| `WV_PATH`   | Path to wv CLI binary               | Auto-detected |
+| Variable          | Description                                   | Default             |
+| ----------------- | --------------------------------------------- | ------------------- |
+| `WV_PATH`         | Path to wv CLI binary                         | Auto-detected       |
 | `WV_PROJECT_ROOT` | Repo root passed to MCP-spawned `wv` commands | Current process cwd |
-| `WV_ACTIVE` | Active node ID (inherited by tools) | —             |
+| `WV_ACTIVE`       | Active node ID (inherited by tools)           | —                   |
 
 ## Agent Pairing
 
@@ -301,15 +308,15 @@ The table below shows the intended scoped pairing for specialised agents. In the
 VS Code configuration, `epic-planner` and `weave-guide` still run against the full `weave` server,
 while `learning-curator` already uses `weave-inspect`.
 
-| Agent file                           | Role                          | MCP scope | Tools available                                                                                                                                                                                                                                                 |
-| ------------------------------------ | ----------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.claude/agents/epic-planner.md`     | Planning & graph construction | `weave-graph` (planned) / `weave` (current) | Primary tools are `weave_add`, `weave_link`, `weave_done`, `weave_batch_done`, `weave_update`, `weave_list`, `weave_resolve`, `weave_delete`                                                                        |
-| `.claude/agents/weave-guide.md`      | Workflow lifecycle guidance   | `weave-session` (planned) / `weave` (current) | Primary tools are `weave_work`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_breadcrumbs`, `weave_plan`, `weave_close_session`, `weave_edit_guard`                   |
-| `.claude/agents/learning-curator.md` | Read-only analysis & curation | `weave-inspect` | `weave_context`, `weave_search`, `weave_tree`, `weave_learnings`, `weave_status`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions` |
+| Agent file                           | Role                          | MCP scope                                     | Tools available                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------ | ----------------------------- | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.claude/agents/epic-planner.md`     | Planning & graph construction | `weave-graph` (planned) / `weave` (current)   | Primary tools are `weave_add`, `weave_link`, `weave_done`, `weave_batch_done`, `weave_update`, `weave_list`, `weave_resolve`, `weave_delete`                                                                                                                                                                                                                                                              |
+| `.claude/agents/weave-guide.md`      | Workflow lifecycle guidance   | `weave-session` (planned) / `weave` (current) | Primary tools are `weave_work`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_breadcrumbs`, `weave_plan`, `weave_close_session`, `weave_edit_guard`                                                                                                                                                                                                           |
+| `.claude/agents/learning-curator.md` | Read-only analysis & curation | `weave-inspect`                               | `weave_context`, `weave_search`, `weave_query`, `weave_tree`, `weave_learnings`, `weave_status`, `weave_ready`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`, `weave_quality_patterns`, `weave_structural_search`, `weave_code_search`, `weave_index` |
 
-This keeps the roadmap visible without pretending the extra scoped servers are already wired into the
-checked-in VS Code config. The learning curator gets the narrower read-only server today; the other
-two agents are expected to move onto their scoped servers as runtime-agent support lands.
+This keeps the roadmap visible without pretending the extra scoped servers are already wired into
+the checked-in VS Code config. The learning curator gets the narrower read-only server today; the
+other two agents are expected to move onto their scoped servers as runtime-agent support lands.
 
 ## Architecture
 
@@ -339,6 +346,6 @@ two agents are expected to move onto their scoped servers as runtime-agent suppo
                       └──────────┘
 ```
 
-All optional scoped servers share the same `wv` CLI and SQLite database — scoping is purely at the MCP
-tool-listing layer, not at the data layer. Any server can execute any `wv` command internally; the
-scope only controls which tools are **advertised and accepted** via the MCP protocol.
+All optional scoped servers share the same `wv` CLI and SQLite database — scoping is purely at the
+MCP tool-listing layer, not at the data layer. Any server can execute any `wv` command internally;
+the scope only controls which tools are **advertised and accepted** via the MCP protocol.

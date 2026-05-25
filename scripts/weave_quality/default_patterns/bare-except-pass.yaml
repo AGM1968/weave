@@ -1,0 +1,21 @@
+id: bare-except-pass
+language: python
+message: "Silenced exception hides errors. Log the exception or handle specifically."
+severity: warning
+rule:
+  any:
+    - pattern: |
+        try:
+          $$$BODY
+        except:
+          pass
+    - pattern: |
+        try:
+          $$$BODY
+        except Exception:
+          pass
+    - pattern: |
+        try:
+          $$$BODY
+        except Exception as $_:
+          pass

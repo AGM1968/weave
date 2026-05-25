@@ -32,6 +32,7 @@
  *   weave_quality_hotspots - Ranked hotspot report
  *   weave_quality_diff - Delta report vs previous scan
  *   weave_quality_functions - Per-function CC report with dispatch tagging
+ *   weave_structural_search - Find code by structural AST pattern (requires ast-grep)
  *   weave_code_search - Hybrid code search over indexed chunks (FTS5 BM25 + cosine RRF)
  *   weave_index     - Index code files into brain.db for semantic search
  */
@@ -102,6 +103,8 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_quality_hotspots",
     "weave_quality_diff",
     "weave_quality_functions",
+    "weave_structural_search",
+    "weave_quality_patterns",
     "weave_code_search",
     "weave_index",
   ],
@@ -1166,6 +1169,49 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "weave_structural_search",
+    description:
+      "Find code by structural AST pattern using ast-grep (tree-sitter). Matches code structure, not text. Use for: finding all calls to a function, all try/except patterns, all for-loops with a condition. Requires ast-grep binary (install via ./install.sh). Returns [{file, line, column, match_text, node_kind}]. Use alongside semble (semantic) and weave_code_search (FTS) for orthogonal search.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pattern: {
+          type: "string",
+          description: "ast-grep structural pattern (e.g. '$F($$$ARGS)' matches any function call)",
+        },
+        lang: {
+          type: "string",
+          description: "Language: python, bash, typescript, go, rust, javascript, ...",
+        },
+        repo: {
+          type: "string",
+          description: "Repository root to search (defaults to current repo root)",
+        },
+      },
+      required: ["pattern", "lang"],
+    },
+  },
+  {
+    name: "weave_quality_patterns",
+    description:
+      "Run structural pattern matching rules (ast-grep) to find code quality issues. Use 'scan' to run all active rules and store findings; 'list' to show rules with hit counts. Built-in rules: subprocess-shell-true (Python), bare-except-pass (Python), unquoted-variable (Bash). Custom rules in .weave/patterns/*.yaml. Requires ast-grep.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subcommand: {
+          type: "string",
+          enum: ["scan", "list"],
+          description: "scan: run rules and store findings; list: show rules with hit counts",
+        },
+        path: {
+          type: "string",
+          description: "Repository root or file to scan (default: current repo root)",
+        },
+      },
+      required: ["subcommand"],
+    },
+  },
+  {
     name: "weave_code_search",
     description:
       "Hybrid code search over indexed chunks (FTS5 BM25 + cosine RRF blend). Run weave_index first. Returns file locations with relevance scores and optional Weave node context. Use instead of semble for project-local code search.",
@@ -2007,6 +2053,25 @@ function handleTool(
       break;
     }
 
+    case "weave_structural_search": {
+      const pattern = args.pattern as string;
+      const lang = args.lang as string;
+      const repo = args.repo as string | undefined;
+      const cmd = ["quality", "structural-search", "--json", `--pattern=${pattern}`, `--lang=${lang}`];
+      if (repo) cmd.push(`--repo=${repo}`);
+      result = wv(cmd, 30_000);
+      break;
+    }
+
+    case "weave_quality_patterns": {
+      const subcommand = args.subcommand as string;
+      const patPath = args.path as string | undefined;
+      const cmd = ["quality", "patterns", subcommand, "--json"];
+      if (patPath) cmd.push(patPath);
+      result = wv(cmd, 60_000);
+      break;
+    }
+
     case "weave_code_search": {
       const query = args.query as string;
       const limit = args.limit as number | undefined;
@@ -2047,7 +2112,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.51.5",
+      version: "1.51.6",
     },
     {
       capabilities: {

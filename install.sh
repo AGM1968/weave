@@ -334,6 +334,14 @@ if [ -f "./scripts/wv" ]; then
     for pyf in ./scripts/weave_quality/*.py; do
         install_file "$pyf" "$LIB_DIR/weave_quality/$(basename "$pyf")"
     done
+    mkdir -p "$LIB_DIR/weave_quality/rules"
+    for rulef in ./scripts/weave_quality/rules/*.yaml; do
+        install_file "$rulef" "$LIB_DIR/weave_quality/rules/$(basename "$rulef")"
+    done
+    mkdir -p "$LIB_DIR/weave_quality/default_patterns"
+    for pf in ./scripts/weave_quality/default_patterns/*.yaml; do
+        install_file "$pf" "$LIB_DIR/weave_quality/default_patterns/$(basename "$pf")"
+    done
     mkdir -p "$LIB_DIR/weave_indexer"
     for pyf in ./scripts/weave_indexer/*.py; do
         install_file "$pyf" "$LIB_DIR/weave_indexer/$(basename "$pyf")"
@@ -447,10 +455,22 @@ else
     quality_modules=$(curl -sSL "https://api.github.com/repos/AGM1968/weave/contents/scripts/weave_quality?ref=main" \
         | jq -r '.[] | select(.name | endswith(".py")) | .name' 2>/dev/null)
     if [ -z "$quality_modules" ]; then
-        quality_modules="__init__.py __main__.py models.py git_metrics.py python_parser.py bash_heuristic.py hotspots.py db.py"
+        quality_modules="__init__.py __main__.py models.py git_metrics.py python_parser.py bash_heuristic.py bash_ast_grep.py typescript_parser.py hotspots.py db.py classification.py findings.py"
     fi
     for pyfile in $quality_modules; do
         download_file "$REPO/scripts/weave_quality/${pyfile}" "$LIB_DIR/weave_quality/${pyfile}"
+    done
+    # Quality rules directory
+    mkdir -p "$LIB_DIR/weave_quality/rules"
+    for rule_file in bash_cc typescript_cc typescript_functions; do
+        download_file "$REPO/scripts/weave_quality/rules/${rule_file}.yaml" \
+            "$LIB_DIR/weave_quality/rules/${rule_file}.yaml"
+    done
+    # Default pattern rules
+    mkdir -p "$LIB_DIR/weave_quality/default_patterns"
+    for pattern_rule in subprocess-shell-true bare-except-pass unquoted-variable; do
+        download_file "$REPO/scripts/weave_quality/default_patterns/${pattern_rule}.yaml" \
+            "$LIB_DIR/weave_quality/default_patterns/${pattern_rule}.yaml"
     done
     # Python indexer package
     mkdir -p "$LIB_DIR/weave_indexer"
@@ -1611,6 +1631,57 @@ if [ "$WITH_MCP" = "1" ]; then
             echo "  }"
         fi
     fi
+fi
+
+# ast-grep (optional — enables wv quality structural-search + accurate bash CC)
+_install_ast_grep() {
+    local ag_bin="$INSTALL_DIR/ast-grep"
+    if command -v ast-grep >/dev/null 2>&1; then
+        return 0  # already on PATH
+    fi
+    if [ -x "$ag_bin" ]; then
+        return 0  # already installed by us
+    fi
+    # Try cargo first (self-updating, version-agnostic)
+    if command -v cargo >/dev/null 2>&1; then
+        echo -e "${CYAN}Installing ast-grep via cargo...${NC}"
+        cargo install ast-grep --quiet 2>/dev/null && {
+            # symlink into INSTALL_DIR if cargo bin differs
+            local cargo_bin
+            cargo_bin=$(command -v ast-grep 2>/dev/null || echo "")
+            if [ -n "$cargo_bin" ] && [ "$cargo_bin" != "$ag_bin" ]; then
+                ln -sf "$cargo_bin" "$ag_bin" 2>/dev/null || true
+            fi
+            echo -e "${GREEN}✓ ast-grep installed (via cargo)${NC}"
+            return 0
+        }
+    fi
+    # Fallback: prebuilt musl binary from GitHub releases
+    local ag_version="0.42.3"
+    local ag_url="https://github.com/ast-grep/ast-grep/releases/download/${ag_version}/ast-grep-x86_64-unknown-linux-musl.zip"
+    if command -v curl >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
+        echo -e "${CYAN}Downloading ast-grep ${ag_version}...${NC}"
+        local tmp_dir
+        tmp_dir=$(mktemp -d)
+        if curl -sSL "$ag_url" -o "$tmp_dir/ast-grep.zip" && \
+           unzip -q "$tmp_dir/ast-grep.zip" -d "$tmp_dir" && \
+           mv "$tmp_dir/ast-grep" "$ag_bin" 2>/dev/null && \
+           chmod +x "$ag_bin"; then
+            rm -rf "$tmp_dir"
+            echo -e "${GREEN}✓ ast-grep ${ag_version} installed to $ag_bin${NC}"
+            return 0
+        fi
+        rm -rf "$tmp_dir"
+    fi
+    echo -e "${YELLOW}⚠ ast-grep not installed (optional) — structural-search + accurate bash CC unavailable${NC}"
+    echo "  Install manually: cargo install ast-grep"
+    return 0
+}
+
+if [ "${SKIP_AST_GREP:-0}" != "1" ]; then
+    echo ""
+    echo -e "${CYAN}━━━ ast-grep (optional) ━━━${NC}"
+    _install_ast_grep
 fi
 
 echo ""

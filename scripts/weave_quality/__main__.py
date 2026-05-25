@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import configparser
 import hashlib
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -28,10 +30,13 @@ import time
 from fnmatch import fnmatch
 from pathlib import Path
 
-from weave_quality.bash_heuristic import analyze_bash_file, detect_bash
+from weave_quality.bash_ast_grep import analyze_bash_file_best, ast_grep_available
+from weave_quality.bash_heuristic import detect_bash
+from weave_quality.typescript_parser import analyze_typescript_file
 from weave_quality.classification import classify_file, load_classify_overrides
 from weave_quality.db import (
     begin_scan,
+    bulk_insert_pattern_findings,
     bulk_upsert_co_changes,
     bulk_upsert_file_entries,
     bulk_upsert_function_cc,
@@ -45,6 +50,7 @@ from weave_quality.db import (
     get_git_stats,
     init_db,
     latest_scan,
+    pattern_findings_summary,
     previous_scan,
     reset_db,
     get_all_function_cc,
@@ -73,7 +79,7 @@ from weave_quality.hotspots import (
     hotspot_summary,
 )
 from weave_quality.findings import cmd_findings_promote
-from weave_quality.models import CKMetrics, FileEntry, FunctionCC, GitStats
+from weave_quality.models import CKMetrics, FileEntry, FunctionCC, GitStats, PatternFinding
 from weave_quality.python_parser import analyze_python_file
 
 log = logging.getLogger(__name__)
@@ -194,7 +200,7 @@ def _discover_files(repo: str, exclude_globs: list[str] | None = None) -> list[s
         # Apply exclude globs
         if exclude_globs and any(fnmatch(rel_path, g) for g in exclude_globs):
             continue
-        if rel_path.endswith(".py") or detect_bash(abs_path):
+        if rel_path.endswith(".py") or rel_path.endswith((".ts", ".tsx")) or detect_bash(abs_path):
             files.append(rel_path)
 
     return sorted(files)
@@ -252,12 +258,22 @@ def _scan_files(
     files_to_scan: list[str],
     scan_id: int,
     classify_overrides: dict[str, list[str]] | None,
-) -> tuple[list[FileEntry], list[CKMetrics], list[FunctionCC], dict[str, int]]:
-    """Analyze each file and return (entries, ck_metrics_list, fn_cc_list, lang_counts)."""
+) -> tuple[list[FileEntry], list[CKMetrics], list[FunctionCC], dict[str, int], str, str]:
+    """Analyze each file and return (entries, ck_metrics_list, fn_cc_list, lang_counts,
+    bash_backend, ts_backend).
+
+    bash_backend: 'ast-grep' when all bash files used ast-grep,
+                  'regex' when none did (binary absent), 'ast-grep+fallback' when mixed.
+    ts_backend:   'ast-grep' when all TS files succeeded, 'unavailable' when none did,
+                  'ast-grep+fallback' when some files fell back (returned None).
+    """
     entries: list[FileEntry] = []
     ck_metrics_list: list[CKMetrics] = []
     all_fn_cc: list[FunctionCC] = []
     lang_counts: dict[str, int] = {}
+    bash_backends_used: set[str] = set()
+    ts_seen = 0
+    ts_succeeded = 0
 
     for rel_path in files_to_scan:
         abs_path = os.path.join(repo, rel_path)
@@ -285,8 +301,35 @@ def _scan_files(
                 fc.scan_id = scan_id
             all_fn_cc.extend(fn_cc)
             lang_counts["python"] = lang_counts.get("python", 0) + 1
+        elif rel_path.endswith((".ts", ".tsx")):
+            ts_seen += 1
+            ts_result = analyze_typescript_file(abs_path, scan_id)
+            if ts_result is None:
+                log.warning("typescript_parser unavailable for %s — skipping", rel_path)
+                continue
+            ts_succeeded += 1
+            entry, fn_cc = ts_result
+            entry = FileEntry(
+                path=rel_path,
+                scan_id=scan_id,
+                language=entry.language,
+                loc=entry.loc,
+                complexity=entry.complexity,
+                functions=entry.functions,
+                max_nesting=entry.max_nesting,
+                avg_fn_len=entry.avg_fn_len,
+                essential_complexity=entry.essential_complexity,
+                indent_sd=entry.indent_sd,
+                category=classify_file(rel_path, classify_overrides),
+            )
+            for fc in fn_cc:
+                fc.path = rel_path
+                fc.scan_id = scan_id
+            all_fn_cc.extend(fn_cc)
+            lang_counts["typescript"] = lang_counts.get("typescript", 0) + 1
         else:
-            entry, fn_cc = analyze_bash_file(abs_path, scan_id)
+            entry, fn_cc, _used_backend = analyze_bash_file_best(abs_path, scan_id)
+            bash_backends_used.add(_used_backend)
             entry = FileEntry(
                 path=rel_path,
                 scan_id=scan_id,
@@ -306,7 +349,21 @@ def _scan_files(
             lang_counts["bash"] = lang_counts.get("bash", 0) + 1
         entries.append(entry)
 
-    return entries, ck_metrics_list, all_fn_cc, lang_counts
+    if not bash_backends_used or bash_backends_used == {"regex"}:
+        bash_backend_agg = "regex"
+    elif bash_backends_used == {"ast-grep"}:
+        bash_backend_agg = "ast-grep"
+    else:
+        bash_backend_agg = "ast-grep+fallback"
+
+    if ts_seen == 0 or ts_succeeded == 0:
+        ts_backend_agg = "unavailable"
+    elif ts_succeeded == ts_seen:
+        ts_backend_agg = "ast-grep"
+    else:
+        ts_backend_agg = "ast-grep+fallback"
+
+    return entries, ck_metrics_list, all_fn_cc, lang_counts, bash_backend_agg, ts_backend_agg
 
 
 def _carry_forward_unchanged(
@@ -373,7 +430,8 @@ def _print_scan_result(
             1
             for f in files_to_scan
             if (f.endswith(".py") and lang == "python")
-            or (not f.endswith(".py") and lang == "bash")
+            or (f.endswith((".ts", ".tsx")) and lang == "typescript")
+            or (not f.endswith((".py", ".ts", ".tsx")) and lang == "bash")
         )
         print(
             f"  {lang.title()}: {count} files ({changed} changed since last scan)",
@@ -432,7 +490,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             files_unchanged.append(rel_path)
 
     classify_overrides = load_classify_overrides(repo)
-    entries, ck_metrics_list, all_fn_cc, lang_counts = _scan_files(
+    entries, ck_metrics_list, all_fn_cc, lang_counts, bash_backend, ts_backend = _scan_files(
         repo, files_to_scan, scan_id, classify_overrides
     )
 
@@ -467,7 +525,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     all_fn_cc = get_all_function_cc(conn, scan_id)
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
-    finish_scan(conn, scan_id, len(entries) + len(files_unchanged), duration_ms)
+    finish_scan(conn, scan_id, len(entries) + len(files_unchanged), duration_ms,
+                bash_cc_backend=bash_backend, ts_cc_backend=ts_backend)
     conn.commit()
     conn.close()
 
@@ -1029,6 +1088,68 @@ def _promote_create(
     return {"node_id": node_id, **result}
 
 
+def _cmd_promote_patterns(args: argparse.Namespace) -> int:
+    """Promote pattern findings grouped by rule_id to Weave nodes."""
+    conn = init_db(args.hot_zone)
+    scan = latest_scan(conn)
+    if scan is None:
+        conn.close()
+        print(_MSG_NO_SCAN, file=sys.stderr)
+        return 1
+
+    summary = pattern_findings_summary(conn, scan.id)
+    conn.close()
+
+    if not summary:
+        msg = "No pattern findings to promote. Run: wv quality patterns scan"
+        print(json.dumps({"promoted": [], "skipped": 0}) if args.json else msg)
+        return 0
+
+    dry_run: bool = args.dry_run
+    parent: str = args.parent
+    existing_findings = _load_existing_findings()
+    promoted: list[dict[str, object]] = []
+
+    for row in summary:
+        rule_id = str(row["rule_id"])
+        count = row["hits"]
+        fid = _finding_id(rule_id, metric="pattern")
+        text = f"Pattern: {rule_id} ({count} findings)"
+        meta = json.dumps({
+            "quality_finding_id": fid,
+            "code_ref": {"rule_id": rule_id, "count": count},
+            "type": "quality-pattern-finding",
+        })
+        entry: dict[str, object] = {"rule_id": rule_id, "count": count, "finding_id": fid, "text": text}
+        if fid in existing_findings:
+            node_id = existing_findings[fid]
+            if dry_run:
+                print(f"[DRY-RUN] Would update {node_id}: {text}", file=sys.stderr)
+            else:
+                _wv_cmd("update", node_id, f"--text={text}", f"--metadata={meta}")
+                print(f'Updated {node_id}: "{text}"', file=sys.stderr)
+            promoted.append({"node_id": node_id, **entry})
+            continue
+        if dry_run:
+            print(f"[DRY-RUN] Would create: {text}", file=sys.stderr)
+            print(f"  -> references {parent}", file=sys.stderr)
+        else:
+            rc, out = _wv_cmd("add", text, f"--metadata={meta}", "--force")
+            if rc != 0:
+                print(f"Error creating node for {rule_id}: {out}", file=sys.stderr)
+                continue
+            node_id = next((w.rstrip(":") for w in out.split() if w.startswith("wv-")), "")
+            if node_id:
+                _wv_cmd("link", node_id, parent, "--type=references")
+                print(f'Created {node_id}: "{text}"', file=sys.stderr)
+                entry["node_id"] = node_id
+        promoted.append(entry)
+
+    if args.json:
+        print(json.dumps({"promoted": promoted, "parent": parent}))
+    return 0
+
+
 def cmd_promote(args: argparse.Namespace) -> int:
     """Execute wv quality promote -- create Weave nodes from top findings."""
     parent: str = args.parent
@@ -1038,6 +1159,9 @@ def cmd_promote(args: argparse.Namespace) -> int:
     if not db_exists(args.hot_zone):
         print(_MSG_NO_DB, file=sys.stderr)
         return 1
+
+    if getattr(args, "from_patterns", False):
+        return _cmd_promote_patterns(args)
 
     conn = init_db(args.hot_zone)
     scan = latest_scan(conn)
@@ -1205,8 +1329,252 @@ def cmd_context_files(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Patterns commands (wv quality patterns scan / list)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PATTERNS_DIR = Path(__file__).parent / "default_patterns"
+
+
+def _load_pattern_rules(
+    repo: Path, conf_disabled: set[str]
+) -> list[tuple[str, Path]]:
+    """Return [(rule_id, rule_path)] for all active pattern rules.
+
+    Loads from:
+      1. _DEFAULT_PATTERNS_DIR (built-in curated rules)
+      2. <repo>/.weave/patterns/*.yaml (user-defined rules)
+    Rules whose id appears in conf_disabled are skipped.
+    """
+    rules: list[tuple[str, Path]] = []
+    for rule_dir in (_DEFAULT_PATTERNS_DIR, repo / ".weave" / "patterns"):
+        if not rule_dir.is_dir():
+            continue
+        for yf in sorted(rule_dir.glob("*.yaml")):
+            rule_id = yf.stem
+            if rule_id not in conf_disabled:
+                rules.append((rule_id, yf))
+    return rules
+
+
+def _disabled_patterns(conf_path: Path) -> set[str]:
+    """Read [patterns] disabled = ... from quality.conf."""
+    disabled: set[str] = set()
+    if not conf_path.exists():
+        return disabled
+    cp = configparser.ConfigParser()
+    cp.read(str(conf_path))
+    raw = cp.get("patterns", "disabled", fallback="")
+    for item in raw.replace(",", " ").split():
+        if item.strip():
+            disabled.add(item.strip())
+    return disabled
+
+
+def _run_pattern_rule(
+    rule_id: str, rule_path: Path, target: Path, scan_id: int
+) -> list[PatternFinding]:
+    """Run ast-grep for one rule file on target; return PatternFinding list."""
+    cmd = ["ast-grep", "scan", "--rule", str(rule_path), "--json", str(target)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
+    except subprocess.TimeoutExpired:
+        log.warning("ast-grep timed out scanning %s with rule %s", target, rule_id)
+        return []
+    if proc.returncode == 2 or (proc.returncode not in (0, 1) and not proc.stdout.strip()):
+        log.warning("ast-grep error for rule %s on %s: %s", rule_id, target, proc.stderr[:200])
+        return []
+    if not proc.stdout.strip():
+        return []
+    try:
+        matches = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    findings: list[PatternFinding] = []
+    if isinstance(matches, list):
+        for m in matches:
+            rng = m.get("range", {})
+            start = rng.get("start", {})
+            findings.append(
+                PatternFinding(
+                    path=str(Path(m.get("file", "")).relative_to(target)
+                              if target.is_dir() else Path(m.get("file", "")).name),
+                    scan_id=scan_id,
+                    rule_id=rule_id,
+                    line=start.get("line", 0) + 1,
+                    col=start.get("column", 0),
+                    match_text=(m.get("text", "") or "")[:200],
+                    severity="warning",
+                )
+            )
+    return findings
+
+
+def cmd_patterns_scan(args: argparse.Namespace) -> int:
+    """Run all active pattern rules and store findings."""
+    if not ast_grep_available():
+        if args.json:
+            print(json.dumps({"error": "ast-grep not installed", "install": "./install.sh"}))
+        else:
+            print("patterns: disabled (ast-grep not found — run ./install.sh)", file=sys.stderr)
+        return 1
+
+    repo = Path(_resolve_repo(getattr(args, "path", None)))
+    conn = init_db(args.hot_zone)
+    scan = latest_scan(conn)
+    if scan is None:
+        print("No scan in DB — run: wv quality scan", file=sys.stderr)
+        conn.close()
+        return 1
+
+    conf_disabled = _disabled_patterns(repo / ".weave" / "quality.conf")
+    rules = _load_pattern_rules(repo, conf_disabled)
+    if not rules:
+        msg = "No pattern rules found."
+        print(json.dumps({"rules": 0, "findings": 0}) if args.json else msg)
+        conn.close()
+        return 0
+
+    target = Path(getattr(args, "path", None) or repo)
+    all_findings: list[PatternFinding] = []
+    for rule_id, rule_path in rules:
+        found = _run_pattern_rule(rule_id, rule_path, target, scan.id)
+        all_findings.extend(found)
+
+    # Normalise paths relative to repo
+    for f in all_findings:
+        try:
+            f.path = str(Path(f.path))
+        except ValueError:
+            pass
+
+    bulk_insert_pattern_findings(conn, all_findings)
+    conn.close()
+
+    summary = {r: sum(1 for f in all_findings if f.rule_id == r) for r, _ in rules}
+    total = len(all_findings)
+
+    if args.json:
+        print(json.dumps({"rules_run": len(rules), "findings": total, "by_rule": summary}))
+    else:
+        print(f"Pattern scan complete: {len(rules)} rules, {total} findings")
+        for rule_id, count in sorted(summary.items(), key=lambda x: -x[1]):
+            print(f"  {rule_id}: {count}")
+    return 0
+
+
+def cmd_patterns_list(args: argparse.Namespace) -> int:
+    """List active rules with last-scan hit counts."""
+    repo = Path(_resolve_repo(getattr(args, "path", None)))
+    conn = init_db(args.hot_zone)
+    scan = latest_scan(conn)
+
+    conf_disabled = _disabled_patterns(repo / ".weave" / "quality.conf")
+    rules = _load_pattern_rules(repo, conf_disabled)
+
+    if scan is not None:
+        hits_by_rule = {
+            r["rule_id"]: r["hits"]
+            for r in pattern_findings_summary(conn, scan.id)
+        }
+    else:
+        hits_by_rule = {}
+    conn.close()
+
+    if args.json:
+        out = [
+            {"rule_id": rid, "path": str(rpath), "hits": hits_by_rule.get(rid, 0)}
+            for rid, rpath in rules
+        ]
+        print(json.dumps(out))
+    else:
+        if not rules:
+            print("No active pattern rules.")
+            return 0
+        print(f"Active pattern rules ({len(rules)}):")
+        for rule_id, rule_path in rules:
+            hits = hits_by_rule.get(rule_id, 0)
+            src = "default" if rule_path.parent == _DEFAULT_PATTERNS_DIR else "custom"
+            print(f"  {rule_id:40s} [{src}] hits={hits}")
+    return 0
+
+
+def cmd_patterns(args: argparse.Namespace) -> int:
+    """Dispatch patterns sub-commands (scan / list / promote)."""
+    sub = getattr(args, "patterns_command", None)
+    if sub == "scan":
+        return cmd_patterns_scan(args)
+    if sub == "list":
+        return cmd_patterns_list(args)
+    if sub == "promote":
+        return _cmd_promote_patterns(args)
+    print("Usage: wv quality patterns {scan,list,promote}", file=sys.stderr)
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # Reset command
 # ---------------------------------------------------------------------------
+
+
+def _structural_search_error(msg: dict[str, str], json_out: bool) -> int:
+    """Print a structured error for structural-search and return 1."""
+    if json_out:
+        print(json.dumps(msg))
+    else:
+        print(f"Error: {msg.get('detail', msg.get('error', 'unknown'))}", file=sys.stderr)
+    return 1
+
+
+def cmd_structural_search(args: argparse.Namespace) -> int:
+    """Execute wv quality structural-search — find code by structural AST pattern via ast-grep."""
+    if not shutil.which("ast-grep"):
+        if args.json:
+            print(json.dumps({"error": "ast-grep not installed", "install": "./install.sh"}))
+        else:
+            print("structural_scan: disabled (ast-grep not found — run ./install.sh)", file=sys.stderr)
+        return 1
+
+    cmd = ["ast-grep", "run", "--pattern", args.pattern, "--lang", args.lang, "--json", args.repo]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+    except subprocess.TimeoutExpired:
+        return _structural_search_error({"error": "timeout", "detail": "ast-grep exceeded 30s"}, args.json)
+
+    # Exit 2 (or empty stdout with non-empty stderr) = invalid pattern / hard error.
+    # Exit 1 with valid JSON = no matches found (ast-grep convention).
+    if proc.returncode == 2 or (proc.returncode != 0 and not proc.stdout.strip()):
+        detail = proc.stderr.strip() or "unknown error"
+        return _structural_search_error({"error": "invalid pattern or ast-grep error", "detail": detail}, args.json)
+
+    matches: list[dict[str, object]] = []
+    raw_out = proc.stdout.strip()
+    if raw_out:
+        try:
+            parsed = json.loads(raw_out)
+            if isinstance(parsed, list):
+                for m in parsed:
+                    rng = m.get("range", {})
+                    start = rng.get("start", {})
+                    matches.append({
+                        "file": m.get("file", ""),
+                        "line": start.get("line", 0) + 1,  # ast-grep is 0-indexed
+                        "column": start.get("column", 0),
+                        "match_text": m.get("text", ""),
+                        "node_kind": m.get("kind", ""),
+                        "rule_id": "structural-search",
+                    })
+        except json.JSONDecodeError:
+            pass
+
+    if args.json:
+        print(json.dumps(matches))
+    else:
+        if not matches:
+            print("No matches found.", file=sys.stderr)
+        for m in matches:
+            snippet = str(m["match_text"]).replace("\n", " ")[:80]
+            print(f"{m['file']}:{m['line']}:{m['column']}: {snippet}")
+    return 0
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
@@ -1297,6 +1665,12 @@ def main() -> int:  # pragma: no cover
     promote_parser.add_argument(
         "--dry-run", action="store_true", help="Show what would be created"
     )
+    promote_parser.add_argument(
+        "--from-patterns",
+        dest="from_patterns",
+        action="store_true",
+        help="Promote pattern findings instead of hotspots",
+    )
 
     findings_promote_parser = sub.add_parser(
         "findings-promote",
@@ -1362,6 +1736,46 @@ def main() -> int:  # pragma: no cover
     # reset
     sub.add_parser("reset", help="Delete quality.db for recovery")
 
+    # structural-search
+    ss_parser = sub.add_parser(
+        "structural-search",
+        help="Find code by structural AST pattern (requires ast-grep)",
+    )
+    ss_parser.add_argument("--pattern", required=True, help="ast-grep pattern")
+    ss_parser.add_argument(
+        "--lang",
+        required=True,
+        help="Language: python, bash, typescript, go, rust, ...",
+    )
+    ss_parser.add_argument(
+        "--repo", default=".", help="Repository root to search (default: .)"
+    )
+    ss_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # patterns
+    patterns_parser = sub.add_parser(
+        "patterns",
+        help="Structural pattern matching (requires ast-grep)",
+    )
+    patterns_sub = patterns_parser.add_subparsers(dest="patterns_command")
+
+    pat_scan_p = patterns_sub.add_parser("scan", help="Run pattern rules and store findings")
+    pat_scan_p.add_argument("path", nargs="?", help="Path to scan (default: repo root)")
+    pat_scan_p.add_argument("--json", action="store_true", help="JSON output")
+
+    pat_list_p = patterns_sub.add_parser("list", help="List active rules with hit counts")
+    pat_list_p.add_argument("path", nargs="?", help="Repo path (default: repo root)")
+    pat_list_p.add_argument("--json", action="store_true", help="JSON output")
+
+    pat_promote_p = patterns_sub.add_parser(
+        "promote", help="Promote findings as Weave nodes"
+    )
+    pat_promote_p.add_argument("--parent", required=True, help="Parent node ID")
+    pat_promote_p.add_argument("--json", action="store_true", help="JSON output")
+    pat_promote_p.add_argument(
+        "--dry-run", action="store_true", help="Show what would be created"
+    )
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -1369,26 +1783,25 @@ def main() -> int:  # pragma: no cover
     else:
         logging.basicConfig(level=logging.WARNING)
 
-    if args.command == "scan":
-        return cmd_scan(args)
-    if args.command == "hotspots":
-        return cmd_hotspots(args)
-    if args.command == "diff":
-        return cmd_diff(args)
-    if args.command == "promote":
-        return cmd_promote(args)
-    if args.command == "findings-promote":
-        return cmd_findings_promote(args)
+    _dispatch = {
+        "scan": cmd_scan,
+        "hotspots": cmd_hotspots,
+        "diff": cmd_diff,
+        "promote": cmd_promote,
+        "findings-promote": cmd_findings_promote,
+        "functions": cmd_functions,
+        "reset": cmd_reset,
+        "structural-search": cmd_structural_search,
+        "patterns": cmd_patterns,
+    }
+    if args.command in _dispatch:
+        return _dispatch[args.command](args)
     if args.command == "health-info":
         cmd_health_info(args)
         return 0
     if args.command == "context-files":
         cmd_context_files(args)
         return 0
-    if args.command == "functions":
-        return cmd_functions(args)
-    if args.command == "reset":
-        return cmd_reset(args)
     parser.print_help()
     return 1
 

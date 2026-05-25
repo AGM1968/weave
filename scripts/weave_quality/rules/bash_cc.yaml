@@ -1,0 +1,15 @@
+id: bash-cc
+language: bash
+# Note: tree-sitter-bash aliases until→while_statement, select→for_statement.
+# Both are counted by the kinds below; no separate until/select kinds exist.
+# All case_item arms count +1 each, including the default *) arm (McCabe convention).
+rule:
+  any:
+    - kind: if_statement
+    - kind: elif_clause
+    - kind: case_item
+    - kind: for_statement
+    - kind: c_style_for_statement
+    - kind: while_statement
+    - pattern: "$A && $B"
+    - pattern: "$A || $B"

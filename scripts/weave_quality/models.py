@@ -355,6 +355,8 @@ class ScanMeta:
     files_count: int = 0
     duration_ms: int = 0
     scanner_version: str = ""  # Weave version that produced this scan
+    bash_cc_backend: str = "regex"  # 'ast-grep' or 'regex'
+    ts_cc_backend: str = "unavailable"  # 'ast-grep' or 'unavailable'
 
     @classmethod
     def create(
@@ -371,6 +373,23 @@ class ScanMeta:
     def is_stale(self, current_head: str) -> bool:
         """Check if this scan is stale (HEAD has moved)."""
         return self.git_head != current_head
+
+
+@dataclass
+class PatternFinding:
+    """One ast-grep structural pattern match.
+
+    Maps to the `pattern_findings` table. Pruned at the same _FILES_SCANS=2
+    boundary as files/file_metrics — point-in-time data, not trend data.
+    """
+
+    path: str = ""
+    scan_id: int = 0
+    rule_id: str = ""
+    line: int = 0
+    col: int = 0
+    match_text: str = ""
+    severity: str = "warning"
 
 
 @dataclass
