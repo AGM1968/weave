@@ -2,6 +2,26 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.51.1] - 2026-05-25
+
+### Fixed
+
+- **MCP tool count corrected to 40** in `README.md` and `README.public.md` (was 35 since v1.50.1
+  added 5 tools but docs were not updated). `weave-inspect` scope count corrected to 19 (was 15).
+- **MCP table gaps filled** — `weave_unlink`, `weave_block`, `weave_unarchive`, `weave_ready`,
+  `weave_query`, `weave_recover`, `weave_code_search`, `weave_index` added to both README tables.
+
+### Changed
+
+- **`templates/CLAUDE.md.template`** — step 0 updated from `git status && wv status` to
+  `wv bootstrap --json` to match canonical `WORKFLOW.md`. Workflow prose condensed.
+- **`CLAUDE.md`** — managed block updated to match template; duplicate `## Workflow` section
+  replaced with a one-line pointer to the canonical reference.
+- **`.claude/agents/AGENTS.md`** — session-start (`wv bootstrap --json`), mid-session, and
+  session-close sequences added; operating rules added; subagent table preserved.
+- **`.weave/runtime.md`** — populated with repo-local Weave startup/close block, graph signal table,
+  mid-session commands, and this-repo dev notes. Previously empty placeholder.
+
 ## [1.51.0] - 2026-05-24
 
 ### Added

@@ -228,10 +228,10 @@ Returns blockers, ancestors with learnings, related nodes, pitfalls, and contrad
 
 ## MCP Server
 
-35 tools for IDE integration via 2 server instances:
+40 tools for IDE integration via 2 server instances:
 
-- **`weave`** (scope=all, 35 tools) — full tool set for Copilot Chat
-- **`weave-inspect`** (scope=inspect, 15 tools) — read-only subset for analysis subagents
+- **`weave`** (scope=all, 40 tools) — full tool set for Copilot Chat
+- **`weave-inspect`** (scope=inspect, 19 tools) — read-only subset for analysis subagents
 - **`--scope=lite`** (7 tools) — lightweight profile for constrained contexts
 
 > **Claude Code** does not use MCP — it interacts with Weave via `wv` CLI and enforcement hooks. MCP
@@ -255,6 +255,14 @@ Returns blockers, ancestors with learnings, related nodes, pitfalls, and contrad
 | `weave_search`            | `wv search`                            | Full-text search                      |
 | `weave_context`           | `wv context`                           | Context Pack for a node               |
 | `weave_link`              | `wv link`                              | Create semantic edges                 |
+| `weave_unlink`            | `wv unlink`                            | Remove semantic edge                  |
+| `weave_block`             | `wv block`                             | Add blocking dependency               |
+| `weave_unarchive`         | `wv unarchive`                         | Restore pruned node from archive      |
+| `weave_ready`             | `wv ready`                             | List unblocked work                   |
+| `weave_query`             | `wv query`                             | Predicate-based node query            |
+| `weave_recover`           | `wv recover`                           | Resume interrupted sync               |
+| `weave_code_search`       | `wv search --code`                     | Hybrid BM25+cosine code search        |
+| `weave_index`             | `wv index`                             | Index code files for hybrid search    |
 | `weave_tree`              | `wv tree`                              | View hierarchy (supports `--mermaid`) |
 | `weave_learnings`         | `wv learnings`                         | Query captured learnings              |
 | `weave_status`            | `wv status`                            | Status summary                        |
