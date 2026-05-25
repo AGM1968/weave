@@ -101,7 +101,7 @@ Your AI coding agent follows the workflow automatically via generated instructio
 ## Core Workflow
 
 ```text
-git status && wv status                 Check repo + graph state
+wv bootstrap --json                     Session snapshot (replaces git status + wv status)
 wv ready                                Find unblocked work
 wv work <id>                            Claim a task (one active at a time)
 git add <files> && git commit -m "..." Commit work files before closing

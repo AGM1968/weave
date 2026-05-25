@@ -2,6 +2,14 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.51.3] - 2026-05-25
+
+### Fixed
+
+- **Core Workflow block** in `README.public.md` and `README.md` — step 0 updated from
+  `git status && wv status` to `wv bootstrap --json`. Was missed during 1.51.1 parity pass which
+  updated CLAUDE.md template and AGENTS.md but not the prose workflow blocks.
+
 ## [1.51.2] - 2026-05-25
 
 ### Fixed
