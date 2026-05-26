@@ -2617,9 +2617,10 @@ cmd_touch() {
 
     local metadata_esc="${metadata//\'/\'\'}"
     db_query "UPDATE nodes SET metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
-    
+    invalidate_context_cache "$id"
     # No stdout — fire-and-forget. Zero token cost.
 }
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_allowed_tools — Read metadata.allowed_tools for a node

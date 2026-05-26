@@ -2,6 +2,34 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.51.8] - 2026-05-26
+
+### Fixed
+
+- **Run-cache write-list completeness** — `touch`, `unarchive`, `ship-agent`, and `findings` were
+  missing from `_wv_run_cache_is_write_cmd`. All four mutate the graph; omitting them meant the
+  run-cache sentinel was not touched after these calls, so a subsequent `wv bootstrap` or `wv ready`
+  could serve stale output for up to 45s. Added alongside the existing list in `wv-cache.sh`.
+  (`findings` invalidates on both `promote --apply` and `list`; acceptable given low call
+  frequency.)
+- **Context-cache invalidation gaps** — `cmd_touch` and `cmd_unarchive` were missing
+  `invalidate_context_cache` calls. `wv touch` updates `current_intent` (read by `wv context`) and
+  `wv unarchive` restores a pruned node into the live graph, making both neighbours' context stale.
+  Fixed: both now call `invalidate_context_cache` after their respective DB writes.
+- **Closing-phase enforcement window unbounded** — after `wv done`, `.session_phase` stayed
+  `closing` indefinitely until the next `wv work`. Both gates (pre-action.sh edit-time and
+  pre-commit-weave.sh commit-time) bypassed enforcement during this window, allowing unlimited
+  untracked edits and commits. Both now reset the phase to `discover` after permitting a single
+  operation (one edit, one commit), bounding the window to its intended one-shot semantics.
+
+### Notes
+
+- `wv allowed-tools` is a pure read (SELECT); the `allowed_tools` writes occur inside `wv done` and
+  `wv work` which are already in the write-cmd list.
+- MCP path asymmetry: `mcp/src/index.ts` does not read `.session_phase`. MCP uses its own gate
+  (`MCP_READ_MODE`). If MCP-driven and Claude Code-driven edits are mixed across a `wv done`, the
+  MCP edits do not participate in the closing-phase window. By design.
+
 ## [1.51.7] - 2026-05-26
 
 ### Performance

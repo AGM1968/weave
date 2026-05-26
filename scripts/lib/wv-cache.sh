@@ -31,7 +31,7 @@ invalidate_context_cache() {
 # ═══════════════════════════════════════════════════════════════════════════
 # Run Cache — command-level output caching for read-only commands
 # ═══════════════════════════════════════════════════════════════════════════
-# Caches stdout of pure-read commands (status, ready, list) in tmpfs.
+# Caches stdout of pure-read commands (ready, list, bootstrap) in tmpfs.
 # Invalidated by a sentinel file touched on every successful write command.
 # TTL provides eventual consistency for out-of-band writes (MCP, other shells).
 #
@@ -50,9 +50,9 @@ _wv_run_cache_is_read_cmd() {
 
 _wv_run_cache_is_write_cmd() {
     case "${1:-}" in
-        add|done|batch-done|bulk-update|delete|work|update|quick|ship|\
-        block|link|unlink|resolve|\
-        batch|plan|enrich-topology|sync|load|compact|prune|clean-ghosts|import|reindex)
+        add|done|batch-done|bulk-update|delete|work|update|touch|allowed-tools|quick|ship|ship-agent|\
+        block|link|unlink|resolve|findings|\
+        unarchive|batch|plan|enrich-topology|sync|load|compact|prune|clean-ghosts|import|reindex)
             return 0 ;;
         *) return 1 ;;
     esac

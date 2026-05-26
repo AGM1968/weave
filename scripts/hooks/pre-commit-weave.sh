@@ -93,11 +93,18 @@ fi
 # Phase-aware enforcement: allow commits in discover and closing phases.
 # discover = exploring before claiming; closing = recording just-closed work.
 # execute  = substantive work in progress (enforce active node).
+# closing is bounded: after one commit (the wv-sync .weave/ commit), reset to
+# discover so subsequent work requires a node claim before the next commit.
 _PC_REPO_HASH=$(echo "$REPO_ROOT" | md5sum | cut -c1-8)
 _PC_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_PC_REPO_HASH}}"
 _PC_PHASE=$(cat "${_PC_HOT_ZONE}/.session_phase" 2>/dev/null || echo "execute")
 
-if [ "$_PC_PHASE" = "discover" ] || [ "$_PC_PHASE" = "closing" ]; then
+if [ "$_PC_PHASE" = "discover" ]; then
+    exit 0
+fi
+
+if [ "$_PC_PHASE" = "closing" ]; then
+    echo "discover" > "${_PC_HOT_ZONE}/.session_phase" 2>/dev/null || true
     exit 0
 fi
 

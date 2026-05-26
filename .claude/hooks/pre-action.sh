@@ -125,6 +125,11 @@ if [ "$_PA_PHASE" = "discover" ] || [ "$_PA_PHASE" = "closing" ]; then
             '{total:$total, with_active:$with_active}' \
             > "$_PA_EDITS_FILE" 2>/dev/null || true
     fi
+    # closing is a one-edit window: reset to discover so subsequent edits
+    # can't silently accumulate without a node claim.
+    if [ "$_PA_PHASE" = "closing" ]; then
+        echo "discover" > "${_PA_HOT_ZONE}/.session_phase" 2>/dev/null || true
+    fi
     exit 0
 fi
 

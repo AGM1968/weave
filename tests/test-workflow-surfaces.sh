@@ -118,7 +118,7 @@ assert_not_contains "$MCP_JSON" '"weave-graph"' "mcp.json: does not ship weave-g
 assert_contains "$MCP_README" 'currently registers **four servers**' "mcp README: documents shipped four-server config"
 assert_contains "$MCP_README" 'optional local addition' "mcp README: preserves scoped-server roadmap"
 assert_contains "$MCP_README" '### Session scope — workflow lifecycle (10 tools)' "mcp README: session scope count is current"
-assert_contains "$MCP_README" '### Inspect scope — read-only queries (15 tools)' "mcp README: inspect scope count is current"
+assert_contains "$MCP_README" '### Inspect scope — read-only queries (21 tools)' "mcp README: inspect scope count is current"
 assert_contains "$MCP_README" '`weave_recover`' "mcp README: session tool inventory includes weave_recover"
 assert_contains "$MCP_README" '`weave_edit_guard`' "mcp README: session tool inventory includes weave_edit_guard"
 assert_contains "$MCP_README" '`weave-graph` (planned) / `weave` (current)' "mcp README: agent pairing distinguishes planned vs current graph server"

@@ -45,6 +45,7 @@ setup_test_env() {
     rm -rf "$TEST_DIR"
     mkdir -p "$TEST_DIR"
     cd "$TEST_DIR"
+    export WV_HOT_ZONE="$TEST_DIR/hot"  # fresh hot zone per test; rm -rf above clears stale DB
     "$WV" init >/dev/null 2>&1
 }
 
@@ -186,7 +187,7 @@ test_cmd_done_invalidation() {
     assert_equals "1" "$before_count" "Blocked node has one blocker"
 
     # Complete blocker
-    "$WV" done "$blocker" >/dev/null 2>&1
+    "$WV" done "$blocker" --skip-verification >/dev/null 2>&1
 
     # Get context again - done blockers are filtered out by design
     # (see docs/WEAVE.md: "blockers (done nodes filtered out)")
@@ -243,7 +244,7 @@ test_cmd_prune_invalidation() {
     "$WV" block "$dep_node" --by="$old_node" >/dev/null 2>&1
 
     # Complete old node
-    "$WV" done "$old_node" >/dev/null 2>&1
+    "$WV" done "$old_node" --skip-verification >/dev/null 2>&1
 
     # Artificially age the node
     # Database is at $WV_HOT_ZONE/brain.db (tmpfs location)
@@ -334,11 +335,47 @@ test_cache_file_lifecycle() {
     fi
 }
 
+# Test 7: wv touch invalidates run cache
+# Verifies the bug fixed in 1.51.7: touch was absent from _wv_run_cache_is_write_cmd
+# so wv bootstrap served stale metadata for up to 45s after a touch.
+test_touch_invalidates_run_cache() {
+    echo ""
+    echo "Test 7: wv touch invalidates run cache"
+    echo "======================================="
+
+    setup_test_env
+    export WV_RUN_CACHE=1
+
+    local node_id
+    node_id=$("$WV" add "Run-cache touch test" | tail -1)
+    "$WV" update "$node_id" --alias=rct >/dev/null 2>&1
+    "$WV" work "$node_id" >/dev/null 2>&1
+
+    # Prime the bootstrap run cache
+    "$WV" bootstrap --json >/dev/null 2>&1
+
+    # Ensure sentinel mtime > cache mtime (1s filesystem granularity)
+    sleep 1
+
+    # Touch node with a unique marker
+    local marker="runcache-intent-$$"
+    "$WV" touch "$node_id" --intent="$marker"
+
+    # Bootstrap must return fresh data; stale cache would return empty intent
+    local got
+    got=$("$WV" bootstrap --json | jq -r \
+        '.active_node.metadata | if type == "string" then fromjson else . end | .current_intent // ""')
+
+    assert_equals "$marker" "$got" "wv touch invalidates run cache: bootstrap shows updated intent"
+
+    export WV_RUN_CACHE=0
+}
+
 # Run all tests
 main() {
     echo "Cache Invalidation Tests"
     echo "========================"
-    echo "Testing: cmd_refs, cmd_block, cmd_done, cmd_link, cmd_prune"
+    echo "Testing: cmd_refs, cmd_block, cmd_done, cmd_link, cmd_prune, run-cache"
     echo ""
 
     test_cmd_refs_link_invalidation
@@ -347,6 +384,7 @@ main() {
     test_cmd_link_invalidation
     test_cmd_prune_invalidation
     test_cache_file_lifecycle
+    test_touch_invalidates_run_cache
 
     # Summary
     echo ""
