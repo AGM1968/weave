@@ -30,6 +30,32 @@ log = logging.getLogger(__name__)
 _RULE_FILE = Path(__file__).parent / "rules" / "bash_cc.yaml"
 
 
+def _parse_ast_grep_output(stdout: str, filepaths: list[str]) -> dict[str, list[int]] | None:
+    """Parse ast-grep JSON output into a per-file map of CC line numbers.
+
+    Used by both single-file and batch paths. Returns None on parse error.
+    """
+    if not stdout.strip():
+        return {fp: [] for fp in filepaths}
+    try:
+        matches = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(matches, list):
+        return None
+
+    result: dict[str, list[int]] = {fp: [] for fp in filepaths}
+    for m in matches:
+        fp = m.get("file", "")
+        rng = m.get("range", {})
+        line = rng.get("start", {}).get("line")
+        if fp in result and isinstance(line, int):
+            result[fp].append(line)
+    for fp in result:
+        result[fp].sort()
+    return result
+
+
 def _cc_lines_from_ast_grep(filepath: str) -> list[int] | None:
     """Run ast-grep on a bash file; return sorted 0-indexed line numbers of CC nodes.
 
@@ -38,61 +64,71 @@ def _cc_lines_from_ast_grep(filepath: str) -> list[int] | None:
     """
     if not shutil.which("ast-grep"):
         return None
-    cmd = [
-        "ast-grep",
-        "scan",
-        "--rule",
-        str(_RULE_FILE),
-        "--json",
-        filepath,
-    ]
+    cmd = ["ast-grep", "scan", "--rule", str(_RULE_FILE), "--json", filepath]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
     except subprocess.TimeoutExpired:
         log.warning("ast-grep timed out on %s", filepath)
         return None
 
-    # Exit 2 = ast-grep error; exit 1 with no stdout = no matches (valid)
     if proc.returncode == 2 or (proc.returncode not in (0, 1) and not proc.stdout.strip()):
         log.warning("ast-grep error on %s: %s", filepath, proc.stderr.strip()[:200])
         return None
 
-    if not proc.stdout.strip():
-        return []
-
-    try:
-        matches = json.loads(proc.stdout)
-    except json.JSONDecodeError:
+    parsed = _parse_ast_grep_output(proc.stdout, [filepath])
+    if parsed is None:
         log.warning("ast-grep JSON parse error on %s", filepath)
         return None
+    return parsed.get(filepath, [])
 
-    if not isinstance(matches, list):
+
+def batch_cc_lines(filepaths: list[str]) -> dict[str, list[int]] | None:
+    """Run ast-grep ONCE on all filepaths; return per-file CC line map.
+
+    Reduces N subprocess spawns to 1 for a full scan.
+    Returns None if ast-grep is absent or times out; callers fall back per-file.
+    Files with no matches get an empty list (not None).
+    """
+    if not filepaths or not shutil.which("ast-grep"):
+        return None
+    cmd = ["ast-grep", "scan", "--rule", str(_RULE_FILE), "--json"] + filepaths
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+    except subprocess.TimeoutExpired:
+        log.warning("ast-grep batch timed out (%d files)", len(filepaths))
         return None
 
-    lines = []
-    for m in matches:
-        rng = m.get("range", {})
-        start = rng.get("start", {})
-        line = start.get("line")
-        if isinstance(line, int):
-            lines.append(line)  # ast-grep is 0-indexed
-    return sorted(lines)
+    if proc.returncode == 2 or (proc.returncode not in (0, 1) and not proc.stdout.strip()):
+        log.warning("ast-grep batch error: %s", proc.stderr.strip()[:200])
+        return None
+
+    parsed = _parse_ast_grep_output(proc.stdout, filepaths)
+    if parsed is None:
+        log.warning("ast-grep batch JSON parse error")
+        return None
+    return parsed
 
 
 def analyze_bash_source_ast_grep(
-    source: str, filepath: str, scan_id: int = 0
+    source: str,
+    filepath: str,
+    scan_id: int = 0,
+    cc_lines: list[int] | None = None,
 ) -> tuple[FileEntry, list[FunctionCC]] | None:
     """Analyze Bash source using ast-grep for CC.
 
     Returns (FileEntry, list[FunctionCC]) or None when ast-grep is unavailable.
     Caller should fall back to analyze_bash_source from bash_heuristic.
 
+    When cc_lines is provided (from batch_cc_lines), skips the subprocess call.
+
     All non-CC metrics (nesting, indent_sd, loc, avg_fn_len) keep the
     existing heuristic — they are not biased by the branch-counting issue.
     Function boundary detection also reuses _find_function_ranges from
     bash_heuristic; only the per-branch count inside each function changes.
     """
-    cc_lines = _cc_lines_from_ast_grep(filepath)
+    if cc_lines is None:
+        cc_lines = _cc_lines_from_ast_grep(filepath)
     if cc_lines is None:
         return None
 
@@ -148,12 +184,17 @@ def ast_grep_available() -> bool:
 
 
 def analyze_bash_file_best(
-    filepath: str, scan_id: int = 0
+    filepath: str,
+    scan_id: int = 0,
+    batch_cc: dict[str, list[int]] | None = None,
 ) -> tuple[FileEntry, list[FunctionCC], str]:
     """Analyze a bash file using the best available backend.
 
     Returns (FileEntry, list[FunctionCC], backend_name).
     backend_name is 'ast-grep' or 'regex'.
+
+    When batch_cc is provided (from batch_cc_lines), uses pre-computed CC lines
+    instead of spawning a subprocess per file.
     """
     try:
         source = Path(filepath).read_text(encoding="utf-8", errors="replace")
@@ -161,7 +202,8 @@ def analyze_bash_file_best(
         log.warning("Could not read %s: %s", filepath, exc)
         source = ""
 
-    result = analyze_bash_source_ast_grep(source, filepath, scan_id)
+    pre_cc = batch_cc.get(filepath) if batch_cc is not None else None
+    result = analyze_bash_source_ast_grep(source, filepath, scan_id, cc_lines=pre_cc)
     if result is not None:
         entry, fn_cc = result
         return entry, fn_cc, "ast-grep"

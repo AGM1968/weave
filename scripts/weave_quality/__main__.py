@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import configparser
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import logging
@@ -29,8 +30,10 @@ import sys
 import time
 from fnmatch import fnmatch
 from pathlib import Path
+import tempfile
 
-from weave_quality.bash_ast_grep import analyze_bash_file_best, ast_grep_available
+from weave_quality.ast_cache import ASTCache
+from weave_quality.bash_ast_grep import analyze_bash_file_best, ast_grep_available, batch_cc_lines
 from weave_quality.bash_heuristic import detect_bash
 from weave_quality.typescript_parser import analyze_typescript_file
 from weave_quality.classification import classify_file, load_classify_overrides
@@ -156,6 +159,47 @@ def _resolve_repo(path: str | None) -> str:
 # File discovery
 # ---------------------------------------------------------------------------
 
+# Extensions that can never be bash/shell scripts — skip shebang check entirely.
+# Generated from observed repo noise (2945 .sql delta files alone caused ~0.36s
+# overhead per incremental scan via unnecessary file opens in detect_bash).
+_NON_SCRIPT_EXTS: frozenset[str] = frozenset(
+    {
+        "sql",
+        "md",
+        "json",
+        "yaml",
+        "yml",
+        "toml",
+        "cfg",
+        "ini",
+        "txt",
+        "pdf",
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "svg",
+        "ico",
+        "csv",
+        "html",
+        "css",
+        "xml",
+        "rst",
+        "lock",
+        "log",
+        "db",
+        "jsonl",
+        "tsv",
+        "gitignore",
+        "gitattributes",
+        "prettierrc",
+        "eslintrc",
+        "shellcheckrc",
+        "sembleignore",
+        "properties",
+    }
+)
+
 
 def _discover_files(repo: str, exclude_globs: list[str] | None = None) -> list[str]:
     """Discover Python and Bash files in the repo.
@@ -200,8 +244,15 @@ def _discover_files(repo: str, exclude_globs: list[str] | None = None) -> list[s
         # Apply exclude globs
         if exclude_globs and any(fnmatch(rel_path, g) for g in exclude_globs):
             continue
-        if rel_path.endswith(".py") or rel_path.endswith((".ts", ".tsx")) or detect_bash(abs_path):
+        if rel_path.endswith(".py") or rel_path.endswith((".ts", ".tsx")):
             files.append(rel_path)
+        else:
+            # Fast-reject known non-script extensions before opening the file.
+            dot = rel_path.rfind(".")
+            if dot != -1 and rel_path[dot + 1 :].lower() in _NON_SCRIPT_EXTS:
+                continue
+            if detect_bash(abs_path):
+                files.append(rel_path)
 
     return sorted(files)
 
@@ -258,6 +309,8 @@ def _scan_files(
     files_to_scan: list[str],
     scan_id: int,
     classify_overrides: dict[str, list[str]] | None,
+    blob_map: dict[str, str] | None = None,
+    ast_cache: "ASTCache | None" = None,
 ) -> tuple[list[FileEntry], list[CKMetrics], list[FunctionCC], dict[str, int], str, str]:
     """Analyze each file and return (entries, ck_metrics_list, fn_cc_list, lang_counts,
     bash_backend, ts_backend).
@@ -275,23 +328,40 @@ def _scan_files(
     ts_seen = 0
     ts_succeeded = 0
 
+    # Pre-batch bash CC analysis: one ast-grep subprocess for all bash files
+    # instead of one per file. Falls back gracefully per-file when batch fails.
+    bash_abs_paths = [
+        os.path.join(repo, rel)
+        for rel in files_to_scan
+        if not rel.endswith((".py", ".ts", ".tsx"))
+    ]
+    _batch_cc: dict[str, list[int]] | None = batch_cc_lines(bash_abs_paths) if bash_abs_paths else None
+
     for rel_path in files_to_scan:
         abs_path = os.path.join(repo, rel_path)
         if rel_path.endswith(".py"):
-            entry, ck, fn_cc = analyze_python_file(abs_path, scan_id)
-            entry = FileEntry(
-                path=rel_path,
-                scan_id=scan_id,
-                language=entry.language,
-                loc=entry.loc,
-                complexity=entry.complexity,
-                functions=entry.functions,
-                max_nesting=entry.max_nesting,
-                avg_fn_len=entry.avg_fn_len,
-                essential_complexity=entry.essential_complexity,
-                indent_sd=entry.indent_sd,
-                category=classify_file(rel_path, classify_overrides),
-            )
+            category = classify_file(rel_path, classify_overrides)
+            blob_sha = blob_map.get(rel_path, "") if blob_map else ""
+            cached = ast_cache.get(blob_sha, rel_path, scan_id, category) if ast_cache else None
+            if cached is not None:
+                entry, ck, fn_cc = cached
+            else:
+                entry, ck, fn_cc = analyze_python_file(abs_path, scan_id)
+                if ast_cache and blob_sha:
+                    ast_cache.put(blob_sha, entry, ck, fn_cc)
+                entry = FileEntry(
+                    path=rel_path,
+                    scan_id=scan_id,
+                    language=entry.language,
+                    loc=entry.loc,
+                    complexity=entry.complexity,
+                    functions=entry.functions,
+                    max_nesting=entry.max_nesting,
+                    avg_fn_len=entry.avg_fn_len,
+                    essential_complexity=entry.essential_complexity,
+                    indent_sd=entry.indent_sd,
+                    category=category,
+                )
             if ck is not None:
                 ck.path = rel_path
                 ck.scan_id = scan_id
@@ -328,7 +398,7 @@ def _scan_files(
             all_fn_cc.extend(fn_cc)
             lang_counts["typescript"] = lang_counts.get("typescript", 0) + 1
         else:
-            entry, fn_cc, _used_backend = analyze_bash_file_best(abs_path, scan_id)
+            entry, fn_cc, _used_backend = analyze_bash_file_best(abs_path, scan_id, batch_cc=_batch_cc)
             bash_backends_used.add(_used_backend)
             entry = FileEntry(
                 path=rel_path,
@@ -490,9 +560,26 @@ def cmd_scan(args: argparse.Namespace) -> int:
             files_unchanged.append(rel_path)
 
     classify_overrides = load_classify_overrides(repo)
-    entries, ck_metrics_list, all_fn_cc, lang_counts, bash_backend, ts_backend = _scan_files(
-        repo, files_to_scan, scan_id, classify_overrides
-    )
+
+    _cache = ASTCache.open(repo, _SCANNER_VERSION)
+
+    # Overlap git work with file analysis: subprocess.run inside git calls releases
+    # the GIL, so both futures run truly concurrently with _scan_files (CPU-bound).
+    # all_files = files_to_scan + files_unchanged covers all paths — no need to
+    # wait for _scan_files before starting git stats.
+    with ThreadPoolExecutor(max_workers=2) as _git_pool:
+        _git_stats_future = _git_pool.submit(enrich_all_git_stats, repo, all_files)
+        _co_changes_future = _git_pool.submit(compute_co_changes, repo)
+
+        entries, ck_metrics_list, all_fn_cc, lang_counts, bash_backend, ts_backend = _scan_files(
+            repo, files_to_scan, scan_id, classify_overrides,
+            blob_map=blob_map, ast_cache=_cache,
+        )
+    # Executor has shut down; futures are resolved.
+    git_stats = _git_stats_future.result()
+    co_changes = _co_changes_future.result()
+
+    _cache.close()
 
     bulk_upsert_file_entries(conn, entries)
     for ck in ck_metrics_list:
@@ -511,11 +598,6 @@ def cmd_scan(args: argparse.Namespace) -> int:
         upsert_complexity_trend(conn, e.path, scan_id, e.complexity, e.essential_complexity)
     for rel_path in files_to_scan:
         upsert_file_state(conn, build_file_state(repo, rel_path, blob_map=blob_map))
-
-    # Deduplicate: entries already includes carry-forward paths from files_unchanged
-    _all_paths = list(dict.fromkeys([e.path for e in entries] + files_unchanged))
-    git_stats = enrich_all_git_stats(repo, _all_paths)
-    co_changes = compute_co_changes(repo)
     if git_stats:
         compute_hotspots(entries, git_stats)
     bulk_upsert_git_stats(conn, git_stats)
@@ -525,7 +607,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
     all_fn_cc = get_all_function_cc(conn, scan_id)
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
-    finish_scan(conn, scan_id, len(entries) + len(files_unchanged), duration_ms,
+    # entries already includes carry-forward rows (extended above); use len(all_files)
+    # to avoid double-counting files_unchanged.
+    finish_scan(conn, scan_id, len(all_files), duration_ms,
                 bash_cc_backend=bash_backend, ts_cc_backend=ts_backend)
     conn.commit()
     conn.close()
@@ -537,7 +621,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         print(json.dumps({
             "scan_id": scan_id,
             "git_head": head,
-            "files_scanned": len(entries) + len(files_unchanged),
+            "files_scanned": len(all_files),
             "files_changed": len(files_to_scan),
             "languages": lang_counts,
             "category_counts": category_counts,
@@ -1361,7 +1445,7 @@ def _disabled_patterns(conf_path: Path) -> set[str]:
     disabled: set[str] = set()
     if not conf_path.exists():
         return disabled
-    cp = configparser.ConfigParser()
+    cp = configparser.ConfigParser(inline_comment_prefixes=("#",), allow_no_value=True)
     cp.read(str(conf_path))
     raw = cp.get("patterns", "disabled", fallback="")
     for item in raw.replace(",", " ").split():
@@ -1534,11 +1618,31 @@ def cmd_structural_search(args: argparse.Namespace) -> int:
             print("structural_scan: disabled (ast-grep not found — run ./install.sh)", file=sys.stderr)
         return 1
 
-    cmd = ["ast-grep", "run", "--pattern", args.pattern, "--lang", args.lang, "--json", args.repo]
+    # ast-grep `run --pattern` has limited metavariable support for Python;
+    # `scan --rule` (YAML) works correctly for all languages.
+    rule_yaml = (
+        f"id: structural-search\n"
+        f"language: {args.lang}\n"
+        f"rule:\n"
+        f"  pattern: |\n"
+        f"    {args.pattern}\n"
+    )
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False, prefix="wv_ss_"
+        ) as tf:
+            tf.write(rule_yaml)
+            rule_path = tf.name
+    except OSError as exc:
+        return _structural_search_error({"error": "temp file error", "detail": str(exc)}, args.json)
+
+    cmd = ["ast-grep", "scan", "--rule", rule_path, "--json", args.repo]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
     except subprocess.TimeoutExpired:
         return _structural_search_error({"error": "timeout", "detail": "ast-grep exceeded 30s"}, args.json)
+    finally:
+        Path(rule_path).unlink(missing_ok=True)
 
     # Exit 2 (or empty stdout with non-empty stderr) = invalid pattern / hard error.
     # Exit 1 with valid JSON = no matches found (ast-grep convention).

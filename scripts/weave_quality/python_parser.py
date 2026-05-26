@@ -82,6 +82,8 @@ class _ComplexityVisitor(ast.NodeVisitor):
         self._depth = 0
         self.max_nesting = 0
         self._per_function = per_function
+        self.self_attrs: set[str] = set()
+        self.call_count: int = 0
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802  # pylint: disable=invalid-name
         """Stop recursion at nested function boundaries in per_function mode."""
@@ -121,6 +123,15 @@ class _ComplexityVisitor(ast.NodeVisitor):
         """Count comprehensions and their if-clauses."""
         self.complexity += 1
         self.complexity += len(node.ifs)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802  # pylint: disable=invalid-name,missing-function-docstring
+        if type(node.value) is ast.Name and node.value.id == "self":  # pylint: disable=unidiomatic-typecheck
+            self.self_attrs.add(node.attr)
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802  # pylint: disable=invalid-name,missing-function-docstring
+        self.call_count += 1
         self.generic_visit(node)
 
 
@@ -398,11 +409,16 @@ def _single_pass_ast(tree: ast.Module) -> ASTAnalysis:
         elif isinstance(node, ast.ImportFrom) and node.module:
             imports.add(node.module.split(".")[0])
 
+    fn_self_attrs: dict[int, frozenset[str]] = {}
+    class_rfc = 0
+
     # Full-tree CC + nesting (one visitor run — matches _ast_complexity/_ast_nesting_depth)
     full_visitor = _ComplexityVisitor()
     full_visitor.visit(tree)
 
-    # Per-function CC + EV
+    # Per-function CC + EV; CC visitor also collects self_attrs and call_count
+    # — folded here to avoid separate ast.walk passes in _compute_lcom (LCOM)
+    # and _ast_ck_metrics (RFC).
     functions: list[FunctionDetail] = []
     for fn_node in func_nodes:
         cc_visitor = _ComplexityVisitor(per_function=True)
@@ -413,6 +429,13 @@ def _single_pass_ast(tree: ast.Module) -> ASTAnalysis:
         for child in ast.iter_child_nodes(fn_node):
             ev_visitor.visit(child)
 
+        fn_id = id(fn_node)
+        fn_self_attrs[fn_id] = frozenset(cc_visitor.self_attrs)
+
+        if fn_id in class_children:
+            # RFC: +1 for the method def itself, + all Call nodes inside it
+            class_rfc += 1 + cc_visitor.call_count
+
         line_end = getattr(fn_node, "end_lineno", fn_node.lineno) or fn_node.lineno
         functions.append(
             FunctionDetail(
@@ -422,7 +445,7 @@ def _single_pass_ast(tree: ast.Module) -> ASTAnalysis:
                 complexity=float(cc_visitor.complexity),
                 essential_complexity=ev_visitor.essential_complexity,
                 is_dispatch=_is_dispatch_function(fn_node),
-                parent_is_class=id(fn_node) in class_children,
+                parent_is_class=fn_id in class_children,
             )
         )
 
@@ -432,6 +455,8 @@ def _single_pass_ast(tree: ast.Module) -> ASTAnalysis:
         functions=functions,
         imports=imports,
         class_nodes=class_nodes,
+        fn_self_attrs=fn_self_attrs,
+        class_rfc=class_rfc,
     )
 
 
@@ -495,15 +520,18 @@ def _ast_ck_metrics(
         direct_bases = max(direct_bases, len(cls_node.bases))
 
     # RFC: method definitions + Call nodes in all classes
-    rfc = 0
-    for cls_node in classes:
-        for item in ast.walk(cls_node):
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Call)):
-                rfc += 1
+    if analysis is not None:
+        rfc = analysis.class_rfc
+    else:
+        rfc = 0
+        for cls_node in classes:
+            for item in ast.walk(cls_node):
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Call)):
+                    rfc += 1
 
     # LCOM: Lack of Cohesion in Methods
-    # 1 - (methods_sharing_attrs / total_methods)
-    lcom = _compute_lcom(classes)
+    fn_attrs = analysis.fn_self_attrs if analysis is not None else None
+    lcom = _compute_lcom(classes, fn_attrs)
 
     return CKMetrics(
         path=path,
@@ -519,42 +547,66 @@ def _ast_ck_metrics(
     )
 
 
-def _compute_lcom(classes: list[ast.ClassDef]) -> float:
+def _self_attrs_for_method(item: ast.FunctionDef | ast.AsyncFunctionDef) -> frozenset[str]:
+    """Walk a method body and collect self.x attribute names."""
+    attrs: set[str] = set()
+    for node in ast.walk(item):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+        ):
+            attrs.add(node.attr)
+    return frozenset(attrs)
+
+
+def _compute_lcom(
+    classes: list[ast.ClassDef],
+    fn_self_attrs: dict[int, frozenset[str]] | None = None,
+) -> float:
     """Compute LCOM (Lack of Cohesion in Methods).
 
-    For each class, find which methods share instance attributes (self.x).
+    When fn_self_attrs is provided (from _single_pass_ast), uses precomputed
+    per-method self.x attr sets — no re-walk. Early-exits to 1.0 when no
+    method references self attributes (all pairs share nothing).
     LCOM = 1 - (pairs_sharing / total_pairs). Averaged across classes.
-    Returns 0.0 if no classes or no methods.
     """
     if not classes:
         return 0.0
 
     lcom_values: list[float] = []
     for cls_node in classes:
-        methods: list[set[str]] = []
-        for item in ast.iter_child_nodes(cls_node):
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                attrs: set[str] = set()
-                for node in ast.walk(item):
-                    if (
-                        isinstance(node, ast.Attribute)
-                        and isinstance(node.value, ast.Name)
-                        and node.value.id == "self"
-                    ):
-                        attrs.add(node.attr)
-                methods.append(attrs)
+        if fn_self_attrs is not None:
+            # pylint: disable=unidiomatic-typecheck
+            method_attrs: list[frozenset[str]] = [
+                fn_self_attrs[id(item)]
+                for item in ast.iter_child_nodes(cls_node)
+                if (type(item) is ast.FunctionDef or type(item) is ast.AsyncFunctionDef)
+                and id(item) in fn_self_attrs
+            ]
+            # pylint: enable=unidiomatic-typecheck
+        else:
+            method_attrs = [
+                _self_attrs_for_method(item)
+                for item in ast.iter_child_nodes(cls_node)
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
 
-        if len(methods) < 2:
+        if len(method_attrs) < 2:
             lcom_values.append(0.0)
             continue
 
-        # Count pairs sharing at least one attribute
+        # Early-exit: no method references self.x → all pairs share nothing → 1.0
+        if not any(method_attrs):
+            lcom_values.append(1.0)
+            continue
+
         total_pairs = 0
         sharing_pairs = 0
-        for i, method_i in enumerate(methods):
-            for method_j in methods[i + 1 :]:
+        for i, mi in enumerate(method_attrs):
+            for mj in method_attrs[i + 1 :]:
                 total_pairs += 1
-                if method_i & method_j:
+                if mi & mj:
                     sharing_pairs += 1
 
         if total_pairs == 0:  # pragma: no cover

@@ -2,7 +2,22 @@
 
 <!-- markdownlint-disable MD024 -->
 
-## [1.51.7] - 2026-05-25
+## [1.51.7] - 2026-05-26
+
+### Performance
+
+- **AST blob-SHA result cache** — `ASTCache` (`.weave/ast_cache.db`, gitignored) keyed on
+  `(blob_sha, scanner_version)`. Unchanged files return cached `FileEntry` / `CKMetrics` /
+  `FunctionCC` without calling `ast.parse()` or `_single_pass_ast()`. Survives `wv quality reset`.
+  Post-reset scan (warm cache, no code changes): 3.1s → 1.2s. Combined with concurrent git: 4.7s →
+  1.2s.
+- **Concurrent git stats** — `enrich_all_git_stats` and `compute_co_changes` submitted to a 2-worker
+  `ThreadPoolExecutor` before `_scan_files` starts; git `subprocess.run()` calls (GIL-free) overlap
+  with CPU-bound Python analysis. Full scan: 4.7s → 3.1s (34%). Incremental: 0.8s → 0.5s.
+- **Single-pass RFC + LCOM** — RFC counted during `_single_pass_ast` (method defs + call nodes per
+  class), stored on `ASTAnalysis.class_rfc`; LCOM uses precomputed `self.x` attr sets from the CC
+  visitor's `visit_Attribute` hook, with early-exit when no method references `self.x`. Full scan:
+  ~7.8s → ~4.7s (40% reduction).
 
 ### Fixed
 
@@ -15,6 +30,12 @@
 - **`deepeval_runner` docs** — `PYTHONPATH=scripts` added to all usage examples (module not on
   default Poetry path); quality-db usage example added; semble MCP-only limitation and AST-chunking
   gap documented.
+- **`wv quality patterns` structural search** — `ast-grep run --pattern` has broken metavariable
+  support for Python; switched to `scan --rule` (YAML temp file). Works for all languages; temp rule
+  cleaned up in `finally` block.
+- **`quality.conf` parsing** — `ConfigParser` now uses `inline_comment_prefixes=('#',)` and
+  `allow_no_value=True`; previously caused `ParsingError` on `[exempt]` entries with inline `#`
+  comments and no `=` delimiter.
 
 ## [1.51.6] - 2026-05-25
 

@@ -191,6 +191,11 @@ class ASTAnalysis:
     functions: list[FunctionDetail] = field(default_factory=list)
     imports: set[str] = field(default_factory=set)
     class_nodes: list[ast.ClassDef] = field(default_factory=list)
+    # id(fn_node) → frozenset of self.x attr names; populated by _single_pass_ast
+    # to avoid re-walking method bodies in _compute_lcom.
+    fn_self_attrs: dict[int, frozenset[str]] = field(default_factory=dict)
+    # RFC count (method defs + Call nodes across all classes); folded into CC walk.
+    class_rfc: int = 0
 
     @property
     def function_count(self) -> int:
