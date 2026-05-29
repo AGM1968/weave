@@ -128,6 +128,13 @@ resolve_hot_zone() {
         Linux*)
             if is_codex_runtime; then
                 echo "/tmp/weave-codex-${uid}"
+            elif [ -d "/tmp/weave-codex-${uid}" ]; then
+                # Follow an already-established codex zone even without the env
+                # signal. The CLI/sync (which see CLAUDE_CODE_SSE_PORT) create this
+                # dir; harness-spawned hooks lack that env var, so without this they
+                # split to /dev/shm and never see the CLI's phase/DB. Keying off the
+                # dir's existence is a filesystem signal both contexts share. (wv-d6af2f)
+                echo "/tmp/weave-codex-${uid}"
             elif is_container; then
                 echo "wv: container detected, using /tmp (safe default)" >&2
                 echo "/tmp/weave-${uid}"

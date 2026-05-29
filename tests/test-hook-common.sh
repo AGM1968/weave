@@ -189,6 +189,24 @@ test_default_phase_when_file_missing() {
     assert_equals "execute" "$phase" "hook-common: missing .session_phase defaults to execute"
 }
 
+test_codex_zone_followed_without_env_signal() {
+    echo "-- resolve_hot_zone follows an existing codex zone even without env signal (wv-d6af2f)"
+    local uid; uid=$(id -u)
+    local codex_dir="/tmp/weave-codex-${uid}"
+    local created=0
+    [ -d "$codex_dir" ] || { mkdir -p "$codex_dir" && created=1; }
+    # Scrub every codex env signal to mimic a harness-spawned hook process.
+    local zone
+    zone=$(env -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+               -u WV_HOT_ZONE -u WV_DB bash -c "
+        source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh' 2>/dev/null
+        resolve_hot_zone
+    " 2>/dev/null || echo "")
+    # Only remove the dir if this test created it; rmdir is a no-op on a live (non-empty) zone.
+    [ "$created" = "1" ] && rmdir "$codex_dir" 2>/dev/null
+    assert_equals "$codex_dir" "$zone" "hook-context resolve_hot_zone follows existing codex zone via filesystem signal"
+}
+
 test_db_preflight_graceful_when_missing() {
     echo "-- DB pre-flight returns 1 (signal to caller: exit 0) when brain.db missing"
     setup_test_env
@@ -425,6 +443,7 @@ main() {
     test_hook_common_sources_without_error
     test_hot_zone_path_matches_wv
     test_default_phase_when_file_missing
+    test_codex_zone_followed_without_env_signal
     test_db_preflight_graceful_when_missing
     test_all_hooks_source_common
     test_install_sh_ships_hook_common

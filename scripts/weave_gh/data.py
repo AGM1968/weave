@@ -158,6 +158,12 @@ def _is_container_runtime() -> bool:
 def _runtime_hot_zone_base(uid: int | None) -> str:
     if _is_codex_runtime():
         return f"/tmp/weave-codex-{uid}" if uid is not None else "/tmp/weave-codex"
+    # Follow an already-established codex zone even without the env signal, so a
+    # process that lacks CLAUDE_CODE_SSE_PORT does not split-brain away from the
+    # zone holding the live DB/phase. Filesystem signal both contexts see. (wv-d6af2f)
+    codex_base = f"/tmp/weave-codex-{uid}" if uid is not None else "/tmp/weave-codex"
+    if uid is not None and Path(codex_base).is_dir():
+        return codex_base
     if _is_container_runtime():
         return f"/tmp/weave-{uid}" if uid is not None else "/tmp/weave"
     if Path("/dev/shm").exists() and os.access("/dev/shm", os.W_OK):

@@ -2,6 +2,19 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.52.1] - 2026-05-29
+
+### Fixed
+
+- **Hot-zone resolution split-brain in sandboxed agent shells.** `resolve_hot_zone` chose the codex
+  (`/tmp/weave-codex-$uid`) vs `/dev/shm/weave` base from `is_codex_runtime()`, which reads
+  `CLAUDE_CODE_SSE_PORT`. The CLI inherits that env var but harness-spawned hook processes do not,
+  so the CLI and the hooks resolved different hot zones — the session-phase transition written by
+  `wv work` never reached the hook that gates edits. Resolution now also follows an already-existing
+  `/tmp/weave-codex-$uid` zone (a filesystem signal both process contexts can see), so CLI and hooks
+  converge on one zone without moving the live DB. Mirrored in the Python resolver. Non-codex hosts
+  never create the dir, so there is no change to native `/dev/shm` behaviour.
+
 ## [1.52.0] - 2026-05-29
 
 ### Added

@@ -393,7 +393,30 @@ class TestResolveDbPath:
             "weave_gh.data.os.getuid", return_value=1000
         ):
             mock_path_cls.return_value.exists.return_value = False
+            # No lingering codex zone on disk -> container default applies.
+            mock_path_cls.return_value.is_dir.return_value = False
             assert _resolve_db_path() == "/tmp/weave-1000/abc12345/brain.db"
+
+    def test_existing_codex_zone_followed_without_env_signal(self) -> None:
+        # wv-d6af2f: a process lacking the codex env signal (e.g. a harness-spawned
+        # hook) must still follow an already-established codex zone, so it does not
+        # split-brain away from the zone holding the live DB.
+        with patch("weave_gh.data._repo_hash", return_value="abc12345"), patch.dict(
+            "os.environ",
+            {
+                "WV_DB": "",
+                "CODEX_CI": "",
+                "CODEX_THREAD_ID": "",
+                "COPILOT_AGENT": "",
+                "CLAUDE_CODE_SSE_PORT": "",
+            },
+        ), patch("weave_gh.data.Path") as mock_path_cls, patch(
+            "weave_gh.data.os.getuid", return_value=1000
+        ):
+            mock_path_cls.return_value.exists.return_value = False
+            # Codex zone dir exists on disk despite no env signal.
+            mock_path_cls.return_value.is_dir.return_value = True
+            assert _resolve_db_path() == "/tmp/weave-codex-1000/abc12345/brain.db"
 
 
 # ---------------------------------------------------------------------------
