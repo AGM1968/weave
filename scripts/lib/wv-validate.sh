@@ -112,6 +112,19 @@ validate_status() {
 # Valid edge types (tight enum to prevent sprawl)
 VALID_EDGE_TYPES="blocks relates_to implements contradicts supersedes references obsoletes addresses resolves"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Finding Schema Constants
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Valid violation_type values for finding nodes.
+# Sourced by both wv-cmd-core.sh (_finding_missing_fields) and
+# pre-close-verification.sh so the enum stays in one place.
+FINDING_VIOLATION_TYPES="historical:defect upstream:management-gap upstream:logic-bug upstream:schema-drift repo:hygiene repo:regression test:gap design:flaw"
+
+# Valid session phase values — single source of truth.
+# Written via wv_set_phase(); read by pre-action.sh + context-guard.sh.
+PHASE_VALUES="discover execute closing"
+
 # Validate edge type against allowed enum
 # Usage: validate_edge_type "implements" || return 1
 validate_edge_type() {

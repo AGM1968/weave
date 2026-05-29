@@ -52,7 +52,28 @@ _wv_run_cache_is_write_cmd() {
     case "${1:-}" in
         add|done|batch-done|bulk-update|delete|work|update|touch|allowed-tools|quick|ship|ship-agent|\
         block|link|unlink|resolve|findings|\
-        unarchive|batch|plan|enrich-topology|sync|load|compact|prune|clean-ghosts|import|reindex)
+        unarchive|batch|plan|enrich-topology|sync|load|compact|prune|clean-ghosts|import|reindex|\
+        recover|session-summary)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Commands that are read-only but not worth caching (or operate outside brain.db).
+# Every dispatch-table entry must appear in one of: read, write, or exempt.
+# wv pattern-audit enforces this; add new commands here or to the write list above.
+_wv_run_cache_is_exempt_cmd() {
+    case "${1:-}" in
+        # Read-only brain.db readers
+        analyze|audit-pitfalls|pattern-audit|bootstrap-agent|breadcrumbs|context|digest|doctor|\
+        edges|edge-types|guide|health|impact|learnings|mcp-status|overview|path|\
+        pending-close|preflight|query|refs|related|search|show|status|tree|validate-finding)
+            return 0 ;;
+        # Operates outside brain.db (quality.db / ast_cache.db / /dev/shm)
+        cache|hotzone|index|quality)
+            return 0 ;;
+        # One-time setup — no existing cache state to invalidate
+        init|init-repo|self-update|selftest)
             return 0 ;;
         *) return 1 ;;
     esac

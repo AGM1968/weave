@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -23,6 +22,7 @@ from .bash_heuristic import (
     _indent_sd,
     analyze_bash_source,
 )
+from .external_tools import ast_grep_bin
 from .models import FileEntry, FunctionCC
 
 log = logging.getLogger(__name__)
@@ -62,9 +62,10 @@ def _cc_lines_from_ast_grep(filepath: str) -> list[int] | None:
     Returns None if ast-grep is absent, errors, or times out.
     Exit 1 from ast-grep means no matches (not an error).
     """
-    if not shutil.which("ast-grep"):
+    ast_grep = ast_grep_bin()
+    if not ast_grep:
         return None
-    cmd = ["ast-grep", "scan", "--rule", str(_RULE_FILE), "--json", filepath]
+    cmd = [ast_grep, "scan", "--rule", str(_RULE_FILE), "--json", filepath]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
     except subprocess.TimeoutExpired:
@@ -89,9 +90,10 @@ def batch_cc_lines(filepaths: list[str]) -> dict[str, list[int]] | None:
     Returns None if ast-grep is absent or times out; callers fall back per-file.
     Files with no matches get an empty list (not None).
     """
-    if not filepaths or not shutil.which("ast-grep"):
+    ast_grep = ast_grep_bin()
+    if not filepaths or not ast_grep:
         return None
-    cmd = ["ast-grep", "scan", "--rule", str(_RULE_FILE), "--json"] + filepaths
+    cmd = [ast_grep, "scan", "--rule", str(_RULE_FILE), "--json"] + filepaths
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
     except subprocess.TimeoutExpired:
@@ -179,8 +181,8 @@ def analyze_bash_source_ast_grep(
 
 
 def ast_grep_available() -> bool:
-    """Return True if the ast-grep binary is on PATH."""
-    return shutil.which("ast-grep") is not None
+    """Return True if the ast-grep binary is available to Weave."""
+    return ast_grep_bin() is not None
 
 
 def analyze_bash_file_best(

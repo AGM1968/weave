@@ -14,11 +14,11 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
+from weave_quality.external_tools import ast_grep_bin
 from weave_quality.models import FileEntry, FunctionCC, FunctionDetail
 
 _RULE_DIR = Path(__file__).parent / "rules"
@@ -56,13 +56,13 @@ def _fn_name(text: str) -> str:
     return "<anonymous>"
 
 
-def _run_rule(rule_path: Path, filepath: str) -> list[dict[str, Any]] | None:
+def _run_rule(rule_path: Path, filepath: str, ast_grep: str) -> list[dict[str, Any]] | None:
     """Run ast-grep scan with rule_path on filepath.
 
     Returns parsed JSON list, or None on hard error.
     Exit 1 with empty stdout = no matches (valid); exit 2 = error.
     """
-    cmd = ["ast-grep", "scan", "--rule", str(rule_path), "--json", filepath]
+    cmd = [ast_grep, "scan", "--rule", str(rule_path), "--json", filepath]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
     except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -121,13 +121,14 @@ def analyze_typescript_file(
 
     Returns (FileEntry, list[FunctionCC]) or None when ast-grep is unavailable.
     """
-    if not shutil.which("ast-grep"):
+    ast_grep = ast_grep_bin()
+    if not ast_grep:
         return None
     if not _CC_RULE.exists() or not _FN_RULE.exists():
         return None
 
-    fn_matches = _run_rule(_FN_RULE, filepath)
-    cc_matches = _run_rule(_CC_RULE, filepath)
+    fn_matches = _run_rule(_FN_RULE, filepath, ast_grep)
+    cc_matches = _run_rule(_CC_RULE, filepath, ast_grep)
     if fn_matches is None or cc_matches is None:
         return None
 

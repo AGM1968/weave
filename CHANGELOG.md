@@ -2,6 +2,58 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.52.0] - 2026-05-29
+
+### Added
+
+- **`wv impact` — work-graph blast-radius query.** Given a node or changed files, reports the
+  impacted subtree, newly unblocked work, and a risk score (folding `cross_impl_deps`,
+  `depth_from_root`, `blocks_count`, and `missing_criteria`). Modes: `--files=path1,path2` seeds the
+  query from changed files; `--suites` emits a lightweight file→test-suite map with no graph
+  traversal. `wv ready --with-impact` annotates ready work with blast radius.
+- **MCP impact surface** — new `weave_impact` tool, plus a `with_impact` option on `weave_ready`,
+  mirroring the CLI for MCP clients.
+- **`wv pattern-audit`** — CI regression net for control-plane patterns. Checks cache-class
+  classification of dispatch commands, single-definition of status/edge/finding enums,
+  `.session_phase` write routing through `wv_set_phase`, hook `wv-hook-common.sh` wiring, and the
+  `pre-action.sh` thin-dispatcher line budget.
+- **`wv validate-finding <id>`** — validates finding-node metadata (required fields, violation type)
+  and is invoked by the `pre-close-verification` hook.
+- **`bash_cc_backend`** column surfaced in `wv quality scan`/`diff` output.
+
+### Changed
+
+- **Hook enforcement crystallized into named units.** All pre-action enforcement checks are now
+  individually named `_hc_check_*` functions in `scripts/lib/wv-hook-common.sh` (installed-path,
+  phase, active-node, stale-node, context-pack, contradictions, blockers) and `pre-action.sh` is a
+  thin dispatcher. Each check has isolated unit tests. Shared hook setup (hot-zone, DB path, phase)
+  is sourced from `wv-hook-common.sh` across all hooks.
+- **Pre-commit test gating is impact-routed** — `pre-commit-weave.sh` selects which shell suites to
+  run via `wv impact --suites` instead of a fixed list, so only suites affected by the staged files
+  execute.
+
+### Fixed
+
+- **`$HOME/.claude/` memory-layer edits no longer require an active Weave node.** Edits under the
+  agent's own memory/runtime directory are classified as external state, exempt from node/phase
+  enforcement and the edit-hygiene tally. Scope is `$HOME/.claude/` only; project-local `.claude/`
+  (hooks, settings, skills) stays governed.
+- **Discover-phase commit gate** — `pre-commit-weave.sh` now blocks non-`.weave/` commits during the
+  discover phase, matching the edit-time gate.
+- **Sandbox runtime parity for hot-zone routing** — `is_codex_runtime` now treats Codex, Copilot,
+  and Claude Code agent shells as codex-style sandboxes for hot-zone selection. These environments
+  can lose `/dev/shm` continuity between tool calls; routing to `/tmp/weave-codex-*` keeps graph
+  state stable across invocations.
+- **Codex PATH and discovery hardening** — Codex and Weave tool PATH handling normalized so the `wv`
+  shim and helper tools resolve consistently inside Codex shells.
+- **`weave_gh` DB resolver parity with bash runtime** — `scripts/weave_gh/data.py::_resolve_db_path`
+  now derives defaults from runtime mode (`codex`/container/native) and adds the missing
+  `/tmp/weave-<uid>/<repo-hash>/brain.db` candidate. This closes Linux/container sandbox drift where
+  Python sync paths could miss the active DB and read from the wrong namespace.
+- **GitHub sync-status guidance hardening** — `wv guide --topic=github` no longer recommends
+  `gh issue list --label weave-synced` (which can undercount on some repos). Guidance now uses an
+  unfiltered open-issues query with local label filtering via `jq`.
+
 ## [1.51.8] - 2026-05-26
 
 ### Fixed

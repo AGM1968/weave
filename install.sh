@@ -311,6 +311,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-journal.sh "$LIB_DIR/lib/wv-journal.sh"
     install_file ./scripts/lib/wv-gh.sh "$LIB_DIR/lib/wv-gh.sh"
     install_file ./scripts/lib/wv-delta.sh "$LIB_DIR/lib/wv-delta.sh"
+    install_file ./scripts/lib/wv-hook-common.sh "$LIB_DIR/lib/wv-hook-common.sh"
     install_file ./scripts/lib/wv-resolve-project.sh "$LIB_DIR/lib/wv-resolve-project.sh"
     install_file ./scripts/lib/wv-resolve-runtime.sh "$LIB_DIR/lib/wv-resolve-runtime.sh"
     install_file ./scripts/lib/VERSION "$LIB_DIR/lib/VERSION"
@@ -354,6 +355,7 @@ if [ -f "./scripts/wv" ]; then
     # can refresh vendored scripts/hooks/ in consumer repos without network access
     mkdir -p "$LIB_DIR/hooks"
     install_file ./scripts/hooks/pre-commit-weave.sh "$LIB_DIR/hooks/pre-commit-weave.sh"
+    install_file ./scripts/hooks/post-commit-weave.sh "$LIB_DIR/hooks/post-commit-weave.sh"
     install_file ./scripts/hooks/prepare-commit-msg-weave.sh "$LIB_DIR/hooks/prepare-commit-msg-weave.sh"
     # Scripts
     cp ./scripts/context-guard.sh "$CONFIG_DIR/"
@@ -361,6 +363,9 @@ if [ -f "./scripts/wv" ]; then
     # Lib available to hooks from global path (~/.config/weave/hooks/../lib/)
     cp ./scripts/lib/wv-resolve-project.sh "$CONFIG_DIR/lib/wv-resolve-project.sh"
     cp ./scripts/lib/wv-resolve-runtime.sh "$CONFIG_DIR/lib/wv-resolve-runtime.sh"
+    cp ./scripts/lib/wv-validate.sh "$CONFIG_DIR/lib/wv-validate.sh"
+    cp ./scripts/lib/wv-config.sh "$CONFIG_DIR/lib/wv-config.sh"
+    cp ./scripts/lib/wv-hook-common.sh "$CONFIG_DIR/lib/wv-hook-common.sh"
     # Claude hooks (all 9 — registered globally via ~/.claude/settings.json under Alt-A)
     cp ./.claude/hooks/context-guard.sh "$CONFIG_DIR/hooks/"
     cp ./.claude/hooks/session-start-context.sh "$CONFIG_DIR/hooks/"
@@ -424,6 +429,7 @@ else
     download_file "$REPO/scripts/lib/wv-journal.sh" "$LIB_DIR/lib/wv-journal.sh"
     download_file "$REPO/scripts/lib/wv-gh.sh" "$LIB_DIR/lib/wv-gh.sh"
     download_file "$REPO/scripts/lib/wv-delta.sh" "$LIB_DIR/lib/wv-delta.sh"
+    download_file "$REPO/scripts/lib/wv-hook-common.sh" "$LIB_DIR/lib/wv-hook-common.sh"
     download_file "$REPO/scripts/lib/wv-resolve-project.sh" "$LIB_DIR/lib/wv-resolve-project.sh"
     download_file "$REPO/scripts/lib/wv-resolve-runtime.sh" "$LIB_DIR/lib/wv-resolve-runtime.sh"
     download_file "$REPO/scripts/lib/VERSION" "$LIB_DIR/lib/VERSION"
@@ -437,6 +443,11 @@ else
     download_file "$REPO/scripts/cmd/wv-cmd-analyze.sh" "$LIB_DIR/cmd/wv-cmd-analyze.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-indexer.sh" "$LIB_DIR/cmd/wv-cmd-indexer.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-query.sh" "$LIB_DIR/cmd/wv-cmd-query.sh"
+    # Git hook sources (used by wv-init-repo --update refresh)
+    mkdir -p "$LIB_DIR/hooks"
+    download_file "$REPO/scripts/hooks/pre-commit-weave.sh" "$LIB_DIR/hooks/pre-commit-weave.sh"
+    download_file "$REPO/scripts/hooks/post-commit-weave.sh" "$LIB_DIR/hooks/post-commit-weave.sh"
+    download_file "$REPO/scripts/hooks/prepare-commit-msg-weave.sh" "$LIB_DIR/hooks/prepare-commit-msg-weave.sh"
     # Python sync package (auto-discover modules from GitHub API)
     mkdir -p "$LIB_DIR/weave_gh"
     local py_modules
@@ -487,6 +498,9 @@ else
     # Lib available to hooks from global path (~/.config/weave/hooks/../lib/)
     curl -sSL "$REPO/scripts/lib/wv-resolve-project.sh" -o "$CONFIG_DIR/lib/wv-resolve-project.sh"
     curl -sSL "$REPO/scripts/lib/wv-resolve-runtime.sh" -o "$CONFIG_DIR/lib/wv-resolve-runtime.sh"
+    curl -sSL "$REPO/scripts/lib/wv-validate.sh" -o "$CONFIG_DIR/lib/wv-validate.sh"
+    curl -sSL "$REPO/scripts/lib/wv-config.sh" -o "$CONFIG_DIR/lib/wv-config.sh"
+    curl -sSL "$REPO/scripts/lib/wv-hook-common.sh" -o "$CONFIG_DIR/lib/wv-hook-common.sh"
     # Claude hooks
     curl -sSL "$REPO/.claude/hooks/context-guard.sh" -o "$CONFIG_DIR/hooks/context-guard.sh"
     curl -sSL "$REPO/.claude/hooks/session-start-context.sh" -o "$CONFIG_DIR/hooks/session-start-context.sh"
@@ -761,6 +775,7 @@ cat << 'RUNTIMECONTENTEOF'
 ## Session Start
 
 ```bash
+if ! command -v wv >/dev/null 2>&1; then wv() { ./scripts/wv "$@"; }; fi
 wv bootstrap --json   # single call: active/ready/blocked + learnings + context policy
 ```
 
@@ -786,6 +801,23 @@ wv quality functions <file>    # identify functions over CC limit
 # Option A: refactor, commit, wv quality scan, retry wv done
 # Option B: add to .weave/quality.conf [exempt] then wv load, retry wv done
 ```
+
+## Agent Runtime Notes
+
+If `wv` is not on PATH, prefer the repo-local wrapper, then the installed binary:
+
+```bash
+./scripts/wv bootstrap --json
+$HOME/.local/bin/wv bootstrap --json
+```
+
+The repo-local wrapper appends existing user tool directories (`$HOME/.local/bin`,
+`$HOME/.cargo/bin`) to PATH so sandbox agent shells can see tools such as `ast-grep`
+without putting the repository or current directory on PATH. Set
+`WV_DISABLE_USER_TOOL_PATHS=1` to disable this normalization.
+
+In sandbox agent shells (Codex/Copilot/Claude Code), Weave uses a persistent
+`/tmp/weave-codex-*` hot zone because `/dev/shm` is not stable across tool invocations.
 <!-- END WEAVE RUNTIME CONTENT -->
 RUNTIMECONTENTEOF
 }
@@ -874,12 +906,15 @@ install_git_hook_from_repo "./scripts/hooks/prepare-commit-msg-weave.sh" "Weave:
 # Git hook: pre-commit (enforce active Weave node)
 install_git_hook_from_repo "./scripts/hooks/pre-commit-weave.sh" "Weave pre-commit" "pre-commit"
 
+# Git hook: post-commit (run deferred non-critical suites)
+install_git_hook_from_repo "./scripts/hooks/post-commit-weave.sh" "Weave post-commit" "post-commit"
+
 # scripts/hooks/ vendor refresh — if a consumer repo has vendored hook sources,
 # keep them current from LIB_DIR so wv doctor --source-compare keeps passing
 _LIB_HOOKS="${LIB_DIR:-$HOME/.local/lib/weave}/hooks"
 if [ -d "$REPO_ROOT/scripts/hooks" ] && [ -d "$_LIB_HOOKS" ]; then
     _updated_vendor=0
-    for _hf in pre-commit-weave.sh prepare-commit-msg-weave.sh; do
+    for _hf in pre-commit-weave.sh post-commit-weave.sh prepare-commit-msg-weave.sh; do
         if [ -f "$REPO_ROOT/scripts/hooks/$_hf" ] && [ -f "$_LIB_HOOKS/$_hf" ]; then
             if ! cmp -s "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf" 2>/dev/null; then
                 cp "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf"
@@ -1027,6 +1062,7 @@ host supports (Agent tool, MCP client subagent, shell subprocess, etc.).
 ## Session start (always)
 
 ```bash
+if ! command -v wv >/dev/null 2>&1; then wv() { ./scripts/wv "$@"; }; fi
 wv bootstrap --json   # single call: active/ready/blocked + recent learnings + context policy
 ```
 
@@ -1048,6 +1084,7 @@ Shortcut: `wv ship <id> --learning="..."` (done + sync; still requires push afte
 ## Operating rules
 
 - No edits without an active node — `wv work <id>` first if `wv status` shows 0 active.
+- Discovery before claiming may read, search, and report only.
 - `wv search "<topic>"` before `wv add` to avoid duplicates.
 - Set `--criteria=` and `--risks=` at creation time, not reactively at claim time.
 - Commit before `wv done` — pre-commit hook blocks after node is closed.
@@ -1395,6 +1432,7 @@ This repository uses **Weave** for task tracking. Every code change must be trac
 ## Pre-flight (run before anything else)
 
 ```bash
+if ! command -v wv >/dev/null 2>&1; then wv() { ./scripts/wv "$@"; }; fi
 wv bootstrap --json   # single call: active/ready/blocked + learnings + context policy
 ```
 

@@ -793,6 +793,17 @@ _context_gather_quality() {
         fi
     fi
 
+    # Source 3: touched_files metadata (common in tests and plan-enriched nodes)
+    local meta_touched
+    meta_touched=$(db_query "SELECT json_extract(metadata, '$.touched_files') FROM nodes WHERE id='$id';" 2>/dev/null)
+    if [ -n "$meta_touched" ] && [ "$meta_touched" != "null" ]; then
+        local touched_from_meta
+        touched_from_meta=$(printf '%s' "$meta_touched" | jq -r '.[]?' 2>/dev/null)
+        if [ -n "$touched_from_meta" ]; then
+            touched_files=$(printf '%s\n%s' "$touched_files" "$touched_from_meta" | sort -u | grep -v '^$')
+        fi
+    fi
+
     if [ -n "$touched_files" ]; then
         local _hz_args=()
         [ -n "$WV_HOT_ZONE" ] && _hz_args=("--hot-zone" "$WV_HOT_ZONE")
@@ -1346,4 +1357,661 @@ cmd_tree() {
 
         echo -e "${indent}${indicator} ${type_label}: ${text} ${CYAN}(${id})${NC} [${status}]${version_suffix}"
     done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _impact_suites_for_files — map changed file paths to affected test suites
+#
+# Loads .weave/test-map.conf (ini-style: source_file = suite [suite ...]).
+# Falls back to naming-convention heuristic when conf is absent or file
+# has no explicit mapping:
+#   scripts/cmd/wv-cmd-<X>.sh  →  tests/test-<X>.sh
+#   scripts/lib/*.sh or scripts/wv  →  tests/run-all.sh
+# Reads .weave/test-times.json for estimated suite cost.
+# Outputs JSON: [{"name":"test-X.sh","last_cost_s":N}, ...]
+# ═══════════════════════════════════════════════════════════════════════════
+
+_impact_suites_for_files() {
+    if [ $# -eq 0 ]; then echo '[]'; return 0; fi
+
+    local map_conf="${WEAVE_DIR}/test-map.conf"
+    local times_json="${WEAVE_DIR}/test-times.json"
+
+    local times_data='{}'
+    [ -f "$times_json" ] && times_data=$(cat "$times_json" 2>/dev/null || echo '{}')
+
+    # Parse conf into associative array (file → "suite1 suite2 ...")
+    declare -A _fmap=()
+    if [ -f "$map_conf" ]; then
+        while IFS= read -r line; do
+            # Strip leading whitespace; skip section headers and comments
+            line="${line#"${line%%[![:space:]]*}"}"
+            [[ "$line" =~ ^\[ || "$line" =~ ^# || -z "$line" ]] && continue
+            local key="${line%%=*}"
+            local val="${line#*=}"
+            key="${key%"${key##*[![:space:]]}"}"  # rtrim key
+            val="${val#"${val%%[![:space:]]*}"}"  # ltrim val
+            _fmap["$key"]="$val"
+        done < "$map_conf"
+    fi
+
+    # Collect matched suites (deduped)
+    declare -A _seen=()
+    for f in "$@"; do
+        local suites=""
+        if [ -n "${_fmap[$f]+x}" ]; then
+            suites="${_fmap[$f]}"
+        else
+            # Naming-convention heuristic
+            case "$f" in
+                scripts/cmd/wv-cmd-*.sh)
+                    local base; base=$(basename "$f" .sh)
+                    suites="tests/test-${base#wv-cmd-}.sh" ;;
+                scripts/lib/*.sh | scripts/wv)
+                    suites="tests/test-hooks.sh tests/test-graph.sh" ;;
+                scripts/hooks/*)
+                    suites="tests/test-hooks.sh" ;;
+                tests/test-*.sh)
+                    suites="$f" ;;
+            esac
+        fi
+        local s
+        for s in $suites; do
+            _seen["$s"]=1
+        done
+    done
+
+    # Emit JSON with cost. name = full suite path; cost lookup uses basename
+    # (test-times.json is keyed by basename from serial-mode timing writes).
+    local out='['
+    local first=true
+    local suite
+    for suite in "${!_seen[@]}"; do
+        local bname; bname=$(basename "$suite")
+        local cost; cost=$(printf '%s' "$times_data" | jq -r --arg n "$bname" '.[$n] // 0' 2>/dev/null || echo 0)
+        [ "$first" = "true" ] || out+=','
+        out+=$(printf '{"name":"%s","last_cost_s":%s}' "$suite" "$cost")
+        first=false
+    done
+    out+=']'
+    echo "$out"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _impact_nodes_for_files — map file paths to seed node IDs via touched_files metadata
+#
+# For each path arg, queries nodes whose touched_files JSON array contains
+# that path. Returns newline-separated node IDs (deduped, active+todo only).
+# Unknown paths produce no output — empty result is not an error.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_impact_nodes_for_files() {
+    if [ $# -eq 0 ]; then return 0; fi
+
+    local path_conditions=""
+    for fp in "$@"; do
+        local esc_fp
+        esc_fp=$(printf '%s' "$fp" | sed "s/'/''/g")
+        if [ -n "$path_conditions" ]; then
+            path_conditions+=" OR "
+        fi
+        path_conditions+="EXISTS (
+            SELECT 1 FROM json_each(json_extract(n.metadata, '$.touched_files'))
+            WHERE value = '${esc_fp}'
+        )"
+    done
+
+    db_query "
+        SELECT DISTINCT n.id FROM nodes n
+        WHERE n.status IN ('todo','active','blocked')
+        AND json_extract(n.metadata, '$.touched_files') IS NOT NULL
+        AND (${path_conditions});
+    " 2>/dev/null || true
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_impact — blast-radius analysis: which nodes does changing a seed affect?
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_impact() {
+    local depth=3
+    local direction="both"
+    local output_format="text"
+    local full=false
+    local include_done=false
+    local include_quality=false
+    local node_cap=50
+    local file_seeds=()
+
+    local seeds=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --depth=*)      depth="${1#*=}" ;;
+            --direction=*)  direction="${1#*=}" ;;
+            --json)         output_format="json" ;;
+            --suites)       output_format="suites" ;;
+            --full)         full=true ;;
+            --include-done) include_done=true ;;
+            --all)          node_cap=10000 ;;
+            --quality)      include_quality=true ;;
+            --files=*)
+                IFS=',' read -ra file_seeds <<< "${1#*=}" ;;
+            -*)
+                echo -e "${RED}Error: unknown flag '$1'${NC}" >&2; return 1 ;;
+            *)
+                seeds+=("$1") ;;
+        esac
+        shift
+    done
+
+    # --suites mode: lightweight file→suite mapping, no graph traversal
+    if [ "$output_format" = "suites" ]; then
+        if [ "${#file_seeds[@]}" -eq 0 ]; then
+            echo -e "${RED}Error: --suites requires --files=<paths>${NC}" >&2
+            return 1
+        fi
+        _impact_suites_for_files "${file_seeds[@]}"
+        return $?
+    fi
+
+    # Resolve file seeds → node IDs (merged with any explicit ID seeds)
+    if [ "${#file_seeds[@]}" -gt 0 ]; then
+        db_ensure
+        local file_nodes
+        file_nodes=$(_impact_nodes_for_files "${file_seeds[@]}")
+        while IFS= read -r nid; do
+            [ -n "$nid" ] && seeds+=("$nid")
+        done <<< "$file_nodes"
+        if [ "${#seeds[@]}" -eq 0 ]; then
+            # No nodes found for the given files — emit empty result, not an error
+            if [ "$output_format" = "json" ]; then
+                printf '{"seeds":[],"impacted":[],"unblocked":[],"affected_suites":[],"summary":{"total_impacted":0,"total_unblocked":0},"source":"files","files":[%s]}\n' \
+                    "$(printf '"%s",' "${file_seeds[@]}" | sed 's/,$//')"
+            else
+                echo "0 impacted, 0 unblocked — no nodes found for: ${file_seeds[*]}"
+            fi
+            return 0
+        fi
+    fi
+
+    if [ "${#seeds[@]}" -eq 0 ]; then
+        echo -e "${RED}Error: at least one seed node ID required (or --files=<path>)${NC}" >&2
+        return 1
+    fi
+
+    case "$direction" in
+        fwd|forward|rev|reverse|both) ;;
+        *)
+            echo -e "${RED}Error: invalid --direction '$direction' (fwd|rev|both)${NC}" >&2
+            return 1 ;;
+    esac
+
+    # Normalize synonyms so cache keys don't fragment.
+    case "$direction" in
+        forward) direction="fwd" ;;
+        reverse) direction="rev" ;;
+    esac
+
+    if ! [[ "$depth" =~ ^[1-9][0-9]*$ ]]; then
+        echo -e "${RED}Error: --depth must be a positive integer, got '$depth'${NC}" >&2
+        return 1
+    fi
+
+    db_ensure
+
+    # Resolve aliases and validate each seed
+    local resolved_seeds=()
+    for raw in "${seeds[@]}"; do
+        local sid
+        sid=$(resolve_id "$raw") || return 1
+
+        # Archived nodes are pruned from the live DB — absence = archived
+        local node_status
+        node_status=$(db_query "SELECT status FROM nodes WHERE id='$(sql_escape "$sid")';")
+        if [ -z "$node_status" ]; then
+            echo -e "${RED}Error: seed $sid not found (node may be archived)${NC}" >&2
+            return 1
+        fi
+
+        # D10: done + fwd or both → error, no auto-flip
+        if [ "$node_status" = "done" ] && \
+           [ "$direction" != "rev" ] && [ "$direction" != "reverse" ]; then
+            echo -e "${RED}Error: seed $sid is done; forward impact already discharged.${NC}" >&2
+            echo "Use --direction=rev (retrospective) or --include-done to force traversal." >&2
+            return 1
+        fi
+
+        resolved_seeds+=("$sid")
+    done
+
+    local walk_flags=("--depth=${depth}" "--direction=${direction}" "--node-cap=${node_cap}")
+    [ "$full" = "true" ]         && walk_flags+=("--full")
+    [ "$include_done" = "true" ] && walk_flags+=("--include-done")
+
+    # Impact cache key includes all traversal/shape flags, including --quality.
+    local edge_set="blocks,implements,addresses"
+    [ "$full" = "true" ] && edge_set="${edge_set},obsoletes,references,resolves,supersedes"
+    local sorted_seeds
+    sorted_seeds=$(printf '%s\n' "${resolved_seeds[@]}" | sort -u | tr '\n' ',' | sed 's/,$//')
+    local quality_key="0"
+    [ "$include_quality" = "true" ] && quality_key="1"
+
+    local cache_dir="$WV_HOT_ZONE/context_cache"
+    mkdir -p "$cache_dir"
+    local cache_key
+    cache_key=$(printf '%s' "${sorted_seeds}|${depth}|${direction}|${edge_set}|${include_done}|${node_cap}|${quality_key}" | sha256sum | cut -c1-16)
+    local cache_file="$cache_dir/impact-${cache_key}.json"
+
+    local walk_json=""
+    if [ -f "$cache_file" ]; then
+        local cache_time db_time
+        cache_time=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
+        db_time=$(stat -c %Y "$WV_DB" 2>/dev/null || stat -f %m "$WV_DB" 2>/dev/null || echo 0)
+        if [ "$cache_time" -ge "$db_time" ]; then
+            walk_json=$(cat "$cache_file")
+        fi
+    fi
+
+    # Run CTE walk on cache miss.
+    if [ -z "$walk_json" ]; then
+        walk_json=$(_impact_walk "${resolved_seeds[@]}" "${walk_flags[@]}") || return 1
+    fi
+
+    # Sprint 2b: fold code quality per impacted node when explicitly requested.
+    if [ "$include_quality" = "true" ]; then
+        local quality_rows='[]'
+        local impacted_id impacted_quality
+        while IFS= read -r impacted_id; do
+            [ -z "$impacted_id" ] && continue
+            impacted_quality=$(_context_gather_quality "$impacted_id")
+            quality_rows=$(printf '%s' "$quality_rows" | jq -c \
+                --arg id "$impacted_id" \
+                --argjson q "$impacted_quality" \
+                '. + [{node_id:$id, code_quality:($q.code_quality // []), quality_as_of:($q.quality_as_of // null)}]')
+        done < <(printf '%s' "$walk_json" | jq -r '.impacted[].node_id')
+
+        walk_json=$(printf '%s' "$walk_json" | jq -c --argjson quality "$quality_rows" '
+            .impacted |= map(
+                . as $node
+                | (first($quality[]? | select(.node_id == $node.node_id))) as $q
+                | if $q
+                  then . + {code_quality: ($q.code_quality // []), quality_as_of: ($q.quality_as_of // null)}
+                  else . + {code_quality: [], quality_as_of: null}
+                  end
+            )
+        ')
+    fi
+
+    # Persist cache after quality fold-in to keep parity by quality_key.
+    if [ -n "$walk_json" ]; then
+        printf '%s' "$walk_json" > "$cache_file"
+    fi
+
+    # Seeds info
+    local seeds_in
+    seeds_in=$(printf "'%s'," "${resolved_seeds[@]}")
+    seeds_in="${seeds_in%,}"
+    local seeds_json
+    seeds_json=$(db_query_json "
+        SELECT id AS node_id, COALESCE(alias,substr(text,1,40)) AS label, status
+        FROM nodes WHERE id IN (${seeds_in});
+    ")
+    seeds_json="${seeds_json:-[]}"
+
+    # Unblocked anti-join: todo/blocked nodes whose ONLY blockers are seeds
+    local unblocked_json
+    unblocked_json=$(db_query_json "
+        SELECT n.id AS node_id, COALESCE(n.alias,substr(n.text,1,40)) AS label, n.status
+        FROM nodes n
+        WHERE n.status IN ('todo','blocked')
+          AND n.id NOT IN (${seeds_in})
+          AND EXISTS (
+              SELECT 1 FROM edges e
+              WHERE e.target=n.id AND e.type='blocks' AND e.source IN (${seeds_in})
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM edges e
+              WHERE e.target=n.id AND e.type='blocks' AND e.source NOT IN (${seeds_in})
+          );
+    ")
+    unblocked_json="${unblocked_json:-[]}"
+
+    # Affected suites from seed nodes' touched files
+    local _files=()
+    local _tf _f
+    for sid in "${resolved_seeds[@]}"; do
+        _tf=$(db_query "SELECT json_extract(metadata,'$.touched_files') FROM nodes WHERE id='$(sql_escape "$sid")';" 2>/dev/null)
+        if [ -n "$_tf" ] && [ "$_tf" != "null" ]; then
+            while IFS= read -r _f; do
+                [ -n "$_f" ] && _files+=("$_f")
+            done < <(printf '%s' "$_tf" | jq -r '.[]?' 2>/dev/null)
+        fi
+    done
+    local suites_json='[]'
+    [ "${#_files[@]}" -gt 0 ] && suites_json=$(_impact_suites_for_files "${_files[@]}")
+
+    # Summary
+    local n_imp n_unbl n_suit total_s
+    n_imp=$(printf '%s' "$walk_json" | jq '.impacted|length')
+    n_unbl=$(printf '%s' "$unblocked_json" | jq 'length')
+    n_suit=$(printf '%s' "$suites_json" | jq 'length')
+    total_s=$(printf '%s' "$suites_json" | jq '[.[].last_cost_s]|add//0')
+    local summary="${n_imp} impacted, ${n_unbl} unblocked, ${n_suit} suites (~${total_s}s)"
+
+    if [ "$output_format" = "json" ]; then
+        printf '%s' "$walk_json" | jq \
+            --argjson seeds    "$seeds_json" \
+            --argjson unblocked "$unblocked_json" \
+            --argjson suites   "$suites_json" \
+                        --arg     include_quality "$include_quality" \
+            --arg     summary  "$summary" \
+            '{seeds:$seeds,
+                            impacted:(.impacted|map(({node_id,label,status,min_depth,directions,
+                                                    blocks_count,missing_criteria:(.missing_criteria==1),
+                                                    depth_from_root,cross_impl_deps,
+                                                                                                        risk_score,risk_factors}
+                                                                        + (if $include_quality=="true"
+                                                                             then {code_quality:(.code_quality // []), quality_as_of:(.quality_as_of // null)}
+                                                                             else {}
+                                                                             end)))),
+              unblocked:$unblocked,
+              edges:.edges,
+              affected_suites:$suites,
+              summary:$summary}'
+    else
+        echo "── Seeds ────────────────────────────────────────────────────────"
+        printf '%s' "$seeds_json" | jq -r '.[] | "  \(.node_id)  [\(.status)]  \(.label)"'
+        echo ""
+        if [ "$n_imp" -eq 0 ]; then
+            echo "No impacted nodes found."
+        else
+            printf '%s' "$walk_json" | jq -r '
+                .impacted | group_by(.min_depth)[] |
+                ("── Depth \(.[0].min_depth) " + ("─" * 48)),
+                (.[] | "  \(.node_id)  [\(.status)]  \(.label)  \(.directions)  blocks:\(.blocks_count)  risk:\(.risk_score)\(if .missing_criteria==1 then "  !criteria" else "" end)")
+            '
+        fi
+        local n_edges
+        n_edges=$(printf '%s' "$walk_json" | jq '.edges|length')
+        if [ "$n_edges" -gt 0 ]; then
+            echo ""
+            echo "── Edges ────────────────────────────────────────────────────────"
+            printf '%s' "$walk_json" | jq -r '.edges[] | "  \(.source) → \(.target)  (\(.type))"'
+        fi
+        if [ "$n_unbl" -gt 0 ]; then
+            echo ""
+            echo "── Unblocked when seeds complete ────────────────────────────────"
+            printf '%s' "$unblocked_json" | jq -r '.[] | "  \(.node_id)  [\(.status)]  \(.label)"'
+        fi
+        if [ "$n_suit" -gt 0 ]; then
+            echo ""
+            echo "── Affected suites ──────────────────────────────────────────────"
+            printf '%s' "$suites_json" | jq -r '.[] | "  \(.name)  (~\(.last_cost_s)s)"'
+        fi
+        echo ""
+        echo -e "${CYAN}${summary}${NC}"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _impact_walk — direction-aware multi-seed CTE walker
+#
+# Prereq: none (creates its own internal seed table per call).
+# Outputs: JSON {"impacted":[...],"edges":[...]} to stdout.
+#
+# Args: <seed-id> [<seed-id> ...] [--depth=N] [--direction=fwd|rev|both]
+#       [--include-done] [--full]
+# ═══════════════════════════════════════════════════════════════════════════
+
+_impact_walk() {
+    local max_depth=3
+    local direction="both"
+    local include_done=false
+    local full=false
+    local node_cap=50
+    local seeds=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --depth=*)      max_depth="${1#*=}" ;;
+            --direction=*)  direction="${1#*=}" ;;
+            --node-cap=*)   node_cap="${1#*=}" ;;
+            --include-done) include_done=true ;;
+            --full)         full=true ;;
+            *)              seeds+=("$1") ;;
+        esac
+        shift
+    done
+
+    if [ "${#seeds[@]}" -eq 0 ]; then
+        echo '{"impacted":[],"edges":[]}'; return 0
+    fi
+
+    # Build VALUES list — seeds are pre-validated by cmd_impact()
+    local seed_vals
+    seed_vals=$(printf "('%s')," "${seeds[@]}")
+    seed_vals="${seed_vals%,}"
+
+    # Edge type set
+    local etypes="'blocks','implements','addresses'"
+    if [ "$full" = "true" ]; then
+        etypes="${etypes},'resolves','references','supersedes','obsoletes'"
+    fi
+
+    # CTE direction branches — UNION ALL + path string, NOT UNION (Principle 2)
+    local fwd_branch="
+      UNION ALL
+      SELECT e.target, i.depth + 1, 'forward', i.path || e.target || ','
+      FROM impact i
+      JOIN edges e ON e.source = i.node_id
+      WHERE i.depth < ${max_depth}
+        AND e.type IN (${etypes})
+        AND instr(i.path, ',' || e.target || ',') = 0"
+
+    local rev_branch="
+      UNION ALL
+      SELECT e.source, i.depth + 1, 'reverse', i.path || e.source || ','
+      FROM impact i
+      JOIN edges e ON e.target = i.node_id
+      WHERE i.depth < ${max_depth}
+        AND e.type IN (${etypes})
+        AND instr(i.path, ',' || e.source || ',') = 0"
+
+    local branches
+    case "$direction" in
+        fwd|forward)  branches="$fwd_branch" ;;
+        rev|reverse)  branches="$rev_branch" ;;
+        *)            branches="${fwd_branch}${rev_branch}" ;;
+    esac
+
+    # _iw_results stores ALL traversed nodes (including done intermediates) for edge tracing.
+    # The done filter is applied only in the output JSON subquery (transparent-intermediate semantics).
+    local output_done_filter="AND status != 'done'"
+    [ "$include_done" = "true" ] && output_done_filter=""
+
+    db_ensure
+
+    sqlite3 -batch -cmd ".timeout 5000" "$WV_DB" <<SQL
+CREATE TEMP TABLE _iw_seeds (id TEXT PRIMARY KEY);
+INSERT OR IGNORE INTO _iw_seeds VALUES ${seed_vals};
+
+-- All traversal-reached nodes except seeds; includes done intermediates for edge tracing.
+CREATE TEMP TABLE _iw_results AS
+WITH RECURSIVE impact(node_id, depth, direction, path) AS (
+  SELECT id, 0, 'seed', ',' || id || ','
+  FROM _iw_seeds
+
+  ${branches}
+)
+SELECT i.node_id,
+       MIN(i.depth)                                                  AS min_depth,
+       CASE
+         WHEN SUM(CASE WHEN i.direction = 'forward' THEN 1 ELSE 0 END) > 0
+          AND SUM(CASE WHEN i.direction = 'reverse' THEN 1 ELSE 0 END) > 0 THEN 'both'
+         WHEN SUM(CASE WHEN i.direction = 'forward' THEN 1 ELSE 0 END) > 0 THEN 'forward'
+         ELSE 'reverse'
+       END                                                           AS directions,
+       COALESCE(n.alias, substr(n.text, 1, 40))                      AS label,
+       n.status,
+       n.text,
+       (SELECT COUNT(*) FROM edges
+        WHERE source = i.node_id AND type = 'blocks')                AS blocks_count,
+       (json_extract(n.metadata, '$.done_criteria') IS NULL)         AS missing_criteria,
+       json_extract(n.metadata, '$.type')                            AS node_type
+FROM impact i
+JOIN nodes n ON n.id = i.node_id
+WHERE i.depth > 0
+  AND i.node_id NOT IN (SELECT id FROM _iw_seeds)
+GROUP BY i.node_id
+ORDER BY min_depth, blocks_count DESC
+LIMIT ${node_cap};
+
+-- Scope for ancestry/risk computation: seeds + impacted nodes.
+CREATE TEMP TABLE _iw_scope AS
+SELECT id AS node_id FROM _iw_seeds
+UNION
+SELECT node_id FROM _iw_results;
+
+-- Walk implements ancestry upward (child -> parent) for each scoped node.
+CREATE TEMP TABLE _iw_root_walk AS
+WITH RECURSIVE root_walk(start_id, node_id, depth, path) AS (
+    SELECT node_id, node_id, 0, ',' || node_id || ','
+    FROM _iw_scope
+
+    UNION ALL
+
+    SELECT rw.start_id,
+                 e.target,
+                 rw.depth + 1,
+                 rw.path || e.target || ','
+    FROM root_walk rw
+    JOIN edges e ON e.source = rw.node_id
+    WHERE e.type = 'implements'
+        AND rw.depth < 64
+        AND instr(rw.path, ',' || e.target || ',') = 0
+)
+SELECT start_id, node_id, depth
+FROM root_walk;
+
+CREATE TEMP TABLE _iw_roots AS
+SELECT rw.start_id AS node_id,
+             COALESCE(
+                 (SELECT rw2.node_id
+                    FROM _iw_root_walk rw2
+                    WHERE rw2.start_id = rw.start_id
+                    ORDER BY rw2.depth DESC
+                    LIMIT 1),
+                 rw.start_id
+             ) AS root_id,
+             MAX(rw.depth) AS depth_from_root
+FROM _iw_root_walk rw
+GROUP BY rw.start_id;
+
+-- Sprint 2a risk scoring basis: depth_from_root + cross-subtree blockers.
+CREATE TEMP TABLE _iw_scored AS
+SELECT r.node_id,
+             r.min_depth,
+             r.directions,
+             r.label,
+             r.status,
+             r.text,
+             r.blocks_count,
+             r.missing_criteria,
+             r.node_type,
+             COALESCE(rr.depth_from_root, 0) AS depth_from_root,
+             (
+                 SELECT COUNT(DISTINCT e.source)
+                 FROM edges e
+                 LEFT JOIN _iw_roots sr ON sr.node_id = e.source
+                 WHERE e.type = 'blocks'
+                     AND e.target = r.node_id
+                     AND COALESCE(sr.root_id, e.source) != COALESCE(rr.root_id, r.node_id)
+             ) AS cross_impl_deps
+FROM _iw_results r
+LEFT JOIN _iw_roots rr ON rr.node_id = r.node_id;
+
+SELECT json_object(
+  'impacted', COALESCE(
+        (SELECT json_group_array(json_object(
+                'node_id',          node_id,
+                'min_depth',        min_depth,
+                'directions',       directions,
+                'label',            label,
+                'status',           status,
+                'text',             text,
+                'blocks_count',     blocks_count,
+                'missing_criteria', missing_criteria,
+                'node_type',        node_type,
+                'depth_from_root',  depth_from_root,
+                'cross_impl_deps',  cross_impl_deps,
+                'risk_score',       risk_score,
+                'risk_factors', json_object(
+                        'blocks_count',       blocks_contrib,
+                        'depth_from_root',    depth_contrib,
+                        'missing_criteria',   criteria_contrib,
+                        'cross_impl_deps',    cross_contrib
+                )
+        ))
+        FROM (
+            SELECT node_id,
+                         min_depth,
+                         directions,
+                         label,
+                         status,
+                         text,
+                         blocks_count,
+                         missing_criteria,
+                         node_type,
+                         depth_from_root,
+                         cross_impl_deps,
+                         ROUND(MIN(0.30, blocks_count * 0.10), 3) AS blocks_contrib,
+                         ROUND(
+                             CASE
+                                 WHEN depth_from_root <= 0 THEN 0.25
+                                 WHEN depth_from_root = 1 THEN 0.20
+                                 WHEN depth_from_root = 2 THEN 0.15
+                                 WHEN depth_from_root = 3 THEN 0.10
+                                 ELSE 0.05
+                             END,
+                             3
+                         ) AS depth_contrib,
+                         ROUND(CASE WHEN missing_criteria = 1 THEN 0.25 ELSE 0.0 END, 3) AS criteria_contrib,
+                         ROUND(MIN(0.20, cross_impl_deps * 0.10), 3) AS cross_contrib,
+                         ROUND(
+                             MIN(
+                                 1.0,
+                                 MIN(0.30, blocks_count * 0.10) +
+                                 CASE
+                                     WHEN depth_from_root <= 0 THEN 0.25
+                                     WHEN depth_from_root = 1 THEN 0.20
+                                     WHEN depth_from_root = 2 THEN 0.15
+                                     WHEN depth_from_root = 3 THEN 0.10
+                                     ELSE 0.05
+                                 END +
+                                 CASE WHEN missing_criteria = 1 THEN 0.25 ELSE 0.0 END +
+                                 MIN(0.20, cross_impl_deps * 0.10)
+                             ),
+                             3
+                         ) AS risk_score
+            FROM _iw_scored
+            WHERE 1=1 ${output_done_filter}
+            ORDER BY min_depth, blocks_count DESC
+        )),
+    json('[]')
+  ),
+  'edges', COALESCE(
+    (SELECT json_group_array(json_object(
+        'source',  source,
+        'target',  target,
+        'type',    type,
+        'weight',  weight,
+        'context', json(COALESCE(context, '{}'))
+        )) FROM edges
+     WHERE source IN (SELECT id FROM _iw_seeds UNION SELECT node_id FROM _iw_results)
+       AND target IN (SELECT id FROM _iw_seeds UNION SELECT node_id FROM _iw_results)),
+    json('[]')
+  )
+);
+SQL
 }

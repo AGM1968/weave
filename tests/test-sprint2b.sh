@@ -475,10 +475,10 @@ test_digest_alerts() {
     setup_test_env
     $WV init >/dev/null 2>&1
 
-    # Create a node with a pitfall but no addressing edge
+    # Create an open node with a pitfall but no addressing edge.
+    # Must stay open (not done) — done-node pitfalls are captured learnings, not unaddressed debt.
     local id1
     id1=$($WV add "Task with pitfall" --metadata='{"pitfall":"Something bad"}' 2>&1 | tail -1)
-    $WV done "$id1" --no-warn >/dev/null 2>&1
 
     local json_output
     json_output=$($WV digest --json 2>/dev/null)

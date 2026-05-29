@@ -14,7 +14,9 @@ set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null || true
 source "$WV_PROJECT_DIR/scripts/lib/wv-resolve-runtime.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-runtime.sh" || exit 0
+_hc_refresh
 
 INPUT=$(cat)
 TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
@@ -39,7 +41,7 @@ case "$FILE_PATH" in
 esac
 
 # Per-repo session ring on tmpfs (matches budget-tally hot-zone naming).
-_TF_HOT_ZONE=$(resolve_repo_hot_zone "" "$REPO_ROOT")
+_TF_HOT_ZONE="${_HC_HOT_ZONE}"
 RING_DIR="${WV_TOUCHED_DIR:-$_TF_HOT_ZONE}"
 RING_FILE="${RING_DIR}/recent-edits.txt"
 mkdir -p "$RING_DIR" 2>/dev/null || exit 0
@@ -54,7 +56,7 @@ RING_CAP="${WV_TOUCHED_RING_CAP:-20}"
 } | tail -n "$RING_CAP" > "${RING_FILE}.new" 2>/dev/null && mv "${RING_FILE}.new" "$RING_FILE" 2>/dev/null || true
 
 # Locate active node and append to its metadata.touched_files (cap 50).
-_TF_DB="${WV_DB:-$(resolve_db "$_TF_HOT_ZONE")}"
+_TF_DB="${WV_DB:-$_HC_DB}"
 [ ! -f "$_TF_DB" ] && exit 0
 
 ACTIVE_ID=$(resolve_active_primary "$_TF_DB" "$_TF_HOT_ZONE") || true

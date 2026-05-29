@@ -78,6 +78,22 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local haystack="$1"
+    local needle="$2"
+    local message="$3"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if ! echo "$haystack" | grep -qF "$needle"; then
+        echo -e "${GREEN}✓${NC} $message"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo -e "${RED}✗${NC} $message"
+        echo "  Expected NOT to find: $needle"
+        echo "  In: $(echo "$haystack" | head -3)"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+}
+
 assert_exit_code() {
     local expected="$1"
     local actual="$2"
@@ -149,7 +165,7 @@ setup_uninitialized_project() {
 add_active_node() {
     local text="$1"
     shift || true
-    "$WV" add "$text" --status=active \
+    "$WV" add "$text" --status=active --force \
         --criteria="hook test setup works|active node available for hook checks" \
         --risks=low "$@"
 }
@@ -202,6 +218,19 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "2" "$EXIT_CODE" "pre-action: exits 2 (hard block) when no active node"
 assert_contains "$OUTPUT" "No active Weave node" "pre-action: message on stderr when no active node"
+
+# --- pre-action.sh (discover phase still blocks edits) ---
+echo ""
+echo "--- pre-action.sh (discover phase blocks edits) ---"
+setup_test_env
+printf '%s' discover > "$WV_HOT_ZONE/.session_phase"
+
+set +e
+OUTPUT=$(echo '{"tool_name":"Edit","tool_input":{"file_path":"test.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "2" "$EXIT_CODE" "pre-action: exits 2 when edit attempted in discover phase"
+assert_contains "$OUTPUT" "Discovery is for reading, searching, and planning only" "pre-action: discover edit block explains read-only discovery"
 
 # --- pre-action.sh (with active node) ---
 echo ""
@@ -373,7 +402,7 @@ echo "--- pre-claim-skills.sh ---"
 setup_test_env
 
 # Node without done_criteria → hard gate (missing planning)
-ID=$("$WV" add "Claim test" 2>/dev/null | tail -1)
+ID=$("$WV" add "Claim test" --force 2>/dev/null | tail -1)
 set +e
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
 EXIT_CODE=$?
@@ -384,7 +413,7 @@ assert_contains "$OUTPUT" "permissionDecision" "pre-claim: contains permissionDe
 assert_contains "$OUTPUT" "/ship-it" "pre-claim: suggests ship-it when done_criteria absent"
 
 # Node with done_criteria but no risks → tiered advisory
-ID2=$("$WV" add "Claim test criteria-only" --metadata='{"done_criteria":["c1"]}' 2>/dev/null | tail -1)
+ID2=$("$WV" add "Claim test criteria-only" --metadata='{"done_criteria":["c1"]}' --force 2>/dev/null | tail -1)
 set +e
 OUTPUT2=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID2\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
 EXIT_CODE2=$?
@@ -393,7 +422,7 @@ assert_exit_code "0" "$EXIT_CODE2" "pre-claim: exits 0 when criteria set but ris
 assert_contains "$OUTPUT2" "pre-mortem" "pre-claim: suggests pre-mortem when done_criteria present but risks absent"
 
 # Node with done_criteria + risks but no alias → tier 3 deny
-ID3_NOALIAS=$("$WV" add "Claim test no alias" --metadata='{"done_criteria":["c1"],"risks":[]}' 2>/dev/null | tail -1)
+ID3_NOALIAS=$("$WV" add "Claim test no alias" --metadata='{"done_criteria":["c1"],"risks":[]}' --force 2>/dev/null | tail -1)
 set +e
 OUTPUT3_NOALIAS=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID3_NOALIAS\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
 EXIT_CODE3_NOALIAS=$?
@@ -402,7 +431,7 @@ assert_exit_code "0" "$EXIT_CODE3_NOALIAS" "pre-claim: exits 0 (soft deny) when 
 assert_contains "$OUTPUT3_NOALIAS" "alias" "pre-claim: suggests alias when done_criteria+risks present but alias absent"
 
 # Node with done_criteria, risks, and alias → silent pass
-ID3=$("$WV" add "Claim test both" --alias=claim-test --metadata='{"done_criteria":["c1"],"risks":[]}' 2>/dev/null | tail -1)
+ID3=$("$WV" add "Claim test both" --alias=claim-test --metadata='{"done_criteria":["c1"],"risks":[]}' --force 2>/dev/null | tail -1)
 set +e
 OUTPUT3=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID3\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
 EXIT_CODE3=$?
@@ -890,20 +919,84 @@ echo ""
 echo "--- repo-managed git hooks ---"
 setup_test_env
 mkdir -p "$TEST_DIR/project/tests"
-cat > "$TEST_DIR/project/tests/test-core.sh" <<'EOF'
+cat > "$TEST_DIR/project/tests/test-graph.sh" <<'EOF'
 #!/bin/sh
 exit 0
 EOF
-chmod +x "$TEST_DIR/project/tests/test-core.sh"
-git -C "$TEST_DIR/project" add tests/test-core.sh
+chmod +x "$TEST_DIR/project/tests/test-graph.sh"
+git -C "$TEST_DIR/project" add tests/test-graph.sh
 add_active_node "Git hook progress task" --criteria="hook prints progress|smoke repo stays green" --risks=low >/dev/null 2>&1
 set +e
-OUTPUT=$(cd "$TEST_DIR/project" && sh "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
 EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "git pre-commit: exits 0 with active node and passing shell smoke"
-assert_contains "$OUTPUT" "running tests/test-core.sh" "git pre-commit: streams shell-test progress"
+assert_contains "$OUTPUT" "running tests/test-graph.sh" "git pre-commit: streams shell-test progress"
 assert_contains "$OUTPUT" "checking for an active Weave node" "git pre-commit: streams active-node check"
+
+setup_test_env
+mkdir -p "$TEST_DIR/project/scripts/hooks" "$TEST_DIR/project/tests"
+cat > "$TEST_DIR/project/scripts/hooks/local-hook.sh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat > "$TEST_DIR/project/tests/test-hooks.sh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$TEST_DIR/project/scripts/hooks/local-hook.sh" "$TEST_DIR/project/tests/test-hooks.sh"
+git -C "$TEST_DIR/project" add scripts/hooks/local-hook.sh tests/test-hooks.sh
+add_active_node "Git hook impact-selected task" --criteria="impact suite mapping works|test-core.sh excluded from pre-commit" --risks=low >/dev/null 2>&1
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: exits 0 with impact-selected suite mapping"
+assert_contains "$OUTPUT" "impact-selected shell suites" "git pre-commit: reports impact-selected suite list"
+assert_contains "$OUTPUT" "tests/test-hooks.sh" "git pre-commit: selects tests/test-hooks.sh for hook file changes"
+QUEUE_FILE="$TEST_DIR/project/.git/.weave-deferred-suites"
+assert_equals "absent" "$(if [ -f "$QUEUE_FILE" ]; then echo present; else echo absent; fi)" "git pre-commit: no deferred queue written (test-core.sh excluded from pre-commit)"
+
+# Verify scripts/cmd/*.sh changes do not trigger test-core.sh
+setup_test_env
+mkdir -p "$TEST_DIR/project/scripts/cmd" "$TEST_DIR/project/tests"
+cat > "$TEST_DIR/project/scripts/cmd/wv-cmd-custom.sh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$TEST_DIR/project/scripts/cmd/wv-cmd-custom.sh"
+git -C "$TEST_DIR/project" add scripts/cmd/wv-cmd-custom.sh
+add_active_node "Git hook cmd-only task" --criteria="cmd changes skip test-core|hook exits cleanly" --risks=low >/dev/null 2>&1
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: cmd-only change exits 0 without running test-core.sh"
+assert_not_contains "$OUTPUT" "test-core.sh" "git pre-commit: test-core.sh not triggered for scripts/cmd changes"
+
+# discover phase with non-.weave file staged must block (no active node bypass)
+setup_test_env
+printf '%s' discover > "$WV_HOT_ZONE/.session_phase"
+echo "# content" > "$TEST_DIR/project/src.sh"
+git -C "$TEST_DIR/project" add src.sh
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: discover phase blocks non-.weave commit without active node"
+assert_contains "$OUTPUT" "No active Weave node" "git pre-commit: discover phase emits no-active-node message"
+
+# discover phase with only .weave/ files staged must pass (already handled by early exit)
+setup_test_env
+printf '%s' discover > "$WV_HOT_ZONE/.session_phase"
+mkdir -p "$TEST_DIR/project/.weave"
+echo "{}" > "$TEST_DIR/project/.weave/state.json"
+git -C "$TEST_DIR/project" add .weave/state.json
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: discover phase allows .weave/-only commit"
 
 setup_test_env
 HOOK_ID=$(add_active_node "Prepare hook task" --criteria="hook adds trailer|smoke passes" --risks=low 2>/dev/null | tail -1)
@@ -929,9 +1022,9 @@ OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "SessionStart" "lifecycle: session starts successfully"
 
 # 2. Create and claim a node (triggers pre-claim-skills)
-TASK_ID=$("$WV" add "Lifecycle test task" 2>/dev/null | tail -1)
+TASK_ID=$("$WV" add "Lifecycle test task" --force 2>/dev/null | tail -1)
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $TASK_ID\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null || true)
-"$WV" update "$TASK_ID" --status=active 2>/dev/null
+"$WV" work "$TASK_ID" 2>/dev/null
 TASK_STATUS=$("$WV" show "$TASK_ID" --json 2>/dev/null | jq -r '.status')
 assert_equals "active" "$TASK_STATUS" "lifecycle: node claimed successfully"
 

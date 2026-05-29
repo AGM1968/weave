@@ -2194,7 +2194,7 @@ cmd_import() {
             local meta_type=$(echo "$line" | jq -r '.metadata | type')
             if [ "$meta_type" = "string" ]; then
                 # Metadata is JSON string (from archive) - parse it
-                metadata=$(echo "$line" | jq -c --arg original_id "$id" '.metadata | fromjson | . + {imported_from: $original_id}')
+                metadata=$(echo "$line" | jq -c --arg original_id "$id" '.metadata | (fromjson? // {}) | . + {imported_from: $original_id}')
             else
                 # Metadata is already object - use directly
                 metadata=$(echo "$line" | jq -c --arg original_id "$id" '.metadata + {imported_from: $original_id}')

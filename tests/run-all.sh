@@ -1,13 +1,11 @@
 #!/bin/bash
 # run-all.sh — Master test runner for Weave CLI tests
 #
-# Run: bash tests/run-all.sh
+# Run: bash tests/run-all.sh             (parallel, fast tier — ~400s wall time)
+#      bash tests/run-all.sh --serial    (serial, for readable output)
+#      bash tests/run-all.sh --slow      (include test-release.sh — ~600s)
+#      bash tests/run-all.sh --suite=X   (single suite by name fragment)
 # Exit: 0 if all suites pass, 1 if any fail
-#
-# Options:
-#   --verbose    Show individual test output
-#   --parallel   Run test suites in parallel (faster but interleaved output)
-#   --suite=X    Run only specific suite (core, graph, data, health)
 
 set -euo pipefail
 
@@ -20,34 +18,41 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# Options
+# Options — parallel is default; use --serial for readable output
 VERBOSE=false
-PARALLEL=false
+PARALLEL=true
 SUITE_FILTER=""
+INCLUDE_SLOW=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --verbose|-v) VERBOSE=true ;;
-        --parallel|-p) PARALLEL=true ;;
-        --suite=*) SUITE_FILTER="${1#*=}" ;;
+        --verbose|-v)   VERBOSE=true ;;
+        --parallel|-p)  PARALLEL=true ;;
+        --serial|-s)    PARALLEL=false ;;
+        --slow)         INCLUDE_SLOW=true ;;
+        --suite=*)      SUITE_FILTER="${1#*=}" ;;
         --help|-h)
-            echo "Usage: $0 [--verbose] [--parallel] [--suite=NAME]"
+            echo "Usage: $0 [--serial] [--slow] [--verbose] [--suite=NAME]"
             echo ""
             echo "Options:"
-            echo "  --verbose, -v   Show individual test output"
-            echo "  --parallel, -p  Run test suites in parallel"
-            echo "  --suite=NAME    Run only specific suite (core, graph, data, health)"
+            echo "  --serial, -s    Serial execution (readable output; default is parallel)"
+            echo "  --slow          Include slow integration suites (test-release.sh ~200s)"
+            echo "  --verbose, -v   Show individual test output (implies --serial)"
+            echo "  --suite=NAME    Run only specific suite (name fragment match)"
+            echo ""
+            echo "Default: parallel fast tier (~25s wall time)"
             exit 0
             ;;
     esac
     shift
 done
 
-# Test suites
-declare -a SUITES=(
+[ "$VERBOSE" = true ] && PARALLEL=false
+
+# Fast tier — runs by default (~25s parallel, ~880s serial)
+declare -a FAST_SUITES=(
     "test-core.sh:Core Commands"
     "test-graph.sh:Graph Commands"
-    "test-release.sh:Release Tests"
     "test-data.sh:Data Commands"
     "test-health.sh:Health Commands"
     "test-sprint2b.sh:Sprint 2b Commands"
@@ -62,6 +67,16 @@ declare -a SUITES=(
     "test-analyze.sh:Analyze Command Tests"
     "test-query.sh:Query Command Tests"
 )
+
+# Slow tier — excluded by default; add with --slow (~200s, runs install+selftest)
+declare -a SLOW_SUITES=(
+    "test-release.sh:Release Tests"
+)
+
+declare -a SUITES=("${FAST_SUITES[@]}")
+if [ "$INCLUDE_SLOW" = true ]; then
+    SUITES+=("${SLOW_SUITES[@]}")
+fi
 
 # Results tracking
 declare -A RESULTS
@@ -83,35 +98,30 @@ run_suite() {
     
     start_time=$(date +%s)
     
+    local passed tests
     if [ "$VERBOSE" = true ]; then
         echo -e "${CYAN}Running: $name${NC}"
         echo "─────────────────────────────────────────────────────────────────────────────"
-        bash "$SCRIPT_DIR/$script" 2>&1
-        exit_code=$?
+        output=$(bash "$SCRIPT_DIR/$script" 2>&1) && exit_code=0 || exit_code=$?
+        echo "$output"
         echo ""
     else
-        output=$(bash "$SCRIPT_DIR/$script" 2>&1) || exit_code=$?
-        exit_code=${exit_code:-0}
+        output=$(bash "$SCRIPT_DIR/$script" 2>&1) && exit_code=0 || exit_code=$?
     fi
-    
+
     end_time=$(date +%s)
     duration=$((end_time - start_time))
     
-    # Parse results from output
-    local passed tests
-    if [ "$VERBOSE" = true ]; then
-        # Re-run to capture output for parsing (inefficient but works)
-        output=$(bash "$SCRIPT_DIR/$script" 2>&1) || true
-    fi
-    
-    # Extract test counts from output (strip ANSI codes first)
+    # Extract test counts from output (strip ANSI codes first).
+    # Prefer "Results: X/Y passed" over "Tests: X | Passed: X | Failed: Y" —
+    # tail -1 on the latter picks up "Failed: 0" as the test count.
     local clean_output
     clean_output=$(echo "$output" | sed 's/\x1b\[[0-9;]*m//g')
-    if echo "$clean_output" | grep -qE "Results:|Tests:"; then
+    if echo "$clean_output" | grep -qE "[0-9]+/[0-9]+ passed"; then
         local result_line
-        result_line=$(echo "$clean_output" | grep -E "Results:|Tests:" | tail -1)
+        result_line=$(echo "$clean_output" | grep -E "[0-9]+/[0-9]+ passed" | tail -1)
         passed=$(echo "$result_line" | grep -oE '[0-9]+' | head -1)
-        tests=$(echo "$result_line" | grep -oE '[0-9]+' | tail -1)
+        tests=$(echo "$result_line" | grep -oE '[0-9]+' | sed -n '2p')
     else
         passed=0
         tests=0
@@ -160,31 +170,31 @@ if [ "$PARALLEL" = true ]; then
     
     # Run all suites in background
     declare -a PIDS
+    run_id=$$
     for suite in "${SUITES[@]}"; do
         script="${suite%%:*}"
-        (bash "$SCRIPT_DIR/$script" > "/tmp/wv-test-$script.out" 2>&1) &
+        (bash "$SCRIPT_DIR/$script" > "/tmp/wv-test-${run_id}-$script.out" 2>&1) &
         PIDS+=($!)
     done
-    
+
     # Wait for all to complete
     for i in "${!SUITES[@]}"; do
         suite="${SUITES[$i]}"
         script="${suite%%:*}"
         name="${suite#*:}"
         pid="${PIDS[$i]}"
-        
-        wait "$pid" || true
-        exit_code=$?
-        
-        output=$(cat "/tmp/wv-test-$script.out" 2>/dev/null || echo "")
-        rm -f "/tmp/wv-test-$script.out"
+
+        wait "$pid" && exit_code=0 || exit_code=$?
+
+        output=$(cat "/tmp/wv-test-${run_id}-$script.out" 2>/dev/null || echo "")
+        rm -f "/tmp/wv-test-${run_id}-$script.out"
         
         # Parse results (strip ANSI codes first)
         clean_output=$(echo "$output" | sed 's/\x1b\[[0-9;]*m//g')
-        if echo "$clean_output" | grep -qE "Results:|Tests:"; then
-            result_line=$(echo "$clean_output" | grep -E "Results:|Tests:" | tail -1)
+        if echo "$clean_output" | grep -qE "[0-9]+/[0-9]+ passed"; then
+            result_line=$(echo "$clean_output" | grep -E "[0-9]+/[0-9]+ passed" | tail -1)
             passed=$(echo "$result_line" | grep -oE '[0-9]+' | head -1)
-            tests=$(echo "$result_line" | grep -oE '[0-9]+' | tail -1)
+            tests=$(echo "$result_line" | grep -oE '[0-9]+' | sed -n '2p')
         else
             passed=0
             tests=0
@@ -214,6 +224,22 @@ fi
 END_TIME=$(date +%s)
 TOTAL_TIME=$((END_TIME - START_TIME))
 
+# Persist per-suite timing to .weave/test-times.json (serial mode only — parallel skips TIMES[])
+if [ "$PARALLEL" = false ] && [ ${#TIMES[@]} -gt 0 ]; then
+    _times_file="$(dirname "$SCRIPT_DIR")/.weave/test-times.json"
+    _existing='{}'
+    [ -f "$_times_file" ] && _existing=$(cat "$_times_file" 2>/dev/null || echo '{}')
+    _updates=''
+    for _script in "${!TIMES[@]}"; do
+        _name=$(basename "$_script")
+        _dur="${TIMES[$_script]}"
+        _updates+=$(printf ',"%s":%s' "$_name" "$_dur")
+    done
+    # Merge: existing + updates (updates win on collision)
+    printf '%s' "$_existing" | jq -r --argjson u "{${_updates#,}}" '. + $u' \
+        > "$_times_file" 2>/dev/null || true
+fi
+
 # Summary
 echo ""
 echo "═══════════════════════════════════════════════════════════════════════════"
@@ -223,6 +249,12 @@ echo ""
 echo -e "  Total tests: ${GREEN}$TOTAL_PASSED${NC}/${YELLOW}$TOTAL_TESTS${NC} passed"
 echo -e "  Total time:  ${TOTAL_TIME}s"
 echo ""
+
+if [ "$INCLUDE_SLOW" = false ] && [ ${#SLOW_SUITES[@]} -gt 0 ]; then
+    echo -e "  ${YELLOW}Slow suites skipped:${NC} $(printf '%s ' "${SLOW_SUITES[@]}" | sed 's/:[^:]*//g')"
+    echo -e "  Run with ${CYAN}--slow${NC} to include (adds ~200s)"
+    echo ""
+fi
 
 if [ ${#FAILED_SUITES[@]} -gt 0 ]; then
     echo -e "  ${RED}Failed suites:${NC}"

@@ -595,6 +595,33 @@ test_learning_hygiene() {
     score5=$($WV show "$id5" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene' 2>/dev/null)
     assert_equals "3" "$score5" "quality: pitfall prefix scores same as pattern"
 
+    # Bench H4: inline learning with a file path reference scores 4 (wv-51b9ca)
+    local id_h4
+    id_h4=$($WV add "Task with file-ref learning" 2>/dev/null | tail -1)
+    $WV done "$id_h4" --learning="pattern: Use scripts/cmd/wv-cmd-core.sh for all core logic" \
+        --skip-verification >/dev/null 2>&1
+    local score_h4
+    score_h4=$($WV show "$id_h4" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene' 2>/dev/null)
+    assert_equals "4" "$score_h4" "quality(H4): file-path ref in learning yields hygiene 4"
+
+    # Bench B1: --learning-file with newline-form (decision/pattern/pitfall on separate lines)
+    # parses all three fields and scores hygiene 4 due to file ref (wv-2f0a81)
+    local lf_b1
+    lf_b1=$(mktemp)
+    printf 'pattern: walk implements edges via scripts/cmd/wv-cmd-graph.sh\npitfall: never skip edge validation\n' > "$lf_b1"
+    local id_b1
+    id_b1=$($WV add "Task with newline-form learning-file" 2>/dev/null | tail -1)
+    $WV done "$id_b1" --learning-file="$lf_b1" --skip-verification >/dev/null 2>&1
+    rm -f "$lf_b1"
+    local b1_meta score_b1 b1_pattern b1_pitfall
+    b1_meta=$($WV show "$id_b1" --json 2>&1 | jq -r '.metadata | fromjson' 2>/dev/null)
+    score_b1=$(echo "$b1_meta" | jq -r '.learning_hygiene' 2>/dev/null)
+    b1_pattern=$(echo "$b1_meta" | jq -r '.pattern // empty' 2>/dev/null)
+    b1_pitfall=$(echo "$b1_meta" | jq -r '.pitfall // empty' 2>/dev/null)
+    assert_contains "$b1_pattern" "walk implements edges" "quality(B1): newline-form pattern field parsed from --learning-file"
+    assert_contains "$b1_pitfall" "never skip edge validation" "quality(B1): newline-form pitfall field parsed from --learning-file"
+    assert_equals "4" "$score_b1" "quality(B1): newline-form learning-file with file ref scores hygiene 4"
+
     # --min-quality filter works
     local filtered
     filtered=$($WV learnings --min-quality=3 --json 2>&1)

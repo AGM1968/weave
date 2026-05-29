@@ -7,13 +7,14 @@ set -e
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null || true
+_hc_refresh
 cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 [ -x "$WV" ] || exit 0
 
-# Per-repo DB namespace: derive from git root hash (needed for stamp file + DB path)
-_REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-_REPO_HASH=$(echo "$_REPO_ROOT" | md5sum | cut -c1-8)
-WV_DB="${WV_DB:-/dev/shm/weave/${_REPO_HASH}/brain.db}"
+# Per-repo DB namespace and hot-zone stamp path from shared helper
+WV_DB="${WV_DB:-${_HC_DB}}"
+_PC_HOT_ZONE="${_HC_HOT_ZONE}"
 
 # Safety commit: save in-progress code before context compaction
 # Prevents work loss if session hits limits after compact
@@ -36,7 +37,7 @@ if ! git diff --cached --quiet 2>/dev/null; then
     else
         git commit -m "wip: pre-compact checkpoint $(date +%H:%M) [skip ci]" --no-verify 2>/dev/null || true
     fi
-    echo "$_NOW" > "/dev/shm/weave/${_REPO_HASH}/.last_checkpoint" 2>/dev/null || true
+    echo "$_NOW" > "${_PC_HOT_ZONE}/.last_checkpoint" 2>/dev/null || true
 fi
 
 # Compact status line

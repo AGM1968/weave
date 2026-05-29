@@ -68,6 +68,7 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
         cd "$_PAYLOAD_CWD" 2>/dev/null || true
     fi
     source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+    source "$HOOK_DIR/../lib/wv-validate.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-validate.sh" 2>/dev/null || true
     if [ -x "$WV" ]; then
         _agent_hook_progress "load node metadata"
         NODE_JSON=$(_agent_hook_run "node-json" "$WV" show "$NODE_ID" --json 2>/dev/null) || {
@@ -91,38 +92,19 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
         fi
 
         if [[ "$NODE_TYPE" == "finding" ]]; then
-            _FINDING_VT_ENUM="historical:defect upstream:management-gap upstream:logic-bug upstream:schema-drift repo:hygiene repo:regression test:gap design:flaw"
-            MISSING_FINDING=$(echo "$NODE_META" | jq -r --arg valid_types "$_FINDING_VT_ENUM" '
-                (.finding // {}) as $finding |
-                ($valid_types | split(" ")) as $enum |
-                [
-                    # violation_type: required + enum-validated
-                    (if (($finding.violation_type // null) | type) == "string"
-                        and (($finding.violation_type | gsub("^\\s+|\\s+$"; "")) | length) > 0
-                        and ($enum | index($finding.violation_type)) != null
-                     then empty
-                     elif (($finding.violation_type // null) | type) == "string"
-                        and (($finding.violation_type | gsub("^\\s+|\\s+$"; "")) | length) > 0
-                     then "finding.violation_type (invalid enum: \($finding.violation_type))"
-                     else "finding.violation_type"
-                     end),
-                    # optional fields: validate only if present
-                    (if ($finding | has("root_cause")) and
-                        ((($finding.root_cause // null) | type) != "string" or (($finding.root_cause | gsub("^\\s+|\\s+$"; "")) | length) == 0)
-                     then "finding.root_cause (present but empty/invalid)" else empty end),
-                    (if ($finding | has("proposed_fix")) and
-                        ((($finding.proposed_fix // null) | type) != "string" or (($finding.proposed_fix | gsub("^\\s+|\\s+$"; "")) | length) == 0)
-                     then "finding.proposed_fix (present but empty/invalid)" else empty end),
-                    (if ($finding | has("confidence")) and
-                        (["high", "medium", "low"] | index(($finding.confidence // "") | tostring)) == null
-                     then "finding.confidence (must be high|medium|low)" else empty end),
-                    (if ($finding | has("fixable")) and ($finding.fixable | type) != "boolean"
-                     then "finding.fixable (must be boolean)" else empty end)
-                ] | join(", ")
-            ' 2>/dev/null || echo "")
-            if [[ -n "$MISSING_FINDING" ]]; then
+            # Prefer explicit WV_CLI when provided, otherwise use the resolved project-local WV.
+            _VF_BIN="${WV_CLI:-$WV}"
+            if [[ -z "$_VF_BIN" ]]; then
+                _VF_BIN="wv"
+            fi
+            _VF_OUT=$("$_VF_BIN" validate-finding "$NODE_ID" 2>/dev/null || true)
+            # Keep explicit false values; jq's `//` treats false as empty.
+            _VF_VALID=$(printf '%s' "$_VF_OUT" | jq -r 'if has("valid") then (.valid | tostring) else "true" end' 2>/dev/null || echo "true")
+            if [[ "$_VF_VALID" != "true" ]]; then
+                _VF_ERRORS=$(printf '%s' "$_VF_OUT" | jq -r '.errors | join(", ")' 2>/dev/null || echo "unknown")
+                _VF_ENUM="${FINDING_VIOLATION_TYPES:-}"
                 jq -n \
-                    --arg detail "finding node requires violation_type before close. Missing or invalid: $MISSING_FINDING. Enum: $_FINDING_VT_ENUM. Minimal: wv update $NODE_ID --metadata='{\"finding\":{\"violation_type\":\"repo:hygiene\"}}'" \
+                    --arg detail "finding node requires violation_type before close. Missing or invalid: $_VF_ERRORS${_VF_ENUM:+. Enum: $_VF_ENUM}. Minimal: wv update $NODE_ID --metadata='{\"finding\":{\"violation_type\":\"repo:hygiene\"}}'" \
                     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
                 exit 0
             fi

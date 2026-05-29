@@ -7,6 +7,10 @@ set -e
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+source "$HOOK_DIR/../lib/wv-validate.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-validate.sh" 2>/dev/null || true
+source "$HOOK_DIR/../lib/wv-config.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-config.sh" 2>/dev/null || true
+source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null || true
+_hc_refresh
 
 # Check if wv is available
 if [ ! -x "$WV" ]; then
@@ -14,9 +18,9 @@ if [ ! -x "$WV" ]; then
     exit 0
 fi
 
-# Resolve hot zone path (mirrors wv-config.sh logic)
-_SS_REPO_HASH=$(echo "$WV_PROJECT_DIR" | md5sum | cut -c1-8)
-_SS_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_SS_REPO_HASH}}"
+# Resolve hot zone path via shared hook helper
+_SS_REPO_HASH="${_HC_REPO_HASH}"
+_SS_HOT_ZONE="${_HC_HOT_ZONE}"
 SENTINEL="${_SS_HOT_ZONE}/.session_sentinel"
 
 # ── Clear stale bash-dedup locks from the previous session ────────────────────
@@ -87,7 +91,7 @@ fi
 mkdir -p "$_SS_HOT_ZONE" 2>/dev/null || true
 # Write session epoch for stale-node detection in pre-action.sh
 date +%s > "${_SS_HOT_ZONE}/.session_epoch" 2>/dev/null || true
-echo "discover" > "${_SS_HOT_ZONE}/.session_phase" 2>/dev/null || true
+wv_set_phase "discover" "$_SS_HOT_ZONE"
 jq -n \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson pid $$ \

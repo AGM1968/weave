@@ -17,13 +17,14 @@ from weave_quality.bash_ast_grep import (
     analyze_bash_source_ast_grep,
     ast_grep_available,
 )
+from weave_quality.external_tools import resolve_tool
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 AST_GREP = pytest.mark.skipif(
-    not __import__("shutil").which("ast-grep"),
+    not ast_grep_available(),
     reason="ast-grep not installed",
 )
 
@@ -47,6 +48,22 @@ class TestAstGrepAvailable:
     def test_returns_bool(self) -> None:
         result = ast_grep_available()
         assert isinstance(result, bool)
+
+    def test_resolve_tool_checks_common_user_bins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import weave_quality.external_tools as tools  # pylint: disable=import-outside-toplevel
+
+        fake_home = tmp_path / "home"
+        fake_bin = fake_home / ".cargo" / "bin"
+        fake_bin.mkdir(parents=True)
+        fake_tool = fake_bin / "ast-grep"
+        fake_tool.write_text("#!/bin/sh\n", encoding="utf-8")
+        fake_tool.chmod(0o755)
+
+        monkeypatch.setattr(tools.shutil, "which", lambda _: None)
+        monkeypatch.setattr(tools.Path, "home", lambda: fake_home)
+        assert resolve_tool("ast-grep") == str(fake_tool)
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +111,7 @@ class TestAnalyzeBashFileBest:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import weave_quality.bash_ast_grep as mod  # pylint: disable=import-outside-toplevel
-        monkeypatch.setattr(mod.shutil, "which", lambda _: None)
+        monkeypatch.setattr(mod, "ast_grep_bin", lambda: None)
         fp = _write_sh(tmp_path, "x=1\n")
         _, _, backend = analyze_bash_file_best(fp)
         assert backend == "regex"
@@ -110,7 +127,7 @@ class TestAstGrepUnavailable:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import weave_quality.bash_ast_grep as mod  # pylint: disable=import-outside-toplevel
-        monkeypatch.setattr(mod.shutil, "which", lambda _: None)
+        monkeypatch.setattr(mod, "ast_grep_bin", lambda: None)
         fp = _write_sh(tmp_path, "echo hello\n")
         source = Path(fp).read_text(encoding="utf-8")
         assert analyze_bash_source_ast_grep(source, fp) is None

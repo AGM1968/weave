@@ -366,7 +366,7 @@ are blocked and others are not.
 
 | Phase      | Set by             | Active-node check                 | Triggered by                               |
 | ---------- | ------------------ | --------------------------------- | ------------------------------------------ |
-| `discover` | session-start hook | skipped                           | Session start — exploring before claiming  |
+| `discover` | session-start hook | edit-class tools blocked          | Session start — exploring before claiming  |
 | `execute`  | `wv work <id>`     | enforced (hard block if 0 active) | Node claimed, substantive work in progress |
 | `closing`  | `wv done <id>`     | skipped                           | Node just closed — allows follow-up commit |
 
@@ -375,8 +375,8 @@ session. Default when no sentinel exists: `execute` (safe, enforcing).
 
 **Common surprises explained by phases:**
 
-- Edits immediately after session start are allowed — you are in `discover`, the hook allows
-  exploration before you claim work.
+- Reads and searches immediately after session start are allowed — you are in `discover`, but
+  edit-class tools still require `wv work <id>` first.
 - After `wv done`, you can commit the changes without a new active node — you are in `closing`.
 - If you see "No active Weave node found (phase: execute)", you skipped `wv work` or the session
   epoch check blocked a stale inherited node — run `wv work <id>` to re-claim.

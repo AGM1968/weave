@@ -148,6 +148,8 @@ assert_file_exists "$REPO/.claude/settings.json"            "creates .claude/set
 assert_file_exists "$REPO/CLAUDE.md"                        "copies CLAUDE.md from template"
 assert_file_exists "$REPO/.claude/settings.local.json"      "creates settings.local.json"
 assert_file_exists "$REPO/.weave/runtime.md"                "creates .weave/runtime.md scaffold"
+assert_contains "$(cat "$REPO/.weave/runtime.md")" "Agent Runtime Notes" "runtime.md includes agent runtime notes"
+assert_contains "$(cat "$REPO/.weave/runtime.md")" "/tmp/weave-codex-*" "runtime.md documents Codex hot zone"
 assert_contains "$(cat "$REPO/.gitignore")" ".weave/.context_policy" "adds .weave/.context_policy to .gitignore"
 assert_contains "$OUTPUT" "Weave"                           "output mentions Weave"
 

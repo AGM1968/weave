@@ -8,6 +8,7 @@ from pathlib import Path
 from weave_gh.digest_cache import (
     DIGEST_SCHEMA,
     compute_structural_digest,
+    extract_weave_hash,
     is_cache_hit,
     load_cache,
     save_cache,
@@ -114,19 +115,50 @@ class TestCachePersistence:
 
 class TestIsCacheHitAndUpdate:
     def test_miss_on_empty(self) -> None:
-        assert is_cache_hit({"schema": 1, "entries": {}}, 5, "wv-a", "d") is False
+        assert is_cache_hit({"schema": DIGEST_SCHEMA, "entries": {}}, 5, "wv-a", "d") is False
 
     def test_hit_after_update(self) -> None:
         cache: dict = {"schema": DIGEST_SCHEMA, "entries": {}}
-        update_cache(cache, 5, "wv-a", "deadbeef")
+        update_cache(cache, 5, "wv-a", "deadbeef", body_hash="abc123")
         assert is_cache_hit(cache, 5, "wv-a", "deadbeef") is True
 
     def test_miss_on_digest_change(self) -> None:
         cache: dict = {"schema": DIGEST_SCHEMA, "entries": {}}
-        update_cache(cache, 5, "wv-a", "deadbeef")
+        update_cache(cache, 5, "wv-a", "deadbeef", body_hash="abc123")
         assert is_cache_hit(cache, 5, "wv-a", "feedface") is False
 
     def test_miss_on_node_id_change(self) -> None:
         cache: dict = {"schema": DIGEST_SCHEMA, "entries": {}}
-        update_cache(cache, 5, "wv-a", "deadbeef")
+        update_cache(cache, 5, "wv-a", "deadbeef", body_hash="abc123")
         assert is_cache_hit(cache, 5, "wv-b", "deadbeef") is False
+
+    def test_miss_without_cached_body_hash(self) -> None:
+        cache: dict = {
+            "schema": DIGEST_SCHEMA,
+            "entries": {"5": {"node_id": "wv-a", "digest": "deadbeef"}},
+        }
+        assert is_cache_hit(cache, 5, "wv-a", "deadbeef") is False
+
+    def test_miss_when_issue_body_hash_differs(self) -> None:
+        cache: dict = {"schema": DIGEST_SCHEMA, "entries": {}}
+        update_cache(cache, 5, "wv-a", "deadbeef", body_hash="abc123")
+        body = "<!-- WEAVE:BEGIN hash=def456 -->\nold\n<!-- WEAVE:END -->"
+        assert (
+            is_cache_hit(cache, 5, "wv-a", "deadbeef", issue_body=body)
+            is False
+        )
+
+    def test_hit_when_issue_body_hash_matches(self) -> None:
+        cache: dict = {"schema": DIGEST_SCHEMA, "entries": {}}
+        update_cache(cache, 5, "wv-a", "deadbeef", body_hash="abc123")
+        body = "<!-- WEAVE:BEGIN hash=abc123 -->\ncurrent\n<!-- WEAVE:END -->"
+        assert is_cache_hit(cache, 5, "wv-a", "deadbeef", issue_body=body) is True
+
+
+class TestExtractWeaveHash:
+    def test_extracts_marker_hash(self) -> None:
+        body = "<!-- WEAVE:BEGIN hash=abc123 -->\nbody\n<!-- WEAVE:END -->"
+        assert extract_weave_hash(body) == "abc123"
+
+    def test_returns_none_without_marker(self) -> None:
+        assert extract_weave_hash("plain issue body") is None

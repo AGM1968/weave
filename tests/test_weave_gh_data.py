@@ -343,6 +343,58 @@ class TestResolveDbPath:
             result = _resolve_db_path()
             assert "abc12345" in result or result.endswith("brain.db")
 
+    def test_codex_default_uses_codex_tmp_hot_zone(self) -> None:
+        with patch("weave_gh.data._repo_hash", return_value="abc12345"), patch.dict(
+            "os.environ",
+            {"WV_DB": "", "CODEX_CI": "1", "CODEX_THREAD_ID": ""},
+        ), patch("weave_gh.data.Path") as mock_path_cls, patch(
+            "weave_gh.data.os.getuid", return_value=1000
+        ):
+            mock_path_cls.return_value.exists.return_value = False
+            assert _resolve_db_path() == "/tmp/weave-codex-1000/abc12345/brain.db"
+
+    def test_codex_thread_id_default_uses_codex_tmp_hot_zone(self) -> None:
+        with patch("weave_gh.data._repo_hash", return_value="abc12345"), patch.dict(
+            "os.environ",
+            {"WV_DB": "", "CODEX_CI": "", "CODEX_THREAD_ID": "thread-1"},
+        ), patch("weave_gh.data.Path") as mock_path_cls, patch(
+            "weave_gh.data.os.getuid", return_value=1000
+        ):
+            mock_path_cls.return_value.exists.return_value = False
+            assert _resolve_db_path() == "/tmp/weave-codex-1000/abc12345/brain.db"
+
+    def test_agent_default_uses_codex_tmp_hot_zone(self) -> None:
+        with patch("weave_gh.data._repo_hash", return_value="abc12345"), patch.dict(
+            "os.environ",
+            {
+                "WV_DB": "",
+                "CODEX_CI": "",
+                "CODEX_THREAD_ID": "",
+                "COPILOT_AGENT": "1",
+            },
+        ), patch("weave_gh.data.Path") as mock_path_cls, patch(
+            "weave_gh.data.os.getuid", return_value=1000
+        ):
+            mock_path_cls.return_value.exists.return_value = False
+            assert _resolve_db_path() == "/tmp/weave-codex-1000/abc12345/brain.db"
+
+    def test_container_default_uses_uid_tmp_hot_zone(self) -> None:
+        with patch("weave_gh.data._repo_hash", return_value="abc12345"), patch.dict(
+            "os.environ",
+            {
+                "WV_DB": "",
+                "CODEX_CI": "",
+                "CODEX_THREAD_ID": "",
+                "COPILOT_AGENT": "",
+                "CLAUDE_CODE_SSE_PORT": "",
+                "CI": "1",
+            },
+        ), patch("weave_gh.data.Path") as mock_path_cls, patch(
+            "weave_gh.data.os.getuid", return_value=1000
+        ):
+            mock_path_cls.return_value.exists.return_value = False
+            assert _resolve_db_path() == "/tmp/weave-1000/abc12345/brain.db"
+
 
 # ---------------------------------------------------------------------------
 # _is_valid_node_id

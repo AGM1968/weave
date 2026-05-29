@@ -14,8 +14,6 @@ from weave_gh.phases import (
     _backfill_gh_issue,
     _current_gh_login,
     _desired_assignee_for_node,
-    _fast_traversal,
-    _full_traversal,
     _handle_existing_issue,
     _handle_new_issue,
     _invalid_assignees,
@@ -547,7 +545,12 @@ class TestSyncAssignee:
         """Should return False and not call _run when assignee already correct."""
         _invalid_assignees.discard("alice")
         calls: list[list[str]] = []
-        with patch("weave_gh.phases._run", side_effect=lambda cmd, **_k: (calls.append(cmd), self._ok_run(cmd))[1]):
+
+        def _capture_ok(cmd: list[str], **_k: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return self._ok_run(cmd)
+
+        with patch("weave_gh.phases._run", side_effect=_capture_ok):
             changed = _sync_assignee(1, "alice", ["alice"], "owner/repo")
         assert changed is False
         assert not calls
@@ -556,7 +559,12 @@ class TestSyncAssignee:
         """Should call gh issue edit --add-assignee when desired != current and user is valid."""
         _invalid_assignees.discard("alice")
         calls: list[list[str]] = []
-        with patch("weave_gh.phases._run", side_effect=lambda cmd, **_k: (calls.append(cmd), self._ok_run(cmd))[1]):
+
+        def _capture_ok(cmd: list[str], **_k: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return self._ok_run(cmd)
+
+        with patch("weave_gh.phases._run", side_effect=_capture_ok):
             changed = _sync_assignee(1, "alice", [], "owner/repo")
         assert changed is True
         edit_call = next(c for c in calls if "edit" in c)
@@ -566,7 +574,12 @@ class TestSyncAssignee:
         """Should return False and not call edit when the user is not a valid collaborator."""
         _invalid_assignees.discard("ghost")
         calls: list[list[str]] = []
-        with patch("weave_gh.phases._run", side_effect=lambda cmd, **_k: (calls.append(cmd), self._fail_run(cmd))[1]):
+
+        def _capture_fail(cmd: list[str], **_k: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return self._fail_run(cmd)
+
+        with patch("weave_gh.phases._run", side_effect=_capture_fail):
             changed = _sync_assignee(1, "ghost", [], "owner/repo")
         assert changed is False
         assert "ghost" in _invalid_assignees
@@ -592,7 +605,12 @@ class TestSyncAssignee:
     def test_remove_assignee(self) -> None:
         """Should call gh issue edit --remove-assignee when desired is None."""
         calls: list[list[str]] = []
-        with patch("weave_gh.phases._run", side_effect=lambda cmd, **_k: (calls.append(cmd), self._ok_run(cmd))[1]):
+
+        def _capture_ok(cmd: list[str], **_k: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return self._ok_run(cmd)
+
+        with patch("weave_gh.phases._run", side_effect=_capture_ok):
             changed = _sync_assignee(1, None, ["alice"], "owner/repo")
         assert changed is True
         assert any("--remove-assignee" in c for c in calls[0])
@@ -606,7 +624,12 @@ class TestSyncAssignee:
     def test_dry_run_no_call(self) -> None:
         """Dry run should return True but not call _run."""
         calls: list[list[str]] = []
-        with patch("weave_gh.phases._run", side_effect=lambda cmd, **_k: (calls.append(cmd), self._ok_run(cmd))[1]):
+
+        def _capture_ok(cmd: list[str], **_k: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return self._ok_run(cmd)
+
+        with patch("weave_gh.phases._run", side_effect=_capture_ok):
             changed = _sync_assignee(1, "alice", [], "owner/repo", dry_run=True)
         assert changed is True
         assert not calls
@@ -1079,6 +1102,47 @@ class TestHandleNewIssuePaths:
         assert stats.created_gh == 0
         assert len(backfill_calls) == 1
 
+    def test_done_title_match_closes_existing_issue(self) -> None:
+        """Done nodes that title-match an open synced issue must close it."""
+        node = _node("wv-done-title", text="Existing task", status="done")
+        existing = _issue(77, title="Existing task", state="OPEN", labels=["weave-synced"])
+        stats = SyncStats()
+        backfill_calls: list[object] = []
+        gh_calls: list[tuple[object, ...]] = []
+
+        def _record_gh_call(*args: object, **_kw: object) -> str:
+            gh_calls.append(args)
+            return ""
+
+        with patch.multiple(
+            "weave_gh.phases",
+            get_edges_for_node=lambda _: [],
+            render_issue_body=lambda *_a, **_k: "",
+            get_labels_for_node=lambda _: [],
+            sync_issue_labels=lambda *_a, **_k: None,
+            build_close_comment=lambda *_a, **_k: "closed",
+            _backfill_gh_issue=lambda *_a, **_k: backfill_calls.append(_a),
+            gh_cli=_record_gh_call,
+        ):
+            _handle_new_issue(
+                node,
+                nodes_by_id={},
+                issues=[existing],
+                issues_by_num={existing.number: existing},
+                issues_by_title={"Existing task": existing},
+                repo="owner/repo",
+                repo_url="https://github.com/owner/repo",
+                stats=stats,
+                dry_run=False,
+            )
+
+        assert stats.already_synced == 1
+        assert stats.closed_gh == 1
+        assert stats.created_gh == 0
+        assert existing.state == "CLOSED"
+        assert len(backfill_calls) == 1
+        assert any(call[:2] == ("issue", "close") for call in gh_calls)
+
     def test_done_only_title_match_duplicate_skips_silently(self) -> None:
         """Historical done-only title duplicates should not emit title-match/backfill chatter."""
         node = _node("wv-titl2", text="Existing task", status="done")
@@ -1240,7 +1304,21 @@ class TestHandleExistingIssuePaths:
             id="wv-reimp", text="Re-imported", status="active",
             metadata={"source": "github", "gh_issue": 10},
         )
-        issue = _issue(10, state="OPEN")
+        issue = _issue(
+            10,
+            state="OPEN",
+            body=(
+                "<!-- WEAVE:BEGIN hash=abc123 -->\n"
+                "## Context\n\n"
+                "## Tasks\n\n"
+                "- [ ] child\n\n"
+                "## Dependency Graph\n\n"
+                "```mermaid\n"
+                "graph TD\n"
+                "```\n"
+                "<!-- WEAVE:END -->"
+            ),
+        )
         stats = SyncStats()
         render_calls: list[object] = []
 
@@ -1249,6 +1327,50 @@ class TestHandleExistingIssuePaths:
             render_issue_body=lambda *_a, **_k: render_calls.append(_a) or "",  # type: ignore[func-returns-value]
         )
         assert not render_calls
+
+    def test_reimported_minimal_body_allows_update(self) -> None:
+        """Re-imported nodes with minimal/stale bodies should be repairable."""
+        node = WeaveNode(
+            id="wv-reimp-fix",
+            text="Re-imported",
+            status="active",
+            metadata={"source": "github", "gh_issue": 11},
+        )
+        issue = _issue(
+            11,
+            state="OPEN",
+            body=(
+                "<!-- WEAVE:BEGIN hash=def456 -->\n"
+                "## Context\n\n"
+                "**Weave ID:** `wv-old`\n"
+                "<!-- WEAVE:END -->"
+            ),
+        )
+        stats = SyncStats()
+        gh_calls: list[tuple[object, ...]] = []
+
+        def _record_gh_call(*args: object, **_kw: object) -> str:
+            gh_calls.append(args)
+            return ""
+
+        self._call(
+            node,
+            issue,
+            stats,
+            render_issue_body=(
+                lambda *_a, **_k: "<!-- WEAVE:BEGIN hash=new -->\n"
+                "## Context\n\n"
+                "**Weave ID:** `wv-reimp-fix`\n"
+                "<!-- WEAVE:END -->"
+            ),
+            should_update_body=lambda *_a: True,
+            extract_human_content=lambda _: "",
+            compose_issue_body=lambda _h, w: w,
+            gh_cli=_record_gh_call,
+        )
+
+        assert stats.updated_gh == 1
+        assert any(call[:2] == ("issue", "edit") for call in gh_calls)
 
     def test_dry_run_close_increments_count(self) -> None:
         """Dry-run close increments closed_gh without calling gh_cli."""
@@ -1588,7 +1710,9 @@ class TestPhaseCDigestCache:
     def _patches(self, **overrides: Any) -> Any:
         base: dict[str, Any] = {
             "get_edges_for_node": lambda _: [],
-            "render_issue_body": lambda *_a, **_k: "<!-- rendered -->",
+            "render_issue_body": lambda *_a, **_k: (
+                "<!-- WEAVE:BEGIN hash=abc123 -->\nbody\n<!-- WEAVE:END -->"
+            ),
             "should_update_body": lambda *_a: True,
             "get_labels_for_node": lambda _: [],
             "sync_issue_labels": lambda *_a, **_k: None,
@@ -1617,7 +1741,17 @@ class TestPhaseCDigestCache:
         # Pre-seed cache with the digest that compute_structural_digest will produce.
         from weave_gh.digest_cache import compute_structural_digest
         digest = compute_structural_digest(node, {node.id: node}, [])
-        cache: dict = {"schema": 1, "entries": {"42": {"node_id": "wv-c1", "digest": digest}}}
+        cache: dict[str, Any] = {
+            "schema": 2,
+            "entries": {
+                "42": {
+                    "node_id": "wv-c1",
+                    "digest": digest,
+                    "body_hash": "abc123",
+                }
+            },
+        }
+        issue.body = "<!-- WEAVE:BEGIN hash=abc123 -->\nold\n<!-- WEAVE:END -->"
 
         with self._patches(render_issue_body=fake_render):
             _handle_existing_issue(
@@ -1635,7 +1769,7 @@ class TestPhaseCDigestCache:
         node = _node("wv-c2", status="todo", gh_issue=43)
         issue = _issue(43, state="OPEN", body="old")
         stats = SyncStats()
-        cache: dict = {"schema": 1, "entries": {}}
+        cache: dict[str, Any] = {"schema": 1, "entries": {}}
 
         with self._patches():
             _handle_existing_issue(
@@ -1648,13 +1782,14 @@ class TestPhaseCDigestCache:
         assert stats.updated_gh == 1
         assert "43" in cache["entries"]
         assert cache["entries"]["43"]["node_id"] == "wv-c2"
+        assert cache["entries"]["43"]["body_hash"] == "abc123"
 
     def test_dry_run_does_not_update_cache(self) -> None:
         """In dry-run, cache should remain untouched even after render."""
         node = _node("wv-c3", status="todo", gh_issue=44)
         issue = _issue(44, state="OPEN", body="old")
         stats = SyncStats()
-        cache: dict = {"schema": 1, "entries": {}}
+        cache: dict[str, Any] = {"schema": 1, "entries": {}}
 
         with self._patches():
             _handle_existing_issue(
@@ -1717,7 +1852,11 @@ class TestPhaseDRepairCheckpoint:
         i1 = _issue(10, state="OPEN")
         i2 = _issue(11, state="OPEN")
         stats = SyncStats()
-        checkpoint = {"schema": 1, "started_at": 0.0, "processed": ["wv-d001"]}
+        checkpoint: dict[str, Any] = {
+            "schema": 1,
+            "started_at": 0.0,
+            "processed": ["wv-d001"],
+        }
 
         with self._patches():
             sync_weave_to_github(

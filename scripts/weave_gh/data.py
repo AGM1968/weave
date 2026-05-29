@@ -125,15 +125,69 @@ def _repo_hash() -> str:
     ).hexdigest()[:8]
 
 
+def _is_codex_runtime() -> bool:
+    """Detect Codex-like sandbox agent environments.
+
+    Copilot and Claude Code agent shells share the same /dev/shm persistence
+    constraint as Codex; treat them as codex-style for hot-zone routing.
+    """
+    return (
+        bool(os.environ.get("CODEX_THREAD_ID"))
+        or os.environ.get("CODEX_CI") == "1"
+        or os.environ.get("COPILOT_AGENT") == "1"
+        or bool(os.environ.get("CLAUDE_CODE_SSE_PORT"))
+    )
+
+
+def _is_container_runtime() -> bool:
+    """Best-effort container detection aligned with bash runtime resolver."""
+    if os.environ.get("CI"):
+        return True
+    if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
+        return True
+    try:
+        cgroup = Path("/proc/1/cgroup")
+        if cgroup.exists():
+            text = cgroup.read_text(encoding="utf-8", errors="ignore")
+            return any(token in text for token in ("docker", "containerd", "podman"))
+    except OSError:
+        return False
+    return False
+
+
+def _runtime_hot_zone_base(uid: int | None) -> str:
+    if _is_codex_runtime():
+        return f"/tmp/weave-codex-{uid}" if uid is not None else "/tmp/weave-codex"
+    if _is_container_runtime():
+        return f"/tmp/weave-{uid}" if uid is not None else "/tmp/weave"
+    if Path("/dev/shm").exists() and os.access("/dev/shm", os.W_OK):
+        return "/dev/shm/weave"
+    return f"/tmp/weave-{uid}" if uid is not None else "/tmp/weave"
+
+
 def _resolve_db_path() -> str:
     """Resolve Weave DB path, checking multiple candidate locations."""
+    rhash = _repo_hash()
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    runtime_base = _runtime_hot_zone_base(uid)
+
     db = os.environ.get("WV_DB", "")
     if db and Path(db).exists():
         return db
+
+    hot_zone = os.environ.get("WV_HOT_ZONE", "")
+    if hot_zone:
+        hot_zone_db = str(Path(hot_zone) / "brain.db")
+        if Path(hot_zone_db).exists():
+            return hot_zone_db
+
     # Try per-repo namespaced hot zone locations
-    rhash = _repo_hash()
     candidates = []
     if rhash:
+        candidates.append(f"{runtime_base}/{rhash}/brain.db")
+        if uid is not None:
+            candidates.append(f"/tmp/weave-codex-{uid}/{rhash}/brain.db")
+            candidates.append(f"/tmp/weave-{uid}/{rhash}/brain.db")
         candidates += [
             f"/dev/shm/weave/{rhash}/brain.db",
             f"/tmp/weave/{rhash}/brain.db",
@@ -145,7 +199,7 @@ def _resolve_db_path() -> str:
             return candidate
     # Default to namespaced path if available
     if rhash:
-        return db or f"/dev/shm/weave/{rhash}/brain.db"
+        return db or f"{runtime_base}/{rhash}/brain.db"
     return db or "/dev/shm/weave/brain.db"
 
 

@@ -662,7 +662,8 @@ _done_read_metadata() {
     echo "$cur_meta"
 }
 
-_FINDING_VIOLATION_TYPES="historical:defect upstream:management-gap upstream:logic-bug upstream:schema-drift repo:hygiene repo:regression test:gap design:flaw"
+# Enum sourced from wv-validate.sh (FINDING_VIOLATION_TYPES) — do not duplicate here.
+_FINDING_VIOLATION_TYPES="$FINDING_VIOLATION_TYPES"
 
 _finding_missing_fields() {
     local meta_json="${1:-{}}"
@@ -1279,7 +1280,7 @@ cmd_done() {
         validate_on_done "$id"
     fi
 
-    echo "closing" > "$WV_HOT_ZONE/.session_phase" 2>/dev/null || true
+    wv_set_phase "closing"
 
     # Advisory: open finding nodes that reference this node as source_node.
     # Emitted on close so the author can triage while context is fresh.
@@ -1630,7 +1631,7 @@ cmd_work() {
     fi
 
     set_primary_node "$id"
-    echo "execute" > "$WV_HOT_ZONE/.session_phase" 2>/dev/null || true
+    wv_set_phase "execute"
 
     # Write allowed_tools to metadata if supplied
     if [ -n "$allowed_tools_raw" ]; then
@@ -1707,6 +1708,27 @@ cmd_work() {
     gh_notify "$id" "work"
 }
 
+# ─── _ready_enrich_impact ────────────────────────────────────────────────────
+# Enriches a JSON array of ready nodes with a per-node "impact" key.
+# Calls `wv impact --json <id>` once per node; failures produce a null stub.
+_ready_enrich_impact() {
+    local nodes_json="$1"
+    local -a ids
+    mapfile -t ids < <(printf '%s' "$nodes_json" | jq -r '.[].id' 2>/dev/null)
+    if [ ${#ids[@]} -eq 0 ]; then
+        echo "$nodes_json"
+        return
+    fi
+    local impact_arr='[]'
+    for nid in "${ids[@]}"; do
+        local imp
+        imp=$("$WV_CLI" impact --json "$nid" 2>/dev/null || echo 'null')
+        impact_arr=$(printf '%s' "$impact_arr" | jq --argjson x "$imp" '. + [$x]' 2>/dev/null || echo "$impact_arr")
+    done
+    printf '%s' "$nodes_json" | jq --argjson impacts "$impact_arr" \
+        '[range(length) as $i | .[$i] + {impact: $impacts[$i]}]' 2>/dev/null || echo "$nodes_json"
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_ready — Show nodes ready to work on
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1718,17 +1740,19 @@ cmd_ready() {
     local subtree_id=""
     local show_findings=false
     local mode_arg=""
+    local with_impact=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --json)      format="json" ;;
-            --json-v2)   format="json-v2" ;;
-            --count)     count_only=true ;;
-            --all)       show_all=true ;;
-            --subtree=*) subtree_id="${1#--subtree=}" ;;
-            --subtree)   shift; subtree_id="${1:-}" ;;
-            --findings)  show_findings=true ;;
-            --mode=*)    mode_arg="${1#--mode=}" ;;
+            --json)        format="json" ;;
+            --json-v2)     format="json-v2" ;;
+            --count)       count_only=true ;;
+            --all)         show_all=true ;;
+            --subtree=*)   subtree_id="${1#--subtree=}" ;;
+            --subtree)     shift; subtree_id="${1:-}" ;;
+            --findings)    show_findings=true ;;
+            --mode=*)      mode_arg="${1#--mode=}" ;;
+            --with-impact) with_impact=true ;;
         esac
         shift
     done
@@ -1827,11 +1851,19 @@ cmd_ready() {
     if [ "$format" = "json-v2" ]; then
         local results
         results=$(db_query_json_v2 "$subtree_cte SELECT n.id, n.text, n.status, n.metadata FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY $_rel_order;")
-        [ -z "$results" ] && echo "[]" || echo "$results"
+        [ -z "$results" ] && results="[]"
+        if [ "$with_impact" = true ]; then
+            results=$(_ready_enrich_impact "$results")
+        fi
+        echo "$results"
     elif [ "$format" = "json" ]; then
         local results
         results=$(db_query_json "$subtree_cte SELECT n.id, n.text, n.status, n.metadata FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY $_rel_order;")
-        [ -z "$results" ] && echo "[]" || echo "$results"
+        [ -z "$results" ] && results="[]"
+        if [ "$with_impact" = true ]; then
+            results=$(_ready_enrich_impact "$results")
+        fi
+        echo "$results"
     else
         db_query "$subtree_cte SELECT n.id, n.text, json_extract(n.metadata, '$.claimed_by'), $_rel_expr AS rel FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY $_rel_order $_mode_limit;" \
         | while IFS='|' read -r id text claimed_by rel; do
@@ -1843,6 +1875,14 @@ cmd_ready() {
                 echo -e "${CYAN}$id${NC}: $text${rel_marker} ${YELLOW}(claimed: $claimed_by)${NC}"
             else
                 echo -e "${CYAN}$id${NC}: $text${rel_marker}"
+            fi
+            if [ "$with_impact" = true ]; then
+                local _imp_json _imp_summary
+                _imp_json=$("$WV_CLI" impact --json "$id" 2>/dev/null || echo '{}')
+                _imp_summary=$(printf '%s' "$_imp_json" | jq -r '.summary // empty' 2>/dev/null)
+                if [ -n "$_imp_summary" ]; then
+                    echo -e "  ${DIM}impact: $_imp_summary${NC}"
+                fi
             fi
         done
 

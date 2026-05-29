@@ -29,6 +29,23 @@ is_container() {
     [ "${_WV_CONTAINER:-no}" = "yes" ]
 }
 
+is_codex_runtime() {
+    # Sandboxed agent shells (Codex/Copilot/Claude Code) do not reliably persist
+    # /dev/shm between tool invocations; route them to the persistent /tmp zone.
+    [ -n "${CODEX_THREAD_ID:-}" ] || [ "${CODEX_CI:-}" = "1" ] \
+        || [ "${COPILOT_AGENT:-}" = "1" ] || [ -n "${CLAUDE_CODE_SSE_PORT:-}" ]
+}
+
+resolve_runtime_label() {
+    if is_codex_runtime; then
+        echo "codex"
+    elif is_container; then
+        echo "container"
+    else
+        echo "native"
+    fi
+}
+
 canonicalize_runtime_path() {
     local path="$1"
     [ -z "$path" ] && return 0
@@ -109,7 +126,9 @@ resolve_hot_zone() {
     uid=$(id -u 2>/dev/null || echo "$UID")
     case "$(uname -s)" in
         Linux*)
-            if is_container; then
+            if is_codex_runtime; then
+                echo "/tmp/weave-codex-${uid}"
+            elif is_container; then
                 echo "wv: container detected, using /tmp (safe default)" >&2
                 echo "/tmp/weave-${uid}"
             elif [ -d "/dev/shm" ] && [ -w "/dev/shm" ] && check_free_space "/dev/shm"; then

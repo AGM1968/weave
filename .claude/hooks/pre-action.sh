@@ -1,282 +1,48 @@
 #!/bin/bash
 # PreToolUse hook: Enforce graph-first before edits (require valid Context Pack)
-# Per proposal (lines 204-208):
-#   Triggers on: edit_file, create_file, wv done
-#   Does NOT trigger on: read-only operations, wv add, wv show
 
 set -e
 
-# Read stdin (JSON payload from Claude Code)
 INPUT=$(cat)
-
-# Extract tool name and input
 TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 TOOL_INPUT=$(echo "$INPUT" | jq -r '.tool_input // empty' 2>/dev/null)
 
-# Guard: block Read calls on large files without a limit (context load policy enforcement)
-if [[ "$TOOL" == "Read" ]]; then
-    FILE_PATH=$(echo "$TOOL_INPUT" | jq -r '.file_path // empty' 2>/dev/null)
-    LIMIT=$(echo "$TOOL_INPUT" | jq -r '.limit // empty' 2>/dev/null)
-    if [[ -n "$FILE_PATH" && -z "$LIMIT" && -f "$FILE_PATH" ]]; then
-        LINE_COUNT=$(wc -l < "$FILE_PATH" 2>/dev/null || echo "0")
-        if [[ "$LINE_COUNT" -gt 500 ]]; then
-            jq -n --arg path "$FILE_PATH" --arg lines "$LINE_COUNT" \
-                '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("File \($path) has \($lines) lines — too large to read whole. Grep for structure first, then read with offset+limit (e.g. limit=200). Context load policy: always grep first on files >500 lines.")}}'
-            exit 0
-        fi
-    fi
-fi
-
-# Block edits to installed copies (should edit source in scripts/ instead)
-# Handles both Claude Code tool names (Edit/Write) and VS Code tool names (create_file, etc.)
-if [[ "$TOOL" =~ ^(Edit|Write|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file)$ ]]; then
-    # VS Code sends camelCase (filePath), Claude Code sends snake_case (file_path)
-    FILE_PATH=$(echo "$TOOL_INPUT" | jq -r '.file_path // .filePath // empty' 2>/dev/null)
-    if [[ "$FILE_PATH" =~ \.local/(bin|lib/weave) ]]; then
-        cat >&2 <<EOF
-ERROR: Editing installed copy at $FILE_PATH
-Edit the SOURCE file instead:
-  ~/.local/bin/wv          → scripts/wv
-  ~/.local/lib/weave/lib/  → scripts/lib/
-  ~/.local/lib/weave/cmd/  → scripts/cmd/
-After editing source, run: ./install.sh
-EOF
-        exit 2
-    fi
-fi
-
-# Check if this is an operation we should enforce
-SHOULD_CHECK=false
-
-# Edit operations — Claude Code names + VS Code names (matchers are ignored in VS Code,
-# so all hooks fire on all tools; this filter is what actually gates enforcement)
-if [[ "$TOOL" =~ ^(Edit|Write|NotebookEdit|mcp__ide__executeCode|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file|edit_notebook_file)$ ]]; then
-    SHOULD_CHECK=true
-fi
-
-# Terminal commands: wv done or wv-close — Claude Code (Bash) + VS Code (run_in_terminal)
-if [[ "$TOOL" == "Bash" || "$TOOL" == "run_in_terminal" ]]; then
-    CMD=$(echo "$TOOL_INPUT" | jq -r '.cmd // .command // empty' 2>/dev/null)
-    if [[ "$CMD" =~ (wv[[:space:]]+done|wv-close|wv[[:space:]]done) ]]; then
-        SHOULD_CHECK=true
-    fi
-    # Bootstrapping commands: always allow even with 0 active nodes.
-    # wv add/work/ready/status/list/show/sync are graph reads or node creation —
-    # they cannot proceed without being allowed first (catch-22 prevention).
-    if [[ "$CMD" =~ ^[[:space:]]*(wv[[:space:]]+(add|work|ready|status|list|show|sync|load|doctor)|wv-init-repo|wv[[:space:]]+--help) ]]; then
-        exit 0
-    fi
-fi
-
-if [ "$SHOULD_CHECK" = "false" ]; then
-    exit 0
-fi
-
-# Find active node (status=active)
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+source "$HOOK_DIR/../lib/wv-validate.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-validate.sh" 2>/dev/null || true
+source "$HOOK_DIR/../lib/wv-config.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-config.sh" 2>/dev/null || true
+source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null || true
 source "$WV_PROJECT_DIR/scripts/lib/wv-resolve-runtime.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-runtime.sh" || exit 0
+_hc_refresh
 
-# Only enforce in projects explicitly initialised with wv-init-repo (.weave/ present)
-# This prevents the hook from blocking edits in personal notes, /tmp, plain git repos, etc.
-if [ -z "${WV_PROJECT_DIR:-}" ] || [ ! -d "${WV_PROJECT_DIR}/.weave" ]; then
+_hc_check_read_size "$TOOL" "$TOOL_INPUT" || exit 0
+_hc_check_installed_path "$TOOL" "$TOOL_INPUT" || exit $?
+
+_hc_classify_tool "$TOOL" "$TOOL_INPUT"
+[ "${_HC_BYPASS_CMD:-false}" = true ] && exit 0
+[ "${_HC_SHOULD_CHECK:-false}" = false ] && exit 0
+
+if [ -z "${WV_PROJECT_DIR:-}" ] || [ ! -d "${WV_PROJECT_DIR}/.weave" ]; then exit 0; fi
+if [ ! -x "$WV" ]; then exit 0; fi
+
+_hc_db_preflight || exit 0
+_hc_init_hygiene_tally "$TOOL"
+
+_PA_PHASE_RC=0
+_hc_check_phase "${_HC_NEW_TOTAL:-}" "${_HC_WITH_ACTIVE:-}" "${_HC_TALLY_FILE:-}" || _PA_PHASE_RC=$?
+if [ "$_PA_PHASE_RC" -ne 0 ]; then
+    if [ "$_PA_PHASE_RC" -eq 2 ]; then exit 2; fi
     exit 0
 fi
 
-if [ ! -x "$WV" ]; then
-    # wv not available, allow action
-    exit 0
-fi
+_hc_check_active_node "${_HC_NEW_TOTAL:-}" "${_HC_WITH_ACTIVE:-}" "${_HC_TALLY_FILE:-}" || exit $?
+_hc_check_stale_node || exit $?
+_hc_resolve_primary_node || exit 0
 
-# DB health pre-flight: verify hot zone DB exists before attempting wv queries
-# Reuse the canonical runtime resolver shared with the CLI.
-_PA_HOT_ZONE=$(resolve_repo_hot_zone "" "$WV_PROJECT_DIR")
-_PA_DB=$(resolve_db "$_PA_HOT_ZONE")
-if [ ! -f "$_PA_DB" ]; then
-    # DB not loaded — allow action (session start hook will load it on next run)
-    exit 0
-fi
+_hc_check_context_pack "$_HC_NODE_ID" || exit $?
+if [ "${_HC_CONTEXT_STAMP_HIT:-false}" = true ]; then exit 0; fi
+_hc_check_contradictions "$_HC_NODE_ID" || exit $?
+_hc_check_blockers "$_HC_NODE_ID" || exit $?
 
-# Hygiene tally (C1): track Edit/Write attempts in this repo and how many had
-# an active node at the gate. Read by `wv session-summary` to compute score.
-# Only count true Edit-class operations (not the wv done Bash variant).
-if [[ "$TOOL" =~ ^(Edit|Write|NotebookEdit|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file|edit_notebook_file)$ ]]; then
-    _PA_EDITS_FILE="${_PA_HOT_ZONE}/session-edits.json"
-    _PA_PRIOR=$(cat "$_PA_EDITS_FILE" 2>/dev/null || echo '{}')
-    _PA_TOTAL=$(echo "$_PA_PRIOR" | jq -r '.total // 0' 2>/dev/null || echo 0)
-    _PA_WITH=$(echo "$_PA_PRIOR" | jq -r '.with_active // 0' 2>/dev/null || echo 0)
-    _PA_NEW_TOTAL=$((_PA_TOTAL + 1))
-    # Compute with_active increment after the active check below; persist totals now.
-fi
-
-# Phase-aware enforcement: skip active-node check in discover/closing phases.
-# discover = session just started, agent is exploring before claiming work.
-# closing  = node just closed via wv done; allow the follow-up commit.
-# execute  = node claimed, substantive work in progress (enforce active node).
-# No sentinel = fall back to execute behaviour (safe default).
-_PA_PHASE=$(cat "${_PA_HOT_ZONE}/.session_phase" 2>/dev/null || echo "execute")
-
-if [ "$_PA_PHASE" = "discover" ] || [ "$_PA_PHASE" = "closing" ]; then
-    # Still record the untracked edit in hygiene tally (count it, but with_active stays 0).
-    if [ -n "${_PA_NEW_TOTAL:-}" ]; then
-        jq -n \
-            --argjson total "$_PA_NEW_TOTAL" \
-            --argjson with_active "$_PA_WITH" \
-            '{total:$total, with_active:$with_active}' \
-            > "$_PA_EDITS_FILE" 2>/dev/null || true
-    fi
-    # closing is a one-edit window: reset to discover so subsequent edits
-    # can't silently accumulate without a node claim.
-    if [ "$_PA_PHASE" = "closing" ]; then
-        echo "discover" > "${_PA_HOT_ZONE}/.session_phase" 2>/dev/null || true
-    fi
-    exit 0
-fi
-
-# Get active nodes (execute phase only — saves subprocess in discover/closing)
-ACTIVE_NODES=$("$WV" list --status=active --json 2>/dev/null || echo "[]")
-ACTIVE_COUNT=$(echo "$ACTIVE_NODES" | jq 'length' 2>/dev/null || echo "0")
-
-# Persist hygiene tally now that ACTIVE_COUNT is known.
-if [ -n "${_PA_NEW_TOTAL:-}" ]; then
-    _PA_NEW_WITH="$_PA_WITH"
-    [ "$ACTIVE_COUNT" != "0" ] && _PA_NEW_WITH=$((_PA_WITH + 1))
-    jq -n \
-        --argjson total "$_PA_NEW_TOTAL" \
-        --argjson with_active "$_PA_NEW_WITH" \
-        '{total:$total, with_active:$with_active}' \
-        > "$_PA_EDITS_FILE" 2>/dev/null || true
-fi
-
-if [ "$ACTIVE_COUNT" = "0" ]; then
-    # No active nodes, suggest using /weave to start work
-    cat >&2 <<EOF
-⚠️  No active Weave node found (phase: execute).
-
-Use \`/weave\` to select work before editing files:
-- \`/weave\` — Show ready work
-- \`/weave wv-xxxxxx\` — Claim specific node
-- \`/weave "description"\` — Create new node
-
-Useful compound helpers:
-- \`wv bootstrap --json\` — Session snapshot (status + context + ready + learnings)
-- \`wv quick "description"\` — Track trivial one-step work
-
-This ensures graph-first workflow with Context Pack generation.
-EOF
-    exit 2
-fi
-
-# Stale-node check: active node must have been claimed in the current session.
-# Prevents silently inheriting a node from a prior session without explicit re-claim.
-SESSION_EPOCH_FILE="${_PA_HOT_ZONE}/.session_epoch"
-if [ -f "$SESSION_EPOCH_FILE" ]; then
-    SESSION_EPOCH=$(cat "$SESSION_EPOCH_FILE" 2>/dev/null || echo "0")
-    NODE_UPDATED=$(echo "$ACTIVE_NODES" | jq -r '.[0].updated_at // empty' 2>/dev/null || echo "")
-    if [ -n "$NODE_UPDATED" ] && [ -n "$SESSION_EPOCH" ] && [ "$SESSION_EPOCH" != "0" ]; then
-        NODE_EPOCH=$(date -d "$NODE_UPDATED" +%s 2>/dev/null || echo "0")
-        STALE_ID=$(echo "$ACTIVE_NODES" | jq -r '.[0].id' 2>/dev/null || echo "?")
-        STALE_TEXT=$(echo "$ACTIVE_NODES" | jq -r '.[0].text // "[unknown]"' 2>/dev/null || echo "[unknown]")
-        if [ "$NODE_EPOCH" -gt 0 ] && [ "$NODE_EPOCH" -lt "$SESSION_EPOCH" ]; then
-            cat >&2 <<EOF
-⚠️  Stale active node not claimed this session: $STALE_ID
-"$STALE_TEXT"
-
-This node was active before the current session started. Explicitly re-claim
-it before editing to confirm this is the work you intend to do:
-  wv work $STALE_ID
-
-Or create a new node if this is different work:
-  wv add "<description>" --status=active
-
-For a fresh session snapshot before picking work:
-    wv bootstrap --json
-EOF
-            exit 2
-        fi
-    fi
-fi
-
-if [ "$ACTIVE_COUNT" -gt "1" ]; then
-    # Multiple active nodes — use primary if set, otherwise warn
-    PRIMARY_FILE="${_PA_HOT_ZONE}/primary"
-    if [ -f "$PRIMARY_FILE" ]; then
-        NODE_ID=$(cat "$PRIMARY_FILE" 2>/dev/null)
-    fi
-fi
-
-# Get the active node ID (fall back to first active if no primary)
-if [ -z "${NODE_ID:-}" ]; then
-    NODE_ID=$(echo "$ACTIVE_NODES" | jq -r '.[0].id' 2>/dev/null)
-fi
-
-if [ -z "$NODE_ID" ] || [ "$NODE_ID" = "null" ]; then
-    exit 0
-fi
-
-# Check if Context Pack has been generated (cache exists or can be generated)
-# Re-use hot zone computed in DB pre-flight above
-CACHE_DIR="${_PA_HOT_ZONE}/context_cache"
-CACHE_FILE="$CACHE_DIR/${NODE_ID}.json"
-
-# First-call-only: skip context check on repeat calls within a session (D2 Option C)
-# The stamp is cleared by invalidate_context_cache() when edges change (block/link/done/resolve)
-CHECKED_STAMP="${_PA_HOT_ZONE}/.context_checked_${NODE_ID}"
-if [ -f "$CHECKED_STAMP" ]; then
-    exit 0
-fi
-
-# Try to generate/retrieve Context Pack
-CONTEXT_PACK=$("$WV" context "$NODE_ID" --json 2>/dev/null || echo "")
-
-if [ -z "$CONTEXT_PACK" ]; then
-    # Soft warning (exit 1) — wv context may fail due to DB contention, missing
-    # wv binary, or transient errors. Agent is informed but not hard-blocked.
-    cat >&2 <<EOF
-⚠️  Context Pack generation failed for node $NODE_ID.
-Check: wv show $NODE_ID / wv status
-EOF
-    exit 1
-fi
-
-# Check for contradictions
-CONTRADICTIONS=$(echo "$CONTEXT_PACK" | jq '.contradictions | length' 2>/dev/null || echo "0")
-if [ "$CONTRADICTIONS" -gt "0" ]; then
-    CONTRADICTION_LIST=$(echo "$CONTEXT_PACK" | jq -r '.contradictions[] | "  - \(.id): \(.text)"' 2>/dev/null || echo "")
-    cat >&2 <<EOF
-🛑 HARD STOP: Contradictions detected for node $NODE_ID
-
-The following nodes contradict your current work:
-$CONTRADICTION_LIST
-
-Resolve contradictions before proceeding:
-  \`wv resolve $NODE_ID <other-id> --winner=$NODE_ID\` (if this approach wins)
-  \`wv resolve $NODE_ID <other-id> --merge\` (combine both approaches)
-  \`wv resolve $NODE_ID <other-id> --defer\` (defer decision, mark as related)
-
-Cannot proceed to EXECUTE phase until contradictions are resolved.
-EOF
-    exit 2
-fi
-
-# Check for blockers (only non-done blockers count)
-BLOCKERS=$(echo "$CONTEXT_PACK" | jq '[.blockers[] | select(.status != "done")] | length' 2>/dev/null || echo "0")
-if [ "$BLOCKERS" -gt "0" ]; then
-    BLOCKER_LIST=$(echo "$CONTEXT_PACK" | jq -r '.blockers[] | select(.status != "done") | "  - \(.id): \(.text)"' 2>/dev/null || echo "")
-    cat >&2 <<EOF
-🛑 BLOCKED: Cannot proceed with node $NODE_ID
-
-This node is blocked by:
-$BLOCKER_LIST
-
-Complete the blocking work first, then retry.
-Or unblock with: \`wv update $NODE_ID --status=todo\` (removes blocked status)
-EOF
-    exit 2
-fi
-
-# All checks passed - Context Pack is valid, no contradictions, no blockers
-# Stamp this node as checked for the session (first-call-only optimization)
-touch "$CHECKED_STAMP" 2>/dev/null || true
-# Allow the edit to proceed
+touch "${_HC_HOT_ZONE}/.context_checked_${_HC_NODE_ID}" 2>/dev/null || true
 exit 0

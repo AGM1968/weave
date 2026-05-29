@@ -6,6 +6,8 @@ set -e
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null || true
+_hc_refresh
 
 # Read input for reason
 INPUT=$(cat)
@@ -37,8 +39,7 @@ if [ -x "$WV" ]; then
 fi
 
 # Derive hot zone path (shared across checkpoint stamp + sentinel cleanup)
-_SE_REPO_HASH=$(echo "$WV_PROJECT_DIR" | md5sum | cut -c1-8)
-_SE_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_SE_REPO_HASH}}"
+_SE_HOT_ZONE="${_HC_HOT_ZONE}"
 
 # Auto-commit .weave/ state to break drift cycle
 # (prevents stop-check blocking on dirty .weave/ from sync/prune above)

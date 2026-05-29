@@ -18,6 +18,7 @@
  *   weave_unarchive - Restore a pruned node from .weave/archive/ to the live graph
  *   weave_status   - Compact status summary
  *   weave_ready    - List unblocked nodes ready to claim
+ *   weave_impact   - Blast-radius analysis from one or more seed nodes
  *   weave_query    - Flexible predicate query over nodes
  *   weave_health   - Graph health check
  *   weave_quick    - Quick-add and start working
@@ -91,6 +92,7 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_query",
     "weave_status",
     "weave_ready",
+    "weave_impact",
     "weave_health",
     "weave_preflight",
     "weave_bootstrap",
@@ -580,8 +582,53 @@ const TOOLS: Tool[] = [
           enum: [...READ_MODES],
           description: "Optional output mode override",
         },
+        with_impact: {
+          type: "boolean",
+          description: "Attach blast-radius impact summary to each ready node",
+        },
       },
       required: [],
+    },
+  },
+  {
+    name: "weave_impact",
+    description:
+      "Run blast-radius analysis from one or more seed nodes. Wraps 'wv impact --json' and returns impacted nodes, unblocked nodes, edges, and optional quality/risk detail.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Seed node IDs (e.g. ['wv-a1b2', 'wv-c3d4'])",
+        },
+        depth: {
+          type: "number",
+          description: "Traversal depth (default: 3)",
+        },
+        direction: {
+          type: "string",
+          enum: ["fwd", "rev", "both"],
+          description: "Traversal direction (default: both)",
+        },
+        full: {
+          type: "boolean",
+          description: "Include extended edge set (resolves/references/supersedes/obsoletes)",
+        },
+        include_done: {
+          type: "boolean",
+          description: "Include done nodes in impacted output",
+        },
+        all: {
+          type: "boolean",
+          description: "Remove node cap",
+        },
+        quality: {
+          type: "boolean",
+          description: "Attach code_quality payload per impacted node",
+        },
+      },
+      required: ["ids"],
     },
   },
   {
@@ -1499,11 +1546,36 @@ function handleTool(
       const all = args.all as boolean | undefined;
       const count = args.count as boolean | undefined;
       const mode = args.mode as ReadMode | undefined;
+      const withImpact = args.with_impact as boolean | undefined;
       const cmd = ["ready", "--json"];
       if (subtree) cmd.push(`--subtree=${subtree}`);
       if (all) cmd.push("--all");
       if (count) cmd.push("--count");
+      if (withImpact) cmd.push("--with-impact");
       result = wvRead(cmd, WV_TIMEOUT, mode);
+      break;
+    }
+
+    case "weave_impact": {
+      const ids = (args.ids as string[] | undefined) ?? [];
+      if (ids.length === 0) {
+        throw new Error("weave_impact requires at least one seed id in 'ids'");
+      }
+      const depth = args.depth as number | undefined;
+      const direction = args.direction as string | undefined;
+      const full = args.full as boolean | undefined;
+      const includeDone = args.include_done as boolean | undefined;
+      const all = args.all as boolean | undefined;
+      const quality = args.quality as boolean | undefined;
+
+      const cmd = ["impact", ...ids, "--json"];
+      if (depth !== undefined) cmd.push(`--depth=${depth}`);
+      if (direction) cmd.push(`--direction=${direction}`);
+      if (full) cmd.push("--full");
+      if (includeDone) cmd.push("--include-done");
+      if (all) cmd.push("--all");
+      if (quality) cmd.push("--quality");
+      result = wv(cmd);
       break;
     }
 
@@ -2112,7 +2184,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.51.8",
+      version: "1.52.0",
     },
     {
       capabilities: {

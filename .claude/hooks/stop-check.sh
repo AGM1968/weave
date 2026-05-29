@@ -25,14 +25,15 @@ fi
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null || true
+_hc_refresh
 cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 
 # Cooldown lock: after emitting a block, suppress re-blocking for 120s.
 # The dirty-state checks still run; only the hard block (exit 1) is suppressed.
 # This lets the agent make progress on sync commands without being blocked on
 # every response, while still enforcing a clean state after cooldown expires.
-_SC_REPO_HASH=$(echo "$WV_PROJECT_DIR" | md5sum | cut -c1-8)
-_SC_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_SC_REPO_HASH}}"
+_SC_HOT_ZONE="${_HC_HOT_ZONE}"
 _SC_LOCK="${_SC_HOT_ZONE}/.stop_check_lock"
 _SC_IN_COOLDOWN=false
 if [ -f "$_SC_LOCK" ]; then

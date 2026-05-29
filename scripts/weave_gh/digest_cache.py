@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -29,9 +30,10 @@ log = logging.getLogger("weave-sync")
 
 # Bump when the digest format or the set of inputs changes.
 # Invalidates every existing cache entry on next sync.
-DIGEST_SCHEMA = 1
+DIGEST_SCHEMA = 2
 
 _CACHE_FILENAME = "sync-digest-cache.json"
+_WEAVE_HASH_RE = re.compile(r"<!--\s*WEAVE:BEGIN\s+hash=([a-f0-9]+)\s*-->")
 
 
 def _repo_root() -> Path | None:
@@ -149,13 +151,23 @@ def is_cache_hit(
     gh_issue: int,
     node_id: str,
     digest: str,
+    *,
+    issue_body: str | None = None,
 ) -> bool:
     """Return True iff cache has a matching entry for this issue+node+digest."""
     entries = cache.get("entries", {})
     entry = entries.get(str(gh_issue))
     if not isinstance(entry, dict):
         return False
-    return entry.get("node_id") == node_id and entry.get("digest") == digest
+    if entry.get("node_id") != node_id or entry.get("digest") != digest:
+        return False
+
+    cached_body_hash = entry.get("body_hash")
+    if not isinstance(cached_body_hash, str) or not cached_body_hash:
+        return False
+    if issue_body is None:
+        return True
+    return extract_weave_hash(issue_body) == cached_body_hash
 
 
 def update_cache(
@@ -163,7 +175,20 @@ def update_cache(
     gh_issue: int,
     node_id: str,
     digest: str,
+    *,
+    body_hash: str | None = None,
 ) -> None:
     """Record a successful sync entry in the in-memory cache."""
     entries = cache.setdefault("entries", {})
-    entries[str(gh_issue)] = {"node_id": node_id, "digest": digest}
+    entry = {"node_id": node_id, "digest": digest}
+    if body_hash:
+        entry["body_hash"] = body_hash
+    entries[str(gh_issue)] = entry
+
+
+def extract_weave_hash(issue_body: str) -> str | None:
+    """Extract the rendered WEAVE block hash from an issue body."""
+    match = _WEAVE_HASH_RE.search(issue_body)
+    if not match:
+        return None
+    return match.group(1)

@@ -45,7 +45,18 @@ _WV_ENV_OVERRIDE_HOT_ZONE=$(resolve_env_override_hot_zone)
 if [ -n "$_WV_ENV_OVERRIDE_HOT_ZONE" ] && ! hot_zone_matches_repo "$_WV_ENV_OVERRIDE_HOT_ZONE" "$REPO_ROOT"; then
     _WV_ENV_OVERRIDE_OWNER=$(read_hot_zone_owner "$_WV_ENV_OVERRIDE_HOT_ZONE")
     [ -z "$_WV_ENV_OVERRIDE_OWNER" ] && [ -n "${WV_PROJECT_DIR:-}" ] && _WV_ENV_OVERRIDE_OWNER="$WV_PROJECT_DIR"
-    echo "wv: ignoring leaked WV_HOT_ZONE/WV_DB override from ${_WV_ENV_OVERRIDE_OWNER:-another repo} (current repo: $REPO_ROOT)" >&2
+
+    # Shell-exported override leaks can persist across commands; warn once per
+    # shell session for the same leak/repo tuple to avoid noisy repeated output.
+    _WV_WARN_ONCE_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+    [ -d "$_WV_WARN_ONCE_DIR" ] && [ -w "$_WV_WARN_ONCE_DIR" ] || _WV_WARN_ONCE_DIR="/tmp"
+    _WV_WARN_ONCE_KEY=$(printf '%s|%s|%s|%s' "$REPO_ROOT" "$_WV_ENV_OVERRIDE_HOT_ZONE" "${_WV_ENV_OVERRIDE_OWNER:-unknown}" "${PPID:-0}" | md5sum | cut -c1-16)
+    _WV_WARN_ONCE_FILE="${_WV_WARN_ONCE_DIR}/wv-leaked-override-${_WV_WARN_ONCE_KEY}.warned"
+    if [ ! -f "$_WV_WARN_ONCE_FILE" ]; then
+        echo "wv: ignoring leaked WV_HOT_ZONE/WV_DB override from ${_WV_ENV_OVERRIDE_OWNER:-another repo} (current repo: $REPO_ROOT)" >&2
+        : > "$_WV_WARN_ONCE_FILE" 2>/dev/null || true
+    fi
+
     unset WV_HOT_ZONE WV_DB WV_PRIMARY_FILE
 fi
 
@@ -165,4 +176,23 @@ validate_hot_size() {
         WV_HOT_SIZE=$(( avail_mb * 80 / 100 ))
         echo "wv: hot zone limited to ${WV_HOT_SIZE}MB (80% of ${avail_mb}MB available)" >&2
     fi
+}
+
+# wv_set_phase — write .session_phase atomically with enum validation.
+# Usage: wv_set_phase <phase> [<hot-zone-dir>]
+# Valid values sourced from PHASE_VALUES in wv-validate.sh.
+# Falls back to no-op if hot zone unavailable.
+wv_set_phase() {
+    local phase="$1"
+    local hot_zone="${2:-${WV_HOT_ZONE:-}}"
+    local valid=false
+    local p
+    for p in ${PHASE_VALUES:-discover execute closing}; do
+        [ "$phase" = "$p" ] && valid=true && break
+    done
+    if [ "$valid" = false ]; then
+        echo "wv_set_phase: invalid phase '$phase' (valid: ${PHASE_VALUES:-discover execute closing})" >&2
+        return 1
+    fi
+    [ -n "$hot_zone" ] && printf '%s' "$phase" > "${hot_zone}/.session_phase" 2>/dev/null || true
 }

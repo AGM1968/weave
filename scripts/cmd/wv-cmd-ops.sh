@@ -353,6 +353,7 @@ cmd_digest() {
     unaddressed_pitfalls=$(db_query "
         SELECT COUNT(*) FROM nodes n
         WHERE json_extract(n.metadata, '\$.pitfall') IS NOT NULL
+        AND n.status != 'done'
         AND n.id NOT IN (
             SELECT e.target FROM edges e
             WHERE e.type IN ('addresses', 'implements', 'supersedes')
@@ -1954,6 +1955,55 @@ _doctor_check_git_hook() {
     fi
 }
 
+# _doctor_check_hot_zone_orphans — warn about hot-zone dirs with no matching repo owner.
+# Args: hot_zone path
+_doctor_check_hot_zone_orphans() {
+    local hot_zone="$1"
+    local hz_parent; hz_parent=$(dirname "$hot_zone")
+    [ -d "$hz_parent" ] || return 0
+    local orphan_count=0 d owner
+    for d in "$hz_parent"/*/; do
+        [ -f "${d}brain.db" ] || continue
+        owner=$(cat "${d}.repo_root" 2>/dev/null || echo "")
+        if [ -n "$owner" ] && [ ! -d "$owner" ]; then
+            orphan_count=$((orphan_count + 1))
+        elif [ -z "$owner" ]; then
+            [ "${d%/}" != "$hot_zone" ] && orphan_count=$((orphan_count + 1))
+        fi
+    done
+    if [ "$orphan_count" -gt 0 ]; then
+        _doctor_record "orphan hot-zones" "warn" \
+            "$orphan_count unmatched dir(s) under $hz_parent — run: wv hotzone gc"
+    fi
+}
+
+# _doctor_check_install_drift — compare source scripts/ tree with installed ~/.local/lib/weave/.
+_doctor_check_install_drift() {
+    local source_path_file="$HOME/.config/weave/source-path"
+    [ -f "$source_path_file" ] || return 0
+    local src_root; src_root=$(cat "$source_path_file" 2>/dev/null || echo "")
+    [ -n "$src_root" ] && [ -d "$src_root/scripts/cmd" ] || return 0
+    local lib_dir="$HOME/.local/lib/weave"
+    local drifted_count=0 src_file rel installed_file
+    for src_file in "$src_root/scripts/cmd/"*.sh "$src_root/scripts/lib/"*.sh "$src_root/scripts/wv"; do
+        [ -f "$src_file" ] || continue
+        rel="${src_file#"$src_root/scripts/"}"
+        installed_file="$lib_dir/$rel"
+        [ "$rel" = "wv" ] && installed_file="$HOME/.local/bin/wv"
+        if [ ! -f "$installed_file" ]; then
+            drifted_count=$((drifted_count + 1))
+        elif [ "$(md5sum "$src_file" 2>/dev/null | awk '{print $1}')" != \
+              "$(md5sum "$installed_file" 2>/dev/null | awk '{print $1}')" ]; then
+            drifted_count=$((drifted_count + 1))
+        fi
+    done
+    if [ "$drifted_count" -eq 0 ]; then
+        _doctor_record "install drift" "pass" "source and installed lib match"
+    else
+        _doctor_record "install drift" "warn" "$drifted_count file(s) differ — run: wv self-update"
+    fi
+}
+
 cmd_doctor() {
     _dr_format="text"
     local _dr_repair=false
@@ -2021,8 +2071,10 @@ cmd_doctor() {
     # 6b. ast-grep present (optional — enables structural_scan)
     if command -v ast-grep >/dev/null 2>&1; then
         local ag_ver
+        local ag_path
+        ag_path=$(command -v ast-grep)
         ag_ver=$(ast-grep --version 2>/dev/null | awk '{print $NF}')
-        _doctor_record "structural_scan" "pass" "enabled (ast-grep $ag_ver)"
+        _doctor_record "structural_scan" "pass" "enabled (ast-grep $ag_ver at $ag_path)"
     else
         _doctor_record "structural_scan" "warn" "disabled (ast-grep not found — run ./install.sh)"
     fi
@@ -2032,6 +2084,21 @@ cmd_doctor() {
     if [ -z "$hot_zone" ]; then
         hot_zone=$(resolve_hot_zone 2>/dev/null)
     fi
+    local runtime_label
+    runtime_label=$(resolve_runtime_label 2>/dev/null || echo "native")
+    case "$runtime_label" in
+        codex)
+            _doctor_record "runtime" "pass" \
+                "sandbox-agent — using /tmp hot zone because /dev/shm may not persist between tool calls"
+            ;;
+        container)
+            _doctor_record "runtime" "pass" \
+                "container — using /tmp hot zone by default"
+            ;;
+        *)
+            _doctor_record "runtime" "pass" "native"
+            ;;
+    esac
     if [ -d "$hot_zone" ]; then
         # 8. Hot zone space
         local avail_kb
@@ -2043,29 +2110,26 @@ cmd_doctor() {
             _doctor_record "hot zone" "warn" "$hot_zone (${avail_mb}MB free — low)"
         fi
         # 8b. Orphan hot-zone count (dirs with no matching .repo_root owner)
-        local hz_parent
-        hz_parent=$(dirname "$hot_zone")
-        if [ -d "$hz_parent" ]; then
-            local orphan_count=0
-            local d
-            for d in "$hz_parent"/*/; do
-                [ -f "${d}brain.db" ] || continue
-                local owner=""
-                owner=$(cat "${d}.repo_root" 2>/dev/null || echo "")
-                if [ -n "$owner" ] && [ ! -d "$owner" ]; then
-                    orphan_count=$((orphan_count + 1))
-                elif [ -z "$owner" ]; then
-                    # No owner file — ownerless dirs from test fixtures
-                    [ "${d%/}" != "$hot_zone" ] && orphan_count=$((orphan_count + 1))
-                fi
-            done
-            if [ "$orphan_count" -gt 0 ]; then
-                _doctor_record "orphan hot-zones" "warn" \
-                    "$orphan_count unmatched dir(s) under $hz_parent — run: wv hotzone gc"
-            fi
-        fi
+        _doctor_check_hot_zone_orphans "$hot_zone"
     else
         _doctor_record "hot zone" "fail" "not found: $hot_zone"
+    fi
+
+    # 8c. Session phase file contains a known value
+    local _phase_file="${hot_zone}/.session_phase"
+    if [ -f "$_phase_file" ]; then
+        local _phase_val
+        _phase_val=$(cat "$_phase_file" 2>/dev/null | tr -d '[:space:]')
+        local _phase_valid=false
+        local _pv
+        for _pv in ${PHASE_VALUES:-discover execute closing}; do
+            [ "$_phase_val" = "$_pv" ] && _phase_valid=true && break
+        done
+        if [ "$_phase_valid" = true ]; then
+            _doctor_record "session phase" "pass" "$_phase_val"
+        else
+            _doctor_record "session phase" "warn" "unknown value '$_phase_val' in .session_phase (expected: ${PHASE_VALUES:-discover execute closing})"
+        fi
     fi
 
     # 9-10. Database accessible + integrity
@@ -2114,9 +2178,40 @@ cmd_doctor() {
 
     # 11-12. Module checks
     _doctor_check_modules "lib modules" "$WV_LIB_DIR/lib" \
-        "wv-config.sh wv-db.sh wv-validate.sh wv-cache.sh wv-journal.sh wv-gh.sh wv-resolve-project.sh"
+        "wv-config.sh wv-db.sh wv-validate.sh wv-cache.sh wv-journal.sh wv-gh.sh wv-hook-common.sh wv-resolve-project.sh"
     _doctor_check_modules "cmd modules" "$WV_LIB_DIR/cmd" \
         "wv-cmd-core.sh wv-cmd-graph.sh wv-cmd-data.sh wv-cmd-ops.sh wv-cmd-quality.sh"
+
+    # 12b. Hook-common wiring check (Sprint 1 pattern crystallization)
+    local _doctor_hooks_total=0
+    local _doctor_hooks_ok=0
+    local _doctor_hooks_missing=""
+    local _doctor_project_root
+    _doctor_project_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    if [ -n "$_doctor_project_root" ] && [ -d "$_doctor_project_root/.claude/hooks" ]; then
+        local _doctor_hook_rel _doctor_hook_abs
+        for _doctor_hook_rel in \
+            ".claude/hooks/pre-action.sh" \
+            ".claude/hooks/session-start-context.sh" \
+            ".claude/hooks/session-end-sync.sh" \
+            ".claude/hooks/stop-check.sh" \
+            ".claude/hooks/pre-compact-context.sh" \
+            ".claude/hooks/wv-touched-files.sh" \
+            ".claude/hooks/context-guard.sh"; do
+            _doctor_hooks_total=$((_doctor_hooks_total + 1))
+            _doctor_hook_abs="$_doctor_project_root/$_doctor_hook_rel"
+            if [ -f "$_doctor_hook_abs" ] && grep -q "wv-hook-common" "$_doctor_hook_abs" 2>/dev/null; then
+                _doctor_hooks_ok=$((_doctor_hooks_ok + 1))
+            else
+                _doctor_hooks_missing="${_doctor_hooks_missing:+$_doctor_hooks_missing, }$_doctor_hook_rel"
+            fi
+        done
+        if [ "$_doctor_hooks_ok" -eq "$_doctor_hooks_total" ]; then
+            _doctor_record "hook-common wiring" "pass" "$_doctor_hooks_ok/$_doctor_hooks_total hooks source wv-hook-common.sh"
+        else
+            _doctor_record "hook-common wiring" "warn" "$_doctor_hooks_ok/$_doctor_hooks_total hooks wired (missing: $_doctor_hooks_missing)"
+        fi
+    fi
 
     # 13. .weave dir
     if [ -d "${WEAVE_DIR:-}" ]; then
@@ -2224,6 +2319,12 @@ cmd_doctor() {
             "$git_root/.git/hooks/prepare-commit-msg" \
             "Weave: append Weave-ID trailers" \
             "install -m 755 scripts/hooks/prepare-commit-msg-weave.sh .git/hooks/prepare-commit-msg"
+        _doctor_check_git_hook \
+            "post-commit hook" \
+            "$git_root/scripts/hooks/post-commit-weave.sh" \
+            "$git_root/.git/hooks/post-commit" \
+            "Weave post-commit" \
+            "install -m 755 scripts/hooks/post-commit-weave.sh .git/hooks/post-commit"
     fi
 
     # 18. Ghost settings: check for chat.hooks.enabled in .vscode/settings.json
@@ -2256,31 +2357,7 @@ cmd_doctor() {
     fi
 
     # 20. Installed lib vs source drift (only when installed from a local git clone)
-    local _source_path_file="$HOME/.config/weave/source-path"
-    if [ -f "$_source_path_file" ]; then
-        local _src_root; _src_root=$(cat "$_source_path_file" 2>/dev/null || echo "")
-        if [ -n "$_src_root" ] && [ -d "$_src_root/scripts/cmd" ]; then
-            local _lib_dir="$HOME/.local/lib/weave"
-            local _drifted_lib=0
-            for src_file in "$_src_root/scripts/cmd/"*.sh "$_src_root/scripts/lib/"*.sh "$_src_root/scripts/wv"; do
-                [ -f "$src_file" ] || continue
-                local rel; rel="${src_file#"$_src_root/scripts/"}"
-                local installed_file; installed_file="$_lib_dir/$rel"
-                # wv main entry point is installed to bin/, not lib/
-                [ "$rel" = "wv" ] && installed_file="$HOME/.local/bin/wv"
-                if [ ! -f "$installed_file" ]; then
-                    _drifted_lib=$((_drifted_lib + 1))
-                elif [ "$(md5sum "$src_file" 2>/dev/null | awk '{print $1}')" != "$(md5sum "$installed_file" 2>/dev/null | awk '{print $1}')" ]; then
-                    _drifted_lib=$((_drifted_lib + 1))
-                fi
-            done
-            if [ "$_drifted_lib" -eq 0 ]; then
-                _doctor_record "install drift" "pass" "source and installed lib match"
-            else
-                _doctor_record "install drift" "warn" "$_drifted_lib file(s) differ — run: wv self-update"
-            fi
-        fi
-    fi
+    _doctor_check_install_drift
 
     # 21. Active wv provenance vs recommended repo-local wrapper
     local _dr_repo_wv _dr_invoked_wv _dr_provenance _dr_canonical_wv
@@ -3637,6 +3714,273 @@ cmd_audit_pitfalls() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# cmd_pattern_audit — CI regression net for control-plane patterns
+# Checks:
+#   1. Every dispatch entry is in cache read, write, or exempt list.
+#   2. Domain enum strings have exactly one definition (no silent drift).
+#   3. No raw echo writes to .session_phase outside wv_set_phase.
+#   4. Required Claude hooks source wv-hook-common.sh.
+# See docs/PROPOSAL-wv-pattern-crystallization.md for context.
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_pattern_audit() {
+    local format="text"
+    local strict=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json)   format="json" ;;
+            --strict) strict=1 ;;
+            --help|-h)
+                echo "Usage: wv pattern-audit [--json] [--strict]"
+                echo ""
+                echo "  --json    machine-readable output"
+                echo "  --strict  exit 1 if any issues found (for CI use)"
+                return 0 ;;
+            *) echo -e "${RED}Unknown option: $1${NC}" >&2; return 1 ;;
+        esac
+        shift
+    done
+
+    local issues=0
+    local findings_json="[]"
+
+    # ── Check 1: cache write-list completeness ──────────────────────────────
+    # Every command in the dispatch table must be in one of:
+    #   read (_wv_run_cache_is_read_cmd)
+    #   write (_wv_run_cache_is_write_cmd)
+    #   exempt (_wv_run_cache_is_exempt_cmd)
+    # Unclassified commands are a latent cache-invalidation bug.
+
+    local wv_bin
+    wv_bin="${WV:-$(command -v wv 2>/dev/null || echo "")}"
+    local wv_script
+    wv_script=$(readlink -f "$wv_bin" 2>/dev/null || echo "$wv_bin")
+
+    local dispatch_cmds unclassified_cmds=""
+    if [ -f "$wv_script" ]; then
+        while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            if ! _wv_run_cache_is_read_cmd "$cmd" 2>/dev/null && \
+               ! _wv_run_cache_is_write_cmd "$cmd" 2>/dev/null && \
+               ! _wv_run_cache_is_exempt_cmd "$cmd" 2>/dev/null; then
+                unclassified_cmds="${unclassified_cmds:+$unclassified_cmds|}$cmd"
+            fi
+        done < <(grep -E '^\s+[a-z][a-zA-Z_-]+\)' "$wv_script" \
+                   | sed 's/[[:space:]]//g; s/).*$//' \
+                   | grep -vE '^\-|\*|^esac' \
+                   | sort -u)
+    fi
+
+    if [ -n "$unclassified_cmds" ]; then
+        local unclassified_list
+        unclassified_list=$(echo "$unclassified_cmds" | tr '|' '\n' | sort)
+        if [ "$format" = "text" ]; then
+            echo -e "${RED}✗ Check 1 FAIL: unclassified commands (not in read/write/exempt list):${NC}"
+            echo "$unclassified_list" | while read -r c; do echo "    $c"; done
+            echo -e "  Add to _wv_run_cache_is_write_cmd or _wv_run_cache_is_exempt_cmd in wv-cache.sh"
+        fi
+        local count
+        count=$(echo "$unclassified_cmds" | tr '|' '\n' | wc -l | tr -d ' ')
+        local cmds_readable
+        cmds_readable=$(echo "$unclassified_cmds" | tr '|' ',')
+        findings_json=$(echo "$findings_json" | jq \
+            --arg detail "unclassified commands: $cmds_readable" --argjson n "$count" \
+            '. + [{"check":"cache_classification","status":"fail","detail":$detail,"count":$n}]')
+        issues=$((issues + count))
+    else
+        [ "$format" = "text" ] && echo -e "${GREEN}✓ Check 1 PASS: all dispatch commands classified (read/write/exempt)${NC}"
+        findings_json=$(echo "$findings_json" | jq \
+            '. + [{"check":"cache_classification","status":"pass","detail":"all commands classified","count":0}]')
+    fi
+
+    # ── Check 2: domain enum duplicate detection ────────────────────────────
+    # Known domain enums must have exactly one definition. More than one means
+    # a consumer copy has drifted or been forgotten when the canonical moved.
+
+    # Resolve roots for scripts + hook checks.
+    local _scripts_root _project_root _git_root
+    _git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    if [ -n "$_git_root" ] && [ -d "$_git_root/scripts" ]; then
+        _project_root="$_git_root"
+        _scripts_root="$_git_root/scripts"
+    elif [ -n "${WV_PROJECT_DIR:-}" ] && [ -d "${WV_PROJECT_DIR}/scripts" ]; then
+        _project_root="$WV_PROJECT_DIR"
+        _scripts_root="${WV_PROJECT_DIR}/scripts"
+    elif [ -n "${WV_LIB_DIR:-}" ] && [ -d "$(dirname "$WV_LIB_DIR")" ]; then
+        _scripts_root=$(cd "$(dirname "$WV_LIB_DIR")" 2>/dev/null && pwd -P)
+        _project_root=$(cd "${_scripts_root}/.." 2>/dev/null && pwd -P)
+    else
+        _scripts_root=$(dirname "$wv_script" 2>/dev/null || echo "")
+        _project_root=$(cd "${_scripts_root}/.." 2>/dev/null && pwd -P)
+    fi
+
+    local enum_issues=0
+    local enum_detail=""
+
+    local -a KNOWN_ENUMS
+    KNOWN_ENUMS=(
+        "VALID_STATUSES"
+        "VALID_EDGE_TYPES"
+        "FINDING_VIOLATION_TYPES"
+    )
+
+    for enum_name in "${KNOWN_ENUMS[@]}"; do
+        local def_count def_files
+        # Count assignment lines: VAR_NAME="..." (not references like $VAR_NAME or --arg VAR_NAME)
+        local search_root="${_project_root:-}/scripts"
+        [ -d "$search_root" ] || search_root="${_scripts_root:-}"
+        if [ -n "$search_root" ] && [ -d "$search_root" ]; then
+            def_files=$(grep -rl "^${enum_name}=" "$search_root" 2>/dev/null | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+            def_count=$(echo "$def_files" | tr ' ' '\n' | grep -c '[^[:space:]]' 2>/dev/null || echo 0)
+        else
+            def_files=""
+            def_count=0
+        fi
+
+        if [ "$def_count" -gt 1 ]; then
+            if [ "$format" = "text" ]; then
+                echo -e "${RED}✗ Check 2 FAIL: ${enum_name} defined in ${def_count} files — drift risk:${NC}"
+                echo "$def_files" | tr ' ' '\n' | while read -r f; do [ -n "$f" ] && echo "    $f"; done
+            fi
+            enum_detail="${enum_detail:+$enum_detail; }${enum_name} in ${def_count} files"
+            enum_issues=$((enum_issues + 1))
+            issues=$((issues + 1))
+        elif [ "$def_count" -eq 0 ]; then
+            if [ "$format" = "text" ]; then
+                echo -e "${YELLOW}⚠ Check 2 WARN: ${enum_name} not found — may be renamed or removed${NC}"
+            fi
+        else
+            [ "$format" = "text" ] && echo -e "${GREEN}✓ Check 2 PASS: ${enum_name} — single definition${NC}"
+        fi
+    done
+
+    if [ "$enum_issues" -eq 0 ]; then
+        findings_json=$(echo "$findings_json" | jq \
+            '. + [{"check":"enum_duplicates","status":"pass","detail":"all domain enums have single definition","count":0}]')
+    else
+        findings_json=$(echo "$findings_json" | jq \
+            --arg detail "$enum_detail" --argjson n "$enum_issues" \
+            '. + [{"check":"enum_duplicates","status":"fail","detail":$detail,"count":$n}]')
+    fi
+
+    # ── Check 3: phase writes must route via wv_set_phase ──────────────────
+    local phase_write_hits
+    local _phase_search_a="$_project_root/scripts"
+    local _phase_search_b="$_project_root/.claude/hooks"
+    [ -d "$_phase_search_a" ] || _phase_search_a="$_scripts_root"
+    phase_write_hits=$(grep -RIn --include='*.sh' -E 'echo[[:space:]].*>[[:space:]]*[^[:space:]]*\.session_phase' \
+        "$_phase_search_a" "$_phase_search_b" 2>/dev/null \
+        | awk -F: '$3 !~ /^[[:space:]]*#/' \
+        | grep -v 'scripts/lib/wv-config.sh' \
+        | grep -v '/tests/' \
+        || true)
+
+    if [ -n "$phase_write_hits" ]; then
+        local phase_issue_count
+        phase_issue_count=$(echo "$phase_write_hits" | grep -c . || echo 0)
+        if [ "$format" = "text" ]; then
+            echo -e "${RED}✗ Check 3 FAIL: raw .session_phase writes detected (use wv_set_phase):${NC}"
+            echo "$phase_write_hits" | while IFS= read -r hit; do [ -n "$hit" ] && echo "    $hit"; done
+        fi
+        findings_json=$(echo "$findings_json" | jq \
+            --arg detail "raw .session_phase writes outside wv_set_phase" --argjson n "$phase_issue_count" \
+            '. + [{"check":"phase_writes","status":"fail","detail":$detail,"count":$n}]')
+        issues=$((issues + phase_issue_count))
+    else
+        [ "$format" = "text" ] && echo -e "${GREEN}✓ Check 3 PASS: .session_phase writes route through wv_set_phase${NC}"
+        findings_json=$(echo "$findings_json" | jq \
+            '. + [{"check":"phase_writes","status":"pass","detail":"no raw .session_phase writes found","count":0}]')
+    fi
+
+    # ── Check 4: required hooks source wv-hook-common.sh ───────────────────
+    local _hooks_dir="$_project_root/.claude/hooks"
+    if [ -d "$_hooks_dir" ]; then
+        local hook_missing=""
+        local hook_missing_count=0
+        local hook_total=0
+        local hook_path
+        for hook_path in \
+            "$_hooks_dir/pre-action.sh" \
+            "$_hooks_dir/session-start-context.sh" \
+            "$_hooks_dir/session-end-sync.sh" \
+            "$_hooks_dir/stop-check.sh" \
+            "$_hooks_dir/pre-compact-context.sh" \
+            "$_hooks_dir/wv-touched-files.sh" \
+            "$_hooks_dir/context-guard.sh"; do
+            hook_total=$((hook_total + 1))
+            if [ ! -f "$hook_path" ] || ! grep -q "wv-hook-common" "$hook_path" 2>/dev/null; then
+                hook_missing_count=$((hook_missing_count + 1))
+                hook_missing="${hook_missing:+$hook_missing, }${hook_path#$_project_root/}"
+            fi
+        done
+
+        if [ "$hook_missing_count" -gt 0 ]; then
+            if [ "$format" = "text" ]; then
+                echo -e "${RED}✗ Check 4 FAIL: required hooks missing wv-hook-common sourcing:${NC}"
+                echo "    $hook_missing"
+            fi
+            findings_json=$(echo "$findings_json" | jq \
+                --arg detail "missing hook-common source in: $hook_missing" --argjson n "$hook_missing_count" \
+                '. + [{"check":"hook_common_sourcing","status":"fail","detail":$detail,"count":$n}]')
+            issues=$((issues + hook_missing_count))
+        else
+            [ "$format" = "text" ] && echo -e "${GREEN}✓ Check 4 PASS: all required hooks source wv-hook-common.sh${NC}"
+            findings_json=$(echo "$findings_json" | jq \
+                --arg detail "all $hook_total required hooks source wv-hook-common.sh" \
+                '. + [{"check":"hook_common_sourcing","status":"pass","detail":$detail,"count":0}]')
+        fi
+    else
+        [ "$format" = "text" ] && echo -e "${YELLOW}⚠ Check 4 WARN: .claude/hooks not found — skipped${NC}"
+        findings_json=$(echo "$findings_json" | jq \
+            '. + [{"check":"hook_common_sourcing","status":"warn","detail":".claude/hooks not found; check skipped","count":0}]')
+    fi
+
+    # ── Check 5: pre-action.sh thin-dispatcher contract (≤ 60 lines) ────────
+    local _pa_hook="$_project_root/.claude/hooks/pre-action.sh"
+    if [ -f "$_pa_hook" ]; then
+        local pa_lines
+        pa_lines=$(wc -l < "$_pa_hook")
+        if [ "$pa_lines" -gt 60 ]; then
+            if [ "$format" = "text" ]; then
+                echo -e "${RED}✗ Check 5 FAIL: pre-action.sh is $pa_lines lines (limit 60)${NC}"
+            fi
+            findings_json=$(echo "$findings_json" | jq \
+                --argjson n "$pa_lines" \
+                '. + [{"check":"thin_dispatcher","status":"fail","detail":"pre-action.sh exceeds 60-line limit","count":$n}]')
+            issues=$((issues + 1))
+        else
+            [ "$format" = "text" ] && echo -e "${GREEN}✓ Check 5 PASS: pre-action.sh is $pa_lines lines (limit 60)${NC}"
+            findings_json=$(echo "$findings_json" | jq \
+                --argjson n "$pa_lines" \
+                '. + [{"check":"thin_dispatcher","status":"pass","detail":"pre-action.sh within 60-line thin-dispatcher limit","count":$n}]')
+        fi
+    else
+        [ "$format" = "text" ] && echo -e "${YELLOW}⚠ Check 5 WARN: pre-action.sh not found — skipped${NC}"
+        findings_json=$(echo "$findings_json" | jq \
+            '. + [{"check":"thin_dispatcher","status":"warn","detail":"pre-action.sh not found; check skipped","count":0}]')
+    fi
+
+    # ── Summary ─────────────────────────────────────────────────────────────
+    if [ "$format" = "json" ]; then
+        jq -n \
+            --argjson findings "$findings_json" \
+            --argjson total_issues "$issues" \
+            '{"pattern_audit":{"issues":$total_issues,"findings":$findings}}'
+    else
+        echo ""
+        if [ "$issues" -eq 0 ]; then
+            echo -e "${GREEN}Pattern audit: PASS (0 issues)${NC}"
+        else
+            echo -e "${RED}Pattern audit: FAIL ($issues issue(s))${NC}"
+        fi
+    fi
+
+    [ "$strict" -eq 1 ] && [ "$issues" -gt 0 ] && return 1
+    return 0
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # cmd_edge_types — Show valid edge types
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -3721,6 +4065,7 @@ cmd_guide() {
             cat <<'EOF'
 Weave Workflow Quick Reference
 
+  0. CLI path:     if ! command -v wv >/dev/null 2>&1; then wv() { ./scripts/wv "$@"; }; fi
   1. Snapshot:     wv bootstrap --json
   2. Find work:    wv ready
   3. Claim it:     wv work <id>
@@ -3756,7 +4101,8 @@ Sync epic bodies / Mermaid diagrams:
   wv sync --gh                       # full bidirectional sync
 
 Check GitHub sync status:
-  gh issue list --label weave-synced
+    gh issue list --state open --limit 200 --json number,title,labels \
+        | jq '[.[] | select(any(.labels[]?.name; . == "weave-synced")) | {number,title}]'
   wv show <id> --json | jq '.[0].metadata | fromjson | .gh_issue'
 
 Label taxonomy applied automatically:
@@ -3941,6 +4287,9 @@ cmd_help_topic() {
         query)
             cmd_query --help
             ;;
+        validate-finding)
+            print_command_help "wv validate-finding <id>" "Validate finding metadata for a node. Exit 0 = valid; exit 1 = invalid. Outputs JSON {valid, errors[]}. Used by pre-close-verification hook to enforce violation_type and optional field constraints before a finding node can be closed."
+            ;;
         init-repo)
             cmd_init_repo --help
             ;;
@@ -4036,6 +4385,9 @@ cmd_help_topic() {
             ;;
         context)
             print_command_help "wv context [id] --json [--mode=bootstrap|discover|execute|full]" "Generate a JSON context pack for a node. If <id> is omitted, wv uses WV_ACTIVE."
+            ;;
+        impact)
+            print_command_help "wv impact <id>... [--files=path1,path2] [--direction=fwd|rev|both] [--depth=N] [--json] [--full] [--include-done] [--all] [--quality]" "Walk the dependency graph from one or more seed nodes. Reports impacted nodes by depth, risk_score/risk_factors, nodes unblocked when seeds complete, and affected test suites. --files=path1,path2 derives seeds from nodes whose touched_files metadata contains those paths (unknown paths emit empty result). --direction=both (default) follows blocks|implements|addresses edges in both directions; fwd=outward only; rev=inward only. --depth=N (default 3). --all removes the 50-node cap. --include-done includes done nodes in the impacted list (they are traversed but hidden by default). --full adds resolves|references|supersedes|obsoletes to the traversed edge types. --json returns structured output."
             ;;
         search)
             cat <<'SEARCHHELP'

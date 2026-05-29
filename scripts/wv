@@ -11,7 +11,7 @@
 #   cmd/wv-cmd-core.sh — init, add, done, ready, list, show, status, update, quick, ship
 #   cmd/wv-cmd-graph.sh— block, link, resolve, related, edges, path, context
 #   cmd/wv-cmd-data.sh — batch, plan, enrich-topology, sync, load, compact, prune, unarchive, clean-ghosts, learnings, refs, import, search, reindex, breadcrumbs
-#   cmd/wv-cmd-ops.sh  — doctor, recover, selftest, mcp-status, health, cache, preflight, digest, overview, session-summary, audit-pitfalls, edge-types, guide, init-repo, help
+#   cmd/wv-cmd-ops.sh  — doctor, recover, selftest, mcp-status, health, cache, preflight, digest, overview, session-summary, audit-pitfalls, pattern-audit, edge-types, guide, init-repo, help
 #   cmd/wv-cmd-quality.sh — quality
 #   cmd/wv-cmd-findings.sh — findings
 
@@ -29,6 +29,21 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export WV_CLI="${WV_CLI:-$SCRIPT_DIR/wv}"
 WV_LIB_DIR="${WV_LIB_DIR:-}"
+
+_wv_append_user_tool_path() {
+    local dir="$1"
+    [ -d "$dir" ] || return 0
+    case ":${PATH:-}:" in
+        *":$dir:"*) return 0 ;;
+    esac
+    PATH="${PATH:+$PATH:}$dir"
+}
+
+if [ "${WV_DISABLE_USER_TOOL_PATHS:-0}" != "1" ]; then
+    _wv_append_user_tool_path "$HOME/.local/bin"
+    _wv_append_user_tool_path "$HOME/.cargo/bin"
+    export PATH
+fi
 
 # Resolve library directory: dev (relative) or installed (XDG)
 if [ -z "$WV_LIB_DIR" ]; then
@@ -159,7 +174,8 @@ _wv_dispatch() {
         path)    _resolve_first_id cmd_path "$@" ;;
         tree)    cmd_tree "$@" ;;
         context) _resolve_first_id cmd_context "$@" ;;
-        
+        impact)  cmd_impact "$@" ;;
+
         # Data commands
         batch)       cmd_batch "$@" ;;
         plan)        cmd_plan "$@" ;;
@@ -193,14 +209,16 @@ _wv_dispatch() {
         overview)        cmd_overview "$@" ;;
         session-summary) cmd_session_summary "$@" ;;
         audit-pitfalls)  cmd_audit_pitfalls "$@" ;;
+        pattern-audit)   cmd_pattern_audit "$@" ;;
         edge-types)      cmd_edge_types "$@" ;;
         guide)           cmd_guide "$@" ;;
         init-repo)       cmd_init_repo "$@" ;;
 
         # Quality / analysis / query commands
-        quality)         cmd_quality "$@" ;;
-        findings)        cmd_findings "$@" ;;
-        analyze)         cmd_analyze "$@" ;;
+        quality)            cmd_quality "$@" ;;
+        findings)           cmd_findings "$@" ;;
+        validate-finding)   _resolve_first_id cmd_validate_finding "$@" ;;
+        analyze)            cmd_analyze "$@" ;;
         index)           cmd_index "$@" ;;
         query)           cmd_query "$@" ;;
         help|--help|-h)  cmd_help "$@" ;;

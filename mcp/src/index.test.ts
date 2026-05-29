@@ -11,7 +11,7 @@ import { join, resolve } from "path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const SERVER_PATH = resolve(__dirname, "../dist/index.js");
-const REQUEST_TIMEOUT_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -277,15 +277,15 @@ describe("Weave MCP Server", () => {
     for (const id of [...createdNodeIds].reverse()) {
       deleteNodeDirect(id);
     }
-  });
+  }, 60_000);
 
   describe("tools/list", () => {
-    it("should list all 42 tools (default scope=all)", async () => {
+    it("should list all 43 tools (default scope=all)", async () => {
       const response = await client.request("tools/list");
       expect(response.error).toBeUndefined();
 
       const tools = (response.result as { tools: { name: string }[] }).tools;
-      expect(tools).toHaveLength(42);
+      expect(tools).toHaveLength(43);
 
       const toolNames = tools.map((t) => t.name);
       expect(toolNames).toContain("weave_search");
@@ -325,6 +325,7 @@ describe("Weave MCP Server", () => {
       expect(toolNames).toContain("weave_block");
       expect(toolNames).toContain("weave_unarchive");
       expect(toolNames).toContain("weave_ready");
+      expect(toolNames).toContain("weave_impact");
       expect(toolNames).toContain("weave_query");
       expect(toolNames).toContain("weave_code_search");
       expect(toolNames).toContain("weave_index");
@@ -432,6 +433,31 @@ describe("Weave MCP Server", () => {
       const context = JSON.parse(result.content[0].text);
       expect(context.node.id).toBe(nodeId);
       expect(Array.isArray(context.blockers)).toBe(true);
+    });
+
+    it("weave_impact should wrap wv impact --json", async () => {
+      const seedId = await createTrackedNode("test-impact-seed");
+      const depId = await createTrackedNode("test-impact-dependent");
+
+      const linkResponse = await client.request("tools/call", {
+        name: "weave_link",
+        arguments: { from_id: seedId, to_id: depId, type: "blocks" },
+      });
+      expect(linkResponse.error).toBeUndefined();
+
+      const response = await client.request("tools/call", {
+        name: "weave_impact",
+        arguments: { ids: [seedId], direction: "fwd" },
+      });
+
+      expect(response.error).toBeUndefined();
+      const result = response.result as { content: { text: string }[] };
+      const payload = JSON.parse(result.content[0].text) as {
+        seeds: Array<{ node_id: string }>;
+        impacted: Array<{ node_id: string }>;
+      };
+      expect(payload.seeds.map((s) => s.node_id)).toContain(seedId);
+      expect(payload.impacted.map((n) => n.node_id)).toContain(depId);
     });
 
     it("weave_health should return health info", async () => {
@@ -709,13 +735,22 @@ describe("Weave MCP Server", () => {
     it("weave_preflight blocks policy-sensitive nodes when quality prerequisites are missing", async () => {
       const dir = mkdtempSync(join(tmpdir(), "weave-mcp-preflight-"));
       const dbPath = join(dir, "brain.db");
-      const env = { WV_DB: dbPath, WV_HOT_ZONE: dir };
-      const nodeId = createActiveNodeDirectWithEnv("test-policy-preflight", env);
+      const env = { WV_DB: dbPath, WV_HOT_ZONE: dir, WV_PROJECT_ROOT: resolve(__dirname, "../..") };
+      const createdId = createActiveNodeDirectWithEnv("test-policy-preflight", env);
+      const resolvedNodeId =
+        spawnSync(
+          "sqlite3",
+          [dbPath, "SELECT id FROM nodes WHERE text='test-policy-preflight' ORDER BY updated_at DESC LIMIT 1;"],
+          {
+            encoding: "utf-8",
+            stdio: ["ignore", "pipe", "ignore"],
+          }
+        ).stdout.trim() || createdId;
       const preflightClient = new MCPTestClient([], env);
 
       spawnSync(
         "sqlite3",
-        [dbPath, `INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('${nodeId}', 'src/policy.py');`],
+        [dbPath, `INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('${resolvedNodeId}', 'src/policy.py');`],
         {
           stdio: "ignore",
         }
@@ -724,7 +759,7 @@ describe("Weave MCP Server", () => {
       try {
         const response = await preflightClient.request("tools/call", {
           name: "weave_preflight",
-          arguments: { id: nodeId },
+          arguments: { id: resolvedNodeId },
         });
 
         const result = response.result as { content: { text: string }[]; isError?: boolean };
@@ -1082,6 +1117,7 @@ describe("Weave MCP Server --scope=inspect", () => {
         "weave_query",
         "weave_status",
         "weave_ready",
+        "weave_impact",
         "weave_health",
         "weave_preflight",
         "weave_bootstrap",
@@ -1100,6 +1136,6 @@ describe("Weave MCP Server --scope=inspect", () => {
         "weave_index",
       ])
     );
-    expect(tools).toHaveLength(21);
+    expect(tools).toHaveLength(22);
   });
 });

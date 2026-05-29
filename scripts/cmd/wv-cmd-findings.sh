@@ -278,3 +278,63 @@ cmd_findings_promote() {
 
     _wv_findings_python "${py_args[@]}"
 }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_validate_finding — validate finding metadata for a node
+#
+# Exit 0: valid  Exit 1: invalid
+# Stdout: {"valid":true|false,"errors":[...]}
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_validate_finding() {
+    local id=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -*)
+                echo -e "${RED}Error: unknown flag '$1'${NC}" >&2; return 1 ;;
+            *)
+                if [ -z "$id" ]; then id="$1"; else
+                    echo -e "${RED}Error: unexpected argument '$1'${NC}" >&2; return 1
+                fi ;;
+        esac
+        shift
+    done
+
+    if [ -z "$id" ]; then
+        echo -e "${RED}Error: node ID required${NC}" >&2; return 1
+    fi
+
+    db_ensure
+    local resolved
+    resolved=$(resolve_id "$id") || return 1
+
+    local meta_raw
+    meta_raw=$(db_query "SELECT metadata FROM nodes WHERE id='$(sql_escape "$resolved")';")
+    if [ -z "$meta_raw" ]; then
+        echo -e "${RED}Error: node $resolved not found${NC}" >&2; return 1
+    fi
+
+    local meta_json
+    meta_json=$(printf '%s' "$meta_raw" | jq -r '.' 2>/dev/null || echo "{}")
+    local node_type
+    node_type=$(printf '%s' "$meta_json" | jq -r '.type // "task"' 2>/dev/null || echo "task")
+
+    if [ "$node_type" != "finding" ]; then
+        printf '{"valid":true,"errors":[],"note":"not a finding node"}\n'
+        return 0
+    fi
+
+    local errors_raw
+    errors_raw=$(_finding_missing_fields "$meta_json" 2>/dev/null || true)
+
+    if [ -z "$errors_raw" ]; then
+        printf '{"valid":true,"errors":[]}\n'
+        return 0
+    fi
+
+    local errors_json
+    errors_json=$(printf '%s\n' "$errors_raw" | jq -R . | jq -s . 2>/dev/null || echo '[]')
+    printf '{"valid":false,"errors":%s}\n' "$errors_json"
+    return 1
+}

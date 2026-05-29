@@ -23,7 +23,6 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -35,8 +34,9 @@ import tempfile
 from weave_quality.ast_cache import ASTCache
 from weave_quality.bash_ast_grep import analyze_bash_file_best, ast_grep_available, batch_cc_lines
 from weave_quality.bash_heuristic import detect_bash
-from weave_quality.typescript_parser import analyze_typescript_file
 from weave_quality.classification import classify_file, load_classify_overrides
+from weave_quality.external_tools import ast_grep_bin
+from weave_quality.typescript_parser import analyze_typescript_file
 from weave_quality.db import (
     begin_scan,
     bulk_insert_pattern_findings,
@@ -419,7 +419,11 @@ def _scan_files(
             lang_counts["bash"] = lang_counts.get("bash", 0) + 1
         entries.append(entry)
 
-    if not bash_backends_used or bash_backends_used == {"regex"}:
+    if not bash_backends_used:
+        # No bash files scanned this run (incremental — all unchanged).
+        # Report the binary's availability as the effective backend.
+        bash_backend_agg = "ast-grep (no changes)" if ast_grep_bin() else "regex (no changes)"
+    elif bash_backends_used == {"regex"}:
         bash_backend_agg = "regex"
     elif bash_backends_used == {"ast-grep"}:
         bash_backend_agg = "ast-grep"
@@ -493,6 +497,8 @@ def _print_scan_result(
     files_to_scan: list[str],
     duration_ms: int,
     summary: dict[str, object],
+    bash_cc_backend: str = "regex",
+    ts_cc_backend: str = "unavailable",
 ) -> None:
     """Print human-readable scan summary to stderr."""
     for lang, count in sorted(lang_counts.items()):
@@ -512,6 +518,10 @@ def _print_scan_result(
         f"  Hotspots: {summary.get('hotspot_count', 0)} files above threshold",
         file=sys.stderr,
     )
+    backend_parts = [f"bash={bash_cc_backend}"]
+    if ts_cc_backend != "unavailable":
+        backend_parts.append(f"ts={ts_cc_backend}")
+    print(f"  CC backend: {', '.join(backend_parts)}", file=sys.stderr)
     print(f"\nQuality score: {summary.get('quality_score', 100)}/100", file=sys.stderr)
 
 
@@ -628,10 +638,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
             "duration_ms": duration_ms,
             "hotspots_above_threshold": summary.get("hotspot_count", 0),
             "quality_score": summary.get("quality_score", 100),
+            "bash_cc_backend": bash_backend,
+            "ts_cc_backend": ts_backend,
         }))
     else:
         print(f"Scanning {repo}...", file=sys.stderr)
-        _print_scan_result(lang_counts, files_to_scan, duration_ms, summary)
+        _print_scan_result(lang_counts, files_to_scan, duration_ms, summary,
+                           bash_cc_backend=bash_backend, ts_cc_backend=ts_backend)
 
     return 0
 
@@ -1055,6 +1068,8 @@ def cmd_diff(args: argparse.Namespace) -> int:
             "removed_files": removed_files,
             "quality_score_current": cur_score,
             "quality_score_previous": prev_score,
+            "bash_cc_backend_current": current.bash_cc_backend,
+            "bash_cc_backend_previous": prev.bash_cc_backend,
         }))
     else:
         _print_diff_result(
@@ -1458,7 +1473,10 @@ def _run_pattern_rule(
     rule_id: str, rule_path: Path, target: Path, scan_id: int
 ) -> list[PatternFinding]:
     """Run ast-grep for one rule file on target; return PatternFinding list."""
-    cmd = ["ast-grep", "scan", "--rule", str(rule_path), "--json", str(target)]
+    ast_grep = ast_grep_bin()
+    if not ast_grep:
+        return []
+    cmd = [ast_grep, "scan", "--rule", str(rule_path), "--json", str(target)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
     except subprocess.TimeoutExpired:
@@ -1611,7 +1629,8 @@ def _structural_search_error(msg: dict[str, str], json_out: bool) -> int:
 
 def cmd_structural_search(args: argparse.Namespace) -> int:
     """Execute wv quality structural-search — find code by structural AST pattern via ast-grep."""
-    if not shutil.which("ast-grep"):
+    ast_grep = ast_grep_bin()
+    if not ast_grep:
         if args.json:
             print(json.dumps({"error": "ast-grep not installed", "install": "./install.sh"}))
         else:
@@ -1636,7 +1655,7 @@ def cmd_structural_search(args: argparse.Namespace) -> int:
     except OSError as exc:
         return _structural_search_error({"error": "temp file error", "detail": str(exc)}, args.json)
 
-    cmd = ["ast-grep", "scan", "--rule", rule_path, "--json", args.repo]
+    cmd = [ast_grep, "scan", "--rule", rule_path, "--json", args.repo]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
     except subprocess.TimeoutExpired:

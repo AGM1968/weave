@@ -6,6 +6,10 @@
 
 set -e
 
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null || true
+_hc_refresh
+
 # Colors
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
