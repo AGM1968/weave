@@ -1,12 +1,14 @@
 ---
 name: fix-issue
-description: "Fixes a GitHub issue or Weave node end-to-end using procedural gates. Use when a tracked issue requires implementation, verification, and closure."
+description:
+  "Fixes a GitHub issue or Weave node end-to-end using procedural gates. Use when a tracked issue
+  requires implementation, verification, and closure."
 ---
 
 # Fix Issue Workflow
 
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator. Use `/weave` instead
-> for the full graph-first workflow. Direct invocation is deprecated and may be removed in a future
+> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator. Use `/weave` instead for
+> the full graph-first workflow. Direct invocation is deprecated and may be removed in a future
 > release.
 
 End-to-end issue resolution with skill-based gates to prevent common failure modes.
@@ -129,7 +131,7 @@ wv done $ARGUMENTS --learning="decision: ... | pattern: ... | pitfall: ..."
 | Implement     | /wv-guard-scope     | Match conventions, respect scope | During coding             |
 | Verify        | /wv-verify-complete | Require verification evidence    | Before closing node       |
 | Stuck         | /wv-detect-loop     | Break out of retry loops         | After 2-3 failed attempts |
-| Context shift | /breadcrumbs        | Leave notes for next session     | Before ending session     |
+| Context shift | /trails             | Leave notes for next session     | Before ending session     |
 
 ## Anti-Patterns to Avoid
 
@@ -138,7 +140,7 @@ wv done $ARGUMENTS --learning="decision: ... | pattern: ... | pitfall: ..."
 3. **Infinite retry** - Stop and reassess with /wv-detect-loop
 4. **Over-exploration** - Search with purpose using /zero-in
 5. **"Looks right"** - Verify with /wv-verify-complete before closing
-6. **Context rot** - Leave /breadcrumbs before compaction
+6. **Context rot** - Leave /trails before compaction
 
 ## Integration
 
@@ -146,7 +148,7 @@ The procedural skills are enforced through:
 
 - **PreToolUse hooks** - Suggest /ship-it and /pre-mortem on claim, /wv-verify-complete on close
 - **Manual invocation** - Call skills explicitly during workflow
-- **PreCompact hook** - Auto-extracts breadcrumbs for context preservation
+- **PreCompact hook** - Auto-extracts trails for context preservation
 
 ## Example
 

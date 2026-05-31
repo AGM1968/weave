@@ -130,7 +130,7 @@ assert_contains "$WORKFLOW_DOC" '## Repair Workflow' "workflow doc: includes rep
 assert_contains "$WORKFLOW_DOC" 'needs_human_verification' "workflow doc: repair workflow covers resumable human verification"
 assert_contains "$WEAVE_SKILL" '### Repair Loop for Detected Issues' "weave skill: includes repair loop guidance"
 assert_contains "$WEAVE_GUIDE" '## Repair Workflow for Detected Issues' "weave-guide: includes repair workflow guidance"
-assert_contains "$WEAVE_GUIDE" 'wv breadcrumbs save --msg="Detected workflow issue, created repair node, next step is ..."' "weave-guide: repair workflow preserves breadcrumbs"
+assert_contains "$WEAVE_GUIDE" 'wv trails save --msg="Detected workflow issue, created repair node, next step is ..."' "weave-guide: repair workflow preserves trails"
 
 echo ""
 echo "=== Results ==="

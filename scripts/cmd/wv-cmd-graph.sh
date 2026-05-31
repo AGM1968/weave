@@ -1524,12 +1524,28 @@ cmd_impact() {
             [ -n "$nid" ] && seeds+=("$nid")
         done <<< "$file_nodes"
         if [ "${#seeds[@]}" -eq 0 ]; then
-            # No nodes found for the given files — emit empty result, not an error
+            # No graph node records these files in touched_files. Do NOT report a
+            # bland "0 impacted" — that reads as "safe" and hides real coupling
+            # (finding wv-70ea8e: a false 0-impacted gave bad pre-edit confidence
+            # while the pre-commit test-map.conf router correctly found affected
+            # suites). Fall back to test-map.conf so suites still surface, and warn
+            # that the graph blast radius is unknown — not zero.
+            local _suites_json
+            _suites_json=$(_impact_suites_for_files "${file_seeds[@]}")
             if [ "$output_format" = "json" ]; then
-                printf '{"seeds":[],"impacted":[],"unblocked":[],"affected_suites":[],"summary":{"total_impacted":0,"total_unblocked":0},"source":"files","files":[%s]}\n' \
+                printf '{"seeds":[],"impacted":[],"unblocked":[],"affected_suites":%s,"summary":{"total_impacted":0,"total_unblocked":0},"source":"files","graph_seed_matched":false,"files":[%s]}\n' \
+                    "$_suites_json" \
                     "$(printf '"%s",' "${file_seeds[@]}" | sed 's/,$//')"
             else
-                echo "0 impacted, 0 unblocked — no nodes found for: ${file_seeds[*]}"
+                echo -e "${YELLOW}⚠ No graph node records these files in touched_files — graph blast radius unknown, NOT 'safe'.${NC}" >&2
+                echo "  files: ${file_seeds[*]}" >&2
+                local _suite_names
+                _suite_names=$(printf '%s' "$_suites_json" | jq -r '.[].name' 2>/dev/null | paste -sd' ' - 2>/dev/null || echo "")
+                if [ -n "$_suite_names" ]; then
+                    echo "  affected test suites (via test-map.conf): $_suite_names"
+                else
+                    echo "  no suites mapped either — consider 'wv touch <path>' on the owning node for graph attribution."
+                fi
             fi
             return 0
         fi

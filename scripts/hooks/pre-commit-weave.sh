@@ -11,16 +11,39 @@ hook_progress() {
     printf '%s\n' "Weave pre-commit: $1" >&2
 }
 
+# hook_duration_ms <start_nanos> — wall-clock milliseconds elapsed since a
+# `date +%s%N` timestamp (LL1). Returns 0 when nanosecond `date` is unavailable
+# (literal "N" output) or the start is the 0 sentinel, so a ledger row never
+# carries a bogus negative/garbage cost.
+hook_duration_ms() {
+    local _t0="$1" _t1 _d
+    _t1=$(date +%s%N 2>/dev/null || echo 0)
+    case "$_t0" in ''|*[!0-9]*) echo 0; return 0 ;; esac
+    case "$_t1" in ''|*[!0-9]*) echo 0; return 0 ;; esac
+    [ "$_t0" = "0" ] && { echo 0; return 0; }
+    _d=$(( (_t1 - _t0) / 1000000 ))
+    [ "$_d" -lt 0 ] && _d=0
+    echo "$_d"
+}
+
 run_hook_suite() {
     _pc_suite="$1"
     _pc_cost="${2:-?}"
     # Heuristic may map to a suite that doesn't exist yet — skip rather than fail.
     [ -f "$REPO_ROOT/$_pc_suite" ] || return 0
     hook_progress "running $_pc_suite (~${_pc_cost}s)..."
-    if ! GIT_CONFIG_COUNT=1 \
+    _pc_t0=$(date +%s%N 2>/dev/null || echo 0)
+    GIT_CONFIG_COUNT=1 \
         GIT_CONFIG_KEY_0=core.hooksPath \
         GIT_CONFIG_VALUE_0=/dev/null \
-        bash "$REPO_ROOT/$_pc_suite" </dev/null >/dev/null 2>&1; then
+        bash "$REPO_ROOT/$_pc_suite" </dev/null >/dev/null 2>&1
+    _pc_rc=$?
+    _pc_dur=$(hook_duration_ms "$_pc_t0")
+    # Record the outcome in the verification ledger (P6a) with its wall-clock cost
+    # (LL1). Best-effort — a recording failure must never block the commit. Keyed on
+    # the staged files' fingerprint.
+    "$WV" test-record "$_pc_suite" --files="${_pc_files_csv:-}" --exit="$_pc_rc" --duration="$_pc_dur" >/dev/null 2>&1 || true
+    if [ "$_pc_rc" -ne 0 ]; then
         echo "" >&2
         echo "✗ $_pc_suite failed — run manually to see details:" >&2
         echo "  bash $_pc_suite" >&2
@@ -41,9 +64,19 @@ REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || exit 0)
 WV="$(command -v wv 2>/dev/null || echo "$REPO_ROOT/scripts/wv")"
 [ ! -x "$WV" ] && exit 0
 
-# Phase helper + enum (best effort). If unavailable, fallback writes below still work.
-source "$REPO_ROOT/scripts/lib/wv-validate.sh" 2>/dev/null || true
-source "$REPO_ROOT/scripts/lib/wv-config.sh" 2>/dev/null || true
+# Phase helper + enum (best effort). Resolve the lib dir like the wv binary does:
+# repo-local scripts/lib/ (source checkout) first, then the installed location.
+# Consumer repos run the installed binary and have NO scripts/lib/, so without
+# this fallback wv_set_phase + validators silently vanish and the hook degrades
+# to its weakest path — wrong phase resolution, no phase reset (finding wv-e754b0 O3).
+_PC_LIB_DIR=""
+for _pc_cand in "$REPO_ROOT/scripts/lib" "$HOME/.local/lib/weave/lib"; do
+    if [ -f "$_pc_cand/wv-config.sh" ]; then _PC_LIB_DIR="$_pc_cand"; break; fi
+done
+if [ -n "$_PC_LIB_DIR" ]; then
+    source "$_PC_LIB_DIR/wv-validate.sh" 2>/dev/null || true
+    source "$_PC_LIB_DIR/wv-config.sh" 2>/dev/null || true
+fi
 
 # Check what's being committed — if only .weave/ files, always allow
 STAGED_FILES=$(git diff --cached --name-only 2>/dev/null)

@@ -232,9 +232,8 @@ close-time friction), turn it into tracked remediation immediately:
      `wv block <current> --by=<new>`.
    - If the repair is related but not blocking, link it with
      `wv link <new> <current> --type=relates_to`.
-3. **Leave breadcrumbs for the next step**
-   - Save what was detected, what was created, and what should happen next with
-     `wv breadcrumbs save`.
+3. **Leave a trail for the next step**
+   - Save what was detected, what was created, and what should happen next with `wv trails save`.
 4. **Avoid unattended close-time stalls**
    - For non-interactive agent flows, prefer recording pending-close state and surfacing
      `needs_human_verification` rather than blocking indefinitely on stdin prompts.
@@ -315,7 +314,7 @@ around 300-400k tokens. Make deliberate choices:
 | **Continue** | Current approach is working, context is fresh       | Keep going                                                |
 | **Rewind**   | Failed approach — tool errors, wrong path, dead end | Rewind to before the attempt (see below)                  |
 | **Compact**  | Context growing but direction is clear              | `/compact focus on <current task>, drop <completed work>` |
-| **/clear**   | Task complete, starting unrelated work              | `wv breadcrumbs save` → `/clear` → reload                 |
+| **/clear**   | Task complete, starting unrelated work              | `wv trails save` → `/clear` → reload                      |
 | **Subagent** | Work produces intermediate output you won't need    | Delegate, keep only the conclusion                        |
 
 ### Rewind — The Most Important Habit
@@ -332,14 +331,14 @@ compaction cannot reliably clean.
 
 **How to rewind:**
 
-1. Before the risky attempt: `wv breadcrumbs save --message="About to try X, current state is Y"`
+1. Before the risky attempt: `wv trails save --message="About to try X, current state is Y"`
 2. After failure: use your client's rewind/undo feature to roll back to before the attempt
 3. After rewinding: capture what you learned:
    `wv done <id> --learning="pitfall: X failed because Y"`
 4. Start the fresh approach with clean context
 
-If your client does not support rewind, use `/clear` with breadcrumbs instead — a fresh session with
-captured learnings is better than a polluted context window.
+If your client does not support rewind, use `/clear` with a saved trail instead — a fresh session
+with captured learnings is better than a polluted context window.
 
 ### Compact Steering
 
@@ -534,7 +533,7 @@ actually done — a soft warning is not a signal to stop working.
 ## Skills
 
 - `/weave [<id>|<text>]` — Graph-first orchestrator (primary interface)
-- `/breadcrumbs [<id>]` — Session memory capsule
+- `/trails [<id>]` — Session memory capsule
 - `/close-session` — End-of-session sync + push protocol
 
 ### Local Skills

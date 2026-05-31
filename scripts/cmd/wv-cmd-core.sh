@@ -644,6 +644,72 @@ print('deteriorating' if s>0.03 else ('refactored' if s<-0.03 else 'stable'))
     done <<< "$paths_raw"
 }
 
+# _done_refresh_test_status — Populate file_test_status from the test_results
+# ledger for each path tracked in node_files, before the status flip (P6b).
+#
+# Per path P: resolve its suites via _impact_suites_for_files (the ONE shared
+# path->suite resolver, also used by pre-commit — never a second copy), then for
+# each suite look up the ledger row keyed (suite, P). Compare the row's stored
+# fingerprint to P's CURRENT fingerprint (_test_file_fingerprint, the same pure
+# function the producer used):
+#   match + exit 0  -> green   (fresh pass)
+#   match + exit !=0 -> red     (fresh fail)
+#   no match         -> stale   (file changed since the recorded run)
+#   no row / no map  -> unknown (non-blocking — the trigger ignores 'unknown')
+# Aggregate across suites with precedence red > stale > green > unknown.
+#
+# Best-effort by design: ALWAYS returns 0. The test gate is inert by default
+# (test_gate=0) and 'unknown' never blocks, so a refresh failure must not break
+# a close. Quality.db is NOT required — this reads brain.db only.
+_done_refresh_test_status() {
+    local id="$1"
+
+    # Honors the shared done-refresh bypass. This reads brain.db (not quality.db),
+    # but reusing WV_REQUIRE_QUALITY=0 keeps one test/legacy escape hatch for the
+    # whole refresh chain and lets trigger tests seed file_test_status directly
+    # without this recompute clobbering it.
+    [ "${WV_REQUIRE_QUALITY:-1}" = "0" ] && return 0
+
+    local paths_raw
+    paths_raw=$(db_query "SELECT path FROM node_files WHERE node_id='$(sql_escape "$id")';" 2>/dev/null || echo "")
+    [ -z "$paths_raw" ] && return 0
+
+    local path
+    while IFS= read -r path; do
+        [ -z "$path" ] && continue
+        local path_esc cur_fp state
+        path_esc=$(sql_escape "$path")
+        cur_fp=$(_test_file_fingerprint "$path")
+
+        # Resolve suites for this path via the shared resolver (JSON -> names).
+        local suites
+        suites=$(_impact_suites_for_files "$path" 2>/dev/null | jq -r '.[].name' 2>/dev/null || echo "")
+
+        state="unknown"
+        local suite row_fp row_exit suite_state
+        for suite in $suites; do
+            row_fp=$(db_query "SELECT fingerprint FROM test_results WHERE suite='$(sql_escape "$suite")' AND path='$path_esc' LIMIT 1;" 2>/dev/null || echo "")
+            [ -z "$row_fp" ] && continue   # no recorded result for this suite+file
+            row_exit=$(db_query "SELECT exit_code FROM test_results WHERE suite='$(sql_escape "$suite")' AND path='$path_esc' LIMIT 1;" 2>/dev/null || echo "")
+            if [ "$row_fp" = "$cur_fp" ]; then
+                if [ "$row_exit" = "0" ]; then suite_state="green"; else suite_state="red"; fi
+            else
+                suite_state="stale"
+            fi
+            # Precedence: red > stale > green > unknown.
+            case "$suite_state" in
+                red)   state="red" ;;
+                stale) [ "$state" != "red" ] && state="stale" ;;
+                green) { [ "$state" = "unknown" ]; } && state="green" ;;
+            esac
+        done
+
+        db_query "INSERT INTO file_test_status(path, state) VALUES('$path_esc', '$state')
+            ON CONFLICT(path) DO UPDATE SET state = excluded.state;" >/dev/null 2>&1 || true
+    done <<< "$paths_raw"
+    return 0
+}
+
 # Shared state for cmd_done helpers (avoids stdout capture in subshells)
 _done_skip_learning=false
 
@@ -1016,16 +1082,21 @@ _done_close_gh_issue() {
     _refresh_parent_gh "$id"
 }
 
-# Append completion record to breadcrumbs.md.
+# Append completion record to trails.md (legacy breadcrumbs.md if not yet migrated).
 # Args: $1=id
-_done_write_breadcrumb() {
+_done_write_trail() {
     local id="$1"
 
     if [ -z "${WEAVE_DIR:-}" ]; then
         return 0
     fi
 
-    local breadcrumb_file="$WEAVE_DIR/breadcrumbs.md"
+    # Prefer trails.md; only append to the legacy file if it still exists and
+    # trails.md does not (cmd_load migrates it on the next load).
+    local breadcrumb_file="$WEAVE_DIR/trails.md"
+    if [ ! -f "$breadcrumb_file" ] && [ -f "$WEAVE_DIR/breadcrumbs.md" ]; then
+        breadcrumb_file="$WEAVE_DIR/breadcrumbs.md"
+    fi
     local node_alias
     node_alias=$(db_query "SELECT COALESCE(alias, '') FROM nodes WHERE id='$id';" 2>/dev/null || true)
     local label="$id"
@@ -1192,6 +1263,8 @@ cmd_done() {
     # Refresh file_metrics and trend signals from quality.db before the gate UPDATE.
     _done_refresh_file_metrics "$id" || return 1
     _done_refresh_trend_signals "$id" || return 1
+    # Refresh test-correctness status from the ledger (best-effort; never blocks).
+    _done_refresh_test_status "$id" || true
 
     # === Close: update status, release claim, clear primary, aggregate commits ===
     local _done_err _done_rc
@@ -1215,12 +1288,24 @@ cmd_done() {
                 v_threshold="$_threshold_key"
                 echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\"}" >&2
             else
-                v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' AND (SELECT value FROM policy_thresholds WHERE key='trend_deteriorating') >= 1 LIMIT 1;" 2>/dev/null || echo "unknown")
-                v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='trend_deteriorating';" 2>/dev/null || echo "1")
-                v_actual=1
-                v_direction=$(db_query "SELECT ft.direction FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' LIMIT 1;" 2>/dev/null || echo "deteriorating")
-                v_threshold="trend_deteriorating"
-                echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\",\"direction\":\"$v_direction\"}" >&2
+                # Not mccabe — distinguish trend (clause 2) from test (clause 3).
+                v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' AND (SELECT value FROM policy_thresholds WHERE key='trend_deteriorating') >= 1 LIMIT 1;" 2>/dev/null || echo "")
+                if [ -n "$v_path" ]; then
+                    v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='trend_deteriorating';" 2>/dev/null || echo "1")
+                    v_actual=1
+                    v_direction=$(db_query "SELECT ft.direction FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' LIMIT 1;" 2>/dev/null || echo "deteriorating")
+                    v_threshold="trend_deteriorating"
+                    echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\",\"direction\":\"$v_direction\"}" >&2
+                else
+                    # Test gate (clause 3): a red/stale file under test_gate>=block.
+                    local v_state
+                    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_test_status fts ON fts.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fts.state IN ('red','stale') LIMIT 1;" 2>/dev/null || echo "unknown")
+                    v_state=$(db_query "SELECT fts.state FROM node_files nf JOIN file_test_status fts ON fts.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fts.state IN ('red','stale') LIMIT 1;" 2>/dev/null || echo "red")
+                    v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='test_gate';" 2>/dev/null || echo "2")
+                    v_actual=1
+                    v_threshold="test_gate"
+                    echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\",\"state\":\"$v_state\"}" >&2
+                fi
             fi
         else
             echo "$_done_err" >&2
@@ -1280,6 +1365,39 @@ cmd_done() {
         validate_on_done "$id"
     fi
 
+    # Test-correctness advisory (P6c, test_gate=warn). At test_gate=1 the trigger
+    # does NOT abort (it only fires at >=2); surface red/stale touched files as a
+    # non-blocking warning so the soft level still has teeth. The query honors
+    # quality_exempt and node-type exemptions (mirroring the trigger's block clause);
+    # the standard suppression flags silence it. block (>=2) already hard-blocked
+    # above, so this only adds signal at the warn level.
+    if [ "$no_warn" != "1" ] && [ "${WV_NO_WARN:-0}" != "1" ] && [ "$skip_verification" != "1" ] && [ "$format" != "json" ]; then
+        local _tg_level
+        _tg_level=$(db_query "SELECT CAST(value AS INTEGER) FROM policy_thresholds WHERE key='test_gate';" 2>/dev/null || echo "0")
+        if [ "${_tg_level:-0}" = "1" ]; then
+            local _tg_bad
+            _tg_bad=$(db_query "
+                SELECT nf.path || ' (' || fts.state || ')'
+                FROM node_files nf
+                JOIN file_test_status fts ON fts.path = nf.path
+                WHERE nf.node_id='$(sql_escape "$id")'
+                  AND fts.state IN ('red','stale')
+                  AND COALESCE((SELECT json_extract(metadata, '\$.type') FROM nodes WHERE id='$(sql_escape "$id")'), '') NOT IN ('finding','epic','session_history')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM quality_exempt qe
+                      WHERE nf.path LIKE CASE WHEN qe.path_pattern LIKE '%/' THEN qe.path_pattern || '%' ELSE qe.path_pattern END
+                  );
+            " 2>/dev/null || true)
+            if [ -n "$_tg_bad" ]; then
+                echo -e "${YELLOW}  ⚠ Test correctness (test_gate=warn) — touched files without a fresh green result:${NC}" >&2
+                while IFS= read -r _p; do
+                    [ -n "$_p" ] && echo -e "    ${YELLOW}·${NC} $_p" >&2
+                done <<< "$_tg_bad"
+                echo -e "    ${YELLOW}Re-run the mapped suite(s), or set test_gate=block to enforce.${NC}" >&2
+            fi
+        fi
+    fi
+
     wv_set_phase "closing"
 
     # Advisory: open finding nodes that reference this node as source_node.
@@ -1301,7 +1419,7 @@ cmd_done() {
         fi
     fi
 
-    # === Post-close: GH issue, cache, notifications, breadcrumbs ===
+    # === Post-close: GH issue, cache, notifications, trails ===
     [ "$no_gh" = "0" ] && _done_close_gh_issue "$id"
 
     # Invalidate context cache for completed node and any nodes it was blocking
@@ -1317,7 +1435,7 @@ cmd_done() {
         gh_notify "$id" "done"
     fi
 
-    _done_write_breadcrumb "$id"
+    _done_write_trail "$id"
     auto_sync --force 2>/dev/null || true
 }
 
@@ -2082,6 +2200,48 @@ cmd_list() {
 # cmd_show — Show node details
 # ═══════════════════════════════════════════════════════════════════════════
 
+# _render_trails — render metadata.trails[] for `wv show` (S2). Shows the latest
+# entry as the headline capsule, flags it "stale — verify" when it predates the
+# current session start (epoch in .session_snapshot), and collapses older entries
+# into a one-line newest-first path summary. No-op when there are no trails.
+_render_trails() {
+    local metadata="$1"
+    local n
+    n=$(echo "$metadata" | jq -r '(.trails // []) | length' 2>/dev/null || echo 0)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    [ "$n" -gt 0 ] || return 0
+
+    local latest goal state next_step blocking at
+    latest=$(echo "$metadata" | jq -c '.trails[-1]' 2>/dev/null)
+    goal=$(echo "$latest" | jq -r '.goal // empty' 2>/dev/null)
+    state=$(echo "$latest" | jq -r '.state // empty' 2>/dev/null)
+    next_step=$(echo "$latest" | jq -r '.next // empty' 2>/dev/null)
+    blocking=$(echo "$latest" | jq -r '.blocking // empty' 2>/dev/null)
+    at=$(echo "$latest" | jq -r '.at // empty' 2>/dev/null)
+
+    # Staleness: flag when the latest entry predates the current session start.
+    local stale=""
+    local snapshot="$WV_HOT_ZONE/.session_snapshot"
+    if [ -n "$at" ] && [ -f "$snapshot" ]; then
+        local start_ts entry_ts
+        IFS=$'\t' read -r start_ts _ < "$snapshot"
+        entry_ts=$(date -d "$at" +%s 2>/dev/null || echo "")
+        if [ -n "$entry_ts" ] && [[ "$start_ts" =~ ^[0-9]+$ ]] && [ "$entry_ts" -lt "$start_ts" ]; then
+            stale="  ${YELLOW}⚠ stale — verify${NC}"
+        fi
+    fi
+
+    echo -e "${CYAN}Trail:${NC}    ${goal}${stale}"
+    [ -n "$state" ]     && echo -e "          state: $state"
+    [ -n "$next_step" ] && echo -e "          next:  $next_step"
+    [ -n "$blocking" ]  && echo -e "          blocking: $blocking"
+    if [ "$n" -gt 1 ]; then
+        local older
+        older=$(echo "$metadata" | jq -r '.trails[:-1] | reverse | map(.goal // "(no goal)") | join("; ")' 2>/dev/null)
+        echo -e "          ${CYAN}path ($((n - 1)) earlier):${NC} $older"
+    fi
+}
+
 cmd_show() {
     local id="${1:-}"
     local format="text"
@@ -2147,6 +2307,7 @@ cmd_show() {
                 if [ -n "$_learning" ]; then
                     echo -e "${CYAN}Learning:${NC} $_learning"
                 fi
+                _render_trails "$metadata"
             else
                 # execute / full: full metadata + timestamps
                 local _intent
@@ -2155,6 +2316,7 @@ cmd_show() {
                 echo -e "${CYAN}Metadata:${NC} $metadata"
                 echo -e "${CYAN}Created:${NC}  $created"
                 echo -e "${CYAN}Updated:${NC}  $updated"
+                _render_trails "$metadata"
             fi
         done
         

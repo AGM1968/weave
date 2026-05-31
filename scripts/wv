@@ -10,7 +10,7 @@
 #   lib/wv-cache.sh    — context cache management
 #   cmd/wv-cmd-core.sh — init, add, done, ready, list, show, status, update, quick, ship
 #   cmd/wv-cmd-graph.sh— block, link, resolve, related, edges, path, context
-#   cmd/wv-cmd-data.sh — batch, plan, enrich-topology, sync, load, compact, prune, unarchive, clean-ghosts, learnings, refs, import, search, reindex, breadcrumbs
+#   cmd/wv-cmd-data.sh — batch, plan, enrich-topology, sync, load, compact, prune, unarchive, clean-ghosts, learnings, refs, import, search, reindex, trails (alias: breadcrumbs)
 #   cmd/wv-cmd-ops.sh  — doctor, recover, selftest, mcp-status, health, cache, preflight, digest, overview, session-summary, audit-pitfalls, pattern-audit, edge-types, guide, init-repo, help
 #   cmd/wv-cmd-quality.sh — quality
 #   cmd/wv-cmd-findings.sh — findings
@@ -191,13 +191,15 @@ _wv_dispatch() {
         import)      cmd_import "$@" ;;
         search)      cmd_search "$@" ;;
         reindex)     cmd_reindex "$@" ;;
-        breadcrumbs) cmd_breadcrumbs "$@" ;;
+        trails)      cmd_trails "$@" ;;
+        breadcrumbs) cmd_trails "$@" ;;  # back-compat alias (one release) for `trails`
         
         # Ops commands
         bootstrap)       cmd_bootstrap "$@" ;;
         bootstrap-agent) cmd_bootstrap_agent "$@" ;;
         doctor)          cmd_doctor "$@" ;;
         hotzone)         cmd_hotzone "$@" ;;
+        test-record)     cmd_test_record "$@" ;;
         self-update)     cmd_self_update "$@" ;;
         recover)         cmd_recover "$@" ;;
         selftest)        cmd_selftest "$@" ;;
@@ -213,6 +215,7 @@ _wv_dispatch() {
         edge-types)      cmd_edge_types "$@" ;;
         guide)           cmd_guide "$@" ;;
         init-repo)       cmd_init_repo "$@" ;;
+        config)          cmd_config "$@" ;;
 
         # Quality / analysis / query commands
         quality)            cmd_quality "$@" ;;

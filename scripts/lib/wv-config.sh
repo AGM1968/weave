@@ -41,6 +41,37 @@ WV_HOT_SIZE=${WV_HOT_SIZE:-512}
 # Maximum database size in bytes. Default 50MB.
 WV_MAX_DB_SIZE=${WV_MAX_DB_SIZE:-52428800}
 
+# ───────────────────────────────────────────────────────────────────────────
+# Global user knobs — disk-sourced every invocation (CLI + hook-spawned)
+# ───────────────────────────────────────────────────────────────────────────
+# User-global opt-in knobs (e.g. WV_CALL_LOG) live in $WV_CONFIG_DIR/config.env,
+# not a shell `export`. Reading from disk on every invocation means enablement
+# survives reboot AND does not depend on env inheritance — a harness-spawned hook
+# `wv` call reads the same file the interactive shell does, so CLI and hook paths
+# can never disagree (resolves the WV_CALL_LOG env-inheritance split-brain).
+# Managed via `wv config`. Safe + zero-overhead when the file is absent.
+WV_CONFIG_DIR="${WV_CONFIG_DIR:-$HOME/.config/weave}"
+_wv_env_file="$WV_CONFIG_DIR/config.env"
+if [ -f "$_wv_env_file" ]; then
+    set -a
+    # shellcheck disable=SC1090  # path is user config, resolved at runtime
+    . "$_wv_env_file" 2>/dev/null || true
+    set +a
+fi
+unset _wv_env_file
+
+# Canonical default path for the opt-in session-analysis call log. Shared by the
+# `wv analyze sessions` reader and `wv config enable session-analysis` so the
+# writer and reader can never imply different locations (finding wv-e754b0 O1a).
+WV_CALL_LOG_DEFAULT="${WV_CALL_LOG_DEFAULT:-$HOME/.local/share/weave/wv_calls.jsonl}"
+
+# Canonical default path for the durable suite-run history log (LL2). The tmpfs
+# test_results table is current-state-only and wiped by `wv load`; this disk-backed
+# append-only JSONL survives wv load + reboot so commit-time friction can be
+# measured. Always-on (the writer is `wv test-record`); the PATH is overridable
+# via `wv config set WV_SUITE_LOG <path>`. Reader: `wv analyze suites` (LL3).
+WV_SUITE_LOG_DEFAULT="${WV_SUITE_LOG_DEFAULT:-$HOME/.local/share/weave/suite_runs.jsonl}"
+
 _WV_ENV_OVERRIDE_HOT_ZONE=$(resolve_env_override_hot_zone)
 if [ -n "$_WV_ENV_OVERRIDE_HOT_ZONE" ] && ! hot_zone_matches_repo "$_WV_ENV_OVERRIDE_HOT_ZONE" "$REPO_ROOT"; then
     _WV_ENV_OVERRIDE_OWNER=$(read_hot_zone_owner "$_WV_ENV_OVERRIDE_HOT_ZONE")

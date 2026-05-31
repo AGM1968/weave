@@ -280,12 +280,12 @@ describe("Weave MCP Server", () => {
   }, 60_000);
 
   describe("tools/list", () => {
-    it("should list all 43 tools (default scope=all)", async () => {
+    it("should list all 44 tools (default scope=all)", async () => {
       const response = await client.request("tools/list");
       expect(response.error).toBeUndefined();
 
       const tools = (response.result as { tools: { name: string }[] }).tools;
-      expect(tools).toHaveLength(43);
+      expect(tools).toHaveLength(44);
 
       const toolNames = tools.map((t) => t.name);
       expect(toolNames).toContain("weave_search");
@@ -311,6 +311,7 @@ describe("Weave MCP Server", () => {
       expect(toolNames).toContain("weave_learnings");
       expect(toolNames).toContain("weave_update");
       expect(toolNames).toContain("weave_touch");
+      expect(toolNames).toContain("weave_trails");
       expect(toolNames).toContain("weave_breadcrumbs");
       expect(toolNames).toContain("weave_plan");
       expect(toolNames).toContain("weave_show");
@@ -565,7 +566,18 @@ describe("Weave MCP Server", () => {
       expect(result.content).toBeDefined();
     });
 
-    it("weave_breadcrumbs show should return content", async () => {
+    it("weave_trails show should return content", async () => {
+      const response = await client.request("tools/call", {
+        name: "weave_trails",
+        arguments: { action: "show" },
+      });
+
+      expect(response.error).toBeUndefined();
+      const result = response.result as { content: { text: string }[] };
+      expect(result.content).toBeDefined();
+    });
+
+    it("weave_breadcrumbs (deprecated alias) show should return content", async () => {
       const response = await client.request("tools/call", {
         name: "weave_breadcrumbs",
         arguments: { action: "show" },
@@ -1084,12 +1096,13 @@ describe("Weave MCP Server --scope=session", () => {
         "weave_overview",
         "weave_bootstrap",
         "weave_close_session",
+        "weave_trails",
         "weave_breadcrumbs",
         "weave_plan",
         "weave_edit_guard",
       ])
     );
-    expect(tools).toHaveLength(11);
+    expect(tools).toHaveLength(12);
   });
 });
 

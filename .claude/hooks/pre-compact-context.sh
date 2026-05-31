@@ -79,18 +79,28 @@ LEARNINGS=$(sqlite3 -json "$WV_DB" "
     ORDER BY updated_at DESC LIMIT 3;
 " 2>/dev/null | jq -c '.' 2>/dev/null) || LEARNINGS="[]"
 
-# Breadcrumbs for active nodes (session memory capsules)
+# Breadcrumbs for active nodes (session memory capsules).
+# Trails epic: read the newest entry from metadata.trails[] (append-only, newest
+# is the last element), falling back to legacy metadata.breadcrumbs for nodes not
+# yet migrated. json_each + ROW_NUMBER avoids the $.trails[#-1] index syntax,
+# which only exists in SQLite >= 3.42 (dev/consumer machines may run older).
 BREADCRUMBS=$(sqlite3 -json "$WV_DB" "
-    SELECT id,
-           json_extract(metadata, '$.breadcrumbs.goal') as goal,
-           json_extract(metadata, '$.breadcrumbs.state') as state,
-           json_extract(metadata, '$.breadcrumbs.next') as next_step,
-           json_extract(metadata, '$.breadcrumbs.files') as files,
-           json_extract(metadata, '$.breadcrumbs.blocking') as blocking
-    FROM nodes
-    WHERE status='active'
-      AND json_extract(metadata, '$.breadcrumbs') IS NOT NULL
-    ORDER BY updated_at DESC LIMIT 3;
+    SELECT n.id,
+           COALESCE(json_extract(lt.entry, '$.goal'),     json_extract(n.metadata, '$.breadcrumbs.goal'))     as goal,
+           COALESCE(json_extract(lt.entry, '$.state'),    json_extract(n.metadata, '$.breadcrumbs.state'))    as state,
+           COALESCE(json_extract(lt.entry, '$.next'),     json_extract(n.metadata, '$.breadcrumbs.next'))     as next_step,
+           COALESCE(json_extract(lt.entry, '$.files'),    json_extract(n.metadata, '$.breadcrumbs.files'))    as files,
+           COALESCE(json_extract(lt.entry, '$.blocking'), json_extract(n.metadata, '$.breadcrumbs.blocking')) as blocking
+    FROM nodes n
+    LEFT JOIN (
+        SELECT nodes.id AS nid, je.value AS entry,
+               ROW_NUMBER() OVER (PARTITION BY nodes.id ORDER BY je.key DESC) AS rn
+        FROM nodes, json_each(nodes.metadata, '$.trails') je
+    ) lt ON lt.nid = n.id AND lt.rn = 1
+    WHERE n.status='active'
+      AND (json_extract(n.metadata, '$.trails') IS NOT NULL
+           OR json_extract(n.metadata, '$.breadcrumbs') IS NOT NULL)
+    ORDER BY n.updated_at DESC LIMIT 3;
 " 2>/dev/null | jq -c '.' 2>/dev/null) || BREADCRUMBS="[]"
 
 # Output as structured context

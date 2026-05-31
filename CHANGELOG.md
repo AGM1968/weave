@@ -2,6 +2,112 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.53.0] - 2026-05-31
+
+### Added
+
+- **`wv trails` — session context trail (replaces `wv breadcrumbs`).** Append-only storage for
+  session context notes: `wv trails save [--message="..."]` appends a timestamped entry;
+  `wv trails show` renders the current trail with staleness detection; `wv trails capsule <id>`
+  attaches the trail to a node on close. The trail is capped and compressed on context compaction.
+  `wv breadcrumbs` remains as a back-compat alias across CLI and MCP. The `trails` skill replaces
+  the `breadcrumbs` skill.
+- **`wv hotzone db`** — prints the resolved `brain.db` path for the current repo. Prevents agents
+  from hand-rolling `/dev/shm` vs `/tmp/weave-codex-*` paths for raw `sqlite3` calls — a guessed
+  path errors and, in a parallel tool batch, cancels sibling calls.
+- **`wv pattern-audit` Check 6 — node-state invariant for deferral.** Fails when a node declares
+  deferral in metadata (`deferred=true` or `blocked_on` set) while still in the ready queue
+  (status=todo with no inbound blocking edge). Promotes a recurring learning from two separate
+  findings to an enforced gate. `wv doctor` gains a matching advisory.
+- **Phase 6 — verification boundary (test-correctness gate).** `wv done` is now the single owner of
+  the "is this correct?" decision for tests as well as structural quality. A producer/consumer split
+  (PROPOSAL graph-as-policy-boundary §4.6): suites record outcomes, `wv done` reads them and
+  decides; it never runs a test runner.
+  - **`test_results` ledger + `wv test-record <suite> --files=… --exit=N`** — one row per file keyed
+    `(suite, path)`, fingerprint = the file's git blob hash. pre-commit and post-commit hooks record
+    their suite outcomes automatically.
+  - **`file_test_status` + `_done_refresh_test_status`** — before the status flip, each touched file
+    is derived green / red / stale / unknown by comparing the recorded fingerprint to the file's
+    current blob (the same pure function both sides compute).
+  - **`test_gate` policy (0=off, 1=warn, 2=block), default off.** `block` ABORTs the close via the
+    `nodes_policy_check` trigger; `warn` emits a non-blocking advisory in `wv done`. Honors
+    `quality_exempt`, the non-code node types `finding`/`epic`/`session_history`, and
+    `--skip-verification` (suppresses the warn advisory; block is a hard gate).
+  - **Single-source trigger.** `nodes_policy_check` is now emitted from one `_policy_trigger_sql()`
+    definition (mccabe + trend + test clauses); `db_init` and the last migration recreate it from
+    there, ending the hand-copied-trigger drift hazard.
+- **Durable gate config — `.weave/quality.conf [thresholds]`.** A new section sets
+  `policy_thresholds` on every `wv load` (the same durable seam as `[exempt]`), so a repo's gate
+  policy survives reboot (tmpfs `brain.db` / `policy_thresholds` is not in `state.sql`).
+- **Impact-grounded pre-claim advisory.** `pre-claim-skills.sh` now enriches the pre-mortem advisory
+  with real `wv impact` blast radius (impacted count, risk score, high-risk nodes, affected suites)
+  and recognizes the `premortem` metadata key, ending a spurious risk-label nag.
+- **`wv config` — one front door for the opt-in knobs (onboarding).**
+  `list | get | set | unset | enable | disable`. `wv config enable session-analysis` writes
+  `WV_CALL_LOG` to a new disk-sourced `~/.config/weave/config.env` (override dir `WV_CONFIG_DIR`)
+  and creates the log dir; `wv config enable test-gate [warn|block]` writes the durable
+  `.weave/quality.conf [thresholds]` and applies it live. No more memorising env-var names or config
+  paths.
+- **Disk-sourced global knobs (`config.env`).** `wv` reads `config.env` on every invocation — CLI
+  and harness-spawned hooks alike — so enablement survives reboot and no longer depends on env
+  inheritance (resolves the session-analysis log under-counting hook traffic).
+- **`wv doctor` verification-layer checks.** Surfaces `test_gate` state, warns when the gate is set
+  in the tmpfs DB but absent from `.weave/quality.conf` (session-only, resets on reboot), warns when
+  `test-map.conf` is missing while the gate is live, and reports the `test_results` ledger count.
+- **Suite-run cost tracking (`duration_ms`).** Each suite run is now timed: pre-commit and
+  post-commit hooks measure wall-clock cost and pass it to `wv test-record --duration=MS`. The
+  `test_results` ledger gains a `duration_ms` column (migrated in place), making per-suite run cost
+  available wherever the ledger is consumed.
+- **Durable suite-run history (`suite_runs.jsonl`).** `wv test-record` appends one JSONL line per
+  suite run to an always-on disk log (`~/.local/share/weave/suite_runs.jsonl`, overridable via
+  `wv config set WV_SUITE_LOG <path>`). The log survives `wv load` and reboot — unlike the tmpfs
+  `test_results` table, which is current-state only. Each row records
+  `{ts, repo, suite, files, exit, duration_ms, sha}`. No file content, no absolute paths.
+- **`wv analyze suites` — suite-run history report.** Aggregates the durable history log per suite:
+  run count, pass/fail counts, total / avg / p95 duration. Heaviest suites sorted first. Defaults to
+  the current repo; `--all` shows all repos; `--repo=<path>` narrows to one. JSON in
+  discover/bootstrap mode, text table otherwise.
+- **`wv config --show-origin` — config provenance.** `wv config list --show-origin` annotates each
+  active knob with the file that provides it (`config.env`, `quality.conf`, or "builtin default").
+  `wv config get <KEY> --show-origin` prints the effective value and its source layer. Mirrors
+  `git config --show-origin`; becomes essential once the per-repo user override layer lands.
+- **`wv config enable test-gate` scaffolds `test-map.conf`.** When the gate is enabled and no
+  `test-map.conf` exists, a commented starter file is written to `.weave/`. The scaffold detects the
+  repo stack (pyproject.toml → Python, Cargo.toml → Rust, package.json → Node, Makefile → shell) and
+  emits language-appropriate wrapper-script examples. Never auto-enforced — user must edit and
+  uncomment. Removes the blank-page barrier to activating the gate.
+
+### Fixed
+
+- **Honest session-analysis reader.** `wv analyze sessions --call-stats` no longer implies a default
+  log path the writer never populates. With logging off it reports "instrumentation disabled" and
+  points to `wv config enable session-analysis`; "enabled but empty" is a distinct message.
+- **pre-commit hook lib resolution.** The hook now resolves its lib dir like the `wv` binary does
+  (repo-local `scripts/lib/` first, then the installed `~/.local/lib/weave/lib`). Consumer repos
+  that run the installed binary and have no `scripts/lib/` previously lost `wv_set_phase` and the
+  validators silently; they now self-heal from the installed libs.
+- **`wv impact --files` fallback when no node tracks the path.** Previously returned a blank "0
+  impacted, 0 suites" — readable as "safe" — when no node recorded the file in `touched_files`. Now
+  consults `_impact_suites_for_files` so affected suites still surface, and warns "blast radius
+  unknown, NOT safe" so the caller knows the graph coverage gap.
+- **Auto-checkpoint hijack guard runs before `git pull --autostash`.** The guard that prevents the
+  checkpoint from absorbing in-progress staged files previously ran after the pull, at which point
+  autostash had already unstaged them. Moved before the pull so staged non-`.weave/` files abort the
+  checkpoint before any index-touching operation.
+- **Stray empty root lock files removed.** Spurious empty lock files in the repo root caused by an
+  edge case in the lock-file cleanup path are removed; `.gitignore` updated to prevent recurrence.
+
+### Documentation
+
+- `docs/WEAVE.md § 4.7` (verification boundary), `docs/DEVELOPMENT.md` (gate machinery), README +
+  README.public "Verification Gates" sections, and `wv guide --topic=verification`. `wv impact`
+  added to the command references (was missing).
+- New `wv guide --topic=instrumentation` and an "Opt-in instrumentation" knob table in README +
+  README.public covering `wv config`, `config.env`, and the verification-gate toggle.
+- New `wv guide --topic=config` — two-layer ownership matrix (user-global `config.env` vs
+  repo-committed `quality.conf`), ownership rule, `wv config` quick reference with `--show-origin`,
+  gitignore boundary, and related-topic pointers.
+
 ## [1.52.1] - 2026-05-29
 
 ### Fixed

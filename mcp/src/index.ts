@@ -24,7 +24,7 @@
  *   weave_quick    - Quick-add and start working
  *   weave_work     - Claim a node to work on
  *   weave_ship     - Complete + sync in one step; pending Git sync is surfaced separately
- *   weave_overview - Session start overview (status + digest + breadcrumbs)
+ *   weave_overview - Session start overview (status + digest + trails)
  *   weave_bootstrap - Single-call session context (status + context + ready + learnings)
  *   weave_show     - Single-node detail view
  *   weave_touch   - Fire-and-forget metadata write (zero token cost)
@@ -73,6 +73,7 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_overview",
     "weave_bootstrap",
     "weave_close_session",
+    "weave_trails",
     "weave_breadcrumbs",
     "weave_plan",
     "weave_edit_guard",
@@ -767,7 +768,7 @@ const TOOLS: Tool[] = [
   {
     name: "weave_overview",
     description:
-      "Get a session-start overview: status summary, health digest, context policy, breadcrumbs, and ready work. Status and ready sections default to discover mode for agent callers.",
+      "Get a session-start overview: status summary, health digest, context policy, trails, and ready work. Status and ready sections default to discover mode for agent callers.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1039,8 +1040,28 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "weave_trails",
+    description:
+      "Save, show, or clear session trails (append-only handoff path). Use to leave context notes for future sessions or agents.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["save", "show", "clear"],
+          description: "Action to perform (default: show)",
+        },
+        message: {
+          type: "string",
+          description: "Session note to save (required when action is 'save')",
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "weave_breadcrumbs",
-    description: "Save, show, or clear session breadcrumbs. Use to leave context notes for future sessions or agents.",
+    description: "Deprecated alias for weave_trails (kept one release for back-compat). Use weave_trails.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1675,7 +1696,7 @@ function handleTool(
         /* skip */
       }
       try {
-        parts.push("\n=== Breadcrumbs ===\n" + wv(["breadcrumbs", "show"]));
+        parts.push("\n=== Trails ===\n" + wv(["trails", "show"]));
       } catch {
         /* skip */
       }
@@ -2033,10 +2054,12 @@ function handleTool(
       break;
     }
 
+    case "weave_trails":
     case "weave_breadcrumbs": {
+      // weave_breadcrumbs is a back-compat alias; both route to the `trails` CLI.
       const action = (args.action as string) || "show";
       const message = args.message as string | undefined;
-      const cmd = ["breadcrumbs", action];
+      const cmd = ["trails", action];
       if (action === "save" && message) cmd.push(`--message=${message}`);
       result = wv(cmd);
       break;
@@ -2184,7 +2207,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.52.1",
+      version: "1.53.0",
     },
     {
       capabilities: {

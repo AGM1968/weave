@@ -65,7 +65,7 @@ _wv_run_cache_is_write_cmd() {
 _wv_run_cache_is_exempt_cmd() {
     case "${1:-}" in
         # Read-only brain.db readers
-        analyze|audit-pitfalls|pattern-audit|bootstrap-agent|breadcrumbs|context|digest|doctor|\
+        analyze|audit-pitfalls|pattern-audit|bootstrap-agent|breadcrumbs|trails|context|digest|doctor|\
         edges|edge-types|guide|health|impact|learnings|mcp-status|overview|path|\
         pending-close|preflight|query|refs|related|search|show|status|tree|validate-finding)
             return 0 ;;

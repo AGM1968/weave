@@ -1,7 +1,7 @@
 #!/bin/bash
 # wv-cmd-data.sh — Data management commands
 #
-# Commands: batch, plan, enrich-topology, sync, load, prune, clean-ghosts, learnings, refs, import, search, reindex, breadcrumbs
+# Commands: batch, plan, enrich-topology, sync, load, prune, clean-ghosts, learnings, refs, import, search, reindex, trails (alias: breadcrumbs)
 # Sourced by: wv entry point (after lib modules)
 # Dependencies: wv-config.sh, wv-db.sh, wv-validate.sh, wv-cache.sh
 
@@ -257,6 +257,28 @@ auto_checkpoint() {
     # Write stamp BEFORE commit to prevent re-entry
     echo "$now" > "$cp_stamp"
 
+    # Hijack guard — must run BEFORE the pull below. `git pull --autostash`
+    # stashes the caller's staged files and pops them back UNSTAGED, which would
+    # defeat a post-pull guard and let the checkpoint churn an in-progress manual
+    # commit. So bail out here, before any index-touching op, when the caller has
+    # pre-staged anything outside .weave/. Escape hatch: WV_CHECKPOINT_ALL=1.
+    if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
+        local _git_root_guard prestaged
+        _git_root_guard=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+        if [ -n "$_git_root_guard" ]; then
+            prestaged=$(git -C "$_git_root_guard" diff --cached --name-only 2>/dev/null \
+                | grep -v '^\.weave/' || true)
+            if [ -n "$prestaged" ]; then
+                {
+                    echo "wv: auto-checkpoint skipped — non-.weave/ files already staged by caller:"
+                    echo "$prestaged" | sed 's/^/  /'
+                    echo "wv: finish your commit first, or set WV_CHECKPOINT_ALL=1 to override."
+                } >&2
+                return 0
+            fi
+        fi
+    fi
+
     # Pull remote changes first to prevent divergence races.
     # --rebase keeps history linear; --autostash handles our dirty .weave/ files.
     # Detect rebase conflicts instead of silently swallowing — a dirty rebase
@@ -286,22 +308,8 @@ auto_checkpoint() {
         # Legacy mode: stage everything (breaks intentional commits)
         git -C "$git_root" add -A >/dev/null 2>&1 || return 0
     else
-        # Hijack guard: if the caller pre-staged anything outside .weave/,
-        # our checkpoint would absorb their intentional commit's payload
-        # under a generic auto-checkpoint message. Refuse (exit 0, no commit)
-        # and warn to stderr. Escape hatch: WV_CHECKPOINT_ALL=1.
-        local prestaged
-        prestaged=$(git -C "$git_root" diff --cached --name-only 2>/dev/null \
-            | grep -v '^\.weave/' || true)
-        if [ -n "$prestaged" ]; then
-            {
-                echo "wv: auto-checkpoint skipped — non-.weave/ files already staged by caller:"
-                echo "$prestaged" | sed 's/^/  /'
-                echo "wv: finish your commit first, or set WV_CHECKPOINT_ALL=1 to override."
-            } >&2
-            return 0
-        fi
-        # Safe mode: only stage .weave/ graph state
+        # Safe mode: only stage .weave/ graph state. The hijack guard ran earlier
+        # (before the pull) so by here no caller files are staged outside .weave/.
         git -C "$git_root" add .weave/ >/dev/null 2>&1 || return 0
     fi
 
@@ -607,11 +615,19 @@ cmd_sync() {
     fi
 }
 
-# _load_quality_config — Populate quality_exempt table from .weave/quality.conf [exempt] section.
-# Reads the [exempt] section: each non-comment, non-blank line is a path pattern.
-# Trailing '/' patterns match directory prefixes (handled in _is_quality_exempt via LIKE).
-# Also DELETEs stale file_metrics rows that match current exempt patterns.
-# Safe to call on empty/missing config — clears table and returns 0.
+# _load_quality_config — Populate quality_exempt + policy_thresholds from .weave/quality.conf.
+#
+# [exempt]      each non-comment, non-blank line is a path pattern. Trailing '/' patterns match
+#               directory prefixes (handled in _is_quality_exempt via LIKE). Stale file_metrics
+#               rows matching a pattern are also deleted.
+# [thresholds]  key = value lines override policy_thresholds defaults (INSERT OR REPLACE). This is
+#               the DURABLE config seam: the brain.db is tmpfs and policy_thresholds is NOT in
+#               state.sql, so without this a raw-SQL threshold change resets to defaults on the next
+#               cold-start/wv load. Committing [thresholds] makes a repo's gate policy (e.g.
+#               test_gate = 1) persist. Runs after migrations seed defaults, so config wins.
+#
+# Safe to call on empty/missing config — clears quality_exempt and returns 0 (thresholds keep their
+# seeded defaults when the section is absent).
 _load_quality_config() {
     local config_file="$WEAVE_DIR/quality.conf"
 
@@ -620,26 +636,40 @@ _load_quality_config() {
 
     [ ! -f "$config_file" ] && return 0
 
-    local in_exempt=0 pattern
+    local section="" pattern
     while IFS= read -r line; do
         # Section header
         if [[ "$line" =~ ^\[([a-z_]+)\] ]]; then
-            [[ "${BASH_REMATCH[1]}" == "exempt" ]] && in_exempt=1 || in_exempt=0
+            section="${BASH_REMATCH[1]}"
             continue
         fi
-        [ "$in_exempt" -eq 0 ] && continue
-        # Strip inline comments and whitespace
-        pattern="${line%%#*}"
-        pattern="${pattern// /}"
-        [ -z "$pattern" ] && continue
-        local pat_esc
-        pat_esc=$(echo "$pattern" | sed "s/'/''/g")
-        sqlite3 "$WV_DB" "INSERT OR IGNORE INTO quality_exempt(path_pattern) VALUES('$pat_esc');" 2>/dev/null || true
-        # Remove stale file_metrics entries matching this exemption
-        if [[ "$pattern" == */ ]]; then
-            sqlite3 "$WV_DB" "DELETE FROM file_metrics WHERE path LIKE '${pat_esc}%';" 2>/dev/null || true
-        else
-            sqlite3 "$WV_DB" "DELETE FROM file_metrics WHERE path = '$pat_esc';" 2>/dev/null || true
+
+        if [ "$section" = "exempt" ]; then
+            # Strip inline comments and whitespace
+            pattern="${line%%#*}"
+            pattern="${pattern// /}"
+            [ -z "$pattern" ] && continue
+            local pat_esc
+            pat_esc=$(echo "$pattern" | sed "s/'/''/g")
+            sqlite3 "$WV_DB" "INSERT OR IGNORE INTO quality_exempt(path_pattern) VALUES('$pat_esc');" 2>/dev/null || true
+            # Remove stale file_metrics entries matching this exemption
+            if [[ "$pattern" == */ ]]; then
+                sqlite3 "$WV_DB" "DELETE FROM file_metrics WHERE path LIKE '${pat_esc}%';" 2>/dev/null || true
+            else
+                sqlite3 "$WV_DB" "DELETE FROM file_metrics WHERE path = '$pat_esc';" 2>/dev/null || true
+            fi
+        elif [ "$section" = "thresholds" ]; then
+            # key = value (inline comments stripped). Validate key (safe identifier) and
+            # value (numeric) before write — these splice into SQL and drive the done gate.
+            local kv key val
+            kv="${line%%#*}"
+            key="${kv%%=*}"; key="${key// /}"
+            val="${kv#*=}"; val="${val// /}"
+            [ -z "$key" ] && continue
+            [ "$key" = "$kv" ] && continue   # no '=' on the line
+            [[ "$key" =~ ^[a-z_]+$ ]] || continue
+            [[ "$val" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || continue
+            sqlite3 "$WV_DB" "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES('$key', $val);" 2>/dev/null || true
         fi
     done < "$config_file"
 }
@@ -749,6 +779,9 @@ EOF
         db_migrate_policy_tables
         db_migrate_language_trigger
         db_migrate_quality_exempt
+        db_migrate_test_results
+        # MUST run last among policy migrations — authoritative trigger via emitter.
+        db_migrate_test_gate
         # Rebuild FTS index from node data (selective dump excludes FTS tables)
         db_rebuild_fts
         # Initialize delta change tracking on the freshly loaded DB (idempotent).
@@ -890,11 +923,47 @@ EOF
         echo -e "${YELLOW}No state.sql found, initialized empty database${NC}" >&2
     fi
 
+    # Seed metadata.trails[0] from any legacy metadata.breadcrumbs (trails epic D1).
+    # Runs after delta replay so it also covers nodes brought in by deltas.
+    # Idempotent: only acts where breadcrumbs is present and trails is absent;
+    # non-destructive (the legacy breadcrumbs key is left intact for one release).
+    _migrate_trails_seed
+
+    # Rename the legacy .weave/breadcrumbs.md rendered file to trails.md (D1).
+    _migrate_trails_file
+
     # Load quality exemptions from .weave/quality.toml (if present) into brain.db.
     _load_quality_config
 
     # Save session start snapshot for activity summary
     _save_session_snapshot
+}
+
+# _migrate_trails_seed — back-fill metadata.trails[] from legacy metadata.breadcrumbs.
+# Set-based UPDATE (one statement, no per-node loop). json(json_extract(...))
+# re-parses the extracted object so json_array embeds it as an object element,
+# not a quoted string. Safe to run on every load.
+_migrate_trails_seed() {
+    db_query "
+        UPDATE nodes
+        SET metadata = json_set(metadata, '\$.trails', json_array(json(json_extract(metadata, '\$.breadcrumbs'))))
+        WHERE json_extract(metadata, '\$.breadcrumbs') IS NOT NULL
+          AND json_extract(metadata, '\$.trails') IS NULL;
+    " 2>/dev/null || true
+}
+
+# _migrate_trails_file — rename the legacy rendered file .weave/breadcrumbs.md to
+# .weave/trails.md (trails epic D1). Only acts when the legacy file exists and the
+# new file does not, so it is idempotent and never clobbers a fresh trails.md.
+# Guarded by _should_persist_weave_state so it never materializes WEAVE_DIR for
+# uninitialized repos or hooks running from $HOME.
+_migrate_trails_file() {
+    _should_persist_weave_state || return 0
+    local legacy="$WEAVE_DIR/breadcrumbs.md"
+    local current="$WEAVE_DIR/trails.md"
+    if [ -f "$legacy" ] && [ ! -f "$current" ]; then
+        mv "$legacy" "$current" 2>/dev/null || true
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2606,47 +2675,110 @@ cmd_reindex() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# cmd_breadcrumbs — Session context dump/restore for continuity
+# cmd_trails — Session context dump/restore for continuity (trails epic S3).
+# Canonical command is `wv trails`; `wv breadcrumbs` aliases here for one release.
+# The on-disk file is .weave/trails.md; the legacy .weave/breadcrumbs.md is read
+# as a fallback (and migrated by cmd_load) so existing repos keep working.
 # ═══════════════════════════════════════════════════════════════════════════
 
-cmd_breadcrumbs() {
+cmd_trails() {
     local action="${1:-show}"
     shift || true
-    local message=""
+    local message="" entry_json="" target_id=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --message=*|--msg=*) message="${1#*=}" ;;
-            save|show|clear) action="$1" ;;
+            --json=*) entry_json="${1#*=}" ;;
+            save|show|clear|capsule) action="$1" ;;
+            wv-*) target_id="$1" ;;
         esac
         shift
     done
 
-    local breadcrumb_file="$WEAVE_DIR/breadcrumbs.md"
+    local trail_file="$WEAVE_DIR/trails.md"
+    local legacy_file="$WEAVE_DIR/breadcrumbs.md"
 
     case "$action" in
+        capsule)
+            _trails_append "$target_id" "$entry_json"
+            ;;
         save)
-            _breadcrumbs_save "$breadcrumb_file" "$message"
+            _trails_save "$trail_file" "$message"
             ;;
         show)
-            if [ ! -f "$breadcrumb_file" ]; then
-                echo "No breadcrumbs found. Start a session and run: wv breadcrumbs save"
-                return 0
+            # Prefer the new file; fall back to the legacy breadcrumbs.md so a
+            # repo that has not yet been migrated still shows its handoff state.
+            if [ -f "$trail_file" ]; then
+                cat "$trail_file"
+            elif [ -f "$legacy_file" ]; then
+                cat "$legacy_file"
+            else
+                echo "No trails found. Start a session and run: wv trails save"
             fi
-            cat "$breadcrumb_file"
             ;;
         clear)
-            rm -f "$breadcrumb_file"
-            echo -e "${GREEN}✓${NC} Breadcrumbs cleared."
+            rm -f "$trail_file" "$legacy_file"
+            echo -e "${GREEN}✓${NC} Trails cleared."
             ;;
         *)
-            echo -e "${RED}Error: unknown action '$action'. Use: show, save, clear${NC}" >&2
+            echo -e "${RED}Error: unknown action '$action'. Use: show, save, clear, capsule${NC}" >&2
             return 1
             ;;
     esac
 }
 
-_breadcrumbs_save() {
+# _trails_append — append a session-handoff capsule to a node's metadata.trails[]
+# (S1 of the trails epic). Append-only: never overwrites. json_patch (used by
+# `wv update --metadata`) replaces arrays atomically, so it cannot append — this
+# helper does a read-modify-write. Seeds trails from any legacy
+# metadata.breadcrumbs object on first append so existing capsules are preserved.
+_trails_append() {
+    local id="$1" entry_json="$2"
+
+    if [ -z "$id" ]; then
+        echo -e "${RED}Error: node id required (e.g. wv trails capsule wv-ab12 --json='{...}')${NC}" >&2
+        return 1
+    fi
+    validate_id "$id" || return 1
+    if ! echo "$entry_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        echo -e "${RED}Error: --json must be a JSON object${NC}" >&2
+        return 1
+    fi
+
+    local cur_meta
+    cur_meta=$(db_query "SELECT COALESCE(metadata,'{}') FROM nodes WHERE id='$(sql_escape "$id")';")
+    if [ -z "$cur_meta" ]; then
+        echo -e "${RED}Error: node $id not found${NC}" >&2
+        return 1
+    fi
+
+    # Cap policy (S2): keep the last N entries so the append-only list stays
+    # bounded on long-running nodes. Configurable via WV_TRAILS_CAP (default 8).
+    local cap="${WV_TRAILS_CAP:-8}"
+    [[ "$cap" =~ ^[0-9]+$ ]] && [ "$cap" -gt 0 ] || cap=8
+
+    local new_meta
+    new_meta=$(echo "$cur_meta" | jq -c --argjson e "$entry_json" --argjson cap "$cap" '
+        # Seed trails from legacy breadcrumbs on first append, then push the entry.
+        # Stamp "at" if the caller did not supply one (newest-last in storage).
+        (.trails // (if .breadcrumbs then [.breadcrumbs] else [] end)) as $t
+        | ($t + [ $e + (if ($e | has("at")) then {} else {at: (now | todateiso8601)} end) ]) as $all
+        # Bounded growth: keep only the most recent $cap entries.
+        | .trails = (if ($all | length) > $cap then $all[($all | length - $cap):] else $all end)
+    ') || {
+        echo -e "${RED}Error: failed to build trail entry${NC}" >&2
+        return 1
+    }
+    new_meta="${new_meta//\'/\'\'}"
+    db_query "UPDATE nodes SET metadata='$new_meta', updated_at=CURRENT_TIMESTAMP WHERE id='$(sql_escape "$id")';"
+
+    local count
+    count=$(echo "$new_meta" | jq '.trails | length' 2>/dev/null || echo "?")
+    echo -e "${GREEN}✓${NC} Trail entry appended to $id ($count total)"
+}
+
+_trails_save() {
     local breadcrumb_file="$1"
     local message="$2"
 
@@ -2659,7 +2791,7 @@ _breadcrumbs_save() {
     mkdir -p "$(dirname "$breadcrumb_file")"
 
     {
-        echo "# Session Breadcrumbs"
+        echo "# Session Trails"
         echo ""
         echo "_Saved: $(date '+%Y-%m-%d %H:%M:%S')_"
         echo ""
@@ -2794,7 +2926,7 @@ _breadcrumbs_save() {
 
     } > "$breadcrumb_file"
 
-    echo -e "${GREEN}✓${NC} Breadcrumbs saved to .weave/breadcrumbs.md"
+    echo -e "${GREEN}✓${NC} Trails saved to .weave/trails.md"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

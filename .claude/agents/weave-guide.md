@@ -12,12 +12,14 @@ dependency management, and knowledge capture.
 ## MCP Server
 
 > **Context-dependent tool access:**
-> - **Agents with Bash tool** (e.g. Claude Code, shell-capable SDK agents): Use `wv` CLI via Bash (tools listed in frontmatter above)
+>
+> - **Agents with Bash tool** (e.g. Claude Code, shell-capable SDK agents): Use `wv` CLI via Bash
+>   (tools listed in frontmatter above)
 > - **Agents without Bash** (e.g. Copilot Chat, MCP-only clients): Use MCP tools below
 
 This agent uses the **`weave`** MCP server (all 31 tools available). Its primary tools are the
 workflow lifecycle operations: `weave_work`, `weave_ship`, `weave_quick`, `weave_overview`,
-`weave_close_session`, `weave_breadcrumbs`, `weave_plan`, `weave_edit_guard`.
+`weave_close_session`, `weave_trails`, `weave_plan`, `weave_edit_guard`.
 
 ```jsonc
 // .mcp.json — server for this agent
@@ -220,7 +222,7 @@ wv block wv-CURRENT --by=$FIX
 wv link $FIX wv-CURRENT --type=relates_to
 
 # Preserve the handoff state
-wv breadcrumbs save --msg="Detected workflow issue, created repair node, next step is ..."
+wv trails save --msg="Detected workflow issue, created repair node, next step is ..."
 ```
 
 For unattended agent paths, avoid waiting forever on close-time prompts. Record a resumable

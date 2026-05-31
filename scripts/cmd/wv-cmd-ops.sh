@@ -248,9 +248,10 @@ cmd_bootstrap() {
     ")
     learnings_json="${learnings_json:-[]}"
 
-    # ── 5. Breadcrumbs (if present) ──
+    # ── 5. Trails (if present) ── prefer trails.md, fall back to legacy breadcrumbs.md
     local breadcrumb=""
-    local bc_file="${WEAVE_DIR}/breadcrumbs.md"
+    local bc_file="${WEAVE_DIR}/trails.md"
+    [ -f "$bc_file" ] || bc_file="${WEAVE_DIR}/breadcrumbs.md"
     if [ -f "$bc_file" ]; then
         breadcrumb=$(head -5 "$bc_file" | grep -v '^#' | grep -v '^$' | head -1 | sed 's/^[[:space:]]*//')
     fi
@@ -444,9 +445,10 @@ cmd_overview() {
         AND id NOT IN (SELECT target FROM edges);")
     total_edges=$(db_query "SELECT COUNT(*) FROM edges;")
 
-    # Breadcrumb — stored as markdown at $WEAVE_DIR/breadcrumbs.md
+    # Trail — stored as markdown at $WEAVE_DIR/trails.md (legacy breadcrumbs.md fallback)
     local breadcrumb=""
-    local bc_file="${WEAVE_DIR}/breadcrumbs.md"
+    local bc_file="${WEAVE_DIR}/trails.md"
+    [ -f "$bc_file" ] || bc_file="${WEAVE_DIR}/breadcrumbs.md"
     if [ -f "$bc_file" ]; then
         breadcrumb=$(grep -v '^#' "$bc_file" | grep -v '^$' | head -1 | sed 's/^[[:space:]]*//')
     fi
@@ -469,7 +471,7 @@ cmd_overview() {
         echo "  Nodes: $total ($active active, $ready_count ready, $blocked blocked, $done_c done)"
         echo "  Edges: $total_edges (${ghost_edges} ghost)"
         [ "$orphans" -gt 0 ] && echo "  ⚠ $orphans orphan nodes"
-        [ -n "$breadcrumb" ] && echo "  Breadcrumb: $breadcrumb"
+        [ -n "$breadcrumb" ] && echo "  Trail: $breadcrumb"
         if [ "$ready_count" -gt 0 ]; then
             echo ""
             echo "  Ready work:"
@@ -1926,14 +1928,478 @@ cmd_hotzone() {
                 printf '  %-10s  %s  nodes=%-4s  owner=%s\n' "$label" "${d%/}" "$nodes" "${owner:-none}"
             done
             ;;
+        db|--db)
+            # Print the resolved brain.db path so agents/scripts never hand-roll
+            # /dev/shm vs /tmp/weave-codex paths in raw sqlite3 (finding wv-f752a5:
+            # a guessed path errors and — in a parallel tool batch — cancels its
+            # siblings). Use: DB=$(wv hotzone --db); sqlite3 "$DB" "..."
+            local hot_zone
+            hot_zone=$(resolve_repo_hot_zone)
+            echo "${WV_DB:-$hot_zone/brain.db}"
+            ;;
         *)
             echo "Usage: wv hotzone <subcommand>"
             echo ""
             echo "Subcommands:"
             echo "  gc [--dry-run]   Remove orphan hot-zone dirs (no .repo_root or dead owner)"
             echo "  list             Show all hot-zone dirs with owner + node count"
+            echo "  db               Print the resolved brain.db path (for raw sqlite3)"
             ;;
     esac
+}
+
+# _test_file_fingerprint <path> — content fingerprint of a SINGLE file for the
+# test_results ledger. git blob hash (pure function of content; identical whether
+# computed by the producer here or the consumer in _done_refresh_test_status),
+# with an mtime:size fallback for untracked files or when git is unavailable.
+# This is the single fingerprint definition both sides share — there is no
+# combined-over-a-set key for either side to reconstruct.
+_test_file_fingerprint() {
+    local f="$1" h
+    h=$(git hash-object "$f" 2>/dev/null)
+    [ -z "$h" ] && h=$(stat -c '%Y:%s' "$f" 2>/dev/null || echo "missing")
+    printf '%s' "$h"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_config — front door for the two durable opt-in seams (finding wv-e754b0)
+# ═══════════════════════════════════════════════════════════════════════════
+# Users should never have to memorise an env-var name or a config-file path:
+#   - Global knobs (WV_CALL_LOG, ...) -> $WV_CONFIG_DIR/config.env, sourced by
+#     wv-config.sh on EVERY CLI + hook invocation (survives reboot; no env
+#     inheritance dependency — resolves the session-analysis split-brain).
+#   - Repo gate policy (test_gate) -> $WEAVE_DIR/quality.conf [thresholds],
+#     loaded into the tmpfs policy_thresholds table by _load_quality_config.
+#     A raw sqlite3 UPDATE is session-only (tmpfs, not in state.sql); the
+#     [thresholds] section is the ONLY durable path.
+
+_config_env_file() { echo "${WV_CONFIG_DIR:-$HOME/.config/weave}/config.env"; }
+
+# _config_env_set KEY VALUE — upsert KEY="VALUE" in config.env (deduped, quoted).
+_config_env_set() {
+    local key="$1" val="$2" file tmp
+    if ! [[ "$key" =~ ^WV_[A-Z0-9_]+$ ]]; then
+        echo "wv config: invalid key '$key' (expected WV_[A-Z0-9_]+)" >&2
+        return 1
+    fi
+    file=$(_config_env_file)
+    mkdir -p "$(dirname "$file")"
+    tmp=$(mktemp)
+    {
+        echo "# Weave global knobs — sourced by wv on every invocation (CLI + hooks)."
+        echo "# Managed by 'wv config set/enable'."
+    } > "$tmp"
+    # Carry forward existing assignments except the key being set (and drop old comments).
+    if [ -f "$file" ]; then
+        grep -vE '^[[:space:]]*#' "$file" 2>/dev/null | grep -vE "^[[:space:]]*${key}=" >> "$tmp" || true
+    fi
+    echo "${key}=\"${val}\"" >> "$tmp"
+    mv "$tmp" "$file"
+    return 0
+}
+
+# _config_env_unset KEY — remove a KEY assignment from config.env.
+_config_env_unset() {
+    local key="$1" file tmp
+    file=$(_config_env_file)
+    [ -f "$file" ] || return 0
+    tmp=$(mktemp)
+    grep -vE "^[[:space:]]*${key}=" "$file" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$file"
+    return 0
+}
+
+# _config_set_threshold KEY VALUE — upsert KEY = VALUE under [thresholds] in
+# the repo's quality.conf (creates the section/file as needed). Durable seam.
+_config_set_threshold() {
+    local key="$1" val="$2" file="${WEAVE_DIR:-}/quality.conf"
+    if [ -z "${WEAVE_DIR:-}" ]; then
+        echo "wv config: not inside a Weave repo (no .weave dir) — gate policy is repo-scoped" >&2
+        return 1
+    fi
+    mkdir -p "$WEAVE_DIR"
+    python3 - "$file" "$key" "$val" <<'PY'
+import os, re, sys
+path, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(path, encoding="utf-8").read().splitlines() if os.path.exists(path) else []
+out, in_thr, seen_thr, done = [], False, False, False
+for line in lines:
+    m = re.match(r'^\[([a-z_]+)\]', line.strip())
+    if m:
+        if in_thr and not done:
+            out.append(f"{key} = {val}"); done = True
+        in_thr = (m.group(1) == "thresholds")
+        seen_thr = seen_thr or in_thr
+        out.append(line); continue
+    if in_thr and re.match(rf'^\s*{re.escape(key)}\s*=', line):
+        if not done:
+            out.append(f"{key} = {val}"); done = True
+        continue
+    out.append(line)
+if in_thr and not done:
+    out.append(f"{key} = {val}"); done = True
+if not seen_thr:
+    if out and out[-1].strip():
+        out.append("")
+    out += ["[thresholds]", f"{key} = {val}"]
+open(path, "w", encoding="utf-8").write("\n".join(out) + "\n")
+PY
+}
+
+_config_enable_session_analysis() {
+    local path="${WV_CALL_LOG_DEFAULT:-$HOME/.local/share/weave/wv_calls.jsonl}"
+    mkdir -p "$(dirname "$path")"
+    _config_env_set WV_CALL_LOG "$path" || return 1
+    echo -e "${GREEN}✓${NC} session-analysis enabled"
+    echo "  call log: $path"
+    echo "  config:   $(_config_env_file)"
+    echo "  Takes effect next wv invocation (CLI + hooks). Read: wv analyze sessions --call-stats"
+    return 0
+}
+
+# _scaffold_test_map — write a commented starter .weave/test-map.conf when absent.
+# Detects the repo stack (Python/Rust/Node/shell) and emits language-specific
+# examples. No-op if test-map.conf already exists. Never auto-enforced — the user
+# must edit and uncomment entries before the gate classifies any file.
+_scaffold_test_map() {
+    local tmap="${WEAVE_DIR}/test-map.conf"
+    [ -f "$tmap" ] && return 0
+
+    local repo_root; repo_root=$(dirname "$WEAVE_DIR")
+    # Header common to all stacks
+    local body
+    body='# .weave/test-map.conf — source file to test suite mapping
+# Format ([map] section, INI-style):
+#   source_file = suite [suite ...]
+# source_file: path relative to repo root (exact match, no globs)
+# suite:       path to a runnable shell script relative to repo root
+#
+# Uncomment and adapt the entries below. A file with no entry falls back to
+# the naming-convention heuristic or classifies as "unknown" (gate inert).
+
+[map]
+'
+    local added=0
+
+    if [ -f "$repo_root/pyproject.toml" ] || [ -f "$repo_root/setup.cfg" ] || [ -f "$repo_root/setup.py" ]; then
+        added=1
+        body+='# Python (pyproject.toml / setup.cfg detected)
+# Create a wrapper that sets up the env and runs pytest, e.g. scripts/run-tests.sh:
+#   #!/usr/bin/env bash
+#   set -e; cd "$(git rev-parse --show-toplevel)" && poetry run pytest tests
+# Then map source files to that wrapper:
+# src/mypackage/module.py  = scripts/run-tests.sh
+# src/mypackage/__init__.py = scripts/run-tests.sh
+
+'
+    fi
+
+    if [ -f "$repo_root/Cargo.toml" ]; then
+        added=1
+        body+='# Rust (Cargo.toml detected)
+# Create a wrapper, e.g. scripts/run-tests.sh:
+#   #!/usr/bin/env bash
+#   set -e; cd "$(git rev-parse --show-toplevel)" && cargo test
+# Then map source files:
+# src/lib.rs   = scripts/run-tests.sh
+# src/main.rs  = scripts/run-tests.sh
+
+'
+    fi
+
+    if [ -f "$repo_root/package.json" ]; then
+        added=1
+        body+='# Node.js (package.json detected)
+# Create a wrapper, e.g. scripts/run-tests.sh:
+#   #!/usr/bin/env bash
+#   set -e; cd "$(git rev-parse --show-toplevel)" && npm test
+# Then map source files:
+# src/index.js = scripts/run-tests.sh
+# src/app.ts   = scripts/run-tests.sh
+
+'
+    fi
+
+    if [ -f "$repo_root/Makefile" ]; then
+        added=1
+        if grep -qE '^test[[:space:]]*:' "$repo_root/Makefile" 2>/dev/null; then
+            body+='# Shell / Makefile (test target detected)
+# Map each source script to its test counterpart:
+# scripts/my-cmd.sh = tests/test-my-cmd.sh
+
+'
+        else
+            body+='# Makefile detected — map shell scripts to their test files:
+# scripts/my-cmd.sh = tests/test-my-cmd.sh
+
+'
+        fi
+    fi
+
+    if [ "$added" = "0" ]; then
+        body+='# Example: map a source file to its test script
+# scripts/my-command.sh = tests/test-my-command.sh
+
+'
+    fi
+
+    printf '%s' "$body" > "$tmap"
+    echo -e "  ${GREEN}✓${NC} scaffolded ${WEAVE_DIR}/test-map.conf — edit to match your project layout"
+    echo "     see: wv guide --topic=verification"
+}
+
+_config_enable_test_gate() {
+    local mode_val=1 label="warn"
+    case "${1:-warn}" in
+        warn|1)        mode_val=1; label="warn (advisory)" ;;
+        block|2|--block) mode_val=2; label="block (hard)" ;;
+        off|0)         mode_val=0; label="off" ;;
+        *) echo "wv config: test-gate mode must be warn|block|off" >&2; return 1 ;;
+    esac
+    _config_set_threshold test_gate "$mode_val" || return 1
+    _load_quality_config 2>/dev/null || true
+    echo -e "${GREEN}✓${NC} verification gate set to ${label} (test_gate=${mode_val})"
+    echo "  durable in: ${WEAVE_DIR}/quality.conf [thresholds]  (commit it to share the policy)"
+    if [ "$mode_val" != "0" ]; then
+        _scaffold_test_map
+    fi
+    return 0
+}
+
+# _config_key_source KEY — print the file that provides the effective value for KEY,
+# or "(builtin default)" if not set in any layer. Checks config.env (global knobs)
+# then quality.conf [thresholds] (repo gate). Used by --show-origin.
+_config_key_source() {
+    local key="$1"
+    local env_file; env_file=$(_config_env_file)
+    if grep -qE "^[[:space:]]*${key}=" "$env_file" 2>/dev/null; then
+        echo "$env_file"; return 0
+    fi
+    if [ -n "${WEAVE_DIR:-}" ] && grep -qE "^[[:space:]]*${key}[[:space:]]*=" "${WEAVE_DIR}/quality.conf" 2>/dev/null; then
+        echo "${WEAVE_DIR}/quality.conf"; return 0
+    fi
+    echo "builtin default"
+}
+
+_config_list() {
+    local show_origin=0
+    [ "${1:-}" = "--show-origin" ] && show_origin=1
+    local file; file=$(_config_env_file)
+    echo "Global knobs ($file):"
+    if [ -f "$file" ] && grep -qvE '^[[:space:]]*(#|$)' "$file" 2>/dev/null; then
+        if [ "$show_origin" = "1" ]; then
+            grep -vE '^[[:space:]]*(#|$)' "$file" | sed "s|^|  |;s|\$|    ($file)|"
+        else
+            grep -vE '^[[:space:]]*(#|$)' "$file" | sed 's/^/  /'
+        fi
+    else
+        echo "  (none set)"
+    fi
+    echo ""
+    local origin_env=""; [ "$show_origin" = "1" ] && origin_env="    ($file)"
+    if [ -n "${WV_CALL_LOG:-}" ]; then
+        echo -e "session-analysis: ${GREEN}enabled${NC} -> ${WV_CALL_LOG}${origin_env}"
+    else
+        echo "session-analysis: disabled  (enable: wv config enable session-analysis)"
+    fi
+    local _suite_log="${WV_SUITE_LOG:-${WV_SUITE_LOG_DEFAULT:-$HOME/.local/share/weave/suite_runs.jsonl}}"
+    local suite_src=""; [ "$show_origin" = "1" ] && { [ -n "${WV_SUITE_LOG:-}" ] && suite_src="    ($file)" || suite_src="    (builtin default)"; }
+    if [ -n "${WV_SUITE_LOG:-}" ]; then
+        echo -e "suite-history:    ${GREEN}always on${NC} -> ${_suite_log} (custom: WV_SUITE_LOG)${suite_src}"
+    else
+        echo "suite-history:    always on -> ${_suite_log}  (override: wv config set WV_SUITE_LOG <path>)${suite_src}"
+    fi
+    if [ -n "${WEAVE_DIR:-}" ]; then
+        local tg quality_file="${WEAVE_DIR}/quality.conf"
+        tg=$(sqlite3 "$WV_DB" "SELECT value FROM policy_thresholds WHERE key='test_gate';" 2>/dev/null)
+        local gate_src=""
+        if [ "$show_origin" = "1" ]; then
+            if grep -qE '^[[:space:]]*test_gate[[:space:]]*=' "$quality_file" 2>/dev/null; then
+                gate_src="    ($quality_file)"
+            else
+                gate_src="    (builtin default)"
+            fi
+        fi
+        echo "verification-gate: test_gate=${tg:-?} (0=off 1=warn 2=block) [repo: $WEAVE_DIR]${gate_src}"
+        if [ "$show_origin" = "0" ]; then
+            if grep -qE '^[[:space:]]*test_gate[[:space:]]*=' "$quality_file" 2>/dev/null; then
+                echo "                   durable (set in .weave/quality.conf [thresholds])"
+            elif [ "${tg:-0}" != "0" ]; then
+                echo -e "                   ${YELLOW}session-only${NC} — not in quality.conf; resets on reboot"
+            fi
+        fi
+    fi
+    return 0
+}
+
+_config_help() {
+    cat <<'EOF'
+Usage: wv config <subcommand>
+
+  list [--show-origin]         Show current global knobs + feature state
+  get <KEY> [--show-origin]    Print the effective value of a knob (and its source layer)
+  set <KEY> <VALUE>            Set a global knob (WV_*) in config.env
+  unset <KEY>                  Remove a global knob from config.env
+  enable session-analysis      Turn on wv call logging (durable, CLI + hooks)
+  disable session-analysis     Turn it off
+  enable test-gate [warn|block] Make the verification gate durable in quality.conf
+  disable test-gate            Set test_gate=0 (durable)
+
+Global knobs live in ~/.config/weave/config.env (override dir: WV_CONFIG_DIR).
+The verification gate is repo-scoped (.weave/quality.conf [thresholds]).
+--show-origin annotates each value with the config file that provides it.
+EOF
+    return 0
+}
+
+cmd_config() {
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+        list|show) _config_list "${1:-}" ;;
+        get)
+            if [ -z "${1:-}" ]; then echo "wv config get: need a KEY" >&2; return 1; fi
+            local _gkey="$1"
+            if [ "${2:-}" = "--show-origin" ]; then
+                local _src; _src=$(_config_key_source "$_gkey")
+                echo "${!_gkey:-}    ($_src)"
+            else
+                echo "${!_gkey:-}"
+            fi ;;
+        set)
+            if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then echo "wv config set: need KEY VALUE" >&2; return 1; fi
+            if _config_env_set "$1" "$2"; then echo -e "${GREEN}✓${NC} set $1 (effective next invocation)"; fi ;;
+        unset)
+            if [ -z "${1:-}" ]; then echo "wv config unset: need a KEY" >&2; return 1; fi
+            _config_env_unset "$1"; echo -e "${GREEN}✓${NC} unset $1" ;;
+        enable)
+            case "${1:-}" in
+                session-analysis) _config_enable_session_analysis ;;
+                test-gate)        shift || true; _config_enable_test_gate "${1:-warn}" ;;
+                *) echo "wv config enable: unknown feature '${1:-}' (session-analysis|test-gate)" >&2; return 1 ;;
+            esac ;;
+        disable)
+            case "${1:-}" in
+                session-analysis) _config_env_unset WV_CALL_LOG && echo -e "${GREEN}✓${NC} session-analysis disabled" ;;
+                test-gate)        _config_enable_test_gate off ;;
+                *) echo "wv config disable: unknown feature '${1:-}' (session-analysis|test-gate)" >&2; return 1 ;;
+            esac ;;
+        help|--help|-h) _config_help ;;
+        *) echo "wv config: unknown subcommand '$sub'" >&2; _config_help >&2; return 1 ;;
+    esac
+}
+
+# ── durable suite-run history (LL2) ─────────────────────────────────────────
+# The tmpfs test_results table is current-state-only and wiped by `wv load`. This
+# append-only JSONL log lives on disk so suite-run history (for measuring
+# commit-time friction) survives wv load + reboot. The path is overridable via
+# `wv config set WV_SUITE_LOG <path>`; default under the user data dir.
+_suite_log_path() {
+    echo "${WV_SUITE_LOG:-${WV_SUITE_LOG_DEFAULT:-$HOME/.local/share/weave/suite_runs.jsonl}}"
+}
+
+# _suite_log_append <suite> <files_csv> <exit> <duration_ms> <sha>
+# One JSONL line per suite RUN (not per file). Best-effort: a logging failure must
+# never break a commit hook. jq -cn guarantees valid JSON + escaping, so a path
+# containing a quote can neither corrupt the log nor inject a field. Records only
+# repo-relative paths + outcome metadata — never file content, env, or secrets —
+# and `repo` is a basename so no absolute $HOME/username path leaks (no PII).
+_suite_log_append() {
+    local suite="$1" files="$2" exit_code="$3" duration_ms="$4" sha="$5"
+    local log_path; log_path=$(_suite_log_path)
+    [ -n "$log_path" ] || return 0
+    mkdir -p "$(dirname "$log_path")" 2>/dev/null || return 0
+    # exit_code/duration_ms are pre-coerced to digits by the caller; default-guard
+    # anyway so a stray value can never make --argjson abort the whole line.
+    case "$exit_code" in ''|*[!0-9]*) exit_code=0 ;; esac
+    case "$duration_ms" in ''|*[!0-9]*) duration_ms=0 ;; esac
+    local repo=""
+    [ -n "${REPO_ROOT:-}" ] && repo=$(basename "$REPO_ROOT")
+    jq -cn \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg repo "$repo" \
+        --arg suite "$suite" \
+        --arg files "$files" \
+        --argjson exit "$exit_code" \
+        --argjson duration_ms "$duration_ms" \
+        --arg sha "$sha" \
+        '{ts:$ts, repo:$repo, suite:$suite, files:$files, exit:$exit, duration_ms:$duration_ms, sha:$sha}' \
+        >> "$log_path" 2>/dev/null || true
+}
+
+# cmd_test_record <suite> [--files=a,b] [--exit=N] [--commit=SHA] [--duration=MS]
+# Records a suite outcome in the test_results ledger (producer shim). Writes ONE
+# row per --files entry, keyed (suite, path), with that file's fingerprint and the
+# shared exit code — so the consumer can ask per-file "is this content fresh?".
+# Idempotent per (suite, path): a re-run overwrites the prior row (latest wins).
+# With no --files, records a single sentinel row (path='') under the HEAD sha.
+# --duration=MS is the suite run's wall-clock cost (LL1); the suite ran once, so
+# every per-file row from that run carries the same shared duration. Omitted or
+# non-numeric coerces to 0 (the "unmeasured" sentinel, matching the prior baseline).
+# Side effect (LL2): also appends ONE durable JSONL history line per run to the
+# on-disk suite log (_suite_log_append) so run history survives `wv load`/reboot,
+# unlike the tmpfs table. Never fails the caller — a recording error must not break
+# a commit hook.
+cmd_test_record() {
+    local suite="${1:-}"
+    shift || true
+    local files="" exit_code="0" commit_sha="" duration_ms="0"
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --files=*)    files="${arg#--files=}" ;;
+            --exit=*)     exit_code="${arg#--exit=}" ;;
+            --commit=*)   commit_sha="${arg#--commit=}" ;;
+            --duration=*) duration_ms="${arg#--duration=}" ;;
+            *) ;;
+        esac
+    done
+
+    if [ -z "$suite" ]; then
+        echo "Usage: wv test-record <suite> [--files=a,b] [--exit=N] [--commit=SHA] [--duration=MS]" >&2
+        return 1
+    fi
+
+    # Coerce a non-numeric exit code to 1 (treat as failure) rather than corrupt the row.
+    case "$exit_code" in
+        ''|*[!0-9]*) exit_code=1 ;;
+    esac
+    # Coerce a non-numeric/empty duration to 0 rather than corrupt the row (cost-blind
+    # is the prior baseline, so 0 is the safe "unmeasured" sentinel).
+    case "$duration_ms" in
+        ''|*[!0-9]*) duration_ms=0 ;;
+    esac
+
+    [ -z "$commit_sha" ] && commit_sha=$(git rev-parse --short HEAD 2>/dev/null || echo "")
+    local suite_esc commit_esc
+    suite_esc=$(sql_escape "$suite")
+    commit_esc=$(sql_escape "$commit_sha")
+
+    # Durable history: one append-only JSONL line per run, survives wv load (LL2).
+    # The tmpfs upserts below remain the gate's current-state view.
+    _suite_log_append "$suite" "$files" "$exit_code" "$duration_ms" "$commit_sha"
+
+    if [ -z "$files" ]; then
+        # Whole-suite run with no file set: one sentinel row keyed on HEAD.
+        local head_fp
+        head_fp=$(git rev-parse --short=16 HEAD 2>/dev/null || echo "nofiles")
+        db_query "INSERT OR REPLACE INTO test_results(suite, path, fingerprint, exit_code, ran_at, commit_sha, duration_ms)
+                  VALUES ('$suite_esc', '', '$(sql_escape "$head_fp")', $exit_code, datetime('now'), '$commit_esc', $duration_ms);" \
+                  >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    # One row per file. printf '%s\n' guarantees a trailing newline so `read` does
+    # not drop the last field.
+    local f fp
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        fp=$(_test_file_fingerprint "$f")
+        db_query "INSERT OR REPLACE INTO test_results(suite, path, fingerprint, exit_code, ran_at, commit_sha, duration_ms)
+                  VALUES ('$suite_esc', '$(sql_escape "$f")', '$(sql_escape "$fp")', $exit_code, datetime('now'), '$commit_esc', $duration_ms);" \
+                  >/dev/null 2>&1 || true
+    done < <(printf '%s\n' "$files" | tr ',' '\n')
+    return 0
 }
 
 # _doctor_check_git_hook label src_path installed_path grep_pattern install_cmd
@@ -2002,6 +2468,53 @@ _doctor_check_install_drift() {
     else
         _doctor_record "install drift" "warn" "$drifted_count file(s) differ — run: wv self-update"
     fi
+}
+
+# _doctor_check_verification — surface the P6 verification-gate layer (finding wv-e754b0 O2).
+# Repo-scoped. The gate ships inert by default and nothing else tells a user it is off,
+# what files it still needs, or that a raw sqlite3 UPDATE silently resets on reboot (tmpfs).
+_doctor_check_verification() {
+    [ -z "${WEAVE_DIR:-}" ] && return 0
+    [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ] || return 0
+
+    local conf="$WEAVE_DIR/quality.conf" tmap="$WEAVE_DIR/test-map.conf" tg
+    tg=$(sqlite3 "$WV_DB" "SELECT value FROM policy_thresholds WHERE key='test_gate';" 2>/dev/null)
+    [ -z "$tg" ] && tg="0"
+    tg="${tg%.0}"   # sqlite may render the integer as 1.0
+
+    local conf_has_gate=false
+    grep -qE '^[[:space:]]*test_gate[[:space:]]*=' "$conf" 2>/dev/null && conf_has_gate=true
+
+    # 1. gate state — test_gate=0 is the shipped default, so report it as pass+hint, not a failure.
+    case "$tg" in
+        0) _doctor_record "verification gate" "pass" "test_gate=0 (off — advisory; enable: wv config enable test-gate)" ;;
+        1) _doctor_record "verification gate" "pass" "test_gate=1 (warn — soft advisory on wv done)" ;;
+        2) _doctor_record "verification gate" "pass" "test_gate=2 (block — hard gate on wv done)" ;;
+        *) _doctor_record "verification gate" "warn" "test_gate=$tg (unrecognised; expected 0|1|2)" ;;
+    esac
+
+    # 2. durability — a gate enabled only in the tmpfs DB resets on reboot (not in state.sql).
+    if [ "$tg" != "0" ] && [ "$conf_has_gate" = false ]; then
+        _doctor_record "verification config" "warn" "test_gate=$tg in DB but not in .weave/quality.conf [thresholds] — session-only, resets on reboot. Fix: wv config enable test-gate"
+    elif [ "$conf_has_gate" = true ]; then
+        _doctor_record "verification config" "pass" "durable in .weave/quality.conf [thresholds]"
+    fi
+
+    # 3. test-map required for the gate to classify anything when live.
+    if [ "$tg" != "0" ]; then
+        if [ -f "$tmap" ]; then
+            _doctor_record "test-map" "pass" ".weave/test-map.conf present"
+        else
+            _doctor_record "test-map" "warn" ".weave/test-map.conf absent — touched files classify 'unknown', gate inert even when on. See: wv guide --topic=verification"
+        fi
+    fi
+
+    # 4. ledger freshness — informational row count.
+    local rows
+    rows=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM test_results;" 2>/dev/null)
+    [ -z "$rows" ] && rows=0
+    _doctor_record "test ledger" "pass" "$rows test_results row(s) recorded"
+    return 0
 }
 
 cmd_doctor() {
@@ -2231,6 +2744,29 @@ cmd_doctor() {
         _doctor_record "journal" "pass" "clean (no incomplete operations)"
     fi
 
+    # 14a. Node-state advisory: deferred-but-ready divergence. Per-install mirror
+    # of pattern-audit Check 6 — a node declaring deferral in metadata
+    # (deferred/blocked_on) while still in the ready queue (todo + no non-done
+    # blocks edge). Advisory only. See docs/PROPOSAL-graph-as-policy-boundary.md.
+    if [ -f "${WV_DB:-}" ]; then
+        local _deferred_ready
+        _deferred_ready=$(db_query "
+            SELECT COUNT(*) FROM nodes n
+            WHERE n.status='todo'
+              AND ( json_extract(n.metadata,'\$.deferred') IN (1,'true')
+                    OR ( json_extract(n.metadata,'\$.blocked_on') IS NOT NULL
+                         AND json_extract(n.metadata,'\$.blocked_on') != '' ) )
+              AND NOT EXISTS (
+                  SELECT 1 FROM edges e JOIN nodes b ON e.source=b.id
+                  WHERE e.target=n.id AND e.type='blocks' AND b.status!='done' );
+        " 2>/dev/null || echo "0")
+        if [ "${_deferred_ready:-0}" -gt 0 ] 2>/dev/null; then
+            _doctor_record "node-state" "warn" "$_deferred_ready node(s) declare deferral in metadata but remain ready — see 'wv pattern-audit' (Check 6); fix with status=blocked-external or a blocks edge"
+        else
+            _doctor_record "node-state" "pass" "no deferred-but-ready divergence"
+        fi
+    fi
+
     # 14b. Explicit git-state pending windows (.weave dirty / ahead of upstream)
     local git_pending_json git_sync_pending git_sync_state git_sync_action git_sync_reason git_sync_hint
     git_pending_json=$(_detect_git_pending 2>/dev/null || echo '{}')
@@ -2372,6 +2908,9 @@ cmd_doctor() {
     else
         _doctor_record "wv provenance" "pass" "$_dr_canonical_wv ($_dr_provenance)"
     fi
+
+    # 22. Verification-gate layer (P6) — repo-scoped; no-op outside a repo.
+    _doctor_check_verification
 
     if [ "$_dr_agent" = true ]; then
         _doctor_check_agent_env
@@ -3720,6 +4259,10 @@ cmd_audit_pitfalls() {
 #   2. Domain enum strings have exactly one definition (no silent drift).
 #   3. No raw echo writes to .session_phase outside wv_set_phase.
 #   4. Required Claude hooks source wv-hook-common.sh.
+#   5. pre-action.sh stays a thin dispatcher (<= 60 lines).
+#   6. Node-state invariant: no node declares deferral in metadata
+#      (deferred/blocked_on) while still in the ready queue (todo + no
+#      non-done blocks edge). See docs/PROPOSAL-graph-as-policy-boundary.md.
 # See docs/PROPOSAL-wv-pattern-crystallization.md for context.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -3961,6 +4504,44 @@ cmd_pattern_audit() {
             '. + [{"check":"thin_dispatcher","status":"warn","detail":"pre-action.sh not found; check skipped","count":0}]')
     fi
 
+    # ── Check 6: node-state invariant — deferral must be graph state, not metadata ──
+    # A node declaring deferral in metadata (deferred=true or blocked_on set) while
+    # status='todo' with no inbound non-done blocks edge still surfaces in `wv ready`
+    # (cmd_ready reads status + type + blocks edges only — never these metadata
+    # fields). Promotes the recurring learning in findings wv-8bb0f4 / wv-f752a5 to
+    # an enforced gate. See docs/PROPOSAL-graph-as-policy-boundary.md.
+    local divergent_nodes=""
+    if [ -f "$WV_DB" ]; then
+        divergent_nodes=$(db_query "
+            SELECT id FROM nodes n
+            WHERE n.status='todo'
+              AND ( json_extract(n.metadata,'\$.deferred') IN (1,'true')
+                    OR ( json_extract(n.metadata,'\$.blocked_on') IS NOT NULL
+                         AND json_extract(n.metadata,'\$.blocked_on') != '' ) )
+              AND NOT EXISTS (
+                  SELECT 1 FROM edges e JOIN nodes b ON e.source=b.id
+                  WHERE e.target=n.id AND e.type='blocks' AND b.status!='done' );
+        " 2>/dev/null || echo "")
+    fi
+    if [ -n "$divergent_nodes" ]; then
+        local divergent_list dcount
+        divergent_list=$(echo "$divergent_nodes" | tr '\n' ' ' | sed 's/ *$//')
+        dcount=$(echo "$divergent_nodes" | grep -c .)
+        if [ "$format" = "text" ]; then
+            echo -e "${RED}✗ Check 6 FAIL: $dcount node(s) declare deferral in metadata but remain in the ready queue:${NC}"
+            echo "$divergent_nodes" | while read -r nid; do [ -n "$nid" ] && echo "    $nid"; done
+            echo -e "  Encode deferral as state: status=blocked-external (or add a blocks edge), not metadata.deferred/blocked_on alone."
+        fi
+        findings_json=$(echo "$findings_json" | jq \
+            --arg detail "deferred-but-ready nodes: $divergent_list" --argjson n "$dcount" \
+            '. + [{"check":"node_state_deferral","status":"fail","detail":$detail,"count":$n}]')
+        issues=$((issues + dcount))
+    else
+        [ "$format" = "text" ] && echo -e "${GREEN}✓ Check 6 PASS: no deferred-but-ready node-state divergence${NC}"
+        findings_json=$(echo "$findings_json" | jq \
+            '. + [{"check":"node_state_deferral","status":"pass","detail":"deferral encoded as status/edges, not metadata-only","count":0}]')
+    fi
+
     # ── Summary ─────────────────────────────────────────────────────────────
     if [ "$format" = "json" ]; then
         jq -n \
@@ -4080,7 +4661,7 @@ Create new work:
   wv add "Description" --gh          # node + GitHub issue (linked)
   wv add "Task" --parent=<epic-id>   # child of an epic
 
-Topics: wv guide --topic=github | learnings | context | routing | mcp
+Topics: wv guide --topic=github | learnings | context | routing | mcp | verification | instrumentation | config
 EOF
             ;;
         github)
@@ -4213,7 +4794,7 @@ Other tools:
   weave_add, weave_done, weave_batch_done, weave_update, weave_list,
   weave_link, weave_tree, weave_context, weave_search, weave_resolve,
   weave_learnings, weave_guide, weave_status, weave_health, weave_sync,
-  weave_breadcrumbs, weave_close_session
+  weave_trails (alias: weave_breadcrumbs), weave_close_session
 
 CLI vs MCP:
   - MCP: fewer round-trips (compound tools), typed JSON responses
@@ -4221,9 +4802,129 @@ CLI vs MCP:
   - Both use the same SQLite graph — changes are visible to either
 EOF
             ;;
+        verification)
+            cat <<'EOF'
+Weave Verification Boundary
+
+wv done is the single owner of the "is this correct?" decision. Other surfaces
+RUN checks and RECORD outcomes; wv done READS them and decides. It never invokes
+a linter or test runner — the close stays fast.
+
+Three surfaces:
+  pre-commit   hygiene gate (lint, active-node) + runs fast/impact suites + records
+  post-commit  runs deferred slow suites + records (advisory, never blocks)
+  wv done      reads recorded signals; owns the gate (nodes_policy_check trigger)
+
+Policy gates (rows in policy_thresholds; enforced only for files in node_files,
+quality_exempt paths always skipped):
+  mccabe_max[_lang]   block if a touched file's max function CC exceeds the limit
+  trend_deteriorating block if a touched file's complexity is deteriorating (default off)
+  test_gate           test correctness: 0=off, 1=warn (advisory), 2=block (default off)
+
+Test gate flow:
+  1. Record per file:   wv test-record <suite> --files=a,b --exit=N
+                        (one row per file; fingerprint = git blob hash)
+  2. Map paths->suites: .weave/test-map.conf   (source_file = suite [suite ...])
+  3. wv done derives file_test_status per touched file:
+       blob == recorded & exit 0  -> green
+       blob == recorded & exit !=0 -> red
+       blob != recorded            -> stale   (file changed since the run)
+       no record / no mapping      -> unknown (never blocks)
+  4. Act by level: off=inert | warn=advisory on red/stale | block=ABORT on red/stale
+
+Enable for a repo (default is off/inert) — easiest is the durable toggle:
+  wv config enable test-gate warn     # or 'block'; writes quality.conf for you
+Or edit DURABLE config directly in .weave/quality.conf:
+  [thresholds]
+  test_gate = 1            # 1=warn, 2=block
+  trend_deteriorating = 1
+Committed + re-applied on every `wv load`, so it survives reboot. (brain.db is
+tmpfs; policy_thresholds is not in state.sql, so a raw sqlite3 UPDATE is
+session-only and resets on cold-start — use quality.conf for durable policy.)
+`wv doctor` flags a gate that is set in the DB but not durably configured.
+
+Exemptions: [exempt] patterns in quality.conf; node types finding/epic/session_history;
+--skip-verification suppresses the warn advisory (block is a hard gate, not bypassable).
+
+Full reference: docs/WEAVE.md § 4.7.
+EOF
+            ;;
+        instrumentation)
+            cat <<'EOF'
+Weave Instrumentation & Opt-in Knobs
+
+Two opt-in surfaces ship OFF by default. Turn them on through one front door —
+`wv config` — so you never have to memorise an env var name or a file path.
+
+1. Session analysis (which wv commands cost the most output/tokens)
+   wv config enable session-analysis     # sets WV_CALL_LOG in config.env
+   wv analyze sessions --call-stats       # read the report
+   wv config disable session-analysis
+
+   Enablement lives in ~/.config/weave/config.env (override dir: WV_CONFIG_DIR)
+   and is read from disk on EVERY invocation — CLI and harness-spawned hooks
+   alike — so it survives reboot and never depends on env inheritance. With it
+   off, the reader says so plainly instead of implying a phantom log path.
+
+2. Verification gate (test-correctness gate on wv done) — repo-scoped
+   wv config enable test-gate warn        # or 'block'
+   wv config disable test-gate
+   See: wv guide --topic=verification   (durability, test-map.conf, exemptions)
+
+Inspect current state any time:
+   wv config list      # global knobs + feature on/off + gate durability
+   wv doctor           # flags a gate enabled in the DB but not durably configured
+
+Global knobs live in ~/.config/weave/config.env, e.g.:
+   WV_CALL_LOG="$HOME/.local/share/weave/wv_calls.jsonl"
+   # WV_DELTA_RETAIN_DAYS=14
+EOF
+            ;;
+        config)
+            cat <<'EOF'
+Weave Config Model
+
+Two config layers:
+
+  User-global (~/.config/weave/config.env)
+    Personal knobs — WV_CALL_LOG, WV_SUITE_LOG, WV_DELTA_RETAIN_DAYS, ...
+    Read from disk on EVERY invocation (CLI + hooks); survives reboot.
+    Not committed to source control. Personal to this machine.
+
+  Repo-committed (.weave/quality.conf [thresholds])
+    Team policy — test_gate, mccabe_max, trend_deteriorating
+    Loaded by wv load on session start. Commit it to share the policy.
+
+Ownership rule:
+  Personal preferences (log paths, verbosity)  -> config.env    (never commit)
+  Team policy (gate mode, quality thresholds)  -> quality.conf  (commit it)
+
+Quick reference:
+  wv config list                          Show active knobs + feature state
+  wv config list --show-origin            Show each value with its source file
+  wv config get <KEY>                     Print effective value of a knob
+  wv config get <KEY> --show-origin       Print value + which layer provides it
+  wv config set <KEY> <VALUE>             Set a WV_* knob in config.env
+  wv config unset <KEY>                   Remove a knob from config.env
+  wv config enable session-analysis       Write WV_CALL_LOG to config.env
+  wv config enable test-gate [warn|block] Write test_gate to quality.conf
+                                          and scaffold .weave/test-map.conf
+  wv config disable session-analysis | test-gate
+
+Gitignore boundary:
+  config.env        personal, never committed
+  quality.conf      team policy, commit it to share the gate mode
+  quality.local.conf  (planned) gitignored user-per-repo override for
+                      personal threshold relaxation without touching quality.conf
+
+Related topics:
+  wv guide --topic=verification     test-map.conf, gate flow, exemptions
+  wv guide --topic=instrumentation  opt-in knobs, session analysis
+EOF
+            ;;
         *)
             echo "Unknown topic: $topic" >&2
-            echo "Topics: workflow (default), github, learnings, context, routing, mcp" >&2
+            echo "Topics: workflow (default), github, learnings, context, routing, mcp, verification, instrumentation, config" >&2
             return 1
             ;;
     esac
@@ -4411,8 +5112,8 @@ SEARCHHELP
         learnings)
             print_command_help "wv learnings [--category=<cat>] [--grep=<pattern>] [--recent=N] [--mode=<mode>] [--node=<id>] [--show-graph]" "Show captured learnings, optionally filtered by category, text, node, or output mode."
             ;;
-        breadcrumbs)
-            print_command_help "wv breadcrumbs [save|show|clear] [--message=\"...\"]" "Persist or inspect session breadcrumbs for handoff and continuity."
+        trails|breadcrumbs)
+            print_command_help "wv trails [save|show|clear|capsule <id>] [--message=\"...\"] [--json='{...}']" "Persist or inspect session trails (append-only handoff path). 'breadcrumbs' is a back-compat alias."
             ;;
         digest)
             print_command_help "wv digest [--json]" "Show a compact one-line health summary."
@@ -4442,7 +5143,7 @@ SEARCHHELP
             print_command_help "wv health [--history[=N]] [--verbose] [--json]" "Run system health checks and optionally include recent health history."
             ;;
         guide)
-            print_command_help "wv guide [--topic=workflow|github|learnings|context|routing|mcp]" "Show a quick reference for common Weave workflows, routing rules, and integrations."
+            print_command_help "wv guide [--topic=workflow|github|learnings|context|routing|mcp|verification|instrumentation|config]" "Show a quick reference for common Weave workflows, routing rules, and integrations."
             ;;
         prune)
             print_command_help "wv prune [--age=48h] [--dry-run] [--orphans-only]" "Archive old done nodes, optionally targeting only orphaned ones."
@@ -4540,7 +5241,7 @@ Commands:
   search <query>    Full-text search nodes [--limit=N] [--status=] [--json]
   reindex           Rebuild full-text search index
   learnings         Show captured learnings [--category=] [--grep=] [--recent=N] [--mode=]
-  breadcrumbs       Session breadcrumbs [save|show|clear] [--message="..."]
+  trails            Session trails [save|show|clear|capsule <id>] (alias: breadcrumbs)
   digest            Compact one-liner health summary [--json]
   session-summary   Session activity stats (nodes created/completed, learnings)
   audit-pitfalls    Show all pitfalls with resolution status
@@ -4551,7 +5252,8 @@ Commands:
   selftest          Round-trip smoke test in isolated environment [--json]
     mcp-status        Verify MCP server is built and IDE config shape is current [--json]
   health            System health check with score and diagnostics [--history[=N]]
-    guide             Workflow quick reference [--topic=workflow|github|learnings|context|routing|mcp]
+  config            Manage durable opt-in knobs [list|get|set|unset|enable|disable]
+    guide             Workflow quick reference [--topic=workflow|github|learnings|context|routing|mcp|verification|instrumentation|config]
   prune             Archive old done nodes
   unarchive <id>    Restore a pruned node from .weave/archive/ [--dry-run] [--with-edges]
   clean-ghosts      Delete ghost edges referencing deleted nodes [--dry-run] [legacy compatibility]
@@ -4593,7 +5295,7 @@ Options:
   --grep=<pattern>  Search text and metadata (learnings)
   --recent=<N>      Show only last N learnings (learnings)
   --mode=<mode>     Output mode: bootstrap|discover|execute|full (read surfaces)
-  --message="..."   Custom note for breadcrumbs (breadcrumbs save)
+  --message="..."   Custom note for trails (trails save)
 
 Examples:
   wv add "Fix authentication bug"
@@ -4629,8 +5331,8 @@ Examples:
   wv refs docs/design.md
   wv refs -t "see wv-a1b2" --link --from=wv-c3d4
   wv refs file.md --json
-  wv breadcrumbs save --message="Pausing for review"
-  wv breadcrumbs show
+  wv trails save --message="Pausing for review"
+  wv trails show
   wv digest
   wv learnings --category=pitfall --recent=5
   wv learnings --grep="testing"

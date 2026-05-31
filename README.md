@@ -168,19 +168,21 @@ wv search --code "query" --graph      # Include active Weave nodes per matched f
 
 ### Graph Operations
 
-| Command                                 | Description                  |
-| --------------------------------------- | ---------------------------- |
-| `wv link <from> <to> --type=implements` | Create semantic edge         |
-| `wv block <id> --by=<blocker>`          | Set dependency               |
-| `wv tree`                               | View hierarchy               |
-| `wv context <id> --json`                | Get full Context Pack        |
-| `wv related <id>`                       | Show semantic relationships  |
-| `wv related <id> --depth=2`             | N-hop neighborhood traversal |
-| `wv path <id>`                          | Show ancestry path           |
-| `wv edge-types`                         | List valid edge types        |
-| `wv edge-types --stats`                 | Edge counts per type         |
-| `wv query edge-type=blocks`             | Nodes with blocking edges    |
-| `wv query --order=connections`          | Most-connected nodes first   |
+| Command                                 | Description                                               |
+| --------------------------------------- | --------------------------------------------------------- |
+| `wv link <from> <to> --type=implements` | Create semantic edge                                      |
+| `wv block <id> --by=<blocker>`          | Set dependency                                            |
+| `wv tree`                               | View hierarchy                                            |
+| `wv context <id> --json`                | Get full Context Pack                                     |
+| `wv related <id>`                       | Show semantic relationships                               |
+| `wv related <id> --depth=2`             | N-hop neighborhood traversal                              |
+| `wv path <id>`                          | Show ancestry path                                        |
+| `wv edge-types`                         | List valid edge types                                     |
+| `wv edge-types --stats`                 | Edge counts per type                                      |
+| `wv query edge-type=blocks`             | Nodes with blocking edges                                 |
+| `wv query --order=connections`          | Most-connected nodes first                                |
+| `wv impact <id>`                        | Blast radius: impacted nodes, risk score, affected suites |
+| `wv impact --files=a,b`                 | Blast radius seeded from changed file paths               |
 
 ### Knowledge Capture
 
@@ -210,6 +212,8 @@ Finding nodes use `metadata.type="finding"` plus nested
 | `wv quality patterns`       | Structural pattern scan/list/promote (requires ast-grep)                                               |
 | `wv clean-ghosts`           | Delete ghost edges (legacy compatibility)                                                              |
 | `wv doctor`                 | Installation health check                                                                              |
+| `wv test-record <suite>`    | Record a suite outcome in the test ledger (`--files=a,b --exit=N`); feeds the test gate                |
+| `wv hotzone --db`           | Print the resolved brain.db path (for raw sqlite3 inspection)                                          |
 | `wv mcp-status`             | MCP server health check                                                                                |
 | `wv selftest`               | End-to-end smoke test                                                                                  |
 | `wv sync --gh`              | Persist graph + sync GitHub issues                                                                     |
@@ -301,7 +305,7 @@ Returns blockers, ancestors with learnings, related nodes, pitfalls, and contrad
 | `weave_preflight`         | `wv preflight`                         | Pre-action checks for a node          |
 | `weave_sync`              | `wv sync`                              | Persist graph + optional GH sync      |
 | `weave_resolve`           | `wv resolve`                           | Resolve contradiction between nodes   |
-| `weave_breadcrumbs`       | `wv breadcrumbs`                       | Save/show/clear session breadcrumbs   |
+| `weave_trails`            | `wv trails`                            | Save/show/clear session trails        |
 | `weave_plan`              | `wv plan`                              | Import markdown plan as epic+tasks    |
 | `weave_guide`             | `wv guide`                             | Workflow quick reference              |
 | `weave_close_session`     | `wv sync --gh`                         | End-of-session cleanup                |
@@ -388,6 +392,57 @@ fully rebuildable from source. Integrated into the existing workflow:
   archive/      # directory prefix (trailing / required)
   ```
   Full reference: `scripts/weave_quality/README.md` § Quality Gate.
+
+## Verification Gates
+
+`wv done` is the single owner of the "is this work correct?" decision. Other surfaces _run_ checks
+and _record_ their outcomes; `wv done` _reads_ them and decides — it never invokes a linter or test
+runner, so closing stays fast.
+
+| Surface         | Role                                                         | Blocks?                           |
+| --------------- | ------------------------------------------------------------ | --------------------------------- |
+| **pre-commit**  | lint + active-node hygiene; runs fast/impact suites; records | hygiene only (tests are advisory) |
+| **post-commit** | runs deferred slow suites; records                           | never (advisory)                  |
+| **wv done**     | reads recorded signals; enforces the gate                    | yes, per configured threshold     |
+
+Three gates run at close, each enforced only for files the node touched (`[exempt]` paths skipped):
+complexity (`mccabe_max`, on by default), trend (`trend_deteriorating`, off), and test correctness
+(`test_gate`, off).
+
+**Test gate (`test_gate`).** Suites record their outcome per file —
+`wv test-record <suite> --files=a,b --exit=N` (the commit hooks do this automatically; fingerprint =
+git blob hash). `.weave/test-map.conf` maps files to suites, so Weave records exit codes without
+running your suites itself. At close, each touched file is **green** (recorded pass, unchanged),
+**red** (recorded fail), **stale** (changed since the run), or **unknown** (no record — never
+blocks). Levels: `0` off · `1` warn (advisory) · `2` block.
+
+Enable durably with `wv config enable test-gate warn` (or `block`), which writes a `[thresholds]`
+section to `.weave/quality.conf` (re-applied on every `wv load`, so it survives reboots — a raw
+`sqlite3` change does not, and `wv doctor` flags that case):
+
+```ini
+[thresholds]
+test_gate = 1            # 0=off (default), 1=warn, 2=block
+```
+
+Non-code node types (`finding`, `epic`, `session_history`) are never test-gated;
+`--skip-verification` suppresses the warn advisory. Full reference: `wv guide --topic=verification`.
+
+## Opt-in instrumentation
+
+Two surfaces ship **off** by default. Turn them on through one front door — `wv config` — so you
+never have to memorise an env-var name or a config path. `wv config list` shows current state;
+`wv guide --topic=instrumentation` has the full reference.
+
+| Feature           | Enable                                     | What it does                                                         | Stored in                          |
+| ----------------- | ------------------------------------------ | -------------------------------------------------------------------- | ---------------------------------- |
+| Session analysis  | `wv config enable session-analysis`        | Logs each `wv` call so `wv analyze sessions --call-stats` can report | `~/.config/weave/config.env`       |
+| Verification gate | `wv config enable test-gate [warn\|block]` | Durable `test_gate` for `wv done` (see Verification Gates)           | `.weave/quality.conf [thresholds]` |
+
+Global knobs live in `~/.config/weave/config.env` (override the dir with `WV_CONFIG_DIR`) and are
+read from disk on **every** invocation — the CLI and harness-spawned hooks alike — so enablement
+survives reboot and never depends on shell env inheritance. Disable with
+`wv config disable <feature>`.
 
 ## GitHub Integration
 

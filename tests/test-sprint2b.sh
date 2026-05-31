@@ -195,14 +195,14 @@ test_breadcrumbs() {
     # Show with no breadcrumbs
     local show_output
     show_output=$($WV breadcrumbs show 2>/dev/null)
-    assert_contains "$show_output" "No breadcrumbs" "show without saved breadcrumbs says none"
+    assert_contains "$show_output" "No trails found" "show without saved breadcrumbs says none"
 
     # Save breadcrumbs
     assert_success "breadcrumbs save succeeds" "$WV" breadcrumbs save
 
     # Show saved breadcrumbs
     show_output=$($WV breadcrumbs show 2>/dev/null)
-    assert_contains "$show_output" "Session Breadcrumbs" "show has header"
+    assert_contains "$show_output" "Session Trails" "show has header"
     assert_contains "$show_output" "Health" "show has health section"
 
     # Save with message
@@ -218,7 +218,7 @@ test_breadcrumbs() {
 
     # Show after clear
     show_output=$($WV breadcrumbs show 2>/dev/null)
-    assert_contains "$show_output" "No breadcrumbs" "show after clear says none"
+    assert_contains "$show_output" "No trails found" "show after clear says none"
 
     # Invalid action
     assert_fails "breadcrumbs with invalid action fails" "$WV" breadcrumbs invalid_action

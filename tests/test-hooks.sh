@@ -439,6 +439,41 @@ set -e
 assert_exit_code "0" "$EXIT_CODE3" "pre-claim: exits 0 when done_criteria, risks, and alias present"
 assert_equals "" "$OUTPUT3" "pre-claim: silent when planning metadata complete"
 
+# finding wv-cd5ddb: a "premortem" key (what /pre-mortem writes) must satisfy the
+# pre-mortem gate — not only the legacy "risks" key. Otherwise a node with a real
+# premortem gets nagged for a missing static risk label.
+ID_PM=$("$WV" add "Claim test premortem key" --alias=claim-pm --metadata='{"done_criteria":["c1"],"premortem":"Risk: x. Mitigation: y."}' --force 2>/dev/null | tail -1)
+set +e
+OUTPUT_PM=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID_PM\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
+EXIT_CODE_PM=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE_PM" "pre-claim: exits 0 when premortem key present"
+assert_equals "" "$OUTPUT_PM" "pre-claim: silent when premortem (not risks) satisfies the gate (wv-cd5ddb)"
+
+# finding wv-cd5ddb: the pre-mortem advisory is grounded in real wv impact blast
+# radius, not the static risk-string heuristic. A node that blocks another should
+# report a non-zero impacted count in the advisory.
+ID_SEED=$("$WV" add "Impact advisory seed" --metadata='{"done_criteria":["c1"]}' --force 2>/dev/null | tail -1)
+ID_DOWN=$("$WV" add "Impact advisory downstream" --force 2>/dev/null | tail -1)
+"$WV" link "$ID_SEED" "$ID_DOWN" --type=blocks --context='{"summary":"seed blocks downstream"}' >/dev/null 2>&1
+set +e
+OUTPUT_IMP=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID_SEED\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
+EXIT_CODE_IMP=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE_IMP" "pre-claim: exits 0 (advisory, never blocks) with impact data"
+assert_contains "$OUTPUT_IMP" "pre-mortem" "pre-claim: still suggests pre-mortem when risks/premortem absent"
+assert_contains "$OUTPUT_IMP" "Blast radius (wv impact)" "pre-claim: advisory grounded in wv impact blast radius (wv-cd5ddb)"
+assert_contains "$OUTPUT_IMP" "1 impacted" "pre-claim: advisory reports real impacted count"
+
+# Graceful fallback: when impact yields no data the advisory still fires (no Blast line),
+# and the claim is never errored. ID2 (no edges) exercises the empty-blast-radius path.
+set +e
+OUTPUT_FB=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID2\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
+EXIT_CODE_FB=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE_FB" "pre-claim: exits 0 when impact has no downstream (graceful)"
+assert_contains "$OUTPUT_FB" "pre-mortem" "pre-claim: advisory still fires with empty blast radius"
+
 # Back-compat: older test payload shape still accepted
 set +e
 OUTPUT=$(echo "{\"command\":\"wv update $ID --status=active\"}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)

@@ -661,16 +661,29 @@ SQL
     jmulti=$("$WV" impact --files=scripts/probe/alpha.sh,scripts/probe/beta.sh --json 2>&1)
     assert_jq_true "$jmulti" '.seeds | length == 2' "files JSON: two files → two seeds"
 
-    # Unknown file → empty result (not an error)
+    # Unknown file → no graph seed: must WARN (not a bland "0 impacted" that reads
+    # as "safe") and still surface affected suites via test-map.conf (wv-70ea8e).
     out=$("$WV" impact --files=no/such/file.py 2>&1)
-    assert_contains "$out" "no nodes found" "files: unknown path emits empty message"
+    assert_contains "$out" "blast radius unknown" "files: unknown path warns instead of silent 0-impacted"
     assert_success "files: unknown path exits 0" "$WV" impact --files=no/such/file.py
 
-    # Unknown file JSON → structured empty
+    # Unknown file JSON → structured empty + graph_seed_matched flag + suites key
     local jempty
     jempty=$("$WV" impact --files=no/such/file.py --json 2>&1)
     assert_jq_true "$jempty" '.seeds | length == 0' "files JSON: unknown path has empty seeds"
     assert_jq_true "$jempty" '.impacted | length == 0' "files JSON: unknown path has empty impacted"
+    assert_jq_true "$jempty" '.graph_seed_matched == false' "files JSON: graph_seed_matched=false when no node owns the file"
+    assert_jq_true "$jempty" '.affected_suites | type == "array"' "files JSON: affected_suites present even with no graph seed"
+
+    # Mapped-but-unattributed file: no node owns it, but test-map.conf maps a suite.
+    # The suite must still surface — this is the wv-70ea8e false-0-impacted fix.
+    mkdir -p "$TEST_DIR/.weave"
+    printf '[map]\nscripts/probe/orphan.sh = tests/test-probe.sh\n' > "$TEST_DIR/.weave/test-map.conf"
+    out=$("$WV" impact --files=scripts/probe/orphan.sh 2>&1)
+    assert_contains "$out" "test-probe.sh" "files: mapped-but-unattributed file surfaces its suite via test-map.conf"
+    local jorphan
+    jorphan=$("$WV" impact --files=scripts/probe/orphan.sh --json 2>&1)
+    assert_jq_true "$jorphan" '.affected_suites | map(.name) | index("tests/test-probe.sh") != null' "files JSON: mapped suite present in affected_suites despite no graph seed"
 }
 
 # ============================================================================

@@ -151,6 +151,8 @@ INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_sh', 100
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_ts', 15);
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('gini_max', 0.85);
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('trend_deteriorating', 0);
+-- test_gate: 0=off (inert), 1=warn (soft, cmd_done), 2=block (trigger ABORT). Default off; P6c rolls out.
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('test_gate', 0);
 
 -- quality_exempt: path patterns excluded from quality gate enforcement.
 -- Patterns use SQLite LIKE syntax; trailing '/' matches directory prefix (appended as '%').
@@ -166,6 +168,41 @@ CREATE TABLE IF NOT EXISTS quality_exempt (
 CREATE TABLE IF NOT EXISTS file_trend (
     path      TEXT PRIMARY KEY,
     direction TEXT NOT NULL DEFAULT 'stable'
+);
+
+-- test_results: the verification ledger (P6a/P6b). Records each suite's outcome
+-- per covered file when it runs (pre-commit, post-commit, make check, CI) so
+-- wv done can read a fresh result instead of invoking a runner — the
+-- producer/consumer split (PROPOSAL graph-as-policy-boundary §4.6). Producers
+-- are language-specific test runners; the consumer (_done_refresh_test_status)
+-- is language-neutral.
+--   fingerprint = git blob hash of THIS single file (mtime:size fallback for
+--                 unstaged/untracked). Per-file so the consumer can recompute it
+--                 with the identical pure function — no ephemeral combined key to
+--                 reconstruct. wv test-record writes one row per --files entry.
+--   commit_sha  = short HEAD at record time ('commit' in the proposal; renamed
+--                 to avoid the SQL reserved word).
+-- PK (suite, path): latest outcome wins per suite+file.
+CREATE TABLE IF NOT EXISTS test_results (
+    suite       TEXT    NOT NULL,
+    path        TEXT    NOT NULL DEFAULT '',
+    fingerprint TEXT    NOT NULL,
+    exit_code   INTEGER NOT NULL,
+    ran_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    commit_sha  TEXT    NOT NULL DEFAULT '',
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (suite, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_results_suite ON test_results(suite);
+
+-- file_test_status: per-file test-correctness state (P6b consumer side).
+-- state ∈ {green, red, stale, unknown}; refreshed by _done_refresh_test_status
+-- from test_results before the status flip. nodes_policy_check reads it (3rd
+-- clause), gated by policy_thresholds.test_gate (0=off, 1=warn, 2=block).
+CREATE TABLE IF NOT EXISTS file_test_status (
+    path  TEXT PRIMARY KEY,
+    state TEXT NOT NULL DEFAULT 'unknown'
 );
 
 -- chunks: file content slices with embeddings for semantic search.
@@ -257,6 +294,12 @@ BEGIN
         END;
 END;
 EOF
+    # Authoritative trigger: recreate nodes_policy_check from the single-source
+    # emitter so a fresh DB has the complete (3-clause) trigger immediately, not
+    # only after the next db_ensure migration pass. The inline copy in the schema
+    # heredoc above is the bootstrap version; this supersedes it. (The heredoc is
+    # an unquoted <<EOF — it cannot call a function mid-body, hence this follow-up.)
+    _policy_trigger_sql | sqlite3 "$WV_DB" 2>/dev/null || true
     # Tighten perms on the DB file in case it predates the umask change.
     [ -f "$WV_DB" ] && chmod 600 "$WV_DB" 2>/dev/null || true
 }
@@ -468,6 +511,46 @@ WHERE json_extract(metadata, '$.type') = 'finding'
 BACKFILL
 }
 
+# Migrate to add the test_results verification ledger (P6a/P6b). Per-file rows
+# keyed (suite, path) so the consumer can recompute each file's fingerprint with
+# the identical pure function. The ledger is a throwaway cache repopulated by the
+# commit hooks, so an old-shape table (pre-path, PK suite,fingerprint) is dropped
+# and recreated rather than data-migrated.
+db_migrate_test_results() {
+    # Detect the legacy shape (no 'path' column) and drop it — no data to preserve.
+    local has_path
+    has_path=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM pragma_table_info('test_results') WHERE name='path';" 2>/dev/null || echo "0")
+    local table_exists
+    table_exists=$(sqlite3 "$WV_DB" "SELECT name FROM sqlite_master WHERE type='table' AND name='test_results';" 2>/dev/null || echo "")
+    if [ -n "$table_exists" ] && [ "$has_path" = "0" ]; then
+        sqlite3 "$WV_DB" "DROP TABLE IF EXISTS test_results;" 2>/dev/null || true
+    fi
+
+    sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
+CREATE TABLE IF NOT EXISTS test_results (
+    suite       TEXT    NOT NULL,
+    path        TEXT    NOT NULL DEFAULT '',
+    fingerprint TEXT    NOT NULL,
+    exit_code   INTEGER NOT NULL,
+    ran_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    commit_sha  TEXT    NOT NULL DEFAULT '',
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (suite, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_results_suite ON test_results(suite);
+MIGRATE
+
+    # An existing path-shape table predating duration_ms (LL1): add the column in
+    # place rather than dropping — preserves current-state freshness rows the P6b
+    # consumer (file_test_status) reads. ALTER ADD COLUMN with a DEFAULT is cheap.
+    local has_duration
+    has_duration=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM pragma_table_info('test_results') WHERE name='duration_ms';" 2>/dev/null || echo "1")
+    if [ "$has_duration" = "0" ]; then
+        sqlite3 "$WV_DB" "ALTER TABLE test_results ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0;" 2>/dev/null || true
+    fi
+}
+
 # Migrate to add node_files, policy_thresholds, and the done-gate trigger.
 # Safe to run repeatedly — CREATE IF NOT EXISTS + INSERT OR IGNORE.
 db_migrate_policy_tables() {
@@ -622,6 +705,102 @@ BEGIN
         END;
 END;
 MIGRATE
+}
+
+# _policy_trigger_sql — SINGLE SOURCE OF TRUTH for the nodes_policy_check trigger.
+#
+# The trigger had been hand-copied across several migrations (policy_tables,
+# language_trigger, quality_exempt); each DROP+CREATE that omitted a clause would
+# silently disable a shipped gate. This emitter collapses those copies to one
+# definition. New gate clauses are added HERE only, and exactly one migration —
+# the latest, db_migrate_test_gate — recreates the trigger from it. Earlier
+# migrations' inline copies are harmlessly overwritten because all migrations run
+# in sequence on every db_ensure and this one runs last. The invariant that all
+# three clauses fire is pinned by test_policy_trigger.
+#
+# Clauses (all share the quality_exempt guard):
+#   1. mccabe_max breach (per-language threshold)            — always active
+#   2. trend deteriorating (gated by trend_deteriorating>=1) — off by default
+#   3. test red/stale     (gated by test_gate>=2 i.e. block) — off by default
+_policy_trigger_sql() {
+    cat <<'TRIGGER'
+DROP TRIGGER IF EXISTS nodes_policy_check;
+
+CREATE TRIGGER nodes_policy_check
+BEFORE UPDATE OF status ON nodes
+WHEN NEW.status = 'done' AND OLD.status = 'active'
+BEGIN
+        SELECT CASE
+                WHEN EXISTS (
+                        SELECT 1 FROM node_files nf
+                        JOIN file_metrics fm ON fm.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND fm.mccabe_max > COALESCE(
+                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
+                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM quality_exempt qe
+                                WHERE nf.path LIKE
+                                    CASE WHEN qe.path_pattern LIKE '%/'
+                                         THEN qe.path_pattern || '%'
+                                         ELSE qe.path_pattern
+                                    END
+                            )
+                ) THEN RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded')
+                WHEN EXISTS (
+                        SELECT 1 FROM node_files nf
+                        JOIN file_trend ft ON ft.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND ft.direction = 'deteriorating'
+                            AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
+                            AND NOT EXISTS (
+                                SELECT 1 FROM quality_exempt qe
+                                WHERE nf.path LIKE
+                                    CASE WHEN qe.path_pattern LIKE '%/'
+                                         THEN qe.path_pattern || '%'
+                                         ELSE qe.path_pattern
+                                    END
+                            )
+                ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
+                WHEN EXISTS (
+                        SELECT 1 FROM node_files nf
+                        JOIN file_test_status fts ON fts.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND fts.state IN ('red', 'stale')
+                            AND (SELECT value FROM policy_thresholds WHERE key = 'test_gate') >= 2
+                            -- Node-type exemption: non-code nodes are never test-gated,
+                            -- even if they accrue node_files. COALESCE so NULL-type
+                            -- (legacy/context) nodes are still gated, not exempted.
+                            AND COALESCE(json_extract(NEW.metadata, '$.type'), '') NOT IN ('finding', 'epic', 'session_history')
+                            AND NOT EXISTS (
+                                SELECT 1 FROM quality_exempt qe
+                                WHERE nf.path LIKE
+                                    CASE WHEN qe.path_pattern LIKE '%/'
+                                         THEN qe.path_pattern || '%'
+                                         ELSE qe.path_pattern
+                                    END
+                            )
+                ) THEN RAISE(ABORT, 'GraphPolicyViolation: test_gate red/stale result')
+        END;
+END;
+TRIGGER
+}
+
+# Migrate to add file_test_status + test_gate threshold and arm the trigger's
+# third (test-correctness) clause. Inert by default: test_gate=0 (off). This is
+# the authoritative trigger (re)creation — it runs last in db_ensure, so its
+# emitter output is the final trigger state for both fresh and existing DBs.
+db_migrate_test_gate() {
+    sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
+CREATE TABLE IF NOT EXISTS file_test_status (
+    path  TEXT PRIMARY KEY,
+    state TEXT NOT NULL DEFAULT 'unknown'
+);
+
+INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('test_gate', 0);
+MIGRATE
+    _policy_trigger_sql | sqlite3 "$WV_DB" 2>/dev/null || true
 }
 
 # Migrate to add chunks table + FTS5 + sync triggers for semantic search.
@@ -793,6 +972,10 @@ db_ensure() {
     db_migrate_chunks
     db_migrate_fts5_learning
     db_migrate_finding_promoted_at
+    db_migrate_test_results
+    # MUST run last: re-creates nodes_policy_check from the single-source emitter
+    # so the authoritative trigger (incl. the test clause) is the final state.
+    db_migrate_test_gate
 
     # Check DB size once per process-tree — export so pipe subshells inherit the flag.
     # Destructive prune requires explicit opt-in: WV_AUTO_PRUNE=1.

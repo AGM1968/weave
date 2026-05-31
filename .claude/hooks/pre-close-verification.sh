@@ -87,7 +87,7 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
             exit 0
         fi
         IS_TRIVIAL=false
-        if [[ "$NODE_TYPE" == "breadcrumbs" ]] || [[ "$NODE_TEXT" =~ ^Test ]]; then
+        if [[ "$NODE_TYPE" == "trails" ]] || [[ "$NODE_TYPE" == "breadcrumbs" ]] || [[ "$NODE_TEXT" =~ ^Test ]]; then
             IS_TRIVIAL=true
         fi
 

@@ -79,12 +79,12 @@ if [ -f "$SENTINEL" ]; then
     [ -n "$_SS_LAST_PROMPT" ] && _CRASH_MSG="${_CRASH_MSG} Last prompt: '${_SS_LAST_PROMPT}'"
     _CRASH_MSG="${_CRASH_MSG} Review and re-claim or close active nodes."
 
-    # Auto-generate recovery breadcrumb
-    "$WV" breadcrumbs save --message="$_CRASH_MSG" >/dev/null 2>&1 || true
+    # Auto-generate recovery trail entry
+    "$WV" trails save --message="$_CRASH_MSG" >/dev/null 2>&1 || true
 
     CRASH_WARNING="CRASH DETECTED: previous session ended abruptly at ${CRASH_TS}. Active at crash: ${CRASH_ACTIVE}."
     [ -n "$_SS_LAST_PROMPT" ] && CRASH_WARNING="${CRASH_WARNING} Last prompt: '${_SS_LAST_PROMPT}'"
-    CRASH_WARNING="${CRASH_WARNING} Recovery breadcrumb saved."
+    CRASH_WARNING="${CRASH_WARNING} Recovery trail saved."
 fi
 
 # ── Write minimal sentinel BEFORE wv load (crash-during-load detectable) ──
@@ -101,7 +101,7 @@ jq -n \
 # Ensure DB is loaded
 "$WV" load >/dev/null 2>&1 || true
 
-# Commit any .weave/ state written during session-start (crash-recovery breadcrumbs,
+# Commit any .weave/ state written during session-start (crash-recovery trails,
 # migrations). Without this, the stop-hook fires on the first response with
 # "unsaved weave state" for changes the agent didn't cause.
 (
@@ -152,16 +152,18 @@ Health: ${HEALTH_SCORE}/100"
     fi
 fi
 
-# Surface stale breadcrumbs (>24h old) so they aren't silently forgotten
+# Surface stale trails (>24h old) so they aren't silently forgotten.
+# Prefer trails.md; fall back to the legacy breadcrumbs.md on un-migrated repos.
 WEAVE_DIR="${WV_PROJECT_DIR}/.weave"
-BC_FILE="${WEAVE_DIR}/breadcrumbs.md"
+BC_FILE="${WEAVE_DIR}/trails.md"
+[ -f "$BC_FILE" ] || BC_FILE="${WEAVE_DIR}/breadcrumbs.md"
 if [ -f "$BC_FILE" ]; then
     now=$(date +%s)
     mtime=$(stat -c %Y "$BC_FILE" 2>/dev/null || stat -f %m "$BC_FILE" 2>/dev/null || echo "$now")
     age_hours=$(( (now - mtime) / 3600 ))
     if [ "$age_hours" -gt 24 ]; then
         CONTEXT="${CONTEXT}
-Breadcrumbs from ${age_hours}h ago — run 'wv breadcrumbs show' to review"
+Trail from ${age_hours}h ago — run 'wv trails show' to review"
     fi
 fi
 

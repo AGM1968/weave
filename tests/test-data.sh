@@ -712,6 +712,24 @@ CP_DIR=$(mktemp -d)
     fi
     _r=$((_r + 1))
 
+    # Pull-enabled regression (wv-6b8ff3): the hijack guard must run BEFORE
+    # `git pull --autostash`. With an upstream configured, a post-pull guard
+    # would see an empty index (autostash already unstaged the caller's file)
+    # and absorb/churn it. Assert a staged file survives a pull-enabled checkpoint.
+    git clone -q --bare "$CP_DIR" "$CP_DIR/remote.git" >/dev/null 2>&1 || true
+    git remote add origin "$CP_DIR/remote.git" >/dev/null 2>&1 || true
+    git push -q -u origin "$(git branch --show-current)" >/dev/null 2>&1 || true
+    echo "pull-path work" > feature2.txt && git add feature2.txt
+    WV_CHECKPOINT_PULL=1 WV_CHECKPOINT_INTERVAL=0 "$WV" add "trigger pull checkpoint" >/dev/null 2>&1 || true
+    _staged2=$(git diff --cached --name-only | grep '^feature2.txt$' || true)
+    if [ -n "$_staged2" ]; then
+        echo -e "  ${GREEN}✓${NC} guard (pull on): autostash did not unstage feature2.txt"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} guard (pull on): feature2.txt lost from index after pull-enabled checkpoint"
+    fi
+    _r=$((_r + 1))
+
     echo "$_p $_r" > "$CP_DIR/.delta"
 )
 if [ -f "$CP_DIR/.delta" ]; then
@@ -720,6 +738,135 @@ if [ -f "$CP_DIR/.delta" ]; then
     TESTS_RUN=$((TESTS_RUN + _cp_r))
 fi
 rm -rf "$CP_DIR"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Trails append-only storage (S1 — wv-0c2404)
+# ═══════════════════════════════════════════════════════════════════════════
+echo "Testing: trails append-only storage"
+reset_db
+
+# Read a node's metadata JSON straight from the DB (version-independent; avoids
+# the $.trails[#-1] index syntax that needs SQLite >= 3.42).
+_meta() { sqlite3 "$WV_DB" "SELECT COALESCE(metadata,'{}') FROM nodes WHERE id='$1';"; }
+
+tr_id=$($WV add "trails subject" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+
+# 1. Append accumulates rather than overwrites; newest is the last element
+$WV breadcrumbs capsule "$tr_id" --json='{"goal":"first","next":"a"}' >/dev/null 2>&1
+$WV breadcrumbs capsule "$tr_id" --json='{"goal":"second","next":"b"}' >/dev/null 2>&1
+len=$(_meta "$tr_id" | jq '.trails | length')
+assert_equals "2" "$len" "two capsules accumulate (append, not overwrite)"
+newest=$(_meta "$tr_id" | jq -r '.trails[-1].goal')
+assert_equals "second" "$newest" "newest entry is the last element"
+
+# 2. Auto-stamps 'at' when omitted
+has_at=$(_meta "$tr_id" | jq -r '.trails[-1] | has("at")')
+assert_equals "true" "$has_at" "capsule auto-stamps 'at' timestamp"
+
+# 3. First append seeds trails[0] from any legacy metadata.breadcrumbs
+seed_id=$($WV add "trails legacy seed" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+$WV update "$seed_id" --metadata='{"breadcrumbs":{"goal":"legacy","state":"old"}}' >/dev/null 2>&1
+$WV breadcrumbs capsule "$seed_id" --json='{"goal":"fresh"}' >/dev/null 2>&1
+first_goal=$(_meta "$seed_id" | jq -r '.trails[0].goal')
+assert_equals "legacy" "$first_goal" "first append seeds trails[0] from legacy breadcrumbs"
+seed_len=$(_meta "$seed_id" | jq '.trails | length')
+assert_equals "2" "$seed_len" "legacy capsule preserved alongside new entry"
+
+# 4. cmd_load back-fills trails from legacy breadcrumbs (D1 migration)
+load_id=$($WV add "trails load migration" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+$WV update "$load_id" --metadata='{"breadcrumbs":{"goal":"premigration"}}' >/dev/null 2>&1
+$WV sync >/dev/null 2>&1
+$WV load >/dev/null 2>&1
+migrated=$(_meta "$load_id" | jq -r '.trails[0].goal')
+assert_equals "premigration" "$migrated" "cmd_load seeds trails[0] from legacy breadcrumbs"
+
+# 5. capsule rejects a missing node id and non-object json
+assert_fails "$WV breadcrumbs capsule --json='{\"goal\":\"x\"}'" "capsule requires a node id"
+assert_fails "$WV breadcrumbs capsule $tr_id --json='[1,2]'" "capsule rejects non-object json"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Trails read/render + cap + staleness (S2 — wv-ae9139)
+# ═══════════════════════════════════════════════════════════════════════════
+echo "Testing: trails cap + render + staleness"
+reset_db
+
+# 6. Cap policy: keep only the last WV_TRAILS_CAP entries
+cap_id=$($WV add "trails cap subject" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+for i in 1 2 3 4 5; do
+    WV_TRAILS_CAP=3 $WV breadcrumbs capsule "$cap_id" --json="{\"goal\":\"e$i\"}" >/dev/null 2>&1
+done
+cap_len=$(_meta "$cap_id" | jq '.trails | length')
+assert_equals "3" "$cap_len" "cap keeps only last WV_TRAILS_CAP (3) entries"
+cap_first=$(_meta "$cap_id" | jq -r '.trails[0].goal')
+assert_equals "e3" "$cap_first" "cap drops oldest entries (e1,e2 gone)"
+cap_last=$(_meta "$cap_id" | jq -r '.trails[-1].goal')
+assert_equals "e5" "$cap_last" "cap retains newest entry"
+
+# 7. wv show renders latest entry + collapsed path
+show_id=$($WV add "trails show subject" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+$WV breadcrumbs capsule "$show_id" --json='{"goal":"older goal"}' >/dev/null 2>&1
+$WV breadcrumbs capsule "$show_id" --json='{"goal":"latest goal","state":"wip","next":"finish"}' >/dev/null 2>&1
+show_out=$($WV show "$show_id" --mode=execute 2>&1)
+assert_contains "$show_out" "Trail:" "wv show renders a Trail block"
+assert_contains "$show_out" "latest goal" "wv show headlines the latest entry"
+assert_contains "$show_out" "1 earlier" "wv show collapses older entries into a path summary"
+
+# 8. Staleness: entries predating the current session start are flagged
+#    Write a session snapshot whose start_ts is 'now', then append a past-dated entry.
+printf '%s\t0\t0\t0\n' "$(date -u +%s)" > "$WV_HOT_ZONE/.session_snapshot"
+stale_id=$($WV add "trails stale subject" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+$WV breadcrumbs capsule "$stale_id" --json='{"goal":"ancient","at":"2020-01-01T00:00:00Z"}' >/dev/null 2>&1
+stale_out=$($WV show "$stale_id" --mode=execute 2>&1)
+assert_contains "$stale_out" "stale" "entry predating session start is flagged stale"
+# A fresh entry (default 'at' = now) is NOT flagged stale
+fresh_id=$($WV add "trails fresh subject" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+$WV breadcrumbs capsule "$fresh_id" --json='{"goal":"current"}' >/dev/null 2>&1
+fresh_out=$($WV show "$fresh_id" --mode=execute 2>&1)
+assert_not_contains "$fresh_out" "stale" "fresh entry is not flagged stale"
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo "Testing: trails rename + back-compat (S3)"
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 1. `wv trails save` writes the new .weave/trails.md (not the legacy file)
+rm -f "$WEAVE_DIR/trails.md" "$WEAVE_DIR/breadcrumbs.md"
+$WV trails save --message="s3 save" >/dev/null 2>&1
+assert_equals "true" "$([ -f "$WEAVE_DIR/trails.md" ] && echo true || echo false)" "wv trails save writes .weave/trails.md"
+assert_equals "false" "$([ -f "$WEAVE_DIR/breadcrumbs.md" ] && echo true || echo false)" "wv trails save does not write legacy breadcrumbs.md"
+ts_show=$($WV trails show 2>&1)
+assert_contains "$ts_show" "s3 save" "wv trails show reads trails.md"
+
+# 2. `wv breadcrumbs` alias routes to the same trails command/file
+rm -f "$WEAVE_DIR/trails.md"
+$WV breadcrumbs save --message="alias save" >/dev/null 2>&1
+assert_equals "true" "$([ -f "$WEAVE_DIR/trails.md" ] && echo true || echo false)" "wv breadcrumbs alias writes trails.md"
+bc_show=$($WV breadcrumbs show 2>&1)
+assert_contains "$bc_show" "alias save" "wv breadcrumbs alias show reads trails.md"
+
+# 3. `wv trails capsule` appends to metadata.trails[] (same as breadcrumbs capsule)
+cap3_id=$($WV add "trails s3 capsule subject" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+$WV trails capsule "$cap3_id" --json='{"goal":"via trails"}' >/dev/null 2>&1
+assert_equals "via trails" "$(_meta "$cap3_id" | jq -r '.trails[-1].goal')" "wv trails capsule appends entry"
+
+# 4. cmd_load migrates legacy .weave/breadcrumbs.md -> trails.md (D1 file migration)
+rm -f "$WEAVE_DIR/trails.md" "$WEAVE_DIR/breadcrumbs.md"
+printf '# Session Breadcrumbs\n\nlegacy file body\n' > "$WEAVE_DIR/breadcrumbs.md"
+$WV load >/dev/null 2>&1
+assert_equals "true" "$([ -f "$WEAVE_DIR/trails.md" ] && echo true || echo false)" "cmd_load renames legacy breadcrumbs.md to trails.md"
+assert_equals "false" "$([ -f "$WEAVE_DIR/breadcrumbs.md" ] && echo true || echo false)" "cmd_load removes legacy breadcrumbs.md after migration"
+mig_show=$($WV trails show 2>&1)
+assert_contains "$mig_show" "legacy file body" "migrated trails.md preserves legacy content"
+
+# 5. show falls back to legacy breadcrumbs.md when trails.md is absent (un-migrated repo)
+rm -f "$WEAVE_DIR/trails.md" "$WEAVE_DIR/breadcrumbs.md"
+printf '# Session Breadcrumbs\n\nfallback body\n' > "$WEAVE_DIR/breadcrumbs.md"
+fb_show=$($WV trails show 2>&1)
+assert_contains "$fb_show" "fallback body" "wv trails show falls back to legacy breadcrumbs.md"
+rm -f "$WEAVE_DIR/breadcrumbs.md"
+
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════

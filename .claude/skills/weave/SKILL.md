@@ -99,21 +99,22 @@ node remains blocked until child completes.
 
 ### Input Modes
 
-| Mode | Command | Steps |
-|------|---------|-------|
-| Node ID | `/weave wv-xxxxxx` | Validate → claim (`wv work <id>`) → CONTEXT |
-| Text | `/weave "Fix bug"` | Create claim-ready node (`wv add "<text>" --status=active --criteria="c1|c2" --risks=low`) when the task is already specific, otherwise create then claim (`wv add "<text>"` → `wv work <id>`) → CONTEXT |
-| None | `/weave` | Prefer `wv bootstrap --json` for session snapshot; fall back to `wv ready --json` → user picks → Mode 1 or 2 |
+| Mode    | Command            | Steps                                                                                                        |
+| ------- | ------------------ | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| Node ID | `/weave wv-xxxxxx` | Validate → claim (`wv work <id>`) → CONTEXT                                                                  |
+| Text    | `/weave "Fix bug"` | Create claim-ready node (`wv add "<text>" --status=active --criteria="c1                                     | c2" --risks=low`) when the task is already specific, otherwise create then claim (`wv add "<text>"`→`wv work <id>`) → CONTEXT |
+| None    | `/weave`           | Prefer `wv bootstrap --json` for session snapshot; fall back to `wv ready --json` → user picks → Mode 1 or 2 |
 
 **Compound helpers:** prefer `wv bootstrap --json` for session-start context, `wv quick` for trivial
 one-step work, and `wv ship` when the close+sync path should stay coupled.
 
-**Claimable:** `todo` or `blocked`. `active` = warn but allow. `done` = block.
-**Vague text** (<5 words, no action verb): clarify it inside `/weave` before proceeding.
+**Claimable:** `todo` or `blocked`. `active` = warn but allow. `done` = block. **Vague text** (<5
+words, no action verb): clarify it inside `/weave` before proceeding.
 
 ### Agent Pre-Launch Validation
 
 Before spawning any weave agent (`epic-planner`, `learning-curator`, `weave-guide`):
+
 1. Read `.claude/agents/<name>.md`
 2. Verify `tools` field includes `"Bash"`
 3. On fail → abort spawn, fall back to inline execution
@@ -131,19 +132,20 @@ Before spawning any weave agent (`epic-planner`, `learning-curator`, `weave-guid
 ## Phase 3: EXECUTE — Do the Work
 
 **Pre-conditions** (enforced by `pre-action.sh` hook):
+
 - Active node exists
 - No unresolved contradictions or blockers
 
 **Edge enforcement:**
 
-| Edge Type | Weight | Action |
-|-----------|--------|--------|
-| `references` | ≥0.7 | Must read before editing |
-| `implements` | any | Verify against spec |
-| `supersedes`/`obsoletes` | any | Warn, do not proceed without override |
+| Edge Type                | Weight | Action                                |
+| ------------------------ | ------ | ------------------------------------- |
+| `references`             | ≥0.7   | Must read before editing              |
+| `implements`             | any    | Verify against spec                   |
+| `supersedes`/`obsoletes` | any    | Warn, do not proceed without override |
 
-**Scope control:** If editing unrelated files → create child node (iteration trigger).
-**Stuck detection:** Same approach fails 2× → pivot strategy or create blocker node.
+**Scope control:** If editing unrelated files → create child node (iteration trigger). **Stuck
+detection:** Same approach fails 2× → pivot strategy or create blocker node.
 
 Use `wv touch <id> --intent="..."` for low-token intent/progress checkpoints between larger
 execution steps instead of repeatedly emitting full context.
@@ -156,7 +158,7 @@ close-time friction, missing guardrail):
 1. Fix it in the current node only if it directly blocks safe completion.
 2. Otherwise create a tracked repair node with `wv add "Task: ..." --gh --parent=<feature-or-epic>`.
 3. If the current node depends on that fix, block current work on the new node.
-4. Save breadcrumbs describing what was detected and the next action.
+4. Save a trail describing what was detected and the next action.
 
 ## Phase 4: CLOSE — Complete with Learnings
 
@@ -165,7 +167,8 @@ close-time friction, missing guardrail):
 **DO NOT call `wv done` until:**
 
 1. **Learning-curator invoked** (non-trivial work):
-   - Invoke via Agent tool (`subagent_type: "learning-curator"`) with node text + files changed + work summary
+   - Invoke via Agent tool (`subagent_type: "learning-curator"`) with node text + files changed +
+     work summary
    - _(Agent SDK / MCP clients: use `weave_learnings` tool instead)_
    - Learnings must contain: `decision:` | `pattern:` | `pitfall:`
    - Trivial work still needs a concise structured learning; there is no `--skip-learnings` flag
@@ -176,7 +179,8 @@ close-time friction, missing guardrail):
 
 3. **Work committed while the node is active** (enforced by `pre-close-verification.sh` hook):
    - Commit code changes before `wv done` so `prepare-commit-msg` can add `Weave-ID:` attribution
-   - Close is denied when non-`.weave/` changes are still uncommitted or no commit can be attributed to the node
+   - Close is denied when non-`.weave/` changes are still uncommitted or no commit can be attributed
+     to the node
 
 ```text
 ✗ WRONG:  wv done wv-XXXX --learning="fixed the bug"
@@ -199,6 +203,6 @@ git push
 If `wv ship` or `wv sync` is interrupted, `wv recover` resumes from the journal.
 
 For non-interactive agent flows, do not leave the system hanging on close-time prompts. Prefer
-capturing pending-close state, surfacing `needs_human_verification`, and resuming with explicit human
-approval. Use `--no-overlap-check` when the agent already has the verification evidence and
+capturing pending-close state, surfacing `needs_human_verification`, and resuming with explicit
+human approval. Use `--no-overlap-check` when the agent already has the verification evidence and
 structured learnings needed to close without overlap prompts.

@@ -32,6 +32,9 @@ export WV_DB="$TEST_DIR/brain.db"
 export WV_REQUIRE_LEARNING=0
 export WV_RUN_CACHE=0
 export WV_PROJECT_DIR="$TEST_DIR"
+# Isolate the durable suite-run log (LL2): wv test-record is always-on, so without
+# this every test-record call here would pollute the real ~/.local/share log.
+export WV_SUITE_LOG="$TEST_DIR/suite_runs.jsonl"
 
 # Cleanup function
 cleanup() {
@@ -1208,7 +1211,7 @@ test_help_surfaces() {
         init add delete done ship ship-agent batch-done bulk-update work preflight recover bootstrap bootstrap-agent
         overview cache pending-close ready list show status update touch allowed-tools quick
         block link unlink resolve related edges path tree plan enrich-topology context search
-        reindex learnings breadcrumbs digest session-summary audit-pitfalls edge-types init-repo
+        reindex learnings trails breadcrumbs digest session-summary audit-pitfalls edge-types init-repo
         doctor selftest mcp-status health guide prune clean-ghosts compact refs import quality
         findings analyze batch sync load
     )
@@ -1504,6 +1507,102 @@ SQL
     arch_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$arch_id" 2>&1)
     assert_contains "$arch_out" "Closed" \
         "done succeeds for file under exempt directory prefix (archive/)"
+
+    # --- Case 8: test_gate clause (P6b) — red/stale file blocks at test_gate>=block ---
+    # NOTE: cases 1 (mccabe) and 5 (trend) above ran against THIS same trigger,
+    # which is recreated from the single-source emitter by db_migrate_test_gate
+    # (last migration). Their ABORT assertions are the regression tripwire proving
+    # the emitter preserved clauses 1 and 2 while adding clause 3.
+    # WV_REQUIRE_QUALITY=0 skips _done_refresh_test_status so the seeded state stands.
+    sqlite3 "$WV_DB" "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES ('test_gate', 2);"
+    local tg_id
+    tg_id=$("$WV" add "Node with a red test file" --force 2>&1 | tail -1)
+    "$WV" work "$tg_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_test_status(path, state) VALUES ('src/untested.py', 'red');
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$tg_id', 'src/untested.py');
+SQL
+    local tg_out
+    tg_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$tg_id" 2>&1 || true)
+    assert_contains "$tg_out" "GraphPolicyViolation" \
+        "done blocked when test_gate=block and a touched file is red"
+    assert_contains "$tg_out" '"threshold":"test_gate"' \
+        "test_gate violation payload names the test_gate threshold"
+    assert_contains "$tg_out" '"state":"red"' \
+        "test_gate violation payload includes the failing state"
+    local tg_status
+    tg_status=$(sqlite3 "$WV_DB" "SELECT status FROM nodes WHERE id='$tg_id';")
+    assert_equals "active" "$tg_status" "node stays active after test_gate abort"
+
+    # --- Case 8b: same red file is INERT when test_gate=off (default 0) ---
+    sqlite3 "$WV_DB" "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES ('test_gate', 0);"
+    local tg_out2
+    tg_out2=$(WV_REQUIRE_QUALITY=0 "$WV" done "$tg_id" 2>&1)
+    assert_contains "$tg_out2" "Closed" \
+        "done succeeds on a red file when test_gate=off (gate inert by default)"
+
+    # --- Case 8c: unknown test state never blocks, even at test_gate=block ---
+    sqlite3 "$WV_DB" "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES ('test_gate', 2);"
+    local tgu_id
+    tgu_id=$("$WV" add "Node with unknown test file" --force 2>&1 | tail -1)
+    "$WV" work "$tgu_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_test_status(path, state) VALUES ('src/unknownst.py', 'unknown');
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$tgu_id', 'src/unknownst.py');
+SQL
+    local tgu_out
+    tgu_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$tgu_id" 2>&1)
+    assert_contains "$tgu_out" "Closed" \
+        "done succeeds when test state is unknown (non-blocking) even at test_gate=block"
+
+    # --- Case 9 (P6c): test_gate=warn emits advisory but does NOT block ---
+    sqlite3 "$WV_DB" "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES ('test_gate', 1);"
+    local warn_id
+    warn_id=$("$WV" add "Node with red file at warn level" --force 2>&1 | tail -1)
+    "$WV" work "$warn_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_test_status(path, state) VALUES ('src/warnme.py', 'red');
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$warn_id', 'src/warnme.py');
+SQL
+    local warn_out
+    warn_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$warn_id" --learning="x" 2>&1)
+    assert_contains "$warn_out" "Closed" \
+        "test_gate=warn does not block the close (advisory only)"
+    assert_contains "$warn_out" "test_gate=warn" \
+        "test_gate=warn emits a non-blocking advisory naming the unverified file"
+
+    # --- Case 9b: --skip-verification suppresses the warn advisory ---
+    local warn_id2
+    warn_id2=$("$WV" add "Node with red file, skip-verification" --force 2>&1 | tail -1)
+    "$WV" work "$warn_id2" >/dev/null 2>&1
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_test_status(path, state) VALUES ('src/skipme.py', 'red');
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$warn_id2', 'src/skipme.py');
+SQL
+    local warn_out2
+    warn_out2=$(WV_REQUIRE_QUALITY=0 "$WV" done "$warn_id2" --skip-verification 2>&1)
+    assert_contains "$warn_out2" "Closed" \
+        "--skip-verification still closes at test_gate=warn"
+    assert_not_contains "$warn_out2" "test_gate=warn" \
+        "--skip-verification suppresses the test_gate warn advisory"
+
+    # --- Case 9c: node-type exemption — an epic with a red file closes even at block ---
+    sqlite3 "$WV_DB" "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES ('test_gate', 2);"
+    local epic_id
+    epic_id=$("$WV" add "Epic touching a red file" --force 2>&1 | tail -1)
+    "$WV" work "$epic_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" <<SQL
+UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'), '\$.type', 'epic') WHERE id='$epic_id';
+INSERT OR REPLACE INTO file_test_status(path, state) VALUES ('src/epicfile.py', 'red');
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$epic_id', 'src/epicfile.py');
+SQL
+    local epic_out
+    epic_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$epic_id" --skip-verification 2>&1)
+    assert_contains "$epic_out" "Closed" \
+        "node-type exemption: an epic with a red touched file closes even at test_gate=block"
+
+    # Restore default so later tests are unaffected.
+    sqlite3 "$WV_DB" "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES ('test_gate', 0);"
 }
 
 test_trend_signal_wiring() {
@@ -2072,6 +2171,216 @@ test_allowed_tools() {
         "wv work without --allowed-tools leaves allowed_tools unset"
 }
 
+test_test_results_ledger() {
+    echo ""
+    echo "Test: test_results ledger + wv test-record (P6a)"
+    echo "============================================================"
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # --- migration provisions the table with the per-path 'path' column ---
+    local has_table has_path
+    has_table=$(sqlite3 "$WV_DB" "SELECT name FROM sqlite_master WHERE type='table' AND name='test_results';")
+    assert_equals "test_results" "$has_table" "test_results table created by migration"
+    has_path=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM pragma_table_info('test_results') WHERE name='path';")
+    assert_equals "1" "$has_path" "test_results has per-file 'path' column (P6b)"
+
+    # --- one row per --files entry, each with that file's own fingerprint ---
+    echo "alpha" > "$TEST_DIR/a.sh"
+    echo "beta"  > "$TEST_DIR/b.sh"
+    "$WV" test-record "tests/test-foo.sh" --files="a.sh,b.sh" --exit=0 >/dev/null 2>&1
+    local row_count fp_a fp_b
+    row_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM test_results WHERE suite='tests/test-foo.sh';")
+    assert_equals "2" "$row_count" "test-record writes one row per --files entry"
+    fp_a=$(sqlite3 "$WV_DB" "SELECT fingerprint FROM test_results WHERE suite='tests/test-foo.sh' AND path='a.sh';")
+    fp_b=$(sqlite3 "$WV_DB" "SELECT fingerprint FROM test_results WHERE suite='tests/test-foo.sh' AND path='b.sh';")
+    assert_success "per-file fingerprint a.sh non-empty" test -n "$fp_a"
+    assert_not_contains "$fp_a" "$fp_b" "distinct files get distinct fingerprints"
+
+    # --- fingerprint == git blob hash (same pure function the consumer uses) ---
+    local blob_a
+    blob_a=$(cd "$TEST_DIR" && git hash-object a.sh)
+    assert_equals "$blob_a" "$fp_a" "fingerprint is the file's git blob hash"
+
+    # --- idempotent per (suite, path): re-record updates the row in place ---
+    "$WV" test-record "tests/test-foo.sh" --files="a.sh" --exit=1 >/dev/null 2>&1
+    local row_count2 ec_a
+    row_count2=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM test_results WHERE suite='tests/test-foo.sh';")
+    assert_equals "2" "$row_count2" "re-record same (suite,path) upserts (no duplicate row)"
+    ec_a=$(sqlite3 "$WV_DB" "SELECT exit_code FROM test_results WHERE suite='tests/test-foo.sh' AND path='a.sh';")
+    assert_equals "1" "$ec_a" "latest outcome wins per (suite, path)"
+
+    # --- fingerprint tracks content: editing the file updates the same row's fp ---
+    echo "alpha-changed" > "$TEST_DIR/a.sh"
+    "$WV" test-record "tests/test-foo.sh" --files="a.sh" --exit=0 >/dev/null 2>&1
+    local fp_a2
+    fp_a2=$(sqlite3 "$WV_DB" "SELECT fingerprint FROM test_results WHERE suite='tests/test-foo.sh' AND path='a.sh';")
+    assert_not_contains "$fp_a" "$fp_a2" "fingerprint changes after content change (same row)"
+
+    # --- non-numeric exit code is coerced to failure (1) ---
+    "$WV" test-record "tests/test-bar.sh" --files="a.sh" --exit=abc >/dev/null 2>&1
+    local ec_bad
+    ec_bad=$(sqlite3 "$WV_DB" "SELECT exit_code FROM test_results WHERE suite='tests/test-bar.sh' AND path='a.sh';")
+    assert_equals "1" "$ec_bad" "non-numeric exit code coerced to 1"
+
+    # --- empty --files records a single sentinel row (path='') ---
+    "$WV" test-record "tests/test-baz.sh" --exit=0 >/dev/null 2>&1
+    local row_nofiles sentinel
+    row_nofiles=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM test_results WHERE suite='tests/test-baz.sh';")
+    assert_equals "1" "$row_nofiles" "test-record with no --files records one sentinel row"
+    sentinel=$(sqlite3 "$WV_DB" "SELECT path FROM test_results WHERE suite='tests/test-baz.sh';")
+    assert_equals "" "$sentinel" "sentinel row has empty path"
+
+    # --- missing suite arg errors ---
+    local bad_rc
+    bad_rc=0
+    "$WV" test-record >/dev/null 2>&1 || bad_rc=$?
+    assert_equals "1" "$bad_rc" "test-record without a suite arg exits 1"
+
+    # --- duration_ms persisted (LL1): --duration stored; absent/garbage -> 0 ---
+    local has_dur dur_stored dur_default dur_garbage
+    has_dur=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM pragma_table_info('test_results') WHERE name='duration_ms';")
+    assert_equals "1" "$has_dur" "test_results has duration_ms column (LL1 migration)"
+    "$WV" test-record "tests/test-dur.sh" --files="a.sh" --exit=0 --duration=4242 >/dev/null 2>&1
+    dur_stored=$(sqlite3 "$WV_DB" "SELECT duration_ms FROM test_results WHERE suite='tests/test-dur.sh' AND path='a.sh';")
+    assert_equals "4242" "$dur_stored" "--duration value persisted to the row"
+    "$WV" test-record "tests/test-dur2.sh" --files="a.sh" --exit=0 >/dev/null 2>&1
+    dur_default=$(sqlite3 "$WV_DB" "SELECT duration_ms FROM test_results WHERE suite='tests/test-dur2.sh' AND path='a.sh';")
+    assert_equals "0" "$dur_default" "absent --duration defaults to 0"
+    "$WV" test-record "tests/test-dur3.sh" --files="a.sh" --exit=0 --duration=abc >/dev/null 2>&1
+    dur_garbage=$(sqlite3 "$WV_DB" "SELECT duration_ms FROM test_results WHERE suite='tests/test-dur3.sh' AND path='a.sh';")
+    assert_equals "0" "$dur_garbage" "non-numeric --duration coerced to 0"
+
+    # --- durable history survives a simulated wv load (LL2) ---
+    # The disk JSONL log is independent of the tmpfs table: wiping the DB (what
+    # wv load does) must not lose history.
+    local log_lines_before log_lines_after
+    log_lines_before=$(wc -l < "$WV_SUITE_LOG" 2>/dev/null | tr -d ' ')
+    assert_success "suite history log written on disk" test -s "$WV_SUITE_LOG"
+    rm -f "$WV_DB"   # simulate wv load wiping the tmpfs current-state table
+    log_lines_after=$(wc -l < "$WV_SUITE_LOG" 2>/dev/null | tr -d ' ')
+    assert_equals "$log_lines_before" "$log_lines_after" "history log survives a tmpfs DB wipe (wv load)"
+    # one JSONL line per RUN (not per file): a 2-file run adds exactly 1 line
+    local before2 after2
+    "$WV" init >/dev/null 2>&1   # rebuild the wiped DB so test-record can upsert
+    before2=$(wc -l < "$WV_SUITE_LOG" 2>/dev/null | tr -d ' ')
+    "$WV" test-record "tests/test-run.sh" --files="a.sh,b.sh" --exit=0 --duration=10 >/dev/null 2>&1
+    after2=$(wc -l < "$WV_SUITE_LOG" 2>/dev/null | tr -d ' ')
+    assert_equals "$((before2 + 1))" "$after2" "one history line per RUN regardless of file count"
+}
+
+test_done_refresh_test_status() {
+    echo ""
+    echo "Test: _done_refresh_test_status — ledger -> file_test_status (P6b consumer)"
+    echo "============================================================"
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # test-map.conf: map the source file to a suite (the shared resolver reads this).
+    mkdir -p "$TEST_DIR/.weave"
+    printf '[map]\nsrc/foo.sh = tests/test-foo.sh\n' > "$TEST_DIR/.weave/test-map.conf"
+
+    mkdir -p "$TEST_DIR/src"
+    echo "green-content" > "$TEST_DIR/src/foo.sh"
+
+    # Producer: record a green result for the current content.
+    (cd "$TEST_DIR" && "$WV" test-record "tests/test-foo.sh" --files="src/foo.sh" --exit=0 >/dev/null 2>&1)
+
+    # A node touching that path.
+    local nid
+    nid=$("$WV" add "Node touching tested file" --force 2>&1 | tail -1)
+    "$WV" work "$nid" >/dev/null 2>&1
+    sqlite3 "$WV_DB" "INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$nid', 'src/foo.sh');"
+
+    # Invoke the consumer directly (WV_REQUIRE_QUALITY default so it runs).
+    run_refresh() {
+        cd "$TEST_DIR" && WEAVE_DIR="$TEST_DIR/.weave" WV_DB="$WV_DB" bash -c "
+            source '$PROJECT_ROOT/scripts/lib/wv-validate.sh'
+            source '$PROJECT_ROOT/scripts/lib/wv-db.sh'
+            source '$PROJECT_ROOT/scripts/cmd/wv-cmd-graph.sh'
+            source '$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh'
+            source '$PROJECT_ROOT/scripts/cmd/wv-cmd-core.sh'
+            _done_refresh_test_status '$1'
+        " 2>/dev/null
+    }
+
+    # --- green: ledger fingerprint matches current content + exit 0 ---
+    run_refresh "$nid"
+    local st_green
+    st_green=$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")
+    assert_equals "green" "$st_green" "fresh pass (fp match + exit 0) -> green"
+
+    # --- stale: content changes after the recorded run ---
+    echo "edited-after-test" > "$TEST_DIR/src/foo.sh"
+    run_refresh "$nid"
+    local st_stale
+    st_stale=$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")
+    assert_equals "stale" "$st_stale" "content changed since recorded run -> stale"
+
+    # --- red: re-record a failing run at the new content ---
+    (cd "$TEST_DIR" && "$WV" test-record "tests/test-foo.sh" --files="src/foo.sh" --exit=1 >/dev/null 2>&1)
+    run_refresh "$nid"
+    local st_red
+    st_red=$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")
+    assert_equals "red" "$st_red" "fresh fail (fp match + exit !=0) -> red"
+
+    # --- unknown: a path with no ledger row / no mapping ---
+    local nid2
+    nid2=$("$WV" add "Node touching unmapped file" --force 2>&1 | tail -1)
+    "$WV" work "$nid2" >/dev/null 2>&1
+    sqlite3 "$WV_DB" "INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$nid2', 'src/nomapping.sh');"
+    echo "x" > "$TEST_DIR/src/nomapping.sh"
+    run_refresh "$nid2"
+    local st_unknown
+    st_unknown=$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/nomapping.sh';")
+    assert_equals "unknown" "$st_unknown" "no ledger result for the path -> unknown"
+}
+
+test_quality_config_thresholds() {
+    echo ""
+    echo "Test: .weave/quality.conf [thresholds] -> policy_thresholds (P6d durable config)"
+    echo "============================================================"
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+    "$WV" sync >/dev/null 2>&1   # create state.sql so wv load has something to restore
+
+    mkdir -p "$TEST_DIR/.weave"
+    cat > "$TEST_DIR/.weave/quality.conf" <<'CONF'
+[exempt]
+vendor/
+
+[thresholds]
+test_gate = 2            # block
+mccabe_max_py = 30
+bogus@key = 5
+test_gate_bad = abc
+CONF
+
+    "$WV" load >/dev/null 2>&1
+
+    # --- valid threshold rows applied (INSERT OR REPLACE over the seeded default) ---
+    local tg mp
+    tg=$(sqlite3 "$WV_DB" "SELECT CAST(value AS INTEGER) FROM policy_thresholds WHERE key='test_gate';")
+    assert_equals "2" "$tg" "[thresholds] test_gate=2 applied durably on load"
+    mp=$(sqlite3 "$WV_DB" "SELECT CAST(value AS INTEGER) FROM policy_thresholds WHERE key='mccabe_max_py';")
+    assert_equals "30" "$mp" "[thresholds] overrides a seeded default (mccabe_max_py)"
+
+    # --- malformed lines rejected (bad key chars, non-numeric value) ---
+    local bogus badval
+    bogus=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM policy_thresholds WHERE key='bogus@key';")
+    assert_equals "0" "$bogus" "[thresholds] rejects keys with invalid characters"
+    badval=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM policy_thresholds WHERE key='test_gate_bad';")
+    assert_equals "0" "$badval" "[thresholds] rejects non-numeric values"
+
+    # --- [exempt] still loads alongside [thresholds] ---
+    local exempt
+    exempt=$(sqlite3 "$WV_DB" "SELECT path_pattern FROM quality_exempt WHERE path_pattern='vendor/';")
+    assert_equals "vendor/" "$exempt" "[exempt] still loads when [thresholds] is present"
+}
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -2097,6 +2406,9 @@ main() {
     test_bootstrap_agent
     test_stale_active_marker
     test_policy_trigger
+    test_test_results_ledger
+    test_done_refresh_test_status
+    test_quality_config_thresholds
     test_trend_signal_wiring
     test_chunk_store_schema
     test_wv_index_command

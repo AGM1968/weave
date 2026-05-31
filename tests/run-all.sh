@@ -65,7 +65,9 @@ declare -a FAST_SUITES=(
     "test-multi-agent.sh:Multi-Agent Tests"
     "test-delta-unit.sh:Delta Unit Tests"
     "test-analyze.sh:Analyze Command Tests"
+    "test-config.sh:Config Command Tests"
     "test-query.sh:Query Command Tests"
+    "test-pattern-audit-check6.sh:Pattern-Audit Check 6 (node-state invariant)"
 )
 
 # Slow tier — excluded by default; add with --slow (~200s, runs install+selftest)
