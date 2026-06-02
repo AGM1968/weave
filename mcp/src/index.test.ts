@@ -280,12 +280,12 @@ describe("Weave MCP Server", () => {
   }, 60_000);
 
   describe("tools/list", () => {
-    it("should list all 44 tools (default scope=all)", async () => {
+    it("should list all 45 tools (default scope=all)", async () => {
       const response = await client.request("tools/list");
       expect(response.error).toBeUndefined();
 
       const tools = (response.result as { tools: { name: string }[] }).tools;
-      expect(tools).toHaveLength(44);
+      expect(tools).toHaveLength(45);
 
       const toolNames = tools.map((t) => t.name);
       expect(toolNames).toContain("weave_search");
@@ -1045,10 +1045,11 @@ describe("Weave MCP Server --scope=graph", () => {
         "weave_resolve",
         "weave_update",
         "weave_touch",
+        "weave_record_edit",
         "weave_delete",
       ])
     );
-    expect(tools).toHaveLength(12);
+    expect(tools).toHaveLength(13);
 
     // Should NOT include inspect or session tools
     expect(toolNames).not.toContain("weave_search");

@@ -53,7 +53,7 @@ _wv_run_cache_is_write_cmd() {
         add|done|batch-done|bulk-update|delete|work|update|touch|allowed-tools|quick|ship|ship-agent|\
         block|link|unlink|resolve|findings|\
         unarchive|batch|plan|enrich-topology|sync|load|compact|prune|clean-ghosts|import|reindex|\
-        recover|session-summary)
+        recover|session-summary|config|test-record)
             return 0 ;;
         *) return 1 ;;
     esac

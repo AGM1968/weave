@@ -55,7 +55,7 @@ assert_contains() {
     local haystack="$1"
     local needle="$2"
     local msg="${3:-contains assertion}"
-    if echo "$haystack" | grep -qF "$needle"; then
+    if grep -qF "$needle" <<<"$haystack"; then
         echo -e "  ${GREEN}✓${NC} $msg"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -70,7 +70,7 @@ assert_not_contains() {
     local haystack="$1"
     local needle="$2"
     local msg="${3:-not contains assertion}"
-    if ! echo "$haystack" | grep -qF "$needle"; then
+    if ! grep -qF "$needle" <<<"$haystack"; then
         echo -e "  ${GREEN}✓${NC} $msg"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -673,7 +673,7 @@ CP_DIR=$(mktemp -d)
 (
     cd "$CP_DIR"
     git init -q
-    git config user.email t@t && git config user.name t
+    git config user.email t@t && git config user.name t && git config commit.gpgsign false
     export WV_HOT_ZONE="$CP_DIR/hz" \
            WV_DB="$CP_DIR/hz/brain.db" \
             WV_PROJECT_DIR="$CP_DIR" \

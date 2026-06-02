@@ -67,7 +67,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF "$needle"; then
+    if grep -qF "$needle" <<<"$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -83,7 +83,7 @@ assert_not_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if ! echo "$haystack" | grep -qF "$needle"; then
+    if ! grep -qF "$needle" <<<"$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -1212,17 +1212,20 @@ setup_test_env
 # Plant a crash sentinel
 echo '{"ts":"2026-03-27T00:00:00Z","active":["wv-aabbcc"]}' > "$WV_HOT_ZONE/.session_sentinel"
 
-# Create Claude JSONL in real HOME at the slug derived from the (unique) test project dir.
-# Using real HOME avoids breaking wv lib resolution inside the hook.
+BRIDGE_HOME="$TEST_DIR/bridge-home"
+mkdir -p "$BRIDGE_HOME"
+
+# Create Claude JSONL under an isolated HOME at the slug derived from the
+# unique test project dir. Hook code resolves wv from the repo path, not HOME.
 _BRIDGE_SLUG=$(echo "$WV_PROJECT_DIR" | tr '/' '-')
-_BRIDGE_JSONL_DIR="$HOME/.claude/projects/${_BRIDGE_SLUG}"
+_BRIDGE_JSONL_DIR="$BRIDGE_HOME/.claude/projects/${_BRIDGE_SLUG}"
 mkdir -p "$_BRIDGE_JSONL_DIR"
 printf '%s\n' \
     '{"type":"summary","summary":"prev session"}' \
     '{"type":"last-prompt","lastPrompt":"okay whats next on the list"}' \
     > "$_BRIDGE_JSONL_DIR/session.jsonl"
 
-OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
+OUTPUT=$(HOME="$BRIDGE_HOME" bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 rm -rf "$_BRIDGE_JSONL_DIR"
 
 assert_contains "$OUTPUT" "CRASH DETECTED" "JSONL bridge: crash path emits CRASH DETECTED"
@@ -1240,13 +1243,13 @@ setup_test_env
 add_active_node "Orphaned after reboot" 2>/dev/null
 "$WV" sync 2>/dev/null || true
 
-_BRIDGE2_JSONL_DIR="$HOME/.claude/projects/${_BRIDGE_SLUG}"
+_BRIDGE2_JSONL_DIR="$BRIDGE_HOME/.claude/projects/${_BRIDGE_SLUG}"
 mkdir -p "$_BRIDGE2_JSONL_DIR"
 printf '%s\n' \
     '{"type":"last-prompt","lastPrompt":"sync state visibility"}' \
     > "$_BRIDGE2_JSONL_DIR/session.jsonl"
 
-OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
+OUTPUT=$(HOME="$BRIDGE_HOME" bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 rm -rf "$_BRIDGE2_JSONL_DIR"
 
 assert_contains "$OUTPUT" "Last prompt:" "JSONL bridge: secondary detection includes Last prompt field"
@@ -1260,9 +1263,9 @@ setup_test_env
 
 # Crash sentinel with no JSONL for this (unique temp) project path — bridge must degrade
 echo '{"ts":"2026-03-27T00:01:00Z","active":["wv-ccddee"]}' > "$WV_HOT_ZONE/.session_sentinel"
-# _BRIDGE_SLUG dir was deleted above; real HOME has no JSONL for this slug
+# _BRIDGE_SLUG dir was deleted above; isolated HOME has no JSONL for this slug
 
-OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
+OUTPUT=$(HOME="$BRIDGE_HOME" bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "CRASH DETECTED" "JSONL bridge: crash detected even without JSONL"
 # Must not contain "Last prompt:" when no JSONL available
 TESTS_RUN=$((TESTS_RUN + 1))

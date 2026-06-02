@@ -57,7 +57,7 @@ Run `wv doctor` to verify your installation.
 cd /path/to/your/project
 wv init-repo --agent=copilot     # VS Code: .vscode/mcp.json (+ legacy .mcp.json) + instructions
 # Or: wv init-repo --agent=claude   # Claude Code: hooks, skills, settings
-# Or: wv init-repo --agent=all      # Both agents in same repo
+# Or: wv init-repo --agent=all      # Claude, Copilot, and Codex in same repo
 wv init-repo --update            # Update existing repo to latest skills/hooks/agents
 wv selftest                      # Verify everything works
 ```

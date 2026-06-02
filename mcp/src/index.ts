@@ -62,6 +62,7 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_resolve",
     "weave_update",
     "weave_touch",
+    "weave_record_edit",
     "weave_delete",
   ],
   session: [
@@ -1037,6 +1038,25 @@ const TOOLS: Tool[] = [
         },
       },
       required: ["id"],
+    },
+  },
+  {
+    name: "weave_record_edit",
+    description:
+      "Record a file path as touched by the active node. Writes directly to node_files for impact attribution. Call after each file edit on surfaces where the PostToolUse hook is unavailable (VS Code Copilot, Codex CLI).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          description: "Node ID (e.g., wv-a1b2)",
+        },
+        path: {
+          type: "string",
+          description: "Repo-relative file path that was edited (e.g., src/utils/helpers.ts)",
+        },
+      },
+      required: ["id", "path"],
     },
   },
   {
@@ -2054,6 +2074,14 @@ function handleTool(
       break;
     }
 
+    case "weave_record_edit": {
+      const id = args.id as string;
+      const path = args.path as string;
+      wv(["touch", id, `--files=${path}`]);
+      result = "ok";
+      break;
+    }
+
     case "weave_trails":
     case "weave_breadcrumbs": {
       // weave_breadcrumbs is a back-compat alias; both route to the `trails` CLI.
@@ -2207,7 +2235,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.53.0",
+      version: "1.54.0",
     },
     {
       capabilities: {

@@ -1438,23 +1438,29 @@ _impact_suites_for_files() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# _impact_nodes_for_files — map file paths to seed node IDs via touched_files metadata
+# _impact_nodes_for_files — map file paths to seed node IDs via attribution
 #
-# For each path arg, queries nodes whose touched_files JSON array contains
-# that path. Returns newline-separated node IDs (deduped, active+todo only).
-# Unknown paths produce no output — empty result is not an error.
+# For each path arg, queries canonical node_files rows first and legacy
+# touched_files metadata as fallback. Returns newline-separated node IDs
+# (deduped, active+todo+blocked only). Unknown paths produce no output —
+# empty result is not an error.
 # ═══════════════════════════════════════════════════════════════════════════
 
 _impact_nodes_for_files() {
     if [ $# -eq 0 ]; then return 0; fi
 
     local path_conditions=""
+    local node_file_paths=""
     for fp in "$@"; do
         local esc_fp
         esc_fp=$(printf '%s' "$fp" | sed "s/'/''/g")
         if [ -n "$path_conditions" ]; then
             path_conditions+=" OR "
         fi
+        if [ -n "$node_file_paths" ]; then
+            node_file_paths+=","
+        fi
+        node_file_paths+="'${esc_fp}'"
         path_conditions+="EXISTS (
             SELECT 1 FROM json_each(json_extract(n.metadata, '$.touched_files'))
             WHERE value = '${esc_fp}'
@@ -1462,10 +1468,22 @@ _impact_nodes_for_files() {
     done
 
     db_query "
-        SELECT DISTINCT n.id FROM nodes n
-        WHERE n.status IN ('todo','active','blocked')
-        AND json_extract(n.metadata, '$.touched_files') IS NOT NULL
-        AND (${path_conditions});
+        SELECT DISTINCT node_id FROM (
+            SELECT n.id AS node_id
+            FROM nodes n
+            JOIN node_files nf ON nf.node_id = n.id
+            WHERE n.status IN ('todo','active','blocked')
+              AND nf.path IN (${node_file_paths})
+
+            UNION
+
+            SELECT n.id AS node_id
+            FROM nodes n
+            WHERE n.status IN ('todo','active','blocked')
+              AND json_extract(n.metadata, '$.touched_files') IS NOT NULL
+              AND (${path_conditions})
+        )
+        ORDER BY node_id;
     " 2>/dev/null || true
 }
 
@@ -1723,14 +1741,15 @@ cmd_impact() {
                         --arg     include_quality "$include_quality" \
             --arg     summary  "$summary" \
             '{seeds:$seeds,
-                            impacted:(.impacted|map(({node_id,label,status,min_depth,directions,
-                                                    blocks_count,missing_criteria:(.missing_criteria==1),
-                                                    depth_from_root,cross_impl_deps,
-                                                                                                        risk_score,risk_factors}
-                                                                        + (if $include_quality=="true"
-                                                                             then {code_quality:(.code_quality // []), quality_as_of:(.quality_as_of // null)}
-                                                                             else {}
-                                                                             end)))),
+                            impacted:(.impacted|map(
+                                                   {node_id:.node_id,label:.label,status:.status,min_depth:.min_depth,directions:.directions,
+                                                    blocks_count:.blocks_count,missing_criteria:(.missing_criteria==1),
+                                                    depth_from_root:.depth_from_root,cross_impl_deps:.cross_impl_deps,
+                                                    risk_score:.risk_score,risk_factors:.risk_factors}
+                                                   + (if $include_quality=="true"
+                                                        then {code_quality:(.code_quality // []), quality_as_of:(.quality_as_of // null)}
+                                                        else {}
+                                                        end))),
               unblocked:$unblocked,
               edges:.edges,
               affected_suites:$suites,

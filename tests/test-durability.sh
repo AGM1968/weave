@@ -84,6 +84,7 @@ setup_remote_tracking() {
     git init --bare "$remote_dir" -q
     git config user.email test@test.com
     git config user.name test
+    git config commit.gpgsign false
     git remote remove origin >/dev/null 2>&1 || true
     git remote add origin "$remote_dir"
 
@@ -191,6 +192,36 @@ else
     echo -e "${GREEN}✓${NC} Journal clean after successful sync (no file)"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 fi
+
+# ─── GH sync failure remains local-safe with sandbox guidance ─────────────
+
+echo ""
+echo -e "${CYAN}--- GH sync sandbox guidance ---${NC}"
+setup_test_env
+"$WV" add "test node for gh sync failure" >/dev/null 2>&1
+
+fake_bin="$TEST_DIR/fake-bin"
+mkdir -p "$fake_bin"
+cat > "$fake_bin/python3" <<'PYEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-m" ] && [ "${2:-}" = "weave_gh" ]; then
+    echo "Command failed: gh repo view --json nameWithOwner -q .nameWithOwner"
+    echo "stderr: error connecting to api.github.com"
+    echo "Error: could not detect GitHub repo"
+    exit 1
+fi
+exec /usr/bin/python3 "$@"
+PYEOF
+chmod +x "$fake_bin/python3"
+
+gh_output=""
+gh_exit=0
+gh_output=$(PATH="$fake_bin:$PATH" "$WV" sync --gh 2>&1) || gh_exit=$?
+assert_equals "0" "$gh_exit" "sync --gh remains non-fatal when GH is sandbox-blocked"
+assert_contains "$gh_output" "Synced to" "sync --gh still performs local .weave sync"
+assert_contains "$gh_output" "GitHub sync did not complete" "sync --gh explains external failure"
+assert_contains "$gh_output" "local .weave sync is complete" "sync --gh distinguishes local and external sync"
+assert_contains "$gh_output" "network/SSH approval" "sync --gh gives sandbox approval guidance"
 
 # ─── Journal wrapping in cmd_delete ─────────────────────────────────────
 
@@ -459,12 +490,16 @@ assert_contains "$doctor_out" "recover" "doctor suggests wv recover"
 echo ""
 echo -e "${CYAN}--- Scan single-transaction ---${NC}"
 
-# This is tested via the existing pytest suite (249 tests).
-# Verify db.py has no conn.commit() in upsert functions:
-commit_count=$(grep -c 'conn\.commit()' "$PROJECT_ROOT/scripts/weave_quality/db.py" 2>/dev/null || echo 0)
-# One conn.commit() per migration function (_migrate_v2, _migrate_v3, _migrate_v4).
-# Upsert functions must NOT add conn.commit() — they run inside caller-managed transactions.
-assert_equals "3" "$commit_count" "db.py has exactly 3 conn.commit() calls (one per migration function)"
+# This is tested via the existing pytest suite. Keep this static guard focused
+# on the transaction invariant: upsert functions run inside caller-managed
+# transactions and must not commit independently.
+upsert_commit_count=$(awk '
+    /^def .*upsert/ { in_upsert = 1 }
+    /^def / && $0 !~ /^def .*upsert/ { in_upsert = 0 }
+    in_upsert && /conn\.commit\(\)/ { count++ }
+    END { print count + 0 }
+' "$PROJECT_ROOT/scripts/weave_quality/db.py")
+assert_equals "0" "$upsert_commit_count" "db.py has no conn.commit() calls inside upsert functions"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Summary

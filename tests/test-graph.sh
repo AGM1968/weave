@@ -661,6 +661,22 @@ SQL
     jmulti=$("$WV" impact --files=scripts/probe/alpha.sh,scripts/probe/beta.sh --json 2>&1)
     assert_jq_true "$jmulti" '.seeds | length == 2' "files JSON: two files → two seeds"
 
+    # Canonical attribution table → seed resolution without touched_files metadata.
+    local fnode_nf fnode_nf_dep jnodefiles
+    fnode_nf=$("$WV" add "File-seeded via node_files" --force 2>&1 | tail -1)
+    fnode_nf_dep=$("$WV" add "Dep of node_files seed" --force 2>&1 | tail -1)
+    "$WV" block "$fnode_nf_dep" --by="$fnode_nf" >/dev/null 2>&1
+    sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$fnode_nf', 'scripts/probe/node-files.sh');" 2>/dev/null
+    jnodefiles=$("$WV" impact --files=scripts/probe/node-files.sh --json 2>&1)
+    assert_jq_true "$jnodefiles" '.seeds | length == 1' "files JSON: node_files attribution resolves one seed"
+    assert_jq_true "$jnodefiles" '.seeds[0].node_id == "'"$fnode_nf"'"' "files JSON: node_files seed matches attributed node"
+    assert_jq_true "$jnodefiles" '.impacted | map(.node_id) | index("'"$fnode_nf_dep"'") != null' "files JSON: node_files seed traverses graph dependencies"
+
+    # Duplicate attribution via node_files + metadata must dedupe to one seed.
+    "$WV" update "$fnode_nf" --metadata='{"touched_files":["scripts/probe/node-files.sh"]}' >/dev/null 2>&1
+    jnodefiles=$("$WV" impact --files=scripts/probe/node-files.sh --json 2>&1)
+    assert_jq_true "$jnodefiles" '.seeds | length == 1' "files JSON: node_files plus metadata duplicate dedupes"
+
     # Unknown file → no graph seed: must WARN (not a bland "0 impacted" that reads
     # as "safe") and still surface affected suites via test-map.conf (wv-70ea8e).
     out=$("$WV" impact --files=no/such/file.py 2>&1)

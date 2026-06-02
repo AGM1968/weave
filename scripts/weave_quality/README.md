@@ -621,9 +621,9 @@ When a scan detects the version differs from the previous scan, it automatically
 re-scan so no stale metrics are carried forward. No manual `wv quality reset` is needed after a
 Weave upgrade.
 
-**Test failures on GPG-signing systems:** Tests that create ephemeral git repos will fail if git
-commit signing is globally enforced (`commit.gpgsign=true`) and the GPG agent is unavailable. Set
-`WV_SKIP_PRECOMMIT=1` or configure per-repo `gpgsign=false` in the test environment.
+**Test commits on GPG-signing systems:** Tests that create ephemeral git repos configure only those
+temp-repo commits with `commit.gpgsign=false`, so sandboxed runs do not need access to the user's
+GPG agent. Real repository commits continue to honor the user's signing configuration.
 
 **Rust accelerator (wv-c1483e) deferred:** A tree-sitter Rust binary (`wvc`) was designed for
 large-repo acceleration. At current scale (300 files ≈ 5.5s), the Python path is fast enough.

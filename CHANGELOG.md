@@ -2,6 +2,101 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.54.0] - 2026-06-02
+
+### Added
+
+- **`node_files` three-layer coverage — Codex MCP + ship-agent backfill + `weave_record_edit`.**
+  File attribution (`node_files` table, consumed by `wv impact --files`) is now populated on all
+  three agent surfaces, not just Claude Code CLI (which has the PostToolUse hook):
+  - **Codex CLI**: `wv init-repo` now registers the Weave MCP server via `codex mcp add` after build
+    so `weave_record_edit` is available inside Codex sandboxes. `.codex/weave.json` scaffold
+    emitted.
+  - **`wv ship-agent` git backfill**: Before closing, reads `created_at` from the node, queries
+    `git log --name-only --since=<created_at>`, and inserts changed paths into `node_files`. Zero
+    agent discipline required — retroactive coverage for every Codex session.
+  - **`weave_record_edit` MCP tool** (graph scope): explicit `(id, path)` write to `node_files` via
+    `wv touch --files=`. For VS Code Copilot and any MCP-capable surface without a PostToolUse hook.
+  - **`wv touch --files=PATH[,PATH]`**: new flag; comma-separated path list inserted into
+    `node_files`. Shared write path for the MCP tool and backfill.
+
+- **`wv analyze sessions` — Pattern E (reopen spike) reporting.**
+  `wv config enable session-analysis` now also counts `reopen_done_node` events per session.
+  Surfaced as `reopen_count` in JSON output and a "Pattern E — reopen" summary line in the human
+  table when count > 0. Closes a telemetry blind-spot identified in the dogfood battery.
+
+- **`wv search --code` Phase 2 gate — `--code` isolation + recall parity.** Two new test sections in
+  `tests/test-query.sh` (41/41 pass): verifies `--code` results are disjoint from graph-only results
+  and that recall parity holds between FTS and hybrid modes.
+
+- **`quality.local.conf` — gitignored per-repo quality override layer.** A second config layer
+  (`.weave/quality.local.conf`) is loaded after the committed `quality.conf`. Lets individual
+  developers suppress warn-level gates locally without touching the shared config. `test_gate=2`
+  (block) is non-overridable: if the committed config sets a block gate, the local layer cannot
+  downgrade it — team-wide blocks remain enforced. Added to `.gitignore` and to the `wv init-repo`
+  scaffold so new repos get it ignored automatically.
+
+- **Codex agent contract in `AGENTS.md` scaffold.** `wv init-repo --agent=codex` now emits a
+  `github_sync` block in the Codex `AGENTS.md` that distinguishes local-only `wv sync` from
+  external-network `wv sync --gh`, annotated with `requires_sandbox_approval`. Prevents Codex agents
+  from silently skipping GitHub sync when network is gated.
+
+- **`install.sh` hook fallback to lib dir.** Hook installation now falls back to
+  `~/.local/lib/weave/hooks/` when the source repo hook is absent, enabling clean installs from the
+  public `weave` repo that carries hooks in the lib dir but not the `.claude/` tree.
+
+### Fixed
+
+- **jq 1.6 compatibility in `wv impact --json` and `wv sync --gh`.** Replaced jq 1.7-only object
+  construction shorthand (`{key,key2}`) with explicit `{key:.key}` form throughout `wv-cmd-graph.sh`
+  and `wv-cmd-ops.sh`. On Debian stable (jq 1.6) the shorthand caused `wv impact --json` to crash
+  silently, which surfaced as `test-hooks` reporting 2 failures and `test-graph` showing `0/0` in
+  parallel mode (script exited before the `Results:` line).
+
+- **`test_weave_gh_data.py` mock for `Path.is_dir()`.** The `P` mock class in
+  `test_falls_back_to_candidate_when_exists` was missing `is_dir`, causing `AttributeError` in
+  `_runtime_hot_zone_base()` on non-Codex environments where `codex_base` is checked.
+
+- **`wv pattern-audit` Check 1 regression — `config` and `test-record` unclassified.** Both commands
+  were added during the v1.53.0 era but never added to the cache write-list in `wv-cache.sh`.
+  `config` mutates env/conf files; `test-record` appends to the JSONL ledger and upserts the DB —
+  both are writes. `wv pattern-audit` Check 1 (all dispatch commands classified) now passes. Pattern
+  A gate clock restarted from 2026-06-01.
+
+- **`auto_checkpoint` noise commit when HEAD is at origin.** After a push, the first `wv add`/
+  `wv done` would trigger `auto_sync → auto_checkpoint` with nothing unpushed, creating a
+  `[skip ci]` checkpoint commit before the next real feature commit. Fixed: when
+  `HEAD == origin/<branch>`, `auto_checkpoint` unstages `.weave/` and returns without committing.
+  The graph state is already on disk (written by `auto_sync`); the next real commit or
+  `wv sync --gh` picks it up naturally. Offline repos (no remote) are unaffected.
+
+- **`wv impact --files` now seeds from `node_files`.** Previously the command only read
+  `touched_files` (PostToolUse hook data); it now also consults `node_files` so impact results are
+  correct for Codex and VS Code Copilot sessions where `touched_files` is not populated.
+
+- **Python module path resolution centralised (`_wv_python_module_path` +
+  `_wv_agent_python_exec_module`).** Duplicate path-resolution blocks in `wv-cmd-data.sh`,
+  `wv-cmd-findings.sh`, `wv-cmd-indexer.sh`, and `wv-cmd-quality.sh` were replaced with two shared
+  helpers in `wv-cmd-ops.sh`. Eliminates a class of "tool not found" failures in Codex sandboxes
+  where Python module discovery fell through.
+
+- **`wv init-repo --update` preserves existing `copilot-instructions.md` content.** A re-run of
+  `wv init-repo --update` was overwriting the repo's existing Copilot instructions with the stub
+  template, discarding project-specific guidance. The updater now appends only the managed Weave
+  block and leaves non-Weave content intact.
+
+- **`wv init-repo` includes Codex in all agent scaffolds.** `--agent=codex` was not emitted during
+  general `wv init-repo` runs; it is now written unconditionally so `.codex/weave.json` and the
+  Codex `AGENTS.md` block are included in every fresh init.
+
+- **Test commits on GPG-signing systems.** Tests that create ephemeral git repos now configure those
+  repos with `commit.gpgsign=false` locally, so sandboxed or CI runs do not require access to the
+  user's GPG agent. Real repository commits continue to honor the user's signing configuration.
+
+- **MCP README and `copilot-instructions.md` `weave_breadcrumbs` → `weave_trails` regression.** Two
+  doc files still named `weave_breadcrumbs` as the primary tool in scope/session tables after the
+  breadcrumbs→trails rename shipped in v1.53.0. Fixed to `weave_trails`; deprecated alias noted.
+
 ## [1.53.0] - 2026-05-31
 
 ### Added

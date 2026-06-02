@@ -2742,7 +2742,18 @@ cmd_update() {
     
     # Remove trailing comma, add updated_at
     updates="${updates%,},updated_at=CURRENT_TIMESTAMP"
-    
+
+    # Reopen detection: --status=active on a done node (Pattern E telemetry, wv-c4fc7e)
+    # Emits an event entry to WV_CALL_LOG (zero overhead when unset).
+    if [[ "$updates" == *"status='active'"* ]] && [[ -n "${WV_CALL_LOG:-}" ]]; then
+        local _cur_status
+        _cur_status=$(db_query "SELECT status FROM nodes WHERE id='$id';" 2>/dev/null | tr -d '[:space:]') || true
+        if [[ "$_cur_status" == "done" ]]; then
+            printf '{"ts":%s,"cmd":"wv update","event":"reopen_done_node","node_id":"%s","source":"shell"}\n' \
+                "$(date +%s.%6N)" "$id" >> "$WV_CALL_LOG" 2>/dev/null || true
+        fi
+    fi
+
     db_query "UPDATE nodes SET $updates WHERE id='$id';"
 
     # Auto-unblock cascade when status changed to done
@@ -2787,10 +2798,18 @@ cmd_touch() {
     
     local metadata=""
     local intent=""
+    local -a files_list=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --metadata=*) metadata="${1#--metadata=}" ;;
             --intent=*)   intent="${1#--intent=}" ;;
+            --files=*)
+                # Comma-separated list of repo-relative file paths to attribute
+                IFS=',' read -ra _tf_arr <<< "${1#--files=}"
+                for _tf in "${_tf_arr[@]}"; do
+                    [ -n "$_tf" ] && files_list+=("$_tf")
+                done
+                ;;
         esac
         shift
     done
@@ -2806,20 +2825,31 @@ cmd_touch() {
         fi
     fi
 
-    if [ -z "$metadata" ]; then
-        echo "Error: --metadata=JSON or --intent=TEXT required" >&2
+    if [ -z "$metadata" ] && [ "${#files_list[@]}" -eq 0 ]; then
+        echo "Error: --metadata=JSON, --intent=TEXT, or --files=PATH required" >&2
         return 1
     fi
 
-    # Validate JSON
-    if ! echo "$metadata" | jq '.' >/dev/null 2>&1; then
-        echo "Error: invalid JSON in --metadata" >&2
-        return 1
+    if [ -n "$metadata" ]; then
+        # Validate JSON
+        if ! echo "$metadata" | jq '.' >/dev/null 2>&1; then
+            echo "Error: invalid JSON in --metadata" >&2
+            return 1
+        fi
+
+        local metadata_esc="${metadata//\'/\'\'}"
+        db_query "UPDATE nodes SET metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+        invalidate_context_cache "$id"
     fi
 
-    local metadata_esc="${metadata//\'/\'\'}"
-    db_query "UPDATE nodes SET metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
-    invalidate_context_cache "$id"
+    # --files: insert repo-relative paths into node_files for impact attribution
+    if [ "${#files_list[@]}" -gt 0 ]; then
+        local id_esc="${id//\'/\'\'}"
+        for _fpath in "${files_list[@]}"; do
+            local _fesc="${_fpath//\'/\'\'}"
+            db_query "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$id_esc', '$_fesc');" 2>/dev/null || true
+        done
+    fi
     # No stdout — fire-and-forget. Zero token cost.
 }
 
@@ -3176,6 +3206,28 @@ cmd_ship_agent() {
     local prev_agent_mode="${WV_AGENT_MODE:-}"
     export WV_NONINTERACTIVE=1
     export WV_AGENT_MODE=1
+
+    # Backfill node_files from git history (for surfaces without PostToolUse hooks,
+    # e.g. Codex CLI and VS Code Copilot). No-op when node_files already populated.
+    local _sa_created_at
+    _sa_created_at=$(db_query "SELECT created_at FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null || echo "")
+    if [ -n "$_sa_created_at" ] && command -v git >/dev/null 2>&1; then
+        local _sa_git_root
+        _sa_git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+        if [ -n "$_sa_git_root" ]; then
+            local _sa_changed
+            _sa_changed=$(git log --name-only --format="" --diff-filter=AMR \
+                --since="$_sa_created_at" HEAD 2>/dev/null \
+                | grep -v '^$' | sort -u || true)
+            if [ -n "$_sa_changed" ]; then
+                local _sa_id_esc="${id//\'/\'\'}"
+                while IFS= read -r _sa_path; do
+                    local _sa_pe="${_sa_path//\'/\'\'}"
+                    db_query "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$_sa_id_esc', '$_sa_pe');" 2>/dev/null || true
+                done <<< "$_sa_changed"
+            fi
+        fi
+    fi
 
     local ship_output ship_rc=0
     ship_output=$(_ship_run "$id" "$learning" "$learning_file" "$gh_flag" "$skip_verification" "$no_overlap_check" "$verification_method" "$verification_evidence" "$verification_evidence_file" 2>&1) || ship_rc=$?

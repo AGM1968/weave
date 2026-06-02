@@ -80,7 +80,7 @@ assert_contains() {
 
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<<"$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -100,7 +100,7 @@ assert_not_contains() {
 
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    if ! echo "$haystack" | grep -qF -- "$needle"; then
+    if ! grep -qF -- "$needle" <<<"$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -569,6 +569,7 @@ test_done() {
 
     git config user.email "test@example.com"
     git config user.name "Weave Test"
+    git config commit.gpgsign false
     git init --bare -q "$ship_remote"
     git remote add origin "$ship_remote"
     git add . >/dev/null 2>&1 || true
@@ -649,6 +650,7 @@ test_done_stores_commit_hashes() {
     "$WV" init >/dev/null 2>&1
     git config user.name "Weave Test"
     git config user.email "weave-test@example.com"
+    git config commit.gpgsign false
 
     local id output node_json stored_commit stored_first head_sha
     id=$("$WV" add "Commit-linked close" --force 2>&1 | tail -1)
@@ -678,6 +680,7 @@ test_done_prefers_implementation_commit_over_checkpoint() {
     "$WV" init >/dev/null 2>&1
     git config user.name "Weave Test"
     git config user.email "weave-test@example.com"
+    git config commit.gpgsign false
 
     local id output node_json stored_commit stored_first stored_second impl_sha checkpoint_sha
     id=$("$WV" add "Commit precedence close" --force 2>&1 | tail -1)
@@ -701,6 +704,70 @@ test_done_prefers_implementation_commit_over_checkpoint() {
     assert_equals "$impl_sha" "$stored_commit" "done keeps the implementation commit as primary metadata"
     assert_equals "$impl_sha" "$stored_first" "done orders implementation commit first in commits metadata"
     assert_equals "$checkpoint_sha" "$stored_second" "done retains checkpoint commit as secondary attribution"
+}
+
+# ============================================================================
+# Test: auto_checkpoint skips noise commit when HEAD == origin
+# ============================================================================
+test_auto_checkpoint_skip_at_origin() {
+    echo ""
+    echo "Test: auto_checkpoint skips commit when HEAD is already at origin"
+    echo "=================================================================="
+
+    local cp_repo cp_hot cp_remote
+    cp_repo=$(mktemp -d "$TEST_DIR/cp-repo.XXXXXX")
+    cp_hot=$(mktemp -d "$TEST_DIR/cp-hot.XXXXXX")
+    cp_remote=$(mktemp -d "$TEST_DIR/cp-remote.XXXXXX")
+
+    cd "$cp_repo"
+    git init -q
+    git config user.email "test@example.com"
+    git config user.name "Weave Test"
+    git config commit.gpgsign false
+
+    export WV_HOT_ZONE="$cp_hot"
+    export WV_DB="$cp_hot/brain.db"
+    export WV_PROJECT_DIR="$cp_repo"
+    "$WV" init >/dev/null 2>&1
+
+    # Push initial state so HEAD == origin
+    git init --bare -q "$cp_remote"
+    git remote add origin "$cp_remote"
+    git add . >/dev/null 2>&1 || true
+    git commit -m "test baseline" --allow-empty >/dev/null 2>&1 || true
+    git push -u origin HEAD -q >/dev/null 2>&1
+
+    local before_sha
+    before_sha=$(git rev-parse HEAD)
+
+    # Trigger auto_checkpoint with zero throttle and pull disabled.
+    # WV_CHECKPOINT_PULL=0 prevents network ops against the bare remote.
+    # WV_CHECKPOINT_INTERVAL=0 bypasses the 10-minute checkpoint throttle.
+    # WV_SYNC_INTERVAL=0 bypasses the sync throttle so auto_sync actually runs.
+    local probe_id probe_out
+    probe_out=$(WV_SYNC_INTERVAL=0 WV_CHECKPOINT_INTERVAL=0 WV_CHECKPOINT_PULL=0 \
+        "$WV" add "cp-race probe" --force 2>&1)
+    probe_id=$(echo "$probe_out" | tail -1)
+
+    local after_sha
+    after_sha=$(git rev-parse HEAD)
+
+    assert_equals "$before_sha" "$after_sha" \
+        "auto_checkpoint skips commit when HEAD is already at origin (no noise before next real commit)"
+
+    # Confirm the node was persisted to the DB — the add itself must complete even
+    # when the checkpoint commit is suppressed.
+    local probe_show
+    probe_show=$("$WV" show "$probe_id" 2>&1)
+    assert_contains "$probe_show" "cp-race probe" \
+        "node added during suppressed checkpoint is accessible in DB"
+
+    # Cleanup
+    export WV_HOT_ZONE="$TEST_DIR"
+    export WV_DB="$TEST_DIR/brain.db"
+    export WV_PROJECT_DIR="$TEST_DIR"
+    cd "$TEST_DIR"
+    rm -rf "$cp_repo" "$cp_hot" "$cp_remote"
 }
 
 # ============================================================================
@@ -925,7 +992,7 @@ test_bootstrap_agent() {
     setup_test_env
     "$WV" init >/dev/null 2>&1
 
-    local active_id bootstrap_json agent_wv agent_db readiness_state provenance
+    local active_id bootstrap_json minimal_json agent_wv agent_db readiness_state provenance
     active_id=$("$WV" add "Bootstrap agent task" --force 2>&1 | tail -1)
     "$WV" work "$active_id" >/dev/null 2>&1
 
@@ -944,6 +1011,19 @@ test_bootstrap_agent() {
 
     provenance=$(echo "$bootstrap_json" | jq -r '.agent.wv_provenance // empty')
     assert_equals "repo-local" "$provenance" "bootstrap-agent reports repo-local provenance when using scripts/wv"
+
+    assert_equals "true" "$(echo "$bootstrap_json" | jq -r '.agent.tools.warmup | index("wv index . --json") != null' 2>/dev/null || echo false)" \
+        "bootstrap-agent exposes copy-pasteable index warm-up"
+    assert_equals "true" "$(echo "$bootstrap_json" | jq -r '.agent.tools.warmup | index("wv quality scan . --json") != null' 2>/dev/null || echo false)" \
+        "bootstrap-agent exposes copy-pasteable quality warm-up"
+    assert_equals "true" "$(echo "$bootstrap_json" | jq -r '.agent.tools.code_search.command == "wv search --code \"<query>\" --json"' 2>/dev/null || echo false)" \
+        "bootstrap-agent documents code search entry point"
+    assert_equals "true" "$(echo "$bootstrap_json" | jq -r '.agent.tools.ast_grep | has("ready")' 2>/dev/null || echo false)" \
+        "bootstrap-agent reports ast-grep readiness without requiring availability"
+
+    minimal_json=$(PATH="/usr/local/bin:/usr/bin:/bin" "$WV" bootstrap-agent --json 2>&1)
+    assert_equals "ready" "$(echo "$minimal_json" | jq -r '.agent.readiness.state // empty' 2>/dev/null || echo failed)" \
+        "bootstrap-agent resolves tools under Codex-style minimal PATH"
 }
 
 # ============================================================================
@@ -1211,7 +1291,7 @@ test_help_surfaces() {
         init add delete done ship ship-agent batch-done bulk-update work preflight recover bootstrap bootstrap-agent
         overview cache pending-close ready list show status update touch allowed-tools quick
         block link unlink resolve related edges path tree plan enrich-topology context search
-        reindex learnings trails breadcrumbs digest session-summary audit-pitfalls edge-types init-repo
+        reindex learnings trails digest session-summary audit-pitfalls edge-types init-repo
         doctor selftest mcp-status health guide prune clean-ghosts compact refs import quality
         findings analyze batch sync load
     )
@@ -1749,6 +1829,11 @@ test_wv_index_command() {
     assert_equals "1" "$fts_hit" \
         "wv index content is FTS5 searchable via chunks_fts"
 
+    sqlite3 "$WV_DB" "DELETE FROM chunks;" 2>/dev/null
+    PATH="/usr/local/bin:/usr/bin:/bin" "$WV" index "$TEST_DIR/src" --no-embed --ext=.py --json > "$TEST_DIR/idx-minimal-path.json" 2>&1
+    assert_equals "true" "$(jq -r 'has("chunks")' "$TEST_DIR/idx-minimal-path.json" 2>/dev/null || echo false)" \
+        "wv index resolves agent Python under Codex-style minimal PATH"
+
     # --- Case 4: re-indexing same file replaces chunks (no duplicates) ---
     local before_count after_count
     before_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM chunks WHERE file LIKE '%sentinel.py';" 2>/dev/null)
@@ -1836,6 +1921,11 @@ test_wv_search_code() {
     local result_count
     result_count=$(echo "$search_json" | jq '.results | length' 2>/dev/null || echo "0")
     assert_success "wv search --code finds indexed content" test "$result_count" -gt 0
+
+    local minimal_path_json minimal_path_count
+    minimal_path_json=$(PATH="/usr/local/bin:/usr/bin:/bin" "$WV" search --code sentinel_hybrid_search_fn --json --mode=fts 2>/dev/null)
+    minimal_path_count=$(echo "$minimal_path_json" | jq '.results | length' 2>/dev/null || echo "0")
+    assert_success "wv search --code resolves agent Python under Codex-style minimal PATH" test "$minimal_path_count" -gt 0
 
     # --- Case 2: JSON result contains required fields ---
     local has_file has_score has_snippet has_source
@@ -2379,6 +2469,37 @@ CONF
     local exempt
     exempt=$(sqlite3 "$WV_DB" "SELECT path_pattern FROM quality_exempt WHERE path_pattern='vendor/';")
     assert_equals "vendor/" "$exempt" "[exempt] still loads when [thresholds] is present"
+
+    # --- O4b guard: test_gate=2 (block) in committed layer cannot be downgraded by local layer ---
+    cat > "$TEST_DIR/.weave/quality.conf" <<'CONF2'
+[thresholds]
+test_gate = 2
+CONF2
+    cat > "$TEST_DIR/.weave/quality.local.conf" <<'CONF3'
+[thresholds]
+test_gate = 0
+CONF3
+    "$WV" load >/dev/null 2>&1
+    local guarded_tg
+    guarded_tg=$(sqlite3 "$WV_DB" "SELECT CAST(value AS INTEGER) FROM policy_thresholds WHERE key='test_gate';")
+    assert_equals "2" "$guarded_tg" "O4b guard: local test_gate=0 cannot downgrade committed test_gate=2 (block)"
+
+    # --- O4b: warn (test_gate=1) in committed layer IS overridable by local layer ---
+    cat > "$TEST_DIR/.weave/quality.conf" <<'CONF4'
+[thresholds]
+test_gate = 1
+CONF4
+    cat > "$TEST_DIR/.weave/quality.local.conf" <<'CONF5'
+[thresholds]
+test_gate = 0
+CONF5
+    "$WV" load >/dev/null 2>&1
+    local warn_overridden_tg
+    warn_overridden_tg=$(sqlite3 "$WV_DB" "SELECT CAST(value AS INTEGER) FROM policy_thresholds WHERE key='test_gate';")
+    assert_equals "0" "$warn_overridden_tg" "O4b: local can override test_gate=1 (warn) — only block is protected"
+
+    # cleanup local conf
+    rm -f "$TEST_DIR/.weave/quality.local.conf"
 }
 
 # ============================================================================
@@ -2398,6 +2519,7 @@ main() {
     test_done
     test_done_stores_commit_hashes
     test_findings_promote
+    test_auto_checkpoint_skip_at_origin
     test_work
     test_list
     test_show

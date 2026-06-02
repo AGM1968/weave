@@ -63,6 +63,23 @@ def db(tmp_path: Path) -> Generator[sqlite3.Connection, None, None]:
     conn.close()
 
 
+def _configure_temp_git_repo(repo: Path) -> None:
+    """Keep temp git repos independent from user signing identity config."""
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=repo, check=True)
+
+
+def _commit_temp_git_repo(repo: Path, *args: str, env: dict[str, str] | None = None) -> None:
+    """Commit in a temp repo without requiring user GPG agent access."""
+    subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "commit", *args],
+        cwd=repo,
+        check=True,
+        env=env,
+    )
+
+
 def _entry(
     path: str,
     scan_id: int,  # pylint: disable=unused-argument
@@ -2701,10 +2718,12 @@ class TestCmdScanCategory:
 
         # Initialise git repo (needed for git ls-files / rev-parse)
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-        subprocess.run(
-            ["git", "commit", "--allow-empty", "-m", "init"],
-            cwd=repo,
-            check=True,
+        _configure_temp_git_repo(repo)
+        _commit_temp_git_repo(
+            repo,
+            "--allow-empty",
+            "-m",
+            "init",
             env={
                 **os.environ,
                 "GIT_AUTHOR_NAME": "t",
@@ -2792,19 +2811,12 @@ class TestDiscoverFiles:
     def _make_git_repo(self, tmp_path: Path) -> Path:
         """Create a minimal git repo with Python and non-Python files."""
         subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-        subprocess.run(
-            ["git", "-C", str(tmp_path), "config", "user.email", "t@t.com"], check=True
-        )
-        subprocess.run(
-            ["git", "-C", str(tmp_path), "config", "user.name", "T"], check=True
-        )
+        _configure_temp_git_repo(tmp_path)
         (tmp_path / "main.py").write_text("x = 1\n")
         (tmp_path / "util.py").write_text("y = 2\n")
         (tmp_path / "skip_me.py").write_text("z = 3\n")
         subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
-        subprocess.run(
-            ["git", "-C", str(tmp_path), "commit", "-q", "-m", "init"], check=True
-        )
+        _commit_temp_git_repo(tmp_path, "-q", "-m", "init")
         return tmp_path
 
     def test_discovers_python_files(self, tmp_path: Path) -> None:
@@ -3032,6 +3044,7 @@ class TestCmdScanExtended:
         repo = tmp_path / "repo"
         repo.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        _configure_temp_git_repo(repo)
         env = {
             **os.environ,
             "GIT_AUTHOR_NAME": "t",
@@ -3043,9 +3056,7 @@ class TestCmdScanExtended:
         if with_bash:
             (repo / "run.sh").write_text("#!/bin/bash\necho hi\n")
         subprocess.run(["git", "add", "."], cwd=repo, check=True, env=env)
-        subprocess.run(
-            ["git", "commit", "-q", "-m", "init"], cwd=repo, check=True, env=env
-        )
+        _commit_temp_git_repo(repo, "-q", "-m", "init", env=env)
         return repo
 
     def test_json_output(
@@ -3622,13 +3633,12 @@ class TestCmdScanCkMetrics:
             "GIT_COMMITTER_EMAIL": "t@t",
         }
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        _configure_temp_git_repo(repo)
         (repo / "mymodule.py").write_text(
             "class MyClass:\n    def method(self) -> None:\n        pass\n"
         )
         subprocess.run(["git", "add", "."], cwd=repo, check=True, env=env)
-        subprocess.run(
-            ["git", "commit", "-q", "-m", "init"], cwd=repo, check=True, env=env
-        )
+        _commit_temp_git_repo(repo, "-q", "-m", "init", env=env)
         return repo
 
     def test_scan_file_with_class(self, tmp_path: Path) -> None:
@@ -3684,13 +3694,12 @@ class TestCmdScanBashFunctions:
             "GIT_COMMITTER_EMAIL": "t@t",
         }
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        _configure_temp_git_repo(repo)
         (repo / "run.sh").write_text(
             "#!/bin/bash\ndo_work() {\n  echo 'hello'\n}\ndo_work\n"
         )
         subprocess.run(["git", "add", "."], cwd=repo, check=True, env=env)
-        subprocess.run(
-            ["git", "commit", "-q", "-m", "init"], cwd=repo, check=True, env=env
-        )
+        _commit_temp_git_repo(repo, "-q", "-m", "init", env=env)
         return repo
 
     def test_scan_bash_with_function(self, tmp_path: Path) -> None:

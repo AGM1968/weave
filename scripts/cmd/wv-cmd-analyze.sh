@@ -91,6 +91,7 @@ from collections import defaultdict
 
 log_path, top_n = sys.argv[1], int(sys.argv[2])
 totals: dict[str, dict] = defaultdict(lambda: {"calls": 0, "total_bytes": 0, "total_ms": 0})
+reopen_count = 0
 
 try:
     with open(log_path, encoding="utf-8") as fh:
@@ -101,6 +102,9 @@ try:
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if entry.get("event") == "reopen_done_node":
+                reopen_count += 1
                 continue
             cmd = str(entry.get("cmd", "unknown"))
             stdout_b = int(entry.get("stdout_bytes", 0))
@@ -114,7 +118,10 @@ except OSError as exc:
     sys.exit(1)
 
 ranked = sorted(totals.items(), key=lambda x: x[1]["total_bytes"], reverse=True)[:top_n]
-print(json.dumps([{"cmd": cmd, "approx_tokens": stats["total_bytes"] // 4, **stats} for cmd, stats in ranked]))
+print(json.dumps({
+    "call_stats": [{"cmd": cmd, "approx_tokens": stats["total_bytes"] // 4, **stats} for cmd, stats in ranked],
+    "reopen_count": reopen_count
+}))
 PYEOF
     ) || return 1
 
@@ -125,7 +132,7 @@ PYEOF
 
     # Human-readable table
     local count
-    count=$(echo "$result" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+    count=$(echo "$result" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d['call_stats']))")
     if [ "$count" = "0" ]; then
         echo "Call log exists but contains no parseable entries: $log_path"
         return 0
@@ -137,11 +144,15 @@ PYEOF
 
     echo "$result" | python3 -c "
 import json, sys
-rows = json.load(sys.stdin)
+d = json.load(sys.stdin)
+rows = d['call_stats']
 for r in rows:
     avg_ms = r['total_ms'] // r['calls'] if r['calls'] else 0
     tokens = r.get('approx_tokens', r['total_bytes'] // 4)
     print(f\"{r['cmd']:<24} {r['total_bytes']:>10,} {tokens:>10,} {r['calls']:>8} {avg_ms:>10}\")
+reopen = d.get('reopen_count', 0)
+if reopen:
+    print(f\"\\nPattern E — reopen (update done→active): {reopen} time{'s' if reopen != 1 else ''}\")
 "
     printf "\nLog: %s\n" "$log_path"
 }

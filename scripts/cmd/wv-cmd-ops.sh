@@ -88,6 +88,14 @@ _bootstrap_python_command() {
         canonicalize_runtime_path "${CLAUDE_PROJECT_DIR}/.venv/bin/python3"
         return 0
     fi
+    if [ -n "${CONDA_PREFIX:-}" ] || [ -n "${CONDA_DEFAULT_ENV:-}" ]; then
+        if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
+            if [ -x /usr/bin/python3 ]; then
+                canonicalize_runtime_path /usr/bin/python3
+                return 0
+            fi
+        fi
+    fi
     if command -v python3 >/dev/null 2>&1; then
         canonicalize_runtime_path "$(command -v python3)"
         return 0
@@ -97,8 +105,123 @@ _bootstrap_python_command() {
     fi
 }
 
+_wv_python_module_path() {
+    local module_dir="$1"
+    local _wv_pypath="${WV_LIB_DIR:-$SCRIPT_DIR}"
+
+    if [ ! -d "$_wv_pypath/$module_dir" ]; then
+        local _wv_real
+        _wv_real=$(readlink -f "$_wv_pypath/lib/wv-config.sh" 2>/dev/null || echo "")
+        if [ -n "$_wv_real" ]; then
+            _wv_pypath=$(dirname "$(dirname "$_wv_real")")
+        fi
+    fi
+
+    printf '%s\n' "$_wv_pypath"
+}
+
+_wv_agent_python_exec_module() {
+    local module="$1"
+    local pypath="$2"
+    shift 2
+
+    local python_command
+    python_command=$(_bootstrap_python_command)
+    if [ -z "$python_command" ]; then
+        echo "wv: no usable Python found for $module" >&2
+        return 127
+    fi
+
+    case "$python_command" in
+        "poetry run python")
+            PYTHONPATH="$pypath" poetry run python -m "$module" "$@"
+            ;;
+        *)
+            PYTHONPATH="$pypath" "$python_command" -m "$module" "$@"
+            ;;
+    esac
+}
+
+_bootstrap_agent_tools_json() {
+    local ast_grep_path ast_grep_version
+    local chunks_count=0 quality_ready=false chunks_ready=false ast_grep_ready=false
+
+    ast_grep_path=$(command -v ast-grep 2>/dev/null || true)
+    if [ -n "$ast_grep_path" ]; then
+        ast_grep_ready=true
+        ast_grep_version=$(ast-grep --version 2>/dev/null | head -1 || true)
+    else
+        ast_grep_version=""
+    fi
+
+    if [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ]; then
+        chunks_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chunks';" 2>/dev/null | {
+            read -r has_chunks
+            if [ "${has_chunks:-0}" = "1" ]; then
+                sqlite3 "$WV_DB" "SELECT COUNT(*) FROM chunks;" 2>/dev/null || echo 0
+            else
+                echo 0
+            fi
+        })
+    fi
+    [ "${chunks_count:-0}" -gt 0 ] 2>/dev/null && chunks_ready=true
+
+    if [ -n "${WV_HOT_ZONE:-}" ] && [ -f "$WV_HOT_ZONE/quality.db" ]; then
+        local scan_count
+        scan_count=$(sqlite3 "$WV_HOT_ZONE/quality.db" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='quality_scans';" 2>/dev/null | {
+            read -r has_scans
+            if [ "${has_scans:-0}" = "1" ]; then
+                sqlite3 "$WV_HOT_ZONE/quality.db" "SELECT COUNT(*) FROM quality_scans;" 2>/dev/null || echo 0
+            else
+                echo 0
+            fi
+        })
+        [ "${scan_count:-0}" -gt 0 ] 2>/dev/null && quality_ready=true
+    fi
+
+    jq -n \
+        --arg ast_grep_path "$ast_grep_path" \
+        --arg ast_grep_version "$ast_grep_version" \
+        --argjson ast_grep_ready "$ast_grep_ready" \
+        --argjson chunks_ready "$chunks_ready" \
+        --argjson chunks_count "${chunks_count:-0}" \
+        --argjson quality_ready "$quality_ready" \
+        '{
+            warmup: [
+                "wv doctor --agent --json",
+                "wv index . --json",
+                "wv quality scan . --json"
+            ],
+            code_search: {
+                command: "wv search --code \"<query>\" --json",
+                ready: $chunks_ready,
+                chunks: $chunks_count,
+                warmup: "wv index . --json"
+            },
+            index: {
+                command: "wv index . --json",
+                ready: $chunks_ready,
+                chunks: $chunks_count
+            },
+            quality: {
+                command: "wv quality scan . --json",
+                ready: $quality_ready
+            },
+            impact: {
+                command: "wv impact <id> --json --quality",
+                warmup: "wv quality scan . --json"
+            },
+            ast_grep: {
+                command: "wv quality structural-search --pattern=<pattern> --lang=python --json",
+                ready: $ast_grep_ready,
+                path: (if $ast_grep_path != "" then $ast_grep_path else null end),
+                version: (if $ast_grep_version != "" then $ast_grep_version else null end)
+            }
+        }'
+}
+
 _bootstrap_agent_info_json() {
-    local wv_command invoked_wv repo_wv db_path python_command wv_provenance readiness_state
+    local wv_command invoked_wv repo_wv db_path python_command wv_provenance readiness_state tools_json
     local wv_ready=false db_ready=false python_ready=false command_mismatch=false
 
     wv_command=$(_bootstrap_canonical_wv_path)
@@ -107,6 +230,7 @@ _bootstrap_agent_info_json() {
     db_path=$(canonicalize_runtime_path "${WV_DB:-}")
     python_command=$(_bootstrap_python_command)
     wv_provenance=$(_bootstrap_wv_provenance "$invoked_wv")
+    tools_json=$(_bootstrap_agent_tools_json)
 
     [ -n "$wv_command" ] && [ -x "$wv_command" ] && wv_ready=true
     [ -n "$db_path" ] && [ -f "$db_path" ] && db_ready=true
@@ -134,6 +258,7 @@ _bootstrap_agent_info_json() {
         --arg db_path "$db_path" \
         --arg python_command "$python_command" \
         --arg readiness_state "$readiness_state" \
+        --argjson tools "$tools_json" \
         --argjson wv_ready "$wv_ready" \
         --argjson db_ready "$db_ready" \
         --argjson python_ready "$python_ready" \
@@ -152,7 +277,8 @@ _bootstrap_agent_info_json() {
                 wv_command: $wv_ready,
                 db_path: $db_ready,
                 python_command: $python_ready
-            }
+            },
+            tools: $tools
         } | with_entries(select(.value != null))'
 }
 
@@ -4683,7 +4809,7 @@ Sync epic bodies / Mermaid diagrams:
 
 Check GitHub sync status:
     gh issue list --state open --limit 200 --json number,title,labels \
-        | jq '[.[] | select(any(.labels[]?.name; . == "weave-synced")) | {number,title}]'
+        | jq '[.[] | select(any(.labels[]?.name; . == "weave-synced")) | {number:.number,title:.title}]'
   wv show <id> --json | jq '.[0].metadata | fromjson | .gh_issue'
 
 Label taxonomy applied automatically:
@@ -5246,7 +5372,7 @@ Commands:
   session-summary   Session activity stats (nodes created/completed, learnings)
   audit-pitfalls    Show all pitfalls with resolution status
   edge-types        List valid semantic edge types [--stats] [--json]
-  init-repo         Bootstrap repo for Weave [--agent=claude|copilot|all] [--update] [--force]
+  init-repo         Bootstrap repo for Weave [--agent=claude|copilot|codex|all] [--update] [--force]
   self-update       Refresh installed wv from the dev clone recorded at install time
   doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]
   selftest          Round-trip smoke test in isolated environment [--json]
@@ -5339,7 +5465,8 @@ Examples:
   wv done wv-a1b2 --no-warn
   wv init-repo                                # bootstrap .claude/ for current repo (claude agent)
   wv init-repo --agent=copilot                # add VS Code Copilot config (.vscode/mcp.json + instructions)
-  wv init-repo --agent=all                    # both claude and copilot
+  wv init-repo --agent=codex                  # add Codex setup contract (.codex/weave.json)
+  wv init-repo --agent=all                    # claude, copilot, and codex
   wv init-repo --update                       # refresh managed files (skills, agents, instructions)
   wv init-repo --force                        # overwrite ALL files including user-customized
 EOF
@@ -5353,7 +5480,7 @@ EOF
 # ═══════════════════════════════════════════════════════════════════════════
 cmd_init_repo() {
     # Delegate to the standalone wv-init-repo binary which handles
-    # --agent=claude|copilot|all, --update, --force, skills, agents,
+    # --agent=claude|copilot|codex|all, --update, --force, skills, agents,
     # copilot-instructions, .vscode/mcp.json, etc.
     local init_repo_bin
     init_repo_bin=$(command -v wv-init-repo 2>/dev/null || echo "$HOME/.local/bin/wv-init-repo")

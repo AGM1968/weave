@@ -353,6 +353,18 @@ Weave-ID: $first_active"
         _cp_last_nw_files=$(git -C "$git_root" diff HEAD~1 HEAD --name-only 2>/dev/null \
             | grep -v '^\.weave/' | grep -v '^$' || true)
 
+        # Skip-when-at-origin guard: if HEAD == remote (nothing unpushed), creating a new
+        # checkpoint commit here would interleave noise before the NEXT real commit.
+        # The .weave/ files are already written to disk by auto_sync; the next real commit
+        # or `wv sync --gh` will include them. This prevents the pattern:
+        #   origin → [noise checkpoint] → [real feature commit]
+        # Unstage .weave/ so it doesn't pollute the caller's index.
+        # Exception: no remote ("none") — always checkpoint in that case.
+        if [ "$_cp_local" = "$_cp_remote" ] && [ "$_cp_remote" != "none" ]; then
+            git -C "$git_root" reset HEAD -- .weave/ >/dev/null 2>&1 || true
+            return 0
+        fi
+
         if [ "$_cp_local" != "$_cp_remote" ] \
            && [[ "$_cp_last_msg" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] \
            && [ -z "$_cp_last_nw_files" ]; then
@@ -405,7 +417,25 @@ _sync_gh() {
     else
         _wv_python3=python3
     fi
-    PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_gh "${gh_args[@]}"
+    local _gh_log _gh_rc _retry_cmd
+    _gh_log=$(mktemp "${TMPDIR:-/tmp}/weave-gh-sync.XXXXXX")
+    PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_gh "${gh_args[@]}" 2>&1 | tee "$_gh_log"
+    _gh_rc=${PIPESTATUS[0]}
+    if [ "$_gh_rc" -ne 0 ]; then
+        _retry_cmd="wv sync --gh"
+        [ -n "$mode" ] && _retry_cmd="$_retry_cmd --mode=$mode"
+        [ -n "$focus_node" ] && _retry_cmd="$_retry_cmd --node=$focus_node"
+        echo -e "${YELLOW}⚠${NC} GitHub sync did not complete; local .weave sync is complete." >&2
+        echo -e "${YELLOW}  External network/API step remains pending.${NC}" >&2
+        if grep -qiE 'api\.github\.com|could not detect GitHub repo|could not resolve host|connection|network|permission|ssh_config|repository' "$_gh_log" 2>/dev/null; then
+            echo -e "${YELLOW}  In sandboxed agents, rerun with network/SSH approval: $_retry_cmd${NC}" >&2
+        else
+            echo -e "${YELLOW}  Retry after resolving the GitHub error: $_retry_cmd${NC}" >&2
+        fi
+        rm -f "$_gh_log"
+        return 0
+    fi
+    rm -f "$_gh_log"
 
     # GH sync modifies the in-memory DB — re-dump so git layer captures changes
     local tmp_sql2 tmp_nodes2 tmp_edges2
@@ -615,7 +645,8 @@ cmd_sync() {
     fi
 }
 
-# _load_quality_config — Populate quality_exempt + policy_thresholds from .weave/quality.conf.
+# _load_quality_config — Populate quality_exempt + policy_thresholds from .weave/quality.conf,
+# then overlay .weave/quality.local.conf (gitignored personal overrides applied second).
 #
 # [exempt]      each non-comment, non-blank line is a path pattern. Trailing '/' patterns match
 #               directory prefixes (handled in _is_quality_exempt via LIKE). Stale file_metrics
@@ -625,53 +656,74 @@ cmd_sync() {
 #               state.sql, so without this a raw-SQL threshold change resets to defaults on the next
 #               cold-start/wv load. Committing [thresholds] makes a repo's gate policy (e.g.
 #               test_gate = 1) persist. Runs after migrations seed defaults, so config wins.
+#               quality.local.conf is applied after quality.conf so local user preferences win.
 #
 # Safe to call on empty/missing config — clears quality_exempt and returns 0 (thresholds keep their
-# seeded defaults when the section is absent).
+# seeded defaults when both files are absent).
 _load_quality_config() {
     local config_file="$WEAVE_DIR/quality.conf"
+    local local_config_file="$WEAVE_DIR/quality.local.conf"
 
     # Always clear and repopulate so removed exemptions take effect on next load.
     sqlite3 "$WV_DB" "DELETE FROM quality_exempt;" 2>/dev/null || true
 
-    [ ! -f "$config_file" ] && return 0
+    # Layer 1: repo-committed quality.conf
+    _parse_quality_conf_file "$config_file"
 
+    # Capture committed test_gate before the local layer can override it.
+    # test_gate=2 (block) is a team-wide hard gate; no individual can downgrade it via
+    # their local file — mirrors --skip-verification (suppresses warn, never block).
+    local committed_test_gate
+    committed_test_gate=$(sqlite3 "$WV_DB" \
+        "SELECT CAST(value AS INTEGER) FROM policy_thresholds WHERE key='test_gate';" 2>/dev/null || echo "")
+
+    # Layer 2: gitignored user-per-repo override (quality.local.conf applied after so it wins)
+    _parse_quality_conf_file "$local_config_file"
+
+    # Guard: committed test_gate=2 (block) cannot be downgraded by the local layer.
+    if [ "$committed_test_gate" = "2" ]; then
+        sqlite3 "$WV_DB" \
+            "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES('test_gate', 2);" \
+            2>/dev/null || true
+    fi
+}
+
+# _parse_quality_conf_file — Internal helper: parse one quality conf file into DB.
+# Shared by _load_quality_config (called for quality.conf then quality.local.conf).
+# Does NOT clear quality_exempt — caller is responsible for the initial clear.
+_parse_quality_conf_file() {
+    local file="$1"
+    [ ! -f "$file" ] && return 0
     local section="" pattern
     while IFS= read -r line; do
-        # Section header
         if [[ "$line" =~ ^\[([a-z_]+)\] ]]; then
             section="${BASH_REMATCH[1]}"
             continue
         fi
-
         if [ "$section" = "exempt" ]; then
-            # Strip inline comments and whitespace
             pattern="${line%%#*}"
             pattern="${pattern// /}"
             [ -z "$pattern" ] && continue
             local pat_esc
             pat_esc=$(echo "$pattern" | sed "s/'/''/g")
             sqlite3 "$WV_DB" "INSERT OR IGNORE INTO quality_exempt(path_pattern) VALUES('$pat_esc');" 2>/dev/null || true
-            # Remove stale file_metrics entries matching this exemption
             if [[ "$pattern" == */ ]]; then
                 sqlite3 "$WV_DB" "DELETE FROM file_metrics WHERE path LIKE '${pat_esc}%';" 2>/dev/null || true
             else
                 sqlite3 "$WV_DB" "DELETE FROM file_metrics WHERE path = '$pat_esc';" 2>/dev/null || true
             fi
         elif [ "$section" = "thresholds" ]; then
-            # key = value (inline comments stripped). Validate key (safe identifier) and
-            # value (numeric) before write — these splice into SQL and drive the done gate.
             local kv key val
             kv="${line%%#*}"
             key="${kv%%=*}"; key="${key// /}"
             val="${kv#*=}"; val="${val// /}"
             [ -z "$key" ] && continue
-            [ "$key" = "$kv" ] && continue   # no '=' on the line
+            [ "$key" = "$kv" ] && continue
             [[ "$key" =~ ^[a-z_]+$ ]] || continue
             [[ "$val" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || continue
             sqlite3 "$WV_DB" "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES('$key', $val);" 2>/dev/null || true
         fi
-    done < "$config_file"
+    done < "$file"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2393,29 +2445,9 @@ _build_fts_expr() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 _wv_search_python() {
-    local _wv_pypath="${WV_LIB_DIR:-$SCRIPT_DIR}"
-    if [ ! -d "$_wv_pypath/weave_search" ]; then
-        local _wv_real
-        _wv_real=$(readlink -f "$_wv_pypath/lib/wv-config.sh" 2>/dev/null || echo "")
-        if [ -n "$_wv_real" ]; then
-            _wv_pypath=$(dirname "$(dirname "$_wv_real")")
-        fi
-    fi
-
-    local _wv_python3=python3
-    local _scripts_parent
-    _scripts_parent=$(dirname "$_wv_pypath")
-    if [ -x "$_scripts_parent/.venv/bin/python3" ]; then
-        _wv_python3="$_scripts_parent/.venv/bin/python3"
-    elif [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -x "${CLAUDE_PROJECT_DIR}/.venv/bin/python3" ]; then
-        _wv_python3="${CLAUDE_PROJECT_DIR}/.venv/bin/python3"
-    elif [ -n "${CONDA_PREFIX:-}" ] || [ -n "${CONDA_DEFAULT_ENV:-}" ]; then
-        if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
-            [ -x /usr/bin/python3 ] && _wv_python3=/usr/bin/python3
-        fi
-    fi
-
-    PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_search "$@"
+    local _wv_pypath
+    _wv_pypath=$(_wv_python_module_path weave_search)
+    _wv_agent_python_exec_module weave_search "$_wv_pypath" "$@"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

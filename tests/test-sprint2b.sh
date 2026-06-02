@@ -67,7 +67,7 @@ assert_equals() {
 assert_contains() {
     local haystack="$1" needle="$2" message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF "$needle"; then
+    if grep -qF "$needle" <<<"$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -81,7 +81,7 @@ assert_contains() {
 assert_not_contains() {
     local haystack="$1" needle="$2" message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if ! echo "$haystack" | grep -qF "$needle"; then
+    if ! grep -qF "$needle" <<<"$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -231,6 +231,7 @@ test_breadcrumbs() {
         git init -q
         git config user.email "t@t.com"
         git config user.name "T"
+        git config commit.gpgsign false
         export WV_HOT_ZONE="$uninitialized_dir"
         export WV_DB="$uninitialized_dir/brain.db"
         export WEAVE_DIR="$uninitialized_dir/.weave"

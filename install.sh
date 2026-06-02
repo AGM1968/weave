@@ -236,8 +236,11 @@ install_git_hook_from_repo() {
         fi
     fi
 
+    local lib_hook="${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks/$hook_name"
     if [ -f "$hook_path" ]; then
         cp "$hook_path" "$hook_dst"
+    elif [ -f "$lib_hook" ]; then
+        cp "$lib_hook" "$hook_dst"
     else
         local repo_base="${REPO:-https://raw.githubusercontent.com/AGM1968/weave/main}"
         curl -sSL "$repo_base/scripts/hooks/$hook_name" -o "$hook_dst"
@@ -654,6 +657,7 @@ cat > "$INSTALL_DIR/wv-init-repo" << 'INITEOF'
 #   wv-init-repo                 # Default: --agent=claude (init only)
 #   wv-init-repo --agent=claude  # Claude Code hooks, skills, settings
 #   wv-init-repo --agent=copilot # VS Code Copilot MCP config
+#   wv-init-repo --agent=codex   # Codex setup contract
 #   wv-init-repo --update        # Update managed files (hooks, skills, agents)
 #   wv-init-repo --force         # Overwrite ALL files including user-customized
 set -e
@@ -672,17 +676,18 @@ for arg in "$@"; do
         --update) UPDATE_MODE=1 ;;
         --force) UPDATE_MODE=1; FORCE_MODE=1 ;;
         --help|-h)
-            echo "Usage: wv-init-repo [--agent=claude|copilot|all] [--update] [--force]"
+            echo "Usage: wv-init-repo [--agent=claude|copilot|codex|all] [--update] [--force]"
             echo ""
             echo "  claude   (default) Claude Code hooks, skills, settings.local.json"
             echo "  copilot  VS Code Copilot MCP config (.vscode/mcp.json + legacy .mcp.json) + copilot-instructions.md"
-            echo "  all      Both Claude Code and VS Code Copilot"
+            echo "  codex    Codex setup contract (.codex/weave.json); AGENTS.md remains universal"
+            echo "  all      Claude Code, VS Code Copilot, and Codex"
             echo ""
             echo "  --update  Update managed files (hooks, skills, agents, copilot-instructions)"
             echo "            Preserves user-customized files (CLAUDE.md, settings.local.json, MCP config)"
             echo "  --force   Like --update but also rewrites MCP config files (.vscode/mcp.json, .mcp.json)"
             echo ""
-            echo "  Comma-separated: --agent=claude,copilot"
+            echo "  Comma-separated: --agent=claude,copilot,codex"
             exit 0
             ;;
     esac
@@ -690,7 +695,7 @@ done
 
 # Expand 'all' and parse comma-separated values
 if [ "$AGENT_ARG" = "all" ]; then
-    AGENTS=(claude copilot)
+    AGENTS=(claude copilot codex)
 else
     IFS=',' read -ra AGENTS <<< "$AGENT_ARG"
 fi
@@ -698,7 +703,7 @@ fi
 # Validate each agent
 for agent in "${AGENTS[@]}"; do
     case "$agent" in
-        claude|copilot) ;;
+        claude|copilot|codex) ;;
         *)
             echo -e "${YELLOW}Unknown agent: $agent — skipping${NC}" >&2
             ;;
@@ -733,8 +738,11 @@ install_git_hook_from_repo() {
         fi
     fi
 
+    local lib_hook="${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks/$hook_name"
     if [ -f "$hook_path" ]; then
         cp "$hook_path" "$hook_dst"
+    elif [ -f "$lib_hook" ]; then
+        cp "$lib_hook" "$hook_dst"
     else
         local repo_base="${REPO:-https://raw.githubusercontent.com/AGM1968/weave/main}"
         curl -sSL "$repo_base/scripts/hooks/$hook_name" -o "$hook_dst"
@@ -873,6 +881,7 @@ WEAVE_PATTERNS=(
     ".weave/*.db-shm"
     ".weave/.context_policy"
     ".weave/.prune_epoch"
+    ".weave/quality.local.conf"
     "!.weave/state.sql"
     "!.claude/settings.json"
 )
@@ -1543,9 +1552,11 @@ COPILOTEOF
         echo -e "  ${GREEN}✓${NC} .github/copilot-instructions.md (Weave block updated)"
     elif grep -qE 'weave_edit_guard|wv status.*active node|git status.*&&.*wv status' "$_cop_dst" \
          && [ "$UPDATE_MODE" = "1" ]; then
-        # Pre-marker Weave stub (Weave workflow fingerprint, no markers yet): replace entirely
-        printf '%s\n' "$_copilot_block" > "$_cop_dst"
-        echo -e "  ${GREEN}✓${NC} .github/copilot-instructions.md (pre-marker Weave stub replaced)"
+        # Pre-marker Weave stub (Weave workflow fingerprint, no markers yet): add managed markers
+        # without discarding possible user customizations mixed into the old unmarked file.
+        _cop_existing=$(cat "$_cop_dst")
+        { printf '%s\n\n' "$_copilot_block"; printf '%s\n' "$_cop_existing"; } > "$_cop_dst"
+        echo -e "  ${GREEN}✓${NC} .github/copilot-instructions.md (pre-marker Weave block marked; existing content preserved)"
     elif [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]; then
         # User-written file without markers + --update/--force: prepend block
         _cop_existing=$(cat "$_cop_dst")
@@ -1555,6 +1566,75 @@ COPILOTEOF
         echo -e "  ${YELLOW}⊘${NC} .github/copilot-instructions.md (exists without Weave block — use --update to prepend)"
     fi
 
+fi
+
+if [ "$AGENT" = "codex" ]; then
+    echo ""
+    echo "Configuring Codex setup contract..."
+
+    _CODEX_DIR="$REPO_ROOT/.codex"
+    _CODEX_CONTRACT="$_CODEX_DIR/weave.json"
+
+    _write_codex_contract() {
+        mkdir -p "$_CODEX_DIR"
+        cat > "$_CODEX_CONTRACT" << CODEXEOF
+{
+  "schema": "weave.codex.v1",
+  "bootstrap": {
+    "command": "./scripts/wv bootstrap-agent --json",
+    "fallback": "$WV_BIN bootstrap-agent --json"
+  },
+  "doctor": {
+    "command": "./scripts/wv doctor --agent --json",
+    "fallback": "$WV_BIN doctor --agent --json"
+  },
+  "runtime": {
+    "hot_zone": "codex",
+    "expected_prefix": "/tmp/weave-codex-\${uid}",
+    "prefer_repo_local_wv": true
+  },
+  "workflow": {
+    "universal_instructions": "AGENTS.md",
+    "no_edits_without_active_node": true,
+    "noninteractive_close": "wv ship-agent"
+  },
+  "github_sync": {
+    "local_first": "./scripts/wv sync",
+    "external_network": "./scripts/wv sync --gh",
+    "requires_sandbox_approval": true,
+    "failure_policy": "local .weave sync remains valid; rerun external_network with network/SSH approval"
+  }
+}
+CODEXEOF
+    }
+
+    if [ ! -f "$_CODEX_CONTRACT" ] || [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]; then
+        _write_codex_contract
+        echo -e "  ${GREEN}✓${NC} .codex/weave.json"
+    else
+        echo -e "  ${YELLOW}⊘${NC} .codex/weave.json (already exists, use --update to refresh)"
+    fi
+
+    # Register Weave MCP server with Codex so weave_edit_guard and weave_record_edit
+    # are available during Codex sessions (codex mcp list must show "weave").
+    if command -v codex >/dev/null 2>&1; then
+        local _mcp_server=""
+        if [ -f "$WV_LIB_DIR/mcp/dist/index.js" ]; then
+            _mcp_server="$WV_LIB_DIR/mcp/dist/index.js"
+        elif [ -f "$REPO_ROOT/mcp/dist/index.js" ]; then
+            _mcp_server="$REPO_ROOT/mcp/dist/index.js"
+        fi
+        if [ -n "$_mcp_server" ]; then
+            codex mcp add weave \
+                --env "WV_PATH=$WV_BIN" \
+                --env "WV_PROJECT_DIR=$REPO_ROOT" \
+                -- node "$_mcp_server" 2>/dev/null \
+                && echo -e "  ${GREEN}✓${NC} codex mcp: weave registered" \
+                || echo -e "  ${YELLOW}⊘${NC} codex mcp add weave skipped (already registered or error)"
+        else
+            echo -e "  ${YELLOW}⊘${NC} codex mcp: MCP server not built — run 'npm run build' in mcp/ first"
+        fi
+    fi
 fi
 
 done  # end for AGENT in AGENTS
@@ -1587,6 +1667,8 @@ for _a in "${AGENTS[@]}"; do
         echo "  .mcp.json — Copilot MCP config (legacy/root)"
         echo "  .github/copilot-instructions.md — Minimal stub (workflow via weave_guide)"
         echo "  .github/hooks/ — VS Code native hook location"
+    elif [ "$_a" = "codex" ]; then
+        echo "  .codex/weave.json — Codex setup contract (AGENTS.md remains universal)"
     fi
 done
 INITEOF

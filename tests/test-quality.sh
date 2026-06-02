@@ -47,6 +47,7 @@ setup_test_env() {
     git init -q
     git config user.email "test@test.com"
     git config user.name "Test"
+    git config commit.gpgsign false
 }
 
 # Create sample source files for scanning
@@ -150,13 +151,15 @@ strip_ansi() {
 assert_contains() {
     local haystack="$1" needle="$2" message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | strip_ansi | grep -qF "$needle"; then
+    local clean_haystack
+    clean_haystack=$(strip_ansi <<<"$haystack")
+    if grep -qF "$needle" <<<"$clean_haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected to find: $needle"
-        echo "  In: $(echo "$haystack" | strip_ansi | head -5)"
+        echo "  In: $(strip_ansi <<<"$haystack" | head -5)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
@@ -164,13 +167,15 @@ assert_contains() {
 assert_not_contains() {
     local haystack="$1" needle="$2" message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if ! echo "$haystack" | strip_ansi | grep -qF "$needle"; then
+    local clean_haystack
+    clean_haystack=$(strip_ansi <<<"$haystack")
+    if ! grep -qF "$needle" <<<"$clean_haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected NOT to find: $needle"
-        echo "  In: $(echo "$haystack" | strip_ansi | head -5)"
+        echo "  In: $(strip_ansi <<<"$haystack" | head -5)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }

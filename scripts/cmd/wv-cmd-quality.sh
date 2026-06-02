@@ -13,31 +13,9 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 _wv_quality_python() {
-    # Resolve the scripts/ parent directory via symlink dereferencing
-    # Same pattern as weave_gh invocation in wv-cmd-data.sh
-    local _wv_pypath="${WV_LIB_DIR:-$SCRIPT_DIR}"
-    if [ ! -d "$_wv_pypath/weave_quality" ]; then
-        # Dev-mode symlinks: resolve through to actual source
-        local _wv_real
-        _wv_real=$(readlink -f "$_wv_pypath/lib/wv-config.sh" 2>/dev/null || echo "")
-        if [ -n "$_wv_real" ]; then
-            _wv_pypath=$(dirname "$(dirname "$_wv_real")")
-        fi
-    fi
-
-    # Bypass conda environments whose Python may be too old (< 3.10).
-    # VIRTUAL_ENV is set by both Poetry and conda — only escape conda.
-    # Only fall back to system Python if conda's Python is actually too old.
-    local _wv_python3=python3
-    if [ -n "${CONDA_PREFIX:-}" ] || [ -n "${CONDA_DEFAULT_ENV:-}" ]; then
-        if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
-            if [ -x /usr/bin/python3 ]; then
-                _wv_python3=/usr/bin/python3
-            fi
-        fi
-    fi
-
-    PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_quality "$@"
+    local _wv_pypath
+    _wv_pypath=$(_wv_python_module_path weave_quality)
+    _wv_agent_python_exec_module weave_quality "$_wv_pypath" "$@"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

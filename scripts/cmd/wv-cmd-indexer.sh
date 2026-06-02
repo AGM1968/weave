@@ -13,31 +13,9 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 _wv_indexer_python() {
-    local _wv_pypath="${WV_LIB_DIR:-$SCRIPT_DIR}"
-    if [ ! -d "$_wv_pypath/weave_indexer" ]; then
-        local _wv_real
-        _wv_real=$(readlink -f "$_wv_pypath/lib/wv-config.sh" 2>/dev/null || echo "")
-        if [ -n "$_wv_real" ]; then
-            _wv_pypath=$(dirname "$(dirname "$_wv_real")")
-        fi
-    fi
-
-    # Prefer a venv Python that has model2vec (embedding support).
-    # Fallback chain: scripts-sibling .venv → CLAUDE_PROJECT_DIR .venv → conda bypass → python3
-    local _wv_python3=python3
-    local _scripts_parent
-    _scripts_parent=$(dirname "$_wv_pypath")
-    if [ -x "$_scripts_parent/.venv/bin/python3" ]; then
-        _wv_python3="$_scripts_parent/.venv/bin/python3"
-    elif [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -x "${CLAUDE_PROJECT_DIR}/.venv/bin/python3" ]; then
-        _wv_python3="${CLAUDE_PROJECT_DIR}/.venv/bin/python3"
-    elif [ -n "${CONDA_PREFIX:-}" ] || [ -n "${CONDA_DEFAULT_ENV:-}" ]; then
-        if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
-            [ -x /usr/bin/python3 ] && _wv_python3=/usr/bin/python3
-        fi
-    fi
-
-    PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_indexer "$@"
+    local _wv_pypath
+    _wv_pypath=$(_wv_python_module_path weave_indexer)
+    _wv_agent_python_exec_module weave_indexer "$_wv_pypath" "$@"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

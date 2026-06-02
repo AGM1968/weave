@@ -276,6 +276,39 @@ out=$("$WV" query "MATCH sqlite" --order=relevance --format=short 2>&1)
 assert_contains "$out" "wv-" "--order=relevance with MATCH returns result"
 
 echo ""
+echo -e "${YELLOW}=== Phase 2 gate: --code separation (wv-e1deb7) ===${NC}"
+
+# --code is a cmd_search flag that routes to the Python hybrid engine.
+# cmd_query MUST NOT have this flag; Phase 2 wrapper must preserve --code
+# as a separate branch in cmd_search, not delegate it to cmd_query.
+out=$("$WV" query --code "sqlite" 2>&1 || true)
+assert_contains "$out" "Error" "--code is not a valid wv query flag (must stay in cmd_search)"
+
+# Verify wv query --help does NOT advertise --code
+out=$("$WV" query --help 2>&1)
+assert_not_contains "$out" "--code" "--help does not mention --code (separation preserved)"
+
+echo ""
+echo -e "${YELLOW}=== Phase 2 gate: wv search / wv query MATCH recall parity (wv-e1deb7) ===${NC}"
+
+# A node with learning content: both wv search and wv query MATCH must find it.
+# This is the no-regression gate for Phase 2 wrapper — if _query_build_sql
+# regresses (e.g. UNION removed), wv query MATCH would miss this node while
+# wv search (which keeps its own UNION) would still find it.
+PARITY_ID=$("$WV" add "wq-test: parity gate node" --status=done \
+    --metadata='{"decision":"xq7paritysentinel Phase2 gate learning recall","pattern":"nodes_learning_fts UNION 2x weight"}' \
+    2>/dev/null | head -1)
+export PARITY_ID
+
+# wv query MATCH must find the sentinel in learning fields
+out=$("$WV" query 'MATCH "xq7paritysentinel"' --order=relevance --limit=10 2>&1)
+assert_contains "$out" "$PARITY_ID" "wv query MATCH finds sentinel in learning fields (dual-FTS UNION active)"
+
+# wv search must also find it (parity baseline — these should agree)
+out=$("$WV" search "xq7paritysentinel" --limit=10 2>&1)
+assert_contains "$out" "$PARITY_ID" "wv search finds same sentinel (parity baseline passes)"
+
+echo ""
 echo -e "${YELLOW}=== wv query: error handling ===${NC}"
 
 out=$("$WV" query --unknown-flag 2>&1 || true)

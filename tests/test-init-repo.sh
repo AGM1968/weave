@@ -3,7 +3,8 @@
 #
 # Verifies that wv init-repo delegates to standalone wv-init-repo and
 # creates the correct scaffolding: .claude/settings.json (permissions only,
-# no hooks key), CLAUDE.md, and --agent=copilot generates VS Code/GitHub files.
+# no hooks key), CLAUDE.md, --agent=copilot generates VS Code/GitHub files,
+# and --agent=codex generates the Codex setup contract.
 #
 # Exit codes:
 #   0 - All tests passed
@@ -233,7 +234,45 @@ assert_not_contains "$COPILOT" "Session Start (MANDATORY)"  "copilot: stub does 
 assert_file_absent "$REPO3/CLAUDE.md"                       "copilot-only: no CLAUDE.md"
 assert_file_absent "$REPO3/.claude/settings.json"           "copilot-only: no .claude/settings.json"
 
-# --- --agent=all creates both ---
+# --- --agent=codex creates Codex contract only ---
+echo ""
+echo "--- --agent=codex ---"
+REPO_CODEX=$(make_test_repo "codex")
+cd "$REPO_CODEX"
+echo "universal" > "$REPO_CODEX/AGENTS.md"
+
+OUTPUT=$("$WV" init-repo --agent=codex 2>&1)
+assert_file_exists "$REPO_CODEX/.codex/weave.json"           "codex: creates .codex/weave.json"
+assert_file_exists "$REPO_CODEX/.weave/runtime.md"           "codex: creates .weave/runtime.md scaffold"
+
+CODEX_JSON=$(cat "$REPO_CODEX/.codex/weave.json")
+assert_contains "$CODEX_JSON" '"schema": "weave.codex.v1"'   "codex: contract has schema"
+assert_contains "$CODEX_JSON" '"universal_instructions": "AGENTS.md"' "codex: contract points at universal AGENTS.md"
+assert_contains "$CODEX_JSON" '"noninteractive_close": "wv ship-agent"' "codex: contract names ship-agent close"
+assert_contains "$CODEX_JSON" '"local_first": "./scripts/wv sync"' "codex: contract names local-first sync"
+assert_contains "$CODEX_JSON" '"external_network": "./scripts/wv sync --gh"' "codex: contract names external GitHub sync"
+assert_contains "$CODEX_JSON" '"requires_sandbox_approval": true' "codex: contract marks GitHub sync approval"
+assert_contains "$CODEX_JSON" 'bootstrap-agent --json'       "codex: contract names bootstrap-agent"
+assert_contains "$CODEX_JSON" 'doctor --agent --json'        "codex: contract names agent doctor"
+CODEX_SCHEMA=$(jq -r '.schema' "$REPO_CODEX/.codex/weave.json")
+assert_equals "weave.codex.v1" "$CODEX_SCHEMA"               "codex: contract is valid JSON"
+
+assert_equals "universal" "$(cat "$REPO_CODEX/AGENTS.md")"   "codex: preserves existing AGENTS.md"
+assert_file_absent "$REPO_CODEX/CLAUDE.md"                   "codex-only: no CLAUDE.md"
+assert_file_absent "$REPO_CODEX/.claude/settings.json"       "codex-only: no .claude/settings.json"
+assert_file_absent "$REPO_CODEX/.github/copilot-instructions.md" "codex-only: no copilot-instructions.md"
+
+printf '%s\n' '{"schema":"stale"}' > "$REPO_CODEX/.codex/weave.json"
+"$WV" init-repo --agent=codex --update 2>&1 >/dev/null
+CODEX_SCHEMA=$(jq -r '.schema' "$REPO_CODEX/.codex/weave.json")
+assert_equals "weave.codex.v1" "$CODEX_SCHEMA"               "codex: --update refreshes contract"
+
+printf '%s\n' '{"custom":true}' > "$REPO_CODEX/.codex/weave.json"
+"$WV" init-repo --agent=codex --force 2>&1 >/dev/null
+CODEX_SCHEMA=$(jq -r '.schema' "$REPO_CODEX/.codex/weave.json")
+assert_equals "weave.codex.v1" "$CODEX_SCHEMA"               "codex: --force refreshes contract"
+
+# --- --agent=all creates all supported agent surfaces ---
 echo ""
 echo "--- --agent=all ---"
 REPO4=$(make_test_repo "all")
@@ -244,6 +283,7 @@ assert_file_exists "$REPO4/.claude/settings.json"           "all: creates .claud
 assert_file_exists "$REPO4/CLAUDE.md"                       "all: creates CLAUDE.md"
 assert_file_exists "$REPO4/.mcp.json"                       "all: creates .mcp.json"
 assert_file_exists "$REPO4/.github/copilot-instructions.md" "all: creates copilot-instructions.md"
+assert_file_exists "$REPO4/.codex/weave.json"               "all: creates Codex contract"
 
 # settings.json still has no hooks key
 SETTINGS4=$(cat "$REPO4/.claude/settings.json")
@@ -283,23 +323,24 @@ echo "my custom content" > "$REPO5/CLAUDE.md"
 assert_contains "$(cat "$REPO5/CLAUDE.md")" "BEGIN WEAVE CLAUDE.MD"  "--update: prepends Weave block to CLAUDE.md"
 assert_contains "$(cat "$REPO5/CLAUDE.md")" "my custom content"  "--update: preserves user content in CLAUDE.md"
 
-# Pre-marker Weave stub: --update should replace entirely (no orphan duplicate)
+# Pre-marker Weave stub: --update should add markers without losing custom content.
 # Simulates upgrading a repo that has an old-style Weave stub without BEGIN/END markers.
 PRE_MARKER_STUB='# GitHub Copilot Instructions
 
 git status && wv status
 wv work <id>
-If 0 active nodes, use wv status to find active node first.'
+If 0 active nodes, use wv status to find active node first.
+
+## Repo-specific Copilot Notes
+
+Keep this custom instruction.'
 printf '%s\n' "$PRE_MARKER_STUB" > "$REPO5/.github/copilot-instructions.md"
 "$WV" init-repo --agent=copilot --update 2>&1 >/dev/null
 COPILOT_PM=$(cat "$REPO5/.github/copilot-instructions.md")
 assert_contains "$COPILOT_PM" "BEGIN WEAVE COPILOT.MD"      "--update pre-marker: adds markers"
-# Old orphan content should not appear after replacement (pre-marker fingerprint line)
-assert_not_contains "$COPILOT_PM" "If 0 active nodes, use wv status to find active node first." \
-    "--update pre-marker: orphan content removed"
-# Title H1 should appear exactly once (new stub has it; doubled if old content was prepended)
-GH_H1_COUNT=$(grep -c '^# GitHub Copilot Instructions$' "$REPO5/.github/copilot-instructions.md" 2>/dev/null || echo 0)
-assert_equals "1" "$GH_H1_COUNT"                             "--update pre-marker: no duplicate title H1"
+assert_contains "$COPILOT_PM" "Keep this custom instruction." "--update pre-marker: preserves custom content"
+assert_contains "$COPILOT_PM" "If 0 active nodes, use wv status to find active node first." \
+    "--update pre-marker: preserves legacy unmarked content"
 
 # --- --help works ---
 echo ""
@@ -307,6 +348,7 @@ echo "--- help ---"
 HELP=$("$WV" init-repo --help 2>&1 || true)
 assert_contains "$HELP" "agent"                             "--help: mentions agent flag"
 assert_contains "$HELP" "copilot"                           "--help: mentions copilot"
+assert_contains "$HELP" "codex"                             "--help: mentions codex"
 assert_contains "$HELP" "update"                            "--help: mentions update"
 
 # --- help text includes init-repo ---

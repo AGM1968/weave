@@ -328,7 +328,10 @@ class TestResolveDbPath:
                     type(
                         "P",
                         (),
-                        {"exists": lambda self: path_exists_for(str(db))},
+                        {
+                            "exists": lambda self: path_exists_for(str(db)),
+                            "is_dir": lambda self: False,
+                        },
                     )()
                 )
                 # Just verify it doesn't crash when rhash is empty
