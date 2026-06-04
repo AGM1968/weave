@@ -1011,6 +1011,48 @@ describe("Weave MCP Server", () => {
       expect(stderr).toContain("[weave-mcp-instrument]   weave_status: 1");
       expect(stderr).toContain("[weave-mcp-instrument]   weave_show: 1");
     });
+
+    it("persists MCP payload telemetry to JSONL when WV_MCP_CALL_LOG is set", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "weave-mcp-telemetry-"));
+      const logPath = join(dir, "mcp-calls.jsonl");
+      const loggedClient = new MCPTestClient([], { WV_MCP_CALL_LOG: logPath });
+      try {
+        await loggedClient.request("tools/list");
+        await loggedClient.request("tools/call", {
+          name: "weave_status",
+          arguments: {},
+        });
+      } finally {
+        await loggedClient.close();
+      }
+
+      try {
+        const entries = readFileSync(logPath, "utf-8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+        expect(entries).toHaveLength(2);
+        expect(entries[0]).toMatchObject({
+          source: "mcp",
+          scope: "all",
+          tool: "tools/list",
+        });
+        expect(entries[0].payload_bytes).toEqual(expect.any(Number));
+        expect(entries[0].elapsed_ms).toEqual(expect.any(Number));
+        expect(entries[0].tools).toEqual(expect.any(Number));
+        expect(entries[1]).toMatchObject({
+          source: "mcp",
+          scope: "all",
+          tool: "weave_status",
+          is_error: false,
+        });
+        expect(entries[1].payload_bytes).toEqual(expect.any(Number));
+        expect(entries[1].elapsed_ms).toEqual(expect.any(Number));
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 });
 

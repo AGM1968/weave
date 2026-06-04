@@ -965,6 +965,16 @@ db_ensure() {
 
     db_stamp_repo_owner
 
+    local schema_lock="$WV_HOT_ZONE/.schema.lock"
+    if command -v flock >/dev/null 2>&1; then
+        exec {schema_lock_fd}>"$schema_lock"
+        flock -w 10 "$schema_lock_fd" || {
+            echo -e "${RED}Error: timed out waiting for Weave schema migration lock${NC}" >&2
+            exec {schema_lock_fd}>&-
+            return 1
+        }
+    fi
+
     db_migrate_edge_type_enum
     db_migrate_policy_tables
     db_migrate_language_trigger
@@ -976,6 +986,11 @@ db_ensure() {
     # MUST run last: re-creates nodes_policy_check from the single-source emitter
     # so the authoritative trigger (incl. the test clause) is the final state.
     db_migrate_test_gate
+
+    if command -v flock >/dev/null 2>&1; then
+        flock -u "$schema_lock_fd" 2>/dev/null || true
+        exec {schema_lock_fd}>&-
+    fi
 
     # Check DB size once per process-tree — export so pipe subshells inherit the flag.
     # Destructive prune requires explicit opt-in: WV_AUTO_PRUNE=1.

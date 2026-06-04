@@ -118,6 +118,10 @@ assert_fails() {
     fi
 }
 
+node_id_from_output() {
+    sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | tail -1
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Test: Digest command
 # ═══════════════════════════════════════════════════════════════════════════
@@ -131,10 +135,10 @@ test_digest() {
 
     # Create some nodes to get meaningful stats
     local id1 id2 id3 id4
-    id1=$($WV add "Task one" 2>&1 | tail -1)
-    id2=$($WV add "Task two" 2>&1 | tail -1)
-    id3=$($WV add "Task three" 2>&1 | tail -1)
-    id4=$($WV add "Active task" 2>&1 | tail -1)
+    id1=$($WV add "Task one" 2>&1 | node_id_from_output)
+    id2=$($WV add "Task two" 2>&1 | node_id_from_output)
+    id3=$($WV add "Task three" 2>&1 | node_id_from_output)
+    id4=$($WV add "Active task" 2>&1 | node_id_from_output)
     $WV work "$id4" >/dev/null 2>&1
 
     # Text format
@@ -189,7 +193,7 @@ test_breadcrumbs() {
     # Create some test data
     $WV add "Active work item" >/dev/null 2>&1
     local id1
-    id1=$($WV add "Working on this" 2>&1 | tail -1)
+    id1=$($WV add "Working on this" 2>&1 | node_id_from_output)
     $WV work "$id1" >/dev/null 2>&1
 
     # Show with no breadcrumbs
@@ -270,10 +274,10 @@ test_learnings_filters() {
 
     # Create nodes with various learning types via metadata
     local id1 id2 id3 id4
-    id1=$($WV add "Auth implementation" --metadata='{"decision":"Use JWT tokens"}' 2>&1 | tail -1)
-    id2=$($WV add "Cache layer" --metadata='{"pattern":"Cache aside pattern"}' 2>&1 | tail -1)
-    id3=$($WV add "API design" --metadata='{"pitfall":"REST naming is tricky"}' 2>&1 | tail -1)
-    id4=$($WV add "DB migration" 2>&1 | tail -1)
+    id1=$($WV add "Auth implementation" --metadata='{"decision":"Use JWT tokens"}' 2>&1 | node_id_from_output)
+    id2=$($WV add "Cache layer" --metadata='{"pattern":"Cache aside pattern"}' 2>&1 | node_id_from_output)
+    id3=$($WV add "API design" --metadata='{"pitfall":"REST naming is tricky"}' 2>&1 | node_id_from_output)
+    id4=$($WV add "DB migration" 2>&1 | node_id_from_output)
 
     # Mark all as done (id1-3 already have learning metadata, id4 gets --learning)
     $WV done "$id1" --no-warn >/dev/null 2>&1
@@ -357,7 +361,7 @@ test_learnings_modes() {
 
     local id i json_output count
     for i in $(seq 1 12); do
-        id=$($WV add "Learning node $i" --metadata="{\"learning\":\"Learning $i\"}" 2>&1 | tail -1)
+        id=$($WV add "Learning node $i" --metadata="{\"learning\":\"Learning $i\"}" 2>&1 | node_id_from_output)
         $WV done "$id" --no-warn >/dev/null 2>&1
     done
 
@@ -395,7 +399,7 @@ test_validation_on_done() {
 
     # Create an orphan node (no edges, no learning) and complete it
     local id1
-    id1=$($WV add "Orphan task" 2>&1 | tail -1)
+    id1=$($WV add "Orphan task" 2>&1 | node_id_from_output)
 
     # Complete without learning — should show validation warnings on stderr
     local full_output
@@ -407,8 +411,8 @@ test_validation_on_done() {
     setup_test_env
     $WV init >/dev/null 2>&1
     local parent child
-    parent=$($WV add "Parent" 2>&1 | tail -1)
-    child=$($WV add "Child" 2>&1 | tail -1)
+    parent=$($WV add "Parent" 2>&1 | node_id_from_output)
+    child=$($WV add "Child" 2>&1 | node_id_from_output)
     $WV link "$child" "$parent" --type=implements >/dev/null 2>&1
 
     local done_output
@@ -420,7 +424,7 @@ test_validation_on_done() {
     setup_test_env
     $WV init >/dev/null 2>&1
     local orphan
-    orphan=$($WV add "Another orphan" 2>&1 | tail -1)
+    orphan=$($WV add "Another orphan" 2>&1 | node_id_from_output)
 
     done_output=$($WV done "$orphan" --no-warn 2>&1)
     assert_not_contains "$done_output" "Validation" "done --no-warn suppresses all warnings"
@@ -440,18 +444,18 @@ test_breadcrumbs_rich() {
 
     # Create a blocked node (wv block sets status=blocked AND creates edge)
     local blocker blocked
-    blocker=$($WV add "Blocker task" 2>&1 | tail -1)
-    blocked=$($WV add "Blocked task" 2>&1 | tail -1)
+    blocker=$($WV add "Blocker task" 2>&1 | node_id_from_output)
+    blocked=$($WV add "Blocked task" 2>&1 | node_id_from_output)
     $WV block "$blocked" --by="$blocker" >/dev/null 2>&1
 
     # Create a node with learning (via metadata since done doesn't support --decision)
     local done_id
-    done_id=$($WV add "Completed work" --metadata='{"decision":"Important decision"}' 2>&1 | tail -1)
+    done_id=$($WV add "Completed work" --metadata='{"decision":"Important decision"}' 2>&1 | node_id_from_output)
     $WV done "$done_id" --no-warn >/dev/null 2>&1
 
     # Create an active node
     local active_id
-    active_id=$($WV add "Working now" 2>&1 | tail -1)
+    active_id=$($WV add "Working now" 2>&1 | node_id_from_output)
     $WV work "$active_id" >/dev/null 2>&1
 
     # Save breadcrumbs
@@ -479,7 +483,7 @@ test_digest_alerts() {
     # Create an open node with a pitfall but no addressing edge.
     # Must stay open (not done) — done-node pitfalls are captured learnings, not unaddressed debt.
     local id1
-    id1=$($WV add "Task with pitfall" --metadata='{"pitfall":"Something bad"}' 2>&1 | tail -1)
+    id1=$($WV add "Task with pitfall" --metadata='{"pitfall":"Something bad"}' 2>&1 | node_id_from_output)
 
     local json_output
     json_output=$($WV digest --json 2>/dev/null)

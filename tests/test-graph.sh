@@ -166,6 +166,10 @@ assert_fails() {
     fi
 }
 
+node_id_from_output() {
+    sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | tail -1
+}
+
 # ============================================================================
 # Test: block
 # ============================================================================
@@ -178,8 +182,8 @@ test_block() {
 
     # Create two nodes
     local blocker target
-    blocker=$("$WV" add "Blocker task" --force 2>&1 | tail -1)
-    target=$("$WV" add "Target task" --force 2>&1 | tail -1)
+    blocker=$("$WV" add "Blocker task" --force 2>&1 | node_id_from_output)
+    target=$("$WV" add "Target task" --force 2>&1 | node_id_from_output)
 
     # Block target by blocker
     local output
@@ -219,8 +223,8 @@ test_link() {
 
     # Create nodes
     local from to
-    from=$("$WV" add "Source node" --force 2>&1 | tail -1)
-    to=$("$WV" add "Target node" --force 2>&1 | tail -1)
+    from=$("$WV" add "Source node" --force 2>&1 | node_id_from_output)
+    to=$("$WV" add "Target node" --force 2>&1 | node_id_from_output)
 
     # Create a link
     local output
@@ -268,8 +272,8 @@ test_resolve() {
 
     # Create contradicting nodes
     local node1 node2
-    node1=$("$WV" add "Approach A" --force 2>&1 | tail -1)
-    node2=$("$WV" add "Approach B" --force 2>&1 | tail -1)
+    node1=$("$WV" add "Approach A" --force 2>&1 | node_id_from_output)
+    node2=$("$WV" add "Approach B" --force 2>&1 | node_id_from_output)
 
     # Create contradiction edge
     "$WV" link "$node1" "$node2" --type=contradicts >/dev/null 2>&1
@@ -287,8 +291,8 @@ test_resolve() {
 
     # Test merge resolution
     setup_test_env
-    node1=$("$WV" add "Idea X" --force 2>&1 | tail -1)
-    node2=$("$WV" add "Idea Y" --force 2>&1 | tail -1)
+    node1=$("$WV" add "Idea X" --force 2>&1 | node_id_from_output)
+    node2=$("$WV" add "Idea Y" --force 2>&1 | node_id_from_output)
     "$WV" link "$node1" "$node2" --type=contradicts >/dev/null 2>&1
 
     output=$("$WV" resolve "$node1" "$node2" --merge 2>&1)
@@ -303,8 +307,8 @@ test_resolve() {
 
     # Test defer resolution
     setup_test_env
-    node1=$("$WV" add "Option 1" --force 2>&1 | tail -1)
-    node2=$("$WV" add "Option 2" --force 2>&1 | tail -1)
+    node1=$("$WV" add "Option 1" --force 2>&1 | node_id_from_output)
+    node2=$("$WV" add "Option 2" --force 2>&1 | node_id_from_output)
     "$WV" link "$node1" "$node2" --type=contradicts >/dev/null 2>&1
 
     output=$("$WV" resolve "$node1" "$node2" --defer 2>&1)
@@ -313,8 +317,8 @@ test_resolve() {
 
     # Resolve requires mode
     setup_test_env
-    node1=$("$WV" add "A" --force 2>&1 | tail -1)
-    node2=$("$WV" add "B" --force 2>&1 | tail -1)
+    node1=$("$WV" add "A" --force 2>&1 | node_id_from_output)
+    node2=$("$WV" add "B" --force 2>&1 | node_id_from_output)
     assert_fails "resolve requires resolution mode" "$WV" resolve "$node1" "$node2"
 
     # Winner must be one of the nodes
@@ -333,9 +337,9 @@ test_related() {
 
     # Create nodes with relationships
     local epic feature1 feature2
-    epic=$("$WV" add "Epic" --force 2>&1 | tail -1)
-    feature1=$("$WV" add "Feature 1" --force 2>&1 | tail -1)
-    feature2=$("$WV" add "Feature 2" --force 2>&1 | tail -1)
+    epic=$("$WV" add "Epic" --force 2>&1 | node_id_from_output)
+    feature1=$("$WV" add "Feature 1" --force 2>&1 | node_id_from_output)
+    feature2=$("$WV" add "Feature 2" --force 2>&1 | node_id_from_output)
 
     # Create edges
     "$WV" link "$feature1" "$epic" --type=implements >/dev/null 2>&1
@@ -382,9 +386,9 @@ test_edges() {
 
     # Create nodes with edges
     local node1 node2 node3
-    node1=$("$WV" add "Node 1" --force 2>&1 | tail -1)
-    node2=$("$WV" add "Node 2" --force 2>&1 | tail -1)
-    node3=$("$WV" add "Node 3" --force 2>&1 | tail -1)
+    node1=$("$WV" add "Node 1" --force 2>&1 | node_id_from_output)
+    node2=$("$WV" add "Node 2" --force 2>&1 | node_id_from_output)
+    node3=$("$WV" add "Node 3" --force 2>&1 | node_id_from_output)
 
     # Create various edges
     "$WV" link "$node1" "$node2" --type=implements >/dev/null 2>&1
@@ -429,9 +433,9 @@ test_path() {
 
     # Create a dependency chain: task <- feature <- epic
     local epic feature task
-    epic=$("$WV" add "Epic" --force 2>&1 | tail -1)
-    feature=$("$WV" add "Feature" --force 2>&1 | tail -1)
-    task=$("$WV" add "Task" --force 2>&1 | tail -1)
+    epic=$("$WV" add "Epic" --force 2>&1 | node_id_from_output)
+    feature=$("$WV" add "Feature" --force 2>&1 | node_id_from_output)
+    task=$("$WV" add "Task" --force 2>&1 | node_id_from_output)
 
     # Create blocking edges (emulates dependency chain)
     "$WV" block "$feature" --by="$epic" >/dev/null 2>&1
@@ -466,8 +470,8 @@ test_impact() {
     # --- fixture 1: single seed, forward ---
     setup_test_env
     local seed dep1
-    seed=$("$WV" add "Seed task" --force 2>&1 | tail -1)
-    dep1=$("$WV" add "Dep of seed" --force 2>&1 | tail -1)
+    seed=$("$WV" add "Seed task" --force 2>&1 | node_id_from_output)
+    dep1=$("$WV" add "Dep of seed" --force 2>&1 | node_id_from_output)
     "$WV" block "$dep1" --by="$seed" >/dev/null 2>&1
 
     local out
@@ -478,9 +482,9 @@ test_impact() {
     # --- fixture 2: multi-seed ---
     setup_test_env
     local s1 s2 dep2
-    s1=$("$WV" add "Seed 1" --force 2>&1 | tail -1)
-    s2=$("$WV" add "Seed 2" --force 2>&1 | tail -1)
-    dep2=$("$WV" add "Shared dep" --force 2>&1 | tail -1)
+    s1=$("$WV" add "Seed 1" --force 2>&1 | node_id_from_output)
+    s2=$("$WV" add "Seed 2" --force 2>&1 | node_id_from_output)
+    dep2=$("$WV" add "Shared dep" --force 2>&1 | node_id_from_output)
     "$WV" block "$dep2" --by="$s1" >/dev/null 2>&1
     "$WV" block "$dep2" --by="$s2" >/dev/null 2>&1
 
@@ -490,8 +494,8 @@ test_impact() {
     # --- fixture 3: cycle guard ---
     setup_test_env
     local ca cb
-    ca=$("$WV" add "Cycle A" --force 2>&1 | tail -1)
-    cb=$("$WV" add "Cycle B" --force 2>&1 | tail -1)
+    ca=$("$WV" add "Cycle A" --force 2>&1 | node_id_from_output)
+    cb=$("$WV" add "Cycle B" --force 2>&1 | node_id_from_output)
     "$WV" block "$cb" --by="$ca" >/dev/null 2>&1
     "$WV" link "$ca" "$cb" --type=implements >/dev/null 2>&1
 
@@ -505,9 +509,9 @@ test_impact() {
     # --- fixture 5: done intermediate is transparent ---
     setup_test_env
     local root mid leaf
-    root=$("$WV" add "Root todo" --force 2>&1 | tail -1)
-    mid=$("$WV" add "Mid done" --force 2>&1 | tail -1)
-    leaf=$("$WV" add "Leaf todo" --force 2>&1 | tail -1)
+    root=$("$WV" add "Root todo" --force 2>&1 | node_id_from_output)
+    mid=$("$WV" add "Mid done" --force 2>&1 | node_id_from_output)
+    leaf=$("$WV" add "Leaf todo" --force 2>&1 | node_id_from_output)
     "$WV" block "$mid" --by="$root" >/dev/null 2>&1
     "$WV" block "$leaf" --by="$mid" >/dev/null 2>&1
     "$WV" done "$mid" --learning="decision: test" >/dev/null 2>&1
@@ -518,8 +522,8 @@ test_impact() {
     # --- fixture 6: done seed + fwd direction → error ---
     setup_test_env
     local dseed dchild
-    dseed=$("$WV" add "Done seed" --force 2>&1 | tail -1)
-    dchild=$("$WV" add "Child of done" --force 2>&1 | tail -1)
+    dseed=$("$WV" add "Done seed" --force 2>&1 | node_id_from_output)
+    dchild=$("$WV" add "Child of done" --force 2>&1 | node_id_from_output)
     "$WV" block "$dchild" --by="$dseed" >/dev/null 2>&1
     "$WV" done "$dseed" --learning="decision: test" >/dev/null 2>&1
 
@@ -531,8 +535,8 @@ test_impact() {
     # --- fixture 7: contradicts edge excluded from traversal ---
     setup_test_env
     local base contra
-    base=$("$WV" add "Base node" --force 2>&1 | tail -1)
-    contra=$("$WV" add "Contradicts node" --force 2>&1 | tail -1)
+    base=$("$WV" add "Base node" --force 2>&1 | node_id_from_output)
+    contra=$("$WV" add "Contradicts node" --force 2>&1 | node_id_from_output)
     "$WV" link "$base" "$contra" --type=contradicts >/dev/null 2>&1
 
     out=$("$WV" impact "$base" 2>&1)
@@ -541,7 +545,7 @@ test_impact() {
     # --- fixture 8: file-to-test map (--json returns affected_suites) ---
     setup_test_env
     local fnode
-    fnode=$("$WV" add "File-mapped node" --force 2>&1 | tail -1)
+    fnode=$("$WV" add "File-mapped node" --force 2>&1 | node_id_from_output)
     # inject touched_files into metadata
     "$WV" update "$fnode" --metadata='{"touched_files":["scripts/cmd/wv-cmd-graph.sh"]}' >/dev/null 2>&1
     # create a test-map.conf so _impact_suites_for_files has something to read
@@ -549,7 +553,7 @@ test_impact() {
     printf '[map]\nscripts/cmd/wv-cmd-graph.sh = tests/test-graph.sh\n' > "$TEST_DIR/.weave/test-map.conf"
 
     local dep_f
-    dep_f=$("$WV" add "Dep for file node" --force 2>&1 | tail -1)
+    dep_f=$("$WV" add "Dep for file node" --force 2>&1 | node_id_from_output)
     "$WV" block "$dep_f" --by="$fnode" >/dev/null 2>&1
     "$WV" update "$dep_f" --metadata='{"touched_files":["scripts/cmd/wv-cmd-graph.sh"]}' >/dev/null 2>&1
 
@@ -638,9 +642,9 @@ SQL
     setup_test_env
 
     local fnode_a fnode_b fnode_dep
-    fnode_a=$("$WV" add "File-seeded node A" --force 2>&1 | tail -1)
-    fnode_b=$("$WV" add "File-seeded node B (unrelated file)" --force 2>&1 | tail -1)
-    fnode_dep=$("$WV" add "Dep of file-seeded A" --force 2>&1 | tail -1)
+    fnode_a=$("$WV" add "File-seeded node A" --force 2>&1 | node_id_from_output)
+    fnode_b=$("$WV" add "File-seeded node B (unrelated file)" --force 2>&1 | node_id_from_output)
+    fnode_dep=$("$WV" add "Dep of file-seeded A" --force 2>&1 | node_id_from_output)
     "$WV" block "$fnode_dep" --by="$fnode_a" >/dev/null 2>&1
     "$WV" update "$fnode_a" --metadata='{"touched_files":["scripts/probe/alpha.sh"]}' >/dev/null 2>&1
     "$WV" update "$fnode_b" --metadata='{"touched_files":["scripts/probe/beta.sh"]}' >/dev/null 2>&1
@@ -663,8 +667,8 @@ SQL
 
     # Canonical attribution table → seed resolution without touched_files metadata.
     local fnode_nf fnode_nf_dep jnodefiles
-    fnode_nf=$("$WV" add "File-seeded via node_files" --force 2>&1 | tail -1)
-    fnode_nf_dep=$("$WV" add "Dep of node_files seed" --force 2>&1 | tail -1)
+    fnode_nf=$("$WV" add "File-seeded via node_files" --force 2>&1 | node_id_from_output)
+    fnode_nf_dep=$("$WV" add "Dep of node_files seed" --force 2>&1 | node_id_from_output)
     "$WV" block "$fnode_nf_dep" --by="$fnode_nf" >/dev/null 2>&1
     sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$fnode_nf', 'scripts/probe/node-files.sh');" 2>/dev/null
     jnodefiles=$("$WV" impact --files=scripts/probe/node-files.sh --json 2>&1)

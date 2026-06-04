@@ -50,7 +50,7 @@ strip_ansi() {
 assert_contains() {
     local haystack="$1" needle="$2" message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | strip_ansi | grep -qF "$needle"; then
+    if echo "$haystack" | strip_ansi | grep -qF -- "$needle"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -64,7 +64,7 @@ assert_contains() {
 assert_not_contains() {
     local haystack="$1" needle="$2" message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if ! echo "$haystack" | strip_ansi | grep -qF "$needle"; then
+    if ! echo "$haystack" | strip_ansi | grep -qF -- "$needle"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else

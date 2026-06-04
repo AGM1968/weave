@@ -2,6 +2,77 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## Unreleased
+
+## [1.54.1] - 2026-06-04
+
+### Added
+
+- **Persistent MCP telemetry JSONL.** Set `WV_MCP_CALL_LOG=/path/to/mcp_calls.jsonl` to persist
+  per-response MCP telemetry with `source=mcp`, tool name, scope, payload bytes, elapsed ms, and
+  response metadata. This complements the existing `--instrument` stderr summary and lets Codex,
+  VS Code, and other MCP clients be measured across sessions.
+
+### Changed
+
+- **Agent graph-discovery guidance now favors targeted readers.** MCP recovery text and
+  agent-facing command references now point at `weave_bootstrap`, `weave_search`, `weave_ready`,
+  `wv status`, and `wv query` before broad `wv list` scans.
+- **Codex readiness setup is more portable and explicit.** `wv init-repo` and related readiness
+  surfaces now prefer repo-local wrappers where needed and make Codex MCP registration state easier
+  to inspect instead of relying on host-specific command availability.
+- **Codex MCP registration defaults to the lite/read-only surface.** Stale full MCP registrations
+  are pruned from Codex setup paths and default registration now targets the bounded lite server
+  unless a broader surface is deliberately configured.
+- **First-class Codex readiness diagnostics.** Codex-oriented bootstrap and doctor output now expose
+  the safe command contract, `.codex/weave.json` expectations, and actionable registration warnings
+  before agents enter a write workflow.
+- **Sandbox-safe Codex telemetry configuration.** MCP telemetry paths now favor writable sandbox
+  locations, and configuration failures are reported directly instead of implying instrumentation was
+  enabled when the client could not write the requested state.
+- **Codex-safe MCP lifecycle defaults.** MCP close/sync tools now avoid GitHub/network work by
+  default so mounted Codex MCP servers do not get monopolized by long lifecycle calls. `weave_done`,
+  `weave_batch_done`, and `weave_ship` pass `--no-gh` unless `WV_MCP_ALLOW_NETWORK=1` is set;
+  `weave_sync` and `weave_close_session` run bounded local sync and return explicit CLI fallbacks
+  for requested `wv sync --gh` work.
+- **`wv ship-agent --no-gh` and `wv batch-done --no-gh`.** Agent-safe close flows can now suppress
+  GitHub issue close/sync behavior consistently across single-node, batch, and MCP close surfaces.
+- **MCP lifecycle documentation aligned across shipped surfaces.** `README.md`, `README.public.md`,
+  and `mcp/README.md` now describe bounded local MCP close/sync behavior, CLI fallback for GitHub
+  sync, and the explicit `WV_MCP_ALLOW_NETWORK=1` opt-in for clients where long network calls are
+  acceptable.
+- **Workflow-surface regression coverage for Codex-safe MCP.** `tests/test-workflow-surfaces.sh`
+  now asserts the network opt-in, default `--no-gh`, and `wv sync --gh` CLI-fallback contract so the
+  MCP lifecycle guidance cannot drift from the implementation.
+- **Bash workflow-suite harness stabilized.** The shell regression suites now cover the Codex
+  readiness and telemetry contracts with corrected id parsing, safer here-string handling under
+  `pipefail`, and clearer diagnosis for long-running parallel/core test batches.
+- **Concurrent schema migrations are serialized.** `wv add` and other concurrent CLI processes now
+  take a hot-zone schema lock before running migrations, preventing FTS5 virtual-table constructor
+  races that could report success while dropping rows in the parallel WAL stress test.
+- **Release surfaces bumped to 1.54.1.** Version metadata now matches across `scripts/lib/VERSION`,
+  `pyproject.toml`, MCP `package.json`/lockfile, MCP server metadata, `docs/WEAVE.md`, and generated
+  Makefile template headers.
+- **Pre-Rust readiness docs grounded in the implementation.** `PATTERNS-rust-signatures.md` and the
+  pattern-crystallization proposal now reflect the current command classifications, `trails` as the
+  canonical command (`breadcrumbs` remains only a compatibility alias), Pattern E as ready/decided,
+  and Pattern F as blocked only on the impact S4 / Weaver IPC boundary.
+- **Unified query reader proposal brought current.** `PROPOSAL-wv-query-unified-reader.md` and the
+  proposal index now distinguish shipped Phase 2a query/search parity from pending Phase 2b reader
+  wrappers. Query Phase 2 is no longer a Rust readiness blocker; telemetry core is documented as
+  `WV_CALL_LOG` session analysis, while query-specific `_telemetry` helpers remain optional follow-up
+  work.
+
+### Fixed
+
+- **Done-node reopen is explicit.** `wv update --status=active` and plain `wv work <done-id>` no
+  longer reopen completed nodes. Follow-on edits must use `wv work <done-id> --reopen`, which records
+  the intentional conversion back to tracked work and emits Pattern E telemetry when call logging is
+  enabled.
+- **Query Phase 2 test assertions are literal-safe.** `tests/test-query.sh` now uses literal
+  contains checks for option-like strings, preventing grep option parsing from making `--code`
+  separation assertions pass or fail for the wrong reason.
+
 ## [1.54.0] - 2026-06-02
 
 ### Added

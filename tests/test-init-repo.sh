@@ -248,10 +248,17 @@ assert_file_exists "$REPO_CODEX/.weave/runtime.md"           "codex: creates .we
 CODEX_JSON=$(cat "$REPO_CODEX/.codex/weave.json")
 assert_contains "$CODEX_JSON" '"schema": "weave.codex.v1"'   "codex: contract has schema"
 assert_contains "$CODEX_JSON" '"universal_instructions": "AGENTS.md"' "codex: contract points at universal AGENTS.md"
-assert_contains "$CODEX_JSON" '"noninteractive_close": "wv ship-agent"' "codex: contract names ship-agent close"
+assert_contains "$CODEX_JSON" '"noninteractive_close": "./scripts/wv ship-agent"' "codex: contract names repo-local ship-agent close"
 assert_contains "$CODEX_JSON" '"local_first": "./scripts/wv sync"' "codex: contract names local-first sync"
 assert_contains "$CODEX_JSON" '"external_network": "./scripts/wv sync --gh"' "codex: contract names external GitHub sync"
 assert_contains "$CODEX_JSON" '"requires_sandbox_approval": true' "codex: contract marks GitHub sync approval"
+assert_contains "$CODEX_JSON" '"fallback": "$HOME/.local/bin/wv bootstrap-agent --json"' "codex: bootstrap fallback is portable"
+assert_contains "$CODEX_JSON" '"claim": "./scripts/wv work <id>"' "codex: contract includes safe claim command"
+assert_contains "$CODEX_JSON" '"record_edit": "./scripts/wv touch <id> --files=<path>"' "codex: contract includes safe edit attribution command"
+assert_contains "$CODEX_JSON" '"default_registration": "weave-lite"' "codex: contract names lite MCP default"
+assert_contains "$CODEX_JSON" '"full_requires": "--codex-mcp=full"' "codex: contract requires explicit full MCP"
+assert_contains "$CODEX_JSON" "Use CLI for GitHub sync" "codex: contract keeps network operations on CLI"
+assert_contains "$OUTPUT" 'codex mcp: skipped (use --codex-mcp to register weave-lite)' "codex: MCP registration is opt-in"
 assert_contains "$CODEX_JSON" 'bootstrap-agent --json'       "codex: contract names bootstrap-agent"
 assert_contains "$CODEX_JSON" 'doctor --agent --json'        "codex: contract names agent doctor"
 CODEX_SCHEMA=$(jq -r '.schema' "$REPO_CODEX/.codex/weave.json")
@@ -271,6 +278,30 @@ printf '%s\n' '{"custom":true}' > "$REPO_CODEX/.codex/weave.json"
 "$WV" init-repo --agent=codex --force 2>&1 >/dev/null
 CODEX_SCHEMA=$(jq -r '.schema' "$REPO_CODEX/.codex/weave.json")
 assert_equals "weave.codex.v1" "$CODEX_SCHEMA"               "codex: --force refreshes contract"
+
+FAKE_BIN="$TEST_DIR/fake-bin"
+mkdir -p "$FAKE_BIN"
+mkdir -p "$REPO_CODEX/mcp/dist"
+printf '%s\n' '/* fake mcp bundle */' > "$REPO_CODEX/mcp/dist/index.js"
+cat > "$FAKE_BIN/codex" <<'CODEXFAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$CODEX_MCP_LOG"
+if [ "$1" = "mcp" ] && [ "$2" = "list" ]; then
+    printf '%s\n' 'Name   Command  Args'
+    printf '%s\n' 'weave  node     /tmp/weave/mcp/dist/index.js'
+fi
+CODEXFAKE
+chmod +x "$FAKE_BIN/codex"
+CODEX_MCP_LOG="$TEST_DIR/codex-mcp.log" PATH="$FAKE_BIN:$PATH" \
+    "$WV" init-repo --agent=codex --force --codex-mcp 2>&1 >/dev/null
+assert_contains "$(cat "$TEST_DIR/codex-mcp.log")" "mcp remove weave" "codex: --codex-mcp prunes stale full MCP registration"
+assert_contains "$(cat "$TEST_DIR/codex-mcp.log")" "mcp add weave-lite" "codex: --codex-mcp registers lite MCP by default"
+assert_contains "$(cat "$TEST_DIR/codex-mcp.log")" "--scope=lite" "codex: default MCP registration uses lite scope"
+
+CODEX_MCP_LOG="$TEST_DIR/codex-mcp-full.log" PATH="$FAKE_BIN:$PATH" \
+    "$WV" init-repo --agent=codex --force --codex-mcp=full 2>&1 >/dev/null
+assert_contains "$(cat "$TEST_DIR/codex-mcp-full.log")" "mcp add weave" "codex: full MCP registration is explicit"
+assert_contains "$(cat "$TEST_DIR/codex-mcp-full.log")" "--scope=all" "codex: full MCP registration uses all scope"
 
 # --- --agent=all creates all supported agent surfaces ---
 echo ""

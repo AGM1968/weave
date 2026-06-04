@@ -670,13 +670,16 @@ NC='\033[0m'
 AGENT_ARG="claude"
 UPDATE_MODE=0
 FORCE_MODE=0
+CODEX_MCP_SCOPE=""
 for arg in "$@"; do
     case "$arg" in
         --agent=*) AGENT_ARG="${arg#--agent=}" ;;
         --update) UPDATE_MODE=1 ;;
         --force) UPDATE_MODE=1; FORCE_MODE=1 ;;
+        --codex-mcp) CODEX_MCP_SCOPE="lite" ;;
+        --codex-mcp=lite|--codex-mcp=inspect|--codex-mcp=full) CODEX_MCP_SCOPE="${arg#--codex-mcp=}" ;;
         --help|-h)
-            echo "Usage: wv-init-repo [--agent=claude|copilot|codex|all] [--update] [--force]"
+            echo "Usage: wv-init-repo [--agent=claude|copilot|codex|all] [--update] [--force] [--codex-mcp[=lite|inspect|full]]"
             echo ""
             echo "  claude   (default) Claude Code hooks, skills, settings.local.json"
             echo "  copilot  VS Code Copilot MCP config (.vscode/mcp.json + legacy .mcp.json) + copilot-instructions.md"
@@ -686,6 +689,9 @@ for arg in "$@"; do
             echo "  --update  Update managed files (hooks, skills, agents, copilot-instructions)"
             echo "            Preserves user-customized files (CLAUDE.md, settings.local.json, MCP config)"
             echo "  --force   Like --update but also rewrites MCP config files (.vscode/mcp.json, .mcp.json)"
+            echo "  --codex-mcp  Register weave-lite in Codex global config (local/read-mostly scope)"
+            echo "  --codex-mcp=inspect  Register read-only weave-inspect instead"
+            echo "  --codex-mcp=full     Register full weave server explicitly"
             echo ""
             echo "  Comma-separated: --agent=claude,copilot,codex"
             exit 0
@@ -1582,11 +1588,11 @@ if [ "$AGENT" = "codex" ]; then
   "schema": "weave.codex.v1",
   "bootstrap": {
     "command": "./scripts/wv bootstrap-agent --json",
-    "fallback": "$WV_BIN bootstrap-agent --json"
+    "fallback": "\$HOME/.local/bin/wv bootstrap-agent --json"
   },
   "doctor": {
     "command": "./scripts/wv doctor --agent --json",
-    "fallback": "$WV_BIN doctor --agent --json"
+    "fallback": "\$HOME/.local/bin/wv doctor --agent --json"
   },
   "runtime": {
     "hot_zone": "codex",
@@ -1596,7 +1602,22 @@ if [ "$AGENT" = "codex" ]; then
   "workflow": {
     "universal_instructions": "AGENTS.md",
     "no_edits_without_active_node": true,
-    "noninteractive_close": "wv ship-agent"
+    "noninteractive_close": "./scripts/wv ship-agent"
+  },
+  "commands": {
+    "claim": "./scripts/wv work <id>",
+    "record_edit": "./scripts/wv touch <id> --files=<path>",
+    "close": "./scripts/wv ship-agent <id> --learning-file=<path> --verification-method=<cmd> --verification-evidence-file=<path> --json",
+    "local_sync": "./scripts/wv sync --mode=fast --node=<id>",
+    "github_sync": "./scripts/wv sync --gh --mode=fast --node=<id>",
+    "push": "git push"
+  },
+  "mcp": {
+    "default_registration": "weave-lite",
+    "recommended_scope": "lite",
+    "read_only": "weave-inspect",
+    "full_requires": "--codex-mcp=full",
+    "network_policy": "Use CLI for GitHub sync, git push, and other privileged/network operations."
   },
   "github_sync": {
     "local_first": "./scripts/wv sync",
@@ -1615,25 +1636,43 @@ CODEXEOF
         echo -e "  ${YELLOW}⊘${NC} .codex/weave.json (already exists, use --update to refresh)"
     fi
 
-    # Register Weave MCP server with Codex so weave_edit_guard and weave_record_edit
-    # are available during Codex sessions (codex mcp list must show "weave").
-    if command -v codex >/dev/null 2>&1; then
-        local _mcp_server=""
+    # Optional: register a scoped Weave MCP server with Codex. Codex sandbox
+    # approvals apply cleanly to CLI commands, not MCP tool calls, so default to
+    # the narrow lite scope and require an explicit full-scope opt-in.
+    if [ -z "$CODEX_MCP_SCOPE" ]; then
+        echo -e "  ${YELLOW}⊘${NC} codex mcp: skipped (use --codex-mcp to register weave-lite)"
+    elif command -v codex >/dev/null 2>&1; then
+        _mcp_server=""
         if [ -f "$WV_LIB_DIR/mcp/dist/index.js" ]; then
             _mcp_server="$WV_LIB_DIR/mcp/dist/index.js"
         elif [ -f "$REPO_ROOT/mcp/dist/index.js" ]; then
             _mcp_server="$REPO_ROOT/mcp/dist/index.js"
         fi
         if [ -n "$_mcp_server" ]; then
-            codex mcp add weave \
+            _codex_mcp_name="weave-lite"
+            _codex_mcp_scope="lite"
+            if [ "$CODEX_MCP_SCOPE" = "inspect" ]; then
+                _codex_mcp_name="weave-inspect"
+                _codex_mcp_scope="inspect"
+            elif [ "$CODEX_MCP_SCOPE" = "full" ]; then
+                _codex_mcp_name="weave"
+                _codex_mcp_scope="all"
+            fi
+            if [ "$_codex_mcp_name" != "weave" ] && codex mcp list 2>/dev/null | grep -q '^weave[[:space:]]'; then
+                codex mcp remove weave >/dev/null 2>&1 \
+                    && echo -e "  ${GREEN}✓${NC} codex mcp: removed stale full weave registration"
+            fi
+            codex mcp add "$_codex_mcp_name" \
                 --env "WV_PATH=$WV_BIN" \
                 --env "WV_PROJECT_DIR=$REPO_ROOT" \
-                -- node "$_mcp_server" 2>/dev/null \
-                && echo -e "  ${GREEN}✓${NC} codex mcp: weave registered" \
-                || echo -e "  ${YELLOW}⊘${NC} codex mcp add weave skipped (already registered or error)"
+                -- node "$_mcp_server" "--scope=$_codex_mcp_scope" 2>/dev/null \
+                && echo -e "  ${GREEN}✓${NC} codex mcp: $_codex_mcp_name registered (--scope=$_codex_mcp_scope)" \
+                || echo -e "  ${YELLOW}⊘${NC} codex mcp add $_codex_mcp_name skipped (already registered or error)"
         else
             echo -e "  ${YELLOW}⊘${NC} codex mcp: MCP server not built — run 'npm run build' in mcp/ first"
         fi
+    else
+        echo -e "  ${YELLOW}⊘${NC} codex mcp: codex command not found"
     fi
 fi
 

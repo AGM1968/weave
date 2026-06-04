@@ -1446,12 +1446,14 @@ cmd_done() {
 cmd_batch_done() {
     local learning=""
     local no_warn=0
+    local no_gh=0
     local ids=()
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --learning=*) learning="${1#*=}" ;;
             --no-warn) no_warn=1 ;;
+            --no-gh) no_gh=1 ;;
             wv-*) ids+=("$1") ;;
         esac
         shift
@@ -1459,7 +1461,7 @@ cmd_batch_done() {
 
     if [ ${#ids[@]} -eq 0 ]; then
         echo -e "${RED}Error: at least one node ID required${NC}" >&2
-        echo "Usage: wv batch-done <id1> <id2> ... [--learning=\"...\"] [--no-warn]" >&2
+        echo "Usage: wv batch-done <id1> <id2> ... [--learning=\"...\"] [--no-warn] [--no-gh]" >&2
         return 1
     fi
 
@@ -1468,6 +1470,7 @@ cmd_batch_done() {
         local args=("$id")
         [ -n "$learning" ] && args+=("--learning=$learning")
         [ "$no_warn" = "1" ] && args+=("--no-warn")
+        [ "$no_gh" = "1" ] && args+=("--no-gh")
 
         if cmd_done "${args[@]}"; then
             ((closed++))
@@ -1672,6 +1675,7 @@ cmd_work() {
     local id="${1:-}"
     local quiet=false
     local force=false
+    local reopen=false
     local format="text"
     local allowed_tools_raw=""
 
@@ -1680,6 +1684,7 @@ cmd_work() {
         case "$1" in
             --quiet|-q) quiet=true ;;
             --force|-f) force=true ;;
+            --reopen)   reopen=true ;;
             --json)     format="json" ;;
             --allowed-tools=*) allowed_tools_raw="${1#--allowed-tools=}" ;;
         esac
@@ -1688,10 +1693,11 @@ cmd_work() {
 
     if [ -z "$id" ]; then
         echo -e "${RED}Error: node ID required${NC}" >&2
-        echo "Usage: wv work <id> [--quiet] [--force] [--json] [--allowed-tools=t1,t2,...]" >&2
+        echo "Usage: wv work <id> [--quiet] [--force] [--reopen] [--json] [--allowed-tools=t1,t2,...]" >&2
         echo "" >&2
         echo "Claims a node and sets WV_ACTIVE for subagent context inheritance." >&2
         echo "Use --force to override a stale claim from another agent." >&2
+        echo "Use --reopen to explicitly move a done node back to active tracked work." >&2
         echo "Run the export command to enable subagent context:" >&2
         echo "  eval \"\$(wv work <id> --quiet)\"" >&2
         return 1
@@ -1705,6 +1711,13 @@ cmd_work() {
     exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
     if [ "$exists" = "0" ]; then
         echo -e "${RED}Error: node $id not found${NC}" >&2
+        return 1
+    fi
+
+    local current_status
+    current_status=$(db_query "SELECT status FROM nodes WHERE id='$id';" 2>/dev/null | tr -d '[:space:]')
+    if [ "$current_status" = "done" ] && [ "$reopen" != true ]; then
+        echo -e "${RED}Error: node $id is done; use 'wv work $id --reopen' to explicitly reopen it${NC}" >&2
         return 1
     fi
 
@@ -1751,6 +1764,19 @@ cmd_work() {
     set_primary_node "$id"
     wv_set_phase "execute"
 
+    if [ "$current_status" = "done" ]; then
+        db_query "UPDATE nodes
+            SET metadata = json_set(COALESCE(metadata,'{}'),
+                    '\$.reopened_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                    '\$.reopened_by_work', json('true')),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = '$id';" 2>/dev/null || true
+        if [ -n "${WV_CALL_LOG:-}" ]; then
+            printf '{"ts":%s,"cmd":"wv work","event":"reopen_done_node","node_id":"%s","source":"shell"}\n' \
+                "$(date +%s.%6N)" "$id" >> "$WV_CALL_LOG" 2>/dev/null || true
+        fi
+    fi
+
     # Write allowed_tools to metadata if supplied
     if [ -n "$allowed_tools_raw" ]; then
         local tools_json
@@ -1765,8 +1791,10 @@ cmd_work() {
         # Structured output for runtime consumption
         local text
         text=$(db_query "SELECT text FROM nodes WHERE id='$id';")
-        jq -n --arg id "$id" --arg text "$text" --arg status "active" \
-            '{"id": $id, "text": $text, "status": $status}'
+        local reopened_json=false
+        [ "$current_status" = "done" ] && reopened_json=true
+        jq -n --arg id "$id" --arg text "$text" --arg status "active" --argjson reopened "$reopened_json" \
+            '{"id": $id, "text": $text, "status": $status, "reopened": $reopened}'
         return 0
     fi
 
@@ -1777,7 +1805,11 @@ cmd_work() {
         # Human-readable output
         local text
         text=$(db_query "SELECT text FROM nodes WHERE id='$id';")
-        echo -e "${GREEN}✓${NC} Claimed: $id"
+        if [ "$current_status" = "done" ]; then
+            echo -e "${GREEN}✓${NC} Reopened: $id"
+        else
+            echo -e "${GREEN}✓${NC} Claimed: $id"
+        fi
         echo "  $text"
 
         # Show last commit touching node's files for context
@@ -2550,6 +2582,7 @@ cmd_update_help() {
 Usage: wv update <id> [options]
 
 Update fields on an existing node.
+Done nodes cannot be reopened with update; use 'wv work <id> --reopen'.
 
 Options:
   --status=<status>          Set status
@@ -2743,14 +2776,13 @@ cmd_update() {
     # Remove trailing comma, add updated_at
     updates="${updates%,},updated_at=CURRENT_TIMESTAMP"
 
-    # Reopen detection: --status=active on a done node (Pattern E telemetry, wv-c4fc7e)
-    # Emits an event entry to WV_CALL_LOG (zero overhead when unset).
-    if [[ "$updates" == *"status='active'"* ]] && [[ -n "${WV_CALL_LOG:-}" ]]; then
+    # Pattern E: done-node reopen is an explicit work claim, not a generic update.
+    if [[ "$updates" == *"status='active'"* ]]; then
         local _cur_status
         _cur_status=$(db_query "SELECT status FROM nodes WHERE id='$id';" 2>/dev/null | tr -d '[:space:]') || true
         if [[ "$_cur_status" == "done" ]]; then
-            printf '{"ts":%s,"cmd":"wv update","event":"reopen_done_node","node_id":"%s","source":"shell"}\n' \
-                "$(date +%s.%6N)" "$id" >> "$WV_CALL_LOG" 2>/dev/null || true
+            echo -e "${RED}Error: cannot reopen a done node with update; use 'wv work $id --reopen'${NC}" >&2
+            return 1
         fi
     fi
 
@@ -3036,13 +3068,14 @@ _ship_run() {
     local verification_method="$7"
     local verification_evidence="$8"
     local verification_evidence_file="$9"
+    local no_gh="${10:-false}"
 
     # Validate ID format
     validate_id "$id" || return 1
 
     # Auto-detect GH sync need before journaling
     local needs_gh=false
-    if _ship_needs_gh "$id" "$gh_flag"; then
+    if [ "$no_gh" != true ] && _ship_needs_gh "$id" "$gh_flag"; then
         needs_gh=true
     fi
 
@@ -3073,6 +3106,9 @@ _ship_run() {
     fi
     if [ "$no_overlap_check" = true ]; then
         done_args+=("--no-overlap-check")
+    fi
+    if [ "$no_gh" = true ]; then
+        done_args+=("--no-gh")
     fi
 
     if [ -n "$learning" ] || [ -n "$learning_file" ]; then
@@ -3158,7 +3194,7 @@ cmd_ship() {
         return 1
     fi
 
-    _ship_run "$id" "$learning" "$learning_file" "$gh_flag" "$skip_verification" "$no_overlap_check" "$verification_method" "$verification_evidence" "$verification_evidence_file"
+    _ship_run "$id" "$learning" "$learning_file" "$gh_flag" "$skip_verification" "$no_overlap_check" "$verification_method" "$verification_evidence" "$verification_evidence_file" false
 }
 
 cmd_ship_agent() {
@@ -3171,6 +3207,7 @@ cmd_ship_agent() {
     local verification_method=""
     local verification_evidence=""
     local verification_evidence_file=""
+    local no_gh=false
     local format="json"
 
     shift || true
@@ -3179,6 +3216,7 @@ cmd_ship_agent() {
             --learning=*) learning="${1#*=}" ;;
             --learning-file=*) learning_file="${1#*=}" ;;
             --gh) gh_flag=true ;;
+            --no-gh) no_gh=true ;;
             --skip-verification) skip_verification=true ;;
             --no-overlap-check) no_overlap_check=true ;;
             --verification-method=*|--verify-method=*) verification_method="${1#*=}" ;;
@@ -3186,7 +3224,7 @@ cmd_ship_agent() {
             --verification-evidence-file=*|--verify-evidence-file=*) verification_evidence_file="${1#*=}" ;;
             --json) format="json" ;;
             --help|-h)
-                echo "Usage: wv ship-agent <id> [--learning=\"...\"|--learning-file=PATH] [--verification-method=\"...\"|--verify-method=\"...\"] [--verification-evidence=\"...\"|--verify-evidence=\"...\"|--verification-evidence-file=PATH] [--gh] [--skip-verification] [--no-overlap-check] [--json]" >&2
+                echo "Usage: wv ship-agent <id> [--learning=\"...\"|--learning-file=PATH] [--verification-method=\"...\"|--verify-method=\"...\"] [--verification-evidence=\"...\"|--verify-evidence=\"...\"|--verification-evidence-file=PATH] [--gh] [--no-gh] [--skip-verification] [--no-overlap-check] [--json]" >&2
                 return 0
                 ;;
         esac
@@ -3230,7 +3268,7 @@ cmd_ship_agent() {
     fi
 
     local ship_output ship_rc=0
-    ship_output=$(_ship_run "$id" "$learning" "$learning_file" "$gh_flag" "$skip_verification" "$no_overlap_check" "$verification_method" "$verification_evidence" "$verification_evidence_file" 2>&1) || ship_rc=$?
+    ship_output=$(_ship_run "$id" "$learning" "$learning_file" "$gh_flag" "$skip_verification" "$no_overlap_check" "$verification_method" "$verification_evidence" "$verification_evidence_file" "$no_gh" 2>&1) || ship_rc=$?
 
     if [ -n "$prev_noninteractive" ]; then
         export WV_NONINTERACTIVE="$prev_noninteractive"

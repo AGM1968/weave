@@ -142,9 +142,22 @@ _wv_agent_python_exec_module() {
     esac
 }
 
+_bootstrap_shell_token() {
+    local token="$1"
+    if [[ "$token" =~ ^[A-Za-z0-9_./:=+-]+$ ]]; then
+        printf '%s\n' "$token"
+    else
+        printf "'%s'\n" "${token//\'/\'\\\'\'}"
+    fi
+}
+
 _bootstrap_agent_tools_json() {
+    local wv_command="${1:-wv}"
+    local wv_token
     local ast_grep_path ast_grep_version
     local chunks_count=0 quality_ready=false chunks_ready=false ast_grep_ready=false
+
+    wv_token=$(_bootstrap_shell_token "$wv_command")
 
     ast_grep_path=$(command -v ast-grep 2>/dev/null || true)
     if [ -n "$ast_grep_path" ]; then
@@ -180,6 +193,7 @@ _bootstrap_agent_tools_json() {
     fi
 
     jq -n \
+        --arg wv "$wv_token" \
         --arg ast_grep_path "$ast_grep_path" \
         --arg ast_grep_version "$ast_grep_version" \
         --argjson ast_grep_ready "$ast_grep_ready" \
@@ -188,31 +202,31 @@ _bootstrap_agent_tools_json() {
         --argjson quality_ready "$quality_ready" \
         '{
             warmup: [
-                "wv doctor --agent --json",
-                "wv index . --json",
-                "wv quality scan . --json"
+                ($wv + " doctor --agent --json"),
+                ($wv + " index . --json"),
+                ($wv + " quality scan . --json")
             ],
             code_search: {
-                command: "wv search --code \"<query>\" --json",
+                command: ($wv + " search --code \"<query>\" --json"),
                 ready: $chunks_ready,
                 chunks: $chunks_count,
-                warmup: "wv index . --json"
+                warmup: ($wv + " index . --json")
             },
             index: {
-                command: "wv index . --json",
+                command: ($wv + " index . --json"),
                 ready: $chunks_ready,
                 chunks: $chunks_count
             },
             quality: {
-                command: "wv quality scan . --json",
+                command: ($wv + " quality scan . --json"),
                 ready: $quality_ready
             },
             impact: {
-                command: "wv impact <id> --json --quality",
-                warmup: "wv quality scan . --json"
+                command: ($wv + " impact <id> --json --quality"),
+                warmup: ($wv + " quality scan . --json")
             },
             ast_grep: {
-                command: "wv quality structural-search --pattern=<pattern> --lang=python --json",
+                command: ($wv + " quality structural-search --pattern=<pattern> --lang=python --json"),
                 ready: $ast_grep_ready,
                 path: (if $ast_grep_path != "" then $ast_grep_path else null end),
                 version: (if $ast_grep_version != "" then $ast_grep_version else null end)
@@ -220,8 +234,48 @@ _bootstrap_agent_tools_json() {
         }'
 }
 
+_bootstrap_codex_json() {
+    local wv_command="${1:-wv}"
+    local wv_token telemetry_log telemetry_token
+    wv_token=$(_bootstrap_shell_token "$wv_command")
+    telemetry_log=""
+    if [ -n "${WV_HOT_ZONE:-}" ]; then
+        telemetry_log="${WV_HOT_ZONE%/}/wv_calls.jsonl"
+    fi
+    telemetry_token=$(_bootstrap_shell_token "${telemetry_log:-/tmp/weave-codex-wv-calls.jsonl}")
+
+    jq -n --arg wv "$wv_token" --arg telemetry_log "${telemetry_log:-/tmp/weave-codex-wv-calls.jsonl}" --arg telemetry_token "$telemetry_token" '{
+        mcp: {
+            recommended_scope: "lite",
+            safe_default: "weave-lite",
+            full_scope_warning: "Full Weave MCP can hang in Codex on network/GitHub operations; use CLI commands for privileged work."
+        },
+        telemetry: {
+            call_log: $telemetry_log,
+            scope: "codex-session",
+            durability: "ephemeral hot-zone path; readable/writable inside Codex sandbox",
+            enable_for_command: ("WV_CALL_LOG=" + $telemetry_token + " " + $wv + " <command>"),
+            analyze: ($wv + " analyze sessions --call-stats --log=" + $telemetry_token)
+        },
+        commands: {
+            bootstrap: ($wv + " bootstrap-agent --json"),
+            doctor: ($wv + " doctor --agent --json"),
+            claim: ($wv + " work <id>"),
+            record_edit: ($wv + " touch <id> --files=<path>"),
+            close: ($wv + " ship-agent <id> --learning-file=<path> --verification-method=<cmd> --verification-evidence-file=<path> --json"),
+            local_sync: ($wv + " sync --mode=fast --node=<id>"),
+            github_sync: ($wv + " sync --gh --mode=fast --node=<id>")
+        },
+        network_policy: {
+            mcp: "local/read-only by default",
+            github_sync: "CLI only; request shell network approval when needed",
+            git_push: "CLI only; request shell network/SSH approval when needed"
+        }
+    }'
+}
+
 _bootstrap_agent_info_json() {
-    local wv_command invoked_wv repo_wv db_path python_command wv_provenance readiness_state tools_json
+    local wv_command invoked_wv repo_wv db_path python_command wv_provenance readiness_state tools_json codex_json
     local wv_ready=false db_ready=false python_ready=false command_mismatch=false
 
     wv_command=$(_bootstrap_canonical_wv_path)
@@ -230,7 +284,8 @@ _bootstrap_agent_info_json() {
     db_path=$(canonicalize_runtime_path "${WV_DB:-}")
     python_command=$(_bootstrap_python_command)
     wv_provenance=$(_bootstrap_wv_provenance "$invoked_wv")
-    tools_json=$(_bootstrap_agent_tools_json)
+    tools_json=$(_bootstrap_agent_tools_json "${wv_command:-wv}")
+    codex_json=$(_bootstrap_codex_json "${wv_command:-wv}")
 
     [ -n "$wv_command" ] && [ -x "$wv_command" ] && wv_ready=true
     [ -n "$db_path" ] && [ -f "$db_path" ] && db_ready=true
@@ -259,6 +314,7 @@ _bootstrap_agent_info_json() {
         --arg python_command "$python_command" \
         --arg readiness_state "$readiness_state" \
         --argjson tools "$tools_json" \
+        --argjson codex "$codex_json" \
         --argjson wv_ready "$wv_ready" \
         --argjson db_ready "$db_ready" \
         --argjson python_ready "$python_ready" \
@@ -278,7 +334,8 @@ _bootstrap_agent_info_json() {
                 db_path: $db_ready,
                 python_command: $python_ready
             },
-            tools: $tools
+            tools: $tools,
+            codex: $codex
         } | with_entries(select(.value != null))'
 }
 
@@ -1967,6 +2024,40 @@ _doctor_check_agent_env() {
     fi
 }
 
+_doctor_check_codex_mcp() {
+    if ! command -v codex >/dev/null 2>&1; then
+        _doctor_record "codex mcp" "warn" "codex command not found; skip MCP scope check"
+        return
+    fi
+
+    local mcp_list
+    mcp_list=$(codex mcp list 2>/dev/null || true)
+    if [ -z "$mcp_list" ]; then
+        _doctor_record "codex mcp" "warn" "no Codex MCP registrations detected; optional: wv init-repo --agent=codex --codex-mcp"
+        return
+    fi
+
+    local has_lite has_inspect has_full
+    has_lite=false
+    has_inspect=false
+    has_full=false
+    printf '%s\n' "$mcp_list" | grep -q '^weave-lite[[:space:]]' && has_lite=true
+    printf '%s\n' "$mcp_list" | grep -q '^weave-inspect[[:space:]]' && has_inspect=true
+    printf '%s\n' "$mcp_list" | grep -q '^weave[[:space:]]' && has_full=true
+
+    if [ "$has_full" = true ] && { [ "$has_lite" = true ] || [ "$has_inspect" = true ]; }; then
+        _doctor_record "codex mcp" "warn" "stale full weave MCP still registered alongside lite/inspect; remove it with: codex mcp remove weave"
+    elif [ "$has_lite" = true ]; then
+        _doctor_record "codex mcp" "pass" "weave-lite registered (recommended Codex default)"
+    elif [ "$has_inspect" = true ]; then
+        _doctor_record "codex mcp" "pass" "weave-inspect registered (read-only Codex scope)"
+    elif [ "$has_full" = true ]; then
+        _doctor_record "codex mcp" "warn" "full weave MCP registered; prefer weave-lite/inspect and use CLI for GitHub/network/write operations"
+    else
+        _doctor_record "codex mcp" "warn" "Weave MCP not registered for Codex; optional: wv init-repo --agent=codex --codex-mcp"
+    fi
+}
+
 cmd_hotzone() {
     local subcmd="${1:-}"
     shift || true
@@ -2109,18 +2200,28 @@ _config_env_set() {
         return 1
     fi
     file=$(_config_env_file)
-    mkdir -p "$(dirname "$file")"
-    tmp=$(mktemp)
+    if ! mkdir -p "$(dirname "$file")"; then
+        echo "wv config: cannot create config directory $(dirname "$file")" >&2
+        return 1
+    fi
+    if ! tmp=$(mktemp); then
+        echo "wv config: cannot create temporary config file" >&2
+        return 1
+    fi
     {
         echo "# Weave global knobs — sourced by wv on every invocation (CLI + hooks)."
         echo "# Managed by 'wv config set/enable'."
-    } > "$tmp"
+    } > "$tmp" || { echo "wv config: cannot write temporary config file" >&2; rm -f "$tmp"; return 1; }
     # Carry forward existing assignments except the key being set (and drop old comments).
     if [ -f "$file" ]; then
         grep -vE '^[[:space:]]*#' "$file" 2>/dev/null | grep -vE "^[[:space:]]*${key}=" >> "$tmp" || true
     fi
-    echo "${key}=\"${val}\"" >> "$tmp"
-    mv "$tmp" "$file"
+    echo "${key}=\"${val}\"" >> "$tmp" || { echo "wv config: cannot write temporary config file" >&2; rm -f "$tmp"; return 1; }
+    if ! mv "$tmp" "$file"; then
+        echo "wv config: cannot update $file" >&2
+        rm -f "$tmp"
+        return 1
+    fi
     return 0
 }
 
@@ -2129,9 +2230,16 @@ _config_env_unset() {
     local key="$1" file tmp
     file=$(_config_env_file)
     [ -f "$file" ] || return 0
-    tmp=$(mktemp)
+    if ! tmp=$(mktemp); then
+        echo "wv config: cannot create temporary config file" >&2
+        return 1
+    fi
     grep -vE "^[[:space:]]*${key}=" "$file" > "$tmp" 2>/dev/null || true
-    mv "$tmp" "$file"
+    if ! mv "$tmp" "$file"; then
+        echo "wv config: cannot update $file" >&2
+        rm -f "$tmp"
+        return 1
+    fi
     return 0
 }
 
@@ -3040,6 +3148,7 @@ cmd_doctor() {
 
     if [ "$_dr_agent" = true ]; then
         _doctor_check_agent_env
+        _doctor_check_codex_mcp
     fi
 
     # Summary
@@ -5142,13 +5251,13 @@ cmd_help_topic() {
             print_command_help "wv ship <id> [--learning=\"...\"|--learning-file=PATH] [--verification-method=\"...\"] [--verification-evidence=\"...\"|--verification-evidence-file=PATH] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--gh] [--skip-verification] [--no-overlap-check]" "Close a node and sync graph state in one step; any remaining Git sync is surfaced separately."
             ;;
         ship-agent)
-            print_command_help "wv ship-agent <id> [--learning=\"...\"|--learning-file=PATH] [--verification-method=\"...\"|--verify-method=\"...\"] [--verification-evidence=\"...\"|--verify-evidence=\"...\"|--verification-evidence-file=PATH] [--gh] [--skip-verification] [--no-overlap-check] [--json]" "Run an agent-safe non-interactive ship flow with doctor --agent precheck and JSON output."
+            print_command_help "wv ship-agent <id> [--learning=\"...\"|--learning-file=PATH] [--verification-method=\"...\"|--verify-method=\"...\"] [--verification-evidence=\"...\"|--verify-evidence=\"...\"|--verification-evidence-file=PATH] [--gh] [--no-gh] [--skip-verification] [--no-overlap-check] [--json]" "Run an agent-safe non-interactive ship flow with doctor --agent precheck and JSON output."
             ;;
         batch-done)
-            print_command_help "wv batch-done <id1> <id2> ... [--learning=\"...\"] [--no-warn]" "Close multiple nodes with a shared learning note."
+            print_command_help "wv batch-done <id1> <id2> ... [--learning=\"...\"] [--no-warn] [--no-gh]" "Close multiple nodes with a shared learning note."
             ;;
         work)
-            print_command_help "wv work <id> [--quiet] [--force] [--json] [--allowed-tools=t1,t2,...]" "Claim a node, set WV_ACTIVE for agent context, and optionally persist an allowed tool list."
+            print_command_help "wv work <id> [--quiet] [--force] [--reopen] [--json] [--allowed-tools=t1,t2,...]" "Claim a node, set WV_ACTIVE for agent context, explicitly reopen done nodes, and optionally persist an allowed tool list."
             ;;
         preflight)
             print_command_help "wv preflight <id>" "Return machine-readable blockers, contradictions, and readiness checks for a node."
@@ -5334,7 +5443,7 @@ Commands:
   delete <id>       Permanently remove a node + edges [--force] [--dry-run] [--no-gh]
   done <id>         Mark node complete [--learning="..."] [--no-warn] [auto-closes GH issue]
     ship <id>         Done + sync in one step; Git sync surfaced separately [--learning="..."] [--gh]
-  batch-done        Close multiple nodes [--learning="..."] [--no-warn]
+  batch-done        Close multiple nodes [--learning="..."] [--no-warn] [--no-gh]
   bulk-update       Update multiple nodes from JSON on stdin [--dry-run]
   work <id>         Claim node & set WV_ACTIVE for subagent context [--quiet]
   preflight <id>    Pre-action checks as JSON (blockers, contradictions, context load)

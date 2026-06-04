@@ -137,7 +137,7 @@ Focused CLI help: `wv help <command>` or `wv <command> --help`.
 | `wv touch <id> --intent="..."`     | Zero-output intent update          |
 | `wv help <command>`                | Focused help for one command       |
 | `wv show <id>`                     | View node details                  |
-| `wv list --status=todo`            | List nodes by status               |
+| `wv query status=todo`             | Targeted node lookup               |
 | `wv ready`                         | Show unblocked work                |
 | `wv search "query"`                | Full-text search across nodes      |
 | `wv search --code "query"`         | Hybrid code search (source files)  |
@@ -277,7 +277,7 @@ Returns blockers, ancestors with learnings, related nodes, pitfalls, and contrad
 | `weave_overview`          | `wv status` + `wv health` + `wv ready` | Session start overview                |
 | `weave_bootstrap`         | `wv bootstrap --json`                  | Single-call session context           |
 | `weave_work`              | `wv work`                              | Claim node + return context           |
-| `weave_ship`              | `wv ship`                              | Complete + sync in one step           |
+| `weave_ship`              | `wv ship-agent --no-gh`                | Bounded local close + sync            |
 | `weave_quick`             | `wv quick`                             | Create + close (trivial tasks)        |
 | `weave_add`               | `wv add`                               | Create a new node                     |
 | `weave_done`              | `wv done`                              | Mark complete with learnings          |
@@ -285,7 +285,7 @@ Returns blockers, ancestors with learnings, related nodes, pitfalls, and contrad
 | `weave_update`            | `wv update`                            | Modify node metadata/status/text      |
 | `weave_touch`             | `wv touch`                             | Fire-and-forget metadata or intent    |
 | `weave_delete`            | `wv delete`                            | Remove node permanently (force req.)  |
-| `weave_list`              | `wv list`                              | List nodes with filters               |
+| `weave_list`              | `wv list`                              | Broad node listing; prefer query flow |
 | `weave_show`              | `wv show`                              | Single-node detail view (JSON)        |
 | `weave_search`            | `wv search`                            | Full-text search                      |
 | `weave_context`           | `wv context`                           | Context Pack for a node               |
@@ -303,12 +303,12 @@ Returns blockers, ancestors with learnings, related nodes, pitfalls, and contrad
 | `weave_status`            | `wv status`                            | Status summary                        |
 | `weave_health`            | `wv health`                            | Graph health check                    |
 | `weave_preflight`         | `wv preflight`                         | Pre-action checks for a node          |
-| `weave_sync`              | `wv sync`                              | Persist graph + optional GH sync      |
+| `weave_sync`              | `wv sync`                              | Persist graph; GH sync uses CLI fallback |
 | `weave_resolve`           | `wv resolve`                           | Resolve contradiction between nodes   |
 | `weave_trails`            | `wv trails`                            | Save/show/clear session trails        |
 | `weave_plan`              | `wv plan`                              | Import markdown plan as epic+tasks    |
 | `weave_guide`             | `wv guide`                             | Workflow quick reference              |
-| `weave_close_session`     | `wv sync --gh`                         | End-of-session cleanup                |
+| `weave_close_session`     | `wv sync`                              | Bounded local sync + repo checks      |
 | `weave_quality_scan`      | `wv quality scan`                      | Codebase quality metrics scan         |
 | `weave_quality_hotspots`  | `wv quality hotspots`                  | Ranked hotspot report                 |
 | `weave_quality_diff`      | `wv quality diff`                      | Delta report vs previous scan         |
@@ -430,14 +430,17 @@ Non-code node types (`finding`, `epic`, `session_history`) are never test-gated;
 
 ## Opt-in instrumentation
 
-Two surfaces ship **off** by default. Turn them on through one front door — `wv config` — so you
-never have to memorise an env-var name or a config path. `wv config list` shows current state;
-`wv guide --topic=instrumentation` has the full reference.
+Instrumentation ships **off** by default. CLI features are enabled through one front door —
+`wv config` — so you never have to memorise an env-var name or a config path. MCP server telemetry
+uses an explicit server environment variable because MCP clients own the launched process
+environment. `wv config list` shows current CLI state; `wv guide --topic=instrumentation` has the
+full reference.
 
 | Feature           | Enable                                     | What it does                                                         | Stored in                          |
 | ----------------- | ------------------------------------------ | -------------------------------------------------------------------- | ---------------------------------- |
 | Session analysis  | `wv config enable session-analysis`        | Logs each `wv` call so `wv analyze sessions --call-stats` can report | `~/.config/weave/config.env`       |
 | Verification gate | `wv config enable test-gate [warn\|block]` | Durable `test_gate` for `wv done` (see Verification Gates)           | `.weave/quality.conf [thresholds]` |
+| MCP telemetry     | `WV_MCP_CALL_LOG=/path/to/mcp_calls.jsonl` | Logs MCP tool payload bytes, elapsed ms, scope, and error status     | MCP client/server environment      |
 
 Global knobs live in `~/.config/weave/config.env` (override the dir with `WV_CONFIG_DIR`) and are
 read from disk on **every** invocation — the CLI and harness-spawned hooks alike — so enablement

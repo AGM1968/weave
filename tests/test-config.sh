@@ -87,6 +87,12 @@ assert_eq "14" "$("$WV" config get WV_DELTA_RETAIN_DAYS 2>&1)" "set/get round-tr
 bad=$("$WV" config set notavar 1 2>&1 || true)
 assert_contains "$bad" "invalid key" "set rejects a non-WV_ key"
 
+bad_cfg="$TEST_DIR/not-a-dir"
+printf 'occupied\n' > "$bad_cfg"
+bad=$(WV_CONFIG_DIR="$bad_cfg" "$WV" config enable session-analysis 2>&1 || true)
+assert_contains "$bad" "cannot create config directory" "enable session-analysis reports config directory failure"
+assert_not_contains "$bad" "session-analysis enabled" "enable session-analysis does not report success after config failure"
+
 # ── verification gate (durable quality.conf [thresholds]) ───────────────────
 "$WV" config enable test-gate warn >/dev/null 2>&1
 conf="$TEST_DIR/.weave/quality.conf"

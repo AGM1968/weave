@@ -42,7 +42,8 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { execFileSync, spawnSync } from "child_process";
-import { accessSync, constants } from "fs";
+import { accessSync, appendFileSync, constants, mkdirSync } from "fs";
+import { dirname } from "path";
 
 // --- Scope definitions ---
 // Each scope exposes a subset of tools for context-silo'd subagents.
@@ -153,6 +154,8 @@ const WV_PATH = findWvPath();
 
 // Default timeout for wv commands (30s). Sync handlers override this.
 const WV_TIMEOUT = 30_000;
+const WV_LIFECYCLE_TIMEOUT = 15_000;
+const MCP_ALLOW_NETWORK = process.env.WV_MCP_ALLOW_NETWORK === "1";
 const STATUS_SCHEMA_VALUES = [
   "todo",
   "active",
@@ -229,6 +232,14 @@ function wvHealthJson(timeout: number = WV_TIMEOUT): string {
 
 function wvRead(args: string[], timeout: number = WV_TIMEOUT, mode?: ReadMode): string {
   return wv([...args, `--mode=${mode ?? MCP_READ_MODE}`], timeout);
+}
+
+function mcpNetworkFallback(command: string): string {
+  return [
+    "MCP network/GitHub lifecycle work is disabled by default to keep mounted MCP servers responsive.",
+    `Run from the CLI if needed: ${command}`,
+    "Set WV_MCP_ALLOW_NETWORK=1 in the MCP server environment to allow MCP to run it directly.",
+  ].join("\n");
 }
 
 // Tool definitions
@@ -713,7 +724,7 @@ const TOOLS: Tool[] = [
   {
     name: "weave_ship",
     description:
-      "Complete current work: mark node done with learning and sync graph/GitHub state. Any remaining Git sync is surfaced separately via status, doctor, or recover. Auto-detects GitHub-linked nodes and syncs GH issues. Always include a learning for non-trivial work.",
+      "Complete current work with a bounded local close + sync. GitHub/network sync is disabled by default in MCP; when requested, the response includes the CLI command to run outside MCP unless WV_MCP_ALLOW_NETWORK=1 is set. Always include a learning for non-trivial work.",
     inputSchema: {
       type: "object",
       properties: {
@@ -740,7 +751,8 @@ const TOOLS: Tool[] = [
         },
         gh: {
           type: "boolean",
-          description: "Force GitHub sync (auto-detected if node or parent epic has gh_issue metadata)",
+          description:
+            "Request GitHub sync. In MCP this returns a CLI fallback unless WV_MCP_ALLOW_NETWORK=1 is set.",
         },
         no_overlap_check: {
           type: "boolean",
@@ -829,13 +841,14 @@ const TOOLS: Tool[] = [
   {
     name: "weave_sync",
     description:
-      "Persist graph to disk and optionally sync GitHub issues. Call periodically and before session end. Use mode='fast' for routine close paths (bounded to focus + impacted set), mode='full' for exhaustive reconcile, mode='repair' to resume from .weave/repair-checkpoint.json after a timeout/interrupt (recommended by wv recover and stop-hook).",
+      "Persist graph to disk. GitHub/network sync is disabled by default in MCP; when gh=true, the response includes the CLI command to run outside MCP unless WV_MCP_ALLOW_NETWORK=1 is set. Use mode='fast' for routine close paths, full for exhaustive reconcile, repair after an interrupted run.",
     inputSchema: {
       type: "object",
       properties: {
         gh: {
           type: "boolean",
-          description: "Also sync GitHub issues (default: false)",
+          description:
+            "Request GitHub sync. In MCP this returns a CLI fallback unless WV_MCP_ALLOW_NETWORK=1 is set.",
         },
         mode: {
           type: "string",
@@ -886,13 +899,14 @@ const TOOLS: Tool[] = [
   {
     name: "weave_close_session",
     description:
-      "End-of-session checkup: sync graph, then report uncommitted files, active nodes, and unpushed commits for MCP clients. Pass mode='repair' if the previous sync was interrupted (.weave/repair-checkpoint.json present).",
+      "End-of-session checkup: bounded local sync, repo-status checks, active-node warning, and optional GitHub CLI fallback. Pass mode='repair' if the previous sync was interrupted (.weave/repair-checkpoint.json present).",
     inputSchema: {
       type: "object",
       properties: {
         gh: {
           type: "boolean",
-          description: "Also sync GitHub issues (default: true)",
+          description:
+            "Request GitHub sync. In MCP this returns a CLI fallback unless WV_MCP_ALLOW_NETWORK=1 is set. Default: false.",
         },
         mode: {
           type: "string",
@@ -1364,23 +1378,62 @@ const SCOPED_TOOLS = getToolsForScope(ACTIVE_SCOPE, TOOLS);
 // Logs payload sizes and per-tool call counts to stderr for baseline measurement.
 // Enable with --instrument flag; disable in production.
 const INSTRUMENT = process.argv.includes("--instrument");
+const MCP_CALL_LOG = process.env.WV_MCP_CALL_LOG || "";
 const toolCallCounts = new Map<string, number>();
 const toolPayloadStats = new Map<string, { calls: number; totalBytes: number; maxBytes: number }>();
+let mcpCallLogWarned = false;
 
 function logInstrumentation(msg: string): void {
   if (INSTRUMENT) console.error(`[weave-mcp-instrument] ${msg}`);
 }
 
-function recordPayloadInstrumentation(tool: string, payload: unknown, extra: string[] = []): void {
-  if (!INSTRUMENT) return;
+function extraFields(extra: string[]): Record<string, string | boolean | number> {
+  const fields: Record<string, string | boolean | number> = {};
+  for (const item of extra) {
+    const [key, ...rest] = item.split("=");
+    if (!key || rest.length === 0) continue;
+    const value = rest.join("=");
+    if (value === "true" || value === "false") fields[key] = value === "true";
+    else if (/^-?\d+$/.test(value)) fields[key] = Number(value);
+    else fields[key] = value;
+  }
+  return fields;
+}
+
+function appendMcpCallLog(entry: Record<string, unknown>): void {
+  if (!MCP_CALL_LOG) return;
+  try {
+    mkdirSync(dirname(MCP_CALL_LOG), { recursive: true });
+    appendFileSync(MCP_CALL_LOG, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch (error: unknown) {
+    if (mcpCallLogWarned) return;
+    mcpCallLogWarned = true;
+    const err = error as Error;
+    console.error(`[weave-mcp-instrument] MCP call log disabled: ${err.message}`);
+  }
+}
+
+function recordPayloadInstrumentation(tool: string, payload: unknown, extra: string[] = [], elapsedMs?: number): void {
+  if (!INSTRUMENT && !MCP_CALL_LOG) return;
   const bytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
-  const stats = toolPayloadStats.get(tool) ?? { calls: 0, totalBytes: 0, maxBytes: 0 };
-  stats.calls += 1;
-  stats.totalBytes += bytes;
-  stats.maxBytes = Math.max(stats.maxBytes, bytes);
-  toolPayloadStats.set(tool, stats);
-  const suffix = extra.length > 0 ? ` ${extra.join(" ")}` : "";
-  logInstrumentation(`payload scope=${ACTIVE_SCOPE} tool=${tool} payload_bytes=${bytes}${suffix}`);
+  if (INSTRUMENT) {
+    const stats = toolPayloadStats.get(tool) ?? { calls: 0, totalBytes: 0, maxBytes: 0 };
+    stats.calls += 1;
+    stats.totalBytes += bytes;
+    stats.maxBytes = Math.max(stats.maxBytes, bytes);
+    toolPayloadStats.set(tool, stats);
+    const suffix = extra.length > 0 ? ` ${extra.join(" ")}` : "";
+    logInstrumentation(`payload scope=${ACTIVE_SCOPE} tool=${tool} payload_bytes=${bytes}${suffix}`);
+  }
+  appendMcpCallLog({
+    ts: Date.now() / 1000,
+    source: "mcp",
+    scope: ACTIVE_SCOPE,
+    tool,
+    payload_bytes: bytes,
+    ...(elapsedMs === undefined ? {} : { elapsed_ms: elapsedMs }),
+    ...extraFields(extra),
+  });
 }
 
 if (INSTRUMENT) {
@@ -1484,6 +1537,7 @@ function handleTool(
       if (learning) cmd.push(`--learning=${learning}`);
       if (noWarn) cmd.push("--no-warn");
       if (noOverlapCheck) cmd.push("--no-overlap-check");
+      if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
       result = wv(cmd);
       if (!learning && !decision && !pattern && !pitfall)
         result +=
@@ -1511,6 +1565,7 @@ function handleTool(
       const cmd = ["batch-done", ...ids];
       if (learning) cmd.push(`--learning=${learning}`);
       if (noWarn) cmd.push("--no-warn");
+      if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
       result = wv(cmd);
       break;
     }
@@ -1688,9 +1743,12 @@ function handleTool(
 
       const cmd = ["ship-agent", id, "--json"];
       if (learning) cmd.push(`--learning=${learning}`);
-      if (gh) cmd.push("--gh");
+      const networkFallback = gh && !MCP_ALLOW_NETWORK ? mcpNetworkFallback(`wv sync --gh --mode=fast --node=${id}`) : "";
+      if (gh && MCP_ALLOW_NETWORK) cmd.push("--gh");
+      if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
       if (noOverlapCheck) cmd.push("--no-overlap-check");
-      result = wv(cmd, 60_000); // sync may be slow
+      result = wv(cmd, WV_LIFECYCLE_TIMEOUT);
+      if (networkFallback) result += `\n\n${networkFallback}`;
       break;
     }
 
@@ -1781,7 +1839,12 @@ function handleTool(
         const pf = JSON.parse(preflightJson);
         if (!pf.node_exists) {
           return {
-            content: [{ type: "text", text: `Error: Node ${id} not found. Run \`wv list\` to see available nodes.` }],
+            content: [
+              {
+                type: "text",
+                text: `Error: Node ${id} not found. Use weave_search, weave_ready, or weave_bootstrap to find available nodes.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -1915,10 +1978,12 @@ function handleTool(
       const gh = args.gh as boolean | undefined;
       const mode = args.mode as string | undefined;
       const node = args.node as string | undefined;
-      const cmd = gh ? ["sync", "--gh"] : ["sync"];
+      const networkFallback = gh && !MCP_ALLOW_NETWORK ? mcpNetworkFallback(`wv sync --gh${mode ? ` --mode=${mode}` : ""}${node ? ` --node=${node}` : ""}`) : "";
+      const cmd = gh && MCP_ALLOW_NETWORK ? ["sync", "--gh"] : ["sync"];
       if (mode) cmd.push(`--mode=${mode}`);
       if (node) cmd.push(`--node=${node}`);
-      result = wv(cmd, 60_000); // sync may be slow
+      result = wv(cmd, WV_LIFECYCLE_TIMEOUT);
+      if (networkFallback) result += `\n\n${networkFallback}`;
       break;
     }
 
@@ -1942,15 +2007,18 @@ function handleTool(
     }
 
     case "weave_close_session": {
-      const gh = (args.gh as boolean) ?? true;
+      const gh = (args.gh as boolean) ?? false;
       const mode = args.mode as string | undefined;
       const parts: string[] = [];
 
       // 1. Sync graph (+ optional GH)
       try {
-        const syncCmd = gh ? ["sync", "--gh"] : ["sync"];
+        const syncCmd = gh && MCP_ALLOW_NETWORK ? ["sync", "--gh"] : ["sync"];
         if (mode) syncCmd.push(`--mode=${mode}`);
-        parts.push("=== Sync ===\n" + wv(syncCmd, 60_000));
+        parts.push("=== Sync ===\n" + wv(syncCmd, WV_LIFECYCLE_TIMEOUT));
+        if (gh && !MCP_ALLOW_NETWORK) {
+          parts.push("\n=== GitHub Sync ===\n" + mcpNetworkFallback(`wv sync --gh${mode ? ` --mode=${mode}` : ""}`));
+        }
       } catch (e) {
         parts.push("=== Sync ===\nError: " + (e as Error).message);
       }
@@ -2235,7 +2303,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.54.0",
+      version: "1.54.1",
     },
     {
       capabilities: {
@@ -2246,8 +2314,9 @@ async function main() {
 
   // List available tools (filtered by scope)
   server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const startedAt = Date.now();
     const payload = { tools: SCOPED_TOOLS };
-    recordPayloadInstrumentation("tools/list", payload, [`tools=${SCOPED_TOOLS.length}`]);
+    recordPayloadInstrumentation("tools/list", payload, [`tools=${SCOPED_TOOLS.length}`], Date.now() - startedAt);
     return payload;
   });
 
@@ -2275,9 +2344,10 @@ async function main() {
       logInstrumentation(`call scope=${ACTIVE_SCOPE} tool=${name} count=${count}`);
     }
 
+    const startedAt = Date.now();
     try {
       const response = handleTool(name, (args as Record<string, unknown>) || {});
-      recordPayloadInstrumentation(name, response, [`is_error=${response.isError ? "true" : "false"}`]);
+      recordPayloadInstrumentation(name, response, [`is_error=${response.isError ? "true" : "false"}`], Date.now() - startedAt);
       return response;
     } catch (error: unknown) {
       const err = error as Error;
@@ -2285,7 +2355,7 @@ async function main() {
         content: [{ type: "text", text: `Error: ${err.message}` }],
         isError: true,
       };
-      recordPayloadInstrumentation(name, response, ["is_error=true"]);
+      recordPayloadInstrumentation(name, response, ["is_error=true"], Date.now() - startedAt);
       return response;
     }
   });

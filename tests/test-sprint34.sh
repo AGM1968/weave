@@ -545,6 +545,53 @@ test_duplicate_task_guards() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Test: Explicit done-node reopen
+# ═══════════════════════════════════════════════════════════════════════════
+
+test_explicit_reopen() {
+    echo ""
+    echo "=== Explicit Done-Node Reopen ==="
+
+    setup_test_env
+    $WV init >/dev/null 2>&1
+
+    local id
+    id=$($WV add "Task: reopen fixture" 2>/dev/null | tail -1)
+    $WV done "$id" --learning="fixture for explicit reopen semantics" --no-overlap-check >/dev/null 2>&1
+
+    local update_out
+    update_out=$($WV update "$id" --status=active 2>&1 || true)
+    assert_contains "$update_out" "cannot reopen a done node with update" "reopen: update --status=active rejects done node"
+
+    local status_after_update
+    status_after_update=$(sqlite3 "$WV_DB" "SELECT status FROM nodes WHERE id='$id';" 2>/dev/null)
+    assert_equals "done" "$status_after_update" "reopen: rejected update leaves node done"
+
+    local work_out
+    work_out=$($WV work "$id" 2>&1 || true)
+    assert_contains "$work_out" "use 'wv work $id --reopen'" "reopen: plain work rejects done node"
+
+    local log_file="$TEST_DIR/reopen-events.jsonl"
+    local config_dir="$TEST_DIR/config"
+    mkdir -p "$config_dir"
+    printf 'WV_CALL_LOG="%s"\n' "$log_file" > "$config_dir/config.env"
+    WV_CONFIG_DIR="$config_dir" $WV work "$id" --reopen >/dev/null 2>&1
+
+    local status_after_reopen
+    status_after_reopen=$(sqlite3 "$WV_DB" "SELECT status FROM nodes WHERE id='$id';" 2>/dev/null)
+    assert_equals "active" "$status_after_reopen" "reopen: work --reopen moves node active"
+
+    local reopened_at
+    reopened_at=$(sqlite3 "$WV_DB" "SELECT json_extract(metadata, '$.reopened_at') FROM nodes WHERE id='$id';" 2>/dev/null)
+    assert_contains "$reopened_at" "T" "reopen: work --reopen records reopen metadata"
+
+    local log_out
+    log_out=$(cat "$log_file" 2>/dev/null || true)
+    assert_contains "$log_out" '"cmd":"wv work"' "reopen: telemetry records explicit work command"
+    assert_contains "$log_out" '"event":"reopen_done_node"' "reopen: telemetry records Pattern E event"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Test: Learning quality scoring
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1083,6 +1130,7 @@ main() {
     test_plan_edges
     test_aliases
     test_duplicate_task_guards
+    test_explicit_reopen
     test_learning_hygiene
     test_health_history
     test_session_summary
