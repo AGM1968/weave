@@ -5050,6 +5050,13 @@ Three surfaces:
   post-commit  runs deferred slow suites + records (advisory, never blocks)
   wv done      reads recorded signals; owns the gate (nodes_policy_check trigger)
 
+Pre-commit pytest behavior:
+  If tests/weave_quality/ or tests/weave_indexer/ exists, the hook runs those
+  optional focused pytest dirs for staged Python changes. Consumer repos are not
+  required to create them; absent dirs are skipped. Repo-local tests should be
+  exposed through .weave/test-map.conf as shell suites, e.g.
+    src/auth/ee_auth.py = scripts/run-unit-tests.sh
+
 Policy gates (rows in policy_thresholds; enforced only for files in node_files,
 quality_exempt paths always skipped):
   mccabe_max[_lang]   block if a touched file's max function CC exceeds the limit

@@ -29,6 +29,7 @@ For a quick close: `wv ship <id> --learning="..."` (done + sync, still requires 
 ## Operating rules
 
 - **No edits without an active node.** `wv status` shows 0 active -> `wv work <id>` first.
+- **Reopening a done node:** `wv work <id> --reopen` (plain `wv work` errors on done nodes).
 - Discovery before claiming may read, search, and report only.
 - **Claim before creating.** `wv search "<topic>"` before `wv add` to avoid duplicates.
 - **Set criteria+risks at creation time**, not reactively at claim time.

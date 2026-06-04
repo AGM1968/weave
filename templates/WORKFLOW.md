@@ -35,15 +35,15 @@ exists; if the hook was not installed, add the trailer manually or run
 | Command                    | What it does                                                           | Key flags                                                                       |
 | -------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `wv ready`                 | List unblocked work                                                    | `--json`, `--count`                                                             |
-| `wv work <id>`             | Claim node (sets active)                                               |                                                                                 |
+| `wv work <id>`             | Claim node (sets active); use `--reopen` for done nodes                | `[--reopen]` to explicitly reopen a done node back to tracked work              |
 | `wv add "<text>"`          | Create node                                                            | `--gh`, `--status=`, `--parent=`, `--alias=`, `--standalone`                    |
 | `wv done <id>`             | Complete node (auto-closes linked GH issue)                            | `--learning="..."`, `--no-overlap-check`, `--no-gh`                             |
-| `wv ship <id>`             | Done + sync in one step; pending Git sync is surfaced separately       | `--learning="..."`, `--gh`, `--no-overlap-check`                                |
+| `wv ship <id>`             | Done + sync in one step; pending Git sync is surfaced separately       | `--learning="..."`, `--no-gh`, `--no-overlap-check`                             |
 | `wv update <id>`           | Modify node                                                            | `--status=`, `--text=`, `--alias=`, `--metadata=`, `--metadata-file=`, `--echo` |
 | `wv overview`              | Compact graph/session snapshot                                         | `--json`                                                                        |
 | `wv help <command>`        | Focused help for one command                                           | Also available as `wv <command> --help`                                         |
 | `wv bootstrap`             | Session-start composite: status + active + context + ready + learnings | `--json` (run-cached, 45s TTL)                                                  |
-| `wv touch`                 | Fire-and-forget intent write (zero stdout)                             | `--intent="TEXT"`                                                               |
+| `wv touch`                 | Fire-and-forget intent write (zero stdout)                             | `--intent="TEXT"`, `--files=path1,path2` (record edited paths in node_files)    |
 | `wv quick "<text>"`        | Track trivial work (create active → commit → done)                     | `--learning="..."`                                                              |
 | `wv show <id>`             | Node details + blockers                                                | `--json`                                                                        |
 | `wv list`                  | All non-done nodes                                                     | `--all`, `--status=`, `--json`                                                  |
@@ -217,6 +217,10 @@ archive/            # directory prefix (trailing / required)
 After editing `.weave/quality.conf`, run `wv load` to sync exemptions into the live DB, then retry
 `wv done`. The `WV_REQUIRE_QUALITY=0` env var bypasses the refresh functions only — the DB
 constraint still fires; use the conf file instead.
+
+**Per-developer override** (gitignored, never shared): `.weave/quality.local.conf` is loaded after
+`.weave/quality.conf` and lets you suppress `warn`-level gates locally without touching the shared
+config. Team-wide `test_gate=2` (block) gates cannot be downgraded by the local layer.
 
 ## Repair Workflow
 

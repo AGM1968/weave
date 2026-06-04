@@ -126,11 +126,18 @@ if [ -n "$STAGED_PY_FILES" ]; then
         PYTHON3=$(command -v python3 2>/dev/null || echo "")
     fi
     if [ -n "$PYTHON3" ] && "$PYTHON3" -c "import pytest" >/dev/null 2>&1; then
-        hook_progress "running focused pytest checks for staged Python changes..."
-        if ! "$PYTHON3" -m pytest "$REPO_ROOT/tests/weave_quality" "$REPO_ROOT/tests/weave_indexer" -q --tb=short 2>&1; then
-            echo "" >&2
-            echo "✗ pytest tests failed — fix before committing." >&2
-            exit 1
+        _pc_pytest_dirs=""
+        for _pc_dir in "$REPO_ROOT/tests/weave_quality" "$REPO_ROOT/tests/weave_indexer"; do
+            [ -d "$_pc_dir" ] && _pc_pytest_dirs="${_pc_pytest_dirs}${_pc_pytest_dirs:+ }$_pc_dir"
+        done
+        if [ -n "$_pc_pytest_dirs" ]; then
+            hook_progress "running focused pytest checks for staged Python changes..."
+            # shellcheck disable=SC2086
+            if ! "$PYTHON3" -m pytest $_pc_pytest_dirs -q --tb=short 2>&1; then
+                echo "" >&2
+                echo "✗ pytest tests failed — fix before committing." >&2
+                exit 1
+            fi
         fi
     fi
 fi

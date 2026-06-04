@@ -149,8 +149,13 @@ assert_file_exists "$REPO/.claude/settings.json"            "creates .claude/set
 assert_file_exists "$REPO/CLAUDE.md"                        "copies CLAUDE.md from template"
 assert_file_exists "$REPO/.claude/settings.local.json"      "creates settings.local.json"
 assert_file_exists "$REPO/.weave/runtime.md"                "creates .weave/runtime.md scaffold"
+assert_file_exists "$REPO/.git/hooks/pre-commit"            "installs actual pre-commit hook entrypoint"
+assert_file_exists "$REPO/.git/hooks/post-commit"           "installs actual post-commit hook entrypoint"
+assert_file_exists "$REPO/.git/hooks/prepare-commit-msg"    "installs actual prepare-commit-msg hook entrypoint"
+assert_file_absent "$REPO/.git/hooks/pre-commit-weave.sh"   "does not install source filename as git hook entrypoint"
 assert_contains "$(cat "$REPO/.weave/runtime.md")" "Agent Runtime Notes" "runtime.md includes agent runtime notes"
 assert_contains "$(cat "$REPO/.weave/runtime.md")" "/tmp/weave-codex-*" "runtime.md documents Codex hot zone"
+assert_contains "$(cat "$REPO/.git/hooks/pre-commit")" "_pc_pytest_dirs" "pre-commit hook has optional pytest-dir guard"
 assert_contains "$(cat "$REPO/.gitignore")" ".weave/.context_policy" "adds .weave/.context_policy to .gitignore"
 assert_contains "$OUTPUT" "Weave"                           "output mentions Weave"
 

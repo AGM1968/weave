@@ -225,45 +225,45 @@ Optional local additions if you want stricter scope isolation:
 
 ### Session scope — workflow lifecycle (12 tools)
 
-| Tool                  | Description                                                                                                          | Required params |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------- | --------------- |
-| `weave_work`          | Claim a node, sets WV_ACTIVE for subagent inheritance                                                                | `id`            |
-| `weave_ready`         | List unblocked nodes ready to claim                                                                                  | —               |
-| `weave_ship`          | Bounded local close + sync. GitHub sync is returned as a CLI fallback unless explicitly enabled. Same learning merge as `weave_done` | `id`            |
-| `weave_recover`       | Resume incomplete ship/sync/delete operations                                                                        | —               |
-| `weave_quick`         | Quick-add a node and immediately start working on it                                                                 | `text`          |
-| `weave_overview`      | Status + health + context policy + ready work                                                                        | —               |
-| `weave_bootstrap`     | Single-call session snapshot: status + context + ready + learnings                                                   | —               |
-| `weave_trails`        | Save, show, or clear session trails (append-only handoff notes)                                                      | —               |
-| `weave_plan`          | Import markdown plan as epic + tasks with GH issues                                                                  | `file`          |
-| `weave_close_session` | Bounded local sync + repo-status check + unpushed commit/active-node warnings                                        | —               |
-| `weave_edit_guard`    | Pre-edit guard: require an active node before edits                                                                  | —               |
+| Tool                  | Description                                                                                                                                    | Required params |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
+| `weave_work`          | Claim a node, sets WV_ACTIVE for subagent inheritance. Pass `reopen=true` to reopen a done node — omitting it on a done node returns an error. | `id`            |
+| `weave_ready`         | List unblocked nodes ready to claim                                                                                                            | —               |
+| `weave_ship`          | Bounded local close + sync. GitHub sync is returned as a CLI fallback unless explicitly enabled. Same learning merge as `weave_done`           | `id`            |
+| `weave_recover`       | Resume incomplete ship/sync/delete operations                                                                                                  | —               |
+| `weave_quick`         | Quick-add a node and immediately start working on it                                                                                           | `text`          |
+| `weave_overview`      | Status + health + context policy + ready work                                                                                                  | —               |
+| `weave_bootstrap`     | Single-call session snapshot: status + context + ready + learnings                                                                             | —               |
+| `weave_trails`        | Save, show, or clear session trails (append-only handoff notes)                                                                                | —               |
+| `weave_plan`          | Import markdown plan as epic + tasks with GH issues                                                                                            | `file`          |
+| `weave_close_session` | Bounded local sync + repo-status check + unpushed commit/active-node warnings                                                                  | —               |
+| `weave_edit_guard`    | Pre-edit guard: require an active node before edits                                                                                            | —               |
 
 ### Inspect scope — read-only queries (21 tools)
 
-| Tool                      | Description                                            | Required params |
-| ------------------------- | ------------------------------------------------------ | --------------- |
-| `weave_context`           | Full Context Pack: node details, blockers, ancestors   | —               |
-| `weave_search`            | Full-text search across nodes (supports stemming)      | `query`         |
-| `weave_query`             | Structured node query by status, type, or metadata     | —               |
-| `weave_tree`              | View epic hierarchy as a tree (JSON output)            | —               |
-| `weave_learnings`         | Query captured learnings (patterns/decisions/pitfalls) | —               |
-| `weave_status`            | Compact summary: active work, ready count, blocked     | —               |
-| `weave_ready`             | List unblocked nodes ready to claim                    | —               |
-| `weave_health`            | Graph health check with score and issues               | —               |
-| `weave_preflight`         | Pre-work validation: blockers, context, readiness      | `id`            |
-| `weave_bootstrap`         | Single-call session snapshot for read-only clients     | —               |
+| Tool                      | Description                                                     | Required params |
+| ------------------------- | --------------------------------------------------------------- | --------------- |
+| `weave_context`           | Full Context Pack: node details, blockers, ancestors            | —               |
+| `weave_search`            | Full-text search across nodes (supports stemming)               | `query`         |
+| `weave_query`             | Structured node query by status, type, or metadata              | —               |
+| `weave_tree`              | View epic hierarchy as a tree (JSON output)                     | —               |
+| `weave_learnings`         | Query captured learnings (patterns/decisions/pitfalls)          | —               |
+| `weave_status`            | Compact summary: active work, ready count, blocked              | —               |
+| `weave_ready`             | List unblocked nodes ready to claim                             | —               |
+| `weave_health`            | Graph health check with score and issues                        | —               |
+| `weave_preflight`         | Pre-work validation: blockers, context, readiness               | `id`            |
+| `weave_bootstrap`         | Single-call session snapshot for read-only clients              | —               |
 | `weave_sync`              | Persist graph to disk; GitHub sync uses CLI fallback by default | —               |
-| `weave_guide`             | Quick reference by workflow topic                      | —               |
-| `weave_show`              | Single-node detail view (JSON output)                  | `id`            |
-| `weave_quality_scan`      | Codebase quality metrics scan (60s timeout)            | —               |
-| `weave_quality_hotspots`  | Ranked hotspot report with limit and threshold         | —               |
-| `weave_quality_diff`      | Delta report vs previous scan                          | —               |
-| `weave_quality_functions` | Per-function CC report with dispatch tagging           | —               |
-| `weave_quality_patterns`  | Structural pattern scan/list (requires ast-grep)       | —               |
-| `weave_structural_search` | Structural code search via ast-grep patterns           | `pattern`       |
-| `weave_code_search`       | Semantic code search via local index                   | `query`         |
-| `weave_index`             | Build or update the local code search index            | —               |
+| `weave_guide`             | Quick reference by workflow topic                               | —               |
+| `weave_show`              | Single-node detail view (JSON output)                           | `id`            |
+| `weave_quality_scan`      | Codebase quality metrics scan (60s timeout)                     | —               |
+| `weave_quality_hotspots`  | Ranked hotspot report with limit and threshold                  | —               |
+| `weave_quality_diff`      | Delta report vs previous scan                                   | —               |
+| `weave_quality_functions` | Per-function CC report with dispatch tagging                    | —               |
+| `weave_quality_patterns`  | Structural pattern scan/list (requires ast-grep)                | —               |
+| `weave_structural_search` | Structural code search via ast-grep patterns                    | `pattern`       |
+| `weave_code_search`       | Semantic code search via local index                            | `query`         |
+| `weave_index`             | Build or update the local code search index                     | —               |
 
 ## Development
 
@@ -302,22 +302,23 @@ plus targeted code review as the fallback signal.
 
 ## Environment Variables
 
-| Variable          | Description                                   | Default             |
-| ----------------- | --------------------------------------------- | ------------------- |
-| `WV_PATH`         | Path to wv CLI binary                         | Auto-detected       |
-| `WV_PROJECT_ROOT` | Repo root passed to MCP-spawned `wv` commands | Current process cwd |
-| `WV_ACTIVE`       | Active node ID (inherited by tools)           | —                   |
-| `WV_MCP_CALL_LOG` | JSONL sink for per-response MCP telemetry     | Disabled            |
-| `WV_MCP_ALLOW_NETWORK` | Allow MCP lifecycle tools to run GitHub/network sync directly (`1` = enabled) | Disabled |
+| Variable               | Description                                                                   | Default             |
+| ---------------------- | ----------------------------------------------------------------------------- | ------------------- |
+| `WV_PATH`              | Path to wv CLI binary                                                         | Auto-detected       |
+| `WV_PROJECT_ROOT`      | Repo root passed to MCP-spawned `wv` commands                                 | Current process cwd |
+| `WV_ACTIVE`            | Active node ID (inherited by tools)                                           | —                   |
+| `WV_MCP_CALL_LOG`      | JSONL sink for per-response MCP telemetry                                     | Disabled            |
+| `WV_MCP_ALLOW_NETWORK` | Allow MCP lifecycle tools to run GitHub/network sync directly (`1` = enabled) | Disabled            |
 
 `--instrument` prints payload and call summaries to stderr for local debugging.
 `WV_MCP_CALL_LOG=/path/to/mcp_calls.jsonl` persists each MCP response as JSONL with `source=mcp`,
 tool name, scope, payload bytes, elapsed ms, and response metadata.
 
 MCP lifecycle tools keep the mounted server responsive by default: `weave_done`, `weave_batch_done`,
-and `weave_ship` close locally with `--no-gh`, while `weave_sync` and `weave_close_session` run local
-sync only. When GitHub sync is requested, the response includes the CLI command to run outside MCP.
-Set `WV_MCP_ALLOW_NETWORK=1` only for MCP clients where long GitHub/network calls are acceptable.
+and `weave_ship` close locally with `--no-gh`, while `weave_sync` and `weave_close_session` run
+local sync only. When GitHub sync is requested, the response includes the CLI command to run outside
+MCP. Set `WV_MCP_ALLOW_NETWORK=1` only for MCP clients where long GitHub/network calls are
+acceptable.
 
 ## Agent Pairing
 

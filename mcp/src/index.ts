@@ -709,13 +709,19 @@ const TOOLS: Tool[] = [
   },
   {
     name: "weave_work",
-    description: "Claim a node to work on. Sets WV_ACTIVE context for subagent inheritance.",
+    description:
+      "Claim a node to work on. Sets WV_ACTIVE context for subagent inheritance. Use reopen=true to explicitly reopen a done node back to active tracked work — without it, calling weave_work on a done node returns an error.",
     inputSchema: {
       type: "object",
       properties: {
         id: {
           type: "string",
           description: "Node ID to claim (e.g., wv-a1b2)",
+        },
+        reopen: {
+          type: "boolean",
+          description:
+            "Reopen a done node back to active tracked work. Required when the node status is 'done' — omitting it returns an error.",
         },
       },
       required: ["id"],
@@ -751,8 +757,7 @@ const TOOLS: Tool[] = [
         },
         gh: {
           type: "boolean",
-          description:
-            "Request GitHub sync. In MCP this returns a CLI fallback unless WV_MCP_ALLOW_NETWORK=1 is set.",
+          description: "Request GitHub sync. In MCP this returns a CLI fallback unless WV_MCP_ALLOW_NETWORK=1 is set.",
         },
         no_overlap_check: {
           type: "boolean",
@@ -847,8 +852,7 @@ const TOOLS: Tool[] = [
       properties: {
         gh: {
           type: "boolean",
-          description:
-            "Request GitHub sync. In MCP this returns a CLI fallback unless WV_MCP_ALLOW_NETWORK=1 is set.",
+          description: "Request GitHub sync. In MCP this returns a CLI fallback unless WV_MCP_ALLOW_NETWORK=1 is set.",
         },
         mode: {
           type: "string",
@@ -1717,7 +1721,10 @@ function handleTool(
 
     case "weave_work": {
       const id = args.id as string;
-      result = wv(["work", id]);
+      const reopen = args.reopen as boolean | undefined;
+      const cmd = ["work", id];
+      if (reopen) cmd.push("--reopen");
+      result = wv(cmd);
       break;
     }
 
@@ -1743,7 +1750,8 @@ function handleTool(
 
       const cmd = ["ship-agent", id, "--json"];
       if (learning) cmd.push(`--learning=${learning}`);
-      const networkFallback = gh && !MCP_ALLOW_NETWORK ? mcpNetworkFallback(`wv sync --gh --mode=fast --node=${id}`) : "";
+      const networkFallback =
+        gh && !MCP_ALLOW_NETWORK ? mcpNetworkFallback(`wv sync --gh --mode=fast --node=${id}`) : "";
       if (gh && MCP_ALLOW_NETWORK) cmd.push("--gh");
       if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
       if (noOverlapCheck) cmd.push("--no-overlap-check");
@@ -1978,7 +1986,10 @@ function handleTool(
       const gh = args.gh as boolean | undefined;
       const mode = args.mode as string | undefined;
       const node = args.node as string | undefined;
-      const networkFallback = gh && !MCP_ALLOW_NETWORK ? mcpNetworkFallback(`wv sync --gh${mode ? ` --mode=${mode}` : ""}${node ? ` --node=${node}` : ""}`) : "";
+      const networkFallback =
+        gh && !MCP_ALLOW_NETWORK
+          ? mcpNetworkFallback(`wv sync --gh${mode ? ` --mode=${mode}` : ""}${node ? ` --node=${node}` : ""}`)
+          : "";
       const cmd = gh && MCP_ALLOW_NETWORK ? ["sync", "--gh"] : ["sync"];
       if (mode) cmd.push(`--mode=${mode}`);
       if (node) cmd.push(`--node=${node}`);
@@ -2303,7 +2314,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.54.1",
+      version: "1.54.2",
     },
     {
       capabilities: {
@@ -2347,7 +2358,12 @@ async function main() {
     const startedAt = Date.now();
     try {
       const response = handleTool(name, (args as Record<string, unknown>) || {});
-      recordPayloadInstrumentation(name, response, [`is_error=${response.isError ? "true" : "false"}`], Date.now() - startedAt);
+      recordPayloadInstrumentation(
+        name,
+        response,
+        [`is_error=${response.isError ? "true" : "false"}`],
+        Date.now() - startedAt
+      );
       return response;
     } catch (error: unknown) {
       const err = error as Error;

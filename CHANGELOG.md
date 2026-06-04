@@ -4,20 +4,50 @@
 
 ## Unreleased
 
+## [1.54.2] - 2026-06-04
+
+### Fixed
+
+- **`wv work --reopen` now documented across all consumer surfaces.** The 1.54.1 behavior change
+  that made done-node reopen explicit (`wv work <id> --reopen`) was not reflected in any
+  consumer-facing document. `WORKFLOW.md`, `AGENTS.md.template`, the `wv-init-repo` AGENTS.md stub,
+  and `.claude/agents/AGENTS.md` now all document the flag with the exact error message agents
+  receive when they omit it.
+- **`weave_work` MCP tool exposes `reopen` parameter.** The MCP tool previously had no way to reopen
+  a done node — calling `weave_work` on a done node returned an error with no recovery path. The
+  `reopen` boolean parameter is now wired through to `wv work --reopen`, and the tool description
+  explains when it is required.
+- **`WORKFLOW.md` command table corrections.** `wv ship` key flags updated from `--gh` to `--no-gh`
+  (the agent-safe default since 1.54.1); `wv touch` gains `--files=path1,path2` (new in 1.54.0 for
+  explicit `node_files` attribution); `wv work` gains `[--reopen]` in the key flags column.
+- **`quality.local.conf` documented in the Quality Gate section of `WORKFLOW.md`.** The
+  per-developer gitignored override layer (new in 1.54.0) was absent from agent-facing docs; agents
+  had no way to discover it without reading source.
+- **`Makefile.template` `wv-close` no longer uses `--no-verify`.** The flag was redundant
+  (`.weave/`-only commits pass the pre-commit hook without it) and inconsistent with Rule 9 ("no
+  hook bypass").
+- **Consumer pre-commit hook no longer requires Weave fixture pytest dirs.** Staged Python commits
+  now run optional focused pytest directories only when `tests/weave_quality/` or
+  `tests/weave_indexer/` exists; consumer repos should route their own suites through
+  `.weave/test-map.conf`.
+- **`wv init-repo --update` refreshes the actual Git hook entrypoints.** Hook installation now
+  writes `pre-commit`, `post-commit`, and `prepare-commit-msg` from the managed `*-weave.sh` sources
+  instead of leaving stale Git entrypoints behind.
+
 ## [1.54.1] - 2026-06-04
 
 ### Added
 
 - **Persistent MCP telemetry JSONL.** Set `WV_MCP_CALL_LOG=/path/to/mcp_calls.jsonl` to persist
   per-response MCP telemetry with `source=mcp`, tool name, scope, payload bytes, elapsed ms, and
-  response metadata. This complements the existing `--instrument` stderr summary and lets Codex,
-  VS Code, and other MCP clients be measured across sessions.
+  response metadata. This complements the existing `--instrument` stderr summary and lets Codex, VS
+  Code, and other MCP clients be measured across sessions.
 
 ### Changed
 
-- **Agent graph-discovery guidance now favors targeted readers.** MCP recovery text and
-  agent-facing command references now point at `weave_bootstrap`, `weave_search`, `weave_ready`,
-  `wv status`, and `wv query` before broad `wv list` scans.
+- **Agent graph-discovery guidance now favors targeted readers.** MCP recovery text and agent-facing
+  command references now point at `weave_bootstrap`, `weave_search`, `weave_ready`, `wv status`, and
+  `wv query` before broad `wv list` scans.
 - **Codex readiness setup is more portable and explicit.** `wv init-repo` and related readiness
   surfaces now prefer repo-local wrappers where needed and make Codex MCP registration state easier
   to inspect instead of relying on host-specific command availability.
@@ -28,8 +58,8 @@
   the safe command contract, `.codex/weave.json` expectations, and actionable registration warnings
   before agents enter a write workflow.
 - **Sandbox-safe Codex telemetry configuration.** MCP telemetry paths now favor writable sandbox
-  locations, and configuration failures are reported directly instead of implying instrumentation was
-  enabled when the client could not write the requested state.
+  locations, and configuration failures are reported directly instead of implying instrumentation
+  was enabled when the client could not write the requested state.
 - **Codex-safe MCP lifecycle defaults.** MCP close/sync tools now avoid GitHub/network work by
   default so mounted Codex MCP servers do not get monopolized by long lifecycle calls. `weave_done`,
   `weave_batch_done`, and `weave_ship` pass `--no-gh` unless `WV_MCP_ALLOW_NETWORK=1` is set;
@@ -41,9 +71,9 @@
   and `mcp/README.md` now describe bounded local MCP close/sync behavior, CLI fallback for GitHub
   sync, and the explicit `WV_MCP_ALLOW_NETWORK=1` opt-in for clients where long network calls are
   acceptable.
-- **Workflow-surface regression coverage for Codex-safe MCP.** `tests/test-workflow-surfaces.sh`
-  now asserts the network opt-in, default `--no-gh`, and `wv sync --gh` CLI-fallback contract so the
-  MCP lifecycle guidance cannot drift from the implementation.
+- **Workflow-surface regression coverage for Codex-safe MCP.** `tests/test-workflow-surfaces.sh` now
+  asserts the network opt-in, default `--no-gh`, and `wv sync --gh` CLI-fallback contract so the MCP
+  lifecycle guidance cannot drift from the implementation.
 - **Bash workflow-suite harness stabilized.** The shell regression suites now cover the Codex
   readiness and telemetry contracts with corrected id parsing, safer here-string handling under
   `pipefail`, and clearer diagnosis for long-running parallel/core test batches.
@@ -60,15 +90,15 @@
 - **Unified query reader proposal brought current.** `PROPOSAL-wv-query-unified-reader.md` and the
   proposal index now distinguish shipped Phase 2a query/search parity from pending Phase 2b reader
   wrappers. Query Phase 2 is no longer a Rust readiness blocker; telemetry core is documented as
-  `WV_CALL_LOG` session analysis, while query-specific `_telemetry` helpers remain optional follow-up
-  work.
+  `WV_CALL_LOG` session analysis, while query-specific `_telemetry` helpers remain optional
+  follow-up work.
 
 ### Fixed
 
 - **Done-node reopen is explicit.** `wv update --status=active` and plain `wv work <done-id>` no
-  longer reopen completed nodes. Follow-on edits must use `wv work <done-id> --reopen`, which records
-  the intentional conversion back to tracked work and emits Pattern E telemetry when call logging is
-  enabled.
+  longer reopen completed nodes. Follow-on edits must use `wv work <done-id> --reopen`, which
+  records the intentional conversion back to tracked work and emits Pattern E telemetry when call
+  logging is enabled.
 - **Query Phase 2 test assertions are literal-safe.** `tests/test-query.sh` now uses literal
   contains checks for option-like strings, preventing grep option parsing from making `--code`
   separation assertions pass or fail for the wrong reason.

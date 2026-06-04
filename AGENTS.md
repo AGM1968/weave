@@ -9,6 +9,9 @@ Use `wv` when it is on PATH; otherwise use the repo-local `./scripts/wv` wrapper
 `wv add "<text>" --status=active --criteria="c1|c2" --risks=low`. If `wv status` shows 0 active
 nodes, do not edit files. Discovery before claiming may read, search, and report only.
 
+To reopen a previously completed node: `wv work <id> --reopen` (plain `wv work` on a done node
+returns an error).
+
 ## Quick reference
 
 ```txt

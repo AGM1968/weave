@@ -416,6 +416,10 @@ running your suites itself. At close, each touched file is **green** (recorded p
 **red** (recorded fail), **stale** (changed since the run), or **unknown** (no record — never
 blocks). Levels: `0` off · `1` warn (advisory) · `2` block.
 
+For staged Python files, pre-commit also runs optional focused pytest dirs when present:
+`tests/weave_quality/` and `tests/weave_indexer/`. Consumer repos do not need to create those dirs;
+repo-local suites should be routed through `.weave/test-map.conf` instead.
+
 Enable durably with `wv config enable test-gate warn` (or `block`), which writes a `[thresholds]`
 section to `.weave/quality.conf` (re-applied on every `wv load`, so it survives reboots — a raw
 `sqlite3` change does not, and `wv doctor` flags that case):

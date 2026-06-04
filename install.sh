@@ -217,10 +217,11 @@ download_file() {
 install_git_hook_from_repo() {
     local hook_path="$1"
     local marker="$2"
-    local label="$3"
-    local hook_name
+    local hook_name="${3:-}"
+    local hook_src_name
     local action="installed"
-    hook_name=$(basename "$hook_path")
+    hook_src_name=$(basename "$hook_path")
+    [ -n "$hook_name" ] || hook_name="$hook_src_name"
 
     if [ ! -d "$HOOK_DIR" ]; then
         return 0
@@ -231,19 +232,19 @@ install_git_hook_from_repo() {
         if grep -q "$marker" "$hook_dst" 2>/dev/null; then
             action="updated"
         else
-            echo -e "  ${YELLOW}⊘${NC} $label (custom hook exists, skipped)"
+            echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (custom hook exists, skipped)"
             return 0
         fi
     fi
 
-    local lib_hook="${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks/$hook_name"
+    local lib_hook="${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks/$hook_src_name"
     if [ -f "$hook_path" ]; then
         cp "$hook_path" "$hook_dst"
     elif [ -f "$lib_hook" ]; then
         cp "$lib_hook" "$hook_dst"
     else
         local repo_base="${REPO:-https://raw.githubusercontent.com/AGM1968/weave/main}"
-        curl -sSL "$repo_base/scripts/hooks/$hook_name" -o "$hook_dst"
+        curl -sSL "$repo_base/scripts/hooks/$hook_src_name" -o "$hook_dst"
     fi
     chmod +x "$hook_dst"
     echo -e "  ${GREEN}✓${NC} .git/hooks/$hook_name ($action)"
@@ -725,10 +726,11 @@ WV_BIN="$WV_BIN_DIR/wv"
 install_git_hook_from_repo() {
     local hook_path="$1"
     local marker="$2"
-    local label="$3"
-    local hook_name
+    local hook_name="${3:-}"
+    local hook_src_name
     local action="installed"
-    hook_name=$(basename "$hook_path")
+    hook_src_name=$(basename "$hook_path")
+    [ -n "$hook_name" ] || hook_name="$hook_src_name"
 
     if [ ! -d "$HOOK_DIR" ]; then
         return 0
@@ -739,19 +741,19 @@ install_git_hook_from_repo() {
         if grep -q "$marker" "$hook_dst" 2>/dev/null; then
             action="updated"
         else
-            echo -e "  ${YELLOW}⊘${NC} $label (custom hook exists, skipped)"
+            echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (custom hook exists, skipped)"
             return 0
         fi
     fi
 
-    local lib_hook="${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks/$hook_name"
+    local lib_hook="${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks/$hook_src_name"
     if [ -f "$hook_path" ]; then
         cp "$hook_path" "$hook_dst"
     elif [ -f "$lib_hook" ]; then
         cp "$lib_hook" "$hook_dst"
     else
         local repo_base="${REPO:-https://raw.githubusercontent.com/AGM1968/weave/main}"
-        curl -sSL "$repo_base/scripts/hooks/$hook_name" -o "$hook_dst"
+        curl -sSL "$repo_base/scripts/hooks/$hook_src_name" -o "$hook_dst"
     fi
     chmod +x "$hook_dst"
     echo -e "  ${GREEN}✓${NC} .git/hooks/$hook_name ($action)"
@@ -1099,6 +1101,7 @@ Shortcut: `wv ship <id> --learning="..."` (done + sync; still requires push afte
 ## Operating rules
 
 - No edits without an active node — `wv work <id>` first if `wv status` shows 0 active.
+- To reopen a done node: `wv work <id> --reopen` (plain `wv work` errors on done nodes).
 - Discovery before claiming may read, search, and report only.
 - `wv search "<topic>"` before `wv add` to avoid duplicates.
 - Set `--criteria=` and `--risks=` at creation time, not reactively at claim time.

@@ -1009,6 +1009,25 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "git pre-commit: cmd-only change exits 0 without running test-core.sh"
 assert_not_contains "$OUTPUT" "test-core.sh" "git pre-commit: test-core.sh not triggered for scripts/cmd changes"
 
+# Consumer repos do not have to ship Weave's own pytest fixture directories.
+# The hook should skip optional focused dirs that are absent and let test-map
+# driven shell suites handle repo-local tests.
+setup_test_env
+mkdir -p "$TEST_DIR/project/src"
+cat > "$TEST_DIR/project/src/consumer.py" <<'EOF'
+def answer() -> int:
+    return 42
+EOF
+git -C "$TEST_DIR/project" add src/consumer.py
+add_active_node "Git hook consumer pytest task" --criteria="missing optional pytest dirs skipped|consumer Python commit passes" --risks=low >/dev/null 2>&1
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: consumer Python commit skips missing optional pytest dirs"
+assert_not_contains "$OUTPUT" "tests/weave_quality" "git pre-commit: does not pass missing weave_quality dir to pytest"
+assert_not_contains "$OUTPUT" "tests/weave_indexer" "git pre-commit: does not pass missing weave_indexer dir to pytest"
+
 # discover phase with non-.weave file staged must block (no active node bypass)
 setup_test_env
 printf '%s' discover > "$WV_HOT_ZONE/.session_phase"
