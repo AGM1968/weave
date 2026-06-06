@@ -2193,16 +2193,17 @@ cmd_list() {
         where_clause="WHERE $filters"
     fi
 
-    # Default cap for agent/non-tty callers: prevents unfiltered dumps.
-    # Explicit --limit, --all, or --status=done bypass the cap.
-    # Tty (interactive) callers also bypass — they can re-run with --all if needed.
+    # Default cap: prevents unbounded dumps regardless of mode.
+    # Claude Code bash tool allocates a pseudo-tty, so mode=execute without an explicit
+    # cap — apply the limit universally. Bypass: --limit=N, --all, or --status=done.
+    local _LIST_DEFAULT_LIMIT=50
     local limit_clause=""
+    local capped=false
     if [ -n "$limit_val" ]; then
         limit_clause="LIMIT $limit_val"
     elif [ "$all" != true ] && [ "$status_filter" != "done" ]; then
-        case "$mode" in
-            bootstrap|discover) limit_clause="LIMIT 20" ;;
-        esac
+        limit_clause="LIMIT $_LIST_DEFAULT_LIMIT"
+        capped=true
     fi
 
     if [ "$format" = "json-v2" ]; then
@@ -2215,7 +2216,8 @@ cmd_list() {
         [ -z "$results" ] && echo "[]" || echo "$results"
     else
         # Text mode: exclude metadata to avoid multiline JSON breaking pipe-delimited parsing
-        db_query "SELECT id, text, status FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;" | while IFS='|' read -r id text status; do
+        local row_count=0
+        while IFS='|' read -r id text status; do
             local color="$NC"
             case "$status" in
                 active) color="$GREEN" ;;
@@ -2224,7 +2226,11 @@ cmd_list() {
                 done) color="$YELLOW" ;;
             esac
             echo -e "${color}[$status]${NC} $id: $text"
-        done
+            row_count=$((row_count + 1))
+        done < <(db_query "SELECT id, text, status FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
+        if [ "$capped" = true ] && [ "$row_count" -ge "$_LIST_DEFAULT_LIMIT" ]; then
+            echo "(showing $_LIST_DEFAULT_LIMIT — use --all for full dump or: wv query <preds> --format=short)" >&2
+        fi
     fi
 }
 

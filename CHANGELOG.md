@@ -4,6 +4,37 @@
 
 ## Unreleased
 
+## [1.55.0] - 2026-06-06
+
+### Added
+
+- **`wv guide --topic=discovery` reference card.** Documents the ground-truth toolset (`wv search`,
+  `wv query`, `wv impact`, `wv edges`, `wv analyze`) with the search-vs-query distinction and three
+  caller quirks (`--limit=` equals-form, IN-list quoting, impact done-seed). Steers agents toward
+  targeted 600-token reads instead of 12k-token `wv list` bulk dumps.
+- **`wv init-repo` reports code-index status.** Setup summary now appends a line showing whether
+  `wv index` has been run; fresh repos display `Run: wv index .` so agents do not silently lose
+  `wv search --code` capability.
+- **Session-close retro surfaces top command by token cost.** The stop hook emits a soft note
+  showing the highest-cost command from `wv analyze sessions --call-stats` when session analysis is
+  enabled. The `close-session` skill documents the step and links to `wv guide --topic=discovery`
+  for follow-up.
+
+### Fixed
+
+- **`wv pattern-audit` Check 2/3 counts no longer double on zero matches.** `grep -c` exits 1 with
+  output `0` on no matches; the `|| echo 0` fallback was appending a second zero, producing
+  `def_count="0 0"`. Both sites now move the fallback outside the command substitution.
+- **Hook `wv-hook-common.sh` sourcing survives Claude Code desktop env.** `BASH_SOURCE[0]` fails to
+  resolve in the Claude Code desktop app, leaving `HOOK_DIR` as CWD and both relative source paths
+  missing. All 9 hooks now carry a third fallback to the absolute install path
+  `${HOME}/.config/weave/lib/wv-hook-common.sh`, and `HOOK_DIR` resolution is hardened with
+  `BASH_SOURCE[0]:-$0`.
+- **`wv list` 50-row cap now fires regardless of tty/mode.** Claude Code's bash tool allocates a
+  pseudo-tty, causing mode to resolve to `execute` and bypassing the previous discover-only cap. The
+  default 50-row limit now applies to all callers without an explicit `--limit`, `--all`, or
+  `--status=done`. Text mode appends a stderr hint pointing to `wv query` when the cap is reached.
+
 ## [1.54.2] - 2026-06-04
 
 ### Fixed

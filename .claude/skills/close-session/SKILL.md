@@ -1,6 +1,8 @@
 ---
 name: close-session
-description: "Runs the end-of-session protocol to save, sync, and push work safely. Use when finishing a session or preparing to hand off work."
+description:
+  "Runs the end-of-session protocol to save, sync, and push work safely. Use when finishing a
+  session or preparing to hand off work."
 ---
 
 # Session Close Protocol
@@ -53,6 +55,19 @@ wv done <id>
 - NEVER stop before pushing — work stays stranded locally
 - NEVER say "ready to push when you are" — YOU must push
 - If push fails, resolve and retry until it succeeds
+
+## Retro (optional but recommended)
+
+After pushing, check if any commands dominated context cost this session:
+
+```bash
+wv analyze sessions --call-stats --top=5
+```
+
+If output shows `wv list` at the top by a large margin, switch to `wv query` or `wv search` for
+targeted reads next session. See `wv guide --topic=discovery`.
+
+Enable persistent tracking if not already on: `wv config enable session-analysis`
 
 ## Handoff
 

@@ -59,7 +59,7 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
     NODE_ID=$(echo "$COMMAND" | grep -oP 'wv-[0-9a-f]{4,6}')
 
     # Get node details
-    HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
     # Anchor project resolution to the session cwd — prevents hot zone race when
     # the hook subshell's cwd doesn't match the project dir.
     _PAYLOAD_CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || echo "")

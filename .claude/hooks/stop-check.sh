@@ -22,10 +22,13 @@ if [ "$STOP_HOOK_ACTIVE" = "true" ]; then
 fi
 
 # Resolve project directory
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
-source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null || true
+source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null \
+    || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null \
+    || source "${HOME}/.config/weave/lib/wv-hook-common.sh" 2>/dev/null \
+    || true
 _hc_refresh
 cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 
@@ -116,6 +119,18 @@ if [ "$AHEAD" -gt 0 ]; then
         echo "Note: $AHEAD unpushed commit(s). Run: git push (or /close-session)" >&2
     fi
     exit 0
+fi
+
+# Retro: surface call-stats if session analysis is enabled and a log exists
+if [ -x "${_WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
+    _WV="${_WV:-wv}"
+    _CALL_STATS=$("$_WV" analyze sessions --call-stats --top=3 --json 2>/dev/null || true)
+    if echo "$_CALL_STATS" | jq -e '.call_stats | length > 0' >/dev/null 2>&1; then
+        _TOP_CMD=$(echo "$_CALL_STATS" | jq -r '.call_stats[0] | "\(.cmd) (\(.calls) calls, ~\(.approx_tokens|tostring) tok)"' 2>/dev/null || true)
+        if [ -n "$_TOP_CMD" ]; then
+            echo "Retro: top command this session: $_TOP_CMD. Full report: wv analyze sessions --call-stats" >&2
+        fi
+    fi
 fi
 
 # State is clean — clear any stale cooldown lock so the next session isn't skipped

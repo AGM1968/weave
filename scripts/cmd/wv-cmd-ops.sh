@@ -4610,7 +4610,7 @@ cmd_pattern_audit() {
         [ -d "$search_root" ] || search_root="${_scripts_root:-}"
         if [ -n "$search_root" ] && [ -d "$search_root" ]; then
             def_files=$(grep -rl "^${enum_name}=" "$search_root" 2>/dev/null | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-            def_count=$(echo "$def_files" | tr ' ' '\n' | grep -c '[^[:space:]]' 2>/dev/null || echo 0)
+            def_count=$(echo "$def_files" | tr ' ' '\n' | grep -c '[^[:space:]]' 2>/dev/null) || def_count=0
         else
             def_files=""
             def_count=0
@@ -4656,7 +4656,7 @@ cmd_pattern_audit() {
 
     if [ -n "$phase_write_hits" ]; then
         local phase_issue_count
-        phase_issue_count=$(echo "$phase_write_hits" | grep -c . || echo 0)
+        phase_issue_count=$(echo "$phase_write_hits" | grep -c .) || phase_issue_count=0
         if [ "$format" = "text" ]; then
             echo -e "${RED}✗ Check 3 FAIL: raw .session_phase writes detected (use wv_set_phase):${NC}"
             echo "$phase_write_hits" | while IFS= read -r hit; do [ -n "$hit" ] && echo "    $hit"; done
@@ -4896,7 +4896,7 @@ Create new work:
   wv add "Description" --gh          # node + GitHub issue (linked)
   wv add "Task" --parent=<epic-id>   # child of an epic
 
-Topics: wv guide --topic=github | learnings | context | routing | mcp | verification | instrumentation | config
+Topics: wv guide --topic=github | learnings | context | routing | mcp | verification | instrumentation | config | discovery
 EOF
             ;;
         github)
@@ -5164,9 +5164,73 @@ Related topics:
   wv guide --topic=instrumentation  opt-in knobs, session analysis
 EOF
             ;;
+        discovery)
+            cat <<'EOF'
+Weave Discovery Toolset
+
+The ground-truth surface for audit and read-only exploration. These are the tools
+to reach for BEFORE editing, not after.
+
+  wv search <q>         FTS5 BM25 over all nodes. Fuzzy — finds "anything about X".
+                          --limit=N     (equals-form only; --limit N fails)
+                          --status=, --type=, --learning
+                          --code        hybrid BM25+cosine over indexed code chunks
+                                        (run `wv index .` once to enable)
+                          --code --graph  attach active nodes to code results
+
+  wv query <preds>      Predicate reader. Exact — answers "nodes where X = Y".
+                          key=value, key!=value, key>=value, key IN (a,b,c)
+                          HAS key, MATCH "phrase"
+                          --order=field, --include=finding|learning
+                          --format=short|json
+                          QUIRK: parens in IN (...) break bash — single-quote
+                          the whole predicate: wv query 'id IN (wv-abc,wv-def)'
+
+  search vs query:      search = BM25-fuzzy ("find me anything about dedup")
+                        query  = predicate-exact ("status=done type=finding stale>=7")
+                        Use search to locate; use query to pin and filter.
+
+  wv impact <id>        Blast-radius walk over typed edges (blocks|implements|addresses).
+                          --full        adds resolves|references|supersedes|obsoletes
+                          --direction=fwd|rev|both
+                          --files=a,b   seed from touched_files
+                          QUIRK: a done-seed refuses fwd walk ("impact already
+                          discharged") — use --direction=rev or --include-done
+
+  wv related <id>       Typed-edge neighbourhood of a node.
+  wv edges <id>           --type=, --direction=, --depth=N
+
+  wv show <id>          Full node detail. --json for machine-readable.
+  wv tree <epic>        Epic → task hierarchy. --mermaid for diagram.
+  wv path <id>          Ancestry chain to root.
+
+  wv analyze sessions   Telemetry: top commands by output bytes / approx tokens.
+    --call-stats          Run this after a session to see where context goes.
+                          wv list averages ~12k tokens/call; wv search/query ~600.
+                          Prefer query or search (20x cheaper) over wv list for
+                          targeted reads. Reserve wv list for full enumeration only.
+
+  wv cache              Prompt-cache health for the project.
+                          --sessions=N, --all; ratio >65% OK / 35-65% LOW / <35% BAD
+
+  wv bootstrap --json   One-call session context snapshot.
+                          Replaces: git status + wv status + wv ready
+
+Typical audit sequence:
+  1. wv search "<topic>"          locate by subject
+  2. wv query 'id IN (...)'       pin the set, filter by status/type
+  3. wv show <id>                 read full detail
+  4. wv impact <id> --direction=rev   check what depends on it
+  5. wv edges <id>                confirm typed relationships
+
+Related topics:
+  wv guide --topic=routing      phase loop, tool classes, token-saving pattern
+  wv guide --topic=context      context pack, scope rules
+EOF
+            ;;
         *)
             echo "Unknown topic: $topic" >&2
-            echo "Topics: workflow (default), github, learnings, context, routing, mcp, verification, instrumentation, config" >&2
+            echo "Topics: workflow (default), github, learnings, context, routing, mcp, verification, instrumentation, config, discovery" >&2
             return 1
             ;;
     esac
@@ -5385,7 +5449,7 @@ SEARCHHELP
             print_command_help "wv health [--history[=N]] [--verbose] [--json]" "Run system health checks and optionally include recent health history."
             ;;
         guide)
-            print_command_help "wv guide [--topic=workflow|github|learnings|context|routing|mcp|verification|instrumentation|config]" "Show a quick reference for common Weave workflows, routing rules, and integrations."
+            print_command_help "wv guide [--topic=workflow|github|learnings|context|routing|mcp|verification|instrumentation|config|discovery]" "Show a quick reference for common Weave workflows, routing rules, and integrations."
             ;;
         prune)
             print_command_help "wv prune [--age=48h] [--dry-run] [--orphans-only]" "Archive old done nodes, optionally targeting only orphaned ones."

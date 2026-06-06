@@ -7,11 +7,14 @@ INPUT=$(cat)
 TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 TOOL_INPUT=$(echo "$INPUT" | jq -r '.tool_input // empty' 2>/dev/null)
 
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
 source "$HOOK_DIR/../lib/wv-validate.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-validate.sh" 2>/dev/null || true
 source "$HOOK_DIR/../lib/wv-config.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-config.sh" 2>/dev/null || true
-source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null || true
+source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null \
+    || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null \
+    || source "${HOME}/.config/weave/lib/wv-hook-common.sh" 2>/dev/null \
+    || true
 source "$WV_PROJECT_DIR/scripts/lib/wv-resolve-runtime.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-runtime.sh" || exit 0
 _hc_refresh
 

@@ -6,8 +6,11 @@
 
 set -e
 
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null || true
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null \
+    || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null \
+    || source "${HOME}/.config/weave/lib/wv-hook-common.sh" 2>/dev/null \
+    || true
 _hc_refresh
 
 # Colors

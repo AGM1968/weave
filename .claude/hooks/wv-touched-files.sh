@@ -12,9 +12,12 @@
 
 set -euo pipefail
 
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
-source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null || true
+source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null \
+    || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null \
+    || source "${HOME}/.config/weave/lib/wv-hook-common.sh" 2>/dev/null \
+    || true
 source "$WV_PROJECT_DIR/scripts/lib/wv-resolve-runtime.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-runtime.sh" || exit 0
 _hc_refresh
 

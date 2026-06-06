@@ -1713,6 +1713,15 @@ for _a in "${AGENTS[@]}"; do
         echo "  .codex/weave.json — Codex setup contract (AGENTS.md remains universal)"
     fi
 done
+# Note whether code search index exists
+if [ -x "$(command -v wv 2>/dev/null)" ]; then
+    _chunks_count=$(wv hotzone db 2>/dev/null | xargs -I{} sqlite3 {} "SELECT COUNT(*) FROM chunks" 2>/dev/null || echo "0")
+    if [ "${_chunks_count:-0}" -gt 0 ]; then
+        echo "  code index      — ${_chunks_count} chunks indexed (wv search --code enabled)"
+    else
+        echo "  code index      — not built. Run: wv index . (enables wv search --code)"
+    fi
+fi
 INITEOF
 
 chmod +x "$INSTALL_DIR/wv-init-repo"
