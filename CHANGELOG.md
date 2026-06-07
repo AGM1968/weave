@@ -4,6 +4,31 @@
 
 ## Unreleased
 
+## [1.56.0] - 2026-06-07
+
+### Added
+
+- **Breadcrumbs skill for orientation-preserving handoffs.** `.claude/skills/breadcrumbs/` adds a
+  compact session breadcrumb workflow so agents can leave decision, file, command, blocker, and
+  next-step context before compaction or handoff.
+
+### Changed
+
+- **Codex hook dispatcher proposal captured for Rust migration planning.**
+  `docs/PROPOSAL-codex-hooks-rust-dispatch.md` records the current hook taxonomy, observed
+  latency/IO costs, and a phased migration path for replacing shell hook entrypoints with a single
+  Rust dispatcher.
+
+### Fixed
+
+- **`wv impact --include-done` now honors done seed nodes.** Done seed nodes are no longer filtered
+  out before traversal when callers explicitly request done-node inclusion.
+- **Delegate phase write-check coverage follows the real phase FSM.** The regression test now
+  asserts the write guard through the delegated phase path instead of relying on stale assumptions.
+- **`wv list` row caps and hook fallbacks are harder to bypass.** The default 50-row cap now applies
+  across caller modes without an explicit override, and Claude Code hook entrypoints have more robust
+  `wv-hook-common.sh` source-path fallback handling.
+
 ## [1.55.0] - 2026-06-06
 
 ### Added
@@ -19,6 +44,8 @@
   showing the highest-cost command from `wv analyze sessions --call-stats` when session analysis is
   enabled. The `close-session` skill documents the step and links to `wv guide --topic=discovery`
   for follow-up.
+- **VS Code hooks directory README.** `.github/hooks/README.md` now documents the team-shared
+  VS Code native hook location and distinguishes it from personal global hooks.
 
 ### Fixed
 

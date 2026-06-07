@@ -20,10 +20,10 @@ Find nodes that are `todo` but never claimed:
 ```bash
 # Check for old unclaimed work
 
-wv list --json | jq -r '.[] | select(.status=="todo") | "\(.id): \(.text) (created: \(.created_at))"'
+wv list --json --all | jq -r '.[] | select(.status=="todo") | "\(.id): \(.text) (created: \(.created_at))"'
 
 # Find nodes older than 7 days still in todo
-wv list --json | jq -r --arg date "$(date -d '7 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-7d '+%Y-%m-%d')" \
+wv list --json --all | jq -r --arg date "$(date -d '7 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-7d '+%Y-%m-%d')" \
   '.[] | select(.status=="todo" and .created_at < $date) | "\(.id): \(.text)"'
 ```
 
@@ -38,7 +38,7 @@ Find nodes stuck in `active` status:
 wv list --status=active
 
 # Check which have been active for >2 days
-wv list --json | jq -r --arg date "$(date -d '2 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-2d '+%Y-%m-%d')" \
+wv list --json --all | jq -r --arg date "$(date -d '2 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-2d '+%Y-%m-%d')" \
   '.[] | select(.status=="active" and .updated_at < $date) | "\(.id): \(.text) (active since: \(.updated_at))"'
 ```
 
@@ -50,7 +50,7 @@ Find potential circular dependencies:
 
 ```bash
 # For each blocked node, check if its blocker is also blocked by it
-for node in $(wv list --status=blocked --json | jq -r '.[].id'); do
+for node in $(wv list --status=blocked --json --all | jq -r '.[].id'); do
   wv show $node --json | jq -r '
     .[] |
     .blockers // [] |
@@ -68,13 +68,13 @@ Find nodes missing useful metadata:
 
 ```bash
 # Find nodes with empty metadata
-wv list --json | jq -r '.[] | select(.metadata == "{}") | "\(.id): \(.text)"'
+wv list --json --all | jq -r '.[] | select(.metadata == "{}") | "\(.id): \(.text)"'
 
 # Find nodes missing 'type' field
-wv list --json | jq -r '.[] | select(.type == null) | "\(.id): \(.text) (no type)"'
+wv list --json --all | jq -r '.[] | select(.type == null) | "\(.id): \(.text) (no type)"'
 
 # Find nodes missing 'priority' field
-wv list --json | jq -r '.[] | select(.priority == null) | "\(.id): \(.text) (no priority)"'
+wv list --json --all | jq -r '.[] | select(.priority == null) | "\(.id): \(.text) (no priority)"'
 ```
 
 **Action:** Add metadata for better organization and filtering.
@@ -117,10 +117,10 @@ Find potentially duplicate work:
 
 ```bash
 # Find nodes with very similar text
-wv list --json | jq -r '.[].text' | sort | uniq -d
+wv list --json --all | jq -r '.[].text' | sort | uniq -d
 
 # Find nodes with same type and similar priority
-wv list --json | jq -r 'group_by(.type, .priority) | .[] |
+wv list --json --all | jq -r 'group_by(.type, .priority) | .[] |
   select(length > 3) |
   "Multiple \(.[0].type) nodes at priority \(.[0].priority): \(length) found"'
 ```
@@ -140,9 +140,9 @@ echo ""
 
 echo "## Summary"
 echo "Total nodes: $(wv list --all --json | jq 'length')"
-echo "Active: $(wv list --status=active --json | jq 'length')"
-echo "Blocked: $(wv list --status=blocked --json | jq 'length')"
-echo "Todo: $(wv list --status=todo --json | jq 'length')"
+echo "Active: $(wv list --status=active --json --all | jq 'length')"
+echo "Blocked: $(wv list --status=blocked --json --all | jq 'length')"
+echo "Todo: $(wv list --status=todo --json --all | jq 'length')"
 echo "Done: $(wv list --all --status=done --json | jq 'length')"
 echo ""
 
@@ -150,21 +150,21 @@ echo "## Issues Found"
 echo ""
 
 echo "### Orphaned Nodes (todo >7 days)"
-wv list --json | jq -r --arg date "$(date -d '7 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-7d '+%Y-%m-%d')" \
+wv list --json --all | jq -r --arg date "$(date -d '7 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-7d '+%Y-%m-%d')" \
   '.[] | select(.status=="todo" and .created_at < $date) | "- \(.id): \(.text)"' | head -10
 echo ""
 
 echo "### Stuck Active Nodes (>2 days)"
-wv list --json | jq -r --arg date "$(date -d '2 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-2d '+%Y-%m-%d')" \
+wv list --json --all | jq -r --arg date "$(date -d '2 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-2d '+%Y-%m-%d')" \
   '.[] | select(.status=="active" and .updated_at < $date) | "- \(.id): \(.text)"' | head -10
 echo ""
 
 echo "### Nodes Missing Type"
-wv list --json | jq -r '.[] | select(.type == null) | "- \(.id): \(.text)"' | head -10
+wv list --json --all | jq -r '.[] | select(.type == null) | "- \(.id): \(.text)"' | head -10
 echo ""
 
 echo "### Nodes Missing Priority"
-wv list --json | jq -r '.[] | select(.priority == null) | "- \(.id): \(.text)"' | head -10
+wv list --json --all | jq -r '.[] | select(.priority == null) | "- \(.id): \(.text)"' | head -10
 echo ""
 
 echo "### Done Nodes Without Learnings"
@@ -208,7 +208,7 @@ wv prune --age=168
 
 ```bash
 # Add default type to nodes without one
-for id in $(wv list --json | jq -r '.[] | select(.type == null) | .id'); do
+for id in $(wv list --json --all | jq -r '.[] | select(.type == null) | .id'); do
   wv update $id --metadata='{"type":"task","priority":3}'
   echo "Added default metadata to $id"
 done
@@ -317,7 +317,7 @@ git status
 
 ```bash
 # In pre-commit hook
-if wv list --status=active --json | jq -e 'length > 0' > /dev/null; then
+if wv list --status=active --json --all | jq -e 'length > 0' > /dev/null; then
   echo "Warning: You have active Weave nodes. Consider completing them."
 fi
 ```
@@ -349,7 +349,7 @@ The `/close-session` skill should run a quick audit:
 
 ```bash
 # Check for active nodes
-if [ "$(wv list --status=active --json | jq 'length')" -gt 0 ]; then
+if [ "$(wv list --status=active --json --all | jq 'length')" -gt 0 ]; then
   echo " Active nodes found - review before ending session"
   wv list --status=active
 fi
@@ -416,10 +416,10 @@ wv list --status=active | head -5
 wv list --status=blocked | head -5
 
 # Count nodes by type
-wv list --json | jq -r '.[].type' | sort | uniq -c
+wv list --json --all | jq -r '.[].type' | sort | uniq -c
 
 # List high-priority work
-wv list --json | jq -r '.[] | select(.priority <= 2) | "\(.id): \(.text) (P\(.priority))"'
+wv list --json --all | jq -r '.[] | select(.priority <= 2) | "\(.id): \(.text) (P\(.priority))"'
 ```
 
 ## Related Skills

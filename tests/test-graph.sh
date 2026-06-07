@@ -529,6 +529,9 @@ test_impact() {
 
     assert_fails "done-seed+fwd: errors on done seed with default direction" "$WV" impact "$dseed"
 
+    out=$("$WV" impact "$dseed" --include-done 2>&1)
+    assert_contains "$out" "Child of done" "done-seed+include-done: force traversal from done seed"
+
     out=$("$WV" impact "$dseed" --direction=rev 2>&1)
     assert_success "done-seed+rev: succeeds with --direction=rev" "$WV" impact "$dseed" --direction=rev
 

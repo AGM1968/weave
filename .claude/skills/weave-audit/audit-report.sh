@@ -11,9 +11,9 @@ echo ""
 
 echo "## Summary"
 total=$(wv list --all --json 2>/dev/null | jq 'length' || echo "0")
-active=$(wv list --status=active --json 2>/dev/null | jq 'length' || echo "0")
-blocked=$(wv list --status=blocked --json 2>/dev/null | jq 'length' || echo "0")
-todo=$(wv list --status=todo --json 2>/dev/null | jq 'length' || echo "0")
+active=$(wv list --status=active --json --all 2>/dev/null | jq 'length' || echo "0")
+blocked=$(wv list --status=blocked --json --all 2>/dev/null | jq 'length' || echo "0")
+todo=$(wv list --status=todo --json --all 2>/dev/null | jq 'length' || echo "0")
 done=$(wv list --all --status=done --json 2>/dev/null | jq 'length' || echo "0")
 
 echo "Total nodes: $total"
@@ -28,7 +28,7 @@ echo ""
 
 echo "### Orphaned Nodes (todo >7 days)"
 CUTOFF_DATE=$(date -d '7 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-7d '+%Y-%m-%d' 2>/dev/null || echo "2020-01-01")
-orphaned=$(wv list --json 2>/dev/null | jq -r --arg date "$CUTOFF_DATE" \
+orphaned=$(wv list --json --all 2>/dev/null | jq -r --arg date "$CUTOFF_DATE" \
   '.[] | select(.status=="todo" and .created_at < $date) | "- \(.id): \(.text)"' | head -10)
 
 if [ -n "$orphaned" ]; then
@@ -40,7 +40,7 @@ echo ""
 
 echo "### Stuck Active Nodes (>2 days)"
 STUCK_DATE=$(date -d '2 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-2d '+%Y-%m-%d' 2>/dev/null || echo "2020-01-01")
-stuck=$(wv list --json 2>/dev/null | jq -r --arg date "$STUCK_DATE" \
+stuck=$(wv list --json --all 2>/dev/null | jq -r --arg date "$STUCK_DATE" \
   '.[] | select(.status=="active" and .updated_at < $date) | "- \(.id): \(.text)"' | head -10)
 
 if [ -n "$stuck" ]; then
@@ -51,7 +51,7 @@ fi
 echo ""
 
 echo "### Nodes Missing Type"
-no_type=$(wv list --json 2>/dev/null | jq -r '.[] | select(.type == null) | "- \(.id): \(.text)"' | head -10)
+no_type=$(wv list --json --all 2>/dev/null | jq -r '.[] | select(.type == null) | "- \(.id): \(.text)"' | head -10)
 
 if [ -n "$no_type" ]; then
   echo "$no_type"
@@ -61,7 +61,7 @@ fi
 echo ""
 
 echo "### Nodes Missing Priority"
-no_priority=$(wv list --json 2>/dev/null | jq -r '.[] | select(.priority == null) | "- \(.id): \(.text)"' | head -10)
+no_priority=$(wv list --json --all 2>/dev/null | jq -r '.[] | select(.priority == null) | "- \(.id): \(.text)"' | head -10)
 
 if [ -n "$no_priority" ]; then
   echo "$no_priority"
@@ -86,12 +86,12 @@ fi
 echo ""
 
 echo "### Epics With No Tracked Children"
-epics_no_children=$(wv list --json 2>/dev/null | jq -r '
+epics_no_children=$(wv list --json --all 2>/dev/null | jq -r '
   .[] | select(
     .status != "done" and
     ((.metadata // "{}") | try fromjson catch {} | .type) == "epic"
   ) | .id' 2>/dev/null | while read -r eid; do
-    child_count=$(wv list --json 2>/dev/null | jq --arg eid "$eid" \
+    child_count=$(wv list --json --all 2>/dev/null | jq --arg eid "$eid" \
       '[.[] | select(.metadata != null) | select((.metadata | try fromjson catch {}) | .parent == $eid)] | length' 2>/dev/null || echo "0")
     # Check via edges (implements edges pointing to this epic)
     edge_count=$(sqlite3 "${WV_DB:-/dev/null}" \
@@ -115,20 +115,20 @@ echo ""
 score=100
 
 # Deduct for orphaned nodes
-orphaned_count=$(wv list --json 2>/dev/null | jq --arg date "$CUTOFF_DATE" \
+orphaned_count=$(wv list --json --all 2>/dev/null | jq --arg date "$CUTOFF_DATE" \
   '[.[] | select(.status=="todo" and .created_at < $date)] | length' || echo "0")
 score=$((score - orphaned_count * 5))
 
 # Deduct for stuck active nodes
-stuck_count=$(wv list --json 2>/dev/null | jq --arg date "$STUCK_DATE" \
+stuck_count=$(wv list --json --all 2>/dev/null | jq --arg date "$STUCK_DATE" \
   '[.[] | select(.status=="active" and .updated_at < $date)] | length' || echo "0")
 score=$((score - stuck_count * 10))
 
 # Deduct for missing metadata
-no_type_count=$(wv list --json 2>/dev/null | jq '[.[] | select(.type == null)] | length' || echo "0")
+no_type_count=$(wv list --json --all 2>/dev/null | jq '[.[] | select(.type == null)] | length' || echo "0")
 score=$((score - no_type_count * 2))
 
-no_priority_count=$(wv list --json 2>/dev/null | jq '[.[] | select(.priority == null)] | length' || echo "0")
+no_priority_count=$(wv list --json --all 2>/dev/null | jq '[.[] | select(.priority == null)] | length' || echo "0")
 score=$((score - no_priority_count * 2))
 
 # Deduct for missing learnings
@@ -149,7 +149,7 @@ while IFS= read -r eid; do
   if [ "$edge_count" = "0" ]; then
     epics_no_children_count=$((epics_no_children_count + 1))
   fi
-done < <(wv list --json 2>/dev/null | jq -r '.[] | select(.status != "done") | select(((.metadata // "{}") | try fromjson catch {} | .type) == "epic") | .id' 2>/dev/null || true)
+done < <(wv list --json --all 2>/dev/null | jq -r '.[] | select(.status != "done") | select(((.metadata // "{}") | try fromjson catch {} | .type) == "epic") | .id' 2>/dev/null || true)
 score=$((score - epics_no_children_count * 15))
 
 # Ensure score doesn't go below 0

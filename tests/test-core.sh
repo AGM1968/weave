@@ -864,6 +864,19 @@ test_list() {
     assert_contains "$output" "[" "list --json outputs JSON array"
     assert_contains "$output" '"id"' "list --json includes id field"
 
+    # Default list cap applies to JSON too, but must not be silent.
+    for i in $(seq 1 55); do
+        "$WV" add "Cap test $i" --status=todo --force >/dev/null 2>&1
+    done
+    local json_out json_err json_count
+    json_out=$("$WV" list --json 2>"$TEST_DIR/list-json.err")
+    json_err=$(cat "$TEST_DIR/list-json.err")
+    json_count=$(echo "$json_out" | jq 'length' 2>/dev/null || echo 0)
+    assert_equals "50" "$json_count" "list --json default cap returns 50 rows"
+    assert_contains "$json_err" "use --all for full JSON" "list --json capped output warns on stderr"
+    json_count=$("$WV" list --json --all 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
+    assert_success "list --json --all returns more than capped default" test "$json_count" -gt 50
+
     # List with status filter
     output=$("$WV" list --status=active 2>&1)
     assert_contains "$output" "$id2" "list --status=active shows active"

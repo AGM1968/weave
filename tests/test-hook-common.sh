@@ -10,6 +10,7 @@
 #   - Default phase (execute) when .session_phase missing
 #   - DB pre-flight: exits 0 gracefully when brain.db missing
 #   - All 7 hooks source wv-hook-common.sh (static check)
+#   - Hooks that resolve the project have installed-path resolver fallbacks
 #   - install.sh includes wv-hook-common.sh in both copy blocks
 #
 # Until wv-0ab403 lands, structural tests run as EXPECT-FAIL.
@@ -43,6 +44,17 @@ HOOKS_NEEDING_COMMON=(
     ".claude/hooks/pre-compact-context.sh"
     ".claude/hooks/wv-touched-files.sh"
     ".claude/hooks/context-guard.sh"
+)
+
+HOOKS_NEEDING_RESOLVE_FALLBACK=(
+    ".claude/hooks/pre-action.sh"
+    ".claude/hooks/pre-claim-skills.sh"
+    ".claude/hooks/pre-close-verification.sh"
+    ".claude/hooks/pre-compact-context.sh"
+    ".claude/hooks/session-end-sync.sh"
+    ".claude/hooks/session-start-context.sh"
+    ".claude/hooks/stop-check.sh"
+    ".claude/hooks/wv-touched-files.sh"
 )
 
 TEST_DIR="/tmp/wv-hook-common-test-$$"
@@ -255,6 +267,26 @@ test_install_sh_ships_hook_common() {
     fi
 }
 
+test_hooks_have_installed_resolver_fallback() {
+    echo "-- hooks that resolve projects have installed resolver fallback"
+    for hook_rel in "${HOOKS_NEEDING_RESOLVE_FALLBACK[@]}"; do
+        local hook_path="$PROJECT_ROOT/$hook_rel"
+        TESTS_RUN=$((TESTS_RUN + 1))
+        if [ ! -f "$hook_path" ]; then
+            echo -e "  ${RED}[FAIL]${NC} hook not found: $hook_rel"
+            TESTS_FAILED=$((TESTS_FAILED + 1))
+            continue
+        fi
+        if grep -q '\.config/weave/lib/wv-resolve-project\.sh' "$hook_path" 2>/dev/null; then
+            echo -e "  ${GREEN}[PASS]${NC} $hook_rel has installed resolver fallback"
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+        else
+            echo -e "  ${RED}[FAIL]${NC} $hook_rel lacks installed resolver fallback"
+            TESTS_FAILED=$((TESTS_FAILED + 1))
+        fi
+    done
+}
+
 # ─── Per-check unit tests (t6) ────────────────────────────────────────────────
 # One allow path + one deny/block path per _hc_check_* function.
 
@@ -446,6 +478,7 @@ main() {
     test_codex_zone_followed_without_env_signal
     test_db_preflight_graceful_when_missing
     test_all_hooks_source_common
+    test_hooks_have_installed_resolver_fallback
     test_install_sh_ships_hook_common
 
     echo ""

@@ -67,8 +67,14 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
         export CLAUDE_PROJECT_DIR="$_PAYLOAD_CWD"
         cd "$_PAYLOAD_CWD" 2>/dev/null || true
     fi
-    source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
-    source "$HOOK_DIR/../lib/wv-validate.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-validate.sh" 2>/dev/null || true
+    source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null \
+        || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" 2>/dev/null \
+        || source "${HOME}/.config/weave/lib/wv-resolve-project.sh" 2>/dev/null \
+        || exit 0
+    source "$HOOK_DIR/../lib/wv-validate.sh" 2>/dev/null \
+        || source "$HOOK_DIR/../../scripts/lib/wv-validate.sh" 2>/dev/null \
+        || source "${HOME}/.config/weave/lib/wv-validate.sh" 2>/dev/null \
+        || true
     if [ -x "$WV" ]; then
         _agent_hook_progress "load node metadata"
         NODE_JSON=$(_agent_hook_run "node-json" "$WV" show "$NODE_ID" --json 2>/dev/null) || {

@@ -2210,10 +2210,24 @@ cmd_list() {
         local results
         results=$(db_query_json_v2 "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
         [ -z "$results" ] && echo "[]" || echo "$results"
+        if [ "$capped" = true ]; then
+            local json_count
+            json_count=$(printf '%s' "${results:-[]}" | jq 'length' 2>/dev/null || echo 0)
+            if [ "$json_count" -ge "$_LIST_DEFAULT_LIMIT" ] 2>/dev/null; then
+                echo "(showing $_LIST_DEFAULT_LIMIT — use --all for full JSON or: wv query <preds> --format=json)" >&2
+            fi
+        fi
     elif [ "$format" = "json" ]; then
         local results
         results=$(db_query_json "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
         [ -z "$results" ] && echo "[]" || echo "$results"
+        if [ "$capped" = true ]; then
+            local json_count
+            json_count=$(printf '%s' "${results:-[]}" | jq 'length' 2>/dev/null || echo 0)
+            if [ "$json_count" -ge "$_LIST_DEFAULT_LIMIT" ] 2>/dev/null; then
+                echo "(showing $_LIST_DEFAULT_LIMIT — use --all for full JSON or: wv query <preds> --format=json)" >&2
+            fi
+        fi
     else
         # Text mode: exclude metadata to avoid multiline JSON breaking pipe-delimited parsing
         local row_count=0

@@ -24,7 +24,10 @@ fi
 # Resolve project directory
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck disable=SC1091
-source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null \
+    || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" 2>/dev/null \
+    || source "${HOME}/.config/weave/lib/wv-resolve-project.sh" 2>/dev/null \
+    || exit 0
 source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null \
     || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null \
     || source "${HOME}/.config/weave/lib/wv-hook-common.sh" 2>/dev/null \
@@ -51,7 +54,7 @@ fi
 # Nodes active for >30 min with no update suggest a crashed or abandoned session.
 if [ -x "${WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
     _WV="${WV:-wv}"
-    IDLE_NODES=$("$_WV" list --json 2>/dev/null | jq -r --argjson cutoff "$(date -d '30 minutes ago' +%s 2>/dev/null || date -v-30M +%s 2>/dev/null || echo 0)" \
+    IDLE_NODES=$("$_WV" list --json --all 2>/dev/null | jq -r --argjson cutoff "$(date -d '30 minutes ago' +%s 2>/dev/null || date -v-30M +%s 2>/dev/null || echo 0)" \
         '.[] | select(.status=="active") | select((.updated_at | strptime("%Y-%m-%d %H:%M:%S") | mktime) < $cutoff) | "  \(.id): \(.text[:60])"' 2>/dev/null || true)
     if [ -n "$IDLE_NODES" ]; then
         echo "Note: active node(s) with no update in >30 min — possible abandoned work:" >&2
@@ -93,7 +96,7 @@ fi
 # Check for active nodes — genuine in-flight work, hard block regardless
 if [ -x "${_WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
     _WV="${_WV:-wv}"
-    ACTIVE_COUNT=$("$_WV" list --json 2>/dev/null | jq '[.[] | select(.status=="active")] | length' 2>/dev/null || echo "0")
+    ACTIVE_COUNT=$("$_WV" list --json --all 2>/dev/null | jq '[.[] | select(.status=="active")] | length' 2>/dev/null || echo "0")
     if [ "$ACTIVE_COUNT" -gt 0 ]; then
         if [ "$_SC_IN_COOLDOWN" = true ]; then
             echo "Note: $ACTIVE_COUNT active node(s) — close with wv done before ending session (cooldown active)." >&2

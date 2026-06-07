@@ -1608,8 +1608,9 @@ cmd_impact() {
             return 1
         fi
 
-        # D10: done + fwd or both → error, no auto-flip
+        # D10: done + fwd or both → error, unless caller explicitly includes done.
         if [ "$node_status" = "done" ] && \
+           [ "$include_done" != "true" ] && \
            [ "$direction" != "rev" ] && [ "$direction" != "reverse" ]; then
             echo -e "${RED}Error: seed $sid is done; forward impact already discharged.${NC}" >&2
             echo "Use --direction=rev (retrospective) or --include-done to force traversal." >&2

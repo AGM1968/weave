@@ -240,22 +240,17 @@ test_doctor_flags_invalid_phase() {
 
 test_no_raw_phase_writes_in_source() {
     echo "-- no raw 'echo ... > .session_phase' calls outside wv_set_phase"
-    # Grep the source tree for direct phase writes (should only appear in wv_set_phase definition)
-    local raw_writes
-    set +o pipefail
-    raw_writes=$(grep -rn 'echo.*session_phase\|printf.*session_phase' \
-        "$PROJECT_ROOT/scripts/" "$PROJECT_ROOT/.claude/hooks/" 2>/dev/null \
-        | grep -v '#\|wv-config\.sh\|session_phase.*cat\|cat.*session_phase' \
-        | wc -l)
-    set -o pipefail
-    if [ "$raw_writes" -gt 0 ]; then
-        echo -e "  ${RED}[FAIL]${NC} raw phase writes still present ($raw_writes sites)"
-        TESTS_RUN=$((TESTS_RUN + 1))
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-    else
+    local output rc=0
+    output=$("$WV" pattern-audit 2>&1) || rc=$?
+    if [ "$rc" -eq 0 ] && echo "$output" | grep -q "Check 3 PASS"; then
         echo -e "  ${GREEN}[PASS]${NC} no raw .session_phase writes"
         TESTS_RUN=$((TESTS_RUN + 1))
         TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo -e "  ${RED}[FAIL]${NC} pattern-audit Check 3 did not pass"
+        echo "$output" | sed 's/^/    /'
+        TESTS_RUN=$((TESTS_RUN + 1))
+        TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
 

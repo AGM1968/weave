@@ -27,7 +27,10 @@ if [[ "$COMMAND" =~ wv[[:space:]]update[[:space:]]wv-[0-9a-f]{4,6}.*--status=act
 
     # Get node details
     HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-    source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" || exit 0
+    source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null \
+        || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" 2>/dev/null \
+        || source "${HOME}/.config/weave/lib/wv-resolve-project.sh" 2>/dev/null \
+        || exit 0
     if [ -x "$WV" ]; then
         # wv show --json returns a compact object (not array) for single-ID queries.
         # Fail-open when node is missing or DB is unreadable — let wv work surface errors.
