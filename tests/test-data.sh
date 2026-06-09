@@ -870,6 +870,25 @@ rm -f "$WEAVE_DIR/breadcrumbs.md"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Floor-guard: refuse to overwrite state.sql with a drastically smaller dump
+# (2026-06-06 sandbox data-loss regression: partial 69-node tmpfs persisted over
+# committed 306 nodes; the empty-guard passed). docs/findings/sandbox-checkpoint-over-truth.md
+# ═══════════════════════════════════════════════════════════════════════════
+reset_db
+for i in $(seq 1 10); do $WV add "floor node $i" --force >/dev/null 2>&1; done
+$WV sync >/dev/null 2>&1 || true
+assert_equals "10" "$(grep -c '^INSERT INTO nodes' "$WEAVE_DIR/state.sql")" "floor-guard baseline: state.sql has 10 nodes"
+# Simulate wiped/partial live DB: delete 8 of 10 directly (no wv, no auto_sync)
+sqlite3 "$WV_DB" "DELETE FROM nodes WHERE id IN (SELECT id FROM nodes LIMIT 8);" 2>/dev/null
+fg_out=$($WV sync 2>&1 || true)
+assert_contains "$fg_out" "BLOCKED" "floor-guard blocks 2-of-10 (<0.70) shrink sync"
+assert_equals "10" "$(grep -c '^INSERT INTO nodes' "$WEAVE_DIR/state.sql")" "floor-guard leaves state.sql intact when blocked"
+WV_FORCE_SYNC=1 $WV sync >/dev/null 2>&1 || true
+assert_equals "2" "$(grep -c '^INSERT INTO nodes' "$WEAVE_DIR/state.sql")" "WV_FORCE_SYNC=1 bypasses floor-guard"
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 echo "═══════════════════════════════════════════════════════════════════════════"

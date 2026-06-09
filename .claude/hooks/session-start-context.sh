@@ -78,25 +78,35 @@ PYEOF
 fi
 
 # ── Crash detection: check for previous session's sentinel ──
-# Sentinel present = previous session did not call session-end-sync.sh
+# Sentinel present = previous session did not fire SessionEnd (crash, terminal killed, etc.)
+# Distinguish: active nodes at exit → true crash needing recovery
+#              empty active list   → clean-close without SessionEnd (no recovery needed)
 CRASH_WARNING=""
 HAD_SENTINEL=false
 if [ -f "$SENTINEL" ]; then
     HAD_SENTINEL=true
     CRASH_DATA=$(cat "$SENTINEL" 2>/dev/null || echo "{}")
     CRASH_TS=$(echo "$CRASH_DATA" | jq -r '.ts // "unknown"' 2>/dev/null || echo "unknown")
-    CRASH_ACTIVE=$(echo "$CRASH_DATA" | jq -r '.active | join(", ")' 2>/dev/null || echo "unknown")
+    CRASH_ACTIVE=$(echo "$CRASH_DATA" | jq -r '.active | join(", ")' 2>/dev/null || echo "")
+    CRASH_ACTIVE_COUNT=$(echo "$CRASH_DATA" | jq '.active | length' 2>/dev/null || echo "0")
 
-    _CRASH_MSG="CRASH RECOVERY: Session killed at ${CRASH_TS}. Active nodes at crash: ${CRASH_ACTIVE}."
-    [ -n "$_SS_LAST_PROMPT" ] && _CRASH_MSG="${_CRASH_MSG} Last prompt: '${_SS_LAST_PROMPT}'"
-    _CRASH_MSG="${_CRASH_MSG} Review and re-claim or close active nodes."
+    if [ "${CRASH_ACTIVE_COUNT:-0}" -gt 0 ]; then
+        # True crash: active work was in progress at exit
+        _CRASH_MSG="CRASH RECOVERY: Session killed at ${CRASH_TS}. Active nodes at crash: ${CRASH_ACTIVE}."
+        [ -n "$_SS_LAST_PROMPT" ] && _CRASH_MSG="${_CRASH_MSG} Last prompt: '${_SS_LAST_PROMPT}'"
+        _CRASH_MSG="${_CRASH_MSG} Review and re-claim or close active nodes."
 
-    # Auto-generate recovery trail entry
-    "$WV" trails save --message="$_CRASH_MSG" >/dev/null 2>&1 || true
+        # Write to trails.md — meaningful recovery info
+        "$WV" trails save --message="$_CRASH_MSG" >/dev/null 2>&1 || true
 
-    CRASH_WARNING="CRASH DETECTED: previous session ended abruptly at ${CRASH_TS}. Active at crash: ${CRASH_ACTIVE}."
-    [ -n "$_SS_LAST_PROMPT" ] && CRASH_WARNING="${CRASH_WARNING} Last prompt: '${_SS_LAST_PROMPT}'"
-    CRASH_WARNING="${CRASH_WARNING} Recovery trail saved."
+        CRASH_WARNING="CRASH DETECTED: session killed at ${CRASH_TS} with active work. Active at crash: ${CRASH_ACTIVE}."
+        [ -n "$_SS_LAST_PROMPT" ] && CRASH_WARNING="${CRASH_WARNING} Last prompt: '${_SS_LAST_PROMPT}'"
+        CRASH_WARNING="${CRASH_WARNING} Recovery trail saved."
+    else
+        # Clean-close without SessionEnd: no active work, just inform briefly
+        # (terminal closed after /close-session, or SessionEnd hook skipped)
+        CRASH_WARNING="Note: Previous session at ${CRASH_TS} closed without clean shutdown. No active work to recover."
+    fi
 fi
 
 # ── Write minimal sentinel BEFORE wv load (crash-during-load detectable) ──

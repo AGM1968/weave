@@ -203,11 +203,11 @@ OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || t
 assert_contains "$OUTPUT" "wv-aaa111" "multi-node crash lists first node"
 assert_contains "$OUTPUT" "wv-bbb222" "multi-node crash lists second node"
 
-# Test: Crash detection with empty active list (crash during loading phase)
+# Test: Empty active list — informational note, not CRASH DETECTED (wv-bd6184)
 setup_test_env
 write_fake_sentinel "2026-03-05T16:00:00Z" '[]'
 OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
-assert_contains "$OUTPUT" "CRASH DETECTED" "loading-phase crash (empty active) detected"
+assert_contains "$OUTPUT" "No active work to recover" "loading-phase crash (empty active) emits informational note"
 
 # Test: No crash warning on clean start (no sentinel)
 setup_test_env

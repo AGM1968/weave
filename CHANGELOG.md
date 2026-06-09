@@ -4,6 +4,23 @@
 
 ## Unreleased
 
+## [1.56.1] - 2026-06-09
+
+### Fixed
+
+- **Sentinel now differentiates clean-close from true crash.** A sentinel with an empty active-node
+  list writes an informational note only; a CRASH RECOVERY trail entry is only written when active
+  nodes were in-flight at session end. Eliminates false crash entries in trails.md from normal
+  terminal closes after `/close-session` (wv-bd6184).
+- **Floor-guard blocks codex-sandbox checkpoint-over-truth data loss.** `_sync_floor_guard_ok()`
+  refuses to overwrite `state.sql` when the new dump contains fewer than `WV_SYNC_FLOOR_RATIO`
+  (default 0.70) of the committed node count. Wired into both `cmd_sync` and `auto_sync`. Bypass for
+  intentional shrinks via `--force` or `WV_FORCE_SYNC=1`. Root cause and recovery procedure
+  documented in `docs/findings/sandbox-checkpoint-over-truth.md` (wv-5494e2).
+- **weave-guide, epic-planner skills updated with placeholder IDs and repair workflow.** Fixes
+  workflow examples to use `wv-XXXXXX` placeholder IDs and adds a Repair Workflow section.
+  `test-crash-sentinel.sh` updated to match new informational-message behavior (wv-443cd8).
+
 ## [1.56.0] - 2026-06-07
 
 ### Added
@@ -26,8 +43,8 @@
 - **Delegate phase write-check coverage follows the real phase FSM.** The regression test now
   asserts the write guard through the delegated phase path instead of relying on stale assumptions.
 - **`wv list` row caps and hook fallbacks are harder to bypass.** The default 50-row cap now applies
-  across caller modes without an explicit override, and Claude Code hook entrypoints have more robust
-  `wv-hook-common.sh` source-path fallback handling.
+  across caller modes without an explicit override, and Claude Code hook entrypoints have more
+  robust `wv-hook-common.sh` source-path fallback handling.
 
 ## [1.55.0] - 2026-06-06
 
@@ -44,8 +61,8 @@
   showing the highest-cost command from `wv analyze sessions --call-stats` when session analysis is
   enabled. The `close-session` skill documents the step and links to `wv guide --topic=discovery`
   for follow-up.
-- **VS Code hooks directory README.** `.github/hooks/README.md` now documents the team-shared
-  VS Code native hook location and distinguishes it from personal global hooks.
+- **VS Code hooks directory README.** `.github/hooks/README.md` now documents the team-shared VS
+  Code native hook location and distinguishes it from personal global hooks.
 
 ### Fixed
 

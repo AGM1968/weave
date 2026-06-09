@@ -102,6 +102,37 @@ _delta_compact() {
     echo "$deleted"
 }
 
+# Floor-guard: block a sync that would shrink state.sql drastically. This is the
+# data-loss prevention beyond the empty (0-node) check. The 2026-06-06 sandbox
+# incident dumped a partial 69-node DB over a committed 306-node state.sql: tmpfs
+# /dev/shm was wiped on session restart, the reload was incomplete, and the
+# auto-checkpoint then persisted the partial over the committed truth. The empty
+# guard passed (69 != 0), so ~237 nodes were lost. Refuse when the new dump has
+# fewer than WV_SYNC_FLOOR_RATIO (default 0.70) of the committed node count.
+# Bypass with --force, WV_FORCE_SYNC=1, or WV_SYNC_FLOOR_RATIO=0.
+_sync_floor_guard_ok() {
+    local new_sql="$1" force="${2:-false}"
+    [ "$force" = true ] && return 0
+    [ "${WV_FORCE_SYNC:-0}" = "1" ] && return 0
+    local ratio="${WV_SYNC_FLOOR_RATIO:-0.70}"
+    case "$ratio" in 0|0.0|0.00) return 0 ;; esac
+    local existing="$WEAVE_DIR/state.sql"
+    [ -f "$existing" ] || return 0
+    local old_n new_n floor
+    old_n=$(grep -c '^INSERT INTO nodes' "$existing" 2>/dev/null || echo 0)
+    new_n=$(grep -c '^INSERT INTO nodes' "$new_sql" 2>/dev/null || echo 0)
+    [ "$old_n" -gt 0 ] || return 0
+    floor=$(awk -v o="$old_n" -v r="$ratio" 'BEGIN{printf "%d", o*r}')
+    if [ "$new_n" -lt "$floor" ]; then
+        echo -e "${RED}✗ Sync BLOCKED (floor-guard): dump has ${new_n} nodes vs ${old_n} committed in state.sql (< ${ratio}x).${NC}" >&2
+        echo -e "${YELLOW}  Refusing to overwrite .weave/state.sql — likely a wiped/partial tmpfs DB (sandbox restart).${NC}" >&2
+        echo -e "${YELLOW}  Recover: run 'wv load' to rehydrate from state.sql, or restore .weave from git.${NC}" >&2
+        echo -e "${YELLOW}  Intentional shrink (e.g. prune)? Override: WV_FORCE_SYNC=1 wv sync  (or 'wv sync --force').${NC}" >&2
+        return 1
+    fi
+    return 0
+}
+
 _should_persist_weave_state() {
     # Keep existing initialized repos durable, but do not materialize .weave/
     # for empty hot-zone-only sessions in non-initialized directories.
@@ -181,6 +212,14 @@ auto_sync() {
 
     dump_state_sql "$WV_DB" "$tmp_sql"
     [ -s "$tmp_sql" ] || { rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; return 0; }
+
+    # Floor-guard: never let an auto-checkpoint persist a drastically smaller graph
+    # over committed truth (the 2026-06-06 sandbox data-loss path). Skip the dump,
+    # keep deltas + _warp_changes pending, leave state.sql intact. Loud on stderr.
+    if ! _sync_floor_guard_ok "$tmp_sql"; then
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        return 0
+    fi
 
     # Second-level no-op guard: triggers can fire on no-net-change operations
     # (e.g. UPDATE that writes the same value). cmp catches these by comparing
@@ -460,10 +499,12 @@ cmd_sync() {
     local format="text"
     local gh_mode=""
     local gh_node=""
+    local force=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --gh) gh_sync=true ;;
             --dry-run) dry_run=true ;;
+            --force) force=true ;;
             --json) format="json" ;;
             --mode=*) gh_mode="${1#*=}" ;;
             --mode) shift; gh_mode="${1:-}" ;;
@@ -511,6 +552,14 @@ cmd_sync() {
     # Guard: refuse to overwrite state.sql with an empty dump (data loss prevention)
     if [ ! -s "$tmp_sql" ]; then
         echo -e "${RED}✗${NC} Sync aborted: database dump was empty (possible lock contention)" >&2
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        trap - EXIT
+        [ "$_sync_journaled" = true ] && journal_end
+        return 1
+    fi
+
+    # Floor-guard: refuse a drastic shrink (partial/wiped tmpfs over committed truth)
+    if ! _sync_floor_guard_ok "$tmp_sql" "$force"; then
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
         trap - EXIT
         [ "$_sync_journaled" = true ] && journal_end
