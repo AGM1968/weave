@@ -438,6 +438,26 @@ test_hc_check_stale_node_block_stale() {
     assert_equals "2" "$rc" "_hc_check_stale_node: blocks stale node (epoch mismatch)"
 }
 
+test_hc_check_stale_node_allow_fresh_sqlite_utc() {
+    echo "-- _hc_check_stale_node: allow fresh node in sqlite UTC format (no false TZ-stale)"
+    [ -f "$HOOK_COMMON" ] || { _hc_xfail "hook-common not yet created"; return; }
+    setup_test_env
+    # Node updated 60s AFTER session start, in the real sqlite zone-less UTC format.
+    # timegm(2026-01-01 12:00:00) = 1767268800; epoch 60s earlier = node is fresh.
+    echo "1767268740" > "$TEST_DIR/.session_epoch"
+    local rc=0
+    # Force a UTC-ahead zone: a naive `date -d` (local) parse would read the stamp
+    # ~5.5h earlier and falsely flag it stale. Correct UTC parse keeps it fresh.
+    bash -c "
+        export TZ='Asia/Kolkata'
+        export WV_HOT_ZONE='$TEST_DIR'
+        source '$HOOK_COMMON' 2>/dev/null
+        _HC_ACTIVE_NODES='[{\"id\":\"wv-abc\",\"text\":\"fresh task\",\"updated_at\":\"2026-01-01 12:00:00\"}]'
+        _hc_check_stale_node
+    " 2>/dev/null || rc=$?
+    assert_equals "0" "$rc" "_hc_check_stale_node: fresh sqlite-UTC node not falsely stale in UTC+ zone"
+}
+
 test_hc_check_contradictions_allow_none() {
     echo "-- _hc_check_contradictions: allow when no contradictions"
     [ -f "$HOOK_COMMON" ] || { _hc_xfail "hook-common not yet created"; return; }
@@ -493,6 +513,7 @@ main() {
     test_hc_check_active_node_block_none
     test_hc_check_stale_node_allow_no_epoch
     test_hc_check_stale_node_block_stale
+    test_hc_check_stale_node_allow_fresh_sqlite_utc
     test_hc_check_contradictions_allow_none
     test_hc_check_contradictions_block_present
 

@@ -538,13 +538,14 @@ assert_equals "" "$OUTPUT" "pre-close: minimal finding (violation_type only) pas
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 assert_equals "" "$OUTPUT" "pre-close: full finding metadata passes with skip-verification"
 
-# Free-text violation_type (not in enum) rejected
-"$WV" update "$FINDING_ID" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end"}}' 2>/dev/null
+# Free-text violation_type (not in enum) rejected — bypass write-time guard to test hook in isolation
+sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(metadata, '$.finding.violation_type', 'R10:open_node_at_end') WHERE id='$FINDING_ID';"
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "invalid enum" "pre-close: free-text violation_type rejected with enum hint"
 
-# Optional fields present but invalid are rejected
-"$WV" update "$FINDING_ID" --metadata='{"type":"finding","finding":{"violation_type":"repo:regression","confidence":0.92,"fixable":"yes"}}' 2>/dev/null
+# Optional fields present but invalid are rejected — bypass write-time guard to test hook in isolation
+_BAD_META='{"type":"finding","commit":"deadbeef","finding":{"violation_type":"repo:regression","confidence":0.92,"fixable":"yes"}}'
+sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json('$_BAD_META') WHERE id='$FINDING_ID';"
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $FINDING_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "finding.confidence" "pre-close: invalid optional field types are denied"
 

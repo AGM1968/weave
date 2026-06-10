@@ -72,8 +72,8 @@ _wv_run_cache_is_exempt_cmd() {
         # Operates outside brain.db (quality.db / ast_cache.db / /dev/shm)
         cache|hotzone|index|quality)
             return 0 ;;
-        # One-time setup — no existing cache state to invalidate
-        init|init-repo|self-update|selftest)
+        # One-time setup/teardown — no existing cache state to invalidate
+        init|init-repo|self-update|selftest|uninstall)
             return 0 ;;
         *) return 1 ;;
     esac

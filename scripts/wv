@@ -201,6 +201,7 @@ _wv_dispatch() {
         hotzone)         cmd_hotzone "$@" ;;
         test-record)     cmd_test_record "$@" ;;
         self-update)     cmd_self_update "$@" ;;
+        uninstall)       cmd_uninstall "$@" ;;
         recover)         cmd_recover "$@" ;;
         selftest)        cmd_selftest "$@" ;;
         mcp-status)      cmd_mcp_status "$@" ;;
@@ -260,10 +261,14 @@ main() {
 # Call Instrumentation (opt-in via WV_CALL_LOG)
 # ═══════════════════════════════════════════════════════════════════════════
 # When WV_CALL_LOG is set, each invocation appends one JSONL line:
-#   {"ts":<epoch>,"cmd":"wv <subcmd>","stdout_bytes":<n>,"stderr_bytes":<n>,"elapsed_ms":<n>,"source":"shell"}
+#   {"ts":<epoch>,"cmd":"wv <subcmd>","stdout_bytes":<n>,"stderr_bytes":<n>,"elapsed_ms":<n>,"source":<src>}
 #
-# Enable:  export WV_CALL_LOG=~/.local/share/weave/wv_calls.jsonl
-# Analyse: wv analyze sessions --call-stats
+# source values: "shell" (interactive terminal), "hook" (Claude Code hook),
+#                "sync" (wv sync --gh / weave_gh), "agent" (Claude Code tool call)
+# Callers set WV_CALL_SOURCE before invoking wv to tag their traffic.
+#
+# Enable:  wv config enable session-analysis
+# Analyse: wv analyze sessions --call-stats [--source=hook|sync|shell|agent]
 # Zero overhead when unset.
 
 if [[ -n "${WV_CALL_LOG:-}" ]]; then
@@ -281,8 +286,9 @@ if [[ -n "${WV_CALL_LOG:-}" ]]; then
     _wv_stdout_bytes=$(wc -c < "$_wv_out")
     _wv_stderr_bytes=$(wc -c < "$_wv_err")
     rm -f "$_wv_out" "$_wv_err"
-    printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"shell"}\n' \
-        "$_wv_ts_epoch" "${1:-help}" "$_wv_stdout_bytes" "$_wv_stderr_bytes" "$_wv_elapsed" \
+    _wv_source="${WV_CALL_SOURCE:-shell}"
+    printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"%s"}\n' \
+        "$_wv_ts_epoch" "${1:-help}" "$_wv_stdout_bytes" "$_wv_stderr_bytes" "$_wv_elapsed" "$_wv_source" \
         >> "$WV_CALL_LOG" 2>/dev/null || true
     exit "$_wv_exit"
 else

@@ -89,10 +89,10 @@ do_uninstall() {
         
         echo -e "${GREEN}✓ Removed CLI tools from $INSTALL_DIR${NC}"
         echo -e "${GREEN}✓ Removed lib modules from $LIB_DIR${NC}"
-        echo -e "${YELLOW}Note: Config at $CONFIG_DIR preserved (contains user data)${NC}"
+        _print_uninstall_notes
         return 0
     fi
-    
+
     echo "Reading manifest..."
     local count=0
     while IFS= read -r file; do
@@ -101,17 +101,32 @@ do_uninstall() {
             count=$((count + 1))
         fi
     done < "$MANIFEST"
-    
+
     # Remove empty directories
     rmdir "$LIB_DIR/lib" "$LIB_DIR/cmd" "$LIB_DIR" 2>/dev/null || true
-    
+
     rm -f "$MANIFEST"
-    
+
     echo -e "${GREEN}✓ Removed $count files${NC}"
+    _print_uninstall_notes
+}
+
+_print_uninstall_notes() {
+    local global_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
     echo -e "${YELLOW}Note: Config at $CONFIG_DIR preserved (contains user data)${NC}"
     echo ""
     echo "To fully remove Weave including config:"
     echo "  rm -rf $CONFIG_DIR"
+    echo ""
+    echo -e "${YELLOW}Note: Claude Code hook entries in $global_settings are NOT removed.${NC}"
+    echo "After deleting $CONFIG_DIR, clean the stale hooks key:"
+    echo "  jq 'del(.hooks)' $global_settings > /tmp/_wv_s.json && mv /tmp/_wv_s.json $global_settings"
+    echo ""
+    echo -e "${YELLOW}Note: Git hooks installed by wv-init-repo in consumer repos must be removed manually.${NC}"
+    echo "Per repo:"
+    echo "  rm -f /path/to/repo/.git/hooks/pre-commit"
+    echo "  rm -f /path/to/repo/.git/hooks/post-commit"
+    echo "  rm -f /path/to/repo/.git/hooks/prepare-commit-msg"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1725,6 +1740,7 @@ fi
 INITEOF
 
 chmod +x "$INSTALL_DIR/wv-init-repo"
+echo "$INSTALL_DIR/wv-init-repo" >> "$MANIFEST"
 
 # Create wv-update command (re-runs installer)
 # Capture the install source dir at install time so wv-update can find it later
@@ -1752,6 +1768,7 @@ else
 fi
 UPDATEEOF
 chmod +x "$INSTALL_DIR/wv-update"
+echo "$INSTALL_DIR/wv-update" >> "$MANIFEST"
 
 # MCP server (optional)
 if [ "$WITH_MCP" = "1" ]; then
@@ -1944,7 +1961,7 @@ case "${action:-install}" in
         echo "  --no-mcp           Skip MCP rebuild even if already installed"
         echo "  --verify           Run wv selftest after install to verify"
         echo "  --local-source=DIR Install from DIR instead of current directory"
-        echo "  --uninstall        Remove all installed files"
+        echo "  --uninstall        Remove manifest-tracked files (preserves ~/.config/weave; see output for manual cleanup)"
         echo "  --upgrade          Pull latest and reinstall"
         echo "  --check-deps       Check required dependencies"
         echo "  --help             Show this help"

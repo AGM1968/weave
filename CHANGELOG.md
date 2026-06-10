@@ -4,6 +4,38 @@
 
 ## Unreleased
 
+## [1.57.0] - 2026-06-10
+
+### Added
+
+- **Stale-signal gate on findings promotion.** `wv findings promote` now accepts `--since-days N`
+  (default 30) and refuses to promote findings whose evidence is older than the threshold. Prevents
+  stale findings from entering the graph with misleading urgency. Override with `--force`
+  (wv-9074c6).
+- **`wv uninstall` command.** Removes Weave from `~/.local/bin/`, `~/.local/lib/weave/`,
+  `~/.config/weave/`, and optionally `.weave/` in the current repo. Documented lifecycle companion
+  to `wv init-repo`. Install help updated to surface the command (wv-fb34e1).
+
+### Fixed
+
+- **Write-time enum guard for `finding.violation_type`.** `wv update` now validates
+  `finding.violation_type` against the canonical enum at write time, not only at close time.
+  Prevents invalid violation types from entering the DB silently (wv-dc9f3e).
+- **Pattern C finding schema reconciled.** `violation_type` enum expanded with `measurement-gap`;
+  `historical:tooling` remapped to `repo:hygiene`. Flat→nested schema inconsistency resolved
+  (wv-01c378).
+- **`wv sync --gh` defaults to fast mode.** Omitting `--mode` previously defaulted to `--mode=full`
+  (exhaustive reconcile across entire graph), which under GH auth failures created duplicate issues
+  and left done nodes with open GH issues. Default is now `--mode=fast` (routine close path). Use
+  `--mode=full` deliberately for periodic reconcile (wv-54db11).
+- **`uninstall` classified as exempt in run-cache registry.** `wv pattern-audit` Check 1 now passes
+  cleanly. Gate clock for Pattern A Rust port reset to 2026-06-10; not-before date 2026-06-24
+  (wv-bdee9e).
+- **`wv list --json` emits `created_at`/`updated_at` fields.** Stale-node UTC parse fixed for
+  downstream consumers that calculate node age (wv-7f08a1).
+- **Telemetry call-log four-count correctness.** `WV_CALL_LOG` entry counts corrected for
+  session-analysis consumers (wv-1ccd51).
+
 ## [1.56.1] - 2026-06-09
 
 ### Fixed

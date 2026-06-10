@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 
@@ -32,9 +33,10 @@ def _is_rate_limited(result: subprocess.CompletedProcess[str]) -> bool:
 def _run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     """Run a command with retry on rate limits."""
     result: subprocess.CompletedProcess[str] | None = None
+    env = {**os.environ, "WV_CALL_SOURCE": "sync"}
     for attempt in range(_MAX_RETRIES + 1):
         log.debug("$ %s (attempt %d)", " ".join(cmd), attempt + 1)
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
 
         if result.returncode == 0:
             return result

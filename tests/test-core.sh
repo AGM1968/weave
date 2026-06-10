@@ -480,9 +480,13 @@ test_done() {
     assert_fails "done rejects finding with no violation_type" \
         env WV_REQUIRE_LEARNING=1 "$WV" done "$finding_id" --skip-verification
 
-    # Invalid enum value rejected
-    "$WV" update "$finding_id" --metadata='{"type":"finding","finding":{"violation_type":"R10:open_node_at_end"}}' >/dev/null 2>&1
-    assert_fails "done rejects finding with free-text violation_type" \
+    # Write-time enum guard (wv-dc9f3e): off-enum violation_type rejected at UPDATE,
+    # not only at close — closes the gap that let invalid findings persist (wv-43f077).
+    assert_fails "update rejects off-enum finding violation_type (write-time guard)" \
+        "$WV" update "$finding_id" --metadata='{"finding":{"violation_type":"R10:open_node_at_end"}}'
+
+    # Invalid value never got written, so the node still lacks a violation_type and done fails.
+    assert_fails "done rejects finding with no valid violation_type" \
         env WV_REQUIRE_LEARNING=1 "$WV" done "$finding_id" --skip-verification
 
     # Minimal shape (violation_type only) accepted
@@ -1041,11 +1045,11 @@ test_bootstrap_agent() {
         "bootstrap-agent recommends lite MCP scope for Codex"
     assert_equals "$PROJECT_ROOT/scripts/wv work <id>" "$(echo "$bootstrap_json" | jq -r '.agent.codex.commands.claim // empty' 2>/dev/null || echo failed)" \
         "bootstrap-agent exposes Codex-safe claim command"
-    assert_contains "$(echo "$bootstrap_json" | jq -r '.agent.codex.telemetry.call_log // empty' 2>/dev/null || echo '')" "$WV_HOT_ZONE/wv_calls.jsonl" \
-        "bootstrap-agent exposes Codex-writable telemetry path"
-    assert_contains "$(echo "$bootstrap_json" | jq -r '.agent.codex.telemetry.enable_for_command // empty' 2>/dev/null || echo '')" "WV_CALL_LOG=" \
-        "bootstrap-agent gives Codex telemetry env wrapper"
-    assert_contains "$(echo "$bootstrap_json" | jq -r '.agent.codex.telemetry.analyze // empty' 2>/dev/null || echo '')" "analyze sessions --call-stats --log=" \
+    assert_contains "$(echo "$bootstrap_json" | jq -r '.agent.codex.telemetry.call_log // empty' 2>/dev/null || echo '')" "wv_calls.jsonl" \
+        "bootstrap-agent exposes telemetry call log path"
+    assert_contains "$(echo "$bootstrap_json" | jq -r '.agent.codex.telemetry.enable_for_command // empty' 2>/dev/null || echo '')" "session-analysis" \
+        "bootstrap-agent gives Codex telemetry enable command"
+    assert_contains "$(echo "$bootstrap_json" | jq -r '.agent.codex.telemetry.analyze // empty' 2>/dev/null || echo '')" "analyze sessions --call-stats" \
         "bootstrap-agent gives Codex telemetry analyze command"
     assert_contains "$(echo "$bootstrap_json" | jq -r '.agent.codex.network_policy.github_sync // empty' 2>/dev/null || echo '')" "CLI only" \
         "bootstrap-agent marks GitHub sync as CLI-only for Codex"

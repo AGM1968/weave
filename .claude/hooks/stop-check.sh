@@ -54,8 +54,11 @@ fi
 # Nodes active for >30 min with no update suggest a crashed or abandoned session.
 if [ -x "${WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
     _WV="${WV:-wv}"
-    IDLE_NODES=$("$_WV" list --json --all 2>/dev/null | jq -r --argjson cutoff "$(date -d '30 minutes ago' +%s 2>/dev/null || date -v-30M +%s 2>/dev/null || echo 0)" \
-        '.[] | select(.status=="active") | select((.updated_at | strptime("%Y-%m-%d %H:%M:%S") | mktime) < $cutoff) | "  \(.id): \(.text[:60])"' 2>/dev/null || true)
+    # Use `list --status=active --json` (db_query_json) — it carries updated_at;
+    # `query --format=json` (json-v2) strips timestamps for leanness. Active-node
+    # count is tiny in practice, so the list default cap is not a concern here.
+    IDLE_NODES=$("$_WV" list --status=active --json 2>/dev/null | jq -r --argjson cutoff "$(date -d '30 minutes ago' +%s 2>/dev/null || date -v-30M +%s 2>/dev/null || echo 0)" \
+        '.[] | select(.updated_at != null) | select((.updated_at | strptime("%Y-%m-%d %H:%M:%S") | mktime) < $cutoff) | "  \(.id): \(.text[:60])"' 2>/dev/null || true)
     if [ -n "$IDLE_NODES" ]; then
         echo "Note: active node(s) with no update in >30 min — possible abandoned work:" >&2
         echo "$IDLE_NODES" >&2
@@ -96,7 +99,7 @@ fi
 # Check for active nodes — genuine in-flight work, hard block regardless
 if [ -x "${_WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
     _WV="${_WV:-wv}"
-    ACTIVE_COUNT=$("$_WV" list --json --all 2>/dev/null | jq '[.[] | select(.status=="active")] | length' 2>/dev/null || echo "0")
+    ACTIVE_COUNT=$("$_WV" query status=active --format=json 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
     if [ "$ACTIVE_COUNT" -gt 0 ]; then
         if [ "$_SC_IN_COOLDOWN" = true ]; then
             echo "Note: $ACTIVE_COUNT active node(s) — close with wv done before ending session (cooldown active)." >&2

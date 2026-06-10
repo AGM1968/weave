@@ -13,6 +13,9 @@ if [ -n "${_WV_HOOK_COMMON_LOADED:-}" ]; then
 fi
 _WV_HOOK_COMMON_LOADED=1
 
+# Tag all wv calls from hook context so wv analyze --source=hook can isolate them.
+export WV_CALL_SOURCE="${WV_CALL_SOURCE:-hook}"
+
 _HC_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$_HC_LIB_DIR/wv-resolve-runtime.sh" 2>/dev/null || true
 
@@ -296,8 +299,11 @@ _hc_check_stale_node() {
 
     [ -n "$node_updated" ] && [ -n "$session_epoch" ] && [ "$session_epoch" != "0" ] || return 0
 
+    # updated_at comes from sqlite as a zone-less UTC stamp ("2026-06-10 11:40:00").
+    # Force UTC interpretation (strip a trailing Z first) so timezones ahead of UTC
+    # don't make every active node look hours-stale and falsely trip the block.
     local node_epoch stale_id stale_text
-    node_epoch=$(date -d "$node_updated" +%s 2>/dev/null || echo "0")
+    node_epoch=$(date -d "${node_updated%Z} UTC" +%s 2>/dev/null || echo "0")
     stale_id=$(echo "${_HC_ACTIVE_NODES:-[]}" | jq -r '.[0].id' 2>/dev/null || echo "?")
     stale_text=$(echo "${_HC_ACTIVE_NODES:-[]}" | jq -r '.[0].text // "[unknown]"' 2>/dev/null || echo "[unknown]")
 

@@ -1096,11 +1096,13 @@ def _finding_id(path: str, metric: str = "hotspot") -> str:
 def _wv_cmd(*cmd_args: str) -> tuple[int, str]:
     """Run a wv CLI command, return (returncode, stdout)."""
     try:
+        env = {**os.environ, "WV_CALL_SOURCE": "sync"}
         result = subprocess.run(
             [os.environ.get("WV_CLI", "wv"), *cmd_args],
             capture_output=True,
             text=True,
             check=False,
+            env=env,
         )
         return result.returncode, result.stdout.strip()
     except FileNotFoundError:
@@ -1804,6 +1806,13 @@ def main() -> int:  # pragma: no cover
         type=int,
         default=5,
         help="Reviewed candidate window size (default: 5)",
+    )
+    findings_promote_parser.add_argument(
+        "--since-days",
+        type=int,
+        default=30,
+        help="Stale-signal gate: only promote learnings whose source node closed "
+        "within N days (default: 30). 0 disables the gate (promote any age).",
     )
     findings_promote_parser.add_argument(
         "--parent", default="", help="Parent node ID to link via references"

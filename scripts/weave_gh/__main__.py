@@ -66,11 +66,11 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         choices=[m.value for m in Mode],
-        default=Mode.FULL.value,
+        default=Mode.FAST.value,
         help=(
-            "Sync mode: fast (scoped to focus node, routine close), full "
-            "(exhaustive, default), repair (operator recovery, exhaustive "
-            "with future resume checkpoints)."
+            "Sync mode: fast (scoped to focus node, routine close, default), "
+            "full (exhaustive reconcile, use deliberately), repair (operator "
+            "recovery with resume checkpoints)."
         ),
     )
     parser.add_argument(

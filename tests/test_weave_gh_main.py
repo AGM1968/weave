@@ -290,7 +290,7 @@ class TestMain:
             main()
 
         assert sync_calls[0]["dry_run"] is True
-        assert sync_calls[0]["mode"] is Mode.FULL
+        assert sync_calls[0]["mode"] is Mode.FAST
 
     def test_mode_flag_parsed(self) -> None:
         """--mode=fast|full|repair is parsed and forwarded to _run_full_sync."""
@@ -313,15 +313,15 @@ class TestMain:
             with pytest.raises(SystemExit):
                 main()
 
-    def test_default_mode_is_full(self) -> None:
-        """Omitting --mode passes Mode.FULL to _run_full_sync."""
+    def test_default_mode_is_fast(self) -> None:
+        """Omitting --mode passes Mode.FAST to _run_full_sync."""
         sync_calls: list[Mode] = []
         with patch.object(sys, "argv", ["weave_gh"]), patch(
             "weave_gh.__main__._run_full_sync",
             side_effect=lambda **k: sync_calls.append(k["mode"]),
         ):
             main()
-        assert sync_calls == [Mode.FULL]
+        assert sync_calls == [Mode.FAST]
 
     def test_node_flag_forwarded(self) -> None:
         """--node=<id> is forwarded as focus_node_id to _run_full_sync."""

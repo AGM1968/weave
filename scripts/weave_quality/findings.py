@@ -9,7 +9,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 _HISTORICAL_PATH_RE = re.compile(
@@ -29,11 +29,13 @@ _HISTORICAL_NUMBERED_ITEM_RE = re.compile(
 def _wv_cmd(*cmd_args: str) -> tuple[int, str]:
     """Run a wv CLI command, return (returncode, stdout)."""
     try:
+        env = {**os.environ, "WV_CALL_SOURCE": "sync"}
         result = subprocess.run(
             [os.environ.get("WV_CLI", "wv"), *cmd_args],
             capture_output=True,
             text=True,
             check=False,
+            env=env,
         )
         return result.returncode, result.stdout.strip()
     except FileNotFoundError:
@@ -699,14 +701,42 @@ def _historical_score_value(candidate: dict[str, object]) -> int:
     return score if isinstance(score, int) else 0
 
 
+def _node_updated_before(node: dict[str, Any], cutoff: datetime) -> bool:
+    """True if the node's updated_at (sqlite UTC stamp) is older than cutoff.
+
+    Missing/unparseable timestamp fails open (not filtered) so a node is never
+    silently dropped on bad data — the gate only excludes provably-old learnings.
+    """
+    ts = node.get("updated_at")
+    if not isinstance(ts, str) or not ts:
+        return False
+    try:
+        parsed = datetime.strptime(ts.replace("Z", "").strip(), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False
+    return parsed.replace(tzinfo=timezone.utc) < cutoff
+
+
 def _prepare_historical_candidates(
     loaded_nodes: list[dict[str, Any]],
+    max_age_days: int = 30,
 ) -> tuple[set[str], set[str], set[tuple[str, str]], list[dict[str, object]]]:
-    """Split nodes into existing finding indexes and ranked promotion candidates."""
+    """Split nodes into existing finding indexes and ranked promotion candidates.
+
+    Stale-signal gate: a learning whose source node closed more than `max_age_days`
+    ago likely describes an already-fixed issue, so promoting it resurfaces resolved
+    work as a fresh finding. Such learnings are skipped. `max_age_days <= 0` disables
+    the gate (promote any age).
+    """
     existing_ids: set[str] = set()
     existing_texts: set[str] = set()
     existing_source_roots: set[tuple[str, str]] = set()
     candidates_by_id: dict[str, dict[str, object]] = {}
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        if max_age_days > 0
+        else None
+    )
 
     for raw_node in loaded_nodes:
         metadata = _load_node_metadata(raw_node)
@@ -729,6 +759,12 @@ def _prepare_historical_candidates(
             continue
 
         if raw_node.get("status") != "done":
+            continue
+
+        # Stale-signal gate (B): skip learnings from nodes closed before the cutoff —
+        # an old learning likely describes an already-fixed issue (3/5 of the first
+        # promotion batch were already resolved, wv-54920f).
+        if cutoff is not None and _node_updated_before(raw_node, cutoff):
             continue
 
         for source_kind, text, promoted_from_learning in _collect_historical_segments(
@@ -1035,8 +1071,9 @@ def cmd_findings_promote(args: argparse.Namespace) -> int:
         return 1
 
     typed_nodes = [node for node in loaded_nodes if isinstance(node, dict)]
+    since_days: int = getattr(args, "since_days", 30)
     existing_ids, existing_texts, existing_source_roots, ranked = _prepare_historical_candidates(
-        typed_nodes
+        typed_nodes, max_age_days=since_days
     )
 
     selected_candidates, duplicate_skipped = _select_historical_candidates(

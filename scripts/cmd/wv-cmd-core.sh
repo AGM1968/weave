@@ -2219,7 +2219,7 @@ cmd_list() {
         fi
     elif [ "$format" = "json" ]; then
         local results
-        results=$(db_query_json "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
+        results=$(db_query_json "SELECT id, text, status, metadata, alias, created_at, updated_at FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
         [ -z "$results" ] && echo "[]" || echo "$results"
         if [ "$capped" = true ]; then
             local json_count
@@ -2652,6 +2652,23 @@ validate_update_metadata_json() {
         fi
         echo "Hint: use --metadata '{\"key\":\"value\"}' for inline JSON or --metadata-file <path> to avoid shell quoting issues." >&2
         return 1
+    fi
+
+    # Write-time enum guard: reject an explicitly-set off-enum finding.violation_type.
+    # Close-time validation alone let invalid findings persist in the graph
+    # (wv-43f077 historical:tooling, wv-f51319 measurement-gap — wv-01c378). Only fires
+    # when violation_type is being set, so incremental updates are unaffected.
+    local _wt_vt
+    _wt_vt=$(printf '%s' "$metadata_payload" | jq -r '.finding.violation_type // empty' 2>/dev/null || echo "")
+    if [ -n "$_wt_vt" ]; then
+        case " $FINDING_VIOLATION_TYPES " in
+            *" $_wt_vt "*) ;;
+            *)
+                echo -e "${RED}Error: invalid finding.violation_type '$_wt_vt' in ${metadata_source}${NC}" >&2
+                echo "  Valid: $FINDING_VIOLATION_TYPES" >&2
+                return 1
+                ;;
+        esac
     fi
 }
 

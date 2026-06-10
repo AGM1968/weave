@@ -238,13 +238,13 @@ _bootstrap_codex_json() {
     local wv_command="${1:-wv}"
     local wv_token telemetry_log telemetry_token
     wv_token=$(_bootstrap_shell_token "$wv_command")
-    telemetry_log=""
-    if [ -n "${WV_HOT_ZONE:-}" ]; then
-        telemetry_log="${WV_HOT_ZONE%/}/wv_calls.jsonl"
-    fi
-    telemetry_token=$(_bootstrap_shell_token "${telemetry_log:-/tmp/weave-codex-wv-calls.jsonl}")
+    # Use the durable config.env path when set; fall back to the persistent default.
+    # The hot-zone path (/tmp/weave-codex-*) was previously used here but is ephemeral
+    # and diverges from WV_CALL_LOG — two writers, two paths, no coordination.
+    telemetry_log="${WV_CALL_LOG:-${WV_CALL_LOG_DEFAULT:-$HOME/.local/share/weave/wv_calls.jsonl}}"
+    telemetry_token=$(_bootstrap_shell_token "$telemetry_log")
 
-    jq -n --arg wv "$wv_token" --arg telemetry_log "${telemetry_log:-/tmp/weave-codex-wv-calls.jsonl}" --arg telemetry_token "$telemetry_token" '{
+    jq -n --arg wv "$wv_token" --arg telemetry_log "$telemetry_log" --arg telemetry_token "$telemetry_token" '{
         mcp: {
             recommended_scope: "lite",
             safe_default: "weave-lite",
@@ -252,10 +252,10 @@ _bootstrap_codex_json() {
         },
         telemetry: {
             call_log: $telemetry_log,
-            scope: "codex-session",
-            durability: "ephemeral hot-zone path; readable/writable inside Codex sandbox",
-            enable_for_command: ("WV_CALL_LOG=" + $telemetry_token + " " + $wv + " <command>"),
-            analyze: ($wv + " analyze sessions --call-stats --log=" + $telemetry_token)
+            scope: "persistent",
+            durability: "durable log at ~/.local/share/weave/wv_calls.jsonl (config.env WV_CALL_LOG); survives reboot",
+            enable_for_command: "wv config enable session-analysis",
+            analyze: ($wv + " analyze sessions --call-stats")
         },
         commands: {
             bootstrap: ($wv + " bootstrap-agent --json"),
@@ -5439,6 +5439,9 @@ SEARCHHELP
         self-update)
             print_command_help "wv self-update" "Refresh installed wv from the dev clone recorded at install time. Equivalent to re-running install.sh from the source directory."
             ;;
+        uninstall)
+            print_command_help "wv uninstall" "Remove installed wv files. Delegates to install.sh --uninstall. Preserves ~/.config/weave (user data) — see output for manual cleanup of ~/.claude/settings.json hooks and consumer repo git hooks."
+            ;;
         selftest)
             print_command_help "wv selftest [--json]" "Run a round-trip smoke test in an isolated environment."
             ;;
@@ -5554,6 +5557,7 @@ Commands:
   edge-types        List valid semantic edge types [--stats] [--json]
   init-repo         Bootstrap repo for Weave [--agent=claude|copilot|codex|all] [--update] [--force]
   self-update       Refresh installed wv from the dev clone recorded at install time
+  uninstall         Remove installed wv files (delegates to install.sh --uninstall)
   doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]
   selftest          Round-trip smoke test in isolated environment [--json]
     mcp-status        Verify MCP server is built and IDE config shape is current [--json]
@@ -5698,6 +5702,34 @@ cmd_self_update() {
         "$wv_update_bin" "$@"
     else
         echo -e "${RED}✗${NC} No install source found. Re-run install.sh from the dev clone." >&2
+        return 1
+    fi
+}
+
+# cmd_uninstall — Remove installed wv files via install.sh --uninstall
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_uninstall() {
+    local source_path_file="$HOME/.config/weave/source-path"
+
+    if [ -f "$source_path_file" ]; then
+        local src_root; src_root=$(cat "$source_path_file" 2>/dev/null || echo "")
+        if [ -n "$src_root" ] && [ -f "$src_root/install.sh" ]; then
+            bash "$src_root/install.sh" --uninstall "$@"
+            return $?
+        fi
+    fi
+
+    # Fallback: download install.sh from GitHub and run --uninstall
+    local tmp_installer; tmp_installer=$(mktemp /tmp/wv-install-XXXXXX.sh)
+    echo "Downloading install.sh from GitHub..."
+    if curl -sSL "https://raw.githubusercontent.com/AGM1968/weave/main/install.sh" -o "$tmp_installer"; then
+        bash "$tmp_installer" --uninstall "$@"
+        local rc=$?
+        rm -f "$tmp_installer"
+        return $rc
+    else
+        rm -f "$tmp_installer"
+        echo -e "${RED}✗${NC} Could not reach GitHub. Run install.sh --uninstall manually." >&2
         return 1
     fi
 }

@@ -44,6 +44,7 @@ cmd_analyze_sessions() {
     local instrumentation_on=false
     [ -n "${WV_CALL_LOG:-}" ] && instrumentation_on=true
     local top_n=10
+    local source_filter=""
     local mode
     mode=$(wv_resolve_mode)
 
@@ -52,11 +53,13 @@ cmd_analyze_sessions() {
             --call-stats|--token-hogs) ;;   # primary mode flag — accepted, no-op (only mode for now)
             --log=*)      log_path="${arg#--log=}"; instrumentation_on=true ;;
             --top=*)      top_n="${arg#--top=}" ;;
+            --source=*)   source_filter="${arg#--source=}" ;;
             --help|-h)
-                echo "Usage: wv analyze sessions --call-stats [--log=<path>] [--top=N]"
+                echo "Usage: wv analyze sessions --call-stats [--log=<path>] [--top=N] [--source=<src>]"
                 echo ""
-                echo "  --log=<path>   JSONL call log (default: ~/.local/share/weave/wv_calls.jsonl)"
-                echo "  --top=N        Show top N commands (default: 10)"
+                echo "  --log=<path>      JSONL call log (default: ~/.local/share/weave/wv_calls.jsonl)"
+                echo "  --top=N           Show top N commands (default: 10)"
+                echo "  --source=<src>    Filter by call origin: shell, hook, sync, agent"
                 echo ""
                 echo "Enable logging (durable, picked up by CLI + hooks):"
                 echo "  wv config enable session-analysis"
@@ -85,11 +88,11 @@ cmd_analyze_sessions() {
 
     # Parse JSONL and aggregate by cmd using python3 (available in runtime env)
     local result
-    result=$(python3 - "$log_path" "$top_n" <<'PYEOF'
+    result=$(python3 - "$log_path" "$top_n" "$source_filter" <<'PYEOF'
 import json, sys
 from collections import defaultdict
 
-log_path, top_n = sys.argv[1], int(sys.argv[2])
+log_path, top_n, source_filter = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 totals: dict[str, dict] = defaultdict(lambda: {"calls": 0, "total_bytes": 0, "total_ms": 0})
 reopen_count = 0
 
@@ -106,6 +109,8 @@ try:
             if entry.get("event") == "reopen_done_node":
                 reopen_count += 1
                 continue
+            if source_filter and entry.get("source", "shell") != source_filter:
+                continue
             cmd = str(entry.get("cmd", "unknown"))
             stdout_b = int(entry.get("stdout_bytes", 0))
             stderr_b = int(entry.get("stderr_bytes", 0))
@@ -120,7 +125,8 @@ except OSError as exc:
 ranked = sorted(totals.items(), key=lambda x: x[1]["total_bytes"], reverse=True)[:top_n]
 print(json.dumps({
     "call_stats": [{"cmd": cmd, "approx_tokens": stats["total_bytes"] // 4, **stats} for cmd, stats in ranked],
-    "reopen_count": reopen_count
+    "reopen_count": reopen_count,
+    "source_filter": source_filter or None
 }))
 PYEOF
     ) || return 1
@@ -138,7 +144,11 @@ PYEOF
         return 0
     fi
 
-    printf "\n${CYAN}Top %s wv commands by output volume${NC}\n" "$top_n"
+    if [ -n "$source_filter" ]; then
+        printf "\n${CYAN}Top %s wv commands by output volume (source: %s)${NC}\n" "$top_n" "$source_filter"
+    else
+        printf "\n${CYAN}Top %s wv commands by output volume${NC}\n" "$top_n"
+    fi
     printf "${DIM}%-24s %10s %10s %8s %10s${NC}\n" "COMMAND" "BYTES" "~TOKENS" "CALLS" "AVG_MS"
     echo "$(printf '%0.s─' {1..66})"
 
