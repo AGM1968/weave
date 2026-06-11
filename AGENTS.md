@@ -46,6 +46,6 @@ MCP equivalent: `weave_code_search` (parameters: `query`, `mode`, `limit`, `grap
 
 ## Full documentation
 
-- **MCP:** `weave_guide` (topics: workflow, github, learnings, context)
+- **MCP:** `weave_guide` (topics: workflow, github, learnings, context, routing, mcp, verification, instrumentation, config, discovery)
 - **CLI:** `wv --help`, `wv help <command>`, or `~/.config/weave/WORKFLOW.md`
 - **Agent-specific instructions:** See the project's `CLAUDE.md`, `.github/copilot-instructions.md`, or equivalent for host-specific guidance

@@ -4,6 +4,47 @@
 
 ## Unreleased
 
+## [1.58.0] - 2026-06-11
+
+Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.md, sprints R1-R3).
+
+### Fixed
+
+- **P1: `wv done --verification-evidence` lost evidence containing apostrophes.** The verification
+  metadata write interpolated jq-built JSON raw into SQL; an apostrophe broke the statement, the
+  unchecked write failed silently, and the node closed without evidence — the post-close advisory
+  then blamed the caller. Now escaped like every sibling write AND rc-checked: a failed metadata
+  write aborts the close loudly. Apostrophe round-trip regression test added (A3-1, wv-c85280).
+- **Hotspot threshold unified across three divergent definitions.** Scan summary counted all-scope,
+  the report queried `WHERE hotspot > 0` then scope-filtered, and health-info hardcoded `0.5` — the
+  summary claimed crossers the report hid. New `count_hotspots()` is the single owner of
+  scope+threshold semantics; `top_hotspots()` applies the threshold in SQL; summary count and report
+  list now share one filter (A2-1, wv-c85280).
+- **`weave_guide` MCP enum allowed only 5 of the CLI's 10 guide topics** despite shelling out to
+  `wv guide`. Enum extended to all 10; stale topic lists in AGENTS/copilot/WORKFLOW templates
+  updated to match (A1-5, wv-4c1279).
+
+### Changed
+
+- **The bash CLI is now production scope in quality views.** `.weave/quality.conf [classify]`
+  promotes `scripts/cmd`, `scripts/lib`, `scripts/wv` — hotspots now surface the real crossers
+  (wv-cmd-ops.sh 0.89, wv-cmd-core.sh 0.64) instead of hiding the product. Quality score drops
+  accordingly; threshold/exemption recalibration is deliberate future work (A2-2, wv-4c1279).
+- **`wv --help` lists the five shipped-but-undocumented commands:** `impact`, `hotzone`,
+  `pattern-audit`, `validate-finding`, `test-record`; `discovery` added to the guide-topic line.
+  Help-surface test extended (A1-1, wv-4c1279).
+- **Session retro guidance prescribes `--since-days=1 --source=agent`** in close-session skill,
+  WORKFLOW template, WEAVE.md, and agent docs — unfiltered call-stats are dominated by cheap hook
+  calls and misread as agent behavior. WEAVE.md's stale `source` field values corrected to
+  `agent|shell|hook|sync|test` (wv-e7192c).
+
+### Hygiene
+
+- ARCHITECTURE.md: MCP tool count corrected (31 → 45), dead `make wv-compliance` claim removed,
+  header retitled as a dated baseline snapshot (A1-2/3/6, wv-d1d38b).
+- Legacy `scripts/sync-weave-gh.sh` archived to `archive/scripts/`; `test-gh-stress.sh` repointed.
+  Stray root `quality.db` and `9127bf5c/` hash-bug artifact removed (A1-4, A2-4, wv-d1d38b).
+
 ## [1.57.0] - 2026-06-10
 
 ### Added
@@ -22,7 +63,7 @@
   `finding.violation_type` against the canonical enum at write time, not only at close time.
   Prevents invalid violation types from entering the DB silently (wv-dc9f3e).
 - **Pattern C finding schema reconciled.** `violation_type` enum expanded with `measurement-gap`;
-  `historical:tooling` remapped to `repo:hygiene`. Flat→nested schema inconsistency resolved
+  `historical:tooling` remapped to `historical:defect`. Flat→nested schema inconsistency resolved
   (wv-01c378).
 - **`wv sync --gh` defaults to fast mode.** Omitting `--mode` previously defaulted to `--mode=full`
   (exhaustive reconcile across entire graph), which under GH auth failures created duplicate issues

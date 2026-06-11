@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-query.sh — Tests for wv query command
 #
 # Tests: predicate parsing, HAS (dual-schema), MATCH FTS, IN, stale,

@@ -130,11 +130,11 @@ fi
 # Retro: surface call-stats if session analysis is enabled and a log exists
 if [ -x "${_WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
     _WV="${_WV:-wv}"
-    _CALL_STATS=$("$_WV" analyze sessions --call-stats --top=3 --json 2>/dev/null || true)
+    _CALL_STATS=$("$_WV" analyze sessions --call-stats --top=3 --since-days=1 --json 2>/dev/null || true)
     if echo "$_CALL_STATS" | jq -e '.call_stats | length > 0' >/dev/null 2>&1; then
         _TOP_CMD=$(echo "$_CALL_STATS" | jq -r '.call_stats[0] | "\(.cmd) (\(.calls) calls, ~\(.approx_tokens|tostring) tok)"' 2>/dev/null || true)
         if [ -n "$_TOP_CMD" ]; then
-            echo "Retro: top command this session: $_TOP_CMD. Full report: wv analyze sessions --call-stats" >&2
+            echo "Retro: top command today: $_TOP_CMD. Full report: wv analyze sessions --call-stats --since-days=1" >&2
         fi
     fi
 fi

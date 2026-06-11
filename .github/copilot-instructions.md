@@ -96,6 +96,6 @@ MCP equivalent: `weave_code_search` (parameters: `query`, `mode`, `limit`, `grap
 
 ## Reference
 
-- MCP: `weave_guide` (topics: workflow, github, learnings, context)
+- MCP: `weave_guide` (topics: workflow, github, learnings, context, routing, mcp, verification, instrumentation, config, discovery)
 - CLI: `wv --help`, `wv help <command>`, or `~/.config/weave/WORKFLOW.md`
 <!-- ── END WEAVE COPILOT.MD ── -->

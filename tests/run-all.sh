@@ -11,6 +11,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Tag suite-driven wv calls so call-stats can separate them from real traffic.
+# (config.env force-enables WV_CALL_LOG even under test env overrides, so suite
+# runs DO write to the user's durable call log — tag them rather than pollute
+# source=shell/agent.)
+export WV_CALL_SOURCE=test
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'

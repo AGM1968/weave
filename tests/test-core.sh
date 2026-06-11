@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-core.sh — Test core Weave commands
 #
 # Tests: init, add, done, list, show, ready, status
@@ -460,6 +462,17 @@ test_done() {
     file_done_meta=$("$WV" show "$file_done_id" --json 2>&1)
     assert_contains "$file_done_meta" "prefer file inputs for long agent learnings" "done --learning-file stores learning metadata"
     assert_contains "$file_done_meta" "12 passed in agent-safe close flow" "done --verification-evidence-file stores verification evidence"
+
+    # Regression (audit A3-1): apostrophes in verification text must survive the
+    # SQL round-trip — previously the metadata write failed silently and the
+    # node still closed with no evidence stored.
+    local apos_id apos_output apos_meta
+    apos_id=$("$WV" add "Task with apostrophe evidence" --force 2>&1 | node_id_from_output)
+    apos_output=$("$WV" done "$apos_id" --learning="pattern: escape user text in SQL" --verification-method="it's a manual check" --verification-evidence="user's apostrophe survives the round-trip" 2>&1)
+    assert_contains "$apos_output" "Closed" "done with apostrophes in verification text succeeds"
+    apos_meta=$("$WV" show "$apos_id" --json 2>&1)
+    assert_contains "$apos_meta" "apostrophe survives the round-trip" "apostrophe verification evidence present after close"
+    assert_contains "$apos_meta" "a manual check" "apostrophe verification method present after close"
 
     # Done on non-existent node fails
     assert_fails "done on non-existent node fails" "$WV" done "wv-0000"
@@ -1359,6 +1372,7 @@ test_help_surfaces() {
         reindex learnings trails digest session-summary audit-pitfalls edge-types init-repo
         doctor selftest mcp-status health guide prune clean-ghosts compact refs import quality
         findings analyze batch sync load
+        impact hotzone pattern-audit validate-finding test-record
     )
 
     local cmd

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-durability.sh — Test durable execution patterns
 #
 # Tests: journal-wrapped ship/sync/delete, crash simulation at each step,

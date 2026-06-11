@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-sprint34.sh — Test Sprint 3+4 features
 #
 # Tests: wv tree, wv plan, aliases, learning quality scoring,

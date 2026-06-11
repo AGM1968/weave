@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-hook-common.sh — Tests for wv-hook-common.sh shared hook library
 #
 # Sprint 1 prerequisite: wv-0ab403 (feat(S1): extract wv-hook-common.sh)

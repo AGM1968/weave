@@ -108,6 +108,22 @@ def rank_hotspots(
     return above[:top_n]
 
 
+def count_hotspots(
+    entries: list[FileEntry],
+    stats: list[GitStats],
+    scope: str = "production",
+    threshold: float = HOTSPOT_THRESHOLD,
+) -> int:
+    """Count threshold-crossing hotspots within scope.
+
+    Single owner of the count semantics: scan summary, hotspots report,
+    and health info must all agree on scope + threshold, or the summary
+    count and the report list contradict each other.
+    """
+    scoped_paths = {e.path for e in entries if _entry_in_scope(e, scope)}
+    return sum(1 for s in stats if s.path in scoped_paths and s.hotspot > threshold)
+
+
 # ---------------------------------------------------------------------------
 # CC Gini coefficient (complexity concentration)
 # ---------------------------------------------------------------------------
@@ -265,13 +281,17 @@ def hotspot_summary(
     stats: list[GitStats],
     fn_cc_list: list[FunctionCC] | None = None,
     top_n: int = 10,
+    scope: str = "production",
 ) -> dict[str, Any]:
     """Generate a hotspot summary report dict.
 
-    Used by both CLI output and --json mode.
+    Used by both CLI output and --json mode.  The hotspot count and the
+    listed items share one filter (same scope, same threshold) so the
+    summary can never claim crossers the report does not list.
     """
     entry_by_path = {e.path: e for e in entries}
-    ranked = rank_hotspots(stats, top_n=top_n)
+    scoped_paths = {e.path for e in entries if _entry_in_scope(e, scope)}
+    ranked = rank_hotspots([s for s in stats if s.path in scoped_paths], top_n=top_n)
 
     items = []
     for gs in ranked:
@@ -290,6 +310,6 @@ def hotspot_summary(
     return {
         "hotspots": items,
         "total_files": len(entries),
-        "hotspot_count": sum(1 for s in stats if s.hotspot > HOTSPOT_THRESHOLD),
-        "quality_score": compute_quality_score(entries, stats, fn_cc_list),
+        "hotspot_count": count_hotspots(entries, stats, scope=scope),
+        "quality_score": compute_quality_score(entries, stats, fn_cc_list, scope=scope),
     }

@@ -273,6 +273,21 @@ class TestGitStats:
         assert top[0].path == "hot.py"
         assert top[1].path == "warm.py"
 
+    def test_top_hotspots_applies_threshold(self, db: sqlite3.Connection) -> None:
+        # Regression (audit A2-1): query previously used WHERE hotspot > 0,
+        # listing below-threshold files the scan summary never counted.
+        stats = [
+            GitStats(path="hot.py", churn=100, hotspot=0.95),
+            GitStats(path="warm.py", churn=50, hotspot=0.6),
+            GitStats(path="tepid.py", churn=20, hotspot=0.3),
+            GitStats(path="cold.py", churn=2, hotspot=0.0),
+        ]
+        bulk_upsert_git_stats(db, stats)
+        top = top_hotspots(db, top_n=10)
+        assert [s.path for s in top] == ["hot.py", "warm.py"]
+        top = top_hotspots(db, top_n=10, threshold=0.7)
+        assert [s.path for s in top] == ["hot.py"]
+
 
 # ---------------------------------------------------------------------------
 # co_change

@@ -1,4 +1,6 @@
 #!/bin/bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-config.sh — Tests for `wv config`, the durable-knob front door, the honest
 # session-analysis reader (O1a), and the doctor verification-gate checks (O2).
 # Covers finding wv-e754b0 onboarding fixes.

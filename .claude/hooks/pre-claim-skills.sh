@@ -64,24 +64,26 @@ if [[ "$COMMAND" =~ wv[[:space:]]update[[:space:]]wv-[0-9a-f]{4,6}.*--status=act
                   + "."' 2>/dev/null || echo "")
         fi
 
-        # Tiers (checked in order — first failing tier blocks):
-        #   1. done_criteria missing → soft deny (node is unplanned)
-        #   2. premortem/risks missing → advisory, grounded in wv impact blast radius
-        #   3. alias missing → soft deny (graph unreadable without aliases)
-        #   4. all present → silent pass
+        # Combined preflight (wv-7c28f4): evaluate ALL gates and report every
+        # unmet one in a single deny, instead of serial discovery across retries.
+        # Gate set and decisions are unchanged:
+        #   done_criteria missing → deny (node is unplanned)
+        #   alias missing         → deny (graph unreadable without short names)
+        #   premortem/risks missing → advisory (deny once, proceed allowed)
+        gates=""
         if [[ "$HAS_SHIP_IT" == "false" ]]; then
-            reason="Run /ship-it before claiming $NODE_ID ($NODE_TEXT) — done_criteria not set. Use --criteria= on wv add, or: wv update $NODE_ID --metadata='{\"done_criteria\":[...]}'"
-            jq -n --arg reason "$reason" \
-                '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$reason}}'
-            exit 0
-        elif [[ "$HAS_PRE_MORTEM" == "false" ]]; then
-            reason="Consider running /pre-mortem (risks) before claiming $NODE_ID ($NODE_TEXT). Proceed with wv update if already done."
+            gates="${gates}[1] done_criteria not set — run /ship-it, use --criteria= on wv add, or: wv update $NODE_ID --metadata='{\"done_criteria\":[...]}'. "
+        fi
+        if [[ -z "$NODE_ALIAS" ]]; then
+            gates="${gates}[2] alias not set — graph is unreadable without short names: wv update $NODE_ID --alias=<short-name>. "
+        fi
+        if [[ "$HAS_PRE_MORTEM" == "false" ]]; then
+            gates="${gates}[3] risks/premortem not set (advisory) — consider /pre-mortem, or --risks= on wv add; proceed if already assessed. "
+        fi
+        if [[ -n "$gates" ]]; then
+            reason="Claim preflight for $NODE_ID ($NODE_TEXT) — unmet gates: $gates"
+            reason="${reason}Satisfy all in one pass, then re-run the claim."
             [[ -n "$IMPACT_LINE" ]] && reason="$reason $IMPACT_LINE"
-            jq -n --arg reason "$reason" \
-                '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$reason}}'
-            exit 0
-        elif [[ -z "$NODE_ALIAS" ]]; then
-            reason="Set an alias before claiming $NODE_ID — graph is unreadable without short names. Run: wv update $NODE_ID --alias=<short-name>"
             jq -n --arg reason "$reason" \
                 '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$reason}}'
             exit 0

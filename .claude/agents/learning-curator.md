@@ -29,7 +29,8 @@ produce proposed learning text and the exact CLI command a shell-capable agent s
 - Use `wv query status=done --limit=N --format=json` for recent done candidates.
 - Avoid `wv list --all` except during explicit audits.
 - Use `git log --grep=<node>` and `git show <commit>` only for candidate nodes.
-- Use `wv analyze sessions --call-stats` when curation workflows produce too much output.
+- Use `wv analyze sessions --call-stats --since-days=1 --source=agent` when curation workflows
+  produce too much output.
 
 ## Learning Schema
 

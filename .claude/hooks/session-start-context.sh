@@ -165,7 +165,9 @@ ${CONTEXT}"
 fi
 
 # Append health score (single line, best effort)
-HEALTH_JSON=$("$WV" health --json 2>/dev/null || echo "")
+# --fast: score-only cached path (wv-0d77b1); older wv versions ignore the
+# flag and fall back to a full health run, so this degrades gracefully.
+HEALTH_JSON=$("$WV" health --fast --json 2>/dev/null || echo "")
 if [ -n "$HEALTH_JSON" ]; then
     HEALTH_SCORE=$(echo "$HEALTH_JSON" | jq -r '.score // empty' 2>/dev/null || true)
     if [ -n "$HEALTH_SCORE" ]; then

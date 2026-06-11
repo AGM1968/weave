@@ -79,6 +79,7 @@ from weave_quality.hotspots import (
     classify_hotspot,
     compute_hotspots,
     compute_quality_score,
+    count_hotspots,
     hotspot_summary,
 )
 from weave_quality.findings import cmd_findings_promote
@@ -1344,7 +1345,7 @@ def cmd_health_info(args: argparse.Namespace) -> None:
     conn.close()
 
     score = compute_quality_score(entries, all_stats, all_fn_cc)
-    hotspot_count = sum(1 for s in all_stats if s.hotspot > 0.5)
+    hotspot_count = count_hotspots(entries, all_stats)
 
     print(
         json.dumps(

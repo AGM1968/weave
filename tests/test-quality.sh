@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-quality.sh -- Test wv quality scan and reset commands (Sprint 3)
 #
 # Tests: wv quality scan, wv quality scan --json, wv quality reset,

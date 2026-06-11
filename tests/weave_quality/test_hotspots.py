@@ -15,6 +15,7 @@ from weave_quality.hotspots import (
     classify_hotspot,
     compute_hotspots,
     compute_quality_score,
+    count_hotspots,
     hotspot_summary,
     rank_hotspots,
     _normalize_values,
@@ -309,6 +310,65 @@ class TestHotspotSummary:
         stats = [_stats(f"f{i}.py", hotspot=0.6 + i * 0.01) for i in range(10)]
         result = hotspot_summary(entries, stats, top_n=3)
         assert len(result["hotspots"]) <= 3
+
+    def test_count_matches_listed_hotspots(self) -> None:
+        # Regression (audit A2-1): count and list previously used different
+        # filters — count was all-scope, list was scope-filtered but had no
+        # threshold, so the summary claimed crossers the report never showed.
+        entries = [
+            _entry("prod_hot.py", complexity=40, category="production"),
+            _entry("prod_cool.py", complexity=5, category="production"),
+            _entry("script_hot.sh", complexity=40, category="script"),
+        ]
+        stats = [
+            _stats("prod_hot.py", churn=100, hotspot=0.9),
+            _stats("prod_cool.py", churn=10, hotspot=0.3),
+            _stats("script_hot.sh", churn=90, hotspot=0.8),
+        ]
+        result = hotspot_summary(entries, stats)
+        assert result["hotspot_count"] == len(result["hotspots"]) == 1
+        assert result["hotspots"][0]["path"] == "prod_hot.py"
+
+    def test_summary_scope_all(self) -> None:
+        entries = [
+            _entry("prod_hot.py", category="production"),
+            _entry("script_hot.sh", category="script"),
+        ]
+        stats = [
+            _stats("prod_hot.py", hotspot=0.9),
+            _stats("script_hot.sh", hotspot=0.8),
+        ]
+        result = hotspot_summary(entries, stats, scope="all")
+        assert result["hotspot_count"] == len(result["hotspots"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Count
+# ---------------------------------------------------------------------------
+
+
+class TestCountHotspots:
+    def test_scope_excludes_out_of_scope_crossers(self) -> None:
+        entries = [
+            _entry("prod.sh", category="production"),
+            _entry("script.sh", category="script"),
+        ]
+        stats = [
+            _stats("prod.sh", hotspot=0.9),
+            _stats("script.sh", hotspot=0.8),
+        ]
+        assert count_hotspots(entries, stats) == 1
+        assert count_hotspots(entries, stats, scope="all") == 2
+        assert count_hotspots(entries, stats, scope="script") == 1
+
+    def test_threshold_param(self) -> None:
+        entries = [_entry("a.py"), _entry("b.py")]
+        stats = [_stats("a.py", hotspot=0.6), _stats("b.py", hotspot=0.4)]
+        assert count_hotspots(entries, stats) == 1
+        assert count_hotspots(entries, stats, threshold=0.3) == 2
+
+    def test_empty(self) -> None:
+        assert count_hotspots([], []) == 0
 
 
 # ---------------------------------------------------------------------------

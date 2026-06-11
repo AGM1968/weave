@@ -402,6 +402,10 @@ print(json.dumps(items))
                 echo -e "${RED}Error: --parent required when active epics exist (use --force or --standalone to override)${NC}" >&2
                 echo -e "${CYAN}  Active epic(s): $epic_list${NC}" >&2
                 echo -e "${CYAN}  Usage: wv add \"...\" --parent=<epic-id>${NC}" >&2
+                # Combined preflight: report every other unmet gate now, not on retry
+                if [ -z "$alias" ]; then
+                    echo -e "${CYAN}  Also missing: --alias=<short-name> (required at claim time)${NC}" >&2
+                fi
                 # Remove the orphan node we just created
                 db_query "DELETE FROM nodes WHERE id='$id';" 2>/dev/null || true
                 return 1
@@ -411,6 +415,18 @@ print(json.dumps(items))
                 echo -e "${YELLOW}⚠ No alias — use --alias=<name>${NC}" >&2
             fi
         fi
+    fi
+
+    # Creating a node directly in active status IS a claim (Pattern B: WorkClaimed
+    # event) — mirror cmd_work so the first edit is not hard-blocked in discover phase.
+    if [ "$status" = "active" ]; then
+        local add_agent_id
+        add_agent_id="$(sql_escape "${WV_AGENT_ID:-$(hostname)-$(whoami)}")"
+        db_query "UPDATE nodes
+            SET metadata = json_set(COALESCE(metadata,'{}'), '\$.claimed_by', '$add_agent_id')
+            WHERE id = '$id';" 2>/dev/null || true
+        set_primary_node "$id"
+        wv_set_phase "execute"
     fi
 
     # Auto-unblock cascade when created with --status=done
@@ -1191,14 +1207,18 @@ cmd_done() {
     # Write inline verification metadata immediately so the pre-close hook
     # sees it on any subsequent re-check (and for auditability).
     if [ -n "$verification_method" ] || [ -n "$verification_evidence" ]; then
-        local ver_json
+        local ver_json ver_json_esc
         ver_json=$(jq -n \
             --arg m "$verification_method" \
             --arg e "$verification_evidence" \
             '{verification_method: $m, verification_evidence: $e} | with_entries(select(.value != ""))')
-        db_query "UPDATE nodes
-            SET metadata = json_patch(COALESCE(metadata,'{}'), json('$ver_json'))
-            WHERE id='$id';"
+        ver_json_esc="${ver_json//\'/\'\'}"
+        if ! db_query "UPDATE nodes
+            SET metadata = json_patch(COALESCE(metadata,'{}'), json('$ver_json_esc'))
+            WHERE id='$id';"; then
+            echo -e "${RED}Error: failed to write verification metadata for $id — node not closed${NC}" >&2
+            return 1
+        fi
     fi
 
     local node_meta pending_reason pending_resume_cmd

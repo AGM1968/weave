@@ -61,11 +61,18 @@ wv done <id>
 After pushing, check if any commands dominated context cost this session:
 
 ```bash
-wv analyze sessions --call-stats --top=5
+wv analyze sessions --call-stats --top=5 --since-days=1 --source=agent
 ```
 
-If output shows `wv list` at the top by a large margin, switch to `wv query` or `wv search` for
-targeted reads next session. See `wv guide --topic=discovery`.
+Always pass a window (`--since-days=1` for a session retro) AND `--source=agent`. Unwindowed output
+is a lifetime aggregate that mixes instrumentation eras — it surfaces long-fixed costs, not this
+session's. Without the source filter, high-frequency hook calls (filtered, ~500 B, mostly never
+entering context) dominate the call counts and make institutional background noise look like an
+agent behavior problem (2026-06-11 retro misread). `source=sync` and `source=test` are excluded by
+default; `--source=agent` narrows to the only slice that actually costs context.
+
+If the agent-sourced output shows `wv list` at the top by a large margin, switch to `wv query` or
+`wv search` for targeted reads next session. See `wv guide --topic=discovery`.
 
 Enable persistent tracking if not already on: `wv config enable session-analysis`
 

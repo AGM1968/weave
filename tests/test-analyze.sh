@@ -1,4 +1,6 @@
 #!/bin/bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-analyze.sh — Tests for wv analyze sessions --call-stats
 # Weave-ID: wv-ad7df8
 
@@ -128,6 +130,98 @@ assert_contains "$output" "wv show" "--token-hogs alias still works"
 output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$LOG" 2>&1)
 assert_contains "$output" "approx_tokens" "approx_tokens field in JSON output"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Windowing + sync exclusion (wv-079d76 — era-blind call-stats)
+# Fixture: one 30-day-old entry, one fresh entry, one fresh sync entry,
+# one entry with no timestamp.
+# ═══════════════════════════════════════════════════════════════════════════
+WLOG=$(mktemp)
+NOW=$(date +%s)
+OLD=$((NOW - 30 * 86400))
+cat >"$WLOG" <<EOF
+{"ts":$OLD.0,"cmd":"wv oldcmd","stdout_bytes":1000,"stderr_bytes":0,"elapsed_ms":5,"source":"shell"}
+{"ts":$NOW.0,"cmd":"wv newcmd","stdout_bytes":2000,"stderr_bytes":0,"elapsed_ms":5,"source":"shell"}
+{"ts":$NOW.0,"cmd":"wv synccmd","stdout_bytes":99999,"stderr_bytes":0,"elapsed_ms":5,"source":"sync"}
+{"cmd":"wv notscmd","stdout_bytes":10,"stderr_bytes":0,"elapsed_ms":5,"source":"shell"}
+{"ts":$NOW.0,"cmd":"wv testcmd","stdout_bytes":5000,"stderr_bytes":0,"elapsed_ms":5,"source":"test"}
+{"ts":$NOW.0,"cmd":"wv agentcmd","stdout_bytes":3000,"stderr_bytes":0,"elapsed_ms":5,"source":"agent"}
+EOF
+
+# Test W1: source=sync excluded by default, exclusion reported
+output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$WLOG" 2>&1)
+assert_not_contains "$output" "wv synccmd" "sync traffic excluded by default"
+assert_contains "$output" '"sync_calls": 1' "excluded sync call count reported"
+
+# Test W2: --include-sync restores sync traffic
+output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$WLOG" --include-sync 2>&1)
+assert_contains "$output" "wv synccmd" "--include-sync counts sync traffic"
+
+# Test W3: explicit --source=sync is an implicit opt-in
+output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$WLOG" --source=sync 2>&1)
+assert_contains "$output" "wv synccmd" "--source=sync includes sync traffic"
+assert_not_contains "$output" "wv newcmd" "--source=sync excludes other sources"
+
+# Test W4: --since-days=7 drops the 30-day-old entry and the no-ts entry
+output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$WLOG" --since-days=7 2>&1)
+assert_contains "$output" "wv newcmd" "--since-days keeps in-window entry"
+assert_not_contains "$output" "wv oldcmd" "--since-days drops out-of-window entry"
+assert_not_contains "$output" "wv notscmd" "--since-days drops entries with no timestamp"
+assert_contains "$output" '"no_ts": 1' "no-timestamp exclusion count reported"
+assert_contains "$output" '"window"' "window metadata present in JSON"
+
+# Test W5: --since=<epoch> works as an absolute cutoff
+output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$WLOG" --since=$((NOW - 86400)) 2>&1)
+assert_contains "$output" "wv newcmd" "--since=<epoch> keeps recent entry"
+assert_not_contains "$output" "wv oldcmd" "--since=<epoch> drops old entry"
+
+# Test W6: --since=<YYYY-MM-DD> date form accepted
+output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$WLOG" --since=2001-01-01 2>&1)
+assert_contains "$output" "wv oldcmd" "--since=<date> includes entries after the date"
+
+# Test W7: invalid --since / --since-days rejected with clear error
+output=$($WV analyze sessions --call-stats --log="$WLOG" --since=notadate 2>&1 || true)
+assert_contains "$output" "invalid --since" "invalid --since value rejected"
+output=$($WV analyze sessions --call-stats --log="$WLOG" --since-days=abc 2>&1 || true)
+assert_contains "$output" "invalid --since-days" "invalid --since-days value rejected"
+
+# Test W8: --json forces JSON output even outside discover mode
+output=$(WV_MODE=execute $WV analyze sessions --call-stats --log="$WLOG" --json 2>&1)
+assert_contains "$output" '"call_stats"' "--json forces JSON output in execute mode"
+
+# Test W9: no window + wide span emits lifetime-aggregate note
+output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$WLOG" 2>&1)
+assert_contains "$output" "lifetime aggregate" "wide unwindowed span carries era advisory note"
+
+# Test W10: human table footer reports sync exclusion
+output=$(WV_MODE=execute $WV analyze sessions --call-stats --log="$WLOG" 2>&1)
+assert_contains "$output" "sync-internal" "table footer reports sync exclusion"
+
+# Test W11: source=test excluded by default, exclusion reported (wv-67871d)
+output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$WLOG" 2>&1)
+assert_not_contains "$output" "wv testcmd" "test-suite traffic excluded by default"
+assert_contains "$output" '"test_calls": 1' "excluded test call count reported"
+
+# Test W12: --include-test restores suite traffic; --source=test is implicit opt-in
+output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$WLOG" --include-test 2>&1)
+assert_contains "$output" "wv testcmd" "--include-test counts suite traffic"
+output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$WLOG" --source=test 2>&1)
+assert_contains "$output" "wv testcmd" "--source=test includes suite traffic"
+assert_not_contains "$output" "wv newcmd" "--source=test excludes other sources"
+
+# Test W13: agent-tagged traffic counted normally and filterable
+output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$WLOG" --source=agent 2>&1)
+assert_contains "$output" "wv agentcmd" "--source=agent isolates agent traffic"
+
+# Test W14: hook-common forces WV_CALL_SOURCE=hook even when session env says agent
+hooked=$(WV_CALL_SOURCE=agent bash -c 'source "'"$REPO_ROOT"'/scripts/lib/wv-hook-common.sh" 2>/dev/null; echo "$WV_CALL_SOURCE"')
+if [ "$hooked" = "hook" ]; then
+    echo -e "  ${GREEN}✓${NC} wv-hook-common.sh overrides inherited agent tag with hook"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "  ${RED}✗${NC} wv-hook-common.sh overrides inherited agent tag with hook (got: '$hooked')"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+
 echo ""
 echo "═══════════════════════════════════════════════════════════════════════════"
 echo "  wv analyze suites (LL3 — durable suite-run history)"
@@ -137,7 +231,7 @@ echo ""
 # Synthetic suite history: test-core 3 runs (1 fail, durs 180k/200k/160k),
 # test-graph 2 runs (durs 35k/40k). nearest-rank p95 of core = 200000.
 SUITELOG=$(mktemp)
-trap 'rm -f "$LOG" "$SUITELOG"' EXIT
+trap 'rm -f "$LOG" "$WLOG" "$SUITELOG"' EXIT
 cat >"$SUITELOG" <<'EOF'
 {"ts":"2026-05-31T10:00:00Z","repo":"r","suite":"tests/test-core.sh","files":"a.sh","exit":0,"duration_ms":180000,"sha":"aaa1"}
 {"ts":"2026-05-31T10:05:00Z","repo":"r","suite":"tests/test-core.sh","files":"b.sh","exit":1,"duration_ms":200000,"sha":"aaa2"}

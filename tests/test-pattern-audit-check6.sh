@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-pattern-audit-check6.sh — Tests for pattern-audit Check 6
 #
 # Source: finding wv-f752a5 / wv-8bb0f4 (recurrence) — "not ready" intent

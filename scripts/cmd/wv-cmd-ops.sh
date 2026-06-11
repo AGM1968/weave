@@ -4027,6 +4027,7 @@ cmd_health() {
     local history_count=0
     local fix=false
     local strict=false
+    local fast=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -4036,6 +4037,7 @@ cmd_health() {
             --history=*) history_count="${1#--history=}" ;;
             --fix) fix=true ;;
             --strict) strict=true ;;
+            --fast) fast=true ;;
         esac
         shift
     done
@@ -4043,6 +4045,58 @@ cmd_health() {
     # Handle --history: show log and exit
     if [ "$history_count" -gt 0 ] 2>/dev/null; then
         _health_show_history "$history_count" "$format"
+        return 0
+    fi
+
+    # --fast: score-focused path for hook callers (wv-0d77b1). Skips quality
+    # collection — the score is computed before quality and does not depend on
+    # it, so the value is exact, not approximate. Freshness reuses the run-cache
+    # write sentinel (touched after every successful write command), so any
+    # CLI graph write invalidates the cache; the TTL bounds staleness from
+    # out-of-band writers that bypass the CLI (direct sqlite, runtime).
+    if [ "$fast" = "true" ]; then
+        local cache_file="$WV_HOT_ZONE/.health_fast.json"
+        local fast_ttl="${WV_HEALTH_FAST_TTL:-300}"
+        if [ -f "$cache_file" ]; then
+            local _hf_now _hf_mtime _hf_age _hf_fresh=true
+            _hf_now=$(date +%s)
+            _hf_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
+            _hf_age=$((_hf_now - _hf_mtime))
+            [ "$_hf_age" -le "$fast_ttl" ] || _hf_fresh=false
+            if [ -f "$WV_RUN_CACHE_SENTINEL" ] && [ "$cache_file" -ot "$WV_RUN_CACHE_SENTINEL" ]; then
+                _hf_fresh=false
+            fi
+            if [ "$_hf_fresh" = "true" ]; then
+                if [ "$format" = "json" ]; then
+                    cat "$cache_file"
+                else
+                    echo "Health: $(jq -r '.score' "$cache_file" 2>/dev/null)/100 (fast, cached)"
+                fi
+                return 0
+            fi
+        fi
+        _health_collect_metrics
+        _health_compute_score
+        # Append to the same trend log as the full path (only on recompute —
+        # a cache hit means the DB is unchanged, so the data point is a duplicate)
+        if [ -d "$WEAVE_DIR" ]; then
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%S)" \
+                "$_h_health_score" "$_h_total_nodes" "$_h_total_edges" \
+                "$_h_orphan_nodes" "$_h_ghost_edges" >> "$WEAVE_DIR/health.log"
+        fi
+        jq -n \
+            --arg score "${_h_health_score:-0}" \
+            --arg nodes "${_h_total_nodes:-0}" \
+            --arg edges "${_h_total_edges:-0}" \
+            --arg orphans "${_h_orphan_nodes:-0}" \
+            '{"score":($score|tonumber),"total_nodes":($nodes|tonumber),"total_edges":($edges|tonumber),"orphan_nodes":($orphans|tonumber),"fast":true}' \
+            > "$cache_file.tmp" 2>/dev/null && mv "$cache_file.tmp" "$cache_file"
+        if [ "$format" = "json" ]; then
+            cat "$cache_file" 2>/dev/null || jq -n --arg s "${_h_health_score:-0}" '{"score":($s|tonumber),"fast":true}'
+        else
+            echo "Health: ${_h_health_score}/100 (fast)"
+        fi
         return 0
     fi
 
@@ -5100,7 +5154,7 @@ Two opt-in surfaces ship OFF by default. Turn them on through one front door —
 
 1. Session analysis (which wv commands cost the most output/tokens)
    wv config enable session-analysis     # sets WV_CALL_LOG in config.env
-   wv analyze sessions --call-stats       # read the report
+   wv analyze sessions --call-stats --since-days=1   # read the report (windowed)
    wv config disable session-analysis
 
    Enablement lives in ~/.config/weave/config.env (override dir: WV_CONFIG_DIR)
@@ -5206,9 +5260,10 @@ to reach for BEFORE editing, not after.
 
   wv analyze sessions   Telemetry: top commands by output bytes / approx tokens.
     --call-stats          Run this after a session to see where context goes.
-                          wv list averages ~12k tokens/call; wv search/query ~600.
-                          Prefer query or search (20x cheaper) over wv list for
-                          targeted reads. Reserve wv list for full enumeration only.
+                          Window it (--since-days=1) for retro reading — unwindowed
+                          output is a lifetime aggregate across instrumentation eras.
+                          Prefer query or search over wv list for targeted reads;
+                          reserve wv list for full enumeration only.
 
   wv cache              Prompt-cache health for the project.
                           --sessions=N, --all; ratio >65% OK / 35-65% LOW / <35% BAD
@@ -5449,7 +5504,7 @@ SEARCHHELP
             print_command_help "wv mcp-status [--json]" "Check whether the local MCP server is built and whether the IDE config contains the current Weave server/env entries."
             ;;
         health)
-            print_command_help "wv health [--history[=N]] [--verbose] [--json]" "Run system health checks and optionally include recent health history."
+            print_command_help "wv health [--history[=N]] [--verbose] [--json] [--fast]" "Run system health checks and optionally include recent health history. --fast serves a score-focused result from a write-invalidated cache (WV_HEALTH_FAST_TTL, default 300s) and skips quality collection — intended for hook callers."
             ;;
         guide)
             print_command_help "wv guide [--topic=workflow|github|learnings|context|routing|mcp|verification|instrumentation|config|discovery]" "Show a quick reference for common Weave workflows, routing rules, and integrations."
@@ -5543,6 +5598,7 @@ Commands:
   related <id>      Show semantic relationships ([--type=] [--direction=] [--json])
   edges <id>        Inspect all edges for a node ([--type=] [--json])
   path <id>         Show ancestry chain
+  impact <id>...    Blast-radius: impacted nodes, risk, unblocked work, test suites [--files=] [--json]
   tree              Show epic -> task hierarchy [--active] [--depth=N] [--json] [--mermaid] [root]
   plan <file>       Import markdown section as epic + tasks [--sprint=N] [--gh] [--dry-run] [--template]
   enrich-topology   Apply epic/task topology from JSON spec [--dry-run] [--sync-gh]
@@ -5554,16 +5610,19 @@ Commands:
   digest            Compact one-liner health summary [--json]
   session-summary   Session activity stats (nodes created/completed, learnings)
   audit-pitfalls    Show all pitfalls with resolution status
+  pattern-audit     Audit source for recurring bug-pattern invariants [--json] [--strict]
   edge-types        List valid semantic edge types [--stats] [--json]
   init-repo         Bootstrap repo for Weave [--agent=claude|copilot|codex|all] [--update] [--force]
   self-update       Refresh installed wv from the dev clone recorded at install time
   uninstall         Remove installed wv files (delegates to install.sh --uninstall)
   doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]
+  hotzone <sub>     Hot-zone DB directories (list, gc) [--json] [--dry-run]
   selftest          Round-trip smoke test in isolated environment [--json]
+  test-record <suite> Record a test-suite run for verification freshness (used by git hooks)
     mcp-status        Verify MCP server is built and IDE config shape is current [--json]
   health            System health check with score and diagnostics [--history[=N]]
   config            Manage durable opt-in knobs [list|get|set|unset|enable|disable]
-    guide             Workflow quick reference [--topic=workflow|github|learnings|context|routing|mcp|verification|instrumentation|config]
+    guide             Workflow quick reference [--topic=workflow|github|learnings|context|routing|mcp|verification|instrumentation|config|discovery]
   prune             Archive old done nodes
   unarchive <id>    Restore a pruned node from .weave/archive/ [--dry-run] [--with-edges]
   clean-ghosts      Delete ghost edges referencing deleted nodes [--dry-run] [legacy compatibility]
@@ -5572,6 +5631,7 @@ Commands:
   import <file>     Import from beads JSONL or JSON
   quality <sub>     Code quality scanner (scan, hotspots, diff, promote, reset)
   findings <sub>    Historical finding promotion (list, promote)
+  validate-finding <id>  Validate finding metadata: exit 0/1 + JSON errors (used by pre-close hook)
   analyze <sub>     Analyze agent session traces and instrumentation data
   query [pred...]   Predicate-based graph reader (status=, HAS, MATCH, IN)
   batch [file]      Execute multiple wv commands from file or stdin [--dry-run] [--stop-on-error]

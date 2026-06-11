@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-sprint2b.sh — Test Sprint 2b: Agent Orientation features
 #
 # Tests: breadcrumbs, digest, learnings filters/modes, write-time validation

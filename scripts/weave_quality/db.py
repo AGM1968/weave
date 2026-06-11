@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .hotspots import HOTSPOT_THRESHOLD
 from .models import (
     CKMetrics,
     CoChange,
@@ -709,13 +710,15 @@ def get_git_stats(conn: sqlite3.Connection, path: str | None = None) -> list[Git
     return [GitStats.from_dict(dict(r)) for r in rows]
 
 
-def top_hotspots(conn: sqlite3.Connection, top_n: int = 10) -> list[GitStats]:
-    """Get top N files by hotspot score from git_stats."""
+def top_hotspots(
+    conn: sqlite3.Connection, top_n: int = 10, threshold: float = HOTSPOT_THRESHOLD
+) -> list[GitStats]:
+    """Get top N files above the hotspot threshold from git_stats."""
     rows = conn.execute(
         """SELECT * FROM git_stats
-           WHERE hotspot > 0
+           WHERE hotspot > ?
            ORDER BY hotspot DESC LIMIT ?""",
-        (top_n,),
+        (threshold, top_n),
     ).fetchall()
     return [GitStats.from_dict(dict(r)) for r in rows]
 

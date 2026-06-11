@@ -36,6 +36,7 @@ run_hook_suite() {
     GIT_CONFIG_COUNT=1 \
         GIT_CONFIG_KEY_0=core.hooksPath \
         GIT_CONFIG_VALUE_0=/dev/null \
+        WV_CALL_SOURCE=test \
         bash "$REPO_ROOT/$_pc_suite" </dev/null >/dev/null 2>&1
     _pc_rc=$?
     _pc_dur=$(hook_duration_ms "$_pc_t0")

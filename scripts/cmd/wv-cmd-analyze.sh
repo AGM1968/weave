@@ -2,7 +2,7 @@
 # wv-cmd-analyze.sh — wv analyze subcommand
 #
 # Usage:
-#   wv analyze sessions --call-stats [--log=<path>] [--top=N]
+#   wv analyze sessions --call-stats [--log=<path>] [--top=N] [--since-days=N] [--include-sync]
 #   wv analyze suites [--log=<path>] [--json]
 #
 # Reads a JSONL call log (enable durably with `wv config enable session-analysis`,
@@ -45,21 +45,38 @@ cmd_analyze_sessions() {
     [ -n "${WV_CALL_LOG:-}" ] && instrumentation_on=true
     local top_n=10
     local source_filter=""
+    local since_days="" since_raw="" include_sync=0 include_test=0 want_json=""
     local mode
     mode=$(wv_resolve_mode)
 
     for arg in "$@"; do
         case "$arg" in
             --call-stats|--token-hogs) ;;   # primary mode flag — accepted, no-op (only mode for now)
-            --log=*)      log_path="${arg#--log=}"; instrumentation_on=true ;;
-            --top=*)      top_n="${arg#--top=}" ;;
-            --source=*)   source_filter="${arg#--source=}" ;;
+            --log=*)        log_path="${arg#--log=}"; instrumentation_on=true ;;
+            --top=*)        top_n="${arg#--top=}" ;;
+            --source=*)     source_filter="${arg#--source=}" ;;
+            --since-days=*) since_days="${arg#--since-days=}" ;;
+            --since=*)      since_raw="${arg#--since=}" ;;
+            --include-sync) include_sync=1 ;;
+            --include-test) include_test=1 ;;
+            --json)         want_json=1 ;;
             --help|-h)
                 echo "Usage: wv analyze sessions --call-stats [--log=<path>] [--top=N] [--source=<src>]"
+                echo "                            [--since-days=N | --since=<date>] [--include-sync]"
+                echo "                            [--include-test] [--json]"
                 echo ""
                 echo "  --log=<path>      JSONL call log (default: ~/.local/share/weave/wv_calls.jsonl)"
                 echo "  --top=N           Show top N commands (default: 10)"
-                echo "  --source=<src>    Filter by call origin: shell, hook, sync, agent"
+                echo "  --source=<src>    Filter by call origin: agent, shell, hook, sync, test"
+                echo "  --since-days=N    Only count calls from the last N days"
+                echo "  --since=<date>    Only count calls at/after <date> (YYYY-MM-DD or epoch seconds)"
+                echo "  --include-sync    Count source=sync traffic (excluded by default: pipeline-internal"
+                echo "                    stdout that never enters agent context)"
+                echo "  --include-test    Count source=test traffic (excluded by default: suite-driven calls)"
+                echo "  --json            Force JSON output (default in discover/bootstrap mode)"
+                echo ""
+                echo "Unwindowed runs are lifetime aggregates and may span instrumentation eras;"
+                echo "for retro reading, always pass a window (e.g. --since-days=1)."
                 echo ""
                 echo "Enable logging (durable, picked up by CLI + hooks):"
                 echo "  wv config enable session-analysis"
@@ -67,6 +84,28 @@ cmd_analyze_sessions() {
                 ;;
         esac
     done
+
+    # Resolve the window to an epoch cutoff. --since wins over --since-days.
+    local since_epoch=""
+    if [ -n "$since_raw" ]; then
+        case "$since_raw" in
+            ''|*[!0-9.]*)
+                if ! since_epoch=$(date -d "$since_raw" +%s 2>/dev/null); then
+                    echo "wv analyze: invalid --since value: '$since_raw' (use YYYY-MM-DD or epoch seconds)" >&2
+                    return 1
+                fi
+                ;;
+            *) since_epoch="$since_raw" ;;
+        esac
+    elif [ -n "$since_days" ]; then
+        case "$since_days" in
+            ''|*[!0-9]*)
+                echo "wv analyze: invalid --since-days value: '$since_days' (expected a positive integer)" >&2
+                return 1
+                ;;
+        esac
+        since_epoch=$(( $(date +%s) - since_days * 86400 ))
+    fi
 
     if [ ! -f "$log_path" ]; then
         if [ "$mode" = "discover" ] || [ "$mode" = "bootstrap" ]; then
@@ -88,13 +127,24 @@ cmd_analyze_sessions() {
 
     # Parse JSONL and aggregate by cmd using python3 (available in runtime env)
     local result
-    result=$(python3 - "$log_path" "$top_n" "$source_filter" <<'PYEOF'
-import json, sys
+    result=$(python3 - "$log_path" "$top_n" "$source_filter" "$since_epoch" "$include_sync" "$include_test" <<'PYEOF'
+import json, sys, time
 from collections import defaultdict
 
 log_path, top_n, source_filter = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+since_epoch = float(sys.argv[4]) if sys.argv[4] else None
+include_sync = sys.argv[5] == "1"
+include_test = sys.argv[6] == "1"
+# Explicit --source=<src> is an opt-in to that traffic, same as --include-<src>.
+drop_sources = set()
+if not include_sync and source_filter != "sync":
+    drop_sources.add("sync")
+if not include_test and source_filter != "test":
+    drop_sources.add("test")
 totals: dict[str, dict] = defaultdict(lambda: {"calls": 0, "total_bytes": 0, "total_ms": 0})
 reopen_count = 0
+excluded = {"sync_calls": 0, "sync_bytes": 0, "test_calls": 0, "test_bytes": 0, "no_ts": 0}
+min_ts = max_ts = None
 
 try:
     with open(log_path, encoding="utf-8") as fh:
@@ -106,14 +156,35 @@ try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            ts = None
+            try:
+                if entry.get("ts") is not None:
+                    ts = float(entry["ts"])
+            except (TypeError, ValueError):
+                pass
+            if since_epoch is not None:
+                if ts is None:
+                    # Era-blind entry: no timestamp means no place in a window.
+                    excluded["no_ts"] += 1
+                    continue
+                if ts < since_epoch:
+                    continue
             if entry.get("event") == "reopen_done_node":
                 reopen_count += 1
                 continue
-            if source_filter and entry.get("source", "shell") != source_filter:
+            source = entry.get("source", "shell")
+            if source_filter and source != source_filter:
                 continue
-            cmd = str(entry.get("cmd", "unknown"))
             stdout_b = int(entry.get("stdout_bytes", 0))
             stderr_b = int(entry.get("stderr_bytes", 0))
+            if source in drop_sources:
+                excluded[f"{source}_calls"] += 1
+                excluded[f"{source}_bytes"] += stdout_b + stderr_b
+                continue
+            if ts is not None:
+                min_ts = ts if min_ts is None or ts < min_ts else min_ts
+                max_ts = ts if max_ts is None or ts > max_ts else max_ts
+            cmd = str(entry.get("cmd", "unknown"))
             elapsed = int(entry.get("elapsed_ms", 0))
             totals[cmd]["calls"] += 1
             totals[cmd]["total_bytes"] += stdout_b + stderr_b
@@ -122,16 +193,26 @@ except OSError as exc:
     print(json.dumps({"error": str(exc)}))
     sys.exit(1)
 
+span_days = round((max_ts - min_ts) / 86400) if min_ts is not None and max_ts is not None else 0
 ranked = sorted(totals.items(), key=lambda x: x[1]["total_bytes"], reverse=True)[:top_n]
-print(json.dumps({
+out = {
     "call_stats": [{"cmd": cmd, "approx_tokens": stats["total_bytes"] // 4, **stats} for cmd, stats in ranked],
     "reopen_count": reopen_count,
-    "source_filter": source_filter or None
-}))
+    "source_filter": source_filter or None,
+    "window": ({"since_epoch": since_epoch,
+                "since": time.strftime("%Y-%m-%d %H:%M", time.localtime(since_epoch))}
+               if since_epoch is not None else None),
+    "span_days": span_days,
+    "excluded": excluded,
+}
+if since_epoch is None and span_days > 14:
+    out["note"] = (f"lifetime aggregate spanning {span_days} days — may mix instrumentation eras; "
+                   "use --since-days=N for retro reading")
+print(json.dumps(out))
 PYEOF
     ) || return 1
 
-    if [ "$mode" = "discover" ] || [ "$mode" = "bootstrap" ]; then
+    if [ -n "$want_json" ] || [ "$mode" = "discover" ] || [ "$mode" = "bootstrap" ]; then
         echo "$result"
         return 0
     fi
@@ -140,7 +221,11 @@ PYEOF
     local count
     count=$(echo "$result" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d['call_stats']))")
     if [ "$count" = "0" ]; then
-        echo "Call log exists but contains no parseable entries: $log_path"
+        if [ -n "$since_epoch" ]; then
+            echo "No calls in the requested window. Widen it (--since-days) or drop the window for lifetime stats."
+        else
+            echo "Call log exists but contains no parseable entries: $log_path"
+        fi
         return 0
     fi
 
@@ -163,6 +248,20 @@ for r in rows:
 reopen = d.get('reopen_count', 0)
 if reopen:
     print(f\"\\nPattern E — reopen (update done→active): {reopen} time{'s' if reopen != 1 else ''}\")
+win = d.get('window')
+if win:
+    print(f\"\\nWindow: since {win['since']}\")
+exc = d.get('excluded') or {}
+if exc.get('sync_calls'):
+    mb = exc['sync_bytes'] / 1e6
+    print(f\"Excluded: {exc['sync_calls']} sync-internal calls ({mb:.1f} MB pipeline stdout, never enters context) — --include-sync to count\")
+if exc.get('test_calls'):
+    mb = exc['test_bytes'] / 1e6
+    print(f\"Excluded: {exc['test_calls']} suite-driven calls ({mb:.1f} MB test stdout) — --include-test to count\")
+if exc.get('no_ts'):
+    print(f\"Excluded: {exc['no_ts']} entries with no timestamp (cannot be windowed)\")
+if d.get('note'):
+    print(f\"Note: {d['note']}\")
 "
     printf "\nLog: %s\n" "$log_path"
 }

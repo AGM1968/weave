@@ -14,7 +14,10 @@ fi
 _WV_HOOK_COMMON_LOADED=1
 
 # Tag all wv calls from hook context so wv analyze --source=hook can isolate them.
-export WV_CALL_SOURCE="${WV_CALL_SOURCE:-hook}"
+# Unconditional: the Claude Code session env carries WV_CALL_SOURCE=agent
+# (settings.json), which hooks inherit — a lifecycle hook is infrastructure,
+# not model-driven traffic, so it must override the inherited tag.
+export WV_CALL_SOURCE=hook
 
 _HC_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$_HC_LIB_DIR/wv-resolve-runtime.sh" 2>/dev/null || true

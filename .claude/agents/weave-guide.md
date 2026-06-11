@@ -54,7 +54,7 @@ wv add "<task>" --status=active --criteria="check 1|check 2" --risks=low
 | Bulk graph changes | `wv batch <file> --dry-run`                        | unreviewed repeated commands       |
 | Read learnings     | `wv learnings --recent=N`, `--grep`, `--node`      | dumping all learnings              |
 | Code discovery     | `wv search --code`, `rg`                           | slow recursive grep                |
-| Tune economy       | `wv analyze sessions --call-stats`                 | guessing which calls are expensive |
+| Tune economy       | `wv analyze sessions --call-stats --since-days=1 --source=agent` | guessing which calls are expensive |
 
 ## Standard Lifecycle
 

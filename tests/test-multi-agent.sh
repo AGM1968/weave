@@ -1,4 +1,6 @@
 #!/bin/bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-multi-agent.sh — Integration tests for multi-agent delta merge (Sprint 1)
 
 set -euo pipefail

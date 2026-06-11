@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-crash-sentinel.sh — Test crash sentinel detection and session recovery
 #
 # Tests: sentinel lifecycle, crash detection, auto-breadcrumb, wv recover --session,

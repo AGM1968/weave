@@ -1,4 +1,6 @@
 #!/bin/bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # Test: wv add --parent preserves child ID in stdout
 # Regression test for bug where invalidate_context_cache clobbered $id variable
 # Fixed in: scripts/lib/wv-cache.sh (use node_id instead of id in for loop)

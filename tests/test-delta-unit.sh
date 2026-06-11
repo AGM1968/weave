@@ -1,4 +1,6 @@
 #!/bin/bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-delta-unit.sh — Unit tests for wv-delta.sh changeset logic
 #
 # Tests the SQL-generating-SQL layer directly: triggers, changeset output,

@@ -264,11 +264,13 @@ main() {
 #   {"ts":<epoch>,"cmd":"wv <subcmd>","stdout_bytes":<n>,"stderr_bytes":<n>,"elapsed_ms":<n>,"source":<src>}
 #
 # source values: "shell" (interactive terminal), "hook" (Claude Code hook),
-#                "sync" (wv sync --gh / weave_gh), "agent" (Claude Code tool call)
+#                "sync" (wv sync --gh / weave_gh), "agent" (Claude Code tool call,
+#                via settings.json env), "test" (suite runs via run-all.sh or the
+#                pre-commit suite gate)
 # Callers set WV_CALL_SOURCE before invoking wv to tag their traffic.
 #
 # Enable:  wv config enable session-analysis
-# Analyse: wv analyze sessions --call-stats [--source=hook|sync|shell|agent]
+# Analyse: wv analyze sessions --call-stats [--source=agent|shell|hook|sync|test]
 # Zero overhead when unset.
 
 if [[ -n "${WV_CALL_LOG:-}" ]]; then

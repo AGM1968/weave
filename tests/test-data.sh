@@ -1,4 +1,6 @@
 #!/bin/bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-data.sh — Tests for wv data commands (sync, load, import, prune, learnings, refs)
 # Weave-ID: wv-4b44
 

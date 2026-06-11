@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-hooks.sh — Test all Claude Code hooks
 #
 # Tests each hook in .claude/hooks/ with simulated JSON input.
@@ -411,6 +413,10 @@ assert_exit_code "0" "$EXIT_CODE" "pre-claim: exits 0 (soft deny) for real Bash 
 assert_contains "$OUTPUT" "hookSpecificOutput" "pre-claim: uses canonical hookSpecificOutput schema"
 assert_contains "$OUTPUT" "permissionDecision" "pre-claim: contains permissionDecision field"
 assert_contains "$OUTPUT" "/ship-it" "pre-claim: suggests ship-it when done_criteria absent"
+# Combined preflight (wv-7c28f4): ALL unmet gates in ONE message, not serial discovery.
+# ID is missing criteria AND alias AND risks — every gate must appear in a single deny.
+assert_contains "$OUTPUT" "alias" "pre-claim combined: alias gate reported alongside done_criteria"
+assert_contains "$OUTPUT" "pre-mortem" "pre-claim combined: premortem advisory reported alongside done_criteria"
 
 # Node with done_criteria but no risks → tiered advisory
 ID2=$("$WV" add "Claim test criteria-only" --metadata='{"done_criteria":["c1"]}' --force 2>/dev/null | tail -1)

@@ -1,4 +1,6 @@
 #!/bin/bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-health.sh — Tests for wv health inspection commands (health, audit-pitfalls, edge-types)
 #
 # Run: bash tests/test-health.sh
@@ -545,6 +547,48 @@ if [ "$strict_exit" -ne 0 ]; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo -e "  ${RED}✗${NC} health --strict should exit non-zero for warnings"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+
+# ============================================================================
+# --fast cached path (wv-0d77b1)
+# ============================================================================
+echo ""
+echo "Testing: health --fast cached path"
+
+reset_db
+$WV add "fast cache probe" --force >/dev/null 2>&1
+
+# Cold run emits valid JSON with a numeric score and fast marker
+FAST_JSON=$($WV health --fast --json 2>/dev/null)
+FAST_SCORE=$(echo "$FAST_JSON" | jq -r '.score // empty' 2>/dev/null)
+FAST_FLAG=$(echo "$FAST_JSON" | jq -r '.fast // empty' 2>/dev/null)
+assert_equals "true" "$FAST_FLAG" "health --fast emits fast:true marker"
+if [ -n "$FAST_SCORE" ] && [ "$FAST_SCORE" -ge 0 ] 2>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} health --fast emits numeric score ($FAST_SCORE)"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "  ${RED}✗${NC} health --fast score missing or non-numeric: '$FAST_SCORE'"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+
+# Warm run serves identical JSON from cache
+FAST_JSON2=$($WV health --fast --json 2>/dev/null)
+assert_equals "$FAST_JSON" "$FAST_JSON2" "health --fast warm hit serves identical cached JSON"
+
+# Fast score matches full health score (exact, not approximate)
+FULL_SCORE=$($WV health --json 2>/dev/null | jq -r '.score // empty' 2>/dev/null)
+assert_equals "$FULL_SCORE" "$FAST_SCORE" "health --fast score matches full health score"
+
+# A write invalidates the cache (sentinel): node count must reflect the write
+$WV add "fast cache invalidator" --force >/dev/null 2>&1
+NODES_BEFORE=$(echo "$FAST_JSON" | jq -r '.total_nodes' 2>/dev/null)
+NODES_AFTER=$($WV health --fast --json 2>/dev/null | jq -r '.total_nodes' 2>/dev/null)
+if [ "$NODES_AFTER" -eq $((NODES_BEFORE + 1)) ] 2>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} write invalidates fast cache (nodes $NODES_BEFORE -> $NODES_AFTER)"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "  ${RED}✗${NC} fast cache stale after write (nodes $NODES_BEFORE -> $NODES_AFTER)"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 

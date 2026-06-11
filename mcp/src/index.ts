@@ -1125,9 +1125,20 @@ const TOOLS: Tool[] = [
       properties: {
         topic: {
           type: "string",
-          enum: ["workflow", "github", "learnings", "context", "mcp"],
+          enum: [
+            "workflow",
+            "github",
+            "learnings",
+            "context",
+            "routing",
+            "mcp",
+            "verification",
+            "instrumentation",
+            "config",
+            "discovery",
+          ],
           description:
-            "Topic to show: workflow (default, 5-step process), github (issue integration), learnings (format + commands), context (load policy + wv context usage), mcp (server setup + tools)",
+            "Topic to show: workflow (default, 5-step process), github (issue integration), learnings (format + commands), context (load policy + wv context usage), routing (phase loop + tool classes), mcp (server setup + tools), verification (test-map + gate flow), instrumentation (opt-in knobs), config (durable knobs), discovery (read-only audit toolset)",
         },
       },
       required: [],
@@ -2314,7 +2325,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.57.0",
+      version: "1.58.0",
     },
     {
       capabilities: {

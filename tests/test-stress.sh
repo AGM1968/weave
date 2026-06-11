@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-stress.sh — Stress testing & resilience hardening for Weave CLI
 #
 # Tests: sync round-trip, concurrency, scale, recovery, fuzzing, bug regressions, integration

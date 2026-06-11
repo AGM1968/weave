@@ -24,7 +24,8 @@ Only create a new active node when no related node fits.
 - Use targeted readers: `show`, `context`, `search`, `query`, `related`, `edges`, `learnings`.
 - Avoid `wv list --all` except for intentional exhaustive audits.
 - Prefer `wv query` for filtered graph reads, for example `wv query status=done HAS learning`.
-- Use `wv analyze sessions --call-stats` to find expensive command patterns.
+- Use `wv analyze sessions --call-stats --since-days=1 --source=agent` to find expensive command
+  patterns (window + source filter; unfiltered counts are dominated by cheap hook calls).
 - Use `wv search --code` for indexed code discovery; use `rg` for exact filesystem search.
 
 ## Weave Memory Primitives

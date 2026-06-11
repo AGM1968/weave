@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-journal.sh — Test operation journal (wv-journal.sh)
 #
 # Tests: journal_begin, journal_step, journal_complete, journal_end,

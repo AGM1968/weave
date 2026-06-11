@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-validate-finding.sh — Golden fixture tests for wv validate-finding
 #
 # Contract: exit 0 = valid, exit 1 = invalid, stdout = {"valid":bool,"errors":[...]}
@@ -139,8 +141,19 @@ test_invalid_violation_type_exits_one() {
     echo "Test: invalid violation_type enum"
     setup_test_env
     local id
-    id=$(_add_finding "$(_invalid_violation_type_meta)")
+    id=$("$WV" add "test finding node" 2>/dev/null | tail -1)
+
+    # Tier 1: wv update --metadata rejects an invalid enum at write time.
     local rc=0
+    "$WV" update "$id" --metadata="$(_invalid_violation_type_meta)" >/dev/null 2>&1 || rc=$?
+    assert_exit 1 "$rc" "invalid enum: rejected at update time"
+
+    # Read-side branch (pre-close hook still validates legacy/dirty data):
+    # plant the bad metadata via direct sqlite, bypassing the write-time guard.
+    local db
+    db=$("$WV" hotzone --db 2>/dev/null)
+    sqlite3 "$db" "UPDATE nodes SET metadata='$(_invalid_violation_type_meta)' WHERE id='$id';"
+    rc=0
     "$WV" validate-finding "$id" >/dev/null 2>&1 || rc=$?
     assert_exit 1 "$rc" "invalid enum: exits 1"
 

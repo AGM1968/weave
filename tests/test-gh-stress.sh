@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-gh-stress.sh — GitHub API stress tests for Weave sync
 #
 # IMPORTANT: These tests hit the live GitHub API. They are NOT part of the
@@ -20,7 +22,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WV="$PROJECT_ROOT/scripts/wv"
-SYNC_SCRIPT="$PROJECT_ROOT/scripts/sync-weave-gh.sh"
+# Legacy bash sync archived (audit R3); live sync is the weave_gh Python module.
+# The source-grep checks below (rate limits, truncation, labels) audit the
+# legacy implementation only.
+SYNC_SCRIPT="$PROJECT_ROOT/archive/scripts/sync-weave-gh.sh"
 
 # Colors
 RED='\033[0;31m'

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
 # test-phase-fsm.sh — Tests for session phase state machine
 #
 # Sprint 1 prerequisite: wv-b7813e (feat(S1): wv_set_phase + PHASE_VALUES + wv doctor check)
@@ -204,6 +206,27 @@ test_work_transition_sets_execute() {
     assert_equals "execute" "$phase" "wv work sets .session_phase to execute"
 }
 
+test_add_active_transition_sets_execute() {
+    echo "-- wv add --status=active sets phase to execute (WorkClaimed event)"
+    setup_test_env
+    echo "discover" > "$TEST_DIR/.session_phase"
+    "$WV" add "active-on-create task" --status=active --standalone \
+        --criteria="c1" --risks=low --alias=add-active-test 2>/dev/null >/dev/null || true
+    local phase
+    phase=$(cat "$TEST_DIR/.session_phase" 2>/dev/null || echo "")
+    assert_equals "execute" "$phase" "wv add --status=active sets .session_phase to execute"
+}
+
+test_add_todo_does_not_change_phase() {
+    echo "-- wv add (todo) leaves phase unchanged"
+    setup_test_env
+    echo "discover" > "$TEST_DIR/.session_phase"
+    "$WV" add "plain todo task" --standalone --alias=add-todo-test 2>/dev/null >/dev/null || true
+    local phase
+    phase=$(cat "$TEST_DIR/.session_phase" 2>/dev/null || echo "")
+    assert_equals "discover" "$phase" "wv add without --status=active leaves phase at discover"
+}
+
 test_done_transition_sets_closing() {
     echo "-- wv done sets phase to closing"
     setup_test_env
@@ -265,6 +288,8 @@ main() {
     test_set_phase_rejects_invalid
     test_default_phase_is_execute
     test_work_transition_sets_execute
+    test_add_active_transition_sets_execute
+    test_add_todo_does_not_change_phase
     test_done_transition_sets_closing
     test_doctor_flags_invalid_phase
     test_no_raw_phase_writes_in_source
