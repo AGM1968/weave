@@ -1826,7 +1826,9 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
           cmd.push(p);
         }
       }
-      result = wvRead(cmd, WV_TIMEOUT);
+      // wv query is the only read command without --mode support — wvRead's
+      // appended --mode=discover makes it error (codex finding, v1.59.0).
+      result = wv(cmd, WV_TIMEOUT);
     return result;
   },
 
@@ -2514,7 +2516,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.59.0",
+      version: "1.59.1",
     },
     {
       capabilities: {

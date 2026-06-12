@@ -242,6 +242,21 @@ else
     fail "tools/call executes a real command (weave_guide returned content)" "output: '${call_out:0:120}'"
 fi
 
+# DB-read smoke: weave_query routes through the read path against the live
+# graph — catches read-path breakage (e.g. wvRead --mode appended to a
+# command that rejects it) that the shell-out smoke above cannot see.
+query_out=$(printf '%s\n%s\n%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"parity-test","version":"0"}}}' \
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"weave_query","arguments":{"predicates":["status=done"],"limit":1}}}' \
+    | timeout 20 node "$MCP_DIST" --scope=all 2>/dev/null \
+    | jq -rs '[.[] | select(.id==4)][0].result.content[0].text // empty' || true)
+if [ -n "$query_out" ] && ! echo "$query_out" | grep -qi "unknown option"; then
+    pass "tools/call weave_query reads the graph (no unknown-option error)"
+else
+    fail "tools/call weave_query reads the graph (no unknown-option error)" "output: '${query_out:0:120}'"
+fi
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Red-tests — the v1.51.0 weave_unarchive --with-edges bug shape
 # ═══════════════════════════════════════════════════════════════════════════

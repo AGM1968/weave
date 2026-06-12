@@ -4,6 +4,17 @@
 
 ## Unreleased
 
+## [1.59.1] - 2026-06-12
+
+### Fixed
+
+- **`weave_query` was broken over MCP** — the handler routed through `wvRead()`, which appends
+  `--mode=discover`, but `wv query` is the only read command without `--mode` support, so every
+  call returned `unknown option: --mode=discover`. Pre-existing since the `wvRead` introduction
+  (v1.58.0 had the same call); surfaced by the codex v1.59.0 verification. Handler now calls
+  `wv()` directly, and the parity suite gained a `weave_query` DB-read execution smoke so
+  read-path breakage can no longer hide behind the shell-out smoke (wv-0b281b).
+
 ## [1.59.0] - 2026-06-12
 
 ### Added
