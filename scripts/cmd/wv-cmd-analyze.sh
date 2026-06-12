@@ -67,7 +67,7 @@ cmd_analyze_sessions() {
                 echo ""
                 echo "  --log=<path>      JSONL call log (default: ~/.local/share/weave/wv_calls.jsonl)"
                 echo "  --top=N           Show top N commands (default: 10)"
-                echo "  --source=<src>    Filter by call origin: agent, shell, hook, sync, test"
+                echo "  --source=<src>    Filter by call origin: agent, shell, hook, sync, test, mcp"
                 echo "  --since-days=N    Only count calls from the last N days"
                 echo "  --since=<date>    Only count calls at/after <date> (YYYY-MM-DD or epoch seconds)"
                 echo "  --include-sync    Count source=sync traffic (excluded by default: pipeline-internal"

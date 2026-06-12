@@ -16,7 +16,8 @@ returns an error).
 
 ```txt
 if ! command -v wv >/dev/null 2>&1; then wv() { ./scripts/wv "$@"; }; fi
-# ./scripts/wv appends existing $HOME/.local/bin and $HOME/.cargo/bin for user tools.
+# ./scripts/wv appends existing $HOME/.local/bin and $HOME/.cargo/bin for user tools;
+# the Weave Makefile targets apply the same PATH fallback for sandbox shells.
 wv bootstrap --json               # 0. Session snapshot — replaces git status + wv status
 wv search "<topic>"               # 1. Check for existing related work before claiming/creating
 wv ready                          # 2. Find unblocked work

@@ -268,7 +268,7 @@ PLANEOF
 
     # Verify no nodes were created
     local node_count
-    node_count=$($WV list --all --json 2>&1 | jq 'length' 2>/dev/null)
+    node_count=$($WV list --all --json 2>/dev/null | jq 'length' 2>/dev/null)
     assert_equals "0" "$node_count" "plan --dry-run: no nodes created"
 
     # Actual import
@@ -278,12 +278,12 @@ PLANEOF
     assert_contains "$plan_out" "Task:" "plan: creates tasks"
 
     # Check nodes exist
-    node_count=$($WV list --all --json 2>&1 | jq 'length' 2>/dev/null)
+    node_count=$($WV list --all --json 2>/dev/null | jq 'length' 2>/dev/null)
     assert_equals "4" "$node_count" "plan: created 1 epic + 3 tasks"
 
     # Bold markers stripped
     local tasks_json
-    tasks_json=$($WV list --all --json 2>&1)
+    tasks_json=$($WV list --all --json 2>/dev/null)
     local has_bold
     has_bold=$(echo "$tasks_json" | jq '[.[] | .text | contains("**")] | any' 2>/dev/null)
     assert_equals "false" "$has_bold" "plan: bold markers stripped from task text"

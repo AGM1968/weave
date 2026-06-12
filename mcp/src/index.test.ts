@@ -1195,3 +1195,41 @@ describe("Weave MCP Server --scope=inspect", () => {
     expect(tools).toHaveLength(22);
   });
 });
+
+describe("Weave MCP Server telemetry source tagging", () => {
+  // Regression: the server inherits the session's WV_CALL_SOURCE=agent; without
+  // the wvEnv override every internal wv subprocess (e.g. weave_edit_guard's
+  // `wv list` per edit) is logged as a direct agent call, inflating
+  // per-command rows in `wv analyze sessions --source=agent`.
+  it("tags internal wv subprocesses as source=mcp even when the session env says agent", async () => {
+    const logPath = join(tmpdir(), `wv-mcp-srctag-${process.pid}-${Date.now()}.jsonl`);
+    // Fresh WV_CONFIG_DIR: config.env is sourced with set -a and would
+    // override the ambient WV_CALL_LOG with the user's real log path.
+    const cfgDir = mkdtempSync(join(tmpdir(), "wv-srctag-cfg-"));
+    const tagged = new MCPTestClient([], {
+      WV_CALL_LOG: logPath,
+      WV_CALL_SOURCE: "agent",
+      WV_CONFIG_DIR: cfgDir,
+    });
+    try {
+      const resp = await tagged.request("tools/call", {
+        name: "weave_status",
+        arguments: {},
+      });
+      expect(resp.error).toBeUndefined();
+      const entries = readFileSync(logPath, "utf-8")
+        .trim()
+        .split("\n")
+        .filter((l) => l.trim() !== "")
+        .map((l) => JSON.parse(l) as { source?: string; cmd?: string });
+      expect(entries.length).toBeGreaterThan(0);
+      for (const entry of entries) {
+        expect(entry.source).toBe("mcp");
+      }
+    } finally {
+      await tagged.close();
+      rmSync(logPath, { force: true });
+      rmSync(cfgDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+});

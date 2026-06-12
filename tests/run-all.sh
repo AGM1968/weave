@@ -74,6 +74,10 @@ declare -a FAST_SUITES=(
     "test-config.sh:Config Command Tests"
     "test-query.sh:Query Command Tests"
     "test-pattern-audit-check6.sh:Pattern-Audit Check 6 (node-state invariant)"
+    "test-pattern-audit-check7.sh:Pattern-Audit Check 7 (function tails)"
+    "test-cmd-battery.sh:Command-Surface Battery"
+    "test-schema-contract.sh:SQL-vs-Schema Contract"
+    "test-mcp-parity.sh:MCP-vs-CLI Flag Parity"
 )
 
 # Slow tier — excluded by default; add with --slow (~200s, runs install+selftest)

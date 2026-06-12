@@ -113,7 +113,6 @@ cmd_findings_list() {
             json_extract(n.metadata, '$.finding.fixable')    AS fixable,
             json_extract(n.metadata, '$.finding.confidence') AS confidence,
             json_extract(n.metadata, '$.finding.violation_type') AS violation_type,
-            n.text,
             CASE WHEN EXISTS (
                 SELECT 1 FROM edges e
                 JOIN nodes t ON e.source = t.id
@@ -123,7 +122,8 @@ cmd_findings_list() {
                 WHEN json_extract(n.metadata, '\$.promoted_at') IS NOT NULL
                 THEN CAST((julianday('now') - julianday(json_extract(n.metadata, '\$.promoted_at'))) AS INTEGER)
                 ELSE NULL
-            END AS age_days
+            END AS age_days,
+            n.text
         FROM nodes n
         WHERE json_extract(n.metadata, '$.type') = 'finding'
         $fixable_clause
@@ -153,7 +153,9 @@ cmd_findings_list() {
     fi
 
     local count=0
-    while IFS='|' read -r id status fixable confidence violation_type text has_fix age_days; do
+    # text reads LAST: it can contain literal '|' (e.g. "fix | calibration: ...");
+    # the final read variable absorbs the remainder, so internal pipes are safe.
+    while IFS='|' read -r id status fixable confidence violation_type has_fix age_days text; do
         count=$((count + 1))
         # Fixable badge (compact)
         local fix_badge

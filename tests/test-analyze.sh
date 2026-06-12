@@ -300,6 +300,23 @@ assert_contains "$output" "No suite history for repo 'other'" "--repo=other show
 output=$(WV_MODE=discover $WV analyze suites --log="$SUITELOG" --repo=r 2>&1)
 assert_contains "$output" '"repo": "r"' "JSON output includes repo scope field"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Call instrumentation append safety (wv-ac0f6a — calllog-leak)
+# Fresh WV_CONFIG_DIR so config.env cannot override the test's WV_CALL_LOG.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Test 22: unwritable WV_CALL_LOG produces zero stderr noise
+ISOCONF=$(mktemp -d)
+stderr_out=$(WV_CONFIG_DIR="$ISOCONF" WV_CALL_LOG=/nonexistent-dir/wv_calls.jsonl $WV --version 2>&1 >/dev/null)
+assert_not_contains "$stderr_out" "nonexistent-dir" "unwritable WV_CALL_LOG leaks no redirection error"
+
+# Test 23: writable WV_CALL_LOG still records the invocation
+WRITELOG="$ISOCONF/calls.jsonl"
+WV_CONFIG_DIR="$ISOCONF" WV_CALL_LOG="$WRITELOG" $WV --version >/dev/null 2>&1
+logged=$(cat "$WRITELOG" 2>/dev/null || true)
+assert_contains "$logged" '"cmd":"wv --version"' "writable WV_CALL_LOG records invocation"
+rm -rf "$ISOCONF"
+
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -289,9 +289,11 @@ if [[ -n "${WV_CALL_LOG:-}" ]]; then
     _wv_stderr_bytes=$(wc -c < "$_wv_err")
     rm -f "$_wv_out" "$_wv_err"
     _wv_source="${WV_CALL_SOURCE:-shell}"
-    printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"%s"}\n' \
+    # Braced group: stderr is silenced before the >> open is attempted, so an
+    # unwritable log path (read-only FS, missing dir) cannot leak bash errors.
+    { printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"%s"}\n' \
         "$_wv_ts_epoch" "${1:-help}" "$_wv_stdout_bytes" "$_wv_stderr_bytes" "$_wv_elapsed" "$_wv_source" \
-        >> "$WV_CALL_LOG" 2>/dev/null || true
+        >> "$WV_CALL_LOG"; } 2>/dev/null || true
     exit "$_wv_exit"
 else
     main "$@"

@@ -877,7 +877,7 @@ test_list() {
     assert_contains "$output" "$id3" "list --all includes done nodes"
 
     # List --json outputs JSON array
-    output=$("$WV" list --json 2>&1)
+    output=$("$WV" list --json 2>/dev/null)
     assert_contains "$output" "[" "list --json outputs JSON array"
     assert_contains "$output" '"id"' "list --json includes id field"
 
@@ -890,7 +890,7 @@ test_list() {
     json_err=$(cat "$TEST_DIR/list-json.err")
     json_count=$(echo "$json_out" | jq 'length' 2>/dev/null || echo 0)
     assert_equals "50" "$json_count" "list --json default cap returns 50 rows"
-    assert_contains "$json_err" "use --all for full JSON" "list --json capped output warns on stderr"
+    assert_contains "$json_err" "use --all for full dump" "list --json capped output warns on stderr"
     json_count=$("$WV" list --json --all 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
     assert_success "list --json --all returns more than capped default" test "$json_count" -gt 50
 
@@ -1477,7 +1477,7 @@ test_findings_promote() {
     assert_contains "$output" '"promoted"' "findings promote apply returns promoted nodes"
     assert_contains "$output" "$parent_id" "findings promote apply reports parent"
 
-    all_nodes=$("$WV" list --all --json 2>&1)
+    all_nodes=$("$WV" list --all --json 2>/dev/null)
     assert_contains "$all_nodes" 'historical_finding_id' "promoted finding stores idempotency metadata"
     assert_contains "$all_nodes" '"type\": \"finding\"' "promoted finding is stored as finding node"
 }

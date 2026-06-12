@@ -33,7 +33,9 @@ _bootstrap_invoked_wv_path() {
     fi
     local resolved
     resolved=$(command -v wv 2>/dev/null || true)
-    [ -n "$resolved" ] && canonicalize_runtime_path "$resolved"
+    if [ -n "$resolved" ]; then
+        canonicalize_runtime_path "$resolved"
+    fi
 }
 
 _bootstrap_canonical_wv_path() {
@@ -46,7 +48,9 @@ _bootstrap_canonical_wv_path() {
 
     local invoked_wv
     invoked_wv=$(_bootstrap_invoked_wv_path)
-    [ -n "$invoked_wv" ] && echo "$invoked_wv"
+    if [ -n "$invoked_wv" ]; then
+        echo "$invoked_wv"
+    fi
 }
 
 _bootstrap_wv_provenance() {
@@ -180,16 +184,12 @@ _bootstrap_agent_tools_json() {
     [ "${chunks_count:-0}" -gt 0 ] 2>/dev/null && chunks_ready=true
 
     if [ -n "${WV_HOT_ZONE:-}" ] && [ -f "$WV_HOT_ZONE/quality.db" ]; then
-        local scan_count
-        scan_count=$(sqlite3 "$WV_HOT_ZONE/quality.db" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='quality_scans';" 2>/dev/null | {
-            read -r has_scans
-            if [ "${has_scans:-0}" = "1" ]; then
-                sqlite3 "$WV_HOT_ZONE/quality.db" "SELECT COUNT(*) FROM quality_scans;" 2>/dev/null || echo 0
-            else
-                echo 0
-            fi
-        })
-        [ "${scan_count:-0}" -gt 0 ] 2>/dev/null && quality_ready=true
+        # scan_meta is the scan-run table (see weave_quality/db.py); same probe
+        # as the search --code readiness path above.
+        local latest_scan
+        latest_scan=$(sqlite3 -batch -cmd ".timeout 3000" "$WV_HOT_ZONE/quality.db" \
+            "SELECT id FROM scan_meta ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
+        [ -n "$latest_scan" ] && quality_ready=true
     fi
 
     jq -n \
@@ -243,20 +243,45 @@ _bootstrap_codex_json() {
     # and diverges from WV_CALL_LOG — two writers, two paths, no coordination.
     telemetry_log="${WV_CALL_LOG:-${WV_CALL_LOG_DEFAULT:-$HOME/.local/share/weave/wv_calls.jsonl}}"
     telemetry_token=$(_bootstrap_shell_token "$telemetry_log")
+    local telemetry_enabled=false telemetry_writable=false
+    [ -n "${WV_CALL_LOG:-}" ] && telemetry_enabled=true
+    if [ "$telemetry_enabled" = true ]; then
+        # Real append probe — permission bits lie on read-only filesystems
+        # (Codex EROFS): the open itself must succeed. Logging would create
+        # the file anyway, so the side effect is acceptable here.
+        { : >> "$telemetry_log"; } 2>/dev/null && telemetry_writable=true
+    else
+        # Side-effect-free heuristic: never create a log that isn't enabled.
+        if [ -e "$telemetry_log" ]; then
+            [ -w "$telemetry_log" ] && telemetry_writable=true
+        else
+            [ -w "$(dirname "$telemetry_log")" ] && telemetry_writable=true
+        fi
+    fi
 
-    jq -n --arg wv "$wv_token" --arg telemetry_log "$telemetry_log" --arg telemetry_token "$telemetry_token" '{
+    jq -n --arg wv "$wv_token" --arg telemetry_log "$telemetry_log" --arg telemetry_token "$telemetry_token" \
+        --argjson telemetry_enabled "$telemetry_enabled" \
+        --argjson telemetry_writable "$telemetry_writable" '{
         mcp: {
             recommended_scope: "lite",
             safe_default: "weave-lite",
             full_scope_warning: "Full Weave MCP can hang in Codex on network/GitHub operations; use CLI commands for privileged work."
         },
-        telemetry: {
+        telemetry: ({
             call_log: $telemetry_log,
-            scope: "persistent",
+            enabled: $telemetry_enabled,
+            writable: $telemetry_writable,
+            scope: (if ($telemetry_enabled | not) then "disabled"
+                    elif $telemetry_writable then "persistent"
+                    else "unavailable" end),
             durability: "durable log at ~/.local/share/weave/wv_calls.jsonl (config.env WV_CALL_LOG); survives reboot",
             enable_for_command: "wv config enable session-analysis",
             analyze: ($wv + " analyze sessions --call-stats")
-        },
+        } + (if $telemetry_enabled and ($telemetry_writable | not) then
+            {warning: "call log path is not writable in this environment — new calls are NOT recorded; analyze reads stale host data"}
+        elif ($telemetry_enabled | not) then
+            {note: "session-analysis is not enabled — no calls are being recorded"}
+        else {} end)),
         commands: {
             bootstrap: ($wv + " bootstrap-agent --json"),
             doctor: ($wv + " doctor --agent --json"),
@@ -2121,19 +2146,33 @@ cmd_hotzone() {
             done
 
             if [ "$dry_run" = true ]; then
-                echo "wv hotzone gc --dry-run: $eligible eligible orphan(s); $skipped skipped (< 1h old)"
+                echo "wv hotzone gc --dry-run: $eligible eligible orphan(s); $skipped skipped (< 1h old) under $hz_parent"
             else
-                echo "wv hotzone gc: removed $removed orphan(s), skipped $skipped (< 1h old)"
+                echo "wv hotzone gc: removed $removed orphan(s), skipped $skipped (< 1h old) under $hz_parent"
+            fi
+            if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+                echo "note: not inside a git repo — the hot-zone parent resolves repo-relatively; cd into a repo to gc its family" >&2
             fi
             ;;
         list)
+            local as_json=false
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --json) as_json=true ;;
+                esac
+                shift
+            done
             local hot_zone hz_parent
             hot_zone=$(resolve_repo_hot_zone)
             hz_parent=$(dirname "$hot_zone")
-            [ -d "$hz_parent" ] || { echo "Hot-zone parent $hz_parent not found."; return 0; }
-            local d
+            if [ ! -d "$hz_parent" ]; then
+                if [ "$as_json" = true ]; then echo "[]"; else echo "Hot-zone parent $hz_parent not found."; fi
+                return 0
+            fi
+            local d json_rows="" row_count=0
             for d in "$hz_parent"/*/; do
                 [ -f "${d}brain.db" ] || continue
+                row_count=$((row_count + 1))
                 local owner=""
                 owner=$(cat "${d}.repo_root" 2>/dev/null || echo "")
                 local nodes=0
@@ -2142,8 +2181,28 @@ cmd_hotzone() {
                 if [ -z "$owner" ] || [ ! -d "$owner" ]; then
                     label="orphan"
                 fi
-                printf '  %-10s  %s  nodes=%-4s  owner=%s\n' "$label" "${d%/}" "$nodes" "${owner:-none}"
+                if [ "$as_json" = true ]; then
+                    local row
+                    # 'label' is a jq reserved word: jq 1.6 (dev machine apt)
+                    # rejects both the bare key {label: ...} AND the variable
+                    # $label; 1.7 tolerates them. Quote the key, avoid the name.
+                    row=$(jq -n --arg lbl "$label" --arg path "${d%/}" --arg nodes "$nodes" --arg owner "${owner:-}" \
+                        '{"label": $lbl, "path": $path, "nodes": (($nodes|tonumber?) // null), "owner": (if $owner == "" then null else $owner end)}')
+                    json_rows="${json_rows:+$json_rows,}$row"
+                else
+                    printf '  %-10s  %s  nodes=%-4s  owner=%s\n' "$label" "${d%/}" "$nodes" "${owner:-none}"
+                fi
             done
+            if [ "$as_json" = true ]; then
+                echo "[${json_rows}]"
+            elif [ "$row_count" -eq 0 ]; then
+                # Silence here looked like a defect during the v1.58 review —
+                # always name the scanned parent so empty output is diagnosable.
+                echo "(no hot-zone dirs under $hz_parent)" >&2
+            fi
+            if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+                echo "note: not inside a git repo — the hot-zone parent resolves repo-relatively; cd into a repo to see its family" >&2
+            fi
             ;;
         db|--db)
             # Print the resolved brain.db path so agents/scripts never hand-roll
@@ -4012,7 +4071,7 @@ _health_format_text() {
         if [ "$_h_contradictions" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_contradictions unresolved contradiction(s) - run 'wv edges <id>' to inspect"; fi
         if [ "$_h_ghost_edges" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_ghost_edges ghost edge(s) referencing deleted nodes - run 'wv clean-ghosts'"; fi
         if [ "$_h_orphan_nodes" -gt 5 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_orphan_nodes orphan node(s) with no edges - consider linking or pruning"; fi
-        if [ "${_h_gh_duplicates:-0}" -gt 0 ] 2>/dev/null; then echo -e "  ${YELLOW}⚠${NC} $_h_gh_duplicates GH issue(s) mapped to multiple open nodes - run 'wv health --json | jq .issues.gh_duplicate_issues' to inspect, then 'wv delete <id> --dry-run'"; fi
+        if [ "${_h_gh_duplicates:-0}" -gt 0 ] 2>/dev/null; then echo -e "  ${YELLOW}⚠${NC} $_h_gh_duplicates GH issue(s) mapped to multiple open nodes - run 'wv health --json | jq .issues.gh_duplicate_issues' to inspect, then 'wv delete <id> --no-gh --dry-run' (use --no-gh to avoid closing an issue still owned by the survivor)"; fi
         if [ "$_h_invalid_statuses" -gt 0 ]; then echo -e "  ${RED}✗${NC} $_h_invalid_statuses node(s) with invalid status - run 'wv update <id> --status=todo' to fix"; fi
         if [ "$_h_empty_edge_ctx" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_empty_edge_ctx edge(s) missing context - run 'wv health --fix' to backfill"; fi
         if [ "$_h_fixed_edge_ctx" -gt 0 ]; then echo -e "  ${GREEN}✓${NC} Fixed: enriched $_h_fixed_edge_ctx edge(s) with auto-context (marked auto:true)"; fi
@@ -4831,6 +4890,60 @@ cmd_pattern_audit() {
             '. + [{"check":"node_state_deferral","status":"pass","detail":"deferral encoded as status/edges, not metadata-only","count":0}]')
     fi
 
+    # ── Check 7: no bare [ cond ] && cmd as a function's last statement ─────
+    # Such a tail returns 1 when the condition is false; under set -euo
+    # pipefail a caller in a plain context aborts. This class shipped >=5
+    # bugs (graph learnings + audit finding A3-2). Predicate helpers are
+    # exempt by name (^_?(is|has|can)_) or a '# predicate' annotation on the
+    # definition line. A '|| ...' alternative on the tail makes it safe.
+    local _pa7_scope="$_project_root/scripts"
+    if [ -d "$_pa7_scope" ]; then
+        local _pa7_awk='
+/^(function[ \t]+)?[A-Za-z_][A-Za-z0-9_]*\(\)[ \t]*\{[ \t]*(#.*)?$/ {
+    fname=$0; sub(/\(\).*/,"",fname); sub(/^function[ \t]+/,"",fname)
+    annotated = ($0 ~ /#[ \t]*predicate/) ? 1 : 0
+    infunc=1; last=""; lastnr=0; next
+}
+infunc && /^\}/ {
+    if (last ~ /^[ \t]*\[\[?[^]]*\]\]?[ \t]*&&/ && last !~ /\|\|/ \
+        && fname !~ /^_?(is|has|can)_/ && !annotated)
+        printf "%s:%d: %s\n", FILENAME, lastnr, fname
+    infunc=0; next
+}
+infunc {
+    line=$0; sub(/^[ \t]+/,"",line)
+    if (line != "" && line !~ /^#/) { last=$0; lastnr=FNR }
+}'
+        local _pa7_files tail_hits=""
+        _pa7_files=$(find "$_pa7_scope" -name '*.sh' -not -path '*/tests/*' -not -path '*/archive/*' 2>/dev/null)
+        [ -f "$_pa7_scope/wv" ] && _pa7_files="${_pa7_files}${_pa7_files:+
+}$_pa7_scope/wv"
+        if [ -n "$_pa7_files" ]; then
+            tail_hits=$(echo "$_pa7_files" | xargs -r awk "$_pa7_awk" 2>/dev/null || true)
+        fi
+        if [ -n "$tail_hits" ]; then
+            local tail_count
+            tail_count=$(echo "$tail_hits" | grep -c .) || tail_count=0
+            if [ "$format" = "text" ]; then
+                echo -e "${RED}✗ Check 7 FAIL: $tail_count function(s) end in a bare [ cond ] && cmd tail:${NC}"
+                echo "$tail_hits" | while IFS= read -r hit; do [ -n "$hit" ] && echo "    $hit"; done
+                echo -e "  Convert to if/fi, append '|| true', or mark genuine predicates with '# predicate' on the definition line."
+            fi
+            findings_json=$(echo "$findings_json" | jq \
+                --arg detail "$(echo "$tail_hits" | tr '\n' ' ' | sed 's/ *$//')" --argjson n "$tail_count" \
+                '. + [{"check":"function_tail_returns","status":"fail","detail":$detail,"count":$n}]')
+            issues=$((issues + tail_count))
+        else
+            [ "$format" = "text" ] && echo -e "${GREEN}✓ Check 7 PASS: no non-predicate function ends in a bare [ cond ] && cmd tail${NC}"
+            findings_json=$(echo "$findings_json" | jq \
+                '. + [{"check":"function_tail_returns","status":"pass","detail":"no errexit-fragile function tails","count":0}]')
+        fi
+    else
+        [ "$format" = "text" ] && echo -e "${YELLOW}⚠ Check 7 WARN: $_pa7_scope not found — skipped${NC}"
+        findings_json=$(echo "$findings_json" | jq \
+            '. + [{"check":"function_tail_returns","status":"warn","detail":"scripts dir not found - skipped","count":0}]')
+    fi
+
     # ── Summary ─────────────────────────────────────────────────────────────
     if [ "$format" = "json" ]; then
         jq -n \
@@ -5371,7 +5484,7 @@ cmd_help_topic() {
             print_command_help "wv delete <id> [--force] [--dry-run] [--no-gh]" "Delete a node and its edges. Use --dry-run to preview deletions and --force to execute them."
             ;;
         done)
-            print_command_help "wv done <id> [--learning=\"...\"|--learning-file=PATH] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--verification-evidence=\"...\"|--verification-evidence-file=PATH] [--no-warn] [--acknowledge-overlap] [--skip-verification] [--no-overlap-check] [--no-gh]" "Close a node and optionally store structured learnings or bypass flags when policy allows it."
+            print_command_help "wv done <id> [--learning=\"...\"|--learning-file=PATH] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--verification-method=\"...\"] [--verification-evidence=\"...\"|--verification-evidence-file=PATH] [--no-warn] [--acknowledge-overlap] [--skip-verification] [--no-overlap-check] [--no-gh]" "Close a node and optionally store structured learnings or bypass flags when policy allows it."
             ;;
         ship)
             print_command_help "wv ship <id> [--learning=\"...\"|--learning-file=PATH] [--verification-method=\"...\"] [--verification-evidence=\"...\"|--verification-evidence-file=PATH] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--gh] [--skip-verification] [--no-overlap-check]" "Close a node and sync graph state in one step; any remaining Git sync is surfaced separately."

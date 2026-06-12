@@ -238,6 +238,34 @@ node_id=$("$WV" add "node to delete" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
 node_check=$("$WV" show "$node_id" 2>&1 || true)
 assert_contains "$node_check" "not found" "Node deleted successfully"
 
+# ─── gh-close ownership guard (shared gh_issue) ─────────────────────────
+# Regression: the survivor query must CAST json_extract to TEXT — gh_issue is
+# stored as a JSON number and a bare INTEGER never equals a TEXT literal in
+# SQLite, which silently disabled the guard.
+
+echo ""
+echo -e "${CYAN}--- delete gh-close ownership guard ---${NC}"
+setup_test_env
+
+# Texts must be dissimilar or the add similarity guard rejects the second node.
+owner_a=$("$WV" add "node being deleted with linked issue" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+owner_b=$("$WV" add "surviving owner that maps the same gh number" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+# gh_issue is stored as a JSON number (jq tonumber at creation) — replicate that.
+sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'),'\$.gh_issue', 4242) WHERE id IN ('$owner_a','$owner_b');"
+
+dry_out=$("$WV" delete "$owner_a" --dry-run 2>&1)
+assert_contains "$dry_out" "would NOT be closed" "dry-run flags shared gh_issue as not-closable"
+
+# Real delete: guard must skip the gh close but still delete the node
+del_out=$("$WV" delete "$owner_a" --force 2>&1 || true)
+assert_contains "$del_out" "Skipped closing GitHub issue #4242" "delete skips closing a shared gh issue"
+node_check=$("$WV" show "$owner_a" 2>&1 || true)
+assert_contains "$node_check" "not found" "shared-issue node still deleted"
+
+# Sole owner: dry-run reports the close would happen
+dry_b=$("$WV" delete "$owner_b" --dry-run 2>&1)
+assert_contains "$dry_b" "would be closed" "dry-run reports close for sole owner"
+
 # ─── Simulated crash during ship (journal recovery) ────────────────────
 
 echo ""

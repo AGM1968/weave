@@ -181,6 +181,11 @@ function wvEnv(extraEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     NO_COLOR: "1",
     WV_AGENT: "1",
     WV_ACTIVE: process.env.WV_ACTIVE || "",
+    // Tag MCP-internal fan-out distinctly: the server inherits the session's
+    // WV_CALL_SOURCE=agent, so without this every internal subprocess (e.g.
+    // weave_edit_guard's `wv list` per edit) is logged as a direct agent call,
+    // inflating per-command rows in `wv analyze sessions --source=agent`.
+    WV_CALL_SOURCE: "mcp",
     ...(projectRoot ? { WV_PROJECT_DIR: projectRoot } : {}),
     ...extraEnv,
   };
@@ -206,7 +211,11 @@ function spawnWv(args: string[], timeout: number = WV_TIMEOUT) {
 // (e.g. quality scan, quality hotspots) write output to stderr.
 function wv(args: string[], timeout: number = WV_TIMEOUT): string {
   const result = spawnWv(args, timeout);
-  if (result.error) {
+  // Sandboxed Node (Codex) can report error.code=EPERM from a post-spawn probe
+  // even though the child ran and exited 0 — when status is a number the child
+  // really ran, so the exit code is the truth; error is fatal only when the
+  // spawn itself failed (status === null).
+  if (result.error && result.status === null) {
     throw new Error(result.error.message || "wv command failed");
   }
   if (result.status !== 0) {
@@ -220,7 +229,7 @@ function wv(args: string[], timeout: number = WV_TIMEOUT): string {
 
 function wvHealthJson(timeout: number = WV_TIMEOUT): string {
   const result = spawnWv(["health", "--json"], timeout);
-  if (result.error) {
+  if (result.error && result.status === null) {
     throw new Error(result.error.message || "wv command failed");
   }
   const stdout = result.stdout?.trim() || "";
@@ -262,6 +271,10 @@ const TOOLS: Tool[] = [
           type: "string",
           enum: [...STATUS_SCHEMA_VALUES],
           description: "Filter by status (legacy in-progress/in_progress map to active)",
+        },
+        type: {
+          type: "string",
+          description: "Filter by metadata.type (e.g. finding, task, epic, learning)",
         },
       },
       required: ["query"],
@@ -311,6 +324,15 @@ const TOOLS: Tool[] = [
           description:
             "Create node without a parent even when epics exist. Semantic alias for force=true — use this when orphan intent is deliberate (chore/doc nodes, standalone fixes).",
         },
+        criteria: {
+          type: "string",
+          description:
+            "Pipe-delimited done criteria (e.g., 'tests pass|docs updated'). Set at creation time — the pre-claim hook requires done_criteria, so claim-ready nodes need this.",
+        },
+        risks: {
+          type: "string",
+          description: "Risk level for the work (e.g., 'low', 'medium', 'high').",
+        },
       },
       required: ["text"],
     },
@@ -351,6 +373,16 @@ const TOOLS: Tool[] = [
           type: "boolean",
           description:
             "Skip FTS5 learning-similarity check entirely — no prompt, no advisory. Use in agent/script contexts where stdin is unavailable.",
+        },
+        verification_method: {
+          type: "string",
+          description:
+            "How the work was verified (e.g., 'make check', 'bash tests/test-core.sh'). Pair with verification_evidence.",
+        },
+        verification_evidence: {
+          type: "string",
+          description:
+            "Inline verification evidence (test output, command results). Attach for non-trivial closes — closes without evidence draw a post-close advisory.",
         },
       },
       required: ["id"],
@@ -640,8 +672,12 @@ const TOOLS: Tool[] = [
           type: "boolean",
           description: "Attach code_quality payload per impacted node",
         },
+        files: {
+          type: "string",
+          description:
+            "Comma-separated file paths; derives seed nodes from touched_files metadata. Alternative to ids.",
+        },
       },
-      required: ["ids"],
     },
   },
   {
@@ -670,6 +706,10 @@ const TOOLS: Tool[] = [
           type: "number",
           description: "Max results (default: 20)",
         },
+        include: {
+          type: "string",
+          description: "Include an extra node type normally hidden from results (e.g. 'finding')",
+        },
       },
       required: [],
     },
@@ -688,6 +728,10 @@ const TOOLS: Tool[] = [
           type: "boolean",
           description: "Auto-fix issues (e.g. backfill empty edge context with auto-generated summaries)",
         },
+        history: {
+          type: "number",
+          description: "Include the N most recent health-history entries",
+        },
       },
       required: [],
     },
@@ -702,6 +746,11 @@ const TOOLS: Tool[] = [
         text: {
           type: "string",
           description: "Node text/description",
+        },
+        learning: {
+          type: "string",
+          description:
+            "Learning to capture on the auto-closed node. Use pipe-delimited format: 'decision: X | pattern: Y | pitfall: Z'.",
         },
       },
       required: ["text"],
@@ -764,6 +813,16 @@ const TOOLS: Tool[] = [
           description:
             "Skip FTS5 learning-similarity check entirely — no prompt, no advisory. Use in agent/script contexts where stdin is unavailable.",
         },
+        verification_method: {
+          type: "string",
+          description:
+            "How the work was verified (e.g., 'make check', 'bash tests/test-core.sh'). Pair with verification_evidence.",
+        },
+        verification_evidence: {
+          type: "string",
+          description:
+            "Inline verification evidence (test output, command results). Attach for non-trivial closes — closes without evidence draw a post-close advisory.",
+        },
       },
       required: ["id"],
     },
@@ -779,6 +838,10 @@ const TOOLS: Tool[] = [
         auto: {
           type: "boolean",
           description: "Auto-recover without prompting (non-interactive)",
+        },
+        session: {
+          type: "boolean",
+          description: "Inspect orphaned active work for the current session",
         },
       },
     },
@@ -863,6 +926,10 @@ const TOOLS: Tool[] = [
         node: {
           type: "string",
           description: "Focus node id (required for mode='fast' when called outside ship/session-end).",
+        },
+        dry_run: {
+          type: "boolean",
+          description: "Show what would be synced without writing",
         },
       },
       required: [],
@@ -1073,8 +1140,16 @@ const TOOLS: Tool[] = [
           type: "string",
           description: "Repo-relative file path that was edited (e.g., src/utils/helpers.ts)",
         },
+        intent: {
+          type: "string",
+          description: "Free-text intent note merged into node metadata (wv touch --intent)",
+        },
+        metadata: {
+          type: "object",
+          description: "JSON metadata to merge silently into the node (wv touch --metadata)",
+        },
       },
-      required: ["id", "path"],
+      required: ["id"],
     },
   },
   {
@@ -1167,8 +1242,12 @@ const TOOLS: Tool[] = [
           type: "boolean",
           description: "Preview what would be created without creating nodes",
         },
+        template: {
+          type: "boolean",
+          description: "Emit the plan template instead of importing (file/sprint not needed)",
+        },
       },
-      required: ["file", "sprint"],
+      required: [],
     },
   },
   {
@@ -1317,12 +1396,21 @@ const TOOLS: Tool[] = [
       properties: {
         subcommand: {
           type: "string",
-          enum: ["scan", "list"],
-          description: "scan: run rules and store findings; list: show rules with hit counts",
+          enum: ["scan", "list", "promote"],
+          description:
+            "scan: run rules and store findings; list: show rules with hit counts; promote: promote findings as Weave nodes (requires parent)",
         },
         path: {
           type: "string",
           description: "Repository root or file to scan (default: current repo root)",
+        },
+        parent: {
+          type: "string",
+          description: "Parent node ID for promoted findings (promote only, required there)",
+        },
+        dry_run: {
+          type: "boolean",
+          description: "Show what promote would create without creating nodes",
         },
       },
       required: ["subcommand"],
@@ -1351,6 +1439,10 @@ const TOOLS: Tool[] = [
         graph: {
           type: "boolean",
           description: "Attach active Weave nodes and quality churn to results",
+        },
+        filter: {
+          type: "string",
+          description: "Constrain code chunks by graph edge type (--filter expression)",
         },
       },
       required: ["query"],
@@ -1483,25 +1575,29 @@ function normalizeStatus(status: string | undefined): string | undefined {
 }
 
 // Tool handlers
-function handleTool(
-  name: string,
-  args: Record<string, unknown>
-): { content: { type: "text"; text: string }[]; isError?: boolean } {
-  let result: string;
+// ── Tool dispatch table ──────────────────────────────────────────────────────
+// Each handler returns either the result text or, for enforcement paths
+// (preflight/edit_guard), a complete ToolResponse envelope with isError set.
+type ToolResponse = { content: { type: "text"; text: string }[]; isError?: boolean };
+type ToolHandler = (args: Record<string, unknown>) => string | ToolResponse;
 
-  switch (name) {
-    case "weave_search": {
+const TOOL_HANDLERS: Record<string, ToolHandler> = {
+  weave_search: (args) => {
+    let result: string;
       const query = args.query as string;
       const limit = args.limit as number | undefined;
       const status = normalizeStatus(args.status as string | undefined);
+      const nodeType = args.type as string | undefined;
       const cmd = ["search", query, "--json"];
       if (limit) cmd.push(`--limit=${limit}`);
       if (status) cmd.push(`--status=${status}`);
+      if (nodeType) cmd.push(`--type=${nodeType}`);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_add": {
+  weave_add: (args) => {
+    let result: string;
       const text = args.text as string;
       const status = normalizeStatus(args.status as string | undefined);
       const metadata = args.metadata as Record<string, unknown> | undefined;
@@ -1510,6 +1606,8 @@ function handleTool(
       const parent = args.parent as string | undefined;
       const force = args.force as boolean | undefined;
       const standalone = args.standalone as boolean | undefined;
+      const criteria = args.criteria as string | undefined;
+      const risks = args.risks as string | undefined;
       const cmd = ["add", text];
       if (status) cmd.push(`--status=${status}`);
       if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
@@ -1518,6 +1616,8 @@ function handleTool(
       if (parent) cmd.push(`--parent=${parent}`);
       if (standalone) cmd.push("--standalone");
       else if (force) cmd.push("--force");
+      if (criteria) cmd.push(`--criteria=${criteria}`);
+      if (risks) cmd.push(`--risks=${risks}`);
       result = wv(cmd);
       // Enforcement warnings — suppress --gh nudge for child nodes (only epic needs a GH issue)
       const warnings: string[] = [];
@@ -1525,10 +1625,11 @@ function handleTool(
         warnings.push("WARNING: No --gh flag. Node has no GitHub issue. Use gh=true for traceability.");
       if (!alias) warnings.push("WARNING: No alias set. Use alias parameter for readable node names.");
       if (warnings.length) result += "\n\n" + warnings.join("\n");
-      break;
-    }
+    return result;
+  },
 
-    case "weave_done": {
+  weave_done: (args) => {
+    let result: string;
       const id = args.id as string;
       let learning = args.learning as string | undefined;
       const decision = args.decision as string | undefined;
@@ -1548,8 +1649,12 @@ function handleTool(
         learning = learning ? `${structured} | ${learning}` : structured;
       }
 
+      const verificationMethod = args.verification_method as string | undefined;
+      const verificationEvidence = args.verification_evidence as string | undefined;
       const cmd = ["done", id];
       if (learning) cmd.push(`--learning=${learning}`);
+      if (verificationMethod) cmd.push(`--verification-method=${verificationMethod}`);
+      if (verificationEvidence) cmd.push(`--verification-evidence=${verificationEvidence}`);
       if (noWarn) cmd.push("--no-warn");
       if (noOverlapCheck) cmd.push("--no-overlap-check");
       if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
@@ -1557,10 +1662,11 @@ function handleTool(
       if (!learning && !decision && !pattern && !pitfall)
         result +=
           "\n\nWARNING: No learning captured. Consider: what decision, pattern, or pitfall should future sessions know?";
-      break;
-    }
+    return result;
+  },
 
-    case "weave_batch_done": {
+  weave_batch_done: (args) => {
+    let result: string;
       const ids = args.ids as string[];
       let learning = args.learning as string | undefined;
       const decision = args.decision as string | undefined;
@@ -1582,18 +1688,20 @@ function handleTool(
       if (noWarn) cmd.push("--no-warn");
       if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_context": {
+  weave_context: (args) => {
+    let result: string;
       const id = args.id as string | undefined;
       const mode = args.mode as ReadMode | undefined;
       const cmd = id ? ["context", id, "--json"] : ["context", "--json"];
       result = wvRead(cmd, WV_TIMEOUT, mode);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_list": {
+  weave_list: (args) => {
+    let result: string;
       const status = normalizeStatus(args.status as string | undefined);
       const all = args.all as boolean | undefined;
       const mode = args.mode as ReadMode | undefined;
@@ -1601,10 +1709,11 @@ function handleTool(
       if (status) cmd.push(`--status=${status}`);
       if (all) cmd.push("--all");
       result = wvRead(cmd, WV_TIMEOUT, mode);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_link": {
+  weave_link: (args) => {
+    let result: string;
       const from = args.from_id as string;
       const to = args.to_id as string;
       const type = args.type as string;
@@ -1614,28 +1723,31 @@ function handleTool(
       if (weight !== undefined) cmd.push(`--weight=${weight}`);
       if (context) cmd.push(`--context=${context}`);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_unlink": {
+  weave_unlink: (args) => {
+    let result: string;
       const from = args.from_id as string;
       const to = args.to_id as string;
       const type = args.type as string;
       result = wv(["unlink", from, to, `--type=${type}`]);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_block": {
+  weave_block: (args) => {
+    let result: string;
       const from = args.from_id as string;
       const to = args.to_id as string;
       const context = args.context as string | undefined;
       const cmd = ["block", from, to];
       if (context) cmd.push(`--context=${context}`);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_unarchive": {
+  weave_unarchive: (args) => {
+    let result: string;
       const id = args.id as string;
       const dryRun = args.dry_run as boolean | undefined;
       const withEdges = args.with_edges as boolean | undefined;
@@ -1643,16 +1755,18 @@ function handleTool(
       if (dryRun) cmd.push("--dry-run");
       if (withEdges) cmd.push("--with-edges");
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_status": {
+  weave_status: (args) => {
+    let result: string;
       const mode = args.mode as ReadMode | undefined;
       result = wvRead(["status"], WV_TIMEOUT, mode);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_ready": {
+  weave_ready: (args) => {
+    let result: string;
       const subtree = args.subtree as string | undefined;
       const all = args.all as boolean | undefined;
       const count = args.count as boolean | undefined;
@@ -1664,13 +1778,15 @@ function handleTool(
       if (count) cmd.push("--count");
       if (withImpact) cmd.push("--with-impact");
       result = wvRead(cmd, WV_TIMEOUT, mode);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_impact": {
+  weave_impact: (args) => {
+    let result: string;
       const ids = (args.ids as string[] | undefined) ?? [];
-      if (ids.length === 0) {
-        throw new Error("weave_impact requires at least one seed id in 'ids'");
+      const files = args.files as string | undefined;
+      if (ids.length === 0 && !files) {
+        throw new Error("weave_impact requires seed ids in 'ids' or paths in 'files'");
       }
       const depth = args.depth as number | undefined;
       const direction = args.direction as string | undefined;
@@ -1680,6 +1796,7 @@ function handleTool(
       const quality = args.quality as boolean | undefined;
 
       const cmd = ["impact", ...ids, "--json"];
+      if (files) cmd.push(`--files=${files}`);
       if (depth !== undefined) cmd.push(`--depth=${depth}`);
       if (direction) cmd.push(`--direction=${direction}`);
       if (full) cmd.push("--full");
@@ -1687,17 +1804,20 @@ function handleTool(
       if (all) cmd.push("--all");
       if (quality) cmd.push("--quality");
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_query": {
+  weave_query: (args) => {
+    let result: string;
       const predicates = (args.predicates as string[] | undefined) ?? [];
       const format = (args.format as string | undefined) ?? "json";
       const order = args.order as string | undefined;
       const limit = args.limit as number | undefined;
+      const include = args.include as string | undefined;
       const cmd = ["query", `--format=${format}`];
       if (order) cmd.push(`--order=${order}`);
       if (limit !== undefined) cmd.push(`--limit=${limit}`);
+      if (include) cmd.push(`--include=${include}`);
       for (const p of predicates) {
         if (p.startsWith("HAS ") || p.startsWith("MATCH ")) {
           const [kw, ...rest] = p.split(" ");
@@ -1707,39 +1827,47 @@ function handleTool(
         }
       }
       result = wvRead(cmd, WV_TIMEOUT);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_health": {
+  weave_health: (args) => {
+    let result: string;
       const verbose = args.verbose as boolean | undefined;
       const fix = args.fix as boolean | undefined;
-      if (!verbose && !fix) {
-        result = wvHealthJson();
-        break;
+      const history = args.history as number | undefined;
+      if (!verbose && !fix && history === undefined) {
+        return wvHealthJson();
       }
       const cmd = ["health", "--json"];
       if (verbose) cmd.push("--verbose");
       if (fix) cmd.push("--fix");
+      if (history !== undefined) cmd.push(`--history=${history}`);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_quick": {
+  weave_quick: (args) => {
+    let result: string;
       const text = args.text as string;
-      result = wv(["quick", text]);
-      break;
-    }
+      const learning = args.learning as string | undefined;
+      const cmd = ["quick", text];
+      if (learning) cmd.push(`--learning=${learning}`);
+      result = wv(cmd);
+    return result;
+  },
 
-    case "weave_work": {
+  weave_work: (args) => {
+    let result: string;
       const id = args.id as string;
       const reopen = args.reopen as boolean | undefined;
       const cmd = ["work", id];
       if (reopen) cmd.push("--reopen");
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_ship": {
+  weave_ship: (args) => {
+    let result: string;
       const id = args.id as string;
       let learning = args.learning as string | undefined;
       const decision = args.decision as string | undefined;
@@ -1759,8 +1887,12 @@ function handleTool(
         learning = learning ? `${structured} | ${learning}` : structured;
       }
 
+      const verificationMethod = args.verification_method as string | undefined;
+      const verificationEvidence = args.verification_evidence as string | undefined;
       const cmd = ["ship-agent", id, "--json"];
       if (learning) cmd.push(`--learning=${learning}`);
+      if (verificationMethod) cmd.push(`--verification-method=${verificationMethod}`);
+      if (verificationEvidence) cmd.push(`--verification-evidence=${verificationEvidence}`);
       const networkFallback =
         gh && !MCP_ALLOW_NETWORK ? mcpNetworkFallback(`wv sync --gh --mode=fast --node=${id}`) : "";
       if (gh && MCP_ALLOW_NETWORK) cmd.push("--gh");
@@ -1768,18 +1900,21 @@ function handleTool(
       if (noOverlapCheck) cmd.push("--no-overlap-check");
       result = wv(cmd, WV_LIFECYCLE_TIMEOUT);
       if (networkFallback) result += `\n\n${networkFallback}`;
-      break;
-    }
+    return result;
+  },
 
-    case "weave_recover": {
+  weave_recover: (args) => {
+    let result: string;
       const cmd = ["recover"];
       if ((args as Record<string, unknown>).json) cmd.push("--json");
       if ((args as Record<string, unknown>).auto) cmd.push("--auto");
+      if ((args as Record<string, unknown>).session) cmd.push("--session");
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_overview": {
+  weave_overview: (args) => {
+    let result: string;
       const mode = args.mode as ReadMode | undefined;
       const parts: string[] = [];
       try {
@@ -1837,20 +1972,22 @@ function handleTool(
         /* skip — context-guard.sh execution failed */
       }
       result = parts.join("\n");
-      break;
-    }
+    return result;
+  },
 
-    case "weave_bootstrap": {
+  weave_bootstrap: (args) => {
+    let result: string;
       const learnings = args.learnings as number | undefined;
       const ready = args.ready as number | undefined;
       const cmd = ["bootstrap", "--json"];
       if (learnings) cmd.push(`--learnings=${learnings}`);
       if (ready) cmd.push(`--ready=${ready}`);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_preflight": {
+  weave_preflight: (args) => {
+    let result: string;
       const id = args.id as string;
       const preflightJson = wv(["preflight", id]);
       // Parse preflight result and return isError for enforcement conditions
@@ -1917,10 +2054,11 @@ function handleTool(
         // JSON parse failed — fall through with raw output
       }
       result = preflightJson;
-      break;
-    }
+    return result;
+  },
 
-    case "weave_edit_guard": {
+  weave_edit_guard: () => {
+    let result: string;
       // Mirror pre-action.sh: check for active node, contradictions, blockers
       // Returns isError:true if no active node — Copilot sees this as a blocking error
       try {
@@ -1990,10 +2128,11 @@ function handleTool(
         // wv not available or DB not loaded — allow (graceful degradation)
         result = "OK: Weave not available — edit guard skipped.";
       }
-      break;
-    }
+    return result;
+  },
 
-    case "weave_sync": {
+  weave_sync: (args) => {
+    let result: string;
       const gh = args.gh as boolean | undefined;
       const mode = args.mode as string | undefined;
       const node = args.node as string | undefined;
@@ -2001,15 +2140,18 @@ function handleTool(
         gh && !MCP_ALLOW_NETWORK
           ? mcpNetworkFallback(`wv sync --gh${mode ? ` --mode=${mode}` : ""}${node ? ` --node=${node}` : ""}`)
           : "";
+      const dryRun = args.dry_run as boolean | undefined;
       const cmd = gh && MCP_ALLOW_NETWORK ? ["sync", "--gh"] : ["sync"];
       if (mode) cmd.push(`--mode=${mode}`);
       if (node) cmd.push(`--node=${node}`);
+      if (dryRun) cmd.push("--dry-run");
       result = wv(cmd, WV_LIFECYCLE_TIMEOUT);
       if (networkFallback) result += `\n\n${networkFallback}`;
-      break;
-    }
+    return result;
+  },
 
-    case "weave_resolve": {
+  weave_resolve: (args) => {
+    let result: string;
       const node1 = args.node1 as string;
       const node2 = args.node2 as string;
       const mode = args.mode as string;
@@ -2025,10 +2167,11 @@ function handleTool(
       }
       if (rationale) cmd.push(`--rationale=${rationale}`);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_close_session": {
+  weave_close_session: (args) => {
+    let result: string;
       const gh = (args.gh as boolean) ?? false;
       const mode = args.mode as string | undefined;
       const parts: string[] = [];
@@ -2088,10 +2231,11 @@ function handleTool(
       }
 
       result = parts.join("\n");
-      break;
-    }
+    return result;
+  },
 
-    case "weave_tree": {
+  weave_tree: (args) => {
+    let result: string;
       const active = args.active as boolean | undefined;
       const depth = args.depth as number | undefined;
       const mermaid = args.mermaid as boolean | undefined;
@@ -2104,10 +2248,11 @@ function handleTool(
       if (depth !== undefined) cmd.push(`--depth=${depth}`);
       if (root) cmd.push(`--root=${root}`);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_learnings": {
+  weave_learnings: (args) => {
+    let result: string;
       const grep = args.grep as string | undefined;
       const recent = args.recent as number | undefined;
       const category = args.category as string | undefined;
@@ -2126,10 +2271,11 @@ function handleTool(
       if (dedup) cmd.push("--dedup");
       if (all) cmd.push("--all");
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_update": {
+  weave_update: (args) => {
+    let result: string;
       const id = args.id as string;
       const status = normalizeStatus(args.status as string | undefined);
       const text = args.text as string | undefined;
@@ -2139,8 +2285,7 @@ function handleTool(
 
       // --remove-key is a standalone operation (returns immediately)
       if (removeKey) {
-        result = wv(["update", id, `--remove-key=${removeKey}`]);
-        break;
+        return wv(["update", id, `--remove-key=${removeKey}`]);
       }
 
       const cmd = ["update", id];
@@ -2149,10 +2294,11 @@ function handleTool(
       if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
       if (alias) cmd.push(`--alias=${alias}`);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_touch": {
+  weave_touch: (args) => {
+    let result: string;
       const id = args.id as string;
       const metadata = args.metadata as Record<string, unknown> | undefined;
       const intent = args.intent as string | undefined;
@@ -2161,39 +2307,58 @@ function handleTool(
       if (intent) cmd.push(`--intent=${intent}`);
       wv(cmd);
       result = "ok";
-      break;
-    }
+    return result;
+  },
 
-    case "weave_record_edit": {
+  weave_record_edit: (args) => {
+    let result: string;
       const id = args.id as string;
-      const path = args.path as string;
-      wv(["touch", id, `--files=${path}`]);
+      const path = args.path as string | undefined;
+      const intent = args.intent as string | undefined;
+      const metadata = args.metadata as Record<string, unknown> | undefined;
+      if (!path && !intent && !metadata) {
+        throw new Error("weave_record_edit requires at least one of: path, intent, metadata");
+      }
+      const cmd = ["touch", id];
+      if (path) cmd.push(`--files=${path}`);
+      if (intent) cmd.push(`--intent=${intent}`);
+      if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
+      wv(cmd);
       result = "ok";
-      break;
-    }
+    return result;
+  },
 
-    case "weave_trails":
-    case "weave_breadcrumbs": {
+  weave_breadcrumbs: (args) => {
+    let result: string;
       // weave_breadcrumbs is a back-compat alias; both route to the `trails` CLI.
       const action = (args.action as string) || "show";
       const message = args.message as string | undefined;
       const cmd = ["trails", action];
       if (action === "save" && message) cmd.push(`--message=${message}`);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_guide": {
+  weave_guide: (args) => {
+    let result: string;
       const topic = args.topic as string | undefined;
       const cmd = ["guide"];
       if (topic) cmd.push(`--topic=${topic}`);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_plan": {
-      const file = args.file as string;
-      const sprint = args.sprint as number;
+  weave_plan: (args) => {
+    let result: string;
+      const template = args.template as boolean | undefined;
+      if (template) {
+        return wv(["plan", "--template"]);
+      }
+      const file = args.file as string | undefined;
+      const sprint = args.sprint as number | undefined;
+      if (!file || sprint === undefined) {
+        throw new Error("weave_plan requires 'file' and 'sprint' (or template=true)");
+      }
       const gh = args.gh as boolean | undefined;
       const dryRun = args.dry_run as boolean | undefined;
       const cmd = ["plan", file, `--sprint=${sprint}`];
@@ -2202,16 +2367,18 @@ function handleTool(
       // --gh: sleep 1 between each issue create (secondary rate limit); 20 tasks ≈ 60s minimum
       const planTimeout = gh ? 180_000 : 60_000;
       result = wv(cmd, planTimeout);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_show": {
+  weave_show: (args) => {
+    let result: string;
       const id = args.id as string;
       result = wv(["show", id, "--json-v2"]);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_delete": {
+  weave_delete: (args) => {
+    let result: string;
       const id = args.id as string;
       const force = args.force as boolean;
       const dryRun = args.dry_run as boolean | undefined;
@@ -2223,20 +2390,22 @@ function handleTool(
       if (dryRun) cmd.push("--dry-run");
       if (noGh) cmd.push("--no-gh");
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_quality_scan": {
+  weave_quality_scan: (args) => {
+    let result: string;
       const path = args.path as string | undefined;
       const exclude = args.exclude as string | undefined;
       const cmd = ["quality", "scan", "--json"];
       if (path) cmd.push(path);
       if (exclude) cmd.push(`--exclude=${exclude}`);
       result = wv(cmd, 60_000); // scans can be slow on large repos
-      break;
-    }
+    return result;
+  },
 
-    case "weave_quality_hotspots": {
+  weave_quality_hotspots: (args) => {
+    let result: string;
       const path = args.path as string | undefined;
       const limit = args.limit as number | undefined;
       const threshold = args.threshold as number | undefined;
@@ -2245,60 +2414,72 @@ function handleTool(
       if (limit) cmd.push(`--limit=${limit}`);
       if (threshold) cmd.push(`--threshold=${threshold}`);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_quality_diff": {
+  weave_quality_diff: (args) => {
+    let result: string;
       const path = args.path as string | undefined;
       const cmd = ["quality", "diff", "--json"];
       if (path) cmd.push(path);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_quality_functions": {
+  weave_quality_functions: (args) => {
+    let result: string;
       const path = args.path as string | undefined;
       const threshold = args.threshold as number | undefined;
       const cmd = ["quality", "functions", "--json"];
       if (path) cmd.push(path);
       if (threshold !== undefined) cmd.push(`--threshold=${threshold}`);
       result = wv(cmd);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_structural_search": {
+  weave_structural_search: (args) => {
+    let result: string;
       const pattern = args.pattern as string;
       const lang = args.lang as string;
       const repo = args.repo as string | undefined;
       const cmd = ["quality", "structural-search", "--json", `--pattern=${pattern}`, `--lang=${lang}`];
       if (repo) cmd.push(`--repo=${repo}`);
       result = wv(cmd, 30_000);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_quality_patterns": {
+  weave_quality_patterns: (args) => {
+    let result: string;
       const subcommand = args.subcommand as string;
       const patPath = args.path as string | undefined;
+      const patParent = args.parent as string | undefined;
+      const patDryRun = args.dry_run as boolean | undefined;
       const cmd = ["quality", "patterns", subcommand, "--json"];
       if (patPath) cmd.push(patPath);
+      if (patParent) cmd.push(`--parent=${patParent}`);
+      if (patDryRun) cmd.push("--dry-run");
       result = wv(cmd, 60_000);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_code_search": {
+  weave_code_search: (args) => {
+    let result: string;
       const query = args.query as string;
       const limit = args.limit as number | undefined;
       const mode = args.mode as string | undefined;
       const graph = args.graph as boolean | undefined;
+      const filter = args.filter as string | undefined;
       const cmd = ["search", "--code", query, "--json"];
       if (limit) cmd.push(`--limit=${limit}`);
       if (mode) cmd.push(`--mode=${mode}`);
       if (graph) cmd.push("--graph");
+      if (filter) cmd.push(`--filter=${filter}`);
       result = wv(cmd, 120_000);
-      break;
-    }
+    return result;
+  },
 
-    case "weave_index": {
+  weave_index: (args) => {
+    let result: string;
       const path = args.path as string | undefined;
       const noEmbed = args.no_embed as boolean | undefined;
       const ext = args.ext as string | undefined;
@@ -2307,16 +2488,24 @@ function handleTool(
       if (noEmbed) cmd.push("--no-embed");
       if (ext) cmd.push(`--ext=${ext}`);
       result = wv(cmd, 300_000);
-      break;
-    }
+    return result;
+  },
+};
 
-    default:
-      throw new Error(`Unknown tool: ${name}`);
+// weave_trails shared a fallthrough case with weave_breadcrumbs in the old
+// switch — same handler, two tool names.
+TOOL_HANDLERS.weave_trails = TOOL_HANDLERS.weave_breadcrumbs;
+
+function handleTool(name: string, args: Record<string, unknown>): ToolResponse {
+  const handler = TOOL_HANDLERS[name];
+  if (!handler) {
+    throw new Error(`Unknown tool: ${name}`);
   }
-
-  return {
-    content: [{ type: "text", text: result }],
-  };
+  const result = handler(args);
+  if (typeof result === "string") {
+    return { content: [{ type: "text", text: result }] };
+  }
+  return result;
 }
 
 // Create and run server
@@ -2325,7 +2514,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.58.0",
+      version: "1.59.0",
     },
     {
       capabilities: {

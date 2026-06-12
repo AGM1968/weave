@@ -108,6 +108,7 @@ _handle_lock() {
 
 _handle_lock "make-build" "(^|[;[:space:]])(make[[:space:]]+(check|test|build)|make[[:space:]]*$)"
 _handle_lock "wv-sync"    "(^|[[:space:]]*[;&|]+[[:space:]]*)wv[[:space:]]+sync"
+_handle_lock "git-commit" "(^|[[:space:]]*[;&|]+[[:space:]]*)git[[:space:]]+commit"
 _handle_lock "git-push"   "(^|[[:space:]]*[;&|]+[[:space:]]*)git[[:space:]]+push"
 _handle_lock "install"    "(^|[[:space:]])\.\/install\.sh"
 _handle_lock "npm-build"  "npm[[:space:]]+(run|test|build|install)"

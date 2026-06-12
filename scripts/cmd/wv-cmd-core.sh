@@ -813,7 +813,7 @@ _done_read_option_file() {
     cat -- "$file_path"
 }
 
-_done_can_prompt_overlap() {
+_done_can_prompt_overlap() { # predicate
     [ "${WV_NONINTERACTIVE:-0}" != "1" ] && [ -z "${CI:-}" ] && [ -t 0 ] && [ -t 2 ]
 }
 
@@ -1106,6 +1106,12 @@ _done_write_trail() {
     if [ -z "${WEAVE_DIR:-}" ]; then
         return 0
     fi
+
+    # Skip for custom DB paths (test isolation) — same guard as auto_sync.
+    # A caller-supplied WV_DB means the active graph is not this repo's graph;
+    # closing a scratch node must not append to the repo's trails.md
+    # (codex finding 2026-06-12: temp-graph wv done dirtied repo trail state).
+    [ -n "${WV_DB_CUSTOM:-}" ] && return 0
 
     # Prefer trails.md; only append to the legacy file if it still exists and
     # trails.md does not (cmd_load migrates it on the next load).
@@ -2215,39 +2221,56 @@ cmd_list() {
 
     # Default cap: prevents unbounded dumps regardless of mode.
     # Claude Code bash tool allocates a pseudo-tty, so mode=execute without an explicit
-    # cap — apply the limit universally. Bypass: --limit=N, --all, or --status=done.
+    # Cap: active/todo/etc → 50; done → 100; explicit --limit or --all bypass.
+    # --status=done previously had no cap; agents calling wv list --status=done dumped
+    # all 500+ done nodes. Cap it too; --all still bypasses for intentional full dumps.
     local _LIST_DEFAULT_LIMIT=50
+    local _LIST_DONE_LIMIT=100
     local limit_clause=""
     local capped=false
     if [ -n "$limit_val" ]; then
         limit_clause="LIMIT $limit_val"
-    elif [ "$all" != true ] && [ "$status_filter" != "done" ]; then
+    elif [ "$all" = true ]; then
+        limit_clause=""
+    elif [ "$status_filter" = "done" ]; then
+        limit_clause="LIMIT $_LIST_DONE_LIMIT"
+        capped=true
+    else
         limit_clause="LIMIT $_LIST_DEFAULT_LIMIT"
         capped=true
     fi
+
+    # Always-on alternatives footer (stderr): every wv list call reminds the agent
+    # of cheaper targeted readers. Previously only fired when hitting the cap —
+    # that meant low-node repos never saw the hint even though call frequency was high.
+    _list_footer() {
+        local count="$1" hit_cap="$2" cap_n="$3"
+        if [ "$hit_cap" = true ]; then
+            echo "(showing $cap_n of $((count)) — use --all for full dump)" >&2
+        fi
+        echo "(targeted reads: wv ready | wv query <preds> | wv search <topic>)" >&2
+    }
 
     if [ "$format" = "json-v2" ]; then
         local results
         results=$(db_query_json_v2 "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
         [ -z "$results" ] && echo "[]" || echo "$results"
-        if [ "$capped" = true ]; then
-            local json_count
-            json_count=$(printf '%s' "${results:-[]}" | jq 'length' 2>/dev/null || echo 0)
-            if [ "$json_count" -ge "$_LIST_DEFAULT_LIMIT" ] 2>/dev/null; then
-                echo "(showing $_LIST_DEFAULT_LIMIT — use --all for full JSON or: wv query <preds> --format=json)" >&2
-            fi
-        fi
+        local json_count cap_n="$_LIST_DEFAULT_LIMIT"
+        [ "$status_filter" = "done" ] && cap_n="$_LIST_DONE_LIMIT"
+        json_count=$(printf '%s' "${results:-[]}" | jq 'length' 2>/dev/null || echo 0)
+        local hit_cap=false
+        [ "$capped" = true ] && [ "$json_count" -ge "$cap_n" ] 2>/dev/null && hit_cap=true
+        _list_footer "$json_count" "$hit_cap" "$cap_n"
     elif [ "$format" = "json" ]; then
         local results
         results=$(db_query_json "SELECT id, text, status, metadata, alias, created_at, updated_at FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
         [ -z "$results" ] && echo "[]" || echo "$results"
-        if [ "$capped" = true ]; then
-            local json_count
-            json_count=$(printf '%s' "${results:-[]}" | jq 'length' 2>/dev/null || echo 0)
-            if [ "$json_count" -ge "$_LIST_DEFAULT_LIMIT" ] 2>/dev/null; then
-                echo "(showing $_LIST_DEFAULT_LIMIT — use --all for full JSON or: wv query <preds> --format=json)" >&2
-            fi
-        fi
+        local json_count cap_n="$_LIST_DEFAULT_LIMIT"
+        [ "$status_filter" = "done" ] && cap_n="$_LIST_DONE_LIMIT"
+        json_count=$(printf '%s' "${results:-[]}" | jq 'length' 2>/dev/null || echo 0)
+        local hit_cap=false
+        [ "$capped" = true ] && [ "$json_count" -ge "$cap_n" ] 2>/dev/null && hit_cap=true
+        _list_footer "$json_count" "$hit_cap" "$cap_n"
     else
         # Text mode: exclude metadata to avoid multiline JSON breaking pipe-delimited parsing
         local row_count=0
@@ -2262,9 +2285,11 @@ cmd_list() {
             echo -e "${color}[$status]${NC} $id: $text"
             row_count=$((row_count + 1))
         done < <(db_query "SELECT id, text, status FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
-        if [ "$capped" = true ] && [ "$row_count" -ge "$_LIST_DEFAULT_LIMIT" ]; then
-            echo "(showing $_LIST_DEFAULT_LIMIT — use --all for full dump or: wv query <preds> --format=short)" >&2
-        fi
+        local cap_n="$_LIST_DEFAULT_LIMIT"
+        [ "$status_filter" = "done" ] && cap_n="$_LIST_DONE_LIMIT"
+        local hit_cap=false
+        [ "$capped" = true ] && [ "$row_count" -ge "$cap_n" ] && hit_cap=true
+        _list_footer "$row_count" "$hit_cap" "$cap_n"
     fi
 }
 
@@ -3456,7 +3481,17 @@ cmd_delete() {
         echo "  Node: $id [$node_status]"
         echo "  Text: $node_text"
         echo "  Edges: $edge_count"
-        [ -n "$gh_num" ] && [ "$gh_num" != "null" ] && echo "  GitHub issue: #$gh_num (would be closed)"
+        if [ -n "$gh_num" ] && [ "$gh_num" != "null" ]; then
+            local _dry_owner_count
+            # CAST: gh_issue is stored as a JSON number; a bare INTEGER never
+            # equals a TEXT literal in SQLite, so compare as TEXT on both sides.
+            _dry_owner_count=$(db_query "SELECT COUNT(*) FROM nodes WHERE id<>'$id' AND CAST(json_extract(metadata,'$.gh_issue') AS TEXT)='$gh_num';" 2>/dev/null || echo "0")
+            if [ "${_dry_owner_count:-0}" -gt 0 ]; then
+                echo "  GitHub issue: #$gh_num (would NOT be closed — $((${_dry_owner_count:-0})) other node(s) still map this issue)"
+            else
+                echo "  GitHub issue: #$gh_num (would be closed)"
+            fi
+        fi
         return 0
     fi
 
@@ -3489,10 +3524,30 @@ cmd_delete() {
 
     journal_complete 1
 
-    # Step 2: Close matching GitHub issue if linked
+    # Advance prune_epoch + re-dump state.sql immediately (D-3/D-4 fix).
+    # auto_sync is throttled and may not fire, leaving state.sql stale with the
+    # deleted node; wv load would then resurrect it from state.sql. cmd_prune uses
+    # the same pattern: write epoch first (blocks old INSERT deltas from replaying),
+    # then dump state.sql directly (captures the post-delete DB state).
+    date +%s > "$WEAVE_DIR/.prune_epoch"
+    local _del_state_tmp
+    _del_state_tmp=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
+    if dump_state_sql "$WV_DB" "$_del_state_tmp" && [ -s "$_del_state_tmp" ]; then
+        mv "$_del_state_tmp" "$WEAVE_DIR/state.sql"
+    else
+        rm -f "$_del_state_tmp"
+    fi
+
+    # Step 2: Close matching GitHub issue if linked and no other node still owns it
     if [ "$close_gh" = "true" ] && [ -n "$gh_num" ] && [ "$gh_num" != "null" ]; then
         journal_step 2 "gh_close" "{\"issue\":$gh_num}"
-        if command -v gh >/dev/null 2>&1; then
+        local _gh_owner_count
+        # CAST: see dry-run survivor query above — integer-stored gh_issue
+        # never matches a TEXT literal without the cast.
+        _gh_owner_count=$(db_query "SELECT COUNT(*) FROM nodes WHERE id<>'$id' AND CAST(json_extract(metadata,'$.gh_issue') AS TEXT)='$gh_num';" 2>/dev/null || echo "0")
+        if [ "${_gh_owner_count:-0}" -gt 0 ]; then
+            echo -e "${YELLOW}ℹ${NC} Skipped closing GitHub issue #$gh_num — ${_gh_owner_count} other node(s) still map this issue" >&2
+        elif command -v gh >/dev/null 2>&1; then
             local repo
             repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
             if [ -n "$repo" ]; then

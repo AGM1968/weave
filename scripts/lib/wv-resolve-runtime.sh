@@ -7,7 +7,7 @@
 # - Keep process-local memoization inside is_container().
 
 # Check if a path has enough free space (in KB)
-check_free_space() {
+check_free_space() { # predicate
     local path="$1"
     local min_kb="${2:-${WV_MIN_SHM:-102400}}"
     local avail_kb

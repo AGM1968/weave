@@ -4,6 +4,69 @@
 
 ## Unreleased
 
+## [1.59.0] - 2026-06-12
+
+### Added
+
+- **MCP tier-3 parity flags exposed** (wv-db8aeb): `weave_query.include`, `weave_health.history`,
+  `weave_recover.session`, `weave_sync.dry_run`, `weave_record_edit.intent`/`.metadata` (now
+  requires only `id` plus one payload), `weave_plan.template` (standalone template emit), and
+  `weave_quality_patterns` gains the `promote` subcommand with `parent`/`dry_run` — promote was
+  absent from the enum entirely. Parity baseline 41 -> 32; every remaining line is a deliberate
+  exclusion, the EXPOSE debt is retired.
+- **Table-driven MCP dispatch** (wv-8e217e): the 850-line `handleTool` switch (CC 237, the repo's
+  worst function) is now a `Record<string, ToolHandler>` map — 45 entries, each handler returning
+  result text or a full response envelope for enforcement paths. The
+  `mcp/src/index.ts` quality-gate exemption is retired; no function in the file exceeds CC 20.
+  Tier-2 parity flags exposed in the same pass: `weave_search.type`, `weave_code_search.filter`,
+  `weave_impact.files` (seeds from file paths; `ids` no longer required when `files` given);
+  `search --mode/--graph/--filter` reclassified as code-path flags already covered by
+  `weave_code_search`. Parity baseline 43 -> 41.
+- **MCP tier-1 parity flags exposed** (wv-4a1de6): `weave_add` gains `criteria`/`risks` (claim-ready
+  node creation per decomposition discipline), `weave_quick` gains `learning`, `weave_ship` gains
+  `verification_method`/`verification_evidence`, and `weave_done` gains `verification_evidence` —
+  agentic closes over MCP can now attach evidence instead of drawing the post-close advisory. Parity
+  baseline shrank 49 → 43 (tests/test-mcp-parity.sh enforces shrink-never-grow).
+
+### Fixed
+
+- **`wv done` under a custom `WV_DB` leaked a "Completed" trail into the repo's
+  `.weave/trails.md`.** `auto_sync` already skips repo-state writes for caller-supplied DB paths
+  (`WV_DB_CUSTOM`); the done-trail writer lacked the same guard, so closing a scratch-graph node
+  from a repo cwd dirtied real trail state. Same skip applied; explicit `wv trails save` is
+  unaffected. Known limitation recorded: the MCP Vitest harness (async piped spawn) is incompatible
+  with the Codex sandbox — verify MCP there via `tests/test-mcp-parity.sh` instead (wv-90415f).
+- **MCP `tools/call` failed entirely in sandboxed Node (Codex).** `spawnSync` there reports
+  `error.code=EPERM` from a post-spawn probe even when the child ran and exited 0; the `wv()`
+  wrapper treated any `error` as fatal. Errors are now fatal only when `status === null` (the spawn
+  itself failed). The parity test gained an execution smoke (`tools/call weave_guide`) so
+  spawn-layer breakage can no longer hide behind green schema/list parity (wv-5fe41b).
+- **`wv done --verification-method` was parsed but undocumented**, hiding it from `--help` — and
+  therefore from the parity test, whose CLI contract is the help text. Now documented, plus exposed
+  and forwarded as `weave_done.verification_method` (wv-5fe41b).
+- **`bootstrap-agent` telemetry claimed `scope: "persistent"` when instrumentation was disabled**,
+  and the append probe created the default log file as a side effect. Now reports
+  `enabled`/`writable` separately with `scope: disabled|persistent|unavailable`; when disabled the
+  probe is side-effect-free (wv-5fe41b).
+- **Direct test execution on bare-PATH sandboxes**: `tests/test-schema-contract.sh` self-appends
+  user tool dirs (poetry discovery), matching `scripts/wv` and the Makefile; pylint's stats cache
+  moved to a writable tmp dir, removing EROFS warning noise (wv-5fe41b).
+- **Call-log instrumentation leaked bash redirection errors on unwritable `WV_CALL_LOG`.** The
+  `2>/dev/null` came after the `>>` open, so read-only filesystems (Codex sandbox EROFS) printed
+  `Read-only file system` on every `wv` invocation. The append is now a braced group with stderr
+  silenced before the open; regression tests cover unwritable and writable paths (wv-ac0f6a).
+- **`make check` failed at command discovery in sandbox shells.** Codex-style shells omit
+  `~/.local/bin`/`~/.cargo/bin` from PATH, so `poetry` and `wv` were unfindable. The Makefile and
+  `Makefile.template` now append both dirs — the same fallback `scripts/wv` applies for itself;
+  documented in the WORKFLOW/AGENTS/CLAUDE templates (wv-3b6b4a).
+- **`bootstrap-agent` quality readiness probed a nonexistent `quality_scans` table**, reporting
+  `tools.quality.ready=false` after a successful scan. Now probes `scan_meta`, the actual scan-run
+  table, matching the `search --code` readiness path (wv-031d20).
+- **`bootstrap-agent` telemetry block claimed `scope: "persistent"` without checking writability.**
+  In read-only sandboxes new calls were silently unrecorded while `analyze sessions` read stale host
+  data. The block now runs a real append probe and reports `writable` plus a warning and
+  `scope: "unavailable"` when the log path cannot be opened (wv-031d20).
+
 ## [1.58.0] - 2026-06-11
 
 Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.md, sprints R1-R3).

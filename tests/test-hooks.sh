@@ -793,6 +793,79 @@ else
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 
+# Git-commit lock lifecycle. Regression guard: the pattern table in
+# bash-dedup-post.sh must include git-commit, or a completed foreground commit
+# leaves its lock pending and the second commit of the standard
+# "work commit → .weave/ sync commit" sequence is denied for GRACE_PERIOD.
+rm -f "$DEDUP_LOCK_DIR/git-commit.lock"
+GC_INPUT=$(jq -n --arg cmd 'git add -A && git commit -m "feat: test"' \
+    '{"tool_name":"Bash","tool_input":{"command":$cmd}}')
+set +e
+OUTPUT=$(echo "$GC_INPUT" | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "bash-dedup: first git commit exits 0 (allow)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$DEDUP_LOCK_DIR/git-commit.lock" ]]; then
+    echo -e "${GREEN}✓${NC} bash-dedup: git commit creates git-commit lock"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} bash-dedup: git commit must create git-commit lock"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# Second commit while lock is fresh — denied
+set +e
+OUTPUT=$(echo "$GC_INPUT" | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null)
+set -e
+assert_contains "$OUTPUT" '"deny"' "bash-dedup: second git commit while locked is denied"
+
+# Foreground completion must clear the git-commit lock
+GC_POST=$(jq -n --arg cmd 'git add -A && git commit -m "feat: test"' \
+    '{"tool_name":"Bash","tool_input":{"command":$cmd,"run_in_background":false},"tool_response":{"output":"done","success":true}}')
+echo "$GC_POST" | bash "$HOOKS_DIR/bash-dedup-post.sh" 2>/dev/null
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$DEDUP_LOCK_DIR/git-commit.lock" ]]; then
+    echo -e "${RED}✗${NC} bash-dedup-post: foreground git commit must clear git-commit lock"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    rm -f "$DEDUP_LOCK_DIR/git-commit.lock"
+else
+    echo -e "${GREEN}✓${NC} bash-dedup-post: foreground git commit clears git-commit lock"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+fi
+
+# Background commit must be promoted to running (lock preserved past GRACE_PERIOD)
+echo "$GC_INPUT" | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null || true  # re-acquire
+GC_BG=$(jq -n --arg cmd 'git add -A && git commit -m "feat: test"' \
+    '{"tool_name":"Bash","tool_input":{"command":$cmd,"run_in_background":true},"tool_response":{"output":null,"backgroundTaskId":"gcbg1","success":true}}')
+set +e
+echo "$GC_BG" | bash "$HOOKS_DIR/bash-dedup-post.sh" 2>/dev/null
+set -e
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$DEDUP_LOCK_DIR/git-commit.lock" ]] \
+    && [[ "$(sed -n '2p' "$DEDUP_LOCK_DIR/git-commit.lock")" == "running" ]]; then
+    echo -e "${GREEN}✓${NC} bash-dedup-post: background git commit promotes lock to running"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} bash-dedup-post: background git commit must promote lock to running"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+rm -f "$DEDUP_LOCK_DIR/git-commit.lock"
+
+# Pattern-table parity: every lock key classified by bash-dedup.sh must also
+# appear in bash-dedup-post.sh, or its lock is never cleared/promoted.
+TESTS_RUN=$((TESTS_RUN + 1))
+PRE_KEYS=$(grep -oP 'LOCK_KEY="\K[a-z-]+' "$HOOKS_DIR/bash-dedup.sh" | sort -u)
+POST_KEYS=$(grep -oP '^_handle_lock "\K[a-z-]+' "$HOOKS_DIR/bash-dedup-post.sh" | sort -u)
+MISSING_KEYS=$(comm -23 <(echo "$PRE_KEYS") <(echo "$POST_KEYS"))
+if [[ -z "$MISSING_KEYS" ]]; then
+    echo -e "${GREEN}✓${NC} bash-dedup: pre/post lock-key tables are in sync"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} bash-dedup: lock keys missing from bash-dedup-post.sh: $(echo "$MISSING_KEYS" | tr '\n' ' ')"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 # --- post-edit-lint.sh ---
 echo ""
 echo "--- post-edit-lint.sh ---"

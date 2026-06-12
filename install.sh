@@ -1784,6 +1784,12 @@ if [ "$WITH_MCP" = "1" ]; then
         mkdir -p "$mcp_dir"
         if [ -f "./mcp/package.json" ]; then
             echo "Building MCP server from local source..."
+            # Refresh the repo-local ./mcp/dist too: git does not track it, but
+            # vitest (SERVER_PATH) and the .mcp.json repo fallback read it — a
+            # stale checkout dist shipped an old server to dev (wv-0cd7f8).
+            if [ -d "./mcp/node_modules" ]; then
+                (cd ./mcp && npm run build --silent 2>&1 | tail -1) || true
+            fi
             cp ./mcp/package.json ./mcp/tsconfig.json "$mcp_dir/" 2>/dev/null || true
             cp -r ./mcp/src "$mcp_dir/" 2>/dev/null || true
             (cd "$mcp_dir" && npm install --production=false --silent 2>&1 | tail -1 && npm run build --silent 2>&1) && {

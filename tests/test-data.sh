@@ -473,7 +473,7 @@ assert_contains "$output" "Imported task 1" "dry-run shows first task"
 assert_contains "$output" "Imported task 2" "dry-run shows second task"
 
 # Verify nothing actually imported (list should be empty or only show init message)
-list_json=$($WV list --json 2>&1 || echo "[]")
+list_json=$($WV list --json 2>/dev/null || echo "[]")
 # Handle empty output
 if [ -z "$list_json" ]; then list_json="[]"; fi
 count=$(echo "$list_json" | jq 'length')
@@ -490,7 +490,7 @@ assert_contains "$list_output" "Imported task 2" "imported task 2 exists"
 assert_contains "$list_output" "Imported task 3" "imported task 3 exists"
 
 # Verify status mapping (beads open -> weave todo)
-json_output=$($WV list --all --json 2>&1)
+json_output=$($WV list --all --json 2>/dev/null)
 todo_count=$(echo "$json_output" | jq '[.[] | select(.status=="todo")] | length')
 assert_equals "1" "$todo_count" "open status mapped to todo"
 
@@ -531,7 +531,7 @@ output=$($WV import "$TEST_DIR/import-weave.jsonl" 2>&1)
 assert_contains "$output" "Imported 1 nodes" "import handles weave format"
 
 # Verify metadata preserved (imported_from added)
-json=$($WV list --all --json 2>&1)
+json=$($WV list --all --json 2>/dev/null)
 meta_has_type=$(echo "$json" | jq -r '.[0].metadata' | jq -r '.type // empty' 2>/dev/null || echo "")
 assert_equals "feature" "$meta_has_type" "weave metadata preserved"
 
@@ -580,7 +580,7 @@ rm -f "$WV_DB" "$WV_DB-wal" "$WV_DB-shm"
 $WV load >/dev/null 2>&1
 
 # Verify nodes restored
-count=$($WV list --all --json 2>&1 | jq 'length')
+count=$($WV list --all --json 2>/dev/null | jq 'length')
 assert_equals "3" "$count" "roundtrip preserves node count"
 
 # Verify edges restored
@@ -869,6 +869,18 @@ fb_show=$($WV trails show 2>&1)
 assert_contains "$fb_show" "fallback body" "wv trails show falls back to legacy breadcrumbs.md"
 rm -f "$WEAVE_DIR/breadcrumbs.md"
 
+# 6. Isolation guard (wv-90415f): wv done under a custom WV_DB must not append
+# a "Completed" trail to the repo's trails.md — same WV_DB_CUSTOM skip as
+# auto_sync. This whole suite runs with custom WV_DB, so closing a node here
+# is exactly the codex leak shape (scratch graph, real repo cwd).
+printf '# Trails\n\npre-existing trail body\n' > "$WEAVE_DIR/trails.md"
+leak_id=$($WV add "trail isolation probe" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+$WV done "$leak_id" --no-warn >/dev/null 2>&1
+leak_trails=$(cat "$WEAVE_DIR/trails.md" 2>/dev/null)
+assert_not_contains "$leak_trails" "Completed" "wv done with custom WV_DB does not append repo trail"
+assert_contains "$leak_trails" "pre-existing trail body" "repo trails.md content untouched by isolated done"
+rm -f "$WEAVE_DIR/trails.md"
+
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -887,6 +899,23 @@ assert_contains "$fg_out" "BLOCKED" "floor-guard blocks 2-of-10 (<0.70) shrink s
 assert_equals "10" "$(grep -c '^INSERT INTO nodes' "$WEAVE_DIR/state.sql")" "floor-guard leaves state.sql intact when blocked"
 WV_FORCE_SYNC=1 $WV sync >/dev/null 2>&1 || true
 assert_equals "2" "$(grep -c '^INSERT INTO nodes' "$WEAVE_DIR/state.sql")" "WV_FORCE_SYNC=1 bypasses floor-guard"
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# findings list: node text containing '|' must not shift pipe-parsed fields
+# ═══════════════════════════════════════════════════════════════════════════
+echo "--- findings list pipe-in-text parsing ---"
+pf_id=$($WV add "finding with embedded pipe char in body text" --force 2>/dev/null | grep -oP 'wv-[a-f0-9]+' | head -1)
+sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'),
+    '\$.type','finding',
+    '\$.promoted_at',datetime('now','-3 days'),
+    '\$.finding', json('{\"fixable\":\"1\",\"confidence\":\"high\",\"violation_type\":\"repo:hygiene\"}')),
+    text='finding: glob gap — needs install.sh entry | calibration: false positive'
+    WHERE id='$pf_id';"
+pf_out=$($WV findings list --all 2>&1)
+assert_not_contains "$pf_out" "integer expression expected" "findings list survives pipe in node text"
+assert_contains "$pf_out" "3d" "findings list age column survives pipe in node text"
 
 echo ""
 
