@@ -2364,11 +2364,20 @@ _scaffold_test_map() {
     body='# .weave/test-map.conf — source file to test suite mapping
 # Format ([map] section, INI-style):
 #   source_file = suite [suite ...]
-# source_file: path relative to repo root (exact match, no globs)
+# source_file: path relative to repo root. Three key forms (most specific wins):
+#   exact      src/app/models.py = suite      single file
+#   glob       src/**/*.py       = suite      shell glob (matches files in subdirs)
+#   prefix     src/              = suite       any file under a directory (trailing /)
 # suite:       path to a runnable shell script relative to repo root
 #
-# Uncomment and adapt the entries below. A file with no entry falls back to
-# the naming-convention heuristic or classifies as "unknown" (gate inert).
+# A `* = suite` line, or suites listed under a [default] section, run when no
+# other key matches a file — so the gate fails *safe* (runs a broad suite)
+# instead of *open* (runs nothing). Per-file precedence:
+#   exact > glob/prefix > naming heuristic > [default].
+# A file matching nothing (and no [default]) makes the pre-commit gate inert
+# for it and now prints a one-line notice rather than passing silently.
+#
+# Uncomment and adapt the entries below.
 
 [map]
 '
@@ -2380,9 +2389,11 @@ _scaffold_test_map() {
 # Create a wrapper that sets up the env and runs pytest, e.g. scripts/run-tests.sh:
 #   #!/usr/bin/env bash
 #   set -e; cd "$(git rev-parse --show-toplevel)" && poetry run pytest tests
-# Then map source files to that wrapper:
-# src/mypackage/module.py  = scripts/run-tests.sh
-# src/mypackage/__init__.py = scripts/run-tests.sh
+# Then map the whole source tree with one prefix (or glob) line:
+# src/         = scripts/run-tests.sh
+# src/**/*.py  = scripts/run-tests.sh
+# Or set a fail-safe default for anything unmapped:
+# *            = scripts/run-tests.sh
 
 '
     fi
@@ -4465,22 +4476,31 @@ PYEOF
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# cmd_audit_pitfalls — Show all pitfalls with resolution status
+# cmd_audit_pitfalls — Show pitfalls with resolution status
+# Default: unaddressed only, top 20 (output budget D3). --all for the full dump.
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_audit_pitfalls() {
     local format="text"
-    local show_addressed=true
+    # Output budget (docs/PROPOSAL-wv-output-budget.md D3): the audit's purpose
+    # is "what is still open" — default to unaddressed only, top 20. --all dumps.
+    local show_addressed=false
     local show_unaddressed=true
+    local top=20
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --json) format="json" ;;
-            --only-unaddressed) show_addressed=false ;;
-            --only-addressed) show_unaddressed=false ;;
+            --only-unaddressed) show_addressed=false; show_unaddressed=true ;;
+            --only-addressed) show_addressed=true; show_unaddressed=false ;;
+            --top=*) top="${1#*=}" ;;
+            --all) show_addressed=true; show_unaddressed=true; top=0 ;;
         esac
         shift
     done
+    case "$top" in
+        ''|*[!0-9]*) top=20 ;;
+    esac
 
     # Query all nodes with pitfall metadata
     local query="
@@ -4499,8 +4519,33 @@ cmd_audit_pitfalls() {
         return
     fi
 
+    # Addressed/eligible counts up front — they drive the truncation summary.
+    local total_addressed
+    total_addressed=$(db_query "
+        SELECT COUNT(DISTINCT target) FROM edges
+        WHERE type IN ('addresses', 'implements', 'supersedes')
+        AND target IN (
+            SELECT id FROM nodes
+            WHERE json_extract(metadata, '\$.pitfall') IS NOT NULL
+        )
+    " 2>/dev/null || echo "0")
+    local total_unaddressed=$((count - total_addressed))
+    local eligible=0
+    if [ "$show_addressed" = true ]; then
+        eligible=$((eligible + total_addressed))
+    fi
+    if [ "$show_unaddressed" = true ]; then
+        eligible=$((eligible + total_unaddressed))
+    fi
+
     # For each pitfall node, check for incoming addresses/implements/supersedes edges
+    local shown=0
     echo "$results" | jq -c '.[]' | while IFS= read -r row; do
+        # At cap: keep draining stdin (break would SIGPIPE jq under pipefail)
+        # but skip all per-row work.
+        if [ "$top" -gt 0 ] && [ "$shown" -ge "$top" ]; then
+            continue
+        fi
         local id text status pitfall
         id=$(echo "$row" | jq -r '.id')
         text=$(echo "$row" | jq -r '.text')
@@ -4534,6 +4579,8 @@ cmd_audit_pitfalls() {
         else
             [ "$show_unaddressed" = false ] && continue
         fi
+
+        shown=$((shown + 1))
 
         if [ "$format" = "json" ]; then
             local resolver_ids
@@ -4580,23 +4627,15 @@ cmd_audit_pitfalls() {
     done | if [ "$format" = "json" ]; then jq -s .; else cat; fi
 
     if [ "$format" != "json" ]; then
-        # Count totals for summary
-        local total_addressed
-        local total_unaddressed
-        total_addressed=$(db_query "
-            SELECT COUNT(DISTINCT target) FROM edges
-            WHERE type IN ('addresses', 'implements', 'supersedes')
-            AND target IN (
-                SELECT id FROM nodes
-                WHERE json_extract(metadata, '\$.pitfall') IS NOT NULL
-            )
-        " 2>/dev/null || echo "0")
-        total_unaddressed=$((count - total_addressed))
-
         echo -e "${CYAN}Summary:${NC}"
         echo -e "  Total pitfalls: $count"
         echo -e "  ${GREEN}Addressed: $total_addressed${NC}"
         echo -e "  ${RED}Unaddressed: $total_unaddressed${NC}"
+        if [ "$top" -gt 0 ] && [ "$eligible" -gt "$top" ]; then
+            echo -e "  ${YELLOW}Showing $top of $eligible matching — use --all for the full list${NC}"
+        fi
+    elif [ "$top" -gt 0 ] && [ "$eligible" -gt "$top" ]; then
+        echo "wv audit-pitfalls: showing $top of $eligible (use --all for the full list)" >&2
     fi
 }
 
@@ -4611,6 +4650,8 @@ cmd_audit_pitfalls() {
 #   6. Node-state invariant: no node declares deferral in metadata
 #      (deferred/blocked_on) while still in the ready queue (todo + no
 #      non-done blocks edge). See docs/PROPOSAL-graph-as-policy-boundary.md.
+#   7. No non-predicate function ends in a bare `[ cond ] && cmd` tail.
+#   8. Raw sqlite3 reads of quality.db stay inside blessed quality helpers.
 # See docs/PROPOSAL-wv-pattern-crystallization.md for context.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -4944,6 +4985,62 @@ infunc {
             '. + [{"check":"function_tail_returns","status":"warn","detail":"scripts dir not found - skipped","count":0}]')
     fi
 
+    # ── Check 8: quality.db sqlite3 access must stay behind blessed helpers ─
+    # The quality readiness bug class recurs when callers hand-roll direct
+    # sqlite3 probes against quality.db and drift from the owner schema in
+    # scripts/weave_quality. Keep shell-side access in explicitly reviewed
+    # helpers; new raw call sites must either move into one of these helpers or
+    # justify a new blessed owner here.
+    local _pa8_scope="$_project_root/scripts"
+    if [ -d "$_pa8_scope" ]; then
+        local _pa8_awk='
+function allowed(fn) {
+    return fn == "_bootstrap_agent_tools_json" ||
+           fn == "_preflight_policy_readiness" ||
+           fn == "_done_refresh_file_metrics" ||
+           fn == "_done_refresh_trend_signals"
+}
+/^(function[ \t]+)?[A-Za-z_][A-Za-z0-9_]*\(\)[ \t]*\{/ {
+    fname=$0; sub(/\(\).*/,"",fname); sub(/^function[ \t]+/,"",fname); next
+}
+{
+    if ($0 ~ /^[ \t]*#/) next
+    if (fname == "cmd_pattern_audit") next
+    if ($0 ~ /sqlite3/ && ($0 ~ /quality\.db/ || $0 ~ /quality_db/)) {
+        if (FILENAME ~ /\/scripts\/weave_quality\//) next
+        if (allowed(fname)) next
+        printf "%s:%d:%s: %s\n", FILENAME, FNR, fname, $0
+    }
+}'
+        local _pa8_files quality_hits=""
+        _pa8_files=$(find "$_pa8_scope" -type f \( -name '*.sh' -o -name 'wv' \) \
+            -not -path '*/tests/*' -not -path '*/archive/*' 2>/dev/null)
+        if [ -n "$_pa8_files" ]; then
+            quality_hits=$(echo "$_pa8_files" | xargs -r awk "$_pa8_awk" 2>/dev/null || true)
+        fi
+        if [ -n "$quality_hits" ]; then
+            local quality_count
+            quality_count=$(echo "$quality_hits" | grep -c .) || quality_count=0
+            if [ "$format" = "text" ]; then
+                echo -e "${RED}✗ Check 8 FAIL: $quality_count raw sqlite3 quality.db access(es) outside blessed helpers:${NC}"
+                echo "$quality_hits" | while IFS= read -r hit; do [ -n "$hit" ] && echo "    $hit"; done
+                echo -e "  Move probes into _preflight_policy_readiness/_bootstrap_agent_tools_json or the quality owner module."
+            fi
+            findings_json=$(echo "$findings_json" | jq \
+                --arg detail "$(echo "$quality_hits" | tr '\n' ' ' | sed 's/ *$//')" --argjson n "$quality_count" \
+                '. + [{"check":"quality_db_sqlite_owner","status":"fail","detail":$detail,"count":$n}]')
+            issues=$((issues + quality_count))
+        else
+            [ "$format" = "text" ] && echo -e "${GREEN}✓ Check 8 PASS: raw sqlite3 quality.db access stays in blessed helpers${NC}"
+            findings_json=$(echo "$findings_json" | jq \
+                '. + [{"check":"quality_db_sqlite_owner","status":"pass","detail":"quality.db sqlite3 access is owner-scoped","count":0}]')
+        fi
+    else
+        [ "$format" = "text" ] && echo -e "${YELLOW}⚠ Check 8 WARN: $_pa8_scope not found — skipped${NC}"
+        findings_json=$(echo "$findings_json" | jq \
+            '. + [{"check":"quality_db_sqlite_owner","status":"warn","detail":"scripts dir not found - skipped","count":0}]')
+    fi
+
     # ── Summary ─────────────────────────────────────────────────────────────
     if [ "$format" = "json" ]; then
         jq -n \
@@ -5116,7 +5213,7 @@ View learnings:
   wv learnings --grep="sqlite"          # search
   wv learnings --recent=5               # last 5
   wv learnings --node=<id>              # for one node
-  wv audit-pitfalls --only-unaddressed  # unresolved pitfalls
+  wv audit-pitfalls                     # unresolved pitfalls (top 20; --all for everything)
 EOF
             ;;
         context)
@@ -5553,7 +5650,7 @@ cmd_help_topic() {
             print_command_help "wv path <id> [--format=chain]" "Show the ancestry path for a node."
             ;;
         tree)
-            print_command_help "wv tree [root] [--active] [--depth=N] [--json] [--mermaid]" "Render epic/task hierarchy as text, JSON, or Mermaid."
+            print_command_help "wv tree [root] [--active] [--depth=N] [--all] [--json] [--mermaid]" "Render epic/task hierarchy as text, JSON, or Mermaid. Capped at 50 nodes (WV_TREE_CAP); --all lifts."
             ;;
         plan)
             print_command_help "wv plan <file.md> --sprint=N [--dry-run] [--gh] [--template]" "Import a markdown plan into epic/task nodes, or emit a template with --template."
@@ -5596,7 +5693,7 @@ SEARCHHELP
             print_command_help "wv session-summary" "Show session activity statistics such as nodes created, completed, and learnings captured."
             ;;
         audit-pitfalls)
-            print_command_help "wv audit-pitfalls" "List pitfall learnings and their resolution status."
+            print_command_help "wv audit-pitfalls [--top=N] [--all] [--only-addressed] [--json]" "List unaddressed pitfalls (top 20 default); --all includes addressed."
             ;;
         edge-types)
             print_command_help "wv edge-types [--stats] [--json]" "List valid semantic edge types and what each one means. --stats adds live edge counts from the graph."

@@ -158,6 +158,14 @@ if [ -n "$_pc_files_csv" ]; then
             [ "$_pc_suite" = "tests/run-all.sh" ] && continue
             run_hook_suite "$_pc_suite" "$_pc_cost"
         done < <(printf '%s' "$_pc_suites_json" | jq -r '.[] | [.name, (.last_cost_s|tostring)] | join("\t")' 2>/dev/null)
+    else
+        # No suite matched any staged source file — the impact gate is inert for
+        # this commit. Surface it so silent test-map rot becomes visible instead
+        # of passing as if it were gated (add a glob/prefix or [default] entry to
+        # .weave/test-map.conf, or run wv test-config to scaffold one).
+        _pc_unmapped_count=$(printf '%s\n' "$NON_WEAVE_FILES" | grep -c . 2>/dev/null || echo 0)
+        echo "⚠ impact gate inert: $_pc_unmapped_count staged file(s) matched no .weave/test-map.conf entry — no suite ran." >&2
+        echo "  Add a glob/prefix/[default] entry (e.g. 'src/ = tests/...') so the gate covers them." >&2
     fi
 fi
 

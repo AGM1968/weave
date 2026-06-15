@@ -244,7 +244,13 @@ install_git_hook_from_repo() {
 
     local hook_dst="$HOOK_DIR/$hook_name"
     if [ -f "$hook_dst" ]; then
-        if grep -q "$marker" "$hook_dst" 2>/dev/null; then
+        # Refresh only a Weave-managed hook. Match the exact marker OR any stable
+        # Weave signature, so an OLDER installed hook whose header wording has
+        # since changed is still recognised and refreshed — instead of being
+        # mistaken for a custom user hook and skipped (left stale, the friction
+        # wv doctor flagged with a manual `install -m 755 ...`). A genuinely
+        # custom hook (no Weave signature) is still preserved.
+        if grep -qE "$marker|# Weave (pre-commit|post-commit|prepare-commit)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
             action="updated"
         else
             echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (custom hook exists, skipped)"
@@ -753,7 +759,13 @@ install_git_hook_from_repo() {
 
     local hook_dst="$HOOK_DIR/$hook_name"
     if [ -f "$hook_dst" ]; then
-        if grep -q "$marker" "$hook_dst" 2>/dev/null; then
+        # Refresh only a Weave-managed hook. Match the exact marker OR any stable
+        # Weave signature, so an OLDER installed hook whose header wording has
+        # since changed is still recognised and refreshed — instead of being
+        # mistaken for a custom user hook and skipped (left stale, the friction
+        # wv doctor flagged with a manual `install -m 755 ...`). A genuinely
+        # custom hook (no Weave signature) is still preserved.
+        if grep -qE "$marker|# Weave (pre-commit|post-commit|prepare-commit)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
             action="updated"
         else
             echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (custom hook exists, skipped)"
@@ -902,6 +914,9 @@ WEAVE_PATTERNS=(
     ".weave/*.db"
     ".weave/*.db-wal"
     ".weave/*.db-shm"
+    "**/.weave/ast_cache.db"
+    "**/.weave/ast_cache.db-wal"
+    "**/.weave/ast_cache.db-shm"
     ".weave/.context_policy"
     ".weave/.prune_epoch"
     ".weave/quality.local.conf"
@@ -941,19 +956,28 @@ install_git_hook_from_repo "./scripts/hooks/pre-commit-weave.sh" "Weave pre-comm
 # Git hook: post-commit (run deferred non-critical suites)
 install_git_hook_from_repo "./scripts/hooks/post-commit-weave.sh" "Weave post-commit" "post-commit"
 
-# scripts/hooks/ vendor refresh — if a consumer repo has vendored hook sources,
-# keep them current from LIB_DIR so wv doctor --source-compare keeps passing
+# scripts/hooks/ vendor refresh — for a consumer repo that vendors hook sources,
+# converge scripts/hooks/ to the canonical set from LIB_DIR so PR review and
+# wv doctor --source-compare see every installed hook. SEED a source that is
+# missing (not just refresh ones already present): a consumer scaffolded before
+# a hook was added (e.g. post-commit-weave.sh) installs the .git/hooks/ copy from
+# the LIB_DIR fallback but never gets the vendored source otherwise, leaving a
+# permanent source/installed asymmetry (wv-2adeef).
 _LIB_HOOKS="${LIB_DIR:-$HOME/.local/lib/weave}/hooks"
 if [ -d "$REPO_ROOT/scripts/hooks" ] && [ -d "$_LIB_HOOKS" ]; then
     _updated_vendor=0
     for _hf in pre-commit-weave.sh post-commit-weave.sh prepare-commit-msg-weave.sh; do
-        if [ -f "$REPO_ROOT/scripts/hooks/$_hf" ] && [ -f "$_LIB_HOOKS/$_hf" ]; then
-            if ! cmp -s "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf" 2>/dev/null; then
-                cp "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf"
-                chmod +x "$REPO_ROOT/scripts/hooks/$_hf"
-                echo -e "  ${GREEN}✓${NC} scripts/hooks/$_hf (updated)"
-                _updated_vendor=1
-            fi
+        [ -f "$_LIB_HOOKS/$_hf" ] || continue
+        if [ ! -f "$REPO_ROOT/scripts/hooks/$_hf" ]; then
+            cp "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf"
+            chmod +x "$REPO_ROOT/scripts/hooks/$_hf"
+            echo -e "  ${GREEN}✓${NC} scripts/hooks/$_hf (seeded)"
+            _updated_vendor=1
+        elif ! cmp -s "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf" 2>/dev/null; then
+            cp "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf"
+            chmod +x "$REPO_ROOT/scripts/hooks/$_hf"
+            echo -e "  ${GREEN}✓${NC} scripts/hooks/$_hf (updated)"
+            _updated_vendor=1
         fi
     done
     [ "$_updated_vendor" -eq 0 ] && true
@@ -1701,13 +1725,24 @@ echo ""
 if [ "$UPDATE_MODE" = "1" ]; then
     echo -e "${GREEN}✓ Weave updated in $REPO_ROOT (agent=$AGENT_LABEL)${NC}"
 
-    # Warn about unstaged changes from update
-    local_changes=$(cd "$REPO_ROOT" && git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard .claude/ .github/ .vscode/ 2>/dev/null || true)
+    # Warn about unstaged changes from update. Include scripts/hooks/ — the
+    # vendor refresh now seeds/refreshes hook SOURCES there (e.g. a newly added
+    # post-commit-weave.sh), which the old .claude/.github/.vscode glob missed.
+    local_changes=$(cd "$REPO_ROOT" && git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard .claude/ .github/ .vscode/ scripts/hooks/ 2>/dev/null || true)
     if [ -n "$local_changes" ]; then
         echo ""
-        echo -e "${YELLOW}⚠ Unstaged changes from update:${NC}"
+        echo -e "${YELLOW}⚠ Unstaged scaffolding changes from update:${NC}"
         echo "$local_changes" | while read -r f; do echo "  $f"; done
-        echo -e "${YELLOW}  Run: git add -A .claude/ .github/ .vscode/ && git commit -m 'chore: update Weave scaffolding'${NC}"
+        # The consumer's own Weave pre-commit hook blocks a commit without an
+        # active node, and a repo with active epics needs --standalone to claim,
+        # so the bare `git commit` the hint used to print just hits that wall.
+        # Give a sequence that actually lands the commit.
+        echo -e "${YELLOW}  To commit (the Weave pre-commit hook needs an active node):${NC}"
+        echo "    wv add \"chore: sync Weave scaffolding\" --standalone --alias=weave-scaffold \\"
+        echo "      --status=active --criteria=\"scaffolding synced\" --risks=low"
+        echo "    git add -A .claude/ .github/ .vscode/ scripts/hooks/ .gitignore && git commit -m \"chore(weave): sync scaffolding\""
+        echo "    wv done <node-id> --skip-verification        # <node-id> from the wv add line above"
+        echo -e "${YELLOW}  Quick path (no node): WV_SKIP_PRECOMMIT=1 git add -A … && git commit -m '…'${NC}"
     fi
 else
     echo -e "${GREEN}✓ Weave initialized in $REPO_ROOT (agent=$AGENT_LABEL)${NC}"

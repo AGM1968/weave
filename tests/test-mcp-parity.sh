@@ -251,10 +251,14 @@ query_out=$(printf '%s\n%s\n%s\n' \
     '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"weave_query","arguments":{"predicates":["status=done"],"limit":1}}}' \
     | timeout 20 node "$MCP_DIST" --scope=all 2>/dev/null \
     | jq -rs '[.[] | select(.id==4)][0].result.content[0].text // empty' || true)
-if [ -n "$query_out" ] && ! echo "$query_out" | grep -qi "unknown option"; then
-    pass "tools/call weave_query reads the graph (no unknown-option error)"
+# Structural assertion only: the failure shape is an Error:-prefixed reply
+# (e.g. "Error: unknown option: --mode=discover"). Never grep result CONTENT
+# for the error string — node text/evidence in the graph may legitimately
+# quote it (self-referential false positive, found on dev 2026-06-12).
+if [ -n "$query_out" ] && ! printf '%s' "$query_out" | head -1 | grep -qE "^Error:"; then
+    pass "tools/call weave_query reads the graph (no Error reply)"
 else
-    fail "tools/call weave_query reads the graph (no unknown-option error)" "output: '${query_out:0:120}'"
+    fail "tools/call weave_query reads the graph (no Error reply)" "output: '${query_out:0:120}'"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

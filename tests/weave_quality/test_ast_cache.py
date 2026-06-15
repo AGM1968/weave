@@ -2,6 +2,7 @@
 
 # pylint: disable=missing-function-docstring,redefined-outer-name
 
+import subprocess
 import time
 
 import pytest
@@ -170,3 +171,25 @@ def test_prune_removes_old_entries(tmp_path):
     assert deleted == 1
     assert c.get("sha_old", "foo.py", 1, "production") is None
     c.close()
+
+
+def test_open_falls_back_to_path_when_not_git(tmp_path):
+    # Not a git repo: cache lives at the given path's .weave/ (existing behavior).
+    c = ASTCache.open(tmp_path, scanner_version="1.0.0")
+    c.close()
+    assert (tmp_path / ".weave" / "ast_cache.db").exists()
+
+
+def test_open_anchors_cache_at_git_toplevel(tmp_path):
+    # Regression for wv-a94144: a subdir-scoped scan path must anchor the cache
+    # at the git top-level, not drop a nested .weave/ in the subdir.
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subdir = tmp_path / "src" / "trigger_launcher"
+    subdir.mkdir(parents=True)
+
+    c = ASTCache.open(subdir, scanner_version="1.0.0")
+    c.close()
+
+    # Cache anchored at repo root, not the subdir scan path.
+    assert (tmp_path / ".weave" / "ast_cache.db").exists()
+    assert not (subdir / ".weave").exists()

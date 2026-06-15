@@ -357,11 +357,15 @@ assert_contains "$output" "Unaddressed: 2" "audit-pitfalls counts 2 unaddressed"
 fix=$($WV add "Fix for first issue" --status=done --force)
 $WV link "$fix" "$pitfall1" --type=addresses >/dev/null 2>&1
 
+# Default hides addressed entries (output budget D3) but still counts them
 output=$($WV audit-pitfalls 2>&1)
-assert_contains "$output" "ADDRESSED" "audit-pitfalls shows ADDRESSED"
 assert_contains "$output" "Addressed: 1" "audit-pitfalls counts 1 addressed"
 assert_contains "$output" "Unaddressed: 1" "audit-pitfalls counts 1 unaddressed"
-assert_contains "$output" "$fix" "audit-pitfalls shows fix node ID"
+assert_not_contains "$output" "$fix" "audit-pitfalls default hides addressed entry"
+
+output=$($WV audit-pitfalls --all 2>&1)
+assert_contains "$output" "[ADDRESSED]" "audit-pitfalls --all shows ADDRESSED"
+assert_contains "$output" "$fix" "audit-pitfalls --all shows fix node ID"
 
 # ============================================================================
 # Test: audit-pitfalls --json
@@ -369,10 +373,10 @@ assert_contains "$output" "$fix" "audit-pitfalls shows fix node ID"
 echo ""
 echo "Testing: audit-pitfalls --json"
 
-# JSON output
-json_output=$($WV audit-pitfalls --json 2>&1)
+# JSON output (--all: default omits the addressed entry)
+json_output=$($WV audit-pitfalls --all --json 2>&1)
 count=$(echo "$json_output" | jq 'length' 2>/dev/null || echo "0")
-assert_equals "2" "$count" "audit-pitfalls --json returns 2 nodes"
+assert_equals "2" "$count" "audit-pitfalls --all --json returns 2 nodes"
 
 # Check addressed field
 addressed_count=$(echo "$json_output" | jq '[.[] | select(.addressed == true)] | length')
@@ -418,8 +422,8 @@ $WV link "$f1" "$p1" --type=addresses >/dev/null 2>&1
 $WV link "$f2" "$p2" --type=implements >/dev/null 2>&1
 $WV link "$f3" "$p3" --type=supersedes >/dev/null 2>&1
 
-# All should be addressed
-json_output=$($WV audit-pitfalls --json 2>&1)
+# All should be addressed (--all: default omits addressed entries)
+json_output=$($WV audit-pitfalls --all --json 2>&1)
 addressed_count=$(echo "$json_output" | jq '[.[] | select(.addressed == true)] | length')
 assert_equals "3" "$addressed_count" "all resolution edge types count as addressed"
 

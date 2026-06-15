@@ -61,6 +61,20 @@ CMD_STRIPPED=$(printf '%s' "$CMD" | sed -E 's/"[^"]*"//g; s/'"'"'[^'"'"']*'"'"'/
 LOCK_KEY=""
 TTL=0
 
+# ── Busy-wait poller detection ─────────────────────────────────────────────────
+# An `until …; do … sleep N; done` / `while …; do … sleep N; done` loop spawned
+# to watch a backgrounded task is the anti-pattern this guard closes: it is not a
+# classified expensive command, so without this check it sails past the lock and
+# busy-waits (the v1.59.1 zombie-watcher regression). Detected on CMD_STRIPPED so
+# the words "until"/"sleep" inside a quoted argument (prose) do not trigger it.
+# The deny decision is gated on an actually-live background lock below, so a
+# legitimate poll loop with nothing in flight is still allowed.
+IS_POLLER=false
+if [[ "$CMD_STRIPPED" =~ (^|[;&|[:space:]])(until|while)[[:space:]] ]] \
+   && [[ "$CMD_STRIPPED" =~ (^|[;&|[:space:]])sleep[[:space:]] ]]; then
+    IS_POLLER=true
+fi
+
 if [[ "$CMD_STRIPPED" =~ (^|[;[:space:]])(make[[:space:]]+(check|test|build)|make[[:space:]]*$) ]]; then
     LOCK_KEY="make-build"
     TTL=600      # 10 min — covers slow CI machines (local suite runs ~90s)
@@ -84,7 +98,8 @@ elif [[ "$CMD_STRIPPED" =~ (^|[;[:space:]])poetry[[:space:]]+run[[:space:]]+pyte
     TTL=120      # test suite runs in <90s
 fi
 
-[[ -z "$LOCK_KEY" ]] && exit 0
+# A normal command with no lock key and not a poller: nothing to do.
+[[ -z "$LOCK_KEY" && "$IS_POLLER" != "true" ]] && exit 0
 
 # ── Portable repo hash (md5sum → md5 → sha256sum → fallback) ─────────────────
 
@@ -100,6 +115,73 @@ REPO_HASH=$(
 )
 LOCK_DIR="/tmp/weave-bash-locks/${REPO_HASH}"
 mkdir -p "$LOCK_DIR"
+
+# ── Live background-lock scan (shared by the poller guard) ──────────────────────
+# Prints "<lock-key>|<original-cmd>" for the first running lock whose background
+# task is still alive, else nothing. Liveness is the same signal the lock
+# expiry uses: a running lock's task-output file still held by a process (fuser
+# /lsof) means in-flight; once released the task has finished and the lock is
+# treated as stale (skipped). With no task id (foreground) or no fuser/lsof,
+# fall back to a generous age window so a fresh lock still reads as live.
+_first_live_bg_lock() {
+    local lf key phase epoch task_id cmd now age out claude_uid
+    now=$(date +%s)
+    claude_uid=$(id -u 2>/dev/null || echo "$UID")
+    for lf in "$LOCK_DIR"/*.lock; do
+        [[ -f "$lf" ]] || continue
+        epoch=$(sed -n '1p' "$lf" 2>/dev/null || echo 0)
+        phase=$(sed -n '2p' "$lf" 2>/dev/null || echo running)
+        cmd=$(sed -n '3p'  "$lf" 2>/dev/null || echo "(unknown)")
+        task_id=$(sed -n '4p' "$lf" 2>/dev/null || echo "")
+        [[ "$phase" == "running" ]] || continue
+        [[ "$epoch" =~ ^[0-9]+$ ]] || continue
+        age=$(( now - epoch ))
+        key="${lf##*/}"; key="${key%.lock}"
+        if [[ "$task_id" =~ ^[a-z0-9]+$ ]]; then
+            out=$(ls "/tmp/claude-${claude_uid}"/*/*/tasks/"${task_id}".output 2>/dev/null | head -1 || echo "")
+            if [[ -n "$out" ]]; then
+                if command -v fuser >/dev/null 2>&1; then
+                    fuser "$out" >/dev/null 2>&1 || continue   # released → finished → stale
+                elif command -v lsof >/dev/null 2>&1; then
+                    lsof "$out" >/dev/null 2>&1 || continue
+                elif [[ "$age" -ge 600 ]]; then
+                    continue
+                fi
+                printf '%s|%s\n' "$key" "$cmd"
+                return 0
+            fi
+        fi
+        # No task id / output file gone: a recently-created running lock is
+        # probably still live — use the age window.
+        if [[ "$age" -lt 600 ]]; then
+            printf '%s|%s\n' "$key" "$cmd"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── Poller guard ────────────────────────────────────────────────────────────────
+# Deny a busy-wait loop only while a tracked background task is actually live —
+# that is exactly the regression (background a commit/make, then spawn a watcher
+# loop instead of yielding for the completion notification). With nothing in
+# flight the loop is allowed, so legitimate `until cond; do sleep; done` waits
+# are unaffected.
+if [[ "$IS_POLLER" == "true" ]]; then
+    _live=$(_first_live_bg_lock || true)
+    if [[ -n "$_live" ]]; then
+        _lkey="${_live%%|*}"
+        _lcmd="${_live#*|}"
+        jq -n --arg key "$_lkey" --arg prev "$_lcmd" \
+            '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("Busy-wait poller blocked: a background [\($key)] task is still running. Do not poll it with until/while+sleep — yield the turn and the harness will send a task-notification when it completes. Running: \($prev)")}}'
+        exit 0
+    fi
+    # No live background task — allow the loop. (If it also matched a lock key,
+    # the loop form is pathological for that command; we still allow without
+    # taking the key lock, which is harmless.)
+    exit 0
+fi
+
 LOCK_FILE="${LOCK_DIR}/${LOCK_KEY}.lock"
 
 # ── Check for existing lock ────────────────────────────────────────────────────

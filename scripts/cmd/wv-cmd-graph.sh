@@ -1116,6 +1116,7 @@ cmd_tree() {
     local json_output=false
     local mermaid_output=false
     local root_filter=""
+    local node_cap="${WV_TREE_CAP:-50}"
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1124,11 +1125,18 @@ cmd_tree() {
             --json)      json_output=true ;;
             --mermaid)   mermaid_output=true ;;
             --root=*)    root_filter="${1#*=}" ;;
+            --all)       node_cap=0 ;;
             --*)         ;;
             *)           root_filter="$1" ;;
         esac
         shift
     done
+
+    # Output budget (docs/PROPOSAL-wv-output-budget.md D1): cap nodes shown,
+    # shallowest-first, so default output stays ~2k tokens. 0 = unbounded.
+    case "$node_cap" in
+        ''|*[!0-9]*) node_cap=50 ;;
+    esac
 
     db_ensure
 
@@ -1156,7 +1164,7 @@ cmd_tree() {
 
     # Build tree query using the resolved CTE anchor.
     # cte_anchor handles --root (explicit node), --active (heuristic + done filter), and default.
-    local query="
+    local tree_cte="
         WITH RECURSIVE tree AS (
             SELECT n.id, n.text, n.status,
                    json_extract(n.metadata, '\$.type') as node_type,
@@ -1176,39 +1184,66 @@ cmd_tree() {
             JOIN edges e ON e.source = n.id AND e.type = 'implements'
             JOIN tree t ON e.target = t.id
             WHERE t.depth < $max_depth
-        )
-        SELECT id, text, status, node_type, depth, root_id
-        FROM tree
-        ORDER BY root_id, depth, id;
+        )"
+    local tree_cte_alias="
+        WITH RECURSIVE tree AS (
+            SELECT n.id, n.text, n.status, n.alias,
+                   json_extract(n.metadata, '\$.type') as node_type,
+                   0 as depth,
+                   n.id as root_id
+            FROM nodes n
+            $cte_anchor
+
+            UNION ALL
+
+            SELECT n.id, n.text, n.status, n.alias,
+                   json_extract(n.metadata, '\$.type') as node_type,
+                   t.depth + 1,
+                   t.root_id
+            FROM nodes n
+            JOIN edges e ON e.source = n.id AND e.type = 'implements'
+            JOIN tree t ON e.target = t.id
+            WHERE t.depth < $max_depth
+        )"
+
+    # Capped subset keeps the shallowest nodes; hidden_children marks where
+    # subtrees were cut so the reader knows which roots to expand.
+    local cap_with=""
+    local cap_src="tree"
+    local hidden_expr="0"
+    local total_nodes=0
+    if [ "$node_cap" -gt 0 ]; then
+        cap_with=", capped AS (SELECT * FROM tree ORDER BY depth, root_id, id LIMIT $node_cap)"
+        cap_src="capped"
+        hidden_expr="(SELECT COUNT(*) FROM tree t2
+                JOIN edges e2 ON e2.source = t2.id AND e2.type = 'implements'
+                WHERE e2.target = c.id AND t2.id NOT IN (SELECT id FROM capped))"
+        total_nodes=$(db_query "$tree_cte SELECT COUNT(*) FROM tree;" 2>/dev/null)
+        if [ -z "$total_nodes" ]; then
+            total_nodes=0
+        fi
+    fi
+
+    local query="
+        ${tree_cte}${cap_with}
+        SELECT c.id, c.text, c.status, c.node_type, c.depth, c.root_id,
+               $hidden_expr as hidden_children
+        FROM $cap_src c
+        ORDER BY c.root_id, c.depth, c.id;
     "
 
     if [ "$json_output" = "true" ]; then
         local results
         results=$(db_query_json "
-            WITH RECURSIVE tree AS (
-                SELECT n.id, n.text, n.status, n.alias,
-                       json_extract(n.metadata, '\$.type') as node_type,
-                       0 as depth,
-                       n.id as root_id
-                FROM nodes n
-                $cte_anchor
-
-                UNION ALL
-
-                SELECT n.id, n.text, n.status, n.alias,
-                       json_extract(n.metadata, '\$.type') as node_type,
-                       t.depth + 1,
-                       t.root_id
-                FROM nodes n
-                JOIN edges e ON e.source = n.id AND e.type = 'implements'
-                JOIN tree t ON e.target = t.id
-                WHERE t.depth < $max_depth
-            )
+            ${tree_cte_alias}${cap_with}
             SELECT id, text, status, alias, node_type, depth, root_id
-            FROM tree
+            FROM $cap_src
             ORDER BY root_id, depth, id;
         ")
         [ -z "$results" ] && echo "[]" || echo "$results"
+        if [ "$node_cap" -gt 0 ] && [ "$total_nodes" -gt "$node_cap" ]; then
+            echo "wv tree: showing $node_cap of $total_nodes nodes (use --all to lift the cap)" >&2
+        fi
         return
     fi
 
@@ -1217,27 +1252,9 @@ cmd_tree() {
     if [ "$mermaid_output" = "true" ]; then
 
         local mermaid_query="
-            WITH RECURSIVE tree AS (
-                SELECT n.id, n.text, n.status, n.alias,
-                       json_extract(n.metadata, '\$.type') as node_type,
-                       0 as depth,
-                       n.id as root_id
-                FROM nodes n
-                $cte_anchor
-
-                UNION ALL
-
-                SELECT n.id, n.text, n.status, n.alias,
-                       json_extract(n.metadata, '\$.type') as node_type,
-                       t.depth + 1,
-                       t.root_id
-                FROM nodes n
-                JOIN edges e ON e.source = n.id AND e.type = 'implements'
-                JOIN tree t ON e.target = t.id
-                WHERE t.depth < $max_depth
-            )
+            ${tree_cte_alias}${cap_with}
             SELECT id, text, status, alias, node_type, depth, root_id
-            FROM tree
+            FROM $cap_src
             ORDER BY root_id, depth, id;
         "
 
@@ -1310,6 +1327,11 @@ cmd_tree() {
             done
         fi
 
+        if [ "$node_cap" -gt 0 ] && [ "$total_nodes" -gt "$node_cap" ]; then
+            echo ""
+            echo "    %% showing $node_cap of $total_nodes nodes (use --all to lift the cap)"
+        fi
+
         return
     fi
 
@@ -1317,7 +1339,7 @@ cmd_tree() {
     # Use ASCII unit separator (0x1F) instead of pipe — node text can contain '|'
     local prev_root=""
     db_ensure
-    sqlite3 -batch -cmd ".timeout 5000" -separator $'\x1f' "$WV_DB" "$query" | while IFS=$'\x1f' read -r id text status node_type depth root_id; do
+    sqlite3 -batch -cmd ".timeout 5000" -separator $'\x1f' "$WV_DB" "$query" | while IFS=$'\x1f' read -r id text status node_type depth root_id hidden_children; do
         # Look up target_version from metadata for epic nodes
         local target_version=""
         if [ "$node_type" = "epic" ] || [ "$depth" = "0" ]; then
@@ -1356,15 +1378,27 @@ cmd_tree() {
         prev_root="$root_id"
 
         echo -e "${indent}${indicator} ${type_label}: ${text} ${CYAN}(${id})${NC} [${status}]${version_suffix}"
+        if [ "${hidden_children:-0}" -gt 0 ]; then
+            echo -e "${indent}  ${YELLOW}+${hidden_children} more not shown (wv tree ${id})${NC}"
+        fi
     done
+
+    if [ "$node_cap" -gt 0 ] && [ "$total_nodes" -gt "$node_cap" ]; then
+        echo ""
+        echo -e "${YELLOW}Showing $node_cap of $total_nodes nodes — use --all for the full tree, or wv tree <id> for a subtree${NC}"
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
 # _impact_suites_for_files — map changed file paths to affected test suites
 #
 # Loads .weave/test-map.conf (ini-style: source_file = suite [suite ...]).
-# Falls back to naming-convention heuristic when conf is absent or file
-# has no explicit mapping:
+# Keys may be exact paths, glob patterns (src/**/*.py = suite), or directory
+# prefixes ending in / (src/ = suite). A `* = suite` entry, or bare suite
+# tokens under a `[default]` section, set a fail-safe default. Per-file
+# precedence: exact > glob/prefix > naming heuristic > [default].
+# Falls back to naming-convention heuristic when conf is absent or a file
+# has no explicit/glob mapping:
 #   scripts/cmd/wv-cmd-<X>.sh  →  tests/test-<X>.sh
 #   scripts/lib/*.sh or scripts/wv  →  tests/run-all.sh
 # Reads .weave/test-times.json for estimated suite cost.
@@ -1380,40 +1414,84 @@ _impact_suites_for_files() {
     local times_data='{}'
     [ -f "$times_json" ] && times_data=$(cat "$times_json" 2>/dev/null || echo '{}')
 
-    # Parse conf into associative array (file → "suite1 suite2 ...")
+    # Parse conf. Exact keys go in _fmap; pattern keys (containing glob
+    # metacharacters * ? [ , or ending in / for a directory prefix) are kept
+    # in insertion order in _pat_keys/_pat_vals so a consumer can map a whole
+    # subtree with one line (src/**/*.py = suite, or src/ = suite). A `* = suite`
+    # entry, or any suite tokens under a `[default]` section, become the
+    # fail-safe default applied when nothing else matches a file.
     declare -A _fmap=()
+    local _pat_keys=() _pat_vals=()
+    local _default_suites=""
     if [ -f "$map_conf" ]; then
+        local _in_default=false
         while IFS= read -r line; do
-            # Strip leading whitespace; skip section headers and comments
+            # Strip leading whitespace; comments and blanks are noise
             line="${line#"${line%%[![:space:]]*}"}"
-            [[ "$line" =~ ^\[ || "$line" =~ ^# || -z "$line" ]] && continue
+            [[ "$line" =~ ^# || -z "$line" ]] && continue
+            # Section headers toggle the [default] accumulator
+            if [[ "$line" =~ ^\[ ]]; then
+                if [[ "$line" =~ ^\[default\] ]]; then _in_default=true; else _in_default=false; fi
+                continue
+            fi
+            if [[ "$line" != *=* ]]; then
+                # Bare suite tokens under [default]: treat as default suites
+                [ "$_in_default" = true ] && _default_suites="${_default_suites:+$_default_suites }$line"
+                continue
+            fi
             local key="${line%%=*}"
             local val="${line#*=}"
             key="${key%"${key##*[![:space:]]}"}"  # rtrim key
+            key="${key#"${key%%[![:space:]]*}"}"  # ltrim key
             val="${val#"${val%%[![:space:]]*}"}"  # ltrim val
-            _fmap["$key"]="$val"
+            if [ "$key" = "*" ]; then
+                _default_suites="${_default_suites:+$_default_suites }$val"
+            elif [[ "$key" == *[\*\?\[]* || "$key" == */ ]]; then
+                _pat_keys+=("$key"); _pat_vals+=("$val")
+            else
+                _fmap["$key"]="$val"
+            fi
         done < "$map_conf"
     fi
 
-    # Collect matched suites (deduped)
+    # Collect matched suites (deduped). Precedence per file:
+    #   exact > glob/prefix > naming heuristic > [default] (fail safe).
     declare -A _seen=()
     for f in "$@"; do
         local suites=""
         if [ -n "${_fmap[$f]+x}" ]; then
             suites="${_fmap[$f]}"
         else
-            # Naming-convention heuristic
-            case "$f" in
-                scripts/cmd/wv-cmd-*.sh)
-                    local base; base=$(basename "$f" .sh)
-                    suites="tests/test-${base#wv-cmd-}.sh" ;;
-                scripts/lib/*.sh | scripts/wv)
-                    suites="tests/test-hooks.sh tests/test-graph.sh" ;;
-                scripts/hooks/*)
-                    suites="tests/test-hooks.sh" ;;
-                tests/test-*.sh)
-                    suites="$f" ;;
-            esac
+            # Glob/prefix keys — union all matching patterns
+            local _i
+            for _i in "${!_pat_keys[@]}"; do
+                local _pk="${_pat_keys[$_i]}"
+                if [[ "$_pk" == */ ]]; then
+                    [[ "$f" == "$_pk"* ]] && suites="${suites:+$suites }${_pat_vals[$_i]}"
+                else
+                    # unquoted RHS is intentional: glob-match the conf key
+                    # shellcheck disable=SC2053
+                    if [[ "$f" == $_pk ]]; then
+                        suites="${suites:+$suites }${_pat_vals[$_i]}"
+                    fi
+                fi
+            done
+            if [ -z "$suites" ]; then
+                # Naming-convention heuristic (Weave's own layout)
+                case "$f" in
+                    scripts/cmd/wv-cmd-*.sh)
+                        local base; base=$(basename "$f" .sh)
+                        suites="tests/test-${base#wv-cmd-}.sh" ;;
+                    scripts/lib/*.sh | scripts/wv)
+                        suites="tests/test-hooks.sh tests/test-graph.sh" ;;
+                    scripts/hooks/*)
+                        suites="tests/test-hooks.sh" ;;
+                    tests/test-*.sh)
+                        suites="$f" ;;
+                esac
+            fi
+            # Fail safe: a configured [default] suite beats running nothing
+            [ -z "$suites" ] && suites="$_default_suites"
         fi
         local s
         for s in $suites; do

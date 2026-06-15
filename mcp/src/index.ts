@@ -992,7 +992,7 @@ const TOOLS: Tool[] = [
   {
     name: "weave_tree",
     description:
-      "View epic hierarchy as a tree. Returns readable text tree by default. Use mermaid=true for a Mermaid dependency graph, or json=true for raw JSON.",
+      "View epic hierarchy as a tree. Output is capped at 50 nodes (shallowest first) with a truncation summary and '+N more' subtree markers — use root=<id> to expand a marked subtree, or all=true to lift the cap (full dump can be very large). Returns readable text tree by default. Use mermaid=true for a Mermaid dependency graph, or json=true for raw JSON.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1015,6 +1015,10 @@ const TOOLS: Tool[] = [
         root: {
           type: "string",
           description: "Filter to subtree rooted at this node ID or alias",
+        },
+        all: {
+          type: "boolean",
+          description: "Lift the 50-node output cap and return the full tree (default: false)",
         },
       },
       required: [],
@@ -1584,912 +1588,910 @@ type ToolHandler = (args: Record<string, unknown>) => string | ToolResponse;
 const TOOL_HANDLERS: Record<string, ToolHandler> = {
   weave_search: (args) => {
     let result: string;
-      const query = args.query as string;
-      const limit = args.limit as number | undefined;
-      const status = normalizeStatus(args.status as string | undefined);
-      const nodeType = args.type as string | undefined;
-      const cmd = ["search", query, "--json"];
-      if (limit) cmd.push(`--limit=${limit}`);
-      if (status) cmd.push(`--status=${status}`);
-      if (nodeType) cmd.push(`--type=${nodeType}`);
-      result = wv(cmd);
+    const query = args.query as string;
+    const limit = args.limit as number | undefined;
+    const status = normalizeStatus(args.status as string | undefined);
+    const nodeType = args.type as string | undefined;
+    const cmd = ["search", query, "--json"];
+    if (limit) cmd.push(`--limit=${limit}`);
+    if (status) cmd.push(`--status=${status}`);
+    if (nodeType) cmd.push(`--type=${nodeType}`);
+    result = wv(cmd);
     return result;
   },
 
   weave_add: (args) => {
     let result: string;
-      const text = args.text as string;
-      const status = normalizeStatus(args.status as string | undefined);
-      const metadata = args.metadata as Record<string, unknown> | undefined;
-      const gh = args.gh as boolean | undefined;
-      const alias = args.alias as string | undefined;
-      const parent = args.parent as string | undefined;
-      const force = args.force as boolean | undefined;
-      const standalone = args.standalone as boolean | undefined;
-      const criteria = args.criteria as string | undefined;
-      const risks = args.risks as string | undefined;
-      const cmd = ["add", text];
-      if (status) cmd.push(`--status=${status}`);
-      if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
-      if (gh) cmd.push("--gh");
-      if (alias) cmd.push(`--alias=${alias}`);
-      if (parent) cmd.push(`--parent=${parent}`);
-      if (standalone) cmd.push("--standalone");
-      else if (force) cmd.push("--force");
-      if (criteria) cmd.push(`--criteria=${criteria}`);
-      if (risks) cmd.push(`--risks=${risks}`);
-      result = wv(cmd);
-      // Enforcement warnings — suppress --gh nudge for child nodes (only epic needs a GH issue)
-      const warnings: string[] = [];
-      if (!gh && !parent)
-        warnings.push("WARNING: No --gh flag. Node has no GitHub issue. Use gh=true for traceability.");
-      if (!alias) warnings.push("WARNING: No alias set. Use alias parameter for readable node names.");
-      if (warnings.length) result += "\n\n" + warnings.join("\n");
+    const text = args.text as string;
+    const status = normalizeStatus(args.status as string | undefined);
+    const metadata = args.metadata as Record<string, unknown> | undefined;
+    const gh = args.gh as boolean | undefined;
+    const alias = args.alias as string | undefined;
+    const parent = args.parent as string | undefined;
+    const force = args.force as boolean | undefined;
+    const standalone = args.standalone as boolean | undefined;
+    const criteria = args.criteria as string | undefined;
+    const risks = args.risks as string | undefined;
+    const cmd = ["add", text];
+    if (status) cmd.push(`--status=${status}`);
+    if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
+    if (gh) cmd.push("--gh");
+    if (alias) cmd.push(`--alias=${alias}`);
+    if (parent) cmd.push(`--parent=${parent}`);
+    if (standalone) cmd.push("--standalone");
+    else if (force) cmd.push("--force");
+    if (criteria) cmd.push(`--criteria=${criteria}`);
+    if (risks) cmd.push(`--risks=${risks}`);
+    result = wv(cmd);
+    // Enforcement warnings — suppress --gh nudge for child nodes (only epic needs a GH issue)
+    const warnings: string[] = [];
+    if (!gh && !parent) warnings.push("WARNING: No --gh flag. Node has no GitHub issue. Use gh=true for traceability.");
+    if (!alias) warnings.push("WARNING: No alias set. Use alias parameter for readable node names.");
+    if (warnings.length) result += "\n\n" + warnings.join("\n");
     return result;
   },
 
   weave_done: (args) => {
     let result: string;
-      const id = args.id as string;
-      let learning = args.learning as string | undefined;
-      const decision = args.decision as string | undefined;
-      const pattern = args.pattern as string | undefined;
-      const pitfall = args.pitfall as string | undefined;
-      const noWarn = args.no_warn as boolean | undefined;
-      const noOverlapCheck = args.no_overlap_check as boolean | undefined;
+    const id = args.id as string;
+    let learning = args.learning as string | undefined;
+    const decision = args.decision as string | undefined;
+    const pattern = args.pattern as string | undefined;
+    const pitfall = args.pitfall as string | undefined;
+    const noWarn = args.no_warn as boolean | undefined;
+    const noOverlapCheck = args.no_overlap_check as boolean | undefined;
 
-      // Compose pipe-delimited learning string from typed params
-      // Merge: typed params compose structured prefix; raw learning appended as context
-      if (decision || pattern || pitfall) {
-        const parts: string[] = [];
-        if (decision) parts.push(`decision: ${decision}`);
-        if (pattern) parts.push(`pattern: ${pattern}`);
-        if (pitfall) parts.push(`pitfall: ${pitfall}`);
-        const structured = parts.join(" | ");
-        learning = learning ? `${structured} | ${learning}` : structured;
-      }
+    // Compose pipe-delimited learning string from typed params
+    // Merge: typed params compose structured prefix; raw learning appended as context
+    if (decision || pattern || pitfall) {
+      const parts: string[] = [];
+      if (decision) parts.push(`decision: ${decision}`);
+      if (pattern) parts.push(`pattern: ${pattern}`);
+      if (pitfall) parts.push(`pitfall: ${pitfall}`);
+      const structured = parts.join(" | ");
+      learning = learning ? `${structured} | ${learning}` : structured;
+    }
 
-      const verificationMethod = args.verification_method as string | undefined;
-      const verificationEvidence = args.verification_evidence as string | undefined;
-      const cmd = ["done", id];
-      if (learning) cmd.push(`--learning=${learning}`);
-      if (verificationMethod) cmd.push(`--verification-method=${verificationMethod}`);
-      if (verificationEvidence) cmd.push(`--verification-evidence=${verificationEvidence}`);
-      if (noWarn) cmd.push("--no-warn");
-      if (noOverlapCheck) cmd.push("--no-overlap-check");
-      if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
-      result = wv(cmd);
-      if (!learning && !decision && !pattern && !pitfall)
-        result +=
-          "\n\nWARNING: No learning captured. Consider: what decision, pattern, or pitfall should future sessions know?";
+    const verificationMethod = args.verification_method as string | undefined;
+    const verificationEvidence = args.verification_evidence as string | undefined;
+    const cmd = ["done", id];
+    if (learning) cmd.push(`--learning=${learning}`);
+    if (verificationMethod) cmd.push(`--verification-method=${verificationMethod}`);
+    if (verificationEvidence) cmd.push(`--verification-evidence=${verificationEvidence}`);
+    if (noWarn) cmd.push("--no-warn");
+    if (noOverlapCheck) cmd.push("--no-overlap-check");
+    if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
+    result = wv(cmd, WV_LIFECYCLE_TIMEOUT);
+    if (!learning && !decision && !pattern && !pitfall)
+      result +=
+        "\n\nWARNING: No learning captured. Consider: what decision, pattern, or pitfall should future sessions know?";
     return result;
   },
 
   weave_batch_done: (args) => {
     let result: string;
-      const ids = args.ids as string[];
-      let learning = args.learning as string | undefined;
-      const decision = args.decision as string | undefined;
-      const pattern = args.pattern as string | undefined;
-      const pitfall = args.pitfall as string | undefined;
-      const noWarn = args.no_warn as boolean | undefined;
+    const ids = args.ids as string[];
+    let learning = args.learning as string | undefined;
+    const decision = args.decision as string | undefined;
+    const pattern = args.pattern as string | undefined;
+    const pitfall = args.pitfall as string | undefined;
+    const noWarn = args.no_warn as boolean | undefined;
 
-      if (decision || pattern || pitfall) {
-        const parts: string[] = [];
-        if (decision) parts.push(`decision: ${decision}`);
-        if (pattern) parts.push(`pattern: ${pattern}`);
-        if (pitfall) parts.push(`pitfall: ${pitfall}`);
-        const structured = parts.join(" | ");
-        learning = learning ? `${structured} | ${learning}` : structured;
-      }
+    if (decision || pattern || pitfall) {
+      const parts: string[] = [];
+      if (decision) parts.push(`decision: ${decision}`);
+      if (pattern) parts.push(`pattern: ${pattern}`);
+      if (pitfall) parts.push(`pitfall: ${pitfall}`);
+      const structured = parts.join(" | ");
+      learning = learning ? `${structured} | ${learning}` : structured;
+    }
 
-      const cmd = ["batch-done", ...ids];
-      if (learning) cmd.push(`--learning=${learning}`);
-      if (noWarn) cmd.push("--no-warn");
-      if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
-      result = wv(cmd);
+    const cmd = ["batch-done", ...ids];
+    if (learning) cmd.push(`--learning=${learning}`);
+    if (noWarn) cmd.push("--no-warn");
+    if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
+    result = wv(cmd);
     return result;
   },
 
   weave_context: (args) => {
     let result: string;
-      const id = args.id as string | undefined;
-      const mode = args.mode as ReadMode | undefined;
-      const cmd = id ? ["context", id, "--json"] : ["context", "--json"];
-      result = wvRead(cmd, WV_TIMEOUT, mode);
+    const id = args.id as string | undefined;
+    const mode = args.mode as ReadMode | undefined;
+    const cmd = id ? ["context", id, "--json"] : ["context", "--json"];
+    result = wvRead(cmd, WV_TIMEOUT, mode);
     return result;
   },
 
   weave_list: (args) => {
     let result: string;
-      const status = normalizeStatus(args.status as string | undefined);
-      const all = args.all as boolean | undefined;
-      const mode = args.mode as ReadMode | undefined;
-      const cmd = ["list", "--json-v2"];
-      if (status) cmd.push(`--status=${status}`);
-      if (all) cmd.push("--all");
-      result = wvRead(cmd, WV_TIMEOUT, mode);
+    const status = normalizeStatus(args.status as string | undefined);
+    const all = args.all as boolean | undefined;
+    const mode = args.mode as ReadMode | undefined;
+    const cmd = ["list", "--json-v2"];
+    if (status) cmd.push(`--status=${status}`);
+    if (all) cmd.push("--all");
+    result = wvRead(cmd, WV_TIMEOUT, mode);
     return result;
   },
 
   weave_link: (args) => {
     let result: string;
-      const from = args.from_id as string;
-      const to = args.to_id as string;
-      const type = args.type as string;
-      const weight = args.weight as number | undefined;
-      const context = args.context as string | undefined;
-      const cmd = ["link", from, to, `--type=${type}`];
-      if (weight !== undefined) cmd.push(`--weight=${weight}`);
-      if (context) cmd.push(`--context=${context}`);
-      result = wv(cmd);
+    const from = args.from_id as string;
+    const to = args.to_id as string;
+    const type = args.type as string;
+    const weight = args.weight as number | undefined;
+    const context = args.context as string | undefined;
+    const cmd = ["link", from, to, `--type=${type}`];
+    if (weight !== undefined) cmd.push(`--weight=${weight}`);
+    if (context) cmd.push(`--context=${context}`);
+    result = wv(cmd);
     return result;
   },
 
   weave_unlink: (args) => {
     let result: string;
-      const from = args.from_id as string;
-      const to = args.to_id as string;
-      const type = args.type as string;
-      result = wv(["unlink", from, to, `--type=${type}`]);
+    const from = args.from_id as string;
+    const to = args.to_id as string;
+    const type = args.type as string;
+    result = wv(["unlink", from, to, `--type=${type}`]);
     return result;
   },
 
   weave_block: (args) => {
     let result: string;
-      const from = args.from_id as string;
-      const to = args.to_id as string;
-      const context = args.context as string | undefined;
-      const cmd = ["block", from, to];
-      if (context) cmd.push(`--context=${context}`);
-      result = wv(cmd);
+    const from = args.from_id as string;
+    const to = args.to_id as string;
+    const context = args.context as string | undefined;
+    const cmd = ["block", from, to];
+    if (context) cmd.push(`--context=${context}`);
+    result = wv(cmd);
     return result;
   },
 
   weave_unarchive: (args) => {
     let result: string;
-      const id = args.id as string;
-      const dryRun = args.dry_run as boolean | undefined;
-      const withEdges = args.with_edges as boolean | undefined;
-      const cmd = ["unarchive", id];
-      if (dryRun) cmd.push("--dry-run");
-      if (withEdges) cmd.push("--with-edges");
-      result = wv(cmd);
+    const id = args.id as string;
+    const dryRun = args.dry_run as boolean | undefined;
+    const withEdges = args.with_edges as boolean | undefined;
+    const cmd = ["unarchive", id];
+    if (dryRun) cmd.push("--dry-run");
+    if (withEdges) cmd.push("--with-edges");
+    result = wv(cmd);
     return result;
   },
 
   weave_status: (args) => {
     let result: string;
-      const mode = args.mode as ReadMode | undefined;
-      result = wvRead(["status"], WV_TIMEOUT, mode);
+    const mode = args.mode as ReadMode | undefined;
+    result = wvRead(["status"], WV_TIMEOUT, mode);
     return result;
   },
 
   weave_ready: (args) => {
     let result: string;
-      const subtree = args.subtree as string | undefined;
-      const all = args.all as boolean | undefined;
-      const count = args.count as boolean | undefined;
-      const mode = args.mode as ReadMode | undefined;
-      const withImpact = args.with_impact as boolean | undefined;
-      const cmd = ["ready", "--json"];
-      if (subtree) cmd.push(`--subtree=${subtree}`);
-      if (all) cmd.push("--all");
-      if (count) cmd.push("--count");
-      if (withImpact) cmd.push("--with-impact");
-      result = wvRead(cmd, WV_TIMEOUT, mode);
+    const subtree = args.subtree as string | undefined;
+    const all = args.all as boolean | undefined;
+    const count = args.count as boolean | undefined;
+    const mode = args.mode as ReadMode | undefined;
+    const withImpact = args.with_impact as boolean | undefined;
+    const cmd = ["ready", "--json"];
+    if (subtree) cmd.push(`--subtree=${subtree}`);
+    if (all) cmd.push("--all");
+    if (count) cmd.push("--count");
+    if (withImpact) cmd.push("--with-impact");
+    result = wvRead(cmd, WV_TIMEOUT, mode);
     return result;
   },
 
   weave_impact: (args) => {
     let result: string;
-      const ids = (args.ids as string[] | undefined) ?? [];
-      const files = args.files as string | undefined;
-      if (ids.length === 0 && !files) {
-        throw new Error("weave_impact requires seed ids in 'ids' or paths in 'files'");
-      }
-      const depth = args.depth as number | undefined;
-      const direction = args.direction as string | undefined;
-      const full = args.full as boolean | undefined;
-      const includeDone = args.include_done as boolean | undefined;
-      const all = args.all as boolean | undefined;
-      const quality = args.quality as boolean | undefined;
+    const ids = (args.ids as string[] | undefined) ?? [];
+    const files = args.files as string | undefined;
+    if (ids.length === 0 && !files) {
+      throw new Error("weave_impact requires seed ids in 'ids' or paths in 'files'");
+    }
+    const depth = args.depth as number | undefined;
+    const direction = args.direction as string | undefined;
+    const full = args.full as boolean | undefined;
+    const includeDone = args.include_done as boolean | undefined;
+    const all = args.all as boolean | undefined;
+    const quality = args.quality as boolean | undefined;
 
-      const cmd = ["impact", ...ids, "--json"];
-      if (files) cmd.push(`--files=${files}`);
-      if (depth !== undefined) cmd.push(`--depth=${depth}`);
-      if (direction) cmd.push(`--direction=${direction}`);
-      if (full) cmd.push("--full");
-      if (includeDone) cmd.push("--include-done");
-      if (all) cmd.push("--all");
-      if (quality) cmd.push("--quality");
-      result = wv(cmd);
+    const cmd = ["impact", ...ids, "--json"];
+    if (files) cmd.push(`--files=${files}`);
+    if (depth !== undefined) cmd.push(`--depth=${depth}`);
+    if (direction) cmd.push(`--direction=${direction}`);
+    if (full) cmd.push("--full");
+    if (includeDone) cmd.push("--include-done");
+    if (all) cmd.push("--all");
+    if (quality) cmd.push("--quality");
+    result = wv(cmd);
     return result;
   },
 
   weave_query: (args) => {
     let result: string;
-      const predicates = (args.predicates as string[] | undefined) ?? [];
-      const format = (args.format as string | undefined) ?? "json";
-      const order = args.order as string | undefined;
-      const limit = args.limit as number | undefined;
-      const include = args.include as string | undefined;
-      const cmd = ["query", `--format=${format}`];
-      if (order) cmd.push(`--order=${order}`);
-      if (limit !== undefined) cmd.push(`--limit=${limit}`);
-      if (include) cmd.push(`--include=${include}`);
-      for (const p of predicates) {
-        if (p.startsWith("HAS ") || p.startsWith("MATCH ")) {
-          const [kw, ...rest] = p.split(" ");
-          cmd.push(kw, rest.join(" "));
-        } else {
-          cmd.push(p);
-        }
+    const predicates = (args.predicates as string[] | undefined) ?? [];
+    const format = (args.format as string | undefined) ?? "json";
+    const order = args.order as string | undefined;
+    const limit = args.limit as number | undefined;
+    const include = args.include as string | undefined;
+    const cmd = ["query", `--format=${format}`];
+    if (order) cmd.push(`--order=${order}`);
+    if (limit !== undefined) cmd.push(`--limit=${limit}`);
+    if (include) cmd.push(`--include=${include}`);
+    for (const p of predicates) {
+      if (p.startsWith("HAS ") || p.startsWith("MATCH ")) {
+        const [kw, ...rest] = p.split(" ");
+        cmd.push(kw, rest.join(" "));
+      } else {
+        cmd.push(p);
       }
-      // wv query is the only read command without --mode support — wvRead's
-      // appended --mode=discover makes it error (codex finding, v1.59.0).
-      result = wv(cmd, WV_TIMEOUT);
+    }
+    // wv query is the only read command without --mode support — wvRead's
+    // appended --mode=discover makes it error (codex finding, v1.59.0).
+    result = wv(cmd, WV_TIMEOUT);
     return result;
   },
 
   weave_health: (args) => {
     let result: string;
-      const verbose = args.verbose as boolean | undefined;
-      const fix = args.fix as boolean | undefined;
-      const history = args.history as number | undefined;
-      if (!verbose && !fix && history === undefined) {
-        return wvHealthJson();
-      }
-      const cmd = ["health", "--json"];
-      if (verbose) cmd.push("--verbose");
-      if (fix) cmd.push("--fix");
-      if (history !== undefined) cmd.push(`--history=${history}`);
-      result = wv(cmd);
+    const verbose = args.verbose as boolean | undefined;
+    const fix = args.fix as boolean | undefined;
+    const history = args.history as number | undefined;
+    if (!verbose && !fix && history === undefined) {
+      return wvHealthJson();
+    }
+    const cmd = ["health", "--json"];
+    if (verbose) cmd.push("--verbose");
+    if (fix) cmd.push("--fix");
+    if (history !== undefined) cmd.push(`--history=${history}`);
+    result = wv(cmd);
     return result;
   },
 
   weave_quick: (args) => {
     let result: string;
-      const text = args.text as string;
-      const learning = args.learning as string | undefined;
-      const cmd = ["quick", text];
-      if (learning) cmd.push(`--learning=${learning}`);
-      result = wv(cmd);
+    const text = args.text as string;
+    const learning = args.learning as string | undefined;
+    const cmd = ["quick", text];
+    if (learning) cmd.push(`--learning=${learning}`);
+    result = wv(cmd);
     return result;
   },
 
   weave_work: (args) => {
     let result: string;
-      const id = args.id as string;
-      const reopen = args.reopen as boolean | undefined;
-      const cmd = ["work", id];
-      if (reopen) cmd.push("--reopen");
-      result = wv(cmd);
+    const id = args.id as string;
+    const reopen = args.reopen as boolean | undefined;
+    const cmd = ["work", id];
+    if (reopen) cmd.push("--reopen");
+    result = wv(cmd);
     return result;
   },
 
   weave_ship: (args) => {
     let result: string;
-      const id = args.id as string;
-      let learning = args.learning as string | undefined;
-      const decision = args.decision as string | undefined;
-      const pattern = args.pattern as string | undefined;
-      const pitfall = args.pitfall as string | undefined;
-      const gh = args.gh as boolean | undefined;
-      const noOverlapCheck = args.no_overlap_check as boolean | undefined;
+    const id = args.id as string;
+    let learning = args.learning as string | undefined;
+    const decision = args.decision as string | undefined;
+    const pattern = args.pattern as string | undefined;
+    const pitfall = args.pitfall as string | undefined;
+    const gh = args.gh as boolean | undefined;
+    const noOverlapCheck = args.no_overlap_check as boolean | undefined;
 
-      // Compose pipe-delimited learning string from typed params
-      // Merge: typed params compose structured prefix; raw learning appended as context
-      if (decision || pattern || pitfall) {
-        const parts: string[] = [];
-        if (decision) parts.push(`decision: ${decision}`);
-        if (pattern) parts.push(`pattern: ${pattern}`);
-        if (pitfall) parts.push(`pitfall: ${pitfall}`);
-        const structured = parts.join(" | ");
-        learning = learning ? `${structured} | ${learning}` : structured;
-      }
+    // Compose pipe-delimited learning string from typed params
+    // Merge: typed params compose structured prefix; raw learning appended as context
+    if (decision || pattern || pitfall) {
+      const parts: string[] = [];
+      if (decision) parts.push(`decision: ${decision}`);
+      if (pattern) parts.push(`pattern: ${pattern}`);
+      if (pitfall) parts.push(`pitfall: ${pitfall}`);
+      const structured = parts.join(" | ");
+      learning = learning ? `${structured} | ${learning}` : structured;
+    }
 
-      const verificationMethod = args.verification_method as string | undefined;
-      const verificationEvidence = args.verification_evidence as string | undefined;
-      const cmd = ["ship-agent", id, "--json"];
-      if (learning) cmd.push(`--learning=${learning}`);
-      if (verificationMethod) cmd.push(`--verification-method=${verificationMethod}`);
-      if (verificationEvidence) cmd.push(`--verification-evidence=${verificationEvidence}`);
-      const networkFallback =
-        gh && !MCP_ALLOW_NETWORK ? mcpNetworkFallback(`wv sync --gh --mode=fast --node=${id}`) : "";
-      if (gh && MCP_ALLOW_NETWORK) cmd.push("--gh");
-      if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
-      if (noOverlapCheck) cmd.push("--no-overlap-check");
-      result = wv(cmd, WV_LIFECYCLE_TIMEOUT);
-      if (networkFallback) result += `\n\n${networkFallback}`;
+    const verificationMethod = args.verification_method as string | undefined;
+    const verificationEvidence = args.verification_evidence as string | undefined;
+    const cmd = ["ship-agent", id, "--json"];
+    if (learning) cmd.push(`--learning=${learning}`);
+    if (verificationMethod) cmd.push(`--verification-method=${verificationMethod}`);
+    if (verificationEvidence) cmd.push(`--verification-evidence=${verificationEvidence}`);
+    const networkFallback = gh && !MCP_ALLOW_NETWORK ? mcpNetworkFallback(`wv sync --gh --mode=fast --node=${id}`) : "";
+    if (gh && MCP_ALLOW_NETWORK) cmd.push("--gh");
+    if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
+    if (noOverlapCheck) cmd.push("--no-overlap-check");
+    result = wv(cmd, WV_LIFECYCLE_TIMEOUT);
+    if (networkFallback) result += `\n\n${networkFallback}`;
     return result;
   },
 
   weave_recover: (args) => {
     let result: string;
-      const cmd = ["recover"];
-      if ((args as Record<string, unknown>).json) cmd.push("--json");
-      if ((args as Record<string, unknown>).auto) cmd.push("--auto");
-      if ((args as Record<string, unknown>).session) cmd.push("--session");
-      result = wv(cmd);
+    const cmd = ["recover"];
+    if ((args as Record<string, unknown>).json) cmd.push("--json");
+    if ((args as Record<string, unknown>).auto) cmd.push("--auto");
+    if ((args as Record<string, unknown>).session) cmd.push("--session");
+    result = wv(cmd);
     return result;
   },
 
   weave_overview: (args) => {
     let result: string;
-      const mode = args.mode as ReadMode | undefined;
-      const parts: string[] = [];
+    const mode = args.mode as ReadMode | undefined;
+    const parts: string[] = [];
+    try {
+      parts.push("=== Status ===\n" + wvRead(["status"], WV_TIMEOUT, mode));
+    } catch {
+      /* skip */
+    }
+    try {
+      parts.push("\n=== Digest ===\n" + wv(["digest"]));
+    } catch {
+      /* skip */
+    }
+    try {
+      parts.push("\n=== Trails ===\n" + wv(["trails", "show"]));
+    } catch {
+      /* skip */
+    }
+    try {
+      parts.push("\n=== Ready Work ===\n" + wvRead(["ready"], WV_TIMEOUT, mode));
+    } catch {
+      /* skip */
+    }
+    // Context load policy (replaces session-start hook injection)
+    // Try dev layout first (__dirname/../../scripts/), then installed (~/.config/weave/)
+    try {
+      const devPath = `${__dirname}/../../scripts/context-guard.sh`;
+      const installedPath = `${process.env.HOME}/.config/weave/context-guard.sh`;
+      let scriptPath: string | undefined;
       try {
-        parts.push("=== Status ===\n" + wvRead(["status"], WV_TIMEOUT, mode));
+        accessSync(devPath, constants.X_OK);
+        scriptPath = devPath;
       } catch {
-        /* skip */
+        /* not dev */
       }
-      try {
-        parts.push("\n=== Digest ===\n" + wv(["digest"]));
-      } catch {
-        /* skip */
-      }
-      try {
-        parts.push("\n=== Trails ===\n" + wv(["trails", "show"]));
-      } catch {
-        /* skip */
-      }
-      try {
-        parts.push("\n=== Ready Work ===\n" + wvRead(["ready"], WV_TIMEOUT, mode));
-      } catch {
-        /* skip */
-      }
-      // Context load policy (replaces session-start hook injection)
-      // Try dev layout first (__dirname/../../scripts/), then installed (~/.config/weave/)
-      try {
-        const devPath = `${__dirname}/../../scripts/context-guard.sh`;
-        const installedPath = `${process.env.HOME}/.config/weave/context-guard.sh`;
-        let scriptPath: string | undefined;
+      if (!scriptPath) {
         try {
-          accessSync(devPath, constants.X_OK);
-          scriptPath = devPath;
+          accessSync(installedPath, constants.X_OK);
+          scriptPath = installedPath;
         } catch {
-          /* not dev */
+          /* not installed */
         }
-        if (!scriptPath) {
-          try {
-            accessSync(installedPath, constants.X_OK);
-            scriptPath = installedPath;
-          } catch {
-            /* not installed */
-          }
-        }
-        if (scriptPath) {
-          const policy = execFileSync("bash", [scriptPath], {
-            encoding: "utf-8",
-            timeout: 5000,
-            env: { ...process.env, NO_COLOR: "1", WV_AGENT: "1" },
-          }).trim();
-          const policyLine = policy.split("\n").find((l) => l.startsWith("policy:"));
-          if (policyLine) parts.push("\n=== Context Policy ===\n" + policyLine);
-        } else {
-          parts.push("\n=== Context Policy ===\nUnavailable (context-guard.sh not found)");
-        }
-      } catch {
-        /* skip — context-guard.sh execution failed */
       }
-      result = parts.join("\n");
+      if (scriptPath) {
+        const policy = execFileSync("bash", [scriptPath], {
+          encoding: "utf-8",
+          timeout: 5000,
+          env: { ...process.env, NO_COLOR: "1", WV_AGENT: "1" },
+        }).trim();
+        const policyLine = policy.split("\n").find((l) => l.startsWith("policy:"));
+        if (policyLine) parts.push("\n=== Context Policy ===\n" + policyLine);
+      } else {
+        parts.push("\n=== Context Policy ===\nUnavailable (context-guard.sh not found)");
+      }
+    } catch {
+      /* skip — context-guard.sh execution failed */
+    }
+    result = parts.join("\n");
     return result;
   },
 
   weave_bootstrap: (args) => {
     let result: string;
-      const learnings = args.learnings as number | undefined;
-      const ready = args.ready as number | undefined;
-      const cmd = ["bootstrap", "--json"];
-      if (learnings) cmd.push(`--learnings=${learnings}`);
-      if (ready) cmd.push(`--ready=${ready}`);
-      result = wv(cmd);
+    const learnings = args.learnings as number | undefined;
+    const ready = args.ready as number | undefined;
+    const cmd = ["bootstrap", "--json"];
+    if (learnings) cmd.push(`--learnings=${learnings}`);
+    if (ready) cmd.push(`--ready=${ready}`);
+    result = wv(cmd);
     return result;
   },
 
   weave_preflight: (args) => {
     let result: string;
-      const id = args.id as string;
-      const preflightJson = wv(["preflight", id]);
-      // Parse preflight result and return isError for enforcement conditions
-      try {
-        const pf = JSON.parse(preflightJson);
-        if (!pf.node_exists) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error: Node ${id} not found. Use weave_search, weave_ready, or weave_bootstrap to find available nodes.`,
-              },
-            ],
-            isError: true,
-          };
-        }
-        if (!pf.node_active) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Warning: Node ${id} is not active. Claim it first with \`wv work ${id}\` before editing files.`,
-              },
-            ],
-            isError: false,
-          };
-        }
-        if (Array.isArray(pf.contradictions) && pf.contradictions.length > 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error: Contradictions detected on node ${id}:\n${pf.contradictions.join("\n")}\n\nResolve with \`wv resolve\` before proceeding.`,
-              },
-            ],
-            isError: true,
-          };
-        }
-        if (pf.has_blockers) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error: Node ${id} has unresolved blockers. Complete blocking work first or run \`wv show ${id}\` to see blockers.`,
-              },
-            ],
-            isError: true,
-          };
-        }
-        if (pf.policy_readiness?.blocking) {
-          const detail = pf.policy_readiness.detail || "Policy-sensitive completion is not ready.";
-          const hint = pf.policy_readiness.hint ? `\n\n${pf.policy_readiness.hint}` : "";
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error: Node ${id} is not policy-ready.\n${detail}${hint}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      } catch {
-        // JSON parse failed — fall through with raw output
+    const id = args.id as string;
+    const preflightJson = wv(["preflight", id]);
+    // Parse preflight result and return isError for enforcement conditions
+    try {
+      const pf = JSON.parse(preflightJson);
+      if (!pf.node_exists) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: Node ${id} not found. Use weave_search, weave_ready, or weave_bootstrap to find available nodes.`,
+            },
+          ],
+          isError: true,
+        };
       }
-      result = preflightJson;
+      if (!pf.node_active) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Warning: Node ${id} is not active. Claim it first with \`wv work ${id}\` before editing files.`,
+            },
+          ],
+          isError: false,
+        };
+      }
+      if (Array.isArray(pf.contradictions) && pf.contradictions.length > 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: Contradictions detected on node ${id}:\n${pf.contradictions.join("\n")}\n\nResolve with \`wv resolve\` before proceeding.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (pf.has_blockers) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: Node ${id} has unresolved blockers. Complete blocking work first or run \`wv show ${id}\` to see blockers.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (pf.policy_readiness?.blocking) {
+        const detail = pf.policy_readiness.detail || "Policy-sensitive completion is not ready.";
+        const hint = pf.policy_readiness.hint ? `\n\n${pf.policy_readiness.hint}` : "";
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: Node ${id} is not policy-ready.\n${detail}${hint}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    } catch {
+      // JSON parse failed — fall through with raw output
+    }
+    result = preflightJson;
     return result;
   },
 
   weave_edit_guard: () => {
     let result: string;
-      // Mirror pre-action.sh: check for active node, contradictions, blockers
-      // Returns isError:true if no active node — Copilot sees this as a blocking error
+    // Mirror pre-action.sh: check for active node, contradictions, blockers
+    // Returns isError:true if no active node — Copilot sees this as a blocking error
+    try {
+      const activeJson = wv(["list", "--status=active", "--json"]);
+      const activeNodes = JSON.parse(activeJson);
+      if (!Array.isArray(activeNodes) || activeNodes.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: [
+                "ERROR: No active Weave node. You MUST claim work before editing files.",
+                "",
+                "Run one of:",
+                "  wv work <id>                         — Claim an existing task",
+                '  wv add "<description>" --gh --alias=<short-name> --status=active --criteria="c1|c2" --risks=low  — Create + claim new task',
+                '  wv quick "<description>"             — Track trivial one-step work',
+                "",
+                'Use `wv search "<topic>"`, `wv ready`, `wv bootstrap --json`, weave_overview, or weave_bootstrap to find available work.',
+              ].join("\n"),
+            },
+          ],
+          isError: true,
+        };
+      }
+      // Active node exists — check for contradictions and blockers
+      const nodeId = activeNodes[0].id as string;
       try {
-        const activeJson = wv(["list", "--status=active", "--json"]);
-        const activeNodes = JSON.parse(activeJson);
-        if (!Array.isArray(activeNodes) || activeNodes.length === 0) {
+        const ctxJson = wvRead(["context", nodeId, "--json"]);
+        const ctx = JSON.parse(ctxJson);
+        if (Array.isArray(ctx.contradictions) && ctx.contradictions.length > 0) {
+          const contraList = ctx.contradictions
+            .map((c: { id: string; text: string }) => `  - ${c.id}: ${c.text}`)
+            .join("\n");
           return {
             content: [
               {
                 type: "text",
-                text: [
-                  "ERROR: No active Weave node. You MUST claim work before editing files.",
-                  "",
-                  "Run one of:",
-                  "  wv work <id>                         — Claim an existing task",
-                  '  wv add "<description>" --gh --alias=<short-name> --status=active --criteria="c1|c2" --risks=low  — Create + claim new task',
-                  '  wv quick "<description>"             — Track trivial one-step work',
-                  "",
-                  'Use `wv search "<topic>"`, `wv ready`, `wv bootstrap --json`, weave_overview, or weave_bootstrap to find available work.',
-                ].join("\n"),
+                text: `ERROR: Contradictions detected on active node ${nodeId}:\n${contraList}\n\nResolve with \`wv resolve\` before editing files.`,
               },
             ],
             isError: true,
           };
         }
-        // Active node exists — check for contradictions and blockers
-        const nodeId = activeNodes[0].id as string;
-        try {
-          const ctxJson = wvRead(["context", nodeId, "--json"]);
-          const ctx = JSON.parse(ctxJson);
-          if (Array.isArray(ctx.contradictions) && ctx.contradictions.length > 0) {
-            const contraList = ctx.contradictions
-              .map((c: { id: string; text: string }) => `  - ${c.id}: ${c.text}`)
-              .join("\n");
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `ERROR: Contradictions detected on active node ${nodeId}:\n${contraList}\n\nResolve with \`wv resolve\` before editing files.`,
-                },
-              ],
-              isError: true,
-            };
-          }
-          const unresolvedBlockers = Array.isArray(ctx.blockers)
-            ? ctx.blockers.filter((b: { status: string }) => b.status !== "done")
-            : [];
-          if (unresolvedBlockers.length > 0) {
-            const blockerList = unresolvedBlockers
-              .map((b: { id: string; text: string }) => `  - ${b.id}: ${b.text}`)
-              .join("\n");
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `ERROR: Active node ${nodeId} has unresolved blockers:\n${blockerList}\n\nComplete blocking work first.`,
-                },
-              ],
-              isError: true,
-            };
-          }
-        } catch {
-          // Context pack generation failed — warn but allow (graceful degradation)
+        const unresolvedBlockers = Array.isArray(ctx.blockers)
+          ? ctx.blockers.filter((b: { status: string }) => b.status !== "done")
+          : [];
+        if (unresolvedBlockers.length > 0) {
+          const blockerList = unresolvedBlockers
+            .map((b: { id: string; text: string }) => `  - ${b.id}: ${b.text}`)
+            .join("\n");
+          return {
+            content: [
+              {
+                type: "text",
+                text: `ERROR: Active node ${nodeId} has unresolved blockers:\n${blockerList}\n\nComplete blocking work first.`,
+              },
+            ],
+            isError: true,
+          };
         }
-        result = `OK: Active node ${nodeId} — "${activeNodes[0].text}". Proceed with edit.`;
       } catch {
-        // wv not available or DB not loaded — allow (graceful degradation)
-        result = "OK: Weave not available — edit guard skipped.";
+        // Context pack generation failed — warn but allow (graceful degradation)
       }
+      result = `OK: Active node ${nodeId} — "${activeNodes[0].text}". Proceed with edit.`;
+    } catch {
+      // wv not available or DB not loaded — allow (graceful degradation)
+      result = "OK: Weave not available — edit guard skipped.";
+    }
     return result;
   },
 
   weave_sync: (args) => {
     let result: string;
-      const gh = args.gh as boolean | undefined;
-      const mode = args.mode as string | undefined;
-      const node = args.node as string | undefined;
-      const networkFallback =
-        gh && !MCP_ALLOW_NETWORK
-          ? mcpNetworkFallback(`wv sync --gh${mode ? ` --mode=${mode}` : ""}${node ? ` --node=${node}` : ""}`)
-          : "";
-      const dryRun = args.dry_run as boolean | undefined;
-      const cmd = gh && MCP_ALLOW_NETWORK ? ["sync", "--gh"] : ["sync"];
-      if (mode) cmd.push(`--mode=${mode}`);
-      if (node) cmd.push(`--node=${node}`);
-      if (dryRun) cmd.push("--dry-run");
-      result = wv(cmd, WV_LIFECYCLE_TIMEOUT);
-      if (networkFallback) result += `\n\n${networkFallback}`;
+    const gh = args.gh as boolean | undefined;
+    const mode = args.mode as string | undefined;
+    const node = args.node as string | undefined;
+    const networkFallback =
+      gh && !MCP_ALLOW_NETWORK
+        ? mcpNetworkFallback(`wv sync --gh${mode ? ` --mode=${mode}` : ""}${node ? ` --node=${node}` : ""}`)
+        : "";
+    const dryRun = args.dry_run as boolean | undefined;
+    const cmd = gh && MCP_ALLOW_NETWORK ? ["sync", "--gh"] : ["sync"];
+    if (mode) cmd.push(`--mode=${mode}`);
+    if (node) cmd.push(`--node=${node}`);
+    if (dryRun) cmd.push("--dry-run");
+    result = wv(cmd, WV_LIFECYCLE_TIMEOUT);
+    if (networkFallback) result += `\n\n${networkFallback}`;
     return result;
   },
 
   weave_resolve: (args) => {
     let result: string;
-      const node1 = args.node1 as string;
-      const node2 = args.node2 as string;
-      const mode = args.mode as string;
-      const winner = args.winner as string | undefined;
-      const rationale = args.rationale as string | undefined;
-      const cmd = ["resolve", node1, node2];
-      if (mode === "winner" && winner) {
-        cmd.push(`--winner=${winner}`);
-      } else if (mode === "merge") {
-        cmd.push("--merge");
-      } else if (mode === "defer") {
-        cmd.push("--defer");
-      }
-      if (rationale) cmd.push(`--rationale=${rationale}`);
-      result = wv(cmd);
+    const node1 = args.node1 as string;
+    const node2 = args.node2 as string;
+    const mode = args.mode as string;
+    const winner = args.winner as string | undefined;
+    const rationale = args.rationale as string | undefined;
+    const cmd = ["resolve", node1, node2];
+    if (mode === "winner" && winner) {
+      cmd.push(`--winner=${winner}`);
+    } else if (mode === "merge") {
+      cmd.push("--merge");
+    } else if (mode === "defer") {
+      cmd.push("--defer");
+    }
+    if (rationale) cmd.push(`--rationale=${rationale}`);
+    result = wv(cmd);
     return result;
   },
 
   weave_close_session: (args) => {
     let result: string;
-      const gh = (args.gh as boolean) ?? false;
-      const mode = args.mode as string | undefined;
-      const parts: string[] = [];
+    const gh = (args.gh as boolean) ?? false;
+    const mode = args.mode as string | undefined;
+    const parts: string[] = [];
 
-      // 1. Sync graph (+ optional GH)
-      try {
-        const syncCmd = gh && MCP_ALLOW_NETWORK ? ["sync", "--gh"] : ["sync"];
-        if (mode) syncCmd.push(`--mode=${mode}`);
-        parts.push("=== Sync ===\n" + wv(syncCmd, WV_LIFECYCLE_TIMEOUT));
-        if (gh && !MCP_ALLOW_NETWORK) {
-          parts.push("\n=== GitHub Sync ===\n" + mcpNetworkFallback(`wv sync --gh${mode ? ` --mode=${mode}` : ""}`));
-        }
-      } catch (e) {
-        parts.push("=== Sync ===\nError: " + (e as Error).message);
+    // 1. Sync graph (+ optional GH)
+    try {
+      const syncCmd = gh && MCP_ALLOW_NETWORK ? ["sync", "--gh"] : ["sync"];
+      if (mode) syncCmd.push(`--mode=${mode}`);
+      parts.push("=== Sync ===\n" + wv(syncCmd, WV_LIFECYCLE_TIMEOUT));
+      if (gh && !MCP_ALLOW_NETWORK) {
+        parts.push("\n=== GitHub Sync ===\n" + mcpNetworkFallback(`wv sync --gh${mode ? ` --mode=${mode}` : ""}`));
       }
+    } catch (e) {
+      parts.push("=== Sync ===\nError: " + (e as Error).message);
+    }
 
-      // 2. Check uncommitted files
-      try {
-        const uncommitted = execFileSync("git", ["status", "--porcelain"], {
-          encoding: "utf-8",
-          env: { ...process.env },
-        }).trim();
-        if (uncommitted) {
-          parts.push("\n=== Uncommitted Files ===\n" + uncommitted);
-        } else {
-          parts.push("\n=== Uncommitted Files ===\nNone — working tree clean");
-        }
-      } catch {
-        parts.push("\n=== Uncommitted Files ===\nCould not check");
+    // 2. Check uncommitted files
+    try {
+      const uncommitted = execFileSync("git", ["status", "--porcelain"], {
+        encoding: "utf-8",
+        env: { ...process.env },
+      }).trim();
+      if (uncommitted) {
+        parts.push("\n=== Uncommitted Files ===\n" + uncommitted);
+      } else {
+        parts.push("\n=== Uncommitted Files ===\nNone — working tree clean");
       }
+    } catch {
+      parts.push("\n=== Uncommitted Files ===\nCould not check");
+    }
 
-      // 3. Check unpushed commits
-      try {
-        const unpushed = execFileSync("git", ["log", "@{u}..HEAD", "--oneline"], {
-          encoding: "utf-8",
-          env: { ...process.env },
-        }).trim();
-        if (unpushed) {
-          parts.push("\n=== Unpushed Commits ===\n" + unpushed);
-        } else {
-          parts.push("\n=== Unpushed Commits ===\nNone — up to date with remote");
-        }
-      } catch {
-        parts.push("\n=== Unpushed Commits ===\nCould not check");
+    // 3. Check unpushed commits
+    try {
+      const unpushed = execFileSync("git", ["log", "@{u}..HEAD", "--oneline"], {
+        encoding: "utf-8",
+        env: { ...process.env },
+      }).trim();
+      if (unpushed) {
+        parts.push("\n=== Unpushed Commits ===\n" + unpushed);
+      } else {
+        parts.push("\n=== Unpushed Commits ===\nNone — up to date with remote");
       }
+    } catch {
+      parts.push("\n=== Unpushed Commits ===\nCould not check");
+    }
 
-      // 4. Active nodes warning
-      try {
-        const status = wvRead(["status"]);
-        if (status.includes("active") && !status.includes("0 active")) {
-          parts.push(
-            "\n=== Warning ===\n" + "Active nodes still open — consider closing with weave_done or weave_ship"
-          );
-        }
-      } catch {
-        /* skip */
+    // 4. Active nodes warning
+    try {
+      const status = wvRead(["status"]);
+      if (status.includes("active") && !status.includes("0 active")) {
+        parts.push("\n=== Warning ===\n" + "Active nodes still open — consider closing with weave_done or weave_ship");
       }
+    } catch {
+      /* skip */
+    }
 
-      result = parts.join("\n");
+    result = parts.join("\n");
     return result;
   },
 
   weave_tree: (args) => {
     let result: string;
-      const active = args.active as boolean | undefined;
-      const depth = args.depth as number | undefined;
-      const mermaid = args.mermaid as boolean | undefined;
-      const json = args.json as boolean | undefined;
-      const root = args.root as string | undefined;
-      const cmd = ["tree"];
-      if (mermaid) cmd.push("--mermaid");
-      else if (json) cmd.push("--json");
-      if (active) cmd.push("--active");
-      if (depth !== undefined) cmd.push(`--depth=${depth}`);
-      if (root) cmd.push(`--root=${root}`);
-      result = wv(cmd);
+    const active = args.active as boolean | undefined;
+    const depth = args.depth as number | undefined;
+    const mermaid = args.mermaid as boolean | undefined;
+    const json = args.json as boolean | undefined;
+    const root = args.root as string | undefined;
+    const all = args.all as boolean | undefined;
+    const cmd = ["tree"];
+    if (mermaid) cmd.push("--mermaid");
+    else if (json) cmd.push("--json");
+    if (active) cmd.push("--active");
+    if (depth !== undefined) cmd.push(`--depth=${depth}`);
+    if (root) cmd.push(`--root=${root}`);
+    if (all) cmd.push("--all");
+    result = wv(cmd);
     return result;
   },
 
   weave_learnings: (args) => {
     let result: string;
-      const grep = args.grep as string | undefined;
-      const recent = args.recent as number | undefined;
-      const category = args.category as string | undefined;
-      const node = args.node as string | undefined;
-      const mode = args.mode as ReadMode | undefined;
-      const minQuality = args.min_quality as number | undefined;
-      const dedup = args.dedup as boolean | undefined;
-      const all = args.all as boolean | undefined;
-      const cmd = ["learnings", "--json"];
-      if (grep) cmd.push(`--grep=${grep}`);
-      if (recent !== undefined) cmd.push(`--recent=${recent}`);
-      if (category) cmd.push(`--category=${category}`);
-      if (node) cmd.push(`--node=${node}`);
-      if (mode) cmd.push(`--mode=${mode}`);
-      if (minQuality !== undefined) cmd.push(`--min-quality=${minQuality}`);
-      if (dedup) cmd.push("--dedup");
-      if (all) cmd.push("--all");
-      result = wv(cmd);
+    const grep = args.grep as string | undefined;
+    const recent = args.recent as number | undefined;
+    const category = args.category as string | undefined;
+    const node = args.node as string | undefined;
+    const mode = args.mode as ReadMode | undefined;
+    const minQuality = args.min_quality as number | undefined;
+    const dedup = args.dedup as boolean | undefined;
+    const all = args.all as boolean | undefined;
+    const cmd = ["learnings", "--json"];
+    if (grep) cmd.push(`--grep=${grep}`);
+    if (recent !== undefined) cmd.push(`--recent=${recent}`);
+    if (category) cmd.push(`--category=${category}`);
+    if (node) cmd.push(`--node=${node}`);
+    if (mode) cmd.push(`--mode=${mode}`);
+    if (minQuality !== undefined) cmd.push(`--min-quality=${minQuality}`);
+    if (dedup) cmd.push("--dedup");
+    if (all) cmd.push("--all");
+    result = wv(cmd);
     return result;
   },
 
   weave_update: (args) => {
     let result: string;
-      const id = args.id as string;
-      const status = normalizeStatus(args.status as string | undefined);
-      const text = args.text as string | undefined;
-      const metadata = args.metadata as Record<string, unknown> | undefined;
-      const alias = args.alias as string | undefined;
-      const removeKey = args.remove_key as string | undefined;
+    const id = args.id as string;
+    const status = normalizeStatus(args.status as string | undefined);
+    const text = args.text as string | undefined;
+    const metadata = args.metadata as Record<string, unknown> | undefined;
+    const alias = args.alias as string | undefined;
+    const removeKey = args.remove_key as string | undefined;
 
-      // --remove-key is a standalone operation (returns immediately)
-      if (removeKey) {
-        return wv(["update", id, `--remove-key=${removeKey}`]);
-      }
+    // --remove-key is a standalone operation (returns immediately)
+    if (removeKey) {
+      return wv(["update", id, `--remove-key=${removeKey}`]);
+    }
 
-      const cmd = ["update", id];
-      if (status) cmd.push(`--status=${status}`);
-      if (text) cmd.push(`--text=${text}`);
-      if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
-      if (alias) cmd.push(`--alias=${alias}`);
-      result = wv(cmd);
+    const cmd = ["update", id];
+    if (status) cmd.push(`--status=${status}`);
+    if (text) cmd.push(`--text=${text}`);
+    if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
+    if (alias) cmd.push(`--alias=${alias}`);
+    result = wv(cmd);
     return result;
   },
 
   weave_touch: (args) => {
     let result: string;
-      const id = args.id as string;
-      const metadata = args.metadata as Record<string, unknown> | undefined;
-      const intent = args.intent as string | undefined;
-      const cmd = ["touch", id];
-      if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
-      if (intent) cmd.push(`--intent=${intent}`);
-      wv(cmd);
-      result = "ok";
+    const id = args.id as string;
+    const metadata = args.metadata as Record<string, unknown> | undefined;
+    const intent = args.intent as string | undefined;
+    const cmd = ["touch", id];
+    if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
+    if (intent) cmd.push(`--intent=${intent}`);
+    wv(cmd);
+    result = "ok";
     return result;
   },
 
   weave_record_edit: (args) => {
     let result: string;
-      const id = args.id as string;
-      const path = args.path as string | undefined;
-      const intent = args.intent as string | undefined;
-      const metadata = args.metadata as Record<string, unknown> | undefined;
-      if (!path && !intent && !metadata) {
-        throw new Error("weave_record_edit requires at least one of: path, intent, metadata");
-      }
-      const cmd = ["touch", id];
-      if (path) cmd.push(`--files=${path}`);
-      if (intent) cmd.push(`--intent=${intent}`);
-      if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
-      wv(cmd);
-      result = "ok";
+    const id = args.id as string;
+    const path = args.path as string | undefined;
+    const intent = args.intent as string | undefined;
+    const metadata = args.metadata as Record<string, unknown> | undefined;
+    if (!path && !intent && !metadata) {
+      throw new Error("weave_record_edit requires at least one of: path, intent, metadata");
+    }
+    const cmd = ["touch", id];
+    if (path) cmd.push(`--files=${path}`);
+    if (intent) cmd.push(`--intent=${intent}`);
+    if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
+    wv(cmd);
+    result = "ok";
     return result;
   },
 
   weave_breadcrumbs: (args) => {
     let result: string;
-      // weave_breadcrumbs is a back-compat alias; both route to the `trails` CLI.
-      const action = (args.action as string) || "show";
-      const message = args.message as string | undefined;
-      const cmd = ["trails", action];
-      if (action === "save" && message) cmd.push(`--message=${message}`);
-      result = wv(cmd);
+    // weave_breadcrumbs is a back-compat alias; both route to the `trails` CLI.
+    const action = (args.action as string) || "show";
+    const message = args.message as string | undefined;
+    const cmd = ["trails", action];
+    if (action === "save" && message) cmd.push(`--message=${message}`);
+    result = wv(cmd);
     return result;
   },
 
   weave_guide: (args) => {
     let result: string;
-      const topic = args.topic as string | undefined;
-      const cmd = ["guide"];
-      if (topic) cmd.push(`--topic=${topic}`);
-      result = wv(cmd);
+    const topic = args.topic as string | undefined;
+    const cmd = ["guide"];
+    if (topic) cmd.push(`--topic=${topic}`);
+    result = wv(cmd);
     return result;
   },
 
   weave_plan: (args) => {
     let result: string;
-      const template = args.template as boolean | undefined;
-      if (template) {
-        return wv(["plan", "--template"]);
-      }
-      const file = args.file as string | undefined;
-      const sprint = args.sprint as number | undefined;
-      if (!file || sprint === undefined) {
-        throw new Error("weave_plan requires 'file' and 'sprint' (or template=true)");
-      }
-      const gh = args.gh as boolean | undefined;
-      const dryRun = args.dry_run as boolean | undefined;
-      const cmd = ["plan", file, `--sprint=${sprint}`];
-      if (gh) cmd.push("--gh");
-      if (dryRun) cmd.push("--dry-run");
-      // --gh: sleep 1 between each issue create (secondary rate limit); 20 tasks ≈ 60s minimum
-      const planTimeout = gh ? 180_000 : 60_000;
-      result = wv(cmd, planTimeout);
+    const template = args.template as boolean | undefined;
+    if (template) {
+      return wv(["plan", "--template"]);
+    }
+    const file = args.file as string | undefined;
+    const sprint = args.sprint as number | undefined;
+    if (!file || sprint === undefined) {
+      throw new Error("weave_plan requires 'file' and 'sprint' (or template=true)");
+    }
+    const gh = args.gh as boolean | undefined;
+    const dryRun = args.dry_run as boolean | undefined;
+    const cmd = ["plan", file, `--sprint=${sprint}`];
+    if (gh) cmd.push("--gh");
+    if (dryRun) cmd.push("--dry-run");
+    // --gh: sleep 1 between each issue create (secondary rate limit); 20 tasks ≈ 60s minimum
+    const planTimeout = gh ? 180_000 : 60_000;
+    result = wv(cmd, planTimeout);
     return result;
   },
 
   weave_show: (args) => {
     let result: string;
-      const id = args.id as string;
-      result = wv(["show", id, "--json-v2"]);
+    const id = args.id as string;
+    result = wv(["show", id, "--json-v2"]);
     return result;
   },
 
   weave_delete: (args) => {
     let result: string;
-      const id = args.id as string;
-      const force = args.force as boolean;
-      const dryRun = args.dry_run as boolean | undefined;
-      const noGh = args.no_gh as boolean | undefined;
-      if (!force) {
-        throw new Error("weave_delete requires force=true to confirm deletion. This is a destructive operation.");
-      }
-      const cmd = ["delete", id, "--force"];
-      if (dryRun) cmd.push("--dry-run");
-      if (noGh) cmd.push("--no-gh");
-      result = wv(cmd);
+    const id = args.id as string;
+    const force = args.force as boolean;
+    const dryRun = args.dry_run as boolean | undefined;
+    const noGh = args.no_gh as boolean | undefined;
+    if (!force) {
+      throw new Error("weave_delete requires force=true to confirm deletion. This is a destructive operation.");
+    }
+    const cmd = ["delete", id, "--force"];
+    if (dryRun) cmd.push("--dry-run");
+    if (noGh) cmd.push("--no-gh");
+    result = wv(cmd);
     return result;
   },
 
   weave_quality_scan: (args) => {
     let result: string;
-      const path = args.path as string | undefined;
-      const exclude = args.exclude as string | undefined;
-      const cmd = ["quality", "scan", "--json"];
-      if (path) cmd.push(path);
-      if (exclude) cmd.push(`--exclude=${exclude}`);
-      result = wv(cmd, 60_000); // scans can be slow on large repos
+    const path = args.path as string | undefined;
+    const exclude = args.exclude as string | undefined;
+    const cmd = ["quality", "scan", "--json"];
+    if (path) cmd.push(path);
+    if (exclude) cmd.push(`--exclude=${exclude}`);
+    result = wv(cmd, 60_000); // scans can be slow on large repos
     return result;
   },
 
   weave_quality_hotspots: (args) => {
     let result: string;
-      const path = args.path as string | undefined;
-      const limit = args.limit as number | undefined;
-      const threshold = args.threshold as number | undefined;
-      const cmd = ["quality", "hotspots", "--json"];
-      if (path) cmd.push(path);
-      if (limit) cmd.push(`--limit=${limit}`);
-      if (threshold) cmd.push(`--threshold=${threshold}`);
-      result = wv(cmd);
+    const path = args.path as string | undefined;
+    const limit = args.limit as number | undefined;
+    const threshold = args.threshold as number | undefined;
+    const cmd = ["quality", "hotspots", "--json"];
+    if (path) cmd.push(path);
+    if (limit) cmd.push(`--limit=${limit}`);
+    if (threshold) cmd.push(`--threshold=${threshold}`);
+    result = wv(cmd);
     return result;
   },
 
   weave_quality_diff: (args) => {
     let result: string;
-      const path = args.path as string | undefined;
-      const cmd = ["quality", "diff", "--json"];
-      if (path) cmd.push(path);
-      result = wv(cmd);
+    const path = args.path as string | undefined;
+    const cmd = ["quality", "diff", "--json"];
+    if (path) cmd.push(path);
+    result = wv(cmd);
     return result;
   },
 
   weave_quality_functions: (args) => {
     let result: string;
-      const path = args.path as string | undefined;
-      const threshold = args.threshold as number | undefined;
-      const cmd = ["quality", "functions", "--json"];
-      if (path) cmd.push(path);
-      if (threshold !== undefined) cmd.push(`--threshold=${threshold}`);
-      result = wv(cmd);
+    const path = args.path as string | undefined;
+    const threshold = args.threshold as number | undefined;
+    const cmd = ["quality", "functions", "--json"];
+    if (path) cmd.push(path);
+    if (threshold !== undefined) cmd.push(`--threshold=${threshold}`);
+    result = wv(cmd);
     return result;
   },
 
   weave_structural_search: (args) => {
     let result: string;
-      const pattern = args.pattern as string;
-      const lang = args.lang as string;
-      const repo = args.repo as string | undefined;
-      const cmd = ["quality", "structural-search", "--json", `--pattern=${pattern}`, `--lang=${lang}`];
-      if (repo) cmd.push(`--repo=${repo}`);
-      result = wv(cmd, 30_000);
+    const pattern = args.pattern as string;
+    const lang = args.lang as string;
+    const repo = args.repo as string | undefined;
+    const cmd = ["quality", "structural-search", "--json", `--pattern=${pattern}`, `--lang=${lang}`];
+    if (repo) cmd.push(`--repo=${repo}`);
+    result = wv(cmd, 30_000);
     return result;
   },
 
   weave_quality_patterns: (args) => {
     let result: string;
-      const subcommand = args.subcommand as string;
-      const patPath = args.path as string | undefined;
-      const patParent = args.parent as string | undefined;
-      const patDryRun = args.dry_run as boolean | undefined;
-      const cmd = ["quality", "patterns", subcommand, "--json"];
-      if (patPath) cmd.push(patPath);
-      if (patParent) cmd.push(`--parent=${patParent}`);
-      if (patDryRun) cmd.push("--dry-run");
-      result = wv(cmd, 60_000);
+    const subcommand = args.subcommand as string;
+    const patPath = args.path as string | undefined;
+    const patParent = args.parent as string | undefined;
+    const patDryRun = args.dry_run as boolean | undefined;
+    const cmd = ["quality", "patterns", subcommand, "--json"];
+    if (patPath) cmd.push(patPath);
+    if (patParent) cmd.push(`--parent=${patParent}`);
+    if (patDryRun) cmd.push("--dry-run");
+    result = wv(cmd, 60_000);
     return result;
   },
 
   weave_code_search: (args) => {
     let result: string;
-      const query = args.query as string;
-      const limit = args.limit as number | undefined;
-      const mode = args.mode as string | undefined;
-      const graph = args.graph as boolean | undefined;
-      const filter = args.filter as string | undefined;
-      const cmd = ["search", "--code", query, "--json"];
-      if (limit) cmd.push(`--limit=${limit}`);
-      if (mode) cmd.push(`--mode=${mode}`);
-      if (graph) cmd.push("--graph");
-      if (filter) cmd.push(`--filter=${filter}`);
-      result = wv(cmd, 120_000);
+    const query = args.query as string;
+    const limit = args.limit as number | undefined;
+    const mode = args.mode as string | undefined;
+    const graph = args.graph as boolean | undefined;
+    const filter = args.filter as string | undefined;
+    const cmd = ["search", "--code", query, "--json"];
+    if (limit) cmd.push(`--limit=${limit}`);
+    if (mode) cmd.push(`--mode=${mode}`);
+    if (graph) cmd.push("--graph");
+    if (filter) cmd.push(`--filter=${filter}`);
+    result = wv(cmd, 120_000);
     return result;
   },
 
   weave_index: (args) => {
     let result: string;
-      const path = args.path as string | undefined;
-      const noEmbed = args.no_embed as boolean | undefined;
-      const ext = args.ext as string | undefined;
-      const cmd = ["index", "--json"];
-      if (path) cmd.push(path);
-      if (noEmbed) cmd.push("--no-embed");
-      if (ext) cmd.push(`--ext=${ext}`);
-      result = wv(cmd, 300_000);
+    const path = args.path as string | undefined;
+    const noEmbed = args.no_embed as boolean | undefined;
+    const ext = args.ext as string | undefined;
+    const cmd = ["index", "--json"];
+    if (path) cmd.push(path);
+    if (noEmbed) cmd.push("--no-embed");
+    if (ext) cmd.push(`--ext=${ext}`);
+    result = wv(cmd, 300_000);
     return result;
   },
 };
@@ -2516,7 +2518,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.59.1",
+      version: "1.60.0",
     },
     {
       capabilities: {

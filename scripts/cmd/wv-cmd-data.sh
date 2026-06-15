@@ -928,6 +928,15 @@ EOF
             # incorporated. Full replay is idempotent by design, so correctness wins:
             # always replay every non-pruned delta on load until a stronger trust model
             # exists than mtime comparisons plus a local manifest.
+            #
+            # Authoritative-drop rejected (wv-c7b34e, D-4 rec-4): "drop live rows
+            # absent from state.sql ∪ replayed deltas" is either a no-op or data loss.
+            # The pre-flight auto_sync --force puts every live row into state.sql
+            # before the rebuild, so when the flush succeeds the absent set is empty;
+            # when the flush fails or is floor-guarded, the absent rows are exactly
+            # the unsynced work most needing preservation. Absence is not a deletion
+            # signal — deletion intent travels via tombstones (prune_epoch + immediate
+            # state.sql dump in cmd_delete/cmd_prune, DELETE statements in deltas).
             local manifest="$WEAVE_DIR/.applied_deltas"
             # Truncate manifest before replay. If replay fails, the manifest stays
             # empty — guaranteeing all deltas are retried on the next wv load.

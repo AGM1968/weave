@@ -1,7 +1,9 @@
 """Persistent AST analysis result cache keyed by git blob SHA.
 
 Stores per-file analysis results (FileEntry metrics, CKMetrics, FunctionCC list)
-in .weave/ast_cache.db — gitignored and NOT wiped by wv quality reset.
+in the repo root's .weave/ast_cache.db — gitignored and NOT wiped by wv quality
+reset. The cache is anchored at the git top-level (not the scan path) so a
+subdir-scoped scan shares the one root cache and never leaks a nested .weave/.
 
 Cache key: (blob_sha, scanner_version)
   blob_sha       — git object SHA; changes when file content changes
@@ -19,12 +21,34 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .models import CKMetrics, FileEntry, FunctionCC
+
+
+def _git_toplevel(path: str | Path) -> str | None:
+    """Return the git working-tree root containing ``path``, or None.
+
+    The cache must live at the repo root's ``.weave/`` (which the consumer's
+    root-anchored .gitignore already covers), not at the scan path — a
+    subdir-scoped scan (e.g. ``wv quality src/foo``) otherwise drops an
+    untracked, un-ignored ``src/foo/.weave/ast_cache.db`` (wv-a94144).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    top = result.stdout.strip()
+    return top or None
 
 
 @dataclass
@@ -69,8 +93,15 @@ class ASTCache:
 
     @classmethod
     def open(cls, repo_root: str | Path, scanner_version: str) -> "ASTCache":
-        """Open (or create) the cache DB at {repo_root}/.weave/ast_cache.db."""
-        db_path = Path(repo_root) / ".weave" / "ast_cache.db"
+        """Open (or create) the cache DB at the repo root's .weave/ast_cache.db.
+
+        ``repo_root`` may be a subdir-scoped scan path; the cache is anchored at
+        the git top-level so it stays inside the already-ignored root ``.weave/``
+        and every scan scope shares one cache (keyed by blob_sha, so collision
+        free). Falls back to ``repo_root`` itself when not in a git repo.
+        """
+        cache_root = _git_toplevel(repo_root) or str(repo_root)
+        db_path = Path(cache_root) / ".weave" / "ast_cache.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(db_path), timeout=5)
         conn.execute("PRAGMA journal_mode=WAL")

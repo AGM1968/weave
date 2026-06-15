@@ -4,16 +4,48 @@
 
 ## Unreleased
 
+## [1.60.0] - 2026-06-15
+
+### Added
+
+- **`test-map.conf` glob / prefix / `[default]` keys** — suite selection for the pre-commit impact
+  gate is no longer exact-match only. Keys may be globs (`src/**/*.py = suite`), directory prefixes
+  (`src/ = suite`), or a fail-safe default (`* = suite`, or a `[default]` section). Per-file
+  precedence: exact > glob/prefix > naming heuristic > `[default]`. Closes the silent-rot failure
+  where unmapped consumer source files committed with zero suite coverage and no signal; the
+  pre-commit hook now also prints a one-line notice when staged files match no entry.
+- **Output budget bounding** — `wv tree` is capped (node cap + truncation line) and
+  `wv audit-pitfalls` defaults to `--only-unaddressed --top=20`, with the MCP `weave_tree`
+  description updated to match. Bounds token-heavy command output that entered agent/MCP context.
+
+### Fixed
+
+- **Vendored git-hook source-seed gap** — `wv-init-repo` now _seeds_ a missing vendored hook source
+  in `scripts/hooks/` (not only refreshes existing ones), so a consumer scaffolded before a hook was
+  added converges to the canonical set instead of running an installed hook with no in-repo source.
+- **`wv-init-repo --update` left stale git hooks** — an installed Weave hook whose header wording
+  had drifted was mistaken for a custom hook and skipped, leaving `.git/hooks/` stale (flagged by
+  `wv doctor` with a manual `install` step). The ownership test now matches any stable Weave
+  signature, so a managed hook is refreshed while a genuinely custom hook is preserved. The
+  post-update hint also lists `scripts/hooks/` changes and prints a node-aware commit sequence.
+- **`wv quality` ast_cache.db leaked into nested `.weave/`** — the AST cache is now anchored at the
+  git top-level regardless of scan path, so a subdir-scoped scan shares the one root cache instead
+  of dropping an untracked, un-ignored `<subdir>/.weave/ast_cache.db`. `wv-init-repo` also seeds a
+  filename-scoped recursive ignore (`**/.weave/ast_cache.db`) that cannot shadow `state.sql`.
+- **Busy-wait poller guard (`bash-dedup`)** — the dedup hook now denies an `until/while`+`sleep`
+  loop while a tracked background task is live (reusing the lock liveness signal), closing the gap
+  where an ad-hoc poller spawned to watch a backgrounded command escaped the lock and busy-waited.
+
 ## [1.59.1] - 2026-06-12
 
 ### Fixed
 
 - **`weave_query` was broken over MCP** — the handler routed through `wvRead()`, which appends
-  `--mode=discover`, but `wv query` is the only read command without `--mode` support, so every
-  call returned `unknown option: --mode=discover`. Pre-existing since the `wvRead` introduction
-  (v1.58.0 had the same call); surfaced by the codex v1.59.0 verification. Handler now calls
-  `wv()` directly, and the parity suite gained a `weave_query` DB-read execution smoke so
-  read-path breakage can no longer hide behind the shell-out smoke (wv-0b281b).
+  `--mode=discover`, but `wv query` is the only read command without `--mode` support, so every call
+  returned `unknown option: --mode=discover`. Pre-existing since the `wvRead` introduction (v1.58.0
+  had the same call); surfaced by the codex v1.59.0 verification. Handler now calls `wv()` directly,
+  and the parity suite gained a `weave_query` DB-read execution smoke so read-path breakage can no
+  longer hide behind the shell-out smoke (wv-0b281b).
 
 ## [1.59.0] - 2026-06-12
 
@@ -27,12 +59,11 @@
   exclusion, the EXPOSE debt is retired.
 - **Table-driven MCP dispatch** (wv-8e217e): the 850-line `handleTool` switch (CC 237, the repo's
   worst function) is now a `Record<string, ToolHandler>` map — 45 entries, each handler returning
-  result text or a full response envelope for enforcement paths. The
-  `mcp/src/index.ts` quality-gate exemption is retired; no function in the file exceeds CC 20.
-  Tier-2 parity flags exposed in the same pass: `weave_search.type`, `weave_code_search.filter`,
-  `weave_impact.files` (seeds from file paths; `ids` no longer required when `files` given);
-  `search --mode/--graph/--filter` reclassified as code-path flags already covered by
-  `weave_code_search`. Parity baseline 43 -> 41.
+  result text or a full response envelope for enforcement paths. The `mcp/src/index.ts` quality-gate
+  exemption is retired; no function in the file exceeds CC 20. Tier-2 parity flags exposed in the
+  same pass: `weave_search.type`, `weave_code_search.filter`, `weave_impact.files` (seeds from file
+  paths; `ids` no longer required when `files` given); `search --mode/--graph/--filter` reclassified
+  as code-path flags already covered by `weave_code_search`. Parity baseline 43 -> 41.
 - **MCP tier-1 parity flags exposed** (wv-4a1de6): `weave_add` gains `criteria`/`risks` (claim-ready
   node creation per decomposition discipline), `weave_quick` gains `learning`, `weave_ship` gains
   `verification_method`/`verification_evidence`, and `weave_done` gains `verification_evidence` —

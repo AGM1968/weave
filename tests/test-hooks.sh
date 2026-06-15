@@ -866,6 +866,54 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
+# ── Poller guard: deny busy-wait loops only while a background task is live ──────
+# A running lock with empty task-id (line 4) and a recent epoch reads as live via
+# the age-window fallback — no fuser-held file needed in the test.
+rm -f "$DEDUP_LOCK_DIR"/*.lock
+POLLER_CMD='until grep -q done /tmp/somelog; do sleep 3; done'
+
+# (a) No background task in flight → poller allowed (no deny).
+set +e
+OUTPUT=$(echo "$(jq -n --arg c "$POLLER_CMD" '{"tool_name":"Bash","tool_input":{"command":$c}}')" \
+    | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "bash-dedup poller: idle poller exits 0"
+assert_not_contains "$OUTPUT" '"deny"' "bash-dedup poller: poller allowed when nothing is in flight"
+
+# (b) A live running bg lock present → poller denied with yield guidance.
+printf '%s\nrunning\nmake check\n\n' "$(date +%s)" > "$DEDUP_LOCK_DIR/make-build.lock"
+set +e
+OUTPUT=$(echo "$(jq -n --arg c "$POLLER_CMD" '{"tool_name":"Bash","tool_input":{"command":$c}}')" \
+    | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "bash-dedup poller: deny is a soft (exit 0) JSON decision"
+assert_contains "$OUTPUT" '"deny"' "bash-dedup poller: poller denied while bg task is live"
+assert_contains "$OUTPUT" 'task-notification' "bash-dedup poller: deny message tells the agent to yield"
+
+# (c) Quoted prose containing until/sleep must NOT be treated as a poller, even
+# with a live bg lock present (CMD_STRIPPED removes the quoted region).
+PROSE_CMD='wv done wv-abc1 --learning="loop until the job is done, then sleep on it"'
+set +e
+OUTPUT=$(echo "$(jq -n --arg c "$PROSE_CMD" '{"tool_name":"Bash","tool_input":{"command":$c}}')" \
+    | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "bash-dedup poller: quoted until/sleep prose exits 0"
+assert_not_contains "$OUTPUT" '"deny"' "bash-dedup poller: quoted until/sleep prose is not a poller"
+
+# (d) A stale running lock (old epoch, no task id) must NOT keep denying pollers.
+printf '%s\nrunning\nmake check\n\n' "$(( $(date +%s) - 700 ))" > "$DEDUP_LOCK_DIR/make-build.lock"
+set +e
+OUTPUT=$(echo "$(jq -n --arg c "$POLLER_CMD" '{"tool_name":"Bash","tool_input":{"command":$c}}')" \
+    | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "bash-dedup poller: stale lock exits 0"
+assert_not_contains "$OUTPUT" '"deny"' "bash-dedup poller: poller allowed once bg lock is stale"
+rm -f "$DEDUP_LOCK_DIR"/*.lock
+
 # --- post-edit-lint.sh ---
 echo ""
 echo "--- post-edit-lint.sh ---"

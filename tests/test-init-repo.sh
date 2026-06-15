@@ -466,6 +466,58 @@ FIRST=$(cat "$REPO9/.gitattributes")
 SECOND=$(cat "$REPO9/.gitattributes")
 assert_equals "$FIRST" "$SECOND" "gitattr idempotent: second run produces identical output"
 
+# --- scripts/hooks/ vendor seeding: missing source is seeded, not skipped ---
+# Regression for wv-2adeef: a consumer that vendors only some hook sources must
+# have the missing one(s) SEEDED on --update, not just refreshed-if-present.
+echo ""
+echo "--- vendor hook-source seeding ---"
+REPO10=$(make_test_repo "vendor-seed")
+cd "$REPO10"
+mkdir -p scripts/hooks
+# Simulate a repo scaffolded before post-commit-weave.sh existed: 2 of 3 sources.
+_LIB_HOOKS_DIR="${LIB_DIR:-$HOME/.local/lib/weave}/hooks"
+if [ -f "$_LIB_HOOKS_DIR/pre-commit-weave.sh" ]; then
+    cp "$_LIB_HOOKS_DIR/pre-commit-weave.sh" scripts/hooks/
+    cp "$_LIB_HOOKS_DIR/prepare-commit-msg-weave.sh" scripts/hooks/
+    # post-commit-weave.sh intentionally absent
+    "$WV" init-repo --update --agent=claude >/dev/null 2>&1
+    assert_file_exists "$REPO10/scripts/hooks/post-commit-weave.sh" \
+        "vendor seed: missing hook source is seeded on --update"
+    # And it matches the canonical lib copy
+    if cmp -s "$_LIB_HOOKS_DIR/post-commit-weave.sh" "$REPO10/scripts/hooks/post-commit-weave.sh"; then
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} vendor seed: seeded source matches canonical lib copy"
+    else
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} vendor seed: seeded source matches canonical lib copy"
+    fi
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${YELLOW}⊘${NC} vendor seed: skipped (lib hooks not installed)"
+fi
+
+# --- installed git-hook refresh: stale Weave hook updated, custom hook kept ---
+# Regression for wv-4bb42e: --update must refresh an existing Weave-managed
+# .git/hooks/ hook even when its (older) wording lacks the exact marker, while
+# still preserving a genuinely custom user hook.
+echo ""
+echo "--- installed git-hook refresh ---"
+REPO11=$(make_test_repo "hook-refresh")
+cd "$REPO11"
+"$WV" init-repo --agent=claude >/dev/null 2>&1
+# Stale Weave pre-commit: a Weave signature (WV_SKIP_PRECOMMIT) but NOT the
+# current "Weave pre-commit" marker — the old logic would skip this as custom.
+printf '#!/usr/bin/env bash\n# legacy weave guard\n# bypass: WV_SKIP_PRECOMMIT=1\nexit 0\n' > "$REPO11/.git/hooks/pre-commit"
+chmod +x "$REPO11/.git/hooks/pre-commit"
+# Genuinely custom hook: no Weave signature — must be preserved.
+printf '#!/bin/sh\necho my-custom-prepare-hook\n' > "$REPO11/.git/hooks/prepare-commit-msg"
+chmod +x "$REPO11/.git/hooks/prepare-commit-msg"
+"$WV" init-repo --agent=claude --update >/dev/null 2>&1
+assert_contains "$(cat "$REPO11/.git/hooks/pre-commit")" "Weave pre-commit hook" \
+    "hook-refresh: stale Weave pre-commit refreshed on --update (not skipped as custom)"
+assert_contains "$(cat "$REPO11/.git/hooks/prepare-commit-msg")" "my-custom-prepare-hook" \
+    "hook-refresh: genuinely custom hook preserved"
+
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Results ==="

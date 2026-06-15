@@ -712,6 +712,46 @@ SQL
 }
 
 # ============================================================================
+# test_impact_suites_matching — test-map.conf glob/prefix/[default] keys
+# Regression for wv-3ddc61: exact-match-only conf silently leaves consumer
+# src trees ungated. --suites mode is DB-free, so we exercise it directly.
+# ============================================================================
+test_impact_suites_matching() {
+    echo ""
+    echo "=== test-map glob/prefix/default matching (wv-3ddc61) ==="
+    setup_test_env
+    mkdir -p "$TEST_DIR/.weave"
+    cat > "$TEST_DIR/.weave/test-map.conf" <<'EOF'
+[map]
+scripts/cmd/wv-cmd-graph.sh = tests/test-exact.sh
+src/runners/ = tests/test-prefix.sh
+src/**/*.py = tests/test-glob.sh
+* = tests/test-default.sh
+EOF
+
+    local out
+    out=$("$WV" impact --suites --files=scripts/cmd/wv-cmd-graph.sh 2>&1)
+    assert_contains "$out" "test-exact.sh" "suites: exact key wins"
+    assert_not_contains "$out" "test-default.sh" "suites: exact match does not fall to default"
+
+    out=$("$WV" impact --suites --files=src/runners/job.py 2>&1)
+    assert_contains "$out" "test-prefix.sh" "suites: prefix key (src/runners/) matches file under dir"
+
+    out=$("$WV" impact --suites --files=src/utils/models.py 2>&1)
+    assert_contains "$out" "test-glob.sh" "suites: glob key (src/**/*.py) matches nested file"
+
+    # A file matching no exact/glob/prefix/heuristic entry falls to [default]
+    # (fail safe) instead of selecting nothing (fail open).
+    out=$("$WV" impact --suites --files=README.md 2>&1)
+    assert_contains "$out" "test-default.sh" "suites: unmatched file falls to default (fail safe)"
+
+    # No conf at all + no default → empty (gate inert, surfaced by the hook).
+    rm -f "$TEST_DIR/.weave/test-map.conf"
+    out=$("$WV" impact --suites --files=src/whatever.go 2>&1)
+    assert_equals "[]" "$out" "suites: no conf + non-heuristic file selects nothing"
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 main() {
@@ -726,6 +766,7 @@ main() {
     test_edges
     test_path
     test_impact
+    test_impact_suites_matching
 
     echo ""
     echo "========================================"

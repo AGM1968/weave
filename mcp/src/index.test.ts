@@ -5,7 +5,7 @@
  */
 
 import { spawn, spawnSync, ChildProcess } from "child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -634,6 +634,13 @@ describe("Weave MCP Server", () => {
       // Should fail with "not found" or similar — NOT leak file contents
       const result = response.result as { isError?: boolean; content: { text: string }[] };
       expect(result.content[0].text).not.toContain("root:");
+    });
+
+    it("weave_done uses the lifecycle timeout for bounded close calls", () => {
+      const sourcePath = resolve(__dirname, "index.ts");
+      const handlerSource = readFileSync(existsSync(sourcePath) ? sourcePath : SERVER_PATH, "utf-8");
+      expect(handlerSource).toContain("weave_done:");
+      expect(handlerSource).toContain("result = wv(cmd, WV_LIFECYCLE_TIMEOUT)");
     });
 
     it("weave_add with backtick injection should not execute", async () => {
