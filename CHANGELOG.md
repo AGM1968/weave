@@ -4,6 +4,27 @@
 
 ## Unreleased
 
+## [1.61.0] - 2026-06-15
+
+### Added
+
+- **Scaffold-sync wiring for the pre-commit test gate** — the two consumer-proven gate improvements
+  (test-bed: earth-engine-analysis) now auto-inherit via `wv init-repo` / scaffolding sync instead
+  of being copy-paste-only templates:
+  - `scripts/test-impacted.sh` — a fast, impact-scoped pre-commit test runner is seeded if-absent
+    (executable). It runs the test command on ONLY the staged sources' mirror test dirs (nearest
+    existing ancestor), falling back to the full suite when nothing resolves. Edit the CONFIG block
+    (`SRC_PREFIX`/`TEST_ROOT`/`RUNNER`/`RUN_ENV`) per repo and route sources to it in
+    `.weave/test-map.conf` (`src/ = scripts/test-impacted.sh`). Never overwritten on `--update`
+    since it carries per-repo edits. Test-bed evidence: cut a localized change from 6.2s/1385 tests
+    to ~1.1s.
+  - `.weave/ci-weave-paths-ignore.snippet.yml` — a reference snippet (refreshed on `--update`)
+    recommending a `paths-ignore: ['.weave/**']` workflow rule over the brittle `[skip ci]` commit
+    token, which GitHub matches anywhere in the message (a real commit merely mentioning it
+    self-skips).
+  - Both templates ship to `~/.config/weave/` on install and are documented in `WORKFLOW.md` (new
+    "Pre-commit Test Gate & CI Hygiene" section) and `CLAUDE.md.template`.
+
 ## [1.60.0] - 2026-06-15
 
 ### Added

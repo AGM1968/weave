@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# test-impacted.sh — fast, impact-scoped test runner for the Weave pre-commit gate.
+#
+# TEMPLATE: copy to <repo>/scripts/test-impacted.sh, edit the CONFIG block, and map
+# sources to it in .weave/test-map.conf (glob/prefix supported since wv 1.60.0):
+#     [map]
+#     src/ = scripts/test-impacted.sh
+#
+# It inspects the STAGED source files and runs the test command on ONLY their
+# mirror test directories under TEST_ROOT (climbing to the nearest existing
+# ancestor), instead of the whole suite. A localized change runs in a fraction of
+# the time; it falls back to the full suite when nothing resolves or when invoked
+# with no staged sources. The test tree must mirror the source tree by DIRECTORY
+# (filenames need not match — e.g. sampling/transect.py -> test_transect_sampler.py).
+#
+# Origin: earth-engine-analysis test-bed (wv-f67f6f) — full unit suite 6.2s/1385
+# tests -> ~1.1s for a single-directory change. Orthogonal to the test-map
+# glob/prefix support (wv-d74631, mapping terseness) and impact suite selection
+# (wv-7dd6a5): this scopes the runner WITHIN a selected suite.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+# ---- CONFIG (edit per repo) ------------------------------------------------
+SRC_PREFIX="src/"                  # staged paths under here are impact-scoped
+SRC_REGEX='^src/.*\.py$'           # which staged files count as sources
+TEST_ROOT="tests/unit"             # root of the mirror test tree
+ACTIVATE="venv/bin/activate"       # sourced if it exists (virtualenv); else skipped
+RUN_ENV=()                         # extra env, e.g. RUN_ENV=(DATABASE_URL="postgresql://...")
+RUNNER=(python -m pytest)          # base test command
+RUNNER_ARGS=(-q --tb=short -m "not integration and not slow")
+# ---------------------------------------------------------------------------
+
+[ -n "$ACTIVATE" ] && [ -f "$ACTIVATE" ] && . "$ACTIVATE"
+
+run_full() {
+    echo "[impact] full suite (no localized target resolved)"
+    exec env "${RUN_ENV[@]}" "${RUNNER[@]}" "$TEST_ROOT" "${RUNNER_ARGS[@]}"
+}
+
+# Staged sources (added/modified). Re-derived here so the script stands alone.
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=AM 2>/dev/null \
+    | grep -E "$SRC_REGEX" || true)
+[ "${#staged[@]}" -eq 0 ] && run_full
+
+# Map each staged source to its mirror test dir, climbing to the nearest existing
+# ancestor. A resolve to TEST_ROOT itself means "run the full suite".
+declare -A targets
+for f in "${staged[@]}"; do
+    rel="${f#"$SRC_PREFIX"}"
+    d="$TEST_ROOT/$(dirname "$rel")"
+    while [ "$d" != "$TEST_ROOT" ] && [ "$d" != "$TEST_ROOT/." ] && [ ! -d "$d" ]; do
+        d="$(dirname "$d")"
+    done
+    case "$d" in "$TEST_ROOT" | "$TEST_ROOT/.") run_full ;; esac
+    targets["$d"]=1
+done
+
+sel=("${!targets[@]}")
+echo "[impact] targets: ${sel[*]}"
+exec env "${RUN_ENV[@]}" "${RUNNER[@]}" "${sel[@]}" "${RUNNER_ARGS[@]}"

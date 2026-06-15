@@ -1,0 +1,30 @@
+# Weave CI hygiene snippet — keep .weave/ state-sync commits from triggering CI.
+#
+# Weave's auto-checkpoint hooks emit `chore(weave): … [skip ci]` commits. Relying
+# on that commit-message token is brittle: GitHub scans the WHOLE message for
+# `[skip ci]`, so a *real* commit whose message merely MENTIONS the token is also
+# skipped (observed in the earth-engine-analysis test-bed, wv-c834af: a deploy
+# commit documenting the gotcha silently self-skipped, and a trailing weave commit
+# at a push HEAD suppressed the code commits under it).
+#
+# Prefer a WORKFLOW RULE keyed on changed files. `paths-ignore` skips a push/PR
+# only when EVERY changed file matches — so pure-.weave pushes skip, while a mixed
+# code+.weave push still runs. Add to each push/pull_request trigger of every
+# workflow that should not run for state-sync commits (deploy, test, lint, …):
+#
+#   on:
+#     push:
+#       branches: [main]
+#       paths-ignore:
+#         - '.weave/**'
+#     pull_request:
+#       branches: [main]
+#       paths-ignore:
+#         - '.weave/**'
+#
+# Notes:
+#   - paths-ignore does NOT affect `workflow_dispatch` or `release` (they always
+#     run) — manual deploys still work.
+#   - The weave hook may still add `[skip ci]`; with this rule it is redundant but
+#     harmless for .weave-only commits.
+#   - Do NOT put the literal skip token in a real commit's message — see above.

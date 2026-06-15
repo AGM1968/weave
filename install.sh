@@ -437,6 +437,9 @@ if [ -f "./scripts/wv" ]; then
     cp ./templates/TOPOLOGY-ENRICH.json.template "$CONFIG_DIR/TOPOLOGY-ENRICH.json.template" 2>/dev/null || true
     # Makefile template for wv-init-repo
     cp ./templates/Makefile.template "$CONFIG_DIR/Makefile.template" 2>/dev/null || true
+    # Fast impact-scoped test runner template + CI paths-ignore snippet for wv-init-repo
+    cp ./templates/test-impacted.sh.template "$CONFIG_DIR/test-impacted.sh.template" 2>/dev/null || true
+    cp ./templates/ci-weave-paths-ignore.snippet.yml "$CONFIG_DIR/ci-weave-paths-ignore.snippet.yml" 2>/dev/null || true
     cp ./templates/copilot-instructions.stub.md "$CONFIG_DIR/copilot-instructions.stub.md" 2>/dev/null || true
     # AGENTS.md template (generic, not project-specific)
     cp ./templates/AGENTS.md.template "$CONFIG_DIR/AGENTS.md.template" 2>/dev/null || true
@@ -572,6 +575,9 @@ else
     curl -sSL "$REPO/templates/TOPOLOGY-ENRICH.json.template" -o "$CONFIG_DIR/TOPOLOGY-ENRICH.json.template" 2>/dev/null || true
     # Makefile template for wv-init-repo
     curl -sSL "$REPO/templates/Makefile.template" -o "$CONFIG_DIR/Makefile.template" 2>/dev/null || true
+    # Fast impact-scoped test runner template + CI paths-ignore snippet for wv-init-repo
+    curl -sSL "$REPO/templates/test-impacted.sh.template" -o "$CONFIG_DIR/test-impacted.sh.template" 2>/dev/null || true
+    curl -sSL "$REPO/templates/ci-weave-paths-ignore.snippet.yml" -o "$CONFIG_DIR/ci-weave-paths-ignore.snippet.yml" 2>/dev/null || true
     curl -sSL "$REPO/templates/copilot-instructions.stub.md" -o "$CONFIG_DIR/copilot-instructions.stub.md" 2>/dev/null || true
     # AGENTS.md template (generic, not project-specific)
     curl -sSL "$REPO/templates/AGENTS.md.template" -o "$CONFIG_DIR/AGENTS.md.template" 2>/dev/null || true
@@ -1308,6 +1314,35 @@ SETTINGSEOF
             echo -e "  ${YELLOW}⊘${NC} Makefile (wv targets already present)"
         else
             echo -e "  ${YELLOW}⊘${NC} Makefile (exists, use --update to append wv targets)"
+        fi
+    fi
+
+    # ── scripts/test-impacted.sh (fast impact-scoped pre-commit test runner) ──
+    # Seeded if-absent only: the template ships an editable CONFIG block (SRC_PREFIX/
+    # TEST_ROOT/RUNNER/RUN_ENV) the consumer tunes per repo, so we never clobber an
+    # edited copy on --update. Map src/ -> it in .weave/test-map.conf to activate.
+    if [ -f "$CONFIG_DIR/test-impacted.sh.template" ]; then
+        if [ ! -f "$REPO_ROOT/scripts/test-impacted.sh" ]; then
+            mkdir -p "$REPO_ROOT/scripts"
+            cp "$CONFIG_DIR/test-impacted.sh.template" "$REPO_ROOT/scripts/test-impacted.sh"
+            chmod +x "$REPO_ROOT/scripts/test-impacted.sh"
+            echo -e "  ${GREEN}✓${NC} scripts/test-impacted.sh (edit CONFIG block, then map src/ in .weave/test-map.conf)"
+        else
+            echo -e "  ${YELLOW}⊘${NC} scripts/test-impacted.sh (exists — edited per repo, not overwritten)"
+        fi
+    fi
+
+    # ── .weave/ci-weave-paths-ignore.snippet.yml (CI hygiene reference snippet) ──
+    # Reference doc, not auto-applied: editing a consumer's workflows automatically
+    # is unsafe. Refreshed on --update so the guidance stays current.
+    if [ -f "$CONFIG_DIR/ci-weave-paths-ignore.snippet.yml" ]; then
+        mkdir -p "$REPO_ROOT/.weave"
+        _snip_dst="$REPO_ROOT/.weave/ci-weave-paths-ignore.snippet.yml"
+        if [ ! -f "$_snip_dst" ] || [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]; then
+            cp "$CONFIG_DIR/ci-weave-paths-ignore.snippet.yml" "$_snip_dst"
+            echo -e "  ${GREEN}✓${NC} .weave/ci-weave-paths-ignore.snippet.yml (add paths-ignore: ['.weave/**'] to your workflows)"
+        else
+            echo -e "  ${YELLOW}⊘${NC} .weave/ci-weave-paths-ignore.snippet.yml (already present)"
         fi
     fi
 

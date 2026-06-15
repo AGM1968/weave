@@ -25,4 +25,9 @@ git push                          # 7. mandatory
 **No edits without an active node.** If `wv status` shows 0 active, claim one first.
 Discovery before claiming may read, search, and report only.
 Focused CLI help: `wv help <command>` or `wv <command> --help`.
+
+Optional fast gate: edit the scaffolded `scripts/test-impacted.sh` CONFIG block and route sources
+to it in `.weave/test-map.conf` (`src/ = scripts/test-impacted.sh`) for impact-scoped pre-commit
+tests; apply `.weave/ci-weave-paths-ignore.snippet.yml` to skip CI on pure-`.weave/` pushes. See
+`~/.config/weave/WORKFLOW.md` § Pre-commit Test Gate.
 <!-- ── END WEAVE CLAUDE.MD ── -->
