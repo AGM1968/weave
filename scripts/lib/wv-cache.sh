@@ -50,7 +50,7 @@ _wv_run_cache_is_read_cmd() {
 
 _wv_run_cache_is_write_cmd() {
     case "${1:-}" in
-        add|done|batch-done|bulk-update|delete|work|update|touch|allowed-tools|quick|ship|ship-agent|\
+        add|remember|memory|done|batch-done|bulk-update|delete|work|update|touch|allowed-tools|quick|ship|ship-agent|\
         block|link|unlink|resolve|findings|\
         unarchive|batch|plan|enrich-topology|sync|load|compact|prune|clean-ghosts|import|reindex|\
         recover|session-summary|config|test-record)

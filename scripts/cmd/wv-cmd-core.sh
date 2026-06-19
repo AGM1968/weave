@@ -450,6 +450,1002 @@ print(json.dumps(items))
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Graph-native memory commands
+# ═══════════════════════════════════════════════════════════════════════════
+
+_memory_usage() {
+    cat >&2 <<'EOF'
+Usage:
+  wv remember <text> [--kind=project] [--scope=repo] [--source-agent=name] [--json]
+  wv memory recall [--agent=current|all|name] [--json]
+      # --agent is caller provenance only; recall is agent-agnostic and never filters.
+      # The resolved caller is echoed on stderr; stdout is the same memory set for every agent.
+  wv memory render [--agent=all|current|claude|claude-memory|copilot|codex|codex-memory|workflow] [--base-dir=DIR] [--path=PATH] [--json]
+  wv memory scan --source=claude|codex|copilot|all [--repo-root=DIR] [--json]
+  wv memory import --source=claude --path=DIR [--repo-root=DIR] [--json]
+  wv memory import --source=codex [--path=DB] [--repo-root=DIR] [--json]
+  wv memory crystallize [--dry-run|--apply-reviewed] [--repo-root=DIR] [--json]
+EOF
+}
+
+_memory_operating_agent() {
+    if [ -n "${WV_OPERATING_AGENT:-}" ]; then
+        echo "$WV_OPERATING_AGENT"
+    elif [ -n "${WV_AGENT_NAME:-}" ]; then
+        echo "$WV_AGENT_NAME"
+    elif [ -n "${CODEX_THREAD_ID:-}" ] || [ "${CODEX_CI:-}" = "1" ]; then
+        echo "codex"
+    elif [ "${COPILOT_AGENT:-}" = "1" ]; then
+        echo "copilot"
+    elif [ -n "${CLAUDE_PROJECT_DIR:-}" ] || [ -n "${CLAUDE_CODE_SSE_PORT:-}" ]; then
+        echo "claude"
+    elif command -v resolve_runtime_label >/dev/null 2>&1; then
+        resolve_runtime_label 2>/dev/null || echo "native"
+    else
+        echo "native"
+    fi
+}
+
+_memory_resolve_agent() {
+    local agent="${1:-current}"
+    if [ "$agent" = "current" ]; then
+        _memory_operating_agent
+    else
+        echo "$agent"
+    fi
+}
+
+_memory_recall_json() {
+    db_query_json_v2 "
+        SELECT id, text, status, metadata
+        FROM nodes
+        WHERE json_extract(metadata, '\$.type') = 'memory'
+          AND COALESCE(json_extract(metadata, '\$.mem_status'), 'active') = 'active'
+        ORDER BY created_at ASC, id ASC;
+    "
+}
+
+_memory_markdown_block() {
+    local entries="$1"
+    printf '%s\n' "$entries" | jq -r '
+        [
+            "<!-- ── BEGIN WEAVE:MEMORY ── managed by wv memory render, do not edit manually -->",
+            "## WEAVE:MEMORY",
+            "",
+            "Authority: weave graph. Capture records dynamic agent provenance, but recall is agent-agnostic. Lifecycle field: metadata.mem_status. Recall: `wv memory recall --agent=all --json`. Capture: `wv remember <text>`.",
+            "",
+            (if length == 0 then "_No active graph memory._" else (.[] | "- [`\(.id)`] \(.text) (verified: \(.metadata.verified_at // "unknown"))") end),
+            "<!-- ── END WEAVE:MEMORY ── -->"
+        ] | .[]
+    '
+}
+
+_memory_render_markdown_file() {
+    local entries="$1" path="$2"
+    local target_dir tmp block
+    target_dir=$(dirname "$path")
+    mkdir -p "$target_dir"
+    block=$(_memory_markdown_block "$entries") || return 1
+    tmp=$(mktemp "$target_dir/.weave-memory.XXXXXX")
+    if [ -f "$path" ]; then
+        python3 - "$path" "$tmp" "$block" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+tmp = pathlib.Path(sys.argv[2])
+block = sys.argv[3]
+start = "<!-- ── BEGIN WEAVE:MEMORY ──"
+end = "<!-- ── END WEAVE:MEMORY ── -->"
+text = path.read_text()
+if start in text and end in text:
+    prefix = text.split(start, 1)[0]
+    suffix = text.split(end, 1)[1]
+    tmp.write_text(prefix + block + suffix)
+else:
+    sep = "" if text.endswith("\n") else "\n"
+    tmp.write_text(text + sep + "\n" + block + "\n")
+PY
+    else
+        printf '%s\n' "$block" > "$tmp"
+    fi
+    mv "$tmp" "$path"
+}
+
+_memory_render_codex_json() {
+    local entries="$1" path="$2"
+    local target_dir tmp
+    target_dir=$(dirname "$path")
+    mkdir -p "$target_dir"
+    if [ ! -f "$path" ]; then
+        printf '%s\n' '{"schema":"weave.codex.v1"}' > "$path"
+    fi
+    tmp=$(mktemp "$target_dir/.weave-memory.XXXXXX")
+    if ! jq --argjson entries "$entries" '
+        . + {
+            memory: {
+                authority: "weave-graph",
+                lifecycle_field: "metadata.mem_status",
+                policy: "codex-local memory is evidence; weave graph is authority",
+                recall: {
+                    command: "./scripts/wv memory recall --agent=all --json",
+                    fallback: "$HOME/.local/bin/wv memory recall --agent=all --json"
+                },
+                capture: {
+                    command: "./scripts/wv remember --json",
+                    fallback: "$HOME/.local/bin/wv remember --json"
+                },
+                scan: {
+                    command: "./scripts/wv memory scan --source=codex --json",
+                    fallback: "$HOME/.local/bin/wv memory scan --source=codex --json"
+                },
+                import: {
+                    command: "./scripts/wv memory import --source=codex --json",
+                    fallback: "$HOME/.local/bin/wv memory import --source=codex --json"
+                },
+                crystallize: {
+                    command: "./scripts/wv memory crystallize --json",
+                    fallback: "$HOME/.local/bin/wv memory crystallize --json"
+                },
+                entries: $entries
+            }
+        }
+    ' "$path" > "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}Error: failed to render memory into $path${NC}" >&2
+        return 1
+    fi
+    mv "$tmp" "$path"
+}
+
+_memory_projection_path() {
+    local projection="$1" base_dir="$2"
+    case "$projection" in
+        claude) echo "$base_dir/CLAUDE.md" ;;
+        claude-memory) echo "$base_dir/.claude/MEMORY.md" ;;
+        codex) echo "$base_dir/.codex/weave.json" ;;
+        codex-memory) echo "$base_dir/.codex/MEMORY.md" ;;
+        copilot) echo "$base_dir/.github/copilot-instructions.md" ;;
+        workflow) echo "$base_dir/WORKFLOW.md" ;;
+        *) return 1 ;;
+    esac
+}
+
+_memory_render_projection() {
+    local projection="$1" entries="$2" path="$3"
+    case "$projection" in
+        codex) _memory_render_codex_json "$entries" "$path" ;;
+        claude|claude-memory|codex-memory|copilot|workflow) _memory_render_markdown_file "$entries" "$path" ;;
+        *)
+            echo -e "${RED}Error: unsupported memory projection '$projection'${NC}" >&2
+            return 1
+            ;;
+    esac
+}
+
+_memory_repo_slug() {
+    local repo_root="$1"
+    printf '%s' "$repo_root" | tr '/' '-'
+}
+
+_memory_file_hash() {
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+}
+
+_memory_scan_claude() {
+    local repo_root="$1"
+    local slug project_dir
+    slug=$(_memory_repo_slug "$repo_root")
+    project_dir="$HOME/.claude/projects/$slug"
+    if [ ! -d "$project_dir" ]; then
+        echo '[]'
+        return 0
+    fi
+    find "$project_dir" -type f \( -path "*/memory/*.md" -o -name "MEMORY.md" -o -name "*.jsonl" \) -print 2>/dev/null \
+        | sort \
+        | jq -Rn --arg repo_root "$repo_root" '
+            [inputs | {
+                source_agent: "claude",
+                source_kind: (if test("\\.md$") then "memory_file" else "session" end),
+                source_path: .,
+                repo_root: $repo_root
+            }]
+        '
+}
+
+_memory_scan_codex() {
+    local repo_root="$1"
+    local codex_dir="$HOME/.codex"
+    if [ ! -d "$codex_dir" ]; then
+        echo '[]'
+        return 0
+    fi
+    local observations='[]' repo_thread_ids='[]' db table cols rows row rollout memrows
+
+    # state_*.sqlite is the repo-scoped index: thread rows carry cwd and
+    # rollout_path. Only rows whose cwd matches this repo are evidence for this
+    # graph; unrelated Codex threads stay out of the observation stream.
+    while IFS= read -r db; do
+        [ -s "$db" ] || continue
+        while IFS= read -r table; do
+            [ -n "$table" ] || continue
+            cols=$(sqlite3 "$db" "PRAGMA table_info('$table');" 2>/dev/null | awk -F'|' '{print $2}' | tr '\n' ' ')
+            case " $cols " in
+                *" cwd "*)
+                    rows=$(sqlite3 -json "$db" "
+                        SELECT rowid, *
+                        FROM '$table'
+                        WHERE cwd = '$(sql_escape "$repo_root")';
+                    " 2>/dev/null || echo '[]')
+                    observations=$(jq -nc \
+                        --argjson obs "$observations" \
+                        --argjson rows "${rows:-[]}" \
+                        --arg source_path "$db" \
+                        --arg repo_root "$repo_root" \
+                        '$obs + ($rows | map({
+                            source_agent: "codex",
+                            source_kind: "thread_db",
+                            source_path: $source_path,
+                            source_session: ((.id // .thread_id // .conversation_id // .rowid // "") | tostring),
+                            title: (.title // null),
+                            memory_mode: (.memory_mode // null),
+                            rollout_path: (.rollout_path // null),
+                            repo_root: $repo_root
+                        }))')
+                    repo_thread_ids=$(jq -nc \
+                        --argjson ids "$repo_thread_ids" \
+                        --argjson rows "${rows:-[]}" \
+                        '($ids + ($rows | map((.id // .thread_id // .conversation_id // "") | tostring) | map(select(length > 0)))) | unique')
+                    while IFS= read -r row; do
+                        rollout=$(printf '%s' "$row" | jq -r '.rollout_path // empty')
+                        [ -n "$rollout" ] && [ -f "$rollout" ] || continue
+                        observations=$(jq -nc \
+                            --argjson obs "$observations" \
+                            --arg source_path "$rollout" \
+                            --arg repo_root "$repo_root" \
+                            '$obs + [{
+                                source_agent: "codex",
+                                source_kind: "rollout",
+                                source_path: $source_path,
+                                repo_root: $repo_root
+                            }]')
+                    done < <(printf '%s\n' "$rows" | jq -c '.[]?')
+                    ;;
+            esac
+        done < <(sqlite3 "$db" "SELECT name FROM sqlite_master WHERE type='table';" 2>/dev/null | sort)
+    done < <(find "$codex_dir" -maxdepth 1 -type f -name "state_*.sqlite" -print 2>/dev/null | sort)
+
+    # memories_*.sqlite stores Codex's own memory pipeline artifacts. Import only
+    # rows from stage1_outputs when present and keep them as evidence, not active
+    # graph memory.
+    while IFS= read -r db; do
+        [ -s "$db" ] || continue
+        if sqlite3 "$db" "SELECT name FROM sqlite_master WHERE type='table' AND name='stage1_outputs';" 2>/dev/null | grep -qx stage1_outputs; then
+            cols=$(sqlite3 "$db" "PRAGMA table_info('stage1_outputs');" 2>/dev/null | awk -F'|' '{print $2}' | tr '\n' ' ')
+            case " $cols " in
+                *" cwd "*)
+                    memrows=$(sqlite3 -json "$db" "
+                        SELECT rowid, *
+                        FROM stage1_outputs
+                        WHERE cwd = '$(sql_escape "$repo_root")';
+                    " 2>/dev/null || echo '[]')
+                    ;;
+                *" thread_id "*)
+                    memrows=$(sqlite3 -json "$db" "SELECT rowid, * FROM stage1_outputs;" 2>/dev/null \
+                        | jq -c --argjson ids "$repo_thread_ids" '[.[] | select((.thread_id // "" | tostring) as $t | $ids | index($t))]' 2>/dev/null || echo '[]')
+                    ;;
+                *)
+                    # No repo identity in this table shape. Skip rather than
+                    # importing cross-repo Codex memory as evidence for this graph.
+                    memrows='[]'
+                    ;;
+            esac
+            observations=$(jq -nc \
+                --argjson obs "$observations" \
+                --argjson rows "${memrows:-[]}" \
+                --arg source_path "$db" \
+                --arg repo_root "$repo_root" \
+                '$obs + ($rows | map({
+                    source_agent: "codex",
+                    source_kind: "memory_db",
+                    source_path: $source_path,
+                    source_session: ((.job_id // .thread_id // .rowid // "") | tostring),
+                    excerpt: ((.output // .text // .content // .summary // .memory // null) | if . == null then null else tostring end),
+                    repo_root: $repo_root
+                }))')
+        fi
+    done < <(find "$codex_dir" -maxdepth 1 -type f -name "memories_*.sqlite" -print 2>/dev/null | sort)
+
+    printf '%s\n' "$observations"
+}
+
+_memory_scan_copilot() {
+    local repo_root="$1"
+    local storage_dir="$HOME/.config/Code/User/workspaceStorage"
+    if [ ! -d "$storage_dir" ]; then
+        echo '[]'
+        return 0
+    fi
+    local observations='[]' wsdir wsjson files
+    while IFS= read -r wsjson; do
+        [ -f "$wsjson" ] || continue
+        if ! jq -r '.. | strings' "$wsjson" 2>/dev/null | sed 's#^file://##' | grep -Fxq "$repo_root"; then
+            continue
+        fi
+        wsdir=$(dirname "$wsjson")
+        observations=$(jq -nc \
+            --argjson obs "$observations" \
+            --arg source_path "$wsjson" \
+            --arg repo_root "$repo_root" \
+            '$obs + [{
+                source_agent: "copilot",
+                source_kind: "workspace",
+                source_path: $source_path,
+                repo_root: $repo_root
+            }]')
+        files=$(find "$wsdir" -type f \( -path "*/chatSessions/*.jsonl" -o -path "*/chatEditingSessions/*/state.json" \) -print 2>/dev/null | sort)
+        if [ -n "$files" ]; then
+            observations=$(printf '%s\n' "$files" | jq -Rn \
+                --argjson obs "$observations" \
+                --arg repo_root "$repo_root" \
+                '$obs + [inputs | {
+                    source_agent: "copilot",
+                    source_kind: (if test("chatSessions/.*\\.jsonl$") then "chat" else "editing_state" end),
+                    source_path: .,
+                    repo_root: $repo_root
+                }]')
+        fi
+    done < <(find "$storage_dir" -mindepth 2 -maxdepth 2 -type f -name "workspace.json" -print 2>/dev/null | sort)
+    printf '%s\n' "$observations"
+}
+
+_memory_scan_sources() {
+    local source="$1" repo_root="$2"
+    case "$source" in
+        claude) _memory_scan_claude "$repo_root" ;;
+        codex) _memory_scan_codex "$repo_root" ;;
+        copilot) _memory_scan_copilot "$repo_root" ;;
+        all)
+            jq -s 'add' \
+                <(_memory_scan_claude "$repo_root") \
+                <(_memory_scan_codex "$repo_root") \
+                <(_memory_scan_copilot "$repo_root")
+            ;;
+        *)
+            echo -e "${RED}Error: unsupported memory scan source '$source'${NC}" >&2
+            return 1
+            ;;
+    esac
+}
+
+_memory_import_claude_dir() {
+    local path="$1" repo_root="$2" format="$3"
+    if [ ! -d "$path" ]; then
+        echo -e "${RED}Error: Claude memory import path not found: $path${NC}" >&2
+        return 1
+    fi
+    db_ensure
+    db_migrate_fts5 2>/dev/null || true
+
+    local imported='[]' file text id hash metadata text_sql metadata_sql
+    while IFS= read -r file; do
+        [ -f "$file" ] || continue
+        text=$(sed '/^#/d; /^$/d' "$file" | head -20 | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')
+        [ -n "$text" ] || text=$(basename "$file")
+        id=$(generate_id)
+        hash=$(_memory_file_hash "$file")
+        metadata=$(jq -nc \
+            --arg repo_root "$repo_root" \
+            --arg source_path "$file" \
+            --arg source_hash "$hash" \
+            '{
+                type: "memory",
+                kind: "project",
+                scope: "repo",
+                mem_status: "candidate",
+                source_agent: "claude",
+                source_kind: "memory_file",
+                source_path: $source_path,
+                source_hash: $source_hash,
+                repo_root: $repo_root,
+                observed_at: (now | strftime("%Y-%m-%dT%H:%M:%SZ"))
+            }')
+        text_sql=$(sql_escape "$text")
+        metadata_sql=$(sql_escape "$metadata")
+        db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text_sql', 'done', '$metadata_sql');"
+        imported=$(printf '%s\n' "$imported" | jq --arg id "$id" --arg path "$file" '. + [{id: $id, source_path: $path}]')
+    done < <(find "$path" -maxdepth 1 -type f -name "*.md" -print 2>/dev/null | sort)
+
+    if [ "$format" = "json" ]; then
+        jq -n --argjson imported "$imported" '{imported: $imported, count: ($imported | length)}'
+    else
+        printf '%s\n' "$imported" | jq -r '.[] | "✓ Imported \(.source_path) -> \(.id)"'
+    fi
+    auto_sync 2>/dev/null || true
+}
+
+_memory_import_codex() {
+    local path="$1" repo_root="$2" format="$3"
+    db_ensure
+    db_migrate_fts5 2>/dev/null || true
+
+    local observations imported='[]'
+    observations=$(_memory_scan_codex "$repo_root") || return 1
+    if [ -n "$path" ]; then
+        observations=$(printf '%s\n' "$observations" | jq --arg path "$path" '[.[] | select(.source_path == $path)]')
+    fi
+
+    local obs text source_path source_session hash id metadata text_sql metadata_sql
+    while IFS= read -r obs; do
+        [ -n "$obs" ] || continue
+        text=$(printf '%s\n' "$obs" | jq -r '.excerpt // empty' | head -20 | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')
+        [ -n "$text" ] || continue
+        source_path=$(printf '%s\n' "$obs" | jq -r '.source_path // ""')
+        source_session=$(printf '%s\n' "$obs" | jq -r '.source_session // ""')
+        hash=$(printf '%s' "$repo_root|$source_path|$source_session|$text" | sha256sum | awk '{print $1}')
+        id=$(generate_id)
+        metadata=$(jq -nc \
+            --arg repo_root "$repo_root" \
+            --arg source_path "$source_path" \
+            --arg source_session "$source_session" \
+            --arg source_hash "$hash" \
+            '{
+                type: "memory",
+                kind: "project",
+                scope: "repo",
+                mem_status: "candidate",
+                source_agent: "codex",
+                source_kind: "memory_db",
+                source_path: $source_path,
+                source_session: $source_session,
+                source_hash: $source_hash,
+                repo_root: $repo_root,
+                observed_at: (now | strftime("%Y-%m-%dT%H:%M:%SZ"))
+            }')
+        text_sql=$(sql_escape "$text")
+        metadata_sql=$(sql_escape "$metadata")
+        db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text_sql', 'done', '$metadata_sql');"
+        imported=$(printf '%s\n' "$imported" | jq --arg id "$id" --arg path "$source_path" --arg session "$source_session" '. + [{id: $id, source_path: $path, source_session: $session}]')
+    done < <(printf '%s\n' "$observations" | jq -c '.[] | select(.source_agent == "codex" and .source_kind == "memory_db")')
+
+    if [ "$format" = "json" ]; then
+        jq -n --argjson imported "$imported" '{imported: $imported, count: ($imported | length)}'
+    else
+        printf '%s\n' "$imported" | jq -r '.[] | "✓ Imported \(.source_path) -> \(.id)"'
+    fi
+    auto_sync 2>/dev/null || true
+}
+
+# ── S4 crystallization ───────────────────────────────────────────────────────
+# Group candidate memory, deduplicate, verify references, mark stale/superseded/
+# contradicted, and promote reviewed candidates. Conservative + deterministic:
+# fuzzy (FTS) overlap is reported only; status changes come from deterministic
+# signals (exact source_hash, missing path/flag, explicit reviewed flag).
+
+_memory_candidates_json() {
+    db_query_json_v2 "
+        SELECT id, text, metadata
+        FROM nodes
+        WHERE json_extract(metadata, '\$.type') = 'memory'
+          AND json_extract(metadata, '\$.mem_status') = 'candidate'
+        ORDER BY created_at ASC, id ASC;
+    "
+}
+
+# Up to 3 FTS terms (>4 chars), sanitized for fts5 MATCH. Reuses the wv-done
+# learning-overlap extraction so dedup behaves consistently across surfaces.
+_memory_fts_terms() {
+    echo "$1" | tr -cs '[:alnum:]' ' ' \
+        | awk '{for(i=1;i<=NF;i++) if(length($i)>4){print $i;c++;if(c>=3)exit}}' \
+        | sed 's/[(){}*:^~"]//g' | tr '\n' ' '
+}
+
+# Sets _cr_dup_id, _cr_dup_kind, _cr_contradicts for one candidate.
+# Tier 1 (deterministic): exact source_hash collision with another memory node.
+# Tier 2 (fuzzy): FTS overlap vs learnings/findings/active memory; opposite
+# polarity flags a contradiction.
+_memory_crystallize_dedup_one() {
+    local id="$1" text="$2" hash="$3"
+    _cr_dup_id=""; _cr_dup_kind=""; _cr_contradicts=""
+    if [ -n "$hash" ] && [ "$hash" != "null" ]; then
+        # Only an EARLIER-INSERTED same-hash node supersedes this one (rowid is
+        # monotonic with insertion; created_at ties at second granularity and id
+        # is random) so identical re-imports collapse onto the first, never mutually.
+        local hmatch
+        hmatch=$(db_query "
+            SELECT n2.id FROM nodes n2, nodes self
+            WHERE self.id = '$id' AND n2.id != self.id
+              AND json_extract(n2.metadata,'\$.type')='memory'
+              AND json_extract(n2.metadata,'\$.source_hash')='$hash'
+              AND n2.rowid < self.rowid
+            LIMIT 1;" 2>/dev/null || true)
+        if [ -n "$hmatch" ]; then
+            _cr_dup_id="$hmatch"; _cr_dup_kind="source_hash"
+            return 0
+        fi
+    fi
+    local terms
+    terms=$(_memory_fts_terms "$text")
+    if [ -z "$terms" ]; then
+        return 0
+    fi
+    local fmatch
+    fmatch=$(db_query "
+        SELECT f.id FROM nodes_fts f
+        JOIN nodes n ON n.id = f.id
+        WHERE nodes_fts MATCH '$terms'
+          AND f.id != '$id'
+          AND ( json_extract(n.metadata,'\$.learning') IS NOT NULL
+                OR json_extract(n.metadata,'\$.type')='finding'
+                OR ( json_extract(n.metadata,'\$.type')='memory'
+                     AND COALESCE(json_extract(n.metadata,'\$.mem_status'),'active')='active' ) )
+        LIMIT 1;" 2>/dev/null || true)
+    if [ -n "$fmatch" ]; then
+        _cr_dup_id="$fmatch"; _cr_dup_kind="fts_overlap"
+        local other npol opol
+        # The opposing claim lives in metadata.learning (learnings/findings) or in
+        # the node text column (remember/import memory). Prefer learning, fall back.
+        other=$(db_query_json "SELECT text, metadata FROM nodes WHERE id='$fmatch';" 2>/dev/null \
+            | jq -r '.[0] | (try (.metadata | fromjson | .learning) catch null) as $l
+                     | (if $l and ($l | length) > 0 then $l else (.text // "") end)' 2>/dev/null || echo "")
+        npol=$(_done_polarity "$text")
+        opol=$(_done_polarity "$other")
+        if [ "$npol" != "0" ] && [ "$opol" != "0" ] && [ "$npol" != "$opol" ]; then
+            _cr_contradicts="$fmatch"
+        fi
+    fi
+    return 0
+}
+
+# Sets _cr_stale_reason for one candidate (mark-only, never deletes). Verifies
+# file-path tokens exist under the repo and that referenced --flags appear in the
+# live command surface. Static lookup only — no command execution.
+#
+# Conservative path detection: a token only counts as a repo-path reference if it
+# has BOTH a path separator AND a known source extension. This skips prose slash-
+# phrases ("offset/limit", "commit/sync/push", "read/write") and bare basename
+# mentions ("wv-config.sh") that real memory text is full of. Existence is checked
+# repo-wide by basename so a moved/relocated file is not falsely marked stale —
+# only flag when confident it is a path AND confident it is absent.
+_memory_crystallize_verify_one() {
+    local text="$1" repo_root="$2"
+    _cr_stale_reason=""
+    local tok base
+    for tok in $(echo "$text" | grep -oE '[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]*\.(sh|md|py|json|sql|ya?ml|toml|cfg|txt|db)' 2>/dev/null || true); do
+        tok="${tok%[.,;:]}"
+        base="${tok##*/}"
+        [ -n "$base" ] || continue
+        if [ ! -e "$repo_root/$tok" ] && [ ! -e "$tok" ] \
+           && [ -z "$(find "$repo_root" -name "$base" -not -path '*/.git/*' -print -quit 2>/dev/null)" ]; then
+            _cr_stale_reason="missing path: $tok"
+            return 0
+        fi
+    done
+    local flag
+    for flag in $(echo "$text" | grep -oE '\-\-[a-z][a-z-]+' || true); do
+        if ! grep -rqF -- "$flag" "$repo_root/scripts" 2>/dev/null; then
+            _cr_stale_reason="unknown flag: $flag"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Write a metadata patch onto a node (merges keys, re-escapes once).
+_memory_patch_metadata() {
+    local id="$1" patch="$2" merged msql
+    merged=$(db_query_json "SELECT metadata FROM nodes WHERE id='$id';" 2>/dev/null \
+        | jq -c --argjson patch "$patch" '(.[0].metadata // "{}" | fromjson) * $patch')
+    msql=$(sql_escape "$merged")
+    db_query "UPDATE nodes SET metadata='$msql', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+}
+
+# Record a semantic edge between two memory/finding nodes (registered types only).
+_memory_crystallize_edge() {
+    local source="$1" target="$2" type="$3"
+    db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at)
+        VALUES ('$source', '$target', '$type', 1.0, 'wv memory crystallize', CURRENT_TIMESTAMP);" 2>/dev/null || true
+}
+
+# Create a finding node for an unresolved contradiction between a candidate and
+# an existing memory/learning/finding.
+_memory_crystallize_finding() {
+    local cand="$1" other="$2" id metadata text_sql metadata_sql
+    id=$(generate_id)
+    metadata=$(jq -nc --arg cand "$cand" --arg other "$other" \
+        '{
+            type: "finding",
+            finding: {
+                violation_type: "memory_contradiction",
+                root_cause: ("candidate memory " + $cand + " contradicts " + $other),
+                proposed_fix: "review both claims; supersede or correct the stale one before promotion",
+                confidence: "low",
+                fixable: false
+            }
+        }')
+    text_sql=$(sql_escape "Finding: candidate memory $cand contradicts $other (opposite polarity)")
+    metadata_sql=$(sql_escape "$metadata")
+    db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text_sql', 'todo', '$metadata_sql');"
+    _memory_crystallize_edge "$cand" "$other" "contradicts"
+    echo "$id"
+}
+
+cmd_remember() {
+    local text=""
+    local kind="project"
+    local scope="repo"
+    local source_agent=""
+    local format="text"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --kind=*) kind="${1#*=}" ;;
+            --scope=*) scope="${1#*=}" ;;
+            --source-agent=*) source_agent="${1#*=}" ;;
+            --json) format="json" ;;
+            --help|-h)
+                _memory_usage
+                return 0
+                ;;
+            --*)
+                echo -e "${RED}Error: unknown option $1${NC}" >&2
+                _memory_usage
+                return 1
+                ;;
+            *)
+                if [ -z "$text" ]; then
+                    text="$1"
+                else
+                    text="$text $1"
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$text" ]; then
+        echo -e "${RED}Error: memory text required${NC}" >&2
+        _memory_usage
+        return 1
+    fi
+
+    if [ -z "$source_agent" ]; then
+        source_agent=$(_memory_operating_agent)
+    fi
+
+    db_ensure
+    db_migrate_fts5 2>/dev/null || true
+
+    local id metadata text_sql metadata_sql
+    id=$(generate_id)
+    metadata=$(jq -nc \
+        --arg kind "$kind" \
+        --arg scope "$scope" \
+        --arg source_agent "$source_agent" \
+        '{
+            type: "memory",
+            kind: $kind,
+            scope: $scope,
+            mem_status: "active",
+            source_agent: $source_agent,
+            source_kind: "remember",
+            verified_at: (now | strftime("%Y-%m-%dT%H:%M:%SZ"))
+        }')
+    text_sql=$(sql_escape "$text")
+    metadata_sql=$(sql_escape "$metadata")
+
+    db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text_sql', 'done', '$metadata_sql');"
+
+    if [ "$format" = "json" ]; then
+        db_query_json_v2 "SELECT id, text, status, metadata FROM nodes WHERE id='$id';" | jq '.[0]'
+    else
+        echo -e "${GREEN}✓${NC} Remembered $id"
+    fi
+
+    auto_sync 2>/dev/null || true
+}
+
+cmd_memory() {
+    local subcmd="${1:-}"
+    shift || true
+
+    case "$subcmd" in
+        recall)
+            local format="text"
+            local agent="current"
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --agent=*) agent="${1#*=}" ;;
+                    --json) format="json" ;;
+                    --help|-h)
+                        _memory_usage
+                        return 0
+                        ;;
+                    *)
+                        echo -e "${RED}Error: unknown option $1${NC}" >&2
+                        _memory_usage
+                        return 1
+                        ;;
+                esac
+                shift
+            done
+            agent=$(_memory_resolve_agent "$agent")
+            local memories
+            memories=$(_memory_recall_json)
+            # --agent is caller/provenance context, never a filter: recall is
+            # agent-agnostic and returns the same active graph memory set for
+            # every agent value. Report the resolved caller on stderr so the flag
+            # is observable, without changing the machine-readable stdout contract
+            # (the rendered .codex/weave.json recall command and the recall tests
+            # parse the bare JSON array). See wv-55ba1d (F2).
+            printf 'recall caller=%s (agent-agnostic; --agent never filters)\n' "$agent" >&2
+            if [ "$format" = "json" ]; then
+                printf '%s\n' "$memories"
+            else
+                printf '%s\n' "$memories" | jq -r '.[] | "\(.id): \(.text)"'
+            fi
+            ;;
+        render)
+            local agent="all"
+            local path=""
+            local path_supplied=false
+            local base_dir="."
+            local format="text"
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --agent=*) agent="${1#*=}" ;;
+                    --base-dir=*) base_dir="${1#*=}" ;;
+                    --path=*) path="${1#*=}"; path_supplied=true ;;
+                    --json) format="json" ;;
+                    --help|-h)
+                        _memory_usage
+                        return 0
+                        ;;
+                    *)
+                        echo -e "${RED}Error: unknown option $1${NC}" >&2
+                        _memory_usage
+                        return 1
+                        ;;
+                esac
+                shift
+            done
+            local raw_agent="$agent"
+            agent=$(_memory_resolve_agent "$agent")
+
+            local projections=()
+            case "$agent" in
+                all|native|container) projections=(claude claude-memory codex codex-memory copilot) ;;
+                claude) projections=(claude) ;;
+                claude-memory) projections=(claude-memory) ;;
+                codex) projections=(codex) ;;
+                codex-memory) projections=(codex-memory) ;;
+                copilot) projections=(copilot) ;;
+                workflow) projections=(workflow) ;;
+                *)
+                    # When --agent=current resolves to a label with no dedicated
+                    # projection (custom WV_OPERATING_AGENT/WV_AGENT_NAME, a subagent
+                    # name, or a future harness), render the full agnostic set rather
+                    # than failing — recall already tolerates unknown agents, so render
+                    # must not be stricter. An explicit unknown --agent=<name> is still
+                    # a hard error (typo guard). See wv-872543 (F3).
+                    if [ "$raw_agent" = "current" ]; then
+                        projections=(claude claude-memory codex codex-memory copilot)
+                    else
+                        echo -e "${RED}Error: unsupported memory projection '$agent'${NC}" >&2
+                        echo "Supported projections: all, current, claude, claude-memory, copilot, codex, codex-memory, workflow" >&2
+                        return 1
+                    fi
+                    ;;
+            esac
+            if [ "$path_supplied" = true ] && [ "${#projections[@]}" -ne 1 ]; then
+                echo -e "${RED}Error: --path can only be used with a single projection${NC}" >&2
+                return 1
+            fi
+
+            local entries rendered_paths='[]' projection target_path
+            entries=$(_memory_recall_json)
+            for projection in "${projections[@]}"; do
+                if [ "$path_supplied" = true ]; then
+                    target_path="$path"
+                else
+                    target_path=$(_memory_projection_path "$projection" "$base_dir") || return 1
+                fi
+                _memory_render_projection "$projection" "$entries" "$target_path" || return 1
+                rendered_paths=$(printf '%s\n' "$rendered_paths" | jq --arg projection "$projection" --arg path "$target_path" '. + [{projection: $projection, path: $path}]')
+            done
+
+            if [ "$format" = "json" ]; then
+                jq -n --arg agent "$agent" --argjson paths "$rendered_paths" --argjson entries "$entries" \
+                    '{projection: $agent, paths: $paths, path: ($paths[0].path // null), entries: ($entries | length)}'
+            else
+                printf '%s\n' "$rendered_paths" | jq -r '.[] | "✓ Rendered graph memory to \(.path)"'
+            fi
+            ;;
+        scan)
+            local source="all"
+            local repo_root
+            repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+            local format="text"
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --source=*) source="${1#*=}" ;;
+                    --repo-root=*) repo_root="${1#*=}" ;;
+                    --json) format="json" ;;
+                    --help|-h)
+                        _memory_usage
+                        return 0
+                        ;;
+                    *)
+                        echo -e "${RED}Error: unknown option $1${NC}" >&2
+                        _memory_usage
+                        return 1
+                        ;;
+                esac
+                shift
+            done
+            local observations
+            observations=$(_memory_scan_sources "$source" "$repo_root") || return 1
+            if [ "$format" = "json" ]; then
+                printf '%s\n' "$observations"
+            else
+                printf '%s\n' "$observations" | jq -r '.[] | "\(.source_agent): \(.source_path)"'
+            fi
+            ;;
+        import)
+            local source="" path="" repo_root
+            repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+            local format="text"
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --source=*) source="${1#*=}" ;;
+                    --path=*) path="${1#*=}" ;;
+                    --repo-root=*) repo_root="${1#*=}" ;;
+                    --json) format="json" ;;
+                    --help|-h)
+                        _memory_usage
+                        return 0
+                        ;;
+                    *)
+                        echo -e "${RED}Error: unknown option $1${NC}" >&2
+                        _memory_usage
+                        return 1
+                        ;;
+                esac
+                shift
+            done
+            case "$source" in
+                claude)
+                    if [ -z "$path" ]; then
+                        echo -e "${RED}Error: --path required for Claude memory import${NC}" >&2
+                        return 1
+                    fi
+                    _memory_import_claude_dir "$path" "$repo_root" "$format"
+                    ;;
+                codex)
+                    _memory_import_codex "$path" "$repo_root" "$format"
+                    ;;
+                *)
+                    echo -e "${RED}Error: memory import supports --source=claude|codex${NC}" >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        crystallize)
+            local mode="dry-run"
+            local format="text"
+            local repo_root
+            repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --dry-run) mode="dry-run" ;;
+                    --apply-reviewed) mode="apply-reviewed" ;;
+                    --repo-root=*) repo_root="${1#*=}" ;;
+                    --json) format="json" ;;
+                    --help|-h)
+                        _memory_usage
+                        return 0
+                        ;;
+                    *)
+                        echo -e "${RED}Error: unknown option $1${NC}" >&2
+                        _memory_usage
+                        return 1
+                        ;;
+                esac
+                shift
+            done
+            db_ensure
+            db_migrate_fts5 2>/dev/null || true
+
+            local candidates report='[]'
+            local cid ctext chash creviewed action now
+            candidates=$(_memory_candidates_json)
+            now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+            # Read candidate rows into an array first so the db_query/sqlite3 calls
+            # inside the loop body cannot consume the feeding fd (1-iteration bug).
+            local cand_rows=() line
+            mapfile -t cand_rows < <(printf '%s' "$candidates" | jq -r '.[] | [.id, (.text // "" | gsub("\t";" ")), (.metadata.source_hash // ""), ((.metadata.reviewed // false) | tostring)] | @tsv')
+            for line in "${cand_rows[@]}"; do
+                IFS=$'\t' read -r cid ctext chash creviewed <<<"$line"
+                [ -n "$cid" ] || continue
+                _memory_crystallize_dedup_one "$cid" "$ctext" "$chash"
+                _memory_crystallize_verify_one "$ctext" "$repo_root"
+
+                # Deterministic signals win; fuzzy overlap is advisory only.
+                action="keep"
+                if [ -n "$_cr_stale_reason" ]; then
+                    action="stale"
+                elif [ "$_cr_dup_kind" = "source_hash" ]; then
+                    action="superseded"
+                elif [ -n "$_cr_contradicts" ]; then
+                    action="contradicts"
+                elif [ "$creviewed" = "true" ]; then
+                    action="promote"
+                elif [ -n "$_cr_dup_id" ]; then
+                    action="overlap"
+                fi
+
+                local finding_id=""
+                if [ "$mode" = "apply-reviewed" ]; then
+                    case "$action" in
+                        stale)
+                            _memory_patch_metadata "$cid" "$(jq -nc --arg r "$_cr_stale_reason" '{mem_status:"stale", stale_reason:$r}')"
+                            ;;
+                        superseded)
+                            _memory_patch_metadata "$cid" "$(jq -nc --arg s "$_cr_dup_id" '{mem_status:"superseded", superseded_by:$s}')"
+                            _memory_crystallize_edge "$_cr_dup_id" "$cid" "supersedes"
+                            ;;
+                        contradicts)
+                            finding_id=$(_memory_crystallize_finding "$cid" "$_cr_contradicts")
+                            ;;
+                        promote)
+                            _memory_patch_metadata "$cid" "$(jq -nc --arg t "$now" '{mem_status:"active", verified_at:$t}')"
+                            ;;
+                    esac
+                fi
+
+                report=$(jq -nc --argjson r "$report" \
+                    --arg id "$cid" --arg action "$action" \
+                    --arg dup "$_cr_dup_id" --arg dupk "$_cr_dup_kind" \
+                    --arg contra "$_cr_contradicts" --arg stale "$_cr_stale_reason" \
+                    --arg reviewed "$creviewed" --arg finding "$finding_id" \
+                    '$r + [{
+                        id: $id,
+                        action: $action,
+                        reviewed: ($reviewed == "true"),
+                        duplicate_of: (if $dup == "" then null else $dup end),
+                        dup_kind: (if $dupk == "" then null else $dupk end),
+                        contradicts: (if $contra == "" then null else $contra end),
+                        stale_reason: (if $stale == "" then null else $stale end),
+                        finding: (if $finding == "" then null else $finding end)
+                    } | with_entries(select(.value != null))]')
+            done
+
+            if [ "$mode" = "apply-reviewed" ]; then
+                auto_sync 2>/dev/null || true
+            fi
+
+            if [ "$format" = "json" ]; then
+                jq -n --arg mode "$mode" --argjson report "$report" \
+                    '{mode: $mode, candidates: ($report | length), results: $report}'
+            else
+                printf '%s\n' "$report" | jq -r '.[] | "\(.action)\t\(.id)\(if .stale_reason then "  ("+.stale_reason+")" elif .duplicate_of then "  (->"+.duplicate_of+")" else "" end)"'
+                printf '%s candidate(s), mode=%s\n' "$(printf '%s' "$report" | jq 'length')" "$mode"
+            fi
+            ;;
+        --help|-h|"")
+            _memory_usage
+            [ -n "$subcmd" ] || return 1
+            ;;
+        *)
+            echo -e "${RED}Error: unknown memory subcommand $subcmd${NC}" >&2
+            _memory_usage
+            return 1
+            ;;
+    esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # _node_commit_shas — Find recent commits attributed to a node ID
 # _store_node_commits — Persist attributed commits onto node metadata
 # _aggregate_epic_commits — Collect child commits onto an epic node
@@ -1137,6 +2133,50 @@ _done_write_trail() {
     } >> "$breadcrumb_file" 2>/dev/null || true
 }
 
+# _done_report_policy_violation — diagnose and print the GraphPolicyViolation JSON
+# for a failed close UPDATE (the DB trigger RAISE), or echo the raw error for a
+# non-policy failure. Distinguishes the three trigger clauses: mccabe_max,
+# trend_deteriorating, and test_gate. Extracted from cmd_done to keep that
+# function under the bash mccabe gate (debt: wv-89ca7c). Args: $1=id $2=error.
+_done_report_policy_violation() {
+    local id="$1" _done_err="$2"
+    if ! echo "$_done_err" | grep -q "GraphPolicyViolation"; then
+        echo "$_done_err" >&2
+        return 0
+    fi
+    local v_path v_actual v_limit v_threshold v_direction
+    local _lang_coalesce="COALESCE((SELECT value FROM policy_thresholds WHERE key='mccabe_max_'||fm.language),(SELECT value FROM policy_thresholds WHERE key='mccabe_max'))"
+    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fm.mccabe_max > $_lang_coalesce LIMIT 1;" 2>/dev/null || echo "")
+    if [ -n "$v_path" ]; then
+        v_actual=$(db_query "SELECT fm.mccabe_max FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fm.mccabe_max > $_lang_coalesce LIMIT 1;" 2>/dev/null || echo "0")
+        local v_lang
+        v_lang=$(db_query "SELECT fm.language FROM file_metrics fm WHERE fm.path='$(sql_escape "$v_path")';" 2>/dev/null || echo "")
+        local _threshold_key="mccabe_max"; [ -n "$v_lang" ] && _threshold_key="mccabe_max_${v_lang}"
+        v_limit=$(db_query "SELECT COALESCE((SELECT value FROM policy_thresholds WHERE key='${_threshold_key}'),(SELECT value FROM policy_thresholds WHERE key='mccabe_max'));" 2>/dev/null || echo "15")
+        v_threshold="$_threshold_key"
+        echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\"}" >&2
+        return 0
+    fi
+    # Not mccabe — distinguish trend (clause 2) from test (clause 3).
+    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' AND (SELECT value FROM policy_thresholds WHERE key='trend_deteriorating') >= 1 LIMIT 1;" 2>/dev/null || echo "")
+    if [ -n "$v_path" ]; then
+        v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='trend_deteriorating';" 2>/dev/null || echo "1")
+        v_actual=1
+        v_direction=$(db_query "SELECT ft.direction FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' LIMIT 1;" 2>/dev/null || echo "deteriorating")
+        v_threshold="trend_deteriorating"
+        echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\",\"direction\":\"$v_direction\"}" >&2
+        return 0
+    fi
+    # Test gate (clause 3): a red/stale file under test_gate>=block.
+    local v_state
+    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_test_status fts ON fts.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fts.state IN ('red','stale') LIMIT 1;" 2>/dev/null || echo "unknown")
+    v_state=$(db_query "SELECT fts.state FROM node_files nf JOIN file_test_status fts ON fts.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fts.state IN ('red','stale') LIMIT 1;" 2>/dev/null || echo "red")
+    v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='test_gate';" 2>/dev/null || echo "2")
+    v_actual=1
+    v_threshold="test_gate"
+    echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\",\"state\":\"$v_state\"}" >&2
+}
+
 cmd_done() {
     local id="${1:-}"
     local reason=""
@@ -1301,41 +2341,7 @@ cmd_done() {
         WHERE id='$id';" 2>&1)
     _done_rc=$?
     if [ "$_done_rc" -ne 0 ]; then
-        if echo "$_done_err" | grep -q "GraphPolicyViolation"; then
-            local v_path v_actual v_limit v_threshold v_direction
-            local _lang_coalesce="COALESCE((SELECT value FROM policy_thresholds WHERE key='mccabe_max_'||fm.language),(SELECT value FROM policy_thresholds WHERE key='mccabe_max'))"
-            v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fm.mccabe_max > $_lang_coalesce LIMIT 1;" 2>/dev/null || echo "")
-            if [ -n "$v_path" ]; then
-                v_actual=$(db_query "SELECT fm.mccabe_max FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fm.mccabe_max > $_lang_coalesce LIMIT 1;" 2>/dev/null || echo "0")
-                local v_lang
-                v_lang=$(db_query "SELECT fm.language FROM file_metrics fm WHERE fm.path='$(sql_escape "$v_path")';" 2>/dev/null || echo "")
-                local _threshold_key="mccabe_max"; [ -n "$v_lang" ] && _threshold_key="mccabe_max_${v_lang}"
-                v_limit=$(db_query "SELECT COALESCE((SELECT value FROM policy_thresholds WHERE key='${_threshold_key}'),(SELECT value FROM policy_thresholds WHERE key='mccabe_max'));" 2>/dev/null || echo "15")
-                v_threshold="$_threshold_key"
-                echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\"}" >&2
-            else
-                # Not mccabe — distinguish trend (clause 2) from test (clause 3).
-                v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' AND (SELECT value FROM policy_thresholds WHERE key='trend_deteriorating') >= 1 LIMIT 1;" 2>/dev/null || echo "")
-                if [ -n "$v_path" ]; then
-                    v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='trend_deteriorating';" 2>/dev/null || echo "1")
-                    v_actual=1
-                    v_direction=$(db_query "SELECT ft.direction FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' LIMIT 1;" 2>/dev/null || echo "deteriorating")
-                    v_threshold="trend_deteriorating"
-                    echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\",\"direction\":\"$v_direction\"}" >&2
-                else
-                    # Test gate (clause 3): a red/stale file under test_gate>=block.
-                    local v_state
-                    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_test_status fts ON fts.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fts.state IN ('red','stale') LIMIT 1;" 2>/dev/null || echo "unknown")
-                    v_state=$(db_query "SELECT fts.state FROM node_files nf JOIN file_test_status fts ON fts.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fts.state IN ('red','stale') LIMIT 1;" 2>/dev/null || echo "red")
-                    v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='test_gate';" 2>/dev/null || echo "2")
-                    v_actual=1
-                    v_threshold="test_gate"
-                    echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\",\"state\":\"$v_state\"}" >&2
-                fi
-            fi
-        else
-            echo "$_done_err" >&2
-        fi
+        _done_report_policy_violation "$id" "$_done_err"
         return 1
     fi
 
@@ -1964,17 +2970,14 @@ cmd_ready() {
         subtree_join="JOIN _subtree st ON n.id = st.id"
     fi
 
-    # Ready = todo status AND not blocked AND not a finding node (surfaced separately)
+    # Ready = todo status AND not a special non-work node (surfaced separately) AND
+    # not blocked by the UNIFIED signal (status/deferral/edge). wv_blocking_reason
+    # is the single source shared with cmd_context so a metadata-deferred node cannot
+    # look ready here while the runtime sees it blocked — or vice versa (wv-f752a5).
     local ready_where="
         n.status = 'todo'
-        AND json_extract(n.metadata, '$.type') IS NOT 'finding'
-        AND NOT EXISTS (
-            SELECT 1 FROM edges e
-            JOIN nodes blocker ON e.source = blocker.id
-            WHERE e.target = n.id
-            AND e.type = 'blocks'
-            AND blocker.status != 'done'
-        )
+        AND COALESCE(json_extract(n.metadata, '\$.type'), '') NOT IN ('finding', 'memory')
+        AND ($(wv_blocking_reason n)) IS NULL
     "
 
     # Default: hide nodes claimed by other agents; --all shows everything

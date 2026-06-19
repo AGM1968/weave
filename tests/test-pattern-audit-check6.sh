@@ -4,13 +4,18 @@ export WV_CALL_SOURCE=test
 # test-pattern-audit-check6.sh — Tests for pattern-audit Check 6
 #
 # Source: finding wv-f752a5 / wv-8bb0f4 (recurrence) — "not ready" intent
-# expressed as node metadata (deferred=true / blocked_on) while status='todo'
-# with no inbound blocks edge still surfaces in `wv ready`. Check 6 promotes
-# that recurring learning to an enforced gate.
+# expressed as node metadata (deferred / blocked_until / blocked_on) while
+# status='todo' with no inbound blocks edge. Check 6 promotes that recurring
+# learning to an enforced gate. Since wv-1f09a6 the read surfaces already exclude
+# such nodes (wv_blocking_reason); Check 6 enforces that status reflects the
+# deferral, using the SAME canonical wv_deferral_metadata_predicate as the reader
+# so checker and reader cannot drift on which keys mean "deferred".
 #
 # Covers:
 #   - FAIL: a todo node with metadata.deferred=true and no blocks edge
 #   - FAIL: a todo node with metadata.blocked_on set and no blocks edge
+#   - FAIL: a todo node with metadata.blocked_until in the future
+#   - PASS: a todo node with metadata.blocked_until in the past (expired)
 #   - PASS: same node re-encoded as status=blocked-external drops the divergence
 #   - PASS: a todo node whose deferral is backed by a real blocks edge
 #
@@ -130,7 +135,25 @@ test_doctor_node_state_advisory() {
     local out
     out=$("$WV" doctor 2>&1 || true)
     assert_contains "$out" "node-state" "doctor emits a node-state check"
-    assert_contains "$out" "remain ready" "doctor warns on deferred-but-ready node"
+    assert_contains "$out" "carry deferral metadata" "doctor warns on deferral-metadata-vs-status divergence"
+}
+
+test_blocked_until_future_fails() {
+    echo "-- todo + metadata.blocked_until in the future + no blocks edge → Check 6 FAIL"
+    local id out
+    id=$(_add_node "time-gated via blocked_until" '{"blocked_until":"2099-01-01"}')
+    out=$("$WV" pattern-audit 2>&1 || true)
+    assert_contains "$out" "Check 6 FAIL" "future blocked_until node flagged (canonical predicate covers it)"
+    assert_contains "$out" "$id" "the divergent node id is listed"
+}
+
+test_blocked_until_past_passes() {
+    echo "-- todo + metadata.blocked_until in the PAST → not a divergence → Check 6 PASS"
+    local out
+    _add_node "expired time-gate" '{"blocked_until":"2000-01-01"}' >/dev/null
+    out=$("$WV" pattern-audit 2>&1 || true)
+    assert_contains "$out" "Check 6 PASS" "an expired blocked_until is not active deferral"
+    assert_not_contains "$out" "Check 6 FAIL" "no FAIL for a past blocked_until"
 }
 
 test_hotzone_db_prints_resolved_path() {
@@ -155,6 +178,8 @@ main() {
 
     setup_test_env; test_deferred_metadata_fails
     setup_test_env; test_blocked_on_metadata_fails
+    setup_test_env; test_blocked_until_future_fails
+    setup_test_env; test_blocked_until_past_passes
     setup_test_env; test_blocked_external_status_passes
     setup_test_env; test_blocks_edge_passes
     setup_test_env; test_doctor_node_state_advisory

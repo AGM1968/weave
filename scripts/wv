@@ -147,6 +147,8 @@ _wv_dispatch() {
         # Core commands
         init)   cmd_init "$@" ;;
         add)    cmd_add "$@" ;;
+        remember) cmd_remember "$@" ;;
+        memory) cmd_memory "$@" ;;
         done)       _resolve_first_id cmd_done "$@" ;;
         batch-done) cmd_batch_done "$@" ;;
         bulk-update) cmd_bulk_update "$@" ;;

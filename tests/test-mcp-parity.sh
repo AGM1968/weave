@@ -80,6 +80,7 @@ weave_resolve --defer
 weave_resolve --merge
 weave_quality_hotspots --top
 weave_update --reopen
+weave_record_edit --files
 # --- inline-equiv (content passed inline over MCP) ---
 weave_done --learning-file
 weave_done --verification-evidence-file
@@ -92,6 +93,7 @@ weave_search --learning
 weave_search --mode
 weave_search --graph
 weave_search --filter
+weave_touch --files
 # --- format/tty ---
 weave_list --json-v
 weave_show --json-v

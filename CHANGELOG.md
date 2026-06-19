@@ -4,6 +4,54 @@
 
 ## Unreleased
 
+## [1.62.0] - 2026-06-19
+
+### Added
+
+- **Graph-native agent-memory substrate** — Weave now acts as the cross-harness durable-memory store
+  for AI coding agents, with the graph as the single source of truth. New `wv memory` surface:
+  - `wv memory` MVP — graph-native memory nodes (`metadata.type=memory`) with a `candidate` ->
+    `active` lifecycle; candidates are excluded from `recall`/`ready` until promoted.
+  - `wv memory scan` / `wv memory import` — detect and import harness-store memory as candidate
+    nodes. Sources are scoped per harness (Claude project memory, Codex `memories_*.sqlite`
+    `stage1_outputs`, Copilot), each carrying `source_agent` / `source_kind` provenance and a
+    deterministic `source_hash` keyed to `repo_root`. `wv memory import --source=codex` closes the
+    Codex scan-only gap by importing repo-scoped `stage1_outputs` rows as candidate memory.
+  - `wv memory crystallize` — promote graph candidates to active memory; operates graph-wide
+    (source-agnostic) and is conservative on prose to avoid promoting low-signal text.
+  - **Memory projections** — `wv memory render` projects active memory for a harness;
+    `--agent=current` falls back to the full generated set for unknown/custom labels rather than
+    rendering empty.
+  - **Repo-scoped Claude memory capture hook** — captures durable Claude project memory scoped to
+    the current repo.
+- **Weaver IPC boundary specification** — `docs/WEAVER-IPC-BOUNDARY.md` defines the runtime<->graph
+  contract (Layer B rule contract + runtime drift audit) between weave-runtime and the Weave graph.
+
+### Changed
+
+- **Unified authoritative blocking signal across read surfaces** — `wv` read surfaces now derive the
+  blocking/ready state from a single authoritative predicate, and `pattern-audit` Check 6 + `doctor`
+  are reconciled against it so CLI, hooks, and audit agree on node state.
+- **`recall --agent` is now observable** — the agent label is honored as a provenance/projection
+  signal instead of being silently inert; known agents, MCP/native callers, and unknown labels all
+  see the same active memory set.
+- **Doctor / pattern-audit memory-authority guards** — `doctor` and `pattern-audit` gained
+  memory-authority checks (Check 9) that flag when graph memory diverges from harness stores; the
+  dual-authority guard is generalized to Codex.
+
+### Fixed
+
+- **`install.sh` ast-grep download is now opt-in** — the installer no longer attempts an
+  opportunistic network/toolchain install of ast-grep. Default install detects an existing binary
+  only; pass `--with-ast-grep` (or `WITH_AST_GREP=1`) to allow the cargo/GitHub install, or
+  `--no-ast-grep` to suppress the optional messaging. Prevents surprising network activity in
+  public/sandbox installs.
+- **Memory and findings excluded from prune** — graph memory nodes and findings are kept out of
+  `wv prune` so durable memory and recorded findings are not garbage-collected.
+- **Codex/Copilot evidence scans are repo-scoped** — evidence scans no longer leak across repos.
+- **Impact seeds include done-file owners** — `wv impact` seeds now include file owners from
+  completed nodes, widening the blast-radius signal.
+
 ## [1.61.0] - 2026-06-15
 
 ### Added
@@ -38,6 +86,9 @@
 - **Output budget bounding** — `wv tree` is capped (node cap + truncation line) and
   `wv audit-pitfalls` defaults to `--only-unaddressed --top=20`, with the MCP `weave_tree`
   description updated to match. Bounds token-heavy command output that entered agent/MCP context.
+- **Pattern-audit Check 8** — raw `sqlite3` access to `quality.db` is now constrained to blessed
+  helper paths, preserving the quality producer/consumer boundary and preventing schema drift in
+  incidental probes.
 
 ### Fixed
 
@@ -85,6 +136,8 @@
   same pass: `weave_search.type`, `weave_code_search.filter`, `weave_impact.files` (seeds from file
   paths; `ids` no longer required when `files` given); `search --mode/--graph/--filter` reclassified
   as code-path flags already covered by `weave_code_search`. Parity baseline 43 -> 41.
+- **Pattern-audit Check 7** — non-predicate Bash functions ending in a bare `[ cond ] && cmd` tail
+  are now flagged, preventing implicit status leaks from becoming control-flow contracts.
 - **MCP tier-1 parity flags exposed** (wv-4a1de6): `weave_add` gains `criteria`/`risks` (claim-ready
   node creation per decomposition discipline), `weave_quick` gains `learning`, `weave_ship` gains
   `verification_method`/`verification_evidence`, and `weave_done` gains `verification_evidence` —

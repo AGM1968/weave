@@ -893,6 +893,14 @@ cmd_context() {
     node_json=$(db_query_json "SELECT id, text, status, json(metadata), created_at, updated_at FROM nodes WHERE id='$id';")
     node_json="${node_json:-[]}"
 
+    # Unified self-blocking signal: is THIS node not-ready by status, deferral, or a
+    # blocks edge? wv_blocking_reason is the single source shared with cmd_ready, so the
+    # runtime's require_clear_context sees the same determination the ready queue uses —
+    # closing the metadata-vs-edge dual representation (wv-f752a5).
+    local self_block_json
+    self_block_json=$(db_query_json "SELECT ($(wv_blocking_reason n)) AS blocked_reason FROM nodes n WHERE n.id='$id';")
+    self_block_json="${self_block_json:-[]}"
+
     # Get blockers (nodes that block this one, excluding completed ones)
     local blockers_json
     blockers_json=$(db_query_json "
@@ -908,7 +916,12 @@ cmd_context() {
         jq -n \
             --argjson node "$node_json" \
             --argjson blockers "$blockers_json" \
-            '{node: ($node[0] | {id, text, status}), blockers: ($blockers | map({id, text, status}))}'
+            --argjson self_block "$self_block_json" \
+            '($self_block[0].blocked_reason // null) as $br
+             | {node: ($node[0] | {id, text, status}),
+                blocked: ($br != null),
+                blocked_reason: $br,
+                blockers: ($blockers | map({id, text, status}))}'
         return 0
     fi
 
@@ -1043,8 +1056,12 @@ cmd_context() {
         --argjson contradictions "$contradictions_json" \
         --argjson quality "$quality_json" \
         --argjson discover_mode "$_discover_mode" \
-        '{
+        --argjson self_block "$self_block_json" \
+        '($self_block[0].blocked_reason // null) as $br |
+        {
             node: ($node[0] | {id, text, status}),
+            blocked: ($br != null),
+            blocked_reason: $br,
             blockers: ($blockers | map({id, text, status, context: (.context | fromjson? // .context)})),
             ancestors: (($ancestors | if $discover_mode then .[0:5] else . end) | map({
                 id,
@@ -1520,12 +1537,21 @@ _impact_suites_for_files() {
 #
 # For each path arg, queries canonical node_files rows first and legacy
 # touched_files metadata as fallback. Returns newline-separated node IDs
-# (deduped, active+todo+blocked only). Unknown paths produce no output —
-# empty result is not an error.
+# (deduped, active+todo+blocked by default; done too when include_done=true).
+# Unknown paths produce no output — empty result is not an error.
 # ═══════════════════════════════════════════════════════════════════════════
 
 _impact_nodes_for_files() {
     if [ $# -eq 0 ]; then return 0; fi
+
+    local include_done="${1:-false}"
+    shift || true
+    if [ $# -eq 0 ]; then return 0; fi
+
+    local status_filter="'todo','active','blocked'"
+    if [ "$include_done" = "true" ]; then
+        status_filter="'todo','active','blocked','done'"
+    fi
 
     local path_conditions=""
     local node_file_paths=""
@@ -1550,14 +1576,14 @@ _impact_nodes_for_files() {
             SELECT n.id AS node_id
             FROM nodes n
             JOIN node_files nf ON nf.node_id = n.id
-            WHERE n.status IN ('todo','active','blocked')
+            WHERE n.status IN (${status_filter})
               AND nf.path IN (${node_file_paths})
 
             UNION
 
             SELECT n.id AS node_id
             FROM nodes n
-            WHERE n.status IN ('todo','active','blocked')
+            WHERE n.status IN (${status_filter})
               AND json_extract(n.metadata, '$.touched_files') IS NOT NULL
               AND (${path_conditions})
         )
@@ -1615,7 +1641,7 @@ cmd_impact() {
     if [ "${#file_seeds[@]}" -gt 0 ]; then
         db_ensure
         local file_nodes
-        file_nodes=$(_impact_nodes_for_files "${file_seeds[@]}")
+        file_nodes=$(_impact_nodes_for_files "$include_done" "${file_seeds[@]}")
         while IFS= read -r nid; do
             [ -n "$nid" ] && seeds+=("$nid")
         done <<< "$file_nodes"

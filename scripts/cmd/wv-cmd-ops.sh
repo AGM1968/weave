@@ -1945,6 +1945,100 @@ _recover_session() {
 # Shared state for _doctor_record (avoids nested function dynamic scoping)
 _dr_pass=0 _dr_fail=0 _dr_warn=0 _dr_total=0 _dr_results="" _dr_format="text"
 
+# Count durable Codex memory-pipeline rows scoped to THIS repo. Codex's
+# memories_*.sqlite stage1_outputs is the durable-memory analog to Claude's
+# memory/*.md (thread/state/rollout DBs are session evidence, not durable
+# memory, and are deliberately excluded — same scope as the Claude *.md-only
+# check). Conservative: only count rows attributable via a cwd column; schemas
+# without repo identity are skipped rather than guessed at.
+_doctor_codex_memory_rows() {
+    local repo_root="$1"
+    local codex_dir="$HOME/.codex" db cols n total=0
+    [ -d "$codex_dir" ] || { echo 0; return 0; }
+    while IFS= read -r db; do
+        [ -s "$db" ] || continue
+        sqlite3 "$db" "SELECT name FROM sqlite_master WHERE type='table' AND name='stage1_outputs';" 2>/dev/null | grep -qx stage1_outputs || continue
+        cols=$(sqlite3 "$db" "PRAGMA table_info('stage1_outputs');" 2>/dev/null | awk -F'|' '{print $2}' | tr '\n' ' ')
+        case " $cols " in
+            *" cwd "*)
+                n=$(sqlite3 "$db" "SELECT COUNT(*) FROM stage1_outputs WHERE cwd='$(sql_escape "$repo_root")';" 2>/dev/null || echo 0)
+                ;;
+            *)
+                n=0
+                ;;
+        esac
+        [ -n "$n" ] && total=$((total + n))
+    done < <(find "$codex_dir" -maxdepth 1 -type f -name "memories_*.sqlite" -print 2>/dev/null | sort)
+    echo "$total"
+}
+
+_doctor_memory_authority() {
+    # Duplicate-authoritative-memory risk (PROPOSAL-wv-agent-memory-substrate S5,
+    # generalized in F1/wv-4c1efd): durable harness memory for THIS repo that is
+    # not represented in the graph is a dual-authority leak — the graph is the
+    # authority, harness files/DBs are evidence/projections. Report-only.
+    #
+    # Per-harness durable-memory analog (sessions are excluded as evidence):
+    #   Claude  : ~/.claude/projects/<slug>/memory/*.md  (content-hash match)
+    #   Codex   : ~/.codex/memories_*.sqlite stage1_outputs rows for this repo
+    #   Copilot : none — VS Code workspace storage is chat/session + index-cache
+    #             evidence (proposal §VS Code Copilot), not a durable memory store.
+    local root slug memdir
+    root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    [ -z "$root" ] && return 0
+    if [ ! -f "${WV_DB:-}" ]; then
+        _doctor_record "memory authority" "pass" "no graph db for this repo"
+        return 0
+    fi
+
+    local any_store=0
+    local warnings=()
+
+    # Claude: memory/*.md vs graph source_hash (precise per-file match).
+    slug=$(printf '%s' "$root" | tr '/' '-')
+    memdir="$HOME/.claude/projects/$slug/memory"
+    if [ -d "$memdir" ]; then
+        local c_total=0 c_unimported=0 f h hit
+        for f in "$memdir"/*.md; do
+            [ -f "$f" ] || continue
+            c_total=$((c_total + 1))
+            any_store=1
+            h=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+            [ -z "$h" ] && continue
+            hit=$(db_query "SELECT 1 FROM nodes WHERE json_extract(metadata,'\$.source_hash')='$h' LIMIT 1;" 2>/dev/null || true)
+            [ -z "$hit" ] && c_unimported=$((c_unimported + 1))
+        done
+        if [ "$c_unimported" -gt 0 ]; then
+            warnings+=("$c_unimported/$c_total Claude memory file(s) — import: wv memory import --source=claude --path=$memdir")
+        fi
+    fi
+
+    # Codex: durable memory-pipeline rows for this repo. A matching graph
+    # candidate imported from memory_db evidence represents the row set for this
+    # repo; otherwise report the import command that closes the authority gap.
+    local cdx_rows cdx_rep
+    cdx_rows=$(_doctor_codex_memory_rows "$root")
+    if [ "${cdx_rows:-0}" -gt 0 ]; then
+        any_store=1
+        cdx_rep=$(db_query "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata,'\$.source_agent')='codex' AND json_extract(metadata,'\$.source_kind')='memory_db' AND json_extract(metadata,'\$.repo_root')='$(sql_escape "$root")';" 2>/dev/null || echo 0)
+        [ -z "$cdx_rep" ] && cdx_rep=0
+        if [ "$cdx_rep" -lt "$cdx_rows" ]; then
+            warnings+=("$((cdx_rows - cdx_rep))/$cdx_rows Codex memory-pipeline row(s) — import: wv memory import --source=codex")
+        fi
+    fi
+
+    if [ "$any_store" -eq 0 ]; then
+        _doctor_record "memory authority" "pass" "no harness memory store for this repo"
+    elif [ "${#warnings[@]}" -gt 0 ]; then
+        local msg
+        msg=$(printf '%s; ' "${warnings[@]}")
+        msg="${msg%; }"
+        _doctor_record "memory authority" "warn" "dual authority risk: $msg"
+    else
+        _doctor_record "memory authority" "pass" "harness memory all represented in graph"
+    fi
+}
+
 _doctor_record() {
     local name="$1" status="$2" detail="$3"
     _dr_total=$((_dr_total + 1))
@@ -2893,7 +2987,7 @@ cmd_doctor() {
         ag_ver=$(ast-grep --version 2>/dev/null | awk '{print $NF}')
         _doctor_record "structural_scan" "pass" "enabled (ast-grep $ag_ver at $ag_path)"
     else
-        _doctor_record "structural_scan" "warn" "disabled (ast-grep not found — run ./install.sh)"
+        _doctor_record "structural_scan" "warn" "disabled (ast-grep not found — install manually or run ./install.sh --with-ast-grep)"
     fi
 
     # 7. Hot zone exists
@@ -3048,28 +3142,32 @@ cmd_doctor() {
         _doctor_record "journal" "pass" "clean (no incomplete operations)"
     fi
 
-    # 14a. Node-state advisory: deferred-but-ready divergence. Per-install mirror
-    # of pattern-audit Check 6 — a node declaring deferral in metadata
-    # (deferred/blocked_on) while still in the ready queue (todo + no non-done
-    # blocks edge). Advisory only. See docs/PROPOSAL-graph-as-policy-boundary.md.
+    # 14a. Node-state advisory: deferral-metadata-vs-status divergence. Per-install
+    # mirror of pattern-audit Check 6 — a node carrying active deferral metadata
+    # (deferred/blocked_until/blocked_on) while status='todo' with no non-done blocks
+    # edge, so status does not reflect the deferral. Uses the SAME canonical predicate
+    # (wv_deferral_metadata_predicate) as Check 6 and wv_blocking_reason. Advisory only.
+    # See docs/PROPOSAL-graph-as-policy-boundary.md.
     if [ -f "${WV_DB:-}" ]; then
         local _deferred_ready
         _deferred_ready=$(db_query "
             SELECT COUNT(*) FROM nodes n
             WHERE n.status='todo'
-              AND ( json_extract(n.metadata,'\$.deferred') IN (1,'true')
-                    OR ( json_extract(n.metadata,'\$.blocked_on') IS NOT NULL
-                         AND json_extract(n.metadata,'\$.blocked_on') != '' ) )
+              AND $(wv_deferral_metadata_predicate n)
               AND NOT EXISTS (
                   SELECT 1 FROM edges e JOIN nodes b ON e.source=b.id
                   WHERE e.target=n.id AND e.type='blocks' AND b.status!='done' );
         " 2>/dev/null || echo "0")
         if [ "${_deferred_ready:-0}" -gt 0 ] 2>/dev/null; then
-            _doctor_record "node-state" "warn" "$_deferred_ready node(s) declare deferral in metadata but remain ready — see 'wv pattern-audit' (Check 6); fix with status=blocked-external or a blocks edge"
+            _doctor_record "node-state" "warn" "$_deferred_ready node(s) carry deferral metadata while status='todo' — status must reflect it; see 'wv pattern-audit' (Check 6); fix with status=blocked-external or a blocks edge"
         else
-            _doctor_record "node-state" "pass" "no deferred-but-ready divergence"
+            _doctor_record "node-state" "pass" "no deferral-metadata-vs-status divergence"
         fi
     fi
+
+    # 14a-bis. Duplicate-authoritative-memory risk: durable Claude/Codex harness
+    # memory for this repo not represented in the graph (S5, generalized F1).
+    _doctor_memory_authority
 
     # 14b. Explicit git-state pending windows (.weave dirty / ahead of upstream)
     local git_pending_json git_sync_pending git_sync_state git_sync_action git_sync_reason git_sync_hint
@@ -4894,19 +4992,22 @@ cmd_pattern_audit() {
     fi
 
     # ── Check 6: node-state invariant — deferral must be graph state, not metadata ──
-    # A node declaring deferral in metadata (deferred=true or blocked_on set) while
-    # status='todo' with no inbound non-done blocks edge still surfaces in `wv ready`
-    # (cmd_ready reads status + type + blocks edges only — never these metadata
-    # fields). Promotes the recurring learning in findings wv-8bb0f4 / wv-f752a5 to
-    # an enforced gate. See docs/PROPOSAL-graph-as-policy-boundary.md.
+    # A node carrying active deferral metadata (wv_deferral_metadata_predicate:
+    # deferred=true / blocked_until future / blocked_on set) while status='todo' with no
+    # inbound non-done blocks edge is a state inconsistency: status must be the
+    # authoritative signal. Since wv-1f09a6 the read surfaces (cmd_ready/cmd_context via
+    # wv_blocking_reason) already treat such a node as blocked — but its status still
+    # claims 'todo', so status lies. This check enforces that status reflects the
+    # deferral, keeping the metadata form from being a second, unreconciled
+    # representation. Uses the SAME canonical predicate as wv_blocking_reason so the
+    # checker and the reader cannot drift. Promotes findings wv-8bb0f4 / wv-f752a5 to an
+    # enforced gate. See docs/PROPOSAL-graph-as-policy-boundary.md.
     local divergent_nodes=""
     if [ -f "$WV_DB" ]; then
         divergent_nodes=$(db_query "
             SELECT id FROM nodes n
             WHERE n.status='todo'
-              AND ( json_extract(n.metadata,'\$.deferred') IN (1,'true')
-                    OR ( json_extract(n.metadata,'\$.blocked_on') IS NOT NULL
-                         AND json_extract(n.metadata,'\$.blocked_on') != '' ) )
+              AND $(wv_deferral_metadata_predicate n)
               AND NOT EXISTS (
                   SELECT 1 FROM edges e JOIN nodes b ON e.source=b.id
                   WHERE e.target=n.id AND e.type='blocks' AND b.status!='done' );
@@ -4917,9 +5018,9 @@ cmd_pattern_audit() {
         divergent_list=$(echo "$divergent_nodes" | tr '\n' ' ' | sed 's/ *$//')
         dcount=$(echo "$divergent_nodes" | grep -c .)
         if [ "$format" = "text" ]; then
-            echo -e "${RED}✗ Check 6 FAIL: $dcount node(s) declare deferral in metadata but remain in the ready queue:${NC}"
+            echo -e "${RED}✗ Check 6 FAIL: $dcount node(s) carry deferral metadata while status='todo' (status must reflect the deferral):${NC}"
             echo "$divergent_nodes" | while read -r nid; do [ -n "$nid" ] && echo "    $nid"; done
-            echo -e "  Encode deferral as state: status=blocked-external (or add a blocks edge), not metadata.deferred/blocked_on alone."
+            echo -e "  Encode deferral as state: status=blocked-external (or add a blocks edge), not metadata.deferred/blocked_until/blocked_on alone."
         fi
         findings_json=$(echo "$findings_json" | jq \
             --arg detail "deferred-but-ready nodes: $divergent_list" --argjson n "$dcount" \
@@ -5039,6 +5140,67 @@ function allowed(fn) {
         [ "$format" = "text" ] && echo -e "${YELLOW}⚠ Check 8 WARN: $_pa8_scope not found — skipped${NC}"
         findings_json=$(echo "$findings_json" | jq \
             '. + [{"check":"quality_db_sqlite_owner","status":"warn","detail":"scripts dir not found - skipped","count":0}]')
+    fi
+
+    # ── Check 9: harness memory stores stay behind blessed helpers ──────────
+    # The agent-memory substrate (PROPOSAL-wv-agent-memory-substrate) makes the
+    # graph the single authority; per-harness stores are evidence/projections.
+    # Harness-store paths ($HOME/.claude/projects, VS Code workspaceStorage, the
+    # ~/.codex session/state/memory DBs) must only be read by the blessed
+    # scan/import/telemetry/doctor helpers. A new site in a recall/render/
+    # bootstrap path is a latent dual-authority leak — a harness file becoming
+    # authoritative memory. New readers must justify a blessed entry here.
+    local _pa9_scope="$_project_root/scripts"
+    if [ -d "$_pa9_scope" ]; then
+        local _pa9_awk='
+function allowed(fn) {
+    return fn == "_memory_scan_claude" ||
+           fn == "_memory_scan_codex" ||
+           fn == "_memory_scan_copilot" ||
+           fn == "_memory_import_claude_dir" ||
+           fn == "_health_cache_summary" ||
+           fn == "cmd_cache" ||
+           fn == "_doctor_memory_authority" ||
+           fn == "_doctor_codex_memory_rows"
+}
+/^(function[ \t]+)?[A-Za-z_][A-Za-z0-9_]*\(\)[ \t]*\{/ {
+    fname=$0; sub(/\(\).*/,"",fname); sub(/^function[ \t]+/,"",fname); next
+}
+{
+    if ($0 ~ /^[ \t]*#/) next
+    if (fname == "cmd_pattern_audit") next
+    if ($0 ~ /\.claude\/projects|workspaceStorage|\.codex\/(sessions|state_|memories_|history)/) {
+        if (allowed(fname)) next
+        printf "%s:%d:%s: %s\n", FILENAME, FNR, fname, $0
+    }
+}'
+        local _pa9_files harness_hits=""
+        _pa9_files=$(find "$_pa9_scope" -type f \( -name '*.sh' -o -name 'wv' \) \
+            -not -path '*/tests/*' -not -path '*/archive/*' 2>/dev/null)
+        if [ -n "$_pa9_files" ]; then
+            harness_hits=$(echo "$_pa9_files" | xargs -r awk "$_pa9_awk" 2>/dev/null || true)
+        fi
+        if [ -n "$harness_hits" ]; then
+            local harness_count
+            harness_count=$(echo "$harness_hits" | grep -c .) || harness_count=0
+            if [ "$format" = "text" ]; then
+                echo -e "${RED}✗ Check 9 FAIL: $harness_count harness-store access(es) outside blessed memory helpers:${NC}"
+                echo "$harness_hits" | while IFS= read -r hit; do [ -n "$hit" ] && echo "    $hit"; done
+                echo -e "  Move harness reads into the scan/import helpers, or add a justified entry to Check 9's allowed()."
+            fi
+            findings_json=$(echo "$findings_json" | jq \
+                --arg detail "$(echo "$harness_hits" | tr '\n' ' ' | sed 's/ *$//')" --argjson n "$harness_count" \
+                '. + [{"check":"memory_authority_owner","status":"fail","detail":$detail,"count":$n}]')
+            issues=$((issues + harness_count))
+        else
+            [ "$format" = "text" ] && echo -e "${GREEN}✓ Check 9 PASS: harness memory stores stay behind blessed helpers${NC}"
+            findings_json=$(echo "$findings_json" | jq \
+                '. + [{"check":"memory_authority_owner","status":"pass","detail":"harness-store access is owner-scoped","count":0}]')
+        fi
+    else
+        [ "$format" = "text" ] && echo -e "${YELLOW}⚠ Check 9 WARN: $_pa9_scope not found — skipped${NC}"
+        findings_json=$(echo "$findings_json" | jq \
+            '. + [{"check":"memory_authority_owner","status":"warn","detail":"scripts dir not found - skipped","count":0}]')
     fi
 
     # ── Summary ─────────────────────────────────────────────────────────────
@@ -5577,6 +5739,12 @@ cmd_help_topic() {
         add)
             print_command_help "wv add <text> [--status=STATUS] [--parent=<id>] [--gh] [--alias=<name>] [--metadata=<json>] [--force] [--standalone] [--criteria=<text>] [--risks=<level>]" "Create a node and print its id. Use --parent when an active epic exists, or --standalone for repo-level chores."
             ;;
+        remember)
+            print_command_help "wv remember <text> [--kind=project] [--scope=repo] [--source-agent=name] [--json]" "Capture a graph-native memory node using metadata.type=memory and metadata.mem_status=active."
+            ;;
+        memory)
+            print_command_help "wv memory recall [--agent=current|all|name] [--json] | wv memory render [--agent=all|current|claude|claude-memory|copilot|codex|codex-memory|workflow] [--base-dir=DIR] [--path=PATH] [--json] | wv memory scan --source=claude|codex|copilot|all [--repo-root=DIR] [--json] | wv memory import --source=claude --path=DIR [--repo-root=DIR] [--json] | wv memory import --source=codex [--path=DB] [--repo-root=DIR] [--json] | wv memory crystallize [--dry-run|--apply-reviewed] [--repo-root=DIR] [--json]" "Recall graph-native memory, render repo-local projections, scan harness state, import Claude project memories or Codex memory-pipeline rows as mem_status=candidate nodes, or crystallize candidates (dedup/verify/mark, promote reviewed). Capture records dynamic agent provenance; graph recall is agent-agnostic. --path is only valid for one render projection or a single Codex memory DB import."
+            ;;
         delete)
             print_command_help "wv delete <id> [--force] [--dry-run] [--no-gh]" "Delete a node and its edges. Use --dry-run to preview deletions and --force to execute them."
             ;;
@@ -5620,7 +5788,7 @@ cmd_help_topic() {
             print_command_help "wv status [--json] [--mode=bootstrap|discover|execute|full]" "Show compact status counts for the current graph."
             ;;
         touch)
-            print_command_help "wv touch <id> (--metadata=<json> | --intent=<text>)" "Silently merge metadata for low-friction intent tracking or fire-and-forget updates."
+            print_command_help "wv touch <id> (--metadata=<json> | --intent=<text> | --files=path1,path2)" "Silently merge metadata for low-friction intent tracking or file attribution. --files records repo-relative paths in node_files for impact/search grounding."
             ;;
         allowed-tools)
             print_command_help "wv allowed-tools <id> [--json]" "Inspect the metadata.allowed_tools list stored on a node."
@@ -5659,7 +5827,7 @@ cmd_help_topic() {
             print_command_help "wv context [id] --json [--mode=bootstrap|discover|execute|full]" "Generate a JSON context pack for a node. If <id> is omitted, wv uses WV_ACTIVE."
             ;;
         impact)
-            print_command_help "wv impact <id>... [--files=path1,path2] [--direction=fwd|rev|both] [--depth=N] [--json] [--full] [--include-done] [--all] [--quality]" "Walk the dependency graph from one or more seed nodes. Reports impacted nodes by depth, risk_score/risk_factors, nodes unblocked when seeds complete, and affected test suites. --files=path1,path2 derives seeds from nodes whose touched_files metadata contains those paths (unknown paths emit empty result). --direction=both (default) follows blocks|implements|addresses edges in both directions; fwd=outward only; rev=inward only. --depth=N (default 3). --all removes the 50-node cap. --include-done includes done nodes in the impacted list (they are traversed but hidden by default). --full adds resolves|references|supersedes|obsoletes to the traversed edge types. --json returns structured output."
+            print_command_help "wv impact <id>... [--files=path1,path2] [--direction=fwd|rev|both] [--depth=N] [--json] [--full] [--include-done] [--all] [--quality]" "Walk the dependency graph from one or more seed nodes. Reports impacted nodes by depth, risk_score/risk_factors, nodes unblocked when seeds complete, and affected test suites. --files=path1,path2 derives seeds from node_files attribution or touched_files metadata (unknown paths emit empty result). --include-done also allows done file owners to become seeds and includes done impacted nodes. --direction=both (default) follows blocks|implements|addresses edges in both directions; fwd=outward only; rev=inward only. --depth=N (default 3). --all removes the 50-node cap. --full adds resolves|references|supersedes|obsoletes to the traversed edge types. --json returns structured output."
             ;;
         search)
             cat <<'SEARCHHELP'
@@ -5779,6 +5947,8 @@ Usage: wv <command> [args]
 Commands:
   init              Initialize database
   add <text>        Add a node (returns ID) [--gh creates GitHub issue]
+  remember <text>   Capture graph-native memory (type=memory, mem_status=active)
+  memory <sub>      Recall/render/scan/import graph memory
   delete <id>       Permanently remove a node + edges [--force] [--dry-run] [--no-gh]
   done <id>         Mark node complete [--learning="..."] [--no-warn] [auto-closes GH issue]
     ship <id>         Done + sync in one step; Git sync surfaced separately [--learning="..."] [--gh]

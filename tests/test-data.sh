@@ -248,6 +248,23 @@ assert_file_exists "$archive_file" "archive file created"
 show_new=$($WV show "$new_node" 2>&1)
 assert_contains "$show_new" "Recent task" "recent task not pruned"
 
+# Verify durable finding evidence is not pruned by generic done-node maintenance
+reset_db
+finding_node=$($WV add "Finding: durable evidence should remain live" --force --metadata='{"type":"finding","finding":{"violation_type":"test:gap"}}' | tail -1)
+$WV done "$finding_node" --skip-verification >/dev/null 2>&1
+sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-72 hours') WHERE id='$finding_node';"
+output=$($WV prune --age=48h --dry-run 2>&1)
+if ! grep -q "$finding_node" <<<"$output"; then
+    echo -e "  ${GREEN}✓${NC} dry-run excludes durable finding node"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "  ${RED}✗${NC} dry-run should not list durable finding node"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+$WV prune --age=48h >/dev/null 2>&1
+finding_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE id='$finding_node';")
+assert_equals "1" "$finding_count" "prune keeps durable finding node live"
+
 # Test prune with custom age
 reset_db
 node3=$($WV add "Task for age test" | tail -1)

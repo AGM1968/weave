@@ -174,6 +174,14 @@ _hc_classify_tool() {
         # not project work. Leave SHOULD_CHECK/IS_EDIT_TOOL false so the dispatcher
         # exits 0 (no node, no phase gate, no hygiene tally). NOTE: only $HOME/.claude/
         # — project-local .claude/ (hooks, settings, skills) stays governed.
+        #
+        # PreToolUse stays allow/deny only here (it cannot rewrite a write into a
+        # graph insert). The prior "external state, do nothing" stance is NARROWLY
+        # superseded for repo-scoped durable memory by capture-after-write:
+        # .claude/hooks/post-memory-capture.sh (PostToolUse) imports a matching
+        # $HOME/.claude/projects/<repo-slug>/memory/*.md write into the graph as a
+        # mem_status=candidate node. See PROPOSAL-wv-agent-memory-substrate S5 and
+        # the feedback_memory_writes_external memory.
         if [[ -n "${HOME:-}" && "$file_path" == "$HOME/.claude/"* ]]; then
             return 0
         fi

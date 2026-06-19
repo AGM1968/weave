@@ -1366,7 +1366,7 @@ test_help_surfaces() {
     root_help=$("$WV" --help 2>&1)
 
     local expected_commands=(
-        init add delete done ship ship-agent batch-done bulk-update work preflight recover bootstrap bootstrap-agent
+        init add remember memory delete done ship ship-agent batch-done bulk-update work preflight recover bootstrap bootstrap-agent
         overview cache pending-close ready list show status update touch allowed-tools quick
         block link unlink resolve related edges path tree plan enrich-topology context search
         reindex learnings trails digest session-summary audit-pitfalls edge-types init-repo
@@ -1381,6 +1381,7 @@ test_help_surfaces() {
     done
     assert_contains "$root_help" "wv help <command>" "root help documents focused help entrypoint"
     assert_contains "$root_help" "wv <command> --help" "root help documents per-command help flag"
+    assert_contains "$root_help" "Recall/render/scan/import graph memory" "root help summarizes all memory subcommands"
 
     local show_help
     show_help=$("$WV" show --help 2>&1)

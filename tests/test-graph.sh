@@ -670,6 +670,16 @@ SQL
     jmulti=$("$WV" impact --files=scripts/probe/alpha.sh,scripts/probe/beta.sh --json 2>&1)
     assert_jq_true "$jmulti" '.seeds | length == 2' "files JSON: two files → two seeds"
 
+    # Done file owners are intentionally hidden by default, but proposal/docs audits
+    # often need to seed from completed authoring nodes.
+    "$WV" update "$fnode_a" --status=done >/dev/null 2>&1
+    local jdone_default jdone_included
+    jdone_default=$("$WV" impact --files=scripts/probe/alpha.sh --json 2>&1)
+    assert_jq_true "$jdone_default" '.seeds | length == 0' "files JSON: done file owner hidden by default"
+    jdone_included=$("$WV" impact --files=scripts/probe/alpha.sh --include-done --json 2>&1)
+    assert_jq_true "$jdone_included" '.seeds | length == 1' "files JSON: --include-done allows done file owner seed"
+    assert_jq_true "$jdone_included" '.seeds[0].node_id == "'"$fnode_a"'"' "files JSON: done seed matches touched_files owner"
+
     # Canonical attribution table → seed resolution without touched_files metadata.
     local fnode_nf fnode_nf_dep jnodefiles
     fnode_nf=$("$WV" add "File-seeded via node_files" --force 2>&1 | node_id_from_output)
@@ -752,6 +762,69 @@ EOF
 }
 
 # ============================================================================
+# Test: unified blocking signal (wv_blocking_reason) — cmd_context surfaces
+# status / deferral / edge blocking, and agrees with cmd_ready. Closes the
+# metadata-vs-edge dual representation (wv-f752a5).
+# ============================================================================
+test_unified_blocking() {
+    echo ""
+    echo "Test: unified blocking signal (context/ready agreement)"
+    echo "======================================================="
+
+    setup_test_env
+
+    local ready_node deferred_node blocker target ctx
+    ready_node=$("$WV" add "plain ready node" --force 2>&1 | node_id_from_output)
+    deferred_node=$("$WV" add "deferred-todo node" --force 2>&1 | node_id_from_output)
+    "$WV" update "$deferred_node" --metadata='{"deferred":true}' >/dev/null 2>&1
+
+    # 'status' reason: wv block sets status=blocked (precedence status > edge)
+    blocker=$("$WV" add "live blocker" --force 2>&1 | node_id_from_output)
+    target=$("$WV" add "edge-blocked target" --force 2>&1 | node_id_from_output)
+    "$WV" block "$target" --by="$blocker" >/dev/null 2>&1
+
+    # context surfaces each reason
+    ctx=$("$WV" context "$deferred_node" --json 2>/dev/null)
+    assert_jq_true "$ctx" '.blocked == true and .blocked_reason == "deferral"' \
+        "context: deferred-todo node is blocked (reason=deferral)"
+
+    ctx=$("$WV" context "$target" --json 2>/dev/null)
+    assert_jq_true "$ctx" '.blocked == true and .blocked_reason == "status"' \
+        "context: wv-block'd node is blocked (reason=status)"
+
+    # 'edge' reason: drift case — a todo node that still has a live inbound blocks
+    # edge must stay excluded (the guard the original NOT EXISTS check provided).
+    # Use a fresh node and reset status to todo so the blocks edge outranks status.
+    local edge_blocker edge_target
+    edge_blocker=$("$WV" add "edge-case blocker" --force 2>&1 | node_id_from_output)
+    edge_target=$("$WV" add "edge-case target" --force 2>&1 | node_id_from_output)
+    "$WV" block "$edge_target" --by="$edge_blocker" >/dev/null 2>&1
+    "$WV" update "$edge_target" --status=todo >/dev/null 2>&1
+    ctx=$("$WV" context "$edge_target" --json 2>/dev/null)
+    assert_jq_true "$ctx" '.blocked == true and .blocked_reason == "edge"' \
+        "context: todo node with a live blocks edge is blocked (reason=edge)"
+
+    ctx=$("$WV" context "$ready_node" --json 2>/dev/null)
+    assert_jq_true "$ctx" '.blocked == false and .blocked_reason == null' \
+        "context: plain todo node is not blocked"
+
+    # bootstrap mode carries the same signal
+    ctx=$("$WV" context "$deferred_node" --json --mode=bootstrap 2>/dev/null)
+    assert_jq_true "$ctx" '.blocked == true and .blocked_reason == "deferral"' \
+        "context bootstrap-mode: deferral signal present"
+
+    # ready AGREES: blocked nodes are excluded, the plain node is present
+    local ready_json
+    ready_json=$("$WV" ready --json 2>/dev/null)
+    assert_jq_true "$ready_json" "any(.[]; .id == \"$ready_node\")" \
+        "ready: plain todo node is ready"
+    assert_jq_true "$ready_json" "all(.[]; .id != \"$deferred_node\")" \
+        "ready: deferred-todo node excluded (agrees with context)"
+    assert_jq_true "$ready_json" "all(.[]; .id != \"$target\")" \
+        "ready: edge-blocked node excluded (agrees with context)"
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 main() {
@@ -767,6 +840,7 @@ main() {
     test_path
     test_impact
     test_impact_suites_matching
+    test_unified_blocking
 
     echo ""
     echo "========================================"

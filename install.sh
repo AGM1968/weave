@@ -8,6 +8,7 @@
 #   ./install.sh --upgrade    Pull latest and reinstall
 #   ./install.sh --verify     Install and verify with selftest
 #   ./install.sh --check-deps Check required dependencies
+#   ./install.sh --with-ast-grep Install optional ast-grep helper (may use network)
 #
 # Remote install:
 #   curl -sSL https://raw.githubusercontent.com/AGM1968/weave/main/install.sh | bash
@@ -405,6 +406,7 @@ if [ -f "./scripts/wv" ]; then
     cp ./.claude/hooks/bash-dedup-post.sh "$CONFIG_DIR/hooks/"
     cp ./.claude/hooks/wv-budget-tally.sh "$CONFIG_DIR/hooks/"
     cp ./.claude/hooks/wv-touched-files.sh "$CONFIG_DIR/hooks/"
+    cp ./.claude/hooks/post-memory-capture.sh "$CONFIG_DIR/hooks/"
     # Agents
     cp ./.claude/agents/weave-guide.md "$CONFIG_DIR/agents/"
     cp ./.claude/agents/epic-planner.md "$CONFIG_DIR/agents/"
@@ -543,6 +545,7 @@ else
     curl -sSL "$REPO/.claude/hooks/bash-dedup-post.sh" -o "$CONFIG_DIR/hooks/bash-dedup-post.sh"
     curl -sSL "$REPO/.claude/hooks/wv-budget-tally.sh" -o "$CONFIG_DIR/hooks/wv-budget-tally.sh"
     curl -sSL "$REPO/.claude/hooks/wv-touched-files.sh" -o "$CONFIG_DIR/hooks/wv-touched-files.sh"
+    curl -sSL "$REPO/.claude/hooks/post-memory-capture.sh" -o "$CONFIG_DIR/hooks/post-memory-capture.sh"
     # Agents
     curl -sSL "$REPO/.claude/agents/weave-guide.md" -o "$CONFIG_DIR/agents/weave-guide.md"
     curl -sSL "$REPO/.claude/agents/epic-planner.md" -o "$CONFIG_DIR/agents/epic-planner.md"
@@ -641,6 +644,9 @@ merge_global_claude_settings() {
                 ]},
                 {"matcher":"Edit|Write|NotebookEdit|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file","hooks":[
                     {"type":"command","command":($h+"/wv-touched-files.sh"),"timeout":5}
+                ]},
+                {"matcher":"Edit|Write|NotebookEdit","hooks":[
+                    {"type":"command","command":($h+"/post-memory-capture.sh"),"timeout":10}
                 ]}
             ],
             "PostToolUseFailure": [
@@ -1681,6 +1687,31 @@ if [ "$AGENT" = "codex" ]; then
     "no_edits_without_active_node": true,
     "noninteractive_close": "./scripts/wv ship-agent"
   },
+  "memory": {
+    "authority": "weave-graph",
+    "lifecycle_field": "metadata.mem_status",
+    "policy": "codex-local memory is evidence; weave graph is authority",
+    "capture": {
+      "command": "./scripts/wv remember --json",
+      "fallback": "\$HOME/.local/bin/wv remember --json"
+    },
+    "recall": {
+      "command": "./scripts/wv memory recall --agent=all --json",
+      "fallback": "\$HOME/.local/bin/wv memory recall --agent=all --json"
+    },
+    "scan": {
+      "command": "./scripts/wv memory scan --source=codex --json",
+      "fallback": "\$HOME/.local/bin/wv memory scan --source=codex --json"
+    },
+    "import": {
+      "command": "./scripts/wv memory import --source=codex --json",
+      "fallback": "\$HOME/.local/bin/wv memory import --source=codex --json"
+    },
+    "crystallize": {
+      "command": "./scripts/wv memory crystallize --json",
+      "fallback": "\$HOME/.local/bin/wv memory crystallize --json"
+    }
+  },
   "commands": {
     "claim": "./scripts/wv work <id>",
     "record_edit": "./scripts/wv touch <id> --files=<path>",
@@ -1901,11 +1932,22 @@ fi
 _install_ast_grep() {
     local ag_bin="$INSTALL_DIR/ast-grep"
     if command -v ast-grep >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ ast-grep already available: $(command -v ast-grep)${NC}"
         return 0  # already on PATH
     fi
     if [ -x "$ag_bin" ]; then
+        echo -e "${GREEN}✓ ast-grep already installed: $ag_bin${NC}"
         return 0  # already installed by us
     fi
+
+    if [ "${WITH_AST_GREP:-0}" != "1" ]; then
+        echo -e "${YELLOW}⊘ ast-grep not installed (optional; no download attempted)${NC}"
+        echo "  Enables structural-search and AST-accurate Bash/TypeScript quality scans."
+        echo "  To install explicitly: ./install.sh --with-ast-grep"
+        echo "  Or install yourself: cargo install ast-grep --locked"
+        return 0
+    fi
+
     # Try cargo first (self-updating, version-agnostic)
     if command -v cargo >/dev/null 2>&1; then
         echo -e "${CYAN}Installing ast-grep via cargo...${NC}"
@@ -1927,7 +1969,8 @@ _install_ast_grep() {
         echo -e "${CYAN}Downloading ast-grep ${ag_version}...${NC}"
         local tmp_dir
         tmp_dir=$(mktemp -d)
-        if curl -sSL "$ag_url" -o "$tmp_dir/ast-grep.zip" && \
+        if curl -fsSL --retry 3 "$ag_url" -o "$tmp_dir/ast-grep.zip" && \
+           unzip -tq "$tmp_dir/ast-grep.zip" >/dev/null && \
            unzip -q "$tmp_dir/ast-grep.zip" -d "$tmp_dir" && \
            mv "$tmp_dir/ast-grep" "$ag_bin" 2>/dev/null && \
            chmod +x "$ag_bin"; then
@@ -1938,13 +1981,17 @@ _install_ast_grep() {
         rm -rf "$tmp_dir"
     fi
     echo -e "${YELLOW}⚠ ast-grep not installed (optional) — structural-search + accurate bash CC unavailable${NC}"
-    echo "  Install manually: cargo install ast-grep"
+    echo "  Install manually: cargo install ast-grep --locked"
     return 0
 }
 
 if [ "${SKIP_AST_GREP:-0}" != "1" ]; then
     echo ""
-    echo -e "${CYAN}━━━ ast-grep (optional) ━━━${NC}"
+    if [ "${WITH_AST_GREP:-0}" = "1" ]; then
+        echo -e "${CYAN}━━━ ast-grep (optional, explicit install) ━━━${NC}"
+    else
+        echo -e "${CYAN}━━━ ast-grep (optional) ━━━${NC}"
+    fi
     _install_ast_grep
 fi
 
@@ -1983,6 +2030,7 @@ fi
 
 DEV_MODE=0
 WITH_MCP=0
+WITH_AST_GREP="${WITH_AST_GREP:-0}"
 VERIFY=0
 LOCAL_SOURCE=""
 
@@ -1993,6 +2041,8 @@ for arg in "$@"; do
         --dev)              DEV_MODE=1 ;;
         --with-mcp)         WITH_MCP=1 ;;
         --no-mcp)           WITH_MCP=0; NO_MCP_EXPLICIT=1 ;;
+        --with-ast-grep)    WITH_AST_GREP=1 ;;
+        --no-ast-grep)      SKIP_AST_GREP=1 ;;
         --verify)           VERIFY=1 ;;
         --local-source=*)   LOCAL_SOURCE="${arg#*=}" ;;
         --uninstall)        action="uninstall" ;;
@@ -2035,6 +2085,8 @@ case "${action:-install}" in
         echo "  --dev              Install by symlinking (for development)"
         echo "  --with-mcp         Also build and install the MCP server (requires Node.js)"
         echo "  --no-mcp           Skip MCP rebuild even if already installed"
+        echo "  --with-ast-grep    Install optional ast-grep helper (may use cargo/GitHub network)"
+        echo "  --no-ast-grep      Skip ast-grep detection/install messaging"
         echo "  --verify           Run wv selftest after install to verify"
         echo "  --local-source=DIR Install from DIR instead of current directory"
         echo "  --uninstall        Remove manifest-tracked files (preserves ~/.config/weave; see output for manual cleanup)"

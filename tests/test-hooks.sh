@@ -1683,6 +1683,7 @@ declare -A HOOK_EVENTS=(
     [bash-dedup-post.sh]=PostToolUse
     [wv-budget-tally.sh]=PostToolUse
     [wv-touched-files.sh]=PostToolUse
+    [post-memory-capture.sh]=PostToolUse
     [stop-check.sh]=Stop
     [session-start-context.sh]=SessionStart
     [context-guard.sh]=SessionStart
@@ -1772,6 +1773,43 @@ for hook in "${!HOOK_EVENTS[@]}"; do
             ;;
     esac
 done
+
+# ============================================================
+# post-memory-capture.sh — repo-scoped Claude memory capture (S5)
+# ============================================================
+echo ""
+echo "--- post-memory-capture.sh ---"
+setup_test_env
+
+mc_home="$TEST_DIR/mc-home"
+mc_slug=$(printf '%s' "$TEST_DIR/project" | tr '/' '-')
+mc_memdir="$mc_home/.claude/projects/$mc_slug/memory"
+mkdir -p "$mc_memdir"
+printf '# m\n\ndurable fact about the resolver path\n' > "$mc_memdir/a.md"
+
+# 1. Matching repo slug, dry default -> advisory + import suggestion, no graph write.
+MC_OUT=$(printf '{"tool_name":"Write","tool_response":{"success":true},"tool_input":{"file_path":"%s/a.md"}}' "$mc_memdir" \
+    | HOME="$mc_home" WV_PROJECT_DIR="$TEST_DIR/project" WV_HOT_ZONE="$TEST_DIR" bash "$HOOKS_DIR/post-memory-capture.sh" 2>/dev/null || true)
+assert_contains "$MC_OUT" "additionalContext" "memory-capture: emits additionalContext advisory for repo-scoped write"
+assert_contains "$MC_OUT" "wv memory import" "memory-capture: advisory points at graph import"
+assert_not_contains "$MC_OUT" "permissionDecision" "memory-capture: PostToolUse hook does not gate (no permissionDecision)"
+
+# 2. Different repo slug -> repo-scope proof rejects, no output (wv-4109ef).
+mc_other="$mc_home/.claude/projects/-some-other-repo/memory"
+mkdir -p "$mc_other"; printf '# m\n\nx\n' > "$mc_other/b.md"
+MC_OTHER=$(printf '{"tool_name":"Write","tool_response":{"success":true},"tool_input":{"file_path":"%s/b.md"}}' "$mc_other" \
+    | HOME="$mc_home" WV_PROJECT_DIR="$TEST_DIR/project" WV_HOT_ZONE="$TEST_DIR" bash "$HOOKS_DIR/post-memory-capture.sh" 2>/dev/null || true)
+assert_equals "" "$MC_OTHER" "memory-capture: rejects a different repo's Claude memory (repo-scope proof)"
+
+# 3. Non-memory file in the repo -> no-op.
+MC_CODE=$(printf '{"tool_name":"Write","tool_response":{"success":true},"tool_input":{"file_path":"%s/project/src.py"}}' "$TEST_DIR" \
+    | HOME="$mc_home" WV_PROJECT_DIR="$TEST_DIR/project" WV_HOT_ZONE="$TEST_DIR" bash "$HOOKS_DIR/post-memory-capture.sh" 2>/dev/null || true)
+assert_equals "" "$MC_CODE" "memory-capture: ignores non-memory file writes"
+
+# 4. Tool failure -> no-op even for a matching memory path.
+MC_FAIL=$(printf '{"tool_name":"Write","tool_response":{"success":false},"tool_input":{"file_path":"%s/a.md"}}' "$mc_memdir" \
+    | HOME="$mc_home" WV_PROJECT_DIR="$TEST_DIR/project" WV_HOT_ZONE="$TEST_DIR" bash "$HOOKS_DIR/post-memory-capture.sh" 2>/dev/null || true)
+assert_equals "" "$MC_FAIL" "memory-capture: skips on failed tool call"
 
 # ============================================================
 echo ""

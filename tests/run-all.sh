@@ -58,6 +58,7 @@ done
 # Fast tier — runs by default (~25s parallel, ~880s serial)
 declare -a FAST_SUITES=(
     "test-core.sh:Core Commands"
+    "test-memory.sh:Graph Memory Commands"
     "test-graph.sh:Graph Commands"
     "test-data.sh:Data Commands"
     "test-health.sh:Health Commands"
@@ -66,6 +67,7 @@ declare -a FAST_SUITES=(
     "test-stress.sh:Stress Tests"
     "test-hooks.sh:Hook Tests"
     "test-init-repo.sh:Init-Repo Tests"
+    "test-install-ast-grep.sh:Install ast-grep Opt-in Tests"
     "test-workflow-surfaces.sh:Workflow Surface Tests"
     "test-crash-sentinel.sh:Crash Sentinel Tests"
     "test-multi-agent.sh:Multi-Agent Tests"
@@ -76,6 +78,7 @@ declare -a FAST_SUITES=(
     "test-pattern-audit-check6.sh:Pattern-Audit Check 6 (node-state invariant)"
     "test-pattern-audit-check7.sh:Pattern-Audit Check 7 (function tails)"
     "test-pattern-audit-check8.sh:Pattern-Audit Check 8 (quality DB owner)"
+    "test-pattern-audit-check9.sh:Pattern-Audit Check 9 (memory authority owner)"
     "test-cmd-battery.sh:Command-Surface Battery"
     "test-schema-contract.sh:SQL-vs-Schema Contract"
     "test-mcp-parity.sh:MCP-vs-CLI Flag Parity"

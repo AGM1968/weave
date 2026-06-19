@@ -141,6 +141,8 @@ echo "  seeded: $N_PIPE $N_APOS $N_DONE $N_FIND"
 # ═══════════════════════════════════════════════════════════════════════════
 echo "--- core ---"
 battery W add        add "battery: scratch write with 'quote | pipe'" --force
+battery J remember   remember "battery memory bridge fact" --json
+battery J memory     memory recall --agent=codex --json
 battery J list       list --json
 battery R show       show "$N_PIPE"
 battery R ready      ready

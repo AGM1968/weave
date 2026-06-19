@@ -90,6 +90,14 @@ json_each
 json_tree
 dbstat"
 
+# External tables owned by another harness's database that the codebase reads
+# but never creates. The memory scan/import path queries Codex's
+# ~/.codex/memories_*.sqlite (stage1_outputs), always gated by a sqlite_master
+# existence probe before use, so a missing table degrades gracefully rather
+# than erroring. These are intentional foreign-schema references, not the
+# invented-table bug shape this guard catches.
+EXTERNAL="stage1_outputs"
+
 check_contract() {
     # $1 = file with known names (one per line), remaining args = source files.
     # Prints violations (referenced but neither known, declared, nor builtin).
@@ -102,6 +110,7 @@ check_contract() {
         grep -qxF "$ref" "$known_file" && continue
         echo "$declared" | grep -qxF "$ref" && continue
         echo "$BUILTIN" | grep -qxF "$ref" && continue
+        echo "$EXTERNAL" | grep -qxF "$ref" && continue
         echo "$NOISE" | grep -qxF "$ref" && continue
         echo "$ref"
     done

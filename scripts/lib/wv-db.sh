@@ -1091,3 +1091,48 @@ db_query_json_v2() {
     ) | del(.created_at, .updated_at)
       | with_entries(select(.value != null and .value != ""))]'
 }
+
+# wv_deferral_metadata_predicate — CANONICAL definition of "node carries ACTIVE
+# deferral METADATA" (the representation that must be reconciled to status). Echoes a
+# SQL boolean for the given node alias. ONE definition shared by the read predicate
+# (wv_blocking_reason) AND the enforcement guard (pattern-audit Check 6, wv doctor
+# node-state) so the deferral keys cannot drift between reader and checker — the very
+# dual-representation bug this guards against, applied to itself. Keys: deferred=true,
+# blocked_until in the future, or blocked_on set.
+wv_deferral_metadata_predicate() {
+    local n="${1:-n}"
+    cat <<SQL
+( json_extract(${n}.metadata, '\$.deferred') IN (1, 'true')
+  OR ( json_extract(${n}.metadata, '\$.blocked_until') IS NOT NULL
+       AND date(json_extract(${n}.metadata, '\$.blocked_until')) > date('now') )
+  OR ( json_extract(${n}.metadata, '\$.blocked_on') IS NOT NULL
+       AND json_extract(${n}.metadata, '\$.blocked_on') != '' ) )
+SQL
+}
+
+# wv_blocking_reason — SINGLE SOURCE OF TRUTH for "is this node blocked / not ready".
+# Echoes a SQL expression (usable in SELECT or WHERE) yielding the REASON a node is
+# not ready under the UNIFIED blocking signal, or NULL when it is ready:
+#   'status'   — explicit blocked / blocked-external status
+#   'deferral' — active deferral metadata (see wv_deferral_metadata_predicate)
+#   'edge'     — an inbound non-done blocks edge
+# Shared by cmd_ready (exclude where reason IS NOT NULL) and cmd_context (surface the
+# reason + a blocked flag) so the CLI and weave-runtime read ONE signal rather than the
+# metadata-vs-edge dual representation (wv-f752a5). Pass the table alias of the node row
+# (default 'n'). Precedence: status > deferral > edge.
+wv_blocking_reason() {
+    local n="${1:-n}"
+    local _defer
+    _defer=$(wv_deferral_metadata_predicate "$n")
+    cat <<SQL
+CASE
+    WHEN ${n}.status IN ('blocked', 'blocked-external') THEN 'status'
+    WHEN ${_defer} THEN 'deferral'
+    WHEN EXISTS (
+        SELECT 1 FROM edges _be JOIN nodes _bn ON _be.source = _bn.id
+        WHERE _be.target = ${n}.id AND _be.type = 'blocks' AND _bn.status != 'done'
+    ) THEN 'edge'
+    ELSE NULL
+END
+SQL
+}

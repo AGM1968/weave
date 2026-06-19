@@ -1274,6 +1274,7 @@ cmd_prune() {
         WHERE status = 'done'
         $age_clause
         $orphan_clause
+        AND COALESCE(json_extract(metadata, '\$.type'), '') NOT IN ('finding', 'memory')
         AND id NOT IN (
             SELECT n.id FROM nodes n
             WHERE json_extract(n.metadata, '\$.pitfall') IS NOT NULL
