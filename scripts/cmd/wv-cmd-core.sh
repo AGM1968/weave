@@ -827,13 +827,18 @@ _memory_import_claude_dir() {
     db_ensure
     db_migrate_fts5 2>/dev/null || true
 
-    local imported='[]' file text id hash metadata text_sql metadata_sql
+    local imported='[]' skipped='[]' file text id hash metadata text_sql metadata_sql
     while IFS= read -r file; do
         [ -f "$file" ] || continue
         text=$(sed '/^#/d; /^$/d' "$file" | head -20 | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')
         [ -n "$text" ] || text=$(basename "$file")
-        id=$(generate_id)
         hash=$(_memory_file_hash "$file")
+        # Idempotency: skip if a memory node with this source_hash already exists.
+        if [ -n "$(db_query "SELECT 1 FROM nodes WHERE json_extract(metadata,'\$.source_hash')='$hash' LIMIT 1;" 2>/dev/null)" ]; then
+            skipped=$(printf '%s\n' "$skipped" | jq --arg path "$file" '. + [{source_path: $path}]')
+            continue
+        fi
+        id=$(generate_id)
         metadata=$(jq -nc \
             --arg repo_root "$repo_root" \
             --arg source_path "$file" \
@@ -857,9 +862,12 @@ _memory_import_claude_dir() {
     done < <(find "$path" -maxdepth 1 -type f -name "*.md" -print 2>/dev/null | sort)
 
     if [ "$format" = "json" ]; then
-        jq -n --argjson imported "$imported" '{imported: $imported, count: ($imported | length)}'
+        jq -n --argjson imported "$imported" --argjson skipped "$skipped" \
+            '{imported: $imported, count: ($imported | length), skipped: ($skipped | length)}'
     else
         printf '%s\n' "$imported" | jq -r '.[] | "✓ Imported \(.source_path) -> \(.id)"'
+        local n_skipped; n_skipped=$(printf '%s\n' "$skipped" | jq 'length')
+        [ "$n_skipped" -gt 0 ] && echo "⏭  Skipped $n_skipped already-imported file(s) (source_hash match)"
     fi
     auto_sync 2>/dev/null || true
 }
@@ -869,7 +877,7 @@ _memory_import_codex() {
     db_ensure
     db_migrate_fts5 2>/dev/null || true
 
-    local observations imported='[]'
+    local observations imported='[]' skipped='[]'
     observations=$(_memory_scan_codex "$repo_root") || return 1
     if [ -n "$path" ]; then
         observations=$(printf '%s\n' "$observations" | jq --arg path "$path" '[.[] | select(.source_path == $path)]')
@@ -883,6 +891,11 @@ _memory_import_codex() {
         source_path=$(printf '%s\n' "$obs" | jq -r '.source_path // ""')
         source_session=$(printf '%s\n' "$obs" | jq -r '.source_session // ""')
         hash=$(printf '%s' "$repo_root|$source_path|$source_session|$text" | sha256sum | awk '{print $1}')
+        # Idempotency: skip if a memory node with this source_hash already exists.
+        if [ -n "$(db_query "SELECT 1 FROM nodes WHERE json_extract(metadata,'\$.source_hash')='$hash' LIMIT 1;" 2>/dev/null)" ]; then
+            skipped=$(printf '%s\n' "$skipped" | jq --arg path "$source_path" '. + [{source_path: $path}]')
+            continue
+        fi
         id=$(generate_id)
         metadata=$(jq -nc \
             --arg repo_root "$repo_root" \
@@ -909,9 +922,12 @@ _memory_import_codex() {
     done < <(printf '%s\n' "$observations" | jq -c '.[] | select(.source_agent == "codex" and .source_kind == "memory_db")')
 
     if [ "$format" = "json" ]; then
-        jq -n --argjson imported "$imported" '{imported: $imported, count: ($imported | length)}'
+        jq -n --argjson imported "$imported" --argjson skipped "$skipped" \
+            '{imported: $imported, count: ($imported | length), skipped: ($skipped | length)}'
     else
         printf '%s\n' "$imported" | jq -r '.[] | "✓ Imported \(.source_path) -> \(.id)"'
+        local n_skipped; n_skipped=$(printf '%s\n' "$skipped" | jq 'length')
+        [ "$n_skipped" -gt 0 ] && echo "⏭  Skipped $n_skipped already-imported row(s) (source_hash match)"
     fi
     auto_sync 2>/dev/null || true
 }
@@ -3872,6 +3888,10 @@ cmd_update() {
     fi
 
     db_query "UPDATE nodes SET $updates WHERE id='$id';"
+
+    # Every update can change the context payload (status, text, alias, or
+    # metadata). Do not leave a same-session runtime consumer with stale state.
+    invalidate_context_cache "$id"
 
     # Auto-unblock cascade when status changed to done
     if [[ "$updates" == *"status='done'"* ]]; then

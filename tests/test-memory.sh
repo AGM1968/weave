@@ -262,6 +262,15 @@ test_memory_scan_and_import() {
     assert_equals "0" "$(printf '%s' "$recall_json" | jq --arg id "$imported_id" '[.[] | select(.id == $id)] | length')" "candidate imports are not active recall"
     assert_equals "0" "$(printf '%s' "$ready_json" | jq --arg id "$imported_id" '[.[] | select(.id == $id)] | length')" "candidate imports do not surface in ready"
 
+    # Idempotency: re-importing the same dir creates no new nodes and reports skips.
+    local claude_reimport claude_candidates_before claude_candidates_after
+    claude_candidates_before=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata,'\$.source_agent')='claude' AND json_extract(metadata,'\$.source_kind')='memory_file';")
+    claude_reimport=$(HOME="$fake_home" "$WV" memory import --source=claude --path="$claude_memory_dir" --repo-root="$TEST_DIR" --json)
+    claude_candidates_after=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata,'\$.source_agent')='claude' AND json_extract(metadata,'\$.source_kind')='memory_file';")
+    assert_equals "0" "$(printf '%s' "$claude_reimport" | jq -r '.count')" "Claude re-import is idempotent (no new candidates)"
+    assert_equals "1" "$(printf '%s' "$claude_reimport" | jq -r '.skipped')" "Claude re-import reports skipped count"
+    assert_equals "$claude_candidates_before" "$claude_candidates_after" "Claude re-import does not duplicate candidate nodes"
+
     local codex_import_json codex_id codex_show recall_after_codex ready_after_codex
     codex_import_json=$(HOME="$fake_home" "$WV" memory import --source=codex --repo-root="$TEST_DIR" --json)
     codex_id=$(printf '%s' "$codex_import_json" | jq -r '.imported[0].id')
@@ -281,6 +290,15 @@ test_memory_scan_and_import() {
     assert_equals "64" "$(printf '%s' "$codex_show" | jq -r '.[0].metadata.source_hash | length')" "Codex import records deterministic source hash"
     assert_equals "0" "$(printf '%s' "$recall_after_codex" | jq --arg id "$codex_id" '[.[] | select(.id == $id)] | length')" "Codex candidates are not active recall"
     assert_equals "0" "$(printf '%s' "$ready_after_codex" | jq --arg id "$codex_id" '[.[] | select(.id == $id)] | length')" "Codex candidates do not surface in ready"
+
+    # Idempotency: re-importing the same Codex rows creates no new nodes and reports skips.
+    local codex_reimport codex_candidates_before codex_candidates_after
+    codex_candidates_before=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata,'\$.source_agent')='codex' AND json_extract(metadata,'\$.source_kind')='memory_db';")
+    codex_reimport=$(HOME="$fake_home" "$WV" memory import --source=codex --repo-root="$TEST_DIR" --json)
+    codex_candidates_after=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata,'\$.source_agent')='codex' AND json_extract(metadata,'\$.source_kind')='memory_db';")
+    assert_equals "0" "$(printf '%s' "$codex_reimport" | jq -r '.count')" "Codex re-import is idempotent (no new candidates)"
+    assert_equals "1" "$(printf '%s' "$codex_reimport" | jq -r '.skipped')" "Codex re-import reports skipped count"
+    assert_equals "$codex_candidates_before" "$codex_candidates_after" "Codex re-import does not duplicate candidate nodes"
 }
 
 test_memory_crystallize() {
@@ -306,11 +324,14 @@ test_memory_crystallize() {
     printf '# t\n\nproduction deployment pipeline never permitted, avoid disable.\n' > "$mem_dir/contra.md"
     "$WV" memory import --source=claude --path="$mem_dir" --repo-root="$TEST_DIR" --json >/dev/null 2>&1
 
-    # A second import of identical content -> same source_hash -> later one superseded.
-    local dup_dir="$TEST_DIR/dup"
-    mkdir -p "$dup_dir"
-    printf '# t\n\nThe scripts/wv entrypoint dispatches commands here.\n' > "$dup_dir/clean.md"
-    "$WV" memory import --source=claude --path="$dup_dir" --repo-root="$TEST_DIR" --json >/dev/null 2>&1
+    # A duplicate candidate sharing clean.md's source_hash (a legacy pre-idempotency
+    # or cross-agent dup) -> crystallize marks the later one superseded. Inserted
+    # directly because `wv memory import` is now idempotent on source_hash.
+    local clean_hash dup_meta
+    clean_hash=$(sqlite3 "$WV_DB" "SELECT json_extract(metadata,'\$.source_hash') FROM nodes WHERE json_extract(metadata,'\$.source_path') LIKE '%mem/clean.md';")
+    dup_meta=$(jq -nc --arg h "$clean_hash" --arg p "$TEST_DIR/dup/clean.md" --arg r "$TEST_DIR" \
+        '{type:"memory",kind:"project",scope:"repo",mem_status:"candidate",source_agent:"claude",source_kind:"memory_file",source_path:$p,source_hash:$h,repo_root:$r}')
+    sqlite3 "$WV_DB" "INSERT INTO nodes (id, text, status, metadata) VALUES ('wv-dddddd', 'The scripts/wv entrypoint dispatches commands here.', 'done', '$(printf '%s' "$dup_meta" | sed "s/'/''/g")');"
 
     local clean_id stale_id contra_id dup_id
     clean_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE json_extract(metadata,'\$.source_path') LIKE '%mem/clean.md';")

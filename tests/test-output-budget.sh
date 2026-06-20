@@ -177,9 +177,10 @@ tree_env=$(WV_TREE_CAP=10 "$WV" tree)
 assert_contains "$tree_env" "Showing 10 of 186 nodes" "WV_TREE_CAP env knob honored"
 
 tree_json=$("$WV" tree --json 2>/dev/null)
-assert_equals "50" "$(echo "$tree_json" | jq 'length')" "--json capped at 50 elements"
-tree_json_stderr=$("$WV" tree --json 2>&1 >/dev/null)
-assert_contains "$tree_json_stderr" "showing 50 of 186" "--json reports truncation on stderr"
+assert_equals "51" "$(echo "$tree_json" | jq 'length')" "--json appends a truncation sentinel"
+assert_equals "true" "$(echo "$tree_json" | jq -r '.[-1].truncated')" "--json exposes truncation in stdout"
+assert_equals "50" "$(echo "$tree_json" | jq -r '.[-1].shown')" "sentinel reports shown count"
+assert_equals "186" "$(echo "$tree_json" | jq -r '.[-1].total')" "sentinel reports total count"
 assert_equals "186" "$("$WV" tree --json --all 2>/dev/null | jq 'length')" "--json --all returns full set"
 
 tree_mermaid=$("$WV" tree --mermaid)

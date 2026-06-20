@@ -18,7 +18,9 @@ invalidate_context_cache() {
     if [ -d "$cache_dir" ]; then
         local node_id
         for node_id in $affected_ids; do
-            rm -f "$cache_dir/${node_id}"-*.json 2>/dev/null
+            # Context cache keys have existed as both <id>.json and
+            # <id>-<mode>.json; clear either form during the transition.
+            rm -f "$cache_dir/${node_id}.json" "$cache_dir/${node_id}"-*.json 2>/dev/null
         done
     fi
 

@@ -4,6 +4,24 @@
 
 ## Unreleased
 
+## [1.62.1] - 2026-06-20
+
+### Fixed
+
+- **Memory import is idempotent** — re-importing unchanged Claude memory files or Codex
+  `stage1_outputs` rows now skips existing `source_hash` values and reports a `skipped` count,
+  preventing duplicate candidate nodes.
+- **Runtime JSON-contract gaps closed** — several `wv` read surfaces now satisfy the weave-runtime
+  IPC boundary:
+  - `wv update` invalidates the context cache on every mutation, so a same-session runtime consumer
+    never reads stale node state after a status/text/alias/metadata change.
+  - `--json-v2` is now accepted by `wv sync`, `wv learnings`, and `wv search`, matching the json-v2
+    contract already used elsewhere.
+  - `wv tree --json` appends a trailing truncation sentinel
+    (`{"_meta":"truncation","shown":N,"total":M,"truncated":true}`) when the node cap is hit, so
+    consumers see truncation in the stdout payload instead of a stderr-only warning.
+  - Context-cache invalidation now clears both `<id>.json` and `<id>-<mode>.json` key forms.
+
 ## [1.62.0] - 2026-06-19
 
 ### Added
@@ -15,8 +33,9 @@
   - `wv memory scan` / `wv memory import` — detect and import harness-store memory as candidate
     nodes. Sources are scoped per harness (Claude project memory, Codex `memories_*.sqlite`
     `stage1_outputs`, Copilot), each carrying `source_agent` / `source_kind` provenance and a
-    deterministic `source_hash` keyed to `repo_root`. `wv memory import --source=codex` closes the
-    Codex scan-only gap by importing repo-scoped `stage1_outputs` rows as candidate memory.
+    deterministic `source_hash` provenance. Codex hashes include `repo_root`; Claude hashes are
+    file-content hashes. `wv memory import --source=codex` closes the Codex scan-only gap by
+    importing repo-scoped `stage1_outputs` rows as candidate memory.
   - `wv memory crystallize` — promote graph candidates to active memory; operates graph-wide
     (source-agnostic) and is conservative on prose to avoid promoting low-signal text.
   - **Memory projections** — `wv memory render` projects active memory for a harness;

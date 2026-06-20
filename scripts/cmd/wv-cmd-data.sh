@@ -506,6 +506,7 @@ cmd_sync() {
             --dry-run) dry_run=true ;;
             --force) force=true ;;
             --json) format="json" ;;
+            --json-v2) format="json-v2" ;;
             --mode=*) gh_mode="${1#*=}" ;;
             --mode) shift; gh_mode="${1:-}" ;;
             --node=*) gh_node="${1#*=}" ;;
@@ -1727,7 +1728,11 @@ cmd_learnings() {
     "
 
     local results
-    results=$(db_query_json "$query")
+    if [ "$format" = "json-v2" ]; then
+        results=$(db_query_json_v2 "$query")
+    else
+        results=$(db_query_json "$query")
+    fi
 
     # Apply grep filter to results (searches text, metadata values)
     if [ -n "$grep_filter" ] && [ -n "$results" ] && [ "$results" != "[]" ]; then
@@ -1781,7 +1786,7 @@ cmd_learnings() {
             2>/dev/null || echo "$results")
     fi
 
-    if [ "$format" = "json" ]; then
+    if [ "$format" = "json" ] || [ "$format" = "json-v2" ]; then
         [ -z "$results" ] && echo "[]" || echo "$results"
         return
     fi
@@ -2529,13 +2534,14 @@ cmd_search() {
             --limit=*) limit="${1#*=}"; extra_args+=("$1") ;;
             --limit) shift; limit="$1"; extra_args+=("--limit=$limit") ;;
             --json) format="json"; extra_args+=("--json") ;;
+            --json-v2) format="json-v2"; extra_args+=("--json-v2") ;;
             --status=*) status_filter="${1#*=}" ;;
             --type=*) type_filter="${1#*=}" ;;
             --learning) learning_only=1 ;;
             --mode=*|--model=*|--graph|--quality-db=*|--filter=*) extra_args+=("$1") ;;
             --filter) shift; extra_args+=("--filter=$1") ;;
             --help|-h)
-                echo "Usage: wv search <query> [--limit=N] [--json] [--status=STATUS] [--type=TYPE] [--learning]"
+                echo "Usage: wv search <query> [--limit=N] [--json|--json-v2] [--status=STATUS] [--type=TYPE] [--learning]"
                 echo "       wv search --code <query> [--limit=N] [--json] [--mode=hybrid|fts|vector] [--graph] [--filter=<expr>]"
                 echo ""
                 echo "  Without --code: searches Weave graph nodes (FTS5 BM25)"
@@ -2668,7 +2674,7 @@ cmd_search() {
         "
     fi
 
-    if [ "$format" = "json" ]; then
+    if [ "$format" = "json" ] || [ "$format" = "json-v2" ]; then
         local json_sql
         if [ "${has_learning_fts:-0}" = "1" ]; then
             json_sql="
@@ -2700,7 +2706,11 @@ cmd_search() {
                 LIMIT $limit;
             "
         fi
-        db_query_json "$json_sql"
+        if [ "$format" = "json-v2" ]; then
+            db_query_json_v2 "$json_sql"
+        else
+            db_query_json "$json_sql"
+        fi
     else
         local results
         results=$(db_query "$sql")

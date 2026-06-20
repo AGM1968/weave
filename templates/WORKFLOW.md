@@ -197,6 +197,69 @@ wv done <id> --learning="decision: what was chosen | pattern: reusable technique
 
 Good learnings are specific, actionable, and scoped to a concrete context.
 
+## Agent Memory
+
+Weave keeps long-lived memory in the graph, not in per-agent files. The graph is the single source
+of truth; per-agent memory files (Claude's `memory/*.md`, Codex's memory pipeline, Copilot's
+instructions) are treated as _harness state_ that gets pulled into the graph and projected back out.
+Recall and crystallization are agent-agnostic — they never filter by who is asking — while scan,
+import, and render carry per-agent provenance.
+
+The pipeline has five verbs:
+
+```bash
+wv memory scan --source=claude|codex|copilot|all   # detect harness memory for this repo
+wv memory import --source=claude --path=<DIR>       # pull harness memory into the graph as candidates
+wv memory import --source=codex [--path=<DB>]       #   (see per-agent table below)
+wv memory crystallize --dry-run                     # classify candidates: keep/stale/superseded/contradicts/promote
+wv memory crystallize --apply-reviewed              # promote reviewed candidates to active; mark the rest
+wv memory recall [--agent=current|all|<name>]       # read active graph memory (agent-agnostic; --agent never filters)
+wv memory render --agent=all|current|<agent>        # write repo-local projections back out per agent
+```
+
+**Lifecycle.** Imported memory lands as `mem_status=candidate` and is excluded from `recall` and
+`ready` — candidates never leak into active context. `crystallize --dry-run` classifies every
+candidate without mutating it; `crystallize --apply-reviewed` promotes only candidates explicitly
+marked `reviewed:true` to `active` and deterministically marks verified stale references as `stale`
+or exact `source_hash` collisions as `superseded`. Opposite-polarity matches remain candidates and
+create a `contradicts` edge plus a finding for review. Fuzzy FTS overlap is reported only, never
+auto-applied.
+
+**Idempotency.** `import` skips any file/row whose `source_hash` already exists and reports a
+`skipped` count, so re-running it on unchanged source creates no duplicates. Crystallization's
+`superseded` path remains as defense-in-depth for legacy or cross-agent duplicates.
+
+**Authority check.** `wv doctor` warns on dual-authority risk when harness memory files are not yet
+represented in the graph (`N/N <agent> memory file(s)`), and clears once imported. The warning names
+the exact `wv memory import` command to run.
+
+### Per-agent surfaces
+
+Memory is agent-agnostic in the graph; only the edges (where it is read from and written to) differ.
+
+| Agent   | Scan | Import                                | Render target                           |
+| ------- | ---- | ------------------------------------- | --------------------------------------- |
+| Claude  | yes  | `--source=claude --path=<memory dir>` | `CLAUDE.md`, `.claude/MEMORY.md`        |
+| Codex   | yes  | `--source=codex [--path=<DB>]`        | `.codex/weave.json`, `.codex/MEMORY.md` |
+| Copilot | yes  | not supported (scan + render only)    | `.github/copilot-instructions.md`       |
+
+- **Claude** — memory lives as `memory/*.md` under the repo's Claude project dir; `--path` points at
+  that directory and is required. `source_hash` is the file content hash. Renders to `CLAUDE.md`
+  (instructions) and `.claude/MEMORY.md` (the durable index).
+- **Codex** — memory comes from the repo-scoped Codex memory pipeline (`stage1_outputs`); `--path`
+  optionally narrows to a single memory DB. `source_hash` is derived from
+  `repo_root|source_path|source_session|excerpt`. Renders to `.codex/weave.json` (the recall command
+  payload) and `.codex/MEMORY.md`.
+- **Copilot** — detected by `scan` and written by `render` to `.github/copilot-instructions.md`, but
+  there is no import path: Copilot has no durable memory store to pull from, so it is a projection
+  consumer only.
+- `render --agent=all` writes every projection; `render --agent=current` resolves the operating
+  agent and falls back to the full set for unknown labels. `render --agent=workflow` refreshes the
+  managed memory block in `WORKFLOW.md` itself.
+
+The graph stays authoritative: import pulls in, crystallize curates, render pushes back out. Any
+agent — including future or custom labels — reads the same active set through `recall`.
+
 ## Quality Gate — GraphPolicyViolation
 
 `wv done` enforces CC thresholds (Bash: 100, Python: 25, TypeScript: 15). If a node touches a file

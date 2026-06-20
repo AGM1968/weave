@@ -1257,10 +1257,14 @@ cmd_tree() {
             FROM $cap_src
             ORDER BY root_id, depth, id;
         ")
-        [ -z "$results" ] && echo "[]" || echo "$results"
+        [ -z "$results" ] && results="[]"
         if [ "$node_cap" -gt 0 ] && [ "$total_nodes" -gt "$node_cap" ]; then
+            results=$(printf '%s\n' "$results" | jq \
+                --argjson shown "$node_cap" --argjson total "$total_nodes" \
+                '. + [{_meta:"truncation", shown:$shown, total:$total, truncated:true}]')
             echo "wv tree: showing $node_cap of $total_nodes nodes (use --all to lift the cap)" >&2
         fi
+        echo "$results"
         return
     fi
 
