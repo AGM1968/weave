@@ -475,6 +475,45 @@ describe("Weave MCP Server", () => {
       expect(health).toHaveProperty("score");
     });
 
+    it("weave_guide forwards procedure id to wv guide --procedure", async () => {
+      // An unknown id round-trips through the CLI; the error echoes the exact id
+      // and config path, proving the MCP surface forwards --procedure=<id> rather
+      // than silently dropping it or sharing only the CLI backend by name.
+      const response = await client.request("tools/call", {
+        name: "weave_guide",
+        arguments: { procedure: "zzz-mcp-fwd-probe" },
+      });
+      expect(response.error).toBeUndefined();
+      const result = response.result as { isError?: boolean; content: { text: string }[] };
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("zzz-mcp-fwd-probe");
+    });
+
+    it("weave_guide rejects topic and procedure together", async () => {
+      const response = await client.request("tools/call", {
+        name: "weave_guide",
+        arguments: { topic: "workflow", procedure: "session" },
+      });
+      expect(response.error).toBeUndefined();
+      const result = response.result as { isError?: boolean; content: { text: string }[] };
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("either topic or procedure");
+    });
+
+    it("weave_guide advertises both topic and procedure in its schema", async () => {
+      const response = await client.request("tools/list");
+      expect(response.error).toBeUndefined();
+      const tools = (
+        response.result as {
+          tools: Array<{ name: string; inputSchema: { properties?: Record<string, unknown> } }>;
+        }
+      ).tools;
+      const guide = tools.find((t) => t.name === "weave_guide");
+      expect(guide).toBeDefined();
+      expect(guide?.inputSchema.properties).toHaveProperty("topic");
+      expect(guide?.inputSchema.properties).toHaveProperty("procedure");
+    });
+
     it("weave_list should return json-v2 node list", async () => {
       const nodeId = await createTrackedNode("test-list-node", { probe: "list-json-v2" });
       const response = await client.request("tools/call", {

@@ -1219,6 +1219,10 @@ const TOOLS: Tool[] = [
           description:
             "Topic to show: workflow (default, 5-step process), github (issue integration), learnings (format + commands), context (load policy + wv context usage), routing (phase loop + tool classes), mcp (server setup + tools), verification (test-map + gate flow), instrumentation (opt-in knobs), config (durable knobs), discovery (read-only audit toolset)",
         },
+        procedure: {
+          type: "string",
+          description: "Installed canonical procedure id. Mutually exclusive with topic; returns the procedure body.",
+        },
       },
       required: [],
     },
@@ -2346,8 +2350,13 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   weave_guide: (args) => {
     let result: string;
     const topic = args.topic as string | undefined;
+    const procedure = args.procedure as string | undefined;
+    if (topic && procedure) {
+      throw new Error("weave_guide accepts either topic or procedure, not both");
+    }
     const cmd = ["guide"];
-    if (topic) cmd.push(`--topic=${topic}`);
+    if (procedure) cmd.push(`--procedure=${procedure}`);
+    else if (topic) cmd.push(`--topic=${topic}`);
     result = wv(cmd);
     return result;
   },
@@ -2518,7 +2527,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.62.1",
+      version: "1.63.0",
     },
     {
       capabilities: {

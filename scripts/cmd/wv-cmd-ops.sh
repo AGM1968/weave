@@ -5294,13 +5294,28 @@ cmd_edge_types() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_guide() {
-    local topic=""
+    local topic="" procedure=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --topic=*) topic="${1#*=}" ;;
+            --procedure=*) procedure="${1#*=}" ;;
         esac
         shift
     done
+
+    if [ -n "$procedure" ]; then
+        if [[ ! "$procedure" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "Error: invalid procedure id '$procedure'" >&2
+            return 1
+        fi
+        local procedure_file="${WV_CONFIG_DIR:-$HOME/.config/weave}/procedures/${procedure}.md"
+        if [ ! -f "$procedure_file" ]; then
+            echo "Error: unknown procedure '$procedure' (not installed: $procedure_file)" >&2
+            return 1
+        fi
+        cat "$procedure_file"
+        return 0
+    fi
 
     case "$topic" in
         workflow|"")

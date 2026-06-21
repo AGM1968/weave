@@ -230,6 +230,57 @@ download_file() {
     echo "$dst" >> "$MANIFEST"
 }
 
+# install_procedure_assets — install canonical procedure bodies outside consumer repos.
+# Local installs copy the source tree; download installs enumerate the flat canonical tree.
+# The destination is a fully-managed mirror: it is wiped and repopulated so a procedure or
+# resource deleted from the source is also removed here (otherwise init-repo would keep
+# projecting it, bypassing the adapters' stale cleanup).
+install_procedure_assets() {
+    local destination="$CONFIG_DIR/procedures"
+    local staging old procedure_file
+    # Populate a sibling staging directory first.  Removing the live canonical
+    # set before a failed local copy/download would leave init-repo with no
+    # usable procedures, and would break the deletion guarantee on retry.
+    mkdir -p "$CONFIG_DIR"
+    staging=$(mktemp -d "$CONFIG_DIR/.procedures-staging.XXXXXX")
+    if [ -d "./templates/procedures" ]; then
+        if ! cp -a ./templates/procedures/. "$staging/"; then
+            rm -rf "$staging"
+            return 1
+        fi
+    else
+        local listing procedure_files
+        if ! listing=$(curl -fsSL "https://api.github.com/repos/AGM1968/weave/contents/templates/procedures?ref=main"); then
+            rm -rf "$staging"
+            return 1
+        fi
+        # Do not treat a failed/empty API response as an empty canonical set: a
+        # successful swap in that state would erase a known-good installation.
+        if ! procedure_files=$(printf '%s' "$listing" | jq -er '[.[]? | select(.type == "file") | .name] | if length > 0 then .[] else error("no procedure files") end'); then
+            rm -rf "$staging"
+            return 1
+        fi
+        while IFS= read -r procedure_file; do
+            [ "$procedure_file" = ".gitkeep" ] && continue
+            if ! curl -fsSL "$REPO/templates/procedures/$procedure_file" -o "$staging/$procedure_file"; then
+                rm -rf "$staging"
+                return 1
+            fi
+            echo "$destination/$procedure_file" >> "$MANIFEST"
+        done <<< "$procedure_files"
+    fi
+
+    old="$CONFIG_DIR/.procedures-old.$$"
+    rm -rf "$old"
+    if [ -e "$destination" ]; then mv "$destination" "$old"; fi
+    if ! mv "$staging" "$destination"; then
+        [ -e "$old" ] && mv "$old" "$destination"
+        rm -rf "$staging"
+        return 1
+    fi
+    rm -rf "$old"
+}
+
 install_git_hook_from_repo() {
     local hook_path="$1"
     local marker="$2"
@@ -337,6 +388,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-journal.sh "$LIB_DIR/lib/wv-journal.sh"
     install_file ./scripts/lib/wv-gh.sh "$LIB_DIR/lib/wv-gh.sh"
     install_file ./scripts/lib/wv-delta.sh "$LIB_DIR/lib/wv-delta.sh"
+    install_file ./scripts/lib/wv-workflow-classes.gen.sh "$LIB_DIR/lib/wv-workflow-classes.gen.sh"
     install_file ./scripts/lib/wv-hook-common.sh "$LIB_DIR/lib/wv-hook-common.sh"
     install_file ./scripts/lib/wv-resolve-project.sh "$LIB_DIR/lib/wv-resolve-project.sh"
     install_file ./scripts/lib/wv-resolve-runtime.sh "$LIB_DIR/lib/wv-resolve-runtime.sh"
@@ -386,11 +438,14 @@ if [ -f "./scripts/wv" ]; then
     # Scripts
     cp ./scripts/context-guard.sh "$CONFIG_DIR/"
     cp ./scripts/resolve-refs.sh "$CONFIG_DIR/"
+    cp ./scripts/project-procedures.sh "$CONFIG_DIR/"
+    cp ./scripts/gen-procedures.sh "$CONFIG_DIR/"
     # Lib available to hooks from global path (~/.config/weave/hooks/../lib/)
     cp ./scripts/lib/wv-resolve-project.sh "$CONFIG_DIR/lib/wv-resolve-project.sh"
     cp ./scripts/lib/wv-resolve-runtime.sh "$CONFIG_DIR/lib/wv-resolve-runtime.sh"
     cp ./scripts/lib/wv-validate.sh "$CONFIG_DIR/lib/wv-validate.sh"
     cp ./scripts/lib/wv-config.sh "$CONFIG_DIR/lib/wv-config.sh"
+    cp ./scripts/lib/wv-workflow-classes.gen.sh "$CONFIG_DIR/lib/wv-workflow-classes.gen.sh"
     cp ./scripts/lib/wv-hook-common.sh "$CONFIG_DIR/lib/wv-hook-common.sh"
     # Claude hooks (all 9 — registered globally via ~/.claude/settings.json under Alt-A)
     cp ./.claude/hooks/context-guard.sh "$CONFIG_DIR/hooks/"
@@ -459,6 +514,7 @@ else
     download_file "$REPO/scripts/lib/wv-journal.sh" "$LIB_DIR/lib/wv-journal.sh"
     download_file "$REPO/scripts/lib/wv-gh.sh" "$LIB_DIR/lib/wv-gh.sh"
     download_file "$REPO/scripts/lib/wv-delta.sh" "$LIB_DIR/lib/wv-delta.sh"
+    download_file "$REPO/scripts/lib/wv-workflow-classes.gen.sh" "$LIB_DIR/lib/wv-workflow-classes.gen.sh"
     download_file "$REPO/scripts/lib/wv-hook-common.sh" "$LIB_DIR/lib/wv-hook-common.sh"
     download_file "$REPO/scripts/lib/wv-resolve-project.sh" "$LIB_DIR/lib/wv-resolve-project.sh"
     download_file "$REPO/scripts/lib/wv-resolve-runtime.sh" "$LIB_DIR/lib/wv-resolve-runtime.sh"
@@ -525,11 +581,15 @@ else
     # Scripts
     curl -sSL "$REPO/scripts/context-guard.sh" -o "$CONFIG_DIR/context-guard.sh"
     curl -sSL "$REPO/scripts/resolve-refs.sh" -o "$CONFIG_DIR/resolve-refs.sh"
+    curl -sSL "$REPO/scripts/project-procedures.sh" -o "$CONFIG_DIR/project-procedures.sh"
+    curl -sSL "$REPO/scripts/gen-procedures.sh" -o "$CONFIG_DIR/gen-procedures.sh"
     # Lib available to hooks from global path (~/.config/weave/hooks/../lib/)
     curl -sSL "$REPO/scripts/lib/wv-resolve-project.sh" -o "$CONFIG_DIR/lib/wv-resolve-project.sh"
     curl -sSL "$REPO/scripts/lib/wv-resolve-runtime.sh" -o "$CONFIG_DIR/lib/wv-resolve-runtime.sh"
     curl -sSL "$REPO/scripts/lib/wv-validate.sh" -o "$CONFIG_DIR/lib/wv-validate.sh"
     curl -sSL "$REPO/scripts/lib/wv-config.sh" -o "$CONFIG_DIR/lib/wv-config.sh"
+    # Must land before wv-hook-common.sh sources it; absent here, hooks silently disable classification.
+    curl -sSL "$REPO/scripts/lib/wv-workflow-classes.gen.sh" -o "$CONFIG_DIR/lib/wv-workflow-classes.gen.sh"
     curl -sSL "$REPO/scripts/lib/wv-hook-common.sh" -o "$CONFIG_DIR/lib/wv-hook-common.sh"
     # Claude hooks
     curl -sSL "$REPO/.claude/hooks/context-guard.sh" -o "$CONFIG_DIR/hooks/context-guard.sh"
@@ -590,8 +650,11 @@ chmod +x "$INSTALL_DIR/wv"
 chmod +x "$INSTALL_DIR/wv-test"
 chmod +x "$CONFIG_DIR/context-guard.sh"
 chmod +x "$CONFIG_DIR/resolve-refs.sh"
+chmod +x "$CONFIG_DIR/project-procedures.sh"
+chmod +x "$CONFIG_DIR/gen-procedures.sh"
 chmod +x "$CONFIG_DIR/hooks/"*.sh
 chmod +x "$CONFIG_DIR/skills/weave-audit/audit-report.sh"
+install_procedure_assets
 
 # Alt-A: Register all hooks globally in ~/.claude/settings.json
 # Per-project settings.json should have NO hooks key (it would shadow global hooks)
@@ -1785,6 +1848,12 @@ CODEXEOF
 fi
 
 done  # end for AGENT in AGENTS
+
+# Procedure bodies live in the installed config; this projects only the adapter
+# requested by init-repo and never writes user-owned AGENTS.md.
+if [ -x "$CONFIG_DIR/project-procedures.sh" ]; then
+    "$CONFIG_DIR/project-procedures.sh" --repo="$REPO_ROOT" --agent="$AGENT_ARG"
+fi
 
 # ── Summary ──
 echo ""

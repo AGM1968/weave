@@ -346,6 +346,34 @@ test_hc_classify_tool_project_file_enforced() {
     assert_equals "true" "$should_check" "_hc_classify_tool: project-local .claude/ edit stays enforced (SHOULD_CHECK=true)"
 }
 
+test_hc_init_hygiene_tally_uses_hook_adapter_class() {
+    echo "-- _hc_init_hygiene_tally: counts every manifest hook edit tool"
+    [ -f "$HOOK_COMMON" ] || { _hc_xfail "hook-common not yet created"; return; }
+    setup_test_env
+    local tally
+    tally=$(bash -c "
+        export WV_HOT_ZONE='$TEST_DIR'
+        source '$HOOK_COMMON' 2>/dev/null
+        _hc_init_hygiene_tally 'mcp__ide__executeCode'
+        printf '%s' \"\$_HC_TALLY_FILE\"
+    " 2>/dev/null || echo "ERR")
+    assert_equals "$TEST_DIR/session-edits.json" "$tally" "_hc_init_hygiene_tally: uses manifest tool class"
+}
+
+test_hc_classify_tool_manifest_commands_bypass() {
+    echo "-- _hc_classify_tool: manifest safe commands bypass enforcement"
+    [ -f "$HOOK_COMMON" ] || { _hc_xfail "hook-common not yet created"; return; }
+    local command bypass
+    for command in bootstrap search context quick recover; do
+        bypass=$(bash -c "
+            source '$HOOK_COMMON' 2>/dev/null
+            _hc_classify_tool 'Bash' '{\"cmd\":\"wv $command\"}'
+            echo \"\$_HC_BYPASS_CMD\"
+        " 2>/dev/null || echo "ERR")
+        assert_equals "true" "$bypass" "_hc_classify_tool: wv $command bypasses from manifest"
+    done
+}
+
 test_hc_check_phase_allow_execute() {
     echo "-- _hc_check_phase: allow edit in execute phase"
     [ -f "$HOOK_COMMON" ] || { _hc_xfail "hook-common not yet created"; return; }
@@ -509,6 +537,8 @@ main() {
     test_hc_check_installed_path_block
     test_hc_classify_tool_home_claude_exempt
     test_hc_classify_tool_project_file_enforced
+    test_hc_init_hygiene_tally_uses_hook_adapter_class
+    test_hc_classify_tool_manifest_commands_bypass
     test_hc_check_phase_allow_execute
     test_hc_check_phase_block_discover_edit
     test_hc_check_active_node_allow

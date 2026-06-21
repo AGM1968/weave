@@ -24,9 +24,16 @@ TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
 
-# Paths
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Paths. Resolve once from an absolute script path, then leave any inherited cwd
+# before setup removes a prior test directory that may currently contain the shell.
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+case "$SCRIPT_SOURCE" in
+    /*) ;;
+    *) SCRIPT_SOURCE="$PWD/$SCRIPT_SOURCE" ;;
+esac
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 HOOKS_DIR="$PROJECT_ROOT/.claude/hooks"
 WV="$PROJECT_ROOT/scripts/wv"
 export WV_LIB_DIR="$PROJECT_ROOT/scripts"
@@ -114,6 +121,7 @@ assert_exit_code() {
 
 # Setup: create isolated test environment with git repo and wv database
 setup_test_env() {
+    cd "$PROJECT_ROOT"
     rm -rf "$TEST_DIR"
     mkdir -p "$TEST_DIR/project/.claude/hooks"
     mkdir -p "$TEST_DIR/project/.weave"
@@ -143,6 +151,7 @@ export WV_PROJECT_DIR="$TEST_DIR/project"
 }
 
 setup_uninitialized_project() {
+    cd "$PROJECT_ROOT"
     rm -rf "$TEST_DIR"
     mkdir -p "$TEST_DIR/project/.claude/hooks"
     mkdir -p "$TEST_DIR/project/scripts"
@@ -163,6 +172,16 @@ setup_uninitialized_project() {
     export CLAUDE_PROJECT_DIR="$TEST_DIR/project"
     export WV_PROJECT_DIR="$TEST_DIR/project"
 }
+
+if [ "${1:-}" = "--cwd-smoke" ]; then
+    # The second setup starts from the first disposable project; without the
+    # known-good cd above it deletes its own inherited cwd and later hooks fail.
+    setup_test_env
+    setup_uninitialized_project
+    [ "$PWD" = "$TEST_DIR/project" ]
+    echo "deleted-cwd setup is resilient"
+    exit 0
+fi
 
 add_active_node() {
     local text="$1"

@@ -4,7 +4,47 @@
 
 ## Unreleased
 
-## [1.62.1] - 2026-06-20
+## [1.63.0] - 2026-06-21
+
+### Added
+
+- **Agent-neutral procedure delivery system** — workflow procedures now live once as host-neutral
+  canonical sources (`templates/procedures/<name>.md`) with a small contract header (`id`,
+  `description`, `fallback`, `visibility`, `adapters`, `claude_skill`, `resources`), installed to
+  `$CONFIG_DIR/procedures/` and projected into each harness's native surface:
+  - **Claude** — auto-discoverable `.claude/skills/<skill>/SKILL.md` (marker-managed, transactional
+    swap that preserves hand-written skills).
+  - **Codex** — managed entries in `.codex/weave.json`.
+  - **Copilot** — a marker-delimited block in `.github/copilot-instructions.md`.
+  - Codex/Copilot also resolve `wv guide --procedure=<id>` and MCP `weave_guide({procedure})` as a
+    portable CLI/MCP fallback.
+- **`wv guide --procedure=<id>`** and MCP **`weave_guide({procedure})`** — serve an installed
+  canonical procedure body on demand (mutually exclusive with `--topic`).
+- **Procedure visibility contract (`local` | `shared`)** — only `shared` + `ready` procedures
+  project into consumer surfaces and ship in releases; a consumer can narrow (never widen) via
+  `.weave/procedures-visibility.conf`.
+- **`gen-procedures.sh` contract validator** — enforces one canonical source per id, adapter
+  reachability, unambiguous Claude skill mapping, resource integrity, and portable references; runs
+  as a projection gate before any consumer surface is mutated.
+
+### Changed
+
+- **WORKFLOW.md is now a thin reference** — extracted the grown-in-place procedures (epic decompose,
+  graph hygiene, quality gate, repair, rules, session context, subagent delegation, agent memory,
+  code search, pre-commit gate) into canonical procedures, leaving a procedure index plus the
+  reference tables. WORKFLOW.md shrank from 697 to 261 lines. GitHub Integration stays as standing
+  reference material (no `gh-sync.md`).
+- **Install / release reconcile procedures as a managed set** — `install.sh` repopulates
+  `$CONFIG_DIR/procedures/` with deletion semantics (a removed canonical procedure stops
+  projecting), `build-release.sh` validates contracts and ships only `shared` + `ready` procedures,
+  and adapter projection is transactional with same-id ownership preflight so hand-authored
+  skills/entries are never overwritten.
+
+### Fixed
+
+- **Stale-projection cleanup** — demoting (`shared` → `local`), deleting, or drafting a procedure
+  now prunes its managed Claude skill, Codex entry, and Copilot line on the next
+  `wv init-repo --update`.
 
 ### Fixed
 

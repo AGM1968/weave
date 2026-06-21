@@ -100,7 +100,7 @@ _hc_init_hygiene_tally() {
     _HC_TALLY_FILE=""
     _HC_NEW_TOTAL=""
     _HC_WITH_ACTIVE=""
-    if [[ "$tool" =~ ^(Edit|Write|NotebookEdit|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file|edit_notebook_file)$ ]]; then
+    if _wf_in_list "$tool" "${_WF_HOOK_EDIT_TOOLS[@]}"; then
         _HC_TALLY_FILE="${_HC_HOT_ZONE}/session-edits.json"
         local prior total with_active
         prior=$(cat "$_HC_TALLY_FILE" 2>/dev/null || echo '{}')
@@ -138,7 +138,7 @@ _hc_check_read_size() {
 # Prints an explanation to stderr; returns 2 so caller can: ... || exit $?
 _hc_check_installed_path() {
     local tool="$1" tool_input="$2"
-    [[ "$tool" =~ ^(Edit|Write|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file)$ ]] || return 0
+    _wf_in_list "$tool" "${_WF_HOOK_EDIT_TOOLS[@]}" || return 0
     local file_path
     # VS Code sends camelCase (filePath); Claude Code sends snake_case (file_path)
     file_path=$(printf '%s' "$tool_input" | jq -r '.file_path // .filePath // empty' 2>/dev/null)
@@ -159,6 +159,36 @@ EOF
 #   _HC_SHOULD_CHECK  — true if active-node enforcement should run
 #   _HC_IS_EDIT_TOOL  — true if tool is an edit operation (not just a wv-done Bash call)
 #   _HC_BYPASS_CMD    — true if caller should exit 0 immediately (bootstrap command)
+_HC_CLASSES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# Generated at install/build time from templates/workflow-classes.conf. Kept adjacent
+# to this library so source and installed hooks resolve the identical projection.
+#
+# This library is sourced on the LEFT of pre-action's `source ... || ... || true`
+# chain, which suppresses set -e — so a missing/partial projection would NOT abort,
+# it would leave the _WF_* arrays empty and SILENTLY disable all classification
+# (every edit/close would fall through to allow). A counterweight must never
+# self-disable silently: guard the source, and if the projection did not populate
+# the classes, fall back to the canonical lists and warn. The fallback duplicates
+# the manifest deliberately as a last resort; the manifest remains the source of
+# truth for the normal (projection-present) path.
+source "$_HC_CLASSES_DIR/wv-workflow-classes.gen.sh" 2>/dev/null || true
+if [ "${#_WF_HOOK_EDIT_TOOLS[@]}" -eq 0 ]; then
+    echo "wv hook: workflow-classes projection missing or empty; using built-in fallback" >&2
+    _WF_BOOTSTRAP_ALLOW=( add work ready status list show sync load doctor bootstrap search context quick recover )
+    _WF_CLOSE_GATED=( "done" ship )
+    _WF_HOOK_EDIT_TOOLS=( Edit Write NotebookEdit mcp__ide__executeCode create_file replace_string_in_file insert_edit_into_file multi_replace_string_in_file edit_notebook_file )
+    _WF_CLAUDE_EDIT_EXEMPT_PREFIXES=( "\$HOME/.claude/" )
+fi
+
+# _wf_in_list — exact membership test for generated workflow classes.
+_wf_in_list() {
+    local needle="$1"
+    shift
+    local value
+    for value in "$@"; do [ "$value" = "$needle" ] && return 0; done
+    return 1
+}
+
 _hc_classify_tool() {
     local tool="$1" tool_input="$2"
     _HC_SHOULD_CHECK=false
@@ -166,7 +196,7 @@ _hc_classify_tool() {
     _HC_BYPASS_CMD=false
 
     # Edit-class tools (Claude Code + VS Code names)
-    if [[ "$tool" =~ ^(Edit|Write|NotebookEdit|mcp__ide__executeCode|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file|edit_notebook_file)$ ]]; then
+    if _wf_in_list "$tool" "${_WF_HOOK_EDIT_TOOLS[@]}"; then
         local file_path
         # VS Code sends camelCase (filePath); Claude Code sends snake_case (file_path)
         file_path=$(printf '%s' "$tool_input" | jq -r '.file_path // .filePath // empty' 2>/dev/null)
@@ -182,9 +212,11 @@ _hc_classify_tool() {
         # $HOME/.claude/projects/<repo-slug>/memory/*.md write into the graph as a
         # mem_status=candidate node. See PROPOSAL-wv-agent-memory-substrate S5 and
         # the feedback_memory_writes_external memory.
-        if [[ -n "${HOME:-}" && "$file_path" == "$HOME/.claude/"* ]]; then
-            return 0
-        fi
+        local exempt_prefix
+        for exempt_prefix in "${_WF_CLAUDE_EDIT_EXEMPT_PREFIXES[@]}"; do
+            exempt_prefix="${exempt_prefix/\$HOME/${HOME:-}}"
+            [[ -n "${HOME:-}" && "$file_path" == "$exempt_prefix"* ]] && return 0
+        done
         _HC_SHOULD_CHECK=true
         _HC_IS_EDIT_TOOL=true
         return 0
@@ -194,16 +226,24 @@ _hc_classify_tool() {
     if [[ "$tool" == "Bash" || "$tool" == "run_in_terminal" ]]; then
         local cmd
         cmd=$(printf '%s' "$tool_input" | jq -r '.cmd // .command // empty' 2>/dev/null)
-        # wv done / wv-close → enforce active node
-        if [[ "$cmd" =~ (wv[[:space:]]+done|wv-close|wv[[:space:]]done) ]]; then
-            _HC_SHOULD_CHECK=true
-            return 0
-        fi
+        # Close-class commands / wv-close → enforce active node.
+        local close_command
+        for close_command in "${_WF_CLOSE_GATED[@]}"; do
+            [[ "$cmd" =~ wv[[:space:]]+"$close_command" ]] && {
+                _HC_SHOULD_CHECK=true
+                return 0
+            }
+        done
+        if [[ "$cmd" =~ wv-close ]]; then _HC_SHOULD_CHECK=true; return 0; fi
         # Bootstrap commands — always allow (catch-22 prevention)
-        if [[ "$cmd" =~ ^[[:space:]]*(wv[[:space:]]+(add|work|ready|status|list|show|sync|load|doctor)|wv-init-repo|wv[[:space:]]+--help) ]]; then
-            _HC_BYPASS_CMD=true
-            return 0
-        fi
+        local bootstrap_command
+        for bootstrap_command in "${_WF_BOOTSTRAP_ALLOW[@]}"; do
+            [[ "$cmd" =~ ^[[:space:]]*wv[[:space:]]+"$bootstrap_command" ]] && {
+                _HC_BYPASS_CMD=true
+                return 0
+            }
+        done
+        if [[ "$cmd" =~ ^[[:space:]]*(wv-init-repo|wv[[:space:]]+--help) ]]; then _HC_BYPASS_CMD=true; return 0; fi
     fi
 }
 

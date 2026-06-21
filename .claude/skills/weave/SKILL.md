@@ -10,6 +10,11 @@ Context Pack generation, blocker validation, and learning capture.
 
 **Current Implementation:** All four phases (INTAKE, CONTEXT, EXECUTE, CLOSE)
 
+> **Memory policy handoff:** `/weave` remains the Claude orchestration facade. For graph-authoritative
+> memory scan, import, crystallization, recall, and render policy, use
+> `wv guide --procedure=agent-memory`. That canonical procedure is shared with non-Claude harnesses;
+> this skill does not duplicate or own its body.
+
 > **Delegation design** (unimplemented): See `docs/DESIGN-weave-delegation.md` for tier routing,
 > Haiku subagent tasks, and result caching design.
 
