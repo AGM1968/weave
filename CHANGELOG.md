@@ -4,6 +4,44 @@
 
 ## Unreleased
 
+## [1.64.0] - 2026-06-25
+
+### Added
+
+- **Cross-harness agent-source attribution** — telemetry now records which harness originated a `wv`
+  call (Claude, Codex, VS Code Copilot) honestly across machines. Codex and Copilot are attested via
+  host markers rather than guessed, behind a documented cross-harness call-source contract
+  (wv-276c18 epic: wv-8af785, wv-67517b).
+- **Agent identity separated from hot-zone placement** — `resolve_agent_id` (identity) and
+  `is_sandboxed_runtime` (placement) are now independent axes, and the run-cache key includes
+  identity so concurrent Claude/Codex agents no longer leak each other's cached results (wv-727175).
+- **Graph memory crystallized into Codex and Copilot surfaces** — `wv memory render --agent=codex`
+  writes `.codex/weave.json` and `--agent=copilot` writes a managed block in
+  `.github/copilot-instructions.md`, projecting active `type=memory` nodes plus recall/capture
+  guidance so cross-harness agents discover and recall graph memory (wv-de2ac7).
+- **Dev-only `md2pdf-hook.sh`** — syncs PDF copies of docs on `.md` change (development tooling).
+- **Repair Workflow guidance in the shipped `WORKFLOW.md`** — documents turning detected workflow
+  defects into tracked remediation and the resumable `needs_human_verification` close, so consumers'
+  workflow reference covers the repair loop.
+
+### Changed
+
+- **`wv ready` announces tree truncation** in its text output, matching the `--json` truncation
+  sentinel so capped result sets are visible to humans, not just parsers.
+- **`wv impact` full traversal includes `relates_to` edges**, so blast-radius reports follow the
+  relationship the cross-agent recall study depends on.
+
+### Fixed
+
+- **Delta-replay durability** — `wv load` no longer reverts a newer `state.sql` when replaying stale
+  local deltas. Node upserts now apply only when `excluded.updated_at >= nodes.updated_at`, and node
+  UPDATE deltas carry an `updated_at` guard. Prevents cross-agent double-claims after a fresh
+  hot-zone load (wv-875c72).
+- **Session-start snapshot guard** — the session-start hook refuses to commit a `.weave` snapshot
+  smaller than HEAD, so a stale-DB shrink can no longer clobber the committed graph.
+- **MCP server test suite isolated from the live Weave graph**, so running the MCP tests no longer
+  reads or mutates the developer's working graph.
+
 ## [1.63.0] - 2026-06-21
 
 ### Added

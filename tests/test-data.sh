@@ -17,6 +17,7 @@ export WV_DB="$TEST_DIR/hot/brain.db"
 export WV_REQUIRE_LEARNING=0
 export WEAVE_DIR="$TEST_DIR/.weave"
 export WV_PROJECT_DIR="$TEST_DIR"
+export WV_AGENT_ID="test-data-agent"
 mkdir -p "$WV_HOT_ZONE" "$WEAVE_DIR"
 cd "$TEST_DIR"
 git init -q 2>/dev/null || true
@@ -24,10 +25,12 @@ git init -q 2>/dev/null || true
 # Counter for tests
 TESTS_RUN=0
 TESTS_PASSED=0
+TESTS_XFAIL=0
 
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
 # Reset database for test isolation
@@ -49,6 +52,23 @@ assert_equals() {
         echo -e "  ${RED}✗${NC} $msg"
         echo "    Expected: '$expected'"
         echo "    Actual:   '$actual'"
+    fi
+    TESTS_RUN=$((TESTS_RUN + 1))
+}
+
+# Documents a known bug while keeping CI green: expected = desired POST-FIX value.
+# Matches  -> the bug is fixed, counts as a normal pass (flip to assert_equals).
+# Differs  -> XFAIL: recorded, non-failing (TESTS_XFAIL), suite still passes.
+assert_xfail() {
+    local expected="$1"
+    local actual="$2"
+    local msg="${3:-xfail assertion}"
+    if [ "$expected" = "$actual" ]; then
+        echo -e "  ${GREEN}✓${NC} $msg (FIXED — promote to assert_equals)"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo -e "  ${YELLOW}[XFAIL]${NC} $msg (known bug; expected post-fix='$expected', got='$actual')"
+        TESTS_XFAIL=$((TESTS_XFAIL + 1))
     fi
     TESTS_RUN=$((TESTS_RUN + 1))
 }
@@ -936,12 +956,44 @@ assert_contains "$pf_out" "3d" "findings list age column survives pipe in node t
 
 echo ""
 
+# ─── Durability replay: claim/agent identity through state.sql + deltas (wv-69dd9a) ──
+# Repro for the delta-replay reversion bug surfaced by wv-727175's durability criterion:
+# a claim is durable in state.sql, but wv load replays a stale pre-claim delta on top and
+# reverts it. auto_sync is disabled under the suite's custom WV_DB, so run in an isolated
+# hot-zone-only sandbox where real deltas are emitted.
+echo "-- durability: claim identity through fresh hot-zone load (wv-69dd9a)"
+_rp=$(mktemp -d)
+(
+    cd "$_rp" && git init -q
+    _Ei=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_rp" "WV_HOT_ZONE=$_rp/hz" "WEAVE_DIR=$_rp/.weave"
+         WV_REQUIRE_LEARNING=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0 WV_AGENT_ID=codex-replaybox)
+    "${_Ei[@]}" "$WV" init >/dev/null 2>&1
+    _id=$("${_Ei[@]}" "$WV" add "durable claim" --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | head -1)
+    "${_Ei[@]}" "$WV" work "$_id" >/dev/null 2>&1
+    "${_Ei[@]}" "$WV" sync >/dev/null 2>&1
+    printf '%s' "$_id" > "$_rp/.rid"
+) >/dev/null 2>&1 || true
+_rid=$(cat "$_rp/.rid" 2>/dev/null || echo "")
+_E=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_rp" "WV_HOT_ZONE=$_rp/hz" "WEAVE_DIR=$_rp/.weave"
+    WV_REQUIRE_LEARNING=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0 WV_AGENT_ID=codex-replaybox)
+# Load WITH deltas: stale pre-claim add-delta must not replay over the newer state.sql
+rm -rf "$_rp/hz"; "${_E[@]}" "$WV" load >/dev/null 2>&1 || true
+_exists=$(sqlite3 "$_rp/hz/brain.db" "SELECT COUNT(*) FROM nodes WHERE id='$_rid';" 2>/dev/null || echo "0")
+_cb_with=$(sqlite3 "$_rp/hz/brain.db" "SELECT json_extract(metadata,'\$.claimed_by') FROM nodes WHERE id='$_rid';" 2>/dev/null || echo "")
+assert_equals "1" "$_exists" "node row survives fresh hot-zone load (graph data durable)"
+assert_equals "codex-replaybox" "$_cb_with" "claim identity survives wv load WITH delta replay"
+# Positive control: load WITHOUT deltas keeps the claim — isolates the bug to delta replay
+rm -rf "$_rp/hz" "$_rp/.weave/deltas"; "${_E[@]}" "$WV" load >/dev/null 2>&1 || true
+_cb_without=$(sqlite3 "$_rp/hz/brain.db" "SELECT json_extract(metadata,'\$.claimed_by') FROM nodes WHERE id='$_rid';" 2>/dev/null || echo "")
+assert_equals "codex-replaybox" "$_cb_without" "claim is durable in state.sql (reverted only by delta replay)"
+rm -rf "$_rp"
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 echo "═══════════════════════════════════════════════════════════════════════════"
-echo -e "Tests: $TESTS_PASSED/$TESTS_RUN passed"
-if [ "$TESTS_PASSED" -eq "$TESTS_RUN" ]; then
+echo -e "Tests: $TESTS_PASSED/$TESTS_RUN passed (${TESTS_XFAIL} xfail)"
+if [ "$((TESTS_PASSED + TESTS_XFAIL))" -eq "$TESTS_RUN" ]; then
     echo -e "${GREEN}All tests passed!${NC}"
     exit 0
 else

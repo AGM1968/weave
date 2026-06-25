@@ -208,6 +208,27 @@ Good learnings are specific, actionable, and scoped to a concrete context.
 Hooks and the CLI enforce active-node, close, and verification invariants. For advisory workflow
 discipline and repair/delegation guidance, use the Procedures index above.
 
+## Repair Workflow
+
+When execution reveals a real workflow problem (broken hook, stale guidance, close-time friction, or
+a missing guardrail), turn the defect into tracked remediation rather than fixing it silently:
+
+1. Fix it in the current node only if it directly blocks safe completion.
+2. Otherwise create a tracked repair node: `wv add "task: ..." --gh --parent=<feature-or-epic>`.
+3. If current work depends on the fix, block it: `wv block <current-id> --by=<repair-id>`.
+4. Save a trail before continuing:
+   `wv trails save --msg="Detected workflow issue, created repair node, next step is ..."`.
+
+For a GitHub sync interrupted by a timeout, Ctrl-C, or crash, resume with
+`wv sync --gh --mode=repair` (see Sync modes above).
+
+### Resumable close (`needs_human_verification`)
+
+When `wv done` cannot auto-verify a close, the node is not lost: it is captured in a `pending_close`
+state and flagged `needs_human_verification` rather than blocking the agent. Resume the close with
+explicit human approval once the evidence is in hand. This keeps non-interactive agent flows from
+hanging on close-time prompts while preserving the verification gate.
+
 ## Session End Behavior
 
 The stop hook has one hard block; everything else soft-warns:

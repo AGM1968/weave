@@ -86,11 +86,19 @@ wv_run_cache_invalidate() {
 }
 
 _wv_run_cache_key() {
-    # Hash argv + presentation context into a cache key
+    # Hash argv + presentation context into a cache key. The resolved agent
+    # identity MUST be in the key: agent-filtered reads (e.g. wv ready hides
+    # nodes claimed by other agents) differ per agent, so two agents sharing a
+    # hot zone would otherwise serve each other stale, wrongly-filtered output
+    # (wv-727175).
     local tty_flag=0
     [ -t 1 ] && tty_flag=1
-    printf '%s\0%s\0%s\0%s\0%s\0' \
-        "$*" "$tty_flag" "${NO_COLOR:-}" "${WV_MODE:-}" "${WV_AGENT:-0}" \
+    local agent_id=""
+    if command -v resolve_agent_id >/dev/null 2>&1; then
+        agent_id=$(resolve_agent_id)
+    fi
+    printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+        "$*" "$tty_flag" "${NO_COLOR:-}" "${WV_MODE:-}" "${WV_AGENT:-0}" "$agent_id" \
         | md5sum | cut -c1-16
 }
 

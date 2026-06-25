@@ -29,15 +29,97 @@ is_container() {
     [ "${_WV_CONTAINER:-no}" = "yes" ]
 }
 
-is_codex_runtime() {
-    # Sandboxed agent shells (Codex/Copilot/Claude Code) do not reliably persist
-    # /dev/shm between tool invocations; route them to the persistent /tmp zone.
+is_sandboxed_runtime() {
+    # PLACEMENT axis only (not identity). Sandboxed agent shells (Codex/Copilot/
+    # Claude Code) do not reliably persist /dev/shm between tool invocations; route
+    # them to the persistent /tmp zone. This is a deliberate OR across harnesses —
+    # it answers "where does the hot zone live", NOT "which agent is acting".
+    # For agent identity (claimed_by, delta provenance) use resolve_agent_id, which
+    # keeps Claude/Codex/Copilot/human distinct. (wv-727175)
     [ -n "${CODEX_THREAD_ID:-}" ] || [ "${CODEX_CI:-}" = "1" ] \
         || [ "${COPILOT_AGENT:-}" = "1" ] || [ -n "${CLAUDE_CODE_SSE_PORT:-}" ]
 }
 
+# Backward-compatible alias — the name conflated placement with the Codex harness;
+# callers should migrate to is_sandboxed_runtime(). (wv-727175)
+is_codex_runtime() {
+    is_sandboxed_runtime
+}
+
+# Detect the acting agent HARNESS for identity (claimed_by / delta provenance).
+# Distinct from is_sandboxed_runtime(): that is a single OR for hot-zone placement;
+# this distinguishes harnesses and refuses to silently guess when markers collide.
+#
+# Returns one of: claude | codex | copilot | human
+# Memoized per process (_WV_AGENT_HARNESS) so the ambiguity diagnostic warns once.
+#
+# Ambiguity: a harness that launches another (e.g. a Codex shell spawned from a
+# Claude session) inherits the parent's markers, so >1 can be present. We cannot
+# infer nesting order from env, so we emit a diagnostic and fall back to a fixed
+# precedence — correctness in that case comes from an explicit WV_AGENT_ID.
+# Precedence prefers self-set opt-in markers (codex/copilot) over CLAUDE_CODE_SSE_PORT,
+# which is a connection port that leaks into child processes.
+resolve_agent_harness() {
+    if [ -n "${_WV_AGENT_HARNESS:-}" ]; then
+        printf '%s\n' "$_WV_AGENT_HARNESS"
+        return 0
+    fi
+
+    local present=""
+    [ -n "${CLAUDE_CODE_SSE_PORT:-}" ] && present="${present} claude"
+    { [ -n "${CODEX_THREAD_ID:-}" ] || [ "${CODEX_CI:-}" = "1" ]; } && present="${present} codex"
+    [ "${COPILOT_AGENT:-}" = "1" ] && present="${present} copilot"
+    present="${present# }"
+
+    local result
+    local n=0
+    [ -n "$present" ] && n=$(printf '%s\n' "$present" | wc -w)
+    if [ "$n" -eq 0 ]; then
+        result="human"
+    elif [ "$n" -eq 1 ]; then
+        result="$present"
+    else
+        printf 'wv: ambiguous agent markers (%s); set WV_AGENT_ID to disambiguate\n' "$present" >&2
+        local h
+        result="${present%% *}"
+        for h in codex copilot claude; do
+            case " $present " in *" $h "*) result="$h"; break ;; esac
+        done
+    fi
+
+    _WV_AGENT_HARNESS="$result"
+    printf '%s\n' "$result"
+}
+
+# Resolve a stable per-agent identity for claimed_by and delta filenames.
+# Precedence:
+#   1. explicit WV_AGENT_ID                  (operator/harness override always wins)
+#   2. <harness>-<host>-<user> from resolve_agent_harness, where harness is
+#      claude|codex|copilot for agents and human for a plain shell — so a human
+#      shell can no longer collapse onto an agent that also left WV_AGENT_ID unset.
+resolve_agent_id() {
+    # Memoized per process (_WV_AGENT_ID_RESOLVED): identity is constant within a
+    # process and this sits on the run-cache key hot path.
+    if [ -n "${_WV_AGENT_ID_RESOLVED:-}" ]; then
+        printf '%s\n' "$_WV_AGENT_ID_RESOLVED"
+        return 0
+    fi
+    local id
+    if [ -n "${WV_AGENT_ID:-}" ]; then
+        id="$WV_AGENT_ID"
+    else
+        local host user harness
+        host=$(hostname 2>/dev/null || echo "host")
+        user=$(whoami 2>/dev/null || echo "user")
+        harness=$(resolve_agent_harness)
+        id="${harness}-${host}-${user}"
+    fi
+    _WV_AGENT_ID_RESOLVED="$id"
+    printf '%s\n' "$id"
+}
+
 resolve_runtime_label() {
-    if is_codex_runtime; then
+    if is_sandboxed_runtime; then
         echo "codex"
     elif is_container; then
         echo "container"
@@ -126,7 +208,7 @@ resolve_hot_zone() {
     uid=$(id -u 2>/dev/null || echo "$UID")
     case "$(uname -s)" in
         Linux*)
-            if is_codex_runtime; then
+            if is_sandboxed_runtime; then
                 echo "/tmp/weave-codex-${uid}"
             elif [ -d "/tmp/weave-codex-${uid}" ]; then
                 # Follow an already-established codex zone even without the env

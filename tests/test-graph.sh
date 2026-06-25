@@ -547,6 +547,19 @@ test_impact() {
     out=$("$WV" impact "$base" 2>&1)
     assert_not_contains "$out" "Contradicts node" "contradicts-edge: node excluded from traversal"
 
+    # --- fixture 7b: relates_to excluded by default, included under --full ---
+    setup_test_env
+    local rel_base rel_node
+    rel_base=$("$WV" add "Relates base" --force 2>&1 | node_id_from_output)
+    rel_node=$("$WV" add "Relates node" --force 2>&1 | node_id_from_output)
+    "$WV" link "$rel_base" "$rel_node" --type=relates_to >/dev/null 2>&1
+
+    out=$("$WV" impact "$rel_base" 2>&1)
+    assert_not_contains "$out" "Relates node" "relates_to-edge: node excluded from default traversal"
+
+    out=$("$WV" impact "$rel_base" --full 2>&1)
+    assert_contains "$out" "Relates node" "relates_to-edge: --full traversal includes node"
+
     # --- fixture 8: file-to-test map (--json returns affected_suites) ---
     setup_test_env
     local fnode

@@ -1734,7 +1734,7 @@ cmd_impact() {
 
     # Impact cache key includes all traversal/shape flags, including --quality.
     local edge_set="blocks,implements,addresses"
-    [ "$full" = "true" ] && edge_set="${edge_set},obsoletes,references,resolves,supersedes"
+    [ "$full" = "true" ] && edge_set="${edge_set},relates_to,obsoletes,references,resolves,supersedes"
     local sorted_seeds
     sorted_seeds=$(printf '%s\n' "${resolved_seeds[@]}" | sort -u | tr '\n' ',' | sed 's/,$//')
     local quality_key="0"
@@ -1940,7 +1940,7 @@ _impact_walk() {
     # Edge type set
     local etypes="'blocks','implements','addresses'"
     if [ "$full" = "true" ]; then
-        etypes="${etypes},'resolves','references','supersedes','obsoletes'"
+        etypes="${etypes},'relates_to','resolves','references','supersedes','obsoletes'"
     fi
 
     # CTE direction branches — UNION ALL + path string, NOT UNION (Principle 2)

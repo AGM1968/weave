@@ -34,6 +34,7 @@ export WV_DB="$TEST_DIR/brain.db"
 export WV_REQUIRE_LEARNING=0
 export WV_RUN_CACHE=0
 export WV_PROJECT_DIR="$TEST_DIR"
+export WV_AGENT_ID="test-core-agent"
 # Isolate the durable suite-run log (LL2): wv test-record is always-on, so without
 # this every test-record call here would pollute the real ~/.local/share log.
 export WV_SUITE_LOG="$TEST_DIR/suite_runs.jsonl"
@@ -2585,6 +2586,93 @@ CONF5
 # ============================================================================
 # Main
 # ============================================================================
+test_agent_identity_resolution() {
+    echo ""
+    echo "Test: agent identity resolution (wv-727175)"
+    echo "==========================================="
+    local L="$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh"
+
+    # 1. explicit WV_AGENT_ID always wins, even with harness markers present
+    local id
+    id=$(env CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 WV_AGENT_ID=explicit-id \
+         bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    assert_equals "explicit-id" "$id" "explicit WV_AGENT_ID wins over markers"
+
+    # 2. each harness yields a distinct identity prefix when exported alone
+    local claude codex copilot human
+    claude=$(env -u WV_AGENT_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+             CLAUDE_CODE_SSE_PORT=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    codex=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u COPILOT_AGENT \
+             CODEX_CI=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    copilot=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI \
+             COPILOT_AGENT=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    human=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+             bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    assert_contains "$claude" "claude-" "claude marker -> claude- identity"
+    assert_contains "$codex" "codex-" "codex marker -> codex- identity"
+    assert_contains "$copilot" "copilot-" "copilot marker -> copilot- identity"
+
+    # 3. human shell does not collapse onto an agent identity
+    assert_contains "$human" "human-" "bare shell -> human- identity (not host-user)"
+    local human_vs_claude="differ"
+    [ "$human" = "$claude" ] && human_vs_claude="same"
+    assert_equals "differ" "$human_vs_claude" "human identity differs from claude identity"
+
+    # 4. ambiguous markers do not silently pretend certainty — a diagnostic is emitted
+    local warn
+    warn=$(env -u WV_AGENT_ID -u COPILOT_AGENT CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 \
+           bash -c "source '$L'; resolve_agent_id >/dev/null" 2>&1)
+    assert_contains "$warn" "ambiguous" "co-present markers emit an ambiguity diagnostic"
+}
+
+test_delta_filename_carries_identity() {
+    echo ""
+    echo "Test: delta filenames carry the resolved agent identity (wv-727175)"
+    echo "==================================================================="
+    # Behavioral, not a source grep: auto_sync is disabled under a custom WV_DB
+    # (the suite sets one), so run in an isolated hot-zone-only sandbox where real
+    # delta changesets are emitted, then read the identity straight off the names.
+    local sandbox; sandbox=$(mktemp -d)
+    local -a E=(env -u WV_DB -u WV_DB_CUSTOM
+                "WV_PROJECT_DIR=$sandbox" "WV_HOT_ZONE=$sandbox/hz"
+                WV_REQUIRE_LEARNING=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0)
+    (
+        cd "$sandbox" || exit 0
+        git init -q
+        "${E[@]}" WV_AGENT_ID=codex-deltabox "$WV" init >/dev/null 2>&1 || true
+        "${E[@]}" WV_AGENT_ID=codex-deltabox "$WV" add "codex change" --force >/dev/null 2>&1 || true
+        "${E[@]}" WV_AGENT_ID=claude-deltabox "$WV" add "claude change" --force >/dev/null 2>&1 || true
+    ) || true
+    local delta_names
+    delta_names=$(find "$sandbox/.weave/deltas" -name '*.sql' 2>/dev/null \
+        | while IFS= read -r f; do basename "$f"; done | tr '\n' ' ')
+    assert_contains "$delta_names" "codex-deltabox" "codex delta filename carries codex identity"
+    assert_contains "$delta_names" "claude-deltabox" "claude delta filename carries claude identity (distinct provenance)"
+    rm -rf "$sandbox"
+}
+
+test_ready_filters_by_resolved_agent() {
+    echo ""
+    echo "Test: ready filters by resolved agent + cache is agent-keyed (wv-727175)"
+    echo "======================================================================="
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+    local id1
+    id1=$("$WV" add "claimed by agentA" --force 2>&1 | node_id_from_output)
+    "$WV" update "$id1" --metadata='{"claimed_by":"agentA"}' >/dev/null 2>&1
+
+    # Cache ON: agentA warms the run cache, then agentB queries. A shared (non
+    # agent-keyed) cache would leak agentA's filtered view to agentB. Identity in
+    # the cache key must keep them separate.
+    local seenA seenB seenBall
+    seenA=$(WV_RUN_CACHE=1 WV_AGENT_ID=agentA "$WV" ready --count 2>/dev/null)
+    seenB=$(WV_RUN_CACHE=1 WV_AGENT_ID=agentB "$WV" ready --count 2>/dev/null)
+    seenBall=$(WV_RUN_CACHE=1 WV_AGENT_ID=agentB "$WV" ready --all --count 2>/dev/null)
+    assert_equals "1" "$seenA" "agentA sees the node it claimed"
+    assert_equals "0" "$seenB" "agentB does not see agentA's claim (cache not shared across agents)"
+    assert_equals "1" "$seenBall" "agentB --all sees the node"
+}
+
 main() {
     echo "========================================"
     echo "Weave Core Command Tests"
@@ -2604,6 +2692,9 @@ main() {
     test_list
     test_show
     test_ready
+    test_agent_identity_resolution
+    test_delta_filename_carries_identity
+    test_ready_filters_by_resolved_agent
     test_status
     test_bootstrap_agent
     test_stale_active_marker

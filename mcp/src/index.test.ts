@@ -13,6 +13,15 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 const SERVER_PATH = resolve(__dirname, "../dist/index.js");
 const REQUEST_TIMEOUT_MS = 30_000;
 
+// Graph-isolation env injected into every spawned wv / MCP-server process so the
+// suite never mutates the developer's live Weave graph. The "Weave MCP Server"
+// block points this at a throwaway WV_DB/WV_HOT_ZONE in beforeAll and resets it
+// in afterAll; an explicit per-test WV_DB (e.g. the code-search fixture) still
+// wins because it is spread after this. Without it, createTrackedNode /
+// createActiveNodeDirect wrote fixtures into the real graph and any interrupted
+// teardown left active nodes behind.
+let GRAPH_ENV: NodeJS.ProcessEnv = {};
+
 interface JsonRpcRequest {
   jsonrpc: "2.0";
   id: number;
@@ -44,6 +53,7 @@ class MCPTestClient {
       env: {
         ...process.env,
         WV_PATH: resolve(__dirname, "../../scripts/wv"),
+        ...GRAPH_ENV,
         ...extraEnv,
       },
     });
@@ -179,6 +189,7 @@ function deleteNodeDirect(id: string): void {
     stdio: "ignore",
     env: {
       ...process.env,
+      ...GRAPH_ENV,
       NO_COLOR: "1",
       WV_AGENT: "1",
     },
@@ -232,6 +243,7 @@ function createActiveNodeDirect(text: string): string {
       encoding: "utf-8",
       env: {
         ...process.env,
+        ...GRAPH_ENV,
         NO_COLOR: "1",
         WV_AGENT: "1",
       },
@@ -247,6 +259,7 @@ function createActiveNodeDirect(text: string): string {
 
 describe("Weave MCP Server", () => {
   let client: MCPTestClient;
+  let isolatedDir: string;
   const createdNodeIds: string[] = [];
 
   async function createTrackedNode(text: string, metadata?: Record<string, unknown>): Promise<string> {
@@ -269,14 +282,27 @@ describe("Weave MCP Server", () => {
   }
 
   beforeAll(() => {
+    // Point the whole block at a throwaway graph so no test writes to the live
+    // Weave DB. Materialize the schema first so wv commands operate on a real DB.
+    isolatedDir = mkdtempSync(join(tmpdir(), "weave-mcp-graph-"));
+    GRAPH_ENV = { WV_DB: join(isolatedDir, "brain.db"), WV_HOT_ZONE: isolatedDir };
+    spawnSync(resolve(__dirname, "../../scripts/wv"), ["init"], {
+      stdio: "ignore",
+      env: { ...process.env, ...GRAPH_ENV, NO_COLOR: "1", WV_AGENT: "1" },
+    });
     client = new MCPTestClient();
   });
 
   afterAll(async () => {
     await client.close();
+    // Best-effort node deletes are kept for symmetry, but teardown no longer
+    // depends on them: dropping the isolated dir removes the whole throwaway DB,
+    // so an interrupted cleanup can never leave nodes in the live graph.
     for (const id of [...createdNodeIds].reverse()) {
       deleteNodeDirect(id);
     }
+    GRAPH_ENV = {};
+    rmSync(isolatedDir, { recursive: true, force: true });
   }, 60_000);
 
   describe("tools/list", () => {

@@ -164,7 +164,7 @@ auto_sync() {
     local stamp_file="$WV_HOT_ZONE/.last_sync"
     local now agent_id
     now=$(date +%s)
-    agent_id="${WV_AGENT_ID:-$(hostname)-$(whoami)}"
+    agent_id="$(resolve_agent_id)"
     if [ "$_force" = false ] && [ -f "$stamp_file" ]; then
         local last_sync
         last_sync=$(cat "$stamp_file" 2>/dev/null || echo "0")

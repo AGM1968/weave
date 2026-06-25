@@ -38,6 +38,37 @@ signal; fuzzy overlap is reported, never applied automatically.
 Imports are idempotent: unchanged source hashes are skipped. The graph remains authoritative:
 import pulls in, crystallize curates, and render projects the active set back out.
 
+## JSON Contract
+
+The public lifecycle surface is `wv memory`; `wv query` may power reads underneath, but it must not
+own lifecycle side effects. Refactors must preserve these machine-readable envelopes:
+
+- `wv remember <text> --json` returns one graph node object with `id`, `text`, `status`, and
+  `metadata`. Required metadata: `type=memory`, `mem_status=active`, `source_agent`,
+  `source_kind=remember`, and `verified_at`.
+- `wv memory recall --agent=<caller> --json` returns a JSON array of active graph-memory nodes.
+  `--agent` is caller provenance only; it must never filter the recalled set.
+- `wv memory render --agent=<projection> --json` returns `{projection, paths, path, entries}` and
+  writes generated projections whose authority remains `weave-graph` and lifecycle field remains
+  `metadata.mem_status`.
+- `wv memory scan --source=<agent> --json` returns observation objects with `source_agent`,
+  `source_kind`, `source_path`, and `repo_root`; scan observes evidence and does not create memory.
+- `wv memory import --source=<agent> --json` returns `{imported, count, skipped}` and creates
+  `mem_status=candidate` nodes with provenance metadata. Re-importing the same source hash skips.
+- `wv memory crystallize --dry-run|--apply-reviewed --json` returns
+  `{mode, candidates, results}`. Each result has `id`, `action`, and `reviewed`; optional fields
+  (`duplicate_of`, `dup_kind`, `contradicts`, `stale_reason`, `finding`) appear only when relevant.
+
+Trail entries are evidence for this same lifecycle, not a parallel store. A reusable trail insight
+should become a candidate memory through the same provenance, deduplication, staleness, and review
+checks as harness-native imports.
+
+Export is a downstream boundary, not another lifecycle owner. `PROPOSAL-wv-knowledge-export.md`
+defines `wv export knowledge` as a future read-only `weave-knowledge/v1` package over settled graph
+knowledge: active memory, structured learnings, findings, and verified completed work. It must read
+the `type=memory` / `mem_status=active` shape frozen here, exclude candidates/stale/superseded
+memory, and never promote or mutate memory. Import/review/promotion stay under the memory lifecycle.
+
 ## Harness Surfaces
 
 | Harness | Scan | Import | Render target |

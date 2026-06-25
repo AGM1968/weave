@@ -222,12 +222,9 @@ SELECT
     -- The CASE emits the pre-clear only when alias is non-NULL (NULL is never indexed).
     -- created_at is preserved from the originating agent; updated_at is LWW.
     --
-    -- DO UPDATE is unconditional (no CASE WHEN excluded.updated_at > nodes.updated_at).
-    -- Correctness relies on cmd_load replaying all pending deltas in a single
-    -- transaction sorted by filename (epoch prefix). A stale INSERT at epoch 10 is
-    -- always applied before a fresher INSERT at epoch 20 — so the unconditional
-    -- overwrite gives the right final state. A per-field timestamp guard would be
-    -- redundant here and would add significant SQL complexity for no gain.
+    -- DO UPDATE is freshness-guarded. state.sql is a full checkpoint and may
+    -- already contain a newer row than an older local delta that remains in
+    -- .weave/deltas; replaying that stale delta must be a no-op, not a reversion.
     WHEN operation = 'INSERT' AND table_name = 'nodes' THEN
       CASE WHEN json_extract(new_data,'\$.alias') IS NOT NULL
         THEN 'UPDATE nodes SET alias=NULL WHERE alias='
@@ -246,7 +243,8 @@ SELECT
       || ' ON CONFLICT(id) DO UPDATE SET'
       || ' text=excluded.text, status=excluded.status,'
       || ' metadata=excluded.metadata, alias=excluded.alias,'
-      || ' updated_at=excluded.updated_at;'
+      || ' updated_at=excluded.updated_at'
+      || ' WHERE nodes.updated_at IS NULL OR excluded.updated_at >= nodes.updated_at;'
 
     -- UPDATE nodes: field-level diff via IS NOT (NULL-safe).
     -- Only changed meaningful fields appear in the SET clause; updated_at is
@@ -272,7 +270,9 @@ SELECT
              || 'updated_at=' || quote(json_extract(new_data,'\$.updated_at')) || ',',
              ','
            )
-        || ' WHERE id=' || quote(json_extract(new_data,'\$.id')) || ';'
+        || ' WHERE id=' || quote(json_extract(new_data,'\$.id'))
+        || ' AND (updated_at IS NULL OR updated_at <= '
+        || quote(json_extract(new_data,'\$.updated_at')) || ');'
       ELSE
         '-- no-op UPDATE on node ' || quote(json_extract(new_data,'\$.id'))
       END
@@ -335,4 +335,3 @@ SELECT
 FROM _warp_changes ORDER BY id;
 "
 }
-

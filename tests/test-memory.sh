@@ -77,12 +77,97 @@ assert_not_contains() {
     fi
 }
 
+assert_jq_true() {
+    local json="$1"
+    local jq_expr="$2"
+    local message="$3"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if printf '%s' "$json" | jq -e "$jq_expr" >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} $message"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo -e "${RED}✗${NC} $message"
+        echo "  jq: $jq_expr"
+        echo "  In: $json"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+}
+
 setup_test_env() {
     rm -rf "$TEST_DIR"
     mkdir -p "$TEST_DIR"
     cd "$TEST_DIR"
     git init -q
     "$WV" init >/dev/null 2>&1
+}
+
+test_memory_lifecycle_contract_shapes() {
+    echo ""
+    echo "Test: memory lifecycle contract shapes"
+    echo "======================================"
+
+    setup_test_env
+
+    local remembered memory_id recall_json render_json scan_json import_json dry_json applied_json
+    remembered=$("$WV" remember "Lifecycle contract fact" --kind=project --scope=repo --source-agent=contract --json)
+    memory_id=$(printf '%s' "$remembered" | jq -r '.id')
+
+    assert_jq_true "$remembered" \
+        '.id | test("^wv-[a-f0-9]+$")' \
+        "contract: remember returns a node id"
+    assert_jq_true "$remembered" \
+        '.status == "done" and .text == "Lifecycle contract fact" and .metadata.type == "memory" and .metadata.mem_status == "active" and .metadata.source_agent == "contract" and .metadata.source_kind == "remember" and (.metadata.verified_at | test("T"))' \
+        "contract: remember JSON carries active memory lifecycle metadata"
+
+    recall_json=$("$WV" memory recall --agent=codex --json 2>/dev/null)
+    assert_jq_true "$recall_json" \
+        'type == "array" and length == 1 and .[0].id == "'"$memory_id"'" and .[0].metadata.type == "memory" and .[0].metadata.mem_status == "active" and .[0].metadata.source_kind == "remember"' \
+        "contract: recall JSON is an agent-agnostic active-memory array"
+
+    mkdir -p "$TEST_DIR/.codex"
+    render_json=$("$WV" memory render --agent=codex --path="$TEST_DIR/.codex/weave.json" --json)
+    assert_jq_true "$render_json" \
+        '.projection == "codex" and .path == "'"$TEST_DIR"'/.codex/weave.json" and (.paths | length == 1) and .paths[0].projection == "codex" and .entries == 1' \
+        "contract: render JSON reports projection, paths, and entry count"
+    assert_jq_true "$(cat "$TEST_DIR/.codex/weave.json")" \
+        '.memory.authority == "weave-graph" and .memory.lifecycle_field == "metadata.mem_status" and .memory.entries[0].id == "'"$memory_id"'" and .memory.entries[0].metadata.mem_status == "active"' \
+        "contract: rendered Codex projection preserves graph authority and lifecycle metadata"
+
+    local fake_home slug claude_project claude_memory_dir
+    fake_home="$TEST_DIR/home"
+    slug=$(printf '%s' "$TEST_DIR" | tr '/' '-')
+    claude_project="$fake_home/.claude/projects/$slug"
+    claude_memory_dir="$claude_project/memory"
+    mkdir -p "$claude_memory_dir"
+    printf '%s\n' "# Contract" "Imported contract candidate" > "$claude_memory_dir/project.md"
+    printf '%s\n' '{"event":"session"}' > "$claude_project/session.jsonl"
+
+    scan_json=$(HOME="$fake_home" "$WV" memory scan --source=claude --repo-root="$TEST_DIR" --json)
+    assert_jq_true "$scan_json" \
+        'type == "array" and any(.[]; .source_agent == "claude" and .source_kind == "memory_file" and (.source_path | endswith("/memory/project.md")) and .repo_root == "'"$TEST_DIR"'") and any(.[]; .source_agent == "claude" and .source_kind == "session")' \
+        "contract: scan JSON reports observations with source provenance"
+
+    import_json=$(HOME="$fake_home" "$WV" memory import --source=claude --path="$claude_memory_dir" --repo-root="$TEST_DIR" --json)
+    assert_jq_true "$import_json" \
+        '.count == 1 and .skipped == 0 and (.imported | length == 1) and (.imported[0].id | test("^wv-[a-f0-9]+$")) and (.imported[0].source_path | endswith("/memory/project.md"))' \
+        "contract: import JSON reports imported candidates and skipped count"
+
+    local candidate_id
+    candidate_id=$(printf '%s' "$import_json" | jq -r '.imported[0].id')
+    assert_equals "candidate" "$(sqlite3 "$WV_DB" "SELECT json_extract(metadata,'\$.mem_status') FROM nodes WHERE id='$candidate_id';")" "contract: imported memory starts as candidate"
+
+    "$WV" update "$candidate_id" --metadata='{"reviewed":true}' >/dev/null 2>&1
+    dry_json=$("$WV" memory crystallize --dry-run --repo-root="$TEST_DIR" --json)
+    assert_jq_true "$dry_json" \
+        '.mode == "dry-run" and .candidates >= 1 and any(.results[]; .id == "'"$candidate_id"'" and .action == "promote" and .reviewed == true)' \
+        "contract: crystallize dry-run reports candidate actions without mutation"
+    assert_equals "candidate" "$(sqlite3 "$WV_DB" "SELECT json_extract(metadata,'\$.mem_status') FROM nodes WHERE id='$candidate_id';")" "contract: dry-run leaves candidate status unchanged"
+
+    applied_json=$("$WV" memory crystallize --apply-reviewed --repo-root="$TEST_DIR" --json)
+    assert_jq_true "$applied_json" \
+        '.mode == "apply-reviewed" and .candidates >= 1 and any(.results[]; .id == "'"$candidate_id"'" and .action == "promote" and .reviewed == true)' \
+        "contract: crystallize apply-reviewed reports applied actions"
+    assert_equals "active" "$(sqlite3 "$WV_DB" "SELECT json_extract(metadata,'\$.mem_status') FROM nodes WHERE id='$candidate_id';")" "contract: apply-reviewed promotes reviewed candidates"
 }
 
 test_remember_recall_ready_and_render() {
@@ -522,6 +607,7 @@ test_memory_verify_prose() {
     assert_equals "stale" "$(printf '%s' "$dry" | jq -r --arg id "$missing_id" '.results[]|select(.id==$id)|.action')" "genuinely-absent slash-path is still detected stale"
 }
 
+test_memory_lifecycle_contract_shapes
 test_remember_recall_ready_and_render
 test_memory_scan_and_import
 test_memory_crystallize

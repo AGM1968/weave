@@ -265,14 +265,19 @@ main() {
 # When WV_CALL_LOG is set, each invocation appends one JSONL line:
 #   {"ts":<epoch>,"cmd":"wv <subcmd>","stdout_bytes":<n>,"stderr_bytes":<n>,"elapsed_ms":<n>,"source":<src>}
 #
-# source values: "shell" (interactive terminal), "hook" (Claude Code hook),
-#                "sync" (wv sync --gh / weave_gh), "agent" (Claude Code tool call,
-#                via settings.json env), "test" (suite runs via run-all.sh or the
-#                pre-commit suite gate)
-# Callers set WV_CALL_SOURCE before invoking wv to tag their traffic.
+# source values: "agent" (harness-attested direct model tool call — Claude Code via
+#                settings.json env; Codex via CODEX_THREAD_ID/CODEX_CI; VS Code Copilot
+#                via COPILOT_AGENT, attested below from host exec markers), "mcp"
+#                (MCP-server child CLI call; kept separate so server fan-out does not
+#                inflate agent stats), "shell" (unproven origin: interactive terminal or
+#                an unattesting harness), "hook" (lifecycle hook), "sync" (wv sync --gh /
+#                weave_gh), "test" (suite runs via run-all.sh or the pre-commit gate).
+# Callers set WV_CALL_SOURCE before invoking wv to tag their traffic; when unset, a Codex
+# or Copilot host marker attests "agent", otherwise the default is "shell".
+# Authoritative taxonomy + readiness-gate policy: docs/TELEMETRY-SOURCE-CONTRACT.md
 #
 # Enable:  wv config enable session-analysis
-# Analyse: wv analyze sessions --call-stats [--source=agent|shell|hook|sync|test]
+# Analyse: wv analyze sessions --call-stats [--source=agent|mcp|shell|hook|sync|test]
 # Zero overhead when unset.
 
 if [[ -n "${WV_CALL_LOG:-}" ]]; then
@@ -290,7 +295,23 @@ if [[ -n "${WV_CALL_LOG:-}" ]]; then
     _wv_stdout_bytes=$(wc -c < "$_wv_out")
     _wv_stderr_bytes=$(wc -c < "$_wv_err")
     rm -f "$_wv_out" "$_wv_err"
-    _wv_source="${WV_CALL_SOURCE:-shell}"
+    # Provenance precedence: an explicit WV_CALL_SOURCE always wins (agent via
+    # Claude Code settings.json, mcp via the MCP server, hook/sync/test via their
+    # setters). Only when unset do we attest direct model origin for harnesses that
+    # expose a host-guaranteed exec marker but no per-call env injection — Codex
+    # (CODEX_THREAD_ID / CODEX_CI=1) and VS Code Copilot (COPILOT_AGENT=1). Those
+    # markers are present only inside model-driven exec, never a human terminal, so
+    # tagging agent here is honest attestation, not shell-as-agent. MCP children keep
+    # mcp because the server sets WV_CALL_SOURCE=mcp, which this branch never reaches.
+    # Marker set mirrors weave_gh/data.py _is_codex_runtime() minus CLAUDE_CODE_SSE_PORT
+    # (Claude already attests via explicit env). Contract: docs/TELEMETRY-SOURCE-CONTRACT.md
+    if [[ -n "${WV_CALL_SOURCE:-}" ]]; then
+        _wv_source="$WV_CALL_SOURCE"
+    elif [[ -n "${CODEX_THREAD_ID:-}" || "${CODEX_CI:-}" == "1" || "${COPILOT_AGENT:-}" == "1" ]]; then
+        _wv_source="agent"
+    else
+        _wv_source="shell"
+    fi
     # Braced group: stderr is silenced before the >> open is attempted, so an
     # unwritable log path (read-only FS, missing dir) cannot leak bash errors.
     { printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"%s"}\n' \

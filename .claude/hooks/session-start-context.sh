@@ -123,9 +123,33 @@ jq -n \
 # Ensure DB is loaded
 "$WV" load >/dev/null 2>&1 || true
 
+# ── Guard: never commit a session-start snapshot that SHRINKS the committed graph ──
+# `wv load` above re-dumps .weave/ from the live hot-zone DB. If that DB is stale or
+# was wiped (reboot, or a different agent's hot zone — Codex uses /tmp/weave-codex-*,
+# Claude Code uses /dev/shm/weave/*), the dump is smaller than HEAD and committing it
+# silently clobbers tracked work. This is exactly how the cross-harness telemetry epic
+# (wv-276c18 + 3 tasks) was lost on 2026-06-24. A session-start snapshot only ever ADDS
+# recovery trails/migrations, so a net node loss vs HEAD is always a regression signal:
+# self-heal by restoring .weave/ from HEAD and re-loading, and do NOT commit the shrink.
+SS_REGRESSION=""
+if git -C "$WV_PROJECT_DIR" rev-parse HEAD >/dev/null 2>&1; then
+    _SS_HEAD_NODES=$(git -C "$WV_PROJECT_DIR" show HEAD:.weave/nodes.jsonl 2>/dev/null | wc -l | tr -d ' ')
+    _SS_DISK_NODES=$(wc -l < "$WV_PROJECT_DIR/.weave/nodes.jsonl" 2>/dev/null | tr -d ' ')
+    if [ -n "$_SS_HEAD_NODES" ] && [ -n "$_SS_DISK_NODES" ] \
+       && [ "$_SS_HEAD_NODES" -gt 0 ] && [ "$_SS_DISK_NODES" -lt "$_SS_HEAD_NODES" ]; then
+        SS_REGRESSION="Weave graph regression blocked at session-start: disk dump shrank to ${_SS_DISK_NODES} nodes vs ${_SS_HEAD_NODES} at HEAD (stale/wiped hot-zone DB). Restored .weave/ from HEAD and re-loaded; snapshot NOT committed."
+        ( cd "$WV_PROJECT_DIR" 2>/dev/null \
+            && git checkout HEAD -- .weave/state.sql .weave/nodes.jsonl .weave/edges.jsonl ) 2>/dev/null || true
+        "$WV" load >/dev/null 2>&1 || true
+        "$WV" trails save --message="$SS_REGRESSION" >/dev/null 2>&1 || true
+    fi
+fi
+
 # Commit any .weave/ state written during session-start (crash-recovery trails,
 # migrations). Without this, the stop-hook fires on the first response with
-# "unsaved weave state" for changes the agent didn't cause.
+# "unsaved weave state" for changes the agent didn't cause. Skipped on regression
+# so a stale dump can never overwrite the committed graph.
+if [ -z "$SS_REGRESSION" ]; then
 (
     set +e
     cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
@@ -134,6 +158,7 @@ jq -n \
         WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): session-start state [skip ci]" 2>/dev/null
     fi
 ) || true
+fi
 
 # ── Overwrite sentinel with full active node list ──
 ACTIVE_IDS=$("$WV" list --status=active --json 2>/dev/null | jq -c '[.[].id]' 2>/dev/null || echo "[]")
@@ -151,6 +176,12 @@ CONTEXT="$STATUS"
 # Prepend crash warning if detected
 if [ -n "$CRASH_WARNING" ]; then
     CONTEXT="${CRASH_WARNING}
+${CONTEXT}"
+fi
+
+# Prepend graph-regression warning if the shrink guard fired
+if [ -n "$SS_REGRESSION" ]; then
+    CONTEXT="${SS_REGRESSION}
 ${CONTEXT}"
 fi
 

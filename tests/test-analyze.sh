@@ -320,6 +320,59 @@ rm -rf "$ISOCONF"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Direct-agent source attribution adapters (wv-67517b)
+# Codex/Copilot direct CLI calls have no per-call env injection like Claude's
+# settings.json, so without an adapter they record as shell — indistinguishable
+# from a human terminal. The wrapper attests "agent" from host-guaranteed exec
+# markers when WV_CALL_SOURCE is unset. Explicit WV_CALL_SOURCE (mcp/hook/...)
+# must always win. Contract: docs/TELEMETRY-SOURCE-CONTRACT.md
+# Each case uses a fresh WV_CONFIG_DIR so config.env cannot inject WV_CALL_SOURCE,
+# and a sandbox-writable WV_CALL_LOG (the Codex sandbox cannot write the default).
+# ───────────────────────────────────────────────────────────────────────────
+adapter_source() {
+    # Run wv with a clean provenance env, echo the recorded "source" field.
+    local conf log
+    conf=$(mktemp -d)
+    log="$conf/calls.jsonl"
+    env -u WV_CALL_SOURCE -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+        WV_CONFIG_DIR="$conf" WV_CALL_LOG="$log" "$@" "$WV" --version >/dev/null 2>&1
+    grep -o '"source":"[^"]*"' "$log" 2>/dev/null | tail -1
+    rm -rf "$conf"
+}
+
+# Test 24: Codex direct CLI (CODEX_THREAD_ID) attests agent, not shell
+src=$(adapter_source CODEX_THREAD_ID=thr_abc123)
+assert_contains "$src" '"source":"agent"' "Codex CODEX_THREAD_ID direct call records agent"
+assert_not_contains "$src" '"source":"shell"' "Codex direct call is not silently shell"
+
+# Test 25: Codex CI marker (CODEX_CI=1) attests agent
+src=$(adapter_source CODEX_CI=1)
+assert_contains "$src" '"source":"agent"' "Codex CODEX_CI=1 direct call records agent"
+
+# Test 26: VS Code Copilot direct CLI (COPILOT_AGENT=1) attests agent, not shell
+src=$(adapter_source COPILOT_AGENT=1)
+assert_contains "$src" '"source":"agent"' "Copilot COPILOT_AGENT=1 direct call records agent"
+assert_not_contains "$src" '"source":"shell"' "Copilot direct call is not silently shell"
+
+# Test 27: no host marker and no WV_CALL_SOURCE -> shell (unproven origin preserved)
+src=$(adapter_source)
+assert_contains "$src" '"source":"shell"' "Bare terminal with no marker stays shell"
+
+# Test 28: explicit WV_CALL_SOURCE=mcp wins over a Codex marker (MCP children stay mcp)
+src=$(adapter_source CODEX_THREAD_ID=thr_abc123 WV_CALL_SOURCE=mcp)
+assert_contains "$src" '"source":"mcp"' "MCP override beats Codex marker (children stay mcp)"
+
+# Test 29: explicit WV_CALL_SOURCE=hook wins over a Copilot marker
+src=$(adapter_source COPILOT_AGENT=1 WV_CALL_SOURCE=hook)
+assert_contains "$src" '"source":"hook"' "hook override beats Copilot marker"
+
+# Test 30: spurious COPILOT_AGENT value (not "1") does not attest agent
+src=$(adapter_source COPILOT_AGENT=0)
+assert_contains "$src" '"source":"shell"' "COPILOT_AGENT=0 does not attest agent"
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 echo "═══════════════════════════════════════════════════════════════════════════"

@@ -12,8 +12,9 @@ OUT=$(mktemp -d)
 # removed on exit even if the build or an assertion fails.
 LOCAL_MD="$PROC_DIR/zzz-release-ittest-local.md"
 LOCAL_ASSET="$PROC_DIR/zzz-release-ittest-asset.sh"
+DRAFT_MD="$PROC_DIR/zzz-release-ittest-draft.md"
 INVALID_MD="$PROC_DIR/zzz-release-ittest-invalid.md"
-cleanup() { rm -f "$LOCAL_MD" "$LOCAL_ASSET" "$INVALID_MD"; rm -rf "$OUT"; }
+cleanup() { rm -f "$LOCAL_MD" "$LOCAL_ASSET" "$DRAFT_MD" "$INVALID_MD"; rm -rf "$OUT"; }
 trap cleanup EXIT
 
 printf '%s\n' '#!/usr/bin/env bash' 'echo dev-only asset' > "$LOCAL_ASSET"
@@ -22,6 +23,9 @@ printf '%s\n' '---' 'id: zzz-release-ittest-local' 'description: Dev-only releas
     'fallback: "wv guide --procedure=zzz-release-ittest-local"' 'adapters: [claude, codex, copilot]' \
     'visibility: local' 'claude_skill: zzz-release-ittest' 'resources:' '  - path: zzz-release-ittest-asset.sh' \
     '    executable: true' '---' '# dev-only body' > "$LOCAL_MD"
+printf '%s\n' '---' 'id: zzz-release-ittest-draft' 'description: Draft-only release test procedure' \
+    'fallback: "wv guide --procedure=zzz-release-ittest-draft"' 'adapters: [claude, codex, copilot]' \
+    'visibility: shared' 'status: draft' 'claude_skill: zzz-release-ittest-draft' '---' '# draft body' > "$DRAFT_MD"
 
 NO_COLOR=1 "$ROOT/build-release.sh" --output="$OUT" > "$OUT/.build.log" 2>&1 || {
     echo "build-release failed:" >&2; tail -20 "$OUT/.build.log" >&2; exit 1; }
@@ -34,10 +38,12 @@ ARTIFACT="$OUT/templates/procedures"
 # Ready + shared procedures survive
 [ -f "$ARTIFACT/quality-gate.md" ]
 [ -f "$ARTIFACT/code-search.md" ]
-# Draft shells (shared but status: draft) are stripped — only a placeholder
+# Draft procedures (shared but status: draft) are stripped — only a placeholder
 # body would otherwise ship to the public release.
-[ ! -e "$ARTIFACT/session.md" ]
-[ ! -e "$ARTIFACT/agent-memory.md" ]
+[ ! -e "$ARTIFACT/zzz-release-ittest-draft.md" ]
+# Shared + ready procedures ship even when they are framework shells. Regression
+# guard: session.md/agent-memory.md are status: ready and must NOT be stripped.
+[ -f "$ARTIFACT/session.md" ]
 
 # A release cannot bypass the contract validator: a shared procedure with an
 # invalid status must fail rather than ship because it is merely "not draft".

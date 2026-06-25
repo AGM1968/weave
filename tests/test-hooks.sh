@@ -209,6 +209,46 @@ OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "hookSpecificOutput" "session-start: still returns hook output in uninitialized repo"
 assert_equals "absent" "$(if [ -d "$TEST_DIR/project/.weave" ]; then echo present; else echo absent; fi)" "session-start: does not create .weave in uninitialized repo"
 
+# Graph-shrink guard: a stale/wiped hot-zone DB at session-start must never commit a
+# .weave snapshot smaller than HEAD (regression that lost the cross-harness telemetry
+# epic on 2026-06-24). Build a committed HEAD graph (BIG), then restore a smaller but
+# consistent on-disk snapshot (SMALL) and confirm the hook self-heals instead of
+# clobbering: no session-start commit, disk restored to HEAD, warning surfaced.
+setup_test_env
+PROJ="$TEST_DIR/project"
+add_active_node "shrink-guard node 1" >/dev/null 2>&1
+add_active_node "shrink-guard node 2" >/dev/null 2>&1
+"$WV" sync >/dev/null 2>&1 || true
+# Capture the SMALL (2-node) consistent snapshot before growing the graph.
+SMALL_SNAP="$TEST_DIR/small-weave"
+rm -rf "$SMALL_SNAP" && cp -a "$PROJ/.weave" "$SMALL_SNAP"
+add_active_node "shrink-guard node 3" >/dev/null 2>&1
+add_active_node "shrink-guard node 4" >/dev/null 2>&1
+"$WV" sync >/dev/null 2>&1 || true
+# wv auto-checkpoints .weave on sync; commit only if anything is still unstaged so
+# HEAD ends with the full (BIG) graph either way.
+( cd "$PROJ" && git add .weave/ 2>/dev/null; git diff --cached --quiet -- .weave/ || git commit -q -m "full graph" ) || true
+HEAD_NODE_LINES=$(git -C "$PROJ" show HEAD:.weave/nodes.jsonl | wc -l | tr -d ' ')
+# Simulate the stale on-disk state a bad reload would leave: restore SMALL over disk
+# and reload so the live DB matches it (disk + DB both behind the committed HEAD).
+rm -rf "$PROJ/.weave" && cp -a "$SMALL_SNAP" "$PROJ/.weave"
+"$WV" load >/dev/null 2>&1 || true
+COMMITS_BEFORE=$(git -C "$PROJ" log --oneline | grep -c "session-start state" || true)
+OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
+COMMITS_AFTER=$(git -C "$PROJ" log --oneline | grep -c "session-start state" || true)
+DISK_NODE_LINES=$(wc -l < "$PROJ/.weave/nodes.jsonl" | tr -d ' ')
+assert_equals "$COMMITS_BEFORE" "$COMMITS_AFTER" "session-start: shrink guard does NOT commit a graph smaller than HEAD"
+assert_equals "$HEAD_NODE_LINES" "$DISK_NODE_LINES" "session-start: shrink guard restores .weave/nodes.jsonl from HEAD"
+assert_contains "$OUTPUT" "shrank" "session-start: shrink guard surfaces a regression warning"
+
+# Negative case: when disk matches HEAD (no shrink), the guard stays silent.
+setup_test_env
+add_active_node "no-shrink node" >/dev/null 2>&1
+"$WV" sync >/dev/null 2>&1 || true
+( cd "$TEST_DIR/project" && git add .weave/ 2>/dev/null; git diff --cached --quiet -- .weave/ || git commit -q -m "graph" ) || true
+OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
+assert_not_contains "$OUTPUT" "shrank" "session-start: no regression warning when disk matches HEAD"
+
 # --- pre-compact-context.sh ---
 echo ""
 echo "--- pre-compact-context.sh ---"

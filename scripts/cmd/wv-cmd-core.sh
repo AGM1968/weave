@@ -421,7 +421,7 @@ print(json.dumps(items))
     # event) — mirror cmd_work so the first edit is not hard-blocked in discover phase.
     if [ "$status" = "active" ]; then
         local add_agent_id
-        add_agent_id="$(sql_escape "${WV_AGENT_ID:-$(hostname)-$(whoami)}")"
+        add_agent_id="$(sql_escape "$(resolve_agent_id)")"
         db_query "UPDATE nodes
             SET metadata = json_set(COALESCE(metadata,'{}'), '\$.claimed_by', '$add_agent_id')
             WHERE id = '$id';" 2>/dev/null || true
@@ -2771,7 +2771,7 @@ cmd_work() {
 
     # Resolve agent identity (strip quotes for SQL safety)
     local agent_id
-    agent_id="$(sql_escape "${WV_AGENT_ID:-$(hostname)-$(whoami)}")"
+    agent_id="$(sql_escape "$(resolve_agent_id)")"
 
     # Atomic CAS claim: succeeds only if unclaimed or already claimed by this agent
     local claim_changes
@@ -2964,7 +2964,7 @@ cmd_ready() {
 
     # Agent identity for claim filtering (same default as cmd_work)
     local agent_id
-    agent_id="$(sql_escape "${WV_AGENT_ID:-$(hostname)-$(whoami)}")"
+    agent_id="$(sql_escape "$(resolve_agent_id)")"
 
     # Validate subtree epic and build recursive CTE (walks implements edges downward)
     local subtree_cte="" subtree_join=""
@@ -3060,6 +3060,11 @@ cmd_ready() {
         fi
         echo "$results"
     else
+        # Total ready (unlimited) so a truncated text view can announce "showing N of M"
+        # instead of silently capping at LIMIT 5 (bootstrap/discover mode) — keeps the
+        # printed rows honest against bootstrap/--count, which always report the full set.
+        local _ready_total
+        _ready_total=$(db_query "$subtree_cte SELECT COUNT(*) FROM nodes n $subtree_join WHERE $ready_where $claim_filter;" 2>/dev/null || echo "0")
         db_query "$subtree_cte SELECT n.id, n.text, json_extract(n.metadata, '$.claimed_by'), $_rel_expr AS rel FROM nodes n $subtree_join WHERE $ready_where $claim_filter ORDER BY $_rel_order $_mode_limit;" \
         | while IFS='|' read -r id text claimed_by rel; do
             local rel_marker=""
@@ -3080,6 +3085,14 @@ cmd_ready() {
                 fi
             fi
         done
+
+        # Truncation notice: when a mode limit hid ready rows, say so explicitly.
+        if [ -n "$_mode_limit" ]; then
+            local _limit_n="${_mode_limit##*LIMIT }"
+            if [ "$_ready_total" -gt "$_limit_n" ] 2>/dev/null; then
+                echo -e "${DIM}  … showing ${_limit_n} of ${_ready_total} ready (use 'wv ready --json' or execute mode for all)${NC}"
+            fi
+        fi
 
         # Findings to implement: opt-in via --findings flag (or tty default)
         if [ "$show_findings" = true ]; then
