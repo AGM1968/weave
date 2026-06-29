@@ -9,6 +9,11 @@ Use `wv` when it is on PATH; otherwise use the repo-local `./scripts/wv` wrapper
 `wv add "<text>" --status=active --criteria="c1|c2" --risks=low`. If `wv status` shows 0 active
 nodes, do not edit files. Discovery before claiming may read, search, and report only.
 
+Open a file with your harness's native file-read before editing it. Shell reads (`cat`/`grep`/`sed`)
+and code-search find the spot but do not satisfy harness edit-guards — editing a file you only
+inspected via a shell command is blocked ("File has not been read"). Grep/partial-read to locate;
+native-read the file you will change.
+
 To reopen a previously completed node: `wv work <id> --reopen` (plain `wv work` on a done node
 returns an error).
 

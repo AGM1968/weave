@@ -227,3 +227,44 @@ wv_set_phase() {
     fi
     [ -n "$hot_zone" ] && printf '%s' "$phase" > "${hot_zone}/.session_phase" 2>/dev/null || true
 }
+
+# _wv_source_drift — fast, cross-agent check: do edited Weave source files
+# (scripts/cmd|lib/*.sh, scripts/wv, scripts/context-guard.sh, .claude/hooks/*.sh)
+# differ from their installed copies? Echoes the drifted basenames (space-
+# separated) and returns 0 if any drift, 1 if clean. No-op (returns 1) in
+# consumer repos that have no source-path pointer. Because every harness —
+# Claude, Codex, Copilot — drives the same `wv` CLI and git pre-commit, this one
+# helper backs both the bootstrap drift advisory and the pre-commit self-heal,
+# so the "run ./install.sh after editing source" signal is agent-agnostic.
+_wv_source_drift() {
+    local cfg="${WV_CONFIG_DIR:-$HOME/.config/weave}"
+    local src_pointer="$cfg/source-path"
+    [ -f "$src_pointer" ] || return 1
+    local src_root; src_root=$(cat "$src_pointer" 2>/dev/null || echo "")
+    [ -n "$src_root" ] && [ -d "$src_root/scripts" ] || return 1
+    local lib_dir="$HOME/.local/lib/weave"
+    local drifted="" src rel installed sm im
+    for src in "$src_root/scripts/cmd/"*.sh "$src_root/scripts/lib/"*.sh \
+               "$src_root/scripts/wv" "$src_root/scripts/context-guard.sh"; do
+        [ -f "$src" ] || continue
+        rel="${src#"$src_root/scripts/"}"
+        installed="$lib_dir/$rel"
+        [ "$rel" = "wv" ] && installed="$HOME/.local/bin/wv"
+        [ "$rel" = "context-guard.sh" ] && installed="$cfg/context-guard.sh"
+        sm=$(md5sum "$src" 2>/dev/null | awk '{print $1}')
+        im=$(md5sum "$installed" 2>/dev/null | awk '{print $1}')
+        [ -f "$installed" ] && [ "$sm" = "$im" ] || drifted="${drifted:+$drifted }$(basename "$src")"
+    done
+    if [ -d "$src_root/.claude/hooks" ] && [ -d "$cfg/hooks" ]; then
+        for src in "$src_root/.claude/hooks/"*.sh; do
+            [ -f "$src" ] || continue
+            installed="$cfg/hooks/$(basename "$src")"
+            sm=$(md5sum "$src" 2>/dev/null | awk '{print $1}')
+            im=$(md5sum "$installed" 2>/dev/null | awk '{print $1}')
+            [ -f "$installed" ] && [ "$sm" = "$im" ] || drifted="${drifted:+$drifted }$(basename "$src")"
+        done
+    fi
+    [ -n "$drifted" ] || return 1
+    printf '%s' "$drifted"
+    return 0
+}

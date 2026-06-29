@@ -261,6 +261,14 @@ test_breadcrumbs() {
     rm -rf "$outside_dir"
     assert_not_contains "$drift_out" "drifted:" "doctor from outside git repo: no false hook-drift warning"
     assert_contains "$drift_out" "hook drift" "doctor from outside git repo: hook drift check still runs"
+
+    # wv-a77603: cross-agent install-drift advisory rides the bootstrap JSON that
+    # every harness (Claude/Codex/Copilot) reads at session start. The isolated
+    # test env has no source-path pointer, so _wv_source_drift no-ops (consumer-
+    # safe) and advisories is an empty array.
+    local boot_adv
+    boot_adv=$("$WV" bootstrap --json 2>/dev/null | jq -c '.advisories' 2>/dev/null)
+    assert_equals "[]" "$boot_adv" "bootstrap exposes advisories array; clean when no source-path (consumer-safe no-op)"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

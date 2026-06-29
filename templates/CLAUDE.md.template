@@ -24,6 +24,9 @@ git push                          # 7. mandatory
 
 **No edits without an active node.** If `wv status` shows 0 active, claim one first.
 Discovery before claiming may read, search, and report only.
+Open files you will edit with your harness's native file-read first — shell reads (`cat`/`grep`/`sed`)
+and code-search are inspection only and do not satisfy edit-guards (editing a file you only `cat`'d is
+blocked, "File has not been read").
 Focused CLI help: `wv help <command>` or `wv <command> --help`.
 
 Optional fast gate: edit the scaffolded `scripts/test-impacted.sh` CONFIG block and route sources

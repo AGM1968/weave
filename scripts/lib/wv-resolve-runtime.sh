@@ -208,10 +208,16 @@ resolve_hot_zone() {
     uid=$(id -u 2>/dev/null || echo "$UID")
     case "$(uname -s)" in
         Linux*)
+            # NOTE: `/tmp/weave-codex-${uid}` is the shared SANDBOXED-RUNTIME zone for
+            # ALL sandboxed harnesses — Codex, Copilot, AND Claude Code (which trips
+            # is_sandboxed_runtime via CLAUDE_CODE_SSE_PORT). The `-codex` name is
+            # historical (Codex-first-class era), not a Codex-only marker. Only a
+            # non-sandboxed native/human shell uses /dev/shm/weave below. Do not assume
+            # "Claude Code -> /dev/shm"; placement follows is_sandboxed_runtime.
             if is_sandboxed_runtime; then
                 echo "/tmp/weave-codex-${uid}"
             elif [ -d "/tmp/weave-codex-${uid}" ]; then
-                # Follow an already-established codex zone even without the env
+                # Follow an already-established sandbox zone even without the env
                 # signal. The CLI/sync (which see CLAUDE_CODE_SSE_PORT) create this
                 # dir; harness-spawned hooks lack that env var, so without this they
                 # split to /dev/shm and never see the CLI's phase/DB. Keying off the

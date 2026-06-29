@@ -178,6 +178,7 @@ if [ -t 1 ] && [ "${WV_AGENT:-0}" != "1" ]; then
             echo "└─ Summarize rather than quote"
             ;;
     esac
+    echo "edit targets: native-read before editing (shell cat/grep don't satisfy edit-guards)"
 
     if [ ${#reasons[@]} -gt 0 ]; then
         echo ""

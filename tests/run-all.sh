@@ -81,6 +81,7 @@ declare -a FAST_SUITES=(
     "test-crash-sentinel.sh:Crash Sentinel Tests"
     "test-multi-agent.sh:Multi-Agent Tests"
     "test-delta-unit.sh:Delta Unit Tests"
+    "test-battery-wrapper.sh:Tier2 Battery Wrapper Security (gap3)"
     "test-analyze.sh:Analyze Command Tests"
     "test-config.sh:Config Command Tests"
     "test-query.sh:Query Command Tests"

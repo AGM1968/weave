@@ -125,8 +125,9 @@ jq -n \
 
 # ── Guard: never commit a session-start snapshot that SHRINKS the committed graph ──
 # `wv load` above re-dumps .weave/ from the live hot-zone DB. If that DB is stale or
-# was wiped (reboot, or a different agent's hot zone — Codex uses /tmp/weave-codex-*,
-# Claude Code uses /dev/shm/weave/*), the dump is smaller than HEAD and committing it
+# was wiped (reboot, or a different runtime's hot zone — sandboxed runtimes incl.
+# Codex AND Claude Code use /tmp/weave-codex-*, native/human shells use /dev/shm/weave/*
+# per is_sandboxed_runtime), the dump is smaller than HEAD and committing it
 # silently clobbers tracked work. This is exactly how the cross-harness telemetry epic
 # (wv-276c18 + 3 tasks) was lost on 2026-06-24. A session-start snapshot only ever ADDS
 # recovery trails/migrations, so a net node loss vs HEAD is always a regression signal:

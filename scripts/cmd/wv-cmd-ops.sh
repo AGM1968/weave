@@ -464,6 +464,34 @@ cmd_bootstrap() {
         breadcrumb=$(head -5 "$bc_file" | grep -v '^#' | grep -v '^$' | head -1 | sed 's/^[[:space:]]*//')
     fi
 
+    # ── Cross-agent install-drift advisory ── editing weave source without
+    # reinstalling leaves installed copies stale; every harness reads bootstrap
+    # at session start, so surface it here (Claude/Codex/Copilot alike).
+    local drift_files drift_advisory=""
+    if drift_files=$(_wv_source_drift); then
+        drift_advisory="install drift: edited source not reinstalled (${drift_files}) — run ./install.sh (dev repo) or 'wv init-repo --update' (consumer) before committing, or the pre-commit drift gate fails"
+    fi
+
+    # ── Cross-agent quality-scan advisory ── the quality gate (_done_refresh_*)
+    # blocks `wv done` when the active node touches tracked files but quality.db
+    # is missing/un-scanned. That surfaces at the finish line, forcing a scan +
+    # retry (wv-7fbc0f). Surface it early via the same readiness evaluator the
+    # close gate uses, so the agent scans during work — cross-agent, every
+    # harness reads bootstrap (Claude/Codex/Copilot). Advisory only; the close
+    # gate stays authoritative.
+    local quality_advisory=""
+    if [ -n "$active_id" ]; then
+        local quality_readiness
+        quality_readiness=$(_preflight_policy_readiness "$active_id" 2>/dev/null || echo '{}')
+        local q_blocking q_status q_files
+        q_blocking=$(echo "$quality_readiness" | jq -r '.blocking // false' 2>/dev/null || echo "false")
+        q_status=$(echo "$quality_readiness" | jq -r '.quality.status // ""' 2>/dev/null || echo "")
+        q_files=$(echo "$quality_readiness" | jq -r '.tracked_files // 0' 2>/dev/null || echo "0")
+        if [ "$q_blocking" = "true" ] && { [ "$q_status" = "missing" ] || [ "$q_status" = "stale" ]; }; then
+            quality_advisory="quality scan needed: active node $active_id touches $q_files tracked file(s) but quality.db is $q_status — run 'wv quality scan .' now so 'wv done' isn't blocked at the finish line"
+        fi
+    fi
+
     # ── Compose final JSON ──
     jq -n \
         --argjson status "$status_json" \
@@ -472,10 +500,13 @@ cmd_bootstrap() {
         --argjson ready "$ready_json" \
         --argjson learnings "$learnings_json" \
         --arg breadcrumb "$breadcrumb" \
+        --arg drift "$drift_advisory" \
+        --arg quality "$quality_advisory" \
         '{
             status: $status,
             active_node: $active_node,
             context: $context,
+            advisories: ([$drift, $quality] | map(select(. != ""))),
             ready: ($ready | map({id, text})),
             learnings: ($learnings | map(
                 (if .metadata and (.metadata | type) == "string"
@@ -5401,6 +5432,11 @@ Session start hook injects a policy based on repo size:
   HIGH   — read files <500 lines whole; grep first for larger
   MEDIUM — always grep before read; no full reads >500 lines
   LOW    — always grep first; only read <200 line slices; summarize
+
+Editing: open a file with your harness's native file-read before editing it. Shell reads
+(cat/grep/sed) and code-search are for inspection only — they do NOT satisfy edit-guards, so
+editing a file you only inspected via a shell command is blocked ("File has not been read").
+Grep/partial-read to find the spot; native-read the file you will change.
 
 Context Pack (before complex work):
   wv context <id> --json | jq .

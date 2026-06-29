@@ -2102,6 +2102,41 @@ test_preflight_policy_readiness() {
         "wv preflight clears the policy block once quality scan data exists"
 }
 
+test_bootstrap_quality_advisory() {
+    echo ""
+    echo "Test: wv bootstrap quality-scan advisory (wv-7fbc0f)"
+    echo "===================================================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    # --- Case 1: active node, no tracked files → no quality advisory ---
+    local idle_id idle_boot
+    idle_id=$("$WV" add "Idle bootstrap node" --force 2>&1 | node_id_from_output)
+    "$WV" work "$idle_id" >/dev/null 2>&1
+    idle_boot=$("$WV" bootstrap --json 2>/dev/null)
+    assert_equals "0" "$(echo "$idle_boot" | jq -r '[.advisories[] | select(startswith("quality scan needed"))] | length' 2>/dev/null || echo -1)" \
+        "bootstrap emits no quality advisory when active node has no tracked files"
+
+    # --- Case 2: tracked files + missing quality.db → advisory surfaces early ---
+    sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$idle_id', 'src/policy.py');"
+    local blocked_boot
+    blocked_boot=$("$WV" bootstrap --json 2>/dev/null)
+    assert_equals "1" "$(echo "$blocked_boot" | jq -r '[.advisories[] | select(startswith("quality scan needed"))] | length' 2>/dev/null || echo -1)" \
+        "bootstrap surfaces a quality-scan advisory when active node touches tracked files but quality.db is missing"
+    assert_contains "$(echo "$blocked_boot" | jq -r '.advisories[] | select(startswith("quality scan needed"))' 2>/dev/null || echo '')" "wv quality scan ." \
+        "quality advisory names the wv quality scan command"
+    assert_contains "$(echo "$blocked_boot" | jq -r '.advisories[] | select(startswith("quality scan needed"))' 2>/dev/null || echo '')" "$idle_id" \
+        "quality advisory names the active node id"
+
+    # --- Case 3: scan data present → advisory clears ---
+    sqlite3 "$WV_HOT_ZONE/quality.db" "CREATE TABLE scan_meta (id INTEGER PRIMARY KEY); INSERT INTO scan_meta(id) VALUES (1);" 2>/dev/null
+    local cleared_boot
+    cleared_boot=$("$WV" bootstrap --json 2>/dev/null)
+    assert_equals "0" "$(echo "$cleared_boot" | jq -r '[.advisories[] | select(startswith("quality scan needed"))] | length' 2>/dev/null || echo -1)" \
+        "bootstrap clears the quality advisory once a scan exists"
+}
+
 test_p2_quality_refresh() {
     echo ""
     echo "Test: P2 — file_metrics refresh on wv done"
@@ -2708,6 +2743,7 @@ main() {
     test_wv_search_learning_fts
     test_wv_search_code
     test_preflight_policy_readiness
+    test_bootstrap_quality_advisory
     test_p2_quality_refresh
     test_trend_soft_warning
     test_allowed_tools

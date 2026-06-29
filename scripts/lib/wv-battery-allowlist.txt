@@ -1,0 +1,21 @@
+# Tier 2 battery wrapper — allowed wv subcommands (SPEC §6).
+#
+# One subcommand per line. Blank lines and "#" comments are ignored.
+# The wrapper refuses any wv subcommand not listed here and FAILS CLOSED if
+# this file is missing or empty.
+#
+# This is the battery's behavioral surface (Tier 1 parity set + read-only
+# inspection). Hard-denied commands must NEVER be added here: sync, push,
+# anything invoking git, raw sqlite3 / hotzone --db, config writes, and
+# memory writes to a live store. The wrapper has no generic command runner.
+bootstrap
+work
+update
+done
+context
+show
+ready
+list
+query
+search
+health

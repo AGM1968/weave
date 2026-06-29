@@ -24,6 +24,11 @@ wv work <id>              # claim it
 
 Call `weave_edit_guard` (MCP) before any edit. If blocked, claim a task first.
 
+Open a file with your harness's native file-read before editing it. Shell reads (`cat`/`grep`/`sed`)
+and code-search find the spot but do not satisfy harness edit-guards — editing a file you only
+inspected via a shell command is blocked ("File has not been read"). Grep/partial-read to locate;
+native-read the file you will change.
+
 ## Core loop
 
 ```bash
@@ -96,6 +101,7 @@ MCP equivalent: `weave_code_search` (parameters: `query`, `mode`, `limit`, `grap
 
 ## Reference
 
-- MCP: `weave_guide` (topics: workflow, github, learnings, context, routing, mcp, verification, instrumentation, config, discovery)
+- MCP: `weave_guide` (topics: workflow, github, learnings, context, routing, mcp, verification,
+  instrumentation, config, discovery)
 - CLI: `wv --help`, `wv help <command>`, or `~/.config/weave/WORKFLOW.md`
 <!-- ── END WEAVE COPILOT.MD ── -->

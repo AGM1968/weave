@@ -34,7 +34,11 @@ echo "$CMD" | grep -qE '(^|[;&|][[:space:]]*)(\./scripts/)?wv[[:space:]]' || exi
 IS_LIST=false
 echo "$CMD" | grep -qE '(^|[;&|][[:space:]]*)(\./scripts/)?wv[[:space:]]+list([[:space:]]|$)' && IS_LIST=true
 
-# Per-repo budget file on tmpfs (matches the hot-zone naming used elsewhere).
+# Per-repo budget file on tmpfs. NOTE: this is an INDEPENDENT ephemeral counter,
+# deliberately NOT the resolved hot-zone — it hardcodes /dev/shm/weave/<hash> and
+# only needs to be self-consistent across this session's tally reads/writes. Under
+# sandboxed runtimes (Claude Code/Codex) the real hot-zone is /tmp/weave-codex-*, so
+# this file legitimately lives elsewhere; if /dev/shm is absent the mkdir below no-ops.
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 REPO_HASH=$(echo "$REPO_ROOT" | md5sum 2>/dev/null | cut -c1-8 || echo "default")
 [[ -z "$REPO_HASH" ]] && REPO_HASH="default"

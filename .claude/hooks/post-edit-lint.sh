@@ -66,4 +66,18 @@ if [[ "$FILE_PATH" =~ \.(md|json|yaml|yml|js|ts|css|html)$ ]]; then
     exit 0
 fi
 
+# Shell/hook source edits: editing these without ./install.sh leaves the installed
+# copy stale, which fails the pre-commit drift gate ~3min in. Nudge immediately —
+# proactive L2 reminder (the cross-agent net is the pre-commit self-heal + the
+# bootstrap advisory; this is the cheap Claude-side win where the path is free).
+case "$FILE_PATH" in
+    */scripts/*.sh|*/scripts/wv|*/.claude/hooks/*.sh)
+        REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+        if [ -n "$REPO_ROOT" ] && [ -x "$REPO_ROOT/install.sh" ]; then
+            echo "{\"additionalContext\": \"Edited installed source ($FILE_PATH) — run ./install.sh before committing, or wv doctor / the pre-commit drift gate will report 'hook drift (stale)'.\"}"
+            exit 0
+        fi
+        ;;
+esac
+
 exit 0

@@ -103,6 +103,25 @@ if [ -z "$WS_DIFF" ] && [ -n "$FULL_DIFF" ]; then
     exit 0
 fi
 
+# ── Self-heal install drift (cross-agent) ──
+# Editing weave source (scripts/*.sh, .claude/hooks/*.sh) without reinstalling
+# leaves the installed copies stale, which the drift gate only catches ~3min into
+# the test suite. Reinstall up front so no harness — Claude, Codex, Copilot —
+# eats that late failure. Only acts in the dev repo (install.sh present).
+if command -v _wv_source_drift >/dev/null 2>&1; then
+    if _pc_drift=$(_wv_source_drift); then
+        _pc_src=$(cat "${WV_CONFIG_DIR:-$HOME/.config/weave}/source-path" 2>/dev/null || echo "")
+        if [ -n "$_pc_src" ] && [ -x "$_pc_src/install.sh" ]; then
+            echo "Weave pre-commit: install drift ($_pc_drift) — self-healing via ./install.sh..." >&2
+            if ( cd "$_pc_src" && ./install.sh ) >/dev/null 2>&1; then
+                echo "Weave pre-commit: install drift healed." >&2
+            else
+                echo "Weave pre-commit: ./install.sh failed — run it manually before committing." >&2
+            fi
+        fi
+    fi
+fi
+
 # Run ruff linter on staged Python files (added/modified only — skip deletions)
 STAGED_PY_FILES=$(git diff --cached --name-only --diff-filter=AM 2>/dev/null | grep '\.py$' | grep -v '^\.weave/' || true)
 if [ -n "$STAGED_PY_FILES" ]; then

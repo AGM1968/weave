@@ -21,6 +21,11 @@ git push                          # 8. MANDATORY before session end
 Never edit a file without an active node. If `wv status` shows 0 active, run `wv work <id>` or
 create a node first.
 
+Open a file with your harness's native file-read before editing it. Shell reads (`cat`/`grep`/`sed`)
+and code-search find the spot but do **not** satisfy harness edit-guards — editing a file you only
+inspected via a shell command is blocked ("File has not been read"). Grep/partial-read to locate;
+native-read the file you will change.
+
 `wv bootstrap --json` replaces 7 separate calls at session start (see Token Awareness). For a quick
 mid-session check, use `wv status` (~31 tokens). `git status && wv status` is the manual fallback
 when bootstrap is unavailable.

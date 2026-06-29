@@ -966,10 +966,17 @@ EOF
                             skipped=$((skipped + 1))
                             continue
                         fi
-                        # Pre-validate: a valid delta has at least one SQL keyword.
-                        # Files without any SQL are corrupt (e.g. written mid-fsync).
+                        # Pre-validate: a valid delta has at least one replayable
+                        # SQL statement. A file whose only content is comment lines
+                        # is an intentional no-op — the changeset generator emits
+                        # "-- no-op UPDATE on node/edge ..." (wv-delta.sh) when an
+                        # UPDATE would change nothing — so it is benign and skipped
+                        # silently. Only non-comment, non-blank garbage (e.g. a file
+                        # truncated mid-fsync) is genuinely corrupt.
                         if ! grep -qiE "^(INSERT|UPDATE|REPLACE|DELETE|BEGIN|PRAGMA)" "$delta" 2>/dev/null; then
-                            echo -e "${YELLOW}⚠ Skipped corrupt delta: ${delta_name}${NC}" >&2
+                            if grep -qvE '^[[:space:]]*(--.*)?$' "$delta" 2>/dev/null; then
+                                echo -e "${YELLOW}⚠ Skipped corrupt delta: ${delta_name}${NC}" >&2
+                            fi
                             continue
                         fi
                         new_deltas+=("$delta")

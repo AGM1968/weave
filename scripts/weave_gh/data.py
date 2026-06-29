@@ -126,10 +126,12 @@ def _repo_hash() -> str:
 
 
 def _is_codex_runtime() -> bool:
-    """Detect Codex-like sandbox agent environments.
+    """Detect sandboxed-runtime agent environments (name is historical).
 
-    Copilot and Claude Code agent shells share the same /dev/shm persistence
-    constraint as Codex; treat them as codex-style for hot-zone routing.
+    Codex, Copilot, AND Claude Code (CLAUDE_CODE_SSE_PORT) all hit the same
+    constraint — /dev/shm is not reliably persisted between tool invocations —
+    so all route to the shared /tmp/weave-codex-<uid> sandbox zone, NOT /dev/shm.
+    The "codex" naming is from the Codex-first-class era, not a Codex-only marker.
     """
     return (
         bool(os.environ.get("CODEX_THREAD_ID"))
