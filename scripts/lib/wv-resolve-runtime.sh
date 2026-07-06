@@ -79,12 +79,15 @@ resolve_agent_harness() {
     elif [ "$n" -eq 1 ]; then
         result="$present"
     else
-        printf 'wv: ambiguous agent markers (%s); set WV_AGENT_ID to disambiguate\n' "$present" >&2
-        local h
+        local h host user suggested
         result="${present%% *}"
         for h in codex copilot claude; do
             case " $present " in *" $h "*) result="$h"; break ;; esac
         done
+        host=$(hostname 2>/dev/null || echo "host")
+        user=$(whoami 2>/dev/null || echo "user")
+        suggested="${result}-${host}-${user}"
+        printf 'wv: ambiguous agent markers (%s); using %s precedence. Set WV_AGENT_ID=%s to make identity explicit.\n' "$present" "$result" "$suggested" >&2
     fi
 
     _WV_AGENT_HARNESS="$result"

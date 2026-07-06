@@ -216,6 +216,8 @@ assert_contains "$MCP_JSON" '"weave-lite"'                  "copilot: mcp.json h
 assert_contains "$MCP_JSON" '"weave-inspect"'               "copilot: mcp.json has weave-inspect server"
 assert_not_contains "$MCP_JSON" '"weave-graph"'             "copilot: mcp.json does not ship weave-graph"
 assert_contains "$MCP_JSON" 'index.js'                      "copilot: mcp.json points to index.js"
+assert_contains "$MCP_JSON" '"WV_AGENT_ID"'                 "copilot: mcp.json pins explicit Weave agent identity"
+assert_contains "$MCP_JSON" 'copilot-${workspaceFolderBasename}' "copilot: mcp.json uses workspace-scoped Copilot identity"
 assert_not_contains "$MCP_JSON" '"mcpServers"'              "copilot: mcp.json uses 'servers' not 'mcpServers'"
 assert_not_contains "$MCP_JSON" '"inputs"'                  "copilot: mcp.json has no 'inputs' key"
 SERVER_COUNT=$(jq '.servers | keys | length' "$REPO3/.mcp.json")

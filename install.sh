@@ -1461,7 +1461,8 @@ if [ "$AGENT" = "copilot" ]; then
             "args": ["$MCP_SERVER"],
             "env": {
                 "WV_PATH": "$WV_BIN",
-                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+                "WV_PROJECT_ROOT": "\${workspaceFolder}",
+                "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         },
         "weave-session": {
@@ -1469,7 +1470,8 @@ if [ "$AGENT" = "copilot" ]; then
             "args": ["$MCP_SERVER", "--scope=session"],
             "env": {
                 "WV_PATH": "$WV_BIN",
-                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+                "WV_PROJECT_ROOT": "\${workspaceFolder}",
+                "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         },
         "weave-lite": {
@@ -1477,7 +1479,8 @@ if [ "$AGENT" = "copilot" ]; then
             "args": ["$MCP_SERVER", "--scope=lite"],
             "env": {
                 "WV_PATH": "$WV_BIN",
-                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+                "WV_PROJECT_ROOT": "\${workspaceFolder}",
+                "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         },
         "weave-inspect": {
@@ -1485,7 +1488,8 @@ if [ "$AGENT" = "copilot" ]; then
             "args": ["$MCP_SERVER", "--scope=inspect"],
             "env": {
                 "WV_PATH": "$WV_BIN",
-                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+                "WV_PROJECT_ROOT": "\${workspaceFolder}",
+                "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         }
     }
@@ -1506,7 +1510,8 @@ MCPEOF
             "args": ["$MCP_SERVER"],
             "env": {
                 "WV_PATH": "$WV_BIN",
-                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+                "WV_PROJECT_ROOT": "\${workspaceFolder}",
+                "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         },
         "weave-session": {
@@ -1514,7 +1519,8 @@ MCPEOF
             "args": ["$MCP_SERVER", "--scope=session"],
             "env": {
                 "WV_PATH": "$WV_BIN",
-                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+                "WV_PROJECT_ROOT": "\${workspaceFolder}",
+                "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         },
         "weave-lite": {
@@ -1522,7 +1528,8 @@ MCPEOF
             "args": ["$MCP_SERVER", "--scope=lite"],
             "env": {
                 "WV_PATH": "$WV_BIN",
-                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+                "WV_PROJECT_ROOT": "\${workspaceFolder}",
+                "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         },
         "weave-inspect": {
@@ -1530,7 +1537,8 @@ MCPEOF
             "args": ["$MCP_SERVER", "--scope=inspect"],
             "env": {
                 "WV_PATH": "$WV_BIN",
-                "WV_PROJECT_ROOT": "\${workspaceFolder}"
+                "WV_PROJECT_ROOT": "\${workspaceFolder}",
+                "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         }
     }

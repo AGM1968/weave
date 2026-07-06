@@ -270,10 +270,10 @@ Returns blockers, ancestors with learnings, related nodes, pitfalls, and contrad
 
 ## MCP Server
 
-40 tools for IDE integration via 2 server instances:
+45 tools for IDE integration via the shipped scoped MCP servers:
 
-- **`weave`** (scope=all, 40 tools) — full tool set for Copilot Chat
-- **`weave-inspect`** (scope=inspect, 19 tools) — read-only subset for analysis subagents
+- **`weave`** (scope=all, 45 tools) — full tool set for Copilot Chat
+- **`weave-inspect`** (scope=inspect, 22 tools) — read-only subset for analysis subagents
 - **`--scope=lite`** (7 tools) — lightweight profile for constrained contexts
 
 > **Claude Code** does not use MCP — it interacts with Weave via `wv` CLI and enforcement hooks. MCP
@@ -476,7 +476,7 @@ Bidirectional sync between Weave nodes and GitHub issues:
 Copilot Chat (@copilot)           Claude Code (@claude / CLI)
         |                                 |
         v                                 v
-   MCP Server (2 instances)          wv CLI + hooks
+   MCP Server (scoped stdio)         wv CLI + hooks
         |                                 |
         +------------+--------------------+
                      |

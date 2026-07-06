@@ -195,6 +195,25 @@ out=$("$WV" query "MATCH nonexistent_xyz_term_abc" 2>&1)
 assert_contains "$out" "No results" "MATCH nonexistent term returns no results"
 
 echo ""
+echo -e "${YELLOW}=== wv query: joined-predicate rejection ===${NC}"
+
+# false-positive direction: parsed as status != 'done MATCH "x"' → matched all nodes
+out=$("$WV" query 'status!=done MATCH "sqlite"' 2>&1 || true)
+assert_contains "$out" "multiple predicates joined" "single-arg 'status!= MATCH' rejected with hint"
+assert_exit_fail "\"$WV\" query 'status!=done MATCH \"sqlite\"'" "single-arg 'status!= MATCH' exits non-zero"
+
+# false-negative direction: whole string fed to FTS5 → matched nothing
+out=$("$WV" query 'MATCH "sqlite" status=done' 2>&1 || true)
+assert_contains "$out" "multiple predicates joined" "single-arg 'MATCH ... status=' rejected with hint"
+
+out=$("$WV" query 'status=done HAS learning' 2>&1 || true)
+assert_contains "$out" "multiple predicates joined" "single-arg 'status= HAS key' rejected with hint"
+
+# regression: correct multi-arg combination still filters
+out=$("$WV" query status!=done MATCH sqlite 2>&1)
+assert_contains "$out" "wq-test: finding about sqlite busy timeout" "multi-arg MATCH + status filter still works"
+
+echo ""
 echo -e "${YELLOW}=== wv query: MATCH dual-FTS learning recall ===${NC}"
 
 # A node whose match phrase appears only in learning/decision, not in the text field.

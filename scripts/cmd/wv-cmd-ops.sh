@@ -3412,13 +3412,30 @@ cmd_mcp_status() {
         local config_path="$1"
         local config_label="$2"
         local missing=()
+        local contract_path="$REPO_ROOT/mcp/contract.json"
 
-        grep -q '"weave"' "$config_path" 2>/dev/null || missing+=("weave")
-        grep -q '"weave-session"' "$config_path" 2>/dev/null || missing+=("weave-session")
-        grep -q '"weave-lite"' "$config_path" 2>/dev/null || missing+=("weave-lite")
-        grep -q '"weave-inspect"' "$config_path" 2>/dev/null || missing+=("weave-inspect")
-        grep -q 'WV_PATH' "$config_path" 2>/dev/null || missing+=("WV_PATH")
-        grep -q 'WV_PROJECT_ROOT' "$config_path" 2>/dev/null || missing+=("WV_PROJECT_ROOT")
+        if command -v jq >/dev/null 2>&1 && [ -f "$contract_path" ]; then
+            local expected_names required_env
+            expected_names=$(jq -r '.servers[].name' "$contract_path" 2>/dev/null || true)
+            required_env=$(jq -r '.environment.required[]' "$contract_path" 2>/dev/null || true)
+            while IFS= read -r server_name; do
+                [ -z "$server_name" ] && continue
+                grep -q "\"$server_name\"" "$config_path" 2>/dev/null || missing+=("$server_name")
+            done <<<"$expected_names"
+            while IFS= read -r env_name; do
+                [ -z "$env_name" ] && continue
+                grep -q "$env_name" "$config_path" 2>/dev/null || missing+=("$env_name")
+            done <<<"$required_env"
+            grep -q 'WV_PATH' "$config_path" 2>/dev/null || missing+=("WV_PATH")
+        else
+            grep -q '"weave"' "$config_path" 2>/dev/null || missing+=("weave")
+            grep -q '"weave-session"' "$config_path" 2>/dev/null || missing+=("weave-session")
+            grep -q '"weave-lite"' "$config_path" 2>/dev/null || missing+=("weave-lite")
+            grep -q '"weave-inspect"' "$config_path" 2>/dev/null || missing+=("weave-inspect")
+            grep -q 'WV_PATH' "$config_path" 2>/dev/null || missing+=("WV_PATH")
+            grep -q 'WV_PROJECT_ROOT' "$config_path" 2>/dev/null || missing+=("WV_PROJECT_ROOT")
+            grep -q 'WV_AGENT_ID' "$config_path" 2>/dev/null || missing+=("WV_AGENT_ID")
+        fi
 
         if [ "${#missing[@]}" -eq 0 ]; then
             _mcp_record "VS Code config" "pass" "$config_label"
@@ -3462,6 +3479,20 @@ cmd_mcp_status() {
         else
             _mcp_record "server dist" "warn" "bundle looks too small (${mcp_size}B)"
         fi
+
+        local startup_json startup_rc startup_status startup_scope startup_tools startup_agent
+        startup_rc=0
+        startup_json=$(node "$mcp_js" --scope=lite --health-check 2>/dev/null) || startup_rc=$?
+        startup_rc=${startup_rc:-0}
+        if [ "$startup_rc" -eq 0 ] && command -v jq >/dev/null 2>&1 && printf '%s' "$startup_json" | jq -e '.schema == "weave-mcp-startup.v1"' >/dev/null 2>&1; then
+            startup_status=$(printf '%s' "$startup_json" | jq -r '.status')
+            startup_scope=$(printf '%s' "$startup_json" | jq -r '.scope')
+            startup_tools=$(printf '%s' "$startup_json" | jq -r '.tools')
+            startup_agent=$(printf '%s' "$startup_json" | jq -r '.agent_id // "unset"')
+            _mcp_record "startup health" "pass" "status=${startup_status} scope=${startup_scope} tools=${startup_tools} agent=${startup_agent}"
+        else
+            _mcp_record "startup health" "warn" "structured health-check unavailable — run: node $mcp_js --scope=lite --health-check"
+        fi
     fi
 
     # 4. Check for IDE configs (supports both agents in same repo)
@@ -3482,6 +3513,37 @@ cmd_mcp_status() {
     fi
     if ! $has_vscode && ! $has_claude; then
         _mcp_record "IDE config" "warn" "no IDE config found — run wv init-repo --agent=copilot or --agent=all"
+    fi
+
+    # 5. Live process visibility. VS Code/Copilot owns stdio server lifetimes, so
+    # absence is advisory, while extra same-scope processes are a stale-server smell.
+    local process_lines process_count duplicate_scope
+    process_lines=$(pgrep -af 'mcp/dist/index.js|weave-mcp|node .*weave' 2>/dev/null | grep -v 'pgrep -af' || true)
+    process_count=$(printf '%s\n' "$process_lines" | sed '/^$/d' | wc -l | tr -d ' ')
+    duplicate_scope=$(
+        printf '%s\n' "$process_lines" | sed '/^$/d' | awk '
+            {
+                scope="all"
+                if ($0 ~ /--scope=graph/) scope="graph"
+                else if ($0 ~ /--scope=session/) scope="session"
+                else if ($0 ~ /--scope=lite/) scope="lite"
+                else if ($0 ~ /--scope=inspect/) scope="inspect"
+                count[scope]++
+            }
+            END {
+                for (scope in count) if (count[scope] > 1) {
+                    if (out) out=out ","
+                    out=out scope ":" count[scope]
+                }
+                print out
+            }'
+    )
+    if [ "$process_count" -eq 0 ] 2>/dev/null; then
+        _mcp_record "server processes" "warn" "no running MCP server visible; start or restart the MCP client if tools are unavailable"
+    elif [ -n "$duplicate_scope" ]; then
+        _mcp_record "server processes" "warn" "${process_count} running, duplicate scope(s): ${duplicate_scope} — restart MCP servers to clear stale instances"
+    else
+        _mcp_record "server processes" "pass" "${process_count} running MCP server process(es), no duplicate scopes visible"
     fi
 
     # Summary

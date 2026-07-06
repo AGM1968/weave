@@ -4,6 +4,35 @@
 
 ## Unreleased
 
+## [1.66.0] - 2026-07-06
+
+### Added
+
+- **Machine-readable MCP lifecycle/config contract** - `mcp/contract.json` now defines server scopes,
+  expected startup policy, tool scope membership, and required configuration environment in one place.
+  Workflow surface tests assert the contract so docs, generated configs, and MCP runtime expectations
+  stay aligned.
+- **Bounded `/goal` scoping command** - the Claude command now focuses on source-classified call
+  telemetry, existing safeguards, and narrowly justified follow-up work instead of running a broad
+  remediation audit by default.
+
+### Changed
+
+- **MCP startup and status diagnostics hardened** - Copilot MCP configs now set explicit
+  `WV_AGENT_ID`, MCP startup can report structured health, and `mcp-status` surfaces startup/process
+  diagnostics while preserving normal stdio protocol behavior.
+- **MCP lifecycle docs aligned with the contract** - public README and MCP README wording now reflects
+  the lifecycle/config contract, including scoped servers and generated client configuration.
+- **Public release-note sanitization is shared** - `build-release.sh` now uses one sanitizer for the
+  shipped changelog, source tag notes, and public GitHub release notes, so internal Weave node ids and
+  dangling `Closes/Fixes/See/Ref wv-*` clauses do not leak into consumer-facing release text.
+
+### Fixed
+
+- **`wv query` rejects joined predicate strings** - single-argument forms like
+  `status!=done MATCH "term"` now fail with a quoting hint instead of silently dropping filters or
+  searching the whole joined string.
+
 ## [1.65.0] - 2026-06-29
 
 ### Added
@@ -39,7 +68,8 @@
 
 - **Cross-harness agent-source attribution** — telemetry now records which harness originated a `wv`
   call (Claude, Codex, VS Code Copilot) honestly across machines. Codex and Copilot are attested via
-  host markers rather than guessed, behind a documented cross-harness call-source contract.
+  host markers rather than guessed, behind a documented cross-harness call-source contract
+.
 - **Agent identity separated from hot-zone placement** — `resolve_agent_id` (identity) and
   `is_sandboxed_runtime` (placement) are now independent axes, and the run-cache key includes
   identity so concurrent Claude/Codex agents no longer leak each other's cached results.
@@ -355,7 +385,8 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 
 - **Stale-signal gate on findings promotion.** `wv findings promote` now accepts `--since-days N`
   (default 30) and refuses to promote findings whose evidence is older than the threshold. Prevents
-  stale findings from entering the graph with misleading urgency. Override with `--force`.
+  stale findings from entering the graph with misleading urgency. Override with `--force`
+.
 - **`wv uninstall` command.** Removes Weave from `~/.local/bin/`, `~/.local/lib/weave/`,
   `~/.config/weave/`, and optionally `.weave/` in the current repo. Documented lifecycle companion
   to `wv init-repo`. Install help updated to surface the command.
@@ -366,13 +397,15 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   `finding.violation_type` against the canonical enum at write time, not only at close time.
   Prevents invalid violation types from entering the DB silently.
 - **Pattern C finding schema reconciled.** `violation_type` enum expanded with `measurement-gap`;
-  `historical:tooling` remapped to `historical:defect`. Flat→nested schema inconsistency resolved.
+  `historical:tooling` remapped to `historical:defect`. Flat→nested schema inconsistency resolved
+.
 - **`wv sync --gh` defaults to fast mode.** Omitting `--mode` previously defaulted to `--mode=full`
   (exhaustive reconcile across entire graph), which under GH auth failures created duplicate issues
   and left done nodes with open GH issues. Default is now `--mode=fast` (routine close path). Use
   `--mode=full` deliberately for periodic reconcile.
 - **`uninstall` classified as exempt in run-cache registry.** `wv pattern-audit` Check 1 now passes
-  cleanly. Gate clock for Pattern A Rust port reset to 2026-06-10; not-before date 2026-06-24.
+  cleanly. Gate clock for Pattern A Rust port reset to 2026-06-10; not-before date 2026-06-24
+.
 - **`wv list --json` emits `created_at`/`updated_at` fields.** Stale-node UTC parse fixed for
   downstream consumers that calculate node age.
 - **Telemetry call-log four-count correctness.** `WV_CALL_LOG` entry counts corrected for
@@ -429,7 +462,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   caller quirks (`--limit=` equals-form, IN-list quoting, impact done-seed). Steers agents toward
   targeted 600-token reads instead of 12k-token `wv list` bulk dumps.
 - **`wv init-repo` reports code-index status.** Setup summary now appends a line showing whether
-  `wv index` has been run; fresh repos display `Run: wv index .` so agents do not silently lose
+  `wv index` has been run; fresh repos display `Run: wv index.` so agents do not silently lose
   `wv search --code` capability.
 - **Session-close retro surfaces top command by token cost.** The stop hook emits a soft note
   showing the highest-cost command from `wv analyze sessions --call-stats` when session analysis is
@@ -1022,7 +1055,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 ### Fixed
 
 - **`wv unarchive` INSERT into generated columns** — `priority` and `type` in the nodes table are
-  `GENERATED ALWAYS AS ... VIRTUAL`; SQLite rejects INSERTs that name them. Removed from INSERT
+  `GENERATED ALWAYS AS... VIRTUAL`; SQLite rejects INSERTs that name them. Removed from INSERT
   column list.
 - **`wv unarchive` set-e last-statement trap** — Two `[ -n "$r_alias" ] && echo` patterns at
   function boundaries returned exit 1 when alias was empty. Replaced with `if/fi` guards.
@@ -1115,11 +1148,11 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   the fallback — correct for new and test zones; only explicit wrong-owner files trigger rejection.
 
 - **Size-check subshell export guard** — `_WV_SIZE_CHECKED` was set but not exported, so pipe
-  subshells (e.g. `cmd_context "$id" --json | jq .`) inherited an empty value and re-fired the
+  subshells (e.g. `cmd_context "$id" --json | jq.`) inherited an empty value and re-fired the
   auto-prune check. Changed to `export _WV_SIZE_CHECKED=1`.
 
 - **`wv context` pretty-prints without `--json`** — previously errored when called without `--json`.
-  Now self-calls with `--json` and pipes through `jq .` for human-readable output.
+  Now self-calls with `--json` and pipes through `jq.` for human-readable output.
 
 - **Code indexer excludes `archive/` directory and `venv_*` prefixes** — `wv search --code` was
   indexing archived proposal docs (dominating code search results) and virtual-environment
@@ -1547,6 +1580,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 
 - **M3 — signed install manifest**: proposal-scope (GPG vs cosign + build-release.sh changes).
 
+
 ## [1.41.2] - 2026-04-19
 
 ### Fixed
@@ -1586,7 +1620,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   `tests/test_weave_gh_phases.py::test_finding_nodes_are_skipped`.
 - **`.claude/scheduled_tasks.lock` tracked in git**: the Claude Code scheduler creates and removes
   this transient lock file each session; it was committed once and every session opened with a
-  `D .claude/scheduled_tasks.lock` entry in `git status`, masking real changes. Added to
+  `D.claude/scheduled_tasks.lock` entry in `git status`, masking real changes. Added to
   `.gitignore` (plus `.claude/*.lock` glob) and removed from the index via `git rm --cached`.
 
 ### Docs
@@ -1659,7 +1693,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   a single UPDATE — atomic, SQL-native, no silent fallback. Matches the `--remove-key` path (already
   `json_remove`-based). Regression tests cover empty→new, preserve+add, apostrophe round-trip,
   unicode + literal `||`, invalid-JSON rejection, and immediate update-then-claim readiness.
-- **`auto_checkpoint` + `wv sync` commit hijack (H1.T3)**: both paths ran `git add .weave/` then
+- **`auto_checkpoint` + `wv sync` commit hijack (H1.T3)**: both paths ran `git add.weave/` then
   committed whatever was staged — absorbing user-prestaged files into a generic
   `chore(weave): auto-checkpoint HH:MM` or `sync state` commit, silently rewriting named work. Both
   paths now enumerate staged files first and skip the commit (with a stderr warning) if any
@@ -1679,11 +1713,11 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   nodes that exist and are properly planned. Retrying passes immediately; each false block costs one
   model turn. Hook now fails open: if `wv show` returns zero rows, exit 0 silently and let `wv work`
   itself surface the clearer "node not found" error. Regression test in `test-hooks.sh` covers an
-  unknown-ID payload. Closes (H1.T1b).
+  unknown-ID payload. (H1.T1b).
 - **`bash-dedup.sh` false-positive classification**: the hook classified long-running commands via
   substring regex over the raw `tool_input.command`. Anchors like
   `(^|[;[:space:]])make[[:space:]]+check` matched real invocations but also matched inside quoted
-  argument text — e.g. a `wv done --learning="... ran make check 572/572 ..."` would acquire the
+  argument text — e.g. a `wv done --learning="... ran make check 572/572..."` would acquire the
   `make-build` lock and hard-block the next unrelated command for up to 10 minutes. Hook now strips
   `"..."` / `'...'` regions before classifying, so structural anchors see only outer shell syntax.
   Npm/poetry patterns gained the same command-start anchor the others already had. Regression table
@@ -1807,7 +1841,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   directory are brought up to date from `~/.config/weave/hooks/` in a single command. Reports how
   many hooks were updated vs already current.
 - **`wv doctor` hook drift message**: Now says `run: wv init-repo --update` instead of
-  `run ./install.sh` — the correct command for repos without `install.sh` on PATH.
+  `run./install.sh` — the correct command for repos without `install.sh` on PATH.
 - **`wv doctor --repair` handles hook drift**: Copies stale hooks from `~/.config/weave/hooks/` into
   the project `.claude/hooks/` (pull direction). Clears drift in one step.
 
@@ -1921,7 +1955,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 - **Multi-agent delta replay — INSERT OR REPLACE alias collision**: `wv_delta_changeset` emitted
   `INSERT OR REPLACE INTO nodes(...)` for delta INSERTs. SQLite OR REPLACE deletes the conflicting
   row before inserting, so a node sharing a unique alias with the incoming row would be silently
-  deleted. Changed to `INSERT INTO ... ON CONFLICT(id) DO UPDATE` targeting the primary key only.
+  deleted. Changed to `INSERT INTO... ON CONFLICT(id) DO UPDATE` targeting the primary key only.
 - **Multi-agent delta replay — FTS shadow table filter removed**: Line-based grep filter for
   `nodes_fts`/`sqlite_sequence` rows was unsafe against multi-line SQL literals. Removed —
   `wv_delta_changeset` never emits FTS shadow tables so the filter was dead code and a risk.
@@ -2071,7 +2105,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 
 ### Fixed
 
-- **`wv sync` state.sql size**: FTS5 index was included in `sqlite3 .dump` output, inflating
+- **`wv sync` state.sql size**: FTS5 index was included in `sqlite3.dump` output, inflating
   state.sql from ~300KB to 55MB. The dump now excludes FTS shadow tables (`nodes_fts*`,
   `edges_fts*`), reducing state.sql by ~99%.
 
@@ -2106,7 +2140,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 ### Added
 
 - **`bash-dedup.sh` / `bash-dedup-post.sh` hooks**: PreToolUse/PostToolUse pair that prevents
-  duplicate long-running Bash commands (make check, wv sync --gh, git push, ./install.sh, npm,
+  duplicate long-running Bash commands (make check, wv sync --gh, git push,./install.sh, npm,
   pytest). Uses per-repo lock files with TTL-based expiry for background commands.
 
 ### Fixed
@@ -2151,10 +2185,10 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 ### Fixed
 
 - **Sync sequence correctness**: `wv sync --gh` writes to `.weave/`, so `git push` without an
-  intervening `git add .weave/ && git commit` left graph state uncommitted after push — causing the
+  intervening `git add.weave/ && git commit` left graph state uncommitted after push — causing the
   stop-hook to re-fire on every subsequent response.
 - **`stop-check.sh`**: blocking message now instructs the full 3-step sequence
-  (`wv sync --gh && git add .weave/ && git commit → git push`) when `.weave/` is dirty; AHEAD-only
+  (`wv sync --gh && git add.weave/ && git commit → git push`) when `.weave/` is dirty; AHEAD-only
   case simplified to `git push`.
 - **`Makefile.template` `wv-push` target**: added conditional commit before `git push`.
 - **`session_lifecycle.py` `quit_hygiene_state`**: `ahead > 0` early return now checks
@@ -2452,7 +2486,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 ### Fixed
 
 - **`wv tree`** — `--root` now correctly anchors CTE in text and JSON modes (regression from
-  v1.24.0). Root cause: `$([ cond ] && echo ...)` inside assignment returns exit 1 under `set -e`,
+  v1.24.0). Root cause: `$([ cond ] && echo...)` inside assignment returns exit 1 under `set -e`,
   silently killing `cmd_tree`. Fixed with `if/fi` guard.
 - **`wv ready --subtree`** — CTE uses `UNION` instead of `UNION ALL` to prevent duplicate node IDs
   from diamond dependencies.
@@ -2541,7 +2575,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 
 - **GH title truncation** — GitHub issue titles now truncated correctly.
 - **Stop hook `.weave/` exclusion** — Broadened to exclude all `.weave/` files, not just deltas.
-- **`wv-init-repo` .gitattributes** — Uses marker block with full template; strips orphaned comments
+- **`wv-init-repo`.gitattributes** — Uses marker block with full template; strips orphaned comments
   from partial upgrades.
 
 ## [1.23.0] - 2026-03-16
@@ -2672,7 +2706,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 - **Bash CC parser: structural brace matching** — `line.count("{") - line.count("}")` counted braces
   inside strings (`"${var}"`), parameter expansions (`${#arr[@]}`), and jq expressions as
   structural. Fixed by only counting `{` on function-definition lines and `}` on standalone lines.
-- **Bash CC parser: one-liner functions** — `func() { ...; }` style definitions had no standalone
+- **Bash CC parser: one-liner functions** — `func() {...; }` style definitions had no standalone
   closing `}`, causing function ranges to extend to EOF. Fixed by detecting `}` at end of the
   definition line.
 - **Bash CC parser: heredoc content** — `}` inside heredocs (e.g. JSON in `cat << EOF`) was counted
@@ -2716,7 +2750,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   or refresh the Weave block in existing CLAUDE.md files without overwriting project content.
 - **AGENTS.md.template** — new generic stub (23 lines) replaces shipping memory-system's 205-line
   development reference to the public repo.
-- **build-release.sh** — CLAUDE.md, AGENTS.md, and .github/copilot-instructions.md all generated
+- **build-release.sh** — CLAUDE.md, AGENTS.md, and.github/copilot-instructions.md all generated
   from templates at build time (no longer ships memory-system-specific copies).
 
 ## [1.17.0] - 2026-03-06
@@ -2726,7 +2760,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 - **VS Code hook enforcement** — hook scripts now handle both Claude Code tool names
   (`Edit`/`Write`/`Bash`) and VS Code tool names (`create_file`/`replace_string_in_file`/
   `run_in_terminal`). The `SHOULD_CHECK` filter in `pre-action.sh` and `tool_input` property
-  extraction (`.file_path // .filePath`) cover both ecosystems. VS Code ignores matchers (all hooks
+  extraction (`.file_path //.filePath`) cover both ecosystems. VS Code ignores matchers (all hooks
   fire on every tool), so this script-level fix closes the enforcement gap for `@copilot`.
 
 - **Minimal copilot-instructions stub** — `wv init-repo --agent=copilot` now generates a 10-line
@@ -3240,7 +3274,7 @@ MCP server now exposes 28 tools (was 23). All scope assignments updated. 24/24 M
 
 ### Fixed
 
-- **Sync data loss prevention**: All 3 `sqlite3 .dump` sites (auto_sync, cmd_sync, post-GH re-dump)
+- **Sync data loss prevention**: All 3 `sqlite3.dump` sites (auto_sync, cmd_sync, post-GH re-dump)
   now use `.timeout 5000` to wait for write locks instead of returning empty. `cmd_sync` also guards
   against empty dumps before overwriting `state.sql`.
 - **Context pitfall scoping**: Replaced blocks-only ancestry CTE with bidirectional
@@ -3386,7 +3420,7 @@ MCP server now exposes 28 tools (was 23). All scope assignments updated. 24/24 M
   passive advisory. Choosing `d` or `s` prevents the learning from being saved; `a` proceeds.
   Non-TTY fallback preserves the original hint line.
 - **Epic commit aggregation**: `wv done` now stores related commit SHAs (via `git log --grep`) in
-  node metadata as `commits: ["abc1234", ...]`. When a task has a parent epic (via `implements`
+  node metadata as `commits: ["abc1234",...]`. When a task has a parent epic (via `implements`
   edge), child commits are aggregated onto the epic node incrementally. Enables navigating from epic
   to all implementing commits.
 - **CLOSE phase mandatory gate**: `/weave` SKILL.md Phase 4 now has an explicit
@@ -3402,7 +3436,7 @@ MCP server now exposes 28 tools (was 23). All scope assignments updated. 24/24 M
 - **`wv plan --gh` secondary rate limit**: CLI already had `sleep 1` between GH issue creates (added
   in 067d50a); the MCP path now also has a sufficient timeout to complete large plans without
   `ETIMEDOUT`.
-- **ShellCheck SC2015**: `_aggregate_epic_commits` call now uses `if/fi` instead of `&& ... || true`
+- **ShellCheck SC2015**: `_aggregate_epic_commits` call now uses `if/fi` instead of `&&... || true`
   to avoid the false-positive where the `|| true` arm runs when the condition is true but the
   command fails.
 
@@ -3485,7 +3519,7 @@ MCP server now exposes 28 tools (was 23). All scope assignments updated. 24/24 M
 
 - **`wv-init-repo --update`**: Updates managed files (hooks, skills, agents,
   copilot-instructions.md) in existing repos without overwriting user-customized files (CLAUDE.md,
-  settings.local.json, .vscode/mcp.json). Use `--force` to overwrite everything.
+  settings.local.json,.vscode/mcp.json). Use `--force` to overwrite everything.
 - **All 16 skills shipped**: `wv-init-repo` now installs all 16 skills (was 3). Includes weave,
   weave-audit, sanity-check, ship-it, pre-mortem, plan-agent, zero-in, wv-clarify-spec,
   wv-decompose-work, wv-detect-loop, wv-guard-scope, wv-verify-complete, breadcrumbs, close-session,

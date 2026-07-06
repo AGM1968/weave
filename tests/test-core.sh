@@ -2658,6 +2658,7 @@ test_agent_identity_resolution() {
     warn=$(env -u WV_AGENT_ID -u COPILOT_AGENT CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 \
            bash -c "source '$L'; resolve_agent_id >/dev/null" 2>&1)
     assert_contains "$warn" "ambiguous" "co-present markers emit an ambiguity diagnostic"
+    assert_contains "$warn" "Set WV_AGENT_ID=codex-" "ambiguity diagnostic suggests a concrete WV_AGENT_ID"
 }
 
 test_delta_filename_carries_identity() {

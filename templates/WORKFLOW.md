@@ -279,7 +279,7 @@ EOF
 
 ## Agents
 
-The default `weave` MCP server exposes all 40 tools. When `weave-inspect` is also registered,
+The default `weave` MCP server exposes all 45 tools. When `weave-inspect` is also registered,
 read-only agents can use its 17-tool inspect subset.
 
 - **weave-guide** — Workflow best practices, anti-patterns (session lifecycle tools)

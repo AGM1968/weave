@@ -93,6 +93,21 @@ _query_parse_predicate() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# _query_joined_predicate_error — reject several predicates joined in one arg
+# 'status!=done MATCH "x"' as ONE shell arg parses as status != 'done MATCH "x"'
+# (matches everything); 'MATCH "x" status=y' feeds the whole string to FTS5
+# (matches nothing). Both silent — fail loudly with the correct form instead.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_query_joined_predicate_error() {
+    echo "Error: multiple predicates joined in one argument: '$1'" >&2
+    echo "Each predicate must be a separate shell argument:" >&2
+    echo "  wrong: wv query 'status!=done MATCH \"topic\"'" >&2
+    echo "  right: wv query status!=done MATCH topic    (quote phrases: MATCH '\"two words\"')" >&2
+    return 1
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # _query_build_sql — assemble WHERE + ORDER + LIMIT
 # Signature: _query_build_sql <from_source> <order> <limit> [predicates...]
 #
@@ -105,14 +120,24 @@ _query_build_sql() {
     local -a preds=("$@")
 
     # Pre-scan for MATCH before parse loop (subshell cannot set globals)
-    local needs_fts=0 fts_expr=""
+    local needs_fts=0 fts_expr="" expr=""
+    # Operator-shaped token after whitespace = joined predicates in one arg.
+    # FTS5 barewords cannot contain '=', so this is safe inside MATCH exprs too.
+    local joined_re='[[:space:]][A-Za-z_-]+(!=|>=|<=|=)'
     local -a non_match=()
     for p in "${preds[@]}"; do
         if [[ "$p" == MATCH\ * ]]; then
+            expr="${p#MATCH }"
+            if [[ "$expr" =~ $joined_re ]] || [[ "$expr" == *" HAS "* ]]; then
+                _query_joined_predicate_error "$p"; return 1
+            fi
             needs_fts=1
-            fts_expr="${p#MATCH }"
+            fts_expr="$expr"
             fts_expr="${fts_expr%\"}"; fts_expr="${fts_expr#\"}"
         else
+            if [[ "$p" == *" MATCH "* ]] || [[ "$p" == *" HAS "* ]] || [[ "$p" =~ $joined_re ]]; then
+                _query_joined_predicate_error "$p"; return 1
+            fi
             non_match+=("$p")
         fi
     done

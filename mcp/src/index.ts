@@ -127,6 +127,7 @@ function parseScope(): Scope {
 }
 
 const ACTIVE_SCOPE = parseScope();
+const HEALTH_CHECK = process.argv.includes("--health-check");
 
 // Find wv CLI - check common locations
 function findWvPath(): string {
@@ -150,12 +151,20 @@ function findWvPath(): string {
   throw new Error("wv CLI not found. Install with: cd weave && ./install.sh");
 }
 
-const WV_PATH = findWvPath();
+let WV_PATH = "";
+let WV_PATH_ERROR = "";
+try {
+  WV_PATH = findWvPath();
+} catch (error: unknown) {
+  WV_PATH_ERROR = (error as Error).message;
+  if (!HEALTH_CHECK) throw error;
+}
 
 // Default timeout for wv commands (30s). Sync handlers override this.
 const WV_TIMEOUT = 30_000;
 const WV_LIFECYCLE_TIMEOUT = 15_000;
 const MCP_ALLOW_NETWORK = process.env.WV_MCP_ALLOW_NETWORK === "1";
+const MCP_STARTUP_REPORT = process.env.WV_MCP_STARTUP_REPORT === "1";
 const STATUS_SCHEMA_VALUES = [
   "todo",
   "active",
@@ -172,6 +181,24 @@ const MCP_READ_MODE: ReadMode = "discover";
 
 function resolveProjectRoot(): string {
   return process.env.WV_PROJECT_ROOT || process.env.WV_PROJECT_DIR || process.cwd();
+}
+
+function startupReport(status: "pass" | "fail" = "pass"): Record<string, unknown> {
+  return {
+    schema: "weave-mcp-startup.v1",
+    status,
+    server: ACTIVE_SCOPE === "all" ? "weave" : `weave-${ACTIVE_SCOPE}`,
+    scope: ACTIVE_SCOPE,
+    tools: SCOPED_TOOLS.length,
+    pid: process.pid,
+    version: "1.66.0",
+    wv_path: WV_PATH || null,
+    wv_path_error: WV_PATH_ERROR || null,
+    project_root: resolveProjectRoot(),
+    agent_id: process.env.WV_AGENT_ID || null,
+    call_log: MCP_CALL_LOG || null,
+    allow_network: MCP_ALLOW_NETWORK,
+  };
 }
 
 function wvEnv(extraEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
@@ -2523,11 +2550,17 @@ function handleTool(name: string, args: Record<string, unknown>): ToolResponse {
 
 // Create and run server
 async function main() {
+  if (HEALTH_CHECK) {
+    const status = WV_PATH_ERROR ? "fail" : "pass";
+    console.log(JSON.stringify(startupReport(status)));
+    process.exit(WV_PATH_ERROR ? 1 : 0);
+  }
+
   const scopeLabel = ACTIVE_SCOPE === "all" ? "" : `-${ACTIVE_SCOPE}`;
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.65.0",
+      version: "1.66.0",
     },
     {
       capabilities: {
@@ -2593,6 +2626,9 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
+  if (MCP_STARTUP_REPORT) {
+    console.error(JSON.stringify({ event: "weave_mcp_startup", ...startupReport("pass") }));
+  }
   console.error(`Weave MCP server started (scope=${ACTIVE_SCOPE}, ${SCOPED_TOOLS.length} tools)`);
 }
 

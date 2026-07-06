@@ -12,6 +12,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const SERVER_PATH = resolve(__dirname, "../dist/index.js");
 const REQUEST_TIMEOUT_MS = 30_000;
+const CONTRACT = JSON.parse(readFileSync(resolve(__dirname, "../contract.json"), "utf-8")) as {
+  scopes: Record<string, { tool_count: number; configured_by_default?: boolean; start_when?: string }>;
+  servers: Array<{ name: string; scope: string; lifecycle: string; start_policy?: string }>;
+  environment: { required: string[] };
+};
 
 // Graph-isolation env injected into every spawned wv / MCP-server process so the
 // suite never mutates the developer's live Weave graph. The "Weave MCP Server"
@@ -257,6 +262,54 @@ function createActiveNodeDirect(text: string): string {
   return extractNodeId(`${result.stdout || ""}\n${result.stderr || ""}`);
 }
 
+describe("Weave MCP startup health", () => {
+  it("keeps lifecycle metadata explicit for shipped scopes", () => {
+    expect(CONTRACT.servers.map((server) => server.name)).toEqual([
+      "weave",
+      "weave-session",
+      "weave-lite",
+      "weave-inspect",
+    ]);
+    for (const server of CONTRACT.servers) {
+      expect(server.lifecycle).toBe("client-managed-stdio");
+      expect(server.start_policy).toBeTruthy();
+      expect(CONTRACT.scopes[server.scope].configured_by_default).toBe(true);
+      expect(CONTRACT.scopes[server.scope].start_when).toBeTruthy();
+    }
+    expect(CONTRACT.scopes.graph.configured_by_default).toBe(false);
+    expect(CONTRACT.scopes.graph.start_when).toBeTruthy();
+    expect(CONTRACT.environment.required).toEqual(expect.arrayContaining(["WV_PROJECT_ROOT", "WV_AGENT_ID"]));
+  });
+
+  it("emits structured startup health and exits without starting stdio", () => {
+    const result = spawnSync("node", [SERVER_PATH, "--scope=lite", "--health-check"], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        WV_PATH: resolve(__dirname, "../../scripts/wv"),
+        WV_PROJECT_ROOT: resolve(__dirname, "../.."),
+        WV_AGENT_ID: "mcp-test-agent",
+      },
+    });
+
+    if (result.error?.message.includes("EPERM")) {
+      console.warn("Skipping startup health subprocess assertion: nested node spawn is blocked by this sandbox");
+      return;
+    }
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    const payload = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+    expect(payload.schema).toBe("weave-mcp-startup.v1");
+    expect(payload.status).toBe("pass");
+    expect(payload.server).toBe("weave-lite");
+    expect(payload.scope).toBe("lite");
+    expect(payload.tools).toBe(CONTRACT.scopes.lite.tool_count);
+    expect(payload.agent_id).toBe("mcp-test-agent");
+    expect(payload.project_root).toBe(resolve(__dirname, "../.."));
+    expect(payload.wv_path).toBe(resolve(__dirname, "../../scripts/wv"));
+  });
+});
+
 describe("Weave MCP Server", () => {
   let client: MCPTestClient;
   let isolatedDir: string;
@@ -306,12 +359,12 @@ describe("Weave MCP Server", () => {
   }, 60_000);
 
   describe("tools/list", () => {
-    it("should list all 45 tools (default scope=all)", async () => {
+    it("should list all tools from the default scope contract", async () => {
       const response = await client.request("tools/list");
       expect(response.error).toBeUndefined();
 
       const tools = (response.result as { tools: { name: string }[] }).tools;
-      expect(tools).toHaveLength(45);
+      expect(tools).toHaveLength(CONTRACT.scopes.all.tool_count);
 
       const toolNames = tools.map((t) => t.name);
       expect(toolNames).toContain("weave_search");
@@ -1163,7 +1216,7 @@ describe("Weave MCP Server --scope=graph", () => {
         "weave_delete",
       ])
     );
-    expect(tools).toHaveLength(13);
+    expect(tools).toHaveLength(CONTRACT.scopes.graph.tool_count);
 
     // Should NOT include inspect or session tools
     expect(toolNames).not.toContain("weave_search");
@@ -1217,7 +1270,7 @@ describe("Weave MCP Server --scope=session", () => {
         "weave_edit_guard",
       ])
     );
-    expect(tools).toHaveLength(12);
+    expect(tools).toHaveLength(CONTRACT.scopes.session.tool_count);
   });
 });
 
@@ -1264,7 +1317,7 @@ describe("Weave MCP Server --scope=inspect", () => {
         "weave_index",
       ])
     );
-    expect(tools).toHaveLength(22);
+    expect(tools).toHaveLength(CONTRACT.scopes.inspect.tool_count);
   });
 });
 

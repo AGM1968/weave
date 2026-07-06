@@ -29,7 +29,7 @@ node mcp/dist/index.js --scope=inspect  # read-only operations only
 
 ## Scope System
 
-The `--scope` flag partitions the 33 available tools into focused subsets. This is designed for **VS
+The `--scope` flag partitions the 45 available tools into focused subsets. This is designed for **VS
 Code's multi-server MCP architecture**, where each Copilot subagent can be given a different server
 with only the tools it needs — reducing context window usage and preventing cross-concern tool
 confusion.
@@ -38,18 +38,32 @@ confusion.
 
 | Scope       | Tools                                                                                                                                                                                                                                                                                                                                                                                                          | Purpose                                    |
 | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| **graph**   | `weave_add`, `weave_link`, `weave_done`, `weave_batch_done`, `weave_list`, `weave_resolve`, `weave_update`, `weave_touch`, `weave_delete` (9)                                                                                                                                                                                                                                                                  | Create/modify/delete nodes and edges       |
+| **graph**   | `weave_add`, `weave_link`, `weave_unlink`, `weave_block`, `weave_unarchive`, `weave_done`, `weave_batch_done`, `weave_list`, `weave_resolve`, `weave_update`, `weave_touch`, `weave_record_edit`, `weave_delete` (13)                                                                                                                                                                                        | Create/modify/delete nodes and edges       |
 | **session** | `weave_work`, `weave_ready`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_close_session`, `weave_trails`, `weave_breadcrumbs` (deprecated alias), `weave_plan`, `weave_edit_guard` (12)                                                                                                                                                                           | Workflow lifecycle management              |
 | **lite**    | `weave_overview`, `weave_bootstrap`, `weave_guide`, `weave_edit_guard`, `weave_status`, `weave_work`, `weave_done` (7)                                                                                                                                                                                                                                                                                         | Minimal task-tracking surface              |
-| **inspect** | `weave_context`, `weave_search`, `weave_query`, `weave_status`, `weave_ready`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`, `weave_quality_patterns`, `weave_structural_search`, `weave_code_search`, `weave_index` (21) | Read-only observation and query            |
-| **all**     | All 42 tools                                                                                                                                                                                                                                                                                                                                                                                                   | Full access (default, backward-compatible) |
+| **inspect** | `weave_context`, `weave_search`, `weave_query`, `weave_status`, `weave_ready`, `weave_impact`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`, `weave_structural_search`, `weave_quality_patterns`, `weave_code_search`, `weave_index` (22) | Read-only observation and query            |
+| **all**     | All 45 tools                                                                                                                                                                                                                                                                                                                                                                                                   | Full access (default, backward-compatible) |
+
+### Scope lifecycle
+
+The checked-in lifecycle is client-managed stdio: the MCP client starts each configured server
+process and restart/cleanup is done by restarting the client. `mcp/contract.json` is the
+machine-readable source of truth for these mappings.
+
+| Server          | Scope     | Start when                                                                                    | Intended clients                                  | Shipped |
+| --------------- | --------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------- | ------- |
+| `weave`         | `all`     | Default server for general interactive work or clients that cannot select narrower scopes      | Copilot chat, general MCP clients                 | yes     |
+| `weave-session` | `session` | Workflow lifecycle clients that need claim, edit guard, close, recovery, or handoff tools     | Copilot chat, workflow subagents                  | yes     |
+| `weave-lite`    | `lite`    | Constrained contexts that need only bootstrap/status/work/done/edit-guard basics              | Copilot chat, Codex optional, constrained agents  | yes     |
+| `weave-inspect` | `inspect` | Read-only research, review, audit, search, health, and quality inspection workflows           | Copilot chat, read-only subagents, review agents  | yes     |
+| `weave-graph`   | `graph`   | Optional local server for agents intentionally creating, linking, updating, or deleting graph nodes | Planning and graph-construction agents       | no      |
 
 ### Design rationale
 
 When an AI agent spawns subagents (e.g., a research subagent, a coding subagent, a review subagent),
 each subagent inherits the full MCP tool set. This creates problems:
 
-1. **Context bloat** — 33 tool definitions compete for limited context window
+1. **Context bloat** — 45 tool definitions compete for limited context window
 2. **Tool confusion** — a read-only research subagent shouldn't see `weave_ship`
 3. **Accidental mutations** — an inspect-only subagent could accidentally call `weave_done`
 
@@ -88,6 +102,11 @@ Invalid scope "bogus". Valid: graph, session, lite, inspect, all
 
 ## Client Configuration
 
+The machine-readable MCP lifecycle/config contract lives at `mcp/contract.json`. It names the
+supported scopes, shipped server entries, intended clients, required/recommended environment
+variables, startup report schema, and default network policy. Treat it as the operator-facing source
+of truth when wiring MCP clients outside the generated `.mcp.json`/`.vscode/mcp.json` files.
+
 ### VS Code Copilot (`.mcp.json`)
 
 The committed repo configuration currently registers **four servers**:
@@ -111,6 +130,7 @@ for specialised subagents.
       "env": {
         "WV_PATH": "${workspaceFolder}/scripts/wv",
         "WV_PROJECT_ROOT": "${workspaceFolder}",
+        "WV_AGENT_ID": "copilot-${workspaceFolderBasename}",
       },
     },
     // Workflow lifecycle only — claim/ship/close-session/edit-guard surfaces
@@ -121,6 +141,7 @@ for specialised subagents.
       "env": {
         "WV_PATH": "${workspaceFolder}/scripts/wv",
         "WV_PROJECT_ROOT": "${workspaceFolder}",
+        "WV_AGENT_ID": "copilot-${workspaceFolderBasename}",
       },
     },
     // Minimal task-tracking surface for lighter-weight Copilot subagents
@@ -131,6 +152,7 @@ for specialised subagents.
       "env": {
         "WV_PATH": "${workspaceFolder}/scripts/wv",
         "WV_PROJECT_ROOT": "${workspaceFolder}",
+        "WV_AGENT_ID": "copilot-${workspaceFolderBasename}",
       },
     },
     // Read-only queries — for research/review subagents
@@ -141,6 +163,7 @@ for specialised subagents.
       "env": {
         "WV_PATH": "${workspaceFolder}/scripts/wv",
         "WV_PROJECT_ROOT": "${workspaceFolder}",
+        "WV_AGENT_ID": "copilot-${workspaceFolderBasename}",
       },
     },
   },
@@ -148,7 +171,9 @@ for specialised subagents.
 ```
 
 `WV_PROJECT_ROOT` pins all `wv` subprocess calls to the intended repository, so edit guards and
-other workflow checks do not depend on the MCP server's inherited cwd.
+other workflow checks do not depend on the MCP server's inherited cwd. `WV_AGENT_ID` pins the MCP
+server's Weave claim identity so Copilot does not inherit ambiguous host markers from another agent
+session.
 
 Optional local additions if you want stricter scope isolation:
 
@@ -159,7 +184,8 @@ Optional local additions if you want stricter scope isolation:
   "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=graph"],
   "env": {
     "WV_PATH": "${workspaceFolder}/scripts/wv",
-    "WV_PROJECT_ROOT": "${workspaceFolder}"
+    "WV_PROJECT_ROOT": "${workspaceFolder}",
+    "WV_AGENT_ID": "copilot-${workspaceFolderBasename}"
   }
 },
 "weave-session": {
@@ -168,7 +194,8 @@ Optional local additions if you want stricter scope isolation:
   "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=session"],
   "env": {
     "WV_PATH": "${workspaceFolder}/scripts/wv",
-    "WV_PROJECT_ROOT": "${workspaceFolder}"
+    "WV_PROJECT_ROOT": "${workspaceFolder}",
+    "WV_AGENT_ID": "copilot-${workspaceFolderBasename}"
   }
 },
 "weave-lite": {
@@ -177,7 +204,8 @@ Optional local additions if you want stricter scope isolation:
   "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=lite"],
   "env": {
     "WV_PATH": "${workspaceFolder}/scripts/wv",
-    "WV_PROJECT_ROOT": "${workspaceFolder}"
+    "WV_PROJECT_ROOT": "${workspaceFolder}",
+    "WV_AGENT_ID": "copilot-${workspaceFolderBasename}"
   }
 }
 ```
@@ -192,7 +220,8 @@ Optional local additions if you want stricter scope isolation:
       "args": ["/path/to/memory-system/mcp/dist/index.js"],
       "env": {
         "WV_PATH": "/path/to/memory-system/scripts/wv",
-        "WV_PROJECT_ROOT": "/path/to/your/repo"
+        "WV_PROJECT_ROOT": "/path/to/your/repo",
+        "WV_AGENT_ID": "mcp-your-repo"
       }
     },
     "weave-inspect": {
@@ -200,7 +229,8 @@ Optional local additions if you want stricter scope isolation:
       "args": ["/path/to/memory-system/mcp/dist/index.js", "--scope=inspect"],
       "env": {
         "WV_PATH": "/path/to/memory-system/scripts/wv",
-        "WV_PROJECT_ROOT": "/path/to/your/repo"
+        "WV_PROJECT_ROOT": "/path/to/your/repo",
+        "WV_AGENT_ID": "mcp-your-repo"
       }
     }
   }
@@ -209,7 +239,7 @@ Optional local additions if you want stricter scope isolation:
 
 ## Available Tools
 
-### Graph scope — write operations (9 tools)
+### Graph scope — write operations (13 tools)
 
 | Tool               | Description                                                                                                                                                                                                 | Required params      |
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
@@ -239,7 +269,7 @@ Optional local additions if you want stricter scope isolation:
 | `weave_close_session` | Bounded local sync + repo-status check + unpushed commit/active-node warnings                                                                  | —               |
 | `weave_edit_guard`    | Pre-edit guard: require an active node before edits                                                                                            | —               |
 
-### Inspect scope — read-only queries (21 tools)
+### Inspect scope — read-only queries (22 tools)
 
 | Tool                      | Description                                                     | Required params |
 | ------------------------- | --------------------------------------------------------------- | --------------- |
@@ -271,7 +301,7 @@ Optional local additions if you want stricter scope isolation:
 # Build
 npm run build
 
-# Run tests (34 tests: tool calls, scope filtering, error handling)
+# Run tests (tool calls, scope filtering, error handling)
 npm test
 
 # Watch mode
@@ -282,10 +312,10 @@ npm run dev
 
 The test suite verifies:
 
-- **Default scope (`all`)** — all 35 tools listed, tool calls work, unknown tools rejected
-- **`--scope=graph`** — only 9 graph tools listed, out-of-scope calls rejected
-- **`--scope=session`** — only 10 session tools listed
-- **`--scope=inspect`** — only 15 inspect tools listed
+- **Default scope (`all`)** — all 45 tools listed, tool calls work, unknown tools rejected
+- **`--scope=graph`** — only 13 graph tools listed, out-of-scope calls rejected
+- **`--scope=session`** — only 12 session tools listed
+- **`--scope=inspect`** — only 22 inspect tools listed
 - **New tool handlers** — weave_show, weave_delete (with force guard), quality tools
 
 Codex sandbox note: `npm --prefix mcp run build` is a reliable in-sandbox compile check, but the
@@ -298,7 +328,8 @@ plus targeted code review as the fallback signal.
 1. Add the tool definition to the `TOOLS` array in `index.ts`
 2. Add a handler case in the `handleTool` switch
 3. Add the tool name to the appropriate scope in `SCOPE_TOOLS`
-4. Update the test tool count assertion
+4. Update `mcp/contract.json` scope counts and lifecycle metadata
+5. Update the README tool inventory if the human-readable list changed
 
 ## Environment Variables
 
@@ -306,9 +337,21 @@ plus targeted code review as the fallback signal.
 | ---------------------- | ----------------------------------------------------------------------------- | ------------------- |
 | `WV_PATH`              | Path to wv CLI binary                                                         | Auto-detected       |
 | `WV_PROJECT_ROOT`      | Repo root passed to MCP-spawned `wv` commands                                 | Current process cwd |
+| `WV_AGENT_ID`          | Explicit Weave claim/provenance identity for MCP-spawned `wv` commands        | Auto-detected       |
 | `WV_ACTIVE`            | Active node ID (inherited by tools)                                           | —                   |
 | `WV_MCP_CALL_LOG`      | JSONL sink for per-response MCP telemetry                                     | Disabled            |
 | `WV_MCP_ALLOW_NETWORK` | Allow MCP lifecycle tools to run GitHub/network sync directly (`1` = enabled) | Disabled            |
+| `WV_MCP_STARTUP_REPORT` | Emit structured startup JSON to stderr (`1` = enabled)                       | Disabled            |
+
+Startup/readiness checks:
+
+```bash
+node mcp/dist/index.js --scope=lite --health-check
+```
+
+The health check prints a `weave-mcp-startup.v1` JSON object with scope, tool count, `wv` path,
+project root, agent identity, telemetry settings, and process id, then exits without starting the
+stdio server.
 
 `--instrument` prints payload and call summaries to stderr for local debugging.
 `WV_MCP_CALL_LOG=/path/to/mcp_calls.jsonl` persists each MCP response as JSONL with `source=mcp`,
@@ -353,7 +396,7 @@ other two agents are expected to move onto their scoped servers as runtime-agent
      ┌────▼──────┐    ┌────▼──────┐    ┌─────▼─────┐
      │ --scope=  │    │ --scope=  │    │ --scope=  │
      │ inspect   │    │ graph     │    │ session   │
-     │(14 tools) │    │ (8 tools) │    │ (9 tools) │
+     │(22 tools) │    │(13 tools) │    │(12 tools) │
      └────┬──────┘    └────┬──────┘    └─────┬─────┘
           │                │                 │
           └────────────────┼─────────────────┘

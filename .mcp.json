@@ -5,7 +5,8 @@
       "args": ["${workspaceFolder}/mcp/dist/index.js"],
       "env": {
         "WV_PATH": "${workspaceFolder}/scripts/wv",
-        "WV_PROJECT_ROOT": "${workspaceFolder}"
+        "WV_PROJECT_ROOT": "${workspaceFolder}",
+        "WV_AGENT_ID": "copilot-${workspaceFolderBasename}"
       }
     },
     "weave-session": {
@@ -13,7 +14,8 @@
       "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=session"],
       "env": {
         "WV_PATH": "${workspaceFolder}/scripts/wv",
-        "WV_PROJECT_ROOT": "${workspaceFolder}"
+        "WV_PROJECT_ROOT": "${workspaceFolder}",
+        "WV_AGENT_ID": "copilot-${workspaceFolderBasename}"
       }
     },
     "weave-lite": {
@@ -21,7 +23,8 @@
       "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=lite"],
       "env": {
         "WV_PATH": "${workspaceFolder}/scripts/wv",
-        "WV_PROJECT_ROOT": "${workspaceFolder}"
+        "WV_PROJECT_ROOT": "${workspaceFolder}",
+        "WV_AGENT_ID": "copilot-${workspaceFolderBasename}"
       }
     },
     "weave-inspect": {
@@ -29,7 +32,8 @@
       "args": ["${workspaceFolder}/mcp/dist/index.js", "--scope=inspect"],
       "env": {
         "WV_PATH": "${workspaceFolder}/scripts/wv",
-        "WV_PROJECT_ROOT": "${workspaceFolder}"
+        "WV_PROJECT_ROOT": "${workspaceFolder}",
+        "WV_AGENT_ID": "copilot-${workspaceFolderBasename}"
       }
     }
   }
