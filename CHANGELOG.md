@@ -4,6 +4,31 @@
 
 ## Unreleased
 
+## [1.67.0] - 2026-07-09
+
+### Added
+
+- **Unknown-taxonomy discovery surfaces** - `wv discover` now reports known-known,
+  known-unknown, unknown-known, and candidate unknown-unknown evidence, and context/bootstrap
+  surfaces embed bounded blindspot signals for active work.
+- **Blindspot-pass workflow procedure** - the workflow templates now include a shared procedure for
+  using bootstrap plus discovery output to probe blindspots before promoting findings.
+
+### Changed
+
+- **Discovery report composition hardened** - done-node seeding, source bucket limits, and metadata
+  rendering now preserve partial evidence and traversal availability instead of collapsing producer
+  issues into empty reports.
+- **Crystallization/readiness docs refreshed** - the Rust signature patterns and crystallization
+  proposal now reflect the July 2026 release and graph state.
+
+### Fixed
+
+- **`wv discover unknown_knowns` parses combined learning metadata** - discovery now reuses the
+  context parser so dominant combined learning strings produce evidence correctly.
+- **`wv discover` cache classification** - the read-only `discover` command is classified as cache
+  exempt and covered by regression tests.
+
 ## [1.66.0] - 2026-07-06
 
 ### Added

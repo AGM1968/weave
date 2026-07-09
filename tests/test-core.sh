@@ -1369,7 +1369,7 @@ test_help_surfaces() {
     local expected_commands=(
         init add remember memory delete done ship ship-agent batch-done bulk-update work preflight recover bootstrap bootstrap-agent
         overview cache pending-close ready list show status update touch allowed-tools quick
-        block link unlink resolve related edges path tree plan enrich-topology context search
+        block link unlink resolve related edges path tree plan enrich-topology context discover search
         reindex learnings trails digest session-summary audit-pitfalls edge-types init-repo
         doctor selftest mcp-status health guide prune clean-ghosts compact refs import quality
         findings analyze batch sync load
@@ -1402,6 +1402,27 @@ test_help_surfaces() {
     local quality_scan_help
     quality_scan_help=$("$WV" help quality scan 2>&1)
     assert_contains "$quality_scan_help" "Usage: wv quality scan" "nested help delegates to quality scan help"
+}
+
+test_discover_cache_classification() {
+    echo ""
+    echo "Test: discover cache classification"
+    echo "==================================="
+
+    local classification
+    classification=$(bash -c "
+        source '$PROJECT_ROOT/scripts/lib/wv-cache.sh'
+        if _wv_run_cache_is_exempt_cmd discover; then
+            printf exempt
+        elif _wv_run_cache_is_read_cmd discover; then
+            printf read
+        elif _wv_run_cache_is_write_cmd discover; then
+            printf write
+        else
+            printf unclassified
+        fi
+    ")
+    assert_equals "exempt" "$classification" "discover is classified as an exempt read"
 }
 
 # ============================================================================
@@ -2752,6 +2773,7 @@ main() {
     test_done_contradiction
     test_update_metadata_merge
     test_help_surfaces
+    test_discover_cache_classification
 
     echo ""
     echo "========================================"

@@ -5729,6 +5729,13 @@ to reach for BEFORE editing, not after.
                         query  = predicate-exact ("status=done type=finding stale>=7")
                         Use search to locate; use query to pin and filter.
 
+  wv discover <id>      Unknown-taxonomy report for one node.
+                          --json        emits known_knowns, known_unknowns,
+                                        unknown_knowns, unknown_unknown_candidates
+                          --depth=N     impact depth for candidate surfacing
+                          --limit=N     cap each bucket
+                          Candidates are hypotheses until a probe produces evidence.
+
   wv impact <id>        Blast-radius walk over typed edges (blocks|implements|addresses).
                           --full        adds resolves|references|supersedes|obsoletes
                           --direction=fwd|rev|both
@@ -5760,12 +5767,14 @@ Typical audit sequence:
   1. wv search "<topic>"          locate by subject
   2. wv query 'id IN (...)'       pin the set, filter by status/type
   3. wv show <id>                 read full detail
-  4. wv impact <id> --direction=rev   check what depends on it
-  5. wv edges <id>                confirm typed relationships
+  4. wv discover <id> --json      classify facts, gaps, learnings, candidates
+  5. wv impact <id> --direction=rev   check what depends on it
+  6. wv edges <id>                confirm typed relationships
 
 Related topics:
   wv guide --topic=routing      phase loop, tool classes, token-saving pattern
   wv guide --topic=context      context pack, scope rules
+  wv guide --procedure=blindspot-pass
 EOF
             ;;
         *)
@@ -5942,6 +5951,9 @@ cmd_help_topic() {
         impact)
             print_command_help "wv impact <id>... [--files=path1,path2] [--direction=fwd|rev|both] [--depth=N] [--json] [--full] [--include-done] [--all] [--quality]" "Walk the dependency graph from one or more seed nodes. Reports impacted nodes by depth, risk_score/risk_factors, nodes unblocked when seeds complete, and affected test suites. --files=path1,path2 derives seeds from node_files attribution or touched_files metadata (unknown paths emit empty result). --include-done also allows done file owners to become seeds and includes done impacted nodes. --direction=both (default) follows blocks|implements|addresses edges in both directions; fwd=outward only; rev=inward only. --depth=N (default 3). --all removes the 50-node cap. --full adds resolves|references|supersedes|obsoletes to the traversed edge types. --json returns structured output."
             ;;
+        discover)
+            print_command_help "wv discover <id> --json [--depth=N] [--limit=N]" "Compose query and impact signals into unknown-taxonomy buckets: known_knowns, known_unknowns, unknown_knowns, and unknown_unknown_candidates."
+            ;;
         search)
             cat <<'SEARCHHELP'
 Usage: wv search <query> [--limit=N] [--json] [--status=STATUS] [--type=TYPE] [--learning]
@@ -6092,6 +6104,7 @@ Commands:
   edges <id>        Inspect all edges for a node ([--type=] [--json])
   path <id>         Show ancestry chain
   impact <id>...    Blast-radius: impacted nodes, risk, unblocked work, test suites [--files=] [--json]
+  discover <id>     Blindspot report: query + impact buckets [--json]
   tree              Show epic -> task hierarchy [--active] [--depth=N] [--json] [--mermaid] [root]
   plan <file>       Import markdown section as epic + tasks [--sprint=N] [--gh] [--dry-run] [--template]
   enrich-topology   Apply epic/task topology from JSON spec [--dry-run] [--sync-gh]

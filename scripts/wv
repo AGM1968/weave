@@ -177,6 +177,7 @@ _wv_dispatch() {
         tree)    cmd_tree "$@" ;;
         context) _resolve_first_id cmd_context "$@" ;;
         impact)  cmd_impact "$@" ;;
+        discover) _resolve_first_id cmd_discover "$@" ;;
 
         # Data commands
         batch)       cmd_batch "$@" ;;

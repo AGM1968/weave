@@ -775,6 +775,85 @@ EOF
 }
 
 # ============================================================================
+# Test: discover
+# ============================================================================
+test_discover() {
+    echo ""
+    echo "Test: wv discover"
+    echo "================="
+
+    setup_test_env
+
+    local seed blocker extra_blocker finding learning learning_combined impacted jout limited string_meta done_out ctx boot
+    seed=$("$WV" add "Discovery seed" \
+        --metadata='{"done_criteria":["report buckets exist"],"risks":["report shape may drift"],"risk_level":"medium"}' \
+        --force 2>&1 | node_id_from_output)
+    blocker=$("$WV" add "Discovery blocker" --force 2>&1 | node_id_from_output)
+    finding=$("$WV" add "Discovery related finding" \
+        --metadata='{"type":"finding","finding":{"violation_type":"test:gap","root_cause":"missing report coverage","proposed_fix":"add discover regression","confidence":"medium","fixable":true}}' \
+        --force 2>&1 | node_id_from_output)
+    learning=$("$WV" add "Discovery prior learning" \
+        --metadata='{"decision":"compose query and impact rather than overloading bootstrap"}' \
+        --force 2>&1 | node_id_from_output)
+    # Canonical combined-learning form: wv done --learning="decision: ... | pattern: ... | pitfall: ..."
+    # stores a single learning string with no separate decision/pattern/pitfall keys.
+    learning_combined=$("$WV" add "Discovery combined learning" \
+        --metadata='{"learning":"decision: keep candidates non-blocking | pattern: probe before promoting to finding | pitfall: unevidenced candidates become graph debt"}' \
+        --force 2>&1 | node_id_from_output)
+    impacted=$("$WV" add "Discovery impacted child" --force 2>&1 | node_id_from_output)
+
+    "$WV" block "$seed" --by="$blocker" >/dev/null 2>&1
+    # More blockers than the context embedding limit used to starve risks and
+    # findings because known_unknowns concatenated sources before slicing.
+    for _ in 1 2 3 4 5; do
+        extra_blocker=$("$WV" add "Discovery extra blocker $_" --force 2>&1 | node_id_from_output)
+        "$WV" block "$seed" --by="$extra_blocker" >/dev/null 2>&1
+    done
+    "$WV" link "$finding" "$seed" --type=relates_to >/dev/null 2>&1
+    "$WV" update "$learning" --status=done >/dev/null 2>&1
+    "$WV" link "$learning" "$seed" --type=relates_to >/dev/null 2>&1
+    "$WV" update "$learning_combined" --status=done >/dev/null 2>&1
+    "$WV" link "$learning_combined" "$seed" --type=relates_to >/dev/null 2>&1
+    "$WV" link "$impacted" "$seed" --type=implements >/dev/null 2>&1
+
+    jout=$("$WV" discover "$seed" --json --depth=2 2>&1)
+
+    assert_jq_true "$jout" '.schema == "weave.discovery.v1"' "discover JSON: schema present"
+    assert_jq_true "$jout" '.known_knowns | any(.category == "known_known" and .source == "done_criteria")' "discover JSON: criteria become known_knowns"
+    assert_jq_true "$jout" '.known_unknowns | any(.source == "blocks_edge" and .evidence.node_id == "'"$blocker"'")' "discover JSON: blockers become known_unknowns"
+    assert_jq_true "$jout" '.known_unknowns | any(.source == "risk_metadata")' "discover JSON: risks become known_unknowns"
+    assert_jq_true "$jout" '.known_unknowns | any(.source == "query" and .evidence.node_id == "'"$finding"'")' "discover JSON: related findings come from query"
+    assert_jq_true "$jout" '.unknown_knowns | any(.source == "query" and .evidence.node_id == "'"$learning"'")' "discover JSON: related learnings become unknown_knowns"
+    assert_jq_true "$jout" '.unknown_knowns | any(.evidence.node_id == "'"$learning"'" and .evidence.decision != null)' "discover JSON: separate-key learning populates decision"
+    assert_jq_true "$jout" '.unknown_knowns | any(.evidence.node_id == "'"$learning_combined"'" and .evidence.decision == "keep candidates non-blocking" and .evidence.pattern == "probe before promoting to finding" and .evidence.pitfall == "unevidenced candidates become graph debt")' "discover JSON: combined-learning string parses into decision/pattern/pitfall"
+    assert_jq_true "$jout" '.unknown_unknown_candidates | any(.source == "impact" and .evidence.node_id == "'"$impacted"'")' "discover JSON: impact nodes become candidates"
+    assert_jq_true "$jout" '.sources.query.blockers == 6 and .sources.impact.impacted >= 1' "discover JSON: source counts summarize query and impact"
+
+    limited=$("$WV" discover "$seed" --json --depth=2 --limit=5 2>&1)
+    assert_jq_true "$limited" '.known_unknowns | length == 5 and any(.source == "blocks_edge") and any(.source == "risk_metadata") and any(.source == "query")' "discover JSON: bucket limit interleaves blockers, risks, and findings"
+
+    # Simulate a query adapter returning metadata as JSON text instead of an
+    # already-decoded object. Discovery should match context's defensive shape
+    # handling rather than silently dropping criteria and risks.
+    sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_quote('{\"done_criteria\":[\"string metadata criterion\"],\"risks\":[\"string metadata risk\"]}') WHERE id='$seed';"
+    string_meta=$("$WV" discover "$seed" --json --depth=2 --limit=5 2>&1)
+    assert_jq_true "$string_meta" '.known_knowns | any(.source == "done_criteria" and .meaning == "Done criterion: string metadata criterion")' "discover JSON: JSON-string metadata preserves criteria"
+    assert_jq_true "$string_meta" '.known_unknowns | any(.source == "risk_metadata" and .meaning == "Recorded risk: string metadata risk")' "discover JSON: JSON-string metadata preserves risks"
+
+    ctx=$("$WV" context "$seed" --json --mode=discover 2>&1)
+    assert_jq_true "$ctx" '.discovery.schema == "weave.discovery.v1" and (.discovery.unknown_unknown_candidates | length >= 1)' "context discover-mode: embeds bounded discovery report"
+
+    "$WV" update "$seed" --status=active >/dev/null 2>&1
+    boot=$("$WV" bootstrap --json 2>/dev/null)
+    assert_jq_true "$boot" '.context.discovery.schema == "weave.discovery.v1" and (.context.discovery.unknown_unknown_candidates | length >= 1)' "bootstrap JSON: active context includes bounded discovery report"
+
+    "$WV" update "$seed" --status=done >/dev/null 2>&1
+    done_out=$("$WV" discover "$seed" --json --depth=2 --limit=5 2>&1)
+    assert_jq_true "$done_out" '.seed.status == "done" and .sources.impact.direction == "rev" and .sources.impact.available == true' "discover JSON: done seeds use explicit reverse impact"
+    assert_jq_true "$done_out" '.sources.impact.impacted > 0 and (.unknown_unknown_candidates | length > 0)' "discover JSON: done seed reverse impact remains useful"
+}
+
+# ============================================================================
 # Test: unified blocking signal (wv_blocking_reason) — cmd_context surfaces
 # status / deferral / edge blocking, and agrees with cmd_ready. Closes the
 # metadata-vs-edge dual representation (wv-f752a5).
@@ -853,6 +932,7 @@ main() {
     test_path
     test_impact
     test_impact_suites_matching
+    test_discover
     test_unified_blocking
 
     echo ""

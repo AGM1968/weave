@@ -169,9 +169,19 @@ echo ""
 echo "--- repair workflow guidance ---"
 assert_contains "$WORKFLOW_DOC" '## Repair Workflow' "workflow doc: includes repair workflow section"
 assert_contains "$WORKFLOW_DOC" 'needs_human_verification' "workflow doc: repair workflow covers resumable human verification"
+assert_contains "$WORKFLOW_DOC" '`blindspot-pass`' "workflow doc: procedure index includes blindspot-pass"
+assert_contains "$WORKFLOW_DOC" '`wv discover <id> --json`' "workflow doc: command table includes wv discover"
 assert_contains "$WEAVE_SKILL" '### Repair Loop for Detected Issues' "weave skill: includes repair loop guidance"
 assert_contains "$WEAVE_GUIDE" '## Repair Workflow for Detected Issues' "weave-guide: includes repair workflow guidance"
 assert_contains "$WEAVE_GUIDE" 'wv trails save --msg="Detected workflow issue, created repair node, next step is ..."' "weave-guide: repair workflow preserves trails"
+
+DISCOVERY_GUIDE=$("$PROJECT_ROOT/scripts/wv" guide --topic=discovery)
+BLINDSPOT_PROCEDURE=$(cat "$PROJECT_ROOT/templates/procedures/blindspot-pass.md")
+assert_contains "$DISCOVERY_GUIDE" 'wv discover <id>' "discovery guide: documents wv discover"
+assert_contains "$DISCOVERY_GUIDE" 'wv guide --procedure=blindspot-pass' "discovery guide: points to blindspot-pass procedure"
+assert_contains "$BLINDSPOT_PROCEDURE" '## Release Example' "blindspot procedure: includes release example"
+assert_contains "$BLINDSPOT_PROCEDURE" '## MCP Example' "blindspot procedure: includes MCP example"
+assert_contains "$BLINDSPOT_PROCEDURE" 'Do not create a blocking finding from a candidate' "blindspot procedure: keeps candidates non-blocking"
 
 echo ""
 echo "=== Results ==="

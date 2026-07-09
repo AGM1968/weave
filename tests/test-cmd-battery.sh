@@ -168,6 +168,7 @@ battery R edges      edges "$N_PIPE"
 battery R path       path "$N_PIPE"
 battery R tree       tree
 battery J context    context "$N_APOS" --json
+battery J discover   discover "$N_APOS" --json
 battery R impact     impact --help
 battery H batch
 battery H plan

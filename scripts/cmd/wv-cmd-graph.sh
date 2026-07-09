@@ -1,7 +1,7 @@
 #!/bin/bash
 # wv-cmd-graph.sh — Graph traversal and edge commands
 #
-# Commands: block, link, unlink, resolve, related, edges, path, context
+# Commands: block, link, unlink, resolve, related, edges, path, context, impact, discover
 # Sourced by: wv entry point (after lib modules)
 # Dependencies: wv-config.sh, wv-db.sh, wv-validate.sh, wv-cache.sh
 
@@ -860,7 +860,7 @@ cmd_context() {
     # Cache setup (per session in tmpfs) — keyed by id+mode so different modes don't collide
     local cache_dir="$WV_HOT_ZONE/context_cache"
     mkdir -p "$cache_dir"
-    local cache_file="$cache_dir/${id}-${mode}.json"
+    local cache_file="$cache_dir/${id}-${mode}-v3.json"
 
     # Check cache validity (invalidate on edge changes or node updates)
     if [ -f "$cache_file" ]; then
@@ -1041,6 +1041,14 @@ cmd_context() {
         quality_json=$(_context_gather_quality "$id")
     fi
 
+    # Bounded blindspot report for planning surfaces. Candidates remain
+    # hypotheses: cmd_discover marks impact-derived rows as candidate state.
+    local discovery_json='null'
+    if [ "$mode" = "discover" ] || [ "$mode" = "execute" ] || [ "$mode" = "full" ]; then
+        discovery_json=$(cmd_discover "$id" --json --depth=2 --limit=5 2>/dev/null || echo 'null')
+        [ -z "$discovery_json" ] && discovery_json='null'
+    fi
+
     # Compose Context Pack with field cleanup and limits (per proposal lines 222-237)
     # discover: cap ancestors at 5
     local _discover_mode="false"
@@ -1055,6 +1063,7 @@ cmd_context() {
         --argjson pitfalls "$pitfalls_json" \
         --argjson contradictions "$contradictions_json" \
         --argjson quality "$quality_json" \
+        --argjson discovery "$discovery_json" \
         --argjson discover_mode "$_discover_mode" \
         --argjson self_block "$self_block_json" \
         '($self_block[0].blocked_reason // null) as $br |
@@ -1117,6 +1126,7 @@ cmd_context() {
                 pitfall: ((.metadata | if type == "string" then fromjson else . end).pitfall)
             })),
             contradictions: ($contradictions | map({id, text, status})),
+            discovery: $discovery,
             code_quality: $quality.code_quality,
             quality_as_of: $quality.quality_as_of
         }' | tee "$cache_file.tmp" && mv "$cache_file.tmp" "$cache_file" || rm -f "$cache_file.tmp"
@@ -1896,6 +1906,303 @@ cmd_impact() {
         echo ""
         echo -e "${CYAN}${summary}${NC}"
     fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_discover — compose query + impact signals into blindspot buckets
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_discover() {
+    local id="${1:-}"
+    shift || true
+    local output_format="json"
+    local depth=2
+    local limit=10
+
+    if [ "$id" = "--help" ] || [ "$id" = "-h" ]; then
+        echo "Usage: wv discover <id> --json [--depth=N] [--limit=N]"
+        echo ""
+        echo "Compose graph memory and impact output into the unknown-taxonomy"
+        echo "report buckets: known_knowns, known_unknowns, unknown_knowns,"
+        echo "and unknown_unknown_candidates."
+        return 0
+    fi
+    if [ -z "$id" ]; then
+        echo -e "${RED}Error: node ID required${NC}" >&2
+        echo "Usage: wv discover <id> --json [--depth=N] [--limit=N]" >&2
+        return 1
+    fi
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json)      output_format="json" ;;
+            --depth=*)   depth="${1#*=}" ;;
+            --limit=*)   limit="${1#*=}" ;;
+            --help|-h)
+                echo "Usage: wv discover <id> --json [--depth=N] [--limit=N]"
+                echo ""
+                echo "Compose graph memory and impact output into the unknown-taxonomy"
+                echo "report buckets: known_knowns, known_unknowns, unknown_knowns,"
+                echo "and unknown_unknown_candidates."
+                return 0
+                ;;
+            -*)
+                echo -e "${RED}Error: unknown flag '$1'${NC}" >&2
+                return 1 ;;
+            *)
+                echo -e "${RED}Error: unexpected argument '$1'${NC}" >&2
+                return 1 ;;
+        esac
+        shift
+    done
+
+    if [ "$output_format" != "json" ]; then
+        echo "Error: wv discover only supports --json output" >&2
+        return 1
+    fi
+    if ! [[ "$depth" =~ ^[1-9][0-9]*$ ]]; then
+        echo -e "${RED}Error: --depth must be a positive integer, got '$depth'${NC}" >&2
+        return 1
+    fi
+    if ! [[ "$limit" =~ ^[1-9][0-9]*$ ]]; then
+        echo -e "${RED}Error: --limit must be a positive integer, got '$limit'${NC}" >&2
+        return 1
+    fi
+
+    db_ensure
+
+    local sid
+    sid=$(resolve_id "$id") || return 1
+
+    local seed_json
+    seed_json=$(db_query_json_v2 "SELECT id, text, status, metadata FROM nodes WHERE id='$(sql_escape "$sid")';")
+    seed_json=$(printf '%s' "${seed_json:-[]}" | jq -c '.[0] // null')
+    if [ "$seed_json" = "null" ]; then
+        echo -e "${RED}Error: node $sid not found${NC}" >&2
+        return 1
+    fi
+
+    local blockers_json findings_json learnings_json impact_json impact_direction impact_error
+    blockers_json=$(db_query_json_v2 "
+        SELECT b.id, b.text, b.status, b.metadata
+        FROM edges e
+        JOIN nodes b ON b.id = e.source
+        WHERE e.target='$(sql_escape "$sid")'
+          AND e.type='blocks'
+          AND b.status != 'done'
+        ORDER BY b.updated_at DESC
+        LIMIT $limit;
+    ")
+    blockers_json="${blockers_json:-[]}"
+
+    findings_json=$(db_query_json_v2 "
+        SELECT DISTINCT f.id, f.text, f.status, f.metadata
+        FROM nodes f
+        JOIN edges e ON (e.source=f.id AND e.target='$(sql_escape "$sid")')
+                    OR (e.target=f.id AND e.source='$(sql_escape "$sid")')
+        WHERE f.status != 'done'
+          AND (f.type='finding' OR json_extract(f.metadata, '\$.type')='finding')
+        ORDER BY f.updated_at DESC
+        LIMIT $limit;
+    ")
+    findings_json="${findings_json:-[]}"
+
+    learnings_json=$(db_query_json_v2 "
+        SELECT DISTINCT l.id, l.text, l.status, l.metadata
+        FROM nodes l
+        JOIN edges e ON (e.source=l.id AND e.target='$(sql_escape "$sid")')
+                    OR (e.target=l.id AND e.source='$(sql_escape "$sid")')
+        WHERE l.status='done'
+          AND (json_extract(l.metadata, '\$.learning') IS NOT NULL
+               OR json_extract(l.metadata, '\$.decision') IS NOT NULL
+               OR json_extract(l.metadata, '\$.pattern') IS NOT NULL
+               OR json_extract(l.metadata, '\$.pitfall') IS NOT NULL)
+        ORDER BY l.updated_at DESC
+        LIMIT $limit;
+    ")
+    learnings_json="${learnings_json:-[]}"
+
+    impact_direction="both"
+    if [ "$(printf '%s' "$seed_json" | jq -r '.status')" = "done" ]; then
+        # Forward impact for completed work has already been discharged. A reverse
+        # walk still gives discovery a useful retrospective view of dependencies
+        # instead of silently degrading to an empty "impact unavailable" result.
+        impact_direction="rev"
+    fi
+    if ! impact_json=$(cmd_impact "$sid" --json "--depth=$depth" "--direction=$impact_direction" 2>&1); then
+        impact_error="$impact_json"
+        impact_json=$(jq -n -c --arg error "$impact_error" \
+            '{impacted:[], unblocked:[], affected_suites:[], summary:"impact unavailable", available:false, error:$error}')
+    fi
+
+    jq -n -c \
+        --arg schema "weave.discovery.v1" \
+        --arg generated_by "wv discover" \
+        --arg impact_direction "$impact_direction" \
+        --argjson seed "$seed_json" \
+        --argjson blockers "$blockers_json" \
+        --argjson findings "$findings_json" \
+        --argjson learnings "$learnings_json" \
+        --argjson impact "$impact_json" \
+        --argjson limit "$limit" '
+        def item($category; $state; $source; $meaning; $probe; $evidence):
+          {
+            category: $category,
+            state: $state,
+            source: $source,
+            meaning: $meaning,
+            probe: $probe
+          }
+          + (if $evidence == null then {} else {evidence: $evidence} end);
+
+        def node_ref($n):
+          {node_id: $n.id, text: $n.text, status: $n.status};
+
+        # db_query_json_v2 currently decodes JSON columns, but normalize here so
+        # discovery remains correct if a query adapter returns metadata as text.
+        def node_metadata($n):
+          ($n.metadata
+           | if type == "object" then .
+             elif type == "string" then (fromjson? // {})
+             else {}
+             end);
+
+        # Preserve source diversity under a single bucket limit. With blockers,
+        # risks, and findings present, round-robin selection prevents a long first
+        # source from starving every later source.
+        def interleave($arrays):
+          [range(0; (($arrays | map(length) | max) // 0)) as $i
+           | $arrays[]
+           | .[$i] // empty];
+
+        # learning_fields — surface explicit decision/pattern/pitfall keys, else
+        # parse the canonical combined "decision: ... | pattern: ... | pitfall: ..."
+        # learning string (wv done --learning=...). Falls back to raw text so the
+        # tacit knowledge is never dropped from evidence.
+        def learning_fields($meta):
+          ($meta.learning // null) as $ls |
+          (if ($ls | type) == "string" and ($ls | length) > 0 then
+            ($ls | split(" | ") | reduce .[] as $part (
+              {};
+              if ($part | startswith("decision: ")) then .decision = ($part | ltrimstr("decision: "))
+              elif ($part | startswith("pattern: ")) then .pattern = ($part | ltrimstr("pattern: "))
+              elif ($part | startswith("pitfall: ")) then .pitfall = ($part | ltrimstr("pitfall: "))
+              else .raw = ((.raw // "") + $part)
+              end
+            ))
+          else {} end) as $parsed |
+          {
+            decision: ($meta.decision // $parsed.decision // null),
+            pattern:  ($meta.pattern  // $parsed.pattern  // null),
+            pitfall:  ($meta.pitfall  // $parsed.pitfall  // null)
+          } as $fields |
+          $fields
+          + (if ($fields.decision == null and $fields.pattern == null and $fields.pitfall == null)
+             then {raw: ($parsed.raw // $ls)} else {} end);
+
+        (node_metadata($seed).done_criteria // []) as $criteria |
+        (node_metadata($seed).risks // []) as $risks |
+        {
+          schema: $schema,
+          generated_by: $generated_by,
+          seed: node_ref($seed),
+          known_knowns: (
+            [item(
+              "known_known";
+              "observed";
+              "active_node";
+              ("Seed node: " + $seed.text);
+              "Read the active node text, status, metadata, and context pack before implementation.";
+              node_ref($seed)
+            )]
+            + ($criteria | map(. as $criterion | item(
+                "known_known";
+                "observed";
+                "done_criteria";
+                ("Done criterion: " + ($criterion | tostring));
+                "Verify closure evidence against this criterion.";
+                null
+              )))
+          )[0:$limit],
+          known_unknowns: (
+            interleave([
+              ($blockers | map(. as $blocker | item(
+                "known_unknown";
+                "candidate";
+                "blocks_edge";
+                ("Open blocker: " + $blocker.text);
+                "Resolve or explicitly defer the blocking node before closing the seed.";
+                node_ref($blocker)
+              ))),
+              ($risks | map(. as $risk | item(
+                  "known_unknown";
+                  "candidate";
+                  "risk_metadata";
+                  ("Recorded risk: " + ($risk | tostring));
+                  "Bound or mitigate this risk during implementation.";
+                  null
+                ))),
+              ($findings | map(. as $finding | item(
+                  "known_unknown";
+                  "promoted_to_finding";
+                  "query";
+                  ("Related open finding: " + $finding.text);
+                  "Inspect the finding metadata and either address, resolve, or defer it.";
+                  node_ref($finding)
+                )))
+            ])
+          )[0:$limit],
+          unknown_knowns: (
+            $learnings | map(. as $learning | item(
+              "unknown_known";
+              "observed";
+              "query";
+              ("Related learning: " + $learning.text);
+              "Apply this prior decision, pattern, or pitfall if it fits the current work.";
+              ({node_id: $learning.id} + learning_fields(node_metadata($learning)))
+            ))
+          )[0:$limit],
+          unknown_unknown_candidates: (
+            (($impact.impacted // []) | map(select(.node_id != $seed.id)) | map(. as $candidate | item(
+              "unknown_unknown_candidate";
+              "candidate";
+              "impact";
+              ("Impact candidate: " + ($candidate.label // $candidate.node_id) + " at depth " + ($candidate.min_depth | tostring) + " with risk " + ($candidate.risk_score | tostring));
+              "Review why the impact walk reached this node; probe touched files, blockers, criteria, and affected suites before treating it as a finding.";
+              {
+                node_id: $candidate.node_id,
+                status: $candidate.status,
+                risk_score: $candidate.risk_score,
+                risk_factors: $candidate.risk_factors,
+                missing_criteria: $candidate.missing_criteria
+              }
+            )))
+            + (($impact.affected_suites // []) | map(. as $suite | item(
+                "unknown_unknown_candidate";
+                "candidate";
+                "impact";
+                ("Affected suite candidate: " + $suite.name);
+                "Run or consciously defer this suite if implementation touches the mapped surface.";
+                $suite
+              )))
+          )[0:$limit],
+          sources: {
+            query: {
+              blockers: ($blockers | length),
+              related_findings: ($findings | length),
+              related_learnings: ($learnings | length)
+            },
+            impact: {
+              direction: $impact_direction,
+              available: ($impact.available // true),
+              error: ($impact.error // null),
+              summary: ($impact.summary // null),
+              impacted: (($impact.impacted // []) | length),
+              affected_suites: (($impact.affected_suites // []) | length)
+            }
+          }
+        }
+    '
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
