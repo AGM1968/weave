@@ -4,6 +4,16 @@
 
 ## Unreleased
 
+## [1.68.1] - 2026-07-11
+
+### Fixed
+
+- **`wv quality patterns` hot-zone routing** - `patterns scan/list/promote` now forwards the active
+  `WV_HOT_ZONE` to the Python quality module like the sibling quality subcommands, avoiding false
+  `No scan in DB` errors in sandboxed/runtime-specific hot zones.
+- **`wv quality patterns scan` repeated-run duplication** - rerunning a pattern scan against the same
+  quality scan now replaces that scan's pattern findings instead of appending duplicate rows.
+
 ## [1.68.0] - 2026-07-11
 
 ### Added

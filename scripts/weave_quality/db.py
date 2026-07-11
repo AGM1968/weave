@@ -860,7 +860,13 @@ def staleness_info(conn: sqlite3.Connection, current_head: str) -> dict[str, Any
 def bulk_insert_pattern_findings(
     conn: sqlite3.Connection, findings: list[PatternFinding]
 ) -> None:
-    """Insert a batch of PatternFinding rows."""
+    """Replace PatternFinding rows for the supplied scan IDs."""
+    scan_ids = sorted({f.scan_id for f in findings})
+    if scan_ids:
+        conn.executemany(
+            "DELETE FROM pattern_findings WHERE scan_id = ?",
+            [(scan_id,) for scan_id in scan_ids],
+        )
     conn.executemany(
         "INSERT INTO pattern_findings (scan_id, path, rule_id, line, col, match_text, severity) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",

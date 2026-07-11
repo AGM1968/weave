@@ -404,7 +404,9 @@ EOF
         shift
     done
 
-    local py_args=("patterns" "$subcmd")
+    local py_args=()
+    [ -n "$WV_HOT_ZONE" ] && py_args+=("--hot-zone" "$WV_HOT_ZONE")
+    py_args+=("patterns" "$subcmd")
     [ -n "$path_arg" ] && py_args+=("$path_arg")
     [ -n "$json_flag" ] && py_args+=("$json_flag")
 

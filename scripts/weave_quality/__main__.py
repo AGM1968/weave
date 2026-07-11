@@ -1566,6 +1566,7 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
         except ValueError:
             pass
 
+    conn.execute("DELETE FROM pattern_findings WHERE scan_id = ?", (scan.id,))
     bulk_insert_pattern_findings(conn, all_findings)
     conn.close()
 

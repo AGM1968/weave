@@ -2,7 +2,7 @@
 
 Covers: hotspots, diff, promote, health-info, context-files, functions.
 """
-# pylint: disable=missing-class-docstring,missing-function-docstring,redefined-outer-name,unused-argument,too-many-lines
+# pylint: disable=missing-class-docstring,missing-function-docstring,redefined-outer-name,unused-argument,too-many-lines,too-few-public-methods
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from weave_quality.__main__ import (
     cmd_functions,
     cmd_health_info,
     cmd_hotspots,
+    cmd_patterns_scan,
     cmd_promote,
     cmd_reset,
     cmd_scan,
@@ -45,6 +46,7 @@ from weave_quality.db import (
     get_file_entries,
     init_db,
     latest_scan,
+    query_pattern_findings,
 )
 from weave_quality.hotspots import compute_hotspots
 from weave_quality.models import FileEntry, FunctionCC, GitStats
@@ -127,6 +129,55 @@ def _populate_scan(
     compute_hotspots(entries, stats)
     bulk_upsert_git_stats(conn, stats)
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Tests: cmd_patterns_scan
+# ---------------------------------------------------------------------------
+
+
+class TestCmdPatternsScan:
+    def test_repeated_scan_replaces_same_scan_findings(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        conn = init_db(hot_zone=str(tmp_path))
+        scan_id = begin_scan(conn, "abc")
+        conn.commit()
+        conn.close()
+
+        doc = tmp_path / "doc.md"
+        doc.write_text("A genuine result.\n", encoding="utf-8")
+        rule = tmp_path / "prose-rule.yaml"
+        rule.write_text(
+            "\n".join(
+                [
+                    "id: prose-test",
+                    "language: prose",
+                    "kind: lexicon",
+                    "terms:",
+                    "  - genuine",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(hot_zone=str(tmp_path), path=str(doc), json=True)
+
+        with patch(
+            "weave_quality.__main__._load_pattern_rules",
+            return_value=[("prose-test", rule)],
+        ):
+            assert cmd_patterns_scan(args) == 0
+            assert cmd_patterns_scan(args) == 0
+
+        capsys.readouterr()
+        conn = init_db(hot_zone=str(tmp_path))
+        rows = query_pattern_findings(conn, scan_id)
+        conn.close()
+        assert len(rows) == 1
+        assert rows[0]["rule_id"] == "prose-test"
 
 
 # ---------------------------------------------------------------------------

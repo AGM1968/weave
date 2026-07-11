@@ -962,6 +962,26 @@ class TestSchemaV6:
         paths = {r["path"] for r in rows}
         assert "a.py" in paths and "b.py" in paths
 
+    def test_bulk_insert_replaces_existing_scan_findings(self, db: sqlite3.Connection) -> None:
+        sid = begin_scan(db, "abc")
+        bulk_insert_pattern_findings(
+            db,
+            [
+                PatternFinding(path="a.py", scan_id=sid, rule_id="rule-A", line=1),
+                PatternFinding(path="b.py", scan_id=sid, rule_id="rule-A", line=2),
+            ],
+        )
+
+        bulk_insert_pattern_findings(
+            db,
+            [PatternFinding(path="c.py", scan_id=sid, rule_id="rule-B", line=3)],
+        )
+
+        rows = query_pattern_findings(db, sid)
+        assert [(r["path"], r["rule_id"], r["line"]) for r in rows] == [
+            ("c.py", "rule-B", 3)
+        ]
+
     def test_query_filter_by_rule(self, db: sqlite3.Connection) -> None:
         sid = begin_scan(db, "abc")
         findings = [
