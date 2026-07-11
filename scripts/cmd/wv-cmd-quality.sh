@@ -47,7 +47,7 @@ Subcommands:
   diff           Delta report vs previous scan
   promote        Create Weave nodes from findings (--parent=<id> required)
   structural-search  Find code by structural pattern (requires ast-grep)
-  patterns           Structural pattern rules: scan/list/promote
+  patterns           Structural + prose pattern rules: scan/list/promote
 
 Options:
   --json         JSON output (scan, hotspots, diff, functions)
@@ -352,7 +352,7 @@ cmd_quality_patterns() {
 Usage: wv quality patterns <subcommand> [options]
 
 Subcommands:
-  scan [path]    Run all active pattern rules and store findings
+  scan [path]    Run all active code/prose pattern rules and store findings
   list [path]    List active rules with last-scan hit counts
   promote        Promote findings as Weave nodes (--parent=<id> required)
 
@@ -364,6 +364,9 @@ Options:
 Pattern rules are loaded from:
   1. Built-in rules: scripts/weave_quality/default_patterns/*.yaml
   2. Custom rules:   .weave/patterns/*.yaml
+
+Code rules require ast-grep. Prose rules are stdlib-only and still run when
+ast-grep is absent.
 
 To disable a rule, add to .weave/quality.conf:
   [patterns]

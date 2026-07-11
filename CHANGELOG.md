@@ -4,6 +4,19 @@
 
 ## Unreleased
 
+## [1.68.0] - 2026-07-11
+
+### Added
+
+- **Prose pattern rules for `wv quality patterns`** - Markdown register checks now run through a
+  stdlib backend for lexicon, motif, and regex rules, with default rules for emphasis hedges,
+  number-free verification language, and casual register.
+
+### Changed
+
+- **Pattern scanning degrades when ast-grep is absent** - code rules are skipped with an install
+  hint while prose rules still run.
+
 ## [1.67.0] - 2026-07-09
 
 ### Added

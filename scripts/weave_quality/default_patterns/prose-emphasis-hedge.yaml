@@ -1,0 +1,25 @@
+id: prose-emphasis-hedge
+language: prose
+kind: lexicon
+severity: info
+provenance: wv-9c9fc1@nowcastr
+message: >-
+  Emphasis-as-reassurance. State the quantity and its verification procedure
+  and let the numbers carry conviction; replace the hedge with the specific
+  claim it gestures at, or delete it. Keep technical compounds (real-time).
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+terms:
+  - real
+  - genuine
+  - genuinely
+  - actually
+  - clearly
+  - obviously
+  - truly
+  - battle-tested
+exempt:
+  - real-time
+  - near-real-time

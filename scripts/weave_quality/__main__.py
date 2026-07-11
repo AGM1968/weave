@@ -84,6 +84,7 @@ from weave_quality.hotspots import (
 )
 from weave_quality.findings import cmd_findings_promote
 from weave_quality.models import CKMetrics, FileEntry, FunctionCC, GitStats, PatternFinding
+from weave_quality.prose_rules import PROSE_LANGUAGES, rule_language, run_prose_rule
 from weave_quality.python_parser import analyze_python_file
 
 log = logging.getLogger(__name__)
@@ -1475,7 +1476,10 @@ def _disabled_patterns(conf_path: Path) -> set[str]:
 def _run_pattern_rule(
     rule_id: str, rule_path: Path, target: Path, scan_id: int
 ) -> list[PatternFinding]:
-    """Run ast-grep for one rule file on target; return PatternFinding list."""
+    """Run one rule file on target; return PatternFinding list."""
+    if rule_language(rule_path) in PROSE_LANGUAGES:
+        return run_prose_rule(rule_id, rule_path, target, scan_id)
+
     ast_grep = ast_grep_bin()
     if not ast_grep:
         return []
@@ -1516,14 +1520,7 @@ def _run_pattern_rule(
 
 def cmd_patterns_scan(args: argparse.Namespace) -> int:
     """Run all active pattern rules and store findings."""
-    if not ast_grep_available():
-        if args.json:
-            print(json.dumps({"error": "ast-grep not installed", "install": "./install.sh"}))
-        else:
-            print("patterns: disabled (ast-grep not found — run ./install.sh)", file=sys.stderr)
-        return 1
-
-    repo = Path(_resolve_repo(getattr(args, "path", None)))
+    repo = Path(_resolve_repo(None))
     conn = init_db(args.hot_zone)
     scan = latest_scan(conn)
     if scan is None:
@@ -1533,6 +1530,23 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
 
     conf_disabled = _disabled_patterns(repo / ".weave" / "quality.conf")
     rules = _load_pattern_rules(repo, conf_disabled)
+    prose_rules = [
+        (rule_id, rule_path)
+        for rule_id, rule_path in rules
+        if rule_language(rule_path) in PROSE_LANGUAGES
+    ]
+    code_rules = [
+        (rule_id, rule_path)
+        for rule_id, rule_path in rules
+        if rule_language(rule_path) not in PROSE_LANGUAGES
+    ]
+    if code_rules and not ast_grep_available():
+        print(
+            f"patterns: skipping {len(code_rules)} code rule(s) "
+            "(ast-grep not found; run ./install.sh); prose rules still run",
+            file=sys.stderr,
+        )
+        rules = prose_rules
     if not rules:
         msg = "No pattern rules found."
         print(json.dumps({"rules": 0, "findings": 0}) if args.json else msg)
@@ -1888,7 +1902,7 @@ def main() -> int:  # pragma: no cover
     # patterns
     patterns_parser = sub.add_parser(
         "patterns",
-        help="Structural pattern matching (requires ast-grep)",
+        help="Structural + prose pattern matching (code rules require ast-grep)",
     )
     patterns_sub = patterns_parser.add_subparsers(dest="patterns_command")
 

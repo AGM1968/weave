@@ -1,0 +1,18 @@
+id: prose-casual-register
+language: prose
+kind: regex
+severity: info
+provenance: wv-6a7ade@nowcastr + report-language-no-unearned-claims memory
+message: >-
+  Casual or unearned register: clause-level causal 'so', gambling metaphors,
+  superlative slant, correction archaeology. Publication-register connectives
+  and plainly stated current values belong in client-facing prose.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+patterns:
+  - ',\s+so\s+(?:the|it|we|this)\b'
+  - '\b(?:bet|punt)\b'
+  - '\bmatters?\s+most\b'
+  - '\ban earlier (?:evaluation|draft|version|run) had (?:reported|claimed|shown)\b'

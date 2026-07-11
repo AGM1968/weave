@@ -1,0 +1,22 @@
+id: prose-number-free-verification
+language: prose
+kind: motif
+severity: info
+provenance: wv-51f327@nowcastr
+message: >-
+  Verification vocabulary with no number within reach reads as reassurance
+  rather than content. Attach the measured quantity or drop the word.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+min_count: 3
+near_window: 80
+terms:
+  - measured
+  - verified
+  - validated
+  - calibrated
+  - proven
+  - independent
+  - already

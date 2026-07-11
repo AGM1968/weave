@@ -150,12 +150,15 @@ scratch. Incremental scans will not recompute metrics for unchanged files.
 
 ### `wv quality patterns`
 
-Structural pattern scanning using ast-grep rules. Finds recurring anti-patterns across the codebase
-(bare `except: pass`, `subprocess(shell=True)`, unquoted shell variables, etc.) and optionally
-promotes findings to Weave nodes.
+Structural and prose pattern scanning. Finds recurring anti-patterns across the codebase (bare
+`except: pass`, `subprocess(shell=True)`, unquoted shell variables, etc.) plus Markdown prose
+register issues such as emphasis hedges, number-free verification motifs, and casual causal
+connectives. Findings can be promoted to Weave nodes.
 
-Requires `ast-grep` on PATH. Pattern rules live in `scripts/weave_quality/default_patterns/` and
-project-local rules in `.weave/patterns/`.
+Code rules require `ast-grep` on PATH; prose rules are stdlib-only and still run when ast-grep is
+absent. Pattern rules live in `scripts/weave_quality/default_patterns/` and project-local rules in
+`.weave/patterns/`. Disable noisy rules with `[patterns] disabled = <rule-id>` in
+`.weave/quality.conf`.
 
 ```bash
 wv quality patterns scan              # scan with all known rules, print findings table
@@ -641,6 +644,6 @@ after a scan.
 (not a block) span a single AST line and are filtered out of function tracking. They contribute to
 file-level CC but do not appear in `wv quality functions` output or per-function CC records.
 
-**`wv quality patterns` requires ast-grep:** The `patterns` subcommand has no fallback. If ast-grep
-is absent, `patterns scan` exits with an error. CC scanning degrades gracefully; pattern scanning
-does not.
+**`wv quality patterns` degrades by backend:** Code pattern rules require ast-grep. If ast-grep is
+absent, `patterns scan` skips code rules with an install hint and still runs prose rules. If no
+runnable rules remain, it reports that no pattern rules were found.

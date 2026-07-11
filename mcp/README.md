@@ -290,7 +290,7 @@ Optional local additions if you want stricter scope isolation:
 | `weave_quality_hotspots`  | Ranked hotspot report with limit and threshold                  | —               |
 | `weave_quality_diff`      | Delta report vs previous scan                                   | —               |
 | `weave_quality_functions` | Per-function CC report with dispatch tagging                    | —               |
-| `weave_quality_patterns`  | Structural pattern scan/list (requires ast-grep)                | —               |
+| `weave_quality_patterns`  | Structural + prose pattern scan/list                            | —               |
 | `weave_structural_search` | Structural code search via ast-grep patterns                    | `pattern`       |
 | `weave_code_search`       | Semantic code search via local index                            | `query`         |
 | `weave_index`             | Build or update the local code search index                     | —               |
