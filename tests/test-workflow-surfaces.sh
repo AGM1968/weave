@@ -140,9 +140,13 @@ assert_contains "$MCP_SOURCE" 'const MCP_ALLOW_NETWORK = process.env.WV_MCP_ALLO
 assert_contains "$MCP_SOURCE" 'schema: "weave-mcp-startup.v1"' "mcp source: emits structured startup health schema"
 assert_contains "$MCP_SOURCE" 'cmd.push("--no-gh")' "mcp source: close tools add --no-gh by default"
 assert_contains "$MCP_SOURCE" 'mcpNetworkFallback(`wv sync --gh' "mcp source: GitHub sync requests return CLI fallback"
-assert_contains "$(sed -n '3380,3455p' "$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh")" "mcp/contract.json" "mcp-status: validates VS Code config against contract"
-assert_contains "$(sed -n '3380,3455p' "$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh")" ".servers[].name" "mcp-status: derives expected server names from contract"
-assert_contains "$(sed -n '3380,3455p' "$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh")" ".environment.required[]" "mcp-status: derives required env from contract"
+# Name-anchored range, not a hardcoded absolute line range: any edit earlier in
+# this (large, frequently-changed) file shifts absolute line numbers and silently
+# stops testing the intended function — this broke once already (wv-fa566a).
+MCP_VSCODE_CHECK_FN=$(awk '/_mcp_check_vscode_config\(\) \{/,/^    \}/' "$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh")
+assert_contains "$MCP_VSCODE_CHECK_FN" "mcp/contract.json" "mcp-status: validates VS Code config against contract"
+assert_contains "$MCP_VSCODE_CHECK_FN" ".servers[].name" "mcp-status: derives expected server names from contract"
+assert_contains "$MCP_VSCODE_CHECK_FN" ".environment.required[]" "mcp-status: derives required env from contract"
 assert_equals "weave-mcp-contract.v1" "$(jq -r '.schema' "$PROJECT_ROOT/mcp/contract.json")" "mcp contract: has schema id"
 assert_equals "weave-mcp-startup.v1" "$(jq -r '.startup_report_schema' "$PROJECT_ROOT/mcp/contract.json")" "mcp contract: names startup report schema"
 assert_equals "5" "$(jq '.scopes | keys | length' "$PROJECT_ROOT/mcp/contract.json")" "mcp contract: declares all supported scopes"

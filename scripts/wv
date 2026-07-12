@@ -80,6 +80,7 @@ source "$WV_LIB_DIR/cmd/wv-cmd-findings.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-analyze.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-indexer.sh"
 source "$WV_LIB_DIR/cmd/wv-cmd-query.sh"
+source "$WV_LIB_DIR/cmd/wv-cmd-hook.sh"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Dispatcher
@@ -228,6 +229,7 @@ _wv_dispatch() {
         analyze)            cmd_analyze "$@" ;;
         index)           cmd_index "$@" ;;
         query)           cmd_query "$@" ;;
+        hook)            cmd_hook "$@" ;;
         help|--help|-h)  cmd_help "$@" ;;
         version|--version|-v) echo "wv $WV_VERSION" ;;
         

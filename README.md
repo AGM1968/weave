@@ -132,23 +132,27 @@ Focused CLI help: `wv help <command>` or `wv <command> --help`.
 
 ### Task Management
 
-| Command                            | Description                        |
-| ---------------------------------- | ---------------------------------- |
-| `wv add "text" --gh`               | Create node + GitHub issue         |
-| `wv work <id>`                     | Claim task (sets active)           |
-| `wv done <id> --learning="..."`    | Complete with captured learning    |
-| `wv ship <id> --learning="..."`    | Complete + sync in one step        |
-| `wv quick "text" --learning="..."` | Create + close in one step         |
-| `wv bootstrap --json`              | Single-call session snapshot       |
-| `wv overview --json`               | Compact graph/session snapshot     |
-| `wv touch <id> --intent="..."`     | Zero-output intent update          |
-| `wv help <command>`                | Focused help for one command       |
-| `wv show <id>`                     | View node details                  |
-| `wv query status=todo`             | Targeted node lookup               |
-| `wv ready`                         | Show unblocked work                |
-| `wv search "query"`                | Full-text search across nodes      |
-| `wv search --code "query"`         | Hybrid code search (source files)  |
-| `wv index`                         | Index source files for code search |
+| Command                            | Description                                                        |
+| ---------------------------------- | ------------------------------------------------------------------ |
+| `wv add "text" --gh`               | Create node + GitHub issue                                         |
+| `wv work <id>`                     | Claim task (sets active)                                           |
+| `wv done <id> --learning="..."`    | Complete with captured learning                                    |
+| `wv ship <id> --learning="..."`    | Complete + sync in one step                                        |
+| `wv quick "text" --learning="..."` | Create + close in one step                                         |
+| `wv bootstrap --json`              | Single-call session snapshot                                       |
+| `wv bootstrap-agent --json`        | Agent bootstrap contract with command/provenance/readiness         |
+| `wv overview --json`               | Compact graph/session snapshot                                     |
+| `wv touch <id> --intent="..."`     | Zero-output intent update                                          |
+| `wv bulk-update < nodes.json`      | Update multiple nodes from JSON stdin                              |
+| `wv help <command>`                | Focused help for one command                                       |
+| `wv show <id>`                     | View node details                                                  |
+| `wv query status=todo`             | Targeted node lookup                                               |
+| `wv ready`                         | Show unblocked work                                                |
+| `wv search "query"`                | Full-text search across nodes                                      |
+| `wv search --code "query"`         | Hybrid code search (source files)                                  |
+| `wv index`                         | Index source files for code search                                 |
+| `wv reindex`                       | Rebuild the graph full-text search index                           |
+| `wv discover <id> --json`          | Blindspot report: composes query + impact into one bucketed result |
 
 ### Search
 
@@ -186,6 +190,8 @@ wv search --code "query" --graph      # Include active Weave nodes per matched f
 | `wv path <id>`                          | Show ancestry path                                        |
 | `wv edge-types`                         | List valid edge types                                     |
 | `wv edge-types --stats`                 | Edge counts per type                                      |
+| `wv edges <id>`                         | Inspect all edges for a node                              |
+| `wv refs <file\|text>`                  | Extract cross-references (dry-run, no edges created)      |
 | `wv query edge-type=blocks`             | Nodes with blocking edges                                 |
 | `wv query --order=connections`          | Most-connected nodes first                                |
 | `wv impact <id>`                        | Blast radius: impacted nodes, risk score, affected suites |
@@ -193,18 +199,24 @@ wv search --code "query" --graph      # Include active Weave nodes per matched f
 
 ### Knowledge Capture
 
-| Command                                | Description                     |
-| -------------------------------------- | ------------------------------- |
-| `wv learnings`                         | View all captured learnings     |
-| `wv learnings --grep="topic"`          | Search learnings by keyword     |
-| `wv audit-pitfalls`                    | Track resolved vs open pitfalls |
-| `wv audit-pitfalls --only-unaddressed` | Show unresolved pitfalls only   |
-| `wv findings list`                     | List finding nodes with summary |
-| `wv findings promote`                  | Promote learnings into findings |
+| Command                                          | Description                                                  |
+| ------------------------------------------------ | ------------------------------------------------------------ |
+| `wv learnings`                                   | View all captured learnings                                  |
+| `wv learnings --grep="topic"`                    | Search learnings by keyword                                  |
+| `wv audit-pitfalls`                              | Track resolved vs open pitfalls                              |
+| `wv audit-pitfalls --only-unaddressed`           | Show unresolved pitfalls only                                |
+| `wv findings list`                               | List finding nodes with summary                              |
+| `wv findings promote`                            | Promote learnings into findings                              |
+| `wv validate-finding <id>`                       | Validate finding metadata: exit 0/1 + JSON errors            |
+| `wv remember "text"`                             | Capture graph-native memory (type=memory, mem_status=active) |
+| `wv memory recall --json`                        | Recall active graph memory, agent-agnostic                   |
+| `wv memory scan --source=claude\|codex\|copilot` | Scan a harness's memory surface for candidates               |
+| `wv memory import --source=claude --path=DIR`    | Import a harness memory surface as candidate nodes           |
 
 Finding nodes use `metadata.type="finding"` plus nested
 `finding.{violation_type, root_cause, proposed_fix, confidence, fixable}` data. `confidence` is
-`high|medium|low`.
+`high|medium|low`. Memory capture records the _operating_ agent's provenance, but recall stays
+agent-agnostic — `source_agent` is evidence, never a recall filter.
 
 ### System
 
@@ -219,6 +231,9 @@ Finding nodes use `metadata.type="finding"` plus nested
 | `wv quality patterns`       | Structural + prose pattern scan/list/promote                                                           |
 | `wv clean-ghosts`           | Delete ghost edges (legacy compatibility)                                                              |
 | `wv doctor`                 | Installation health check                                                                              |
+| `wv doctor --agent --json`  | Agent-facing checks: Codex MCP scope, Codex hooks state, Python/pytest resolution                      |
+| `wv pattern-audit --json`   | Static checks that catch recurring bug patterns before they regress                                    |
+| `wv session-summary`        | Session activity stats: nodes created/completed, learnings captured                                    |
 | `wv test-record <suite>`    | Record a suite outcome in the test ledger (`--files=a,b --exit=N`); feeds the test gate                |
 | `wv hotzone --db`           | Print the resolved brain.db path (for raw sqlite3 inspection)                                          |
 | `wv mcp-status`             | MCP server health check                                                                                |
@@ -341,6 +356,10 @@ Hooks enforce workflow rules deterministically — the AI agent cannot bypass st
   `hooks` key (shallow merge limitation: project hooks shadow global hooks entirely).
 - **10 Makefile wv targets** — CI integration and discoverability.
 - **MCP `weave_edit_guard`** — Pre-edit gate for VS Code Copilot and other MCP clients.
+- **Codex hooks (opt-in)** — `wv init-repo --agent=codex --codex-hooks` writes `.codex/hooks.json`,
+  a separate, human-trust-reviewed adapter onto the same `wv hook dispatch` enforcement
+  (active-node, phase, stale-node, installed-path) that Claude's hooks use. Claude and Codex hooks
+  are independent host surfaces — neither fires for the other.
 
 ## Code Quality
 

@@ -1103,6 +1103,29 @@ CODEXFAKE
     codex_mcp_detail=$(echo "$doctor_json" | jq -r '.checks[] | select(.check=="codex mcp") | .detail // empty' 2>/dev/null || echo "")
     assert_contains "$codex_mcp_detail" "weave-lite registered" \
         "doctor --agent reports recommended Codex MCP scope"
+
+    local codex_hooks_detail
+    rm -rf .codex
+    doctor_json=$("$WV" doctor --agent --json 2>&1)
+    codex_hooks_detail=$(echo "$doctor_json" | jq -r '.checks[] | select(.check=="codex hooks") | .detail // empty' 2>/dev/null || echo "")
+    assert_contains "$codex_hooks_detail" "no project Codex hooks" \
+        "doctor --agent warns when Codex hooks are absent"
+
+    mkdir -p .codex
+    printf '%s\n' '{"hooks":{"SessionStart":[{}],"PreToolUse":[{}]}}' > .codex/hooks.json
+    doctor_json=$("$WV" doctor --agent --json 2>&1)
+    codex_hooks_detail=$(echo "$doctor_json" | jq -r '.checks[] | select(.check=="codex hooks") | .detail // empty' 2>/dev/null || echo "")
+    assert_contains "$codex_hooks_detail" "stale, missing event(s)" \
+        "doctor --agent warns when Codex hooks config is missing events"
+    assert_contains "$codex_hooks_detail" "PostToolUse" \
+        "doctor --agent names the missing Codex hook events"
+
+    printf '%s\n' '{"hooks":{"SessionStart":[{}],"PreToolUse":[{}],"PostToolUse":[{}],"Stop":[{}]}}' > .codex/hooks.json
+    doctor_json=$("$WV" doctor --agent --json 2>&1)
+    codex_hooks_detail=$(echo "$doctor_json" | jq -r '.checks[] | select(.check=="codex hooks") | .detail // empty' 2>/dev/null || echo "")
+    assert_contains "$codex_hooks_detail" "pending trust" \
+        "doctor --agent reports pending-trust for a complete Codex hooks config"
+    rm -rf .codex
 }
 
 # ============================================================================
@@ -1369,6 +1392,7 @@ test_help_surfaces() {
     local expected_commands=(
         init add remember memory delete done ship ship-agent batch-done bulk-update work preflight recover bootstrap bootstrap-agent
         overview cache pending-close ready list show status update touch allowed-tools quick
+        hook
         block link unlink resolve related edges path tree plan enrich-topology context discover search
         reindex learnings trails digest session-summary audit-pitfalls edge-types init-repo
         doctor selftest mcp-status health guide prune clean-ghosts compact refs import quality

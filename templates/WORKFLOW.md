@@ -75,7 +75,7 @@ This table is generated from `templates/workflow-classes.conf`. The pre-action h
 | `wv path <id>`             | Ancestry chain                                                                                                         | `--format=chain`                                                                                               |
 | `wv plan <file>`           | Import markdown as epic + tasks                                                                                        | `--sprint=N`, `--gh`, `--dry-run`                                                                              |
 | `wv context <id> --json`   | Context pack (blockers, ancestors, pitfalls)                                                                           | Cached per session                                                                                             |
-| `wv discover <id> --json`  | Blindspot report: known facts/gaps/prior learnings plus bounded candidate unknowns                                      | `--depth=N`, `--limit=N`                                                                                       |
+| `wv discover <id> --json`  | Blindspot report: known facts/gaps/prior learnings plus bounded candidate unknowns                                     | `--depth=N`, `--limit=N`                                                                                       |
 | `wv search <query>`        | Full-text search across graph nodes                                                                                    | `--json`, `--status=`                                                                                          |
 | `wv index [path]`          | Index code files into brain.db for hybrid search                                                                       | `--ext=`, `--no-embed`, `--json`                                                                               |
 | `wv search --code <query>` | Hybrid code search (BM25 + cosine RRF) over indexed chunks                                                             | `--mode=hybrid\|fts\|vector`, `--graph`, `--json`                                                              |
@@ -214,6 +214,13 @@ Good learnings are specific, actionable, and scoped to a concrete context.
 
 Hooks and the CLI enforce active-node, close, and verification invariants. For advisory workflow
 discipline and repair/delegation guidance, use the Procedures index above.
+
+Claude Code hooks (`~/.claude/settings.json`, `.claude/hooks/*`) and Codex hooks
+(`.codex/hooks.json`, opt-in via `wv init-repo --agent=codex --codex-hooks`) are separate host
+surfaces with independent config, trust review, and lifecycle events — one does not fire for the
+other. Both call the same shared dispatcher (`wv hook dispatch --event=<event>`) so enforcement
+logic is not duplicated per-host; only the adapter differs. `wv doctor --agent` reports each host's
+hook/config state independently.
 
 ## Repair Workflow
 

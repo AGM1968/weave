@@ -268,3 +268,53 @@ _wv_source_drift() {
     printf '%s' "$drifted"
     return 0
 }
+
+# _wv_concurrent_session — detection-only guard for wv-fa566a: a second LIVE
+# agent process (not a crash artifact) with a cwd inside this repo can edit or
+# delete working-tree files with no coordination — scripts/lib/wv-config.sh
+# was deleted twice in one session this way. .weave/ has cross-agent guards
+# (wv-b767ff, wv-66aa00); the working tree itself does not.
+#
+# Linux-only (/proc); silently no-ops elsewhere (return 1) since this is
+# advisory, not a blocking gate. Excludes the caller's own ancestor chain —
+# the harness driving THIS session (e.g. a "claude" process) commonly has its
+# own cwd inside the repo too, and is not a distinct concurrent session.
+# Echoes a description and returns 0 on a hit; returns 1 when clean.
+_wv_concurrent_session() {
+    local repo_root="$1"
+    [ -d /proc ] || return 1
+    [ -n "$repo_root" ] || return 1
+
+    local self_chain=" $$ " walk="$$" hops=0
+    while [ -n "$walk" ] && [ "$walk" != "1" ] && [ "$hops" -lt 30 ]; do
+        walk=$(awk -F: '/^PPid:/{gsub(/[ \t]/,"",$2); print $2}' "/proc/$walk/status" 2>/dev/null)
+        [ -n "$walk" ] || break
+        self_chain="${self_chain}${walk} "
+        hops=$((hops + 1))
+    done
+
+    local pid_dir pid cwd comm cmd
+    for pid_dir in /proc/[0-9]*; do
+        pid="${pid_dir#/proc/}"
+        case "$self_chain" in *" $pid "*) continue ;; esac
+        cwd=$(readlink -f "$pid_dir/cwd" 2>/dev/null) || continue
+        [ -n "$cwd" ] || continue
+        case "$cwd" in "$repo_root") ;; "$repo_root"/*) ;; *) continue ;; esac
+        # Match the executable name (/proc/<pid>/comm), not the full cmdline —
+        # cmdline substring matching false-positived on an unrelated bash
+        # subprocess whose command referenced a ~/.claude/ path. comm is
+        # truncated to 15 chars by the kernel, so match by prefix.
+        comm=$(cat "$pid_dir/comm" 2>/dev/null)
+        [ -n "$comm" ] || continue
+        case "$comm" in
+            codex*|claude*|copilot*) ;;
+            *) continue ;;
+        esac
+        cmd=$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null)
+        [ -n "$cmd" ] || cmd="$comm"
+        printf 'another live agent process (pid %s: %s) has a working directory inside this repo -- working-tree edits are not coordinated between sessions (wv-fa566a)' \
+            "$pid" "$(printf '%s' "$cmd" | cut -c1-80)"
+        return 0
+    done
+    return 1
+}

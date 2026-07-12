@@ -113,7 +113,13 @@ if command -v _wv_source_drift >/dev/null 2>&1; then
         _pc_src=$(cat "${WV_CONFIG_DIR:-$HOME/.config/weave}/source-path" 2>/dev/null || echo "")
         if [ -n "$_pc_src" ] && [ -x "$_pc_src/install.sh" ]; then
             echo "Weave pre-commit: install drift ($_pc_drift) — self-healing via ./install.sh..." >&2
-            if ( cd "$_pc_src" && ./install.sh ) >/dev/null 2>&1; then
+            # Self-heal must install to the REAL machine location regardless of
+            # who/what triggered this hook. A test harness's exported isolation
+            # vars (e.g. tests/test-hooks.sh sets WV_LIB_DIR=<repo>/scripts to
+            # sandbox its own fixtures) leak into this subshell and previously
+            # redirected the MCP build into a stray, untracked scripts/mcp/ tree
+            # instead of ~/.local/lib/weave/mcp (found via wv-fa566a follow-up).
+            if ( unset WV_LIB_DIR WV_CONFIG_DIR WV_HOT_ZONE WV_DB WV_PROJECT_DIR; cd "$_pc_src" && ./install.sh ) >/dev/null 2>&1; then
                 echo "Weave pre-commit: install drift healed." >&2
             else
                 echo "Weave pre-commit: ./install.sh failed — run it manually before committing." >&2

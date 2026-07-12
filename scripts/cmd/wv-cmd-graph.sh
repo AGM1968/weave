@@ -2067,6 +2067,14 @@ cmd_discover() {
              else {}
              end);
 
+        # Older nodes may store one criterion or risk as a scalar. Normalize
+        # these metadata values before map-based report composition.
+        def metadata_values($value):
+          if ($value | type) == "array" then $value
+          elif $value == null then []
+          else [$value]
+          end;
+
         # Preserve source diversity under a single bucket limit. With blockers,
         # risks, and findings present, round-robin selection prevents a long first
         # source from starving every later source.
@@ -2100,8 +2108,8 @@ cmd_discover() {
           + (if ($fields.decision == null and $fields.pattern == null and $fields.pitfall == null)
              then {raw: ($parsed.raw // $ls)} else {} end);
 
-        (node_metadata($seed).done_criteria // []) as $criteria |
-        (node_metadata($seed).risks // []) as $risks |
+        metadata_values(node_metadata($seed).done_criteria) as $criteria |
+        metadata_values(node_metadata($seed).risks) as $risks |
         {
           schema: $schema,
           generated_by: $generated_by,

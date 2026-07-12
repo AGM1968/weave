@@ -1139,6 +1139,20 @@ assert_contains "$LAST_MSG" "auto-checkpoint" "session-end: auto-checkpoint comm
 # --- repo-managed git hooks ---
 echo ""
 echo "--- repo-managed git hooks ---"
+
+# Structural regression (wv-fa566a follow-up): the install-drift self-heal
+# subshell must not let a caller's exported test/dev-isolation vars (e.g.
+# this very suite's WV_LIB_DIR="$PROJECT_ROOT/scripts") leak into the real
+# ./install.sh it shells out to — that previously redirected the MCP build
+# into an untracked scripts/mcp/ tree instead of ~/.local/lib/weave/mcp. A
+# full dynamic run is slow/network-dependent (npm install); assert the
+# unset guard is present in source instead.
+SELF_HEAL_BLOCK=$(sed -n '/Self-heal install drift/,/^fi$/p' "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh")
+assert_contains "$SELF_HEAL_BLOCK" "unset WV_LIB_DIR" \
+    "pre-commit self-heal unsets WV_LIB_DIR before shelling out to install.sh"
+assert_contains "$SELF_HEAL_BLOCK" "unset WV_LIB_DIR WV_CONFIG_DIR WV_HOT_ZONE WV_DB WV_PROJECT_DIR" \
+    "pre-commit self-heal clears all known test-isolation vars, not just one"
+
 setup_test_env
 mkdir -p "$TEST_DIR/project/tests"
 cat > "$TEST_DIR/project/tests/test-graph.sh" <<'EOF'

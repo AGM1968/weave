@@ -221,6 +221,7 @@ battery R audit-pitfalls audit-pitfalls
 battery R edge-types edge-types --stats
 battery R guide      guide --topic=discovery
 battery R config     config
+battery H hook
 battery H test-record
 battery H selftest
 

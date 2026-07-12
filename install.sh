@@ -204,18 +204,35 @@ do_upgrade() {
 install_file() {
     local src="$1"
     local dst="$2"
-    
-    # Remove existing file/symlink first
-    rm -f "$dst" 2>/dev/null || true
-    
+
+    # Verify the source before touching dst. A concurrent process editing this
+    # same checkout (e.g. another live agent session) can make src vanish
+    # between install runs; removing dst first would leave the installed copy
+    # deleted with nothing to replace it (wv-fa566a).
+    if [ ! -e "$src" ]; then
+        echo "install_file: source not found, leaving existing install untouched: $src" >&2
+        return 1
+    fi
+
     if [ "$DEV_MODE" = "1" ]; then
         # Use absolute path for symlink
         local abs_src=$(cd "$(dirname "$src")" && pwd)/$(basename "$src")
         ln -sf "$abs_src" "$dst"
     else
-        cp "$src" "$dst"
+        # Copy to a same-directory temp file and rename into place, so a
+        # copy that fails partway (disk full, src vanishes mid-copy) never
+        # leaves dst removed or truncated.
+        local tmp_dst
+        tmp_dst=$(mktemp "${dst}.XXXXXX" 2>/dev/null) || tmp_dst="${dst}.tmp.$$"
+        if ! cp "$src" "$tmp_dst"; then
+            rm -f "$tmp_dst" 2>/dev/null || true
+            echo "install_file: copy failed, leaving existing install untouched: $src -> $dst" >&2
+            return 1
+        fi
+        chmod --reference="$src" "$tmp_dst" 2>/dev/null || true
+        mv -f "$tmp_dst" "$dst"
     fi
-    
+
     # Record in manifest
     echo "$dst" >> "$MANIFEST"
 }
@@ -225,8 +242,18 @@ install_file() {
 download_file() {
     local url="$1"
     local dst="$2"
-    
-    curl -sSL "$url" -o "$dst"
+
+    # Same atomic-replace principle as install_file: download to a temp file
+    # first so a network failure never leaves dst truncated/empty while still
+    # being recorded in the manifest as installed.
+    local tmp_dst
+    tmp_dst=$(mktemp "${dst}.XXXXXX" 2>/dev/null) || tmp_dst="${dst}.tmp.$$"
+    if ! curl -fsSL "$url" -o "$tmp_dst"; then
+        rm -f "$tmp_dst" 2>/dev/null || true
+        echo "download_file: download failed, leaving existing install untouched: $url -> $dst" >&2
+        return 1
+    fi
+    mv -f "$tmp_dst" "$dst"
     echo "$dst" >> "$MANIFEST"
 }
 
@@ -403,6 +430,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/cmd/wv-cmd-analyze.sh "$LIB_DIR/cmd/wv-cmd-analyze.sh"
     install_file ./scripts/cmd/wv-cmd-indexer.sh "$LIB_DIR/cmd/wv-cmd-indexer.sh"
     install_file ./scripts/cmd/wv-cmd-query.sh "$LIB_DIR/cmd/wv-cmd-query.sh"
+    install_file ./scripts/cmd/wv-cmd-hook.sh "$LIB_DIR/cmd/wv-cmd-hook.sh"
     # Python sync package
     mkdir -p "$LIB_DIR/weave_gh"
     for pyf in ./scripts/weave_gh/*.py; do
@@ -529,6 +557,7 @@ else
     download_file "$REPO/scripts/cmd/wv-cmd-analyze.sh" "$LIB_DIR/cmd/wv-cmd-analyze.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-indexer.sh" "$LIB_DIR/cmd/wv-cmd-indexer.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-query.sh" "$LIB_DIR/cmd/wv-cmd-query.sh"
+    download_file "$REPO/scripts/cmd/wv-cmd-hook.sh" "$LIB_DIR/cmd/wv-cmd-hook.sh"
     # Git hook sources (used by wv-init-repo --update refresh)
     mkdir -p "$LIB_DIR/hooks"
     download_file "$REPO/scripts/hooks/pre-commit-weave.sh" "$LIB_DIR/hooks/pre-commit-weave.sh"
@@ -768,15 +797,17 @@ AGENT_ARG="claude"
 UPDATE_MODE=0
 FORCE_MODE=0
 CODEX_MCP_SCOPE=""
+CODEX_HOOKS=0
 for arg in "$@"; do
     case "$arg" in
         --agent=*) AGENT_ARG="${arg#--agent=}" ;;
         --update) UPDATE_MODE=1 ;;
         --force) UPDATE_MODE=1; FORCE_MODE=1 ;;
+        --codex-hooks) CODEX_HOOKS=1 ;;
         --codex-mcp) CODEX_MCP_SCOPE="lite" ;;
         --codex-mcp=lite|--codex-mcp=inspect|--codex-mcp=full) CODEX_MCP_SCOPE="${arg#--codex-mcp=}" ;;
         --help|-h)
-            echo "Usage: wv-init-repo [--agent=claude|copilot|codex|all] [--update] [--force] [--codex-mcp[=lite|inspect|full]]"
+            echo "Usage: wv-init-repo [--agent=claude|copilot|codex|all] [--update] [--force] [--codex-hooks] [--codex-mcp[=lite|inspect|full]]"
             echo ""
             echo "  claude   (default) Claude Code hooks, skills, settings.local.json"
             echo "  copilot  VS Code Copilot MCP config (.vscode/mcp.json + legacy .mcp.json) + copilot-instructions.md"
@@ -786,6 +817,7 @@ for arg in "$@"; do
             echo "  --update  Update managed files (hooks, skills, agents, copilot-instructions)"
             echo "            Preserves user-customized files (CLAUDE.md, settings.local.json, MCP config)"
             echo "  --force   Like --update but also rewrites MCP config files (.vscode/mcp.json, .mcp.json)"
+            echo "  --codex-hooks  Generate project lifecycle hooks for explicit review and trust"
             echo "  --codex-mcp  Register weave-lite in Codex global config (local/read-mostly scope)"
             echo "  --codex-mcp=inspect  Register read-only weave-inspect instead"
             echo "  --codex-mcp=full     Register full weave server explicitly"
@@ -1734,6 +1766,8 @@ if [ "$AGENT" = "codex" ]; then
 
     _CODEX_DIR="$REPO_ROOT/.codex"
     _CODEX_CONTRACT="$_CODEX_DIR/weave.json"
+    CODEX_HOOKS_ENABLED="$CODEX_HOOKS"
+    [ ! -f "$_CODEX_DIR/hooks.json" ] || CODEX_HOOKS_ENABLED=1
 
     _write_codex_contract() {
         mkdir -p "$_CODEX_DIR"
@@ -1752,6 +1786,13 @@ if [ "$AGENT" = "codex" ]; then
     "hot_zone": "codex",
     "expected_prefix": "/tmp/weave-codex-\${uid}",
     "prefer_repo_local_wv": true
+  },
+  "hooks": {
+    "enabled": $CODEX_HOOKS_ENABLED,
+    "config": ".codex/hooks.json",
+    "trust_command": "/hooks",
+    "requires_review": true,
+    "dispatcher": "./scripts/wv hook dispatch"
   },
   "workflow": {
     "universal_instructions": "AGENTS.md",
@@ -1808,11 +1849,80 @@ if [ "$AGENT" = "codex" ]; then
 CODEXEOF
     }
 
-    if [ ! -f "$_CODEX_CONTRACT" ] || [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]; then
+    _write_codex_hooks() {
+        mkdir -p "$_CODEX_DIR"
+        cat > "$_CODEX_DIR/hooks.json" <<'CODEXHOOKSEOF'
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=SessionStart --json",
+            "timeout": 30,
+            "statusMessage": "Loading Weave context"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=PreToolUse --json",
+            "timeout": 30,
+            "statusMessage": "Checking Weave active node"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=PostToolUse --json",
+            "timeout": 30,
+            "statusMessage": "Recording Weave edit context"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=Stop --json",
+            "timeout": 30,
+            "statusMessage": "Checking Weave close state"
+          }
+        ]
+      }
+    ]
+  }
+}
+CODEXHOOKSEOF
+    }
+
+    if [ ! -f "$_CODEX_CONTRACT" ] || [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ] || [ "$CODEX_HOOKS" = "1" ]; then
         _write_codex_contract
         echo -e "  ${GREEN}✓${NC} .codex/weave.json"
     else
         echo -e "  ${YELLOW}⊘${NC} .codex/weave.json (already exists, use --update to refresh)"
+    fi
+
+    if [ "$CODEX_HOOKS" = "1" ]; then
+        _write_codex_hooks
+        echo -e "  ${GREEN}✓${NC} .codex/hooks.json"
+        echo "  Review and trust these project hooks with /hooks before expecting enforcement."
+    else
+        echo -e "  ${YELLOW}⊘${NC} codex hooks: skipped (use --codex-hooks to generate for review)"
     fi
 
     # Optional: register a scoped Weave MCP server with Codex. Codex sandbox
@@ -1904,6 +2014,7 @@ for _a in "${AGENTS[@]}"; do
         echo "  .github/hooks/ — VS Code native hook location"
     elif [ "$_a" = "codex" ]; then
         echo "  .codex/weave.json — Codex setup contract (AGENTS.md remains universal)"
+        [ "$CODEX_HOOKS" != "1" ] || echo "  .codex/hooks.json — project lifecycle hooks (review/trust with /hooks)"
     fi
 done
 # Note whether code search index exists

@@ -97,6 +97,8 @@ weave_touch --files
 # --- format/tty ---
 weave_list --json-v
 weave_show --json-v
+weave_ready --json-v
+weave_ready --findings
 weave_show --mode
 weave_learnings --show-graph
 weave_update --echo

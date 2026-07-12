@@ -784,7 +784,7 @@ test_discover() {
 
     setup_test_env
 
-    local seed blocker extra_blocker finding learning learning_combined impacted jout limited string_meta done_out ctx boot
+    local seed blocker extra_blocker finding learning learning_combined impacted jout limited string_meta scalar_risk_meta done_out ctx boot
     seed=$("$WV" add "Discovery seed" \
         --metadata='{"done_criteria":["report buckets exist"],"risks":["report shape may drift"],"risk_level":"medium"}' \
         --force 2>&1 | node_id_from_output)
@@ -839,6 +839,12 @@ test_discover() {
     string_meta=$("$WV" discover "$seed" --json --depth=2 --limit=5 2>&1)
     assert_jq_true "$string_meta" '.known_knowns | any(.source == "done_criteria" and .meaning == "Done criterion: string metadata criterion")' "discover JSON: JSON-string metadata preserves criteria"
     assert_jq_true "$string_meta" '.known_unknowns | any(.source == "risk_metadata" and .meaning == "Recorded risk: string metadata risk")' "discover JSON: JSON-string metadata preserves risks"
+
+    # Legacy metadata can contain a single risk as a scalar rather than an
+    # array. Discovery must normalize that shape before applying jq map.
+    sqlite3 "$WV_DB" "UPDATE nodes SET metadata='{\"risks\":\"scalar metadata risk\"}' WHERE id='$seed';"
+    scalar_risk_meta=$("$WV" discover "$seed" --json --depth=2 --limit=5 2>&1)
+    assert_jq_true "$scalar_risk_meta" '.known_unknowns | any(.source == "risk_metadata" and .meaning == "Recorded risk: scalar metadata risk")' "discover JSON: scalar risks metadata emits risk evidence"
 
     ctx=$("$WV" context "$seed" --json --mode=discover 2>&1)
     assert_jq_true "$ctx" '.discovery.schema == "weave.discovery.v1" and (.discovery.unknown_unknown_candidates | length >= 1)' "context discover-mode: embeds bounded discovery report"

@@ -4,6 +4,35 @@
 
 ## Unreleased
 
+## [1.69.0] - 2026-07-12
+
+### Added
+
+- **Codex lifecycle hook dispatcher** - `wv hook dispatch --event=<event>` gives Codex the same
+  active-node, phase, stale-node, and installed-path enforcement Claude Code's hooks provide. Opt-in
+  via `wv init-repo --agent=codex --codex-hooks`, which requires human trust review before the
+  generated `.codex/hooks.json` runs.
+- **`wv doctor --agent` Codex-hooks check** - reports whether project Codex hooks are absent, stale,
+  or present-but-pending-trust.
+- **`wv bootstrap` concurrent-session advisory** - detects a second live agent process (matched by
+  executable name) with a working directory inside the same repo and surfaces it alongside the
+  existing install-drift and quality-scan advisories.
+
+### Fixed
+
+- **`install_file`/`download_file` atomic replace** - both now stage to a temp file and rename into
+  place instead of deleting the destination before verifying the copy/download succeeded, so a
+  failed install no longer leaves a working copy deleted or corrupted.
+- **`pattern-audit` Check 1 `$WV` self-reference** - resolves the checkout actually running the
+  check instead of `command -v wv`, which previously could scan a different installed binary's
+  dispatch table (false result when auditing a git worktree or historical release tag).
+- **Pre-commit install-drift self-heal environment leak** - no longer inherits a caller's exported
+  test/dev-isolation variables (e.g. a test suite's `WV_LIB_DIR` override) when shelling out to the
+  real `./install.sh`, which previously could redirect a build into the wrong, untracked location.
+- **Codex `PreToolUse` dispatch enforcement parity** - now runs the installed-path guard, phase
+  gate, and stale-node check in the same order as Claude's `pre-action.sh`, closing a gap where a
+  Codex session could silently reuse a stale active node inherited from a crashed prior session.
+
 ## [1.68.1] - 2026-07-11
 
 ### Fixed
@@ -11,8 +40,8 @@
 - **`wv quality patterns` hot-zone routing** - `patterns scan/list/promote` now forwards the active
   `WV_HOT_ZONE` to the Python quality module like the sibling quality subcommands, avoiding false
   `No scan in DB` errors in sandboxed/runtime-specific hot zones.
-- **`wv quality patterns scan` repeated-run duplication** - rerunning a pattern scan against the same
-  quality scan now replaces that scan's pattern findings instead of appending duplicate rows.
+- **`wv quality patterns scan` repeated-run duplication** - rerunning a pattern scan against the
+  same quality scan now replaces that scan's pattern findings instead of appending duplicate rows.
 
 ## [1.68.0] - 2026-07-11
 
@@ -31,9 +60,9 @@
 
 ### Added
 
-- **Unknown-taxonomy discovery surfaces** - `wv discover` now reports known-known,
-  known-unknown, unknown-known, and candidate unknown-unknown evidence, and context/bootstrap
-  surfaces embed bounded blindspot signals for active work.
+- **Unknown-taxonomy discovery surfaces** - `wv discover` now reports known-known, known-unknown,
+  unknown-known, and candidate unknown-unknown evidence, and context/bootstrap surfaces embed
+  bounded blindspot signals for active work.
 - **Blindspot-pass workflow procedure** - the workflow templates now include a shared procedure for
   using bootstrap plus discovery output to probe blindspots before promoting findings.
 
@@ -56,10 +85,10 @@
 
 ### Added
 
-- **Machine-readable MCP lifecycle/config contract** - `mcp/contract.json` now defines server scopes,
-  expected startup policy, tool scope membership, and required configuration environment in one place.
-  Workflow surface tests assert the contract so docs, generated configs, and MCP runtime expectations
-  stay aligned.
+- **Machine-readable MCP lifecycle/config contract** - `mcp/contract.json` now defines server
+  scopes, expected startup policy, tool scope membership, and required configuration environment in
+  one place. Workflow surface tests assert the contract so docs, generated configs, and MCP runtime
+  expectations stay aligned.
 - **Bounded `/goal` scoping command** - the Claude command now focuses on source-classified call
   telemetry, existing safeguards, and narrowly justified follow-up work instead of running a broad
   remediation audit by default.
@@ -69,11 +98,12 @@
 - **MCP startup and status diagnostics hardened** - Copilot MCP configs now set explicit
   `WV_AGENT_ID`, MCP startup can report structured health, and `mcp-status` surfaces startup/process
   diagnostics while preserving normal stdio protocol behavior.
-- **MCP lifecycle docs aligned with the contract** - public README and MCP README wording now reflects
-  the lifecycle/config contract, including scoped servers and generated client configuration.
+- **MCP lifecycle docs aligned with the contract** - public README and MCP README wording now
+  reflects the lifecycle/config contract, including scoped servers and generated client
+  configuration.
 - **Public release-note sanitization is shared** - `build-release.sh` now uses one sanitizer for the
-  shipped changelog, source tag notes, and public GitHub release notes, so internal Weave node ids and
-  dangling `Closes/Fixes/See/Ref wv-*` clauses do not leak into consumer-facing release text.
+  shipped changelog, source tag notes, and public GitHub release notes, so internal Weave node ids
+  and dangling `Closes/Fixes/See/Ref wv-*` clauses do not leak into consumer-facing release text.
 
 ### Fixed
 

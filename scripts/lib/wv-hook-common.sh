@@ -76,6 +76,15 @@ _hc_refresh() {
     _HC_HOT_ZONE=$(_hc_hot_zone "$_HC_PROJECT_DIR")
     _HC_DB=$(_hc_db_path "$_HC_HOT_ZONE")
     _HC_PHASE=$(_hc_phase_value "$_HC_HOT_ZONE")
+    # _hc_check_active_node / _hc_check_context_pack shell out via "$WV" with
+    # no fallback of their own — they assumed every caller sources
+    # wv-resolve-project.sh first (which sets WV="$WV_PROJECT_DIR/scripts/wv").
+    # wv-cmd-hook.sh's PreToolUse dispatch does not, and silently failed open
+    # under nounset (wv-015891). Guarantee WV here, in the one place every
+    # caller already runs first, using the same project-dir-relative fallback
+    # wv-resolve-project.sh uses rather than a script-relative SCRIPT_DIR that
+    # standalone hook scripts don't define.
+    WV="${WV:-${WV_CLI:-$_HC_PROJECT_DIR/scripts/wv}}"
 }
 
 # _hc_db_preflight — verify the hot-zone DB exists before attempting wv queries.

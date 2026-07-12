@@ -492,6 +492,15 @@ cmd_bootstrap() {
         fi
     fi
 
+    # ── Concurrent-session advisory (wv-fa566a) ── a second live agent process
+    # sharing this working tree can edit/delete files with no coordination; the
+    # existing cross-agent guards cover .weave/, not the working tree itself.
+    local concurrent_advisory="" _cs_root
+    _cs_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    if [ -n "$_cs_root" ]; then
+        concurrent_advisory=$(_wv_concurrent_session "$_cs_root" 2>/dev/null || echo "")
+    fi
+
     # ── Compose final JSON ──
     jq -n \
         --argjson status "$status_json" \
@@ -502,11 +511,12 @@ cmd_bootstrap() {
         --arg breadcrumb "$breadcrumb" \
         --arg drift "$drift_advisory" \
         --arg quality "$quality_advisory" \
+        --arg concurrent "$concurrent_advisory" \
         '{
             status: $status,
             active_node: $active_node,
             context: $context,
-            advisories: ([$drift, $quality] | map(select(. != ""))),
+            advisories: ([$drift, $quality, $concurrent] | map(select(. != ""))),
             ready: ($ready | map({id, text})),
             learnings: ($learnings | map(
                 (if .metadata and (.metadata | type) == "string"
@@ -2208,6 +2218,47 @@ _doctor_check_codex_mcp() {
     fi
 }
 
+# Detect the project Codex hook config and surface trust guidance. Codex hook
+# trust is reviewed inside Codex itself (via /hooks) and is not reliably
+# inspectable from outside the running session, so a present + complete
+# config still warns "pending trust" rather than "pass" (see
+# docs/PROPOSAL-codex-hooks-rust-dispatch.md test plan item 10).
+_doctor_check_codex_hooks() {
+    local git_root hooks_file contract_file
+    git_root=$(git rev-parse --show-toplevel 2>/dev/null)
+    if [ -z "$git_root" ]; then
+        _doctor_record "codex hooks" "warn" "not in a git repo; skip"
+        return
+    fi
+    hooks_file="$git_root/.codex/hooks.json"
+    contract_file="$git_root/.codex/weave.json"
+
+    if [ ! -f "$hooks_file" ]; then
+        if [ -f "$contract_file" ] && jq -e '(.hooks.enabled // 0) == 1' "$contract_file" >/dev/null 2>&1; then
+            _doctor_record "codex hooks" "warn" ".codex/weave.json records hooks enabled but .codex/hooks.json is missing; run: wv init-repo --agent=codex --codex-hooks --force"
+        else
+            _doctor_record "codex hooks" "warn" "no project Codex hooks; optional: wv init-repo --agent=codex --codex-hooks"
+        fi
+        return
+    fi
+
+    if ! jq -e 'type == "object" and (.hooks | type) == "object"' "$hooks_file" >/dev/null 2>&1; then
+        _doctor_record "codex hooks" "fail" ".codex/hooks.json is present but is not valid JSON with a top-level hooks object"
+        return
+    fi
+
+    local missing="" ev
+    for ev in SessionStart PreToolUse PostToolUse Stop; do
+        jq -e --arg ev "$ev" '(.hooks[$ev] // []) | length > 0' "$hooks_file" >/dev/null 2>&1 || missing="${missing:+$missing, }$ev"
+    done
+    if [ -n "$missing" ]; then
+        _doctor_record "codex hooks" "warn" ".codex/hooks.json is stale, missing event(s): $missing -- regenerate with wv init-repo --agent=codex --codex-hooks --force"
+        return
+    fi
+
+    _doctor_record "codex hooks" "warn" ".codex/hooks.json covers SessionStart/PreToolUse/PostToolUse/Stop -- pending trust; review and trust with /hooks in Codex before it enforces"
+}
+
 cmd_hotzone() {
     local subcmd="${1:-}"
     shift || true
@@ -3348,6 +3399,7 @@ cmd_doctor() {
     if [ "$_dr_agent" = true ]; then
         _doctor_check_agent_env
         _doctor_check_codex_mcp
+        _doctor_check_codex_hooks
     fi
 
     # Summary
@@ -4875,8 +4927,13 @@ cmd_pattern_audit() {
     #   exempt (_wv_run_cache_is_exempt_cmd)
     # Unclassified commands are a latent cache-invalidation bug.
 
+    # Self-reference the checkout actually running this check, not whatever
+    # "wv" happens to resolve on PATH — a stale/newer installed binary can
+    # have a different dispatch table than a git-worktree or historical-tag
+    # checkout, producing a false FAIL (wv-dfaa75). Same fallback convention
+    # as _hook_active_id/_wv_concurrent_session.
     local wv_bin
-    wv_bin="${WV:-$(command -v wv 2>/dev/null || echo "")}"
+    wv_bin="${WV:-${WV_CLI:-$SCRIPT_DIR/wv}}"
     local wv_script
     wv_script=$(readlink -f "$wv_bin" 2>/dev/null || echo "$wv_bin")
 
@@ -5843,6 +5900,9 @@ cmd_help_topic() {
         query)
             cmd_query --help
             ;;
+        hook)
+            cmd_hook --help
+            ;;
         validate-finding)
             print_command_help "wv validate-finding <id>" "Validate finding metadata for a node. Exit 0 = valid; exit 1 = invalid. Outputs JSON {valid, errors[]}. Used by pre-close-verification hook to enforce violation_type and optional field constraints before a finding node can be closed."
             ;;
@@ -5898,7 +5958,7 @@ cmd_help_topic() {
             print_command_help "wv pending-close [--json]" "List nodes waiting for explicit overlap acknowledgement before close."
             ;;
         ready)
-            print_command_help "wv ready [--json] [--count] [--mode=bootstrap|discover|execute|full]" "List unblocked work, optionally as JSON or a count-only response."
+            print_command_help "wv ready [--json | --json-v2] [--count] [--all] [--with-impact] [--findings] [--subtree=<id>] [--mode=bootstrap|discover|execute|full]" "List unblocked work. --with-impact ranks by blast radius (wv impact per node); --subtree=<id> scopes to a node's descendants; --findings includes the findings digest."
             ;;
         list)
             print_command_help "wv list [--all] [--status=<status>] [--json | --json-v2] [--mode=bootstrap|discover|execute|full]" "List nodes, excluding done by default. Use --json-v2 for the lean parsed-metadata shape."
@@ -6096,6 +6156,7 @@ Commands:
   touch <id>        Silent metadata merge for per-turn intent updates
   allowed-tools     Read metadata.allowed_tools for a node [--json]
   quick             Create and close a trivial one-step node
+  hook dispatch     Host-neutral lifecycle hook dispatcher [--event=] [--json]
   block <id>        Add blocking edge (--by=<blocker>)
   link <from> <to>  Create semantic edge (--type=<type> [--weight=] [--context=])
   unlink <from> <to> Remove a semantic edge (--type=<type>)
@@ -6118,7 +6179,7 @@ Commands:
   audit-pitfalls    Show all pitfalls with resolution status
   pattern-audit     Audit source for recurring bug-pattern invariants [--json] [--strict]
   edge-types        List valid semantic edge types [--stats] [--json]
-  init-repo         Bootstrap repo for Weave [--agent=claude|copilot|codex|all] [--update] [--force]
+  init-repo         Bootstrap repo for Weave [--agent=claude|copilot|codex|all] [--codex-hooks] [--update] [--force]
   self-update       Refresh installed wv from the dev clone recorded at install time
   uninstall         Remove installed wv files (delegates to install.sh --uninstall)
   doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]
@@ -6216,6 +6277,7 @@ Examples:
   wv init-repo                                # bootstrap .claude/ for current repo (claude agent)
   wv init-repo --agent=copilot                # add VS Code Copilot config (.vscode/mcp.json + instructions)
   wv init-repo --agent=codex                  # add Codex setup contract (.codex/weave.json)
+  wv init-repo --agent=codex --codex-hooks    # opt in to project Codex lifecycle hooks
   wv init-repo --agent=all                    # claude, copilot, and codex
   wv init-repo --update                       # refresh managed files (skills, agents, instructions)
   wv init-repo --force                        # overwrite ALL files including user-customized

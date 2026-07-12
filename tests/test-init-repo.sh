@@ -272,6 +272,9 @@ assert_contains "$CODEX_JSON" '"default_registration": "weave-lite"' "codex: con
 assert_contains "$CODEX_JSON" '"full_requires": "--codex-mcp=full"' "codex: contract requires explicit full MCP"
 assert_contains "$CODEX_JSON" "Use CLI for GitHub sync" "codex: contract keeps network operations on CLI"
 assert_contains "$OUTPUT" 'codex mcp: skipped (use --codex-mcp to register weave-lite)' "codex: MCP registration is opt-in"
+assert_contains "$OUTPUT" 'codex hooks: skipped (use --codex-hooks to generate for review)' "codex: hooks are opt-in"
+assert_file_absent "$REPO_CODEX/.codex/hooks.json"             "codex: default init does not generate hooks"
+assert_contains "$CODEX_JSON" '"enabled": 0'                 "codex: default contract records hooks disabled"
 assert_contains "$CODEX_JSON" 'bootstrap-agent --json'       "codex: contract names bootstrap-agent"
 assert_contains "$CODEX_JSON" 'doctor --agent --json'        "codex: contract names agent doctor"
 CODEX_SCHEMA=$(jq -r '.schema' "$REPO_CODEX/.codex/weave.json")
@@ -315,6 +318,13 @@ CODEX_MCP_LOG="$TEST_DIR/codex-mcp-full.log" PATH="$FAKE_BIN:$PATH" \
     "$WV" init-repo --agent=codex --force --codex-mcp=full 2>&1 >/dev/null
 assert_contains "$(cat "$TEST_DIR/codex-mcp-full.log")" "mcp add weave" "codex: full MCP registration is explicit"
 assert_contains "$(cat "$TEST_DIR/codex-mcp-full.log")" "--scope=all" "codex: full MCP registration uses all scope"
+
+OUTPUT=$("$WV" init-repo --agent=codex --force --codex-hooks 2>&1)
+assert_file_exists "$REPO_CODEX/.codex/hooks.json"             "codex: --codex-hooks generates project hooks"
+assert_contains "$(cat "$REPO_CODEX/.codex/hooks.json")" '"PreToolUse"' "codex: hook config includes edit guard"
+assert_contains "$(cat "$REPO_CODEX/.codex/hooks.json")" 'hook dispatch --event=PostToolUse --json' "codex: hook config calls shared dispatcher"
+assert_contains "$(cat "$REPO_CODEX/.codex/weave.json")" '"enabled": 1' "codex: opt-in contract records hooks enabled"
+assert_contains "$OUTPUT" 'Review and trust these project hooks with /hooks' "codex: opt-in prints trust guidance"
 
 # --- --agent=all creates all supported agent surfaces ---
 echo ""
