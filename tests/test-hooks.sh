@@ -1063,6 +1063,37 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "stop-check: exits 0 (soft warn) with unpushed commits"
 assert_contains "$STDERR_OUT" "unpushed" "stop-check: warns about unpushed commits on stderr"
 
+# --- stop-check.sh: cross-agent active-node scoping (wv-86ea58) ---
+# Sandboxed Claude Code and Codex/Copilot/MCP sessions on the same repo can share
+# one hot zone. An active node claimed by a DIFFERENT agent must not hard-block
+# THIS session's stop-check; an active node claimed by THIS agent still must.
+echo ""
+echo "--- stop-check.sh (cross-agent active-node scoping) ---"
+setup_test_env
+git -C "$TEST_DIR/project" add -A 2>/dev/null
+git -C "$TEST_DIR/project" commit -m "test setup" -q 2>/dev/null
+rm -f "$(WV_PROJECT_DIR="$TEST_DIR/project" "$WV" hotzone --db 2>/dev/null | xargs dirname 2>/dev/null)/.stop_check_lock" 2>/dev/null || true
+
+# Foreign agent's active node (e.g. copilot/MCP identity) — must NOT block.
+WV_AGENT_ID="copilot-other-session" "$WV" add "foreign agent active node" --status=active --force \
+    --criteria="c1" --risks=low >/dev/null 2>&1
+
+set +e
+OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "stop-check: does not hard-block on a different agent's active node"
+
+# This session's OWN active node — must still hard-block.
+add_active_node "own agent active node" >/dev/null 2>&1
+
+set +e
+OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "1" "$EXIT_CODE" "stop-check: hard-blocks on this session's own active node"
+assert_contains "$OUTPUT" '"decision": "block"' "stop-check: emits block decision JSON for own active node"
+
 # --- session-end-sync.sh ---
 echo ""
 echo "--- session-end-sync.sh ---"

@@ -96,10 +96,25 @@ if [ "$WEAVE_DIRTY" -gt 0 ] && [ "$AHEAD" -eq 0 ]; then
     exit 0
 fi
 
-# Check for active nodes — genuine in-flight work, hard block regardless
+# Check for active nodes claimed by THIS agent — genuine in-flight work, hard
+# block regardless. Scoped by claimed_by, not a raw global count: a sandboxed
+# Claude Code session and a sandboxed Codex session on the same repo share one
+# hot zone (wv-86ea58), so an active node claimed by a DIFFERENT agent is that
+# agent's in-flight work, not this session's, and must not block this session
+# from ending. Unclaimed nodes still count (defensive default).
 if [ -x "${_WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
     _WV="${_WV:-wv}"
-    ACTIVE_COUNT=$("$_WV" query status=active --format=json 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
+    _SC_SELF=""
+    if command -v resolve_agent_id >/dev/null 2>&1; then
+        _SC_SELF=$(resolve_agent_id 2>/dev/null || echo "")
+    fi
+    if [ -n "$_SC_SELF" ]; then
+        ACTIVE_COUNT=$("$_WV" query status=active --format=json 2>/dev/null \
+            | jq --arg me "$_SC_SELF" '[.[] | select((.metadata.claimed_by // $me) == $me)] | length' 2>/dev/null || echo "0")
+    else
+        # Agent identity unavailable — fall back to the pre-fix global count.
+        ACTIVE_COUNT=$("$_WV" query status=active --format=json 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
+    fi
     if [ "$ACTIVE_COUNT" -gt 0 ]; then
         if [ "$_SC_IN_COOLDOWN" = true ]; then
             echo "Note: $ACTIVE_COUNT active node(s) — close with wv done before ending session (cooldown active)." >&2

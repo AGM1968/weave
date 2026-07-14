@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+## [1.69.1] - 2026-07-14
+
+### Fixed
+
+- **Cross-agent stop-hook scoping** - the Claude stop hook now blocks only active work claimed by
+  the current agent (or unclaimed work), so parallel sandboxed Claude, Codex, Copilot, and MCP
+  sessions sharing a Weave hot zone no longer prevent each other from ending normally.
+
 ## [1.69.0] - 2026-07-12
 
 ### Added
@@ -119,7 +127,7 @@
   `install.sh` left the installed copy stale and only surfaced at commit time. `wv bootstrap` now
   emits an install-drift advisory at session start (every harness — Claude, Codex, Copilot), and the
   git pre-commit hook self-heals the drift, backed by a single helper in `wv-config.sh` shared by
-  the CLI and the hook.
+  the CLI and the hook (wv-a77603).
 
 ### Changed
 
@@ -127,18 +135,18 @@
   active node touches tracked files but `quality.db` is missing/un-scanned now also surfaces as a
   non-blocking `wv bootstrap` advisory, so agents scan during work instead of being blocked at the
   finish line. Reuses the close gate's own `_preflight_policy_readiness` evaluator; the close gate
-  is unchanged and stays authoritative.
+  is unchanged and stays authoritative (wv-7fbc0f).
 - **`/tmp/weave-codex-<uid>` documented as the shared sandboxed-runtime hot zone** — comment-only
   alignment clarifying that Claude Code, Codex, and Copilot all use it (via `is_sandboxed_runtime`);
-  only native/human shells use `/dev/shm/weave`. The `-codex` name is historical.
+  only native/human shells use `/dev/shm/weave`. The `-codex` name is historical (wv-22b037).
 - **Edit-target read caveat encoded into the context-load policy** — `context-guard.sh` and the
   consumer templates now state that shell reads (`cat`/`grep`/`sed`) and code-search do not satisfy
-  harness edit-guards; only a native read of the edit target does.
+  harness edit-guards; only a native read of the edit target does (wv-60eb0d).
 
 ### Fixed
 
 - **`wv load` no longer flags no-op deltas as corrupt** — comment-only "no-op UPDATE" deltas are
-  intentional and are no longer reported as corruption via a two-stage grep.
+  intentional and are no longer reported as corruption via a two-stage grep (wv-607e9b).
 
 ## [1.64.0] - 2026-06-25
 
@@ -147,14 +155,14 @@
 - **Cross-harness agent-source attribution** — telemetry now records which harness originated a `wv`
   call (Claude, Codex, VS Code Copilot) honestly across machines. Codex and Copilot are attested via
   host markers rather than guessed, behind a documented cross-harness call-source contract
-.
+  (wv-276c18 epic: wv-8af785, wv-67517b).
 - **Agent identity separated from hot-zone placement** — `resolve_agent_id` (identity) and
   `is_sandboxed_runtime` (placement) are now independent axes, and the run-cache key includes
-  identity so concurrent Claude/Codex agents no longer leak each other's cached results.
+  identity so concurrent Claude/Codex agents no longer leak each other's cached results (wv-727175).
 - **Graph memory crystallized into Codex and Copilot surfaces** — `wv memory render --agent=codex`
   writes `.codex/weave.json` and `--agent=copilot` writes a managed block in
   `.github/copilot-instructions.md`, projecting active `type=memory` nodes plus recall/capture
-  guidance so cross-harness agents discover and recall graph memory.
+  guidance so cross-harness agents discover and recall graph memory (wv-de2ac7).
 - **Dev-only `md2pdf-hook.sh`** — syncs PDF copies of docs on `.md` change (development tooling).
 - **Repair Workflow guidance in the shipped `WORKFLOW.md`** — documents turning detected workflow
   defects into tracked remediation and the resumable `needs_human_verification` close, so consumers'
@@ -172,7 +180,7 @@
 - **Delta-replay durability** — `wv load` no longer reverts a newer `state.sql` when replaying stale
   local deltas. Node upserts now apply only when `excluded.updated_at >= nodes.updated_at`, and node
   UPDATE deltas carry an `updated_at` guard. Prevents cross-agent double-claims after a fresh
-  hot-zone load.
+  hot-zone load (wv-875c72).
 - **Session-start snapshot guard** — the session-start hook refuses to commit a `.weave` snapshot
   smaller than HEAD, so a stale-DB shrink can no longer clobber the committed graph.
 - **MCP server test suite isolated from the live Weave graph**, so running the MCP tests no longer
@@ -350,19 +358,19 @@
   returned `unknown option: --mode=discover`. Pre-existing since the `wvRead` introduction (v1.58.0
   had the same call); surfaced by the codex v1.59.0 verification. Handler now calls `wv()` directly,
   and the parity suite gained a `weave_query` DB-read execution smoke so read-path breakage can no
-  longer hide behind the shell-out smoke.
+  longer hide behind the shell-out smoke (wv-0b281b).
 
 ## [1.59.0] - 2026-06-12
 
 ### Added
 
-- **MCP tier-3 parity flags exposed**: `weave_query.include`, `weave_health.history`,
+- **MCP tier-3 parity flags exposed** (wv-db8aeb): `weave_query.include`, `weave_health.history`,
   `weave_recover.session`, `weave_sync.dry_run`, `weave_record_edit.intent`/`.metadata` (now
   requires only `id` plus one payload), `weave_plan.template` (standalone template emit), and
   `weave_quality_patterns` gains the `promote` subcommand with `parent`/`dry_run` — promote was
   absent from the enum entirely. Parity baseline 41 -> 32; every remaining line is a deliberate
   exclusion, the EXPOSE debt is retired.
-- **Table-driven MCP dispatch**: the 850-line `handleTool` switch (CC 237, the repo's
+- **Table-driven MCP dispatch** (wv-8e217e): the 850-line `handleTool` switch (CC 237, the repo's
   worst function) is now a `Record<string, ToolHandler>` map — 45 entries, each handler returning
   result text or a full response envelope for enforcement paths. The `mcp/src/index.ts` quality-gate
   exemption is retired; no function in the file exceeds CC 20. Tier-2 parity flags exposed in the
@@ -371,7 +379,7 @@
   as code-path flags already covered by `weave_code_search`. Parity baseline 43 -> 41.
 - **Pattern-audit Check 7** — non-predicate Bash functions ending in a bare `[ cond ] && cmd` tail
   are now flagged, preventing implicit status leaks from becoming control-flow contracts.
-- **MCP tier-1 parity flags exposed**: `weave_add` gains `criteria`/`risks` (claim-ready
+- **MCP tier-1 parity flags exposed** (wv-4a1de6): `weave_add` gains `criteria`/`risks` (claim-ready
   node creation per decomposition discipline), `weave_quick` gains `learning`, `weave_ship` gains
   `verification_method`/`verification_evidence`, and `weave_done` gains `verification_evidence` —
   agentic closes over MCP can now attach evidence instead of drawing the post-close advisory. Parity
@@ -384,37 +392,37 @@
   (`WV_DB_CUSTOM`); the done-trail writer lacked the same guard, so closing a scratch-graph node
   from a repo cwd dirtied real trail state. Same skip applied; explicit `wv trails save` is
   unaffected. Known limitation recorded: the MCP Vitest harness (async piped spawn) is incompatible
-  with the Codex sandbox — verify MCP there via `tests/test-mcp-parity.sh` instead.
+  with the Codex sandbox — verify MCP there via `tests/test-mcp-parity.sh` instead (wv-90415f).
 - **MCP `tools/call` failed entirely in sandboxed Node (Codex).** `spawnSync` there reports
   `error.code=EPERM` from a post-spawn probe even when the child ran and exited 0; the `wv()`
   wrapper treated any `error` as fatal. Errors are now fatal only when `status === null` (the spawn
   itself failed). The parity test gained an execution smoke (`tools/call weave_guide`) so
-  spawn-layer breakage can no longer hide behind green schema/list parity.
+  spawn-layer breakage can no longer hide behind green schema/list parity (wv-5fe41b).
 - **`wv done --verification-method` was parsed but undocumented**, hiding it from `--help` — and
   therefore from the parity test, whose CLI contract is the help text. Now documented, plus exposed
-  and forwarded as `weave_done.verification_method`.
+  and forwarded as `weave_done.verification_method` (wv-5fe41b).
 - **`bootstrap-agent` telemetry claimed `scope: "persistent"` when instrumentation was disabled**,
   and the append probe created the default log file as a side effect. Now reports
   `enabled`/`writable` separately with `scope: disabled|persistent|unavailable`; when disabled the
-  probe is side-effect-free.
+  probe is side-effect-free (wv-5fe41b).
 - **Direct test execution on bare-PATH sandboxes**: `tests/test-schema-contract.sh` self-appends
   user tool dirs (poetry discovery), matching `scripts/wv` and the Makefile; pylint's stats cache
-  moved to a writable tmp dir, removing EROFS warning noise.
+  moved to a writable tmp dir, removing EROFS warning noise (wv-5fe41b).
 - **Call-log instrumentation leaked bash redirection errors on unwritable `WV_CALL_LOG`.** The
   `2>/dev/null` came after the `>>` open, so read-only filesystems (Codex sandbox EROFS) printed
   `Read-only file system` on every `wv` invocation. The append is now a braced group with stderr
-  silenced before the open; regression tests cover unwritable and writable paths.
+  silenced before the open; regression tests cover unwritable and writable paths (wv-ac0f6a).
 - **`make check` failed at command discovery in sandbox shells.** Codex-style shells omit
   `~/.local/bin`/`~/.cargo/bin` from PATH, so `poetry` and `wv` were unfindable. The Makefile and
   `Makefile.template` now append both dirs — the same fallback `scripts/wv` applies for itself;
-  documented in the WORKFLOW/AGENTS/CLAUDE templates.
+  documented in the WORKFLOW/AGENTS/CLAUDE templates (wv-3b6b4a).
 - **`bootstrap-agent` quality readiness probed a nonexistent `quality_scans` table**, reporting
   `tools.quality.ready=false` after a successful scan. Now probes `scan_meta`, the actual scan-run
-  table, matching the `search --code` readiness path.
+  table, matching the `search --code` readiness path (wv-031d20).
 - **`bootstrap-agent` telemetry block claimed `scope: "persistent"` without checking writability.**
   In read-only sandboxes new calls were silently unrecorded while `analyze sessions` read stale host
   data. The block now runs a real append probe and reports `writable` plus a warning and
-  `scope: "unavailable"` when the log path cannot be opened.
+  `scope: "unavailable"` when the log path cannot be opened (wv-031d20).
 
 ## [1.58.0] - 2026-06-11
 
@@ -426,36 +434,36 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   metadata write interpolated jq-built JSON raw into SQL; an apostrophe broke the statement, the
   unchecked write failed silently, and the node closed without evidence — the post-close advisory
   then blamed the caller. Now escaped like every sibling write AND rc-checked: a failed metadata
-  write aborts the close loudly. Apostrophe round-trip regression test added (A3-1,).
+  write aborts the close loudly. Apostrophe round-trip regression test added (A3-1, wv-c85280).
 - **Hotspot threshold unified across three divergent definitions.** Scan summary counted all-scope,
   the report queried `WHERE hotspot > 0` then scope-filtered, and health-info hardcoded `0.5` — the
   summary claimed crossers the report hid. New `count_hotspots()` is the single owner of
   scope+threshold semantics; `top_hotspots()` applies the threshold in SQL; summary count and report
-  list now share one filter (A2-1,).
+  list now share one filter (A2-1, wv-c85280).
 - **`weave_guide` MCP enum allowed only 5 of the CLI's 10 guide topics** despite shelling out to
   `wv guide`. Enum extended to all 10; stale topic lists in AGENTS/copilot/WORKFLOW templates
-  updated to match (A1-5,).
+  updated to match (A1-5, wv-4c1279).
 
 ### Changed
 
 - **The bash CLI is now production scope in quality views.** `.weave/quality.conf [classify]`
   promotes `scripts/cmd`, `scripts/lib`, `scripts/wv` — hotspots now surface the real crossers
   (wv-cmd-ops.sh 0.89, wv-cmd-core.sh 0.64) instead of hiding the product. Quality score drops
-  accordingly; threshold/exemption recalibration is deliberate future work (A2-2,).
+  accordingly; threshold/exemption recalibration is deliberate future work (A2-2, wv-4c1279).
 - **`wv --help` lists the five shipped-but-undocumented commands:** `impact`, `hotzone`,
   `pattern-audit`, `validate-finding`, `test-record`; `discovery` added to the guide-topic line.
-  Help-surface test extended (A1-1,).
+  Help-surface test extended (A1-1, wv-4c1279).
 - **Session retro guidance prescribes `--since-days=1 --source=agent`** in close-session skill,
   WORKFLOW template, WEAVE.md, and agent docs — unfiltered call-stats are dominated by cheap hook
   calls and misread as agent behavior. WEAVE.md's stale `source` field values corrected to
-  `agent|shell|hook|sync|test`.
+  `agent|shell|hook|sync|test` (wv-e7192c).
 
 ### Hygiene
 
 - ARCHITECTURE.md: MCP tool count corrected (31 → 45), dead `make wv-compliance` claim removed,
-  header retitled as a dated baseline snapshot (A1-2/3/6,).
+  header retitled as a dated baseline snapshot (A1-2/3/6, wv-d1d38b).
 - Legacy `scripts/sync-weave-gh.sh` archived to `archive/scripts/`; `test-gh-stress.sh` repointed.
-  Stray root `quality.db` and `9127bf5c/` hash-bug artifact removed (A1-4, A2-4,).
+  Stray root `quality.db` and `9127bf5c/` hash-bug artifact removed (A1-4, A2-4, wv-d1d38b).
 
 ## [1.57.0] - 2026-06-10
 
@@ -464,30 +472,30 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 - **Stale-signal gate on findings promotion.** `wv findings promote` now accepts `--since-days N`
   (default 30) and refuses to promote findings whose evidence is older than the threshold. Prevents
   stale findings from entering the graph with misleading urgency. Override with `--force`
-.
+  (wv-9074c6).
 - **`wv uninstall` command.** Removes Weave from `~/.local/bin/`, `~/.local/lib/weave/`,
   `~/.config/weave/`, and optionally `.weave/` in the current repo. Documented lifecycle companion
-  to `wv init-repo`. Install help updated to surface the command.
+  to `wv init-repo`. Install help updated to surface the command (wv-fb34e1).
 
 ### Fixed
 
 - **Write-time enum guard for `finding.violation_type`.** `wv update` now validates
   `finding.violation_type` against the canonical enum at write time, not only at close time.
-  Prevents invalid violation types from entering the DB silently.
+  Prevents invalid violation types from entering the DB silently (wv-dc9f3e).
 - **Pattern C finding schema reconciled.** `violation_type` enum expanded with `measurement-gap`;
   `historical:tooling` remapped to `historical:defect`. Flat→nested schema inconsistency resolved
-.
+  (wv-01c378).
 - **`wv sync --gh` defaults to fast mode.** Omitting `--mode` previously defaulted to `--mode=full`
   (exhaustive reconcile across entire graph), which under GH auth failures created duplicate issues
   and left done nodes with open GH issues. Default is now `--mode=fast` (routine close path). Use
-  `--mode=full` deliberately for periodic reconcile.
+  `--mode=full` deliberately for periodic reconcile (wv-54db11).
 - **`uninstall` classified as exempt in run-cache registry.** `wv pattern-audit` Check 1 now passes
   cleanly. Gate clock for Pattern A Rust port reset to 2026-06-10; not-before date 2026-06-24
-.
+  (wv-bdee9e).
 - **`wv list --json` emits `created_at`/`updated_at` fields.** Stale-node UTC parse fixed for
-  downstream consumers that calculate node age.
+  downstream consumers that calculate node age (wv-7f08a1).
 - **Telemetry call-log four-count correctness.** `WV_CALL_LOG` entry counts corrected for
-  session-analysis consumers.
+  session-analysis consumers (wv-1ccd51).
 
 ## [1.56.1] - 2026-06-09
 
@@ -496,15 +504,15 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 - **Sentinel now differentiates clean-close from true crash.** A sentinel with an empty active-node
   list writes an informational note only; a CRASH RECOVERY trail entry is only written when active
   nodes were in-flight at session end. Eliminates false crash entries in trails.md from normal
-  terminal closes after `/close-session`.
+  terminal closes after `/close-session` (wv-bd6184).
 - **Floor-guard blocks codex-sandbox checkpoint-over-truth data loss.** `_sync_floor_guard_ok()`
   refuses to overwrite `state.sql` when the new dump contains fewer than `WV_SYNC_FLOOR_RATIO`
   (default 0.70) of the committed node count. Wired into both `cmd_sync` and `auto_sync`. Bypass for
   intentional shrinks via `--force` or `WV_FORCE_SYNC=1`. Root cause and recovery procedure
-  documented in `docs/findings/sandbox-checkpoint-over-truth.md`.
+  documented in `docs/findings/sandbox-checkpoint-over-truth.md` (wv-5494e2).
 - **weave-guide, epic-planner skills updated with placeholder IDs and repair workflow.** Fixes
   workflow examples to use `wv-XXXXXX` placeholder IDs and adds a Repair Workflow section.
-  `test-crash-sentinel.sh` updated to match new informational-message behavior.
+  `test-crash-sentinel.sh` updated to match new informational-message behavior (wv-443cd8).
 
 ## [1.56.0] - 2026-06-07
 
@@ -540,7 +548,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   caller quirks (`--limit=` equals-form, IN-list quoting, impact done-seed). Steers agents toward
   targeted 600-token reads instead of 12k-token `wv list` bulk dumps.
 - **`wv init-repo` reports code-index status.** Setup summary now appends a line showing whether
-  `wv index` has been run; fresh repos display `Run: wv index.` so agents do not silently lose
+  `wv index` has been run; fresh repos display `Run: wv index .` so agents do not silently lose
   `wv search --code` capability.
 - **Session-close retro surfaces top command by token cost.** The stop hook emits a soft note
   showing the highest-cost command from `wv analyze sessions --call-stats` when session analysis is
@@ -1133,7 +1141,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 ### Fixed
 
 - **`wv unarchive` INSERT into generated columns** — `priority` and `type` in the nodes table are
-  `GENERATED ALWAYS AS... VIRTUAL`; SQLite rejects INSERTs that name them. Removed from INSERT
+  `GENERATED ALWAYS AS ... VIRTUAL`; SQLite rejects INSERTs that name them. Removed from INSERT
   column list.
 - **`wv unarchive` set-e last-statement trap** — Two `[ -n "$r_alias" ] && echo` patterns at
   function boundaries returned exit 1 when alias was empty. Replaced with `if/fi` guards.
@@ -1226,11 +1234,11 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   the fallback — correct for new and test zones; only explicit wrong-owner files trigger rejection.
 
 - **Size-check subshell export guard** — `_WV_SIZE_CHECKED` was set but not exported, so pipe
-  subshells (e.g. `cmd_context "$id" --json | jq.`) inherited an empty value and re-fired the
+  subshells (e.g. `cmd_context "$id" --json | jq .`) inherited an empty value and re-fired the
   auto-prune check. Changed to `export _WV_SIZE_CHECKED=1`.
 
 - **`wv context` pretty-prints without `--json`** — previously errored when called without `--json`.
-  Now self-calls with `--json` and pipes through `jq.` for human-readable output.
+  Now self-calls with `--json` and pipes through `jq .` for human-readable output.
 
 - **Code indexer excludes `archive/` directory and `venv_*` prefixes** — `wv search --code` was
   indexing archived proposal docs (dominating code search results) and virtual-environment
@@ -1318,7 +1326,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   hooks touching themselves on invocation, and (b) excluding `.claude/hooks/`, `.claude/skills/`,
   and `.claude/agents/` from the dirty-file scope entirely. The deadlock was self-defeating: the
   very `wv ship` invocation that should close the node re-triggered the hooks that dirtied the
-  files. Filed as `docs/findings/ship-clean-tree-gate-self-defeating.md`.
+  files. Filed as `docs/findings/ship-clean-tree-gate-self-defeating.md` (wv-4ab15e).
 - **`wv load` fails when state.sql contains benign SQLite runtime errors** — `sqlite3` exits 1 on
   non-fatal errors during import (e.g. malformed JSON in a generated column check) even when all
   rows were imported successfully. The load guard treated any non-zero exit as a corrupt dump and
@@ -1657,7 +1665,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 ### Deferred
 
 - **M3 — signed install manifest**: proposal-scope (GPG vs cosign + build-release.sh changes).
-
+  Tracked as `wv-fecd7c`.
 
 ## [1.41.2] - 2026-04-19
 
@@ -1698,7 +1706,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   `tests/test_weave_gh_phases.py::test_finding_nodes_are_skipped`.
 - **`.claude/scheduled_tasks.lock` tracked in git**: the Claude Code scheduler creates and removes
   this transient lock file each session; it was committed once and every session opened with a
-  `D.claude/scheduled_tasks.lock` entry in `git status`, masking real changes. Added to
+  `D .claude/scheduled_tasks.lock` entry in `git status`, masking real changes. Added to
   `.gitignore` (plus `.claude/*.lock` glob) and removed from the index via `git rm --cached`.
 
 ### Docs
@@ -1771,7 +1779,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   a single UPDATE — atomic, SQL-native, no silent fallback. Matches the `--remove-key` path (already
   `json_remove`-based). Regression tests cover empty→new, preserve+add, apostrophe round-trip,
   unicode + literal `||`, invalid-JSON rejection, and immediate update-then-claim readiness.
-- **`auto_checkpoint` + `wv sync` commit hijack (H1.T3)**: both paths ran `git add.weave/` then
+- **`auto_checkpoint` + `wv sync` commit hijack (H1.T3)**: both paths ran `git add .weave/` then
   committed whatever was staged — absorbing user-prestaged files into a generic
   `chore(weave): auto-checkpoint HH:MM` or `sync state` commit, silently rewriting named work. Both
   paths now enumerate staged files first and skip the commit (with a stderr warning) if any
@@ -1791,11 +1799,11 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   nodes that exist and are properly planned. Retrying passes immediately; each false block costs one
   model turn. Hook now fails open: if `wv show` returns zero rows, exit 0 silently and let `wv work`
   itself surface the clearer "node not found" error. Regression test in `test-hooks.sh` covers an
-  unknown-ID payload. (H1.T1b).
+  unknown-ID payload. Closes wv-cc197a (H1.T1b).
 - **`bash-dedup.sh` false-positive classification**: the hook classified long-running commands via
   substring regex over the raw `tool_input.command`. Anchors like
   `(^|[;[:space:]])make[[:space:]]+check` matched real invocations but also matched inside quoted
-  argument text — e.g. a `wv done --learning="... ran make check 572/572..."` would acquire the
+  argument text — e.g. a `wv done --learning="... ran make check 572/572 ..."` would acquire the
   `make-build` lock and hard-block the next unrelated command for up to 10 minutes. Hook now strips
   `"..."` / `'...'` regions before classifying, so structural anchors see only outer shell syntax.
   Npm/poetry patterns gained the same command-start anchor the others already had. Regression table
@@ -1919,7 +1927,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   directory are brought up to date from `~/.config/weave/hooks/` in a single command. Reports how
   many hooks were updated vs already current.
 - **`wv doctor` hook drift message**: Now says `run: wv init-repo --update` instead of
-  `run./install.sh` — the correct command for repos without `install.sh` on PATH.
+  `run ./install.sh` — the correct command for repos without `install.sh` on PATH.
 - **`wv doctor --repair` handles hook drift**: Copies stale hooks from `~/.config/weave/hooks/` into
   the project `.claude/hooks/` (pull direction). Clears drift in one step.
 
@@ -2033,7 +2041,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 - **Multi-agent delta replay — INSERT OR REPLACE alias collision**: `wv_delta_changeset` emitted
   `INSERT OR REPLACE INTO nodes(...)` for delta INSERTs. SQLite OR REPLACE deletes the conflicting
   row before inserting, so a node sharing a unique alias with the incoming row would be silently
-  deleted. Changed to `INSERT INTO... ON CONFLICT(id) DO UPDATE` targeting the primary key only.
+  deleted. Changed to `INSERT INTO ... ON CONFLICT(id) DO UPDATE` targeting the primary key only.
 - **Multi-agent delta replay — FTS shadow table filter removed**: Line-based grep filter for
   `nodes_fts`/`sqlite_sequence` rows was unsafe against multi-line SQL literals. Removed —
   `wv_delta_changeset` never emits FTS shadow tables so the filter was dead code and a risk.
@@ -2183,7 +2191,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 
 ### Fixed
 
-- **`wv sync` state.sql size**: FTS5 index was included in `sqlite3.dump` output, inflating
+- **`wv sync` state.sql size**: FTS5 index was included in `sqlite3 .dump` output, inflating
   state.sql from ~300KB to 55MB. The dump now excludes FTS shadow tables (`nodes_fts*`,
   `edges_fts*`), reducing state.sql by ~99%.
 
@@ -2218,7 +2226,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 ### Added
 
 - **`bash-dedup.sh` / `bash-dedup-post.sh` hooks**: PreToolUse/PostToolUse pair that prevents
-  duplicate long-running Bash commands (make check, wv sync --gh, git push,./install.sh, npm,
+  duplicate long-running Bash commands (make check, wv sync --gh, git push, ./install.sh, npm,
   pytest). Uses per-repo lock files with TTL-based expiry for background commands.
 
 ### Fixed
@@ -2263,10 +2271,10 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 ### Fixed
 
 - **Sync sequence correctness**: `wv sync --gh` writes to `.weave/`, so `git push` without an
-  intervening `git add.weave/ && git commit` left graph state uncommitted after push — causing the
+  intervening `git add .weave/ && git commit` left graph state uncommitted after push — causing the
   stop-hook to re-fire on every subsequent response.
 - **`stop-check.sh`**: blocking message now instructs the full 3-step sequence
-  (`wv sync --gh && git add.weave/ && git commit → git push`) when `.weave/` is dirty; AHEAD-only
+  (`wv sync --gh && git add .weave/ && git commit → git push`) when `.weave/` is dirty; AHEAD-only
   case simplified to `git push`.
 - **`Makefile.template` `wv-push` target**: added conditional commit before `git push`.
 - **`session_lifecycle.py` `quit_hygiene_state`**: `ahead > 0` early return now checks
@@ -2564,7 +2572,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 ### Fixed
 
 - **`wv tree`** — `--root` now correctly anchors CTE in text and JSON modes (regression from
-  v1.24.0). Root cause: `$([ cond ] && echo...)` inside assignment returns exit 1 under `set -e`,
+  v1.24.0). Root cause: `$([ cond ] && echo ...)` inside assignment returns exit 1 under `set -e`,
   silently killing `cmd_tree`. Fixed with `if/fi` guard.
 - **`wv ready --subtree`** — CTE uses `UNION` instead of `UNION ALL` to prevent duplicate node IDs
   from diamond dependencies.
@@ -2653,7 +2661,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 
 - **GH title truncation** — GitHub issue titles now truncated correctly.
 - **Stop hook `.weave/` exclusion** — Broadened to exclude all `.weave/` files, not just deltas.
-- **`wv-init-repo`.gitattributes** — Uses marker block with full template; strips orphaned comments
+- **`wv-init-repo` .gitattributes** — Uses marker block with full template; strips orphaned comments
   from partial upgrades.
 
 ## [1.23.0] - 2026-03-16
@@ -2784,7 +2792,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 - **Bash CC parser: structural brace matching** — `line.count("{") - line.count("}")` counted braces
   inside strings (`"${var}"`), parameter expansions (`${#arr[@]}`), and jq expressions as
   structural. Fixed by only counting `{` on function-definition lines and `}` on standalone lines.
-- **Bash CC parser: one-liner functions** — `func() {...; }` style definitions had no standalone
+- **Bash CC parser: one-liner functions** — `func() { ...; }` style definitions had no standalone
   closing `}`, causing function ranges to extend to EOF. Fixed by detecting `}` at end of the
   definition line.
 - **Bash CC parser: heredoc content** — `}` inside heredocs (e.g. JSON in `cat << EOF`) was counted
@@ -2828,7 +2836,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   or refresh the Weave block in existing CLAUDE.md files without overwriting project content.
 - **AGENTS.md.template** — new generic stub (23 lines) replaces shipping memory-system's 205-line
   development reference to the public repo.
-- **build-release.sh** — CLAUDE.md, AGENTS.md, and.github/copilot-instructions.md all generated
+- **build-release.sh** — CLAUDE.md, AGENTS.md, and .github/copilot-instructions.md all generated
   from templates at build time (no longer ships memory-system-specific copies).
 
 ## [1.17.0] - 2026-03-06
@@ -2838,7 +2846,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 - **VS Code hook enforcement** — hook scripts now handle both Claude Code tool names
   (`Edit`/`Write`/`Bash`) and VS Code tool names (`create_file`/`replace_string_in_file`/
   `run_in_terminal`). The `SHOULD_CHECK` filter in `pre-action.sh` and `tool_input` property
-  extraction (`.file_path //.filePath`) cover both ecosystems. VS Code ignores matchers (all hooks
+  extraction (`.file_path // .filePath`) cover both ecosystems. VS Code ignores matchers (all hooks
   fire on every tool), so this script-level fix closes the enforcement gap for `@copilot`.
 
 - **Minimal copilot-instructions stub** — `wv init-repo --agent=copilot` now generates a 10-line
@@ -3352,15 +3360,15 @@ MCP server now exposes 28 tools (was 23). All scope assignments updated. 24/24 M
 
 ### Fixed
 
-- **Sync data loss prevention**: All 3 `sqlite3.dump` sites (auto_sync, cmd_sync, post-GH re-dump)
+- **Sync data loss prevention**: All 3 `sqlite3 .dump` sites (auto_sync, cmd_sync, post-GH re-dump)
   now use `.timeout 5000` to wait for write locks instead of returning empty. `cmd_sync` also guards
   against empty dumps before overwriting `state.sql`.
-- **Context pitfall scoping**: Replaced blocks-only ancestry CTE with bidirectional
+- **Context pitfall scoping (wv-517f)**: Replaced blocks-only ancestry CTE with bidirectional
   neighborhood walk across all edge types (depth-limited to 4 hops). Pitfalls linked via
   `implements`/`addresses` edges are now included in context packs.
-- **Health check false penalty**: Added `blocked-external` to allowed status set so
+- **Health check false penalty (wv-01e7)**: Added `blocked-external` to allowed status set so
   legitimate nodes don't trigger health score deductions.
-- **Context ancestors diamond dedup**: Changed `cmd_context` ancestors CTE from
+- **Context ancestors diamond dedup (wv-77cd)**: Changed `cmd_context` ancestors CTE from
   `UNION ALL` to `UNION` to prevent duplicate ancestors in diamond dependency graphs.
 - **Test hygiene**: Promoted 13 `assert_xfail` tests to real assertions — 0 known bugs remain in the
   stress test suite.
@@ -3498,7 +3506,7 @@ MCP server now exposes 28 tools (was 23). All scope assignments updated. 24/24 M
   passive advisory. Choosing `d` or `s` prevents the learning from being saved; `a` proceeds.
   Non-TTY fallback preserves the original hint line.
 - **Epic commit aggregation**: `wv done` now stores related commit SHAs (via `git log --grep`) in
-  node metadata as `commits: ["abc1234",...]`. When a task has a parent epic (via `implements`
+  node metadata as `commits: ["abc1234", ...]`. When a task has a parent epic (via `implements`
   edge), child commits are aggregated onto the epic node incrementally. Enables navigating from epic
   to all implementing commits.
 - **CLOSE phase mandatory gate**: `/weave` SKILL.md Phase 4 now has an explicit
@@ -3514,7 +3522,7 @@ MCP server now exposes 28 tools (was 23). All scope assignments updated. 24/24 M
 - **`wv plan --gh` secondary rate limit**: CLI already had `sleep 1` between GH issue creates (added
   in 067d50a); the MCP path now also has a sufficient timeout to complete large plans without
   `ETIMEDOUT`.
-- **ShellCheck SC2015**: `_aggregate_epic_commits` call now uses `if/fi` instead of `&&... || true`
+- **ShellCheck SC2015**: `_aggregate_epic_commits` call now uses `if/fi` instead of `&& ... || true`
   to avoid the false-positive where the `|| true` arm runs when the condition is true but the
   command fails.
 
@@ -3597,7 +3605,7 @@ MCP server now exposes 28 tools (was 23). All scope assignments updated. 24/24 M
 
 - **`wv-init-repo --update`**: Updates managed files (hooks, skills, agents,
   copilot-instructions.md) in existing repos without overwriting user-customized files (CLAUDE.md,
-  settings.local.json,.vscode/mcp.json). Use `--force` to overwrite everything.
+  settings.local.json, .vscode/mcp.json). Use `--force` to overwrite everything.
 - **All 16 skills shipped**: `wv-init-repo` now installs all 16 skills (was 3). Includes weave,
   weave-audit, sanity-check, ship-it, pre-mortem, plan-agent, zero-in, wv-clarify-spec,
   wv-decompose-work, wv-detect-loop, wv-guard-scope, wv-verify-complete, breadcrumbs, close-session,
