@@ -194,6 +194,7 @@ _bootstrap_agent_tools_json() {
 
     jq -n \
         --arg wv "$wv_token" \
+        --arg wv_raw "$wv_command" \
         --arg ast_grep_path "$ast_grep_path" \
         --arg ast_grep_version "$ast_grep_version" \
         --argjson ast_grep_ready "$ast_grep_ready" \
@@ -224,6 +225,39 @@ _bootstrap_agent_tools_json() {
             impact: {
                 command: ($wv + " impact <id> --json --quality"),
                 warmup: ($wv + " quality scan . --json")
+            },
+            discovery_routing: {
+                procedure: ($wv + " guide --procedure=discovery-routing"),
+                locate_work: [
+                    {
+                        operation: "search",
+                        argv_template: [$wv_raw, "search", "{topic}", "--json"],
+                        placeholders: {topic: "graph work topic, for example auth"}
+                    },
+                    {
+                        operation: "query",
+                        argv_template: [$wv_raw, "query", "{predicate}", "--format=json"],
+                        placeholders: {predicate: "one exact predicate, for example status=active"}
+                    }
+                ],
+                uncertain_or_cross_node: [
+                    {operation: "context", argv_template: [$wv_raw, "context", "{node_id}", "--json"]},
+                    {operation: "discover", argv_template: [$wv_raw, "discover", "{node_id}", "--json"]},
+                    {operation: "impact", argv_template: [$wv_raw, "impact", "{node_id}", "--json"]}
+                ],
+                unfamiliar_implementation: {
+                    operation: "search_code",
+                    argv_template: [$wv_raw, "search", "--code", "{concept}", "--graph", "--json"]
+                },
+                broad_edit: {
+                    operation: "impact_files",
+                    argv_template: [$wv_raw, "impact", "--files={targets}", "--json"],
+                    placeholders: {targets: "comma-separated repository-relative paths"}
+                },
+                hotspot: [
+                    {operation: "quality_functions", argv_template: [$wv_raw, "quality", "functions", "{file}", "--json"]},
+                    {operation: "quality_patterns", argv_template: [$wv_raw, "quality", "patterns", "scan", "{scope}", "--json"]}
+                ]
             },
             ast_grep: {
                 command: ($wv + " quality structural-search --pattern=<pattern> --lang=python --json"),

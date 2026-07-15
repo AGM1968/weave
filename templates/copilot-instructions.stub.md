@@ -99,6 +99,14 @@ wv search --code "query" --mode=fts  # exact tokens / function names
 
 MCP equivalent: `weave_code_search` (parameters: `query`, `mode`, `limit`, `graph`).
 
+## Conditional discovery routing
+
+Use `wv search "<topic>"` then exact `wv query` predicates to locate graph work. For uncertain or
+cross-node work: `wv context <id> --json` → `wv discover <id> --json` → `wv impact <id>`. Use
+`wv search --code "<concept>" --graph` for unfamiliar implementation, `wv impact --files=<targets>`
+before broad edits, and `wv quality functions <file>` plus `wv quality patterns scan <scope>` on
+hotspots. Canonical procedure: `wv guide --procedure=discovery-routing`.
+
 ## Reference
 
 - MCP: `weave_guide` (topics: workflow, github, learnings, context, routing, mcp, verification,

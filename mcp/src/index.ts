@@ -42,7 +42,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { execFileSync, spawnSync } from "child_process";
-import { accessSync, appendFileSync, constants, mkdirSync } from "fs";
+import { accessSync, appendFileSync, constants, existsSync, mkdirSync, statSync } from "fs";
 import { dirname } from "path";
 
 // --- Scope definitions ---
@@ -115,29 +115,60 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
   ],
 };
 
+// Stable startup error taxonomy. Each code maps to a fixed exit status so
+// callers (health checks, process supervisors) can branch on the number
+// without parsing message text; the message itself is still carried for
+// humans via STARTUP_ERROR.detail / --health-check's "detail" field.
+export type StartupErrorCode = "invalid_scope" | "wv_not_found" | "bad_project_root" | "startup_failure";
+
+export const STARTUP_EXIT_CODES: Record<StartupErrorCode, number> = {
+  invalid_scope: 2,
+  wv_not_found: 3,
+  bad_project_root: 4,
+  startup_failure: 1,
+};
+
+let STARTUP_ERROR: { code: StartupErrorCode; message: string } | null = null;
+
+function failStartup(code: StartupErrorCode, message: string): void {
+  STARTUP_ERROR = STARTUP_ERROR || { code, message };
+  if (!HEALTH_CHECK) {
+    console.error(message);
+    process.exit(STARTUP_EXIT_CODES[code]);
+  }
+}
+
+const HEALTH_CHECK = process.argv.includes("--health-check");
+
 function parseScope(): Scope {
   const arg = process.argv.find((a) => a.startsWith("--scope="));
   if (!arg) return "all";
   const value = arg.split("=")[1] as Scope;
   if (!["graph", "session", "inspect", "lite", "all"].includes(value)) {
-    console.error(`Invalid scope "${value}". Valid: graph, session, inspect, lite, all`);
-    process.exit(1);
+    failStartup("invalid_scope", `Invalid scope "${value}". Valid: graph, session, inspect, lite, all`);
+    return "all"; // health-check mode: keep resolving remaining fields for the report
   }
   return value;
 }
 
 const ACTIVE_SCOPE = parseScope();
-const HEALTH_CHECK = process.argv.includes("--health-check");
 
-// Find wv CLI - check common locations
-function findWvPath(): string {
-  const paths = [
+// Find wv CLI - check common locations. Exported so tests can verify candidate
+// resolution without spawning a subprocess (the real dev-mode fallback below
+// always resolves inside this repo, so a full end-to-end "not found" spawn
+// can't be simulated without deleting/moving files).
+export function findWvCandidates(home: string | undefined, moduleDir: string): string[] {
+  return [
     process.env.WV_PATH,
-    `${process.env.HOME}/.local/bin/wv`,
+    home ? `${home}/.local/bin/wv` : undefined,
     "/usr/local/bin/wv",
     // Dev mode: relative to this package
-    `${__dirname}/../../scripts/wv`,
+    `${moduleDir}/../../scripts/wv`,
   ].filter(Boolean) as string[];
+}
+
+function findWvPath(): string {
+  const paths = findWvCandidates(process.env.HOME, __dirname);
 
   for (const p of paths) {
     try {
@@ -157,8 +188,19 @@ try {
   WV_PATH = findWvPath();
 } catch (error: unknown) {
   WV_PATH_ERROR = (error as Error).message;
-  if (!HEALTH_CHECK) throw error;
+  failStartup("wv_not_found", WV_PATH_ERROR);
 }
+
+function validateProjectRoot(): void {
+  const explicit = process.env.WV_PROJECT_ROOT || process.env.WV_PROJECT_DIR;
+  if (!explicit) return;
+  const ok = existsSync(explicit) && statSync(explicit).isDirectory();
+  if (!ok) {
+    failStartup("bad_project_root", `Project root "${explicit}" does not exist or is not a directory.`);
+  }
+}
+
+validateProjectRoot();
 
 // Default timeout for wv commands (30s). Sync handlers override this.
 const WV_TIMEOUT = 30_000;
@@ -187,11 +229,13 @@ function startupReport(status: "pass" | "fail" = "pass"): Record<string, unknown
   return {
     schema: "weave-mcp-startup.v1",
     status,
+    code: STARTUP_ERROR?.code ?? null,
+    detail: STARTUP_ERROR?.message ?? null,
     server: ACTIVE_SCOPE === "all" ? "weave" : `weave-${ACTIVE_SCOPE}`,
     scope: ACTIVE_SCOPE,
     tools: SCOPED_TOOLS.length,
     pid: process.pid,
-    version: "1.69.1",
+    version: "1.70.0",
     wv_path: WV_PATH || null,
     wv_path_error: WV_PATH_ERROR || null,
     project_root: resolveProjectRoot(),
@@ -2551,16 +2595,16 @@ function handleTool(name: string, args: Record<string, unknown>): ToolResponse {
 // Create and run server
 async function main() {
   if (HEALTH_CHECK) {
-    const status = WV_PATH_ERROR ? "fail" : "pass";
+    const status = STARTUP_ERROR ? "fail" : "pass";
     console.log(JSON.stringify(startupReport(status)));
-    process.exit(WV_PATH_ERROR ? 1 : 0);
+    process.exit(STARTUP_ERROR ? STARTUP_EXIT_CODES[STARTUP_ERROR.code] : 0);
   }
 
   const scopeLabel = ACTIVE_SCOPE === "all" ? "" : `-${ACTIVE_SCOPE}`;
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.69.1",
+      version: "1.70.0",
     },
     {
       capabilities: {
@@ -2632,7 +2676,14 @@ async function main() {
   console.error(`Weave MCP server started (scope=${ACTIVE_SCOPE}, ${SCOPED_TOOLS.length} tools)`);
 }
 
-main().catch((error) => {
-  console.error("Fatal error:", error);
-  process.exit(1);
-});
+// Guard so tests can `import` this module (e.g. to exercise findWvCandidates)
+// without starting the stdio server or re-running module-level startup checks
+// as a side effect. Every real invocation runs this file directly (`node
+// dist/index.js`, the package.json `bin` entry), so require.main === module
+// there; only an in-process require/import skips the auto-start.
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`[startup_failure] Fatal error: ${(error as Error).message ?? error}`);
+    process.exit(STARTUP_EXIT_CODES.startup_failure);
+  });
+}

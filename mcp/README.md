@@ -36,13 +36,13 @@ confusion.
 
 ### Scope definitions
 
-| Scope       | Tools                                                                                                                                                                                                                                                                                                                                                                                                          | Purpose                                    |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| **graph**   | `weave_add`, `weave_link`, `weave_unlink`, `weave_block`, `weave_unarchive`, `weave_done`, `weave_batch_done`, `weave_list`, `weave_resolve`, `weave_update`, `weave_touch`, `weave_record_edit`, `weave_delete` (13)                                                                                                                                                                                        | Create/modify/delete nodes and edges       |
-| **session** | `weave_work`, `weave_ready`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_close_session`, `weave_trails`, `weave_breadcrumbs` (deprecated alias), `weave_plan`, `weave_edit_guard` (12)                                                                                                                                                                           | Workflow lifecycle management              |
-| **lite**    | `weave_overview`, `weave_bootstrap`, `weave_guide`, `weave_edit_guard`, `weave_status`, `weave_work`, `weave_done` (7)                                                                                                                                                                                                                                                                                         | Minimal task-tracking surface              |
+| Scope       | Tools                                                                                                                                                                                                                                                                                                                                                                                                                          | Purpose                                    |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------ |
+| **graph**   | `weave_add`, `weave_link`, `weave_unlink`, `weave_block`, `weave_unarchive`, `weave_done`, `weave_batch_done`, `weave_list`, `weave_resolve`, `weave_update`, `weave_touch`, `weave_record_edit`, `weave_delete` (13)                                                                                                                                                                                                          | Create/modify/delete nodes and edges       |
+| **session** | `weave_work`, `weave_ready`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_close_session`, `weave_trails`, `weave_breadcrumbs` (deprecated alias), `weave_plan`, `weave_edit_guard` (12)                                                                                                                                                                                           | Workflow lifecycle management              |
+| **lite**    | `weave_overview`, `weave_bootstrap`, `weave_guide`, `weave_edit_guard`, `weave_status`, `weave_work`, `weave_done` (7)                                                                                                                                                                                                                                                                                                         | Minimal task-tracking surface              |
 | **inspect** | `weave_context`, `weave_search`, `weave_query`, `weave_status`, `weave_ready`, `weave_impact`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`, `weave_structural_search`, `weave_quality_patterns`, `weave_code_search`, `weave_index` (22) | Read-only observation and query            |
-| **all**     | All 45 tools                                                                                                                                                                                                                                                                                                                                                                                                   | Full access (default, backward-compatible) |
+| **all**     | All 45 tools                                                                                                                                                                                                                                                                                                                                                                                                                   | Full access (default, backward-compatible) |
 
 ### Scope lifecycle
 
@@ -50,13 +50,19 @@ The checked-in lifecycle is client-managed stdio: the MCP client starts each con
 process and restart/cleanup is done by restarting the client. `mcp/contract.json` is the
 machine-readable source of truth for these mappings.
 
-| Server          | Scope     | Start when                                                                                    | Intended clients                                  | Shipped |
-| --------------- | --------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------- | ------- |
-| `weave`         | `all`     | Default server for general interactive work or clients that cannot select narrower scopes      | Copilot chat, general MCP clients                 | yes     |
-| `weave-session` | `session` | Workflow lifecycle clients that need claim, edit guard, close, recovery, or handoff tools     | Copilot chat, workflow subagents                  | yes     |
-| `weave-lite`    | `lite`    | Constrained contexts that need only bootstrap/status/work/done/edit-guard basics              | Copilot chat, Codex optional, constrained agents  | yes     |
-| `weave-inspect` | `inspect` | Read-only research, review, audit, search, health, and quality inspection workflows           | Copilot chat, read-only subagents, review agents  | yes     |
-| `weave-graph`   | `graph`   | Optional local server for agents intentionally creating, linking, updating, or deleting graph nodes | Planning and graph-construction agents       | no      |
+This is deliberately diagnostic-only, not pidfile-based reuse. A stdio server's input and output
+pipes belong to the client that launched it, so another MCP client cannot safely attach to the same
+process. Reuse would require a separately designed broker or transport with ownership, cleanup, and
+access-control rules. `wv mcp-status` therefore reports missing or duplicate scopes and directs the
+operator to restart the owning client; it never attempts to adopt or kill a client-owned server.
+
+| Server          | Scope     | Start when                                                                                          | Intended clients                                 | Shipped |
+| --------------- | --------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------ | ------- |
+| `weave`         | `all`     | Default server for general interactive work or clients that cannot select narrower scopes           | Copilot chat, general MCP clients                | yes     |
+| `weave-session` | `session` | Workflow lifecycle clients that need claim, edit guard, close, recovery, or handoff tools           | Copilot chat, workflow subagents                 | yes     |
+| `weave-lite`    | `lite`    | Constrained contexts that need only bootstrap/status/work/done/edit-guard basics                    | Copilot chat, Codex optional, constrained agents | yes     |
+| `weave-inspect` | `inspect` | Read-only research, review, audit, search, health, and quality inspection workflows                 | Copilot chat, read-only subagents, review agents | yes     |
+| `weave-graph`   | `graph`   | Optional local server for agents intentionally creating, linking, updating, or deleting graph nodes | Planning and graph-construction agents           | no      |
 
 ### Design rationale
 
@@ -99,6 +105,22 @@ Invalid scope values cause the server to exit immediately with a non-zero exit c
 ```txt
 Invalid scope "bogus". Valid: graph, session, lite, inspect, all
 ```
+
+### Startup error codes
+
+Startup-time failures use a stable code -> exit-code mapping (also machine-readable in
+`mcp/contract.json` under `error_codes`), so a process supervisor or `--health-check` caller can
+branch on the number without parsing message text:
+
+| Code               | Exit code | Meaning                                                                    | Remediation                                                               |
+| ------------------ | --------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `invalid_scope`    | 2         | `--scope` value is not one of the supported scopes                         | Pass one of: `graph`, `session`, `inspect`, `lite`, `all`                 |
+| `wv_not_found`     | 3         | The `wv` CLI binary could not be located on any known path                 | Set `WV_PATH`, or run `./install.sh` so `~/.local/bin/wv` exists          |
+| `bad_project_root` | 4         | `WV_PROJECT_ROOT`/`WV_PROJECT_DIR` is set but doesn't exist                | Point it at a valid checkout, or unset it to fall back to the process cwd |
+| `startup_failure`  | 1         | Unexpected exception during startup (e.g. stdio transport connect failure) | Check stderr for the underlying exception; retry or file an issue         |
+
+These codes surface in two places: the process exit code, and — when the failure happens before the
+stdio transport connects — the `code`/`detail` fields of the `--health-check` report (see below).
 
 ## Client Configuration
 
@@ -333,15 +355,15 @@ plus targeted code review as the fallback signal.
 
 ## Environment Variables
 
-| Variable               | Description                                                                   | Default             |
-| ---------------------- | ----------------------------------------------------------------------------- | ------------------- |
-| `WV_PATH`              | Path to wv CLI binary                                                         | Auto-detected       |
-| `WV_PROJECT_ROOT`      | Repo root passed to MCP-spawned `wv` commands                                 | Current process cwd |
-| `WV_AGENT_ID`          | Explicit Weave claim/provenance identity for MCP-spawned `wv` commands        | Auto-detected       |
-| `WV_ACTIVE`            | Active node ID (inherited by tools)                                           | —                   |
-| `WV_MCP_CALL_LOG`      | JSONL sink for per-response MCP telemetry                                     | Disabled            |
-| `WV_MCP_ALLOW_NETWORK` | Allow MCP lifecycle tools to run GitHub/network sync directly (`1` = enabled) | Disabled            |
-| `WV_MCP_STARTUP_REPORT` | Emit structured startup JSON to stderr (`1` = enabled)                       | Disabled            |
+| Variable                | Description                                                                   | Default             |
+| ----------------------- | ----------------------------------------------------------------------------- | ------------------- |
+| `WV_PATH`               | Path to wv CLI binary                                                         | Auto-detected       |
+| `WV_PROJECT_ROOT`       | Repo root passed to MCP-spawned `wv` commands                                 | Current process cwd |
+| `WV_AGENT_ID`           | Explicit Weave claim/provenance identity for MCP-spawned `wv` commands        | Auto-detected       |
+| `WV_ACTIVE`             | Active node ID (inherited by tools)                                           | —                   |
+| `WV_MCP_CALL_LOG`       | JSONL sink for per-response MCP telemetry                                     | Disabled            |
+| `WV_MCP_ALLOW_NETWORK`  | Allow MCP lifecycle tools to run GitHub/network sync directly (`1` = enabled) | Disabled            |
+| `WV_MCP_STARTUP_REPORT` | Emit structured startup JSON to stderr (`1` = enabled)                        | Disabled            |
 
 Startup/readiness checks:
 
@@ -351,7 +373,9 @@ node mcp/dist/index.js --scope=lite --health-check
 
 The health check prints a `weave-mcp-startup.v1` JSON object with scope, tool count, `wv` path,
 project root, agent identity, telemetry settings, and process id, then exits without starting the
-stdio server.
+stdio server. On failure, `status` is `"fail"` and `code`/`detail` are populated from the
+[startup error codes](#startup-error-codes) table above; the process exit code also matches that
+table (e.g. exit 3 for `wv_not_found`). On success both `code` and `detail` are `null`.
 
 `--instrument` prints payload and call summaries to stderr for local debugging.
 `WV_MCP_CALL_LOG=/path/to/mcp_calls.jsonl` persists each MCP response as JSONL with `source=mcp`,

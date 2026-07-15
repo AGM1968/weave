@@ -79,6 +79,7 @@ _INIT_DIR="$TEST_DIR/init-setup"
 mkdir "$_INIT_DIR"
 cd "$_INIT_DIR"
 git init -q
+git config commit.gpgsign false
 git remote add origin "$BARE_REPO"
 cat > .gitattributes << 'GITATTR'
 .weave/state.sql merge=ours -diff
@@ -97,6 +98,7 @@ _reg_drivers() {
     git -C "$1" config merge.theirs.driver "cp %B %A"
     git -C "$1" config user.email test@test.com
     git -C "$1" config user.name test
+    git -C "$1" config commit.gpgsign false
 }
 
 # Helper: generate a production-format delta from _warp_changes using

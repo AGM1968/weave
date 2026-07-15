@@ -50,6 +50,30 @@ wv search --code "query" --graph          # include active Weave nodes per file
 
 MCP equivalent: `weave_code_search` (parameters: `query`, `mode`, `limit`, `graph`).
 
+## Conditional discovery routing
+
+Use the shared `discovery-routing` procedure when scope is uncertain or crosses nodes/modules:
+
+```bash
+# Locate graph work.
+wv search "auth"
+wv query status=active --format=json
+
+# Investigate uncertain or cross-node work.
+wv context wv-abc123 --json
+wv discover wv-abc123 --json
+wv impact wv-abc123 --json
+
+# Use these when their conditions apply.
+wv search --code "authentication" --graph
+wv impact --files=src/auth.py,src/session.py --json
+wv quality functions src/auth.py --json
+wv quality patterns scan src --json
+```
+
+`bootstrap` and `context` already provide bounded discovery; use direct `discover` when they surface
+material uncertainty. Canonical procedure: `wv guide --procedure=discovery-routing`.
+
 ## Full documentation
 
 - **MCP:** `weave_guide` (topics: workflow, github, learnings, context, routing, mcp, verification, instrumentation, config, discovery)

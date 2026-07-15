@@ -29,6 +29,13 @@ and code-search are inspection only and do not satisfy edit-guards (editing a fi
 blocked, "File has not been read").
 Focused CLI help: `wv help <command>` or `wv <command> --help`.
 
+**Conditional discovery:** locate graph work with `wv search "<topic>"` then exact `wv query`
+predicates. For uncertain/cross-node work use `wv context <id> --json` → `wv discover <id> --json`
+→ `wv impact <id>`; use `wv search --code "<concept>" --graph` for unfamiliar implementation,
+`wv impact --files=<targets>` before broad edits, and `wv quality functions <file>` plus
+`wv quality patterns scan <scope>` on hotspots. Full procedure:
+`wv guide --procedure=discovery-routing`.
+
 Optional fast gate: edit the scaffolded `scripts/test-impacted.sh` CONFIG block and route sources
 to it in `.weave/test-map.conf` (`src/ = scripts/test-impacted.sh`) for impact-scoped pre-commit
 tests; apply `.weave/ci-weave-paths-ignore.snippet.yml` to skip CI on pure-`.weave/` pushes. See

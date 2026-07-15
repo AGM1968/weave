@@ -196,50 +196,61 @@ fi
 START_TIME=$(date +%s)
 
 if [ "$PARALLEL" = true ]; then
-    echo -e "${YELLOW}Running ${#SUITES[@]} test suites in parallel...${NC}"
+    # Suites create isolated databases and temporary Git repositories. Launching
+    # every suite at once exhausts sandbox resources and causes mid-suite exits.
+    MAX_PARALLEL="${WV_TEST_JOBS:-4}"
+    if ! [[ "$MAX_PARALLEL" =~ ^[1-9][0-9]*$ ]]; then
+        echo -e "${RED}Error: WV_TEST_JOBS must be a positive integer${NC}" >&2
+        exit 2
+    fi
+    echo -e "${YELLOW}Running ${#SUITES[@]} test suites in batches of $MAX_PARALLEL...${NC}"
     echo ""
-    
-    # Run all suites in background
-    declare -a PIDS
+
+    # Run bounded batches so resource-heavy suites cannot starve one another.
     run_id=$$
-    for suite in "${SUITES[@]}"; do
-        script="${suite%%:*}"
-        (bash "$SCRIPT_DIR/$script" > "/tmp/wv-test-${run_id}-$script.out" 2>&1) &
-        PIDS+=($!)
-    done
+    for ((batch_start=0; batch_start<${#SUITES[@]}; batch_start+=MAX_PARALLEL)); do
+        declare -a PIDS=()
+        batch_end=$((batch_start + MAX_PARALLEL))
+        [ "$batch_end" -gt "${#SUITES[@]}" ] && batch_end="${#SUITES[@]}"
 
-    # Wait for all to complete
-    for i in "${!SUITES[@]}"; do
-        suite="${SUITES[$i]}"
-        script="${suite%%:*}"
-        name="${suite#*:}"
-        pid="${PIDS[$i]}"
+        for ((i=batch_start; i<batch_end; i++)); do
+            script="${SUITES[$i]%%:*}"
+            (bash "$SCRIPT_DIR/$script" > "/tmp/wv-test-${run_id}-$script.out" 2>&1) &
+            PIDS+=($!)
+        done
 
-        wait "$pid" && exit_code=0 || exit_code=$?
+        for ((i=batch_start; i<batch_end; i++)); do
+            suite="${SUITES[$i]}"
+            script="${suite%%:*}"
+            name="${suite#*:}"
+            pid="${PIDS[$((i - batch_start))]}"
 
-        output=$(cat "/tmp/wv-test-${run_id}-$script.out" 2>/dev/null || echo "")
-        rm -f "/tmp/wv-test-${run_id}-$script.out"
+            wait "$pid" && exit_code=0 || exit_code=$?
+
+            output=$(cat "/tmp/wv-test-${run_id}-$script.out" 2>/dev/null || echo "")
+            rm -f "/tmp/wv-test-${run_id}-$script.out"
         
         # Parse results (strip ANSI codes first)
-        clean_output=$(echo "$output" | sed 's/\x1b\[[0-9;]*m//g')
-        if echo "$clean_output" | grep -qE "[0-9]+/[0-9]+ passed"; then
-            result_line=$(echo "$clean_output" | grep -E "[0-9]+/[0-9]+ passed" | tail -1)
-            passed=$(echo "$result_line" | grep -oE '[0-9]+' | head -1)
-            tests=$(echo "$result_line" | grep -oE '[0-9]+' | sed -n '2p')
-        else
-            passed=0
-            tests=0
-        fi
+            clean_output=$(echo "$output" | sed 's/\x1b\[[0-9;]*m//g')
+            if echo "$clean_output" | grep -qE "[0-9]+/[0-9]+ passed"; then
+                result_line=$(echo "$clean_output" | grep -E "[0-9]+/[0-9]+ passed" | tail -1)
+                passed=$(echo "$result_line" | grep -oE '[0-9]+' | head -1)
+                tests=$(echo "$result_line" | grep -oE '[0-9]+' | sed -n '2p')
+            else
+                passed=0
+                tests=0
+            fi
         
-        TOTAL_PASSED=$((TOTAL_PASSED + passed))
-        TOTAL_TESTS=$((TOTAL_TESTS + tests))
+            TOTAL_PASSED=$((TOTAL_PASSED + passed))
+            TOTAL_TESTS=$((TOTAL_TESTS + tests))
         
-        if [ "$exit_code" -ne 0 ]; then
-            FAILED_SUITES+=("$name")
-            echo -e "  ${RED}✗${NC} $name: $passed/$tests tests"
-        else
-            echo -e "  ${GREEN}✓${NC} $name: $passed/$tests tests"
-        fi
+            if [ "$exit_code" -ne 0 ]; then
+                FAILED_SUITES+=("$name")
+                echo -e "  ${RED}✗${NC} $name: $passed/$tests tests"
+            else
+                echo -e "  ${GREEN}✓${NC} $name: $passed/$tests tests"
+            fi
+        done
     done
 else
     echo -e "${YELLOW}Running ${#SUITES[@]} test suites...${NC}"

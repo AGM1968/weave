@@ -5,10 +5,11 @@
  */
 
 import { spawn, spawnSync, ChildProcess } from "child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { findWvCandidates } from "./index";
 
 const SERVER_PATH = resolve(__dirname, "../dist/index.js");
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -307,6 +308,91 @@ describe("Weave MCP startup health", () => {
     expect(payload.agent_id).toBe("mcp-test-agent");
     expect(payload.project_root).toBe(resolve(__dirname, "../.."));
     expect(payload.wv_path).toBe(resolve(__dirname, "../../scripts/wv"));
+    expect(payload.code).toBeNull();
+    expect(payload.detail).toBeNull();
+  });
+
+  it("reports invalid_scope with a stable exit code and health-check code/detail", () => {
+    const env = { ...process.env, WV_PATH: resolve(__dirname, "../../scripts/wv") };
+
+    const plain = spawnSync("node", [SERVER_PATH, "--scope=bogus"], { encoding: "utf-8", env });
+    if (plain.error?.message.includes("EPERM")) {
+      console.warn("Skipping invalid-scope subprocess assertion: nested node spawn is blocked by this sandbox");
+      return;
+    }
+    expect(plain.status).toBe(2);
+    expect(plain.stderr).toContain('Invalid scope "bogus"');
+
+    const health = spawnSync("node", [SERVER_PATH, "--scope=bogus", "--health-check"], { encoding: "utf-8", env });
+    expect(health.status).toBe(2);
+    const payload = JSON.parse(health.stdout.trim()) as Record<string, unknown>;
+    expect(payload.status).toBe("fail");
+    expect(payload.code).toBe("invalid_scope");
+    expect(payload.detail).toContain('Invalid scope "bogus"');
+  });
+
+  it("reports bad_project_root with a stable exit code and health-check code/detail", () => {
+    const env = {
+      ...process.env,
+      WV_PATH: resolve(__dirname, "../../scripts/wv"),
+      WV_PROJECT_ROOT: "/nonexistent-project-root-xyz",
+    };
+
+    const plain = spawnSync("node", [SERVER_PATH, "--scope=lite"], { encoding: "utf-8", env });
+    if (plain.error?.message.includes("EPERM")) {
+      console.warn("Skipping bad-project-root subprocess assertion: nested node spawn is blocked by this sandbox");
+      return;
+    }
+    expect(plain.status).toBe(4);
+    expect(plain.stderr).toContain("/nonexistent-project-root-xyz");
+
+    const health = spawnSync("node", [SERVER_PATH, "--scope=lite", "--health-check"], { encoding: "utf-8", env });
+    expect(health.status).toBe(4);
+    const payload = JSON.parse(health.stdout.trim()) as Record<string, unknown>;
+    expect(payload.status).toBe("fail");
+    expect(payload.code).toBe("bad_project_root");
+    expect(payload.detail).toContain("/nonexistent-project-root-xyz");
+  });
+
+  it("reports wv_not_found from an isolated distribution", () => {
+    // Copying the built entry point changes its module-relative development
+    // fallback without touching the real repository or executable.
+    const isolatedRoot = mkdtempSync(join(tmpdir(), "weave-mcp-no-wv-"));
+    const isolatedDist = join(isolatedRoot, "mcp", "dist");
+    const fakeHome = join(isolatedRoot, "home");
+    mkdirSync(isolatedDist, { recursive: true });
+    mkdirSync(fakeHome);
+    cpSync(SERVER_PATH, join(isolatedDist, "index.js"));
+
+    const priorWvPath = process.env.WV_PATH;
+    try {
+      const candidates = findWvCandidates("/nonexistent-home-xyz", "/nonexistent-module-dir-xyz");
+      expect(candidates.length).toBeGreaterThan(0);
+      for (const candidate of candidates) {
+        expect(existsSync(candidate)).toBe(false);
+      }
+      const result = spawnSync("node", [join(isolatedDist, "index.js"), "--scope=lite", "--health-check"], {
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          NODE_PATH: resolve(__dirname, "../node_modules"),
+          WV_PATH: "",
+        },
+      });
+      if (result.error?.message.includes("EPERM")) {
+        console.warn("Skipping missing-wv subprocess assertion: nested node spawn is blocked by this sandbox");
+        return;
+      }
+      expect(result.status).toBe(3);
+      const payload = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+      expect(payload.status).toBe("fail");
+      expect(payload.code).toBe("wv_not_found");
+      expect(payload.detail).toContain("wv CLI not found");
+    } finally {
+      if (priorWvPath !== undefined) process.env.WV_PATH = priorWvPath;
+      rmSync(isolatedRoot, { recursive: true, force: true });
+    }
   });
 });
 

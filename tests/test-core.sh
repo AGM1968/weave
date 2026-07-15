@@ -1053,6 +1053,13 @@ test_bootstrap_agent() {
         "bootstrap-agent exposes copy-pasteable quality warm-up using resolved wv"
     assert_equals "true" "$(echo "$bootstrap_json" | jq -r --arg wv "$PROJECT_ROOT/scripts/wv" '.agent.tools.code_search.command == ($wv + " search --code \"<query>\" --json")' 2>/dev/null || echo false)" \
         "bootstrap-agent documents code search entry point"
+    assert_equals "true" "$(echo "$bootstrap_json" | jq -r --arg wv "$PROJECT_ROOT/scripts/wv" '.agent.tools.discovery_routing.uncertain_or_cross_node == [{operation:"context",argv_template:[$wv,"context","{node_id}","--json"]},{operation:"discover",argv_template:[$wv,"discover","{node_id}","--json"]},{operation:"impact",argv_template:[$wv,"impact","{node_id}","--json"]}]' 2>/dev/null || echo false)" \
+        "bootstrap-agent exposes conditional discovery routing"
+    local spaced_wv spaced_routing
+    spaced_wv="$TEST_DIR/wv with spaces"
+    spaced_routing=$(bash -c 'source "$1"; _bootstrap_agent_tools_json "$2"' _ "$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh" "$spaced_wv")
+    assert_equals "$spaced_wv" "$(echo "$spaced_routing" | jq -r '.discovery_routing.uncertain_or_cross_node[0].argv_template[0]' 2>/dev/null || echo failed)" \
+        "bootstrap-agent keeps raw executable path in argv templates"
     assert_equals "true" "$(echo "$bootstrap_json" | jq -r '.agent.tools.ast_grep | has("ready")' 2>/dev/null || echo false)" \
         "bootstrap-agent reports ast-grep readiness without requiring availability"
     assert_equals "lite" "$(echo "$bootstrap_json" | jq -r '.agent.codex.mcp.recommended_scope // empty' 2>/dev/null || echo failed)" \

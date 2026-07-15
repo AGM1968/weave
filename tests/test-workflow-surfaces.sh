@@ -89,6 +89,56 @@ LEGACY_LEARNING_MATCHES=$(rg -n 'wv done .*--learning="pattern:|Brief learning n
 assert_equals "" "$LEGACY_LEARNING_MATCHES" "skills: no shorthand or nested learning examples remain"
 
 echo ""
+echo "--- discovery-routing projections ---"
+ROOT_AGENTS=$(cat "$PROJECT_ROOT/AGENTS.md")
+ROOT_CLAUDE=$(cat "$PROJECT_ROOT/CLAUDE.md")
+ROOT_COPILOT=$(cat "$PROJECT_ROOT/.github/copilot-instructions.md")
+ROUTING_SKILL=$(cat "$PROJECT_ROOT/.claude/skills/wv-discovery-routing/SKILL.md")
+
+assert_contains "$ROOT_AGENTS" 'wv guide --procedure=discovery-routing' "AGENTS: points to discovery routing procedure"
+assert_contains "$ROOT_CLAUDE" 'wv guide --procedure=discovery-routing' "Claude block: points to discovery routing procedure"
+assert_contains "$ROOT_COPILOT" 'wv guide --procedure=discovery-routing' "Copilot block: points to discovery routing procedure"
+assert_contains "$ROUTING_SKILL" '# Discovery Routing' "Claude skill: projects discovery routing procedure"
+assert_equals "true" "$(jq -r '[.procedures[]? | select(.id == "discovery-routing" and .managed == true)] | length == 1' "$PROJECT_ROOT/.codex/weave.json")" \
+    "Codex config: projects managed discovery routing procedure"
+
+visibility_override_ids() {
+    [ -f "$PROJECT_ROOT/.weave/procedures-visibility.conf" ] || return 0
+    awk '/^\[local\]/{inside=1; next} /^\[/{inside=0} inside {sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if ($0 != "") print}' \
+        "$PROJECT_ROOT/.weave/procedures-visibility.conf"
+}
+
+expected_projection_ids() { # adapter; emit procedure ids or Claude skill names
+    local adapter="$1" file id adapters visibility status skill
+    while IFS= read -r file; do
+        id=$(awk -F': *' '/^id:/{print $2; exit}' "$file")
+        adapters=$(awk -F': *' '/^adapters:/{print $2; exit}' "$file")
+        visibility=$(awk -F': *' '/^visibility:/{print $2; exit}' "$file"); visibility=${visibility:-local}
+        status=$(awk -F': *' '/^status:/{print $2; exit}' "$file"); status=${status:-ready}
+        [ "$visibility" = shared ] && [ "$status" = ready ] || continue
+        printf '%s\n' "$(visibility_override_ids)" | grep -qxF "$id" && continue
+        printf '%s' "$adapters" | tr -d '[]' | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -qxF "$adapter" || continue
+        if [ "$adapter" = claude ]; then
+            skill=$(awk -F': *' '/^claude_skill:/{print $2; exit}' "$file")
+            printf '%s\n' "$skill"
+        else
+            printf '%s\n' "$id"
+        fi
+    done < <(find "$PROJECT_ROOT/templates/procedures" -maxdepth 1 -name '*.md' -type f | sort)
+}
+
+EXPECTED_CODEX=$(expected_projection_ids codex | sort)
+ACTUAL_CODEX=$(jq -r '.procedures[]? | select(.managed == true) | .id' "$PROJECT_ROOT/.codex/weave.json" | sort)
+EXPECTED_CLAUDE=$(expected_projection_ids claude | sort)
+ACTUAL_CLAUDE=$(find "$PROJECT_ROOT/.claude/skills" -mindepth 2 -maxdepth 2 -name SKILL.md -type f -exec grep -lF 'WEAVE-MANAGED-SKILL' {} + | xargs -r -n1 dirname | xargs -r -n1 basename | sort)
+EXPECTED_COPILOT=$(expected_projection_ids copilot | sort)
+ACTUAL_COPILOT=$(awk '/BEGIN WEAVE PROCEDURES/{inside=1; next} /END WEAVE PROCEDURES/{inside=0} inside {sub(/^- /, ""); sub(/ —.*/, ""); if ($0 != "") print}' "$PROJECT_ROOT/.github/copilot-instructions.md" | sort)
+
+assert_equals "$EXPECTED_CODEX" "$ACTUAL_CODEX" "Codex: managed procedures exactly match canonical eligible set"
+assert_equals "$EXPECTED_CLAUDE" "$ACTUAL_CLAUDE" "Claude: managed skills exactly match canonical eligible set"
+assert_equals "$EXPECTED_COPILOT" "$ACTUAL_COPILOT" "Copilot: managed procedures exactly match canonical eligible set"
+
+echo ""
 echo "--- agents: claim flow and orchestrator entry ---"
 WEAVE_GUIDE=$(cat "$PROJECT_ROOT/.claude/agents/weave-guide.md")
 EPIC_PLANNER=$(cat "$PROJECT_ROOT/.claude/agents/epic-planner.md")

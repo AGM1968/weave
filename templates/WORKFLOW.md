@@ -171,6 +171,7 @@ installed canonical body — so a pointer never breaks after `wv init-repo`.
 | `graph-hygiene`  | Health checks, pruning, orphan classification, stale-node cleanup        | `wv guide --procedure=graph-hygiene`  |
 | `precommit-gate` | Impact-scoped pre-commit test gate + CI `.weave/` hygiene                | `wv guide --procedure=precommit-gate` |
 | `code-search`    | Two-surface code/graph search and `wv ready` re-ranking                  | `wv guide --procedure=code-search`    |
+| `discovery-routing` | Conditional graph, code, impact, and inspection routing                 | `wv guide --procedure=discovery-routing` |
 | `blindspot-pass` | Unknown-taxonomy pass before implementation with release and MCP probes  | `wv guide --procedure=blindspot-pass` |
 
 All procedure bodies live only in their canonical file and are reachable through their fallback.
