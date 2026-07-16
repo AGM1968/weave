@@ -1,0 +1,1 @@
+{"decision":"allow_with_advisories","event_id":"evt-3","graph_revision":42,"policy_revision":"policy-1","evidence_ids":["ev-2"],"reason_codes":["evidence_stale"],"affected_nodes":["wv-123abc"],"affected_files":[],"remediation":[{"action":"refresh_evidence"}],"host_mapping":null}

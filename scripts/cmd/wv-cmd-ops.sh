@@ -3205,7 +3205,7 @@ cmd_doctor() {
 
     # 11-12. Module checks
     _doctor_check_modules "lib modules" "$WV_LIB_DIR/lib" \
-        "wv-config.sh wv-db.sh wv-validate.sh wv-cache.sh wv-journal.sh wv-gh.sh wv-hook-common.sh wv-resolve-project.sh"
+        "wv-config.sh wv-db.sh wv-validate.sh wv-cache.sh wv-journal.sh wv-gh.sh wv-delta.sh wv-delta-catalog.sh wv-checkpoint-generation.sh wv-hook-common.sh wv-resolve-project.sh"
     _doctor_check_modules "cmd modules" "$WV_LIB_DIR/cmd" \
         "wv-cmd-core.sh wv-cmd-graph.sh wv-cmd-data.sh wv-cmd-ops.sh wv-cmd-quality.sh"
 

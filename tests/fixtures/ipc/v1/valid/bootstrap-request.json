@@ -1,0 +1,1 @@
+{"protocol_version":"weave.ipc.v1","operation":"bootstrap","request_id":"boot-1","repository":{"canonical_root":"/repo","repository_id":"git:0123456789abcdef0123456789abcdef01234567","worktree_id":"git-worktree:0123456789abcdef0123456789abcdef01234567"},"actor":{"id":"a","kind":"ci","harness":"test","instance_id":"i","attestation":"none"},"timeout_ms":1,"payload":{"limit":10}}

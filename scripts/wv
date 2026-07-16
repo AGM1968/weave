@@ -69,6 +69,8 @@ source "$WV_LIB_DIR/lib/wv-cache.sh"
 source "$WV_LIB_DIR/lib/wv-journal.sh"
 source "$WV_LIB_DIR/lib/wv-gh.sh"
 source "$WV_LIB_DIR/lib/wv-delta.sh"
+source "$WV_LIB_DIR/lib/wv-delta-catalog.sh"
+source "$WV_LIB_DIR/lib/wv-checkpoint-generation.sh"
 
 # Source command modules
 source "$WV_LIB_DIR/cmd/wv-cmd-core.sh"

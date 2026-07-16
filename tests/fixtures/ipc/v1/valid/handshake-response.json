@@ -1,0 +1,1 @@
+{"protocol_version":"weave.ipc.v1","operation":"handshake","request_id":"req-1","server_version":"1.70.0","selected_protocol_version":"weave.ipc.v1","server_capabilities":[{"name":"protocol.handshake.v1","version":"1"}],"result":{"selected_protocol_version":"weave.ipc.v1","server_capabilities":[{"name":"protocol.handshake.v1","version":"1"}]},"advisories":[]}

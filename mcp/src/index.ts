@@ -235,7 +235,7 @@ function startupReport(status: "pass" | "fail" = "pass"): Record<string, unknown
     scope: ACTIVE_SCOPE,
     tools: SCOPED_TOOLS.length,
     pid: process.pid,
-    version: "1.70.0",
+    version: "1.70.1",
     wv_path: WV_PATH || null,
     wv_path_error: WV_PATH_ERROR || null,
     project_root: resolveProjectRoot(),
@@ -2604,7 +2604,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.70.0",
+      version: "1.70.1",
     },
     {
       capabilities: {

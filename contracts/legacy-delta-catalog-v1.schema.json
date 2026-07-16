@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://weave.dev/contracts/legacy-delta-catalog-v1.schema.json",
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "generation": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "delta_path": {
+      "type": "string",
+      "pattern": "^deltas/([A-Za-z0-9][A-Za-z0-9._-]{0,127}/)*[A-Za-z0-9][A-Za-z0-9._-]{0,127}\\.sql$"
+    },
+    "archive_path": {
+      "type": "string",
+      "pattern": "^legacy-deltas/v1/([A-Za-z0-9][A-Za-z0-9._-]{0,127}/)*[A-Za-z0-9][A-Za-z0-9._-]{0,127}\\.sql$"
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw_sha256", "original_path", "archived_path", "disposition"],
+      "properties": {
+        "raw_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "original_path": {
+          "$ref": "#/$defs/delta_path"
+        },
+        "archived_path": {
+          "$ref": "#/$defs/archive_path"
+        },
+        "disposition": {
+          "const": "incorporated"
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "checkpoint_generation", "entries"],
+  "properties": {
+    "format": {
+      "const": "weave.legacy-delta-catalog.v1"
+    },
+    "checkpoint_generation": {
+      "$ref": "#/$defs/generation"
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    }
+  }
+}

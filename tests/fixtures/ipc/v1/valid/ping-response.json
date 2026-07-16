@@ -1,0 +1,1 @@
+{"protocol_version":"weave.ipc.v1","operation":"ping","request_id":"ping-1","server_version":"1.70.0","selected_protocol_version":"weave.ipc.v1","server_capabilities":[],"result":{"service":"weave","protocol_version":"weave.ipc.v1"},"advisories":[]}

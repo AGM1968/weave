@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://weave.dev/contracts/delta-operation-v2.schema.json",
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "status_value": {
+      "type": "string",
+      "enum": ["todo", "ready", "active", "blocked", "done"]
+    },
+    "claimed_by_value": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "risk_level_value": {
+      "type": "string",
+      "enum": ["none", "low", "medium", "high"]
+    },
+    "status_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected", "value"],
+      "properties": {
+        "expected": {
+          "$ref": "#/$defs/status_value"
+        },
+        "value": {
+          "$ref": "#/$defs/status_value"
+        }
+      }
+    },
+    "claimed_by_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected", "value"],
+      "properties": {
+        "expected": {
+          "$ref": "#/$defs/claimed_by_value"
+        },
+        "value": {
+          "$ref": "#/$defs/claimed_by_value"
+        }
+      }
+    },
+    "risk_level_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected", "value"],
+      "properties": {
+        "expected": {
+          "$ref": "#/$defs/risk_level_value"
+        },
+        "value": {
+          "$ref": "#/$defs/risk_level_value"
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "operation_id",
+    "actor_id",
+    "actor_sequence",
+    "canonicalization",
+    "operation_sha256",
+    "payload"
+  ],
+  "properties": {
+    "format": {
+      "const": "weave.delta.v2"
+    },
+    "operation_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "actor_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "actor_sequence": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "canonicalization": {
+      "const": "weave.canonical-json.v1"
+    },
+    "operation_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity", "mutation"],
+      "properties": {
+        "entity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": {
+            "kind": {
+              "const": "node"
+            },
+            "id": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "mutation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "fields"],
+          "properties": {
+            "kind": {
+              "const": "node_patch"
+            },
+            "fields": {
+              "type": "object",
+              "additionalProperties": false,
+              "minProperties": 1,
+              "properties": {
+                "status": {
+                  "$ref": "#/$defs/status_patch"
+                },
+                "claimed_by": {
+                  "$ref": "#/$defs/claimed_by_patch"
+                },
+                "risk_level": {
+                  "$ref": "#/$defs/risk_level_patch"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

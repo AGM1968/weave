@@ -988,6 +988,88 @@ _cb_without=$(sqlite3 "$_rp/hz/brain.db" "SELECT json_extract(metadata,'\$.claim
 assert_equals "codex-replaybox" "$_cb_without" "claim is durable in state.sql (reverted only by delta replay)"
 rm -rf "$_rp"
 
+# ─── Durability replay: committed historical unconditional delta (wv-188ddc) ──
+# The freshness guard in wv_delta_changeset only protects deltas emitted after
+# wv-875c72.  A fresh clone can still contain older committed SQL using the
+# former unconditional INSERT OR REPLACE shape.  Keep this as an XFAIL until
+# replay has a catalog-level trust/causality rule; it must use cmd_load rather
+# than applying SQL directly so the evidence covers the real loader path.
+echo "-- durability: historical unconditional delta through fresh Git clone (wv-188ddc)"
+_hist_src=$(mktemp -d)
+_hist_clone=$(mktemp -d)
+rm -rf "$_hist_clone"
+(
+    cd "$_hist_src" && git init -q
+    _Hi=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_hist_src" "WV_HOT_ZONE=$_hist_src/hz" "WEAVE_DIR=$_hist_src/.weave"
+         WV_REQUIRE_LEARNING=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0 WV_AGENT_ID=codex-historical-replay)
+    "${_Hi[@]}" "$WV" init >/dev/null 2>&1
+    _hid=$("${_Hi[@]}" "$WV" add "historical delta baseline" --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | head -1)
+    # Publish a newer state.sql, then discard its generated deltas.  The only
+    # committed delta below is deliberately in the pre-guard SQL format.
+    sqlite3 "$_hist_src/hz/brain.db" "UPDATE nodes SET text='newer checkpoint value', status='ready', updated_at=200 WHERE id='$_hid';"
+    WV_FORCE_SYNC=1 "${_Hi[@]}" "$WV" sync >/dev/null 2>&1
+    rm -rf "$_hist_src/.weave/deltas"
+    mkdir -p "$_hist_src/.weave/deltas"
+    cat > "$_hist_src/.weave/deltas/100-000000-legacy.sql" <<EOF
+INSERT OR REPLACE INTO nodes(id,text,status,metadata,alias,created_at,updated_at)
+VALUES('$_hid','historical unconditional value','todo','{}',NULL,100,150);
+EOF
+    git add .weave
+    git -c commit.gpgsign=false -c user.name='Weave test' -c user.email='weave-test@example.invalid' commit -qm 'fixture: historical delta replay'
+    printf '%s' "$_hid" > "$_hist_src/.hid"
+) >/dev/null 2>&1 || true
+_hist_id=$(cat "$_hist_src/.hid" 2>/dev/null || echo "")
+git clone -q "$_hist_src" "$_hist_clone" 2>/dev/null || true
+_H=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_hist_clone" "WV_HOT_ZONE=$_hist_clone/hz" "WEAVE_DIR=$_hist_clone/.weave"
+    WV_REQUIRE_LEARNING=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0 WV_AGENT_ID=codex-historical-replay)
+_hist_load=$("${_H[@]}" "$WV" load 2>&1 || true)
+_hist_text=$(sqlite3 "$_hist_clone/hz/brain.db" "SELECT text FROM nodes WHERE id='$_hist_id';" 2>/dev/null || echo "")
+_hist_manifest=$(cat "$_hist_clone/.weave/.applied_deltas" 2>/dev/null || echo "")
+assert_contains "$_hist_load" "Replayed 1 delta(s)" "historical fixture replays through normal load"
+assert_contains "$_hist_manifest" "100-000000-legacy.sql" "historical replay is recorded observationally"
+assert_xfail "newer checkpoint value" "$_hist_text" "historical unconditional delta cannot revert newer snapshot"
+rm -rf "$_hist_src" "$_hist_clone"
+
+# ─── Durability replay: clock-skewed current delta (wv-188ddc) ──────────────
+# A guarded current-format delta still resolves conflicts by updated_at.  This
+# literal clone/load case keeps the causally newer checkpoint at 200 and gives
+# the remote delta a skewed wall clock of 300.  It documents the remaining
+# causality gap without pretending that timestamp LWW is a safe merge rule.
+echo "-- durability: clock-skewed delta through fresh Git clone (wv-188ddc)"
+_skew_src=$(mktemp -d)
+_skew_clone=$(mktemp -d)
+rm -rf "$_skew_clone"
+(
+    cd "$_skew_src" && git init -q
+    _Si=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_skew_src" "WV_HOT_ZONE=$_skew_src/hz" "WEAVE_DIR=$_skew_src/.weave"
+         WV_REQUIRE_LEARNING=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0 WV_AGENT_ID=codex-skew-replay)
+    "${_Si[@]}" "$WV" init >/dev/null 2>&1
+    _sid=$("${_Si[@]}" "$WV" add "clock skew baseline" --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | head -1)
+    sqlite3 "$_skew_src/hz/brain.db" "UPDATE nodes SET text='causally newer checkpoint', status='ready', updated_at=200 WHERE id='$_sid';"
+    WV_FORCE_SYNC=1 "${_Si[@]}" "$WV" sync >/dev/null 2>&1
+    rm -rf "$_skew_src/.weave/deltas"
+    mkdir -p "$_skew_src/.weave/deltas"
+    cat > "$_skew_src/.weave/deltas/300-000000-skew.sql" <<EOF
+INSERT INTO nodes(id,text,status,metadata,alias,created_at,updated_at)
+VALUES('$_sid','clock-skewed remote value','todo','{}',NULL,100,300)
+ON CONFLICT(id) DO UPDATE SET text=excluded.text,status=excluded.status,
+metadata=excluded.metadata,alias=excluded.alias,updated_at=excluded.updated_at
+WHERE nodes.updated_at IS NULL OR excluded.updated_at >= nodes.updated_at;
+EOF
+    git add .weave
+    git -c commit.gpgsign=false -c user.name='Weave test' -c user.email='weave-test@example.invalid' commit -qm 'fixture: clock-skew replay'
+    printf '%s' "$_sid" > "$_skew_src/.sid"
+) >/dev/null 2>&1 || true
+_skew_id=$(cat "$_skew_src/.sid" 2>/dev/null || echo "")
+git clone -q "$_skew_src" "$_skew_clone" 2>/dev/null || true
+_S=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_skew_clone" "WV_HOT_ZONE=$_skew_clone/hz" "WEAVE_DIR=$_skew_clone/.weave"
+    WV_REQUIRE_LEARNING=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0 WV_AGENT_ID=codex-skew-replay)
+_skew_load=$("${_S[@]}" "$WV" load 2>&1 || true)
+_skew_text=$(sqlite3 "$_skew_clone/hz/brain.db" "SELECT text FROM nodes WHERE id='$_skew_id';" 2>/dev/null || echo "")
+assert_contains "$_skew_load" "Replayed 1 delta(s)" "clock-skew fixture replays through normal load"
+assert_xfail "causally newer checkpoint" "$_skew_text" "clock-skewed timestamp cannot override causal checkpoint"
+rm -rf "$_skew_src" "$_skew_clone"
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════

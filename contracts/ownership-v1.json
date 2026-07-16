@@ -1,0 +1,1 @@
+{"version":"weave.ipc.v1","service":["live graph state",".weave serialization","delta replay","integrity","representation reconciliation"],"host_or_cli":["git fetch","git checkout","git merge","git add","git commit","git push"],"adapter":["GitHub issue projection"]}

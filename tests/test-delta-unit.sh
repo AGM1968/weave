@@ -246,6 +246,38 @@ fi
     || fail "T12b: manifest not written" "manifest non-empty: $(cat "$MANIFEST")"
 rm -f "$BAD_DELTA" "$REPLAY_DB" "$MANIFEST"
 
+# T13: A pre-checkpoint delta must not overwrite a newer snapshot row.
+# This is the fresh-clone replay shape: state.sql already has the later row,
+# while the committed delta history still contains an older update.
+RECV=$(make_recv)
+sqlite3 "$RECV" "INSERT INTO nodes(id,text,status,metadata,created_at,updated_at) VALUES('wv-stale','checkpoint value','ready','{}',100,200);"
+sqlite3 "$DB" "INSERT INTO nodes(id,text,status,metadata,created_at,updated_at) VALUES('wv-stale','old delta value','todo','{}',100,150);"
+CS=$(wv_delta_changeset "$DB")
+sqlite3 "$RECV" "$CS"
+stale_text=$(sqlite3 "$RECV" "SELECT text FROM nodes WHERE id='wv-stale';")
+stale_updated=$(sqlite3 "$RECV" "SELECT updated_at FROM nodes WHERE id='wv-stale';")
+[ "$stale_text" = "checkpoint value" ] && [ "$stale_updated" = "200" ] \
+    && ok "T13: stale delta cannot revert newer checkpoint row" \
+    || fail "T13: stale checkpoint replay" "text='$stale_text' updated_at='$stale_updated' CS=$CS"
+rm -f "$RECV"
+wv_delta_reset "$DB"
+
+# T14: The current conflict rule is deterministic wall-clock LWW. A skewed
+# sender with a later timestamp wins, which documents the remaining
+# cross-machine risk rather than treating it as causal ordering.
+RECV=$(make_recv)
+sqlite3 "$RECV" "INSERT INTO nodes(id,text,status,metadata,created_at,updated_at) VALUES('wv-skew','causally newer local','ready','{}',100,200);"
+sqlite3 "$DB" "INSERT INTO nodes(id,text,status,metadata,created_at,updated_at) VALUES('wv-skew','clock-skewed remote','todo','{}',100,300);"
+CS=$(wv_delta_changeset "$DB")
+sqlite3 "$RECV" "$CS"
+skew_text=$(sqlite3 "$RECV" "SELECT text FROM nodes WHERE id='wv-skew';")
+skew_updated=$(sqlite3 "$RECV" "SELECT updated_at FROM nodes WHERE id='wv-skew';")
+[ "$skew_text" = "clock-skewed remote" ] && [ "$skew_updated" = "300" ] \
+    && ok "T14: skewed timestamp deterministically wins under LWW" \
+    || fail "T14: clock-skew LWW semantics" "text='$skew_text' updated_at='$skew_updated' CS=$CS"
+rm -f "$RECV"
+wv_delta_reset "$DB"
+
 rm -f "$DB"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────

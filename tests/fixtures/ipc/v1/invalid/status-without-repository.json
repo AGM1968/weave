@@ -1,0 +1,1 @@
+{"protocol_version":"weave.ipc.v1","operation":"status","request_id":"bad-repo","actor":{"id":"a","kind":"ci","harness":"test","instance_id":"i","attestation":"none"},"timeout_ms":1,"payload":{}}

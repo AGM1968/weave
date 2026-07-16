@@ -1,0 +1,67 @@
+{
+  "format": "weave.canonical-json.v1",
+  "standard": "RFC8785",
+  "restrictions": [
+    "integer values only; non-integer JSON numbers are invalid",
+    "negative zero is invalid",
+    "lone Unicode surrogates are invalid"
+  ],
+  "vectors": [
+    {
+      "value": {
+        "actor_id": "replica-a",
+        "actor_sequence": 42,
+        "payload": {
+          "entity": {
+            "id": "wv-123abc",
+            "kind": "node"
+          }
+        }
+      },
+      "canonical_utf8": "{\"actor_id\":\"replica-a\",\"actor_sequence\":42,\"payload\":{\"entity\":{\"id\":\"wv-123abc\",\"kind\":\"node\"}}}",
+      "sha256": "6824c86c56cece32dc5133ef6c7a40296d60eea4d2ad183f5bade79e5110e72c"
+    },
+    {
+      "value": {
+        "😀": 1,
+        "": 2,
+        "a": 3
+      },
+      "canonical_utf8": "{\"a\":3,\"😀\":1,\"\":2}",
+      "sha256": "a901d5c9340048b768183fd6fb82e7d0f7792049a0aafa9d2c7ccd845d984ad3"
+    },
+    {
+      "value": {
+        "text": "line\nquote\"tab\t\u0001"
+      },
+      "canonical_utf8": "{\"text\":\"line\\nquote\\\"tab\\t\\u0001\"}",
+      "sha256": "e983236751ad802189d26b7a9f5e1d2e30de4a085b36abf6b4595f41093e783b"
+    },
+    {
+      "value": {
+        "n": 9007199254740991
+      },
+      "canonical_utf8": "{\"n\":9007199254740991}",
+      "sha256": "e1da48c6a6089f06ecb4e0a2259e658e3786b2420f52baccdf929ec6460d7b41"
+    },
+    {
+      "value": {
+        "emoji": "😀"
+      },
+      "canonical_utf8": "{\"emoji\":\"😀\"}",
+      "sha256": "4525cb52c6a0122eacc150bacd11eb4a1d4615485ca8a5639c28d70f1c240193"
+    }
+  ],
+  "invalid_vectors": [
+    {
+      "construct": "lone_high_surrogate",
+      "input_json": "\"\\ud800\"",
+      "reason": "lone_surrogate"
+    },
+    {
+      "construct": "negative_zero",
+      "input_json": "-0",
+      "reason": "negative_zero"
+    }
+  ]
+}

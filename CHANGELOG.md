@@ -4,6 +4,23 @@
 
 ## Unreleased
 
+## [1.70.1] - 2026-07-16
+
+### Added
+
+- **Durability contract foundation** — added parser-safe canonical JSON vectors, Delta v2
+  operation-envelope hashing, typed node-field patch vocabulary, checkpoint/legacy-delta schemas,
+  and bundle verification fixtures for the checkpoint transition.
+- **Checkpoint staging helpers** — added non-dispatched catalog scanning and generation staging
+  helpers that reject unsafe paths, symlinks, non-regular entries, malformed journals, and
+  non-contained archived legacy SQL.
+
+### Fixed
+
+- **Durability helper installation** — `install.sh` now ships the new durability helper libraries,
+  and `wv doctor` checks the complete sourced module set so installed hosts cannot silently miss
+  checkpoint support files.
+
 ## [1.70.0] - 2026-07-15
 
 ### Added

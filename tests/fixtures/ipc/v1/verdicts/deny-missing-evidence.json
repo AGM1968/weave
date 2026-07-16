@@ -1,0 +1,1 @@
+{"decision":"deny","event_id":"evt-1","graph_revision":42,"policy_revision":"policy-1","evidence_ids":[],"reason_codes":["evidence_missing"],"affected_nodes":["wv-123abc"],"affected_files":["scripts/wv"],"remediation":[{"action":"produce_evidence"}],"host_mapping":null}

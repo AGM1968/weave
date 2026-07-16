@@ -84,6 +84,8 @@ declare -a FAST_SUITES=(
     "test-crash-sentinel.sh:Crash Sentinel Tests"
     "test-multi-agent.sh:Multi-Agent Tests"
     "test-delta-unit.sh:Delta Unit Tests"
+    "test-delta-catalog.sh:Delta Catalog Scanner"
+    "test-checkpoint-generation.sh:Checkpoint Generation Builder"
     "test-battery-wrapper.sh:Tier2 Battery Wrapper Security (gap3)"
     "test-analyze.sh:Analyze Command Tests"
     "test-config.sh:Config Command Tests"
@@ -97,6 +99,7 @@ declare -a FAST_SUITES=(
     "test-schema-contract.sh:SQL-vs-Schema Contract"
     "test-mcp-parity.sh:MCP-vs-CLI Flag Parity"
     "test-output-budget.sh:Output Budget Golden Tests"
+    "test-ipc-contract.sh:IPC Contract Validation"
 )
 
 # Slow tier — excluded by default; add with --slow (~200s, runs install+selftest)

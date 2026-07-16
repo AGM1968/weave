@@ -1,0 +1,1 @@
+{"protocol_version":"weave.ipc.v1","operation":"handshake","request_id":"req-1","actor":{"id":"codex-1","kind":"codex","harness":"codex","instance_id":"instance-1","attestation":"process_credentials"},"timeout_ms":1000,"payload":{"supported_protocol_versions":["weave.ipc.v1"],"requested_capabilities":[{"name":"protocol.handshake.v1","version":"1"}]}}

@@ -1,0 +1,1 @@
+{"format":"weave.legacy-delta-catalog.v1","checkpoint_generation":"0001","entries":[{"raw_sha256":"67e694de11199f3a67258a3fa2d5cf0f6d9fc8d4e378bc54885b233fe55afa47","original_path":"deltas/2026-07-16/100-legacy.sql","archived_path":"legacy-deltas/v1/2026-07-16/100-legacy.sql","disposition":"incorporated"}]}

@@ -1,0 +1,1 @@
+{"version":"weave.ipc.v1","vocabulary":"policy_reason_code","codes":["evidence_missing","evidence_stale","graph_integrity_failed","policy_preflight_failed","repository_state_unknown"]}
