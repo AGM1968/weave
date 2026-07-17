@@ -23,6 +23,8 @@
 #   wv_delta_has_changes  O(1) check → exit 0 if changes exist, exit 1 if not
 #   wv_delta_reset        Clear all tracked changes
 #   wv_delta_changeset    Emit SQL changeset to stdout
+#   wv_delta_v2_write_operations
+#                          Emit Delta v2 semantic operation JSON sidecars
 
 # Shell cache: once _warp_changes is confirmed to exist, skip the probe SELECT
 # on every auto_sync cycle (~60s). Saves one sqlite3 round-trip per cycle.
@@ -334,4 +336,169 @@ SELECT
   END
 FROM _warp_changes ORDER BY id;
 "
+}
+
+# wv_delta_v2_write_operations DB OUT_DIR ACTOR_ID
+#
+# Experimental Delta v2 writer.  This does not replace SQL deltas yet; it emits
+# one immutable JSON operation per semantic node-field patch so the replay/CAS
+# path can be developed and tested without changing the current loader.  Only
+# stable lifecycle fields from node UPDATE changes are emitted:
+#
+#   status      -> nodes.status
+#   claimed_by  -> json(metadata).claimed_by, absent normalizes to null
+#   risk_level  -> json(metadata).risk_level, absent normalizes to "none"
+#
+# Unsupported table/field changes deliberately produce no v2 operation; the
+# existing SQL delta remains the compatibility authority until Delta v2 replay is
+# fail-closed and enabled.
+wv_delta_v2_write_operations() {
+    local db="$1" out_dir="$2" actor_id="$3"
+    mkdir -p "$out_dir" || return 1
+    python3 - "$db" "$out_dir" "$actor_id" <<'PY'
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import uuid
+
+db, out_dir, actor_id = sys.argv[1:4]
+STATUSES = {"todo", "ready", "active", "blocked", "done"}
+RISK_LEVELS = {"none", "low", "medium", "high"}
+
+
+def canonical(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, list):
+        return "[" + ",".join(canonical(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            canonical(str(key)) + ":" + canonical(value[key])
+            for key in sorted(value.keys())
+        ) + "}"
+    raise TypeError(f"unsupported canonical value type: {type(value).__name__}")
+
+
+def sha256_text(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def parse_change_json(raw):
+    if not raw:
+        return {}
+    value = json.loads(raw)
+    return value if isinstance(value, dict) else {}
+
+
+def parse_metadata(raw):
+    if raw is None or raw == "":
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def claimed_by(metadata):
+    value = metadata.get("claimed_by")
+    if value is None:
+        return None
+    if isinstance(value, str) and value:
+        return value
+    raise ValueError("claimed_by must be null or non-empty string")
+
+
+def risk_level(metadata):
+    value = metadata.get("risk_level", "none")
+    if isinstance(value, str) and value in RISK_LEVELS:
+        return value
+    raise ValueError("risk_level must be one of none/low/medium/high")
+
+
+def build_fields(old_data, new_data):
+    fields = {}
+    old_status = old_data.get("status")
+    new_status = new_data.get("status")
+    if old_status != new_status:
+        if old_status in STATUSES and new_status in STATUSES:
+            fields["status"] = {"expected": old_status, "value": new_status}
+        else:
+            raise ValueError("status must be a stable lifecycle value")
+
+    old_meta = parse_metadata(old_data.get("metadata"))
+    new_meta = parse_metadata(new_data.get("metadata"))
+    old_claimed = claimed_by(old_meta)
+    new_claimed = claimed_by(new_meta)
+    if old_claimed != new_claimed:
+        fields["claimed_by"] = {"expected": old_claimed, "value": new_claimed}
+
+    old_risk = risk_level(old_meta)
+    new_risk = risk_level(new_meta)
+    if old_risk != new_risk:
+        fields["risk_level"] = {"expected": old_risk, "value": new_risk}
+    return fields
+
+
+def operation_for(row):
+    change_id, table_name, operation, row_id, old_raw, new_raw = row
+    if table_name != "nodes" or operation != "UPDATE":
+        return None
+    old_data = parse_change_json(old_raw)
+    new_data = parse_change_json(new_raw)
+    fields = build_fields(old_data, new_data)
+    if not fields:
+        return None
+
+    payload = {
+        "entity": {"kind": "node", "id": row_id},
+        "mutation": {"kind": "node_patch", "fields": fields},
+    }
+    seed = canonical({
+        "actor_id": actor_id,
+        "actor_sequence": int(change_id),
+        "payload": payload,
+    })
+    operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, sha256_text(seed)))
+    operation_doc = {
+        "format": "weave.delta.v2",
+        "operation_id": operation_id,
+        "actor_id": actor_id,
+        "actor_sequence": int(change_id),
+        "canonicalization": "weave.canonical-json.v1",
+        "payload": payload,
+    }
+    operation_doc["operation_sha256"] = sha256_text(canonical(operation_doc))
+    return operation_doc
+
+
+conn = sqlite3.connect(db)
+rows = conn.execute(
+    "SELECT id, table_name, operation, row_id, old_data, new_data "
+    "FROM _warp_changes ORDER BY id"
+).fetchall()
+written = 0
+for row in rows:
+    op = operation_for(row)
+    if op is None:
+        continue
+    path = os.path.join(out_dir, f"{op['actor_sequence']:012d}-{op['operation_id']}.json")
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(canonical(op))
+        fh.write("\n")
+    os.replace(tmp, path)
+    written += 1
+print(written)
+PY
 }

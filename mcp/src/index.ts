@@ -42,8 +42,8 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { execFileSync, spawnSync } from "child_process";
-import { accessSync, appendFileSync, constants, existsSync, mkdirSync, statSync } from "fs";
-import { dirname } from "path";
+import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, statSync } from "fs";
+import { dirname, join } from "path";
 
 // --- Scope definitions ---
 // Each scope exposes a subset of tools for context-silo'd subagents.
@@ -191,6 +191,20 @@ try {
   failStartup("wv_not_found", WV_PATH_ERROR);
 }
 
+// Read from package.json (shipped alongside dist/ both in-repo and in the
+// installed layout) instead of hardcoding, so a version bump can't drift out
+// of sync with what the server reports.
+function resolvePkgVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"));
+    return typeof pkg.version === "string" ? pkg.version : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+const PKG_VERSION = resolvePkgVersion();
+
 function validateProjectRoot(): void {
   const explicit = process.env.WV_PROJECT_ROOT || process.env.WV_PROJECT_DIR;
   if (!explicit) return;
@@ -235,7 +249,7 @@ function startupReport(status: "pass" | "fail" = "pass"): Record<string, unknown
     scope: ACTIVE_SCOPE,
     tools: SCOPED_TOOLS.length,
     pid: process.pid,
-    version: "1.70.1",
+    version: PKG_VERSION,
     wv_path: WV_PATH || null,
     wv_path_error: WV_PATH_ERROR || null,
     project_root: resolveProjectRoot(),
@@ -2604,7 +2618,7 @@ async function main() {
   const server = new Server(
     {
       name: `weave-mcp-server${scopeLabel}`,
-      version: "1.70.1",
+      version: PKG_VERSION,
     },
     {
       capabilities: {

@@ -30,6 +30,7 @@ RUNNER=(python -m pytest)          # base test command
 RUNNER_ARGS=(-q --tb=short -m "not integration and not slow")
 # ---------------------------------------------------------------------------
 
+# shellcheck source=/dev/null
 [ -n "$ACTIVATE" ] && [ -f "$ACTIVATE" ] && . "$ACTIVATE"
 
 run_full() {

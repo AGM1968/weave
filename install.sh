@@ -1033,6 +1033,7 @@ WEAVE_PATTERNS=(
     ".weave/quality.local.conf"
     "!.weave/state.sql"
     "!.claude/settings.json"
+    ".claude/settings.local.json"
 )
 if [ -f "$GITIGNORE" ]; then
     added=0
@@ -1486,6 +1487,22 @@ fi
 if [ "$AGENT" = "copilot" ]; then
         # VS Code Copilot: .vscode/mcp.json + .mcp.json + .github/copilot-instructions.md
 
+        # Both files below are committed/shared via git (unlike settings.local.json),
+        # so baking in THIS machine's resolved $HOME breaks every other machine/user
+        # that clones the repo (e.g. node /home/aligm/... ENOENTs on any other box).
+        # Emit the portable ${env:HOME} form whenever the resolved path sits under
+        # $HOME (the standard install layout); fall back to the literal path for
+        # non-standard installs (e.g. WV_LIB_DIR override, dev-mode repo-relative
+        # paths) where portability isn't the goal anyway.
+        MCP_SERVER_JSON="$MCP_SERVER"
+        case "$MCP_SERVER" in
+            "$HOME"/*) MCP_SERVER_JSON="\${env:HOME}${MCP_SERVER#$HOME}" ;;
+        esac
+        WV_BIN_JSON="$WV_BIN"
+        case "$WV_BIN" in
+            "$HOME"/*) WV_BIN_JSON="\${env:HOME}${WV_BIN#$HOME}" ;;
+        esac
+
         # ── .vscode/mcp.json (VS Code workspace MCP config; user file) ──
         if [ ! -f "$REPO_ROOT/.vscode/mcp.json" ] || [ "$FORCE_MODE" = "1" ]; then
                 mkdir -p "$REPO_ROOT/.vscode"
@@ -1494,36 +1511,36 @@ if [ "$AGENT" = "copilot" ]; then
     "servers": {
         "weave": {
             "command": "node",
-            "args": ["$MCP_SERVER"],
+            "args": ["$MCP_SERVER_JSON"],
             "env": {
-                "WV_PATH": "$WV_BIN",
+                "WV_PATH": "$WV_BIN_JSON",
                 "WV_PROJECT_ROOT": "\${workspaceFolder}",
                 "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         },
         "weave-session": {
             "command": "node",
-            "args": ["$MCP_SERVER", "--scope=session"],
+            "args": ["$MCP_SERVER_JSON", "--scope=session"],
             "env": {
-                "WV_PATH": "$WV_BIN",
+                "WV_PATH": "$WV_BIN_JSON",
                 "WV_PROJECT_ROOT": "\${workspaceFolder}",
                 "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         },
         "weave-lite": {
             "command": "node",
-            "args": ["$MCP_SERVER", "--scope=lite"],
+            "args": ["$MCP_SERVER_JSON", "--scope=lite"],
             "env": {
-                "WV_PATH": "$WV_BIN",
+                "WV_PATH": "$WV_BIN_JSON",
                 "WV_PROJECT_ROOT": "\${workspaceFolder}",
                 "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         },
         "weave-inspect": {
             "command": "node",
-            "args": ["$MCP_SERVER", "--scope=inspect"],
+            "args": ["$MCP_SERVER_JSON", "--scope=inspect"],
             "env": {
-                "WV_PATH": "$WV_BIN",
+                "WV_PATH": "$WV_BIN_JSON",
                 "WV_PROJECT_ROOT": "\${workspaceFolder}",
                 "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
@@ -1543,36 +1560,36 @@ MCPEOF
     "servers": {
         "weave": {
             "command": "node",
-            "args": ["$MCP_SERVER"],
+            "args": ["$MCP_SERVER_JSON"],
             "env": {
-                "WV_PATH": "$WV_BIN",
+                "WV_PATH": "$WV_BIN_JSON",
                 "WV_PROJECT_ROOT": "\${workspaceFolder}",
                 "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         },
         "weave-session": {
             "command": "node",
-            "args": ["$MCP_SERVER", "--scope=session"],
+            "args": ["$MCP_SERVER_JSON", "--scope=session"],
             "env": {
-                "WV_PATH": "$WV_BIN",
+                "WV_PATH": "$WV_BIN_JSON",
                 "WV_PROJECT_ROOT": "\${workspaceFolder}",
                 "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         },
         "weave-lite": {
             "command": "node",
-            "args": ["$MCP_SERVER", "--scope=lite"],
+            "args": ["$MCP_SERVER_JSON", "--scope=lite"],
             "env": {
-                "WV_PATH": "$WV_BIN",
+                "WV_PATH": "$WV_BIN_JSON",
                 "WV_PROJECT_ROOT": "\${workspaceFolder}",
                 "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }
         },
         "weave-inspect": {
             "command": "node",
-            "args": ["$MCP_SERVER", "--scope=inspect"],
+            "args": ["$MCP_SERVER_JSON", "--scope=inspect"],
             "env": {
-                "WV_PATH": "$WV_BIN",
+                "WV_PATH": "$WV_BIN_JSON",
                 "WV_PROJECT_ROOT": "\${workspaceFolder}",
                 "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
             }

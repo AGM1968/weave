@@ -4,6 +4,32 @@
 
 ## Unreleased
 
+## [1.70.2] - 2026-07-17
+
+### Fixed
+
+- **`wv-init-repo` scaffolding portability** — `.vscode/mcp.json` and `.mcp.json` (legacy root
+  config) baked in the resolved absolute path to `MCP_SERVER`/`WV_BIN` at generation time instead of
+  a portable `${env:HOME}` form. Any repo scaffolded or force-updated on one machine shipped a path
+  that only resolved there, ENOENT-ing every MCP server spawn on any other machine/user that cloned
+  it — traced as the root cause of VS Code extension-host crashes in `weave-runtime`, `warp`, and
+  `insar`. Now emits `${env:HOME}`-relative paths whenever the resolved path sits under
+  `$HOME`; non-standard installs (`WV_LIB_DIR` override, dev-mode repo-relative paths) are
+  unaffected.
+- **MCP server version drift** — `mcp/src/index.ts` hardcoded its reported version as a literal
+  string in two places instead of reading `package.json`, so the version reported by
+  `weave_bootstrap`/health-check could silently go stale after a release bump (already true for the
+  installed copy, one version behind the repo). Now derived from `package.json` at module load.
+- **`.claude/settings.local.json` wrongly trackable** — `wv-init-repo`'s `.gitignore` scaffolding
+  never included this file despite treating it as machine-local everywhere else (MCP server absolute
+  paths, local permission allowlist), so a plain `git add -A` on a repo without a hand-crafted
+  `.gitignore` picked it up — confirmed committed in `weave-runtime` since 2026-04-29 with another
+  machine's paths baked in. Added the missing `.gitignore` rule.
+- **`make check` release gate broken** — pre-existing shellcheck SC1090 warning on
+  `scripts/test-impacted.sh`'s config-block `ACTIVATE` source line blocked `make check` (and
+  therefore any release) for everyone, unrelated to this release's other changes. Added the standard
+  `shellcheck source=/dev/null` directive to both the template and this repo's own copy.
+
 ## [1.70.1] - 2026-07-16
 
 ### Added
@@ -25,9 +51,9 @@
 
 ### Added
 
-- **Conditional discovery routing** — canonical shared procedures now teach hosts when to move
-  from ordinary context into graph query, discovery, impact, code search, and quality inspection.
-  Codex, Claude, Copilot, and bootstrap-agent projections are generated from the same source.
+- **Conditional discovery routing** — canonical shared procedures now teach hosts when to move from
+  ordinary context into graph query, discovery, impact, code search, and quality inspection. Codex,
+  Claude, Copilot, and bootstrap-agent projections are generated from the same source.
 
 ### Changed
 
@@ -39,8 +65,8 @@
 
 ### Fixed
 
-- **Multi-agent temporary repository commits** — test fixtures disable inherited Git commit
-  signing, so environments with unavailable signing helpers no longer fail unrelated suites.
+- **Multi-agent temporary repository commits** — test fixtures disable inherited Git commit signing,
+  so environments with unavailable signing helpers no longer fail unrelated suites.
 
 ## [1.69.1] - 2026-07-14
 

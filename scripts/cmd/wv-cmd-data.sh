@@ -200,6 +200,14 @@ auto_sync() {
     local delta_file="$delta_dir/${delta_prefix}-${agent_id}-$$.sql"
     wv_delta_changeset "$WV_DB" > "$delta_file" 2>/dev/null || true
     [ -s "$delta_file" ] || rm -f "$delta_file"
+    if [ "${WV_DELTA_V2_WRITE:-0}" = "1" ]; then
+        local delta_v2_dir="$delta_dir/v2"
+        if ! wv_delta_v2_write_operations "$WV_DB" "$delta_v2_dir" "$agent_id" >/dev/null; then
+            echo "wv: warning: Delta v2 sidecar write failed; SQL delta remains authoritative" >&2
+            [ "${WV_DELTA_V2_STRICT:-0}" = "1" ] && return 1
+        fi
+        find "$delta_v2_dir" -type d -empty -delete 2>/dev/null || true
+    fi
 
     # Full dump to state.sql — kept as the authoritative snapshot and audit trail.
     # Deltas complement the dump; they are not a replacement. state.sql is what
