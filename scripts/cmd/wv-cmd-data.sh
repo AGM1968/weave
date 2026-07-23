@@ -33,7 +33,7 @@ sys.stdout.write(pat.sub(fix, sys.stdin.read()))
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# dump_state_sql — Selective dump excluding FTS index (nodes + edges + meta)
+# dump_state_sql — Selective dump excluding FTS index (nodes + edges + file attribution)
 # ═══════════════════════════════════════════════════════════════════════════
 
 # FTS5 index is derived data rebuilt from node content in ~18ms.  The full
@@ -49,7 +49,7 @@ sys.stdout.write(pat.sub(fix, sys.stdin.read()))
 # no local changes had been made. The table is recreated empty by wv_delta_init
 # on every load; triggers are reinstalled at the same time.
 #
-# This function dumps only the data tables and the schema preamble needed
+# This function dumps only the semantic data tables and the schema preamble needed
 # to reconstruct the database. FTS is rebuilt on load via db_rebuild_fts.
 # Delta tracking is reinstalled on load via wv_delta_init.
 dump_state_sql() {
@@ -57,6 +57,7 @@ dump_state_sql() {
     {
         sqlite3 -cmd ".timeout 5000" "$db" ".dump nodes" 2>/dev/null
         sqlite3 -cmd ".timeout 5000" "$db" ".dump edges" 2>/dev/null
+        sqlite3 -cmd ".timeout 5000" "$db" ".dump node_files" 2>/dev/null
     } | strip_unistr > "$outfile"
 }
 
@@ -119,8 +120,10 @@ _sync_floor_guard_ok() {
     local existing="$WEAVE_DIR/state.sql"
     [ -f "$existing" ] || return 0
     local old_n new_n floor
-    old_n=$(grep -c '^INSERT INTO nodes' "$existing" 2>/dev/null || echo 0)
-    new_n=$(grep -c '^INSERT INTO nodes' "$new_sql" 2>/dev/null || echo 0)
+    old_n=$(grep -c '^INSERT INTO nodes' "$existing" 2>/dev/null || true)
+    new_n=$(grep -c '^INSERT INTO nodes' "$new_sql" 2>/dev/null || true)
+    old_n=${old_n:-0}
+    new_n=${new_n:-0}
     [ "$old_n" -gt 0 ] || return 0
     floor=$(awk -v o="$old_n" -v r="$ratio" 'BEGIN{printf "%d", o*r}')
     if [ "$new_n" -lt "$floor" ]; then
@@ -958,7 +961,19 @@ EOF
             # Sort by filename (epoch prefix) for causal ordering across agents
             delta_files=$(find "$WEAVE_DIR/deltas" -name '*.sql' -printf '%f\t%p\n' 2>/dev/null | sort | cut -f2)
             if [ -n "$delta_files" ]; then
-                local skipped=0
+                local skipped=0 skipped_legacy=0 snapshot_max_epoch=0
+                snapshot_max_epoch=$(sqlite3 "$WV_DB" "
+                    SELECT COALESCE(MAX(
+                        CASE
+                            WHEN typeof(updated_at) IN ('integer','real') THEN CAST(updated_at AS INTEGER)
+                            WHEN CAST(updated_at AS TEXT) != ''
+                                 AND CAST(updated_at AS TEXT) NOT GLOB '*[^0-9]*'
+                            THEN CAST(updated_at AS INTEGER)
+                            ELSE CAST(strftime('%s', updated_at) AS INTEGER)
+                        END
+                    ), 0)
+                    FROM nodes;
+                " 2>/dev/null || echo "0")
                 # Collect replayable delta paths into an array, then replay in a
                 # single batched sqlite3 call instead of N subprocesses.
                 local -a new_deltas=()
@@ -972,6 +987,16 @@ EOF
                         # Prune epoch filter
                         if [ "$delta_ts" -le "$prune_epoch" ] 2>/dev/null; then
                             skipped=$((skipped + 1))
+                            continue
+                        fi
+                        # Legacy back-catalog delta guard: pre-wv-875c72 node
+                        # deltas used unconditional INSERT OR REPLACE. If such a
+                        # delta predates the loaded checkpoint, replaying it can
+                        # revert newer state.sql. Current generated deltas use
+                        # ON CONFLICT with a freshness WHERE and stay replayable.
+                        if grep -qiE '^INSERT OR REPLACE INTO nodes' "$delta" 2>/dev/null \
+                            && [ "${delta_ts:-0}" -le "${snapshot_max_epoch:-0}" ] 2>/dev/null; then
+                            skipped_legacy=$((skipped_legacy + 1))
                             continue
                         fi
                         # Pre-validate: a valid delta has at least one replayable
@@ -1037,6 +1062,9 @@ EOF
                 sqlite3 "$WV_DB" "PRAGMA foreign_keys = ON;" 2>/dev/null || true
                 if [ "$skipped" -gt 0 ]; then
                     echo -e "${YELLOW}ℹ${NC} Skipped $skipped pre-prune delta(s)" >&2
+                fi
+                if [ "$skipped_legacy" -gt 0 ]; then
+                    echo -e "${YELLOW}ℹ${NC} Skipped $skipped_legacy legacy pre-checkpoint delta(s)" >&2
                 fi
             fi
         fi

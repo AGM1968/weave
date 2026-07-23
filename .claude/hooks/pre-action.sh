@@ -31,6 +31,12 @@ _hc_check_read_size "$TOOL" "$TOOL_INPUT" || exit 0
 _hc_check_installed_path "$TOOL" "$TOOL_INPUT" || exit $?
 
 _hc_classify_tool "$TOOL" "$TOOL_INPUT"
+# Malformed mutation payloads fail closed instead of downgrading to inspection
+# (wv-692c2d); empty stdin stays a manual-invocation no-op.
+if [ "${_HC_MALFORMED:-false}" = true ] && [ -n "$INPUT" ]; then
+    echo "PreToolUse payload malformed (${_HC_MALFORMED_REASON:-unknown}); failing closed" >&2
+    exit 2
+fi
 [ "${_HC_BYPASS_CMD:-false}" = true ] && exit 0
 [ "${_HC_SHOULD_CHECK:-false}" = false ] && exit 0
 

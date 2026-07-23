@@ -1006,13 +1006,13 @@ rm -rf "$_hist_clone"
     _hid=$("${_Hi[@]}" "$WV" add "historical delta baseline" --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | head -1)
     # Publish a newer state.sql, then discard its generated deltas.  The only
     # committed delta below is deliberately in the pre-guard SQL format.
-    sqlite3 "$_hist_src/hz/brain.db" "UPDATE nodes SET text='newer checkpoint value', status='ready', updated_at=200 WHERE id='$_hid';"
+    sqlite3 "$_hist_src/hz/brain.db" "UPDATE nodes SET text='newer checkpoint value', status='ready', updated_at='2026-07-23 12:00:00' WHERE id='$_hid';"
     WV_FORCE_SYNC=1 "${_Hi[@]}" "$WV" sync >/dev/null 2>&1
     rm -rf "$_hist_src/.weave/deltas"
     mkdir -p "$_hist_src/.weave/deltas"
-    cat > "$_hist_src/.weave/deltas/100-000000-legacy.sql" <<EOF
+    cat > "$_hist_src/.weave/deltas/1784746753-000000-legacy.sql" <<EOF
 INSERT OR REPLACE INTO nodes(id,text,status,metadata,alias,created_at,updated_at)
-VALUES('$_hid','historical unconditional value','todo','{}',NULL,100,150);
+VALUES('$_hid','historical unconditional value','todo','{}',NULL,100,1784746753);
 EOF
     git add .weave
     git -c commit.gpgsign=false -c user.name='Weave test' -c user.email='weave-test@example.invalid' commit -qm 'fixture: historical delta replay'
@@ -1025,9 +1025,9 @@ _H=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_hist_clone" "WV_HOT_ZONE=$_hi
 _hist_load=$("${_H[@]}" "$WV" load 2>&1 || true)
 _hist_text=$(sqlite3 "$_hist_clone/hz/brain.db" "SELECT text FROM nodes WHERE id='$_hist_id';" 2>/dev/null || echo "")
 _hist_manifest=$(cat "$_hist_clone/.weave/.applied_deltas" 2>/dev/null || echo "")
-assert_contains "$_hist_load" "Replayed 1 delta(s)" "historical fixture replays through normal load"
-assert_contains "$_hist_manifest" "100-000000-legacy.sql" "historical replay is recorded observationally"
-assert_xfail "newer checkpoint value" "$_hist_text" "historical unconditional delta cannot revert newer snapshot"
+assert_contains "$_hist_load" "Skipped 1 legacy pre-checkpoint delta(s)" "historical pre-checkpoint legacy delta is skipped through normal load"
+assert_not_contains "$_hist_manifest" "1784746753-000000-legacy.sql" "historical skipped delta is not recorded as replayed"
+assert_equals "newer checkpoint value" "$_hist_text" "historical unconditional delta cannot revert newer snapshot"
 rm -rf "$_hist_src" "$_hist_clone"
 
 # ─── Durability replay: clock-skewed current delta (wv-188ddc) ──────────────

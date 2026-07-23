@@ -43,6 +43,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { execFileSync, spawnSync } from "child_process";
 import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, statSync } from "fs";
+import { hostname, userInfo } from "os";
 import { dirname, join } from "path";
 
 // --- Scope definitions ---
@@ -239,6 +240,55 @@ function resolveProjectRoot(): string {
   return process.env.WV_PROJECT_ROOT || process.env.WV_PROJECT_DIR || process.cwd();
 }
 
+// Mirrors resolve_agent_harness() in scripts/lib/wv-resolve-runtime.sh (bash) and
+// _is_codex_runtime()-adjacent identity handling in scripts/weave_gh/phases.py.
+// Kept in sync by hand across all three languages -- there is no single source
+// any of them import from. See docs/AGENT-IDENTITY-CONTRACT.md for the full
+// contract (wv-5fbc6c).
+// Precedence copilot > claude > codex on ambiguity: Copilot's marker is
+// self-set with no known leak vector; CODEX_THREAD_ID/CODEX_CI can be
+// co-present with a genuine top-level Claude Code session and must not win
+// (wv-4d4c96 — that direction previously mislabeled real Claude sessions codex).
+const AGENT_HARNESS_PRECEDENCE = ["copilot", "claude", "codex"] as const;
+type AgentHarness = (typeof AGENT_HARNESS_PRECEDENCE)[number] | "human";
+
+export function resolveAgentHarness(): AgentHarness {
+  const present: Array<(typeof AGENT_HARNESS_PRECEDENCE)[number]> = [];
+  if (process.env.CLAUDE_CODE_SSE_PORT) present.push("claude");
+  if (process.env.CODEX_THREAD_ID || process.env.CODEX_CI === "1") present.push("codex");
+  if (process.env.COPILOT_AGENT === "1") present.push("copilot");
+
+  if (present.length === 0) return "human";
+  if (present.length === 1) return present[0];
+
+  const winner = AGENT_HARNESS_PRECEDENCE.find((h) => present.includes(h)) ?? present[0];
+  console.error(
+    `wv-mcp: ambiguous agent markers (${present.join(" ")}); using ${winner} precedence. ` +
+      `Set WV_AGENT_ID to make identity explicit.`
+  );
+  return winner;
+}
+
+// Mirrors resolve_agent_id() (bash): explicit WV_AGENT_ID always wins; otherwise
+// <harness>-<host>-<user>, matching the format scripts/weave_gh/phases.py
+// recognizes as a local (non-GH-login) claim.
+export function resolveAgentId(): string {
+  if (process.env.WV_AGENT_ID) return process.env.WV_AGENT_ID;
+  let host = "host";
+  let user = "user";
+  try {
+    host = hostname();
+  } catch {
+    // keep fallback
+  }
+  try {
+    user = userInfo().username;
+  } catch {
+    // keep fallback
+  }
+  return `${resolveAgentHarness()}-${host}-${user}`;
+}
+
 function startupReport(status: "pass" | "fail" = "pass"): Record<string, unknown> {
   return {
     schema: "weave-mcp-startup.v1",
@@ -253,7 +303,7 @@ function startupReport(status: "pass" | "fail" = "pass"): Record<string, unknown
     wv_path: WV_PATH || null,
     wv_path_error: WV_PATH_ERROR || null,
     project_root: resolveProjectRoot(),
-    agent_id: process.env.WV_AGENT_ID || null,
+    agent_id: resolveAgentId(),
     call_log: MCP_CALL_LOG || null,
     allow_network: MCP_ALLOW_NETWORK,
   };

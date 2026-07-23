@@ -1,0 +1,861 @@
+{
+  "format": "weave.rust-e3.harness-normalization.v2",
+  "malformed_events": [
+    {
+      "case_kind": "malformed_required_field",
+      "event_id": "e3-claude-pretooluse-missing-tool",
+      "expected_failure": {
+        "decision": "fail_closed",
+        "must_not_normalize_as": "inspect",
+        "reason_code": "missing_required_field"
+      },
+      "host": "claude",
+      "malformation": "tool_name absent from PreToolUse payload",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session-1",
+        "tool_input": {
+          "file_path": "src/lib.rs"
+        }
+      }
+    },
+    {
+      "case_kind": "malformed_required_field",
+      "event_id": "e3-claude-posttooluse-bad-input",
+      "expected_failure": {
+        "decision": "fail_closed",
+        "must_not_normalize_as": "inspect",
+        "reason_code": "invalid_required_field"
+      },
+      "host": "claude",
+      "malformation": "tool_input is a string, not an object",
+      "raw_event_kind": "PostToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "PostToolUse",
+        "session_id": "claude-session-1",
+        "tool_input": "src/lib.rs",
+        "tool_name": "Edit"
+      }
+    },
+    {
+      "case_kind": "malformed_required_field",
+      "event_id": "e3-claude-sessionstart-not-json",
+      "expected_failure": {
+        "decision": "fail_closed",
+        "must_not_normalize_as": "inspect",
+        "reason_code": "invalid_required_field"
+      },
+      "host": "claude",
+      "malformation": "payload is not JSON",
+      "raw_event_kind": "SessionStart",
+      "raw_stdin": "this is not a json payload"
+    },
+    {
+      "case_kind": "malformed_required_field",
+      "event_id": "e3-claude-stop-array",
+      "expected_failure": {
+        "decision": "fail_closed",
+        "must_not_normalize_as": "inspect",
+        "reason_code": "invalid_required_field"
+      },
+      "host": "claude",
+      "malformation": "payload is a JSON array, not an object",
+      "raw_event_kind": "Stop",
+      "raw_stdin": "[]"
+    },
+    {
+      "case_kind": "malformed_required_field",
+      "event_id": "e3-codex-pretooluse-missing-tool",
+      "expected_failure": {
+        "decision": "fail_closed",
+        "must_not_normalize_as": "inspect",
+        "reason_code": "missing_required_field"
+      },
+      "host": "codex",
+      "malformation": "tool absent from PreToolUse payload",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "input": {
+          "patchText": "*** Begin Patch\n*** Update File: src/a.py\n*** End Patch"
+        },
+        "thread_id": "codex-thread-1"
+      }
+    },
+    {
+      "case_kind": "malformed_required_field",
+      "event_id": "e3-codex-posttooluse-bad-input",
+      "expected_failure": {
+        "decision": "fail_closed",
+        "must_not_normalize_as": "inspect",
+        "reason_code": "invalid_required_field"
+      },
+      "host": "codex",
+      "malformation": "input is a number, not an object",
+      "raw_event_kind": "PostToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "input": 7,
+        "thread_id": "codex-thread-1",
+        "tool": "apply_patch"
+      }
+    },
+    {
+      "case_kind": "malformed_required_field",
+      "event_id": "e3-codex-sessionstart-not-json",
+      "expected_failure": {
+        "decision": "fail_closed",
+        "must_not_normalize_as": "inspect",
+        "reason_code": "invalid_required_field"
+      },
+      "host": "codex",
+      "malformation": "payload is not JSON",
+      "raw_event_kind": "SessionStart",
+      "raw_stdin": "{broken"
+    },
+    {
+      "case_kind": "malformed_required_field",
+      "event_id": "e3-codex-stop-string",
+      "expected_failure": {
+        "decision": "fail_closed",
+        "must_not_normalize_as": "inspect",
+        "reason_code": "invalid_required_field"
+      },
+      "host": "codex",
+      "malformation": "payload is a JSON string, not an object",
+      "raw_event_kind": "Stop",
+      "raw_stdin": "\"stop\""
+    },
+    {
+      "case_kind": "malformed_required_field",
+      "event_id": "e3-cli-invocation-empty-argv",
+      "expected_failure": {
+        "decision": "fail_closed",
+        "must_not_normalize_as": "inspect",
+        "reason_code": "invalid_required_field"
+      },
+      "host": "cli",
+      "malformation": "argv is an empty array",
+      "raw_event_kind": "cli_invocation",
+      "raw_payload": {
+        "argv": [],
+        "cwd": "/repo/main"
+      }
+    },
+    {
+      "case_kind": "malformed_required_field",
+      "event_id": "e3-mcp-tool-call-missing-tool",
+      "expected_failure": {
+        "decision": "fail_closed",
+        "must_not_normalize_as": "inspect",
+        "reason_code": "missing_required_field"
+      },
+      "host": "mcp",
+      "malformation": "tool absent from mcp_tool_call payload",
+      "raw_event_kind": "mcp_tool_call",
+      "raw_payload": {
+        "arguments": {
+          "id": "wv-1234"
+        },
+        "cwd": "/repo/main"
+      }
+    }
+  ],
+  "manifest_fixture": "tests/fixtures/rust-evidence/e3/host-capability-manifest.json",
+  "manifest_sha256": "sha256:3ae86eed9d11b59107fc88db564c0b0da7f5bf78e8e60bcd9301298fe6bb2816",
+  "raw_events": [
+    {
+      "case_kind": "allow",
+      "event_id": "e3-claude-pretooluse-allow",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [],
+        "destructive": false,
+        "fail_posture": "advisory",
+        "operation": "inspect",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "unknown",
+        "worktree_identity": "known"
+      },
+      "host": "claude",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session-1",
+        "tool_input": {
+          "file_path": "src/lib.rs"
+        },
+        "tool_name": "Read"
+      }
+    },
+    {
+      "case_kind": "mutation",
+      "event_id": "e3-claude-pretooluse-edit",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [
+          "working_tree_edit"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "edit_file",
+        "path_scope": "known",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "working_tree",
+        "worktree_identity": "known"
+      },
+      "host": "claude",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session-1",
+        "tool_input": {
+          "file_path": "src/lib.rs",
+          "new_string": "b",
+          "old_string": "a"
+        },
+        "tool_name": "Edit"
+      }
+    },
+    {
+      "case_kind": "mutation",
+      "event_id": "e3-claude-pretooluse-commit",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [
+          "git_commit"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "commit",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": true,
+        "target": "git",
+        "worktree_identity": "known"
+      },
+      "host": "claude",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session-1",
+        "tool_input": {
+          "command": "git commit -m 'fix: adapter'"
+        },
+        "tool_name": "Bash"
+      }
+    },
+    {
+      "case_kind": "mutation",
+      "event_id": "e3-claude-pretooluse-close",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [
+          "node_close"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "close_node",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": true,
+        "target": "graph",
+        "worktree_identity": "known"
+      },
+      "host": "claude",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session-1",
+        "tool_input": {
+          "command": "wv done wv-1234 --learning='x'"
+        },
+        "tool_name": "Bash"
+      }
+    },
+    {
+      "case_kind": "mutation",
+      "event_id": "e3-claude-pretooluse-update",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [
+          "graph_update"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "update_node",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": true,
+        "target": "graph",
+        "worktree_identity": "known"
+      },
+      "host": "claude",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session-1",
+        "tool_input": {
+          "command": "wv update wv-1234 --alias=x"
+        },
+        "tool_name": "Bash"
+      }
+    },
+    {
+      "case_kind": "unknown_path",
+      "event_id": "e3-claude-pretooluse-unknown-path",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [
+          "working_tree_edit"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "edit_file",
+        "path_scope": "unknown",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "working_tree",
+        "worktree_identity": "known"
+      },
+      "host": "claude",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session-1",
+        "tool_input": {},
+        "tool_name": "Edit"
+      }
+    },
+    {
+      "case_kind": "allow",
+      "event_id": "e3-claude-posttooluse-allow",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [],
+        "destructive": false,
+        "fail_posture": "advisory",
+        "operation": "inspect",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "unknown",
+        "worktree_identity": "known"
+      },
+      "host": "claude",
+      "raw_event_kind": "PostToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "PostToolUse",
+        "session_id": "claude-session-1",
+        "tool_input": {
+          "file_path": "src/lib.rs"
+        },
+        "tool_name": "Read",
+        "tool_response": {
+          "success": true
+        }
+      }
+    },
+    {
+      "case_kind": "mutation",
+      "event_id": "e3-claude-posttooluse-edit",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [
+          "working_tree_edit"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "edit_file",
+        "path_scope": "known",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "working_tree",
+        "worktree_identity": "known"
+      },
+      "host": "claude",
+      "raw_event_kind": "PostToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "PostToolUse",
+        "session_id": "claude-session-1",
+        "tool_input": {
+          "content": "x",
+          "file_path": "src/new.rs"
+        },
+        "tool_name": "Write",
+        "tool_response": {
+          "success": true
+        }
+      }
+    },
+    {
+      "case_kind": "unknown_path",
+      "event_id": "e3-claude-posttooluse-unknown-path",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [
+          "working_tree_edit"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "edit_file",
+        "path_scope": "unknown",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "working_tree",
+        "worktree_identity": "known"
+      },
+      "host": "claude",
+      "raw_event_kind": "PostToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "PostToolUse",
+        "session_id": "claude-session-1",
+        "tool_input": {
+          "content": "x"
+        },
+        "tool_name": "Write",
+        "tool_response": {
+          "success": true
+        }
+      }
+    },
+    {
+      "case_kind": "allow",
+      "event_id": "e3-claude-sessionstart-allow",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [],
+        "destructive": false,
+        "fail_posture": "advisory",
+        "operation": "session_lifecycle",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "graph",
+        "worktree_identity": "known"
+      },
+      "host": "claude",
+      "raw_event_kind": "SessionStart",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "SessionStart",
+        "session_id": "claude-session-1"
+      }
+    },
+    {
+      "case_kind": "allow",
+      "event_id": "e3-claude-stop-allow",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [],
+        "destructive": false,
+        "fail_posture": "advisory",
+        "operation": "session_lifecycle",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "graph",
+        "worktree_identity": "known"
+      },
+      "host": "claude",
+      "raw_event_kind": "Stop",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "Stop",
+        "session_id": "claude-session-1"
+      }
+    },
+    {
+      "case_kind": "allow",
+      "event_id": "e3-codex-pretooluse-allow",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [],
+        "destructive": false,
+        "fail_posture": "advisory",
+        "operation": "inspect",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "unknown",
+        "worktree_identity": "known"
+      },
+      "host": "codex",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "input": {
+          "path": "src/a.py"
+        },
+        "thread_id": "codex-thread-1",
+        "tool": "Read"
+      }
+    },
+    {
+      "case_kind": "mutation",
+      "event_id": "e3-codex-pretooluse-edit",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [
+          "working_tree_edit"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "edit_file",
+        "path_scope": "known",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "working_tree",
+        "worktree_identity": "known"
+      },
+      "host": "codex",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "input": {
+          "patchText": "*** Begin Patch\n*** Update File: src/a.py\n*** End Patch"
+        },
+        "thread_id": "codex-thread-1",
+        "tool": "apply_patch"
+      }
+    },
+    {
+      "case_kind": "unknown_path",
+      "event_id": "e3-codex-pretooluse-unknown-path",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [
+          "working_tree_edit"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "edit_file",
+        "path_scope": "unknown",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "working_tree",
+        "worktree_identity": "known"
+      },
+      "host": "codex",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "input": {
+          "patchText": "*** Begin Patch\n*** End Patch"
+        },
+        "thread_id": "codex-thread-1",
+        "tool": "apply_patch"
+      }
+    },
+    {
+      "case_kind": "allow",
+      "event_id": "e3-codex-posttooluse-allow",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [],
+        "destructive": false,
+        "fail_posture": "advisory",
+        "operation": "inspect",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "unknown",
+        "worktree_identity": "known"
+      },
+      "host": "codex",
+      "raw_event_kind": "PostToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "input": {
+          "path": "src/a.py"
+        },
+        "response": {
+          "success": true
+        },
+        "thread_id": "codex-thread-1",
+        "tool": "Read"
+      }
+    },
+    {
+      "case_kind": "mutation",
+      "event_id": "e3-codex-posttooluse-edit",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [
+          "working_tree_edit"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "edit_file",
+        "path_scope": "known",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "working_tree",
+        "worktree_identity": "known"
+      },
+      "host": "codex",
+      "raw_event_kind": "PostToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "input": {
+          "patchText": "*** Begin Patch\n*** Update File: src/a.py\n*** End Patch"
+        },
+        "response": {
+          "success": true
+        },
+        "thread_id": "codex-thread-1",
+        "tool": "apply_patch"
+      }
+    },
+    {
+      "case_kind": "unknown_path",
+      "event_id": "e3-codex-posttooluse-unknown-path",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [
+          "working_tree_edit"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "edit_file",
+        "path_scope": "unknown",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "working_tree",
+        "worktree_identity": "known"
+      },
+      "host": "codex",
+      "raw_event_kind": "PostToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "input": {},
+        "response": {
+          "success": true
+        },
+        "thread_id": "codex-thread-1",
+        "tool": "apply_patch"
+      }
+    },
+    {
+      "case_kind": "allow",
+      "event_id": "e3-codex-sessionstart-allow",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [],
+        "destructive": false,
+        "fail_posture": "advisory",
+        "operation": "session_lifecycle",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "graph",
+        "worktree_identity": "known"
+      },
+      "host": "codex",
+      "raw_event_kind": "SessionStart",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "thread_id": "codex-thread-1"
+      }
+    },
+    {
+      "case_kind": "allow",
+      "event_id": "e3-codex-stop-allow",
+      "expected_normalized": {
+        "actor_provenance": "harness_actor",
+        "capabilities": [],
+        "destructive": false,
+        "fail_posture": "advisory",
+        "operation": "session_lifecycle",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "graph",
+        "worktree_identity": "known"
+      },
+      "host": "codex",
+      "raw_event_kind": "Stop",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "thread_id": "codex-thread-1"
+      }
+    },
+    {
+      "case_kind": "allow",
+      "event_id": "e3-cli-invocation-allow",
+      "expected_normalized": {
+        "actor_provenance": "process_actor",
+        "capabilities": [],
+        "destructive": false,
+        "fail_posture": "advisory",
+        "operation": "inspect",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "unknown",
+        "worktree_identity": "known"
+      },
+      "host": "cli",
+      "raw_event_kind": "cli_invocation",
+      "raw_payload": {
+        "argv": [
+          "wv",
+          "status",
+          "--json"
+        ],
+        "cwd": "/repo/main"
+      }
+    },
+    {
+      "case_kind": "mutation",
+      "event_id": "e3-cli-invocation-update",
+      "expected_normalized": {
+        "actor_provenance": "process_actor",
+        "capabilities": [
+          "graph_update"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "update_node",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": true,
+        "target": "graph",
+        "worktree_identity": "known"
+      },
+      "host": "cli",
+      "raw_event_kind": "cli_invocation",
+      "raw_payload": {
+        "argv": [
+          "wv",
+          "update",
+          "wv-1234",
+          "--alias=x"
+        ],
+        "cwd": "/repo/main"
+      }
+    },
+    {
+      "case_kind": "mutation",
+      "event_id": "e3-cli-invocation-close",
+      "expected_normalized": {
+        "actor_provenance": "process_actor",
+        "capabilities": [
+          "node_close"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "close_node",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": true,
+        "target": "graph",
+        "worktree_identity": "known"
+      },
+      "host": "cli",
+      "raw_event_kind": "cli_invocation",
+      "raw_payload": {
+        "argv": [
+          "wv",
+          "done",
+          "wv-1234"
+        ],
+        "cwd": "/repo/main"
+      }
+    },
+    {
+      "case_kind": "allow",
+      "event_id": "e3-mcp-tool-call-allow",
+      "expected_normalized": {
+        "actor_provenance": "tool_actor",
+        "capabilities": [],
+        "destructive": false,
+        "fail_posture": "advisory",
+        "operation": "inspect",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": false,
+        "target": "unknown",
+        "worktree_identity": "known"
+      },
+      "host": "mcp",
+      "raw_event_kind": "mcp_tool_call",
+      "raw_payload": {
+        "arguments": {
+          "query": "x"
+        },
+        "cwd": "/repo/main",
+        "tool": "weave_search"
+      }
+    },
+    {
+      "case_kind": "mutation",
+      "event_id": "e3-mcp-tool-call-update",
+      "expected_normalized": {
+        "actor_provenance": "tool_actor",
+        "capabilities": [
+          "graph_update"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "update_node",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": true,
+        "target": "graph",
+        "worktree_identity": "known"
+      },
+      "host": "mcp",
+      "raw_event_kind": "mcp_tool_call",
+      "raw_payload": {
+        "arguments": {
+          "id": "wv-1234"
+        },
+        "cwd": "/repo/main",
+        "tool": "weave_update"
+      }
+    },
+    {
+      "case_kind": "mutation",
+      "event_id": "e3-mcp-tool-call-close",
+      "expected_normalized": {
+        "actor_provenance": "tool_actor",
+        "capabilities": [
+          "node_close"
+        ],
+        "destructive": true,
+        "fail_posture": "fail_closed",
+        "operation": "close_node",
+        "path_scope": "repository_wide",
+        "repository_identity": "known",
+        "shared": true,
+        "target": "graph",
+        "worktree_identity": "known"
+      },
+      "host": "mcp",
+      "raw_event_kind": "mcp_tool_call",
+      "raw_payload": {
+        "arguments": {
+          "id": "wv-1234"
+        },
+        "cwd": "/repo/main",
+        "tool": "weave_done"
+      }
+    }
+  ]
+}

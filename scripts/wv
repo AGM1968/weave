@@ -286,6 +286,21 @@ main() {
 # Zero overhead when unset.
 
 if [[ -n "${WV_CALL_LOG:-}" ]]; then
+    _wv_json_escape() {
+        local value="${1:-}"
+        value="${value//\\/\\\\}"
+        value="${value//\"/\\\"}"
+        value="${value//$'\n'/\\n}"
+        value="${value//$'\r'/\\r}"
+        printf '%s' "$value"
+    }
+    _wv_generate_call_id() {
+        if command -v uuidgen >/dev/null 2>&1; then
+            uuidgen
+        else
+            printf 'wv-%s-%s-%s' "$(date +%s%N)" "$$" "$RANDOM"
+        fi
+    }
     _wv_ts_start=$(date +%s%3N)
     _wv_ts_epoch=$(date +%s.%6N)
     _wv_out=$(mktemp -t wv-calllog-XXXXXX)
@@ -317,10 +332,13 @@ if [[ -n "${WV_CALL_LOG:-}" ]]; then
     else
         _wv_source="shell"
     fi
+    _wv_repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
+    _wv_call_id="${WV_CALL_ID:-$(_wv_generate_call_id)}"
+    _wv_workflow_id="${WV_WORKFLOW_ID:-}"
     # Braced group: stderr is silenced before the >> open is attempted, so an
     # unwritable log path (read-only FS, missing dir) cannot leak bash errors.
-    { printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"%s"}\n' \
-        "$_wv_ts_epoch" "${1:-help}" "$_wv_stdout_bytes" "$_wv_stderr_bytes" "$_wv_elapsed" "$_wv_source" \
+    { printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"%s","call_id":"%s","workflow_id":"%s","repo_root":"%s"}\n' \
+        "$_wv_ts_epoch" "$(_wv_json_escape "${1:-help}")" "$_wv_stdout_bytes" "$_wv_stderr_bytes" "$_wv_elapsed" "$(_wv_json_escape "$_wv_source")" "$(_wv_json_escape "$_wv_call_id")" "$(_wv_json_escape "$_wv_workflow_id")" "$(_wv_json_escape "$_wv_repo_root")" \
         >> "$WV_CALL_LOG"; } 2>/dev/null || true
     exit "$_wv_exit"
 else

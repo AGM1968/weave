@@ -4,6 +4,26 @@
 
 ## Unreleased
 
+## [1.70.3] - 2026-07-23
+
+### Fixed
+
+- **Legacy pre-checkpoint delta skip with ISO timestamps** — `wv load` now distinguishes all-digit
+  epoch values from ISO timestamp strings when comparing legacy SQL delta filenames to the loaded
+  checkpoint. This prevents a timestamp like `2026-07-23 12:00:00` from being cast to year `2026`
+  and allowing old pre-checkpoint deltas to replay over newer `.weave/state.sql` graph state.
+- **Public release projection during evidence hardening** — `README.public.md` now states the
+  maintenance/freeze posture, and `build-release.sh` strips private evidence-gate suites and
+  fixtures from the public bundle while those gates remain active.
+- **`resolve_agent_harness` codex/claude tie-break inverted** — when both a Codex marker
+  (`CODEX_THREAD_ID`/`CODEX_CI`) and `CLAUDE_CODE_SSE_PORT` were present in the same process, Codex
+  won precedence on the theory that Claude's marker leaks into a Codex child process. Observed in
+  practice the other way: a genuine top-level Claude Code session carried a stray Codex marker and
+  got mislabeled `codex-<host>-<user>`, corrupting `claimed_by`/delta provenance and silently
+  dropping GitHub assignee sync (`weave_gh` can't map a harness-prefixed identity back to a login).
+  Claude now wins the claude/codex tie; Copilot (`COPILOT_AGENT=1`, no known leak vector) keeps top
+  precedence.
+
 ## [1.70.2] - 2026-07-17
 
 ### Fixed
@@ -13,9 +33,8 @@
   a portable `${env:HOME}` form. Any repo scaffolded or force-updated on one machine shipped a path
   that only resolved there, ENOENT-ing every MCP server spawn on any other machine/user that cloned
   it — traced as the root cause of VS Code extension-host crashes in `weave-runtime`, `warp`, and
-  `insar`. Now emits `${env:HOME}`-relative paths whenever the resolved path sits under
-  `$HOME`; non-standard installs (`WV_LIB_DIR` override, dev-mode repo-relative paths) are
-  unaffected.
+  `insar`. Now emits `${env:HOME}`-relative paths whenever the resolved path sits under `$HOME`;
+  non-standard installs (`WV_LIB_DIR` override, dev-mode repo-relative paths) are unaffected.
 - **MCP server version drift** — `mcp/src/index.ts` hardcoded its reported version as a literal
   string in two places instead of reading `package.json`, so the version reported by
   `weave_bootstrap`/health-check could silently go stale after a release bump (already true for the

@@ -1,0 +1,168 @@
+{
+  "adapter": "wv hook normalize",
+  "adapter_source": "scripts/cmd/wv-cmd-hook.sh",
+  "format": "weave.rust-e3.host-capability-manifest.v1",
+  "hosts": {
+    "claude": {
+      "capabilities": [
+        "working_tree_edit",
+        "graph_update",
+        "git_commit",
+        "node_close"
+      ],
+      "mutation_reachability": {
+        "close_node": "PreToolUse",
+        "commit": "PreToolUse",
+        "edit_file": "PreToolUse",
+        "update_node": "PreToolUse"
+      },
+      "observed_version": "2.1.215 (Claude Code)",
+      "raw_events": {
+        "PostToolUse": {
+          "case_kinds": [
+            "allow",
+            "malformed_required_field",
+            "mutation",
+            "unknown_path"
+          ]
+        },
+        "PreToolUse": {
+          "case_kinds": [
+            "allow",
+            "malformed_required_field",
+            "mutation",
+            "unknown_path"
+          ]
+        },
+        "SessionStart": {
+          "case_kinds": [
+            "allow",
+            "malformed_required_field"
+          ]
+        },
+        "Stop": {
+          "case_kinds": [
+            "allow",
+            "malformed_required_field"
+          ]
+        }
+      },
+      "status": "eligible",
+      "unsupported_host_events": [
+        "PermissionRequest",
+        "PreCompact",
+        "PostCompact",
+        "UserPromptSubmit",
+        "SubagentStart",
+        "SubagentStop"
+      ],
+      "version_source": "claude-code --version",
+      "version_status": "observed"
+    },
+    "cli": {
+      "capabilities": [
+        "graph_update",
+        "node_close"
+      ],
+      "mutation_reachability": {
+        "close_node": "cli_invocation",
+        "update_node": "cli_invocation"
+      },
+      "observed_version": "wv 1.70.2",
+      "raw_events": {
+        "cli_invocation": {
+          "case_kinds": [
+            "allow",
+            "malformed_required_field",
+            "mutation"
+          ]
+        }
+      },
+      "status": "eligible",
+      "unsupported_host_events": [],
+      "version_source": "wv --version",
+      "version_status": "observed"
+    },
+    "codex": {
+      "capabilities": [
+        "working_tree_edit"
+      ],
+      "mutation_reachability": {
+        "edit_file": "PreToolUse"
+      },
+      "observed_version": "codex-cli 0.144.5",
+      "raw_events": {
+        "PostToolUse": {
+          "case_kinds": [
+            "allow",
+            "malformed_required_field",
+            "mutation",
+            "unknown_path"
+          ]
+        },
+        "PreToolUse": {
+          "case_kinds": [
+            "allow",
+            "malformed_required_field",
+            "mutation",
+            "unknown_path"
+          ]
+        },
+        "SessionStart": {
+          "case_kinds": [
+            "allow",
+            "malformed_required_field"
+          ]
+        },
+        "Stop": {
+          "case_kinds": [
+            "allow",
+            "malformed_required_field"
+          ]
+        }
+      },
+      "reachability_gaps": "commit/close_node/update_node are not demonstrated through the codex hook surface: only apply_patch payloads are exercised (tests/test-codex-hooks.sh) and codex hooks are disabled by default (.codex/weave.json hooks.enabled=0)",
+      "status": "eligible",
+      "unsupported_host_events": [
+        "PermissionRequest",
+        "PreCompact",
+        "PostCompact",
+        "UserPromptSubmit",
+        "SubagentStart",
+        "SubagentStop"
+      ],
+      "version_source": "codex --version",
+      "version_status": "observed"
+    },
+    "copilot": {
+      "exclusion_reason": "no wv hook dispatch integration is configured for VS Code Copilot sessions; eligibility requires a demonstrated adapter surface",
+      "status": "excluded"
+    },
+    "mcp": {
+      "capabilities": [
+        "graph_update",
+        "node_close"
+      ],
+      "mutation_reachability": {
+        "close_node": "mcp_tool_call",
+        "update_node": "mcp_tool_call"
+      },
+      "observed_version": "1.70.2",
+      "raw_events": {
+        "mcp_tool_call": {
+          "case_kinds": [
+            "allow",
+            "malformed_required_field",
+            "mutation"
+          ]
+        }
+      },
+      "status": "eligible",
+      "unsupported_host_events": [],
+      "version_source": "mcp/package.json",
+      "version_status": "observed"
+    }
+  },
+  "manifest_version": "2026-07-22.1",
+  "normalize_schema": "weave.hook-normalize.v1"
+}

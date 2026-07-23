@@ -49,6 +49,8 @@ is_codex_runtime() {
 # Detect the acting agent HARNESS for identity (claimed_by / delta provenance).
 # Distinct from is_sandboxed_runtime(): that is a single OR for hot-zone placement;
 # this distinguishes harnesses and refuses to silently guess when markers collide.
+# Canonical implementation — see docs/AGENT-IDENTITY-CONTRACT.md for the full
+# contract (precedence rule, identity format, and the python/MCP parity obligations).
 #
 # Returns one of: claude | codex | copilot | human
 # Memoized per process (_WV_AGENT_HARNESS) so the ambiguity diagnostic warns once.
@@ -57,8 +59,14 @@ is_codex_runtime() {
 # Claude session) inherits the parent's markers, so >1 can be present. We cannot
 # infer nesting order from env, so we emit a diagnostic and fall back to a fixed
 # precedence — correctness in that case comes from an explicit WV_AGENT_ID.
-# Precedence prefers self-set opt-in markers (codex/copilot) over CLAUDE_CODE_SSE_PORT,
-# which is a connection port that leaks into child processes.
+# Precedence: copilot > claude > codex. Originally codex was ranked above claude
+# on the theory that CLAUDE_CODE_SSE_PORT leaks into a Codex child process spawned
+# from a Claude session. In practice the observed failure ran the other way: a
+# genuine top-level Claude Code session carried a stray Codex marker and got
+# mislabeled codex-<host>-<user>, corrupting claimed_by/delta provenance and
+# silently dropping GitHub assignee sync (wv-4d4c96). Claude now wins the
+# claude/codex tie; copilot's marker (COPILOT_AGENT=1) is set by neither Claude
+# nor Codex and has no known leak vector, so it keeps top precedence.
 resolve_agent_harness() {
     if [ -n "${_WV_AGENT_HARNESS:-}" ]; then
         printf '%s\n' "$_WV_AGENT_HARNESS"
@@ -81,7 +89,7 @@ resolve_agent_harness() {
     else
         local h host user suggested
         result="${present%% *}"
-        for h in codex copilot claude; do
+        for h in copilot claude codex; do
             case " $present " in *" $h "*) result="$h"; break ;; esac
         done
         host=$(hostname 2>/dev/null || echo "host")

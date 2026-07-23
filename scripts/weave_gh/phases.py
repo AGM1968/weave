@@ -74,21 +74,32 @@ def _current_gh_login() -> str | None:
     return login or None
 
 
+# Harnesses resolve_agent_id() (scripts/lib/wv-resolve-runtime.sh) prefixes onto
+# claimed_by as <harness>-<host>-<user>. Kept in sync manually; there is no single
+# source both languages import from. See docs/AGENT-IDENTITY-CONTRACT.md for the
+# full contract this module is obligated to recognize (wv-5fbc6c).
+_AGENT_HARNESSES = ("claude", "codex", "copilot", "human")
+
+
 def _desired_assignee_for_node(node: WeaveNode) -> str | None:
     """Resolve the GH assignee login to sync for a node.
 
-    `claimed_by` is primarily a local lock identity (WV_AGENT_ID or hostname-user),
-    not necessarily a GitHub login. For active local claims, map back to the
+    `claimed_by` is primarily a local lock identity -- either the bare
+    `hostname-user` fallback or a harness-prefixed `<harness>-hostname-user`
+    written by resolve_agent_id() (bash) -- not necessarily a GitHub login. For
+    active local claims (bare or harness-prefixed), map back to the
     authenticated GH user; for done nodes, skip assignee sync entirely.
     """
     if node.status == "done" or not node.claimed_by:
         return None
 
+    host_user = f"{socket.gethostname()}-{getpass.getuser()}"
     local_agent_ids = {
         value
         for value in (
             os.getenv("WV_AGENT_ID"),
-            f"{socket.gethostname()}-{getpass.getuser()}",
+            host_user,
+            *(f"{harness}-{host_user}" for harness in _AGENT_HARNESSES),
         )
         if value
     }

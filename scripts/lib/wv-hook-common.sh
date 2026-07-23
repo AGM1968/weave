@@ -203,6 +203,24 @@ _hc_classify_tool() {
     _HC_SHOULD_CHECK=false
     _HC_IS_EDIT_TOOL=false
     _HC_BYPASS_CMD=false
+    _HC_MALFORMED=false
+    _HC_MALFORMED_REASON=""
+
+    # Payload-malformation detection (E3 contract, wv-692c2d): a mutation event
+    # whose required fields are broken must not silently downgrade to inspection.
+    # Callers decide the posture: PreToolUse consumers fail closed on the flag;
+    # advisory events may ignore it. Infrastructure faults are NOT flagged here —
+    # jq availability is the caller's preflight.
+    if [ -z "$tool" ]; then
+        _HC_MALFORMED=true
+        _HC_MALFORMED_REASON="missing_required_field: tool_name"
+        return 0
+    fi
+    if [ -n "$tool_input" ] && ! printf '%s' "$tool_input" | jq -e 'type == "object" or type == "null"' >/dev/null 2>&1; then
+        _HC_MALFORMED=true
+        _HC_MALFORMED_REASON="invalid_required_field: tool_input must be an object"
+        return 0
+    fi
 
     # Edit-class tools (Claude Code + VS Code names)
     if _wf_in_list "$tool" "${_WF_HOOK_EDIT_TOOLS[@]}"; then
@@ -235,6 +253,13 @@ _hc_classify_tool() {
     if [[ "$tool" == "Bash" || "$tool" == "run_in_terminal" ]]; then
         local cmd
         cmd=$(printf '%s' "$tool_input" | jq -r '.cmd // .command // empty' 2>/dev/null)
+        # A terminal invocation without a command cannot be classified — flag it
+        # rather than falling through as non-checkable (matches wv hook normalize).
+        if [ -z "$cmd" ]; then
+            _HC_MALFORMED=true
+            _HC_MALFORMED_REASON="invalid_required_field: terminal command is required"
+            return 0
+        fi
         # Close-class commands / wv-close → enforce active node.
         local close_command
         for close_command in "${_WF_CLOSE_GATED[@]}"; do

@@ -690,6 +690,29 @@ class TestDesiredAssigneeForNode:
             node = _node("wv-local", status="active", claimed_by="host-user")
             assert _desired_assignee_for_node(node) == "octocat"
 
+    def test_harness_prefixed_local_claim_maps_to_authenticated_login(self) -> None:
+        """<harness>-host-user claims (resolve_agent_id, bash) must resolve as
+        local, not fall through to a literal (bogus) GH login candidate.
+
+        Regression for wv-4d4c96: a bash-claimed `codex-debian-alistair` was
+        previously indistinguishable from a real collaborator login and got
+        rejected by GH as an invalid assignee instead of mapping to the
+        authenticated user, silently dropping the assignment.
+        """
+        _current_gh_login.cache_clear()
+        ok = subprocess.CompletedProcess([], returncode=0, stdout="octocat\n", stderr="")
+        with patch("weave_gh.phases.socket.gethostname", return_value="debian"), patch(
+            "weave_gh.phases.getpass.getuser", return_value="alistair"
+        ), patch("weave_gh.phases._run", return_value=ok):
+            for harness in ("claude", "codex", "copilot", "human"):
+                _current_gh_login.cache_clear()
+                node = _node(
+                    "wv-local-harness",
+                    status="active",
+                    claimed_by=f"{harness}-debian-alistair",
+                )
+                assert _desired_assignee_for_node(node) == "octocat"
+
 
 # ---------------------------------------------------------------------------
 # Phase 2: GH→Weave sets claimed_by from assignees

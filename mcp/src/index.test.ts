@@ -9,7 +9,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rm
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { findWvCandidates } from "./index";
+import { findWvCandidates, resolveAgentHarness, resolveAgentId } from "./index";
 
 const SERVER_PATH = resolve(__dirname, "../dist/index.js");
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -262,6 +262,62 @@ function createActiveNodeDirect(text: string): string {
 
   return extractNodeId(`${result.stdout || ""}\n${result.stderr || ""}`);
 }
+
+describe("resolveAgentHarness / resolveAgentId cross-harness parity (wv-4d4c96 / wv-5fbc6c)", () => {
+  const MARKER_VARS = ["WV_AGENT_ID", "CLAUDE_CODE_SSE_PORT", "CODEX_THREAD_ID", "CODEX_CI", "COPILOT_AGENT"] as const;
+  let saved: Record<string, string | undefined>;
+
+  beforeAll(() => {
+    saved = Object.fromEntries(MARKER_VARS.map((k) => [k, process.env[k]]));
+  });
+
+  afterAll(() => {
+    for (const k of MARKER_VARS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  function setMarkers(vars: Partial<Record<(typeof MARKER_VARS)[number], string>>): void {
+    for (const k of MARKER_VARS) {
+      if (vars[k] === undefined) delete process.env[k];
+      else process.env[k] = vars[k];
+    }
+  }
+
+  it("resolves each harness alone", () => {
+    setMarkers({ CLAUDE_CODE_SSE_PORT: "1" });
+    expect(resolveAgentHarness()).toBe("claude");
+    setMarkers({ CODEX_CI: "1" });
+    expect(resolveAgentHarness()).toBe("codex");
+    setMarkers({ COPILOT_AGENT: "1" });
+    expect(resolveAgentHarness()).toBe("copilot");
+    setMarkers({});
+    expect(resolveAgentHarness()).toBe("human");
+  });
+
+  it("claude wins the claude/codex tie, matching the bash and python fixes (wv-4d4c96)", () => {
+    setMarkers({ CLAUDE_CODE_SSE_PORT: "1", CODEX_CI: "1" });
+    expect(resolveAgentHarness()).toBe("claude");
+    expect(resolveAgentId()).toMatch(/^claude-/);
+  });
+
+  it("copilot still wins a three-way tie", () => {
+    setMarkers({ CLAUDE_CODE_SSE_PORT: "1", CODEX_CI: "1", COPILOT_AGENT: "1" });
+    expect(resolveAgentHarness()).toBe("copilot");
+    expect(resolveAgentId()).toMatch(/^copilot-/);
+  });
+
+  it("explicit WV_AGENT_ID always wins over any marker", () => {
+    setMarkers({ WV_AGENT_ID: "explicit-id", CLAUDE_CODE_SSE_PORT: "1", CODEX_CI: "1" });
+    expect(resolveAgentId()).toBe("explicit-id");
+  });
+
+  it("produces the <harness>-<host>-<user> format scripts/weave_gh/phases.py recognizes as local", () => {
+    setMarkers({ CLAUDE_CODE_SSE_PORT: "1" });
+    expect(resolveAgentId()).toMatch(/^claude-.+-.+$/);
+  });
+});
 
 describe("Weave MCP startup health", () => {
   it("keeps lifecycle metadata explicit for shipped scopes", () => {

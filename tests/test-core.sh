@@ -2705,12 +2705,25 @@ test_agent_identity_resolution() {
     [ "$human" = "$claude" ] && human_vs_claude="same"
     assert_equals "differ" "$human_vs_claude" "human identity differs from claude identity"
 
-    # 4. ambiguous markers do not silently pretend certainty — a diagnostic is emitted
+    # 4. ambiguous markers do not silently pretend certainty — a diagnostic is emitted.
+    # Claude wins the claude/codex tie (wv-4d4c96): a genuine top-level Claude Code
+    # session with a stray Codex marker must not be mislabeled codex-<host>-<user>.
     local warn
     warn=$(env -u WV_AGENT_ID -u COPILOT_AGENT CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 \
            bash -c "source '$L'; resolve_agent_id >/dev/null" 2>&1)
     assert_contains "$warn" "ambiguous" "co-present markers emit an ambiguity diagnostic"
-    assert_contains "$warn" "Set WV_AGENT_ID=codex-" "ambiguity diagnostic suggests a concrete WV_AGENT_ID"
+    assert_contains "$warn" "Set WV_AGENT_ID=claude-" "ambiguity diagnostic suggests claude, not codex, on a claude/codex tie"
+
+    local claude_wins
+    claude_wins=$(env -u WV_AGENT_ID -u COPILOT_AGENT CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 \
+                  bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    assert_contains "$claude_wins" "claude-" "claude+codex co-present resolves to claude, not codex (wv-4d4c96)"
+
+    # 5. copilot still wins over both when all three are co-present (unchanged)
+    local copilot_wins
+    copilot_wins=$(env -u WV_AGENT_ID CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 COPILOT_AGENT=1 \
+                   bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    assert_contains "$copilot_wins" "copilot-" "copilot still wins a three-way tie"
 }
 
 test_delta_filename_carries_identity() {
