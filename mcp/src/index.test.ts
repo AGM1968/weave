@@ -9,7 +9,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rm
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { findWvCandidates, resolveAgentHarness, resolveAgentId } from "./index";
+import { findWvCandidates, resolveAgentHarness, resolveAgentId, resolvePatternsListBudgetMs } from "./index";
 
 const SERVER_PATH = resolve(__dirname, "../dist/index.js");
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -179,6 +179,63 @@ exec "$REAL_WV" "$@"
   };
 }
 
+// wv-c4e639: a fake `wv` that returns a SPECIFIC (malformed/wrong-shape/
+// wrong-exit-code) response for "quality patterns validate" only, passing
+// every other invocation straight through to the real binary (needed for
+// the MCP server's own startup/handshake and any other tool calls made
+// against the same client). WV_PATH (checked first by findWvCandidates)
+// is how the server is pointed at it.
+// wv-8b3f8a: a minimal but structurally valid `coverage` object -- every
+// value present is boolean, matching isValidPatternCoverage's own
+// requirement, without needing to enumerate the full documented
+// kind/scope/maturity/key sets a real cmd_patterns_validate run would.
+// Fixtures below that aren't specifically testing coverage itself use
+// this so they keep isolating whatever check they were originally
+// written for, instead of failing on the (correctly stricter) envelope
+// check first.
+const VALID_COVERAGE = {
+  kinds: { lexicon: false },
+  match_scopes: { line: false },
+  maturities: { candidate: false },
+  optional_keys: { exempt: false },
+};
+
+function createFakeWvForValidate(stdout: string, exitCode: number): { wvPath: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "weave-mcp-fakewv-"));
+  const wvPath = join(dir, "wv-fake.sh");
+  const realWvPath = resolve(__dirname, "../../scripts/wv");
+  const script = `#!/bin/sh
+case "$*" in
+  *"quality patterns validate"*)
+    printf '%s' ${JSON.stringify(stdout)}
+    exit ${exitCode}
+    ;;
+esac
+exec ${JSON.stringify(realWvPath)} "$@"
+`;
+  writeFileSync(wvPath, script, "utf-8");
+  chmodSync(wvPath, 0o755);
+  return { wvPath, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+function createFakeWvForReport(stdout: string, exitCode: number): { wvPath: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "weave-mcp-fakewv-report-"));
+  const wvPath = join(dir, "wv-fake.sh");
+  const realWvPath = resolve(__dirname, "../../scripts/wv");
+  const script = `#!/bin/sh
+case "$*" in
+  *"quality patterns report"*)
+    printf '%s' ${JSON.stringify(stdout)}
+    exit ${exitCode}
+    ;;
+esac
+exec ${JSON.stringify(realWvPath)} "$@"
+`;
+  writeFileSync(wvPath, script, "utf-8");
+  chmodSync(wvPath, 0o755);
+  return { wvPath, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
 function readLoggedCommands(logPath: string): string[] {
   try {
     return readFileSync(logPath, "utf-8")
@@ -216,6 +273,32 @@ function createCodeSearchFixtureDb(): { dbPath: string; hotZone: string; cleanup
     dbPath,
     hotZone: dir,
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+// wv-6cd72e: a throwaway repo root (own hot zone, own .weave/patterns/) for
+// weave_quality_patterns contract/parity tests -- passed as MCPTestClient's
+// `cwd` so resolveProjectRoot() falls through to process.cwd() inside the
+// spawned server, and _resolve_repo (Python) in turn falls through the same
+// way (no REPO_ROOT env, no enclosing git repo under system tmp) to ITS OWN
+// process.cwd() -- both land on `dir` without any env-var wiring needed.
+function createQualityPatternsFixture(): {
+  dir: string;
+  hotZone: string;
+  env: NodeJS.ProcessEnv;
+  cleanup: () => void;
+} {
+  const dir = mkdtempSync(join(tmpdir(), "weave-mcp-qpatterns-"));
+  const hotZone = mkdtempSync(join(tmpdir(), "weave-mcp-qpatterns-hz-"));
+  mkdirSync(join(dir, ".weave", "patterns"), { recursive: true });
+  return {
+    dir,
+    hotZone,
+    env: { WV_HOT_ZONE: hotZone },
+    cleanup: () => {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(hotZone, { recursive: true, force: true });
+    },
   };
 }
 
@@ -316,6 +399,33 @@ describe("resolveAgentHarness / resolveAgentId cross-harness parity (wv-4d4c96 /
   it("produces the <harness>-<host>-<user> format scripts/weave_gh/phases.py recognizes as local", () => {
     setMarkers({ CLAUDE_CODE_SSE_PORT: "1" });
     expect(resolveAgentId()).toMatch(/^claude-.+-.+$/);
+  });
+});
+
+describe("resolvePatternsListBudgetMs (wv-112599, external code review round 3 finding 4)", () => {
+  // `Number(raw) || 60_000` used to let -1/Infinity/1.5 all pass straight
+  // through as spawnSync's literal timeout -- Node throws on each of those
+  // before `wv` even runs -- while 0 and unparseable text silently fell
+  // back to 60000. Only a positive safe integer should ever reach
+  // spawnSync; everything else falls back to the same 60000 default.
+  it("accepts a positive safe integer as-is", () => {
+    expect(resolvePatternsListBudgetMs("400")).toBe(400);
+    expect(resolvePatternsListBudgetMs("60000")).toBe(60_000);
+    expect(resolvePatternsListBudgetMs("1")).toBe(1);
+  });
+
+  it("falls back to 60000 for values that would make spawnSync throw", () => {
+    expect(resolvePatternsListBudgetMs("-1")).toBe(60_000);
+    expect(resolvePatternsListBudgetMs("Infinity")).toBe(60_000);
+    expect(resolvePatternsListBudgetMs("-Infinity")).toBe(60_000);
+    expect(resolvePatternsListBudgetMs("1.5")).toBe(60_000);
+  });
+
+  it("falls back to 60000 for zero, unset, and unparseable input, matching the valid-value fallback", () => {
+    expect(resolvePatternsListBudgetMs("0")).toBe(60_000);
+    expect(resolvePatternsListBudgetMs(undefined)).toBe(60_000);
+    expect(resolvePatternsListBudgetMs("not-a-number")).toBe(60_000);
+    expect(resolvePatternsListBudgetMs("")).toBe(60_000);
   });
 });
 
@@ -607,6 +717,13 @@ describe("Weave MCP Server", () => {
       expect(byName.weave_add.inputSchema.properties?.status?.enum).toEqual(
         expect.arrayContaining(["active", "in-progress", "in_progress"])
       );
+      // wv-07bd33: CLI `wv add --verification-plan` had no MCP schema
+      // counterpart (tests/test-mcp-parity.sh drift). Guards the schema half
+      // of the fix; the forwarding half is covered by the tools/call test
+      // "forwards verification_plan to wv add" below.
+      expect(
+        (byName.weave_add.inputSchema.properties as Record<string, { type?: string }>)?.verification_plan?.type
+      ).toBe("string");
       expect(byName.weave_list.inputSchema.properties?.status?.enum).toEqual(
         expect.arrayContaining(["active", "in-progress", "in_progress"])
       );
@@ -903,6 +1020,30 @@ describe("Weave MCP Server", () => {
       expect(handlerSource).toContain("result = wv(cmd, WV_LIFECYCLE_TIMEOUT)");
     });
 
+    it("weave_done forwards an explicit completion file scope", async () => {
+      const wrapper = createLoggedWvWrapper();
+      const loggedClient = new MCPTestClient([], { WV_PATH: wrapper.wvPath });
+      let commands: string[] = [];
+      try {
+        await loggedClient.request("tools/call", {
+          name: "weave_done",
+          arguments: {
+            id: "wv-0000",
+            completion_files: ["scripts/example.py", "tests/test-example.sh"],
+          },
+        });
+        commands = readLoggedCommands(wrapper.logPath);
+      } finally {
+        await loggedClient.close();
+        wrapper.cleanup();
+      }
+      expect(commands).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining("done wv-0000 --completion-files=scripts/example.py,tests/test-example.sh"),
+        ])
+      );
+    });
+
     it("weave_add with backtick injection should not execute", async () => {
       const response = await client.request("tools/call", {
         name: "weave_add",
@@ -912,6 +1053,30 @@ describe("Weave MCP Server", () => {
       const result = response.result as { content: { text: string }[] };
       createdNodeIds.push(extractNodeId(result.content[0].text));
       expect(result.content[0].text).not.toContain("root:");
+    });
+
+    it("weave_add forwards verification_plan to wv add (wv-07bd33)", async () => {
+      const addResponse = await client.request("tools/call", {
+        name: "weave_add",
+        arguments: {
+          text: "test-verification-plan-forwarding",
+          standalone: true,
+          verification_plan: "make check-full exits 0",
+        },
+      });
+      expect(addResponse.error).toBeUndefined();
+      const addResult = addResponse.result as { isError?: boolean; content: { text: string }[] };
+      expect(addResult.isError).not.toBe(true);
+      const nodeId = extractNodeId(addResult.content[0].text);
+      createdNodeIds.push(nodeId);
+
+      const showResponse = await client.request("tools/call", {
+        name: "weave_show",
+        arguments: { id: nodeId },
+      });
+      const showResult = showResponse.result as { content: { text: string }[] };
+      const nodes = JSON.parse(showResult.content[0].text);
+      expect(nodes[0].metadata).toEqual(expect.objectContaining({ verification_plan: "make check-full exits 0" }));
     });
 
     // --- New tool tests (wv-5c5e0f) ---
@@ -976,6 +1141,1058 @@ describe("Weave MCP Server", () => {
       // May error if no quality.db exists, but should not crash
       const result = response.result as { content: { text: string }[] };
       expect(result.content).toBeDefined();
+    });
+
+    it("weave_quality_patterns list additively surfaces scope and shadow_advisories (wv-6cd72e)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "list" },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as {
+          rules: unknown[];
+          scope: string | null;
+          shadow_advisories: string[];
+        };
+        // Built-in default rules (scripts/weave_quality/default_patterns/)
+        // are always present, regardless of the fixture's own (empty)
+        // .weave/patterns/ dir.
+        expect(Array.isArray(payload.rules)).toBe(true);
+        expect(payload.rules.length).toBeGreaterThan(0);
+        // No scan has run in this fixture -- scope stays null, additively
+        // present rather than absent.
+        expect(payload.scope).toBeNull();
+        expect(payload.shadow_advisories).toEqual([]);
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate reports an invalid rule without hiding the rest (wv-6cd72e)", async () => {
+      const fixture = createQualityPatternsFixture();
+      // Unlike scan/list (fail closed on the first invalid rule), validate
+      // reports every candidate independently -- see cmd_patterns_validate.
+      writeFileSync(join(fixture.dir, ".weave", "patterns", "broken-rule.yaml"), "id: [unclosed\n", "utf-8");
+      const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as {
+          rules: Array<{ rule_id: string; status: string; error?: string }>;
+          valid: boolean;
+        };
+        expect(payload.valid).toBe(false);
+        const broken = payload.rules.find((r) => r.rule_id === "broken-rule");
+        expect(broken?.status).toBe("invalid");
+        expect(broken?.error).toContain("missing or empty 'id'");
+        // The rest of the (built-in) rules still validate independently --
+        // one broken file must not hide the others.
+        expect(payload.rules.some((r) => r.status === "valid")).toBe(true);
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns forwards path and preserves scan target/report scope (wv-6cd72e)", async () => {
+      const fixture = createQualityPatternsFixture();
+      writeFileSync(
+        join(fixture.dir, ".weave", "patterns", "test-lexicon-rule.yaml"),
+        "id: test-lexicon-rule\nlanguage: prose\nkind: regex\npatterns:\n  - forbidden\n",
+        "utf-8"
+      );
+      writeFileSync(join(fixture.dir, "doc.md"), "This text contains the forbidden word.\n", "utf-8");
+      const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      try {
+        const scanResponse = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "scan", path: "doc.md" },
+        });
+        expect(scanResponse.error).toBeUndefined();
+        const scanResult = scanResponse.result as { content: { text: string }[] };
+        const scanPayload = JSON.parse(scanResult.content[0].text) as { findings: number };
+        expect(scanPayload.findings).toBe(1);
+
+        const reportResponse = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "report", path: "doc.md" },
+        });
+        expect(reportResponse.error).toBeUndefined();
+        const reportResult = reportResponse.result as { content: { text: string }[] };
+        const reportPayload = JSON.parse(reportResult.content[0].text) as {
+          scope: string | null;
+          by_rule: Record<string, { findings: number }>;
+        };
+        // Preserved verbatim from the CLI's own --json payload -- the path
+        // argument was forwarded, not reimplemented.
+        expect(reportPayload.scope).toBe("doc.md");
+        expect(reportPayload.by_rule["test-lexicon-rule"].findings).toBe(1);
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns direct report call rejects malformed JSON (wv-67a6e5)", async () => {
+      // wv-67a6e5 (external code review round 3, finding 7): a DIRECT
+      // {subcommand: "report"} call used to fall straight through to the
+      // generic wv() helper -- any exit-0 stdout was returned as
+      // successful tool content, no shape check at all.
+      const fixture = createQualityPatternsFixture();
+      const fakeWv = createFakeWvForReport("not valid json{{{", 0);
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "report" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("malformed JSON");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it.each([
+      ["an empty object", "{}"],
+      ["an empty array", "[]"],
+      ["scope alone, missing by_rule/recurring_waivers/finding_count", JSON.stringify({ scope: "ok" })],
+      [
+        "every field present but wrongly typed",
+        JSON.stringify({ by_rule: "bogus", recurring_waivers: 42, finding_count: -1, scope: "ok" }),
+      ],
+    ])(
+      "weave_quality_patterns direct report call rejects %s as a wrong-shaped payload (wv-67a6e5)",
+      async (_label, reportStdout) => {
+        const fixture = createQualityPatternsFixture();
+        const fakeWv = createFakeWvForReport(reportStdout, 0);
+        const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+        try {
+          const response = await patternsClient.request("tools/call", {
+            name: "weave_quality_patterns",
+            arguments: { subcommand: "report" },
+          });
+          const result = response.result as { isError?: boolean; content: { text: string }[] };
+          expect(result.isError).toBe(true);
+          expect(result.content[0].text).toContain("unexpected payload shape");
+        } finally {
+          await patternsClient.close();
+          fakeWv.cleanup();
+          fixture.cleanup();
+        }
+      }
+    );
+
+    it("weave_quality_patterns validate accepts a path argument (wv-6cd72e)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate", path: fixture.dir },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as { valid: boolean };
+        expect(payload.valid).toBe(true);
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate rejects malformed JSON instead of returning it (wv-c4e639)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const fakeWv = createFakeWvForValidate("not valid json{{{", 0);
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("malformed JSON");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate rejects a wrong-shaped payload (wv-c4e639)", async () => {
+      const fixture = createQualityPatternsFixture();
+      // Well-formed JSON, but missing the required valid/rules fields --
+      // e.g. a stray {"ok": true} from some unrelated future command
+      // reusing this exit convention.
+      const fakeWv = createFakeWvForValidate(JSON.stringify({ ok: true }), 0);
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("unexpected payload shape");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate rejects an exit code that disagrees with its own payload (wv-c4e639)", async () => {
+      const fixture = createQualityPatternsFixture();
+      // Well-formed, correctly-shaped, internally CONSISTENT payload
+      // (valid:false genuinely matches its one rules[] entry's own
+      // status:"invalid" -- see wv-860c8c's rules[]/valid consistency
+      // check, which fires first and must not be what trips this test),
+      // but exit 0 while claiming valid: false -- cmd_patterns_validate's
+      // own invariant is `0 if all_valid else 1`, so this combination
+      // should never occur for a genuine run.
+      const fakeWv = createFakeWvForValidate(
+        JSON.stringify({
+          valid: false,
+          rules: [{ rule_id: "broken-rule", path: "/tmp/broken-rule.yaml", status: "invalid", error: "bad schema" }],
+          coverage: VALID_COVERAGE,
+        }),
+        0
+      );
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("disagrees with its own payload");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate rejects an unexpected exit code (wv-c4e639)", async () => {
+      const fixture = createQualityPatternsFixture();
+      // exit 2 with well-formed-looking stdout -- a crash or partial
+      // timeout write that happens to leave SOMETHING on stdout must
+      // not be mistaken for a real result just because it's nonempty.
+      const fakeWv = createFakeWvForValidate(JSON.stringify({ valid: true, rules: [] }), 2);
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("unexpected code 2");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns list surfaces scope_error distinctly from a legitimate null scope (wv-5b9f55)", async () => {
+      // wv-5b9f55 finding 8 (external code review): a genuine failure in
+      // list's internal `report --json` call (used only to obtain scope)
+      // used to be silently folded into the same scope: null a legitimate
+      // "no scan has ever run" naturally produces -- indistinguishable to
+      // a caller either way. This fake `wv` makes ONLY "quality patterns
+      // report" fail (list's own primary call passes through to the real
+      // binary untouched), so rules/shadow_advisories stay populated while
+      // scope collapses to null WITH an additive scope_error explaining why.
+      const fixture = createQualityPatternsFixture();
+      const dir = mkdtempSync(join(tmpdir(), "weave-mcp-fakewv-report-"));
+      const wvPath = join(dir, "wv-fake.sh");
+      const realWvPath = resolve(__dirname, "../../scripts/wv");
+      writeFileSync(
+        wvPath,
+        `#!/bin/sh\ncase "$*" in\n  *"quality patterns report"*)\n    echo "simulated report crash" >&2\n    exit 3\n    ;;\nesac\nexec ${JSON.stringify(realWvPath)} "$@"\n`,
+        "utf-8"
+      );
+      chmodSync(wvPath, 0o755);
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "list" },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as {
+          rules: unknown[];
+          scope: string | null;
+          scope_error?: string;
+          shadow_advisories: string[];
+        };
+        expect(Array.isArray(payload.rules)).toBe(true);
+        expect(payload.rules.length).toBeGreaterThan(0);
+        expect(payload.scope).toBeNull();
+        expect(payload.scope_error).toContain("simulated report crash");
+      } finally {
+        await patternsClient.close();
+        rmSync(dir, { recursive: true, force: true });
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns list scopes its internal report call to path, not an unrelated ambient repo (wv-5b9f55)", async () => {
+      // wv-5b9f55 finding 8 (external code review): report's own `repo`
+      // resolution ignores any explicit path argument entirely for repo
+      // purposes -- before this fix, list's internal report call inherited
+      // repo resolution from the ambient REPO_ROOT/git-root/cwd instead of
+      // the repo list itself was just asked to scope to. A deliberately
+      // WRONG ambient REPO_ROOT (a second, unrelated repo) makes this
+      // observable: report's own _report_scope canonicalization of its
+      // stored last-scan target ("doc.md") against `repo` can only produce
+      // the clean relative "doc.md" label when `repo` genuinely matches
+      // where "doc.md" actually lives -- any other repo makes the target
+      // un-relativizable, falling back to the full absolute path string
+      // instead. (A second, related bug this same fix closes: report must
+      // run with NO explicit path argument at all here -- forwarding
+      // list's own repo-root path onto report's command line made report
+      // treat it as an EXPLICIT SCAN TARGET override, always collapsing
+      // scope to the degenerate "." instead of the real stored target.)
+      const fixture = createQualityPatternsFixture();
+      const wrongRepo = mkdtempSync(join(tmpdir(), "weave-mcp-wrong-repo-"));
+      writeFileSync(
+        join(fixture.dir, ".weave", "patterns", "test-lexicon-rule.yaml"),
+        "id: test-lexicon-rule\nlanguage: prose\nkind: regex\npatterns:\n  - forbidden\n",
+        "utf-8"
+      );
+      writeFileSync(join(fixture.dir, "doc.md"), "This text contains the forbidden word.\n", "utf-8");
+      const patternsClient = new MCPTestClient([], { ...fixture.env, REPO_ROOT: wrongRepo }, fixture.dir);
+      try {
+        const scanResponse = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "scan", path: "doc.md" },
+        });
+        expect(scanResponse.error).toBeUndefined();
+
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "list", path: fixture.dir },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as { scope: string | null };
+        // Clean relative label -- report's own repo agreed with list's,
+        // despite the ambient REPO_ROOT pointing somewhere else entirely.
+        expect(payload.scope).toBe("doc.md");
+      } finally {
+        await patternsClient.close();
+        rmSync(wrongRepo, { recursive: true, force: true });
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns list's own repo-root path is not mistaken for an explicit report target (wv-5b9f55)", async () => {
+      // wv-5b9f55 finding 8 (external code review), isolated from the
+      // ambient-repo mismatch above: even with NO wrong ambient REPO_ROOT
+      // at all, forwarding list's own repo-root `path` onto report's
+      // command line made report treat it as an EXPLICIT SCAN TARGET
+      // override (_canonicalize_target(repo, explicit_path)) rather than
+      // letting it fall through to its normal "last stored scan target"
+      // lookup -- collapsing scope to the degenerate "." (target == repo)
+      // instead of the real stored target ("doc.md") every time list was
+      // called with an explicit path at all.
+      const fixture = createQualityPatternsFixture();
+      writeFileSync(
+        join(fixture.dir, ".weave", "patterns", "test-lexicon-rule.yaml"),
+        "id: test-lexicon-rule\nlanguage: prose\nkind: regex\npatterns:\n  - forbidden\n",
+        "utf-8"
+      );
+      writeFileSync(join(fixture.dir, "doc.md"), "This text contains the forbidden word.\n", "utf-8");
+      const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      try {
+        const scanResponse = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "scan", path: "doc.md" },
+        });
+        expect(scanResponse.error).toBeUndefined();
+
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "list", path: fixture.dir },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as { scope: string | null };
+        expect(payload.scope).toBe("doc.md");
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns list surfaces a managed-rule shadow advisory (wv-6cd72e)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const managedDir = join(fixture.dir, ".weave", "patterns", "managed");
+      mkdirSync(managedDir, { recursive: true });
+      writeFileSync(join(managedDir, ".overridden"), "shadowed-rule.yaml\n", "utf-8");
+      writeFileSync(
+        join(fixture.dir, ".weave", "patterns", "shadowed-rule.yaml"),
+        "id: shadowed-rule\nlanguage: prose\nkind: regex\npatterns:\n  - absent\n",
+        "utf-8"
+      );
+      const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "list" },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as {
+          rules: Array<{ rule_id: string }>;
+          shadow_advisories: string[];
+        };
+        // stdout's own rule listing is untouched by the advisory -- it's
+        // additive, not a replacement.
+        expect(payload.rules.some((r) => r.rule_id === "shadowed-rule")).toBe(true);
+        expect(payload.shadow_advisories).toHaveLength(1);
+        expect(payload.shadow_advisories[0]).toContain("shadowed-rule");
+        expect(payload.shadow_advisories[0]).toContain("shadows an available");
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns list's internal report call resolves the requested repo even when the MCP server's own project root differs (wv-20adef)", async () => {
+      // wv-20adef (external code review round 2): setting REPO_ROOT itself
+      // in the report subprocess's env (wv-5b9f55's original fix) does not
+      // survive the real `wv` wrapper -- the bash entry point's own
+      // wv-config.sh unconditionally reassigns REPO_ROOT from
+      // `git rev-parse --show-toplevel` against the wv subprocess's own
+      // cwd (resolveProjectRoot(), the MCP SERVER's project root), before
+      // _resolve_repo(None) in Python ever sees the value the MCP server
+      // set. Every earlier test's MCPTestClient happened to be spawned
+      // FROM the same directory as the requested repo, so this went
+      // unnoticed -- here the MCP server's own cwd is a genuinely
+      // unrelated directory, exposing the mismatch.
+      const fixture = createQualityPatternsFixture();
+      const mcpCwd = mkdtempSync(join(tmpdir(), "weave-mcp-unrelated-cwd-"));
+      writeFileSync(
+        join(fixture.dir, ".weave", "patterns", "test-lexicon-rule.yaml"),
+        "id: test-lexicon-rule\nlanguage: prose\nkind: regex\npatterns:\n  - forbidden\n",
+        "utf-8"
+      );
+      writeFileSync(join(fixture.dir, "doc.md"), "This text contains the forbidden word.\n", "utf-8");
+      // Seed the scan directly (not through this test's own MCP client,
+      // which is deliberately anchored elsewhere) -- cmd_patterns_scan's
+      // own repo resolution (_resolve_repo(None)) always follows cwd, so
+      // this subprocess's cwd is what makes it target fixture.dir.
+      const scanResult = spawnSync(
+        resolve(__dirname, "../../scripts/wv"),
+        ["quality", "patterns", "scan", "--json", "doc.md"],
+        {
+          cwd: fixture.dir,
+          encoding: "utf-8",
+          env: { ...process.env, ...fixture.env, NO_COLOR: "1", WV_AGENT: "1" },
+        }
+      );
+      expect(scanResult.status).toBe(0);
+
+      const patternsClient = new MCPTestClient([], fixture.env, mcpCwd);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "list", path: fixture.dir },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as { scope: string | null; scope_error?: string };
+        // A clean "doc.md" label (not null, not a scope_error) proves
+        // report's own repo resolution followed fixture.dir -- the repo
+        // list itself was scoped to -- not mcpCwd.
+        expect(payload.scope_error).toBeUndefined();
+        expect(payload.scope).toBe("doc.md");
+      } finally {
+        await patternsClient.close();
+        rmSync(mcpCwd, { recursive: true, force: true });
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate rejects a null entry in rules[] (wv-860c8c)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const fakeWv = createFakeWvForValidate(
+        JSON.stringify({ valid: true, rules: [null], coverage: VALID_COVERAGE }),
+        0
+      );
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("unexpected shape");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate rejects a rules[] entry missing rule_id/path/error (wv-860c8c)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const fakeWv = createFakeWvForValidate(
+        JSON.stringify({ valid: true, rules: [{ status: "invalid" }], coverage: VALID_COVERAGE }),
+        0
+      );
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("unexpected shape");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate rejects valid:false with an all-valid rules[] (wv-860c8c)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const fakeWv = createFakeWvForValidate(
+        JSON.stringify({
+          valid: false,
+          rules: [{ rule_id: "r", path: "/tmp/r.yaml", status: "valid", language: "python" }],
+          coverage: VALID_COVERAGE,
+        }),
+        1
+      );
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("disagrees with its own rules[] statuses");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate rejects an empty rules[] (wv-8b3f8a)", async () => {
+      // wv-8b3f8a (external code review round 3 re-audit): {valid: true,
+      // rules: []} used to pass -- every() is vacuously true on an empty
+      // array for both the per-entry shape check and the valid/entries
+      // consistency check. _DEFAULT_PATTERNS_DIR always ships built-in
+      // rules, so an empty rules[] is not a reachable state from a
+      // working install.
+      const fixture = createQualityPatternsFixture();
+      const fakeWv = createFakeWvForValidate(JSON.stringify({ valid: true, rules: [], coverage: VALID_COVERAGE }), 0);
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("unexpected payload shape");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate rejects a valid entry missing language (wv-8b3f8a)", async () => {
+      // cmd_patterns_validate always sets entry["language"] on every
+      // status=="valid" entry (and clears it again if a later duplicate-
+      // id collision demotes it to "invalid") -- a valid entry without
+      // one is exactly as unreachable as an invalid one without `error`.
+      const fixture = createQualityPatternsFixture();
+      const fakeWv = createFakeWvForValidate(
+        JSON.stringify({
+          valid: true,
+          rules: [{ rule_id: "r", path: "/tmp/r.yaml", status: "valid" }],
+          coverage: VALID_COVERAGE,
+        }),
+        0
+      );
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("unexpected shape");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate rejects a valid entry carrying a leftover error field (wv-731450)", async () => {
+      // wv-731450 (external code review round 3 re-audit): cmd_patterns_validate
+      // builds an entry inside exactly one of two mutually exclusive
+      // branches -- the try sets status/language, the except sets
+      // status/error -- so a status=="valid" entry with an `error`
+      // tagging along is exactly as unreachable as one missing `language`.
+      const fixture = createQualityPatternsFixture();
+      const fakeWv = createFakeWvForValidate(
+        JSON.stringify({
+          valid: true,
+          rules: [{ rule_id: "r", path: "/tmp/r.yaml", status: "valid", language: "python", error: "boom" }],
+          coverage: VALID_COVERAGE,
+        }),
+        0
+      );
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("unexpected shape");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate rejects an invalid entry carrying a leftover language field (wv-731450)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const fakeWv = createFakeWvForValidate(
+        JSON.stringify({
+          valid: false,
+          rules: [{ rule_id: "r", path: "/tmp/r.yaml", status: "invalid", error: "boom", language: "python" }],
+          coverage: VALID_COVERAGE,
+        }),
+        1
+      );
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("unexpected shape");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it.each([
+      [
+        "a missing coverage field",
+        { valid: true, rules: [{ rule_id: "r", path: "/tmp/r.yaml", status: "valid", language: "python" }] },
+      ],
+      [
+        "coverage missing a required group",
+        {
+          valid: true,
+          rules: [{ rule_id: "r", path: "/tmp/r.yaml", status: "valid", language: "python" }],
+          coverage: { kinds: {}, match_scopes: {}, maturities: {} },
+        },
+      ],
+      [
+        "coverage with a non-boolean value",
+        {
+          valid: true,
+          rules: [{ rule_id: "r", path: "/tmp/r.yaml", status: "valid", language: "python" }],
+          coverage: { kinds: { lexicon: "yes" }, match_scopes: {}, maturities: {}, optional_keys: {} },
+        },
+      ],
+      [
+        "coverage whose groups are all vacuously empty (wv-731450)",
+        {
+          valid: true,
+          rules: [{ rule_id: "r", path: "/tmp/r.yaml", status: "valid", language: "python" }],
+          coverage: { kinds: {}, match_scopes: {}, maturities: {}, optional_keys: {} },
+        },
+      ],
+    ])("weave_quality_patterns validate rejects %s (wv-8b3f8a)", async (_label, payload) => {
+      const fixture = createQualityPatternsFixture();
+      const fakeWv = createFakeWvForValidate(JSON.stringify(payload), 0);
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("unexpected payload shape");
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns validate accepts a genuine well-formed payload (wv-8b3f8a)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const fakeWv = createFakeWvForValidate(
+        JSON.stringify({
+          valid: false,
+          rules: [
+            { rule_id: "good", path: "/tmp/good.yaml", status: "valid", language: "python" },
+            { rule_id: "bad", path: "/tmp/bad.yaml", status: "invalid", error: "boom" },
+          ],
+          coverage: VALID_COVERAGE,
+        }),
+        1
+      );
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: fakeWv.wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "validate" },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBeFalsy();
+        const payload = JSON.parse(result.content[0].text) as { valid: boolean; rules: unknown[] };
+        expect(payload.valid).toBe(false);
+        expect(payload.rules).toHaveLength(2);
+      } finally {
+        await patternsClient.close();
+        fakeWv.cleanup();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns list rejects empty stdout instead of fabricating rules: [] (wv-ce5ca6)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const dir = mkdtempSync(join(tmpdir(), "weave-mcp-fakewv-list-"));
+      const wvPath = join(dir, "wv-fake.sh");
+      const realWvPath = resolve(__dirname, "../../scripts/wv");
+      writeFileSync(
+        wvPath,
+        `#!/bin/sh\ncase "$*" in\n  *"quality patterns list"*)\n    exit 0\n    ;;\nesac\nexec ${JSON.stringify(realWvPath)} "$@"\n`,
+        "utf-8"
+      );
+      chmodSync(wvPath, 0o755);
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "list" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("unexpected payload shape");
+      } finally {
+        await patternsClient.close();
+        rmSync(dir, { recursive: true, force: true });
+        fixture.cleanup();
+      }
+    });
+
+    it.each([
+      ["a scalar", "42"],
+      ["an object", "{}"],
+      ["null", "null"],
+      ["an array with an invalid entry", JSON.stringify([{ rule_id: "x" }])],
+    ])("weave_quality_patterns list rejects %s as rules (wv-ce5ca6)", async (_label, stdout) => {
+      const fixture = createQualityPatternsFixture();
+      const dir = mkdtempSync(join(tmpdir(), "weave-mcp-fakewv-list-"));
+      const wvPath = join(dir, "wv-fake.sh");
+      const realWvPath = resolve(__dirname, "../../scripts/wv");
+      writeFileSync(
+        wvPath,
+        `#!/bin/sh\ncase "$*" in\n  *"quality patterns list"*)\n    printf '%s' ${JSON.stringify(stdout)}\n    exit 0\n    ;;\nesac\nexec ${JSON.stringify(realWvPath)} "$@"\n`,
+        "utf-8"
+      );
+      chmodSync(wvPath, 0o755);
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "list" },
+        });
+        const result = response.result as { isError?: boolean; content: { text: string }[] };
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("unexpected payload shape");
+      } finally {
+        await patternsClient.close();
+        rmSync(dir, { recursive: true, force: true });
+        fixture.cleanup();
+      }
+    });
+
+    it.each([
+      [
+        "failed with hits:null but no error",
+        JSON.stringify([{ rule_id: "r", path: "/tmp/r.yaml", status: "failed", hits: null }]),
+      ],
+      [
+        "success with hits:null instead of a count",
+        JSON.stringify([{ rule_id: "r", path: "/tmp/r.yaml", status: "success", hits: null }]),
+      ],
+      ["an unrecognized status", JSON.stringify([{ rule_id: "r", path: "/tmp/r.yaml", status: "bogus", hits: null }])],
+      [
+        "negative hits on success",
+        JSON.stringify([{ rule_id: "r", path: "/tmp/r.yaml", status: "success", hits: -1 }]),
+      ],
+      [
+        "fractional hits on success",
+        JSON.stringify([{ rule_id: "r", path: "/tmp/r.yaml", status: "success", hits: 1.5 }]),
+      ],
+      [
+        "not_run with a nonnull hits",
+        JSON.stringify([{ rule_id: "r", path: "/tmp/r.yaml", status: "not_run", hits: 0 }]),
+      ],
+      [
+        "success carrying a leftover error field (wv-731450)",
+        JSON.stringify([{ rule_id: "r", path: "/tmp/r.yaml", status: "success", hits: 0, error: "scan failed" }]),
+      ],
+      [
+        "not_run carrying a leftover error field (wv-731450)",
+        JSON.stringify([{ rule_id: "r", path: "/tmp/r.yaml", status: "not_run", hits: null, error: "boom" }]),
+      ],
+    ])(
+      "weave_quality_patterns list rejects %s as an impossible status/hits combination (wv-885d12)",
+      async (_label, stdout) => {
+        const fixture = createQualityPatternsFixture();
+        const dir = mkdtempSync(join(tmpdir(), "weave-mcp-fakewv-list-"));
+        const wvPath = join(dir, "wv-fake.sh");
+        const realWvPath = resolve(__dirname, "../../scripts/wv");
+        writeFileSync(
+          wvPath,
+          `#!/bin/sh\ncase "$*" in\n  *"quality patterns list"*)\n    printf '%s' ${JSON.stringify(stdout)}\n    exit 0\n    ;;\nesac\nexec ${JSON.stringify(realWvPath)} "$@"\n`,
+          "utf-8"
+        );
+        chmodSync(wvPath, 0o755);
+        const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: wvPath }, fixture.dir);
+        try {
+          const response = await patternsClient.request("tools/call", {
+            name: "weave_quality_patterns",
+            arguments: { subcommand: "list" },
+          });
+          const result = response.result as { isError?: boolean; content: { text: string }[] };
+          expect(result.isError).toBe(true);
+          expect(result.content[0].text).toContain("unexpected payload shape");
+        } finally {
+          await patternsClient.close();
+          rmSync(dir, { recursive: true, force: true });
+          fixture.cleanup();
+        }
+      }
+    );
+
+    it("weave_quality_patterns list accepts each of the three genuine status/hits states (wv-885d12)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const dir = mkdtempSync(join(tmpdir(), "weave-mcp-fakewv-list-"));
+      const wvPath = join(dir, "wv-fake.sh");
+      const realWvPath = resolve(__dirname, "../../scripts/wv");
+      const stdout = JSON.stringify([
+        { rule_id: "a", path: "/tmp/a.yaml", status: "not_run", hits: null },
+        { rule_id: "b", path: "/tmp/b.yaml", status: "failed", hits: null, error: "boom" },
+        { rule_id: "c", path: "/tmp/c.yaml", status: "success", hits: 0 },
+      ]);
+      writeFileSync(
+        wvPath,
+        `#!/bin/sh\ncase "$*" in\n  *"quality patterns list"*)\n    printf '%s' ${JSON.stringify(stdout)}\n    exit 0\n    ;;\nesac\nexec ${JSON.stringify(realWvPath)} "$@"\n`,
+        "utf-8"
+      );
+      chmodSync(wvPath, 0o755);
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "list" },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as { rules: unknown[] };
+        expect(payload.rules).toHaveLength(3);
+      } finally {
+        await patternsClient.close();
+        rmSync(dir, { recursive: true, force: true });
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns list does not label an unrelated stderr warning as a shadow advisory (wv-ce5ca6)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const dir = mkdtempSync(join(tmpdir(), "weave-mcp-fakewv-list-"));
+      const wvPath = join(dir, "wv-fake.sh");
+      const realWvPath = resolve(__dirname, "../../scripts/wv");
+      writeFileSync(
+        wvPath,
+        `#!/bin/sh
+case "$*" in
+  *"quality patterns list"*)
+    echo "⚠ some unrelated future warning that also starts with the glyph" >&2
+    printf '%s' '[{"rule_id":"r","path":"/tmp/r.yaml","status":"not_run","hits":null}]'
+    exit 0
+    ;;
+esac
+exec ${JSON.stringify(realWvPath)} "$@"
+`,
+        "utf-8"
+      );
+      chmodSync(wvPath, 0o755);
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: wvPath }, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "list" },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as { shadow_advisories: string[] };
+        expect(payload.shadow_advisories).toEqual([]);
+      } finally {
+        await patternsClient.close();
+        rmSync(dir, { recursive: true, force: true });
+        fixture.cleanup();
+      }
+    });
+
+    it.each([
+      ["an empty object", "{}"],
+      ["an empty array", "[]"],
+      ["a non-string scope", JSON.stringify({ scope: 42 })],
+      // wv-67a6e5 (external code review round 3, finding 7): a
+      // well-typed `scope` alone used to be sufficient here -- this
+      // payload is missing by_rule/recurring_waivers/finding_count
+      // entirely, which the shared isValidPatternReportPayload validator
+      // (now used by both list's internal call and a direct report call)
+      // rejects.
+      ["scope alone, missing by_rule/recurring_waivers/finding_count", JSON.stringify({ scope: "ok" })],
+    ])(
+      "weave_quality_patterns list surfaces scope_error for report returning %s (wv-ce5ca6)",
+      async (_label, reportStdout) => {
+        const fixture = createQualityPatternsFixture();
+        const dir = mkdtempSync(join(tmpdir(), "weave-mcp-fakewv-report-"));
+        const wvPath = join(dir, "wv-fake.sh");
+        const realWvPath = resolve(__dirname, "../../scripts/wv");
+        writeFileSync(
+          wvPath,
+          `#!/bin/sh\ncase "$*" in\n  *"quality patterns report"*)\n    printf '%s' ${JSON.stringify(reportStdout)}\n    exit 0\n    ;;\nesac\nexec ${JSON.stringify(realWvPath)} "$@"\n`,
+          "utf-8"
+        );
+        chmodSync(wvPath, 0o755);
+        const patternsClient = new MCPTestClient([], { ...fixture.env, WV_PATH: wvPath }, fixture.dir);
+        try {
+          const response = await patternsClient.request("tools/call", {
+            name: "weave_quality_patterns",
+            arguments: { subcommand: "list" },
+          });
+          expect(response.error).toBeUndefined();
+          const result = response.result as { content: { text: string }[] };
+          const payload = JSON.parse(result.content[0].text) as {
+            rules: unknown[];
+            scope: string | null;
+            scope_error?: string;
+          };
+          expect(Array.isArray(payload.rules)).toBe(true);
+          expect(payload.rules.length).toBeGreaterThan(0);
+          expect(payload.scope).toBeNull();
+          expect(payload.scope_error).toContain("unexpected payload shape");
+        } finally {
+          await patternsClient.close();
+          rmSync(dir, { recursive: true, force: true });
+          fixture.cleanup();
+        }
+      }
+    );
+
+    it("weave_quality_patterns list's internal report call only gets what's left of the shared budget, not a fresh one (wv-c9ea87)", async () => {
+      // wv-c9ea87 (external code review round 2): the primary list call
+      // and its internal report call each used to get an independent,
+      // fresh 60s timeout -- a slow primary call followed by a report call
+      // that also stalls could block one synchronous MCP request for
+      // close to 120s combined. WV_MCP_PATTERNS_LIST_BUDGET_MS lets this
+      // test observe the shared-budget behavior in milliseconds instead of
+      // waiting anywhere near a real 60s: the primary call alone (300ms)
+      // already exhausts a 400ms shared budget, so report must be SKIPPED
+      // entirely -- not given a fresh budget that would let its own 1s
+      // sleep complete.
+      const fixture = createQualityPatternsFixture();
+      const dir = mkdtempSync(join(tmpdir(), "weave-mcp-fakewv-budget-"));
+      const wvPath = join(dir, "wv-fake.sh");
+      const realWvPath = resolve(__dirname, "../../scripts/wv");
+      writeFileSync(
+        wvPath,
+        `#!/bin/sh
+case "$*" in
+  *"quality patterns list"*)
+    sleep 0.3
+    printf '%s' '[{"rule_id":"r","path":"/tmp/r.yaml","status":"not_run","hits":null}]'
+    exit 0
+    ;;
+  *"quality patterns report"*)
+    sleep 4
+    printf '%s' '{"scope":null}'
+    exit 0
+    ;;
+esac
+exec ${JSON.stringify(realWvPath)} "$@"
+`,
+        "utf-8"
+      );
+      chmodSync(wvPath, 0o755);
+      const patternsClient = new MCPTestClient(
+        [],
+        { ...fixture.env, WV_PATH: wvPath, WV_MCP_PATTERNS_LIST_BUDGET_MS: "400" },
+        fixture.dir
+      );
+      try {
+        const start = Date.now();
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "list" },
+        });
+        const elapsed = Date.now() - start;
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as { scope: string | null; scope_error?: string };
+        expect(payload.scope_error).toContain("budget");
+        // A wide margin below primary(300ms) + report(4000ms) combined --
+        // proves report never actually ran (a fresh-budget report call
+        // would have pushed this past ~4300ms). Generous enough to absorb
+        // process-spawn/stdio overhead without becoming flaky.
+        expect(elapsed).toBeLessThan(3000);
+      } finally {
+        await patternsClient.close();
+        rmSync(dir, { recursive: true, force: true });
+        fixture.cleanup();
+      }
     });
 
     it("weave_code_search reports readiness when chunks or graph context are missing", async () => {

@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Literal
 
 _DEFAULT_MODEL = "minishlab/potion-code-16M"
 _FTS_SPECIAL = re.compile(r'[()"\^*~:\-]')
@@ -43,6 +45,32 @@ class SearchResult:
     def snippet(self) -> str:
         """First 200 chars of content with newlines collapsed."""
         return self.content[:200].replace("\n", " ")
+
+
+SearchExecutionStatus = Literal["success", "degraded", "failure"]
+
+
+@dataclass
+class HybridSearchDiagnostics:
+    """Observed result counts from each hybrid retrieval leg."""
+
+    fts_result_count: int = 0
+    vector_result_count: int = 0
+    fts_status: SearchExecutionStatus = "success"
+    vector_status: SearchExecutionStatus = "success"
+
+
+@dataclass
+class SearchExecutionResult:
+    """Results plus an explicit, stable backend execution disposition."""
+
+    results: list[SearchResult]
+    status: SearchExecutionStatus
+    reason: str | None = None
+
+    def disposition(self) -> dict[str, str | None]:
+        """Return the JSON-safe execution disposition."""
+        return {"status": self.status, "reason": self.reason}
 
 
 VectorRow = tuple[int, str, int, int, str, bytes]
@@ -92,6 +120,10 @@ class FilterResolution:
         }
 
 
+class FilterBackendError(RuntimeError):
+    """A valid graph filter could not execute against the search database."""
+
+
 def _normalize_repo_path(path: str) -> str:
     """Canonicalize repository-relative paths for chunks.file/node_files.path joins."""
     normalized = path.strip().replace("\\", "/")
@@ -124,7 +156,10 @@ def resolve_filter_scope(filter_expr: str, db_path: str) -> FilterResolution:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", edge_type):
         raise ValueError(f"invalid edge type in filter: {edge_type}")
 
-    conn = sqlite3.connect(db_path)
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.Error as exc:
+        raise FilterBackendError("graph database is unavailable") from exc
     try:
         if op == "exists":
             node_rows = conn.execute(
@@ -152,8 +187,8 @@ def resolve_filter_scope(filter_expr: str, db_path: str) -> FilterResolution:
                 """,
                 (edge_type,),
             ).fetchall()
-    except sqlite3.OperationalError as exc:
-        raise ValueError(
+    except sqlite3.Error as exc:
+        raise FilterBackendError(
             "graph tables unavailable in current DB; ensure nodes/edges/node_files are present"
         ) from exc
     finally:
@@ -163,7 +198,10 @@ def resolve_filter_scope(filter_expr: str, db_path: str) -> FilterResolution:
     if not node_ids:
         return FilterResolution(expr=expr, node_ids=[], files=[])
 
-    conn = sqlite3.connect(db_path)
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.Error as exc:
+        raise FilterBackendError("graph database is unavailable") from exc
     try:
         placeholders = ",".join("?" for _ in node_ids)
         file_rows = conn.execute(
@@ -176,8 +214,8 @@ def resolve_filter_scope(filter_expr: str, db_path: str) -> FilterResolution:
             """,
             tuple(node_ids),
         ).fetchall()
-    except sqlite3.OperationalError as exc:
-        raise ValueError(
+    except sqlite3.Error as exc:
+        raise FilterBackendError(
             "node_files table unavailable in current DB; cannot build file allowlist"
         ) from exc
     finally:
@@ -370,19 +408,24 @@ def _build_fts_expr(query: str) -> str:
     return " OR ".join(f'"{t}"' for t in tokens[:12])
 
 
-def fts_search(
+def execute_fts_search(
     query: str,
     db_path: str,
     limit: int = 10,
     allowed_files: set[str] | None = None,
-) -> list[SearchResult]:
-    """BM25 full-text search over chunks_fts. Returns results sorted best-first."""
+) -> SearchExecutionResult:
+    """Execute BM25 search without collapsing backend failure into an empty match set."""
+    if limit <= 0:
+        return SearchExecutionResult([], "success", "zero_limit")
     if not Path(db_path).exists():
-        return []
+        return SearchExecutionResult([], "failure", "database_missing")
     if allowed_files is not None and len(allowed_files) == 0:
-        return []
+        return SearchExecutionResult([], "success", "empty_scope")
     fts_expr = _build_fts_expr(query)
-    conn = sqlite3.connect(db_path)
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.Error:
+        return SearchExecutionResult([], "failure", "fts_database_error")
     try:
         if allowed_files:
             file_list = sorted(allowed_files)
@@ -413,132 +456,189 @@ def fts_search(
                 """,
                 (fts_expr, limit),
             ).fetchall()
-    except sqlite3.OperationalError:
-        return []
+    except sqlite3.Error:
+        return SearchExecutionResult([], "failure", "fts_database_error")
     finally:
         conn.close()
     # bm25() returns negative values — negate so higher=better
-    return [
+    results = [
         SearchResult(r[0], r[1], r[2], r[3], r[4], -r[5], "fts")
         for r in rows
     ]
+    return SearchExecutionResult(results, "success", None if results else "no_matches")
 
 
-def _load_vector_rows(db_path: str) -> list[VectorRow]:
-    """Return chunks with embeddings, or [] when the schema is missing vector prerequisites."""
-    conn = sqlite3.connect(db_path)
+def fts_search(
+    query: str, db_path: str, limit: int = 10, allowed_files: set[str] | None = None
+) -> list[SearchResult]:
+    """Compatibility wrapper returning only FTS results."""
+    return execute_fts_search(query, db_path, limit, allowed_files).results
+
+
+def _load_vector_rows(  # pylint: disable=too-many-return-statements
+    db_path: str,
+    allowed_files: set[str] | None,
+) -> tuple[list[VectorRow], str | None]:
+    """Return complete in-scope embedded chunks and a stable failure reason, if any."""
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.Error:
+        return [], "vector_database_error"
     try:
         try:
             rows = conn.execute(
                 "SELECT id, file, line_start, line_end, content, embedding"
-                " FROM chunks WHERE embedding IS NOT NULL"
+                " FROM chunks"
             ).fetchall()
-        except sqlite3.OperationalError:
-            return []
+        except sqlite3.Error:
+            return [], "vector_schema_unavailable"
     finally:
         conn.close()
 
+    scoped_rows = [
+        row
+        for row in rows
+        if allowed_files is None
+        or (len(row) >= 2 and isinstance(row[1], str)
+            and _normalize_repo_path(row[1]) in allowed_files)
+    ]
+    if not scoped_rows:
+        return [], None
+
     typed_rows: list[VectorRow] = []
-    for row in rows:
+    for row in scoped_rows:
         if len(row) != 6:
-            continue
+            return [], "invalid_stored_vectors"
         chunk_id, file_path, line_start, line_end, content, embedding = row
         if not isinstance(chunk_id, int):
-            continue
+            return [], "invalid_stored_vectors"
         if not isinstance(file_path, str):
-            continue
+            return [], "invalid_stored_vectors"
         if not isinstance(line_start, int):
-            continue
+            return [], "invalid_stored_vectors"
         if not isinstance(line_end, int):
-            continue
+            return [], "invalid_stored_vectors"
         if not isinstance(content, str):
-            continue
+            return [], "invalid_stored_vectors"
+        if embedding is None:
+            return [], "embeddings_unavailable"
         if not isinstance(embedding, bytes):
-            continue
+            return [], "invalid_stored_vectors"
         typed_rows.append((chunk_id, file_path, line_start, line_end, content, embedding))
 
-    return typed_rows
+    return typed_rows, None
 
 
-def vector_search(
+def execute_vector_search(  # pylint: disable=too-many-return-statements
     query: str,
     db_path: str,
     limit: int = 10,
     model_name: str = _DEFAULT_MODEL,
     allowed_files: set[str] | None = None,
-) -> list[SearchResult]:
-    """Cosine similarity search over stored chunk embeddings."""
+) -> SearchExecutionResult:
+    """Execute vector search with explicit prerequisite and runtime failures."""
+    if limit <= 0:
+        return SearchExecutionResult([], "success", "zero_limit")
     if not Path(db_path).exists():
-        return []
+        return SearchExecutionResult([], "failure", "database_missing")
     if allowed_files is not None and len(allowed_files) == 0:
-        return []
+        return SearchExecutionResult([], "success", "empty_scope")
 
-    rows = _load_vector_rows(db_path)
+    rows, load_error = _load_vector_rows(db_path, allowed_files)
+    if load_error:
+        return SearchExecutionResult([], "failure", load_error)
     if not rows:
-        return []
-    if allowed_files:
-        rows = [row for row in rows if _normalize_repo_path(row[1]) in allowed_files]
-        if not rows:
-            return []
+        return SearchExecutionResult([], "success", "no_candidates")
 
     try:
         import numpy as np  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
         from model2vec import StaticModel  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
         model = StaticModel.from_pretrained(model_name)
         q_vec = model.encode([query])[0].astype(np.float32)
+    except ImportError:  # pragma: no cover - environment dependent
+        return SearchExecutionResult([], "failure", "vector_dependency_unavailable")
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        return []
+        return SearchExecutionResult([], "failure", "embedding_model_unavailable")
 
-    dim = len(q_vec)
-    q_norm = float(np.linalg.norm(q_vec))
-    if q_norm == 0:
-        return []
+    try:
+        if q_vec.ndim != 1 or q_vec.size == 0 or not np.all(np.isfinite(q_vec)):
+            return SearchExecutionResult([], "failure", "invalid_query_vector")
+        dim = len(q_vec)
+        q_norm = float(np.linalg.norm(q_vec))
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return SearchExecutionResult([], "failure", "invalid_query_vector")
+    if not math.isfinite(q_norm) or q_norm <= 0:
+        return SearchExecutionResult([], "failure", "invalid_query_vector")
 
-    valid = [r for r in rows if len(r[5]) // 4 == dim]
-    if not valid:
-        return []
+    if any(len(row[5]) % 4 != 0 or len(row[5]) // 4 != dim for row in rows):
+        return SearchExecutionResult([], "failure", "vector_dimension_mismatch")
 
-    matrix = np.stack([np.frombuffer(r[5], dtype=np.float32) for r in valid])  # (N, dim)
+    matrix = np.stack([np.frombuffer(row[5], dtype=np.float32) for row in rows])  # (N, dim)
+    if not np.all(np.isfinite(matrix)) or not np.all(np.isfinite(q_vec)):
+        return SearchExecutionResult([], "failure", "invalid_vectors")
     e_norms = np.linalg.norm(matrix, axis=1)  # (N,)
-    nonzero = e_norms > 0
-    if not np.any(nonzero):
-        return []
+    if not np.all(np.isfinite(e_norms)) or not np.all(e_norms > 0):
+        return SearchExecutionResult([], "failure", "invalid_stored_vectors")
 
-    valid_rows = [r for r, ok in zip(valid, nonzero) if ok]
-    scores = (matrix[nonzero] @ q_vec) / (e_norms[nonzero] * q_norm)  # (M,)
+    scores = (matrix @ q_vec) / (e_norms * q_norm)
+    if not np.all(np.isfinite(scores)):
+        return SearchExecutionResult([], "failure", "invalid_vector_scores")
 
-    k = min(limit, len(valid_rows))
-    if k == 0:
-        return []
-    if k < len(valid_rows):
+    k = min(limit, len(rows))
+    if k < len(rows):
         top = np.argpartition(scores, -k)[-k:]
         order = top[np.argsort(scores[top])[::-1]]
     else:
         order = np.argsort(scores)[::-1]
 
-    return [
+    results = [
         SearchResult(
-            valid_rows[i][0], valid_rows[i][1], valid_rows[i][2],
-            valid_rows[i][3], valid_rows[i][4], float(scores[i]), "vector",
+            rows[i][0], rows[i][1], rows[i][2],
+            rows[i][3], rows[i][4], float(scores[i]), "vector",
         )
         for i in order
     ]
+    return SearchExecutionResult(results, "success")
 
 
-def hybrid_search(
+def vector_search(
+    query: str, db_path: str, limit: int = 10, model_name: str = _DEFAULT_MODEL,
+    allowed_files: set[str] | None = None,
+) -> list[SearchResult]:
+    """Compatibility wrapper returning only vector results."""
+    return execute_vector_search(query, db_path, limit, model_name, allowed_files).results
+
+
+def execute_hybrid_search(
     query: str,
     db_path: str,
     limit: int = 10,
     model_name: str = _DEFAULT_MODEL,
     rrf_k: int = 60,
     allowed_files: set[str] | None = None,
-) -> list[SearchResult]:
-    """RRF blend of FTS BM25 and cosine similarity — best of both retrieval modes."""
+    diagnostics: HybridSearchDiagnostics | None = None,
+) -> SearchExecutionResult:
+    """Execute both retrieval legs and report success, degradation, or failure."""
     fetch = limit * 3
-    fts = fts_search(query, db_path, limit=fetch, allowed_files=allowed_files)
-    vec = vector_search(
+    fts_execution = execute_fts_search(query, db_path, limit=fetch, allowed_files=allowed_files)
+    vector_execution = execute_vector_search(
         query, db_path, limit=fetch, model_name=model_name, allowed_files=allowed_files
     )
+    fts = fts_execution.results
+    vec = vector_execution.results
+    if diagnostics is not None:
+        diagnostics.fts_result_count = len(fts)
+        diagnostics.vector_result_count = len(vec)
+        diagnostics.fts_status = fts_execution.status
+        diagnostics.vector_status = vector_execution.status
+
+    failures = [
+        execution
+        for execution in (fts_execution, vector_execution)
+        if execution.status == "failure"
+    ]
+    if len(failures) == 2:
+        return SearchExecutionResult([], "failure", "all_hybrid_backends_failed")
 
     fts_rank = {r.chunk_id: i + 1 for i, r in enumerate(fts)}
     vec_rank = {r.chunk_id: i + 1 for i, r in enumerate(vec)}
@@ -560,7 +660,7 @@ def hybrid_search(
         rrf_scores[cid] = score
 
     top_ids = sorted(rrf_scores, key=lambda cid: rrf_scores[cid], reverse=True)[:limit]
-    return [
+    results = [
         SearchResult(
             cid,
             all_chunks[cid].file,
@@ -572,6 +672,109 @@ def hybrid_search(
         )
         for cid in top_ids
     ]
+    if failures:
+        failed_leg = "fts" if fts_execution.status == "failure" else "vector"
+        return SearchExecutionResult(results, "degraded", f"{failed_leg}_backend_failed")
+    return SearchExecutionResult(results, "success")
+
+
+def hybrid_search(
+    query: str, db_path: str, limit: int = 10, model_name: str = _DEFAULT_MODEL,
+    rrf_k: int = 60, allowed_files: set[str] | None = None,
+    diagnostics: HybridSearchDiagnostics | None = None,
+) -> list[SearchResult]:
+    """Compatibility wrapper returning only hybrid results."""
+    return execute_hybrid_search(
+        query, db_path, limit, model_name, rrf_k, allowed_files, diagnostics
+    ).results
+
+
+def _print_json_results(
+    results: list[SearchResult],
+    graph_ctx: dict[str, Any],
+    filter_resolution: FilterResolution | None,
+    readiness: dict[str, ReadinessSignal],
+    execution: SearchExecutionResult,
+) -> None:
+    out = []
+    for result in results:
+        entry: dict[str, object] = {
+            "file": result.file,
+            "line_start": result.line_start,
+            "line_end": result.line_end,
+            "score": result.score,
+            "snippet": result.snippet,
+            "source": result.source,
+        }
+        if graph_ctx:
+            file_context = graph_ctx.get(result.file)
+            entry["weave_nodes"] = file_context.weave_nodes if file_context else []
+            entry["churn"] = file_context.churn if file_context else None
+            entry["hotspot"] = file_context.hotspot if file_context else None
+        out.append(entry)
+    print(json.dumps({
+        "results": out,
+        "execution": execution.disposition(),
+        **({"filter": filter_resolution.to_dict()} if filter_resolution else {}),
+        "readiness": {key: signal.to_dict() for key, signal in readiness.items()},
+    }))
+
+
+def _print_text_results(
+    query: str,
+    mode: str,
+    results: list[SearchResult],
+    graph_ctx: dict[str, Any],
+    filter_resolution: FilterResolution | None,
+    readiness: dict[str, ReadinessSignal],
+    show_graph: bool,
+) -> None:
+    if not results:
+        if filter_resolution and not filter_resolution.files:
+            print(
+                "No code matches found: filter resolved to 0 allowlisted files "
+                f"({filter_resolution.expr})"
+            )
+        else:
+            print(f"No code matches found for: {query}")
+        if filter_resolution:
+            print(
+                f"Filter: {filter_resolution.expr}  "
+                f"[nodes={len(filter_resolution.node_ids)} files={len(filter_resolution.files)}]"
+            )
+        _print_readiness(readiness)
+        return
+
+    print(f"Code search: {query}  [{mode}]")
+    print()
+    if filter_resolution:
+        print(
+            f"Filter: {filter_resolution.expr}  "
+            f"[nodes={len(filter_resolution.node_ids)} files={len(filter_resolution.files)}]"
+        )
+        print()
+    if show_graph or any(not signal.ready for signal in readiness.values()):
+        _print_readiness(readiness)
+    for i, result in enumerate(results, 1):
+        print(
+            f"  {i:2}. {result.file}:{result.line_start}-{result.line_end}  "
+            f"[score={result.score:.4f}]"
+        )
+        print(f"      {result.snippet[:120]}")
+        if graph_ctx:
+            file_context = graph_ctx.get(result.file)
+            if file_context and file_context.weave_nodes:
+                node_summary = ", ".join(
+                    f"{node['id']}({node['status']})" for node in file_context.weave_nodes[:3]
+                )
+                print(f"      nodes: {node_summary}")
+            if file_context and file_context.churn is not None:
+                print(
+                    f"      churn: {file_context.churn}  hotspot: {file_context.hotspot:.3f}"
+                    if file_context.hotspot
+                    else f"      churn: {file_context.churn}"
+                )
+        print()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -607,20 +810,21 @@ def main(argv: list[str] | None = None) -> int:
             # Candidate enforcement is applied to all retrieval modes.
             filter_resolution = resolve_filter_scope(args.filter, db_path)
             allowed_files = set(filter_resolution.files)
-        except ValueError as exc:
+        except (ValueError, FilterBackendError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
     if args.mode == "fts":
-        results = fts_search(args.query, db_path, args.limit, allowed_files=allowed_files)
+        execution = execute_fts_search(args.query, db_path, args.limit, allowed_files=allowed_files)
     elif args.mode == "vector":
-        results = vector_search(
+        execution = execute_vector_search(
             args.query, db_path, args.limit, args.model, allowed_files=allowed_files
         )
     else:
-        results = hybrid_search(
+        execution = execute_hybrid_search(
             args.query, db_path, args.limit, args.model, allowed_files=allowed_files
         )
+    results = execution.results
 
     hot_zone = os.environ.get("WV_HOT_ZONE", "")
     quality_db = args.quality_db or (f"{hot_zone}/quality.db" if hot_zone else None)
@@ -632,69 +836,18 @@ def main(argv: list[str] | None = None) -> int:
         graph_ctx = enrich_results(results, db_path, quality_db)
 
     if args.json_out:
-        out = []
-        for r in results:
-            entry: dict[str, object] = {
-                "file": r.file,
-                "line_start": r.line_start,
-                "line_end": r.line_end,
-                "score": r.score,
-                "snippet": r.snippet,
-                "source": r.source,
-            }
-            if graph_ctx:
-                fc = graph_ctx.get(r.file)
-                entry["weave_nodes"] = fc.weave_nodes if fc else []
-                entry["churn"] = fc.churn if fc else None
-                entry["hotspot"] = fc.hotspot if fc else None
-            out.append(entry)
-        print(json.dumps({
-            "results": out,
-            **({"filter": filter_resolution.to_dict()} if filter_resolution else {}),
-            "readiness": {key: signal.to_dict() for key, signal in readiness.items()},
-        }))
+        _print_json_results(results, graph_ctx, filter_resolution, readiness, execution)
         return 0
 
-    if not results:
-        if filter_resolution and not filter_resolution.files:
-            print(
-                "No code matches found: filter resolved to 0 allowlisted files "
-                f"({filter_resolution.expr})"
-            )
-        else:
-            print(f"No code matches found for: {args.query}")
-        if filter_resolution:
-            print(
-                f"Filter: {filter_resolution.expr}  "
-                f"[nodes={len(filter_resolution.node_ids)} files={len(filter_resolution.files)}]"
-            )
-        _print_readiness(readiness)
-        return 0
-
-    print(f"Code search: {args.query}  [{args.mode}]")
-    print()
-    if filter_resolution:
-        print(
-            f"Filter: {filter_resolution.expr}  "
-            f"[nodes={len(filter_resolution.node_ids)} files={len(filter_resolution.files)}]"
-        )
-        print()
-    if args.graph or any(not signal.ready for signal in readiness.values()):
-        _print_readiness(readiness)
-    for i, r in enumerate(results, 1):
-        print(f"  {i:2}. {r.file}:{r.line_start}-{r.line_end}  [score={r.score:.4f}]")
-        print(f"      {r.snippet[:120]}")
-        if graph_ctx:
-            fc = graph_ctx.get(r.file)
-            if fc and fc.weave_nodes:
-                node_summary = ", ".join(
-                    f"{n['id']}({n['status']})" for n in fc.weave_nodes[:3]
-                )
-                print(f"      nodes: {node_summary}")
-            if fc and fc.churn is not None:
-                print(f"      churn: {fc.churn}  hotspot: {fc.hotspot:.3f}" if fc.hotspot else
-                      f"      churn: {fc.churn}")
-        print()
+    _print_text_results(
+        args.query,
+        args.mode,
+        results,
+        graph_ctx,
+        filter_resolution,
+        readiness,
+        args.graph,
+    )
     return 0
 
 

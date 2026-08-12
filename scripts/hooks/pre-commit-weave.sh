@@ -188,9 +188,22 @@ if [ -n "$_pc_files_csv" ]; then
         # this commit. Surface it so silent test-map rot becomes visible instead
         # of passing as if it were gated (add a glob/prefix or [default] entry to
         # .weave/test-map.conf, or run wv test-config to scaffold one).
+        #
+        # wv-734186: the message used to be identical whether .weave/test-map.conf
+        # was entirely absent or present-but-non-matching -- a half-configured
+        # gate looked exactly like an unconfigured one, and repeated on every
+        # commit regardless. Distinguish the two, and name a sample of the
+        # actual unmatched staged files (not just a count) in the second case.
         _pc_unmapped_count=$(printf '%s\n' "$NON_WEAVE_FILES" | grep -c . 2>/dev/null || echo 0)
-        echo "⚠ impact gate inert: $_pc_unmapped_count staged file(s) matched no .weave/test-map.conf entry — no suite ran." >&2
-        echo "  Add a glob/prefix/[default] entry (e.g. 'src/ = tests/...') so the gate covers them." >&2
+        _pc_unmapped_sample=$(printf '%s\n' "$NON_WEAVE_FILES" | grep -v '^$' | head -3 | paste -sd ', ' -)
+        if [ ! -f "$REPO_ROOT/.weave/test-map.conf" ]; then
+            echo "⚠ impact gate inert: no .weave/test-map.conf found — $_pc_unmapped_count staged file(s) unmapped, no suite ran." >&2
+            echo "  Run 'wv test-config' to scaffold one, or add a glob/prefix/[default] entry (e.g. 'src/ = tests/...')." >&2
+        else
+            echo "⚠ impact gate inert: .weave/test-map.conf exists but matched none of $_pc_unmapped_count staged file(s), no suite ran." >&2
+            echo "  Unmatched: $_pc_unmapped_sample" >&2
+            echo "  Add a glob/prefix/[default] entry covering them (e.g. 'src/ = tests/...') to .weave/test-map.conf." >&2
+        fi
     fi
 fi
 

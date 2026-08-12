@@ -178,4 +178,18 @@ printf '%s\n' '---' 'name: manual' '---' '# hand written' > "$NREPO/.claude/skil
 if bash "$PROJECT" --source="$N" --repo="$NREPO" 2>/dev/null; then echo "FAIL: late collision accepted"; exit 1; fi
 [ ! -e "$NREPO/.claude/skills/wv-first" ] || { echo "FAIL: earlier procedure mutated before late collision"; exit 1; }
 
-echo 'Results: 28/28 passed'
+# --- O. Repository-class guard precedes every direct projection write --------
+O="$TMP/o"; OREPO="$TMP/orepo"; mkdir -p "$O" "$OREPO"
+git -C "$OREPO" init -q
+git -C "$OREPO" remote add origin git@github.com:example/fork.git
+git -C "$OREPO" remote add upstream https://github.com/upstream/canonical.git
+mkproc "$O" guarded '[claude, codex, copilot]' 'visibility: shared' 'claude_skill: wv-guarded'
+before=$(find "$OREPO" -path "$OREPO/.git" -prune -o -type f -print | sort)
+if bash "$PROJECT" --source="$O" --repo="$OREPO" 2>/dev/null; then
+    echo "FAIL: direct projector accepted vendored-upstream repository"
+    exit 1
+fi
+after=$(find "$OREPO" -path "$OREPO/.git" -prune -o -type f -print | sort)
+[ "$before" = "$after" ] || { echo "FAIL: repository-class refusal mutated projection target"; exit 1; }
+
+echo 'Results: 30/30 passed'

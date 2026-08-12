@@ -2,16 +2,19 @@ id: prose-number-free-verification
 language: prose
 kind: motif
 severity: info
-provenance: wv-51f327@nowcastr
+policy: always-on-shared
+maturity: promotable
+provenance: >-
+  wv-51f327@nowcastr.
 message: >-
-  Verification vocabulary with no number within reach reads as reassurance
-  rather than content. Attach the measured quantity or drop the word.
+  When the same verification term occurs at least three times in a file, flag each occurrence with no digit within 80
+  characters in its reflowed paragraph. Attach the local measured quantity or drop the reassurance term.
 paths:
   - "docs/*.md"
   - "docs/**/*.md"
   - "*.md"
 min_count: 3
-near_window: 80
+require_no_digit_within: 80
 terms:
   - measured
   - verified
@@ -20,3 +23,7 @@ terms:
   - proven
   - independent
   - already
+positive_controls:
+  - "The result was measured carefully. It was measured again. A final measured result followed."
+negative_controls:
+  - "The rate was measured at 5/min. The error was measured at 2%. Coverage was measured over 30 days."

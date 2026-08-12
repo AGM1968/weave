@@ -13,6 +13,9 @@ import pytest
 
 from weave_search.__main__ import (
     _build_fts_expr,
+    execute_fts_search,
+    execute_hybrid_search,
+    execute_vector_search,
     fts_search,
     hybrid_search,
     main,
@@ -174,11 +177,19 @@ class TestFtsSearch:
 
     def test_missing_db_returns_empty(self) -> None:
         results = fts_search("query", "/nonexistent/path.db")
-        assert results == []
+        assert not results
 
     def test_no_match_returns_empty(self, db_path: str) -> None:
         results = fts_search("xyznotaword", db_path)
-        assert results == []
+        assert not results
+
+    def test_execution_distinguishes_empty_from_failure(self, db_path: str) -> None:
+        empty = execute_fts_search("xyznotaword", db_path)
+        failed = execute_fts_search("query", "/nonexistent/path.db")
+        assert (empty.status, empty.reason, empty.results) == ("success", "no_matches", [])
+        assert (failed.status, failed.reason, failed.results) == (
+            "failure", "database_missing", []
+        )
 
     def test_limit_respected(self, db_path: str) -> None:
         results = fts_search("sqlite", db_path, limit=1)
@@ -236,7 +247,29 @@ class TestVectorSearch:
 
     def test_empty_allowlist_short_circuits(self, db_path: str) -> None:
         results = vector_search("cosine", db_path, allowed_files=set())
-        assert results == []
+        assert not results
+
+    def test_execution_distinguishes_intentional_empty_from_failure(self, db_path: str) -> None:
+        empty = execute_vector_search("cosine", db_path, allowed_files=set())
+        failed = execute_vector_search("query", "/nonexistent/path.db")
+        assert (empty.status, empty.reason) == ("success", "empty_scope")
+        assert (failed.status, failed.reason) == ("failure", "database_missing")
+
+    def test_partial_embedding_coverage_fails_closed(self, db_path: str) -> None:
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO chunks(file, line_start, line_end, content, embedding)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("src/missing.py", 1, 2, "missing vector", None),
+        )
+        conn.commit()
+        conn.close()
+
+        execution = execute_vector_search("cosine", db_path)
+
+        assert execution.status == "failure"
+        assert execution.reason == "embeddings_unavailable"
+        assert not vector_search("cosine", db_path)
 
 
 # ── hybrid_search ─────────────────────────────────────────────────────────────
@@ -298,6 +331,13 @@ class TestHybridSearch:
         assert results
         assert all(r.file == "src/bar.py" for r in results)
 
+    def test_execution_reports_degraded_and_failure(self, db_path: str) -> None:
+        degraded = execute_hybrid_search("cosine", db_path)
+        failed = execute_hybrid_search("query", "/nonexistent/path.db")
+        assert degraded.status in {"success", "degraded"}  # model availability is environment-specific
+        assert failed.status == "failure"
+        assert failed.reason == "all_hybrid_backends_failed"
+
 
 class TestResolveFilterScope:
     def test_edge_type_filter_resolves_nodes_and_files(self, db_path: str) -> None:
@@ -331,6 +371,7 @@ class TestMain:
         data = json.loads(output)
         assert isinstance(data, dict)
         assert "results" in data
+        assert data["execution"]["status"] in {"success", "degraded", "failure"}
         assert "readiness" in data
         assert isinstance(data["results"], list)
         if data["results"]:

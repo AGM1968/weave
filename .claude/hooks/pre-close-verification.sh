@@ -75,6 +75,15 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
         || source "$HOOK_DIR/../../scripts/lib/wv-validate.sh" 2>/dev/null \
         || source "${HOME}/.config/weave/lib/wv-validate.sh" 2>/dev/null \
         || true
+    # wv-822bea/wv-37e2e0: node_files (uncapped) is the authoritative
+    # file-attribution table; metadata.touched_files is a capped (50-entry)
+    # display copy of the same signal. Need _HC_DB to query node_files
+    # directly below.
+    source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null \
+        || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null \
+        || source "${HOME}/.config/weave/lib/wv-hook-common.sh" 2>/dev/null \
+        || true
+    command -v _hc_refresh >/dev/null 2>&1 && _hc_refresh
     if [ -x "$WV" ]; then
         _agent_hook_progress "load node metadata"
         NODE_JSON=$(_agent_hook_run "node-json" "$WV" show "$NODE_ID" --json 2>/dev/null) || {
@@ -142,8 +151,39 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
                   | grep -v '^\.claude/skills/' \
                   | grep -v '^\.claude/agents/' || true
             )
-            if [[ -n "$DIRTY_FILES" ]]; then
-                DIRTY_SAMPLE=$(echo "$DIRTY_FILES" | head -3 | paste -sd ', ' -)
+            # wv-e48993: scope the block to files THIS node touched (Edit/Write/
+            # NotebookEdit attribution captured live by wv-touched-files.sh into
+            # metadata.touched_files), not every dirty file in the repo. Blocking
+            # on unrelated dirt from an earlier, already-closed session forces
+            # the wrong remedy -- committing foreign work under THIS node's
+            # Weave-ID -- or leaving a finished node open. When touched_files is
+            # empty/absent (no signal -- a non-Claude-Code session, or a node
+            # older than this tracking), fall back to the prior strict behavior
+            # and block on any dirt, since we can't tell foreign from own.
+            #
+            # wv-822bea/wv-37e2e0: metadata.touched_files is capped at 50 paths
+            # (wv-touched-files.sh's WV_TOUCHED_NODE_CAP) -- a node whose 51st
+            # touched file drops off the ring can fail this ownership check even
+            # though that file is still genuinely its own, and the gate would
+            # then treat a dirty 51st file as foreign. node_files is the same
+            # attribution signal written UNCAPPED (INSERT OR IGNORE, no trim) --
+            # union both so the cap only ever ADDS false-foreign risk, never
+            # subtracts real ownership.
+            TOUCHED_FILES=$(echo "$NODE_META" | jq -r '(.touched_files // [])[]' 2>/dev/null || true)
+            NODE_FILES_DB=""
+            _PCV_DB="${WV_DB:-${_HC_DB:-}}"
+            if [ -n "$_PCV_DB" ] && command -v sql_escape >/dev/null 2>&1; then
+                NODE_FILES_DB=$(_agent_hook_run "node_files lookup" sqlite3 "$_PCV_DB" \
+                    "SELECT path FROM node_files WHERE node_id='$(sql_escape "$NODE_ID")';" 2>/dev/null || true)
+            fi
+            OWN_FILES=$(printf '%s\n%s\n' "$TOUCHED_FILES" "$NODE_FILES_DB" | sed '/^$/d' | sort -u)
+            if [[ -n "$OWN_FILES" ]]; then
+                OWN_DIRTY=$(comm -12 <(printf '%s\n' "$DIRTY_FILES" | sort -u) <(printf '%s\n' "$OWN_FILES" | sort -u))
+            else
+                OWN_DIRTY="$DIRTY_FILES"
+            fi
+            if [[ -n "$OWN_DIRTY" ]]; then
+                DIRTY_SAMPLE=$(echo "$OWN_DIRTY" | head -3 | paste -sd ', ' -)
                 jq -n \
                     --arg detail "Commit work before close. Non-.weave changes are still uncommitted: $DIRTY_SAMPLE. Run git add <files> && git commit while $NODE_ID is active, then retry wv done." \
                     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
@@ -188,12 +228,24 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
         # Require verification for non-trivial work
         if [[ "$HAS_VERIFICATION" == "false" && "$HAS_LEGACY_VERIFICATION" == "false" ]]; then
             if [[ "$IS_TRIVIAL" == "false" ]]; then
+                # wv-734186: verification_method/verification_evidence were
+                # only ever askable at THIS close-time gate -- "what would
+                # count as done" was discovered as a fresh question once
+                # the work was already finished. wv add --verification-plan
+                # lets it be recorded upfront; surface it back here as a
+                # reminder if one was recorded, so answering the gate means
+                # confirming the plan rather than inventing one cold.
+                _VF_PLAN=$(echo "$NODE_META" | jq -r '.verification_plan // empty' 2>/dev/null)
+                _VF_PLAN_HINT=""
+                if [[ -n "$_VF_PLAN" ]]; then
+                    _VF_PLAN_HINT=" Recorded plan: \"$_VF_PLAN\" — confirm it held and cite the evidence."
+                fi
                 # PreToolUse soft deny (exit 0 + hookSpecificOutput JSON)
                 # Schema: hookSpecificOutput.permissionDecision (current API, not deprecated top-level)
                 # "deny" is lowercase — "DENY" silently fails (original bug)
                 jq -n \
                     --arg node "$NODE_ID" \
-                    --arg detail "Run: wv done $NODE_ID --verification-method=\"make check\" --verification-evidence=\"all tests pass\" ... — or wv update $NODE_ID --metadata='{\"verification_method\":\"...\"}' first — or --skip-verification for trivial tasks." \
+                    --arg detail "Run: wv done $NODE_ID --verification-method=\"make check\" --verification-evidence=\"all tests pass\" ... — or wv update $NODE_ID --metadata='{\"verification_method\":\"...\"}' first — or --skip-verification for trivial tasks.${_VF_PLAN_HINT}" \
                     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
                 exit 0
             fi

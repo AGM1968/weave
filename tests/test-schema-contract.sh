@@ -98,6 +98,18 @@ dbstat"
 # invented-table bug shape this guard catches.
 EXTERNAL="stage1_outputs"
 
+# Transient backup tables (wv-8b2c21) that scripts/weave_quality/db.py's
+# stranded-backup repair creates/reads/drops via DYNAMIC SQL (backup =
+# f"{table}_v9" -- never a literal CREATE TABLE/RENAME TO string this file's
+# own regex-based extract_declared can match) when a prior v10 migration was
+# interrupted mid-rename. Legitimate and intentional, not the invented-table
+# bug shape this guard catches -- but also structurally absent from the
+# known-tables set collected above: they're merged into the live tables and
+# DROPPED as part of the same repair pass, so they never exist in a freshly-
+# initialized quality.db either (wv-45eff1).
+TRANSIENT="pattern_findings_v9
+pattern_rule_runs_v9"
+
 check_contract() {
     # $1 = file with known names (one per line), remaining args = source files.
     # Prints violations (referenced but neither known, declared, nor builtin).
@@ -111,6 +123,7 @@ check_contract() {
         echo "$declared" | grep -qxF "$ref" && continue
         echo "$BUILTIN" | grep -qxF "$ref" && continue
         echo "$EXTERNAL" | grep -qxF "$ref" && continue
+        echo "$TRANSIENT" | grep -qxF "$ref" && continue
         echo "$NOISE" | grep -qxF "$ref" && continue
         echo "$ref"
     done

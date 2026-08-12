@@ -1,0 +1,25 @@
+id: prose-retrospective-announcement
+language: prose
+kind: regex
+severity: info
+policy: always-on-shared
+maturity: promotable
+provenance: >-
+  wv-1accdd @nowcast (2026-07-18), ported and retained by
+  earth-engine-analysis. A retrospective achievement announcement was removed
+  from stakeholder prose in favor of the current technical fact.
+message: >-
+  Retrospective announcement assumes a before-and-after reference point the
+  reader does not share. State the current fact directly.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+patterns:
+  - '\bnow (exists?|available|possible|live|in place|operational|unlocked|resolved)\b'
+  - '\bwe now have\b'
+positive_controls:
+  - "The endpoint now exists."
+negative_controls:
+  - "The currently operational endpoint serves 5 regions."
+  - "The present inventory contains three endpoints."

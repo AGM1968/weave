@@ -263,17 +263,17 @@ Optional local additions if you want stricter scope isolation:
 
 ### Graph scope — write operations (13 tools)
 
-| Tool               | Description                                                                                                                                                                                                 | Required params      |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| `weave_add`        | Create a new node, returns generated ID                                                                                                                                                                     | `text`               |
-| `weave_link`       | Create a semantic edge between two nodes                                                                                                                                                                    | `from`, `to`, `type` |
-| `weave_done`       | Mark a node as complete, optionally record a learning. Accepts `learning` (raw string) and/or typed `decision`/`pattern`/`pitfall` params — when both are provided, raw is appended after structured params | `id`                 |
-| `weave_batch_done` | Complete multiple nodes at once. Same learning merge behavior as `weave_done`                                                                                                                               | `ids`                |
-| `weave_update`     | Modify node metadata, status, text, or alias                                                                                                                                                                | `id`                 |
-| `weave_touch`      | Fire-and-forget metadata or intent update                                                                                                                                                                   | `id`                 |
-| `weave_list`       | List nodes with optional status/all filters                                                                                                                                                                 | —                    |
-| `weave_resolve`    | Resolve conflicting nodes (winner/merge/defer strategy)                                                                                                                                                     | `ids`, `strategy`    |
-| `weave_delete`     | Permanently remove a node (requires `force=true`)                                                                                                                                                           | `id`, `force`        |
+| Tool               | Description                                                                                                                                                                                                                           | Required params      |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `weave_add`        | Create a new node, returns generated ID                                                                                                                                                                                               | `text`               |
+| `weave_link`       | Create a semantic edge between two nodes                                                                                                                                                                                              | `from`, `to`, `type` |
+| `weave_done`       | Mark a node as complete, optionally record a learning. Accepts `learning` (raw string) and/or typed `decision`/`pattern`/`pitfall` params; `completion_files` selects an attributed completion-quality scope without changing history | `id`                 |
+| `weave_batch_done` | Complete multiple nodes at once. Same learning merge behavior as `weave_done`                                                                                                                                                         | `ids`                |
+| `weave_update`     | Modify node metadata, status, text, or alias                                                                                                                                                                                          | `id`                 |
+| `weave_touch`      | Fire-and-forget metadata or intent update                                                                                                                                                                                             | `id`                 |
+| `weave_list`       | List nodes with optional status/all filters                                                                                                                                                                                           | —                    |
+| `weave_resolve`    | Resolve conflicting nodes (winner/merge/defer strategy)                                                                                                                                                                               | `ids`, `strategy`    |
+| `weave_delete`     | Permanently remove a node (requires `force=true`)                                                                                                                                                                                     | `id`, `force`        |
 
 ### Session scope — workflow lifecycle (12 tools)
 
@@ -293,29 +293,29 @@ Optional local additions if you want stricter scope isolation:
 
 ### Inspect scope — read-only queries (22 tools)
 
-| Tool                      | Description                                                     | Required params |
-| ------------------------- | --------------------------------------------------------------- | --------------- |
-| `weave_context`           | Full Context Pack: node details, blockers, ancestors            | —               |
-| `weave_search`            | Full-text search across nodes (supports stemming)               | `query`         |
-| `weave_query`             | Structured node query by status, type, or metadata              | —               |
-| `weave_tree`              | View epic hierarchy as a tree (JSON output)                     | —               |
-| `weave_learnings`         | Query captured learnings (patterns/decisions/pitfalls)          | —               |
-| `weave_status`            | Compact summary: active work, ready count, blocked              | —               |
-| `weave_ready`             | List unblocked nodes ready to claim                             | —               |
-| `weave_health`            | Graph health check with score and issues                        | —               |
-| `weave_preflight`         | Pre-work validation: blockers, context, readiness               | `id`            |
-| `weave_bootstrap`         | Single-call session snapshot for read-only clients              | —               |
-| `weave_sync`              | Persist graph to disk; GitHub sync uses CLI fallback by default | —               |
-| `weave_guide`             | Quick reference by workflow topic                               | —               |
-| `weave_show`              | Single-node detail view (JSON output)                           | `id`            |
-| `weave_quality_scan`      | Codebase quality metrics scan (60s timeout)                     | —               |
-| `weave_quality_hotspots`  | Ranked hotspot report with limit and threshold                  | —               |
-| `weave_quality_diff`      | Delta report vs previous scan                                   | —               |
-| `weave_quality_functions` | Per-function CC report with dispatch tagging                    | —               |
-| `weave_quality_patterns`  | Structural + prose pattern scan/list                            | —               |
-| `weave_structural_search` | Structural code search via ast-grep patterns                    | `pattern`       |
-| `weave_code_search`       | Semantic code search via local index                            | `query`         |
-| `weave_index`             | Build or update the local code search index                     | —               |
+| Tool                      | Description                                                             | Required params |
+| ------------------------- | ----------------------------------------------------------------------- | --------------- |
+| `weave_context`           | Full Context Pack: node details, blockers, ancestors                    | —               |
+| `weave_search`            | Full-text search across nodes (supports stemming)                       | `query`         |
+| `weave_query`             | Structured node query by status, type, or metadata                      | —               |
+| `weave_tree`              | View epic hierarchy as a tree (JSON output)                             | —               |
+| `weave_learnings`         | Query captured learnings (patterns/decisions/pitfalls)                  | —               |
+| `weave_status`            | Compact summary: active work, ready count, blocked                      | —               |
+| `weave_ready`             | List unblocked nodes ready to claim                                     | —               |
+| `weave_health`            | Graph health check with score and issues                                | —               |
+| `weave_preflight`         | Pre-work validation: blockers, context, readiness                       | `id`            |
+| `weave_bootstrap`         | Single-call session snapshot for read-only clients                      | —               |
+| `weave_sync`              | Persist graph to disk; GitHub sync uses CLI fallback by default         | —               |
+| `weave_guide`             | Quick reference by workflow topic                                       | —               |
+| `weave_show`              | Single-node detail view (JSON output)                                   | `id`            |
+| `weave_quality_scan`      | Codebase quality metrics scan (60s timeout)                             | —               |
+| `weave_quality_hotspots`  | Ranked hotspot report with limit and threshold                          | —               |
+| `weave_quality_diff`      | Delta report vs previous scan                                           | —               |
+| `weave_quality_functions` | Per-function CC report with dispatch tagging                            | —               |
+| `weave_quality_patterns`  | Structural + prose pattern scan/list/validate/report/adjudicate/promote | —               |
+| `weave_structural_search` | Structural code search via ast-grep patterns                            | `pattern`       |
+| `weave_code_search`       | Semantic code search via local index                                    | `query`         |
+| `weave_index`             | Build or update the local code search index                             | —               |
 
 ## Development
 

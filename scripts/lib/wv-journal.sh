@@ -51,7 +51,7 @@ _journal_append() {
 # Public API
 # ═══════════════════════════════════════════════════════════════════════════
 
-# journal_begin <op_type> <args_json>
+# journal_begin <op_type> <args_json> [initial_action]
 # Begin a journaled operation. Sets _WV_CURRENT_OP_ID and _WV_IN_JOURNAL.
 #
 # Args:
@@ -64,12 +64,16 @@ _journal_append() {
 journal_begin() {
     local op_type="$1"
     local args_json="${2:-"{}"}"
+    local initial_action="${3:-}"
+    local op_id
+    local initial_json=""
 
-    _WV_CURRENT_OP_ID=$(_journal_op_id)
+    op_id=$(_journal_op_id)
+    [ -n "$initial_action" ] && initial_json=",\"initial_action\":\"$initial_action\""
+    _journal_append "{\"event\":\"begin\",\"op\":\"$op_type\",\"op_id\":\"$op_id\",\"args\":$args_json$initial_json,\"ts\":\"$(_journal_ts)\"}" || return $?
+    _WV_CURRENT_OP_ID="$op_id"
     _WV_CURRENT_OP_TYPE="$op_type"
     export _WV_IN_JOURNAL=1
-
-    _journal_append "{\"event\":\"begin\",\"op\":\"$op_type\",\"op_id\":\"$_WV_CURRENT_OP_ID\",\"args\":$args_json,\"ts\":\"$(_journal_ts)\"}"
 }
 
 # journal_step <step_num> <action> [args_json]
@@ -107,7 +111,7 @@ journal_complete() {
 # Mark the current operation as fully complete. Unsets _WV_IN_JOURNAL.
 #
 journal_end() {
-    _journal_append "{\"event\":\"end\",\"op\":\"$_WV_CURRENT_OP_TYPE\",\"op_id\":\"$_WV_CURRENT_OP_ID\",\"ts\":\"$(_journal_ts)\"}"
+    _journal_append "{\"event\":\"end\",\"op\":\"$_WV_CURRENT_OP_TYPE\",\"op_id\":\"$_WV_CURRENT_OP_ID\",\"ts\":\"$(_journal_ts)\"}" || return $?
 
     unset _WV_IN_JOURNAL
     unset _WV_CURRENT_OP_ID
@@ -156,7 +160,11 @@ journal_recover() {
             args: (map(select(.event == "begin"))[0].args),
             started_at: (map(select(.event == "begin"))[0].ts),
             completed_steps: ([.[] | select(.event == "step" and .status == "done") | .step] | sort | unique),
-            pending_step: ([.[] | select(.event == "step" and .status == "pending")] | last | if . then {step: .step, action: .action} else null end)
+            pending_step: (([.[] | select(.event == "step" and .status == "pending")] | last) as $pending |
+              if $pending then {step: $pending.step, action: $pending.action}
+              else (map(select(.event == "begin"))[0].initial_action as $initial |
+                if $initial then {step: 1, action: $initial} else null end)
+              end)
         } end
     ' "$_WV_JOURNAL_FILE" 2>/dev/null)
 

@@ -1,8 +1,11 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "weave-mcp-server",
-  "version": "1.70.3",
+  "version": "1.71.0-rc.1",
   "description": "MCP server for Weave CLI - exposes graph operations as AI tools",
+  "engines": {
+    "node": ">=20"
+  },
   "main": "dist/index.js",
   "bin": {
     "weave-mcp-server": "dist/index.js"

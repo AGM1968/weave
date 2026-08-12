@@ -14,6 +14,10 @@ source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null \
     || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null \
     || source "${HOME}/.config/weave/lib/wv-hook-common.sh" 2>/dev/null \
     || true
+source "$HOOK_DIR/../lib/wv-checkpoint-ci.sh" 2>/dev/null \
+    || source "$HOOK_DIR/../../scripts/lib/wv-checkpoint-ci.sh" 2>/dev/null \
+    || source "${HOME}/.config/weave/lib/wv-checkpoint-ci.sh" 2>/dev/null \
+    || true
 _hc_refresh
 cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 [ -x "$WV" ] || exit 0
@@ -28,6 +32,14 @@ _PC_HOT_ZONE="${_HC_HOT_ZONE}"
 # Stage only .weave/ state — code changes belong in intentional feature commits.
 # Using 'git add -A' here caused race conditions with state.sql across sessions.
 _NOW=$(date +%s)
+# wv-822bea/wv-179c49: hijack guard, same rule as auto_checkpoint/cmd_sync in
+# wv-cmd-data.sh — refuse to commit if the caller pre-staged anything outside
+# .weave/, so this checkpoint never silently absorbs unrelated in-progress work.
+_PC_PRESTAGED=""
+if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
+    _PC_PRESTAGED=$(git diff --cached --name-only 2>/dev/null | grep -v '^\.weave/' || true)
+fi
+if [ -z "$_PC_PRESTAGED" ]; then
 git add .weave/ 2>/dev/null || true
 if ! git diff --cached --quiet 2>/dev/null; then
     _PC_BRANCH=$(git branch --show-current 2>/dev/null || echo "main")
@@ -35,15 +47,20 @@ if ! git diff --cached --quiet 2>/dev/null; then
     _PC_REMOTE=$(git rev-parse "origin/$_PC_BRANCH" 2>/dev/null || echo "none")
     _PC_LAST_MSG=$(git log -1 --format='%s' 2>/dev/null || echo "")
     _PC_LAST_NW=$(git diff HEAD~1 HEAD --name-only 2>/dev/null | grep -v '^\.weave/' | grep -v '^$' || true)
+    # wv-e937f8: see session-end-sync.sh's identical comment. wv-179c49: fail
+    # toward NOT skipping CI when the marker helper is unavailable or fails.
+    _PC_SKIP_CI=$(command -v wv_checkpoint_ci_marker >/dev/null 2>&1 \
+        && wv_checkpoint_ci_marker "$PWD" || echo "")
     if [ "$_PC_LOCAL" != "$_PC_REMOTE" ] \
        && [[ "$_PC_LAST_MSG" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] \
        && [ -z "$_PC_LAST_NW" ]; then
         git commit --amend --no-edit --no-verify 2>/dev/null || \
-        git commit -m "wip: pre-compact checkpoint $(date +%H:%M) [skip ci]" --no-verify 2>/dev/null || true
+        git commit -m "wip: pre-compact checkpoint $(date +%H:%M)${_PC_SKIP_CI}" --no-verify 2>/dev/null || true
     else
-        git commit -m "wip: pre-compact checkpoint $(date +%H:%M) [skip ci]" --no-verify 2>/dev/null || true
+        git commit -m "wip: pre-compact checkpoint $(date +%H:%M)${_PC_SKIP_CI}" --no-verify 2>/dev/null || true
     fi
     echo "$_NOW" > "${_PC_HOT_ZONE}/.last_checkpoint" 2>/dev/null || true
+fi
 fi
 
 # Compact status line

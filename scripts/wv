@@ -71,6 +71,8 @@ source "$WV_LIB_DIR/lib/wv-gh.sh"
 source "$WV_LIB_DIR/lib/wv-delta.sh"
 source "$WV_LIB_DIR/lib/wv-delta-catalog.sh"
 source "$WV_LIB_DIR/lib/wv-checkpoint-generation.sh"
+source "$WV_LIB_DIR/lib/wv-checkpoint-ci.sh"
+source "$WV_LIB_DIR/lib/wv-repository-class.sh"
 
 # Source command modules
 source "$WV_LIB_DIR/cmd/wv-cmd-core.sh"
@@ -221,6 +223,7 @@ _wv_dispatch() {
         pattern-audit)   cmd_pattern_audit "$@" ;;
         edge-types)      cmd_edge_types "$@" ;;
         guide)           cmd_guide "$@" ;;
+        repo-class)      cmd_repo_class "$@" ;;
         init-repo)       cmd_init_repo "$@" ;;
         config)          cmd_config "$@" ;;
 
@@ -268,7 +271,10 @@ main() {
 # Call Instrumentation (opt-in via WV_CALL_LOG)
 # ═══════════════════════════════════════════════════════════════════════════
 # When WV_CALL_LOG is set, each invocation appends one JSONL line:
-#   {"ts":<epoch>,"cmd":"wv <subcmd>","stdout_bytes":<n>,"stderr_bytes":<n>,"elapsed_ms":<n>,"source":<src>}
+#   {"ts":<epoch>,"cmd":"wv <subcmd>","stdout_bytes":<n>,"stderr_bytes":<n>,"elapsed_ms":<n>,
+#    "source":<src>,"call_id":<id>,"workflow_id":<id>,"trace_id":<id>,"repo_root":<path>,"exit_status":<n>,
+#    "argv":[<normalized args>],"graph_identity_before":<obj>,"graph_identity_after":<obj>,
+#    "policy_revision":<obj>}
 #
 # source values: "agent" (harness-attested direct model tool call — Claude Code via
 #                settings.json env; Codex via CODEX_THREAD_ID/CODEX_CI; VS Code Copilot
@@ -281,18 +287,51 @@ main() {
 # or Copilot host marker attests "agent", otherwise the default is "shell".
 # Authoritative taxonomy + readiness-gate policy: docs/TELEMETRY-SOURCE-CONTRACT.md
 #
+# argv preserves the operation, option names, node ids, and known nested subcommands. All other
+# values are replaced by "<redacted:N>" (their byte length); --option=value is represented as
+# --option=<redacted:N>. This keeps free text and secrets out of the log regardless of length.
+#
+# graph_identity_before/after are SHA-256 fingerprints of ordered nodes, edges, and node-file
+# attribution read in one SQLite transaction. Unlike connection-local PRAGMA data_version, the
+# fingerprint remains comparable across the separate wrapper connections used before and after a
+# call. Falls back to the shared unavailable marker
+# {"status":"unavailable","reason":...,"provenance":"wv_call_log"} when $WV_DB does not yet
+# exist or sqlite3/sha256sum is missing; opening the file only in that guarded path (never blind)
+# avoids sqlite3's create-on-open side effect. trace_id uses WV_TRACE_ID when supplied, otherwise
+# the workflow id when present, otherwise the per-call id. policy_revision uses the same unavailable
+# marker unconditionally: no live host adapter emits an authoritative policy revision yet
+# (finding wv-426134), so claiming one here would be dishonest, not incomplete.
+#
 # Enable:  wv config enable session-analysis
 # Analyse: wv analyze sessions --call-stats [--source=agent|mcp|shell|hook|sync|test]
 # Zero overhead when unset.
 
 if [[ -n "${WV_CALL_LOG:-}" ]]; then
     _wv_json_escape() {
-        local value="${1:-}"
-        value="${value//\\/\\\\}"
-        value="${value//\"/\\\"}"
-        value="${value//$'\n'/\\n}"
-        value="${value//$'\r'/\\r}"
-        printf '%s' "$value"
+        local value="${1:-}" result="" char escaped
+        local index code
+        for ((index = 0; index < ${#value}; index++)); do
+            char="${value:index:1}"
+            case "$char" in
+                \\) result+='\\' ;;
+                '"') result+='\"' ;;
+                $'\b') result+='\b' ;;
+                $'\f') result+='\f' ;;
+                $'\n') result+='\n' ;;
+                $'\r') result+='\r' ;;
+                $'\t') result+='\t' ;;
+                *)
+                    printf -v code '%d' "'$char"
+                    if [ "$code" -lt 32 ]; then
+                        printf -v escaped '\\u%04x' "$code"
+                        result+="$escaped"
+                    else
+                        result+="$char"
+                    fi
+                    ;;
+            esac
+        done
+        printf '%s' "$result"
     }
     _wv_generate_call_id() {
         if command -v uuidgen >/dev/null 2>&1; then
@@ -301,8 +340,138 @@ if [[ -n "${WV_CALL_LOG:-}" ]]; then
             printf 'wv-%s-%s-%s' "$(date +%s%N)" "$$" "$RANDOM"
         fi
     }
+    _wv_byte_length() {
+        local LC_ALL=C
+        printf '%s' "${#1}"
+    }
+    _wv_unavailable_json() {
+        printf '{"status":"unavailable","reason":"%s","provenance":"wv_call_log"}' "$(_wv_json_escape "$1")"
+    }
+    _wv_graph_identity_json() {
+        if [[ -n "${WV_DB:-}" && -f "$WV_DB" ]] \
+            && command -v sqlite3 >/dev/null 2>&1 \
+            && command -v sha256sum >/dev/null 2>&1; then
+            local snapshot fingerprint
+            snapshot=$(sqlite3 -readonly "$WV_DB" 2>/dev/null <<'SQL'
+BEGIN;
+SELECT json_array('node', id, text, status, json(metadata), alias, created_at, updated_at)
+FROM nodes ORDER BY id;
+SELECT json_array('edge', source, target, type, weight, json(context), created_at)
+FROM edges ORDER BY source, target, type;
+SELECT json_array('node_file', node_id, path)
+FROM node_files ORDER BY node_id, path;
+COMMIT;
+SQL
+            ) || {
+                _wv_unavailable_json "graph fingerprint query failed"
+                return 0
+            }
+            fingerprint=$(printf '%s' "$snapshot" | sha256sum | awk '{print $1}')
+            if [[ "$fingerprint" =~ ^[a-f0-9]{64}$ ]]; then
+                printf '{"kind":"sqlite_graph_fingerprint","value":"sha256:%s"}' "$fingerprint"
+                return 0
+            fi
+            _wv_unavailable_json "graph fingerprint hashing failed"
+            return 0
+        fi
+        _wv_unavailable_json "WV_DB not resolvable or graph fingerprint tools unavailable"
+    }
+    _wv_normalized_operation() {
+        local operation="${1:-help}"
+        case "$operation" in
+            init|add|remember|memory|done|batch-done|bulk-update|delete|work|ready|list|show|status|pending-close|update|touch|allowed-tools|quick|ship|ship-agent|block|link|unlink|resolve|related|edges|path|tree|context|impact|discover|batch|plan|enrich-topology|sync|load|compact|prune|unarchive|clean-ghosts|learnings|refs|import|search|reindex|trails|breadcrumbs|bootstrap|bootstrap-agent|doctor|hotzone|test-record|self-update|uninstall|recover|selftest|mcp-status|health|cache|preflight|digest|overview|session-summary|audit-pitfalls|pattern-audit|edge-types|guide|init-repo|config|quality|findings|validate-finding|analyze|index|query|hook|help|--help|-h|version|--version|-v)
+                printf '%s' "$operation"
+                ;;
+            *)
+                printf '<redacted:%s>' "$(_wv_byte_length "$operation")"
+                ;;
+        esac
+    }
+    _wv_known_option() {
+        case "$1" in
+            --json|--json-v2|--all|--count|--findings|--with-impact|--call-stats|--token-hogs|--trace-eval|--force|--quiet|--help|-h|--gh|--no-gh|--no-warn|--no-overlap-check|--skip-verification|--standalone|--code|--graph|--learning|--include-sync|--include-test|--status|--parent|--subtree|--text|--metadata|--metadata-file|--criteria|--risks|--learning-file|--verification-method|--verification-evidence|--verification-evidence-file|--intent|--files|--type|--limit|--mode|--source|--repo|--log|--usage-log|--call-log|--workflow-id|--trace-id|--topic|--procedure|--top|--since|--since-days|--host|--format|--order|--direction|--depth|--alias)
+                return 0
+                ;;
+        esac
+        return 1
+    }
+    _wv_option_consumes_value() {
+        case "$1" in
+            --status|--parent|--subtree|--text|--metadata|--metadata-file|--criteria|--risks|--learning-file|--verification-method|--verification-evidence|--verification-evidence-file|--intent|--files|--type|--limit|--mode|--source|--repo|--log|--usage-log|--call-log|--workflow-id|--trace-id|--topic|--procedure|--top|--since|--since-days|--host|--format|--order|--direction|--depth|--alias)
+                return 0
+                ;;
+        esac
+        return 1
+    }
+    _wv_nested_operation() {
+        case "$1:$2" in
+            analyze:sessions|analyze:suites|config:enable|config:disable|config:get|config:set|hook:dispatch|quality:scan|quality:functions|quality:patterns|findings:promote|cache:clear|cache:stats)
+                return 0
+                ;;
+        esac
+        return 1
+    }
+    _wv_node_id_position() {
+        case "$1:$2" in
+            done:1|delete:1|work:1|show:1|update:1|touch:1|allowed-tools:1|ship:1|ship-agent:1|block:1|resolve:1|related:1|edges:1|tree:1|context:1|discover:1|preflight:1|validate-finding:1|link:1|link:2|unlink:1|unlink:2|path:1|path:2)
+                return 0
+                ;;
+        esac
+        if [ "$1" = "batch-done" ] && [ "$2" -ge 1 ]; then
+            return 0
+        fi
+        return 1
+    }
+    _wv_argv_json() {
+        local first=1 index=0 operation="${1:-help}" nested="${2:-}" redact_operand=0 id_operand=0 arg normalized option value
+        printf '['
+        for arg in "$@"; do
+            [ "$first" -eq 1 ] || printf ','
+            first=0
+            if [ "$index" -eq 0 ]; then
+                normalized=$(_wv_normalized_operation "$arg")
+            elif [ "$redact_operand" -eq 1 ]; then
+                if [ "$id_operand" -eq 1 ] && [[ "$arg" =~ ^wv-[a-f0-9]{4,6}$ ]]; then
+                    normalized="$arg"
+                else
+                    normalized="<redacted:$(_wv_byte_length "$arg")>"
+                fi
+                redact_operand=0
+                id_operand=0
+            elif [ "$operation" = "config" ] && [ "$nested" = "set" ] && [ "$index" -gt 1 ]; then
+                normalized="<redacted:$(_wv_byte_length "$arg")>"
+            elif [[ "$arg" == --*=* ]]; then
+                option="${arg%%=*}"
+                value="${arg#*=}"
+                if [[ "$option" =~ ^--(parent|subtree)$ ]] && [[ "$value" =~ ^wv-[a-f0-9]{4,6}$ ]]; then
+                    normalized="${option}=${value}"
+                elif _wv_known_option "$option"; then
+                    normalized="${option}=<redacted:$(_wv_byte_length "$value")>"
+                else
+                    normalized="<redacted:$(_wv_byte_length "$arg")>"
+                fi
+            elif [ "$index" -eq 1 ] && _wv_nested_operation "$operation" "$arg"; then
+                normalized="$arg"
+            elif _wv_node_id_position "$operation" "$index" && [[ "$arg" =~ ^wv-[a-f0-9]{4,6}$ ]]; then
+                normalized="$arg"
+            elif _wv_known_option "$arg"; then
+                normalized="$arg"
+                if _wv_option_consumes_value "$arg"; then
+                    redact_operand=1
+                    [[ "$arg" =~ ^--(parent|subtree)$ ]] && id_operand=1
+                fi
+            else
+                normalized="<redacted:$(_wv_byte_length "$arg")>"
+            fi
+            printf '"%s"' "$(_wv_json_escape "$normalized")"
+            index=$((index + 1))
+        done
+        printf ']'
+    }
     _wv_ts_start=$(date +%s%3N)
     _wv_ts_epoch=$(date +%s.%6N)
+    _wv_argv=$(_wv_argv_json "$@")
+    _wv_graph_before=$(_wv_graph_identity_json)
     _wv_out=$(mktemp -t wv-calllog-XXXXXX)
     _wv_err=$(mktemp -t wv-calllog-err-XXXXXX)
     _wv_exit=0
@@ -310,6 +479,7 @@ if [[ -n "${WV_CALL_LOG:-}" ]]; then
     main "$@" > >( tee "$_wv_out" ) 2> >( tee "$_wv_err" >&2 )
     _wv_exit=$?
     set -e
+    _wv_graph_after=$(_wv_graph_identity_json)
     _wv_ts_end=$(date +%s%3N)
     _wv_elapsed=$((_wv_ts_end - _wv_ts_start))
     _wv_stdout_bytes=$(wc -c < "$_wv_out")
@@ -335,10 +505,13 @@ if [[ -n "${WV_CALL_LOG:-}" ]]; then
     _wv_repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
     _wv_call_id="${WV_CALL_ID:-$(_wv_generate_call_id)}"
     _wv_workflow_id="${WV_WORKFLOW_ID:-}"
+    _wv_trace_id="${WV_TRACE_ID:-${_wv_workflow_id:-$_wv_call_id}}"
+    _wv_cmd=$(_wv_normalized_operation "${1:-help}")
+    _wv_policy_revision=$(_wv_unavailable_json "no live host adapter emits an authoritative policy revision (wv-426134)")
     # Braced group: stderr is silenced before the >> open is attempted, so an
     # unwritable log path (read-only FS, missing dir) cannot leak bash errors.
-    { printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"%s","call_id":"%s","workflow_id":"%s","repo_root":"%s"}\n' \
-        "$_wv_ts_epoch" "$(_wv_json_escape "${1:-help}")" "$_wv_stdout_bytes" "$_wv_stderr_bytes" "$_wv_elapsed" "$(_wv_json_escape "$_wv_source")" "$(_wv_json_escape "$_wv_call_id")" "$(_wv_json_escape "$_wv_workflow_id")" "$(_wv_json_escape "$_wv_repo_root")" \
+    { printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"%s","call_id":"%s","workflow_id":"%s","trace_id":"%s","repo_root":"%s","exit_status":%d,"argv":%s,"graph_identity_before":%s,"graph_identity_after":%s,"policy_revision":%s}\n' \
+        "$_wv_ts_epoch" "$(_wv_json_escape "$_wv_cmd")" "$_wv_stdout_bytes" "$_wv_stderr_bytes" "$_wv_elapsed" "$(_wv_json_escape "$_wv_source")" "$(_wv_json_escape "$_wv_call_id")" "$(_wv_json_escape "$_wv_workflow_id")" "$(_wv_json_escape "$_wv_trace_id")" "$(_wv_json_escape "$_wv_repo_root")" "$_wv_exit" "$_wv_argv" "$_wv_graph_before" "$_wv_graph_after" "$_wv_policy_revision" \
         >> "$WV_CALL_LOG"; } 2>/dev/null || true
     exit "$_wv_exit"
 else

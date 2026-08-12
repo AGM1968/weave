@@ -2,7 +2,12 @@ id: prose-casual-register
 language: prose
 kind: regex
 severity: info
-provenance: wv-6a7ade@nowcastr + report-language-no-unearned-claims memory
+policy: always-on-shared
+maturity: promotable
+provenance: >-
+  wv-6a7ade@nowcastr + report-language-no-unearned-claims memory. Expanded
+  after a 2026-07-30 review showed the original four following words caught
+  only one of five causal-clause forms.
 message: >-
   Casual or unearned register: clause-level causal 'so', gambling metaphors,
   superlative slant, correction archaeology. Publication-register connectives
@@ -12,7 +17,19 @@ paths:
   - "docs/**/*.md"
   - "*.md"
 patterns:
-  - ',\s+so\s+(?:the|it|we|this)\b'
+  - '[,—–]\s*so\s+(?!that(?:\s+|$))\S+'
   - '\b(?:bet|punt)\b'
   - '\bmatters?\s+most\b'
   - '\ban earlier (?:evaluation|draft|version|run) had (?:reported|claimed|shown)\b'
+positive_controls:
+  - "The gate passed, so any remaining warning is unrelated."
+  - "The gate passed, so none remained."
+  - "The gate passed, so no retry ran."
+  - "The gate passed, so an alert was unnecessary."
+  - "The gate passed — so the workflow continued."
+  - "The gate passed, so that's settled."
+  - "The gate passed, so **the workflow** continued."
+  - "The gate passed, so the\nworkflow continued."
+negative_controls:
+  - "The gate waits, so that every receipt is durable."
+  - "The result follows from the measured causal model."

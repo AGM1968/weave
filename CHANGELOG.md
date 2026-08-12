@@ -4,6 +4,202 @@
 
 ## Unreleased
 
+## [1.71.0-rc.1] - 2026-08-12
+
+First public prerelease of the Weave 1.71 LTS maintenance line since v1.70.3. Weave (Bash/Python) is
+now maintained as a supported long-term maintenance line, kept separate from an in-progress Rust
+successor program. That Rust work remains a private, shadow/read-only evaluation effort gated behind
+its own durability and evidence criteria — **this release transfers no Rust mutation authority and
+ships no Rust, evaluation, or private evidence-lab code**; those surfaces are excluded from the
+public artifact entirely, as they always have been.
+
+### Fixed
+
+- **Skip-CI safety** — automatic checkpoint and state-sync commits no longer apply `[skip ci]`
+  unconditionally; the marker is now omitted whenever the unpushed range ahead of the tracked
+  upstream carries non-graph-storage changes. Push-triggered CI can no longer be silently skipped
+  alongside code landing in the same push.
+- **Close-gate ownership** — closing a unit of work no longer blocks on unrelated dirty files
+  elsewhere in the tree; the gate now scopes to files the closing work touched, with a new
+  diagnostic surfacing any foreign leftover dirt afterward instead of silently ignoring it.
+- **Repository containment** — initialization and scaffolding projection now fail closed before
+  writing into forks or repositories without verified ownership, instead of assuming write access.
+- **Projection durability** — explicit metadata updates now publish a durable projection of graph
+  state before the underlying change is considered complete, and scaffolding/pattern projection
+  writes are atomic and validate complete, well-formed manifests before touching disk.
+- **MCP contract hardening** — the MCP tool schema is kept in lockstep with the CLI: a previously
+  CLI-only flag (recording upfront what would count as "done" on a new item, surfaced again as a
+  reminder if closing it is later blocked) is now exposed to MCP callers too, with regression
+  coverage that catches this class of drift automatically going forward. The local MCP server also
+  now requires Node.js 20+ and rejects unsupported runtimes up front instead of failing later and
+  unpredictably.
+- **Context-cache correctness** — the on-disk context cache is now correctly invalidated on schema
+  changes, preventing a stale cached payload shape from being served after an upgrade.
+- **Doctor diagnostics** — new advisories catch dirty files left behind by a closed unit of work and
+  a quality-rule manifest entry that resolves in neither the shared nor the project-local tier,
+  surfacing drift that previously went unnoticed.
+- **Scanner correctness** — quality-rule handling now fails closed, instead of silently skipping, on
+  malformed syntax, invalid schema, duplicate rule ids, and invalid patterns; two different rules
+  independently flagging the exact same location no longer double-count as separate findings.
+
+### Also included
+
+Everything from the 1.71.0-dev.1 through dev.4 preview line below: stable quality-finding identity
+across scans, protected/repeatable evaluation runs, search-failure-aware evaluation scoring,
+state-aware workflow observations, decimal-safe delta timestamps, and assorted CLI papercut fixes.
+
+Verified with the full test suite (2700+ cases) — including cross-harness agent-identity parity and
+MCP-vs-CLI flag parity — plus the release-integrity suite and a rebuilt, installed, and
+selftest-verified artifact, before publishing.
+
+## [1.71.0-dev.4] - 2026-08-11
+
+Private corrective preview for installation on owned machines, folding in an external code review
+round of the earth-engine-analysis consumer repo (dev.3). Seven findings fixed after independent
+validation against current HEAD; two audit claims found already stale or not reproducible were left
+untouched. This version is not a public release.
+
+### Fixed
+
+- **Checkpoint `[skip ci]` scoping** — auto-checkpoint and sync-state commits now omit `[skip ci]`
+  when the unpushed range ahead of the branch's upstream carries non-`.weave/` work, instead of
+  applying the marker unconditionally. Reproduced live in this repo's own history: a prior
+  checkpoint commit landed `[skip ci]` on top of unpushed real code and both were pushed together,
+  which would silently skip CI for the whole push on any repo with push-triggered CI.
+- **`wv done`'s dirty-tree gate scoped to the closing node** — the pre-close gate blocked on any
+  non-`.weave/` dirty file in the repo, not just files the closing node actually touched, forcing
+  either a misattributed commit under the wrong node or an indefinitely open node. Now scopes to the
+  node's own `touched_files` when available, falling back to the prior strict behavior otherwise.
+  New `wv doctor` advisory (`closed-node-dirt`) surfaces genuinely foreign leftover dirt after the
+  fact.
+- **Managed pattern-rule resync UX** — the shadow-warning text now names the required follow-up
+  (`wv init-repo --update`) instead of leaving a deleted shadowing rule permanently missing; a new
+  `wv doctor` advisory (`managed-pattern-completeness`) catches a manifest id resolving in neither
+  the managed nor the custom tier.
+- **Learnings supersession visibility** — `wv learnings` (both default text and `--show-graph`) now
+  marks a superseded node and surfaces the `wv resolve` rationale, instead of printing a retracted
+  learning verbatim with no marker. `wv done --learning=` now warns when it detects an undelimited
+  multi-marker learning it could not split into structured fields.
+- **Five CLI papercuts** — `wv add --risks=` rejects an out-of-enum value instead of silently
+  dropping it; the orphan-node warning skips `--standalone` nodes; `wv context --json` includes
+  `done_criteria`/`risks`/`risk_level`; the scaffolded `CLAUDE.md`/`AGENTS.md`/copilot templates no
+  longer ship a dead `./scripts/wv` fallback; `wv link`/`edges`/etc. accept a hyphenated edge-type
+  alias (`relates-to`) for the underscored canonical form.
+- **Verification-plan upfront + impact-gate message clarity** — `wv add --verification-plan="..."`
+  records upfront what would count as done, surfaced back as a reminder if `wv done` is later
+  blocked for missing verification. The impact-gate-inert pre-commit warning now distinguishes an
+  absent `.weave/test-map.conf` from a present-but-non-matching one, naming the unmatched files.
+- **Cross-rule finding dedup** — two different pattern rules independently flagging the identical
+  `(path, line, col)` no longer double-count in scan totals and adjudication tracking; the
+  higher-maturity rule's finding is kept on a collision.
+
+## [1.71.0-dev.3] - 2026-07-30
+
+Private measurement preview for installation on owned machines. This version is not a public release
+and does not establish representative precision, defect rates, or gate authority.
+
+### Added
+
+- **Stable quality finding adjudication** — pattern findings use content-derived identities and
+  preserve human dispositions across scans so rule precision and recurring waivers can be measured.
+- **Protected evaluation runs** — validation and holdout datasets use repository-bound one-touch
+  ledgers with explicit invalidation history and digest-bound reports.
+- **Crystallize calibration scorer** — a digest-bound 16-slot historical seed scores five actions
+  plus explicit abstention while preserving unavailable identities as anonymous ordinal slots.
+
+### Changed
+
+- **Search execution evidence** — FTS, vector, and hybrid search distinguish successful empty
+  retrieval from backend failure. Evaluation scores successful empty results and excludes failed or
+  degraded executions from accuracy denominators.
+
+### Preview boundaries
+
+- Scanner findings and GPU observations remain unadjudicated evidence, not defect counts.
+- The crystallize seed is non-authoritative and not representative beyond its reviewed slots.
+- Evaluation, evidence, Rust, and private calibration artifacts remain excluded from the product
+  tarball; the public `AGM1968/weave` repository remains unchanged.
+
+## [1.71.0-dev.2] - 2026-07-30
+
+Private corrective preview for installation on owned machines. This version is not a public release
+and does not grant Rust mutation authority or claim cross-machine causal durability.
+
+### Changed
+
+- **Promotable quality-rule evidence** — promotable definitions now own positive and hard negative
+  controls that execute through the production matcher. Evidentiary maturity remains independent
+  from project policy reach.
+- **Actionable pattern findings** — text and JSON scans report exact matches with relative paths,
+  one-based locations, rule IDs, and severity while preserving aggregate fields.
+
+### Fixed
+
+- **Rule claim and schema drift** — causal `so` coverage now handles arbitrary clause openers,
+  contractions, formatting, and soft wraps while excluding `so that`; verification-motif wording now
+  states its actual repetition and local-number semantics. Promotable narrative metadata uses block
+  scalars.
+- **Vendored repository containment** — initialization and projection fail closed before tracked
+  writes in upstream forks and other repositories without verified ownership.
+- **Portable graph metadata** — explicit metadata updates publish portable graph projections before
+  the live mutation is considered complete.
+- **Decimal delta timestamps** — leading-zero nanoseconds are converted explicitly as base 10,
+  preventing Bash from treating digits 8 or 9 as invalid octal input.
+
+### Preview boundaries
+
+- Stable finding identity, adjudication history, holdout ledgers, search failure dispositions, and
+  crystallize classification scoring remain ordered measurement follow-ups, not claims of this
+  preview.
+- Pre-Rust evidence runners, corpora, shadow evaluators, and private measurement fixtures remain
+  development-only and are excluded from the product artifact.
+
+## [1.71.0-dev.1] - 2026-07-29
+
+Private preview for installation on owned machines. This version is not a public release and does
+not grant Rust mutation authority or claim cross-machine causal durability.
+
+### Added
+
+- **State-aware workflow observations** — opt-in call logs now carry stable call, workflow, and
+  trace identifiers, exit status, normalized argument structure, and before/after graph
+  fingerprints. `wv analyze sessions --trace-eval` reports repeated observations and can join a
+  versioned provider-usage sidecar without conflating measured usage with byte-derived estimates.
+- **Managed prose-quality rules** — `wv init-repo` projects a curated shared bundle into
+  `.weave/patterns/managed/` while preserving project-owned rules and explicit local overrides.
+- **Pattern execution receipts** — quality scans distinguish successful zero-hit execution from
+  not-run, changed, and failed definitions.
+
+### Changed
+
+- **MCP runtime prerequisite** — local MCP installation now requires Node.js 20 or newer and rejects
+  unsupported runtimes before dependency installation.
+- **Markdown prose matching** — prose rules operate over soft-wrapped paragraphs with source-line
+  mappings, while structural Markdown rules retain line scope.
+- **Evaluation reporting boundaries** — deterministic retrieval, policy, completion, remediation,
+  stop, topology, and usage reports remain observational and non-authoritative; independent gate
+  owners retain pass, fail, and inconclusive decisions.
+
+### Fixed
+
+- **Fail-closed quality-rule handling** — malformed syntax, invalid schema, duplicate IDs, invalid
+  regular expressions, and execution errors now fail list and scan with actionable paths. Pattern
+  promotion rejects stale or partial snapshots.
+- **Managed projection safety** — installation and repository projection validate complete
+  newline-terminated manifests, reject malformed assets and symlinked destinations, and mutate
+  managed files atomically.
+- **Release cleanup containment** — dev-only cleanup requires a nonempty build root before recursive
+  deletion.
+
+### Preview boundaries
+
+- Telemetry is opt-in and argument-payload-redacted, not anonymous: records retain operational
+  structure, timestamps, graph fingerprints, and repository paths.
+- Provider usage is reported only when a canonical host sidecar is supplied; policy revision remains
+  unavailable until a host emits an authoritative value.
+- Pre-Rust evidence runners, corpora, shadow evaluators, and private measurement fixtures remain
+  development-only and are excluded from the product artifact.
+
 ## [1.70.3] - 2026-07-23
 
 ### Fixed

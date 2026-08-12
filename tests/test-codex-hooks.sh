@@ -249,11 +249,11 @@ check "stamp-hit block decision names the active node" _jq_ok "$stamped_output" 
     '.decision == "block" and .active_node == $id and (.reason | contains("blocked by incomplete work"))' --arg id "$stamped_node"
 "$WV" update "$stamped_node" --status=done >/dev/null
 
-# --- dispatch/normalize fail-closed alignment on the E3 malformed fixtures (wv-692c2d) ---
-# For every E3 malformed PreToolUse event: normalize must fail closed (exit 2)
+# --- dispatch/normalize fail-closed alignment on malformed hook fixtures (wv-692c2d) ---
+# For every malformed PreToolUse event: normalize must fail closed (exit 2)
 # AND dispatch must block (exit 1). Advisory/lifecycle events keep dispatch's
 # deliberate fail-open posture, asserted separately below.
-E3_FIXTURE="$ROOT/tests/fixtures/rust-evidence/e3/harness-normalization.json"
+HOOK_FIXTURE="$ROOT/tests/fixtures/hook-normalization/malformed-events.json"
 while IFS=$'\t' read -r event_id host raw_kind payload; do
     set +e
     printf '%s' "$payload" | "$WV" hook normalize --host="$host" --event="$raw_kind" >/dev/null 2>&1
@@ -261,13 +261,13 @@ while IFS=$'\t' read -r event_id host raw_kind payload; do
     dispatch_output=$(printf '%s' "$payload" | "$WV" hook dispatch --event="$raw_kind" --json 2>/dev/null)
     dispatch_rc=$?
     set -e
-    check "E3 $event_id: normalize fails closed and dispatch blocks" \
+    check "$event_id: normalize fails closed and dispatch blocks" \
         bash -c "[ '$normalize_rc' -eq 2 ] && [ '$dispatch_rc' -eq 1 ]"
-    check "E3 $event_id: dispatch decision is a malformed-payload block" \
+    check "$event_id: dispatch decision is a malformed-payload block" \
         _jq_ok "$dispatch_output" '.decision == "block" and (.reason | contains("Malformed hook payload"))'
 done < <(jq -r '.malformed_events[]
     | select(.raw_event_kind == "PreToolUse")
-    | [.event_id, .host, .raw_event_kind, (.raw_payload | tojson)] | @tsv' "$E3_FIXTURE")
+    | [.event_id, .host, .raw_event_kind, (.raw_payload | tojson)] | @tsv' "$HOOK_FIXTURE")
 
 set +e
 lifecycle_output=$(printf 'not json' | "$WV" hook dispatch --event=Stop --json 2>/dev/null)

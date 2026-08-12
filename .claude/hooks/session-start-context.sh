@@ -22,6 +22,10 @@ source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null \
     || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null \
     || source "${HOME}/.config/weave/lib/wv-hook-common.sh" 2>/dev/null \
     || true
+source "$HOOK_DIR/../lib/wv-checkpoint-ci.sh" 2>/dev/null \
+    || source "$HOOK_DIR/../../scripts/lib/wv-checkpoint-ci.sh" 2>/dev/null \
+    || source "${HOME}/.config/weave/lib/wv-checkpoint-ci.sh" 2>/dev/null \
+    || true
 _hc_refresh
 
 # Check if wv is available
@@ -154,9 +158,23 @@ if [ -z "$SS_REGRESSION" ]; then
 (
     set +e
     cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
+    # wv-822bea/wv-179c49: hijack guard, same rule as auto_checkpoint/cmd_sync
+    # in wv-cmd-data.sh — refuse to commit if the caller pre-staged anything
+    # outside .weave/, so a session-start checkpoint never silently absorbs
+    # (and, worse, [skip-ci-marks) unrelated in-progress work.
+    if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
+        _SS_PRESTAGED=$(git diff --cached --name-only 2>/dev/null | grep -v '^\.weave/' || true)
+        [ -n "$_SS_PRESTAGED" ] && exit 0
+    fi
     git add .weave/ 2>/dev/null
     if ! git diff --cached --quiet -- .weave/ 2>/dev/null; then
-        WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): session-start state [skip ci]" 2>/dev/null
+        # wv-e937f8: see session-end-sync.sh's identical comment. wv-179c49:
+        # fail toward NOT skipping CI when the marker helper is unavailable
+        # or fails — the old " [skip ci]" fallback here defaulted to the
+        # unsafe direction on the exact failure mode this exists to prevent.
+        _SS_SKIP_CI=$(command -v wv_checkpoint_ci_marker >/dev/null 2>&1 \
+            && wv_checkpoint_ci_marker "$PWD" || echo "")
+        WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): session-start state${_SS_SKIP_CI}" 2>/dev/null
     fi
 ) || true
 fi

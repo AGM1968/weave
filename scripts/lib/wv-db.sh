@@ -259,10 +259,24 @@ BEFORE UPDATE OF status ON nodes
 WHEN NEW.status = 'done' AND OLD.status = 'active'
 BEGIN
         SELECT CASE
+                WHEN json_type(NEW.metadata, '$.completion_scope.files') IS NOT NULL
+                     AND (
+                         json_type(NEW.metadata, '$.completion_scope.files') != 'array'
+                         OR json_array_length(NEW.metadata, '$.completion_scope.files') = 0
+                         OR COALESCE(json_extract(NEW.metadata, '$.completion_scope.attempt_id'), '') = ''
+                         OR json_extract(NEW.metadata, '$.completion_scope.attempt_id') IS json_extract(OLD.metadata, '$.completion_scope.attempt_id')
+                         OR EXISTS (
+                             SELECT 1 FROM json_each(NEW.metadata, '$.completion_scope.files') scoped
+                             WHERE scoped.type != 'text' OR scoped.value = ''
+                                OR NOT EXISTS (SELECT 1 FROM node_files nf WHERE nf.node_id=NEW.id AND nf.path=scoped.value)
+                         )
+                     ) THEN RAISE(ABORT, 'GraphPolicyViolation: invalid completion scope')
                 WHEN EXISTS (
                         SELECT 1 FROM node_files nf
                         JOIN file_metrics fm ON fm.path = nf.path
                         WHERE nf.node_id = NEW.id
+                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
+                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
                             AND fm.mccabe_max > COALESCE(
                                 (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
                                 (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
@@ -280,6 +294,8 @@ BEGIN
                         SELECT 1 FROM node_files nf
                         JOIN file_trend ft ON ft.path = nf.path
                         WHERE nf.node_id = NEW.id
+                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
+                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
                             AND ft.direction = 'deteriorating'
                             AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
                             AND NOT EXISTS (
@@ -595,6 +611,8 @@ BEGIN
                         SELECT 1 FROM node_files nf
                         JOIN file_metrics fm ON fm.path = nf.path
                         WHERE nf.node_id = NEW.id
+                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
+                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
                             AND fm.mccabe_max > COALESCE(
                                 (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
                                 (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
@@ -604,6 +622,8 @@ BEGIN
                         SELECT 1 FROM node_files nf
                         JOIN file_trend ft ON ft.path = nf.path
                         WHERE nf.node_id = NEW.id
+                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
+                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
                             AND ft.direction = 'deteriorating'
                             AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
                 ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
@@ -731,10 +751,24 @@ BEFORE UPDATE OF status ON nodes
 WHEN NEW.status = 'done' AND OLD.status = 'active'
 BEGIN
         SELECT CASE
+                WHEN json_type(NEW.metadata, '$.completion_scope.files') IS NOT NULL
+                     AND (
+                         json_type(NEW.metadata, '$.completion_scope.files') != 'array'
+                         OR json_array_length(NEW.metadata, '$.completion_scope.files') = 0
+                         OR COALESCE(json_extract(NEW.metadata, '$.completion_scope.attempt_id'), '') = ''
+                         OR json_extract(NEW.metadata, '$.completion_scope.attempt_id') IS json_extract(OLD.metadata, '$.completion_scope.attempt_id')
+                         OR EXISTS (
+                             SELECT 1 FROM json_each(NEW.metadata, '$.completion_scope.files') scoped
+                             WHERE scoped.type != 'text' OR scoped.value = ''
+                                OR NOT EXISTS (SELECT 1 FROM node_files nf WHERE nf.node_id=NEW.id AND nf.path=scoped.value)
+                         )
+                     ) THEN RAISE(ABORT, 'GraphPolicyViolation: invalid completion scope')
                 WHEN EXISTS (
                         SELECT 1 FROM node_files nf
                         JOIN file_metrics fm ON fm.path = nf.path
                         WHERE nf.node_id = NEW.id
+                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
+                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
                             AND fm.mccabe_max > COALESCE(
                                 (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
                                 (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
@@ -752,6 +786,8 @@ BEGIN
                         SELECT 1 FROM node_files nf
                         JOIN file_trend ft ON ft.path = nf.path
                         WHERE nf.node_id = NEW.id
+                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
+                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
                             AND ft.direction = 'deteriorating'
                             AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
                             AND NOT EXISTS (
@@ -767,6 +803,8 @@ BEGIN
                         SELECT 1 FROM node_files nf
                         JOIN file_test_status fts ON fts.path = nf.path
                         WHERE nf.node_id = NEW.id
+                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
+                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
                             AND fts.state IN ('red', 'stale')
                             AND (SELECT value FROM policy_thresholds WHERE key = 'test_gate') >= 2
                             -- Node-type exemption: non-code nodes are never test-gated,
@@ -854,21 +892,35 @@ MIGRATE_FTS
     fi
 }
 
-# Rebuild FTS5 index from existing nodes (for migration or repair)
+# Rebuild FTS5 index from existing nodes (for migration or repair).
+#
+# Covers BOTH search tables, not just nodes_fts (wv-ddb359: a prior version
+# only rebuilt nodes_fts, so a corrupted nodes_learning_fts had no repair
+# path short of hand-dropping it). The two tables need different repair
+# strategies because of how each stores content:
+#   - nodes_fts is an EXTERNAL CONTENT table (content=nodes) -- its rows are
+#     virtual, re-derived from the nodes table on demand, so the FTS5
+#     'rebuild' special command is sufficient and cheap.
+#   - nodes_learning_fts is a plain (non external-content) FTS5 table -- it
+#     owns its row data in its own shadow _content table, so 'rebuild' only
+#     re-derives the index FROM that shadow table and would preserve any
+#     corruption living there. DROP + recreate (db_migrate_fts5_learning is
+#     idempotent: CREATE IF NOT EXISTS + backfill from nodes.metadata) is the
+#     repair that actually fixed this in production.
 db_reindex_fts5() {
     db_ensure
-    
+
     # Check if FTS5 is available
     local fts5_available
     fts5_available=$(sqlite3 "$WV_DB" "SELECT sqlite_compileoption_used('ENABLE_FTS5');" 2>/dev/null || echo "0")
-    
+
     if [ "$fts5_available" != "1" ]; then
         echo "Error: FTS5 not available in this SQLite build" >&2
         return 1
     fi
-    
+
     echo "Rebuilding FTS5 index..." >&2
-    
+
     sqlite3 "$WV_DB" <<'REINDEX'
 -- Ensure FTS table exists
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
@@ -885,6 +937,13 @@ REINDEX
     local count
     count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes_fts;")
     echo "Indexed $count nodes" >&2
+
+    sqlite3 "$WV_DB" "DROP TABLE IF EXISTS nodes_learning_fts;" 2>/dev/null || true
+    db_migrate_fts5_learning
+
+    local learning_count
+    learning_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes_learning_fts;" 2>/dev/null || echo 0)
+    echo "Indexed $learning_count learning entries" >&2
 }
 
 # Rebuild FTS silently on load (called after importing selective state.sql

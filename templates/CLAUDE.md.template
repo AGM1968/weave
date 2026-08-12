@@ -4,9 +4,10 @@
 > Task tracking active. Canonical reference: `wv guide` or `~/.config/weave/WORKFLOW.md`.
 
 ```txt
-if ! command -v wv >/dev/null 2>&1; then wv() { ./scripts/wv "$@"; }; fi
-# ./scripts/wv appends existing $HOME/.local/bin and $HOME/.cargo/bin for user tools;
-# the Weave Makefile targets apply the same PATH fallback for sandbox shells.
+if ! command -v wv >/dev/null 2>&1; then wv() { "$HOME/.local/bin/wv" "$@"; }; fi
+# Fallback for a shell where ~/.local/bin is not yet on PATH (sandboxed
+# agents, fresh shells before the next login). This repo does not vendor
+# weave's own scripts/wv -- wv is installed globally by install.sh.
 wv bootstrap --json               # 0. Session snapshot — replaces git status + wv status
 wv search "<topic>"               # 1. Check for existing related work before claiming/creating
 wv ready                          # 2. Find unblocked work

@@ -1,0 +1,32 @@
+id: prose-self-attested-virtue
+language: prose
+kind: regex
+severity: info
+policy: always-on-shared
+maturity: promotable
+provenance: >-
+  wv-d74573 @nowcast (2026-07-29). A user correction on "honest interval"
+  led to a repository sweep that found 12 instances across seven documents.
+  Each adjudicated instance had a more precise technical replacement.
+message: >-
+  Self-attested virtue vouches for the writing instead of naming a property of
+  the result. Replace it with the statistical, logical, or epistemic property
+  actually meant, such as unbiased, known, binding, measured, or unverified.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+patterns:
+  - '(?i)\bhonest\w*\b'
+  - '(?i)\bcandid(?:ly)?\b'
+  - '(?i)\btruthful(?:ly)?\b'
+  - '(?i)\bto be (?:perfectly |completely |entirely |totally )?(?:fair|frank)\b'
+  - '(?i)\bin all (?:honesty|fairness)\b'
+exempt:
+  - honest broker
+  - honest-but-curious
+positive_controls:
+  - "This gives an honest interval."
+negative_controls:
+  - "The protocol uses an honest broker to separate the parties."
+  - "The proof assumes an honest-but-curious adversary."

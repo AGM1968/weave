@@ -333,7 +333,8 @@ resolve_delta_filename_prefix() {
         _WV_DELTA_STAMP_SEQ=0
     fi
 
-    printf -v prefix '%010d-%09d-%06d' "$epoch_sec" "$epoch_subsec" "${_WV_DELTA_STAMP_SEQ:-0}"
+    printf -v prefix '%010d-%09d-%06d' \
+        "$epoch_sec" "$((10#$epoch_subsec))" "${_WV_DELTA_STAMP_SEQ:-0}"
     if [ -n "$outvar" ]; then
         printf -v "$outvar" '%s' "$prefix"
     else

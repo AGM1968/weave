@@ -412,6 +412,25 @@ test_add() {
         assert_contains "$risk_meta" "\"risk_level\":\"$level\"" "--risks=$level sets risk_level"
         assert_contains "$risk_meta" '"risks":[]' "--risks=$level seeds empty risks list"
     done
+
+    # wv-cccf70: a value outside the enum used to be silently accepted
+    # (exit 0) and stored NOTHING -- --criteria has no such enum and always
+    # persists, which is why the two flags looked asymmetric. Must reject
+    # loudly now, not silently no-op.
+    assert_fails "add rejects an out-of-enum --risks value" "$WV" add "bad risks" --risks="r1,r2" --force
+    local bad_risks_out
+    bad_risks_out=$("$WV" add "bad risks message" --risks="r1,r2" --force 2>&1) || true
+    assert_contains "$bad_risks_out" "none|low|medium|high|critical" "add --risks rejection names the valid enum"
+
+    # wv-734186: verification-method/verification-evidence were only ever
+    # askable at wv done close time. --verification-plan lets "what would
+    # count as done" be recorded upfront on wv add.
+    local plan_id plan_meta
+    plan_id=$("$WV" add "verification plan flag test" --force \
+        --verification-plan="run pytest tests/foo.py" 2>&1 | node_id_from_output)
+    plan_meta=$("$WV" show "$plan_id" --json | jq -r '.metadata')
+    assert_contains "$plan_meta" '"verification_plan":"run pytest tests/foo.py"' \
+        "add --verification-plan stores the plan in metadata"
 }
 
 # ============================================================================
@@ -1385,6 +1404,111 @@ test_update_metadata_merge() {
     assert_contains "$update_help" "--metadata-file <path>" "wv update --help documents safer file-backed metadata"
 }
 
+test_update_metadata_portability() {
+    echo ""
+    echo "Test: wv update --metadata portable snapshot and delta replay"
+    echo "============================================================"
+
+    local sandbox source_repo snapshot_repo delta_repo source_hot
+    sandbox=$(mktemp -d)
+    source_repo="$sandbox/source"
+    snapshot_repo="$sandbox/snapshot"
+    delta_repo="$sandbox/delta"
+    source_hot="$sandbox/source-hot"
+    mkdir -p "$source_repo" "$snapshot_repo" "$delta_repo"
+    git -C "$source_repo" init -q
+    git -C "$snapshot_repo" init -q
+    git -C "$delta_repo" init -q
+
+    local -a source_env=(env -u WV_DB -u WV_DB_CUSTOM
+        "WV_PROJECT_DIR=$source_repo" "WV_HOT_ZONE=$source_hot"
+        WV_REQUIRE_LEARNING=0 WV_AUTO_CHECKPOINT=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=60)
+    "${source_env[@]}" "$WV" init >/dev/null 2>&1
+
+    local id
+    id=$(cd "$source_repo" && "${source_env[@]}" "$WV" add "portable metadata" \
+        --metadata='{"base":{"kept":true}}' --force 2>&1 | node_id_from_output)
+    (cd "$source_repo" && "${source_env[@]}" "$WV" sync >/dev/null 2>&1)
+
+    # Preserve a pre-update checkpoint and isolate the update delta. The recent
+    # sync stamp intentionally remains: this reproduces the portability failure
+    # where ordinary auto_sync throttling used to skip every tracked artifact.
+    cp "$source_repo/.weave/state.sql" "$sandbox/baseline-state.sql"
+    rm -rf "$source_repo/.weave/deltas"
+    (cd "$source_repo" && "${source_env[@]}" "$WV" update "$id" \
+        --metadata='{"breadcrumbs":{"goal":"portable","nested":{"next":"verify"}}}' >/dev/null 2>&1)
+    (cd "$source_repo" && "${source_env[@]}" "$WV" update "$id" \
+        --metadata='{"breadcrumbs":{"nested":{"receipt":"kept"}}}' >/dev/null 2>&1)
+
+    local merged_meta
+    merged_meta=$(cd "$source_repo" && "${source_env[@]}" "$WV" show "$id" --json-v2 | jq -c '.[0].metadata')
+    assert_contains "$merged_meta" '"next":"verify"' "second merge preserves prior nested metadata"
+    assert_contains "$merged_meta" '"receipt":"kept"' "second merge adds nested metadata"
+
+    # Exercise both deletion forms through the same forced persistence path.
+    (cd "$source_repo" && "${source_env[@]}" "$WV" update "$id" \
+        --metadata='{"temporary":"remove-me","breadcrumbs":{"nested":{"next":null}}}' >/dev/null 2>&1)
+    (cd "$source_repo" && "${source_env[@]}" "$WV" update "$id" \
+        --remove-key=temporary >/dev/null 2>&1)
+
+    local live_meta projected_meta delta_text
+    live_meta=$(cd "$source_repo" && "${source_env[@]}" "$WV" show "$id" --json-v2 | jq -c '.[0].metadata')
+    projected_meta=$(jq -c --arg id "$id" 'select(.id == $id) | (.metadata | fromjson)' \
+        "$source_repo/.weave/nodes.jsonl")
+    delta_text=$(find "$source_repo/.weave/deltas" -name '*.sql' -type f -exec cat {} + 2>/dev/null || true)
+
+    assert_contains "$live_meta" '"base":{"kept":true}' "live merge preserves unrelated metadata"
+    assert_contains "$live_meta" '"receipt":"kept"' "second merge adds nested metadata"
+    assert_equals "false" "$(jq -r '.breadcrumbs.nested | has("next")' <<< "$live_meta")" \
+        "RFC-7396 null removes a nested metadata key"
+    assert_equals "false" "$(jq -r 'has("temporary")' <<< "$live_meta")" \
+        "--remove-key removes top-level metadata before persistence"
+    assert_equals "$live_meta" "$projected_meta" "nodes.jsonl immediately matches live metadata"
+    assert_contains "$(grep -a 'breadcrumbs' "$source_repo/.weave/state.sql" || true)" "breadcrumbs" \
+        "state.sql immediately contains nested metadata"
+    assert_contains "$delta_text" "breadcrumbs" "metadata update emits a replayable delta inside throttle window"
+
+    # Snapshot round trip: copy only portable graph state into a fresh repository.
+    cp -a "$source_repo/.weave" "$snapshot_repo/.weave"
+    local -a snapshot_env=(env -u WV_DB -u WV_DB_CUSTOM
+        "WV_PROJECT_DIR=$snapshot_repo" "WV_HOT_ZONE=$sandbox/snapshot-hot"
+        WV_REQUIRE_LEARNING=0 WV_AUTO_CHECKPOINT=0 WV_AUTO_SYNC=0)
+    (cd "$snapshot_repo" && "${snapshot_env[@]}" "$WV" load >/dev/null 2>&1)
+    local snapshot_meta live_portable snapshot_portable
+    snapshot_meta=$(cd "$snapshot_repo" && "${snapshot_env[@]}" "$WV" show "$id" --json-v2 | jq -c '.[0].metadata')
+    live_portable=$(jq -c '{base, breadcrumbs}' <<< "$live_meta")
+    snapshot_portable=$(jq -c '{base, breadcrumbs}' <<< "$snapshot_meta")
+    assert_equals "$live_portable" "$snapshot_portable" \
+        "fresh load preserves exact nested metadata from snapshot"
+
+    # Delta-only round trip: replay update deltas over the pre-update checkpoint.
+    mkdir -p "$delta_repo/.weave"
+    cp "$sandbox/baseline-state.sql" "$delta_repo/.weave/state.sql"
+    cp -a "$source_repo/.weave/deltas" "$delta_repo/.weave/deltas"
+    local -a delta_env=(env -u WV_DB -u WV_DB_CUSTOM
+        "WV_PROJECT_DIR=$delta_repo" "WV_HOT_ZONE=$sandbox/delta-hot"
+        WV_REQUIRE_LEARNING=0 WV_AUTO_CHECKPOINT=0 WV_AUTO_SYNC=0)
+    (cd "$delta_repo" && "${delta_env[@]}" "$WV" load >/dev/null 2>&1)
+    local replay_meta replay_portable
+    replay_meta=$(cd "$delta_repo" && "${delta_env[@]}" "$WV" show "$id" --json-v2 | jq -c '.[0].metadata')
+    replay_portable=$(jq -c '{base, breadcrumbs}' <<< "$replay_meta")
+    assert_equals "$live_portable" "$replay_portable" "delta replay preserves exact nested metadata update"
+
+    # Persistence failure must not be reported as portable success. The SQLite
+    # mutation remains recoverable locally and _warp_changes remains pending.
+    chmod -R a-w "$source_repo/.weave"
+    local failure_output failure_rc=0
+    failure_output=$(cd "$source_repo" && "${source_env[@]}" "$WV" update "$id" \
+        --metadata='{"failure_probe":true}' 2>&1) || failure_rc=$?
+    chmod -R u+w "$source_repo/.weave"
+    assert_equals "1" "$([ "$failure_rc" -ne 0 ] && echo 1 || echo 0)" \
+        "metadata update fails closed when portable artifacts cannot be written"
+    assert_contains "$failure_output" "portable sync failed" \
+        "metadata persistence failure gives recovery guidance"
+
+    rm -rf "$sandbox"
+}
+
 test_help_surfaces() {
     echo ""
     echo "Test: CLI help surfaces"
@@ -1401,7 +1525,7 @@ test_help_surfaces() {
         overview cache pending-close ready list show status update touch allowed-tools quick
         hook
         block link unlink resolve related edges path tree plan enrich-topology context discover search
-        reindex learnings trails digest session-summary audit-pitfalls edge-types init-repo
+        reindex learnings trails digest session-summary audit-pitfalls edge-types repo-class init-repo
         doctor selftest mcp-status health guide prune clean-ghosts compact refs import quality
         findings analyze batch sync load
         impact hotzone pattern-audit validate-finding test-record
@@ -1478,12 +1602,15 @@ test_orphan_prevention() {
     assert_contains "$output" "--parent" "orphan guard fires when active epic exists"
     assert_contains "$output" "Error" "orphan guard prints error message"
 
-    # Verify the node was rolled back (guard deletes node on error)
-    # Note: the add output WILL contain wv-XXXX from the creation step before rollback.
-    # The correct check is that the node doesn't appear in the list after the failed add.
+    # The guard now runs before the node is created, so no id is ever printed
+    # for the rejected add (previously it printed a confirmation line for a
+    # node that then got rolled back — an agent parsing stdout would record
+    # an id that no longer existed).
+    assert_not_contains "$output" "✓" "orphan guard rejects before printing a confirmation"
+
     local list_output
     list_output=$("$WV" list 2>&1)
-    assert_not_contains "$list_output" "Orphan task attempt" "orphan guard rolls back the node"
+    assert_not_contains "$list_output" "Orphan task attempt" "orphan guard never creates the node"
 
     # With --parent specified, add succeeds
     local child_id
@@ -2774,6 +2901,78 @@ test_ready_filters_by_resolved_agent() {
     assert_equals "1" "$seenBall" "agentB --all sees the node"
 }
 
+test_delta_stamp_leading_zero_subseconds() {
+    echo ""
+    echo "Test: delta stamps force leading-zero subseconds to decimal"
+    echo "==========================================================="
+    local L="$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh"
+    local first second stderr_file
+    stderr_file="$TEST_DIR/delta-stamp.stderr"
+    first=$(bash -c "
+        source '$L'
+        resolve_unix_clock_parts() { printf '%s\\n' '1785407566 029084018'; }
+        resolve_delta_filename_prefix
+    " 2>"$stderr_file")
+    second=$(bash -c "
+        source '$L'
+        resolve_unix_clock_parts() { printf '%s\\n' '1785407566 029084018'; }
+        resolve_delta_filename_prefix first
+        resolve_delta_filename_prefix second
+        printf '%s\\n' \"\$second\"
+    " 2>>"$stderr_file")
+
+    assert_equals "1785407566-029084018-000000" "$first" "leading-zero subseconds retain width"
+    assert_equals "1785407566-029084018-000001" "$second" "same-clock sequence remains ordered"
+    assert_equals "" "$(cat "$stderr_file")" "leading-zero subseconds emit no octal warning"
+}
+
+test_done_completion_scope() {
+    echo ""
+    echo "Test: done completion scope preserves historical attribution"
+    echo "============================================================"
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    local id rc meta count scoped_out json_out
+    id=$("$WV" add "long-lived scoped close" --status=active --criteria="scope is audited" --risks=low --force 2>&1 | node_id_from_output)
+    sqlite3 "$WV_DB" "INSERT INTO node_files(node_id,path) VALUES('$id','clean.sh'),('$id','historical.sh');
+      INSERT INTO file_metrics(path,mccabe_max,language) VALUES('clean.sh',1,'sh'),('historical.sh',999,'sh');"
+
+    rc=0
+    WV_REQUIRE_QUALITY=0 "$WV" done "$id" --skip-verification >/dev/null 2>&1 || rc=$?
+    assert_equals "1" "$rc" "done without completion scope retains all-node_files gate"
+
+    scoped_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files=clean.sh --skip-verification 2>&1)
+    assert_contains "$scoped_out" "explicit (1 policy / 2 historical files)" "done reports explicit and historical completion counts"
+    meta=$("$WV" show "$id" --json | jq -r '.metadata')
+    assert_contains "$meta" '"completion_scope"' "done records completion scope metadata"
+    assert_contains "$meta" '"clean.sh"' "completion scope records selected file"
+    count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM node_files WHERE node_id='$id';")
+    assert_equals "2" "$count" "completion scope does not delete historical node_files"
+
+    id=$("$WV" add "invalid scoped close" --force 2>&1 | node_id_from_output)
+    sqlite3 "$WV_DB" "INSERT INTO node_files(node_id,path) VALUES('$id','clean.sh');"
+    assert_fails "completion scope requires active status" env WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files=clean.sh --skip-verification
+    assert_fails "completion scope rejects non-attributed path" env WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files=other.sh --skip-verification
+    assert_fails "completion scope rejects non-normalized path" env WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files=./clean.sh --skip-verification
+    assert_fails "completion scope rejects empty selection" env WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files= --skip-verification
+
+    id=$("$WV" add "persisted scope cannot authorize close" --status=active --criteria="scope is fresh" --risks=low --force 2>&1 | node_id_from_output)
+    sqlite3 "$WV_DB" "INSERT INTO node_files(node_id,path) VALUES('$id','clean.sh'),('$id','historical.sh');
+      UPDATE nodes SET metadata=json_set(metadata,'\$.completion_scope',json('{\"files\":[\"clean.sh\"],\"attempt_id\":\"injected\"}')) WHERE id='$id';"
+    assert_fails "persisted completion scope cannot authorize a direct status transition" sqlite3 "$WV_DB" "UPDATE nodes SET status='done' WHERE id='$id';"
+    assert_fails "plain done ignores persisted completion scope" env WV_REQUIRE_QUALITY=0 "$WV" done "$id" --skip-verification
+
+    id=$("$WV" add "json scoped close" --status=active --criteria="scope is reported" --risks=low --force 2>&1 | node_id_from_output)
+    sqlite3 "$WV_DB" "INSERT INTO node_files(node_id,path) VALUES('$id','clean.sh');"
+    json_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files=clean.sh --skip-verification --json)
+    assert_equals "explicit" "$(jq -r '.completion_scope.mode' <<< "$json_out")" "JSON done reports explicit scope mode"
+    assert_equals "1" "$(jq -r '.completion_scope.policy_files' <<< "$json_out")" "JSON done reports policy file count"
+    meta=$("$WV" show "$id" --json | jq -c '.metadata | fromjson | .completion_scope')
+    assert_fails "already-done node rejects completion audit rewrite" env WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files=clean.sh --skip-verification
+    assert_equals "$meta" "$("$WV" show "$id" --json | jq -c '.metadata | fromjson | .completion_scope')" "rejected re-close preserves completion audit"
+}
+
 main() {
     echo "========================================"
     echo "Weave Core Command Tests"
@@ -2786,6 +2985,7 @@ main() {
     test_add
     test_orphan_prevention
     test_done
+    test_done_completion_scope
     test_done_stores_commit_hashes
     test_findings_promote
     test_auto_checkpoint_skip_at_origin
@@ -2795,6 +2995,7 @@ main() {
     test_ready
     test_agent_identity_resolution
     test_delta_filename_carries_identity
+    test_delta_stamp_leading_zero_subseconds
     test_ready_filters_by_resolved_agent
     test_status
     test_bootstrap_agent
@@ -2816,6 +3017,7 @@ main() {
     test_ready_relevance_boost
     test_done_contradiction
     test_update_metadata_merge
+    test_update_metadata_portability
     test_help_surfaces
     test_discover_cache_classification
 

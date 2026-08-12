@@ -262,6 +262,34 @@ test_breadcrumbs() {
     assert_not_contains "$drift_out" "drifted:" "doctor from outside git repo: no false hook-drift warning"
     assert_contains "$drift_out" "hook drift" "doctor from outside git repo: hook drift check still runs"
 
+    # wv-ddb359: doctor's FTS5 check must also probe nodes_learning_fts, not
+    # just nodes_fts -- a corruption confined to the learning index was
+    # previously invisible to both PRAGMA integrity_check and this check,
+    # letting `wv doctor` report healthy while every `wv done` failed.
+    local doctor_out
+    doctor_out=$("$WV" doctor --json 2>/dev/null)
+    assert_contains "$doctor_out" "FTS5 learning index" "doctor reports a dedicated FTS5 learning-index check"
+    local learning_status
+    learning_status=$(echo "$doctor_out" | jq -r '.checks[] | select(.check=="FTS5 learning index") | .status' 2>/dev/null)
+    assert_equals "pass" "$learning_status" "FTS5 learning-index check passes on a healthy DB"
+
+    # Simulate the actual corruption class: drop the learning index out from
+    # under a live nodes table (structurally what a corrupted-but-page-valid
+    # shadow index looks like -- base data intact, derived index gone/bad).
+    # --repair must recreate it and report the repair, not just fail closed.
+    sqlite3 "$WV_DB" "DROP TABLE IF EXISTS nodes_learning_fts;"
+    local repair_out
+    repair_out=$("$WV" doctor --repair --json 2>/dev/null)
+    local repair_status repair_detail
+    repair_status=$(echo "$repair_out" | jq -r '.checks[] | select(.check=="FTS5 learning index") | .status' 2>/dev/null)
+    repair_detail=$(echo "$repair_out" | jq -r '.checks[] | select(.check=="FTS5 learning index") | .detail' 2>/dev/null)
+    assert_equals "pass" "$repair_status" "doctor --repair recreates a dropped nodes_learning_fts"
+    assert_contains "$repair_detail" "repaired" "doctor --repair reports the learning-index repair explicitly"
+
+    local learning_exists
+    learning_exists=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='nodes_learning_fts';" 2>/dev/null)
+    assert_equals "1" "$learning_exists" "nodes_learning_fts table exists again after doctor --repair"
+
     # wv-a77603: cross-agent install-drift advisory rides the bootstrap JSON that
     # every harness (Claude/Codex/Copilot) reads at session start. The isolated
     # test env has no source-path pointer, so _wv_source_drift no-ops (consumer-

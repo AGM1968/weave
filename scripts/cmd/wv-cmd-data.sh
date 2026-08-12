@@ -201,7 +201,11 @@ auto_sync() {
     local delta_prefix
     resolve_delta_filename_prefix delta_prefix
     local delta_file="$delta_dir/${delta_prefix}-${agent_id}-$$.sql"
-    wv_delta_changeset "$WV_DB" > "$delta_file" 2>/dev/null || true
+    if ! wv_delta_changeset "$WV_DB" > "$delta_file"; then
+        rm -f "$delta_file"
+        echo "wv: failed to generate portable delta" >&2
+        return 1
+    fi
     [ -s "$delta_file" ] || rm -f "$delta_file"
     if [ "${WV_DELTA_V2_WRITE:-0}" = "1" ]; then
         local delta_v2_dir="$delta_dir/v2"
@@ -217,19 +221,22 @@ auto_sync() {
     # cmd_load uses to reconstruct the DB from scratch; deltas patch it forward.
     mkdir -p "$WEAVE_DIR"
     local tmp_sql tmp_nodes tmp_edges
-    tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
-    tmp_nodes=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX")
-    tmp_edges=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX")
+    tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX") || return 1
+    tmp_nodes=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX") || { rm -f "$tmp_sql"; return 1; }
+    tmp_edges=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX") || { rm -f "$tmp_sql" "$tmp_nodes"; return 1; }
 
-    dump_state_sql "$WV_DB" "$tmp_sql"
-    [ -s "$tmp_sql" ] || { rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; return 0; }
+    if ! dump_state_sql "$WV_DB" "$tmp_sql" || [ ! -s "$tmp_sql" ]; then
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        echo "wv: failed to generate portable state snapshot" >&2
+        return 1
+    fi
 
     # Floor-guard: never let an auto-checkpoint persist a drastically smaller graph
     # over committed truth (the 2026-06-06 sandbox data-loss path). Skip the dump,
     # keep deltas + _warp_changes pending, leave state.sql intact. Loud on stderr.
     if ! _sync_floor_guard_ok "$tmp_sql"; then
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
-        return 0
+        return 1
     fi
 
     # Second-level no-op guard: triggers can fire on no-net-change operations
@@ -243,12 +250,23 @@ auto_sync() {
         return 0
     fi
 
-    db_query_json "SELECT * FROM nodes;" 2>/dev/null | jq -c '.[]' > "$tmp_nodes" 2>/dev/null || true
-    db_query_json "SELECT * FROM edges;" 2>/dev/null | jq -c '.[]' > "$tmp_edges" 2>/dev/null || true
+    if ! db_query_json "SELECT * FROM nodes;" | jq -c '.[]' > "$tmp_nodes" \
+        || ! db_query_json "SELECT * FROM edges;" | jq -c '.[]' > "$tmp_edges"; then
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        echo "wv: failed to generate portable JSONL projections" >&2
+        return 1
+    fi
 
-    mv "$tmp_sql" "$WEAVE_DIR/state.sql"
-    mv "$tmp_nodes" "$WEAVE_DIR/nodes.jsonl"
-    mv "$tmp_edges" "$WEAVE_DIR/edges.jsonl"
+    # Publish readable projections first and the authoritative snapshot last.
+    # If a move fails, retain _warp_changes so a later sync can regenerate all
+    # artifacts rather than treating a partial publish as durable.
+    if ! mv "$tmp_nodes" "$WEAVE_DIR/nodes.jsonl" \
+        || ! mv "$tmp_edges" "$WEAVE_DIR/edges.jsonl" \
+        || ! mv "$tmp_sql" "$WEAVE_DIR/state.sql"; then
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        echo "wv: failed to publish portable graph artifacts" >&2
+        return 1
+    fi
 
     # Reset change tracking after successful persist
     wv_delta_reset "$WV_DB"
@@ -415,19 +433,26 @@ Weave-ID: $first_active"
             return 0
         fi
 
+        # wv-e937f8: [skip ci] applies to the whole PUSH at its tip, not just
+        # this commit's own (always .weave-only) diff -- omit it when the
+        # unpushed range ahead of upstream already carries non-.weave/ work,
+        # so this checkpoint landing on top doesn't silently skip CI for it.
+        local _cp_skip_ci
+        _cp_skip_ci=$(wv_checkpoint_ci_marker "$git_root")
+
         if [ "$_cp_local" != "$_cp_remote" ] \
            && [[ "$_cp_last_msg" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] \
            && [ -z "$_cp_last_nw_files" ]; then
             # Amend with fresh timestamp + trailers so Weave-ID stays current
             git -C "$git_root" commit --amend \
-                -m "chore(weave): auto-checkpoint $ts [skip ci]${trailers}" \
+                -m "chore(weave): auto-checkpoint $ts${_cp_skip_ci}${trailers}" \
                 --no-verify --quiet 2>/dev/null || \
             git -C "$git_root" commit \
-                -m "chore(weave): auto-checkpoint $ts [skip ci]${trailers}" \
+                -m "chore(weave): auto-checkpoint $ts${_cp_skip_ci}${trailers}" \
                 --no-verify --quiet 2>/dev/null || true
         else
             git -C "$git_root" commit \
-                -m "chore(weave): auto-checkpoint $ts [skip ci]${trailers}" \
+                -m "chore(weave): auto-checkpoint $ts${_cp_skip_ci}${trailers}" \
                 --no-verify --quiet 2>/dev/null || true
         fi
     fi
@@ -582,10 +607,16 @@ cmd_sync() {
     db_query_json "SELECT * FROM nodes;" | jq -c '.[]' > "$tmp_nodes" 2>/dev/null || true
     db_query_json "SELECT * FROM edges;" | jq -c '.[]' > "$tmp_edges" 2>/dev/null || true
 
-    # Atomic move (prevents partial writes on interrupt)
-    mv "$tmp_sql" "$WEAVE_DIR/state.sql"
-    mv "$tmp_nodes" "$WEAVE_DIR/nodes.jsonl"
-    mv "$tmp_edges" "$WEAVE_DIR/edges.jsonl"
+    # Publish human-readable projections first and state.sql last. A successful
+    # state.sql rename is the durability acknowledgement used by ship/recovery.
+    if ! mv "$tmp_nodes" "$WEAVE_DIR/nodes.jsonl" ||
+       ! mv "$tmp_edges" "$WEAVE_DIR/edges.jsonl" ||
+       ! mv "$tmp_sql" "$WEAVE_DIR/state.sql"; then
+        echo -e "${RED}✗${NC} Sync aborted: failed to publish durable graph state" >&2
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        trap - EXIT
+        return 1
+    fi
     trap - EXIT
 
     # Guard: if anything after this point (auto_checkpoint, git, gh_sync) is
@@ -674,6 +705,10 @@ cmd_sync() {
             _sync_last_nw_files=$(git -C "$git_root" diff HEAD~1 HEAD --name-only 2>/dev/null \
                 | grep -v '^\.weave/' | grep -v '^$' || true)
 
+            # wv-e937f8: see auto_checkpoint's identical comment above.
+            local _sync_skip_ci
+            _sync_skip_ci=$(wv_checkpoint_ci_marker "$git_root")
+
             # Amend if last commit is an unpushed weave-only checkpoint (same rule as auto_checkpoint).
             if [ "$_sync_local_head" != "$_sync_remote_head" ] \
                && [[ "$_sync_last_msg" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] \
@@ -681,11 +716,11 @@ cmd_sync() {
                 git -C "$git_root" commit --amend --no-edit \
                     --no-verify --quiet 2>/dev/null || \
                 git -C "$git_root" commit \
-                    -m "chore(weave): sync state [skip ci]" \
+                    -m "chore(weave): sync state${_sync_skip_ci}" \
                     --no-verify --quiet 2>/dev/null || true
             else
                 git -C "$git_root" commit \
-                    -m "chore(weave): sync state [skip ci]" \
+                    -m "chore(weave): sync state${_sync_skip_ci}" \
                     --no-verify --quiet 2>/dev/null || true
             fi
             # Update checkpoint stamp so auto_checkpoint respects this commit
@@ -1842,11 +1877,22 @@ cmd_learnings() {
         return
     fi
 
+    # wv-18b8f5 (external code review round 3 re-audit): wv resolve rewrites
+    # a contradicts edge into a supersedes edge (winner -> loser, wv-cmd-
+    # graph.sh's cmd_resolve) and that protects wv preflight, but a
+    # retracted learning kept printing verbatim here with no marker -- the
+    # text is deliberately KEPT (not mutated), so it must be KEPT AND
+    # LABELLED. One query up front (loser id -> winner id) covers both
+    # formatters below without a per-row query in the fast text path.
+    local superseded_map
+    superseded_map=$(db_query_json "SELECT target AS loser, source AS winner FROM edges WHERE type='supersedes';" 2>/dev/null | \
+        jq -c '[.[] | {(.loser): .winner}] | add // {}' 2>/dev/null || echo '{}')
+
     # Fast path: single jq call formats all output (avoids N*9 subprocess spawns)
     if [ "$show_graph" != true ]; then
-        _learnings_format_text "$results"
+        _learnings_format_text "$results" "$superseded_map"
     else
-        _learnings_format_graph "$results"
+        _learnings_format_graph "$results" "$superseded_map"
     fi
 }
 
@@ -1855,15 +1901,17 @@ cmd_learnings() {
 # Uses top-level metadata keys if present, falls back to inline parsing.
 _learnings_format_text() {
     local results="$1"
+    local superseded_map="${2:-{\}}"
     local _green _yellow _cyan _nc
     printf -v _green '%b' "$GREEN"
     printf -v _yellow '%b' "$YELLOW"
     printf -v _cyan '%b' "$CYAN"
     printf -v _nc '%b' "$NC"
     echo "$results" | jq -r --arg G "$_green" --arg Y "$_yellow" \
-        --arg C "$_cyan" --arg N "$_nc" '
+        --arg C "$_cyan" --arg N "$_nc" --argjson SUP "$superseded_map" '
         .[] |
         .id as $id | .text as $text |
+        ($SUP[$id] // null) as $winner |
         ((.metadata // "{}") | if type == "string" then fromjson else . end) as $m |
 
         # Use top-level keys if present, else parse inline markers from learning
@@ -1897,6 +1945,7 @@ _learnings_format_text() {
         end) as $p |
 
         ($C + $id + $N + ": " + ($text | .[0:72])),
+        (if $winner then "  " + $Y + "[SUPERSEDED by " + $winner + "]" + $N + " — retained verbatim below, not authoritative" else empty end),
         (if $p.decision then "  " + $G + "Decision:" + $N + " " + $p.decision else empty end),
         (if $p.pattern  then "  " + $G + "Pattern:"  + $N + "  " + $p.pattern  else empty end),
         (if $p.pitfall  then "  " + $Y + "Pitfall:"  + $N + "  " + $p.pitfall  else empty end),
@@ -1908,6 +1957,7 @@ _learnings_format_text() {
 # _learnings_format_graph — Slow path: per-row DB queries for --show-graph edges
 _learnings_format_graph() {
     local results="$1"
+    local superseded_map="${2:-{\}}"
     echo "$results" | jq -c '.[]' | while read -r row; do
         # Extract all fields in one jq call, parsing inline markers from learning
         eval "$(echo "$row" | jq -r '
@@ -1948,6 +1998,18 @@ _learnings_format_graph() {
         ' 2>/dev/null)"
 
         echo -e "${CYAN}$id${NC}: $text"
+        # wv-18b8f5: see cmd_learnings' own comment on the map this is built
+        # from -- a superseded learning is retained verbatim on purpose, so
+        # it must be labelled, not just kept.
+        local _lg_winner
+        _lg_winner=$(echo "$superseded_map" | jq -r --arg id "$id" '.[$id] // empty' 2>/dev/null)
+        if [ -n "$_lg_winner" ]; then
+            echo -e "  ${YELLOW}[SUPERSEDED by $_lg_winner]${NC} — retained verbatim below, not authoritative"
+            local _lg_rationale
+            _lg_rationale=$(db_query_json "SELECT context FROM edges WHERE type='supersedes' AND source='$_lg_winner' AND target='$id';" 2>/dev/null | \
+                jq -r '.[0].context // "" | (try fromjson catch {}).reason // empty' 2>/dev/null)
+            [ -n "$_lg_rationale" ] && echo "    Rationale: $_lg_rationale"
+        fi
         [ -n "$decision" ] && echo -e "  ${GREEN}Decision:${NC} $decision"
         [ -n "$pattern" ]  && echo -e "  ${GREEN}Pattern:${NC}  $pattern"
         [ -n "$pitfall" ]  && echo -e "  ${YELLOW}Pitfall:${NC}  $pitfall"

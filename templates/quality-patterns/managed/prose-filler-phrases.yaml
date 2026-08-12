@@ -1,0 +1,30 @@
+id: prose-filler-phrases
+language: prose
+kind: regex
+severity: info
+policy: always-on-shared
+maturity: promotable
+provenance: >-
+  wv-cc46cc @nowcast, ported and retained by earth-engine-analysis. Each
+  phrase has a shorter exact equivalent and does not encode a project-specific
+  register stance.
+message: >-
+  Filler phrase with a shorter exact equivalent. Replace it with the direct
+  form: "in order to" with "to", "due to the fact that" with "because",
+  and equivalent reductions.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+patterns:
+  - '\bin order to\b'
+  - '\bdue to the fact that\b'
+  - '\bat this point in time\b'
+  - '\bit is important to note\b'
+  - '\bhas the ability to\b'
+  - '\bin the event that\b'
+positive_controls:
+  - "In order to proceed, measure the input."
+negative_controls:
+  - "The order to proceed was issued after the measurement."
+  - "The event that triggered the alert occurred at 05:00."

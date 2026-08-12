@@ -5,7 +5,7 @@
 #   ./install-mcp.sh              Build and install MCP server
 #   ./install-mcp.sh --verify     Build, install, and verify with wv mcp-status
 #
-# Requires: Node.js 18+, npm
+# Requires: Node.js 20+, npm
 
 set -e
 
@@ -37,8 +37,14 @@ echo -e "${CYAN}━━━ Weave MCP Server Installer ━━━${NC}"
 
 # Check dependencies
 if ! command -v node &>/dev/null; then
-    echo -e "${RED}✗ node not found — MCP server requires Node.js 18+${NC}"
+    echo -e "${RED}✗ node not found — MCP server requires Node.js 20+${NC}"
     echo "  Install from: https://nodejs.org/"
+    exit 1
+fi
+
+node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
+if ! [[ "$node_major" =~ ^[0-9]+$ ]] || [ "$node_major" -lt 20 ]; then
+    echo -e "${RED}✗ Node.js 20+ required (found $(node --version 2>/dev/null || echo unknown))${NC}"
     exit 1
 fi
 

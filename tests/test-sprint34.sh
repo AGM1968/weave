@@ -1120,6 +1120,83 @@ test_checkpoint_trailers() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Test: wv learnings surfaces supersession (wv-18b8f5)
+# ═══════════════════════════════════════════════════════════════════════════
+
+test_learnings_supersession_marker() {
+    echo ""
+    echo "=== Learnings Supersession Marker ==="
+
+    setup_test_env
+    $WV init >/dev/null 2>&1
+
+    local loser winner
+    loser=$($WV add "stale claim" --standalone --force 2>/dev/null | tail -1)
+    $WV update "$loser" --metadata='{"decision":"OLD claim that later turned out wrong"}' >/dev/null 2>&1
+    winner=$($WV add "corrected claim" --standalone --force 2>/dev/null | tail -1)
+    $WV link "$loser" "$winner" --type=contradicts >/dev/null 2>&1
+    $WV resolve "$loser" "$winner" --winner="$winner" --rationale="found the real cause" >/dev/null 2>&1
+
+    # Default text output (the more commonly hit path -- not just --show-graph)
+    local text_out
+    text_out=$($WV learnings --node="$loser" 2>&1)
+    assert_contains "$text_out" "SUPERSEDED by $winner" "learnings (text): marks a superseded node"
+    assert_contains "$text_out" "OLD claim" "learnings (text): retracted text still printed verbatim, not deleted"
+
+    # --show-graph also carries the marker, plus the resolve rationale
+    local graph_out
+    graph_out=$($WV learnings --node="$loser" --show-graph 2>&1)
+    assert_contains "$graph_out" "SUPERSEDED by $winner" "learnings --show-graph: marks a superseded node"
+    assert_contains "$graph_out" "found the real cause" "learnings --show-graph: surfaces the resolve rationale"
+
+    # The winner's own learning is unaffected
+    local winner_out
+    winner_out=$($WV learnings --node="$winner" 2>&1)
+    assert_not_contains "$winner_out" "SUPERSEDED" "learnings: the winning node itself carries no marker"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Test: wv done --learning= warns on an undelimited category marker (wv-18b8f5)
+# ═══════════════════════════════════════════════════════════════════════════
+
+test_learning_undelimited_marker_warning() {
+    echo ""
+    echo "=== Undelimited Learning Marker Warning ==="
+
+    setup_test_env
+    $WV init >/dev/null 2>&1
+
+    # Continuous prose with two embedded markers and no '|' -- the exact
+    # shape that silently collapsed into .decision alone (wv-90c332's own
+    # reproduction in the external audit).
+    local id1 out1
+    id1=$($WV add "undelimited test" --standalone --force 2>/dev/null | tail -1)
+    $WV work "$id1" >/dev/null 2>&1
+    out1=$($WV done "$id1" --skip-verification \
+        --learning="Decision: some prose here. pattern: more prose with no pipe. pitfall: even more" 2>&1)
+    assert_contains "$out1" "no '|' between them" "done --learning: warns on undelimited multi-marker prose"
+    assert_contains "$out1" "wv update" "done --learning: names the fix-up command"
+    local meta1
+    meta1=$($WV show "$id1" --json 2>&1 | jq -r '.metadata | fromjson')
+    assert_contains "$(echo "$meta1" | jq -r '.pattern // "MISSING"')" "MISSING" "done --learning: confirms .pattern really did NOT get split out"
+
+    # Properly '|'-delimited multi-marker learning -- must stay silent
+    local id2 out2
+    id2=$($WV add "delimited test" --standalone --force 2>/dev/null | tail -1)
+    $WV work "$id2" >/dev/null 2>&1
+    out2=$($WV done "$id2" --skip-verification \
+        --learning="decision: x | pattern: y | pitfall: z" 2>&1)
+    assert_not_contains "$out2" "no '|' between them" "done --learning: silent when markers are properly '|'-delimited"
+
+    # Single marker, no pipe needed -- must stay silent
+    local id3 out3
+    id3=$($WV add "single marker test" --standalone --force 2>/dev/null | tail -1)
+    $WV work "$id3" >/dev/null 2>&1
+    out3=$($WV done "$id3" --skip-verification --learning="decision: just one thing" 2>&1)
+    assert_not_contains "$out3" "no '|' between them" "done --learning: silent for a single marker with nothing to split"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Run all tests
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1138,6 +1215,8 @@ main() {
     test_session_summary
     test_session_summary_hygiene
     test_learnings_dedup
+    test_learnings_supersession_marker
+    test_learning_undelimited_marker_warning
     test_resolve_first_id
     test_checkpoint_trailers
 

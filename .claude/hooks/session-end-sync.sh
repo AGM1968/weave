@@ -13,6 +13,10 @@ source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null \
     || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null \
     || source "${HOME}/.config/weave/lib/wv-hook-common.sh" 2>/dev/null \
     || true
+source "$HOOK_DIR/../lib/wv-checkpoint-ci.sh" 2>/dev/null \
+    || source "$HOOK_DIR/../../scripts/lib/wv-checkpoint-ci.sh" 2>/dev/null \
+    || source "${HOME}/.config/weave/lib/wv-checkpoint-ci.sh" 2>/dev/null \
+    || true
 _hc_refresh
 
 # Read input for reason
@@ -52,6 +56,16 @@ _SE_HOT_ZONE="${_HC_HOT_ZONE}"
 # Amend only when HEAD is itself an unpushed weave-only checkpoint commit —
 # same three-guard rule as auto_checkpoint in wv-cmd-data.sh:
 #   (a) unpushed  (b) subject matches checkpoint patterns  (c) no non-.weave files
+# wv-822bea/wv-179c49: hijack guard, same rule as auto_checkpoint/cmd_sync in
+# wv-cmd-data.sh — refuse to commit if the caller pre-staged anything outside
+# .weave/, so this checkpoint never silently absorbs unrelated in-progress work.
+_SE_PRESTAGED=""
+if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
+    _SE_PRESTAGED=$(git diff --cached --name-only 2>/dev/null | grep -v '^\.weave/' || true)
+fi
+if [ -n "$_SE_PRESTAGED" ]; then
+    :
+else
 git add .weave/ 2>/dev/null || true
 if ! git diff --cached --quiet 2>/dev/null; then
     _SE_BRANCH=$(git branch --show-current 2>/dev/null || echo "main")
@@ -60,17 +74,25 @@ if ! git diff --cached --quiet 2>/dev/null; then
     _SE_LAST_MSG=$(git log -1 --format='%s' 2>/dev/null || echo "")
     _SE_LAST_NW=$(git diff HEAD~1 HEAD --name-only 2>/dev/null | grep -v '^\.weave/' | grep -v '^$' || true)
     _NOW=$(date +%s)
+    # wv-e937f8: [skip ci] applies to the whole PUSH at its tip, not just this
+    # commit's own (always .weave-only) diff -- omit it when the unpushed
+    # range ahead of upstream already carries non-.weave/ work. wv-179c49:
+    # fail toward NOT skipping CI when the marker helper is unavailable or
+    # fails, not toward the old unsafe skip-ci-by-default fallback.
+    _SE_SKIP_CI=$(command -v wv_checkpoint_ci_marker >/dev/null 2>&1 \
+        && wv_checkpoint_ci_marker "$PWD" || echo "")
     if [ "$_SE_LOCAL_HEAD" != "$_SE_REMOTE_HEAD" ] \
        && [[ "$_SE_LAST_MSG" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] \
        && [ -z "$_SE_LAST_NW" ]; then
         # HEAD is an unpushed weave-only checkpoint — safe to amend
         WV_AUTO_CHECKPOINT_ACTIVE=1 git commit --amend --no-edit 2>/dev/null || \
-            WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): auto-checkpoint $(date +%H:%M) [skip ci]" 2>/dev/null || true
+            WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): auto-checkpoint $(date +%H:%M)${_SE_SKIP_CI}" 2>/dev/null || true
     else
-        WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): auto-checkpoint $(date +%H:%M) [skip ci]" 2>/dev/null || true
+        WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): auto-checkpoint $(date +%H:%M)${_SE_SKIP_CI}" 2>/dev/null || true
     fi
     # Update checkpoint stamp so auto_checkpoint sees this commit
     echo "$_NOW" > "${_SE_HOT_ZONE}/.last_checkpoint" 2>/dev/null || true
+fi
 fi
 
 # Push to remote with exponential backoff (multi-agent contention)

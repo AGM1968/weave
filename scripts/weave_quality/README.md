@@ -156,19 +156,61 @@ register issues such as emphasis hedges, number-free verification motifs, and ca
 connectives. Findings can be promoted to Weave nodes.
 
 Code rules require `ast-grep` on PATH; prose rules are stdlib-only and still run when ast-grep is
-absent. Pattern rules live in `scripts/weave_quality/default_patterns/` and project-local rules in
-`.weave/patterns/`. Disable noisy rules with `[patterns] disabled = <rule-id>` in
-`.weave/quality.conf`.
+absent. Built-in rules live in `scripts/weave_quality/default_patterns/`. `wv init-repo` projects
+curated shared prose rules into `.weave/patterns/managed/`, while project-owned rules remain in
+`.weave/patterns/*.yaml` and are never overwritten by managed updates. Duplicate IDs across those
+layers are rejected rather than silently shadowed. Disable noisy rules with
+`[patterns] disabled = <rule-id>` in `.weave/quality.conf`.
+
+Rule loading fails closed: malformed YAML-subset syntax, filename/ID mismatches, unsupported prose
+kinds, empty matcher lists, and invalid regular expressions make both `patterns list` and
+`patterns scan` return an actionable error naming the definition path. Valid rules with zero
+findings remain listed normally. Prose regex and lexicon rules match reflowed Markdown paragraphs so
+soft wrapping does not hide a phrase; structural Markdown rules declare `match_scope: line` to
+retain exact source-line behavior. Fenced code blocks (including one nested a level under a
+blockquote, e.g. `> \`\`\`text`) are skipped automatically for every kind, as are lines naming a
+rule's own id.
+
+A verbatim-quoted passage that isn't fenced code — e.g. a tool's plain-text output sample pasted
+into a paragraph — still needs to stay unchanged even though its register would otherwise trip a
+prose rule. Bracket it with `<!-- wv-quality:verbatim-start -->` /
+`<!-- wv-quality:verbatim-end -->` HTML comments to opt that line range out of every prose rule
+kind, regardless of which rule is scanning. This is deliberately an explicit author opt-in, not
+automatic detection like the fence handling above. An unterminated start marker exempts through end
+of file rather than failing the scan.
+
+When two different rules each flag the identical `(path, line, col)` — e.g. a built-in and a
+project-local prose rule both firing on the same phrase — the scan keeps only the higher-maturity
+rule's finding for that spot (`promotable` > `observed` > `candidate`; code rules and ties fall back
+to rule id order). This is **same-start-location collision suppression**, not span-overlap dedup: it
+only merges an exact position match on all three of path/line/col, never two findings whose spans
+merely overlap at different start columns. `(path, line, col)` is the identity the whole pipeline
+keys on — findings, receipts, and reported counts all agree on it, so `patterns scan`'s per-rule
+`by_rule` count, each rule's stored `patterns list` receipt hit count, and the number of matches
+actually listed for that rule are always the same number for a given scan. A rule's own intrinsic
+match count (before any of its hits were suppressed as someone else's duplicate) is separately
+reported as `raw_hits` in `patterns scan --json` — a rule that loses every match to a
+higher-maturity rule at the same spot still shows up there instead of reading as an unexplained
+zero.
 
 ```bash
 wv quality patterns scan              # scan with all known rules, print findings table
 wv quality patterns scan --json       # machine-readable output
 wv quality patterns list              # list loaded rule IDs and their descriptions
+wv quality patterns adjudicate qf-... waived --note "approved terminology"
+wv quality patterns report            # per-rule precision, scoped to the last scan's target
+wv quality patterns report docs/      # ...or an explicit path, overriding that scope
+wv quality patterns validate          # validate every candidate rule + report schema coverage
 wv quality patterns promote --top=N --parent=wv-xxxxxx   # create nodes from top findings
 ```
 
-Findings are stored in the `pattern_findings` table and retained for 2 scans (pruned automatically
-on the next `wv quality scan`).
+Point-in-time findings are stored in `pattern_findings` and retained for 2 scans. Each match also
+receives a stable `qf-...` identity derived from its rule, repository-relative path, normalized
+match, and normalized source-line context. Durable finding state and append-only human disposition
+history survive point-in-time replacement and pruning. `accepted_defect` and `waived` count as
+confirmed findings for reported `decided_precision`, `false_positive` counts against it, and
+`unresolved` remains outside that explicitly named denominator. Scanner output is unadjudicated
+evidence by default, not a defect count.
 
 ---
 
@@ -463,8 +505,11 @@ git_stats        -- path, churn, authors, age_days, hotspot,
                  --   ownership_fraction, minor_contributors
 file_state       -- path, mtime, git_blob  (incremental scan state)
 co_change        -- path_a, path_b, count
-pattern_findings -- scan_id, rule_id, path, line, col, match_text, severity
+pattern_findings -- scan_id, finding_key, rule_id, path, line, col, match_text, severity
                  --   (retained for 2 scans; pruned on next scan)
+pattern_finding_state -- stable identity, latest disposition, first/last scan, scan count
+pattern_finding_occurrences -- unique finding_key + scan_id recurrence ledger
+pattern_finding_disposition_history -- append-only human adjudication events
 ```
 
 Per-function CC is stored in `file_metrics` using EAV pattern:
@@ -495,7 +540,7 @@ Per-function CC is stored in `file_metrics` using EAV pattern:
 |                        | `batch_blob_shas()`, `compute_co_changes()`                           |
 | `hotspots.py`          | Hotspot scoring, quality score formula, Gini, CC histogram            |
 | `db.py`                | SQLite schema creation, reads/writes, 5-scan retention policy;        |
-|                        | `pattern_findings` table with 2-scan retention                        |
+|                        | point-in-time findings plus durable adjudication state/history        |
 | `rules/`               | ast-grep YAML rules: `bash_cc.yaml`, `typescript_cc.yaml`,            |
 |                        | `typescript_functions.yaml`; structural pattern rules in              |
 |                        | `default_patterns/`                                                   |

@@ -23,6 +23,12 @@ for arg in "$@"; do
     esac
 done
 
+REPO_CLASS_LIB="$SELF_DIR/lib/wv-repository-class.sh"
+[ -f "$REPO_CLASS_LIB" ] || { echo "project-procedures: repository classification helper missing: $REPO_CLASS_LIB" >&2; exit 1; }
+# shellcheck source=scripts/lib/wv-repository-class.sh
+source "$REPO_CLASS_LIB"
+wv_repository_require_owned "$REPO" "procedure projection" || exit 1
+
 # Validate the full contract set BEFORE mutating any consumer surface, so an
 # invalid procedure aborts the run instead of silently pruning projections.
 GEN="$SELF_DIR/gen-procedures.sh"

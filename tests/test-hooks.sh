@@ -705,6 +705,85 @@ git -C "$TEST_DIR/project" commit --amend -m "feat: attributed commit hygiene" -
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $COMMIT_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 assert_equals "" "$OUTPUT" "pre-close: silent when an attributed work commit exists"
 
+# wv-e48993: the dirty-tree gate must scope to the closing node's OWN
+# touched_files (captured live by wv-touched-files.sh), not every dirty file
+# in the repo -- an earlier, already-closed session's leftover foreign dirt
+# must not block this node's close. Give it an attributed commit up front
+# (mirrors COMMIT_ID's own setup above) so the dirty-file check is the ONLY
+# gate left to exercise -- otherwise the later "no commit attributed" gate
+# would also deny, for an unrelated reason, and mask what this is testing.
+SCOPE_ID=$(add_active_node "touched-files scoping test node" \
+    --metadata='{"verification":{"method":"test","result":"pass"},"touched_files":["scoped-own.txt"]}' 2>/dev/null | tail -1)
+echo "seed" > "$TEST_DIR/project/scope-seed.txt"
+git -C "$TEST_DIR/project" add scope-seed.txt
+git -C "$TEST_DIR/project" commit -q -m "feat: scope test seed" -m "Weave-ID: $SCOPE_ID"
+
+echo "foreign" > "$TEST_DIR/project/foreign-dirt.txt"
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $SCOPE_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_equals "" "$OUTPUT" "pre-close: silent when the only dirt is outside this node's touched_files"
+assert_exit_code "0" "$EXIT_CODE" "pre-close: foreign-dirt pass-through does not itself error"
+
+rm -f "$TEST_DIR/project/foreign-dirt.txt"
+echo "own work" > "$TEST_DIR/project/scoped-own.txt"
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $SCOPE_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+set -e
+assert_contains "$OUTPUT" "Commit work before close" "pre-close: still denies close when dirt IS in this node's touched_files"
+
+rm -f "$TEST_DIR/project/scoped-own.txt"
+git -C "$TEST_DIR/project" rm -q scope-seed.txt >/dev/null 2>&1 || true
+git -C "$TEST_DIR/project" commit -q -m "chore: clean up scoping test fixture" >/dev/null 2>&1 || true
+"$WV" done "$SCOPE_ID" --skip-verification 2>/dev/null || true  # cleanup
+
+# wv-822bea/wv-37e2e0: metadata.touched_files is capped at 50 entries
+# (wv-touched-files.sh's WV_TOUCHED_NODE_CAP); node_files is the same
+# attribution written UNCAPPED. A node whose 51st touched file fell off the
+# metadata ring must still be recognized as owning it via node_files, not
+# treated as foreign dirt that blocks close.
+CAP_ID=$(add_active_node ">50 touched-files cap regression node" \
+    --metadata='{"verification":{"method":"test","result":"pass"}}' 2>/dev/null | tail -1)
+CAP_META='{"touched_files":['
+for _capn in $(seq 1 50); do
+    CAP_META="${CAP_META}\"cap-file-${_capn}.txt\","
+done
+CAP_META="${CAP_META%,}]}"
+sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_patch(metadata, '$CAP_META') WHERE id='$CAP_ID';" 2>/dev/null
+for _capn in $(seq 1 51); do
+    sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$CAP_ID', 'cap-file-${_capn}.txt');" 2>/dev/null
+done
+echo "seed" > "$TEST_DIR/project/cap-seed.txt"
+git -C "$TEST_DIR/project" add cap-seed.txt
+git -C "$TEST_DIR/project" commit -q -m "feat: cap test seed" -m "Weave-ID: $CAP_ID"
+# cap-file-51.txt is in node_files (uncapped) but fell out of metadata's
+# 50-entry ring — dirtying it must still be recognized as this node's own.
+echo "own work past the cap" > "$TEST_DIR/project/cap-file-51.txt"
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $CAP_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+set -e
+assert_contains "$OUTPUT" "Commit work before close" "pre-close: 51st touched file (past metadata cap) still recognized via node_files"
+
+rm -f "$TEST_DIR/project/cap-file-51.txt"
+git -C "$TEST_DIR/project" rm -q cap-seed.txt >/dev/null 2>&1 || true
+git -C "$TEST_DIR/project" commit -q -m "chore: clean up cap test fixture" >/dev/null 2>&1 || true
+"$WV" done "$CAP_ID" --skip-verification 2>/dev/null || true  # cleanup
+
+# wv-734186: verification_method/verification_evidence were only ever
+# askable at THIS close-time gate -- wv add --verification-plan lets it be
+# recorded upfront, and the gate's own rejection must surface it back as a
+# reminder rather than asking the question cold a second time.
+PLAN_ID=$(add_active_node "verification plan test node" \
+    --metadata='{"verification_plan":"run pytest tests/foo.py"}' 2>/dev/null | tail -1)
+echo "seed" > "$TEST_DIR/project/plan-seed.txt"
+git -C "$TEST_DIR/project" add plan-seed.txt
+git -C "$TEST_DIR/project" commit -q -m "feat: plan seed" -m "Weave-ID: $PLAN_ID"
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $PLAN_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+assert_contains "$OUTPUT" 'Recorded plan: \"run pytest tests/foo.py\"' \
+    "pre-close: surfaces a recorded --verification-plan as a reminder"
+"$WV" done "$PLAN_ID" --skip-verification 2>/dev/null || true  # cleanup
+
 "$WV" done "$ID2" --skip-verification 2>/dev/null || true  # cleanup
 
 # Non-matching command
@@ -1259,6 +1338,31 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "git pre-commit: consumer Python commit skips missing optional pytest dirs"
 assert_not_contains "$OUTPUT" "tests/weave_quality" "git pre-commit: does not pass missing weave_quality dir to pytest"
 assert_not_contains "$OUTPUT" "tests/weave_indexer" "git pre-commit: does not pass missing weave_indexer dir to pytest"
+# wv-734186: this fixture has no .weave/test-map.conf at all -- the impact
+# gate message must say so explicitly, not the same generic text a
+# present-but-non-matching config would also produce.
+assert_contains "$OUTPUT" "impact gate inert: no .weave/test-map.conf found" \
+    "git pre-commit: impact-inert message distinguishes a fully absent config"
+
+# wv-734186: a PRESENT .weave/test-map.conf that simply does not match the
+# staged file must say so distinctly, and name the unmatched file(s).
+setup_test_env
+mkdir -p "$TEST_DIR/project/src"
+printf '[map]\nsrc/ = tests/test-graph.sh\n' > "$TEST_DIR/project/.weave/test-map.conf"
+cat > "$TEST_DIR/project/docs.md" <<'EOF'
+# unrelated docs change, not covered by the src/ mapping above
+EOF
+git -C "$TEST_DIR/project" add docs.md .weave/test-map.conf
+add_active_node "Git hook unmatched-config task" --criteria="present-but-nonmatching config is distinguished|unmatched file is named" --risks=low >/dev/null 2>&1
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: present-but-nonmatching test-map.conf still exits 0"
+assert_contains "$OUTPUT" "impact gate inert: .weave/test-map.conf exists but matched none" \
+    "git pre-commit: impact-inert message distinguishes a present-but-nonmatching config"
+assert_contains "$OUTPUT" "Unmatched: docs.md" \
+    "git pre-commit: impact-inert message names the actual unmatched file"
 
 # discover phase with non-.weave file staged must block (no active node bypass)
 setup_test_env

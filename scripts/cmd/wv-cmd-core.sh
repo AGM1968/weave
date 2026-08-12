@@ -18,6 +18,14 @@ cmd_init() {
         shift
     done
 
+    local repo_root
+    repo_root=$(dirname "$WEAVE_DIR")
+    if [ -L "$WEAVE_DIR" ]; then
+        echo "wv: refusing symlinked Weave directory: $WEAVE_DIR" >&2
+        return 1
+    fi
+    wv_repository_require_owned "$repo_root" "wv init" || return 1
+
     # Force reset: wipe everything and start fresh
     if [ "$force" = true ]; then
         local count=0
@@ -247,6 +255,7 @@ cmd_add() {
     local format="text"
     local criteria=""
     local risks_flag=""
+    local verification_plan=""
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -261,6 +270,7 @@ cmd_add() {
             --json) format="json" ;;
             --criteria=*) criteria="${1#*=}" ;;
             --risks=*) risks_flag="${1#*=}" ;;
+            --verification-plan=*) verification_plan="${1#*=}" ;;
             --*) ;; # skip unrecognized flags
             *) text="$text $1" ;;
         esac
@@ -269,7 +279,7 @@ cmd_add() {
 
     if [ -z "$text" ]; then
         echo -e "${RED}Error: text required${NC}" >&2
-        echo "Usage: wv add \"task description\" [--status=todo|active|done|blocked] [--parent=<id>] [--gh] [--force] [--standalone] [--criteria=\"c1|c2\"] [--risks=low|medium|high|none]" >&2
+        echo "Usage: wv add \"task description\" [--status=todo|active|done|blocked] [--parent=<id>] [--gh] [--force] [--standalone] [--criteria=\"c1|c2\"] [--risks=low|medium|high|none] [--verification-plan=\"...\"]" >&2
         return 1
     fi
 
@@ -291,10 +301,32 @@ print(json.dumps(items))
     if [ -n "$risks_flag" ]; then
         case "$risks_flag" in
             none|low|medium|high|critical) metadata=$(echo "$metadata" | jq --arg r "$risks_flag" '. + {risks: [], risk_level: $r}' 2>/dev/null || echo "$metadata") ;;
+            *)
+                # wv-cccf70: this case statement used to have no default --
+                # any value outside the enum (a typo, or a reasonable-
+                # looking freeform list like --risks="r1","r2") was
+                # silently accepted with exit 0 and stored nothing, the
+                # worst of both worlds (--criteria has no such enum and
+                # always persists, which is why the two flags looked
+                # asymmetric). Reject loudly instead.
+                echo -e "${RED}Error: --risks must be one of none|low|medium|high|critical (got: $risks_flag)${NC}" >&2
+                return 1
+                ;;
         esac
     fi
     if [ "$standalone" = true ]; then
         metadata=$(echo "$metadata" | jq '. + {standalone: true}' 2>/dev/null || echo "$metadata")
+    fi
+    # wv-734186: verification-method/verification-evidence were only ever
+    # askable at wv done close time -- "what would count as done" is worth
+    # answering before starting, not discovered as a fresh question once
+    # the work is already finished. --verification-plan is deliberately a
+    # SEPARATE field from the close-time verification_method/
+    # verification_evidence (which report what actually happened) -- it
+    # records the upfront intent, and pre-close-verification.sh's own
+    # rejection hint surfaces it back at close time as a reminder.
+    if [ -n "$verification_plan" ]; then
+        metadata=$(echo "$metadata" | jq --arg vp "$verification_plan" '. + {verification_plan: $vp}' 2>/dev/null || echo "$metadata")
     fi
 
     # Validate parent if provided
@@ -344,6 +376,40 @@ print(json.dumps(items))
         fi
     fi
 
+    # Orphan prevention: require --parent when active epics exist (skip with --force).
+    # Runs before the node is created so a rejected `wv add` never prints a
+    # confirmation for an id that gets rolled back (an agent parsing stdout would
+    # otherwise record an id that no longer exists).
+    if [ -z "$parent" ] && [ "$force" != "true" ]; then
+        local node_type
+        node_type=$(echo "$metadata" | jq -r '.type // "task"' 2>/dev/null || echo "task")
+        if [ "$node_type" != "epic" ]; then
+            local active_epics
+            active_epics=$(db_query "
+                SELECT id FROM nodes
+                WHERE status IN ('todo','active')
+                AND json_extract(metadata,'\$.type') = 'epic'
+                ORDER BY created_at DESC LIMIT 3;
+            " 2>/dev/null || true)
+            if [ -n "$active_epics" ]; then
+                local epic_list
+                epic_list=$(echo "$active_epics" | tr '\n' ' ' | sed 's/ $//')
+                echo -e "${RED}Error: --parent required when active epics exist (use --force or --standalone to override)${NC}" >&2
+                echo -e "${CYAN}  Active epic(s): $epic_list${NC}" >&2
+                echo -e "${CYAN}  Usage: wv add \"...\" --parent=<epic-id>${NC}" >&2
+                # Combined preflight: report every other unmet gate now, not on retry
+                if [ -z "$alias" ]; then
+                    echo -e "${CYAN}  Also missing: --alias=<short-name> (required at claim time)${NC}" >&2
+                fi
+                return 1
+            fi
+            # No active epics — just warn about missing alias
+            if [ -z "$alias" ]; then
+                echo -e "${YELLOW}⚠ No alias — use --alias=<name>${NC}" >&2
+            fi
+        fi
+    fi
+
     # Dedup check: warn if similar non-done nodes exist (skip with --force or --parent)
     # Child nodes naturally share vocabulary with their parent — skip for decomposition.
     if [ "$force" != "true" ] && [ -z "$parent" ]; then
@@ -382,39 +448,6 @@ print(json.dumps(items))
     if [ -n "$parent" ]; then
         cmd_link "$id" "$parent" --type=implements 2>/dev/null
         echo -e "${GREEN}✓${NC} Linked to parent $parent" >&2
-    fi
-
-    # Orphan prevention: require --parent when active epics exist (skip with --force)
-    if [ -z "$parent" ] && [ "$force" != "true" ]; then
-        local node_type
-        node_type=$(echo "$metadata" | jq -r '.type // "task"' 2>/dev/null || echo "task")
-        if [ "$node_type" != "epic" ]; then
-            local active_epics
-            active_epics=$(db_query "
-                SELECT id FROM nodes
-                WHERE status IN ('todo','active')
-                AND json_extract(metadata,'\$.type') = 'epic'
-                ORDER BY created_at DESC LIMIT 3;
-            " 2>/dev/null || true)
-            if [ -n "$active_epics" ]; then
-                local epic_list
-                epic_list=$(echo "$active_epics" | tr '\n' ' ' | sed 's/ $//')
-                echo -e "${RED}Error: --parent required when active epics exist (use --force or --standalone to override)${NC}" >&2
-                echo -e "${CYAN}  Active epic(s): $epic_list${NC}" >&2
-                echo -e "${CYAN}  Usage: wv add \"...\" --parent=<epic-id>${NC}" >&2
-                # Combined preflight: report every other unmet gate now, not on retry
-                if [ -z "$alias" ]; then
-                    echo -e "${CYAN}  Also missing: --alias=<short-name> (required at claim time)${NC}" >&2
-                fi
-                # Remove the orphan node we just created
-                db_query "DELETE FROM nodes WHERE id='$id';" 2>/dev/null || true
-                return 1
-            fi
-            # No active epics — just warn about missing alias
-            if [ -z "$alias" ]; then
-                echo -e "${YELLOW}⚠ No alias — use --alias=<name>${NC}" >&2
-            fi
-        fi
     fi
 
     # Creating a node directly in active status IS a claim (Pattern B: WorkClaimed
@@ -1568,14 +1601,27 @@ _is_quality_exempt() {
     [ -n "$result" ]
 }
 
+# Return the auditable completion scope when one was explicitly set, otherwise
+# preserve the legacy behavior of checking every historically attributed file.
+_done_quality_paths() {
+    local id="$1"
+    local scope_json="${2:-}"
+    local scope_clause=""
+    if [ -n "$scope_json" ]; then
+        scope_clause="AND path IN (SELECT value FROM json_each('$(sql_escape "$scope_json")'))"
+    fi
+    db_query "SELECT path FROM node_files WHERE node_id='$(sql_escape "$id")' $scope_clause;" 2>/dev/null || echo ""
+}
+
 _done_refresh_file_metrics() {
     local id="$1"
+    local scope_json="${2:-}"
 
     [ "${WV_REQUIRE_QUALITY:-1}" = "0" ] && return 0
 
     # Read paths tracked for this node
     local paths_raw
-    paths_raw=$(db_query "SELECT path FROM node_files WHERE node_id='$(sql_escape "$id")';" 2>/dev/null || echo "")
+    paths_raw=$(_done_quality_paths "$id" "$scope_json")
     [ -z "$paths_raw" ] && return 0
 
     # quality.db must exist when node_files is non-empty
@@ -1634,11 +1680,12 @@ _done_refresh_file_metrics() {
 # Non-blocking: missing trend data defaults to 'stable' rather than failing.
 _done_refresh_trend_signals() {
     local id="$1"
+    local scope_json="${2:-}"
 
     [ "${WV_REQUIRE_QUALITY:-1}" = "0" ] && return 0
 
     local paths_raw
-    paths_raw=$(db_query "SELECT path FROM node_files WHERE node_id='$(sql_escape "$id")';" 2>/dev/null || echo "")
+    paths_raw=$(_done_quality_paths "$id" "$scope_json")
     [ -z "$paths_raw" ] && return 0
 
     local quality_db="$WV_HOT_ZONE/quality.db"
@@ -1691,6 +1738,7 @@ print('deteriorating' if s>0.03 else ('refactored' if s<-0.03 else 'stable'))
 # a close. Quality.db is NOT required — this reads brain.db only.
 _done_refresh_test_status() {
     local id="$1"
+    local scope_json="${2:-}"
 
     # Honors the shared done-refresh bypass. This reads brain.db (not quality.db),
     # but reusing WV_REQUIRE_QUALITY=0 keeps one test/legacy escape hatch for the
@@ -1699,7 +1747,7 @@ _done_refresh_test_status() {
     [ "${WV_REQUIRE_QUALITY:-1}" = "0" ] && return 0
 
     local paths_raw
-    paths_raw=$(db_query "SELECT path FROM node_files WHERE node_id='$(sql_escape "$id")';" 2>/dev/null || echo "")
+    paths_raw=$(_done_quality_paths "$id" "$scope_json")
     [ -z "$paths_raw" ] && return 0
 
     local path
@@ -2003,6 +2051,28 @@ _done_store_learning() {
     db_query "UPDATE nodes SET metadata='$new_meta', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
     score_learning "$id" 2>/dev/null || true
 
+    # wv-18b8f5 (external code review round 3 re-audit): the parse above
+    # only splits on a LITERAL ' | ' -- a learning that mentions two or more
+    # of decision:/pattern:/pitfall: without ever using '|' to separate them
+    # silently collapses everything into whichever marker appeared first
+    # (see the jq filter above: split(" | ") on a string with no '|' yields
+    # one segment, so only the FIRST marker's branch of the reduce ever
+    # fires). The dropped markers become invisible prose with no error --
+    # in particular, an embedded pitfall: that never became its own
+    # metadata key is invisible to 'wv audit-pitfalls', which only indexes
+    # the top-level key. Detected independently of the parse above (2+
+    # distinct markers present, but no '|' anywhere to separate them) so
+    # this warns even if the jq parse itself is later rewritten.
+    local _marker_count=0
+    [[ "$learning" == *[Dd][Ee][Cc][Ii][Ss][Ii][Oo][Nn]:* ]] && _marker_count=$((_marker_count + 1))
+    [[ "$learning" == *[Pp][Aa][Tt][Tt][Ee][Rr][Nn]:* ]] && _marker_count=$((_marker_count + 1))
+    [[ "$learning" == *[Pp][Ii][Tt][Ff][Aa][Ll][Ll]:* ]] && _marker_count=$((_marker_count + 1))
+    if [ "$_marker_count" -ge 2 ] && [[ "$learning" != *"|"* ]]; then
+        echo -e "${YELLOW}Warning: this learning mentions $_marker_count of decision:/pattern:/pitfall: with no '|' between them.${NC}" >&2
+        echo -e "${YELLOW}  Only the FIRST marker was captured as a structured field -- the rest is embedded prose that audit-pitfalls and other category-based reads will never see.${NC}" >&2
+        echo -e "${YELLOW}  Fix now: wv update $id --metadata='{\"pattern\":\"...\",\"pitfall\":\"...\"}' to split them out explicitly.${NC}" >&2
+    fi
+
     # Soft format suggestion: nudge toward structured learning format
     local has_structured=false
     if [[ "$learning" == *"decision:"* ]] || [[ "$learning" == *"pattern:"* ]] || [[ "$learning" == *"pitfall:"* ]]; then
@@ -2155,16 +2225,23 @@ _done_write_trail() {
 # trend_deteriorating, and test_gate. Extracted from cmd_done to keep that
 # function under the bash mccabe gate (debt: wv-89ca7c). Args: $1=id $2=error.
 _done_report_policy_violation() {
-    local id="$1" _done_err="$2"
+    local id="$1" _done_err="$2" scope_json="${3:-}"
     if ! echo "$_done_err" | grep -q "GraphPolicyViolation"; then
         echo "$_done_err" >&2
         return 0
     fi
+    if echo "$_done_err" | grep -q "invalid completion scope"; then
+        echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"completion_scope\",\"detail\":\"invalid or stale completion scope\"}" >&2
+        return 0
+    fi
     local v_path v_actual v_limit v_threshold v_direction
+    local scope_filter=""
+    [ -n "$scope_json" ] && scope_filter="AND nf.path IN (SELECT value FROM json_each('$(sql_escape "$scope_json")'))"
+    local exempt_filter="AND NOT EXISTS (SELECT 1 FROM quality_exempt qe WHERE nf.path LIKE CASE WHEN qe.path_pattern LIKE '%/' THEN qe.path_pattern || '%' ELSE qe.path_pattern END)"
     local _lang_coalesce="COALESCE((SELECT value FROM policy_thresholds WHERE key='mccabe_max_'||fm.language),(SELECT value FROM policy_thresholds WHERE key='mccabe_max'))"
-    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fm.mccabe_max > $_lang_coalesce LIMIT 1;" 2>/dev/null || echo "")
+    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND fm.mccabe_max > $_lang_coalesce $exempt_filter LIMIT 1;" 2>/dev/null || echo "")
     if [ -n "$v_path" ]; then
-        v_actual=$(db_query "SELECT fm.mccabe_max FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fm.mccabe_max > $_lang_coalesce LIMIT 1;" 2>/dev/null || echo "0")
+        v_actual=$(db_query "SELECT fm.mccabe_max FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND fm.mccabe_max > $_lang_coalesce $exempt_filter LIMIT 1;" 2>/dev/null || echo "0")
         local v_lang
         v_lang=$(db_query "SELECT fm.language FROM file_metrics fm WHERE fm.path='$(sql_escape "$v_path")';" 2>/dev/null || echo "")
         local _threshold_key="mccabe_max"; [ -n "$v_lang" ] && _threshold_key="mccabe_max_${v_lang}"
@@ -2174,19 +2251,20 @@ _done_report_policy_violation() {
         return 0
     fi
     # Not mccabe — distinguish trend (clause 2) from test (clause 3).
-    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' AND (SELECT value FROM policy_thresholds WHERE key='trend_deteriorating') >= 1 LIMIT 1;" 2>/dev/null || echo "")
+    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND ft.direction='deteriorating' AND (SELECT value FROM policy_thresholds WHERE key='trend_deteriorating') >= 1 $exempt_filter LIMIT 1;" 2>/dev/null || echo "")
     if [ -n "$v_path" ]; then
         v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='trend_deteriorating';" 2>/dev/null || echo "1")
         v_actual=1
-        v_direction=$(db_query "SELECT ft.direction FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND ft.direction='deteriorating' LIMIT 1;" 2>/dev/null || echo "deteriorating")
+        v_direction=$(db_query "SELECT ft.direction FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND ft.direction='deteriorating' $exempt_filter LIMIT 1;" 2>/dev/null || echo "deteriorating")
         v_threshold="trend_deteriorating"
         echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\",\"direction\":\"$v_direction\"}" >&2
         return 0
     fi
     # Test gate (clause 3): a red/stale file under test_gate>=block.
     local v_state
-    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_test_status fts ON fts.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fts.state IN ('red','stale') LIMIT 1;" 2>/dev/null || echo "unknown")
-    v_state=$(db_query "SELECT fts.state FROM node_files nf JOIN file_test_status fts ON fts.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' AND fts.state IN ('red','stale') LIMIT 1;" 2>/dev/null || echo "red")
+    local node_type_filter="AND COALESCE((SELECT json_extract(metadata, '$.type') FROM nodes WHERE id='$(sql_escape "$id")'),'') NOT IN ('finding','epic','session_history')"
+    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_test_status fts ON fts.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND fts.state IN ('red','stale') AND (SELECT value FROM policy_thresholds WHERE key='test_gate') >= 2 $node_type_filter $exempt_filter LIMIT 1;" 2>/dev/null || echo "unknown")
+    v_state=$(db_query "SELECT fts.state FROM node_files nf JOIN file_test_status fts ON fts.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND fts.state IN ('red','stale') AND (SELECT value FROM policy_thresholds WHERE key='test_gate') >= 2 $node_type_filter $exempt_filter LIMIT 1;" 2>/dev/null || echo "red")
     v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='test_gate';" 2>/dev/null || echo "2")
     v_actual=1
     v_threshold="test_gate"
@@ -2208,6 +2286,8 @@ cmd_done() {
     local verification_evidence_file=""
     local no_gh=0
     local allowed_tools_raw=""
+    local completion_files_raw=""
+    local completion_files_set=0
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -2225,6 +2305,7 @@ cmd_done() {
             --verification-evidence-file=*) verification_evidence_file="${1#*=}" ;;
             --no-gh) no_gh=1 ;;
             --allowed-tools=*) allowed_tools_raw="${1#--allowed-tools=}" ;;
+            --completion-files=*) completion_files_raw="${1#*=}"; completion_files_set=1 ;;
         esac
         shift
     done
@@ -2259,11 +2340,47 @@ cmd_done() {
     validate_id "$id" || return 1
 
     # Verify node exists
-    local exists
+    local exists node_status
     exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
     if [ "$exists" = "0" ]; then
         echo -e "${RED}Error: node $id not found${NC}" >&2
         return 1
+    fi
+    node_status=$(db_query "SELECT status FROM nodes WHERE id='$id';")
+    if [ "$node_status" = "done" ]; then
+        echo -e "${RED}Error: node $id is already done; completion audit was not changed${NC}" >&2
+        return 1
+    fi
+    if [ "$completion_files_set" = "1" ] && [ "$node_status" != "active" ]; then
+        echo -e "${RED}Error: --completion-files requires an active node (current: $node_status)${NC}" >&2
+        return 1
+    fi
+
+    # A completion scope narrows quality policy only; node_files remains an
+    # append-only impact history. Require canonical repo-relative paths and
+    # existing attribution before durably recording the audited scope.
+    local scope_json="" scope_object="" scope_esc=""
+    if [ "$completion_files_set" = "1" ]; then
+        scope_json='[]'
+        local scope_path scope_count
+        IFS=',' read -ra _done_scope_parts <<< "$completion_files_raw"
+        for scope_path in "${_done_scope_parts[@]}"; do
+            if [ -z "$scope_path" ] || [[ "$scope_path" = /* ]] || [[ "$scope_path" = ./* ]] ||
+               [[ "$scope_path" = */ ]] || [[ "$scope_path" = *//* ]] ||
+               [[ "/$scope_path/" = */./* ]] || [[ "/$scope_path/" = */../* ]]; then
+                echo -e "${RED}Error: --completion-files requires nonempty normalized repo-relative paths (invalid: '$scope_path')${NC}" >&2
+                return 1
+            fi
+            scope_count=$(db_query "SELECT COUNT(*) FROM node_files WHERE node_id='$id' AND path='$(sql_escape "$scope_path")';" 2>/dev/null || echo 0)
+            if [ "$scope_count" = "0" ]; then
+                echo -e "${RED}Error: completion file '$scope_path' is not attributed to node $id${NC}" >&2
+                return 1
+            fi
+            scope_json=$(jq -c --arg p "$scope_path" '. + [$p] | unique' <<< "$scope_json")
+        done
+        [ "$(jq 'length' <<< "$scope_json")" -gt 0 ] || { echo -e "${RED}Error: --completion-files cannot be empty${NC}" >&2; return 1; }
+        scope_object=$(jq -cn --argjson files "$scope_json" --arg set_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg attempt_id "$(date +%s%N)-$$-$RANDOM" '{files:$files,set_at:$set_at,attempt_id:$attempt_id}')
+        scope_esc=$(sql_escape "$scope_object")
     fi
 
     # Write inline verification metadata immediately so the pre-close hook
@@ -2343,21 +2460,34 @@ cmd_done() {
     fi
 
     # Refresh file_metrics and trend signals from quality.db before the gate UPDATE.
-    _done_refresh_file_metrics "$id" || return 1
-    _done_refresh_trend_signals "$id" || return 1
+    _done_refresh_file_metrics "$id" "$scope_json" || return 1
+    _done_refresh_trend_signals "$id" "$scope_json" || return 1
     # Refresh test-correctness status from the ledger (best-effort; never blocks).
-    _done_refresh_test_status "$id" || true
+    _done_refresh_test_status "$id" "$scope_json" || true
 
     # === Close: update status, release claim, clear primary, aggregate commits ===
     local _done_err _done_rc
+    local completion_metadata_expr="json_remove(COALESCE(metadata,'{}'), '$.claimed_by', '$.pending_close', '$.needs_human_verification', '$.completion_scope')"
+    if [ "$completion_files_set" = "1" ]; then
+        completion_metadata_expr="json_set(json_remove(COALESCE(metadata,'{}'), '$.claimed_by', '$.pending_close', '$.needs_human_verification'), '$.completion_scope', json('$scope_esc'))"
+    fi
+    if [ "${_WV_SHIP_DURABLE_CLOSE:-0}" = "1" ]; then
+        completion_metadata_expr="json_set($completion_metadata_expr, '$.ship_pending', json('true'), '$.ship_pending_mode', 'post_close')"
+    fi
+    local done_status_guard="AND status='$(sql_escape "$node_status")'"
     _done_err=$(db_query "UPDATE nodes
         SET status='done',
-            metadata = json_remove(COALESCE(metadata,'{}'), '$.claimed_by', '$.pending_close', '$.needs_human_verification'),
+            metadata = $completion_metadata_expr,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id='$id';" 2>&1)
+        WHERE id='$id' $done_status_guard;
+        SELECT changes();" 2>&1)
     _done_rc=$?
     if [ "$_done_rc" -ne 0 ]; then
-        _done_report_policy_violation "$id" "$_done_err"
+        _done_report_policy_violation "$id" "$_done_err" "$scope_json"
+        return 1
+    fi
+    if [ "$(echo "$_done_err" | tail -1)" != "1" ]; then
+        echo -e "${RED}Error: node $id changed state before completion; audit was not written${NC}" >&2
         return 1
     fi
 
@@ -2377,13 +2507,24 @@ cmd_done() {
     # Auto-unblock nodes that were only blocked by this one
     _do_unblock_cascade "$id"
 
+    local historical_files policy_files scope_mode
+    historical_files=$(db_query "SELECT COUNT(*) FROM node_files WHERE node_id='$(sql_escape "$id")';" 2>/dev/null || echo 0)
+    policy_files="$historical_files"
+    scope_mode="legacy"
+    if [ "$completion_files_set" = "1" ]; then
+        policy_files=$(jq 'length' <<< "$scope_json")
+        scope_mode="explicit"
+    fi
+
     if [ "$format" = "json" ]; then
         local text
         text=$(db_query "SELECT text FROM nodes WHERE id='$id';")
         jq -n --arg id "$id" --arg text "$text" --arg status "done" \
-            '{"id": $id, "text": $text, "status": $status}'
+            --arg scope_mode "$scope_mode" --argjson historical_files "$historical_files" --argjson policy_files "$policy_files" \
+            '{"id": $id, "text": $text, "status": $status, "completion_scope": {"mode": $scope_mode, "historical_files": $historical_files, "policy_files": $policy_files}}'
     else
         echo -e "${GREEN}✓${NC} Closed: $id"
+        echo "  Completion scope: $scope_mode ($policy_files policy / $historical_files historical files)"
         # Show what learning was actually stored — makes silent loss immediately visible
         if [ -n "$learning" ]; then
             local _l_meta _l_keys _l_hygiene
@@ -2427,8 +2568,11 @@ cmd_done() {
             _tg_bad=$(db_query "
                 SELECT nf.path || ' (' || fts.state || ')'
                 FROM node_files nf
+                JOIN nodes n ON n.id=nf.node_id
                 JOIN file_test_status fts ON fts.path = nf.path
                 WHERE nf.node_id='$(sql_escape "$id")'
+                  AND (json_type(n.metadata, '\$.completion_scope.files') IS NULL
+                       OR nf.path IN (SELECT value FROM json_each(n.metadata, '\$.completion_scope.files')))
                   AND fts.state IN ('red','stale')
                   AND COALESCE((SELECT json_extract(metadata, '\$.type') FROM nodes WHERE id='$(sql_escape "$id")'), '') NOT IN ('finding','epic','session_history')
                   AND NOT EXISTS (
@@ -3874,8 +4018,14 @@ cmd_update() {
                 validate_metadata_key "$remove_key" || return 1
                 # Use json_remove to atomically remove a single metadata key
                 db_query "UPDATE nodes SET metadata = json_remove(metadata, '\$.${remove_key}'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+                # Metadata carries criteria, learnings, and handoff state. Persist
+                # it immediately: a throttled sync can otherwise leave the change
+                # only in the hot-zone DB, absent from state.sql and deltas.
+                if ! auto_sync --force; then
+                    echo -e "${RED}Error: metadata key was removed locally, but portable sync failed; resolve the error and run 'wv sync'${NC}" >&2
+                    return 1
+                fi
                 echo -e "${GREEN}✓${NC} Removed metadata key '${remove_key}' from $id"
-                auto_sync 2>/dev/null || true
                 return 0
                 ;;
         esac
@@ -3920,14 +4070,25 @@ cmd_update() {
                     AND json_extract(metadata, '$.promoted_at') IS NULL;" 2>/dev/null || true
     fi
 
-    # --echo: return updated node as JSON (eliminates need for a follow-up show call)
+    # Metadata carries criteria, learnings, and handoff state. Persist explicit
+    # metadata updates immediately so a commit made inside the normal sync
+    # throttle window cannot omit them from the portable graph artifacts.
+    if [ "$metadata_supplied" = true ]; then
+        if ! auto_sync --force; then
+            echo -e "${RED}Error: metadata was updated locally, but portable sync failed; resolve the error and run 'wv sync'${NC}" >&2
+            return 1
+        fi
+    else
+        auto_sync 2>/dev/null || true
+    fi
+
+    # Report success only after durability-critical metadata persistence passes.
+    # --echo returns the updated node as JSON (avoids a follow-up show call).
     if [ "$echo_mode" = true ]; then
         db_query_json_v2 "SELECT id, text, status, metadata FROM nodes WHERE id='$id';"
     else
         echo -e "${GREEN}✓${NC} Updated: $id"
     fi
-
-    auto_sync 2>/dev/null || true
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4176,6 +4337,66 @@ _ship_needs_gh() {
     [ -n "$gh_found" ]
 }
 
+_ship_sync_without_commit() {
+    local previous_skip="${_WV_SKIP_SYNC_COMMIT:-}"
+    local previous_skip_set="${_WV_SKIP_SYNC_COMMIT+x}"
+    local rc=0
+    export _WV_SKIP_SYNC_COMMIT=1
+    cmd_sync "$@" || rc=$?
+    if [ -n "$previous_skip_set" ]; then
+        export _WV_SKIP_SYNC_COMMIT="$previous_skip"
+    else
+        unset _WV_SKIP_SYNC_COMMIT
+    fi
+    return "$rc"
+}
+
+_ship_mark_pending() {
+    local id="$1"
+    local mode="$2"
+    local changed
+    changed=$(db_query "UPDATE nodes
+        SET metadata = json_set(COALESCE(metadata,'{}'),
+            '$.ship_pending', json('true'),
+            '$.ship_pending_mode', '$(sql_escape "$mode")')
+        WHERE id = '$(sql_escape "$id")' AND status != 'done';
+        SELECT changes();") || return $?
+    [ "$changed" = "1" ]
+}
+
+_ship_clear_pending_durable() {
+    local id="$1"
+    local previous_mode mode_present marker_present rc=0
+    previous_mode=$(db_query "SELECT COALESCE(json_extract(metadata, '$.ship_pending_mode'), '')
+        FROM nodes WHERE id = '$(sql_escape "$id")';" 2>/dev/null || echo "legacy")
+    mode_present=$(db_query "SELECT CASE WHEN json_type(metadata, '$.ship_pending_mode') IS NULL THEN 0 ELSE 1 END
+        FROM nodes WHERE id = '$(sql_escape "$id")';" 2>/dev/null || echo "0")
+    marker_present=$(db_query "SELECT CASE WHEN json_type(metadata, '$.ship_pending') IS NULL THEN 0 ELSE 1 END
+        FROM nodes WHERE id = '$(sql_escape "$id")';" 2>/dev/null || echo "0")
+    db_query "UPDATE nodes
+        SET metadata = json_remove(COALESCE(metadata,'{}'), '$.ship_pending', '$.ship_pending_mode')
+        WHERE id = '$(sql_escape "$id")';" >/dev/null || return 1
+    _ship_sync_without_commit || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if [ "$marker_present" = "1" ] && [ "$mode_present" = "1" ]; then
+            db_query "UPDATE nodes
+                SET metadata = json_set(COALESCE(metadata,'{}'),
+                    '$.ship_pending', json('true'),
+                    '$.ship_pending_mode', '$(sql_escape "$previous_mode")')
+                WHERE id = '$(sql_escape "$id")';" >/dev/null 2>&1 || true
+        elif [ "$marker_present" = "1" ]; then
+            db_query "UPDATE nodes
+                SET metadata = json_set(COALESCE(metadata,'{}'), '$.ship_pending', json('true'))
+                WHERE id = '$(sql_escape "$id")';" >/dev/null 2>&1 || true
+        elif [ "$mode_present" = "1" ]; then
+            db_query "UPDATE nodes
+                SET metadata = json_set(COALESCE(metadata,'{}'), '$.ship_pending_mode', '$(sql_escape "$previous_mode")')
+                WHERE id = '$(sql_escape "$id")';" >/dev/null 2>&1 || true
+        fi
+        return "$rc"
+    fi
+}
+
 _ship_run() {
     local id="$1"
     local learning="$2"
@@ -4191,20 +4412,41 @@ _ship_run() {
     # Validate ID format
     validate_id "$id" || return 1
 
+    # Reject incomplete input before creating any durable protocol state.
+    if [ -z "$learning" ] && [ -z "$learning_file" ] && [ "$skip_verification" != true ]; then
+        echo -e "${RED}Error: --learning=\"...\", --learning-file=PATH, or --skip-verification required${NC}" >&2
+        echo "Usage: wv ship <id> --learning=\"decision: ... | pattern: ... | pitfall: ...\"" >&2
+        return 1
+    fi
+    local ship_status
+    ship_status=$(db_query "SELECT status FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null)
+    if [ -z "$ship_status" ] || [ "$ship_status" = "done" ]; then
+        echo -e "${RED}Error: ship requires an existing non-done node${NC}" >&2
+        return 1
+    fi
+
     # Auto-detect GH sync need before journaling
     local needs_gh=false
     if [ "$no_gh" != true ] && _ship_needs_gh "$id" "$gh_flag"; then
         needs_gh=true
     fi
 
-    # Set ship_pending metadata marker (survives reboot for fallback recovery)
-    db_query "UPDATE nodes SET metadata = json_set(COALESCE(metadata,'{}'), '$.ship_pending', json('true')) WHERE id = '$id';" 2>/dev/null || true
-
     # Begin journaled operation
-    journal_begin "ship" "{\"id\":\"$id\",\"gh\":$needs_gh}"
+    if ! journal_begin "ship" "{\"id\":\"$id\",\"gh\":$needs_gh}" "persist_intent"; then
+        unset _WV_IN_JOURNAL _WV_CURRENT_OP_ID _WV_CURRENT_OP_TYPE
+        return 1
+    fi
 
-    # Step 1: Close the node
-    journal_step 1 "done" "{\"id\":\"$id\"}"
+    # Persist intent before close can change node state. The explicit journal
+    # phase avoids an unrecoverable begin-with-no-pending-step crash window.
+    journal_step 1 "persist_intent" "{\"id\":\"$id\"}" || return $?
+    if ! _ship_mark_pending "$id" "pre_close" || ! _ship_sync_without_commit; then
+        return 1
+    fi
+    journal_complete 1 || return $?
+
+    # Step 2: Close the node
+    journal_step 2 "done" "{\"id\":\"$id\"}" || return $?
     local done_rc=0
     local done_args=("$id")
     if [ -n "$learning" ]; then
@@ -4229,56 +4471,56 @@ _ship_run() {
         done_args+=("--no-gh")
     fi
 
+    local previous_ship_close="${_WV_SHIP_DURABLE_CLOSE:-}"
+    local previous_ship_close_set="${_WV_SHIP_DURABLE_CLOSE+x}"
+    export _WV_SHIP_DURABLE_CLOSE=1
     if [ -n "$learning" ] || [ -n "$learning_file" ]; then
         cmd_done "${done_args[@]}" || done_rc=$?
     elif [ "$skip_verification" = true ]; then
         done_args+=("--skip-verification")
         cmd_done "${done_args[@]}" || done_rc=$?
+    fi
+    if [ -n "$previous_ship_close_set" ]; then
+        export _WV_SHIP_DURABLE_CLOSE="$previous_ship_close"
     else
-        echo -e "${RED}Error: --learning=\"...\", --learning-file=PATH, or --skip-verification required${NC}" >&2
-        echo "Usage: wv ship <id> --learning=\"decision: ... | pattern: ... | pitfall: ...\"" >&2
-        journal_abort 2>/dev/null || true
-        return 1
+        unset _WV_SHIP_DURABLE_CLOSE
     fi
     if [ "$done_rc" -eq 2 ]; then
-        db_query "UPDATE nodes SET metadata = json_remove(COALESCE(metadata,'{}'), '$.ship_pending') WHERE id = '$id';" 2>/dev/null || true
+        _ship_clear_pending_durable || return $?
         journal_end
         journal_clean
         return 2
     elif [ "$done_rc" -ne 0 ]; then
         return "$done_rc"
     fi
-    journal_complete 1
+    journal_complete 2 || return $?
 
-    # Step 2: Sync to disk (with GH if needed)
-    journal_step 2 "sync" "{\"gh\":$needs_gh}"
-    local _ship_prev_skip_sync_commit="${_WV_SKIP_SYNC_COMMIT:-}"
-    export _WV_SKIP_SYNC_COMMIT=1
+    # Step 3: Sync to disk (with GH if needed)
+    journal_step 3 "sync" "{\"gh\":$needs_gh}" || return $?
+    local sync_rc=0
     if [ "$needs_gh" = true ]; then
         echo -e "${CYAN}ℹ${NC} GitHub-linked node detected — syncing with --gh --mode=fast"
-        cmd_sync --gh --mode=fast --node="$id"
+        _ship_sync_without_commit --gh --mode=fast --node="$id" || sync_rc=$?
     else
-        cmd_sync
+        _ship_sync_without_commit || sync_rc=$?
     fi
-    if [ -n "$_ship_prev_skip_sync_commit" ]; then
-        export _WV_SKIP_SYNC_COMMIT="$_ship_prev_skip_sync_commit"
-    else
-        unset _WV_SKIP_SYNC_COMMIT
-    fi
-    journal_complete 2
+    [ "$sync_rc" -eq 0 ] || return "$sync_rc"
+    journal_complete 3 || return $?
 
-    # Clear ship_pending marker and complete journal. Remote sync may still be
-    # pending — surfaced explicitly via wv status / wv doctor / wv recover.
-    db_query "UPDATE nodes SET metadata = json_remove(metadata, '$.ship_pending') WHERE id = '$id';" 2>/dev/null || true
-    journal_end
-    journal_clean
+    # Marker clearance is itself durable before the journal can complete.
+    # Remote sync may still be pending — surfaced via status/doctor/recover.
+    journal_step 4 "clear_pending" "{\"id\":\"$id\"}" || return $?
+    _ship_clear_pending_durable "$id" || return $?
+    journal_complete 4 || return $?
+    journal_end || return $?
+    journal_clean || return $?
 }
 
 cmd_ship() {
     # Check for incomplete operations before starting a new ship
     if journal_has_incomplete 2>/dev/null; then
         echo -e "${YELLOW}⚠ Recovering incomplete operation before shipping...${NC}" >&2
-        cmd_recover --auto 2>/dev/null || true
+        cmd_recover --auto || return $?
     fi
 
     local id="${1:-}"

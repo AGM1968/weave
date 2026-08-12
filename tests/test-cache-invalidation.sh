@@ -337,7 +337,56 @@ test_cache_file_lifecycle() {
     fi
 }
 
-# Test 7: wv touch invalidates run cache
+# Test 7: pre-existing v3 cache file does not shadow the v4 payload shape (wv-22ca26)
+# cmd_context added done_criteria/risks/risk_level (node) and blocked_reason (envelope)
+# to its output without changing the cache filename, so a cache entry written before
+# that change could be served verbatim after upgrade and silently mask the new fields.
+# The fix bumps the cache key (v3 -> v4); this proves a stale v3 file on disk is
+# ignored rather than read.
+test_v3_cache_upgrade_no_shadow() {
+    echo ""
+    echo "Test 7: stale pre-upgrade (v3) cache file does not shadow the new payload shape"
+    echo "================================================================================="
+
+    setup_test_env
+
+    local node
+    node=$("$WV" add "Cache upgrade test node" | tail -1)
+
+    local cache_dir="$WV_HOT_ZONE/context_cache"
+    mkdir -p "$cache_dir"
+
+    # Simulate a pre-upgrade cache entry written by the OLD (v3) code path: missing
+    # done_criteria/risks/risk_level on node and blocked_reason on the envelope.
+    local stale_file="$cache_dir/${node}-bootstrap-v3.json"
+    printf '{"node":{"id":"%s","text":"stale","status":"todo"},"blocked":false,"blockers":[]}' "$node" > "$stale_file"
+
+    local response
+    response=$("$WV" context "$node" --json --mode=bootstrap)
+
+    local has_done_criteria has_blocked_reason
+    has_done_criteria=$(echo "$response" | jq '(.node // {}) | has("done_criteria")')
+    has_blocked_reason=$(echo "$response" | jq 'has("blocked_reason")')
+
+    assert_equals "true" "$has_done_criteria" "fresh response has node.done_criteria (stale v3 cache not served)"
+    assert_equals "true" "$has_blocked_reason" "fresh response has blocked_reason (stale v3 cache not served)"
+
+    # The stale v3 file itself must be left untouched (proves it was never opened for
+    # read or write -- the new code looked at the v4 filename exclusively)
+    local stale_untouched
+    stale_untouched=$(jq 'has("blocked_reason") | not' "$stale_file")
+    assert_equals "true" "$stale_untouched" "stale v3 cache file left as-is on disk"
+
+    # A fresh v4-keyed cache file should now exist alongside the stale v3 one
+    local v4_file="$cache_dir/${node}-bootstrap-v4.json"
+    if [ -f "$v4_file" ]; then
+        assert_equals "true" "true" "new v4 cache file created"
+    else
+        echo -e "${YELLOW}⊘${NC} v4 cache file not found at expected path - cache filename convention may have changed"
+    fi
+}
+
+# Test 8: wv touch invalidates run cache
 # Verifies the bug fixed in 1.51.7: touch was absent from _wv_run_cache_is_write_cmd
 # so wv bootstrap served stale metadata for up to 45s after a touch.
 test_touch_invalidates_run_cache() {
@@ -386,6 +435,7 @@ main() {
     test_cmd_link_invalidation
     test_cmd_prune_invalidation
     test_cache_file_lifecycle
+    test_v3_cache_upgrade_no_shadow
     test_touch_invalidates_run_cache
 
     # Summary

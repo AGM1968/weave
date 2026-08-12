@@ -1,0 +1,30 @@
+id: prose-work-context-leakage
+language: prose
+kind: regex
+severity: info
+policy: always-on-shared
+maturity: promotable
+provenance: >-
+  wv-cc46cc and wv-61b858 @nowcast, ported and retained by
+  earth-engine-analysis. Chat artifacts and session deixis survived into
+  documents even though their readers share neither context.
+message: >-
+  Working-context leakage refers to the chat, session, or update that produced
+  the document. Describe the work product rather than its conversation.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+patterns:
+  - '\bI hope this helps\b'
+  - '\blet me know if\b'
+  - '\bwould you like me to\b'
+  - '\bas of my last (update|training)\b'
+  - '\bbased on available information\b'
+  - '\bthis session\b'
+  - '\bthis conversation\b'
+positive_controls:
+  - "This session produced the result."
+negative_controls:
+  - "The session token expires after 30 minutes."
+  - "The conversation protocol records three message types."

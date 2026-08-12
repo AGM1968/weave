@@ -1,1 +1,59 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://weave.dev/contracts/evidence-v1.schema.json","type":"object","additionalProperties":false,"required":["evidence_id","provider","provider_version","repository","subjects","content_hashes","policy_fingerprint","observed_at","freshness","status","provenance"],"properties":{"evidence_id":{"type":"string"},"provider":{"type":"string"},"provider_version":{"type":"string"},"repository":{"$ref":"protocol-v1.schema.json#/$defs/repository_identity"},"subjects":{"type":"object"},"content_hashes":{"type":"object"},"policy_fingerprint":{"type":"string"},"observed_at":{"type":"string","format":"date-time"},"freshness":{"type":"object"},"status":{"enum":["pass","fail","stale","unavailable"]},"provenance":{"type":"object"}}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://weave.dev/contracts/evidence-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evidence_id",
+    "provider",
+    "provider_version",
+    "repository",
+    "subjects",
+    "content_hashes",
+    "policy_fingerprint",
+    "observed_at",
+    "freshness",
+    "status",
+    "provenance"
+  ],
+  "properties": {
+    "evidence_id": { "type": "string" },
+    "provider": { "type": "string" },
+    "provider_version": { "type": "string" },
+    "repository": { "$ref": "protocol-v1.schema.json#/$defs/repository_identity" },
+    "subjects": { "type": "object" },
+    "content_hashes": { "type": "object" },
+    "policy_fingerprint": { "type": "string" },
+    "observed_at": { "type": "string", "format": "date-time" },
+    "freshness": { "type": "object" },
+    "status": { "enum": ["pass", "fail", "stale", "unavailable"] },
+    "provenance": { "$ref": "#/$defs/provenance" }
+  },
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "required": ["references"],
+      "properties": {
+        "references": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/durable_reference" }
+        }
+      }
+    },
+    "durable_reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id", "commit_sha"],
+      "properties": {
+        "node_id": { "type": "string", "pattern": "^wv-[0-9a-f]{6}$" },
+        "commit_sha": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+        "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "path_hint": { "type": "string", "minLength": 1 },
+        "repository_id": { "type": "string", "minLength": 1 },
+        "semantic_ref": { "type": "string", "minLength": 1 }
+      },
+      "dependentRequired": { "path_hint": ["content_digest"] }
+    }
+  }
+}

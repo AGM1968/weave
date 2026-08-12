@@ -44,7 +44,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema, Tool } from "@modelconte
 import { execFileSync, spawnSync } from "child_process";
 import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, statSync } from "fs";
 import { hostname, userInfo } from "os";
-import { dirname, join } from "path";
+import { dirname, join, resolve } from "path";
 
 // --- Scope definitions ---
 // Each scope exposes a subset of tools for context-silo'd subagents.
@@ -220,6 +220,27 @@ validateProjectRoot();
 // Default timeout for wv commands (30s). Sync handlers override this.
 const WV_TIMEOUT = 30_000;
 const WV_LIFECYCLE_TIMEOUT = 15_000;
+// wv-c9ea87: the shared deadline for one weave_quality_patterns "list" call
+// (its own primary scan/list invocation plus its internal "report" call --
+// see wvQualityPatternsList). Overridable only for tests that need to
+// observe the shared-budget behavior without waiting anywhere near a real
+// 60s in CI; production deployments should never set this.
+//
+// wv-112599 (external code review round 3, finding 4): `Number(raw) ||
+// 60_000` let -1/Infinity/1.5 all pass through as the literal spawnSync
+// timeout -- Node throws on each of those before `wv` even runs -- while
+// 0 and unparseable text silently fell back to 60000, an inconsistent mix
+// of "reject" and "silently default" for different kinds of bad input.
+// Node's own timeout contract (see spawnSync's `options.timeout`) only
+// accepts a positive safe integer, so that's the sole value accepted here
+// too; anything else (including 0, negative, fractional, non-finite, or
+// unset/unparseable) consistently falls back to the 60s default instead
+// of ever reaching spawnSync.
+export function resolvePatternsListBudgetMs(raw: string | undefined): number {
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : 60_000;
+}
+const PATTERNS_LIST_BUDGET_MS = resolvePatternsListBudgetMs(process.env.WV_MCP_PATTERNS_LIST_BUDGET_MS);
 const MCP_ALLOW_NETWORK = process.env.WV_MCP_ALLOW_NETWORK === "1";
 const MCP_STARTUP_REPORT = process.env.WV_MCP_STARTUP_REPORT === "1";
 const STATUS_SCHEMA_VALUES = [
@@ -330,13 +351,13 @@ function stripAnsi(raw: string): string {
   return raw.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
-function spawnWv(args: string[], timeout: number = WV_TIMEOUT) {
+function spawnWv(args: string[], timeout: number = WV_TIMEOUT, extraEnv: NodeJS.ProcessEnv = {}) {
   return spawnSync(WV_PATH, args, {
     encoding: "utf-8",
     maxBuffer: 10 * 1024 * 1024, // 10MB
     timeout,
     cwd: resolveProjectRoot(),
-    env: wvEnv(),
+    env: wvEnv(extraEnv),
   });
 }
 
@@ -360,6 +381,467 @@ function wv(args: string[], timeout: number = WV_TIMEOUT): string {
   // that write primary output there (legacy quality subcommands without --json).
   const raw = result.stdout?.trim() || result.stderr?.trim() || "";
   return stripAnsi(raw);
+}
+
+// weave_quality_patterns' "list" subcommand additively surfaces two
+// advisories the underlying CLI's own `--json` payload deliberately keeps
+// OUT of stdout, to never change that bare array's shape for existing
+// scripted consumers (see cmd_patterns_list's own comment in
+// scripts/weave_quality/__main__.py): the scan scope/target (shown only in
+// TEXT mode) and managed-rule shadow warnings (always stderr-only, in both
+// modes). Neither is re-derived here — both come from the CLI's OWN
+// already-computed values, just read from a different channel/subcommand
+// than the plain `wv` proxy normally uses (wv-6cd72e).
+// wv-ce5ca6 (external code review round 2): a "rule state" entry from
+// `patterns list --json` is {rule_id: string, path: string, status: string,
+// hits: number|null, [error: string]} (see cmd_patterns_list's own
+// rule_states.append(...)) -- checked structurally so a scalar, an object,
+// null, or an array containing any invalid entry is rejected outright
+// instead of silently passed through as "rules".
+//
+// wv-885d12 (external code review round 3 re-audit): the round-2 fix above
+// only checked each FIELD's own type in isolation -- `status` was any
+// nonempty string, `hits` was any number or null, with no cross-field
+// invariant at all. cmd_patterns_list's own producer contract
+// (scripts/weave_quality/__main__.py:2453-2463, mirroring
+// record_pattern_rule_failure/record_pattern_rule_success's own DB
+// invariants) only ever produces exactly three states: "not_run" with
+// hits:null; "failed" with hits:null and a nonempty `error`; "success"
+// with a nonnegative integer `hits`. {status:"failed", hits:null} with no
+// error, {status:"success", hits:null}, an unrecognized status like
+// "bogus", and negative/fractional hits were all still accepted before
+// this -- none of them a reachable state from a working install.
+//
+// wv-731450 (external code review round 3 re-audit): "success"/"not_run"
+// still accepted an opposite-state `error` field tagging along (e.g.
+// {status:"success", hits:0, error:"scan failed"}) -- cmd_patterns_list's
+// own state dict only ever ADDS "error" inside the `if receipt["error"]`
+// branch, and record_pattern_rule_success (db.py) explicitly writes
+// error=NULL on every success upsert, so a success/not_run entry
+// carrying `error` is exactly as unreachable as the cases above.
+function isValidPatternListEntry(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  if (typeof entry.rule_id !== "string" || entry.rule_id.length === 0) return false;
+  if (typeof entry.path !== "string" || entry.path.length === 0) return false;
+  switch (entry.status) {
+    case "not_run":
+      return entry.hits === null && !("error" in entry);
+    case "failed":
+      return entry.hits === null && typeof entry.error === "string" && entry.error.length > 0;
+    case "success":
+      return Number.isInteger(entry.hits) && (entry.hits as number) >= 0 && !("error" in entry);
+    default:
+      return false;
+  }
+}
+
+// The exact managed-shadow advisory _wv quality patterns list_ ever prints
+// (cmd_patterns_list, wv-f0b306) -- both rule_id occurrences must match via
+// backreference, so an unrelated stderr line that merely happens to start
+// with the same glyph (a future warning, a stray tool message) is never
+// mislabeled as this specific advisory.
+//
+// wv-8d16bd (external code review round 3 re-audit): the message gained a
+// "AND run 'wv init-repo --update'" clause -- deleting the local copy alone
+// doesn't resync the managed version, and following the OLD advice as
+// written silently dropped the rule entirely. Keep this regex byte-for-byte
+// in sync with cmd_patterns_list's own f-string.
+const SHADOW_ADVISORY_RE =
+  /^⚠ (\S+): \.weave\/patterns\/\1\.yaml shadows an available managed rule of the same id \(never applied\) — delete the local copy AND run 'wv init-repo --update' to sync the managed version, if this was a completed promotion$/;
+
+function wvQualityPatternsList(cmd: string[], patPath: string | undefined): string {
+  // wv-c9ea87 (external code review round 2): list's own scan and its
+  // internal report call each used to get an independent, fresh 60s
+  // timeout budget -- a slow scan followed by a report call that also
+  // stalls could block this single synchronous MCP request for close to
+  // 120s combined, well past what a calling client's own timeout expects.
+  // One shared deadline now covers the whole call; the report call only
+  // ever gets whatever's left of it, never a fresh budget of its own.
+  const deadline = Date.now() + PATTERNS_LIST_BUDGET_MS;
+  const result = spawnWv(cmd, PATTERNS_LIST_BUDGET_MS);
+  if (result.error && result.status === null) {
+    throw new Error(result.error.message || "wv command failed");
+  }
+  if (result.status !== 0) {
+    throw new Error(result.stderr?.trim() || result.stdout?.trim() || `wv exited with code ${result.status}`);
+  }
+  // wv-ce5ca6 (external code review round 2): stdout was previously
+  // defaulted to the literal string "[]" whenever it was empty (`||
+  // "[]"`), fabricating a clean "zero rules" result indistinguishable
+  // from a genuine crash that produced no output on an exit-0 path; and
+  // whatever the parsed JSON turned out to be -- a scalar, an object,
+  // null, or an array with invalid entries mixed in -- was accepted as
+  // "rules" with no shape check at all. `_DEFAULT_PATTERNS_DIR` always
+  // ships built-in rules (see _candidate_pattern_files), so a genuinely
+  // empty or malformed rules array from a working install should never
+  // happen -- fail loudly instead of returning either fabricated or
+  // unchecked content.
+  const stdout = stripAnsi(result.stdout?.trim() || "");
+  let parsedRules: unknown;
+  try {
+    parsedRules = stdout ? JSON.parse(stdout) : null;
+  } catch {
+    throw new Error(`wv quality patterns list produced malformed JSON: ${stdout.slice(0, 200)}`);
+  }
+  if (!Array.isArray(parsedRules) || parsedRules.length === 0 || !parsedRules.every(isValidPatternListEntry)) {
+    throw new Error(
+      `wv quality patterns list returned an unexpected payload shape: ${stdout.slice(0, 200) || "(empty output)"}`
+    );
+  }
+  const rules = parsedRules;
+  const shadowAdvisories = stripAnsi(result.stderr || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => SHADOW_ADVISORY_RE.test(line));
+  // scope comes from `report`'s own --json payload, which already computes
+  // it from the SAME underlying source (latest_pattern_run's stored
+  // target, or an explicit path) as list's own text-mode header — see
+  // _report_scope's docstring: "the label is the raw target string,
+  // matching how list shows 'last scanned: <target>'". Reusing report's
+  // already-additive scope field avoids re-deriving scope-resolution logic
+  // here; a failure to obtain it (e.g. no scan has ever run) is
+  // non-fatal — the rule listing itself is still the primary payload.
+  //
+  // wv-5b9f55 finding 8 (external code review): report's own path
+  // handling is NOT symmetric with list's, in TWO ways.
+  //
+  // (a) cmd_patterns_list resolves `repo` via _resolve_repo(patPath) --
+  // patPath (when given) IS the repository root. cmd_patterns_report
+  // resolves `repo` via _resolve_repo(None) UNCONDITIONALLY -- an
+  // explicit path there is never the repo itself. WV_REPO_ROOT_OVERRIDE
+  // is the env var _resolve_repo(None) checks first (ahead of REPO_ROOT
+  // -- see wv-20adef below for why REPO_ROOT itself doesn't survive):
+  // setting it here, resolved the identical way list's own path
+  // argument already is (Path(...).resolve(), mirrored via Node's
+  // resolve() against the SAME subprocess cwd both calls share), makes
+  // this one report subprocess call agree with list's own repo without
+  // touching report's CLI contract.
+  //
+  // wv-20adef (external code review round 2): this used to set REPO_ROOT
+  // itself, which does NOT survive the real `wv` wrapper -- the bash
+  // entry point's own wv-config.sh unconditionally reassigns REPO_ROOT
+  // from `git rev-parse --show-toplevel` against the wv SUBPROCESS's own
+  // cwd (resolveProjectRoot(), the MCP server's project root -- see
+  // spawnWv), discarding whatever this extraEnv set, before
+  // _resolve_repo(None) in Python ever runs. That only went unnoticed
+  // because every existing test's fixture happened to spawn the MCP
+  // server itself from the same directory as `patPath`, so wv-config.sh's
+  // own recomputed REPO_ROOT coincidentally agreed anyway.
+  // WV_REPO_ROOT_OVERRIDE is a name wv-config.sh never touches, so it
+  // survives the wrapper intact whenever the MCP server's own project
+  // root differs from the repo a `list`/`validate` call is scoped to.
+  //
+  // (b) Forwarding patPath onto report's OWN command line (as before)
+  // compounds the mismatch further: report treats a path ARGUMENT as an
+  // EXPLICIT SCAN TARGET override (_canonicalize_target(repo,
+  // explicit_path)), skipping its normal "last stored scan target"
+  // lookup entirely -- so passing list's own repo-root patPath through
+  // made report canonicalize THAT root against itself, always
+  // collapsing scope to the degenerate "." (target == repo) instead of
+  // whatever sub-target list's own last scan actually targeted. report
+  // must run with NO explicit path argument here -- only REPO_ROOT --
+  // so it naturally falls through to reporting on latest_pattern_run's
+  // own stored target, scoped against the CORRECT repo via (a).
+  //
+  // A genuine command failure (nonzero exit, a timeout, malformed JSON)
+  // is also no longer silently folded into the same `scope: null` a
+  // legitimate "no scan has ever run" naturally produces — the two are
+  // indistinguishable to a caller otherwise, and the former is exactly
+  // the kind of problem a caller deciding whether to trust `scope` at
+  // all needs to know about. Surfaced additively as `scope_error`,
+  // still non-fatal to the primary rule-listing payload.
+  const reportCmd = ["quality", "patterns", "report", "--json"];
+  const reportEnv: NodeJS.ProcessEnv = patPath ? { WV_REPO_ROOT_OVERRIDE: resolve(resolveProjectRoot(), patPath) } : {};
+  let scope: string | null = null;
+  let scopeError: string | null = null;
+  // wv-c9ea87: only whatever's left of the shared 60s deadline above, not
+  // a fresh budget -- a report call that would start after the deadline
+  // has already passed is skipped entirely rather than handed a zero or
+  // negative timeout (spawnSync treats a falsy timeout as "no timeout").
+  const reportBudget = deadline - Date.now();
+  if (reportBudget <= 0) {
+    scopeError = "wv quality patterns list's shared 60s budget was exhausted before its internal report call could run";
+  } else {
+    const reportResult = spawnWv(reportCmd, reportBudget, reportEnv);
+    if (reportResult.error && reportResult.status === null) {
+      scopeError = reportResult.error.message || "wv quality patterns report failed";
+    } else if (reportResult.status !== 0) {
+      scopeError = stripAnsi(
+        reportResult.stderr?.trim() ||
+          reportResult.stdout?.trim() ||
+          `wv quality patterns report exited with code ${reportResult.status}`
+      );
+    } else {
+      // wv-ce5ca6: {}, [], and {scope: 42} used to all parse successfully
+      // and produce no scope_error -- `report.scope ?? null` treats a
+      // MISSING key the same as an explicit null, and never checks that
+      // `report` is even an object at all, let alone that `scope` (when
+      // present) is a string. cmd_patterns_report always sets
+      // report["scope"] = scope_label (str | None) on its own dict --
+      // require exactly that shape.
+      //
+      // wv-67a6e5 (external code review round 3, finding 7): this used to
+      // check only the `scope` field in isolation -- {by_rule: "bogus",
+      // recurring_waivers: 42, finding_count: -1, scope: "ok"} passed. Now
+      // shares the SAME full-contract validator direct `report` calls use
+      // (isValidPatternReportPayload); a report call still degrades to a
+      // non-fatal `scope_error` here (list's own rules[] payload remains
+      // the primary, still-useful result either way), it just no longer
+      // trusts `scope` off a payload that fails everywhere else.
+      const reportStdout = stripAnsi(reportResult.stdout?.trim() || "");
+      let parsedReport: unknown;
+      try {
+        parsedReport = JSON.parse(reportStdout);
+      } catch {
+        scopeError = "wv quality patterns report produced malformed JSON";
+        parsedReport = undefined;
+      }
+      if (parsedReport !== undefined) {
+        if (isValidPatternReportPayload(parsedReport)) {
+          scope = parsedReport.scope;
+        } else {
+          scopeError = `wv quality patterns report returned an unexpected payload shape: ${reportStdout.slice(0, 200)}`;
+        }
+      }
+    }
+  }
+  const payload: Record<string, unknown> = { rules, scope, shadow_advisories: shadowAdvisories };
+  if (scopeError !== null) payload.scope_error = scopeError;
+  return JSON.stringify(payload);
+}
+
+// wv-860c8c (external code review round 2): a "validate" rule entry
+// (cmd_patterns_validate's own results.append(entry)) is {rule_id: string,
+// path: string, status: "valid"|"invalid", [language: string],
+// [error: string]} -- status=="invalid" always carries its own `error`
+// (see the PatternRuleValidationError except-branch and the duplicate-id
+// collision branch, both of which set entry["error"] whenever they set
+// status to "invalid"). Checked structurally so {rules: [null]} or
+// {rules: [{status: "invalid"}]} (no rule_id/path/error at all) are
+// rejected instead of accepted as real per-rule results.
+//
+// wv-8b3f8a (external code review round 3 re-audit): a status=="valid"
+// entry was accepted with no further check at all -- but
+// cmd_patterns_validate always sets entry["language"] = validate_pattern_
+// rule(...)'s own return value in that branch (scripts/weave_quality/
+// __main__.py:2324-2326), and clears it again if a later duplicate-id
+// collision demotes the entry to "invalid" (entry.pop("language", None)).
+// A valid entry missing `language` is exactly as unreachable from a
+// working install as an invalid one missing `error`.
+//
+// wv-731450 (external code review round 3 re-audit): "valid" still
+// accepted an opposite-state `error` field, and "invalid" still accepted
+// a leftover `language` field. cmd_patterns_validate's own entry dict is
+// built exclusively inside one of two mutually exclusive branches (the
+// try succeeds and sets status/language, or the except sets
+// status/error) -- language and error are never both present on the
+// same entry, so either combination is exactly as unreachable as a
+// missing required field.
+function isValidPatternValidateEntry(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  if (typeof entry.rule_id !== "string" || entry.rule_id.length === 0) return false;
+  if (typeof entry.path !== "string" || entry.path.length === 0) return false;
+  if (entry.status === "valid") {
+    return typeof entry.language === "string" && entry.language.length > 0 && !("error" in entry);
+  }
+  if (entry.status === "invalid") {
+    return typeof entry.error === "string" && entry.error.length > 0 && !("language" in entry);
+  }
+  return false;
+}
+
+// wv-8b3f8a (external code review round 3 re-audit): cmd_patterns_validate
+// always sets payload["coverage"] = {kinds, match_scopes, maturities,
+// optional_keys} (scripts/weave_quality/__main__.py:2372-2382), each a
+// dict mapping every documented schema value for that group to whether a
+// currently-valid rule actually exercises it -- i.e. an object whose own
+// values are all booleans. Checked structurally, not just "is an object",
+// the same way rules[] entries are.
+//
+// wv-731450 (external code review round 3 re-audit): each group's own
+// check was `Object.values(group).every(...)`, vacuously true for `{}` --
+// {kinds:{}, match_scopes:{}, maturities:{}, optional_keys:{}} passed.
+// cmd_patterns_validate builds every group from a fixed, nonempty Python
+// tuple (_PROSE_SCHEMA_KINDS/_MATCH_SCOPES/_MATURITIES/_OPTIONAL_KEYS,
+// __main__.py:2237-2246) mapped unconditionally to True/False -- the
+// SET of keys per group never varies, only the booleans do, so a group
+// with zero keys is exactly as unreachable as one with a non-boolean
+// value. Deliberately NOT cross-checking the exact enumerated key names
+// here (that would hand-duplicate the Python schema constants in TS as a
+// second source of truth, the tradeoff wv-8b3f8a's own decision already
+// weighed against) -- nonempty is the boundary this check can enforce
+// without that duplication.
+function isValidPatternCoverage(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const coverage = value as Record<string, unknown>;
+  return (["kinds", "match_scopes", "maturities", "optional_keys"] as const).every((key) => {
+    const group = coverage[key];
+    if (group === null || typeof group !== "object" || Array.isArray(group)) return false;
+    const entries = Object.values(group as Record<string, unknown>);
+    return entries.length > 0 && entries.every((v) => typeof v === "boolean");
+  });
+}
+
+// weave_quality_patterns' "validate" subcommand deliberately returns a
+// NONZERO exit code when it finds an invalid rule (cmd_patterns_validate:
+// `return 0 if all_valid else 1`) -- unlike scan/list/report, where a
+// nonzero exit really does mean something went wrong, validate's own stdout
+// JSON is a fully useful, successfully-produced result either way ("some
+// rules are invalid" is a normal finding, not a crash). The generic wv()
+// helper treats any nonzero exit as a thrown error, which would otherwise
+// swallow a legitimate {"rules": [...], "valid": false} payload behind an
+// "Error: ..." wrapper (wv-6cd72e).
+//
+// Accepting "exit in {0,1}" alone is NOT sufficient (wv-c4e639, external
+// code review finding 3): a genuine crash that happens to exit 0 or 1 with
+// partial/garbage/empty stdout (a truncated timeout write, a malformed-JSON
+// regression, an unrelated future command reusing this exit convention)
+// would otherwise be returned as if it were a real result. Only two exact
+// shapes are accepted: exit 0 with {valid: true, rules: [...]}, or exit 1
+// with {valid: false, rules: [...]} -- parsed and shape-checked, and cross-
+// checked against cmd_patterns_validate's own `0 if all_valid else 1`
+// invariant (a payload claiming valid:true at exit 1, or vice versa, is
+// exactly as suspect as a missing field and rejected the same way).
+//
+// wv-860c8c (external code review round 2): the envelope check alone
+// ({valid: boolean, rules: array}) still accepted {valid:true,
+// rules:[null]}, {valid:true, rules:[{status:"invalid"}]}, and
+// {valid:false, rules:[]} -- none of them impossible per the envelope
+// shape, all three impossible per cmd_patterns_validate's own contract.
+// Every rules[] entry is now checked structurally (isValidPatternValidateEntry),
+// and `valid` is cross-checked against the entries' own statuses, not just
+// against the exit code.
+function wvQualityPatternsValidate(cmd: string[]): string {
+  const result = spawnWv(cmd, 60_000);
+  if (result.error && result.status === null) {
+    throw new Error(result.error.message || "wv command failed");
+  }
+  if (result.status !== 0 && result.status !== 1) {
+    // The "unexpected code" message must always lead -- a crash that
+    // still leaves SOMETHING on stdout/stderr (a partial timeout write,
+    // stray unrelated output) must not silently take priority over the
+    // one fact that actually matters here (wv-c4e639: an earlier version
+    // let stdout content win over this message whenever stdout was
+    // merely nonempty, which is exactly the "trust nonempty output"
+    // mistake this whole fix exists to close).
+    const detail = result.stderr?.trim() || result.stdout?.trim();
+    throw new Error(
+      `wv quality patterns validate exited with unexpected code ${result.status}` +
+        (detail ? `: ${detail.slice(0, 200)}` : "")
+    );
+  }
+  const stdout = stripAnsi(result.stdout?.trim() || "");
+  let payload: unknown;
+  try {
+    payload = JSON.parse(stdout);
+  } catch {
+    throw new Error(
+      `wv quality patterns validate produced malformed JSON (exit ${result.status}): ` +
+        (stdout.slice(0, 200) || result.stderr?.trim() || "(empty output)")
+    );
+  }
+  const rec = payload as { valid?: unknown; rules?: unknown; coverage?: unknown } | null;
+  if (
+    rec === null ||
+    typeof rec !== "object" ||
+    typeof rec.valid !== "boolean" ||
+    !Array.isArray(rec.rules) ||
+    // wv-8b3f8a (external code review round 3 re-audit): {valid: true,
+    // rules: []} used to pass -- Array.prototype.every is vacuously true
+    // on an empty array for BOTH checks below, so an empty rules[] never
+    // tripped either one. _DEFAULT_PATTERNS_DIR always ships built-in
+    // rules (same reasoning wv-ce5ca6 already established for `list`),
+    // so a genuinely empty rules[] from a working install should never
+    // happen -- fail loudly instead of accepting a vacuously "clean"
+    // result.
+    rec.rules.length === 0 ||
+    !isValidPatternCoverage(rec.coverage)
+  ) {
+    throw new Error(
+      `wv quality patterns validate returned an unexpected payload shape (exit ${result.status}): ${stdout.slice(0, 200)}`
+    );
+  }
+  const rules = rec.rules as unknown[];
+  if (!rules.every(isValidPatternValidateEntry)) {
+    throw new Error(
+      `wv quality patterns validate returned a rules[] entry with an unexpected shape (exit ${result.status}): ${stdout.slice(0, 200)}`
+    );
+  }
+  const allEntriesValid = rules.every((entry) => (entry as { status: string }).status === "valid");
+  if (rec.valid !== allEntriesValid) {
+    throw new Error(
+      `wv quality patterns validate's top-level "valid" (${rec.valid}) disagrees with its own rules[] statuses ` +
+        `(exit ${result.status}): ${stdout.slice(0, 200)}`
+    );
+  }
+  const expectedStatus = rec.valid ? 0 : 1;
+  if (result.status !== expectedStatus) {
+    throw new Error(
+      `wv quality patterns validate exit code (${result.status}) disagrees with its own payload ` +
+        `(valid: ${rec.valid}) -- expected exit ${expectedStatus}`
+    );
+  }
+  return stdout;
+}
+
+// wv-67a6e5 (external code review round 3, finding 7): cmd_patterns_report's
+// own contract (scripts/weave_quality/db.py's pattern_adjudication_report,
+// plus cmd_patterns_report itself additively setting `scope`) always
+// produces {by_rule: object, recurring_waivers: array, finding_count:
+// nonnegative integer, scope: string|null}. wvQualityPatternsList's own
+// internal report call used to check only `scope`'s shape -- {}, [], and
+// other malformed-but-truthy payloads passed as long as a `scope` field
+// happened to be a string or absent-as-null. A DIRECT weave_quality_patterns
+// report call skipped validation entirely, falling through to the generic
+// wv() helper, which returns any exit-0 stdout (including "[]", "{}", or
+// malformed JSON) as successful tool content. One shared validator now
+// covers both call sites.
+function isValidPatternReportPayload(value: unknown): value is {
+  by_rule: Record<string, unknown>;
+  recurring_waivers: unknown[];
+  finding_count: number;
+  scope: string | null;
+} {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const report = value as Record<string, unknown>;
+  return (
+    typeof report.by_rule === "object" &&
+    report.by_rule !== null &&
+    !Array.isArray(report.by_rule) &&
+    Array.isArray(report.recurring_waivers) &&
+    Number.isInteger(report.finding_count) &&
+    (report.finding_count as number) >= 0 &&
+    (report.scope === null || typeof report.scope === "string")
+  );
+}
+
+// A direct `weave_quality_patterns` call with subcommand "report" -- unlike
+// list's own internal report call, a malformed/empty/wrong-shaped payload
+// here IS the entire result, so it throws (fatal) rather than degrading to
+// a non-fatal `scope_error` alongside other primary content.
+function wvQualityPatternsReport(cmd: string[]): string {
+  const result = spawnWv(cmd, 60_000);
+  if (result.error && result.status === null) {
+    throw new Error(result.error.message || "wv command failed");
+  }
+  if (result.status !== 0) {
+    throw new Error(result.stderr?.trim() || result.stdout?.trim() || `wv exited with code ${result.status}`);
+  }
+  const stdout = stripAnsi(result.stdout?.trim() || "");
+  let payload: unknown;
+  try {
+    payload = stdout ? JSON.parse(stdout) : null;
+  } catch {
+    throw new Error(`wv quality patterns report produced malformed JSON: ${stdout.slice(0, 200)}`);
+  }
+  if (!isValidPatternReportPayload(payload)) {
+    throw new Error(
+      `wv quality patterns report returned an unexpected payload shape: ${stdout.slice(0, 200) || "(empty output)"}`
+    );
+  }
+  return stdout;
 }
 
 function wvHealthJson(timeout: number = WV_TIMEOUT): string {
@@ -468,6 +950,11 @@ const TOOLS: Tool[] = [
           type: "string",
           description: "Risk level for the work (e.g., 'low', 'medium', 'high').",
         },
+        verification_plan: {
+          type: "string",
+          description:
+            "What would count as done, recorded upfront. Surfaced again as a reminder if wv done is later blocked for missing verification.",
+        },
       },
       required: ["text"],
     },
@@ -518,6 +1005,13 @@ const TOOLS: Tool[] = [
           type: "string",
           description:
             "Inline verification evidence (test output, command results). Attach for non-trivial closes — closes without evidence draw a post-close advisory.",
+        },
+        completion_files: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+          description:
+            "Attributed repository-relative files to use as the explicit completion quality scope. Historical file attribution remains unchanged.",
         },
       },
       required: ["id"],
@@ -1533,19 +2027,20 @@ const TOOLS: Tool[] = [
   {
     name: "weave_quality_patterns",
     description:
-      "Run structural pattern matching rules (ast-grep) to find code quality issues. Use 'scan' to run all active rules and store findings; 'list' to show rules with hit counts. Built-in rules: subprocess-shell-true (Python), bare-except-pass (Python), unquoted-variable (Bash). Custom rules in .weave/patterns/*.yaml. Requires ast-grep.",
+      "Run structural and prose quality rules, validate rule definitions, adjudicate stable findings, and report per-rule decided precision and recurring waivers. Scanner results remain unadjudicated evidence until labeled.",
     inputSchema: {
       type: "object",
       properties: {
         subcommand: {
           type: "string",
-          enum: ["scan", "list", "promote"],
+          enum: ["scan", "list", "validate", "adjudicate", "report", "promote"],
           description:
-            "scan: run rules and store findings; list: show rules with hit counts; promote: promote findings as Weave nodes (requires parent)",
+            "scan: run rules; list: show rule receipts (response additively includes scope and shadow_advisories, see below); validate: check every candidate rule file independently and report prose schema coverage; adjudicate: label a stable finding; report: decided precision and recurring waivers, scoped to path; promote: create Weave nodes",
         },
         path: {
           type: "string",
-          description: "Repository root or file to scan (default: current repo root)",
+          description:
+            "For list/validate: the repository ROOT (base for .weave/patterns/ rule lookup) — must be a directory; a file here silently limits results to built-in rules only, since that project's own custom/managed rules are never found (default: current repo root). For scan/report: a scan TARGET within the repo — a single file or a directory (default for scan: current repo root; for report: the last scan's own target). Not applicable to adjudicate/promote.",
         },
         parent: {
           type: "string",
@@ -1554,6 +2049,19 @@ const TOOLS: Tool[] = [
         dry_run: {
           type: "boolean",
           description: "Show what promote would create without creating nodes",
+        },
+        finding_key: {
+          type: "string",
+          description: "Stable qf-* finding key (adjudicate only)",
+        },
+        disposition: {
+          type: "string",
+          enum: ["accepted_defect", "false_positive", "waived", "unresolved"],
+          description: "Human finding disposition (adjudicate only)",
+        },
+        note: {
+          type: "string",
+          description: "Human rationale or waiver reference (adjudicate only)",
         },
       },
       required: ["subcommand"],
@@ -1751,6 +2259,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     const standalone = args.standalone as boolean | undefined;
     const criteria = args.criteria as string | undefined;
     const risks = args.risks as string | undefined;
+    const verificationPlan = args.verification_plan as string | undefined;
     const cmd = ["add", text];
     if (status) cmd.push(`--status=${status}`);
     if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
@@ -1761,6 +2270,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     else if (force) cmd.push("--force");
     if (criteria) cmd.push(`--criteria=${criteria}`);
     if (risks) cmd.push(`--risks=${risks}`);
+    if (verificationPlan) cmd.push(`--verification-plan=${verificationPlan}`);
     result = wv(cmd);
     // Enforcement warnings — suppress --gh nudge for child nodes (only epic needs a GH issue)
     const warnings: string[] = [];
@@ -1793,10 +2303,12 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
 
     const verificationMethod = args.verification_method as string | undefined;
     const verificationEvidence = args.verification_evidence as string | undefined;
+    const completionFiles = args.completion_files as string[] | undefined;
     const cmd = ["done", id];
     if (learning) cmd.push(`--learning=${learning}`);
     if (verificationMethod) cmd.push(`--verification-method=${verificationMethod}`);
     if (verificationEvidence) cmd.push(`--verification-evidence=${verificationEvidence}`);
+    if (completionFiles) cmd.push(`--completion-files=${completionFiles.join(",")}`);
     if (noWarn) cmd.push("--no-warn");
     if (noOverlapCheck) cmd.push("--no-overlap-check");
     if (!MCP_ALLOW_NETWORK) cmd.push("--no-gh");
@@ -2597,17 +3109,43 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   },
 
   weave_quality_patterns: (args) => {
-    let result: string;
     const subcommand = args.subcommand as string;
     const patPath = args.path as string | undefined;
     const patParent = args.parent as string | undefined;
     const patDryRun = args.dry_run as boolean | undefined;
+    const findingKey = args.finding_key as string | undefined;
+    const disposition = args.disposition as string | undefined;
+    const note = args.note as string | undefined;
     const cmd = ["quality", "patterns", subcommand, "--json"];
-    if (patPath) cmd.push(patPath);
-    if (patParent) cmd.push(`--parent=${patParent}`);
-    if (patDryRun) cmd.push("--dry-run");
-    result = wv(cmd, 60_000);
-    return result;
+    // scan/list/validate/report all accept the same optional scope path --
+    // forwarded uncategorically here for parity, exactly as the CLI itself
+    // consumes it for each (wv-6cd72e): no path-handling logic is
+    // reimplemented, only the argument is passed through.
+    if (subcommand === "scan" || subcommand === "list" || subcommand === "validate" || subcommand === "report") {
+      if (patPath) cmd.push(patPath);
+    } else if (subcommand === "adjudicate") {
+      if (!findingKey || !disposition) {
+        throw new Error("weave_quality_patterns adjudicate requires finding_key and disposition");
+      }
+      cmd.push(findingKey, disposition);
+      if (note) cmd.push(`--note=${note}`);
+    } else if (subcommand === "promote") {
+      if (!patParent) {
+        throw new Error("weave_quality_patterns promote requires parent");
+      }
+      cmd.push(`--parent=${patParent}`);
+      if (patDryRun) cmd.push("--dry-run");
+    }
+    if (subcommand === "list") {
+      return wvQualityPatternsList(cmd, patPath);
+    }
+    if (subcommand === "validate") {
+      return wvQualityPatternsValidate(cmd);
+    }
+    if (subcommand === "report") {
+      return wvQualityPatternsReport(cmd);
+    }
+    return wv(cmd, 60_000);
   },
 
   weave_code_search: (args) => {

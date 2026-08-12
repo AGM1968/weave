@@ -1023,10 +1023,15 @@ EOF
     local has_learning
     has_learning=$(echo "$metadata" | jq -r 'if (.decision // .pattern // .pitfall // .learning) then "yes" else "no" end' 2>/dev/null || echo "no")
 
-    # Orphan check
-    local total_edges
+    # Orphan check. wv-cccf70: a node explicitly created with --standalone
+    # already records metadata.standalone=true -- that IS the declaration
+    # that it's meant to have no edges (--parent required when active
+    # epics exist routes here on purpose); warning about the exact state
+    # the flag creates trains the reader to ignore validation hints.
+    local total_edges is_standalone
     total_edges=$(db_query "SELECT COUNT(*) FROM edges WHERE source='$id' OR target='$id';" 2>/dev/null || echo "0")
-    if [ "$total_edges" = "0" ]; then
+    is_standalone=$(echo "$metadata" | jq -r '.standalone // false' 2>/dev/null || echo "false")
+    if [ "$total_edges" = "0" ] && [ "$is_standalone" != "true" ]; then
         [ -n "$warn_items" ] && warn_items="${warn_items},"
         warn_items="${warn_items}\"Orphan node — no edges\""
     fi
@@ -1116,14 +1121,19 @@ validate_on_done() {
     fi
 
     # Check: orphan node (no edges)
-    # Findings are capture-and-park by design — orphan warning is noise for them.
+    # Findings are capture-and-park by design — orphan warning is noise for
+    # them. wv-cccf70: same reasoning extends to a node explicitly created
+    # with --standalone (metadata.standalone=true) -- that flag IS the
+    # declaration that no edges are expected; warning about the exact state
+    # it creates trains the reader to ignore validation hints.
     if [ "$node_type" != "finding" ]; then
-        local edge_count
+        local edge_count is_standalone
         edge_count=$(db_query "
             SELECT COUNT(*) FROM edges
             WHERE source='$id' OR target='$id';
         " 2>/dev/null || echo "0")
-        if [ "$edge_count" = "0" ]; then
+        is_standalone=$(echo "$node_meta" | jq -r '.standalone // false' 2>/dev/null || echo "false")
+        if [ "$edge_count" = "0" ] && [ "$is_standalone" != "true" ]; then
             warnings="${warnings}\n  ⚠ Orphan node — no edges. Consider: wv link $id <parent> --type=implements"
         fi
     fi
@@ -1133,8 +1143,12 @@ validate_on_done() {
     trend_rows=$(db_query "
         SELECT nf.path || '|' || ft.direction
         FROM node_files nf
+        JOIN nodes n ON n.id=nf.node_id
         JOIN file_trend ft ON ft.path = nf.path
-        WHERE nf.node_id='$id' AND ft.direction='deteriorating'
+        WHERE nf.node_id='$id'
+          AND (json_type(n.metadata, '\$.completion_scope.files') IS NULL
+               OR nf.path IN (SELECT value FROM json_each(n.metadata, '\$.completion_scope.files')))
+          AND ft.direction='deteriorating'
         ORDER BY nf.path;
     " 2>/dev/null || true)
     if [ -n "$trend_rows" ]; then
@@ -1624,7 +1638,7 @@ cmd_recover() {
     local pending_nodes=""
     if [ "$journal_found" = false ]; then
         pending_nodes=$(db_query "
-            SELECT id, text, json_extract(metadata, '$.ship_pending') as sp
+            SELECT id
             FROM nodes
             WHERE json_extract(metadata, '$.ship_pending') IS NOT NULL
                 AND json_extract(metadata, '$.ship_pending') = 1;
@@ -1696,13 +1710,13 @@ cmd_recover() {
         # Determine recovery action based on op type and stuck step
         case "$op" in
             ship)
-                _recover_ship "$args" "$pending_action" "$auto_mode"
+                _recover_ship "$args" "$pending_action" "$auto_mode" || return $?
                 ;;
             sync)
-                _recover_sync "$args" "$pending_action" "$auto_mode"
+                _recover_sync "$args" "$pending_action" "$auto_mode" || return $?
                 ;;
             delete)
-                _recover_delete "$args" "$pending_action" "$auto_mode"
+                _recover_delete "$args" "$pending_action" "$auto_mode" || return $?
                 ;;
             *)
                 echo -e "${YELLOW}Unknown operation type: $op${NC}" >&2
@@ -1724,14 +1738,22 @@ cmd_recover() {
     # === ship_pending fallback (reboot recovery) ===
     if [ -n "$pending_nodes" ]; then
         if [ "$json_mode" = true ]; then
-            echo "{\"status\":\"ship_pending\",\"nodes\":$(echo "$pending_nodes" | jq -R -s 'split("\n") | map(select(length > 0) | split("|") | {id: .[0], text: .[1]})')}"
+            local pending_json
+            pending_json=$(db_query_json "SELECT id, text,
+                    COALESCE(json_extract(metadata, '$.ship_pending_mode'), 'legacy') AS mode
+                FROM nodes
+                WHERE json_extract(metadata, '$.ship_pending') = 1;")
+            echo "{\"status\":\"ship_pending\",\"nodes\":$pending_json}"
             return 0
         fi
 
         echo -e "${YELLOW}⚠ Found node(s) with ship_pending marker (likely interrupted by reboot)${NC}"
-        echo "$pending_nodes" | while IFS='|' read -r node_id node_text _; do
+        echo "$pending_nodes" | while read -r node_id; do
             [ -z "$node_id" ] && continue
-            echo "  $node_id: $node_text"
+            local node_text pending_mode
+            node_text=$(db_query "SELECT text FROM nodes WHERE id='$(sql_escape "$node_id")';")
+            pending_mode=$(db_query "SELECT COALESCE(json_extract(metadata, '$.ship_pending_mode'), 'legacy') FROM nodes WHERE id='$(sql_escape "$node_id")';")
+            echo "  $node_id: $node_text ($pending_mode)"
         done
         echo ""
 
@@ -1747,20 +1769,45 @@ cmd_recover() {
         fi
 
         # Recovery: sync local graph state (node is already done, just need to persist)
+        local invalid_pending
+        invalid_pending=$(echo "$pending_nodes" | while read -r node_id; do
+            [ -z "$node_id" ] && continue
+            local pending_status pending_mode
+            pending_status=$(db_query "SELECT status FROM nodes WHERE id='$(sql_escape "$node_id")';" 2>/dev/null)
+            pending_mode=$(db_query "SELECT COALESCE(json_extract(metadata, '$.ship_pending_mode'), 'legacy') FROM nodes WHERE id='$(sql_escape "$node_id")';" 2>/dev/null)
+            if [ "$pending_status" != "done" ] || { [ "$pending_mode" != "post_close" ] && [ "$pending_mode" != "legacy" ]; }; then
+                echo "$node_id($pending_status/$pending_mode)"
+            fi
+        done)
+        if [ -n "$invalid_pending" ]; then
+            echo -e "${RED}Error: contradictory or pre-close ship state; markers preserved: $(echo "$invalid_pending" | tr '\n' ' ')${NC}" >&2
+            return 1
+        fi
         local _recover_prev_skip_sync_commit="${_WV_SKIP_SYNC_COMMIT:-}"
         export _WV_SKIP_SYNC_COMMIT=1
-        cmd_sync 2>/dev/null || true
+        local fallback_sync_rc=0
+        cmd_sync 2>/dev/null || fallback_sync_rc=$?
         if [ -n "$_recover_prev_skip_sync_commit" ]; then
             export _WV_SKIP_SYNC_COMMIT="$_recover_prev_skip_sync_commit"
         else
             unset _WV_SKIP_SYNC_COMMIT
         fi
+        if [ "$fallback_sync_rc" -ne 0 ]; then
+            echo -e "${RED}Error: recovery sync failed; ship_pending markers preserved${NC}" >&2
+            return "$fallback_sync_rc"
+        fi
 
-        # Clear ship_pending markers
-        echo "$pending_nodes" | while IFS='|' read -r node_id _ _; do
+        # Clear each marker durably only after every node is confirmed done.
+        local clear_rc=0
+        while read -r node_id; do
             [ -z "$node_id" ] && continue
-            db_query "UPDATE nodes SET metadata = json_remove(metadata, '$.ship_pending') WHERE id = '$node_id';" 2>/dev/null || true
-        done
+            _ship_clear_pending_durable "$node_id" || clear_rc=$?
+            [ "$clear_rc" -eq 0 ] || break
+        done <<< "$pending_nodes"
+        if [ "$clear_rc" -ne 0 ]; then
+            echo -e "${RED}Error: failed to clear ship_pending marker(s); recovery remains pending${NC}" >&2
+            return "$clear_rc"
+        fi
         echo -e "${GREEN}✓${NC} Recovery complete"
     fi
 
@@ -1825,39 +1872,102 @@ _recover_ship() {
     local auto="$3"
     local id
     id=$(echo "$args" | jq -r '.id // empty')
+    local recover_status recover_mode recover_marker
+    recover_status=$(db_query "SELECT status FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null)
+    recover_mode=$(db_query "SELECT COALESCE(json_extract(metadata, '$.ship_pending_mode'), 'legacy') FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null)
+    recover_marker=$(db_query "SELECT CASE WHEN json_extract(metadata, '$.ship_pending') = 1 THEN 1 ELSE 0 END FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null)
 
     case "$stuck_action" in
-        done)
-            echo "  Recovery: re-run cmd_done + sync"
-            if [ "$auto" != true ]; then
-                echo -n "  Proceed? [Y/n] "
-                read -r answer
-                [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 0
+        persist_intent)
+            if [ "$recover_marker" != "1" ]; then
+                echo "  Recovery: no intent was persisted; safely aborting incomplete ship"
+                return 0
             fi
-            cmd_done "$id" --no-warn 2>/dev/null || true
+            if [ "$recover_status" != "active" ] && [ "$recover_status" != "todo" ]; then
+                echo -e "${RED}Error: contradictory pre-close recovery state ($recover_status/$recover_mode); journal preserved${NC}" >&2
+                return 1
+            fi
+            if [ "$recover_mode" != "pre_close" ]; then
+                echo -e "${RED}Error: contradictory pre-close recovery mode ($recover_status/$recover_mode); journal preserved${NC}" >&2
+                return 1
+            fi
+            if [ "$auto" = true ]; then
+                echo -e "${YELLOW}Recovery stopped before close; run 'wv recover' to abort safely, then re-run ship.${NC}" >&2
+                return 1
+            fi
+            echo -n "  Abort the incomplete pre-close attempt (node remains open)? [y/N] "
+            read -r answer
+            if [ "$answer" != "y" ] && [ "$answer" != "Y" ]; then
+                return 2
+            fi
+            _ship_clear_pending_durable "$id" || return $?
+            recover_marker=0
+            ;;
+        done)
+            if [ "$recover_status" != "done" ] || [ "$recover_marker" != "1" ] || [ "$recover_mode" != "post_close" ]; then
+                echo -e "${RED}Error: close was not durably completed; refusing to manufacture closure ($recover_status/$recover_mode)${NC}" >&2
+                return 1
+            fi
+            echo "  Recovery: close completed atomically; re-run sync"
             local _recover_prev_skip_sync_commit="${_WV_SKIP_SYNC_COMMIT:-}"
+            local _recover_prev_skip_sync_commit_set="${_WV_SKIP_SYNC_COMMIT+x}"
             export _WV_SKIP_SYNC_COMMIT=1
-            cmd_sync 2>/dev/null || true
-            if [ -n "$_recover_prev_skip_sync_commit" ]; then
+            local rc=0
+            cmd_sync || rc=$?
+            if [ "$rc" -ne 0 ]; then
+                if [ -n "$_recover_prev_skip_sync_commit_set" ]; then
+                    export _WV_SKIP_SYNC_COMMIT="$_recover_prev_skip_sync_commit"
+                else
+                    unset _WV_SKIP_SYNC_COMMIT
+                fi
+                return "$rc"
+            fi
+            if [ -n "$_recover_prev_skip_sync_commit_set" ]; then
                 export _WV_SKIP_SYNC_COMMIT="$_recover_prev_skip_sync_commit"
             else
                 unset _WV_SKIP_SYNC_COMMIT
             fi
             ;;
         sync)
+            if [ "$recover_status" != "done" ] || [ "$recover_marker" != "1" ] || { [ "$recover_mode" != "post_close" ] && [ "$recover_mode" != "legacy" ]; }; then
+                echo -e "${RED}Error: contradictory ship sync recovery state ($recover_status/$recover_mode); marker preserved${NC}" >&2
+                return 1
+            fi
             echo "  Recovery: re-run sync"
             if [ "$auto" != true ]; then
                 echo -n "  Proceed? [Y/n] "
                 read -r answer
-                [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 0
+                [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 2
             fi
             local _recover_prev_skip_sync_commit="${_WV_SKIP_SYNC_COMMIT:-}"
+            local _recover_prev_skip_sync_commit_set="${_WV_SKIP_SYNC_COMMIT+x}"
             export _WV_SKIP_SYNC_COMMIT=1
-            cmd_sync 2>/dev/null || true
-            if [ -n "$_recover_prev_skip_sync_commit" ]; then
+            local rc=0
+            cmd_sync || rc=$?
+            if [ "$rc" -ne 0 ]; then
+                if [ -n "$_recover_prev_skip_sync_commit_set" ]; then
+                    export _WV_SKIP_SYNC_COMMIT="$_recover_prev_skip_sync_commit"
+                else
+                    unset _WV_SKIP_SYNC_COMMIT
+                fi
+                return "$rc"
+            fi
+            if [ -n "$_recover_prev_skip_sync_commit_set" ]; then
                 export _WV_SKIP_SYNC_COMMIT="$_recover_prev_skip_sync_commit"
             else
                 unset _WV_SKIP_SYNC_COMMIT
+            fi
+            ;;
+        clear_pending)
+            if [ "$recover_status" != "done" ] || { [ "$recover_marker" = "1" ] && [ "$recover_mode" != "post_close" ] && [ "$recover_mode" != "legacy" ]; }; then
+                echo -e "${RED}Error: contradictory marker-clear recovery state ($recover_status/$recover_mode); journal preserved${NC}" >&2
+                return 1
+            fi
+            echo "  Recovery: durably clear completed ship marker"
+            if [ "$auto" != true ]; then
+                echo -n "  Proceed? [Y/n] "
+                read -r answer
+                [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 2
             fi
             ;;
         git_commit)
@@ -1865,7 +1975,7 @@ _recover_ship() {
             if [ "$auto" != true ]; then
                 echo -n "  Proceed? [Y/n] "
                 read -r answer
-                [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 0
+                [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 2
             fi
             local git_pending_json git_sync_hint
             git_pending_json=$(_detect_git_pending 2>/dev/null || echo '{}')
@@ -1877,17 +1987,23 @@ _recover_ship() {
             if [ "$auto" != true ]; then
                 echo -n "  Proceed? [Y/n] "
                 read -r answer
-                [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 0
+                [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 2
             fi
             local git_pending_json git_sync_hint
             git_pending_json=$(_detect_git_pending 2>/dev/null || echo '{}')
             git_sync_hint=$(echo "$git_pending_json" | jq -r '.hint // "no action required"' 2>/dev/null || echo "no action required")
             echo "  Hint: $git_sync_hint"
             ;;
+        *)
+            echo -e "${RED}Error: unsupported ship recovery action '$stuck_action'; journal preserved${NC}" >&2
+            return 1
+            ;;
     esac
 
-    # Clear ship_pending if present
-    [ -n "$id" ] && db_query "UPDATE nodes SET metadata = json_remove(metadata, '$.ship_pending') WHERE id = '$id';" 2>/dev/null || true
+    # Clear ship_pending durably before the recovered journal can complete.
+    if [ -n "$id" ] && [ "$recover_marker" = "1" ]; then
+        _ship_clear_pending_durable "$id" || return $?
+    fi
     echo -e "${GREEN}✓${NC} Recovery complete"
 }
 
@@ -1906,12 +2022,16 @@ _recover_sync() {
         git_commit)
             echo "  Recovery: re-run git commit"
             ;;
+        *)
+            echo -e "${RED}Error: unsupported sync recovery action '$stuck_action'; journal preserved${NC}" >&2
+            return 1
+            ;;
     esac
 
     if [ "$auto" != true ]; then
         echo -n "  Proceed? [Y/n] "
         read -r answer
-        [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 0
+        [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 2
     fi
 
     local gh_flag
@@ -1919,9 +2039,9 @@ _recover_sync() {
     if [ "$gh_flag" = "true" ]; then
         # Phase D: prefer --mode=repair so an interrupted sync resumes from
         # its checkpoint instead of redoing the entire walk.
-        cmd_sync --gh --mode=repair 2>/dev/null || true
+        cmd_sync --gh --mode=repair || return $?
     else
-        cmd_sync 2>/dev/null || true
+        cmd_sync || return $?
     fi
     echo -e "${GREEN}✓${NC} Recovery complete"
 }
@@ -1930,28 +2050,39 @@ _recover_delete() {
     local args="$1"
     local stuck_action="$2"
     local auto="$3"
-    local gh_issue
+    local gh_issue id
     gh_issue=$(echo "$args" | jq -r '.gh_issue // empty')
+    id=$(echo "$args" | jq -r '.id // empty')
 
-    if [ "$stuck_action" = "gh_close" ] && [ -n "$gh_issue" ]; then
-        echo "  Recovery: close GitHub issue #$gh_issue"
-        if [ "$auto" != true ]; then
-            echo -n "  Proceed? [Y/n] "
-            read -r answer
-            [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 0
-        fi
-        if command -v gh >/dev/null 2>&1; then
+    case "$stuck_action" in
+        sqlite_delete)
+            [ -n "$id" ] || return 1
+            if [ "$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null)" != "0" ]; then
+                echo "  SQLite delete was not completed; re-run wv delete manually."
+                return 1
+            fi
+            echo "  SQLite delete is confirmed complete."
+            ;;
+        gh_close)
+            [ -n "$gh_issue" ] || { echo -e "${RED}Error: missing GitHub issue for delete recovery${NC}" >&2; return 1; }
+            echo "  Recovery: close GitHub issue #$gh_issue"
+            if [ "$auto" != true ]; then
+                echo -n "  Proceed? [Y/n] "
+                read -r answer
+                [ "$answer" = "n" ] || [ "$answer" = "N" ] && return 2
+            fi
+            command -v gh >/dev/null 2>&1 || return 1
             local repo
             repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
-            if [ -n "$repo" ]; then
-                gh issue close "$gh_issue" --repo "$repo" 2>/dev/null && \
-                    echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_issue" >&2 || \
-                    echo -e "${YELLOW}Warning: Could not close issue${NC}" >&2
-            fi
-        fi
-    else
-        echo "  SQLite delete already completed. No further recovery needed."
-    fi
+            [ -n "$repo" ] || return 1
+            gh issue close "$gh_issue" --repo "$repo" >/dev/null || return $?
+            echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_issue" >&2
+            ;;
+        *)
+            echo -e "${RED}Error: unsupported delete recovery action '$stuck_action'; journal preserved${NC}" >&2
+            return 1
+            ;;
+    esac
     echo -e "${GREEN}✓${NC} Recovery complete"
 }
 
@@ -3044,6 +3175,20 @@ cmd_doctor() {
         shift
     done
 
+    if [ "$_dr_repair" = "true" ]; then
+        local _dr_repo_root _dr_persistent_root
+        _dr_repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+        wv_repository_require_owned "$_dr_repo_root" "wv doctor --repair" || return 1
+        if [ -n "${WEAVE_DIR:-}" ]; then
+            _dr_persistent_root=$(dirname "$WEAVE_DIR")
+            if [ -L "$WEAVE_DIR" ]; then
+                echo "wv: refusing wv doctor --repair through symlinked Weave directory: $WEAVE_DIR" >&2
+                return 1
+            fi
+            wv_repository_require_owned "$_dr_persistent_root" "wv doctor --repair" || return 1
+        fi
+    fi
+
     _dr_pass=0 _dr_fail=0 _dr_warn=0 _dr_total=0 _dr_results=""
 
     [ "$_dr_format" = "text" ] && echo "Weave Doctor — Installation Health"
@@ -3203,9 +3348,57 @@ cmd_doctor() {
         fi
     fi
 
+    # 10c. FTS5 learning-index integrity (wv-ddb359: nodes_learning_fts is a
+    # separate FTS5 table from nodes_fts, checked in 10b -- a corruption
+    # confined to it is otherwise invisible to both PRAGMA integrity_check
+    # and 10b's nodes_fts-only check. Repair is DROP + recreate, not
+    # 'rebuild': nodes_learning_fts owns its content in its own shadow
+    # table (unlike nodes_fts's content=nodes), so 'rebuild' would only
+    # re-derive the index FROM that shadow table and preserve any
+    # corruption living there. See db_reindex_fts5.
+    if [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ]; then
+        local learning_fts5_available
+        learning_fts5_available=$(sqlite3 "$WV_DB" \
+            "SELECT sqlite_compileoption_used('ENABLE_FTS5');" 2>/dev/null || echo "0")
+        if [ "$learning_fts5_available" = "1" ]; then
+            local learning_table_exists learning_fts_ok
+            learning_table_exists=$(sqlite3 "$WV_DB" \
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='nodes_learning_fts';" 2>/dev/null)
+            if [ "$learning_table_exists" = "1" ]; then
+                learning_fts_ok=$(sqlite3 "$WV_DB" \
+                    "INSERT INTO nodes_learning_fts(nodes_learning_fts) VALUES('integrity-check');" 2>&1)
+            else
+                # A missing table is itself the failure signal here (db_ensure
+                # keeps it present via db_migrate_fts5_learning's CREATE IF NOT
+                # EXISTS) -- not a reason to skip the check, or the exact
+                # dropped-table corruption class this check exists for goes
+                # undetected.
+                learning_fts_ok="missing: nodes_learning_fts table does not exist"
+            fi
+            if [ -z "$learning_fts_ok" ]; then
+                _doctor_record "FTS5 learning index" "pass" "integrity OK"
+            else
+                if [ "$_dr_repair" = "true" ]; then
+                    sqlite3 "$WV_DB" "DROP TABLE IF EXISTS nodes_learning_fts;" 2>/dev/null
+                    db_migrate_fts5_learning
+                    local learning_recheck
+                    learning_recheck=$(sqlite3 "$WV_DB" \
+                        "INSERT INTO nodes_learning_fts(nodes_learning_fts) VALUES('integrity-check');" 2>&1)
+                    if [ -z "$learning_recheck" ]; then
+                        _doctor_record "FTS5 learning index" "pass" "repaired (dropped + rebuilt)"
+                    else
+                        _doctor_record "FTS5 learning index" "fail" "repair failed — manual: wv reindex"
+                    fi
+                else
+                    _doctor_record "FTS5 learning index" "fail" "corrupt or missing — run: wv doctor --repair"
+                fi
+            fi
+        fi
+    fi
+
     # 11-12. Module checks
     _doctor_check_modules "lib modules" "$WV_LIB_DIR/lib" \
-        "wv-config.sh wv-db.sh wv-validate.sh wv-cache.sh wv-journal.sh wv-gh.sh wv-delta.sh wv-delta-catalog.sh wv-checkpoint-generation.sh wv-hook-common.sh wv-resolve-project.sh"
+        "wv-config.sh wv-db.sh wv-validate.sh wv-cache.sh wv-journal.sh wv-gh.sh wv-delta.sh wv-delta-catalog.sh wv-checkpoint-generation.sh wv-repository-class.sh wv-hook-common.sh wv-resolve-project.sh"
     _doctor_check_modules "cmd modules" "$WV_LIB_DIR/cmd" \
         "wv-cmd-core.sh wv-cmd-graph.sh wv-cmd-data.sh wv-cmd-ops.sh wv-cmd-quality.sh"
 
@@ -3284,6 +3477,144 @@ cmd_doctor() {
     # 14a-bis. Duplicate-authoritative-memory risk: durable Claude/Codex harness
     # memory for this repo not represented in the graph (S5, generalized F1).
     _doctor_memory_authority
+
+    # 14a-ter. Managed pattern-rule shadow advisory: mirrors 'wv quality
+    # patterns list' own warning (a project-local custom rule sharing a
+    # managed rule's id, silently never applied -- see
+    # scripts/weave_quality/__main__.py's _shadowed_managed_pattern_ids)
+    # without re-deriving the detection logic here (wv-3a0a40) -- invokes
+    # the SAME Python entry point patterns list itself uses
+    # (_wv_quality_python, sourced from wv-cmd-quality.sh) and captures
+    # its own stderr, where that command already prints the warning
+    # unconditionally in both --json and text mode. Gated on the
+    # .overridden marker file's own existence first (cheap short-circuit
+    # -- _shadowed_managed_pattern_ids returns immediately without it
+    # too, but this also skips the rule-load work entirely on a repo with
+    # no managed-pattern reconcile history at all). Advisory only.
+    if [ -f "${WEAVE_DIR:-}/patterns/managed/.overridden" ]; then
+        local -a _shadow_py_args=()
+        [ -n "$WV_HOT_ZONE" ] && _shadow_py_args+=("--hot-zone" "$WV_HOT_ZONE")
+        _shadow_py_args+=("patterns" "list" "--json")
+        # Capture ONLY stderr (2>&1 duplicates fd2 into the command-
+        # substitution's own capture pipe BEFORE >/dev/null retargets fd1
+        # away from it -- no external pipe to grep involved, so $? below
+        # is _wv_quality_python's own exit status, not a pipeline tail's
+        # (see feedback_pipe_masks_exit_code) -- capturing an unpiped
+        # status is exactly why this doesn't reuse the piped form the
+        # first version of this check had.
+        local _shadow_stderr
+        _shadow_stderr=$(_wv_quality_python "${_shadow_py_args[@]}" 2>&1 >/dev/null)
+        local _shadow_status=$?
+        if [ "$_shadow_status" -ne 0 ]; then
+            # wv-92ca0e: a failed delegate means shadowing was never
+            # actually evaluated -- never report pass for an unevaluated
+            # check (e.g. a malformed local rule breaks patterns list
+            # entirely, well before it would even reach shadow detection).
+            _doctor_record "pattern-shadow" "warn" "could not evaluate managed-rule shadowing -- 'wv quality patterns list' failed (exit $_shadow_status); run it directly for detail"
+        elif echo "$_shadow_stderr" | grep -q "shadows an available"; then
+            local _shadow_count
+            _shadow_count=$(echo "$_shadow_stderr" | grep -c "shadows an available")
+            _doctor_record "pattern-shadow" "warn" "$_shadow_count managed rule(s) shadowed by a local copy — run 'wv quality patterns list' for detail"
+        else
+            _doctor_record "pattern-shadow" "pass" "no managed-rule shadowing detected"
+        fi
+    fi
+
+    # 14a-ter-bis. Managed pattern-rule completeness (wv-8d16bd, external
+    # code review round 3 re-audit): a manifest id whose file exists in
+    # NEITHER tier (managed/ nor the project-local override) is not
+    # shadowed, it is MISSING -- exactly the state left behind by deleting
+    # a shadowing local copy without rerunning 'wv init-repo --update'
+    # afterward (24 rules -> 23 in the reported audit). The pattern-shadow
+    # check above only re-derives cmd_patterns_list's OWN warning, which
+    # stops firing entirely once the id drops out of active_ids -- it
+    # would report a false "pass" for a rule that quietly vanished.
+    # Checked against the union of .overridden (shadowed ids) and
+    # .manifest (currently-synced ids) -- every id either reconcile has
+    # ever placed or knowingly skipped; both already store the bare
+    # "<id>.yaml" filename.
+    if [ -f "${WEAVE_DIR:-}/patterns/managed/.overridden" ] || [ -f "${WEAVE_DIR:-}/patterns/managed/.manifest" ]; then
+        local _mc_missing="" _mc_id
+        while IFS= read -r _mc_id; do
+            [ -z "$_mc_id" ] && continue
+            if [ ! -f "${WEAVE_DIR:-}/patterns/managed/$_mc_id" ] && [ ! -f "${WEAVE_DIR:-}/patterns/$_mc_id" ]; then
+                _mc_missing="${_mc_missing:+$_mc_missing, }${_mc_id%.yaml}"
+            fi
+        done < <(cat "${WEAVE_DIR:-}/patterns/managed/.overridden" "${WEAVE_DIR:-}/patterns/managed/.manifest" 2>/dev/null | sort -u)
+        if [ -n "$_mc_missing" ]; then
+            _doctor_record "managed-pattern-completeness" "warn" "manifest id(s) missing from BOTH the managed and custom tiers (deleted without a resync?): $_mc_missing — run 'wv init-repo --update'"
+        else
+            _doctor_record "managed-pattern-completeness" "pass" "every known managed-pattern id resolves in one tier"
+        fi
+    fi
+
+    # 14a-quinquies. Closed-node uncommitted dirt attribution (wv-e48993):
+    # pre-close-verification.sh now scopes its blocking check to the closing
+    # node's OWN touched_files, so genuinely foreign dirt no longer blocks
+    # `wv done` (and is no longer misattributed under the wrong node's
+    # Weave-ID). That fixed the false-block/misattribution bug, but it also
+    # means a session can close every node it owns and still leave real work
+    # uncommitted with nothing reporting it afterward -- this check closes
+    # that gap. Advisory only; attributes current non-.weave dirt to the
+    # most recently closed node whose touched_files overlaps it, when one
+    # exists.
+    local _cd_dirty
+    _cd_dirty=$(
+        {
+            git diff --name-only 2>/dev/null
+            git diff --cached --name-only 2>/dev/null
+            git ls-files --others --exclude-standard 2>/dev/null
+        } | sort -u | grep -v '^$' \
+          | grep -v '^\.weave/' \
+          | grep -v '^\.claude/hooks/' \
+          | grep -v '^\.claude/skills/' \
+          | grep -v '^\.claude/agents/' || true
+    )
+    if [ -z "$_cd_dirty" ]; then
+        _doctor_record "closed-node-dirt" "pass" "no uncommitted non-.weave files"
+    else
+        local _cd_count _cd_active_owned _cd_remainder _cd_remainder_count
+        local _cd_done_owned _cd_done_remainder _cd_unattributed
+        _cd_count=$(echo "$_cd_dirty" | grep -c .)
+        # wv-822bea/wv-950080 (distribution re-audit): the prior "stop at the
+        # first candidate node whose touched_files overlaps ANY dirty path"
+        # logic false-passed a mixed dirty set (e.g. one file explained by an
+        # active node, a second file that is genuinely done-owned or
+        # unattributed) as soon as the active node matched, without ever
+        # looking at whether it explained the REST of the dirt. It also used
+        # `grep -Ff` (substring) rather than exact path equality, so
+        # ownership of "foo" could wrongly explain "foo.txt". Fixed: build
+        # the full set of paths owned by ANY currently-active node (union of
+        # the uncapped node_files table and the capped metadata.touched_files
+        # display copy, exact-line matched via comm), subtract that from the
+        # dirty set, and only classify what's LEFT — never short-circuit on
+        # the first match.
+        _cd_active_owned=$(db_query "
+            SELECT nf.path FROM node_files nf JOIN nodes n ON n.id = nf.node_id WHERE n.status='active'
+            UNION
+            SELECT je.value FROM nodes n, json_each(COALESCE(json_extract(n.metadata,'\$.touched_files'), '[]')) je WHERE n.status='active';
+        " 2>/dev/null | sort -u)
+        _cd_remainder=$(comm -23 <(printf '%s\n' "$_cd_dirty" | sort -u) <(printf '%s\n' "$_cd_active_owned" | sort -u))
+        if [ -z "$_cd_remainder" ]; then
+            _doctor_record "closed-node-dirt" "pass" "all $_cd_count uncommitted non-.weave file(s) explained by currently active node(s) own work"
+        else
+            _cd_remainder_count=$(echo "$_cd_remainder" | grep -c .)
+            _cd_done_owned=$(db_query "
+                SELECT nf.path FROM node_files nf JOIN nodes n ON n.id = nf.node_id WHERE n.status='done'
+                UNION
+                SELECT je.value FROM nodes n, json_each(COALESCE(json_extract(n.metadata,'\$.touched_files'), '[]')) je WHERE n.status='done';
+            " 2>/dev/null | sort -u)
+            _cd_done_remainder=$(comm -12 <(printf '%s\n' "$_cd_remainder" | sort -u) <(printf '%s\n' "$_cd_done_owned" | sort -u))
+            _cd_unattributed=$(comm -23 <(printf '%s\n' "$_cd_remainder" | sort -u) <(printf '%s\n' "$_cd_done_owned" | sort -u))
+            if [ -n "$_cd_done_remainder" ] && [ -n "$_cd_unattributed" ]; then
+                _doctor_record "closed-node-dirt" "warn" "$_cd_remainder_count non-.weave file(s) uncommitted beyond any active node's own work: $(echo "$_cd_done_remainder" | grep -c .) likely from already-closed node(s) (touched_files/node_files overlap), $(echo "$_cd_unattributed" | grep -c .) with no clear owner — commit or discard"
+            elif [ -n "$_cd_done_remainder" ]; then
+                _doctor_record "closed-node-dirt" "warn" "$_cd_remainder_count non-.weave file(s) still uncommitted beyond any active node's own work, likely from already-closed node(s) (touched_files/node_files overlap) — commit or discard"
+            else
+                _doctor_record "closed-node-dirt" "warn" "$_cd_remainder_count non-.weave file(s) still uncommitted with no clear owner among active/done nodes — commit or discard"
+            fi
+        fi
+    fi
 
     # 14b. Explicit git-state pending windows (.weave dirty / ahead of upstream)
     local git_pending_json git_sync_pending git_sync_state git_sync_action git_sync_reason git_sync_hint
@@ -5953,7 +6284,7 @@ cmd_help_topic() {
             print_command_help "wv init [--force]" "Initialize the Weave database in the current hot zone, recovering synced state when available."
             ;;
         add)
-            print_command_help "wv add <text> [--status=STATUS] [--parent=<id>] [--gh] [--alias=<name>] [--metadata=<json>] [--force] [--standalone] [--criteria=<text>] [--risks=<level>]" "Create a node and print its id. Use --parent when an active epic exists, or --standalone for repo-level chores."
+            print_command_help "wv add <text> [--status=STATUS] [--parent=<id>] [--gh] [--alias=<name>] [--metadata=<json>] [--force] [--standalone] [--criteria=<text>] [--risks=<level>] [--verification-plan=<text>]" "Create a node and print its id. Use --parent when an active epic exists, or --standalone for repo-level chores. --verification-plan records upfront what would count as done, surfaced again as a reminder if wv done is later blocked for missing verification."
             ;;
         remember)
             print_command_help "wv remember <text> [--kind=project] [--scope=repo] [--source-agent=name] [--json]" "Capture a graph-native memory node using metadata.type=memory and metadata.mem_status=active."
@@ -5965,7 +6296,7 @@ cmd_help_topic() {
             print_command_help "wv delete <id> [--force] [--dry-run] [--no-gh]" "Delete a node and its edges. Use --dry-run to preview deletions and --force to execute them."
             ;;
         done)
-            print_command_help "wv done <id> [--learning=\"...\"|--learning-file=PATH] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--verification-method=\"...\"] [--verification-evidence=\"...\"|--verification-evidence-file=PATH] [--no-warn] [--acknowledge-overlap] [--skip-verification] [--no-overlap-check] [--no-gh]" "Close a node and optionally store structured learnings or bypass flags when policy allows it."
+            print_command_help "wv done <id> [--completion-files=path,...] [--learning=\"...\"|--learning-file=PATH] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--verification-method=\"...\"] [--verification-evidence=\"...\"|--verification-evidence-file=PATH] [--no-warn] [--acknowledge-overlap] [--skip-verification] [--no-overlap-check] [--no-gh]" "Close a node; an explicit completion-files scope audits quality against attributed selected files while preserving file history."
             ;;
         ship)
             print_command_help "wv ship <id> [--learning=\"...\"|--learning-file=PATH] [--verification-method=\"...\"] [--verification-evidence=\"...\"|--verification-evidence-file=PATH] [--decision=\"...\"] [--pattern=\"...\"] [--pitfall=\"...\"] [--gh] [--skip-verification] [--no-overlap-check]" "Close a node and sync graph state in one step; any remaining Git sync is surfaced separately."
@@ -6087,6 +6418,9 @@ SEARCHHELP
             ;;
         doctor)
             print_command_help "wv doctor [--json] [--repair] [--agent]" "Run installation and surface-contract diagnostics for the CLI, hooks, and repo wiring. --agent adds python, pytest, import-path, and provenance checks for agent flows."
+            ;;
+        repo-class)
+            print_command_help "wv repo-class [--json] [--offline] | wv repo-class set owned|vendored-upstream [--acknowledge-upstream-fork] | wv repo-class audit [--json] [--offline]" "Inspect or persist clone-local repository ownership classification, or audit tracked and historical Weave scaffolding without mutation."
             ;;
         self-update)
             print_command_help "wv self-update" "Refresh installed wv from the dev clone recorded at install time. Equivalent to re-running install.sh from the source directory."
@@ -6213,7 +6547,8 @@ Commands:
   audit-pitfalls    Show all pitfalls with resolution status
   pattern-audit     Audit source for recurring bug-pattern invariants [--json] [--strict]
   edge-types        List valid semantic edge types [--stats] [--json]
-  init-repo         Bootstrap repo for Weave [--agent=claude|copilot|codex|all] [--codex-hooks] [--update] [--force]
+  repo-class        Inspect/set clone-local owned vs vendored-upstream classification; audit scaffolding exposure
+  init-repo         Bootstrap owned repo for Weave [--agent=claude|copilot|codex|all] [--codex-hooks] [--update] [--force]
   self-update       Refresh installed wv from the dev clone recorded at install time
   uninstall         Remove installed wv files (delegates to install.sh --uninstall)
   doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]
@@ -6316,6 +6651,65 @@ Examples:
   wv init-repo --update                       # refresh managed files (skills, agents, instructions)
   wv init-repo --force                        # overwrite ALL files including user-customized
 EOF
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_repo_class — Clone-local repository ownership boundary and exposure audit
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_repo_class() {
+    local action="show" format="text" offline=0 acknowledge=0 class="" repo
+    repo=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            show|audit) action="$1" ;;
+            set)
+                action="set"
+                shift
+                class="${1:-}"
+                ;;
+            --json) format="json" ;;
+            --offline) offline=1 ;;
+            --acknowledge-upstream-fork) acknowledge=1 ;;
+            --help|-h)
+                cmd_help repo-class
+                return 0
+                ;;
+            *) echo "wv repo-class: unknown argument: $1" >&2; return 2 ;;
+        esac
+        shift
+    done
+
+    if [ "$action" = "set" ]; then
+        [ -n "$class" ] || { echo "wv repo-class set requires owned or vendored-upstream" >&2; return 2; }
+        wv_repository_class_set "$repo" "$class" "$acknowledge" || return $?
+    fi
+
+    local result rc=0
+    if [ "$action" = "audit" ]; then
+        result=$(wv_repository_audit_json "$repo" "$offline") || rc=$?
+    else
+        result=$(wv_repository_class_json "$repo" "$offline")
+    fi
+    if [ "$format" = "json" ]; then
+        printf '%s\n' "$result"
+    elif [ "$action" = "audit" ]; then
+        printf 'Repository class: %s (%s)\n' "$(jq -r '.class' <<< "$result")" "$(jq -r '.reason' <<< "$result")"
+        case "$(jq -r '.exposure_state' <<< "$result")" in
+            clean) printf 'Scaffolding audit: clean\n' ;;
+            residue_only) printf 'Scaffolding audit: PASS (unreachable residue; pruning optional)\n' ;;
+            *) printf 'Scaffolding audit: REMEDIATION REQUIRED\n' ;;
+        esac
+        if [ "$(jq -r '.remediation_required' <<< "$result")" = true ]; then
+            jq -r '(.current_exposure.tracked_paths[] | "  tracked: \(.)"), (.current_exposure.marker_paths[] | "  marker: \(.)"), (.reachable_exposure.history_commits[] | "  reachable history: \(.)")' <<< "$result"
+        elif [ "$(jq -r '.exposure_state' <<< "$result")" = residue_only ]; then
+            jq -r '.residue.commits[] | "  unreachable residue: \(.)"' <<< "$result"
+        fi
+    else
+        printf 'Repository class: %s\n' "$(jq -r '.class' <<< "$result")"
+        printf 'Source: %s\n' "$(jq -r '.source' <<< "$result")"
+        printf 'Reason: %s\n' "$(jq -r '.reason' <<< "$result")"
+    fi
+    return "$rc"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

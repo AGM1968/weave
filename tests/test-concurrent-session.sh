@@ -45,8 +45,10 @@ source "$PROJECT_ROOT/scripts/lib/wv-config.sh"
 TEST_DIR="/tmp/wv-concurrent-session-test-$$"
 mkdir -p "$TEST_DIR/repo" "$TEST_DIR/fake-bin"
 git -C "$TEST_DIR/repo" init -q
+UNRELATED_PID=""
 FAKE_PID=""
 cleanup() {
+    [ -z "$UNRELATED_PID" ] || kill "$UNRELATED_PID" 2>/dev/null || true
     [ -z "$FAKE_PID" ] || kill "$FAKE_PID" 2>/dev/null || true
     rm -rf "$TEST_DIR"
 }
@@ -64,7 +66,8 @@ else
 fi
 
 # ── Unrelated process with a cwd inside the repo (not agent-named) must not match ──
-(cd "$TEST_DIR/repo" && sleep 30 &)
+(cd "$TEST_DIR/repo" && exec sleep 30) &
+UNRELATED_PID=$!
 sleep 0.3
 _result=""
 if _result=$(_wv_concurrent_session "$TEST_DIR/repo"); then
@@ -72,14 +75,16 @@ if _result=$(_wv_concurrent_session "$TEST_DIR/repo"); then
 else
     check "unrelated (non-agent-named) process in repo cwd does not trigger an advisory" true
 fi
-pkill -f "sleep 30" 2>/dev/null || true
+kill "$UNRELATED_PID" 2>/dev/null || true
+wait "$UNRELATED_PID" 2>/dev/null || true
+UNRELATED_PID=""
 sleep 0.2
 
 # ── A process named like an agent CLI, with a cwd inside the repo, must match ──
 cp /bin/sleep "$TEST_DIR/fake-bin/codex"
-(cd "$TEST_DIR/repo" && "$TEST_DIR/fake-bin/codex" 30 &)
+(cd "$TEST_DIR/repo" && exec "$TEST_DIR/fake-bin/codex" 30) &
+FAKE_PID=$!
 sleep 0.3
-FAKE_PID=$(pgrep -f "$TEST_DIR/fake-bin/codex" | head -1)
 _result=""
 if _result=$(_wv_concurrent_session "$TEST_DIR/repo"); then
     check "agent-named process with a cwd inside the repo triggers an advisory" true
@@ -89,11 +94,12 @@ fi
 check "advisory names the offending pid" bash -c '[[ "$1" == *"$2"* ]]' _ "$_result" "$FAKE_PID"
 check "advisory references wv-fa566a for traceability" bash -c '[[ "$1" == *"wv-fa566a"* ]]' _ "$_result"
 kill "$FAKE_PID" 2>/dev/null || true
+wait "$FAKE_PID" 2>/dev/null || true
 FAKE_PID=""
 
 # ── Own process tree (ancestor chain) must never self-flag ──
 _self_result=""
-if _self_result=$(_wv_concurrent_session "$PROJECT_ROOT"); then
+if _self_result=$(cd "$TEST_DIR/repo" && _wv_concurrent_session "$TEST_DIR/repo"); then
     check "does not self-flag the caller's own ancestor chain" false
 else
     check "does not self-flag the caller's own ancestor chain" true

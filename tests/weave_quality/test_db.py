@@ -1,6 +1,6 @@
 """Tests for weave_quality.db schema, lifecycle, and staleness."""
 
-# pylint: disable=missing-class-docstring,missing-function-docstring,redefined-outer-name,unused-argument
+# pylint: disable=missing-class-docstring,missing-function-docstring,redefined-outer-name,unused-argument,too-many-lines
 
 from __future__ import annotations
 
@@ -11,6 +11,11 @@ from pathlib import Path
 import pytest
 
 from weave_quality.db import (
+    ADJUDICATION_NUDGE_SCANS,
+    _MAX_PATTERN_RUNS,
+    PatternMigrationConflictError,
+    adjudicate_pattern_finding,
+    begin_pattern_run,
     begin_scan,
     bulk_insert_pattern_findings,
     bulk_upsert_co_changes,
@@ -19,6 +24,7 @@ from weave_quality.db import (
     bulk_upsert_function_cc,
     bulk_upsert_git_stats,
     file_changed,
+    finish_pattern_run,
     finish_scan,
     get_ck_metrics,
     get_co_changes,
@@ -31,9 +37,15 @@ from weave_quality.db import (
     compute_trend_direction,
     get_all_trend_directions,
     latest_scan,
+    pattern_adjudication_report,
+    pattern_finding_states,
     pattern_findings_summary,
+    pattern_rule_runs,
     previous_scan,
     query_pattern_findings,
+    record_pattern_rule_failure,
+    record_pattern_rule_success,
+    replace_pattern_scan_results,
     staleness_info,
     top_hotspots,
     upsert_ck_metrics,
@@ -948,7 +960,7 @@ class TestSchemaV6:
         assert "pattern_findings" in tables
 
     def test_bulk_insert_and_query(self, db: sqlite3.Connection) -> None:
-        sid = begin_scan(db, "abc")
+        sid = begin_pattern_run(db, "abc", ".")
         findings = [
             PatternFinding(path="a.py", scan_id=sid, rule_id="bare-except-pass",
                            line=10, col=0, match_text="except: pass", severity="warning"),
@@ -963,7 +975,7 @@ class TestSchemaV6:
         assert "a.py" in paths and "b.py" in paths
 
     def test_bulk_insert_replaces_existing_scan_findings(self, db: sqlite3.Connection) -> None:
-        sid = begin_scan(db, "abc")
+        sid = begin_pattern_run(db, "abc", ".")
         bulk_insert_pattern_findings(
             db,
             [
@@ -983,7 +995,7 @@ class TestSchemaV6:
         ]
 
     def test_query_filter_by_rule(self, db: sqlite3.Connection) -> None:
-        sid = begin_scan(db, "abc")
+        sid = begin_pattern_run(db, "abc", ".")
         findings = [
             PatternFinding(path="a.py", scan_id=sid, rule_id="rule-A", line=1),
             PatternFinding(path="b.py", scan_id=sid, rule_id="rule-B", line=2),
@@ -995,7 +1007,7 @@ class TestSchemaV6:
         assert rows[0]["rule_id"] == "rule-A"
 
     def test_summary_groups_by_rule(self, db: sqlite3.Connection) -> None:
-        sid = begin_scan(db, "abc")
+        sid = begin_pattern_run(db, "abc", ".")
         findings = [
             PatternFinding(path="a.py", scan_id=sid, rule_id="rule-A", line=1),
             PatternFinding(path="b.py", scan_id=sid, rule_id="rule-A", line=2),
@@ -1030,22 +1042,28 @@ class TestSchemaV6:
         assert "pattern_findings" in tables
 
     def test_retention_prunes_pattern_findings(self, db: sqlite3.Connection) -> None:
-        sid1 = begin_scan(db, "aaa")
+        # pattern_findings is keyed off pattern_runs(id), independent of
+        # scan_meta -- an unrelated complexity scan must not touch it.
+        sid1 = begin_pattern_run(db, "aaa", ".")
         bulk_insert_pattern_findings(db, [
             PatternFinding(path="a.py", scan_id=sid1, rule_id="r", line=1)
         ])
         db.commit()
-        sid2 = begin_scan(db, "bbb")
-        bulk_insert_pattern_findings(db, [
-            PatternFinding(path="b.py", scan_id=sid2, rule_id="r", line=2)
-        ])
+        begin_scan(db, "unrelated-complexity-scan")
         db.commit()
-        # begin_scan for a 3rd scan prunes pattern_findings at _FILES_SCANS=2
-        begin_scan(db, "ccc")
-        db.commit()
-        remaining = db.execute("SELECT scan_id FROM pattern_findings").fetchall()
-        scan_ids = {r[0] for r in remaining}
-        assert sid1 not in scan_ids
+        remaining = {r[0] for r in db.execute("SELECT scan_id FROM pattern_findings").fetchall()}
+        assert sid1 in remaining
+
+        # pattern_runs has its own retention window (_MAX_PATTERN_RUNS=5),
+        # decoupled from scan_meta's _MAX_SCANS/_FILES_SCANS.
+        for i in range(5):
+            run_id = begin_pattern_run(db, f"head{i}", ".")
+            bulk_insert_pattern_findings(db, [
+                PatternFinding(path=f"{i}.py", scan_id=run_id, rule_id="r", line=1)
+            ])
+            db.commit()
+        remaining = {r[0] for r in db.execute("SELECT scan_id FROM pattern_findings").fetchall()}
+        assert sid1 not in remaining
 
 
 class TestSchemaV7:
@@ -1057,6 +1075,71 @@ class TestSchemaV7:
         sid = begin_scan(db, "abc", ts_cc_backend="ast-grep")
         row = db.execute("SELECT ts_cc_backend FROM scan_meta WHERE id=?", (sid,)).fetchone()
         assert row[0] == "ast-grep"
+
+
+class TestSchemaV8:
+    def test_pattern_rule_receipts_distinguish_success_and_failure(
+        self, db: sqlite3.Connection
+    ) -> None:
+        sid = begin_pattern_run(db, "abc", ".")
+        replace_pattern_scan_results(
+            db,
+            sid,
+            [],
+            [
+                {
+                    "rule_id": "zero-hit",
+                    "definition_hash": "abc123",
+                    "rule_path": "/rules/zero-hit.yaml",
+                    "target": "/repo/docs",
+                    "hits": 0,
+                    "ran_at": "2026-07-29T12:00:00",
+                }
+            ],
+        )
+        receipt = pattern_rule_runs(db, sid)[0]
+        assert receipt["status"] == "success"
+        assert receipt["hits"] == 0
+
+        record_pattern_rule_failure(
+            db,
+            sid,
+            "zero-hit",
+            "def456",
+            "/rules/zero-hit.yaml",
+            "/repo/docs",
+            "backend failed",
+        )
+        receipt = pattern_rule_runs(db, sid)[0]
+        assert receipt["status"] == "failed"
+        assert receipt["hits"] is None
+        assert receipt["error"] == "backend failed"
+
+    def test_record_pattern_rule_success_is_durable_before_the_scan_finishes(
+        self, db: sqlite3.Connection
+    ) -> None:
+        """record_pattern_rule_success writes immediately (commits), unlike
+        replace_pattern_scan_results' batched end-of-scan write -- a rule
+        recorded this way must be queryable even if the caller never goes
+        on to call replace_pattern_scan_results at all (e.g. a later rule
+        in the same scan fails before that point is reached)."""
+        sid = begin_pattern_run(db, "abc", ".")
+        record_pattern_rule_success(
+            db, sid, "rule-a", "hash-a", "/rules/rule-a.yaml", ".", 0,
+        )
+        receipt = pattern_rule_runs(db, sid)[0]
+        assert receipt["status"] == "success"
+        assert receipt["hits"] == 0
+        assert receipt["error"] is None
+
+        # Upsert semantics match record_pattern_rule_failure's.
+        record_pattern_rule_success(
+            db, sid, "rule-a", "hash-a2", "/rules/rule-a.yaml", ".", 3,
+        )
+        receipt = pattern_rule_runs(db, sid)[0]
+        assert receipt["status"] == "success"
+        assert receipt["hits"] == 3
+        assert receipt["definition_hash"] == "hash-a2"
 
     def test_latest_scan_returns_ts_backend(self, db: sqlite3.Connection) -> None:
         begin_scan(db, "abc", ts_cc_backend="ast-grep")
@@ -1113,3 +1196,1335 @@ class TestSchemaV7:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(scan_meta)").fetchall()}
         conn.close()
         assert "ts_cc_backend" in cols
+
+
+class TestSchemaV9:
+    def test_pre_v9_pattern_findings_migrates_before_key_index_creation(
+        self, tmp_path: Path
+    ) -> None:
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript("""
+            CREATE TABLE scan_meta (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scanned_at TEXT NOT NULL,
+                git_head TEXT NOT NULL
+            );
+            CREATE TABLE pattern_findings (
+                id INTEGER PRIMARY KEY,
+                scan_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER DEFAULT 0,
+                match_text TEXT,
+                severity TEXT DEFAULT 'warning'
+            );
+        """)
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(pattern_findings)")}
+        indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(pattern_findings)")
+        }
+        conn.close()
+        assert "finding_key" in cols
+        assert "idx_pf_key" in indexes
+
+    def test_disposition_and_recurrence_survive_scan_replacement_and_pruning(
+        self, db: sqlite3.Connection
+    ) -> None:
+        sid1 = begin_pattern_run(db, "aaa", ".")
+        finding = PatternFinding(
+            path="docs/a.md",
+            scan_id=sid1,
+            rule_id="prose-test",
+            line=2,
+            match_text="genuine",
+            finding_key="qf-stable",
+            context_text="A genuine result.",
+        )
+        run = {
+            "rule_id": "prose-test",
+            "definition_hash": "abc123",
+            "rule_path": "/rules/prose-test.yaml",
+            "target": "/repo/docs",
+            "hits": 1,
+            "ran_at": "2026-07-30T12:00:00",
+        }
+        replace_pattern_scan_results(db, sid1, [finding], [run])
+        row = adjudicate_pattern_finding(db, "qf-stable", "waived", "accepted wording")
+        assert row is not None and row["disposition"] == "waived"
+
+        sid2 = begin_pattern_run(db, "bbb", ".")
+        finding.scan_id = sid2
+        replace_pattern_scan_results(db, sid2, [finding], [run])
+        # Replacing the same scan is not another recurrence.
+        replace_pattern_scan_results(db, sid2, [finding], [run])
+        # Replaying an older scan does not over-count or regress last_seen.
+        finding.scan_id = sid1
+        replace_pattern_scan_results(db, sid1, [finding], [run])
+        begin_pattern_run(db, "ccc", ".")
+        db.commit()
+
+        state = pattern_finding_states(db, ["qf-stable"])[0]
+        assert state["disposition"] == "waived"
+        assert state["scan_count"] == 2
+        assert state["first_seen_scan_id"] == sid1
+        assert state["last_seen_scan_id"] == sid2
+        history = db.execute(
+            "SELECT disposition, note FROM pattern_finding_disposition_history "
+            "WHERE finding_key = ?",
+            ("qf-stable",),
+        ).fetchall()
+        assert [tuple(row) for row in history] == [("waived", "accepted wording")]
+        report = pattern_adjudication_report(db)
+        assert report["by_rule"]["prose-test"]["decided_precision"] == 1.0
+        assert report["by_rule"]["prose-test"]["decided_count"] == 1
+        assert report["recurring_waivers"][0]["scan_count"] == 2
+
+    def test_adjudication_report_nudges_unresolved_recurring_rules(
+        self, db: sqlite3.Connection
+    ) -> None:
+        """A rule with findings surviving ADJUDICATION_NUDGE_SCANS scans and
+        zero human dispositions gets flagged -- zero decided_count is "no
+        signal yet", not proof of low precision."""
+        finding = PatternFinding(
+            path="a.md",
+            scan_id=0,
+            rule_id="prose-test",
+            finding_key="qf-unresolved",
+            match_text="genuine",
+            context_text="A genuine result.",
+        )
+        run = {
+            "rule_id": "prose-test",
+            "definition_hash": "abc123",
+            "rule_path": "/rules/prose-test.yaml",
+            "target": "/repo",
+            "hits": 1,
+            "ran_at": "2026-07-30T12:00:00",
+        }
+        for _ in range(ADJUDICATION_NUDGE_SCANS - 1):
+            sid = begin_pattern_run(db, "aaa", ".")
+            finding.scan_id = sid
+            replace_pattern_scan_results(db, sid, [finding], [run])
+
+        below_threshold = pattern_adjudication_report(db)
+        assert below_threshold["by_rule"]["prose-test"]["needs_adjudication"] is False
+
+        sid = begin_pattern_run(db, "aaa", ".")
+        finding.scan_id = sid
+        replace_pattern_scan_results(db, sid, [finding], [run])
+
+        at_threshold = pattern_adjudication_report(db)
+        summary = at_threshold["by_rule"]["prose-test"]
+        assert summary["max_scan_count"] == ADJUDICATION_NUDGE_SCANS
+        assert summary["needs_adjudication"] is True
+
+        # A single disposition silences the nudge even though scan_count
+        # keeps climbing -- there's human signal now.
+        adjudicate_pattern_finding(db, "qf-unresolved", "waived")
+        decided = pattern_adjudication_report(db)
+        assert decided["by_rule"]["prose-test"]["needs_adjudication"] is False
+
+    def test_adjudication_report_scopes_by_path_prefix(
+        self, db: sqlite3.Connection
+    ) -> None:
+        sid = begin_pattern_run(db, "aaa", ".")
+        docs_finding = PatternFinding(
+            path="docs/a.md",
+            scan_id=sid,
+            rule_id="prose-test",
+            finding_key="qf-docs",
+            match_text="genuine",
+            context_text="A genuine result.",
+        )
+        scripts_finding = PatternFinding(
+            path="scripts/b.py",
+            scan_id=sid,
+            rule_id="prose-test",
+            finding_key="qf-scripts",
+            match_text="genuine",
+            context_text="A genuine result.",
+        )
+        replace_pattern_scan_results(
+            db, sid, [docs_finding, scripts_finding], []
+        )
+        adjudicate_pattern_finding(db, "qf-docs", "accepted_defect")
+        adjudicate_pattern_finding(db, "qf-scripts", "false_positive")
+
+        unscoped = pattern_adjudication_report(db)
+        assert unscoped["by_rule"]["prose-test"]["decided_count"] == 2
+
+        scoped = pattern_adjudication_report(db, path_prefix="docs")
+        assert scoped["by_rule"]["prose-test"]["decided_count"] == 1
+        assert scoped["by_rule"]["prose-test"]["decided_precision"] == 1.0
+
+        exact_file_scope = pattern_adjudication_report(db, path_prefix="docs/a.md")
+        assert exact_file_scope["by_rule"]["prose-test"]["decided_count"] == 1
+
+        # A prefix that only shares characters (not a path segment) must not match --
+        # "doc" should not pull in "docs/a.md".
+        near_miss = pattern_adjudication_report(db, path_prefix="doc")
+        assert not near_miss["by_rule"]
+
+    def test_replacement_reconciles_disappeared_occurrence_without_losing_disposition(
+        self, db: sqlite3.Connection
+    ) -> None:
+        sid1 = begin_pattern_run(db, "aaa", ".")
+        finding = PatternFinding(
+            path="a.md",
+            scan_id=sid1,
+            rule_id="r",
+            finding_key="qf-reappears",
+            match_text="match",
+            context_text="context",
+        )
+        replace_pattern_scan_results(db, sid1, [finding], [])
+        assert adjudicate_pattern_finding(db, finding.finding_key, "waived") is not None
+
+        replace_pattern_scan_results(db, sid1, [], [])
+        absent = pattern_finding_states(db, [finding.finding_key])[0]
+        assert absent["scan_count"] == 0
+        assert absent["first_seen_scan_id"] is None
+        assert absent["last_seen_scan_id"] is None
+        assert absent["disposition"] == "waived"
+        assert pattern_adjudication_report(db)["finding_count"] == 0
+
+        sid2 = begin_pattern_run(db, "bbb", ".")
+        finding.scan_id = sid2
+        replace_pattern_scan_results(db, sid2, [finding], [])
+        reappeared = pattern_finding_states(db, [finding.finding_key])[0]
+        assert reappeared["scan_count"] == 1
+        assert reappeared["disposition"] == "waived"
+        assert not pattern_adjudication_report(db)["recurring_waivers"]
+
+    @pytest.mark.parametrize(
+        "disposition",
+        ["accepted_defect", "false_positive", "waived", "unresolved"],
+    )
+    def test_all_supported_dispositions_are_audited(
+        self, db: sqlite3.Connection, disposition: str
+    ) -> None:
+        sid = begin_pattern_run(db, "aaa", ".")
+        finding = PatternFinding(
+            path="a.md",
+            scan_id=sid,
+            rule_id="r",
+            finding_key="qf-one",
+            context_text="context",
+        )
+        replace_pattern_scan_results(db, sid, [finding], [])
+        assert adjudicate_pattern_finding(db, "qf-one", disposition) is not None
+        history = db.execute(
+            "SELECT disposition FROM pattern_finding_disposition_history"
+        ).fetchone()
+        assert history[0] == disposition
+
+
+# Pre-v10 pattern_findings/pattern_rule_runs schema (FK'd to scan_meta),
+# seeded with one finding + receipt under scan_id=1 -- shared by the
+# interruption/migration fixtures below, since none of them can start from a
+# live wv quality db (they need to construct a specific mid-migration state
+# that init_db would never itself produce).
+_TRUE_V9_SCHEMA_SQL = """
+    CREATE TABLE scan_meta (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scanned_at TEXT NOT NULL,
+        git_head TEXT NOT NULL
+    );
+    CREATE TABLE pattern_findings (
+        id INTEGER PRIMARY KEY,
+        scan_id INTEGER NOT NULL,
+        finding_key TEXT,
+        path TEXT NOT NULL,
+        rule_id TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        col INTEGER DEFAULT 0,
+        match_text TEXT,
+        severity TEXT DEFAULT 'warning',
+        FOREIGN KEY(scan_id) REFERENCES scan_meta(id) ON DELETE CASCADE
+    );
+    CREATE TABLE pattern_rule_runs (
+        scan_id INTEGER NOT NULL,
+        rule_id TEXT NOT NULL,
+        definition_hash TEXT NOT NULL,
+        rule_path TEXT NOT NULL,
+        target TEXT NOT NULL,
+        status TEXT NOT NULL,
+        hits INTEGER,
+        error TEXT,
+        ran_at TEXT NOT NULL,
+        FOREIGN KEY(scan_id) REFERENCES scan_meta(id) ON DELETE CASCADE,
+        PRIMARY KEY(scan_id, rule_id)
+    );
+    CREATE TABLE pattern_finding_state (
+        finding_key TEXT PRIMARY KEY,
+        rule_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        match_text TEXT NOT NULL,
+        context_text TEXT NOT NULL,
+        first_seen_scan_id INTEGER,
+        last_seen_scan_id INTEGER,
+        scan_count INTEGER NOT NULL DEFAULT 1,
+        disposition TEXT NOT NULL DEFAULT 'unresolved',
+        note TEXT,
+        adjudicated_at TEXT,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE pattern_finding_occurrences (
+        finding_key TEXT NOT NULL,
+        scan_id INTEGER NOT NULL,
+        PRIMARY KEY(finding_key, scan_id)
+    );
+    INSERT INTO scan_meta (id, scanned_at, git_head) VALUES (1, '2026-01-01T00:00:00', 'abc');
+    INSERT INTO pattern_findings
+        (scan_id, finding_key, path, rule_id, line, match_text)
+        VALUES (1, 'qf-a', 'docs/a.md', 'r', 1, 'x');
+    INSERT INTO pattern_rule_runs
+        (scan_id, rule_id, definition_hash, rule_path, target, status, hits, ran_at)
+        VALUES (1, 'r', 'hash', '/rules/r.yaml', 'docs', 'success', 1, '2026-01-01T00:00:00');
+"""
+
+
+class TestSchemaV10:
+    def test_rebuild_recovers_a_backup_stranded_right_after_both_renames(
+        self, tmp_path: Path
+    ) -> None:
+        """A crash right after both ALTER TABLE ... RENAME TO ..._v9
+        statements (the old, non-atomic rebuild) leaves the live table names
+        gone -- on restart _SCHEMA's CREATE TABLE IF NOT EXISTS silently
+        recreates them fresh, already correctly FK'd to pattern_runs, which
+        would make the ordinary FK-based rebuild check think nothing needs
+        doing and strand the old rows in the _v9 backup forever."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript(_TRUE_V9_SCHEMA_SQL)
+        raw.executescript("""
+            ALTER TABLE pattern_findings RENAME TO pattern_findings_v9;
+            ALTER TABLE pattern_rule_runs RENAME TO pattern_rule_runs_v9;
+        """)
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        findings = conn.execute("SELECT finding_key FROM pattern_findings").fetchall()
+        receipts = conn.execute("SELECT rule_id FROM pattern_rule_runs").fetchall()
+        conn.close()
+
+        assert "pattern_findings_v9" not in tables
+        assert "pattern_rule_runs_v9" not in tables
+        assert [row[0] for row in findings] == ["qf-a"]
+        assert [row[0] for row in receipts] == ["r"]
+
+    def test_rebuild_repair_is_idempotent_when_the_copy_already_completed(
+        self, tmp_path: Path
+    ) -> None:
+        """A crash after the INSERT...SELECT copy but before the DROP TABLE
+        backup statements leaves BOTH the live table (already holding the
+        copied rows) and the _v9 backup (still holding the same rows) --
+        the repair merge must not duplicate them."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript(_TRUE_V9_SCHEMA_SQL)
+        raw.executescript("""
+            ALTER TABLE pattern_findings RENAME TO pattern_findings_v9;
+            ALTER TABLE pattern_rule_runs RENAME TO pattern_rule_runs_v9;
+            CREATE TABLE pattern_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                git_head TEXT NOT NULL,
+                target TEXT NOT NULL DEFAULT '.',
+                files_count INTEGER,
+                duration_ms INTEGER,
+                finished_at TEXT
+            );
+            CREATE TABLE pattern_findings (
+                id INTEGER PRIMARY KEY,
+                scan_id INTEGER NOT NULL,
+                finding_key TEXT,
+                path TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER DEFAULT 0,
+                match_text TEXT,
+                severity TEXT DEFAULT 'warning',
+                FOREIGN KEY(scan_id) REFERENCES pattern_runs(id) ON DELETE CASCADE
+            );
+            CREATE TABLE pattern_rule_runs (
+                scan_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                definition_hash TEXT NOT NULL,
+                rule_path TEXT NOT NULL,
+                target TEXT NOT NULL,
+                status TEXT NOT NULL,
+                hits INTEGER,
+                error TEXT,
+                ran_at TEXT NOT NULL,
+                FOREIGN KEY(scan_id) REFERENCES pattern_runs(id) ON DELETE CASCADE,
+                PRIMARY KEY(scan_id, rule_id)
+            );
+            INSERT INTO pattern_findings
+                (id, scan_id, finding_key, path, rule_id, line, col, match_text, severity)
+                SELECT id, scan_id, finding_key, path, rule_id, line, col, match_text, severity
+                FROM pattern_findings_v9;
+            INSERT INTO pattern_rule_runs
+                (scan_id, rule_id, definition_hash, rule_path, target, status, hits, error, ran_at)
+                SELECT scan_id, rule_id, definition_hash, rule_path, target, status, hits, error, ran_at
+                FROM pattern_rule_runs_v9;
+        """)
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        findings = conn.execute("SELECT finding_key FROM pattern_findings").fetchall()
+        receipts = conn.execute("SELECT rule_id FROM pattern_rule_runs").fetchall()
+        conn.close()
+
+        assert "pattern_findings_v9" not in tables
+        assert "pattern_rule_runs_v9" not in tables
+        assert [row[0] for row in findings] == ["qf-a"]
+        assert [row[0] for row in receipts] == ["r"]
+
+    def test_rebuild_handles_interruption_between_the_two_table_renames(
+        self, tmp_path: Path
+    ) -> None:
+        """A crash between the two ALTER TABLE ... RENAME TO ..._v9
+        statements strands only ONE table -- the other is still under its
+        original name and old scan_meta-FK'd schema. Both must end up
+        correctly rebuilt, not just the one the FK-based check happens to
+        still recognize as needing work."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript(_TRUE_V9_SCHEMA_SQL)
+        raw.execute("ALTER TABLE pattern_findings RENAME TO pattern_findings_v9")
+        raw.commit()
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        fk_rows = conn.execute("PRAGMA foreign_key_list(pattern_rule_runs)").fetchall()
+        findings = conn.execute("SELECT finding_key FROM pattern_findings").fetchall()
+        receipts = conn.execute("SELECT rule_id FROM pattern_rule_runs").fetchall()
+        conn.close()
+
+        assert "pattern_findings_v9" not in tables
+        assert "pattern_rule_runs_v9" not in tables
+        assert not any(row["table"] == "scan_meta" for row in fk_rows)
+        assert [row[0] for row in findings] == ["qf-a"]
+        assert [row[0] for row in receipts] == ["r"]
+
+    def test_repair_preserves_a_distinct_finding_that_collides_on_id(
+        self, tmp_path: Path
+    ) -> None:
+        """A stranded pattern_findings_v9 backup and the live table it was
+        recreated alongside can legitimately hold DIFFERENT findings under
+        the same id (id is a surrogate key, not a stable identity -- a
+        fresh scan claimed id=1 for an unrelated finding after the old
+        interrupted rebuild left the backup stranded). INSERT OR IGNORE
+        would silently keep only the live row and then permanently lose
+        the backup's when the backup is dropped -- the distinct backup row
+        must survive under a fresh id instead."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript(_TRUE_V9_SCHEMA_SQL)
+        raw.executescript("""
+            ALTER TABLE pattern_findings RENAME TO pattern_findings_v9;
+            ALTER TABLE pattern_rule_runs RENAME TO pattern_rule_runs_v9;
+            CREATE TABLE pattern_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                git_head TEXT NOT NULL,
+                target TEXT NOT NULL DEFAULT '.',
+                files_count INTEGER,
+                duration_ms INTEGER,
+                finished_at TEXT
+            );
+            CREATE TABLE pattern_findings (
+                id INTEGER PRIMARY KEY,
+                scan_id INTEGER NOT NULL,
+                finding_key TEXT,
+                path TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER DEFAULT 0,
+                match_text TEXT,
+                severity TEXT DEFAULT 'warning',
+                FOREIGN KEY(scan_id) REFERENCES pattern_runs(id) ON DELETE CASCADE
+            );
+            CREATE TABLE pattern_rule_runs (
+                scan_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                definition_hash TEXT NOT NULL,
+                rule_path TEXT NOT NULL,
+                target TEXT NOT NULL,
+                status TEXT NOT NULL,
+                hits INTEGER,
+                error TEXT,
+                ran_at TEXT NOT NULL,
+                FOREIGN KEY(scan_id) REFERENCES pattern_runs(id) ON DELETE CASCADE,
+                PRIMARY KEY(scan_id, rule_id)
+            );
+            -- A fresh pattern run (scan_id=2) claimed pattern_findings id=1
+            -- for an UNRELATED finding after the interrupted rebuild
+            -- stranded the backup -- the backup's own id=1 finding
+            -- (scan_id=1, "qf-a") is a genuinely different row.
+            INSERT INTO pattern_runs (id, started_at, git_head, target, finished_at)
+                VALUES (2, '2026-02-01T00:00:00', 'def', '.', '2026-02-01T00:00:00');
+            INSERT INTO pattern_findings
+                (id, scan_id, finding_key, path, rule_id, line, match_text)
+                VALUES (1, 2, 'qf-new', 'src/new.py', 'r', 1, 'y');
+        """)
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        findings = {
+            row["finding_key"]: row["path"]
+            for row in conn.execute("SELECT finding_key, path FROM pattern_findings")
+        }
+        conn.close()
+
+        assert "pattern_findings_v9" not in tables
+        # Both the pre-existing live finding and the backup's distinct one
+        # (reassigned a fresh id, since id=1 was already taken) survive.
+        assert findings == {"qf-new": "src/new.py", "qf-a": "docs/a.md"}
+
+    def test_repair_refuses_to_drop_a_backup_with_conflicting_rule_run_content(
+        self, tmp_path: Path
+    ) -> None:
+        """(scan_id, rule_id) is pattern_rule_runs' real primary key --
+        unlike pattern_findings.id, a content collision here means two
+        different runs' receipts are being conflated, not a harmless
+        reinsert. The repair must refuse to merge/drop rather than
+        silently picking one receipt over the other."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript(_TRUE_V9_SCHEMA_SQL)
+        raw.executescript("""
+            ALTER TABLE pattern_findings RENAME TO pattern_findings_v9;
+            ALTER TABLE pattern_rule_runs RENAME TO pattern_rule_runs_v9;
+            CREATE TABLE pattern_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                git_head TEXT NOT NULL,
+                target TEXT NOT NULL DEFAULT '.',
+                files_count INTEGER,
+                duration_ms INTEGER,
+                finished_at TEXT
+            );
+            CREATE TABLE pattern_findings (
+                id INTEGER PRIMARY KEY,
+                scan_id INTEGER NOT NULL,
+                finding_key TEXT,
+                path TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER DEFAULT 0,
+                match_text TEXT,
+                severity TEXT DEFAULT 'warning',
+                FOREIGN KEY(scan_id) REFERENCES pattern_runs(id) ON DELETE CASCADE
+            );
+            CREATE TABLE pattern_rule_runs (
+                scan_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                definition_hash TEXT NOT NULL,
+                rule_path TEXT NOT NULL,
+                target TEXT NOT NULL,
+                status TEXT NOT NULL,
+                hits INTEGER,
+                error TEXT,
+                ran_at TEXT NOT NULL,
+                FOREIGN KEY(scan_id) REFERENCES pattern_runs(id) ON DELETE CASCADE,
+                PRIMARY KEY(scan_id, rule_id)
+            );
+            INSERT INTO pattern_runs (id, started_at, git_head, target, finished_at)
+                VALUES (1, '2026-01-01T00:00:00', 'abc', 'docs', '2026-01-01T00:00:00');
+            -- Live receipt for (scan_id=1, rule_id='r') CONFLICTS with the
+            -- backup's own receipt for the same key (different status).
+            INSERT INTO pattern_rule_runs
+                (scan_id, rule_id, definition_hash, rule_path, target, status, hits, ran_at)
+                VALUES (1, 'r', 'hash', '/rules/r.yaml', 'docs', 'failed', NULL,
+                        '2026-01-01T00:00:00');
+        """)
+        raw.close()
+
+        with pytest.raises(PatternMigrationConflictError, match="conflict"):
+            init_db(hot_zone=str(tmp_path))
+
+        # The backup must still be there -- nothing was silently dropped.
+        raw = sqlite3.connect(str(db_file))
+        tables = {
+            row[0]
+            for row in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        raw.close()
+        assert "pattern_rule_runs_v9" in tables
+
+    def test_true_v9_backfill_preserves_the_receipt_target(self, tmp_path: Path) -> None:
+        """A legacy id's real scan target lives on its pattern_rule_runs
+        receipt (scan_meta never recorded one) -- hardcoding target='.'
+        during backfill would silently turn a migrated scoped scan (of
+        "docs", here) into a repo-root-scoped one now that report/list
+        scope directly from pattern_runs.target (wv-40d3d6)."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript(_TRUE_V9_SCHEMA_SQL)  # receipt target is 'docs'
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        target = conn.execute("SELECT target FROM pattern_runs WHERE id = 1").fetchone()[0]
+        conn.close()
+        assert target == "docs"
+
+    def test_true_v9_backfill_ignores_a_failed_receipts_target(self, tmp_path: Path) -> None:
+        """Under v9's shared scan_id (complexity and pattern scans reused
+        the same sequence), a root scan's successful findings could survive
+        while a LATER, unrelated invocation reused the same scan_id and
+        failed against a DIFFERENT target -- record_pattern_rule_failure's
+        upsert deliberately preserves the earlier findings on failure. That
+        failed receipt's target describes the later, unrelated attempt, not
+        the run whose findings actually survived -- using it regardless of
+        status would rescope root findings as if they were docs-scoped."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript("""
+            CREATE TABLE scan_meta (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scanned_at TEXT NOT NULL,
+                git_head TEXT NOT NULL
+            );
+            CREATE TABLE pattern_findings (
+                id INTEGER PRIMARY KEY,
+                scan_id INTEGER NOT NULL,
+                finding_key TEXT,
+                path TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER DEFAULT 0,
+                match_text TEXT,
+                severity TEXT DEFAULT 'warning',
+                FOREIGN KEY(scan_id) REFERENCES scan_meta(id) ON DELETE CASCADE
+            );
+            CREATE TABLE pattern_rule_runs (
+                scan_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                definition_hash TEXT NOT NULL,
+                rule_path TEXT NOT NULL,
+                target TEXT NOT NULL,
+                status TEXT NOT NULL,
+                hits INTEGER,
+                error TEXT,
+                ran_at TEXT NOT NULL,
+                FOREIGN KEY(scan_id) REFERENCES scan_meta(id) ON DELETE CASCADE,
+                PRIMARY KEY(scan_id, rule_id)
+            );
+            -- Root scan succeeded and stored a root finding.
+            INSERT INTO pattern_findings
+                (scan_id, finding_key, path, rule_id, line, match_text)
+                VALUES (1, 'qf-root', 'src/root.py', 'r', 1, 'x');
+            -- A LATER docs scan reused the same scan_id and failed --
+            -- record_pattern_rule_failure's upsert overwrote the receipt
+            -- with status='failed', target='docs', while preserving the
+            -- root finding above untouched.
+            INSERT INTO pattern_rule_runs
+                (scan_id, rule_id, definition_hash, rule_path, target, status, error, ran_at)
+                VALUES (1, 'r', 'hash', '/rules/r.yaml', 'docs', 'failed', 'boom',
+                        '2026-01-02T00:00:00');
+        """)
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        target = conn.execute("SELECT target FROM pattern_runs WHERE id = 1").fetchone()[0]
+        findings = conn.execute("SELECT path, finding_key FROM pattern_findings").fetchall()
+        conn.close()
+        assert target == "."
+        assert [(row["path"], row["finding_key"]) for row in findings] == [
+            ("src/root.py", "qf-root")
+        ]
+
+    def test_already_migrated_non_dot_mis_scoping_is_repaired_too(
+        self, tmp_path: Path
+    ) -> None:
+        """The prior buggy release could already have persisted an
+        INCORRECT non-'.' target (adopted from a later, unrelated failed
+        receipt reusing the same v9 scan_id -- see wv-367b1c) before this
+        fix shipped. A repair pass that only revisits rows currently
+        sitting on '.' never examines that already-wrong 'docs' value --
+        it must be reclassified from evidence regardless of its CURRENT
+        target, not just when that happens to be the default."""
+        conn = init_db(hot_zone=str(tmp_path))
+        run_id = begin_pattern_run(conn, "abc", ".")
+        finding = PatternFinding(
+            path="src/root.py", scan_id=run_id, rule_id="r", finding_key="qf-root", line=1,
+        )
+        replace_pattern_scan_results(conn, run_id, [finding], [])
+        finish_pattern_run(conn, run_id, files_count=1, duration_ms=10)
+        # Simulate the OLD buggy migration's gap directly: a later, failed,
+        # differently-targeted receipt got adopted as this run's target,
+        # even though it has no successful evidence supporting "docs".
+        conn.execute(
+            "INSERT INTO pattern_rule_runs "
+            "(scan_id, rule_id, definition_hash, rule_path, target, status, error, ran_at) "
+            "VALUES (?, 'r', 'hash', '/rules/r.yaml', 'docs', 'failed', 'boom', "
+            "'2026-01-02T00:00:00')",
+            (run_id,),
+        )
+        conn.execute("UPDATE pattern_runs SET target = 'docs' WHERE id = ?", (run_id,))
+        conn.commit()
+        conn.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        target = conn.execute(
+            "SELECT target FROM pattern_runs WHERE id = ?", (run_id,)
+        ).fetchone()[0]
+        conn.close()
+        assert target == "."
+
+    def test_modern_failed_run_with_no_evidence_keeps_its_own_target(
+        self, tmp_path: Path
+    ) -> None:
+        """A genuinely modern failed run (begin_pattern_run already recorded
+        its real target correctly at creation time) publishes no findings
+        or successful receipts under it -- it must be left untouched by
+        reclassification, not rewritten to the conservative '.' fallback
+        just because it has no successful-receipt evidence."""
+        conn = init_db(hot_zone=str(tmp_path))
+        run_id = begin_pattern_run(conn, "abc", "docs")
+        record_pattern_rule_failure(
+            conn, run_id, "r", "hash", "/rules/r.yaml", "docs", "boom",
+        )
+        conn.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        target = conn.execute(
+            "SELECT target FROM pattern_runs WHERE id = ?", (run_id,)
+        ).fetchone()[0]
+        conn.close()
+        assert target == "docs"
+
+    def test_already_migrated_dot_target_is_repaired_from_receipts(
+        self, tmp_path: Path
+    ) -> None:
+        """An already-migrated row backfilled by the earlier buggy migration
+        (which always hardcoded target='.') must be repaired from its
+        receipts, not left silently repo-root-scoped."""
+        conn = init_db(hot_zone=str(tmp_path))
+        run_id = begin_pattern_run(conn, "abc", "docs")
+        finding = PatternFinding(
+            path="docs/a.md", scan_id=run_id, rule_id="r", finding_key="qf-a", line=1,
+        )
+        rule_run = {
+            "rule_id": "r",
+            "definition_hash": "hash",
+            "rule_path": "/rules/r.yaml",
+            "target": "docs",
+            "hits": 1,
+            "ran_at": "2026-01-01T00:00:00",
+        }
+        replace_pattern_scan_results(conn, run_id, [finding], [rule_run])
+        finish_pattern_run(conn, run_id, files_count=1, duration_ms=10)
+        # Simulate the earlier buggy migration's gap directly: the run's
+        # target was hardcoded to '.' despite its receipt naming 'docs'.
+        conn.execute("UPDATE pattern_runs SET target = '.' WHERE id = ?", (run_id,))
+        conn.commit()
+        conn.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        target = conn.execute(
+            "SELECT target FROM pattern_runs WHERE id = ?", (run_id,)
+        ).fetchone()[0]
+        conn.close()
+        assert target == "docs"
+
+    def test_occurrence_only_legacy_id_falls_back_to_dot_target(
+        self, tmp_path: Path
+    ) -> None:
+        """A legacy id with no receipts at all (only a durable occurrence
+        row survived v9 retention) has no target evidence to read -- it
+        must fall back to '.', not raise or leave the row unreserved."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript(_TRUE_V9_SCHEMA_SQL)
+        raw.executescript("""
+            DELETE FROM pattern_findings WHERE scan_id = 1;
+            DELETE FROM pattern_rule_runs WHERE scan_id = 1;
+            INSERT INTO pattern_finding_occurrences (finding_key, scan_id) VALUES ('qf-a', 1);
+        """)
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        target = conn.execute("SELECT target FROM pattern_runs WHERE id = 1").fetchone()[0]
+        conn.close()
+        assert target == "."
+
+    def test_conflicting_receipt_targets_fall_back_to_dot_target(
+        self, tmp_path: Path
+    ) -> None:
+        """Two receipts for the same legacy id that disagree on target
+        (shouldn't happen in practice, but a defensively unioned legacy id
+        must not silently pick one) fall back to '.' rather than guessing."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript(_TRUE_V9_SCHEMA_SQL)
+        raw.execute(
+            "INSERT INTO pattern_rule_runs "
+            "(scan_id, rule_id, definition_hash, rule_path, target, status, hits, ran_at) "
+            "VALUES (1, 'r2', 'hash2', '/rules/r2.yaml', 'other', 'success', 1, "
+            "'2026-01-01T00:00:00')"
+        )
+        raw.commit()
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        target = conn.execute("SELECT target FROM pattern_runs WHERE id = 1").fetchone()[0]
+        conn.close()
+        assert target == "."
+
+    def test_migration_reserves_ids_orphaned_in_occurrences_alone(
+        self, tmp_path: Path
+    ) -> None:
+        """A finding's raw pattern_findings row and pattern_rule_runs receipt
+        can already be pruned under v9 retention while its
+        pattern_finding_occurrences rows (the durable scan_count evidence)
+        remain. The migration must still reserve that scan_id in pattern_runs
+        -- otherwise begin_pattern_run hands it back out to a brand new scan,
+        and replace_pattern_scan_results deletes the old occurrence."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript("""
+            CREATE TABLE scan_meta (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scanned_at TEXT NOT NULL,
+                git_head TEXT NOT NULL
+            );
+            CREATE TABLE pattern_findings (
+                id INTEGER PRIMARY KEY,
+                scan_id INTEGER NOT NULL,
+                finding_key TEXT,
+                path TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER DEFAULT 0,
+                match_text TEXT,
+                severity TEXT DEFAULT 'warning',
+                FOREIGN KEY(scan_id) REFERENCES scan_meta(id) ON DELETE CASCADE
+            );
+            CREATE TABLE pattern_rule_runs (
+                scan_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                definition_hash TEXT NOT NULL,
+                rule_path TEXT NOT NULL,
+                target TEXT NOT NULL,
+                status TEXT NOT NULL,
+                hits INTEGER,
+                error TEXT,
+                ran_at TEXT NOT NULL,
+                FOREIGN KEY(scan_id) REFERENCES scan_meta(id) ON DELETE CASCADE,
+                PRIMARY KEY(scan_id, rule_id)
+            );
+            CREATE TABLE pattern_finding_state (
+                finding_key TEXT PRIMARY KEY,
+                rule_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                match_text TEXT NOT NULL,
+                context_text TEXT NOT NULL,
+                first_seen_scan_id INTEGER,
+                last_seen_scan_id INTEGER,
+                scan_count INTEGER NOT NULL DEFAULT 1,
+                disposition TEXT NOT NULL DEFAULT 'unresolved',
+                note TEXT,
+                adjudicated_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE pattern_finding_occurrences (
+                finding_key TEXT NOT NULL,
+                scan_id INTEGER NOT NULL,
+                PRIMARY KEY(finding_key, scan_id)
+            );
+            -- pattern_findings/pattern_rule_runs for scan_id=1 are already
+            -- pruned (empty) -- only the occurrence survives, as v9
+            -- retention allows.
+            INSERT INTO pattern_finding_occurrences (finding_key, scan_id)
+                VALUES ('qf-old', 1);
+            INSERT INTO pattern_finding_state
+                (finding_key, rule_id, path, match_text, context_text,
+                 first_seen_scan_id, last_seen_scan_id, scan_count,
+                 disposition, updated_at)
+                VALUES ('qf-old', 'r', 'a.md', 'x', 'x', 1, 1, 1,
+                        'waived', '2026-01-01T00:00:00');
+        """)
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        reserved = {row[0] for row in conn.execute("SELECT id FROM pattern_runs")}
+        assert 1 in reserved
+
+        new_run_id = begin_pattern_run(conn, "new-head", ".")
+        assert new_run_id != 1
+        replace_pattern_scan_results(conn, new_run_id, [], [])
+
+        old_occurrences = conn.execute(
+            "SELECT scan_id FROM pattern_finding_occurrences WHERE finding_key = 'qf-old'"
+        ).fetchall()
+        assert [row[0] for row in old_occurrences] == [1]
+        old_state = pattern_finding_states(conn, ["qf-old"])[0]
+        assert old_state["scan_count"] == 1
+        assert old_state["disposition"] == "waived"
+
+    def test_repeated_failures_do_not_evict_the_last_successful_run(
+        self, db: sqlite3.Connection
+    ) -> None:
+        """begin_pattern_run creates and (now) prunes a run before its rule
+        loop executes -- a failed run is still committed as a row. Retention
+        must count finished and unfinished runs in separate windows, or a
+        chain of failures alone can prune away an earlier successful run's
+        findings even though it was never touched by any of them."""
+        good_run = begin_pattern_run(db, "good", ".")
+        finding = PatternFinding(
+            path="a.md", scan_id=good_run, rule_id="r", finding_key="qf-good", line=1,
+        )
+        replace_pattern_scan_results(db, good_run, [finding], [])
+        finish_pattern_run(db, good_run, files_count=1, duration_ms=10)
+
+        for i in range(_MAX_PATTERN_RUNS + 1):
+            failed_run = begin_pattern_run(db, f"bad{i}", ".")
+            record_pattern_rule_failure(
+                db, failed_run, "r", "hash", "/rules/r.yaml", ".", "boom",
+            )
+
+        remaining = {
+            r[0] for r in db.execute("SELECT scan_id FROM pattern_findings").fetchall()
+        }
+        assert good_run in remaining
+        assert pattern_finding_states(db, ["qf-good"])[0]["scan_count"] == 1
+
+    def test_true_v9_backfill_classifies_finished_at_from_evidence(
+        self, tmp_path: Path
+    ) -> None:
+        """A pre-v10 database (pattern_findings/pattern_rule_runs still FK'd to
+        scan_meta, no pattern_runs table at all) backfills one pattern_runs
+        row per legacy scan_id. A legacy id with a real finding is finished;
+        a legacy id that only ever has a failed receipt (every rule errored,
+        nothing matched) is not a completed scan and must stay unfinished."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript("""
+            CREATE TABLE scan_meta (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scanned_at TEXT NOT NULL,
+                git_head TEXT NOT NULL
+            );
+            CREATE TABLE pattern_findings (
+                id INTEGER PRIMARY KEY,
+                scan_id INTEGER NOT NULL,
+                finding_key TEXT,
+                path TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER DEFAULT 0,
+                match_text TEXT,
+                severity TEXT DEFAULT 'warning',
+                FOREIGN KEY(scan_id) REFERENCES scan_meta(id) ON DELETE CASCADE
+            );
+            CREATE TABLE pattern_rule_runs (
+                scan_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                definition_hash TEXT NOT NULL,
+                rule_path TEXT NOT NULL,
+                target TEXT NOT NULL,
+                status TEXT NOT NULL,
+                hits INTEGER,
+                error TEXT,
+                ran_at TEXT NOT NULL,
+                FOREIGN KEY(scan_id) REFERENCES scan_meta(id) ON DELETE CASCADE,
+                PRIMARY KEY(scan_id, rule_id)
+            );
+            CREATE TABLE pattern_finding_state (
+                finding_key TEXT PRIMARY KEY,
+                rule_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                match_text TEXT NOT NULL,
+                context_text TEXT NOT NULL,
+                first_seen_scan_id INTEGER,
+                last_seen_scan_id INTEGER,
+                scan_count INTEGER NOT NULL DEFAULT 1,
+                disposition TEXT NOT NULL DEFAULT 'unresolved',
+                note TEXT,
+                adjudicated_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE pattern_finding_occurrences (
+                finding_key TEXT NOT NULL,
+                scan_id INTEGER NOT NULL,
+                PRIMARY KEY(finding_key, scan_id)
+            );
+            -- scan_id=1: a real finding -- a completed, successful v9 scan.
+            INSERT INTO pattern_findings
+                (scan_id, finding_key, path, rule_id, line, match_text)
+                VALUES (1, 'qf-hit', 'a.md', 'r', 1, 'x');
+            INSERT INTO pattern_rule_runs
+                (scan_id, rule_id, definition_hash, rule_path, target, status, hits, ran_at)
+                VALUES (1, 'r', 'hash', '/rules/r.yaml', '.', 'success', 1, '2026-01-01T00:00:00');
+            -- scan_id=2: every rule errored, nothing ever matched -- not a
+            -- completed scan, even though it left a v9 receipt row.
+            INSERT INTO pattern_rule_runs
+                (scan_id, rule_id, definition_hash, rule_path, target, status, error, ran_at)
+                VALUES (2, 'r', 'hash', '/rules/r.yaml', '.', 'failed', 'boom', '2026-01-01T00:00:00');
+        """)
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        rows = {
+            row["id"]: row["finished_at"]
+            for row in conn.execute("SELECT id, finished_at FROM pattern_runs")
+        }
+        assert rows[1] is not None
+        assert rows[2] is None
+
+    def test_already_migrated_buggy_v10_reclassifies_finished_at_from_evidence(
+        self, tmp_path: Path
+    ) -> None:
+        """A database already migrated by the earlier buggy _migrate_v10 (one
+        that only set finished_at on newly-INSERTed rows) has a pattern_runs
+        row for a genuinely successful run sitting on finished_at = NULL.
+        init_db must reclassify it from evidence so subsequent failures
+        cannot evict it -- the exact regression this migration exists to
+        prevent."""
+        conn = init_db(hot_zone=str(tmp_path))
+        good_run = begin_pattern_run(conn, "good", ".")
+        finding = PatternFinding(
+            path="a.md", scan_id=good_run, rule_id="r", finding_key="qf-good", line=1,
+        )
+        replace_pattern_scan_results(conn, good_run, [finding], [])
+        # Simulate the earlier buggy migration's gap directly: a row with
+        # legacy provenance (as a real v9-backfilled row would carry) sitting
+        # on finished_at = NULL despite having real evidence attached.
+        # origin='legacy' is set explicitly here because begin_pattern_run
+        # above stamped 'native' -- this row stands in for a genuine legacy
+        # backfill artifact, not an in-progress native invocation (which
+        # test_native_partial_success_then_failure_stays_unfinished_across_reopen
+        # covers separately and must NOT be reclassified this way).
+        conn.execute(
+            "UPDATE pattern_runs SET finished_at = NULL, origin = 'legacy' WHERE id = ?",
+            (good_run,),
+        )
+        conn.commit()
+        conn.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        finished_at = conn.execute(
+            "SELECT finished_at FROM pattern_runs WHERE id = ?", (good_run,)
+        ).fetchone()[0]
+        assert finished_at is not None
+
+        for i in range(_MAX_PATTERN_RUNS + 1):
+            failed_run = begin_pattern_run(conn, f"bad{i}", ".")
+            record_pattern_rule_failure(
+                conn, failed_run, "r", "hash", "/rules/r.yaml", ".", "boom",
+            )
+
+        remaining = {
+            r[0] for r in conn.execute("SELECT scan_id FROM pattern_findings").fetchall()
+        }
+        assert good_run in remaining
+        assert pattern_finding_states(conn, ["qf-good"])[0]["scan_count"] == 1
+
+    def test_migration_reclassification_leaves_a_genuinely_unfinished_run_null(
+        self, tmp_path: Path
+    ) -> None:
+        """A row with no findings, no occurrences, and no successful receipt
+        (an interrupted run, or one where every rule failed) has no evidence
+        of completion and must stay classified unfinished across an init_db
+        re-run -- the reclassification pass must not blanket-mark every NULL
+        row finished."""
+        conn = init_db(hot_zone=str(tmp_path))
+        failed_run = begin_pattern_run(conn, "bad", ".")
+        record_pattern_rule_failure(
+            conn, failed_run, "r", "hash", "/rules/r.yaml", ".", "boom",
+        )
+        conn.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        finished_at = conn.execute(
+            "SELECT finished_at FROM pattern_runs WHERE id = ?", (failed_run,)
+        ).fetchone()[0]
+        assert finished_at is None
+
+    def test_native_partial_success_then_failure_stays_unfinished_across_reopen(
+        self, tmp_path: Path
+    ) -> None:
+        """A NATIVE run (created by begin_pattern_run, not legacy-backfilled)
+        where one rule's successful receipt was durably committed
+        (record_pattern_rule_success, wv-29aeb0) before a LATER rule in the
+        same invocation fails -- or the process crashes -- has real success
+        evidence but was never finished via finish_pattern_run. Unlike a
+        legacy-backfilled row, this run's finished_at must stay NULL across
+        a database reopen: the evidence-based reclassification heuristic is
+        only valid for origin='legacy' rows (see wv-033ec6). Before that
+        fix, _migrate_v10 promoted this exact partial run to finished on
+        every init_db() call."""
+        conn = init_db(hot_zone=str(tmp_path))
+        run_id = begin_pattern_run(conn, "head", "docs")
+        record_pattern_rule_success(
+            conn, run_id, "a", "ha", "/rules/a.yaml", "docs", 0,
+        )
+        record_pattern_rule_failure(
+            conn, run_id, "b", "hb", "/rules/b.yaml", "docs", "boom",
+        )
+        assert (
+            conn.execute(
+                "SELECT finished_at FROM pattern_runs WHERE id = ?", (run_id,)
+            ).fetchone()[0]
+            is None
+        )
+        conn.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        finished_at = conn.execute(
+            "SELECT finished_at FROM pattern_runs WHERE id = ?", (run_id,)
+        ).fetchone()[0]
+        assert finished_at is None
+        # Both immediately-committed receipts must still be intact -- this
+        # regression is about lifecycle state, not receipt durability.
+        receipts = {row["rule_id"]: row["status"] for row in pattern_rule_runs(conn, run_id)}
+        assert receipts == {"a": "success", "b": "failed"}
+
+    def test_origin_less_existing_native_row_is_not_promoted_to_finished(
+        self, tmp_path: Path
+    ) -> None:
+        """The real upgrade shape wv-033ec6's own regression test doesn't
+        exercise: a pattern_runs table that already exists WITHOUT an origin
+        column (built by a pre-origin version of this migration) can hold a
+        row that is actually a partial/interrupted NATIVE run, not a legacy
+        backfill -- e.g. one immediate successful receipt committed, then a
+        crash or a later rule's failure, before origin shipped. Defaulting
+        every origin-less existing row to 'legacy' at ALTER time (the
+        original bug) hands this row straight to the evidence-based
+        finished_at reconstruction pass and promotes it to finished on the
+        very next init_db(), even though finish_pattern_run never ran."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript("""
+            CREATE TABLE pattern_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                git_head TEXT NOT NULL,
+                target TEXT NOT NULL DEFAULT '.',
+                files_count INTEGER,
+                duration_ms INTEGER,
+                finished_at TEXT
+            );
+            CREATE TABLE pattern_findings (
+                id INTEGER PRIMARY KEY,
+                scan_id INTEGER NOT NULL,
+                finding_key TEXT,
+                path TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER DEFAULT 0,
+                match_text TEXT,
+                severity TEXT DEFAULT 'warning',
+                FOREIGN KEY(scan_id) REFERENCES pattern_runs(id) ON DELETE CASCADE
+            );
+            CREATE TABLE pattern_rule_runs (
+                scan_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                definition_hash TEXT NOT NULL,
+                rule_path TEXT NOT NULL,
+                target TEXT NOT NULL,
+                status TEXT NOT NULL,
+                hits INTEGER,
+                error TEXT,
+                ran_at TEXT NOT NULL,
+                FOREIGN KEY(scan_id) REFERENCES pattern_runs(id) ON DELETE CASCADE,
+                PRIMARY KEY(scan_id, rule_id)
+            );
+            -- id=1: a NATIVE run from before `origin` shipped -- one rule's
+            -- success receipt durably committed (wv-29aeb0), then the
+            -- invocation never finished (a later rule failed, or a crash).
+            INSERT INTO pattern_runs (id, started_at, git_head, target, finished_at)
+                VALUES (1, '2026-02-01T00:00:00', 'abc', '.', NULL);
+            INSERT INTO pattern_rule_runs
+                (scan_id, rule_id, definition_hash, rule_path, target, status, hits, ran_at)
+                VALUES (1, 'a', 'ha', '/rules/a.yaml', '.', 'success', 0, '2026-02-01T00:00:00');
+            INSERT INTO pattern_rule_runs
+                (scan_id, rule_id, definition_hash, rule_path, target, status, error, ran_at)
+                VALUES (1, 'b', 'hb', '/rules/b.yaml', '.', 'failed', 'boom', '2026-02-01T00:00:00');
+        """)
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        row = conn.execute(
+            "SELECT finished_at, origin FROM pattern_runs WHERE id = 1"
+        ).fetchone()
+        conn.close()
+
+        assert row["finished_at"] is None
+        assert row["origin"] != "legacy"
+
+    def test_omitted_origin_write_on_a_current_schema_db_is_not_promoted_to_finished(
+        self, tmp_path: Path
+    ) -> None:
+        """A pre-origin or downgraded writer that INSERTs into pattern_runs
+        without naming the origin column at all -- no ALTER involved, this
+        is a plain insert against an ALREADY-current schema -- must not get
+        the column's default silently mislabeled 'legacy'. One immediate
+        success receipt (record_pattern_rule_success, wv-29aeb0) then a
+        reopen must not promote the still-unfinished row to finished."""
+        conn = init_db(hot_zone=str(tmp_path))
+        conn.execute(
+            "INSERT INTO pattern_runs (started_at, git_head, target) VALUES (?, ?, ?)",
+            ("2026-02-01T00:00:00", "h", "docs"),
+        )
+        conn.commit()
+        run_id = conn.execute(
+            "SELECT id FROM pattern_runs WHERE started_at = '2026-02-01T00:00:00'"
+        ).fetchone()[0]
+        before = conn.execute(
+            "SELECT origin, finished_at FROM pattern_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        assert before["origin"] != "legacy"
+        assert before["finished_at"] is None
+
+        record_pattern_rule_success(
+            conn, run_id, "a", "ha", "/rules/a.yaml", "docs", 0,
+        )
+        conn.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        after = conn.execute(
+            "SELECT origin, finished_at FROM pattern_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        assert after["origin"] != "legacy"
+        assert after["finished_at"] is None
+
+    def test_deployed_db_with_stale_legacy_default_is_rebuilt_on_reopen(
+        self, tmp_path: Path
+    ) -> None:
+        """CREATE TABLE IF NOT EXISTS never retrofits an EXISTING table's
+        schema -- a database created by the immediately-preceding schema
+        (origin column already present, but still defaulting to 'legacy')
+        keeps that stale default forever unless explicitly rebuilt. An old
+        writer that omits origin on such a database must not silently
+        inherit 'legacy' and get promoted to finished from one receipt.
+        Also verifies the rebuild preserves an existing row (its own
+        'legacy' origin unchanged) and FK-referencing pattern_findings."""
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript("""
+            CREATE TABLE pattern_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at  TEXT NOT NULL,
+                git_head    TEXT NOT NULL,
+                target      TEXT NOT NULL DEFAULT '.',
+                files_count INTEGER,
+                duration_ms INTEGER,
+                finished_at TEXT,
+                origin      TEXT NOT NULL DEFAULT 'legacy'
+            );
+            CREATE TABLE pattern_findings (
+                id INTEGER PRIMARY KEY,
+                scan_id INTEGER NOT NULL,
+                finding_key TEXT,
+                path TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER DEFAULT 0,
+                match_text TEXT,
+                severity TEXT DEFAULT 'warning',
+                FOREIGN KEY(scan_id) REFERENCES pattern_runs(id) ON DELETE CASCADE
+            );
+            CREATE TABLE pattern_rule_runs (
+                scan_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                definition_hash TEXT NOT NULL,
+                rule_path TEXT NOT NULL,
+                target TEXT NOT NULL,
+                status TEXT NOT NULL,
+                hits INTEGER,
+                error TEXT,
+                ran_at TEXT NOT NULL,
+                FOREIGN KEY(scan_id) REFERENCES pattern_runs(id) ON DELETE CASCADE,
+                PRIMARY KEY(scan_id, rule_id)
+            );
+            -- A pre-existing, genuinely finished legacy run with a real
+            -- finding attached -- must survive the rebuild untouched.
+            INSERT INTO pattern_runs (id, started_at, git_head, target)
+                VALUES (99, '2020-01-01T00:00:00', 'abc', '.');
+            INSERT INTO pattern_findings
+                (scan_id, finding_key, path, rule_id, line, match_text)
+                VALUES (99, 'qf-old', 'a.md', 'r', 1, 'x');
+        """)
+        raw.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        origin_col = next(
+            row for row in conn.execute("PRAGMA table_info(pattern_runs)") if row["name"] == "origin"
+        )
+        assert origin_col["dflt_value"] == "'unknown'"
+
+        # The pre-existing legacy row and its finding both survived the
+        # rebuild unchanged -- only the table's DEFAULT clause changed.
+        old_row = conn.execute("SELECT origin FROM pattern_runs WHERE id = 99").fetchone()
+        assert old_row["origin"] == "legacy"
+        assert conn.execute(
+            "SELECT 1 FROM pattern_findings WHERE scan_id = 99"
+        ).fetchone() is not None
+
+        # An old writer that omits origin entirely on this now-rebuilt,
+        # already-current-schema database must not silently get 'legacy'.
+        conn.execute(
+            "INSERT INTO pattern_runs (started_at, git_head, target) VALUES (?, ?, ?)",
+            ("t", "h", "docs"),
+        )
+        conn.commit()
+        run_id = conn.execute(
+            "SELECT id FROM pattern_runs WHERE started_at = 't'"
+        ).fetchone()[0]
+        before = conn.execute(
+            "SELECT origin, finished_at FROM pattern_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        assert before["origin"] == "unknown"
+        assert before["finished_at"] is None
+        record_pattern_rule_success(conn, run_id, "a", "ha", "/rules/a.yaml", "docs", 0)
+        conn.close()
+
+        conn = init_db(hot_zone=str(tmp_path))
+        after = conn.execute(
+            "SELECT origin, finished_at FROM pattern_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        assert after["origin"] == "unknown"
+        assert after["finished_at"] is None
+
+        # FK enforcement (including ON DELETE CASCADE) still works after
+        # the rebuild -- confirms `foreign_keys` was correctly restored.
+        conn.execute("DELETE FROM pattern_runs WHERE id = 99")
+        conn.commit()
+        assert conn.execute(
+            "SELECT 1 FROM pattern_findings WHERE scan_id = 99"
+        ).fetchone() is None

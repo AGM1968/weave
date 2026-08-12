@@ -1,0 +1,26 @@
+id: markdown-split-code-span
+language: prose
+kind: regex
+severity: info
+policy: always-on-shared
+maturity: promotable
+match_scope: line
+provenance: >-
+  wv-7df0b7 @nowcast (2026-07-17). Four wrapped file-path spans rendered with
+  spurious spaces in the stakeholder PDF. Reproduced across later document
+  reviews and adjudicated as a structural rendering defect.
+message: >-
+  A line containing exactly one backtick usually splits an inline code span
+  across source lines. Keep the complete inline code span on one source line;
+  name very long paths in prose instead.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+patterns:
+  - '^[^`]*`[^`]*$'
+positive_controls:
+  - "The path starts at `scripts/\nworker.py`."
+negative_controls:
+  - "Use `scripts/worker.py` for the complete path."
+  - "```text\ncomplete fenced content\n```"

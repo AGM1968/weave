@@ -7,8 +7,9 @@ This repository uses **Weave** for task tracking. Every code change must be trac
 ## Pre-flight (run before anything else)
 
 ```bash
-if ! command -v wv >/dev/null 2>&1; then wv() { ./scripts/wv "$@"; }; fi
-# ./scripts/wv appends existing $HOME/.local/bin and $HOME/.cargo/bin for user tools.
+if ! command -v wv >/dev/null 2>&1; then wv() { "$HOME/.local/bin/wv" "$@"; }; fi
+# Fallback for a shell where ~/.local/bin is not yet on PATH. This repo
+# does not vendor weave's own scripts/wv -- wv is installed globally.
 wv bootstrap --json   # single call: active/ready/blocked + learnings + context policy
 ```
 

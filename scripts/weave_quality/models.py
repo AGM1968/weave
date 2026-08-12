@@ -381,6 +381,25 @@ class ScanMeta:
 
 
 @dataclass
+class PatternRun:
+    """Metadata for a single `wv quality patterns scan` run.
+
+    Maps to the `pattern_runs` table. Deliberately independent of
+    ScanMeta/scan_meta (the complexity-scan sequence): pattern scans get
+    their own lifecycle identity so a rescan or an unrelated `wv quality
+    scan` can no longer collide on / prune a shared id (see
+    db.begin_pattern_run and _migrate_v10).
+    """
+
+    id: int = 0
+    started_at: str = ""  # ISO 8601 timestamp
+    git_head: str = ""  # HEAD SHA at run time
+    target: str = "."  # canonical repo-relative posix path, or "." for repo root
+    files_count: int = 0
+    duration_ms: int = 0
+
+
+@dataclass
 class PatternFinding:
     """One ast-grep structural pattern match.
 
@@ -395,6 +414,8 @@ class PatternFinding:
     col: int = 0
     match_text: str = ""
     severity: str = "warning"
+    finding_key: str = ""
+    context_text: str = ""
 
 
 @dataclass

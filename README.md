@@ -1,50 +1,54 @@
 # Weave
 
-Weave is currently in maintenance mode while the upstream `memory-system` repository completes a
-private evidence-hardening phase.
+Weave is the Bash/Python implementation of a durable work, memory, and policy graph for coding
+agents. As of v1.71 it is maintained as a supported long-term maintenance (LTS) line, kept
+deliberately separate from an in-progress Rust successor program.
 
-No new public feature release is planned until the private evidence gates are lifted. The active
-work is to prove trusted capture, execution, durability, and host-verdict channels before expanding
-public claims or mutation authority.
+## Two Separate Lifecycles
+
+```
+┌────────────────────────────────┐
+│ Weave 1.71 LTS                  │
+│ Bash/Python compatibility       │
+│ Public maintenance releases     │
+└────────────────┬─────────────────┘
+                 │ contract / reference behavior
+                 ▼
+┌────────────────────────────────┐
+│ Rust successor program          │
+│ Shadow / read-only initially    │
+│ E1–E7 gates before mutation     │
+│ authority and cutover           │
+└────────────────────────────────┘
+```
+
+- **Weave 1.71 (this repository)** is the supported line. It receives correctness, security,
+  durability, compatibility, and installer fixes.
+- **The Rust successor** is a separate, non-authoritative program: shadow/read-only against this
+  repository's behavior as its reference contract, until it passes its own durability and evidence
+  gates (E1 through E7). Those gates block _Rust_ mutation authority and cutover — they do not, and
+  have never, blocked ordinary maintenance releases of this Bash/Python line.
 
 ## Public Status
 
-- Existing public releases remain available as-is.
-- New public releases are limited to critical safety or durability fixes.
-- Experimental mutation authority is not released.
-- Experimental evidence fixtures are not product guarantees.
-- Internal graph state, transcripts, host session exports, and evidence-lab artifacts are not part of
-  the public release surface.
+- Weave 1.71 is an active, supported maintenance line — not archived, not frozen.
+- Releases on this line are scoped to correctness, security, durability, compatibility, and
+  installer fixes, not new features.
+- No experimental Rust mutation authority, evaluation harness, or private evidence-lab code is part
+  of this release, or of any release on this maintenance line.
+- Internal graph state, transcripts, host session exports, and evidence-lab artifacts are not part
+  of the public release surface — this repository is generated and stays graph-free by design.
 
-## Current Internal Gates
-
-The upstream project is intentionally fail-closed:
-
-- E5 workflow evidence requires a trusted capture runner before workflows count.
-- E6 durability evidence requires a trusted execution runner before cases pass.
-- E2 dispatched remediation evidence requires an IPC verdict shape with `policy_revision`,
-  `reason_codes[]`, and `evidence_ids[]`.
-- E7 shadow evaluation depends on authoritative E2, E3, and E6 corpora.
-
-Until those gates close, the public channel should be treated as stable/archival rather than an
-active feature stream.
-
-## Maintenance Fixes
-
-The current maintenance projection is limited to:
-
-- skipping legacy pre-checkpoint SQL deltas correctly when the checkpoint `updated_at` value is an
-  ISO timestamp rather than a numeric epoch;
-- publishing this maintenance/freeze notice;
-- keeping private E1/E2/E4/E5/E6 evidence gate suites and fixtures out of the public release
-  bundle.
+See `CHANGELOG.md` for the fixes in each release.
 
 ## Existing Users
 
-If you already use Weave, keep using the release you have unless you need a specific safety fix.
+If you already use Weave, keep using the release you have unless you need a specific fix from a
+newer one. This release is published as a prerelease and will not be pulled in automatically by
+`wv-update`; install it explicitly if you want it before it is promoted.
 
-For private/internal deployments from the upstream source repository, update via the source clone and
-then refresh consumer repositories:
+For private/internal deployments from the upstream source repository, update via the source clone
+and then refresh consumer repositories:
 
 ```bash
 cd /path/to/memory-system
@@ -52,16 +56,30 @@ git pull --ff-only
 ./install.sh
 
 cd /path/to/consumer-repo
+wv repo-class --json
 wv init-repo --agent=all --update
 wv load
 wv bootstrap --json
 ```
 
-Use `--agent=claude`, `--agent=codex`, or `--agent=copilot` instead of `--agent=all` when a consumer
-repo should receive only one host surface.
+Run `init-repo` only for repositories classified as `owned`; bulk deployments must skip
+`vendored-upstream` and `ambiguous` targets. Use `--agent=claude`, `--agent=codex`, or
+`--agent=copilot` instead of `--agent=all` when a consumer repo should receive only one host
+surface.
 
 ## Archive Direction
 
-The public repository may move to an archival posture once the private replacement path is proven.
-That decision should happen after the trusted evidence gates and internal SSH-machine distribution
-path are stable.
+This repository is **not** being archived. Archival is a future decision, gated on all of the
+following being true at once:
+
+- a named successor repository is publicly accessible;
+- it has compatible install/update and migration instructions;
+- existing graphs load into it without semantic loss;
+- its mutation authority has passed its E1–E7 evidence gates;
+- rollback from the successor to Weave 1.71 has been demonstrated;
+- owned-machine canaries have run successfully for a defined period;
+- a final Weave 1.71 release ships migration and archival notices.
+
+None of those conditions are met today: the Rust program remains gated, mutation cutover has not
+happened, and no public production-ready successor exists yet. Until they are, Weave 1.71 continues
+to receive maintenance releases.

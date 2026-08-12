@@ -13,6 +13,8 @@ Usage:
 Invoked by the Bash wrapper: wv-cmd-quality.sh
 """
 
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import argparse
@@ -27,8 +29,10 @@ import sqlite3
 import subprocess
 import sys
 import time
+import unicodedata
 from fnmatch import fnmatch
 from pathlib import Path
+from typing import NoReturn, TypedDict
 import tempfile
 
 from weave_quality.ast_cache import ASTCache
@@ -38,8 +42,10 @@ from weave_quality.classification import classify_file, load_classify_overrides
 from weave_quality.external_tools import ast_grep_bin
 from weave_quality.typescript_parser import analyze_typescript_file
 from weave_quality.db import (
+    ADJUDICATION_NUDGE_SCANS,
+    adjudicate_pattern_finding,
+    begin_pattern_run,
     begin_scan,
-    bulk_insert_pattern_findings,
     bulk_upsert_co_changes,
     bulk_upsert_file_entries,
     bulk_upsert_function_cc,
@@ -47,14 +53,22 @@ from weave_quality.db import (
     db_exists,
     db_path,
     file_changed,
+    finish_pattern_run,
     finish_scan,
     get_all_trend_directions,
     get_file_entries,
     get_git_stats,
     init_db,
+    latest_pattern_run,
     latest_scan,
+    pattern_adjudication_report,
+    pattern_finding_states,
     pattern_findings_summary,
+    pattern_rule_runs,
     previous_scan,
+    record_pattern_rule_failure,
+    record_pattern_rule_success,
+    replace_pattern_scan_results,
     reset_db,
     get_all_function_cc,
     get_function_cc,
@@ -84,7 +98,14 @@ from weave_quality.hotspots import (
 )
 from weave_quality.findings import cmd_findings_promote
 from weave_quality.models import CKMetrics, FileEntry, FunctionCC, GitStats, PatternFinding
-from weave_quality.prose_rules import PROSE_LANGUAGES, rule_language, run_prose_rule
+from weave_quality.prose_rules import (
+    PROSE_LANGUAGES,
+    PatternRuleExecutionError,
+    PatternRuleValidationError,
+    load_prose_rule,
+    run_prose_rule,
+    validate_pattern_rule,
+)
 from weave_quality.python_parser import analyze_python_file
 
 log = logging.getLogger(__name__)
@@ -95,6 +116,7 @@ _VERSION_FILE = Path(__file__).parent.parent / "lib" / "VERSION"
 _SCANNER_VERSION = _VERSION_FILE.read_text().strip() if _VERSION_FILE.exists() else ""
 _MSG_NO_DB = "No quality.db found. Run 'wv quality scan' first."
 _MSG_NO_SCAN = "No scan data. Run 'wv quality scan' first."
+_MSG_NO_PATTERN_SCAN = "No pattern scan data. Run 'wv quality patterns scan' first."
 # ---------------------------------------------------------------------------
 # Path resolution
 # ---------------------------------------------------------------------------
@@ -129,12 +151,29 @@ def _load_config_excludes(repo: str) -> list[str]:
 def _resolve_repo(path: str | None) -> str:
     """Resolve the target repository root.
 
-    Uses the given path, or REPO_ROOT env, or git rev-parse.
-    Critical: when run from earth-engine-analysis/, scanner must target
-    THAT repo, not memory-system/ where wv is installed.
+    Uses the given path, or WV_REPO_ROOT_OVERRIDE env, or REPO_ROOT env, or
+    git rev-parse. Critical: when run from earth-engine-analysis/, scanner
+    must target THAT repo, not memory-system/ where wv is installed.
+
+    wv-20adef (external code review round 2): the bash `wv` entry point's
+    own wv-config.sh UNCONDITIONALLY reassigns REPO_ROOT from
+    `git rev-parse --show-toplevel` (the CURRENT PROCESS's cwd), regardless
+    of whatever value the parent process already set it to -- so a caller
+    like the MCP server's internal `wv quality patterns report` call, which
+    sets REPO_ROOT via subprocess env specifically to steer repo resolution
+    somewhere other than its own cwd, gets silently overridden before this
+    function ever sees it (report never receives an explicit path argument
+    for repo-resolution purposes at all -- see cmd_patterns_list's own
+    comment in the MCP server). WV_REPO_ROOT_OVERRIDE is never touched by
+    wv-config.sh, so a caller that needs to steer repo resolution past that
+    reassignment sets THIS instead, checked first.
     """
     if path:
         return str(Path(path).resolve())
+
+    override = os.environ.get("WV_REPO_ROOT_OVERRIDE", "")
+    if override:
+        return override
 
     repo_root = os.environ.get("REPO_ROOT", "")
     if repo_root:
@@ -1193,15 +1232,50 @@ def _promote_create(
 
 def _cmd_promote_patterns(args: argparse.Namespace) -> int:
     """Promote pattern findings grouped by rule_id to Weave nodes."""
+    repo = Path(_resolve_repo(None))
     conn = init_db(args.hot_zone)
-    scan = latest_scan(conn)
-    if scan is None:
+    run = latest_pattern_run(conn)
+    if run is None:
         conn.close()
-        print(_MSG_NO_SCAN, file=sys.stderr)
+        print(_MSG_NO_PATTERN_SCAN, file=sys.stderr)
         return 1
 
-    summary = pattern_findings_summary(conn, scan.id)
+    conf_disabled = _disabled_patterns(repo / ".weave" / "quality.conf")
+    try:
+        rules = _load_pattern_rules(repo, conf_disabled)
+    except PatternRuleValidationError as exc:
+        conn.close()
+        return _pattern_rule_error(exc, args.json)
+    receipts = {str(row["rule_id"]): row for row in pattern_rule_runs(conn, run.id)}
+    summary = pattern_findings_summary(conn, run.id)
+    current_hashes = {
+        rule_id: _pattern_definition_hash(rule_path) for rule_id, rule_path, _ in rules
+    }
+    incomplete = [
+        rule_id
+        for rule_id, definition_hash in current_hashes.items()
+        if (receipt := receipts.get(rule_id)) is None
+        or receipt["status"] != "success"
+        or receipt["definition_hash"] != definition_hash
+    ]
+    incomplete.extend(
+        str(row["rule_id"])
+        for row in summary
+        if str(row["rule_id"]) not in current_hashes
+    )
     conn.close()
+
+    if incomplete:
+        detail = (
+            "pattern findings are not a complete successful snapshot for active rules: "
+            + ", ".join(sorted(set(incomplete)))
+            + "; run: wv quality patterns scan"
+        )
+        if args.json:
+            print(json.dumps({"error": "incomplete_pattern_scan", "detail": detail}))
+        else:
+            print(f"Error: {detail}", file=sys.stderr)
+        return 1
 
     if not summary:
         msg = "No pattern findings to promote. Run: wv quality patterns scan"
@@ -1440,23 +1514,209 @@ _DEFAULT_PATTERNS_DIR = Path(__file__).parent / "default_patterns"
 
 def _load_pattern_rules(
     repo: Path, conf_disabled: set[str]
-) -> list[tuple[str, Path]]:
-    """Return [(rule_id, rule_path)] for all active pattern rules.
+) -> list[tuple[str, Path, str]]:
+    """Return [(rule_id, rule_path, language)] for all active pattern rules.
 
     Loads from:
       1. _DEFAULT_PATTERNS_DIR (built-in curated rules)
-      2. <repo>/.weave/patterns/*.yaml (user-defined rules)
+      2. <repo>/.weave/patterns/managed/*.yaml (projected by wv init-repo)
+      3. <repo>/.weave/patterns/*.yaml (user-defined rules)
     Rules whose id appears in conf_disabled are skipped.
+
+    language is captured here from validate_pattern_rule's own return value
+    (it already reads and parses the file to validate it) instead of being
+    re-derived later by a separate rule_language(rule_path) call. A second,
+    unguarded read raced a rule file that vanished or became unreadable
+    between validation and classification: rule_language() swallows OSError
+    into "", which silently misclassified an already-validated prose rule as
+    a code rule -- one that could then be dropped from `rules` entirely
+    before ever reaching the per-rule execution boundary that would
+    otherwise record a failed receipt (see wv-dc2e44).
     """
-    rules: list[tuple[str, Path]] = []
-    for rule_dir in (_DEFAULT_PATTERNS_DIR, repo / ".weave" / "patterns"):
+    rules: list[tuple[str, Path, str]] = []
+    patterns_dir = repo / ".weave" / "patterns"
+    seen: dict[str, Path] = {}
+    for rule_dir in (
+        _DEFAULT_PATTERNS_DIR,
+        patterns_dir / "managed",
+        patterns_dir,
+    ):
         if not rule_dir.is_dir():
             continue
         for yf in sorted(rule_dir.glob("*.yaml")):
             rule_id = yf.stem
-            if rule_id not in conf_disabled:
-                rules.append((rule_id, yf))
+            language = validate_pattern_rule(yf, rule_id)
+            if rule_id in conf_disabled:
+                continue
+            if rule_id in seen:
+                raise PatternRuleValidationError(
+                    f"duplicate pattern id {rule_id!r}: {seen[rule_id]} and {yf}"
+                )
+            seen[rule_id] = yf
+            rules.append((rule_id, yf, language))
     return rules
+
+
+def _shadowed_managed_pattern_ids(repo: Path) -> list[str]:
+    """Return rule ids a project-local rule is currently shadowing.
+
+    install.sh's managed-pattern reconcile writes <repo>/.weave/patterns/managed/.overridden
+    whenever a same-named .weave/patterns/<id>.yaml exists, so the managed
+    (often refined) version was never distributed into the repo. That is
+    almost always a completed promotion round-trip where the local copy
+    should be deleted — surface it instead of leaving it silent.
+    """
+    overridden_file = repo / ".weave" / "patterns" / "managed" / ".overridden"
+    if not overridden_file.is_file():
+        return []
+    ids = []
+    for line in overridden_file.read_text(encoding="utf-8").splitlines():
+        name = line.strip()
+        if name.endswith(".yaml"):
+            ids.append(name[: -len(".yaml")])
+    return ids
+
+
+def _pattern_rule_error(exc: PatternRuleValidationError, json_out: bool) -> int:
+    """Report an invalid pattern definition without presenting it as active."""
+    if json_out:
+        print(json.dumps({"error": "invalid_pattern_rule", "detail": str(exc)}))
+    else:
+        print(f"patterns: invalid rule: {exc}", file=sys.stderr)
+    return 1
+
+
+def _non_directory_repo_root_error(repo: Path, json_out: bool) -> int | None:
+    """Reject a `path` argument that resolves to something other than a
+    directory, returning an exit code to return immediately -- or None
+    when `repo` is fine (an existing directory).
+
+    wv-5b9f55 finding 9 (external code review): unlike scan/report,
+    where `path` names a scan TARGET within a fixed repo (a single file
+    is a legitimate target there), list/validate resolve `path` as the
+    REPOSITORY ROOT itself -- _candidate_pattern_files/_load_pattern_rules
+    both build `repo / ".weave" / "patterns"` and simply skip it via
+    `rule_dir.is_dir()` when it isn't a directory, silently falling back
+    to built-in rules only. That produced a misleadingly clean "validate"
+    result (or an incomplete "list") with no indication the project's own
+    custom/managed rules were never even looked for -- failing loudly
+    here instead.
+
+    wv-210ec4 (external code review round 2): the original check
+    exempted a MISSING or broken-symlink path from this contract
+    (`repo.exists()` is False for both, same as it is for a fresh, never-
+    created directory) on the theory that "doesn't exist" was a separate,
+    pre-existing concern -- but the MCP contract documents `path` as
+    "must be a directory" unconditionally, and a missing/broken root is
+    exactly the misleading-clean-result trap this function exists to
+    close: a typo'd or stale path still silently validated built-ins
+    only, indistinguishable from a project with no custom rules at all.
+    `not repo.is_dir()` covers missing, broken-symlink, and non-directory
+    file in one check -- `_resolve_repo`'s own fallbacks (explicit path,
+    REPO_ROOT env, git root, cwd) always resolve to a real existing
+    directory in ordinary use, so this only ever fires for a genuinely
+    bad explicit `path` argument.
+
+    wv-0065a6 (external code review round 3, finding 8): `repo.is_dir()`
+    itself raises PermissionError/OSError (not just returns False) when a
+    parent directory in `repo`'s own path is unreadable -- e.g. a repo
+    root sitting behind a chmod-000 ancestor -- producing an uncaught
+    traceback instead of this function's own promised structured JSON
+    error. Treated the same as "not a directory": we genuinely can't
+    confirm `repo` is usable either way.
+    """
+    try:
+        repo_is_dir = repo.is_dir()
+    except OSError as exc:
+        detail = f"{repo} could not be accessed ({exc.strerror or exc}) -- check its permissions"
+        if json_out:
+            print(json.dumps({"error": "invalid_repo_root", "detail": detail}))
+        else:
+            print(f"patterns: {detail}", file=sys.stderr)
+        return 1
+    if not repo_is_dir:
+        detail = (
+            f"{repo} is not a directory -- list/validate resolve `path` as the "
+            "repository ROOT (the base for .weave/patterns/), not a scan target "
+            "file; pass the repository directory instead"
+        )
+        if json_out:
+            print(json.dumps({"error": "invalid_repo_root", "detail": detail}))
+        else:
+            print(f"patterns: {detail}", file=sys.stderr)
+        return 1
+    return None
+
+
+def _pattern_definition_hash(rule_path: Path) -> str:
+    """Return the stable content hash used to bind execution receipts."""
+    return hashlib.sha256(rule_path.read_bytes()).hexdigest()
+
+
+def _normalise_finding_identity_text(value: str) -> str:
+    """Normalize prose/code fragments without depending on source line layout."""
+    return " ".join(unicodedata.normalize("NFKC", value).split())
+
+
+def _attach_pattern_finding_identities(
+    findings: list[PatternFinding], target: Path, repo: Path
+) -> None:
+    """Bind findings to rule, path, normalized match, and source-line context.
+
+    A source-read failure (deleted mid-scan, permission denied, ...) is
+    NOT swallowed here -- it propagates to the caller (cmd_patterns_scan),
+    which runs this inside the same per-rule PatternRuleExecutionError
+    boundary as rule execution itself, so it becomes a recorded failed
+    receipt. Silently falling back to an empty source previously let a
+    finding whose context could never actually be read still get recorded
+    as a successful, correctly-identified finding.
+    """
+    source_cache: dict[str, list[str]] = {}
+    for finding in findings:
+        source = target / finding.path if target.is_dir() else target
+        cache_key = str(source)
+        if cache_key not in source_cache:
+            source_cache[cache_key] = source.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+        lines = source_cache[cache_key]
+        context = lines[finding.line - 1] if 0 < finding.line <= len(lines) else finding.match_text
+        # os.path.abspath, not Path.resolve() -- resolve() follows symlinks,
+        # which would key a symlinked file's finding identity/report path on
+        # its target's location rather than the name it was actually scanned
+        # under, and could fold a real file and a symlink to it into a
+        # collision (or split one file's own identity across two labels).
+        try:
+            finding.path = (
+                Path(os.path.abspath(str(source)))
+                .relative_to(Path(os.path.abspath(str(repo))))
+                .as_posix()
+            )
+        except ValueError:
+            # Outside repo (a test fixture, or any --path pointed elsewhere):
+            # the target-relative label alone (e.g. "a.md") isn't a stable
+            # identity -- two distinct files under different external
+            # targets can share it, colliding their finding_key and
+            # adjudication history. Use the lexical absolute source path
+            # instead; _report_scope scopes reports against this same form.
+            finding.path = Path(os.path.abspath(str(source))).as_posix()
+        normalized_match = _normalise_finding_identity_text(finding.match_text)
+        finding.context_text = _normalise_finding_identity_text(context)
+        identity = json.dumps(
+            [finding.rule_id, finding.path, normalized_match, finding.context_text],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        finding.finding_key = "qf-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _pattern_execution_error(exc: PatternRuleExecutionError, json_out: bool) -> int:
+    """Report a rule execution failure without replacing prior findings."""
+    if json_out:
+        print(json.dumps({"error": "pattern_rule_execution_failed", "detail": str(exc)}))
+    else:
+        print(f"patterns: rule execution failed: {exc}", file=sys.stderr)
+    return 1
 
 
 def _disabled_patterns(conf_path: Path) -> set[str]:
@@ -1473,12 +1733,65 @@ def _disabled_patterns(conf_path: Path) -> set[str]:
     return disabled
 
 
+def _validate_ast_grep_match(match: dict[str, object], rule_path: Path, target: Path) -> None:
+    """Validate one ast-grep JSON match record before path/range handling.
+
+    A malformed record -- from a backend bug, or a crafted/corrupted
+    process substitution -- must fail closed as PatternRuleExecutionError,
+    not escape as an uncaught AttributeError/TypeError/ValueError from a
+    downstream .get()/int() call, and not silently resolve an empty "file"
+    field to Path("") == "." (which can pass the directory-target
+    containment check when cwd happens to equal the target, creating a
+    phantom finding at that path). line/column are optional (default 0,
+    matching the original relaxed .get(key, 0) reads) but must be
+    nonnegative integers -- excluding bool, which is an int subclass in
+    Python -- when present. A NUL byte in "file" passes every check above
+    (nonempty string, lexical abspath/relative_to containment) but later
+    raises ValueError ("embedded null byte") the first time something
+    actually opens the path (e.g. Path.read_text() during finding-identity
+    attachment) -- reject it here instead, at the same boundary as every
+    other malformed-record case.
+    """
+
+    def fail(detail: str) -> NoReturn:
+        raise PatternRuleExecutionError(
+            f"{rule_path}: ast-grep returned a malformed match record for {target}: {detail}"
+        )
+
+    file_field = match.get("file")
+    if not isinstance(file_field, str) or not file_field:
+        fail("file must be a nonempty string")
+    if "\x00" in file_field:
+        fail("file must not contain a NUL byte")
+    rng = match.get("range")
+    if not isinstance(rng, dict):
+        fail("range must be an object")
+    start = rng.get("start")
+    if not isinstance(start, dict):
+        fail("range.start must be an object")
+    for key in ("line", "column"):
+        value = start.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            fail(f"range.start.{key} must be a nonnegative integer")
+    text = match.get("text", "")
+    if not isinstance(text, str):
+        fail("text must be a string")
+
+
 def _run_pattern_rule(
-    rule_id: str, rule_path: Path, target: Path, scan_id: int
+    rule_id: str, rule_path: Path, target: Path, scan_id: int, repo: Path, language: str
 ) -> list[PatternFinding]:
-    """Run one rule file on target; return PatternFinding list."""
-    if rule_language(rule_path) in PROSE_LANGUAGES:
-        return run_prose_rule(rule_id, rule_path, target, scan_id)
+    """Run one rule file on target; return PatternFinding list.
+
+    language is the caller's already-validated classification (see
+    _load_pattern_rules), not re-derived here -- a second rule_language()
+    read at execution time could race a rule file that vanishes between
+    validation and this call, silently reclassifying an already-validated
+    prose rule as code instead of surfacing the read failure as a proper
+    execution error.
+    """
+    if language in PROSE_LANGUAGES:
+        return run_prose_rule(rule_id, rule_path, target, scan_id, repo)
 
     ast_grep = ast_grep_bin()
     if not ast_grep:
@@ -1486,35 +1799,70 @@ def _run_pattern_rule(
     cmd = [ast_grep, "scan", "--rule", str(rule_path), "--json", str(target)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
-    except subprocess.TimeoutExpired:
-        log.warning("ast-grep timed out scanning %s with rule %s", target, rule_id)
-        return []
-    if proc.returncode == 2 or (proc.returncode not in (0, 1) and not proc.stdout.strip()):
-        log.warning("ast-grep error for rule %s on %s: %s", rule_id, target, proc.stderr[:200])
-        return []
+    except subprocess.TimeoutExpired as exc:
+        raise PatternRuleExecutionError(
+            f"{rule_path}: ast-grep timed out scanning {target}"
+        ) from exc
+    if proc.returncode not in (0, 1):
+        detail = proc.stderr.strip()[:500] or f"exit {proc.returncode}"
+        raise PatternRuleExecutionError(f"{rule_path}: ast-grep failed on {target}: {detail}")
     if not proc.stdout.strip():
         return []
     try:
         matches = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return []
+    except json.JSONDecodeError as exc:
+        raise PatternRuleExecutionError(
+            f"{rule_path}: ast-grep returned malformed JSON for {target}"
+        ) from exc
+    if not isinstance(matches, list):
+        raise PatternRuleExecutionError(
+            f"{rule_path}: ast-grep returned non-list JSON for {target}"
+        )
     findings: list[PatternFinding] = []
-    if isinstance(matches, list):
-        for m in matches:
-            rng = m.get("range", {})
-            start = rng.get("start", {})
-            findings.append(
-                PatternFinding(
-                    path=str(Path(m.get("file", "")).relative_to(target)
-                              if target.is_dir() else Path(m.get("file", "")).name),
-                    scan_id=scan_id,
-                    rule_id=rule_id,
-                    line=start.get("line", 0) + 1,
-                    col=start.get("column", 0),
-                    match_text=(m.get("text", "") or "")[:200],
-                    severity="warning",
-                )
+    for match in matches:
+        if not isinstance(match, dict):
+            raise PatternRuleExecutionError(
+                f"{rule_path}: ast-grep returned an invalid match record for {target}"
             )
+        _validate_ast_grep_match(match, rule_path, target)
+        rng = match["range"]
+        start = rng["start"]
+        match_path = Path(str(match["file"]))
+        # os.path.abspath (not .resolve(), which would follow symlinks and
+        # relabel a result under its target's real location) normalizes away
+        # "." / ".." components before the containment check below --
+        # relative_to() alone does a purely lexical prefix comparison, so an
+        # unnormalized "target/../sibling/x.py" would pass containment
+        # against "target" despite lexically escaping it.
+        norm_match = Path(os.path.abspath(str(match_path)))
+        norm_target = Path(os.path.abspath(str(target)))
+        if target.is_dir():
+            try:
+                display_path = str(norm_match.relative_to(norm_target))
+            except ValueError as exc:
+                raise PatternRuleExecutionError(
+                    f"{rule_path}: ast-grep returned a file outside target {target}: {match_path}"
+                ) from exc
+        else:
+            # A single-file target has no containment relationship to check
+            # via relative_to -- the result must name that exact file, not
+            # merely share its basename with a different file elsewhere.
+            if norm_match != norm_target:
+                raise PatternRuleExecutionError(
+                    f"{rule_path}: ast-grep returned a file outside target {target}: {match_path}"
+                )
+            display_path = norm_target.name
+        findings.append(
+            PatternFinding(
+                path=display_path,
+                scan_id=scan_id,
+                rule_id=rule_id,
+                line=int(start.get("line", 0)) + 1,
+                col=int(start.get("column", 0)),
+                match_text=str(match.get("text", "")),
+                severity="warning",
+            )
+        )
     return findings
 
 
@@ -1522,23 +1870,22 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
     """Run all active pattern rules and store findings."""
     repo = Path(_resolve_repo(None))
     conn = init_db(args.hot_zone)
-    scan = latest_scan(conn)
-    if scan is None:
-        print("No scan in DB — run: wv quality scan", file=sys.stderr)
-        conn.close()
-        return 1
 
     conf_disabled = _disabled_patterns(repo / ".weave" / "quality.conf")
-    rules = _load_pattern_rules(repo, conf_disabled)
+    try:
+        rules = _load_pattern_rules(repo, conf_disabled)
+    except PatternRuleValidationError as exc:
+        conn.close()
+        return _pattern_rule_error(exc, args.json)
     prose_rules = [
-        (rule_id, rule_path)
-        for rule_id, rule_path in rules
-        if rule_language(rule_path) in PROSE_LANGUAGES
+        (rule_id, rule_path, language)
+        for rule_id, rule_path, language in rules
+        if language in PROSE_LANGUAGES
     ]
     code_rules = [
-        (rule_id, rule_path)
-        for rule_id, rule_path in rules
-        if rule_language(rule_path) not in PROSE_LANGUAGES
+        (rule_id, rule_path, language)
+        for rule_id, rule_path, language in rules
+        if language not in PROSE_LANGUAGES
     ]
     if code_rules and not ast_grep_available():
         print(
@@ -1547,79 +1894,735 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         rules = prose_rules
-    if not rules:
-        msg = "No pattern rules found."
-        print(json.dumps({"rules": 0, "findings": 0}) if args.json else msg)
+
+    # Canonicalize and validate the target before the no-rules branch below
+    # -- a zero-rule invocation (every rule disabled, or only code rules
+    # exist and ast-grep is unavailable) must still reject a nonexistent
+    # target rather than reporting success.
+    target, canonical_target = _canonicalize_target(repo, getattr(args, "path", None))
+    if not target.exists():
         conn.close()
+        return _pattern_execution_error(
+            PatternRuleExecutionError(f"target does not exist: {target}"), args.json
+        )
+
+    if not rules:
+        # Every invocation gets its own pattern_runs lifecycle row, even a
+        # zero-rule one -- otherwise report/list keep presenting an earlier
+        # target's scope, and this successful invocation is simply absent
+        # from lifecycle history (see wv-40d3d6).
+        run_id = begin_pattern_run(conn, git_head_sha(repo), canonical_target)
+        finish_pattern_run(conn, run_id, files_count=0, duration_ms=0)
+        conn.close()
+        msg = "No pattern rules found."
+        print(
+            json.dumps(
+                {
+                    "rules": 0,
+                    "rules_run": 0,
+                    "findings": 0,
+                    "by_rule": {},
+                    "matches": [],
+                }
+            )
+            if args.json
+            else msg
+        )
         return 0
 
-    target = Path(getattr(args, "path", None) or repo)
+    # Pattern scans get their own lifecycle id, independent of scan_meta (the
+    # complexity-scan sequence) -- a rescan or an unrelated `wv quality scan`
+    # must not collide with or prune this invocation's findings.
+    run_id = begin_pattern_run(conn, git_head_sha(repo), canonical_target)
+    started = time.time()
+
     all_findings: list[PatternFinding] = []
-    for rule_id, rule_path in rules:
-        found = _run_pattern_rule(rule_id, rule_path, target, scan.id)
-        all_findings.extend(found)
-
-    # Normalise paths relative to repo
-    for f in all_findings:
+    successful_runs: list[dict[str, object]] = []
+    for rule_id, rule_path, language in rules:
+        # "" default -- if _pattern_definition_hash itself fails below (the
+        # rule file vanished between discovery and here), the except clause
+        # still has SOME value to record a failed receipt with.
+        definition_hash = ""
         try:
-            f.path = str(Path(f.path))
-        except ValueError:
-            pass
+            # Hashing is inside the boundary too: a rule that disappears
+            # after _load_pattern_rules discovered it (deleted mid-scan)
+            # must record a failed receipt, not escape here uncaught before
+            # a single try/except in this loop has even started watching.
+            definition_hash = _pattern_definition_hash(rule_path)
+            found = _run_pattern_rule(rule_id, rule_path, target, run_id, repo, language)
+            # Identity attachment reads each finding's source file and
+            # builds a Path from a backend-derived path string -- kept
+            # inside this same failure boundary (not run once for the
+            # whole scan afterward) so a path a validated-but-still-bad
+            # backend result produces (or any other OS/Path failure here)
+            # becomes a PatternRuleExecutionError and a recorded failed
+            # receipt for the rule that actually produced it, instead of an
+            # uncaught exception that leaves the run unfinished with no
+            # receipt and silently drops every finding gathered so far.
+            _attach_pattern_finding_identities(found, target, repo)
+        except PatternRuleExecutionError as exc:
+            record_pattern_rule_failure(
+                conn,
+                run_id,
+                rule_id,
+                definition_hash,
+                str(rule_path),
+                canonical_target,
+                str(exc),
+            )
+            conn.close()
+            return _pattern_execution_error(exc, args.json)
+        except (OSError, ValueError) as exc:
+            wrapped = PatternRuleExecutionError(
+                f"{rule_path}: failed to prepare or execute rule against {target}: {exc}"
+            )
+            record_pattern_rule_failure(
+                conn,
+                run_id,
+                rule_id,
+                definition_hash,
+                str(rule_path),
+                canonical_target,
+                str(wrapped),
+            )
+            conn.close()
+            return _pattern_execution_error(wrapped, args.json)
+        # Recorded immediately (not only via the batched
+        # replace_pattern_scan_results call below) so this rule's
+        # successful, zero-hit-or-not receipt survives a LATER rule's
+        # failure in the same scan -- otherwise a completed rule is
+        # reported "not_run", indistinguishable from never having executed,
+        # whenever any later rule in the same invocation fails.
+        record_pattern_rule_success(
+            conn, run_id, rule_id, definition_hash, str(rule_path), canonical_target, len(found)
+        )
+        all_findings.extend(found)
+        successful_runs.append(
+            {
+                "rule_id": rule_id,
+                "definition_hash": definition_hash,
+                "rule_path": str(rule_path),
+                "target": canonical_target,
+                "hits": len(found),
+                "ran_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+        )
 
-    conn.execute("DELETE FROM pattern_findings WHERE scan_id = ?", (scan.id,))
-    bulk_insert_pattern_findings(conn, all_findings)
+    # wv-c71833: snapshot each rule's own raw match count before the
+    # same-start-location collision suppression below can shrink it. This
+    # is distinct from and unaffected by that suppression -- it is what the
+    # rule itself matched -- and is surfaced in the scan output (raw_hits)
+    # so a rule that loses every match to a higher-maturity rule at the
+    # same (path, line, col) still shows evidence of having matched
+    # something, instead of reading identically to a genuine zero-hit rule.
+    raw_hits_by_rule = {str(run["rule_id"]): int(str(run["hits"])) for run in successful_runs}
+
+    # wv-19bc39 (external code review round 3 re-audit): two different rule
+    # ids can each independently flag the identical (path, line, col) -- the
+    # audit's own reproduction had a built-in and a project-local prose rule
+    # both firing on the same comma-plus-"so" text, inflating the scan total
+    # and adjudication/waiver tracking with what is, from a reader's
+    # perspective, one finding counted twice. Keyed on (path, line, col)
+    # only, not match_text -- the two colliding rules captured slightly
+    # different surrounding text at the SAME start position in the audit's
+    # own repro. Deliberately narrow: does not attempt to merge findings
+    # whose spans overlap at DIFFERENT start columns (a fuzzier, unrelated
+    # problem) -- only an exact (path, line, col) collision counts.
+    # Higher-maturity rule wins (promotable > observed > candidate); code
+    # rules and ties fall back to rule_id order for a deterministic pick.
+    # This only trims the STORED/REPORTED finding set -- each rule's own
+    # per-rule "hits" receipt (record_pattern_rule_success, already written
+    # above) is unaffected and still counts every match that rule itself
+    # produced, independent of what any other rule also matched at the same
+    # spot; that is an intrinsic property of the rule, not a duplicate.
+    if len(all_findings) > 1:
+        rule_maturity: dict[str, str] = {}
+        for maturity_rule_id, maturity_rule_path, maturity_language in rules:
+            if maturity_language in PROSE_LANGUAGES:
+                try:
+                    parsed_rule = load_prose_rule(maturity_rule_path, maturity_rule_id)
+                except (PatternRuleValidationError, OSError, ValueError):
+                    continue
+                rule_maturity[maturity_rule_id] = str(parsed_rule.get("maturity", "candidate"))
+        maturity_rank = {"promotable": 2, "observed": 1, "candidate": 0}
+        by_span: dict[tuple[str, int, int], list[PatternFinding]] = {}
+        for pf in all_findings:
+            by_span.setdefault((pf.path, pf.line, pf.col), []).append(pf)
+        if any(len(group) > 1 for group in by_span.values()):
+            deduped: list[PatternFinding] = []
+            for group in by_span.values():
+                group.sort(
+                    key=lambda f: (
+                        -maturity_rank.get(rule_maturity.get(f.rule_id, "candidate"), 0),
+                        f.rule_id,
+                    )
+                )
+                deduped.append(group[0])
+            all_findings = deduped
+
+    # wv-c71833: the receipt's persisted "hits" must agree with what this
+    # same invocation reports in by_rule and stores in pattern_findings --
+    # otherwise `patterns scan`, `patterns list`, and a rule's own receipt
+    # read as three different counts for the same run. Overwrite each
+    # successful run's hits from the (possibly deduped) all_findings that
+    # actually landed in the store; raw_hits_by_rule (captured above, before
+    # dedup) still carries what the rule itself matched for the scan output.
+    final_hits_by_rule: dict[str, int] = {}
+    for pf in all_findings:
+        final_hits_by_rule[pf.rule_id] = final_hits_by_rule.get(pf.rule_id, 0) + 1
+    for run in successful_runs:
+        run["hits"] = final_hits_by_rule.get(str(run["rule_id"]), 0)
+
+    replace_pattern_scan_results(conn, run_id, all_findings, successful_runs)
+    finish_pattern_run(
+        conn,
+        run_id,
+        files_count=len({finding.path for finding in all_findings}),
+        duration_ms=int((time.time() - started) * 1000),
+    )
+    finding_states = {
+        str(row["finding_key"]): row
+        for row in pattern_finding_states(
+            conn, sorted({finding.finding_key for finding in all_findings})
+        )
+    }
     conn.close()
 
-    summary = {r: sum(1 for f in all_findings if f.rule_id == r) for r, _ in rules}
+    summary = {r: sum(1 for f in all_findings if f.rule_id == r) for r, _, _ in rules}
+    # wv-c71833: by_rule (== stored receipt hits == patterns list count for
+    # this scan) vs. what each rule itself matched before same-start-location
+    # collision suppression -- only present as its own key so by_rule's
+    # values keep meaning exactly one thing (the reported/stored count).
+    raw_hits = {r: raw_hits_by_rule.get(r, 0) for r, _, _ in rules}
     total = len(all_findings)
 
+    matches = [
+        {
+            "rule_id": finding.rule_id,
+            "path": finding.path,
+            "line": finding.line,
+            "col": finding.col + 1,
+            "match_text": finding.match_text,
+            "severity": finding.severity,
+            "finding_key": finding.finding_key,
+            "disposition": finding_states[finding.finding_key]["disposition"],
+            "scan_count": finding_states[finding.finding_key]["scan_count"],
+        }
+        for finding in sorted(
+            all_findings,
+            key=lambda finding: (finding.rule_id, finding.path, finding.line, finding.col),
+        )
+    ]
     if args.json:
-        print(json.dumps({"rules_run": len(rules), "findings": total, "by_rule": summary}))
+        print(
+            json.dumps(
+                {
+                    "rules": len(rules),
+                    "rules_run": len(rules),
+                    "findings": total,
+                    "by_rule": summary,
+                    "raw_hits": raw_hits,
+                    "matches": matches,
+                }
+            )
+        )
     else:
         print(f"Pattern scan complete: {len(rules)} rules, {total} findings")
         for rule_id, count in sorted(summary.items(), key=lambda x: -x[1]):
-            print(f"  {rule_id}: {count}")
+            raw = raw_hits.get(rule_id, count)
+            suffix = (
+                f"  ({raw} matched, {raw - count} suppressed as same-position duplicate)"
+                if raw > count
+                else ""
+            )
+            print(f"  {rule_id}: {count}{suffix}")
+            for finding in matches:
+                if finding["rule_id"] == rule_id:
+                    match_text = str(finding["match_text"]).replace("\n", " ")
+                    print(
+                        f"    {finding['path']}:{finding['line']}:{finding['col']}: "
+                        f"[{finding['rule_id']}/{finding['severity']}] {match_text}"
+                    )
     return 0
+
+
+def cmd_patterns_adjudicate(args: argparse.Namespace) -> int:
+    """Apply a human disposition to one stable pattern finding identity."""
+    conn = init_db(args.hot_zone)
+    row = adjudicate_pattern_finding(
+        conn, args.finding_key, args.disposition, getattr(args, "note", None)
+    )
+    if row is None:
+        conn.close()
+        detail = f"unknown pattern finding key: {args.finding_key}"
+        if args.json:
+            print(json.dumps({"error": "pattern_finding_not_found", "detail": detail}))
+        else:
+            print(f"Error: {detail}", file=sys.stderr)
+        return 1
+    report = pattern_adjudication_report(conn)
+    conn.close()
+    payload = {"finding": row, "report": report}
+    if args.json:
+        print(json.dumps(payload))
+    else:
+        print(
+            f"Adjudicated {row['finding_key']}: {row['disposition']} "
+            f"({row['rule_id']} {row['path']})"
+        )
+    return 0
+
+
+def _canonicalize_target(repo: Path, raw: str | None) -> tuple[Path, str]:
+    """Resolve a raw CLI path argument against cwd, then relativize to repo.
+
+    Returns (absolute lexical Path, canonical repo-relative posix string --
+    or an absolute string when the target is outside repo, e.g. a test
+    fixture). Shared by cmd_patterns_scan (to pick the scan target) and
+    cmd_patterns_report (to interpret an explicit `--path` the same way) --
+    an explicit CLI argument is cwd-relative like any other path argument,
+    unlike a *stored* scan target, which cmd_patterns_scan already wrote out
+    canonicalized and so is used as-is (see _report_scope).
+
+    Absolute via os.path.abspath, not Path.resolve() -- resolve() follows
+    symlinks, which would make a symlinked target's canonical label (and
+    thus its paths: matching and report scoping) reflect where the symlink
+    points rather than the name the caller actually asked for.
+    """
+    target = Path(os.path.abspath(raw)) if raw else repo
+    try:
+        canonical = target.relative_to(repo).as_posix()
+    except ValueError:
+        # Outside repo (e.g. a test fixture) -- keep an absolute label rather
+        # than raising; scans/reports against synthetic targets are still valid.
+        canonical = str(target)
+    return target, canonical
+
+
+def _report_scope(repo: Path, target_str: str | None) -> tuple[str | None, str | None]:
+    """Resolve a stored scan target to (display label, repo-relative path-prefix filter).
+
+    The label is the raw target string (matching how `list` shows "last
+    scanned: <target>"); the filter is None -- meaning report everything,
+    unscoped -- only when there's no known target yet, or the target IS the
+    repo root (a "." prefix would reject every finding instead of admitting
+    all of them). A target outside the repo (e.g. an explicit `--path`
+    elsewhere, or a test fixture) still gets a filter: its lexical absolute
+    path, matching how _attach_pattern_finding_identities identifies
+    findings under it.
+
+    `patterns scan` now stores a canonical repo-relative posix string (see
+    cmd_patterns_scan) -- that's used directly rather than re-resolved
+    against the current process cwd, which is what made a stored relative
+    target resolve differently depending on where `report` was later
+    invoked from. An absolute target_str (an explicit `--path` argument, or
+    a receipt written before this fix) is still resolved against repo for
+    backward compatibility.
+    """
+    if not target_str:
+        return None, None
+    candidate = Path(target_str)
+    if candidate.is_absolute():
+        # Legacy absolute receipt (written before targets were canonicalized)
+        # -- os.path.abspath, not .resolve(), so this stays consistent with
+        # the lexical (non-symlink-following) paths used everywhere else.
+        try:
+            rel = (
+                Path(os.path.abspath(target_str))
+                .relative_to(Path(os.path.abspath(str(repo))))
+                .as_posix()
+            )
+        except ValueError:
+            # Genuinely outside repo -- scope by the same lexical absolute
+            # path findings under it were identified by, instead of
+            # dropping the filter and reporting everything unscoped.
+            rel = Path(os.path.abspath(target_str)).as_posix()
+    else:
+        rel = candidate.as_posix()
+    return target_str, None if rel == "." else rel
+
+
+def cmd_patterns_report(args: argparse.Namespace) -> int:
+    """Report per-rule precision and recurring waiver clusters, scoped to a target."""
+    repo = Path(_resolve_repo(None))
+    conn = init_db(args.hot_zone)
+    run = latest_pattern_run(conn)
+    # The run row itself names the scope, not a receipt derived from it -- an
+    # interrupted or zero-rule run still has a target on pattern_runs even
+    # with no (or zero) per-rule receipts, so deriving scope from the first
+    # receipt would silently fall back to an unscoped report for those runs.
+    last_scan_target = run.target if run is not None else None
+    explicit_path = getattr(args, "path", None)
+    target_str: str | None
+    if explicit_path:
+        # A CLI argument is cwd-relative like any other path argument --
+        # canonicalize it the same way cmd_patterns_scan canonicalizes its
+        # own target, instead of treating it as already repo-relative (only
+        # the STORED last_scan_target actually is).
+        _, target_str = _canonicalize_target(repo, str(explicit_path))
+    else:
+        target_str = last_scan_target
+    scope_label, scope_prefix = _report_scope(repo, target_str)
+    report = pattern_adjudication_report(conn, path_prefix=scope_prefix)
+    conn.close()
+    report["scope"] = scope_label
+    if args.json:
+        print(json.dumps(report))
+        return 0
+    if not report["by_rule"]:
+        msg = "No pattern findings have been observed."
+        if scope_label is not None:
+            msg = f"No pattern findings have been observed under {scope_label}."
+        print(msg)
+        return 0
+    scope_suffix = f" (scope: {scope_label})" if scope_label is not None else ""
+    print(f"Pattern adjudication report{scope_suffix}:")
+    by_rule = report["by_rule"]
+    assert isinstance(by_rule, dict)
+    needs_adjudication: list[str] = []
+    for rule_id, summary in by_rule.items():
+        assert isinstance(summary, dict)
+        precision = summary["decided_precision"]
+        precision_text = "unavailable" if precision is None else f"{float(precision):.3f}"
+        nudge = ""
+        if summary.get("needs_adjudication"):
+            needs_adjudication.append(rule_id)
+            nudge = " [needs adjudication]"
+        print(
+            f"  {rule_id}: decided_precision={precision_text} "
+            f"decided_count={summary['decided_count']} "
+            f"findings={summary['findings']} occurrences={summary['occurrences']} "
+            f"unresolved={summary['unresolved']}{nudge}"
+        )
+    if needs_adjudication:
+        print(
+            f"Needs adjudication (0 decided across >= {ADJUDICATION_NUDGE_SCANS} "
+            f"scans of occurrence): {', '.join(needs_adjudication)}"
+        )
+    waivers = report["recurring_waivers"]
+    assert isinstance(waivers, list)
+    print(f"Recurring waivers: {len(waivers)}")
+    for waiver in waivers:
+        assert isinstance(waiver, dict)
+        print(
+            f"  {waiver['finding_key']} {waiver['rule_id']} {waiver['path']} "
+            f"scans={waiver['scan_count']}"
+        )
+    return 0
+
+
+_PROSE_SCHEMA_KINDS = ("lexicon", "motif", "density", "regex")
+_PROSE_SCHEMA_MATCH_SCOPES = ("line", "paragraph", "document")
+_PROSE_SCHEMA_MATURITIES = ("candidate", "observed", "promotable")
+_PROSE_SCHEMA_OPTIONAL_KEYS = (
+    "exempt",
+    "paths",
+    "min_count",
+    "require_no_digit_within",
+    "positive_controls",
+    "negative_controls",
+    "severity",
+    "policy",
+    "provenance",
+    "message",
+)
+
+
+class _RuleSchemaInfo(TypedDict):
+    """Coverage-relevant fields for one validated prose rule.
+
+    Kept out of the JSON-serializable result entries (a plain dict[str,
+    object]) and tracked separately by id(entry) instead -- so a rule
+    invalidated by a later id-collision check is trivially excluded from
+    coverage just by not being looked up, with nothing to pop/clean up.
+    """
+
+    kind: str
+    match_scope: str
+    maturity: str | None
+    keys: list[str]
+
+
+def _candidate_pattern_files(repo: Path) -> list[Path]:
+    """Return every *.yaml candidate across all three rule tiers, duplicates and all.
+
+    Unlike `_load_pattern_rules` (which fails closed on the first invalid
+    file, and treats a same-id collision across tiers as fatal), this
+    enumerates every file so `validate` can report every rule's own status
+    in one pass instead of one-fix-rerun-repeat.
+    """
+    patterns_dir = repo / ".weave" / "patterns"
+    files: list[Path] = []
+    for rule_dir in (_DEFAULT_PATTERNS_DIR, patterns_dir / "managed", patterns_dir):
+        if rule_dir.is_dir():
+            files.extend(sorted(rule_dir.glob("*.yaml")))
+    return files
+
+
+def cmd_patterns_validate(args: argparse.Namespace) -> int:
+    """Validate every candidate rule independently and report schema coverage.
+
+    `list`/`scan` fail closed on the first invalid rule file, which turns
+    fixing several broken rules into a one-at-a-time loop. This validates
+    each candidate on its own so every error surfaces in one pass, plus a
+    coverage summary of which documented prose schema kind/match_scope/
+    maturity/optional-key values are actually exercised by the valid ones --
+    catching schema surface that's documented but dead.
+    """
+    repo = Path(_resolve_repo(getattr(args, "path", None)))
+    error_code = _non_directory_repo_root_error(repo, args.json)
+    if error_code is not None:
+        return error_code
+    try:
+        files = _candidate_pattern_files(repo)
+    except OSError as exc:
+        # wv-0065a6 (external code review round 3, finding 8): repo itself
+        # passed _non_directory_repo_root_error's check above, but a
+        # *tier* directory under it (e.g. .weave/patterns/ made
+        # unreadable, not just missing) can still raise PermissionError
+        # out of rule_dir.is_dir()/.glob() -- an uncaught traceback
+        # instead of the structured error this command otherwise
+        # promises. A genuinely ABSENT tier directory still stays a
+        # silent, valid skip (rule_dir.is_dir() returning False, not
+        # raising) -- only inaccessibility is treated as an error.
+        detail = f"could not enumerate pattern rule directories under {repo} ({exc.strerror or exc})"
+        if args.json:
+            print(json.dumps({"error": "invalid_repo_root", "detail": detail}))
+        else:
+            print(f"patterns: {detail}", file=sys.stderr)
+        return 1
+
+    results: list[dict[str, object]] = []
+    schema_by_id: dict[int, _RuleSchemaInfo] = {}
+    all_valid = True
+    for rule_path in files:
+        rule_id = rule_path.stem
+        entry: dict[str, object] = {"rule_id": rule_id, "path": str(rule_path)}
+        try:
+            language = validate_pattern_rule(rule_path, rule_id)
+            entry["status"] = "valid"
+            entry["language"] = language
+            if language in PROSE_LANGUAGES:
+                rule = load_prose_rule(rule_path, rule_id)
+                schema_by_id[id(entry)] = {
+                    "kind": str(rule.get("kind", "")),
+                    "match_scope": str(rule.get("match_scope", "")),
+                    "maturity": str(rule["maturity"]) if "maturity" in rule else None,
+                    "keys": [key for key in _PROSE_SCHEMA_OPTIONAL_KEYS if key in rule],
+                }
+        except PatternRuleValidationError as exc:
+            entry["status"] = "invalid"
+            entry["error"] = str(exc)
+            all_valid = False
+        results.append(entry)
+
+    # The real loader (_load_pattern_rules) rejects a same-id rule appearing
+    # in more than one tier/file. Cross-check ALL candidates here -- not
+    # just the ones that independently validated -- because if one of two
+    # same-id files happens to be malformed, the loader fails on ITS error
+    # first, but the otherwise-valid copy is just as unusable once that's
+    # fixed; flag the collision now instead of only surfacing it in a later
+    # validate run. A malformed entry keeps its own parse error with the
+    # collision appended, rather than losing it.
+    by_id: dict[str, list[dict[str, object]]] = {}
+    for entry in results:
+        by_id.setdefault(str(entry["rule_id"]), []).append(entry)
+    for rule_id, entries in by_id.items():
+        if len(entries) < 2:
+            continue
+        all_paths = sorted(str(e["path"]) for e in entries)
+        for entry in entries:
+            others = [p for p in all_paths if p != entry["path"]]
+            collision = f"duplicate pattern id {rule_id!r} also defined in: " + ", ".join(others)
+            if entry["status"] == "valid":
+                entry["status"] = "invalid"
+                entry.pop("language", None)
+                schema_by_id.pop(id(entry), None)
+                entry["error"] = collision
+            else:
+                entry["error"] = f"{entry['error']} (also: {collision})"
+        all_valid = False
+
+    # Coverage reflects entries still valid AFTER collision invalidation --
+    # computing it from the first pass would count a rule's kind/scope/
+    # maturity/keys as "exercised" even though it ended up invalid.
+    kinds_seen: set[str] = set()
+    scopes_seen: set[str] = set()
+    maturities_seen: set[str] = set()
+    keys_seen: set[str] = set()
+    for entry in results:
+        if entry["status"] != "valid":
+            continue
+        schema = schema_by_id.get(id(entry))
+        if schema is None:
+            continue
+        kinds_seen.add(schema["kind"])
+        scopes_seen.add(schema["match_scope"])
+        if schema["maturity"] is not None:
+            maturities_seen.add(schema["maturity"])
+        keys_seen.update(schema["keys"])
+
+    coverage = {
+        "kinds": {kind: kind in kinds_seen for kind in _PROSE_SCHEMA_KINDS},
+        "match_scopes": {
+            scope: scope in scopes_seen for scope in _PROSE_SCHEMA_MATCH_SCOPES
+        },
+        "maturities": {
+            maturity: maturity in maturities_seen for maturity in _PROSE_SCHEMA_MATURITIES
+        },
+        "optional_keys": {key: key in keys_seen for key in _PROSE_SCHEMA_OPTIONAL_KEYS},
+    }
+    payload: dict[str, object] = {
+        "rules": results,
+        "coverage": coverage,
+        "valid": all_valid,
+    }
+    if args.json:
+        print(json.dumps(payload))
+        return 0 if all_valid else 1
+
+    for entry in results:
+        if entry["status"] == "valid":
+            print(f"  {entry['rule_id']:40s} [{entry['language']}] valid")
+        else:
+            print(f"  {entry['rule_id']:40s} INVALID: {entry['error']}")
+    print()
+    print("Prose schema coverage (valid rules only):")
+    for group_name, group in (
+        ("kind", coverage["kinds"]),
+        ("match_scope", coverage["match_scopes"]),
+        ("maturity", coverage["maturities"]),
+        ("optional key", coverage["optional_keys"]),
+    ):
+        assert isinstance(group, dict)
+        used = sorted(name for name, present in group.items() if present)
+        missing = sorted(name for name, present in group.items() if not present)
+        summary = f"  {group_name}: {len(used)}/{len(group)} exercised"
+        if missing:
+            summary += f", unused: {', '.join(missing)}"
+        print(summary)
+    return 0 if all_valid else 1
 
 
 def cmd_patterns_list(args: argparse.Namespace) -> int:
     """List active rules with last-scan hit counts."""
     repo = Path(_resolve_repo(getattr(args, "path", None)))
+    error_code = _non_directory_repo_root_error(repo, args.json)
+    if error_code is not None:
+        return error_code
     conn = init_db(args.hot_zone)
-    scan = latest_scan(conn)
+    run = latest_pattern_run(conn)
 
-    conf_disabled = _disabled_patterns(repo / ".weave" / "quality.conf")
-    rules = _load_pattern_rules(repo, conf_disabled)
+    try:
+        conf_disabled = _disabled_patterns(repo / ".weave" / "quality.conf")
+        rules = _load_pattern_rules(repo, conf_disabled)
+    except PatternRuleValidationError as exc:
+        conn.close()
+        return _pattern_rule_error(exc, args.json)
+    except OSError as exc:
+        # wv-731450 (external code review round 3 re-audit of wv-0065a6):
+        # unlike validate's _candidate_pattern_files (guarded), list reads
+        # .weave/quality.conf via _disabled_patterns and the tier
+        # directories via _load_pattern_rules BEFORE the try block that
+        # was only guarding PatternRuleValidationError -- an inaccessible
+        # (not just absent) .weave/ still raised an uncaught
+        # PermissionError here, the same trap wv-0065a6 closed for
+        # validate. A genuinely ABSENT quality.conf/tier directory stays a
+        # silent, valid skip (conf_path.exists()/rule_dir.is_dir()
+        # returning False, not raising) -- only inaccessibility is an
+        # error.
+        conn.close()
+        detail = f"could not enumerate pattern rule directories under {repo} ({exc.strerror or exc})"
+        if args.json:
+            print(json.dumps({"error": "invalid_repo_root", "detail": detail}))
+        else:
+            print(f"patterns: {detail}", file=sys.stderr)
+        return 1
 
-    if scan is not None:
-        hits_by_rule = {
-            r["rule_id"]: r["hits"]
-            for r in pattern_findings_summary(conn, scan.id)
-        }
-    else:
-        hits_by_rule = {}
+    receipts = (
+        {str(row["rule_id"]): row for row in pattern_rule_runs(conn, run.id)}
+        if run is not None
+        else {}
+    )
     conn.close()
 
-    if args.json:
-        out = [
-            {"rule_id": rid, "path": str(rpath), "hits": hits_by_rule.get(rid, 0)}
-            for rid, rpath in rules
+    try:
+        rule_states: list[dict[str, object]] = []
+        for rule_id, rule_path, _ in rules:
+            receipt = receipts.get(rule_id)
+            current_hash = _pattern_definition_hash(rule_path)
+            if receipt is None or receipt["definition_hash"] != current_hash:
+                state: dict[str, object] = {"status": "not_run", "hits": None}
+            else:
+                state = {"status": receipt["status"], "hits": receipt["hits"]}
+                if receipt["error"]:
+                    state["error"] = receipt["error"]
+            rule_states.append({"rule_id": rule_id, "path": str(rule_path), **state})
+
+        active_ids = {rule_id for rule_id, _, _ in rules}
+        shadowed_ids = [
+            rule_id
+            for rule_id in _shadowed_managed_pattern_ids(repo)
+            if rule_id in active_ids
         ]
-        print(json.dumps(out))
+    except OSError as exc:
+        # Same boundary, the two reads that happen after rules are
+        # loaded: _pattern_definition_hash's read_bytes() (a rule file
+        # made unreadable between load and hashing) and
+        # _shadowed_managed_pattern_ids' is_file()/read_text() on
+        # .weave/patterns/managed/.overridden.
+        detail = f"could not read pattern metadata under {repo} ({exc.strerror or exc})"
+        if args.json:
+            print(json.dumps({"error": "invalid_repo_root", "detail": detail}))
+        else:
+            print(f"patterns: {detail}", file=sys.stderr)
+        return 1
+    # Advisory only, always on stderr (in both --json and text mode) so it never
+    # changes the shape of the stdout payload for existing consumers.
+    for rule_id in shadowed_ids:
+        # wv-8d16bd (external code review round 3 re-audit): deleting the
+        # local copy alone does NOT resync the managed version -- the
+        # reconcile that would copy it back into .weave/patterns/managed/
+        # only runs on 'wv init-repo --update', not automatically. Deleting
+        # without rerunning it drops the rule entirely (24 rules -> 23 in
+        # the reported audit), worse than the shadow it "fixed". Name the
+        # required follow-up so this warning's own advice is complete.
+        print(
+            f"⚠ {rule_id}: .weave/patterns/{rule_id}.yaml shadows an available "
+            "managed rule of the same id (never applied) — delete the local "
+            "copy AND run 'wv init-repo --update' to sync the managed "
+            "version, if this was a completed promotion",
+            file=sys.stderr,
+        )
+
+    if args.json:
+        print(json.dumps(rule_states))
     else:
         if not rules:
             print("No active pattern rules.")
             return 0
-        print(f"Active pattern rules ({len(rules)}):")
-        for rule_id, rule_path in rules:
-            hits = hits_by_rule.get(rule_id, 0)
-            src = "default" if rule_path.parent == _DEFAULT_PATTERNS_DIR else "custom"
-            print(f"  {rule_id:40s} [{src}] hits={hits}")
+        # The run row itself names the scope, not a receipt derived from it
+        # -- an interrupted or zero-rule run still has a target on
+        # pattern_runs even with no per-rule receipts to read it from.
+        scan_target = run.target if run is not None else None
+        header = f"Active pattern rules ({len(rules)})"
+        if scan_target is not None:
+            header += f", last scanned: {scan_target}"
+        print(f"{header}:")
+        for (rule_id, rule_path, _), state in zip(rules, rule_states):
+            if rule_path.parent == _DEFAULT_PATTERNS_DIR:
+                src = "default"
+            elif rule_path.parent.name == "managed":
+                src = "managed"
+            else:
+                src = "custom"
+            hits = state["hits"] if state["hits"] is not None else "-"
+            print(f"  {rule_id:40s} [{src}] status={state['status']} hits={hits}")
     return 0
 
 
 def cmd_patterns(args: argparse.Namespace) -> int:
-    """Dispatch patterns sub-commands (scan / list / promote)."""
+    """Dispatch pattern scan, adjudication, reporting, and promotion commands."""
     sub = getattr(args, "patterns_command", None)
     if sub == "scan":
         return cmd_patterns_scan(args)
@@ -1627,7 +2630,16 @@ def cmd_patterns(args: argparse.Namespace) -> int:
         return cmd_patterns_list(args)
     if sub == "promote":
         return _cmd_promote_patterns(args)
-    print("Usage: wv quality patterns {scan,list,promote}", file=sys.stderr)
+    if sub == "adjudicate":
+        return cmd_patterns_adjudicate(args)
+    if sub == "report":
+        return cmd_patterns_report(args)
+    if sub == "validate":
+        return cmd_patterns_validate(args)
+    print(
+        "Usage: wv quality patterns {scan,list,adjudicate,report,validate,promote}",
+        file=sys.stderr,
+    )
     return 1
 
 
@@ -1923,6 +2935,34 @@ def main() -> int:  # pragma: no cover
     pat_promote_p.add_argument(
         "--dry-run", action="store_true", help="Show what would be created"
     )
+
+    pat_adjudicate_p = patterns_sub.add_parser(
+        "adjudicate", help="Apply a human disposition to a stable finding key"
+    )
+    pat_adjudicate_p.add_argument("finding_key", help="Stable qf-* key from pattern scan output")
+    pat_adjudicate_p.add_argument(
+        "disposition",
+        choices=("accepted_defect", "false_positive", "waived", "unresolved"),
+    )
+    pat_adjudicate_p.add_argument("--note", help="Human rationale or waiver reference")
+    pat_adjudicate_p.add_argument("--json", action="store_true", help="JSON output")
+
+    pat_report_p = patterns_sub.add_parser(
+        "report", help="Report per-rule precision and recurring waivers"
+    )
+    pat_report_p.add_argument(
+        "path",
+        nargs="?",
+        help="Scope report to this target (default: last scan's target)",
+    )
+    pat_report_p.add_argument("--json", action="store_true", help="JSON output")
+
+    pat_validate_p = patterns_sub.add_parser(
+        "validate",
+        help="Validate every candidate rule independently and report schema coverage",
+    )
+    pat_validate_p.add_argument("path", nargs="?", help="Repo path (default: repo root)")
+    pat_validate_p.add_argument("--json", action="store_true", help="JSON output")
 
     args = parser.parse_args()
 

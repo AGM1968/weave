@@ -64,6 +64,26 @@ setup_test_env() {
     "$WV" init 2>/dev/null || true
 }
 
+setup_state_publish_fault() {
+    local fail_at="$1"
+    mkdir -p "$TEST_DIR/mock-bin"
+    cat > "$TEST_DIR/mock-bin/mv" <<'EOF'
+#!/usr/bin/env bash
+target="${!#}"
+if [[ "$target" == */.weave/state.sql ]]; then
+    count=$(($(cat "$WV_TEST_MV_COUNT" 2>/dev/null || echo 0) + 1))
+    printf '%s\n' "$count" > "$WV_TEST_MV_COUNT"
+    if [ "$count" -eq "$WV_TEST_MV_FAIL_AT" ]; then
+        exit 1
+    fi
+fi
+exec /bin/mv "$@"
+EOF
+    chmod +x "$TEST_DIR/mock-bin/mv"
+    export WV_TEST_MV_COUNT="$TEST_DIR/mv-count"
+    export WV_TEST_MV_FAIL_AT="$fail_at"
+}
+
 setup_source4_env() {
     rm -rf "$TEST_DIR"
     mkdir -p "$TEST_DIR/repo" "$TEST_DIR/hot"
@@ -295,6 +315,63 @@ assert_contains "$recovery" '"status":"incomplete"' "recover detects incomplete 
 assert_contains "$recovery" '"op":"ship"' "recover identifies ship operation"
 assert_contains "$recovery" '"action":"sync"' "recover identifies stuck at sync"
 
+# A failed done policy gate must leave both recovery records intact and must
+# never be journaled or reported as recovered.
+setup_test_env
+node_id=$("$WV" add "ship policy failure" --force 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+"$WV" work "$node_id" >/dev/null 2>&1
+sqlite3 "$WV_DB" "INSERT INTO node_files(node_id,path) VALUES('$node_id','violating.sh');
+  INSERT INTO file_metrics(path,mccabe_max,language) VALUES('violating.sh',999,'sh');
+  UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'),'\$.ship_pending',json('true')) WHERE id='$node_id';"
+journal_begin "ship" "{\"id\":\"$node_id\",\"gh\":false}"
+journal_step 1 "done" "{\"id\":\"$node_id\"}"
+recover_rc=0
+WV_REQUIRE_QUALITY=0 "$WV" recover --auto >"$TEST_DIR/recover-policy.out" 2>&1 || recover_rc=$?
+assert_equals "1" "$recover_rc" "recover propagates failed done policy gate"
+status=$(sqlite3 "$WV_DB" "SELECT status FROM nodes WHERE id='$node_id';")
+assert_equals "active" "$status" "failed ship recovery does not close node"
+pending=$(sqlite3 "$WV_DB" "SELECT json_extract(metadata,'\$.ship_pending') FROM nodes WHERE id='$node_id';")
+assert_equals "1" "$pending" "failed ship recovery preserves ship_pending"
+recovery=$("$WV" recover --json 2>/dev/null)
+assert_contains "$recovery" '"status":"incomplete"' "failed ship recovery preserves incomplete journal"
+assert_fails "failed ship recovery does not print success" grep -q "Recovery complete" "$TEST_DIR/recover-policy.out"
+
+# New ship journals carry an initial recoverable phase in the begin record.
+setup_test_env
+node_id=$("$WV" add "begin-only recovery" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+"$WV" work "$node_id" >/dev/null 2>&1
+journal_begin "ship" "{\"id\":\"$node_id\",\"gh\":false}" "persist_intent"
+begin_recovery=$("$WV" recover --json 2>/dev/null)
+assert_contains "$begin_recovery" '"action":"persist_intent"' "begin-only ship journal has a recoverable initial phase"
+"$WV" recover --auto >/dev/null 2>&1
+status=$(sqlite3 "$WV_DB" "SELECT status FROM nodes WHERE id='$node_id';")
+assert_equals "active" "$status" "begin-only recovery never closes the node"
+assert_fails "begin-only recovery completes the obsolete journal" journal_has_incomplete
+
+# If the target changes after validation but before intent persistence, the
+# markerless initial phase remains safe to abort rather than poisoning recovery.
+setup_test_env
+node_id=$("$WV" add "raced begin-only recovery" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+journal_begin "ship" "{\"id\":\"$node_id\",\"gh\":false}" "persist_intent"
+sqlite3 "$WV_DB" "UPDATE nodes SET status='done' WHERE id='$node_id';"
+"$WV" recover --auto >/dev/null 2>&1
+assert_fails "markerless target-state race does not poison recovery" journal_has_incomplete
+
+# Invalid ship targets are rejected before any marker or journal is created.
+setup_test_env
+node_id=$("$WV" add "already completed ship target" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+"$WV" done "$node_id" --skip-verification >/dev/null 2>&1
+ship_rc=0
+"$WV" ship "$node_id" --skip-verification --no-gh >/dev/null 2>&1 || ship_rc=$?
+assert_equals "1" "$ship_rc" "ship rejects an already-done node before protocol start"
+pending=$(sqlite3 "$WV_DB" "SELECT COALESCE(json_extract(metadata,'\$.ship_pending'),0) FROM nodes WHERE id='$node_id';")
+assert_equals "0" "$pending" "rejected done-node ship leaves no marker"
+assert_fails "rejected done-node ship leaves no journal" journal_has_incomplete
+ship_rc=0
+"$WV" ship wv-deadbeef --skip-verification --no-gh >/dev/null 2>&1 || ship_rc=$?
+assert_equals "1" "$ship_rc" "ship rejects a missing node before protocol start"
+assert_fails "rejected missing-node ship leaves no journal" journal_has_incomplete
+
 # ─── ship_pending metadata marker ──────────────────────────────────────
 
 echo ""
@@ -317,6 +394,108 @@ rm -f "$WV_HOT_ZONE/ops.journal"
 # wv recover should find the pending node via metadata fallback
 recovery=$("$WV" recover --json 2>/dev/null)
 assert_contains "$recovery" '"ship_pending"' "recover finds ship_pending via metadata"
+
+fallback_rc=0
+"$WV" recover --auto >"$TEST_DIR/recover-active-fallback.out" 2>&1 || fallback_rc=$?
+assert_equals "1" "$fallback_rc" "ship_pending fallback rejects a node that is not done"
+pending=$(sqlite3 "$WV_DB" "SELECT json_extract(metadata,'\$.ship_pending') FROM nodes WHERE id='$node_id';")
+assert_equals "1" "$pending" "rejected ship_pending fallback preserves marker"
+
+# Pre-close intent must survive loss of both the hot database and journal.
+setup_test_env
+node_id=$("$WV" add "pre-close reboot" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+"$WV" work "$node_id" >/dev/null 2>&1
+sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'),
+  '\$.ship_pending',json('true'),'\$.ship_pending_mode','pre_close') WHERE id='$node_id';"
+"$WV" sync >/dev/null 2>&1
+rm -f "$WV_DB" "$WV_HOT_ZONE/ops.journal"
+"$WV" init >/dev/null 2>&1 || true
+status=$(sqlite3 "$WV_DB" "SELECT status FROM nodes WHERE id='$node_id';")
+pending_state=$(sqlite3 "$WV_DB" "SELECT json_extract(metadata,'\$.ship_pending') || '|' || json_extract(metadata,'\$.ship_pending_mode') FROM nodes WHERE id='$node_id';")
+assert_equals "active" "$status" "pre-close reboot does not manufacture closure"
+assert_equals "1|pre_close" "$pending_state" "pre-close reboot preserves boolean marker and mode"
+recovery=$("$WV" recover --json 2>/dev/null)
+recovery_mode=$(echo "$recovery" | jq -r '.nodes[0].mode')
+assert_equals "pre_close" "$recovery_mode" "recover reports persisted pre-close mode"
+
+# A real ship whose post-close publish fails must reboot to the last complete
+# pre-close snapshot, never a markerless or partially closed state.
+setup_test_env
+node_id=$("$WV" add "atomic close publish failure" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+"$WV" work "$node_id" >/dev/null 2>&1
+setup_state_publish_fault 2
+ship_rc=0
+PATH="$TEST_DIR/mock-bin:$PATH" "$WV" ship "$node_id" --skip-verification --no-gh >/dev/null 2>&1 || ship_rc=$?
+assert_equals "1" "$ship_rc" "ship stops when post-close state publication fails"
+rm -f "$WV_DB" "$WV_HOT_ZONE/ops.journal"
+unset WV_TEST_MV_FAIL_AT WV_TEST_MV_COUNT
+"$WV" init >/dev/null 2>&1 || true
+reboot_state=$(sqlite3 "$WV_DB" "SELECT status || '|' || json_extract(metadata,'\$.ship_pending_mode') FROM nodes WHERE id='$node_id';")
+assert_equals "active|pre_close" "$reboot_state" "failed atomic close publish reboots conservatively"
+
+# A real ship whose final clearance publish fails leaves the prior durable
+# done/post_close snapshot available for idempotent reboot recovery.
+setup_test_env
+node_id=$("$WV" add "clear publish failure" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+"$WV" work "$node_id" >/dev/null 2>&1
+setup_state_publish_fault 3
+ship_rc=0
+PATH="$TEST_DIR/mock-bin:$PATH" "$WV" ship "$node_id" --skip-verification --no-gh >/dev/null 2>&1 || ship_rc=$?
+assert_equals "1" "$ship_rc" "ship stops when marker-clear publication fails"
+hot_state=$(sqlite3 "$WV_DB" "SELECT status || '|' || json_extract(metadata,'\$.ship_pending') || '|' || json_extract(metadata,'\$.ship_pending_mode') FROM nodes WHERE id='$node_id';")
+assert_equals "done|1|post_close" "$hot_state" "failed clearance exactly restores the hot post-close marker"
+sqlite3 "$TEST_DIR/durable-check.db" < .weave/state.sql
+durable_state=$(sqlite3 "$TEST_DIR/durable-check.db" "SELECT status || '|' || json_extract(metadata,'\$.ship_pending_mode') FROM nodes WHERE id='$node_id';")
+assert_equals "done|post_close" "$durable_state" "failed clearance preserves durable post-close recovery state"
+rm -f "$WV_DB" "$WV_HOT_ZONE/ops.journal"
+unset WV_TEST_MV_FAIL_AT WV_TEST_MV_COUNT
+"$WV" init >/dev/null 2>&1
+pending=$(sqlite3 "$WV_DB" "SELECT COALESCE(json_extract(metadata,'\$.ship_pending'),0) FROM nodes WHERE id='$node_id';")
+assert_equals "0" "$pending" "post-close publish failure recovers idempotently after reboot"
+
+# Post-close state is durably pending until recovery clears and persists it.
+setup_test_env
+node_id=$("$WV" add "post-close reboot" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+sqlite3 "$WV_DB" "UPDATE nodes SET status='done', metadata=json_set(COALESCE(metadata,'{}'),
+  '\$.ship_pending',json('true'),'\$.ship_pending_mode','post_close') WHERE id='$node_id';"
+"$WV" sync >/dev/null 2>&1
+rm -f "$WV_DB" "$WV_HOT_ZONE/ops.journal"
+"$WV" init >/dev/null 2>&1
+pending=$(sqlite3 "$WV_DB" "SELECT COALESCE(json_extract(metadata,'\$.ship_pending'),0) FROM nodes WHERE id='$node_id';")
+assert_equals "0" "$pending" "post-close reboot recovery clears marker"
+rm -f "$WV_DB" "$WV_HOT_ZONE/ops.journal"
+"$WV" init >/dev/null 2>&1
+pending=$(sqlite3 "$WV_DB" "SELECT COALESCE(json_extract(metadata,'\$.ship_pending'),0) FROM nodes WHERE id='$node_id';")
+assert_equals "0" "$pending" "post-close marker clearance survives a second reboot"
+
+# Legacy boolean-only markers remain recoverable during protocol rollout.
+setup_test_env
+node_id=$("$WV" add "legacy pending reboot" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+sqlite3 "$WV_DB" "UPDATE nodes SET status='done', metadata=json_set(COALESCE(metadata,'{}'),
+  '\$.ship_pending',json('true')) WHERE id='$node_id';"
+"$WV" sync >/dev/null 2>&1
+rm -f "$WV_DB" "$WV_HOT_ZONE/ops.journal"
+# Loading is explicit here because recover cannot query a missing hot database.
+"$WV" init >/dev/null 2>&1
+pending=$(sqlite3 "$WV_DB" "SELECT COALESCE(json_extract(metadata,'\$.ship_pending'),0) FROM nodes WHERE id='$node_id';")
+assert_equals "0" "$pending" "legacy boolean ship_pending remains recoverable"
+
+# A completed ship persists marker clearance before reporting a clean journal.
+setup_test_env
+node_id=$("$WV" add "completed ship reboot" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+"$WV" work "$node_id" >/dev/null 2>&1
+"$WV" ship "$node_id" --skip-verification --no-gh >/dev/null 2>&1
+status=$(sqlite3 "$WV_DB" "SELECT status FROM nodes WHERE id='$node_id';")
+pending=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE id='$node_id' AND json_extract(metadata,'\$.ship_pending') IS NOT NULL;")
+assert_equals "done" "$status" "successful ship closes node"
+assert_equals "0" "$pending" "successful ship clears hot marker"
+rm -f "$WV_DB" "$WV_HOT_ZONE/ops.journal"
+"$WV" init >/dev/null 2>&1
+pending=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE id='$node_id' AND json_extract(metadata,'\$.ship_pending') IS NOT NULL;")
+assert_equals "0" "$pending" "successful ship clearance survives reboot"
+recovery=$("$WV" recover --json 2>/dev/null)
+recovery_status=$(echo "$recovery" | jq -r 'if .status == "ship_pending" then "pending" else "clear" end')
+assert_equals "clear" "$recovery_status" "completed ship has no recoverable protocol state"
 
 # ─── pending_close metadata fallback ────────────────────────────────────
 

@@ -1,0 +1,29 @@
+{
+  "malformed_events": [
+    {
+      "event_id": "claude-pretooluse-missing-tool",
+      "host": "claude",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session-1",
+        "tool_input": {
+          "file_path": "src/lib.rs"
+        }
+      }
+    },
+    {
+      "event_id": "codex-pretooluse-missing-tool",
+      "host": "codex",
+      "raw_event_kind": "PreToolUse",
+      "raw_payload": {
+        "cwd": "/repo/main",
+        "input": {
+          "patchText": "*** Begin Patch\n*** Update File: src/a.py\n*** End Patch"
+        },
+        "thread_id": "codex-thread-1"
+      }
+    }
+  ]
+}

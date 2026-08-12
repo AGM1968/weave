@@ -1,0 +1,26 @@
+id: markdown-bold-label-metadata
+language: prose
+kind: regex
+severity: info
+policy: always-on-shared
+maturity: promotable
+match_scope: line
+provenance: >-
+  wv-3324fd @earth-engine-analysis (2026-07-23). Consecutive bold-label
+  metadata lines collapsed into an unreadable run-on when Pandoc joined the
+  adjacent Markdown lines. Adjudicated as a structural rendering defect.
+message: >-
+  Bold-label metadata can collapse into a run-on when consecutive lines form
+  one Markdown paragraph. Use a list, table, or YAML frontmatter so each key
+  retains its own line.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+patterns:
+  - '^\*\*[^*\n]+:\*\*\s*`[^`]*`\s*$'
+positive_controls:
+  - "**Endpoint:** `https://example.test`"
+negative_controls:
+  - "- **Endpoint:** `https://example.test`"
+  - "The **Endpoint:** value is described inline."

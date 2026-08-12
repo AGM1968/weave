@@ -253,6 +253,14 @@ test_link() {
     # Link validates edge type
     assert_fails "link rejects invalid edge type" "$WV" link "$from" "$to" --type=invalid
 
+    # wv-cccf70: every other flag in this CLI is hyphenated
+    # (--verification-method) while VALID_EDGE_TYPES is underscored
+    # (relates_to) -- accept the hyphenated spelling as an input alias.
+    output=$("$WV" link "$from" "$to" --type=relates-to 2>&1)
+    assert_contains "$output" "relates_to" "link accepts a hyphenated edge type alias, stored canonically"
+    output=$("$WV" edges "$from" 2>&1)
+    assert_contains "$output" "relates_to" "the hyphen-aliased edge is actually stored as relates_to"
+
     # Link validates nodes exist
     assert_fails "link fails for non-existent source" "$WV" link "wv-0000" "$to" --type=relates_to
     assert_fails "link fails for non-existent target" "$WV" link "$from" "wv-0000" --type=relates_to
@@ -923,6 +931,47 @@ test_unified_blocking() {
 }
 
 # ============================================================================
+# Test: wv context --json surfaces gate metadata (wv-cccf70)
+# ============================================================================
+test_context_node_gate_fields() {
+    echo ""
+    echo "Test: wv context --json surfaces done_criteria/risks/risk_level"
+    echo "================================================================"
+
+    setup_test_env
+
+    local id ctx
+    id=$("$WV" add "gate metadata test" --standalone --force \
+        --criteria="c1|c2" --risks=medium 2>&1 | node_id_from_output)
+
+    # wv-cccf70: {id,text,status} used to drop done_criteria/risks/
+    # risk_level entirely from .node -- wv preflight was the only reliable
+    # read path for has_done_criteria, confirmed exact match to an
+    # external audit repro (agent misdiagnosed --risks as also dropped
+    # because .node returned no metadata at all to check against).
+    ctx=$("$WV" context "$id" --json --mode=bootstrap 2>&1)
+    assert_jq_true "$ctx" '.node.done_criteria == ["c1", "c2"]' \
+        "context bootstrap-mode: .node.done_criteria present and correct"
+    assert_jq_true "$ctx" '.node.risk_level == "medium"' \
+        "context bootstrap-mode: .node.risk_level present and correct"
+
+    ctx=$("$WV" context "$id" --json --mode=discover 2>&1)
+    assert_jq_true "$ctx" '.node.done_criteria == ["c1", "c2"]' \
+        "context discover-mode: .node.done_criteria present and correct"
+    assert_jq_true "$ctx" '.node.risk_level == "medium"' \
+        "context discover-mode: .node.risk_level present and correct"
+
+    # A node with no gate metadata at all must still resolve to the
+    # documented default shape (empty array / null), not a jq error from
+    # indexing a missing key.
+    local bare_id bare_ctx
+    bare_id=$("$WV" add "no gate metadata" --standalone --force 2>&1 | node_id_from_output)
+    bare_ctx=$("$WV" context "$bare_id" --json --mode=discover 2>&1)
+    assert_jq_true "$bare_ctx" '.node.done_criteria == [] and .node.risk_level == null' \
+        "context discover-mode: bare node defaults done_criteria=[] risk_level=null"
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 main() {
@@ -940,6 +989,7 @@ main() {
     test_impact_suites_matching
     test_discover
     test_unified_blocking
+    test_context_node_gate_fields
 
     echo ""
     echo "========================================"

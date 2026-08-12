@@ -3,6 +3,7 @@
 #
 # Usage:
 #   wv analyze sessions --call-stats [--log=<path>] [--top=N] [--since-days=N] [--include-sync]
+#   wv analyze sessions --trace-eval --log=<path> [--usage-log=<path>] --json
 #   wv analyze suites [--log=<path>] [--json]
 #
 # Reads a JSONL call log (enable durably with `wv config enable session-analysis`,
@@ -23,6 +24,7 @@ cmd_analyze() {
             echo ""
             echo "Subcommands:"
             echo "  sessions --call-stats   Show top wv commands by byte output"
+            echo "  sessions --trace-eval   Observe state-aware traces from a WV_CALL_LOG JSONL file"
             echo "  suites                  Per-suite run count + duration (total/avg/p95) + pass/fail"
             echo "                          Defaults to current repo; use --all to see all repos"
             ;;
@@ -45,13 +47,15 @@ cmd_analyze_sessions() {
     [ -n "${WV_CALL_LOG:-}" ] && instrumentation_on=true
     local top_n=10
     local source_filter=""
-    local since_days="" since_raw="" include_sync=0 include_test=0 want_json=""
+    local since_days="" since_raw="" include_sync=0 include_test=0 want_json="" trace_eval=0 usage_log=""
     local mode
     mode=$(wv_resolve_mode)
 
     for arg in "$@"; do
         case "$arg" in
             --call-stats|--token-hogs) ;;   # primary mode flag — accepted, no-op (only mode for now)
+            --trace-eval)    trace_eval=1; want_json=1 ;;
+            --usage-log=*)   usage_log="${arg#--usage-log=}" ;;
             --log=*)        log_path="${arg#--log=}"; instrumentation_on=true ;;
             --top=*)        top_n="${arg#--top=}" ;;
             --source=*)     source_filter="${arg#--source=}" ;;
@@ -64,6 +68,7 @@ cmd_analyze_sessions() {
                 echo "Usage: wv analyze sessions --call-stats [--log=<path>] [--top=N] [--source=<src>]"
                 echo "                            [--since-days=N | --since=<date>] [--include-sync]"
                 echo "                            [--include-test] [--json]"
+                echo "       wv analyze sessions --trace-eval --log=<path> [--usage-log=<path>] --json"
                 echo ""
                 echo "  --log=<path>      JSONL call log (default: ~/.local/share/weave/wv_calls.jsonl)"
                 echo "  --top=N           Show top N commands (default: 10)"
@@ -74,6 +79,8 @@ cmd_analyze_sessions() {
                 echo "                    stdout that never enters agent context)"
                 echo "  --include-test    Count source=test traffic (excluded by default: suite-driven calls)"
                 echo "  --json            Force JSON output (default in discover/bootstrap mode)"
+                echo "  --trace-eval      Emit versioned observational trace measurements as JSON"
+                echo "  --usage-log=<path> Canonical host usage JSONL joined by trace/workflow/call ID"
                 echo ""
                 echo "Unwindowed runs are lifetime aggregates and may span instrumentation eras;"
                 echo "for retro reading, always pass a window (e.g. --since-days=1)."
@@ -82,8 +89,21 @@ cmd_analyze_sessions() {
                 echo "  wv config enable session-analysis"
                 return 0
                 ;;
+            *)
+                echo "wv analyze sessions: unknown option: $arg" >&2
+                return 1
+                ;;
         esac
     done
+
+    if [ "$trace_eval" -eq 1 ]; then
+        local evaluator="$WV_LIB_DIR/profiling/audit_sessions.py"
+        [ -f "$evaluator" ] || evaluator="$WV_LIB_DIR/../profiling/audit_sessions.py"
+        local -a evaluator_args=(--log "$log_path")
+        [ -z "$usage_log" ] || evaluator_args+=(--usage-log "$usage_log")
+        python3 "$evaluator" "${evaluator_args[@]}"
+        return $?
+    fi
 
     # Resolve the window to an epoch cutoff. --since wins over --since-days.
     local since_epoch=""
@@ -141,7 +161,9 @@ if not include_sync and source_filter != "sync":
     drop_sources.add("sync")
 if not include_test and source_filter != "test":
     drop_sources.add("test")
-totals: dict[str, dict] = defaultdict(lambda: {"calls": 0, "total_bytes": 0, "total_ms": 0})
+totals: dict[str, dict] = defaultdict(
+    lambda: {"calls": 0, "total_bytes": 0, "total_stdout_bytes": 0, "total_ms": 0}
+)
 reopen_count = 0
 excluded = {"sync_calls": 0, "sync_bytes": 0, "test_calls": 0, "test_bytes": 0, "no_ts": 0}
 min_ts = max_ts = None
@@ -188,6 +210,7 @@ try:
             elapsed = int(entry.get("elapsed_ms", 0))
             totals[cmd]["calls"] += 1
             totals[cmd]["total_bytes"] += stdout_b + stderr_b
+            totals[cmd]["total_stdout_bytes"] += stdout_b
             totals[cmd]["total_ms"] += elapsed
 except OSError as exc:
     print(json.dumps({"error": str(exc)}))
@@ -196,7 +219,8 @@ except OSError as exc:
 span_days = round((max_ts - min_ts) / 86400) if min_ts is not None and max_ts is not None else 0
 ranked = sorted(totals.items(), key=lambda x: x[1]["total_bytes"], reverse=True)[:top_n]
 out = {
-    "call_stats": [{"cmd": cmd, "approx_tokens": stats["total_bytes"] // 4, **stats} for cmd, stats in ranked],
+    "call_stats": [{"cmd": cmd, "estimated_output_tokens": stats["total_stdout_bytes"] // 4, **stats}
+                   for cmd, stats in ranked],
     "reopen_count": reopen_count,
     "source_filter": source_filter or None,
     "window": ({"since_epoch": since_epoch,
@@ -243,7 +267,7 @@ d = json.load(sys.stdin)
 rows = d['call_stats']
 for r in rows:
     avg_ms = r['total_ms'] // r['calls'] if r['calls'] else 0
-    tokens = r.get('approx_tokens', r['total_bytes'] // 4)
+    tokens = r['estimated_output_tokens']
     print(f\"{r['cmd']:<24} {r['total_bytes']:>10,} {tokens:>10,} {r['calls']:>8} {avg_ms:>10}\")
 reopen = d.get('reopen_count', 0)
 if reopen:

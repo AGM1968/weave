@@ -1,0 +1,41 @@
+id: prose-ai-vocabulary
+language: prose
+kind: lexicon
+severity: info
+policy: always-on-shared
+maturity: promotable
+provenance: >-
+  wv-cc46cc @nowcast, ported and retained by earth-engine-analysis. Derived
+  from repeated AI-assisted technical-writing reviews; intended as an
+  editorial prompt, not proof of machine authorship.
+message: >-
+  High-frequency generated-text vocabulary often decorates rather than
+  informs. Replace it with the specific technical claim or delete it.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+terms:
+  - delve
+  - delves
+  - delving
+  - tapestry
+  - testament
+  - pivotal
+  - interplay
+  - garner
+  - garnered
+  - fostering
+  - showcase
+  - showcases
+  - showcasing
+  - seamless
+  - seamlessly
+  - groundbreaking
+  - game-changing
+  - cutting-edge
+positive_controls:
+  - "This pivotal result decorates the claim."
+negative_controls:
+  - "The conclusion pivots on the measured 5 percent difference."
+  - "The protocol cuts the edge at a measured coordinate."

@@ -121,7 +121,13 @@ cmd_link() {
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --type=*) edge_type="${1#*=}" ;;
+            # wv-cccf70: every other flag in this CLI is hyphenated
+            # (--verification-method), but VALID_EDGE_TYPES itself is
+            # underscored (relates_to) to match the DB CHECK constraint --
+            # accept the hyphenated spelling as an input alias here rather
+            # than rename the canonical enum, which stores/reads underscored
+            # values everywhere else (wv-db.sh schema, existing edges).
+            --type=*) edge_type="${1#*=}"; edge_type="${edge_type//-/_}" ;;
             --weight=*) weight="${1#*=}" ;;
             --context=*) context="${1#*=}" ;;
         esac
@@ -225,7 +231,7 @@ cmd_unlink() {
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --type=*) edge_type="${1#*=}" ;;
+            --type=*) edge_type="${1#*=}"; edge_type="${edge_type//-/_}" ;;
         esac
         shift
     done
@@ -441,7 +447,7 @@ cmd_related() {
     shift || true
     while [ $# -gt 0 ]; do
         case "$1" in
-            --type=*)      edge_type="${1#*=}" ;;
+            --type=*)      edge_type="${1#*=}"; edge_type="${edge_type//-/_}" ;;
             --direction=*) direction="${1#*=}" ;;
             --depth=*)     depth="${1#*=}" ;;
             --json)        output_format="json" ;;
@@ -597,7 +603,7 @@ cmd_edges() {
     shift || true
     while [ $# -gt 0 ]; do
         case "$1" in
-            --type=*) edge_type="${1#*=}" ;;
+            --type=*) edge_type="${1#*=}"; edge_type="${edge_type//-/_}" ;;
             --json) output_format="json" ;;
         esac
         shift
@@ -857,10 +863,14 @@ cmd_context() {
         return $?
     fi
 
-    # Cache setup (per session in tmpfs) — keyed by id+mode so different modes don't collide
+    # Cache setup (per session in tmpfs) — keyed by id+mode so different modes don't collide.
+    # Version suffix bumped on any payload-shape change (v3 -> v4: wv-22ca26 added
+    # done_criteria/risks/risk_level to node and blocked_reason to the envelope) so a
+    # pre-upgrade cache file on disk cannot mask the new fields — it just misses on the
+    # new filename and gets regenerated, rather than being read and served stale-shaped.
     local cache_dir="$WV_HOT_ZONE/context_cache"
     mkdir -p "$cache_dir"
-    local cache_file="$cache_dir/${id}-${mode}-v3.json"
+    local cache_file="$cache_dir/${id}-${mode}-v4.json"
 
     # Check cache validity (invalidate on edge changes or node updates)
     if [ -f "$cache_file" ]; then
@@ -890,7 +900,7 @@ cmd_context() {
 
     # Get node details
     local node_json
-    node_json=$(db_query_json "SELECT id, text, status, json(metadata), created_at, updated_at FROM nodes WHERE id='$id';")
+    node_json=$(db_query_json "SELECT id, text, status, json(metadata) AS metadata, created_at, updated_at FROM nodes WHERE id='$id';")
     node_json="${node_json:-[]}"
 
     # Unified self-blocking signal: is THIS node not-ready by status, deferral, or a
@@ -918,7 +928,16 @@ cmd_context() {
             --argjson blockers "$blockers_json" \
             --argjson self_block "$self_block_json" \
             '($self_block[0].blocked_reason // null) as $br
-             | {node: ($node[0] | {id, text, status}),
+             # wv-cccf70: {id,text,status} dropped done_criteria/risks/
+             # risk_level entirely -- wv preflight was the only reliable
+             # read path for has_done_criteria, confirmed exact match to
+             # an external audit repro. Surface the gate-relevant subset
+             # here too, not the full metadata blob (keeps this payload
+             # small and stable rather than exposing every ad-hoc key).
+             | {node: ($node[0] | . + {metadata: (.metadata | if type == "string" then fromjson else . end)} | {id, text, status,
+                    done_criteria: (.metadata.done_criteria // []),
+                    risks: (.metadata.risks // []),
+                    risk_level: (.metadata.risk_level // null)}),
                 blocked: ($br != null),
                 blocked_reason: $br,
                 blockers: ($blockers | map({id, text, status}))}'
@@ -1068,7 +1087,13 @@ cmd_context() {
         --argjson self_block "$self_block_json" \
         '($self_block[0].blocked_reason // null) as $br |
         {
-            node: ($node[0] | {id, text, status}),
+            # wv-cccf70: same reasoning as the identical comment in
+            # bootstrap mode above -- surface the gate-relevant metadata
+            # subset here too.
+            node: ($node[0] | . + {metadata: (.metadata | if type == "string" then fromjson else . end)} | {id, text, status,
+                done_criteria: (.metadata.done_criteria // []),
+                risks: (.metadata.risks // []),
+                risk_level: (.metadata.risk_level // null)}),
             blocked: ($br != null),
             blocked_reason: $br,
             blockers: ($blockers | map({id, text, status, context: (.context | fromjson? // .context)})),

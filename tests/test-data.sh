@@ -657,6 +657,37 @@ output=$($WV reindex 2>&1)
 assert_contains "$output" "Indexed" "reindex reports success"
 assert_contains "$output" "4 nodes" "reindex counted all nodes"
 
+# wv-ddb359: reindex must repair nodes_learning_fts too, not just nodes_fts.
+# Give node1 learning content so the learning index has something to index.
+$WV update "$node1" --metadata='{"pattern":"authentication lesson learned"}' >/dev/null 2>&1
+
+# Simulate a stale/corrupted FTS5 shadow index by dropping both search
+# tables out from under a live nodes table -- structurally what the
+# production incident looked like (base data intact, derived index gone/
+# bad). 'wv reindex' must recreate and repopulate BOTH, and a plain write
+# to nodes must succeed afterward: that write is exactly what failed in
+# production, because the AFTER UPDATE sync triggers threw SQLITE_CORRUPT
+# reaching into the stale index.
+sqlite3 "$WV_DB" "DROP TABLE IF EXISTS nodes_fts;"
+sqlite3 "$WV_DB" "DROP TABLE IF EXISTS nodes_learning_fts;"
+
+output=$($WV reindex 2>&1)
+assert_contains "$output" "4 nodes" "reindex repopulates nodes_fts after it's dropped"
+assert_contains "$output" "learning entries" "reindex also repairs nodes_learning_fts, not just nodes_fts"
+
+fts_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes_fts;")
+assert_equals "4" "$fts_count" "nodes_fts fully repopulated after drop"
+
+learning_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes_learning_fts;")
+assert_equals "1" "$learning_count" "nodes_learning_fts repopulated from node metadata after drop"
+
+if $WV update "$node2" --metadata='{"probe":"post-repair write"}' >/dev/null 2>&1; then
+    write_rc=0
+else
+    write_rc=1
+fi
+assert_equals "0" "$write_rc" "node write succeeds after reindex repairs both FTS5 tables"
+
 # Test basic search (text column)
 output=$($WV search "authentication" 2>&1)
 assert_contains "$output" "$node1" "search finds first auth node"
@@ -777,6 +808,170 @@ if [ -f "$CP_DIR/.delta" ]; then
     TESTS_RUN=$((TESTS_RUN + _cp_r))
 fi
 rm -rf "$CP_DIR"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Checkpoint/sync [skip ci] scoping (wv-e937f8)
+# ═══════════════════════════════════════════════════════════════════════════
+# Regression: GitHub applies [skip ci] to the WHOLE PUSH when it appears at
+# the push's tip, not just that one commit's own (always .weave/-only) diff.
+# A checkpoint/sync commit landing on top of already-unpushed non-.weave/
+# work must omit the marker so that work isn't silently skip-ci'd too.
+echo "Testing checkpoint [skip ci] scoping..."
+SKIPCI_DIR=$(mktemp -d)
+(
+    cd "$SKIPCI_DIR"
+    git init -q -b main
+    git config user.email t@t && git config user.name t && git config commit.gpgsign false
+    git init -q --bare "$SKIPCI_DIR/remote.git" >/dev/null 2>&1
+    git remote add origin "$SKIPCI_DIR/remote.git"
+    touch README.md && git add README.md && git commit -q -m "init"
+    git push -q -u origin main
+
+    # Full isolation from the suite's own custom WV_DB/WEAVE_DIR (same pattern
+    # as the durability-replay sandboxes below) — without unsetting
+    # WV_DB_CUSTOM and pinning WEAVE_DIR explicitly, wv init's hot-zone
+    # recovery can resolve .weave/ against the suite's OWN sandbox state
+    # instead of this throwaway repo.
+    _Ci=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$SKIPCI_DIR" "WV_HOT_ZONE=$SKIPCI_DIR/hz"
+         "WEAVE_DIR=$SKIPCI_DIR/.weave" WV_CHECKPOINT_INTERVAL=0 WV_CHECKPOINT_PULL=0 WV_SYNC_INTERVAL=0)
+    mkdir -p "$SKIPCI_DIR/hz"
+    "${_Ci[@]}" "$WV" init >/dev/null 2>&1 || true
+    "${_Ci[@]}" "$WV" add "seed" >/dev/null 2>&1 || true
+
+    _p=0 _r=0
+
+    # A real code commit, left unpushed — the exact scenario reproduced live
+    # in memory-system's own history (commit ec4eea5c landing [skip ci] on
+    # top of unpushed 42f8e759).
+    echo "code" > code.txt && git add code.txt && git commit -q -m "feat: real change"
+
+    # A checkpoint/sync commit landing on top must NOT carry [skip ci] — the
+    # unpushed range ahead of origin now includes the real code commit above.
+    "${_Ci[@]}" "$WV" sync >/dev/null 2>&1
+    _skipci_msg=$(git log -1 --format='%s')
+    if [[ "$_skipci_msg" != *"[skip ci]"* ]]; then
+        echo -e "  ${GREEN}✓${NC} checkpoint on top of unpushed code omits [skip ci]"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} checkpoint wrongly carries [skip ci] over unpushed code: $_skipci_msg"
+    fi
+    _r=$((_r + 1))
+
+    # The checkpoint's own diff is still .weave/-only (staging discipline
+    # unchanged) — only the marker is scoped, not what gets committed.
+    _skipci_files=$(git diff HEAD~1 HEAD --name-only)
+    if ! echo "$_skipci_files" | grep -qv '^\.weave/'; then
+        echo -e "  ${GREEN}✓${NC} checkpoint commit itself stays .weave/-only"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} checkpoint commit unexpectedly touched non-.weave/ files: $_skipci_files"
+    fi
+    _r=$((_r + 1))
+
+    echo "$_p $_r" > "$SKIPCI_DIR/.delta"
+)
+if [ -f "$SKIPCI_DIR/.delta" ]; then
+    read -r _skipci_p _skipci_r < "$SKIPCI_DIR/.delta"
+    TESTS_PASSED=$((TESTS_PASSED + _skipci_p))
+    TESTS_RUN=$((TESTS_RUN + _skipci_r))
+fi
+rm -rf "$SKIPCI_DIR"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# wv_checkpoint_ci_marker fail-safe direction (wv-822bea/wv-179c49)
+# ═══════════════════════════════════════════════════════════════════════════
+# Distribution re-audit of wv-e937f8 found the marker still defaulted to
+# " [skip ci]" whenever it couldn't prove the range was .weave/-only — the
+# unsafe direction. These exercise the library function directly against
+# the three failure modes the re-audit reproduced.
+echo "Testing wv_checkpoint_ci_marker fail-safe direction..."
+source "$REPO_ROOT/scripts/lib/wv-checkpoint-ci.sh"
+CIFS_DIR=$(mktemp -d)
+(
+    cd "$CIFS_DIR"
+    git init -q -b main
+    git config user.email t@t && git config user.name t && git config commit.gpgsign false
+    # release-track (scenario 2 below) intentionally has a different name
+    # than the local branch — push.default=simple refuses a bare `git push`
+    # in that shape, so pin an explicit refspec everywhere in this block.
+    git config push.default upstream
+    git init -q --bare "$CIFS_DIR/remote.git" >/dev/null 2>&1
+
+    _p=0 _r=0
+
+    # 1. New branch with a real commit and NO upstream configured yet — the
+    # exact scenario where a first `git push -u` would send the whole
+    # history, including this commit, as the push tip's range. Must NOT
+    # produce a marker (old code always did here).
+    echo "code" > code.txt && git add code.txt && git commit -q -m "feat: pre-upstream change"
+    _cifs_marker=$(wv_checkpoint_ci_marker "$CIFS_DIR")
+    if [ -z "$_cifs_marker" ]; then
+        echo -e "  ${GREEN}✓${NC} no-upstream + real commit produces no [skip ci]"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} no-upstream + real commit wrongly produced: '$_cifs_marker'"
+    fi
+    _r=$((_r + 1))
+
+    # 2. Upstream tracking a differently-named remote branch (not
+    # origin/<local-branch>) — @{u} must resolve it, not a hardcoded guess.
+    # A hardcoded "origin/$branch" (origin/main) doesn't exist here at all
+    # (the remote branch is release-track), so the OLD code's "upstream
+    # doesn't resolve" path would wrongly default to [skip ci] and miss the
+    # unpushed commit below entirely.
+    git remote add origin "$CIFS_DIR/remote.git"
+    git push -q -u origin main:release-track
+    echo "code2" > code2.txt && git add code2.txt && git commit -q -m "feat: change after push"
+    _cifs_marker=$(wv_checkpoint_ci_marker "$CIFS_DIR")
+    if [ -z "$_cifs_marker" ]; then
+        echo -e "  ${GREEN}✓${NC} @{u} resolves a differently-named upstream branch (finds unpushed work via it)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} differently-named upstream not resolved via @{u}: '$_cifs_marker'"
+    fi
+    _r=$((_r + 1))
+    git push -q origin HEAD:release-track >/dev/null 2>&1 || true
+
+    # 3. Add-then-remove within the unpushed range: net endpoint diff shows
+    # NOTHING (the file cancels out), but the range genuinely touched a
+    # non-.weave/ path partway through. `git log --name-only` over the
+    # range must still catch it — an endpoint `git diff` would not.
+    echo "temp" > cancel.txt && git add cancel.txt && git commit -q -m "feat: add temp file"
+    git rm -q cancel.txt && git commit -q -m "revert: remove temp file"
+    _cifs_netdiff=$(git diff "@{u}"..HEAD --name-only 2>/dev/null)
+    _cifs_marker=$(wv_checkpoint_ci_marker "$CIFS_DIR")
+    if [ -z "$_cifs_netdiff" ] && [ -z "$_cifs_marker" ]; then
+        echo -e "  ${GREEN}✓${NC} add-then-remove in range still detected (log-based, not endpoint-diff)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} add-then-remove in range: net-diff-empty=$([ -z "$_cifs_netdiff" ] && echo yes || echo no) marker='$_cifs_marker'"
+    fi
+    _r=$((_r + 1))
+
+    # 4. Baseline: a fully .weave/-only unpushed range (no real code churn
+    # after the last push) still gets the marker — the fix must not become
+    # unconditionally empty.
+    git push -q origin HEAD:release-track >/dev/null 2>&1 || true
+    mkdir -p .weave && echo "x" > .weave/state.sql && git add .weave/ && git commit -q -m "chore(weave): checkpoint"
+    _cifs_marker=$(wv_checkpoint_ci_marker "$CIFS_DIR")
+    if [ "$_cifs_marker" = " [skip ci]" ]; then
+        echo -e "  ${GREEN}✓${NC} genuinely .weave/-only unpushed range still gets [skip ci]"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} .weave/-only range unexpectedly produced: '$_cifs_marker'"
+    fi
+    _r=$((_r + 1))
+
+    echo "$_p $_r" > "$CIFS_DIR/.delta"
+)
+if [ -f "$CIFS_DIR/.delta" ]; then
+    read -r _cifs_p _cifs_r < "$CIFS_DIR/.delta"
+    TESTS_PASSED=$((TESTS_PASSED + _cifs_p))
+    TESTS_RUN=$((TESTS_RUN + _cifs_r))
+fi
+rm -rf "$CIFS_DIR"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════

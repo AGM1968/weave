@@ -308,6 +308,87 @@ install_procedure_assets() {
     rm -rf "$old"
 }
 
+install_pattern_assets() {
+    local destination="$CONFIG_DIR/quality-patterns/managed"
+    local staging old pattern_file
+    mkdir -p "$(dirname "$destination")"
+    staging=$(mktemp -d "$CONFIG_DIR/.quality-patterns-staging.XXXXXX")
+    if [ -d "./templates/quality-patterns/managed" ]; then
+        if ! cp -a ./templates/quality-patterns/managed/. "$staging/"; then
+            rm -rf "$staging"
+            return 1
+        fi
+    else
+        if ! curl -fsSL "$REPO/templates/quality-patterns/managed/manifest.txt" \
+            -o "$staging/manifest.txt"; then
+            rm -rf "$staging"
+            return 1
+        fi
+        while IFS= read -r pattern_file; do
+            case "$pattern_file" in
+                ""|*/*|*..*) rm -rf "$staging"; return 1 ;;
+                *.yaml) ;;
+                *) rm -rf "$staging"; return 1 ;;
+            esac
+            if ! curl -fsSL \
+                "$REPO/templates/quality-patterns/managed/$pattern_file" \
+                -o "$staging/$pattern_file"; then
+                rm -rf "$staging"
+                return 1
+            fi
+        done < "$staging/manifest.txt"
+    fi
+
+    if [ ! -s "$staging/manifest.txt" ] \
+        || [ -n "$(tail -c 1 "$staging/manifest.txt")" ] \
+        || [ "$(sort "$staging/manifest.txt" | uniq -d | wc -l)" -ne 0 ]; then
+        rm -rf "$staging"
+        return 1
+    fi
+    while IFS= read -r pattern_file; do
+        case "$pattern_file" in
+            ""|*/*|*..*) rm -rf "$staging"; return 1 ;;
+            *.yaml) ;;
+            *) rm -rf "$staging"; return 1 ;;
+        esac
+        [ -f "$staging/$pattern_file" ] || { rm -rf "$staging"; return 1; }
+    done < "$staging/manifest.txt"
+    for pattern_file in "$staging"/*.yaml; do
+        [ -f "$pattern_file" ] || { rm -rf "$staging"; return 1; }
+        grep -qxF "$(basename "$pattern_file")" "$staging/manifest.txt" \
+            || { rm -rf "$staging"; return 1; }
+    done
+    if ! PYTHONPATH="$LIB_DIR" python3 - "$staging" <<'PY'
+import sys
+from pathlib import Path
+from weave_quality.prose_rules import validate_pattern_rule
+
+root = Path(sys.argv[1])
+for path in root.glob("*.yaml"):
+    validate_pattern_rule(path, path.stem)
+PY
+    then
+        rm -rf "$staging"
+        return 1
+    fi
+
+    old="$CONFIG_DIR/.quality-patterns-old.$$"
+    rm -rf "$old"
+    if [ -e "$destination" ] || [ -L "$destination" ]; then
+        mv "$destination" "$old"
+    fi
+    if ! mv "$staging" "$destination"; then
+        [ -e "$old" ] && mv "$old" "$destination"
+        rm -rf "$staging"
+        return 1
+    fi
+    rm -rf "$old"
+    while IFS= read -r pattern_file; do
+        echo "$destination/$pattern_file" >> "$MANIFEST"
+    done < "$destination/manifest.txt"
+    echo "$destination/manifest.txt" >> "$MANIFEST"
+}
+
 install_git_hook_from_repo() {
     local hook_path="$1"
     local marker="$2"
@@ -369,6 +450,7 @@ do_install() {
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$LIB_DIR/lib"
 mkdir -p "$LIB_DIR/cmd"
+mkdir -p "$LIB_DIR/profiling"
 mkdir -p "$CONFIG_DIR"
 
 # Create config subdirectories
@@ -417,6 +499,8 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-delta.sh "$LIB_DIR/lib/wv-delta.sh"
     install_file ./scripts/lib/wv-delta-catalog.sh "$LIB_DIR/lib/wv-delta-catalog.sh"
     install_file ./scripts/lib/wv-checkpoint-generation.sh "$LIB_DIR/lib/wv-checkpoint-generation.sh"
+    install_file ./scripts/lib/wv-checkpoint-ci.sh "$LIB_DIR/lib/wv-checkpoint-ci.sh"
+    install_file ./scripts/lib/wv-repository-class.sh "$LIB_DIR/lib/wv-repository-class.sh"
     install_file ./scripts/lib/wv-workflow-classes.gen.sh "$LIB_DIR/lib/wv-workflow-classes.gen.sh"
     install_file ./scripts/lib/wv-hook-common.sh "$LIB_DIR/lib/wv-hook-common.sh"
     install_file ./scripts/lib/wv-resolve-project.sh "$LIB_DIR/lib/wv-resolve-project.sh"
@@ -433,6 +517,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/cmd/wv-cmd-indexer.sh "$LIB_DIR/cmd/wv-cmd-indexer.sh"
     install_file ./scripts/cmd/wv-cmd-query.sh "$LIB_DIR/cmd/wv-cmd-query.sh"
     install_file ./scripts/cmd/wv-cmd-hook.sh "$LIB_DIR/cmd/wv-cmd-hook.sh"
+    install_file ./profiling/audit_sessions.py "$LIB_DIR/profiling/audit_sessions.py"
     # Python sync package
     mkdir -p "$LIB_DIR/weave_gh"
     for pyf in ./scripts/weave_gh/*.py; do
@@ -477,6 +562,8 @@ if [ -f "./scripts/wv" ]; then
     cp ./scripts/lib/wv-config.sh "$CONFIG_DIR/lib/wv-config.sh"
     cp ./scripts/lib/wv-workflow-classes.gen.sh "$CONFIG_DIR/lib/wv-workflow-classes.gen.sh"
     cp ./scripts/lib/wv-hook-common.sh "$CONFIG_DIR/lib/wv-hook-common.sh"
+    cp ./scripts/lib/wv-checkpoint-ci.sh "$CONFIG_DIR/lib/wv-checkpoint-ci.sh"
+    cp ./scripts/lib/wv-repository-class.sh "$CONFIG_DIR/lib/wv-repository-class.sh"
     # Claude hooks (all 9 — registered globally via ~/.claude/settings.json under Alt-A)
     cp ./.claude/hooks/context-guard.sh "$CONFIG_DIR/hooks/"
     cp ./.claude/hooks/session-start-context.sh "$CONFIG_DIR/hooks/"
@@ -546,6 +633,8 @@ else
     download_file "$REPO/scripts/lib/wv-delta.sh" "$LIB_DIR/lib/wv-delta.sh"
     download_file "$REPO/scripts/lib/wv-delta-catalog.sh" "$LIB_DIR/lib/wv-delta-catalog.sh"
     download_file "$REPO/scripts/lib/wv-checkpoint-generation.sh" "$LIB_DIR/lib/wv-checkpoint-generation.sh"
+    download_file "$REPO/scripts/lib/wv-checkpoint-ci.sh" "$LIB_DIR/lib/wv-checkpoint-ci.sh"
+    download_file "$REPO/scripts/lib/wv-repository-class.sh" "$LIB_DIR/lib/wv-repository-class.sh"
     download_file "$REPO/scripts/lib/wv-workflow-classes.gen.sh" "$LIB_DIR/lib/wv-workflow-classes.gen.sh"
     download_file "$REPO/scripts/lib/wv-hook-common.sh" "$LIB_DIR/lib/wv-hook-common.sh"
     download_file "$REPO/scripts/lib/wv-resolve-project.sh" "$LIB_DIR/lib/wv-resolve-project.sh"
@@ -562,6 +651,7 @@ else
     download_file "$REPO/scripts/cmd/wv-cmd-indexer.sh" "$LIB_DIR/cmd/wv-cmd-indexer.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-query.sh" "$LIB_DIR/cmd/wv-cmd-query.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-hook.sh" "$LIB_DIR/cmd/wv-cmd-hook.sh"
+    download_file "$REPO/profiling/audit_sessions.py" "$LIB_DIR/profiling/audit_sessions.py"
     # Git hook sources (used by wv-init-repo --update refresh)
     mkdir -p "$LIB_DIR/hooks"
     download_file "$REPO/scripts/hooks/pre-commit-weave.sh" "$LIB_DIR/hooks/pre-commit-weave.sh"
@@ -585,7 +675,7 @@ else
     quality_modules=$(curl -sSL "https://api.github.com/repos/AGM1968/weave/contents/scripts/weave_quality?ref=main" \
         | jq -r '.[] | select(.name | endswith(".py")) | .name' 2>/dev/null)
     if [ -z "$quality_modules" ]; then
-        quality_modules="__init__.py __main__.py models.py git_metrics.py python_parser.py bash_heuristic.py bash_ast_grep.py typescript_parser.py hotspots.py db.py classification.py findings.py"
+        quality_modules="__init__.py __main__.py models.py git_metrics.py python_parser.py bash_heuristic.py bash_ast_grep.py typescript_parser.py hotspots.py db.py classification.py findings.py prose_rules.py"
     fi
     for pyfile in $quality_modules; do
         download_file "$REPO/scripts/weave_quality/${pyfile}" "$LIB_DIR/weave_quality/${pyfile}"
@@ -598,7 +688,7 @@ else
     done
     # Default pattern rules
     mkdir -p "$LIB_DIR/weave_quality/default_patterns"
-    for pattern_rule in subprocess-shell-true bare-except-pass unquoted-variable; do
+    for pattern_rule in subprocess-shell-true bare-except-pass unquoted-variable prose-casual-register prose-emphasis-hedge prose-number-free-verification; do
         download_file "$REPO/scripts/weave_quality/default_patterns/${pattern_rule}.yaml" \
             "$LIB_DIR/weave_quality/default_patterns/${pattern_rule}.yaml"
     done
@@ -624,6 +714,8 @@ else
     # Must land before wv-hook-common.sh sources it; absent here, hooks silently disable classification.
     curl -sSL "$REPO/scripts/lib/wv-workflow-classes.gen.sh" -o "$CONFIG_DIR/lib/wv-workflow-classes.gen.sh"
     curl -sSL "$REPO/scripts/lib/wv-hook-common.sh" -o "$CONFIG_DIR/lib/wv-hook-common.sh"
+    curl -sSL "$REPO/scripts/lib/wv-checkpoint-ci.sh" -o "$CONFIG_DIR/lib/wv-checkpoint-ci.sh"
+    curl -sSL "$REPO/scripts/lib/wv-repository-class.sh" -o "$CONFIG_DIR/lib/wv-repository-class.sh"
     # Claude hooks
     curl -sSL "$REPO/.claude/hooks/context-guard.sh" -o "$CONFIG_DIR/hooks/context-guard.sh"
     curl -sSL "$REPO/.claude/hooks/session-start-context.sh" -o "$CONFIG_DIR/hooks/session-start-context.sh"
@@ -688,6 +780,7 @@ chmod +x "$CONFIG_DIR/gen-procedures.sh"
 chmod +x "$CONFIG_DIR/hooks/"*.sh
 chmod +x "$CONFIG_DIR/skills/weave-audit/audit-report.sh"
 install_procedure_assets
+install_pattern_assets
 
 # Alt-A: Register all hooks globally in ~/.claude/settings.json
 # Per-project settings.json should have NO hooks key (it would shadow global hooks)
@@ -802,6 +895,8 @@ UPDATE_MODE=0
 FORCE_MODE=0
 CODEX_MCP_SCOPE=""
 CODEX_HOOKS=0
+REPOSITORY_CLASS_ARG=""
+ACKNOWLEDGE_UPSTREAM_FORK=0
 for arg in "$@"; do
     case "$arg" in
         --agent=*) AGENT_ARG="${arg#--agent=}" ;;
@@ -810,8 +905,10 @@ for arg in "$@"; do
         --codex-hooks) CODEX_HOOKS=1 ;;
         --codex-mcp) CODEX_MCP_SCOPE="lite" ;;
         --codex-mcp=lite|--codex-mcp=inspect|--codex-mcp=full) CODEX_MCP_SCOPE="${arg#--codex-mcp=}" ;;
+        --repository-class=*) REPOSITORY_CLASS_ARG="${arg#--repository-class=}" ;;
+        --acknowledge-upstream-fork) ACKNOWLEDGE_UPSTREAM_FORK=1 ;;
         --help|-h)
-            echo "Usage: wv-init-repo [--agent=claude|copilot|codex|all] [--update] [--force] [--codex-hooks] [--codex-mcp[=lite|inspect|full]]"
+            echo "Usage: wv-init-repo [--agent=claude|copilot|codex|all] [--update] [--force] [--repository-class=owned|vendored-upstream] [--acknowledge-upstream-fork] [--codex-hooks] [--codex-mcp[=lite|inspect|full]]"
             echo ""
             echo "  claude   (default) Claude Code hooks, skills, settings.local.json"
             echo "  copilot  VS Code Copilot MCP config (.vscode/mcp.json + legacy .mcp.json) + copilot-instructions.md"
@@ -821,6 +918,8 @@ for arg in "$@"; do
             echo "  --update  Update managed files (hooks, skills, agents, copilot-instructions)"
             echo "            Preserves user-customized files (CLAUDE.md, settings.local.json, MCP config)"
             echo "  --force   Like --update but also rewrites MCP config files (.vscode/mcp.json, .mcp.json)"
+            echo "  --repository-class=CLASS  Persist clone-local owned or vendored-upstream classification"
+            echo "  --acknowledge-upstream-fork  Required to classify an unresolved or upstream repo as owned"
             echo "  --codex-hooks  Generate project lifecycle hooks for explicit review and trust"
             echo "  --codex-mcp  Register weave-lite in Codex global config (local/read-mostly scope)"
             echo "  --codex-mcp=inspect  Register read-only weave-inspect instead"
@@ -829,6 +928,7 @@ for arg in "$@"; do
             echo "  Comma-separated: --agent=claude,copilot,codex"
             exit 0
             ;;
+        *) echo "wv-init-repo: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
 
@@ -854,6 +954,14 @@ CONFIG_DIR="${WV_CONFIG_DIR:-$HOME/.config/weave}"
 MCP_SERVER="${WV_LIB_DIR:-$HOME/.local/lib/weave}/mcp/dist/index.js"
 WV_BIN_DIR=$(cd "$(dirname "$0")" && pwd)
 WV_BIN="$WV_BIN_DIR/wv"
+REPO_CLASS_LIB="${WV_LIB_DIR:-$HOME/.local/lib/weave}/lib/wv-repository-class.sh"
+[ -f "$REPO_CLASS_LIB" ] || { echo "wv-init-repo: repository classification helper missing: $REPO_CLASS_LIB" >&2; exit 1; }
+# shellcheck source=scripts/lib/wv-repository-class.sh
+source "$REPO_CLASS_LIB"
+if [ -n "$REPOSITORY_CLASS_ARG" ]; then
+    wv_repository_class_set "$REPO_ROOT" "$REPOSITORY_CLASS_ARG" "$ACKNOWLEDGE_UPSTREAM_FORK"
+fi
+wv_repository_require_owned "$REPO_ROOT" "wv init-repo" || exit 1
 
 install_git_hook_from_repo() {
     local hook_path="$1"
@@ -907,7 +1015,132 @@ else
 fi
 
 # ── Core setup (all agents) ──────────────────────────────────────────────
+if [ -L "$REPO_ROOT/.weave" ]; then
+    echo "wv-init-repo: refusing symlinked .weave directory: $REPO_ROOT/.weave" >&2
+    exit 1
+fi
 mkdir -p "$REPO_ROOT/.weave"
+
+# Curated shared pattern rules. The managed subdirectory is owned by
+# wv-init-repo; top-level .weave/patterns/*.yaml remains project-owned.
+_PATTERN_SRC="$CONFIG_DIR/quality-patterns/managed"
+_PATTERN_PARENT="$REPO_ROOT/.weave/patterns"
+_PATTERN_DST="$REPO_ROOT/.weave/patterns/managed"
+_PATTERN_SRC_MANIFEST="$_PATTERN_SRC/manifest.txt"
+_PATTERN_DST_MANIFEST="$_PATTERN_DST/.manifest"
+if [ -f "$_PATTERN_SRC_MANIFEST" ]; then
+    if [ -L "$_PATTERN_PARENT" ] || [ -L "$_PATTERN_DST" ]; then
+        echo "wv-init-repo: refusing symlinked managed pattern directory: $_PATTERN_DST" >&2
+        exit 1
+    fi
+    if [ ! -s "$_PATTERN_SRC_MANIFEST" ] \
+        || [ -n "$(tail -c 1 "$_PATTERN_SRC_MANIFEST")" ] \
+        || [ "$(sort "$_PATTERN_SRC_MANIFEST" | uniq -d | wc -l)" -ne 0 ]; then
+        echo "wv-init-repo: invalid or duplicate managed pattern manifest" >&2
+        exit 1
+    fi
+    while IFS= read -r _pattern_file; do
+        case "$_pattern_file" in
+            ""|*/*|*..*)
+                echo "wv-init-repo: invalid managed pattern manifest entry: $_pattern_file" >&2
+                exit 1
+                ;;
+            *.yaml) ;;
+            *)
+                echo "wv-init-repo: invalid managed pattern manifest entry: $_pattern_file" >&2
+                exit 1
+                ;;
+        esac
+        [ -f "$_PATTERN_SRC/$_pattern_file" ] && [ ! -L "$_PATTERN_SRC/$_pattern_file" ] || {
+            echo "wv-init-repo: managed pattern missing from installed assets: $_pattern_file" >&2
+            exit 1
+        }
+    done < "$_PATTERN_SRC_MANIFEST"
+    for _pattern_source in "$_PATTERN_SRC"/*.yaml; do
+        [ -f "$_pattern_source" ] || continue
+        grep -qxF "$(basename "$_pattern_source")" "$_PATTERN_SRC_MANIFEST" || {
+            echo "wv-init-repo: unmanifested managed pattern asset: $_pattern_source" >&2
+            exit 1
+        }
+    done
+    if ! PYTHONPATH="${WV_LIB_DIR:-$HOME/.local/lib/weave}" python3 - "$_PATTERN_SRC" <<'PY'
+import sys
+from pathlib import Path
+from weave_quality.prose_rules import validate_pattern_rule
+
+root = Path(sys.argv[1])
+for path in root.glob("*.yaml"):
+    validate_pattern_rule(path, path.stem)
+PY
+    then
+        echo "wv-init-repo: installed managed pattern assets failed validation" >&2
+        exit 1
+    fi
+    if [ -d "$_PATTERN_DST" ] && find "$_PATTERN_DST" -type l -print -quit | grep -q .; then
+        echo "wv-init-repo: refusing symlink inside managed pattern directory: $_PATTERN_DST" >&2
+        exit 1
+    fi
+    if [ -f "$_PATTERN_DST_MANIFEST" ]; then
+        if [ ! -s "$_PATTERN_DST_MANIFEST" ] \
+            || [ -n "$(tail -c 1 "$_PATTERN_DST_MANIFEST")" ] \
+            || [ "$(sort "$_PATTERN_DST_MANIFEST" | uniq -d | wc -l)" -ne 0 ]; then
+            echo "wv-init-repo: invalid or duplicate prior managed pattern manifest" >&2
+            exit 1
+        fi
+        while IFS= read -r _old_pattern; do
+            case "$_old_pattern" in
+                ""|*/*|*..*) echo "wv-init-repo: invalid prior managed pattern manifest" >&2; exit 1 ;;
+                *.yaml) ;;
+                *) echo "wv-init-repo: invalid prior managed pattern manifest" >&2; exit 1 ;;
+            esac
+        done < "$_PATTERN_DST_MANIFEST"
+    fi
+
+    mkdir -p "$_PATTERN_PARENT"
+    _PATTERN_STAGE=$(mktemp -d "$_PATTERN_PARENT/.managed-staging.XXXXXX")
+    if [ -d "$_PATTERN_DST" ]; then
+        cp -a "$_PATTERN_DST/." "$_PATTERN_STAGE/"
+    fi
+    rm -f "$_PATTERN_STAGE/.manifest"
+    if [ -f "$_PATTERN_DST_MANIFEST" ]; then
+        while IFS= read -r _old_pattern; do
+            rm -f "$_PATTERN_STAGE/$_old_pattern"
+        done < "$_PATTERN_DST_MANIFEST"
+    fi
+    _new_pattern_manifest="$_PATTERN_STAGE/.manifest"
+    : > "$_new_pattern_manifest"
+    # .overridden is rebuilt fresh every run: it records managed rule ids this
+    # reconcile skipped because a same-named project-local rule already exists
+    # (almost always a completed promotion round-trip where the local copy
+    # should be deleted). `wv quality patterns list`/`doctor` read it to warn
+    # that the local copy is silently shadowing an improved managed version.
+    _new_pattern_overridden="$_PATTERN_STAGE/.overridden"
+    : > "$_new_pattern_overridden"
+    while IFS= read -r _pattern_file; do
+        _pattern_local_override="$REPO_ROOT/.weave/patterns/$_pattern_file"
+        if [ -f "$_pattern_local_override" ]; then
+            echo -e "  ${YELLOW}⊘${NC} .weave/patterns/managed/$_pattern_file (project-local override preserved)"
+            printf '%s\n' "$_pattern_file" >> "$_new_pattern_overridden"
+            continue
+        fi
+        if [ -e "$_PATTERN_STAGE/$_pattern_file" ]; then
+            echo -e "  ${YELLOW}⊘${NC} .weave/patterns/managed/$_pattern_file (unmanaged file exists, preserved)"
+            continue
+        fi
+        cp "$_PATTERN_SRC/$_pattern_file" "$_PATTERN_STAGE/$_pattern_file"
+        printf '%s\n' "$_pattern_file" >> "$_new_pattern_manifest"
+    done < "$_PATTERN_SRC_MANIFEST"
+    _PATTERN_OLD="$_PATTERN_PARENT/.managed-old.$$"
+    rm -rf "$_PATTERN_OLD"
+    [ ! -e "$_PATTERN_DST" ] || mv "$_PATTERN_DST" "$_PATTERN_OLD"
+    if ! mv "$_PATTERN_STAGE" "$_PATTERN_DST"; then
+        [ ! -e "$_PATTERN_OLD" ] || mv "$_PATTERN_OLD" "$_PATTERN_DST"
+        rm -rf "$_PATTERN_STAGE"
+        exit 1
+    fi
+    rm -rf "$_PATTERN_OLD"
+    echo -e "  ${GREEN}✓${NC} .weave/patterns/managed (reconciled)"
+fi
 
 # .weave/runtime.md scaffold (shared by weave-runtime system prompt injection)
 # Two-block architecture:
@@ -2002,7 +2235,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
     # Warn about unstaged changes from update. Include scripts/hooks/ — the
     # vendor refresh now seeds/refreshes hook SOURCES there (e.g. a newly added
     # post-commit-weave.sh), which the old .claude/.github/.vscode glob missed.
-    local_changes=$(cd "$REPO_ROOT" && git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard .claude/ .github/ .vscode/ scripts/hooks/ 2>/dev/null || true)
+    local_changes=$(cd "$REPO_ROOT" && git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard .claude/ .github/ .vscode/ .weave/patterns/ scripts/hooks/ 2>/dev/null || true)
     if [ -n "$local_changes" ]; then
         echo ""
         echo -e "${YELLOW}⚠ Unstaged scaffolding changes from update:${NC}"
@@ -2014,7 +2247,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
         echo -e "${YELLOW}  To commit (the Weave pre-commit hook needs an active node):${NC}"
         echo "    wv add \"chore: sync Weave scaffolding\" --standalone --alias=weave-scaffold \\"
         echo "      --status=active --criteria=\"scaffolding synced\" --risks=low"
-        echo "    git add -A .claude/ .github/ .vscode/ scripts/hooks/ .gitignore && git commit -m \"chore(weave): sync scaffolding\""
+        echo "    git add -A .claude/ .github/ .vscode/ .weave/patterns/ scripts/hooks/ .gitignore && git commit -m \"chore(weave): sync scaffolding\""
         echo "    wv done <node-id> --skip-verification        # <node-id> from the wv add line above"
         echo -e "${YELLOW}  Quick path (no node): WV_SKIP_PRECOMMIT=1 git add -A … && git commit -m '…'${NC}"
     fi
@@ -2022,6 +2255,7 @@ else
     echo -e "${GREEN}✓ Weave initialized in $REPO_ROOT (agent=$AGENT_LABEL)${NC}"
 fi
 echo "  .weave/         — graph storage"
+echo "  .weave/patterns/managed/ — curated shared quality rules"
 echo "  .gitignore      — Weave entries added"
 for _a in "${AGENTS[@]}"; do
     if [ "$_a" = "claude" ]; then

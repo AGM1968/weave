@@ -57,6 +57,8 @@ resolve_delta_filename_prefix prefix_a
 resolve_delta_filename_prefix prefix_b
 unset -f date
 unset _WV_DELTA_STAMP_KEY _WV_DELTA_STAMP_SEQ
+DELTA_DAY=$(date -u +%F)
+DELTA_REPLAY_EPOCH=9999999998
 
 assert "Delta prefix encodes seconds, nanos, and zero sequence" \
     '[ "$prefix_a" = "1778349970-123456789-000000" ]' \
@@ -99,6 +101,11 @@ _reg_drivers() {
     git -C "$1" config user.email test@test.com
     git -C "$1" config user.name test
     git -C "$1" config commit.gpgsign false
+    (
+        cd "$1"
+        env -u WV_HOT_ZONE -u WV_DB -u WEAVE_DIR WV_PROJECT_DIR="$1" \
+            "$WV" repo-class set owned --acknowledge-upstream-fork >/dev/null
+    )
 }
 
 # Helper: generate a production-format delta from _warp_changes using
@@ -149,6 +156,7 @@ init_agent_db() {
     export WV_HOT_ZONE="$hot"
     export WV_DB="$db"
     export WEAVE_DIR="$dir/.weave"
+    export WV_PROJECT_DIR="$dir"
     cd "$dir"
     $WV init 2>/dev/null || true
 }
@@ -160,6 +168,7 @@ sync_and_push() {
     export WV_HOT_ZONE="$dir/hot"
     export WV_DB="$dir/hot/brain.db"
     export WEAVE_DIR="$dir/.weave"
+    export WV_PROJECT_DIR="$dir"
     cd "$dir"
     $WV sync 2>/dev/null || true
     git add .weave/ 2>/dev/null || true
@@ -187,7 +196,7 @@ $WV add "Agent A task" 2>/dev/null
 AGENT_A_NODE=$($WV list --json 2>/dev/null | python3 -c "import sys,json; nodes=json.load(sys.stdin); print([n['id'] for n in nodes if 'Agent A' in n['text']][0])")
 
 # Write Agent A's delta via wv_delta_changeset (production code path).
-gen_delta "$AGENT_A_DIR/.weave/deltas/2026-03-15/0000000001-agentA.sql"
+gen_delta "$AGENT_A_DIR/.weave/deltas/$DELTA_DAY/0000000001-agentA.sql"
 sync_and_push "$AGENT_A_DIR" "agentA"
 
 # Agent B pulls, creates its own node
@@ -200,7 +209,7 @@ $WV add "Agent B task" 2>/dev/null
 AGENT_B_NODE=$($WV list --json 2>/dev/null | python3 -c "import sys,json; nodes=json.load(sys.stdin); print([n['id'] for n in nodes if 'Agent B' in n['text']][0])")
 
 # Write Agent B's delta via wv_delta_changeset (production code path).
-gen_delta "$AGENT_B_DIR/.weave/deltas/2026-03-15/0000000002-agentB.sql"
+gen_delta "$AGENT_B_DIR/.weave/deltas/$DELTA_DAY/0000000002-agentB.sql"
 sync_and_push "$AGENT_B_DIR" "agentB"
 
 # Observer pulls both and loads
@@ -235,27 +244,30 @@ echo "--- Same-node LWW: last-writer-wins per row ---"
 export WV_HOT_ZONE="$AGENT_A_DIR/hot"
 export WV_DB="$AGENT_A_DIR/hot/brain.db"
 export WEAVE_DIR="$AGENT_A_DIR/.weave"
+export WV_PROJECT_DIR="$AGENT_A_DIR"
 cd "$AGENT_A_DIR"
 $WV update "$AGENT_A_NODE" --text="Agent A updated this" 2>/dev/null
 
 # Write earlier-epoch delta (Agent A loses LWW) directly to observer's delta dir.
-gen_delta "$OBSERVER_DIR/.weave/deltas/2026-03-15/0000000010-agentA.sql"
+gen_delta "$OBSERVER_DIR/.weave/deltas/$DELTA_DAY/0000000010-agentA.sql"
 
 # Agent B loads agent-a's state, updates the SAME node
 export WV_HOT_ZONE="$AGENT_B_DIR/hot"
 export WV_DB="$AGENT_B_DIR/hot/brain.db"
 export WEAVE_DIR="$AGENT_B_DIR/.weave"
+export WV_PROJECT_DIR="$AGENT_B_DIR"
 cd "$AGENT_B_DIR"
 $WV load 2>/dev/null || true
 $WV update "$AGENT_A_NODE" --text="Agent B wins this" 2>/dev/null
 
 # Write later-epoch delta (Agent B wins LWW) directly to observer.
-gen_delta "$OBSERVER_DIR/.weave/deltas/2026-03-15/0000000020-agentB.sql"
+gen_delta "$OBSERVER_DIR/.weave/deltas/$DELTA_DAY/0000000020-agentB.sql"
 
 # Observer loads merged state: replays epoch-sorted deltas → Agent B wins
 export WV_HOT_ZONE="$OBSERVER_DIR/hot"
 export WV_DB="$OBSERVER_DIR/hot/brain.db"
 export WEAVE_DIR="$OBSERVER_DIR/.weave"
+export WV_PROJECT_DIR="$OBSERVER_DIR"
 cd "$OBSERVER_DIR"
 $WV load 2>/dev/null || true
 
@@ -279,19 +291,20 @@ init_agent_db "$SAME_SOURCE_DIR"
 SAME_LOAD_DIR="$TEST_DIR/same-second-load"
 git clone "$BARE_REPO" "$SAME_LOAD_DIR" -q 2>/dev/null
 _reg_drivers "$SAME_LOAD_DIR"
-mkdir -p "$SAME_LOAD_DIR/.weave/deltas/2026-03-15"
+mkdir -p "$SAME_LOAD_DIR/.weave/deltas/$DELTA_DAY"
 
 export WV_HOT_ZONE="$SAME_SOURCE_DIR/hot"
 export WV_DB="$SAME_SOURCE_DIR/hot/brain.db"
 export WEAVE_DIR="$SAME_SOURCE_DIR/.weave"
+export WV_PROJECT_DIR="$SAME_SOURCE_DIR"
 cd "$SAME_SOURCE_DIR"
 
 $WV add "Same-second base" 2>/dev/null
 SAME_NODE=$($WV list --json 2>/dev/null | python3 -c "import sys,json; nodes=json.load(sys.stdin); print([n['id'] for n in nodes if 'Same-second base' in n['text']][0])")
-gen_delta "$SAME_LOAD_DIR/.weave/deltas/2026-03-15/1778349970-123456789-000000-agentSeq-111.sql"
+gen_delta "$SAME_LOAD_DIR/.weave/deltas/$DELTA_DAY/$DELTA_REPLAY_EPOCH-123456789-000000-agentSeq-111.sql"
 
 $WV update "$SAME_NODE" --text="Second sequence wins" 2>/dev/null
-gen_delta "$SAME_LOAD_DIR/.weave/deltas/2026-03-15/1778349970-123456789-000001-agentSeq-111.sql"
+gen_delta "$SAME_LOAD_DIR/.weave/deltas/$DELTA_DAY/$DELTA_REPLAY_EPOCH-123456789-000001-agentSeq-111.sql"
 
 init_agent_db "$SAME_LOAD_DIR"
 $WV load 2>/dev/null || true
@@ -303,6 +316,7 @@ assert "Same-second replay applies higher sequence last" '[ "$same_text" = "Seco
 export WV_HOT_ZONE="$OBSERVER_DIR/hot"
 export WV_DB="$OBSERVER_DIR/hot/brain.db"
 export WEAVE_DIR="$OBSERVER_DIR/.weave"
+export WV_PROJECT_DIR="$OBSERVER_DIR"
 cd "$OBSERVER_DIR"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -335,13 +349,13 @@ assert "Agent B deltas have agentB suffix" '[ "$b_deltas" -gt 0 ]' "at least 1 a
 echo ""
 echo "--- Corrupt delta handling ---"
 
-echo "THIS IS NOT SQL" > "$OBSERVER_DIR/.weave/deltas/2026-03-15/9999999999-corrupt.sql"
+echo "THIS IS NOT SQL" > "$OBSERVER_DIR/.weave/deltas/$DELTA_DAY/9999999999-corrupt.sql"
 corrupt_output=$($WV load 2>&1)
 
 assert "Corrupt delta produces warning" 'echo "$corrupt_output" | grep -q "Skipped corrupt"' "warning about corrupt delta"
 
 # Clean up corrupt file
-rm -f "$OBSERVER_DIR/.weave/deltas/2026-03-15/9999999999-corrupt.sql"
+rm -f "$OBSERVER_DIR/.weave/deltas/$DELTA_DAY/9999999999-corrupt.sql"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Test 7: Delta load is idempotent — second load produces same node count
@@ -375,7 +389,7 @@ echo "--- Prune delta isolation ---"
 PRUNE_DIR="$TEST_DIR/prune-agent"
 git clone "$BARE_REPO" "$PRUNE_DIR" -q 2>/dev/null
 _reg_drivers "$PRUNE_DIR"
-mkdir -p "$PRUNE_DIR/.weave/deltas/2026-03-15" "$PRUNE_DIR/hot"
+mkdir -p "$PRUNE_DIR/.weave/deltas/$DELTA_DAY" "$PRUNE_DIR/hot"
 init_agent_db "$PRUNE_DIR"
 
 # Create nodes, mark done, backdate so they're prunable

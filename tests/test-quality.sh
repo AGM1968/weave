@@ -270,6 +270,21 @@ test_help_flags() {
 }
 test_help_flags
 
+test_patterns_help_documents_rule_schema() {
+    local out
+    out=$("$WV" quality patterns --help 2>&1) || true
+    assert_contains "$out" "kind: lexicon" "patterns help documents kind: lexicon"
+    assert_contains "$out" "kind: motif" "patterns help documents kind: motif"
+    assert_contains "$out" "kind: density" "patterns help documents kind: density"
+    assert_contains "$out" "kind: regex" "patterns help documents kind: regex"
+    assert_contains "$out" "match_scope" "patterns help documents match_scope"
+    assert_contains "$out" "maturity" "patterns help documents maturity"
+    assert_contains "$out" "require_no_digit_within" "patterns help documents require_no_digit_within"
+    assert_contains "$out" "min_count" "patterns help documents min_count"
+    assert_contains "$out" "Managed rules" "patterns help documents the managed rule tier"
+}
+test_patterns_help_documents_rule_schema
+
 # ---------------------------------------------------------------------------
 # Test: wv quality scan --json (first scan, all files changed)
 # ---------------------------------------------------------------------------

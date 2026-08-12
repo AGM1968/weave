@@ -7,9 +7,10 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 CONFIG="$TMP/config"
 REPO="$TMP/repo"
-mkdir -p "$CONFIG/procedures" "$REPO"
+mkdir -p "$CONFIG/procedures" "$CONFIG/lib" "$REPO"
 cp "$ROOT/scripts/project-procedures.sh" "$CONFIG/project-procedures.sh"
 cp "$ROOT/scripts/gen-procedures.sh" "$CONFIG/gen-procedures.sh"
+cp "$ROOT/scripts/lib/wv-repository-class.sh" "$CONFIG/lib/wv-repository-class.sh"
 chmod +x "$CONFIG/project-procedures.sh" "$CONFIG/gen-procedures.sh"
 
 write_procedure() {

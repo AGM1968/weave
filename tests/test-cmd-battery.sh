@@ -221,6 +221,7 @@ battery R audit-pitfalls audit-pitfalls
 battery R edge-types edge-types --stats
 battery R guide      guide --topic=discovery
 battery R config     config
+battery J repo-class repo-class --json
 battery H hook
 battery H test-record
 battery H selftest
