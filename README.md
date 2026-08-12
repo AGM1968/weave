@@ -56,8 +56,8 @@ Download the source archive attached to the desired
 directory:
 
 ```bash
-tar -xzf weave-1.71.0-rc.2.tar.gz
-cd weave-1.71.0-rc.2
+tar -xzf weave-1.71.0-rc.3.tar.gz
+cd weave-1.71.0-rc.3
 ./install.sh --verify
 ```
 

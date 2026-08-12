@@ -4,10 +4,11 @@
 
 ## Unreleased
 
-## [1.71.0-rc.2] - 2026-08-12
+## [1.71.0-rc.3] - 2026-08-12
 
 Corrective prerelease based on the first closed consumer adjudication of Weave's prose rules. This
-respin replaces rc.1 as the promotion candidate; rc.1 should not be promoted to stable.
+is the promotion candidate after rc.1 was superseded and the malformed public rc.2 projection was
+withdrawn.
 
 ### Fixed
 
@@ -25,6 +26,9 @@ respin replaces rc.1 as the promotion candidate; rc.1 should not be promoted to 
 - **Release projection containment** — public artifacts now recursively strip ignored nested
   `.weave` runtime caches from every shipped subtree, including builds made from worked-in source
   checkouts rather than only fresh clones.
+- **Content-exact public projection** — release synchronization now compares file content rather
+  than trusting size and modification time, preventing same-size version metadata from a previous
+  release surviving when source and public clones were created in the same timestamp interval.
 
 ### Added
 
