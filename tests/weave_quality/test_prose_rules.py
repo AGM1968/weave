@@ -279,7 +279,6 @@ def test_default_prose_rules_parse_and_execute(tmp_path: Path) -> None:
     assert [path.stem for path in rule_paths] == [
         "prose-casual-register",
         "prose-emphasis-hedge",
-        "prose-number-free-verification",
     ]
     for rule_path in rule_paths:
         assert validate_pattern_rule(rule_path, rule_path.stem) == "prose"
@@ -338,7 +337,15 @@ def test_causal_so_claim_covers_openers_excludes_so_that_and_reflows(tmp_path: P
 def test_number_free_verification_measures_repetition_not_document_numbers(
     tmp_path: Path,
 ) -> None:
-    rule_path = DEFAULT_PATTERNS / "prose-number-free-verification.yaml"
+    # Engine coverage only: the former built-in rule was withdrawn after its
+    # first closed adjudication measured 0/14 precision on methods prose.
+    # Keep the motif/digit-window contract tested without presenting that
+    # uncalibrated term list as an active default.
+    rule_path = _rule(
+        tmp_path,
+        "id: verification-test\nlanguage: prose\nkind: motif\nmin_count: 3\n"
+        "require_no_digit_within: 80\nterms:\n  - measured\n",
+    )
     unsupported = _write(
         tmp_path / "unsupported.md",
         "Measured output was reported. Measured output was reviewed. "
@@ -349,8 +356,59 @@ def test_number_free_verification_measures_repetition_not_document_numbers(
         "Measured output was 5/min. Measured error was 2%. "
         "Measured coverage was 30 days.\n",
     )
-    assert len(run_prose_rule(rule_path.stem, rule_path, unsupported, scan_id=1)) == 3
-    assert not run_prose_rule(rule_path.stem, rule_path, supported, scan_id=1)
+    assert len(run_prose_rule("verification-test", rule_path, unsupported, scan_id=1)) == 3
+    assert not run_prose_rule("verification-test", rule_path, supported, scan_id=1)
+
+
+def test_prose_matchers_exclude_inline_code_spans(tmp_path: Path) -> None:
+    emphasis = DEFAULT_PATTERNS / "prose-emphasis-hedge.yaml"
+    casual = DEFAULT_PATTERNS / "prose-casual-register.yaml"
+    verification = _rule(
+        tmp_path,
+        "id: verification-test\nlanguage: prose\nkind: motif\nmin_count: 3\n"
+        "require_no_digit_within: 80\nterms:\n  - measured\n",
+    )
+    doc = _write(
+        tmp_path / "inline.md",
+        "Keep `actually`, `passed, so hidden`, and `measured measured measured` as examples. "
+        "Actually revise prose that passed, so continue with a measured result, then measured output, "
+        "then another measured result.\n",
+    )
+
+    assert [finding.match_text for finding in run_prose_rule(
+        emphasis.stem, emphasis, doc, scan_id=1
+    )] == ["Actually"]
+    assert [finding.match_text for finding in run_prose_rule(
+        casual.stem, casual, doc, scan_id=1
+    )] == [", so continue"]
+    assert len(run_prose_rule("verification-test", verification, doc, scan_id=1)) == 3
+
+
+def test_multiline_inline_code_is_excluded_but_unmatched_backtick_is_literal(
+    tmp_path: Path,
+) -> None:
+    rule_path = DEFAULT_PATTERNS / "prose-emphasis-hedge.yaml"
+    doc = _write(
+        tmp_path / "multiline.md",
+        "A span starts `actually\nand stays actually hidden` before actually prose.\n\n"
+        "An unmatched `actually remains literal.\n",
+    )
+
+    found = run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+    assert [(finding.line, finding.match_text) for finding in found] == [
+        (2, "actually"),
+        (4, "actually"),
+    ]
+
+
+def test_inline_code_mask_preserves_source_position_after_span(tmp_path: Path) -> None:
+    rule_path = DEFAULT_PATTERNS / "prose-emphasis-hedge.yaml"
+    doc = _write(tmp_path / "position.md", "Prefix `actually` then clearly revise.\n")
+
+    found = run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+    assert [(finding.line, finding.col, finding.match_text) for finding in found] == [
+        (1, 23, "clearly")
+    ]
 
 
 def test_regex_rule_exempts_legitimate_compound_terms(tmp_path: Path) -> None:

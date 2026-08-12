@@ -1897,6 +1897,39 @@ def pattern_adjudication_report(
             if str(row["path"]) == path_prefix
             or str(row["path"]).startswith(path_prefix + "/")
         ]
+    # A disposition is durable, but its finding is current only when it
+    # occurred in the newest completed scan whose target covered that path.
+    # Looking only at scan_count keeps an edited-away key alive forever:
+    # real rescans allocate a fresh pattern_runs id, so the old occurrence
+    # remains historical even though the replacement scan no longer found
+    # it. Keep that state for reattachment if the same key reappears, while
+    # excluding it from today's precision denominator.
+    completed_runs = conn.execute(
+        "SELECT id, target FROM pattern_runs WHERE finished_at IS NOT NULL "
+        "ORDER BY id DESC"
+    ).fetchall()
+    occurrences = {
+        (int(row["scan_id"]), str(row["finding_key"]))
+        for row in conn.execute(
+            "SELECT scan_id, finding_key FROM pattern_finding_occurrences"
+        ).fetchall()
+    }
+
+    def target_covers_path(target: str, path: str) -> bool:
+        if target == ".":
+            return not Path(path).is_absolute()
+        return path == target or path.startswith(target.rstrip("/") + "/")
+
+    def is_current(row: dict[str, object]) -> bool:
+        path = str(row["path"])
+        for run in completed_runs:
+            if target_covers_path(str(run["target"]), path):
+                return (int(run["id"]), str(row["finding_key"])) in occurrences
+        # Preserve pre-pattern_runs/migrated state when no completed scan can
+        # establish a newer truth for this path.
+        return int(str(row["scan_count"])) > 0
+
+    rows = [row for row in rows if is_current(row)]
     by_rule: dict[str, dict[str, object]] = {}
     recurring_waivers: list[dict[str, object]] = []
     for row in rows:
@@ -1914,6 +1947,7 @@ def pattern_adjudication_report(
                 "unresolved": 0,
                 "decided_count": 0,
                 "decided_precision": None,
+                "actionable_rate": None,
                 "max_scan_count": 0,
                 "needs_adjudication": False,
             },
@@ -1949,6 +1983,9 @@ def pattern_adjudication_report(
             str(summary["waived"])
         )
         summary["decided_precision"] = true_positives / decided if decided else None
+        summary["actionable_rate"] = (
+            int(str(summary["accepted_defects"])) / decided if decided else None
+        )
         summary["needs_adjudication"] = (
             decided == 0 and int(str(summary["max_scan_count"])) >= ADJUDICATION_NUDGE_SCANS
         )

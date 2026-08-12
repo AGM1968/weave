@@ -4,6 +4,34 @@
 
 ## Unreleased
 
+## [1.71.0-rc.2] - 2026-08-12
+
+Corrective prerelease based on the first closed consumer adjudication of Weave's prose rules. This
+respin replaces rc.1 as the promotion candidate; rc.1 should not be promoted to stable.
+
+### Fixed
+
+- **Current adjudication precision** — editing away a finding now makes its durable disposition
+  dormant rather than leaving the historical key in current precision denominators. A later exact
+  reappearance still recovers its prior disposition, and narrower scans do not stale findings
+  outside their target.
+- **Inline-code prose exclusion** — prose content rules no longer flag examples inside CommonMark
+  inline code spans, including spans crossing a soft-wrapped source line. Unmatched backticks remain
+  literal text and source positions after a span remain exact.
+- **Zero-precision default withdrawn** — `prose-number-free-verification` was removed from the active
+  built-in set after its first closed methods-document adjudication classified all 14 findings as
+  false positives. The motif engine remains available, but this term list will not return without
+  broader cross-genre calibration.
+- **Release projection containment** — public artifacts now recursively strip ignored nested
+  `.weave` runtime caches from every shipped subtree, including builds made from worked-in source
+  checkouts rather than only fresh clones.
+
+### Added
+
+- **Actionable rate** — pattern reports now show `accepted_defect / decided_count` beside pattern
+  precision, distinguishing an accurate review prompt with legitimate waivers from a finding that
+  usually warrants an edit.
+
 ## [1.71.0-rc.1] - 2026-08-12
 
 First public prerelease of the Weave 1.71 LTS maintenance line since v1.70.3. Weave (Bash/Python) is

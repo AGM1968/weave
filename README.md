@@ -1,85 +1,153 @@
 # Weave
 
-Weave is the Bash/Python implementation of a durable work, memory, and policy graph for coding
-agents. As of v1.71 it is maintained as a supported long-term maintenance (LTS) line, kept
-deliberately separate from an in-progress Rust successor program.
+Weave is a local-first work, memory, and policy graph for coding agents. It gives Claude Code,
+Codex, Copilot, MCP clients, CI, and human operators one durable workflow built around the `wv`
+command.
 
-## Two Separate Lifecycles
+Weave stores project state in `.weave/`, uses SQLite for fast local queries, and projects durable
+graph state into Git so work, decisions, dependencies, and learnings survive across sessions and
+machines.
 
-```
-┌────────────────────────────────┐
-│ Weave 1.71 LTS                  │
-│ Bash/Python compatibility       │
-│ Public maintenance releases     │
-└────────────────┬─────────────────┘
-                 │ contract / reference behavior
-                 ▼
-┌────────────────────────────────┐
-│ Rust successor program          │
-│ Shadow / read-only initially    │
-│ E1–E7 gates before mutation     │
-│ authority and cutover           │
-└────────────────────────────────┘
-```
+> **Release status:** 1.71 is the supported Bash/Python LTS maintenance line. The current 1.71
+> release is a prerelease; v1.70.3 remains the latest stable release.
 
-- **Weave 1.71 (this repository)** is the supported line. It receives correctness, security,
-  durability, compatibility, and installer fixes.
-- **The Rust successor** is a separate, non-authoritative program: shadow/read-only against this
-  repository's behavior as its reference contract, until it passes its own durability and evidence
-  gates (E1 through E7). Those gates block _Rust_ mutation authority and cutover — they do not, and
-  have never, blocked ordinary maintenance releases of this Bash/Python line.
+## What Weave Provides
 
-## Public Status
+- graph-backed tasks with criteria, risks, blockers, dependencies, and aliases;
+- explicit claim, preflight, verification, completion, and recovery workflows;
+- durable decisions, patterns, pitfalls, trails, and context packs;
+- impact-selected tests and policy checks tied to touched files;
+- Git and optional GitHub issue synchronization;
+- shared workflow surfaces for Claude Code, Codex, Copilot, CLI, and MCP clients;
+- repository health, graph audits, code search, and prose-quality diagnostics.
 
-- Weave 1.71 is an active, supported maintenance line — not archived, not frozen.
-- Releases on this line are scoped to correctness, security, durability, compatibility, and
-  installer fixes, not new features.
-- No experimental Rust mutation authority, evaluation harness, or private evidence-lab code is part
-  of this release, or of any release on this maintenance line.
-- Internal graph state, transcripts, host session exports, and evidence-lab artifacts are not part
-  of the public release surface — this repository is generated and stays graph-free by design.
+## Requirements
 
-See `CHANGELOG.md` for the fixes in each release.
+- Linux or macOS;
+- Bash, Git, SQLite 3, `jq`, and Python 3.11+;
+- Node.js 20+ only when installing the optional MCP server;
+- GitHub CLI (`gh`) only when using GitHub synchronization.
 
-## Existing Users
-
-If you already use Weave, keep using the release you have unless you need a specific fix from a
-newer one. This release is published as a prerelease and will not be pulled in automatically by
-`wv-update`; install it explicitly if you want it before it is promoted.
-
-For private/internal deployments from the upstream source repository, update via the source clone
-and then refresh consumer repositories:
+Check dependencies without installing:
 
 ```bash
-cd /path/to/memory-system
-git pull --ff-only
-./install.sh
+./install.sh --check-deps
+```
 
-cd /path/to/consumer-repo
-wv repo-class --json
+## Install
+
+### Latest stable release
+
+```bash
+curl -sSL https://raw.githubusercontent.com/AGM1968/weave/v1.70.3/install.sh | bash
+```
+
+Ensure `~/.local/bin` is on `PATH`, then confirm the installation:
+
+```bash
+wv --version
+wv selftest
+```
+
+### A specific prerelease
+
+Download the source archive attached to the desired
+[GitHub release](https://github.com/AGM1968/weave/releases), extract it, and install from that
+directory:
+
+```bash
+tar -xzf weave-1.71.0-rc.2.tar.gz
+cd weave-1.71.0-rc.2
+./install.sh --verify
+```
+
+Install the optional MCP server with:
+
+```bash
+./install.sh --with-mcp
+```
+
+## Start Using Weave
+
+Initialize an owned project repository:
+
+```bash
+cd /path/to/your-project
+wv init-repo --agent=all
+wv bootstrap --json
+```
+
+Use `--agent=claude`, `--agent=codex`, or `--agent=copilot` when only one host integration should
+be projected. Weave checks repository ownership before writing managed files; inspect uncertain
+repositories with `wv repo-class --json` rather than forcing initialization.
+
+A minimal work cycle:
+
+```bash
+# Create and claim work.
+wv add "Fix session recovery" \
+  --status=active \
+  --criteria="recovery test passes|failure mode documented" \
+  --risks=medium
+
+# Inspect the active context and readiness gates.
+wv bootstrap --json
+wv preflight <node-id> --json
+
+# Attribute changed files, commit the implementation, and close with reusable learning.
+wv touch <node-id> --files=src/recovery.py,tests/test_recovery.py
+git add src/recovery.py tests/test_recovery.py
+git commit -m "fix: recover interrupted sessions"
+wv done <node-id> \
+  --learning="decision: ... | pattern: ... | pitfall: ..."
+
+# Persist graph state and optionally synchronize linked GitHub issues.
+wv sync --gh
+git add .weave/
+git diff --cached --quiet || git commit -m "chore(weave): sync state"
+git push
+```
+
+Run `wv help`, `wv help <command>`, or `wv guide --topic=workflow` for command guidance.
+
+## Updating
+
+For stable installations:
+
+```bash
+wv self-update
+```
+
+After updating Weave, refresh managed integration files in each owned project:
+
+```bash
 wv init-repo --agent=all --update
 wv load
 wv bootstrap --json
 ```
 
-Run `init-repo` only for repositories classified as `owned`; bulk deployments must skip
-`vendored-upstream` and `ambiguous` targets. Use `--agent=claude`, `--agent=codex`, or
-`--agent=copilot` instead of `--agent=all` when a consumer repo should receive only one host
-surface.
+Prereleases are opt-in and are not installed automatically while an older release remains marked
+Latest. Install a prerelease archive explicitly as shown above.
 
-## Archive Direction
+## Data and Repository Boundaries
 
-This repository is **not** being archived. Archival is a future decision, gated on all of the
-following being true at once:
+- Project graph data lives under `.weave/` in the project repository.
+- Runtime databases and caches are local implementation details; durable projections are the Git
+  synchronization surface.
+- Do not initialize vendored or third-party repositories. Use `wv repo-class --json` when ownership
+  is unclear.
+- Review `.weave/` changes like any other project state before pushing them.
 
-- a named successor repository is publicly accessible;
-- it has compatible install/update and migration instructions;
-- existing graphs load into it without semantic loss;
-- its mutation authority has passed its E1–E7 evidence gates;
-- rollback from the successor to Weave 1.71 has been demonstrated;
-- owned-machine canaries have run successfully for a defined period;
-- a final Weave 1.71 release ships migration and archival notices.
+## Maintenance Status
 
-None of those conditions are met today: the Rust program remains gated, mutation cutover has not
-happened, and no public production-ready successor exists yet. Until they are, Weave 1.71 continues
-to receive maintenance releases.
+Weave 1.71 is active and supported for correctness, security, durability, compatibility, and
+installer fixes. It is not feature-frozen and this repository is not being archived.
+
+A possible successor implementation is being evaluated separately. It is not part of this release,
+has no authority over Weave repositories, and does not change the support status of this LTS line.
+Archival would require a public replacement, documented migration and rollback, compatible graph
+loading without semantic loss, successful canaries, and a final maintenance release announcing the
+transition. Those conditions have not been met.
+
+See [CHANGELOG.md](CHANGELOG.md) for release-specific changes and
+[LICENSE](LICENSE) for licensing terms.

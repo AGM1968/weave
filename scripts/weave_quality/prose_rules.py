@@ -1364,6 +1364,22 @@ def _mask_inline_code(line: str, open_run_len: int = 0) -> tuple[str, int, bool,
     return resolved, 0, incoming_closed, resolved
 
 
+def _mask_paragraph_inline_code(text: str) -> str:
+    """Blank CommonMark code spans without changing paragraph offsets.
+
+    Paragraph reflow has already established the Markdown block boundary,
+    so a single _mask_inline_code call can resolve both ordinary and
+    source-line-spanning code spans. An unmatched opening run is literal
+    CommonMark text and must be replayed; proven spans before it remain
+    masked. Spaces, rather than NULs, make the result safe for every prose
+    matcher including broad regular expressions while preserving exact
+    source-position mapping.
+    """
+    masked, open_run_len, _incoming_closed, literal_replay = _mask_inline_code(text)
+    resolved = literal_replay if open_run_len else masked
+    return resolved.replace("\0", " ")
+
+
 def _quote_depth_is_boundary(quote_depth: int, prior_quote_depth: int) -> bool:
     """Shared by both _scan_lines and _verbatim_exempt_lines: an explicit
     ">" line always states its own nesting depth -- entering deeper (a
@@ -2824,7 +2840,10 @@ def _scan_lines(  # pylint: disable=too-many-statements
             starts.append((offset, lineno, source_col))
             parts.append(line)
             offset += len(line)
-        out.append(_ScanLine("".join(parts), tuple(starts), len(out)))
+        reflowed = "".join(parts)
+        out.append(
+            _ScanLine(_mask_paragraph_inline_code(reflowed), tuple(starts), len(out))
+        )
         paragraph.clear()
         container = ""
         prior_quote_depth = 0

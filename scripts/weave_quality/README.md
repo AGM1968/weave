@@ -152,8 +152,8 @@ scratch. Incremental scans will not recompute metrics for unchanged files.
 
 Structural and prose pattern scanning. Finds recurring anti-patterns across the codebase (bare
 `except: pass`, `subprocess(shell=True)`, unquoted shell variables, etc.) plus Markdown prose
-register issues such as emphasis hedges, number-free verification motifs, and casual causal
-connectives. Findings can be promoted to Weave nodes.
+register issues such as emphasis hedges and casual causal connectives. Findings can be promoted to
+Weave nodes.
 
 Code rules require `ast-grep` on PATH; prose rules are stdlib-only and still run when ast-grep is
 absent. Built-in rules live in `scripts/weave_quality/default_patterns/`. `wv init-repo` projects
@@ -209,8 +209,10 @@ receives a stable `qf-...` identity derived from its rule, repository-relative p
 match, and normalized source-line context. Durable finding state and append-only human disposition
 history survive point-in-time replacement and pruning. `accepted_defect` and `waived` count as
 confirmed findings for reported `decided_precision`, `false_positive` counts against it, and
-`unresolved` remains outside that explicitly named denominator. Scanner output is unadjudicated
-evidence by default, not a defect count.
+`unresolved` remains outside that explicitly named denominator. `actionable_rate` uses the same
+decided denominator but counts only `accepted_defect`, distinguishing an accurate review prompt
+with many legitimate waivers from a finding that usually warrants a change. Scanner output is
+unadjudicated evidence by default, not a defect count.
 
 ---
 

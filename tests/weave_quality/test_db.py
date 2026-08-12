@@ -1281,6 +1281,7 @@ class TestSchemaV9:
         assert [tuple(row) for row in history] == [("waived", "accepted wording")]
         report = pattern_adjudication_report(db)
         assert report["by_rule"]["prose-test"]["decided_precision"] == 1.0
+        assert report["by_rule"]["prose-test"]["actionable_rate"] == 0.0
         assert report["by_rule"]["prose-test"]["decided_count"] == 1
         assert report["recurring_waivers"][0]["scan_count"] == 2
 
@@ -1361,6 +1362,7 @@ class TestSchemaV9:
         scoped = pattern_adjudication_report(db, path_prefix="docs")
         assert scoped["by_rule"]["prose-test"]["decided_count"] == 1
         assert scoped["by_rule"]["prose-test"]["decided_precision"] == 1.0
+        assert scoped["by_rule"]["prose-test"]["actionable_rate"] == 1.0
 
         exact_file_scope = pattern_adjudication_report(db, path_prefix="docs/a.md")
         assert exact_file_scope["by_rule"]["prose-test"]["decided_count"] == 1
@@ -1400,6 +1402,75 @@ class TestSchemaV9:
         assert reappeared["scan_count"] == 1
         assert reappeared["disposition"] == "waived"
         assert not pattern_adjudication_report(db)["recurring_waivers"]
+
+    def test_new_completed_rescan_excludes_disappeared_key_from_precision(
+        self, db: sqlite3.Connection
+    ) -> None:
+        first_scan = begin_pattern_run(db, "aaa", "docs/a.md")
+        finding = PatternFinding(
+            path="docs/a.md",
+            scan_id=first_scan,
+            rule_id="prose-test",
+            finding_key="qf-edited-away",
+            match_text="actually",
+            context_text="This is actually verified.",
+        )
+        replace_pattern_scan_results(db, first_scan, [finding], [])
+        finish_pattern_run(db, first_scan, files_count=1, duration_ms=1)
+        assert adjudicate_pattern_finding(
+            db, finding.finding_key, "false_positive"
+        ) is not None
+        assert pattern_adjudication_report(db)["by_rule"]["prose-test"][
+            "decided_precision"
+        ] == 0.0
+
+        second_scan = begin_pattern_run(db, "bbb", "docs/a.md")
+        replace_pattern_scan_results(db, second_scan, [], [])
+        finish_pattern_run(db, second_scan, files_count=0, duration_ms=1)
+
+        report = pattern_adjudication_report(db)
+        assert report["finding_count"] == 0
+        assert not report["by_rule"]
+        dormant = pattern_finding_states(db, [finding.finding_key])[0]
+        assert dormant["disposition"] == "false_positive"
+        assert dormant["scan_count"] == 1
+
+        third_scan = begin_pattern_run(db, "ccc", "docs/a.md")
+        finding.scan_id = third_scan
+        replace_pattern_scan_results(db, third_scan, [finding], [])
+        finish_pattern_run(db, third_scan, files_count=1, duration_ms=1)
+
+        reappeared = pattern_adjudication_report(db)
+        summary = reappeared["by_rule"]["prose-test"]
+        assert summary["decided_count"] == 1
+        assert summary["decided_precision"] == 0.0
+        state = pattern_finding_states(db, [finding.finding_key])[0]
+        assert state["disposition"] == "false_positive"
+        assert state["scan_count"] == 2
+
+    def test_narrow_rescan_does_not_stale_findings_outside_its_target(
+        self, db: sqlite3.Connection
+    ) -> None:
+        root_scan = begin_pattern_run(db, "aaa", ".")
+        finding = PatternFinding(
+            path="other/b.md",
+            scan_id=root_scan,
+            rule_id="prose-test",
+            finding_key="qf-other",
+            match_text="actually",
+            context_text="This is actually verified.",
+        )
+        replace_pattern_scan_results(db, root_scan, [finding], [])
+        finish_pattern_run(db, root_scan, files_count=1, duration_ms=1)
+        assert adjudicate_pattern_finding(db, finding.finding_key, "waived") is not None
+
+        docs_scan = begin_pattern_run(db, "bbb", "docs")
+        replace_pattern_scan_results(db, docs_scan, [], [])
+        finish_pattern_run(db, docs_scan, files_count=0, duration_ms=1)
+
+        report = pattern_adjudication_report(db, path_prefix="other")
+        assert report["finding_count"] == 1
+        assert report["by_rule"]["prose-test"]["decided_precision"] == 1.0
 
     @pytest.mark.parametrize(
         "disposition",

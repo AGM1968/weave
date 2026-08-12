@@ -763,6 +763,19 @@ class TestCmdPatternsScan:
             assert scoped["by_rule"]["prose-test"]["decided_count"] == 1
             assert scoped["by_rule"]["prose-test"]["decided_precision"] == 1.0
 
+            # Acting on that finding changes its stable key or removes it.
+            # A real rescan allocates a NEW pattern_runs id, so the durable
+            # adjudication must become dormant rather than contaminating the
+            # current report's precision denominator forever.
+            (docs / "a.md").write_text("A specific result.\n", encoding="utf-8")
+            assert cmd_patterns_scan(docs_scan_args) == 0
+            capsys.readouterr()
+            assert cmd_patterns_report(report_args) == 0
+            after_edit = json.loads(capsys.readouterr().out)
+            assert after_edit["scope"] == "docs"
+            assert not after_edit["by_rule"]
+            assert after_edit["finding_count"] == 0
+
             # An explicit path argument overrides the last scan's target.
             other_report_args = argparse.Namespace(
                 hot_zone=str(hotzone), path=str(other), json=True
@@ -1176,6 +1189,7 @@ class TestCmdPatternsScan:
             assert cmd_patterns_report(text_args) == 0
             text = capsys.readouterr().out
             assert "prose-test: decided_precision=unavailable" in text
+            assert "actionable_rate=unavailable" in text
             assert "[needs adjudication]" in text
             needs_line = next(
                 line for line in text.splitlines() if line.startswith("Needs adjudication")

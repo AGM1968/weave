@@ -2284,12 +2284,17 @@ def cmd_patterns_report(args: argparse.Namespace) -> int:
         assert isinstance(summary, dict)
         precision = summary["decided_precision"]
         precision_text = "unavailable" if precision is None else f"{float(precision):.3f}"
+        actionable = summary["actionable_rate"]
+        actionable_text = (
+            "unavailable" if actionable is None else f"{float(actionable):.3f}"
+        )
         nudge = ""
         if summary.get("needs_adjudication"):
             needs_adjudication.append(rule_id)
             nudge = " [needs adjudication]"
         print(
             f"  {rule_id}: decided_precision={precision_text} "
+            f"actionable_rate={actionable_text} "
             f"decided_count={summary['decided_count']} "
             f"findings={summary['findings']} occurrences={summary['occurrences']} "
             f"unresolved={summary['unresolved']}{nudge}"
