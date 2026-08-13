@@ -138,8 +138,10 @@ Compact quality summary for `wv health` output. Not a standalone command — cal
 
 ### `wv quality reset`
 
-Deletes `quality.db` entirely. Use when schema changes break an existing DB or after major Weave
-upgrades.
+Deletes the hot-zone `quality.db` entirely. Use when schema changes break an existing DB or after
+major Weave upgrades. Human pattern adjudications remain in the tracked
+`.weave/quality-adjudications.jsonl` projection and return on the next `wv load`; scan evidence and
+recurrence counts are rebuilt by scanning.
 
 ```bash
 wv quality reset
@@ -206,13 +208,19 @@ wv quality patterns promote --top=N --parent=wv-xxxxxx   # create nodes from top
 
 Point-in-time findings are stored in `pattern_findings` and retained for 2 scans. Each match also
 receives a stable `qf-...` identity derived from its rule, repository-relative path, normalized
-match, and normalized source-line context. Durable finding state and append-only human disposition
-history survive point-in-time replacement and pruning. `accepted_defect` and `waived` count as
-confirmed findings for reported `decided_precision`, `false_positive` counts against it, and
-`unresolved` remains outside that explicitly named denominator. `actionable_rate` uses the same
-decided denominator but counts only `accepted_defect`, distinguishing an accurate review prompt
-with many legitimate waivers from a finding that usually warrants a change. Scanner output is
-unadjudicated evidence by default, not a defect count.
+match, and same-match occurrence ordinal. The source context remains stored for review but is not
+part of identity, so an unrelated edit to the line does not orphan its disposition. Durable finding
+state and append-only human disposition
+history survive point-in-time replacement and pruning. `wv sync` atomically projects those human
+records to `.weave/quality-adjudications.jsonl`; current state for deleted paths is pruned while
+its append-only history remains, and `wv load` merges live state into a fresh hot zone.
+Ephemeral findings, scan IDs, occurrences, and recurrence counts are deliberately excluded and
+rediscovered from source. `accepted_defect` and `waived` count as confirmed findings for reported
+`decided_precision`, `false_positive` counts against it, and `unresolved` remains outside that
+explicitly named denominator. `actionable_rate` uses the same decided denominator but counts only
+`accepted_defect`, distinguishing an accurate review prompt with many legitimate waivers from a
+finding that usually warrants a change. Scanner output is unadjudicated evidence by default, not a
+defect count.
 
 ---
 
@@ -488,10 +496,11 @@ Accounts for ~1s at 175-file scale.
 `quality.db` lives at `$WV_HOT_ZONE/quality.db` — a sibling to `brain.db` in the per-repo hot zone
 (e.g. `/dev/shm/weave/a1b2c3d4/quality.db`). It is:
 
-- **Never synced** to `.weave/state.sql`
-- **Never git-tracked**
-- **Rebuildable** at any time via `wv quality scan`
-- **Retained across sessions** (lives on tmpfs until machine reboot, or until `wv quality reset`)
+- The SQLite file is **never synced** or git-tracked.
+- Scan evidence is rebuildable at any time via `wv quality scan`.
+- Human adjudication state/history is synced separately in the tracked, union-mergeable
+  `.weave/quality-adjudications.jsonl` projection.
+- `wv load` restores that projection before a rescan reattaches each disposition to its finding.
 
 **Retention:** 5 scans (expanded from 2 in v1.8.0 for trend analysis).
 

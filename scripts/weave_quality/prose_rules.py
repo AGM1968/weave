@@ -444,7 +444,7 @@ def load_prose_rule(rule_path: Path, expected_id: str | None = None) -> dict[str
         if language not in PROSE_LANGUAGES:
             raise ValueError(f"unsupported prose language {language!r}")
         kind = _require_string(rule, "kind").lower()
-        matcher_key = "terms" if kind in {"lexicon", "motif", "density"} else "patterns"
+        matcher_key = "terms" if kind in {"lexicon", "motif", "density", "citation"} else "patterns"
         if kind not in _KIND_ENGINES:
             raise ValueError(f"unsupported prose kind {kind!r}")
         rule["kind"] = kind
@@ -453,7 +453,11 @@ def load_prose_rule(rule_path: Path, expected_id: str | None = None) -> dict[str
         # density additionally accepts "document": pool every paragraph/line
         # unit in the file into one counting scope, instead of counting each
         # unit separately. No other kind gives match_scope a counting role.
-        valid_scopes = {"line", "paragraph", "document"} if kind == "density" else {"line", "paragraph"}
+        valid_scopes = (
+            {"line", "paragraph", "heading", "document"}
+            if kind == "density"
+            else {"line", "paragraph", "heading"}
+        )
         if match_scope not in valid_scopes:
             raise ValueError(f"unsupported match_scope {match_scope!r}")
         matchers = _require_string_list(rule, matcher_key)
@@ -489,6 +493,11 @@ def load_prose_rule(rule_path: Path, expected_id: str | None = None) -> dict[str
             lowered_terms = [term.lower() for term in terms_list]
             if len(lowered_terms) != len(set(lowered_terms)):
                 raise ValueError("density 'terms' must not contain duplicate values")
+        if kind == "citation":
+            modes = set(_string_list(rule, "terms"))
+            unsupported = modes - {"unresolved-author-date", "cited-reference-missing-year"}
+            if unsupported:
+                raise ValueError(f"unsupported citation checks: {sorted(unsupported)}")
         if any(key in rule for key in ("positive_controls", "negative_controls")):
             _validate_control_examples(rule)
     except (OSError, ValueError) as exc:
@@ -2797,14 +2806,40 @@ def _open_list_item(
     return list_ctx, content, source_col, opened_block
 
 
-def _scan_lines(  # pylint: disable=too-many-statements
+def _scan_lines(  # pylint: disable=too-many-statements,too-many-branches
     text: str, rule: dict[str, object]
 ) -> list[_ScanLine]:
     """Return raw lines or Markdown prose paragraphs with source mappings."""
     source_lines = text.splitlines()
     default_scope = _default_match_scope(rule)
-    if str(rule.get("match_scope", default_scope)) == "line":
+    match_scope = str(rule.get("match_scope", default_scope))
+    if match_scope == "line":
         return _scan_lines_raw(source_lines, rule)
+    if match_scope == "heading":
+        paragraph_rule = {**rule, "match_scope": "paragraph"}
+        headings: list[_ScanLine] = []
+        for scan_line in _scan_lines(text, paragraph_rule):
+            if len(scan_line.starts) != 1:
+                continue
+            _offset, lineno, _source_col = scan_line.starts[0]
+            raw = source_lines[lineno - 1]
+            probe, _quote_depth, _virtual_offset = _dequote(raw)
+            match = _MARKDOWN_HEADING_RE.match(probe)
+            if match is None:
+                continue
+            prefix = len(raw) - len(probe) + match.end()
+            end = len(raw)
+            closing = re.search(r"[ \t]+#+[ \t]*$", raw[prefix:])
+            if closing is not None:
+                end = prefix + closing.start()
+            headings.append(
+                _ScanLine(
+                    scan_line.text[prefix:end],
+                    ((0, lineno, prefix),),
+                    len(headings),
+                )
+            )
+        return headings
 
     verbatim_exempt = _verbatim_exempt_lines(source_lines)
     out: list[_ScanLine] = []
@@ -3174,7 +3209,11 @@ def _scan_lines(  # pylint: disable=too-many-statements
             list_stack, container = _restore_owned_list_stack(
                 owning_stack, clear_has_paragraph=True
             )
-            out.append(_ScanLine(line, ((0, lineno, 0),), len(out)))
+            out.append(
+                _ScanLine(
+                    _mask_paragraph_inline_code(line), ((0, lineno, 0),), len(out)
+                )
+            )
             continue
 
         # kind == "lazy" with container != "list" (that combination was
@@ -3322,11 +3361,139 @@ def _regex_findings(text: str, rule: dict[str, object]) -> list[_Span]:
     return out
 
 
+_PARENTHETICAL_RE = re.compile(r"\(([^()\n]+)\)")
+_AUTHOR_DATE_RE = re.compile(
+    r"(?P<author>[^\W\d_][\w'’.-]*)(?:\s+et\s+al\.)?,\s*(?P<year>(?:19|20)\d{2})",
+    re.UNICODE,
+)
+_REFERENCES_HEADING_RE = re.compile(
+    r"^ {0,3}(?P<marks>#{1,6})[ \t]+(?:\d+(?:\.\d+)*\.?[ \t]+)?"
+    r"(?:References?|Sources?|Bibliography|Works[ \t]+cited|Literature[ \t]+cited|"
+    r"Reference[ \t]+list)[ \t]*#*[ \t]*$",
+    re.I,
+)
+_ATX_HEADING_LEVEL_RE = re.compile(r"^ {0,3}(?P<marks>#{1,6})(?:[ \t]+|$)")
+
+
+def _is_author_date_name(token: str) -> bool:
+    """Reject code-like tokens that merely occupy an author-date shape."""
+    return bool(token and token[0].isupper()) and not (
+        re.match(r"^[A-Z]\d", token) or re.fullmatch(r"\w+-[0-9a-f]{6}", token, re.I)
+    )
+
+
+def _citation_findings(text: str, rule: dict[str, object]) -> list[_Span]:
+    """Resolve simple author-date citations against a Markdown references section."""
+    modes = set(_string_list(rule, "terms"))
+    lines = text.splitlines()
+    reference_heading = next(
+        (
+            (index, match)
+            for index, line in enumerate(lines)
+            if (match := _REFERENCES_HEADING_RE.match(line))
+        ),
+        None,
+    )
+    if reference_heading is None:
+        references_start = references_end = len(lines)
+    else:
+        references_start, heading_match = reference_heading
+        reference_level = len(heading_match.group("marks"))
+        references_end = next(
+            (
+                index
+                for index, line in enumerate(lines[references_start + 1 :], references_start + 1)
+                if (match := _ATX_HEADING_LEVEL_RE.match(line))
+                and len(match.group("marks")) <= reference_level
+            ),
+            len(lines),
+        )
+    references = lines[references_start + 1 : references_end]
+    citations: list[tuple[_ScanLine, int, int, str, str, str]] = []
+    for segment_start, segment in (
+        (0, lines[:references_start]),
+        (references_end, lines[references_end:]),
+    ):
+        for unit in _scan_lines("\n".join(segment), {**rule, "match_scope": "paragraph"}):
+            scan_line = _ScanLine(
+                unit.text,
+                tuple(
+                    (start, lineno + segment_start, source_col)
+                    for start, lineno, source_col in unit.starts
+                ),
+                unit.index + segment_start,
+            )
+            for parenthetical in _PARENTHETICAL_RE.finditer(scan_line.text):
+                for inner in _AUTHOR_DATE_RE.finditer(parenthetical.group(1)):
+                    if not _is_author_date_name(inner.group("author")):
+                        continue
+                    start = parenthetical.start(1) + inner.start()
+                    citations.append(
+                        (
+                            scan_line,
+                            start,
+                            parenthetical.start(1) + inner.end(),
+                            inner.group("author"),
+                            inner.group("year"),
+                            inner.group(0),
+                        )
+                    )
+
+    reference_units: list[_ScanLine] = []
+    if references:
+        line_delta = references_start + 1
+        for unit in _scan_lines("\n".join(references), {**rule, "match_scope": "paragraph"}):
+            reference_units.append(
+                _ScanLine(
+                    unit.text,
+                    tuple(
+                        (start, lineno + line_delta, source_col)
+                        for start, lineno, source_col in unit.starts
+                    ),
+                    unit.index + len(citations),
+                )
+            )
+
+    out: list[_Span] = []
+    cited_authors = {author.lower() for _line, _start, _end, author, _year, _text in citations}
+    if "unresolved-author-date" in modes:
+        for scan_line, start, end, raw_author, year, match_text in citations:
+            author = raw_author.lower()
+            if any(
+                re.search(rf"\b{re.escape(author)}\b", unit.text, re.I)
+                and re.search(rf"\b{year}\b", unit.text)
+                for unit in reference_units
+            ):
+                continue
+            out.append((scan_line, start, end, match_text))
+
+    if "cited-reference-missing-year" in modes and citations:
+        for unit in reference_units:
+            lowered = unit.text.lower()
+            entry_author = next(
+                (name for name in cited_authors if re.search(rf"\b{re.escape(name)}\b", lowered)),
+                None,
+            )
+            if entry_author is None or re.search(r"\b(?:19|20)\d{2}\b", unit.text):
+                continue
+            start = lowered.index(entry_author)
+            out.append(
+                (
+                    unit,
+                    start,
+                    start + len(entry_author),
+                    unit.text[start : start + len(entry_author)],
+                )
+            )
+    return out
+
+
 _KIND_ENGINES = {
     "lexicon": _lexicon_findings,
     "motif": _motif_findings,
     "density": _density_findings,
     "regex": _regex_findings,
+    "citation": _citation_findings,
 }
 
 

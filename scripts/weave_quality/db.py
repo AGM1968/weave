@@ -1,7 +1,8 @@
 """quality.db schema, lifecycle, and staleness detection.
 
 SQLite DB at $WV_HOT_ZONE/quality.db -- flat sibling to brain.db.
-Never synced to git, never tracked, fully rebuildable from source + git.
+Scan evidence is ephemeral and fully rebuildable from source + git. Human
+pattern-finding adjudications are projected separately by wv sync/load.
 
 Schema (originally from PROPOSAL-wv-quality.md; extended by migrations v2 and v3):
   - scan_meta: scan run metadata + staleness tracking
@@ -1869,6 +1870,215 @@ def adjudicate_pattern_finding(
     )
     conn.commit()
     return pattern_finding_states(conn, [finding_key])[0]
+
+
+_ADJUDICATION_PROJECTION_TYPES = {"state", "history"}
+_DISPOSITIONS = {"accepted_defect", "false_positive", "waived", "unresolved"}
+
+
+def _read_adjudication_projection(path: Path) -> list[dict[str, object]]:
+    """Read and minimally validate the merge-friendly adjudication JSONL."""
+    if not path.exists():
+        return []
+    records: list[dict[str, object]] = []
+    with path.open(encoding="utf-8") as handle:
+        for lineno, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{path}:{lineno}: invalid adjudication JSON: {exc}"
+                ) from exc
+            if (
+                not isinstance(record, dict)
+                or record.get("type") not in _ADJUDICATION_PROJECTION_TYPES
+            ):
+                raise ValueError(f"{path}:{lineno}: unsupported adjudication record")
+            if not isinstance(record.get("finding_key"), str):
+                raise ValueError(f"{path}:{lineno}: missing finding_key")
+            if record.get("disposition") not in _DISPOSITIONS:
+                raise ValueError(
+                    f"{path}:{lineno}: unsupported disposition "
+                    f"{record.get('disposition')!r}"
+                )
+            records.append(record)
+    return records
+
+
+def _projection_state_rank(record: dict[str, object]) -> tuple[str, str, str]:
+    """Deterministic last-write-wins rank for union-merged state records."""
+    return (
+        str(record.get("adjudicated_at") or ""),
+        str(record.get("updated_at") or ""),
+        json.dumps(record, sort_keys=True, ensure_ascii=False),
+    )
+
+
+def _projection_state_path_exists(record: dict[str, object], projection: Path) -> bool:
+    """Whether a state record still names a file inside the projection's repo."""
+    if projection.parent.name != ".weave" or not isinstance(record.get("path"), str):
+        return True
+    repo = projection.parent.parent.resolve()
+    candidate = (repo / str(record["path"])).resolve()
+    try:
+        candidate.relative_to(repo)
+    except ValueError:
+        return True
+    return candidate.is_file()
+
+
+def export_pattern_adjudications(conn: sqlite3.Connection, path: Path) -> int:
+    """Atomically merge durable human adjudications into a JSONL projection."""
+    existing = _read_adjudication_projection(path)
+    states = {
+        str(record["finding_key"]): record
+        for record in existing
+        if record["type"] == "state"
+    }
+    histories = {
+        json.dumps(record, sort_keys=True, ensure_ascii=False): record
+        for record in existing
+        if record["type"] == "history"
+    }
+    rows = conn.execute(
+        "SELECT finding_key, rule_id, path, match_text, context_text, disposition, "
+        "note, adjudicated_at, updated_at FROM pattern_finding_state "
+        "WHERE disposition != 'unresolved' OR EXISTS ("
+        "SELECT 1 FROM pattern_finding_disposition_history h "
+        "WHERE h.finding_key = pattern_finding_state.finding_key) "
+        "ORDER BY finding_key"
+    ).fetchall()
+    for row in rows:
+        record = {"type": "state", **dict(row)}
+        key = str(record["finding_key"])
+        current = states.get(key)
+        if current is None or _projection_state_rank(record) >= _projection_state_rank(
+            current
+        ):
+            states[key] = record
+    rows = conn.execute(
+        "SELECT finding_key, disposition, note, adjudicated_at "
+        "FROM pattern_finding_disposition_history "
+        "ORDER BY finding_key, adjudicated_at, id"
+    ).fetchall()
+    for row in rows:
+        record = {"type": "history", **dict(row)}
+        histories[json.dumps(record, sort_keys=True, ensure_ascii=False)] = record
+
+    states = {
+        key: record
+        for key, record in states.items()
+        if _projection_state_path_exists(record, path)
+    }
+    records = [states[key] for key in sorted(states)]
+    records.extend(
+        sorted(
+            histories.values(),
+            key=lambda record: (
+                str(record["finding_key"]),
+                str(record.get("adjudicated_at") or ""),
+                json.dumps(record, sort_keys=True, ensure_ascii=False),
+            ),
+        )
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            for record in records:
+                payload = json.dumps(record, sort_keys=True, ensure_ascii=False)
+                handle.write(payload + "\n")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return len(records)
+
+
+def import_pattern_adjudications(conn: sqlite3.Connection, path: Path) -> int:
+    """Merge a durable adjudication projection into an initialized quality DB."""
+    states: dict[str, dict[str, object]] = {}
+    histories: dict[str, dict[str, object]] = {}
+    for record in _read_adjudication_projection(path):
+        key = str(record["finding_key"])
+        if record["type"] == "state":
+            current = states.get(key)
+            if current is None or _projection_state_rank(
+                record
+            ) >= _projection_state_rank(current):
+                states[key] = record
+        else:
+            histories[json.dumps(record, sort_keys=True, ensure_ascii=False)] = record
+
+    for key, record in states.items():
+        required = ("rule_id", "path", "match_text", "context_text", "updated_at")
+        if any(not isinstance(record.get(field), str) for field in required):
+            raise ValueError(f"{path}: incomplete state record for {key}")
+        existing = conn.execute(
+            "SELECT adjudicated_at, updated_at FROM pattern_finding_state "
+            "WHERE finding_key = ?", (key,),
+        ).fetchone()
+        existing_rank = (
+            str(existing["adjudicated_at"] or ""),
+            str(existing["updated_at"] or ""),
+            "",
+        ) if existing is not None else None
+        if existing_rank is not None and existing_rank > _projection_state_rank(record):
+            continue
+        conn.execute(
+            "INSERT INTO pattern_finding_state "
+            "(finding_key, rule_id, path, match_text, context_text, first_seen_scan_id, "
+            "last_seen_scan_id, scan_count, disposition, note, adjudicated_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?, ?, ?) "
+            "ON CONFLICT(finding_key) DO UPDATE SET "
+            "rule_id=excluded.rule_id, path=excluded.path, match_text=excluded.match_text, "
+            "context_text=excluded.context_text, disposition=excluded.disposition, "
+            "note=excluded.note, adjudicated_at=excluded.adjudicated_at, "
+            "updated_at=excluded.updated_at",
+            (
+                key, record["rule_id"], record["path"], record["match_text"],
+                record["context_text"], record["disposition"], record.get("note"),
+                record.get("adjudicated_at"), record["updated_at"],
+            ),
+        )
+
+    existing_history = {
+        (str(row[0]), str(row[1]), row[2], str(row[3]))
+        for row in conn.execute(
+            "SELECT finding_key, disposition, note, adjudicated_at "
+            "FROM pattern_finding_disposition_history"
+        ).fetchall()
+    }
+    imported = 0
+    for record in histories.values():
+        key = str(record["finding_key"])
+        present = conn.execute(
+            "SELECT 1 FROM pattern_finding_state WHERE finding_key = ?", (key,)
+        ).fetchone()
+        if present is None:
+            # Deleted-path state records are pruned on export while history is
+            # retained in JSONL as an audit trail. It can reattach if a later
+            # scan recreates the same stable finding identity.
+            continue
+        identity = (
+            key, str(record["disposition"]), record.get("note"),
+            str(record.get("adjudicated_at") or ""),
+        )
+        if not identity[3]:
+            raise ValueError(f"{path}: history record has no adjudicated_at for {key}")
+        if identity in existing_history:
+            continue
+        conn.execute(
+            "INSERT INTO pattern_finding_disposition_history "
+            "(finding_key, disposition, note, adjudicated_at) VALUES (?, ?, ?, ?)",
+            identity,
+        )
+        existing_history.add(identity)
+        imported += 1
+    conn.commit()
+    return len(states) + imported
 
 
 # A rule that has racked up findings across this many scans without a single

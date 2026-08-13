@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Generator
 from pathlib import Path
@@ -23,6 +24,7 @@ from weave_quality.db import (
     bulk_upsert_file_state,
     bulk_upsert_function_cc,
     bulk_upsert_git_stats,
+    export_pattern_adjudications,
     file_changed,
     finish_pattern_run,
     finish_scan,
@@ -33,6 +35,7 @@ from weave_quality.db import (
     get_function_cc,
     get_git_stats,
     init_db,
+    import_pattern_adjudications,
     is_stale,
     compute_trend_direction,
     get_all_trend_directions,
@@ -1284,6 +1287,112 @@ class TestSchemaV9:
         assert report["by_rule"]["prose-test"]["actionable_rate"] == 0.0
         assert report["by_rule"]["prose-test"]["decided_count"] == 1
         assert report["recurring_waivers"][0]["scan_count"] == 2
+
+    def test_adjudication_projection_survives_fresh_hot_zone(
+        self, tmp_path: Path
+    ) -> None:
+        source = init_db(hot_zone=str(tmp_path / "source"))
+        scan_id = begin_pattern_run(source, "aaa", "docs")
+        finding = PatternFinding(
+            path="docs/a.md",
+            scan_id=scan_id,
+            rule_id="prose-test",
+            line=2,
+            match_text="genuine",
+            finding_key="qf-durable",
+            context_text="A genuine result.",
+        )
+        run = {
+            "rule_id": "prose-test",
+            "definition_hash": "abc123",
+            "rule_path": "/rules/prose-test.yaml",
+            "target": "/repo/docs",
+            "hits": 1,
+            "ran_at": "2026-08-13T12:00:00",
+        }
+        replace_pattern_scan_results(source, scan_id, [finding], [run])
+        adjudicate_pattern_finding(
+            source, finding.finding_key, "false_positive", "sense"
+        )
+        projection = tmp_path / ".weave" / "quality-adjudications.jsonl"
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs" / "a.md").write_text("A genuine result.\n", encoding="utf-8")
+
+        assert export_pattern_adjudications(source, projection) == 2
+        source.close()
+        text = projection.read_text(encoding="utf-8")
+        assert "first_seen_scan_id" not in text
+        assert "last_seen_scan_id" not in text
+        assert '"type": "state"' in text
+        assert '"type": "history"' in text
+
+        restored = init_db(hot_zone=str(tmp_path / "restored"))
+        assert import_pattern_adjudications(restored, projection) == 2
+        state = pattern_finding_states(restored, [finding.finding_key])[0]
+        assert state["disposition"] == "false_positive"
+        assert state["scan_count"] == 0
+        history = restored.execute(
+            "SELECT disposition, note FROM pattern_finding_disposition_history"
+        ).fetchall()
+        assert [tuple(row) for row in history] == [("false_positive", "sense")]
+
+        new_scan = begin_pattern_run(restored, "bbb", "docs")
+        finding.scan_id = new_scan
+        replace_pattern_scan_results(restored, new_scan, [finding], [run])
+        rescanned = pattern_finding_states(restored, [finding.finding_key])[0]
+        assert rescanned["disposition"] == "false_positive"
+        assert rescanned["scan_count"] == 1
+        restored.close()
+
+    def test_projection_export_merges_existing_records_before_load(
+        self, tmp_path: Path
+    ) -> None:
+        projection = tmp_path / ".weave" / "quality-adjudications.jsonl"
+        projection.parent.mkdir()
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs" / "a.md").write_text("match\n", encoding="utf-8")
+        projection.write_text(
+            '{"adjudicated_at":"2026-08-13T12:00:00","context_text":"context",'
+            '"disposition":"waived","finding_key":"qf-remote","match_text":"match",'
+            '"note":"remote","path":"docs/a.md","rule_id":"prose-test",'
+            '"type":"state","updated_at":"2026-08-13T12:00:00"}\n'
+            '{"adjudicated_at":"2026-08-13T12:00:00","disposition":"waived",'
+            '"finding_key":"qf-remote","note":"remote","type":"history"}\n',
+            encoding="utf-8",
+        )
+        fresh = init_db(hot_zone=str(tmp_path / "fresh"))
+
+        assert export_pattern_adjudications(fresh, projection) == 2
+        assert import_pattern_adjudications(fresh, projection) == 2
+        assert pattern_finding_states(fresh, ["qf-remote"])[0]["disposition"] == "waived"
+        assert import_pattern_adjudications(fresh, projection) == 1
+        history_count = fresh.execute(
+            "SELECT COUNT(*) FROM pattern_finding_disposition_history"
+        ).fetchone()[0]
+        assert history_count == 1
+        fresh.close()
+
+    def test_projection_prunes_deleted_path_state_but_retains_history(
+        self, tmp_path: Path
+    ) -> None:
+        projection = tmp_path / ".weave" / "quality-adjudications.jsonl"
+        projection.parent.mkdir()
+        projection.write_text(
+            '{"adjudicated_at":"2026-08-13T12:00:00","context_text":"gone",'
+            '"disposition":"waived","finding_key":"qf-deleted","match_text":"match",'
+            '"note":"probe","path":".canary-tmp/adj.md","rule_id":"prose-test",'
+            '"type":"state","updated_at":"2026-08-13T12:00:00"}\n'
+            '{"adjudicated_at":"2026-08-13T12:00:00","disposition":"waived",'
+            '"finding_key":"qf-deleted","note":"probe","type":"history"}\n',
+            encoding="utf-8",
+        )
+        fresh = init_db(hot_zone=str(tmp_path / "fresh"))
+
+        assert export_pattern_adjudications(fresh, projection) == 1
+        records = [json.loads(line) for line in projection.read_text().splitlines()]
+        assert [record["type"] for record in records] == ["history"]
+        assert import_pattern_adjudications(fresh, projection) == 0
+        fresh.close()
 
     def test_adjudication_report_nudges_unresolved_recurring_rules(
         self, db: sqlite3.Connection

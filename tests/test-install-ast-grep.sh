@@ -59,6 +59,9 @@ lib_dir="$tmp/lib"
 config_dir="$tmp/config"
 home_dir="$tmp/home"
 mkdir -p "$stub_bin" "$install_dir" "$lib_dir" "$config_dir" "$home_dir/.claude"
+mkdir -p "$lib_dir/weave_quality/default_patterns"
+touch "$lib_dir/weave_quality/default_patterns/prose-casual-register.yaml"
+touch "$lib_dir/weave_quality/default_patterns/prose-number-free-verification.yaml"
 
 make_stub "$stub_bin" cargo
 make_stub "$stub_bin" curl
@@ -79,7 +82,11 @@ default_out=$(cat /tmp/wv-install-ast-default.out)
 default_calls=$(cat "$WV_STUB_LOG")
 
 assert_contains "$default_out" "no download attempted" "default install reports ast-grep skipped without download"
+assert_contains "$default_out" "wv init-repo --update" "install names required existing-repo refresh"
 assert_equals "" "$default_calls" "default install does not call cargo/curl/unzip for ast-grep"
+assert_equals "false" "$([ -e "$lib_dir/weave_quality/default_patterns/prose-casual-register.yaml" ] && echo true || echo false)" "default install prunes renamed built-in rule"
+assert_equals "false" "$([ -e "$lib_dir/weave_quality/default_patterns/prose-number-free-verification.yaml" ] && echo true || echo false)" "default install prunes withdrawn built-in rule"
+assert_equals "true" "$([ -e "$lib_dir/weave_quality/default_patterns/prose-register-review.yaml" ] && echo true || echo false)" "default install adds neutrally named replacement rule"
 
 : > "$WV_STUB_LOG"
 set +e

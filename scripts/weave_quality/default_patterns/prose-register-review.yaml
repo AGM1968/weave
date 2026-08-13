@@ -1,4 +1,4 @@
-id: prose-casual-register
+id: prose-register-review
 language: prose
 kind: regex
 severity: info
@@ -9,7 +9,7 @@ provenance: >-
   after a 2026-07-30 review showed the original four following words caught
   only one of five causal-clause forms.
 message: >-
-  Casual or unearned register: clause-level causal 'so', gambling metaphors,
+  Register review: clause-level causal 'so', gambling metaphors,
   superlative slant, correction archaeology. Publication-register connectives
   and plainly stated current values belong in client-facing prose.
 paths:

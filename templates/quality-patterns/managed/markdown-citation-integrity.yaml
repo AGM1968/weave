@@ -1,0 +1,28 @@
+id: markdown-citation-integrity
+language: prose
+kind: citation
+severity: warning
+policy: always-on-shared
+maturity: promotable
+provenance: >-
+  AC-4 from earth-engine-analysis canary wv-7a8d45. A mechanical body-to-
+  bibliography join found three unresolved citations and eighteen entries
+  without publication years in one academic document.
+message: >-
+  Author-date citation integrity failure. Add the matching reference entry
+  and publication year, or correct the body citation so the bibliography
+  resolves it mechanically.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+terms:
+  - unresolved-author-date
+  - cited-reference-missing-year
+positive_controls:
+  - "The method follows (Jiménez et al., 2023).\n\n## References\nRussell, A. Soil moisture."
+negative_controls:
+  - "The method follows (Jiménez et al., 2023).\n\n## References\nJiménez, A. et al. (2023). Soil moisture."
+  - "The method follows (Yue et al., 2019).\n\n## 10. Sources\nYue, J. et al. (2019). Soil moisture."
+  - "Deliverables (D1.2, 2024) and (P29, 2026) define the work."
+  - "Tracked as (wv-e321fd, 2026) in the graph."

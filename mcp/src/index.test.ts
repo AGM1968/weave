@@ -1545,14 +1545,27 @@ describe("Weave MCP Server", () => {
     it("weave_quality_patterns list surfaces a managed-rule shadow advisory (wv-6cd72e)", async () => {
       const fixture = createQualityPatternsFixture();
       const managedDir = join(fixture.dir, ".weave", "patterns", "managed");
+      const configDir = join(fixture.dir, "config");
+      const installedManagedDir = join(configDir, "quality-patterns", "managed");
       mkdirSync(managedDir, { recursive: true });
+      mkdirSync(installedManagedDir, { recursive: true });
       writeFileSync(join(managedDir, ".overridden"), "shadowed-rule.yaml\n", "utf-8");
+      writeFileSync(join(installedManagedDir, "manifest.txt"), "shadowed-rule.yaml\n", "utf-8");
+      writeFileSync(
+        join(installedManagedDir, "shadowed-rule.yaml"),
+        "id: shadowed-rule\nlanguage: prose\nkind: regex\npatterns:\n  - managed\n",
+        "utf-8"
+      );
       writeFileSync(
         join(fixture.dir, ".weave", "patterns", "shadowed-rule.yaml"),
         "id: shadowed-rule\nlanguage: prose\nkind: regex\npatterns:\n  - absent\n",
         "utf-8"
       );
-      const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      const patternsClient = new MCPTestClient(
+        [],
+        { ...fixture.env, WV_CONFIG_DIR: configDir },
+        fixture.dir
+      );
       try {
         const response = await patternsClient.request("tools/call", {
           name: "weave_quality_patterns",

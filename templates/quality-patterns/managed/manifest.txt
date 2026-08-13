@@ -1,7 +1,13 @@
+markdown-bare-url.yaml
 markdown-bold-label-metadata.yaml
+markdown-citation-integrity.yaml
 markdown-split-code-span.yaml
 prose-ai-vocabulary.yaml
+prose-em-dash-density.yaml
 prose-filler-phrases.yaml
 prose-retrospective-announcement.yaml
+prose-rhetorical-heading.yaml
 prose-self-attested-virtue.yaml
+prose-significance-heading.yaml
+prose-verification-reassurance.yaml
 prose-work-context-leakage.yaml

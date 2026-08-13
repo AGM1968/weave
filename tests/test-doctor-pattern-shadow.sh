@@ -43,6 +43,7 @@ WV="$PROJECT_ROOT/scripts/wv"
 
 TEST_DIR="/tmp/wv-doctor-shadow-fixture-$$"
 export WV_HOT_ZONE="$TEST_DIR/hotzone"
+export WV_CONFIG_DIR="$TEST_DIR/config"
 
 cleanup() { cd /tmp && rm -rf "$TEST_DIR"; }
 trap cleanup EXIT
@@ -86,7 +87,16 @@ assert_not_contains() {
 test_shadowed_rule_warns() {
     echo "-- .overridden marker + a same-id local rule → doctor WARN"
     mkdir -p .weave/patterns/managed
+    mkdir -p "$WV_CONFIG_DIR/quality-patterns/managed"
     echo "shadowed-rule.yaml" > .weave/patterns/managed/.overridden
+    echo "shadowed-rule.yaml" > "$WV_CONFIG_DIR/quality-patterns/managed/manifest.txt"
+    cat > "$WV_CONFIG_DIR/quality-patterns/managed/shadowed-rule.yaml" <<'EOF'
+id: shadowed-rule
+language: prose
+kind: regex
+patterns:
+  - managed
+EOF
     cat > .weave/patterns/shadowed-rule.yaml <<'EOF'
 id: shadowed-rule
 language: prose

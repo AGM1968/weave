@@ -408,11 +408,14 @@ Prose rules: language: prose, stdlib-only, always run. One of four kinds:
                   per-pattern occurrence floor, same idea as motif's.
                   Optional: exempt: [...].
 All four also accept:
-  match_scope: line | paragraph  (default: line for markdown-* ids, else
+  match_scope: line | paragraph | heading
+                                  (default: line for markdown-* ids, else
                                    paragraph — reflows soft-wrapped prose,
                                    skipping fenced code and respecting
                                    blockquotes/lists; density also accepts
                                    document, see above)
+                                  heading scans ATX heading content without
+                                  exposing the # marker to each rule pattern
                                   line scope never rewrites a line's text,
                                   but still drops a line entirely when it's
                                   inside a fenced code block (including one
@@ -497,5 +500,8 @@ EOF
         [ -n "$dry_run" ] && py_args+=("$dry_run")
     fi
 
-    _wv_quality_python "${py_args[@]}"
+    _wv_quality_python "${py_args[@]}" || return $?
+    if [ "$subcmd" = "adjudicate" ]; then
+        _quality_adjudications_export
+    fi
 }

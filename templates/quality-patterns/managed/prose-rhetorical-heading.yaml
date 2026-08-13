@@ -1,0 +1,26 @@
+id: prose-rhetorical-heading
+language: prose
+kind: regex
+match_scope: heading
+severity: info
+policy: always-on-shared
+maturity: promotable
+provenance: >-
+  AC-1 from earth-engine-analysis canary wv-7a8d45. Seven cited papers used
+  no question, wh-clause, or explainer heading among 62 headings.
+message: >-
+  Rhetorical or explanatory heading. Name the section's technical content
+  rather than posing the question that its prose will answer.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+patterns:
+  - '^(?:(\d[\d.]*\s+)?(Why|How|What|Which|Where|When|Whether)\b.*|.*\?\s*)$'
+positive_controls:
+  - "## 4. What each sensor senses"
+  - "## 5.1.2 Which depth is the optical target"
+  - "## Is this result stable?"
+negative_controls:
+  - "## Sensor measurement depths"
+  - "What each sensor senses is described below."

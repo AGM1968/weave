@@ -4,6 +4,52 @@
 
 ## Unreleased
 
+## [1.71.0-rc.5] - 2026-08-13
+
+Release-candidate respin of rc.4 with the E6/E7 durability evidence chain rebound to the exact
+shipped `tests/test-data.sh` source and all five controlled runner bundles recaptured against the
+rc.4 implementation closure. Assertions, dispositions, and runtime behavior are unchanged; the
+full gate passes with only the documented clock-skew XFAIL.
+
+## [1.71.0-rc.4] - 2026-08-13
+
+Consumer-audited corrective prerelease for the prose-quality subsystem. The release was gated by a
+29-fixture known-answer suite and a complete corpus census of each newly shipped rule; both were
+rerun after installation in existing repositories rather than only against the source checkout.
+
+### Fixed
+
+- **Durable adjudication** — human dispositions and their append-only history are projected to
+  `.weave/quality-adjudications.jsonl`, restored into a fresh hot zone by `wv load`, and retain a
+  stable finding identity when source positions move. Sync prunes current state for deleted paths
+  while preserving history, so ephemeral probes do not remain live indefinitely.
+- **Citation integrity precision** — the citation rule recognises conventional `References`,
+  `Sources`, `Bibliography`, `Works cited`, `Literature cited`, and `Reference list` headings,
+  including numbered forms; bounds each list at the next equal-or-higher heading; and rejects
+  code-shaped pseudo-authors. The audited corpus improved from 1 correct finding in 102 to 1 in 1
+  before the underlying document defect was repaired, without losing either positive control.
+- **Markdown prose masking** — inline code is excluded consistently in paragraphs, list items,
+  blockquotes, headings, and table cells, preventing examples used to document a rule from firing
+  that rule.
+- **Managed-rule adoption** — installation now tells existing repositories to run
+  `wv init-repo --update`; runtime listing warns when the managed projection is stale; and custom
+  rules shadowing an available managed twin are reported even before that twin is projected.
+- **Rule calibration** — the zero-precision number-free-verification motif remains retired. Its
+  narrow reassurance residue is covered by `prose-verification-reassurance`, while register,
+  rhetorical-heading, significance-heading, em-dash-density, work-context, bare-URL, and citation
+  rules carry the independently verified cases.
+- **Heading result identity** — a rhetorical heading matching both a wh-word and a question mark
+  produces one finding for the heading rather than two overlapping findings.
+
+### Added
+
+- **Prose rule capabilities** — `kind: density`, `kind: citation`, and
+  `match_scope: heading` support punctuation-density checks, reference-list resolution, and heading
+  rules without embedding Markdown marker syntax in every pattern.
+- **Known-answer release gate** — 29 fixtures preserve the audit cases across regression, near-miss,
+  and coverage classes. Corpus census remains a separate required gate because fixture correctness
+  alone did not predict the first citation rule's real-document precision.
+
 ## [1.71.0-rc.3] - 2026-08-12
 
 Corrective prerelease based on the first closed consumer adjudication of Weave's prose rules. This

@@ -23,8 +23,16 @@ patterns:
   - '\bbased on available information\b'
   - '\bthis session\b'
   - '\bthis conversation\b'
+  - '\bthis chat\b'
+  - '\b(from|into) this (chat|thread)\b'
+  - '\banything (else )?you (want|need|would like)\b'
+  - '\b(back to|into) your (systems?|repo|editor)\b'
 positive_controls:
   - "This session produced the result."
+  - "Copy from this chat into a file."
+  - "Anything you want adjusted before you take it."
+  - "Getting this back to your systems as Markdown."
 negative_controls:
   - "The session token expires after 30 minutes."
   - "The conversation protocol records three message types."
+  - "The editor renders the repository file."

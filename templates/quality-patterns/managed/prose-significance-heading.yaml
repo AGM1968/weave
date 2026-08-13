@@ -1,0 +1,24 @@
+id: prose-significance-heading
+language: prose
+kind: regex
+match_scope: heading
+severity: info
+policy: always-on-shared
+maturity: promotable
+provenance: >-
+  AC-2 from earth-engine-analysis canary wv-7a8d45. Significance scaffolding
+  moved into a comma-appended heading clause that existing prose rules missed.
+message: >-
+  Significance scaffold appended to a heading. Name the technical content or
+  relationship directly instead of promising why, what, or how it matters.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+patterns:
+  - ',\s+(and\s+)?(why|what|how|where|which)\b'
+positive_controls:
+  - "## 2. The conversion, and where its error comes from"
+negative_controls:
+  - "## Conversion error sources"
+  - "The conversion, and where its error comes from, is described below."

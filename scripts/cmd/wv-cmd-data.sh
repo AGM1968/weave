@@ -61,6 +61,22 @@ dump_state_sql() {
     } | strip_unistr > "$outfile"
 }
 
+# Human pattern-finding dispositions are the only non-rebuildable quality.db
+# content. Keep them in a union-mergeable JSONL projection; scan findings and
+# recurrence counters remain hot-zone-only and are rediscovered from source.
+_quality_adjudications_export() {
+    local quality_db="$WV_HOT_ZONE/quality.db"
+    [ -f "$quality_db" ] || return 0
+    _wv_quality_python --hot-zone "$WV_HOT_ZONE" \
+        adjudications-export "$WEAVE_DIR/quality-adjudications.jsonl"
+}
+
+_quality_adjudications_import() {
+    local projection="$WEAVE_DIR/quality-adjudications.jsonl"
+    [ -f "$projection" ] || return 0
+    _wv_quality_python --hot-zone "$WV_HOT_ZONE" adjudications-import "$projection"
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # auto_sync — Throttled auto-persist after mutating commands
 # ═══════════════════════════════════════════════════════════════════════════
@@ -617,6 +633,10 @@ cmd_sync() {
         trap - EXIT
         return 1
     fi
+    if ! _quality_adjudications_export; then
+        echo -e "${RED}✗${NC} Sync aborted: failed to publish quality adjudications" >&2
+        return 1
+    fi
     trap - EXIT
 
     # Guard: if anything after this point (auto_checkpoint, git, gh_sync) is
@@ -1110,6 +1130,11 @@ EOF
         # Initialize delta change tracking (idempotent)
         wv_delta_init "$WV_DB"
         echo -e "${YELLOW}No state.sql found, initialized empty database${NC}" >&2
+    fi
+
+    if ! _quality_adjudications_import; then
+        echo -e "${RED}Error: failed to restore quality adjudications${NC}" >&2
+        return 1
     fi
 
     # Seed metadata.trails[0] from any legacy metadata.breadcrumbs (trails epic D1).

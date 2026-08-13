@@ -1,0 +1,25 @@
+id: markdown-bare-url
+language: prose
+kind: regex
+match_scope: paragraph
+severity: info
+policy: always-on-shared
+maturity: promotable
+provenance: >-
+  AC-5 from earth-engine-analysis canary wv-7a8d45. Bare URLs produced
+  unbreakable Pandoc output and overfull boxes while links and autolinks did not.
+message: >-
+  Bare URL in prose. Use a Markdown link or angle-bracket autolink so renderers
+  can identify and format the destination correctly.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+patterns:
+  - '(?<![<(])https?://[^\s)>]+'
+positive_controls:
+  - "Source: https://example.test/a/very/long/path"
+negative_controls:
+  - "Source: <https://example.test/path>"
+  - "See [the source](https://example.test/path)."
+  - "Use `https://example.test/path` in the example."

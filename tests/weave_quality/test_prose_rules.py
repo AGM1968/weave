@@ -76,6 +76,27 @@ def test_parser_preserves_quoted_hash_and_normalizes_fields(tmp_path: Path) -> N
     assert rule["patterns"] == ["^# heading$"]
 
 
+def test_heading_match_scope_validates_and_scans_heading_content(tmp_path: Path) -> None:
+    rule_path = _write(
+        tmp_path / "heading.yaml",
+        "id: heading\nlanguage: prose\nkind: regex\nmatch_scope: heading\n"
+        "patterns:\n  - '^What\\b'\n",
+    )
+    rule = load_prose_rule(rule_path, "heading")
+    assert rule["match_scope"] == "heading"
+    doc = _write(
+        tmp_path / "headings.md",
+        "What prose does not count.\n\n## What each sensor senses\n\n"
+        "> ### What quoted heading means ###\n\n## `What hidden code means`\n",
+    )
+
+    found = run_prose_rule("heading", rule_path, doc, scan_id=1)
+    assert [(item.line, item.col, item.match_text) for item in found] == [
+        (3, 3, "What"),
+        (5, 6, "What"),
+    ]
+
+
 def test_parser_accepts_plain_scalar_continuation_and_list_comments(
     tmp_path: Path,
 ) -> None:
@@ -277,8 +298,8 @@ def test_default_prose_rules_parse_and_execute(tmp_path: Path) -> None:
     rule_paths = sorted(DEFAULT_PATTERNS.glob("prose-*.yaml"))
 
     assert [path.stem for path in rule_paths] == [
-        "prose-casual-register",
         "prose-emphasis-hedge",
+        "prose-register-review",
     ]
     for rule_path in rule_paths:
         assert validate_pattern_rule(rule_path, rule_path.stem) == "prose"
@@ -298,11 +319,20 @@ def test_managed_pattern_manifest_is_complete_and_rules_are_executable(
 
     examples = {
         "markdown-bold-label-metadata": "**Endpoint:** `https://example.test`\n",
+        "markdown-bare-url": "Source: https://example.test/long/path\n",
+        "markdown-citation-integrity": (
+            "The method follows (Jiménez et al., 2023).\n\n"
+            "## References\nRussell, A. (2014). Soil moisture.\n"
+        ),
         "markdown-split-code-span": "The `scripts/\n",
         "prose-ai-vocabulary": "This pivotal result decorates the claim.\n",
+        "prose-em-dash-density": "One—two—three—four linked asides.\n",
         "prose-filler-phrases": "In order to proceed, measure the input.\n",
+        "prose-rhetorical-heading": "## What each sensor senses\n",
         "prose-retrospective-announcement": "The endpoint now exists.\n",
         "prose-self-attested-virtue": "This gives an honest interval.\n",
+        "prose-significance-heading": "## The conversion, and where its error comes from\n",
+        "prose-verification-reassurance": "The result was measured carefully.\n",
         "prose-work-context-leakage": "This session produced the result.\n",
     }
     for rule_path in rule_paths:
@@ -320,8 +350,87 @@ def test_managed_rules_own_positive_and_hard_negative_controls() -> None:
         assert validate_pattern_rule(rule_path, rule_path.stem) == "prose"
 
 
+def test_citation_integrity_resolves_multiple_author_date_citations(tmp_path: Path) -> None:
+    rule_path = MANAGED_PATTERNS / "markdown-citation-integrity.yaml"
+    doc = _write(
+        tmp_path / "citations.md",
+        "Evidence agrees (Jiménez et al., 2023; Russell, 2014; Nkobane, 2014).\n\n"
+        "## References\n"
+        "Jiménez, A. et al. (2023). Soil moisture.\n\n"
+        "Russell, A. (2014). Calibration.\n\n"
+        "Nkobane, M. Calibration without a date.\n",
+    )
+
+    found = run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+    assert [(item.line, item.col, item.match_text) for item in found] == [
+        (1, 54, "Nkobane, 2014"),
+        (8, 0, "Nkobane"),
+    ]
+
+
+def test_citation_integrity_ignores_complete_entries_and_code(tmp_path: Path) -> None:
+    rule_path = MANAGED_PATTERNS / "markdown-citation-integrity.yaml"
+    doc = _write(
+        tmp_path / "citations.md",
+        "Evidence agrees (Jiménez et al., 2023) and not `(Missing, 2022)`.\n\n"
+        "## References\n"
+        "Jiménez, A. et al. (2023). Soil moisture.\n",
+    )
+    assert not run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+
+
+@pytest.mark.parametrize(
+    "heading",
+    ["Sources", "10. Sources", "Bibliography", "Works cited", "Literature cited", "Reference list"],
+)
+def test_citation_integrity_recognizes_conventional_reference_headings(
+    tmp_path: Path, heading: str
+) -> None:
+    rule_path = MANAGED_PATTERNS / "markdown-citation-integrity.yaml"
+    doc = _write(
+        tmp_path / "citations.md",
+        f"Evidence agrees (O'Donovan et al., 2023).\n\n## {heading}\n"
+        "O'Donovan, P. et al. (2023). Soil moisture.\n",
+    )
+    assert not run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+
+
+def test_citation_integrity_bounds_reference_section_and_scans_later_body(
+    tmp_path: Path,
+) -> None:
+    rule_path = MANAGED_PATTERNS / "markdown-citation-integrity.yaml"
+    doc = _write(
+        tmp_path / "citations.md",
+        "Evidence agrees (Yue et al., 2019).\n\n## 10. Sources\n"
+        "Yue, J. et al. (2019). Soil moisture.\n\n"
+        "## Annex A. Review\nYue's method was discussed.\n"
+        "A later claim remains unresolved (Missing, 2024).\n",
+    )
+    found = run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+    assert [(item.line, item.match_text) for item in found] == [(8, "Missing, 2024")]
+
+
+@pytest.mark.parametrize("token", ["D1.2", "D4.5", "P29", "wv-e321fd", "mo"])
+def test_citation_integrity_rejects_code_like_pseudo_authors(
+    tmp_path: Path, token: str
+) -> None:
+    rule_path = MANAGED_PATTERNS / "markdown-citation-integrity.yaml"
+    doc = _write(
+        tmp_path / "citations.md",
+        f"Tracked as ({token}, 2026).\n\n## References\n",
+    )
+    assert not run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+
+
+def test_rhetorical_heading_reports_one_finding_for_wh_question(tmp_path: Path) -> None:
+    rule_path = MANAGED_PATTERNS / "prose-rhetorical-heading.yaml"
+    doc = _write(tmp_path / "heading.md", "## Why does the estimate fail?\n")
+    found = run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+    assert len(found) == 1
+
+
 def test_causal_so_claim_covers_openers_excludes_so_that_and_reflows(tmp_path: Path) -> None:
-    rule_path = DEFAULT_PATTERNS / "prose-casual-register.yaml"
+    rule_path = DEFAULT_PATTERNS / "prose-register-review.yaml"
     doc = _write(
         tmp_path / "causal.md",
         "Passed, so any warning is unrelated.\n"
@@ -362,7 +471,7 @@ def test_number_free_verification_measures_repetition_not_document_numbers(
 
 def test_prose_matchers_exclude_inline_code_spans(tmp_path: Path) -> None:
     emphasis = DEFAULT_PATTERNS / "prose-emphasis-hedge.yaml"
-    casual = DEFAULT_PATTERNS / "prose-casual-register.yaml"
+    casual = DEFAULT_PATTERNS / "prose-register-review.yaml"
     verification = _rule(
         tmp_path,
         "id: verification-test\nlanguage: prose\nkind: motif\nmin_count: 3\n"
@@ -409,6 +518,32 @@ def test_inline_code_mask_preserves_source_position_after_span(tmp_path: Path) -
     assert [(finding.line, finding.col, finding.match_text) for finding in found] == [
         (1, 23, "clearly")
     ]
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        ("## `passed, so hidden`\n", []),
+        ("| case | `passed, so hidden` |\n", []),
+        ("## `passed, so hidden` passed, so visible\n", [(1, 29, ", so visible")]),
+        (
+            "| code | `passed, so hidden` | prose | passed, so visible |\n",
+            [(1, 45, ", so visible")],
+        ),
+    ],
+)
+def test_inline_code_is_masked_in_headings_and_table_rows(
+    tmp_path: Path,
+    source: str,
+    expected: list[tuple[int, int, str]],
+) -> None:
+    rule_path = DEFAULT_PATTERNS / "prose-register-review.yaml"
+    doc = _write(tmp_path / "contexts.md", source)
+
+    found = run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+    assert [
+        (finding.line, finding.col, finding.match_text) for finding in found
+    ] == expected
 
 
 def test_regex_rule_exempts_legitimate_compound_terms(tmp_path: Path) -> None:

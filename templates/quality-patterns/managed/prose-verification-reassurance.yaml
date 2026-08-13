@@ -1,0 +1,27 @@
+id: prose-verification-reassurance
+language: prose
+kind: regex
+severity: info
+policy: always-on-shared
+maturity: observed
+provenance: >-
+  PR-1b residue from earth-engine-analysis verification wv-0f3523. The broad
+  number-free motif was retired at 0.000 measured precision; this narrower
+  rule watches explicitly reassuring verification phrases without matching
+  technical noun senses such as independent closure dimensions.
+message: >-
+  Verification reassurance without supporting evidence. State the measured
+  quantity, procedure, or acceptance threshold instead of relying on an
+  adverb or repeated verification label.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+patterns:
+  - '\b(measured|verified|validated|calibrated)\s+(carefully|again|successfully|thoroughly)\b'
+  - '\b(final|another|repeated)\s+(measured|verified|validated|calibrated)\s+(result|value|outcome)\b'
+positive_controls:
+  - "The result was measured carefully. It was measured again. A final measured result followed."
+negative_controls:
+  - "Three acquisitions give one independent closure dimension."
+  - "The rate was measured at 5/min and independently reproduced."

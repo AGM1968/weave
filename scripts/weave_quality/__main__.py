@@ -52,6 +52,7 @@ from weave_quality.db import (
     bulk_upsert_git_stats,
     db_exists,
     db_path,
+    export_pattern_adjudications,
     file_changed,
     finish_pattern_run,
     finish_scan,
@@ -59,6 +60,7 @@ from weave_quality.db import (
     get_file_entries,
     get_git_stats,
     init_db,
+    import_pattern_adjudications,
     latest_pattern_run,
     latest_scan,
     pattern_adjudication_report,
@@ -1560,12 +1562,19 @@ def _load_pattern_rules(
 def _shadowed_managed_pattern_ids(repo: Path) -> list[str]:
     """Return rule ids a project-local rule is currently shadowing.
 
-    install.sh's managed-pattern reconcile writes <repo>/.weave/patterns/managed/.overridden
-    whenever a same-named .weave/patterns/<id>.yaml exists, so the managed
-    (often refined) version was never distributed into the repo. That is
-    almost always a completed promotion round-trip where the local copy
-    should be deleted — surface it instead of leaving it silent.
+    Prefer the installed managed inventory so a newly promoted rule is visible
+    before the repository projection is refreshed. Fall back to reconcile's
+    .overridden marker when installed assets are unavailable.
     """
+    installed = _installed_managed_pattern_names()
+    if installed:
+        patterns_dir = repo / ".weave" / "patterns"
+        return sorted(
+            name.removesuffix(".yaml")
+            for name in installed
+            if (patterns_dir / name).is_file()
+        )
+
     overridden_file = repo / ".weave" / "patterns" / "managed" / ".overridden"
     if not overridden_file.is_file():
         return []
@@ -1575,6 +1584,52 @@ def _shadowed_managed_pattern_ids(repo: Path) -> list[str]:
         if name.endswith(".yaml"):
             ids.append(name[: -len(".yaml")])
     return ids
+
+
+def _installed_managed_pattern_dir() -> Path:
+    config_root = Path(os.environ.get("WV_CONFIG_DIR", Path.home() / ".config" / "weave"))
+    return config_root / "quality-patterns" / "managed"
+
+
+def _managed_pattern_manifest_names(path: Path) -> set[str]:
+    if not path.is_file():
+        return set()
+    return {
+        name
+        for raw in path.read_text(encoding="utf-8").splitlines()
+        if (name := raw.strip()).endswith(".yaml") and "/" not in name and ".." not in name
+    }
+
+
+def _installed_managed_pattern_names() -> set[str]:
+    return _managed_pattern_manifest_names(_installed_managed_pattern_dir() / "manifest.txt")
+
+
+def _stale_managed_pattern_ids(repo: Path) -> list[str]:
+    """Return installed managed ids whose existing repo projection is stale."""
+    managed_dir = repo / ".weave" / "patterns" / "managed"
+    if not managed_dir.is_dir():
+        return []
+    installed_dir = _installed_managed_pattern_dir()
+    installed = _installed_managed_pattern_names()
+    if not installed:
+        return []
+    projected = _managed_pattern_manifest_names(managed_dir / ".manifest")
+    overridden = _managed_pattern_manifest_names(managed_dir / ".overridden")
+    stale = (projected | overridden) - installed
+    for name in installed:
+        if (repo / ".weave" / "patterns" / name).is_file():
+            continue
+        projected_rule = managed_dir / name
+        installed_rule = installed_dir / name
+        if (
+            name not in projected
+            or not projected_rule.is_file()
+            or not installed_rule.is_file()
+            or projected_rule.read_bytes() != installed_rule.read_bytes()
+        ):
+            stale.add(name)
+    return sorted(name.removesuffix(".yaml") for name in stale)
 
 
 def _pattern_rule_error(exc: PatternRuleValidationError, json_out: bool) -> int:
@@ -1661,7 +1716,7 @@ def _normalise_finding_identity_text(value: str) -> str:
 def _attach_pattern_finding_identities(
     findings: list[PatternFinding], target: Path, repo: Path
 ) -> None:
-    """Bind findings to rule, path, normalized match, and source-line context.
+    """Bind findings to rule, path, normalized match, and match ordinal.
 
     A source-read failure (deleted mid-scan, permission denied, ...) is
     NOT swallowed here -- it propagates to the caller (cmd_patterns_scan),
@@ -1672,6 +1727,7 @@ def _attach_pattern_finding_identities(
     as a successful, correctly-identified finding.
     """
     source_cache: dict[str, list[str]] = {}
+    occurrence_counts: dict[tuple[str, str, str], int] = {}
     for finding in findings:
         source = target / finding.path if target.is_dir() else target
         cache_key = str(source)
@@ -1702,8 +1758,10 @@ def _attach_pattern_finding_identities(
             finding.path = Path(os.path.abspath(str(source))).as_posix()
         normalized_match = _normalise_finding_identity_text(finding.match_text)
         finding.context_text = _normalise_finding_identity_text(context)
+        occurrence = (finding.rule_id, finding.path, normalized_match)
+        occurrence_counts[occurrence] = occurrence_counts.get(occurrence, 0) + 1
         identity = json.dumps(
-            [finding.rule_id, finding.path, normalized_match, finding.context_text],
+            [*occurrence, occurrence_counts[occurrence]],
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -2316,8 +2374,8 @@ def cmd_patterns_report(args: argparse.Namespace) -> int:
     return 0
 
 
-_PROSE_SCHEMA_KINDS = ("lexicon", "motif", "density", "regex")
-_PROSE_SCHEMA_MATCH_SCOPES = ("line", "paragraph", "document")
+_PROSE_SCHEMA_KINDS = ("lexicon", "motif", "density", "regex", "citation")
+_PROSE_SCHEMA_MATCH_SCOPES = ("line", "paragraph", "heading", "document")
 _PROSE_SCHEMA_MATURITIES = ("candidate", "observed", "promotable")
 _PROSE_SCHEMA_OPTIONAL_KEYS = (
     "exempt",
@@ -2565,6 +2623,7 @@ def cmd_patterns_list(args: argparse.Namespace) -> int:
             rule_states.append({"rule_id": rule_id, "path": str(rule_path), **state})
 
         active_ids = {rule_id for rule_id, _, _ in rules}
+        stale_ids = _stale_managed_pattern_ids(repo)
         shadowed_ids = [
             rule_id
             for rule_id in _shadowed_managed_pattern_ids(repo)
@@ -2584,6 +2643,12 @@ def cmd_patterns_list(args: argparse.Namespace) -> int:
         return 1
     # Advisory only, always on stderr (in both --json and text mode) so it never
     # changes the shape of the stdout payload for existing consumers.
+    if stale_ids:
+        print(
+            "⚠ managed pattern projection is stale for "
+            f"{', '.join(stale_ids)} — run 'wv init-repo --update' before scanning",
+            file=sys.stderr,
+        )
     for rule_id in shadowed_ids:
         # wv-8d16bd (external code review round 3 re-audit): deleting the
         # local copy alone does NOT resync the managed version -- the
@@ -2747,6 +2812,29 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_adjudications_export(args: argparse.Namespace) -> int:
+    """Export only durable human adjudications for wv sync."""
+    conn = init_db(args.hot_zone)
+    try:
+        export_pattern_adjudications(conn, Path(args.path))
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_adjudications_import(args: argparse.Namespace) -> int:
+    """Import durable human adjudications for wv load."""
+    path = Path(args.path)
+    if not path.exists():
+        return 0
+    conn = init_db(args.hot_zone)
+    try:
+        import_pattern_adjudications(conn, path)
+    finally:
+        conn.close()
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -2901,6 +2989,11 @@ def main() -> int:  # pragma: no cover
     # reset
     sub.add_parser("reset", help="Delete quality.db for recovery")
 
+    adjudications_export = sub.add_parser("adjudications-export", help=argparse.SUPPRESS)
+    adjudications_export.add_argument("path")
+    adjudications_import = sub.add_parser("adjudications-import", help=argparse.SUPPRESS)
+    adjudications_import.add_argument("path")
+
     # structural-search
     ss_parser = sub.add_parser(
         "structural-search",
@@ -2984,6 +3077,8 @@ def main() -> int:  # pragma: no cover
         "findings-promote": cmd_findings_promote,
         "functions": cmd_functions,
         "reset": cmd_reset,
+        "adjudications-export": cmd_adjudications_export,
+        "adjudications-import": cmd_adjudications_import,
         "structural-search": cmd_structural_search,
         "patterns": cmd_patterns,
     }

@@ -1,0 +1,27 @@
+id: prose-em-dash-density
+language: prose
+kind: density
+match_scope: paragraph
+min_count: 3
+severity: info
+policy: always-on-shared
+maturity: promotable
+provenance: >-
+  QP-2 and AC-2 from earth-engine-analysis canary wv-7a8d45. Three or more
+  em dashes in one paragraph was the motivating density case; the audited
+  reference corpus and calibration document were quiet at this threshold.
+message: >-
+  Dense em-dash punctuation can turn one paragraph into a chain of asides.
+  Keep the strongest interruption and express the remaining relationships
+  with sentences, commas, parentheses, or explicit connectives.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+terms:
+  - "—"
+positive_controls:
+  - "One—two—three—four linked asides."
+negative_controls:
+  - "One—two linked clauses."
+  - "One—two here."

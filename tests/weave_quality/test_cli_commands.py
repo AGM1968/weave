@@ -24,6 +24,7 @@ from weave_quality.__main__ import (
     _get_current_head,
     _load_config_excludes,
     _load_pattern_rules,
+    _stale_managed_pattern_ids,
     _resolve_repo,
     _run_pattern_rule,
     _shadowed_managed_pattern_ids,
@@ -643,8 +644,9 @@ class TestCmdPatternsScan:
             assert cmd_patterns_adjudicate(adjudicate_args) == 0
             capsys.readouterr()
 
-            # Source line movement and scan identity do not change finding identity.
-            doc.write_text("\nA genuine result.\n", encoding="utf-8")
+            # Source movement, surrounding prose edits, and scan identity do
+            # not change finding identity.
+            doc.write_text("\nThe revised report has a genuine result today.\n", encoding="utf-8")
             conn = init_db(hot_zone=str(hotzone))
             begin_scan(conn, "def")
             conn.commit()
@@ -670,6 +672,60 @@ class TestCmdPatternsScan:
                 "scan_count": 2,
                 "note": "intentional terminology",
             }
+        ]
+
+    def test_repeated_matches_have_distinct_position_independent_keys(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        hotzone = tmp_path / "hotzone"
+        doc = tmp_path / "doc.md"
+        doc.write_text(
+            "A genuine first result.\n\nA genuine second result.\n", encoding="utf-8"
+        )
+        rule = tmp_path / "prose-test.yaml"
+        rule.write_text(
+            "id: prose-test\nlanguage: prose\nkind: lexicon\nterms:\n  - genuine\n",
+            encoding="utf-8",
+        )
+        scan_args = argparse.Namespace(hot_zone=str(hotzone), path=str(doc), json=True)
+
+        with (
+            patch("weave_quality.__main__._resolve_repo", return_value=str(tmp_path)),
+            patch(
+                "weave_quality.__main__._load_pattern_rules",
+                return_value=[("prose-test", rule, "prose")],
+            ),
+        ):
+            assert cmd_patterns_scan(scan_args) == 0
+            first = json.loads(capsys.readouterr().out)
+            first_keys = [match["finding_key"] for match in first["matches"]]
+            assert len(first_keys) == len(set(first_keys)) == 2
+
+            adjudicate_args = argparse.Namespace(
+                hot_zone=str(hotzone),
+                finding_key=first_keys[1],
+                disposition="waived",
+                note="second occurrence",
+                json=True,
+            )
+            assert cmd_patterns_adjudicate(adjudicate_args) == 0
+            capsys.readouterr()
+
+            doc.write_text(
+                "Introductory material moved here.\n\n"
+                "The first revised paragraph has a genuine result.\n\n"
+                "The second revised paragraph also has a genuine result.\n",
+                encoding="utf-8",
+            )
+            assert cmd_patterns_scan(scan_args) == 0
+            second = json.loads(capsys.readouterr().out)
+
+        assert [match["finding_key"] for match in second["matches"]] == first_keys
+        assert [match["disposition"] for match in second["matches"]] == [
+            "unresolved",
+            "waived",
         ]
 
     def test_report_scopes_to_last_scan_target_by_default(
@@ -1745,8 +1801,8 @@ def test_resolve_repo_falls_back_to_repo_root_without_override(
 def test_pattern_loader_rejects_duplicate_ids(tmp_path: Path) -> None:
     patterns = tmp_path / ".weave" / "patterns"
     patterns.mkdir(parents=True)
-    (patterns / "prose-casual-register.yaml").write_text(
-        "id: prose-casual-register\nlanguage: prose\nkind: regex\n"
+    (patterns / "prose-register-review.yaml").write_text(
+        "id: prose-register-review\nlanguage: prose\nkind: regex\n"
         "patterns:\n  - duplicate\n",
         encoding="utf-8",
     )
@@ -1765,13 +1821,16 @@ def test_pattern_loader_validates_disabled_rules(tmp_path: Path) -> None:
         _load_pattern_rules(tmp_path, {"disabled-broken"})
 
 
-def test_shadowed_managed_pattern_ids_reads_overridden_marker(tmp_path: Path) -> None:
+def test_shadowed_managed_pattern_ids_reads_overridden_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     managed = tmp_path / ".weave" / "patterns" / "managed"
     managed.mkdir(parents=True)
     (managed / ".overridden").write_text(
         "prose-casual-register.yaml\nmarkdown-split-code-span.yaml\n",
         encoding="utf-8",
     )
+    monkeypatch.setenv("WV_CONFIG_DIR", str(tmp_path / "empty-config"))
     assert _shadowed_managed_pattern_ids(tmp_path) == [
         "prose-casual-register",
         "markdown-split-code-span",
@@ -1782,17 +1841,67 @@ def test_shadowed_managed_pattern_ids_absent_marker_is_empty(tmp_path: Path) -> 
     assert not _shadowed_managed_pattern_ids(tmp_path)
 
 
+def test_installed_manifest_finds_shadow_before_projection_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config" / "quality-patterns" / "managed"
+    config.mkdir(parents=True)
+    (config / "manifest.txt").write_text("promoted-rule.yaml\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    managed = repo / ".weave" / "patterns" / "managed"
+    managed.mkdir(parents=True)
+    local = repo / ".weave" / "patterns" / "promoted-rule.yaml"
+    local.write_text("custom\n", encoding="utf-8")
+    monkeypatch.setenv("WV_CONFIG_DIR", str(tmp_path / "config"))
+
+    assert _shadowed_managed_pattern_ids(repo) == ["promoted-rule"]
+
+
+def test_stale_managed_projection_compares_installed_inventory_and_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config" / "quality-patterns" / "managed"
+    config.mkdir(parents=True)
+    (config / "manifest.txt").write_text(
+        "changed-rule.yaml\nnew-rule.yaml\n", encoding="utf-8"
+    )
+    (config / "changed-rule.yaml").write_text("current\n", encoding="utf-8")
+    (config / "new-rule.yaml").write_text("new\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    managed = repo / ".weave" / "patterns" / "managed"
+    managed.mkdir(parents=True)
+    (managed / ".manifest").write_text(
+        "changed-rule.yaml\nretired-rule.yaml\n", encoding="utf-8"
+    )
+    (managed / "changed-rule.yaml").write_text("stale\n", encoding="utf-8")
+    (managed / "retired-rule.yaml").write_text("retired\n", encoding="utf-8")
+    monkeypatch.setenv("WV_CONFIG_DIR", str(tmp_path / "config"))
+
+    assert _stale_managed_pattern_ids(repo) == [
+        "changed-rule",
+        "new-rule",
+        "retired-rule",
+    ]
+
+
 def test_patterns_list_warns_on_shadowed_managed_rule(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     hotzone = tmp_path / "hotzone"
     init_db(hot_zone=str(hotzone)).close()
     managed = tmp_path / ".weave" / "patterns" / "managed"
     managed.mkdir(parents=True)
-    (managed / ".overridden").write_text("prose-casual-register.yaml\n", encoding="utf-8")
-    rule = tmp_path / "prose-casual-register.yaml"
+    (managed / ".manifest").write_text("older-rule.yaml\n", encoding="utf-8")
+    config = tmp_path / "config" / "quality-patterns" / "managed"
+    config.mkdir(parents=True)
+    (config / "manifest.txt").write_text("promoted-rule.yaml\n", encoding="utf-8")
+    (config / "promoted-rule.yaml").write_text("managed\n", encoding="utf-8")
+    monkeypatch.setenv("WV_CONFIG_DIR", str(tmp_path / "config"))
+    rule = tmp_path / ".weave" / "patterns" / "promoted-rule.yaml"
     rule.write_text(
-        "id: prose-casual-register\nlanguage: prose\nkind: regex\npatterns:\n  - absent\n",
+        "id: promoted-rule\nlanguage: prose\nkind: regex\npatterns:\n  - absent\n",
         encoding="utf-8",
     )
     args = argparse.Namespace(hot_zone=str(hotzone), path=str(tmp_path), json=False)
@@ -1801,13 +1910,14 @@ def test_patterns_list_warns_on_shadowed_managed_rule(
         patch("weave_quality.__main__._resolve_repo", return_value=str(tmp_path)),
         patch(
             "weave_quality.__main__._load_pattern_rules",
-            return_value=[("prose-casual-register", rule, "prose")],
+            return_value=[("promoted-rule", rule, "prose")],
         ),
     ):
         assert cmd_patterns_list(args) == 0
         captured = capsys.readouterr()
-        assert "prose-casual-register" in captured.err
+        assert "promoted-rule" in captured.err
         assert "shadows an available managed rule" in captured.err
+        assert "managed pattern projection is stale" in captured.err
         # stdout stays exactly the existing rule listing, unaffected
         assert "shadow" not in captured.out
 
@@ -1860,9 +1970,11 @@ def test_validate_reports_every_rule_independently_and_schema_coverage(
         "motif": False,
         "density": True,
         "regex": False,
+        "citation": False,
     }
     assert coverage["match_scopes"]["document"] is True
     assert coverage["match_scopes"]["line"] is False
+    assert coverage["match_scopes"]["heading"] is False
     assert coverage["maturities"] == {
         "candidate": True,
         "observed": False,
@@ -1996,7 +2108,7 @@ def test_validate_all_valid_returns_zero_and_text_output_lists_unused_surface(
 
     assert "qp-test-lexicon" in text
     assert "valid" in text
-    assert "kind: 1/4 exercised, unused:" in text
+    assert "kind: 1/5 exercised, unused:" in text
     assert "density" in text and "motif" in text and "regex" in text
 
 

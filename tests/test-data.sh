@@ -207,6 +207,34 @@ list_output=$($WV list 2>&1)
 assert_contains "$list_output" "Test node for sync" "loaded data contains first node"
 assert_contains "$list_output" "Another node for sync" "loaded data contains second node"
 
+# Human quality adjudications are projected separately from ephemeral scan
+# evidence and survive replacement of the entire hot-zone quality.db.
+mkdir -p "$WEAVE_DIR/patterns"
+cat > "$WEAVE_DIR/patterns/prose-durability-probe.yaml" <<'EOF'
+id: prose-durability-probe
+language: prose
+kind: regex
+patterns:
+  - '\bflibbertigibbet\b'
+EOF
+echo "A flibbertigibbet appears." > durability.md
+pattern_json=$($WV quality patterns scan durability.md --json)
+finding_key=$(printf '%s' "$pattern_json" | jq -r \
+    '.matches[] | select(.rule_id == "prose-durability-probe") | .finding_key')
+$WV quality patterns adjudicate "$finding_key" false_positive --note "sense control" >/dev/null
+assert_file_exists "$WEAVE_DIR/quality-adjudications.jsonl" "quality adjudication projection created"
+$WV sync >/dev/null
+rm -f "$WV_HOT_ZONE/quality.db" "$WV_HOT_ZONE/quality.db-wal" "$WV_HOT_ZONE/quality.db-shm"
+$WV load >/dev/null
+$WV quality patterns scan durability.md --json >/dev/null
+report_json=$($WV quality patterns report durability.md --json)
+decided_count=$(printf '%s' "$report_json" | jq -r \
+    '.by_rule["prose-durability-probe"].decided_count')
+history_count=$(sqlite3 "$WV_HOT_ZONE/quality.db" \
+    "SELECT COUNT(*) FROM pattern_finding_disposition_history;")
+assert_equals "1" "$decided_count" "fresh hot zone restores adjudication state"
+assert_equals "1" "$history_count" "fresh hot zone restores adjudication history"
+
 # Test load with no state.sql
 rm -f "$WEAVE_DIR/state.sql"
 rm -f "$WV_DB" "$WV_DB-wal" "$WV_DB-shm"

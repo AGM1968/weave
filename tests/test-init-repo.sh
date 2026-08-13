@@ -554,7 +554,9 @@ assert_contains "$(cat "$REPO6/.gitattributes")" "BEGIN WEAVE GITATTRIBUTES" "gi
 assert_contains "$(cat "$REPO6/.gitattributes")" "END WEAVE GITATTRIBUTES"   "gitattr: has END marker"
 assert_contains "$(cat "$REPO6/.gitattributes")" "-diff linguist-generated"  "gitattr: has -diff flag"
 assert_contains "$(cat "$REPO6/.gitattributes")" "state.sql.txt-dump"        "gitattr: has txt-dump entry"
+assert_contains "$(cat "$REPO6/.gitattributes")" "quality-adjudications.jsonl merge=union" "gitattr: adjudications use union merge"
 assert_contains "$(cat "$REPO6/.gitattributes")" "deltas/**/*.sql merge=theirs" "gitattr: has deltas merge=theirs"
+assert_contains "$(cat "$REPO6/.gitignore")" "!.weave/quality-adjudications.jsonl" "gitignore: adjudication projection remains tracked"
 
 # --- .gitattributes: upgrade bare entries to marker block ---
 echo ""

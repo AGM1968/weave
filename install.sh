@@ -533,6 +533,11 @@ if [ -f "./scripts/wv" ]; then
         install_file "$rulef" "$LIB_DIR/weave_quality/rules/$(basename "$rulef")"
     done
     mkdir -p "$LIB_DIR/weave_quality/default_patterns"
+    for installed_pattern in "$LIB_DIR"/weave_quality/default_patterns/*.yaml; do
+        [ -f "$installed_pattern" ] || continue
+        [ -f "./scripts/weave_quality/default_patterns/$(basename "$installed_pattern")" ] \
+            || rm -f "$installed_pattern"
+    done
     for pf in ./scripts/weave_quality/default_patterns/*.yaml; do
         install_file "$pf" "$LIB_DIR/weave_quality/default_patterns/$(basename "$pf")"
     done
@@ -688,7 +693,9 @@ else
     done
     # Default pattern rules
     mkdir -p "$LIB_DIR/weave_quality/default_patterns"
-    for pattern_rule in subprocess-shell-true bare-except-pass unquoted-variable prose-casual-register prose-emphasis-hedge prose-number-free-verification; do
+    rm -f "$LIB_DIR/weave_quality/default_patterns/prose-casual-register.yaml" \
+        "$LIB_DIR/weave_quality/default_patterns/prose-number-free-verification.yaml"
+    for pattern_rule in subprocess-shell-true bare-except-pass unquoted-variable prose-register-review prose-emphasis-hedge; do
         download_file "$REPO/scripts/weave_quality/default_patterns/${pattern_rule}.yaml" \
             "$LIB_DIR/weave_quality/default_patterns/${pattern_rule}.yaml"
     done
@@ -1265,6 +1272,7 @@ WEAVE_PATTERNS=(
     ".weave/.prune_epoch"
     ".weave/quality.local.conf"
     "!.weave/state.sql"
+    "!.weave/quality-adjudications.jsonl"
     "!.claude/settings.json"
     ".claude/settings.local.json"
 )
@@ -1340,6 +1348,7 @@ ATTR_BLOCK="${ATTR_MARKER_BEGIN}
 .weave/state.sql.txt-dump -diff linguist-generated
 .weave/nodes.jsonl merge=ours -diff linguist-generated
 .weave/edges.jsonl merge=ours -diff linguist-generated
+.weave/quality-adjudications.jsonl merge=union
 .weave/breadcrumbs.md merge=ours
 
 # Delta files: unique filenames mean no real conflicts; merge=theirs is a safety net.
@@ -2453,6 +2462,9 @@ echo ""
 echo "To set up a new repo:"
 echo "  cd /path/to/your/repo"
 echo "  wv init-repo"
+echo ""
+echo -e "${YELLOW}Existing Weave repositories require a managed-asset refresh after install:${NC}"
+echo "  cd /path/to/existing/repo && wv init-repo --update"
 
 # Run verification if requested
 if [ "$VERIFY" = "1" ]; then
