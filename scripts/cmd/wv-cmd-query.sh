@@ -89,6 +89,15 @@ _query_parse_predicate() {
     fi
 
     echo "Error: cannot parse predicate: '$raw'" >&2
+    # A key:value guess is the common first attempt; predicates use key=value.
+    # 'parent' is not a column at all -- children hang off edges, so name the
+    # command that actually lists them rather than leaving the user to guess.
+    case "$raw" in
+        parent:*|parent=*)
+            echo "Hint: parent is not a queryable field. Use 'wv tree <epic-id>' to list an epic's children." >&2 ;;
+        *:*)
+            echo "Hint: predicates use key=value, not key:value (e.g. status=todo). See 'wv query --help' for the key list." >&2 ;;
+    esac
     return 1
 }
 

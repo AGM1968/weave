@@ -56,7 +56,7 @@ C="$TMP/c"; CREPO="$TMP/crepo"; mkdir -p "$C" "$CREPO"
 mkproc "$C" liveproc '[claude, codex, copilot]' 'visibility: shared' 'claude_skill: wv-liveproc'
 bash "$PROJECT" --source="$C" --repo="$CREPO"
 [ -f "$CREPO/.claude/skills/wv-liveproc/SKILL.md" ]
-grep -qF "$MARKER" "$CREPO/.claude/skills/wv-liveproc/SKILL.md"   # generated skills carry the marker
+grep -qF -- "$MARKER" "$CREPO/.claude/skills/wv-liveproc/SKILL.md"   # generated skills carry the marker
 [ "$(jq -r '[.procedures[].id] | index("liveproc")' "$CREPO/.codex/weave.json")" != "null" ]
 grep -qF 'wv guide --procedure=liveproc' "$CREPO/.github/copilot-instructions.md"
 

@@ -28,10 +28,17 @@ hook_duration_ms() {
 
 run_hook_suite() {
     _pc_suite="$1"
-    _pc_cost="${2:-?}"
+    _pc_cost="${2:-}"
     # Heuristic may map to a suite that doesn't exist yet — skip rather than fail.
     [ -f "$REPO_ROOT/$_pc_suite" ] || return 0
-    hook_progress "running $_pc_suite (~${_pc_cost}s)..."
+    # A suite with no recorded wall time must not announce "~0s": that reads as a
+    # measurement of a fast suite, and an operator who then waits two minutes for
+    # a silent gate concludes it hung and interrupts it, losing the commit.
+    if [ -n "$_pc_cost" ] && [ "$_pc_cost" -gt 0 ] 2>/dev/null; then
+        hook_progress "running $_pc_suite (~${_pc_cost}s)..."
+    else
+        hook_progress "running $_pc_suite (duration not yet measured)..."
+    fi
     _pc_t0=$(date +%s%N 2>/dev/null || echo 0)
     GIT_CONFIG_COUNT=1 \
         GIT_CONFIG_KEY_0=core.hooksPath \
@@ -145,7 +152,17 @@ if [ -n "$STAGED_PY_FILES" ]; then
             exit 1
         fi
     fi
+fi
 
+# The weave_quality pytest suite asserts the managed-rule manifest is complete
+# and that every managed rule carries an executable example, so a rule YAML is
+# inside its scope even when no Python file changes. Keyed on staged .py alone,
+# it never ran for a rule-only commit: prose-significance-scaffold was added
+# with its manifest entry but no example, and sat failing until an unrelated
+# Python change happened to stage alongside it.
+STAGED_QUALITY_RULES=$(git diff --cached --name-only --diff-filter=AMD 2>/dev/null \
+    | grep -E '^(templates/quality-patterns|\.weave/patterns)/managed/' || true)
+if [ -n "$STAGED_PY_FILES" ] || [ -n "$STAGED_QUALITY_RULES" ]; then
     if [ -f "$REPO_ROOT/.venv/bin/python3" ]; then
         PYTHON3="$REPO_ROOT/.venv/bin/python3"
     else
@@ -157,13 +174,76 @@ if [ -n "$STAGED_PY_FILES" ]; then
             [ -d "$_pc_dir" ] && _pc_pytest_dirs="${_pc_pytest_dirs}${_pc_pytest_dirs:+ }$_pc_dir"
         done
         if [ -n "$_pc_pytest_dirs" ]; then
-            hook_progress "running focused pytest checks for staged Python changes..."
+            hook_progress "running focused pytest checks for staged Python/rule changes..."
             # shellcheck disable=SC2086
             if ! "$PYTHON3" -m pytest $_pc_pytest_dirs -q --tb=short 2>&1; then
                 echo "" >&2
                 echo "✗ pytest tests failed — fix before committing." >&2
                 exit 1
             fi
+        fi
+    fi
+fi
+
+# Run shellcheck on the STAGED CONTENT of shell files.
+#
+# Lint is not reachable through impact-selected suite routing: shellcheck lives
+# in `make check`, so a lint regression in a file the map DOES route stays
+# invisible behind green suites (b3f84bbb introduced SC1090 in pre-action.sh,
+# a mapped file whose suites all passed, and it went two commits unnoticed).
+#
+# THE BLOB, NOT THE WORKING TREE. Naming staged files and letting shellcheck
+# read them off disk checks whatever is in the worktree, so a dirty index behind
+# a clean worktree committed content that was never linted.
+#
+# NUL-SAFE END TO END. An earlier version piped `-z` output through `tr '\0'
+# '\n'`, which throws the safety away at the first step: a path containing a
+# newline was silently skipped. `xargs` then split paths on spaces, turning one
+# real file into two nonexistent ones and blocking the commit for files that
+# were fine. Paths are read into an array with `mapfile -d ''` and passed as
+# arguments to the linter — no tr, no xargs, no word splitting.
+#
+# FAILS CLOSED. If the temp dir or the materialisation cannot be produced, the
+# commit is refused. Warning and continuing turns the gate off silently, which
+# is the failure mode this whole gate exists to prevent.
+if command -v shellcheck >/dev/null 2>&1; then
+    _pc_sc_all=()
+    mapfile -d '' -t _pc_sc_all < <(git diff --cached --name-only --diff-filter=ACMR -z 2>/dev/null)
+    _pc_sc_files=()
+    for _pc_f in "${_pc_sc_all[@]}"; do
+        case "$_pc_f" in
+            scripts/*.sh|.claude/*.sh|install.sh|install-mcp.sh|build-release.sh|scripts/wv-battery-wrapper)
+                _pc_sc_files+=("$_pc_f") ;;
+        esac
+    done
+    if [ "${#_pc_sc_files[@]}" -gt 0 ]; then
+        hook_progress "running shellcheck on ${#_pc_sc_files[@]} staged shell file(s)..."
+        _pc_sc_dir=$(mktemp -d "${TMPDIR:-/tmp}/wv-sc.XXXXXX" 2>/dev/null) || _pc_sc_dir=""
+        # Checked BEFORE any --prefix is built: an empty value would make the
+        # prefix "/" and materialise the index over the filesystem root.
+        if [ -z "$_pc_sc_dir" ] || [ ! -d "$_pc_sc_dir" ]; then
+            echo "✗ shellcheck gate: could not create a temp directory — refusing to commit unlinted content" >&2
+            exit 1
+        fi
+        if ! printf '%s\0' "${_pc_sc_files[@]}" \
+            | git checkout-index -f -z --stdin --prefix="$_pc_sc_dir/" 2>/dev/null; then
+            rm -rf "$_pc_sc_dir"
+            echo "✗ shellcheck gate: could not materialise the staged index — refusing to commit unlinted content" >&2
+            exit 1
+        fi
+        [ -f "$REPO_ROOT/.shellcheckrc" ] && cp "$REPO_ROOT/.shellcheckrc" "$_pc_sc_dir/" 2>/dev/null
+        _pc_sc_rc=0
+        _pc_sc_out=$( cd "$_pc_sc_dir" && shellcheck --severity=warning -- "${_pc_sc_files[@]}" 2>&1 ) || _pc_sc_rc=$?
+        rm -rf "$_pc_sc_dir"
+        if [ "$_pc_sc_rc" -ne 0 ]; then
+            echo "" >&2
+            echo "✗ shellcheck findings in STAGED content:" >&2
+            echo "$_pc_sc_out" >&2
+            echo "" >&2
+            echo "  These are the bytes being committed — the working tree may differ." >&2
+            echo "  Fix, then re-stage. Project-wide suppressions live in .shellcheckrc" >&2
+            echo "" >&2
+            exit 1
         fi
     fi
 fi
@@ -177,8 +257,18 @@ if [ -n "$_pc_files_csv" ]; then
     _pc_suite_count=$(printf '%s' "$_pc_suites_json" | jq 'length' 2>/dev/null || echo 0)
     if [ "${_pc_suite_count:-0}" -gt 0 ]; then
         _pc_selected=$(printf '%s' "$_pc_suites_json" | jq -r '[.[].name] | join(", ")' 2>/dev/null || echo "")
-        _pc_selected_cost=$(printf '%s' "$_pc_suites_json" | jq '[.[].last_cost_s] | add // 0' 2>/dev/null || echo 0)
-        hook_progress "impact-selected shell suites: $_pc_selected (~${_pc_selected_cost}s)"
+        _pc_selected_cost=$(printf '%s' "$_pc_suites_json" | jq '[.[].last_cost_s // 0] | add // 0' 2>/dev/null || echo 0)
+        # Count suites with no recorded time so the total is not quoted as if it
+        # covered them; an unmeasured suite contributes 0 and would silently
+        # understate the wait.
+        _pc_unmeasured=$(printf '%s' "$_pc_suites_json" | jq '[.[] | select((.last_cost_s // 0) <= 0)] | length' 2>/dev/null || echo 0)
+        if [ "${_pc_unmeasured:-0}" -eq 0 ] 2>/dev/null; then
+            hook_progress "impact-selected shell suites: $_pc_selected (~${_pc_selected_cost}s)"
+        elif [ "${_pc_selected_cost:-0}" -gt 0 ] 2>/dev/null; then
+            hook_progress "impact-selected shell suites: $_pc_selected (~${_pc_selected_cost}s measured, ${_pc_unmeasured} not yet measured)"
+        else
+            hook_progress "impact-selected shell suites: $_pc_selected (duration not yet measured)"
+        fi
         while IFS=$'\t' read -r _pc_suite _pc_cost; do
             [ "$_pc_suite" = "tests/run-all.sh" ] && continue
             run_hook_suite "$_pc_suite" "$_pc_cost"

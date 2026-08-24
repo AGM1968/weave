@@ -1,0 +1,31 @@
+# Production WV_TEST_* fault-injection hooks — the complete inventory.
+#
+# These are deliberately LOCAL: each lives at the site it perturbs, takes exact
+# values, and is greppable by name. There is no shared runtime fault dispatcher,
+# because these hooks cross different ownership boundaries and a central
+# dispatcher would hide that.
+#
+# Every hook requires the master opt-in WV_TEST_MODE=1 as well as its own exact
+# value. Set without WV_TEST_MODE=1 a hook is ignored (with a warning) so a
+# stray value in a real environment cannot divert real behaviour; set with it,
+# an unrecognised value is an error rather than a silent bypass or no-op.
+#
+# tests/test-test-hook-registry.sh fails if production code gains a WV_TEST_*
+# hook that is not listed here, or if a listed hook no longer appears in the
+# file that claims to own it. Adding a hook means adding a line here.
+#
+# That audit is INVENTORY ONLY. It cannot show that a hook is gated or that it
+# validates its value -- grep finding "WV_TEST_MODE" in a file does not
+# distinguish a guard from a comment. Each hook's gating and rejection are
+# asserted behaviourally in the suite that owns it.
+#
+# Validation must run BEFORE any conditional branch in its command. Both the
+# impact and orphan-classifier hooks originally validated inside the branch
+# that executes the fault, so an unrecognised value was accepted on a cache hit
+# and on a sweep with no orphans respectively -- the ordinary fast paths.
+#
+# format: NAME | owning file | allowed values | purpose
+WV_TEST_MODE | (master) | 1 | Master opt-in. Every hook below is inert without it.
+WV_TEST_SYNC_STUB | scripts/cmd/wv-cmd-data.sh | ok,fail:state,fail:nodes,fail:edges | Stands in for a succeeding GitHub step so the post-sync projection and stamping path is reachable offline, and forces one projection to fail.
+WV_TEST_FAIL_ORPHAN_KINDS | scripts/cmd/wv-cmd-data.sh | 1 | Forces the orphan-kind classifier to fail as a whole, a branch unreachable from the CLI.
+WV_TEST_IMPACT_RACE | scripts/cmd/wv-cmd-graph.sh | 1 | Mutates the graph during the impact walk, the window the cache publication check exists to close.

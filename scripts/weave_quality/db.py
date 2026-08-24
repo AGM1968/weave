@@ -22,6 +22,7 @@ Recovery: delete quality.db entirely (wv quality reset).
 from __future__ import annotations
 
 import logging
+import hashlib
 import json
 import os
 import sqlite3
@@ -186,6 +187,7 @@ CREATE TABLE IF NOT EXISTS pattern_rule_runs (
 -- Stable identity and latest human disposition survive point-in-time finding pruning.
 CREATE TABLE IF NOT EXISTS pattern_finding_state (
     finding_key        TEXT PRIMARY KEY,
+    content_key        TEXT,
     rule_id            TEXT NOT NULL,
     path               TEXT NOT NULL,
     match_text         TEXT NOT NULL,
@@ -225,6 +227,9 @@ CREATE INDEX IF NOT EXISTS idx_pf_scan ON pattern_findings(scan_id);
 CREATE INDEX IF NOT EXISTS idx_pf_rule ON pattern_findings(rule_id);
 CREATE INDEX IF NOT EXISTS idx_prr_scan ON pattern_rule_runs(scan_id);
 CREATE INDEX IF NOT EXISTS idx_pfs_rule ON pattern_finding_state(rule_id);
+-- idx_pfs_content is created by _migrate_v11, not here: _SCHEMA runs before the
+-- migrations, so on a pre-v11 database the column does not exist yet and this
+-- script would abort on "no such column: content_key".
 CREATE INDEX IF NOT EXISTS idx_pfo_scan ON pattern_finding_occurrences(scan_id);
 CREATE INDEX IF NOT EXISTS idx_pfdh_key ON pattern_finding_disposition_history(finding_key);
 CREATE INDEX IF NOT EXISTS idx_gs_hotspot ON git_stats(hotspot DESC);
@@ -1020,6 +1025,38 @@ def _migrate_v10(conn: sqlite3.Connection) -> None:
     _migrate_v10_rebuild_pattern_tables(conn)
 
 
+def _migrate_v11(conn: sqlite3.Connection) -> None:
+    """Add pattern_finding_state.content_key and backfill it (Finding K).
+
+    Idempotent: the column check short-circuits on an already-migrated database,
+    and the backfill only touches rows whose content_key is still NULL.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(pattern_finding_state)")}
+    if "content_key" not in cols:
+        conn.execute("ALTER TABLE pattern_finding_state ADD COLUMN content_key TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pfs_content ON pattern_finding_state(content_key)"
+    )
+    rows = conn.execute(
+        "SELECT finding_key, rule_id, match_text, context_text FROM pattern_finding_state "
+        "WHERE content_key IS NULL"
+    ).fetchall()
+    if rows:
+        conn.executemany(
+            "UPDATE pattern_finding_state SET content_key = ? WHERE finding_key = ?",
+            [
+                (
+                    content_key_for(
+                        str(r["rule_id"]), str(r["match_text"]), str(r["context_text"])
+                    ),
+                    str(r["finding_key"]),
+                )
+                for r in rows
+            ],
+        )
+    conn.commit()
+
+
 def init_db(hot_zone: str | None = None) -> sqlite3.Connection:
     """Initialise quality.db, creating schema if needed.
 
@@ -1040,6 +1077,7 @@ def init_db(hot_zone: str | None = None) -> sqlite3.Connection:
     _migrate_v8(conn)
     _migrate_v9(conn)
     _migrate_v10(conn)
+    _migrate_v11(conn)
     log.debug("quality.db initialised at %s", resolved)
     return conn
 
@@ -1744,6 +1782,27 @@ def pattern_findings_summary(
     return [dict(r) for r in rows]
 
 
+def content_key_for(rule_id: str, match_text: str, context_text: str) -> str:
+    """A finding's PATH-FREE identity: same rule, same match, same surroundings.
+
+    finding_key deliberately includes the path, because two different files can
+    legitimately carry the same match and adjudicating one must not waive the
+    other. That is right for identity and wrong for memory: moving or copying a
+    document changes every finding_key in it, so its entire adjudication history
+    is lost, and a gate that materialises a HEAD blob in a temp directory sees
+    every finding as unresolved (Finding K).
+
+    content_key is the second axis. It answers "has this exact finding been
+    adjudicated ANYWHERE", which is what survives a rename and what a gate needs
+    to ask. It never overrides a path-keyed disposition -- it only fills in when
+    the path-keyed one is still unresolved.
+    """
+    identity = json.dumps(
+        [rule_id, match_text, context_text], ensure_ascii=False, separators=(",", ":")
+    )
+    return "qc-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 def replace_pattern_scan_results(
     conn: sqlite3.Connection,
     scan_id: int,
@@ -1782,14 +1841,18 @@ def replace_pattern_scan_results(
     )
     conn.executemany(
         "INSERT INTO pattern_finding_state "
-        "(finding_key, rule_id, path, match_text, context_text, first_seen_scan_id, "
-        "last_seen_scan_id, scan_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?) "
+        "(finding_key, content_key, rule_id, path, match_text, context_text, "
+        "first_seen_scan_id, last_seen_scan_id, scan_count, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?) "
         "ON CONFLICT(finding_key) DO UPDATE SET "
+        "content_key=excluded.content_key, "
         "rule_id=excluded.rule_id, path=excluded.path, match_text=excluded.match_text, "
         "context_text=excluded.context_text, updated_at=excluded.updated_at",
         [
             (
-                f.finding_key, f.rule_id, f.path, f.match_text, f.context_text,
+                f.finding_key,
+                content_key_for(f.rule_id, f.match_text, f.context_text),
+                f.rule_id, f.path, f.match_text, f.context_text,
                 scan_id, scan_id, now,
             )
             for f in findings
@@ -1842,7 +1905,53 @@ def pattern_finding_states(
         rows = conn.execute(
             "SELECT * FROM pattern_finding_state ORDER BY rule_id, path, finding_key"
         ).fetchall()
-    return [dict(row) for row in rows]
+    return _apply_inherited_dispositions(conn, [dict(row) for row in rows])
+
+
+def _apply_inherited_dispositions(
+    conn: sqlite3.Connection, states: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    """Fill an unresolved finding's disposition from the same content elsewhere.
+
+    A path-keyed disposition always wins; this only speaks when the row is still
+    'unresolved'. That makes an adjudication survive a rename, a copy, and a gate
+    that materialises a HEAD blob under a temp path -- the cases where the bytes
+    and the judgement are unchanged and only the location moved (Finding K).
+
+    Every row carries disposition_source so a caller can tell an inherited
+    verdict from one made against this exact path, rather than the two being
+    indistinguishable.
+    """
+    unresolved = [
+        s for s in states
+        if s.get("disposition") == "unresolved" and s.get("content_key")
+    ]
+    for state in states:
+        state["disposition_source"] = "path"
+    if not unresolved:
+        return states
+    keys = sorted({str(s["content_key"]) for s in unresolved})
+    placeholders = ",".join("?" for _ in keys)
+    # MAX(adjudicated_at) picks the most recent judgement when the same content
+    # was adjudicated at more than one path.
+    inherited: dict[str, sqlite3.Row] = {}
+    for row in conn.execute(
+        f"SELECT content_key, disposition, note, adjudicated_at, path FROM pattern_finding_state "
+        f"WHERE content_key IN ({placeholders}) AND disposition != 'unresolved' "
+        "ORDER BY adjudicated_at",
+        keys,
+    ).fetchall():
+        inherited[str(row["content_key"])] = row
+    for state in unresolved:
+        row = inherited.get(str(state["content_key"]))
+        if row is None:
+            continue
+        state["disposition"] = row["disposition"]
+        state["note"] = row["note"]
+        state["adjudicated_at"] = row["adjudicated_at"]
+        state["disposition_source"] = "content"
+        state["inherited_from_path"] = row["path"]
+    return states
 
 
 def adjudicate_pattern_finding(

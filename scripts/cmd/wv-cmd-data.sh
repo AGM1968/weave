@@ -1,7 +1,7 @@
 #!/bin/bash
 # wv-cmd-data.sh — Data management commands
 #
-# Commands: batch, plan, enrich-topology, sync, load, prune, clean-ghosts, learnings, refs, import, search, reindex, trails (alias: breadcrumbs)
+# Commands: batch, plan, enrich-topology, sync, load, prune, clean-ghosts, commit-refs, learnings, refs, import, search, reindex, trails (alias: breadcrumbs)
 # Sourced by: wv entry point (after lib modules)
 # Dependencies: wv-config.sh, wv-db.sh, wv-validate.sh, wv-cache.sh
 
@@ -510,8 +510,41 @@ _sync_gh() {
     fi
     local _gh_log _gh_rc _retry_cmd
     _gh_log=$(mktemp "${TMPDIR:-/tmp}/weave-gh-sync.XXXXXX")
-    PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_gh "${gh_args[@]}" 2>&1 | tee "$_gh_log"
-    _gh_rc=${PIPESTATUS[0]}
+    # Suite-only hook: stand in for a SUCCEEDING GitHub step so the projection
+    # and stamping path below can be exercised at all. Offline the real call
+    # fails and this function returns early, which left the code that certifies
+    # a sync with no reachable test -- exactly where a failed projection was
+    # being certified as a completed sync.
+    #
+    # TWO gates, both required. Gating the bypass on the variable merely being
+    # NONEMPTY meant WV_TEST_SYNC_STUB=typo skipped GitHub entirely: the case
+    # set _gh_rc=1, and the GitHub-failure branch below returns 0, so the
+    # command reported local success having never contacted GitHub. Without
+    # WV_TEST_MODE=1 the hook is ignored and the real sync runs; with it, an
+    # unrecognised value is an error, never a bypass.
+    local _sync_stub=""
+    if [ -n "${WV_TEST_SYNC_STUB:-}" ]; then
+        if [ "${WV_TEST_MODE:-}" != "1" ]; then
+            echo -e "${YELLOW}⚠ WV_TEST_SYNC_STUB is set but WV_TEST_MODE=1 is not — ignoring it and syncing for real.${NC}" >&2
+        else
+            case "${WV_TEST_SYNC_STUB}" in
+                ok|fail:state|fail:nodes|fail:edges)
+                    _sync_stub="${WV_TEST_SYNC_STUB}"
+                    ;;
+                *)
+                    echo -e "${RED}Error: WV_TEST_SYNC_STUB='${WV_TEST_SYNC_STUB}' is not a recognised value (ok, fail:state, fail:nodes, fail:edges)${NC}" >&2
+                    rm -f "$_gh_log"
+                    return 1
+                    ;;
+            esac
+        fi
+    fi
+    if [ -n "$_sync_stub" ]; then
+        _gh_rc=0
+    else
+        PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_gh "${gh_args[@]}" 2>&1 | tee "$_gh_log"
+        _gh_rc=${PIPESTATUS[0]}
+    fi
     if [ "$_gh_rc" -ne 0 ]; then
         _retry_cmd="wv sync --gh"
         [ -n "$mode" ] && _retry_cmd="$_retry_cmd --mode=$mode"
@@ -528,17 +561,90 @@ _sync_gh() {
     fi
     rm -f "$_gh_log"
 
+    # Read the mutation counter BEFORE the dumps, not after. Recorded
+    # afterwards, a mutation landing between the dump and the record was
+    # certified as synced while sitting in no dump at all -- the graph then
+    # looked synced forever, since needs_sync compares against that number.
+    # Read first, the recorded value can only UNDERSTATE what the snapshot
+    # holds, and understating means "sync again", which is the safe direction.
+    local _sync_seq_before
+    _sync_seq_before=$(wv_mutation_seq "$WV_DB" 2>/dev/null || echo "")
+
     # GH sync modifies the in-memory DB — re-dump so git layer captures changes
     local tmp_sql2 tmp_nodes2 tmp_edges2
     tmp_sql2=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
     tmp_nodes2=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX")
     tmp_edges2=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX")
-    dump_state_sql "$WV_DB" "$tmp_sql2" && [ -s "$tmp_sql2" ] && mv "$tmp_sql2" "$WEAVE_DIR/state.sql" || rm -f "$tmp_sql2"
-    db_query_json "SELECT * FROM nodes;" 2>/dev/null | jq -c '.[]' > "$tmp_nodes2" 2>/dev/null && mv "$tmp_nodes2" "$WEAVE_DIR/nodes.jsonl" || rm -f "$tmp_nodes2"
-    db_query_json "SELECT * FROM edges;" 2>/dev/null | jq -c '.[]' > "$tmp_edges2" 2>/dev/null && mv "$tmp_edges2" "$WEAVE_DIR/edges.jsonl" || rm -f "$tmp_edges2"
+    # Every projection must land before either stamp is written.
+    #
+    # These were `cmd && [ -s ] && mv || rm -f`, and the trailing `rm` SUCCEEDS
+    # -- so a failed projection made the whole line exit 0 and the stamps went
+    # down anyway, certifying GitHub mutations that reached no file on disk.
+    # The nodes/edges forms are pipelines as well, whose status is jq's, so a
+    # failed db_query_json feeding a successful jq also reported success; they
+    # run under `pipefail` in a subshell now.
+    #
+    # `[ -s ]` guards state.sql only. An empty nodes.jsonl or edges.jsonl is a
+    # legitimate projection of a graph with no rows of that kind, so requiring
+    # bytes there would fail a correct sync.
+    local _dump_ok=true
+    if dump_state_sql "$WV_DB" "$tmp_sql2" \
+        && [ "$_sync_stub" != "fail:state" ] \
+        && [ -s "$tmp_sql2" ] \
+        && mv "$tmp_sql2" "$WEAVE_DIR/state.sql"; then
+        :
+    else
+        rm -f "$tmp_sql2" 2>/dev/null || true
+        _dump_ok=false
+    fi
+    if ( set -o pipefail; db_query_json "SELECT * FROM nodes;" 2>/dev/null | jq -c '.[]' > "$tmp_nodes2" 2>/dev/null ) \
+        && [ "$_sync_stub" != "fail:nodes" ] \
+        && mv "$tmp_nodes2" "$WEAVE_DIR/nodes.jsonl"; then
+        :
+    else
+        rm -f "$tmp_nodes2" 2>/dev/null || true
+        _dump_ok=false
+    fi
+    if ( set -o pipefail; db_query_json "SELECT * FROM edges;" 2>/dev/null | jq -c '.[]' > "$tmp_edges2" 2>/dev/null ) \
+        && [ "$_sync_stub" != "fail:edges" ] \
+        && mv "$tmp_edges2" "$WEAVE_DIR/edges.jsonl"; then
+        :
+    else
+        rm -f "$tmp_edges2" 2>/dev/null || true
+        _dump_ok=false
+    fi
+
+    if [ "$_dump_ok" != true ]; then
+        # A stamp outliving a failed projection is worse than no stamp: it
+        # asserts "everything through counter N is on disk" about bytes that
+        # were never written, and needs_sync then reads clean forever. Clear
+        # both and fail, so the caller syncs again.
+        rm -f "$WV_HOT_ZONE/.last_gh_sync" "$WV_HOT_ZONE/.last_gh_sync_seq" 2>/dev/null || true
+        echo -e "${RED}Error: could not project the graph to $WEAVE_DIR after GitHub sync — sync stamps cleared, run 'wv sync --gh' again${NC}" >&2
+        return 1
+    fi
 
     # Record GH sync timestamp for visibility in `wv status --json`
     date +%s > "$WV_HOT_ZONE/.last_gh_sync" 2>/dev/null || true
+    # Record the mutation counter too. A timestamp cannot answer "has the graph
+    # changed since this sync": it cannot see a DELETE, and MAX(updated_at) can
+    # even move backwards when the deleted row was the newest.
+    #
+    # Which counter gets recorded is bound to the snapshot that was actually
+    # persisted. Unchanged across the dumps means the snapshot IS that graph,
+    # so record the exact value; changed means the dumps raced a writer, so
+    # record the pre-dump value and let the next sync settle it. Neither branch
+    # can record a counter ahead of the bytes on disk.
+    local _sync_seq_after _sync_seq_record
+    _sync_seq_after=$(wv_mutation_seq "$WV_DB" 2>/dev/null || echo "")
+    _sync_seq_record=$(wv_mutation_seq_for_snapshot "$_sync_seq_before" "$_sync_seq_after")
+    if [ -n "$_sync_seq_record" ]; then
+        printf '%s\n' "$_sync_seq_record" > "$WV_HOT_ZONE/.last_gh_sync_seq" 2>/dev/null || true
+    else
+        # No readable counter: leave no stamp rather than a wrong one. An
+        # absent file already means "needs sync" downstream.
+        rm -f "$WV_HOT_ZONE/.last_gh_sync_seq" 2>/dev/null || true
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -661,7 +767,14 @@ cmd_sync() {
     # Step 2: Bidirectional GitHub sync if --gh flag or WV_GH_SYNC=1
     if [ "$gh_sync" = true ] || [ "${WV_GH_SYNC:-0}" = "1" ]; then
         [ "$_sync_journaled" = true ] && journal_step 2 "gh_sync"
-        _sync_gh "$dry_run" "$gh_mode" "$gh_node"
+        # A projection failure inside _sync_gh must reach the caller's exit
+        # status. Discarding it left `wv sync --gh` reporting success while it
+        # had just cleared its own stamps and told the user to run again --
+        # and every scripted caller read that 0 as "synced".
+        if ! _sync_gh "$dry_run" "$gh_mode" "$gh_node"; then
+            [ "$_sync_journaled" = true ] && journal_complete 2
+            return 1
+        fi
         [ "$_sync_journaled" = true ] && journal_complete 2
     fi
 
@@ -776,6 +889,43 @@ cmd_sync() {
 #
 # Safe to call on empty/missing config — clears quality_exempt and returns 0 (thresholds keep their
 # seeded defaults when both files are absent).
+# _quality_config_signature — content digest of both quality config layers.
+# Content, not mtime: a git checkout can restore an older config with a fresh
+# mtime, and a same-size edit can leave mtime unchanged within a filesystem's
+# timestamp granularity. Missing files hash as '-' so creating or deleting one
+# is itself a change.
+_quality_config_signature() {
+    local sig="" f
+    for f in "$WEAVE_DIR/quality.conf" "$WEAVE_DIR/quality.local.conf"; do
+        if [ -f "$f" ]; then
+            sig="${sig}$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1):"
+        else
+            sig="${sig}-:"
+        fi
+    done
+    printf '%s' "$sig"
+}
+
+# _ensure_quality_config_fresh — reload quality config when the files changed.
+#
+# wv-6657dd: the quality gate is a SQL trigger reading the quality_exempt TABLE,
+# but only _load_quality_config writes that table, and it ran solely from
+# cmd_load and _config_enable_test_gate. An exemption committed to quality.conf
+# after the last wv load was therefore unenforced, and wv done hard-blocked on a
+# path the project had already exempted — a false GraphPolicyViolation that
+# looks exactly like real debt. The stamp lives beside the DB in the hot zone,
+# so a rebuilt brain.db loses it and reloads, keeping the two in step.
+_ensure_quality_config_fresh() {
+    [ -n "${WV_HOT_ZONE:-}" ] || return 0
+    [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ] || return 0
+    local stamp="$WV_HOT_ZONE/.quality_conf_sig"
+    local current previous=""
+    current=$(_quality_config_signature)
+    [ -f "$stamp" ] && previous=$(cat "$stamp" 2>/dev/null || printf '')
+    [ "$current" = "$previous" ] && return 0
+    _load_quality_config || return 0
+}
+
 _load_quality_config() {
     local config_file="$WEAVE_DIR/quality.conf"
     local local_config_file="$WEAVE_DIR/quality.local.conf"
@@ -802,6 +952,45 @@ _load_quality_config() {
             "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES('test_gate', 2);" \
             2>/dev/null || true
     fi
+
+    # wv-6657dd: stamp what was just loaded so _ensure_quality_config_fresh can
+    # tell a current table from a stale one. Written here rather than in the
+    # freshness check so every load path — cmd_load, the test-gate config
+    # command — leaves the stamp consistent with the table.
+    if [ -n "${WV_HOT_ZONE:-}" ]; then
+        _quality_config_signature > "$WV_HOT_ZONE/.quality_conf_sig" 2>/dev/null || true
+    fi
+}
+
+# _quality_conf_declares_exempt — does the CONFIG (not the table) exempt this path?
+#
+# wv-6657dd: the safety net behind _ensure_quality_config_fresh. If a gate block
+# ever survives the reload, the reporter uses this to say so plainly rather than
+# presenting stale policy as real debt — the failure mode that previously cost a
+# refactor of an already-exempt file. Mirrors the table's matching rule: a
+# trailing '/' is a directory prefix, everything else is an exact path.
+_quality_conf_declares_exempt() {
+    local path="$1" file line pattern section
+    [ -n "$path" ] || return 1
+    for file in "$WEAVE_DIR/quality.conf" "$WEAVE_DIR/quality.local.conf"; do
+        [ -f "$file" ] || continue
+        section=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^\[([a-z_]+)\] ]]; then
+                section="${BASH_REMATCH[1]}"
+                continue
+            fi
+            [ "$section" = "exempt" ] || continue
+            pattern="${line%%#*}"
+            pattern="${pattern// /}"
+            [ -z "$pattern" ] && continue
+            case "$pattern" in
+                */) [[ "$path" == "$pattern"* ]] && return 0 ;;
+                *) [ "$path" = "$pattern" ] && return 0 ;;
+            esac
+        done < "$file"
+    done
+    return 1
 }
 
 # _parse_quality_conf_file — Internal helper: parse one quality conf file into DB.
@@ -1227,6 +1416,567 @@ cmd_clean_ghosts() {
     "
 
     echo -e "${GREEN}✓${NC} Deleted $ghost_count ghost edge(s)"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_commit_refs — Audit metadata.commit / metadata.commits provenance refs
+#
+# `wv done` records the SHAs whose messages carry the node's Weave-ID
+# (_store_node_commits) and unions the child SHAs onto the parent epic
+# (_aggregate_epic_commits). Both read the working clone at close time, so a
+# ref that is later amended, soft-reset, rebased or gc'd goes stale in place
+# and nothing notices. Finding wv-55d2de measured 97 stale refs across 118
+# nodes, the bulk of them auto-checkpoint commits a later checkpoint replaced.
+#
+# Classes are decided by reachability, not by existence alone:
+#   reachable   — an ancestor of the pushed branch. Durable provenance.
+#   pending     — reachable from some local ref but not yet from the pushed
+#                 branch: unpushed work, or work on another branch. NOT an
+#                 orphan — pushing or merging turns it into `reachable`.
+#   unreachable — the object exists but no ref reaches it: superseded by an
+#                 amend, reset or rebase. Orphan.
+#   missing     — not in the object database at all: gc'd, or recorded in a
+#                 different clone. Orphan.
+#
+# Auto-checkpoint commits stay recorded on purpose. While one survives it is
+# real provenance, and _node_commit_shas already sorts checkpoints behind
+# regular commits so the primary ref is never a checkpoint when a regular
+# commit exists. They are reported as their own kind instead, so the dominant
+# orphan population is visible without a second query.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# _commit_refs_pushed_ref — the ref that "pushed" means for this clone.
+# Prefers the configured upstream, then the conventional origin heads.
+# Returns 1 when no pushed ref exists (a clone with no remote), which puts the
+# sweep in degraded mode rather than reporting every local commit as an orphan.
+_commit_refs_pushed_ref() {
+    local up cand
+    up=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo "")
+    if [ -n "$up" ] && git rev-parse --verify --quiet "$up" >/dev/null 2>&1; then
+        printf '%s\n' "$up"
+        return 0
+    fi
+    for cand in origin/main origin/master; do
+        if git rev-parse --verify --quiet "$cand" >/dev/null 2>&1; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# _commit_refs_keep_live <json-array> — drop SHAs no ref reaches any more.
+#
+# "Live" here means reachable from ANY ref (or HEAD), not "pushed": a commit on
+# an unmerged branch is real provenance and must survive. That is the same
+# boundary the sweep draws between `pending` and `unreachable`, so the filter
+# and the report never disagree about a given SHA.
+#
+# Two git calls regardless of list length — `wv done` on a large epic
+# aggregates dozens of child refs, and a per-SHA merge-base/--contains probe
+# turned that into a per-close pile of subprocesses.
+#
+# Fails OPEN: when git cannot answer at all (no git, no repo, no HEAD) the
+# input is returned untouched. Silently discarding real provenance because the
+# clone was unavailable is a worse outcome than carrying a stale ref, which
+# `wv commit-refs` reports and `wv commit-refs --prune` removes deliberately.
+_commit_refs_keep_live() {
+    local shas_json="$1"
+    local live_file kept
+
+    command -v git >/dev/null 2>&1 || { printf '%s' "$shas_json"; return 0; }
+    git rev-parse --git-dir >/dev/null 2>&1 || { printf '%s' "$shas_json"; return 0; }
+    git rev-parse --verify --quiet HEAD >/dev/null 2>&1 || { printf '%s' "$shas_json"; return 0; }
+
+    live_file=$(mktemp "${TMPDIR:-/tmp}/wv-live-refs.XXXXXX") || { printf '%s' "$shas_json"; return 0; }
+    if ! git rev-list --all HEAD > "$live_file" 2>/dev/null; then
+        rm -f "$live_file"
+        printf '%s' "$shas_json"
+        return 0
+    fi
+
+    # Recorded refs may be abbreviated, so each is resolved to a full OID before
+    # being looked up in the reachable set.
+    kept=$(printf '%s' "$shas_json" | jq -r '.[]? // empty' 2>/dev/null \
+        | git cat-file --batch-check='%(objectname) %(objecttype)' --buffer 2>/dev/null \
+        | paste -d' ' <(printf '%s' "$shas_json" | jq -r '.[]? // empty' 2>/dev/null) - \
+        | awk -v live="$live_file" '
+            BEGIN { while ((getline l < live) > 0) { L[l] = 1 } }
+            NF >= 3 && $3 == "commit" && ($2 in L) { print $1 }
+          ' \
+        | jq -R . | jq -sc . 2>/dev/null)
+    rm -f "$live_file"
+
+    [ -n "$kept" ] || { printf '%s' "$shas_json"; return 0; }
+    printf '%s' "$kept"
+}
+
+# _commit_refs_scan <workdir> <pushed_ref> — classify every recorded ref.
+#
+# Writes "<node_id>\t<recorded_ref>\t<class>" to <workdir>/rows. Recorded refs
+# may be abbreviated (7 of them are, historically), so every ref is resolved
+# through `git cat-file --batch-check` first and classified on the full OID
+# while still being REPORTED in the form the node actually stores — a prune
+# that matched on the resolved form would not match the stored string.
+_commit_refs_scan() {
+    local workdir="$1" pushed_ref="$2"
+
+    db_query "
+        SELECT n.id || char(9) || j.value
+        FROM nodes n, json_each(json_extract(n.metadata, '\$.commits')) j
+        WHERE json_valid(n.metadata)
+          AND json_type(n.metadata, '\$.commits') = 'array'
+          AND j.type = 'text'
+        UNION
+        SELECT n.id || char(9) || json_extract(n.metadata, '\$.commit')
+        FROM nodes n
+        WHERE json_valid(n.metadata)
+          AND json_type(n.metadata, '\$.commit') = 'text';
+    " 2>/dev/null | awk -F'\t' '
+        # Structural filter ONLY. A hex-width pattern here silently DROPPED every
+        # ref it could not parse: junk vanished instead of being reported missing,
+        # and a SHA-256 repository (64-char OIDs) dropped every ref it had, so the
+        # sweep reported refs:0 orphaned:0 and doctor read it as clean. Let git
+        # decide what resolves; anything it cannot resolve is classified missing.
+        # Whitespace is still excluded because cat-file and the TSV are both
+        # line- and field-delimited, and a ref containing either would misalign
+        # the recorded-to-resolved pairing rather than merely fail to resolve.
+        NF == 2 && $2 != "" && $2 !~ /[ \t]/
+    ' | sort -u > "$workdir/pairs"
+
+    : > "$workdir/rows"
+    [ -s "$workdir/pairs" ] || return 0
+
+    cut -f2 "$workdir/pairs" | sort -u > "$workdir/refs"
+
+    # recorded -> resolved OID (or the "missing" marker), order-preserving.
+    git cat-file --batch-check='%(objectname) %(objecttype)' --buffer \
+        < "$workdir/refs" > "$workdir/check" 2>/dev/null || : > "$workdir/check"
+    if [ "$(wc -l < "$workdir/check")" != "$(wc -l < "$workdir/refs")" ]; then
+        # cat-file could not answer for this clone; treat every ref as unresolved
+        # rather than silently mis-pairing lines against each other.
+        awk '{print $1 " - missing"}' "$workdir/refs" > "$workdir/resolved"
+    else
+        paste -d' ' "$workdir/refs" "$workdir/check" > "$workdir/resolved"
+    fi
+
+    git rev-list --all HEAD 2>/dev/null | sort -u > "$workdir/anyref"
+    if [ -n "$pushed_ref" ]; then
+        git rev-list "$pushed_ref" 2>/dev/null | sort -u > "$workdir/pushed"
+    else
+        : > "$workdir/pushed"
+    fi
+
+    awk -v resolved="$workdir/resolved" -v anyref="$workdir/anyref" -v pushed="$workdir/pushed" '
+        BEGIN {
+            FS = "\t"
+            while ((getline line < resolved) > 0) {
+                n = split(line, f, " ")
+                if (n >= 3 && f[3] == "commit") { OID[f[1]] = f[2] }
+                else { OID[f[1]] = "" }
+            }
+            while ((getline line < anyref) > 0) { A[line] = 1 }
+            while ((getline line < pushed) > 0) { P[line] = 1 }
+        }
+        {
+            oid = OID[$2]
+            if (oid == "")        cls = "missing"
+            else if (oid in P)    cls = "reachable"
+            else if (oid in A)    cls = "pending"
+            else                  cls = "unreachable"
+            print $1 "\t" $2 "\t" cls
+        }
+    ' "$workdir/pairs" > "$workdir/rows"
+}
+
+# _commit_refs_print_detail <workdir> <rows-file> — print one line per ref,
+# tagged checkpoint / regular / unknown.
+#
+# Subjects are resolved in ONE batched `git log --stdin` rather than a call per
+# ref: `--all` over this repo's own graph is ~1900 refs, and the per-ref form
+# took 21s where the batched form takes under a second.
+# _commit_refs_kinds <workdir> <rows-file> — emit "<recorded_ref>\t<kind>",
+# kind being checkpoint | regular | unknown. Subjects are resolved in ONE
+# batched `git log --stdin`; a per-ref call took 21s over this graph.
+_commit_refs_kinds() {
+    local workdir="$1" src="$2"
+
+    awk 'NF >= 3 && $3 == "commit" { print $1 "\t" $2 }' "$workdir/resolved" > "$workdir/oidmap"
+    awk -F'\t' -v oidmap="$workdir/oidmap" '
+        BEGIN { while ((getline line < oidmap) > 0) { split(line, f, "\t"); M[f[1]] = f[2] } }
+        { if ($2 in M) print M[$2] }
+    ' "$src" | sort -u > "$workdir/kind_oids"
+
+    : > "$workdir/kind_subjects"
+    if [ -s "$workdir/kind_oids" ]; then
+        git log --no-walk --stdin --format='%H%x09%s' < "$workdir/kind_oids" \
+            > "$workdir/kind_subjects" 2>/dev/null || : > "$workdir/kind_subjects"
+    fi
+
+    awk -F'\t' -v oidmap="$workdir/oidmap" -v subjects="$workdir/kind_subjects" '
+        BEGIN {
+            while ((getline line < oidmap) > 0)   { split(line, f, "\t"); M[f[1]] = f[2] }
+            while ((getline line < subjects) > 0) { split(line, f, "\t"); S[f[1]] = f[2] }
+        }
+        {
+            kind = "unknown"
+            if ($2 in M) {
+                subject = S[M[$2]]
+                if (subject ~ /^chore\(weave\): auto-checkpoint/ ||
+                    subject ~ /^chore\(weave\): sync state/ ||
+                    subject ~ /^chore\(weave\): session-start state/) { kind = "checkpoint" }
+                else if (subject != "") { kind = "regular" }
+            }
+            print $2 "\t" kind
+        }
+    ' "$src"
+}
+
+_commit_refs_print_detail() {
+    local workdir="$1" src="$2"
+
+    awk 'NF >= 3 && $3 == "commit" { print $1 "\t" $2 }' "$workdir/resolved" > "$workdir/oidmap"
+
+    awk -F'\t' -v oidmap="$workdir/oidmap" '
+        BEGIN { while ((getline line < oidmap) > 0) { split(line, f, "\t"); M[f[1]] = f[2] } }
+        { if ($2 in M) print M[$2] }
+    ' "$src" | sort -u > "$workdir/detail_oids"
+
+    : > "$workdir/subjects"
+    if [ -s "$workdir/detail_oids" ]; then
+        git log --no-walk --stdin --format='%H%x09%s' < "$workdir/detail_oids" \
+            > "$workdir/subjects" 2>/dev/null || : > "$workdir/subjects"
+    fi
+
+    awk -F'\t' -v oidmap="$workdir/oidmap" -v subjects="$workdir/subjects" '
+        BEGIN {
+            while ((getline line < oidmap) > 0)   { split(line, f, "\t"); M[f[1]] = f[2] }
+            while ((getline line < subjects) > 0) { split(line, f, "\t"); S[f[1]] = f[2] }
+        }
+        {
+            kind = "unknown"
+            if ($2 in M) {
+                subject = S[M[$2]]
+                if (subject ~ /^chore\(weave\): auto-checkpoint/ ||
+                    subject ~ /^chore\(weave\): sync state/ ||
+                    subject ~ /^chore\(weave\): session-start state/) { kind = "checkpoint" }
+                else if (subject != "") { kind = "regular" }
+            }
+            printf "  %-12s %-40s %-11s %s\n", $1, $2, $3, kind
+        }
+    ' "$src"
+}
+
+# _commit_refs_prune_node <id> <drop-json-array> — remove the listed refs from
+# one node's metadata, repairing the primary `commit` pointer.
+#
+# Prunes wherever a ref is recorded, aggregating epics included. Aggregators
+# regenerate `commits` from their children (_aggregate_epic_commits), so an
+# epic-only edit does not persist while a child still carries the ref — this is
+# why cleanup has to reach the children, and why the prevention filter in the
+# aggregator is what stops the epic re-acquiring it afterwards.
+# The transformation is a SINGLE UPDATE, not a SELECT into jq and back. The
+# round-trip version rewrote the whole metadata object from a value read moments
+# earlier, so any concurrent write to an unrelated key on the same node — a
+# claim, a learning, a touch — was silently reverted by the prune, and the write
+# never advanced updated_at, leaving the row looking untouched to every
+# last-write-wins consumer (delta replay included).
+#
+# $kept is the surviving commits array, recomputed in-statement from the row's
+# own metadata. SQLite has no LATERAL, so it cannot be bound once in a FROM
+# subquery and reused; it is spelled out per branch instead.
+_commit_refs_prune_node() {
+    local id="$1" drop_json="$2"
+    local id_esc drop_esc kept
+
+    id_esc=$(sql_escape "$id")
+    drop_esc="${drop_json//\'/\'\'}"
+    kept="(SELECT json_group_array(je.value)
+            FROM json_each(json_extract(nodes.metadata, '\$.commits')) je
+            WHERE je.value NOT IN (SELECT dv.value FROM json_each('$drop_esc') dv))"
+
+    db_query "
+        UPDATE nodes SET
+          metadata = CASE
+            WHEN json_array_length($kept) = 0
+              -- Emptying the array does NOT authorise removing the primary: a
+              -- node can record a live \$.commit alongside an array holding only
+              -- dead refs, and dropping it there destroyed a reachable ref (three
+              -- of them, in the wv-3ce8d9 cleanup run). Remove the primary only
+              -- when the primary itself is being dropped.
+              THEN CASE
+                     WHEN json_extract(nodes.metadata, '\$.commit')
+                          IN (SELECT dv.value FROM json_each('$drop_esc') dv)
+                       THEN json_remove(nodes.metadata, '\$.commits', '\$.commit')
+                     ELSE json_remove(nodes.metadata, '\$.commits')
+                   END
+            WHEN json_extract(nodes.metadata, '\$.commit')
+                 IN (SELECT dv.value FROM json_each('$drop_esc') dv)
+              THEN json_set(nodes.metadata,
+                     '\$.commits', json($kept),
+                     '\$.commit',  json_extract($kept, '\$[0]'))
+            ELSE json_set(nodes.metadata, '\$.commits', json($kept))
+          END,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id='$id_esc';
+    " || return 1
+}
+
+cmd_commit_refs() {
+    # Hook VALIDATION runs before every branch, including the one taken when
+    # there are no orphans at all. Sitting inside the orphans-present branch, it
+    # accepted an unrecognised value silently on a clean sweep -- the ordinary
+    # case -- so "unknown values are rejected" held only when the data happened
+    # to exercise the path. Only the fault EXECUTION stays at the site it
+    # perturbs.
+    local _kinds_stub=false
+    if [ -n "${WV_TEST_FAIL_ORPHAN_KINDS:-}" ]; then
+        if [ "${WV_TEST_MODE:-}" != "1" ]; then
+            echo "wv commit-refs: WV_TEST_FAIL_ORPHAN_KINDS is set but WV_TEST_MODE=1 is not — ignoring it" >&2
+        elif [ "${WV_TEST_FAIL_ORPHAN_KINDS}" = "1" ]; then
+            _kinds_stub=true
+        else
+            echo "wv commit-refs: WV_TEST_FAIL_ORPHAN_KINDS='${WV_TEST_FAIL_ORPHAN_KINDS}' is not a recognised value (1)" >&2
+            return 1
+        fi
+    fi
+
+    local format="text" prune=false dry_run=false show_all=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json)    format="json" ;;
+            --prune)   prune=true ;;
+            --dry-run) dry_run=true ;;
+            --all)     show_all=true ;;
+            --help|-h) cmd_help commit-refs; return 0 ;;
+            *) echo "wv commit-refs: unknown argument: $1" >&2; return 2 ;;
+        esac
+        shift
+    done
+
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        echo "wv commit-refs: not a git repository — nothing to verify refs against" >&2
+        return 1
+    fi
+
+    local pushed_ref degraded=false
+    pushed_ref=$(_commit_refs_pushed_ref) || { pushed_ref=""; degraded=true; }
+
+    local workdir
+    workdir=$(mktemp -d "${TMPDIR:-/tmp}/wv-commit-refs.XXXXXX") || return 1
+
+    _commit_refs_scan "$workdir" "$pushed_ref"
+
+    local total reachable pending unreachable missing orphan_nodes
+    total=$(wc -l < "$workdir/rows" | tr -d ' ')
+    reachable=$(awk -F'\t' '$3=="reachable"' "$workdir/rows" | wc -l | tr -d ' ')
+    pending=$(awk -F'\t' '$3=="pending"' "$workdir/rows" | wc -l | tr -d ' ')
+    unreachable=$(awk -F'\t' '$3=="unreachable"' "$workdir/rows" | wc -l | tr -d ' ')
+    missing=$(awk -F'\t' '$3=="missing"' "$workdir/rows" | wc -l | tr -d ' ')
+
+    awk -F'\t' '$3=="unreachable" || $3=="missing"' "$workdir/rows" | sort > "$workdir/orphans"
+    orphan_nodes=$(cut -f1 "$workdir/orphans" | sort -u | wc -l | tr -d ' ')
+
+    # Split the orphan population by kind. Auto-checkpoint refs are superseded
+    # constantly and are the designed steady state; a REGULAR ref going
+    # unreachable is a real provenance loss. Reporting one number for both let
+    # expected churn sit as a permanent warning, which is how a genuine loss
+    # would have gone unnoticed among it.
+    local orphan_ckpt=0 orphan_reg=0 orphan_unknown=0 _kinds_rc=0
+    if [ -s "$workdir/orphans" ]; then
+        # Force the classifier to fail as a whole: a branch unreachable from the
+        # CLI, since it only fails on an unreadable workdir it created itself,
+        # and an untestable fail-open is what put that defect here. Validation
+        # of the hook happened at the top of this function; only the fault
+        # itself belongs here.
+        _kinds_rc=0
+        if [ "$_kinds_stub" = true ]; then
+            : > "$workdir/orphan_kinds"
+            _kinds_rc=1
+        else
+            _commit_refs_kinds "$workdir" "$workdir/orphans" > "$workdir/orphan_kinds" 2>/dev/null || _kinds_rc=$?
+        fi
+        if [ "$_kinds_rc" -ne 0 ]; then
+            # Classification failed as a whole. The previous fallback emptied
+            # the file, which zeroed all three counters -- so a sweep holding
+            # orphans reported "0 checkpoint, 0 regular, 0 unknown", the exact
+            # shape of a clean run. The one number that would have shown a
+            # genuine provenance loss was the number the failure erased.
+            # Attribute the whole population to unknown instead: conservative,
+            # and it still says there is something here to look at.
+            awk -F'\t' '{ print $2 "\tunknown" }' "$workdir/orphans" > "$workdir/orphan_kinds" 2>/dev/null \
+                || : > "$workdir/orphan_kinds"
+            echo "wv commit-refs: could not classify orphan refs by kind; counting them all as unknown" >&2
+        fi
+        orphan_ckpt=$(awk -F'\t' '$2=="checkpoint"' "$workdir/orphan_kinds" | wc -l | tr -d ' ')
+        orphan_reg=$(awk -F'\t' '$2=="regular"' "$workdir/orphan_kinds" | wc -l | tr -d ' ')
+        orphan_unknown=$(awk -F'\t' '$2=="unknown"' "$workdir/orphan_kinds" | wc -l | tr -d ' ')
+
+        # Reconcile against the orphan population. Every orphan row is
+        # classified into exactly one of the three kinds, so the three counts
+        # must sum to the row total. A partial emission -- the classifier dying
+        # mid-write, which leaves a nonzero exit AND a short file, or succeeding
+        # with fewer rows than it read -- otherwise under-reports silently, the
+        # same fail-open in a smaller size. Charge any shortfall to unknown.
+        local orphan_rows orphan_classified
+        orphan_rows=$(wc -l < "$workdir/orphans" | tr -d ' ')
+        orphan_classified=$((orphan_ckpt + orphan_reg + orphan_unknown))
+        if [ "${orphan_rows:-0}" -gt "$orphan_classified" ]; then
+            orphan_unknown=$((orphan_unknown + orphan_rows - orphan_classified))
+            echo "wv commit-refs: $((orphan_rows - orphan_classified)) orphan ref(s) could not be classified; counted as unknown" >&2
+        fi
+    fi
+
+    local detail_src="$workdir/orphans"
+    [ "$show_all" = true ] && { sort "$workdir/rows" > "$workdir/detail"; detail_src="$workdir/detail"; }
+
+    # ── Prune runs BEFORE the report so the report can state what happened ────
+    # (a --json consumer could not otherwise tell a persisted prune from an
+    # unpersisted one: the disclosure used to be text-only.)
+    local rc=0 pruned=0 failed=0 persisted=not_attempted
+    if [ "$prune" = true ] && [ -s "$workdir/orphans" ] && [ "$dry_run" != true ]; then
+        # Ensure change tracking EXISTS before mutating. An absent _warp_changes
+        # is not an empty one: auto_sync would recreate the table after the
+        # untracked UPDATE, then see no pending rows and report a clean sync
+        # while state.sql never moved.
+        if declare -f wv_delta_init >/dev/null 2>&1; then
+            sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT 1 FROM _warp_changes LIMIT 0;" >/dev/null 2>&1 \
+                || wv_delta_init "$WV_DB" >/dev/null 2>&1 || true
+        fi
+
+        local state_file="$WEAVE_DIR/state.sql" state_before="" state_after=""
+        state_before=$(md5sum "$state_file" 2>/dev/null | awk '{print $1}')
+
+        local node drops
+        while IFS= read -r node; do
+            drops=$(awk -F'\t' -v n="$node" '$1==n {print $2}' "$workdir/orphans" | jq -R . | jq -sc .)
+            if _commit_refs_prune_node "$node" "$drops"; then
+                pruned=$((pruned + 1))
+            else
+                failed=$((failed + 1))
+                echo "wv commit-refs: failed to prune $node" >&2
+            fi
+        done < <(cut -f1 "$workdir/orphans" | sort -u)
+
+        # Persistence is proved against the AUTHORITATIVE snapshot. A drained
+        # change log is not proof — with tracking absent it is vacuously empty,
+        # and auto_sync returns 0 from five separate skip paths besides.
+        if [ "${WV_AUTO_SYNC:-1}" = "0" ] || [ -n "${WV_DB_CUSTOM:-}" ] || [ -n "${_WV_IN_JOURNAL:-}" ]; then
+            persisted=skipped
+        else
+            auto_sync --force >/dev/null 2>&1 || true
+            state_after=$(md5sum "$state_file" 2>/dev/null | awk '{print $1}')
+            if [ -n "$state_after" ] && [ "$state_before" != "$state_after" ]; then
+                persisted=true
+            else
+                persisted=false
+            fi
+        fi
+        { [ "$failed" -gt 0 ] || [ "$persisted" = false ]; } && rc=1
+    elif [ "$prune" = true ] && [ -s "$workdir/orphans" ]; then
+        persisted=dry_run
+    elif [ "$prune" = true ]; then
+        persisted=nothing_to_prune
+    fi
+
+    if [ "$format" = "json" ]; then
+        # The rows go to jq through a FILE, never through an argv-sized argument:
+        # --argjson with this repository's ~1900 refs blows the per-argument limit
+        # (E2BIG), and the old form swallowed it, exiting 0 with empty stdout.
+        if ! awk -F'\t' '{print $1 "\t" $2 "\t" $3}' "$detail_src" \
+            | jq -R -s '
+                [ split("\n")[] | select(length > 0) | split("\t")
+                  | {node: .[0], ref: .[1], class: .[2]} ]' > "$workdir/refs.json" 2>/dev/null; then
+            echo "wv commit-refs: failed to serialize ref rows" >&2
+            rm -rf "$workdir"
+            return 1
+        fi
+        if ! jq -n \
+            --arg pushed "${pushed_ref:-}" \
+            --arg persisted "$persisted" \
+            --argjson degraded "$([ "$degraded" = true ] && echo true || echo false)" \
+            --argjson total "${total:-0}" \
+            --argjson reachable "${reachable:-0}" \
+            --argjson pending "${pending:-0}" \
+            --argjson unreachable "${unreachable:-0}" \
+            --argjson missing "${missing:-0}" \
+            --argjson orphan_nodes "${orphan_nodes:-0}" \
+            --argjson orphan_ckpt "${orphan_ckpt:-0}" \
+            --argjson orphan_reg "${orphan_reg:-0}" \
+            --argjson orphan_unknown "${orphan_unknown:-0}" \
+            --argjson pruned "${pruned:-0}" \
+            --argjson prune_failed "${failed:-0}" \
+            --slurpfile refs "$workdir/refs.json" \
+            '{
+                pushed_ref: (if $pushed == "" then null else $pushed end),
+                degraded: $degraded,
+                totals: {
+                    refs: $total,
+                    reachable: $reachable,
+                    pending: $pending,
+                    unreachable: $unreachable,
+                    missing: $missing,
+                    orphaned: ($unreachable + $missing),
+                    orphaned_nodes: $orphan_nodes,
+                    orphaned_checkpoint: $orphan_ckpt,
+                    orphaned_regular: $orphan_reg,
+                    orphaned_unknown: $orphan_unknown
+                },
+                prune: {
+                    attempted: ($persisted != "not_attempted"),
+                    nodes_pruned: $pruned,
+                    nodes_failed: $prune_failed,
+                    persisted: $persisted
+                },
+                refs: ($refs[0] // [])
+            }'; then
+            echo "wv commit-refs: failed to render JSON output" >&2
+            rm -rf "$workdir"
+            return 1
+        fi
+    else
+        echo "Commit-ref provenance — ${total} recorded ref(s)"
+        if [ "$degraded" = true ]; then
+            echo -e "  ${YELLOW}⊘${NC} no pushed ref (no upstream, origin/main or origin/master) — 'pending' cannot be distinguished from 'reachable'"
+        else
+            echo "  pushed ref: $pushed_ref"
+        fi
+        echo "  reachable:   $reachable (ancestor of the pushed ref)"
+        echo "  pending:     $pending (local only — not pushed yet, or on another branch)"
+        echo "  unreachable: $unreachable (object exists, no ref reaches it — superseded)"
+        echo "  missing:     $missing (not in this object database)"
+        if [ "$((unreachable + missing))" -gt 0 ]; then
+            echo -e "  ${YELLOW}⚠${NC} $((unreachable + missing)) orphaned ref(s) across $orphan_nodes node(s)"
+        else
+            echo -e "  ${GREEN}✓${NC} no orphaned refs"
+        fi
+        if [ -s "$detail_src" ]; then
+            echo ""
+            _commit_refs_print_detail "$workdir" "$detail_src"
+        fi
+    fi
+
+    if [ "$prune" = true ] && [ "$format" = "text" ]; then
+        case "$persisted" in
+            nothing_to_prune)
+                echo -e "\n${GREEN}✓${NC} nothing to prune" ;;
+            dry_run)
+                echo -e "\n${YELLOW}Would prune $((unreachable + missing)) ref(s) from $orphan_nodes node(s)${NC}" ;;
+            true)
+                echo -e "\n${GREEN}✓${NC} pruned orphaned refs from $pruned node(s) and persisted" ;;
+            skipped)
+                echo -e "\n${GREEN}✓${NC} pruned orphaned refs from $pruned node(s) (auto-sync disabled — persist with: wv sync)" ;;
+        esac
+        [ "$failed" -gt 0 ] && echo -e "${RED}✗${NC} $failed node(s) failed to prune"
+    fi
+    if [ "$persisted" = false ]; then
+        echo "wv commit-refs: pruned $pruned node(s) but .weave/state.sql did not change — NOT persisted" >&2
+        echo "  The hot DB is ahead of the git layer; a wv load would restore the refs. Run: wv sync" >&2
+    fi
+
+    rm -rf "$workdir"
+    return "$rc"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2290,8 +3040,10 @@ cmd_refs() {
         shift
     done
 
-    # Read from stdin if no input yet
-    if [ -z "$input" ] && [ ! -t 0 ]; then
+    # Read from stdin if no input yet. stdin_has_input, not [ ! -t 0 ]: a
+    # non-terminal fd 0 is not the same thing as input, and an inherited idle
+    # pipe blocked here forever (wv-f541e1).
+    if [ -z "$input" ] && stdin_has_input; then
         input=$(cat)
     fi
 
@@ -2394,6 +3146,12 @@ cmd_batch() {
             return 1
         fi
         input_source="$file"
+    elif ! stdin_has_input; then
+        # Without a file the loop below reads /dev/stdin, which blocks forever
+        # on a terminal or an inherited idle pipe (wv-f541e1).
+        echo -e "${RED}Error: no input on stdin${NC}" >&2
+        echo "Usage: wv batch <file> | wv batch < commands.txt" >&2
+        return 1
     fi
 
     db_ensure
@@ -2404,8 +3162,10 @@ cmd_batch() {
     local skipped=0
 
     while IFS= read -r line; do
-        # Skip empty lines and comments
-        [[ -z "$line" ]] && continue
+        # Skip blank lines and comments. Whitespace-only counts as blank: a line
+        # of spaces survived `[ -z ]`, ran a bare `wv`, printed the help text and
+        # was counted as a succeeded command (wv-2c5615).
+        [[ -z "${line//[[:space:]]/}" ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
 
         total=$((total + 1))
@@ -2434,6 +3194,17 @@ cmd_batch() {
             fi
         fi
     done < "$input_source"
+
+    # An empty stream, an empty file and a comments-only file all reached the
+    # summary with nothing executed, and "0 succeeded, 0 failed (of 0)" with
+    # rc 0 certified that no-op as success (wv-2c5615). Nothing ran, so nothing
+    # is proven — the idle-pipe guard above only covers a stream that never
+    # opens, not one that opens empty.
+    if [ "$total" -eq 0 ]; then
+        echo -e "${RED}Error: no commands to execute${NC}" >&2
+        echo "Usage: wv batch <file> | wv batch < commands.txt" >&2
+        return 1
+    fi
 
     echo ""
     if [ "$dry_run" = true ]; then
@@ -2561,11 +3332,13 @@ cmd_import() {
         if [ "$dry_run" = true ]; then
             echo -e "${YELLOW}Would import:${NC} $id → $new_id: $text"
         else
-            # Escape for SQL
-            text="${text//\'/\'\'}"
-            metadata="${metadata//\'/\'\'}"
-            
-            db_query "INSERT OR IGNORE INTO nodes (id, text, status, metadata) VALUES ('$new_id', '$text', '$status', '$metadata');"
+            # Escape for SQL into separate variables — wv-360528: escaping in
+            # place made the confirmation below print doubled apostrophes, the
+            # same leak cmd_add had.
+            local sql_text="${text//\'/\'\'}"
+            local sql_metadata="${metadata//\'/\'\'}"
+
+            db_query "INSERT OR IGNORE INTO nodes (id, text, status, metadata) VALUES ('$new_id', '$sql_text', '$status', '$sql_metadata');"
             echo -e "${GREEN}✓${NC} $id → $new_id: $text"
         fi
         
@@ -2916,11 +3689,14 @@ cmd_trails() {
     local action="${1:-show}"
     shift || true
     local message="" entry_json="" target_id=""
+    # Track which flags were *given*, not just which are non-empty: `--json=` with
+    # a malformed value must be rejected, not silently treated as absent (Finding M).
+    local message_given=0 json_given=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --message=*|--msg=*) message="${1#*=}" ;;
-            --json=*) entry_json="${1#*=}" ;;
+            --message=*|--msg=*) message="${1#*=}"; message_given=1 ;;
+            --json=*) entry_json="${1#*=}"; json_given=1 ;;
             save|show|clear|capsule) action="$1" ;;
             wv-*) target_id="$1" ;;
         esac
@@ -2929,6 +3705,18 @@ cmd_trails() {
 
     local trail_file="$WEAVE_DIR/trails.md"
     local legacy_file="$WEAVE_DIR/breadcrumbs.md"
+
+    # One flag name must not carry opposite contracts on sibling subcommands
+    # (Finding M): --json belongs to capsule, --message to save. A flag given to
+    # the wrong subcommand is an error, never a silent no-op.
+    if [ "$json_given" -eq 1 ] && [ "$action" != "capsule" ]; then
+        echo -e "${RED}Error: --json is only valid for 'wv trails capsule <id>'; 'wv trails $action' takes --message=\"...\"${NC}" >&2
+        return 1
+    fi
+    if [ "$message_given" -eq 1 ] && [ "$action" != "save" ]; then
+        echo -e "${RED}Error: --message is only valid for 'wv trails save'; 'wv trails $action' takes --json='{...}'${NC}" >&2
+        return 1
+    fi
 
     case "$action" in
         capsule)
@@ -3009,6 +3797,30 @@ _trails_append() {
     echo -e "${GREEN}✓${NC} Trail entry appended to $id ($count total)"
 }
 
+# _trails_release_lock — drop whichever lock _trails_save acquired. Only one
+# mechanism is ever held, so exactly one branch applies.
+_trails_release_lock() {
+    local fd="$1" dir="$2"
+    if [ -n "$fd" ]; then
+        eval "exec ${fd}>&-" 2>/dev/null || true
+    elif [ -n "$dir" ]; then
+        rmdir "$dir" 2>/dev/null || true
+    fi
+}
+
+# _tr_flatten — collapse a free-form value to a single line for a generated row.
+#
+# Node text and learning fields are author-controlled and reach these rows
+# verbatim. A value carrying a NEWLINE emits extra lines into the generated
+# region, so a node whose text contained "## Health" forged a section heading
+# there: it satisfied a structure check that should have failed, and it ended
+# the row count of the section it appeared in early, which fails the save
+# outright. Every row starts with "- **", so once a value is single-line it can
+# no longer begin a line with "## " or a reserved marker.
+_tr_flatten() {
+    printf '%s' "$1" | tr '\n\r\t' '   ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
+}
+
 _trails_save() {
     local breadcrumb_file="$1"
     local message="$2"
@@ -3021,17 +3833,171 @@ _trails_save() {
 
     mkdir -p "$(dirname "$breadcrumb_file")"
 
-    {
+    # ── Serialise the whole read-modify-write ────────────────────────
+    # This function reads the existing notes, rebuilds the file and rewrites it.
+    # Unserialised, concurrent saves each read the same prior state and the last
+    # writer wins: a 20-way probe retained 1 of 20 notes. The lock is held
+    # across read, build and write, and the write itself is an atomic rename so
+    # no reader observes a half-written file.
+    local _tr_lock="${breadcrumb_file}.lock"
+    local _tr_lock_fd="" _tr_lock_dir=""
+    # Fail closed: a timed-out flock must fall back to the directory lock, never
+    # continue unlocked. An earlier -w 15 with `|| true` did exactly that and
+    # still lost 5 of 20 concurrent notes, because each save holds the lock for
+    # the graph queries below and 20 of them do not fit in 15s.
+    local _tr_lock_wait="${WV_TRAILS_LOCK_WAIT:-120}"
+    [[ "$_tr_lock_wait" =~ ^[0-9]+$ ]] && [ "$_tr_lock_wait" -gt 0 ] || _tr_lock_wait=120
+    # Exactly ONE mechanism is used, chosen by availability before any process
+    # participates. Falling back from a timed-out flock to a directory lock made
+    # the two independent: the waiter took the directory lock and wrote while the
+    # original flock holder was still live. A timeout is contention, not a licence
+    # to proceed, so it fails and the caller retries.
+    if command -v flock >/dev/null 2>&1; then
+        if ! exec {_tr_lock_fd}>"$_tr_lock" 2>/dev/null; then
+            echo -e "${RED}Error: cannot open trails lock $_tr_lock${NC}" >&2
+            return 1
+        fi
+        if ! flock -w "$_tr_lock_wait" "$_tr_lock_fd" 2>/dev/null; then
+            eval "exec ${_tr_lock_fd}>&-" 2>/dev/null || true
+            echo -e "${RED}Error: another trails save held the lock for more than ${_tr_lock_wait}s; nothing was written${NC}" >&2
+            return 1
+        fi
+    else
+        # No flock: a directory lock, never reclaimed on timeout. Removing a lock
+        # whose owner has not been proven dead evicts a live writer.
+        _tr_lock_dir="${_tr_lock}.d"
+        local _tr_spin=0 _tr_spin_max=$((_tr_lock_wait * 20))
+        while ! mkdir "$_tr_lock_dir" 2>/dev/null; do
+            _tr_spin=$((_tr_spin + 1))
+            if [ "$_tr_spin" -gt "$_tr_spin_max" ]; then
+                _tr_lock_dir=""
+                echo -e "${RED}Error: another trails save held the lock for more than ${_tr_lock_wait}s; nothing was written${NC}" >&2
+                echo -e "${YELLOW}  If no save is running, remove the stale lock: rmdir ${_tr_lock}.d${NC}" >&2
+                return 1
+            fi
+            sleep 0.05
+        done
+    fi
+
+    # ── Notes are append-only (Finding M) ────────────────────────────────────
+    # Every other section of this file is regenerated from the graph, so Notes
+    # holds the only content a save cannot reconstruct. Rewriting the file with
+    # just the new message destroyed committed handoffs, including a session's
+    # own CRASH RECOVERY note when a second save followed the first.
+    # A note body is free-form markdown and may contain anything, including the
+    # delimiters used here. Two rules keep that from truncating the section:
+    #   - on write, any line that would collide with a reserved marker is
+    #     neutralised with a single leading space (renders identically);
+    #   - on read, the section ends at the LAST end marker in the file, since
+    #     every generated marker is written after all note bodies.
+    # Files written before the marker existed fall back to matching the
+    # generated headings exactly ('## Blocked-looking note' is not one of them).
+    # Completion records. `wv done` appends "## <date> — Completed <label>" to
+    # the END of this file, below everything the generator writes. A save
+    # regenerated the file and carried over the Notes block ALONE, so every
+    # completion record was dropped -- and unlike Notes, they are not
+    # reconstructable from the graph in the form they were written. A single
+    # probe save in this repository destroyed 85 of them (647a6d48). They are
+    # captured here and re-appended after the generated body is validated.
+    local prior_completions=""
+    if [ -f "$breadcrumb_file" ]; then
+        prior_completions=$(awk '
+            /^## [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} (—|--) Completed / { found = 1 }
+            found { print }
+        ' "$breadcrumb_file" 2>/dev/null || true)
+    fi
+
+    local prior_notes=""
+    if [ -f "$breadcrumb_file" ]; then
+        if grep -q '^<!-- /wv-notes -->$' "$breadcrumb_file"; then
+            local _end_line
+            _end_line=$(grep -n '^<!-- /wv-notes -->$' "$breadcrumb_file" | tail -1 | cut -d: -f1)
+            prior_notes=$(awk -v endl="$_end_line" '
+                NR >= endl                 { exit }
+                /^## Notes[[:space:]]*$/   { inn = 1; next }
+                inn                        { print }
+            ' "$breadcrumb_file" | sed -e '/./,$!d')
+        else
+            prior_notes=$(awk '
+                /^## Notes[[:space:]]*$/                         { inn = 1; next }
+                inn && /^## (Active Work|Recent Learnings|Health)$/ { inn = 0 }
+                inn && /^## Ready Work \([0-9]+ unblocked\)$/     { inn = 0 }
+                inn && /^## Blocked \([0-9]+\)$/                  { inn = 0 }
+                inn                                              { print }
+            ' "$breadcrumb_file" | sed -e '/./,$!d')
+        fi
+    fi
+    # Notes written before this release carry no entry marker; label them so
+    # they stay attributable once newer entries are stacked above.
+    if [ -n "$prior_notes" ] && ! printf '%s\n' "$prior_notes" | grep -q '^<!-- wv-note -->$'; then
+        prior_notes=$(printf '<!-- wv-note -->\n### (undated, saved before notes became append-only)\n\n%s' "$prior_notes")
+    fi
+
+    # Bounded growth: keep the newest N entries, the new one included. Entries
+    # are counted by their generated marker, never by '### ' headings — a note
+    # body may contain its own subheadings and must not be split across the cap.
+    local notes_cap="${WV_TRAILS_NOTES_CAP:-20}"
+    [[ "$notes_cap" =~ ^[0-9]+$ ]] && [ "$notes_cap" -gt 0 ] || notes_cap=20
+
+    local notes_body=""
+    if [ -n "$message" ]; then
+        # Neutralise reserved markers appearing in the note text itself.
+        local safe_message
+        safe_message=$(printf '%s\n' "$message" | sed -e 's|^<!-- /wv-notes -->$| <!-- /wv-notes -->|' -e 's|^<!-- wv-note -->$| <!-- wv-note -->|')
+        notes_body=$(printf '<!-- wv-note -->\n### %s\n\n%s' "$(date '+%Y-%m-%d %H:%M:%S')" "$safe_message")
+    fi
+    if [ -n "$prior_notes" ]; then
+        local keep="$notes_cap"
+        [ -n "$message" ] && keep=$((notes_cap - 1))
+        local kept=""
+        if [ "$keep" -gt 0 ]; then
+            kept=$(printf '%s\n' "$prior_notes" | awk -v cap="$keep" '
+                /^<!-- wv-note -->$/ { n++; if (n > cap) exit }
+                                     { print }
+            ' | sed -e '/./,$!d')
+        fi
+        if [ -n "$kept" ]; then
+            if [ -n "$notes_body" ]; then
+                notes_body=$(printf '%s\n\n%s' "$notes_body" "$kept")
+            else
+                notes_body="$kept"
+            fi
+        fi
+    fi
+
+    local _tr_tmp="${breadcrumb_file}.tmp.$$" _tr_write_rc=0
+    local _TR_EOF_SENTINEL="<!-- wv-trails-complete -->"
+    # GENERATE, then write ONCE. Earlier attempts keyed on the exit status of a
+    # redirected group or subshell; both report only their LAST command, so an
+    # earlier failed write followed by successful output still returned 0.
+    # `set -e` inside the subshell does not fix it either: measured here, errexit
+    # reads as ON via `$-` inside the subshell, a bare `false` runs, and
+    # execution CONTINUES — bash suppresses errexit for the dynamic extent of a
+    # command invoked in a condition context and subshells inherit that
+    # suppression whatever they set themselves. So the status of a multi-write
+    # body is not trustworthy in this codebase, by construction.
+    #
+    # A single write has an unambiguous status, and its byte count is checkable
+    # against the content that was supposed to land. Generation failures degrade
+    # to shorter content, which the length check catches.
+    local _tr_body _tr_bytes
+    _tr_body=$(
+        _tr_sections=""
         echo "# Session Trails"
         echo ""
         echo "_Saved: $(date '+%Y-%m-%d %H:%M:%S')_"
         echo ""
 
-        # Custom message
-        if [ -n "$message" ]; then
+        # Notes — newest entry first, older entries preserved beneath it.
+        # The closing marker delimits free-form note text from the generated
+        # sections below, so the next save can read it back without guessing.
+        if [ -n "$notes_body" ]; then
+            _tr_sections="${_tr_sections}${_tr_sections:+|}## Notes"
             echo "## Notes"
             echo ""
-            echo "$message"
+            printf '%s\n' "$notes_body"
+            echo ""
+            echo "<!-- /wv-notes -->"
             echo ""
         fi
 
@@ -3043,19 +4009,22 @@ _trails_save() {
         " 2>/dev/null)
         local active_count
         active_count=$(echo "$active_nodes" | jq 'length' 2>/dev/null || echo "0")
-        active_count="${active_count:-0}"
+        # Same normalisation as the other three counts, replacing a ${x:-0}
+        # default plus a 2>/dev/null that hid the error instead of preventing it.
+        [[ "$active_count" =~ ^[0-9]+$ ]] || active_count=0
 
-        if [ "$active_count" -gt 0 ] 2>/dev/null && [ "$active_count" != "0" ]; then
+        if [ "$active_count" -gt 0 ]; then
+            _tr_sections="${_tr_sections}${_tr_sections:+|}## Active Work@@$active_count"
             echo "## Active Work"
             echo ""
             echo "$active_nodes" | jq -c '.[]' | while read -r row; do
                 local nid ntext ntype
                 nid=$(echo "$row" | jq -r '.id')
-                ntext=$(echo "$row" | jq -r '.text')
+                ntext=$(_tr_flatten "$(echo "$row" | jq -r '.text')")
                 local meta_raw
                 meta_raw=$(echo "$row" | jq -r '.metadata // "{}"')
                 [[ "$meta_raw" != "{"* ]] && meta_raw=$(echo "$meta_raw" | jq -r '.' 2>/dev/null || echo "{}")
-                ntype=$(echo "$meta_raw" | jq -r '.type // "task"' 2>/dev/null)
+                ntype=$(_tr_flatten "$(echo "$meta_raw" | jq -r '.type // "task"' 2>/dev/null)")
                 echo "- **$nid** ($ntype): $ntext"
             done
             echo ""
@@ -3064,15 +4033,29 @@ _trails_save() {
         # Ready work (unblocked)
         local ready_count
         ready_count=$(cmd_ready --count 2>/dev/null || echo "0")
+        # `|| echo 0` only covers a FAILING command. cmd_ready can succeed and
+        # print nothing (fresh repo), and the empty value then reaches [ -gt ]
+        # as 'integer expression expected' on stderr and as a blank in Health.
+        [[ "$ready_count" =~ ^[0-9]+$ ]] || ready_count=0
         if [ "$ready_count" -gt 0 ]; then
+            local ready_nodes ready_shown
+            ready_nodes=$(cmd_ready --json 2>/dev/null || echo "[]")
+            # The heading states the TOTAL ready count while the body is capped
+            # at ten rows. The manifest must record what will be EMITTED, not the
+            # total, or every repo with more than ten ready nodes fails its own
+            # completeness check and `wv trails save` writes nothing — which is
+            # what this repository did at 19 ready. The count is still derived
+            # from the data rather than from the echo succeeding, so a failed row
+            # write is still detected.
+            ready_shown=$(printf '%s' "$ready_nodes" | jq -c '.[]' 2>/dev/null | head -10 | wc -l | tr -d ' ')
+            [[ "$ready_shown" =~ ^[0-9]+$ ]] || ready_shown=0
+            _tr_sections="${_tr_sections}${_tr_sections:+|}## Ready Work ($ready_count unblocked)@@$ready_shown"
             echo "## Ready Work ($ready_count unblocked)"
             echo ""
-            local ready_nodes
-            ready_nodes=$(cmd_ready --json 2>/dev/null || echo "[]")
             echo "$ready_nodes" | jq -c '.[]' 2>/dev/null | head -10 | while read -r row; do
                 local nid ntext
                 nid=$(echo "$row" | jq -r '.id')
-                ntext=$(echo "$row" | jq -r '.text')
+                ntext=$(_tr_flatten "$(echo "$row" | jq -r '.text')")
                 echo "- **$nid**: $ntext"
             done
             echo ""
@@ -3088,12 +4071,13 @@ _trails_save() {
         blocked_count=$(echo "$blocked_nodes" | jq 'length' 2>/dev/null || echo "0")
         [[ "$blocked_count" =~ ^[0-9]+$ ]] || blocked_count=0
         if [ "$blocked_count" -gt 0 ]; then
+            _tr_sections="${_tr_sections}${_tr_sections:+|}## Blocked ($blocked_count)@@$blocked_count"
             echo "## Blocked ($blocked_count)"
             echo ""
             echo "$blocked_nodes" | jq -c '.[]' | while read -r row; do
                 local nid ntext
                 nid=$(echo "$row" | jq -r '.id')
-                ntext=$(echo "$row" | jq -r '.text')
+                ntext=$(_tr_flatten "$(echo "$row" | jq -r '.text')")
                 # Find what blocks it
                 local blockers
                 blockers=$(db_query "
@@ -3101,6 +4085,7 @@ _trails_save() {
                     WHERE target='$nid' AND type='blocks'
                     AND source IN (SELECT id FROM nodes WHERE status != 'done');
                 " 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
+                blockers=$(_tr_flatten "$blockers")
                 if [ -n "$blockers" ]; then
                     echo "- **$nid**: $ntext _(blocked by: $blockers)_"
                 else
@@ -3122,7 +4107,10 @@ _trails_save() {
         " 2>/dev/null)
         local learn_count
         learn_count=$(echo "$recent_learnings" | jq 'length' 2>/dev/null || echo "0")
-        if [ "$learn_count" -gt 0 ] && [ "$learn_count" != "0" ]; then
+        # Same shape: jq exits 0 and prints nothing when handed empty input.
+        [[ "$learn_count" =~ ^[0-9]+$ ]] || learn_count=0
+        if [ "$learn_count" -gt 0 ]; then
+            _tr_sections="${_tr_sections}${_tr_sections:+|}## Recent Learnings@@$learn_count"
             echo "## Recent Learnings"
             echo ""
             echo "$recent_learnings" | jq -c '.[]' | while read -r row; do
@@ -3135,16 +4123,17 @@ _trails_save() {
                 pitfall=$(echo "$meta_raw" | jq -r '.pitfall // empty' 2>/dev/null)
                 learning=$(echo "$meta_raw" | jq -r '.learning // empty' 2>/dev/null)
                 local parts=""
-                [ -n "$decision" ] && parts="decision: $decision"
-                [ -n "$pattern" ] && parts="${parts:+$parts; }pattern: $pattern"
-                [ -n "$pitfall" ] && parts="${parts:+$parts; }pitfall: $pitfall"
-                [ -n "$learning" ] && parts="${parts:+$parts; }note: $learning"
-                echo "- **$nid**: $parts"
+                [ -n "$decision" ] && parts="decision: $decision" || true
+                [ -n "$pattern" ] && parts="${parts:+$parts; }pattern: $pattern" || true
+                [ -n "$pitfall" ] && parts="${parts:+$parts; }pitfall: $pitfall" || true
+                [ -n "$learning" ] && parts="${parts:+$parts; }note: $learning" || true
+                echo "- **$nid**: $(_tr_flatten "$parts")"
             done
             echo ""
         fi
 
         # Health snapshot
+        _tr_sections="${_tr_sections}${_tr_sections:+|}## Health"
         echo "## Health"
         echo ""
         local total active ready blocked done_c
@@ -3155,7 +4144,141 @@ _trails_save() {
         echo "Nodes: $total total ($active active, $ready_count ready, $blocked blocked, $done_c done)"
         echo ""
 
-    } > "$breadcrumb_file"
+        # Reserved end-of-file sentinel, written LAST. The previous check
+        # grepped for `^Nodes: ` anywhere in the file, which a note body can
+        # forge — notes are written before the generated sections, so a note
+        # line reading "Nodes: ..." satisfied the integrity check while the
+        # real generated write had failed.
+        echo "$_TR_EOF_SENTINEL sections=$_tr_sections"
+    )
+    printf '%s\n' "$_tr_body" > "$_tr_tmp"
+    _tr_write_rc=$?
+    # Byte-exactness: the file must hold exactly the generated content. A short
+    # write leaves fewer bytes than were generated, whatever status it reported.
+    local _tr_expect
+    _tr_expect=$(printf '%s\n' "$_tr_body" | wc -c 2>/dev/null || echo -1)
+    _tr_bytes=$(wc -c < "$_tr_tmp" 2>/dev/null || echo 0)
+    if [ "${_tr_bytes:-0}" -ne "${_tr_expect:--1}" ]; then
+        _tr_write_rc=1
+    fi
+
+    # A failed write or rename must not report success. An unwritable directory
+    # previously returned 0 and printed "Trails saved" with the note absent —
+    # the same fail-open shape as the --json flag this fix started from.
+    # Three independent conditions, because they fail for different reasons:
+    #   write status  — the single write itself
+    #   byte count    — a short write (checked above)
+    #   structure     — content that was never GENERATED, which a byte check
+    #                   cannot see: a skipped section shortens the body and the
+    #                   file matches it exactly.
+    # Structure is validated only in the region after the LAST `<!-- /wv-notes -->`
+    # marker. Everything there is generated, so a note body cannot forge it —
+    # notes are written before that marker, which is why the previous
+    # `grep '^Nodes: '` over the whole file was satisfiable by a crafted note.
+    # Verifies EVERY section the generator DECLARED, not just one. The generator
+    # records each heading in a manifest immediately before emitting it, so a
+    # heading whose write fails stays declared but absent — the middle-generation
+    # failure a byte check cannot see, because a skipped heading shortens the
+    # body and the file then matches that shorter body exactly. Requiring only
+    # Health left every other section unguarded.
+    _tr_structure_ok() {
+        local f="$1" last start gen manifest sec oldifs
+        last=$(tail -n 1 "$f" 2>/dev/null)
+        case "$last" in "$_TR_EOF_SENTINEL sections="*) ;; *) return 1 ;; esac
+        manifest=${last#"$_TR_EOF_SENTINEL sections="}
+        # Health is emitted unconditionally; its absence means a truncated manifest.
+        case "|$manifest|" in *"|## Health|"*) ;; *) return 1 ;; esac
+        # Only the region after the LAST notes marker is generated content, so a
+        # note body cannot forge a heading into it.
+        start=$(grep -n '^<!-- /wv-notes -->$' "$f" 2>/dev/null | tail -n 1 | cut -d: -f1)
+        if [ -n "$start" ]; then
+            gen=$(tail -n "+$((start + 1))" "$f" 2>/dev/null)
+        else
+            gen=$(cat "$f" 2>/dev/null)
+        fi
+        oldifs="$IFS"
+        IFS='|'
+        for sec in $manifest; do
+            [ -n "$sec" ] || continue
+            # A manifest entry may carry the item count the DB reported for that
+            # section, as `heading@@N`. Validating headings alone let a section
+            # whose BODY failed to emit publish silently: the heading was there,
+            # the rows were gone, and the save reported success. The count comes
+            # from the query that decided to emit the section, so it is
+            # independent of whatever the emission actually produced.
+            local want=""
+            case "$sec" in
+                *"@@"*)
+                    want=${sec##*@@}
+                    sec=${sec%@@*}
+                    ;;
+            esac
+            if [ -n "$want" ]; then
+                local got
+                got=$(printf '%s\n' "$gen" | awk -v h="$sec" '
+                    $0 == h { inside = 1; next }
+                    inside && /^## / { inside = 0 }
+                    inside && /^- \*\*/ { n++ }
+                    END { print n + 0 }
+                ')
+                if [ "${got:-0}" -ne "$want" ] 2>/dev/null; then
+                    IFS="$oldifs"
+                    return 1
+                fi
+            fi
+            if [ "$sec" = "## Notes" ]; then
+                # The Notes heading sits inside the notes block, BEFORE the
+                # marker, so it cannot be found in the generated region. It is
+                # checked against the whole file; forging it gains nothing,
+                # since a forged Notes heading is what the notes block is for.
+                grep -qxF -- "$sec" "$f" || { IFS="$oldifs"; return 1; }
+            elif ! printf '%s\n' "$gen" | grep -qxF -- "$sec"; then
+                IFS="$oldifs"
+                return 1
+            fi
+        done
+        IFS="$oldifs"
+        return 0
+    }
+    if [ "$_tr_write_rc" -ne 0 ] || [ ! -s "$_tr_tmp" ] || ! _tr_structure_ok "$_tr_tmp"; then
+        rm -f "$_tr_tmp" 2>/dev/null || true
+        _trails_release_lock "${_tr_lock_fd:-}" "${_tr_lock_dir:-}"
+        echo -e "${RED}Error: could not write $_tr_tmp; trails.md is unchanged${NC}" >&2
+        return 1
+    fi
+    # Re-append the completion log, after validation and before the rename.
+    # Order matters twice over: the generated body must still END at the
+    # sentinel for the structure check to mean anything, and these records must
+    # not be scanned as generated section content -- their "## <date>" lines
+    # would read as section headings. Appending to the temp file keeps the
+    # publish a single atomic rename.
+    if [ -n "$prior_completions" ]; then
+        if ! printf '\n%s\n' "$prior_completions" >> "$_tr_tmp" 2>/dev/null; then
+            rm -f "$_tr_tmp" 2>/dev/null || true
+            _trails_release_lock "${_tr_lock_fd:-}" "${_tr_lock_dir:-}"
+            echo -e "${RED}Error: could not preserve completion records; $breadcrumb_file is unchanged${NC}" >&2
+            return 1
+        fi
+        # A dropped record is silent data loss, so prove the count survived
+        # rather than trusting the append's exit status.
+        local _tr_want_c _tr_got_c
+        _tr_want_c=$(printf '%s\n' "$prior_completions" | grep -c '^## [0-9]\{4\}-' || true)
+        _tr_got_c=$(grep -c '^## [0-9]\{4\}-' "$_tr_tmp" 2>/dev/null || true)
+        if [ "${_tr_got_c:-0}" -lt "${_tr_want_c:-0}" ]; then
+            rm -f "$_tr_tmp" 2>/dev/null || true
+            _trails_release_lock "${_tr_lock_fd:-}" "${_tr_lock_dir:-}"
+            echo -e "${RED}Error: completion records were lost while saving; $breadcrumb_file is unchanged${NC}" >&2
+            return 1
+        fi
+    fi
+
+    if ! mv -f "$_tr_tmp" "$breadcrumb_file" 2>/dev/null; then
+        rm -f "$_tr_tmp" 2>/dev/null || true
+        _trails_release_lock "${_tr_lock_fd:-}" "${_tr_lock_dir:-}"
+        echo -e "${RED}Error: could not replace $breadcrumb_file; it is unchanged${NC}" >&2
+        return 1
+    fi
+    _trails_release_lock "${_tr_lock_fd:-}" "${_tr_lock_dir:-}"
 
     echo -e "${GREEN}✓${NC} Trails saved to .weave/trails.md"
 }

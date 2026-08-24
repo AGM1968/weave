@@ -108,7 +108,7 @@ This file is loaded into weave-runtime system prompts. Keep repo-specific instru
 ${RUNTIME_MARKER_END}"
 
     tmp=$(mktemp)
-    if grep -qF "$RUNTIME_MARKER_BEGIN" "$RUNTIME_MD"; then
+    if grep -qF -- "$RUNTIME_MARKER_BEGIN" "$RUNTIME_MD"; then
         awk -v begin="$RUNTIME_MARKER_BEGIN" -v end="$RUNTIME_MARKER_END" -v block="$block" '
             $0 == begin { print block; skip=1; next }
             skip && $0 == end { skip=0; next }

@@ -61,7 +61,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF "$needle"; then
+    if echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "  ${GREEN}[PASS]${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -75,7 +75,7 @@ assert_not_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF "$needle"; then
+    if echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "  ${RED}[FAIL]${NC} $message (unexpected '$needle' in output)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     else

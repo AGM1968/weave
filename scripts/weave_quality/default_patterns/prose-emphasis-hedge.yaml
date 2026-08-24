@@ -9,7 +9,8 @@ provenance: >-
 message: >-
   Emphasis-as-reassurance. State the quantity and its verification procedure
   and let the numbers carry conviction; replace the hedge with the specific
-  claim it gestures at, or delete it. Keep technical compounds (real-time).
+  claim it gestures at, or delete it. Keep technical compounds (real-time,
+  real-world).
 paths:
   - "docs/*.md"
   - "docs/**/*.md"
@@ -26,7 +27,9 @@ terms:
 exempt:
   - real-time
   - near-real-time
+  - real-world
 positive_controls:
   - "The result is genuinely robust."
 negative_controls:
   - "The real-time feed reports 5 samples per minute."
+  - "Assessing The Real-World Economic Value of Weather Forecasts under Compounding Extremes"

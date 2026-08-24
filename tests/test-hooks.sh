@@ -76,7 +76,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if grep -qF "$needle" <<<"$haystack"; then
+    if grep -qF -- "$needle" <<<"$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -92,7 +92,7 @@ assert_not_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if ! grep -qF "$needle" <<<"$haystack"; then
+    if ! grep -qF -- "$needle" <<<"$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -279,6 +279,35 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "2" "$EXIT_CODE" "pre-action: exits 2 (hard block) when no active node"
 assert_contains "$OUTPUT" "No active Weave node" "pre-action: message on stderr when no active node"
+
+# --- pre-action.sh (malformed payload fails closed) ---
+# wv-692c2d gave the fail-closed posture to `wv hook dispatch`/`normalize`, and
+# tests/test-codex-hooks.sh covers those. Nothing exercised pre-action.sh's own
+# copy of the rule, so relocating it into _hc_check_payload could have silently
+# downgraded a broken mutation event to inspection with every suite still green.
+echo ""
+echo "--- pre-action.sh (malformed payload) ---"
+setup_test_env
+
+set +e
+OUTPUT=$(echo '{"tool_input":{"file_path":"test.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "2" "$EXIT_CODE" "pre-action: exits 2 on a payload missing tool_name"
+assert_contains "$OUTPUT" "malformed" "pre-action: names the malformation on stderr"
+
+set +e
+OUTPUT=$(echo '{"tool_name":"Edit","tool_input":"not-an-object"}' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "2" "$EXIT_CODE" "pre-action: exits 2 when tool_input is not an object"
+
+# Empty stdin is a manual invocation, not a broken host event — it must stay a no-op.
+set +e
+OUTPUT=$(printf '' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-action: empty stdin stays a no-op, not a block"
 
 # --- pre-action.sh (discover phase still blocks edits) ---
 echo ""
@@ -1363,6 +1392,60 @@ assert_contains "$OUTPUT" "impact gate inert: .weave/test-map.conf exists but ma
     "git pre-commit: impact-inert message distinguishes a present-but-nonmatching config"
 assert_contains "$OUTPUT" "Unmatched: docs.md" \
     "git pre-commit: impact-inert message names the actual unmatched file"
+
+# shellcheck gate reads the STAGED BLOB, not the working tree (wv-d6c692).
+# Naming staged files and letting shellcheck read them off disk checks whatever
+# is in the worktree, so a dirty index behind a clean worktree committed content
+# that was never linted. This stages a finding, then cleans the worktree.
+setup_test_env
+mkdir -p "$TEST_DIR/project/scripts"
+if command -v shellcheck >/dev/null 2>&1; then
+    cp "$PROJECT_ROOT/.shellcheckrc" "$TEST_DIR/project/.shellcheckrc" 2>/dev/null || true
+    printf '#!/bin/bash\necho $(ls)\n' > "$TEST_DIR/project/scripts/staged-dirty.sh"
+    git -C "$TEST_DIR/project" add scripts/staged-dirty.sh
+    printf '#!/bin/bash\necho "clean"\n' > "$TEST_DIR/project/scripts/staged-dirty.sh"
+    set +e
+    OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+    EXIT_CODE=$?
+    set -e
+    assert_exit_code "1" "$EXIT_CODE" "git pre-commit: dirty index behind a clean worktree is refused"
+    assert_contains "$OUTPUT" "STAGED content" "git pre-commit: names the staged blob as the thing linted"
+    git -C "$TEST_DIR/project" reset -q >/dev/null 2>&1 || true
+    rm -f "$TEST_DIR/project/scripts/staged-dirty.sh"
+else
+    echo -e "  ${YELLOW}-${NC} shellcheck unavailable — staged-blob gate test skipped"
+fi
+
+# NUL-safety and fail-closed materialisation (wv-baf98b, wv-32fef5). An earlier
+# version piped `-z` output through `tr '\0' '\n'`, so a path containing a
+# newline was skipped entirely, and `xargs` split paths on spaces into
+# nonexistent files and blocked commits for files that were fine.
+setup_test_env
+if command -v shellcheck >/dev/null 2>&1; then
+    cp "$PROJECT_ROOT/.shellcheckrc" "$TEST_DIR/project/.shellcheckrc" 2>/dev/null || true
+    mkdir -p "$TEST_DIR/project/scripts"
+    printf '#!/bin/bash\necho $(ls)\n' > "$TEST_DIR/project/scripts/nl"$'\n'"name.sh"
+    git -C "$TEST_DIR/project" add "scripts/nl"$'\n'"name.sh" 2>/dev/null
+    set +e
+    OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+    EXIT_CODE=$?
+    set -e
+    assert_exit_code "1" "$EXIT_CODE" "git pre-commit: a newline in a staged path is still linted"
+    assert_contains "$OUTPUT" "STAGED content" "git pre-commit: newline path reaches the linter"
+    git -C "$TEST_DIR/project" reset -q >/dev/null 2>&1 || true
+    rm -f "$TEST_DIR/project/scripts/nl"$'\n'"name.sh"
+
+    printf '#!/bin/bash\necho "fine"\n' > "$TEST_DIR/project/scripts/with space.sh"
+    git -C "$TEST_DIR/project" add "scripts/with space.sh"
+    set +e
+    OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+    set -e
+    assert_not_contains "$OUTPUT" "STAGED content" "git pre-commit: a clean path containing a space is not falsely blocked"
+    git -C "$TEST_DIR/project" reset -q >/dev/null 2>&1 || true
+    rm -f "$TEST_DIR/project/scripts/with space.sh"
+else
+    echo -e "  ${YELLOW}-${NC} shellcheck unavailable — NUL-safety gate tests skipped"
+fi
 
 # discover phase with non-.weave file staged must block (no active node bypass)
 setup_test_env

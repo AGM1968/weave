@@ -280,6 +280,42 @@ wv_delta_reset "$DB"
 
 rm -f "$DB"
 
+# ─── wv_mutation_seq_for_snapshot ────────────────────────────────────────────
+# Regression (release review 4): the GitHub sync recorded the counter read
+# AFTER dumping state, so a mutation landing between the dump and the record
+# was certified as synced while present in no dump -- and stayed invisible,
+# because needs_sync compares against exactly that number. The recorded value
+# must never be ahead of the snapshot it certifies.
+
+echo ""
+echo "wv_mutation_seq_for_snapshot"
+
+got=$(wv_mutation_seq_for_snapshot 7 7)
+[ "$got" = "7" ] && ok "unchanged across the snapshot records the exact counter" \
+    || fail "unchanged across the snapshot records the exact counter" "got '$got'"
+
+got=$(wv_mutation_seq_for_snapshot 7 9)
+[ "$got" = "7" ] && ok "a writer racing the snapshot records the pre-snapshot counter" \
+    || fail "a writer racing the snapshot records the pre-snapshot counter" "got '$got'"
+
+# The direction of the error is the whole point: understating asks for another
+# sync, overstating loses the mutation for good.
+got=$(wv_mutation_seq_for_snapshot 7 9)
+[ "$got" -le 9 ] && ok "the recorded counter is never ahead of the graph" \
+    || fail "the recorded counter is never ahead of the graph" "got '$got'"
+
+got=$(wv_mutation_seq_for_snapshot "" 9)
+[ -z "$got" ] && ok "no pre-snapshot reading records no stamp at all" \
+    || fail "no pre-snapshot reading records no stamp at all" "got '$got'"
+
+got=$(wv_mutation_seq_for_snapshot "notanumber" 9)
+[ -z "$got" ] && ok "a non-numeric reading is not recorded as a counter" \
+    || fail "a non-numeric reading is not recorded as a counter" "got '$got'"
+
+got=$(wv_mutation_seq_for_snapshot 7 "")
+[ "$got" = "7" ] && ok "an unreadable post-snapshot counter falls back to the pre-snapshot one" \
+    || fail "an unreadable post-snapshot counter falls back to the pre-snapshot one" "got '$got'"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 
 echo ""

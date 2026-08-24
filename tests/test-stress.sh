@@ -134,7 +134,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF "$needle"; then
+    if echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "  ${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -153,7 +153,7 @@ assert_not_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if ! echo "$haystack" | grep -qF "$needle"; then
+    if ! echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "  ${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -1188,8 +1188,8 @@ test_context_pitfall_scoping() {
     context=$("$WV" context "$task1" --json 2>/dev/null || echo "{}")
 
     local has_pit1=false has_pit2=false
-    echo "$context" | grep -qF "$pit1" 2>/dev/null && has_pit1=true
-    echo "$context" | grep -qF "$pit2" 2>/dev/null && has_pit2=true
+    echo "$context" | grep -qF -- "$pit1" 2>/dev/null && has_pit1=true
+    echo "$context" | grep -qF -- "$pit2" 2>/dev/null && has_pit2=true
 
     # Fixed: wv-517f — pitfall scoping via neighborhood walk (all edge types)
     assert_equals "true" "$has_pit1" "Context includes own pitfall"

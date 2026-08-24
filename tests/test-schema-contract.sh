@@ -119,12 +119,12 @@ check_contract() {
     declared=$(extract_declared "$@")
     extract_referenced "$@" | while read -r ref; do
         [ -z "$ref" ] && continue
-        grep -qxF "$ref" "$known_file" && continue
-        echo "$declared" | grep -qxF "$ref" && continue
-        echo "$BUILTIN" | grep -qxF "$ref" && continue
-        echo "$EXTERNAL" | grep -qxF "$ref" && continue
-        echo "$TRANSIENT" | grep -qxF "$ref" && continue
-        echo "$NOISE" | grep -qxF "$ref" && continue
+        grep -qxF -- "$ref" "$known_file" && continue
+        echo "$declared" | grep -qxF -- "$ref" && continue
+        echo "$BUILTIN" | grep -qxF -- "$ref" && continue
+        echo "$EXTERNAL" | grep -qxF -- "$ref" && continue
+        echo "$TRANSIENT" | grep -qxF -- "$ref" && continue
+        echo "$NOISE" | grep -qxF -- "$ref" && continue
         echo "$ref"
     done
 }

@@ -79,7 +79,7 @@ assert_contains() {
 
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    if echo "$haystack" | grep -qF "$needle"; then
+    if echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -99,7 +99,7 @@ assert_not_contains() {
 
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    if ! echo "$haystack" | grep -qF "$needle"; then
+    if ! echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -972,6 +972,93 @@ test_context_node_gate_fields() {
 }
 
 # ============================================================================
+# Test: wv context survives oversized payloads and fails loudly (wv-5850d4)
+#
+# cmd_context used to hand every payload to jq as an --argjson argv string.
+# One argument over MAX_ARG_STRLEN (131072 on Linux) makes execve fail with
+# E2BIG before jq starts, and the old `jq | tee` pipeline reported tee's exit
+# status — so the command printed nothing and returned 0. On the live graph
+# that silently broke `wv context <id> --json` for every node on the pre-Rust
+# evidence epic. The payloads now arrive via --slurpfile, so size is not a
+# correctness boundary, and a compose failure propagates.
+# ============================================================================
+test_context_oversized_payload() {
+    echo ""
+    echo "Test: wv context composes oversized packs and fails loudly"
+    echo "================================================================"
+
+    setup_test_env
+
+    local seed pad meta_file i pid
+    seed=$("$WV" add "oversized pack seed" --standalone --force 2>&1 | node_id_from_output)
+
+    # 50KB of pitfall text per node. Three survive the LIMIT 3 slice, so the
+    # composed pitfalls payload is ~150KB — still past MAX_ARG_STRLEN. The
+    # per-query LIMIT alone would not save this; only reading from files does.
+    pad=$(printf 'x%.0s' $(seq 1 50000))
+    meta_file="$TEST_DIR/pitfall-meta.json"
+
+    for i in 1 2 3 4; do
+        pid=$("$WV" add "oversized pitfall node $i" --standalone --force 2>&1 | node_id_from_output)
+        jq -n --arg p "PITFALL_MARKER_$i $pad" '{pitfall: $p}' > "$meta_file"
+        "$WV" update "$pid" --metadata-file "$meta_file" >/dev/null 2>&1
+        "$WV" link "$pid" "$seed" --type=relates_to >/dev/null 2>&1
+    done
+
+    local ctx rc
+    ctx=$("$WV" context "$seed" --json 2>/dev/null)
+    rc=$?
+
+    assert_equals "0" "$rc" "context: oversized pitfall payload still exits 0"
+    assert_jq_true "$ctx" '.node.id != null' \
+        "context: oversized pitfall payload still emits a parseable pack"
+    assert_jq_true "$ctx" '(.pitfalls | length) == 3' \
+        "context: pitfalls bounded to 3 regardless of neighborhood size"
+    assert_jq_true "$ctx" '(.related | length) <= 5' \
+        "context: related bounded to 5"
+
+    # The pitfalls query selected json(n.metadata) with no AS metadata alias,
+    # so the composer's .metadata was always null and every entry rendered
+    # pitfall: null — the section existed but carried nothing.
+    assert_jq_true "$ctx" \
+        '(.pitfalls | map(.pitfall) | all(type == "string" and startswith("PITFALL_MARKER_")))' \
+        "context: pitfall text actually reaches the pack (metadata alias)"
+
+    # A failing composer must not look like a successful empty pack.
+    local shim_dir real_jq out
+    real_jq=$(command -v jq)
+    shim_dir="$TEST_DIR/jq-shim"
+    mkdir -p "$shim_dir"
+    {
+        echo '#!/bin/bash'
+        echo 'for a in "$@"; do'
+        echo '    if [ "$a" = "--slurpfile" ]; then'
+        echo '        echo "forced compose failure" >&2'
+        echo '        exit 5'
+        echo '    fi'
+        echo 'done'
+        echo "exec $real_jq \"\$@\""
+    } > "$shim_dir/jq"
+    chmod +x "$shim_dir/jq"
+
+    rm -rf "$TEST_DIR/context_cache"
+    assert_fails "context: compose failure returns non-zero" \
+        env PATH="$shim_dir:$PATH" "$WV" context "$seed" --json
+
+    rm -rf "$TEST_DIR/context_cache"
+    # set -euo pipefail is active: the failing command must not abort the suite.
+    out=$(PATH="$shim_dir:$PATH" "$WV" context "$seed" --json 2>/dev/null) || true
+    assert_equals "" "$out" "context: compose failure writes nothing to stdout"
+
+    # ...and must not leave the failure behind as a servable cache entry.
+    rm -rf "$TEST_DIR/context_cache"
+    PATH="$shim_dir:$PATH" "$WV" context "$seed" --json >/dev/null 2>&1 || true
+    ctx=$("$WV" context "$seed" --json 2>/dev/null)
+    assert_jq_true "$ctx" '.node.id != null' \
+        "context: a failed compose is not cached as an empty pack"
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 main() {
@@ -990,6 +1077,7 @@ main() {
     test_discover
     test_unified_blocking
     test_context_node_gate_fields
+    test_context_oversized_payload
 
     echo ""
     echo "========================================"

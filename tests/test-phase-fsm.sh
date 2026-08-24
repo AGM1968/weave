@@ -73,7 +73,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF "$needle"; then
+    if echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "  ${GREEN}[PASS]${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -118,7 +118,7 @@ test_phase_values_contains_all_values() {
     local phase_values
     phase_values=$(bash -c "source '$WV_VALIDATE' 2>/dev/null; echo \"\${PHASE_VALUES:-}\"")
     for val in execute discover closing; do
-        if echo "$phase_values" | grep -qw "$val"; then
+        if echo "$phase_values" | grep -qw -- "$val"; then
             echo -e "  ${GREEN}[PASS]${NC} PHASE_VALUES contains '$val'"
             TESTS_RUN=$((TESTS_RUN + 1))
             TESTS_PASSED=$((TESTS_PASSED + 1))

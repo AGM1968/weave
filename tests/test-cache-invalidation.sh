@@ -30,6 +30,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WV="$PROJECT_ROOT/scripts/wv"
 
+# wv_mutation_seq is the production mutation clock. The deletion tests below
+# record a sync stamp exactly the way _sync_gh does, rather than reimplementing
+# the counter query and testing a copy of it.
+# shellcheck source=../scripts/lib/wv-delta.sh
+source "$PROJECT_ROOT/scripts/lib/wv-delta.sh"
+
 # Test environment
 TEST_DIR="/tmp/wv-cache-test-$$"
 export WEAVE_DIR="$TEST_DIR/.weave"
@@ -78,7 +84,7 @@ assert_contains() {
 
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    if echo "$haystack" | grep -q "$needle"; then
+    if echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -422,11 +428,177 @@ test_touch_invalidates_run_cache() {
     export WV_RUN_CACHE=0
 }
 
+# Test 9: a deletion invalidates the wv impact cache
+# Regression (release review 3): the cache was validated against a TIMESTAMP
+# clock, MAX(updated_at) over nodes and edges. A timestamp cannot see a DELETE,
+# and unlinking the newest edge moves that clock BACKWARDS -- measured, from
+# 1787519439 to 1787519438 -- so a cache written before the deletion looked
+# newer than the graph and was served with the deleted edge still in it.
+test_impact_cache_invalidated_by_unlink() {
+    echo ""
+    echo "Test 9: deletion invalidates the wv impact cache"
+    echo "================================================"
+
+    setup_test_env
+
+    local src tgt
+    src=$("$WV" add "Impact seed node" | tail -1)
+    tgt=$("$WV" add "Impact target node" | tail -1)
+    "$WV" link "$src" "$tgt" --type=blocks >/dev/null 2>&1
+
+    # Prime the cache: this run writes the walk and its mutation counter.
+    local before
+    before=$("$WV" impact "$src" --json 2>/dev/null | jq -r '.impacted | length')
+    assert_equals "1" "$before" "impact reports the linked node before the unlink"
+
+    "$WV" unlink "$src" "$tgt" --type=blocks >/dev/null 2>&1
+
+    local after after_edges
+    after=$("$WV" impact "$src" --json 2>/dev/null | jq -r '.impacted | length')
+    assert_equals "0" "$after" "impact drops the unlinked node instead of serving the cache"
+    after_edges=$("$WV" impact "$src" --json 2>/dev/null | jq -r '.edges | length')
+    assert_equals "0" "$after_edges" "the deleted edge is gone from the served edge list"
+}
+
+# Test 10: a deletion is visible to needs_sync
+# Same root cause as Test 9 on a different surface: status compared the last
+# sync stamp against MAX(updated_at), so an unsynced deletion reported as
+# synced -- and because deleting the newest row moves that clock backwards, it
+# reported as synced even more confidently the more recent the deletion was.
+test_needs_sync_sees_deletion() {
+    echo ""
+    echo "Test 10: needs_sync sees a deletion"
+    echo "==================================="
+
+    setup_test_env
+
+    local src tgt
+    src=$("$WV" add "Sync seed node" | tail -1)
+    tgt=$("$WV" add "Sync target node" | tail -1)
+    "$WV" link "$src" "$tgt" --type=blocks >/dev/null 2>&1
+
+    # Record a completed sync the way _sync_gh does: wall clock plus counter.
+    date +%s > "$WV_HOT_ZONE/.last_gh_sync"
+    wv_mutation_seq "$WV_HOT_ZONE/brain.db" > "$WV_HOT_ZONE/.last_gh_sync_seq"
+
+    local synced
+    synced=$("$WV" status --json 2>/dev/null | jq -r '.needs_sync')
+    assert_equals "false" "$synced" "needs_sync clears after a recorded sync"
+
+    "$WV" unlink "$src" "$tgt" --type=blocks >/dev/null 2>&1
+
+    local after
+    after=$("$WV" status --json 2>/dev/null | jq -r '.needs_sync')
+    assert_equals "true" "$after" "needs_sync flips true after an edge deletion"
+}
+
+# Test 11: a walk that raced a mutation is not published
+# Regression (release review 4): the sequence was recorded AFTER generating the
+# walk, so a mutation landing during generation certified OLD content with the
+# NEW counter. Every later reader then saw a cache that looked current and never
+# expired -- the mutation was invisible permanently, not just until the next
+# call. The sequence is now read before the walk and re-checked after, the walk
+# is published only if the graph did not move, and the counter travels INSIDE
+# the cache file so a reader cannot pair it with someone else's walk.
+test_impact_cache_not_published_when_walk_raced() {
+    echo ""
+    echo "Test 11: a walk that raced a mutation is not published"
+    echo "======================================================"
+
+    setup_test_env
+
+    local src tgt
+    src=$("$WV" add "Race seed node" | tail -1)
+    tgt=$("$WV" add "Race target node" | tail -1)
+    "$WV" link "$src" "$tgt" --type=blocks >/dev/null 2>&1
+
+    local cache_dir="$WV_HOT_ZONE/context_cache"
+
+    # A walk that the graph moved underneath must publish nothing at all.
+    WV_TEST_MODE=1 WV_TEST_IMPACT_RACE=1 "$WV" impact "$src" --json >/dev/null 2>&1
+    local raced_files
+    raced_files=$(find "$cache_dir" -name 'impact-*-v2.json' 2>/dev/null | wc -l | tr -d ' ')
+    assert_equals "0" "$raced_files" "a walk that raced a mutation is not published"
+
+    # An undisturbed walk publishes, and its stored counter matches the graph.
+    "$WV" impact "$src" --json >/dev/null 2>&1
+    local clean_files
+    clean_files=$(find "$cache_dir" -name 'impact-*-v2.json' 2>/dev/null | wc -l | tr -d ' ')
+    assert_equals "1" "$clean_files" "an undisturbed walk is published"
+
+    local cache_path stored_seq db_seq
+    cache_path=$(find "$cache_dir" -name 'impact-*-v2.json' 2>/dev/null | head -1)
+    stored_seq=$(head -n 1 "$cache_path" 2>/dev/null)
+    db_seq=$(sqlite3 "$WV_HOT_ZONE/brain.db" \
+        "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='_warp_changes'), 0);" 2>/dev/null)
+    assert_equals "$db_seq" "$stored_seq" "the published counter is the graph the walk actually saw"
+
+    # The counter lives in the file, not beside it: a sidecar cannot be renamed
+    # together with the walk, so a reader could pair mismatched halves.
+    local sidecars
+    sidecars=$(find "$cache_dir" -name 'impact-*.seq' 2>/dev/null | wc -l | tr -d ' ')
+    assert_equals "0" "$sidecars" "no sidecar counter file is left to be torn from its walk"
+}
+
+# Test 12: the WV_TEST_IMPACT_RACE hook is gated and validated on every path
+# Regression (release review 5): validation sat INSIDE the cache-miss branch,
+# so an unrecognised value was accepted silently whenever the walk was served
+# from cache -- the ordinary fast path. "Unknown values are rejected" held only
+# where a test was least likely to look.
+test_impact_race_hook_is_gated_and_validated() {
+    echo ""
+    echo "Test 12: the impact race hook is gated and validated on every path"
+    echo "=================================================================="
+
+    setup_test_env
+
+    local src tgt
+    src=$("$WV" add "Hook gate seed" | tail -1)
+    tgt=$("$WV" add "Hook gate target" | tail -1)
+    "$WV" link "$src" "$tgt" --type=blocks >/dev/null 2>&1
+
+    local db="$WV_HOT_ZONE/brain.db"
+    local seq_q="SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='_warp_changes'), 0);"
+
+    # 1. Without the master opt-in, a VALID value is inert. The hook's whole
+    #    effect is a graph mutation, so an unchanged counter is direct proof it
+    #    did not fire -- not merely that the command survived.
+    #
+    #    This MUST run on a cache MISS. The fault executes inside the cache-miss
+    #    branch, so measuring around a cached call proves nothing: the hook
+    #    would stay silent even with the master gate removed, and the assertion
+    #    would pass while testing nothing. (It did, until this line was added.)
+    find "$WV_HOT_ZONE/context_cache" -name 'impact-*-v2.json' -delete 2>/dev/null || true
+    local seq_before seq_after rc
+    seq_before=$(sqlite3 "$db" "$seq_q" 2>/dev/null)
+    rc=0
+    WV_TEST_IMPACT_RACE=1 "$WV" impact "$src" --json >/dev/null 2>&1 || rc=$?
+    seq_after=$(sqlite3 "$db" "$seq_q" 2>/dev/null)
+    assert_equals "0" "$rc" "a valid race value without WV_TEST_MODE=1 does not fail the command"
+    assert_equals "$seq_before" "$seq_after" "a valid race value without WV_TEST_MODE=1 mutates nothing"
+
+    # 2. With test mode, an invalid value is rejected on a CACHE HIT -- the path
+    #    that used to skip validation entirely.
+    "$WV" impact "$src" --json >/dev/null 2>&1
+    local cached
+    cached=$(find "$WV_HOT_ZONE/context_cache" -name 'impact-*-v2.json' 2>/dev/null | wc -l | tr -d ' ')
+    assert_equals "1" "$cached" "a cache entry exists, so the next call takes the cached path"
+    rc=0
+    WV_TEST_MODE=1 WV_TEST_IMPACT_RACE=typo "$WV" impact "$src" --json >/dev/null 2>&1 || rc=$?
+    assert_equals "1" "$rc" "an invalid race value is rejected on a cache hit"
+
+    # 3. And on a cache miss, so the outcome does not depend on cache state.
+    find "$WV_HOT_ZONE/context_cache" -name 'impact-*-v2.json' -delete 2>/dev/null || true
+    rc=0
+    WV_TEST_MODE=1 WV_TEST_IMPACT_RACE=typo "$WV" impact "$src" --json >/dev/null 2>&1 || rc=$?
+    assert_equals "1" "$rc" "an invalid race value is rejected on a cache miss"
+}
+
 # Run all tests
 main() {
     echo "Cache Invalidation Tests"
     echo "========================"
-    echo "Testing: cmd_refs, cmd_block, cmd_done, cmd_link, cmd_prune, run-cache"
+    echo "Testing: cmd_refs, cmd_block, cmd_done, cmd_link, cmd_prune, run-cache, deletion"
     echo ""
 
     test_cmd_refs_link_invalidation
@@ -437,6 +609,10 @@ main() {
     test_cache_file_lifecycle
     test_v3_cache_upgrade_no_shadow
     test_touch_invalidates_run_cache
+    test_impact_cache_invalidated_by_unlink
+    test_needs_sync_sees_deletion
+    test_impact_cache_not_published_when_walk_raced
+    test_impact_race_hook_is_gated_and_validated
 
     # Summary
     echo ""

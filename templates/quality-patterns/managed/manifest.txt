@@ -9,5 +9,6 @@ prose-retrospective-announcement.yaml
 prose-rhetorical-heading.yaml
 prose-self-attested-virtue.yaml
 prose-significance-heading.yaml
+prose-significance-scaffold.yaml
 prose-verification-reassurance.yaml
 prose-work-context-leakage.yaml

@@ -4,6 +4,25 @@
 
 ## Unreleased
 
+## [1.71.0-rc.7] - 2026-08-24
+
+Public maintenance prerelease carrying the post-rc.5 durability and fail-closed safety review,
+plus the approved prose-correctness fixes and `prose-significance-scaffold` managed rule. Private
+evidence batteries, Rust shadows, graph state, capture artifacts, and unrelated feature work remain
+excluded from the public `weave` projection.
+
+### Fixed
+
+- Preserve append-only UTF-8 trails and completion history across failed, interrupted, and
+  concurrent saves.
+- Fail closed when graph projections, sync snapshots, caches, commit provenance, hooks, or stdin
+  consumers cannot certify the bytes they report.
+- Refresh installed provenance and managed hooks atomically, with consumer-local agent paths.
+- Correct prose code-span parsing, rule provenance, duplicate isolation, relocation-stable
+  adjudication, ignored-rule validation, and `real-world` precision.
+- Strip private Rust-shadow suites and fixtures together with their implementation so the public
+  aggregate never invokes an orphaned test.
+
 ## [1.71.0-rc.5] - 2026-08-13
 
 Release-candidate respin of rc.4 with the E6/E7 durability evidence chain rebound to the exact

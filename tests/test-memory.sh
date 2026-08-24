@@ -262,7 +262,7 @@ test_remember_recall_ready_and_render() {
     sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-72 hours') WHERE id='$memory_id';"
     local prune_dry_run post_prune_recall memory_live_count
     prune_dry_run=$("$WV" prune --age=48h --dry-run)
-    assert_equals "0" "$(grep -c "$memory_id" <<<"$prune_dry_run" || true)" "prune dry-run excludes durable memory nodes"
+    assert_equals "0" "$(grep -c -- "$memory_id" <<<"$prune_dry_run" || true)" "prune dry-run excludes durable memory nodes"
 
     "$WV" prune --age=48h >/dev/null
     memory_live_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE id='$memory_id';")
@@ -596,6 +596,13 @@ test_memory_verify_prose() {
     printf '# t\n\nUse commit/sync/push order; trace read/write paths with offset/limit. See scripts/lib/realfile.sh.\n' > "$mem_dir/prose.md"
     # A genuinely-absent path reference (slash + extension, basename not in repo).
     printf '# t\n\nThis cites gone/deleted-xyz.sh which is removed.\n' > "$mem_dir/missing.md"
+    # Finding E mechanism 1. $TEST_DIR/scripts holds only this test's own files,
+    # standing in for a consumer repo. Flags belonging to OTHER tools must not be
+    # checked at all, a real wv flag must resolve against wv's own surface
+    # (WV_LIB_DIR, not $repo_root/scripts), and a bogus wv flag must still fire.
+    printf '# t\n\nRunning `uv sync --all-extras` pulls the XPU build; use `uv sync --extra cpu`.\n' > "$mem_dir/foreignflags.md"
+    printf '# t\n\nPrefer `wv remember "<text>" --kind=project` over editing the index.\n' > "$mem_dir/wvflag.md"
+    printf '# t\n\nClose with `wv done <id> --frobnicate-widget` to record it.\n' > "$mem_dir/bogusflag.md"
     "$WV" memory import --source=claude --path="$mem_dir" --repo-root="$TEST_DIR" --json >/dev/null 2>&1
 
     local prose_id missing_id dry
@@ -605,6 +612,15 @@ test_memory_verify_prose() {
 
     assert_equals "" "$(printf '%s' "$dry" | jq -r --arg id "$prose_id" '.results[]|select(.id==$id)|.stale_reason // ""')" "prose slash-phrases + relative ref to a real file are not marked stale"
     assert_equals "stale" "$(printf '%s' "$dry" | jq -r --arg id "$missing_id" '.results[]|select(.id==$id)|.action')" "genuinely-absent slash-path is still detected stale"
+
+    local foreign_id wvflag_id bogus_id
+    foreign_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE json_extract(metadata,'\$.source_path') LIKE '%foreignflags.md';")
+    wvflag_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE json_extract(metadata,'\$.source_path') LIKE '%wvflag.md';")
+    bogus_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE json_extract(metadata,'\$.source_path') LIKE '%bogusflag.md';")
+
+    assert_equals "" "$(printf '%s' "$dry" | jq -r --arg id "$foreign_id" '.results[]|select(.id==$id)|.stale_reason // ""')" "another tool's flags (uv --all-extras/--extra) are not checked against wv"
+    assert_equals "" "$(printf '%s' "$dry" | jq -r --arg id "$wvflag_id" '.results[]|select(.id==$id)|.stale_reason // ""')" "a real wv flag resolves in a consumer repo (WV_LIB_DIR, not repo scripts/)"
+    assert_equals "stale" "$(printf '%s' "$dry" | jq -r --arg id "$bogus_id" '.results[]|select(.id==$id)|.action')" "a bogus wv flag is still detected stale"
 }
 
 test_memory_lifecycle_contract_shapes
@@ -615,7 +631,45 @@ test_memory_doctor_authority
 test_memory_doctor_authority_codex
 test_memory_recall_agent_observable
 test_memory_render_current_unknown_fallback
+test_memory_overlap_guards() {
+    echo ""
+    echo "Test: crystallize overlap needs 3 terms and a matching kind (Finding E mech 2)"
+    echo "============================================================"
+
+    setup_test_env
+
+    # Active memories a candidate could be proposed against. Same vocabulary,
+    # different kind.
+    "$WV" remember "telemetry ingestion backlog reprocessing" --kind=feedback --source-agent=test >/dev/null 2>&1
+    "$WV" remember "filesystem checkpoint validation ordering" --kind=project --source-agent=test >/dev/null 2>&1
+
+    local mem_dir="$TEST_DIR/mem"
+    mkdir -p "$mem_dir"
+    # Shares all three FTS terms with the seed, but the seed is kind=feedback
+    # and an imported memory is kind=project -- different classes of record, so
+    # proposing a merge would misfile the one a reader goes looking for.
+    printf '# t\n\ntelemetry ingestion backlog reprocessing is slow.\n' > "$mem_dir/crosskind.md"
+    # Fewer than three qualifying terms: one shared noun is not a conjunction.
+    printf '# t\n\ntelemetry is odd.\n' > "$mem_dir/tooshort.md"
+    # Positive control: same kind as the project seed below, three shared terms.
+    printf '# t\n\nfilesystem checkpoint validation is slow.\n' > "$mem_dir/samekind.md"
+    "$WV" memory import --source=claude --path="$mem_dir" --repo-root="$TEST_DIR" --json >/dev/null 2>&1
+
+    local cross_id short_id same_id dry
+    cross_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE json_extract(metadata,'\$.source_path') LIKE '%crosskind.md';")
+    short_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE json_extract(metadata,'\$.source_path') LIKE '%tooshort.md';")
+    same_id=$(sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE json_extract(metadata,'\$.source_path') LIKE '%samekind.md';")
+    dry=$("$WV" memory crystallize --dry-run --repo-root="$TEST_DIR" --json)
+
+    # Positive control FIRST: without it the two guards below pass against any
+    # implementation, including one that never proposes an overlap at all.
+    assert_contains "$(printf '%s' "$dry" | jq -r --arg id "$same_id" '.results[]|select(.id==$id)|.duplicate_of // "NONE"')" "wv-" "a same-kind memory sharing three terms IS still proposed as an overlap"
+    assert_equals "" "$(printf '%s' "$dry" | jq -r --arg id "$cross_id" '.results[]|select(.id==$id)|.duplicate_of // ""')" "a memory of a different kind is not proposed as an overlap target"
+    assert_equals "" "$(printf '%s' "$dry" | jq -r --arg id "$short_id" '.results[]|select(.id==$id)|.duplicate_of // ""')" "fewer than three FTS terms proposes no overlap"
+}
+
 test_memory_verify_prose
+test_memory_overlap_guards
 
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

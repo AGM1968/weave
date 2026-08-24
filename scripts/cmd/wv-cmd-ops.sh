@@ -2245,6 +2245,109 @@ _doctor_memory_authority() {
     fi
 }
 
+# _doctor_commit_refs — orphaned commit-provenance advisory (wv-fc4ac2).
+#
+# `wv done` records the SHAs carrying a node's Weave-ID; an amend, reset,
+# rebase or gc later strips them out from under the graph and nothing notices
+# (wv-55d2de). This is the surface that makes the count visible without being
+# asked for. Advisory only: existing orphans are a cleanup job (wv-3ce8d9),
+# not an installation fault, and --repair deliberately does NOT prune them —
+# discarding recorded provenance is a deliberate act, not a repair.
+# _doctor_install_provenance — can this install say which fixes it has?
+#
+# VERSION cannot answer that. Fixes land continuously between bumps, so an
+# install can be many commits behind while reporting an identical version
+# string, and nothing on the consumer side reveals it. install.sh records the
+# source commit; this reports it, and compares against the source checkout when
+# that is still reachable.
+_doctor_install_provenance() {
+    # Honour WV_LIB_DIR: hardcoding the default path checked a DIFFERENT install
+    # than the one running whenever the library lives elsewhere, so the report
+    # described something the caller was not using.
+    # Honour WV_LIB_DIR for a relocated INSTALL, but not when it points at the
+    # source checkout: running from source, WV_LIB_DIR is scripts/, and reading
+    # provenance from there describes the working tree rather than any installed
+    # copy. Hardcoding the default was wrong for a relocated install; using it
+    # blindly is wrong in dev mode. Distinguish the two.
+    local _prov_dir="${WV_LIB_DIR:-${HOME}/.local/lib/weave}"
+    if [ -f "$_prov_dir/wv" ] || [ -f "$_prov_dir/../scripts/wv" ]; then
+        _prov_dir="${HOME}/.local/lib/weave"
+    fi
+    local prov="$_prov_dir/lib/INSTALL_PROVENANCE"
+    if [ ! -f "$prov" ]; then
+        _doctor_record "install provenance" "warn" \
+            "not recorded — re-run ./install.sh so this install can report which commit it came from"
+        return 0
+    fi
+    local desc icommit ipath
+    desc=$(grep -m1 '^describe=' "$prov" 2>/dev/null | cut -d= -f2-)
+    icommit=$(grep -m1 '^commit=' "$prov" 2>/dev/null | cut -d= -f2-)
+    ipath=$(grep -m1 '^source_path=' "$prov" 2>/dev/null | cut -d= -f2-)
+
+    # Compare against the source it came from, when that is still present.
+    if [ -n "$ipath" ] && [ -d "$ipath/.git" ] && [ -n "$icommit" ]; then
+        local head behind
+        head=$(git -C "$ipath" rev-parse HEAD 2>/dev/null || echo "")
+        if [ -n "$head" ] && [ "$head" != "$icommit" ]; then
+            behind=$(git -C "$ipath" rev-list --count "$icommit..$head" 2>/dev/null || echo "?")
+            _doctor_record "install provenance" "warn" \
+                "installed at ${desc:-unknown}; source is $behind commit(s) ahead — re-run ./install.sh"
+            return 0
+        fi
+    fi
+    # A dirty install is not a healthy one: it cannot be reproduced from any
+    # commit, so reporting it as a clean pass hid exactly the case where the
+    # running code does not correspond to anything in the history.
+    local idirty
+    idirty=$(grep -m1 '^dirty=' "$prov" 2>/dev/null | cut -d= -f2-)
+    if [ "$idirty" = "true" ]; then
+        _doctor_record "install provenance" "warn" \
+            "${desc:-unknown} — installed from a DIRTY tree, so it matches no commit; reinstall from a clean checkout to make it reproducible"
+        return 0
+    fi
+    _doctor_record "install provenance" "pass" "${desc:-unknown}"
+}
+
+_doctor_commit_refs() {
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        _doctor_record "commit refs" "pass" "not a git repository — nothing to verify against"
+        return 0
+    fi
+    if ! declare -f cmd_commit_refs >/dev/null 2>&1; then
+        _doctor_record "commit refs" "warn" "wv commit-refs unavailable in this install"
+        return 0
+    fi
+
+    local summary orphaned nodes total
+    summary=$(cmd_commit_refs --json 2>/dev/null || echo "")
+    if [ -z "$summary" ]; then
+        _doctor_record "commit refs" "warn" "sweep failed — run: wv commit-refs"
+        return 0
+    fi
+    orphaned=$(printf '%s' "$summary" | jq -r '.totals.orphaned // 0' 2>/dev/null || echo 0)
+    nodes=$(printf '%s' "$summary" | jq -r '.totals.orphaned_nodes // 0' 2>/dev/null || echo 0)
+    total=$(printf '%s' "$summary" | jq -r '.totals.refs // 0' 2>/dev/null || echo 0)
+    local ckpt reg unk
+    ckpt=$(printf '%s' "$summary" | jq -r '.totals.orphaned_checkpoint // 0' 2>/dev/null || echo 0)
+    reg=$(printf '%s' "$summary" | jq -r '.totals.orphaned_regular // 0' 2>/dev/null || echo 0)
+    unk=$(printf '%s' "$summary" | jq -r '.totals.orphaned_unknown // 0' 2>/dev/null || echo 0)
+
+    # Checkpoint churn is the DESIGNED steady state: auto-checkpoint commits are
+    # superseded constantly, so their refs go unreachable as a matter of course.
+    # Reporting that identically to a regular ref going unreachable made the
+    # advisory a permanent warning, and a permanent warning is where a real
+    # provenance loss hides. Only regular or unclassifiable orphans warn.
+    if [ "${reg:-0}" -gt 0 ] 2>/dev/null || [ "${unk:-0}" -gt 0 ] 2>/dev/null; then
+        _doctor_record "commit refs" "warn" \
+            "$((reg + unk)) non-checkpoint ref(s) orphaned of $total across $nodes node(s) (plus $ckpt expected checkpoint) — inspect: wv commit-refs; remove: wv commit-refs --prune"
+    elif [ "${orphaned:-0}" -gt 0 ] 2>/dev/null; then
+        _doctor_record "commit refs" "pass" \
+            "$total recorded ref(s); $ckpt orphaned checkpoint ref(s) — expected churn, clear with: wv commit-refs --prune"
+    else
+        _doctor_record "commit refs" "pass" "$total recorded ref(s), none orphaned"
+    fi
+}
+
 _doctor_record() {
     local name="$1" status="$2" detail="$3"
     _dr_total=$((_dr_total + 1))
@@ -2614,7 +2717,7 @@ _config_env_set() {
     } > "$tmp" || { echo "wv config: cannot write temporary config file" >&2; rm -f "$tmp"; return 1; }
     # Carry forward existing assignments except the key being set (and drop old comments).
     if [ -f "$file" ]; then
-        grep -vE '^[[:space:]]*#' "$file" 2>/dev/null | grep -vE "^[[:space:]]*${key}=" >> "$tmp" || true
+        grep -vE '^[[:space:]]*#' "$file" 2>/dev/null | grep -vE -- "^[[:space:]]*${key}=" >> "$tmp" || true
     fi
     echo "${key}=\"${val}\"" >> "$tmp" || { echo "wv config: cannot write temporary config file" >&2; rm -f "$tmp"; return 1; }
     if ! mv "$tmp" "$file"; then
@@ -2634,7 +2737,7 @@ _config_env_unset() {
         echo "wv config: cannot create temporary config file" >&2
         return 1
     fi
-    grep -vE "^[[:space:]]*${key}=" "$file" > "$tmp" 2>/dev/null || true
+    grep -vE -- "^[[:space:]]*${key}=" "$file" > "$tmp" 2>/dev/null || true
     if ! mv "$tmp" "$file"; then
         echo "wv config: cannot update $file" >&2
         rm -f "$tmp"
@@ -2817,10 +2920,10 @@ _config_enable_test_gate() {
 _config_key_source() {
     local key="$1"
     local env_file; env_file=$(_config_env_file)
-    if grep -qE "^[[:space:]]*${key}=" "$env_file" 2>/dev/null; then
+    if grep -qE -- "^[[:space:]]*${key}=" "$env_file" 2>/dev/null; then
         echo "$env_file"; return 0
     fi
-    if [ -n "${WEAVE_DIR:-}" ] && grep -qE "^[[:space:]]*${key}[[:space:]]*=" "${WEAVE_DIR}/quality.conf" 2>/dev/null; then
+    if [ -n "${WEAVE_DIR:-}" ] && grep -qE -- "^[[:space:]]*${key}[[:space:]]*=" "${WEAVE_DIR}/quality.conf" 2>/dev/null; then
         echo "${WEAVE_DIR}/quality.conf"; return 0
     fi
     echo "builtin default"
@@ -3054,9 +3157,9 @@ _doctor_check_git_hook() {
     if [ -f "$installed" ]; then
         if [ -f "$src" ] && cmp -s "$src" "$installed" 2>/dev/null; then
             _doctor_record "$label" "pass" "Weave hook installed and current"
-        elif [ ! -f "$src" ] && grep -q "$grep_pattern" "$installed" 2>/dev/null; then
+        elif [ ! -f "$src" ] && grep -q -- "$grep_pattern" "$installed" 2>/dev/null; then
             _doctor_record "$label" "pass" "Weave hook installed (managed by wv init-repo)"
-        elif grep -q "$grep_pattern" "$installed" 2>/dev/null; then
+        elif grep -q -- "$grep_pattern" "$installed" 2>/dev/null; then
             _doctor_record "$label" "warn" "stale — $install_cmd"
         else
             _doctor_record "$label" "warn" "exists but not the Weave version — $install_cmd"
@@ -3478,6 +3581,13 @@ cmd_doctor() {
     # memory for this repo not represented in the graph (S5, generalized F1).
     _doctor_memory_authority
 
+    # 14a-quinquies. Can this install report which fixes it carries?
+    _doctor_install_provenance
+
+    # 14a-quater. Commit-provenance drift: SHAs recorded on nodes that no ref
+    # reaches any more (amended/reset/rebased/gc'd) -- wv-55d2de.
+    _doctor_commit_refs
+
     # 14a-ter. Managed pattern-rule shadow advisory: mirrors 'wv quality
     # patterns list' own warning (a project-local custom rule sharing a
     # managed rule's id, silently never applied -- see
@@ -3729,7 +3839,7 @@ cmd_doctor() {
         if [ -n "$matcher" ]; then
             local missing_tools=""
             for tool in Edit Write Bash; do
-                echo "$matcher" | grep -q "$tool" || missing_tools="${missing_tools:+$missing_tools, }$tool"
+                echo "$matcher" | grep -q -- "$tool" || missing_tools="${missing_tools:+$missing_tools, }$tool"
             done
             if [ -z "$missing_tools" ]; then
                 _doctor_record "hook matchers" "pass" "Edit, Write, Bash covered"
@@ -3841,7 +3951,7 @@ cmd_mcp_status() {
             done <<<"$expected_names"
             while IFS= read -r env_name; do
                 [ -z "$env_name" ] && continue
-                grep -q "$env_name" "$config_path" 2>/dev/null || missing+=("$env_name")
+                grep -q -- "$env_name" "$config_path" 2>/dev/null || missing+=("$env_name")
             done <<<"$required_env"
             grep -q 'WV_PATH' "$config_path" 2>/dev/null || missing+=("WV_PATH")
         else
@@ -5376,7 +5486,7 @@ cmd_pattern_audit() {
         local search_root="${_project_root:-}/scripts"
         [ -d "$search_root" ] || search_root="${_scripts_root:-}"
         if [ -n "$search_root" ] && [ -d "$search_root" ]; then
-            def_files=$(grep -rl "^${enum_name}=" "$search_root" 2>/dev/null | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+            def_files=$(grep -rl -- "^${enum_name}=" "$search_root" 2>/dev/null | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//')
             def_count=$(echo "$def_files" | tr ' ' '\n' | grep -c '[^[:space:]]' 2>/dev/null) || def_count=0
         else
             def_files=""
@@ -6446,6 +6556,20 @@ SEARCHHELP
         unarchive)
             print_command_help "wv unarchive <id> [--dry-run] [--with-edges]" "Restore a pruned node from .weave/archive/ back into the live graph."
             ;;
+        commit-refs)
+            print_command_help "wv commit-refs [--json] [--all] [--prune [--dry-run]]" \
+                "Audit the commit SHAs recorded in node metadata against the pushed branch.
+
+Classes: reachable (ancestor of the pushed ref), pending (local only — unpushed
+or on another branch, not an orphan), unreachable (object exists but no ref
+reaches it — superseded by an amend/reset/rebase), missing (gone from this
+object database). Orphaned = unreachable + missing.
+
+By default only orphaned refs are listed; --all lists every recorded ref.
+--prune removes orphaned refs at every node that records them, children
+included — an epic-only edit does not survive, because epics regenerate their
+commits list from their children."
+            ;;
         clean-ghosts)
             print_command_help "wv clean-ghosts [--dry-run]" "Remove edges that reference deleted nodes."
             ;;
@@ -6562,6 +6686,7 @@ Commands:
   prune             Archive old done nodes
   unarchive <id>    Restore a pruned node from .weave/archive/ [--dry-run] [--with-edges]
   clean-ghosts      Delete ghost edges referencing deleted nodes [--dry-run] [legacy compatibility]
+  commit-refs       Audit recorded commit SHAs against the pushed branch [--json] [--all] [--prune]
   compact           Delete replayed deltas after safety checks [--older-than=Nd]
   refs <file|text>  Extract cross-references (dry-run, no edges)
   import <file>     Import from beads JSONL or JSON

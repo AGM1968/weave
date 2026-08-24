@@ -19,6 +19,7 @@ from unittest.mock import patch
 import pytest
 
 from weave_quality.__main__ import (
+    _DEFAULT_PATTERNS_DIR,
     _discover_files,
     _finding_id,
     _get_current_head,
@@ -26,6 +27,7 @@ from weave_quality.__main__ import (
     _load_pattern_rules,
     _stale_managed_pattern_ids,
     _resolve_repo,
+    _rule_source,
     _run_pattern_rule,
     _shadowed_managed_pattern_ids,
     _wv_cmd,
@@ -492,6 +494,9 @@ class TestCmdPatternsScan:
             assert payload["matches"] == [
                 {
                     "rule_id": "prose-test",
+                    # Provenance travels with the finding, not only with `list`:
+                    # a rule authored under .weave/patterns/ is "custom".
+                    "source": "custom",
                     "path": "doc.md",
                     "line": 1,
                     "col": 3,
@@ -499,12 +504,23 @@ class TestCmdPatternsScan:
                     "severity": "info",
                     "finding_key": payload["matches"][0]["finding_key"],
                     "disposition": "unresolved",
+                    # Finding K: "path" means adjudicated at this exact
+                    # location, "content" means inherited from the same finding
+                    # elsewhere (a rename, a copy, or a gate's temp blob).
+                    "disposition_source": "path",
                     "scan_count": 1,
                 }
             ]
             assert payload["matches"][0]["finding_key"].startswith("qf-")
+            # Top-level map lets a by_rule consumer resolve provenance without
+            # walking every match.
+            assert payload["rule_sources"] == {"prose-test": "custom"}
         else:
             assert "doc.md:1:3: [prose-test/info] genuine" in output
+            # Finding C: scan tagged nothing while list tagged every rule, so
+            # the edit-fix loop could not tell a shared core default from a
+            # project-local convention without a separate invocation.
+            assert "prose-test [custom]: 1" in output
 
     def test_scan_finding_path_stays_lexical_through_a_symlink(
         self,
@@ -1798,16 +1814,42 @@ def test_resolve_repo_falls_back_to_repo_root_without_override(
     assert _resolve_repo(None) == str(repo_root_dir)
 
 
-def test_pattern_loader_rejects_duplicate_ids(tmp_path: Path) -> None:
+def test_pattern_loader_skips_duplicate_id_without_aborting_the_load(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Finding N: a duplicate id used to raise, which took every rule down.
+
+    A repo attempting a local override lost all of its register gates at once
+    until it worked out that its own patch was the cause. The colliding file is
+    now skipped, loudly, and every other rule still loads. The earlier tier
+    wins -- defaults and managed are the shared, curated rules -- so a local
+    copy cannot silently swap a shared rule's definition.
+    """
     patterns = tmp_path / ".weave" / "patterns"
     patterns.mkdir(parents=True)
-    (patterns / "prose-register-review.yaml").write_text(
+    collider = patterns / "prose-register-review.yaml"
+    collider.write_text(
         "id: prose-register-review\nlanguage: prose\nkind: regex\n"
         "patterns:\n  - duplicate\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="duplicate pattern id"):
-        _load_pattern_rules(tmp_path, set())
+
+    rules = _load_pattern_rules(tmp_path, set())
+
+    ids = [rule_id for rule_id, _, _ in rules]
+    assert "prose-register-review" in ids
+    assert len(ids) == len(set(ids)), "loader must not return the same id twice"
+    # The default definition survives; the local copy is the one dropped.
+    winner = next(path for rule_id, path, _ in rules if rule_id == "prose-register-review")
+    assert winner.parent == _DEFAULT_PATTERNS_DIR
+    assert winner != collider
+    # Every other default rule still loaded -- the whole point of the change.
+    assert len(ids) > 1
+
+    err = capsys.readouterr().err
+    assert "duplicate pattern id" in err
+    assert str(collider) in err
 
 
 def test_pattern_loader_validates_disabled_rules(tmp_path: Path) -> None:
@@ -6004,3 +6046,103 @@ class TestCmdPromoteMetadataParsing:
         assert result == 0
         out = capsys.readouterr().err
         assert "Updated" in out
+
+
+def test_rule_source_derivation_covers_all_three_origins(tmp_path: Path) -> None:
+    """`list` and `scan` share one derivation, so they cannot drift apart."""
+    assert _rule_source(_DEFAULT_PATTERNS_DIR / "prose-x.yaml") == "default"
+    assert _rule_source(tmp_path / "managed" / "prose-x.yaml") == "managed"
+    assert _rule_source(tmp_path / "patterns" / "prose-x.yaml") == "custom"
+
+def test_adjudication_survives_relocation_but_does_not_bleed(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Finding K: a moved document kept its bytes and lost its whole history.
+
+    finding_key includes the path on purpose -- two files carrying the same
+    match must be adjudicated separately -- so relocation changes every key. The
+    content_key axis lets an unresolved finding inherit a verdict made on the
+    same rule, match and surrounding context elsewhere, which is what a rename,
+    a copy, and a gate materialising a HEAD blob under a temp path all need.
+    """
+    hotzone = tmp_path / "hz"
+    rule = tmp_path / "prose-test.yaml"
+    rule.write_text(
+        "id: prose-test\nlanguage: prose\nkind: lexicon\nterms:\n  - genuine\n",
+        encoding="utf-8",
+    )
+    original = tmp_path / "original.md"
+    original.write_text("The pipeline yields a genuine result here.\n", encoding="utf-8")
+
+    def scan(target: Path) -> dict[str, object]:
+        args = argparse.Namespace(hot_zone=str(hotzone), path=str(target), json=True)
+        with (
+            patch("weave_quality.__main__._resolve_repo", return_value=str(tmp_path)),
+            patch(
+                "weave_quality.__main__._load_pattern_rules",
+                return_value=[("prose-test", rule, "prose")],
+            ),
+        ):
+            assert cmd_patterns_scan(args) == 0
+        return json.loads(capsys.readouterr().out)
+
+    first = scan(original)
+    original_key = first["matches"][0]["finding_key"]
+    assert first["matches"][0]["disposition"] == "unresolved"
+    assert first["matches"][0]["disposition_source"] == "path"
+
+    adjudicate_args = argparse.Namespace(
+        hot_zone=str(hotzone),
+        finding_key=original_key,
+        disposition="false_positive",
+        note="quotation",
+        json=True,
+    )
+    assert cmd_patterns_adjudicate(adjudicate_args) == 0
+    capsys.readouterr()
+
+    # Same bytes, new location.
+    relocated = tmp_path / "moved" / "relocated.md"
+    relocated.parent.mkdir()
+    relocated.write_text(original.read_text(encoding="utf-8"), encoding="utf-8")
+    moved = scan(relocated)
+    moved_match = moved["matches"][0]
+
+    assert moved_match["finding_key"] != original_key, "path is still part of identity"
+    assert moved_match["disposition"] == "false_positive"
+    assert moved_match["disposition_source"] == "content"
+
+    # A different document with the same matched word but different surrounding
+    # context must NOT inherit -- that is the collision path-keying prevents.
+    other = tmp_path / "other.md"
+    other.write_text("An unrelated sentence about a genuine artifact.\n", encoding="utf-8")
+    other_match = scan(other)["matches"][0]
+    assert other_match["disposition"] == "unresolved"
+    assert other_match["disposition_source"] == "path"
+
+def test_stray_yml_rule_is_reported_not_silently_ignored(tmp_path, capsys):
+    """A rule the loader will not read must say so.
+
+    Only *.yaml is loaded, so a perfectly valid rule saved as .yml never ran
+    and scan, list and validate all stayed silent with exit 0 -- the author had
+    no way to learn their rule was inert. The file is still not loaded
+    (silently activating rules that were never executing would change gate
+    outcomes in existing repos), but its absence is now announced.
+    """
+    patterns = tmp_path / ".weave" / "patterns"
+    patterns.mkdir(parents=True)
+    (patterns / "zz-stray.yml").write_text(
+        "id: zz-stray\nlanguage: prose\ndescription: probe\nseverity: low\n"
+        "patterns:\n  - regex: 'zzzneverappearszzz'\n    message: probe\n",
+        encoding="utf-8",
+    )
+
+    rules = _load_pattern_rules(tmp_path, set())
+
+    assert all(rule_id != "zz-stray" for rule_id, _, _ in rules), (
+        "a .yml file must not be loaded as a rule"
+    )
+    err = capsys.readouterr().err
+    assert "zz-stray.yml" in err, "the ignored file must be named"
+    assert "zz-stray.yaml" in err, "the message must give the rename to make"

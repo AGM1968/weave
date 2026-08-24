@@ -87,8 +87,8 @@ battery() {
 
     local fail=""
     [ "$rc" -ne 0 ] && fail="rc=$rc"
-    if grep -qE "$ERROR_MARKERS" "$out_f" "$err_f" 2>/dev/null; then
-        fail="${fail:+$fail, }error marker: $(grep -hoE "$ERROR_MARKERS" "$out_f" "$err_f" | head -1)"
+    if grep -qE -- "$ERROR_MARKERS" "$out_f" "$err_f" 2>/dev/null; then
+        fail="${fail:+$fail, }error marker: $(grep -hoE -- "$ERROR_MARKERS" "$out_f" "$err_f" | head -1)"
     fi
     if [ "$tier" = "J" ] && ! jq -e . <"$out_f" >/dev/null 2>&1; then
         fail="${fail:+$fail, }stdout not valid JSON"
@@ -183,6 +183,7 @@ battery W load       load
 battery R compact    compact --dry-run
 battery R prune      prune --dry-run
 battery R clean-ghosts clean-ghosts --dry-run
+battery J commit-refs commit-refs --json
 battery R learnings  learnings
 battery R refs       refs -t "see $N_PIPE and $N_DONE"
 battery J search     search "battery" --json

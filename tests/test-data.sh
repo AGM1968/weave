@@ -77,7 +77,10 @@ assert_contains() {
     local haystack="$1"
     local needle="$2"
     local msg="${3:-contains assertion}"
-    if grep -qF "$needle" <<<"$haystack"; then
+    # `--` is required: without it a needle beginning with "-" is parsed as
+    # grep OPTIONS. In this helper that is a false negative; in
+    # assert_not_contains it is a silent false PASS.
+    if grep -qF -- "$needle" <<<"$haystack"; then
         echo -e "  ${GREEN}✓${NC} $msg"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -92,7 +95,9 @@ assert_not_contains() {
     local haystack="$1"
     local needle="$2"
     local msg="${3:-not contains assertion}"
-    if ! grep -qF "$needle" <<<"$haystack"; then
+    # See assert_contains: without `--`, a leading-dash needle makes this
+    # assertion pass without ever testing anything.
+    if ! grep -qF -- "$needle" <<<"$haystack"; then
         echo -e "  ${GREEN}✓${NC} $msg"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -302,7 +307,7 @@ finding_node=$($WV add "Finding: durable evidence should remain live" --force --
 $WV done "$finding_node" --skip-verification >/dev/null 2>&1
 sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-72 hours') WHERE id='$finding_node';"
 output=$($WV prune --age=48h --dry-run 2>&1)
-if ! grep -q "$finding_node" <<<"$output"; then
+if ! grep -q -- "$finding_node" <<<"$output"; then
     echo -e "  ${GREEN}✓${NC} dry-run excludes durable finding node"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -512,8 +517,100 @@ assert_contains "$output" "1." "refs --max shows first reference"
 # Can't assert against "2." since we may match wv-xxx2
 
 # Test refs without input
-output=$($WV refs 2>&1 || true)
+# Bounded deliberately: this is the call that hung. When the suite runs from a
+# shell holding a pipe open on fd 0 it is indistinguishable from the idle-pipe
+# case below, so without `timeout` a regression here does not fail the suite —
+# it stalls it, which is how wv-f541e1 cost 900s and read as a concurrency
+# fault. Verified: reverting the fix makes this line hang until the outer
+# timeout kills the whole run, and every assertion after it goes unreported.
+output=$(timeout 5 $WV refs 2>&1 || true)
 assert_contains "$output" "input required" "refs without input shows error"
+
+# Test refs with an inherited idle pipe on stdin (wv-f541e1)
+# The line above is the case that hung: run from a shell that leaves an open
+# pipe on fd 0, `wv refs` read stdin because it was not a terminal, and waited
+# for a writer that never wrote.
+#
+# The idle producer is a FIFO this shell holds open for writing and never writes
+# to, so fd 0 is a pipe with no data and no EOF — exactly the inherited
+# descriptor that hung — and nothing upstream outlives the assertion. The
+# earlier form, `sleep 10 | timeout 5 $WV refs`, bounded wv but not the
+# pipeline: the shell still waited out the producer, so each assertion cost the
+# producer's full sleep and a producer that never exits would have stalled the
+# suite despite the timeout (wv-2c5615). `timeout` stays on wv, which is what
+# makes the exit code readable — 1 is usage, 124 is still blocked, and
+# asserting merely "nonzero" would pass on the bug.
+idle_fifo="$TEST_DIR/idle-stdin.fifo"
+rm -f "$idle_fifo"
+mkfifo "$idle_fifo"
+exec 9<>"$idle_fifo"
+
+set +e
+timeout 5 $WV refs <"$idle_fifo" >/dev/null 2>&1
+refs_idle_rc=$?
+set -e
+assert_equals "1" "$refs_idle_rc" "refs on an idle stdin pipe fails fast (124 = still blocked)"
+
+output=$(timeout 5 $WV refs <"$idle_fifo" 2>&1 || true)
+assert_contains "$output" "input required" "refs on an idle stdin pipe shows usage"
+
+# An explicit pipe with data still reaches the extractor, and a producer that
+# is slow but real is not mistaken for absent input: the wait is bounded on
+# the first byte, not on the whole stream.
+output=$(echo "See $ref_node for details" | timeout 5 $WV refs 2>&1)
+assert_contains "$output" "$ref_node" "refs still reads a piped stdin"
+
+output=$( (sleep 1; echo "See $ref_node for details") | timeout 8 $WV refs 2>&1)
+assert_contains "$output" "$ref_node" "refs waits for a slow stdin producer"
+
+# Test batch with an inherited idle pipe on stdin (wv-f541e1)
+# Same defect, and worse: cmd_batch defaulted to reading /dev/stdin with no
+# terminal check at all, so it blocked on a bare tty too.
+set +e
+timeout 5 $WV batch <"$idle_fifo" >/dev/null 2>&1
+batch_idle_rc=$?
+set -e
+assert_equals "1" "$batch_idle_rc" "batch on an idle stdin pipe fails fast (124 = still blocked)"
+
+output=$(timeout 5 $WV batch <"$idle_fifo" 2>&1 || true)
+assert_contains "$output" "no input on stdin" "batch on an idle stdin pipe shows usage"
+
+exec 9>&-
+rm -f "$idle_fifo"
+
+# An idle stream and an EMPTY one are different questions, and only the first
+# was asked (wv-2c5615). stdin_has_input answers "a read will not block", which
+# EOF satisfies, so /dev/null passed the guard, no line was executed, and batch
+# reported "0 succeeded, 0 failed (of 0)" with rc 0 — a no-op certified as a
+# successful run. Nothing ran, so nothing is proven.
+set +e
+timeout 5 $WV batch </dev/null >/dev/null 2>&1
+batch_empty_rc=$?
+set -e
+assert_equals "1" "$batch_empty_rc" "batch on empty stdin exits nonzero"
+
+output=$(timeout 5 $WV batch </dev/null 2>&1 || true)
+assert_contains "$output" "no commands to execute" "batch on empty stdin shows usage"
+assert_not_contains "$output" "Batch complete" "batch on empty stdin does not report a completed run"
+
+# A file that parses to nothing is the same no-op by another route.
+printf '# only a comment\n\n   \n' > "$TEST_DIR/batch-blank.txt"
+set +e
+timeout 5 $WV batch "$TEST_DIR/batch-blank.txt" >/dev/null 2>&1
+batch_blank_rc=$?
+set -e
+assert_equals "1" "$batch_blank_rc" "batch on a comments-and-blanks file exits nonzero"
+
+# A whitespace-only line survived the `[ -z ]` skip, ran a bare `wv`, printed
+# the help text and was counted as a succeeded command.
+printf '   \nready --count\n' > "$TEST_DIR/batch-ws.txt"
+output=$(timeout 8 $WV batch "$TEST_DIR/batch-ws.txt" 2>&1 || true)
+assert_contains "$output" "1 succeeded" "batch skips a whitespace-only line rather than running a bare wv"
+assert_not_contains "$output" "Usage: wv <command>" "batch does not execute a whitespace-only line"
+
+# A piped command list is still executed.
+batch_node=$(echo 'add "batch stdin still works"' | timeout 8 $WV batch 2>&1 || true)
+assert_contains "$batch_node" "Batch complete" "batch still reads a piped command list"
 
 echo ""
 
@@ -558,6 +655,19 @@ assert_contains "$list_output" "Imported task 3" "imported task 3 exists"
 json_output=$($WV list --all --json 2>/dev/null)
 todo_count=$(echo "$json_output" | jq '[.[] | select(.status=="todo")] | length')
 assert_equals "1" "$todo_count" "open status mapped to todo"
+
+# wv-360528: import escaped $text in place for the INSERT and then echoed the
+# mutated variable, so apostrophes came back doubled in the confirmation — the
+# same leak cmd_add had. What is echoed must equal what is stored.
+reset_db
+cat > "$TEST_DIR/import-apos.jsonl" << 'EOF'
+{"id":"apos-1","title":"don't split it's quotes","status":"open","priority":1}
+EOF
+output=$($WV import "$TEST_DIR/import-apos.jsonl" 2>&1)
+assert_contains "$output" "don't split it's quotes" "import echoes unescaped text"
+assert_not_contains "$output" "don''t" "import confirmation does not double apostrophes"
+imported_text=$($WV list --all --json 2>/dev/null | jq -r '.[0].text')
+assert_equals "don't split it's quotes" "$imported_text" "import stores apostrophes unescaped"
 
 done_count=$(echo "$json_output" | jq '[.[] | select(.status=="done")] | length')
 assert_equals "1" "$done_count" "closed status mapped to done"
@@ -736,7 +846,7 @@ assert_equals "1" "$line_count" "search respects --limit"
 output=$($WV search "authentication" --status=done 2>&1)
 assert_contains "$output" "$node1" "status filter shows done nodes"
 # Note: output should NOT contain node2 since it's still todo
-if echo "$output" | grep -q "$node2"; then
+if echo "$output" | grep -q -- "$node2"; then
     TESTS_RUN=$((TESTS_RUN + 1))
     echo "  ✗ status filter excludes non-matching status (found $node2 unexpectedly)"
 else
@@ -1144,6 +1254,237 @@ rm -f "$WEAVE_DIR/trails.md"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
+echo "Testing: trails --json/--message contract + append-only Notes (Finding M)"
+# ═══════════════════════════════════════════════════════════════════════════
+# --json validated on capsule but silently discarded on save, and --message
+# REPLACED the Notes section the usage string calls append-only. Two probe
+# saves once reduced a 75-line handoff to one word.
+
+# 1. --json belongs to capsule only; save must reject it rather than ignore it
+rm -f "$WEAVE_DIR/trails.md"
+mj_out=$($WV trails save --json='{not valid json' 2>&1) && mj_rc=0 || mj_rc=$?
+assert_equals "1" "$mj_rc" "wv trails save rejects malformed --json (exit 1)"
+assert_contains "$mj_out" "only valid for" "save --json error names the right subcommand"
+vj_out=$($WV trails save --json='{"marker":"mv"}' 2>&1) && vj_rc=0 || vj_rc=$?
+assert_equals "1" "$vj_rc" "wv trails save rejects well-formed --json too (wrong subcommand)"
+assert_not_contains "$vj_out" "Trails saved" "rejected save never reports success"
+
+# 2. --message belongs to save only; the sibling contract is symmetric
+sym_id=$($WV add "trails contract subject" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+cm_out=$($WV trails capsule "$sym_id" --message="wrong flag" 2>&1) && cm_rc=0 || cm_rc=$?
+assert_equals "1" "$cm_rc" "wv trails capsule rejects --message (exit 1)"
+assert_contains "$cm_out" "only valid for" "capsule --message error names the right subcommand"
+
+# 3. capsule's existing --json contract is unchanged
+cj_out=$($WV trails capsule "$sym_id" --json='{not valid' 2>&1 || true)
+assert_contains "$cj_out" "must be a JSON object" "capsule still rejects malformed --json"
+$WV trails capsule "$sym_id" --json='{"goal":"kept"}' >/dev/null 2>&1
+assert_equals "kept" "$(_meta "$sym_id" | jq -r '.trails[-1].goal')" "capsule still appends a valid entry"
+
+# 4. Notes append rather than replace, newest first, each under a dated heading
+rm -f "$WEAVE_DIR/trails.md"
+$WV trails save --message="M-FIRST note" >/dev/null 2>&1
+$WV trails save --message="M-SECOND note" >/dev/null 2>&1
+mnotes=$(cat "$WEAVE_DIR/trails.md")
+assert_contains "$mnotes" "M-FIRST note" "an earlier note survives the next save"
+assert_contains "$mnotes" "M-SECOND note" "the newest note is present"
+assert_equals "2" "$(grep -c '^### ' "$WEAVE_DIR/trails.md")" "each note gets its own dated heading"
+first_line=$(grep -n 'M-SECOND note' "$WEAVE_DIR/trails.md" | cut -d: -f1)
+second_line=$(grep -n 'M-FIRST note' "$WEAVE_DIR/trails.md" | cut -d: -f1)
+assert_equals "true" "$([ "$first_line" -lt "$second_line" ] && echo true || echo false)" "newest note is written above older notes"
+
+# 5. A save with no --message at all must not drop the notes section
+$WV trails save >/dev/null 2>&1
+bare=$(cat "$WEAVE_DIR/trails.md")
+assert_contains "$bare" "M-FIRST note" "a bare save preserves earlier notes"
+assert_contains "$bare" "M-SECOND note" "a bare save preserves the newest note"
+
+# 6. A note body may contain its own markdown headings without being truncated
+rm -f "$WEAVE_DIR/trails.md"
+$WV trails save --message="$(printf 'head\n\n## Blocked-looking user heading\n\nM-TAIL marker')" >/dev/null 2>&1
+$WV trails save --message="M-NEXT" >/dev/null 2>&1
+assert_contains "$(cat "$WEAVE_DIR/trails.md")" "M-TAIL marker" "a note containing '## ' headings is preserved whole"
+
+# 7. Growth is bounded by WV_TRAILS_NOTES_CAP, dropping oldest first
+rm -f "$WEAVE_DIR/trails.md"
+for mi in 1 2 3 4 5; do WV_TRAILS_NOTES_CAP=3 $WV trails save --message="M-CAP-$mi" >/dev/null 2>&1; done
+assert_equals "3" "$(grep -c '^### ' "$WEAVE_DIR/trails.md")" "notes cap keeps exactly WV_TRAILS_NOTES_CAP entries"
+assert_contains "$(cat "$WEAVE_DIR/trails.md")" "M-CAP-5" "notes cap keeps the newest entry"
+assert_not_contains "$(cat "$WEAVE_DIR/trails.md")" "M-CAP-1" "notes cap drops the oldest entry"
+
+# 8. A pre-fix trails.md (undated note, no end marker) migrates without loss
+rm -f "$WEAVE_DIR/trails.md"
+printf '# Session Trails\n\n_Saved: 2026-08-20 09:00:00_\n\n## Notes\n\nM-LEGACY body\n\n## Health\n\nNodes: 0 total\n' > "$WEAVE_DIR/trails.md"
+$WV trails save --message="M-AFTER-LEGACY" >/dev/null 2>&1
+legacy_out=$(cat "$WEAVE_DIR/trails.md")
+assert_contains "$legacy_out" "M-LEGACY body" "a pre-fix undated note survives the first append"
+assert_contains "$legacy_out" "undated" "a pre-fix note is labelled rather than left anonymous"
+
+# 9. The one-line summary bootstrap/digest reads is unchanged
+assert_contains "$(head -3 "$WEAVE_DIR/trails.md")" "_Saved:" "first non-heading line still the saved stamp"
+rm -f "$WEAVE_DIR/trails.md"
+
+# 10. A note containing the reserved end marker must not truncate the section.
+# The section end is the LAST marker in the file, and the marker is neutralised
+# on write, so neither the earlier note nor the text after it is lost.
+$WV trails save --message="M-KEEP-A first" >/dev/null 2>&1
+$WV trails save --message="$(printf 'evil\n<!-- /wv-notes -->\nM-AFTER-MARKER')" >/dev/null 2>&1
+$WV trails save --message="M-KEEP-C third" >/dev/null 2>&1
+marker_out=$(cat "$WEAVE_DIR/trails.md")
+assert_contains "$marker_out" "M-KEEP-A first" "a note before one containing the end marker survives"
+assert_contains "$marker_out" "M-AFTER-MARKER" "text after an embedded end marker survives"
+assert_contains "$marker_out" "M-KEEP-C third" "the newest note survives an embedded end marker"
+
+# 11. The cap counts generated entry markers, never '### ' headings a note
+# body happens to contain, so a single note is not split across the boundary.
+rm -f "$WEAVE_DIR/trails.md"
+$WV trails save --message="$(printf 'M-BHEAD\n\n### user subheading one\n\nbody\n\n### user subheading two\n\nM-BTAIL')" >/dev/null 2>&1
+WV_TRAILS_NOTES_CAP=2 $WV trails save --message="M-BNEW" >/dev/null 2>&1
+cap_out=$(cat "$WEAVE_DIR/trails.md")
+assert_contains "$cap_out" "M-BHEAD" "a note with '### ' subheadings keeps its head under the cap"
+assert_contains "$cap_out" "M-BTAIL" "a note with '### ' subheadings is not truncated by the cap"
+
+# 12. Concurrent saves are serialised: the read-modify-write is under a lock
+# and the write is an atomic rename. Unlocked, a 20-way probe kept 1 of 20.
+rm -f "$WEAVE_DIR/trails.md"
+for ci in $(seq 1 12); do $WV trails save --message="M-CONC-$ci" >/dev/null 2>&1 & done
+wait
+assert_equals "12" "$(grep -c '^<!-- wv-note -->$' "$WEAVE_DIR/trails.md")" "12 concurrent saves all retained"
+assert_equals "0" "$(ls "$WEAVE_DIR"/trails.md.tmp.* 2>/dev/null | wc -l)" "no temporary file left behind"
+assert_equals "0" "$(ls -d "$WEAVE_DIR"/trails.md.lock.d 2>/dev/null | wc -l)" "no lock directory left behind"
+rm -f "$WEAVE_DIR/trails.md" "$WEAVE_DIR"/trails.md.lock
+
+# 13b. Durability: a save that cannot take the lock, or cannot write, must FAIL
+# rather than report success. Each of these previously returned 0.
+rm -f "$WEAVE_DIR/trails.md" "$WEAVE_DIR"/trails.md.lock
+$WV trails save --message="M-DUR-BASE" >/dev/null 2>&1
+# (a) lock held by another process: the save must not write alongside it
+exec 9>"$WEAVE_DIR/trails.md.lock"
+flock 9 2>/dev/null || true
+dur_out=$(WV_TRAILS_LOCK_WAIT=1 $WV trails save --message="M-DUR-INTRUDER" 2>&1) && dur_rc=0 || dur_rc=$?
+exec 9>&-
+if command -v flock >/dev/null 2>&1; then
+    assert_equals "1" "$dur_rc" "a save that cannot take the held lock exits nonzero"
+    assert_not_contains "$dur_out" "Trails saved" "a lock timeout never reports success"
+    assert_equals "0" "$(grep -c 'M-DUR-INTRUDER' "$WEAVE_DIR/trails.md")" "a lock timeout writes nothing"
+    assert_contains "$(cat "$WEAVE_DIR/trails.md")" "M-DUR-BASE" "a lock timeout leaves the existing notes intact"
+fi
+# (b) the lock is released cleanly, so the next save still works
+$WV trails save --message="M-DUR-AFTER" >/dev/null 2>&1
+assert_contains "$(cat "$WEAVE_DIR/trails.md")" "M-DUR-AFTER" "a save succeeds once the lock is free"
+# (c) an unwritable directory must not report success
+cp "$WEAVE_DIR/trails.md" "$TEST_DIR/dur-before.md"
+chmod a-w "$WEAVE_DIR"
+dur2_out=$($WV trails save --message="M-DUR-UNWRITABLE" 2>&1) && dur2_rc=0 || dur2_rc=$?
+chmod u+w "$WEAVE_DIR"
+assert_equals "1" "$dur2_rc" "a save into an unwritable directory exits nonzero"
+assert_not_contains "$dur2_out" "Trails saved" "a failed write never reports success"
+assert_equals "true" "$(cmp -s "$TEST_DIR/dur-before.md" "$WEAVE_DIR/trails.md" && echo true || echo false)" "a failed write leaves trails.md byte-identical"
+assert_equals "0" "$(ls "$WEAVE_DIR"/trails.md.tmp.* 2>/dev/null | wc -l)" "a failed write leaves no temporary file"
+rm -f "$WEAVE_DIR/trails.md" "$WEAVE_DIR"/trails.md.lock
+
+# (d) tail integrity: a save is validated for the content the generator always
+# writes LAST, not merely for being non-empty. `$?` after the redirected group
+# is the last `echo` inside it, so it cannot report a write that died part way
+# (SC2320); a truncated file whose final line happened to succeed was published
+# as a good save. The Health block is unconditional and last, so its absence is
+# the truncation signal — this asserts the marker the check depends on is
+# actually there, since removing it would silently disable the check.
+$WV trails save --message="M-TAIL" >/dev/null 2>&1
+tr_last=$(tail -n 1 "$WEAVE_DIR/trails.md")
+assert_contains "$tr_last" "<!-- wv-trails-complete --> sections=" "a saved trail ends with the completion sentinel and its section manifest"
+
+# UTF-8: byte-exactness must compare bytes to bytes. `${#var}` counts CHARACTERS
+# in a UTF-8 locale while `wc -c` counts bytes, and comparing the two rejected
+# every non-ASCII note — "café — 你好" is 9 characters and 16 bytes.
+$WV trails save --message="Unicode café — 你好" >/dev/null 2>&1
+tr_utf8_rc=$?
+assert_equals "0" "$tr_utf8_rc" "a note containing multi-byte UTF-8 saves"
+assert_contains "$(cat "$WEAVE_DIR/trails.md")" "café" "the UTF-8 note is present in the saved trail"
+
+# REAL generation failures, injected through WV_LIB_DIR against a mutated copy
+# of the library. Two distinct losses, because they are caught by different
+# machinery and an earlier version of this test conflated them:
+#   heading lost -> the manifest names a section the file does not contain
+#   BODY lost    -> the heading is present and the rows are gone, which heading
+#                   validation cannot see and a byte check cannot see either
+#                   (the body shortens and the file matches it exactly). Caught
+#                   by comparing the DB-derived item count carried in the
+#                   manifest against the rows actually present.
+# The body case replaces the row emission with a FAILING command rather than a
+# redirect: `echo ... >&2` still exits 0 and proves nothing about failure.
+tr_lib=$(mktemp -d)
+cp -r "$REPO_ROOT/scripts/lib" "$REPO_ROOT/scripts/cmd" "$tr_lib/" 2>/dev/null || true
+if [ -f "$tr_lib/cmd/wv-cmd-data.sh" ]; then
+    cp -r "$tr_lib/cmd" "$tr_lib/cmd-body" 2>/dev/null || true
+    sed -i 's|^        echo "## Health"$|        echo "## Health" >\&2|' "$tr_lib/cmd/wv-cmd-data.sh" || true
+    # Body loss: the row emission FAILS outright, leaving the heading intact.
+    sed -i 's|^                echo "- \*\*\$nid\*\* (\$ntype): \$ntext"$|                false|' "$tr_lib/cmd-body/wv-cmd-data.sh" || true
+
+    # An active node is required, or the Active Work section is never emitted
+    # and the body-loss injection would have nothing to lose.
+    tr_body_node=$($WV add "trails body-loss fixture" 2>/dev/null | tail -1)
+    $WV update "$tr_body_node" --status=active >/dev/null 2>&1 || true
+    $WV trails save --message="M-BODY-BASE" >/dev/null 2>&1 || true
+    cp "$WEAVE_DIR/trails.md" "$TEST_DIR/tr-gen-before.md"
+
+    set +e
+    # stdin closed: wv's call-log wrapper tees through `cat`, which blocks
+    # forever on an inherited interactive stdin and hung the whole suite.
+    tr_gen_out=$(WV_LIB_DIR="$tr_lib" $WV trails save --message="M-GEN-FAIL" </dev/null 2>&1)
+    tr_gen_rc=$?
+    set -e
+    assert_equals "1" "$tr_gen_rc" "a lost section heading makes the save exit nonzero"
+    assert_not_contains "$tr_gen_out" "Trails saved" "a lost section heading never reports success"
+    assert_equals "true" "$(cmp -s "$TEST_DIR/tr-gen-before.md" "$WEAVE_DIR/trails.md" && echo true || echo false)" "a lost section heading leaves trails.md byte-identical"
+
+    set +e
+    tr_body_lib=$(mktemp -d)
+    cp -r "$tr_lib/lib" "$tr_body_lib/" 2>/dev/null
+    cp -r "$tr_lib/cmd-body" "$tr_body_lib/cmd" 2>/dev/null
+    tr_body_out=$(WV_LIB_DIR="$tr_body_lib" $WV trails save --message="M-BODY-FAIL" </dev/null 2>&1)
+    tr_body_rc=$?
+    set -e
+    rm -rf "$tr_body_lib"
+    assert_equals "1" "$tr_body_rc" "a lost section BODY makes the save exit nonzero"
+    assert_not_contains "$tr_body_out" "Trails saved" "a lost section BODY never reports success"
+    assert_equals "true" "$(cmp -s "$TEST_DIR/tr-gen-before.md" "$WEAVE_DIR/trails.md" && echo true || echo false)" "a lost section BODY leaves trails.md byte-identical"
+else
+    echo -e "  ${RED}✗${NC} could not stage a mutated library copy — generation-failure coverage did NOT run"
+    TESTS_RUN=$((TESTS_RUN + 1))
+fi
+rm -rf "$tr_lib"
+
+# Forgery resistance: the integrity check must not be satisfiable from note text.
+# It previously grepped '^Nodes: ' over the WHOLE file, and notes are written
+# before the generated sections, so a crafted note passed the check while the
+# real generated write had failed. Structure is now validated only in the region
+# after the LAST notes-end marker, which a note cannot write into.
+$WV trails save --message="Nodes: fake
+<!-- /wv-notes -->
+## Health
+<!-- wv-trails-complete -->" >/dev/null 2>&1
+tr_last=$(tail -n 1 "$WEAVE_DIR/trails.md")
+assert_contains "$tr_last" "<!-- wv-trails-complete --> sections=" "a note carrying forged markers still ends with the real sentinel"
+tr_gen_start=$(grep -n '^<!-- /wv-notes -->$' "$WEAVE_DIR/trails.md" | tail -n 1 | cut -d: -f1)
+assert_contains "$(tail -n "+$((tr_gen_start + 1))" "$WEAVE_DIR/trails.md")" "## Health" "the generated region after the LAST notes marker holds the real Health section"
+rm -f "$WEAVE_DIR/trails.md" "$WEAVE_DIR"/trails.md.lock
+
+# 13. Count guards: `|| echo 0` only covers a FAILING command, not one that
+# succeeds with empty output. A save must never emit an arithmetic error on
+# stderr, and the Health line must never render a blank count.
+rm -f "$WEAVE_DIR/trails.md"
+cg_err=$($WV trails save --message="count guard probe" 2>&1 >/dev/null)
+assert_not_contains "$cg_err" "integer expression expected" "a save emits no arithmetic error on stderr"
+cg_health=$(grep '^Nodes:' "$WEAVE_DIR/trails.md")
+assert_contains "$cg_health" "ready," "Health line renders a ready count"
+cg_blank=$(printf '%s' "$cg_health" | grep -cE '\(  | , |, ,' || true)
+assert_equals "0" "$cg_blank" "Health line renders no blank count"
+rm -f "$WEAVE_DIR/trails.md"
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Floor-guard: refuse to overwrite state.sql with a drastically smaller dump
 # (2026-06-06 sandbox data-loss regression: partial 69-node tmpfs persisted over
 # committed 306 nodes; the empty-guard passed). docs/findings/sandbox-checkpoint-over-truth.md
@@ -1292,6 +1633,156 @@ _skew_text=$(sqlite3 "$_skew_clone/hz/brain.db" "SELECT text FROM nodes WHERE id
 assert_contains "$_skew_load" "Replayed 1 delta(s)" "clock-skew fixture replays through normal load"
 assert_xfail "causally newer checkpoint" "$_skew_text" "clock-skewed timestamp cannot override causal checkpoint"
 rm -rf "$_skew_src" "$_skew_clone"
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo "Testing: trails save when ready nodes exceed the ten-row body cap"
+# ═══════════════════════════════════════════════════════════════════════════
+# Regression (release review 3): the Ready Work heading states the TOTAL ready
+# count while the body is capped at ten rows. The completeness manifest recorded
+# the total, so every graph with more than ten ready nodes failed its own
+# structure check and `wv trails save` wrote NOTHING -- reporting the failure
+# only on stderr. This repository sat at 19 ready with a dead save.
+reset_db
+for _cap_i in $(seq 1 12); do
+    $WV add "over-cap ready node $_cap_i" --force >/dev/null 2>&1
+done
+_cap_ready=$($WV ready --json 2>/dev/null | jq 'length')
+assert_equals "12" "$_cap_ready" "fixture holds more ready nodes than the ten-row body cap"
+
+rm -f "$WEAVE_DIR/trails.md"
+_cap_rc=0
+$WV trails save --message="over-cap save" >/dev/null 2>&1 || _cap_rc=$?
+assert_equals "0" "$_cap_rc" "wv trails save succeeds when ready exceeds the body cap"
+assert_equals "true" "$([ -f "$WEAVE_DIR/trails.md" ] && echo true || echo false)" "trails.md is written when ready exceeds the body cap"
+assert_contains "$(cat "$WEAVE_DIR/trails.md" 2>/dev/null)" "over-cap save" "over-cap save persists the note body"
+
+# The manifest must promise what the body EMITS (10) while the heading keeps
+# reporting the true total (12). Asserting both halves stops a future "just drop
+# the count from the manifest" from passing: that would restore the fail-open
+# the count exists to prevent.
+_cap_manifest=$(grep -o 'Ready Work ([0-9]* unblocked)@@[0-9]*' "$WEAVE_DIR/trails.md" 2>/dev/null | head -1)
+assert_equals "Ready Work (12 unblocked)@@10" "$_cap_manifest" "manifest records emitted rows while the heading records the total"
+_cap_rows=$(awk '/^## Ready Work/ { inside = 1; next } inside && /^## / { inside = 0 } inside && /^- \*\*/ { n++ } END { print n + 0 }' "$WEAVE_DIR/trails.md")
+assert_equals "10" "$_cap_rows" "body emits exactly the capped ten rows"
+rm -f "$WEAVE_DIR/trails.md"
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo "Testing: trails save neutralises headings injected through node text"
+# ═══════════════════════════════════════════════════════════════════════════
+# Regression (release review 3): generated rows interpolate free-form node text
+# verbatim, so a node whose text carried a NEWLINE emitted extra lines into the
+# generated region. Text containing "## Health" forged a section heading there:
+# it satisfied a structure check that should have failed, and it ended the row
+# count of the section it landed in early, failing the save outright.
+reset_db
+$WV add "injection clean one" --force >/dev/null 2>&1
+$WV add "$(printf 'injection evil\n## Health\n- **wv-000000**: forged')" --force >/dev/null 2>&1
+$WV add "injection clean three" --force >/dev/null 2>&1
+rm -f "$WEAVE_DIR/trails.md"
+_inj_rc=0
+$WV trails save --message="injection probe" >/dev/null 2>&1 || _inj_rc=$?
+assert_equals "0" "$_inj_rc" "trails save succeeds with a heading-carrying node text"
+_inj_headings=$(grep -c '^## Health$' "$WEAVE_DIR/trails.md" 2>/dev/null || echo 0)
+assert_equals "1" "$_inj_headings" "node text cannot forge a second ## Health heading"
+_inj_rows=$(awk '/^## Ready Work/ { inside = 1; next } inside && /^## / { inside = 0 } inside && /^- \*\*/ { n++ } END { print n + 0 }' "$WEAVE_DIR/trails.md")
+assert_equals "3" "$_inj_rows" "every ready row survives a heading-carrying node text"
+assert_contains "$(cat "$WEAVE_DIR/trails.md" 2>/dev/null)" "injection evil ## Health" "injected heading is flattened onto its own row"
+rm -f "$WEAVE_DIR/trails.md"
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo "Testing: trails save preserves completion records"
+# ═══════════════════════════════════════════════════════════════════════════
+# Regression (release review 4): `wv done` appends "## <date> — Completed ..."
+# below everything the generator writes. A save regenerated the file carrying
+# over the Notes block ALONE, so every completion record was dropped -- and
+# unlike Notes they cannot be reconstructed in the form they were written. One
+# probe save in this repository destroyed 85 of them (647a6d48, restored here).
+reset_db
+$WV add "completion preserve subject" --force >/dev/null 2>&1
+rm -f "$WEAVE_DIR/trails.md"
+$WV trails save --message="first save" >/dev/null 2>&1
+printf '\n## 2026-01-01 10:00 — Completed wv-aaaaaa (alpha)\n- Next ready: wv-bbbbbb\n\n## 2026-01-02 11:00 — Completed wv-cccccc (gamma)\n' >> "$WEAVE_DIR/trails.md"
+_cmp_before=$(grep -c '^## 20[0-9][0-9]-' "$WEAVE_DIR/trails.md" || true)
+assert_equals "2" "$_cmp_before" "fixture holds two completion records before the save"
+
+_cmp_rc=0
+$WV trails save --message="second save" >/dev/null 2>&1 || _cmp_rc=$?
+assert_equals "0" "$_cmp_rc" "trails save succeeds with completion records present"
+_cmp_after=$(grep -c '^## 20[0-9][0-9]-' "$WEAVE_DIR/trails.md" || true)
+assert_equals "2" "$_cmp_after" "completion records survive a regenerating save"
+assert_contains "$(cat "$WEAVE_DIR/trails.md")" "Completed wv-aaaaaa (alpha)" "the oldest completion record is preserved verbatim"
+assert_contains "$(cat "$WEAVE_DIR/trails.md")" "- Next ready: wv-bbbbbb" "a record's body lines are preserved, not just its heading"
+assert_contains "$(cat "$WEAVE_DIR/trails.md")" "second save" "the new note is still written alongside them"
+
+# Preserved records must not be re-scanned as generated sections: their
+# "## <date>" lines would otherwise read as section headings, and they must not
+# multiply across saves either.
+$WV trails save --message="third save" >/dev/null 2>&1
+_cmp_third=$(grep -c '^## 20[0-9][0-9]-' "$WEAVE_DIR/trails.md" || true)
+assert_equals "2" "$_cmp_third" "records are preserved once per save, not duplicated"
+_cmp_sentinel=$(grep -c 'wv-trails-complete' "$WEAVE_DIR/trails.md" || true)
+assert_equals "1" "$_cmp_sentinel" "exactly one end-of-generation sentinel survives"
+rm -f "$WEAVE_DIR/trails.md"
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo "Testing: a failed post-GitHub projection is not certified as a sync"
+# ═══════════════════════════════════════════════════════════════════════════
+# Regression (release review 4 follow-up): the three projections ran as
+# `cmd && [ -s ] && mv || rm -f`, and the trailing rm SUCCEEDS -- so a failed
+# projection made the line exit 0 and both sync stamps were written anyway,
+# certifying GitHub mutations that reached no file on disk. needs_sync then
+# read clean forever. Driven through WV_TEST_SYNC_STUB because the real
+# GitHub step fails offline and returns before this code is reached.
+_syncdir=$(mktemp -d)
+(cd "$_syncdir" && git init -q 2>/dev/null && git config user.email t@t.invalid && git config user.name t && git config commit.gpgsign false)
+_SY=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_syncdir" "WV_HOT_ZONE=$_syncdir/hz" "WEAVE_DIR=$_syncdir/.weave" WV_REQUIRE_LEARNING=0)
+"${_SY[@]}" "$WV" init >/dev/null 2>&1
+"${_SY[@]}" "$WV" add "sync stamp probe" --force >/dev/null 2>&1
+
+# A healthy sync records both stamps — otherwise the removal check below is
+# satisfied by them never having existed.
+_sync_rc=0
+"${_SY[@]}" WV_TEST_MODE=1 WV_TEST_SYNC_STUB=ok "$WV" sync --gh </dev/null >/dev/null 2>&1 || _sync_rc=$?
+assert_equals "0" "$_sync_rc" "a healthy sync succeeds"
+_sync_stamps=$(ls "$_syncdir/hz/.last_gh_sync" "$_syncdir/hz/.last_gh_sync_seq" 2>/dev/null | wc -l | tr -d ' ')
+assert_equals "2" "$_sync_stamps" "a healthy sync records both stamps"
+
+# Each projection failure must fail the command AND clear the stamps left by
+# the healthy sync above.
+for _sync_target in state nodes edges; do
+    _sync_rc=0
+    "${_SY[@]}" WV_TEST_MODE=1 WV_TEST_SYNC_STUB="fail:$_sync_target" "$WV" sync --gh </dev/null >/dev/null 2>&1 || _sync_rc=$?
+    assert_equals "1" "$_sync_rc" "a failed $_sync_target projection makes wv sync --gh exit nonzero"
+    _sync_stamps=$(ls "$_syncdir/hz/.last_gh_sync" "$_syncdir/hz/.last_gh_sync_seq" 2>/dev/null | wc -l | tr -d ' ')
+    assert_equals "0" "$_sync_stamps" "a failed $_sync_target projection clears both sync stamps"
+    # Restore the stamps so the next iteration also tests REMOVAL.
+    "${_SY[@]}" WV_TEST_MODE=1 WV_TEST_SYNC_STUB=ok "$WV" sync --gh </dev/null >/dev/null 2>&1 || true
+done
+
+# The hook itself must not be a bypass. Gating it on the variable merely being
+# NONEMPTY meant any unrecognised value skipped the real GitHub call and still
+# reported local success -- a test hook silently diverting production behaviour.
+_sync_rc=0
+_sync_out=$("${_SY[@]}" WV_TEST_MODE=1 WV_TEST_SYNC_STUB=typo "$WV" sync --gh </dev/null 2>&1) || _sync_rc=$?
+assert_equals "1" "$_sync_rc" "an unrecognised WV_TEST_SYNC_STUB value fails instead of bypassing GitHub"
+assert_contains "$_sync_out" "not a recognised value" "the rejection names the offending value"
+
+# Without the master opt-in the hook is inert, so a stray value in a real
+# environment cannot divert a real sync. No stamps means no bypass happened.
+rm -f "$_syncdir/hz/.last_gh_sync" "$_syncdir/hz/.last_gh_sync_seq"
+"${_SY[@]}" WV_TEST_SYNC_STUB=ok "$WV" sync --gh </dev/null >/dev/null 2>&1 || true
+_sync_stamps=$(ls "$_syncdir/hz/.last_gh_sync" "$_syncdir/hz/.last_gh_sync_seq" 2>/dev/null | wc -l | tr -d ' ')
+assert_equals "0" "$_sync_stamps" "WV_TEST_SYNC_STUB is inert without WV_TEST_MODE=1"
+
+rm -rf "$_syncdir"
+
+echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Summary

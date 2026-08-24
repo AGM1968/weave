@@ -1291,15 +1291,33 @@ def _advance_block_states(
 _BACKTICK_RUN_RE = re.compile(r"`+")
 
 
+def _leading_backslash_escaped(line: str, index: int) -> bool:
+    """True if the character at `index` is escaped by backslash.
+
+    CommonMark backslash-escaping consumes exactly one following character
+    per backslash, so what matters is the parity of the run of backslashes
+    immediately before `index`: an odd run escapes it, an even run (each
+    pair having escaped itself) does not.
+    """
+    count = 0
+    i = index - 1
+    while i >= 0 and line[i] == "\\":
+        count += 1
+        i -= 1
+    return count % 2 == 1
+
+
 def _mask_inline_code(line: str, open_run_len: int = 0) -> tuple[str, int, bool, str]:
     """Replace CommonMark inline-code span content with a neutral filler.
 
     Approximates CommonMark's inline-code rule: an opening run of N
     backticks is closed by the next run of exactly N backticks; an opening
     run with no matching close anywhere in the document is literal text, not
-    a code span. Used to keep a verbatim-marker directive from being
-    recognized when it's merely being *mentioned* inside inline code (e.g.
-    documentation about the marker itself), not written as a real
+    a code span. A backtick that is itself backslash-escaped (an odd run of
+    backslashes immediately before it) cannot open a span either -- see
+    _leading_backslash_escaped. Used to keep a verbatim-marker directive from
+    being recognized when it's merely being *mentioned* inside inline code
+    (e.g. documentation about the marker itself), not written as a real
     standalone directive line.
 
     open_run_len carries an unmatched opening backtick run's length in from
@@ -1351,22 +1369,39 @@ def _mask_inline_code(line: str, open_run_len: int = 0) -> tuple[str, int, bool,
     for run in _BACKTICK_RUN_RE.finditer(line, pos):
         if run.start() < masked_until:
             continue  # inside an already-masked span
+        run_start = run.start()
         run_len = len(run.group(0))
+        if _leading_backslash_escaped(line, run_start):
+            # A backslash escapes exactly the run's first backtick, which
+            # CommonMark then renders as a literal backtick rather than a
+            # code-span delimiter: \`literal, not code\` is prose, not a
+            # span (confirmed against Pandoc; see
+            # WEAVE_RULE_CONTRIBUTION_2026-08-14 Part 5.3, C4). Only that
+            # one backtick is exempt -- any backticks remaining in the run
+            # still form a shorter, unescaped run. This exemption applies
+            # only to a run that might OPEN a span here; a run searched for
+            # as a CLOSE (above, and in the `close = re.search(...)` calls
+            # below) is unaffected, since backslash escapes do not apply
+            # inside an already-open code span either way.
+            run_start += 1
+            run_len -= 1
+            if run_len == 0:
+                continue
         close = re.search(rf"(?<!`)`{{{run_len}}}(?!`)", line[run.end():])
         if close is None:
             # Unmatched on this line -- may still close on a later physical
             # line, so mask speculatively through EOL and carry the run
             # length forward. If THIS run never closes, only its own
-            # suffix (from run.start() onward) reverts to literal --
+            # suffix (from run_start onward) reverts to literal --
             # everything before it (including an incoming run that DID
             # close earlier on this same line) stays masked/proven.
-            for i in range(run.start(), len(line)):
+            for i in range(run_start, len(line)):
                 out[i] = "\0"
             masked = "".join(out)
-            literal_replay = masked[: run.start()] + line[run.start() :]
+            literal_replay = masked[:run_start] + line[run_start:]
             return masked, run_len, incoming_closed, literal_replay
         span_end = run.end() + close.end()
-        for i in range(run.start(), span_end):
+        for i in range(run_start, span_end):
             out[i] = "\0"
         masked_until = span_end
     resolved = "".join(out)
@@ -3382,10 +3417,12 @@ def _is_author_date_name(token: str) -> bool:
     )
 
 
-def _citation_findings(text: str, rule: dict[str, object]) -> list[_Span]:
-    """Resolve simple author-date citations against a Markdown references section."""
-    modes = set(_string_list(rule, "terms"))
-    lines = text.splitlines()
+def _locate_references_section(lines: list[str]) -> tuple[int, int]:
+    """Return (references_start, references_end): the line range of a
+    Markdown references/bibliography section, closed by the next heading at
+    the same or a shallower level. (len(lines), len(lines)) when no such
+    heading exists at all.
+    """
     reference_heading = next(
         (
             (index, match)
@@ -3395,20 +3432,26 @@ def _citation_findings(text: str, rule: dict[str, object]) -> list[_Span]:
         None,
     )
     if reference_heading is None:
-        references_start = references_end = len(lines)
-    else:
-        references_start, heading_match = reference_heading
-        reference_level = len(heading_match.group("marks"))
-        references_end = next(
-            (
-                index
-                for index, line in enumerate(lines[references_start + 1 :], references_start + 1)
-                if (match := _ATX_HEADING_LEVEL_RE.match(line))
-                and len(match.group("marks")) <= reference_level
-            ),
-            len(lines),
-        )
-    references = lines[references_start + 1 : references_end]
+        return len(lines), len(lines)
+    references_start, heading_match = reference_heading
+    reference_level = len(heading_match.group("marks"))
+    references_end = next(
+        (
+            index
+            for index, line in enumerate(lines[references_start + 1 :], references_start + 1)
+            if (match := _ATX_HEADING_LEVEL_RE.match(line))
+            and len(match.group("marks")) <= reference_level
+        ),
+        len(lines),
+    )
+    return references_start, references_end
+
+
+def _extract_citations(
+    lines: list[str], rule: dict[str, object], references_start: int, references_end: int
+) -> list[tuple[_ScanLine, int, int, str, str, str]]:
+    """Author-date citations in the body text -- everything outside the
+    references section itself, both before and after it."""
     citations: list[tuple[_ScanLine, int, int, str, str, str]] = []
     for segment_start, segment in (
         (0, lines[:references_start]),
@@ -3438,53 +3481,96 @@ def _citation_findings(text: str, rule: dict[str, object]) -> list[_Span]:
                             inner.group(0),
                         )
                     )
+    return citations
 
+
+def _build_reference_units(
+    references: list[str],
+    rule: dict[str, object],
+    references_start: int,
+    citation_count: int,
+) -> list[_ScanLine]:
+    """Paragraph-scoped scan lines for the references section itself.
+
+    .index continues on from citation_count so the body citations and the
+    reference-section units share one monotonic index space.
+    """
     reference_units: list[_ScanLine] = []
-    if references:
-        line_delta = references_start + 1
-        for unit in _scan_lines("\n".join(references), {**rule, "match_scope": "paragraph"}):
-            reference_units.append(
-                _ScanLine(
-                    unit.text,
-                    tuple(
-                        (start, lineno + line_delta, source_col)
-                        for start, lineno, source_col in unit.starts
-                    ),
-                    unit.index + len(citations),
-                )
+    if not references:
+        return reference_units
+    line_delta = references_start + 1
+    for unit in _scan_lines("\n".join(references), {**rule, "match_scope": "paragraph"}):
+        reference_units.append(
+            _ScanLine(
+                unit.text,
+                tuple(
+                    (start, lineno + line_delta, source_col)
+                    for start, lineno, source_col in unit.starts
+                ),
+                unit.index + citation_count,
             )
+        )
+    return reference_units
+
+
+def _unresolved_author_date_findings(
+    citations: list[tuple[_ScanLine, int, int, str, str, str]],
+    reference_units: list[_ScanLine],
+) -> list[_Span]:
+    """Citations naming an author-year the references section never backs."""
+    out: list[_Span] = []
+    for scan_line, start, end, raw_author, year, match_text in citations:
+        author = raw_author.lower()
+        if any(
+            re.search(rf"\b{re.escape(author)}\b", unit.text, re.I)
+            and re.search(rf"\b{year}\b", unit.text)
+            for unit in reference_units
+        ):
+            continue
+        out.append((scan_line, start, end, match_text))
+    return out
+
+
+def _missing_year_findings(
+    reference_units: list[_ScanLine], cited_authors: set[str]
+) -> list[_Span]:
+    """Reference entries that name a cited author but carry no year."""
+    out: list[_Span] = []
+    for unit in reference_units:
+        lowered = unit.text.lower()
+        entry_author = next(
+            (name for name in cited_authors if re.search(rf"\b{re.escape(name)}\b", lowered)),
+            None,
+        )
+        if entry_author is None or re.search(r"\b(?:19|20)\d{2}\b", unit.text):
+            continue
+        start = lowered.index(entry_author)
+        out.append(
+            (
+                unit,
+                start,
+                start + len(entry_author),
+                unit.text[start : start + len(entry_author)],
+            )
+        )
+    return out
+
+
+def _citation_findings(text: str, rule: dict[str, object]) -> list[_Span]:
+    """Resolve simple author-date citations against a Markdown references section."""
+    modes = set(_string_list(rule, "terms"))
+    lines = text.splitlines()
+    references_start, references_end = _locate_references_section(lines)
+    references = lines[references_start + 1 : references_end]
+    citations = _extract_citations(lines, rule, references_start, references_end)
+    reference_units = _build_reference_units(references, rule, references_start, len(citations))
 
     out: list[_Span] = []
-    cited_authors = {author.lower() for _line, _start, _end, author, _year, _text in citations}
     if "unresolved-author-date" in modes:
-        for scan_line, start, end, raw_author, year, match_text in citations:
-            author = raw_author.lower()
-            if any(
-                re.search(rf"\b{re.escape(author)}\b", unit.text, re.I)
-                and re.search(rf"\b{year}\b", unit.text)
-                for unit in reference_units
-            ):
-                continue
-            out.append((scan_line, start, end, match_text))
-
+        out.extend(_unresolved_author_date_findings(citations, reference_units))
     if "cited-reference-missing-year" in modes and citations:
-        for unit in reference_units:
-            lowered = unit.text.lower()
-            entry_author = next(
-                (name for name in cited_authors if re.search(rf"\b{re.escape(name)}\b", lowered)),
-                None,
-            )
-            if entry_author is None or re.search(r"\b(?:19|20)\d{2}\b", unit.text):
-                continue
-            start = lowered.index(entry_author)
-            out.append(
-                (
-                    unit,
-                    start,
-                    start + len(entry_author),
-                    unit.text[start : start + len(entry_author)],
-                )
-            )
+        cited_authors = {author.lower() for _line, _start, _end, author, _year, _text in citations}
+        out.extend(_missing_year_findings(reference_units, cited_authors))
     return out
 
 

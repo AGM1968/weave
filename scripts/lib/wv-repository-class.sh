@@ -225,8 +225,8 @@ wv_repository_audit_json() {
         $0 ~ /^scripts\/hooks\/.*-weave\.sh$/ { print }
     ' > "$tracked_file"
     {
-        git -C "$repo" grep -Il -E "$marker_ere" -- ':!*.lock' 2>/dev/null || true
-        git -C "$repo" grep --cached -Il -E "$marker_ere" -- ':!*.lock' 2>/dev/null || true
+        git -C "$repo" grep -Il -E -e "$marker_ere" -- ':!*.lock' 2>/dev/null || true
+        git -C "$repo" grep --cached -Il -E -e "$marker_ere" -- ':!*.lock' 2>/dev/null || true
     } | awk 'NF && !seen[$0]++' > "$markers_file"
     {
         git -C "$repo" log --all --reflog --full-history --format='%H' -- \

@@ -134,6 +134,47 @@ assert_equals "1" "$rc" "download_file: returns 1 when curl fails"
 assert_equals "installed copy" "$(cat "$TEST_DIR/dst/g.sh")" "download_file: dst content untouched when curl fails"
 assert_equals "" "$(cat "$MANIFEST")" "download_file: does not record a failed download in the manifest"
 
+# ── installer wiring the repo actually depends on ─────────────────────────
+# Two defects sat here unnoticed: install.sh DEFINED install_git_hook_from_repo
+# and never called it (the only call sites live inside the wv-init-repo
+# heredoc), so a normal upgrade left .git/hooks/ at whatever version it was
+# scaffolded with; and an install recorded no provenance, so VERSION alone
+# could not say which fixes it carried — a consumer sat 72 commits behind at an
+# identical version string.
+INSTALL_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/install.sh"
+_heredoc_end=$(awk '/^INITEOF$/ {print NR; exit}' "$INSTALL_SH")
+# Match INVOCATIONS only: a prose mention in a comment counts otherwise, which
+# is how the first version of this check passed with a call removed.
+_call_lines=$(grep -nE '^[[:space:]]*install_git_hook_from_repo ' "$INSTALL_SH" | cut -d: -f1)
+_outside=0
+for _l in $_call_lines; do
+    [ -n "$_heredoc_end" ] && [ "$_l" -gt "$_heredoc_end" ] && _outside=$((_outside + 1))
+    [ -n "$_heredoc_end" ] && [ "$_l" -lt "$_heredoc_end" ] || true
+done
+# Calls before the heredoc's start are the installer's own; count those.
+_heredoc_start=$(grep -n 'wv-init-repo" << .INITEOF' "$INSTALL_SH" | head -1 | cut -d: -f1)
+_own=0
+for _l in $_call_lines; do
+    if [ -n "$_heredoc_start" ] && [ "$_l" -lt "$_heredoc_start" ]; then _own=$((_own + 1)); fi
+done
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ "$_own" -ge 3 ]; then
+    echo -e "  ${GREEN}✓${NC} install.sh refreshes this repo's git hooks itself, not only via wv-init-repo"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "  ${RED}✗${NC} install.sh does not call install_git_hook_from_repo outside the wv-init-repo heredoc ($_own calls)"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q 'INSTALL_PROVENANCE' "$INSTALL_SH"; then
+    echo -e "  ${GREEN}✓${NC} install.sh records install provenance"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "  ${RED}✗${NC} install.sh records no install provenance — VERSION alone cannot say which fixes an install carries"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
 echo ""
 echo "========================================"
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

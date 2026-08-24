@@ -96,7 +96,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF "$needle"; then
+    if echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "  ${GREEN}[PASS]${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -279,7 +279,13 @@ test_hooks_have_installed_resolver_fallback() {
             TESTS_FAILED=$((TESTS_FAILED + 1))
             continue
         fi
-        if grep -q '\.config/weave/lib/wv-resolve-project\.sh' "$hook_path" 2>/dev/null; then
+        # Matches both shapes: a literal per-library source line, and a hook that
+        # resolves the library NAME through a shared search path (pre-action.sh).
+        # The assertion is that the installed location is reachable at all, not
+        # that one particular line spells it out — pinning the line shape made a
+        # refactor that KEPT the fallback look like it had dropped it.
+        if grep -q '\.config/weave/lib/wv-resolve-project\.sh' "$hook_path" 2>/dev/null \
+            || grep -q '\.config/weave/lib' "$hook_path" 2>/dev/null; then
             echo -e "  ${GREEN}[PASS]${NC} $hook_rel has installed resolver fallback"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -287,6 +293,91 @@ test_hooks_have_installed_resolver_fallback() {
             TESTS_FAILED=$((TESTS_FAILED + 1))
         fi
     done
+}
+
+# Behavioural counterpart to the grep above: prove pre-action.sh really does
+# load its libraries from the installed location, by running a copy that has no
+# sibling libs at all and a HOME pointing at a synthetic install. The grep can
+# only see that a path is mentioned; this sees it used.
+test_pre_action_resolves_installed_libs() {
+    echo "-- pre-action.sh resolves libraries from the installed location"
+    TESTS_RUN=$((TESTS_RUN + 1))
+
+    local sandbox fake_home rc
+    sandbox=$(mktemp -d)
+    fake_home="$sandbox/home"
+    mkdir -p "$fake_home/.config/weave/lib" "$sandbox/elsewhere"
+    cp "$PROJECT_ROOT"/scripts/lib/wv-resolve-project.sh \
+       "$PROJECT_ROOT"/scripts/lib/wv-validate.sh \
+       "$PROJECT_ROOT"/scripts/lib/wv-config.sh \
+       "$PROJECT_ROOT"/scripts/lib/wv-hook-common.sh \
+       "$PROJECT_ROOT"/scripts/lib/wv-resolve-runtime.sh \
+       "$fake_home/.config/weave/lib/" 2>/dev/null
+    cp "$PROJECT_ROOT/.claude/hooks/pre-action.sh" "$sandbox/elsewhere/pre-action.sh"
+
+    # A malformed payload is the cheapest proof the libraries loaded: the exit-2
+    # verdict comes from _hc_classify_tool + _hc_check_payload, so a hook that
+    # failed to source them could not produce it.
+    set +e
+    echo '{"tool_input":{"file_path":"x.py"}}' \
+        | env HOME="$fake_home" bash "$sandbox/elsewhere/pre-action.sh" >/dev/null 2>&1
+    rc=$?
+    set -e
+    rm -rf "$sandbox"
+
+    if [ "$rc" -eq 2 ]; then
+        echo -e "  ${GREEN}[PASS]${NC} installed-location libraries are loaded and enforce"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo -e "  ${RED}[FAIL]${NC} hook with no sibling libs did not enforce via installed libs (rc=$rc)"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+}
+
+# A readable library is not necessarily a loadable one. When the nearest copy is
+# broken, the search must fall through to a valid one further out: a hook that
+# claims the load and then dies at its first _hc_* call exits 127, which
+# PreToolUse reads as ALLOW — so a malformed mutation payload that must be
+# blocked with 2 sails through instead. Silent, and worse than a hard failure.
+test_pre_action_falls_through_broken_library() {
+    echo "-- pre-action.sh falls through a broken nearest library (${1:-syntax})"
+    TESTS_RUN=$((TESTS_RUN + 1))
+
+    local sandbox fake_home rc
+    sandbox=$(mktemp -d)
+    fake_home="$sandbox/home"
+    mkdir -p "$fake_home/.config/weave/lib" "$sandbox/hooks" "$sandbox/lib"
+    cp "$PROJECT_ROOT"/scripts/lib/wv-resolve-project.sh \
+       "$PROJECT_ROOT"/scripts/lib/wv-validate.sh \
+       "$PROJECT_ROOT"/scripts/lib/wv-config.sh \
+       "$PROJECT_ROOT"/scripts/lib/wv-hook-common.sh \
+       "$PROJECT_ROOT"/scripts/lib/wv-resolve-runtime.sh \
+       "$fake_home/.config/weave/lib/" 2>/dev/null
+    cp "$PROJECT_ROOT/.claude/hooks/pre-action.sh" "$sandbox/hooks/pre-action.sh"
+    # Nearest candidate ($HOOK_DIR/../lib): readable, and broken in the way the
+    # caller asks for. "syntax" dies before running anything; "guard" is the
+    # nastier one — it sets the library's own double-source guard and THEN fails,
+    # so a fallback that re-sources hits that guard and returns immediately,
+    # leaving the library unloaded even though the source appeared to succeed.
+    case "${1:-syntax}" in
+        guard)  printf '_WV_HOOK_COMMON_LOADED=1\nreturn 1\n' > "$sandbox/lib/wv-hook-common.sh" ;;
+        *)      printf 'this is ( not valid bash\n' > "$sandbox/lib/wv-hook-common.sh" ;;
+    esac
+
+    set +e
+    echo '{"tool_input":{"file_path":"x.py"}}' \
+        | env HOME="$fake_home" bash "$sandbox/hooks/pre-action.sh" >/dev/null 2>&1
+    rc=$?
+    set -e
+    rm -rf "$sandbox"
+
+    if [ "$rc" -eq 2 ]; then
+        echo -e "  ${GREEN}[PASS]${NC} ${1:-syntax}-broken nearest library falls through to the installed one (rc=2)"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo -e "  ${RED}[FAIL]${NC} expected 2 (block) with a ${1:-syntax}-broken nearest library, got rc=$rc"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
 }
 
 # ─── Per-check unit tests (t6) ────────────────────────────────────────────────
@@ -529,6 +620,9 @@ main() {
     test_db_preflight_graceful_when_missing
     test_all_hooks_source_common
     test_hooks_have_installed_resolver_fallback
+    test_pre_action_resolves_installed_libs
+    test_pre_action_falls_through_broken_library syntax
+    test_pre_action_falls_through_broken_library guard
     test_install_sh_ships_hook_common
 
     echo ""

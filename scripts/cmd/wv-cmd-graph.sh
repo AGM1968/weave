@@ -923,11 +923,22 @@ cmd_context() {
 
     # bootstrap mode: blockers only — skip all expensive traversals
     if [ "$mode" = "bootstrap" ]; then
+        # wv-5850d4: same argv-size hazard as the full composer below — node
+        # metadata alone can outgrow MAX_ARG_STRLEN — so read payloads from
+        # files here too.
+        local bootstrap_pack
+        bootstrap_pack=$(mktemp -d "$cache_dir/.pack-XXXXXX") || return 1
+        printf '%s' "$node_json"       > "$bootstrap_pack/node.json"
+        printf '%s' "$blockers_json"   > "$bootstrap_pack/blockers.json"
+        printf '%s' "$self_block_json" > "$bootstrap_pack/self_block.json"
         jq -n \
-            --argjson node "$node_json" \
-            --argjson blockers "$blockers_json" \
-            --argjson self_block "$self_block_json" \
-            '($self_block[0].blocked_reason // null) as $br
+            --slurpfile _node "$bootstrap_pack/node.json" \
+            --slurpfile _blockers "$bootstrap_pack/blockers.json" \
+            --slurpfile _self_block "$bootstrap_pack/self_block.json" \
+            '$_node[0] as $node |
+             $_blockers[0] as $blockers |
+             $_self_block[0] as $self_block |
+             ($self_block[0].blocked_reason // null) as $br
              # wv-cccf70: {id,text,status} dropped done_criteria/risks/
              # risk_level entirely -- wv preflight was the only reliable
              # read path for has_done_criteria, confirmed exact match to
@@ -941,7 +952,12 @@ cmd_context() {
                 blocked: ($br != null),
                 blocked_reason: $br,
                 blockers: ($blockers | map({id, text, status}))}'
-        return 0
+        local bootstrap_rc=$?
+        rm -rf "$bootstrap_pack"
+        if [ "$bootstrap_rc" -ne 0 ]; then
+            echo -e "${RED}Error: failed to compose bootstrap context for $id${NC}" >&2
+        fi
+        return "$bootstrap_rc"
     fi
 
     # Get ancestors (walk blocks + implements chains with cycle detection and depth limit)
@@ -988,7 +1004,8 @@ cmd_context() {
         FROM edges e
         JOIN nodes n ON n.id = e.source
         WHERE e.target = '$id' AND e.type != 'blocks'
-        ORDER BY weight DESC;
+        ORDER BY weight DESC
+        LIMIT 5;
     ")
     related_json="${related_json:-[]}"
 
@@ -1013,6 +1030,13 @@ cmd_context() {
     # Walk all edge types (blocks, implements, addresses, references) in both
     # directions to build the reachable set, then filter for pitfall nodes.
     # Depth-limited to 4 hops to prevent runaway traversal on large graphs.
+    #
+    # wv-5850d4: two corrections here. (1) The LIMIT matches the composer's
+    # $pitfalls[0:3] slice — without it a wide neighborhood (wv-a8c823: 217
+    # nodes, 56 pitfall rows, ~140KB of metadata) fetched megabytes only to
+    # discard all but three. (2) json(n.metadata) had no AS metadata alias, so
+    # the column arrived as "json(n.metadata)" and the composer's .metadata was
+    # always null — every pitfall rendered with pitfall: null.
     local pitfalls_json
     pitfalls_json=$(db_query_json "
         WITH RECURSIVE node_neighborhood AS (
@@ -1029,18 +1053,21 @@ cmd_context() {
                 SELECT e.source FROM edges e WHERE e.target = a.id
             )
         )
-        SELECT DISTINCT n.id, n.text, n.status, json(n.metadata)
+        SELECT DISTINCT n.id, n.text, n.status, json(n.metadata) AS metadata
         FROM nodes n
         WHERE json_extract(n.metadata, '$.pitfall') IS NOT NULL
           AND n.id IN (SELECT id FROM node_neighborhood)
-        ORDER BY n.updated_at DESC;
+        ORDER BY n.updated_at DESC
+        LIMIT 3;
     ")
     pitfalls_json="${pitfalls_json:-[]}"
 
     # Get contradictions (nodes with contradicts edges)
+    # wv-5850d4: metadata dropped from the projection — the composer maps only
+    # {id, text, status}, so it was pure payload weight.
     local contradictions_json
     contradictions_json=$(db_query_json "
-        SELECT DISTINCT n.id, n.text, n.status, json(n.metadata)
+        SELECT DISTINCT n.id, n.text, n.status
         FROM edges e
         JOIN nodes n ON (n.id = e.target OR n.id = e.source)
         WHERE e.type = 'contradicts'
@@ -1073,19 +1100,48 @@ cmd_context() {
     local _discover_mode="false"
     [ "$mode" = "discover" ] && _discover_mode="true"
 
+    # wv-5850d4: payloads reach jq through files, never argv. A single --argjson
+    # string over MAX_ARG_STRLEN (131072 on Linux) makes execve fail with E2BIG
+    # before jq ever starts, which surfaced as empty stdout with exit 0. The
+    # per-query LIMITs above keep the payloads small; --slurpfile makes their
+    # size stop being a correctness boundary at all. Each file holds one JSON
+    # value, so $_name[0] is the payload and the composer body is unchanged.
+    local pack_dir
+    pack_dir=$(mktemp -d "$cache_dir/.pack-XXXXXX") || return 1
+    printf '%s' "$node_json"           > "$pack_dir/node.json"
+    printf '%s' "$blockers_json"       > "$pack_dir/blockers.json"
+    printf '%s' "$ancestors_json"      > "$pack_dir/ancestors.json"
+    printf '%s' "$related_json"        > "$pack_dir/related.json"
+    printf '%s' "$finding_json"        > "$pack_dir/finding.json"
+    printf '%s' "$pitfalls_json"       > "$pack_dir/pitfalls.json"
+    printf '%s' "$contradictions_json" > "$pack_dir/contradictions.json"
+    printf '%s' "$quality_json"        > "$pack_dir/quality.json"
+    printf '%s' "$discovery_json"      > "$pack_dir/discovery.json"
+    printf '%s' "$self_block_json"     > "$pack_dir/self_block.json"
+
     jq -n \
-        --argjson node "$node_json" \
-        --argjson blockers "$blockers_json" \
-        --argjson ancestors "$ancestors_json" \
-        --argjson related "$related_json" \
-        --argjson finding "$finding_json" \
-        --argjson pitfalls "$pitfalls_json" \
-        --argjson contradictions "$contradictions_json" \
-        --argjson quality "$quality_json" \
-        --argjson discovery "$discovery_json" \
+        --slurpfile _node "$pack_dir/node.json" \
+        --slurpfile _blockers "$pack_dir/blockers.json" \
+        --slurpfile _ancestors "$pack_dir/ancestors.json" \
+        --slurpfile _related "$pack_dir/related.json" \
+        --slurpfile _finding "$pack_dir/finding.json" \
+        --slurpfile _pitfalls "$pack_dir/pitfalls.json" \
+        --slurpfile _contradictions "$pack_dir/contradictions.json" \
+        --slurpfile _quality "$pack_dir/quality.json" \
+        --slurpfile _discovery "$pack_dir/discovery.json" \
+        --slurpfile _self_block "$pack_dir/self_block.json" \
         --argjson discover_mode "$_discover_mode" \
-        --argjson self_block "$self_block_json" \
-        '($self_block[0].blocked_reason // null) as $br |
+        '$_node[0] as $node |
+        $_blockers[0] as $blockers |
+        $_ancestors[0] as $ancestors |
+        $_related[0] as $related |
+        $_finding[0] as $finding |
+        $_pitfalls[0] as $pitfalls |
+        $_contradictions[0] as $contradictions |
+        $_quality[0] as $quality |
+        $_discovery[0] as $discovery |
+        $_self_block[0] as $self_block |
+        ($self_block[0].blocked_reason // null) as $br |
         {
             # wv-cccf70: same reasoning as the identical comment in
             # bootstrap mode above -- surface the gate-relevant metadata
@@ -1154,7 +1210,22 @@ cmd_context() {
             discovery: $discovery,
             code_quality: $quality.code_quality,
             quality_as_of: $quality.quality_as_of
-        }' | tee "$cache_file.tmp" && mv "$cache_file.tmp" "$cache_file" || rm -f "$cache_file.tmp"
+        }' > "$cache_file.tmp"
+    local compose_rc=$?
+    rm -rf "$pack_dir"
+
+    # wv-5850d4: the old form piped jq into tee, so the pipeline reported tee's
+    # status and a failed compose returned 0 with nothing on stdout — a silent
+    # miss for every caller of workflow rule 5. Fail loudly instead, and never
+    # leave a truncated pack behind as a cache entry.
+    if [ "$compose_rc" -ne 0 ]; then
+        rm -f "$cache_file.tmp"
+        echo -e "${RED}Error: failed to compose context pack for $id${NC}" >&2
+        return "$compose_rc"
+    fi
+
+    mv "$cache_file.tmp" "$cache_file" || { rm -f "$cache_file.tmp"; return 1; }
+    cat "$cache_file"
 }
 
 
@@ -1635,6 +1706,24 @@ _impact_nodes_for_files() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_impact() {
+    # Hook VALIDATION runs before every branch, including the cached path and
+    # any early exit. Sitting inside the cache-miss branch, it accepted an
+    # unrecognised value silently whenever the walk was served from cache --
+    # so "unknown values are rejected" was true only on the slow path, which
+    # is the one a test is least likely to take twice. Only the fault EXECUTION
+    # stays at the site it perturbs.
+    local _impact_race=false
+    if [ -n "${WV_TEST_IMPACT_RACE:-}" ]; then
+        if [ "${WV_TEST_MODE:-}" != "1" ]; then
+            echo "wv impact: WV_TEST_IMPACT_RACE is set but WV_TEST_MODE=1 is not — ignoring it" >&2
+        elif [ "${WV_TEST_IMPACT_RACE}" = "1" ]; then
+            _impact_race=true
+        else
+            echo -e "${RED}Error: WV_TEST_IMPACT_RACE='${WV_TEST_IMPACT_RACE}' is not a recognised value (1)${NC}" >&2
+            return 1
+        fi
+    fi
+
     local depth=3
     local direction="both"
     local output_format="text"
@@ -1698,14 +1787,33 @@ cmd_impact() {
                     "$_suites_json" \
                     "$(printf '"%s",' "${file_seeds[@]}" | sed 's/,$//')"
             else
-                echo -e "${YELLOW}⚠ No graph node records these files in touched_files — graph blast radius unknown, NOT 'safe'.${NC}" >&2
-                echo "  files: ${file_seeds[*]}" >&2
+                # Distinguish "nothing records these files" from "only COMPLETED
+                # work records them". The second is common and the old message
+                # called it the first, then recommended an attribution command
+                # that was already satisfied -- so following the advice changed
+                # nothing and the operator had no way to tell why.
+                local _done_nodes _done_count
+                _done_nodes=$(_impact_nodes_for_files true "${file_seeds[@]}")
+                # grep -c PRINTS 0 and EXITS 1 when nothing matches, so a
+                # '|| echo 0' fallback appends a second zero and the arithmetic
+                # test below then fails on "0\n0".
+                _done_count=$(printf '%s\n' "$_done_nodes" | grep -c '[^[:space:]]' 2>/dev/null || true)
+                _done_count=${_done_count:-0}
+                if [ "${_done_count:-0}" -gt 0 ]; then
+                    echo -e "${YELLOW}⚠ These files are recorded only on COMPLETED nodes — no open work is impacted.${NC}" >&2
+                    echo "  files: ${file_seeds[*]}" >&2
+                    echo "  ${_done_count} done node(s) record them; re-run with --include-done to list them." >&2
+                else
+                    echo -e "${YELLOW}⚠ No graph node records these files in touched_files — graph blast radius unknown, NOT 'safe'.${NC}" >&2
+                    echo "  files: ${file_seeds[*]}" >&2
+                fi
                 local _suite_names
                 _suite_names=$(printf '%s' "$_suites_json" | jq -r '.[].name' 2>/dev/null | paste -sd' ' - 2>/dev/null || echo "")
                 if [ -n "$_suite_names" ]; then
                     echo "  affected test suites (via test-map.conf): $_suite_names"
-                else
-                    echo "  no suites mapped either — consider 'wv touch <path>' on the owning node for graph attribution."
+                elif [ "${_done_count:-0}" -eq 0 ]; then
+                    # Correct syntax: touch takes the node id and --files=, not a bare path.
+                    echo "  no suites mapped either — attribute with 'wv touch <node-id> --files=${file_seeds[*]}', and run 'wv index .' if code search is also empty."
                 fi
             fi
             return 0
@@ -1779,20 +1887,48 @@ cmd_impact() {
     mkdir -p "$cache_dir"
     local cache_key
     cache_key=$(printf '%s' "${sorted_seeds}|${depth}|${direction}|${edge_set}|${include_done}|${node_cap}|${quality_key}" | sha256sum | cut -c1-16)
-    local cache_file="$cache_dir/impact-${cache_key}.json"
+    # -v2: the certifying sequence moved INSIDE the file, so a v1 entry and its
+    # sidecar must not be picked up by the new reader.
+    local cache_file="$cache_dir/impact-${cache_key}-v2.json"
 
     local walk_json=""
     if [ -f "$cache_file" ]; then
-        local cache_time db_time
-        cache_time=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
-        db_time=$(stat -c %Y "$WV_DB" 2>/dev/null || stat -f %m "$WV_DB" 2>/dev/null || echo 0)
-        if [ "$cache_time" -ge "$db_time" ]; then
-            walk_json=$(cat "$cache_file")
+        # Validate against the MUTATION COUNTER, not a timestamp and not the
+        # database file's mtime. Timestamps cannot see a DELETE -- unlinking the
+        # newest edge moved MAX(updated_at) BACKWARDS, so a cache written before
+        # the deletion looked newer and was served with the deleted edge still
+        # in it. The file mtime measures access, since SQLite journals on reads.
+        # The certifying counter is the cache file's FIRST LINE, not a sidecar.
+        # Two files cannot be published together, so a reader could pair one
+        # publisher's walk with another's sequence; one file and one rename
+        # cannot be torn.
+        local cache_seq now_seq
+        cache_seq=$(head -n 1 "$cache_file" 2>/dev/null || echo "")
+        now_seq=$(wv_mutation_seq "$WV_DB" 2>/dev/null || echo "")
+        case "${cache_seq}${now_seq}" in
+            ''|*[!0-9]*) cache_seq=-1; now_seq=-2 ;;
+        esac
+        if [ "${cache_seq:--1}" = "${now_seq:--2}" ]; then
+            walk_json=$(tail -n +2 "$cache_file")
         fi
     fi
 
-    # Run CTE walk on cache miss.
+    # Run CTE walk on cache miss. The sequence is read BEFORE the walk starts:
+    # it is the graph the walk is about to observe, and publication below is
+    # conditional on it still being that graph afterwards.
+    local seq_before="" cache_filled=false
     if [ -z "$walk_json" ]; then
+        cache_filled=true
+        seq_before=$(wv_mutation_seq "$WV_DB" 2>/dev/null || echo "")
+        # Move the graph DURING the walk: the window the publication check
+        # below exists to close, which a test cannot otherwise hit
+        # deterministically. Validation of the hook happened at the top of this
+        # function; only the fault itself belongs here.
+        if [ "$_impact_race" = true ]; then
+            sqlite3 -cmd ".timeout 5000" "$WV_DB" \
+                "UPDATE nodes SET updated_at = updated_at WHERE id IN (SELECT id FROM nodes LIMIT 1);" \
+                >/dev/null 2>&1 || true
+        fi
         walk_json=$(_impact_walk "${resolved_seeds[@]}" "${walk_flags[@]}") || return 1
     fi
 
@@ -1809,7 +1945,14 @@ cmd_impact() {
                 '. + [{node_id:$id, code_quality:($q.code_quality // []), quality_as_of:($q.quality_as_of // null)}]')
         done < <(printf '%s' "$walk_json" | jq -r '.impacted[].node_id')
 
-        walk_json=$(printf '%s' "$walk_json" | jq -c --argjson quality "$quality_rows" '
+        # $quality_rows accumulates one entry per impacted node, so it grows with
+        # the blast radius and is the argv-limit risk here; the per-node $q above
+        # is one node's quality and stays small.
+        local _q_file
+        _q_file=$(mktemp "${TMPDIR:-/tmp}/wv-qual.XXXXXX") || return 1
+        printf '%s' "$quality_rows" > "$_q_file"
+        walk_json=$(printf '%s' "$walk_json" | jq -c --slurpfile _quality "$_q_file" '
+            $_quality[0] as $quality |
             .impacted |= map(
                 . as $node
                 | (first($quality[]? | select(.node_id == $node.node_id))) as $q
@@ -1819,11 +1962,33 @@ cmd_impact() {
                   end
             )
         ')
+        rm -f "$_q_file"
     fi
 
     # Persist cache after quality fold-in to keep parity by quality_key.
-    if [ -n "$walk_json" ]; then
-        printf '%s' "$walk_json" > "$cache_file"
+    #
+    # Publication is conditional on the graph not having moved during
+    # generation. Recording the sequence AFTER generating the walk certified
+    # OLD content with the NEW counter: a mutation landing between the walk and
+    # the record was invisible to every later reader, permanently, because the
+    # cache then looked current forever. Re-read and compare; a mismatch means
+    # this walk is already stale, so publish nothing and let the next call
+    # rebuild. The write is a temp file plus a rename, so a reader sees either
+    # the whole previous entry or the whole new one.
+    if [ -n "$walk_json" ] && [ "$cache_filled" = true ]; then
+        local seq_after
+        seq_after=$(wv_mutation_seq "$WV_DB" 2>/dev/null || echo "")
+        case "${seq_before}${seq_after}" in
+            ''|*[!0-9]*) seq_before=-1; seq_after=-2 ;;
+        esac
+        if [ "$seq_before" = "$seq_after" ]; then
+            local _cache_tmp="${cache_file}.tmp.$$"
+            if { printf '%s\n' "$seq_after"; printf '%s' "$walk_json"; } > "$_cache_tmp" 2>/dev/null; then
+                mv -f "$_cache_tmp" "$cache_file" 2>/dev/null || rm -f "$_cache_tmp" 2>/dev/null || true
+            else
+                rm -f "$_cache_tmp" 2>/dev/null || true
+            fi
+        fi
     fi
 
     # Seeds info
@@ -1878,13 +2043,22 @@ cmd_impact() {
     local summary="${n_imp} impacted, ${n_unbl} unblocked, ${n_suit} suites (~${total_s}s)"
 
     if [ "$output_format" = "json" ]; then
+        # Payloads through files, not argv: an --argjson string over
+        # MAX_ARG_STRLEN fails execve with E2BIG before jq starts, surfacing as
+        # empty stdout with exit 0. These three grow with the graph.
+        local _imp_dir
+        _imp_dir=$(mktemp -d "${TMPDIR:-/tmp}/wv-imp.XXXXXX") || return 1
+        printf '%s' "$seeds_json"     > "$_imp_dir/seeds.json"
+        printf '%s' "$unblocked_json" > "$_imp_dir/unblocked.json"
+        printf '%s' "$suites_json"    > "$_imp_dir/suites.json"
         printf '%s' "$walk_json" | jq \
-            --argjson seeds    "$seeds_json" \
-            --argjson unblocked "$unblocked_json" \
-            --argjson suites   "$suites_json" \
+            --slurpfile _seeds    "$_imp_dir/seeds.json" \
+            --slurpfile _unblocked "$_imp_dir/unblocked.json" \
+            --slurpfile _suites   "$_imp_dir/suites.json" \
                         --arg     include_quality "$include_quality" \
             --arg     summary  "$summary" \
-            '{seeds:$seeds,
+            '$_seeds[0] as $seeds | $_unblocked[0] as $unblocked | $_suites[0] as $suites |
+             {seeds:$seeds,
                             impacted:(.impacted|map(
                                                    {node_id:.node_id,label:.label,status:.status,min_depth:.min_depth,directions:.directions,
                                                     blocks_count:.blocks_count,missing_criteria:(.missing_criteria==1),
@@ -1898,6 +2072,9 @@ cmd_impact() {
               edges:.edges,
               affected_suites:$suites,
               summary:$summary}'
+        _imp_rc=$?
+        rm -rf "$_imp_dir"
+        return "$_imp_rc"
     else
         echo "── Seeds ────────────────────────────────────────────────────────"
         printf '%s' "$seeds_json" | jq -r '.[] | "  \(.node_id)  [\(.status)]  \(.label)"'
@@ -2060,16 +2237,33 @@ cmd_discover() {
             '{impacted:[], unblocked:[], affected_suites:[], summary:"impact unavailable", available:false, error:$error}')
     fi
 
+    # Payloads reach jq through FILES, not argv. A single --argjson string over
+    # MAX_ARG_STRLEN (131072 on Linux) makes execve fail with E2BIG before jq
+    # starts, which surfaces as empty stdout with exit 0 — the same failure
+    # cmd_context was fixed for in f3375783, measured in a consumer at 540
+    # nodes. $impact alone embeds a full impact report and grows with the graph.
+    local _disc_dir
+    _disc_dir=$(mktemp -d "${TMPDIR:-/tmp}/wv-disc.XXXXXX") || return 1
+    printf '%s' "$seed_json"      > "$_disc_dir/seed.json"
+    printf '%s' "$blockers_json"  > "$_disc_dir/blockers.json"
+    printf '%s' "$findings_json"  > "$_disc_dir/findings.json"
+    printf '%s' "$learnings_json" > "$_disc_dir/learnings.json"
+    printf '%s' "$impact_json"    > "$_disc_dir/impact.json"
     jq -n -c \
         --arg schema "weave.discovery.v1" \
         --arg generated_by "wv discover" \
         --arg impact_direction "$impact_direction" \
-        --argjson seed "$seed_json" \
-        --argjson blockers "$blockers_json" \
-        --argjson findings "$findings_json" \
-        --argjson learnings "$learnings_json" \
-        --argjson impact "$impact_json" \
+        --slurpfile _seed "$_disc_dir/seed.json" \
+        --slurpfile _blockers "$_disc_dir/blockers.json" \
+        --slurpfile _findings "$_disc_dir/findings.json" \
+        --slurpfile _learnings "$_disc_dir/learnings.json" \
+        --slurpfile _impact "$_disc_dir/impact.json" \
         --argjson limit "$limit" '
+        $_seed[0] as $seed |
+        $_blockers[0] as $blockers |
+        $_findings[0] as $findings |
+        $_learnings[0] as $learnings |
+        $_impact[0] as $impact |
         def item($category; $state; $source; $meaning; $probe; $evidence):
           {
             category: $category,
@@ -2236,6 +2430,9 @@ cmd_discover() {
           }
         }
     '
+    _disc_rc=$?
+    rm -rf "$_disc_dir"
+    return "$_disc_rc"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

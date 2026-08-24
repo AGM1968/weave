@@ -332,6 +332,7 @@ def test_managed_pattern_manifest_is_complete_and_rules_are_executable(
         "prose-retrospective-announcement": "The endpoint now exists.\n",
         "prose-self-attested-virtue": "This gives an honest interval.\n",
         "prose-significance-heading": "## The conversion, and where its error comes from\n",
+        "prose-significance-scaffold": "Why this matters. The gauge is missing.\n",
         "prose-verification-reassurance": "The result was measured carefully.\n",
         "prose-work-context-leakage": "This session produced the result.\n",
     }
@@ -508,6 +509,49 @@ def test_multiline_inline_code_is_excluded_but_unmatched_backtick_is_literal(
         (2, "actually"),
         (4, "actually"),
     ]
+
+
+def test_backslash_escaped_backtick_is_not_a_code_span_delimiter(tmp_path: Path) -> None:
+    rule_path = DEFAULT_PATTERNS / "prose-emphasis-hedge.yaml"
+    # WEAVE_RULE_CONTRIBUTION_2026-08-14 Part 5.3, C4: CommonMark (confirmed
+    # against Pandoc) treats an escaped backtick as literal text, not a
+    # code-span delimiter, so the prose between them stays visible to rules.
+    doc = _write(
+        tmp_path / "escaped.md",
+        "Keep \\`actually, not code\\` as prose.\n",
+    )
+
+    found = run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+    assert [finding.match_text for finding in found] == ["actually"]
+
+
+def test_double_backslash_before_backtick_does_not_escape_it(tmp_path: Path) -> None:
+    rule_path = DEFAULT_PATTERNS / "prose-emphasis-hedge.yaml"
+    # An even run of backslashes escapes itself (pairwise), leaving the
+    # backtick that follows unescaped -- a real code span forms and masks it.
+    doc = _write(
+        tmp_path / "double-escaped.md",
+        "Double \\\\`actually` visible.\n",
+    )
+
+    found = run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+    # wv-d313c8: exact-emptiness is the assertion this file makes throughout
+    # (see the sibling `== []` checks); `not found` would also pass on None.
+    assert found == []  # pylint: disable=use-implicit-booleaness-not-comparison
+
+
+def test_backslash_escapes_only_the_runs_first_backtick(tmp_path: Path) -> None:
+    rule_path = DEFAULT_PATTERNS / "prose-emphasis-hedge.yaml"
+    # \`` : the backslash escapes only the run's first backtick: the
+    # remaining single backtick is a real, unescaped delimiter and still
+    # opens a code span with the next matching backtick.
+    doc = _write(
+        tmp_path / "partial-escape.md",
+        "\\``actually` visible actually.\n",
+    )
+
+    found = run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+    assert [finding.match_text for finding in found] == ["actually"]
 
 
 def test_inline_code_mask_preserves_source_position_after_span(tmp_path: Path) -> None:

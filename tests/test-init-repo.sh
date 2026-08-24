@@ -184,6 +184,28 @@ assert_file_exists "$REPO/.git/hooks/prepare-commit-msg"    "installs actual pre
 assert_file_absent "$REPO/.git/hooks/pre-commit-weave.sh"   "does not install source filename as git hook entrypoint"
 assert_contains "$(cat "$REPO/.weave/runtime.md")" "Agent Runtime Notes" "runtime.md includes agent runtime notes"
 assert_contains "$(cat "$REPO/.weave/runtime.md")" "/tmp/weave-codex-*" "runtime.md documents Codex hot zone"
+# Release review 3 (wv-89f85b): a fresh consumer's runtime.md contradicted
+# itself about where wv lives. The session-start code fence hardcoded
+# ./scripts/wv -- which a consumer repo does not have, so the fallback did not
+# fall back, it failed -- while the prose below it advised the installed
+# binary. Both halves are now chosen together from the same pair of variables,
+# so assert them together, and in a CONSUMER repo, which is where the two
+# disagreed. The same contradiction is asserted for CLAUDE.md above.
+# Scoped to the fence, not the whole file: the prose below it names the same
+# installed path, so a whole-file grep passes even with the contradiction fully
+# restored -- it did when this was written that way.
+RUNTIME_SESSION_START=$(awk '
+    /^## Session Start/ { in_section = 1; next }
+    in_section && /^```bash/ { in_fence = 1; next }
+    in_fence && /^```/ { exit }
+    in_fence { print }
+' "$REPO/.weave/runtime.md")
+assert_contains "$RUNTIME_SESSION_START" '$HOME/.local/bin/wv' \
+    "runtime.md session-start fallback points at the installed binary"
+assert_not_contains "$RUNTIME_SESSION_START" './scripts/wv' \
+    "runtime.md session-start does not hand a consumer the repo-local path it lacks"
+assert_contains "$(cat "$REPO/.weave/runtime.md")" 'call the installed binary directly' \
+    "runtime.md prose agrees with its own session-start block"
 assert_contains "$(cat "$REPO/.git/hooks/pre-commit")" "_pc_pytest_dirs" "pre-commit hook has optional pytest-dir guard"
 assert_contains "$(cat "$REPO/.gitignore")" ".weave/.context_policy" "adds .weave/.context_policy to .gitignore"
 assert_contains "$OUTPUT" "Weave"                           "output mentions Weave"
@@ -278,6 +300,69 @@ assert_not_contains "$COPILOT" "Session Start (MANDATORY)"  "copilot: stub does 
 # copilot-only should NOT create claude-specific files
 assert_file_absent "$REPO3/CLAUDE.md"                       "copilot-only: no CLAUDE.md"
 assert_file_absent "$REPO3/.claude/settings.json"           "copilot-only: no .claude/settings.json"
+
+# --- copilot: the inline fallback block is localized like the template one ---
+# Regression (release review 3): when the stub template is missing from the
+# config dir, the Copilot surface is built from an inline copy. That copy was
+# emitted UNLOCALIZED, so it kept the shipped stub's consumer wording while
+# hardcoding ./scripts/wv -- handing an agent in a consumer repo a path that
+# does not exist, directly contradicting the prose beside it. Both branches now
+# go through _wv_localize_agent_block.
+echo ""
+echo "--- copilot: inline fallback localization ---"
+COP_STUB="$WV_CONFIG_DIR/copilot-instructions.stub.md"
+COP_STUB_BACKUP="$TEST_DIR/copilot-instructions.stub.md.bak"
+cp "$COP_STUB" "$COP_STUB_BACKUP"
+rm -f "$COP_STUB"
+
+# (a) a consumer repo has no ./scripts/wv, so the fallback must name the binary
+REPO_FB=$(make_test_repo "copilot-fallback-consumer")
+cd "$REPO_FB"
+"$WV" init-repo --agent=copilot >/dev/null 2>&1
+COP_FB=$(cat "$REPO_FB/.github/copilot-instructions.md")
+assert_contains "$COP_FB" 'wv() { "$HOME/.local/bin/wv" "$@"; }' "copilot fallback: consumer repo falls back to the installed binary"
+assert_not_contains "$COP_FB" 'wv() { ./scripts/wv "$@"; }' "copilot fallback: consumer repo is not sent to a nonexistent ./scripts/wv"
+
+# (b) a weave source checkout does vendor scripts/wv, so it must be preferred
+REPO_FB2=$(make_test_repo "copilot-fallback-source")
+mkdir -p "$REPO_FB2/scripts/lib"
+printf '#!/bin/sh\n' > "$REPO_FB2/scripts/wv"
+chmod +x "$REPO_FB2/scripts/wv"
+touch "$REPO_FB2/scripts/lib/wv-config.sh"
+cd "$REPO_FB2"
+"$WV" init-repo --agent=copilot >/dev/null 2>&1
+COP_FB2=$(cat "$REPO_FB2/.github/copilot-instructions.md")
+assert_contains "$COP_FB2" 'wv() { ./scripts/wv "$@"; }' "copilot fallback: source checkout prefers the repo-local wrapper"
+assert_not_contains "$COP_FB2" 'wv() { "$HOME/.local/bin/wv" "$@"; }' "copilot fallback: source checkout is not sent to the installed binary"
+
+cp "$COP_STUB_BACKUP" "$COP_STUB"
+
+# --- git hooks are replaced by rename, never rewritten in place ---
+# Regression (release review 4, wv-c5ed92): the hook was installed with a plain
+# `cp` onto the destination, which truncates and rewrites the existing inode.
+# The pre-commit hook's own drift self-heal runs install.sh, so a commit that
+# touched the hook source rewrote the file bash was mid-way through executing:
+# it resumed at its old byte offset inside new content and died with a syntax
+# error naming a valid line, then succeeded on retry, which read as a flake.
+# A rename swaps the directory entry and leaves the running process on its
+# original inode -- so a refreshed hook must have a DIFFERENT inode.
+echo ""
+echo "--- git hook replacement is atomic ---"
+REPO_HOOK=$(make_test_repo "hook-atomicity")
+cd "$REPO_HOOK"
+"$WV" init-repo --agent=claude >/dev/null 2>&1
+assert_equals "yes" "$([ -f "$REPO_HOOK/.git/hooks/pre-commit" ] && echo yes || echo no)" \
+    "hook: pre-commit is installed"
+HOOK_INODE_BEFORE=$(stat -c %i "$REPO_HOOK/.git/hooks/pre-commit" 2>/dev/null || echo before)
+# Prove the refresh actually happens, or the inode comparison proves nothing.
+printf '# drift marker\n' >> "$REPO_HOOK/.git/hooks/pre-commit"
+"$WV" init-repo --agent=claude --update >/dev/null 2>&1
+HOOK_INODE_AFTER=$(stat -c %i "$REPO_HOOK/.git/hooks/pre-commit" 2>/dev/null || echo after)
+assert_not_contains "$(cat "$REPO_HOOK/.git/hooks/pre-commit" 2>/dev/null)" "# drift marker" \
+    "hook: refresh actually replaced the file"
+if [ "$HOOK_INODE_BEFORE" != "$HOOK_INODE_AFTER" ]; then HOOK_REPLACE=rename; else HOOK_REPLACE=in-place; fi
+assert_equals "rename" "$HOOK_REPLACE" \
+    "hook: replaced by rename (new inode), not rewritten under a running process"
 
 # --- --agent=codex creates Codex contract only ---
 echo ""

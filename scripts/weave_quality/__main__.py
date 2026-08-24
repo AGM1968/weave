@@ -1514,6 +1514,22 @@ def cmd_context_files(args: argparse.Namespace) -> None:
 _DEFAULT_PATTERNS_DIR = Path(__file__).parent / "default_patterns"
 
 
+def _rule_source(rule_path: Path) -> str:
+    """Where a rule's definition came from: default, managed, or custom.
+
+    Single derivation shared by `patterns list` and `patterns scan` so the two
+    cannot drift. Provenance is the context needed to judge a hit -- a shared
+    core default carries a general lesson, a project-local rule is house style
+    -- and scan is the command run in the edit-fix loop, so it has to carry the
+    tag too rather than making the operator run list separately to get it.
+    """
+    if rule_path.parent == _DEFAULT_PATTERNS_DIR:
+        return "default"
+    if rule_path.parent.name == "managed":
+        return "managed"
+    return "custom"
+
+
 def _load_pattern_rules(
     repo: Path, conf_disabled: set[str]
 ) -> list[tuple[str, Path, str]]:
@@ -1545,15 +1561,46 @@ def _load_pattern_rules(
     ):
         if not rule_dir.is_dir():
             continue
+        # A rule file the loader will not read must SAY SO. Only *.yaml is
+        # loaded, so a perfectly valid rule saved as .yml never ran and scan,
+        # list and validate all stayed silent with exit 0 -- the author had no
+        # way to learn their rule was inert. Reported rather than loaded:
+        # silently activating files that were never executing would change gate
+        # outcomes in existing repos without anyone asking for it.
+        for stray in sorted(rule_dir.glob("*.yml")):
+            print(
+                f"patterns: ignoring {stray}: rule files must use the .yaml "
+                f"extension; rename it to {stray.with_suffix('.yaml').name} "
+                "for it to be loaded",
+                file=sys.stderr,
+            )
         for yf in sorted(rule_dir.glob("*.yaml")):
             rule_id = yf.stem
             language = validate_pattern_rule(yf, rule_id)
             if rule_id in conf_disabled:
                 continue
             if rule_id in seen:
-                raise PatternRuleValidationError(
-                    f"duplicate pattern id {rule_id!r}: {seen[rule_id]} and {yf}"
+                # Finding N: this used to raise, which aborted the whole load
+                # and took every rule down with it -- a repo attempting a local
+                # override lost all of its register gates at once until it
+                # worked out that its own patch was the cause. Degrade instead:
+                # keep the earlier tier's rule (defaults and managed are the
+                # shared, curated ones) and skip the colliding file.
+                #
+                # Deliberately NOT last-tier-wins. Silently swapping a shared
+                # rule's definition is the trap the nowcast register hit, where
+                # a local copy shadowed a managed rule and was never applied.
+                # `patterns validate` still reports the collision as invalid,
+                # so the loader degrading and the linter being strict agree
+                # that the file is unusable -- they just differ on blast radius.
+                print(
+                    f"patterns: ignoring {yf}: duplicate pattern id {rule_id!r} "
+                    f"already defined by {seen[rule_id]}; "
+                    "rename the rule or remove one copy "
+                    "(run 'wv quality patterns validate' to list every collision)",
+                    file=sys.stderr,
                 )
+                continue
             seen[rule_id] = yf
             rules.append((rule_id, yf, language))
     return rules
@@ -1924,6 +1971,144 @@ def _run_pattern_rule(
     return findings
 
 
+class _ScanAborted(Exception):
+    """A rule failed; its receipt is already recorded and the scan must stop."""
+
+    def __init__(self, error: PatternRuleExecutionError) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _execute_pattern_rules(
+    conn: sqlite3.Connection,
+    rules: list[tuple[str, Path, str]],
+    target: Path,
+    run_id: int,
+    repo: Path,
+    canonical_target: str,
+) -> tuple[list[PatternFinding], list[dict[str, object]]]:
+    """Run every rule, writing a per-rule receipt as each one completes.
+
+    Receipts are written immediately rather than only in the batched
+    replace_pattern_scan_results call, so a completed rule's result survives a
+    LATER rule's failure -- otherwise it reports "not_run", indistinguishable
+    from never having executed. On failure the receipt is recorded and
+    _ScanAborted is raised so the caller can close the connection and render
+    the error.
+    """
+    all_findings: list[PatternFinding] = []
+    successful_runs: list[dict[str, object]] = []
+    for rule_id, rule_path, language in rules:
+        # "" default -- if _pattern_definition_hash itself fails below (the
+        # rule file vanished between discovery and here), the except clause
+        # still has SOME value to record a failed receipt with.
+        definition_hash = ""
+        try:
+            # Hashing is inside the boundary too: a rule that disappears
+            # after _load_pattern_rules discovered it (deleted mid-scan)
+            # must record a failed receipt, not escape here uncaught before
+            # a single try/except in this loop has even started watching.
+            definition_hash = _pattern_definition_hash(rule_path)
+            found = _run_pattern_rule(rule_id, rule_path, target, run_id, repo, language)
+            # Identity attachment reads each finding's source file and
+            # builds a Path from a backend-derived path string -- kept
+            # inside this same failure boundary (not run once for the
+            # whole scan afterward) so a path a validated-but-still-bad
+            # backend result produces (or any other OS/Path failure here)
+            # becomes a PatternRuleExecutionError and a recorded failed
+            # receipt for the rule that actually produced it, instead of an
+            # uncaught exception that leaves the run unfinished with no
+            # receipt and silently drops every finding gathered so far.
+            _attach_pattern_finding_identities(found, target, repo)
+        except PatternRuleExecutionError as exc:
+            record_pattern_rule_failure(
+                conn,
+                run_id,
+                rule_id,
+                definition_hash,
+                str(rule_path),
+                canonical_target,
+                str(exc),
+            )
+            raise _ScanAborted(exc) from exc
+        except (OSError, ValueError) as exc:
+            wrapped = PatternRuleExecutionError(
+                f"{rule_path}: failed to prepare or execute rule against {target}: {exc}"
+            )
+            record_pattern_rule_failure(
+                conn,
+                run_id,
+                rule_id,
+                definition_hash,
+                str(rule_path),
+                canonical_target,
+                str(wrapped),
+            )
+            raise _ScanAborted(wrapped) from exc
+        # Recorded immediately (not only via the batched
+        # replace_pattern_scan_results call below) so this rule's
+        # successful, zero-hit-or-not receipt survives a LATER rule's
+        # failure in the same scan -- otherwise a completed rule is
+        # reported "not_run", indistinguishable from never having executed,
+        # whenever any later rule in the same invocation fails.
+        record_pattern_rule_success(
+            conn, run_id, rule_id, definition_hash, str(rule_path), canonical_target, len(found)
+        )
+        all_findings.extend(found)
+        successful_runs.append(
+            {
+                "rule_id": rule_id,
+                "definition_hash": definition_hash,
+                "rule_path": str(rule_path),
+                "target": canonical_target,
+                "hits": len(found),
+                "ran_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+        )
+    return all_findings, successful_runs
+
+
+def _suppress_same_span_findings(
+    all_findings: list[PatternFinding],
+    rules: list[tuple[str, Path, str]],
+) -> list[PatternFinding]:
+    """Collapse findings from different rules at the identical (path, line, col).
+
+    Keyed on start position only, not match_text -- two rules flagging the same
+    spot capture slightly different surrounding text. Higher maturity wins
+    (promotable > observed > candidate); code rules and ties fall back to
+    rule_id order for a deterministic pick. Deliberately narrow: spans that
+    overlap at DIFFERENT start columns are a fuzzier, unrelated problem and are
+    left alone.
+    """
+    if len(all_findings) <= 1:
+        return all_findings
+    rule_maturity: dict[str, str] = {}
+    for maturity_rule_id, maturity_rule_path, maturity_language in rules:
+        if maturity_language in PROSE_LANGUAGES:
+            try:
+                parsed_rule = load_prose_rule(maturity_rule_path, maturity_rule_id)
+            except (PatternRuleValidationError, OSError, ValueError):
+                continue
+            rule_maturity[maturity_rule_id] = str(parsed_rule.get("maturity", "candidate"))
+    maturity_rank = {"promotable": 2, "observed": 1, "candidate": 0}
+    by_span: dict[tuple[str, int, int], list[PatternFinding]] = {}
+    for pf in all_findings:
+        by_span.setdefault((pf.path, pf.line, pf.col), []).append(pf)
+    if not any(len(group) > 1 for group in by_span.values()):
+        return all_findings
+    deduped: list[PatternFinding] = []
+    for group in by_span.values():
+        group.sort(
+            key=lambda f: (
+                -maturity_rank.get(rule_maturity.get(f.rule_id, "candidate"), 0),
+                f.rule_id,
+            )
+        )
+        deduped.append(group[0])
+    return deduped
+
+
 def cmd_patterns_scan(args: argparse.Namespace) -> int:
     """Run all active pattern rules and store findings."""
     repo = Path(_resolve_repo(None))
@@ -1994,77 +2179,13 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
     run_id = begin_pattern_run(conn, git_head_sha(repo), canonical_target)
     started = time.time()
 
-    all_findings: list[PatternFinding] = []
-    successful_runs: list[dict[str, object]] = []
-    for rule_id, rule_path, language in rules:
-        # "" default -- if _pattern_definition_hash itself fails below (the
-        # rule file vanished between discovery and here), the except clause
-        # still has SOME value to record a failed receipt with.
-        definition_hash = ""
-        try:
-            # Hashing is inside the boundary too: a rule that disappears
-            # after _load_pattern_rules discovered it (deleted mid-scan)
-            # must record a failed receipt, not escape here uncaught before
-            # a single try/except in this loop has even started watching.
-            definition_hash = _pattern_definition_hash(rule_path)
-            found = _run_pattern_rule(rule_id, rule_path, target, run_id, repo, language)
-            # Identity attachment reads each finding's source file and
-            # builds a Path from a backend-derived path string -- kept
-            # inside this same failure boundary (not run once for the
-            # whole scan afterward) so a path a validated-but-still-bad
-            # backend result produces (or any other OS/Path failure here)
-            # becomes a PatternRuleExecutionError and a recorded failed
-            # receipt for the rule that actually produced it, instead of an
-            # uncaught exception that leaves the run unfinished with no
-            # receipt and silently drops every finding gathered so far.
-            _attach_pattern_finding_identities(found, target, repo)
-        except PatternRuleExecutionError as exc:
-            record_pattern_rule_failure(
-                conn,
-                run_id,
-                rule_id,
-                definition_hash,
-                str(rule_path),
-                canonical_target,
-                str(exc),
-            )
-            conn.close()
-            return _pattern_execution_error(exc, args.json)
-        except (OSError, ValueError) as exc:
-            wrapped = PatternRuleExecutionError(
-                f"{rule_path}: failed to prepare or execute rule against {target}: {exc}"
-            )
-            record_pattern_rule_failure(
-                conn,
-                run_id,
-                rule_id,
-                definition_hash,
-                str(rule_path),
-                canonical_target,
-                str(wrapped),
-            )
-            conn.close()
-            return _pattern_execution_error(wrapped, args.json)
-        # Recorded immediately (not only via the batched
-        # replace_pattern_scan_results call below) so this rule's
-        # successful, zero-hit-or-not receipt survives a LATER rule's
-        # failure in the same scan -- otherwise a completed rule is
-        # reported "not_run", indistinguishable from never having executed,
-        # whenever any later rule in the same invocation fails.
-        record_pattern_rule_success(
-            conn, run_id, rule_id, definition_hash, str(rule_path), canonical_target, len(found)
+    try:
+        all_findings, successful_runs = _execute_pattern_rules(
+            conn, rules, target, run_id, repo, canonical_target
         )
-        all_findings.extend(found)
-        successful_runs.append(
-            {
-                "rule_id": rule_id,
-                "definition_hash": definition_hash,
-                "rule_path": str(rule_path),
-                "target": canonical_target,
-                "hits": len(found),
-                "ran_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            }
-        )
+    except _ScanAborted as aborted:
+        conn.close()
+        return _pattern_execution_error(aborted.error, args.json)
 
     # wv-c71833: snapshot each rule's own raw match count before the
     # same-start-location collision suppression below can shrink it. This
@@ -2093,30 +2214,7 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
     # above) is unaffected and still counts every match that rule itself
     # produced, independent of what any other rule also matched at the same
     # spot; that is an intrinsic property of the rule, not a duplicate.
-    if len(all_findings) > 1:
-        rule_maturity: dict[str, str] = {}
-        for maturity_rule_id, maturity_rule_path, maturity_language in rules:
-            if maturity_language in PROSE_LANGUAGES:
-                try:
-                    parsed_rule = load_prose_rule(maturity_rule_path, maturity_rule_id)
-                except (PatternRuleValidationError, OSError, ValueError):
-                    continue
-                rule_maturity[maturity_rule_id] = str(parsed_rule.get("maturity", "candidate"))
-        maturity_rank = {"promotable": 2, "observed": 1, "candidate": 0}
-        by_span: dict[tuple[str, int, int], list[PatternFinding]] = {}
-        for pf in all_findings:
-            by_span.setdefault((pf.path, pf.line, pf.col), []).append(pf)
-        if any(len(group) > 1 for group in by_span.values()):
-            deduped: list[PatternFinding] = []
-            for group in by_span.values():
-                group.sort(
-                    key=lambda f: (
-                        -maturity_rank.get(rule_maturity.get(f.rule_id, "candidate"), 0),
-                        f.rule_id,
-                    )
-                )
-                deduped.append(group[0])
-            all_findings = deduped
+    all_findings = _suppress_same_span_findings(all_findings, rules)
 
     # wv-c71833: the receipt's persisted "hits" must agree with what this
     # same invocation reports in by_rule and stores in pattern_findings --
@@ -2152,11 +2250,31 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
     # collision suppression -- only present as its own key so by_rule's
     # values keep meaning exactly one thing (the reported/stored count).
     raw_hits = {r: raw_hits_by_rule.get(r, 0) for r, _, _ in rules}
-    total = len(all_findings)
+    rule_sources = {r: _rule_source(path) for r, path, _ in rules}
 
+    return _emit_pattern_scan(
+        args, rules, all_findings, finding_states, summary, raw_hits, rule_sources
+    )
+
+
+def _emit_pattern_scan(
+    args: argparse.Namespace,
+    rules: list[tuple[str, Path, str]],
+    all_findings: list[PatternFinding],
+    # One row per finding_key, as pattern_finding_states() returns them: the
+    # body reads ["disposition"], ["scan_count"] and .get("disposition_source")
+    # off each row, none of which a bare `object` value supports.
+    finding_states: dict[str, dict[str, object]],
+    summary: dict[str, int],
+    raw_hits: dict[str, int],
+    rule_sources: dict[str, str],
+) -> int:
+    """Render one scan's result as JSON or as the per-rule text report."""
+    total = len(all_findings)
     matches = [
         {
             "rule_id": finding.rule_id,
+            "source": rule_sources.get(finding.rule_id, "custom"),
             "path": finding.path,
             "line": finding.line,
             "col": finding.col + 1,
@@ -2164,6 +2282,11 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
             "severity": finding.severity,
             "finding_key": finding.finding_key,
             "disposition": finding_states[finding.finding_key]["disposition"],
+            # "path" when adjudicated at this exact location, "content" when the
+            # verdict was inherited from the same finding elsewhere (Finding K).
+            "disposition_source": finding_states[finding.finding_key].get(
+                "disposition_source", "path"
+            ),
             "scan_count": finding_states[finding.finding_key]["scan_count"],
         }
         for finding in sorted(
@@ -2180,6 +2303,7 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
                     "findings": total,
                     "by_rule": summary,
                     "raw_hits": raw_hits,
+                    "rule_sources": rule_sources,
                     "matches": matches,
                 }
             )
@@ -2193,7 +2317,7 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
                 if raw > count
                 else ""
             )
-            print(f"  {rule_id}: {count}{suffix}")
+            print(f"  {rule_id} [{rule_sources.get(rule_id, 'custom')}]: {count}{suffix}")
             for finding in matches:
                 if finding["rule_id"] == rule_id:
                     match_text = str(finding["match_text"]).replace("\n", " ")
@@ -2422,6 +2546,95 @@ def _candidate_pattern_files(repo: Path) -> list[Path]:
     return files
 
 
+def _stray_yml_pattern_files(repo: Path) -> list[Path]:
+    """Return every *.yml candidate across all three rule tiers.
+
+    Only *.yaml is loaded, so a perfectly valid rule saved as .yml never
+    runs. `_load_pattern_rules` (scan/list) warns about these; `validate`
+    enumerated *.yaml alone, so the one command whose entire job is telling
+    an author what is wrong with their rule files stayed silent about a file
+    that was inert -- and still answered valid: true, exit 0.
+    """
+    patterns_dir = repo / ".weave" / "patterns"
+    files: list[Path] = []
+    for rule_dir in (_DEFAULT_PATTERNS_DIR, patterns_dir / "managed", patterns_dir):
+        if rule_dir.is_dir():
+            files.extend(sorted(rule_dir.glob("*.yml")))
+    return files
+
+
+def _flag_duplicate_rule_ids(
+    results: list[dict[str, object]],
+    schema_by_id: dict[int, _RuleSchemaInfo],
+) -> bool:
+    """Invalidate every entry sharing a rule id; return whether any collided.
+
+    The real loader rejects a same-id rule appearing in more than one
+    tier/file. Cross-check ALL candidates here -- not just the ones that
+    independently validated -- because if one of two same-id files is
+    malformed the loader fails on ITS error first, while the otherwise-valid
+    copy is just as unusable once that is fixed. A malformed entry keeps its
+    own parse error with the collision appended rather than losing it.
+    """
+    by_id: dict[str, list[dict[str, object]]] = {}
+    for entry in results:
+        by_id.setdefault(str(entry["rule_id"]), []).append(entry)
+    collided = False
+    for rule_id, entries in by_id.items():
+        if len(entries) < 2:
+            continue
+        all_paths = sorted(str(e["path"]) for e in entries)
+        for entry in entries:
+            others = [p for p in all_paths if p != entry["path"]]
+            collision = f"duplicate pattern id {rule_id!r} also defined in: " + ", ".join(others)
+            if entry["status"] == "valid":
+                entry["status"] = "invalid"
+                entry.pop("language", None)
+                schema_by_id.pop(id(entry), None)
+                entry["error"] = collision
+            else:
+                entry["error"] = f"{entry['error']} (also: {collision})"
+        collided = True
+    return collided
+
+
+def _prose_schema_coverage(
+    results: list[dict[str, object]],
+    schema_by_id: dict[int, _RuleSchemaInfo],
+) -> dict[str, object]:
+    """Which documented schema values the still-valid rules actually exercise.
+
+    Computed from entries valid AFTER collision invalidation -- using the first
+    pass would count a rule's kind/scope/maturity/keys as exercised even though
+    it ended up invalid.
+    """
+    kinds_seen: set[str] = set()
+    scopes_seen: set[str] = set()
+    maturities_seen: set[str] = set()
+    keys_seen: set[str] = set()
+    for entry in results:
+        if entry["status"] != "valid":
+            continue
+        schema = schema_by_id.get(id(entry))
+        if schema is None:
+            continue
+        kinds_seen.add(schema["kind"])
+        scopes_seen.add(schema["match_scope"])
+        if schema["maturity"] is not None:
+            maturities_seen.add(schema["maturity"])
+        keys_seen.update(schema["keys"])
+    return {
+        "kinds": {kind: kind in kinds_seen for kind in _PROSE_SCHEMA_KINDS},
+        "match_scopes": {
+            scope: scope in scopes_seen for scope in _PROSE_SCHEMA_MATCH_SCOPES
+        },
+        "maturities": {
+            maturity: maturity in maturities_seen for maturity in _PROSE_SCHEMA_MATURITIES
+        },
+        "optional_keys": {key: key in keys_seen for key in _PROSE_SCHEMA_OPTIONAL_KEYS},
+    }
+
+
 def cmd_patterns_validate(args: argparse.Namespace) -> int:
     """Validate every candidate rule independently and report schema coverage.
 
@@ -2438,6 +2651,7 @@ def cmd_patterns_validate(args: argparse.Namespace) -> int:
         return error_code
     try:
         files = _candidate_pattern_files(repo)
+        strays = _stray_yml_pattern_files(repo)
     except OSError as exc:
         # wv-0065a6 (external code review round 3, finding 8): repo itself
         # passed _non_directory_repo_root_error's check above, but a
@@ -2487,54 +2701,30 @@ def cmd_patterns_validate(args: argparse.Namespace) -> int:
     # fixed; flag the collision now instead of only surfacing it in a later
     # validate run. A malformed entry keeps its own parse error with the
     # collision appended, rather than losing it.
-    by_id: dict[str, list[dict[str, object]]] = {}
-    for entry in results:
-        by_id.setdefault(str(entry["rule_id"]), []).append(entry)
-    for rule_id, entries in by_id.items():
-        if len(entries) < 2:
-            continue
-        all_paths = sorted(str(e["path"]) for e in entries)
-        for entry in entries:
-            others = [p for p in all_paths if p != entry["path"]]
-            collision = f"duplicate pattern id {rule_id!r} also defined in: " + ", ".join(others)
-            if entry["status"] == "valid":
-                entry["status"] = "invalid"
-                entry.pop("language", None)
-                schema_by_id.pop(id(entry), None)
-                entry["error"] = collision
-            else:
-                entry["error"] = f"{entry['error']} (also: {collision})"
+    if _flag_duplicate_rule_ids(results, schema_by_id):
+        all_valid = False
+
+    # Appended after the collision check on purpose: a stray shares its stem
+    # with the .yaml beside it in the common "renamed a copy" case, and that is
+    # not the cross-tier id collision _flag_duplicate_rule_ids exists to catch.
+    for stray in strays:
+        results.append(
+            {
+                "rule_id": stray.stem,
+                "path": str(stray),
+                "status": "ignored",
+                "error": (
+                    "rule files must use the .yaml extension; rename it to "
+                    f"{stray.with_suffix('.yaml').name} for it to be loaded"
+                ),
+            }
+        )
         all_valid = False
 
     # Coverage reflects entries still valid AFTER collision invalidation --
     # computing it from the first pass would count a rule's kind/scope/
     # maturity/keys as "exercised" even though it ended up invalid.
-    kinds_seen: set[str] = set()
-    scopes_seen: set[str] = set()
-    maturities_seen: set[str] = set()
-    keys_seen: set[str] = set()
-    for entry in results:
-        if entry["status"] != "valid":
-            continue
-        schema = schema_by_id.get(id(entry))
-        if schema is None:
-            continue
-        kinds_seen.add(schema["kind"])
-        scopes_seen.add(schema["match_scope"])
-        if schema["maturity"] is not None:
-            maturities_seen.add(schema["maturity"])
-        keys_seen.update(schema["keys"])
-
-    coverage = {
-        "kinds": {kind: kind in kinds_seen for kind in _PROSE_SCHEMA_KINDS},
-        "match_scopes": {
-            scope: scope in scopes_seen for scope in _PROSE_SCHEMA_MATCH_SCOPES
-        },
-        "maturities": {
-            maturity: maturity in maturities_seen for maturity in _PROSE_SCHEMA_MATURITIES
-        },
-        "optional_keys": {key: key in keys_seen for key in _PROSE_SCHEMA_OPTIONAL_KEYS},
-    }
+    coverage = _prose_schema_coverage(results, schema_by_id)
     payload: dict[str, object] = {
         "rules": results,
         "coverage": coverage,
@@ -2547,6 +2737,8 @@ def cmd_patterns_validate(args: argparse.Namespace) -> int:
     for entry in results:
         if entry["status"] == "valid":
             print(f"  {entry['rule_id']:40s} [{entry['language']}] valid")
+        elif entry["status"] == "ignored":
+            print(f"  {entry['rule_id']:40s} IGNORED: {entry['error']}")
         else:
             print(f"  {entry['rule_id']:40s} INVALID: {entry['error']}")
     print()
@@ -2680,12 +2872,7 @@ def cmd_patterns_list(args: argparse.Namespace) -> int:
             header += f", last scanned: {scan_target}"
         print(f"{header}:")
         for (rule_id, rule_path, _), state in zip(rules, rule_states):
-            if rule_path.parent == _DEFAULT_PATTERNS_DIR:
-                src = "default"
-            elif rule_path.parent.name == "managed":
-                src = "managed"
-            else:
-                src = "custom"
+            src = _rule_source(rule_path)
             hits = state["hits"] if state["hits"] is not None else "-"
             print(f"  {rule_id:40s} [{src}] status={state['status']} hits={hits}")
     return 0

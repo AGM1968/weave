@@ -176,6 +176,58 @@ wv_delta_has_changes() {
     [ "$result" = "1" ]
 }
 
+# wv_mutation_seq — a monotonic counter of graph MUTATIONS.
+#
+# _warp_changes.id is AUTOINCREMENT, so SQLite keeps its high-water mark in
+# sqlite_sequence even after wv_delta_reset clears the rows. That makes it a
+# true mutation clock where timestamps are not:
+#
+#   - MAX(updated_at) cannot see a DELETE at all, and can move BACKWARDS when
+#     the deleted row was the newest -- measured: unlinking the most recent edge
+#     moved it 1787519439 -> 1787519438, so a cache written before the deletion
+#     looks newer than the clock and is served stale.
+#   - Second-resolution timestamps cannot separate two changes in one second.
+#   - A file mtime measures access, not change, because SQLite journals on reads.
+#
+# Prints 0 when the table has never been written, which is a safe "unknown"
+# because it can only cause a miss, never a stale hit.
+wv_mutation_seq() {
+    local db="${1:-$WV_DB}"
+    local seq
+    seq=$(sqlite3 -cmd ".timeout 5000" "$db" \
+        "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='_warp_changes'), 0);" 2>/dev/null || echo "")
+    case "$seq" in
+        ''|*[!0-9]*) echo 0 ;;
+        *) echo "$seq" ;;
+    esac
+}
+
+# wv_mutation_seq_for_snapshot <seq-before> <seq-after> — the counter it is safe
+# to record for a snapshot taken between those two readings.
+#
+# Recording the counter read AFTER a snapshot certifies content the snapshot may
+# not hold: a mutation landing between the two is marked captured and then stays
+# invisible for good, because every later freshness test compares against that
+# number. Unchanged means the snapshot IS that graph, so the exact value is
+# safe. Changed means a writer raced the snapshot, and the earlier value is the
+# only one that cannot overstate what was captured. Understating costs one
+# redundant sync; overstating loses the mutation.
+#
+# Prints nothing when there is no usable reading, which callers treat as "record
+# no stamp" -- an absent stamp already reads as "needs sync" downstream.
+wv_mutation_seq_for_snapshot() {
+    local before="${1:-}" after="${2:-}"
+    case "$before" in ''|*[!0-9]*) before="" ;; esac
+    case "$after" in ''|*[!0-9]*) after="" ;; esac
+    if [ -z "$before" ]; then
+        return 0
+    elif [ "$before" = "$after" ]; then
+        printf '%s\n' "$after"
+    else
+        printf '%s\n' "$before"
+    fi
+}
+
 # wv_delta_reset — clear the change log after a successful sync or delta replay.
 # Called after: auto_sync persists state.sql, cmd_load replays deltas,
 # and cmd_prune (prevents pruned-node DELETEs from leaking into delta files).

@@ -173,7 +173,7 @@ map_tool() {
         help=$("$WV" $cand --help 2>&1 || true)
         # Real subcommand help starts "Usage: wv <cmd>"; the global fallback
         # for unknown commands starts "Usage: wv <command>".
-        if echo "$help" | grep -qE "^Usage: wv $first"; then
+        if echo "$help" | grep -qE -- "^Usage: wv $first"; then
             echo "$cand"
             return 0
         fi
@@ -191,7 +191,7 @@ parity_gaps() {
         '.[] | select(.name==$t) | .inputSchema.properties // {} | keys[]' \
         "$schema_file" | sed 's/_/-/g; s/^/--/' | sort -u)
     comm -23 <(echo "$cli_flags") <(echo "$props") \
-        | grep -E '^--' | grep -vE "$GLOBAL_IGNORE" | sed "s/^/$tool /" || true
+        | grep -E '^--' | grep -vE -- "$GLOBAL_IGNORE" | sed "s/^/$tool /" || true
 }
 
 new_gaps=""
@@ -199,7 +199,7 @@ checked=0
 skipped=0
 while read -r tool; do
     rest=${tool#weave_}
-    if echo "$SKIP_TOOLS" | tr ' ' '\n' | grep -qxF "$rest"; then
+    if echo "$SKIP_TOOLS" | tr ' ' '\n' | grep -qxF -- "$rest"; then
         skipped=$((skipped + 1))
         continue
     fi
@@ -211,7 +211,7 @@ while read -r tool; do
     checked=$((checked + 1))
     while read -r gap; do
         [ -z "$gap" ] && continue
-        echo "$BASELINE" | grep -qxF "$gap" && continue
+        echo "$BASELINE" | grep -qxF -- "$gap" && continue
         new_gaps="$new_gaps$gap"$'\n'
     done < <(parity_gaps "$tool" "$cli_cmd" "$SCHEMA")
 done < <(jq -r '.[].name' "$SCHEMA")

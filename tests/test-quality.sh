@@ -155,7 +155,7 @@ assert_contains() {
     TESTS_RUN=$((TESTS_RUN + 1))
     local clean_haystack
     clean_haystack=$(strip_ansi <<<"$haystack")
-    if grep -qF "$needle" <<<"$clean_haystack"; then
+    if grep -qF -- "$needle" <<<"$clean_haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -171,7 +171,7 @@ assert_not_contains() {
     TESTS_RUN=$((TESTS_RUN + 1))
     local clean_haystack
     clean_haystack=$(strip_ansi <<<"$haystack")
-    if ! grep -qF "$needle" <<<"$clean_haystack"; then
+    if ! grep -qF -- "$needle" <<<"$clean_haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -284,6 +284,60 @@ test_patterns_help_documents_rule_schema() {
     assert_contains "$out" "Managed rules" "patterns help documents the managed rule tier"
 }
 test_patterns_help_documents_rule_schema
+
+# ---------------------------------------------------------------------------
+# Test: patterns validate reports a rule saved with the wrong extension
+# Regression (release review 3): only *.yaml is loaded, so a rule saved as
+# *.yml never runs. scan and list warn about it; validate -- the one command
+# whose whole job is telling an author what is wrong with their rule files --
+# enumerated *.yaml alone, omitted the stray, and answered valid: true, exit 0.
+# Runs against its own repo: the shared TEST_DIR fixture is scanned by later
+# tests and must not gain rule files or be re-initialised underneath them.
+# ---------------------------------------------------------------------------
+test_patterns_validate_reports_stray_yml() {
+    local yrepo
+    yrepo=$(mktemp -d "/tmp/wv-quality-yml-XXXXXX")
+    mkdir -p "$yrepo/.weave/patterns"
+    printf 'id: stray-rule\nlanguage: python\nkind: ast\n' > "$yrepo/.weave/patterns/stray-rule.yml"
+
+    local out rc=0
+    out=$("$WV" quality patterns validate "$yrepo" 2>&1) || rc=$?
+    assert_equals "1" "$rc" "validate exits nonzero when a rule file is ignored for its extension"
+    assert_contains "$out" "stray-rule" "validate names the ignored rule file"
+    assert_contains "$out" "IGNORED" "validate marks it ignored, not valid and not invalid"
+    assert_contains "$out" "stray-rule.yaml" "validate says what to rename it to"
+
+    local vjson
+    vjson=$("$WV" quality patterns validate "$yrepo" --json 2>/dev/null) || true
+    assert_equals "false" "$(echo "$vjson" | jq -r '.valid')" "validate does not report valid with an ignored rule present"
+    assert_equals "ignored" "$(echo "$vjson" | jq -r '.rules[] | select(.rule_id=="stray-rule") | .status')" "the stray is carried in the structured result"
+
+    # A .yml beside a .yaml of the same stem is a renamed copy, not the
+    # cross-tier id collision the duplicate check exists to catch: the .yaml
+    # must still validate on its own terms.
+    rm -f "$yrepo/.weave/patterns/stray-rule.yml"
+    cat > "$yrepo/.weave/patterns/pair-rule.yaml" <<'PAIREOF'
+id: pair-rule
+language: python
+message: "probe rule"
+severity: warning
+rule:
+  pattern: |
+    try:
+      $$$BODY
+    except:
+      pass
+PAIREOF
+    cp "$yrepo/.weave/patterns/pair-rule.yaml" "$yrepo/.weave/patterns/pair-rule.yml"
+    vjson=$("$WV" quality patterns validate "$yrepo" --json 2>/dev/null) || true
+    assert_equals "valid" "$(echo "$vjson" | jq -r '.rules[] | select(.rule_id=="pair-rule" and .status!="ignored") | .status')" \
+        "a .yaml is not invalidated by a same-stem .yml beside it"
+    assert_equals "ignored" "$(echo "$vjson" | jq -r '.rules[] | select(.rule_id=="pair-rule" and .status=="ignored") | .status')" \
+        "the same-stem .yml is still reported as ignored"
+
+    rm -rf "$yrepo"
+}
+test_patterns_validate_reports_stray_yml
 
 # ---------------------------------------------------------------------------
 # Test: wv quality scan --json (first scan, all files changed)

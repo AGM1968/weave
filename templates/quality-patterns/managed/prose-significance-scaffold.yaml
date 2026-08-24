@@ -1,0 +1,64 @@
+id: prose-significance-scaffold
+language: prose
+kind: regex
+severity: info
+provenance: >-
+  wv-efa6fb @nowcastr (2026-07-23 -- "stated directly in CDDIS's own
+  registration confirmation. This matters because RTKLIB's NTRIP client does
+  not support HTTPS natively." merged into one clause in
+  gnss_ppp_pipeline_scoping.md). Extended 2026-07-28 -- "the historical-
+  coverage / live-endpoint follow-up below answers the two questions that
+  matter" in docs/Samarco/site_scoping.md, a second surface form of the same
+  move: a noun phrase flagging its own importance ("questions that matter")
+  rather than the sentence announcing it outright. User-flagged as the same
+  family as the original catch. Repaired wv-9a62ef 2026-07-30: this field was
+  a plain multi-line scalar whose continuation line began "move: ", which YAML
+  parses as a nested mapping key, so the rule never loaded from the day it was
+  written. Keep provenance folded (>-) -- prose describing a colon-bearing
+  quote is the normal case here, not the exception.
+message: >-
+  Significance scaffold: prose flagging that something is important instead
+  of just stating it and letting the content carry the weight -- either a
+  sentence announcing an explanation is coming ("this matters because", "the
+  reason this matters is", "what makes this significant is") or a noun
+  phrase doing the same job ("the questions that matter", "what actually
+  matters here"). Almost always mergeable into the preceding or following
+  clause with an em dash or "and", or fixable by just naming the things
+  directly -- delete the flag, keep the content.
+paths:
+  - "docs/*.md"
+  - "docs/**/*.md"
+  - "*.md"
+patterns:
+  - '\bthis matters because\b'
+  - '\bthat matters because\b'
+  - '\bthe reason this matters\b'
+  - '\bwhat makes this (significant|important)\b'
+  - '\b\w+ that matters?\b'
+  - '\bwhat (?:actually |really )?matters\b'
+  # Added wv-848fda 2026-08-22 after a corpus sweep found the rule catching 2
+  # of ~28 'matters' constructions in the tracked docs. Three causes, each
+  # measured rather than guessed:
+  #
+  # 'Why this matters.' as a bold lead-in, the single commonest form here
+  # (roa_assessment:104, weave_quality_rule_promotion_findings:511 and :608).
+  - '\bwhy (?:this|it|that|they) matters?\b'
+  # The bare predicate, where the subject carries the flag instead of a 'that'
+  # clause: 'The distinction matters', 'This distinction matters for tool
+  # choice' (data_gap_resolution:1559, measurement_methods:288,
+  # gnss_ppp_pipeline_scoping:222).
+  - '\b(?:this|that|the|these|those) [\w-]+ matters\b'
+  # An adverb between 'that' and 'matters' defeats the adjacency the original
+  # pattern needs: 'the metric that actually matters' (roa_assessment:214).
+  - '\bthat (?:actually |really |truly |genuinely )matters\b'
+positive_controls:
+  - "Why this matters. The gauge is missing."
+  - "Why it matters for us"
+  - "The distinction matters: a null says a candidate was tried."
+  - "the metric that actually matters for a warning system"
+negative_controls:
+  # These key on 'matters'; a singular 'matter' is a different word and the
+  # corpus contains it as a noun. reference_index:113 must stay quiet.
+  - "with the issue front matter alongside it"
+  - "The reason is a matter of timescale."
+  - "a training-signal matter"

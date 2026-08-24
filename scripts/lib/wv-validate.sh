@@ -143,8 +143,62 @@ validate_edge_type() {
     if [ "$valid" = false ]; then
         echo -e "${RED}Error: invalid edge type '$edge_type'${NC}" >&2
         echo -e "Valid types: $VALID_EDGE_TYPES" >&2
+        # Naming the closest type beats reprinting the whole enum. A dependency
+        # edge is the common first guess and 'blocks' is its INVERSE, not its
+        # synonym, so say which way round the arguments go rather than letting
+        # the user create a silently reversed edge.
+        case "$edge_type" in
+            depends_on|depends|dependson|requires|needs|needed_by|blocked_by)
+                echo -e "Hint: use 'blocks' with the arguments reversed — 'wv link <blocker> <blocked> --type=blocks' expresses '<blocked> depends on <blocker>'." >&2 ;;
+            parent|parent_of|child|child_of|subtask|subtask_of)
+                echo -e "Hint: parent links are 'implements', child first — 'wv link <child> <parent> --type=implements'." >&2 ;;
+            fixes|fixed_by|closes|solves)
+                echo -e "Hint: closest types are 'resolves' (task to its finding) and 'addresses' (source addresses a pitfall in target)." >&2 ;;
+            duplicates|duplicate_of|replaces|replaced_by)
+                echo -e "Hint: closest types are 'supersedes' (target replaces source) and 'obsoletes' (target makes source obsolete)." >&2 ;;
+            related|related_to|relates|see_also|mentions|refs)
+                echo -e "Hint: closest types are 'relates_to' and 'references'." >&2 ;;
+        esac
         return 1
     fi
 
     return 0
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stdin Input
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Answer whether stdin carries input a command may read, without consuming it.
+# Usage: if stdin_has_input; then input=$(cat); fi
+#
+# Reading stdin unconditionally blocks until the writer closes it. A command
+# with no other input source therefore waits forever when wv inherits an
+# unrelated open descriptor on fd 0 — `sleep 20 | wv refs`, or a harness that
+# leaves a pipe open — with no output and no timeout. That stalled
+# tests/test-data.sh for 900s at the refs section and read as a concurrency
+# fault (wv-f541e1). A terminal is not treated as piped input at all.
+#
+# `read -t 0` reports readability without reading a byte, so a caller may still
+# consume the stream in full afterwards, whether by `cat` or by redirection.
+# It answers immediately for a regular file, a redirect, and a closed pipe (EOF
+# is a ready condition); only a pipe that is open with nothing in it is unknown,
+# so that is the single case worth waiting on. The wait is bounded, and bounded
+# on the FIRST byte only — a producer that has started still gets to finish.
+stdin_has_input() {
+    local timeout="${WV_STDIN_TIMEOUT:-2}"
+    # A malformed override must not turn a bounded wait into an unbounded one,
+    # nor into an arithmetic error at the comparison below.
+    [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=2
+
+    [ -t 0 ] && return 1
+
+    local waited=0
+    local deadline=$((timeout * 10))
+    while :; do
+        read -t 0 && return 0
+        [ "$waited" -ge "$deadline" ] && return 1
+        sleep 0.1
+        waited=$((waited + 1))
+    done
 }

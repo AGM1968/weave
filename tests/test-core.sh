@@ -397,6 +397,29 @@ test_add() {
     standalone_meta=$(echo "$show_output" | jq -r '.metadata | fromjson | .standalone' 2>/dev/null)
     assert_equals "true" "$standalone_meta" "add --standalone stores standalone intent"
 
+    # wv-360528: $text and $metadata are SQL-escaped in place before the INSERT,
+    # and the confirmation echo read the mutated variable — so every apostrophe
+    # came back doubled ("don''t"). The stored text was always correct; only the
+    # echo and the --gh handoff were wrong, and the same escaped $text became the
+    # GitHub issue title verbatim. What the user is shown must equal what is
+    # stored, byte for byte.
+    local apos_text="don't split it's quotes"
+    local apos_out apos_id apos_stored apos_echo
+    apos_out=$("$WV" add "$apos_text" --standalone --force 2>&1)
+    apos_id=$(echo "$apos_out" | node_id_from_output)
+    apos_stored=$("$WV" show "$apos_id" --json 2>&1 | jq -r '.text')
+    assert_equals "$apos_text" "$apos_stored" "add stores apostrophes unescaped"
+    apos_echo=$(echo "$apos_out" | grep -F -- "$apos_id:" | sed "s/.*$apos_id: //")
+    assert_equals "$apos_text" "$apos_echo" "add echoes the text it stored, not the SQL-escaped form"
+    assert_not_contains "$apos_out" "don''t" "add confirmation does not double apostrophes"
+
+    # The aliased branch prints from the same variable — cover it too.
+    local alias_out alias_id alias_echo
+    alias_out=$("$WV" add "$apos_text" --alias=apos-alias --standalone --force 2>&1)
+    alias_id=$(echo "$alias_out" | node_id_from_output)
+    alias_echo=$(echo "$alias_out" | grep -F -- "$alias_id (apos-alias): " | sed "s/.*(apos-alias): //")
+    assert_equals "$apos_text" "$alias_echo" "add --alias echoes unescaped text"
+
     # Add fails without text
     assert_fails "add requires text" "$WV" add
 
@@ -2126,7 +2149,7 @@ test_wv_search_learning_fts() {
     local search_out
     search_out=$("$WV" search "stateless auth" 2>/dev/null || echo "")
     local found_learning
-    found_learning=$(echo "$search_out" | grep -c "$learning_id" || true)
+    found_learning=$(echo "$search_out" | grep -c -- "$learning_id" || true)
     assert_success "wv search finds nodes via learning content" \
         test "${found_learning:-0}" -gt 0
 
@@ -2134,7 +2157,7 @@ test_wv_search_learning_fts() {
     local text_out
     text_out=$("$WV" search "login form" 2>/dev/null || echo "")
     local found_plain
-    found_plain=$(echo "$text_out" | grep -c "$plain_id" || true)
+    found_plain=$(echo "$text_out" | grep -c -- "$plain_id" || true)
     assert_success "wv search still finds nodes via node text" \
         test "${found_plain:-0}" -gt 0
 
@@ -2142,7 +2165,7 @@ test_wv_search_learning_fts() {
     local learning_filter_out
     learning_filter_out=$("$WV" search "middleware" --learning 2>/dev/null || echo "")
     local found_learning_filter
-    found_learning_filter=$(echo "$learning_filter_out" | grep -c "$learning_id" || true)
+    found_learning_filter=$(echo "$learning_filter_out" | grep -c -- "$learning_id" || true)
     assert_success "wv search --learning finds node with learning content" \
         test "${found_learning_filter:-0}" -gt 0
 
@@ -2792,6 +2815,106 @@ CONF5
     local warn_overridden_tg
     warn_overridden_tg=$(sqlite3 "$WV_DB" "SELECT CAST(value AS INTEGER) FROM policy_thresholds WHERE key='test_gate';")
     assert_equals "0" "$warn_overridden_tg" "O4b: local can override test_gate=1 (warn) — only block is protected"
+}
+
+# ============================================================================
+# Test: quality config is resynced before the gate enforces it (wv-6657dd)
+#
+# The gate is a SQL trigger reading the quality_exempt and policy_thresholds
+# TABLES, but only _load_quality_config writes them, and it used to run solely
+# from wv load and the test-gate config command. An exemption committed to
+# .weave/quality.conf after the last load was therefore unenforced, and wv done
+# hard-blocked on a path the project had already exempted — a false
+# GraphPolicyViolation indistinguishable from real debt.
+# ============================================================================
+test_quality_config_autoreload() {
+    echo ""
+    echo "Test: wv done resyncs quality.conf before enforcing the gate"
+    echo "============================================================"
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+    "$WV" sync >/dev/null 2>&1
+
+    mkdir -p "$TEST_DIR/.weave"
+    cat > "$TEST_DIR/.weave/quality.conf" <<'CONF'
+[exempt]
+vendor/
+
+[thresholds]
+mccabe_max_py = 30
+CONF
+    "$WV" load >/dev/null 2>&1
+
+    # --- Baseline: a breaching, non-exempt path really does block ---
+    local hot_id hot_out
+    hot_id=$("$WV" add "node touching a hot file" --force 2>&1 | node_id_from_output)
+    "$WV" work "$hot_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('src/hot.py', 99, 'py');
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$hot_id', 'src/hot.py');
+SQL
+    hot_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$hot_id" 2>&1 || true)
+    assert_contains "$hot_out" "GraphPolicyViolation" \
+        "baseline: gate blocks a breaching non-exempt path"
+
+    # --- Exempt it in the CONFIG ONLY, with no wv load in between ---
+    cat > "$TEST_DIR/.weave/quality.conf" <<'CONF2'
+[exempt]
+vendor/
+src/hot.py
+
+[thresholds]
+mccabe_max_py = 30
+CONF2
+
+    local stale_rows
+    stale_rows=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM quality_exempt WHERE path_pattern='src/hot.py';")
+    assert_equals "0" "$stale_rows" \
+        "precondition: the enforced table has not seen the new exemption yet"
+
+    # `|| true` on the expected-success calls too: pre-fix this command exits
+    # non-zero, and under `set -e` a bare capture would abort the whole suite
+    # instead of letting the assertion report which behaviour regressed.
+    local resync_out
+    resync_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$hot_id" 2>&1 || true)
+    assert_contains "$resync_out" "Closed" \
+        "wv done honours an exemption added to quality.conf since the last load"
+    assert_not_contains "$resync_out" "GraphPolicyViolation" \
+        "no false policy violation once the config exempts the path"
+
+    local synced_rows
+    synced_rows=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM quality_exempt WHERE path_pattern='src/hot.py';")
+    assert_equals "1" "$synced_rows" \
+        "gate resynced quality_exempt from quality.conf without an explicit wv load"
+
+    # --- Thresholds come from the same file and must resync too ---
+    local thr_id thr_out
+    thr_id=$("$WV" add "node touching a second hot file" --force 2>&1 | node_id_from_output)
+    "$WV" work "$thr_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" <<SQL
+INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('src/other.py', 99, 'py');
+INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$thr_id', 'src/other.py');
+SQL
+    thr_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$thr_id" 2>&1 || true)
+    assert_contains "$thr_out" "GraphPolicyViolation" \
+        "baseline: CC=99 breaches mccabe_max_py=30"
+
+    cat > "$TEST_DIR/.weave/quality.conf" <<'CONF3'
+[exempt]
+vendor/
+src/hot.py
+
+[thresholds]
+mccabe_max_py = 500
+CONF3
+    thr_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$thr_id" 2>&1 || true)
+    assert_contains "$thr_out" "Closed" \
+        "wv done honours a [thresholds] change made since the last load"
+    local synced_thr
+    synced_thr=$(sqlite3 "$WV_DB" "SELECT CAST(value AS INTEGER) FROM policy_thresholds WHERE key='mccabe_max_py';")
+    assert_equals "500" "$synced_thr" \
+        "policy_thresholds resynced from quality.conf without an explicit wv load"
 
     # cleanup local conf
     rm -f "$TEST_DIR/.weave/quality.local.conf"
@@ -2973,6 +3096,143 @@ test_done_completion_scope() {
     assert_equals "$meta" "$("$WV" show "$id" --json | jq -c '.metadata | fromjson | .completion_scope')" "rejected re-close preserves completion audit"
 }
 
+test_stdin_never_blocks() {
+    echo ""
+    echo "Test: a stdin-reading command never blocks on an inherited idle pipe"
+    echo "============================================================"
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+
+    local rc out id idle_fifo
+
+    # wv-f541e1: the terminal check that guarded this read answered "fd 0 is
+    # not a tty", which is not the same question as "fd 0 carries input". Run
+    # from a shell holding an unrelated pipe open, `cat` waited for a writer
+    # that never wrote.
+    #
+    # The idle producer is a FIFO this shell holds open for writing and never
+    # writes to: no data, no EOF, and nothing upstream to outlive the assertion.
+    # `sleep 10 | timeout 5 "$WV" bulk-update` bounded wv but not the pipeline —
+    # the shell waited out the producer either way, so a producer that never
+    # exits would have stalled this suite despite the timeout (wv-2c5615).
+    # `timeout` stays on wv, which keeps the exit code readable: 1 is usage,
+    # 124 is still blocked, and "nonzero" would accept the bug.
+    idle_fifo="$TEST_DIR/idle-stdin.fifo"
+    rm -f "$idle_fifo"
+    mkfifo "$idle_fifo"
+    exec 9<>"$idle_fifo"
+
+    set +e
+    timeout 5 "$WV" bulk-update <"$idle_fifo" >/dev/null 2>&1
+    rc=$?
+    set -e
+    assert_equals "1" "$rc" "bulk-update on an idle stdin pipe fails fast (124 = still blocked)"
+
+    out=$(timeout 5 "$WV" bulk-update <"$idle_fifo" 2>&1 || true)
+    assert_contains "$out" "no input on stdin" "bulk-update on an idle stdin pipe shows usage"
+
+    exec 9>&-
+    rm -f "$idle_fifo"
+
+    # An EMPTY stream is not an idle one, and only the idle case was guarded
+    # (wv-2c5615): EOF satisfies "a read will not block", so /dev/null reached
+    # jq, which emits no value for empty input and exits 0 — the array check
+    # passed, `count` came back empty, `[ "" -eq 0 ]` raised "integer expression
+    # expected", and the command still returned 0.
+    set +e
+    timeout 5 "$WV" bulk-update </dev/null >/dev/null 2>"$TEST_DIR/empty-stdin.err"
+    rc=$?
+    set -e
+    assert_equals "1" "$rc" "bulk-update on empty stdin exits nonzero"
+    assert_not_contains "$(cat "$TEST_DIR/empty-stdin.err")" "integer expression expected" "bulk-update on empty stdin emits no bash integer error"
+
+    out=$(printf '   \n' | timeout 5 "$WV" bulk-update 2>&1 || true)
+    assert_contains "$out" "no input on stdin" "bulk-update on whitespace-only stdin shows usage"
+
+    # A real pipe is still read and applied.
+    id=$("$WV" add "stdin probe target" 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+    out=$(echo "[{\"id\":\"$id\",\"alias\":\"stdin-probe\"}]" | timeout 8 "$WV" bulk-update 2>&1 || true)
+
+    # This assertion carries the probe's other half: it must consume nothing.
+    # A readability check that ate the first line would truncate every real
+    # pipe, and the applied alias is what proves it did not -- mutation-checked
+    # by making the probe consuming, which turns the alias null.
+    #
+    # Two attempts to assert the same property on an error STRING were removed
+    # instead of being fixed a third time. A truncated payload prints neither
+    # jq's internal "not an array" (wv suppresses it) nor wv's own "stdin must
+    # be a JSON array" -- empty input passed that check too, which is the
+    # separate defect the assertions above now cover (wv-2c5615). Both greped
+    # for text wv never emits, so both passed under the mutant that should have
+    # failed them. Asserting the applied state answers the question; asserting a
+    # guessed message only resembles proof.
+    assert_equals "stdin-probe" "$("$WV" show "$id" --json 2>/dev/null | jq -r '.alias')" "bulk-update still applies a piped JSON array"
+}
+
+test_quick_commits_only_staged() {
+    echo ""
+    echo "Test: wv quick commits only staged work and fails closed"
+    echo "============================================================"
+    setup_test_env
+    git config user.email "t@example.com"
+    git config user.name "t"
+    printf 'v1\n' > staged.txt
+    printf 'v1\n' > other.txt
+    git add -A >/dev/null 2>&1
+    git commit -qm init >/dev/null 2>&1
+    "$WV" init >/dev/null 2>&1
+
+    local id rc out subject changed
+
+    # 1. Only what the caller staged is committed; unrelated dirty files stay dirty.
+    printf 'v2\n' > staged.txt
+    printf 'v2\n' > other.txt
+    git add staged.txt >/dev/null 2>&1
+    id=$("$WV" quick "quick staged only" 2>/dev/null | grep -oE '^wv-[a-f0-9]+$' | head -1)
+    subject=$(git log --format='%H %s' | grep -m1 'quick staged only' | cut -d' ' -f1)
+    changed=$(git show --name-only --format='' "$subject" | grep -c 'txt' || true)
+    assert_equals "1" "$changed" "wv quick commits exactly the staged file"
+    assert_contains "$(git show --name-only --format='' "$subject")" "staged.txt" "wv quick commits the staged file"
+    assert_equals "1" "$(git diff --quiet other.txt; echo $?)" "an unrelated modified file is left uncommitted"
+    assert_equals "v2" "$(cat other.txt)" "an unrelated modified file is left unmodified"
+    assert_equals "done" "$("$WV" show "$id" 2>/dev/null | awk '/^Status/{print $2}')" "wv quick still closes its node"
+
+    # 2. A failed commit leaves the node ACTIVE and exits nonzero.
+    # The commit is forced to fail with a held index.lock, NOT a pre-commit hook:
+    # the weave gate runs suites with core.hooksPath=/dev/null, so a hook-based
+    # failure silently becomes a SUCCESSFUL commit and the assertions below
+    # invert. index.lock is honoured regardless of hooksPath.
+    printf 'v3\n' > staged.txt
+    git add staged.txt >/dev/null 2>&1
+    : > .git/index.lock
+    rc=0
+    out=$("$WV" quick "quick failing commit" 2>&1) || rc=$?
+    rm -f .git/index.lock
+    id=$(printf '%s\n' "$out" | grep -oE '^wv-[a-f0-9]+$' | head -1)
+    assert_equals "1" "$rc" "a failed commit exits nonzero"
+    assert_contains "$out" "left ACTIVE" "a failed commit says the node stays active"
+    assert_equals "active" "$("$WV" show "$id" 2>/dev/null | awk '/^Status/{print $2}')" "a failed commit leaves the node active"
+
+    # 3. Nothing staged: documented create/commit/close behaviour is preserved.
+    git checkout -q -- . 2>/dev/null || true
+    git reset -q >/dev/null 2>&1
+    rc=0
+    out=$("$WV" quick "quick nothing staged" 2>&1) || rc=$?
+    id=$(printf '%s\n' "$out" | grep -oE '^wv-[a-f0-9]+$' | head -1)
+    assert_equals "0" "$rc" "nothing staged still exits zero"
+    assert_equals "done" "$("$WV" show "$id" 2>/dev/null | awk '/^Status/{print $2}')" "nothing staged still closes the node"
+
+    # 4. Unstaged-only: left untouched, never auto-staged.
+    printf 'v9\n' > other.txt
+    rc=0
+    out=$("$WV" quick "quick unstaged only" 2>&1) || rc=$?
+    assert_equals "0" "$rc" "unstaged-only exits zero"
+    assert_contains "$out" "Nothing staged" "unstaged-only says nothing was staged"
+    assert_equals "1" "$(git diff --quiet other.txt; echo $?)" "unstaged-only leaves the file dirty"
+    assert_equals "0" "$(git log --oneline -- other.txt | grep -c 'quick unstaged only' || true)" "unstaged-only never commits the file"
+}
+
+
 main() {
     echo "========================================"
     echo "Weave Core Command Tests"
@@ -3004,6 +3264,7 @@ main() {
     test_test_results_ledger
     test_done_refresh_test_status
     test_quality_config_thresholds
+    test_quality_config_autoreload
     test_trend_signal_wiring
     test_chunk_store_schema
     test_wv_index_command
@@ -3020,6 +3281,8 @@ main() {
     test_update_metadata_portability
     test_help_surfaces
     test_discover_cache_classification
+    test_quick_commits_only_staged
+    test_stdin_never_blocks
 
     echo ""
     echo "========================================"

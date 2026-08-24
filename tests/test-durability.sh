@@ -140,7 +140,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF "$needle"; then
+    if echo "$haystack" | grep -qF -- "$needle"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -640,7 +640,11 @@ status_json=$("$WV" status --json 2>/dev/null)
 assert_contains "$status_json" '"git_sync_action": "push_only"' "status reports push_only for ahead .weave commit"
 assert_contains "$status_json" '"git_sync_reason": "ahead_weave"' "status reports ahead_weave reason"
 
-doctor_out=$("$WV" doctor 2>&1)
+# `wv doctor` exits nonzero when it REPORTS findings, and this suite runs
+# under `set -e`: an unguarded capture aborted the whole run before a
+# single assertion executed. These assertions are about what doctor
+# reports, not about its verdict.
+doctor_out=$("$WV" doctor 2>&1 || true)
 assert_contains "$doctor_out" "git sync" "doctor checks git sync state"
 assert_contains "$doctor_out" "ahead_weave" "doctor reports recoverable ahead state"
 
@@ -672,13 +676,13 @@ echo ""
 echo -e "${CYAN}--- wv doctor journal check ---${NC}"
 setup_test_env
 
-doctor_out=$("$WV" doctor 2>&1)
+doctor_out=$("$WV" doctor 2>&1 || true)
 assert_contains "$doctor_out" "journal" "doctor checks journal health"
 assert_contains "$doctor_out" "clean" "doctor reports clean journal"
 assert_contains "$doctor_out" "wv provenance" "doctor checks wv provenance"
 assert_contains "$doctor_out" "repo-local" "doctor reports repo-local wv provenance when using scripts/wv"
 
-doctor_agent_out=$("$WV" doctor --agent 2>&1)
+doctor_agent_out=$("$WV" doctor --agent 2>&1 || true)
 assert_contains "$doctor_agent_out" "agent python" "doctor --agent checks python command resolution"
 assert_contains "$doctor_agent_out" "agent pytest" "doctor --agent checks pytest availability"
 assert_contains "$doctor_agent_out" "agent imports" "doctor --agent checks import visibility"
@@ -690,7 +694,7 @@ journal_begin "sync" '{}'
 journal_step 1 "dump"
 # No complete, no end
 
-doctor_out=$("$WV" doctor 2>&1)
+doctor_out=$("$WV" doctor 2>&1 || true)
 assert_contains "$doctor_out" "incomplete" "doctor detects incomplete journal op"
 assert_contains "$doctor_out" "recover" "doctor suggests wv recover"
 

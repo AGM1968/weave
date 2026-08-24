@@ -420,8 +420,12 @@ print(json.dumps(items))
 
     local id=$(generate_id)
     local original_text="$text"
+    local original_metadata="$metadata"
 
-    # Escape single quotes in text and metadata
+    # Escape single quotes in text and metadata. wv-360528: $text and $metadata
+    # are SQL-escaped IN PLACE for the INSERT below, so every later reader must
+    # use the original_* copies. Anything echoed to the user or handed to gh
+    # that reads the mutated variable prints doubled apostrophes.
     text="${text//\'/\'\'}"
     metadata="${metadata//\'/\'\'}"
 
@@ -439,9 +443,9 @@ print(json.dumps(items))
                 AND json_extract(metadata, '$.promoted_at') IS NULL;" 2>/dev/null || true
 
     if [ -n "$alias" ]; then
-        echo -e "${GREEN}✓${NC} $id ($alias): $text" >&2
+        echo -e "${GREEN}✓${NC} $id ($alias): $original_text" >&2
     else
-        echo -e "${GREEN}✓${NC} $id: $text" >&2
+        echo -e "${GREEN}✓${NC} $id: $original_text" >&2
     fi
 
     # Link to parent if --parent provided
@@ -469,7 +473,10 @@ print(json.dumps(items))
 
     # Create matching GitHub issue if --gh flag is set
     if [ "$create_gh" = true ] && command -v gh >/dev/null 2>&1; then
-        _add_create_gh_issue "$id" "$text" "$metadata" "$alias"
+        # wv-360528: the unescaped copies — the escaped $text became the GitHub
+        # issue title verbatim, and the escaped $metadata was re-escaped inside
+        # the helper before its UPDATE, doubling apostrophes in stored metadata.
+        _add_create_gh_issue "$id" "$original_text" "$original_metadata" "$alias"
     fi
 
     if [ "$format" = "json" ]; then
@@ -802,7 +809,7 @@ _memory_scan_copilot() {
     local observations='[]' wsdir wsjson files
     while IFS= read -r wsjson; do
         [ -f "$wsjson" ] || continue
-        if ! jq -r '.. | strings' "$wsjson" 2>/dev/null | sed 's#^file://##' | grep -Fxq "$repo_root"; then
+        if ! jq -r '.. | strings' "$wsjson" 2>/dev/null | sed 's#^file://##' | grep -Fxq -- "$repo_root"; then
             continue
         fi
         wsdir=$(dirname "$wsjson")
@@ -983,6 +990,12 @@ _memory_candidates_json() {
 
 # Up to 3 FTS terms (>4 chars), sanitized for fts5 MATCH. Reuses the wv-done
 # learning-overlap extraction so dedup behaves consistently across surfaces.
+# Terms are taken positionally (first three words over four characters) and
+# AND-ed by FTS5. Selecting the LONGEST words instead was tried and reverted:
+# it optimises for distinctiveness within one memory, but dedup needs terms
+# likely to appear in BOTH records, and the change silently stopped detecting a
+# genuine opposite-polarity contradiction whose shared vocabulary sat early in
+# each text. The false-positive guards live in the caller instead.
 _memory_fts_terms() {
     echo "$1" | tr -cs '[:alnum:]' ' ' \
         | awk '{for(i=1;i<=NF;i++) if(length($i)>4){print $i;c++;if(c>=3)exit}}' \
@@ -1013,12 +1026,28 @@ _memory_crystallize_dedup_one() {
             return 0
         fi
     fi
-    local terms
+    local terms term_count
     terms=$(_memory_fts_terms "$text")
-    if [ -z "$terms" ]; then
+    term_count=$(printf '%s\n' "$terms" | tr ' ' '\n' | grep -c '[^[:space:]]' || true)
+    # Terms are AND-ed by FTS5, so three of them is a real conjunction while one
+    # or two is close to a single shared noun -- exactly the "shares only the
+    # site name" false merge the finding recorded. Below three, propose nothing.
+    if [ -z "$terms" ] || [ "${term_count:-0}" -lt 3 ]; then
         return 0
     fi
+    # Carry the candidate's own memory kind into the comparison: a feedback note
+    # and a project note that happen to share vocabulary are not the same entry,
+    # and proposing a merge across them misfiles the one a reader goes looking
+    # for. Kind is only compared against other MEMORY nodes; a learning or
+    # finding is a different class of record and is matched on terms alone.
+    local cand_kind
+    cand_kind=$(db_query "SELECT COALESCE(json_extract(metadata,'\$.kind'),'') FROM nodes WHERE id='$id';" 2>/dev/null || true)
+    local cand_kind_esc
+    cand_kind_esc=$(printf '%s' "$cand_kind" | sed "s/'/''/g")
     local fmatch
+    # ORDER BY rank (bm25) so the proposal is the BEST match and is stable --
+    # a bare LIMIT 1 returned whichever row SQLite produced first, so the same
+    # candidate could name a different target between runs.
     fmatch=$(db_query "
         SELECT f.id FROM nodes_fts f
         JOIN nodes n ON n.id = f.id
@@ -1027,7 +1056,9 @@ _memory_crystallize_dedup_one() {
           AND ( json_extract(n.metadata,'\$.learning') IS NOT NULL
                 OR json_extract(n.metadata,'\$.type')='finding'
                 OR ( json_extract(n.metadata,'\$.type')='memory'
-                     AND COALESCE(json_extract(n.metadata,'\$.mem_status'),'active')='active' ) )
+                     AND COALESCE(json_extract(n.metadata,'\$.mem_status'),'active')='active'
+                     AND COALESCE(json_extract(n.metadata,'\$.kind'),'') = '$cand_kind_esc' ) )
+        ORDER BY rank
         LIMIT 1;" 2>/dev/null || true)
     if [ -n "$fmatch" ]; then
         _cr_dup_id="$fmatch"; _cr_dup_kind="fts_overlap"
@@ -1070,13 +1101,31 @@ _memory_crystallize_verify_one() {
             return 0
         fi
     done
-    local flag
-    for flag in $(echo "$text" | grep -oE '\-\-[a-z][a-z-]+' || true); do
-        if ! grep -rqF -- "$flag" "$repo_root/scripts" 2>/dev/null; then
-            _cr_stale_reason="unknown flag: $flag"
-            return 0
-        fi
-    done
+    # Flags are only checked when they sit on a line that also invokes `wv`.
+    # A memory quoting `uv sync --all-extras` or the gcloud installer's
+    # --path-update is describing ANOTHER tool, and marking it stale because wv
+    # has no such flag is a false positive that demotes a correct memory
+    # (Finding E mechanism 1).
+    #
+    # Resolution is against WV_LIB_DIR -- wv's own code, wherever it is
+    # installed -- not $repo_root/scripts. That directory only holds wv's
+    # source when the repository being crystallized IS memory-system; in any
+    # consumer repo it holds that project's scripts, so EVERY wv flag read as
+    # unknown and every memory quoting a wv command was marked stale.
+    local _cr_flag_surface="${WV_LIB_DIR:-}"
+    if [ ! -d "$_cr_flag_surface" ]; then
+        _cr_flag_surface="$repo_root/scripts"
+    fi
+    local flag wv_lines
+    wv_lines=$(printf '%s\n' "$text" | grep -E '(^|[^a-zA-Z0-9_-])wv[ 	]' || true)
+    if [ -n "$wv_lines" ]; then
+        for flag in $(printf '%s\n' "$wv_lines" | grep -oE '\-\-[a-z][a-z-]+' | sort -u || true); do
+            if ! grep -rqF -- "$flag" "$_cr_flag_surface" 2>/dev/null; then
+                _cr_stale_reason="unknown flag: $flag"
+                return 0
+            fi
+        done
+    fi
     return 0
 }
 
@@ -1536,7 +1585,7 @@ _store_node_commits() {
 
     local existing_primary
     existing_primary=$(echo "$cur_meta" | jq -r '.commit // empty' 2>/dev/null || echo "")
-    if [ -n "$existing_primary" ] && printf '%s\n' "$shas" | grep -qx "$existing_primary"; then
+    if [ -n "$existing_primary" ] && printf '%s\n' "$shas" | grep -qx -- "$existing_primary"; then
         primary_sha="$existing_primary"
     else
         primary_sha=$(printf '%s\n' "$shas" | head -1)
@@ -1564,6 +1613,18 @@ _aggregate_epic_commits() {
         if . and . != "" then (. | fromjson | .commits // []) else [] end | .[]
     ] | unique | sort' 2>/dev/null || echo "[]")
     [ "$all_shas" = "[]" ] && return 0
+    # Prevention (wv-fc4ac2): the union is copied out of CHILD metadata, which is
+    # the one place a stale SHA can enter an aggregate — a child ref that was
+    # amended, reset or gc'd since its close would otherwise be re-acquired by
+    # the epic on every sync, which is why hand-removing it from the epic alone
+    # never held (wv-99893f kept re-acquiring 61b9fcab from wv-f1aec5).
+    # _store_node_commits needs no such filter: its SHAs come straight from
+    # `git log` over HEAD, so they are live by construction.
+    # Fails open when git cannot answer; `wv commit-refs` reports what survives.
+    if declare -f _commit_refs_keep_live >/dev/null 2>&1; then
+        all_shas=$(_commit_refs_keep_live "$all_shas")
+    fi
+    { [ -z "$all_shas" ] || [ "$all_shas" = "[]" ]; } && return 0
     local epic_meta_raw epic_meta updated
     epic_meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='$(sql_escape "$epic_id")';" 2>/dev/null || echo "[]")
     epic_meta=$(echo "$epic_meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
@@ -2234,6 +2295,14 @@ _done_report_policy_violation() {
         echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"completion_scope\",\"detail\":\"invalid or stale completion scope\"}" >&2
         return 0
     fi
+    # wv-6657dd: last line of defence. cmd_done resyncs the policy tables before
+    # the close, so a block on a config-exempt path should be impossible; if one
+    # slips through anyway, name the drift instead of reporting stale policy as
+    # real debt.
+    _report_exempt_drift() {
+        _quality_conf_declares_exempt "$1" || return 0
+        echo -e "${YELLOW}  advisory: $1 is exempt in ${WEAVE_DIR}/quality.conf but the enforced quality_exempt table is stale — run 'wv load' to resync${NC}" >&2
+    }
     local v_path v_actual v_limit v_threshold v_direction
     local scope_filter=""
     [ -n "$scope_json" ] && scope_filter="AND nf.path IN (SELECT value FROM json_each('$(sql_escape "$scope_json")'))"
@@ -2248,6 +2317,7 @@ _done_report_policy_violation() {
         v_limit=$(db_query "SELECT COALESCE((SELECT value FROM policy_thresholds WHERE key='${_threshold_key}'),(SELECT value FROM policy_thresholds WHERE key='mccabe_max'));" 2>/dev/null || echo "15")
         v_threshold="$_threshold_key"
         echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\"}" >&2
+        _report_exempt_drift "$v_path"
         return 0
     fi
     # Not mccabe — distinguish trend (clause 2) from test (clause 3).
@@ -2258,6 +2328,7 @@ _done_report_policy_violation() {
         v_direction=$(db_query "SELECT ft.direction FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND ft.direction='deteriorating' $exempt_filter LIMIT 1;" 2>/dev/null || echo "deteriorating")
         v_threshold="trend_deteriorating"
         echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\",\"direction\":\"$v_direction\"}" >&2
+        _report_exempt_drift "$v_path"
         return 0
     fi
     # Test gate (clause 3): a red/stale file under test_gate>=block.
@@ -2338,6 +2409,13 @@ cmd_done() {
 
     # Validate ID format (SQL injection prevention)
     validate_id "$id" || return 1
+
+    # wv-6657dd: the quality gate is a SQL trigger reading the quality_exempt
+    # and policy_thresholds TABLES, which only _load_quality_config writes. Sync
+    # them from .weave/quality.conf before the close can fire that trigger, so
+    # the gate enforces the committed policy rather than whatever was loaded
+    # last. Cheap: two file hashes, and a reload only when they changed.
+    _ensure_quality_config_fresh 2>/dev/null || true
 
     # Verify node exists
     local exists node_status
@@ -2714,14 +2792,24 @@ USAGE
         shift
     done
 
-    # Read JSON from stdin
-    local input
-    if [ -t 0 ]; then
+    # Read JSON from stdin. The terminal check alone let an inherited idle pipe
+    # through to a `cat` that never returns (wv-f541e1).
+    #
+    # stdin_has_input answers "a read will not block", and EOF satisfies that,
+    # so an empty or whitespace-only stream still arrives here. Emptiness is the
+    # caller's question, not the probe's: jq emits no value for empty input and
+    # exits 0, so the array check below passed, `count` came back empty, and
+    # `[ "" -eq 0 ]` raised an integer error while the command still reported
+    # success (wv-2c5615).
+    local input=""
+    if stdin_has_input; then
+        input=$(cat)
+    fi
+    if [[ -z "${input//[[:space:]]/}" ]]; then
         echo -e "${RED}Error: no input on stdin${NC}" >&2
         echo "Usage: echo '[{\"id\":\"wv-xxxxxx\",\"alias\":\"test\"}]' | wv bulk-update" >&2
         return 1
     fi
-    input=$(cat)
 
     # Validate JSON array
     if ! echo "$input" | jq 'if type == "array" then . else error("not an array") end' >/dev/null 2>&1; then
@@ -2730,7 +2818,13 @@ USAGE
     fi
 
     local count
-    count=$(echo "$input" | jq 'length')
+    count=$(echo "$input" | jq 'length' 2>/dev/null)
+    # A non-numeric length is not a countable array, whatever jq exited with —
+    # comparing it arithmetically is what produced the bogus integer error.
+    if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Error: stdin must be a JSON array${NC}" >&2
+        return 1
+    fi
     if [ "$count" -eq 0 ]; then
         echo -e "${YELLOW}No items in array${NC}" >&2
         return 0
@@ -3637,9 +3731,22 @@ cmd_status() {
     local stamp_file="$WV_HOT_ZONE/.last_gh_sync"
     if [ -f "$stamp_file" ]; then
         last_sync_at=$(cat "$stamp_file" 2>/dev/null || echo "0")
-        local db_mtime
-        db_mtime=$(stat -c %Y "$WV_DB" 2>/dev/null || echo "0")
-        if [ "$db_mtime" -gt "$last_sync_at" ] 2>/dev/null; then
+        # Compare MUTATION COUNTERS, not timestamps and not the file mtime.
+        # mtime measures access (SQLite journals on reads), and a timestamp
+        # clock cannot see a DELETE -- unlinking the newest edge moved
+        # MAX(updated_at) backwards, so an unsynced deletion read as synced.
+        local seq_file="$WV_HOT_ZONE/.last_gh_sync_seq"
+        local synced_seq now_seq
+        synced_seq=$(cat "$seq_file" 2>/dev/null || echo "")
+        now_seq=$(wv_mutation_seq "$WV_DB" 2>/dev/null || echo "")
+        case "$synced_seq" in ''|*[!0-9]*) synced_seq="" ;; esac
+        case "$now_seq" in ''|*[!0-9]*) now_seq="" ;; esac
+        if [ -n "$synced_seq" ] && [ -n "$now_seq" ]; then
+            [ "$now_seq" -gt "$synced_seq" ] && needs_sync="true"
+        else
+            # No counter recorded yet (a sync predating this, or an unreadable
+            # graph): report needs_sync rather than claiming synced on no
+            # evidence. The next sync records one and this self-heals.
             needs_sync="true"
         fi
     else
@@ -4281,20 +4388,32 @@ cmd_quick() {
         local git_root
         git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
         if [ -n "$git_root" ]; then
-            # Check for staged or unstaged tracked changes
+            # Commit only what the caller staged. `git add -u` used to stage
+            # every tracked modification, so running `wv quick` mid-edit swept
+            # unrelated in-progress work into a commit whose message described
+            # this node's defect (wv-1aca2c). Unstaged work is left alone.
             local has_staged has_unstaged
             has_staged=$(git -C "$git_root" diff --cached --quiet 2>/dev/null; echo $?)
             has_unstaged=$(git -C "$git_root" diff --quiet 2>/dev/null; echo $?)
 
-            if [ "$has_staged" != "0" ] || [ "$has_unstaged" != "0" ]; then
-                # Stage tracked changes (not untracked files — user should add those explicitly)
-                git -C "$git_root" add -u 2>/dev/null || true
+            if [ "$has_staged" != "0" ]; then
                 if git -C "$git_root" commit -m "$text"; then
                     committed=true
-                    echo -e "${GREEN}✓${NC} Committed" >&2
+                    echo -e "${GREEN}✓${NC} Committed staged changes" >&2
+                    if [ "$has_unstaged" != "0" ]; then
+                        echo -e "${YELLOW}⚠${NC} Unstaged changes were left uncommitted" >&2
+                    fi
                 else
-                    echo -e "${YELLOW}⚠${NC} Commit failed — closing node anyway" >&2
+                    # A failed commit must not close the node: the work is not
+                    # recorded, and a closed node hides that from the next session.
+                    echo -e "${RED}Error: commit failed — $id is left ACTIVE${NC}" >&2
+                    echo -e "${YELLOW}  Resolve the commit, then close it: wv done $id${NC}" >&2
+                    cmd_sync 2>/dev/null || true
+                    echo "$id"
+                    return 1
                 fi
+            elif [ "$has_unstaged" != "0" ]; then
+                echo -e "${YELLOW}⊘${NC} Nothing staged — unstaged changes left untouched; stage them first to commit" >&2
             else
                 echo -e "${YELLOW}⊘${NC} No changes to commit" >&2
             fi

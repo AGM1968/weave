@@ -281,6 +281,27 @@ _hc_classify_tool() {
     fi
 }
 
+# _hc_check_payload — fail closed on a malformed mutation payload (wv-692c2d).
+#
+# _hc_classify_tool only RECORDS the malformation in _HC_MALFORMED; the posture
+# is the caller's, because advisory events may legitimately ignore it while a
+# PreToolUse consumer must not let a broken mutation event downgrade to
+# inspection. This is that posture, kept next to the classifier that sets the
+# flag rather than restated in each hook.
+#
+# Args: <raw stdin> — empty stdin is a manual invocation, not a broken host
+#       event, and stays a no-op.
+# Returns:
+#   0 → payload usable; caller continues
+#   2 → malformed; caller: exit 2
+_hc_check_payload() {
+    local input="${1:-}"
+    [ "${_HC_MALFORMED:-false}" = true ] || return 0
+    [ -n "$input" ] || return 0
+    echo "PreToolUse payload malformed (${_HC_MALFORMED_REASON:-unknown}); failing closed" >&2
+    return 2
+}
+
 # _hc_check_phase — phase-aware enforcement gate.
 # Reads globals: _HC_PHASE, _HC_IS_EDIT_TOOL, _HC_HOT_ZONE.
 # Args: [new_total [with_active [edits_file]]] — hygiene tally written on early exit.

@@ -75,7 +75,7 @@ project_one() {
     local visibility status
     visibility=$(awk -F': *' '/^visibility:/{print $2; exit}' "$file")
     visibility=${visibility:-local}
-    if [ "$visibility" = shared ] && printf '%s\n' "$OVERRIDE_LOCAL" | grep -qxF "$id"; then
+    if [ "$visibility" = shared ] && printf '%s\n' "$OVERRIDE_LOCAL" | grep -qxF -- "$id"; then
         visibility=local
     fi
     [ "$visibility" = shared ] || return 0
@@ -94,7 +94,7 @@ project_one() {
     # procedure, so a hand-authored artifact is never partially overwritten.
     local skill_dir="$REPO/.claude/skills/$claude_skill" skill_md
     skill_md="$skill_dir/SKILL.md"
-    if [ "$do_claude" = true ] && [ -f "$skill_md" ] && ! grep -qF "$CLAUDE_MARKER" "$skill_md"; then
+    if [ "$do_claude" = true ] && [ -f "$skill_md" ] && ! grep -qF -- "$CLAUDE_MARKER" "$skill_md"; then
         echo "procedure $id: refusing to overwrite hand-written skill '$claude_skill'" >&2
         return 1
     fi
@@ -162,12 +162,12 @@ preflight_one() {
     adapters=$(awk -F': *' '/^adapters:/{print $2; exit}' "$file")
     claude_skill=$(awk -F': *' '/^claude_skill:/{print $2; exit}' "$file")
     visibility=$(awk -F': *' '/^visibility:/{print $2; exit}' "$file"); visibility=${visibility:-local}
-    if [ "$visibility" = shared ] && printf '%s\n' "$OVERRIDE_LOCAL" | grep -qxF "$id"; then visibility=local; fi
+    if [ "$visibility" = shared ] && printf '%s\n' "$OVERRIDE_LOCAL" | grep -qxF -- "$id"; then visibility=local; fi
     [ "$visibility" = shared ] || return 0
     status=$(awk -F': *' '/^status:/{print $2; exit}' "$file"); [ "${status:-ready}" = ready ] || return 0
     if adapter_has "$adapters" claude && { [ "$AGENT" = all ] || [ "$AGENT" = claude ]; }; then
         skill_md="$REPO/.claude/skills/$claude_skill/SKILL.md"
-        if [ -f "$skill_md" ] && ! grep -qF "$CLAUDE_MARKER" "$skill_md"; then
+        if [ -f "$skill_md" ] && ! grep -qF -- "$CLAUDE_MARKER" "$skill_md"; then
             echo "procedure $id: refusing to overwrite hand-written skill '$claude_skill'" >&2
             return 1
         fi
@@ -223,9 +223,9 @@ remove_stale_claude_procedures() {
     local dir name
     for dir in "$REPO/.claude/skills"/*/; do
         [ -f "$dir/SKILL.md" ] || continue
-        grep -qF "$CLAUDE_MARKER" "$dir/SKILL.md" || continue
+        grep -qF -- "$CLAUDE_MARKER" "$dir/SKILL.md" || continue
         name=$(basename "$dir")
-        if ! printf '%s\n' "${CLAUDE_SKILLS[@]:-}" | grep -qxF "$name"; then
+        if ! printf '%s\n' "${CLAUDE_SKILLS[@]:-}" | grep -qxF -- "$name"; then
             rm -rf "$dir"
         fi
     done

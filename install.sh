@@ -410,7 +410,7 @@ install_git_hook_from_repo() {
         # mistaken for a custom user hook and skipped (left stale, the friction
         # wv doctor flagged with a manual `install -m 755 ...`). A genuinely
         # custom hook (no Weave signature) is still preserved.
-        if grep -qE "$marker|# Weave (pre-commit|post-commit|prepare-commit)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
+        if grep -qE -- "$marker|# Weave (pre-commit|post-commit|prepare-commit)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
             action="updated"
         else
             echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (custom hook exists, skipped)"
@@ -419,15 +419,37 @@ install_git_hook_from_repo() {
     fi
 
     local lib_hook="${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks/$hook_src_name"
+
+    # Write to a same-directory temp and RENAME into place. Copying onto the
+    # destination truncates and rewrites the inode -- and the pre-commit hook's
+    # own install-drift self-heal runs install.sh, so a commit that touched the
+    # hook source rewrote the very file bash was executing. Bash reads a script
+    # incrementally, so it resumed at its old byte offset inside new content and
+    # died with a syntax error naming a line that was perfectly valid; the retry
+    # then succeeded, which made it read as a flake. A rename swaps the
+    # directory entry and leaves the running process on its original inode.
+    local hook_tmp hook_got=0
+    hook_tmp=$(mktemp "${hook_dst}.XXXXXX" 2>/dev/null) || hook_tmp="${hook_dst}.tmp.$$"
     if [ -f "$hook_path" ]; then
-        cp "$hook_path" "$hook_dst"
+        cp "$hook_path" "$hook_tmp" && hook_got=1
     elif [ -f "$lib_hook" ]; then
-        cp "$lib_hook" "$hook_dst"
+        cp "$lib_hook" "$hook_tmp" && hook_got=1
     else
         local repo_base="${REPO:-https://raw.githubusercontent.com/AGM1968/weave/main}"
-        curl -sSL "$repo_base/scripts/hooks/$hook_src_name" -o "$hook_dst"
+        curl -sSL "$repo_base/scripts/hooks/$hook_src_name" -o "$hook_tmp" \
+            && [ -s "$hook_tmp" ] && hook_got=1
     fi
-    chmod +x "$hook_dst"
+    if [ "$hook_got" != "1" ]; then
+        rm -f "$hook_tmp" 2>/dev/null || true
+        echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (source unavailable, existing hook kept)"
+        return 0
+    fi
+    chmod +x "$hook_tmp"
+    if ! mv -f "$hook_tmp" "$hook_dst" 2>/dev/null; then
+        rm -f "$hook_tmp" 2>/dev/null || true
+        echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (could not be replaced, existing hook kept)"
+        return 0
+    fi
     echo -e "  ${GREEN}✓${NC} .git/hooks/$hook_name ($action)"
 }
 
@@ -506,6 +528,25 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-resolve-project.sh "$LIB_DIR/lib/wv-resolve-project.sh"
     install_file ./scripts/lib/wv-resolve-runtime.sh "$LIB_DIR/lib/wv-resolve-runtime.sh"
     install_file ./scripts/lib/VERSION "$LIB_DIR/lib/VERSION"
+
+    # Install provenance. VERSION alone cannot answer "which fixes does this
+    # install have": fixes land continuously between bumps, so an install can
+    # be dozens of commits behind while reporting an identical version string.
+    # That is not hypothetical — a consumer sat 72 commits behind v1.71.0-rc.5,
+    # still hitting a jq argv-limit bug fixed four days earlier, with nothing on
+    # its side able to reveal it. Recording the source commit makes the question
+    # answerable with `wv doctor` instead of a file-by-file diff.
+    {
+        echo "installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "source_path=$(pwd -P 2>/dev/null || echo unknown)"
+        echo "commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+        echo "describe=$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+        echo "branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+        # Untracked files count. `git diff --quiet HEAD` ignores them, so an
+        # install built from a tree carrying uncommitted new files recorded
+        # dirty=false and looked reproducible when it was not.
+        echo "dirty=$(if [ -n "$(git status --porcelain 2>/dev/null)" ]; then echo true; else echo false; fi)"
+    } > "$LIB_DIR/lib/INSTALL_PROVENANCE" 2>/dev/null || true
     # Command modules (XDG: ~/.local/lib/weave/cmd/)
     install_file ./scripts/cmd/wv-cmd-core.sh "$LIB_DIR/cmd/wv-cmd-core.sh"
     install_file ./scripts/cmd/wv-cmd-graph.sh "$LIB_DIR/cmd/wv-cmd-graph.sh"
@@ -555,6 +596,26 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/hooks/pre-commit-weave.sh "$LIB_DIR/hooks/pre-commit-weave.sh"
     install_file ./scripts/hooks/post-commit-weave.sh "$LIB_DIR/hooks/post-commit-weave.sh"
     install_file ./scripts/hooks/prepare-commit-msg-weave.sh "$LIB_DIR/hooks/prepare-commit-msg-weave.sh"
+
+    # Refresh THIS repository's git hooks too, when installing from inside one.
+    #
+    # These were only ever refreshed by the generated `wv-init-repo` (the call
+    # sites live inside the INITEOF heredoc), so a normal `./install.sh` upgrade
+    # updated LIB_DIR and left .git/hooks/ at whatever version it was scaffolded
+    # with. A behaviour change to a hook therefore did not take effect for an
+    # existing install until someone ran `wv init-repo --update` or copied it by
+    # hand — which is how a new pre-commit gate could sit inert while `wv doctor`
+    # reported the hook merely "stale". install_git_hook_from_repo was defined
+    # here and never called; this is the missing call.
+    #
+    # It refreshes only Weave-managed hooks: a custom hook without a Weave
+    # signature is preserved and skipped, per the marker check in the function.
+    if [ -d "$(git rev-parse --git-dir 2>/dev/null)/hooks" ] 2>/dev/null; then
+        HOOK_DIR="$(git rev-parse --git-dir 2>/dev/null)/hooks"
+        install_git_hook_from_repo ./scripts/hooks/pre-commit-weave.sh "Weave pre-commit" "pre-commit"
+        install_git_hook_from_repo ./scripts/hooks/post-commit-weave.sh "Weave post-commit" "post-commit"
+        install_git_hook_from_repo ./scripts/hooks/prepare-commit-msg-weave.sh "Weave: append Weave-ID trailers" "prepare-commit-msg"
+    fi
     # Scripts
     cp ./scripts/context-guard.sh "$CONFIG_DIR/"
     cp ./scripts/resolve-refs.sh "$CONFIG_DIR/"
@@ -645,6 +706,18 @@ else
     download_file "$REPO/scripts/lib/wv-resolve-project.sh" "$LIB_DIR/lib/wv-resolve-project.sh"
     download_file "$REPO/scripts/lib/wv-resolve-runtime.sh" "$LIB_DIR/lib/wv-resolve-runtime.sh"
     download_file "$REPO/scripts/lib/VERSION" "$LIB_DIR/lib/VERSION"
+    # A remote install has no source checkout, but it must still record WHAT it
+    # installed -- otherwise doctor's "not recorded" warning can never be
+    # cleared by the reinstall it recommends, which makes the advice useless.
+    # source=remote is the honest answer to "which commit": unknown, from $REPO.
+    {
+        echo "installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "source_path=remote:$REPO"
+        echo "commit=unknown"
+        echo "describe=remote-$(cat "$LIB_DIR/lib/VERSION" 2>/dev/null | tr -d '[:space:]')"
+        echo "branch=unknown"
+        echo "dirty=unknown"
+    } > "$LIB_DIR/lib/INSTALL_PROVENANCE" 2>/dev/null || true
     # Command modules (XDG: ~/.local/lib/weave/cmd/)
     download_file "$REPO/scripts/cmd/wv-cmd-core.sh" "$LIB_DIR/cmd/wv-cmd-core.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-graph.sh" "$LIB_DIR/cmd/wv-cmd-graph.sh"
@@ -957,6 +1030,39 @@ for agent in "${AGENTS[@]}"; do
 done
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+
+# _wv_localize_agent_block — correct a managed agent block for THIS repo.
+#
+# The shipped templates describe a consumer: they set the PATH fallback to
+# the installed wv and state the repo "does not vendor weave's own
+# scripts/wv". In the weave source checkout both halves are false, and
+# `wv init-repo --update` wrote them over accurate guidance -- pointing an
+# agent at the installed binary while it edits the working tree, so it would
+# test something other than what it changed. Applied to every rendered agent
+# surface, not just CLAUDE.md, since they carry the same paragraph.
+_wv_localize_agent_block() {
+    if [ ! -x "$REPO_ROOT/scripts/wv" ] || [ ! -f "$REPO_ROOT/scripts/lib/wv-config.sh" ]; then
+        printf '%s\n' "$1"
+        return 0
+    fi
+    printf '%s\n' "$1" | awk '
+        /^if ! command -v wv >\/dev\/null 2>&1; then wv\(\)/ {
+            print "if ! command -v wv >/dev/null 2>&1; then wv() { ./scripts/wv \"$@\"; }; fi"
+            print "# ./scripts/wv appends existing $HOME/.local/bin and $HOME/.cargo/bin for user tools;"
+            print "# the Weave Makefile targets apply the same PATH fallback for sandbox shells."
+            # Drop the template s own comment paragraph, however many lines
+            # it runs to: CLAUDE.md.template uses three and the copilot stub
+            # two, and a fixed count would swallow the first command line of
+            # the shorter surface.
+            skip = 1
+            next
+        }
+        skip == 1 && /^#/ { next }
+        skip == 1 { skip = 0 }
+        { print }
+    '
+}
+
 CONFIG_DIR="${WV_CONFIG_DIR:-$HOME/.config/weave}"
 MCP_SERVER="${WV_LIB_DIR:-$HOME/.local/lib/weave}/mcp/dist/index.js"
 WV_BIN_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -991,7 +1097,7 @@ install_git_hook_from_repo() {
         # mistaken for a custom user hook and skipped (left stale, the friction
         # wv doctor flagged with a manual `install -m 755 ...`). A genuinely
         # custom hook (no Weave signature) is still preserved.
-        if grep -qE "$marker|# Weave (pre-commit|post-commit|prepare-commit)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
+        if grep -qE -- "$marker|# Weave (pre-commit|post-commit|prepare-commit)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
             action="updated"
         else
             echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (custom hook exists, skipped)"
@@ -1000,15 +1106,37 @@ install_git_hook_from_repo() {
     fi
 
     local lib_hook="${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks/$hook_src_name"
+
+    # Write to a same-directory temp and RENAME into place. Copying onto the
+    # destination truncates and rewrites the inode -- and the pre-commit hook's
+    # own install-drift self-heal runs install.sh, so a commit that touched the
+    # hook source rewrote the very file bash was executing. Bash reads a script
+    # incrementally, so it resumed at its old byte offset inside new content and
+    # died with a syntax error naming a line that was perfectly valid; the retry
+    # then succeeded, which made it read as a flake. A rename swaps the
+    # directory entry and leaves the running process on its original inode.
+    local hook_tmp hook_got=0
+    hook_tmp=$(mktemp "${hook_dst}.XXXXXX" 2>/dev/null) || hook_tmp="${hook_dst}.tmp.$$"
     if [ -f "$hook_path" ]; then
-        cp "$hook_path" "$hook_dst"
+        cp "$hook_path" "$hook_tmp" && hook_got=1
     elif [ -f "$lib_hook" ]; then
-        cp "$lib_hook" "$hook_dst"
+        cp "$lib_hook" "$hook_tmp" && hook_got=1
     else
         local repo_base="${REPO:-https://raw.githubusercontent.com/AGM1968/weave/main}"
-        curl -sSL "$repo_base/scripts/hooks/$hook_src_name" -o "$hook_dst"
+        curl -sSL "$repo_base/scripts/hooks/$hook_src_name" -o "$hook_tmp" \
+            && [ -s "$hook_tmp" ] && hook_got=1
     fi
-    chmod +x "$hook_dst"
+    if [ "$hook_got" != "1" ]; then
+        rm -f "$hook_tmp" 2>/dev/null || true
+        echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (source unavailable, existing hook kept)"
+        return 0
+    fi
+    chmod +x "$hook_tmp"
+    if ! mv -f "$hook_tmp" "$hook_dst" 2>/dev/null; then
+        rm -f "$hook_tmp" 2>/dev/null || true
+        echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (could not be replaced, existing hook kept)"
+        return 0
+    fi
     echo -e "  ${GREEN}✓${NC} .git/hooks/$hook_name ($action)"
 }
 
@@ -1154,6 +1282,35 @@ fi
 #   Block 1: BEGIN/END WEAVE RUNTIME CONTEXT  — context policy, managed by context-guard.sh
 #   Block 2: BEGIN/END WEAVE RUNTIME CONTENT  — generic Weave guidance, updatable by --update
 #   Below block 2: repo-specific content, never touched by init-repo
+# The PATH guidance differs by repo kind, and stating the wrong one is worse
+# than stating none: a consumer has no ./scripts/wv to prefer, while in the
+# weave source checkout pointing at the installed binary sends an agent to test
+# something other than the tree it is editing.
+if [ -x "$REPO_ROOT/scripts/wv" ] && [ -f "$REPO_ROOT/scripts/lib/wv-config.sh" ]; then
+    _WV_RUNTIME_WV_FALLBACK='if ! command -v wv >/dev/null 2>&1; then wv() { ./scripts/wv "$@"; }; fi'
+    _WV_RUNTIME_PATH_NOTE='If `wv` is not on PATH, prefer the repo-local wrapper, then the installed binary:
+
+```bash
+./scripts/wv bootstrap --json
+$HOME/.local/bin/wv bootstrap --json
+```
+
+The repo-local wrapper appends existing user tool directories (`$HOME/.local/bin`,
+`$HOME/.cargo/bin`) to PATH so sandbox agent shells can see tools such as `ast-grep`
+without putting the repository or current directory on PATH. Set
+`WV_DISABLE_USER_TOOL_PATHS=1` to disable this normalization.'
+else
+    _WV_RUNTIME_WV_FALLBACK='if ! command -v wv >/dev/null 2>&1; then wv() { "$HOME/.local/bin/wv" "$@"; }; fi'
+    _WV_RUNTIME_PATH_NOTE='If `wv` is not on PATH, call the installed binary directly:
+
+```bash
+$HOME/.local/bin/wv bootstrap --json
+```
+
+This repository does not vendor weave'"'"'s own `scripts/wv`; wv is installed globally
+by install.sh.'
+fi
+
 RUNTIME_MD="$REPO_ROOT/.weave/runtime.md"
 RUNTIME_MD_MARKER_BEGIN="<!-- BEGIN WEAVE RUNTIME CONTEXT -->"
 RUNTIME_MD_CONTENT_BEGIN="<!-- BEGIN WEAVE RUNTIME CONTENT -->"
@@ -1169,7 +1326,12 @@ cat << 'RUNTIMECONTENTEOF'
 ## Session Start
 
 ```bash
-if ! command -v wv >/dev/null 2>&1; then wv() { ./scripts/wv "$@"; }; fi
+RUNTIMECONTENTEOF
+# Executable fallback, chosen for the repo this lands in: a consumer has
+# no ./scripts/wv, so hardcoding it handed the agent a path that does not
+# exist while the surrounding prose advised the installed binary.
+printf '%s\n' "$_WV_RUNTIME_WV_FALLBACK"
+cat << 'RUNTIMECONTENTEOF'
 wv bootstrap --json   # single call: active/ready/blocked + learnings + context policy
 ```
 
@@ -1197,18 +1359,12 @@ wv quality functions <file>    # identify functions over CC limit
 ```
 
 ## Agent Runtime Notes
-
-If `wv` is not on PATH, prefer the repo-local wrapper, then the installed binary:
-
-```bash
-./scripts/wv bootstrap --json
-$HOME/.local/bin/wv bootstrap --json
-```
-
-The repo-local wrapper appends existing user tool directories (`$HOME/.local/bin`,
-`$HOME/.cargo/bin`) to PATH so sandbox agent shells can see tools such as `ast-grep`
-without putting the repository or current directory on PATH. Set
-`WV_DISABLE_USER_TOOL_PATHS=1` to disable this normalization.
+RUNTIMECONTENTEOF
+# Emitted OUTSIDE the quoted heredoc: that heredoc is <<'EOF' precisely because
+# the rest of its body contains $ sequences that must stay literal, so a
+# placeholder inside it would have been written out verbatim.
+printf '\n%s\n' "$_WV_RUNTIME_PATH_NOTE"
+cat << 'RUNTIMECONTENTEOF'
 
 In sandbox agent shells (Codex/Copilot/Claude Code), Weave uses a persistent
 `/tmp/weave-codex-*` hot zone because `/dev/shm` is not stable across tool invocations.
@@ -1222,7 +1378,7 @@ if [ ! -f "$RUNTIME_MD" ]; then
         printf '\nAdd repo-specific instructions below this line.\n'
     } > "$RUNTIME_MD"
     echo -e "  ${GREEN}✓${NC} .weave/runtime.md"
-elif ! grep -qF "$RUNTIME_MD_MARKER_BEGIN" "$RUNTIME_MD"; then
+elif ! grep -qF -- "$RUNTIME_MD_MARKER_BEGIN" "$RUNTIME_MD"; then
     # No context block at all — prepend both blocks
     _tmp_runtime=$(mktemp)
     {
@@ -1233,7 +1389,7 @@ elif ! grep -qF "$RUNTIME_MD_MARKER_BEGIN" "$RUNTIME_MD"; then
     } > "$_tmp_runtime"
     mv "$_tmp_runtime" "$RUNTIME_MD"
     echo -e "  ${GREEN}✓${NC} .weave/runtime.md (managed blocks prepended)"
-elif ([ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]) && ! grep -qF "$RUNTIME_MD_CONTENT_BEGIN" "$RUNTIME_MD"; then
+elif ([ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]) && ! grep -qF -- "$RUNTIME_MD_CONTENT_BEGIN" "$RUNTIME_MD"; then
     # Has context block but no content block — inject content block after context block
     _tmp_runtime=$(mktemp)
     awk -v content="$(_runtime_content_block)" '
@@ -1279,7 +1435,7 @@ WEAVE_PATTERNS=(
 if [ -f "$GITIGNORE" ]; then
     added=0
     for entry in "${WEAVE_PATTERNS[@]}"; do
-        if ! grep -qxF "$entry" "$GITIGNORE"; then
+        if ! grep -qxF -- "$entry" "$GITIGNORE"; then
             if [ "$added" -eq 0 ]; then
                 echo "" >> "$GITIGNORE"
                 echo "# Weave" >> "$GITIGNORE"
@@ -1357,7 +1513,7 @@ ATTR_BLOCK="${ATTR_MARKER_BEGIN}
 ${ATTR_MARKER_END}"
 
 if [ -f "$GITATTR" ]; then
-    if grep -qF "$ATTR_MARKER_BEGIN" "$GITATTR"; then
+    if grep -qF -- "$ATTR_MARKER_BEGIN" "$GITATTR"; then
         # Markers present — replace between them + strip orphaned weave comments
         tmpattr=$(mktemp)
         awk -v begin="$ATTR_MARKER_BEGIN" -v end="$ATTR_MARKER_END" -v block="$ATTR_BLOCK" '
@@ -1472,7 +1628,12 @@ host supports (Agent tool, MCP client subagent, shell subprocess, etc.).
 ## Session start (always)
 
 ```bash
-if ! command -v wv >/dev/null 2>&1; then wv() { ./scripts/wv "$@"; }; fi
+AGENTSEOF
+# Executable fallback, chosen for the repo this lands in: a consumer has
+# no ./scripts/wv, so hardcoding it handed the agent a path that does not
+# exist while the surrounding prose advised the installed binary.
+printf '%s\n' "$_WV_RUNTIME_WV_FALLBACK"
+cat << 'AGENTSEOF'
 wv bootstrap --json   # single call: active/ready/blocked + recent learnings + context policy
 ```
 
@@ -1526,9 +1687,18 @@ AGENTSEOF
         echo -e "  ${YELLOW}⊘${NC} .claude/agents/AGENTS.md (already exists, skipped)"
     fi
 
+
     # ── CLAUDE.md (weave block — prepend/update, preserve project content) ──
     if [ -f "$CONFIG_DIR/CLAUDE.md.template" ]; then
         _weave_block=$(cat "$CONFIG_DIR/CLAUDE.md.template")
+        # The template's PATH-fallback paragraph is written for a consumer repo
+        # and asserts the repo "does not vendor weave's own scripts/wv". In the
+        # weave source checkout that is exactly backwards, and running
+        # `wv init-repo --update` there replaced accurate guidance with a false
+        # statement plus a fallback pointing at the INSTALLED wv rather than the
+        # working tree -- so an agent following it would edit source and test
+        # something else. A repo that vendors scripts/wv gets the vendored form.
+        _weave_block=$(_wv_localize_agent_block "$_weave_block")
         if [ ! -f "$REPO_ROOT/CLAUDE.md" ]; then
             # New repo: create with weave block + project knowledge placeholder
             {
@@ -1883,11 +2053,16 @@ GHHOOKSEOF
     mkdir -p "$REPO_ROOT/.github"
     _STUB_TEMPLATE="$CONFIG_DIR/copilot-instructions.stub.md"
 
-    # Build managed block from installed template or inline fallback
+    # Build managed block from installed template or inline fallback. BOTH go
+    # through _wv_localize_agent_block: the fallback is a copy of the shipped
+    # stub, so it describes a consumer -- installed binary, "does not vendor
+    # weave's own scripts/wv" -- and rendering it unlocalized in the weave
+    # source checkout wrote guidance that was false there, the same way the
+    # template branch did before it was localized. One correction, one path.
     if [ -f "$_STUB_TEMPLATE" ]; then
-        _copilot_block=$(cat "$_STUB_TEMPLATE")
+        _copilot_block=$(_wv_localize_agent_block "$(cat "$_STUB_TEMPLATE")")
     else
-        _copilot_block=$(cat << 'COPILOTEOF'
+        _copilot_block=$(_wv_localize_agent_block "$(cat << 'COPILOTEOF'
 <!-- ── BEGIN WEAVE COPILOT.MD ── managed by wv init-repo, do not edit manually -->
 # GitHub Copilot Instructions
 
@@ -1896,7 +2071,7 @@ This repository uses **Weave** for task tracking. Every code change must be trac
 ## Pre-flight (run before anything else)
 
 ```bash
-if ! command -v wv >/dev/null 2>&1; then wv() { ./scripts/wv "$@"; }; fi
+if ! command -v wv >/dev/null 2>&1; then wv() { "$HOME/.local/bin/wv" "$@"; }; fi
 wv bootstrap --json   # single call: active/ready/blocked + learnings + context policy
 ```
 
@@ -1988,7 +2163,7 @@ MCP equivalent: `weave_code_search` (parameters: `query`, `mode`, `limit`, `grap
 - CLI: `wv --help`, `wv help <command>`, or `~/.config/weave/WORKFLOW.md`
 <!-- ── END WEAVE COPILOT.MD ── -->
 COPILOTEOF
-)
+)")
     fi
 
     _cop_dst="$REPO_ROOT/.github/copilot-instructions.md"
