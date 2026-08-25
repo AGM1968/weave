@@ -4,7 +4,7 @@
 
 ## Unreleased
 
-## [1.71.0-rc.7] - 2026-08-24
+## [1.71.0-rc.7] - 2026-08-25
 
 Public maintenance prerelease carrying the post-rc.5 durability and fail-closed safety review,
 plus the approved prose-correctness fixes and `prose-significance-scaffold` managed rule. Private
