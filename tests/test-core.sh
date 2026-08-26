@@ -1551,7 +1551,7 @@ test_help_surfaces() {
         reindex learnings trails digest session-summary audit-pitfalls edge-types repo-class init-repo
         doctor selftest mcp-status health guide prune clean-ghosts compact refs import quality
         findings analyze batch sync load
-        impact hotzone pattern-audit validate-finding test-record
+        impact hotzone pattern-audit validate-finding test-record test-status
     )
 
     local cmd
@@ -2660,6 +2660,40 @@ test_test_results_ledger() {
     dur_garbage=$(sqlite3 "$WV_DB" "SELECT duration_ms FROM test_results WHERE suite='tests/test-dur3.sh' AND path='a.sh';")
     assert_equals "0" "$dur_garbage" "non-numeric --duration coerced to 0"
 
+    # --- test-status is all-files, fail-closed, and can target index blobs ---
+    git add a.sh b.sh
+    "$WV" test-record "tests/test-status.sh" --files="a.sh,b.sh" --exit=0 >/dev/null 2>&1
+    assert_success "test-status accepts an all-files fresh green result" \
+        "$WV" test-status "tests/test-status.sh" --files="a.sh,b.sh" --quiet
+    assert_success "test-status --staged accepts matching index blobs" \
+        "$WV" test-status "tests/test-status.sh" --files="a.sh,b.sh" --staged --quiet
+
+    echo "unstaged-working-copy" > "$TEST_DIR/a.sh"
+    assert_fails "test-status current-content mode rejects an edited working copy" \
+        "$WV" test-status "tests/test-status.sh" --files="a.sh,b.sh" --quiet
+    assert_success "test-status --staged still describes the unchanged commit candidate" \
+        "$WV" test-status "tests/test-status.sh" --files="a.sh,b.sh" --staged --quiet
+
+    git add a.sh
+    assert_fails "test-status rejects a stale staged blob" \
+        "$WV" test-status "tests/test-status.sh" --files="a.sh,b.sh" --staged --quiet
+    "$WV" test-record "tests/test-status.sh" --files="a.sh,b.sh" --exit=1 >/dev/null 2>&1
+    assert_fails "test-status rejects fresh failed rows" \
+        "$WV" test-status "tests/test-status.sh" --files="a.sh,b.sh" --staged --quiet
+    "$WV" test-record "tests/test-status.sh" --files="a.sh,b.sh" --exit=0 >/dev/null 2>&1
+    sqlite3 "$WV_DB" "DELETE FROM test_results WHERE suite='tests/test-status.sh' AND path='b.sh';"
+    assert_fails "test-status rejects a partial result set" \
+        "$WV" test-status "tests/test-status.sh" --files="a.sh,b.sh" --staged --quiet
+    assert_fails "test-status rejects an unknown suite" \
+        "$WV" test-status "tests/never-ran.sh" --files="a.sh" --staged --quiet
+
+    local status_usage_rc=0
+    "$WV" test-status "tests/test-status.sh" --files= --quiet >/dev/null 2>&1 || status_usage_rc=$?
+    assert_equals "2" "$status_usage_rc" "test-status requires a non-empty file set"
+    status_usage_rc=0
+    "$WV" test-status "tests/test-status.sh" --files=,, --quiet >/dev/null 2>&1 || status_usage_rc=$?
+    assert_equals "2" "$status_usage_rc" "test-status rejects a file list with no real paths"
+
     # --- durable history survives a simulated wv load (LL2) ---
     # The disk JSONL log is independent of the tmpfs table: wiping the DB (what
     # wv load does) must not lose history.
@@ -2734,7 +2768,28 @@ test_done_refresh_test_status() {
     st_red=$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")
     assert_equals "red" "$st_red" "fresh fail (fp match + exit !=0) -> red"
 
-    # --- unknown: a path with no ledger row / no mapping ---
+    # --- mapped + missing: required evidence is absent, so fail closed ---
+    sqlite3 "$WV_DB" "DELETE FROM test_results WHERE suite='tests/test-foo.sh' AND path='src/foo.sh';"
+    run_refresh "$nid"
+    local st_missing
+    st_missing=$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")
+    assert_equals "stale" "$st_missing" "mapped path with no ledger result -> stale"
+
+    # Every suite in a multi-suite mapping is required. One green row cannot
+    # conceal another suite whose evidence is absent.
+    printf '[map]\nsrc/foo.sh = tests/test-foo.sh tests/test-other.sh\n' > "$TEST_DIR/.weave/test-map.conf"
+    (cd "$TEST_DIR" && "$WV" test-record "tests/test-foo.sh" --files="src/foo.sh" --exit=0 >/dev/null 2>&1)
+    run_refresh "$nid"
+    local st_partial
+    st_partial=$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")
+    assert_equals "stale" "$st_partial" "partial multi-suite evidence -> stale"
+    (cd "$TEST_DIR" && "$WV" test-record "tests/test-other.sh" --files="src/foo.sh" --exit=0 >/dev/null 2>&1)
+    run_refresh "$nid"
+    local st_all_green
+    st_all_green=$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")
+    assert_equals "green" "$st_all_green" "all mapped suites fresh and passing -> green"
+
+    # --- unknown: a path with no mapping has no required suite ---
     local nid2
     nid2=$("$WV" add "Node touching unmapped file" --force 2>&1 | node_id_from_output)
     "$WV" work "$nid2" >/dev/null 2>&1
@@ -2743,7 +2798,7 @@ test_done_refresh_test_status() {
     run_refresh "$nid2"
     local st_unknown
     st_unknown=$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/nomapping.sh';")
-    assert_equals "unknown" "$st_unknown" "no ledger result for the path -> unknown"
+    assert_equals "unknown" "$st_unknown" "unmapped path -> unknown"
 }
 
 test_quality_config_thresholds() {

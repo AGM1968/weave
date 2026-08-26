@@ -80,10 +80,9 @@ _bootstrap_wv_provenance() {
 _bootstrap_python_command() {
     local repo_root="${REPO_ROOT:-}"
 
-    if [ -n "$repo_root" ] && [ -f "$repo_root/pyproject.toml" ] && command -v poetry >/dev/null 2>&1; then
-        echo "poetry run python"
-        return 0
-    fi
+    # Resolve an existing interpreter only. Invoking a package manager here made
+    # read-only agent commands mutate consumer repositories: Poetry treated any
+    # pyproject.toml as its own and recreated uv-managed virtualenvs.
     if [ -n "$repo_root" ] && [ -x "$repo_root/.venv/bin/python3" ]; then
         canonicalize_runtime_path "$repo_root/.venv/bin/python3"
         return 0
@@ -136,14 +135,7 @@ _wv_agent_python_exec_module() {
         return 127
     fi
 
-    case "$python_command" in
-        "poetry run python")
-            PYTHONPATH="$pypath" poetry run python -m "$module" "$@"
-            ;;
-        *)
-            PYTHONPATH="$pypath" "$python_command" -m "$module" "$@"
-            ;;
-    esac
+    PYTHONPATH="$pypath" "$python_command" -m "$module" "$@"
 }
 
 _bootstrap_shell_token() {
@@ -348,12 +340,7 @@ _bootstrap_agent_info_json() {
 
     [ -n "$wv_command" ] && [ -x "$wv_command" ] && wv_ready=true
     [ -n "$db_path" ] && [ -f "$db_path" ] && db_ready=true
-    if [ -n "$python_command" ]; then
-        case "$python_command" in
-            "poetry run python") command -v poetry >/dev/null 2>&1 && python_ready=true ;;
-            *) [ -x "$python_command" ] && python_ready=true ;;
-        esac
-    fi
+    [ -n "$python_command" ] && [ -x "$python_command" ] && python_ready=true
     if [ -n "$wv_command" ] && [ -n "$invoked_wv" ] && [ "$wv_command" != "$invoked_wv" ]; then
         command_mismatch=true
     fi
@@ -2348,6 +2335,35 @@ _doctor_commit_refs() {
     fi
 }
 
+_doctor_local_procedure_command_refs() {
+    local procedures_dir="$1" file id matches=""
+    [ -d "$procedures_dir" ] || return 0
+
+    for file in "$procedures_dir"/*.md; do
+        [ -f "$file" ] || continue
+        if awk '
+            BEGIN { section=0; visibility="local"; command_ref=0 }
+            /^---[[:space:]]*$/ { section++; next }
+            section == 1 && /^visibility:/ {
+                value=$0
+                sub(/^visibility:[[:space:]]*/, "", value)
+                sub(/[[:space:]]*#.*/, "", value)
+                visibility=value
+            }
+            section >= 2 && $0 ~ /(^|[^.\/:[:alnum:]_-])wv[[:space:]]+[^[:space:]]/ {
+                command_ref=1
+            }
+            END { exit !(visibility == "local" && command_ref) }
+        ' "$file"; then
+            id=$(awk -F': *' '/^id:/{print $2; exit}' "$file")
+            [ -n "$id" ] || id=$(basename "$file" .md)
+            matches="${matches:+$matches, }$id"
+        fi
+    done
+
+    printf '%s' "$matches"
+}
+
 _doctor_record() {
     local name="$1" status="$2" detail="$3"
     _dr_total=$((_dr_total + 1))
@@ -2393,17 +2409,8 @@ _doctor_agent_python_exec() {
     local python_command="$1"
     shift
 
-    case "$python_command" in
-        "poetry run python")
-            PYTHONPATH="${WV_LIB_DIR:-}" poetry run python "$@"
-            ;;
-        "")
-            return 127
-            ;;
-        *)
-            PYTHONPATH="${WV_LIB_DIR:-}" "$python_command" "$@"
-            ;;
-    esac
+    [ -n "$python_command" ] || return 127
+    PYTHONPATH="${WV_LIB_DIR:-}" "$python_command" "$@"
 }
 
 _doctor_check_agent_env() {
@@ -2418,22 +2425,11 @@ _doctor_check_agent_env() {
     fi
 
     local python_detail="$python_command"
-    case "$python_command" in
-        "poetry run python")
-            if command -v poetry >/dev/null 2>&1; then
-                _doctor_record "agent python" "pass" "$python_detail"
-            else
-                _doctor_record "agent python" "fail" "poetry required for agent python command but not found"
-            fi
-            ;;
-        *)
-            if [ -x "$python_command" ]; then
-                _doctor_record "agent python" "pass" "$python_detail"
-            else
-                _doctor_record "agent python" "fail" "$python_detail not executable"
-            fi
-            ;;
-    esac
+    if [ -x "$python_command" ]; then
+        _doctor_record "agent python" "pass" "$python_detail"
+    else
+        _doctor_record "agent python" "fail" "$python_detail not executable"
+    fi
 
     local pytest_version
     pytest_version=$(_doctor_agent_python_exec "$python_command" -m pytest --version 2>/dev/null | head -1 || true)
@@ -2678,6 +2674,17 @@ _test_file_fingerprint() {
     local f="$1" h
     h=$(git hash-object "$f" 2>/dev/null)
     [ -z "$h" ] && h=$(stat -c '%Y:%s' "$f" 2>/dev/null || echo "missing")
+    printf '%s' "$h"
+}
+
+# _test_file_fingerprint_staged <path> — fingerprint the blob currently in the
+# Git index. A pre-commit freshness probe must describe the bytes Git will
+# commit, not a possibly different working-tree copy. Deleted/missing index
+# entries use the same "missing" sentinel as the current-file fallback above.
+_test_file_fingerprint_staged() {
+    local f="$1" h
+    h=$(git rev-parse --verify ":$f" 2>/dev/null || true)
+    [ -z "$h" ] && h="missing"
     printf '%s' "$h"
 }
 
@@ -3148,6 +3155,73 @@ cmd_test_record() {
                   >/dev/null 2>&1 || true
     done < <(printf '%s\n' "$files" | tr ',' '\n')
     return 0
+}
+
+# cmd_test_status <suite> --files=a,b [--staged] [--quiet]
+#
+# Read-only freshness predicate over the canonical test_results ledger. Exit 0
+# only when EVERY named file has a row for the suite whose fingerprint matches
+# the selected content and whose exit code is zero. Missing rows, failed rows,
+# stale fingerprints, and an empty file set all return non-zero, so callers can
+# safely degrade to running the real suite.
+#
+# --staged compares against index blobs and is the pre-commit form. Without it,
+# the command compares the working tree, matching wv done's freshness consumer.
+cmd_test_status() {
+    local suite="${1:-}"
+    shift || true
+    local files="" staged=false quiet=false arg
+    for arg in "$@"; do
+        case "$arg" in
+            --files=*) files="${arg#--files=}" ;;
+            --staged) staged=true ;;
+            --quiet) quiet=true ;;
+            *)
+                echo "wv test-status: unknown option '$arg'" >&2
+                return 2
+                ;;
+        esac
+    done
+
+    if [ -z "$suite" ] || [ -z "$files" ]; then
+        echo "Usage: wv test-status <suite> --files=a,b [--staged] [--quiet]" >&2
+        return 2
+    fi
+
+    local suite_esc overall="green" processed=0 f path_esc cur_fp row row_fp row_exit state
+    suite_esc=$(sql_escape "$suite")
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        processed=$((processed + 1))
+        path_esc=$(sql_escape "$f")
+        if [ "$staged" = true ]; then
+            cur_fp=$(_test_file_fingerprint_staged "$f")
+        else
+            cur_fp=$(_test_file_fingerprint "$f")
+        fi
+        row=$(db_query "SELECT fingerprint || char(31) || exit_code
+                        FROM test_results
+                        WHERE suite='$suite_esc' AND path='$path_esc'
+                        LIMIT 1;" 2>/dev/null || true)
+        if [ -z "$row" ]; then
+            state="unknown"
+        else
+            row_fp="${row%%$'\x1f'*}"
+            row_exit="${row#*$'\x1f'}"
+            if [ "$row_fp" != "$cur_fp" ]; then
+                state="stale"
+            elif [ "$row_exit" = "0" ]; then
+                state="green"
+            else
+                state="red"
+            fi
+        fi
+        [ "$state" = "green" ] || overall="$state"
+        [ "$quiet" = true ] || printf '%s\t%s\n' "$state" "$f"
+    done < <(printf '%s\n' "$files" | tr ',' '\n')
+
+    [ "$processed" -gt 0 ] || return 2
+    [ "$overall" = "green" ]
 }
 
 # _doctor_check_git_hook label src_path installed_path grep_pattern install_cmd
@@ -3658,6 +3732,58 @@ cmd_doctor() {
         fi
     fi
 
+    # 14a-quinquies. Coaching guide advisories, mirroring the managed-pattern
+    # family above. A project override under .weave/guides/ outranks the package
+    # guide of the same id, so a stale override silently outranks an improved one
+    # indefinitely -- the same failure the pattern-shadow record exists to surface.
+    if [ -d "${WEAVE_DIR:-}/guides" ]; then
+        local _gs_shadowed="" _gs_file _gs_name _gs_pkg
+        _gs_pkg="$(_wv_python_module_path weave_quality 2>/dev/null)/weave_quality/guides"
+        for _gs_file in "${WEAVE_DIR:-}"/guides/*.md; do
+            [ -f "$_gs_file" ] || continue
+            _gs_name="$(basename "$_gs_file")"
+            [ -f "$_gs_pkg/$_gs_name" ] || continue
+            _gs_shadowed="${_gs_shadowed:+$_gs_shadowed, }${_gs_name%.md}"
+        done
+        if [ -n "$_gs_shadowed" ]; then
+            _doctor_record "guide-shadow" "warn" "project guide(s) shadowing a package guide of the same id: $_gs_shadowed — confirm the override is still wanted"
+        else
+            _doctor_record "guide-shadow" "pass" "no project guide is shadowing a package guide"
+        fi
+    fi
+
+    # Every catalogued violation type resolves to a guide or to the explicit
+    # _uncoached fallback. A missing fallback means a catalogued type with no
+    # guide of its own would coach nothing at all -- the single outcome the
+    # fallback exists to prevent. Recorded unconditionally: a completeness check
+    # that silently skips is indistinguishable from one that passed.
+    local _gc_pkg="$REPO_ROOT/scripts/weave_quality/guides"
+    [ -d "$_gc_pkg" ] || _gc_pkg="${WV_LIB_DIR:-}/weave_quality/guides"
+    if [ -d "$_gc_pkg" ]; then
+        if [ -f "$_gc_pkg/_uncoached.md" ]; then
+            _doctor_record "guide-completeness" "pass" "the _uncoached fallback ships, so every catalogued violation type coaches"
+        else
+            _doctor_record "guide-completeness" "warn" "_uncoached.md is absent from $_gc_pkg — a catalogued type with no guide of its own would coach nothing"
+        fi
+    else
+        _doctor_record "guide-completeness" "warn" "no coaching guides directory resolved (looked in $_gc_pkg)"
+    fi
+
+    # 14a-quater. Procedure visibility semantic-drift advisory: local is the
+    # safe default, but a local procedure that documents the installed `wv`
+    # command may actually describe consumer behavior and warrants periodic
+    # review for promotion to shared. Scan body content only so the required
+    # frontmatter fallback (`wv guide --procedure=...`) does not self-match.
+    # Repository-development invocations (`./scripts/wv`) are intentionally
+    # excluded. Advisory only.
+    local _pv_drift
+    _pv_drift=$(_doctor_local_procedure_command_refs "${WV_CONFIG_DIR:-$HOME/.config/weave}/procedures")
+    if [ -n "$_pv_drift" ]; then
+        _doctor_record "procedure-visibility" "warn" "local procedure(s) reference consumer wv commands: $_pv_drift — review visibility: shared"
+    else
+        _doctor_record "procedure-visibility" "pass" "no local procedures reference consumer wv commands"
+    fi
+
     # 14a-quinquies. Closed-node uncommitted dirt attribution (wv-e48993):
     # pre-close-verification.sh now scopes its blocking check to the closing
     # node's OWN touched_files, so genuinely foreign dirt no longer blocks
@@ -3902,6 +4028,41 @@ cmd_doctor() {
 # cmd_mcp_status — Verify MCP server is built and reachable
 # ═══════════════════════════════════════════════════════════════════════════
 
+_mcp_scope_statuses() { # contract_path process_lines
+    local contract_path="$1" process_lines="$2"
+    local scope expected running duplicate status entries=""
+
+    while IFS= read -r scope; do
+        [ -n "$scope" ] || continue
+        expected=$(jq -r --arg scope "$scope" '.scopes[$scope].configured_by_default // false' "$contract_path")
+        running=$(
+            printf '%s\n' "$process_lines" | sed '/^$/d' | awk -v target="$scope" '
+                {
+                    scope="all"
+                    if ($0 ~ /--scope=/) {
+                        scope=$0
+                        sub(/^.*--scope=/, "", scope)
+                        sub(/[[:space:]].*$/, "", scope)
+                    }
+                    if (scope == target) count++
+                }
+                END { print count + 0 }'
+        )
+        duplicate=false
+        status="unknown"
+        if [ "$running" -gt 1 ]; then
+            duplicate=true
+            status="stale"
+        elif [ "$running" -eq 1 ]; then
+            status="running"
+        fi
+        entries="${entries:+$entries,}$(printf '{"scope":"%s","expected":%s,"running":%d,"duplicate":%s,"status":"%s"}' \
+            "$scope" "$expected" "$running" "$duplicate" "$status")"
+    done < <(jq -r '.scopes | keys[]' "$contract_path")
+
+    printf '[%s]\n' "$entries"
+}
+
 cmd_mcp_status() {
     local format="text"
     while [ $# -gt 0 ]; do
@@ -4044,41 +4205,26 @@ cmd_mcp_status() {
 
     # 5. Live process visibility. VS Code/Copilot owns stdio server lifetimes, so
     # absence is advisory, while extra same-scope processes are a stale-server smell.
-    local process_lines process_count duplicate_scope
+    local process_lines process_count duplicate_scope per_scope scope_summary
     process_lines=$(pgrep -af 'mcp/dist/index.js|weave-mcp|node .*weave' 2>/dev/null | grep -v 'pgrep -af' || true)
-    process_count=$(printf '%s\n' "$process_lines" | sed '/^$/d' | wc -l | tr -d ' ')
-    duplicate_scope=$(
-        printf '%s\n' "$process_lines" | sed '/^$/d' | awk '
-            {
-                scope="all"
-                if ($0 ~ /--scope=graph/) scope="graph"
-                else if ($0 ~ /--scope=session/) scope="session"
-                else if ($0 ~ /--scope=lite/) scope="lite"
-                else if ($0 ~ /--scope=inspect/) scope="inspect"
-                count[scope]++
-            }
-            END {
-                for (scope in count) if (count[scope] > 1) {
-                    if (out) out=out ","
-                    out=out scope ":" count[scope]
-                }
-                print out
-            }'
-    )
+    per_scope=$(_mcp_scope_statuses "$REPO_ROOT/mcp/contract.json" "$process_lines")
+    process_count=$(jq '[.[].running] | add // 0' <<<"$per_scope")
+    duplicate_scope=$(jq -r '[.[] | select(.duplicate) | "\(.scope):\(.running)"] | join(",")' <<<"$per_scope")
+    scope_summary=$(jq -r '[.[] | "\(.scope) \(if .expected then "expected" else "optional" end)/\(.status) (\(.running))"] | join(", ")' <<<"$per_scope")
     if [ "$process_count" -eq 0 ] 2>/dev/null; then
-        _mcp_record "server processes" "warn" "no running MCP server visible; start or restart the MCP client if tools are unavailable"
+        _mcp_record "server processes" "warn" "$scope_summary — no server visible; start or restart the MCP client if tools are unavailable"
     elif [ -n "$duplicate_scope" ]; then
-        _mcp_record "server processes" "warn" "${process_count} running, duplicate scope(s): ${duplicate_scope} — restart MCP servers to clear stale instances"
+        _mcp_record "server processes" "warn" "$scope_summary — restart duplicate scope(s) ${duplicate_scope} to clear stale instances"
     else
-        _mcp_record "server processes" "pass" "${process_count} running MCP server process(es), no duplicate scopes visible"
+        _mcp_record "server processes" "pass" "$scope_summary"
     fi
 
     # Summary
     if [ "$format" = "json" ]; then
         local overall="pass"
         [ "$fail" -gt 0 ] && overall="fail"
-        printf '{"overall":"%s","passed":%d,"failed":%d,"warnings":%d,"total":%d,"checks":[%s]}\n' \
-            "$overall" "$pass" "$fail" "$warn" "$total" "$results"
+        printf '{"overall":"%s","passed":%d,"failed":%d,"warnings":%d,"total":%d,"checks":[%s],"per_scope":%s}\n' \
+            "$overall" "$pass" "$fail" "$warn" "$total" "$results" "$per_scope"
     else
         echo ""
         if [ "$fail" -gt 0 ]; then
@@ -6381,6 +6527,9 @@ cmd_help_topic() {
         validate-finding)
             print_command_help "wv validate-finding <id>" "Validate finding metadata for a node. Exit 0 = valid; exit 1 = invalid. Outputs JSON {valid, errors[]}. Used by pre-close-verification hook to enforce violation_type and optional field constraints before a finding node can be closed."
             ;;
+        test-status)
+            print_command_help "wv test-status <suite> --files=a,b [--staged] [--quiet]" "Return success only when every named file has a fresh green result for the suite. --staged compares the recorded result with Git index blobs for pre-commit reuse; the default compares working-tree content."
+            ;;
         init-repo)
             cmd_init_repo --help
             ;;
@@ -6679,6 +6828,7 @@ Commands:
   hotzone <sub>     Hot-zone DB directories (list, gc) [--json] [--dry-run]
   selftest          Round-trip smoke test in isolated environment [--json]
   test-record <suite> Record a test-suite run for verification freshness (used by git hooks)
+  test-status <suite> Check whether every named file has a fresh green suite result
     mcp-status        Verify MCP server is built and IDE config shape is current [--json]
   health            System health check with score and diagnostics [--history[=N]]
   config            Manage durable opt-in knobs [list|get|set|unset|enable|disable]

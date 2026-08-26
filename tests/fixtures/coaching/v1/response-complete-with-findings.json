@@ -1,0 +1,36 @@
+{
+  "format": "weave.coaching-response.v1",
+  "state": "complete_with_findings",
+  "bounded": true,
+  "blocks": [
+    {
+      "violation_type": "code:swallowed-exception",
+      "node_id": "wv-44e524",
+      "occurrence_count": 7,
+      "sampled": true,
+      "policy": "advisory",
+      "confidence": "high",
+      "recurrence": 4,
+      "resolving": {"node_id": null, "status": null},
+      "occurrences": [
+        {
+          "path": "scripts/weave_quality/example.py",
+          "line": 88,
+          "shape": "location",
+          "content": "except Exception: pass",
+          "detectors": [{"rule_id": "bare-except-pass", "message": "Silenced exception hides errors.", "finding_key": "qf-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]
+        }
+      ],
+      "guide": {
+        "id": "swallowed-exception",
+        "language": "python",
+        "source": "package",
+        "why": "A catch-all that discards the error hides a failure nobody has named.",
+        "corrective_move": "Catch only the error you can name; recover, add context and re-raise, or log the traceback at a boundary that must stay alive.",
+        "expected_outcome": "The failure is visible to whoever is on call, and the catch states a decision.",
+        "avoid": "Narrowing the type or adding a suppression comment while the error is still discarded.",
+        "names_missing_guide": false
+      }
+    }
+  ]
+}

@@ -524,6 +524,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-checkpoint-ci.sh "$LIB_DIR/lib/wv-checkpoint-ci.sh"
     install_file ./scripts/lib/wv-repository-class.sh "$LIB_DIR/lib/wv-repository-class.sh"
     install_file ./scripts/lib/wv-workflow-classes.gen.sh "$LIB_DIR/lib/wv-workflow-classes.gen.sh"
+    install_file ./scripts/lib/wv-violation-vocabulary.gen.sh "$LIB_DIR/lib/wv-violation-vocabulary.gen.sh"
     install_file ./scripts/lib/wv-hook-common.sh "$LIB_DIR/lib/wv-hook-common.sh"
     install_file ./scripts/lib/wv-resolve-project.sh "$LIB_DIR/lib/wv-resolve-project.sh"
     install_file ./scripts/lib/wv-resolve-runtime.sh "$LIB_DIR/lib/wv-resolve-runtime.sh"
@@ -559,6 +560,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/cmd/wv-cmd-query.sh "$LIB_DIR/cmd/wv-cmd-query.sh"
     install_file ./scripts/cmd/wv-cmd-hook.sh "$LIB_DIR/cmd/wv-cmd-hook.sh"
     install_file ./profiling/audit_sessions.py "$LIB_DIR/profiling/audit_sessions.py"
+    install_file ./profiling/checkpoint_overlap.py "$LIB_DIR/profiling/checkpoint_overlap.py"
     # Python sync package
     mkdir -p "$LIB_DIR/weave_gh"
     for pyf in ./scripts/weave_gh/*.py; do
@@ -581,6 +583,29 @@ if [ -f "./scripts/wv" ]; then
     done
     for pf in ./scripts/weave_quality/default_patterns/*.yaml; do
         install_file "$pf" "$LIB_DIR/weave_quality/default_patterns/$(basename "$pf")"
+    done
+    install_file ./scripts/weave_quality/default_patterns/manifest.json \
+        "$LIB_DIR/weave_quality/default_patterns/manifest.json"
+    # Coaching guide assets. Flat by contract: both installer paths enumerate
+    # this directory non-recursively, which is also why a guide basename may
+    # never contain a dot or a slash.
+    mkdir -p "$LIB_DIR/weave_quality/guides"
+    for guide in ./scripts/weave_quality/guides/*.md; do
+        install_file "$guide" "$LIB_DIR/weave_quality/guides/$(basename "$guide")"
+    done
+    # Pure coaching package: planner and view. Installed like any other package
+    # so the resolved guide and the code that renders it travel together.
+    mkdir -p "$LIB_DIR/weave_coaching"
+    for pyf in ./scripts/weave_coaching/*.py; do
+        install_file "$pyf" "$LIB_DIR/weave_coaching/$(basename "$pyf")"
+    done
+    # Machine-readable contracts the runtime reads (the violation vocabulary and
+    # the coaching schemas). Installed mode resolves these from $LIB_DIR, never
+    # from a source checkout that may not exist on the target machine.
+    mkdir -p "$LIB_DIR/contracts"
+    for contract in ./contracts/violation-vocabulary-v1.json ./contracts/coaching-*.json; do
+        [ -f "$contract" ] || continue
+        install_file "$contract" "$LIB_DIR/contracts/$(basename "$contract")"
     done
     mkdir -p "$LIB_DIR/weave_indexer"
     for pyf in ./scripts/weave_indexer/*.py; do
@@ -627,6 +652,7 @@ if [ -f "./scripts/wv" ]; then
     cp ./scripts/lib/wv-validate.sh "$CONFIG_DIR/lib/wv-validate.sh"
     cp ./scripts/lib/wv-config.sh "$CONFIG_DIR/lib/wv-config.sh"
     cp ./scripts/lib/wv-workflow-classes.gen.sh "$CONFIG_DIR/lib/wv-workflow-classes.gen.sh"
+    cp ./scripts/lib/wv-violation-vocabulary.gen.sh "$CONFIG_DIR/lib/wv-violation-vocabulary.gen.sh"
     cp ./scripts/lib/wv-hook-common.sh "$CONFIG_DIR/lib/wv-hook-common.sh"
     cp ./scripts/lib/wv-checkpoint-ci.sh "$CONFIG_DIR/lib/wv-checkpoint-ci.sh"
     cp ./scripts/lib/wv-repository-class.sh "$CONFIG_DIR/lib/wv-repository-class.sh"
@@ -702,6 +728,7 @@ else
     download_file "$REPO/scripts/lib/wv-checkpoint-ci.sh" "$LIB_DIR/lib/wv-checkpoint-ci.sh"
     download_file "$REPO/scripts/lib/wv-repository-class.sh" "$LIB_DIR/lib/wv-repository-class.sh"
     download_file "$REPO/scripts/lib/wv-workflow-classes.gen.sh" "$LIB_DIR/lib/wv-workflow-classes.gen.sh"
+    download_file "$REPO/scripts/lib/wv-violation-vocabulary.gen.sh" "$LIB_DIR/lib/wv-violation-vocabulary.gen.sh"
     download_file "$REPO/scripts/lib/wv-hook-common.sh" "$LIB_DIR/lib/wv-hook-common.sh"
     download_file "$REPO/scripts/lib/wv-resolve-project.sh" "$LIB_DIR/lib/wv-resolve-project.sh"
     download_file "$REPO/scripts/lib/wv-resolve-runtime.sh" "$LIB_DIR/lib/wv-resolve-runtime.sh"
@@ -730,6 +757,7 @@ else
     download_file "$REPO/scripts/cmd/wv-cmd-query.sh" "$LIB_DIR/cmd/wv-cmd-query.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-hook.sh" "$LIB_DIR/cmd/wv-cmd-hook.sh"
     download_file "$REPO/profiling/audit_sessions.py" "$LIB_DIR/profiling/audit_sessions.py"
+    download_file "$REPO/profiling/checkpoint_overlap.py" "$LIB_DIR/profiling/checkpoint_overlap.py"
     # Git hook sources (used by wv-init-repo --update refresh)
     mkdir -p "$LIB_DIR/hooks"
     download_file "$REPO/scripts/hooks/pre-commit-weave.sh" "$LIB_DIR/hooks/pre-commit-weave.sh"
@@ -753,7 +781,12 @@ else
     quality_modules=$(curl -sSL "https://api.github.com/repos/AGM1968/weave/contents/scripts/weave_quality?ref=main" \
         | jq -r '.[] | select(.name | endswith(".py")) | .name' 2>/dev/null)
     if [ -z "$quality_modules" ]; then
-        quality_modules="__init__.py __main__.py models.py git_metrics.py python_parser.py bash_heuristic.py bash_ast_grep.py typescript_parser.py hotspots.py db.py classification.py findings.py prose_rules.py"
+        # Fallback for an unavailable/rate-limited API. Kept in exact-set parity
+        # with scripts/weave_quality/*.py by tests/test-install-asset-parity.sh:
+        # a module missing here installs a package that imports and then fails at
+        # runtime, and this list had already drifted twice before that check
+        # existed.
+        quality_modules="__init__.py __main__.py ast_cache.py bash_ast_grep.py bash_heuristic.py classification.py coaching_apply.py coaching_evidence.py db.py external_tools.py findings.py git_metrics.py guides.py hotspots.py models.py prose_rules.py python_parser.py typescript_parser.py"
     fi
     for pyfile in $quality_modules; do
         download_file "$REPO/scripts/weave_quality/${pyfile}" "$LIB_DIR/weave_quality/${pyfile}"
@@ -771,6 +804,39 @@ else
     for pattern_rule in subprocess-shell-true bare-except-pass unquoted-variable prose-register-review prose-emphasis-hedge; do
         download_file "$REPO/scripts/weave_quality/default_patterns/${pattern_rule}.yaml" \
             "$LIB_DIR/weave_quality/default_patterns/${pattern_rule}.yaml"
+    done
+    download_file "$REPO/scripts/weave_quality/default_patterns/manifest.json" \
+        "$LIB_DIR/weave_quality/default_patterns/manifest.json"
+    # Coaching guide assets. Enumerated non-recursively, like the modules above,
+    # which is why the guides directory must stay flat.
+    mkdir -p "$LIB_DIR/weave_quality/guides"
+    local coaching_guides
+    coaching_guides=$(curl -sSL "https://api.github.com/repos/AGM1968/weave/contents/scripts/weave_quality/guides?ref=main" \
+        | jq -r '.[] | select(.name | endswith(".md")) | .name' 2>/dev/null)
+    if [ -z "$coaching_guides" ]; then
+        coaching_guides="_clean.md _incomplete.md _uncoached.md swallowed-exception.md swallowed-exception.python.md"
+    fi
+    for guide_file in $coaching_guides; do
+        download_file "$REPO/scripts/weave_quality/guides/${guide_file}" \
+            "$LIB_DIR/weave_quality/guides/${guide_file}"
+    done
+    # Pure coaching package
+    mkdir -p "$LIB_DIR/weave_coaching"
+    local coaching_modules
+    coaching_modules=$(curl -sSL "https://api.github.com/repos/AGM1968/weave/contents/scripts/weave_coaching?ref=main" \
+        | jq -r '.[] | select(.name | endswith(".py")) | .name' 2>/dev/null)
+    if [ -z "$coaching_modules" ]; then
+        coaching_modules="__init__.py planner.py view.py"
+    fi
+    for coaching_file in $coaching_modules; do
+        download_file "$REPO/scripts/weave_coaching/${coaching_file}" \
+            "$LIB_DIR/weave_coaching/${coaching_file}"
+    done
+    # Machine-readable contracts the runtime reads
+    mkdir -p "$LIB_DIR/contracts"
+    for contract_file in violation-vocabulary-v1.json coaching-promotion-v1.schema.json \
+        coaching-response-v1.schema.json coaching-guide-v1.schema.json; do
+        download_file "$REPO/contracts/${contract_file}" "$LIB_DIR/contracts/${contract_file}"
     done
     # Python indexer package
     mkdir -p "$LIB_DIR/weave_indexer"
@@ -1455,16 +1521,6 @@ else
     echo -e "  ${GREEN}✓${NC} .gitignore (created with Weave entries)"
 fi
 
-# Git hook: prepare-commit-msg (portable, awk-based)
-HOOK_DIR="$REPO_ROOT/.git/hooks"
-install_git_hook_from_repo "./scripts/hooks/prepare-commit-msg-weave.sh" "Weave: append Weave-ID trailers" "prepare-commit-msg"
-
-# Git hook: pre-commit (enforce active Weave node)
-install_git_hook_from_repo "./scripts/hooks/pre-commit-weave.sh" "Weave pre-commit" "pre-commit"
-
-# Git hook: post-commit (run deferred non-critical suites)
-install_git_hook_from_repo "./scripts/hooks/post-commit-weave.sh" "Weave post-commit" "post-commit"
-
 # scripts/hooks/ vendor refresh — for a consumer repo that vendors hook sources,
 # converge scripts/hooks/ to the canonical set from LIB_DIR so PR review and
 # wv doctor --source-compare see every installed hook. SEED a source that is
@@ -1491,6 +1547,21 @@ if [ -d "$REPO_ROOT/scripts/hooks" ] && [ -d "$_LIB_HOOKS" ]; then
     done
     [ "$_updated_vendor" -eq 0 ] && true
 fi
+
+# Refresh tracked hook sources before installing .git/hooks copies. Installing
+# first leaves the executable one release behind whenever a consumer vendors a
+# stale source: the first pass copies that stale file into .git/hooks and only
+# then refreshes its source, so doctor requires a second update to converge.
+HOOK_DIR="$REPO_ROOT/.git/hooks"
+
+# Git hook: prepare-commit-msg (portable, awk-based)
+install_git_hook_from_repo "./scripts/hooks/prepare-commit-msg-weave.sh" "Weave: append Weave-ID trailers" "prepare-commit-msg"
+
+# Git hook: pre-commit (enforce active Weave node)
+install_git_hook_from_repo "./scripts/hooks/pre-commit-weave.sh" "Weave pre-commit" "pre-commit"
+
+# Git hook: post-commit (run deferred non-critical suites)
+install_git_hook_from_repo "./scripts/hooks/post-commit-weave.sh" "Weave post-commit" "post-commit"
 
 # .gitattributes: merge strategy + diff suppression for Weave state files
 # Uses BEGIN/END markers (like Makefile template) for reliable idempotent updates

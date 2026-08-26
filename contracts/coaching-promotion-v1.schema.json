@@ -1,0 +1,767 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://weave.dev/contracts/coaching-promotion-v1.schema.json",
+  "$comment": "Normalized accepted-evidence input and pure promotion-plan output. The planner is a pure function from `promotion_input` to `promotion_plan`: no analyzer runs, no disposition writes, no graph access. quality.db never appears here \u2014 the provider adapter joins durable adjudication state to a complete current scan and emits `promotion_input`.",
+  "$defs": {
+    "anchor": {
+      "$comment": "Conceptual occurrence identity. Derived from the path and the NFKC-normalized match and context \u2014 the same components as the durable content key with the rule id removed, so one anchor can be reported by several rules. Line and column are deliberately absent: they live only in the prunable point-in-time table and were excluded from qf-* identity on purpose.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "normalized_match",
+        "normalized_context"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "$comment": "Repository-relative POSIX path, or a lexical absolute path for a target outside the repository."
+        },
+        "normalized_match": {
+          "type": "string"
+        },
+        "normalized_context": {
+          "type": "string"
+        }
+      }
+    },
+    "location_snapshot": {
+      "$comment": "Display-only. Read from the latest complete scan at promotion time and never part of any identity; absent when no current scan row backs the anchor.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scan_id"
+      ],
+      "properties": {
+        "scan_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "column": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "detector_record": {
+      "$comment": "One rule's view of one anchor. Every qf-* that contributed is preserved; none of these fields may enter an identity.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "finding_key",
+        "disposition",
+        "scan_count"
+      ],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "finding_key": {
+          "type": "string",
+          "pattern": "^qf-[0-9a-f]{64}$"
+        },
+        "content_key": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        },
+        "disposition": {
+          "const": "accepted_defect"
+        },
+        "scan_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "definition_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "provider_observation": {
+      "$comment": "One accepted raw observation emitted by the provider adapter. The planner, not the provider, normalizes match/context and derives conceptual anchors.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "match_text",
+        "context_text",
+        "detector"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "match_text": {
+          "type": "string"
+        },
+        "context_text": {
+          "type": "string"
+        },
+        "detector": {
+          "$ref": "#/$defs/detector_record"
+        },
+        "location": {
+          "$ref": "#/$defs/location_snapshot"
+        }
+      }
+    },
+    "provider_rejection": {
+      "$comment": "Accepted durable evidence the provider refuses to treat as a current observation. It remains raw so the pure planner owns normalization and anchor derivation; it carries no location and can never become a candidate.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "path",
+        "match_text",
+        "context_text",
+        "detector",
+        "detail"
+      ],
+      "properties": {
+        "reason": {
+          "const": "not_current"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "match_text": {
+          "type": "string"
+        },
+        "context_text": {
+          "type": "string"
+        },
+        "detector": {
+          "$ref": "#/$defs/detector_record"
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "occurrence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "anchor",
+        "detectors",
+        "merged"
+      ],
+      "properties": {
+        "anchor": {
+          "$ref": "#/$defs/anchor"
+        },
+        "detectors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/detector_record"
+          }
+        },
+        "location": {
+          "$ref": "#/$defs/location_snapshot"
+        },
+        "merged": {
+          "type": "boolean",
+          "$comment": "True when more than one rule contributed. Merging happens only across different rules, and only when each contributing rule has exactly one observation for the anchor; repeated equal anchors within one rule stay separate unless the reviewed plan pairs them explicitly."
+        },
+        "merge_declined": {
+          "enum": [
+            "repeated_anchor_within_rule",
+            "unequal_anchor",
+            "explicit_review_required"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "merged": {
+                "const": true
+              }
+            },
+            "required": [
+              "merged"
+            ]
+          },
+          "then": {
+            "properties": {
+              "detectors": {
+                "type": "array",
+                "minItems": 2
+              },
+              "merge_declined": false
+            }
+          },
+          "else": {
+            "properties": {
+              "detectors": {
+                "type": "array",
+                "maxItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "snapshot_state": {
+      "$comment": "Fail-closed analysis completeness. Only `complete` may support promotion.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "complete",
+            "incomplete"
+          ]
+        },
+        "causes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/incomplete_cause"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "complete"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "causes": false
+            }
+          },
+          "else": {
+            "required": [
+              "causes"
+            ],
+            "properties": {
+              "causes": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "incomplete_cause": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "rule_id"
+      ],
+      "properties": {
+        "reason": {
+          "enum": [
+            "receipt_missing",
+            "receipt_failed",
+            "definition_hash_stale",
+            "rule_not_active",
+            "repo_rule_not_at_head",
+            "package_rule_not_manifest_bound"
+          ]
+        },
+        "rule_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "type": "string"
+        }
+      }
+    },
+    "rule_definition_binding": {
+      "$comment": "The authority for one active rule's validation bytes. Target rules are reconstructible from the named commit; installed package defaults are authorized by the exact shipped manifest and honestly remain non-reconstructible until package installation records a source revision.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["authority", "path", "revision", "definition_sha256", "reconstructible_from_commit"],
+          "properties": {
+            "authority": {"const": "target_head"},
+            "path": {"type": "string", "minLength": 1},
+            "revision": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+            "definition_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "reconstructible_from_commit": {"const": true}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["authority", "asset", "manifest_sha256", "definition_sha256", "reconstructible_from_commit"],
+          "properties": {
+            "authority": {"const": "package_manifest"},
+            "asset": {"type": "string", "pattern": "^default_patterns/[A-Za-z0-9][A-Za-z0-9._-]*\\.yaml$"},
+            "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "definition_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "reconstructible_from_commit": {"const": false}
+          }
+        }
+      ]
+    },
+    "promotion_input": {
+      "$comment": "What the provider adapter hands the planner. Only accepted defects reach it; recurrence alone never does.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "scope",
+        "catalog_version",
+        "snapshot",
+        "observations",
+        "provider_rejections",
+        "catalog_violation_types",
+        "rule_definition_bindings",
+        "rule_violation_types",
+        "resolved_guides"
+      ],
+      "properties": {
+        "format": {
+          "const": "weave.coaching-promotion-input.v1"
+        },
+        "scope": {
+          "$ref": "#/$defs/promotion_scope"
+        },
+        "catalog_version": {
+          "const": "weave.violation-vocabulary.v1"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/snapshot_state"
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/provider_observation"
+          }
+        },
+        "provider_rejections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/provider_rejection"
+          },
+          "$comment": "Provider-classified durable evidence that must remain visible in the plan but cannot promote."
+        },
+        "catalog_violation_types": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1},
+          "$comment": "The catalog membership set used for this plan. It travels in the document so the pure planner can prove canonical promotion never emits an off-catalog type without reading the catalog file out of band."
+        },
+        "rule_violation_types": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          },
+          "$comment": "rule_id -> catalogued violation_type. The mapping is rule-owned and read by the provider; it travels IN the input because the planner is a pure function of one document. A planner given the mapping out of band would leave every frozen case underspecified."
+        },
+        "rule_definition_bindings": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/rule_definition_binding"},
+          "$comment": "rule_id -> authority for the exact bytes whose scan receipt gates promotion. A complete scoped input has a binding for exactly its reviewed rule_ids."
+        },
+        "resolved_guides": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/guide_resolution"
+          },
+          "$comment": "violation_type -> the guide the host resolved for it, with the remediation summary the canonical finding requires. Resolution reads the filesystem, so it happens outside the planner and arrives here as an immutable value."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "snapshot": {
+                "type": "object",
+                "properties": {
+                  "state": {
+                    "const": "incomplete"
+                  }
+                },
+                "required": [
+                  "state"
+                ]
+              }
+            },
+            "required": [
+              "snapshot"
+            ]
+          },
+          "then": {
+            "properties": {
+              "observations": {
+                "type": "array",
+                "maxItems": 0
+              },
+              "provider_rejections": {
+                "type": "array",
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "snapshot": {
+                "type": "object",
+                "properties": {"state": {"const": "complete"}},
+                "required": ["state"]
+              }
+            },
+            "required": ["snapshot"]
+          },
+          "then": {
+            "properties": {
+              "rule_definition_bindings": {"type": "object", "minProperties": 1}
+            }
+          }
+        }
+      ]
+    },
+    "promotion_scope": {
+      "$comment": "The reviewed boundary a promotion identity is stable within.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "review_parent"
+      ],
+      "properties": {
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "review_parent": {
+          "type": "string",
+          "pattern": "^wv-[0-9a-f]{6}$"
+        },
+        "rule_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "resolved_guide": {
+      "$comment": "Identity of the guide asset that coached this finding. The digest is promotion-time provenance only: never an identity, freshness, validation, or CLI/MCP parity input, because a .weave/guides/ override makes it machine-local.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^_?[a-z0-9]+(-[a-z0-9]+)*$"
+        },
+        "language": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "enum": [
+            "project",
+            "package",
+            "fallback"
+          ]
+        },
+        "definition_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "missing_guide_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+        },
+        "missing_violation_type": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"source": {"const": "fallback"}}, "required": ["source"]},
+          "then": {
+            "properties": {
+              "id": {"const": "_uncoached"},
+              "missing_guide_id": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"},
+              "missing_violation_type": {"type": "string", "minLength": 1}
+            },
+            "required": ["missing_guide_id", "missing_violation_type"]
+          },
+          "else": {
+            "properties": {
+              "id": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"},
+              "missing_guide_id": false,
+              "missing_violation_type": false
+            }
+          }
+        }
+      ]
+    },
+    "promotion_candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "promotion_id",
+        "violation_type",
+        "guide",
+        "occurrences",
+        "rule_definition_bindings",
+        "policy",
+        "proposed_fix"
+      ],
+      "properties": {
+        "promotion_id": {
+          "type": "string",
+          "pattern": "^cp-[0-9a-f]{64}$",
+          "$comment": "cp- plus SHA-256 of the UTF-8 JSON encoding of [violation_type, guide.id, guide.language, scope.target, scope.review_parent, sorted(scope.rule_ids or [])]. Never derived from display order, line/column, detector message, source text, or the guide digest. JSON Schema enforces the shape; the contract suite enforces derivation and conceptual uniqueness."
+        },
+        "violation_type": {
+          "type": "string",
+          "minLength": 1,
+          "$comment": "Must be present in contracts/violation-vocabulary-v1.json; canonical promotion never emits an absent or off-catalog value."
+        },
+        "guide": {
+          "$ref": "#/$defs/resolved_guide"
+        },
+        "occurrences": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/occurrence"
+          }
+        },
+        "rule_definition_bindings": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"$ref": "#/$defs/rule_definition_binding"},
+          "$comment": "The authority bindings for exactly the detector rules contributing to this candidate."
+        },
+        "policy": {
+          "enum": [
+            "advisory",
+            "required"
+          ]
+        },
+        "confidence": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "fixable": {
+          "type": "boolean"
+        },
+        "root_cause": {
+          "type": "string"
+        },
+        "proposed_fix": {
+          "type": "string",
+          "minLength": 1,
+          "$comment": "Must be specific remediation; a generic 'review source' string is not a valid promoted fix."
+        },
+        "decided_precision": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "existing_node": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^wv-[0-9a-f]{6}$"
+        },
+        "action": {
+          "enum": [
+            "create",
+            "update",
+            "unchanged"
+          ]
+        }
+      }
+    },
+    "promotion_plan": {
+      "$comment": "The planner's whole output. Dry-run serializes exactly these bytes and apply consumes them; apply recomputing a different plan is a blocking tripwire.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "scope",
+        "catalog_version",
+        "snapshot",
+        "candidates"
+      ],
+      "properties": {
+        "format": {
+          "const": "weave.coaching-promotion-plan.v1"
+        },
+        "scope": {
+          "$ref": "#/$defs/promotion_scope"
+        },
+        "catalog_version": {
+          "const": "weave.violation-vocabulary.v1"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/snapshot_state"
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/promotion_candidate"
+          }
+        },
+        "rejected": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "reason"
+            ],
+            "properties": {
+              "reason": {
+                "enum": [
+                  "uncatalogued_violation_type",
+                  "no_guide_and_no_reviewed_fallback",
+                  "not_accepted",
+                  "not_current",
+                  "conflicting_detector_facts"
+                ]
+              },
+              "rule_id": {
+                "type": "string"
+              },
+              "finding_key": {
+                "type": "string",
+                "pattern": "^qf-[0-9a-f]{64}$"
+              },
+              "anchor": {
+                "$ref": "#/$defs/anchor"
+              },
+              "detail": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "snapshot": {
+                "type": "object",
+                "properties": {
+                  "state": {
+                    "const": "incomplete"
+                  }
+                },
+                "required": [
+                  "state"
+                ]
+              }
+            },
+            "required": [
+              "snapshot"
+            ]
+          },
+          "then": {
+            "properties": {
+              "candidates": {
+                "type": "array",
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "guide_resolution": {
+      "$comment": "What the host resolved for one violation type: the guide's identity, plus the two summary fields a canonical finding is required to carry. The finding stores these; it never stores the guide body, which stays an independently versioned asset. Passing them in keeps the planner pure -- it cannot read a guide file to invent remediation.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "guide",
+        "root_cause",
+        "proposed_fix"
+      ],
+      "properties": {
+        "guide": {
+          "$ref": "#/$defs/resolved_guide"
+        },
+        "root_cause": {
+          "type": "string",
+          "minLength": 1
+        },
+        "proposed_fix": {
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "fixable": {
+          "type": "boolean"
+        },
+        "policy": {
+          "enum": [
+            "advisory",
+            "required"
+          ]
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/promotion_input"
+    },
+    {
+      "$ref": "#/$defs/promotion_plan"
+    }
+  ]
+}

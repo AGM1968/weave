@@ -225,6 +225,7 @@ battery R config     config
 battery J repo-class repo-class --json
 battery H hook
 battery H test-record
+battery H test-status
 battery H selftest
 
 echo "--- quality / analysis / query ---"

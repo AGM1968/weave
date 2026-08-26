@@ -31,6 +31,15 @@ run_hook_suite() {
     _pc_cost="${2:-}"
     # Heuristic may map to a suite that doesn't exist yet — skip rather than fail.
     [ -f "$REPO_ROOT/$_pc_suite" ] || return 0
+    # A deliberately pre-run suite may already certify these exact index blobs.
+    # Reuse only an all-files fresh green result; test-status returns non-zero for
+    # a missing/wiped ledger, a failed row, a stale fingerprint, or a partial
+    # file set, and older installed wv versions do not know the command — every
+    # one of those cases falls through to the unchanged real-suite execution.
+    if "$WV" test-status "$_pc_suite" --files="${_pc_files_csv:-}" --staged --quiet >/dev/null 2>&1; then
+        hook_progress "reusing fresh green result for $_pc_suite (exact staged content)"
+        return 0
+    fi
     # A suite with no recorded wall time must not announce "~0s": that reads as a
     # measurement of a fast suite, and an operator who then waits two minutes for
     # a silent gate concludes it hung and interrupts it, losing the commit.

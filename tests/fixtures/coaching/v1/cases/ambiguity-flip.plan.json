@@ -1,0 +1,100 @@
+{
+  "format": "weave.coaching-promotion-plan.v1",
+  "scope": {
+    "target": "scripts",
+    "review_parent": "wv-44e524",
+    "rule_ids": [
+      "bare-except-pass",
+      "python-broad-except"
+    ]
+  },
+  "catalog_version": "weave.violation-vocabulary.v1",
+  "snapshot": {
+    "state": "complete"
+  },
+  "candidates": [
+    {
+      "promotion_id": "cp-07a780e75b110502e83efcd80c29240033e86f96eb0eef1bb89a3a8eb581c43f",
+      "violation_type": "code:swallowed-exception",
+      "guide": {
+        "id": "swallowed-exception",
+        "language": "python",
+        "source": "package"
+      },
+      "policy": "advisory",
+      "confidence": "high",
+      "fixable": true,
+      "root_cause": "A broad except discards an error nobody has named.",
+      "proposed_fix": "Catch the specific error the call raises, or add context and re-raise; log the traceback at a boundary that must stay alive.",
+      "rule_definition_bindings": {
+        "bare-except-pass": {"authority": "package_manifest", "asset": "default_patterns/bare-except-pass.yaml", "manifest_sha256": "6e7d0d88c46c488a89cff8f09c028a2157f00baa4be0601af689a99e164318fb", "definition_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "reconstructible_from_commit": false},
+        "python-broad-except": {"authority": "target_head", "path": ".weave/patterns/python-broad-except.yaml", "revision": "dddddddddddddddddddddddddddddddddddddddd", "definition_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "reconstructible_from_commit": true}
+      },
+      "occurrences": [
+        {
+          "anchor": {
+            "path": "scripts/weave_quality/example.py",
+            "normalized_match": "try: risky() except Exception: pass",
+            "normalized_context": "except Exception: pass"
+          },
+          "location": {
+            "scan_id": 41,
+            "line": 88
+          },
+          "merged": false,
+          "merge_declined": "repeated_anchor_within_rule",
+          "detectors": [
+            {
+              "rule_id": "bare-except-pass",
+              "finding_key": "qf-4ae9fabed083eaac1c66f8c020965a0d30f8b7c16335d947a41e68a7a1edf638",
+              "disposition": "accepted_defect",
+              "scan_count": 5
+            }
+          ]
+        },
+        {
+          "anchor": {
+            "path": "scripts/weave_quality/example.py",
+            "normalized_match": "try: risky() except Exception: pass",
+            "normalized_context": "except Exception: pass"
+          },
+          "location": {
+            "scan_id": 41,
+            "line": 140
+          },
+          "merged": false,
+          "merge_declined": "repeated_anchor_within_rule",
+          "detectors": [
+            {
+              "rule_id": "bare-except-pass",
+              "finding_key": "qf-ea0a9f973bb14a9305258178c768be774f9efe5094768de938dd7f3c58fafc6a",
+              "disposition": "accepted_defect",
+              "scan_count": 1
+            }
+          ]
+        },
+        {
+          "anchor": {
+            "path": "scripts/weave_quality/example.py",
+            "normalized_match": "try: risky() except Exception: pass",
+            "normalized_context": "except Exception: pass"
+          },
+          "location": {
+            "scan_id": 41,
+            "line": 88
+          },
+          "merged": false,
+          "merge_declined": "repeated_anchor_within_rule",
+          "detectors": [
+            {
+              "rule_id": "python-broad-except",
+              "finding_key": "qf-686899adeed0ab3d3d73cc8b2bbead0c204eac2104d12c4fa84eda37e6ca939d",
+              "disposition": "accepted_defect",
+              "scan_count": 3
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -66,6 +66,11 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_touch",
     "weave_record_edit",
     "weave_delete",
+    // Published here as well as in inspect: promote WRITES nodes and edges, and
+    // a mutation needs a surface that authorizes mutation. inspect keeps the
+    // read-only half of this tool (scan, list, validate, report, adjudicate,
+    // and canonical dry-run) and refuses the writing half.
+    "weave_quality_patterns",
   ],
   session: [
     "weave_work",
@@ -111,6 +116,7 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_quality_functions",
     "weave_structural_search",
     "weave_quality_patterns",
+    "weave_findings",
     "weave_code_search",
     "weave_index",
   ],
@@ -2063,8 +2069,49 @@ const TOOLS: Tool[] = [
           type: "string",
           description: "Human rationale or waiver reference (adjudicate only)",
         },
+        canonical: {
+          type: "boolean",
+          description:
+            "promote only: promote reviewed accepted evidence into canonical type=finding nodes. Defaults to dry-run, which emits the plan; legacy aggregate promotion is unchanged without this.",
+        },
+        apply: {
+          type: "boolean",
+          description:
+            "promote --canonical only: apply a reviewed plan. Requires plan_file and consumes those exact bytes. Mutually exclusive with dry_run, and refused in the read-only 'inspect' scope.",
+        },
+        plan_file: {
+          type: "string",
+          description:
+            "promote --canonical --apply only: path to the reviewed plan, exactly as dry-run produced it. The review parent comes from the plan, not from parent.",
+        },
+        language: {
+          type: "string",
+          description: "promote --canonical only: language hint for guide resolution",
+        },
       },
       required: ["subcommand"],
+    },
+  },
+  {
+    name: "weave_findings",
+    description:
+      "Review canonical findings. Without detail: the compact list with fixability, confidence, violation type, and resolving state. With detail: the shared coaching projection — guide, bounded occurrences, policy — rendered by the same renderer the CLI and ready digest use. Read-only; creating resolving work stays a separate, explicit step.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        detail: {
+          type: "boolean",
+          description: "Render the coaching projection instead of the compact list",
+        },
+        fixable: {
+          type: "boolean",
+          description: "Only findings marked fixable (compact list only)",
+        },
+        limit: {
+          type: "number",
+          description: "Max findings shown (compact list only; default 20)",
+        },
+      },
     },
   },
   {
@@ -3130,11 +3177,49 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
       cmd.push(findingKey, disposition);
       if (note) cmd.push(`--note=${note}`);
     } else if (subcommand === "promote") {
-      if (!patParent) {
+      const canonical = args.canonical as boolean | undefined;
+      const applyPlan = args.apply as boolean | undefined;
+      const planFile = args.plan_file as string | undefined;
+      const language = args.language as string | undefined;
+
+      if (applyPlan && !canonical) {
+        throw new Error("weave_quality_patterns promote: apply requires canonical");
+      }
+      if (applyPlan && patDryRun) {
+        throw new Error("weave_quality_patterns promote: apply and dry_run are mutually exclusive");
+      }
+      if (applyPlan && !planFile) {
+        throw new Error("weave_quality_patterns promote: apply requires plan_file");
+      }
+      // A scope whose published contract is "read-only observation and query"
+      // must not write nodes and edges. Both mutating paths are refused here:
+      // canonical apply, and legacy promote without dry_run. Reviewing is still
+      // available -- canonical defaults to dry-run, and legacy accepts dry_run --
+      // so inspect keeps everything it could honestly offer.
+      //
+      // CLI behaviour is untouched: this is an MCP surface boundary, not a
+      // change to what `wv` does when a human runs it.
+      const mutates = applyPlan || (!canonical && !patDryRun);
+      if (mutates && ACTIVE_SCOPE === "inspect") {
+        throw new Error(
+          "weave_quality_patterns promote: this call creates Weave nodes and is not available in " +
+            'the read-only "inspect" scope. Review here (canonical defaults to dry-run, and legacy ' +
+            "promote accepts dry_run), then run the mutating call from the graph scope, which " +
+            "authorizes mutation.",
+        );
+      }
+      // Apply takes its review parent from the reviewed plan, so parent is
+      // required for planning only. Passing both is refused by the CLI itself
+      // when they disagree.
+      if (!patParent && !applyPlan) {
         throw new Error("weave_quality_patterns promote requires parent");
       }
-      cmd.push(`--parent=${patParent}`);
+      if (patParent) cmd.push(`--parent=${patParent}`);
       if (patDryRun) cmd.push("--dry-run");
+      if (canonical) cmd.push("--canonical");
+      if (applyPlan) cmd.push("--apply");
+      if (planFile) cmd.push(`--plan-file=${planFile}`);
+      if (language) cmd.push(`--language=${language}`);
     }
     if (subcommand === "list") {
       return wvQualityPatternsList(cmd, patPath);
@@ -3145,6 +3230,19 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     if (subcommand === "report") {
       return wvQualityPatternsReport(cmd);
     }
+    return wv(cmd, 60_000);
+  },
+
+  weave_findings: (args) => {
+    const detail = args.detail as boolean | undefined;
+    const fixable = args.fixable as boolean | undefined;
+    const limit = args.limit as number | undefined;
+    // The same argv the CLI uses, so the projection cannot drift between
+    // surfaces: one renderer, reached two ways.
+    const cmd = ["findings", "list", "--json"];
+    if (detail) cmd.push("--detail");
+    if (fixable) cmd.push("--fixable");
+    if (limit) cmd.push(`--limit=${limit}`);
     return wv(cmd, 60_000);
   },
 

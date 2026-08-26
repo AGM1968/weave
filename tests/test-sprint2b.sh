@@ -535,6 +535,59 @@ test_digest_alerts() {
     assert_contains "$text_output" "pitfall" "digest text shows pitfall alert"
 }
 
+test_agent_python_resolution_is_side_effect_free() {
+    echo ""
+    echo "=== Agent Python Resolution Is Side-Effect-Free ==="
+
+    setup_test_env
+    mkdir -p "$TEST_DIR/fake-bin" "$TEST_DIR/modules" .venv/bin
+    printf '%s\n' '[project]' 'name = "fixture"' > pyproject.toml
+    touch uv.lock
+    # Model the cross-namespace SSD case: the virtualenv exists on disk but its
+    # interpreter target is unavailable in this mount namespace.
+    ln -s /unavailable/host-python .venv/bin/python3
+    cat > "$TEST_DIR/fake-bin/poetry" <<'POETRYFAKE'
+#!/usr/bin/env bash
+touch "$POETRY_WAS_INVOKED"
+exit 99
+POETRYFAKE
+    chmod +x "$TEST_DIR/fake-bin/poetry"
+    printf '%s\n' 'print("module ran")' > "$TEST_DIR/modules/resolver_probe.py"
+
+    local resolved output expected_system_python marker="$TEST_DIR/poetry-invoked"
+    expected_system_python=$(PATH="$TEST_DIR/fake-bin:/usr/bin:/bin" command -v python3)
+    resolved=$(REPO_ROOT="$TEST_DIR" PATH="$TEST_DIR/fake-bin:/usr/bin:/bin" \
+        bash -c 'source "$1"; source "$2"; _bootstrap_python_command' _ \
+        "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" \
+        "$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh")
+    assert_equals "$expected_system_python" "$resolved" \
+        "uv repository with unavailable virtualenv falls back to an existing interpreter"
+
+    output=$(REPO_ROOT="$TEST_DIR" POETRY_WAS_INVOKED="$marker" \
+        PATH="$TEST_DIR/fake-bin:/usr/bin:/bin" \
+        bash -c 'source "$1"; source "$2"; _wv_agent_python_exec_module resolver_probe "$3"' _ \
+        "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" \
+        "$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh" "$TEST_DIR/modules")
+    assert_equals "module ran" "$output" \
+        "agent module executes without invoking a repository package manager"
+    assert_equals "false" "$([ -e "$marker" ] && echo true || echo false)" \
+        "read-only agent module resolution does not invoke Poetry"
+
+    rm -f uv.lock .venv/bin/python3
+    touch poetry.lock
+    cat > .venv/bin/python3 <<'PYTHONFAKE'
+#!/usr/bin/env bash
+exec /usr/bin/python3 "$@"
+PYTHONFAKE
+    chmod +x .venv/bin/python3
+    resolved=$(REPO_ROOT="$TEST_DIR" PATH="$TEST_DIR/fake-bin:/usr/bin:/bin" \
+        bash -c 'source "$1"; source "$2"; _bootstrap_python_command' _ \
+        "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" \
+        "$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh")
+    assert_equals "$TEST_DIR/.venv/bin/python3" "$resolved" \
+        "Poetry repository uses its existing virtualenv interpreter directly"
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Run all tests
 # ═══════════════════════════════════════════════════════════════════════════
@@ -550,6 +603,7 @@ main() {
     test_validation_on_done
     test_breadcrumbs_rich
     test_digest_alerts
+    test_agent_python_resolution_is_side_effect_free
 
     echo ""
     echo "════════════════════════════════════"

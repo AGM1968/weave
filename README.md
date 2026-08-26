@@ -19,7 +19,9 @@ machines.
 - impact-selected tests and policy checks tied to touched files;
 - Git and optional GitHub issue synchronization;
 - shared workflow surfaces for Claude Code, Codex, Copilot, CLI, and MCP clients;
-- repository health, graph audits, code search, and prose-quality diagnostics.
+- repository health, graph audits, code search, and prose-quality diagnostics;
+- reviewed promotion of accepted quality findings into tracked remediation work, with the guidance
+  for each rendered the same way wherever it appears.
 
 ## Requirements
 
@@ -56,8 +58,8 @@ Download the source archive attached to the desired
 directory:
 
 ```bash
-tar -xzf weave-1.71.0-rc.3.tar.gz
-cd weave-1.71.0-rc.3
+tar -xzf weave-1.71.0-rc.8.tar.gz
+cd weave-1.71.0-rc.8
 ./install.sh --verify
 ```
 

@@ -593,6 +593,7 @@ describe("Weave MCP Server", () => {
     GRAPH_ENV = { WV_DB: join(isolatedDir, "brain.db"), WV_HOT_ZONE: isolatedDir };
     spawnSync(resolve(__dirname, "../../scripts/wv"), ["init"], {
       stdio: "ignore",
+      cwd: isolatedDir,
       env: { ...process.env, ...GRAPH_ENV, NO_COLOR: "1", WV_AGENT: "1" },
     });
     client = new MCPTestClient();
@@ -1169,6 +1170,234 @@ describe("Weave MCP Server", () => {
         expect(payload.shadow_advisories).toEqual([]);
       } finally {
         await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("canonical promotion produces the same plan over MCP as the CLI (wv-f677d9)", async () => {
+      // Parity is the point of Phase 3: one lifecycle reached two ways. The
+      // promotion identity and the semantic metadata must match exactly;
+      // guide digests are deliberately excluded, because a .weave/guides/
+      // override makes them machine-local and two hosts would disagree about
+      // the same defect (see EVIDENCE-HASH-BINDING-CONTRACT.md).
+      const fixture = createQualityPatternsFixture();
+      writeFileSync(
+        join(fixture.dir, ".weave", "patterns", "swallow-check.yaml"),
+        [
+          "id: swallow-check",
+          "language: python",
+          "violation_type: code:swallowed-exception",
+          'message: "Silenced exception hides errors."',
+          "severity: warning",
+          "rule:",
+          "  pattern: |",
+          "    try:",
+          "      $$$BODY",
+          "    except ValueError:",
+          "      pass",
+          "",
+        ].join("\n"),
+      );
+      writeFileSync(
+        join(fixture.dir, "app.py"),
+        "def risky():\n    try:\n        do_work()\n    except ValueError:\n        pass\n",
+      );
+
+      const wvBin = resolve(__dirname, "../../scripts/wv");
+      const runWv = (argv: string[]) =>
+        spawnSync(wvBin, argv, {
+          cwd: fixture.dir,
+          env: { ...process.env, ...fixture.env },
+          encoding: "utf-8",
+        });
+      const runGit = (argv: string[]) =>
+        spawnSync("git", argv, { cwd: fixture.dir, encoding: "utf-8" });
+
+      // A real repository with the rule COMMITTED: canonical promotion binds
+      // each active rule to a tracked blob at HEAD, so an uncommitted rule
+      // yields repo_rule_not_at_head and an incomplete snapshot that plans
+      // nothing. Without this the fixture would exercise the refusal path and
+      // prove nothing about parity.
+      runGit(["init", "-q"]);
+      runGit(["config", "user.email", "t@t"]);
+      runGit(["config", "user.name", "t"]);
+      runGit(["add", "-A"]);
+      runGit(["-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture"]);
+
+      runWv(["quality", "patterns", "scan", "--json"]);
+      const listed = runWv(["quality", "patterns", "list", "--json"]);
+      expect(listed.status).toBe(0);
+
+      const cliPlan = runWv([
+        "quality",
+        "patterns",
+        "promote",
+        "--canonical",
+        "--parent=wv-44e524",
+        "--json",
+      ]);
+      expect(cliPlan.status).toBe(0);
+
+      const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "promote", canonical: true, parent: "wv-44e524" },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+
+        const strip = (raw: string): unknown => {
+          const plan = JSON.parse(raw) as {
+            candidates: { guide?: Record<string, unknown> }[];
+          };
+          for (const candidate of plan.candidates) {
+            if (candidate.guide) delete candidate.guide.definition_hash;
+          }
+          return plan;
+        };
+
+        expect(strip(result.content[0].text)).toEqual(strip(cliPlan.stdout));
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    }, 120_000);
+
+    it("canonical apply is refused in the read-only inspect scope (wv-18ae68)", async () => {
+      // The inspect scope publishes itself as read-only observation and query.
+      // Canonical apply writes nodes and edges, so it does not belong there --
+      // reviewing the plan does.
+      const fixture = createQualityPatternsFixture();
+      const patternsClient = new MCPTestClient(["--scope=inspect"], fixture.env, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: {
+            subcommand: "promote",
+            canonical: true,
+            apply: true,
+            plan_file: join(fixture.dir, "plan.json"),
+          },
+        });
+        const result = response.result as { content: { text: string }[]; isError?: boolean };
+        expect(result.content[0].text).toContain("read-only");
+        expect(result.content[0].text).toContain("inspect");
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("legacy promote is refused in the read-only inspect scope (wv-18ae68)", async () => {
+      // The pre-existing half of the breach: legacy promote creates nodes and
+      // has always been reachable from a scope published as read-only.
+      const fixture = createQualityPatternsFixture();
+      const patternsClient = new MCPTestClient(["--scope=inspect"], fixture.env, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "promote", parent: "wv-44e524" },
+        });
+        const result = response.result as { content: { text: string }[] };
+        expect(result.content[0].text).toContain("creates Weave nodes");
+        expect(result.content[0].text).toContain("graph scope");
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("inspect still permits every reading promote path (wv-18ae68)", async () => {
+      // Refusing the writes must not cost inspect the reviewing it can honestly
+      // offer: legacy dry_run, and canonical which defaults to dry-run.
+      const fixture = createQualityPatternsFixture();
+      const patternsClient = new MCPTestClient(["--scope=inspect"], fixture.env, fixture.dir);
+      try {
+        for (const args of [
+          { subcommand: "promote", parent: "wv-44e524", dry_run: true },
+          { subcommand: "promote", parent: "wv-44e524", canonical: true },
+        ]) {
+          const response = await patternsClient.request("tools/call", {
+            name: "weave_quality_patterns",
+            arguments: args,
+          });
+          const result = response.result as { content: { text: string }[] };
+          expect(result.content[0].text).not.toContain("creates Weave nodes");
+          expect(result.content[0].text).not.toContain("read-only");
+        }
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("the graph scope authorizes the mutating promote (wv-18ae68)", async () => {
+      // A refusal is only defensible if the operation has a home. graph is the
+      // published mutation surface, so the tool is available there and the
+      // scope guard does not fire.
+      const fixture = createQualityPatternsFixture();
+      const patternsClient = new MCPTestClient(["--scope=graph"], fixture.env, fixture.dir);
+      try {
+        const listed = await patternsClient.request("tools/list", {});
+        const tools = (listed.result as { tools: { name: string }[] }).tools;
+        expect(tools.map((t) => t.name)).toContain("weave_quality_patterns");
+
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "promote", parent: "wv-44e524" },
+        });
+        const result = response.result as { content: { text: string }[] };
+        expect(result.content[0].text).not.toContain("read-only");
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("canonical apply refuses an incoherent argument set (wv-f677d9)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      try {
+        const cases: [Record<string, unknown>, string][] = [
+          [{ subcommand: "promote", apply: true, plan_file: "/tmp/p.json" }, "requires canonical"],
+          [
+            { subcommand: "promote", canonical: true, apply: true, dry_run: true, plan_file: "/tmp/p.json" },
+            "mutually exclusive",
+          ],
+          [{ subcommand: "promote", canonical: true, apply: true }, "requires plan_file"],
+        ];
+        for (const [args, expected] of cases) {
+          const response = await patternsClient.request("tools/call", {
+            name: "weave_quality_patterns",
+            arguments: args,
+          });
+          const result = response.result as { content: { text: string }[] };
+          expect(result.content[0].text).toContain(expected);
+        }
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_findings renders the shared coaching projection (wv-f677d9)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const findingsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      try {
+        const response = await findingsClient.request("tools/call", {
+          name: "weave_findings",
+          arguments: { detail: true },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as { format: string; state: string };
+        // The same envelope the CLI and the ready digest render, so the three
+        // surfaces cannot drift into three dialects of one projection.
+        expect(payload.format).toBe("weave.coaching-response.v1");
+        expect(["complete_clean", "complete_with_findings", "incomplete"]).toContain(payload.state);
+      } finally {
+        await findingsClient.close();
         fixture.cleanup();
       }
     });

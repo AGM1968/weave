@@ -153,6 +153,10 @@ test_clean_source_records_clean_install() {
     assert_equals "false" "$(prov_field "$PROV" dirty)" "a clean source tree records dirty=false"
     assert_equals "$(git -C "$SRC" rev-parse HEAD)" "$(prov_field "$PROV" commit)" \
         "provenance records the source commit"
+    assert_equals \
+        "$(sha256sum "$SRC/scripts/weave_quality/default_patterns/manifest.json" | cut -d' ' -f1)" \
+        "$(sha256sum "$LIB_DIR/weave_quality/default_patterns/manifest.json" | cut -d' ' -f1)" \
+        "local install preserves the default-pattern authority manifest bytes"
 }
 
 test_untracked_files_count_as_dirty() {
@@ -294,6 +298,10 @@ STUB
         "remote provenance is honest that the commit is unknown"
     assert_contains "$(prov_field "$remote_prov" describe)" "remote-" \
         "remote provenance describes itself as a remote install"
+    assert_equals \
+        "$(sha256sum "$SRC/scripts/weave_quality/default_patterns/manifest.json" | cut -d' ' -f1)" \
+        "$(sha256sum "$remote_lib/weave_quality/default_patterns/manifest.json" | cut -d' ' -f1)" \
+        "remote install preserves the default-pattern authority manifest bytes"
 }
 
 echo "=== install provenance regression tests ==="

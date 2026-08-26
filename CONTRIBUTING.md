@@ -86,6 +86,12 @@ The pre-commit hook enforces that an active Weave node exists before committing.
 - Markdownlint clean (`npx markdownlint-cli '**/*.md'`)
 - No image emojis -- use text markers instead
 
+### Prose pattern rules
+
+See [The prose pattern scanner](docs/PROSE_PATTERN_SCANNER.md) before adding or promoting a prose
+rule. It covers rule kinds, scopes, maturity, controls, adjudication, corpus testing, and the
+difference between a generally supported rule and a project-local house convention.
+
 ## Testing
 
 ```bash

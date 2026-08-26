@@ -69,7 +69,7 @@ _wv_run_cache_is_exempt_cmd() {
         # Read-only brain.db readers
         analyze|audit-pitfalls|pattern-audit|bootstrap-agent|breadcrumbs|trails|context|digest|doctor|\
         discover|edges|edge-types|guide|health|impact|learnings|mcp-status|overview|path|\
-        pending-close|preflight|query|refs|related|search|show|status|tree|validate-finding)
+        pending-close|preflight|query|refs|related|search|show|status|test-status|tree|validate-finding)
             return 0 ;;
         # Operates outside brain.db (quality.db / ast_cache.db / /dev/shm)
         cache|hotzone|index|quality)

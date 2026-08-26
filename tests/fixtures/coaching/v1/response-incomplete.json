@@ -1,0 +1,9 @@
+{
+  "format": "weave.coaching-response.v1",
+  "state": "incomplete",
+  "blocks": [],
+  "causes": [
+    {"code": "receipt_failed", "rule_id": "unquoted-variable", "detail": "rule execution failed during the last scan", "remedy": "wv quality patterns scan"},
+    {"code": "definition_hash_stale", "rule_id": "prose-filler-phrases", "detail": "receipt predates the current rule definition", "remedy": "wv quality patterns scan"}
+  ]
+}

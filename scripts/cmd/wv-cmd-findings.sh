@@ -62,16 +62,19 @@ cmd_findings_list() {
     local limit=20
     local show_all=false
     local stale_days=""
+    local detail=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --json)     format="json" ;;
+            --detail)   detail=true ;;
             --fixable)  fixable_only=true ;;
             --all)      show_all=true ;;
             --limit=*)  limit="${1#--limit=}" ;;
             --stale=*)  stale_days="${1#--stale=}" ;;
             --help|-h)
-                echo "Usage: wv findings list [--fixable] [--json] [--limit=N | --all] [--stale=N]" >&2
+                echo "Usage: wv findings list [--fixable] [--json] [--detail] [--limit=N | --all] [--stale=N]" >&2
+                echo "  --detail    render the shared coaching projection (guide, occurrences, policy)" >&2
                 echo "  --stale=N   show only findings promoted more than N days ago" >&2
                 echo "  Default: shows most recent 20. Use --all for full list (can be large)." >&2
                 return 0
@@ -83,6 +86,14 @@ cmd_findings_list() {
         esac
         shift
     done
+
+    if [ "$detail" = true ]; then
+        local _detail_args=("coaching")
+        [ "$format" = "json" ] && _detail_args+=("--json")
+        [ "$show_all" = true ] && _detail_args+=("--limit=0")
+        _wv_findings_python "${_detail_args[@]}"
+        return $?
+    fi
 
     local fixable_clause=""
     if [ "$fixable_only" = true ]; then

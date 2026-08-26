@@ -1,0 +1,40 @@
+{
+  "format": "weave.coaching-promotion-input.v1",
+  "scope": {
+    "target": "scripts",
+    "review_parent": "wv-44e524",
+    "rule_ids": [
+      "unquoted-variable"
+    ]
+  },
+  "catalog_version": "weave.violation-vocabulary.v1",
+  "catalog_violation_types": [
+    "code:unquoted-expansion"
+  ],
+  "snapshot": {
+    "state": "complete"
+  },
+  "observations": [],
+  "provider_rejections": [
+    {
+      "reason": "not_current",
+      "path": "scripts/legacy.sh",
+      "match_text": "rm  $target",
+      "context_text": "rm $target",
+      "detector": {
+        "rule_id": "unquoted-variable",
+        "finding_key": "qf-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "disposition": "accepted_defect",
+        "scan_count": 3
+      },
+      "detail": "accepted durable row has no observation in the current complete scan; needs separate historical review"
+    }
+  ],
+  "rule_definition_bindings": {
+    "unquoted-variable": {"authority": "package_manifest", "asset": "default_patterns/unquoted-variable.yaml", "manifest_sha256": "6e7d0d88c46c488a89cff8f09c028a2157f00baa4be0601af689a99e164318fb", "definition_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "reconstructible_from_commit": false}
+  },
+  "rule_violation_types": {
+    "unquoted-variable": "code:unquoted-expansion"
+  },
+  "resolved_guides": {}
+}

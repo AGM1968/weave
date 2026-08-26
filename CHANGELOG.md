@@ -4,6 +4,37 @@
 
 ## Unreleased
 
+## [1.71.0-rc.8] - 2026-08-26
+
+Adds canonical finding coaching: adjudicated quality evidence can be reviewed into canonical
+`type=finding` nodes carrying concrete occurrences, detector provenance, and remediation guidance,
+with one renderer shared by every surface that displays it. Private evidence batteries, Rust
+shadows, graph state, and capture artifacts remain excluded from the public `weave` projection.
+
+### Added
+
+- `wv quality patterns promote --canonical` promotes reviewed, human-accepted quality evidence into
+  canonical findings. It defaults to dry-run and emits a plan; `--apply --plan-file=` consumes those
+  exact reviewed bytes and takes its review parent from the plan.
+- `wv findings list --detail` renders the coaching projection — guide, bounded occurrences, policy —
+  from the same renderer used by the readiness digest, discovery, context, and bootstrap.
+- Coaching guides ship as package assets with `.weave/guides/` project overrides, resolved
+  project-before-package and language-before-generic, falling back to a guide that still coaches and
+  names the gap.
+- `contracts/violation-vocabulary-v1.json` is the machine-readable source for canonical violation
+  types and their guide names; detector rules declare one reference into it.
+- `weave_findings` MCP tool for read-only finding review, and canonical promotion review over
+  `weave_quality_patterns`.
+
+### Fixed
+
+- The MCP `inspect` scope is genuinely read-only: promotion calls that create nodes are refused
+  there and available from the mutation scope instead.
+- Promotion refuses to certify a rule whose bytes are not committed, so a promoted finding cannot
+  record provenance that no commit contains.
+- Both installer paths ship the coaching guides, contracts, and pure package; a drifted fallback
+  module list that silently produced an incomplete install is corrected and now checked.
+
 ## [1.71.0-rc.7] - 2026-08-25
 
 Public maintenance prerelease carrying the post-rc.5 durability and fail-closed safety review,
@@ -22,6 +53,255 @@ excluded from the public `weave` projection.
   adjudication, ignored-rule validation, and `real-world` precision.
 - Strip private Rust-shadow suites and fixtures together with their implementation so the public
   aggregate never invokes an orphaned test.
+
+## [1.71.0-rc.6] - 2026-08-24
+
+Internal release candidate consolidating the post-rc.5 reliability review: false-success paths now
+fail closed, graph caches key freshness on content rather than SQLite access, install provenance and
+managed hooks are verifiable, trails preserve UTF-8 append-only history, stdin consumers are
+bounded, and interrupted graph projections cannot contaminate source tags. The public `weave`
+release remains frozen; this candidate is distributed from the private source repository only.
+
+### Fixed
+
+- **`wv quick` commits only what you staged** — it ran `git add -u` first, staging every tracked
+  modification, so running it mid-edit to record an unrelated defect swept in-progress work into a
+  commit whose message described the new node. Unstaged tracked changes are now left in the working
+  tree and reported, and untracked files are unaffected as before. A **failed** commit now leaves the
+  node active and exits nonzero instead of printing `Commit failed — closing node anyway` and closing
+  it, which hid unrecorded work from the next session. With nothing staged the documented
+  create/commit/close behaviour is unchanged.
+
+- **`wv trails` notes are append-only** — `wv trails save --message=` now records each note under a
+  dated `###` heading above the notes already in `.weave/trails.md`, instead of rewriting the file
+  with only the newest message. The previous behaviour destroyed committed handoffs, including a
+  session's own `CRASH RECOVERY` note when the session-start hook saved twice in one run, and a
+  `wv trails save` with no message at all removed the section outright. Growth is bounded by
+  `WV_TRAILS_NOTES_CAP` (default 20, oldest dropped first). Notes written before this release are
+  preserved and labelled `### (undated,...)` on first append. The section is delimited by an
+  explicit `<!-- /wv-notes -->` marker, so a note whose body contains its own `## ` headings is
+  no longer truncated. The section end is resolved from the *last* marker in the file and reserved
+  markers appearing in note text are neutralised on write, so a note that itself contains
+  `<!-- /wv-notes -->` cannot truncate the notes above it. Entries are counted for the cap by a
+  generated `<!-- wv-note -->` marker rather than by `###` headings, so a note containing its own
+  subheadings is never split across the cap boundary.
+- **`wv trails save` is serialised** — the read-modify-write is held under a per-repository lock
+  (`flock`, falling back to a directory lock; wait bounded by `WV_TRAILS_LOCK_WAIT`, default 120s)
+  and the file is replaced by atomic rename. Concurrent saves previously each read the same prior
+  state and the last writer won: a 20-way probe retained 1 of 20 notes. A first attempt using
+  `flock -w 15 || true` still lost 5 of 20, because a timed-out lock silently continued unlocked.
+  Exactly one mechanism is now chosen by availability before any process participates: mixing them
+  let a waiter take the directory lock and write while the original `flock` holder was still live.
+  A lock timeout fails with a nonzero exit rather than proceeding, and the directory lock is never
+  reclaimed on timeout, since removing a lock whose owner has not been proven dead evicts a live
+  writer.
+- **A failed `wv trails save` reports failure** — the temporary write and the rename are both
+  checked. In an unwritable directory the command previously exited 0 and printed `Trails saved`
+  while the note was absent. It now removes the temporary file, releases the lock, leaves
+  `trails.md` byte-identical, and exits nonzero.
+- **`wv trails` flag contract** — `--json` is accepted only by `wv trails capsule`, and `--message`
+  only by `wv trails save`. Passing either to the wrong subcommand now fails with an error naming
+  the right one. Previously `save` parsed `--json` and discarded it, reporting success for input
+  its sibling rejected as malformed.
+
+- **Aggregating epics no longer re-acquire dead commit refs** — `wv done` rebuilds an epic's
+  `metadata.commits` from its children on every close, so a child SHA that a later amend, reset or
+  rebase orphaned was copied back onto the epic each time, and removing it from the epic by hand
+  never held. The union is now filtered to commits some ref still reaches. The filter fails open
+  when git cannot answer at all: losing real provenance because the clone was unavailable is worse
+  than carrying a ref that `wv commit-refs` reports.
+
+### Added
+
+- **The pre-commit gate lints staged shell** — staged Python has been linted with `ruff` here since
+  the start; staged shell had nothing, because `shellcheck` lives only in `make check`, outside
+  impact-based suite routing. A lint regression in a file the map *does* route therefore stayed
+  invisible behind green suites: `SC1090` was introduced in `pre-action.sh` and went unnoticed for
+  two commits while `make shellcheck` was red. The gate now runs `shellcheck --severity=warning` on
+  staged shell files and blocks on findings. Scope mirrors the Makefile's `SHFILES`, so the gate and
+  `make shellcheck` cannot disagree; an absent `shellcheck` is a no-op, not a failure.
+
+### Fixed
+
+- **`wv commit-refs --prune` no longer destroys a live primary ref** — when every entry in
+  `metadata.commits` was orphaned, the primary `metadata.commit` was removed along with the array
+  even if the primary itself was still reachable. A node may record a live primary beside an array
+  of dead refs, and that shape lost three reachable refs before it was caught. The primary is now
+  removed only when the primary itself is being dropped. Existing tests could not see this: they
+  recorded the same SHA to both keys, so "drop the primary because it is dead" and "drop the primary
+  because the array emptied" were indistinguishable.
+
+- **The `wv impact` cache works** — it compared its cache file's mtime against the database file's
+  mtime, and SQLite journals on reads, so the file advanced on every query, including the command's
+  own seed resolution moments earlier. The cache was written on every run and read on none: measured,
+  the newest entry sat about 36 hours behind the file mtime while the walk re-ran each time. It now
+  compares against the graph clock (`MAX(updated_at)`), matching `wv context`.
+
+- **Agent surfaces describe the repo they are written into** — the managed blocks are authored for a
+  consumer, so `wv init-repo --update` wrote into the weave source checkout that the repo "does not
+  vendor weave's own `scripts/wv`" and pointed the PATH fallback at the installed binary, sending an
+  agent to test something other than the tree it was editing. `.weave/runtime.md` had the inverse
+  defect, hardcoding the source-repo form for consumers. Every rendered surface — `CLAUDE.md`,
+  `.github/copilot-instructions.md`, `.weave/runtime.md` — now takes the form matching the repo it
+  is written into. `AGENTS.md` is user-owned and untouched.
+
+- **`wv doctor` separates expected checkpoint churn from real provenance loss** — auto-checkpoint
+  refs go unreachable as a matter of course, and reporting them identically to a regular ref going
+  unreachable made the advisory a permanent warning, which is where a genuine loss would hide. The
+  sweep now reports `orphaned_checkpoint`, `orphaned_regular` and `orphaned_unknown` separately;
+  doctor passes on checkpoint-only churn while disclosing it, and warns on any non-checkpoint or
+  unclassifiable orphan.
+
+- **`needs_sync` reflects the graph, not the file** — it compared the database file's mtime against
+  the sync stamp, and SQLite journals on reads, so merely running `wv ready` bumped the mtime and
+  the flag latched true immediately after a successful sync and never cleared. It is now derived
+  from the newest node and edge timestamp: it clears on sync, rises when the graph actually changes,
+  and is stable across reads.
+
+- **A rule file with the wrong extension is reported, not ignored** — only `*.yaml` is loaded, so a
+  perfectly valid rule saved as `.yml` never ran while `scan`, `list` and `validate` all stayed
+  silent with exit 0, giving the author no way to learn their rule was inert. The file is still not
+  loaded — silently activating rules that were never executing would change gate outcomes in
+  existing repositories — but it is now named, with the rename to make.
+
+- **`wv impact` and `wv discover` compose through files, not argv** — `wv context` was fixed for
+  this in `f3375783`, but the same shape remained in `impact` (seeds, unblocked, suites, and the
+  per-node quality rows) and `discover` (which embeds a whole impact report). A `--argjson` payload
+  past `MAX_ARG_STRLEN` fails `execve` with `E2BIG` before `jq` starts, surfacing as empty stdout
+  with exit 0 — and it degrades before it fails, serving truncated JSON that parses into a shorter
+  graph. Output is byte-identical; the limit is simply no longer a correctness boundary. `wv tree`
+  was left alone: its `--argjson` arguments are two integers and its results already go through
+  stdin.
+
+- **A normal `./install.sh` refreshes this repository's git hooks** — the hook-refresh calls lived
+  only inside the generated `wv-init-repo`, while `install.sh` itself defined
+  `install_git_hook_from_repo` and never called it. An upgrade therefore updated the library and
+  left `.git/hooks/` at whatever version the repo was scaffolded with, so a behaviour change to a
+  hook did not take effect until someone ran `wv init-repo --update` or copied the file by hand.
+  Custom hooks are still preserved and skipped.
+
+- **An install records where it came from** — `VERSION` cannot say which fixes an install carries,
+  because fixes land continuously between bumps: a consumer sat 72 commits behind `v1.71.0-rc.5`,
+  still hitting a `jq` argv-limit bug fixed four days earlier, with an identical version string and
+  nothing able to reveal it. `install.sh` now writes commit, `describe`, branch, dirty state and
+  source path, and `wv doctor` reports them — flagging an install that is behind its source, and
+  saying so plainly when no provenance was recorded at all.
+
+- **A section whose body fails to emit no longer publishes** — the completeness manifest recorded
+  headings only, so forcing the active-node row emission to fail left the heading in place, the rows
+  gone, and the save reporting success. The manifest now carries the item count the database reported
+  for each list section, taken from the query that decided to emit the section and therefore
+  independent of what the emission produced; the check compares it against the rows actually present.
+  Heading loss and body loss are caught by different machinery and are now covered separately.
+
+- **UTF-8 notes save again** — the byte-exactness check compared `wc -c` bytes against Bash
+  `${#var}` characters, so any multi-byte note failed and wrote nothing (`café — 你好` is 9
+  characters, 16 bytes). Both sides are now measured in bytes.
+
+- **A failed section write is detected wherever it happens** — structural validation required only
+  the Health block, so a heading whose write failed in any other section still published. The
+  generator now records each section it emits in a manifest carried on the sentinel line, and every
+  declared section is verified present. A byte check cannot see this class: a skipped heading
+  shortens the body and the file then matches that shorter body exactly.
+
+- **The staged-shell gate handles every path shape and fails closed** — `-z` output was piped through
+  `tr '\0' '\n'`, discarding NUL-safety at the first step, so a staged filename containing a newline
+  was never linted; `xargs` then split paths on spaces into nonexistent files and blocked commits for
+  files that were fine. Paths are now read with `mapfile -d ''` and passed as arguments. A `mktemp`
+  or `checkout-index` failure now refuses the commit instead of warning and continuing, and `mktemp`
+  is checked before any `--prefix` is built, so the empty-variable `--prefix="/"` path is gone.
+
+- **`wv trails save` durability, properly this time** — the previous fix took the status of a
+  redirected compound, which is its LAST command, so an earlier failed write followed by successful
+  output still returned 0; and its `^Nodes: ` integrity check could be satisfied by a crafted note,
+  since notes are written before the generated sections. `set -e` is not a usable remedy here:
+  measured, errexit reads as on inside the subshell, a failing command runs, and execution
+  continues — bash suppresses errexit for the dynamic extent of a command in a condition context and
+  subshells inherit that. The body is now generated once and written once, and three independent
+  conditions are checked: write status, byte-exactness against the generated content, and structural
+  completeness validated only in the region after the last `<!-- /wv-notes -->` marker, which a note
+  cannot write into. Verified against middle-generation failure, final-write failure, and both with
+  forged markers in the note.
+
+- **The staged-shell gate lints the staged blob** — it named staged files and let `shellcheck` read
+  them from the working tree, so a dirty index behind a clean worktree committed content that was
+  never linted. The index is now materialised with `git checkout-index` into a temp tree and linted
+  there, with `.shellcheckrc` copied in so project suppressions still apply. Renames are covered
+  (`ACMR`, not `AM`) and paths are NUL-safe.
+
+- **`wv trails save` detects a write that died part way** — the write status was read from `$?`
+  after the redirected group, which is the last `echo` inside it and says nothing about whether the
+  redirection or the earlier writes succeeded. A truncated file whose final line happened to succeed
+  passed both the status check and the non-empty check, and was published as a good save. The status
+  now comes from the compound command itself, and the saved file is validated for the Health block
+  the generator always writes last. This also clears the final `shellcheck` finding in the tree.
+
+- **A hook library that fails *after* setting its guard no longer disables enforcement** — the
+  previous fix checked whether the source succeeded, but a copy that sets `_WV_HOOK_COMMON_LOADED=1`
+  and then fails leaves that guard behind, so the valid installed copy returned immediately at its
+  own double-source guard and the library was never loaded. The hook still died at 127, still read
+  as ALLOW. Load guards are now cleared after a failed source so the next candidate re-executes.
+  The earlier test only covered a syntax error, which fails before setting anything; the runtime
+  failure is covered now too.
+
+- **`wv commit-refs --prune` proves persistence against the snapshot** — a drained change log is not
+  proof: with `_warp_changes` and its update trigger dropped, `auto_sync` recreated tracking *after*
+  the untracked UPDATE, saw nothing pending, and the command reported a persistence that never
+  happened while `state.sql` stayed byte-identical. Change tracking is now ensured to exist before
+  the mutation, and persistence is confirmed by `state.sql` actually changing.
+
+- **`wv commit-refs --json` reports what the prune did** — the persistence disclosure was text-only,
+  so a JSON consumer could not tell a persisted prune from an unpersisted one. The payload now
+  carries a `prune` object (`attempted`, `nodes_pruned`, `nodes_failed`, `persisted`).
+
+- **`wv commit-refs --all --json` no longer dies on large graphs** — the ref array was passed to `jq`
+  through `--argjson`, which exceeds the per-argument limit (`E2BIG`) at this repository's ~1900
+  refs; the failure was swallowed, exiting 0 with empty stdout. Rows now reach `jq` through a file,
+  and a serialization or render failure exits nonzero instead of reporting success.
+
+- **A broken hook library no longer disables enforcement** — `pre-action.sh` picked its libraries by
+  readability alone and claimed the load even when the file failed to source, so a broken nearest
+  copy was never replaced by a valid installed one. The hook then died at its first `_hc_*` call
+  with 127, which PreToolUse reads as ALLOW: a malformed mutation payload that must be blocked with
+  2 went through instead. A candidate now counts only if it actually sources.
+
+- **`wv commit-refs --prune` persists before reporting success** — it wrote only to the hot DB, so
+  `state.sql` stayed byte-identical and the next `wv load` restored every ref just removed, while
+  the command printed success. It now syncs and *verifies* the change log drained rather than
+  trusting a return code (`auto_sync` returns 0 from five different skip paths), reports explicitly
+  when auto-sync is disabled, and exits nonzero when a prune could not be persisted.
+
+- **`wv commit-refs --prune` is a single atomic statement** — it was a `SELECT` into `jq` and back,
+  rewriting the whole metadata object from a value read moments earlier, so a concurrent write to
+  any other key on the same node was silently reverted, and `updated_at` never moved. The
+  transformation is now one SQL `UPDATE` that advances `updated_at`.
+
+- **`wv commit-refs` no longer drops refs it cannot parse** — the scan pre-filter required 4-40 hex
+  characters, so malformed refs were silently discarded instead of reported, and a SHA-256
+  repository dropped every 64-character OID it had: the sweep reported `refs: 0, orphaned: 0` and
+  `wv doctor` read that as clean. Ref values now go to `git cat-file`, which decides what resolves;
+  anything it cannot resolve is classified `missing`.
+
+- **`pre-action.sh` is a thin dispatcher again** — it had grown to 66 lines against the 60-line
+  budget `wv pattern-audit` Check 5 enforces, so the audit failed. The line count comes down by
+  moving the malformed-payload posture into `_hc_check_payload` in `wv-hook-common.sh`, next to the
+  `_hc_classify_tool` that sets the flag, and by collapsing four copies of the library-source
+  fallback chain into one rule applied to all five libraries. Behaviour is unchanged: every payload
+  in a 15-case differential returns the same exit code as before. `pre-action.sh`'s own fail-closed
+  path now has direct test coverage, which it never had — only `wv hook
+  dispatch`/`normalize` were tested for it.
+
+### Added
+
+- **`wv commit-refs`** — audits the commit SHAs recorded on nodes against the pushed branch. Each
+  ref is classified `reachable` (an ancestor of the pushed ref), `pending` (local only — unpushed
+  or on another branch, and not an orphan), `unreachable` (the object exists but no ref reaches it,
+  the signature of an amend, reset or rebase) or `missing` (gone from this object database).
+  `--all` lists every ref rather than only the orphans, `--json` emits the same data structured,
+  and `--prune` removes orphaned refs — at every node that records one, children included, since
+  an epic-only edit does not survive the next aggregation. `wv doctor` now carries the count as an
+  advisory so drift surfaces without being asked for; `--repair` deliberately does not prune, as
+  discarding recorded provenance is a deliberate act rather than a repair.
 
 ## [1.71.0-rc.5] - 2026-08-13
 

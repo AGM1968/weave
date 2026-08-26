@@ -28,6 +28,19 @@
         "status": { "type": "string" }
       }
     },
+    "structured_risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scenario", "impact", "likelihood", "detectability", "mitigation", "tripwire"],
+      "properties": {
+        "scenario": { "type": "string", "minLength": 1 },
+        "impact": { "type": "string", "minLength": 1 },
+        "likelihood": { "type": "string", "minLength": 1 },
+        "detectability": { "type": "string", "minLength": 1 },
+        "mitigation": { "type": "string", "minLength": 1 },
+        "tripwire": { "type": "string", "minLength": 1 }
+      }
+    },
     "context_node": {
       "type": "object",
       "additionalProperties": false,
@@ -37,7 +50,10 @@
         "text": { "type": "string" },
         "status": { "type": "string" },
         "done_criteria": { "type": "array", "items": { "type": "string" } },
-        "risks": { "type": "array", "items": { "type": "string" } },
+        "risks": {
+          "type": "array",
+          "items": { "oneOf": [{ "type": "string" }, { "$ref": "#/$defs/structured_risk" }] }
+        },
         "risk_level": { "type": ["string", "null"] }
       }
     },

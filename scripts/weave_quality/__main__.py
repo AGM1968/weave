@@ -32,7 +32,7 @@ import time
 import unicodedata
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import NoReturn, TypedDict
+from typing import Any, NoReturn, TypedDict
 import tempfile
 
 from weave_quality.ast_cache import ASTCache
@@ -1232,8 +1232,221 @@ def _promote_create(
     return {"node_id": node_id, **result}
 
 
+def _cmd_promote_patterns_canonical(args: argparse.Namespace) -> int:
+    """Canonical mode: reviewed accepted evidence -> canonical type=finding nodes.
+
+    Defaults to dry-run. Apply consumes the exact reviewed plan BYTES rather than
+    recomputing a plan: a plan recomputed at apply time can differ from the one a
+    human reviewed, and then the review approved something else.
+    """
+    from .coaching_apply import ApplyError, apply_plan, default_runner
+    from .coaching_evidence import EvidenceError, build_promotion_input
+
+    if args.apply and args.dry_run:
+        print("Error: --apply and --dry-run are mutually exclusive.", file=sys.stderr)
+        return 2
+
+    repo = Path(_resolve_repo(None))
+
+    if args.apply:
+        if not args.plan_file:
+            print("Error: --apply requires --plan-file=<reviewed plan>.", file=sys.stderr)
+            return 2
+        try:
+            plan_bytes = Path(args.plan_file).read_bytes()
+        except OSError as exc:
+            print(f"Error: cannot read {args.plan_file}: {exc}", file=sys.stderr)
+            return 1
+        # review_parent comes from the plan. An acquisition argument that
+        # disagrees is a conflict, not an override: apply must act on the scope
+        # that was actually reviewed.
+        try:
+            planned_parent = json.loads(plan_bytes)["scope"]["review_parent"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            print(f"Error: {args.plan_file} is not a promotion plan ({exc}).", file=sys.stderr)
+            return 1
+        if args.parent and args.parent != planned_parent:
+            print(
+                f"Error: --parent={args.parent} conflicts with the reviewed plan's "
+                f"review_parent {planned_parent}.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            result = apply_plan(
+                plan_bytes, run=default_runner, metadata_writer=_write_metadata_patch
+            )
+        except ApplyError as exc:
+            payload = {"error": exc.code, "detail": str(exc)}
+            print(json.dumps(payload) if args.json else f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result) if args.json else _format_apply(result))
+        return 0
+
+    catalog_path = _contracts_dir() / "violation-vocabulary-v1.json"
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        print(f"Error: cannot read {catalog_path}: {exc}", file=sys.stderr)
+        return 1
+
+    scope = {"target": ".", "review_parent": args.parent}
+    try:
+        document = build_promotion_input(
+            repo, catalog, scope, hot_zone=args.hot_zone, language=args.language or None
+        )
+    except EvidenceError as exc:
+        payload = {"error": exc.code, "detail": str(exc)}
+        print(json.dumps(payload) if args.json else f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from weave_coaching import plan_promotions  # noqa: PLC0415
+
+    plan = plan_promotions(document)
+    if args.json:
+        print(json.dumps(plan, indent=2))
+    else:
+        print(_format_plan(plan))
+    # An incomplete snapshot is a non-success exit even though the response is
+    # well formed: the caller must not read "no candidates" as "nothing to fix".
+    return 0 if plan["snapshot"]["state"] == "complete" else 1
+
+
+def cmd_coaching_render(args: argparse.Namespace) -> int:
+    """Render coaching for finding nodes — the one renderer every surface shares.
+
+    `wv findings list --detail`, the `ready` digest, and context/discovery all
+    call this rather than formatting finding metadata themselves. Three surfaces
+    growing three dialects of the same coaching is the fragmentation this slice
+    exists to remove, so the projection is bounded here and embedded there.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from weave_coaching import view  # noqa: PLC0415
+
+    from .guides import GuideError, resolve  # noqa: PLC0415
+
+    code, out = _wv_cmd("findings", "list", "--all", "--json")
+    if code != 0:
+        print(f"Error: could not read findings: {out}", file=sys.stderr)
+        return 1
+    try:
+        nodes = json.loads(out) if out else []
+    except json.JSONDecodeError as exc:
+        print(f"Error: findings list returned malformed JSON: {exc}", file=sys.stderr)
+        return 1
+
+    wanted = {n.strip() for n in args.node_ids.split(",") if n.strip()} if args.node_ids else None
+
+    catalog_path = _contracts_dir() / "violation-vocabulary-v1.json"
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        print(f"Error: cannot read {catalog_path}: {exc}", file=sys.stderr)
+        return 1
+
+    findings: list[dict[str, Any]] = []
+    guides: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        metadata = _load_node_metadata_local(node)
+        finding = metadata.get("finding") or {}
+        violation_type = finding.get("violation_type")
+        occurrences = (finding.get("quality") or {}).get("occurrences")
+        if not violation_type or not occurrences:
+            # A finding with no promoted occurrence set has nothing to coach
+            # over. It stays in `findings list`; it is simply not a coaching block.
+            continue
+        if wanted is not None and str(node.get("id")) not in wanted:
+            continue
+        try:
+            guide = resolve(violation_type, catalog, finding.get("guide", {}).get("language"),
+                            project_root=Path(_resolve_repo(None)))
+        except GuideError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        guides[violation_type] = guide.content()
+        findings.append({
+            "violation_type": violation_type,
+            "node_id": str(node.get("id")),
+            "occurrences": occurrences,
+            "policy": finding.get("policy"),
+            "confidence": finding.get("confidence"),
+        })
+
+    limit = None if args.limit <= 0 else args.limit
+    response = view.render_response(findings, guides, {"state": "complete"}, limit=limit)
+    # Embedded in another surface, an empty projection must say nothing. Its
+    # clean message is true of quality coaching and reads as a contradiction
+    # when it lands directly under a list of findings that surface just printed.
+    if args.embed and not response["blocks"]:
+        return 0
+    if args.json:
+        print(json.dumps(response, indent=2))
+    else:
+        print(view.render_text(response), end="")
+    return 0
+
+
+def _load_node_metadata_local(node: dict[str, Any]) -> dict[str, Any]:
+    metadata = node.get("metadata")
+    if isinstance(metadata, str) and metadata:
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _contracts_dir() -> Path:
+    """Where the machine-readable contracts live, source or installed.
+
+    Installed mode resolves them beside the package under $LIB_DIR/contracts;
+    a source checkout resolves them from the repository root.
+    """
+    installed = Path(__file__).resolve().parents[1] / "contracts"
+    if (installed / "violation-vocabulary-v1.json").is_file():
+        return installed
+    return Path(__file__).resolve().parents[2] / "contracts"
+
+
+def _write_metadata_patch(patch: dict[str, Any]) -> str:
+    """Persist a metadata patch for `wv update --metadata-file`."""
+    handle = tempfile.NamedTemporaryFile(
+        "w", suffix=".json", delete=False, encoding="utf-8"
+    )
+    with handle:
+        json.dump(patch, handle)
+    return handle.name
+
+
+def _format_plan(plan: dict[str, Any]) -> str:
+    lines = [f"Promotion plan ({plan['snapshot']['state']})"]
+    for cause in plan["snapshot"].get("causes", []):
+        lines.append(f"  [{cause['reason']}] {cause.get('rule_id', '')} {cause.get('detail', '')}")
+    for candidate in plan["candidates"]:
+        count = len(candidate["occurrences"])
+        lines.append(
+            f"  {candidate['promotion_id'][:12]}...  {candidate['violation_type']} "
+            f"({count} occurrence{'s' if count != 1 else ''})"
+        )
+    for rejected in plan.get("rejected", []):
+        lines.append(f"  rejected [{rejected['reason']}] {rejected.get('rule_id', '')}")
+    if not plan["candidates"]:
+        lines.append("  no candidates")
+    return "\n".join(lines)
+
+
+def _format_apply(result: dict[str, Any]) -> str:
+    lines = [f"Applied plan {result['reviewed_plan_sha256'][:12]}..."]
+    for entry in result["applied"]:
+        lines.append(f"  {entry['action']:9} {entry['node_id']}  {entry['promotion_id'][:12]}...")
+    return "\n".join(lines)
+
+
 def _cmd_promote_patterns(args: argparse.Namespace) -> int:
     """Promote pattern findings grouped by rule_id to Weave nodes."""
+    if getattr(args, "canonical", False):
+        return _cmd_promote_patterns_canonical(args)
     repo = Path(_resolve_repo(None))
     conn = init_db(args.hot_zone)
     run = latest_pattern_run(conn)
@@ -1751,7 +1964,14 @@ def _non_directory_repo_root_error(repo: Path, json_out: bool) -> int | None:
 
 
 def _pattern_definition_hash(rule_path: Path) -> str:
-    """Return the stable content hash used to bind execution receipts."""
+    """Return the stable content hash used to bind execution receipts.
+
+    Binds WORKING-TREE bytes as scan-receipt provenance. Promotion may use this
+    digest for validation only after `coaching_evidence.rule_definition_bindings`
+    proves the same bytes match target HEAD or the shipped package manifest.
+    See docs/EVIDENCE-HASH-BINDING-CONTRACT.md; do not let direct
+    receipt/worktree equality become a validation authority again.
+    """
     return hashlib.sha256(rule_path.read_bytes()).hexdigest()
 
 
@@ -3220,6 +3440,40 @@ def main() -> int:  # pragma: no cover
     pat_promote_p.add_argument(
         "--dry-run", action="store_true", help="Show what would be created"
     )
+    # Canonical mode. Legacy aggregate promotion is unchanged without --canonical,
+    # so an existing caller cannot be moved onto the new lifecycle by accident.
+    pat_promote_p.add_argument(
+        "--canonical",
+        action="store_true",
+        help="Promote accepted quality evidence into canonical type=finding nodes",
+    )
+    pat_promote_p.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply a reviewed plan (canonical mode; requires --plan-file)",
+    )
+    pat_promote_p.add_argument(
+        "--plan-file",
+        default="",
+        help="The reviewed plan bytes to apply, exactly as produced by dry-run",
+    )
+    pat_promote_p.add_argument(
+        "--language", default="", help="Language hint for guide resolution"
+    )
+
+    coaching_p = sub.add_parser(
+        "coaching", help="Render the shared coaching projection for finding nodes"
+    )
+    coaching_p.add_argument("--node-ids", default="", help="Comma-separated finding node ids")
+    coaching_p.add_argument("--json", action="store_true", help="Complete JSON envelope")
+    coaching_p.add_argument(
+        "--embed", action="store_true",
+        help="Print nothing when there is nothing to coach (for embedding in another surface)",
+    )
+    coaching_p.add_argument(
+        "--limit", type=int, default=3,
+        help="Occurrences shown per block in text mode; 0 shows every occurrence",
+    )
 
     pat_adjudicate_p = patterns_sub.add_parser(
         "adjudicate", help="Apply a human disposition to a stable finding key"
@@ -3267,6 +3521,7 @@ def main() -> int:  # pragma: no cover
         "adjudications-export": cmd_adjudications_export,
         "adjudications-import": cmd_adjudications_import,
         "structural-search": cmd_structural_search,
+        "coaching": cmd_coaching_render,
         "patterns": cmd_patterns,
     }
     if args.command in _dispatch:

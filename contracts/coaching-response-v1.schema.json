@@ -1,0 +1,379 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://weave.dev/contracts/coaching-response-v1.schema.json",
+  "$comment": "The coaching response envelope shared by every display surface: wv findings, wv ready --findings, context, discovery, and the MCP tools that invoke the same argv. The shared text projection is capped at 12,288 UTF-8 bytes; JSON retains complete reviewed evidence. This is a response state, not a durable object and not a replacement for an error string \u2014 an incomplete analysis still returns a non-success exit alongside state=incomplete.",
+  "$defs": {
+    "state": {
+      "$comment": "Only complete_clean may render a qualified clean message. An empty or broken analysis stream can never be configured into success.",
+      "enum": [
+        "complete_clean",
+        "complete_with_findings",
+        "incomplete"
+      ]
+    },
+    "cause": {
+      "$comment": "Typed reasons a result is incomplete or a guide could not be resolved. Prose is for the reader; the code is what a caller branches on.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "receipt_missing",
+            "receipt_failed",
+            "definition_hash_stale",
+            "rule_not_active",
+            "repo_rule_not_at_head",
+            "package_rule_not_manifest_bound",
+            "guide_override_invalid",
+            "guide_invalid",
+            "guide_missing",
+            "catalog_unreadable",
+            "uncatalogued_violation_type"
+          ]
+        },
+        "rule_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "remedy": {
+          "type": "string",
+          "$comment": "The command that would obtain a trustworthy snapshot, when one exists."
+        }
+      }
+    },
+    "occurrence_line": {
+      "$comment": "One rendered occurrence. `content` is the stored match or context and is primary; the detector message and rule id are secondary provenance. Repeating an analyzer message beside twenty locations teaches less than twenty matched fragments lined up.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "content",
+        "shape",
+        "detectors"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "content": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1,
+          "$comment": "Promotion-time snapshot; absent when no current scan row backs the anchor."
+        },
+        "column": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "shape": {
+          "enum": [
+            "location",
+            "file"
+          ],
+          "$comment": "File/document-scoped observations are one occurrence per path and render without a line."
+        },
+        "detectors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "rule_id",
+              "finding_key"
+            ],
+            "properties": {
+              "rule_id": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "finding_key": {
+                "type": "string",
+                "pattern": "^qf-[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"shape": {"const": "location"}}, "required": ["shape"]},
+          "then": {"properties": {"line": {"type": "integer", "minimum": 1}}, "required": ["line"]},
+          "else": {"properties": {"line": false, "column": false}}
+        }
+      ]
+    },
+    "guide_block": {
+      "$comment": "The rendered guide, in the fixed section order every surface prints. `avoid` carries the anti-gaming warning; it matters more here than upstream because the reader is usually an agent that can satisfy a detector without fixing anything.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source",
+        "why",
+        "corrective_move"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^_?[a-z0-9]+(-[a-z0-9]+)*$"
+        },
+        "language": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "enum": [
+            "project",
+            "package",
+            "fallback"
+          ]
+        },
+        "why": {
+          "type": "string",
+          "minLength": 1
+        },
+        "corrective_move": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_outcome": {
+          "type": "string"
+        },
+        "avoid": {
+          "type": "string"
+        },
+        "names_missing_guide": {
+          "type": "boolean",
+          "$comment": "True when the fallback rendered: coaching still happens, and it says which specific guide is absent rather than implying none is needed."
+        },
+        "missing_guide_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+        },
+        "missing_violation_type": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"source": {"const": "fallback"}}, "required": ["source"]},
+          "then": {
+            "properties": {
+              "names_missing_guide": {"const": true},
+              "missing_guide_id": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"},
+              "missing_violation_type": {"type": "string", "minLength": 1}
+            },
+            "required": ["names_missing_guide", "missing_guide_id", "missing_violation_type"]
+          },
+          "else": {"properties": {"missing_guide_id": false, "missing_violation_type": false}}
+        }
+      ]
+    },
+    "coaching_block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "violation_type",
+        "occurrence_count",
+        "occurrences",
+        "guide"
+      ],
+      "properties": {
+        "violation_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "node_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^wv-[0-9a-f]{6}$"
+        },
+        "occurrence_count": {
+          "type": "integer",
+          "minimum": 1,
+          "$comment": "The true total, even when `occurrences` holds a bounded sample."
+        },
+        "occurrences": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/occurrence_line"
+          }
+        },
+        "sampled": {
+          "type": "boolean"
+        },
+        "guide": {
+          "$ref": "#/$defs/guide_block"
+        },
+        "policy": {
+          "enum": [
+            "advisory",
+            "required"
+          ]
+        },
+        "confidence": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "recurrence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "resolving": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "node_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^wv-[0-9a-f]{6}$"
+            },
+            "status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "state",
+        "blocks"
+      ],
+      "properties": {
+        "format": {
+          "const": "weave.coaching-response.v1"
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/coaching_block"
+          },
+          "$comment": "Present-and-empty for complete_clean. Blocks may still render under state=incomplete: successful detectors are shown, and the whole result stays incomplete."
+        },
+        "causes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/cause"
+          }
+        },
+        "bounded": {
+          "type": "boolean",
+          "$comment": "True when text output sampled occurrences; the JSON form retains the complete reviewed evidence."
+        },
+        "clean_message": {
+          "type": "string",
+          "$comment": "Only valid under complete_clean, and qualified: structural checks do not prove correctness or design quality."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "complete_clean"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "required": [
+              "clean_message"
+            ],
+            "properties": {
+              "blocks": {
+                "type": "array",
+                "maxItems": 0
+              },
+              "causes": false,
+              "clean_message": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "incomplete"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "required": [
+              "causes"
+            ],
+            "properties": {
+              "causes": {
+                "type": "array",
+                "minItems": 1
+              },
+              "clean_message": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "complete_with_findings"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "blocks": {
+                "type": "array",
+                "minItems": 1
+              },
+              "causes": false,
+              "clean_message": false
+            }
+          }
+        }
+      ]
+    }
+  },
+  "$ref": "#/$defs/response"
+}

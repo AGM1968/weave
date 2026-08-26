@@ -1,0 +1,66 @@
+{
+  "format": "weave.coaching-fixtures.v1",
+  "$comment": "Frozen Phase 0 cases. Each planner case is an input the provider adapter could emit and the exact plan a correct planner must produce from it. Phase 1 replays them through the pure planner; Phase 3 replays the same bytes through the offline Rust shadow. Written independently of Habit Hooks; no upstream text or fixture is copied.",
+  "planner_cases": [
+    {
+      "name": "merge-across-rules",
+      "proves": "Two rules reporting one conceptual anchor render one occurrence carrying both detector records, and every qf-* is preserved.",
+      "acceptance_criterion": 4
+    },
+    {
+      "name": "ambiguity-flip",
+      "proves": "Scan N+1 of the merge case: one contributing rule now reports the anchor twice, so the pair that merged in scan N no longer may. The candidate plan changes; an already promoted finding must not until the replacement plan is reviewed and applied.",
+      "acceptance_criterion": 14,
+      "pairs_with": "merge-across-rules"
+    },
+    {
+      "name": "normalization-collapses",
+      "proves": "Normalization is the planner's responsibility: observations differing only in whitespace and unicode form reach one anchor. The provider emits raw match and context, so this case would prove nothing if normalization had stayed provider-side.",
+      "acceptance_criterion": 11
+    },
+    {
+      "name": "distinct-anchors-stay-distinct",
+      "proves": "Two different matches in one file from one rule remain two occurrences. Merging is across rules only.",
+      "acceptance_criterion": 4
+    },
+    {
+      "name": "incomplete-blocks-promotion",
+      "proves": "An incomplete snapshot carries typed causes, no observations, and plans no candidates. Incomplete is never clean and never promotable.",
+      "acceptance_criterion": 2
+    },
+    {
+      "name": "not-current-is-rejected",
+      "proves": "An accepted durable finding absent from the current complete scan remains visible as a planner-derived not_current rejection and cannot become a candidate.",
+      "acceptance_criterion": 1
+    }
+  ],
+  "guide_cases": [
+    {
+      "name": "project-override",
+      "path": "guides/project-override",
+      "expect": "resolves",
+      "proves": "A valid project guide outranks the package guide of the same id and language."
+    },
+    {
+      "name": "invalid-override",
+      "path": "guides/invalid-override",
+      "expect": "fails_closed",
+      "cause": "guide_override_invalid",
+      "proves": "A project override missing a required section fails closed. It must never fall through to the package guide, which would hide the broken override indefinitely."
+    }
+  ],
+  "response_cases": [
+    {
+      "name": "response-complete-clean",
+      "state": "complete_clean"
+    },
+    {
+      "name": "response-complete-with-findings",
+      "state": "complete_with_findings"
+    },
+    {
+      "name": "response-incomplete",
+      "state": "incomplete"
+    }
+  ]
+}

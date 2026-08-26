@@ -121,7 +121,20 @@ VALID_EDGE_TYPES="blocks relates_to implements contradicts supersedes references
 # pre-close-verification.sh so the enum stays in one place.
 # measurement-gap added 2026-06-10 (wv-01c378): distinct observability-gap class the
 # validator lagged; see docs/PATTERNS-rust-signatures.md Pattern C reconciliation.
-FINDING_VIOLATION_TYPES="historical:defect upstream:management-gap upstream:logic-bug upstream:schema-drift repo:hygiene repo:regression test:gap design:flaw measurement-gap"
+#
+# The list itself now comes from contracts/violation-vocabulary-v1.json, projected
+# into wv-violation-vocabulary.gen.sh by scripts/gen-violation-vocabulary.sh. It is
+# sourced HERE rather than from scripts/wv so the entry point stays out of the
+# changed hash-bound surface; the fallback keeps a stale or partial install
+# validating rather than accepting anything, since an empty enum would make every
+# violation_type invalid and block every finding close.
+_wv_vocabulary_projection="${BASH_SOURCE[0]%/*}/wv-violation-vocabulary.gen.sh"
+if [ -f "$_wv_vocabulary_projection" ]; then
+    # shellcheck source=scripts/lib/wv-violation-vocabulary.gen.sh
+    . "$_wv_vocabulary_projection"
+fi
+unset _wv_vocabulary_projection
+: "${FINDING_VIOLATION_TYPES:=historical:defect upstream:management-gap upstream:logic-bug upstream:schema-drift repo:hygiene repo:regression test:gap design:flaw measurement-gap}"
 
 # Valid session phase values — single source of truth.
 # Written via wv_set_phase(); read by pre-action.sh + context-guard.sh.

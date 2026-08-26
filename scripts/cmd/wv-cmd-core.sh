@@ -1791,12 +1791,14 @@ print('deteriorating' if s>0.03 else ('refactored' if s<-0.03 else 'stable'))
 #   match + exit 0  -> green   (fresh pass)
 #   match + exit !=0 -> red     (fresh fail)
 #   no match         -> stale   (file changed since the recorded run)
-#   no row / no map  -> unknown (non-blocking — the trigger ignores 'unknown')
+#   mapped + no row  -> stale   (required evidence is absent)
+#   no map           -> unknown (non-blocking — no suite is required)
 # Aggregate across suites with precedence red > stale > green > unknown.
 #
 # Best-effort by design: ALWAYS returns 0. The test gate is inert by default
-# (test_gate=0) and 'unknown' never blocks, so a refresh failure must not break
-# a close. Quality.db is NOT required — this reads brain.db only.
+# (test_gate=0); when block mode is enabled, mapped paths without complete
+# evidence are written as stale and rejected by the policy trigger. Quality.db
+# is NOT required — this reads brain.db only.
 _done_refresh_test_status() {
     local id="$1"
     local scope_json="${2:-}"
@@ -1822,15 +1824,25 @@ _done_refresh_test_status() {
         local suites
         suites=$(_impact_suites_for_files "$path" 2>/dev/null | jq -r '.[].name' 2>/dev/null || echo "")
 
-        state="unknown"
+        if [ -n "$suites" ]; then
+            # A mapped path starts stale and becomes green only if every required
+            # suite has a fresh passing row. This makes an absent/wiped ledger or
+            # a partial multi-suite result fail closed when test_gate=block.
+            state="green"
+        else
+            state="unknown"
+        fi
         local suite row_fp row_exit suite_state
         for suite in $suites; do
             row_fp=$(db_query "SELECT fingerprint FROM test_results WHERE suite='$(sql_escape "$suite")' AND path='$path_esc' LIMIT 1;" 2>/dev/null || echo "")
-            [ -z "$row_fp" ] && continue   # no recorded result for this suite+file
-            row_exit=$(db_query "SELECT exit_code FROM test_results WHERE suite='$(sql_escape "$suite")' AND path='$path_esc' LIMIT 1;" 2>/dev/null || echo "")
-            if [ "$row_fp" = "$cur_fp" ]; then
-                if [ "$row_exit" = "0" ]; then suite_state="green"; else suite_state="red"; fi
+            if [ -z "$row_fp" ]; then
+                suite_state="stale"
             else
+                row_exit=$(db_query "SELECT exit_code FROM test_results WHERE suite='$(sql_escape "$suite")' AND path='$path_esc' LIMIT 1;" 2>/dev/null || echo "")
+            fi
+            if [ -n "$row_fp" ] && [ "$row_fp" = "$cur_fp" ]; then
+                if [ "$row_exit" = "0" ]; then suite_state="green"; else suite_state="red"; fi
+            elif [ -n "$row_fp" ]; then
                 suite_state="stale"
             fi
             # Precedence: red > stale > green > unknown.
@@ -3365,7 +3377,16 @@ cmd_ready() {
                     echo -e "    $display"
                 done <<< "$finding_rows"
                 echo -e "${YELLOW}───────────────────────────────────────────────────────────────${NC}"
-                echo -e "  Use ${CYAN}wv findings list${NC} for full details."
+                echo -e "  Use ${CYAN}wv findings list --detail${NC} for the coaching projection."
+                # The bounded coaching projection, from the one renderer every
+                # surface shares. Only findings carrying promoted occurrences
+                # produce a block, so this is silent until canonical promotion
+                # has actually run -- the digest above is unchanged either way.
+                local _ready_ids
+                _ready_ids=$(printf '%s\n' "$finding_rows" | cut -d'|' -f1 | paste -sd, -)
+                if [ -n "$_ready_ids" ]; then
+                    _wv_findings_python coaching --embed --node-ids="$_ready_ids" --limit=2 2>/dev/null || true
+                fi
             fi
         fi
 

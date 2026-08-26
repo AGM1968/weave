@@ -38,10 +38,10 @@ confusion.
 
 | Scope       | Tools                                                                                                                                                                                                                                                                                                                                                                                                                          | Purpose                                    |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------ |
-| **graph**   | `weave_add`, `weave_link`, `weave_unlink`, `weave_block`, `weave_unarchive`, `weave_done`, `weave_batch_done`, `weave_list`, `weave_resolve`, `weave_update`, `weave_touch`, `weave_record_edit`, `weave_delete` (13)                                                                                                                                                                                                          | Create/modify/delete nodes and edges       |
+| **graph**   | `weave_add`, `weave_link`, `weave_unlink`, `weave_block`, `weave_unarchive`, `weave_done`, `weave_batch_done`, `weave_list`, `weave_resolve`, `weave_update`, `weave_touch`, `weave_record_edit`, `weave_delete`, `weave_quality_patterns` (14)                                                                                                                                                                                                          | Create/modify/delete nodes and edges       |
 | **session** | `weave_work`, `weave_ready`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_close_session`, `weave_trails`, `weave_breadcrumbs` (deprecated alias), `weave_plan`, `weave_edit_guard` (12)                                                                                                                                                                                           | Workflow lifecycle management              |
 | **lite**    | `weave_overview`, `weave_bootstrap`, `weave_guide`, `weave_edit_guard`, `weave_status`, `weave_work`, `weave_done` (7)                                                                                                                                                                                                                                                                                                         | Minimal task-tracking surface              |
-| **inspect** | `weave_context`, `weave_search`, `weave_query`, `weave_status`, `weave_ready`, `weave_impact`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`, `weave_structural_search`, `weave_quality_patterns`, `weave_code_search`, `weave_index` (22) | Read-only observation and query            |
+| **inspect** | `weave_context`, `weave_search`, `weave_query`, `weave_status`, `weave_ready`, `weave_impact`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`, `weave_structural_search`, `weave_quality_patterns`, `weave_findings`, `weave_code_search`, `weave_index` (23) | Read-only observation and query            |
 | **all**     | All 45 tools                                                                                                                                                                                                                                                                                                                                                                                                                   | Full access (default, backward-compatible) |
 
 ### Scope lifecycle
@@ -313,9 +313,16 @@ Optional local additions if you want stricter scope isolation:
 | `weave_quality_diff`      | Delta report vs previous scan                                           | —               |
 | `weave_quality_functions` | Per-function CC report with dispatch tagging                            | —               |
 | `weave_quality_patterns`  | Structural + prose pattern scan/list/validate/report/adjudicate/promote | —               |
+| `weave_findings`          | Review canonical findings; `detail` renders the shared coaching projection | —               |
 | `weave_structural_search` | Structural code search via ast-grep patterns                            | `pattern`       |
 | `weave_code_search`       | Semantic code search via local index                                    | `query`         |
 | `weave_index`             | Build or update the local code search index                             | —               |
+
+`weave_quality_patterns` is published in both `inspect` and `graph`. Its reading subcommands
+(scan, list, validate, report, adjudicate, and canonical promote's dry-run) work in either.
+Its writing calls — canonical `apply`, and legacy `promote` without `dry_run` — create Weave
+nodes and are refused in `inspect`, which is read-only; run those from `graph`. The `wv` CLI
+is unaffected: this is an MCP surface boundary, not a change to the command itself.
 
 ## Development
 

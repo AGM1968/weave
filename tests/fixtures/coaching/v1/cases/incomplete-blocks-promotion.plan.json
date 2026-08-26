@@ -1,0 +1,28 @@
+{
+  "format": "weave.coaching-promotion-plan.v1",
+  "scope": {
+    "target": "scripts",
+    "review_parent": "wv-44e524",
+    "rule_ids": [
+      "bare-except-pass",
+      "python-broad-except"
+    ]
+  },
+  "catalog_version": "weave.violation-vocabulary.v1",
+  "snapshot": {
+    "state": "incomplete",
+    "causes": [
+      {
+        "reason": "receipt_failed",
+        "rule_id": "bare-except-pass",
+        "detail": "rule execution failed during the last scan"
+      },
+      {
+        "reason": "definition_hash_stale",
+        "rule_id": "python-broad-except",
+        "detail": "receipt predates the current rule definition"
+      }
+    ]
+  },
+  "candidates": []
+}

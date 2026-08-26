@@ -209,6 +209,7 @@ _wv_dispatch() {
         doctor)          cmd_doctor "$@" ;;
         hotzone)         cmd_hotzone "$@" ;;
         test-record)     cmd_test_record "$@" ;;
+        test-status)     cmd_test_status "$@" ;;
         self-update)     cmd_self_update "$@" ;;
         uninstall)       cmd_uninstall "$@" ;;
         recover)         cmd_recover "$@" ;;
@@ -380,7 +381,7 @@ SQL
     _wv_normalized_operation() {
         local operation="${1:-help}"
         case "$operation" in
-            init|add|remember|memory|done|batch-done|bulk-update|delete|work|ready|list|show|status|pending-close|update|touch|allowed-tools|quick|ship|ship-agent|block|link|unlink|resolve|related|edges|path|tree|context|impact|discover|batch|plan|enrich-topology|sync|load|compact|prune|unarchive|clean-ghosts|commit-refs|learnings|refs|import|search|reindex|trails|breadcrumbs|bootstrap|bootstrap-agent|doctor|hotzone|test-record|self-update|uninstall|recover|selftest|mcp-status|health|cache|preflight|digest|overview|session-summary|audit-pitfalls|pattern-audit|edge-types|guide|init-repo|config|quality|findings|validate-finding|analyze|index|query|hook|help|--help|-h|version|--version|-v)
+            init|add|remember|memory|done|batch-done|bulk-update|delete|work|ready|list|show|status|pending-close|update|touch|allowed-tools|quick|ship|ship-agent|block|link|unlink|resolve|related|edges|path|tree|context|impact|discover|batch|plan|enrich-topology|sync|load|compact|prune|unarchive|clean-ghosts|commit-refs|learnings|refs|import|search|reindex|trails|breadcrumbs|bootstrap|bootstrap-agent|doctor|hotzone|test-record|test-status|self-update|uninstall|recover|selftest|mcp-status|health|cache|preflight|digest|overview|session-summary|audit-pitfalls|pattern-audit|edge-types|guide|init-repo|config|quality|findings|validate-finding|analyze|index|query|hook|help|--help|-h|version|--version|-v)
                 printf '%s' "$operation"
                 ;;
             *)
@@ -390,7 +391,7 @@ SQL
     }
     _wv_known_option() {
         case "$1" in
-            --json|--json-v2|--all|--count|--findings|--with-impact|--call-stats|--token-hogs|--trace-eval|--force|--quiet|--help|-h|--gh|--no-gh|--no-warn|--no-overlap-check|--skip-verification|--standalone|--code|--graph|--learning|--include-sync|--include-test|--status|--parent|--subtree|--text|--metadata|--metadata-file|--criteria|--risks|--learning-file|--verification-method|--verification-evidence|--verification-evidence-file|--intent|--files|--type|--limit|--mode|--source|--repo|--log|--usage-log|--call-log|--workflow-id|--trace-id|--topic|--procedure|--top|--since|--since-days|--host|--format|--order|--direction|--depth|--alias)
+            --json|--json-v2|--all|--count|--findings|--canonical|--dry-run|--apply|--detail|--plan-file|--with-impact|--call-stats|--token-hogs|--trace-eval|--force|--quiet|--help|-h|--gh|--no-gh|--no-warn|--no-overlap-check|--skip-verification|--standalone|--code|--graph|--learning|--include-sync|--include-test|--status|--parent|--subtree|--text|--metadata|--metadata-file|--criteria|--risks|--learning-file|--verification-method|--verification-evidence|--verification-evidence-file|--intent|--files|--type|--limit|--mode|--source|--repo|--log|--usage-log|--call-log|--workflow-id|--trace-id|--topic|--procedure|--top|--since|--since-days|--host|--format|--order|--direction|--depth|--alias)
                 return 0
                 ;;
         esac
@@ -398,7 +399,7 @@ SQL
     }
     _wv_option_consumes_value() {
         case "$1" in
-            --status|--parent|--subtree|--text|--metadata|--metadata-file|--criteria|--risks|--learning-file|--verification-method|--verification-evidence|--verification-evidence-file|--intent|--files|--type|--limit|--mode|--source|--repo|--log|--usage-log|--call-log|--workflow-id|--trace-id|--topic|--procedure|--top|--since|--since-days|--host|--format|--order|--direction|--depth|--alias)
+            --status|--parent|--subtree|--text|--metadata|--metadata-file|--plan-file|--criteria|--risks|--learning-file|--verification-method|--verification-evidence|--verification-evidence-file|--intent|--files|--type|--limit|--mode|--source|--repo|--log|--usage-log|--call-log|--workflow-id|--trace-id|--topic|--procedure|--top|--since|--since-days|--host|--format|--order|--direction|--depth|--alias)
                 return 0
                 ;;
         esac

@@ -1,0 +1,75 @@
+{
+  "format": "weave.violation-vocabulary.v1",
+  "description": "Canonical finding.violation_type values and their coaching guide basenames. Detector rules declare one flat reference into this vocabulary; the mapping itself stays beside the rule definition so project-local rules work and a mapping change stales that rule's receipt while guide prose does not.",
+  "guide_basename_rules": {
+    "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+    "flat": true,
+    "reserved_prefix": "_",
+    "reserved_windows_devices": ["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"],
+    "unique_case_insensitive": true,
+    "notes": [
+      "No dots: a guide file is resolved as <basename>.md or <basename>.<language>.md, so a dotted basename would be read as a language variant.",
+      "No subdirectories: both installer paths enumerate the guides directory non-recursively.",
+      "The leading underscore is reserved for the three presentation guides (_clean, _incomplete, _uncoached) and can never be claimed by a catalogued type.",
+      "Windows device names are reserved so the same flat asset set is installable on every supported filesystem."
+    ]
+  },
+  "types": {
+    "historical:defect": {"guide": "historical-defect", "status": "legacy", "summary": "A defect recorded by a past learning or pitfall."},
+    "upstream:management-gap": {"guide": "upstream-management-gap", "status": "legacy", "summary": "An upstream process or ownership gap outside this repository."},
+    "upstream:logic-bug": {"guide": "upstream-logic-bug", "status": "legacy", "summary": "A logic defect owned by an upstream component."},
+    "upstream:schema-drift": {"guide": "upstream-schema-drift", "status": "legacy", "summary": "An upstream schema or contract has drifted from its consumers."},
+    "repo:hygiene": {"guide": "repo-hygiene", "status": "legacy", "summary": "Repository hygiene: stale, duplicated, or misplaced material."},
+    "repo:regression": {"guide": "repo-regression", "status": "legacy", "summary": "Behaviour that previously worked and no longer does."},
+    "test:gap": {"guide": "test-gap", "status": "legacy", "summary": "Behaviour that no test covers."},
+    "design:flaw": {"guide": "design-flaw", "status": "legacy", "summary": "A design decision that produces recurring defects."},
+    "measurement-gap": {"guide": "measurement-gap", "status": "legacy", "summary": "A claim that cannot be checked because nothing measures it."},
+
+    "historical:guardrail": {"guide": "historical-guardrail", "status": "compatibility", "summary": "An operational guardrail recorded by a past learning."},
+    "historical:root_cause": {"guide": "historical-root-cause", "status": "compatibility", "summary": "A validated explanatory root cause promoted from history."},
+    "historical:tooling": {"guide": "historical-tooling", "status": "compatibility", "summary": "A Weave/runtime tooling defect promoted from history."},
+    "historical:finding": {"guide": "historical-finding", "status": "compatibility", "summary": "Promoted from a source node already typed as a finding."},
+    "historical:pitfall": {"guide": "historical-pitfall", "status": "compatibility", "summary": "Promoted from a recorded pitfall."},
+    "historical:learning-promotion": {"guide": "historical-learning-promotion", "status": "compatibility", "summary": "Promoted from a learning with no more specific signal."},
+    "memory_contradiction": {"guide": "memory-contradiction", "status": "compatibility", "summary": "Two memory or finding claims assert opposite polarity."},
+
+    "code:swallowed-exception": {"guide": "swallowed-exception", "status": "canonical", "summary": "A catch-all that discards the error hides a failure nobody has named."},
+    "code:unsafe-subprocess": {"guide": "unsafe-subprocess", "status": "canonical", "summary": "A subprocess invocation lets the shell reinterpret its arguments."},
+    "code:unquoted-expansion": {"guide": "unquoted-expansion", "status": "canonical", "summary": "An unquoted expansion re-splits and globs its own value."},
+    "prose:generated-vocabulary": {"guide": "generated-vocabulary", "status": "canonical", "summary": "High-frequency generated-text vocabulary decorates instead of informing."},
+    "prose:filler": {"guide": "filler", "status": "canonical", "summary": "Filler and hedging phrases that carry no claim."},
+    "prose:unearned-significance": {"guide": "unearned-significance", "status": "canonical", "summary": "Headings or scaffolding that announce importance the content does not carry."},
+    "prose:self-attested-virtue": {"guide": "self-attested-virtue", "status": "canonical", "summary": "Text asserting its own rigour, completeness, or verification instead of showing it."},
+    "prose:work-context-leakage": {"guide": "work-context-leakage", "status": "canonical", "summary": "Session or process narration leaking into a durable document."},
+    "prose:punctuation-density": {"guide": "punctuation-density", "status": "canonical", "summary": "A punctuation habit dense enough to read as a tic."},
+    "prose:register": {"guide": "register", "status": "canonical", "summary": "Register inappropriate to the document's audience."},
+    "markdown:malformed-markup": {"guide": "malformed-markup", "status": "canonical", "summary": "Markup that renders differently than the author intended."},
+    "markdown:citation-integrity": {"guide": "citation-integrity", "status": "canonical", "summary": "A citation that does not resolve to a real, dated reference."},
+    "markdown:metadata-formatting": {"guide": "metadata-formatting", "status": "canonical", "summary": "Metadata expressed as ad-hoc emphasis rather than structure."}
+  },
+  "compatibility": {
+    "absent_violation_type": {
+      "policy": "readable",
+      "detail": "A finding node with no finding.violation_type stays readable and survives unrelated updates. The pre-close validator continues to require the field before close, and canonical quality promotion never emits an absent value."
+    },
+    "canonical_promotion_requires_catalogued_type": true,
+    "emitters": [
+      {
+        "site": "scripts/weave_quality/findings.py::_historical_violation_type",
+        "catalogued": ["historical:defect", "historical:guardrail", "historical:root_cause", "historical:tooling", "historical:finding", "historical:pitfall", "historical:learning-promotion"],
+        "open_ended": "^R\\d+:[A-Za-z0-9._-]+$",
+        "policy": "The scraped rule code is provenance, not a type. It must be recorded alongside a catalogued type rather than becoming the type itself; an unbounded type namespace has no guide and no review."
+      },
+      {
+        "site": "scripts/cmd/wv-cmd-core.sh::_memory_crystallize_finding",
+        "catalogued": ["memory_contradiction"],
+        "policy": "Writes finding metadata through a direct SQL INSERT, bypassing the update-path enum gate. The literal value is catalogued as-is rather than renamed so existing nodes stay valid without rewriting."
+      },
+      {
+        "site": "wv update --metadata / wv add --metadata",
+        "catalogued": "any",
+        "policy": "Enum-gated at write time against the projected vocabulary."
+      }
+    ]
+  }
+}

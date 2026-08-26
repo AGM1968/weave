@@ -69,6 +69,21 @@ GLOBAL_IGNORE='^--(help|json)$'
 BASELINE="# --- policy-network (WV_MCP_ALLOW_NETWORK owns these) ---
 weave_done --no-gh
 weave_batch_done --no-gh
+# --- tool-split: weave_findings covers findings list only ---
+# The findings command also carries promote, which creates nodes from
+# historical learnings. weave_findings is published in the read-only inspect
+# scope and reviews existing findings; putting promote flags on it would make a
+# mutating operation reachable from a scope that documents itself read-only
+# (see wv-18ae68). Canonical quality promotion lives on
+# weave_quality_patterns promote, where parent/dry-run/apply already are.
+# No backticks in this string: BASELINE is double-quoted, so they would run.
+weave_findings --apply
+weave_findings --dry-run
+weave_findings --include-guardrails
+weave_findings --include-root-causes
+weave_findings --include-tooling
+weave_findings --parent
+weave_findings --top
 # --- safety-bypass ---
 weave_done --skip-verification
 weave_ship --skip-verification

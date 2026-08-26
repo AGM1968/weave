@@ -2249,7 +2249,29 @@ cmd_discover() {
     printf '%s' "$findings_json"  > "$_disc_dir/findings.json"
     printf '%s' "$learnings_json" > "$_disc_dir/learnings.json"
     printf '%s' "$impact_json"    > "$_disc_dir/impact.json"
+
+    # The bounded coaching projection for exactly the findings this report
+    # already carries -- the same renderer behind `wv findings list --detail`
+    # and the ready digest, so the three surfaces cannot drift into three
+    # dialects of one projection.
+    #
+    # Additive and optional: `coaching` appears only when a finding here holds
+    # promoted occurrences, so every existing field keeps its meaning and a
+    # consumer that does not know the key is unaffected. --embed keeps it silent
+    # when there is nothing to coach; a renderer failure is never fatal to
+    # discovery, which must keep working when coaching cannot be resolved.
+    local _disc_coaching="null" _disc_finding_ids
+    _disc_finding_ids=$(printf '%s' "$findings_json" | jq -r 'map(.id) | join(",")' 2>/dev/null || true)
+    if [ -n "$_disc_finding_ids" ]; then
+        _disc_coaching=$(_wv_findings_python coaching --embed --json \
+            --node-ids="$_disc_finding_ids" --limit=2 2>/dev/null || true)
+        # jq refuses an empty --argjson, and "nothing to coach" is the ordinary case.
+        [ -n "$_disc_coaching" ] || _disc_coaching="null"
+        printf '%s' "$_disc_coaching" | jq -e . >/dev/null 2>&1 || _disc_coaching="null"
+    fi
+
     jq -n -c \
+        --argjson _coaching "$_disc_coaching" \
         --arg schema "weave.discovery.v1" \
         --arg generated_by "wv discover" \
         --arg impact_direction "$impact_direction" \
@@ -2429,6 +2451,7 @@ cmd_discover() {
             }
           }
         }
+        + (if $_coaching == null then {} else {coaching: $_coaching} end)
     '
     _disc_rc=$?
     rm -rf "$_disc_dir"

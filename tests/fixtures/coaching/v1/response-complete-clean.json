@@ -1,0 +1,6 @@
+{
+  "format": "weave.coaching-response.v1",
+  "state": "complete_clean",
+  "blocks": [],
+  "clean_message": "Pattern rules completed with no accepted defects in scope. Structural checks do not prove correctness or design quality."
+}

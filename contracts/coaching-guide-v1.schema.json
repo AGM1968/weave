@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://weave.dev/contracts/coaching-guide-v1.schema.json",
+  "$comment": "A coaching guide asset: small validated frontmatter plus fixed prose sections. Guides are package assets under scripts/weave_quality/guides/ with .weave/guides/ overrides, resolved deterministically and never templated — no Jinja, no executable Markdown, no runner escape hatch. Guide prose is versioned independently of detector rules: a wording change must never stale a scan receipt or move a promotion identity.",
+  "$defs": {
+    "frontmatter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "violation_type", "summary"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^_?[a-z0-9]+(-[a-z0-9]+)*$",
+          "$comment": "Must equal the file's basename with any .<language> suffix and the .md extension removed. The leading underscore is reserved for the three presentation guides."
+        },
+        "violation_type": {
+          "type": "string",
+          "minLength": 1,
+          "$comment": "The catalogued type this guide coaches, or the literal '_presentation' for _clean/_incomplete/_uncoached, which coach a response state rather than a violation."
+        },
+        "language": {
+          "type": ["string", "null"],
+          "$comment": "Set only on a language variant. Must equal the .<language> segment of the filename."
+        },
+        "summary": {"type": "string", "minLength": 1}
+      }
+    },
+    "sections": {
+      "$comment": "The fixed section order every surface renders. `why` and `corrective_move` are required because a guide that cannot say what is wrong or what to do instead is not coaching. `avoid` is optional but strongly expected on any guide whose detector can be satisfied without fixing anything — the reader is usually an agent.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["why", "corrective_move"],
+      "properties": {
+        "why": {"type": "string", "minLength": 1},
+        "corrective_move": {"type": "string", "minLength": 1},
+        "expected_outcome": {"type": "string", "minLength": 1},
+        "avoid": {"type": "string", "minLength": 1}
+      }
+    },
+    "guide": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["frontmatter", "sections"],
+      "properties": {
+        "frontmatter": {"$ref": "#/$defs/frontmatter"},
+        "sections": {"$ref": "#/$defs/sections"}
+      }
+    },
+    "resolution": {
+      "$comment": "Deterministic, with no plugin axis. The first hit wins; there is no merging across layers. A project override that fails frontmatter or section validation is NOT skipped in favour of the package guide — it fails closed with a guide_override_invalid cause, because silently preferring the package copy would hide a broken override indefinitely.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["order", "fallback", "invalid_override"],
+      "properties": {
+        "order": {
+          "type": "array",
+          "items": {"type": "string"},
+          "const": [
+            ".weave/guides/<id>.<language>.md",
+            ".weave/guides/<id>.md",
+            "<package>/guides/<id>.<language>.md",
+            "<package>/guides/<id>.md",
+            "<package>/guides/_uncoached.md"
+          ]
+        },
+        "fallback": {"const": "_uncoached"},
+        "invalid_override": {"const": "fail_closed"}
+      }
+    },
+    "file_rules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["flat", "extension", "language_suffix"],
+      "properties": {
+        "flat": {"const": true, "$comment": "No subdirectories: both installer paths enumerate the guides directory non-recursively."},
+        "extension": {"const": ".md"},
+        "language_suffix": {"const": "<id>.<language>.md", "$comment": "Why a catalogued guide basename may never contain a dot: a dotted basename is indistinguishable from a language variant."}
+      }
+    }
+  },
+  "$ref": "#/$defs/guide"
+}

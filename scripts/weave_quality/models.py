@@ -403,8 +403,15 @@ class PatternRun:
 class PatternFinding:
     """One ast-grep structural pattern match.
 
-    Maps to the `pattern_findings` table. Pruned at the same _FILES_SCANS=2
-    boundary as files/file_metrics — point-in-time data, not trend data.
+    Maps to the `pattern_findings` table: point-in-time data, not trend data.
+    Retention is the pattern window (_MAX_PATTERN_RUNS), keyed off pattern_runs
+    and independent of scan_meta -- `begin_scan` deliberately does NOT prune
+    these rows with files/file_metrics, so an unrelated `wv quality scan` cannot
+    touch pattern-scan history.
+
+    `line` and `col` are therefore point-in-time too. Durable identity and human
+    dispositions live in `pattern_finding_state`, which carries neither: anything
+    that must survive pruning keys off path/match/context, never off a line.
     """
 
     path: str = ""

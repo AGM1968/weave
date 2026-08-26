@@ -12,7 +12,16 @@
       "text": "Example",
       "status": "active",
       "done_criteria": ["c1"],
-      "risks": [],
+      "risks": [
+        {
+          "scenario": "An unverified release is published",
+          "impact": "high",
+          "likelihood": "low",
+          "detectability": "easy",
+          "mitigation": "Run the release gates before tagging",
+          "tripwire": "Any required gate fails"
+        }
+      ],
       "risk_level": "low"
     },
     "blocked": false,

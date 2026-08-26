@@ -861,6 +861,25 @@ test_discover() {
     boot=$("$WV" bootstrap --json 2>/dev/null)
     assert_jq_true "$boot" '.context.discovery.schema == "weave.discovery.v1" and (.context.discovery.unknown_unknown_candidates | length >= 1)' "bootstrap JSON: active context includes bounded discovery report"
 
+    # wv-183684: the bounded coaching projection rides the discovery envelope,
+    # so context and bootstrap inherit it without inventing their own rendering.
+    # It is ADDITIVE: absent when no related finding carries promoted
+    # occurrences, which is why the negative case is asserted first.
+    assert_jq_true "$jout" '(has("coaching") | not) or (.coaching.format == "weave.coaching-response.v1")' \
+        "discover JSON: coaching is absent or a valid coaching-response envelope"
+
+    coach_meta=$(printf '%s' '{"type":"finding","finding":{"violation_type":"code:swallowed-exception","root_cause":"r","proposed_fix":"f","policy":"advisory","guide":{"id":"swallowed-exception","language":"python","source":"package"},"quality":{"promotion_id":"cp-aaaa","occurrences":[{"anchor":{"path":"app.py","normalized_match":"except Exception: pass","normalized_context":"except Exception: pass"},"merged":false,"detectors":[{"rule_id":"bare-except-pass","finding_key":"qf-bbbb","disposition":"accepted_defect","scan_count":2}],"location":{"scan_id":1,"line":12}}]}}}')
+    coach_finding=$("$WV" add "Finding: code:swallowed-exception (1 occurrence)" --standalone --metadata="$coach_meta" --force 2>/dev/null | grep -o "wv-[0-9a-f]\{6\}" | head -1)
+    "$WV" link "$coach_finding" "$seed" --type=references >/dev/null 2>&1
+    coached=$("$WV" discover "$seed" --json 2>/dev/null)
+    assert_jq_true "$coached" '.coaching.format == "weave.coaching-response.v1" and (.coaching.blocks | length >= 1) and (.coaching.blocks[0].occurrence_count >= 1)' \
+        "discover JSON: a related promoted finding renders a bounded coaching block"
+    assert_jq_true "$coached" '(.known_unknowns | length) >= 1 and (.schema == "weave.discovery.v1")' \
+        "discover JSON: existing discovery fields keep their meaning alongside coaching"
+    ctx_coached=$("$WV" context "$seed" --json --mode=discover 2>&1)
+    assert_jq_true "$ctx_coached" '.discovery.coaching.format == "weave.coaching-response.v1"' \
+        "context discover-mode: inherits the coaching projection from discovery"
+
     "$WV" update "$seed" --status=done >/dev/null 2>&1
     done_out=$("$WV" discover "$seed" --json --depth=2 --limit=5 2>&1)
     assert_jq_true "$done_out" '.seed.status == "done" and .sources.impact.direction == "rev" and .sources.impact.available == true' "discover JSON: done seeds use explicit reverse impact"

@@ -370,6 +370,13 @@ Subcommands:
                  maturity/optional-key values are actually exercised by
                  the valid rules, to catch documented-but-dead surface.
   promote        Promote findings as Weave nodes (--parent=<id> required)
+                 --canonical promotes reviewed accepted evidence into canonical
+                 type=finding nodes. Canonical mode defaults to dry-run; write
+                 the plan with --json, review it, then apply those exact bytes:
+                   wv quality patterns promote --canonical --parent=<id> --json > plan.json
+                   wv quality patterns promote --canonical --apply --plan-file=plan.json
+                 --apply and --dry-run are mutually exclusive, and apply takes
+                 its review parent from the plan rather than from --parent.
 
 Options:
   --json         JSON output
@@ -453,6 +460,10 @@ EOF
     local parent=""
     local dry_run=""
     local note=""
+    local canonical=""
+    local apply_flag=""
+    local plan_file=""
+    local language=""
     local -a positional=()
 
     while [ $# -gt 0 ]; do
@@ -461,6 +472,12 @@ EOF
             --parent=*)   parent="${1#--parent=}" ;;
             --parent)     shift; parent="$1" ;;
             --dry-run)    dry_run="--dry-run" ;;
+            --canonical)  canonical="--canonical" ;;
+            --apply)      apply_flag="--apply" ;;
+            --plan-file=*) plan_file="${1#--plan-file=}" ;;
+            --plan-file)  shift; plan_file="${1:-}" ;;
+            --language=*) language="${1#--language=}" ;;
+            --language)   shift; language="${1:-}" ;;
             --note=*)     note="${1#--note=}" ;;
             --note)       shift; note="${1:-}" ;;
             --help|-h)    ;;
@@ -498,6 +515,12 @@ EOF
         fi
         py_args+=("--parent" "$parent")
         [ -n "$dry_run" ] && py_args+=("$dry_run")
+        # Canonical mode is opt-in; without --canonical the legacy aggregate
+        # promotion below is byte-for-byte the path it always was.
+        [ -n "$canonical" ] && py_args+=("$canonical")
+        [ -n "$apply_flag" ] && py_args+=("$apply_flag")
+        [ -n "$plan_file" ] && py_args+=("--plan-file" "$plan_file")
+        [ -n "$language" ] && py_args+=("--language" "$language")
     fi
 
     _wv_quality_python "${py_args[@]}" || return $?

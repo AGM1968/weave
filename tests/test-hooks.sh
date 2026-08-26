@@ -1294,8 +1294,10 @@ assert_contains "$SELF_HEAL_BLOCK" "unset WV_LIB_DIR WV_CONFIG_DIR WV_HOT_ZONE W
 
 setup_test_env
 mkdir -p "$TEST_DIR/project/tests"
-cat > "$TEST_DIR/project/tests/test-graph.sh" <<'EOF'
+FRESH_SUITE_RUNS="$TEST_DIR/fresh-suite-runs"
+cat > "$TEST_DIR/project/tests/test-graph.sh" <<EOF
 #!/bin/sh
+echo run >> "$FRESH_SUITE_RUNS"
 exit 0
 EOF
 chmod +x "$TEST_DIR/project/tests/test-graph.sh"
@@ -1308,6 +1310,34 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "git pre-commit: exits 0 with active node and passing shell smoke"
 assert_contains "$OUTPUT" "running tests/test-graph.sh" "git pre-commit: streams shell-test progress"
 assert_contains "$OUTPUT" "checking for an active Weave node" "git pre-commit: streams active-node check"
+assert_equals "1" "$(wc -l < "$FRESH_SUITE_RUNS" | tr -d ' ')" \
+    "git pre-commit: first unknown result executes the real suite"
+
+# Repeating the hook against the identical staged tree reuses the exact green
+# ledger row instead of executing an expensive suite twice.
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: fresh green result exits 0"
+assert_contains "$OUTPUT" "reusing fresh green result for tests/test-graph.sh" \
+    "git pre-commit: names exact staged-result reuse"
+assert_equals "1" "$(wc -l < "$FRESH_SUITE_RUNS" | tr -d ' ')" \
+    "git pre-commit: fresh green result does not execute the suite again"
+
+# Any staged-byte change invalidates the row and falls through to the unchanged
+# suite execution path.
+printf '# changed\n' >> "$TEST_DIR/project/tests/test-graph.sh"
+git -C "$TEST_DIR/project" add tests/test-graph.sh
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: stale result reruns and passes"
+assert_contains "$OUTPUT" "running tests/test-graph.sh" \
+    "git pre-commit: stale result falls through to real suite execution"
+assert_equals "2" "$(wc -l < "$FRESH_SUITE_RUNS" | tr -d ' ')" \
+    "git pre-commit: stale staged bytes execute the suite exactly once"
 
 setup_test_env
 mkdir -p "$TEST_DIR/project/scripts/hooks" "$TEST_DIR/project/tests"

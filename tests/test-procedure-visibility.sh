@@ -55,11 +55,22 @@ bash "$ROOT/scripts/project-procedures.sh" --source="$SRC" --repo="$R2"
 [ ! -e "$R2/.codex/weave.json" ] || [ "$(jq -r '[.procedures[].id] | index("shared1")' "$R2/.codex/weave.json")" = "null" ]
 [ ! -e "$R2/.github/copilot-instructions.md" ] || ! grep -qF 'wv guide --procedure=shared1' "$R2/.github/copilot-instructions.md"
 
-# 6. gen-procedures rejects an invalid visibility value.
+# 6. The canonical dev-guide extraction is a real local procedure: it remains
+# available to wv guide but never projects to a consumer adapter.
+LOCAL_DEV="$ROOT/templates/procedures/local-development.md"
+[ "$(awk -F': *' '/^visibility:/{print $2; exit}' "$LOCAL_DEV")" = "local" ]
+grep -qF 'wv <command>' "$LOCAL_DEV"
+LOCAL_SRC="$TMP/local-src"; R3="$TMP/r3"; mkdir -p "$LOCAL_SRC" "$R3"
+cp "$LOCAL_DEV" "$LOCAL_SRC/"
+bash "$ROOT/scripts/gen-procedures.sh" --source="$LOCAL_SRC" --check >/dev/null
+bash "$ROOT/scripts/project-procedures.sh" --source="$LOCAL_SRC" --repo="$R3" --agent=codex
+[ ! -e "$R3/.codex/weave.json" ] || [ "$(jq -r '[.procedures[].id] | index("local-development")' "$R3/.codex/weave.json")" = "null" ]
+
+# 7. gen-procedures rejects an invalid visibility value.
 mkproc bad '[codex]' 'visibility: public'
 if bash "$ROOT/scripts/gen-procedures.sh" --source="$SRC" --check >/dev/null 2>&1; then
     echo "invalid visibility value unexpectedly passed validation" >&2
     exit 1
 fi
 
-echo 'Results: 10/10 passed'
+echo 'Results: 15/15 passed'

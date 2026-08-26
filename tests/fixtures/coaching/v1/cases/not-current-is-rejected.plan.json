@@ -1,0 +1,28 @@
+{
+  "format": "weave.coaching-promotion-plan.v1",
+  "scope": {
+    "target": "scripts",
+    "review_parent": "wv-44e524",
+    "rule_ids": [
+      "unquoted-variable"
+    ]
+  },
+  "catalog_version": "weave.violation-vocabulary.v1",
+  "snapshot": {
+    "state": "complete"
+  },
+  "candidates": [],
+  "rejected": [
+    {
+      "reason": "not_current",
+      "rule_id": "unquoted-variable",
+      "finding_key": "qf-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "anchor": {
+        "path": "scripts/legacy.sh",
+        "normalized_match": "rm $target",
+        "normalized_context": "rm $target"
+      },
+      "detail": "accepted durable row has no observation in the current complete scan; needs separate historical review"
+    }
+  ]
+}

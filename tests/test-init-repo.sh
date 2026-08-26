@@ -731,6 +731,25 @@ else
     echo -e "${YELLOW}⊘${NC} vendor seed: skipped (lib hooks not installed)"
 fi
 
+# A single update must converge both the tracked source and its installed hook.
+# The old order installed .git/hooks/pre-commit from the stale tracked source,
+# then refreshed scripts/hooks/pre-commit-weave.sh, leaving doctor to require a
+# second update before the two files matched.
+REPO10_ORDER=$(make_test_repo "vendor-refresh-order")
+cd "$REPO10_ORDER"
+mkdir -p scripts/hooks
+printf '#!/bin/sh\n# Weave pre-commit\n# stale vendored source\n' > scripts/hooks/pre-commit-weave.sh
+chmod +x scripts/hooks/pre-commit-weave.sh
+"$WV" init-repo --update --agent=claude >/dev/null 2>&1
+if cmp -s "$_LIB_HOOKS_DIR/pre-commit-weave.sh" "$REPO10_ORDER/scripts/hooks/pre-commit-weave.sh" \
+    && cmp -s "$REPO10_ORDER/scripts/hooks/pre-commit-weave.sh" "$REPO10_ORDER/.git/hooks/pre-commit"; then
+    HOOK_SOURCE_PARITY=yes
+else
+    HOOK_SOURCE_PARITY=no
+fi
+assert_equals "yes" "$HOOK_SOURCE_PARITY" \
+    "vendor refresh: one update leaves tracked and installed pre-commit hooks identical"
+
 # --- installed git-hook refresh: stale Weave hook updated, custom hook kept ---
 # Regression for wv-4bb42e: --update must refresh an existing Weave-managed
 # .git/hooks/ hook even when its (older) wording lacks the exact marker, while

@@ -1,0 +1,75 @@
+{
+  "format": "weave.coaching-promotion-plan.v1",
+  "scope": {
+    "target": "scripts",
+    "review_parent": "wv-44e524",
+    "rule_ids": [
+      "bare-except-pass"
+    ]
+  },
+  "catalog_version": "weave.violation-vocabulary.v1",
+  "snapshot": {
+    "state": "complete"
+  },
+  "candidates": [
+    {
+      "promotion_id": "cp-153518f8a5f5d8066eab342a2981bf383e6730cd78797149d2e3afa573e7579f",
+      "violation_type": "code:swallowed-exception",
+      "guide": {
+        "id": "swallowed-exception",
+        "language": "python",
+        "source": "package"
+      },
+      "policy": "advisory",
+      "confidence": "high",
+      "fixable": true,
+      "root_cause": "A broad except discards an error nobody has named.",
+      "proposed_fix": "Catch the specific error the call raises, or add context and re-raise; log the traceback at a boundary that must stay alive.",
+      "rule_definition_bindings": {
+        "bare-except-pass": {"authority": "package_manifest", "asset": "default_patterns/bare-except-pass.yaml", "manifest_sha256": "6e7d0d88c46c488a89cff8f09c028a2157f00baa4be0601af689a99e164318fb", "definition_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "reconstructible_from_commit": false}
+      },
+      "occurrences": [
+        {
+          "anchor": {
+            "path": "scripts/weave_quality/example.py",
+            "normalized_match": "try: other() except Exception: pass",
+            "normalized_context": "except Exception: pass # other"
+          },
+          "location": {
+            "scan_id": 41,
+            "line": 201
+          },
+          "merged": false,
+          "detectors": [
+            {
+              "rule_id": "bare-except-pass",
+              "finding_key": "qf-6f61f23b93401f901aa3ed30481aea163d5a8727c0ab1d744d3e8115f0f707cb",
+              "disposition": "accepted_defect",
+              "scan_count": 1
+            }
+          ]
+        },
+        {
+          "anchor": {
+            "path": "scripts/weave_quality/example.py",
+            "normalized_match": "try: risky() except Exception: pass",
+            "normalized_context": "except Exception: pass"
+          },
+          "location": {
+            "scan_id": 41,
+            "line": 88
+          },
+          "merged": false,
+          "detectors": [
+            {
+              "rule_id": "bare-except-pass",
+              "finding_key": "qf-5803ccf7af961bec5afd2ae749d603abc1a6cc341fc770419559637875cd24de",
+              "disposition": "accepted_defect",
+              "scan_count": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
