@@ -2824,7 +2824,8 @@ _scaffold_test_map() {
 # A `* = suite` line, or suites listed under a [default] section, run when no
 # other key matches a file — so the gate fails *safe* (runs a broad suite)
 # instead of *open* (runs nothing). Per-file precedence:
-#   exact > glob/prefix > naming heuristic > [default].
+#   union(exact, matching glob/prefix) > naming heuristic > [default].
+# Unioning explicit matches means a specific row cannot remove a broader suite.
 # A file matching nothing (and no [default]) makes the pre-commit gate inert
 # for it and now prints a one-line notice rather than passing silently.
 #
@@ -2839,7 +2840,7 @@ _scaffold_test_map() {
         body+='# Python (pyproject.toml / setup.cfg detected)
 # Create a wrapper that sets up the env and runs pytest, e.g. scripts/run-tests.sh:
 #   #!/usr/bin/env bash
-#   set -e; cd "$(git rev-parse --show-toplevel)" && poetry run pytest tests
+#   set -e; cd "$(git rev-parse --show-toplevel)" && python -m pytest tests
 # Then map the whole source tree with one prefix (or glob) line:
 # src/         = scripts/run-tests.sh
 # src/**/*.py  = scripts/run-tests.sh

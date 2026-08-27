@@ -762,11 +762,20 @@ EOF
 
     local out
     out=$("$WV" impact --suites --files=scripts/cmd/wv-cmd-graph.sh 2>&1)
-    assert_contains "$out" "test-exact.sh" "suites: exact key wins"
+    assert_contains "$out" "test-exact.sh" "suites: exact key contributes its suite"
     assert_not_contains "$out" "test-default.sh" "suites: exact match does not fall to default"
 
     out=$("$WV" impact --suites --files=src/runners/job.py 2>&1)
     assert_contains "$out" "test-prefix.sh" "suites: prefix key (src/runners/) matches file under dir"
+
+    # Adding an exact row must not remove a suite inherited from a broader
+    # prefix. VERSION lost its E6 route this way before explicit matches were
+    # unioned with patterns.
+    sed -i '/scripts\/cmd\/wv-cmd-graph.sh/c\scripts/cmd/wv-cmd-graph.sh = tests/test-exact.sh\nscripts/cmd/ = tests/test-broad.sh' \
+        "$TEST_DIR/.weave/test-map.conf"
+    out=$("$WV" impact --suites --files=scripts/cmd/wv-cmd-graph.sh 2>&1)
+    assert_contains "$out" "test-exact.sh" "suites: exact mapping remains selected"
+    assert_contains "$out" "test-broad.sh" "suites: exact mapping cannot suppress broader prefix suite"
 
     out=$("$WV" impact --suites --files=src/utils/models.py 2>&1)
     assert_contains "$out" "test-glob.sh" "suites: glob key (src/**/*.py) matches nested file"

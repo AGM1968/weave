@@ -4,6 +4,21 @@
 
 ## Unreleased
 
+## [1.71.0-rc.9] - 2026-08-27
+
+Corrective distribution prerelease. The public projection no longer imposes Poetry on consumers,
+and the publication path now fails closed on stale generated content and derives prerelease status
+from the version being released.
+
+### Fixed
+
+- Remove the public projection's Poetry build backend and private development-tool configuration
+  while retaining the pytest configuration required by its shipped tests.
+- Commit generated public content without running source-repository authored-work hooks, and stop
+  publication if that commit or the committed-payload checks fail.
+- Pass `--prerelease` to GitHub automatically for rc, alpha, beta, and development versions so a
+  release candidate cannot be presented as the latest stable release.
+
 ## [1.71.0-rc.8] - 2026-08-26
 
 Adds canonical finding coaching: adjudicated quality evidence can be reviewed into canonical

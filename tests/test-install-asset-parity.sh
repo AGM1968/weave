@@ -75,6 +75,31 @@ else
 $(printf '%s\n' "$dupes" | sed 's/^/    /')"
 fi
 
+# Compare the worktree map to HEAD across every tracked path. A map edit may
+# add coverage, but it must not silently remove a suite selected before it.
+before_map="$TMP/test-map.before.conf"
+if git -C "$ROOT" show HEAD:.weave/test-map.conf > "$before_map" 2>/dev/null && \
+   python3 "$ROOT/tests/lib/test-map-monotonic.py" "$before_map" \
+       "$ROOT/.weave/test-map.conf" --repo "$ROOT" > "$TMP/map-monotonic" 2>&1; then
+    pass "test-map edit preserves every previously selected suite"
+else
+    fail "test-map edit preserves every previously selected suite" \
+        "$(sed 's/^/    /' "$TMP/map-monotonic" 2>/dev/null)"
+fi
+
+# Negative control: removing a broad route must be visible to the checker.
+printf '[map]\nscripts/ = tests/test-broad.sh\n' > "$TMP/map-old.conf"
+printf '[map]\nscripts/ = tests/test-narrow.sh\n' > "$TMP/map-new.conf"
+if python3 "$ROOT/tests/lib/test-map-monotonic.py" "$TMP/map-old.conf" \
+    "$TMP/map-new.conf" --repo "$ROOT" > "$TMP/map-negative" 2>&1; then
+    fail "test-map route reduction is rejected" "    checker accepted a removed suite"
+elif grep -qF -- "routing lost tests/test-broad.sh" "$TMP/map-negative"; then
+    pass "test-map route reduction is rejected"
+else
+    fail "test-map route reduction is rejected" \
+        "$(sed 's/^/    /' "$TMP/map-negative")"
+fi
+
 # Negative control: a checker that stopped checking passes everything above.
 work="$TMP/repo"
 mkdir -p "$work/tests/lib" "$work/scripts/weave_coaching" "$work/scripts/weave_quality/guides" "$work/contracts"

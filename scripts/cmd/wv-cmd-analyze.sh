@@ -5,6 +5,7 @@
 #   wv analyze sessions --call-stats [--log=<path>] [--top=N] [--since-days=N] [--include-sync]
 #   wv analyze sessions --trace-eval --log=<path> [--usage-log=<path>] --json
 #   wv analyze suites [--log=<path>] [--json]
+#   wv analyze checkpoints [--days=N] [--log=<path>] [--repo=<path>] [--json]
 #
 # Reads a JSONL call log (enable durably with `wv config enable session-analysis`,
 # which sets WV_CALL_LOG in ~/.config/weave/config.env) and surfaces the wv
@@ -19,6 +20,7 @@ cmd_analyze() {
     case "$sub" in
         sessions) cmd_analyze_sessions "$@" ;;
         suites)   cmd_analyze_suites "$@" ;;
+        checkpoints) cmd_analyze_checkpoints "$@" ;;
         help|--help|-h)
             echo "Usage: wv analyze <subcommand> [options]"
             echo ""
@@ -27,6 +29,7 @@ cmd_analyze() {
             echo "  sessions --trace-eval   Observe state-aware traces from a WV_CALL_LOG JSONL file"
             echo "  suites                  Per-suite run count + duration (total/avg/p95) + pass/fail"
             echo "                          Defaults to current repo; use --all to see all repos"
+            echo "  checkpoints             Measure auto-checkpoint overlap with recorded wv calls"
             ;;
         *)
             echo "wv analyze: unknown subcommand: $sub" >&2
@@ -34,6 +37,16 @@ cmd_analyze() {
             return 1
             ;;
     esac
+}
+
+cmd_analyze_checkpoints() {
+    local analyzer="$WV_LIB_DIR/profiling/checkpoint_overlap.py"
+    [ -f "$analyzer" ] || analyzer="$WV_LIB_DIR/../profiling/checkpoint_overlap.py"
+    if [ ! -f "$analyzer" ]; then
+        echo "wv analyze checkpoints: checkpoint analyzer is not installed" >&2
+        return 1
+    fi
+    python3 "$analyzer" "$@"
 }
 
 cmd_analyze_sessions() {

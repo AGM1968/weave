@@ -1521,9 +1521,10 @@ cmd_tree() {
 #
 # Loads .weave/test-map.conf (ini-style: source_file = suite [suite ...]).
 # Keys may be exact paths, glob patterns (src/**/*.py = suite), or directory
-# prefixes ending in / (src/ = suite). A `* = suite` entry, or bare suite
-# tokens under a `[default]` section, set a fail-safe default. Per-file
-# precedence: exact > glob/prefix > naming heuristic > [default].
+# prefixes ending in / (src/ = suite). Exact and matching pattern entries are
+# unioned so adding a more-specific row cannot remove a broader safety suite.
+# A `* = suite` entry, or bare suite tokens under a `[default]` section, sets a
+# fail-safe default used after explicit mappings and the naming heuristic.
 # Falls back to naming-convention heuristic when conf is absent or a file
 # has no explicit/glob mapping:
 #   scripts/cmd/wv-cmd-<X>.sh  →  tests/test-<X>.sh
@@ -1581,45 +1582,46 @@ _impact_suites_for_files() {
         done < "$map_conf"
     fi
 
-    # Collect matched suites (deduped). Precedence per file:
-    #   exact > glob/prefix > naming heuristic > [default] (fail safe).
+    # Collect matched suites (deduped). Exact and every matching glob/prefix
+    # entry are unioned; only a file with no explicit match uses the naming
+    # heuristic, then [default] as the fail-safe.
     declare -A _seen=()
     for f in "$@"; do
         local suites=""
         if [ -n "${_fmap[$f]+x}" ]; then
             suites="${_fmap[$f]}"
-        else
-            # Glob/prefix keys — union all matching patterns
-            local _i
-            for _i in "${!_pat_keys[@]}"; do
-                local _pk="${_pat_keys[$_i]}"
-                if [[ "$_pk" == */ ]]; then
-                    [[ "$f" == "$_pk"* ]] && suites="${suites:+$suites }${_pat_vals[$_i]}"
-                else
-                    # unquoted RHS is intentional: glob-match the conf key
-                    # shellcheck disable=SC2053
-                    if [[ "$f" == $_pk ]]; then
-                        suites="${suites:+$suites }${_pat_vals[$_i]}"
-                    fi
-                fi
-            done
-            if [ -z "$suites" ]; then
-                # Naming-convention heuristic (Weave's own layout)
-                case "$f" in
-                    scripts/cmd/wv-cmd-*.sh)
-                        local base; base=$(basename "$f" .sh)
-                        suites="tests/test-${base#wv-cmd-}.sh" ;;
-                    scripts/lib/*.sh | scripts/wv)
-                        suites="tests/test-hooks.sh tests/test-graph.sh" ;;
-                    scripts/hooks/*)
-                        suites="tests/test-hooks.sh" ;;
-                    tests/test-*.sh)
-                        suites="$f" ;;
-                esac
-            fi
-            # Fail safe: a configured [default] suite beats running nothing
-            [ -z "$suites" ] && suites="$_default_suites"
         fi
+        # Glob/prefix keys — union all matching patterns, including when an
+        # exact row exists. This is the monotonic routing invariant.
+        local _i
+        for _i in "${!_pat_keys[@]}"; do
+            local _pk="${_pat_keys[$_i]}"
+            if [[ "$_pk" == */ ]]; then
+                [[ "$f" == "$_pk"* ]] && suites="${suites:+$suites }${_pat_vals[$_i]}"
+            else
+                # unquoted RHS is intentional: glob-match the conf key
+                # shellcheck disable=SC2053
+                if [[ "$f" == $_pk ]]; then
+                    suites="${suites:+$suites }${_pat_vals[$_i]}"
+                fi
+            fi
+        done
+        if [ -z "$suites" ]; then
+            # Naming-convention heuristic (Weave's own layout)
+            case "$f" in
+                scripts/cmd/wv-cmd-*.sh)
+                    local base; base=$(basename "$f" .sh)
+                    suites="tests/test-${base#wv-cmd-}.sh" ;;
+                scripts/lib/*.sh | scripts/wv)
+                    suites="tests/test-hooks.sh tests/test-graph.sh" ;;
+                scripts/hooks/*)
+                    suites="tests/test-hooks.sh" ;;
+                tests/test-*.sh)
+                    suites="$f" ;;
+            esac
+        fi
+        # Fail safe: a configured [default] suite beats running nothing
+        [ -z "$suites" ] && suites="$_default_suites"
         local s
         for s in $suites; do
             _seen["$s"]=1

@@ -148,6 +148,19 @@ assert_not_contains "$output" "approx_tokens" "legacy ambiguous token estimate n
 show_estimate=$(printf '%s' "$output" | jq -r '.call_stats[] | select(.cmd == "wv show") | .estimated_output_tokens')
 assert_eq "4250" "$show_estimate" "output token estimate derives from stdout bytes only"
 
+# ───────────────────────────────────────────────────────────────────────────
+# Checkpoint overlap is exposed through the CLI without changing its report.
+# ───────────────────────────────────────────────────────────────────────────
+checkpoint_help=$($WV analyze --help 2>&1)
+assert_contains "$checkpoint_help" "checkpoints" "analyze help lists checkpoint overlap"
+direct_checkpoints=$(python3 "$REPO_ROOT/profiling/checkpoint_overlap.py" \
+    --days=1 --log="$LOG" --repo="$REPO_ROOT" --json)
+cli_checkpoints=$($WV analyze checkpoints \
+    --days=1 --log="$LOG" --repo="$REPO_ROOT" --json)
+assert_eq "$(printf '%s' "$direct_checkpoints" | jq -S .)" \
+    "$(printf '%s' "$cli_checkpoints" | jq -S .)" \
+    "wv analyze checkpoints preserves the script report"
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Windowing + sync exclusion (wv-079d76 — era-blind call-stats)
 # Fixture: one 30-day-old entry, one fresh entry, one fresh sync entry,
