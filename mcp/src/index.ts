@@ -1095,6 +1095,11 @@ const TOOLS: Tool[] = [
           type: "boolean",
           description: "Include done nodes (default: false)",
         },
+        claimed_by: {
+          type: "string",
+          description:
+            "Filter by claim owner. Use 'current' for the nodes this agent holds, or an explicit agent id. Excludes another agent's claims.",
+        },
         mode: {
           type: "string",
           enum: ["bootstrap", "discover", "execute", "full"],
@@ -2405,10 +2410,12 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     let result: string;
     const status = normalizeStatus(args.status as string | undefined);
     const all = args.all as boolean | undefined;
+    const claimedBy = args.claimed_by as string | undefined;
     const mode = args.mode as ReadMode | undefined;
     const cmd = ["list", "--json-v2"];
     if (status) cmd.push(`--status=${status}`);
     if (all) cmd.push("--all");
+    if (claimedBy) cmd.push(`--claimed-by=${claimedBy}`);
     result = wvRead(cmd, WV_TIMEOUT, mode);
     return result;
   },
@@ -3205,7 +3212,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
           "weave_quality_patterns promote: this call creates Weave nodes and is not available in " +
             'the read-only "inspect" scope. Review here (canonical defaults to dry-run, and legacy ' +
             "promote accepts dry_run), then run the mutating call from the graph scope, which " +
-            "authorizes mutation.",
+            "authorizes mutation."
         );
       }
       // Apply takes its review parent from the reviewed plan, so parent is

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-import configparser
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -109,6 +108,16 @@ from weave_quality.prose_rules import (
     validate_pattern_rule,
 )
 from weave_quality.python_parser import analyze_python_file
+
+# Re-exported deliberately: rule loading now lives in pattern_loader so the
+# evidence adapter can reach it without importing this module, but the names
+# stay bound here because this module's own call sites -- and the tests that
+# patch them -- resolve them through this namespace.
+from weave_quality.pattern_loader import (
+    _DEFAULT_PATTERNS_DIR,
+    _disabled_patterns,
+    _load_pattern_rules,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1239,8 +1248,10 @@ def _cmd_promote_patterns_canonical(args: argparse.Namespace) -> int:
     recomputing a plan: a plan recomputed at apply time can differ from the one a
     human reviewed, and then the review approved something else.
     """
-    from .coaching_apply import ApplyError, apply_plan, default_runner
-    from .coaching_evidence import EvidenceError, build_promotion_input
+    # Lazy: coaching_evidence imports back from this module, so a top-level
+    # import here would close the cycle at import time.
+    from .coaching_apply import ApplyError, apply_plan, default_runner  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+    from .coaching_evidence import EvidenceError, build_promotion_input  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
 
     if args.apply and args.dry_run:
         print("Error: --apply and --dry-run are mutually exclusive.", file=sys.stderr)
@@ -1301,7 +1312,7 @@ def _cmd_promote_patterns_canonical(args: argparse.Namespace) -> int:
         return 1
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from weave_coaching import plan_promotions  # noqa: PLC0415
+    from weave_coaching import plan_promotions  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
 
     plan = plan_promotions(document)
     if args.json:
@@ -1322,9 +1333,9 @@ def cmd_coaching_render(args: argparse.Namespace) -> int:
     exists to remove, so the projection is bounded here and embedded there.
     """
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from weave_coaching import view  # noqa: PLC0415
+    from weave_coaching import view  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
 
-    from .guides import GuideError, resolve  # noqa: PLC0415
+    from .guides import GuideError, resolve  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
 
     code, out = _wv_cmd("findings", "list", "--all", "--json")
     if code != 0:
@@ -1724,7 +1735,7 @@ def cmd_context_files(args: argparse.Namespace) -> None:
 # Patterns commands (wv quality patterns scan / list)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_PATTERNS_DIR = Path(__file__).parent / "default_patterns"
+
 
 
 def _rule_source(rule_path: Path) -> str:
@@ -1741,82 +1752,6 @@ def _rule_source(rule_path: Path) -> str:
     if rule_path.parent.name == "managed":
         return "managed"
     return "custom"
-
-
-def _load_pattern_rules(
-    repo: Path, conf_disabled: set[str]
-) -> list[tuple[str, Path, str]]:
-    """Return [(rule_id, rule_path, language)] for all active pattern rules.
-
-    Loads from:
-      1. _DEFAULT_PATTERNS_DIR (built-in curated rules)
-      2. <repo>/.weave/patterns/managed/*.yaml (projected by wv init-repo)
-      3. <repo>/.weave/patterns/*.yaml (user-defined rules)
-    Rules whose id appears in conf_disabled are skipped.
-
-    language is captured here from validate_pattern_rule's own return value
-    (it already reads and parses the file to validate it) instead of being
-    re-derived later by a separate rule_language(rule_path) call. A second,
-    unguarded read raced a rule file that vanished or became unreadable
-    between validation and classification: rule_language() swallows OSError
-    into "", which silently misclassified an already-validated prose rule as
-    a code rule -- one that could then be dropped from `rules` entirely
-    before ever reaching the per-rule execution boundary that would
-    otherwise record a failed receipt (see wv-dc2e44).
-    """
-    rules: list[tuple[str, Path, str]] = []
-    patterns_dir = repo / ".weave" / "patterns"
-    seen: dict[str, Path] = {}
-    for rule_dir in (
-        _DEFAULT_PATTERNS_DIR,
-        patterns_dir / "managed",
-        patterns_dir,
-    ):
-        if not rule_dir.is_dir():
-            continue
-        # A rule file the loader will not read must SAY SO. Only *.yaml is
-        # loaded, so a perfectly valid rule saved as .yml never ran and scan,
-        # list and validate all stayed silent with exit 0 -- the author had no
-        # way to learn their rule was inert. Reported rather than loaded:
-        # silently activating files that were never executing would change gate
-        # outcomes in existing repos without anyone asking for it.
-        for stray in sorted(rule_dir.glob("*.yml")):
-            print(
-                f"patterns: ignoring {stray}: rule files must use the .yaml "
-                f"extension; rename it to {stray.with_suffix('.yaml').name} "
-                "for it to be loaded",
-                file=sys.stderr,
-            )
-        for yf in sorted(rule_dir.glob("*.yaml")):
-            rule_id = yf.stem
-            language = validate_pattern_rule(yf, rule_id)
-            if rule_id in conf_disabled:
-                continue
-            if rule_id in seen:
-                # Finding N: this used to raise, which aborted the whole load
-                # and took every rule down with it -- a repo attempting a local
-                # override lost all of its register gates at once until it
-                # worked out that its own patch was the cause. Degrade instead:
-                # keep the earlier tier's rule (defaults and managed are the
-                # shared, curated ones) and skip the colliding file.
-                #
-                # Deliberately NOT last-tier-wins. Silently swapping a shared
-                # rule's definition is the trap the nowcast register hit, where
-                # a local copy shadowed a managed rule and was never applied.
-                # `patterns validate` still reports the collision as invalid,
-                # so the loader degrading and the linter being strict agree
-                # that the file is unusable -- they just differ on blast radius.
-                print(
-                    f"patterns: ignoring {yf}: duplicate pattern id {rule_id!r} "
-                    f"already defined by {seen[rule_id]}; "
-                    "rename the rule or remove one copy "
-                    "(run 'wv quality patterns validate' to list every collision)",
-                    file=sys.stderr,
-                )
-                continue
-            seen[rule_id] = yf
-            rules.append((rule_id, yf, language))
-    return rules
 
 
 def _shadowed_managed_pattern_ids(repo: Path) -> list[str]:
@@ -2042,20 +1977,6 @@ def _pattern_execution_error(exc: PatternRuleExecutionError, json_out: bool) -> 
     else:
         print(f"patterns: rule execution failed: {exc}", file=sys.stderr)
     return 1
-
-
-def _disabled_patterns(conf_path: Path) -> set[str]:
-    """Read [patterns] disabled = ... from quality.conf."""
-    disabled: set[str] = set()
-    if not conf_path.exists():
-        return disabled
-    cp = configparser.ConfigParser(inline_comment_prefixes=("#",), allow_no_value=True)
-    cp.read(str(conf_path))
-    raw = cp.get("patterns", "disabled", fallback="")
-    for item in raw.replace(",", " ").split():
-        if item.strip():
-            disabled.add(item.strip())
-    return disabled
 
 
 def _validate_ast_grep_match(match: dict[str, object], rule_path: Path, target: Path) -> None:

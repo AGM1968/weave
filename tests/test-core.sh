@@ -491,6 +491,32 @@ test_done() {
     show_meta=$("$WV" show "$id" --json 2>&1)
     assert_contains "$show_meta" "always test your code" "done --learning stores in metadata"
 
+    # Regression (wv-a0a219): documented explicit learning flags were accepted
+    # but discarded. Cover both nowcast probes that exposed the silent loss.
+    local explicit_id explicit_output explicit_meta flags_only_id flags_only_output flags_only_meta
+    explicit_id=$("$WV" add "Task with explicit learning fields" --force 2>&1 | node_id_from_output)
+    explicit_output=$("$WV" done "$explicit_id" --learning="hygiene: explicit fields survive" \
+        --decision="choose the direct parser" --pattern="persist every documented flag" \
+        --pitfall="successful closes can hide discarded values" 2>&1)
+    explicit_meta=$("$WV" show "$explicit_id" --json 2>&1)
+    assert_contains "$explicit_output" "Learning saved: decision, pattern, pitfall, learning" \
+        "done reports learning plus every explicit field it persisted"
+    assert_contains "$explicit_meta" "choose the direct parser" "done --decision persists"
+    assert_contains "$explicit_meta" "persist every documented flag" "done --pattern persists"
+    assert_contains "$explicit_meta" "successful closes can hide discarded values" "done --pitfall persists"
+    assert_contains "$explicit_meta" "hygiene: explicit fields survive" "done keeps plain --learning with explicit fields"
+
+    flags_only_id=$("$WV" add "Task with explicit fields only" --force 2>&1 | node_id_from_output)
+    flags_only_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$flags_only_id" \
+        --decision="flags count as learning" --pattern="flags-only closes retain metadata" \
+        --pitfall="never close successfully with empty fields" 2>&1)
+    flags_only_meta=$("$WV" show "$flags_only_id" --json 2>&1)
+    assert_contains "$flags_only_output" "Learning saved: decision, pattern, pitfall" \
+        "done reports every flags-only field it persisted"
+    assert_contains "$flags_only_meta" "flags count as learning" "flags-only --decision persists"
+    assert_contains "$flags_only_meta" "flags-only closes retain metadata" "flags-only --pattern persists"
+    assert_contains "$flags_only_meta" "never close successfully with empty fields" "flags-only --pitfall persists"
+
     # Done with learning/evidence file inputs for agent-safe large text
     local learning_file evidence_file file_done_id file_done_output file_done_meta
     learning_file="$TEST_DIR/done-learning.txt"
@@ -647,6 +673,19 @@ test_done() {
     ship_meta=$("$WV" show "$ship_id" --json 2>&1)
     assert_contains "$ship_meta" '"status":"done"' "ship still closes the node with --no-overlap-check"
     assert_not_contains "$ship_meta" "learning_overlap_noted" "ship forwards no-overlap-check to done"
+
+    local ship_flags_id ship_flags_exit ship_flags_meta
+    ship_flags_id=$("$WV" add "Ship explicit learning fields" --force 2>&1 | node_id_from_output)
+    ship_flags_exit=0
+    WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" ship "$ship_flags_id" \
+        --decision="ship forwards decisions" --pattern="ship forwards patterns" \
+        --pitfall="ship must not discard documented flags" --no-overlap-check \
+        >/dev/null 2>&1 || ship_flags_exit=$?
+    assert_equals "0" "$ship_flags_exit" "ship accepts explicit learning flags"
+    ship_flags_meta=$("$WV" show "$ship_flags_id" --json 2>&1)
+    assert_contains "$ship_flags_meta" "ship forwards decisions" "ship --decision persists"
+    assert_contains "$ship_flags_meta" "ship forwards patterns" "ship --pattern persists"
+    assert_contains "$ship_flags_meta" "ship must not discard documented flags" "ship --pitfall persists"
 
     ship_status=$("$WV" status --json 2>&1)
     assert_contains "$ship_status" '"git_sync_pending": true' "ship leaves pending remote sync surfaced in status"
@@ -903,10 +942,14 @@ test_list() {
     "$WV" init >/dev/null 2>&1
 
     # Create nodes with different statuses
-    local id1 id2 id3
+    local id1 id2 id3 agent_a_id agent_b_id
     id1=$("$WV" add "Todo task" --status=todo --force 2>&1 | node_id_from_output)
     id2=$("$WV" add "Active task" --status=active --criteria="tests pass" --risks=low --force 2>&1 | node_id_from_output)
     id3=$("$WV" add "Done task" --status=done --force 2>&1 | node_id_from_output)
+    agent_a_id=$(WV_AGENT_ID="agent-a" "$WV" add "Agent A active task" --status=active \
+        --criteria="agent filter works" --risks=low --force 2>&1 | node_id_from_output)
+    agent_b_id=$(WV_AGENT_ID="agent-b" "$WV" add "Agent B active task" --status=active \
+        --criteria="agent filter works" --risks=low --force 2>&1 | node_id_from_output)
 
     # Default list excludes done
     local output
@@ -941,6 +984,16 @@ test_list() {
     output=$("$WV" list --status=active 2>&1)
     assert_contains "$output" "$id2" "list --status=active shows active"
     assert_not_contains "$output" "$id1" "list --status=active excludes todo"
+
+    output=$("$WV" list --status=active --claimed-by=agent-a --json 2>/dev/null)
+    assert_contains "$output" "$agent_a_id" "list --claimed-by accepts an explicit agent ID"
+    assert_not_contains "$output" "$agent_b_id" "list --claimed-by excludes other agents"
+
+    output=$(WV_AGENT_ID="agent-b" "$WV" list --status=active --claimed-by=current --json 2>/dev/null)
+    assert_contains "$output" "$agent_b_id" "list --claimed-by=current resolves the acting agent"
+    assert_not_contains "$output" "$agent_a_id" "current sentinel excludes foreign claims"
+
+    assert_fails "list rejects an empty --claimed-by value" "$WV" list --claimed-by=
 }
 
 # ============================================================================

@@ -10,17 +10,16 @@ are behaviours of code that ships today:
   missing edge reports success.
 """
 
+# pylint: disable=missing-class-docstring,missing-function-docstring,redefined-outer-name,unused-argument
+
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-
-from weave_quality.coaching_apply import (  # noqa: E402
+from weave_quality.coaching_apply import (
     ApplyError,
     apply_plan,
     metadata_patch,

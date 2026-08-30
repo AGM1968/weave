@@ -4,6 +4,27 @@
 
 ## Unreleased
 
+## [1.71.0-rc.10] - 2026-08-30
+
+Canary-driven workflow correctness prerelease. Documented close fields are no longer silently
+discarded, concurrent agents no longer attach one another's active work to commits, and every
+shipping surface now exposes and installs the same corrected workflow.
+
+### Fixed
+
+- Persist `wv done` and `wv ship` values supplied through `--decision`, `--pattern`, and
+  `--pitfall`, including flags-only closes and closes that also carry a plain `--learning` value.
+- Add `wv list --claimed-by=<agent-id>|current` and use the current-agent filter in the managed
+  `prepare-commit-msg` hook. One agent's multiple active nodes are all attributed while foreign
+  claims are excluded.
+- Expose the claim-owner filter through MCP `weave_list`, so MCP clients can use the actor-scoped
+  contract rather than the unfiltered list surface.
+- Move active quality-rule loading into a cycle-free shared module and register that module in the
+  installer's fallback manifest, preventing API-unavailable installs from shipping an incomplete
+  `weave_quality` package.
+- Reconcile MCP documentation and workflow assertions with the server's 46-tool contract, and
+  restore a fully green release gate with pylint cyclic-import checking enabled.
+
 ## [1.71.0-rc.9] - 2026-08-27
 
 Corrective distribution prerelease. The public projection no longer imposes Poetry on consumers,

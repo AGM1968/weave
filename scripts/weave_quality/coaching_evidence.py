@@ -33,6 +33,10 @@ from pathlib import Path
 from typing import Any
 
 from . import guides
+# The CLI's own definition of which rules are active, shared rather than
+# re-derived: deriving it separately would let this adapter and the scan that
+# produced the receipts disagree about the rule set they are discussing.
+from .pattern_loader import _disabled_patterns, _load_pattern_rules
 from .db import (
     db_path,
     init_db,
@@ -338,14 +342,6 @@ def build_promotion_input(
     language: str | None = None,
 ) -> dict[str, Any]:
     """Assemble the promotion input document for a reviewed scope."""
-    # Imported here, not at module scope: this is the CLI's own definition of
-    # which rules are active. Re-deriving it would let this adapter and the scan
-    # that produced the receipts disagree about the rule set they are discussing.
-    from .__main__ import (  # noqa: PLC0415
-        _disabled_patterns,
-        _load_pattern_rules,
-    )
-
     if not db_path(hot_zone).exists():
         raise EvidenceError("no quality database; run: wv quality patterns scan", "no_database")
 
@@ -405,6 +401,6 @@ def build_promotion_input(
             key: definition_bindings[key]
             for key in sorted(rule_ids & set(definition_bindings))
         },
-        "rule_violation_types": {k: v for k, v in sorted(mapping.items())},
+        "rule_violation_types": dict(sorted(mapping.items())),
         "resolved_guides": resolved,
     }

@@ -1503,6 +1503,9 @@ assert_exit_code "0" "$EXIT_CODE" "git pre-commit: discover phase allows .weave/
 
 setup_test_env
 HOOK_ID=$(add_active_node "Prepare hook task" --criteria="hook adds trailer|smoke passes" --risks=low 2>/dev/null | tail -1)
+HOOK_ID_2=$(add_active_node "Second prepare hook task" --criteria="multi-claim hook adds trailer" --risks=low 2>/dev/null | tail -1)
+FOREIGN_HOOK_ID=$(WV_AGENT_ID="codex-other-session" add_active_node "Foreign prepare hook task" \
+    --criteria="foreign claim is excluded" --risks=low 2>/dev/null | tail -1)
 MSG_FILE="$TEST_DIR/project/COMMIT_EDITMSG"
 printf 'hook smoke\n' > "$MSG_FILE"
 set +e
@@ -1512,6 +1515,8 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "prepare-commit-msg hook exits 0"
 MSG_CONTENT=$(cat "$MSG_FILE")
 assert_contains "$MSG_CONTENT" "Weave-ID: $HOOK_ID" "prepare-commit-msg hook appends active Weave-ID"
+assert_contains "$MSG_CONTENT" "Weave-ID: $HOOK_ID_2" "prepare-commit-msg hook appends every current-agent active ID"
+assert_not_contains "$MSG_CONTENT" "Weave-ID: $FOREIGN_HOOK_ID" "prepare-commit-msg hook excludes foreign-agent active IDs"
 
 # ============================================================
 # INTEGRATION TEST: Full session lifecycle

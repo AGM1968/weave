@@ -133,7 +133,11 @@ def metadata_patch(current_metadata: dict[str, Any], desired: dict[str, Any]) ->
     same node survives untouched -- it is neither carried into the patch nor
     nulled out of existence.
     """
-    return _merge_patch(owned_projection(current_metadata), desired)
+    # Both arguments are dicts, so _merge_patch takes its mapping branch and
+    # returns the dict it builds; its `Any` return exists for the recursive
+    # scalar case, which is unreachable from here.
+    patch: dict[str, Any] = _merge_patch(owned_projection(current_metadata), desired)
+    return patch
 
 
 def _node_metadata(node: dict[str, Any]) -> dict[str, Any]:
@@ -240,6 +244,7 @@ def candidate_metadata(candidate: dict[str, Any], digest: str) -> dict[str, Any]
 
 
 def candidate_text(candidate: dict[str, Any]) -> str:
+    """The node text for a promoted candidate, counting its occurrences."""
     count = len(candidate["occurrences"])
     noun = "occurrence" if count == 1 else "occurrences"
     return f"Finding: {candidate['violation_type']} ({count} {noun})"

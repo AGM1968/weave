@@ -287,6 +287,28 @@ class TestFunctionCC:
         _, fn_cc = analyze_bash_source(source, "test.sh")
         assert not fn_cc
 
+    def test_bare_invocation_is_not_a_function(self) -> None:
+        source = _src("""
+            action()
+            if true; then
+                echo "still top-level"
+            fi
+        """)
+        entry, fn_cc = analyze_bash_source(source, "test.sh")
+        assert entry.functions == 0
+        assert not fn_cc
+
+    def test_brace_on_next_line_is_a_function(self) -> None:
+        source = _src("""
+            action()
+            {
+                echo "function body"
+            }
+        """)
+        entry, fn_cc = analyze_bash_source(source, "test.sh")
+        assert entry.functions == 1
+        assert fn_cc[0].function_name == "action"
+
 
 # ---------------------------------------------------------------------------
 # Coupling metrics

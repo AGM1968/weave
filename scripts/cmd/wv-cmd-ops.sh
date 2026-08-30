@@ -3501,27 +3501,57 @@ cmd_doctor() {
         _doctor_record "database" "warn" "no active database"
     fi
 
-    # 10b. FTS5 index integrity (PRAGMA integrity_check misses FTS5 shadow tables)
+    # 10b. FTS5 index integrity.
+    #
+    # Two probes, because they catch different things and the cheap one is blind
+    # to the failure this repo actually hits:
+    #
+    #   'integrity-check' validates the index against ITSELF. It passed during
+    #   both live incidents (wv-44993d 2026-08-08, again 2026-08-27) while
+    #   UPDATE nodes was throwing SQLITE_CORRUPT graph-wide, so on its own it is
+    #   not a detector for this class.
+    #
+    #   The orphan probe compares index docids against real node rowids. That is
+    #   the actual divergence: nodes_fts is external-content over a TEXT-primary-key
+    #   table, so an INSERT OR REPLACE (delta replay) moves the rowid, and with
+    #   recursive_triggers OFF the implicit delete never fires nodes_ad -- stranding
+    #   an index entry at the old rowid. Silent until nodes_au trips on it.
+    #   Root cause and the load-path fix: wv-d2e6c6.
     if [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ]; then
-        local fts5_ok
+        local fts5_ok fts5_orphans
         fts5_ok=$(sqlite3 "$WV_DB" \
             "INSERT INTO nodes_fts(nodes_fts) VALUES('integrity-check');" 2>&1)
-        if [ -z "$fts5_ok" ]; then
-            _doctor_record "FTS5 index" "pass" "integrity OK"
+        fts5_orphans=$(sqlite3 "$WV_DB" \
+            "CREATE VIRTUAL TABLE temp.wv_fv USING fts5vocab(main, nodes_fts, instance);
+             SELECT count(DISTINCT doc) FROM temp.wv_fv
+             WHERE doc NOT IN (SELECT rowid FROM nodes);" 2>/dev/null || echo "")
+        [ -n "$fts5_orphans" ] || fts5_orphans=0
+        if [ -z "$fts5_ok" ] && [ "$fts5_orphans" -eq 0 ] 2>/dev/null; then
+            _doctor_record "FTS5 index" "pass" "integrity OK; no orphaned index entries"
         else
+            local _fts5_why="corrupt"
+            [ "$fts5_orphans" -gt 0 ] 2>/dev/null \
+                && _fts5_why="${fts5_orphans} orphaned index entries (rowids with no node)"
             if [ "$_dr_repair" = "true" ]; then
+                # 'rebuild' re-derives from nodes for an external-content table,
+                # so it discards orphans outright.
                 sqlite3 "$WV_DB" \
                     "INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');" 2>/dev/null
-                local fts5_recheck
+                local fts5_recheck fts5_orphans_recheck
                 fts5_recheck=$(sqlite3 "$WV_DB" \
                     "INSERT INTO nodes_fts(nodes_fts) VALUES('integrity-check');" 2>&1)
-                if [ -z "$fts5_recheck" ]; then
+                fts5_orphans_recheck=$(sqlite3 "$WV_DB" \
+                    "CREATE VIRTUAL TABLE temp.wv_fv2 USING fts5vocab(main, nodes_fts, instance);
+                     SELECT count(DISTINCT doc) FROM temp.wv_fv2
+                     WHERE doc NOT IN (SELECT rowid FROM nodes);" 2>/dev/null || echo "")
+                [ -n "$fts5_orphans_recheck" ] || fts5_orphans_recheck=0
+                if [ -z "$fts5_recheck" ] && [ "$fts5_orphans_recheck" -eq 0 ] 2>/dev/null; then
                     _doctor_record "FTS5 index" "pass" "repaired (rebuilt)"
                 else
                     _doctor_record "FTS5 index" "fail" "repair failed — manual: wv reindex"
                 fi
             else
-                _doctor_record "FTS5 index" "fail" "corrupt — run: wv doctor --repair"
+                _doctor_record "FTS5 index" "fail" "${_fts5_why} — run: wv doctor --repair"
             fi
         fi
     fi
@@ -6586,7 +6616,7 @@ cmd_help_topic() {
             print_command_help "wv ready [--json | --json-v2] [--count] [--all] [--with-impact] [--findings] [--subtree=<id>] [--mode=bootstrap|discover|execute|full]" "List unblocked work. --with-impact ranks by blast radius (wv impact per node); --subtree=<id> scopes to a node's descendants; --findings includes the findings digest."
             ;;
         list)
-            print_command_help "wv list [--all] [--status=<status>] [--json | --json-v2] [--mode=bootstrap|discover|execute|full]" "List nodes, excluding done by default. Use --json-v2 for the lean parsed-metadata shape."
+            print_command_help "wv list [--all] [--status=<status>] [--claimed-by=<agent-id>|current] [--json | --json-v2] [--mode=bootstrap|discover|execute|full]" "List nodes, excluding done by default. Use --claimed-by=current for nodes owned by this agent and --json-v2 for the lean parsed-metadata shape."
             ;;
         show)
             print_command_help "wv show <id> [--json | --json-v2] [--mode=bootstrap|discover|execute|full]" "Show node details in text or JSON. --json-v2 returns the lean parsed-metadata shape."
@@ -6864,6 +6894,7 @@ Options:
   --max=N           Max references to extract (refs, default 10)
   --limit=N         Max results to return (search, default 10)
   --status=<status> Filter by status (search)
+  --claimed-by=<id>|current  Filter list by claim owner
   --link            Create edges for detected refs (refs, requires --from)
   --from=<id>       Source node for edge creation (refs --link)
   --interactive     Prompt for non-auto refs in link mode (refs --link)

@@ -1300,6 +1300,28 @@ EOF
                         # would emit a delta containing all of them — snowballing the
                         # same changes across all agents indefinitely.
                         wv_delta_reset "$WV_DB"
+                        # Re-derive nodes_fts AFTER replay, not only before it.
+                        #
+                        # db_rebuild_fts ran earlier against the state.sql import, so
+                        # the index was consistent at that point. Replay then applies
+                        # INSERT OR REPLACE INTO nodes. For a TEXT-PRIMARY-KEY table
+                        # the rowid is implicit, so REPLACE deletes the conflicting
+                        # row (new rowid) — and SQLite only fires DELETE triggers for
+                        # that implicit delete when recursive_triggers is ON, which it
+                        # is not (it is set nowhere in this codebase). So nodes_ad
+                        # never runs, nodes_ai does, and every replaced node strands an
+                        # orphaned nodes_fts entry at its old rowid.
+                        #
+                        # Orphans are invisible to both PRAGMA integrity_check and
+                        # FTS5 'integrity-check' — they surface only later, as
+                        # SQLITE_CORRUPT from the nodes_au sync trigger on ANY
+                        # UPDATE to nodes, which takes out wv done graph-wide
+                        # (wv-44993d 2026-08-08, again 2026-08-27; root cause wv-d2e6c6).
+                        #
+                        # 'rebuild' re-derives from nodes for an external-content
+                        # table, so it discards orphans outright. Idempotent, and only
+                        # paid when deltas actually replayed.
+                        db_rebuild_fts
                         echo -e "${GREEN}✓${NC} Replayed $delta_count delta(s)" >&2
                     fi
                 fi

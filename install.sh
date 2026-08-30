@@ -786,7 +786,7 @@ else
         # a module missing here installs a package that imports and then fails at
         # runtime, and this list had already drifted twice before that check
         # existed.
-        quality_modules="__init__.py __main__.py ast_cache.py bash_ast_grep.py bash_heuristic.py classification.py coaching_apply.py coaching_evidence.py db.py external_tools.py findings.py git_metrics.py guides.py hotspots.py models.py prose_rules.py python_parser.py typescript_parser.py"
+        quality_modules="__init__.py __main__.py ast_cache.py bash_ast_grep.py bash_heuristic.py classification.py coaching_apply.py coaching_evidence.py db.py external_tools.py findings.py git_metrics.py guides.py hotspots.py models.py pattern_loader.py prose_rules.py python_parser.py typescript_parser.py"
     fi
     for pyfile in $quality_modules; do
         download_file "$REPO/scripts/weave_quality/${pyfile}" "$LIB_DIR/weave_quality/${pyfile}"

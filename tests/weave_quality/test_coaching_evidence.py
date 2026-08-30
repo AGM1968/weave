@@ -11,28 +11,30 @@ filter that silently matches nothing, a snapshot that reports complete while the
 receipts say otherwise.
 """
 
+# `== []` is deliberate throughout: these assertions pin an empty list, not
+# merely a falsey value, which `not x` would weaken to.
+# pylint: disable=missing-class-docstring,missing-function-docstring,redefined-outer-name
+# pylint: disable=use-implicit-booleaness-not-comparison,too-few-public-methods
+
 from __future__ import annotations
 
 import argparse
 import json
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-
-from weave_coaching import plan_promotions  # noqa: E402
-from weave_quality.__main__ import cmd_patterns_scan  # noqa: E402
-from weave_quality.coaching_evidence import (  # noqa: E402
+from weave_coaching import plan_promotions
+from weave_quality.__main__ import cmd_patterns_scan
+from weave_quality.coaching_evidence import (
     EvidenceError,
     _package_rule_manifest,
     build_promotion_input,
 )
-from weave_quality.db import (  # noqa: E402
+from weave_quality.db import (
     adjudicate_pattern_finding,
     init_db,
     latest_pattern_run,

@@ -12,7 +12,7 @@ REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || exit 0)
 WV="$(command -v wv 2>/dev/null || echo "$REPO_ROOT/scripts/wv")"
 [ ! -x "$WV" ] && exit 0
 
-ACTIVE_IDS=$("$WV" list --status=active --json 2>/dev/null | jq -r '.[].id' 2>/dev/null)
+ACTIVE_IDS=$("$WV" list --status=active --claimed-by=current --json 2>/dev/null | jq -r '.[].id' 2>/dev/null)
 [ -z "$ACTIVE_IDS" ] && exit 0
 grep -q "^Weave-ID:" "$COMMIT_MSG_FILE" 2>/dev/null && exit 0
 

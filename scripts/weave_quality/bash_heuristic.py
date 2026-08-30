@@ -135,9 +135,13 @@ def _find_function_ranges(lines: list[str]) -> list[tuple[int, int]]:
     """
     ranges: list[tuple[int, int]] = []
     for i, line in enumerate(lines):
-        if _FUNC_PATTERN.match(line):
-            end = _find_function_end(lines, i)
-            ranges.append((i, end))
+        if not _FUNC_PATTERN.match(line):
+            continue
+        stripped = line.strip()
+        if "{" not in stripped and (i + 1 >= len(lines) or lines[i + 1].strip() != "{"):
+            continue
+        end = _find_function_end(lines, i)
+        ranges.append((i, end))
     return ranges
 
 

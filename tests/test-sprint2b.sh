@@ -290,6 +290,46 @@ test_breadcrumbs() {
     learning_exists=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='nodes_learning_fts';" 2>/dev/null)
     assert_equals "1" "$learning_exists" "nodes_learning_fts table exists again after doctor --repair"
 
+    # wv-d2e6c6: the orphaned-index-entry class. A dropped table (above) is the
+    # easy case. The failure that actually took out `wv done` graph-wide twice is
+    # subtler: nodes_fts is external-content over a TEXT-primary-key table, so an
+    # INSERT OR REPLACE -- what delta replay emits -- moves the node's implicit
+    # rowid, and with recursive_triggers OFF the implicit delete never fires
+    # nodes_ad. The index entry at the OLD rowid is stranded, and BOTH
+    # PRAGMA integrity_check and FTS5 'integrity-check' still report ok.
+    local orphan_target
+    orphan_target=$(sqlite3 "$WV_DB" "SELECT id FROM nodes LIMIT 1;" 2>/dev/null)
+    sqlite3 "$WV_DB" "INSERT OR REPLACE INTO nodes(id,text,status,metadata)
+                      SELECT id,text,status,metadata FROM nodes WHERE id='$orphan_target';"
+
+    local orphan_count fts_self_check
+    orphan_count=$(sqlite3 "$WV_DB" \
+        "CREATE VIRTUAL TABLE temp.t_fv USING fts5vocab(main, nodes_fts, instance);
+         SELECT count(DISTINCT doc) FROM temp.t_fv WHERE doc NOT IN (SELECT rowid FROM nodes);" 2>/dev/null)
+    assert_equals "1" "$orphan_count" "INSERT OR REPLACE strands an orphaned nodes_fts entry"
+
+    # The probe doctor used to rely on: proves it cannot see this class.
+    fts_self_check=$(sqlite3 "$WV_DB" "INSERT INTO nodes_fts(nodes_fts) VALUES('integrity-check');" 2>&1)
+    assert_equals "" "$fts_self_check" "FTS5 'integrity-check' reports clean despite the orphan (why it is not a detector)"
+
+    # doctor exits non-zero when a check fails -- which is the whole point here,
+    # so tolerate it rather than letting set -e abort the suite.
+    local orphan_out orphan_status orphan_detail
+    orphan_out=$("$WV" doctor --json 2>/dev/null || true)
+    orphan_status=$(echo "$orphan_out" | jq -r '.checks[] | select(.check=="FTS5 index") | .status' 2>/dev/null)
+    orphan_detail=$(echo "$orphan_out" | jq -r '.checks[] | select(.check=="FTS5 index") | .detail' 2>/dev/null)
+    assert_equals "fail" "$orphan_status" "doctor detects an orphaned nodes_fts entry"
+    assert_contains "$orphan_detail" "orphaned" "doctor names the orphan class, not a generic corruption"
+
+    local orphan_repair orphan_repair_status orphan_after
+    orphan_repair=$("$WV" doctor --repair --json 2>/dev/null)
+    orphan_repair_status=$(echo "$orphan_repair" | jq -r '.checks[] | select(.check=="FTS5 index") | .status' 2>/dev/null)
+    assert_equals "pass" "$orphan_repair_status" "doctor --repair clears the orphaned entry"
+    orphan_after=$(sqlite3 "$WV_DB" \
+        "CREATE VIRTUAL TABLE temp.t_fv2 USING fts5vocab(main, nodes_fts, instance);
+         SELECT count(DISTINCT doc) FROM temp.t_fv2 WHERE doc NOT IN (SELECT rowid FROM nodes);" 2>/dev/null)
+    assert_equals "0" "$orphan_after" "no orphaned nodes_fts entries remain after repair"
+
     # wv-a77603: cross-agent install-drift advisory rides the bootstrap JSON that
     # every harness (Claude/Codex/Copilot) reads at session start. The isolated
     # test env has no source-path pointer, so _wv_source_drift no-ops (consumer-

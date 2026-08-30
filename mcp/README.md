@@ -29,7 +29,7 @@ node mcp/dist/index.js --scope=inspect  # read-only operations only
 
 ## Scope System
 
-The `--scope` flag partitions the 45 available tools into focused subsets. This is designed for **VS
+The `--scope` flag partitions the 46 available tools into focused subsets. This is designed for **VS
 Code's multi-server MCP architecture**, where each Copilot subagent can be given a different server
 with only the tools it needs — reducing context window usage and preventing cross-concern tool
 confusion.
@@ -42,7 +42,7 @@ confusion.
 | **session** | `weave_work`, `weave_ready`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_close_session`, `weave_trails`, `weave_breadcrumbs` (deprecated alias), `weave_plan`, `weave_edit_guard` (12)                                                                                                                                                                                           | Workflow lifecycle management              |
 | **lite**    | `weave_overview`, `weave_bootstrap`, `weave_guide`, `weave_edit_guard`, `weave_status`, `weave_work`, `weave_done` (7)                                                                                                                                                                                                                                                                                                         | Minimal task-tracking surface              |
 | **inspect** | `weave_context`, `weave_search`, `weave_query`, `weave_status`, `weave_ready`, `weave_impact`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`, `weave_structural_search`, `weave_quality_patterns`, `weave_findings`, `weave_code_search`, `weave_index` (23) | Read-only observation and query            |
-| **all**     | All 45 tools                                                                                                                                                                                                                                                                                                                                                                                                                   | Full access (default, backward-compatible) |
+| **all**     | All 46 tools                                                                                                                                                                                                                                                                                                                                                                                                                   | Full access (default, backward-compatible) |
 
 ### Scope lifecycle
 
@@ -261,7 +261,7 @@ Optional local additions if you want stricter scope isolation:
 
 ## Available Tools
 
-### Graph scope — write operations (13 tools)
+### Graph scope — write operations (14 tools)
 
 | Tool               | Description                                                                                                                                                                                                                           | Required params      |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
@@ -291,7 +291,7 @@ Optional local additions if you want stricter scope isolation:
 | `weave_close_session` | Bounded local sync + repo-status check + unpushed commit/active-node warnings                                                                  | —               |
 | `weave_edit_guard`    | Pre-edit guard: require an active node before edits                                                                                            | —               |
 
-### Inspect scope — read-only queries (22 tools)
+### Inspect scope — read-only queries (23 tools)
 
 | Tool                      | Description                                                             | Required params |
 | ------------------------- | ----------------------------------------------------------------------- | --------------- |

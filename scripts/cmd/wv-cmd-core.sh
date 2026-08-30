@@ -1994,6 +1994,7 @@ _done_mark_pending_close() {
 
 _done_store_learning() {
     local id="$1" learning="$2" acknowledge_overlap="${3:-0}" no_overlap_check="${4:-0}"
+    local explicit_decision="${5:-}" explicit_pattern="${6:-}" explicit_pitfall="${7:-}"
     _done_skip_learning=false
     _done_pending_close=false
 
@@ -2099,9 +2100,14 @@ _done_store_learning() {
               -e 's/[Pp][Aa][Tt][Tt][Ee][Rr][Nn]:/pattern:/g' \
               -e 's/[Pp][Ii][Tt][Ff][Aa][Ll][Ll]:/pitfall:/g' 2>/dev/null) || norm_learning="$learning"
     local new_meta
-    new_meta=$(echo "$cur_meta" | jq --arg l "$norm_learning" --arg raw "$learning" '
+    new_meta=$(echo "$cur_meta" | jq \
+        --arg l "$norm_learning" \
+        --arg raw "$learning" \
+        --arg decision "$explicit_decision" \
+        --arg pattern "$explicit_pattern" \
+        --arg pitfall "$explicit_pitfall" '
         ($l | until(test("\\|\\s*\\|") | not; gsub("\\|\\s*\\|"; "|"))) as $norm |
-        if ($norm | test("^(decision|pattern|pitfall):")) then
+        (if ($norm | test("^(decision|pattern|pitfall):")) then
           ($norm | split(" | ") | map(select(length > 0) | gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | reduce .[] as $seg (
             {};
             if ($seg | test("^decision:")) then .decision = ($seg | sub("^decision:\\s*"; ""))
@@ -2118,7 +2124,9 @@ _done_store_learning() {
           . + ($parsed | to_entries | map(select(.value != null and .value != "")) | from_entries)
         else
           . + {learning: $raw}
-        end
+        end) |
+        . + ({decision: $decision, pattern: $pattern, pitfall: $pitfall}
+            | with_entries(select(.value != "")))
     ') || new_meta=$(echo "$cur_meta" | jq --arg l "$learning" '. + {learning: $l}' 2>/dev/null) || new_meta="$cur_meta"
     new_meta="${new_meta//\'/\'\'}"
     db_query "UPDATE nodes SET metadata='$new_meta', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
@@ -2358,6 +2366,9 @@ cmd_done() {
     local id="${1:-}"
     local reason=""
     local learning=""
+    local decision=""
+    local pattern=""
+    local pitfall=""
     local learning_file=""
     local no_warn=0
     local skip_verification=0
@@ -2377,6 +2388,9 @@ cmd_done() {
         case "$1" in
             --reason=*) reason="${1#*=}" ;;
             --learning=*) learning="${1#*=}" ;;
+            --decision=*) decision="${1#*=}" ;;
+            --pattern=*) pattern="${1#*=}" ;;
+            --pitfall=*) pitfall="${1#*=}" ;;
             --learning-file=*) learning_file="${1#*=}" ;;
             --no-warn) no_warn=1 ;;
             --skip-verification) skip_verification=1 ;;
@@ -2412,6 +2426,15 @@ cmd_done() {
     fi
     if [ -n "$verification_evidence_file" ]; then
         verification_evidence=$(_done_read_option_file "--verification-evidence-file" "$verification_evidence_file") || return 1
+    fi
+
+    # Explicit learning fields are first-class inputs. Build the structured
+    # form for flags-only closes so the existing overlap and hygiene checks run,
+    # then let the explicit values override any same-named inline marker.
+    if [ -z "$learning" ] && { [ -n "$decision" ] || [ -n "$pattern" ] || [ -n "$pitfall" ]; }; then
+        [ -n "$decision" ] && learning="decision: $decision"
+        [ -n "$pattern" ] && learning="${learning:+$learning | }pattern: $pattern"
+        [ -n "$pitfall" ] && learning="${learning:+$learning | }pitfall: $pitfall"
     fi
 
     if [ -z "$id" ]; then
@@ -2533,7 +2556,8 @@ cmd_done() {
     if [ -n "$learning" ]; then
         # Strip ANSI escape codes (color sequences leak from terminal output)
         learning=$(printf '%s' "$learning" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
-        _done_store_learning "$id" "$learning" "$acknowledge_overlap" "$no_overlap_check"
+        _done_store_learning "$id" "$learning" "$acknowledge_overlap" "$no_overlap_check" \
+            "$decision" "$pattern" "$pitfall"
         if [ "$_done_pending_close" = true ]; then
             return 2
         fi
@@ -3423,6 +3447,8 @@ cmd_list() {
     local status_filter=""
     local priority_filter=""
     local type_filter=""
+    local claimed_by_filter=""
+    local claimed_by_set=false
     local format="text"
     local all=false
     local limit_val=""
@@ -3433,6 +3459,7 @@ cmd_list() {
             --status=*) status_filter="${1#*=}" ;;
             --priority=*) priority_filter="${1#*=}" ;;
             --type=*) type_filter="${1#*=}" ;;
+            --claimed-by=*) claimed_by_filter="${1#*=}"; claimed_by_set=true ;;
             --limit=*) limit_val="${1#*=}" ;;
             --json)    format="json" ;;
             --json-v2) format="json-v2" ;;
@@ -3480,6 +3507,13 @@ cmd_list() {
         fi
     fi
 
+    if [ "$claimed_by_filter" = "current" ]; then
+        claimed_by_filter=$(resolve_agent_id)
+    elif [ "$claimed_by_set" = true ] && [ -z "$claimed_by_filter" ]; then
+        echo -e "${RED}Error: --claimed-by requires an agent ID or 'current'${NC}" >&2
+        return 1
+    fi
+
     # Build WHERE clause with multiple filters
     local where_clause=""
     local filters=""
@@ -3503,6 +3537,16 @@ cmd_list() {
             filters="$filters AND type = '$type_filter'"
         else
             filters="type = '$type_filter'"
+        fi
+    fi
+
+    if [ -n "$claimed_by_filter" ]; then
+        local claimed_by_escaped
+        claimed_by_escaped=$(sql_escape "$claimed_by_filter")
+        if [ -n "$filters" ]; then
+            filters="$filters AND json_extract(metadata, '$.claimed_by') = '$claimed_by_escaped'"
+        else
+            filters="json_extract(metadata, '$.claimed_by') = '$claimed_by_escaped'"
         fi
     fi
 
@@ -4548,12 +4592,16 @@ _ship_run() {
     local verification_evidence="$8"
     local verification_evidence_file="$9"
     local no_gh="${10:-false}"
+    local decision="${11:-}"
+    local pattern="${12:-}"
+    local pitfall="${13:-}"
 
     # Validate ID format
     validate_id "$id" || return 1
 
     # Reject incomplete input before creating any durable protocol state.
-    if [ -z "$learning" ] && [ -z "$learning_file" ] && [ "$skip_verification" != true ]; then
+    if [ -z "$learning" ] && [ -z "$learning_file" ] && [ -z "$decision" ] &&
+       [ -z "$pattern" ] && [ -z "$pitfall" ] && [ "$skip_verification" != true ]; then
         echo -e "${RED}Error: --learning=\"...\", --learning-file=PATH, or --skip-verification required${NC}" >&2
         echo "Usage: wv ship <id> --learning=\"decision: ... | pattern: ... | pitfall: ...\"" >&2
         return 1
@@ -4595,6 +4643,9 @@ _ship_run() {
     if [ -n "$learning_file" ]; then
         done_args+=("--learning-file=$learning_file")
     fi
+    [ -n "$decision" ] && done_args+=("--decision=$decision")
+    [ -n "$pattern" ] && done_args+=("--pattern=$pattern")
+    [ -n "$pitfall" ] && done_args+=("--pitfall=$pitfall")
     if [ -n "$verification_method" ]; then
         done_args+=("--verification-method=$verification_method")
     fi
@@ -4614,7 +4665,8 @@ _ship_run() {
     local previous_ship_close="${_WV_SHIP_DURABLE_CLOSE:-}"
     local previous_ship_close_set="${_WV_SHIP_DURABLE_CLOSE+x}"
     export _WV_SHIP_DURABLE_CLOSE=1
-    if [ -n "$learning" ] || [ -n "$learning_file" ]; then
+    if [ -n "$learning" ] || [ -n "$learning_file" ] || [ -n "$decision" ] ||
+       [ -n "$pattern" ] || [ -n "$pitfall" ]; then
         cmd_done "${done_args[@]}" || done_rc=$?
     elif [ "$skip_verification" = true ]; then
         done_args+=("--skip-verification")
@@ -4666,6 +4718,9 @@ cmd_ship() {
     local id="${1:-}"
     local learning=""
     local learning_file=""
+    local decision=""
+    local pattern=""
+    local pitfall=""
     local gh_flag=false
     local skip_verification=false
     local no_overlap_check=false
@@ -4678,6 +4733,9 @@ cmd_ship() {
         case "$1" in
             --learning=*) learning="${1#*=}" ;;
             --learning-file=*) learning_file="${1#*=}" ;;
+            --decision=*) decision="${1#*=}" ;;
+            --pattern=*) pattern="${1#*=}" ;;
+            --pitfall=*) pitfall="${1#*=}" ;;
             --gh) gh_flag=true ;;
             --skip-verification) skip_verification=true ;;
             --no-overlap-check) no_overlap_check=true ;;
@@ -4694,7 +4752,9 @@ cmd_ship() {
         return 1
     fi
 
-    _ship_run "$id" "$learning" "$learning_file" "$gh_flag" "$skip_verification" "$no_overlap_check" "$verification_method" "$verification_evidence" "$verification_evidence_file" false
+    _ship_run "$id" "$learning" "$learning_file" "$gh_flag" "$skip_verification" "$no_overlap_check" \
+        "$verification_method" "$verification_evidence" "$verification_evidence_file" false \
+        "$decision" "$pattern" "$pitfall"
 }
 
 cmd_ship_agent() {
@@ -4768,7 +4828,9 @@ cmd_ship_agent() {
     fi
 
     local ship_output ship_rc=0
-    ship_output=$(_ship_run "$id" "$learning" "$learning_file" "$gh_flag" "$skip_verification" "$no_overlap_check" "$verification_method" "$verification_evidence" "$verification_evidence_file" "$no_gh" 2>&1) || ship_rc=$?
+    ship_output=$(_ship_run "$id" "$learning" "$learning_file" "$gh_flag" "$skip_verification" \
+        "$no_overlap_check" "$verification_method" "$verification_evidence" \
+        "$verification_evidence_file" "$no_gh" "" "" "" 2>&1) || ship_rc=$?
 
     if [ -n "$prev_noninteractive" ]; then
         export WV_NONINTERACTIVE="$prev_noninteractive"
