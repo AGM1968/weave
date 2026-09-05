@@ -77,6 +77,11 @@ _wv_run_cache_is_exempt_cmd() {
         # One-time setup/teardown and clone-local Git metadata — no existing cache state to invalidate
         init|init-repo|repo-class|self-update|selftest|uninstall)
             return 0 ;;
+        # Stamps .weave/causal-cutover, a plain file outside brain.db; its own
+        # coordination-gate query is informational, not a nodes/edges mutation
+        # a cached read/list/bootstrap output would need to reflect
+        cutover)
+            return 0 ;;
         *) return 1 ;;
     esac
 }

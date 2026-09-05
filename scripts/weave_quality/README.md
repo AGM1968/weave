@@ -199,6 +199,8 @@ zero.
 wv quality patterns scan              # scan with all known rules, print findings table
 wv quality patterns scan --json       # machine-readable output
 wv quality patterns list              # list loaded rule IDs and their descriptions
+wv quality patterns show RULE_ID      # what one rule matches, as the engine matches it
+wv quality patterns show --all --json # every rule's matcher in one call
 wv quality patterns adjudicate qf-... waived --note "approved terminology"
 wv quality patterns report            # per-rule precision, scoped to the last scan's target
 wv quality patterns report docs/      # ...or an explicit path, overriding that scope
@@ -210,17 +212,16 @@ Point-in-time findings are stored in `pattern_findings` and retained for 2 scans
 receives a stable `qf-...` identity derived from its rule, repository-relative path, normalized
 match, and same-match occurrence ordinal. The source context remains stored for review but is not
 part of identity, so an unrelated edit to the line does not orphan its disposition. Durable finding
-state and append-only human disposition
-history survive point-in-time replacement and pruning. `wv sync` atomically projects those human
-records to `.weave/quality-adjudications.jsonl`; current state for deleted paths is pruned while
-its append-only history remains, and `wv load` merges live state into a fresh hot zone.
-Ephemeral findings, scan IDs, occurrences, and recurrence counts are deliberately excluded and
-rediscovered from source. `accepted_defect` and `waived` count as confirmed findings for reported
-`decided_precision`, `false_positive` counts against it, and `unresolved` remains outside that
-explicitly named denominator. `actionable_rate` uses the same decided denominator but counts only
-`accepted_defect`, distinguishing an accurate review prompt with many legitimate waivers from a
-finding that usually warrants a change. Scanner output is unadjudicated evidence by default, not a
-defect count.
+state and append-only human disposition history survive point-in-time replacement and pruning.
+`wv sync` atomically projects those human records to `.weave/quality-adjudications.jsonl`; current
+state for deleted paths is pruned while its append-only history remains, and `wv load` merges live
+state into a fresh hot zone. Ephemeral findings, scan IDs, occurrences, and recurrence counts are
+deliberately excluded and rediscovered from source. `accepted_defect` and `waived` count as
+confirmed findings for reported `decided_precision`, `false_positive` counts against it, and
+`unresolved` remains outside that explicitly named denominator. `actionable_rate` uses the same
+decided denominator but counts only `accepted_defect`, distinguishing an accurate review prompt with
+many legitimate waivers from a finding that usually warrants a change. Scanner output is
+unadjudicated evidence by default, not a defect count.
 
 ---
 

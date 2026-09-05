@@ -1,6 +1,7 @@
 id: prose-self-attested-virtue
 language: prose
 kind: regex
+violation_type: prose:self-attested-virtue
 severity: info
 policy: always-on-shared
 maturity: promotable

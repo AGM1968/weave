@@ -11,6 +11,7 @@ Design decisions (from PROPOSAL-wv-quality.md):
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import subprocess
 from collections import Counter
@@ -79,6 +80,54 @@ def batch_blob_shas(repo: str | Path) -> dict[str, str]:
         parts = meta.split()
         if len(parts) >= 3:
             blob_map[path] = parts[2]
+    return blob_map
+
+
+def _blob_sha_of_bytes(data: bytes) -> str:
+    """git's own object id for this content: sha1 of "blob <len>\\0" + bytes.
+
+    Using git's exact formula rather than any convenient digest is what makes a
+    dirty-but-identical file hash equal to its HEAD blob, so reverting an edit
+    reads as unchanged instead of scheduling a scan forever.
+    """
+    h = hashlib.sha1(b"blob %d\0" % len(data))  # noqa: S324 - object id, not a security hash
+    h.update(data)
+    return h.hexdigest()
+
+
+def working_tree_blob_shas(repo: str | Path) -> dict[str, str]:
+    """Blob SHAs describing what is ON DISK, not what HEAD holds.
+
+    `batch_blob_shas` reads `git ls-tree -r HEAD`, so its SHA for a tracked file
+    with uncommitted edits is the SHA of the committed content. Two layers
+    treated that value as a content fingerprint and were wrong together
+    (wv-7fbfe1): `file_changed` read the file as unchanged and skipped it, and
+    `ASTCache` -- whose key is documented as "changes when file content changes"
+    -- returned the parse of the committed version to anyone who got past that.
+    A function split from CC 26 to 11 still reported 26, under its pre-edit line
+    span, and the `wv done` mccabe gate read that row.
+
+    Every uncommitted edit is invisible under the HEAD map, which is the state a
+    repository is in exactly when the gate runs. One `git diff` names the dirty
+    tracked files and their real content is hashed here. Untracked files are
+    absent from ls-tree, keep the empty string, and continue to fall through to
+    mtime.
+    """
+    blob_map = batch_blob_shas(repo)
+    dirty = _git(["diff", "--name-only", "HEAD"], cwd=repo)
+    if not dirty:
+        return blob_map
+    root = Path(repo)
+    for rel in dirty.split("\n"):
+        rel = rel.strip()
+        if not rel:
+            continue
+        try:
+            blob_map[rel] = _blob_sha_of_bytes((root / rel).read_bytes())
+        except OSError:
+            # Deleted in the working tree: drop the stale HEAD SHA so the file
+            # falls through to mtime rather than asserting committed content.
+            blob_map.pop(rel, None)
     return blob_map
 
 

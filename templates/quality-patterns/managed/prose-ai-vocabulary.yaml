@@ -1,6 +1,7 @@
 id: prose-ai-vocabulary
 language: prose
 kind: lexicon
+violation_type: prose:generated-vocabulary
 severity: info
 policy: always-on-shared
 maturity: promotable

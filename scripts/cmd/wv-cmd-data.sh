@@ -52,13 +52,64 @@ sys.stdout.write(pat.sub(fix, sys.stdin.read()))
 # This function dumps only the semantic data tables and the schema preamble needed
 # to reconstruct the database. FTS is rebuilt on load via db_rebuild_fts.
 # Delta tracking is reinstalled on load via wv_delta_init.
+#
+# All four tables are dumped inside ONE explicit transaction on ONE sqlite3
+# connection (round 3 finding 4). Four separate `sqlite3 db ".dump X"`
+# invocations are four separate connections, each its own implicit
+# transaction -- a writer that commits between them (an edge insert landing
+# after nodes is dumped but before edges is) can leave the combined output
+# referencing a node the nodes dump never captured, or vice versa: a
+# self-inconsistent snapshot that fails `PRAGMA foreign_key_check` on
+# reload. An explicit BEGIN before the first read pins every subsequent
+# `.dump` in the same session to that read's snapshot (verified: a
+# concurrent writer's commit between two `.dump` calls inside one held
+# transaction is invisible to the later one); COMMIT (a no-op on a read-only
+# transaction) just releases it. `.dump` on a table that does not exist
+# (a DB predating tombstones) emits an empty PRAGMA/BEGIN/COMMIT block and
+# does not abort the session, matching the prior per-call behavior.
 dump_state_sql() {
     local db="$1" outfile="$2"
-    {
-        sqlite3 -cmd ".timeout 5000" "$db" ".dump nodes" 2>/dev/null
-        sqlite3 -cmd ".timeout 5000" "$db" ".dump edges" 2>/dev/null
-        sqlite3 -cmd ".timeout 5000" "$db" ".dump node_files" 2>/dev/null
-    } | strip_unistr > "$outfile"
+    sqlite3 -cmd ".timeout 5000" "$db" <<'SQL' 2>/dev/null | strip_unistr > "$outfile"
+BEGIN;
+.dump nodes
+.dump edges
+.dump node_files
+.dump tombstones
+COMMIT;
+SQL
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _wv_snapshot_db — point-in-time backup copy for a multi-artifact export
+# ═══════════════════════════════════════════════════════════════════════════
+
+# dump_state_sql's fix above gives state.sql itself one consistent view
+# (round 3 finding 4), but nodes.jsonl and edges.jsonl were still queried
+# through SEPARATE connections AFTER it -- either could observe a LATER
+# state than what state.sql captured, or than each other, tearing the
+# overall exported bundle (round 4 finding 5). SQLite's `.backup` performs
+# an online, transactionally-consistent copy of the whole database even
+# against a live writer; state.sql and both JSONL projections can then all
+# be derived from this ONE static file, decoupled from anything that
+# happens on the live DB afterward. Prints the backup's path to stdout on
+# success; the caller MUST `rm -f` it when done.
+_wv_snapshot_db() {
+    local live_db="$1" weave_dir="$2"
+    local snap
+    snap=$(mktemp "$weave_dir/.export-snapshot.db.XXXXXX") || return 1
+    if ! sqlite3 -cmd ".timeout 5000" "$live_db" ".backup '$snap'" 2>/dev/null; then
+        rm -f "$snap"
+        return 1
+    fi
+    printf '%s\n' "$snap"
+}
+
+# _wv_query_json_snapshot SNAPSHOT_DB SQL — like db_query_json, but against an
+# arbitrary DB file (a snapshot from _wv_snapshot_db) rather than the global
+# $WV_DB. db_query_json itself stays coupled to $WV_DB (used throughout the
+# rest of the codebase for live queries); this is only for the export bundle.
+_wv_query_json_snapshot() {
+    sqlite3 -json -cmd ".timeout 5000" "$1" "$2"
 }
 
 # Human pattern-finding dispositions are the only non-rebuildable quality.db
@@ -75,6 +126,168 @@ _quality_adjudications_import() {
     local projection="$WEAVE_DIR/quality-adjudications.jsonl"
     [ -f "$projection" ] || return 0
     _wv_quality_python --hot-zone "$WV_HOT_ZONE" adjudications-import "$projection"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _wv_emit_deltas — compact the pending batch and emit the v1 SQL changeset +
+# v2 CAS sidecars, advancing lineage for everything this cycle claims.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Shared by auto_sync and cmd_sync (round 4 finding 1): cmd_sync used to skip
+# this path entirely -- it persisted state.sql/nodes.jsonl/edges.jsonl (all
+# merge=ours) and drained _warp_changes with no delta emitted at all. Proven
+# sequence: a mutation pending because auto_sync was throttled gets included
+# in `wv sync`'s state.sql, no delta is emitted, and the tracker is drained;
+# an established peer's `git pull` keeps ITS OWN (older) state.sql under
+# merge=ours and has no mergeable artifact from which to ever learn the
+# mutation -- permanently hidden from every existing clone. Running the
+# identical emission path here, before cmd_sync's own drain, closes that gap
+# for both callers without duplicating the generation logic.
+#
+# _wv_emit_deltas DB WEAVE_DIR AGENT_ID
+#   Prints the cycle's LOCKED-IN watermark (from wv_delta_compact_batch,
+#   round 4 finding 2 -- self-captured under that function's own write lock,
+#   not a separately-raced SELECT) to stdout as its only output. Every
+#   remaining step of the caller's sync cycle (the dump, the final
+#   wv_delta_reset) MUST use this exact value, not one it captures itself.
+#   Returns 0 on a normal emission (including a legitimate no-op cycle) or a
+#   non-strict v2 sidecar failure (SQL delta stays authoritative, matching
+#   prior behavior); 1 only when the v1 changeset itself could not be
+#   generated, or a v2 failure under WV_DELTA_V2_STRICT -- the caller must
+#   not proceed to dump/publish this cycle, though the watermark is still
+#   printed so it can still be used for whatever cleanup it needs.
+_wv_emit_deltas() {
+    local db="$1" weave_dir="$2" agent_id="$3"
+    local watermark compact_rc=0
+    watermark=$(wv_delta_compact_batch "$db") || compact_rc=$?
+    case "$watermark" in ''|*[!0-9]*) watermark=0 ;; esac
+    # A compaction failure must abort here, not fall through to changeset
+    # generation on the uncompacted rows it left behind (round 4 finding 1):
+    # every caller invokes this function as `if ! x=$(_wv_emit_deltas ...);`,
+    # which -- because the function's own exit status is being tested --
+    # suspends `set -e` for EVERY command inside it, this one included, per
+    # bash's errexit-inside-a-tested-command semantics. Without this explicit
+    # check, a compact_batch timeout/SQL error rolls compaction back (proven
+    # in isolation) but this function silently continues on the fallback
+    # watermark, generating a changeset straight from the still-uncompacted
+    # same-entity multi-op rows compaction exists to collapse -- reopening
+    # the exact silent-lost-write defect wv_delta_compact_batch was written
+    # to close (round 3 finding 2 / round 2 finding 2).
+    if [ "$compact_rc" -ne 0 ]; then
+        echo "wv: batch compaction failed; not emitting a delta this cycle (will retry next sync)" >&2
+        printf '%s\n' "$watermark"
+        return 1
+    fi
+
+    # Emit delta changeset before the full dump. The changeset captures exactly
+    # what changed since the last wv_delta_reset, in causal order (by _warp_changes.id).
+    # Stored as .weave/deltas/<YYYY-MM-DD>/<epoch>-<subsec>-<seq>-<agent_id>-<pid>.sql.
+    local delta_dir="$weave_dir/deltas/$(date +%Y-%m-%d)"
+    mkdir -p "$delta_dir"
+    local delta_prefix
+    resolve_delta_filename_prefix delta_prefix
+    local delta_filename="${delta_prefix}-${agent_id}-$$.sql"
+
+    # Stage the whole emission (v1 delta + v2 sidecars) in a private,
+    # PID-scoped directory on the same filesystem as $delta_dir, and only
+    # publish it into the real, git-visible .weave/deltas/ tree once
+    # everything through the lineage stamp below has succeeded (round 5
+    # review finding: this function used to write the v1 delta straight to
+    # its final path the moment wv_delta_changeset returned -- fully
+    # git-visible immediately, with cleanup only on a LATER failure. A
+    # concurrent `git add .weave/` in that window could commit it before the
+    # cleanup ran, and a retry then re-emitted the same batch again under a
+    # fresh lineage with no way to undo the first commit). Nothing under
+    # $staging_dir is ever git-visible, so a failure at any point before
+    # publish is just `rm -rf $staging_dir` -- no cross-actor cleanup
+    # scoping needed, since this directory is never shared with anyone.
+    local staging_dir="$delta_dir/.staging-$$"
+    rm -rf "$staging_dir"
+    mkdir -p "$staging_dir/v2"
+    local staged_delta="$staging_dir/$delta_filename"
+
+    # Lineage stamp for everything emitted this cycle (wv-cdb45a): one Lamport
+    # tick past the durable high-water.
+    local lineage_seq
+    lineage_seq=$(( $(wv_lineage_seq_base "$db" "$weave_dir/deltas") + 1 ))
+    if ! wv_delta_changeset "$db" "$agent_id" "$lineage_seq" "$watermark" > "$staged_delta"; then
+        rm -rf "$staging_dir"
+        echo "wv: failed to generate portable delta" >&2
+        printf '%s\n' "$watermark"
+        return 1
+    fi
+    # Drop a changeset that carries no replayable statement (wv-253abd): an
+    # empty file, or one whose only content is the lineage header plus
+    # `-- no-op` comments, cannot patch a clone forward and would otherwise
+    # flag as a corrupt delta on every load in every clone. A
+    # `-- WARNING: unparseable edge row_id` line is the one non-replayable
+    # comment kept -- the sole on-disk trace of a corrupt _warp_changes row.
+    local keep_delta=true
+    if [ ! -s "$staged_delta" ]; then
+        rm -f "$staged_delta"
+        keep_delta=false
+    elif ! grep -qiE '^(INSERT|UPDATE|REPLACE|DELETE|BEGIN|PRAGMA)' "$staged_delta" 2>/dev/null \
+        && ! grep -q '^-- WARNING:' "$staged_delta" 2>/dev/null; then
+        rm -f "$staged_delta"
+        keep_delta=false
+    fi
+    # Delta v2 CAS sidecars default ON as of the delta-causality cutover.
+    # deltas_root (4th arg) stays the REAL .weave/deltas so the lineage
+    # sequence is computed from committed history; out_dir (2nd arg) is the
+    # staging v2/ dir, so nothing lands in the real tree until publish below.
+    if [ "${WV_DELTA_V2_WRITE:-1}" = "1" ]; then
+        if ! wv_delta_v2_write_operations "$db" "$staging_dir/v2" "$agent_id" "$weave_dir/deltas" "$watermark" >/dev/null; then
+            echo "wv: warning: Delta v2 sidecar write failed; SQL delta remains authoritative" >&2
+            if [ "${WV_DELTA_V2_STRICT:-0}" = "1" ]; then
+                rm -rf "$staging_dir"
+                printf '%s\n' "$watermark"
+                return 1
+            fi
+        fi
+    fi
+    # Advance the local lineage high-water to match what the delta just claimed,
+    # so the next cycle's wv_lineage_seq_base does not hand out the same number
+    # again. Fires _warp_changes triggers; those rows (id > watermark) are left
+    # for the NEXT cycle's compaction to clean up, matching the existing
+    # deferred-cleanup pattern -- draining them here would need a second,
+    # later watermark this function has no way to hand back atomically.
+    #
+    # A stamp failure must abort here, before the caller ever publishes or
+    # drains (round 4 finding 4): wv_lineage_stamp no longer swallows its own
+    # errors, but a caller that ignored ITS return would still publish
+    # state.sql / drain _warp_changes with rows that never received the
+    # lineage this cycle's delta claims for them. Nothing has been published
+    # yet, so a failure here is just discarding the staging directory -- no
+    # second, different delta can ever land at this same seq, because this
+    # one never claimed it anywhere durable.
+    if ! wv_lineage_stamp "$db" "$agent_id" "$lineage_seq" "$watermark"; then
+        rm -rf "$staging_dir"
+        echo "wv: lineage stamp failed; this cycle's delta was not kept (will retry next sync)" >&2
+        printf '%s\n' "$watermark"
+        return 1
+    fi
+
+    # Everything succeeded -- publish the staged files into their real,
+    # git-visible locations. Each rename is same-filesystem and lands a file
+    # that was already complete before the move (never partially written),
+    # so the window where a concurrent reader could observe a partial
+    # publish is as small as bash lets a loop of renames be, not the whole
+    # emission's generation time.
+    if [ "$keep_delta" = true ]; then
+        mv "$staged_delta" "$delta_dir/$delta_filename" 2>/dev/null || true
+    fi
+    if [ "${WV_DELTA_V2_WRITE:-1}" = "1" ] && [ -d "$staging_dir/v2" ]; then
+        local delta_v2_dir="$delta_dir/v2"
+        mkdir -p "$delta_v2_dir"
+        local staged_op
+        for staged_op in "$staging_dir/v2"/*.json; do
+            [ -e "$staged_op" ] || continue
+            mv "$staged_op" "$delta_v2_dir/" 2>/dev/null || true
+        done
+        find "$delta_v2_dir" -type d -empty -delete 2>/dev/null || true
+    fi
+    rm -rf "$staging_dir"
+    printf '%s\n' "$watermark"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -166,6 +379,78 @@ _should_persist_weave_state() {
     [ "$node_count" -gt 0 ] || [ "$edge_count" -gt 0 ]
 }
 
+# _publish_weave_bundle WEAVE_DIR TMP_NODES TMP_EDGES TMP_SQL
+#
+# Publishes the three portable graph artifacts (nodes.jsonl, edges.jsonl,
+# state.sql) as a group instead of three independent renames. Both callers
+# (auto_sync and _sync_gh's re-dump) previously did `mv nodes && mv edges &&
+# mv sql`, each individually checked -- but a failure partway through still
+# left whichever renames had ALREADY succeeded in place: nodes.jsonl or
+# edges.jsonl reflecting the new snapshot while state.sql (or each other)
+# still held the old one. The caller correctly treats that as a failure and
+# retries, but the torn bundle sits on disk in the meantime, where a
+# concurrent `git add .weave/` (a different agent's checkpoint, a stray
+# script) can commit it exactly as torn.
+#
+# Backs up whatever currently exists at each target first (or records that it
+# didn't exist), attempts all three renames, and on any failure restores
+# every target to its pre-call state -- removing a target this call newly
+# created, or restoring the backup for one it overwrote. A backup that cannot
+# even be taken refuses the whole publish up front rather than risk a torn
+# result. Every input tmp path is consumed (renamed away) or removed by this
+# function; callers must not rm them themselves afterward, on success OR
+# failure.
+_publish_weave_bundle() {
+    local weave_dir="$1" tmp_nodes="$2" tmp_edges="$3" tmp_sql="$4"
+    local -a target_names=("nodes.jsonl" "edges.jsonl" "state.sql")
+    local -a tmps=("$tmp_nodes" "$tmp_edges" "$tmp_sql")
+    local -a backups=("" "" "")
+    local i target backup
+
+    for i in 0 1 2; do
+        target="$weave_dir/${target_names[$i]}"
+        if [ -f "$target" ]; then
+            backup="${target}.bak.$$"
+            if ! cp -p "$target" "$backup" 2>/dev/null; then
+                local j
+                for j in 0 1 2; do
+                    [ -n "${backups[$j]}" ] && rm -f "${backups[$j]}"
+                done
+                rm -f "$tmp_nodes" "$tmp_edges" "$tmp_sql"
+                return 1
+            fi
+            backups[$i]="$backup"
+        fi
+    done
+
+    local failed=false
+    for i in 0 1 2; do
+        target="$weave_dir/${target_names[$i]}"
+        if ! mv "${tmps[$i]}" "$target"; then
+            failed=true
+            break
+        fi
+    done
+
+    if [ "$failed" = true ]; then
+        for i in 0 1 2; do
+            target="$weave_dir/${target_names[$i]}"
+            if [ -n "${backups[$i]}" ]; then
+                mv -f "${backups[$i]}" "$target" 2>/dev/null || true
+            else
+                rm -f "$target" 2>/dev/null || true
+            fi
+        done
+        rm -f "$tmp_nodes" "$tmp_edges" "$tmp_sql" 2>/dev/null || true
+        return 1
+    fi
+
+    for i in 0 1 2; do
+        [ -n "${backups[$i]}" ] && rm -f "${backups[$i]}"
+    done
+    return 0
+}
+
 auto_sync() {
     local _force=false
     for _arg in "$@"; do [ "$_arg" = "--force" ] && _force=true; done
@@ -198,38 +483,33 @@ auto_sync() {
         return 0
     fi
 
+    # A pre-check watermark for the two branches below that never touch the
+    # live nodes/edges tables (the persist-skip path just drains a tracker
+    # table) -- safe to capture with a plain, unlocked SELECT since nothing
+    # downstream of it derives values from live tables. The MAIN path below
+    # gets its authoritative watermark from wv_delta_compact_batch itself
+    # (round 4 finding 2), not this one.
+    local _precheck_watermark
+    _precheck_watermark=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COALESCE(MAX(id),0) FROM _warp_changes;" 2>/dev/null || echo 0)
+    case "$_precheck_watermark" in *[!0-9]*) _precheck_watermark=0 ;; esac
+
     if ! _should_persist_weave_state; then
-        wv_delta_reset "$WV_DB"
+        # A drain failure means _warp_changes still holds these rows -- stamping
+        # success anyway would suppress the retry that clears them (deep-review
+        # finding: reset failures were not checked before success reporting).
+        wv_delta_reset "$WV_DB" "$_precheck_watermark" || return 1
         echo "$now" > "$stamp_file"
         return 0
     fi
 
-    # Emit delta changeset before the full dump. The changeset captures exactly
-    # what changed since the last wv_delta_reset, in causal order (by _warp_changes.id).
-    # Stored as .weave/deltas/<YYYY-MM-DD>/<epoch>-<subsec>-<seq>-<agent_id>-<pid>.sql.
-    # The first field stays epoch-seconds for prune compatibility; fixed-width
-    # subsecond and sequence fields make same-second emissions replay deterministically.
-    # Day-subdirectory prevents single-dir inode bloat over time. These files are
-    # committed to git and replayed by other agents on wv load (multi-agent merge).
-    # Empty files (no-op cycles) are removed immediately.
-    local delta_dir="$WEAVE_DIR/deltas/$(date +%Y-%m-%d)"
-    mkdir -p "$delta_dir"
-    local delta_prefix
-    resolve_delta_filename_prefix delta_prefix
-    local delta_file="$delta_dir/${delta_prefix}-${agent_id}-$$.sql"
-    if ! wv_delta_changeset "$WV_DB" > "$delta_file"; then
-        rm -f "$delta_file"
-        echo "wv: failed to generate portable delta" >&2
+    # Compact the pending batch and emit the v1 changeset + v2 sidecars.
+    # _wv_emit_deltas self-captures the cycle's watermark under
+    # wv_delta_compact_batch's own write lock (round 4 finding 2) and prints
+    # it; every step downstream (the dump, the final reset) uses THIS value,
+    # not the pre-check one above.
+    local _sync_watermark
+    if ! _sync_watermark=$(_wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "$agent_id"); then
         return 1
-    fi
-    [ -s "$delta_file" ] || rm -f "$delta_file"
-    if [ "${WV_DELTA_V2_WRITE:-0}" = "1" ]; then
-        local delta_v2_dir="$delta_dir/v2"
-        if ! wv_delta_v2_write_operations "$WV_DB" "$delta_v2_dir" "$agent_id" >/dev/null; then
-            echo "wv: warning: Delta v2 sidecar write failed; SQL delta remains authoritative" >&2
-            [ "${WV_DELTA_V2_STRICT:-0}" = "1" ] && return 1
-        fi
-        find "$delta_v2_dir" -type d -empty -delete 2>/dev/null || true
     fi
 
     # Full dump to state.sql — kept as the authoritative snapshot and audit trail.
@@ -241,8 +521,19 @@ auto_sync() {
     tmp_nodes=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX") || { rm -f "$tmp_sql"; return 1; }
     tmp_edges=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX") || { rm -f "$tmp_sql" "$tmp_nodes"; return 1; }
 
-    if ! dump_state_sql "$WV_DB" "$tmp_sql" || [ ! -s "$tmp_sql" ]; then
+    # Point-in-time snapshot (round 4 finding 5): state.sql and both JSONL
+    # projections are all derived from this ONE static backup copy, not
+    # three separate live connections that could each observe a different
+    # moment. See _wv_snapshot_db's header for the full mechanism.
+    local _snap_db
+    if ! _snap_db=$(_wv_snapshot_db "$WV_DB" "$WEAVE_DIR"); then
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        echo "wv: failed to snapshot database for export" >&2
+        return 1
+    fi
+
+    if ! dump_state_sql "$_snap_db" "$tmp_sql" || [ ! -s "$tmp_sql" ]; then
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
         echo "wv: failed to generate portable state snapshot" >&2
         return 1
     fi
@@ -251,7 +542,7 @@ auto_sync() {
     # over committed truth (the 2026-06-06 sandbox data-loss path). Skip the dump,
     # keep deltas + _warp_changes pending, leave state.sql intact. Loud on stderr.
     if ! _sync_floor_guard_ok "$tmp_sql"; then
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
         return 1
     fi
 
@@ -260,32 +551,46 @@ auto_sync() {
     # the dump output directly — if state.sql is byte-identical, skip the jsonl
     # regeneration and checkpoint entirely.
     if [ -f "$WEAVE_DIR/state.sql" ] && cmp -s "$tmp_sql" "$WEAVE_DIR/state.sql"; then
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
-        wv_delta_reset "$WV_DB"
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        wv_delta_reset "$WV_DB" "$_sync_watermark" || return 1
         echo "$now" > "$stamp_file"
         return 0
     fi
 
-    if ! db_query_json "SELECT * FROM nodes;" | jq -c '.[]' > "$tmp_nodes" \
-        || ! db_query_json "SELECT * FROM edges;" | jq -c '.[]' > "$tmp_edges"; then
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+    if ! _wv_query_json_snapshot "$_snap_db" "SELECT * FROM nodes;" | jq -c '.[]' > "$tmp_nodes" \
+        || ! _wv_query_json_snapshot "$_snap_db" "SELECT * FROM edges;" | jq -c '.[]' > "$tmp_edges"; then
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
         echo "wv: failed to generate portable JSONL projections" >&2
         return 1
     fi
+    rm -f "$_snap_db"
 
-    # Publish readable projections first and the authoritative snapshot last.
-    # If a move fails, retain _warp_changes so a later sync can regenerate all
-    # artifacts rather than treating a partial publish as durable.
-    if ! mv "$tmp_nodes" "$WEAVE_DIR/nodes.jsonl" \
-        || ! mv "$tmp_edges" "$WEAVE_DIR/edges.jsonl" \
-        || ! mv "$tmp_sql" "$WEAVE_DIR/state.sql"; then
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+    # Publish all three artifacts as a group (_publish_weave_bundle): a
+    # partial failure previously left whichever renames had already
+    # succeeded in place -- a torn bundle a concurrent `git add .weave/`
+    # could commit -- even though _warp_changes correctly stayed pending for
+    # a later sync to regenerate everything.
+    if ! _publish_weave_bundle "$WEAVE_DIR" "$tmp_nodes" "$tmp_edges" "$tmp_sql"; then
         echo "wv: failed to publish portable graph artifacts" >&2
         return 1
     fi
 
-    # Reset change tracking after successful persist
-    wv_delta_reset "$WV_DB"
+    # Reset change tracking after successful persist. Bounded to this cycle's
+    # watermark: a row a concurrent writer added after dump_state_sql's
+    # snapshot was taken stays pending for the next cycle instead of being
+    # erased with nothing to show it ever existed.
+    #
+    # A reset failure (deep-review finding) leaves these already-published
+    # rows sitting in _warp_changes: harmless in itself (the next cycle just
+    # re-emits a redundant, CAS-guarded delta for them), but stamping success
+    # here would suppress the retry that clears them, since the throttle
+    # reads this stamp to decide whether a later cycle even attempts one. The
+    # artifacts just published are correct regardless, so still checkpoint
+    # them -- only the stamp and this cycle's own success are withheld.
+    if ! wv_delta_reset "$WV_DB" "$_sync_watermark"; then
+        auto_checkpoint "$now"
+        return 1
+    fi
 
     # NOTE: _delta_compact is NOT called here. Auto-compaction is unsafe in a
     # multi-agent topology: state.sql uses merge=ours, so Agent B keeps its own
@@ -587,31 +892,49 @@ _sync_gh() {
     # `[ -s ]` guards state.sql only. An empty nodes.jsonl or edges.jsonl is a
     # legitimate projection of a graph with no rows of that kind, so requiring
     # bytes there would fail a correct sync.
+    #
+    # All three come from ONE point-in-time snapshot (round 4 finding 5),
+    # same as auto_sync/cmd_sync -- three separate live connections here
+    # could each observe a different moment, tearing the re-dumped bundle
+    # exactly like the original state.sql/JSONL split did.
+    # Generate all three projections BEFORE publishing any of them
+    # (_publish_weave_bundle then moves all three as a group) -- previously
+    # each block generated-and-moved its own file independently, so a
+    # generation failure on the SECOND or THIRD file still left the FIRST
+    # one's successful move in place: a torn bundle (new state.sql, stale
+    # nodes.jsonl, say) a concurrent `git add .weave/` could commit, even
+    # though the sync stamps correctly clear below to force a retry.
     local _dump_ok=true
-    if dump_state_sql "$WV_DB" "$tmp_sql2" \
+    local _snap_db2
+    if ! _snap_db2=$(_wv_snapshot_db "$WV_DB" "$WEAVE_DIR"); then
+        _snap_db2=""
+        _dump_ok=false
+    fi
+    if [ -n "$_snap_db2" ] && dump_state_sql "$_snap_db2" "$tmp_sql2" \
         && [ "$_sync_stub" != "fail:state" ] \
-        && [ -s "$tmp_sql2" ] \
-        && mv "$tmp_sql2" "$WEAVE_DIR/state.sql"; then
+        && [ -s "$tmp_sql2" ]; then
         :
     else
-        rm -f "$tmp_sql2" 2>/dev/null || true
         _dump_ok=false
     fi
-    if ( set -o pipefail; db_query_json "SELECT * FROM nodes;" 2>/dev/null | jq -c '.[]' > "$tmp_nodes2" 2>/dev/null ) \
-        && [ "$_sync_stub" != "fail:nodes" ] \
-        && mv "$tmp_nodes2" "$WEAVE_DIR/nodes.jsonl"; then
+    if [ -n "$_snap_db2" ] && ( set -o pipefail; _wv_query_json_snapshot "$_snap_db2" "SELECT * FROM nodes;" 2>/dev/null | jq -c '.[]' > "$tmp_nodes2" 2>/dev/null ) \
+        && [ "$_sync_stub" != "fail:nodes" ]; then
         :
     else
-        rm -f "$tmp_nodes2" 2>/dev/null || true
         _dump_ok=false
     fi
-    if ( set -o pipefail; db_query_json "SELECT * FROM edges;" 2>/dev/null | jq -c '.[]' > "$tmp_edges2" 2>/dev/null ) \
-        && [ "$_sync_stub" != "fail:edges" ] \
-        && mv "$tmp_edges2" "$WEAVE_DIR/edges.jsonl"; then
+    if [ -n "$_snap_db2" ] && ( set -o pipefail; _wv_query_json_snapshot "$_snap_db2" "SELECT * FROM edges;" 2>/dev/null | jq -c '.[]' > "$tmp_edges2" 2>/dev/null ) \
+        && [ "$_sync_stub" != "fail:edges" ]; then
         :
     else
-        rm -f "$tmp_edges2" 2>/dev/null || true
         _dump_ok=false
+    fi
+    rm -f "$_snap_db2" 2>/dev/null || true
+
+    if [ "$_dump_ok" = true ]; then
+        _publish_weave_bundle "$WEAVE_DIR" "$tmp_nodes2" "$tmp_edges2" "$tmp_sql2" || _dump_ok=false
+    else
+        rm -f "$tmp_sql2" "$tmp_nodes2" "$tmp_edges2" 2>/dev/null || true
     fi
 
     if [ "$_dump_ok" != true ]; then
@@ -682,9 +1005,14 @@ cmd_sync() {
 
     db_ensure
     if ! _should_persist_weave_state; then
-        wv_delta_reset "$WV_DB"
+        local _reset_ok=true
+        wv_delta_reset "$WV_DB" || _reset_ok=false
         if [ "$format" = "json" ]; then
-            jq -n '{"ok": true, "skipped": true, "reason": "empty_uninitialized"}'
+            if [ "$_reset_ok" = true ]; then
+                jq -n '{"ok": true, "skipped": true, "reason": "empty_uninitialized"}'
+            else
+                jq -n '{"ok": false, "skipped": true, "reason": "empty_uninitialized", "warning": "change tracker drain failed, retained for next sync"}'
+            fi
         else
             echo -e "${YELLOW}Nothing to sync: graph is empty and .weave is not initialized${NC}" >&2
         fi
@@ -692,6 +1020,7 @@ cmd_sync() {
             journal_end
             journal_clean
         fi
+        [ "$_reset_ok" = true ] || return 1
         return 0
     fi
     mkdir -p "$WEAVE_DIR"
@@ -699,19 +1028,52 @@ cmd_sync() {
     # Step 1: Dump to disk
     [ "$_sync_journaled" = true ] && journal_step 1 "dump"
 
+    # Compact the pending batch and emit the v1 changeset + v2 sidecars
+    # BEFORE anything below reads or drains _warp_changes (round 4 finding
+    # 1): cmd_sync used to skip this path entirely -- it persisted
+    # state.sql/nodes.jsonl/edges.jsonl (all merge=ours) straight from the
+    # live DB and drained the tracker with no delta emitted at all, so an
+    # established peer's `git pull` kept its own older state.sql and had no
+    # mergeable artifact from which to ever learn the mutation. See
+    # _wv_emit_deltas's header for the full mechanism (shared with
+    # auto_sync) and wv_delta_compact_batch's header for why the watermark
+    # this hands back is self-captured under its own write lock rather than
+    # a separately-raced SELECT (round 4 finding 2).
+    local agent_id
+    agent_id="$(resolve_agent_id)"
+    local _sync_watermark
+    if ! _sync_watermark=$(_wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "$agent_id"); then
+        echo -e "${RED}✗${NC} Sync aborted: failed to generate delta changeset" >&2
+        [ "$_sync_journaled" = true ] && journal_end
+        return 1
+    fi
+
     # Atomic sync: write to temp files, then move atomically
     local tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
     local tmp_nodes=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX")
     local tmp_edges=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX")
-    trap 'rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" 2>/dev/null' EXIT
+    local _snap_db=""
+    trap 'rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db" 2>/dev/null' EXIT
+
+    # Point-in-time snapshot (round 4 finding 5): state.sql and both JSONL
+    # projections are all derived from this ONE static backup copy, not
+    # three separate live connections that could each observe a different
+    # moment. See _wv_snapshot_db's header for the full mechanism.
+    if ! _snap_db=$(_wv_snapshot_db "$WV_DB" "$WEAVE_DIR"); then
+        echo -e "${RED}✗${NC} Sync aborted: failed to snapshot database for export" >&2
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        trap - EXIT
+        [ "$_sync_journaled" = true ] && journal_end
+        return 1
+    fi
 
     # Selective dump: data tables only, excluding FTS index (rebuilt on load)
-    dump_state_sql "$WV_DB" "$tmp_sql"
+    dump_state_sql "$_snap_db" "$tmp_sql"
 
     # Guard: refuse to overwrite state.sql with an empty dump (data loss prevention)
     if [ ! -s "$tmp_sql" ]; then
         echo -e "${RED}✗${NC} Sync aborted: database dump was empty (possible lock contention)" >&2
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
         trap - EXIT
         [ "$_sync_journaled" = true ] && journal_end
         return 1
@@ -719,15 +1081,28 @@ cmd_sync() {
 
     # Floor-guard: refuse a drastic shrink (partial/wiped tmpfs over committed truth)
     if ! _sync_floor_guard_ok "$tmp_sql" "$force"; then
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
         trap - EXIT
         [ "$_sync_journaled" = true ] && journal_end
         return 1
     fi
 
-    # Also export to JSONL for human readability
-    db_query_json "SELECT * FROM nodes;" | jq -c '.[]' > "$tmp_nodes" 2>/dev/null || true
-    db_query_json "SELECT * FROM edges;" | jq -c '.[]' > "$tmp_edges" 2>/dev/null || true
+    # Also export to JSONL for human readability. A failed query/jq pipeline
+    # must not silently publish an EMPTY projection over a real one (round 4
+    # finding 5) -- `|| true` here used to let that through undetected, ahead
+    # of the tracker drain below, so the failure was invisible until someone
+    # noticed nodes.jsonl/edges.jsonl had gone empty. `set -o pipefail` in a
+    # subshell reports the query's exit status, not jq's.
+    if ! ( set -o pipefail; _wv_query_json_snapshot "$_snap_db" "SELECT * FROM nodes;" | jq -c '.[]' > "$tmp_nodes" ) \
+        || ! ( set -o pipefail; _wv_query_json_snapshot "$_snap_db" "SELECT * FROM edges;" | jq -c '.[]' > "$tmp_edges" ); then
+        echo -e "${RED}✗${NC} Sync aborted: failed to generate portable JSONL projections" >&2
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        trap - EXIT
+        [ "$_sync_journaled" = true ] && journal_end
+        return 1
+    fi
+    rm -f "$_snap_db"
+    _snap_db=""
 
     # Publish human-readable projections first and state.sql last. A successful
     # state.sql rename is the durability acknowledgement used by ship/recovery.
@@ -737,6 +1112,25 @@ cmd_sync() {
         echo -e "${RED}✗${NC} Sync aborted: failed to publish durable graph state" >&2
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
         trap - EXIT
+        return 1
+    fi
+    # Drain change tracking now that state.sql durably carries every pending
+    # change (found chasing test-commit-refs.sh, not a flake). cmd_sync now
+    # emits the same delta/v1 changeset + v2 sidecars auto_sync does, via
+    # _wv_emit_deltas above (round 4 finding 1) -- it did not before, and
+    # that gap alone was silent, permanent data loss for any already-cloned
+    # peer (state.sql/nodes.jsonl/edges.jsonl are merge=ours, so a peer's
+    # `git pull` keeps its own older state.sql and has nothing else to learn
+    # the mutation from). Draining here, as soon as the dump state.sql now
+    # reflects is durable, additionally stops a change already captured in
+    # this cycle's delta from also entering some LATER, unrelated auto_sync
+    # batch under a second, different lineage seq. Bounded to this cycle's
+    # watermark (from _wv_emit_deltas, self-captured under
+    # wv_delta_compact_batch's write lock -- round 4 finding 2) so a
+    # genuinely concurrent write landing after that lock was acquired is not
+    # erased alongside it.
+    if ! wv_delta_reset "$WV_DB" "$_sync_watermark"; then
+        echo -e "${RED}✗${NC} Sync: change tracker drain failed (see warning above); retained for next sync" >&2
         return 1
     fi
     if ! _quality_adjudications_export; then
@@ -913,16 +1307,34 @@ _quality_config_signature() {
 # cmd_load and _config_enable_test_gate. An exemption committed to quality.conf
 # after the last wv load was therefore unenforced, and wv done hard-blocked on a
 # path the project had already exempted — a false GraphPolicyViolation that
-# looks exactly like real debt. The stamp lives beside the DB in the hot zone,
-# so a rebuilt brain.db loses it and reloads, keeping the two in step.
+# looks exactly like real debt.
+#
+# wv-785ba1: the signature is read from quality_config_sig INSIDE brain.db, not
+# from a file beside it. The file outlived the database it described, so a hot
+# zone whose brain.db had been rebuilt kept a stamp asserting that an empty
+# quality_exempt was current, and the same false block returned by a different
+# route. An absent row now reads as "no claim" and forces the reload.
+#
+# TWO GATE INPUTS, ONE RULE. The wv done trigger reads two projections, and the
+# durable source is authoritative for both:
+#
+#   quality_exempt / policy_thresholds  <- .weave/quality.conf   (this guard)
+#   file_metrics.mccabe_max             <- the working tree      (wv-7fbfe1)
+#
+# wv-7fbfe1 was the same shape: the incremental scan keyed change detection on
+# the HEAD blob SHA, so an uncommitted edit left the projection describing
+# committed code and the gate judged a function the author had already fixed.
+# In both cases the projection is a cache, and a cache must not outlive its own
+# claim to be current. Whenever a gate input is derived, check what invalidates
+# the derivation and make that the same event that invalidates the claim.
 _ensure_quality_config_fresh() {
     [ -n "${WV_HOT_ZONE:-}" ] || return 0
     [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ] || return 0
-    local stamp="$WV_HOT_ZONE/.quality_conf_sig"
     local current previous=""
     current=$(_quality_config_signature)
-    [ -f "$stamp" ] && previous=$(cat "$stamp" 2>/dev/null || printf '')
-    [ "$current" = "$previous" ] && return 0
+    previous=$(sqlite3 "$WV_DB" \
+        "SELECT signature FROM quality_config_sig WHERE id = 1;" 2>/dev/null || printf '')
+    [ -n "$previous" ] && [ "$current" = "$previous" ] && return 0
     _load_quality_config || return 0
 }
 
@@ -957,9 +1369,18 @@ _load_quality_config() {
     # tell a current table from a stale one. Written here rather than in the
     # freshness check so every load path — cmd_load, the test-gate config
     # command — leaves the stamp consistent with the table.
-    if [ -n "${WV_HOT_ZONE:-}" ]; then
-        _quality_config_signature > "$WV_HOT_ZONE/.quality_conf_sig" 2>/dev/null || true
-    fi
+    #
+    # wv-785ba1: written INTO the database, in the same transaction-visible
+    # place as the tables it describes. It was a file beside the DB, which
+    # outlives the DB: a rebuilt brain.db kept a stamp claiming an empty
+    # quality_exempt was current.
+    sqlite3 "$WV_DB" \
+        "INSERT OR REPLACE INTO quality_config_sig(id, signature) VALUES(1, '$(
+            _quality_config_signature | sed "s/'/''/g"
+        )');" 2>/dev/null || true
+    # Remove the superseded sibling stamp so a downgrade cannot read it as fresh.
+    [ -n "${WV_HOT_ZONE:-}" ] && rm -f "$WV_HOT_ZONE/.quality_conf_sig" 2>/dev/null
+    return 0
 }
 
 # _quality_conf_declares_exempt — does the CONFIG (not the table) exempt this path?
@@ -1029,6 +1450,165 @@ _parse_quality_conf_file() {
             sqlite3 "$WV_DB" "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES('$key', $val);" 2>/dev/null || true
         fi
     done < "$file"
+}
+
+# _causal_cutover_seq — parse the lineage_seq from .weave/causal-cutover, or echo
+# nothing. Shared by the Delta v2 dispatch and the v1 SQL back-catalog guard
+# (wv-2448dd). Fails OPEN: a marker that does not parse to a non-negative integer
+# is ignored with a warning, because silently skipping a whole back-catalog on a
+# garbled marker would drop an agent's un-replayed work.
+_causal_cutover_seq() {
+    [ -f "$WEAVE_DIR/causal-cutover" ] || return 0
+    local seq
+    seq=$(sed -n 's/.*"lineage_seq"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' \
+        "$WEAVE_DIR/causal-cutover" 2>/dev/null | head -1)
+    case "$seq" in
+        ''|*[!0-9]*)
+            echo -e "${YELLOW}⚠ Ignoring .weave/causal-cutover — no numeric lineage_seq${NC}" >&2
+            return 0 ;;
+    esac
+    printf '%s\n' "$seq"
+}
+
+# _delta_v2_replay WEAVE_DIR DB — dispatch the Delta v2 CAS replay (wv-ba9dc8).
+#
+# The actual causality fix. wv-delta-v2-replay.py applies every committed
+# `.weave/deltas/<date>/v2/*.json` operation under per-field compare-and-set,
+# ordered by the Lamport lineage each op carries, in a single transaction. An op
+# whose `expected` preimage does not match the graph is REPORTED
+# (precondition_conflict) and not applied; a malformed, hash-mismatched or
+# unknown-version op is a HARD failure that rolls the whole batch back and exits
+# non-zero — the loader does not commit a partially-applied v2 batch, and does
+# not silently fall through to the v1 SQL path on corruption.
+#
+# Fail-closed policy: on a hard failure, WV_DELTA_V2_STRICT=1 aborts the load;
+# otherwise the batch is already rolled back and the v1 SQL deltas (themselves
+# lineage-guarded) remain the compatibility authority, with a loud warning.
+#
+# The writer (WV_DELTA_V2_WRITE) defaults ON as of the delta-causality cutover
+# (S4 wv-806a6b, alongside the E6/E7 recapture). A catalog that predates the
+# flip carries no v2/*.json ops, so this stays a no-op on the historical
+# back-catalog and only engages once post-cutover syncs have emitted sidecars.
+_delta_v2_replay() {
+    local weave_dir="$1" db="$2"
+    local v2_root="$weave_dir/deltas"
+    [ -d "$v2_root" ] || return 0
+
+    local -a v2_ops=()
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] && v2_ops+=("$line")
+    done < <(find "$v2_root" -path '*/v2/*.json' -type f -printf '%f\t%p\n' 2>/dev/null \
+        | LC_ALL=C sort | cut -f2)
+    [ "${#v2_ops[@]}" -gt 0 ] || return 0
+
+    local replay_py="${WV_LIB_DIR:-$SCRIPT_DIR}/lib/wv-delta-v2-replay.py"
+    [ -f "$replay_py" ] || replay_py="$SCRIPT_DIR/lib/wv-delta-v2-replay.py"
+    if [ ! -f "$replay_py" ]; then
+        echo -e "${YELLOW}⚠ Delta v2 replay evaluator not found — skipping v2 dispatch${NC}" >&2
+        return 0
+    fi
+
+    local -a args=("$db")
+    local cutover_seq
+    cutover_seq=$(_causal_cutover_seq)
+    [ -n "$cutover_seq" ] && args+=(--cutover-seq "$cutover_seq")
+    [ "${WV_DELTA_V2_STRICT:-0}" = "1" ] && args+=(--strict)
+    args+=("${v2_ops[@]}")
+
+    local out rc=0
+    out=$(python3 "$replay_py" "${args[@]}" 2>&1) || rc=$?
+    local summary
+    summary=$(printf '%s\n' "$out" | tail -1 | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+counts = d.get("summary", {})
+print(" ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+' 2>/dev/null || true)
+
+    if [ "$rc" -ne 0 ]; then
+        echo -e "${YELLOW}⚠ Delta v2 replay aborted (rc=$rc) — v2 batch rolled back${NC}" >&2
+        [ -n "$summary" ] && echo -e "${YELLOW}  dispositions: $summary${NC}" >&2
+        if [ "${WV_DELTA_V2_STRICT:-0}" = "1" ]; then
+            return 1
+        fi
+        return 0
+    fi
+    if [ -n "$summary" ] && [ "$summary" != "" ]; then
+        # Only announce when something other than pure no-ops happened.
+        case "$summary" in
+            *applied=*|*precondition_conflict=*|*skipped_superseded=*|*skipped_pre_cutover=*|*ambiguous_same_lineage=*)
+                echo -e "${GREEN}✓${NC} Delta v2 replay: $summary" >&2 ;;
+        esac
+    fi
+    # Replay fired the change-tracking triggers and touched node text/metadata;
+    # clear the tracker and re-derive FTS exactly as the v1 replay path does.
+    # A drain failure doesn't undo a correct replay -- the graph itself is
+    # right -- but the next auto_sync would otherwise re-emit these rows as
+    # a redundant delta, so it's worth a loud warning rather than silence.
+    wv_delta_reset "$db" || echo -e "${YELLOW}⚠ Delta v2 replay: change tracker drain failed — next sync may re-emit these changes${NC}" >&2
+    db_rebuild_fts
+    return 0
+}
+
+# _reconcile_tombstones DB — enforce cross-machine deletion tombstones (wv-0d5e07).
+#
+# state.sql now ships a `tombstones` table (kind,id,lineage_seq,lineage_actor)
+# written by wv delete / wv prune / Delta v2 *_delete in place of the gitignored,
+# machine-local .weave/.prune_epoch. A tombstone travels to every clone; this pass
+# runs AFTER both delta-replay blocks and removes any node or edge the delta
+# back-catalog resurrected at or before its recorded tombstone (seq, actor) —
+# compared as a SQLite row-value tuple (the same idiom db_write_tombstone's own
+# ON CONFLICT already uses), matching every other lineage guard's (seq, actor)
+# order instead of comparing lineage_seq alone. A recreate whose (seq, actor) is
+# strictly greater than the tombstone survives, mirroring
+# wv-delta-v2-replay.py::_apply_delete (a pre-cutover row sits at lineage_seq 0
+# and is always superseded). A bare `lineage_seq <= t.lineage_seq` let a
+# tombstone at (seq, actor-A) delete a row a causally later (seq, actor-Z)
+# recreate had just landed at the same seq.
+#
+# Scoped strictly to tombstoned ids by the JOIN — unlike the old .prune_epoch
+# epoch cutoff it never touches another agent's unrelated, not-yet-replayed work.
+#
+# The reconcile DELETEs fire the change triggers; wv_delta_reset clears the
+# tracker afterwards (as the v1/v2 replay paths do) so the local reconcile is not
+# re-emitted as a propagating delta — every clone reconciles independently from
+# the tombstone rows it received in state.sql.
+_reconcile_tombstones() {
+    local db="$1"
+    local changed
+    # The leading SELECT is the only statement that writes stdout — it counts the
+    # rows the two DELETEs are about to remove (FTS-trigger inserts would inflate
+    # total_changes(), so count first rather than after).
+    changed=$(sqlite3 -batch "$db" <<'SQL' 2>/dev/null || echo 0
+SELECT
+    (SELECT COUNT(*) FROM nodes n JOIN tombstones t
+       ON t.kind = 'node' AND t.id = n.id
+     WHERE n.lineage_seq = 0 OR (n.lineage_seq, n.lineage_actor) <= (t.lineage_seq, t.lineage_actor))
+  + (SELECT COUNT(*) FROM edges e JOIN tombstones t
+       ON t.kind = 'edge' AND t.id = e.source || ':' || e.target || ':' || e.type
+     WHERE e.lineage_seq = 0 OR (e.lineage_seq, e.lineage_actor) <= (t.lineage_seq, t.lineage_actor));
+DELETE FROM nodes WHERE rowid IN (
+    SELECT n.rowid FROM nodes n
+    JOIN tombstones t ON t.kind = 'node' AND t.id = n.id
+    WHERE n.lineage_seq = 0 OR (n.lineage_seq, n.lineage_actor) <= (t.lineage_seq, t.lineage_actor)
+);
+DELETE FROM edges WHERE rowid IN (
+    SELECT e.rowid FROM edges e
+    JOIN tombstones t ON t.kind = 'edge'
+     AND t.id = e.source || ':' || e.target || ':' || e.type
+    WHERE e.lineage_seq = 0 OR (e.lineage_seq, e.lineage_actor) <= (t.lineage_seq, t.lineage_actor)
+);
+SQL
+    )
+    if [ "${changed:-0}" -gt 0 ] 2>/dev/null; then
+        wv_delta_reset "$db" 2>/dev/null || true
+        db_rebuild_fts 2>/dev/null || true
+        echo -e "${YELLOW}ℹ${NC} Reconciled $changed resurrected row(s) against deletion tombstones" >&2
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1131,6 +1711,10 @@ EOF
         db_migrate_alias
         # Migrate to virtual columns (Tier 1)
         db_migrate_virtual_columns
+        # Migrate writer lineage (epic delta-causality). Must run before delta
+        # replay below: replay orders and guards on these columns, and a state.sql
+        # written by an older release carries neither.
+        db_migrate_lineage
         # Migrate quality policy tables + trigger (language-aware thresholds, exempt paths).
         # Triggers are excluded from state.sql selective dump and must be reinstalled on load.
         db_migrate_policy_tables
@@ -1145,6 +1729,16 @@ EOF
         # Triggers are not stored in state.sql (selective dump excludes them),
         # so they must be reinstalled after every load.
         wv_delta_init "$WV_DB"
+
+        # Delta v2 CAS replay (wv-ba9dc8) — runs BEFORE the v1 SQL replay so the
+        # lineage it stamps is already in place when the lineage-guarded v1
+        # statements run (they become no-ops for anything v2 advanced). The
+        # writer defaults on post-cutover (S4 wv-806a6b); a pre-cutover catalog
+        # carries no sidecars, so this is a no-op there.
+        if ! _delta_v2_replay "$WEAVE_DIR" "$WV_DB"; then
+            echo -e "${RED}Error: Delta v2 replay failed under WV_DELTA_V2_STRICT${NC}" >&2
+            return 1
+        fi
 
         # Delta replay — multi-agent merge
         #
@@ -1166,16 +1760,39 @@ EOF
         # PRAGMA foreign_keys is a no-op inside a transaction, so it must be
         # applied outside any transaction wrapper.
         #
-        # Prune epoch filter: cmd_prune writes .weave/.prune_epoch (Unix timestamp)
-        # after deleting nodes. Deltas older than that epoch contain INSERT OR REPLACE
-        # statements for now-pruned nodes — replaying them would resurrect deleted
-        # nodes. Skip any delta file whose epoch prefix predates the prune epoch.
+        # Prune epoch filter — LEGACY (wv-0d5e07). wv delete / wv prune no longer
+        # write .weave/.prune_epoch; deletion intent now travels as `tombstones`
+        # rows in state.sql, enforced by _reconcile_tombstones after replay. A
+        # .prune_epoch left on disk by an older release is still honoured for the
+        # per-file skip below for one release. When a causal-cutover marker exists
+        # it already skips every pre-cutover no-lineage delta (a strict superset of
+        # what the epoch cutoff covered), so the legacy file is migrated away;
+        # otherwise it is kept and the operator is told to stamp `wv cutover`.
+        # This runs regardless of whether any deltas exist so a straggler file is
+        # always cleaned up once a cutover marker is in place.
+        local prune_epoch=0
+        if [ -f "$WEAVE_DIR/.prune_epoch" ]; then
+            prune_epoch=$(cat "$WEAVE_DIR/.prune_epoch" 2>/dev/null || echo "0")
+            if [ -f "$WEAVE_DIR/causal-cutover" ]; then
+                rm -f "$WEAVE_DIR/.prune_epoch"
+                echo -e "${YELLOW}ℹ${NC} Migrated legacy .weave/.prune_epoch → superseded by causal-cutover + tombstones" >&2
+            else
+                echo -e "${YELLOW}⚠${NC} .weave/.prune_epoch is legacy (wv-0d5e07) — honoured this load; stamp 'wv cutover' to retire it" >&2
+            fi
+        fi
         if [ -d "$WEAVE_DIR/deltas" ]; then
             local delta_files delta_count=0
-            local prune_epoch=0
-            if [ -f "$WEAVE_DIR/.prune_epoch" ]; then
-                prune_epoch=$(cat "$WEAVE_DIR/.prune_epoch" 2>/dev/null || echo "0")
-            fi
+            # Causal cutover marker (wv-2448dd), parsed by the shared helper.
+            # `.weave/causal-cutover` is a committed operator declaration — written
+            # once by `wv cutover` when every agent has synced — naming the
+            # lineage_seq at which this graph became causal. Once it exists, a v1
+            # SQL delta that carries no lineage statement predates the cutover and
+            # must not alter any row, regardless of its filename epoch or embedded
+            # updated_at (post-cutover deltas carry lineage_seq guards and still
+            # replay). A delta file is SQL executed against the DB and cannot write
+            # this sibling file, so the marker cannot be forged from the catalog.
+            local cutover_seq=""
+            cutover_seq=$(_causal_cutover_seq)
             # Applied-deltas manifest (.weave/.applied_deltas): one basename per line.
             # Keep writing it for observability, but do NOT trust it to skip replay.
             #
@@ -1191,8 +1808,9 @@ EOF
             # before the rebuild, so when the flush succeeds the absent set is empty;
             # when the flush fails or is floor-guarded, the absent rows are exactly
             # the unsynced work most needing preservation. Absence is not a deletion
-            # signal — deletion intent travels via tombstones (prune_epoch + immediate
-            # state.sql dump in cmd_delete/cmd_prune, DELETE statements in deltas).
+            # signal — deletion intent travels via the tombstones table (written by
+            # cmd_delete/cmd_prune + immediate state.sql dump, enforced after replay
+            # by _reconcile_tombstones) and DELETE statements in deltas.
             local manifest="$WEAVE_DIR/.applied_deltas"
             # Truncate manifest before replay. If replay fails, the manifest stays
             # empty — guaranteeing all deltas are retried on the next wv load.
@@ -1202,10 +1820,11 @@ EOF
             # only matters if the process is killed mid-replay, in which case we
             # want a retry anyway.
             : > "$manifest"
-            # Sort by filename (epoch prefix) for causal ordering across agents
+            # Initial iteration order is by filename; the REPLAY order is set
+            # below by parsed lineage (wv-5a2627), not this lexical epoch sort.
             delta_files=$(find "$WEAVE_DIR/deltas" -name '*.sql' -printf '%f\t%p\n' 2>/dev/null | sort | cut -f2)
             if [ -n "$delta_files" ]; then
-                local skipped=0 skipped_legacy=0 snapshot_max_epoch=0
+                local skipped=0 skipped_legacy=0 skipped_cutover=0 snapshot_max_epoch=0
                 snapshot_max_epoch=$(sqlite3 "$WV_DB" "
                     SELECT COALESCE(MAX(
                         CASE
@@ -1222,6 +1841,13 @@ EOF
                 # single batched sqlite3 call instead of N subprocesses.
                 local -a new_deltas=()
                 local -a new_names=()
+                # wv-5a2627: sort survivors by the lineage each delta carries.
+                # Key fields are joined by US (0x1f) — NOT a tab: `read`/`sort`
+                # with an IFS-whitespace delimiter collapse an empty actor field
+                # and shift the path out of position. The header read runs once
+                # per SURVIVING delta (after the skips), not once per file.
+                local -a _replay_keys=()
+                local _US=$'\x1f'
                 while IFS= read -r delta; do
                     if [ -s "$delta" ]; then
                         # bash builtins replace basename + grep -oP subprocesses
@@ -1248,20 +1874,66 @@ EOF
                         # is an intentional no-op — the changeset generator emits
                         # "-- no-op UPDATE on node/edge ..." (wv-delta.sh) when an
                         # UPDATE would change nothing — so it is benign and skipped
-                        # silently. Only non-comment, non-blank garbage (e.g. a file
-                        # truncated mid-fsync) is genuinely corrupt.
+                        # silently. The benign set also covers the wv-5a2627
+                        # `/* weave-lineage seq=N actor=A */` block-comment header:
+                        # auto_sync now drops a header-only no-op before commit
+                        # (wv-253abd), but consumer catalogs may already hold one,
+                        # and it must skip silently rather than warn on every load.
+                        # Only non-comment, non-blank garbage (e.g. a file truncated
+                        # mid-fsync) is genuinely corrupt.
                         if ! grep -qiE "^(INSERT|UPDATE|REPLACE|DELETE|BEGIN|PRAGMA)" "$delta" 2>/dev/null; then
-                            if grep -qvE '^[[:space:]]*(--.*)?$' "$delta" 2>/dev/null; then
+                            if grep -qvE '^[[:space:]]*(--.*|/\*.*\*/)?$' "$delta" 2>/dev/null; then
                                 echo -e "${YELLOW}⚠ Skipped corrupt delta: ${delta_name}${NC}" >&2
                             fi
                             continue
                         fi
-                        new_deltas+=("$delta")
-                        new_names+=("$delta_name")
+                        # Parse the lineage header (wv-5a2627) up front:
+                        # `/* weave-lineage seq=<n> actor=<a> */` on line 1, emitted
+                        # by wv_delta_changeset iff seq>0 -- i.e. for every genuine
+                        # post-cutover emission. No header (legacy / pre-lineage /
+                        # hand-written) sorts first at seq 0; path is the final
+                        # tie-break so the old back-catalog keeps its filename-epoch
+                        # order and same-lineage emissions stay deterministic.
+                        local _hl _lseq _lactor _has_lineage_header=0
+                        _hl=$(head -n1 "$delta" 2>/dev/null)
+                        if [ "${_hl#/\* weave-lineage seq=}" != "$_hl" ]; then
+                            _has_lineage_header=1
+                            _lseq=${_hl#/\* weave-lineage seq=}
+                            _lactor=${_lseq#* actor=}
+                            _lactor=${_lactor% \*/}
+                            _lseq=${_lseq%% actor=*}
+                        else
+                            _lseq=0; _lactor=
+                        fi
+                        case "$_lseq" in ''|*[!0-9]*) _lseq=0 ;; esac
+                        # Pre-cutover back-catalog guard (wv-2448dd): with the
+                        # causal cutover marker in place, a delta with no lineage
+                        # header was emitted before the graph became causal, and is
+                        # skipped regardless of filename epoch or embedded timestamp.
+                        # The classifier is the SAME structural signal the ordering
+                        # above already trusts -- not a whole-file grep for the
+                        # substring "lineage_seq=". A body-wide grep also matches
+                        # that substring appearing inside a quoted node text or
+                        # metadata VALUE (this epic's own nodes describe the feature
+                        # in prose), which would misclassify a genuinely pre-cutover,
+                        # unguarded delta as post-cutover and let it replay.
+                        if [ -n "$cutover_seq" ] && [ "$_has_lineage_header" -eq 0 ]; then
+                            skipped_cutover=$((skipped_cutover + 1))
+                            continue
+                        fi
+                        _replay_keys+=("$(printf '%018d%s%s%s%s%s%s' "$_lseq" "$_US" "$_lactor" "$_US" "$delta" "$_US" "$delta_name")")
                         delta_count=$((delta_count + 1))
                     fi
                 done <<< "$delta_files"
                 if [ "$delta_count" -gt 0 ]; then
+                    # Materialise the lineage-ordered replay list (wv-5a2627):
+                    # numeric on seq, then actor, then path.
+                    local _k_seq _k_actor _k_path _k_name
+                    while IFS=$'\x1f' read -r _k_seq _k_actor _k_path _k_name; do
+                        [ -n "$_k_path" ] || continue
+                        new_deltas+=("$_k_path")
+                        new_names+=("$_k_name")
+                    done < <(printf '%s\n' "${_replay_keys[@]}" | LC_ALL=C sort -t$'\x1f' -k1,1 -k2,2 -k3,3)
                     # Single batched sqlite3 call: wrap FK toggle + all deltas in one
                     # transaction — per-statement auto-commit costs ~1 fsync each;
                     # a single transaction reduces N commits to 1.
@@ -1298,8 +1970,11 @@ EOF
                         # fired the triggers, so _warp_changes now contains every
                         # replayed operation. Without this reset, the next auto_sync
                         # would emit a delta containing all of them — snowballing the
-                        # same changes across all agents indefinitely.
-                        wv_delta_reset "$WV_DB"
+                        # same changes across all agents indefinitely. The load itself
+                        # already succeeded (state.sql imported, replay applied), so a
+                        # drain failure here doesn't undo that -- but it must not pass
+                        # silently given exactly what it risks.
+                        wv_delta_reset "$WV_DB" || echo -e "${YELLOW}⚠ Post-replay change tracker drain failed — next sync may re-emit replayed changes${NC}" >&2
                         # Re-derive nodes_fts AFTER replay, not only before it.
                         #
                         # db_rebuild_fts ran earlier against the state.sql import, so
@@ -1332,8 +2007,17 @@ EOF
                 if [ "$skipped_legacy" -gt 0 ]; then
                     echo -e "${YELLOW}ℹ${NC} Skipped $skipped_legacy legacy pre-checkpoint delta(s)" >&2
                 fi
+                if [ "$skipped_cutover" -gt 0 ]; then
+                    echo -e "${YELLOW}ℹ${NC} Skipped $skipped_cutover pre-cutover delta(s) (causal cutover @ lineage_seq $cutover_seq)" >&2
+                fi
             fi
         fi
+
+        # Enforce cross-machine deletion tombstones AFTER both delta blocks: the
+        # v1 catalog may have resurrected a node/edge that a delete recorded a
+        # tombstone for. Runs unconditionally (a tombstone can arrive via state.sql
+        # with no deltas present) and is idempotent.
+        _reconcile_tombstones "$WV_DB"
 
         echo -e "${GREEN}✓${NC} Loaded from $WEAVE_DIR/state.sql" >&2
     else
@@ -2089,6 +2773,89 @@ cmd_compact() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# cmd_cutover — Stamp the causal cutover (wv-2448dd)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Writes .weave/causal-cutover, a committed operator declaration naming the
+# lineage_seq at which this graph became causal. After it is committed, cmd_load
+# gives skipped_pre_cutover to every v1 SQL delta that carries no lineage
+# statement — the 5.5-month back-catalog that predates wv-cdb45a — instead of
+# clock-ranking it. Post-cutover deltas carry lineage_seq guards and still replay.
+#
+# This is the one operation in the delta path that can lose data: a delta a
+# concurrent agent has not yet replayed becomes unreplayable once the marker is
+# committed and pushed. So it mirrors cmd_compact's coordination gate (refuse
+# while any node is claimed) and requires an explicit confirmation. It is never
+# inferred and never run on load.
+cmd_cutover() {
+    local assume_yes=false force=false as_json=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes|-y) assume_yes=true ;;
+            --force) force=true ;;
+            --json) as_json=true ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+        shift
+    done
+
+    _should_persist_weave_state || { echo -e "${RED}✗${NC} not a Weave repository" >&2; return 1; }
+    mkdir -p "$WEAVE_DIR"
+    local marker="$WEAVE_DIR/causal-cutover"
+
+    if [ -f "$marker" ] && [ "$force" != true ]; then
+        local existing
+        existing=$(sed -n 's/.*"lineage_seq"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$marker" 2>/dev/null | head -1)
+        echo -e "${YELLOW}ℹ${NC} causal cutover already stamped (lineage_seq ${existing:-?}) at $marker" >&2
+        echo "  Use --force to restamp at the current lineage high-water." >&2
+        $as_json && printf '{"status":"exists","lineage_seq":%s}\n' "${existing:-null}"
+        return 0
+    fi
+
+    local seq
+    seq=$(wv_lineage_seq_base "$WV_DB" "$WEAVE_DIR/deltas" 2>/dev/null || echo 0)
+    case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
+    if [ "$seq" -lt 1 ]; then
+        echo -e "${RED}✗${NC} lineage high-water is 0 — no causal writes to cut over from." >&2
+        echo "  Do some tracked work and 'wv sync' first (wv-cdb45a stamps lineage on sync)." >&2
+        return 1
+    fi
+
+    # Coordination gate — a claimed node may hold un-synced pre-cutover work.
+    local active_claims
+    active_claims=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND json_extract(metadata, '\$.claimed_by') IS NOT NULL;" 2>/dev/null || echo "0")
+    if [ "$active_claims" -gt 0 ] && [ "$force" != true ]; then
+        echo -e "${RED}✗${NC} $active_claims node(s) currently claimed by agents." >&2
+        echo "  Their un-synced deltas would become unreplayable after the cutover." >&2
+        echo "  Wait until every agent has closed and synced, or use --force." >&2
+        return 1
+    fi
+
+    if [ "$assume_yes" != true ]; then
+        echo -e "${YELLOW}⚠${NC} Stamp the causal cutover at lineage_seq $seq?" >&2
+        echo "  Only run this when EVERY agent has synced. A committed, pushed cutover" >&2
+        echo "  makes every pre-cutover v1 delta unreplayable in every clone." >&2
+        printf "  Type 'yes' to continue: " >&2
+        local reply; read -r reply
+        [ "$reply" = "yes" ] || { echo "Aborted." >&2; return 1; }
+    fi
+
+    local actor created
+    actor=$(resolve_agent_id 2>/dev/null || echo "unknown")
+    created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    printf '{"schema":"weave.causal-cutover.v1","lineage_seq":%s,"actor":"%s","created_at":"%s"}\n' \
+        "$seq" "$actor" "$created" > "$marker"
+
+    if $as_json; then
+        printf '{"status":"stamped","lineage_seq":%s,"actor":"%s","created_at":"%s","marker":"%s"}\n' \
+            "$seq" "$actor" "$created" "$marker"
+    else
+        echo -e "${GREEN}✓${NC} Causal cutover stamped at lineage_seq $seq → $marker"
+        echo "  Commit it to activate: git add .weave/causal-cutover && git commit"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # cmd_prune — Archive old done nodes
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -2238,6 +3005,24 @@ cmd_prune() {
         fi
     fi
 
+    # Capture the lineage of every node (and its incident edges) BEFORE the
+    # DELETEs run, so the tombstones written below carry the highest lineage each
+    # row held. Deletion intent then travels cross-machine as `tombstones` rows in
+    # state.sql (wv-0d5e07), replacing the gitignored .weave/.prune_epoch.
+    local _prune_agent
+    _prune_agent="$(resolve_agent_id 2>/dev/null || echo unknown)"
+    local _tomb_pairs=""   # newline list: "kind\tident\tlineage_seq"
+    while read -r id; do
+        local _esc_pid _nseq
+        _esc_pid="$(sql_escape "$id")"
+        _nseq=$(db_query "SELECT COALESCE(lineage_seq,0) FROM nodes WHERE id='$_esc_pid';" 2>/dev/null || echo 0)
+        _tomb_pairs+="node	${id}	${_nseq:-0}"$'\n'
+        while IFS='|' read -r _es _et _ety _eseq; do
+            [ -n "$_es" ] || continue
+            _tomb_pairs+="edge	${_es}:${_et}:${_ety}	${_eseq:-0}"$'\n'
+        done < <(db_query "SELECT source, target, type, COALESCE(lineage_seq,0) FROM edges WHERE source='$_esc_pid' OR target='$_esc_pid';" 2>/dev/null)
+    done < <(echo "$candidates" | cut -d'|' -f1)
+
     # Delete nodes and orphaned edges in a single atomic transaction.
     # DELETEs must NOT leak into delta files. Prune decisions are local:
     # a node pruned on this agent may still be active on another agent's timeline.
@@ -2258,10 +3043,14 @@ cmd_prune() {
     prune_sql+="DELETE FROM _warp_changes;COMMIT;"
     db_query "$prune_sql"
 
-    # Write prune epoch: the Unix timestamp of this prune run.
-    # cmd_load reads this and skips any delta file whose epoch prefix is <= prune_epoch,
-    # preventing old INSERT OR REPLACE deltas from resurrecting pruned nodes on reload.
-    date +%s > "$WEAVE_DIR/.prune_epoch"
+    # Record a cross-machine deletion tombstone per pruned node and incident edge.
+    # tombstones has no _warp trigger, so these INSERTs do not leak into deltas —
+    # prune stays non-propagating; the tombstone rows travel only via state.sql
+    # and each clone's _reconcile_tombstones re-enforces them after replay.
+    while IFS=$'\t' read -r _tk _ti _tseq; do
+        [ -n "$_tk" ] || continue
+        db_write_tombstone "$_tk" "$_ti" "${_tseq:-0}" "$_prune_agent"
+    done <<< "$_tomb_pairs"
 
     # Re-dump state.sql so it no longer contains pruned nodes.
     # Without this, wv load would resurrect them from the stale snapshot.
@@ -2493,6 +3282,11 @@ cmd_unarchive() {
         echo -e "${RED}Error: failed to insert node $node_id${NC}" >&2
         return 1
     fi
+
+    # Clear any deletion tombstone for this id (wv-0d5e07). Without this the
+    # restored row (lineage_seq 0 from the archive) sits at or below its tombstone
+    # and _reconcile_tombstones would delete it again on the next wv load.
+    db_query "DELETE FROM tombstones WHERE kind='node' AND id='$(sql_escape "$node_id")';" 2>/dev/null || true
 
     echo -e "${GREEN}✓${NC} Restored: $node_id — $r_text"
 

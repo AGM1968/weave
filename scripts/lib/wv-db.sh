@@ -162,6 +162,23 @@ CREATE TABLE IF NOT EXISTS quality_exempt (
     reason       TEXT NOT NULL DEFAULT ''
 );
 
+-- quality_config_sig: which .weave/quality.conf the two tables above were
+-- projected from. It lives HERE, inside the database it describes, so the memo
+-- and the projection share one lifetime and cannot disagree.
+--
+-- wv-785ba1: the signature used to be a file beside the DB
+-- ($WV_HOT_ZONE/.quality_conf_sig), on the reasoning that "a rebuilt brain.db
+-- loses it and reloads". A sibling file survives the database. A hot zone whose
+-- brain.db was rebuilt kept a stamp asserting freshness over an empty
+-- quality_exempt, so wv done hard-blocked on a path quality.conf had explicitly
+-- exempted -- the same false GraphPolicyViolation wv-6657dd set out to prevent,
+-- reached by losing the table instead of by editing the file. Dropping the DB
+-- now drops the claim about it.
+CREATE TABLE IF NOT EXISTS quality_config_sig (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    signature TEXT NOT NULL
+);
+
 -- file_trend: per-file trend direction, refreshed by wv done from quality.db.
 -- Values: 'deteriorating' | 'stable' | 'refactored'. Consumed by wv-67a870 soft
 -- warning and wv-44cbc5 hard gate; stored here so the trigger can query it.
@@ -316,6 +333,10 @@ EOF
     # heredoc above is the bootstrap version; this supersedes it. (The heredoc is
     # an unquoted <<EOF — it cannot call a function mid-body, hence this follow-up.)
     _policy_trigger_sql | sqlite3 "$WV_DB" 2>/dev/null || true
+    # Writer lineage lives in a migration rather than the schema heredoc above so
+    # that a fresh database and a migrated one produce identical CREATE TABLE
+    # text — see db_migrate_lineage for why that matters to state.sql.
+    db_migrate_lineage
     # Tighten perms on the DB file in case it predates the umask change.
     [ -f "$WV_DB" ] && chmod 600 "$WV_DB" 2>/dev/null || true
 }
@@ -403,6 +424,121 @@ CREATE INDEX IF NOT EXISTS idx_nodes_priority ON nodes(priority);
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
 CREATE INDEX IF NOT EXISTS idx_nodes_type_priority ON nodes(type, priority);
 MIGRATE
+}
+
+# Migrate nodes and edges to carry writer lineage (wv-e1556b, epic delta-causality).
+#
+# Delta replay used to resolve every conflict by comparing wall clocks, which is
+# not an ordering that can answer "which write happened after the other"
+# (docs/PROPOSAL-delta-causality.md). These two columns carry the information the
+# comparison was missing: which actor last wrote the row, and at what point on
+# that actor's Lamport counter.
+#
+# lineage_seq is a Lamport value, not a timestamp. It is only ever compared to
+# other lineage_seq values, and an actor advances it past the maximum it has
+# observed, so it is monotonic per actor by construction and comparable across
+# actors. (lineage_seq, lineage_actor) is a total order with a deterministic
+# tie-break for concurrent writes.
+#
+# The CHECK constraints are the point, not decoration. nodes.updated_at is
+# declared DATETIME (NUMERIC affinity) but is written as TEXT by
+# CURRENT_TIMESTAMP and as INTEGER by direct SQL; SQLite orders every INTEGER
+# before every TEXT, so a mixed-storage-class column does not compare values at
+# all, it compares storage classes and one side wins unconditionally. Pinning the
+# storage class at write time is what stops the replacement inheriting that.
+#
+# Backfill is deterministic: pre-causality rows take ('', 0), which sorts before
+# every real lineage and identifies them as pre-cutover to the loader.
+#
+# Called from db_init as well as from cmd_load, so a freshly created database and
+# a migrated one carry byte-identical schema text — ALTER TABLE appends columns
+# at the end of the stored CREATE TABLE, which a hand-written CREATE TABLE in the
+# db_init heredoc could not reproduce. state.sql is compared byte-wise by the
+# auto_sync no-op guard, so that divergence would be permanent churn between
+# agents.
+#
+# Canonical column order is (lineage_actor, lineage_seq) on BOTH tables — the
+# order the four ALTERs below produce on a clean table. ALTER TABLE ADD COLUMN
+# can only append, so a load-migrate reaches that order only when the snapshot
+# it imported carried no lineage columns or already carried them in this order.
+# It cannot repair a snapshot whose columns are absent-on-one-table or reversed
+# (that is how the wv-e1556b snapshot first shipped — nodes with lineage_seq
+# alone, later auto-synced to a reversed (seq, actor)). Two things follow:
+#   - a diverged snapshot must be REGENERATED from a canonical db_init database
+#     (see wv-5d3ba8), never hand-patched;
+#   - a hot-zone DB already migrated in the wrong order does NOT self-heal on
+#     `wv load` — cmd_load's pre-flight `auto_sync --force` dumps that DB over
+#     state.sql first. Recover by removing the hot zone so the reload has no
+#     live DB to flush: `rm -rf "$WV_HOT_ZONE" && wv load`.
+# tests/test-data.sh guards the committed .weave/state.sql against regressing to
+# a non-db_init order.
+db_migrate_lineage() {
+    sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
+ALTER TABLE nodes ADD COLUMN lineage_actor TEXT NOT NULL DEFAULT '' CHECK(typeof(lineage_actor) = 'text');
+ALTER TABLE nodes ADD COLUMN lineage_seq INTEGER NOT NULL DEFAULT 0 CHECK(typeof(lineage_seq) = 'integer');
+ALTER TABLE edges ADD COLUMN lineage_actor TEXT NOT NULL DEFAULT '' CHECK(typeof(lineage_actor) = 'text');
+ALTER TABLE edges ADD COLUMN lineage_seq INTEGER NOT NULL DEFAULT 0 CHECK(typeof(lineage_seq) = 'integer');
+MIGRATE
+    # Replay orders by (lineage_seq, lineage_actor) and seeds an actor's counter
+    # from the maximum it can observe; both are covering-index reads.
+    sqlite3 "$WV_DB" <<'MIGRATE_IDX' 2>/dev/null || true
+CREATE INDEX IF NOT EXISTS idx_nodes_lineage ON nodes(lineage_seq, lineage_actor);
+CREATE INDEX IF NOT EXISTS idx_edges_lineage ON edges(lineage_seq, lineage_actor);
+MIGRATE_IDX
+    # Cross-machine deletion tombstone (epic delta-causality, wv-ba9dc8 +
+    # wv-0d5e07). Replaces the gitignored, machine-local .weave/.prune_epoch:
+    # dump_state_sql emits this table so a delete travels to every clone. Delta v2
+    # node_delete/edge_delete write a row here on the op lineage; the v1 paths
+    # wv delete / wv prune write one on the deleted row's own lineage via
+    # db_write_tombstone. cmd_load's _reconcile_tombstones then removes any entity
+    # the delta back-catalog resurrected at or below its tombstone lineage_seq,
+    # while a genuine higher-lineage recreate survives. Created here rather than in
+    # the db_init heredoc so a fresh and a migrated database carry byte-identical
+    # CREATE TABLE text (state.sql is byte-compared by auto_sync).
+    sqlite3 "$WV_DB" <<'MIGRATE_TOMB' 2>/dev/null || true
+CREATE TABLE IF NOT EXISTS tombstones (
+    kind TEXT NOT NULL CHECK(kind IN ('node','edge')),
+    id TEXT NOT NULL,
+    lineage_seq INTEGER NOT NULL DEFAULT 0 CHECK(typeof(lineage_seq) = 'integer'),
+    lineage_actor TEXT NOT NULL DEFAULT '' CHECK(typeof(lineage_actor) = 'text'),
+    PRIMARY KEY (kind, id)
+);
+MIGRATE_TOMB
+}
+
+# db_write_tombstone KIND ID [LINEAGE_SEQ] [LINEAGE_ACTOR] — record a cross-machine
+# deletion tombstone (epic delta-causality, wv-0d5e07). Called by wv delete and
+# wv prune in place of the machine-local .weave/.prune_epoch. KIND is 'node' or
+# 'edge'; ID is the node id, or the "source:target:type" identity for an edge
+# (the join key wv-delta-v2-replay.py::_apply_delete also tombstones on).
+#
+# LINEAGE_SEQ is the deleted row's own lineage_seq at delete time — the highest
+# lineage that row can carry — so any delta that later replays its creation or an
+# earlier patch lands at or below the tombstone and _reconcile_tombstones removes
+# it, while a recreate stamped after the delete carries a strictly greater
+# lineage_seq and survives (the reconcile orders on seq alone for these v1-written
+# rows). LINEAGE_ACTOR is provenance — the agent performing the delete
+# (resolve_agent_id) — kept for parity with the Delta v2 tombstone shape. Omitted
+# args fall to the pre-cutover floor (0, ''). ON CONFLICT keeps the higher
+# (seq, actor) so a re-delete never regresses an existing tombstone.
+db_write_tombstone() {
+    local kind="$1" ident="$2" lseq="${3:-0}" lactor="${4:-}"
+    [ "$kind" = "node" ] || [ "$kind" = "edge" ] || return 1
+    [ -n "$ident" ] || return 1
+    [[ "$lseq" =~ ^[0-9]+$ ]] || lseq=0
+    local esc_id esc_actor
+    if command -v sql_escape >/dev/null 2>&1; then
+        esc_id=$(sql_escape "$ident"); esc_actor=$(sql_escape "$lactor")
+    else
+        esc_id=${ident//\'/\'\'}; esc_actor=${lactor//\'/\'\'}
+    fi
+    db_query "INSERT INTO tombstones(kind, id, lineage_seq, lineage_actor)
+        VALUES ('$kind', '$esc_id', $lseq, '$esc_actor')
+        ON CONFLICT(kind, id) DO UPDATE SET
+            lineage_seq = excluded.lineage_seq,
+            lineage_actor = excluded.lineage_actor
+        WHERE (excluded.lineage_seq, excluded.lineage_actor)
+            > (tombstones.lineage_seq, tombstones.lineage_actor);"
 }
 
 # Migrate to add FTS5 full-text search table (Phase 2.1).
@@ -681,6 +817,23 @@ db_migrate_quality_exempt() {
 CREATE TABLE IF NOT EXISTS quality_exempt (
     path_pattern TEXT PRIMARY KEY,
     reason       TEXT NOT NULL DEFAULT ''
+);
+
+-- quality_config_sig: which .weave/quality.conf the two tables above were
+-- projected from. It lives HERE, inside the database it describes, so the memo
+-- and the projection share one lifetime and cannot disagree.
+--
+-- wv-785ba1: the signature used to be a file beside the DB
+-- ($WV_HOT_ZONE/.quality_conf_sig), on the reasoning that "a rebuilt brain.db
+-- loses it and reloads". A sibling file survives the database. A hot zone whose
+-- brain.db was rebuilt kept a stamp asserting freshness over an empty
+-- quality_exempt, so wv done hard-blocked on a path quality.conf had explicitly
+-- exempted -- the same false GraphPolicyViolation wv-6657dd set out to prevent,
+-- reached by losing the table instead of by editing the file. Dropping the DB
+-- now drops the claim about it.
+CREATE TABLE IF NOT EXISTS quality_config_sig (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    signature TEXT NOT NULL
 );
 
 DROP TRIGGER IF EXISTS nodes_policy_check;
@@ -1136,6 +1289,9 @@ db_query_json() {
 # db_query_json_v2 — lean JSON shape for --json-v2 flag:
 #   - metadata promoted from escaped string to nested object
 #   - created_at / updated_at omitted
+#   - lineage_actor / lineage_seq omitted: replay bookkeeping, not graph meaning,
+#     and lineage_seq=0 on a backfilled row would survive the empty-value filter
+#     and appear in every consumer record (weave_gh, the active-node hook, MCP)
 #   - null/empty fields omitted
 db_query_json_v2() {
     db_ensure
@@ -1147,7 +1303,7 @@ db_query_json_v2() {
         then {metadata: (.metadata | fromjson? // {})}
         else {}
         end
-    ) | del(.created_at, .updated_at)
+    ) | del(.created_at, .updated_at, .lineage_actor, .lineage_seq)
       | with_entries(select(.value != null and .value != ""))]'
 }
 

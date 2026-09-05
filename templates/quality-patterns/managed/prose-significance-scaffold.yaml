@@ -1,6 +1,7 @@
 id: prose-significance-scaffold
 language: prose
 kind: regex
+violation_type: prose:unearned-significance
 severity: info
 provenance: >-
   wv-efa6fb @nowcastr (2026-07-23 -- "stated directly in CDDIS's own

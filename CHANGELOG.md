@@ -4,6 +4,107 @@
 
 ## Unreleased
 
+## [1.71.0-rc.11] - 2026-09-04
+
+Causal delta ordering and prose-tooling prerelease. `wv load` now merges deltas by causal lineage
+rather than the wall clock, so a delta replayed from the committed back-catalog cannot revert or
+delete a causally newer row; the Delta v2 CAS op sidecars are written by default and dispatched
+first. Prose tooling reports what a repair sweep and a pattern rule actually do, and three managed
+rules now record their peer-reviewed corpus support.
+
+### Added
+
+- `wv quality prose-shape [path] [--baseline <ref>]` reports what a repair sweep turns prose into,
+  which finding counts cannot show: sentence count, word count, length spread, and how sentences
+  continue after a comma. A split-only sweep reads as `coord_pct` falling with `subord_pct` and
+  `phrase_pct` flat — joins became full stops rather than another relationship. `--baseline`
+  profiles the same paths at a git ref through the same code path and compares only files present on
+  both sides. No thresholds ship: the movement is reported, the judgement is the document's.
+
+- `wv quality patterns show [RULE_ID|--all]` reports what a rule searches for, as the engine
+  searches for it: the expressions, their flags, and the kinds that have none. The matcher is not
+  the `terms:` list, and nothing exposed the difference — `lexicon` and `motif` are word-bounded and
+  case-INsensitive, `density` is a lowercased substring with no word boundary, and `citation`
+  carries check-mode selectors rather than searchable text, so `show` returns a null expression list
+  for it instead of inventing one. Rules with `min_count` or proximity suppression say so, and say
+  that a match count is not a violation count. `--all` is one call; expressions come from the
+  engine's own `_word_regex` rather than a second implementation that could drift from it.
+
+- A guide may declare extra `##` sections in frontmatter (`sections: name|name`), so a violation
+  type with named sub-forms or a corpus exemplars block no longer fails to load. The vocabulary
+  stays closed around the declaration: an undeclared heading, a declaration the body never uses, a
+  declaration restating one of the four fixed names, and an empty declared section are all errors.
+  Declared bodies render after the fixed four under `extended_sections`.
+- `wv init-repo` seeds the project guide contract: `.weave/guides.README.md` (resolution order, the
+  section rules, and how a local section name is promoted upstream) plus a working
+  `.weave/guides/example-violation.md` to copy. Seeded files are never overwritten on `--update`.
+  Driven by `templates/authoring/manifest.conf`, so the next authorable class is a template and a
+  row rather than new installer code.
+
+### Changed
+
+- Delta replay is ordered by causal lineage, not the wall clock (epic). Every changeset
+  arm now carries `(lineage_seq, lineage_actor)` and a compare-and-set guard, so a delta replayed
+  from the committed back-catalog can no longer revert or delete a causally newer row; `wv load`
+  orders the v1 SQL replay by the `/* weave-lineage */` header rather than the filename epoch. A
+  committed `.weave/causal-cutover` marker fail-closes the pre-lineage back-catalog, and
+  cross-machine deletions travel as `tombstones` rows in `state.sql` in place of the machine-local
+  `.weave/.prune_epoch`. Consumers inherit the `.gitattributes` rules (`causal-cutover merge=ours`,
+  `deltas/**/*.json merge=theirs`) on `wv init-repo --update`. Existing consumer repos need no
+  migration: their committed catalogs predate the cutover marker and are skipped on load; a one-time
+  `wv compact` after every agent has synced past the marker is optional housekeeping, not required.
+
+- The Delta v2 CAS op sidecars (`.weave/deltas/<date>/v2/*.json`) are now written by default and
+  dispatched first on `wv load`, under per-field expected/value preconditions. Set
+  `WV_DELTA_V2_WRITE=0` to suppress them; the lineage-guarded v1 SQL path stays authoritative on its
+  own either way.
+
+- `wv quality patterns scan` distinguishes a rule that found nothing from one that never ran. Every
+  prose rule is scoped to `docs/**/*.md`, so scanning a `.py` reported each at 0 — a structural zero
+  printed identically to a clean result. Out-of-scope rules are now named in the rows, in the header
+  count, and as `out_of_scope` in `--json`.
+
+- Three managed rules now record their corpus support: `prose-work-context-leakage`,
+  `prose-retrospective-announcement` and `prose-verification-reassurance` occur zero times in
+  986,291 words of peer-reviewed papers, which is the strongest evidence a prohibition can carry.
+  The first two also fire in this repository and are load-bearing; the third fires nowhere and is
+  supported but inert, a distinction the provenance keeps rather than flattens.
+
+- All 14 managed prose and markdown rules now declare `violation_type`, mapped to the catalogued
+  vocabulary in `contracts/violation-vocabulary-v1.json`. The coaching planner rejected every one of
+  their observations as `uncatalogued_violation_type`, so a managed rule could fire and never coach.
+  They now resolve; types without a guide of their own reach `_uncoached`, which coaches and names
+  the gap rather than erroring. Consumers inherit this on `wv init-repo --update`.
+
+- `prose-filler-phrases` no longer flags `in order to`. Calibrated against 84 peer-reviewed papers
+  (986,291 words), where it appears 81 times — 0.821 per 10,000, and 81 of the rule's 91 corpus
+  hits. Published technical writing spends it to state purpose where a bare "to" states sequence, so
+  forbidding it was stricter than the standard the rule appeals to. The five retained phrases occur
+  10 times in that corpus and the prohibition stands for them. Consumers inherit this on
+  `wv init-repo --update`. See `docs/RULE-CALIBRATION-2026-09-02.md`.
+
+### Fixed
+
+- A wall-clock-newer delta at a lower causal lineage could silently override a causally newer
+  checkpoint on `wv load` (); the E6 durability battery had encoded this as an expected
+  XFAIL. The lineage-guarded merge resolves it and the battery re-contracts the row to `pass`.
+
+- Delta v2 `node_patch` / `edge_patch` replay lacked the lineage guard `node_create` already
+  carried, so a stale-lineage op (e.g. the `claimed_by` patch `wv add` emits) applied against — and
+  regressed the `lineage_seq` of — a causally newer row on a fresh clone whose `state.sql` was
+  already authoritative, re-opening it to stale v1 deltas. Both patch appliers now report
+  `precondition_conflict` when the row is already at or beyond a later emission.
+
+- A no-net-change mutation emitted a changeset that was only the `/* weave-lineage */` header plus a
+  `-- no-op` comment; `auto_sync` kept the non-empty file and `wv load`'s corrupt-delta detector
+  flagged the block-comment header as corrupt on every load in every clone. `auto_sync` now drops a
+  changeset with no replayable statement, and the detector treats a self-contained `/* … */` line as
+  benign.
+
+- `wv quality patterns` help documented "one of four kinds" and never mentioned `citation`, the one
+  kind with no text form. Five kinds now, with `lexicon`/`motif` case-insensitivity stated where a
+  rule author will see it.
+
 ## [1.71.0-rc.10] - 2026-08-30
 
 Canary-driven workflow correctness prerelease. Documented close fields are no longer silently
@@ -27,9 +128,9 @@ shipping surface now exposes and installs the same corrected workflow.
 
 ## [1.71.0-rc.9] - 2026-08-27
 
-Corrective distribution prerelease. The public projection no longer imposes Poetry on consumers,
-and the publication path now fails closed on stale generated content and derives prerelease status
-from the version being released.
+Corrective distribution prerelease. The public projection no longer imposes Poetry on consumers, and
+the publication path now fails closed on stale generated content and derives prerelease status from
+the version being released.
 
 ### Fixed
 
@@ -73,8 +174,8 @@ shadows, graph state, and capture artifacts remain excluded from the public `wea
 
 ## [1.71.0-rc.7] - 2026-08-25
 
-Public maintenance prerelease carrying the post-rc.5 durability and fail-closed safety review,
-plus the approved prose-correctness fixes and `prose-significance-scaffold` managed rule. Private
+Public maintenance prerelease carrying the post-rc.5 durability and fail-closed safety review, plus
+the approved prose-correctness fixes and `prose-significance-scaffold` managed rule. Private
 evidence batteries, Rust shadows, graph state, capture artifacts, and unrelated feature work remain
 excluded from the public `weave` projection.
 
@@ -103,9 +204,9 @@ release remains frozen; this candidate is distributed from the private source re
 - **`wv quick` commits only what you staged** — it ran `git add -u` first, staging every tracked
   modification, so running it mid-edit to record an unrelated defect swept in-progress work into a
   commit whose message described the new node. Unstaged tracked changes are now left in the working
-  tree and reported, and untracked files are unaffected as before. A **failed** commit now leaves the
-  node active and exits nonzero instead of printing `Commit failed — closing node anyway` and closing
-  it, which hid unrecorded work from the next session. With nothing staged the documented
+  tree and reported, and untracked files are unaffected as before. A **failed** commit now leaves
+  the node active and exits nonzero instead of printing `Commit failed — closing node anyway` and
+  closing it, which hid unrecorded work from the next session. With nothing staged the documented
   create/commit/close behaviour is unchanged.
 
 - **`wv trails` notes are append-only** — `wv trails save --message=` now records each note under a
@@ -115,8 +216,8 @@ release remains frozen; this candidate is distributed from the private source re
   `wv trails save` with no message at all removed the section outright. Growth is bounded by
   `WV_TRAILS_NOTES_CAP` (default 20, oldest dropped first). Notes written before this release are
   preserved and labelled `### (undated,...)` on first append. The section is delimited by an
-  explicit `<!-- /wv-notes -->` marker, so a note whose body contains its own `## ` headings is
-  no longer truncated. The section end is resolved from the *last* marker in the file and reserved
+  explicit `<!-- /wv-notes -->` marker, so a note whose body contains its own `## ` headings is no
+  longer truncated. The section end is resolved from the _last_ marker in the file and reserved
   markers appearing in note text are neutralised on write, so a note that itself contains
   `<!-- /wv-notes -->` cannot truncate the notes above it. Entries are counted for the cap by a
   generated `<!-- wv-note -->` marker rather than by `###` headings, so a note containing its own
@@ -127,8 +228,8 @@ release remains frozen; this candidate is distributed from the private source re
   state and the last writer won: a 20-way probe retained 1 of 20 notes. A first attempt using
   `flock -w 15 || true` still lost 5 of 20, because a timed-out lock silently continued unlocked.
   Exactly one mechanism is now chosen by availability before any process participates: mixing them
-  let a waiter take the directory lock and write while the original `flock` holder was still live.
-  A lock timeout fails with a nonzero exit rather than proceeding, and the directory lock is never
+  let a waiter take the directory lock and write while the original `flock` holder was still live. A
+  lock timeout fails with a nonzero exit rather than proceeding, and the directory lock is never
   reclaimed on timeout, since removing a lock whose owner has not been proven dead evicts a live
   writer.
 - **A failed `wv trails save` reports failure** — the temporary write and the rename are both
@@ -137,8 +238,8 @@ release remains frozen; this candidate is distributed from the private source re
   `trails.md` byte-identical, and exits nonzero.
 - **`wv trails` flag contract** — `--json` is accepted only by `wv trails capsule`, and `--message`
   only by `wv trails save`. Passing either to the wrong subcommand now fails with an error naming
-  the right one. Previously `save` parsed `--json` and discarded it, reporting success for input
-  its sibling rejected as malformed.
+  the right one. Previously `save` parsed `--json` and discarded it, reporting success for input its
+  sibling rejected as malformed.
 
 - **Aggregating epics no longer re-acquire dead commit refs** — `wv done` rebuilds an epic's
   `metadata.commits` from its children on every close, so a child SHA that a later amend, reset or
@@ -151,7 +252,7 @@ release remains frozen; this candidate is distributed from the private source re
 
 - **The pre-commit gate lints staged shell** — staged Python has been linted with `ruff` here since
   the start; staged shell had nothing, because `shellcheck` lives only in `make check`, outside
-  impact-based suite routing. A lint regression in a file the map *does* route therefore stayed
+  impact-based suite routing. A lint regression in a file the map _does_ route therefore stayed
   invisible behind green suites: `SC1090` was introduced in `pre-action.sh` and went unnoticed for
   two commits while `make shellcheck` was red. The gate now runs `shellcheck --severity=warning` on
   staged shell files and blocks on findings. Scope mirrors the Makefile's `SHFILES`, so the gate and
@@ -169,9 +270,9 @@ release remains frozen; this candidate is distributed from the private source re
 
 - **The `wv impact` cache works** — it compared its cache file's mtime against the database file's
   mtime, and SQLite journals on reads, so the file advanced on every query, including the command's
-  own seed resolution moments earlier. The cache was written on every run and read on none: measured,
-  the newest entry sat about 36 hours behind the file mtime while the walk re-ran each time. It now
-  compares against the graph clock (`MAX(updated_at)`), matching `wv context`.
+  own seed resolution moments earlier. The cache was written on every run and read on none:
+  measured, the newest entry sat about 36 hours behind the file mtime while the walk re-ran each
+  time. It now compares against the graph clock (`MAX(updated_at)`), matching `wv context`.
 
 - **Agent surfaces describe the repo they are written into** — the managed blocks are authored for a
   consumer, so `wv init-repo --update` wrote into the weave source checkout that the repo "does not
@@ -225,10 +326,11 @@ release remains frozen; this candidate is distributed from the private source re
 
 - **A section whose body fails to emit no longer publishes** — the completeness manifest recorded
   headings only, so forcing the active-node row emission to fail left the heading in place, the rows
-  gone, and the save reporting success. The manifest now carries the item count the database reported
-  for each list section, taken from the query that decided to emit the section and therefore
-  independent of what the emission produced; the check compares it against the rows actually present.
-  Heading loss and body loss are caught by different machinery and are now covered separately.
+  gone, and the save reporting success. The manifest now carries the item count the database
+  reported for each list section, taken from the query that decided to emit the section and
+  therefore independent of what the emission produced; the check compares it against the rows
+  actually present. Heading loss and body loss are caught by different machinery and are now covered
+  separately.
 
 - **UTF-8 notes save again** — the byte-exactness check compared `wc -c` bytes against Bash
   `${#var}` characters, so any multi-byte note failed and wrote nothing (`café — 你好` is 9
@@ -240,21 +342,22 @@ release remains frozen; this candidate is distributed from the private source re
   declared section is verified present. A byte check cannot see this class: a skipped heading
   shortens the body and the file then matches that shorter body exactly.
 
-- **The staged-shell gate handles every path shape and fails closed** — `-z` output was piped through
-  `tr '\0' '\n'`, discarding NUL-safety at the first step, so a staged filename containing a newline
-  was never linted; `xargs` then split paths on spaces into nonexistent files and blocked commits for
-  files that were fine. Paths are now read with `mapfile -d ''` and passed as arguments. A `mktemp`
-  or `checkout-index` failure now refuses the commit instead of warning and continuing, and `mktemp`
-  is checked before any `--prefix` is built, so the empty-variable `--prefix="/"` path is gone.
+- **The staged-shell gate handles every path shape and fails closed** — `-z` output was piped
+  through `tr '\0' '\n'`, discarding NUL-safety at the first step, so a staged filename containing a
+  newline was never linted; `xargs` then split paths on spaces into nonexistent files and blocked
+  commits for files that were fine. Paths are now read with `mapfile -d ''` and passed as arguments.
+  A `mktemp` or `checkout-index` failure now refuses the commit instead of warning and continuing,
+  and `mktemp` is checked before any `--prefix` is built, so the empty-variable `--prefix="/"` path
+  is gone.
 
 - **`wv trails save` durability, properly this time** — the previous fix took the status of a
   redirected compound, which is its LAST command, so an earlier failed write followed by successful
   output still returned 0; and its `^Nodes: ` integrity check could be satisfied by a crafted note,
   since notes are written before the generated sections. `set -e` is not a usable remedy here:
-  measured, errexit reads as on inside the subshell, a failing command runs, and execution
-  continues — bash suppresses errexit for the dynamic extent of a command in a condition context and
-  subshells inherit that. The body is now generated once and written once, and three independent
-  conditions are checked: write status, byte-exactness against the generated content, and structural
+  measured, errexit reads as on inside the subshell, a failing command runs, and execution continues
+  — bash suppresses errexit for the dynamic extent of a command in a condition context and subshells
+  inherit that. The body is now generated once and written once, and three independent conditions
+  are checked: write status, byte-exactness against the generated content, and structural
   completeness validated only in the region after the last `<!-- /wv-notes -->` marker, which a note
   cannot write into. Verified against middle-generation failure, final-write failure, and both with
   forged markers in the note.
@@ -272,16 +375,16 @@ release remains frozen; this candidate is distributed from the private source re
   now comes from the compound command itself, and the saved file is validated for the Health block
   the generator always writes last. This also clears the final `shellcheck` finding in the tree.
 
-- **A hook library that fails *after* setting its guard no longer disables enforcement** — the
+- **A hook library that fails _after_ setting its guard no longer disables enforcement** — the
   previous fix checked whether the source succeeded, but a copy that sets `_WV_HOOK_COMMON_LOADED=1`
   and then fails leaves that guard behind, so the valid installed copy returned immediately at its
   own double-source guard and the library was never loaded. The hook still died at 127, still read
-  as ALLOW. Load guards are now cleared after a failed source so the next candidate re-executes.
-  The earlier test only covered a syntax error, which fails before setting anything; the runtime
-  failure is covered now too.
+  as ALLOW. Load guards are now cleared after a failed source so the next candidate re-executes. The
+  earlier test only covered a syntax error, which fails before setting anything; the runtime failure
+  is covered now too.
 
 - **`wv commit-refs --prune` proves persistence against the snapshot** — a drained change log is not
-  proof: with `_warp_changes` and its update trigger dropped, `auto_sync` recreated tracking *after*
+  proof: with `_warp_changes` and its update trigger dropped, `auto_sync` recreated tracking _after_
   the untracked UPDATE, saw nothing pending, and the command reported a persistence that never
   happened while `state.sql` stayed byte-identical. Change tracking is now ensured to exist before
   the mutation, and persistence is confirmed by `state.sql` actually changing.
@@ -290,10 +393,10 @@ release remains frozen; this candidate is distributed from the private source re
   so a JSON consumer could not tell a persisted prune from an unpersisted one. The payload now
   carries a `prune` object (`attempted`, `nodes_pruned`, `nodes_failed`, `persisted`).
 
-- **`wv commit-refs --all --json` no longer dies on large graphs** — the ref array was passed to `jq`
-  through `--argjson`, which exceeds the per-argument limit (`E2BIG`) at this repository's ~1900
-  refs; the failure was swallowed, exiting 0 with empty stdout. Rows now reach `jq` through a file,
-  and a serialization or render failure exits nonzero instead of reporting success.
+- **`wv commit-refs --all --json` no longer dies on large graphs** — the ref array was passed to
+  `jq` through `--argjson`, which exceeds the per-argument limit (`E2BIG`) at this repository's
+  ~1900 refs; the failure was swallowed, exiting 0 with empty stdout. Rows now reach `jq` through a
+  file, and a serialization or render failure exits nonzero instead of reporting success.
 
 - **A broken hook library no longer disables enforcement** — `pre-action.sh` picked its libraries by
   readability alone and claimed the load even when the file failed to source, so a broken nearest
@@ -303,7 +406,7 @@ release remains frozen; this candidate is distributed from the private source re
 
 - **`wv commit-refs --prune` persists before reporting success** — it wrote only to the hot DB, so
   `state.sql` stayed byte-identical and the next `wv load` restored every ref just removed, while
-  the command printed success. It now syncs and *verifies* the change log drained rather than
+  the command printed success. It now syncs and _verifies_ the change log drained rather than
   trusting a return code (`auto_sync` returns 0 from five different skip paths), reports explicitly
   when auto-sync is disabled, and exits nonzero when a prune could not be persisted.
 
@@ -324,18 +427,18 @@ release remains frozen; this candidate is distributed from the private source re
   `_hc_classify_tool` that sets the flag, and by collapsing four copies of the library-source
   fallback chain into one rule applied to all five libraries. Behaviour is unchanged: every payload
   in a 15-case differential returns the same exit code as before. `pre-action.sh`'s own fail-closed
-  path now has direct test coverage, which it never had — only `wv hook
-  dispatch`/`normalize` were tested for it.
+  path now has direct test coverage, which it never had — only
+  `wv hook dispatch`/`normalize` were tested for it.
 
 ### Added
 
 - **`wv commit-refs`** — audits the commit SHAs recorded on nodes against the pushed branch. Each
-  ref is classified `reachable` (an ancestor of the pushed ref), `pending` (local only — unpushed
-  or on another branch, and not an orphan), `unreachable` (the object exists but no ref reaches it,
-  the signature of an amend, reset or rebase) or `missing` (gone from this object database).
-  `--all` lists every ref rather than only the orphans, `--json` emits the same data structured,
-  and `--prune` removes orphaned refs — at every node that records one, children included, since
-  an epic-only edit does not survive the next aggregation. `wv doctor` now carries the count as an
+  ref is classified `reachable` (an ancestor of the pushed ref), `pending` (local only — unpushed or
+  on another branch, and not an orphan), `unreachable` (the object exists but no ref reaches it, the
+  signature of an amend, reset or rebase) or `missing` (gone from this object database). `--all`
+  lists every ref rather than only the orphans, `--json` emits the same data structured, and
+  `--prune` removes orphaned refs — at every node that records one, children included, since an
+  epic-only edit does not survive the next aggregation. `wv doctor` now carries the count as an
   advisory so drift surfaces without being asked for; `--repair` deliberately does not prune, as
   discarding recorded provenance is a deliberate act rather than a repair.
 
@@ -343,8 +446,8 @@ release remains frozen; this candidate is distributed from the private source re
 
 Release-candidate respin of rc.4 with the E6/E7 durability evidence chain rebound to the exact
 shipped `tests/test-data.sh` source and all five controlled runner bundles recaptured against the
-rc.4 implementation closure. Assertions, dispositions, and runtime behavior are unchanged; the
-full gate passes with only the documented clock-skew XFAIL.
+rc.4 implementation closure. Assertions, dispositions, and runtime behavior are unchanged; the full
+gate passes with only the documented clock-skew XFAIL.
 
 ## [1.71.0-rc.4] - 2026-08-13
 
@@ -378,9 +481,9 @@ rerun after installation in existing repositories rather than only against the s
 
 ### Added
 
-- **Prose rule capabilities** — `kind: density`, `kind: citation`, and
-  `match_scope: heading` support punctuation-density checks, reference-list resolution, and heading
-  rules without embedding Markdown marker syntax in every pattern.
+- **Prose rule capabilities** — `kind: density`, `kind: citation`, and `match_scope: heading`
+  support punctuation-density checks, reference-list resolution, and heading rules without embedding
+  Markdown marker syntax in every pattern.
 - **Known-answer release gate** — 29 fixtures preserve the audit cases across regression, near-miss,
   and coverage classes. Corpus census remains a separate required gate because fixture correctness
   alone did not predict the first citation rule's real-document precision.
@@ -400,10 +503,10 @@ withdrawn.
 - **Inline-code prose exclusion** — prose content rules no longer flag examples inside CommonMark
   inline code spans, including spans crossing a soft-wrapped source line. Unmatched backticks remain
   literal text and source positions after a span remain exact.
-- **Zero-precision default withdrawn** — `prose-number-free-verification` was removed from the active
-  built-in set after its first closed methods-document adjudication classified all 14 findings as
-  false positives. The motif engine remains available, but this term list will not return without
-  broader cross-genre calibration.
+- **Zero-precision default withdrawn** — `prose-number-free-verification` was removed from the
+  active built-in set after its first closed methods-document adjudication classified all 14
+  findings as false positives. The motif engine remains available, but this term list will not
+  return without broader cross-genre calibration.
 - **Release projection containment** — public artifacts now recursively strip ignored nested
   `.weave` runtime caches from every shipped subtree, including builds made from worked-in source
   checkouts rather than only fresh clones.

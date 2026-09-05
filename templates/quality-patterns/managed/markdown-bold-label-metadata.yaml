@@ -1,6 +1,7 @@
 id: markdown-bold-label-metadata
 language: prose
 kind: regex
+violation_type: markdown:metadata-formatting
 severity: info
 policy: always-on-shared
 maturity: promotable

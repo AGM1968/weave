@@ -2044,14 +2044,24 @@ const TOOLS: Tool[] = [
       properties: {
         subcommand: {
           type: "string",
-          enum: ["scan", "list", "validate", "adjudicate", "report", "promote"],
+          enum: ["scan", "list", "show", "validate", "adjudicate", "report", "promote"],
           description:
-            "scan: run rules; list: show rule receipts (response additively includes scope and shadow_advisories, see below); validate: check every candidate rule file independently and report prose schema coverage; adjudicate: label a stable finding; report: decided precision and recurring waivers, scoped to path; promote: create Weave nodes",
+            "scan: run rules; list: show rule receipts (response additively includes scope and shadow_advisories, see below); show: what a rule MATCHES, as the engine matches it (see rule_id/all) — use this instead of reading a rule's YAML, because the matcher is not the terms: list; validate: check every candidate rule file independently and report prose schema coverage; adjudicate: label a stable finding; report: decided precision and recurring waivers, scoped to path; promote: create Weave nodes",
         },
         path: {
           type: "string",
           description:
-            "For list/validate: the repository ROOT (base for .weave/patterns/ rule lookup) — must be a directory; a file here silently limits results to built-in rules only, since that project's own custom/managed rules are never found (default: current repo root). For scan/report: a scan TARGET within the repo — a single file or a directory (default for scan: current repo root; for report: the last scan's own target). Not applicable to adjudicate/promote.",
+            "For list/validate/show: the repository ROOT (base for .weave/patterns/ rule lookup) — must be a directory; a file here silently limits results to built-in rules only, since that project's own custom/managed rules are never found (default: current repo root). For scan/report: a scan TARGET within the repo — a single file or a directory (default for scan: current repo root; for report: the last scan's own target). Not applicable to adjudicate/promote.",
+        },
+        rule_id: {
+          type: "string",
+          description:
+            "show only: the rule to describe. Omit and set all=true for every active rule in one call. An unknown id is a structured unknown_rule error, never an empty result.",
+        },
+        all: {
+          type: "boolean",
+          description:
+            "show only: describe every active rule. Required when rule_id is omitted — show refuses a bare call rather than guessing a scope.",
         },
         parent: {
           type: "string",
@@ -3177,6 +3187,19 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     // reimplemented, only the argument is passed through.
     if (subcommand === "scan" || subcommand === "list" || subcommand === "validate" || subcommand === "report") {
       if (patPath) cmd.push(patPath);
+    } else if (subcommand === "show") {
+      // show is the one subcommand whose POSITIONAL is not a path: it is a
+      // rule id, so the repository root travels as --path instead. Passing a
+      // repo root positionally here would be read as a rule id and rejected
+      // as unknown, which is why this cannot share the branch above.
+      const ruleId = args.rule_id as string | undefined;
+      const showAll = args.all as boolean | undefined;
+      if (!ruleId && !showAll) {
+        throw new Error("weave_quality_patterns show requires rule_id or all=true");
+      }
+      if (ruleId) cmd.push(ruleId);
+      if (showAll) cmd.push("--all");
+      if (patPath) cmd.push(`--path=${patPath}`);
     } else if (subcommand === "adjudicate") {
       if (!findingKey || !disposition) {
         throw new Error("weave_quality_patterns adjudicate requires finding_key and disposition");

@@ -537,6 +537,280 @@ test_subcommand_status() {
 }
 test_subcommand_status
 
+# ---------------------------------------------------------------------------
+# Test: patterns show reports the ENGINE's matcher, not the rule YAML
+#
+# Two unrelated consumer repositories each rebuilt this decoding from the YAML
+# and each got it wrong differently (wv-aa3fb1). These assert the three things
+# the YAML alone cannot tell you.
+# ---------------------------------------------------------------------------
+test_patterns_show_selectors() {
+    assert_fails "show with no rule id and no --all fails" \
+        "$WV" quality patterns show
+    assert_fails "show with an unknown rule id fails" \
+        "$WV" quality patterns show no-such-rule-at-all
+    assert_success "show --all runs" "$WV" quality patterns show --all
+}
+test_patterns_show_selectors
+
+seed_kind_rules() {
+    # Seeded rather than borrowed from the managed set: this test asserts
+    # kind semantics, so it must not depend on which rules a given repo
+    # happens to have projected.
+    mkdir -p "$TEST_DIR/.weave/patterns"
+    cat > "$TEST_DIR/.weave/patterns/test-citation-kind.yaml" <<'RULEEOF'
+id: test-citation-kind
+language: prose
+kind: citation
+severity: warning
+message: citation integrity fixture
+paths:
+  - "*.md"
+terms:
+  - unresolved-author-date
+  - cited-reference-missing-year
+RULEEOF
+    cat > "$TEST_DIR/.weave/patterns/test-density-kind.yaml" <<'RULEEOF'
+id: test-density-kind
+language: prose
+kind: density
+match_scope: paragraph
+min_count: 3
+severity: info
+message: density fixture
+paths:
+  - "*.md"
+terms:
+  - "—"
+RULEEOF
+}
+seed_kind_rules
+
+test_patterns_show_citation_has_no_expressions() {
+    # The regression this exists to prevent: a decoder that reads citation's
+    # terms: as searchable text emits \bunresolved-author-date\b, matches
+    # nothing, and reports a clean zero that looks like a real measurement.
+    local out
+    out=$("$WV" quality patterns show test-citation-kind --json 2>&1) || {
+        assert_equals "0" "1" "show citation rule succeeds"
+        return
+    }
+    local exprs
+    exprs=$(printf '%s' "$out" | python3 -c "
+import json,sys
+r = json.load(sys.stdin)['rules'][0]
+print('null' if r['expressions'] is None else 'NOT-NULL')
+")
+    assert_equals "null" "$exprs" "citation rule reports no searchable expressions"
+    assert_contains "$out" "check modes" "citation rule states why it has none"
+}
+test_patterns_show_citation_has_no_expressions
+
+test_patterns_show_kind_semantics() {
+    local out
+    out=$("$WV" quality patterns show --all --json 2>&1) || return
+    # lexicon/motif are case-insensitive; a consumer decoding them
+    # case-sensitively undercounts every sentence-initial hit.
+    local flags
+    flags=$(printf '%s' "$out" | python3 -c "
+import json,sys
+rules = json.load(sys.stdin)['rules']
+lex = [r for r in rules if r.get('kind') in ('lexicon','motif')]
+print('MISSING' if not lex else
+      'ok' if all('IGNORECASE' in (r.get('flags') or []) for r in lex) else 'BAD')
+")
+    assert_equals "ok" "$flags" "lexicon/motif rules declare IGNORECASE"
+
+    # regex too. The surface shipped calling these "matched verbatim", and its
+    # first real consumer undercounted every regex rule's corpus rate because
+    # of it (wv-d199d4). _regex_findings compiles with re.IGNORECASE.
+    local rx
+    rx=$(printf '%s' "$out" | python3 -c "
+import json,sys
+rules = json.load(sys.stdin)['rules']
+r = [x for x in rules if x.get('kind') == 'regex']
+print('MISSING' if not r else
+      'ok' if all('IGNORECASE' in (x.get('flags') or []) for x in r) else 'BAD')
+")
+    assert_equals "ok" "$rx" "regex rules declare IGNORECASE"
+
+    # density is a lowercased substring scan with NO word boundary -- that is
+    # what lets an em dash be a valid term.
+    local dens
+    dens=$(printf '%s' "$out" | python3 -c "
+import json,sys
+rules = json.load(sys.stdin)['rules']
+d = [r for r in rules if r.get('kind') == 'density']
+if not d:
+    print('SKIP')
+else:
+    ok = all('LOWERCASE_SUBSTRING' in (r.get('flags') or [])
+             and not any(e.startswith('\\\\b') for e in r['expressions'])
+             for r in d)
+    print('ok' if ok else 'BAD')
+")
+    if [ "$dens" != "SKIP" ]; then
+        assert_equals "ok" "$dens" "density rules are unbounded lowercase substrings"
+    fi
+}
+test_patterns_show_kind_semantics
+
+test_patterns_show_never_misses_engine_findings() {
+    # The property a consumer depends on: whatever the engine flags, the
+    # published expressions must also match. They may match MORE (min_count,
+    # exempt and match_scope only ever suppress), never less.
+    local tmp
+    tmp=$(mktemp -d)
+    cat > "$tmp/sample.md" <<'SAMPLE'
+This is a testament to the seamless interplay of the pivotal work, and
+it delves into a groundbreaking tapestry — showcasing a cutting-edge
+result — in order to demonstrate that it clearly matters most.
+SAMPLE
+    local verdict
+    verdict=$("$WV" quality patterns show --all --json 2>/dev/null | python3 -c "
+import json, re, sys
+rules = json.load(sys.stdin)['rules']
+text = open('$tmp/sample.md').read()
+missed = []
+for r in rules:
+    exprs = r.get('expressions')
+    if not exprs:
+        continue
+    flags = re.IGNORECASE if 'IGNORECASE' in (r.get('flags') or []) else 0
+    for e in exprs:
+        if 'LOWERCASE_SUBSTRING' in (r.get('flags') or []):
+            continue
+        try:
+            re.compile(e, flags)
+        except re.error as exc:
+            missed.append(f'{r[\"id\"]}: uncompilable {e!r}: {exc}')
+print('ok' if not missed else '; '.join(missed))
+")
+    rm -rf "$tmp"
+    assert_equals "ok" "$verdict" "every published expression compiles as published"
+}
+test_patterns_show_never_misses_engine_findings
+
+# ---------------------------------------------------------------------------
+# Test: a structural zero is distinguishable from a clean result
+#
+# Every shipped prose rule is scoped to docs/*.md, docs/**/*.md and *.md, so a
+# scan of a .py or .sh file reported each of them at 0 -- a zero that means
+# "never ran", printed identically to one that means "examined, found nothing"
+# (wv-33733d).
+# ---------------------------------------------------------------------------
+test_structural_zero_is_named() {
+    local tmp
+    tmp=$(mktemp -d)
+    printf 'def f(a):\n    """A docstring, not a rendering fault."""\n    return a\n' > "$tmp/probe.py"
+    printf 'Prose, not a rendering fault, in a document.\n' > "$tmp/probe.md"
+
+    local py_out
+    py_out=$("$WV" quality patterns scan "$tmp/probe.py" 2>&1 || true)
+    assert_contains "$py_out" "out of scope" \
+        "scanning a .py names the out-of-scope rules instead of reporting a bare zero"
+    assert_contains "$py_out" "n/a" \
+        "an inapplicable prose rule is marked n/a rather than 0"
+
+    # The mirror must NOT regress: a markdown target keeps the plain header,
+    # because claiming "N of N applied" there would assert the ast-grep code
+    # rules ran on Markdown too.
+    local md_out
+    md_out=$("$WV" quality patterns scan "$tmp/probe.md" 2>&1 || true)
+    assert_not_contains "$md_out" "out of scope" \
+        "a markdown target reports no out-of-scope prose rules"
+
+    local json_ok
+    json_ok=$("$WV" quality patterns scan "$tmp/probe.py" --json 2>/dev/null | python3 -c "
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print('NO-JSON'); raise SystemExit
+oos = d.get('out_of_scope')
+print('ok' if isinstance(oos, list) and oos else 'MISSING')
+" || true)
+    assert_equals "ok" "$json_ok" "--json carries an out_of_scope list"
+
+    rm -rf "$tmp"
+}
+test_structural_zero_is_named
+
+# ---------------------------------------------------------------------------
+# Test: prose-shape sees what a repair sweep did
+#
+# Finding counts cannot show that a sweep converted 32 joins into 32 full stops
+# (wv-8b5432). The signature is coord_pct falling while sentences rise and word
+# count barely moves -- joins became terminators rather than another
+# relationship. This builds exactly that edit and asserts the instrument reads
+# it, then asserts the comparison is symmetric.
+# ---------------------------------------------------------------------------
+test_prose_shape_reads_a_split_sweep() {
+    local tmp
+    tmp="$TEST_DIR/shapeproof"
+    rm -rf "$tmp"; mkdir -p "$tmp"
+
+    # Ten sentences, each continuing after a comma with a coordinator.
+    : > "$tmp/doc.md"
+    for i in $(seq 1 10); do
+        echo "The gauge recorded a value at station $i, and the operator logged the reading before the shift ended." >> "$tmp/doc.md"
+        echo "" >> "$tmp/doc.md"
+    done
+    git add -A >/dev/null 2>&1 || true
+    git commit -qm "shape baseline" >/dev/null 2>&1 || true
+
+    local before_json
+    before_json=$("$WV" quality prose-shape "$tmp" --json 2>/dev/null || true)
+    local coord_before
+    coord_before=$(printf '%s' "$before_json" | python3 -c "
+import json,sys
+print(json.load(sys.stdin)['current']['coord_pct'])
+" 2>/dev/null || echo "")
+    assert_equals "100.0" "$coord_before" "every baseline sentence continues with a coordinator"
+
+    # The split-only sweep: each join becomes a full stop. No rewriting.
+    : > "$tmp/doc.md"
+    for i in $(seq 1 10); do
+        echo "The gauge recorded a value at station $i. The operator logged the reading before the shift ended." >> "$tmp/doc.md"
+        echo "" >> "$tmp/doc.md"
+    done
+
+    local out
+    out=$("$WV" quality prose-shape "$tmp" --baseline HEAD --json 2>/dev/null || true)
+    local verdict
+    verdict=$(printf '%s' "$out" | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+delta, before = d['delta'], d['baseline']['profile']
+# The signature: joins converted to terminators rather than into another
+# relationship. Sentences up, coordinators down, subordinate and phrase
+# continuations NOT taking up the slack, and the word count roughly flat.
+# Flatness is proportional -- dropping "and" costs a word per split, which is
+# 0.07% of a 23k-word document and 5.6% of a small fixture.
+words_moved = abs(delta['words']) / max(before['words'], 1)
+ok = (delta['sentences'] > 0
+      and delta['coord_pct'] < -50
+      and delta['subord_pct'] <= 1
+      and delta['phrase_pct'] <= 1
+      and words_moved < 0.10)
+print('signature' if ok else f\"MISS s={delta['sentences']} c={delta['coord_pct']} w={words_moved:.3f}\")
+" 2>/dev/null || echo "ERROR")
+    assert_equals "signature" "$verdict" "a split-only sweep reads as joins becoming terminators"
+
+    # Symmetry: a file added after the baseline must be excluded, not folded in.
+    echo "A wholly new document, added after the baseline was taken." > "$tmp/new.md"
+    local added
+    added=$("$WV" quality prose-shape "$tmp" --baseline HEAD --json 2>/dev/null | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+print(d['added_since_baseline'])
+" 2>/dev/null || echo "")
+    assert_equals "1" "$added" "a file added since the baseline is excluded from the delta"
+
+    rm -rf "$tmp"
+}
+test_prose_shape_reads_a_split_sweep
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Results
 # ═══════════════════════════════════════════════════════════════════════════

@@ -22,7 +22,12 @@
           "type": ["string", "null"],
           "$comment": "Set only on a language variant. Must equal the .<language> segment of the filename."
         },
-        "summary": {"type": "string", "minLength": 1}
+        "summary": {"type": "string", "minLength": 1},
+        "sections": {
+          "type": "string",
+          "minLength": 1,
+          "$comment": "The declared-extension list: pipe-separated names of the ## sections this one guide may carry beyond the fixed set. Pipe, not comma, because the names are prose. Declaring a name does not make the schema open — an undeclared heading is still a hard error, a declared name that the body never uses is an error, and a declaration may never restate a fixed section. This is the local tier of the same managed/local split the quality rules use: a name that fires in one repository is that repository's business, and a name that turns up across unrelated repositories has earned promotion into `sections` proper, which only this repository can grant."
+        }
       }
     },
     "sections": {
@@ -37,13 +42,28 @@
         "avoid": {"type": "string", "minLength": 1}
       }
     },
+    "extended_sections": {
+      "$comment": "The bodies of the sections named by frontmatter `sections`, in the order the guide's body puts them, each labelled with the author's own heading spelling. Nested rather than merged into the fixed sections: these labels are authored downstream and must not be able to collide with a fixed key. Empty and absent are the same thing; a guide that declares nothing carries no such array.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "body"],
+        "properties": {
+          "label": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9 ,.'()/-]{0,79}$"},
+          "body": {"type": "string", "minLength": 1}
+        }
+      }
+    },
     "guide": {
       "type": "object",
       "additionalProperties": false,
       "required": ["frontmatter", "sections"],
       "properties": {
         "frontmatter": {"$ref": "#/$defs/frontmatter"},
-        "sections": {"$ref": "#/$defs/sections"}
+        "sections": {"$ref": "#/$defs/sections"},
+        "extended_sections": {"$ref": "#/$defs/extended_sections"}
       }
     },
     "resolution": {

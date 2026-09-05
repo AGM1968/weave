@@ -6,6 +6,20 @@
       "type": "string",
       "pattern": "^[a-f0-9]{64}$"
     },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seq", "actor"],
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "actor": {
+          "type": "string"
+        }
+      }
+    },
     "status_value": {
       "type": "string",
       "enum": ["todo", "ready", "active", "blocked", "done"]
@@ -24,6 +38,61 @@
     "risk_level_value": {
       "type": "string",
       "enum": ["none", "low", "medium", "high"]
+    },
+    "text_value": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "alias_value": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "metadata_value": {
+      "type": "object"
+    },
+    "weight_value": {
+      "$comment": "Edge weight is a decimal string (weave.canonical-json.v1 has no non-integer number form). repr(float(x)) on both writer and replay makes the CAS comparison stable.",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "context_value": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "timestamp_value": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "integer"
+        }
+      ]
     },
     "status_patch": {
       "type": "object",
@@ -63,6 +132,333 @@
           "$ref": "#/$defs/risk_level_value"
         }
       }
+    },
+    "text_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected", "value"],
+      "properties": {
+        "expected": {
+          "$ref": "#/$defs/text_value"
+        },
+        "value": {
+          "$ref": "#/$defs/text_value"
+        }
+      }
+    },
+    "alias_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected", "value"],
+      "properties": {
+        "expected": {
+          "$ref": "#/$defs/alias_value"
+        },
+        "value": {
+          "$ref": "#/$defs/alias_value"
+        }
+      }
+    },
+    "metadata_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected", "value"],
+      "properties": {
+        "expected": {
+          "$ref": "#/$defs/metadata_value"
+        },
+        "value": {
+          "$ref": "#/$defs/metadata_value"
+        }
+      }
+    },
+    "weight_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected", "value"],
+      "properties": {
+        "expected": {
+          "$ref": "#/$defs/weight_value"
+        },
+        "value": {
+          "$ref": "#/$defs/weight_value"
+        }
+      }
+    },
+    "context_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected", "value"],
+      "properties": {
+        "expected": {
+          "$ref": "#/$defs/context_value"
+        },
+        "value": {
+          "$ref": "#/$defs/context_value"
+        }
+      }
+    },
+    "node_entity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {
+          "const": "node"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "edge_entity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "source", "target", "type"],
+      "properties": {
+        "kind": {
+          "const": "edge"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "node_patch_fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/status_patch"
+        },
+        "claimed_by": {
+          "$ref": "#/$defs/claimed_by_patch"
+        },
+        "risk_level": {
+          "$ref": "#/$defs/risk_level_patch"
+        },
+        "text": {
+          "$ref": "#/$defs/text_patch"
+        },
+        "alias": {
+          "$ref": "#/$defs/alias_patch"
+        },
+        "metadata": {
+          "$ref": "#/$defs/metadata_patch"
+        }
+      }
+    },
+    "edge_patch_fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "weight": {
+          "$ref": "#/$defs/weight_patch"
+        },
+        "context": {
+          "$ref": "#/$defs/context_patch"
+        }
+      }
+    },
+    "node_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "status", "metadata", "alias", "created_at"],
+      "properties": {
+        "text": {
+          "$ref": "#/$defs/text_value"
+        },
+        "status": {
+          "$ref": "#/$defs/status_value"
+        },
+        "metadata": {
+          "$ref": "#/$defs/metadata_value"
+        },
+        "alias": {
+          "$ref": "#/$defs/alias_value"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp_value"
+        }
+      }
+    },
+    "edge_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["weight", "context", "created_at"],
+      "properties": {
+        "weight": {
+          "$ref": "#/$defs/weight_value"
+        },
+        "context": {
+          "$ref": "#/$defs/context_value"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp_value"
+        }
+      }
+    },
+    "node_create_op": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity", "mutation", "lineage"],
+      "properties": {
+        "entity": {
+          "$ref": "#/$defs/node_entity"
+        },
+        "lineage": {
+          "$ref": "#/$defs/lineage"
+        },
+        "mutation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "row"],
+          "properties": {
+            "kind": {
+              "const": "node_create"
+            },
+            "row": {
+              "$ref": "#/$defs/node_row"
+            }
+          }
+        }
+      }
+    },
+    "node_patch_op": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity", "mutation", "lineage"],
+      "properties": {
+        "entity": {
+          "$ref": "#/$defs/node_entity"
+        },
+        "lineage": {
+          "$ref": "#/$defs/lineage"
+        },
+        "mutation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "fields"],
+          "properties": {
+            "kind": {
+              "const": "node_patch"
+            },
+            "fields": {
+              "$ref": "#/$defs/node_patch_fields"
+            }
+          }
+        }
+      }
+    },
+    "node_delete_op": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity", "mutation", "lineage"],
+      "properties": {
+        "entity": {
+          "$ref": "#/$defs/node_entity"
+        },
+        "lineage": {
+          "$ref": "#/$defs/lineage"
+        },
+        "mutation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": {
+              "const": "node_delete"
+            }
+          }
+        }
+      }
+    },
+    "edge_create_op": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity", "mutation", "lineage"],
+      "properties": {
+        "entity": {
+          "$ref": "#/$defs/edge_entity"
+        },
+        "lineage": {
+          "$ref": "#/$defs/lineage"
+        },
+        "mutation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "row"],
+          "properties": {
+            "kind": {
+              "const": "edge_create"
+            },
+            "row": {
+              "$ref": "#/$defs/edge_row"
+            }
+          }
+        }
+      }
+    },
+    "edge_patch_op": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity", "mutation", "lineage"],
+      "properties": {
+        "entity": {
+          "$ref": "#/$defs/edge_entity"
+        },
+        "lineage": {
+          "$ref": "#/$defs/lineage"
+        },
+        "mutation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "fields"],
+          "properties": {
+            "kind": {
+              "const": "edge_patch"
+            },
+            "fields": {
+              "$ref": "#/$defs/edge_patch_fields"
+            }
+          }
+        }
+      }
+    },
+    "edge_delete_op": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity", "mutation", "lineage"],
+      "properties": {
+        "entity": {
+          "$ref": "#/$defs/edge_entity"
+        },
+        "lineage": {
+          "$ref": "#/$defs/lineage"
+        },
+        "mutation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": {
+              "const": "edge_delete"
+            }
+          }
+        }
+      }
     }
   },
   "type": "object",
@@ -99,51 +495,26 @@
       "$ref": "#/$defs/sha256"
     },
     "payload": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["entity", "mutation"],
-      "properties": {
-        "entity": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["kind", "id"],
-          "properties": {
-            "kind": {
-              "const": "node"
-            },
-            "id": {
-              "type": "string",
-              "minLength": 1
-            }
-          }
+      "oneOf": [
+        {
+          "$ref": "#/$defs/node_create_op"
         },
-        "mutation": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["kind", "fields"],
-          "properties": {
-            "kind": {
-              "const": "node_patch"
-            },
-            "fields": {
-              "type": "object",
-              "additionalProperties": false,
-              "minProperties": 1,
-              "properties": {
-                "status": {
-                  "$ref": "#/$defs/status_patch"
-                },
-                "claimed_by": {
-                  "$ref": "#/$defs/claimed_by_patch"
-                },
-                "risk_level": {
-                  "$ref": "#/$defs/risk_level_patch"
-                }
-              }
-            }
-          }
+        {
+          "$ref": "#/$defs/node_patch_op"
+        },
+        {
+          "$ref": "#/$defs/node_delete_op"
+        },
+        {
+          "$ref": "#/$defs/edge_create_op"
+        },
+        {
+          "$ref": "#/$defs/edge_patch_op"
+        },
+        {
+          "$ref": "#/$defs/edge_delete_op"
         }
-      }
+      ]
     }
   }
 }

@@ -1672,11 +1672,20 @@ def file_changed(
     """Check if a file has changed since last scan.
 
     Returns True if the file should be re-scanned.
+
+    THE BLOB SHA IS ONLY AUTHORITATIVE IF IT DESCRIBES THE WORKING TREE. Callers
+    must source it from `working_tree_blob_shas`, which hashes the bytes on disk
+    for dirty files, and never from `batch_blob_shas` alone -- that one reads
+    `git ls-tree -r HEAD`, so every uncommitted edit carries its pre-edit SHA and
+    this comparison silently reports "unchanged" (wv-7fbfe1).
+
+    Untracked files are absent from the map, arrive as "", and fall through to
+    mtime.
     """
     fs = get_file_state(conn, path)
     if fs is None:
         return True  # Never scanned
-    # Check blob SHA first (authoritative), fall back to mtime
+    # Blob SHA first (authoritative for working-tree content), else mtime
     if current_blob and fs.git_blob:
         return current_blob != fs.git_blob
     return current_mtime != fs.mtime

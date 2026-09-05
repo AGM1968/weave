@@ -585,6 +585,48 @@ def _iter_text_files(target: Path, include: list[str], repo: Path) -> list[Path]
     return files
 
 
+def prose_rule_out_of_scope(
+    rule_path: Path, target: Path, repo: Path | None = None
+) -> bool:
+    """True when no file under `target` is in this rule's `paths:` scope.
+
+    A rule that never ran and a rule that ran clean both report zero findings,
+    and the two mean opposite things. Every shipped prose rule is scoped to
+    `docs/*.md`, `docs/**/*.md` and `*.md`, so scanning a `.py` or `.sh` file
+    reports each of them at 0 -- a STRUCTURAL zero, indistinguishable in the
+    output from a file that was examined and found clean (wv-33733d; the same
+    defect nowcast recorded as its Finding J).
+
+    Early-exit rather than counting: the answer only needs one eligible file.
+    The expensive direction is proving a scope empty, which is precisely the
+    single-file case where the walk is trivial.
+    """
+    rule = load_prose_rule(rule_path)
+    include = _string_list(rule, "paths")
+    resolved_repo = repo if repo is not None else (
+        target if target.is_dir() else target.parent
+    )
+    if target.is_file():
+        if target.suffix.lower() not in _TEXT_SUFFIXES:
+            return True
+        if not include:
+            return False
+        return not any(
+            fnmatch(_repo_relative_posix(target, resolved_repo), glob) for glob in include
+        )
+    for path in target.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in _TEXT_SUFFIXES:
+            continue
+        if _SKIP_PARTS.intersection(path.parts):
+            continue
+        if include and not any(
+            fnmatch(_repo_relative_posix(path, resolved_repo), glob) for glob in include
+        ):
+            continue
+        return False
+    return True
+
+
 def _word_regex(terms: list[str]) -> re.Pattern[str]:
     alts = "|".join(re.escape(term) for term in sorted(terms, key=len, reverse=True))
     return re.compile(rf"\b({alts})\b", re.IGNORECASE)

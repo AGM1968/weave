@@ -1174,6 +1174,115 @@ describe("Weave MCP Server", () => {
       }
     });
 
+    it("weave_quality_patterns show reports the engine's matcher, not the terms list (wv-ea2dac)", async () => {
+      // The reason this surface exists: two consumer repositories rebuilt rule
+      // decoding from the YAML and each got a different part of it wrong.
+      // Codex and Copilot reach quality only through MCP, so a CLI-only fix
+      // would have left them re-deriving it.
+      const fixture = createQualityPatternsFixture();
+      writeFileSync(
+        join(fixture.dir, ".weave", "patterns", "mcp-citation-kind.yaml"),
+        [
+          "id: mcp-citation-kind",
+          "language: prose",
+          "kind: citation",
+          "severity: warning",
+          "message: citation integrity fixture",
+          "paths:",
+          '  - "*.md"',
+          "terms:",
+          "  - unresolved-author-date",
+          "  - cited-reference-missing-year",
+          "",
+        ].join("\n")
+      );
+      const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "show", rule_id: "mcp-citation-kind" },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as {
+          rules: {
+            id: string;
+            kind: string;
+            expressions: string[] | null;
+            reason?: string;
+            checks?: string[];
+          }[];
+        };
+        expect(payload.rules).toHaveLength(1);
+        const rule = payload.rules[0];
+        expect(rule.id).toBe("mcp-citation-kind");
+        expect(rule.kind).toBe("citation");
+        // The regression: a decoder that treats these terms as searchable text
+        // emits \bunresolved-author-date\b, matches nothing, and reports a
+        // clean zero indistinguishable from a real measurement. null, not [].
+        expect(rule.expressions).toBeNull();
+        expect(rule.reason).toContain("check modes");
+        expect(rule.checks).toEqual(["unresolved-author-date", "cited-reference-missing-year"]);
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns show --all carries per-kind matcher flags (wv-ea2dac)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      try {
+        const response = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "show", all: true },
+        });
+        expect(response.error).toBeUndefined();
+        const result = response.result as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0].text) as {
+          rules: { id: string; kind: string; flags?: string[] }[];
+        };
+        expect(payload.rules.length).toBeGreaterThan(0);
+        // Built-in prose-emphasis-hedge is a lexicon rule. Case-insensitivity
+        // is the fact a consumer decoder cannot read off the YAML, and
+        // decoding it case-sensitively undercounts every sentence-initial hit.
+        const lexicon = payload.rules.filter((r) => r.kind === "lexicon");
+        expect(lexicon.length).toBeGreaterThan(0);
+        for (const rule of lexicon) {
+          expect(rule.flags).toContain("IGNORECASE");
+        }
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
+    it("weave_quality_patterns show refuses a bare call and an unknown id (wv-ea2dac)", async () => {
+      const fixture = createQualityPatternsFixture();
+      const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
+      try {
+        // No rule_id and no all: refused at the MCP boundary rather than
+        // guessing a scope.
+        const bare = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "show" },
+        });
+        const bareText = JSON.stringify(bare);
+        expect(bareText).toContain("rule_id or all");
+
+        // An unknown id is a structured error, never an empty result -- an
+        // empty rule list would read as "this rule matches nothing".
+        const unknown = await patternsClient.request("tools/call", {
+          name: "weave_quality_patterns",
+          arguments: { subcommand: "show", rule_id: "no-such-rule-at-all" },
+        });
+        expect(JSON.stringify(unknown)).toContain("unknown_rule");
+      } finally {
+        await patternsClient.close();
+        fixture.cleanup();
+      }
+    });
+
     it("canonical promotion produces the same plan over MCP as the CLI (wv-f677d9)", async () => {
       // Parity is the point of Phase 3: one lifecycle reached two ways. The
       // promotion identity and the semantic metadata must match exactly;
@@ -1196,11 +1305,11 @@ describe("Weave MCP Server", () => {
           "    except ValueError:",
           "      pass",
           "",
-        ].join("\n"),
+        ].join("\n")
       );
       writeFileSync(
         join(fixture.dir, "app.py"),
-        "def risky():\n    try:\n        do_work()\n    except ValueError:\n        pass\n",
+        "def risky():\n    try:\n        do_work()\n    except ValueError:\n        pass\n"
       );
 
       const wvBin = resolve(__dirname, "../../scripts/wv");
@@ -1210,8 +1319,7 @@ describe("Weave MCP Server", () => {
           env: { ...process.env, ...fixture.env },
           encoding: "utf-8",
         });
-      const runGit = (argv: string[]) =>
-        spawnSync("git", argv, { cwd: fixture.dir, encoding: "utf-8" });
+      const runGit = (argv: string[]) => spawnSync("git", argv, { cwd: fixture.dir, encoding: "utf-8" });
 
       // A real repository with the rule COMMITTED: canonical promotion binds
       // each active rule to a tracked blob at HEAD, so an uncommitted rule
@@ -1228,14 +1336,7 @@ describe("Weave MCP Server", () => {
       const listed = runWv(["quality", "patterns", "list", "--json"]);
       expect(listed.status).toBe(0);
 
-      const cliPlan = runWv([
-        "quality",
-        "patterns",
-        "promote",
-        "--canonical",
-        "--parent=wv-44e524",
-        "--json",
-      ]);
+      const cliPlan = runWv(["quality", "patterns", "promote", "--canonical", "--parent=wv-44e524", "--json"]);
       expect(cliPlan.status).toBe(0);
 
       const patternsClient = new MCPTestClient([], fixture.env, fixture.dir);
@@ -1790,11 +1891,7 @@ describe("Weave MCP Server", () => {
         "id: shadowed-rule\nlanguage: prose\nkind: regex\npatterns:\n  - absent\n",
         "utf-8"
       );
-      const patternsClient = new MCPTestClient(
-        [],
-        { ...fixture.env, WV_CONFIG_DIR: configDir },
-        fixture.dir
-      );
+      const patternsClient = new MCPTestClient([], { ...fixture.env, WV_CONFIG_DIR: configDir }, fixture.dir);
       try {
         const response = await patternsClient.request("tools/call", {
           name: "weave_quality_patterns",

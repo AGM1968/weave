@@ -35,6 +35,7 @@ cmd_quality() {
         promote) cmd_quality_promote "$@" ;;
         structural-search) cmd_quality_structural_search "$@" ;;
         patterns) cmd_quality_patterns "$@" ;;
+        prose-shape) cmd_quality_prose_shape "$@" ;;
         ""|help|-h|--help)
             cat >&2 <<'EOF'
 Usage: wv quality <subcommand> [options]
@@ -48,6 +49,11 @@ Subcommands:
   promote        Create Weave nodes from findings (--parent=<id> required)
   structural-search  Find code by structural pattern (requires ast-grep)
   patterns           Structural + prose pattern rules: scan/list/promote
+  prose-shape [path] Sentence shape of a document set: counts, length spread,
+                     and how sentences continue after a comma. --baseline <ref>
+                     profiles the same paths at a git ref through the same code
+                     path, so a repair sweep can be read as movement rather than
+                     as a finding count. [--json]
 
 Options:
   --json         JSON output (scan, hotspots, diff, functions)
@@ -77,6 +83,50 @@ EOF
             return 1
             ;;
     esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_quality_prose_shape — wv quality prose-shape [path] [--baseline=<ref>] [--json]
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_quality_prose_shape() {
+    local json_flag=""
+    local baseline=""
+    local shape_path=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json)        json_flag="--json" ;;
+            --baseline=*)  baseline="${1#--baseline=}" ;;
+            --baseline)    shift; baseline="${1:-}" ;;
+            --help|-h)
+                echo "Usage: wv quality prose-shape [path] [--baseline=<git-ref>] [--json]" >&2
+                return 0
+                ;;
+            -*)
+                echo -e "${RED}Unexpected option: $1${NC}" >&2
+                return 1
+                ;;
+            *)
+                if [ -z "$shape_path" ]; then
+                    shape_path="$1"
+                else
+                    echo -e "${RED}Unexpected argument: $1${NC}" >&2
+                    return 1
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    local py_args=()
+    [ -n "$WV_HOT_ZONE" ] && py_args+=("--hot-zone" "$WV_HOT_ZONE")
+    py_args+=("prose-shape")
+    [ -n "$shape_path" ] && py_args+=("$shape_path")
+    [ -n "$baseline" ] && py_args+=("--baseline" "$baseline")
+    [ -n "$json_flag" ] && py_args+=("$json_flag")
+
+    _wv_quality_python "${py_args[@]}"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -346,7 +396,7 @@ cmd_quality_patterns() {
     shift 2>/dev/null || true
 
     case "$subcmd" in
-        scan|list|adjudicate|report|validate|promote) ;;
+        scan|list|show|adjudicate|report|validate|promote) ;;
         ""|help|-h|--help)
             cat >&2 <<'EOF'
 Usage: wv quality patterns <subcommand> [options]
@@ -354,6 +404,13 @@ Usage: wv quality patterns <subcommand> [options]
 Subcommands:
   scan [path]    Run all active code/prose pattern rules and store findings
   list [path]    List active rules with last-scan hit counts
+  show [RULE_ID] What a rule searches for, as the ENGINE searches for it:
+                 the expressions, their flags, and the kinds that have no
+                 searchable form at all. [--all] [--path DIR] [--json]
+                 Use this instead of reading the rule YAML -- the matcher is
+                 not the terms: list. lexicon/motif are word-bounded and
+                 case-INsensitive, density is a lowercased substring with no
+                 word boundary, and citation has no text form whatever.
   adjudicate KEY DISPOSITION
                  Label a stable finding as accepted_defect, false_positive,
                  waived, or unresolved [--note TEXT]
@@ -396,11 +453,13 @@ custom rule silently keeps shadowing its improved managed twin instead.
 Code rules: language: <ast-grep language> (e.g. python, bash, typescript)
 plus a nested rule: mapping in ast-grep pattern syntax. Require ast-grep.
 
-Prose rules: language: prose, stdlib-only, always run. One of four kinds:
-  kind: lexicon   terms: [...] — flag any word-boundary match of a term.
+Prose rules: language: prose, stdlib-only, always run. One of five kinds:
+  kind: lexicon   terms: [...] — flag any word-boundary match of a term,
+                  case-INsensitively.
                   Optional: exempt: [...] (substrings that suppress a hit).
   kind: motif     terms: [...], min_count: N (default 3) — flag a term only
-                  in files where it recurs at least N times.
+                  in files where it recurs at least N times. Word-bounded and
+                  case-insensitive, as lexicon.
                   Optional: require_no_digit_within: N — suppress hits with
                   a digit within N chars of the match (off unless set).
   kind: density   terms: [...], min_count: N (default 3) — flag terms that
@@ -414,7 +473,15 @@ Prose rules: language: prose, stdlib-only, always run. One of four kinds:
                   Optional: min_count: N (default 1, i.e. every match) — a
                   per-pattern occurrence floor, same idea as motif's.
                   Optional: exempt: [...].
-All four also accept:
+  kind: citation  terms: [...] — NOT searchable text. The terms name check
+                  modes, exactly two of them: unresolved-author-date and
+                  cited-reference-missing-year, run by a resolver that reads
+                  the document's own reference list. A tool that treats them
+                  as terms and searches for the literal string
+                  "unresolved-author-date" finds nothing and reports a clean
+                  zero, which is why 'patterns show' returns a null
+                  expression list for this kind rather than an empty one.
+All five also accept:
   match_scope: line | paragraph | heading
                                   (default: line for markdown-* ids, else
                                    paragraph — reflows soft-wrapped prose,
@@ -464,11 +531,16 @@ EOF
     local apply_flag=""
     local plan_file=""
     local language=""
+    local all_flag=""
+    local show_path=""
     local -a positional=()
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --json)       json_flag="--json" ;;
+            --all)        all_flag="--all" ;;
+            --path=*)     show_path="${1#--path=}" ;;
+            --path)       shift; show_path="${1:-}" ;;
             --parent=*)   parent="${1#--parent=}" ;;
             --parent)     shift; parent="$1" ;;
             --dry-run)    dry_run="--dry-run" ;;
@@ -502,6 +574,12 @@ EOF
         fi
         py_args+=("${positional[@]}")
         [ -n "$note" ] && py_args+=("--note" "$note")
+    elif [ "$subcmd" = "show" ]; then
+        # show's positional is a RULE ID, not a repo path -- the repo comes
+        # from --path, so a mistyped rule id can't be read as a repo root.
+        [ "${#positional[@]}" -gt 0 ] && py_args+=("${positional[0]}")
+        [ -n "$all_flag" ] && py_args+=("$all_flag")
+        [ -n "$show_path" ] && py_args+=("--path" "$show_path")
     elif [ "${#positional[@]}" -gt 0 ]; then
         path_arg="${positional[0]}"
         py_args+=("$path_arg")

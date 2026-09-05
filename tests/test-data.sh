@@ -37,6 +37,18 @@ NC='\033[0m'
 reset_db() {
     rm -f "$WV_DB" "$WV_DB-wal" "$WV_DB-shm"
     rm -f "$WEAVE_DIR/state.sql" "$WEAVE_DIR/nodes.jsonl" "$WEAVE_DIR/edges.jsonl"
+    # Also clear accumulated deltas + the applied-deltas manifest (wv-4448a2
+    # review round 4, finding 1 follow-on): cmd_sync now emits a real v1/v2
+    # delta for every `wv sync`, where it previously emitted none. Without
+    # this, a delta from a test EARLIER in this suite's shared .weave/deltas
+    # (never cleared by the rest of this function) survives every later
+    # reset_db and gets replayed by the FIRST `wv load` any later test
+    # happens to call, resurrecting that earlier test's already-wiped nodes
+    # alongside the current test's own. Caught by "roundtrip preserves node
+    # count" landing 5 instead of 3 -- two of the "sync command" test's nodes
+    # (line ~171) came back from a delta file `reset_db` had never touched.
+    rm -rf "$WEAVE_DIR/deltas"
+    rm -f "$WEAVE_DIR/.applied_deltas"
     $WV init >/dev/null 2>&1
 }
 
@@ -949,6 +961,496 @@ rm -rf "$CP_DIR"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
+# explicit `wv sync` must emit the same delta an established peer needs
+# (wv-4448a2 review round 4, finding 1)
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_sync used to persist state.sql/nodes.jsonl/edges.jsonl (all merge=ours)
+# straight from the live DB and drain _warp_changes with NO delta emitted --
+# it never ran the changeset/v2-sidecar path auto_sync does. Proven sequence:
+# a mutation pending because auto_sync was throttled gets included in `wv
+# sync`'s state.sql, no delta is emitted, and the tracker is drained; an
+# ALREADY-ESTABLISHED peer's `git pull` keeps ITS OWN (older) state.sql under
+# merge=ours and has no mergeable artifact from which to ever learn the
+# mutation -- permanently hidden. Modeled without an actual git clone/merge
+# (heavier, and merge=ours's outcome is deterministic): snapshot the peer's
+# pre-mutation state.sql, mutate + `wv sync` in "origin", then swap state.sql
+# back to the peer's stale snapshot -- exactly what merge=ours leaves an
+# established peer holding -- and load a peer hot-zone against that stale
+# state.sql plus whatever deltas got committed. If cmd_sync emitted a real
+# delta, the peer converges anyway; if it did not (the pre-fix bug), the
+# mutation is invisible to it.
+echo "Testing explicit wv sync emits a delta for an established peer..."
+SY_DIR=$(mktemp -d)
+(
+    cd "$SY_DIR"
+    git init -q
+    git config user.email t@t && git config user.name t && git config commit.gpgsign false
+    # WEAVE_DIR must be re-pointed explicitly: wv-config.sh only computes it
+    # from WV_PROJECT_DIR when unset, and test-data.sh's own top-level
+    # `export WEAVE_DIR=...` (line 18) is otherwise inherited into this
+    # subshell unchanged, silently redirecting every $WV call below at the
+    # OUTER harness's .weave, not $SY_DIR's.
+    export WV_HOT_ZONE="$SY_DIR/hz" WV_DB="$SY_DIR/hz/brain.db" WV_PROJECT_DIR="$SY_DIR" \
+           WEAVE_DIR="$SY_DIR/.weave" \
+           WV_AUTO_SYNC=0 WV_REQUIRE_LEARNING=0 WV_REQUIRE_QUALITY=0
+    mkdir -p "$WV_HOT_ZONE"
+    "$WV" init >/dev/null 2>&1
+    _sid=$("$WV" add "sync target" --status=todo --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | head -1)
+    "$WV" sync >/dev/null 2>&1
+    git add -A && git commit -q -m "baseline"
+
+    _p=0 _r=0
+
+    # The peer's pre-mutation snapshot -- what an established clone already
+    # has on disk before this cycle's mutation ever happens.
+    cp "$SY_DIR/.weave/state.sql" "$SY_DIR/.peer-state.sql.snapshot"
+
+    # Mutation pending only because auto_sync is throttled (WV_AUTO_SYNC=0
+    # above) -- exactly the reviewer's precondition. An explicit `wv sync`
+    # (not auto_sync) is the only thing that will ever persist it.
+    "$WV" update "$_sid" --status=done >/dev/null 2>&1
+    _delta_count_before=$(find "$SY_DIR/.weave/deltas" -name '*.sql' 2>/dev/null | wc -l | tr -d ' ')
+    "$WV" sync >/dev/null 2>&1
+    _delta_count_after=$(find "$SY_DIR/.weave/deltas" -name '*.sql' 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$_delta_count_after" -gt "$_delta_count_before" ]; then
+        echo -e "  ${GREEN}✓${NC} explicit wv sync emits a new delta file (round 4 finding 1)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} explicit wv sync emitted no delta (before=$_delta_count_before after=$_delta_count_after)"
+    fi
+    _r=$((_r + 1))
+    _new_delta=$(find "$SY_DIR/.weave/deltas" -name '*.sql' -newer "$SY_DIR/.peer-state.sql.snapshot" 2>/dev/null | head -1)
+    if [ -n "$_new_delta" ] && grep -qi "status" "$_new_delta" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} the emitted delta carries the status mutation"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} emitted delta missing or does not carry the mutation: $_new_delta"
+    fi
+    _r=$((_r + 1))
+
+    # Simulate merge=ours: an established peer keeps its OWN pre-mutation
+    # state.sql after a pull, but git still gives it the new delta files
+    # (deltas are ordinary new files, not merge=ours). Swap state.sql back to
+    # the peer's stale snapshot and load a fresh peer hot-zone against it.
+    cp "$SY_DIR/.peer-state.sql.snapshot" "$SY_DIR/.weave/state.sql"
+    PEER_HZ="$SY_DIR/peer-hz"
+    _peer_load=$(env -u WV_DB WV_HOT_ZONE="$PEER_HZ" WV_PROJECT_DIR="$SY_DIR" WV_AUTO_SYNC=0 "$WV" load 2>&1)
+    _peer_status=$(env -u WV_DB WV_HOT_ZONE="$PEER_HZ" WV_PROJECT_DIR="$SY_DIR" WV_AUTO_SYNC=0 "$WV" show "$_sid" --json 2>/dev/null | jq -r '.status')
+    if [ "$_peer_status" = "done" ]; then
+        echo -e "  ${GREEN}✓${NC} an established peer holding its own stale state.sql still converges via the emitted delta"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} established peer did not converge: status=$_peer_status load=$_peer_load"
+    fi
+    _r=$((_r + 1))
+
+    echo "$_p $_r" > "$SY_DIR/.delta"
+)
+if [ -f "$SY_DIR/.delta" ]; then
+    read -r _sy_p _sy_r < "$SY_DIR/.delta"
+    TESTS_PASSED=$((TESTS_PASSED + _sy_p))
+    TESTS_RUN=$((TESTS_RUN + _sy_r))
+fi
+rm -rf "$SY_DIR"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _wv_snapshot_db decouples the export bundle from writes that land after it
+# is taken (wv-4448a2 review round 4, finding 5)
+# ═══════════════════════════════════════════════════════════════════════════
+# dump_state_sql's own fix (round 3 finding 4) gives state.sql one consistent
+# view, but nodes.jsonl/edges.jsonl were still queried through SEPARATE live
+# connections after it -- either could observe a state LATER than what
+# state.sql captured. `.backup` produces a private, static file immune to
+# ANY subsequent write on the source DB by construction, so this does not
+# need a real concurrency harness (unlike finding 2's write-lock proof) --
+# sequencing a write strictly AFTER the snapshot is taken is sufficient: if
+# the snapshot is truly decoupled, that later write must be invisible to it.
+echo "Testing _wv_snapshot_db decouples the export bundle from later writes..."
+SNAP_DIR=$(mktemp -d)
+(
+    cd "$SNAP_DIR"
+    git init -q
+    git config user.email t@t && git config user.name t && git config commit.gpgsign false
+    # WEAVE_DIR must be re-pointed explicitly -- see the matching comment in
+    # the finding-1 test block above.
+    export WV_HOT_ZONE="$SNAP_DIR/hz" WV_DB="$SNAP_DIR/hz/brain.db" WV_PROJECT_DIR="$SNAP_DIR" \
+           WEAVE_DIR="$SNAP_DIR/.weave" \
+           WV_AUTO_SYNC=0 WV_REQUIRE_LEARNING=0 WV_REQUIRE_QUALITY=0
+    mkdir -p "$WV_HOT_ZONE"
+    "$WV" init >/dev/null 2>&1
+    _p=0 _r=0
+
+    # Capture library paths BEFORE sourcing wv-config.sh: it reassigns its
+    # own REPO_ROOT (the caller's project root, not this repo) once run
+    # inside this temp project directory, which would otherwise clobber the
+    # path used to source wv-cmd-data.sh next.
+    _wv_config_lib="$REPO_ROOT/scripts/lib/wv-config.sh"
+    _wv_cmd_data_lib="$REPO_ROOT/scripts/cmd/wv-cmd-data.sh"
+    source "$_wv_config_lib" >/dev/null 2>&1 || true
+    source "$_wv_cmd_data_lib" >/dev/null 2>&1
+
+    sqlite3 "$WV_DB" "INSERT INTO nodes(id,text,status,created_at,updated_at) VALUES('wv-snap-a','before',1,1,1);"
+    _snap=$(_wv_snapshot_db "$WV_DB" "$WEAVE_DIR")
+    _snap_ok=$?
+    if [ "$_snap_ok" -eq 0 ] && [ -f "$_snap" ]; then
+        echo -e "  ${GREEN}✓${NC} _wv_snapshot_db produces a backup file"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} _wv_snapshot_db failed (rc=$_snap_ok path=$_snap)"
+    fi
+    _r=$((_r + 1))
+
+    # Mutate the LIVE db strictly AFTER the snapshot was taken.
+    sqlite3 "$WV_DB" "UPDATE nodes SET text='after' WHERE id='wv-snap-a';
+INSERT INTO nodes(id,text,status,created_at,updated_at) VALUES('wv-snap-b','landed-after-snapshot',1,2,2);"
+
+    _snap_text=$(sqlite3 "$_snap" "SELECT text FROM nodes WHERE id='wv-snap-a';" 2>/dev/null)
+    _snap_b_count=$(sqlite3 "$_snap" "SELECT COUNT(*) FROM nodes WHERE id='wv-snap-b';" 2>/dev/null)
+    if [ "$_snap_text" = "before" ] && [ "$_snap_b_count" = "0" ]; then
+        echo -e "  ${GREEN}✓${NC} the snapshot is immune to a write landing after it was taken (round 4 finding 5)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} snapshot leaked a later write: text='$_snap_text' b_count=$_snap_b_count"
+    fi
+    _r=$((_r + 1))
+
+    _live_text=$(sqlite3 "$WV_DB" "SELECT text FROM nodes WHERE id='wv-snap-a';" 2>/dev/null)
+    _live_b_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE id='wv-snap-b';" 2>/dev/null)
+    if [ "$_live_text" = "after" ] && [ "$_live_b_count" = "1" ]; then
+        echo -e "  ${GREEN}✓${NC} sanity: the live DB really did change (the snapshot isn't just stale by accident)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} sanity check failed: live text='$_live_text' b_count=$_live_b_count"
+    fi
+    _r=$((_r + 1))
+
+    # _wv_query_json_snapshot reads the SAME snapshot, not $WV_DB.
+    _json_text=$(_wv_query_json_snapshot "$_snap" "SELECT * FROM nodes WHERE id='wv-snap-a';" | jq -r '.[0].text')
+    if [ "$_json_text" = "before" ]; then
+        echo -e "  ${GREEN}✓${NC} _wv_query_json_snapshot queries the snapshot, not the live DB"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} _wv_query_json_snapshot returned '$_json_text', expected 'before'"
+    fi
+    _r=$((_r + 1))
+
+    rm -f "$_snap"
+    echo "$_p $_r" > "$SNAP_DIR/.delta"
+)
+if [ -f "$SNAP_DIR/.delta" ]; then
+    read -r _snap_p _snap_r < "$SNAP_DIR/.delta"
+    TESTS_PASSED=$((TESTS_PASSED + _snap_p))
+    TESTS_RUN=$((TESTS_RUN + _snap_r))
+fi
+rm -rf "$SNAP_DIR"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _wv_emit_deltas aborts on a compaction or lineage-stamp failure, instead of
+# emitting an uncompacted / un-stamped delta anyway (wv-4448a2 review round 4
+# verdict 2, findings 1 and 4)
+# ═══════════════════════════════════════════════════════════════════════════
+echo "Testing _wv_emit_deltas aborts on compaction/lineage-stamp failure..."
+FAIL_DIR=$(mktemp -d)
+(
+    cd "$FAIL_DIR"
+    git init -q
+    git config user.email t@t && git config user.name t && git config commit.gpgsign false
+    export WV_HOT_ZONE="$FAIL_DIR/hz" WV_DB="$FAIL_DIR/hz/brain.db" WV_PROJECT_DIR="$FAIL_DIR" \
+           WEAVE_DIR="$FAIL_DIR/.weave" \
+           WV_AUTO_SYNC=0 WV_REQUIRE_LEARNING=0 WV_REQUIRE_QUALITY=0
+    mkdir -p "$WV_HOT_ZONE"
+    "$WV" init >/dev/null 2>&1
+    _p=0 _r=0
+
+    _wv_config_lib="$REPO_ROOT/scripts/lib/wv-config.sh"
+    _wv_delta_lib="$REPO_ROOT/scripts/lib/wv-delta.sh"
+    _wv_cmd_data_lib="$REPO_ROOT/scripts/cmd/wv-cmd-data.sh"
+    source "$_wv_config_lib" >/dev/null 2>&1 || true
+    source "$_wv_delta_lib"
+    source "$_wv_cmd_data_lib" >/dev/null 2>&1
+    wv_delta_init "$WV_DB"
+
+    # --- Finding 1: a compact_batch failure must abort the whole emission ---
+    sqlite3 "$WV_DB" "INSERT INTO nodes(id,text,status,created_at,updated_at) VALUES('wv-fail-a','A','todo',1,1);"
+    wv_delta_reset "$WV_DB"
+    sqlite3 "$WV_DB" "UPDATE nodes SET text='B' WHERE id='wv-fail-a';
+UPDATE nodes SET text='C' WHERE id='wv-fail-a';"
+    _before_rows=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM _warp_changes WHERE row_id='wv-fail-a';")
+    # Hold an EXCLUSIVE lock longer than compact_batch's own 5s timeout so
+    # the SAME real failure this fix targets actually fires.
+    ( sqlite3 -cmd ".timeout 500" "$WV_DB" <<'SQL'
+BEGIN EXCLUSIVE;
+.shell sleep 7
+COMMIT;
+SQL
+    ) &
+    _lock_pid=$!
+    sleep 0.3
+    # `|| _emit_rc=$?`, not a bare assignment then `$?` on the next line: under
+    # this file's `set -e`, a plain `var=$(cmd)` whose cmd fails aborts the
+    # whole script right here, before `_emit_rc=$?` is ever reached -- the
+    # exact bash gotcha round 4 verdict 2 finding 1 is about, now on the
+    # OTHER side: this test WANTS _wv_emit_deltas to fail.
+    _emit_rc=0
+    _emit_out=$(_wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "test-agent" 2>/tmp/wv-f1-stderr.$$) || _emit_rc=$?
+    wait "$_lock_pid" 2>/dev/null
+    _delta_count=$(find "$WEAVE_DIR/deltas" -name '*.sql' 2>/dev/null | wc -l | tr -d ' ')
+    _after_rows=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM _warp_changes WHERE row_id='wv-fail-a';")
+    if [ "$_emit_rc" -ne 0 ] && [ "$_delta_count" = "0" ] && [ "$_after_rows" = "$_before_rows" ]; then
+        echo -e "  ${GREEN}✓${NC} a compact_batch failure aborts _wv_emit_deltas: no delta emitted, _warp_changes untouched (round 4 finding 1)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} compaction failure not aborted (rc=$_emit_rc deltas=$_delta_count before=$_before_rows after=$_after_rows)"
+    fi
+    _r=$((_r + 1))
+    rm -f /tmp/wv-f1-stderr.$$
+    wv_delta_reset "$WV_DB"
+    rm -rf "$WEAVE_DIR/deltas"
+
+    # --- Finding 4: a lineage-stamp failure must abort and discard the
+    # delta this same call already wrote, not publish it anyway ---
+    sqlite3 "$WV_DB" "INSERT INTO nodes(id,text,status,created_at,updated_at) VALUES('wv-fail-b','A','todo',1,1);"
+    wv_delta_reset "$WV_DB"
+    sqlite3 "$WV_DB" "UPDATE nodes SET text='B' WHERE id='wv-fail-b';"
+    wv_lineage_stamp() { echo "SIMULATED lineage stamp failure" >&2; return 1; }
+    _emit_rc2=0
+    _emit_out2=$(_wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "test-agent" 2>/tmp/wv-f4-stderr.$$) || _emit_rc2=$?
+    _delta_count2=$(find "$WEAVE_DIR/deltas" -name '*.sql' 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$_emit_rc2" -ne 0 ] && [ "$_delta_count2" = "0" ]; then
+        echo -e "  ${GREEN}✓${NC} a lineage-stamp failure aborts _wv_emit_deltas and discards the already-written delta (round 4 finding 4)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} lineage-stamp failure not aborted (rc=$_emit_rc2 deltas=$_delta_count2)"
+    fi
+    _r=$((_r + 1))
+    rm -f /tmp/wv-f4-stderr.$$
+    # Round 5: `unset -f` deletes the function outright -- bash has no
+    # shadow/restore for a redefined function -- leaving wv_lineage_stamp
+    # entirely undefined for every test that runs after this one. Re-source
+    # the lib instead, which cleanly restores the real definition.
+    source "$_wv_delta_lib"
+
+    # --- Round 5 finding: a lineage-stamp failure discarded the WHOLE day's
+    # v2/ sidecar directory (`rm -rf "$delta_dir/v2"`), destroying every
+    # OTHER emission's already-committed sidecars sharing that per-day
+    # directory, not just this cycle's own. Establish a historical sidecar
+    # first, then force a stamp failure on a SECOND emission and confirm the
+    # first survives. ---
+    rm -rf "$WEAVE_DIR/deltas"
+    sqlite3 "$WV_DB" "INSERT INTO nodes(id,text,status,created_at,updated_at) VALUES('wv-fail-c1','A','todo',1,1);"
+    wv_delta_reset "$WV_DB"
+    sqlite3 "$WV_DB" "UPDATE nodes SET text='B' WHERE id='wv-fail-c1';"
+    _emit_rc_hist=0
+    _wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "test-agent" >/dev/null 2>&1 || _emit_rc_hist=$?
+    _v2_dir=$(find "$WEAVE_DIR/deltas" -type d -name v2 | head -1)
+    _hist_count=$(find "$_v2_dir" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$_emit_rc_hist" -ne 0 ] || [ -z "$_v2_dir" ] || [ "$_hist_count" -lt 1 ]; then
+        echo -e "  ${RED}✗${NC} round 5 stamp-failure fixture setup did not produce a historical sidecar (rc=$_emit_rc_hist dir=$_v2_dir count=$_hist_count)"
+    fi
+
+    sqlite3 "$WV_DB" "INSERT INTO nodes(id,text,status,created_at,updated_at) VALUES('wv-fail-c2','A','todo',1,1);"
+    wv_delta_reset "$WV_DB"
+    sqlite3 "$WV_DB" "UPDATE nodes SET text='B' WHERE id='wv-fail-c2';"
+    wv_lineage_stamp() { echo "SIMULATED lineage stamp failure" >&2; return 1; }
+    _emit_rc3=0
+    _wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "test-agent" >/dev/null 2>/tmp/wv-f5a-stderr.$$ || _emit_rc3=$?
+    source "$_wv_delta_lib"
+    _hist_count_after=$(find "$_v2_dir" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$_emit_rc3" -ne 0 ] && [ "$_hist_count_after" = "$_hist_count" ]; then
+        echo -e "  ${GREEN}✓${NC} a lineage-stamp failure discards only this cycle's own v2 sidecars, not the whole day's v2/ directory (round 5)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} stamp failure wiped historical sidecars (rc=$_emit_rc3 before=$_hist_count after=$_hist_count_after)"
+    fi
+    _r=$((_r + 1))
+    rm -f /tmp/wv-f5a-stderr.$$
+
+    # --- Round 5 finding: under WV_DELTA_V2_STRICT=1, a v2 writer failure
+    # left the SQL delta AND any sidecars it partially wrote behind, with no
+    # lineage ever stamped for them -- a retry next cycle would re-derive the
+    # SAME lineage_seq and collide with its own orphaned leftovers. ---
+    rm -rf "$WEAVE_DIR/deltas"
+    sqlite3 "$WV_DB" "INSERT INTO nodes(id,text,status,created_at,updated_at) VALUES('wv-fail-e','A','todo',1,1);"
+    wv_delta_reset "$WV_DB"
+    sqlite3 "$WV_DB" "UPDATE nodes SET text='B' WHERE id='wv-fail-e';"
+    _expected_seq=$(( $(wv_lineage_seq_base "$WV_DB" "$WEAVE_DIR/deltas") + 1 ))
+    wv_delta_v2_write_operations() {
+        # Simulate a writer that dies partway through, having already
+        # written one partial sidecar for THIS cycle -- and, matching the
+        # real writer's manifest contract (round 5 review: cleanup now
+        # tracks exact invocation-owned paths instead of a seq-prefix glob),
+        # recorded that exact path in its manifest ($6) before failing.
+        mkdir -p "$2"
+        local _partial="$2/$(printf '%012d' "$_expected_seq")-fake-partial.json"
+        printf '{"partial":true}' > "$_partial"
+        [ -n "${6:-}" ] && printf '%s\n' "$_partial" > "$6"
+        return 1
+    }
+    export WV_DELTA_V2_STRICT=1
+    _emit_rc5=0
+    _wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "test-agent" >/dev/null 2>/tmp/wv-f5b-stderr.$$ || _emit_rc5=$?
+    unset WV_DELTA_V2_STRICT
+    source "$_wv_delta_lib"
+    _sql_left=$(find "$WEAVE_DIR/deltas" -maxdepth 2 -name '*.sql' 2>/dev/null | wc -l | tr -d ' ')
+    _json_left=$(find "$WEAVE_DIR/deltas" -name "$(printf '%012d' "$_expected_seq")-*.json*" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$_emit_rc5" -ne 0 ] && [ "$_sql_left" = "0" ] && [ "$_json_left" = "0" ]; then
+        echo -e "  ${GREEN}✓${NC} a strict-mode v2 writer failure rolls back this emission's own SQL delta and partial sidecars (round 5)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} strict writer failure left artifacts behind (rc=$_emit_rc5 sql=$_sql_left json=$_json_left)"
+    fi
+    _r=$((_r + 1))
+    rm -f /tmp/wv-f5b-stderr.$$
+
+    # --- Round 5 review: cleanup must be scoped to files THIS invocation
+    # actually created, not every sidecar sharing the lineage_seq filename
+    # prefix -- two actors can legitimately compute the SAME next seq
+    # independently before either stamps it (each writes under its own
+    # actor-scoped operation_id at that prefix). A strict-mode failure for
+    # one actor must not delete a DIFFERENT actor's legitimate sidecar
+    # sitting at the same seq prefix. ---
+    rm -rf "$WEAVE_DIR/deltas"
+    sqlite3 "$WV_DB" "INSERT INTO nodes(id,text,status,created_at,updated_at) VALUES('wv-fail-f','A','todo',1,1);"
+    wv_delta_reset "$WV_DB"
+    sqlite3 "$WV_DB" "UPDATE nodes SET text='B' WHERE id='wv-fail-f';"
+    _expected_seq2=$(( $(wv_lineage_seq_base "$WV_DB" "$WEAVE_DIR/deltas") + 1 ))
+    _v2_dir2="$WEAVE_DIR/deltas/$(date +%Y-%m-%d)/v2"
+    mkdir -p "$_v2_dir2"
+    _other_actor_sidecar="$_v2_dir2/$(printf '%012d' "$_expected_seq2")-other-actor-op.json"
+    printf '{"format":"weave.delta.v2","other_actor":true}' > "$_other_actor_sidecar"
+    wv_delta_v2_write_operations() {
+        # This actor's own writer dies partway through, having written and
+        # recorded (in its manifest, $6) exactly one sidecar of its OWN --
+        # never the sibling actor's file above, which shares the seq prefix
+        # but not this invocation's manifest.
+        mkdir -p "$2"
+        local _mine="$2/$(printf '%012d' "$_expected_seq2")-this-actor-op.json"
+        printf '{"format":"weave.delta.v2","mine":true}' > "$_mine"
+        [ -n "${6:-}" ] && printf '%s\n' "$_mine" > "$6"
+        return 1
+    }
+    export WV_DELTA_V2_STRICT=1
+    _emit_rc6=0
+    _wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "test-agent" >/dev/null 2>/tmp/wv-f5c-stderr.$$ || _emit_rc6=$?
+    unset WV_DELTA_V2_STRICT
+    source "$_wv_delta_lib"
+    _other_survives=0
+    [ -f "$_other_actor_sidecar" ] && _other_survives=1
+    _mine_gone=0
+    [ -f "$_v2_dir2/$(printf '%012d' "$_expected_seq2")-this-actor-op.json" ] || _mine_gone=1
+    if [ "$_emit_rc6" -ne 0 ] && [ "$_other_survives" = "1" ] && [ "$_mine_gone" = "1" ]; then
+        echo -e "  ${GREEN}✓${NC} a strict-mode failure cleans up only THIS invocation's own v2 sidecars, not a different actor's file sharing the same lineage_seq prefix (round 5 review)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} strict failure deleted or left wrong sidecars (rc=$_emit_rc6 other_survives=$_other_survives mine_gone=$_mine_gone)"
+    fi
+    _r=$((_r + 1))
+    rm -f /tmp/wv-f5c-stderr.$$
+
+    # --- Deep-review finding: _publish_weave_bundle must not leave a torn
+    # bundle (some targets updated, others stale) when a rename partway
+    # through the group fails. Override `mv` to fail specifically on the
+    # edges.jsonl target -- nodes.jsonl (renamed first) must be rolled back
+    # to its prior content, not left holding the new snapshot while
+    # state.sql (never attempted) stays old. ---
+    _bundle_dir="$FAIL_DIR/bundle-test"
+    mkdir -p "$_bundle_dir"
+    printf 'OLD_NODES' > "$_bundle_dir/nodes.jsonl"
+    printf 'OLD_EDGES' > "$_bundle_dir/edges.jsonl"
+    printf 'OLD_SQL' > "$_bundle_dir/state.sql"
+    _tmp_n=$(mktemp); _tmp_e=$(mktemp); _tmp_s=$(mktemp)
+    printf 'NEW_NODES' > "$_tmp_n"
+    printf 'NEW_EDGES' > "$_tmp_e"
+    printf 'NEW_SQL' > "$_tmp_s"
+    mv() {
+        case "$2" in
+            */edges.jsonl) return 1 ;;
+            *) command mv "$@" ;;
+        esac
+    }
+    _pub_rc=0
+    _publish_weave_bundle "$_bundle_dir" "$_tmp_n" "$_tmp_e" "$_tmp_s" || _pub_rc=$?
+    unset -f mv
+    _n_after=$(cat "$_bundle_dir/nodes.jsonl" 2>/dev/null)
+    _e_after=$(cat "$_bundle_dir/edges.jsonl" 2>/dev/null)
+    _s_after=$(cat "$_bundle_dir/state.sql" 2>/dev/null)
+    if [ "$_pub_rc" -ne 0 ] && [ "$_n_after" = "OLD_NODES" ] && [ "$_e_after" = "OLD_EDGES" ] && [ "$_s_after" = "OLD_SQL" ]; then
+        echo -e "  ${GREEN}✓${NC} _publish_weave_bundle rolls back an already-renamed target when a later one in the group fails (deep-review finding)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} bundle publish left a torn state (rc=$_pub_rc nodes='$_n_after' edges='$_e_after' sql='$_s_after')"
+    fi
+    _r=$((_r + 1))
+    rm -f "$_tmp_n" "$_tmp_e" "$_tmp_s"
+
+    # Same failure mode, but nothing existed before this call (first-ever
+    # publish): the newly-created nodes.jsonl must be removed, not left
+    # behind, since the group as a whole did not succeed.
+    _bundle_dir2="$FAIL_DIR/bundle-test-fresh"
+    mkdir -p "$_bundle_dir2"
+    _tmp_n2=$(mktemp); _tmp_e2=$(mktemp); _tmp_s2=$(mktemp)
+    printf 'NEW_NODES' > "$_tmp_n2"
+    printf 'NEW_EDGES' > "$_tmp_e2"
+    printf 'NEW_SQL' > "$_tmp_s2"
+    mv() {
+        case "$2" in
+            */edges.jsonl) return 1 ;;
+            *) command mv "$@" ;;
+        esac
+    }
+    _pub_rc2=0
+    _publish_weave_bundle "$_bundle_dir2" "$_tmp_n2" "$_tmp_e2" "$_tmp_s2" || _pub_rc2=$?
+    unset -f mv
+    if [ "$_pub_rc2" -ne 0 ] && [ ! -e "$_bundle_dir2/nodes.jsonl" ] && [ ! -e "$_bundle_dir2/edges.jsonl" ] && [ ! -e "$_bundle_dir2/state.sql" ]; then
+        echo -e "  ${GREEN}✓${NC} _publish_weave_bundle removes a newly-created target on group failure when there was nothing to restore (deep-review finding)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} fresh-publish rollback left artifacts (rc=$_pub_rc2 nodes=$([ -e "$_bundle_dir2/nodes.jsonl" ] && echo yes || echo no) edges=$([ -e "$_bundle_dir2/edges.jsonl" ] && echo yes || echo no) sql=$([ -e "$_bundle_dir2/state.sql" ] && echo yes || echo no))"
+    fi
+    _r=$((_r + 1))
+    rm -f "$_tmp_n2" "$_tmp_e2" "$_tmp_s2"
+
+    # --- Deep-review finding: a wv_delta_reset failure must not be reported
+    # as a clean sync. Force it to fail and confirm auto_sync returns
+    # nonzero and does not stamp .last_sync, so the throttle does not
+    # suppress a natural retry. ---
+    sqlite3 "$WV_DB" "INSERT INTO nodes(id,text,status,created_at,updated_at) VALUES('wv-fail-reset','A','todo',1,1);"
+    wv_delta_reset "$WV_DB"
+    sqlite3 "$WV_DB" "UPDATE nodes SET text='B' WHERE id='wv-fail-reset';"
+    rm -f "$WV_HOT_ZONE/.last_sync"
+    wv_delta_reset() { echo "SIMULATED reset failure" >&2; return 1; }
+    export WV_CHECKPOINT_INTERVAL=0
+    _sync_rc=0
+    # auto_sync has its own early-return guards independent of the mock above:
+    # WV_AUTO_SYNC=0 (set fixture-wide, above) and WV_DB_CUSTOM (derived by
+    # wv-config.sh from this fixture's exported WV_DB, needed elsewhere in
+    # this file for direct sqlite3 access) both short-circuit it before it
+    # would ever reach wv_delta_reset. A subshell scopes both overrides
+    # cleanly without touching the rest of the fixture.
+    ( export WV_AUTO_SYNC=1 WV_DB_CUSTOM=""; auto_sync --force >/dev/null 2>/tmp/wv-freset-stderr.$$ ) || _sync_rc=$?
+    source "$_wv_delta_lib"
+    if [ "$_sync_rc" -ne 0 ] && [ ! -f "$WV_HOT_ZONE/.last_sync" ]; then
+        echo -e "  ${GREEN}✓${NC} auto_sync does not stamp .last_sync when wv_delta_reset fails, so the throttle does not suppress a retry (deep-review finding)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} auto_sync stamped success despite a reset failure (rc=$_sync_rc stamp_exists=$([ -f "$WV_HOT_ZONE/.last_sync" ] && echo yes || echo no))"
+    fi
+    _r=$((_r + 1))
+    rm -f /tmp/wv-freset-stderr.$$
+
+    echo "$_p $_r" > "$FAIL_DIR/.delta"
+)
+if [ -f "$FAIL_DIR/.delta" ]; then
+    read -r _fail_p _fail_r < "$FAIL_DIR/.delta"
+    TESTS_PASSED=$((TESTS_PASSED + _fail_p))
+    TESTS_RUN=$((TESTS_RUN + _fail_r))
+fi
+rm -rf "$FAIL_DIR"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Checkpoint/sync [skip ci] scoping (wv-e937f8)
 # ═══════════════════════════════════════════════════════════════════════════
 # Regression: GitHub applies [skip ci] to the WHOLE PUSH when it appears at
@@ -1594,12 +2096,16 @@ assert_not_contains "$_hist_manifest" "1784746753-000000-legacy.sql" "historical
 assert_equals "newer checkpoint value" "$_hist_text" "historical unconditional delta cannot revert newer snapshot"
 rm -rf "$_hist_src" "$_hist_clone"
 
-# ─── Durability replay: clock-skewed current delta (wv-188ddc) ──────────────
-# A guarded current-format delta still resolves conflicts by updated_at.  This
-# literal clone/load case keeps the causally newer checkpoint at 200 and gives
-# the remote delta a skewed wall clock of 300.  It documents the remaining
-# causality gap without pretending that timestamp LWW is a safe merge rule.
-echo "-- durability: clock-skewed delta through fresh Git clone (wv-188ddc)"
+# ─── Durability replay: clock-skewed current delta (wv-188ddc / wv-4448a2) ──
+# The lineage guard (wv-cdb45a) resolves this conflict by causal order, not the
+# wall clock.  The checkpoint row is stamped at lineage_seq 9 (bumped to 10 by
+# the forced sync's re-stamp) with updated_at 200; the remote delta carries a
+# LOWER lineage_seq 5 but a HIGHER skewed wall clock of 300.  The guard G
+# (nodes.lineage_seq = 0 OR 5 > nodes.lineage_seq OR tie-break) is false against
+# the seq-10 row, so the DO UPDATE is a no-op: the delta still replays, it just
+# cannot revert the causally newer checkpoint.  (Pre-S4 this delta was a legacy
+# no-lineage upsert whose updated_at >= guard let the skew win — the XFAIL.)
+echo "-- durability: clock-skewed delta through fresh Git clone (wv-188ddc / wv-4448a2)"
 _skew_src=$(mktemp -d)
 _skew_clone=$(mktemp -d)
 rm -rf "$_skew_clone"
@@ -1609,16 +2115,26 @@ rm -rf "$_skew_clone"
          WV_REQUIRE_LEARNING=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0 WV_AGENT_ID=codex-skew-replay)
     "${_Si[@]}" "$WV" init >/dev/null 2>&1
     _sid=$("${_Si[@]}" "$WV" add "clock skew baseline" --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | head -1)
-    sqlite3 "$_skew_src/hz/brain.db" "UPDATE nodes SET text='causally newer checkpoint', status='ready', updated_at=200 WHERE id='$_sid';"
+    # Stamp the checkpoint on the causal path: lineage_seq 9 makes the forced
+    # sync re-stamp it to 10 (wv_lineage_seq_base 9 + 1), comfortably above the
+    # skew delta's seq 5.
+    sqlite3 "$_skew_src/hz/brain.db" "UPDATE nodes SET text='causally newer checkpoint', status='ready', updated_at=200, lineage_seq=9, lineage_actor='codex-skew-replay' WHERE id='$_sid';"
     WV_FORCE_SYNC=1 "${_Si[@]}" "$WV" sync >/dev/null 2>&1
     rm -rf "$_skew_src/.weave/deltas"
     mkdir -p "$_skew_src/.weave/deltas"
+    # Current wv_delta_changeset shape: a /* weave-lineage */ header + a
+    # lineage-guarded upsert.  seq 5 is below the checkpoint's seq 10, so guard G
+    # is false and the skew value (updated_at 300) cannot land.
     cat > "$_skew_src/.weave/deltas/300-000000-skew.sql" <<EOF
-INSERT INTO nodes(id,text,status,metadata,alias,created_at,updated_at)
-VALUES('$_sid','clock-skewed remote value','todo','{}',NULL,100,300)
+/* weave-lineage seq=5 actor=skew-writer */
+INSERT INTO nodes(id,text,status,metadata,alias,created_at,updated_at,lineage_seq,lineage_actor)
+VALUES('$_sid','clock-skewed remote value','todo','{}',NULL,100,300,5,'skew-writer')
 ON CONFLICT(id) DO UPDATE SET text=excluded.text,status=excluded.status,
-metadata=excluded.metadata,alias=excluded.alias,updated_at=excluded.updated_at
-WHERE nodes.updated_at IS NULL OR excluded.updated_at >= nodes.updated_at;
+metadata=excluded.metadata,alias=excluded.alias,updated_at=excluded.updated_at,
+lineage_seq=excluded.lineage_seq,lineage_actor=excluded.lineage_actor
+WHERE nodes.lineage_seq = 0
+   OR 5 > nodes.lineage_seq
+   OR (5 = nodes.lineage_seq AND 'skew-writer' > nodes.lineage_actor);
 EOF
     git add .weave
     git -c commit.gpgsign=false -c user.name='Weave test' -c user.email='weave-test@example.invalid' commit -qm 'fixture: clock-skew replay'
@@ -1631,8 +2147,149 @@ _S=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_skew_clone" "WV_HOT_ZONE=$_sk
 _skew_load=$("${_S[@]}" "$WV" load 2>&1 || true)
 _skew_text=$(sqlite3 "$_skew_clone/hz/brain.db" "SELECT text FROM nodes WHERE id='$_skew_id';" 2>/dev/null || echo "")
 assert_contains "$_skew_load" "Replayed 1 delta(s)" "clock-skew fixture replays through normal load"
-assert_xfail "causally newer checkpoint" "$_skew_text" "clock-skewed timestamp cannot override causal checkpoint"
+assert_equals "causally newer checkpoint" "$_skew_text" "clock-skewed timestamp cannot override causal checkpoint"
 rm -rf "$_skew_src" "$_skew_clone"
+
+# ─── No-op changeset with lineage header is not corrupt (wv-253abd) ─────────
+# wv-5a2627 gave every changeset a `/* weave-lineage seq= actor= */` block
+# comment. A no-net-change mutation still fires the _warp trigger, so the
+# changeset is that header plus a `-- no-op UPDATE ...` line and nothing else.
+# Two regressions: (a) auto_sync must not persist such a file; (b) if a
+# consumer catalog already committed one, cmd_load must skip it silently, not
+# warn "Skipped corrupt delta" on every load forever.
+echo "-- durability: no-op changeset carrying the lineage header is benign (wv-253abd)"
+_noop_src=$(mktemp -d)
+_noop_clone=$(mktemp -d)
+rm -rf "$_noop_clone"
+(
+    cd "$_noop_src" && git init -q
+    _Ni=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_noop_src" "WV_HOT_ZONE=$_noop_src/hz" "WEAVE_DIR=$_noop_src/.weave"
+         WV_REQUIRE_LEARNING=0 WV_REQUIRE_QUALITY=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0 WV_AGENT_ID=codex-noop-replay)
+    "${_Ni[@]}" "$WV" init >/dev/null 2>&1
+    _nid=$("${_Ni[@]}" "$WV" add "no-op baseline" --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | head -1)
+    WV_FORCE_SYNC=1 "${_Ni[@]}" "$WV" sync >/dev/null 2>&1
+    rm -rf "$_noop_src/.weave/deltas"; mkdir -p "$_noop_src/.weave/deltas"
+    # (a) a genuine no-net-change mutation: fire the UPDATE trigger without
+    # changing any tracked field, then let auto_sync run.
+    sqlite3 "$_noop_src/hz/brain.db" "UPDATE nodes SET status=status WHERE id='$_nid';"
+    "${_Ni[@]}" "$WV" status >/dev/null 2>&1 || true
+    _kept_noop=0
+    while IFS= read -r _f; do
+        [ -n "$_f" ] || continue
+        grep -qiE '^(INSERT|UPDATE|REPLACE|DELETE|BEGIN|PRAGMA)' "$_f" 2>/dev/null || _kept_noop=1
+    done < <(find "$_noop_src/.weave/deltas" -name '*.sql')
+    printf '%s' "$_kept_noop" > "$_noop_src/.kept"
+    # (b) simulate a no-op delta already committed by an older writer.
+    mkdir -p "$_noop_src/.weave/deltas/2026-09-04"
+    printf "/* weave-lineage seq=5 actor=noop-writer */\n-- no-op UPDATE on node '%s'\n" "$_nid" \
+        > "$_noop_src/.weave/deltas/2026-09-04/1788000000-000000-000-noop-writer-1.sql"
+    git add .weave
+    git -c commit.gpgsign=false -c user.name='Weave test' -c user.email='weave-test@example.invalid' commit -qm 'fixture: no-op delta replay'
+    printf '%s' "$_nid" > "$_noop_src/.nid"
+) >/dev/null 2>&1 || true
+_noop_id=$(cat "$_noop_src/.nid" 2>/dev/null || echo "")
+_noop_kept=$(cat "$_noop_src/.kept" 2>/dev/null || echo "1")
+git clone -q "$_noop_src" "$_noop_clone" 2>/dev/null || true
+_NL=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_noop_clone" "WV_HOT_ZONE=$_noop_clone/hz" "WEAVE_DIR=$_noop_clone/.weave"
+     WV_REQUIRE_LEARNING=0 WV_REQUIRE_QUALITY=0 WV_AUTO_SYNC=0 WV_AGENT_ID=codex-noop-replay)
+_noop_load=$("${_NL[@]}" "$WV" load 2>&1 || true)
+_noop_text=$(sqlite3 "$_noop_clone/hz/brain.db" "SELECT text FROM nodes WHERE id='$_noop_id';" 2>/dev/null || echo "")
+assert_equals "0" "$_noop_kept" "auto_sync drops a comment-only no-op changeset (wv-253abd fix a)"
+assert_not_contains "$_noop_load" "Skipped corrupt delta" "committed no-op delta with lineage header is not flagged corrupt (wv-253abd fix b)"
+assert_equals "no-op baseline" "$_noop_text" "no-op delta leaves the node untouched"
+rm -rf "$_noop_src" "$_noop_clone"
+
+# ─── Causal cutover: pre-lineage back-catalog is fail-closed (wv-2448dd) ─────
+# Once .weave/causal-cutover is committed, a v1 delta carrying no lineage
+# statement is skipped_pre_cutover regardless of its filename epoch, while a
+# post-cutover delta (carries lineage_seq) still replays. The marker is a file
+# the delta catalog cannot write, and the loader fails OPEN on a marker that
+# does not parse to a positive integer.
+echo "-- durability: causal cutover fail-closes the pre-lineage v1 catalog (wv-2448dd)"
+_cut=$(mktemp -d)
+(
+    cd "$_cut" && git init -q
+    _CE=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_cut" "WV_HOT_ZONE=$_cut/hz" "WEAVE_DIR=$_cut/.weave"
+         WV_REQUIRE_LEARNING=0 WV_REQUIRE_QUALITY=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0 WV_AGENT_ID=cutover-fixture)
+    "${_CE[@]}" "$WV" init >/dev/null 2>&1
+    _cid=$("${_CE[@]}" "$WV" add "cutover target" --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | head -1)
+    WV_FORCE_SYNC=1 "${_CE[@]}" "$WV" sync >/dev/null 2>&1
+    rm -rf "$_cut/.weave/deltas"; mkdir -p "$_cut/.weave/deltas/2026-03-20"
+    # pre-cutover format: no lineage statement, an old epoch prefix
+    printf "UPDATE nodes SET text='REVERTED' WHERE id='%s';\n" "$_cid" \
+        > "$_cut/.weave/deltas/2026-03-20/1774018152-legacy.sql"
+    # post-cutover format: carries the /* weave-lineage */ header wv_delta_changeset
+    # emits for every real seq>0 emission (wv-5a2627) -- the structural signal the
+    # pre-cutover guard now classifies on, not a bare lineage_seq= substring.
+    printf "/* weave-lineage seq=50 actor=cutover-fixture */\nUPDATE nodes SET status='ready', lineage_seq=50, lineage_actor='cutover-fixture' WHERE id='%s';\n" "$_cid" \
+        > "$_cut/.weave/deltas/2026-03-20/9999999999-000000-post.sql"
+    printf '%s' "$_cid" > "$_cut/.cid"
+) >/dev/null 2>&1 || true
+_cut_id=$(cat "$_cut/.cid" 2>/dev/null || echo "")
+_CL=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_cut" "WV_HOT_ZONE=$_cut/hz2" "WEAVE_DIR=$_cut/.weave"
+     WV_REQUIRE_LEARNING=0 WV_REQUIRE_QUALITY=0 WV_AUTO_SYNC=0 WV_AGENT_ID=cutover-fixture)
+# No marker yet: the pre-cutover delta applies (reverts the text).
+"${_CL[@]}" "$WV" load >/dev/null 2>&1 || true
+_cut_before=$(sqlite3 "$_cut/hz2/brain.db" "SELECT text FROM nodes WHERE id='$_cut_id';" 2>/dev/null || echo "")
+assert_equals "REVERTED" "$_cut_before" "without the marker a pre-lineage v1 delta still mutates the row"
+# Stamp + load again: pre-cutover skipped, post-cutover replayed.
+echo '{"schema":"weave.causal-cutover.v1","lineage_seq":40,"actor":"op","created_at":"2026-09-03T00:00:00Z"}' > "$_cut/.weave/causal-cutover"
+rm -rf "$_cut/hz2"
+_cut_load=$("${_CL[@]}" "$WV" load 2>&1 || true)
+_cut_after=$(sqlite3 "$_cut/hz2/brain.db" "SELECT text || '|' || status FROM nodes WHERE id='$_cut_id';" 2>/dev/null || echo "")
+assert_contains "$_cut_load" "Skipped 1 pre-cutover delta(s)" "the marker makes cmd_load report a distinct pre-cutover skip"
+assert_equals "cutover target|ready" "$_cut_after" "pre-cutover delta is skipped while the post-cutover delta still replays"
+# A garbled marker fails OPEN (does not silently skip the whole catalog).
+echo 'not json' > "$_cut/.weave/causal-cutover"
+rm -rf "$_cut/hz2"
+_cut_bad=$("${_CL[@]}" "$WV" load 2>&1 || true)
+_cut_bad_txt=$(sqlite3 "$_cut/hz2/brain.db" "SELECT text FROM nodes WHERE id='$_cut_id';" 2>/dev/null || echo "")
+assert_contains "$_cut_bad" "Ignoring .weave/causal-cutover" "an unparseable marker is reported and ignored"
+assert_equals "REVERTED" "$_cut_bad_txt" "a garbled marker fails open — the pre-cutover delta is not skipped"
+# A genuinely pre-cutover (headerless) delta whose VALUE happens to contain the
+# substring "lineage_seq=" must still be classified pre-cutover and skipped: the
+# classifier is the /* weave-lineage */ header, not a whole-file grep for that
+# substring, which would otherwise misclassify prose that quotes the feature.
+echo '{"schema":"weave.causal-cutover.v1","lineage_seq":40,"actor":"op","created_at":"2026-09-03T00:00:00Z"}' > "$_cut/.weave/causal-cutover"
+printf "UPDATE nodes SET text='mentions lineage_seq=1 in prose, no real header' WHERE id='%s';\n" "$_cut_id" \
+    > "$_cut/.weave/deltas/2026-03-20/1774018153-legacy-decoy.sql"
+rm -rf "$_cut/hz2"
+_cut_decoy=$("${_CL[@]}" "$WV" load 2>&1 || true)
+_cut_decoy_txt=$(sqlite3 "$_cut/hz2/brain.db" "SELECT text FROM nodes WHERE id='$_cut_id';" 2>/dev/null || echo "")
+assert_contains "$_cut_decoy" "Skipped 2 pre-cutover delta(s)" "a headerless delta whose VALUE embeds 'lineage_seq=' is still classified pre-cutover"
+assert_equals "cutover target" "$_cut_decoy_txt" "the decoy delta's embedded substring does not let it bypass the pre-cutover guard"
+rm -rf "$_cut"
+
+# Criterion: a fresh clone of THIS repository at its real delta catalog must
+# load to the same graph the committed state.sql describes — the pre-cutover
+# back-catalog contributes nothing. Meaningful only once the marker is committed
+# AND the working-tree state.sql matches HEAD (an in-session dump that lags its
+# own deltas would diverge for reasons unrelated to the cutover).
+if [ -f "$REPO_ROOT/.weave/causal-cutover" ] && \
+   git -C "$REPO_ROOT" diff --quiet -- .weave/state.sql .weave/nodes.jsonl 2>/dev/null; then
+    echo "-- durability: fresh clone of this repo — pre-cutover back-catalog contributes nothing (wv-2448dd)"
+    _rowhash() { sqlite3 "$1" "
+        SELECT id||char(31)||text||char(31)||status||char(31)||coalesce(metadata,'')||char(31)||coalesce(alias,'')||char(31)||created_at||char(31)||updated_at FROM nodes ORDER BY id;
+        SELECT source||char(31)||target||char(31)||type||char(31)||weight||char(31)||coalesce(context,'')||char(31)||created_at FROM edges ORDER BY source,target,type;
+    " 2>/dev/null | sha256sum | cut -d' ' -f1; }
+    # (a) clone + full load: marker active, pre-cutover catalog skipped.
+    _cln=$(mktemp -d); rm -rf "$_cln"
+    git clone -q "$REPO_ROOT" "$_cln" 2>/dev/null || true
+    _CN=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_cln" "WV_HOT_ZONE=$_cln/hz" "WEAVE_DIR=$_cln/.weave"
+         WV_REQUIRE_LEARNING=0 WV_REQUIRE_QUALITY=0 WV_AUTO_SYNC=0 WV_AGENT_ID=clone-diff)
+    _cln_load=$("${_CN[@]}" "$WV" load 2>&1 || true)
+    _clone_hash=$(_rowhash "$_cln/hz/brain.db")
+    # (b) same clone, deltas removed: state.sql alone. If the pre-cutover catalog
+    # is truly inert, (a) and (b) are the same graph.
+    rm -rf "$_cln/hz" "$_cln/.weave/deltas"
+    "${_CN[@]}" "$WV" load >/dev/null 2>&1 || true
+    _bare_hash=$(_rowhash "$_cln/hz/brain.db")
+    rm -rf "$_cln"
+    assert_contains "$_cln_load" "pre-cutover delta(s)" "the clone load skips the pre-cutover back-catalog"
+    assert_equals "$_bare_hash" "$_clone_hash" "a fresh clone loads to the same graph with or without the pre-cutover catalog"
+else
+    echo "-- durability: clone/state.sql parity test inert (marker uncommitted or state.sql lags HEAD)"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo "Testing: trails save when ready nodes exceed the ten-row body cap"
@@ -1781,6 +2438,181 @@ _sync_stamps=$(ls "$_syncdir/hz/.last_gh_sync" "$_syncdir/hz/.last_gh_sync_seq" 
 assert_equals "0" "$_sync_stamps" "WV_TEST_SYNC_STUB is inert without WV_TEST_MODE=1"
 
 rm -rf "$_syncdir"
+
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo "Testing: writer lineage columns (wv-e1556b, epic delta-causality)"
+# ═══════════════════════════════════════════════════════════════════════════
+# Delta replay used to decide conflicts by comparing wall clocks. These columns
+# carry the ordering information that comparison was missing. The migration has
+# to satisfy three separate constraints at once: it must reach an existing
+# database through the real cmd_load path, it must reach a fresh one through
+# db_init with IDENTICAL schema text (state.sql is compared byte-wise by the
+# auto_sync no-op guard, so a divergence is permanent churn between agents), and
+# it must pin the storage class -- the column it replaces did not, and SQLite
+# orders every INTEGER before every TEXT, so a mixed column compares storage
+# classes rather than values.
+reset_db
+
+_lin_cols=$(sqlite3 "$WV_DB" "SELECT name FROM pragma_table_info('nodes') WHERE name LIKE 'lineage%' ORDER BY name;" 2>/dev/null | tr '\n' ' ')
+assert_equals "lineage_actor lineage_seq " "$_lin_cols" "fresh database carries both lineage columns on nodes"
+_lin_ecols=$(sqlite3 "$WV_DB" "SELECT name FROM pragma_table_info('edges') WHERE name LIKE 'lineage%' ORDER BY name;" 2>/dev/null | tr '\n' ' ')
+assert_equals "lineage_actor lineage_seq " "$_lin_ecols" "fresh database carries both lineage columns on edges"
+
+# The committed snapshot must carry the lineage columns in the SAME physical
+# order db_init produces, or a load-migrate of it yields a different CREATE TABLE
+# than a fresh database and the auto_sync byte-compare guard churns forever
+# between agents (wv-5d3ba8: the wv-e1556b snapshot shipped nodes with
+# lineage_seq alone, which a load-migrate then extended to (seq, actor) while a
+# fresh db_init gives (actor, seq)). Compare declared column order, not a sorted
+# set, and load the real committed .weave/state.sql through the real cmd_load.
+_lin_fresh_ord() { sqlite3 "$1" "SELECT sql FROM sqlite_master WHERE type='table' AND name='$2';" 2>/dev/null | grep -oE 'lineage_(actor|seq)' | awk '!seen[$0]++' | tr '\n' ' '; }
+_lin_snap_dir=$(mktemp -d)
+(
+    cd "$_lin_snap_dir" && git init -q
+    _LS=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_lin_snap_dir" "WV_HOT_ZONE=$_lin_snap_dir/hz" "WEAVE_DIR=$_lin_snap_dir/.weave"
+         WV_REQUIRE_LEARNING=0 WV_AUTO_SYNC=0 WV_AGENT_ID=lineage-snap-order)
+    mkdir -p "$_lin_snap_dir/.weave"
+    cp "$REPO_ROOT/.weave/state.sql" "$_lin_snap_dir/.weave/state.sql"
+    cp "$REPO_ROOT/.weave/nodes.jsonl" "$_lin_snap_dir/.weave/nodes.jsonl" 2>/dev/null || true
+    cp "$REPO_ROOT/.weave/edges.jsonl" "$_lin_snap_dir/.weave/edges.jsonl" 2>/dev/null || true
+    "${_LS[@]}" "$WV" load >/dev/null 2>&1
+) >/dev/null 2>&1 || true
+_lin_snap_n=$(_lin_fresh_ord "$_lin_snap_dir/hz/brain.db" nodes)
+_lin_snap_e=$(_lin_fresh_ord "$_lin_snap_dir/hz/brain.db" edges)
+_lin_ref_n=$(_lin_fresh_ord "$WV_DB" nodes)
+_lin_ref_e=$(_lin_fresh_ord "$WV_DB" edges)
+rm -rf "$_lin_snap_dir"
+assert_equals "$_lin_ref_n" "$_lin_snap_n" "committed state.sql loads nodes lineage columns in db_init order"
+assert_equals "$_lin_ref_e" "$_lin_snap_e" "committed state.sql loads edges lineage columns in db_init order"
+
+# Storage class is pinned at write time. Without this the replacement inherits
+# exactly the defect it exists to remove. lineage_seq has INTEGER affinity, so a
+# non-numeric string cannot be coerced and the CHECK rejects it outright.
+_lin_seq_rc=0
+sqlite3 "$WV_DB" "INSERT INTO nodes(id,text,lineage_seq) VALUES('wv-lin1','x','not-an-int');" >/dev/null 2>&1 || _lin_seq_rc=$?
+assert_equals "1" "$([ "$_lin_seq_rc" -ne 0 ] && echo 1 || echo 0)" "a non-integer lineage_seq is rejected by CHECK"
+# lineage_actor has TEXT affinity: a bare number is coerced to text on the way in
+# -- which is the storage class we want -- so the stored value is text either
+# way. That coercion is the "single storage class" guarantee updated_at never
+# had. The CHECK is the backstop for a value affinity does NOT coerce: a blob.
+sqlite3 "$WV_DB" "INSERT INTO nodes(id,text,lineage_actor) VALUES('wv-lin2','x',7);" >/dev/null 2>&1
+_lin_act_type=$(sqlite3 "$WV_DB" "SELECT typeof(lineage_actor) FROM nodes WHERE id='wv-lin2';" 2>/dev/null)
+assert_equals "text" "$_lin_act_type" "a numeric lineage_actor is coerced to text storage class"
+_lin_blob_rc=0
+sqlite3 "$WV_DB" "INSERT INTO nodes(id,text,lineage_actor) VALUES('wv-lin3','x',x'00');" >/dev/null 2>&1 || _lin_blob_rc=$?
+assert_equals "1" "$([ "$_lin_blob_rc" -ne 0 ] && echo 1 || echo 0)" "a blob lineage_actor is rejected by CHECK"
+
+# Backfill is deterministic, and ('',0) sorts before every real lineage so the
+# loader can recognise a pre-cutover row.
+$WV add "lineage backfill probe" --force >/dev/null 2>&1
+_lin_default=$(sqlite3 "$WV_DB" "SELECT lineage_actor || '|' || lineage_seq FROM nodes WHERE text='lineage backfill probe';" 2>/dev/null)
+assert_equals "|0" "$_lin_default" "a row written without lineage takes the deterministic ('',0) backfill"
+
+# The columns must survive the snapshot, or they cannot travel between agents.
+_lin_dump=$(mktemp)
+WV_DB="$WV_DB" bash -c "
+    source '$REPO_ROOT/scripts/lib/wv-db.sh'
+    source '$REPO_ROOT/scripts/cmd/wv-cmd-data.sh'
+    dump_state_sql '$WV_DB' '$_lin_dump'
+" >/dev/null 2>&1 || true
+_lin_in_dump=$(grep -c "lineage_seq" "$_lin_dump" 2>/dev/null || true)
+assert_equals "1" "$([ "${_lin_in_dump:-0}" -ge 1 ] && echo 1 || echo 0)" "lineage columns appear in dump_state_sql output"
+rm -f "$_lin_dump"
+
+# Migration is idempotent: cmd_load runs it on every load, and ALTER TABLE on an
+# existing column is an error the migration swallows by design.
+_lin_before=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM pragma_table_info('nodes');" 2>/dev/null)
+WV_DB="$WV_DB" bash -c "
+    source '$REPO_ROOT/scripts/lib/wv-db.sh'
+    db_migrate_lineage
+    db_migrate_lineage
+" >/dev/null 2>&1 || true
+_lin_after=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM pragma_table_info('nodes');" 2>/dev/null)
+assert_equals "$_lin_before" "$_lin_after" "re-running the lineage migration adds no duplicate columns"
+
+# The migration must also reach a database that predates every lineage column,
+# not only one db_init already built.
+_lin_bare=$(mktemp /tmp/wv-lineage-bare-XXXXXX.db)
+sqlite3 "$_lin_bare" <<'SQL'
+CREATE TABLE nodes (id TEXT PRIMARY KEY, text TEXT, status TEXT,
+    metadata TEXT DEFAULT '{}', created_at DATETIME, updated_at DATETIME);
+CREATE TABLE edges (source TEXT, target TEXT, type TEXT);
+SQL
+WV_DB="$_lin_bare" bash -c "
+    source '$REPO_ROOT/scripts/lib/wv-db.sh'
+    db_migrate_lineage
+" >/dev/null 2>&1 || true
+_lin_bare_cols=$(sqlite3 "$_lin_bare" "
+    SELECT (SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name LIKE 'lineage%')
+         + (SELECT COUNT(*) FROM pragma_table_info('edges') WHERE name LIKE 'lineage%');" 2>/dev/null)
+rm -f "$_lin_bare"
+assert_equals "4" "$_lin_bare_cols" "the migration adds all four columns to a pre-lineage database"
+
+# A snapshot written by a release that predates the columns must still load. The
+# loader replaces the database with the one state.sql describes and only then
+# runs the migrations, so this exercises the real ordering rather than a mock.
+_lin_old=$(mktemp -d)
+(
+    cd "$_lin_old" && git init -q
+    _LO=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_lin_old" "WV_HOT_ZONE=$_lin_old/hz" "WEAVE_DIR=$_lin_old/.weave"
+         WV_REQUIRE_LEARNING=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0 WV_AGENT_ID=lineage-oldsnap)
+    "${_LO[@]}" "$WV" init >/dev/null 2>&1
+    _lid=$("${_LO[@]}" "$WV" add "pre-lineage snapshot node" --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | head -1)
+    WV_FORCE_SYNC=1 "${_LO[@]}" "$WV" sync >/dev/null 2>&1
+    # Rewrite state.sql as a pre-lineage release would have emitted it: strip the
+    # column definitions and drop the two trailing positional values per row.
+    python3 - "$_lin_old/.weave/state.sql" <<'PYOLD'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s = re.sub(r",\s*lineage_actor TEXT NOT NULL DEFAULT '' CHECK\(typeof\(lineage_actor\) = 'text'\)", "", s)
+s = re.sub(r",\s*lineage_seq INTEGER NOT NULL DEFAULT 0 CHECK\(typeof\(lineage_seq\) = 'integer'\)", "", s)
+s = re.sub(r"CREATE INDEX IF NOT EXISTS idx_(nodes|edges)_lineage[^;]*;\n?", "", s)
+s = re.sub(r",'',0\);", ");", s)
+open(p, "w").write(s)
+PYOLD
+    printf '%s' "$_lid" > "$_lin_old/.lid"
+) >/dev/null 2>&1 || true
+_lin_id=$(cat "$_lin_old/.lid" 2>/dev/null || echo "")
+# grep -c prints 0 AND exits 1 on no match, so `|| echo 0` would append a second
+# line here where zero is the expected count. Swallow the status, keep the count.
+_lin_stripped=$(grep -c "lineage_seq" "$_lin_old/.weave/state.sql" 2>/dev/null || true)
+assert_equals "0" "${_lin_stripped:-0}" "the pre-lineage fixture snapshot really has no lineage columns"
+_LL=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_lin_old" "WV_HOT_ZONE=$_lin_old/hz2" "WEAVE_DIR=$_lin_old/.weave"
+     WV_REQUIRE_LEARNING=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0 WV_AGENT_ID=lineage-oldsnap)
+"${_LL[@]}" "$WV" load >/dev/null 2>&1 || true
+_lin_loaded=$(sqlite3 "$_lin_old/hz2/brain.db" "SELECT text FROM nodes WHERE id='$_lin_id';" 2>/dev/null || echo "")
+assert_equals "pre-lineage snapshot node" "$_lin_loaded" "a pre-lineage state.sql still loads"
+# The migration backfills the imported row to ('', 0); cmd_load then replays the
+# committed delta, which (wv-cdb45a) is lineage-guarded and carries this actor's
+# first sequence, so the row deterministically ends at (lineage-oldsnap, 1). The
+# point is that migration and lineage-guarded replay compose to a single stable
+# value, not that the backfill is visible in isolation.
+_lin_backfilled=$(sqlite3 "$_lin_old/hz2/brain.db" "SELECT lineage_actor || '|' || lineage_seq FROM nodes WHERE id='$_lin_id';" 2>/dev/null || echo "")
+assert_equals "lineage-oldsnap|1" "$_lin_backfilled" "cmd_load lands the pre-lineage row at a deterministic lineage"
+# Idempotent: a second load replays the same delta and the lineage does not move.
+"${_LL[@]}" "$WV" load >/dev/null 2>&1 || true
+_lin_backfilled2=$(sqlite3 "$_lin_old/hz2/brain.db" "SELECT lineage_actor || '|' || lineage_seq FROM nodes WHERE id='$_lin_id';" 2>/dev/null || echo "")
+assert_equals "lineage-oldsnap|1" "$_lin_backfilled2" "a second load does not advance the row's lineage"
+
+# db_rebuild_fts runs after replay for a reason: an INSERT OR REPLACE moves the
+# implicit rowid without firing nodes_ad, stranding orphaned index entries that
+# surface later as graph-wide SQLITE_CORRUPT (wv-d2e6c6). The migration must not
+# disturb that. fts5vocab sees the orphans PRAGMA integrity_check cannot.
+_lin_orphans=$(sqlite3 "$_lin_old/hz2/brain.db" "
+    CREATE VIRTUAL TABLE IF NOT EXISTS temp.nodes_fts_v USING fts5vocab(main, nodes_fts, instance);
+    SELECT COUNT(DISTINCT doc) FROM temp.nodes_fts_v
+    WHERE doc NOT IN (SELECT rowid FROM nodes);" 2>/dev/null || echo "probe-failed")
+assert_equals "0" "$_lin_orphans" "loading with the lineage migration strands no orphaned nodes_fts rows"
+rm -rf "$_lin_old"
+
+# json-v2 is the shape weave_gh, the active-node hook and MCP consume. lineage is
+# replay bookkeeping; lineage_seq=0 would otherwise survive the empty-value
+# filter and appear in every one of those records.
+_lin_v2=$($WV list --all --json-v2 2>/dev/null | jq -r '[.[] | select(has("lineage_seq") or has("lineage_actor"))] | length' 2>/dev/null || echo "jq-missing")
+assert_equals "0" "$_lin_v2" "json-v2 records omit the lineage columns"
 
 echo ""
 

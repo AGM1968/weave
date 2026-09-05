@@ -80,7 +80,7 @@ from weave_quality.db import (
     upsert_file_state,
 )
 from weave_quality.git_metrics import (
-    batch_blob_shas,
+    working_tree_blob_shas,
     build_file_state,
     compute_co_changes,
     enrich_all_git_stats,
@@ -103,10 +103,19 @@ from weave_quality.prose_rules import (
     PROSE_LANGUAGES,
     PatternRuleExecutionError,
     PatternRuleValidationError,
+    # Private by name, deliberate by use: `patterns show` exists to stop
+    # consumers re-deriving the engine's matcher construction from the rule
+    # YAML, so it has to report what the engine actually builds rather than a
+    # second implementation that can drift from it.
+    _repo_relative_posix,
+    _string_list,
+    _word_regex,
     load_prose_rule,
+    prose_rule_out_of_scope,
     run_prose_rule,
     validate_pattern_rule,
 )
+from weave_quality.prose_shape import markdown_files, profile_texts
 from weave_quality.python_parser import analyze_python_file
 
 # Re-exported deliberately: rule loading now lives in pattern_loader so the
@@ -607,7 +616,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
             _SCANNER_VERSION,
         )
 
-    blob_map = batch_blob_shas(repo)
+    # Working-tree SHAs, not HEAD's: an uncommitted edit has to be visible
+    # to both file_changed and the AST cache (wv-7fbfe1).
+    blob_map = working_tree_blob_shas(repo)
     files_to_scan: list[str] = []
     files_unchanged: list[str] = []
     for rel_path in all_files:
@@ -2393,8 +2404,20 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
     raw_hits = {r: raw_hits_by_rule.get(r, 0) for r, _, _ in rules}
     rule_sources = {r: _rule_source(path) for r, path, _ in rules}
 
+    # A prose rule with no eligible file under the target reported zero because
+    # it never ran, not because the file is clean (wv-33733d). Only computed for
+    # rules that found nothing, so a scan with findings pays nothing for it.
+    out_of_scope = sorted(
+        rule_id
+        for rule_id, rule_path, language in rules
+        if language in PROSE_LANGUAGES
+        and not summary.get(rule_id)
+        and prose_rule_out_of_scope(rule_path, target, repo)
+    )
+
     return _emit_pattern_scan(
-        args, rules, all_findings, finding_states, summary, raw_hits, rule_sources
+        args, rules, all_findings, finding_states, summary, raw_hits, rule_sources,
+        out_of_scope,
     )
 
 
@@ -2409,8 +2432,11 @@ def _emit_pattern_scan(
     summary: dict[str, int],
     raw_hits: dict[str, int],
     rule_sources: dict[str, str],
+    out_of_scope: list[str] | None = None,
 ) -> int:
     """Render one scan's result as JSON or as the per-rule text report."""
+    out_of_scope = out_of_scope or []
+    out_of_scope_set = set(out_of_scope)
     total = len(all_findings)
     matches = [
         {
@@ -2445,13 +2471,35 @@ def _emit_pattern_scan(
                     "by_rule": summary,
                     "raw_hits": raw_hits,
                     "rule_sources": rule_sources,
+                    # Rules whose paths: matched no file under the target. Their
+                    # by_rule zero means "never ran", not "found nothing".
+                    "out_of_scope": out_of_scope,
                     "matches": matches,
                 }
             )
         )
     else:
-        print(f"Pattern scan complete: {len(rules)} rules, {total} findings")
+        # The applied fraction is only claimed when something was skipped. With
+        # nothing out of scope, printing "N of N applied" would assert that the
+        # ast-grep code rules ran too -- and a python rule on a Markdown target
+        # is the same structural zero through ast-grep's own language filter,
+        # which this check does not cover.
+        if out_of_scope_set:
+            applied = len(rules) - len(out_of_scope_set)
+            print(
+                f"Pattern scan complete: {applied} of {len(rules)} prose/code rules "
+                f"applied, {total} findings "
+                f"({len(out_of_scope_set)} prose rule(s) out of scope for this target)"
+            )
+        else:
+            print(f"Pattern scan complete: {len(rules)} rules, {total} findings")
         for rule_id, count in sorted(summary.items(), key=lambda x: -x[1]):
+            if rule_id in out_of_scope_set:
+                print(
+                    f"  {rule_id} [{rule_sources.get(rule_id, 'custom')}]: "
+                    "n/a — no file under this target is in the rule's paths:"
+                )
+                continue
             raw = raw_hits.get(rule_id, count)
             suffix = (
                 f"  ({raw} matched, {raw - count} suppressed as same-position duplicate)"
@@ -3019,6 +3067,268 @@ def cmd_patterns_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rule_matcher_spec(rule: dict[str, object]) -> dict[str, object]:
+    """What a rule actually searches for, as the ENGINE searches for it.
+
+    Consumers reimplement this from the rule YAML because nothing exposes it,
+    and two unrelated repositories (earth-engine-analysis, nowcast) each got it
+    wrong in a different way. The failures are worth naming, because each one
+    is a thing the YAML alone cannot tell you:
+
+      citation carries no searchable text at all. Its `terms:` are check-mode
+      selectors -- load_prose_rule constrains them to exactly
+      {unresolved-author-date, cited-reference-missing-year} -- handed to a
+      resolver. A decoder that treats them as terms emits
+      `\\bunresolved-author-date\\b`, which matched 0 times in 986,291 words of
+      peer-reviewed corpus and printed as "neither corpus": a false verdict
+      shaped exactly like a real measurement. `expressions` is None here, and
+      the reason travels with it.
+
+      EVERY prose kind is case-insensitive, regex included. lexicon and motif
+      get it from _word_regex, density from lowercasing both sides, and regex
+      from _regex_findings compiling each pattern with re.IGNORECASE -- so a
+      pattern written \\bdue to the fact that\\b matches "DUE TO THE FACT THAT"
+      too. Decoding any of them case-sensitively undercounts every
+      sentence-initial hit: 10% of prose-ai-vocabulary's true rate in that same
+      corpus, and every regex rule's rate in the first pass of the 2026-09-02
+      calibration, which this surface reported as "matched verbatim".
+
+      density is a lowercased SUBSTRING scan with no word boundary at all
+      (_density_findings), which is what lets an em dash be a valid term. A
+      decoder that word-bounds it inverts the result: `\\b—\\b` needs a word
+      character on both sides of an em dash and so matches almost nothing.
+
+    And a match is not a finding. density and motif carry min_count, motif adds
+    require_no_digit_within suppression, so a raw count answers "how often does
+    this construction appear" (the rate question both consumers were asking)
+    and not "how many findings would the engine report".
+    """
+    kind = str(rule.get("kind", ""))
+    scope = str(rule.get("match_scope", ""))
+    spec: dict[str, object] = {"kind": kind, "match_scope": scope}
+
+    if kind == "citation":
+        spec["expressions"] = None
+        spec["reason"] = "citation rules carry check modes, not searchable text"
+        spec["checks"] = [str(t) for t in _string_list(rule, "terms")]
+        return spec
+
+    if kind == "regex":
+        spec["expressions"] = [str(p) for p in _string_list(rule, "patterns")]
+        spec["flags"] = ["IGNORECASE"]
+        spec["semantics"] = "regex, case-insensitive"
+    elif kind in {"lexicon", "motif"}:
+        terms = [str(t) for t in _string_list(rule, "terms")]
+        if kind == "lexicon":
+            # One alternation, longest-first -- the engine's own construction.
+            spec["expressions"] = [_word_regex(terms).pattern]
+        else:
+            spec["expressions"] = [_word_regex([t]).pattern for t in terms]
+        spec["flags"] = ["IGNORECASE"]
+        spec["semantics"] = "word-bounded alternation, case-insensitive"
+    elif kind == "density":
+        spec["expressions"] = [str(t) for t in _string_list(rule, "terms")]
+        spec["flags"] = ["LOWERCASE_SUBSTRING"]
+        spec["semantics"] = (
+            "literal substring on lowercased text, no word boundary"
+        )
+    else:  # pragma: no cover -- load_prose_rule rejects unknown kinds first
+        spec["expressions"] = None
+        spec["reason"] = f"unsupported kind {kind!r}"
+        return spec
+
+    for key in ("min_count", "require_no_digit_within"):
+        if key in rule:
+            spec[key] = rule[key]
+    if kind in {"density", "motif"} or "min_count" in rule:
+        spec["note"] = "match count is not a violation count"
+    return spec
+
+
+def _show_error(kind: str, detail: str, json_out: bool) -> int:
+    """One structured-or-plain error shape for every `patterns show` refusal."""
+    if json_out:
+        print(json.dumps({"error": kind, "detail": detail}))
+    else:
+        print(f"patterns: {detail}", file=sys.stderr)
+    return 1
+
+
+def _show_rule_row(
+    rule_id: str, rule_path: Path, language: str, repo: Path
+) -> dict[str, object]:
+    """One rule's published matcher, or why it has none."""
+    row: dict[str, object] = {
+        "id": rule_id,
+        "language": language,
+        "source": _repo_relative_posix(rule_path, repo),
+    }
+    if language not in PROSE_LANGUAGES:
+        # ast-grep rules carry a nested rule: mapping, not expressions.
+        row["kind"] = "ast-grep"
+        row["expressions"] = None
+        row["reason"] = "code rules are ast-grep patterns, not regexes"
+        return row
+    row.update(_rule_matcher_spec(load_prose_rule(rule_path, rule_id)))
+    return row
+
+
+def _print_rule_row(row: dict[str, object]) -> None:
+    """Human rendering: expressions, their flags, or the reason there are none."""
+    print(f"{row['id']}  [{row['kind']}]  {row['source']}")
+    exprs = row.get("expressions")
+    if exprs is None:
+        print(f"    (no searchable expressions) {row.get('reason', '')}")
+        if row.get("checks"):
+            print(f"    checks: {', '.join(str(c) for c in row['checks'])}")
+        print()
+        return
+    flags = row.get("flags") or []
+    suffix = f"  [{', '.join(str(f) for f in flags)}]" if flags else ""
+    for expr in exprs:  # type: ignore[union-attr]
+        print(f"    {expr}{suffix}")
+    if row.get("note"):
+        print(f"    note: {row['note']}")
+    print()
+
+
+def cmd_patterns_show(args: argparse.Namespace) -> int:
+    """Emit what each rule searches for, so a consumer need not guess."""
+    repo = Path(_resolve_repo(getattr(args, "path", None)))
+    error_code = _non_directory_repo_root_error(repo, args.json)
+    if error_code is not None:
+        return error_code
+
+    wanted = getattr(args, "rule_id", None)
+    if wanted is None and not getattr(args, "all", False):
+        return _show_error("no_rule_selected", "give a rule id or --all", args.json)
+
+    try:
+        conf_disabled = _disabled_patterns(repo / ".weave" / "quality.conf")
+        rules = _load_pattern_rules(repo, conf_disabled)
+    except PatternRuleValidationError as exc:
+        return _pattern_rule_error(exc, args.json)
+    except OSError as exc:
+        return _show_error(
+            "invalid_repo_root",
+            f"could not enumerate pattern rule directories under {repo} "
+            f"({exc.strerror or exc})",
+            args.json,
+        )
+
+    try:
+        out = [
+            _show_rule_row(rule_id, rule_path, language, repo)
+            for rule_id, rule_path, language in rules
+            if wanted is None or rule_id == wanted
+        ]
+    except PatternRuleValidationError as exc:
+        return _pattern_rule_error(exc, args.json)
+
+    if wanted is not None and not out:
+        return _show_error("unknown_rule", f"no rule {wanted!r} in {repo}", args.json)
+
+    if args.json:
+        print(json.dumps({"repo": str(repo), "rules": out}, indent=2))
+        return 0
+    for row in out:
+        _print_rule_row(row)
+    return 0
+
+
+def cmd_prose_shape(args: argparse.Namespace) -> int:
+    """Report sentence shape, and the movement a repair sweep produced."""
+    repo = Path(_resolve_repo(None))
+    target = Path(getattr(args, "path", None) or repo)
+    if not target.is_absolute():
+        target = (Path.cwd() / target).resolve()
+    if not target.exists():
+        return _show_error("target_missing", f"no such path: {target}", args.json)
+
+    files = markdown_files(target)
+    if not files:
+        return _show_error(
+            "no_markdown", f"no .md files under {target}", args.json
+        )
+
+    current = profile_texts(
+        [f.read_text(encoding="utf-8", errors="replace") for f in files]
+    )
+    payload: dict[str, object] = {
+        "target": str(target),
+        "files": len(files),
+        "current": current,
+    }
+
+    baseline_ref = getattr(args, "baseline", None)
+    if baseline_ref:
+        # SAME FILE SET ON BOTH SIDES. Profiling every file now against only the
+        # files that existed then would fold "documents added" into the delta and
+        # read it as shape movement -- the same asymmetry that put a rule's
+        # provenance at 26.9 words against 21.1. Files added since the baseline
+        # are counted and excluded, not silently included on one side.
+        before_texts: list[str] = []
+        after_texts: list[str] = []
+        added = 0
+        for f in files:
+            rel = _repo_relative_posix(f, repo)
+            proc = subprocess.run(
+                ["git", "show", f"{baseline_ref}:{rel}"],
+                cwd=str(repo), capture_output=True, text=True, check=False,
+            )
+            if proc.returncode != 0:
+                added += 1
+                continue
+            before_texts.append(proc.stdout)
+            after_texts.append(f.read_text(encoding="utf-8", errors="replace"))
+        if not before_texts:
+            return _show_error(
+                "baseline_empty",
+                f"no file under {target} exists at {baseline_ref}",
+                args.json,
+            )
+        before = profile_texts(before_texts)
+        after = profile_texts(after_texts)
+        payload["compared_files"] = len(before_texts)
+        payload["added_since_baseline"] = added
+        payload["baseline"] = {"ref": baseline_ref, "profile": before}
+        payload["after"] = after
+        payload["delta"] = {
+            k: round(float(after[k]) - float(before[k]), 4) for k in after
+        }
+
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print(f"{len(files)} markdown file(s) under {target}")
+    if "baseline" in payload:
+        base = payload["baseline"]["profile"]  # type: ignore[index]
+        after = payload["after"]  # type: ignore[index]
+        delta = payload["delta"]  # type: ignore[index]
+        note = (
+            f", {payload['added_since_baseline']} added since and excluded"
+            if payload["added_since_baseline"]
+            else ""
+        )
+        print(
+            f"  {payload['compared_files']} present at {baseline_ref}{note}\n"
+        )
+        print(f"  {'metric':14} {'before':>10} {'after':>10} {'delta':>10}")
+        print("  " + "-" * 48)
+        for key in after:
+            print(f"  {key:14} {base[key]:>10} {after[key]:>10} {delta[key]:>+10}")
+        print(
+            "\n  A split-only sweep shows coord_pct falling with subord_pct and\n"
+            "  phrase_pct flat, sentences up, and words unchanged: joins became\n"
+            "  full stops rather than another relationship."
+        )
+    else:
+        for key, value in current.items():
+            print(f"  {key:14} {value}")
+    return 0
+
+
 def cmd_patterns(args: argparse.Namespace) -> int:
     """Dispatch pattern scan, adjudication, reporting, and promotion commands."""
     sub = getattr(args, "patterns_command", None)
@@ -3026,6 +3336,8 @@ def cmd_patterns(args: argparse.Namespace) -> int:
         return cmd_patterns_scan(args)
     if sub == "list":
         return cmd_patterns_list(args)
+    if sub == "show":
+        return cmd_patterns_show(args)
     if sub == "promote":
         return _cmd_promote_patterns(args)
     if sub == "adjudicate":
@@ -3035,7 +3347,7 @@ def cmd_patterns(args: argparse.Namespace) -> int:
     if sub == "validate":
         return cmd_patterns_validate(args)
     print(
-        "Usage: wv quality patterns {scan,list,adjudicate,report,validate,promote}",
+        "Usage: wv quality patterns {scan,list,show,adjudicate,report,validate,promote}",
         file=sys.stderr,
     )
     return 1
@@ -3353,6 +3665,23 @@ def main() -> int:  # pragma: no cover
     pat_list_p.add_argument("path", nargs="?", help="Repo path (default: repo root)")
     pat_list_p.add_argument("--json", action="store_true", help="JSON output")
 
+    shape_p = sub.add_parser(
+        "prose-shape", help="Sentence shape of a document set, and its movement"
+    )
+    shape_p.add_argument("path", nargs="?", help="File or directory (default: repo root)")
+    shape_p.add_argument("--baseline", help="git ref to compare the same paths against")
+    shape_p.add_argument("--json", action="store_true", help="JSON output")
+
+    pat_show_p = patterns_sub.add_parser(
+        "show", help="Show what a rule searches for, as the engine searches for it"
+    )
+    pat_show_p.add_argument("rule_id", nargs="?", help="Rule id (omit with --all)")
+    pat_show_p.add_argument(
+        "--all", action="store_true", help="Every active rule"
+    )
+    pat_show_p.add_argument("--path", help="Repo path (default: repo root)")
+    pat_show_p.add_argument("--json", action="store_true", help="JSON output")
+
     pat_promote_p = patterns_sub.add_parser(
         "promote", help="Promote findings as Weave nodes"
     )
@@ -3444,6 +3773,7 @@ def main() -> int:  # pragma: no cover
         "structural-search": cmd_structural_search,
         "coaching": cmd_coaching_render,
         "patterns": cmd_patterns,
+        "prose-shape": cmd_prose_shape,
     }
     if args.command in _dispatch:
         return _dispatch[args.command](args)

@@ -191,6 +191,7 @@ _wv_dispatch() {
         sync)        cmd_sync "$@" ;;
         load)        cmd_load "$@" ;;
         compact)     cmd_compact "$@" ;;
+        cutover)     cmd_cutover "$@" ;;
         prune)       cmd_prune "$@" ;;
         unarchive)   cmd_unarchive "$@" ;;
         clean-ghosts) cmd_clean_ghosts "$@" ;;

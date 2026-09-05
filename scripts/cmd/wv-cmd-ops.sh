@@ -6756,6 +6756,9 @@ commits list from their children."
         compact)
             print_command_help "wv compact [--older-than=Nd] [--dry-run] [--force]" "Delete replayed delta files after age and active-claim safety checks."
             ;;
+        cutover)
+            print_command_help "wv cutover [--yes] [--force] [--json]" "Stamp the causal cutover (.weave/causal-cutover) so cmd_load skips the pre-lineage v1 delta back-catalog. Operator-run; requires every agent synced."
+            ;;
         refs)
             print_command_help "wv refs <file> | wv refs -t <text> | echo <text> | wv refs [--link --from=<id>] [--json] [--max=N]" "Extract Weave node references from text and optionally create edges."
             ;;
@@ -6865,6 +6868,7 @@ Commands:
   config            Manage durable opt-in knobs [list|get|set|unset|enable|disable]
     guide             Workflow quick reference [--topic=workflow|github|learnings|context|routing|mcp|verification|instrumentation|config|discovery]
   prune             Archive old done nodes
+  cutover           Stamp the causal cutover so load skips the pre-lineage delta back-catalog [--yes] [--force] [--json]
   unarchive <id>    Restore a pruned node from .weave/archive/ [--dry-run] [--with-edges]
   clean-ghosts      Delete ghost edges referencing deleted nodes [--dry-run] [legacy compatibility]
   commit-refs       Audit recorded commit SHAs against the pushed branch [--json] [--all] [--prune]

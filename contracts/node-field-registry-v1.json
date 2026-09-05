@@ -1,1 +1,23 @@
-{"format":"weave.node-fields.v1","fields":{"status":{"storage":"column:status","value":{"enum":["todo","ready","active","blocked","done"]},"absent":"not_allowed"},"claimed_by":{"storage":"metadata.$.claimed_by","value":{"type":["string","null"]},"absent":"null_only"},"risk_level":{"storage":"metadata.$.risk_level","value":{"enum":["none","low","medium","high"]},"absent":"default:none"}}}
+{
+  "format": "weave.node-fields.v1",
+  "fields": {
+    "status": {
+      "storage": "column:status",
+      "value": { "enum": ["todo", "ready", "active", "blocked", "done"] },
+      "absent": "not_allowed"
+    },
+    "claimed_by": {
+      "storage": "metadata.$.claimed_by",
+      "value": { "type": ["string", "null"] },
+      "absent": "null_only"
+    },
+    "risk_level": {
+      "storage": "metadata.$.risk_level",
+      "value": { "enum": ["none", "low", "medium", "high"] },
+      "absent": "default:none"
+    },
+    "text": { "storage": "column:text", "value": { "type": ["string", "null"] }, "absent": "not_allowed" },
+    "alias": { "storage": "column:alias", "value": { "type": ["string", "null"] }, "absent": "null_only" },
+    "metadata": { "storage": "column:metadata", "value": { "type": "object" }, "absent": "not_allowed" }
+  }
+}

@@ -1,6 +1,7 @@
 id: markdown-split-code-span
 language: prose
 kind: regex
+violation_type: markdown:malformed-markup
 severity: info
 policy: always-on-shared
 maturity: promotable

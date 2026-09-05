@@ -595,6 +595,213 @@ test_impact_race_hook_is_gated_and_validated() {
 }
 
 # Run all tests
+test_uncommitted_edit_invalidates_function_rows() {
+    echo ""
+    echo "Test 12: an uncommitted edit invalidates per-function CC rows"
+    echo "============================================================="
+
+    # wv-7fbfe1. blob_map came from `git ls-tree -r HEAD`, so a tracked file with
+    # uncommitted edits carried its PRE-EDIT SHA. file_changed read that as
+    # unchanged and skipped the file; ASTCache, keyed on the same value, handed
+    # back the committed parse to anything that got past. `wv quality functions`
+    # then served the old complexity under the old line span, and the `wv done`
+    # mccabe gate reads exactly those rows -- while the repository is dirty,
+    # which is the only state it is ever in when the gate runs.
+    setup_test_env
+    git init -q . >/dev/null 2>&1 || true
+    git config user.email "test@test.com" || true
+    git config user.name "Test" || true
+    git config commit.gpgsign false || true
+
+    mkdir -p src
+    printf 'def sample(a):\n    if a: return 1\n    return 0\n' > src/sample.py
+    git add -A >/dev/null 2>&1 || true
+    git commit -qm "baseline" >/dev/null 2>&1 || true
+
+    "$WV" quality scan >/dev/null 2>&1 || true
+    local before
+    before=$("$WV" quality functions src/sample.py 2>&1 | grep -oE 'CC=[0-9]+' | head -1 || true)
+    assert_equals "CC=2" "$before" "baseline complexity is recorded"
+
+    # Same function, far more branching -- and deliberately NOT committed.
+    cat > src/sample.py <<'PYEOF'
+def sample(a, b, c, d, e):
+    if a:
+        if b:
+            if c:
+                if d:
+                    if e: return 1
+    for i in range(10):
+        if i > 5 and a or b: return 2
+    while c:
+        if d or e: break
+    return 0
+PYEOF
+
+    "$WV" quality scan >/dev/null 2>&1 || true
+    local after
+    after=$("$WV" quality functions src/sample.py 2>&1 | grep -oE 'CC=[0-9]+' | head -1 || true)
+    local changed="stale"
+    [ -n "$after" ] && [ "$after" != "CC=2" ] && changed="updated"
+    assert_equals "updated" "$changed" \
+        "rescan reflects the uncommitted edit (no 'wv quality reset' needed)"
+
+    # The stored span is the tell: a carried-forward row keeps the pre-edit one,
+    # so a stale row is recognisable without knowing the right complexity.
+    local span span_state
+    span=$("$WV" quality functions src/sample.py 2>&1 | grep -oE 'L:[0-9]+-[0-9]+' | head -1 || true)
+    span_state="stale"
+    [ -n "$span" ] && [ "$span" != "L:1-3" ] && span_state="refreshed"
+    assert_equals "refreshed" "$span_state" "stored line span is refreshed with the value"
+
+    # Reverting to the committed bytes must settle rather than re-scan forever:
+    # the working-tree hash uses git's own blob formula, so identical content
+    # hashes back to the HEAD blob.
+    printf 'def sample(a):\n    if a: return 1\n    return 0\n' > src/sample.py
+    "$WV" quality scan >/dev/null 2>&1 || true
+    local reverted
+    reverted=$("$WV" quality functions src/sample.py 2>&1 | grep -oE 'CC=[0-9]+' | head -1 || true)
+    assert_equals "CC=2" "$reverted" "reverting to committed bytes returns the baseline"
+
+    cd "$PROJECT_ROOT" 2>/dev/null || true
+}
+
+test_done_gate_reads_post_edit_complexity() {
+    echo ""
+    echo "Test 13: the wv done complexity gate reads a post-edit value"
+    echo "============================================================"
+
+    # wv-7fbfe1, end to end. _done_refresh_file_metrics reads MAX(fn_cc:*) for
+    # the LATEST scan out of quality.db and upserts it into brain.db, which the
+    # gate compares against policy_thresholds. It never scans for itself, so a
+    # scan blind to the working tree left the gate judging committed code: a
+    # close blocked over a defect the author had already fixed but not committed.
+    #
+    # Both halves are asserted. The first proves the gate is actually armed in
+    # this environment -- without it, a gate that silently never fires would
+    # make the second assertion pass for the wrong reason.
+    setup_test_env
+    git init -q . >/dev/null 2>&1 || true
+    git config user.email "test@test.com" || true
+    git config user.name "Test" || true
+    git config commit.gpgsign false || true
+
+    mkdir -p src
+    {
+        echo "def gate(a, b, c, d, e, f):"
+        for i in $(seq 1 30); do
+            echo "    if a and b or c and d or e and f: return $i"
+        done
+        echo "    return 0"
+    } > src/gate.py
+    git add -A >/dev/null 2>&1 || true
+    git commit -qm "high complexity baseline" >/dev/null 2>&1 || true
+    "$WV" quality scan >/dev/null 2>&1 || true
+
+    local blocked_node
+    blocked_node=$("$WV" add "gate armed check" --standalone --criteria="c" --risks=low 2>/dev/null | tail -1)
+    sqlite3 "$WV_HOT_ZONE/brain.db" \
+        "INSERT OR REPLACE INTO node_files(node_id, path) VALUES('$blocked_node','src/gate.py');" \
+        >/dev/null 2>&1 || true
+    "$WV" work "$blocked_node" >/dev/null 2>&1 || true
+
+    local armed="not-armed"
+    "$WV" done "$blocked_node" --skip-verification >/dev/null 2>&1 || armed="armed"
+    assert_equals "armed" "$armed" "the complexity gate blocks a close over committed high CC"
+
+    # Same file, repaired, and deliberately NOT committed.
+    printf 'def gate(a):\n    if a: return 1\n    return 0\n' > src/gate.py
+    "$WV" quality scan >/dev/null 2>&1 || true
+
+    local outcome="blocked"
+    if "$WV" done "$blocked_node" --skip-verification >/dev/null 2>&1; then
+        outcome="closed"
+    fi
+    assert_equals "closed" "$outcome" \
+        "wv done accepts an uncommitted complexity repair (gate is not reading a stale row)"
+
+    cd "$PROJECT_ROOT" 2>/dev/null || true
+}
+
+test_exempt_projection_survives_a_rebuilt_db() {
+    echo ""
+    echo "Test 14: a declared exemption survives losing its projection"
+    echo "============================================================"
+
+    # wv-785ba1. The quality gate is a SQL trigger reading the quality_exempt
+    # TABLE, projected from .weave/quality.conf by _load_quality_config.
+    # wv-6657dd added a freshness check so an exemption committed after the last
+    # load still counts -- but memoised it in a file BESIDE the database
+    # ($WV_HOT_ZONE/.quality_conf_sig). A sibling file outlives the database it
+    # describes, so a hot zone whose brain.db had been rebuilt kept a stamp
+    # asserting that an empty quality_exempt was current, and wv done blocked on
+    # a path quality.conf had explicitly exempted.
+    #
+    # The signature now lives in quality_config_sig inside brain.db, so losing
+    # the projection loses the claim about it. This test recreates the exact
+    # divergence: table cleared, and a sibling stamp planted with the CURRENT
+    # signature. Old code trusts the file and refuses; new code ignores it,
+    # finds no in-DB claim, and reloads.
+    setup_test_env
+    git init -q . >/dev/null 2>&1 || true
+    git config user.email "test@test.com" || true
+    git config user.name "Test" || true
+    git config commit.gpgsign false || true
+
+    mkdir -p src
+    {
+        echo "def gate(a, b, c, d, e, f):"
+        for i in $(seq 1 30); do
+            echo "    if a and b or c and d or e and f: return $i"
+        done
+        echo "    return 0"
+    } > src/gate.py
+    printf '[exempt]\nsrc/gate.py\n' > "$WEAVE_DIR/quality.conf"
+    git add -A >/dev/null 2>&1 || true
+    git commit -qm "exempt baseline" >/dev/null 2>&1 || true
+
+    "$WV" quality scan >/dev/null 2>&1 || true
+    "$WV" load >/dev/null 2>&1 || true
+
+    local node
+    node=$("$WV" add "exempt freshness" --standalone --criteria="c" --risks=low 2>/dev/null | tail -1)
+    sqlite3 "$WV_HOT_ZONE/brain.db" \
+        "INSERT OR REPLACE INTO node_files(node_id, path) VALUES('$node','src/gate.py');" \
+        >/dev/null 2>&1 || true
+    "$WV" work "$node" >/dev/null 2>&1 || true
+
+    # Capture the REAL signature the loader just recorded, so the sibling stamp
+    # planted below is one the old memo would accept. A stamp with any other
+    # content mismatches and provokes a reload, which would make this test pass
+    # against the very code it exists to fail.
+    local real_sig
+    real_sig=$(sqlite3 "$WV_HOT_ZONE/brain.db" \
+        "SELECT signature FROM quality_config_sig WHERE id = 1;" 2>/dev/null || printf '')
+    assert_equals "yes" "$([ -n "$real_sig" ] && echo yes || echo no)" \
+        "the loader recorded a config signature in the database"
+
+    # The projection and its in-DB claim go, as a rebuilt brain.db loses both.
+    sqlite3 "$WV_HOT_ZONE/brain.db" \
+        "DELETE FROM quality_exempt; DELETE FROM quality_config_sig;" >/dev/null 2>&1 || true
+    # The superseded sibling stamp, planted CURRENT: exactly what made the old
+    # memo claim an empty table was fresh.
+    printf '%s' "$real_sig" > "$WV_HOT_ZONE/.quality_conf_sig" 2>/dev/null || true
+
+    local outcome="blocked"
+    if "$WV" done "$node" --skip-verification >/dev/null 2>&1; then
+        outcome="closed"
+    fi
+    assert_equals "closed" "$outcome" \
+        "wv done honours quality.conf after the projection is lost"
+
+    local restored
+    restored=$(sqlite3 "$WV_HOT_ZONE/brain.db" \
+        "SELECT COUNT(*) FROM quality_exempt;" 2>/dev/null || echo "0")
+    assert_equals "1" "$restored" "the exemption was re-projected from the committed file"
+
+    cd "$PROJECT_ROOT" 2>/dev/null || true
+}
+
 main() {
     echo "Cache Invalidation Tests"
     echo "========================"
@@ -613,6 +820,9 @@ main() {
     test_needs_sync_sees_deletion
     test_impact_cache_not_published_when_walk_raced
     test_impact_race_hook_is_gated_and_validated
+    test_uncommitted_edit_invalidates_function_rows
+    test_done_gate_reads_post_edit_complexity
+    test_exempt_projection_survives_a_rebuilt_db
 
     # Summary
     echo ""

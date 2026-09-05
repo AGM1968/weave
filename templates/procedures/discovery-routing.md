@@ -13,14 +13,21 @@ claude_skill: wv-discovery-routing
 Start with the smallest question that can resolve the uncertainty. Do not turn routine work into a
 broad scan; branch into richer inspection only when scope, unfamiliarity, or risk warrants it.
 
-| Need | Route |
-| --- | --- |
-| Locate related work or prior decisions | `wv search "<topic>"` → `wv query <exact predicates>` |
+| Need                                    | Route                                                                   |
+| --------------------------------------- | ----------------------------------------------------------------------- |
+| Locate related work or prior decisions  | `wv search "<topic>"` → `wv query <exact predicates>`                   |
 | Understand uncertain or cross-node work | `wv context <id> --json` → `wv discover <id> --json` → `wv impact <id>` |
-| Locate unfamiliar implementation | `wv search --code "<concept>" --graph` |
-| Edit broad or cross-module targets | `wv impact --files=<targets>` |
-| Touch a hotspot or complex path | `wv quality functions <file>` then `wv quality patterns scan <scope>` |
+| Locate unfamiliar implementation        | `wv search --code "<concept>" --graph`                                  |
+| Edit broad or cross-module targets      | `wv impact --files=<targets>`                                           |
+| Touch a hotspot or complex path         | `wv quality functions <file>` then `wv quality patterns scan <scope>`   |
+| Know what a prose rule matches          | `wv quality patterns show <rule-id>` (or `--all --json`)                |
 
 `bootstrap` and `context` already include bounded discovery. Run direct `discover` when their result
 shows a material unknown, cross-node relationship, prior learning, or candidate blind spot that must
 be assessed before implementation.
+
+Do not read `.weave/patterns/*.yaml` to learn what a rule matches. The matcher is not the `terms:`
+list: `lexicon` and `motif` are case-insensitive, `density` is a lowercased substring with no word
+boundary, and `citation` carries check-mode selectors rather than searchable text. Two consumer
+repositories each derived a decoder from those files and each got a different one of those wrong.
+`show` reports what the engine builds.

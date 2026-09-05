@@ -1,6 +1,7 @@
 id: markdown-bare-url
 language: prose
 kind: regex
+violation_type: markdown:malformed-markup
 match_scope: paragraph
 severity: info
 policy: always-on-shared

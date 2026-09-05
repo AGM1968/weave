@@ -1,6 +1,7 @@
 id: prose-rhetorical-heading
 language: prose
 kind: regex
+violation_type: prose:register
 match_scope: heading
 severity: info
 policy: always-on-shared

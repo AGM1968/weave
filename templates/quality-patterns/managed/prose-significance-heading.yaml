@@ -1,6 +1,7 @@
 id: prose-significance-heading
 language: prose
 kind: regex
+violation_type: prose:unearned-significance
 match_scope: heading
 severity: info
 policy: always-on-shared

@@ -7,8 +7,15 @@
 .weave/edges.jsonl merge=ours -diff linguist-generated
 .weave/quality-adjudications.jsonl merge=union
 .weave/breadcrumbs.md merge=ours
+# Causal cutover marker (wv-2448dd): an operator declaration stamped once when
+# every agent has synced. merge=ours keeps the local stamp rather than halting a
+# merge; concurrent stamping is operator error the coordination gate guards.
+.weave/causal-cutover merge=ours -diff linguist-generated
 
 # Delta files: unique filenames mean no real conflicts; merge=theirs is a safety net.
 # Requires: git config merge.theirs.driver "cp %B %A" (done by wv-init-repo)
+# v1 SQL changesets and, post-cutover (wv-4448a2), the immutable Delta v2 op
+# sidecars under deltas/<date>/v2/.
 .weave/deltas/**/*.sql merge=theirs
+.weave/deltas/**/*.json merge=theirs
 # ── END WEAVE GITATTRIBUTES ──

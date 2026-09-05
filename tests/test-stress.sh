@@ -707,13 +707,17 @@ test_corrupt_edges_only() {
     grep -v "INSERT INTO.*edges" "$TEST_DIR/.weave/state.sql" > "$TEST_DIR/.weave/state.sql.tmp"
     mv "$TEST_DIR/.weave/state.sql.tmp" "$TEST_DIR/.weave/state.sql"
 
-    # Load — current code only checks nodes table
+    # Load — this used to document a real gap (wv load only checked the nodes
+    # table, so an edge stripped from state.sql was silently lost, edge_count
+    # 0). Delta v2 CAS sidecars are dispatched on every load independently of
+    # state.sql (default on since the delta-causality epic), so the edge's
+    # own durable v2 operation file recovers it regardless of what state.sql
+    # says — the gap this test used to document no longer reproduces.
     "$WV" load >/dev/null 2>&1
     local edge_count
     edge_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM edges;" 2>/dev/null)
 
-    # This SHOULD be 0 (edges were stripped) — documents the known gap
-    assert_equals "0" "$edge_count" "Edges lost from corrupt file (documents known validation gap)" || true
+    assert_equals "1" "$edge_count" "Edge recovered via Delta v2 replay despite corrupt state.sql"
 
     teardown_test_env
 }

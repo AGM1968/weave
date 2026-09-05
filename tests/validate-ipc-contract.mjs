@@ -89,9 +89,28 @@ const nodeFieldRegistry = read(path.join(contracts, "node-field-registry-v1.json
 assert(nodeFieldRegistry.format === "weave.node-fields.v1", "node field registry format mismatch");
 const registryFields = Object.keys(nodeFieldRegistry.fields).sort();
 const deltaPatchFields = Object.keys(
-  deltaOperationV2Schema.properties.payload.properties.mutation.properties.fields.properties
+  deltaOperationV2Schema.$defs.node_patch_fields.properties
 ).sort();
-assert(isDeepStrictEqual(registryFields, deltaPatchFields), "Delta v2 patch fields must match node field registry");
+assert(isDeepStrictEqual(registryFields, deltaPatchFields), "Delta v2 node_patch fields must match node field registry");
+const deltaEdgePatchFields = Object.keys(deltaOperationV2Schema.$defs.edge_patch_fields.properties).sort();
+assert(
+  isDeepStrictEqual(deltaEdgePatchFields, ["context", "weight"]),
+  "Delta v2 edge_patch fields must be weight and context"
+);
+const deltaMutationKinds = deltaOperationV2Schema.properties.payload.oneOf
+  .map((ref) => deltaOperationV2Schema.$defs[ref.$ref.split("/").pop()].properties.mutation.properties.kind.const)
+  .sort();
+assert(
+  isDeepStrictEqual(deltaMutationKinds, [
+    "edge_create",
+    "edge_delete",
+    "edge_patch",
+    "node_create",
+    "node_delete",
+    "node_patch",
+  ]),
+  "Delta v2 must define all six create/patch/delete mutation kinds"
+);
 assert(
   isDeepStrictEqual(nodeFieldRegistry.fields.status.value.enum, deltaOperationV2Schema.$defs.status_value.enum),
   "status registry/schema enum mismatch"

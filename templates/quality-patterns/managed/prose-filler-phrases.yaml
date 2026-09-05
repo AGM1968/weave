@@ -1,30 +1,35 @@
 id: prose-filler-phrases
 language: prose
 kind: regex
+violation_type: prose:filler
 severity: info
 policy: always-on-shared
 maturity: promotable
 provenance: >-
-  wv-cc46cc @nowcast, ported and retained by earth-engine-analysis. Each
-  phrase has a shorter exact equivalent and does not encode a project-specific
-  register stance.
+  wv-cc46cc @nowcast, ported and retained by earth-engine-analysis. Each phrase has a shorter exact equivalent and does
+  not encode a project-specific register stance. Calibrated 2026-09-02 (wv-961a15) against 84 peer-reviewed papers,
+  986,291 words. The five retained phrases occur 17 times there, 0.172 per 10,000, so writing that cleared external
+  editorial review effectively does not use them. "in order to" was REMOVED by that measurement: 118 of the rule's 135
+  corpus hits, 1.196 per 10,000, so published technical writing does spend it, and a rule forbidding it is stricter than
+  the standard it appeals to. It states purpose where a bare "to" states sequence. The rate in this repository was NOT
+  used to reach that verdict -- docs/ has already been swept by this rule, so its own rate measures the rule's effect.
+  Three never-swept corpora totalling 167,220 words use the construction zero times, which is what rules out enforcement
+  as the explanation. All corpora share one author, so this establishes generality across domain and register only.
 message: >-
-  Filler phrase with a shorter exact equivalent. Replace it with the direct
-  form: "in order to" with "to", "due to the fact that" with "because",
-  and equivalent reductions.
+  Filler phrase with a shorter exact equivalent. Replace it with the direct form: "due to the fact that" with "because",
+  "at this point in time" with "now", and equivalent reductions.
 paths:
   - "docs/*.md"
   - "docs/**/*.md"
   - "*.md"
 patterns:
-  - '\bin order to\b'
   - '\bdue to the fact that\b'
   - '\bat this point in time\b'
   - '\bit is important to note\b'
   - '\bhas the ability to\b'
   - '\bin the event that\b'
 positive_controls:
-  - "In order to proceed, measure the input."
+  - "Due to the fact that the sensor drifted, the run was discarded."
 negative_controls:
-  - "The order to proceed was issued after the measurement."
+  - "The drift was due to temperature, and the fact that it recurred is separate."
   - "The event that triggered the alert occurred at 05:00."

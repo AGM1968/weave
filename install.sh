@@ -520,6 +520,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-gh.sh "$LIB_DIR/lib/wv-gh.sh"
     install_file ./scripts/lib/wv-delta.sh "$LIB_DIR/lib/wv-delta.sh"
     install_file ./scripts/lib/wv-delta-catalog.sh "$LIB_DIR/lib/wv-delta-catalog.sh"
+    install_file ./scripts/lib/wv-delta-v2-replay.py "$LIB_DIR/lib/wv-delta-v2-replay.py"
     install_file ./scripts/lib/wv-checkpoint-generation.sh "$LIB_DIR/lib/wv-checkpoint-generation.sh"
     install_file ./scripts/lib/wv-checkpoint-ci.sh "$LIB_DIR/lib/wv-checkpoint-ci.sh"
     install_file ./scripts/lib/wv-repository-class.sh "$LIB_DIR/lib/wv-repository-class.sh"
@@ -707,6 +708,14 @@ if [ -f "./scripts/wv" ]; then
     cp ./templates/test-impacted.sh.template "$CONFIG_DIR/test-impacted.sh.template" 2>/dev/null || true
     cp ./templates/ci-weave-paths-ignore.snippet.yml "$CONFIG_DIR/ci-weave-paths-ignore.snippet.yml" 2>/dev/null || true
     cp ./templates/copilot-instructions.stub.md "$CONFIG_DIR/copilot-instructions.stub.md" 2>/dev/null || true
+    # Authoring templates: what a consumer needs to WRITE a guide (and, as the
+    # manifest grows, the other classes it may author) rather than only receive
+    # one. Copied whole; wv-init-repo reads manifest.conf to place them.
+    if [ -d ./templates/authoring ]; then
+        rm -rf "$CONFIG_DIR/authoring"
+        mkdir -p "$CONFIG_DIR/authoring"
+        cp -a ./templates/authoring/. "$CONFIG_DIR/authoring/" 2>/dev/null || true
+    fi
     # AGENTS.md template (generic, not project-specific)
     cp ./templates/AGENTS.md.template "$CONFIG_DIR/AGENTS.md.template" 2>/dev/null || true
 else
@@ -786,7 +795,7 @@ else
         # a module missing here installs a package that imports and then fails at
         # runtime, and this list had already drifted twice before that check
         # existed.
-        quality_modules="__init__.py __main__.py ast_cache.py bash_ast_grep.py bash_heuristic.py classification.py coaching_apply.py coaching_evidence.py db.py external_tools.py findings.py git_metrics.py guides.py hotspots.py models.py pattern_loader.py prose_rules.py python_parser.py typescript_parser.py"
+        quality_modules="__init__.py __main__.py ast_cache.py bash_ast_grep.py bash_heuristic.py classification.py coaching_apply.py coaching_evidence.py db.py external_tools.py findings.py git_metrics.py guides.py hotspots.py models.py pattern_loader.py prose_rules.py prose_shape.py python_parser.py typescript_parser.py"
     fi
     for pyfile in $quality_modules; do
         download_file "$REPO/scripts/weave_quality/${pyfile}" "$LIB_DIR/weave_quality/${pyfile}"
@@ -913,6 +922,21 @@ else
     curl -sSL "$REPO/templates/test-impacted.sh.template" -o "$CONFIG_DIR/test-impacted.sh.template" 2>/dev/null || true
     curl -sSL "$REPO/templates/ci-weave-paths-ignore.snippet.yml" -o "$CONFIG_DIR/ci-weave-paths-ignore.snippet.yml" 2>/dev/null || true
     curl -sSL "$REPO/templates/copilot-instructions.stub.md" -o "$CONFIG_DIR/copilot-instructions.stub.md" 2>/dev/null || true
+    # Authoring templates. The manifest is fetched first and then enumerates the
+    # rest: a hardcoded fallback list here is the drift install-asset-parity.py
+    # exists to catch, and a manifest that lists a file it did not fetch would
+    # seed a consumer with a dangling row.
+    mkdir -p "$CONFIG_DIR/authoring"
+    if curl -fsSL "$REPO/templates/authoring/manifest.conf" \
+        -o "$CONFIG_DIR/authoring/manifest.conf" 2>/dev/null; then
+        while IFS='|' read -r _authoring_src _authoring_rest; do
+            case "$_authoring_src" in ""|\#*) continue ;; esac
+            [ -n "$_authoring_rest" ] || continue
+            mkdir -p "$CONFIG_DIR/authoring/$(dirname "$_authoring_src")"
+            curl -sSL "$REPO/templates/authoring/$_authoring_src" \
+                -o "$CONFIG_DIR/authoring/$_authoring_src" 2>/dev/null || true
+        done < "$CONFIG_DIR/authoring/manifest.conf"
+    fi
     # AGENTS.md template (generic, not project-specific)
     curl -sSL "$REPO/templates/AGENTS.md.template" -o "$CONFIG_DIR/AGENTS.md.template" 2>/dev/null || true
 fi
@@ -1577,10 +1601,17 @@ ATTR_BLOCK="${ATTR_MARKER_BEGIN}
 .weave/edges.jsonl merge=ours -diff linguist-generated
 .weave/quality-adjudications.jsonl merge=union
 .weave/breadcrumbs.md merge=ours
+# Causal cutover marker (wv-2448dd): an operator declaration stamped once when
+# every agent has synced. merge=ours keeps the local stamp rather than halting a
+# merge; concurrent stamping is operator error the coordination gate guards.
+.weave/causal-cutover merge=ours -diff linguist-generated
 
 # Delta files: unique filenames mean no real conflicts; merge=theirs is a safety net.
 # Requires: git config merge.theirs.driver \"cp %B %A\" (done by wv-init-repo)
+# v1 SQL changesets and, post-cutover (wv-4448a2), the immutable Delta v2 op
+# sidecars under deltas/<date>/v2/.
 .weave/deltas/**/*.sql merge=theirs
+.weave/deltas/**/*.json merge=theirs
 ${ATTR_MARKER_END}"
 
 if [ -f "$GITATTR" ]; then
@@ -1642,6 +1673,53 @@ if wv init 2>/dev/null; then
     echo -e "  ${GREEN}✓${NC} Weave database initialized"
 else
     echo -e "  ${YELLOW}⊘${NC} Weave database (already initialized)"
+fi
+
+# ── authoring templates (.weave/guides/, and whatever the manifest grows) ──
+# Weave delivers guides, procedures and rules into a consumer but templated
+# nothing a consumer could author against, so two unrelated consumer repos
+# each built the same guide tooling alone. This seeds the contract instead.
+#
+# Deliberately manifest-driven rather than a block per class: a consumer may
+# author a procedure on the same footing as a guide, so the next class is a
+# template file and a manifest row, not another branch here.
+_AUTHORING_SRC="$CONFIG_DIR/authoring"
+if [ -f "$_AUTHORING_SRC/manifest.conf" ]; then
+    while IFS='|' read -r _auth_src _auth_dst _auth_mode _auth_note; do
+        case "$_auth_src" in ""|\#*) continue ;; esac
+        case "$_auth_dst" in
+            ""|/*|*..*)
+                echo "wv-init-repo: invalid authoring destination: $_auth_dst" >&2
+                exit 1
+                ;;
+        esac
+        case "$_auth_mode" in
+            seed|refresh) ;;
+            *)
+                echo "wv-init-repo: invalid authoring mode for $_auth_dst: $_auth_mode" >&2
+                exit 1
+                ;;
+        esac
+        [ -f "$_AUTHORING_SRC/$_auth_src" ] || {
+            echo "wv-init-repo: authoring template missing from installed assets: $_auth_src" >&2
+            exit 1
+        }
+        _auth_full="$REPO_ROOT/$_auth_dst"
+        _auth_dir=$(dirname "$_auth_full")
+        if [ -L "$_auth_dir" ] || [ -L "$_auth_full" ]; then
+            echo "wv-init-repo: refusing symlinked authoring destination: $_auth_dst" >&2
+            exit 1
+        fi
+        if [ -f "$_auth_full" ] \
+            && { [ "$_auth_mode" = "seed" ] \
+                 || { [ "$UPDATE_MODE" != "1" ] && [ "$FORCE_MODE" != "1" ]; }; }; then
+            echo -e "  ${YELLOW}⊘${NC} $_auth_dst (exists — authored here, not overwritten)"
+            continue
+        fi
+        mkdir -p "$_auth_dir"
+        cp "$_AUTHORING_SRC/$_auth_src" "$_auth_full"
+        echo -e "  ${GREEN}✓${NC} $_auth_dst ($_auth_note)"
+    done < "$_AUTHORING_SRC/manifest.conf"
 fi
 
 # ── Agent-specific setup ─────────────────────────────────────────────────
@@ -2490,7 +2568,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
     # Warn about unstaged changes from update. Include scripts/hooks/ — the
     # vendor refresh now seeds/refreshes hook SOURCES there (e.g. a newly added
     # post-commit-weave.sh), which the old .claude/.github/.vscode glob missed.
-    local_changes=$(cd "$REPO_ROOT" && git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard .claude/ .github/ .vscode/ .weave/patterns/ scripts/hooks/ 2>/dev/null || true)
+    local_changes=$(cd "$REPO_ROOT" && git diff --name-only 2>/dev/null; git ls-files --others --exclude-standard .claude/ .github/ .vscode/ .weave/patterns/ .weave/guides/ .weave/guides.README.md scripts/hooks/ 2>/dev/null || true)
     if [ -n "$local_changes" ]; then
         echo ""
         echo -e "${YELLOW}⚠ Unstaged scaffolding changes from update:${NC}"
@@ -2502,7 +2580,7 @@ if [ "$UPDATE_MODE" = "1" ]; then
         echo -e "${YELLOW}  To commit (the Weave pre-commit hook needs an active node):${NC}"
         echo "    wv add \"chore: sync Weave scaffolding\" --standalone --alias=weave-scaffold \\"
         echo "      --status=active --criteria=\"scaffolding synced\" --risks=low"
-        echo "    git add -A .claude/ .github/ .vscode/ .weave/patterns/ scripts/hooks/ .gitignore && git commit -m \"chore(weave): sync scaffolding\""
+        echo "    git add -A .claude/ .github/ .vscode/ .weave/patterns/ .weave/guides/ .weave/guides.README.md scripts/hooks/ .gitignore && git commit -m \"chore(weave): sync scaffolding\""
         echo "    wv done <node-id> --skip-verification        # <node-id> from the wv add line above"
         echo -e "${YELLOW}  Quick path (no node): WV_SKIP_PRECOMMIT=1 git add -A … && git commit -m '…'${NC}"
     fi
@@ -2511,6 +2589,7 @@ else
 fi
 echo "  .weave/         — graph storage"
 echo "  .weave/patterns/managed/ — curated shared quality rules"
+echo "  .weave/guides/ — write coaching prose this repo needs; see .weave/guides.README.md"
 echo "  .gitignore      — Weave entries added"
 for _a in "${AGENTS[@]}"; do
     if [ "$_a" = "claude" ]; then

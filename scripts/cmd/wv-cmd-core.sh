@@ -4993,6 +4993,17 @@ cmd_delete() {
     connected=$(db_query "SELECT DISTINCT source FROM edges WHERE target='$id' UNION SELECT DISTINCT target FROM edges WHERE source='$id';" | tr '\n' ' ')
     affected_nodes="$affected_nodes $connected"
 
+    # Capture lineage BEFORE the DELETEs so the deletion tombstones carry the
+    # highest lineage each row held (wv-0d5e07).
+    local _del_agent _del_node_seq
+    _del_agent="$(resolve_agent_id 2>/dev/null || echo unknown)"
+    _del_node_seq=$(db_query "SELECT COALESCE(lineage_seq,0) FROM nodes WHERE id='$id';" 2>/dev/null || echo 0)
+    local _del_edge_tombs=""   # newline list of "source:target:type\tlineage_seq"
+    while IFS='|' read -r _es _et _ety _eseq; do
+        [ -n "$_es" ] || continue
+        _del_edge_tombs+="${_es}:${_et}:${_ety}	${_eseq:-0}"$'\n'
+    done < <(db_query "SELECT source, target, type, COALESCE(lineage_seq,0) FROM edges WHERE source='$id' OR target='$id';" 2>/dev/null)
+
     # Delete edges first (no ON DELETE CASCADE)
     db_query "DELETE FROM edges WHERE source='$id' OR target='$id';"
     db_query "DELETE FROM node_files WHERE node_id='$id';"
@@ -5004,12 +5015,18 @@ cmd_delete() {
 
     journal_complete 1
 
-    # Advance prune_epoch + re-dump state.sql immediately (D-3/D-4 fix).
-    # auto_sync is throttled and may not fire, leaving state.sql stale with the
-    # deleted node; wv load would then resurrect it from state.sql. cmd_prune uses
-    # the same pattern: write epoch first (blocks old INSERT deltas from replaying),
-    # then dump state.sql directly (captures the post-delete DB state).
-    date +%s > "$WEAVE_DIR/.prune_epoch"
+    # Record cross-machine deletion tombstones + re-dump state.sql immediately
+    # (D-3/D-4 fix, wv-0d5e07). auto_sync is throttled and may not fire, leaving
+    # state.sql stale with the deleted node; wv load would then resurrect it. The
+    # tombstone rows (node + every incident edge) travel in state.sql and let each
+    # clone's _reconcile_tombstones drop the row again if the delta back-catalog
+    # replays its creation. tombstones has no _warp trigger so this stays local
+    # (delete is non-propagating), like the .prune_epoch it replaces.
+    db_write_tombstone node "$id" "${_del_node_seq:-0}" "$_del_agent"
+    while IFS=$'\t' read -r _etomb_id _etomb_seq; do
+        [ -n "$_etomb_id" ] || continue
+        db_write_tombstone edge "$_etomb_id" "${_etomb_seq:-0}" "$_del_agent"
+    done <<< "$_del_edge_tombs"
     local _del_state_tmp
     _del_state_tmp=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
     if dump_state_sql "$WV_DB" "$_del_state_tmp" && [ -s "$_del_state_tmp" ]; then

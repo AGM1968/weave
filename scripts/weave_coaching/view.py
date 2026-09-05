@@ -75,7 +75,12 @@ def _occurrence_line(occurrence: dict[str, Any]) -> dict[str, Any]:
 
 
 def _guide_block(guide: dict[str, Any]) -> dict[str, Any]:
-    """The guide block, carrying only the sections the contract defines."""
+    """The guide block: the fixed sections, plus whatever the guide declared.
+
+    `extended_sections` stays a nested list rather than being merged into this
+    block. Its labels are authored downstream, so flattening them here would let
+    a consumer guide name a key this block already owns.
+    """
     block = {
         "id": guide["id"],
         "source": guide.get("source", "package"),
@@ -87,6 +92,7 @@ def _guide_block(guide: dict[str, Any]) -> dict[str, Any]:
         "expected_outcome",
         "avoid",
         "names_missing_guide",
+        "extended_sections",
         # Carried, not dropped: these are what make the fallback honest. A
         # block that says a guide is missing without naming which one leaves
         # the reader unable to act on the gap, and the schema requires both
@@ -237,6 +243,11 @@ def render_text(response: dict[str, Any]) -> str:
         if guide.get("avoid"):
             lines.append("")
             lines.append(f"Avoid: {guide['avoid']}")
+        # After the fixed four, in the order the guide's own body puts them.
+        for extra in guide.get("extended_sections") or ():
+            lines.append("")
+            lines.append(f"{extra['label']}:")
+            lines.append(extra["body"])
         if guide.get("names_missing_guide"):
             lines.append("")
             lines.append(

@@ -1,6 +1,7 @@
 id: prose-em-dash-density
 language: prose
 kind: density
+violation_type: prose:punctuation-density
 match_scope: paragraph
 min_count: 3
 severity: info

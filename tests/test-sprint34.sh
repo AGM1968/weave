@@ -42,16 +42,34 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# tests/run-all.sh runs up to 4 suites concurrently (documented there:
+# "Launching every suite at once exhausts sandbox resources and causes
+# mid-suite exits") -- under real contention a `git` subprocess can
+# transiently fail to even fork, and under `set -e` that silently kills this
+# whole suite with no error text (reproduced: dies right after echoing a
+# section header, before any assertion runs). Every call here is idempotent
+# (init/config/an --allow-empty commit), so retrying past a transient
+# failure is safe; a real, persistent failure still surfaces after 3 tries.
+_retry_or_die() {
+    local attempt
+    for attempt in 1 2 3; do
+        "$@" && return 0
+        sleep 0.3
+    done
+    echo "FATAL: '$*' failed 3 times (transient resource exhaustion?)" >&2
+    return 1
+}
+
 setup_test_env() {
     rm -rf "$TEST_DIR"
     mkdir -p "$TEST_DIR/.weave"
     cd "$TEST_DIR"
     # Need git repo for WEAVE_DIR resolution
-    git init -q
+    _retry_or_die git init -q
     # Disable GPG signing and set identity (global config may lack user.email in CI/SSH)
-    git config commit.gpgsign false
-    git config user.email "test@weave.local"
-    git config user.name "Weave Test"
+    _retry_or_die git config commit.gpgsign false
+    _retry_or_die git config user.email "test@weave.local"
+    _retry_or_die git config user.name "Weave Test"
 }
 
 # ---------------------------------------------------------------------------
@@ -1050,12 +1068,26 @@ test_resolve_first_id() {
 test_checkpoint_trailers() {
     echo ""
     echo "--- Checkpoint Trailers ---"
+    # wv-config.sh derives WV_DB_CUSTOM="${WV_DB:+1}", and auto_sync skips the
+    # git auto-checkpoint entirely whenever WV_DB_CUSTOM is set -- exactly
+    # what this file's top-scope `export WV_DB="$TEST_DIR/brain.db"` does, for
+    # every OTHER test's direct sqlite3 verification. This test never queries
+    # $WV_DB itself (only $WV commands and git log), so unset it just here:
+    # wv's own default DB resolution inside WV_HOT_ZONE is all it needs, and
+    # this lets auto_sync's checkpoint actually run instead of being silently
+    # skipped (found while diagnosing the round-5 resource-contention flake:
+    # a retry fix for a real transient-fork issue in setup_test_env exposed
+    # that this test could never have passed, contention or not, because of
+    # this WV_DB_CUSTOM interaction -- the original "0/0" failure mode always
+    # masked it before any assertion here ran).
+    local _saved_wv_db="${WV_DB:-}"
+    unset WV_DB
     setup_test_env
 
     # Need an initial commit so git log works
     # Disable GPG signing (global gpgsign=true fails in CI/SSH)
-    git config commit.gpgsign false
-    git commit --allow-empty -m "init" --no-verify -q
+    _retry_or_die git config commit.gpgsign false
+    _retry_or_die git commit --allow-empty -m "init" --no-verify -q
 
     # Disable throttle for all checkpoint tests
     export WV_CHECKPOINT_INTERVAL=0
@@ -1117,6 +1149,7 @@ test_checkpoint_trailers() {
     assert_equals "2" "$commit_count" "checkpoint: consecutive checkpoints collapse to single commit"
 
     unset WV_CHECKPOINT_INTERVAL
+    [ -n "$_saved_wv_db" ] && export WV_DB="$_saved_wv_db"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

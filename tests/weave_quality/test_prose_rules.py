@@ -327,7 +327,7 @@ def test_managed_pattern_manifest_is_complete_and_rules_are_executable(
         "markdown-split-code-span": "The `scripts/\n",
         "prose-ai-vocabulary": "This pivotal result decorates the claim.\n",
         "prose-em-dash-density": "One—two—three—four linked asides.\n",
-        "prose-filler-phrases": "In order to proceed, measure the input.\n",
+        "prose-filler-phrases": "Due to the fact that it drifted, we stopped.\n",
         "prose-rhetorical-heading": "## What each sensor senses\n",
         "prose-retrospective-announcement": "The endpoint now exists.\n",
         "prose-self-attested-virtue": "This gives an honest interval.\n",
@@ -604,9 +604,9 @@ def test_regex_rule_exempts_legitimate_compound_terms(tmp_path: Path) -> None:
 
 def test_prose_regex_matches_across_soft_wrap_and_maps_source_line(tmp_path: Path) -> None:
     rule_path = MANAGED_PATTERNS / "prose-filler-phrases.yaml"
-    doc = _write(tmp_path / "wrapped.md", "The method runs in\norder to preserve evidence.\n")
+    doc = _write(tmp_path / "wrapped.md", "The work stopped due to\nthe fact that evidence vanished.\n")
     found = run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
-    assert [(finding.line, finding.col) for finding in found] == [(1, 16)]
+    assert [(finding.line, finding.col) for finding in found] == [(1, 17)]
 
 
 def test_line_scoped_structural_rule_does_not_reflow(tmp_path: Path) -> None:
@@ -2836,8 +2836,8 @@ def test_overlap_collapse_is_transitive_across_a_chain(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("- The method runs in\n  order to preserve evidence.\n", (1, 18)),
-        ("> The method runs in\n> order to preserve evidence.\n", (1, 18)),
+        ("- The work stopped due to\n  the fact that evidence vanished.\n", (1, 19)),
+        ("> The work stopped due to\n> the fact that evidence vanished.\n", (1, 19)),
     ],
 )
 def test_soft_wrap_matching_inside_markdown_containers(

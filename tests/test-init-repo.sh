@@ -511,6 +511,59 @@ PATTERN_HASH_AFTER=$(find "$REPO5/.weave/patterns" -type f -print0 | sort -z | x
 assert_equals "$PATTERN_HASH_BEFORE" "$PATTERN_HASH_AFTER" \
     "--update: managed pattern projection is idempotent"
 
+# --- authoring templates: the consumer's side of the guide contract ---
+# Weave templated nothing a consumer could author a guide against, so two
+# unrelated consumer repos each built the same tooling alone. These cover the
+# seeding contract: agent-neutral, seed never clobbers, refresh keeps current.
+echo ""
+echo "--- authoring templates ---"
+REPO_AUTHOR=$(make_test_repo "authoring")
+cd "$REPO_AUTHOR"
+
+# --agent=codex, not claude: guides are agent-neutral and must not be scaffolded
+# out of the Claude branch, which is where the sibling seeded templates live.
+"$WV" init-repo --agent=codex >/dev/null 2>&1
+assert_file_exists "$REPO_AUTHOR/.weave/guides.README.md" \
+    "authoring: seeds the guide contract regardless of agent"
+assert_file_exists "$REPO_AUTHOR/.weave/guides/example-violation.md" \
+    "authoring: seeds a guide to copy"
+assert_contains "$(cat "$REPO_AUTHOR/.weave/guides.README.md")" "sections:" \
+    "authoring: the contract documents the declared-section extension"
+assert_contains "$(cat "$REPO_AUTHOR/.weave/guides.README.md")" "upstream" \
+    "authoring: the contract documents the promotion path"
+
+# The resolution directory holds guides and nothing else, so anything that globs
+# it -- doctor's guide-shadow advisory, a consumer's own validator -- never has
+# to special-case a file that is not a guide.
+GUIDE_DIR_ENTRIES=$(ls "$REPO_AUTHOR/.weave/guides")
+assert_equals "example-violation.md" "$GUIDE_DIR_ENTRIES" \
+    "authoring: nothing but guides is seeded into .weave/guides/"
+
+# The seeded guide must satisfy the shipped parser, not merely look like a guide.
+if PYTHONPATH="$WV_LIB_DIR" python3 -c "
+import sys
+from pathlib import Path
+from weave_quality.guides import parse_guide
+parse_guide(Path(sys.argv[1]), 'project')
+" "$REPO_AUTHOR/.weave/guides/example-violation.md" 2>"$TEST_DIR/authoring-parse.err"; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} authoring: the seeded guide parses with the shipped parser"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} authoring: the seeded guide parses with the shipped parser"
+    sed 's/^/    /' "$TEST_DIR/authoring-parse.err"
+fi
+
+# seed mode: an authored file is never overwritten, which is the whole point of
+# handing a consumer a starting point rather than a managed asset.
+echo "AUTHORED HERE" >> "$REPO_AUTHOR/.weave/guides/example-violation.md"
+echo "stale" > "$REPO_AUTHOR/.weave/guides.README.md"
+"$WV" init-repo --agent=codex --update >/dev/null 2>&1
+assert_contains "$(cat "$REPO_AUTHOR/.weave/guides/example-violation.md")" "AUTHORED HERE" \
+    "authoring: --update preserves an authored guide"
+assert_not_contains "$(cat "$REPO_AUTHOR/.weave/guides.README.md")" "stale" \
+    "authoring: --update refreshes the contract reference"
+
 # Invalid prior manifests and symlinked destinations fail before mutation.
 REPO_PATTERN_BAD=$(make_test_repo "pattern-invalid-manifest")
 cd "$REPO_PATTERN_BAD"

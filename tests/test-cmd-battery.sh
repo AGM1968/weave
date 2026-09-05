@@ -244,6 +244,7 @@ skip self-update "mutates the user-level install from a source clone"
 skip uninstall   "destructive to the user-level install"
 skip init-repo   "installer-class; covered by install/deploy pipeline + doctor"
 skip pattern-audit "audits the source repo registry; meaningless from a scratch repo"
+skip cutover      "exercised with full assertions in test-cutover.sh (irreversible marker; needs a controlled lineage/claim setup this scratch battery doesn't construct)"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Coverage guard: every dispatch-table command is exercised or skipped

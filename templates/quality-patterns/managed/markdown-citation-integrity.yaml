@@ -1,6 +1,7 @@
 id: markdown-citation-integrity
 language: prose
 kind: citation
+violation_type: markdown:citation-integrity
 severity: warning
 policy: always-on-shared
 maturity: promotable

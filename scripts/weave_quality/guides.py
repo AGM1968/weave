@@ -28,7 +28,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -46,9 +46,17 @@ SECTION_KEYS = {
 }
 REQUIRED_SECTIONS = ("why", "corrective_move")
 REQUIRED_FRONTMATTER = ("id", "violation_type", "summary")
-ALLOWED_FRONTMATTER = ("id", "violation_type", "language", "summary")
+ALLOWED_FRONTMATTER = ("id", "violation_type", "language", "summary", "sections")
 ID_PATTERN = re.compile(r"^_?[a-z0-9]+(-[a-z0-9]+)*$")
 _HEADING = re.compile(r"##\s+(.+?)\s*$")
+
+# The declared-extension separator. Pipe rather than comma because the section
+# names this exists to carry are prose -- nowcast's read "The appended negation,
+# a second form under this type" -- and a comma would split them mid-name.
+SECTION_DECLARATION_SEPARATOR = "|"
+# A declared name is prose, not an identifier, but it still has to be a name: no
+# markup, no newline, and short enough to render as a heading on any surface.
+SECTION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ,.'()/-]{0,79}$")
 
 # Ranges that cover the pictographs and dingbats house style keeps out of docs.
 _EMOJI = re.compile("[←-⯿☀-➿\U0001f000-\U0001faff]")
@@ -80,10 +88,15 @@ class Guide:
     definition_hash: str
     missing_guide_id: str | None = None
     missing_violation_type: str | None = None
+    # Declared extensions, in body order, as (label, body) pairs. A tuple
+    # because the dataclass is frozen and this crosses the purity boundary with
+    # the rest of the value. Empty on every guide that does not declare any,
+    # which is every package guide shipped today.
+    extended: tuple[tuple[str, str], ...] = ()
 
     def content(self) -> dict[str, Any]:
         """The guide block a coaching response renders."""
-        block = {
+        block: dict[str, Any] = {
             "id": self.id,
             "language": self.language,
             "source": self.source,
@@ -94,6 +107,13 @@ class Guide:
         if self.missing_violation_type is not None:
             block["missing_violation_type"] = self.missing_violation_type
         block.update(self.sections)
+        # Nested, never flattened alongside the fixed sections: a declared name
+        # is authored downstream and would otherwise be free to collide with
+        # `id`, `source`, or a section key and silently overwrite it.
+        if self.extended:
+            block["extended_sections"] = [
+                {"label": label, "body": body} for label, body in self.extended
+            ]
         return block
 
     def identity(self) -> dict[str, Any]:
@@ -137,6 +157,53 @@ class Guide:
 
 def _normalize(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split())
+
+
+def _declared_sections(path: Path, raw: str | None, code: str) -> dict[str, str]:
+    """The extra section names this one guide may carry, keyed by match name.
+
+    The fixed vocabulary stays closed: a heading outside `SECTION_KEYS` is still
+    an error unless the file itself declared it here. What this adds is a local
+    tier, exactly as managed and local quality rules are tiered -- a name that
+    fires in one repository is that repository's business, and a name that turns
+    up across unrelated repositories is a construction that has earned a place
+    in the fixed set. Promotion moves a name from here to `SECTION_KEYS`; it is
+    not something a consumer can do to itself by writing a guide.
+    """
+    if raw is None:
+        return {}
+    if not raw.strip():
+        raise GuideError(
+            f"{path.name}: frontmatter 'sections' is present but declares nothing; omit it",
+            code,
+            path,
+        )
+
+    declared: dict[str, str] = {}
+    for item in raw.split(SECTION_DECLARATION_SEPARATOR):
+        label = _normalize(item)
+        if not label:
+            raise GuideError(
+                f"{path.name}: frontmatter 'sections' has an empty entry", code, path
+            )
+        if not SECTION_NAME_PATTERN.fullmatch(label):
+            raise GuideError(
+                f"{path.name}: declared section {label!r} is not a section name", code, path
+            )
+        name = label.lower()
+        if name in SECTION_KEYS:
+            raise GuideError(
+                f"{path.name}: declared section {label!r} is already a fixed section; a "
+                f"declaration may extend the vocabulary, never redefine it",
+                code,
+                path,
+            )
+        if name in declared:
+            raise GuideError(
+                f"{path.name}: declared section {label!r} appears twice", code, path
+            )
+        declared[name] = label
+    return declared
 
 
 def parse_guide(path: Path, source: str) -> Guide:
@@ -198,23 +265,58 @@ def parse_guide(path: Path, source: str) -> Guide:
             path,
         )
 
+    declared = _declared_sections(path, frontmatter.get("sections"), code)
+
     sections: dict[str, str] = {}
-    current: str | None = None
+    extended: dict[str, str] = {}
+    labels: dict[str, str] = {}
+    current: tuple[str, str] | None = None
     for line in body.splitlines():
         heading = _HEADING.fullmatch(line)
         if heading:
-            name = heading.group(1).strip().lower()
-            if name not in SECTION_KEYS:
-                raise GuideError(f"{path.name}: unknown section {heading.group(1)!r}", code, path)
-            current = SECTION_KEYS[name]
-            sections[current] = ""
+            raw = heading.group(1).strip()
+            name = _normalize(raw).lower()
+            if name in SECTION_KEYS:
+                current = ("fixed", SECTION_KEYS[name])
+                sections[current[1]] = ""
+            elif name in declared:
+                # Declared. The label the reader sees is the author's own
+                # spelling in the body, not the frontmatter's; the frontmatter
+                # only decides which names are admissible.
+                current = ("extended", name)
+                extended[name] = ""
+                labels[name] = _normalize(raw)
+            else:
+                raise GuideError(
+                    f"{path.name}: unknown section {raw!r} — a section outside the fixed set must "
+                    f"be declared in frontmatter 'sections'",
+                    code,
+                    path,
+                )
             continue
-        if current is not None:
-            sections[current] = (sections[current] + "\n" + line).strip()
+        if current is None:
+            continue
+        kind, key = current
+        target = sections if kind == "fixed" else extended
+        target[key] = (target[key] + "\n" + line).strip()
 
     for required in REQUIRED_SECTIONS:
         if not sections.get(required):
             raise GuideError(f"{path.name}: section {required} is required", code, path)
+
+    # A declaration the body never uses is drift in the direction the loud
+    # failure above cannot see: the frontmatter widens what the file may contain
+    # and nothing narrows it back when the content goes away.
+    for name, label in declared.items():
+        if name not in extended:
+            raise GuideError(
+                f"{path.name}: frontmatter declares section {label!r} but the body has "
+                f"no such heading",
+                code,
+                path,
+            )
+        if not extended[name]:
+            raise GuideError(f"{path.name}: declared section {label!r} is empty", code, path)
 
     if _EMOJI.search(text):
         raise GuideError(f"{path.name}: guides use text markers, not emoji", code, path)
@@ -227,6 +329,7 @@ def parse_guide(path: Path, source: str) -> Guide:
         sections={key: _normalize(value) for key, value in sections.items()},
         source=source,
         definition_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
+        extended=tuple((labels[name], _normalize(text)) for name, text in extended.items()),
     )
 
 
@@ -286,14 +389,11 @@ def resolve(
             continue
         guide = parse_guide(path, source)
         if source == "fallback":
-            return Guide(
-                id=guide.id,
-                violation_type=guide.violation_type,
-                language=guide.language,
-                summary=guide.summary,
-                sections=guide.sections,
-                source=guide.source,
-                definition_hash=guide.definition_hash,
+            # `replace` rather than a field-by-field rebuild: the rebuild had to
+            # be revisited every time the value grew a field, and silently
+            # dropped whatever it had not been taught about.
+            return replace(
+                guide,
                 missing_guide_id=guide_id,
                 missing_violation_type=violation_type,
             )
