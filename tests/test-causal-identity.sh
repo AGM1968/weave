@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+export WV_CALL_SOURCE=test
+# The composite causal identity recorded on every instrumented call.
+#
+# The identity it replaced covered nodes, edges and node_files: it moved when a
+# node's text changed and stood still when a tombstone was written, a cutover
+# was stamped, or a delta arrived. Each check below moves exactly ONE component
+# and requires the identity to move with it, because a causal identity that
+# misses an input is worse than none -- it reports "nothing changed" about a
+# change it cannot see.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WV="$ROOT/scripts/wv"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
+run=0; pass=0
+ok() { run=$((run+1)); pass=$((pass+1)); echo -e "  ${GREEN}✓${NC} $1"; }
+bad() { run=$((run+1)); echo -e "  ${RED}✗${NC} $1"; [ -n "${2:-}" ] && echo "      $2"; }
+check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$2], got [$3]"; fi; }
+differs() { if [ "$2" != "$3" ]; then ok "$1"; else bad "$1" "identity did not move: $2"; fi; }
+
+TEST_DIR=$(mktemp -d /tmp/wv-causal-identity-XXXXXX)
+trap 'rm -rf "$TEST_DIR"' EXIT
+export WEAVE_DIR="$TEST_DIR/.weave"
+export WV_HOT_ZONE="$TEST_DIR/hot"
+# config.env is sourced with `set -a` on every invocation and therefore beats an
+# ambient export: without a config dir of its own this suite would write into the
+# operator's real call log and read identities that are not its own.
+export WV_CONFIG_DIR="$TEST_DIR/config"
+mkdir -p "$WV_CONFIG_DIR"
+export WV_CALL_LOG="$TEST_DIR/calls.jsonl"
+cd "$TEST_DIR" || exit 1
+git init -q . >/dev/null 2>&1
+git config user.email test@test.com; git config user.name Test; git config commit.gpgsign false
+"$WV" init >/dev/null 2>&1
+
+echo "=== composite causal identity ==="
+
+# The identity after the previous call, read back from the log the call wrote.
+identity() {
+    "$WV" status >/dev/null 2>&1
+    tail -1 "$WV_CALL_LOG" | jq -r '.graph_identity_after.value // "unavailable"'
+}
+kind() { tail -1 "$WV_CALL_LOG" | jq -r '.graph_identity_after.kind // "missing"'; }
+
+base=$(identity)
+check "the identity is a composite, not a graph fingerprint" "composite_causal_identity" "$(kind)"
+case "$base" in
+    sha256:*) ok "the identity is a sha256 value" ;;
+    *) bad "the identity is a sha256 value" "got [$base]" ;;
+esac
+check "a call that changes nothing leaves the identity where it was" "$base" "$(identity)"
+
+# ROWS. The one component the old fingerprint already covered.
+"$WV" add "identity probe" --standalone >/dev/null 2>&1
+rows_moved=$(identity)
+differs "a new node moves the identity" "$base" "$rows_moved"
+
+# TOMBSTONES. A delete writes a tombstone; nodes and edges lose a row, so this
+# would move any fingerprint. What the tombstone check needs is a change that
+# ONLY touches the tombstone table, which is why it is written directly.
+probe=$("$WV" add "tombstone probe" --standalone --json 2>/dev/null | jq -r '.id // empty')
+before_tombstone=$(identity)
+# wv hotzone --db is the supported way to reach the live database; guessing a
+# hot-zone path is how a test ends up asserting against a file nothing wrote.
+db=$("$WV" hotzone --db 2>/dev/null | tail -1)
+sqlite3 "$db" "INSERT OR REPLACE INTO tombstones (kind, id, lineage_seq, lineage_actor)
+               VALUES ('node','${probe:-wv-probe}',1,'identity-suite');" 2>/dev/null
+tombstones=$(sqlite3 "$db" "SELECT count(*) FROM tombstones WHERE lineage_actor='identity-suite';" 2>/dev/null)
+check "the tombstone probe was actually written" "1" "$tombstones"
+differs "a tombstone-only change moves the identity" "$before_tombstone" "$(identity)"
+
+# CUTOVER MARKER.
+before_marker=$(identity)
+printf 'lineage_seq=1\n' > "$WEAVE_DIR/causal-cutover"
+after_marker=$(identity)
+differs "a cutover-marker-only change moves the identity" "$before_marker" "$after_marker"
+printf 'lineage_seq=2\n' > "$WEAVE_DIR/causal-cutover"
+differs "editing the marker's contents moves the identity again" "$after_marker" "$(identity)"
+
+# CUTOVER AUTHORIZATION MANIFEST. No writer exists yet (wv-7e17b9): what is
+# pinned here is that absence is hashed as absence, so the file appearing is
+# itself a change. Without this, authorization evidence could arrive, or be
+# rewritten, under an unmoved identity.
+before_manifest=$(identity)
+printf '{"observed_frontiers":{}}\n' > "$WEAVE_DIR/cutover-authorization.json"
+after_manifest=$(identity)
+differs "an authorization-manifest-only change moves the identity" "$before_manifest" "$after_manifest"
+printf '{"observed_frontiers":{"actor":1}}\n' > "$WEAVE_DIR/cutover-authorization.json"
+differs "rewriting the manifest moves the identity again" "$after_manifest" "$(identity)"
+rm -f "$WEAVE_DIR/cutover-authorization.json"
+differs "removing the manifest moves the identity back off its present state" "$(identity)" "$after_manifest"
+
+# DELTA-CATALOG FRONTIER. Paths are not enough: the repository calls deltas
+# immutable and does not enforce it, so a frontier over paths alone stands still
+# through an in-place rewrite -- the one delta mutation that should be loudest.
+before_delta=$(identity)
+mkdir -p "$WEAVE_DIR/deltas/2026-01-01"
+probe_delta="$WEAVE_DIR/deltas/2026-01-01/1700000000-000000-probe.sql"
+printf -- '-- probe\n' > "$probe_delta"
+after_delta=$(identity)
+differs "an arriving delta moves the identity" "$before_delta" "$after_delta"
+printf -- '-- probe rewritten in place\n' > "$probe_delta"
+rewritten=$(identity)
+differs "rewriting a delta's contents at the same path moves the identity" "$after_delta" "$rewritten"
+# Same byte length as the line before it, so a size-only signature would not see
+# this either; only the content digest does.
+printf -- '-- probe rewritten in placX\n' > "$probe_delta"
+differs "a same-length rewrite moves the identity" "$rewritten" "$(identity)"
+rm -f "$probe_delta"
+differs "removing the delta moves the identity again" "$(identity)" "$rewritten"
+
+# Staging directories are NOT part of the frontier. They are PID-scoped scratch
+# no peer can see, and a sync that crashes or fails to publish between staging
+# and rename leaves one behind. Hashing it made this machine's causal identity
+# depend on that residue -- identity drift with no graph change behind it, and
+# the reason a failed publication now discards its staging rather than keeping
+# files no later process would come back for.
+same() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "identity moved: $2 -> $3"; fi; }
+before_staging=$(identity)
+mkdir -p "$WEAVE_DIR/deltas/2026-01-01/.staging-99999/v2"
+printf -- '-- staged, never published\n' > "$WEAVE_DIR/deltas/2026-01-01/.staging-99999/probe.sql"
+printf '{"staged":true}' > "$WEAVE_DIR/deltas/2026-01-01/.staging-99999/v2/000000000001-op.json"
+same "an unpublished staging directory does not move the identity" "$before_staging" "$(identity)"
+rm -rf "$WEAVE_DIR/deltas/2026-01-01/.staging-99999"
+same "removing an unpublished staging directory does not move it either" "$before_staging" "$(identity)"
+
+# The digest is cached against a (path, size, mtime) signature. The cache must
+# make an unchanged catalog cheap without making a changed one invisible.
+cache="$WV_HOT_ZONE/delta-catalog-digest"
+[ -s "$cache" ] && ok "the content digest is cached for an unchanged catalog" \
+  || bad "the content digest is cached for an unchanged catalog" "no cache at $cache"
+cached_before=$(cat "$cache")
+"$WV" status >/dev/null 2>&1
+check "an unchanged catalog reuses the cached digest" "$cached_before" "$(cat "$cache")"
+
+# ONE VALUE. The log line carries a single identity per side, not a set of
+# per-component hashes -- the growing-ad-hoc-hash shape this replaced.
+fields=$(tail -1 "$WV_CALL_LOG" | jq -r '[keys[] | select(test("identity|fingerprint"))] | sort | join(",")')
+check "the call line carries exactly one identity per side" "graph_identity_after,graph_identity_before" "$fields"
+covers=$(tail -1 "$WV_CALL_LOG" | jq -r '.graph_identity_after.covers | join(",")')
+check "the identity declares what it covers" \
+  "graph_rows,lineage,tombstones,cutover_marker,cutover_authorization_manifest,delta_catalog_frontier" "$covers"
+
+# The private evidence programme recomputes this value in Python and compares it
+# to call-log rows byte for byte when it admits a counted capture. That
+# agreement is checked on live values in the private suite that owns the
+# recomputation. It was checked here, which made a retained public suite import
+# a package the release excludes, so the assertion could not run in the
+# projection it shipped into.
+
+echo ""
+echo "Results: $pass/$run passed"
+[ "$pass" -eq "$run" ]

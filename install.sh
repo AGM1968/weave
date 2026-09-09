@@ -514,9 +514,12 @@ if [ -f "./scripts/wv" ]; then
     # Library modules (XDG: ~/.local/lib/weave/lib/)
     install_file ./scripts/lib/wv-config.sh "$LIB_DIR/lib/wv-config.sh"
     install_file ./scripts/lib/wv-db.sh "$LIB_DIR/lib/wv-db.sh"
+    install_file ./scripts/lib/wv-db-lineage.sh "$LIB_DIR/lib/wv-db-lineage.sh"
     install_file ./scripts/lib/wv-validate.sh "$LIB_DIR/lib/wv-validate.sh"
     install_file ./scripts/lib/wv-cache.sh "$LIB_DIR/lib/wv-cache.sh"
+    install_file ./scripts/lib/wv-command-capabilities.sh "$LIB_DIR/lib/wv-command-capabilities.sh"
     install_file ./scripts/lib/wv-journal.sh "$LIB_DIR/lib/wv-journal.sh"
+    install_file ./scripts/lib/wv-attempt-journal.sh "$LIB_DIR/lib/wv-attempt-journal.sh"
     install_file ./scripts/lib/wv-gh.sh "$LIB_DIR/lib/wv-gh.sh"
     install_file ./scripts/lib/wv-delta.sh "$LIB_DIR/lib/wv-delta.sh"
     install_file ./scripts/lib/wv-delta-catalog.sh "$LIB_DIR/lib/wv-delta-catalog.sh"
@@ -608,6 +611,21 @@ if [ -f "./scripts/wv" ]; then
         [ -f "$contract" ] || continue
         install_file "$contract" "$LIB_DIR/contracts/$(basename "$contract")"
     done
+    # The MCP contract is one of these, and is installed unconditionally rather
+    # than under --with-mcp: wv mcp-status reads it whether or not this machine
+    # builds the server, and it used to be read from the CONSUMER repository's
+    # own mcp/contract.json -- a file no consumer has, which made scope
+    # reporting collapse silently instead of failing.
+    if [ -f ./mcp/contract.json ]; then
+        mkdir -p "$LIB_DIR/mcp"
+        install_file ./mcp/contract.json "$LIB_DIR/mcp/contract.json"
+    else
+        # Guarded like the contracts loop above: install_file returns nonzero on
+        # a missing source and this script runs under set -e, so a bare call
+        # would turn one absent asset into an aborted install. An absence is not
+        # silent either way -- wv mcp-status reports the authority unavailable.
+        echo "install: mcp/contract.json not found in source; wv mcp-status will report the contract unavailable" >&2
+    fi
     mkdir -p "$LIB_DIR/weave_indexer"
     for pyf in ./scripts/weave_indexer/*.py; do
         install_file "$pyf" "$LIB_DIR/weave_indexer/$(basename "$pyf")"
@@ -727,9 +745,12 @@ else
     # Library modules (XDG: ~/.local/lib/weave/lib/)
     download_file "$REPO/scripts/lib/wv-config.sh" "$LIB_DIR/lib/wv-config.sh"
     download_file "$REPO/scripts/lib/wv-db.sh" "$LIB_DIR/lib/wv-db.sh"
+    download_file "$REPO/scripts/lib/wv-db-lineage.sh" "$LIB_DIR/lib/wv-db-lineage.sh"
     download_file "$REPO/scripts/lib/wv-validate.sh" "$LIB_DIR/lib/wv-validate.sh"
     download_file "$REPO/scripts/lib/wv-cache.sh" "$LIB_DIR/lib/wv-cache.sh"
+    download_file "$REPO/scripts/lib/wv-command-capabilities.sh" "$LIB_DIR/lib/wv-command-capabilities.sh"
     download_file "$REPO/scripts/lib/wv-journal.sh" "$LIB_DIR/lib/wv-journal.sh"
+    download_file "$REPO/scripts/lib/wv-attempt-journal.sh" "$LIB_DIR/lib/wv-attempt-journal.sh"
     download_file "$REPO/scripts/lib/wv-gh.sh" "$LIB_DIR/lib/wv-gh.sh"
     download_file "$REPO/scripts/lib/wv-delta.sh" "$LIB_DIR/lib/wv-delta.sh"
     download_file "$REPO/scripts/lib/wv-delta-catalog.sh" "$LIB_DIR/lib/wv-delta-catalog.sh"
@@ -823,7 +844,7 @@ else
     coaching_guides=$(curl -sSL "https://api.github.com/repos/AGM1968/weave/contents/scripts/weave_quality/guides?ref=main" \
         | jq -r '.[] | select(.name | endswith(".md")) | .name' 2>/dev/null)
     if [ -z "$coaching_guides" ]; then
-        coaching_guides="_clean.md _incomplete.md _uncoached.md swallowed-exception.md swallowed-exception.python.md"
+        coaching_guides="_clean.md _incomplete.md _uncoached.md register.md swallowed-exception.md swallowed-exception.python.md"
     fi
     for guide_file in $coaching_guides; do
         download_file "$REPO/scripts/weave_quality/guides/${guide_file}" \
@@ -847,6 +868,9 @@ else
         coaching-response-v1.schema.json coaching-guide-v1.schema.json; do
         download_file "$REPO/contracts/${contract_file}" "$LIB_DIR/contracts/${contract_file}"
     done
+    # The MCP contract, on the same terms as the local path above.
+    mkdir -p "$LIB_DIR/mcp"
+    download_file "$REPO/mcp/contract.json" "$LIB_DIR/mcp/contract.json"
     # Python indexer package
     mkdir -p "$LIB_DIR/weave_indexer"
     download_file "$REPO/scripts/weave_indexer/__init__.py" "$LIB_DIR/weave_indexer/__init__.py"

@@ -55,16 +55,30 @@ bash "$ROOT/scripts/project-procedures.sh" --source="$SRC" --repo="$R2"
 [ ! -e "$R2/.codex/weave.json" ] || [ "$(jq -r '[.procedures[].id] | index("shared1")' "$R2/.codex/weave.json")" = "null" ]
 [ ! -e "$R2/.github/copilot-instructions.md" ] || ! grep -qF 'wv guide --procedure=shared1' "$R2/.github/copilot-instructions.md"
 
-# 6. The canonical dev-guide extraction is a real local procedure: it remains
-# available to wv guide but never projects to a consumer adapter.
-LOCAL_DEV="$ROOT/templates/procedures/local-development.md"
-[ "$(awk -F': *' '/^visibility:/{print $2; exit}' "$LOCAL_DEV")" = "local" ]
-grep -qF 'wv <command>' "$LOCAL_DEV"
+# 6. A local-visibility procedure remains available to wv guide but never
+# projects to a consumer adapter. Built synthetically rather than read from
+# templates/procedures/local-development.md: that file is stripped from the
+# public projection, and this suite is retained there, so pointing at it made a
+# shipped test depend on a file the release deliberately removes. The property
+# under test is the visibility rule, not that one particular document.
 LOCAL_SRC="$TMP/local-src"; R3="$TMP/r3"; mkdir -p "$LOCAL_SRC" "$R3"
-cp "$LOCAL_DEV" "$LOCAL_SRC/"
+cat > "$LOCAL_SRC/local-only.md" <<'LOCALPROC'
+---
+id: local-only
+description: "A development procedure that must never reach a consumer adapter."
+fallback: "wv guide --procedure=local-only"
+adapters: [codex]
+visibility: local
+status: ready
+---
+
+# Local Only
+
+Run `wv <command>` locally.
+LOCALPROC
 bash "$ROOT/scripts/gen-procedures.sh" --source="$LOCAL_SRC" --check >/dev/null
 bash "$ROOT/scripts/project-procedures.sh" --source="$LOCAL_SRC" --repo="$R3" --agent=codex
-[ ! -e "$R3/.codex/weave.json" ] || [ "$(jq -r '[.procedures[].id] | index("local-development")' "$R3/.codex/weave.json")" = "null" ]
+[ ! -e "$R3/.codex/weave.json" ] || [ "$(jq -r '[.procedures[].id] | index("local-only")' "$R3/.codex/weave.json")" = "null" ]
 
 # 7. gen-procedures rejects an invalid visibility value.
 mkproc bad '[codex]' 'visibility: public'

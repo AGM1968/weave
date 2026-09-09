@@ -336,7 +336,11 @@ EOF
     # Writer lineage lives in a migration rather than the schema heredoc above so
     # that a fresh database and a migrated one produce identical CREATE TABLE
     # text — see db_migrate_lineage for why that matters to state.sql.
-    db_migrate_lineage
+    #
+    # Propagated explicitly rather than left to `set -e`: a database initialised
+    # without the lineage columns cannot sync, and a caller that runs with -e
+    # disabled would otherwise carry on with one that reported failure.
+    db_migrate_lineage || return 1
     # Tighten perms on the DB file in case it predates the umask change.
     [ -f "$WV_DB" ] && chmod 600 "$WV_DB" 2>/dev/null || true
 }
@@ -426,85 +430,13 @@ CREATE INDEX IF NOT EXISTS idx_nodes_type_priority ON nodes(type, priority);
 MIGRATE
 }
 
-# Migrate nodes and edges to carry writer lineage (wv-e1556b, epic delta-causality).
-#
-# Delta replay used to resolve every conflict by comparing wall clocks, which is
-# not an ordering that can answer "which write happened after the other"
-# (docs/PROPOSAL-delta-causality.md). These two columns carry the information the
-# comparison was missing: which actor last wrote the row, and at what point on
-# that actor's Lamport counter.
-#
-# lineage_seq is a Lamport value, not a timestamp. It is only ever compared to
-# other lineage_seq values, and an actor advances it past the maximum it has
-# observed, so it is monotonic per actor by construction and comparable across
-# actors. (lineage_seq, lineage_actor) is a total order with a deterministic
-# tie-break for concurrent writes.
-#
-# The CHECK constraints are the point, not decoration. nodes.updated_at is
-# declared DATETIME (NUMERIC affinity) but is written as TEXT by
-# CURRENT_TIMESTAMP and as INTEGER by direct SQL; SQLite orders every INTEGER
-# before every TEXT, so a mixed-storage-class column does not compare values at
-# all, it compares storage classes and one side wins unconditionally. Pinning the
-# storage class at write time is what stops the replacement inheriting that.
-#
-# Backfill is deterministic: pre-causality rows take ('', 0), which sorts before
-# every real lineage and identifies them as pre-cutover to the loader.
-#
-# Called from db_init as well as from cmd_load, so a freshly created database and
-# a migrated one carry byte-identical schema text — ALTER TABLE appends columns
-# at the end of the stored CREATE TABLE, which a hand-written CREATE TABLE in the
-# db_init heredoc could not reproduce. state.sql is compared byte-wise by the
-# auto_sync no-op guard, so that divergence would be permanent churn between
-# agents.
-#
-# Canonical column order is (lineage_actor, lineage_seq) on BOTH tables — the
-# order the four ALTERs below produce on a clean table. ALTER TABLE ADD COLUMN
-# can only append, so a load-migrate reaches that order only when the snapshot
-# it imported carried no lineage columns or already carried them in this order.
-# It cannot repair a snapshot whose columns are absent-on-one-table or reversed
-# (that is how the wv-e1556b snapshot first shipped — nodes with lineage_seq
-# alone, later auto-synced to a reversed (seq, actor)). Two things follow:
-#   - a diverged snapshot must be REGENERATED from a canonical db_init database
-#     (see wv-5d3ba8), never hand-patched;
-#   - a hot-zone DB already migrated in the wrong order does NOT self-heal on
-#     `wv load` — cmd_load's pre-flight `auto_sync --force` dumps that DB over
-#     state.sql first. Recover by removing the hot zone so the reload has no
-#     live DB to flush: `rm -rf "$WV_HOT_ZONE" && wv load`.
-# tests/test-data.sh guards the committed .weave/state.sql against regressing to
-# a non-db_init order.
-db_migrate_lineage() {
-    sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
-ALTER TABLE nodes ADD COLUMN lineage_actor TEXT NOT NULL DEFAULT '' CHECK(typeof(lineage_actor) = 'text');
-ALTER TABLE nodes ADD COLUMN lineage_seq INTEGER NOT NULL DEFAULT 0 CHECK(typeof(lineage_seq) = 'integer');
-ALTER TABLE edges ADD COLUMN lineage_actor TEXT NOT NULL DEFAULT '' CHECK(typeof(lineage_actor) = 'text');
-ALTER TABLE edges ADD COLUMN lineage_seq INTEGER NOT NULL DEFAULT 0 CHECK(typeof(lineage_seq) = 'integer');
-MIGRATE
-    # Replay orders by (lineage_seq, lineage_actor) and seeds an actor's counter
-    # from the maximum it can observe; both are covering-index reads.
-    sqlite3 "$WV_DB" <<'MIGRATE_IDX' 2>/dev/null || true
-CREATE INDEX IF NOT EXISTS idx_nodes_lineage ON nodes(lineage_seq, lineage_actor);
-CREATE INDEX IF NOT EXISTS idx_edges_lineage ON edges(lineage_seq, lineage_actor);
-MIGRATE_IDX
-    # Cross-machine deletion tombstone (epic delta-causality, wv-ba9dc8 +
-    # wv-0d5e07). Replaces the gitignored, machine-local .weave/.prune_epoch:
-    # dump_state_sql emits this table so a delete travels to every clone. Delta v2
-    # node_delete/edge_delete write a row here on the op lineage; the v1 paths
-    # wv delete / wv prune write one on the deleted row's own lineage via
-    # db_write_tombstone. cmd_load's _reconcile_tombstones then removes any entity
-    # the delta back-catalog resurrected at or below its tombstone lineage_seq,
-    # while a genuine higher-lineage recreate survives. Created here rather than in
-    # the db_init heredoc so a fresh and a migrated database carry byte-identical
-    # CREATE TABLE text (state.sql is byte-compared by auto_sync).
-    sqlite3 "$WV_DB" <<'MIGRATE_TOMB' 2>/dev/null || true
-CREATE TABLE IF NOT EXISTS tombstones (
-    kind TEXT NOT NULL CHECK(kind IN ('node','edge')),
-    id TEXT NOT NULL,
-    lineage_seq INTEGER NOT NULL DEFAULT 0 CHECK(typeof(lineage_seq) = 'integer'),
-    lineage_actor TEXT NOT NULL DEFAULT '' CHECK(typeof(lineage_actor) = 'text'),
-    PRIMARY KEY (kind, id)
-);
-MIGRATE_TOMB
-}
+# Writer lineage lives in scripts/lib/wv-db-lineage.sh: db_lineage_shape,
+# db_lineage_pair_verdict, db_migrate_lineage and their helpers. wv doctor
+# consults the same classifier, so it is a module rather than a section here.
+# Located from this file rather than from $WV_LIB_DIR: tests source wv-db.sh
+# directly, without wv-config.sh, and a module that only resolves under the full
+# entry point is a module the suites cannot reach.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wv-db-lineage.sh"
 
 # db_write_tombstone KIND ID [LINEAGE_SEQ] [LINEAGE_ACTOR] — record a cross-machine
 # deletion tombstone (epic delta-causality, wv-0d5e07). Called by wv delete and

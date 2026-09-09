@@ -124,7 +124,9 @@ class TestPromotionInput:
 
         document = build_promotion_input(scanned, CATALOG, SCOPE, hot_zone=str(scanned))
         assert [o["detector"]["finding_key"] for o in document["observations"]] == keys
-        assert document["rule_violation_types"] == {"swallow-check": "code:swallowed-exception"}
+        # Scoped to the rule under test: shipped rules legitimately declare
+        # their own types, and whole-dict equality re-breaks every time one does.
+        assert document["rule_violation_types"]["swallow-check"] == "code:swallowed-exception"
         binding = document["rule_definition_bindings"]["swallow-check"]
         assert binding["authority"] == "target_head"
         assert binding["revision"] == subprocess.run(
@@ -260,7 +262,7 @@ class TestPromotionInput:
         _accept_everything(scanned)
 
         document = build_promotion_input(scanned, CATALOG, SCOPE, hot_zone=str(scanned))
-        assert document["rule_violation_types"] == {}
+        assert "swallow-check" not in document["rule_violation_types"]
         plan = plan_promotions(document)
         assert plan["candidates"] == []
         assert [r["reason"] for r in plan["rejected"]] == ["uncatalogued_violation_type"]

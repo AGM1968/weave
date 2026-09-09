@@ -1640,15 +1640,19 @@ test_discover_cache_classification() {
     echo "Test: discover cache classification"
     echo "==================================="
 
+    # Cache behaviour now comes from the capability registry projection, not
+    # from three lists in wv-cache.sh. "exempt" was never a category of its own:
+    # it meant neither served nor invalidating, which is what the registry says
+    # directly for a read that is not worth caching.
     local classification
     classification=$(bash -c "
-        source '$PROJECT_ROOT/scripts/lib/wv-cache.sh'
-        if _wv_run_cache_is_exempt_cmd discover; then
-            printf exempt
-        elif _wv_run_cache_is_read_cmd discover; then
+        source '$PROJECT_ROOT/scripts/lib/wv-command-capabilities.sh'
+        if _wv_cap_serve discover ''; then
             printf read
-        elif _wv_run_cache_is_write_cmd discover; then
+        elif _wv_cap_invalidate discover ''; then
             printf write
+        elif _wv_cap_known discover; then
+            printf exempt
         else
             printf unclassified
         fi

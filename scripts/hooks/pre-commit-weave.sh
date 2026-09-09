@@ -257,6 +257,63 @@ if command -v shellcheck >/dev/null 2>&1; then
     fi
 fi
 
+# Prose gate for staged markdown (wv-7816b4). Docs are not reachable through
+# impact-selected suite routing -- most of docs/ maps to no suite at all -- so
+# prose drift and markdown defects land unchecked. This session reflowed a doc
+# to 100 columns, split `(kind, id, lineage_seq, lineage_actor)` across a line
+# break inside a code span, and committed it; only a post-hoc scan caught it.
+#
+# THE BLOB, NOT THE WORKING TREE, for the same reason shellcheck above uses it.
+#
+# BASELINE-RELATIVE. Only findings the diff ADDS block. The repo carries
+# hundreds of pre-existing hits (82 `, so` in CHANGELOG.md); failing on
+# inherited debt would train the bypass reflex this gate exists to avoid.
+#
+# SOURCE-SCOPED. Every rule is `info` severity, so severity cannot separate a
+# rendering defect from house style. Managed + custom rules (the curated AI-tell
+# corpus) block; default rules advise.
+#
+# FAILS CLOSED on a materialisation it cannot produce, open on a missing
+# scanner -- an unavailable optional tool must not wedge every commit.
+_pc_md_all=()
+mapfile -d '' -t _pc_md_all < <(git diff --cached --name-only --diff-filter=ACMR -z 2>/dev/null)
+_pc_md_files=()
+for _pc_f in "${_pc_md_all[@]}"; do
+    case "$_pc_f" in
+        *.md) _pc_md_files+=("$_pc_f") ;;
+    esac
+done
+if [ "${#_pc_md_files[@]}" -gt 0 ] && [ -f "$REPO_ROOT/scripts/prose-gate.py" ]; then
+    hook_progress "prose gate on ${#_pc_md_files[@]} staged markdown file(s)..."
+    _pc_md_dir=$(mktemp -d "${TMPDIR:-/tmp}/wv-prose.XXXXXX" 2>/dev/null) || _pc_md_dir=""
+    # Checked BEFORE any --prefix is built: an empty value would make the
+    # prefix "/" and materialise the index over the filesystem root.
+    if [ -z "$_pc_md_dir" ] || [ ! -d "$_pc_md_dir" ]; then
+        echo "✗ prose gate: could not create a temp directory — refusing to commit unscanned content" >&2
+        exit 1
+    fi
+    if ! printf '%s\0' "${_pc_md_files[@]}" \
+        | git checkout-index -f -z --stdin --prefix="$_pc_md_dir/staged/" 2>/dev/null; then
+        rm -rf "$_pc_md_dir"
+        echo "✗ prose gate: could not materialise the staged index — refusing to commit unscanned content" >&2
+        exit 1
+    fi
+    # HEAD baseline. A path absent here is a new file and baselines to empty,
+    # which prose-gate.py handles; an unborn HEAD leaves the dir empty entirely.
+    for _pc_f in "${_pc_md_files[@]}"; do
+        mkdir -p "$_pc_md_dir/head/$(dirname "$_pc_f")" 2>/dev/null || true
+        git show "HEAD:$_pc_f" > "$_pc_md_dir/head/$_pc_f" 2>/dev/null || \
+            rm -f "$_pc_md_dir/head/$_pc_f" 2>/dev/null || true
+    done
+    _pc_md_rc=0
+    WV_BIN="$WV" python3 "$REPO_ROOT/scripts/prose-gate.py" \
+        "$_pc_md_dir/staged" "$_pc_md_dir/head" "${_pc_md_files[@]}" || _pc_md_rc=$?
+    rm -rf "$_pc_md_dir"
+    if [ "$_pc_md_rc" -ne 0 ]; then
+        exit 1
+    fi
+fi
+
 # Run fast shell workflow suites determined by wv impact --suites.
 # Mapping is driven by .weave/test-map.conf + naming-convention heuristics.
 # tests/run-all.sh is a meta-runner — skip it.

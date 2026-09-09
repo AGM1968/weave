@@ -145,17 +145,31 @@ _quality_adjudications_import() {
 # for both callers without duplicating the generation logic.
 #
 # _wv_emit_deltas DB WEAVE_DIR AGENT_ID
-#   Prints the cycle's LOCKED-IN watermark (from wv_delta_compact_batch,
-#   round 4 finding 2 -- self-captured under that function's own write lock,
-#   not a separately-raced SELECT) to stdout as its only output. Every
-#   remaining step of the caller's sync cycle (the dump, the final
-#   wv_delta_reset) MUST use this exact value, not one it captures itself.
+#   Line 1 of stdout is the cycle's LOCKED-IN watermark (from
+#   wv_delta_compact_batch, round 4 finding 2 -- self-captured under that
+#   function's own write lock, not a separately-raced SELECT). Every remaining
+#   step of the caller's sync cycle (the dump, the final wv_delta_reset) MUST
+#   use this exact value, not one it captures itself.
+#
+#   Line 2 is the staging directory holding the emission. It is STAGED, not
+#   published: nothing under it is git-visible, and the caller decides its
+#   fate with _wv_publish_staged_deltas (after the state.sql rename that
+#   acknowledges durability) or _wv_discard_staged_deltas (on any path that
+#   does not reach that rename). This function used to publish it itself,
+#   which meant .weave/deltas/ could carry a mutation state.sql had refused;
+#   cmd_load replays deltas, so the refusal was undone on the next load and a
+#   ship whose post-close publish failed came back closed. The function is
+#   called in a command substitution, so a return value cannot travel back in
+#   a global -- hence the second line rather than an out-parameter.
+#
 #   Returns 0 on a normal emission (including a legitimate no-op cycle) or a
 #   non-strict v2 sidecar failure (SQL delta stays authoritative, matching
 #   prior behavior); 1 only when the v1 changeset itself could not be
 #   generated, or a v2 failure under WV_DELTA_V2_STRICT -- the caller must
 #   not proceed to dump/publish this cycle, though the watermark is still
-#   printed so it can still be used for whatever cleanup it needs.
+#   printed so it can still be used for whatever cleanup it needs. Every
+#   non-zero return has already discarded its own staging directory, so line
+#   2 is absent and the caller has nothing to clean up.
 _wv_emit_deltas() {
     local db="$1" weave_dir="$2" agent_id="$3"
     local watermark compact_rc=0
@@ -267,27 +281,125 @@ _wv_emit_deltas() {
         return 1
     fi
 
-    # Everything succeeded -- publish the staged files into their real,
-    # git-visible locations. Each rename is same-filesystem and lands a file
-    # that was already complete before the move (never partially written),
-    # so the window where a concurrent reader could observe a partial
-    # publish is as small as bash lets a loop of renames be, not the whole
-    # emission's generation time.
-    if [ "$keep_delta" = true ]; then
-        mv "$staged_delta" "$delta_dir/$delta_filename" 2>/dev/null || true
+    # Everything through the lineage stamp succeeded, but publishing is NOT
+    # this function's call to make. state.sql's rename is the durability
+    # acknowledgement ship and recovery read; publishing the changeset here
+    # put a durable record of the mutation into .weave/deltas/ BEFORE that
+    # acknowledgement, and cmd_load replays it. A ship whose post-close
+    # publish failed therefore came back from the next load fully closed with
+    # its ship_pending marker cleared -- the state tests/test-durability.sh
+    # forbids -- because the acknowledgement had refused a mutation the
+    # operation log had already accepted. Nothing under $staging_dir is
+    # git-visible, so the caller can still discard the whole emission; it
+    # publishes only once the acknowledgement it gates on has landed.
+    #
+    # Stdout contract: line 1 is the watermark (as before), line 2 is the
+    # staging directory to publish or discard. A caller that ignores line 2
+    # emits nothing, which is the safe direction to fail.
+    _wv_delta_keep_or_drop_staged "$keep_delta" "$staged_delta"
+    printf '%s\n' "$watermark"
+    printf '%s\n' "$staging_dir"
+}
+
+# _wv_delta_keep_or_drop_staged KEEP STAGED_DELTA -- the staged v1 changeset is
+# published only when it carries a replayable statement; dropping the file here
+# is what tells the publisher below there is nothing to move.
+_wv_delta_keep_or_drop_staged() {
+    [ "$1" = true ] || rm -f "$2"
+}
+
+# _wv_publish_staged_deltas STAGING_DIR -- move a staged emission into the real,
+# git-visible .weave/deltas/ tree. Each rename is same-filesystem and lands a
+# file that was already complete before the move (never partially written), so
+# the window where a concurrent reader could observe a partial publish is as
+# small as bash lets a loop of renames be, not the emission's generation time.
+#
+# Call this only after the state.sql rename has succeeded. Publishing before it
+# is what let a refused acknowledgement be undone by delta replay.
+#
+# CONTRACT:
+#   - returns NON-ZERO if any move failed;
+#   - discards the residual staging directory rather than retaining it;
+#   - the caller MUST NOT drain _warp_changes on a non-zero return;
+#   - the next sync regenerates the whole emission from those rows.
+#
+# Every failure used to be swallowed with `2>/dev/null || true`, the staging
+# directory was deleted regardless, and the function returned success -- after
+# which both callers drained _warp_changes on that false success. state.sql
+# renames, the delta move fails, the tracker drains, and a merge-ours peer never
+# learns the mutation from any artifact: the silent permanent data loss the delta
+# emission exists to prevent, reintroduced one layer below where it was fixed.
+#
+# The first correction retained the unpublishable file and this header described
+# that. Retention was not retry state: staging is PID-scoped (.staging-$$) and
+# each emission clears only its own, so no later sync would ever look at the
+# retained file again. The retry state is _warp_changes, which is why the caller
+# keeping it pending -- not the staged bytes surviving -- is what makes a failed
+# publication recoverable. See the body for why the discard is also required.
+_wv_publish_staged_deltas() {
+    local staging_dir="$1"
+    [ -n "$staging_dir" ] && [ -d "$staging_dir" ] || return 0
+    local delta_dir failed=0
+    delta_dir="$(dirname "$staging_dir")"
+    if ! mkdir -p "$delta_dir" 2>/dev/null; then
+        echo "wv: cannot create $delta_dir to publish this cycle's delta" >&2
+        return 1
     fi
-    if [ "${WV_DELTA_V2_WRITE:-1}" = "1" ] && [ -d "$staging_dir/v2" ]; then
+    local staged
+    for staged in "$staging_dir"/*.sql; do
+        [ -e "$staged" ] || continue
+        if ! mv "$staged" "$delta_dir/"; then
+            echo "wv: failed to publish delta changeset $(basename "$staged")" >&2
+            failed=1
+        fi
+    done
+    if [ -d "$staging_dir/v2" ]; then
         local delta_v2_dir="$delta_dir/v2"
-        mkdir -p "$delta_v2_dir"
-        local staged_op
-        for staged_op in "$staging_dir/v2"/*.json; do
-            [ -e "$staged_op" ] || continue
-            mv "$staged_op" "$delta_v2_dir/" 2>/dev/null || true
-        done
+        if mkdir -p "$delta_v2_dir" 2>/dev/null; then
+            local staged_op
+            for staged_op in "$staging_dir/v2"/*.json; do
+                [ -e "$staged_op" ] || continue
+                if ! mv "$staged_op" "$delta_v2_dir/"; then
+                    echo "wv: failed to publish Delta v2 sidecar $(basename "$staged_op")" >&2
+                    failed=1
+                fi
+            done
+        else
+            echo "wv: cannot create $delta_v2_dir to publish this cycle's v2 sidecars" >&2
+            failed=1
+        fi
         find "$delta_v2_dir" -type d -empty -delete 2>/dev/null || true
     fi
+    if [ "$failed" -ne 0 ]; then
+        # DISCARD what could not be published. Retaining it looked like
+        # preserving retry state and was not: staging is PID-scoped
+        # (.staging-$$) and every emission clears only its own, so the next
+        # sync -- a different process -- would never look at these files again.
+        # They would sit under the deltas root forever, orphaned, and until the
+        # frontier learned to skip them they also moved this machine's causal
+        # identity digest with no graph change behind it.
+        #
+        # The retry state that matters is _warp_changes, which the caller keeps
+        # pending precisely because this returned non-zero. The next sync
+        # regenerates the whole changeset from those rows. A partially published
+        # cycle therefore leaves a v1 changeset the next one re-emits under a
+        # fresh filename; both replay, and the v2 CAS sidecars carry
+        # deterministic operation ids, so the re-emission is a no-op where it
+        # overlaps rather than a conflict.
+        rm -rf "$staging_dir"
+        echo "wv: delta publication incomplete; this cycle's emission was discarded and will be regenerated by the next sync" >&2
+        return 1
+    fi
     rm -rf "$staging_dir"
-    printf '%s\n' "$watermark"
+}
+
+# _wv_discard_staged_deltas STAGING_DIR -- drop an emission whose acknowledgement
+# never landed. _warp_changes is deliberately NOT drained on these paths, so the
+# next sync regenerates the same changeset rather than losing it.
+_wv_discard_staged_deltas() {
+    local staging_dir="$1"
+    [ -n "$staging_dir" ] && [ -d "$staging_dir" ] || return 0
+    rm -rf "$staging_dir"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -507,19 +619,21 @@ auto_sync() {
     # wv_delta_compact_batch's own write lock (round 4 finding 2) and prints
     # it; every step downstream (the dump, the final reset) uses THIS value,
     # not the pre-check one above.
-    local _sync_watermark
-    if ! _sync_watermark=$(_wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "$agent_id"); then
+    local _sync_emitted _sync_watermark _sync_staging
+    if ! _sync_emitted=$(_wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "$agent_id"); then
         return 1
     fi
+    _sync_watermark=$(printf '%s\n' "$_sync_emitted" | sed -n '1p')
+    _sync_staging=$(printf '%s\n' "$_sync_emitted" | sed -n '2p')
 
     # Full dump to state.sql — kept as the authoritative snapshot and audit trail.
     # Deltas complement the dump; they are not a replacement. state.sql is what
     # cmd_load uses to reconstruct the DB from scratch; deltas patch it forward.
     mkdir -p "$WEAVE_DIR"
     local tmp_sql tmp_nodes tmp_edges
-    tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX") || return 1
-    tmp_nodes=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX") || { rm -f "$tmp_sql"; return 1; }
-    tmp_edges=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX") || { rm -f "$tmp_sql" "$tmp_nodes"; return 1; }
+    tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX") || { _wv_discard_staged_deltas "$_sync_staging"; return 1; }
+    tmp_nodes=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX") || { rm -f "$tmp_sql"; _wv_discard_staged_deltas "$_sync_staging"; return 1; }
+    tmp_edges=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX") || { rm -f "$tmp_sql" "$tmp_nodes"; _wv_discard_staged_deltas "$_sync_staging"; return 1; }
 
     # Point-in-time snapshot (round 4 finding 5): state.sql and both JSONL
     # projections are all derived from this ONE static backup copy, not
@@ -528,12 +642,14 @@ auto_sync() {
     local _snap_db
     if ! _snap_db=$(_wv_snapshot_db "$WV_DB" "$WEAVE_DIR"); then
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        _wv_discard_staged_deltas "$_sync_staging"
         echo "wv: failed to snapshot database for export" >&2
         return 1
     fi
 
     if ! dump_state_sql "$_snap_db" "$tmp_sql" || [ ! -s "$tmp_sql" ]; then
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        _wv_discard_staged_deltas "$_sync_staging"
         echo "wv: failed to generate portable state snapshot" >&2
         return 1
     fi
@@ -543,6 +659,7 @@ auto_sync() {
     # keep deltas + _warp_changes pending, leave state.sql intact. Loud on stderr.
     if ! _sync_floor_guard_ok "$tmp_sql"; then
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        _wv_discard_staged_deltas "$_sync_staging"
         return 1
     fi
 
@@ -552,6 +669,15 @@ auto_sync() {
     # regeneration and checkpoint entirely.
     if [ -f "$WEAVE_DIR/state.sql" ] && cmp -s "$tmp_sql" "$WEAVE_DIR/state.sql"; then
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        # The state.sql already on disk is byte-identical to the one this cycle
+        # would have published, so the acknowledgement this emission gates on is
+        # already satisfied and the staged changeset publishes normally. A
+        # failed publication must not drain the tracker: the rows it describes
+        # are the only remaining record of the mutation for a merge-ours peer.
+        if ! _wv_publish_staged_deltas "$_sync_staging"; then
+            echo "wv: delta publication failed; change tracker left pending for the next sync" >&2
+            return 1
+        fi
         wv_delta_reset "$WV_DB" "$_sync_watermark" || return 1
         echo "$now" > "$stamp_file"
         return 0
@@ -560,6 +686,7 @@ auto_sync() {
     if ! _wv_query_json_snapshot "$_snap_db" "SELECT * FROM nodes;" | jq -c '.[]' > "$tmp_nodes" \
         || ! _wv_query_json_snapshot "$_snap_db" "SELECT * FROM edges;" | jq -c '.[]' > "$tmp_edges"; then
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        _wv_discard_staged_deltas "$_sync_staging"
         echo "wv: failed to generate portable JSONL projections" >&2
         return 1
     fi
@@ -571,7 +698,20 @@ auto_sync() {
     # could commit -- even though _warp_changes correctly stayed pending for
     # a later sync to regenerate everything.
     if ! _publish_weave_bundle "$WEAVE_DIR" "$tmp_nodes" "$tmp_edges" "$tmp_sql"; then
+        _wv_discard_staged_deltas "$_sync_staging"
         echo "wv: failed to publish portable graph artifacts" >&2
+        return 1
+    fi
+
+    # The acknowledgement landed; only now does the emission become durable and
+    # git-visible. _warp_changes is still pending, so a crash inside this rename
+    # loop costs a redundant re-emission next cycle, never the mutation -- but
+    # only because the drain below is skipped when publication fails. Draining
+    # on a swallowed failure is how the mutation would be lost for every
+    # merge-ours peer.
+    if ! _wv_publish_staged_deltas "$_sync_staging"; then
+        auto_checkpoint "$now"
+        echo "wv: delta publication failed; change tracker left pending for the next sync" >&2
         return 1
     fi
 
@@ -1041,19 +1181,21 @@ cmd_sync() {
     # a separately-raced SELECT (round 4 finding 2).
     local agent_id
     agent_id="$(resolve_agent_id)"
-    local _sync_watermark
-    if ! _sync_watermark=$(_wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "$agent_id"); then
+    local _sync_emitted _sync_watermark _sync_staging
+    if ! _sync_emitted=$(_wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "$agent_id"); then
         echo -e "${RED}✗${NC} Sync aborted: failed to generate delta changeset" >&2
         [ "$_sync_journaled" = true ] && journal_end
         return 1
     fi
+    _sync_watermark=$(printf '%s\n' "$_sync_emitted" | sed -n '1p')
+    _sync_staging=$(printf '%s\n' "$_sync_emitted" | sed -n '2p')
 
     # Atomic sync: write to temp files, then move atomically
     local tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
     local tmp_nodes=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX")
     local tmp_edges=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX")
     local _snap_db=""
-    trap 'rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db" 2>/dev/null' EXIT
+    trap 'rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db" 2>/dev/null; _wv_discard_staged_deltas "$_sync_staging"' EXIT
 
     # Point-in-time snapshot (round 4 finding 5): state.sql and both JSONL
     # projections are all derived from this ONE static backup copy, not
@@ -1062,6 +1204,7 @@ cmd_sync() {
     if ! _snap_db=$(_wv_snapshot_db "$WV_DB" "$WEAVE_DIR"); then
         echo -e "${RED}✗${NC} Sync aborted: failed to snapshot database for export" >&2
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        _wv_discard_staged_deltas "$_sync_staging"
         trap - EXIT
         [ "$_sync_journaled" = true ] && journal_end
         return 1
@@ -1074,6 +1217,7 @@ cmd_sync() {
     if [ ! -s "$tmp_sql" ]; then
         echo -e "${RED}✗${NC} Sync aborted: database dump was empty (possible lock contention)" >&2
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        _wv_discard_staged_deltas "$_sync_staging"
         trap - EXIT
         [ "$_sync_journaled" = true ] && journal_end
         return 1
@@ -1082,6 +1226,7 @@ cmd_sync() {
     # Floor-guard: refuse a drastic shrink (partial/wiped tmpfs over committed truth)
     if ! _sync_floor_guard_ok "$tmp_sql" "$force"; then
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        _wv_discard_staged_deltas "$_sync_staging"
         trap - EXIT
         [ "$_sync_journaled" = true ] && journal_end
         return 1
@@ -1097,6 +1242,7 @@ cmd_sync() {
         || ! ( set -o pipefail; _wv_query_json_snapshot "$_snap_db" "SELECT * FROM edges;" | jq -c '.[]' > "$tmp_edges" ); then
         echo -e "${RED}✗${NC} Sync aborted: failed to generate portable JSONL projections" >&2
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        _wv_discard_staged_deltas "$_sync_staging"
         trap - EXIT
         [ "$_sync_journaled" = true ] && journal_end
         return 1
@@ -1105,15 +1251,31 @@ cmd_sync() {
     _snap_db=""
 
     # Publish human-readable projections first and state.sql last. A successful
-    # state.sql rename is the durability acknowledgement used by ship/recovery.
+    # state.sql rename is the durability acknowledgement used by ship/recovery,
+    # and nothing else durable may record this cycle's mutation until it lands
+    # -- the staged changeset is published immediately below, never before.
     if ! mv "$tmp_nodes" "$WEAVE_DIR/nodes.jsonl" ||
        ! mv "$tmp_edges" "$WEAVE_DIR/edges.jsonl" ||
        ! mv "$tmp_sql" "$WEAVE_DIR/state.sql"; then
         echo -e "${RED}✗${NC} Sync aborted: failed to publish durable graph state" >&2
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
+        _wv_discard_staged_deltas "$_sync_staging"
         trap - EXIT
         return 1
     fi
+
+    # The acknowledgement landed. _warp_changes is still pending until the drain
+    # below, so a crash inside this rename loop costs a redundant re-emission on
+    # the next sync, never the mutation itself -- provided the drain does not run
+    # when publication failed. state.sql is merge=ours, so for an established
+    # peer the delta is the ONLY artifact that can carry this mutation across.
+    if ! _wv_publish_staged_deltas "$_sync_staging"; then
+        echo -e "${RED}✗${NC} Sync aborted: failed to publish the delta changeset; change tracker left pending for the next sync" >&2
+        trap - EXIT
+        [ "$_sync_journaled" = true ] && journal_end
+        return 1
+    fi
+    _sync_staging=""
     # Drain change tracking now that state.sql durably carries every pending
     # change (found chasing test-commit-refs.sh, not a flake). cmd_sync now
     # emits the same delta/v1 changeset + v2 sidecars auto_sync does, via
@@ -1643,8 +1805,21 @@ cmd_load() {
             local edge_count
             edge_count=$(sqlite3 "$tmp_db" "SELECT COUNT(*) FROM edges;" 2>/dev/null || echo "-1")
             if [ "$edge_count" = "-1" ]; then
-                echo -e "${RED}Warning: edges table missing or corrupt in state.sql${NC}" >&2
-                echo -e "${YELLOW}  Graph structure may be incomplete. Run wv sync --gh to rebuild.${NC}" >&2
+                # REFUSED, not warned. This used to print a warning and then
+                # replace the live database anyway, so a state.sql missing a
+                # graph table installed a database that loaded clean, passed
+                # doctor, and then failed every sync and every commit-refs for
+                # the life of that hot zone. The load is atomic by construction
+                # -- import to a temp database, validate, then replace -- and a
+                # missing graph table is exactly what validation is for.
+                rm -f "$tmp_db"
+                trap - EXIT
+                echo -e "${RED}Error: edges table missing or corrupt in state.sql — refusing to load${NC}" >&2
+                echo -e "${YELLOW}  The existing database is untouched. A snapshot without a graph table${NC}" >&2
+                echo -e "${YELLOW}  cannot sync or persist commit-refs, so installing it would trade a${NC}" >&2
+                echo -e "${YELLOW}  readable database for a silently broken one.${NC}" >&2
+                echo -e "${YELLOW}  Regenerate the snapshot from a healthy clone, or run wv sync --gh to rebuild.${NC}" >&2
+                return 1
             elif [ "$edge_count" = "0" ]; then
                 local node_count
                 node_count=$(sqlite3 "$tmp_db" "SELECT COUNT(*) FROM nodes;" 2>/dev/null || echo "0")
@@ -1714,7 +1889,11 @@ EOF
         # Migrate writer lineage (epic delta-causality). Must run before delta
         # replay below: replay orders and guards on these columns, and a state.sql
         # written by an older release carries neither.
-        db_migrate_lineage
+        #
+        # Propagated explicitly: replay below orders on these columns, and
+        # continuing past a migration that could not establish them is how a
+        # load reports success over a database that cannot sync.
+        db_migrate_lineage || return 1
         # Migrate quality policy tables + trigger (language-aware thresholds, exempt paths).
         # Triggers are excluded from state.sql selective dump and must be reinstalled on load.
         db_migrate_policy_tables

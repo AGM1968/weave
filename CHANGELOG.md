@@ -4,6 +4,124 @@
 
 ## Unreleased
 
+## [1.71.0-rc.12] - 2026-09-07
+
+Corrective maintenance prerelease. `db_migrate_lineage` could not converge a database whose lineage
+columns were present on one table and absent on the other: it sent four `ALTER TABLE` statements
+through one `sqlite3` script under `2>/dev/null || true`, so on a CLI that abandons a script at its
+first error the already-migrated table's `duplicate column name` stopped the repair before the other
+table was reached, and the discarded exit status reported success either way. The failure repeats
+identically on every retry, so `wv sync` and `wv commit-refs --prune` could never persist again for
+the life of that database. The migration now repairs per column from `pragma_table_info`, verifies
+the postcondition on both tables, and fails loudly with the hot-zone reset recovery for a shape
+`ALTER TABLE` cannot reach. `wv doctor` gained a `lineage schema` check on the same classifier —
+`PRAGMA integrity_check` validates pages, not columns, and reported the affected database healthy
+throughout.
+
+Also carries the capability registry as the runtime authority for command taxonomy, the durable
+attempt journal with a pre-dispatch call identity and explicit policy provenance, one composite
+causal identity recorded before and after every instrumented call, and the causal-cutover consumer
+guide shipped as a procedure rather than an unshippable `docs/` file. The journal and the identity
+are off unless `WV_ATTEMPT_JOURNAL` or `WV_CALL_LOG` names a path, so a default install pays for
+neither.
+
+### Fixed
+
+- **A refused durability acknowledgement is no longer undone by delta replay.** `wv sync` published
+  the delta changeset into `.weave/deltas/` before dumping `state.sql`, whose rename the code itself
+  treats as the durability acknowledgement that `wv ship` and recovery read. Because `wv load`
+  replays deltas, a ship whose post-close publish failed came back from the next load fully closed
+  with its `ship_pending` marker cleared: the acknowledgement had refused a mutation the operation
+  log already carried. The changeset is now staged and published only after the `state.sql` rename
+  lands, and discarded on every path that does not reach one. `_warp_changes` stays pending until
+  after that publish, so an interruption costs a redundant re-emission on the next sync rather than
+  the mutation.
+
+- **Thirteen shipped test suites ran in no aggregate.** `tests/run-all.sh` invoked 78 of the 93
+  suites in `tests/`, and the release projection's membership check only proved that the aggregate
+  invokes nothing missing — a suite could ship and be run by nothing, and thirteen did, in this
+  repository as well as in every projection built from it. `tests/test-durability.sh` had been
+  failing on the defect above the whole time. Every `tests/*.sh` now carries one of two
+  dispositions, retained-and-run or stripped; all thirteen are retained-and-run, and the
+  projection's test files and aggregate membership are compared as sets in both directions, so a
+  suite classified as neither fails the release build. The same classification is enforced against
+  the source tree by `tests/test-install-asset-parity.sh`, which fails at commit time rather than at
+  release time.
+
+- **The dependency-closure gate could not see path references.** It scanned retained tests for
+  imports of excluded Python modules, which says nothing about a shell suite that reaches its
+  dependency by path. The first suite promoted into the aggregate found the gap:
+  `scripts/lib/wv-workflow-classes.gen.sh` ships and its header instructs the reader to regenerate
+  it with `scripts/gen-workflow-classes.sh`, which did not ship. The generator ships now, and the
+  gate covers `$ROOT/scripts/...` references as well as imports.
+
+- **Tagging and publishing verify by construction.** `--release` set the publish, tag and archive
+  flags and left verification off, so the one command that uploads an artifact was also the one that
+  could skip install, selftest and the projection's retained aggregate. `--tag` and `--release` now
+  imply `--verify`, and `--dry-run` reports the resolved plan.
+
+- **`wv show` no longer renders completed blockers as current.** It listed every `blocks` edge with
+  no status filter, so a node whose blockers had all closed still read as blocked while
+  `wv context --json` reported it ready. Open blockers keep the `Blocked by:` heading; satisfied
+  ones move to `Blockers cleared:`.
+
+- **A failed delta publication no longer drains the change tracker.** Moving delta publication after
+  the durability acknowledgement left every rename inside the new publisher swallowed by `|| true`:
+  the staging directory was deleted regardless and the call returned success, so both callers
+  drained `_warp_changes` on a failure that never surfaced. `state.sql` renames, the delta move
+  fails, the tracker drains, and a merge-ours peer never learns the mutation from any artifact.
+  Publication now returns non-zero, names the file it could not publish, and no caller drains on
+  failure. The emission itself is discarded rather than kept: staging is PID-scoped (`.staging-$$`)
+  and each emission clears only its own, so a later sync — a different process — would never look at
+  a retained file again, and the residue moved this machine's causal-identity digest with no graph
+  change behind it. The retry state is `_warp_changes`, which the caller keeps pending precisely
+  because publication returned non-zero; the next sync regenerates the changeset from those rows,
+  and the v2 sidecars' deterministic operation ids make the overlap a no-op rather than a conflict.
+
+- **Publication cannot be reached with verification bypassed.** `WV_RELEASE_TEST_SKIP_AGGREGATE=1`
+  with `--release` announced the build as not release-verified, tagged, published, and then printed
+  "Release build verified". The knob is refused at argument validation whenever `--tag` or
+  `--release` is set, and the verified line prints only for a run whose aggregate executed.
+
+- **The commit that is verified is the commit that is tagged.** The pre-tag graph sync and `.weave`
+  flush ran after construction and after verification, so the flush commit moved `HEAD` and the
+  verified bytes belonged to an earlier commit than the tag. They run in preflight now; the commit
+  is pinned and reported, and the tag phase refuses a moved `HEAD` or a dirtied tree. An existing
+  source tag at a different commit, or an existing GitHub release, aborts rather than being skipped
+  while publication continues.
+
+- **Publication fails closed and names immutable objects.** Every git operation in the release path
+  was a warning: source and public branch and tag pushes could fail and the run would still create
+  the GitHub release, an existing source tag ended the tag phase without reaching the remote, and an
+  existing public tag was skipped without checking what it named. All of them abort now, both
+  remotes' refs are read back and required to name the intended commits, and an unreadable remote is
+  a refusal rather than an empty answer. `--release` no longer finishes without publishing when the
+  output directory has no usable remote. The public destination and both tag-conflict checks run
+  before any push on either repository, so a refusal leaves both remotes untouched. And publication
+  no longer reads `HEAD`: the source and public commits and branches are pinned before the first
+  push, both tags are created against those SHAs, both branches are pushed as
+  `$SHA:refs/heads/$BRANCH`, and the remotes are verified against the pins. A commit landing
+  mid-release is simply not part of it.
+
+- **The artifact is built from the pinned commit, not the working tree.** Pinning `SOURCE_SHA` fixed
+  what a release tags and pushes; construction went on copying the live checkout, so a commit
+  landing in the source repository mid-build could put newer working-tree bytes into an artifact
+  whose branch and tag correctly named the older pinned commit — one artifact, two commits. A
+  tagging or publishing run now materialises `SOURCE_SHA` with `git archive` into a temporary tree
+  and every copy, generator, contract gate and changelog read sources that snapshot, which cannot
+  observe later working-tree activity at all. The shipping manifest and `VERSION` are re-checked
+  against the snapshot, so a shipped path untracked at the pinned commit fails the build instead of
+  silently dropping out of the artifact. The builder is the one source read a snapshot cannot pin,
+  because bash reads it incrementally as it runs: `build-release.sh` changing on disk mid-run is
+  detected and refused before anything is pushed. The control commits a changed shipped file
+  immediately after the pin and requires the artifact, and the published public commit, to carry the
+  pinned version.
+
+- **Aggregate membership is proved by execution, not declaration.** The check compared
+  `run-all.sh`'s suite declarations against the projection's test files, which a runner satisfies
+  while executing nothing. `run-all.sh` now reports the suites whose processes ran and returned a
+  status, and the release compares that executed set against the retained files in both directions.
+
 ## [1.71.0-rc.11] - 2026-09-04
 
 Causal delta ordering and prose-tooling prerelease. `wv load` now merges deltas by causal lineage

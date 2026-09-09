@@ -211,6 +211,21 @@ test_block() {
 
     # Block prevents circular blocking
     assert_fails "block prevents circular blocking" "$WV" block "$blocker" --by="$target"
+
+    # `wv show` used to render every blocks edge under "Blocked by:" regardless
+    # of the blocker's status, so a node whose blockers had all closed still
+    # read as blocked while `wv context` reported blocked=false. A completed
+    # blocker belongs under its own heading, not under the one that states the
+    # node's current state.
+    output=$("$WV" show "$target" 2>&1)
+    assert_contains "$output" "Blocked by:" "an open blocker renders as blocking"
+    assert_not_contains "$output" "Blockers cleared:" "no cleared heading while the blocker is open"
+
+    "$WV" work "$blocker" >/dev/null 2>&1
+    "$WV" done "$blocker" --skip-verification >/dev/null 2>&1
+    output=$("$WV" show "$target" 2>&1)
+    assert_contains "$output" "Blockers cleared:" "a completed blocker renders as cleared"
+    assert_not_contains "$output" "Blocked by:" "a completed blocker no longer renders as blocking"
 }
 
 # ============================================================================

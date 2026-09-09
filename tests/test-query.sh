@@ -49,24 +49,34 @@ strip_ansi() {
     sed 's/\x1b\[[0-9;]*m//g'
 }
 
+# NORMALIZE FIRST, THEN MATCH ON A HERESTRING -- never `echo "$x" | strip_ansi |
+# grep -q`. `grep -q` exits at its first match, which can kill the upstream `sed`
+# with SIGPIPE (141); under `set -o pipefail` that becomes the pipeline's status,
+# so a MATCHING assertion reports a failure. It is timing-dependent -- it needs
+# the writer to still be writing when the reader leaves -- so it surfaces as a
+# rare, load-sensitive single-assertion failure rather than a reproducible one.
+# A herestring has no upstream process to signal. The same reasoning is written
+# out in tests/test-assert-helper-safety.sh, for the same reason.
 assert_contains() {
-    local haystack="$1" needle="$2" message="$3"
+    local haystack="$1" needle="$2" message="$3" clean
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | strip_ansi | grep -qF -- "$needle"; then
+    clean=$(printf '%s' "$haystack" | strip_ansi)
+    if grep -qF -- "$needle" <<<"$clean"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected to find: $needle"
-        echo "  In: $(echo "$haystack" | strip_ansi | head -5)"
+        echo "  In: $(head -5 <<<"$clean")"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
 
 assert_not_contains() {
-    local haystack="$1" needle="$2" message="$3"
+    local haystack="$1" needle="$2" message="$3" clean
     TESTS_RUN=$((TESTS_RUN + 1))
-    if ! echo "$haystack" | strip_ansi | grep -qF -- "$needle"; then
+    clean=$(printf '%s' "$haystack" | strip_ansi)
+    if ! grep -qF -- "$needle" <<<"$clean"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -120,27 +130,32 @@ assert_exit_fail() {
 
 populate_nodes() {
     # active task (--force bypasses claim-ready hook in test env)
-    TASK_ID=$("$WV" add "wq-test: active task node" --status=active --force 2>/dev/null | head -1)
+    TASK_ID=$("$WV" add "wq-test: active task node" --status=active --force 2>/dev/null)
+    TASK_ID=${TASK_ID%%$'\n'*}
 
     # done node with learning (new schema)
     DONE_ID=$("$WV" add "wq-test: done node with decision learning" --status=done \
         --metadata='{"learning":"decision: use phrase-quote for FTS5 | pitfall: subshell loses state"}' \
-        2>/dev/null | head -1)
+        2>/dev/null)
+    DONE_ID=${DONE_ID%%$'\n'*}
 
     # done node with dual-schema learning fields
     DUAL_ID=$("$WV" add "wq-test: dual-schema learning node" --status=done \
         --metadata='{"decision":"prefer indexes over full scans","pattern":"always EXPLAIN QUERY PLAN"}' \
-        2>/dev/null | head -1)
+        2>/dev/null)
+    DUAL_ID=${DUAL_ID%%$'\n'*}
 
     # finding node (--force bypasses active-node check)
     FIND_ID=$("$WV" add "wq-test: finding about sqlite busy timeout" --status=active \
         --metadata='{"type":"finding","finding":{"fixable":1,"confidence":"high","violation_type":"perf"}}' \
-        --force 2>/dev/null | head -1)
+        --force 2>/dev/null)
+    FIND_ID=${FIND_ID%%$'\n'*}
 
     # node with metadata field
     META_ID=$("$WV" add "wq-test: node with custom priority" --status=todo \
         --metadata='{"priority":"high"}' \
-        2>/dev/null | head -1)
+        2>/dev/null)
+    META_ID=${META_ID%%$'\n'*}
 
     export TASK_ID DONE_ID DUAL_ID FIND_ID META_ID
 }
@@ -221,7 +236,8 @@ echo -e "${YELLOW}=== wv query: MATCH dual-FTS learning recall ===${NC}"
 # that learning-content nodes are returned and not silently dropped.
 LEARNING_ONLY_ID=$("$WV" add "wq-test: node with generic title" --status=done \
     --metadata='{"decision":"prefer unique sentinel phrase zxqvfoo for testing","pattern":"sentinel only in learning"}' \
-    2>/dev/null | head -1)
+    2>/dev/null)
+LEARNING_ONLY_ID=${LEARNING_ONLY_ID%%$'\n'*}
 export LEARNING_ONLY_ID
 
 out=$("$WV" query "MATCH zxqvfoo" 2>&1)
@@ -318,7 +334,8 @@ echo -e "${YELLOW}=== Phase 2 gate: wv search / wv query MATCH recall parity (wv
 # wv search (which keeps its own UNION) would still find it.
 PARITY_ID=$("$WV" add "wq-test: parity gate node" --status=done \
     --metadata='{"decision":"xq7paritysentinel Phase2 gate learning recall","pattern":"nodes_learning_fts UNION 2x weight"}' \
-    2>/dev/null | head -1)
+    2>/dev/null)
+PARITY_ID=${PARITY_ID%%$'\n'*}
 export PARITY_ID
 
 # wv query MATCH must find the sentinel in learning fields

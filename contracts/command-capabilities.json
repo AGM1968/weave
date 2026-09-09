@@ -1,0 +1,1234 @@
+{
+  "commands": [
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "add"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "allowed-tools"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "analyze"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "audit-pitfalls"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "batch"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "batch-done"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "block"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": true
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "bootstrap"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "bootstrap-agent"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "breadcrumbs"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "breadcrumbs",
+      "suboperation": "capsule"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "breadcrumbs",
+      "suboperation": "clear"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "breadcrumbs",
+      "suboperation": "save"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "breadcrumbs",
+      "suboperation": "show"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "bulk-update"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "cache"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "clean-ghosts"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db",
+        "git"
+      ],
+      "operation": "commit-refs"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "compact"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "installation",
+        "repo_state"
+      ],
+      "operation": "config"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "installation",
+        "repo_state"
+      ],
+      "operation": "config",
+      "suboperation": "disable"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "installation",
+        "repo_state"
+      ],
+      "operation": "config",
+      "suboperation": "enable"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "config",
+      "suboperation": "get"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "config",
+      "suboperation": "list"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "installation",
+        "repo_state"
+      ],
+      "operation": "config",
+      "suboperation": "set"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "config",
+      "suboperation": "show"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "installation",
+        "repo_state"
+      ],
+      "operation": "config",
+      "suboperation": "unset"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "context"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "repo_state"
+      ],
+      "operation": "cutover"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "delete"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "digest"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "discover"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "installation",
+        "repo_state"
+      ],
+      "operation": "doctor"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "done"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "edge-types"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "edges"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "enrich-topology"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "findings"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "findings",
+      "suboperation": "list"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "findings",
+      "suboperation": "promote"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "guide"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "health"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "hook"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "administrative",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "hotzone"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "hotzone",
+      "suboperation": "db"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "administrative",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "hotzone",
+      "suboperation": "gc"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "hotzone",
+      "suboperation": "list"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "impact"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "import"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "administrative",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "index"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db",
+        "repo_state"
+      ],
+      "operation": "init"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "repo_state",
+        "working_tree"
+      ],
+      "operation": "init-repo"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "learnings"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "link"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": true
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "list"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "load"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "mcp-status"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db",
+        "repo_state"
+      ],
+      "operation": "memory"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "memory",
+      "suboperation": "crystallize"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "memory",
+      "suboperation": "import"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "memory",
+      "suboperation": "recall"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "repo_state"
+      ],
+      "operation": "memory",
+      "suboperation": "render"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "memory",
+      "suboperation": "scan"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "overview"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "path"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "pattern-audit"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "pending-close"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "plan"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "preflight"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db",
+        "repo_state"
+      ],
+      "operation": "prune"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db",
+        "quality_db"
+      ],
+      "operation": "quality"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "quality",
+      "suboperation": "diff"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "quality",
+      "suboperation": "functions"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "quality",
+      "suboperation": "hotspots"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "administrative",
+      "mutation_targets": [
+        "quality_db"
+      ],
+      "operation": "quality",
+      "suboperation": "patterns"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "quality",
+      "suboperation": "promote"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "quality",
+      "suboperation": "prose-shape"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "administrative",
+      "mutation_targets": [
+        "quality_db"
+      ],
+      "operation": "quality",
+      "suboperation": "reset"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "administrative",
+      "mutation_targets": [
+        "quality_db"
+      ],
+      "operation": "quality",
+      "suboperation": "scan"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "quality",
+      "suboperation": "structural-search"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "query"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db",
+        "git"
+      ],
+      "operation": "quick"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": true
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "ready"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "recover"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "refs"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "reindex"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "related"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "remember"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "git"
+      ],
+      "operation": "repo-class"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "repo-class",
+      "suboperation": "audit"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "git"
+      ],
+      "operation": "repo-class",
+      "suboperation": "set"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "resolve"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "search"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "administrative",
+      "mutation_targets": [
+        "installation"
+      ],
+      "operation": "self-update"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "administrative",
+      "mutation_targets": [],
+      "operation": "selftest"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "session-summary"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db",
+        "external_projection"
+      ],
+      "operation": "ship"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db",
+        "external_projection"
+      ],
+      "operation": "ship-agent"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "show"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "status"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db",
+        "external_projection",
+        "repo_state"
+      ],
+      "operation": "sync"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "test-record"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "test-status"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "touch"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "trails"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "trails",
+      "suboperation": "capsule"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "trails",
+      "suboperation": "clear"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "trails",
+      "suboperation": "save"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "trails",
+      "suboperation": "show"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "tree"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "unarchive"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "administrative",
+      "mutation_targets": [
+        "installation"
+      ],
+      "operation": "uninstall"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "unlink"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "update"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
+      "evidence_class": "observation",
+      "mutation_targets": [],
+      "operation": "validate-finding"
+    },
+    {
+      "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db"
+      ],
+      "operation": "work"
+    }
+  ],
+  "schema": "weave.command-capabilities.v1"
+}

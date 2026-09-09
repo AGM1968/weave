@@ -37,54 +37,19 @@ invalidate_context_cache() {
 # Invalidated by a sentinel file touched on every successful write command.
 # TTL provides eventual consistency for out-of-band writes (MCP, other shells).
 #
+# Which commands those are is NOT decided here. _wv_cap_serve and
+# _wv_cap_invalidate in the generated wv-command-capabilities.sh project it from
+# contracts/command-capabilities.json, which is also where E1 reads evidence
+# class and where wv pattern-audit reads totality. Three hand-maintained lists
+# used to live here -- read, write and exempt -- and a fourth copy in E1 drifted
+# from them unnoticed for a month. To change how a command is cached, edit the
+# registry and regenerate; there is nothing to add here.
+#
 # Disable: WV_RUN_CACHE=0
 
 WV_RUN_CACHE_TTL="${WV_RUN_CACHE_TTL:-45}"
 WV_RUN_CACHE_DIR="${WV_HOT_ZONE}/run_cache"
 WV_RUN_CACHE_SENTINEL="${WV_HOT_ZONE}/.run_cache.invalidate"
-
-_wv_run_cache_is_read_cmd() {
-    case "${1:-}" in
-        ready|list|bootstrap) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-_wv_run_cache_is_write_cmd() {
-    case "${1:-}" in
-        add|remember|memory|done|batch-done|bulk-update|delete|work|update|touch|allowed-tools|quick|ship|ship-agent|\
-        block|link|unlink|resolve|findings|\
-        unarchive|batch|plan|enrich-topology|sync|load|compact|prune|clean-ghosts|commit-refs|import|reindex|\
-        recover|session-summary|config|test-record|hook)
-            return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-# Commands that are read-only but not worth caching (or operate outside brain.db).
-# Every dispatch-table entry must appear in one of: read, write, or exempt.
-# wv pattern-audit enforces this; add new commands here or to the write list above.
-_wv_run_cache_is_exempt_cmd() {
-    case "${1:-}" in
-        # Read-only brain.db readers
-        analyze|audit-pitfalls|pattern-audit|bootstrap-agent|breadcrumbs|trails|context|digest|doctor|\
-        discover|edges|edge-types|guide|health|impact|learnings|mcp-status|overview|path|\
-        pending-close|preflight|query|refs|related|search|show|status|test-status|tree|validate-finding)
-            return 0 ;;
-        # Operates outside brain.db (quality.db / ast_cache.db / /dev/shm)
-        cache|hotzone|index|quality)
-            return 0 ;;
-        # One-time setup/teardown and clone-local Git metadata — no existing cache state to invalidate
-        init|init-repo|repo-class|self-update|selftest|uninstall)
-            return 0 ;;
-        # Stamps .weave/causal-cutover, a plain file outside brain.db; its own
-        # coordination-gate query is informational, not a nodes/edges mutation
-        # a cached read/list/bootstrap output would need to reflect
-        cutover)
-            return 0 ;;
-        *) return 1 ;;
-    esac
-}
 
 wv_run_cache_invalidate() {
     touch "$WV_RUN_CACHE_SENTINEL" 2>/dev/null || true

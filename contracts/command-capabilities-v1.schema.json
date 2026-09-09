@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://weave.dev/contracts/command-capabilities-v1.schema.json",
+  "$comment": "Static command capabilities: what each wv operation can touch, whether the run cache may serve or must invalidate, and how the counterweight classifies it. This is the single authority the dispatcher, the cache logic and E1 all project from. It replaced three hand-maintained Bash lists (_wv_run_cache_is_read_cmd / _wv_run_cache_is_write_cmd / _wv_run_cache_is_exempt_cmd) and a fourth copy in E1's MUTATION_COMMANDS, which drifted apart unnoticed for a month (commit-refs, 871a348a). Deliberately excluded: policy verdicts, journal states, causal identities and outcome fields. Those are per-call facts and belong to the attempt journal and the adjudication overlay, never to a static declaration.",
+  "$defs": {
+    "invariants": {
+      "$comment": "Not a referenced definition: the record of what this document deliberately does NOT state, so a reader is never left believing the schema covers it. Four invariants cannot be expressed in JSON Schema and are enforced by scripts/weave_registry.py, which executes THIS document for every question of shape and adds only these. TOTALITY: every command in the wv dispatch table has a row with no suboperation, so no call is ever unclassified. DOMINANCE: a command-level row must be at least as strong as every suboperation row beneath it -- its mutation_targets a superset, its evidence_class no weaker, its cache.invalidate set if any child sets it, and its cache.serve clear if any child clears it. Dominance is what makes 'conservative classification where flags alter effects' checkable rather than aspirational: an unrecognized or newly added suboperation falls back to the command-level row and can never be classified more weakly than the specific behaviour it actually performs. EXCLUSIVITY: no row both serves from and invalidates the run cache. CANONICITY: the registry document is in canonical form and sorted by (operation, suboperation), so its digest is reproducible. This schema is a trusted versioned build artifact rather than something the Python validator checks: the validator executes it and never inspects it, ajv strict compilation in tests/test-command-capabilities.sh is what certifies it, and a change of meaning belongs in a new -v2 file rather than an edit here. An edit under v1 is not forbidden but cannot be silent, because the contract identity covers this file's bytes."
+    },
+    "mutation_target": {
+      "$comment": "Durable state a command can change. brain_db is the graph database; repo_state is tracked repository content such as .weave/ files and markers; working_tree is untracked or scaffolded developer files; git is refs and commit metadata; external_projection is anything published outside the repository such as GitHub issues; quality_db covers derived local analysis stores; installation covers the installed toolchain itself.",
+      "enum": ["brain_db", "external_projection", "git", "installation", "quality_db", "repo_state", "working_tree"]
+    },
+    "evidence_class": {
+      "$comment": "How the counterweight treats the call. mutation_attempt is an attempt to change durable shared evidence-bearing state and belongs in a measured denominator. observation reads without changing. administrative changes derived, machine-local or installation state that no campaign measures. Ordered observation < administrative < mutation_attempt for the dominance rule below.",
+      "enum": ["administrative", "mutation_attempt", "observation"]
+    },
+    "cache": {
+      "$comment": "Run-cache effect. serve means a cached result may satisfy this call; invalidate means the call must drop cached results. Both false is the ordinary case for a command that neither benefits from nor disturbs the cache. Both true is contradictory and rejected.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["invalidate", "serve"],
+      "properties": {
+        "invalidate": { "type": "boolean" },
+        "serve": { "type": "boolean" }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cache", "evidence_class", "mutation_targets", "operation"],
+      "properties": {
+        "operation": {
+          "$comment": "The dispatched subcommand name, exactly as it appears in the wv dispatch table.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$"
+        },
+        "suboperation": {
+          "$comment": "Present only on rows that refine a mixed command, such as config get versus config set. Lookup takes the exact (operation, suboperation) row when one exists and otherwise the row for that operation with no suboperation, which is therefore required for every dispatched command.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$"
+        },
+        "handler": {
+          "$comment": "The shell function that implements the command. Recorded only where dispatch could genuinely be generated from this registry; absent means the mapping is not claimed to be authoritative for dispatch.",
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]*$"
+        },
+        "mutation_targets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/mutation_target" }
+        },
+        "cache": { "$ref": "#/$defs/cache" },
+        "evidence_class": { "$ref": "#/$defs/evidence_class" }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["commands", "schema"],
+  "properties": {
+    "schema": { "const": "weave.command-capabilities.v1" },
+    "commands": {
+      "$comment": "Sorted by (operation, suboperation) so the canonical serialization is stable and its digest is reproducible. The digest is computed over the canonical bytes of the registry document and is not stored inside it, which could not then hash itself. What journal events and campaign manifests bind is the contract identity -- sha256 over the schema id, this schema file's bytes and the registry digest, emitted by 'weave_registry.py identity' -- because the registry digest alone would let a schema edit change which rows are admissible while every previously captured digest still matched.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/command" }
+    }
+  }
+}

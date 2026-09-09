@@ -3173,19 +3173,27 @@ def _show_rule_row(
     return row
 
 
+def _row_strings(row: dict[str, object], field: str) -> list[str]:
+    """A row field as printable strings. Rows carry object values, so a caller
+    that iterates one directly is trusting a shape the type does not state."""
+    value = row.get(field)
+    return [str(item) for item in value] if isinstance(value, (list, tuple)) else []
+
+
 def _print_rule_row(row: dict[str, object]) -> None:
     """Human rendering: expressions, their flags, or the reason there are none."""
     print(f"{row['id']}  [{row['kind']}]  {row['source']}")
     exprs = row.get("expressions")
     if exprs is None:
         print(f"    (no searchable expressions) {row.get('reason', '')}")
-        if row.get("checks"):
-            print(f"    checks: {', '.join(str(c) for c in row['checks'])}")
+        checks = _row_strings(row, "checks")
+        if checks:
+            print(f"    checks: {', '.join(checks)}")
         print()
         return
-    flags = row.get("flags") or []
-    suffix = f"  [{', '.join(str(f) for f in flags)}]" if flags else ""
-    for expr in exprs:  # type: ignore[union-attr]
+    flags = _row_strings(row, "flags")
+    suffix = f"  [{', '.join(flags)}]" if flags else ""
+    for expr in _row_strings(row, "expressions"):
         print(f"    {expr}{suffix}")
     if row.get("note"):
         print(f"    note: {row['note']}")
@@ -3259,6 +3267,9 @@ def cmd_prose_shape(args: argparse.Namespace) -> int:
         "files": len(files),
         "current": current,
     }
+    # The printed table reads these, not payload: values recovered from a
+    # dict[str, object] have lost the shape the profile actually has.
+    comparison: tuple[dict[str, float | int], dict[str, float | int], dict[str, float | int]] | None = None
 
     baseline_ref = getattr(args, "baseline", None)
     if baseline_ref:
@@ -3289,23 +3300,24 @@ def cmd_prose_shape(args: argparse.Namespace) -> int:
             )
         before = profile_texts(before_texts)
         after = profile_texts(after_texts)
+        delta: dict[str, float | int] = {
+            key: round(float(value) - float(before[key]), 4)
+            for key, value in after.items()
+        }
+        comparison = (before, after, delta)
         payload["compared_files"] = len(before_texts)
         payload["added_since_baseline"] = added
         payload["baseline"] = {"ref": baseline_ref, "profile": before}
         payload["after"] = after
-        payload["delta"] = {
-            k: round(float(after[k]) - float(before[k]), 4) for k in after
-        }
+        payload["delta"] = delta
 
     if args.json:
         print(json.dumps(payload, indent=2))
         return 0
 
     print(f"{len(files)} markdown file(s) under {target}")
-    if "baseline" in payload:
-        base = payload["baseline"]["profile"]  # type: ignore[index]
-        after = payload["after"]  # type: ignore[index]
-        delta = payload["delta"]  # type: ignore[index]
+    if comparison is not None:
+        base, after, delta = comparison
         note = (
             f", {payload['added_since_baseline']} added since and excluded"
             if payload["added_since_baseline"]
@@ -3316,8 +3328,8 @@ def cmd_prose_shape(args: argparse.Namespace) -> int:
         )
         print(f"  {'metric':14} {'before':>10} {'after':>10} {'delta':>10}")
         print("  " + "-" * 48)
-        for key in after:
-            print(f"  {key:14} {base[key]:>10} {after[key]:>10} {delta[key]:>+10}")
+        for key, value in after.items():
+            print(f"  {key:14} {base[key]:>10} {value:>10} {delta[key]:>+10}")
         print(
             "\n  A split-only sweep shows coord_pct falling with subord_pct and\n"
             "  phrase_pct flat, sentences up, and words unchanged: joins became\n"
@@ -3478,6 +3490,115 @@ def cmd_adjudications_import(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+
+def _add_pattern_and_prose_parsers(sub: Any) -> None:
+    """The patterns group with its subcommands, prose-shape and coaching.
+
+    Split out of main() only for length. Registration order is help order, so
+    the block is called where it used to sit and stays in its original order.
+    """
+    patterns_parser = sub.add_parser(
+        "patterns",
+        help="Structural + prose pattern matching (code rules require ast-grep)",
+    )
+    patterns_sub = patterns_parser.add_subparsers(dest="patterns_command")
+
+    pat_scan_p = patterns_sub.add_parser("scan", help="Run pattern rules and store findings")
+    pat_scan_p.add_argument("path", nargs="?", help="Path to scan (default: repo root)")
+    pat_scan_p.add_argument("--json", action="store_true", help="JSON output")
+
+    pat_list_p = patterns_sub.add_parser("list", help="List active rules with hit counts")
+    pat_list_p.add_argument("path", nargs="?", help="Repo path (default: repo root)")
+    pat_list_p.add_argument("--json", action="store_true", help="JSON output")
+
+    shape_p = sub.add_parser(
+        "prose-shape", help="Sentence shape of a document set, and its movement"
+    )
+    shape_p.add_argument("path", nargs="?", help="File or directory (default: repo root)")
+    shape_p.add_argument("--baseline", help="git ref to compare the same paths against")
+    shape_p.add_argument("--json", action="store_true", help="JSON output")
+
+    pat_show_p = patterns_sub.add_parser(
+        "show", help="Show what a rule searches for, as the engine searches for it"
+    )
+    pat_show_p.add_argument("rule_id", nargs="?", help="Rule id (omit with --all)")
+    pat_show_p.add_argument(
+        "--all", action="store_true", help="Every active rule"
+    )
+    pat_show_p.add_argument("--path", help="Repo path (default: repo root)")
+    pat_show_p.add_argument("--json", action="store_true", help="JSON output")
+
+    pat_promote_p = patterns_sub.add_parser(
+        "promote", help="Promote findings as Weave nodes"
+    )
+    pat_promote_p.add_argument("--parent", required=True, help="Parent node ID")
+    pat_promote_p.add_argument("--json", action="store_true", help="JSON output")
+    pat_promote_p.add_argument(
+        "--dry-run", action="store_true", help="Show what would be created"
+    )
+    # Canonical mode. Legacy aggregate promotion is unchanged without --canonical,
+    # so an existing caller cannot be moved onto the new lifecycle by accident.
+    pat_promote_p.add_argument(
+        "--canonical",
+        action="store_true",
+        help="Promote accepted quality evidence into canonical type=finding nodes",
+    )
+    pat_promote_p.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply a reviewed plan (canonical mode; requires --plan-file)",
+    )
+    pat_promote_p.add_argument(
+        "--plan-file",
+        default="",
+        help="The reviewed plan bytes to apply, exactly as produced by dry-run",
+    )
+    pat_promote_p.add_argument(
+        "--language", default="", help="Language hint for guide resolution"
+    )
+
+    coaching_p = sub.add_parser(
+        "coaching", help="Render the shared coaching projection for finding nodes"
+    )
+    coaching_p.add_argument("--node-ids", default="", help="Comma-separated finding node ids")
+    coaching_p.add_argument("--json", action="store_true", help="Complete JSON envelope")
+    coaching_p.add_argument(
+        "--embed", action="store_true",
+        help="Print nothing when there is nothing to coach (for embedding in another surface)",
+    )
+    coaching_p.add_argument(
+        "--limit", type=int, default=3,
+        help="Occurrences shown per block in text mode; 0 shows every occurrence",
+    )
+
+    pat_adjudicate_p = patterns_sub.add_parser(
+        "adjudicate", help="Apply a human disposition to a stable finding key"
+    )
+    pat_adjudicate_p.add_argument("finding_key", help="Stable qf-* key from pattern scan output")
+    pat_adjudicate_p.add_argument(
+        "disposition",
+        choices=("accepted_defect", "false_positive", "waived", "unresolved"),
+    )
+    pat_adjudicate_p.add_argument("--note", help="Human rationale or waiver reference")
+    pat_adjudicate_p.add_argument("--json", action="store_true", help="JSON output")
+
+    pat_report_p = patterns_sub.add_parser(
+        "report", help="Report per-rule precision and recurring waivers"
+    )
+    pat_report_p.add_argument(
+        "path",
+        nargs="?",
+        help="Scope report to this target (default: last scan's target)",
+    )
+    pat_report_p.add_argument("--json", action="store_true", help="JSON output")
+
+    pat_validate_p = patterns_sub.add_parser(
+        "validate",
+        help="Validate every candidate rule independently and report schema coverage",
+    )
+    pat_validate_p.add_argument("path", nargs="?", help="Repo path (default: repo root)")
+    pat_validate_p.add_argument("--json", action="store_true", help="JSON output")
 
 
 def main() -> int:  # pragma: no cover
@@ -3650,108 +3771,7 @@ def main() -> int:  # pragma: no cover
     )
     ss_parser.add_argument("--json", action="store_true", help="JSON output")
 
-    # patterns
-    patterns_parser = sub.add_parser(
-        "patterns",
-        help="Structural + prose pattern matching (code rules require ast-grep)",
-    )
-    patterns_sub = patterns_parser.add_subparsers(dest="patterns_command")
-
-    pat_scan_p = patterns_sub.add_parser("scan", help="Run pattern rules and store findings")
-    pat_scan_p.add_argument("path", nargs="?", help="Path to scan (default: repo root)")
-    pat_scan_p.add_argument("--json", action="store_true", help="JSON output")
-
-    pat_list_p = patterns_sub.add_parser("list", help="List active rules with hit counts")
-    pat_list_p.add_argument("path", nargs="?", help="Repo path (default: repo root)")
-    pat_list_p.add_argument("--json", action="store_true", help="JSON output")
-
-    shape_p = sub.add_parser(
-        "prose-shape", help="Sentence shape of a document set, and its movement"
-    )
-    shape_p.add_argument("path", nargs="?", help="File or directory (default: repo root)")
-    shape_p.add_argument("--baseline", help="git ref to compare the same paths against")
-    shape_p.add_argument("--json", action="store_true", help="JSON output")
-
-    pat_show_p = patterns_sub.add_parser(
-        "show", help="Show what a rule searches for, as the engine searches for it"
-    )
-    pat_show_p.add_argument("rule_id", nargs="?", help="Rule id (omit with --all)")
-    pat_show_p.add_argument(
-        "--all", action="store_true", help="Every active rule"
-    )
-    pat_show_p.add_argument("--path", help="Repo path (default: repo root)")
-    pat_show_p.add_argument("--json", action="store_true", help="JSON output")
-
-    pat_promote_p = patterns_sub.add_parser(
-        "promote", help="Promote findings as Weave nodes"
-    )
-    pat_promote_p.add_argument("--parent", required=True, help="Parent node ID")
-    pat_promote_p.add_argument("--json", action="store_true", help="JSON output")
-    pat_promote_p.add_argument(
-        "--dry-run", action="store_true", help="Show what would be created"
-    )
-    # Canonical mode. Legacy aggregate promotion is unchanged without --canonical,
-    # so an existing caller cannot be moved onto the new lifecycle by accident.
-    pat_promote_p.add_argument(
-        "--canonical",
-        action="store_true",
-        help="Promote accepted quality evidence into canonical type=finding nodes",
-    )
-    pat_promote_p.add_argument(
-        "--apply",
-        action="store_true",
-        help="Apply a reviewed plan (canonical mode; requires --plan-file)",
-    )
-    pat_promote_p.add_argument(
-        "--plan-file",
-        default="",
-        help="The reviewed plan bytes to apply, exactly as produced by dry-run",
-    )
-    pat_promote_p.add_argument(
-        "--language", default="", help="Language hint for guide resolution"
-    )
-
-    coaching_p = sub.add_parser(
-        "coaching", help="Render the shared coaching projection for finding nodes"
-    )
-    coaching_p.add_argument("--node-ids", default="", help="Comma-separated finding node ids")
-    coaching_p.add_argument("--json", action="store_true", help="Complete JSON envelope")
-    coaching_p.add_argument(
-        "--embed", action="store_true",
-        help="Print nothing when there is nothing to coach (for embedding in another surface)",
-    )
-    coaching_p.add_argument(
-        "--limit", type=int, default=3,
-        help="Occurrences shown per block in text mode; 0 shows every occurrence",
-    )
-
-    pat_adjudicate_p = patterns_sub.add_parser(
-        "adjudicate", help="Apply a human disposition to a stable finding key"
-    )
-    pat_adjudicate_p.add_argument("finding_key", help="Stable qf-* key from pattern scan output")
-    pat_adjudicate_p.add_argument(
-        "disposition",
-        choices=("accepted_defect", "false_positive", "waived", "unresolved"),
-    )
-    pat_adjudicate_p.add_argument("--note", help="Human rationale or waiver reference")
-    pat_adjudicate_p.add_argument("--json", action="store_true", help="JSON output")
-
-    pat_report_p = patterns_sub.add_parser(
-        "report", help="Report per-rule precision and recurring waivers"
-    )
-    pat_report_p.add_argument(
-        "path",
-        nargs="?",
-        help="Scope report to this target (default: last scan's target)",
-    )
-    pat_report_p.add_argument("--json", action="store_true", help="JSON output")
-
-    pat_validate_p = patterns_sub.add_parser(
-        "validate",
-        help="Validate every candidate rule independently and report schema coverage",
-    )
-    pat_validate_p.add_argument("path", nargs="?", help="Repo path (default: repo root)")
-    pat_validate_p.add_argument("--json", action="store_true", help="JSON output")
+    _add_pattern_and_prose_parsers(sub)
 
     args = parser.parse_args()
 

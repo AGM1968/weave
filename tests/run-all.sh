@@ -3,7 +3,6 @@
 #
 # Run: bash tests/run-all.sh             (parallel, fast tier — ~400s wall time)
 #      bash tests/run-all.sh --serial    (serial, for readable output)
-#      bash tests/run-all.sh --slow      (include test-release.sh — ~600s)
 #      bash tests/run-all.sh --suite=X   (single suite by name fragment)
 # Exit: 0 if all suites pass, 1 if any fail
 
@@ -42,7 +41,6 @@ while [ $# -gt 0 ]; do
             echo ""
             echo "Options:"
             echo "  --serial, -s    Serial execution (readable output; default is parallel)"
-            echo "  --slow          Include slow integration suites (test-release.sh ~200s)"
             echo "  --verbose, -v   Show individual test output (implies --serial)"
             echo "  --suite=NAME    Run only specific suite (name fragment match)"
             echo ""
@@ -64,8 +62,6 @@ declare -a FAST_SUITES=(
     "test-coaching-fixtures.sh:Coaching Frozen Fixtures"
     "test-coaching-purity.sh:Coaching Planner Purity"
     "test-coaching-view.sh:Coaching View"
-    "test-install-asset-parity.sh:Install Asset Parity"
-    "test-e6-source-authority.sh:E6 Receipt Source Authority"
     "test-memory.sh:Graph Memory Commands"
     "test-graph.sh:Graph Commands"
     "test-data.sh:Data Commands"
@@ -88,7 +84,6 @@ declare -a FAST_SUITES=(
     "test-install-ast-grep.sh:Install ast-grep Opt-in Tests"
     "test-install-file.sh:Install File Atomic-Replace Tests"
     "test-install-provenance.sh:Install Provenance Tests"
-    "test-repository-hygiene.sh:Repository Hygiene Tests"
     "test-concurrent-session.sh:Concurrent Session Detection Tests"
     "test-mcp-status-scopes.sh:MCP Status Scope Tests"
     "test-crash-sentinel.sh:Crash Sentinel Tests"
@@ -101,7 +96,6 @@ declare -a FAST_SUITES=(
     "test-delta-replay-order.sh:Delta Replay Lineage Ordering"
     "test-cutover.sh:Causal Cutover Marker"
     "test-checkpoint-generation.sh:Checkpoint Generation Builder"
-    "test-battery-wrapper.sh:Tier2 Battery Wrapper Security (gap3)"
     "test-analyze.sh:Analyze Command Tests"
     "test-config.sh:Config Command Tests"
     "test-query.sh:Query Command Tests"
@@ -117,13 +111,38 @@ declare -a FAST_SUITES=(
     "test-schema-contract.sh:SQL-vs-Schema Contract"
     "test-mcp-parity.sh:MCP-vs-CLI Flag Parity"
     "test-agent-identity-parity.sh:Cross-Harness Agent-Identity Parity"
+    "test-command-capabilities.sh:Command Capability Registry"
+    "test-causal-identity.sh:Composite Causal Identity"
+    "test-attempt-journal.sh:Attempt Journal"
+    "test-telemetry-normalization.sh:Call-Log Operation Normalization"
     "test-output-budget.sh:Output Budget Golden Tests"
     "test-ipc-contract.sh:IPC Contract Validation"
+    # Thirteen suites shipped to consumers with no aggregate -- source or
+    # projection -- ever running them. Every one of them tests a shipped
+    # surface, so all thirteen are classified retained-and-run rather than
+    # stripped. test-durability.sh had been failing on a real defect the whole
+    # time (the delta changeset was published before the state.sql rename that
+    # acknowledges durability, so a refused acknowledgement was undone by
+    # replay). release_aggregate.py now compares the projection's test files
+    # against this list as SETS, so a suite added to tests/ and to neither
+    # this list nor a build-release.sh strip list fails the release build.
+    "test-assert-helper-safety.sh:Assertion Helper Option-Barrier Safety"
+    "test-cache-invalidation.sh:Context Cache Invalidation"
+    "test-durability.sh:Durable Execution and Recovery"
+    "test-gh-issue-body-bug.sh:Parent-Add Child-ID Regression"
+    "test-hook-common.sh:Shared Hook Library"
+    "test-hook-dispatch.sh:Host-Neutral Hook Dispatch"
+    "test-journal.sh:Operation Journal"
+    "test-phase-fsm.sh:Session Phase State Machine"
+    "test-quality.sh:Quality Scan and Reset"
+    "test-test-hook-registry.sh:Production Fault-Injection Hook Inventory"
+    "test-validate-finding.sh:Validate-Finding Golden Fixtures"
+    "test-workflow-manifest.sh:Workflow Manifest Projections"
+    "test-wv-flag-normalization.sh:Canonical Flag Telemetry Normalization"
 )
 
 # Slow tier — excluded by default; add with --slow (~200s, runs install+selftest)
 declare -a SLOW_SUITES=(
-    "test-release.sh:Release Tests"
 )
 
 declare -a SUITES=("${FAST_SUITES[@]}")
@@ -137,6 +156,11 @@ declare -A TIMES
 TOTAL_PASSED=0
 TOTAL_TESTS=0
 FAILED_SUITES=()
+# Suites this run actually EXECUTED, as opposed to the ones it declares. The
+# release compares this set against the projection's test files, because the
+# membership check upstream reads the declarations in this file and a runner
+# that declares a suite and never runs it satisfies that check completely --
+EXECUTED_SUITES=()
 
 echo "═══════════════════════════════════════════════════════════════════════════"
 echo -e "${CYAN}Weave CLI Test Suite${NC}"
@@ -161,6 +185,7 @@ run_suite() {
     else
         output=$(bash "$SCRIPT_DIR/$script" 2>&1) && exit_code=0 || exit_code=$?
     fi
+    EXECUTED_SUITES+=("$script")
 
     end_time=$(date +%s)
     duration=$((end_time - start_time))
@@ -169,12 +194,13 @@ run_suite() {
     # Prefer "Results: X/Y passed" over "Tests: X | Passed: X | Failed: Y" —
     # tail -1 on the latter picks up "Failed: 0" as the test count.
     local clean_output
-    clean_output=$(echo "$output" | sed 's/\x1b\[[0-9;]*m//g')
-    if echo "$clean_output" | grep -qE "[0-9]+/[0-9]+ passed"; then
-        local result_line
-        result_line=$(echo "$clean_output" | grep -E "[0-9]+/[0-9]+ passed" | tail -1)
-        passed=$(echo "$result_line" | grep -oE '[0-9]+' | head -1)
-        tests=$(echo "$result_line" | grep -oE '[0-9]+' | sed -n '2p')
+    clean_output=$(printf '%s' "$output" | sed 's/\x1b\[[0-9;]*m//g')
+    if grep -qE "[0-9]+/[0-9]+ passed" <<<"$clean_output"; then
+        local result_line result_numbers
+        result_line=$(grep -E "[0-9]+/[0-9]+ passed" <<<"$clean_output" | tail -1)
+        result_numbers=$(grep -oE '[0-9]+' <<<"$result_line")
+        passed=${result_numbers%%$'\n'*}
+        tests=$(sed -n '2p' <<<"$result_numbers")
     else
         passed=0
         tests=0
@@ -189,8 +215,11 @@ run_suite() {
         FAILED_SUITES+=("$name")
         echo -e "  ${RED}✗${NC} $name: $passed/$tests tests (${duration}s)"
         if [ "$VERBOSE" != true ]; then
-            # Show failure output
-            echo "$output" | grep -E "✗|FAIL|Error" | head -10 | sed 's/^/    /'
+            # Show failure output. awk, not `grep | head`: head leaves after ten
+            # lines and the SIGPIPE that kills grep is this runner's own status
+            # under `set -euo pipefail`, so reporting a failure could abort the
+            # run that was reporting it.
+            awk '/✗|FAIL|Error/ && shown < 10 { print "    " $0; shown++ }' <<<"$clean_output"
         fi
     else
         echo -e "  ${GREEN}✓${NC} $name: $passed/$tests tests (${duration}s)"
@@ -248,29 +277,48 @@ if [ "$PARALLEL" = true ]; then
             pid="${PIDS[$((i - batch_start))]}"
 
             wait "$pid" && exit_code=0 || exit_code=$?
+            EXECUTED_SUITES+=("$script")
 
-            output=$(cat "/tmp/wv-test-${run_id}-$script.out" 2>/dev/null || echo "")
-            rm -f "/tmp/wv-test-${run_id}-$script.out"
-        
-        # Parse results (strip ANSI codes first)
-            clean_output=$(echo "$output" | sed 's/\x1b\[[0-9;]*m//g')
-            if echo "$clean_output" | grep -qE "[0-9]+/[0-9]+ passed"; then
-                result_line=$(echo "$clean_output" | grep -E "[0-9]+/[0-9]+ passed" | tail -1)
-                passed=$(echo "$result_line" | grep -oE '[0-9]+' | head -1)
-                tests=$(echo "$result_line" | grep -oE '[0-9]+' | sed -n '2p')
+            suite_log="/tmp/wv-test-${run_id}-$script.out"
+            output=$(cat "$suite_log" 2>/dev/null || echo "")
+
+            # Parse results (strip ANSI codes first). Normalize once, then match
+            # on herestrings: `echo "$x" | grep -q` lets grep leave at its first
+            # match while the writer is still writing, and the SIGPIPE that
+            # follows becomes the pipeline's status under `set -o pipefail`.
+            clean_output=$(printf '%s' "$output" | sed 's/\x1b\[[0-9;]*m//g')
+            if grep -qE "[0-9]+/[0-9]+ passed" <<<"$clean_output"; then
+                result_line=$(grep -E "[0-9]+/[0-9]+ passed" <<<"$clean_output" | tail -1)
+                result_numbers=$(grep -oE '[0-9]+' <<<"$result_line")
+                passed=${result_numbers%%$'\n'*}
+                tests=$(sed -n '2p' <<<"$result_numbers")
             else
                 passed=0
                 tests=0
             fi
-        
+
             TOTAL_PASSED=$((TOTAL_PASSED + passed))
             TOTAL_TESTS=$((TOTAL_TESTS + tests))
-        
+
             if [ "$exit_code" -ne 0 ]; then
                 FAILED_SUITES+=("$name")
                 echo -e "  ${RED}✗${NC} $name: $passed/$tests tests"
+                # A COUNT IS NOT A DIAGNOSIS. This deleted the suite's output and
+                # printed only "45/46", so a single failing assertion inside a
+                # release --verify could not be identified afterwards at all --
+                # and a one-assertion failure is exactly the shape a flake takes.
+                # The failing suite's full output is kept, and its failure lines
+                # are shown here as the serial path already does. awk rather than
+                # `grep | head`, because a reader that leaves early is the bug
+                # this whole change is about.
+                awk '/✗|FAIL|Error/ && shown < 10 { print "    " $0; shown++ }' <<<"$clean_output"
+                failed_log="${WV_TEST_FAILED_LOG_DIR:-/tmp}/wv-test-failed-${run_id}-$script.out"
+                if mv "$suite_log" "$failed_log" 2>/dev/null; then
+                    echo "    full output: $failed_log"
+                fi
             else
                 echo -e "  ${GREEN}✓${NC} $name: $passed/$tests tests"
+                rm -f "$suite_log"
             fi
         done
     done
@@ -312,6 +360,15 @@ echo "════════════════════════�
 echo ""
 echo -e "  Total tests: ${GREEN}$TOTAL_PASSED${NC}/${YELLOW}$TOTAL_TESTS${NC} passed"
 echo -e "  Total time:  ${TOTAL_TIME}s"
+echo ""
+
+# Machine-readable execution record. Unprefixed counts and colour make the
+# summary above unreliable to parse; these lines are the contract the release
+# reads. A suite appears here only if its process ran and returned a status.
+echo "executed-suites-total: ${#EXECUTED_SUITES[@]}"
+for _executed in "${EXECUTED_SUITES[@]}"; do
+    echo "executed-suite: $_executed"
+done
 echo ""
 
 if [ "$INCLUDE_SLOW" = false ] && [ ${#SLOW_SUITES[@]} -gt 0 ]; then

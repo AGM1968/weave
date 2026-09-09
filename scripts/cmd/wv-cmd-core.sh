@@ -396,6 +396,16 @@ print(json.dumps(items))
                 epic_list=$(echo "$active_epics" | tr '\n' ' ' | sed 's/ $//')
                 echo -e "${RED}Error: --parent required when active epics exist (use --force or --standalone to override)${NC}" >&2
                 echo -e "${CYAN}  Active epic(s): $epic_list${NC}" >&2
+                # A gate that leaves no trace cannot be measured. The emitter adds
+                # the envelope and owns evidence-mode failure, so this call site
+                # supplies only what it alone knows -- and does NOT discard the
+                # result: a verdict that could not be written is the one event a
+                # counted campaign cannot do without.
+                wv_attempt_emit policy_verdict \
+                    rule=orphan_prevention \
+                    decision=deny \
+                    would_violate_invariant=yes \
+                    detail="a non-epic node created with no parent while an epic is open orphans it"
                 echo -e "${CYAN}  Usage: wv add \"...\" --parent=<epic-id>${NC}" >&2
                 # Combined preflight: report every other unmet gate now, not on retry
                 if [ -z "$alias" ]; then
@@ -3752,11 +3762,27 @@ cmd_show() {
             fi
         done
         
-        # Show blocking relationships
-        local blockers=$(db_query "SELECT source FROM edges WHERE target='$id' AND type='blocks';")
-        if [ -n "$blockers" ]; then
+        # Show blocking relationships, split by whether they still block.
+        # This listed every blocks edge regardless of status, so a node whose
+        # blockers had all closed still rendered a full "Blocked by:" list while
+        # `wv context` reported blocked=false with an empty blocker array. Two
+        # surfaces disagreeing about the same node is how stale release
+        # bookkeeping gets read as current. The satisfied edges are history
+        # worth keeping, so they are shown under their own heading rather than
+        # hidden.
+        local open_blockers satisfied_blockers
+        open_blockers=$(db_query "SELECT source FROM edges e WHERE e.target='$id' AND e.type='blocks' AND EXISTS (SELECT 1 FROM nodes n WHERE n.id=e.source AND n.status != 'done');")
+        satisfied_blockers=$(db_query "SELECT source FROM edges e WHERE e.target='$id' AND e.type='blocks' AND EXISTS (SELECT 1 FROM nodes n WHERE n.id=e.source AND n.status = 'done');")
+        if [ -n "$open_blockers" ]; then
             echo -e "${CYAN}Blocked by:${NC}"
-            echo "$blockers" | while read -r blocker_id; do
+            echo "$open_blockers" | while read -r blocker_id; do
+                local blocker_text=$(db_query "SELECT text FROM nodes WHERE id='$blocker_id';")
+                echo "  - $blocker_id: $blocker_text"
+            done
+        fi
+        if [ -n "$satisfied_blockers" ]; then
+            echo -e "${CYAN}Blockers cleared:${NC}"
+            echo "$satisfied_blockers" | while read -r blocker_id; do
                 local blocker_text=$(db_query "SELECT text FROM nodes WHERE id='$blocker_id';")
                 echo "  - $blocker_id: $blocker_text"
             done

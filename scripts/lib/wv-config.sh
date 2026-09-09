@@ -27,6 +27,15 @@ if [ "$REPO_ROOT" = "$HOME" ] || [ "$REPO_ROOT" = "/root" ]; then
 fi
 WEAVE_DIR="${WEAVE_DIR:-${REPO_ROOT:+$REPO_ROOT/.weave}}"
 
+# Cutover evidence, named here because two consumers need the same path before
+# either writes it: the composite causal identity hashes the manifest's presence
+# and bytes on every instrumented call (wv-62bb60), and wv cutover will write it
+# (wv-7e17b9). Until it does, the identity records it as explicitly absent --
+# absent and present hash differently, so the file appearing moves the identity
+# even though nothing here yet knows what it will contain.
+WV_CUTOVER_MARKER_FILE="${WV_CUTOVER_MARKER_FILE:-causal-cutover}"
+WV_CUTOVER_AUTHORIZATION_FILE="${WV_CUTOVER_AUTHORIZATION_FILE:-cutover-authorization.json}"
+
 # Side-effect-free runtime resolution helpers shared with hooks.
 source "$_WV_LIB_DIR/lib/wv-resolve-runtime.sh"
 REPO_ROOT=$(canonicalize_runtime_path "$REPO_ROOT")

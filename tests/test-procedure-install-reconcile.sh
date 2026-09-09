@@ -14,7 +14,14 @@ REPO="$TMP/repo"
 # Use a disposable full source tree so the installer exercises its normal local
 # source path without touching this checkout or the user's install.
 mkdir -p "$SOURCE" "$REPO"
-cp -a "$ROOT/." "$SOURCE/"
+# Copy the source tree WITHOUT the volatile directories. `cp -a "$ROOT/."`
+# copied .git, .weave and mcp/node_modules too: tens of thousands of files that
+# this fixture never reads, being written by whatever else the aggregate is
+# running at the time. A file that appears or vanishes mid-copy fails cp, and
+# under set -e that ends the suite before its first assertion -- which is how
+# this pair reported 0/0 in the aggregate while passing standalone.
+rsync -a --exclude=.git --exclude=.weave --exclude=node_modules \
+    --exclude=__pycache__ --exclude=dist "$ROOT/" "$SOURCE/"
 
 PROC="$SOURCE/templates/procedures/zzz-install-reconcile.md"
 ASSET="$SOURCE/templates/procedures/zzz-install-reconcile.txt"

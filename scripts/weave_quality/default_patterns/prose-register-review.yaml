@@ -1,6 +1,7 @@
 id: prose-register-review
 language: prose
 kind: regex
+violation_type: prose:register
 severity: info
 policy: always-on-shared
 maturity: promotable

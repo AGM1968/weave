@@ -457,11 +457,11 @@ git -C "$GRAPH_REPO" init -q
 (cd "$GRAPH_REPO" && WV_CONFIG_DIR="$GRAPH_CONFIG" $WV init >/dev/null 2>&1)
 (cd "$GRAPH_REPO" && WV_CONFIG_DIR="$GRAPH_CONFIG" WV_CALL_LOG="$GRAPH_LOG" $WV add "telemetry mutation" --force >/dev/null 2>&1)
 mutation_row=$(tail -1 "$GRAPH_LOG" 2>/dev/null || true)
-graph_mutation_ok=$(printf '%s' "$mutation_row" | jq -r '.graph_identity_before.kind == "sqlite_graph_fingerprint" and .graph_identity_after.kind == "sqlite_graph_fingerprint" and .graph_identity_before != .graph_identity_after' 2>/dev/null || true)
+graph_mutation_ok=$(printf '%s' "$mutation_row" | jq -r '.graph_identity_before.kind == "composite_causal_identity" and .graph_identity_after.kind == "composite_causal_identity" and .graph_identity_before != .graph_identity_after' 2>/dev/null || true)
 assert_contains "$graph_mutation_ok" "true" "graph fingerprint changes after a real mutation"
 (cd "$GRAPH_REPO" && WV_CONFIG_DIR="$GRAPH_CONFIG" WV_CALL_LOG="$GRAPH_LOG" $WV status --json >/dev/null 2>&1)
 read_row=$(tail -1 "$GRAPH_LOG" 2>/dev/null || true)
-graph_read_ok=$(printf '%s' "$read_row" | jq -r '.graph_identity_before.kind == "sqlite_graph_fingerprint" and .graph_identity_after.kind == "sqlite_graph_fingerprint" and .graph_identity_before == .graph_identity_after' 2>/dev/null || true)
+graph_read_ok=$(printf '%s' "$read_row" | jq -r '.graph_identity_before.kind == "composite_causal_identity" and .graph_identity_after.kind == "composite_causal_identity" and .graph_identity_before == .graph_identity_after' 2>/dev/null || true)
 assert_contains "$graph_read_ok" "true" "graph fingerprint stays stable across a read-only call"
 (cd "$GRAPH_REPO" && WV_CONFIG_DIR="$GRAPH_CONFIG" WV_CALL_LOG="$GRAPH_LOG" $WV ready --count >/dev/null 2>&1)
 ready_row=$(tail -1 "$GRAPH_LOG" 2>/dev/null || true)

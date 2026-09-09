@@ -1243,7 +1243,15 @@ SQL
     wv_delta_reset "$WV_DB"
     sqlite3 "$WV_DB" "UPDATE nodes SET text='B' WHERE id='wv-fail-c1';"
     _emit_rc_hist=0
-    _wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "test-agent" >/dev/null 2>&1 || _emit_rc_hist=$?
+    # _wv_emit_deltas STAGES; publication is the caller's, gated on the
+    # state.sql acknowledgement. This fixture needs a genuinely published
+    # historical sidecar, so it publishes the staging directory the emission
+    # names on line 2 of its stdout. Without this the `find ... -name v2`
+    # below matches the staging copy instead, and the next cycle's cleanup --
+    # same PID, same staging path -- removes the very file this test is
+    # asserting survives.
+    _emit_hist_out=$(_wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "test-agent" 2>/dev/null) || _emit_rc_hist=$?
+    _wv_publish_staged_deltas "$(printf '%s\n' "$_emit_hist_out" | sed -n '2p')"
     _v2_dir=$(find "$WEAVE_DIR/deltas" -type d -name v2 | head -1)
     _hist_count=$(find "$_v2_dir" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
     if [ "$_emit_rc_hist" -ne 0 ] || [ -z "$_v2_dir" ] || [ "$_hist_count" -lt 1 ]; then
@@ -1348,6 +1356,94 @@ SQL
     fi
     _r=$((_r + 1))
     rm -f /tmp/wv-f5c-stderr.$$
+
+    # --- Round 5 finding: a failed delta PUBLICATION must be visible, must
+    # keep the staged emission for retry, and must not report success. Every
+    # mv failure used to be swallowed with `|| true`, the staging directory was
+    # deleted anyway, and the function returned 0 -- after which both callers
+    # drained _warp_changes. state.sql renames, the delta move fails, the
+    # tracker drains, and a merge-ours peer never learns the mutation from any
+    # artifact. Three shapes: the v1 changeset alone, a v2 sidecar alone, and a
+    # partial publication where one file lands and another does not. ---
+    _pub_case() {
+        # $1 = case label, $2 = mv-failure glob, $3.. = files to stage
+        local _label="$1" _failglob="$2"; shift 2
+        local _root="$FAIL_DIR/delta-publish-$_label"
+        rm -rf "$_root"; mkdir -p "$_root/deltas/.staging-x/v2"
+        local _f
+        for _f in "$@"; do
+            mkdir -p "$(dirname "$_root/deltas/.staging-x/$_f")"
+            printf 'PAYLOAD' > "$_root/deltas/.staging-x/$_f"
+        done
+        # Match the SOURCE, not the last argument: _wv_publish_staged_deltas
+        # moves each file into a destination DIRECTORY, so the target is the
+        # same for every call and only $1 identifies the file.
+        # shellcheck disable=SC2317
+        mv() {
+            case "$1" in
+                $_failglob) return 1 ;;
+                *) command mv "$@" ;;
+            esac
+        }
+        _pubdelta_rc=0
+        _wv_publish_staged_deltas "$_root/deltas/.staging-x" >/dev/null 2>&1 || _pubdelta_rc=$?
+        unset -f mv
+        _pubdelta_root="$_root"
+    }
+
+    # Round 5 review: staging must be DISCARDED, not retained. It is PID-scoped
+    # and every emission clears only its own, so a "retained" directory is never
+    # looked at again -- orphaned scratch under the deltas root, not retry
+    # state. The retry state is _warp_changes, which the caller keeps pending
+    # because publication returned non-zero.
+
+    # v1 only: the changeset cannot be moved.
+    _pub_case v1only '*.sql' "changeset.sql"
+    _staging_left=0; [ -d "$_pubdelta_root/deltas/.staging-x" ] && _staging_left=1
+    if [ "$_pubdelta_rc" -ne 0 ] && [ "$_staging_left" = "0" ]; then
+        echo -e "  ${GREEN}✓${NC} a failed v1 changeset publication returns non-zero and discards its staging (round 5 review)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} v1 publication failure not surfaced or staging orphaned (rc=$_pubdelta_rc staging_left=$_staging_left)"
+    fi
+    _r=$((_r + 1))
+
+    # v2 only: the sidecar cannot be moved, the changeset can.
+    _pub_case v2only '*.json' "changeset.sql" "v2/000000000001-op.json"
+    _staging_left=0; [ -d "$_pubdelta_root/deltas/.staging-x" ] && _staging_left=1
+    if [ "$_pubdelta_rc" -ne 0 ] && [ "$_staging_left" = "0" ]; then
+        echo -e "  ${GREEN}✓${NC} a failed v2 sidecar publication returns non-zero and discards its staging (round 5 review)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} v2 publication failure not surfaced or staging orphaned (rc=$_pubdelta_rc staging_left=$_staging_left)"
+    fi
+    _r=$((_r + 1))
+
+    # Partial: the changeset lands, one of two sidecars does not. The call still
+    # fails, and nothing is left staged for a process that will never come back
+    # for it.
+    _pub_case partial '*-bad.json' "changeset.sql" "v2/000000000001-good.json" "v2/000000000002-bad.json"
+    _partial_published=$(find "$_pubdelta_root/deltas" -maxdepth 2 -name 'changeset.sql' 2>/dev/null | wc -l | tr -d ' ')
+    _staging_left=0; [ -d "$_pubdelta_root/deltas/.staging-x" ] && _staging_left=1
+    if [ "$_pubdelta_rc" -ne 0 ] && [ "$_partial_published" = "1" ] && [ "$_staging_left" = "0" ]; then
+        echo -e "  ${GREEN}✓${NC} a partial delta publication fails, discards the remainder, and never reports success (round 5 review)"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} partial publication mishandled (rc=$_pubdelta_rc sql=$_partial_published staging_left=$_staging_left)"
+    fi
+    _r=$((_r + 1))
+
+    # A clean publication still succeeds and clears the staging directory.
+    _pub_case clean '/nonexistent-target' "changeset.sql" "v2/000000000001-op.json"
+    _clean_staging_gone=0
+    [ -d "$_pubdelta_root/deltas/.staging-x" ] || _clean_staging_gone=1
+    if [ "$_pubdelta_rc" -eq 0 ] && [ "$_clean_staging_gone" = "1" ]; then
+        echo -e "  ${GREEN}✓${NC} a clean delta publication succeeds and removes the staging directory"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} clean publication regressed (rc=$_pubdelta_rc staging_gone=$_clean_staging_gone)"
+    fi
+    _r=$((_r + 1))
 
     # --- Deep-review finding: _publish_weave_bundle must not leave a torn
     # bundle (some targets updated, others stale) when a rename partway
@@ -2613,6 +2709,267 @@ rm -rf "$_lin_old"
 # filter and appear in every one of those records.
 _lin_v2=$($WV list --all --json-v2 2>/dev/null | jq -r '[.[] | select(has("lineage_seq") or has("lineage_actor"))] | length' 2>/dev/null || echo "jq-missing")
 assert_equals "0" "$_lin_v2" "json-v2 records omit the lineage columns"
+
+# ── Partial lineage schemas (wv-e1556b) ────────────────────────────────────
+#
+# The migration used to send all four ALTERs through one sqlite3 script under
+# `2>/dev/null || true`. sqlite3 abandons a script at its first error, so a
+# database whose nodes were already migrated aborted before either edges
+# statement and reported success on a half-migrated schema — which shipped in
+# rc.11 and left a consumer unable to sync or persist a prune for the life of
+# that database. Every partial subset is exercised here because the defect was
+# invisible to the two cases the suite had: fresh, and fully migrated.
+
+# _lin_fixture DB "<nodes lineage cols>" "<edges lineage cols>" — build a
+# database carrying exactly the named lineage columns, in the order given.
+# Column definitions are separated by ';' because each one contains spaces.
+_lin_fixture() {
+    local _db="$1" _ncols="$2" _ecols="$3" _c _old_ifs
+    rm -f "$_db"
+    sqlite3 "$_db" "CREATE TABLE nodes (id TEXT PRIMARY KEY, text TEXT, status TEXT,
+        metadata TEXT DEFAULT '{}', created_at DATETIME, updated_at DATETIME);
+        CREATE TABLE edges (source TEXT, target TEXT, type TEXT);"
+    _old_ifs="$IFS"; IFS=';'
+    for _c in $_ncols; do
+        if [ -n "$_c" ]; then IFS="$_old_ifs" sqlite3 "$_db" "ALTER TABLE nodes ADD COLUMN $_c;"; fi
+    done
+    for _c in $_ecols; do
+        if [ -n "$_c" ]; then IFS="$_old_ifs" sqlite3 "$_db" "ALTER TABLE edges ADD COLUMN $_c;"; fi
+    done
+    IFS="$_old_ifs"
+}
+# _lin_migrate DB — run the real migration against DB, print "rc|nodes|edges".
+_lin_migrate() {
+    WV_DB="$1" bash -c "
+        source '$REPO_ROOT/scripts/lib/wv-db.sh'
+        db_migrate_lineage >/dev/null 2>&1; _rc=\$?
+        printf '%s|%s|%s' \"\$_rc\" \"\$(db_lineage_shape nodes)\" \"\$(db_lineage_shape edges)\"
+    " 2>/dev/null
+}
+_LIN_A="lineage_actor TEXT NOT NULL DEFAULT ''"
+_LIN_S="lineage_seq INTEGER NOT NULL DEFAULT 0"
+_lin_tmp=$(mktemp -d)
+
+# The consumer's exact shape: nodes complete, edges untouched. One duplicate
+# column on nodes must not suppress either edges repair.
+_lin_fixture "$_lin_tmp/consumer.db" "$_LIN_A;$_LIN_S" ""
+assert_equals "0|canonical|canonical" "$(_lin_migrate "$_lin_tmp/consumer.db")" \
+    "the shipped consumer shape (nodes migrated, edges bare) converges"
+_lin_order=$(sqlite3 "$_lin_tmp/consumer.db" "SELECT group_concat(name) FROM (
+    SELECT name FROM pragma_table_info('edges') WHERE name LIKE 'lineage%' ORDER BY cid);" 2>/dev/null)
+assert_equals "lineage_actor,lineage_seq" "$_lin_order" \
+    "the repair appends edges lineage columns in canonical order"
+# Canonical order is only half of it: state.sql is byte-compared, so the column
+# TEXT a repair appends has to match what a fresh db_init writes.
+_lin_text=$(sqlite3 "$_lin_tmp/consumer.db" ".schema edges" 2>/dev/null | grep -o "lineage_seq INTEGER NOT NULL DEFAULT 0 CHECK(typeof(lineage_seq) = 'integer')")
+assert_equals "lineage_seq INTEGER NOT NULL DEFAULT 0 CHECK(typeof(lineage_seq) = 'integer')" "$_lin_text" \
+    "a repaired column carries the same definition text db_init produces"
+assert_equals "0|canonical|canonical" "$(_lin_migrate "$_lin_tmp/consumer.db")" \
+    "re-running the migration on the repaired database is a clean no-op"
+
+# Every other subset that ALTER TABLE can reach.
+_lin_fixture "$_lin_tmp/bare.db" "" ""
+assert_equals "0|canonical|canonical" "$(_lin_migrate "$_lin_tmp/bare.db")" \
+    "a database with no lineage columns at all converges"
+_lin_fixture "$_lin_tmp/edgesonly.db" "" "$_LIN_A;$_LIN_S"
+assert_equals "0|canonical|canonical" "$(_lin_migrate "$_lin_tmp/edgesonly.db")" \
+    "the mirror shape (edges migrated, nodes bare) converges"
+_lin_fixture "$_lin_tmp/actoronly.db" "$_LIN_A" "$_LIN_A"
+assert_equals "0|canonical|canonical" "$(_lin_migrate "$_lin_tmp/actoronly.db")" \
+    "a one-column partial on both tables gains the missing lineage_seq"
+_lin_fixture "$_lin_tmp/mixed.db" "$_LIN_A" ""
+assert_equals "0|canonical|canonical" "$(_lin_migrate "$_lin_tmp/mixed.db")" \
+    "different partial shapes on the two tables converge in one pass"
+
+# The consumer's CLI abandons a script at its first error; sqlite3 3.46.1 prints
+# the error and carries on, so on this machine the old four-in-one migration
+# would have limped through the case above and the suite would have proved
+# nothing. Whether the CLI bails is a build property, so pin it: a shim that
+# forces -bail reproduces the Debian 12 behaviour on any host. Under it the old
+# migration could never reach its edges statements; this one issues no failing
+# statement at all, because it only ALTERs a column PRAGMA says is missing.
+_lin_shim=$(mktemp -d)
+printf '#!/bin/bash\nexec %s -bail "$@"\n' "$(command -v sqlite3)" > "$_lin_shim/sqlite3"
+chmod +x "$_lin_shim/sqlite3"
+_lin_fixture "$_lin_tmp/bail.db" "$_LIN_A;$_LIN_S" ""
+_lin_bail=$(PATH="$_lin_shim:$PATH" _lin_migrate "$_lin_tmp/bail.db")
+assert_equals "0|canonical|canonical" "$_lin_bail" \
+    "the consumer shape converges even when the sqlite3 CLI bails on the first script error"
+rm -rf "$_lin_shim"
+
+# Shapes ALTER TABLE cannot reach are refused, not half-repaired: appending the
+# missing column would pin a reversed order into the stored CREATE TABLE text
+# and make state.sql churn between agents forever.
+# The verdict is taken for the PAIR, so an unrepairable pair is refused whole
+# rather than half-applied: repairing the reachable table would leave the
+# database in a third shape that neither the snapshot nor the target describes,
+# and the operator's recovery is the same either way.
+_lin_fixture "$_lin_tmp/seqonly.db" "$_LIN_S" ""
+_lin_seq_only=$(_lin_migrate "$_lin_tmp/seqonly.db")
+assert_equals "1|seq-only|absent" "$_lin_seq_only" \
+    "a seq-first partial is refused for the pair, leaving the database as it was"
+_lin_fixture "$_lin_tmp/reversed.db" "$_LIN_S;$_LIN_A" "$_LIN_S;$_LIN_A"
+assert_equals "1|reversed|reversed" "$(_lin_migrate "$_lin_tmp/reversed.db")" \
+    "an already-reversed schema fails instead of reporting success"
+# The failure has to be legible: silence is what turned this into an outage.
+_lin_msg=$(WV_DB="$_lin_tmp/reversed.db" bash -c "
+    source '$REPO_ROOT/scripts/lib/wv-db.sh'; db_migrate_lineage" 2>&1 >/dev/null || true)
+assert_equals "1" "$([ -n "$_lin_msg" ] && echo 1 || echo 0)" \
+    "an unrepairable schema reports the failure on stderr instead of discarding it"
+assert_equals "1" "$(echo "$_lin_msg" | grep -c 'rm -rf' || true)" \
+    "the failure names the hot-zone reset recovery"
+
+# ── the full pair matrix ──────────────────────────────────────────────────────
+#
+# Driven from the enumerated shape set rather than a chosen sample, so every
+# ordered pair is covered by construction. The rule the migration and wv doctor
+# both apply:
+#   canonical/canonical                      pass, nothing to do
+#   no-table/no-table                        pre-initialisation, nothing to do
+#   both in {canonical, absent, actor-only}  migrate to canonical/canonical
+#   everything else                          fail, leaving the database as it was
+# The mixed no-table pairs are why this exists: a substring postcondition read
+# them as benign and shipped a database that could not sync.
+_lin_shape_cols() {
+    case "$1" in
+        canonical)  printf '%s;%s' "$_LIN_A" "$_LIN_S" ;;
+        reversed)   printf '%s;%s' "$_LIN_S" "$_LIN_A" ;;
+        actor-only) printf '%s' "$_LIN_A" ;;
+        seq-only)   printf '%s' "$_LIN_S" ;;
+        absent)     printf '' ;;
+    esac
+}
+_lin_matrix_fixture() {
+    local _db="$1" _n="$2" _e="$3"
+    _lin_fixture "$_db" "$(_lin_shape_cols "$_n")" "$(_lin_shape_cols "$_e")"
+    [ "$_n" = "no-table" ] && sqlite3 "$_db" "DROP TABLE nodes;"
+    [ "$_e" = "no-table" ] && sqlite3 "$_db" "DROP TABLE edges;"
+    return 0
+}
+_LIN_SHAPES="canonical absent actor-only seq-only reversed no-table"
+for _mn in $_LIN_SHAPES; do
+    for _me in $_LIN_SHAPES; do
+        _lin_matrix_fixture "$_lin_tmp/matrix.db" "$_mn" "$_me"
+        case "$_mn/$_me" in
+            no-table/no-table) _want="0|no-table|no-table" ;;
+            canonical/canonical|canonical/absent|canonical/actor-only|\
+            absent/canonical|absent/absent|absent/actor-only|\
+            actor-only/canonical|actor-only/absent|actor-only/actor-only)
+                _want="0|canonical|canonical" ;;
+            *) _want="1|$_mn|$_me" ;;
+        esac
+        assert_equals "$_want" "$(_lin_migrate "$_lin_tmp/matrix.db")" \
+            "lineage pair ($_mn, $_me)"
+    done
+done
+
+# wv doctor must see the shape too. It reported "accessible, integrity OK" and
+# passed 35 of 38 checks against the broken consumer database while every sync
+# failed, because integrity_check validates pages, not columns.
+_lin_fixture "$_lin_tmp/doctor.db" "$_LIN_A;$_LIN_S" ""
+_lin_doc=$(WV_DB="$_lin_tmp/doctor.db" WV_DB_CUSTOM=1 "$WV" doctor 2>/dev/null | grep -c "lineage schema:.*edges=absent" || true)
+assert_equals "1" "$_lin_doc" "wv doctor fails the lineage-shape check on the broken consumer database"
+_lin_doc_ok=$(WV_DB="$_lin_tmp/bare.db" WV_DB_CUSTOM=1 "$WV" doctor 2>/dev/null | grep -c "lineage schema: nodes and edges carry" || true)
+assert_equals "1" "$_lin_doc_ok" "wv doctor passes the lineage-shape check on a canonical database"
+
+# A mixed no-table pair is a failure, not an advisory. Reading the two shapes
+# independently reported "graph tables not created yet" for a database whose
+# nodes were canonical, whose edges did not exist, and whose every sync aborted.
+_lin_matrix_fixture "$_lin_tmp/doctor-mixed.db" canonical no-table
+_lin_doc_mixed=$(WV_DB="$_lin_tmp/doctor-mixed.db" WV_DB_CUSTOM=1 "$WV" doctor 2>/dev/null | grep -c "lineage schema:.*edges=no-table.*cannot persist" || true)
+assert_equals "1" "$_lin_doc_mixed" \
+    "wv doctor fails a mixed no-table pair instead of calling it pre-initialisation"
+_lin_matrix_fixture "$_lin_tmp/doctor-preinit.db" no-table no-table
+_lin_doc_preinit=$(WV_DB="$_lin_tmp/doctor-preinit.db" WV_DB_CUSTOM=1 "$WV" doctor 2>/dev/null | grep -c "graph tables not created yet" || true)
+assert_equals "1" "$_lin_doc_preinit" \
+    "wv doctor still reports a genuinely pre-initialisation database as an advisory"
+rm -rf "$_lin_tmp"
+
+# cmd_load refuses a snapshot missing a graph table, and leaves the live database
+# alone. It used to warn and replace anyway: the installed database then loaded
+# clean, passed doctor, and failed every sync for the life of that hot zone.
+_lin_load=$(mktemp -d)
+(
+    cd "$_lin_load" && git init -q && git commit -q --allow-empty -m init
+    _LL=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_lin_load" "WV_HOT_ZONE=$_lin_load/hz"
+         "WEAVE_DIR=$_lin_load/.weave" WV_REQUIRE_LEARNING=0 WV_AGENT_ID=load-refusal)
+    "${_LL[@]}" "$WV" init >/dev/null 2>&1
+    "${_LL[@]}" "$WV" add "load refusal probe" --force >/dev/null 2>&1
+    WV_FORCE_SYNC=1 "${_LL[@]}" "$WV" sync >/dev/null 2>&1
+    sqlite3 "$_lin_load/hz/brain.db" "SELECT COUNT(*) FROM nodes;" > "$_lin_load/.before"
+    # A snapshot with no edges table at all.
+    grep -v '^CREATE TABLE edges\|^INSERT INTO edges' "$_lin_load/.weave/state.sql" > "$_lin_load/.weave/state.sql.new"
+    mv "$_lin_load/.weave/state.sql.new" "$_lin_load/.weave/state.sql"
+    "${_LL[@]}" "$WV" load > "$_lin_load/.load.out" 2>&1
+    printf '%s' "$?" > "$_lin_load/.rc"
+    sqlite3 "$_lin_load/hz/brain.db" "SELECT COUNT(*) FROM nodes;" > "$_lin_load/.after" 2>/dev/null || echo unreadable > "$_lin_load/.after"
+) >/dev/null 2>&1 || true
+assert_equals "1" "$(cat "$_lin_load/.rc" 2>/dev/null || echo missing)" \
+    "wv load refuses a snapshot whose graph table is missing"
+assert_equals "1" "$(grep -c 'refusing to load' "$_lin_load/.load.out" 2>/dev/null || true)" \
+    "and says it is refusing rather than warning"
+assert_equals "$(cat "$_lin_load/.before" 2>/dev/null)" "$(cat "$_lin_load/.after" 2>/dev/null)" \
+    "the existing database is left exactly as it was"
+rm -rf "$_lin_load"
+
+# End to end, against the symptom the consumer actually reported: the delta
+# lineage stamp fails, so sync aborts and nothing reaches the git layer.
+_lin_out=$(mktemp -d)
+(
+    cd "$_lin_out" && git init -q && git commit -q --allow-empty -m init
+    _LO=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_lin_out" "WV_HOT_ZONE=$_lin_out/hz" "WEAVE_DIR=$_lin_out/.weave"
+         WV_REQUIRE_LEARNING=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=0 WV_AGENT_ID=lineage-outage)
+    "${_LO[@]}" "$WV" init >/dev/null 2>&1
+    "${_LO[@]}" "$WV" add "outage probe" --force >/dev/null 2>&1
+    # Rebuild edges without lineage columns: the divergence a snapshot that
+    # carried them on nodes alone leaves behind.
+    sqlite3 "$_lin_out/hz/brain.db" <<'SQLBREAK' >/dev/null 2>&1
+PRAGMA foreign_keys=OFF;
+CREATE TABLE edges_new (source TEXT NOT NULL, target TEXT NOT NULL,
+    type TEXT NOT NULL CHECK(type IN ('blocks','relates_to','implements','contradicts','supersedes','references','obsoletes','addresses','resolves')),
+    weight REAL DEFAULT 1.0, context JSON DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(source, target, type));
+INSERT INTO edges_new(source,target,type,weight,context,created_at) SELECT source,target,type,weight,context,created_at FROM edges;
+DROP TABLE edges;
+ALTER TABLE edges_new RENAME TO edges;
+SQLBREAK
+    _rc_before=0
+    WV_FORCE_SYNC=1 "${_LO[@]}" "$WV" sync >/dev/null 2>&1 || _rc_before=$?
+    printf '%s' "$_rc_before" > "$_lin_out/.rc_before"
+    # The consumer's other symptom, same cause one layer up: a prune mutates the
+    # hot DB, auto-sync cannot write state.sql, and commit-refs reports the
+    # mutation as not persisted. A commit sha no object database holds is an
+    # orphaned ref, which is what makes the node prunable.
+    _lin_node=$(sqlite3 "$_lin_out/hz/brain.db" "SELECT id FROM nodes LIMIT 1;" 2>/dev/null)
+    "${_LO[@]}" "$WV" update "$_lin_node" \
+        --metadata '{"commit":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}' >/dev/null 2>&1
+    "${_LO[@]}" "$WV" commit-refs --prune > "$_lin_out/.prune_before" 2>&1 || true
+    WV_DB="$_lin_out/hz/brain.db" bash -c "source '$REPO_ROOT/scripts/lib/wv-db.sh'; db_migrate_lineage" >/dev/null 2>&1
+    _rc_after=0
+    WV_FORCE_SYNC=1 "${_LO[@]}" "$WV" sync >/dev/null 2>&1 || _rc_after=$?
+    printf '%s' "$_rc_after" > "$_lin_out/.rc_after"
+    # A second orphaned ref, because the failed prune already dropped the first
+    # one from the hot DB — the state the "NOT persisted" warning describes.
+    "${_LO[@]}" "$WV" update "$_lin_node" \
+        --metadata '{"commit":"feedfacefeedfacefeedfacefeedfacefeedface"}' >/dev/null 2>&1
+    sha256sum "$_lin_out/.weave/state.sql" | cut -d' ' -f1 > "$_lin_out/.state_before_prune"
+    "${_LO[@]}" "$WV" commit-refs --prune > "$_lin_out/.prune_after" 2>&1 || true
+    sha256sum "$_lin_out/.weave/state.sql" | cut -d' ' -f1 > "$_lin_out/.state_after_prune"
+) >/dev/null 2>&1 || true
+assert_equals "1" "$(cat "$_lin_out/.rc_before" 2>/dev/null || echo missing)" \
+    "the fixture reproduces the reported outage: sync aborts on the partial schema"
+assert_equals "1" "$(grep -c 'NOT persisted' "$_lin_out/.prune_before" 2>/dev/null || true)" \
+    "commit-refs --prune reports a non-persisted mutation on the partial schema"
+assert_equals "0" "$(cat "$_lin_out/.rc_after" 2>/dev/null || echo missing)" \
+    "sync persists again once the migration has repaired the partial schema"
+assert_equals "1" "$(grep -c 'and persisted' "$_lin_out/.prune_after" 2>/dev/null || true)" \
+    "commit-refs --prune persists again after the repair"
+assert_equals "1" "$([ "$(cat "$_lin_out/.state_before_prune" 2>/dev/null)" != "$(cat "$_lin_out/.state_after_prune" 2>/dev/null)" ] && echo 1 || echo 0)" \
+    "the repaired prune changes state.sql rather than only the hot database"
+_lin_persisted=$(grep -c "lineage_actor" "$_lin_out/.weave/state.sql" 2>/dev/null || true)
+assert_equals "1" "$([ "${_lin_persisted:-0}" -ge 1 ] && echo 1 || echo 0)" \
+    "the repaired schema reaches the git layer in state.sql"
+rm -rf "$_lin_out"
 
 echo ""
 

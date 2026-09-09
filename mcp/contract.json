@@ -1,0 +1,180 @@
+{
+  "schema": "weave-mcp-contract.v1",
+  "version": "1.71.0-rc.12",
+  "transport": "stdio",
+  "default_scope": "all",
+  "startup_report_schema": "weave-mcp-startup.v1",
+  "servers": [
+    {
+      "name": "weave",
+      "scope": "all",
+      "intended_clients": ["copilot-chat", "general-mcp"],
+      "lifecycle": "client-managed-stdio",
+      "start_policy": "start with the primary MCP client session; restart by restarting the client",
+      "default": true
+    },
+    {
+      "name": "weave-session",
+      "scope": "session",
+      "intended_clients": ["copilot-chat", "workflow-subagent"],
+      "lifecycle": "client-managed-stdio",
+      "start_policy": "start only for workflow lifecycle clients that need claim, guard, close, or handoff tools",
+      "default": false
+    },
+    {
+      "name": "weave-lite",
+      "scope": "lite",
+      "intended_clients": ["copilot-chat", "codex-optional", "constrained-context-agent"],
+      "lifecycle": "client-managed-stdio",
+      "start_policy": "start only for constrained contexts that need minimal task tracking",
+      "default": false
+    },
+    {
+      "name": "weave-inspect",
+      "scope": "inspect",
+      "intended_clients": ["copilot-chat", "read-only-subagent", "review-subagent"],
+      "lifecycle": "client-managed-stdio",
+      "start_policy": "start only for read-only research, review, audit, or quality inspection clients",
+      "default": false
+    }
+  ],
+  "scopes": {
+    "all": {
+      "tool_count": 46,
+      "purpose": "Full backward-compatible MCP surface for general work",
+      "intended_clients": ["copilot-chat", "general-mcp"],
+      "start_when": "Use as the default server for general interactive work or when a client cannot select narrower scoped servers.",
+      "configured_by_default": true
+    },
+    "graph": {
+      "tool_count": 14,
+      "purpose": "Graph mutation surface for specialised planning/build agents",
+      "intended_clients": ["planning-subagent", "graph-construction-agent"],
+      "start_when": "Optional local server for agents that intentionally create, link, update, or delete graph nodes.",
+      "configured_by_default": false
+    },
+    "session": {
+      "tool_count": 12,
+      "purpose": "Workflow lifecycle surface for claim, guard, close, and session handoff",
+      "intended_clients": ["copilot-chat", "workflow-subagent"],
+      "start_when": "Use for agents whose primary job is claim, edit guard, close, recovery, or session handoff.",
+      "configured_by_default": true
+    },
+    "lite": {
+      "tool_count": 7,
+      "purpose": "Minimal task-tracking surface for constrained contexts",
+      "intended_clients": ["copilot-chat", "codex-optional", "constrained-context-agent"],
+      "start_when": "Use where context budget is tight and only bootstrap/status/work/done/edit-guard basics are needed.",
+      "configured_by_default": true
+    },
+    "inspect": {
+      "tool_count": 23,
+      "purpose": "Read-only observation, search, health, and quality inspection surface",
+      "intended_clients": ["copilot-chat", "read-only-subagent", "review-subagent"],
+      "start_when": "Use for research, review, audit, search, health, quality, and other read-only inspection workflows.",
+      "configured_by_default": true
+    }
+  },
+  "environment": {
+    "required": ["WV_PROJECT_ROOT", "WV_AGENT_ID"],
+    "recommended": ["WV_PATH"],
+    "optional": [
+      "WV_ACTIVE",
+      "WV_MCP_CALL_LOG",
+      "WV_MCP_ALLOW_NETWORK",
+      "WV_MCP_STARTUP_REPORT",
+      "WV_MCP_PATTERNS_LIST_BUDGET_MS"
+    ],
+    "variables": {
+      "WV_PATH": {
+        "description": "Path to the wv CLI binary used by MCP-spawned subprocesses",
+        "default": "Auto-detected"
+      },
+      "WV_PROJECT_ROOT": {
+        "description": "Repository root passed to MCP-spawned wv commands",
+        "default": "Current process cwd"
+      },
+      "WV_AGENT_ID": {
+        "description": "Explicit Weave claim/provenance identity for MCP-spawned wv commands",
+        "default": "Auto-detected, but explicit identity is required by the shipped config contract"
+      },
+      "WV_ACTIVE": {
+        "description": "Active node id inherited by MCP tools",
+        "default": ""
+      },
+      "WV_MCP_CALL_LOG": {
+        "description": "JSONL sink for MCP response telemetry",
+        "default": "Disabled"
+      },
+      "WV_MCP_ALLOW_NETWORK": {
+        "description": "Allow MCP lifecycle tools to run GitHub/network sync directly when set to 1",
+        "default": "0"
+      },
+      "WV_MCP_STARTUP_REPORT": {
+        "description": "Emit structured startup JSON to stderr when set to 1",
+        "default": "0"
+      },
+      "WV_MCP_PATTERNS_LIST_BUDGET_MS": {
+        "description": "Shared timeout budget (ms) for one weave_quality_patterns list call, covering both its own primary invocation and its internal report call combined -- test-only, production deployments should not set this",
+        "default": "60000"
+      }
+    }
+  },
+  "startup_report": {
+    "schema": "weave-mcp-startup.v1",
+    "command": "node mcp/dist/index.js --scope=lite --health-check",
+    "required_fields": [
+      "schema",
+      "status",
+      "code",
+      "detail",
+      "server",
+      "scope",
+      "tools",
+      "pid",
+      "version",
+      "wv_path",
+      "project_root",
+      "agent_id",
+      "allow_network"
+    ],
+    "status_values": ["pass", "fail"],
+    "note": "code and detail are null on a passing (\"pass\") report; on a reported failure code is one of error_codes below and detail is the human-readable message. startup_failure is a process-startup exit (stderr plus exit 1), not a health-check report, because no report can be emitted after an unexpected main() failure."
+  },
+  "status_report": {
+    "command": "wv mcp-status --json",
+    "per_scope_required_fields": ["scope", "expected", "running", "duplicate", "status"],
+    "status_values": ["running", "stale", "unknown"],
+    "semantics": {
+      "running": "Exactly one matching process is visible for the scope.",
+      "stale": "More than one matching process is visible for the scope; restart the client-managed servers.",
+      "unknown": "No matching process is visible. Client-managed stdio servers may be idle, so absence is advisory rather than stale."
+    }
+  },
+  "error_codes": {
+    "invalid_scope": {
+      "exit_code": 2,
+      "meaning": "The --scope value is not one of the supported scopes.",
+      "remediation": "Pass one of: graph, session, inspect, lite, all."
+    },
+    "wv_not_found": {
+      "exit_code": 3,
+      "meaning": "The wv CLI binary could not be located on any known path.",
+      "remediation": "Set WV_PATH to the wv binary, or run ./install.sh so ~/.local/bin/wv exists."
+    },
+    "bad_project_root": {
+      "exit_code": 4,
+      "meaning": "WV_PROJECT_ROOT/WV_PROJECT_DIR is set but does not exist or is not a directory.",
+      "remediation": "Point WV_PROJECT_ROOT at a valid repository checkout, or unset it to fall back to the process cwd."
+    },
+    "startup_failure": {
+      "exit_code": 1,
+      "meaning": "An unexpected exception occurred during MCP server startup (e.g. stdio transport connect failure).",
+      "remediation": "Check stderr for the underlying exception; retry, and file an issue if it recurs."
+    }
+  },
+  "network_policy": {
+    "default": "local-only",
+    "github_sync": "disabled unless WV_MCP_ALLOW_NETWORK=1; otherwise tools return a CLI fallback"
+  }
+}

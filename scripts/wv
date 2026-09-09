@@ -62,11 +62,17 @@ if [ -z "$WV_LIB_DIR" ]; then
 fi
 
 # Source library modules (order matters: config first, then db needs config vars)
+# wv-command-capabilities.sh is generated from contracts/command-capabilities.json
+# and declares what each command touches, whether the run cache may serve it and
+# how the counterweight classifies it. It is data, has no dependencies, and is
+# sourced first so every module below can consult it.
+source "$WV_LIB_DIR/lib/wv-command-capabilities.sh"
 source "$WV_LIB_DIR/lib/wv-config.sh"
 source "$WV_LIB_DIR/lib/wv-db.sh"
 source "$WV_LIB_DIR/lib/wv-validate.sh"
 source "$WV_LIB_DIR/lib/wv-cache.sh"
 source "$WV_LIB_DIR/lib/wv-journal.sh"
+source "$WV_LIB_DIR/lib/wv-attempt-journal.sh"
 source "$WV_LIB_DIR/lib/wv-gh.sh"
 source "$WV_LIB_DIR/lib/wv-delta.sh"
 source "$WV_LIB_DIR/lib/wv-delta-catalog.sh"
@@ -254,7 +260,13 @@ main() {
 
     # Run cache: serve cached stdout for pure-read commands (status, ready, list)
     # Disable with WV_RUN_CACHE=0
-    if [ "${WV_RUN_CACHE:-1}" = "1" ] && _wv_run_cache_is_read_cmd "$cmd"; then
+    #
+    # Classified at command level: the empty suboperation resolves the command's
+    # own registry row, which dominance guarantees is never weaker than any
+    # refinement beneath it. Resolving the refinement here would need the same
+    # argv parse the dispatcher does not yet do; that arrives with the attempt
+    # journal (wv-eb3c76), which resolves once and records what it resolved.
+    if [ "${WV_RUN_CACHE:-1}" = "1" ] && _wv_cap_serve "$cmd" ""; then
         wv_run_cache_wrap _wv_dispatch "$@"
         return $?
     fi
@@ -263,7 +275,7 @@ main() {
     _wv_dispatch "$@" || rc=$?
 
     # Invalidate run cache after successful writes
-    if [ "$rc" -eq 0 ] && _wv_run_cache_is_write_cmd "$cmd"; then
+    if [ "$rc" -eq 0 ] && _wv_cap_invalidate "$cmd" ""; then
         wv_run_cache_invalidate
     fi
 
@@ -294,10 +306,13 @@ main() {
 # values are replaced by "<redacted:N>" (their byte length); --option=value is represented as
 # --option=<redacted:N>. This keeps free text and secrets out of the log regardless of length.
 #
-# graph_identity_before/after are SHA-256 fingerprints of ordered nodes, edges, and node-file
-# attribution read in one SQLite transaction. Unlike connection-local PRAGMA data_version, the
-# fingerprint remains comparable across the separate wrapper connections used before and after a
-# call. Falls back to the shared unavailable marker
+# graph_identity_before/after carry the composite causal identity: one SHA-256 over the ordered
+# rows and their lineage, tombstones, node-file attribution, the cutover marker, the cutover
+# authorization manifest and the delta-catalog frontier (see _wv_causal_identity_json). The field
+# names predate the widening and are kept so existing readers keep working; what changed is that
+# the value no longer stands still for a tombstone, a cutover or an arriving delta. Unlike
+# connection-local PRAGMA data_version, it remains comparable across the separate wrapper
+# connections used before and after a call. Falls back to the shared unavailable marker
 # {"status":"unavailable","reason":...,"provenance":"wv_call_log"} when $WV_DB does not yet
 # exist or sqlite3/sha256sum is missing; opening the file only in that guarded path (never blind)
 # avoids sqlite3's create-on-open side effect. trace_id uses WV_TRACE_ID when supplied, otherwise
@@ -308,34 +323,20 @@ main() {
 # Enable:  wv config enable session-analysis
 # Analyse: wv analyze sessions --call-stats [--source=agent|mcp|shell|hook|sync|test]
 # Zero overhead when unset.
+#
+# The attempt journal (scripts/lib/wv-attempt-journal.sh) shares this wrapper but not its
+# contract: WV_ATTEMPT_JOURNAL names its path, WV_EVIDENCE_MODE=1 makes it mandatory and
+# fail-closed, and it records call_started before dispatch so a killed call leaves an explicit
+# incomplete attempt. The call log stays opt-in and best-effort either way.
 
-if [[ -n "${WV_CALL_LOG:-}" ]]; then
-    _wv_json_escape() {
-        local value="${1:-}" result="" char escaped
-        local index code
-        for ((index = 0; index < ${#value}; index++)); do
-            char="${value:index:1}"
-            case "$char" in
-                \\) result+='\\' ;;
-                '"') result+='\"' ;;
-                $'\b') result+='\b' ;;
-                $'\f') result+='\f' ;;
-                $'\n') result+='\n' ;;
-                $'\r') result+='\r' ;;
-                $'\t') result+='\t' ;;
-                *)
-                    printf -v code '%d' "'$char"
-                    if [ "$code" -lt 32 ]; then
-                        printf -v escaped '\\u%04x' "$code"
-                        result+="$escaped"
-                    else
-                        result+="$char"
-                    fi
-                    ;;
-            esac
-        done
-        printf '%s' "$result"
-    }
+# The wrapper runs for the analytics call log, for the attempt journal, or for
+# evidence mode. Each surface is emitted under its own condition inside: sharing
+# the wrapper is what lets both see the same call identity and the same causal
+# identity, rather than each computing its own and disagreeing.
+if [[ -n "${WV_CALL_LOG:-}" ]] || wv_attempt_journal_enabled; then
+    # Defined once in wv-attempt-journal.sh so the call log and the journal cannot
+    # escape differently; the old name stays because every printf below uses it.
+    _wv_json_escape() { wv_json_escape "$@"; }
     _wv_generate_call_id() {
         if command -v uuidgen >/dev/null 2>&1; then
             uuidgen
@@ -350,45 +351,151 @@ if [[ -n "${WV_CALL_LOG:-}" ]]; then
     _wv_unavailable_json() {
         printf '{"status":"unavailable","reason":"%s","provenance":"wv_call_log"}' "$(_wv_json_escape "$1")"
     }
-    _wv_graph_identity_json() {
-        if [[ -n "${WV_DB:-}" && -f "$WV_DB" ]] \
-            && command -v sqlite3 >/dev/null 2>&1 \
-            && command -v sha256sum >/dev/null 2>&1; then
-            local snapshot fingerprint
-            snapshot=$(sqlite3 -readonly "$WV_DB" 2>/dev/null <<'SQL'
+    # ── Composite causal identity (wv-62bb60) ──────────────────────────────
+    # ONE value over everything that can change what the graph causally IS: the
+    # rows, the lineage stamped on them, the tombstones that record what is gone,
+    # the cutover marker, the cutover authorization manifest, and the
+    # delta-catalog frontier. It replaces a fingerprint over nodes, edges and
+    # node_files alone -- which moved for a text edit but not for a tombstone, a
+    # cutover, or an arriving delta -- and it is deliberately a single value: the
+    # failure mode being closed is a growing set of ad hoc hashes, each covering
+    # one input and none of them the identity.
+    #
+    # Components are labelled lines, and a missing component contributes an
+    # explicit "absent" line rather than nothing, so a component that is absent
+    # and a component that contributed the empty string cannot collide. The
+    # authorization manifest has no writer yet; hashing its absence now means the
+    # day it appears, the identity moves.
+    _WV_CAUSAL_IDENTITY_FORMAT="weave.causal-identity.v1"
+    _wv_identity_file_line() {
+        local label="$1" path="$2" hash
+        if [ -f "$path" ]; then
+            hash=$(sha256sum -- "$path" 2>/dev/null | awk '{print $1}') || return 1
+            [ -n "$hash" ] || return 1
+            printf '%s\tpresent\t%s\n' "$label" "$hash"
+        else
+            printf '%s\tabsent\n' "$label"
+        fi
+    }
+    _wv_identity_delta_frontier_line() {
+        local root="$1" cache listing signature count digest cached_signature cached_digest
+        if [ ! -d "$root" ]; then
+            printf 'delta_catalog_frontier\tabsent\n'
+            return 0
+        fi
+        # The identity covers delta CONTENT, not just which paths exist. Paths
+        # alone rested on an invariant the repository states and does not enforce:
+        # rewrite a delta in place and a path-only frontier stands still, which is
+        # exactly the mutation a causal identity must not miss.
+        #
+        # Contents are not re-read on every call. The cache key is a metadata
+        # signature (path, size, mtime) over the catalog; when it is unchanged the
+        # stored content digest is reused. Cost is a stat walk in the common case
+        # and a full rehash only when the catalog actually moved. RESIDUAL: a
+        # rewrite that preserves path, size AND mtime within one hot-zone lifetime
+        # reuses the cached digest. The hot zone is tmpfs, so the window closes at
+        # reboot, and a Delta v2 file carries its own operation_sha256 for an
+        # independent check.
+        # Staging directories are excluded. They are PID-scoped scratch under the
+        # deltas root that no peer can ever see, so hashing them made the
+        # machine's causal identity depend on whether some earlier sync happened
+        # to leave one behind -- identity drift with no graph change behind it.
+        # Only published files belong in a frontier that describes what this
+        # machine can hand to another.
+        listing=$(LC_ALL=C find -P "$root" -type f -not -path '*/.staging-*' -printf '%P\t%s\t%T@\n' 2>/dev/null | LC_ALL=C sort) || return 1
+        count=$(printf '%s\n' "$listing" | grep -c . || true)
+        signature=$(printf '%s\n' "$listing" | sha256sum | awk '{print $1}') || return 1
+        cache="${WV_HOT_ZONE:-${TMPDIR:-/tmp}}/delta-catalog-digest"
+        if [ -r "$cache" ]; then
+            read -r cached_signature cached_digest < "$cache" 2>/dev/null || true
+            if [ "${cached_signature:-}" = "$signature" ] && [ -n "${cached_digest:-}" ]; then
+                printf 'delta_catalog_frontier\tpresent\t%s\t%s\n' "$count" "$cached_digest"
+                return 0
+            fi
+        fi
+        digest=$( (cd "$root" && LC_ALL=C find -P . -type f -not -path '*/.staging-*' -printf '%P\0' 2>/dev/null | LC_ALL=C sort -z | xargs -0 -r sha256sum) \
+            | awk '{printf "%s\t%s\n", $2, $1}' | LC_ALL=C sort | sha256sum | awk '{print $1}') || return 1
+        { mkdir -p "$(dirname "$cache")" && printf '%s %s\n' "$signature" "$digest" > "$cache"; } 2>/dev/null || true
+        printf 'delta_catalog_frontier\tpresent\t%s\t%s\n' "$count" "$digest"
+    }
+    _wv_causal_identity_json() {
+        local weave_dir="${WEAVE_DIR:-}"
+        if [[ -z "${WV_DB:-}" || ! -f "$WV_DB" ]] \
+            || ! command -v sqlite3 >/dev/null 2>&1 \
+            || ! command -v sha256sum >/dev/null 2>&1; then
+            _wv_unavailable_json "WV_DB not resolvable or causal identity tools unavailable"
+            return 0
+        fi
+        if [[ -z "$weave_dir" || ! -d "$weave_dir" ]]; then
+            _wv_unavailable_json "repository .weave directory not resolvable"
+            return 0
+        fi
+        local snapshot rows components identity
+        snapshot=$(sqlite3 -readonly "$WV_DB" 2>/dev/null <<'SQL'
 BEGIN;
-SELECT json_array('node', id, text, status, json(metadata), alias, created_at, updated_at)
+SELECT json_array('node', id, text, status, json(metadata), alias, created_at, updated_at,
+                  lineage_actor, lineage_seq)
 FROM nodes ORDER BY id;
-SELECT json_array('edge', source, target, type, weight, json(context), created_at)
+SELECT json_array('edge', source, target, type, weight, json(context), created_at,
+                  lineage_actor, lineage_seq)
 FROM edges ORDER BY source, target, type;
 SELECT json_array('node_file', node_id, path)
 FROM node_files ORDER BY node_id, path;
+SELECT json_array('tombstone', kind, id, lineage_seq, lineage_actor)
+FROM tombstones ORDER BY kind, id;
 COMMIT;
 SQL
-            ) || {
-                _wv_unavailable_json "graph fingerprint query failed"
-                return 0
-            }
-            fingerprint=$(printf '%s' "$snapshot" | sha256sum | awk '{print $1}')
-            if [[ "$fingerprint" =~ ^[a-f0-9]{64}$ ]]; then
-                printf '{"kind":"sqlite_graph_fingerprint","value":"sha256:%s"}' "$fingerprint"
-                return 0
-            fi
-            _wv_unavailable_json "graph fingerprint hashing failed"
+        ) || {
+            _wv_unavailable_json "causal identity query failed"
+            return 0
+        }
+        rows=$(printf '%s' "$snapshot" | sha256sum | awk '{print $1}') || {
+            _wv_unavailable_json "causal identity hashing failed"
+            return 0
+        }
+        components=$(
+            printf '%s\n' "$_WV_CAUSAL_IDENTITY_FORMAT"
+            printf 'graph_rows\t%s\n' "$rows"
+            _wv_identity_file_line cutover_marker "$weave_dir/${WV_CUTOVER_MARKER_FILE:-causal-cutover}"
+            _wv_identity_file_line cutover_authorization_manifest \
+                "$weave_dir/${WV_CUTOVER_AUTHORIZATION_FILE:-cutover-authorization.json}"
+            _wv_identity_delta_frontier_line "$weave_dir/deltas"
+        ) || {
+            _wv_unavailable_json "causal identity component read failed"
+            return 0
+        }
+        identity=$(printf '%s\n' "$components" | sha256sum | awk '{print $1}')
+        if [[ "$identity" =~ ^[a-f0-9]{64}$ ]]; then
+            printf '{"kind":"composite_causal_identity","format":"%s","covers":["graph_rows","lineage","tombstones","cutover_marker","cutover_authorization_manifest","delta_catalog_frontier"],"value":"sha256:%s"}' \
+                "$_WV_CAUSAL_IDENTITY_FORMAT" "$identity"
             return 0
         fi
-        _wv_unavailable_json "WV_DB not resolvable or graph fingerprint tools unavailable"
+        _wv_unavailable_json "causal identity hashing failed"
     }
+    # An operation name is not a secret, but an unrecognized first argument might
+    # be: it is whatever the user typed. The set of names that are NOT secret is
+    # exactly the dispatch table, which the capability registry already declares
+    # in full and pattern-audit already checks for totality -- so ask it, rather
+    # than keep a fourth list that drifts. It drifted: cutover and repo-class were
+    # dispatched for months and logged as <redacted:N> in every line, which is how
+    # the E1 denominator lost two mutating commands.
+    #
+    # The four tokens below are not dispatch entries and never will be: they are
+    # help and version flags handled before dispatch. They are named here because
+    # a registry row would assert they are commands.
     _wv_normalized_operation() {
         local operation="${1:-help}"
         case "$operation" in
-            init|add|remember|memory|done|batch-done|bulk-update|delete|work|ready|list|show|status|pending-close|update|touch|allowed-tools|quick|ship|ship-agent|block|link|unlink|resolve|related|edges|path|tree|context|impact|discover|batch|plan|enrich-topology|sync|load|compact|prune|unarchive|clean-ghosts|commit-refs|learnings|refs|import|search|reindex|trails|breadcrumbs|bootstrap|bootstrap-agent|doctor|hotzone|test-record|test-status|self-update|uninstall|recover|selftest|mcp-status|health|cache|preflight|digest|overview|session-summary|audit-pitfalls|pattern-audit|edge-types|guide|init-repo|config|quality|findings|validate-finding|analyze|index|query|hook|help|--help|-h|version|--version|-v)
+            help|--help|-h|version|--version|-v)
                 printf '%s' "$operation"
-                ;;
-            *)
-                printf '<redacted:%s>' "$(_wv_byte_length "$operation")"
+                return 0
                 ;;
         esac
+        if _wv_cap_known "$operation" 2>/dev/null; then
+            printf '%s' "$operation"
+        else
+            printf '<redacted:%s>' "$(_wv_byte_length "$operation")"
+        fi
     }
     _wv_known_option() {
         case "$1" in
@@ -471,23 +578,47 @@ SQL
         done
         printf ']'
     }
-    _wv_ts_start=$(date +%s%3N)
-    _wv_ts_epoch=$(date +%s.%6N)
-    _wv_argv=$(_wv_argv_json "$@")
-    _wv_graph_before=$(_wv_graph_identity_json)
-    _wv_out=$(mktemp -t wv-calllog-XXXXXX)
-    _wv_err=$(mktemp -t wv-calllog-err-XXXXXX)
-    _wv_exit=0
-    set +e
-    main "$@" > >( tee "$_wv_out" ) 2> >( tee "$_wv_err" >&2 )
-    _wv_exit=$?
-    set -e
-    _wv_graph_after=$(_wv_graph_identity_json)
-    _wv_ts_end=$(date +%s%3N)
-    _wv_elapsed=$((_wv_ts_end - _wv_ts_start))
-    _wv_stdout_bytes=$(wc -c < "$_wv_out")
-    _wv_stderr_bytes=$(wc -c < "$_wv_err")
-    rm -f "$_wv_out" "$_wv_err"
+    # Resolved classification, taken from the registry projection once. The
+    # journal records what dispatch resolved rather than the command word, so no
+    # reader re-derives a taxonomy: a second resolver is exactly the drift the
+    # registry replaced.
+    _wv_resolve_suboperation() {
+        case "${2:-}" in
+            ""|-*) return 0 ;;
+        esac
+        _wv_cap_refines "$1" "$2" && printf '%s' "$2"
+        return 0
+    }
+    _wv_targets_json() {
+        local targets target first=1
+        targets=$(_wv_cap_targets "$1" "${2:-}" 2>/dev/null) || targets=""
+        printf '['
+        for target in $targets; do
+            [ "$first" -eq 1 ] || printf ','
+            first=0
+            printf '"%s"' "$(_wv_json_escape "$target")"
+        done
+        printf ']'
+    }
+    # The call's policy provenance, stated rather than implied. A call with no
+    # verdict is NOT an allow: until every gate that can decide emits rule,
+    # decision and would_violate_invariant, no call is countable on policy
+    # provenance, and saying so explicitly is the difference between missing
+    # evidence and fabricated evidence.
+    _wv_policy_json() {
+        local verdicts state reason
+        verdicts=$(wv_attempt_verdict_count)
+        if [ "${verdicts:-0}" -eq 0 ]; then
+            state="unavailable"
+            reason="no gate emitted a verdict for this call; gate coverage is incomplete, so silence is not an allow"
+        else
+            state="partial"
+            reason="the verdicts recorded for this call are complete, but gate coverage across wv is not, so the call is still not countable"
+        fi
+        printf '{"state":"%s","countable":false,"verdicts":%s,"reason":"%s"}' \
+            "$state" "${verdicts:-0}" "$(wv_json_escape "$reason")"
+    }
+
     # Provenance precedence: an explicit WV_CALL_SOURCE always wins (agent via
     # Claude Code settings.json, mcp via the MCP server, hook/sync/test via their
     # setters). Only when unset do we attest direct model origin for harnesses that
@@ -506,16 +637,124 @@ SQL
         _wv_source="shell"
     fi
     _wv_repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
-    _wv_call_id="${WV_CALL_ID:-$(_wv_generate_call_id)}"
+    # BEFORE dispatch, and exported: a gate that runs inside the call needs an
+    # identity to attach its verdict to, and one assigned after the command has
+    # already run is not that.
+    #
+    # Exporting it means a wv launched underneath this one inherits it, and the
+    # first version of this let the child adopt the parent's identity outright:
+    # two call_started events under one call_id, and -- because the verdict
+    # marker is keyed on that id and reset at both ends of every call -- a nested
+    # call silently deleting the outer call's policy verdicts. wv quick alone
+    # reaches that through its own pre-commit hook.
+    #
+    # WV_CALL_ID_OWNER is what separates the two cases an inherited variable
+    # cannot distinguish on its own. A harness that pins WV_CALL_ID for a root
+    # call sets no owner, so the id is honoured as given. A wv process stamps
+    # itself as owner, so a descendant sees an owner that is not its own process
+    # and mints a fresh identity, keeping the inherited one as parent_call_id.
+    # Scoping the marker to the process instead would stop the deletion and
+    # leave the duplicate identities, which is the half that corrupts counting.
+    _wv_parent_call_id=""
+    if [ -n "${WV_CALL_ID:-}" ] && [ -n "${WV_CALL_ID_OWNER:-}" ] && [ "$WV_CALL_ID_OWNER" != "$$" ]; then
+        _wv_parent_call_id="$WV_CALL_ID"
+        _wv_call_id=$(_wv_generate_call_id)
+    else
+        _wv_call_id="${WV_CALL_ID:-$(_wv_generate_call_id)}"
+    fi
+    export WV_CALL_ID="$_wv_call_id"
+    export WV_CALL_ID_OWNER="$$"
     _wv_workflow_id="${WV_WORKFLOW_ID:-}"
     _wv_trace_id="${WV_TRACE_ID:-${_wv_workflow_id:-$_wv_call_id}}"
-    _wv_cmd=$(_wv_normalized_operation "${1:-help}")
-    _wv_policy_revision=$(_wv_unavailable_json "no live host adapter emits an authoritative policy revision (wv-426134)")
-    # Braced group: stderr is silenced before the >> open is attempted, so an
-    # unwritable log path (read-only FS, missing dir) cannot leak bash errors.
-    { printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"%s","call_id":"%s","workflow_id":"%s","trace_id":"%s","repo_root":"%s","exit_status":%d,"argv":%s,"graph_identity_before":%s,"graph_identity_after":%s,"policy_revision":%s}\n' \
-        "$_wv_ts_epoch" "$(_wv_json_escape "$_wv_cmd")" "$_wv_stdout_bytes" "$_wv_stderr_bytes" "$_wv_elapsed" "$(_wv_json_escape "$_wv_source")" "$(_wv_json_escape "$_wv_call_id")" "$(_wv_json_escape "$_wv_workflow_id")" "$(_wv_json_escape "$_wv_trace_id")" "$(_wv_json_escape "$_wv_repo_root")" "$_wv_exit" "$_wv_argv" "$_wv_graph_before" "$_wv_graph_after" "$_wv_policy_revision" \
-        >> "$WV_CALL_LOG"; } 2>/dev/null || true
+    _wv_operation=$(_wv_normalized_operation "${1:-help}")
+    _wv_suboperation=$(_wv_resolve_suboperation "${1:-help}" "${2:-}")
+    _wv_evidence_class=$(_wv_cap_evidence_class "${1:-help}" "$_wv_suboperation" 2>/dev/null) || _wv_evidence_class="unclassified"
+    _wv_targets=$(_wv_targets_json "${1:-help}" "$_wv_suboperation")
+    _wv_ts_start=$(date +%s%3N)
+    _wv_ts_epoch=$(date +%s.%6N)
+    _wv_argv=$(_wv_argv_json "$@")
+    _wv_graph_before=$(_wv_causal_identity_json)
+
+    # One context, set once: every event carries the same envelope because no call
+    # site assembles one. wv_attempt_emit fails the call closed by itself under
+    # evidence mode, so a caller cannot discard the failure.
+    wv_attempt_context "$_wv_call_id" "$_wv_workflow_id" "$_wv_trace_id" "$_wv_source" \
+        "$_wv_repo_root" "$_wv_operation" "$_wv_suboperation" "$_wv_evidence_class" \
+        "$_wv_targets" "${WV_CAPABILITIES_IDENTITY:+sha256:$WV_CAPABILITIES_IDENTITY}" \
+        "${WV_CAPABILITIES_SCHEMA:-}" "$_wv_graph_before" "$_wv_parent_call_id"
+    wv_attempt_verdicts_reset
+
+    # Durable before dispatch, so a call killed at any point after this leaves an
+    # explicit incomplete attempt rather than silence.
+    wv_attempt_emit call_started disposition=incomplete "argv:=$_wv_argv" || exit 1
+
+    _wv_out=$(mktemp -t wv-calllog-XXXXXX)
+    _wv_err=$(mktemp -t wv-calllog-err-XXXXXX)
+
+    # Everything after dispatch runs from an EXIT trap, not after `main` returns.
+    # A command that calls exit directly -- wv config get on a missing key is one
+    # -- never comes back to the caller, and before this the call simply vanished
+    # from both surfaces: no completion event, no analytics row, and an attempt
+    # that looked killed. The trap makes completion the property of the process
+    # ending rather than of main being well behaved.
+    _wv_finalize() {
+        local rc=$?
+        [ -n "${_WV_FINALIZED:-}" ] && return "$rc"
+        _WV_FINALIZED=1
+        _wv_exit="$rc"
+        _wv_graph_after=$(_wv_causal_identity_json)
+        _wv_ts_end=$(date +%s%3N)
+        _wv_elapsed=$((_wv_ts_end - _wv_ts_start))
+        _wv_stdout_bytes=$(wc -c < "$_wv_out" 2>/dev/null || echo 0)
+        _wv_stderr_bytes=$(wc -c < "$_wv_err" 2>/dev/null || echo 0)
+        rm -f "$_wv_out" "$_wv_err"
+
+        # What a mutation-class call did to durable state, derived from the two
+        # identities rather than declared. A failed call that moved the identity
+        # anyway is the interesting case, and it is visible here instead of being
+        # reported as simply failed.
+        if [ "$_wv_evidence_class" = "mutation_attempt" ]; then
+            if [ "$_wv_graph_before" = "$_wv_graph_after" ]; then
+                _wv_disposition="unchanged"
+            else
+                _wv_disposition="changed"
+            fi
+            wv_attempt_emit mutation_disposition \
+                "disposition=$_wv_disposition" "exit_status:=$_wv_exit" \
+                "causal_identity_after:=$_wv_graph_after" || exit 1
+        fi
+        wv_attempt_emit call_completed disposition=complete \
+            "exit_status:=$_wv_exit" "elapsed_ms:=$_wv_elapsed" \
+            "causal_identity_after:=$_wv_graph_after" \
+            "policy:=$(_wv_policy_json)" || exit 1
+        wv_attempt_verdicts_reset
+
+        _wv_cmd="$_wv_operation"
+        _wv_policy_revision=$(_wv_unavailable_json "no live host adapter emits an authoritative policy revision (wv-426134)")
+        # Analytics stays opt-in and best-effort: the journal above is the surface
+        # that fails closed, and coupling them would make enabling analytics change
+        # evidence semantics.
+        # parent_call_id is carried on both surfaces or on neither: an analytics
+        # reader reconstructing a call tree from one and the journal from the
+        # other would disagree about which calls had parents.
+        _wv_parent_json="null"
+        [ -n "${_wv_parent_call_id:-}" ] &&
+            _wv_parent_json="\"$(_wv_json_escape "$_wv_parent_call_id")\""
+        [[ -n "${WV_CALL_LOG:-}" ]] &&
+        # Braced group: stderr is silenced before the >> open is attempted, so an
+        # unwritable log path (read-only FS, missing dir) cannot leak bash errors.
+        { printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"%s","call_id":"%s","parent_call_id":%s,"workflow_id":"%s","trace_id":"%s","repo_root":"%s","exit_status":%d,"argv":%s,"graph_identity_before":%s,"graph_identity_after":%s,"policy_revision":%s}\n' \
+            "$_wv_ts_epoch" "$(_wv_json_escape "$_wv_cmd")" "$_wv_stdout_bytes" "$_wv_stderr_bytes" "$_wv_elapsed" "$(_wv_json_escape "$_wv_source")" "$(_wv_json_escape "$_wv_call_id")" "$_wv_parent_json" "$(_wv_json_escape "$_wv_workflow_id")" "$(_wv_json_escape "$_wv_trace_id")" "$(_wv_json_escape "$_wv_repo_root")" "$_wv_exit" "$_wv_argv" "$_wv_graph_before" "$_wv_graph_after" "$_wv_policy_revision" \
+            >> "$WV_CALL_LOG"; } 2>/dev/null || true
+        return "$rc"
+    }
+    trap '_wv_finalize' EXIT
+
+    _wv_exit=0
+    set +e
+    main "$@" > >( tee "$_wv_out" ) 2> >( tee "$_wv_err" >&2 )
+    _wv_exit=$?
+    set -e
     exit "$_wv_exit"
 else
     main "$@"

@@ -3501,6 +3501,38 @@ cmd_doctor() {
         _doctor_record "database" "warn" "no active database"
     fi
 
+    # 10a. Writer-lineage schema shape.
+    #
+    # PRAGMA integrity_check validates the pages against themselves; it says
+    # nothing about whether the columns the delta writer needs are there. During
+    # the rc.11 consumer outage (wv-e1556b) this command reported "database:
+    # accessible, integrity OK" and passed 35 of 38 checks while every wv sync
+    # aborted on `no such column: lineage_seq` — nodes was migrated, edges was
+    # not, and nothing here looked. Shape is asked of db_lineage_shape, the same
+    # classifier db_migrate_lineage repairs from, so doctor and the migration
+    # cannot disagree about the database in front of them.
+    if [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ]; then
+        local _lin_nodes _lin_edges
+        _lin_nodes=$(db_lineage_shape nodes)
+        _lin_edges=$(db_lineage_shape edges)
+        # One verdict for the pair, from the same classifier the migration uses.
+        # Reading the two shapes independently — an `||` on no-table — passed a
+        # database whose nodes were canonical and whose edges did not exist,
+        # while sync aborted and commit-refs could not persist. A table that has
+        # not been created is benign only when neither has.
+        case "$(db_lineage_pair_verdict "$_lin_nodes" "$_lin_edges")" in
+        canonical)
+            _doctor_record "lineage schema" "pass" "nodes and edges carry (lineage_actor, lineage_seq)"
+            ;;
+        preinit)
+            _doctor_record "lineage schema" "warn" "graph tables not created yet (nodes=$_lin_nodes, edges=$_lin_edges)"
+            ;;
+        *)
+            _doctor_record "lineage schema" "fail" "nodes=$_lin_nodes, edges=$_lin_edges — sync and commit-refs cannot persist; recover with: rm -rf \"\$WV_HOT_ZONE\" && wv load"
+            ;;
+        esac
+    fi
+
     # 10b. FTS5 index integrity.
     #
     # Two probes, because they catch different things and the cheap one is blind
@@ -4063,6 +4095,17 @@ _mcp_scope_statuses() { # contract_path process_lines
     local contract_path="$1" process_lines="$2"
     local scope expected running duplicate status entries=""
 
+    # An unreadable authority ends this, rather than falling through the loop
+    # and printing []. The empty array was indistinguishable from "the contract
+    # declares no scopes", so a consumer with no contract at all was told its
+    # servers were missing instead of that the contract was.
+    if [ -z "$contract_path" ] || [ ! -f "$contract_path" ]; then
+        return 1
+    fi
+    if ! jq -e '.scopes | type == "object"' "$contract_path" >/dev/null 2>&1; then
+        return 1
+    fi
+
     while IFS= read -r scope; do
         [ -n "$scope" ] || continue
         expected=$(jq -r --arg scope "$scope" '.scopes[$scope].configured_by_default // false' "$contract_path")
@@ -4127,11 +4170,29 @@ cmd_mcp_status() {
         fi
     }
 
+    # The MCP contract is an installed asset, not a file in the repository being
+    # inspected. It was read as "$REPO_ROOT/mcp/contract.json", which exists in
+    # this development checkout and in no consumer: the VS Code check then
+    # silently validated nothing and the scope table came back empty, so
+    # mcp-status reported "no server visible" about a machine whose servers it
+    # had never looked for. Installed copy first, source tree only as a
+    # development fallback, and no third answer -- a missing authority is
+    # reported, never assumed empty.
+    _mcp_contract_path() {
+        local candidate
+        for candidate in "${WV_LIB_DIR:-}/mcp/contract.json" "$REPO_ROOT/mcp/contract.json"; do
+            case "$candidate" in /mcp/contract.json) continue ;; esac
+            [ -f "$candidate" ] && { printf '%s' "$candidate"; return 0; }
+        done
+        return 1
+    }
+
     _mcp_check_vscode_config() {
         local config_path="$1"
         local config_label="$2"
         local missing=()
-        local contract_path="$REPO_ROOT/mcp/contract.json"
+        local contract_path
+        contract_path=$(_mcp_contract_path) || contract_path=""
 
         if command -v jq >/dev/null 2>&1 && [ -f "$contract_path" ]; then
             local expected_names required_env
@@ -4236,18 +4297,26 @@ cmd_mcp_status() {
 
     # 5. Live process visibility. VS Code/Copilot owns stdio server lifetimes, so
     # absence is advisory, while extra same-scope processes are a stale-server smell.
-    local process_lines process_count duplicate_scope per_scope scope_summary
+    local process_lines process_count duplicate_scope per_scope scope_summary contract_path
     process_lines=$(pgrep -af 'mcp/dist/index.js|weave-mcp|node .*weave' 2>/dev/null | grep -v 'pgrep -af' || true)
-    per_scope=$(_mcp_scope_statuses "$REPO_ROOT/mcp/contract.json" "$process_lines")
-    process_count=$(jq '[.[].running] | add // 0' <<<"$per_scope")
-    duplicate_scope=$(jq -r '[.[] | select(.duplicate) | "\(.scope):\(.running)"] | join(",")' <<<"$per_scope")
-    scope_summary=$(jq -r '[.[] | "\(.scope) \(if .expected then "expected" else "optional" end)/\(.status) (\(.running))"] | join(", ")' <<<"$per_scope")
-    if [ "$process_count" -eq 0 ] 2>/dev/null; then
-        _mcp_record "server processes" "warn" "$scope_summary — no server visible; start or restart the MCP client if tools are unavailable"
-    elif [ -n "$duplicate_scope" ]; then
-        _mcp_record "server processes" "warn" "$scope_summary — restart duplicate scope(s) ${duplicate_scope} to clear stale instances"
+    contract_path=$(_mcp_contract_path) || contract_path=""
+    if ! per_scope=$(_mcp_scope_statuses "$contract_path" "$process_lines"); then
+        # Said out loud. Reporting "no server visible" here would be a claim
+        # about this machine's servers made without ever reading the contract
+        # that names them.
+        _mcp_record "server processes" "fail" \
+            "MCP contract unavailable — reinstall weave (expected ${WV_LIB_DIR:-\$WV_LIB_DIR}/mcp/contract.json); scope status cannot be determined"
     else
-        _mcp_record "server processes" "pass" "$scope_summary"
+        process_count=$(jq '[.[].running] | add // 0' <<<"$per_scope")
+        duplicate_scope=$(jq -r '[.[] | select(.duplicate) | "\(.scope):\(.running)"] | join(",")' <<<"$per_scope")
+        scope_summary=$(jq -r '[.[] | "\(.scope) \(if .expected then "expected" else "optional" end)/\(.status) (\(.running))"] | join(", ")' <<<"$per_scope")
+        if [ "$process_count" -eq 0 ] 2>/dev/null; then
+            _mcp_record "server processes" "warn" "$scope_summary — no server visible; start or restart the MCP client if tools are unavailable"
+        elif [ -n "$duplicate_scope" ]; then
+            _mcp_record "server processes" "warn" "$scope_summary — restart duplicate scope(s) ${duplicate_scope} to clear stale instances"
+        else
+            _mcp_record "server processes" "pass" "$scope_summary"
+        fi
     fi
 
     # Summary
@@ -5572,12 +5641,12 @@ cmd_pattern_audit() {
     local issues=0
     local findings_json="[]"
 
-    # ── Check 1: cache write-list completeness ──────────────────────────────
-    # Every command in the dispatch table must be in one of:
-    #   read (_wv_run_cache_is_read_cmd)
-    #   write (_wv_run_cache_is_write_cmd)
-    #   exempt (_wv_run_cache_is_exempt_cmd)
-    # Unclassified commands are a latent cache-invalidation bug.
+    # ── Check 1: capability registry totality ───────────────────────────────
+    # Every command in the dispatch table must have a row in
+    # contracts/command-capabilities.json, which _wv_cap_known projects. An
+    # unclassified command is a latent cache-invalidation bug and an evidence
+    # hole at once: nothing decides whether the run cache may serve it, and E1
+    # cannot say whether it mutates.
 
     # Self-reference the checkout actually running this check, not whatever
     # "wv" happens to resolve on PATH — a stale/newer installed binary can
@@ -5593,9 +5662,7 @@ cmd_pattern_audit() {
     if [ -f "$wv_script" ]; then
         while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
-            if ! _wv_run_cache_is_read_cmd "$cmd" 2>/dev/null && \
-               ! _wv_run_cache_is_write_cmd "$cmd" 2>/dev/null && \
-               ! _wv_run_cache_is_exempt_cmd "$cmd" 2>/dev/null; then
+            if ! _wv_cap_known "$cmd" 2>/dev/null; then
                 unclassified_cmds="${unclassified_cmds:+$unclassified_cmds|}$cmd"
             fi
         done < <(grep -E '^\s+[a-z][a-zA-Z_-]+\)' "$wv_script" \
@@ -5608,9 +5675,10 @@ cmd_pattern_audit() {
         local unclassified_list
         unclassified_list=$(echo "$unclassified_cmds" | tr '|' '\n' | sort)
         if [ "$format" = "text" ]; then
-            echo -e "${RED}✗ Check 1 FAIL: unclassified commands (not in read/write/exempt list):${NC}"
+            echo -e "${RED}✗ Check 1 FAIL: commands with no capability registry row:${NC}"
             echo "$unclassified_list" | while read -r c; do echo "    $c"; done
-            echo -e "  Add to _wv_run_cache_is_write_cmd or _wv_run_cache_is_exempt_cmd in wv-cache.sh"
+            echo -e "  Add a row to contracts/command-capabilities.json, then:"
+            echo -e "    python3 scripts/weave_registry.py validate && python3 scripts/weave_registry.py generate"
         fi
         local count
         count=$(echo "$unclassified_cmds" | tr '|' '\n' | wc -l | tr -d ' ')
@@ -5621,7 +5689,7 @@ cmd_pattern_audit() {
             '. + [{"check":"cache_classification","status":"fail","detail":$detail,"count":$n}]')
         issues=$((issues + count))
     else
-        [ "$format" = "text" ] && echo -e "${GREEN}✓ Check 1 PASS: all dispatch commands classified (read/write/exempt)${NC}"
+        [ "$format" = "text" ] && echo -e "${GREEN}✓ Check 1 PASS: every dispatch command has a capability registry row${NC}"
         findings_json=$(echo "$findings_json" | jq \
             '. + [{"check":"cache_classification","status":"pass","detail":"all commands classified","count":0}]')
     fi

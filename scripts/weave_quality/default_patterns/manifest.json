@@ -3,7 +3,7 @@
   "rules": {
     "bare-except-pass.yaml": "a541403f1a67f5045acfc4913855c4e73d0d68f0badc4e1d579a3cf7d38c9777",
     "prose-emphasis-hedge.yaml": "a567296be5641dfb3513ccffe9cfe44a93716e3267f33e4f12051ca90c761c75",
-    "prose-register-review.yaml": "1f2dc20d6f4c55f377a7e8a70c7a836fd89545edaf2a09c105455a9668f784f6",
+    "prose-register-review.yaml": "01a67582a309aebf00a34e1ead9c9b793cbc5362c54baee7e2feaf83f98485d7",
     "subprocess-shell-true.yaml": "b63a6401ce11b67b8c7fa7fe0b4dc5f69848d24ebb3cc9d8bdc5b8bb35280768",
     "unquoted-variable.yaml": "3d9105cb90d208ca32c6a3f112707f03b2d4f8e764cf892b99e89bb733625019"
   }

@@ -1,0 +1,317 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://weave.dev/contracts/attempt-journal-v1.schema.json",
+  "$comment": "One event of the durable attempt journal. Every event carries the same envelope -- who called, under which capability contract, against which causal state -- and each event type adds the fields only it can supply. The envelope is not a convention: scripts/lib/wv-attempt-journal.sh builds it in one place so a call site cannot emit a partial event, and this schema is what says which fields that is. A reader (E1, the adjudication overlay, a Rust port) must never re-derive a classification the emitter already resolved.",
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "unavailable": {
+      "$comment": "The shared shape for a fact that could not be obtained. It is emitted instead of a guess, and it is never the empty string or a zero.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provenance",
+        "reason",
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "const": "unavailable"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "provenance": {
+          "type": "string"
+        }
+      }
+    },
+    "identity": {
+      "$comment": "The composite causal identity, or an explicit unavailable marker. Never absent: a missing identity and an unobtainable one are different facts.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "covers",
+            "format",
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "const": "composite_causal_identity"
+            },
+            "format": {
+              "type": "string"
+            },
+            "covers": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              }
+            },
+            "value": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        {
+          "$ref": "#/$defs/unavailable"
+        }
+      ]
+    },
+    "policy": {
+      "$comment": "The call's policy provenance, stated explicitly on every completion. countable is false while any dispatched gate can still decide without emitting a verdict: a call with no verdict is NOT an allow, and E1 must not read it as one. state is 'unavailable' when no gate spoke for this call and 'partial' when some did, and neither promotes to a countable allow until gate coverage is complete.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "countable",
+        "reason",
+        "state",
+        "verdicts"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "partial",
+            "unavailable"
+          ]
+        },
+        "countable": {
+          "const": false
+        },
+        "verdicts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "call_id",
+    "causal_identity_before",
+    "event",
+    "evidence_class",
+    "format",
+    "mutation_targets",
+    "operation",
+    "parent_call_id",
+    "registry_identity",
+    "registry_schema",
+    "repo_root",
+    "source",
+    "suboperation",
+    "trace_id",
+    "ts",
+    "workflow_id"
+  ],
+  "properties": {
+    "format": {
+      "const": "weave.attempt-journal.v1"
+    },
+    "event": {
+      "enum": [
+        "call_completed",
+        "call_started",
+        "mutation_disposition",
+        "policy_verdict"
+      ]
+    },
+    "ts": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "call_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "parent_call_id": {
+      "$comment": "The enclosing wv call when this call was launched underneath another, null when it is a root. Nullable rather than absent: a reader must be able to distinguish a call with no parent from a writer that does not record parents.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "workflow_id": {
+      "type": "string"
+    },
+    "trace_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source": {
+      "enum": [
+        "agent",
+        "hook",
+        "mcp",
+        "shell",
+        "sync",
+        "test"
+      ]
+    },
+    "repo_root": {
+      "type": "string"
+    },
+    "operation": {
+      "type": "string",
+      "minLength": 1
+    },
+    "suboperation": {
+      "type": "string"
+    },
+    "evidence_class": {
+      "enum": [
+        "administrative",
+        "mutation_attempt",
+        "observation",
+        "unclassified"
+      ]
+    },
+    "mutation_targets": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "registry_identity": {
+      "type": "string"
+    },
+    "registry_schema": {
+      "type": "string"
+    },
+    "causal_identity_before": {
+      "$ref": "#/$defs/identity"
+    },
+    "causal_identity_after": {
+      "$ref": "#/$defs/identity"
+    },
+    "disposition": {
+      "enum": [
+        "changed",
+        "complete",
+        "incomplete",
+        "unchanged"
+      ]
+    },
+    "argv": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "exit_status": {
+      "type": "integer"
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rule": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decision": {
+      "enum": [
+        "advisory",
+        "allow",
+        "deny"
+      ]
+    },
+    "would_violate_invariant": {
+      "enum": [
+        "no",
+        "unknown",
+        "yes"
+      ]
+    },
+    "detail": {
+      "type": "string"
+    },
+    "policy": {
+      "$ref": "#/$defs/policy"
+    }
+  },
+  "oneOf": [
+    {
+      "$comment": "Written before dispatch. Its disposition is incomplete and stays incomplete unless a completion follows, which is what makes a killed call visible.",
+      "properties": {
+        "event": {
+          "const": "call_started"
+        },
+        "argv": {},
+        "disposition": {}
+      },
+      "required": [
+        "argv",
+        "disposition",
+        "event"
+      ]
+    },
+    {
+      "$comment": "A gate that decided inside the call. rule, decision and would_violate_invariant are all required: E1 cannot count a mutation whose verdict names no rule or leaves the invariant question open.",
+      "properties": {
+        "event": {
+          "const": "policy_verdict"
+        },
+        "decision": {},
+        "rule": {},
+        "would_violate_invariant": {}
+      },
+      "required": [
+        "decision",
+        "event",
+        "rule",
+        "would_violate_invariant"
+      ]
+    },
+    {
+      "$comment": "What a mutation-class call did to durable state, derived from the two identities rather than declared.",
+      "properties": {
+        "event": {
+          "const": "mutation_disposition"
+        },
+        "causal_identity_after": {},
+        "disposition": {},
+        "exit_status": {}
+      },
+      "required": [
+        "causal_identity_after",
+        "disposition",
+        "event",
+        "exit_status"
+      ]
+    },
+    {
+      "$comment": "The call ended. policy states the call's policy provenance explicitly, so no reader infers an allow from an absent verdict.",
+      "properties": {
+        "event": {
+          "const": "call_completed"
+        },
+        "causal_identity_after": {},
+        "disposition": {},
+        "elapsed_ms": {},
+        "exit_status": {},
+        "policy": {}
+      },
+      "required": [
+        "causal_identity_after",
+        "disposition",
+        "elapsed_ms",
+        "event",
+        "exit_status",
+        "policy"
+      ]
+    }
+  ]
+}

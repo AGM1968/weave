@@ -65,7 +65,11 @@ mcp_identity() {
 
 python_recognizes_local() {
     # $1 = claimed_by string to check; prints "true"/"false"
-    PYTHONPATH="$REPO_ROOT/scripts" poetry run --directory "$REPO_ROOT" python - "$1" <<'PY' 2>/dev/null
+    # python3 directly, not poetry run: weave_gh is standard-library-only here
+    # and the poetry indirection made this suite fail in any environment that
+    # ships the tests without the development toolchain -- which is every
+    # consumer of the public projection.
+    PYTHONPATH="$REPO_ROOT/scripts" python3 - "$1" <<'PY' 2>/dev/null
 import sys
 from unittest.mock import patch
 import subprocess
