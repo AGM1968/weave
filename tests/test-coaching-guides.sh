@@ -79,7 +79,7 @@ expect_problem() {
         fail "$label" "    scanner crashed (exit $status) instead of reporting the defect"
         return
     fi
-    if printf '%s\n' "$out" | grep -qF -- "$fragment"; then
+    if grep -qF -- "$fragment" <<< "$out"; then
         pass "$label"
     else
         fail "$label" "    expected a problem mentioning: $fragment
@@ -128,13 +128,17 @@ expect_problem "an unparseable guide is reported" "missing frontmatter opening f
 
 # But a scan that cannot be trusted at all must fail closed. A missing guides
 # directory is not "no problems found"; it is a scan that did not happen.
+# Refused by name: a crash further in also exits nonzero without a COUNT line,
+# which let the scanner lose its own check unnoticed (wv-e07ee4).
 scan "$TMP/definitely-absent"; scan_status=$?
 out=$(cat "$TMP/out")
-if [ "$scan_status" -ne 0 ] && ! scan_ok "$out"; then
+if [ "$scan_status" -ne 0 ] && ! scan_ok "$out" && grep -q 'not a guides directory' <<< "$out" \
+        && ! grep -q Traceback <<< "$out"; then
     pass "a scan that cannot run fails closed"
 else
     fail "a scan that cannot run fails closed" \
-        "    scanner exited $scan_status and produced a COUNT line for a directory that does not exist"
+        "    scanner exited $scan_status for a directory that does not exist; output:
+$(sed 's/^/    /' <<< "$out" | tail -3)"
 fi
 
 # ── the declared-section extension ────────────────────────────────────────────
@@ -152,7 +156,7 @@ expect_clean() {
         fail "$label" "    scanner crashed (exit $status) instead of validating the case"
         return
     fi
-    if printf '%s\n' "$out" | grep -q '^PROBLEM'; then
+    if grep -q '^PROBLEM' <<< "$out"; then
         fail "$label" "$(printf '%s\n' "$out" | grep '^PROBLEM' | sed 's/^PROBLEM /    /')"
     else
         pass "$label"
@@ -207,7 +211,7 @@ for check in DECLARATION:"frontmatter declares the extension" \
              EXTENDED:"the extended-section shape is contracted" \
              CLOSED:"the fixed section set stays closed"; do
     key="${check%%:*}"; label="${check#*:}"; label="${label%\"}"; label="${label#\"}"
-    if printf '%s\n' "$extension" | grep -qxF -- "${key}_OK"; then
+    if grep -qxF -- "${key}_OK" <<< "$extension"; then
         pass "$label"
     else
         fail "$label" "    contracts/coaching-guide-v1.schema.json has drifted from guides.py"
@@ -284,10 +288,10 @@ for problem in problems:
 print(f"COUNT {len(rows)}")
 PY_AUTHORING
 )
-if ! printf '%s\n' "$authoring" | grep -q '^COUNT '; then
+if ! grep -q '^COUNT ' <<< "$authoring"; then
     fail "authoring templates validate" "    check produced no COUNT line:
 $(printf '%s\n' "$authoring" | sed 's/^/    /')"
-elif printf '%s\n' "$authoring" | grep -q '^PROBLEM'; then
+elif grep -q '^PROBLEM' <<< "$authoring"; then
     fail "authoring templates validate" \
         "$(printf '%s\n' "$authoring" | grep '^PROBLEM' | sed 's/^PROBLEM /    /')"
 else
@@ -314,11 +318,11 @@ PY
 if [ -z "$resolution" ]; then
     fail "resolution contract is readable" "    schema read produced no output"
 else
-    printf '%s\n' "$resolution" | grep -q '^ORDER_OK$' \
+    grep -q '^ORDER_OK$' <<< "$resolution" \
         && pass "resolution order is project-language first, package fallback last" \
         || fail "resolution order is project-language first, package fallback last" \
             "    $(printf '%s\n' "$resolution" | grep '^ORDER_BAD' || echo 'order missing')"
-    printf '%s\n' "$resolution" | grep -q '^FAILCLOSED_OK$' \
+    grep -q '^FAILCLOSED_OK$' <<< "$resolution" \
         && pass "an invalid project override fails closed" \
         || fail "an invalid project override fails closed" \
             "    invalid_override must be fail_closed, not a silent fall-through to the package guide"

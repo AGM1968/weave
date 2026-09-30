@@ -58,21 +58,27 @@ _SE_HOT_ZONE="${_HC_HOT_ZONE}"
 #   (a) unpushed  (b) subject matches checkpoint patterns  (c) no non-.weave files
 # wv-822bea/wv-179c49: hijack guard, same rule as auto_checkpoint/cmd_sync in
 # wv-cmd-data.sh — refuse to commit if the caller pre-staged anything outside
-# .weave/, so this checkpoint never silently absorbs unrelated in-progress work.
+# graph state, so this checkpoint never silently absorbs unrelated in-progress
+# work. wv-2e6341: only graph state is staged; .weave/ configuration stays in
+# the tree, and without the helpers (lib not found) nothing is committed.
 _SE_PRESTAGED=""
-if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
-    _SE_PRESTAGED=$(git diff --cached --name-only 2>/dev/null | grep -v '^\.weave/' || true)
+if ! command -v wv_stage_graph_state >/dev/null 2>&1; then
+    _SE_PRESTAGED="checkpoint helpers unavailable"
+elif [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
+    _SE_PRESTAGED=$(wv_staged_non_graph_state "$PWD")
 fi
 if [ -n "$_SE_PRESTAGED" ]; then
     :
 else
-git add .weave/ 2>/dev/null || true
+wv_stage_graph_state "$PWD" 2>/dev/null || true
 if ! git diff --cached --quiet 2>/dev/null; then
     _SE_BRANCH=$(git branch --show-current 2>/dev/null || echo "main")
     _SE_LOCAL_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
     _SE_REMOTE_HEAD=$(git rev-parse "origin/$_SE_BRANCH" 2>/dev/null || echo "none")
     _SE_LAST_MSG=$(git log -1 --format='%s' 2>/dev/null || echo "")
-    _SE_LAST_NW=$(git diff HEAD~1 HEAD --name-only 2>/dev/null | grep -v '^\.weave/' | grep -v '^$' || true)
+    # --no-renames: a file moved into .weave/ would otherwise list only under
+    # its new path, and the commit would read as .weave-only (wv-b60cd5).
+    _SE_LAST_NW=$(git diff --no-renames HEAD~1 HEAD --name-only 2>/dev/null | grep -v '^\.weave/' | grep -v '^$' || true)
     _NOW=$(date +%s)
     # wv-e937f8: [skip ci] applies to the whole PUSH at its tip, not just this
     # commit's own (always .weave-only) diff -- omit it when the unpushed

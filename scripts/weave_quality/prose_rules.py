@@ -404,6 +404,31 @@ def _validate_positive_int(rule: dict[str, object], key: str, default: int) -> N
         raise ValueError(f"{key!r} must be positive")
 
 
+def _validate_calibration(rule: dict[str, object]) -> None:
+    """A rerunnable calibration reference, or none (wv-335581).
+
+    Free-text provenance can quote a measured threshold ("26.9 words against
+    21.1") without saying how to reproduce it. calibration_script names the
+    repo-relative script that produced the number and calibration_command the
+    command that reruns it; the two travel together, the command must invoke
+    the script, and the path must stay inside the repository. Whether the
+    script exists is checked where the repository is known
+    (`wv quality patterns validate`).
+    """
+    present = [key for key in ("calibration_script", "calibration_command") if key in rule]
+    if not present:
+        return
+    if len(present) != 2:
+        raise ValueError("calibration_script and calibration_command must be given together")
+    script = _require_string(rule, "calibration_script")
+    command = _require_string(rule, "calibration_command")
+    parts = Path(script).parts
+    if script.startswith("/") or ".." in parts or not parts:
+        raise ValueError(f"calibration_script {script!r} must be a repo-relative path inside the repository")
+    if script not in command:
+        raise ValueError(f"calibration_command must invoke calibration_script {script!r}")
+
+
 def _validate_maturity_and_controls(rule: dict[str, object], rule_path: Path) -> bool:
     """Validate the lifecycle/controls contract; return whether controls are required."""
     maturity = _require_string(rule, "maturity").lower() if "maturity" in rule else ""
@@ -425,6 +450,7 @@ def _validate_maturity_and_controls(rule: dict[str, object], rule_path: Path) ->
     for optional_scalar in ("severity", "policy", "maturity", "message", "provenance"):
         if optional_scalar in rule:
             _require_string(rule, optional_scalar)
+    _validate_calibration(rule)
     if controls_required:
         _require_block_scalar(rule_path, "provenance")
         _require_block_scalar(rule_path, "message")
@@ -583,6 +609,41 @@ def _iter_text_files(target: Path, include: list[str], repo: Path) -> list[Path]
             continue
         files.append(path)
     return files
+
+
+# The file extensions ast-grep assigns to each language it parses, so a code
+# rule's scope is exactly the files ast-grep would hand it.
+CODE_LANGUAGE_SUFFIXES: dict[str, frozenset[str]] = {
+    "bash": frozenset({".bash", ".bats", ".cgi", ".command", ".env", ".fcgi", ".ksh",
+                       ".sh", ".in", ".tmux", ".tool", ".zsh"}),
+    "python": frozenset({".py", ".py3", ".pyi", ".bzl"}),
+    "typescript": frozenset({".ts", ".cts", ".mts"}),
+    "tsx": frozenset({".tsx"}),
+    "javascript": frozenset({".js", ".cjs", ".mjs", ".jsx"}),
+}
+
+
+def code_rule_out_of_scope(language: str, target: Path) -> bool:
+    """True when `target` holds no file of the code rule's language.
+
+    The code-rule mirror of prose_rule_out_of_scope (wv-76fc4a): ast-grep
+    only runs a rule on files of its language, so a python rule scanned
+    against a Markdown file reported a bare 0 that read as a clean scan. A
+    language this map does not know is never claimed out of scope, and a rule
+    that also narrows itself with files:/ignores: can only be under-claimed,
+    never over-claimed, because no file of its language means it did not run.
+    """
+    suffixes = CODE_LANGUAGE_SUFFIXES.get(language)
+    if suffixes is None:
+        return False
+    if target.is_file():
+        return target.suffix.lower() not in suffixes
+    for path in target.rglob("*"):
+        if ".git" in path.parts:
+            continue
+        if path.is_file() and path.suffix.lower() in suffixes:
+            return False
+    return True
 
 
 def prose_rule_out_of_scope(
@@ -1450,6 +1511,53 @@ def _mask_inline_code(line: str, open_run_len: int = 0) -> tuple[str, int, bool,
     return resolved, 0, incoming_closed, resolved
 
 
+# What a masked inline-code span becomes in the text prose matchers see. Not
+# whitespace, so a pattern's \s cannot bridge a code span and join the
+# punctuation on either side of it into one prose match (wv-87d003: a list of
+# code items, "`cin`, `wind_speed_ms` and `cape`", masked to spaces, read as
+# ", and"); not a word character, so no word pattern matches it; one character
+# per masked character, so source coordinates stay exact. Invisible, and
+# turned back into a space in reported match text, so a finding's text and key
+# are unchanged wherever the match did not depend on crossing a code span.
+MASK_BARRIER = "\u2063"
+
+
+def _table_row_cells(line: str) -> list[tuple[int, str]]:
+    """(source column, text) for each non-empty cell of a Markdown table row.
+
+    Cells split on pipes a backslash does not escape, as GFM does; the leading
+    and trailing pipe are optional; surrounding whitespace is dropped from the
+    text and counted into the column, so source positions stay exact.
+    """
+    cells: list[tuple[int, str]] = []
+    start = 0
+    for i, char in enumerate(line + "|"):
+        if char != "|" or (i and i < len(line) and line[i - 1] == "\\"):
+            continue
+        raw = line[start:i]
+        stripped = raw.strip()
+        if stripped:
+            cells.append((start + len(raw) - len(raw.lstrip()), stripped))
+        start = i + 1
+    return cells
+
+
+def _block_line_units(line: str, lineno: int, kind: str, first_index: int) -> list[_ScanLine]:
+    """Scan units for a heading, a thematic break or a table row, numbered from first_index.
+
+    A heading or break is one unit. A table row gives one unit per cell, each at its
+    own source column, so no matcher can combine text from two cells into one
+    synthetic finding (wv-e257e9); the whole row used to be one unit, and any
+    pattern that tolerates a pipe could span cells.
+    """
+    if kind in ("heading", "break"):
+        return [_ScanLine(_mask_paragraph_inline_code(line), ((0, lineno, 0),), first_index)]
+    return [
+        _ScanLine(_mask_paragraph_inline_code(cell), ((0, lineno, cell_col),), first_index + offset)
+        for offset, (cell_col, cell) in enumerate(_table_row_cells(line))
+    ]
+
+
 def _mask_paragraph_inline_code(text: str) -> str:
     """Blank CommonMark code spans without changing paragraph offsets.
 
@@ -1457,13 +1565,13 @@ def _mask_paragraph_inline_code(text: str) -> str:
     so a single _mask_inline_code call can resolve both ordinary and
     source-line-spanning code spans. An unmatched opening run is literal
     CommonMark text and must be replayed; proven spans before it remain
-    masked. Spaces, rather than NULs, make the result safe for every prose
-    matcher including broad regular expressions while preserving exact
-    source-position mapping.
+    masked. MASK_BARRIER rather than NUL keeps the result printable and
+    storable, and rather than a space keeps whitespace-tolerant patterns from
+    reading across the span, while preserving exact source-position mapping.
     """
     masked, open_run_len, _incoming_closed, literal_replay = _mask_inline_code(text)
     resolved = literal_replay if open_run_len else masked
-    return resolved.replace("\0", " ")
+    return resolved.replace("\0", MASK_BARRIER)
 
 
 def _quote_depth_is_boundary(quote_depth: int, prior_quote_depth: int) -> bool:
@@ -3286,11 +3394,7 @@ def _scan_lines(  # pylint: disable=too-many-statements,too-many-branches
             list_stack, container = _restore_owned_list_stack(
                 owning_stack, clear_has_paragraph=True
             )
-            out.append(
-                _ScanLine(
-                    _mask_paragraph_inline_code(line), ((0, lineno, 0),), len(out)
-                )
-            )
+            out.extend(_block_line_units(line, lineno, kind, len(out)))
             continue
 
         # kind == "lazy" with container != "list" (that combination was
@@ -3659,7 +3763,7 @@ def run_prose_rule(
                     rule_id=rule_id,
                     line=lineno,
                     col=col,
-                    match_text=match_text,
+                    match_text=match_text.replace(MASK_BARRIER, " "),
                     severity=severity,
                 )
             )

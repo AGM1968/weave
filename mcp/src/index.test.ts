@@ -13,6 +13,7 @@ import { findWvCandidates, resolveAgentHarness, resolveAgentId, resolvePatternsL
 
 const SERVER_PATH = resolve(__dirname, "../dist/index.js");
 const REQUEST_TIMEOUT_MS = 30_000;
+const CLOSE_GRACE_MS = 10_000;
 const CONTRACT = JSON.parse(readFileSync(resolve(__dirname, "../contract.json"), "utf-8")) as {
   scopes: Record<string, { tool_count: number; configured_by_default?: boolean; start_when?: string }>;
   servers: Array<{ name: string; scope: string; lifecycle: string; start_policy?: string }>;
@@ -132,11 +133,14 @@ class MCPTestClient {
         resolve();
       };
       this.server.on("close", finish);
+      // The kill is for a hung server, not a slow one: a server still writing
+      // its exit output (the --instrument summary) under a loaded push gate
+      // lost it to a SIGKILL one second after stdin closed (wv-7f69b8).
       setTimeout(() => {
         if (settled) return;
         this.server.kill("SIGKILL");
         setTimeout(finish, 1000); // Force resolve after kill if needed
-      }, 1000);
+      }, CLOSE_GRACE_MS);
     });
   }
 
@@ -590,7 +594,16 @@ describe("Weave MCP Server", () => {
     // Point the whole block at a throwaway graph so no test writes to the live
     // Weave DB. Materialize the schema first so wv commands operate on a real DB.
     isolatedDir = mkdtempSync(join(tmpdir(), "weave-mcp-graph-"));
-    GRAPH_ENV = { WV_DB: join(isolatedDir, "brain.db"), WV_HOT_ZONE: isolatedDir };
+    // WEAVE_DIR too: wv takes .weave/ from the working directory's repository,
+    // not from WV_DB, so without it any .weave/ write from these processes
+    // lands in the repository hosting the suite. wv delete re-dumped the
+    // throwaway graph over its state.sql that way (wv-9acb57, fixed in wv by
+    // wv-5d5ef2); this keeps the next such writer out as well.
+    GRAPH_ENV = {
+      WV_DB: join(isolatedDir, "brain.db"),
+      WV_HOT_ZONE: isolatedDir,
+      WEAVE_DIR: join(isolatedDir, ".weave"),
+    };
     spawnSync(resolve(__dirname, "../../scripts/wv"), ["init"], {
       stdio: "ignore",
       cwd: isolatedDir,
@@ -610,6 +623,19 @@ describe("Weave MCP Server", () => {
     GRAPH_ENV = {};
     rmSync(isolatedDir, { recursive: true, force: true });
   }, 60_000);
+
+  // wv-9acb57: an override wv judges to belong to another repository is
+  // discarded as a leak, silently after the first warning in a shell, and the
+  // call then runs against the hosting repository's live graph. Assert that wv,
+  // spawned the way this block spawns it, resolves the throwaway graph.
+  it("resolves the throwaway graph for wv spawned like this block's helpers", () => {
+    const result = spawnSync(resolve(__dirname, "../../scripts/wv"), ["hotzone", "db"], {
+      encoding: "utf-8",
+      env: { ...process.env, ...GRAPH_ENV, NO_COLOR: "1", WV_AGENT: "1" },
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim().split("\n").pop()).toBe(join(isolatedDir, "brain.db"));
+  });
 
   describe("tools/list", () => {
     it("should list all tools from the default scope contract", async () => {
@@ -758,6 +784,9 @@ describe("Weave MCP Server", () => {
       expect(result.content).toBeDefined();
       expect(result.content[0].text).toContain("=== Status ===");
       expect(result.content[0].text).toContain("=== Ready Work ===");
+      // wv-f757a4: the policy section was silently absent (hook script under a
+      // 5s timeout, no "policy:" line in its agent output); it must carry a level.
+      expect(result.content[0].text).toMatch(/=== Context Policy ===\npolicy: (HIGH|MEDIUM|LOW)/);
     });
 
     it("weave_context should return JSON context for a node", async () => {

@@ -5,6 +5,33 @@
 # Sourced by: wv entry point (after lib modules)
 # Dependencies: wv-config.sh, wv-db.sh, wv-validate.sh, wv-cache.sh
 
+# _wv_exit_trap [cleanup] — install this module's EXIT cleanup without
+# displacing the call's own completion. scripts/wv records call_completed from
+# its EXIT trap (_wv_finalize); a bare `trap '<cleanup>' EXIT` replaced it and a
+# bare `trap - EXIT` removed it, so every sync -- and every call that syncs,
+# such as quick and ship -- ended without a completion record and read as a
+# killed attempt (wv-15422b). With a cleanup, run it, then complete the call
+# with the original exit status; with none, restore the completion trap alone.
+# Sourced without scripts/wv (a test harness), or running in a subshell, it
+# falls back to a plain trap.
+# The cleanup text is expanded into the trap string now on purpose: it names
+# the variables the trap reads when it fires.
+# shellcheck disable=SC2064,SC2154
+_wv_exit_trap() {
+    # A subshell (a command substitution such as ship-agent's $(_ship_run ...))
+    # must not complete the call: its EXIT is not the call's, and finalizing
+    # there records the call twice and resets the verdict marker under it.
+    if ! declare -F _wv_finalize >/dev/null || [ "$BASHPID" != "$$" ]; then
+        if [ -n "${1:-}" ]; then trap "$1" EXIT; else trap - EXIT; fi
+        return 0
+    fi
+    if [ -n "${1:-}" ]; then
+        trap "_wv_trap_rc=\$?; $1; ( exit \$_wv_trap_rc ); _wv_finalize" EXIT
+    else
+        trap '_wv_finalize' EXIT
+    fi
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # strip_unistr — Post-process SQLite .dump output for cross-version compat
 # ═══════════════════════════════════════════════════════════════════════════
@@ -249,8 +276,9 @@ _wv_emit_deltas() {
     # deltas_root (4th arg) stays the REAL .weave/deltas so the lineage
     # sequence is computed from committed history; out_dir (2nd arg) is the
     # staging v2/ dir, so nothing lands in the real tree until publish below.
+    # The 7th arg hands over this cycle's lineage_seq so v2 carries the v1 number.
     if [ "${WV_DELTA_V2_WRITE:-1}" = "1" ]; then
-        if ! wv_delta_v2_write_operations "$db" "$staging_dir/v2" "$agent_id" "$weave_dir/deltas" "$watermark" >/dev/null; then
+        if ! wv_delta_v2_write_operations "$db" "$staging_dir/v2" "$agent_id" "$weave_dir/deltas" "$watermark" "" "$lineage_seq" >/dev/null; then
             echo "wv: warning: Delta v2 sidecar write failed; SQL delta remains authoritative" >&2
             if [ "${WV_DELTA_V2_STRICT:-0}" = "1" ]; then
                 rm -rf "$staging_dir"
@@ -274,9 +302,19 @@ _wv_emit_deltas() {
     # yet, so a failure here is just discarding the staging directory -- no
     # second, different delta can ever land at this same seq, because this
     # one never claimed it anywhere durable.
-    if ! wv_lineage_stamp "$db" "$agent_id" "$lineage_seq" "$watermark"; then
+    # Three-valued on purpose (wv-c395a3): "will retry next sync" is true for a
+    # transient fault and a falsehood for a schema one, where every later cycle
+    # fails here identically. wv_lineage_stamp has already explained the cause
+    # and named the recovery; this line only decides whether to promise a retry.
+    local _stamp_rc=0
+    wv_lineage_stamp "$db" "$agent_id" "$lineage_seq" "$watermark" || _stamp_rc=$?
+    if [ "$_stamp_rc" -ne 0 ]; then
         rm -rf "$staging_dir"
-        echo "wv: lineage stamp failed; this cycle's delta was not kept (will retry next sync)" >&2
+        if [ "$_stamp_rc" -eq 2 ]; then
+            echo "wv: this cycle's delta was discarded and the next sync cannot succeed until the schema above is repaired" >&2
+        else
+            echo "wv: lineage stamp failed; this cycle's delta was not kept (will retry next sync)" >&2
+        fi
         printf '%s\n' "$watermark"
         return 1
     fi
@@ -454,27 +492,87 @@ _delta_compact() {
 # Bypass with --force, WV_FORCE_SYNC=1, or WV_SYNC_FLOOR_RATIO=0.
 _sync_floor_guard_ok() {
     local new_sql="$1" force="${2:-false}"
-    [ "$force" = true ] && return 0
-    [ "${WV_FORCE_SYNC:-0}" = "1" ] && return 0
+    # Every bypass still judges the shrink, so an override that let a large
+    # shrink through is recorded rather than indistinguishable from no shrink.
+    local bypass=""
+    [ "$force" = true ] && bypass="--force"
+    [ -z "$bypass" ] && [ "${WV_FORCE_SYNC:-0}" = "1" ] && bypass="WV_FORCE_SYNC=1"
     local ratio="${WV_SYNC_FLOOR_RATIO:-0.70}"
-    case "$ratio" in 0|0.0|0.00) return 0 ;; esac
+    case "$ratio" in 0|0.0|0.00)
+        [ -z "$bypass" ] && bypass="WV_SYNC_FLOOR_RATIO=0"
+        ratio=0.70 ;;  # judged against the floor the knob switched off
+    esac
     local existing="$WEAVE_DIR/state.sql"
-    [ -f "$existing" ] || return 0
+    if [ ! -f "$existing" ]; then
+        [ "${_WV_ATTEMPT_OPERATION:-sync}" != "sync" ] || wv_policy_verdict sync_shrink_floor allow no "" "no committed state to shrink"
+        return 0
+    fi
     local old_n new_n floor
     old_n=$(grep -c '^INSERT INTO nodes' "$existing" 2>/dev/null || true)
     new_n=$(grep -c '^INSERT INTO nodes' "$new_sql" 2>/dev/null || true)
     old_n=${old_n:-0}
     new_n=${new_n:-0}
-    [ "$old_n" -gt 0 ] || return 0
+    if [ "$old_n" -le 0 ]; then
+        [ "${_WV_ATTEMPT_OPERATION:-sync}" != "sync" ] || wv_policy_verdict sync_shrink_floor allow no "" "the committed state holds no nodes"
+        return 0
+    fi
     floor=$(awk -v o="$old_n" -v r="$ratio" 'BEGIN{printf "%d", o*r}')
+    if [ "$new_n" -lt "$floor" ] && [ -n "$bypass" ]; then
+        [ "${_WV_ATTEMPT_OPERATION:-sync}" != "sync" ] || wv_policy_verdict sync_shrink_floor allow yes "$bypass" \
+            "synced a dump of $new_n nodes over $old_n committed"
+        return 0
+    fi
     if [ "$new_n" -lt "$floor" ]; then
+        [ "${_WV_ATTEMPT_OPERATION:-sync}" != "sync" ] || wv_policy_verdict sync_shrink_floor deny yes "" \
+            "a dump of $new_n nodes would overwrite $old_n committed"
         echo -e "${RED}✗ Sync BLOCKED (floor-guard): dump has ${new_n} nodes vs ${old_n} committed in state.sql (< ${ratio}x).${NC}" >&2
         echo -e "${YELLOW}  Refusing to overwrite .weave/state.sql — likely a wiped/partial tmpfs DB (sandbox restart).${NC}" >&2
         echo -e "${YELLOW}  Recover: run 'wv load' to rehydrate from state.sql, or restore .weave from git.${NC}" >&2
         echo -e "${YELLOW}  Intentional shrink (e.g. prune)? Override: WV_FORCE_SYNC=1 wv sync  (or 'wv sync --force').${NC}" >&2
         return 1
     fi
+    [ "${_WV_ATTEMPT_OPERATION:-sync}" != "sync" ] || wv_policy_verdict sync_shrink_floor allow no "" "the dump keeps at least the floor of the committed nodes"
     return 0
+}
+
+# _wv_db_foreign_to_weave_dir — true when WV_DB is overridden but WEAVE_DIR was
+# not chosen with it, so WEAVE_DIR is the working directory's repository and the
+# DB is some other graph. An override paired with an explicit WEAVE_DIR (a test
+# graph and its own .weave/) is consistent (wv-7ab3cd).
+_wv_db_foreign_to_weave_dir() {
+    [ -n "${WV_DB_CUSTOM:-}" ] && [ -z "${WEAVE_DIR_CUSTOM:-}" ]
+}
+
+# _redump_state_after_removal <removed-node-count> — re-dump state.sql after
+# wv delete / wv prune removed nodes from the live DB, so wv load cannot
+# resurrect them (wv-0d5e07). Two cases must not reach the file (wv-5d5ef2):
+# a DB foreign to WEAVE_DIR (the MCP test teardown deleted from a 5-node
+# throwaway DB and replaced a 1698-node state.sql), and a dump missing more
+# nodes than the removal took, which is a stale or partial DB, not the result
+# of the removal. The allowed shrink is the removal itself, so no ratio
+# applies. Returns 0 when state.sql was rewritten or deliberately left.
+_redump_state_after_removal() {
+    local removed="${1:-0}"
+    _wv_db_foreign_to_weave_dir && return 0
+    [ -d "$WEAVE_DIR" ] || return 0
+    local tmp_sql
+    tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX") || return 1
+    if ! dump_state_sql "$WV_DB" "$tmp_sql" || [ ! -s "$tmp_sql" ]; then
+        rm -f "$tmp_sql"
+        return 1
+    fi
+    if [ -f "$WEAVE_DIR/state.sql" ]; then
+        local old_n new_n
+        old_n=$(grep -c '^INSERT INTO nodes' "$WEAVE_DIR/state.sql" 2>/dev/null || true)
+        new_n=$(grep -c '^INSERT INTO nodes' "$tmp_sql" 2>/dev/null || true)
+        if [ "${new_n:-0}" -lt $(( ${old_n:-0} - removed )) ]; then
+            rm -f "$tmp_sql"
+            echo -e "${YELLOW}⚠ state.sql kept: the DB dump has ${new_n:-0} nodes, but ${old_n:-0} committed minus ${removed} removed is $(( ${old_n:-0} - removed )).${NC}" >&2
+            echo -e "${YELLOW}  The DB is missing nodes this removal did not take; run 'wv load' or restore .weave/ from git.${NC}" >&2
+            return 1
+        fi
+    fi
+    mv "$tmp_sql" "$WEAVE_DIR/state.sql"
 }
 
 _should_persist_weave_state() {
@@ -745,6 +843,57 @@ auto_sync() {
     auto_checkpoint "$now"
 }
 
+# auto_sync_or_warn — opportunistic persist that never hides its own failure.
+#
+# The call sites that trail a mutating command used to spell this
+# `auto_sync 2>/dev/null || true`, which discarded BOTH auto_sync's stderr
+# diagnostics and its exit status. A write that never reached state.sql then
+# looked exactly like one that did, which is how the consumer loss report
+# (wv-87ac0f) stayed invisible until the graph was reloaded elsewhere.
+#
+# These sites stay non-fatal on purpose: the mutation itself already succeeded
+# in the hot-zone DB, so aborting here would report failure for work that was
+# in fact done. The contract is warn, do not abort. Durability-critical sites
+# spell `if ! auto_sync --force` directly and return non-zero instead.
+#
+# tests/test-autosync-visibility.sh pins both forms as the only permitted ones.
+auto_sync_or_warn() {
+    auto_sync "$@" && return 0
+    echo -e "${YELLOW}⚠${NC}  wv: the change is in the hot-zone database but was NOT persisted to ${WEAVE_DIR:-.weave}/state.sql — run 'wv sync' before relying on it" >&2
+    return 0
+}
+
+# persist_or_refuse — durability gate a command runs BEFORE reporting success.
+#
+# auto_sync_or_warn keeps a failure visible, but a warning printed under a
+# "✓ Closed" line still reads as success, and the line is what an agent parses.
+# A command whose persistence failed must not announce the mutation at all: the
+# node reads done here and unchanged in every other clone, which is precisely
+# the divergence the consumer loss report (wv-87ac0f) described.
+#
+# Callers place this after their last mutation and before their first success
+# line, and return its status. Returning non-zero deliberately skips whatever
+# the caller does next — for wv done that includes closing the GitHub issue,
+# which must not happen for a closure that is about to vanish.
+#
+# A skipped sync is not a failure: auto_sync returns 0 from five deliberate skip
+# paths (disabled, journal-protected, custom DB, throttled, no changes). This
+# gate reports what auto_sync reports and claims nothing further; proving that
+# bytes reached state.sql is a stronger check and belongs to the caller that
+# needs it (see cmd_commit_refs, which compares the snapshot digest).
+persist_or_refuse() {
+    local what="$1"; shift
+    auto_sync "$@" && return 0
+    {
+        echo ""
+        echo -e "${RED}✗ NOT PERSISTED${NC} — $what changed in the hot-zone database only."
+        echo "  ${WEAVE_DIR:-.weave}/state.sql was not updated, so this reads as unchanged in"
+        echo "  every other clone and after the next 'wv load'. Resolve the error above and"
+        echo "  run 'wv sync'; the change is not lost until the hot zone is reset."
+    } >&2
+    return 1
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # auto_checkpoint — WIP git commit to prevent session data loss
 # ═══════════════════════════════════════════════════════════════════════════
@@ -790,16 +939,16 @@ auto_checkpoint() {
     # stashes the caller's staged files and pops them back UNSTAGED, which would
     # defeat a post-pull guard and let the checkpoint churn an in-progress manual
     # commit. So bail out here, before any index-touching op, when the caller has
-    # pre-staged anything outside .weave/. Escape hatch: WV_CHECKPOINT_ALL=1.
+    # pre-staged anything outside graph state -- .weave/ configuration included
+    # (wv-2e6341). Escape hatch: WV_CHECKPOINT_ALL=1.
     if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
         local _git_root_guard prestaged
         _git_root_guard=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
         if [ -n "$_git_root_guard" ]; then
-            prestaged=$(git -C "$_git_root_guard" diff --cached --name-only 2>/dev/null \
-                | grep -v '^\.weave/' || true)
+            prestaged=$(wv_staged_non_graph_state "$_git_root_guard")
             if [ -n "$prestaged" ]; then
                 {
-                    echo "wv: auto-checkpoint skipped — non-.weave/ files already staged by caller:"
+                    echo "wv: auto-checkpoint skipped — files outside graph state already staged by caller:"
                     echo "$prestaged" | sed 's/^/  /'
                     echo "wv: finish your commit first, or set WV_CHECKPOINT_ALL=1 to override."
                 } >&2
@@ -837,9 +986,10 @@ auto_checkpoint() {
         # Legacy mode: stage everything (breaks intentional commits)
         git -C "$git_root" add -A >/dev/null 2>&1 || return 0
     else
-        # Safe mode: only stage .weave/ graph state. The hijack guard ran earlier
-        # (before the pull) so by here no caller files are staged outside .weave/.
-        git -C "$git_root" add .weave/ >/dev/null 2>&1 || return 0
+        # Safe mode: only stage graph state, never .weave/ configuration such as
+        # test-map.conf (wv-2e6341). The hijack guard ran earlier (before the
+        # pull) so by here no caller files are staged outside graph state.
+        wv_stage_graph_state "$git_root" >/dev/null 2>&1 || return 0
     fi
 
     # Only commit if there are staged changes
@@ -1195,7 +1345,7 @@ cmd_sync() {
     local tmp_nodes=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX")
     local tmp_edges=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX")
     local _snap_db=""
-    trap 'rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db" 2>/dev/null; _wv_discard_staged_deltas "$_sync_staging"' EXIT
+    _wv_exit_trap 'rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db" 2>/dev/null; _wv_discard_staged_deltas "$_sync_staging"'
 
     # Point-in-time snapshot (round 4 finding 5): state.sql and both JSONL
     # projections are all derived from this ONE static backup copy, not
@@ -1205,7 +1355,7 @@ cmd_sync() {
         echo -e "${RED}✗${NC} Sync aborted: failed to snapshot database for export" >&2
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
         _wv_discard_staged_deltas "$_sync_staging"
-        trap - EXIT
+        _wv_exit_trap
         [ "$_sync_journaled" = true ] && journal_end
         return 1
     fi
@@ -1218,7 +1368,7 @@ cmd_sync() {
         echo -e "${RED}✗${NC} Sync aborted: database dump was empty (possible lock contention)" >&2
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
         _wv_discard_staged_deltas "$_sync_staging"
-        trap - EXIT
+        _wv_exit_trap
         [ "$_sync_journaled" = true ] && journal_end
         return 1
     fi
@@ -1227,7 +1377,7 @@ cmd_sync() {
     if ! _sync_floor_guard_ok "$tmp_sql" "$force"; then
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
         _wv_discard_staged_deltas "$_sync_staging"
-        trap - EXIT
+        _wv_exit_trap
         [ "$_sync_journaled" = true ] && journal_end
         return 1
     fi
@@ -1243,7 +1393,7 @@ cmd_sync() {
         echo -e "${RED}✗${NC} Sync aborted: failed to generate portable JSONL projections" >&2
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
         _wv_discard_staged_deltas "$_sync_staging"
-        trap - EXIT
+        _wv_exit_trap
         [ "$_sync_journaled" = true ] && journal_end
         return 1
     fi
@@ -1260,7 +1410,7 @@ cmd_sync() {
         echo -e "${RED}✗${NC} Sync aborted: failed to publish durable graph state" >&2
         rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"
         _wv_discard_staged_deltas "$_sync_staging"
-        trap - EXIT
+        _wv_exit_trap
         return 1
     fi
 
@@ -1271,7 +1421,7 @@ cmd_sync() {
     # peer the delta is the ONLY artifact that can carry this mutation across.
     if ! _wv_publish_staged_deltas "$_sync_staging"; then
         echo -e "${RED}✗${NC} Sync aborted: failed to publish the delta changeset; change tracker left pending for the next sync" >&2
-        trap - EXIT
+        _wv_exit_trap
         [ "$_sync_journaled" = true ] && journal_end
         return 1
     fi
@@ -1299,13 +1449,13 @@ cmd_sync() {
         echo -e "${RED}✗${NC} Sync aborted: failed to publish quality adjudications" >&2
         return 1
     fi
-    trap - EXIT
+    _wv_exit_trap
 
     # Guard: if anything after this point (auto_checkpoint, git, gh_sync) is
     # interrupted/killed, ensure journal_end still fires so the op isn't left
     # stuck. Cleared on normal exit before explicit journal_end call below.
     [ "$_sync_journaled" = true ] && \
-        trap 'journal_end 2>/dev/null; journal_clean 2>/dev/null' EXIT
+        _wv_exit_trap 'journal_end 2>/dev/null; journal_clean 2>/dev/null'
 
     if [ "$format" = "json" ]; then
         echo -e "${GREEN}✓${NC} Synced to $WEAVE_DIR" >&2
@@ -1345,7 +1495,7 @@ cmd_sync() {
     if [ "${_WV_SKIP_SYNC_COMMIT:-0}" = "1" ]; then
         [ "$_sync_journaled" = true ] && journal_complete "$_sync_commit_step"
         if [ "$_sync_journaled" = true ]; then
-            trap - EXIT
+            _wv_exit_trap
             journal_end
             journal_clean
         fi
@@ -1369,11 +1519,10 @@ cmd_sync() {
         # after the caller finishes their commit. Override: WV_CHECKPOINT_ALL=1.
         if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
             local _sync_prestaged
-            _sync_prestaged=$(git -C "$git_root" diff --cached --name-only 2>/dev/null \
-                | grep -v '^\.weave/' || true)
+            _sync_prestaged=$(wv_staged_non_graph_state "$git_root")
             if [ -n "$_sync_prestaged" ]; then
                 {
-                    echo "wv: sync-state commit skipped — non-.weave/ files already staged by caller:"
+                    echo "wv: sync-state commit skipped — files outside graph state already staged by caller:"
                     echo "$_sync_prestaged" | sed 's/^/  /'
                     echo "wv: finish your commit first, or set WV_CHECKPOINT_ALL=1 to override."
                 } >&2
@@ -1382,7 +1531,9 @@ cmd_sync() {
                 return 0
             fi
         fi
-        git -C "$git_root" add .weave/ >/dev/null 2>&1 || true
+        # Graph state only: this commit skips the pre-commit gate, so .weave/
+        # configuration must reach a commit that runs it (wv-2e6341).
+        wv_stage_graph_state "$git_root" >/dev/null 2>&1 || true
         if ! git -C "$git_root" diff --cached --quiet 2>/dev/null; then
             local _sync_now _sync_branch _sync_local_head _sync_remote_head
             local _sync_last_msg _sync_last_nw_files
@@ -1418,7 +1569,7 @@ cmd_sync() {
     fi
 
     if [ "$_sync_journaled" = true ]; then
-        trap - EXIT  # normal path — clear the safety trap before explicit call
+        _wv_exit_trap  # normal path — clear the safety trap before explicit call
         journal_complete "$_sync_commit_step"
         journal_end
         journal_clean
@@ -1623,7 +1774,7 @@ _causal_cutover_seq() {
     [ -f "$WEAVE_DIR/causal-cutover" ] || return 0
     local seq
     seq=$(sed -n 's/.*"lineage_seq"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' \
-        "$WEAVE_DIR/causal-cutover" 2>/dev/null | head -1)
+        "$WEAVE_DIR/causal-cutover" 2>/dev/null | sed -n 1p)
     case "$seq" in
         ''|*[!0-9]*)
             echo -e "${YELLOW}⚠ Ignoring .weave/causal-cutover — no numeric lineage_seq${NC}" >&2
@@ -1773,11 +1924,94 @@ SQL
     fi
 }
 
+# _load_report_dropped_nodes DB PRE_DB — name nodes the load silently dropped.
+#
+# A load replaces the live database with state.sql and then replays deltas. A
+# node that was live beforehand and appears in neither is gone, and until now
+# nothing said so: the guards around the replace are all AGGREGATE counts -- a
+# >50% node-count drop, or fewer 'done' rows than before -- so losing a handful
+# of nodes passes every one of them and reports routine progress (wv-061f1f).
+# That is the shape of the cross-harness clobber in wv-b767ff, where a stale hot
+# zone re-dumped a smaller graph over a larger committed one.
+#
+# Nodes carrying a deletion tombstone are excluded: those were deleted on
+# purpose, and naming them would bury the real signal in routine noise.
+_load_report_dropped_nodes() {
+    local db="$1" pre_db="$2"
+    [ -f "$pre_db" ] || return 0
+    local dropped
+    dropped=$(sqlite3 "$db" "
+ATTACH DATABASE '$pre_db' AS pre;
+SELECT p.id FROM pre.nodes p
+ WHERE NOT EXISTS (SELECT 1 FROM main.nodes n WHERE n.id = p.id)
+   AND NOT EXISTS (SELECT 1 FROM main.tombstones t WHERE t.kind = 'node' AND t.id = p.id)
+ ORDER BY p.id;
+DETACH DATABASE pre;" 2>/dev/null) || return 0
+    [ -n "$dropped" ] || return 0
+
+    local count
+    count=$(printf '%s\n' "$dropped" | grep -c .)
+    # Deliberately RED and itemised, not another yellow count line. The skipped
+    # pre-prune / pre-cutover / legacy lines above are routine and expected; this
+    # one is unrecoverable-by-retry data loss, and an id is what makes it
+    # recoverable at all (git log -S the id over .weave/nodes.jsonl).
+    echo -e "${RED}✗ ${count} node(s) were live before this load and are in neither state.sql nor any delta:${NC}" >&2
+    printf '%s\n' "$dropped" | sed 's/^/    /' >&2
+    echo -e "${YELLOW}  They were not deleted — nothing recorded their removal. Recover an id from git:${NC}" >&2
+    echo -e "${YELLOW}    git log -S'<id>' --oneline -- .weave/nodes.jsonl${NC}" >&2
+}
+
+# The live database is shared: a parallel SessionStart hook, the status line,
+# any other wv may hold it open while a load runs. Its bytes therefore change
+# only through SQLite, never by file operations (wv-f241fa). rm+mv under an open
+# connection is SQLite's documented corruption path: a connection opened on the
+# old inode opens "-wal" by PATH at its first read, so its next commit lands in
+# the new file's WAL and is replayed over the fresh import. On 2026-09-26 the
+# live graph went "malformed" that way -- its WAL's page 1 carried schema cookie
+# 22 against a file at 4. Likewise cp of a WAL-mode file copies neither the
+# commits still in the WAL nor a consistent image.
+
+# _load_snapshot_db <dest> -- consistent copy of the live DB via the backup API.
+_load_snapshot_db() {
+    sqlite3 -cmd ".timeout 5000" "$WV_DB" ".backup '$1'" 2>/dev/null
+}
+
+# _load_install_db <tmp_db> -- make an imported database the live one.
+_load_install_db() {
+    local tmp_db="$1" verdict=""
+    if [ ! -e "$WV_DB" ]; then
+        mv "$tmp_db" "$WV_DB"
+        return
+    fi
+    # The backup API writes every page under SQLite's own locks, so open
+    # connections see the old database or the new one, never a mix.
+    # The restore keeps the inode, so the schema stamp is cleared here rather
+    # than left for db_ensure to notice.
+    if sqlite3 -cmd ".timeout 5000" "$WV_DB" ".restore '$tmp_db'" 2>/dev/null; then
+        rm -f "$tmp_db" "$WV_DB.ensured"
+        return 0
+    fi
+    # A live file SQLite cannot even check is already lost to every reader, so
+    # no connection has a consistent image to protect: replace it outright.
+    # That is also how a load heals a corrupt hot zone. A healthy file that
+    # refused the restore (held locked past the timeout) is left alone.
+    verdict=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "PRAGMA quick_check;" 2>/dev/null) || verdict=""
+    if [ "${verdict%%$'\n'*}" != "ok" ]; then
+        rm -f "$WV_DB" "$WV_DB-wal" "$WV_DB-shm"
+        mv "$tmp_db" "$WV_DB"
+        return 0
+    fi
+    return 1
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_load — Load database from git layer
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_load() {
+    # Snapshot of the graph as it was before the replace, for the dropped-node
+    # diff at the end. Declared here so the cleanup trap below can reach it.
+    local pre_load_db=""
     # Security: create hot zone 0700 so sibling users cannot read state
     # (see wv-db.sh db_init; same rationale).
     local prev_umask
@@ -1789,12 +2023,14 @@ cmd_load() {
 
     # Pre-flight: flush live DB → state.sql before loading to prevent status
     # regression when in-session wv done closures were throttled and not yet synced.
-    auto_sync --force 2>/dev/null || true
+    # A silent failure here is the status regression this flush exists to prevent,
+    # so the warning has to reach the operator before state.sql is replayed over it.
+    auto_sync_or_warn --force
 
     if [ -f "$WEAVE_DIR/state.sql" ]; then
         # Atomic load: import to temp DB first, validate, then replace
         local tmp_db=$(mktemp "$WV_HOT_ZONE/.brain.db.XXXXXX")
-        trap 'rm -f "$tmp_db" 2>/dev/null' EXIT
+        _wv_exit_trap 'rm -f "$tmp_db" 2>/dev/null'
 
         # Import ignoring non-zero exit: sqlite3 exits 1 on benign runtime errors
         # (e.g. malformed JSON in a generated column during INSERT) even when all
@@ -1813,7 +2049,7 @@ cmd_load() {
                 # -- import to a temp database, validate, then replace -- and a
                 # missing graph table is exactly what validation is for.
                 rm -f "$tmp_db"
-                trap - EXIT
+                _wv_exit_trap
                 echo -e "${RED}Error: edges table missing or corrupt in state.sql — refusing to load${NC}" >&2
                 echo -e "${YELLOW}  The existing database is untouched. A snapshot without a graph table${NC}" >&2
                 echo -e "${YELLOW}  cannot sync or persist commit-refs, so installing it would trade a${NC}" >&2
@@ -1837,7 +2073,7 @@ cmd_load() {
                 if [ "$drop_pct" -gt 50 ]; then
                     echo -e "${YELLOW}⚠ Warning: node count drops from ${old_count} → ${new_count} (${drop_pct}% loss)${NC}" >&2
                     echo -e "${YELLOW}  state.sql may be stale. Existing DB kept as backup: ${WV_DB}.bak${NC}" >&2
-                    cp "$WV_DB" "${WV_DB}.bak" 2>/dev/null || true
+                    _load_snapshot_db "${WV_DB}.bak" || true
                 fi
             fi
             # Status regression guard: warn if state.sql has more active nodes than current DB
@@ -1851,16 +2087,35 @@ cmd_load() {
                 echo -e "${YELLOW}⚠ Warning: state.sql has ${lost} fewer 'done' node(s) than current DB${NC}" >&2
                 echo -e "${YELLOW}  Recent wv done closures may not have been synced — run wv sync before wv load${NC}" >&2
                 echo -e "${YELLOW}  Current DB backed up: ${WV_DB}.bak${NC}" >&2
-                cp "$WV_DB" "${WV_DB}.bak" 2>/dev/null || true
+                _load_snapshot_db "${WV_DB}.bak" || true
+            fi
+
+            # Keep the pre-load graph aside so the drop diff below has something
+            # to compare against. It is the whole database rather than an id list
+            # because the comparison is then one ATTACH and one query, and the
+            # copy is on tmpfs. Removed unconditionally once the diff has run.
+            if [ -e "$WV_DB" ]; then
+                pre_load_db=$(mktemp "$WV_HOT_ZONE/.preload.db.XXXXXX")
+                _load_snapshot_db "$pre_load_db" || { rm -f "$pre_load_db"; pre_load_db=""; }
             fi
 
             # Validation passed, replace existing DB
-            rm -f "$WV_DB" "$WV_DB-wal" "$WV_DB-shm"
-            mv "$tmp_db" "$WV_DB"
-            trap - EXIT
+            if ! _load_install_db "$tmp_db"; then
+                rm -f "$tmp_db" "$pre_load_db"
+                _wv_exit_trap
+                echo -e "${RED}Error: the live database stayed locked; it was not replaced${NC}" >&2
+                echo -e "${YELLOW}  Another wv process held it past the timeout. Retry wv load.${NC}" >&2
+                return 1
+            fi
+            _WV_DB_READY=""   # a new DB: db_ensure must migrate it again
+            # Hand the EXIT trap over from the temp import to the pre-load
+            # snapshot: the migration and strict-v2-replay paths below both
+            # return early, and without this the snapshot outlives them in the
+            # hot zone.
+            _wv_exit_trap 'rm -f "$pre_load_db" 2>/dev/null'
         else
             rm -f "$tmp_db"
-            trap - EXIT
+            _wv_exit_trap
             echo -e "${RED}Error: state.sql is corrupt, keeping existing database${NC}" >&2
             return 1
         fi
@@ -2197,6 +2452,16 @@ EOF
         # tombstone for. Runs unconditionally (a tombstone can arrive via state.sql
         # with no deltas present) and is idempotent.
         _reconcile_tombstones "$WV_DB"
+
+        # AFTER the replay and the tombstone pass, so a node the deltas restore
+        # or a delete intentionally removed is not reported as lost. What is left
+        # was live, is gone, and nothing durable records why.
+        if [ -n "${pre_load_db:-}" ]; then
+            _load_report_dropped_nodes "$WV_DB" "$pre_load_db"
+            rm -f "$pre_load_db"
+            pre_load_db=""
+            _wv_exit_trap
+        fi
 
         echo -e "${GREEN}✓${NC} Loaded from $WEAVE_DIR/state.sql" >&2
     else
@@ -2607,6 +2872,145 @@ _commit_refs_prune_node() {
     " || return 1
 }
 
+# _commit_refs_trailers — the reverse audit: commit trailer -> node
+#
+# cmd_commit_refs asks whether a node's recorded SHAs still resolve. This asks
+# the other direction: whether a Weave-ID trailer already pushed to the world
+# still names a node this graph has. Nothing checked that, so a trailer
+# pointing at nothing stayed invisible until a human noticed (wv-1dfa43, the
+# detection half of wv-0f1092, which shipped `wv add --id` as the repair).
+#
+# Absence from the live graph is NOT the finding. Of 2347 trailer ids on the
+# pushed branch, 1245 resolve to no live node, and almost all of them are
+# ordinary pruned history. Reporting those would bury the real case in noise,
+# which done_criteria rules out. An id is only dangling when the graph has no
+# record of ever having WRITTEN it:
+#
+#   live      — a node exists under that id, at any status. Not a finding;
+#               done, blocked and superseded nodes all still exist.
+#   tombstoned— deliberately deleted. Not a finding.
+#   pruned    — absent now, but the write log shows it existed. Not a finding.
+#   dangling  — absent, untombstoned, and never written. The trailer names a
+#               node this graph never had.
+#
+# The oracle is .weave/deltas, the git-tracked write log, which begins later
+# than the repository does. A trailer on a commit at or before the log's first
+# day cannot be adjudicated -- the node may have been created hours before
+# logging started -- so those are counted as `unadjudicable` and never reported
+# as dangling. That horizon is derived from the log, not hardcoded, so it moves
+# as the log is pruned. Read-only and offline throughout: it opens the database
+# with mode=ro and asks git only about objects already in this clone.
+_commit_refs_trailers() {
+    local format="text"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --trailers) ;;
+            --json) format="json" ;;
+            *) echo "wv commit-refs --trailers: unknown argument: $1" >&2; return 2 ;;
+        esac
+        shift
+    done
+
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        echo "wv commit-refs --trailers: not a git repository" >&2
+        return 1
+    fi
+
+    local pushed_ref
+    pushed_ref=$(_commit_refs_pushed_ref) || {
+        echo "wv commit-refs --trailers: no pushed ref in this clone — nothing to audit" >&2
+        return 1
+    }
+
+    WV_TR_REF="$pushed_ref" WV_TR_DB="$WV_DB" WV_TR_FORMAT="$format" \
+    WV_TR_WEAVE="$WEAVE_DIR" python3 - <<'PY'
+import json, os, pathlib, re, sqlite3, subprocess, sys
+
+ref = os.environ["WV_TR_REF"]
+weave = pathlib.Path(os.environ["WV_TR_WEAVE"])
+fmt = os.environ["WV_TR_FORMAT"]
+
+# Every Weave-ID trailer on the pushed branch. Read from the raw body rather
+# than %(trailers:key=Weave-ID,valueonly), which returns only ONE value when a
+# commit carries several.
+log = subprocess.run(
+    ["git", "log", ref, "--format=%H%x1f%ad%x1f%B%x1e", "--date=short"],
+    capture_output=True, text=True, check=False,
+)
+if log.returncode != 0:
+    print("wv commit-refs --trailers: cannot read git log", file=sys.stderr)
+    raise SystemExit(1)
+
+trailer = re.compile(r"^\s*Weave-ID:\s*(wv-[0-9a-f]{4,})\s*$", re.M)
+hits: dict[str, list[str]] = {}
+when: dict[str, str] = {}
+for record in log.stdout.split("\x1e"):
+    parts = record.split("\x1f")
+    if len(parts) < 3:
+        continue
+    sha, date, body = parts[0].strip(), parts[1].strip(), parts[2]
+    for m in trailer.finditer(body):
+        hits.setdefault(m.group(1), []).append(sha)
+        when[sha] = date
+
+db = os.environ.get("WV_TR_DB") or ""
+con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+live = {r[0] for r in con.execute("SELECT id FROM nodes")}
+tombs = {r[0] for r in con.execute("SELECT id FROM tombstones WHERE kind='node'")}
+
+# Ids this graph ever wrote, from the tracked delta log plus the current export.
+written = set()
+sqlpat = re.compile(r"VALUES\s*\(\s*'(wv-[0-9a-f]+)'|\bid\s*=\s*'(wv-[0-9a-f]+)'")
+days = []
+for day in (weave / "deltas").glob("*"):
+    if day.is_dir():
+        days.append(day.name)
+    for f in day.rglob("*.sql") if day.is_dir() else []:
+        for m in sqlpat.finditer(f.read_text(errors="replace")):
+            written.add(m.group(1) or m.group(2))
+export = weave / "nodes.jsonl"
+if export.exists():
+    for m in re.finditer(r'"id":"(wv-[0-9a-f]+)"', export.read_text(errors="replace")):
+        written.add(m.group(1))
+horizon = min(days) if days else ""
+
+dangling, unadjudicable = [], []
+for node_id, shas in sorted(hits.items()):
+    if node_id in live or node_id in tombs or node_id in written:
+        continue
+    after = sorted(s for s in shas if when.get(s, "") > horizon)
+    if after:
+        dangling.append({"id": node_id, "commits": sorted(shas), "adjudicable_commits": after})
+    else:
+        unadjudicable.append(node_id)
+
+report = {
+    "pushed_ref": ref,
+    "trailer_ids": len(hits),
+    "live": sum(1 for i in hits if i in live),
+    "write_log_horizon": horizon,
+    "unadjudicable": sorted(unadjudicable),
+    "dangling": dangling,
+}
+if fmt == "json":
+    print(json.dumps(report, indent=2, sort_keys=True))
+    raise SystemExit(0)
+
+print(f"Weave-ID trailers on {ref}: {len(hits)} distinct id(s), {report['live']} live")
+if horizon:
+    print(f"write log begins {horizon}; {len(unadjudicable)} id(s) predate it and cannot be adjudicated")
+if not dangling:
+    print("No dangling trailers: every adjudicable id was written by this graph at some point.")
+    raise SystemExit(0)
+print(f"\n{len(dangling)} dangling trailer id(s) — pushed, but this graph never wrote them:")
+for row in dangling:
+    shown = ", ".join(s[:9] for s in row["adjudicable_commits"][:4])
+    more = "" if len(row["adjudicable_commits"]) <= 4 else f" (+{len(row['adjudicable_commits']) - 4} more)"
+    print(f"  {row['id']}  {shown}{more}")
+    print(f"    repair: wv add --id={row['id']} \"<what this node was>\"")
+PY
+}
+
 cmd_commit_refs() {
     # Hook VALIDATION runs before every branch, including the one taken when
     # there are no orphans at all. Sitting inside the orphans-present branch, it
@@ -2634,6 +3038,7 @@ cmd_commit_refs() {
             --prune)   prune=true ;;
             --dry-run) dry_run=true ;;
             --all)     show_all=true ;;
+            --trailers) _commit_refs_trailers "$@"; return $? ;;
             --help|-h) cmd_help commit-refs; return 0 ;;
             *) echo "wv commit-refs: unknown argument: $1" >&2; return 2 ;;
         esac
@@ -2750,7 +3155,9 @@ cmd_commit_refs() {
         if [ "${WV_AUTO_SYNC:-1}" = "0" ] || [ -n "${WV_DB_CUSTOM:-}" ] || [ -n "${_WV_IN_JOURNAL:-}" ]; then
             persisted=skipped
         else
-            auto_sync --force >/dev/null 2>&1 || true
+            # stdout is noise here; stderr is the only explanation the operator
+            # gets for a persisted=false verdict, so it is deliberately kept.
+            auto_sync_or_warn --force >/dev/null
             state_after=$(md5sum "$state_file" 2>/dev/null | awk '{print $1}')
             if [ -n "$state_after" ] && [ "$state_before" != "$state_after" ]; then
                 persisted=true
@@ -2895,11 +3302,17 @@ cmd_compact() {
     # divergence — those changes are permanently lost for that agent.
     local active_claims
     active_claims=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND json_extract(metadata, '\$.claimed_by') IS NOT NULL;" 2>/dev/null || echo "0")
-    if [ "$active_claims" -gt 0 ] && [ "$force" != true ]; then
+    if [ "$active_claims" -gt 0 ] && [ "$force" = true ]; then
+        wv_policy_verdict compact_waits_for_claims allow yes --force "compacted while agents held claims"
+    elif [ "$active_claims" -gt 0 ]; then
+        wv_policy_verdict compact_waits_for_claims deny yes "" \
+            "compacting now could delete deltas a claimed agent has not replayed"
         echo -e "${RED}✗${NC} $active_claims node(s) currently claimed by agents." >&2
         echo "  Active agents may not have replayed all deltas yet." >&2
         echo "  Use --force to compact anyway, or wait until all agents finish." >&2
         return 1
+    else
+        wv_policy_verdict compact_waits_for_claims allow no "" "no agent holds a claim"
     fi
 
     echo -e "${YELLOW}⚠${NC} Only run compact when all agents have loaded the latest state." \
@@ -2984,7 +3397,7 @@ cmd_cutover() {
 
     if [ -f "$marker" ] && [ "$force" != true ]; then
         local existing
-        existing=$(sed -n 's/.*"lineage_seq"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$marker" 2>/dev/null | head -1)
+        existing=$(sed -n 's/.*"lineage_seq"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$marker" 2>/dev/null | sed -n 1p)
         echo -e "${YELLOW}ℹ${NC} causal cutover already stamped (lineage_seq ${existing:-?}) at $marker" >&2
         echo "  Use --force to restamp at the current lineage high-water." >&2
         $as_json && printf '{"status":"exists","lineage_seq":%s}\n' "${existing:-null}"
@@ -3003,11 +3416,17 @@ cmd_cutover() {
     # Coordination gate — a claimed node may hold un-synced pre-cutover work.
     local active_claims
     active_claims=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND json_extract(metadata, '\$.claimed_by') IS NOT NULL;" 2>/dev/null || echo "0")
-    if [ "$active_claims" -gt 0 ] && [ "$force" != true ]; then
+    if [ "$active_claims" -gt 0 ] && [ "$force" = true ]; then
+        wv_policy_verdict cutover_waits_for_claims allow yes --force "cut over while agents held claims"
+    elif [ "$active_claims" -gt 0 ]; then
+        wv_policy_verdict cutover_waits_for_claims deny yes "" \
+            "a cutover now would strand claimed agents' un-synced deltas"
         echo -e "${RED}✗${NC} $active_claims node(s) currently claimed by agents." >&2
         echo "  Their un-synced deltas would become unreplayable after the cutover." >&2
         echo "  Wait until every agent has closed and synced, or use --force." >&2
         return 1
+    else
+        wv_policy_verdict cutover_waits_for_claims allow no "" "no agent holds a claim"
     fi
 
     if [ "$assume_yes" != true ]; then
@@ -3143,12 +3562,14 @@ cmd_prune() {
         return
     fi
 
-    mkdir -p "$archive_dir"
-
-    # Export to archive
+    # Export to archive, but not from a DB foreign to WEAVE_DIR: its rows are not
+    # this repository's graph (wv-5d5ef2, wv-7ab3cd, as in cmd_delete).
     local ids
     ids=$(echo "$candidates" | cut -d'|' -f1 | while read -r _id; do printf '%s,' "$(sql_escape "$_id")"; done | sed 's/,$//')
-    db_query_json "SELECT * FROM nodes WHERE id IN ('${ids//,/\',\'}')" | jq -c '.[]' >> "$archive_file"
+    if ! _wv_db_foreign_to_weave_dir; then
+        mkdir -p "$archive_dir"
+        db_query_json "SELECT * FROM nodes WHERE id IN ('${ids//,/\',\'}')" | jq -c '.[]' >> "$archive_file"
+    fi
 
     # Collect nodes affected by edge deletion for cache invalidation
     # Include: pruned nodes + any nodes connected to them
@@ -3190,16 +3611,10 @@ cmd_prune() {
     # state.sql (wv-0d5e07), replacing the gitignored .weave/.prune_epoch.
     local _prune_agent
     _prune_agent="$(resolve_agent_id 2>/dev/null || echo unknown)"
-    local _tomb_pairs=""   # newline list: "kind\tident\tlineage_seq"
+    local _tomb_pairs=""   # db_capture_tombstones lines for every candidate
     while read -r id; do
-        local _esc_pid _nseq
-        _esc_pid="$(sql_escape "$id")"
-        _nseq=$(db_query "SELECT COALESCE(lineage_seq,0) FROM nodes WHERE id='$_esc_pid';" 2>/dev/null || echo 0)
-        _tomb_pairs+="node	${id}	${_nseq:-0}"$'\n'
-        while IFS='|' read -r _es _et _ety _eseq; do
-            [ -n "$_es" ] || continue
-            _tomb_pairs+="edge	${_es}:${_et}:${_ety}	${_eseq:-0}"$'\n'
-        done < <(db_query "SELECT source, target, type, COALESCE(lineage_seq,0) FROM edges WHERE source='$_esc_pid' OR target='$_esc_pid';" 2>/dev/null)
+        [ -n "$id" ] || continue
+        _tomb_pairs+="$(db_capture_tombstones "$id")"$'\n'
     done < <(echo "$candidates" | cut -d'|' -f1)
 
     # Delete nodes and orphaned edges in a single atomic transaction.
@@ -3226,20 +3641,11 @@ cmd_prune() {
     # tombstones has no _warp trigger, so these INSERTs do not leak into deltas —
     # prune stays non-propagating; the tombstone rows travel only via state.sql
     # and each clone's _reconcile_tombstones re-enforces them after replay.
-    while IFS=$'\t' read -r _tk _ti _tseq; do
-        [ -n "$_tk" ] || continue
-        db_write_tombstone "$_tk" "$_ti" "${_tseq:-0}" "$_prune_agent"
-    done <<< "$_tomb_pairs"
+    db_write_tombstones "$_prune_agent" <<< "$_tomb_pairs"
 
     # Re-dump state.sql so it no longer contains pruned nodes.
     # Without this, wv load would resurrect them from the stale snapshot.
-    local tmp_sql
-    tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
-    if dump_state_sql "$WV_DB" "$tmp_sql" && [ -s "$tmp_sql" ]; then
-        mv "$tmp_sql" "$WEAVE_DIR/state.sql"
-    else
-        rm -f "$tmp_sql"
-    fi
+    _redump_state_after_removal "$(printf '%s\n' "$candidates" | grep -c .)" || true
 
     # Invalidate context cache for all affected nodes
     # shellcheck disable=SC2086  # word-split intentional — affected_nodes is space-delimited ID list
@@ -4243,7 +4649,7 @@ cmd_import() {
     
     # Process JSONL or JSON array
     local content
-    if head -1 "$file" | grep -q '^\['; then
+    if grep -q '^\[' <<< "$(head -1 "$file")"; then
         # JSON array - convert to JSONL
         content=$(jq -c '.[]' "$file")
     else
@@ -4505,6 +4911,14 @@ cmd_search() {
     # nodes_learning_fts uses column `learning_text`, not `text` — rewrite prefix
     local learning_fts_expr
     learning_fts_expr="${fts_expr//text:/learning_text:}"
+    # nodes_fts matches text and alias (wv-92b72c): an alias whose words are not
+    # in the node text was unfindable, so an exact alias returned unrelated nodes
+    # while wv show and wv query alias= resolved it. An exact alias ranks first.
+    local node_fts_expr _fts_cols='{text alias}:'
+    node_fts_expr="${fts_expr//text:/$_fts_cols}"
+    local alias_exact="${query//\'/\'\'}"
+    local alias_first="(id IN (SELECT id FROM nodes WHERE alias = '$alias_exact')) DESC,"
+    local alias_first_n="(n.id IN (SELECT id FROM nodes WHERE alias = '$alias_exact')) DESC,"
 
     # Build filter clauses
     local status_clause=""
@@ -4547,7 +4961,7 @@ cmd_search() {
                 SELECT n.id, n.text, n.status, f.rank AS rank
                 FROM nodes_fts f
                 JOIN nodes n ON f.rowid = n.rowid
-                WHERE nodes_fts MATCH '$fts_expr'
+                WHERE nodes_fts MATCH '$node_fts_expr'
                 $status_clause $type_clause $learning_clause
                 UNION ALL
                 SELECT n.id, n.text, n.status, lf.rank * 2.0 AS rank
@@ -4557,7 +4971,7 @@ cmd_search() {
                 $status_clause $type_clause $learning_clause
             )
             GROUP BY id
-            ORDER BY rank
+            ORDER BY $alias_first rank
             LIMIT $limit;
         "
     else
@@ -4565,9 +4979,9 @@ cmd_search() {
             SELECT n.id, n.text, n.status, f.rank AS rank
             FROM nodes_fts f
             JOIN nodes n ON f.rowid = n.rowid
-            WHERE nodes_fts MATCH '$fts_expr'
+            WHERE nodes_fts MATCH '$node_fts_expr'
             $status_clause $type_clause $learning_clause
-            ORDER BY rank
+            ORDER BY $alias_first_n rank
             LIMIT $limit;
         "
     fi
@@ -4580,7 +4994,7 @@ cmd_search() {
                     SELECT n.id, n.text, n.status, n.metadata, f.rank AS rank
                     FROM nodes_fts f
                     JOIN nodes n ON f.rowid = n.rowid
-                    WHERE nodes_fts MATCH '$fts_expr'
+                    WHERE nodes_fts MATCH '$node_fts_expr'
                     $status_clause $type_clause $learning_clause
                     UNION ALL
                     SELECT n.id, n.text, n.status, n.metadata, lf.rank * 2.0 AS rank
@@ -4590,7 +5004,7 @@ cmd_search() {
                     $status_clause $type_clause $learning_clause
                 )
                 GROUP BY id
-                ORDER BY rank
+                ORDER BY $alias_first rank
                 LIMIT $limit;
             "
         else
@@ -4598,9 +5012,9 @@ cmd_search() {
                 SELECT n.id, n.text, n.status, n.metadata, f.rank AS rank
                 FROM nodes_fts f
                 JOIN nodes n ON f.rowid = n.rowid
-                WHERE nodes_fts MATCH '$fts_expr'
+                WHERE nodes_fts MATCH '$node_fts_expr'
                 $status_clause $type_clause $learning_clause
-                ORDER BY rank
+                ORDER BY $alias_first_n rank
                 LIMIT $limit;
             "
         fi
@@ -4924,7 +5338,7 @@ _trails_save() {
     fi
     # Notes written before this release carry no entry marker; label them so
     # they stay attributable once newer entries are stacked above.
-    if [ -n "$prior_notes" ] && ! printf '%s\n' "$prior_notes" | grep -q '^<!-- wv-note -->$'; then
+    if [ -n "$prior_notes" ] && ! grep -q '^<!-- wv-note -->$' <<< "$prior_notes"; then
         prior_notes=$(printf '<!-- wv-note -->\n### (undated, saved before notes became append-only)\n\n%s' "$prior_notes")
     fi
 
@@ -5042,12 +5456,12 @@ _trails_save() {
             # what this repository did at 19 ready. The count is still derived
             # from the data rather than from the echo succeeding, so a failed row
             # write is still detected.
-            ready_shown=$(printf '%s' "$ready_nodes" | jq -c '.[]' 2>/dev/null | head -10 | wc -l | tr -d ' ')
+            ready_shown=$(printf '%s' "$ready_nodes" | jq -c '.[]' 2>/dev/null | sed -n '1,10p' | wc -l | tr -d ' ')
             [[ "$ready_shown" =~ ^[0-9]+$ ]] || ready_shown=0
             _tr_sections="${_tr_sections}${_tr_sections:+|}## Ready Work ($ready_count unblocked)@@$ready_shown"
             echo "## Ready Work ($ready_count unblocked)"
             echo ""
-            echo "$ready_nodes" | jq -c '.[]' 2>/dev/null | head -10 | while read -r row; do
+            echo "$ready_nodes" | jq -c '.[]' 2>/dev/null | sed -n '1,10p' | while read -r row; do
                 local nid ntext
                 nid=$(echo "$row" | jq -r '.id')
                 ntext=$(_tr_flatten "$(echo "$row" | jq -r '.text')")
@@ -5227,7 +5641,7 @@ _trails_save() {
                 # checked against the whole file; forging it gains nothing,
                 # since a forged Notes heading is what the notes block is for.
                 grep -qxF -- "$sec" "$f" || { IFS="$oldifs"; return 1; }
-            elif ! printf '%s\n' "$gen" | grep -qxF -- "$sec"; then
+            elif ! grep -qxF -- "$sec" <<< "$gen"; then
                 IFS="$oldifs"
                 return 1
             fi
@@ -5642,7 +6056,7 @@ cmd_plan() {
         echo -e "${RED}$_fail_count task(s) failed -- re-run without --gh and use 'wv sync --gh' to batch-create issues${NC}" >&2
     fi
 
-    auto_sync 2>/dev/null || true
+    auto_sync_or_warn
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

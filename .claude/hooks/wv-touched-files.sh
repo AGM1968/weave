@@ -61,6 +61,11 @@ RING_CAP="${WV_TOUCHED_RING_CAP:-20}"
     echo "$REL_PATH"
 } | tail -n "$RING_CAP" > "${RING_FILE}.new" 2>/dev/null && mv "${RING_FILE}.new" "$RING_FILE" 2>/dev/null || true
 
+# A path outside the repository (a memory file, a scratch file) stays absolute
+# after normalisation. It is not the node's work product and no test map can
+# route it, so attributing it made wv done report it stale forever.
+case "$REL_PATH" in /*) exit 0 ;; esac
+
 # Locate active node and append to its metadata.touched_files (cap 50).
 _TF_DB="${WV_DB:-$_HC_DB}"
 [ ! -f "$_TF_DB" ] && exit 0

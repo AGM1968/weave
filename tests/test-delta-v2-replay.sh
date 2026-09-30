@@ -1323,7 +1323,7 @@ mkdir -p "$REPO"
   git config user.name Tester
   common=(WV_HOT_ZONE="$HOT" WV_AUTO_CHECKPOINT=0 WV_SYNC_INTERVAL=0)
   env "${common[@]}" "$ROOT/scripts/wv" init >/dev/null
-  tgt=$(env "${common[@]}" "$ROOT/scripts/wv" add "dispatch target" --status=todo --criteria=c --risks=low | grep -o 'wv-[a-f0-9]\{6\}' | head -1)
+  tgt=$(env "${common[@]}" "$ROOT/scripts/wv" add "dispatch target" --status=todo --criteria=c --risks=low | grep -o 'wv-[a-f0-9]\{6\}' | sed -n 1p)
   env "${common[@]}" "$ROOT/scripts/wv" sync >/dev/null 2>&1 || true
   echo "$tgt" > "$TMP/tgt-id"
 )
@@ -1371,7 +1371,7 @@ rm -rf "$HOT"
 load_err=$(cd "$REPO" && WV_HOT_ZONE="$HOT" WV_AUTO_CHECKPOINT=0 "$ROOT/scripts/wv" load 2>&1 >/dev/null)
 status_after=$(cd "$REPO" && WV_HOT_ZONE="$HOT" WV_AUTO_CHECKPOINT=0 "$ROOT/scripts/wv" show "$TGT" --json 2>/dev/null | jq -r '.status')
 [ "$status_after" = "blocked" ] && ok "wv load applies a committed v2 node_patch sidecar" || bad "wv load applies a committed v2 node_patch sidecar (status=$status_after)"
-printf '%s' "$load_err" | grep -q "Delta v2 replay:" && ok "wv load reports v2 dispositions on stderr" || bad "wv load reports v2 dispositions on stderr"
+grep -q "Delta v2 replay:" <<< "$load_err" && ok "wv load reports v2 dispositions on stderr" || bad "wv load reports v2 dispositions on stderr"
 
 # Hard failure: a corrupt v2 op rolls back and, under strict, fails the load.
 printf '{"format":"weave.delta.v2","garbage":true}\n' > "$V2DIR/000000999998-corrupt.json"

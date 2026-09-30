@@ -30,6 +30,12 @@ native-read the file you will change.
 mid-session check, use `wv status` (~31 tokens). `git status && wv status` is the manual fallback
 when bootstrap is unavailable.
 
+Read `readiness` in the bootstrap output before claiming work. It lists open nodes marked structural
+(`metadata.structural: true`: a red gate, a guard that cannot fire, a tool reporting a result it did
+not earn) and, in a repository whose check records its result, whether that check is known green for
+HEAD. Fix what it lists first: work on a broken framework measures the breakage, not the work. Mark
+a node structural with `wv update <id> --metadata '{"structural": true}'`.
+
 **Sandbox shells:** if `wv` is not on PATH (e.g. Codex sandboxes omit `~/.local/bin`), use the
 repo-local `./scripts/wv` wrapper — it appends `$HOME/.local/bin` and `$HOME/.cargo/bin` itself. The
 Weave Makefile targets apply the same PATH fallback, so `make wv-*` and `make check` work without
@@ -65,7 +71,7 @@ This table is generated from `templates/workflow-classes.conf`. The pre-action h
 | `wv update <id>`           | Modify node                                                                                                            | `--status=`, `--text=`, `--alias=`, `--metadata=`, `--metadata-file=`, `--echo`                                |
 | `wv overview`              | Compact graph/session snapshot                                                                                         | `--json`                                                                                                       |
 | `wv help <command>`        | Focused help for one command                                                                                           | Also available as `wv <command> --help`                                                                        |
-| `wv bootstrap`             | Session-start composite: status + active + context + ready + learnings                                                 | `--json` (run-cached, 45s TTL)                                                                                 |
+| `wv bootstrap`             | Session-start composite: status + readiness + active + context + ready + learnings                                     | `--json` (run-cached, 45s TTL)                                                                                 |
 | `wv touch`                 | Fire-and-forget intent write (zero stdout)                                                                             | `--intent="TEXT"`, `--files=path1,path2` (record edited paths in node_files)                                   |
 | `wv quick "<text>"`        | Track trivial work (create active → commit → done)                                                                     | `--learning="..."`                                                                                             |
 | `wv show <id>`             | Node details + blockers                                                                                                | `--json`                                                                                                       |

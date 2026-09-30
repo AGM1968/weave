@@ -134,14 +134,14 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
     else
         echo -e "  ${RED}✗${NC} $message"
         echo "    Expected to find: $needle"
-        echo "    In: $(echo "$haystack" | head -5)"
+        echo "    In: $(echo "$haystack" | sed -n '1,5p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         FAILURES+=("$message")
         return 1
@@ -153,14 +153,14 @@ assert_not_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if ! echo "$haystack" | grep -qF -- "$needle"; then
+    if ! grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
     else
         echo -e "  ${RED}✗${NC} $message"
         echo "    Expected NOT to find: $needle"
-        echo "    In: $(echo "$haystack" | head -5)"
+        echo "    In: $(echo "$haystack" | sed -n '1,5p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         FAILURES+=("$message")
         return 1
@@ -744,11 +744,11 @@ test_missing_tmpfs() {
     if [ "$exit_code" -eq 0 ]; then
         echo -e "  ${GREEN}✓${NC} Status recovers gracefully after missing DB"
         TESTS_PASSED=$((TESTS_PASSED + 1))
-    elif echo "$result" | grep -qi "load\|restore\|missing\|not found"; then
+    elif grep -qi "load\|restore\|missing\|not found" <<< "$result"; then
         echo -e "  ${GREEN}✓${NC} Status gives helpful error about missing DB"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
-        echo -e "  ${YELLOW}⚠${NC} Status gives unhelpful error on missing DB: $(echo "$result" | head -1)"
+        echo -e "  ${YELLOW}⚠${NC} Status gives unhelpful error on missing DB: $(echo "$result" | sed -n 1p)"
         TESTS_XFAIL=$((TESTS_XFAIL + 1))
     fi
 
@@ -1192,8 +1192,8 @@ test_context_pitfall_scoping() {
     context=$("$WV" context "$task1" --json 2>/dev/null || echo "{}")
 
     local has_pit1=false has_pit2=false
-    echo "$context" | grep -qF -- "$pit1" 2>/dev/null && has_pit1=true
-    echo "$context" | grep -qF -- "$pit2" 2>/dev/null && has_pit2=true
+    grep -qF -- "$pit1" <<< "$context" 2>/dev/null && has_pit1=true
+    grep -qF -- "$pit2" <<< "$context" 2>/dev/null && has_pit2=true
 
     # Fixed: wv-517f — pitfall scoping via neighborhood walk (all edge types)
     assert_equals "true" "$has_pit1" "Context includes own pitfall"
@@ -1215,7 +1215,7 @@ test_health_invalid_status() {
 
     local health score
     health=$("$WV" health 2>&1) || true  # exits non-zero for invalid statuses
-    score=$(echo "$health" | grep -oE '[0-9]+/100' | head -1 || echo "unknown")
+    score=$(echo "$health" | grep -oE '[0-9]+/100' | sed -n 1p || echo "unknown")
 
     # Fixed: wv-01e7 — health check now detects invalid statuses
     assert_fails "Health penalizes invalid status (score: $score)" "$([ "$score" = "100/100" ] && echo 0 || echo 1)"

@@ -67,8 +67,27 @@ _wv_run_cache_key() {
     if command -v resolve_agent_id >/dev/null 2>&1; then
         agent_id=$(resolve_agent_id)
     fi
-    printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+    # State outside the graph that bootstrap's readiness verdict reads (wv-9e14fa):
+    # HEAD and the framework-check record `make check` writes to the git dir.
+    # Neither touches the write sentinel, so without them a cached bootstrap
+    # served a green framework for up to the TTL after make check recorded red
+    # or HEAD moved past the checked commit. One git fork covers both paths;
+    # outside a repository both stay empty.
+    local git_dir="" head="" record="" upstream=""
+    { IFS= read -r git_dir && IFS= read -r head; } < <(
+        git rev-parse --path-format=absolute --git-common-dir HEAD 2>/dev/null) || true
+    if [ -n "$git_dir" ] && [ -f "$git_dir/weave-framework-check.json" ]; then
+        record=$(<"$git_dir/weave-framework-check.json")
+    fi
+    # More of the same (wv-2d4482): the upstream commit decides the heavy tier's
+    # pending/green and moves on push, not on HEAD; the config dir holds the
+    # source-path pointer behind the install-drift advisory; HOME locates the
+    # installed copies it compares. A second bootstrap after any of them moved
+    # replayed the first one's advisories for the whole TTL.
+    upstream=$(git rev-parse --verify --quiet '@{u}' 2>/dev/null || true)
+    printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0' \
         "$*" "$tty_flag" "${NO_COLOR:-}" "${WV_MODE:-}" "${WV_AGENT:-0}" "$agent_id" \
+        "$head" "$record" "$upstream" "${WV_CONFIG_DIR:-}" "${HOME:-}" \
         | md5sum | cut -c1-16
 }
 
@@ -82,8 +101,12 @@ _wv_run_cache_is_fresh() {
     age=$((now - mtime))
     [ "$age" -le "$WV_RUN_CACHE_TTL" ] || return 1
 
-    # Invalidated by a write since this entry was created?
-    if [ -f "$WV_RUN_CACHE_SENTINEL" ] && [ "$cache_file" -ot "$WV_RUN_CACHE_SENTINEL" ]; then
+    # Invalidated by a write since this entry was created? Fresh only if the
+    # entry is STRICTLY newer than the sentinel: file timestamps tick coarsely
+    # (~4ms here, whole seconds on some systems), so a write in the same tick as
+    # the entry left it "not older" and it was served for the whole TTL
+    # (wv-228099).
+    if [ -f "$WV_RUN_CACHE_SENTINEL" ] && ! [ "$cache_file" -nt "$WV_RUN_CACHE_SENTINEL" ]; then
         return 1
     fi
 

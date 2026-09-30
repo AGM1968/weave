@@ -23,7 +23,7 @@ assert_contains() {
     local haystack="$1"
     local needle="$2"
     local msg="${3:-contains assertion}"
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${GREEN}✓${NC} $msg"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -38,7 +38,7 @@ assert_not_contains() {
     local haystack="$1"
     local needle="$2"
     local msg="${3:-not contains assertion}"
-    if ! echo "$haystack" | grep -qF -- "$needle"; then
+    if ! grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${GREEN}✓${NC} $msg"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else

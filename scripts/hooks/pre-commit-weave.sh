@@ -2,9 +2,20 @@
 # Weave pre-commit hook: require active node before committing code changes
 #
 # Enforces the "track ALL work in Weave" rule from AGENTS.md.
-# Allows .weave/-only commits and WIP checkpoints through.
+# Allows graph-state-only commits and WIP checkpoints through.
 #
 # Skip with: git commit --no-verify (or WV_SKIP_PRECOMMIT=1)
+
+# Stale-copy guard (wv-98f12b): .git/hooks/ holds a COPY of this file, refreshed
+# only by install.sh / wv init-repo. When the repository carries the source and
+# the copy differs, run the source instead of silently gating with old logic,
+# and say so. WV_HOOK_REEXEC stops a second hop.
+_wv_hook_src="$(git rev-parse --show-toplevel 2>/dev/null)/scripts/hooks/pre-commit-weave.sh"
+if [ -z "${WV_HOOK_REEXEC:-}" ] && [ -f "$_wv_hook_src" ] && ! cmp -s "$_wv_hook_src" "$0"; then
+    echo "Weave pre-commit: installed hook differs from scripts/hooks/pre-commit-weave.sh — running the source (refresh with ./install.sh)" >&2
+    export WV_HOOK_REEXEC=1
+    exec bash "$_wv_hook_src" "$@"
+fi
 
 hook_progress() {
     [ "${WV_HOOK_PROGRESS:-1}" = "0" ] && return 0
@@ -26,48 +37,9 @@ hook_duration_ms() {
     echo "$_d"
 }
 
-run_hook_suite() {
-    _pc_suite="$1"
-    _pc_cost="${2:-}"
-    # Heuristic may map to a suite that doesn't exist yet — skip rather than fail.
-    [ -f "$REPO_ROOT/$_pc_suite" ] || return 0
-    # A deliberately pre-run suite may already certify these exact index blobs.
-    # Reuse only an all-files fresh green result; test-status returns non-zero for
-    # a missing/wiped ledger, a failed row, a stale fingerprint, or a partial
-    # file set, and older installed wv versions do not know the command — every
-    # one of those cases falls through to the unchanged real-suite execution.
-    if "$WV" test-status "$_pc_suite" --files="${_pc_files_csv:-}" --staged --quiet >/dev/null 2>&1; then
-        hook_progress "reusing fresh green result for $_pc_suite (exact staged content)"
-        return 0
-    fi
-    # A suite with no recorded wall time must not announce "~0s": that reads as a
-    # measurement of a fast suite, and an operator who then waits two minutes for
-    # a silent gate concludes it hung and interrupts it, losing the commit.
-    if [ -n "$_pc_cost" ] && [ "$_pc_cost" -gt 0 ] 2>/dev/null; then
-        hook_progress "running $_pc_suite (~${_pc_cost}s)..."
-    else
-        hook_progress "running $_pc_suite (duration not yet measured)..."
-    fi
-    _pc_t0=$(date +%s%N 2>/dev/null || echo 0)
-    GIT_CONFIG_COUNT=1 \
-        GIT_CONFIG_KEY_0=core.hooksPath \
-        GIT_CONFIG_VALUE_0=/dev/null \
-        WV_CALL_SOURCE=test \
-        bash "$REPO_ROOT/$_pc_suite" </dev/null >/dev/null 2>&1
-    _pc_rc=$?
-    _pc_dur=$(hook_duration_ms "$_pc_t0")
-    # Record the outcome in the verification ledger (P6a) with its wall-clock cost
-    # (LL1). Best-effort — a recording failure must never block the commit. Keyed on
-    # the staged files' fingerprint.
-    "$WV" test-record "$_pc_suite" --files="${_pc_files_csv:-}" --exit="$_pc_rc" --duration="$_pc_dur" >/dev/null 2>&1 || true
-    if [ "$_pc_rc" -ne 0 ]; then
-        echo "" >&2
-        echo "✗ $_pc_suite failed — run manually to see details:" >&2
-        echo "  bash $_pc_suite" >&2
-        echo "" >&2
-        exit 1
-    fi
-}
+# The suite pool (run_hook_suites and its helpers) lives in
+# scripts/lib/wv-gate-pool.sh, shared with the pre-push gate; it is sourced
+# below with the other libraries.
 
 # Prevent recursive hook execution when this hook launches test suites that
 # perform their own git commits.
@@ -86,20 +58,57 @@ WV="$(command -v wv 2>/dev/null || echo "$REPO_ROOT/scripts/wv")"
 # Consumer repos run the installed binary and have NO scripts/lib/, so without
 # this fallback wv_set_phase + validators silently vanish and the hook degrades
 # to its weakest path — wrong phase resolution, no phase reset (finding wv-e754b0 O3).
+# Beside this hook first (scripts/hooks/../lib), as pre-push and the suite pool
+# below already do: a hook run from a checkout against another repository found
+# no $REPO_ROOT/scripts/lib and gated with the INSTALLED helpers, so a source
+# fix to wv-checkpoint-ci.sh never reached it (wv-29d13c). A copied .git/hooks
+# entry has no ../lib and falls through as before.
 _PC_LIB_DIR=""
-for _pc_cand in "$REPO_ROOT/scripts/lib" "$HOME/.local/lib/weave/lib"; do
+for _pc_cand in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/../lib" \
+    "$REPO_ROOT/scripts/lib" "$HOME/.local/lib/weave/lib"; do
     if [ -f "$_pc_cand/wv-config.sh" ]; then _PC_LIB_DIR="$_pc_cand"; break; fi
 done
 if [ -n "$_PC_LIB_DIR" ]; then
     source "$_PC_LIB_DIR/wv-validate.sh" 2>/dev/null || true
     source "$_PC_LIB_DIR/wv-config.sh" 2>/dev/null || true
+    source "$_PC_LIB_DIR/wv-checkpoint-ci.sh" 2>/dev/null || true
 fi
+# The suite pool comes from beside THIS hook first (scripts/hooks/../lib, the
+# source a checkout runs), so a hook run from a checkout never gates with an
+# installed pool of a different version; a copied .git/hooks entry falls back
+# to the resolved and installed lib dirs. Missing everywhere fails the gate at
+# the call site, never silently skips suites.
+for _pc_cand in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/../lib" \
+    "$_PC_LIB_DIR" "$HOME/.local/lib/weave/lib"; do
+    if [ -n "$_pc_cand" ] && [ -f "$_pc_cand/wv-gate-pool.sh" ]; then
+        source "$_pc_cand/wv-gate-pool.sh"
+        break
+    fi
+done
 
-# Check what's being committed — if only .weave/ files, always allow
-STAGED_FILES=$(git diff --cached --name-only 2>/dev/null)
+# Check what's being committed — if only graph state, always allow
+# --no-renames throughout: rename detection lists only the new path, so a
+# git mv hid the old path from routing and dropped the file from A/M filters
+# (wv-29d13c).
+STAGED_FILES=$(git diff --cached --name-only --no-renames 2>/dev/null)
 [ -z "$STAGED_FILES" ] && exit 0
 
-NON_WEAVE_FILES=$(echo "$STAGED_FILES" | grep -v '^\.weave/' || true)
+# Graph state (state.sql, nodes/edges jsonl, deltas, trails) is what wv writes
+# as the graph changes, and it selects no suite. The rest of .weave/ --
+# test-map.conf, quality.conf, patterns/, evidence/ -- is configuration someone
+# edits on purpose, and its own test-map rows must fire: dropping every .weave/
+# path let a map-only commit exit 0 with no suite (wv-a118d6). The allowlist is
+# the one the checkpoint sites commit by (wv-2e6341), so the two cannot drift.
+# NON_WEAVE_FILES keeps its name for the code below; it now means "staged files
+# outside graph state".
+if command -v wv_staged_non_graph_state >/dev/null 2>&1; then
+    NON_WEAVE_FILES=$(wv_staged_non_graph_state "$REPO_ROOT")
+else
+    NON_WEAVE_FILES=$(echo "$STAGED_FILES" | grep -v '^\.weave/' || true)
+    if echo "$STAGED_FILES" | grep -q '^\.weave/'; then
+        echo "Weave pre-commit: graph-state helper not found (wv-checkpoint-ci.sh) — staged .weave/ files are not gated; refresh with ./install.sh" >&2
+    fi
+fi
 [ -z "$NON_WEAVE_FILES" ] && exit 0
 
 # Allow auto-checkpoint WIP commits (contain [skip ci] in message)
@@ -119,15 +128,42 @@ if [ -z "$WS_DIFF" ] && [ -n "$FULL_DIFF" ]; then
     exit 0
 fi
 
+# ── Gate measurement (wv-ffda33) ── Armed only past the early exits above, so
+# .weave-only and checkpoint commits do not drown real gate times. Every suite
+# record this gate writes carries WV_GATE_PHASE/WV_GATE_ID, and the EXIT trap
+# writes one gate record -- wall time, the estimate it announced, the suites it
+# selected, and how it ended -- on success and on every failure path alike.
+export WV_GATE_PHASE=pre-commit
+WV_GATE_ID="pc-$(date +%s%N 2>/dev/null || date +%s)-$$"
+export WV_GATE_ID
+_pc_gate_t0=$(date +%s%N 2>/dev/null || echo 0)
+_pc_gate_suites=""
+_pc_gate_estimate_ms=""
+_pc_gate_finish() {
+    local rc=$?
+    "$WV" test-record gate --gate --exit="$rc" --duration="$(hook_duration_ms "$_pc_gate_t0")" \
+        --estimate="$_pc_gate_estimate_ms" --suites="$_pc_gate_suites" >/dev/null 2>&1 || true
+    return "$rc"
+}
+trap _pc_gate_finish EXIT
+
 # ── Self-heal install drift (cross-agent) ──
 # Editing weave source (scripts/*.sh, .claude/hooks/*.sh) without reinstalling
 # leaves the installed copies stale, which the drift gate only catches ~3min into
 # the test suite. Reinstall up front so no harness — Claude, Codex, Copilot —
 # eats that late failure. Only acts in the dev repo (install.sh present).
+#
+# Never under a test run (WV_CALL_SOURCE=test: the gate pool sets it for every
+# suite, and suites export it). A suite that commits inside its fixture runs
+# this hook, and the install below targets the REAL HOME, so a test run
+# reinstalled the host from whatever the working tree held — an uncommitted
+# edit, or a planted mutant (wv-75937a, cloud probe wv-0b9d5c).
 if command -v _wv_source_drift >/dev/null 2>&1; then
     if _pc_drift=$(_wv_source_drift); then
         _pc_src=$(cat "${WV_CONFIG_DIR:-$HOME/.config/weave}/source-path" 2>/dev/null || echo "")
-        if [ -n "$_pc_src" ] && [ -x "$_pc_src/install.sh" ]; then
+        if [ "${WV_CALL_SOURCE:-}" = "test" ]; then
+            echo "Weave pre-commit: install drift ($_pc_drift) — not self-healing under a test run" >&2
+        elif [ -n "$_pc_src" ] && [ -x "$_pc_src/install.sh" ]; then
             echo "Weave pre-commit: install drift ($_pc_drift) — self-healing via ./install.sh..." >&2
             # Self-heal must install to the REAL machine location regardless of
             # who/what triggered this hook. A test harness's exported isolation
@@ -145,7 +181,7 @@ if command -v _wv_source_drift >/dev/null 2>&1; then
 fi
 
 # Run ruff linter on staged Python files (added/modified only — skip deletions)
-STAGED_PY_FILES=$(git diff --cached --name-only --diff-filter=AM 2>/dev/null | grep '\.py$' | grep -v '^\.weave/' || true)
+STAGED_PY_FILES=$(git diff --cached --name-only --no-renames --diff-filter=AM 2>/dev/null | grep '\.py$' | grep -v '^\.weave/' || true)
 if [ -n "$STAGED_PY_FILES" ]; then
     if command -v ruff > /dev/null 2>&1; then
         hook_progress "running ruff on staged Python files..."
@@ -169,7 +205,7 @@ fi
 # it never ran for a rule-only commit: prose-significance-scaffold was added
 # with its manifest entry but no example, and sat failing until an unrelated
 # Python change happened to stage alongside it.
-STAGED_QUALITY_RULES=$(git diff --cached --name-only --diff-filter=AMD 2>/dev/null \
+STAGED_QUALITY_RULES=$(git diff --cached --name-only --no-renames --diff-filter=AMD 2>/dev/null \
     | grep -E '^(templates/quality-patterns|\.weave/patterns)/managed/' || true)
 if [ -n "$STAGED_PY_FILES" ] || [ -n "$STAGED_QUALITY_RULES" ]; then
     if [ -f "$REPO_ROOT/.venv/bin/python3" ]; then
@@ -185,7 +221,9 @@ if [ -n "$STAGED_PY_FILES" ] || [ -n "$STAGED_QUALITY_RULES" ]; then
         if [ -n "$_pc_pytest_dirs" ]; then
             hook_progress "running focused pytest checks for staged Python/rule changes..."
             # shellcheck disable=SC2086
-            if ! "$PYTHON3" -m pytest $_pc_pytest_dirs -q --tb=short 2>&1; then
+            # Isolated from the commit's git environment: the tests build their
+            # own repositories (wv-34ef3d).
+            if ! gate_isolated "$PYTHON3" -m pytest $_pc_pytest_dirs -q --tb=short 2>&1; then
                 echo "" >&2
                 echo "✗ pytest tests failed — fix before committing." >&2
                 exit 1
@@ -314,14 +352,79 @@ if [ "${#_pc_md_files[@]}" -gt 0 ] && [ -f "$REPO_ROOT/scripts/prose-gate.py" ];
     fi
 fi
 
+# ── Release leak guard (wv-4351d6) ──
+# A shipped test that names a stripped Rust evidence path breaks
+# tests/test-release.sh, yet a change to a test file selects only that file's
+# own suite, so the check never ran on the commit that broke it (wv-eeaded).
+# Where the repository carries the guard (the release builder's own source
+# repository), any staged tests/ path or build-release.sh runs it against the
+# STAGED index, not the working tree (wv-d6c692). Consumer repositories have no
+# build-release.sh, so this is a no-op there.
+#
+# FAILS CLOSED on a materialisation it cannot produce, like the prose gate.
+_pc_leak_hit=false
+for _pc_f in "${_pc_md_all[@]}"; do
+    case "$_pc_f" in tests/* | build-release.sh) _pc_leak_hit=true; break ;; esac
+done
+if [ "$_pc_leak_hit" = true ] && git ls-files --error-unmatch -- build-release.sh tests/test-shipped-test-refs.sh >/dev/null 2>&1; then
+    hook_progress "release leak guard on the staged tests/..."
+    _pc_leak_dir=$(mktemp -d "${TMPDIR:-/tmp}/wv-leak.XXXXXX" 2>/dev/null) || _pc_leak_dir=""
+    if [ -z "$_pc_leak_dir" ] || [ ! -d "$_pc_leak_dir" ]; then
+        echo "✗ release leak guard: could not create a temp directory — refusing to commit unchecked tests" >&2
+        exit 1
+    fi
+    if ! git ls-files -z -- tests build-release.sh \
+        | git checkout-index -f -z --stdin --prefix="$_pc_leak_dir/" 2>/dev/null; then
+        rm -rf "$_pc_leak_dir"
+        echo "✗ release leak guard: could not materialise the staged index — refusing to commit unchecked tests" >&2
+        exit 1
+    fi
+    _pc_leak_rc=0
+    bash "$_pc_leak_dir/tests/test-shipped-test-refs.sh" --scan "$_pc_leak_dir" || _pc_leak_rc=$?
+    rm -rf "$_pc_leak_dir"
+    if [ "$_pc_leak_rc" -ne 0 ]; then
+        exit 1
+    fi
+fi
+
 # Run fast shell workflow suites determined by wv impact --suites.
 # Mapping is driven by .weave/test-map.conf + naming-convention heuristics.
 # tests/run-all.sh is a meta-runner — skip it.
 _pc_files_csv=$(printf '%s\n' "$NON_WEAVE_FILES" | paste -sd ',' -)
 if [ -n "$_pc_files_csv" ]; then
+    # The suite pool is required: without it a call below would print "command
+    # not found" and the hook -- which does not run under set -e -- would carry
+    # on and pass with no suite run (found by ultrareview follow-up).
+    if ! command -v run_hook_suites >/dev/null 2>&1 || ! command -v gate_pool_estimates >/dev/null 2>&1 \
+        || ! command -v gate_pool_launch_order >/dev/null 2>&1; then
+        echo "✗ Weave pre-commit: the suite pool (wv-gate-pool.sh) was not found — refresh with ./install.sh" >&2
+        exit 1
+    fi
     _pc_suites_json=$("$WV" impact --suites --files="$_pc_files_csv" 2>/dev/null || echo '[]')
+    _pc_suites_json=$(gate_pool_estimates "$_pc_suites_json")
     _pc_suite_count=$(printf '%s' "$_pc_suites_json" | jq 'length' 2>/dev/null || echo 0)
-    if [ "${_pc_suite_count:-0}" -gt 0 ]; then
+    # Push tier (wv-862ac0). A suite in the test map's [heavy] section is left
+    # to the pre-push gate, which runs every heavy suite the pushed commits
+    # select against the pushed tip and refuses the push until each is green.
+    # Only when that gate is really installed in the hooks git will run: with
+    # no Weave pre-push hook, deferring would mean the suite never runs, so it
+    # runs here as it always did.
+    _pc_heavy=$(jq -r '[.[] | select(.tier == "heavy") | .name] | join(", ")' <<< "$_pc_suites_json" 2>/dev/null || echo "")
+    if [ -n "$_pc_heavy" ]; then
+        # The same predicate wv done uses; an older library without it counts
+        # as "not installed", which runs the heavy suites here -- the safe way.
+        if command -v wv_prepush_gate_installed >/dev/null 2>&1 && wv_prepush_gate_installed; then
+            hook_progress "deferred to the pre-push gate (heavy tier): $_pc_heavy"
+            _pc_suites_json=$(jq -c '[.[] | select(.tier != "heavy")]' <<< "$_pc_suites_json" 2>/dev/null || echo '[]')
+        else
+            hook_progress "no Weave pre-push gate installed — running heavy-tier suites here: $_pc_heavy"
+        fi
+    fi
+    _pc_light_count=$(printf '%s' "$_pc_suites_json" | jq 'length' 2>/dev/null || echo 0)
+    if [ "${_pc_suite_count:-0}" -gt 0 ] && [ "${_pc_light_count:-0}" -eq 0 ]; then
+        hook_progress "every selected suite is heavy-tier; nothing to run before commit"
+    elif [ "${_pc_suite_count:-0}" -gt 0 ]; then
+        _pc_gate_suites=$(printf '%s' "$_pc_suites_json" | jq -r '[.[].name] | join(",")' 2>/dev/null || echo "")
         _pc_selected=$(printf '%s' "$_pc_suites_json" | jq -r '[.[].name] | join(", ")' 2>/dev/null || echo "")
         _pc_selected_cost=$(printf '%s' "$_pc_suites_json" | jq '[.[].last_cost_s // 0] | add // 0' 2>/dev/null || echo 0)
         # Count suites with no recorded time so the total is not quoted as if it
@@ -329,16 +432,17 @@ if [ -n "$_pc_files_csv" ]; then
         # understate the wait.
         _pc_unmeasured=$(printf '%s' "$_pc_suites_json" | jq '[.[] | select((.last_cost_s // 0) <= 0)] | length' 2>/dev/null || echo 0)
         if [ "${_pc_unmeasured:-0}" -eq 0 ] 2>/dev/null; then
+            # Only a fully measured total is recorded as the gate's estimate; a
+            # partial sum would make the estimate error look better than it is.
+            _pc_gate_estimate_ms=$(( ${_pc_selected_cost:-0} * 1000 ))
             hook_progress "impact-selected shell suites: $_pc_selected (~${_pc_selected_cost}s)"
         elif [ "${_pc_selected_cost:-0}" -gt 0 ] 2>/dev/null; then
             hook_progress "impact-selected shell suites: $_pc_selected (~${_pc_selected_cost}s measured, ${_pc_unmeasured} not yet measured)"
         else
             hook_progress "impact-selected shell suites: $_pc_selected (duration not yet measured)"
         fi
-        while IFS=$'\t' read -r _pc_suite _pc_cost; do
-            [ "$_pc_suite" = "tests/run-all.sh" ] && continue
-            run_hook_suite "$_pc_suite" "$_pc_cost"
-        done < <(printf '%s' "$_pc_suites_json" | jq -r '.[] | [.name, (.last_cost_s|tostring)] | join("\t")' 2>/dev/null)
+        _pc_launch=$(gate_pool_launch_order "$_pc_suites_json")
+        run_hook_suites <<< "$_pc_launch"
     else
         # No suite matched any staged source file — the impact gate is inert for
         # this commit. Surface it so silent test-map rot becomes visible instead
@@ -363,6 +467,7 @@ if [ -n "$_pc_files_csv" ]; then
     fi
 fi
 
+
 # Phase-aware enforcement: allow commits in discover and closing phases.
 # discover = exploring before claiming; closing = recording just-closed work.
 # execute  = substantive work in progress (enforce active node).
@@ -373,7 +478,7 @@ _PC_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_PC_REPO_HASH}}"
 _PC_PHASE=$(cat "${_PC_HOT_ZONE}/.session_phase" 2>/dev/null || echo "execute")
 
 if [ "$_PC_PHASE" = "closing" ]; then
-    wv_set_phase "discover" "$_PC_HOT_ZONE" || true
+    command -v wv_set_phase >/dev/null 2>&1 && { wv_set_phase "discover" "$_PC_HOT_ZONE" || true; }
     exit 0
 fi
 

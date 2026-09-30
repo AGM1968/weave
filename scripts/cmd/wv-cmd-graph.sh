@@ -20,6 +20,7 @@ cmd_block() {
         case "$1" in
             --by=*) blocker="${1#*=}" ;;
             --context=*) context="${1#*=}"; explicit_context=true ;;
+            *) _wv_reject_arg block "$1"; return 1 ;;
         esac
         shift
     done
@@ -48,6 +49,7 @@ cmd_block() {
 
     # Prevent self-blocking
     if [ "$id" = "$blocker" ]; then
+        wv_policy_verdict block_graph_acyclic deny yes "" "a node blocking itself can never become ready"
         echo -e "${RED}Error: a node cannot block itself${NC}" >&2
         return 1
     fi
@@ -56,9 +58,11 @@ cmd_block() {
     local reverse_exists
     reverse_exists=$(db_query "SELECT COUNT(*) FROM edges WHERE source='$id' AND target='$blocker' AND type='blocks';")
     if [ "$reverse_exists" != "0" ]; then
+        wv_policy_verdict block_graph_acyclic deny yes "" "two nodes blocking each other can never become ready"
         echo -e "${RED}Error: circular block detected — $blocker is already blocked by $id${NC}" >&2
         return 1
     fi
+    wv_policy_verdict block_graph_acyclic allow no "" "the edge closes no cycle"
 
     # Validate JSON context if explicit
     if [ "$explicit_context" = "true" ]; then
@@ -130,6 +134,7 @@ cmd_link() {
             --type=*) edge_type="${1#*=}"; edge_type="${edge_type//-/_}" ;;
             --weight=*) weight="${1#*=}" ;;
             --context=*) context="${1#*=}" ;;
+            *) _wv_reject_arg link "$1"; return 1 ;;
         esac
         shift
     done
@@ -353,6 +358,11 @@ cmd_resolve() {
                 loser="$node1"
             fi
 
+            # Close the loser first, through the same receipt as wv done
+            # (wv-957fc8): a refused close must leave the graph unchanged, not
+            # rewire the contradiction around a node that is still open.
+            _done_close "$loser" "" "metadata" "status='done', updated_at=CURRENT_TIMESTAMP" || return 1
+
             # Remove contradiction edge
             db_query "DELETE FROM edges WHERE type='contradicts' AND ((source='$node1' AND target='$node2') OR (source='$node2' AND target='$node1'));"
 
@@ -366,14 +376,21 @@ cmd_resolve() {
                 db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$winner', '$loser', 'supersedes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
             fi
 
-            # Mark loser as done/obsolete
-            db_query "UPDATE nodes SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id='$loser';"
-
             echo -e "${GREEN}✓${NC} Resolved: $winner supersedes $loser"
             [ -n "$rationale" ] && echo "  Rationale: $rationale"
             ;;
 
         merge)
+            # Close both originals first, each through the same receipt as wv
+            # done (wv-957fc8), before the merged node exists. If the second is
+            # refused the first is already closed; say so rather than leave it
+            # to be discovered.
+            _done_close "$node1" "" "metadata" "status='done', updated_at=CURRENT_TIMESTAMP" || return 1
+            if ! _done_close "$node2" "" "metadata" "status='done', updated_at=CURRENT_TIMESTAMP"; then
+                echo -e "${RED}Error: $node2 could not be closed; $node1 is already closed and no merged node was created${NC}" >&2
+                return 1
+            fi
+
             # Create new merged node
             local merged_text="Merged: $(db_query "SELECT text FROM nodes WHERE id='$node1';" | head -1) + $(db_query "SELECT text FROM nodes WHERE id='$node2';" | head -1)"
             local new_id=$(generate_id)
@@ -398,14 +415,13 @@ cmd_resolve() {
                 db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$new_id', '$node2', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
             fi
 
-            # Mark both original nodes as done
-            db_query "UPDATE nodes SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id IN ('$node1', '$node2');"
-
             echo -e "${GREEN}✓${NC} Resolved: created merged node $new_id (obsoletes $node1 and $node2)"
             [ -n "$rationale" ] && echo "  Rationale: $rationale"
             ;;
 
         defer)
+            # A deferral closes nothing, so the close rules have nothing to judge.
+            _close_rules_not_engaged "a deferred resolution closes neither node"
             # Remove contradiction edge
             db_query "DELETE FROM edges WHERE type='contradicts' AND ((source='$node1' AND target='$node2') OR (source='$node2' AND target='$node1'));"
 
@@ -891,8 +907,11 @@ cmd_context() {
         " 2>/dev/null || echo "0")
         edge_time="${edge_time:-0}"
 
-        # Cache is valid if newer than any edge/node changes
-        if [ "$cache_time" -ge "$edge_time" ]; then
+        # Valid only if STRICTLY newer than any edge/node change: both clocks are
+        # whole seconds, so a change in the same second as the cache write is
+        # indistinguishable from one before it, and ">=" served the pre-change
+        # pack -- a removed contradiction kept denying edits (wv-228099).
+        if [ "$cache_time" -gt "$edge_time" ]; then
             cat "$cache_file"
             return 0
         fi
@@ -1529,8 +1548,11 @@ cmd_tree() {
 # has no explicit/glob mapping:
 #   scripts/cmd/wv-cmd-<X>.sh  →  tests/test-<X>.sh
 #   scripts/lib/*.sh or scripts/wv  →  tests/run-all.sh
+# Bare suite paths under a `[heavy]` section mark the push tier (wv-862ac0):
+# routing is unchanged, but each suite is emitted with "tier":"heavy" or
+# "light", and the pre-commit gate leaves heavy suites to the pre-push gate.
 # Reads .weave/test-times.json for estimated suite cost.
-# Outputs JSON: [{"name":"test-X.sh","last_cost_s":N}, ...]
+# Outputs JSON: [{"name":"test-X.sh","last_cost_s":N,"tier":"light|heavy"}, ...]
 # ═══════════════════════════════════════════════════════════════════════════
 
 _impact_suites_for_files() {
@@ -1551,15 +1573,33 @@ _impact_suites_for_files() {
     declare -A _fmap=()
     local _pat_keys=() _pat_vals=()
     local _default_suites=""
+    # [scanners] (wv-b21ca8): a suite that scans a whole tree, with the globs
+    # it scans. Additive: after a file resolves as usual, [default] included,
+    # every scanner whose scope matches it is added, so no row, heuristic or
+    # fail-safe changes. One registry, not a row per scanned file.
+    local _scan_suites=() _scan_scopes=()
+    declare -A _heavy=()
     if [ -f "$map_conf" ]; then
-        local _in_default=false
+        local _in_default=false _in_scanners=false _in_heavy=false
         while IFS= read -r line; do
             # Strip leading whitespace; comments and blanks are noise
             line="${line#"${line%%[![:space:]]*}"}"
             [[ "$line" =~ ^# || -z "$line" ]] && continue
             # Section headers toggle the [default] accumulator
             if [[ "$line" =~ ^\[ ]]; then
-                if [[ "$line" =~ ^\[default\] ]]; then _in_default=true; else _in_default=false; fi
+                _in_default=false; _in_scanners=false; _in_heavy=false
+                if [[ "$line" =~ ^\[default\] ]]; then _in_default=true; fi
+                if [[ "$line" =~ ^\[scanners\] ]]; then _in_scanners=true; fi
+                if [[ "$line" =~ ^\[heavy\] ]]; then _in_heavy=true; fi
+                continue
+            fi
+            if [ "$_in_heavy" = true ]; then
+                # Tier only: never a route, so a stray '=' line here is ignored
+                # rather than read as a mapping.
+                if [[ "$line" != *=* ]]; then
+                    local _h
+                    for _h in $line; do _heavy["$_h"]=1; done
+                fi
                 continue
             fi
             if [[ "$line" != *=* ]]; then
@@ -1572,6 +1612,10 @@ _impact_suites_for_files() {
             key="${key%"${key##*[![:space:]]}"}"  # rtrim key
             key="${key#"${key%%[![:space:]]*}"}"  # ltrim key
             val="${val#"${val%%[![:space:]]*}"}"  # ltrim val
+            if [ "$_in_scanners" = true ]; then
+                _scan_suites+=("$key"); _scan_scopes+=("$val")
+                continue
+            fi
             if [ "$key" = "*" ]; then
                 _default_suites="${_default_suites:+$_default_suites }$val"
             elif [[ "$key" == *[\*\?\[]* || "$key" == */ ]]; then
@@ -1583,7 +1627,8 @@ _impact_suites_for_files() {
     fi
 
     # Collect matched suites (deduped). Exact and every matching glob/prefix
-    # entry are unioned; only a file with no explicit match uses the naming
+    # entry are unioned, plus a changed test suite itself unless its own exact
+    # row says otherwise; only a file with no match uses the naming
     # heuristic, then [default] as the fail-safe.
     declare -A _seen=()
     for f in "$@"; do
@@ -1606,6 +1651,12 @@ _impact_suites_for_files() {
                 fi
             fi
         done
+        # A changed suite runs itself. A broader glob or prefix row adds to
+        # that; only the suite's own exact row can redirect it, as for a suite
+        # another suite drives (wv-a8ab96).
+        if [[ "$f" == tests/test-*.sh && -z "${_fmap[$f]+x}" ]]; then
+            suites="${suites:+$suites }$f"
+        fi
         if [ -z "$suites" ]; then
             # Naming-convention heuristic (Weave's own layout)
             case "$f" in
@@ -1616,12 +1667,26 @@ _impact_suites_for_files() {
                     suites="tests/test-hooks.sh tests/test-graph.sh" ;;
                 scripts/hooks/*)
                     suites="tests/test-hooks.sh" ;;
-                tests/test-*.sh)
-                    suites="$f" ;;
             esac
         fi
         # Fail safe: a configured [default] suite beats running nothing
         [ -z "$suites" ] && suites="$_default_suites"
+        # Tree-wide scanners whose scope covers this file (wv-b21ca8)
+        local _si _scope _scopes
+        for _si in "${!_scan_suites[@]}"; do
+            # read -ra splits without pathname expansion: an unquoted
+            # $scopes would glob 'tests/*.sh' against the working directory
+            # and miss a file that does not exist yet.
+            read -ra _scopes <<< "${_scan_scopes[$_si]}"
+            for _scope in "${_scopes[@]}"; do
+                # unquoted RHS is intentional: glob-match the scope
+                # shellcheck disable=SC2053
+                if [[ "$f" == $_scope ]]; then
+                    suites="${suites:+$suites }${_scan_suites[$_si]}"
+                    break
+                fi
+            done
+        done
         local s
         for s in $suites; do
             _seen["$s"]=1
@@ -1636,8 +1701,10 @@ _impact_suites_for_files() {
     for suite in "${!_seen[@]}"; do
         local bname; bname=$(basename "$suite")
         local cost; cost=$(printf '%s' "$times_data" | jq -r --arg n "$bname" '.[$n] // 0' 2>/dev/null || echo 0)
+        local tier=light
+        [ -n "${_heavy[$suite]+x}" ] && tier=heavy
         [ "$first" = "true" ] || out+=','
-        out+=$(printf '{"name":"%s","last_cost_s":%s}' "$suite" "$cost")
+        out+=$(printf '{"name":"%s","last_cost_s":%s,"tier":"%s"}' "$suite" "$cost" "$tier")
         first=false
     done
     out+=']'

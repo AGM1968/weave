@@ -218,10 +218,13 @@ cmd_findings_promote() {
     local include_root_causes=""
     local include_tooling=""
     local since_days=""
+    local violation_type=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --json)       json_flag="--json" ;;
+            --violation-type=*) violation_type="${1#--violation-type=}" ;;
+            --violation-type)   shift; violation_type="$1" ;;
             --top=*)      top_n="${1#--top=}" ;;
             --top)        shift; top_n="$1" ;;
             --since-days=*) since_days="${1#--since-days=}" ;;
@@ -234,9 +237,12 @@ cmd_findings_promote() {
             --include-root-causes) include_root_causes="--include-root-causes" ;;
             --include-tooling) include_tooling="--include-tooling" ;;
             --help|-h)
-                echo "Usage: wv findings promote [--top=N] [--since-days=N] [--json] [--dry-run] [--include-guardrails] [--include-root-causes] [--include-tooling] [--apply --parent=<node-id>]" >&2
+                echo "Usage: wv findings promote [--top=N] [--since-days=N] [--violation-type=<type>] [--json] [--dry-run] [--include-guardrails] [--include-root-causes] [--include-tooling] [--apply --parent=<node-id>]" >&2
                 echo "  --top defines the reviewed candidate window; --apply does not backfill past that window." >&2
+                echo "  Candidates rank by score, ties by source node id, so a qualifying learning can sit outside" >&2
+                echo "  a --top window: a low --top shows the highest-scoring candidates, not every one (wv-db68df)." >&2
                 echo "  --since-days gates stale signal: only promote learnings whose source node closed within N days (default 30; 0 disables)." >&2
+                echo "  --violation-type files every promoted finding under one catalogued type (contracts/violation-vocabulary-v1.json)." >&2
                 return 0
                 ;;
             *)
@@ -271,6 +277,7 @@ cmd_findings_promote() {
     [ -n "$parent" ] && py_args+=("--parent" "$parent")
     [ -n "$top_n" ] && py_args+=("--top" "$top_n")
     [ -n "$since_days" ] && py_args+=("--since-days" "$since_days")
+    [ -n "$violation_type" ] && py_args+=("--violation-type" "$violation_type")
     [ -n "$json_flag" ] && py_args+=("$json_flag")
     [ -n "$dry_run" ] && py_args+=("$dry_run")
     [ -n "$apply" ] && py_args+=("$apply")

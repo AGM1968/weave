@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -111,6 +112,7 @@ from weave_quality.prose_rules import (
     _string_list,
     _word_regex,
     load_prose_rule,
+    code_rule_out_of_scope,
     prose_rule_out_of_scope,
     run_prose_rule,
     validate_pattern_rule,
@@ -166,6 +168,52 @@ def _load_config_excludes(repo: str) -> list[str]:
             if line:
                 excludes.append(line)
     return excludes
+
+
+def _load_config_exempt(repo: str, section_name: str = "[pattern_exempt]") -> list[str]:
+    """Path patterns of one quality.conf section, from .weave/quality.conf then
+    quality.local.conf.
+
+    The pattern scan reads [pattern_exempt]. It used to read [exempt]
+    (wv-5278fe), but [exempt] holds complexity debt for the close gate, so a
+    file exempted for its CC hid every pattern finding too: the rename-blind
+    defect in wv-cmd-ops.sh was invisible to the scanner (wv-b60cd5). The two
+    are separate keys now. Layering and matching are the close gate's
+    (_parse_quality_conf_file in wv-cmd-data.sh): a pattern ending in / is a
+    directory prefix, anything else one exact repo-relative path. The name uses
+    an underscore because that parser only recognises [a-z_]+ section headers.
+    """
+    patterns: list[str] = []
+    for name in ("quality.conf", "quality.local.conf"):
+        conf = Path(repo) / ".weave" / name
+        if not conf.is_file():
+            continue
+        section = ""
+        for raw_line in conf.read_text().splitlines():
+            line = raw_line.strip()
+            if line.startswith("["):
+                section = line.lower()
+                continue
+            if section != section_name:
+                continue
+            pattern = line.split("#", 1)[0].replace(" ", "")
+            if pattern and pattern not in patterns:
+                patterns.append(pattern)
+    return patterns
+
+
+def _is_exempt(rel_path: str, patterns: list[str]) -> bool:
+    return any(
+        rel_path.startswith(p) if p.endswith("/") else rel_path == p for p in patterns
+    )
+
+
+def _finding_repo_path(finding_path: str, target: Path, repo: Path) -> str:
+    """A finding's path is relative to the scan target; exemptions are relative
+    to the repository."""
+    base = Path(os.path.abspath(str(target)))
+    full = base / finding_path if base.is_dir() else base
+    return os.path.relpath(str(full), os.path.abspath(str(repo))).replace(os.sep, "/")
 
 
 def _resolve_repo(path: str | None) -> str:
@@ -276,13 +324,14 @@ def _discover_files(repo: str, exclude_globs: list[str] | None = None) -> list[s
 
     try:
         result = subprocess.run(
-            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            # -z: unquoted names; the default C-quotes non-ASCII paths (wv-99c85a).
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
             capture_output=True,
             text=True,
             check=True,
             cwd=repo,
         )
-        candidates = result.stdout.strip().splitlines()
+        candidates = [p for p in result.stdout.split("\0") if p]
     except (subprocess.CalledProcessError, FileNotFoundError):  # pragma: no cover
         # Fallback: walk filesystem
         candidates = []
@@ -2035,6 +2084,11 @@ def _validate_ast_grep_match(match: dict[str, object], rule_path: Path, target: 
         fail("text must be a string")
 
 
+# Dot-directories that hold code a pattern rule must see. ast-grep skips every
+# hidden directory while walking a target, so each one is passed by name.
+_SCANNED_DOT_DIRS = (".claude",)
+
+
 def _run_pattern_rule(
     rule_id: str, rule_path: Path, target: Path, scan_id: int, repo: Path, language: str
 ) -> list[PatternFinding]:
@@ -2054,6 +2108,12 @@ def _run_pattern_rule(
     if not ast_grep:
         return []
     cmd = [ast_grep, "scan", "--rule", str(rule_path), "--json", str(target)]
+    # ast-grep skips dot-directories when it walks a directory, so no bash rule
+    # ever reached .claude/hooks/*.sh (wv-b60cd5). Naming the directory makes
+    # ast-grep scan it; hidden trees in general (.git, .venv) stay unscanned.
+    for dot_dir in _SCANNED_DOT_DIRS:
+        if target.is_dir() and (target / dot_dir).is_dir():
+            cmd.append(str(target / dot_dir))
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
     except subprocess.TimeoutExpired as exc:
@@ -2150,6 +2210,7 @@ def _execute_pattern_rules(
     """
     all_findings: list[PatternFinding] = []
     successful_runs: list[dict[str, object]] = []
+    exempt = _load_config_exempt(str(repo))
     for rule_id, rule_path, language in rules:
         # "" default -- if _pattern_definition_hash itself fails below (the
         # rule file vanished between discovery and here), the except clause
@@ -2162,6 +2223,11 @@ def _execute_pattern_rules(
             # a single try/except in this loop has even started watching.
             definition_hash = _pattern_definition_hash(rule_path)
             found = _run_pattern_rule(rule_id, rule_path, target, run_id, repo, language)
+            if exempt:
+                found = [
+                    f for f in found
+                    if not _is_exempt(_finding_repo_path(f.path, target, repo), exempt)
+                ]
             # Identity attachment reads each finding's source file and
             # builds a Path from a backend-derived path string -- kept
             # inside this same failure boundary (not run once for the
@@ -2404,15 +2470,18 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
     raw_hits = {r: raw_hits_by_rule.get(r, 0) for r, _, _ in rules}
     rule_sources = {r: _rule_source(path) for r, path, _ in rules}
 
-    # A prose rule with no eligible file under the target reported zero because
-    # it never ran, not because the file is clean (wv-33733d). Only computed for
-    # rules that found nothing, so a scan with findings pays nothing for it.
+    # A rule with no eligible file under the target reported zero because it
+    # never ran, not because the file is clean: a prose rule outside its
+    # paths: (wv-33733d), a code rule with no file of its language (wv-76fc4a).
+    # Only computed for rules that found nothing, so a scan with findings pays
+    # nothing for it.
     out_of_scope = sorted(
         rule_id
         for rule_id, rule_path, language in rules
-        if language in PROSE_LANGUAGES
-        and not summary.get(rule_id)
-        and prose_rule_out_of_scope(rule_path, target, repo)
+        if not summary.get(rule_id)
+        and (prose_rule_out_of_scope(rule_path, target, repo)
+             if language in PROSE_LANGUAGES
+             else code_rule_out_of_scope(language, target))
     )
 
     return _emit_pattern_scan(
@@ -2479,17 +2548,16 @@ def _emit_pattern_scan(
             )
         )
     else:
-        # The applied fraction is only claimed when something was skipped. With
-        # nothing out of scope, printing "N of N applied" would assert that the
-        # ast-grep code rules ran too -- and a python rule on a Markdown target
-        # is the same structural zero through ast-grep's own language filter,
-        # which this check does not cover.
+        # The applied fraction is only claimed when something was skipped.
+        # Both kinds of structural zero are counted: a prose rule outside its
+        # paths: and a code rule with no file of its language (wv-76fc4a), so
+        # "N of M applied" never asserts that a rule ran on files it cannot see.
         if out_of_scope_set:
             applied = len(rules) - len(out_of_scope_set)
             print(
                 f"Pattern scan complete: {applied} of {len(rules)} prose/code rules "
                 f"applied, {total} findings "
-                f"({len(out_of_scope_set)} prose rule(s) out of scope for this target)"
+                f"({len(out_of_scope_set)} rule(s) out of scope for this target)"
             )
         else:
             print(f"Pattern scan complete: {len(rules)} rules, {total} findings")
@@ -2497,7 +2565,7 @@ def _emit_pattern_scan(
             if rule_id in out_of_scope_set:
                 print(
                     f"  {rule_id} [{rule_sources.get(rule_id, 'custom')}]: "
-                    "n/a — no file under this target is in the rule's paths:"
+                    "n/a — no file under this target is in the rule's scope"
                 )
                 continue
             raw = raw_hits.get(rule_id, count)
@@ -2701,6 +2769,8 @@ _PROSE_SCHEMA_OPTIONAL_KEYS = (
     "policy",
     "provenance",
     "message",
+    "calibration_script",
+    "calibration_command",
 )
 
 
@@ -2824,6 +2894,28 @@ def _prose_schema_coverage(
     }
 
 
+def _report_calibration(entry: dict[str, object], rule: dict[str, object], repo: Path) -> None:
+    """Expose a rule's rerun contract, and refuse one that cannot be rerun.
+
+    The parser has already checked the reference's shape; here the repository
+    is known, so a script that is not there makes the rule invalid rather than
+    leaving a quotable number with nothing behind it (wv-335581).
+    """
+    if "calibration_script" not in rule:
+        return
+    script = str(rule["calibration_script"])
+    if not (repo / script).is_file():
+        raise PatternRuleValidationError(
+            f"{entry['path']}: calibration_script {script!r} does not exist under {repo}"
+        )
+    command = str(rule["calibration_command"])
+    entry["calibration"] = {
+        "script": script,
+        "command": command,
+        "rerun": f"cd {shlex.quote(str(repo))} && {command}",
+    }
+
+
 def cmd_patterns_validate(args: argparse.Namespace) -> int:
     """Validate every candidate rule independently and report schema coverage.
 
@@ -2870,6 +2962,7 @@ def cmd_patterns_validate(args: argparse.Namespace) -> int:
             entry["language"] = language
             if language in PROSE_LANGUAGES:
                 rule = load_prose_rule(rule_path, rule_id)
+                _report_calibration(entry, rule, repo)
                 schema_by_id[id(entry)] = {
                     "kind": str(rule.get("kind", "")),
                     "match_scope": str(rule.get("match_scope", "")),
@@ -2926,6 +3019,9 @@ def cmd_patterns_validate(args: argparse.Namespace) -> int:
     for entry in results:
         if entry["status"] == "valid":
             print(f"  {entry['rule_id']:40s} [{entry['language']}] valid")
+            calibration = entry.get("calibration")
+            if isinstance(calibration, dict):
+                print(f"  {'':40s} calibration rerun: {calibration['rerun']}")
         elif entry["status"] == "ignored":
             print(f"  {entry['rule_id']:40s} IGNORED: {entry['error']}")
         else:
@@ -3698,6 +3794,12 @@ def main() -> int:  # pragma: no cover
     )
     findings_promote_parser.add_argument(
         "--parent", default="", help="Parent node ID to link via references"
+    )
+    findings_promote_parser.add_argument(
+        "--violation-type",
+        default="",
+        help="File every promoted finding under this catalogued violation_type "
+        "(contracts/violation-vocabulary-v1.json); uncatalogued values are refused",
     )
     findings_promote_parser.add_argument(
         "--json", action="store_true", help="JSON output"

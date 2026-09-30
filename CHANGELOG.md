@@ -4,6 +4,176 @@
 
 ## Unreleased
 
+## [1.71.0-rc.13] - 2026-09-30
+
+rc.13 replaces the rc.12 release archive, which carried a `.git` directory it should not have; the
+rc.12 archive is superseded. It also fixes Delta v2 replay on Python 3.11 (Debian 12's default),
+where every `wv load` of a repository with a causal cutover rolled the v2 batch back. Beyond that:
+persistence failures that now surface instead of passing silently, a two-tier commit gate, typed
+policy verdicts for every refusal, and a faster CLI.
+
+### Added
+
+- **`wv --version` identifies the build.** Two installs of the same tag can run different code. The
+  version line now appends the recorded build, for example
+  `wv 1.71.0-rc.13 (build v1.71.0-rc.13-4-g1a2b3c4d5)`, with a dirty marker when the install came
+  from an uncommitted tree. The leading `wv <version>` is unchanged for anything parsing it.
+
+- **`wv add --id=<wv-id>` reconstructs a lost node.** A pushed commit trailer names a node id
+  permanently; if the node is later lost, the id can now be recreated. An alias or an id that
+  already exists is refused.
+
+- **`wv commit-refs` audits pushed `Weave-ID` trailers back to the graph,** classifying each id as
+  present, tombstoned (deleted on purpose) or dangling. `wv add --id` repairs a dangling one.
+
+- **`wv context-policy`** prints the context load policy (HIGH, MEDIUM or LOW) from one source that
+  every harness and the MCP server share.
+
+- **A two-tier commit gate.** Suites listed under `[heavy]` in `.weave/test-map.conf` run at push
+  time in a new pre-push hook, against the pushed tip, instead of on every commit. The hook refuses
+  a push on a red suite, on a tracked tree that differs from the tip, or on a pushed ref that is not
+  `HEAD`. `install.sh` and `wv init-repo` install it; a repository without a `[heavy]` section is
+  unaffected, and pre-commit keeps running heavy suites wherever no pre-push hook is installed.
+
+- **The pre-commit gate runs suites in parallel,** `WV_GATE_JOBS` at a time (default 4; `1` restores
+  the serial gate), longest first, estimated from each suite's recent runs.
+
+- **`wv hotzone db`** prints the live graph database path, the supported way to read the graph with
+  `sqlite3`. `wv doctor` warns about a second `brain.db` for the same repository elsewhere.
+
+- **`wv remember --supersedes=<id>`** replaces a memory and keeps the old one as its tombstone.
+
+- **`AGENTS.md` is generated** between markers like the other agent surfaces, so it no longer drifts
+  from the procedures it summarises.
+
+- **Session start reports a red framework.** `wv bootstrap` reads the last `make check` record and
+  names a failing framework as the first thing to fix.
+
+- **Three default quality rules** (`git-listing-rename-blind`, `live-db-file-operation`,
+  `lookup-skips-beside-self`) with coaching guides, a `code:vacuous-verification` violation type,
+  and `wv findings promote --violation-type=<type>`.
+
+- **A `verify-before-fixed` procedure and skill:** watch the test fail without the fix, and check
+  the failures are the expected ones, before calling a defect fixed.
+
+- **`wv doctor` checks the Delta v2 catalog** and fails on a committed op that would make every load
+  roll back v2 replay. `wv-delta-v2-replay.py --check` runs the same validation without a database.
+
+- **Every refusal names its rule.** `contracts/policy-rules-v1.json` declares which rules may refuse
+  which operations. Command gates, close clauses, SQLite triggers and host hooks record a typed
+  verdict in the attempt journal (deny, bypass with the flag that granted it, advisory or allow),
+  and every path that closes a node goes through the same checks as `wv done`.
+
+### Changed
+
+- **Write-path commands refuse arguments they do not recognise.** `wv add`, `done`, `work`, `block`,
+  `link`, `touch`, `quick`, `ship` and `update` used to skip an unknown option and still report
+  success, so `wv done <id> --learnings=...` closed the node and dropped the learning. They now exit
+  nonzero and write nothing. `wv update` accepts `--text`, `--status`, `--alias` and `--remove-key`
+  in the space-separated form as well.
+
+- **Metadata numbers must be integers,** as `weave.canonical-json.v1` requires. Store a scaled
+  integer or a decimal string instead of a float.
+
+- **`--risks` accepts only `none`, `low`, `medium` and `high`.**
+
+- **A hot-zone override owned by another repository is refused.** A `WV_HOT_ZONE` or `WV_DB` naming
+  another repository's hot zone now fails with exit 1 instead of falling back to the current
+  repository's live graph.
+
+- **`wv init-repo` keeps a locally edited vendored hook source** unless run with `--update` or
+  `--force`.
+
+- **`wv quality patterns scan` reads its own `[pattern_exempt]` section.** `[exempt]` holds
+  complexity debt for the close gate and no longer hides pattern findings. The scan also covers
+  `.claude/`.
+
+- **`wv list` reports the true number of matches** when its cap hides some; MCP `weave_list` takes
+  `limit`.
+
+- **`wv search` indexes aliases,** and an exact alias ranks first.
+
+- **`wv add` catches reworded duplicates** by weighted word overlap instead of an exact five-word
+  match.
+
+- **`wv ready` hides nodes marked reserved** and says how many; `wv ready --all` lists them and
+  `wv work` refuses them unless `WV_ALLOW_RESERVED=1`.
+
+- **Git hooks run the repository's source when their installed copy is stale,** and say so.
+
+- **Automatic commits stage graph state only,** so configuration under `.weave/` goes through the
+  commit gate like any other file.
+
+- **`install.sh`** removes skills it installed that no longer ship, installs `trails` in place of
+  `breadcrumbs`, re-renders the Codex contract's memory on `--update`, and leaves the repository's
+  hooks alone under a sandboxed `HOME`.
+
+- **Session start labels how the previous session ended** from its final state.
+
+### Fixed
+
+- **Delta v2 replay on Python 3.11.** `wv load` rolled the v2 batch back on every load of a
+  repository with a causal cutover.
+
+- **`wv done` and `wv add` no longer report success after a failed persist.** They print
+  `NOT PERSISTED`, exit nonzero, and `wv done` leaves the linked GitHub issue open. Twelve other
+  call sites that discarded sync failures now warn when a change reached only the hot-zone database.
+
+- **`wv load` names the nodes it drops,** with the command that recovers one from
+  `.weave/nodes.jsonl`, and changes the live database only through SQLite.
+
+- **`wv work` reports a claim only when it persisted.**
+
+- **Session start probes whether the graph can be written,** so a hot zone that cannot persist no
+  longer scores 100/100.
+
+- **Lineage schema repair.** A lineage stamp failure routes to recovery instead of promising a
+  retry, `db_ensure` migrates a partial lineage schema, `wv doctor` hydrates committed state on a
+  cold start, and the edge-type enum rebuild keeps the lineage columns.
+
+- **`wv delete` and `wv prune` never re-dump a foreign or partial database over `state.sql`.**
+
+- **Delta v2 validation matches the schema** for edge weights and node patches, and the writer
+  refuses a non-finite weight.
+
+- **Enabling call telemetry no longer turns off abort-on-error.**
+
+- **`wv query` matches JSON booleans and numbers** in metadata.
+
+- **A pipeline under `pipefail` no longer reports a `grep -q` match as a failure.**
+
+- **Renames no longer hide the old path** from the commit gates or `wv doctor`.
+
+- **Quality tooling:** out-of-scope code rules say so instead of reporting 0, masked code spans and
+  table cells no longer manufacture prose findings, bash function ends are found past heredoc
+  comments and `; }` one-liners, and dirty files with non-ASCII names are scanned.
+
+- **The pre-close hook honours `--skip-verification`** before the commit-attribution check, and no
+  longer advises amending a commit that may be pushed.
+
+- **Caches treat a same-second write as newer,** so a stale entry is not served.
+
+- **A test run no longer reinstalls the host** through the pre-commit self-heal.
+
+### Performance
+
+- **Each `wv` call does less work before it starts:** schema migrations run once per process and are
+  skipped when a stamp shows they are current, and command modules load on first use.
+
+### Removed
+
+- **`scripts/hooks/post-commit-weave.sh`**, replaced by the pre-push tier. `install.sh` removes the
+  installed copy and a Weave-marked `.git/hooks/post-commit`.
+
+- **`scripts/context-guard.sh`**; the SessionStart hook is the one copy.
+
+- **The `breadcrumbs` skill.** Use `trails`.
+
+### Known issues
+
+- **The schema stamp can certify a failed migration.** If a migration fails transiently, later calls
+  skip it. Deleting `brain.db.ensured` in the hot zone makes the next call re-run the migrations.
+
 ## [1.71.0-rc.12] - 2026-09-07
 
 Corrective maintenance prerelease. `db_migrate_lineage` could not converge a database whose lineage
@@ -161,12 +331,12 @@ rules now record their peer-reviewed corpus support.
 
 ### Changed
 
-- Delta replay is ordered by causal lineage, not the wall clock (epic). Every changeset
-  arm now carries `(lineage_seq, lineage_actor)` and a compare-and-set guard, so a delta replayed
-  from the committed back-catalog can no longer revert or delete a causally newer row; `wv load`
-  orders the v1 SQL replay by the `/* weave-lineage */` header rather than the filename epoch. A
-  committed `.weave/causal-cutover` marker fail-closes the pre-lineage back-catalog, and
-  cross-machine deletions travel as `tombstones` rows in `state.sql` in place of the machine-local
+- Delta replay is ordered by causal lineage, not the wall clock (epic). Every changeset arm now
+  carries `(lineage_seq, lineage_actor)` and a compare-and-set guard, so a delta replayed from the
+  committed back-catalog can no longer revert or delete a causally newer row; `wv load` orders the
+  v1 SQL replay by the `/* weave-lineage */` header rather than the filename epoch. A committed
+  `.weave/causal-cutover` marker fail-closes the pre-lineage back-catalog, and cross-machine
+  deletions travel as `tombstones` rows in `state.sql` in place of the machine-local
   `.weave/.prune_epoch`. Consumers inherit the `.gitattributes` rules (`causal-cutover merge=ours`,
   `deltas/**/*.json merge=theirs`) on `wv init-repo --update`. Existing consumer repos need no
   migration: their committed catalogs predate the cutover marker and are skipped on load; a one-time
@@ -204,8 +374,8 @@ rules now record their peer-reviewed corpus support.
 ### Fixed
 
 - A wall-clock-newer delta at a lower causal lineage could silently override a causally newer
-  checkpoint on `wv load` (); the E6 durability battery had encoded this as an expected
-  XFAIL. The lineage-guarded merge resolves it and the battery re-contracts the row to `pass`.
+  checkpoint on `wv load` (); the E6 durability battery had encoded this as an expected XFAIL. The
+  lineage-guarded merge resolves it and the battery re-contracts the row to `pass`.
 
 - Delta v2 `node_patch` / `edge_patch` replay lacked the lineage guard `node_create` already
   carried, so a stale-lineage op (e.g. the `claimed_by` patch `wv add` emits) applied against — and
@@ -392,13 +562,13 @@ release remains frozen; this candidate is distributed from the private source re
   measured, the newest entry sat about 36 hours behind the file mtime while the walk re-ran each
   time. It now compares against the graph clock (`MAX(updated_at)`), matching `wv context`.
 
-- **Agent surfaces describe the repo they are written into** — the managed blocks are authored for a
+- **Agent surfaces describe the repo they are written into**: the managed blocks are authored for a
   consumer, so `wv init-repo --update` wrote into the weave source checkout that the repo "does not
   vendor weave's own `scripts/wv`" and pointed the PATH fallback at the installed binary, sending an
   agent to test something other than the tree it was editing. `.weave/runtime.md` had the inverse
-  defect, hardcoding the source-repo form for consumers. Every rendered surface — `CLAUDE.md`,
-  `.github/copilot-instructions.md`, `.weave/runtime.md` — now takes the form matching the repo it
-  is written into. `AGENTS.md` is user-owned and untouched.
+  defect, hardcoding the source-repo form for consumers. Every rendered surface (`CLAUDE.md`,
+  `.github/copilot-instructions.md`, `.weave/runtime.md`) now takes the form matching the repo it is
+  written into. `AGENTS.md` is user-owned and untouched.
 
 - **`wv doctor` separates expected checkpoint churn from real provenance loss** — auto-checkpoint
   refs go unreachable as a matter of course, and reporting them identically to a regular ref going
@@ -413,11 +583,11 @@ release remains frozen; this candidate is distributed from the private source re
   from the newest node and edge timestamp: it clears on sync, rises when the graph actually changes,
   and is stable across reads.
 
-- **A rule file with the wrong extension is reported, not ignored** — only `*.yaml` is loaded, so a
+- **A rule file with the wrong extension is reported, not ignored**: only `*.yaml` is loaded, so a
   perfectly valid rule saved as `.yml` never ran while `scan`, `list` and `validate` all stayed
   silent with exit 0, giving the author no way to learn their rule was inert. The file is still not
-  loaded — silently activating rules that were never executing would change gate outcomes in
-  existing repositories — but it is now named, with the rename to make.
+  loaded, since silently activating rules that were never executing would change gate outcomes in
+  existing repositories, but it is now named, with the rename to make.
 
 - **`wv impact` and `wv discover` compose through files, not argv** — `wv context` was fixed for
   this in `f3375783`, but the same shape remained in `impact` (seeds, unblocked, suites, and the
@@ -545,17 +715,17 @@ release remains frozen; this candidate is distributed from the private source re
   `_hc_classify_tool` that sets the flag, and by collapsing four copies of the library-source
   fallback chain into one rule applied to all five libraries. Behaviour is unchanged: every payload
   in a 15-case differential returns the same exit code as before. `pre-action.sh`'s own fail-closed
-  path now has direct test coverage, which it never had — only
-  `wv hook dispatch`/`normalize` were tested for it.
+  path now has direct test coverage, which it never had — only `wv hook dispatch`/`normalize` were
+  tested for it.
 
 ### Added
 
-- **`wv commit-refs`** — audits the commit SHAs recorded on nodes against the pushed branch. Each
-  ref is classified `reachable` (an ancestor of the pushed ref), `pending` (local only — unpushed or
-  on another branch, and not an orphan), `unreachable` (the object exists but no ref reaches it, the
+- **`wv commit-refs`**: audits the commit SHAs recorded on nodes against the pushed branch. Each ref
+  is classified `reachable` (an ancestor of the pushed ref), `pending` (local only: unpushed or on
+  another branch, and not an orphan), `unreachable` (the object exists but no ref reaches it, the
   signature of an amend, reset or rebase) or `missing` (gone from this object database). `--all`
   lists every ref rather than only the orphans, `--json` emits the same data structured, and
-  `--prune` removes orphaned refs — at every node that records one, children included, since an
+  `--prune` removes orphaned refs at every node that records one, children included, since an
   epic-only edit does not survive the next aggregation. `wv doctor` now carries the count as an
   advisory so drift surfaces without being asked for; `--repair` deliberately does not prune, as
   discarding recorded provenance is a deliberate act rather than a repair.
@@ -1066,9 +1236,8 @@ not grant Rust mutation authority or claim cross-machine causal durability.
 ### Added
 
 - **Cross-harness agent-source attribution** — telemetry now records which harness originated a `wv`
-  call (Claude, Codex, VS Code Copilot) honestly across machines. Codex and Copilot are attested via
-  host markers rather than guessed, behind a documented cross-harness call-source contract
-.
+  call (Claude, Codex, VS Code Copilot) accurately across machines. Codex and Copilot are attested
+  via host markers rather than guessed, behind a documented cross-harness call-source contract.
 - **Agent identity separated from hot-zone placement** — `resolve_agent_id` (identity) and
   `is_sandboxed_runtime` (placement) are now independent axes, and the run-cache key includes
   identity so concurrent Claude/Codex agents no longer leak each other's cached results.
@@ -1103,7 +1272,7 @@ not grant Rust mutation authority or claim cross-machine causal durability.
 
 ### Added
 
-- **Agent-neutral procedure delivery system** — workflow procedures now live once as host-neutral
+- **Agent-neutral procedure delivery system** — workflow procedures are defined once as host-neutral
   canonical sources (`templates/procedures/<name>.md`) with a small contract header (`id`,
   `description`, `fallback`, `visibility`, `adapters`, `claude_skill`, `resources`), installed to
   `$CONFIG_DIR/procedures/` and projected into each harness's native surface:
@@ -1283,17 +1452,17 @@ not grant Rust mutation authority or claim cross-machine causal durability.
   `weave_quality_patterns` gains the `promote` subcommand with `parent`/`dry_run` — promote was
   absent from the enum entirely. Parity baseline 41 -> 32; every remaining line is a deliberate
   exclusion, the EXPOSE debt is retired.
-- **Table-driven MCP dispatch**: the 850-line `handleTool` switch (CC 237, the repo's
-  worst function) is now a `Record<string, ToolHandler>` map — 45 entries, each handler returning
-  result text or a full response envelope for enforcement paths. The `mcp/src/index.ts` quality-gate
+- **Table-driven MCP dispatch**: the 850-line `handleTool` switch (CC 237, the repo's worst
+  function) is now a `Record<string, ToolHandler>` map — 45 entries, each handler returning result
+  text or a full response envelope for enforcement paths. The `mcp/src/index.ts` quality-gate
   exemption is retired; no function in the file exceeds CC 20. Tier-2 parity flags exposed in the
   same pass: `weave_search.type`, `weave_code_search.filter`, `weave_impact.files` (seeds from file
   paths; `ids` no longer required when `files` given); `search --mode/--graph/--filter` reclassified
   as code-path flags already covered by `weave_code_search`. Parity baseline 43 -> 41.
 - **Pattern-audit Check 7** — non-predicate Bash functions ending in a bare `[ cond ] && cmd` tail
   are now flagged, preventing implicit status leaks from becoming control-flow contracts.
-- **MCP tier-1 parity flags exposed**: `weave_add` gains `criteria`/`risks` (claim-ready
-  node creation per decomposition discipline), `weave_quick` gains `learning`, `weave_ship` gains
+- **MCP tier-1 parity flags exposed**: `weave_add` gains `criteria`/`risks` (claim-ready node
+  creation per decomposition discipline), `weave_quick` gains `learning`, `weave_ship` gains
   `verification_method`/`verification_evidence`, and `weave_done` gains `verification_evidence` —
   agentic closes over MCP can now attach evidence instead of drawing the post-close advisory. Parity
   baseline shrank 49 → 43 (tests/test-mcp-parity.sh enforces shrink-never-grow).
@@ -1384,8 +1553,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 
 - **Stale-signal gate on findings promotion.** `wv findings promote` now accepts `--since-days N`
   (default 30) and refuses to promote findings whose evidence is older than the threshold. Prevents
-  stale findings from entering the graph with misleading urgency. Override with `--force`
-.
+  stale findings from entering the graph with misleading urgency. Override with `--force`.
 - **`wv uninstall` command.** Removes Weave from `~/.local/bin/`, `~/.local/lib/weave/`,
   `~/.config/weave/`, and optionally `.weave/` in the current repo. Documented lifecycle companion
   to `wv init-repo`. Install help updated to surface the command.
@@ -1396,15 +1564,13 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   `finding.violation_type` against the canonical enum at write time, not only at close time.
   Prevents invalid violation types from entering the DB silently.
 - **Pattern C finding schema reconciled.** `violation_type` enum expanded with `measurement-gap`;
-  `historical:tooling` remapped to `historical:defect`. Flat→nested schema inconsistency resolved
-.
+  `historical:tooling` remapped to `historical:defect`. Flat→nested schema inconsistency resolved.
 - **`wv sync --gh` defaults to fast mode.** Omitting `--mode` previously defaulted to `--mode=full`
   (exhaustive reconcile across entire graph), which under GH auth failures created duplicate issues
   and left done nodes with open GH issues. Default is now `--mode=fast` (routine close path). Use
   `--mode=full` deliberately for periodic reconcile.
 - **`uninstall` classified as exempt in run-cache registry.** `wv pattern-audit` Check 1 now passes
-  cleanly. Gate clock for Pattern A Rust port reset to 2026-06-10; not-before date 2026-06-24
-.
+  cleanly. Gate clock for Pattern A Rust port reset to 2026-06-10; not-before date 2026-06-24.
 - **`wv list --json` emits `created_at`/`updated_at` fields.** Stale-node UTC parse fixed for
   downstream consumers that calculate node age.
 - **Telemetry call-log four-count correctness.** `WV_CALL_LOG` entry counts corrected for
@@ -1698,7 +1864,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   findings to an enforced gate. `wv doctor` gains a matching advisory.
 - **Phase 6 — verification boundary (test-correctness gate).** `wv done` is now the single owner of
   the "is this correct?" decision for tests as well as structural quality. A producer/consumer split
-  (PROPOSAL graph-as-policy-boundary §4.6): suites record outcomes, `wv done` reads them and
+  (PROPOSAL graph-as-policy-boundary section 4.6): suites record outcomes, `wv done` reads them and
   decides; it never runs a test runner.
   - **`test_results` ledger + `wv test-record <suite> --files=… --exit=N`** — one row per file keyed
     `(suite, path)`, fingerprint = the file's git blob hash. pre-commit and post-commit hooks record
@@ -1756,9 +1922,10 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 
 ### Fixed
 
-- **Honest session-analysis reader.** `wv analyze sessions --call-stats` no longer implies a default
-  log path the writer never populates. With logging off it reports "instrumentation disabled" and
-  points to `wv config enable session-analysis`; "enabled but empty" is a distinct message.
+- **Accurate session-analysis reader.** `wv analyze sessions --call-stats` no longer implies a
+  default log path the writer never populates. With logging off it reports "instrumentation
+  disabled" and points to `wv config enable session-analysis`; "enabled but empty" is a distinct
+  message.
 - **pre-commit hook lib resolution.** The hook now resolves its lib dir like the `wv` binary does
   (repo-local `scripts/lib/` first, then the installed `~/.local/lib/weave/lib`). Consumer repos
   that run the installed binary and have no `scripts/lib/` previously lost `wv_set_phase` and the
@@ -2187,7 +2354,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   ```
 
   Run `wv load` after editing the file to apply in an existing session. Full reference:
-  `wv quality help` and `scripts/weave_quality/README.md` § Quality Gate.
+  `wv quality help` and `scripts/weave_quality/README.md` (Quality Gate section).
 
 - **`wv query` — unified predicate-based graph reader** — new command with full predicate parser
   supporting `key=value`, `key!=value`, `key>=N`, `key IN (a,b,c)`, `HAS key` (dual-schema aware for
@@ -2579,7 +2746,6 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 
 - **M3 — signed install manifest**: proposal-scope (GPG vs cosign + build-release.sh changes).
 
-
 ## [1.41.2] - 2026-04-19
 
 ### Fixed
@@ -2619,8 +2785,8 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   `tests/test_weave_gh_phases.py::test_finding_nodes_are_skipped`.
 - **`.claude/scheduled_tasks.lock` tracked in git**: the Claude Code scheduler creates and removes
   this transient lock file each session; it was committed once and every session opened with a
-  `D.claude/scheduled_tasks.lock` entry in `git status`, masking real changes. Added to
-  `.gitignore` (plus `.claude/*.lock` glob) and removed from the index via `git rm --cached`.
+  `D.claude/scheduled_tasks.lock` entry in `git status`, masking real changes. Added to `.gitignore`
+  (plus `.claude/*.lock` glob) and removed from the index via `git rm --cached`.
 
 ### Docs
 
@@ -2735,10 +2901,10 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   `runtime/` to `archive/runtime/` and `archive/tests/` respectively. Removed the `runtime`
   dependency group from `pyproject.toml` (anthropic, rich, textual, openai, keyring). Retargeted
   pyright, mypy, and pytest config to exclude `archive/`. Updated `build-release.sh` strip paths,
-  `docs/ARCHITECTURE.md` §2 (marked archived), and `README.md` boundaries section. Bandit retargeted
-  to `scripts/weave_gh` + `scripts/weave_quality` with `--skip B108,B324,B608` for intentional false
-  positives (tmpfs paths, non-security MD5, internal SQL formatting). Runtime continues development
-  in the separate `weave-runtime` repo.
+  `docs/ARCHITECTURE.md` section 2 (marked archived), and `README.md` boundaries section. Bandit
+  retargeted to `scripts/weave_gh` + `scripts/weave_quality` with `--skip B108,B324,B608` for
+  intentional false positives (tmpfs paths, non-security MD5, internal SQL formatting). Runtime
+  continues development in the separate `weave-runtime` repo.
 
 ## [1.39.0] - 2026-04-16
 
@@ -2788,7 +2954,8 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   overhead when unset. Works alongside the Python runtime path (identical JSONL schema).
 - **`wv analyze sessions --call-stats`**: Reads the call log and ranks commands by output volume —
   surfaces which `wv` commands inject the most tokens into agent context.
-- **WEAVE.md §8.3 Call Instrumentation**: Public docs covering enable/log format/analyze usage.
+- **WEAVE.md section 8.3 Call Instrumentation**: Public docs covering enable/log format/analyze
+  usage.
 - **`tests/test-analyze.sh`**: 7-test regression suite for `wv analyze sessions`.
 
 ### Fixed
@@ -3749,8 +3916,8 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
   or refresh the Weave block in existing CLAUDE.md files without overwriting project content.
 - **AGENTS.md.template** — new generic stub (23 lines) replaces shipping memory-system's 205-line
   development reference to the public repo.
-- **build-release.sh** — CLAUDE.md, AGENTS.md, and.github/copilot-instructions.md all generated
-  from templates at build time (no longer ships memory-system-specific copies).
+- **build-release.sh** — CLAUDE.md, AGENTS.md, and.github/copilot-instructions.md all generated from
+  templates at build time (no longer ships memory-system-specific copies).
 
 ## [1.17.0] - 2026-03-06
 
@@ -3997,7 +4164,7 @@ within ±2 (BoolOp counting — intentional divergence documented in `docs/CC-ME
 
 - **Quality scanner: DIT→direct_bases rename** — `len(cls.bases)` measures the number of direct base
   classes (breadth), not inheritance chain depth. Metric renamed from `dit` to `direct_bases` for
-  semantic honesty. Old key retained in VALID_METRICS for backwards DB compatibility. (Issue 5)
+  semantic accuracy. Old key retained in VALID_METRICS for backwards DB compatibility. (Issue 5)
 - **Quality scanner: ExceptHandler ev depth** — `visit_ExceptHandler` now increments depth in the
   essential complexity visitor, so return statements inside `except` blocks register at a different
   structural depth than returns in the `try` body. Fixes ev(G) under-counting for try/except
@@ -4276,13 +4443,13 @@ MCP server now exposes 28 tools (was 23). All scope assignments updated. 24/24 M
 - **Sync data loss prevention**: All 3 `sqlite3.dump` sites (auto_sync, cmd_sync, post-GH re-dump)
   now use `.timeout 5000` to wait for write locks instead of returning empty. `cmd_sync` also guards
   against empty dumps before overwriting `state.sql`.
-- **Context pitfall scoping**: Replaced blocks-only ancestry CTE with bidirectional
-  neighborhood walk across all edge types (depth-limited to 4 hops). Pitfalls linked via
-  `implements`/`addresses` edges are now included in context packs.
-- **Health check false penalty**: Added `blocked-external` to allowed status set so
-  legitimate nodes don't trigger health score deductions.
-- **Context ancestors diamond dedup**: Changed `cmd_context` ancestors CTE from
-  `UNION ALL` to `UNION` to prevent duplicate ancestors in diamond dependency graphs.
+- **Context pitfall scoping**: Replaced blocks-only ancestry CTE with bidirectional neighborhood
+  walk across all edge types (depth-limited to 4 hops). Pitfalls linked via `implements`/`addresses`
+  edges are now included in context packs.
+- **Health check false penalty**: Added `blocked-external` to allowed status set so legitimate nodes
+  don't trigger health score deductions.
+- **Context ancestors diamond dedup**: Changed `cmd_context` ancestors CTE from `UNION ALL` to
+  `UNION` to prevent duplicate ancestors in diamond dependency graphs.
 - **Test hygiene**: Promoted 13 `assert_xfail` tests to real assertions — 0 known bugs remain in the
   stress test suite.
 

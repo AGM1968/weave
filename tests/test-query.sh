@@ -373,6 +373,37 @@ assert_contains "$out" "query" "wv help lists query command"
 out=$("$WV" help query 2>&1)
 assert_contains "$out" "Predicates:" "wv help query delegates to --help"
 
+# wv-e99999: metadata equality compared json_extract() against a quoted string,
+# so a JSON true (json_extract -> 1) never equalled 'true' and a JSON 216 never
+# equalled '216'. The query returned nothing, which reads as "no such nodes".
+echo ""
+echo -e "${YELLOW}=== wv query: typed metadata equality ===${NC}"
+
+tq() { local id; id=$("$WV" add "$1" --status=todo --metadata="$2" 2>/dev/null); echo "${id%%$'\n'*}"; }
+tq "wq-typed: bool true"    '{"structural":true,"commits":216}' >/dev/null
+tq "wq-typed: string true"  '{"structural":"true","commits":"216"}' >/dev/null
+tq "wq-typed: bool false"   '{"structural":false,"commits":7}' >/dev/null
+
+out=$("$WV" query structural=true 2>&1)
+assert_contains "$out" "wq-typed: bool true" "key=true matches a JSON boolean true"
+assert_contains "$out" "wq-typed: string true" "key=true still matches the string 'true'"
+assert_not_contains "$out" "wq-typed: bool false" "key=true excludes a JSON false"
+out=$("$WV" query structural=false 2>&1)
+assert_contains "$out" "wq-typed: bool false" "key=false matches a JSON boolean false"
+out=$("$WV" query structural!=true 2>&1)
+assert_contains "$out" "wq-typed: bool false" "key!=true keeps a JSON false"
+assert_not_contains "$out" "wq-typed: bool true" "key!=true drops a JSON true"
+assert_not_contains "$out" "wq-typed: string true" "key!=true drops the string 'true'"
+assert_not_contains "$out" "wq-test: active task" "key!=true still excludes nodes without the key"
+out=$("$WV" query commits=216 2>&1)
+assert_contains "$out" "wq-typed: bool true" "key=<n> matches a JSON number"
+assert_contains "$out" "wq-typed: string true" "key=<n> still matches the numeric string"
+assert_not_contains "$out" "wq-typed: bool false" "key=<n> excludes other numbers"
+out=$("$WV" query "structural IN (true,maybe)" 2>&1)
+assert_contains "$out" "wq-typed: bool true" "key IN (true,...) matches a JSON boolean"
+out=$("$WV" query --help 2>&1)
+assert_contains "$out" "JSON boolean" "--help states how booleans and numbers compare"
+
 # ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------

@@ -104,7 +104,7 @@ DB=$(make_db)
 # T1: NULL alias INSERT — no pre-clear emitted
 sqlite3 "$DB" "INSERT INTO nodes(id,text,alias) VALUES('wv-0001','task one',NULL);"
 CS=$(wv_delta_changeset "$DB")
-echo "$CS" | grep -q 'UPDATE nodes SET alias=NULL' \
+grep -q 'UPDATE nodes SET alias=NULL' <<< "$CS" \
     && fail "T1: NULL alias" "pre-clear emitted for NULL alias" \
     || ok "T1: NULL alias INSERT — no pre-clear emitted"
 wv_delta_reset "$DB"
@@ -112,7 +112,7 @@ wv_delta_reset "$DB"
 # T2: Non-NULL alias INSERT — pre-clear emitted
 sqlite3 "$DB" "INSERT INTO nodes(id,text,alias) VALUES('wv-0002','task two','mytask');"
 CS=$(wv_delta_changeset "$DB")
-echo "$CS" | grep -q "UPDATE nodes SET alias=NULL, lineage_seq=0, lineage_actor='' WHERE alias='mytask' AND id!='wv-0002'" \
+grep -q "UPDATE nodes SET alias=NULL, lineage_seq=0, lineage_actor='' WHERE alias='mytask' AND id!='wv-0002'" <<< "$CS" \
     && ok "T2: non-NULL alias INSERT — pre-clear emitted" \
     || fail "T2: alias pre-clear" "not found in: $CS"
 wv_delta_reset "$DB"
@@ -134,7 +134,7 @@ wv_delta_reset "$DB"
 # T4: Timestamps propagate through INSERT changeset
 sqlite3 "$DB" "INSERT INTO nodes(id,text,created_at,updated_at) VALUES('wv-0004','ts node',1700000000,1700000001);"
 CS=$(wv_delta_changeset "$DB")
-echo "$CS" | grep -q '1700000000' && echo "$CS" | grep -q '1700000001' \
+grep -q '1700000000' <<< "$CS" && grep -q '1700000001' <<< "$CS" \
     && ok "T4: INSERT changeset carries created_at + updated_at" \
     || fail "T4: timestamp propagation" "not found in: $CS"
 wv_delta_reset "$DB"
@@ -142,7 +142,7 @@ wv_delta_reset "$DB"
 # T5: Node DELETE emits correct statement
 sqlite3 "$DB" "DELETE FROM nodes WHERE id='wv-0004';"
 CS=$(wv_delta_changeset "$DB")
-echo "$CS" | grep -q "DELETE FROM nodes WHERE id='wv-0004'" \
+grep -q "DELETE FROM nodes WHERE id='wv-0004'" <<< "$CS" \
     && ok "T5: node DELETE emits correct statement" \
     || fail "T5: node DELETE" "not found: $CS"
 wv_delta_reset "$DB"
@@ -152,7 +152,7 @@ sqlite3 "$DB" "INSERT INTO nodes(id,text,status) VALUES('wv-0005','stable','read
 wv_delta_reset "$DB"
 sqlite3 "$DB" "UPDATE nodes SET status='ready' WHERE id='wv-0005';"
 CS=$(wv_delta_changeset "$DB")
-echo "$CS" | grep -q '^-- no-op UPDATE' \
+grep -q '^-- no-op UPDATE' <<< "$CS" \
     && ok "T6: no-op UPDATE emits -- no-op comment" \
     || fail "T6: no-op UPDATE" "expected comment, got: $CS"
 wv_delta_reset "$DB"
@@ -162,7 +162,7 @@ sqlite3 "$DB" "INSERT INTO nodes(id,text,alias) VALUES('wv-0006','null alias',NU
 wv_delta_reset "$DB"
 sqlite3 "$DB" "UPDATE nodes SET alias='newalias' WHERE id='wv-0006';"
 CS=$(wv_delta_changeset "$DB")
-echo "$CS" | grep -q "alias='newalias'" \
+grep -q "alias='newalias'" <<< "$CS" \
     && ok "T7: NULL→value UPDATE included in diff" \
     || fail "T7: NULL→value" "not in changeset: $CS"
 wv_delta_reset "$DB"
@@ -170,7 +170,7 @@ wv_delta_reset "$DB"
 # T8: value→NULL UPDATE is included in diff
 sqlite3 "$DB" "UPDATE nodes SET alias=NULL WHERE id='wv-0006';"
 CS=$(wv_delta_changeset "$DB")
-echo "$CS" | grep -q 'alias=NULL' \
+grep -q 'alias=NULL' <<< "$CS" \
     && ok "T8: value→NULL UPDATE included in diff" \
     || fail "T8: value→NULL" "not in changeset: $CS"
 wv_delta_reset "$DB"
@@ -180,7 +180,7 @@ sqlite3 "$DB" "INSERT INTO edges(source,target,type) VALUES('wv-0001','wv-0002',
 wv_delta_reset "$DB"
 sqlite3 "$DB" "DELETE FROM edges WHERE source='wv-0001' AND target='wv-0002' AND type='blocks';"
 CS=$(wv_delta_changeset "$DB")
-echo "$CS" | grep -q "DELETE FROM edges WHERE source='wv-0001' AND target='wv-0002' AND type='blocks'" \
+grep -q "DELETE FROM edges WHERE source='wv-0001' AND target='wv-0002' AND type='blocks'" <<< "$CS" \
     && ok "T9: edge DELETE colon-split parses correctly" \
     || fail "T9: edge DELETE" "bad parse: $CS"
 wv_delta_reset "$DB"
@@ -220,7 +220,7 @@ sqlite3 "$DB" "INSERT INTO edges(source,target,type,weight) VALUES('wv-c','wv-d'
 wv_delta_reset "$DB"
 sqlite3 "$DB" "UPDATE edges SET weight=1.0 WHERE source='wv-c' AND target='wv-d' AND type='blocks';"
 CS=$(wv_delta_changeset "$DB")
-echo "$CS" | grep -q '^-- no-op UPDATE on edge' \
+grep -q '^-- no-op UPDATE on edge' <<< "$CS" \
     && ok "T10c: edge UPDATE no-op emits comment" \
     || fail "T10c: edge no-op" "expected comment, got: $CS"
 wv_delta_reset "$DB"
@@ -317,12 +317,12 @@ UPDATE edges SET weight=2.0 WHERE source='wv-keep' AND target='wv-gone' AND type
 DELETE FROM edges WHERE source='wv-gone' AND target='wv-keep' AND type='implements';"
 CS=$(wv_delta_changeset "$DB" "agent-a" 7)
 guarded=0
-echo "$CS" | grep -q "INSERT INTO nodes.*lineage_seq.*ON CONFLICT.*WHERE nodes.lineage_seq = 0" && guarded=$((guarded+1))
-echo "$CS" | grep -qE "UPDATE nodes SET .*lineage_seq=7.* WHERE id='wv-keep'.*nodes.lineage_seq = 0" && guarded=$((guarded+1))
-echo "$CS" | grep -qE "DELETE FROM nodes WHERE id='wv-gone' AND \(lineage_seq = 0 OR \(lineage_seq, lineage_actor\) <= \(7,'agent-a'\)\)" && guarded=$((guarded+1))
-echo "$CS" | grep -q "INSERT INTO edges.*lineage_seq.*ON CONFLICT.*WHERE edges.lineage_seq = 0" && guarded=$((guarded+1))
-echo "$CS" | grep -qE "UPDATE edges SET .*lineage_seq=7.*edges.lineage_seq = 0" && guarded=$((guarded+1))
-echo "$CS" | grep -qE "DELETE FROM edges WHERE .*AND \(lineage_seq = 0 OR \(lineage_seq, lineage_actor\) <= \(7,'agent-a'\)\)" && guarded=$((guarded+1))
+grep -q "INSERT INTO nodes.*lineage_seq.*ON CONFLICT.*WHERE nodes.lineage_seq = 0" <<< "$CS" && guarded=$((guarded+1))
+grep -qE "UPDATE nodes SET .*lineage_seq=7.* WHERE id='wv-keep'.*nodes.lineage_seq = 0" <<< "$CS" && guarded=$((guarded+1))
+grep -qE "DELETE FROM nodes WHERE id='wv-gone' AND \(lineage_seq = 0 OR \(lineage_seq, lineage_actor\) <= \(7,'agent-a'\)\)" <<< "$CS" && guarded=$((guarded+1))
+grep -q "INSERT INTO edges.*lineage_seq.*ON CONFLICT.*WHERE edges.lineage_seq = 0" <<< "$CS" && guarded=$((guarded+1))
+grep -qE "UPDATE edges SET .*lineage_seq=7.*edges.lineage_seq = 0" <<< "$CS" && guarded=$((guarded+1))
+grep -qE "DELETE FROM edges WHERE .*AND \(lineage_seq = 0 OR \(lineage_seq, lineage_actor\) <= \(7,'agent-a'\)\)" <<< "$CS" && guarded=$((guarded+1))
 [ "$guarded" = "6" ] \
     && ok "T15: all six changeset arms carry a lineage guard" \
     || fail "T15: six-arm guard" "guarded=$guarded/6 CS=$CS"
@@ -664,7 +664,7 @@ sqlite3 "$DB" "UPDATE nodes SET text='B' WHERE id='wv-ca';
 UPDATE nodes SET status='active' WHERE id='wv-ca';"
 watermark_ca=$(wv_delta_compact_batch "$DB")
 ca_new_data=$(sqlite3 "$DB" "SELECT new_data FROM _warp_changes WHERE row_id='wv-ca';")
-echo "$ca_new_data" | grep -q '"created_at":777' \
+grep -q '"created_at":777' <<< "$ca_new_data" \
     && ok "wv_delta_compact_batch preserves created_at through a chain that ends in UPDATE (round 3 finding 2.1)" \
     || fail "compact_batch created_at" "new_data=$ca_new_data"
 wv_delta_reset "$DB"
@@ -742,7 +742,7 @@ INSERT INTO nodes(id,text,status,created_at,updated_at) VALUES('wv-samefields','
 watermark_sf=$(wv_delta_compact_batch "$DB")
 sf_op=$(sqlite3 "$DB" "SELECT operation FROM _warp_changes WHERE row_id='wv-samefields';")
 CS_SF=$(wv_delta_changeset "$DB" "agent-a" 9 "$watermark_sf")
-echo "$CS_SF" | grep -q '^-- no-op' \
+grep -q '^-- no-op' <<< "$CS_SF" \
     && fail "compact_batch same-fields recreate" "changeset collapsed to a no-op comment: $CS_SF" \
     || ok "wv_delta_compact_batch never collapses a delete-then-recreate to a no-op comment even when recreated fields match (round 3 finding 2.2)"
 wv_delta_reset "$DB"
@@ -877,6 +877,35 @@ got=$(wv_mutation_seq_for_snapshot "notanumber" 9)
 got=$(wv_mutation_seq_for_snapshot 7 "")
 [ "$got" = "7" ] && ok "an unreadable post-snapshot counter falls back to the pre-snapshot one" \
     || fail "an unreadable post-snapshot counter falls back to the pre-snapshot one" "got '$got'"
+
+# ─── S0 re-measure survivors (wv-70fdf4) ─────────────────────────────────────
+# Both were inverted in a planted break and every routed suite stayed green.
+
+# wv_delta_changeset <db> <actor> <seq> <max_id> emits only changes up to
+# max_id: auto_sync reads the change log's high-water mark before dumping, and
+# a change landing after it belongs to the next changeset.
+DB=$(make_db)
+sqlite3 "$DB" "INSERT INTO nodes(id,text) VALUES('wv-0701','before the mark');"
+MARK=$(sqlite3 "$DB" "SELECT MAX(id) FROM _warp_changes;")
+sqlite3 "$DB" "INSERT INTO nodes(id,text) VALUES('wv-0702','after the mark');"
+CS=$(wv_delta_changeset "$DB" "" 0 "$MARK")
+if grep -q "wv-0701" <<< "$CS" && ! grep -q "wv-0702" <<< "$CS"; then
+    ok "a changeset bounded by max_id holds only the changes up to it"
+else
+    fail "a changeset bounded by max_id holds only the changes up to it" "got: $CS"
+fi
+
+# wv_lineage_seq_base takes the highest sequence in the v2 catalog when the
+# graph holds none, so a new writer never reuses a published sequence.
+CAT=$(mktemp -d /tmp/delta-catalog-XXXXXX)
+mkdir -p "$CAT/2026-09-01/v2" "$CAT/2026-09-02/v2"
+: > "$CAT/2026-09-01/v2/000000000003-aaaa.json"
+: > "$CAT/2026-09-02/v2/000000000012-bbbb.json"
+: > "$CAT/2026-09-02/v2/000000000007-cccc.json"
+got=$(wv_lineage_seq_base "$CAT/no-such.db" "$CAT")
+[ "$got" = "12" ] && ok "the lineage base is the highest catalog sequence" \
+    || fail "the lineage base is the highest catalog sequence" "got '$got'"
+rm -rf "$CAT"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 

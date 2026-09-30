@@ -34,19 +34,24 @@ _PC_HOT_ZONE="${_HC_HOT_ZONE}"
 _NOW=$(date +%s)
 # wv-822bea/wv-179c49: hijack guard, same rule as auto_checkpoint/cmd_sync in
 # wv-cmd-data.sh — refuse to commit if the caller pre-staged anything outside
-# .weave/, so this checkpoint never silently absorbs unrelated in-progress work.
+# graph state, so this checkpoint never silently absorbs unrelated in-progress
+# work. wv-2e6341: only graph state is staged; .weave/ configuration stays in
+# the tree, and without the helpers (lib not found) nothing is committed.
 _PC_PRESTAGED=""
-if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
-    _PC_PRESTAGED=$(git diff --cached --name-only 2>/dev/null | grep -v '^\.weave/' || true)
+if ! command -v wv_stage_graph_state >/dev/null 2>&1; then
+    _PC_PRESTAGED="checkpoint helpers unavailable"
+elif [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
+    _PC_PRESTAGED=$(wv_staged_non_graph_state "$PWD")
 fi
 if [ -z "$_PC_PRESTAGED" ]; then
-git add .weave/ 2>/dev/null || true
+wv_stage_graph_state "$PWD" 2>/dev/null || true
 if ! git diff --cached --quiet 2>/dev/null; then
     _PC_BRANCH=$(git branch --show-current 2>/dev/null || echo "main")
     _PC_LOCAL=$(git rev-parse HEAD 2>/dev/null || echo "")
     _PC_REMOTE=$(git rev-parse "origin/$_PC_BRANCH" 2>/dev/null || echo "none")
     _PC_LAST_MSG=$(git log -1 --format='%s' 2>/dev/null || echo "")
-    _PC_LAST_NW=$(git diff HEAD~1 HEAD --name-only 2>/dev/null | grep -v '^\.weave/' | grep -v '^$' || true)
+    # --no-renames: see session-end-sync.sh (wv-b60cd5).
+    _PC_LAST_NW=$(git diff --no-renames HEAD~1 HEAD --name-only 2>/dev/null | grep -v '^\.weave/' | grep -v '^$' || true)
     # wv-e937f8: see session-end-sync.sh's identical comment. wv-179c49: fail
     # toward NOT skipping CI when the marker helper is unavailable or fails.
     _PC_SKIP_CI=$(command -v wv_checkpoint_ci_marker >/dev/null 2>&1 \

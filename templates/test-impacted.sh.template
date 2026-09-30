@@ -39,8 +39,9 @@ run_full() {
 }
 
 # Staged sources (added/modified). Re-derived here so the script stands alone.
-mapfile -t staged < <(git diff --cached --name-only --diff-filter=AM 2>/dev/null \
-    | grep -E "$SRC_REGEX" || true)
+# --no-renames: a renamed-and-edited source is status R, which AM would drop.
+mapfile -t staged < <(git diff --cached --name-only --no-renames --diff-filter=AM 2>/dev/null \
+    | grep -E -- "$SRC_REGEX" || true)
 [ "${#staged[@]}" -eq 0 ] && run_full
 
 # Map each staged source to its mirror test dir, climbing to the nearest existing

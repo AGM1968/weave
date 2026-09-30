@@ -244,6 +244,17 @@ class TestFailureHandling:
             apply_plan(json.dumps(document).encode(), run=FakeWv(), metadata_writer=writer)
         assert caught.value.code == "incomplete_snapshot"
 
+    def test_a_document_that_is_not_a_plan_is_refused_before_any_call(self, writer) -> None:
+        # wv-e07ee4: without this check a foreign document with a complete
+        # snapshot reached the graph writes.
+        document = json.loads(plan(["a.py"]))
+        document["format"] = "weave.coaching-promotion-input.v1"
+        wv = FakeWv()
+        with pytest.raises(ApplyError, match="not a promotion plan") as caught:
+            apply_plan(json.dumps(document).encode(), run=wv, metadata_writer=writer)
+        assert caught.value.code == "usage"
+        assert not wv.calls
+
 
 class TestPlanBytes:
     def test_the_digest_travels_into_the_node(self, writer) -> None:

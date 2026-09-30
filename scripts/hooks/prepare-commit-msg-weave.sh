@@ -1,6 +1,15 @@
 #!/usr/bin/env sh
 # Weave: append Weave-ID trailers to commit messages
 
+# Stale-copy guard (wv-98f12b): see pre-commit-weave.sh.
+_wv_hook_src="$(git rev-parse --show-toplevel 2>/dev/null)/scripts/hooks/prepare-commit-msg-weave.sh"
+if [ -z "${WV_HOOK_REEXEC:-}" ] && [ -f "$_wv_hook_src" ] && ! cmp -s "$_wv_hook_src" "$0"; then
+    echo "Weave prepare-commit-msg: installed hook differs from scripts/hooks/prepare-commit-msg-weave.sh — running the source (refresh with ./install.sh)" >&2
+    WV_HOOK_REEXEC=1
+    export WV_HOOK_REEXEC
+    exec sh "$_wv_hook_src" "$@"
+fi
+
 COMMIT_MSG_FILE="$1"
 COMMIT_SOURCE="$2"
 

@@ -64,7 +64,7 @@ from weave_quality.db import (
     query_pattern_findings,
 )
 from weave_quality.hotspots import compute_hotspots
-from weave_quality.models import FileEntry, FunctionCC, GitStats
+from weave_quality.models import FileEntry, FunctionCC, GitStats, PatternFinding
 from weave_quality.prose_rules import PatternRuleExecutionError
 
 
@@ -150,6 +150,165 @@ def _populate_scan(
 # ---------------------------------------------------------------------------
 # Tests: cmd_patterns_scan
 # ---------------------------------------------------------------------------
+
+
+class TestPatternScanHonoursExempt:
+    """wv-5278fe: pattern scan omits paths .weave/quality.conf exempts, with
+    the close gate's matching (trailing / is a directory prefix, otherwise an
+    exact path) and layering (quality.local.conf after quality.conf). Since
+    wv-b60cd5 the section is [pattern_exempt]; [exempt] is complexity debt."""
+
+    def test_exempt_paths_produce_no_findings(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        weave = tmp_path / ".weave"
+        weave.mkdir()
+        (weave / "quality.conf").write_text(
+            "[exclude]\nexcluded_only.py\n\n[pattern_exempt]\nvendor/   # third-party\ngen.py\n"
+        )
+        (weave / "quality.local.conf").write_text("[pattern_exempt]\nlocal_only.py\n")
+        rule = tmp_path / "rule.yml"
+        rule.write_text("id: r1\n")
+        paths = ["vendor/lib.py", "gen.py", "local_only.py", "excluded_only.py",
+                 "src/kept.py", "vendorish.py", "src/gen.py"]
+        def found(_rule_id, _rule_path, _target, scan_id, _repo, _language):
+            return [PatternFinding(path=p, scan_id=scan_id, rule_id="r1", line=1, match_text="x")
+                    for p in paths]
+        conn = init_db(hot_zone=str(tmp_path))
+        begin_scan(conn, "abc")
+        conn.commit()
+        conn.close()
+        args = argparse.Namespace(hot_zone=str(tmp_path), path=str(tmp_path), json=True)
+        with (
+            patch("weave_quality.__main__._resolve_repo", return_value=str(tmp_path)),
+            patch("weave_quality.__main__._load_pattern_rules", return_value=[("r1", rule, "python")]),
+            patch("weave_quality.__main__._run_pattern_rule", side_effect=found),
+            patch("weave_quality.__main__._attach_pattern_finding_identities"),
+        ):
+            assert cmd_patterns_scan(args) == 0
+        reported = sorted(m["path"] for m in json.loads(capsys.readouterr().out)["matches"])
+        # [exclude] is a scan-scope list for other consumers, not an exemption;
+        # a directory prefix does not match a sibling that merely shares it,
+        # and an exact pattern does not match the same basename elsewhere.
+        assert reported == ["excluded_only.py", "src/gen.py", "src/kept.py", "vendorish.py"]
+
+    def test_a_scan_rooted_below_the_repository_matches_repo_relative_patterns(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        (tmp_path / ".weave").mkdir()
+        (tmp_path / ".weave" / "quality.conf").write_text("[pattern_exempt]\nsrc/vendor/\n")
+        src = tmp_path / "src"
+        src.mkdir()
+        rule = tmp_path / "rule.yml"
+        rule.write_text("id: r1\n")
+        def found(_rule_id, _rule_path, _target, scan_id, _repo, _language):
+            return [PatternFinding(path=p, scan_id=scan_id, rule_id="r1", line=1, match_text="x")
+                    for p in ("vendor/a.py", "b.py")]
+        conn = init_db(hot_zone=str(tmp_path))
+        begin_scan(conn, "abc")
+        conn.commit()
+        conn.close()
+        args = argparse.Namespace(hot_zone=str(tmp_path), path=str(src), json=True)
+        with (
+            patch("weave_quality.__main__._resolve_repo", return_value=str(tmp_path)),
+            patch("weave_quality.__main__._load_pattern_rules", return_value=[("r1", rule, "python")]),
+            patch("weave_quality.__main__._run_pattern_rule", side_effect=found),
+            patch("weave_quality.__main__._attach_pattern_finding_identities"),
+        ):
+            assert cmd_patterns_scan(args) == 0
+        reported = [m["path"] for m in json.loads(capsys.readouterr().out)["matches"]]
+        assert reported == ["b.py"]
+
+    def test_a_complexity_exemption_does_not_hide_pattern_findings(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """wv-b60cd5: [exempt] is the close gate's complexity debt. A file listed
+        there for its CC must still get pattern findings."""
+        (tmp_path / ".weave").mkdir()
+        (tmp_path / ".weave" / "quality.conf").write_text(
+            "[exempt]\nscripts/cmd/ops.sh  # debt: CC, plan wv-x\n"
+        )
+        rule = tmp_path / "rule.yml"
+        rule.write_text("id: r1\n")
+        def found(_rule_id, _rule_path, _target, scan_id, _repo, _language):
+            return [PatternFinding(path="scripts/cmd/ops.sh", scan_id=scan_id, rule_id="r1",
+                                   line=1, match_text="x")]
+        conn = init_db(hot_zone=str(tmp_path))
+        begin_scan(conn, "abc")
+        conn.commit()
+        conn.close()
+        args = argparse.Namespace(hot_zone=str(tmp_path), path=str(tmp_path), json=True)
+        with (
+            patch("weave_quality.__main__._resolve_repo", return_value=str(tmp_path)),
+            patch("weave_quality.__main__._load_pattern_rules", return_value=[("r1", rule, "bash")]),
+            patch("weave_quality.__main__._run_pattern_rule", side_effect=found),
+            patch("weave_quality.__main__._attach_pattern_finding_identities"),
+        ):
+            assert cmd_patterns_scan(args) == 0
+        reported = [m["path"] for m in json.loads(capsys.readouterr().out)["matches"]]
+        assert reported == ["scripts/cmd/ops.sh"]
+
+
+class TestPatternScanReachesDotDirectories:
+    """wv-b60cd5: ast-grep skips hidden directories while walking a target, so
+    .claude/hooks/*.sh was never scanned; the scan names .claude explicitly."""
+
+    def test_claude_dir_is_passed_to_ast_grep(self, tmp_path: Path) -> None:
+        (tmp_path / ".claude" / "hooks").mkdir(parents=True)
+        rule = tmp_path / "rule.yml"
+        rule.write_text("id: r1\n")
+        seen: list[list[str]] = []
+        def fake_run(cmd, **_kwargs):
+            seen.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+        with (
+            patch("weave_quality.__main__.ast_grep_bin", return_value="ast-grep"),
+            patch("weave_quality.__main__.subprocess.run", side_effect=fake_run),
+        ):
+            _run_pattern_rule("r1", rule, tmp_path, 1, tmp_path, "bash")
+        assert seen and str(tmp_path / ".claude") in seen[0]
+
+    def test_no_dot_dir_is_added_when_absent(self, tmp_path: Path) -> None:
+        rule = tmp_path / "rule.yml"
+        rule.write_text("id: r1\n")
+        seen: list[list[str]] = []
+        def fake_run(cmd, **_kwargs):
+            seen.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+        with (
+            patch("weave_quality.__main__.ast_grep_bin", return_value="ast-grep"),
+            patch("weave_quality.__main__.subprocess.run", side_effect=fake_run),
+        ):
+            _run_pattern_rule("r1", rule, tmp_path, 1, tmp_path, "bash")
+        assert seen and seen[0][-1] == str(tmp_path)
+
+
+class TestPatternRuleAstGrepFailure:
+    """wv-e07ee4: an ast-grep exit above 1 is a rule failure, not zero findings.
+    Swallowing it made a broken rule report a clean scan."""
+
+    def test_ast_grep_error_exit_raises_with_its_stderr(self, tmp_path: Path) -> None:
+        rule = tmp_path / "rule.yml"
+        rule.write_text("id: r1\n")
+        def fake_run(cmd, **_kwargs):
+            return subprocess.CompletedProcess(cmd, 2, stdout="", stderr="bad rule syntax")
+        with (
+            patch("weave_quality.__main__.ast_grep_bin", return_value="ast-grep"),
+            patch("weave_quality.__main__.subprocess.run", side_effect=fake_run),
+            pytest.raises(PatternRuleExecutionError, match="ast-grep failed on .*: bad rule syntax"),
+        ):
+            _run_pattern_rule("r1", rule, tmp_path, 1, tmp_path, "bash")
+
+    def test_ast_grep_no_match_exit_is_not_a_failure(self, tmp_path: Path) -> None:
+        rule = tmp_path / "rule.yml"
+        rule.write_text("id: r1\n")
+        def fake_run(cmd, **_kwargs):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+        with (
+            patch("weave_quality.__main__.ast_grep_bin", return_value="ast-grep"),
+            patch("weave_quality.__main__.subprocess.run", side_effect=fake_run),
+        ):
+            assert not _run_pattern_rule("r1", rule, tmp_path, 1, tmp_path, "bash")
 
 
 class TestCmdPatternsScan:
@@ -2767,6 +2926,7 @@ def _make_findings_promote_args(
     include_guardrails: bool = False,
     include_root_causes: bool = False,
     include_tooling: bool = False,
+    violation_type: str = "",
 ) -> argparse.Namespace:
     return argparse.Namespace(
         hot_zone="unused",
@@ -2778,6 +2938,7 @@ def _make_findings_promote_args(
         include_guardrails=include_guardrails,
         include_root_causes=include_root_causes,
         include_tooling=include_tooling,
+        violation_type=violation_type,
     )
 
 
@@ -3113,6 +3274,65 @@ class TestCmdFindingsPromote:  # pylint: disable=too-many-public-methods
             "signal_types": ["defect"],
             "backfill": False,
         }
+
+    def test_apply_files_findings_under_a_catalogued_violation_type(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--violation-type stores that type on the created finding (wv-db68df)."""
+        nodes = json.dumps(
+            [
+                {
+                    "id": "wv-source",
+                    "text": "Investigate hook regression",
+                    "status": "done",
+                    "metadata": json.dumps(
+                        {
+                            "learning": (
+                                "pitfall: hooks copied by install.sh but not wired into "
+                                "settings.json"
+                            )
+                        }
+                    ),
+                }
+            ]
+        )
+        args = _make_findings_promote_args(
+            parent="wv-parent",
+            json_out=True,
+            apply=True,
+            violation_type="code:vacuous-verification",
+        )
+
+        def fake_wv(*cmd_args: str) -> tuple[int, str]:
+            if cmd_args == ("list", "--json", "--all"):
+                return 0, nodes
+            if cmd_args[0] == "add":
+                return 0, "wv-new123: Finding: hooks copied by install.sh ..."
+            if cmd_args[0] == "link":
+                return 0, ""
+            return 1, "unexpected"
+
+        with patch("weave_quality.findings._wv_cmd", side_effect=fake_wv) as mock_wv:
+            result = cmd_findings_promote(args)
+
+        assert result == 0
+        capsys.readouterr()
+        add_calls = [call.args for call in mock_wv.call_args_list if call.args[0] == "add"]
+        assert len(add_calls) == 1
+        metadata_arg = next(a for a in add_calls[0] if a.startswith("--metadata="))
+        stored = json.loads(metadata_arg[len("--metadata="):])
+        assert stored["finding"]["violation_type"] == "code:vacuous-verification"
+
+    def test_rejects_an_uncatalogued_violation_type(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An uncatalogued --violation-type is refused before anything is read."""
+        args = _make_findings_promote_args(json_out=True, violation_type="made:up-type")
+        with patch("weave_quality.findings._wv_cmd") as mock_wv:
+            result = cmd_findings_promote(args)
+        assert result == 1
+        assert "not catalogued" in capsys.readouterr().err
+        mock_wv.assert_not_called()
 
     def test_apply_does_not_backfill_beyond_reviewed_defect_window(
         self, capsys: pytest.CaptureFixture[str]
@@ -6146,3 +6366,82 @@ def test_stray_yml_rule_is_reported_not_silently_ignored(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "zz-stray.yml" in err, "the ignored file must be named"
     assert "zz-stray.yaml" in err, "the message must give the rename to make"
+
+
+# ---------------------------------------------------------------------------
+# wv-335581: rerunnable calibration provenance
+# ---------------------------------------------------------------------------
+
+
+def _calibrated_rule(patterns_dir: Path, rule_id: str, extra: str) -> None:
+    (patterns_dir / f"{rule_id}.yaml").write_text(
+        f"id: {rule_id}\nlanguage: prose\nkind: regex\n"
+        "provenance: >-\n  free text stays compatible, 26.9 against 21.1\n"
+        f"patterns:\n  - 'foo'\n{extra}",
+        encoding="utf-8",
+    )
+
+
+def test_patterns_validate_reports_a_calibration_rerun_contract(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "repo"
+    patterns_dir = repo / ".weave" / "patterns"
+    patterns_dir.mkdir(parents=True)
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "calibrate.py").write_text("print(26.9)\n", encoding="utf-8")
+    _calibrated_rule(patterns_dir, "qp-calibrated",
+                     "calibration_script: scripts/calibrate.py\n"
+                     "calibration_command: python3 scripts/calibrate.py --corpus docs/\n")
+    _calibrated_rule(patterns_dir, "qp-missing-script",
+                     "calibration_script: scripts/gone.py\n"
+                     "calibration_command: python3 scripts/gone.py\n")
+    _calibrated_rule(patterns_dir, "qp-free-text-only", "")
+    args = argparse.Namespace(hot_zone=str(tmp_path / "hz"), path=str(repo), json=True)
+    with patch("weave_quality.__main__._DEFAULT_PATTERNS_DIR", tmp_path / "no-default-rules"):
+        cmd_patterns_validate(args)
+        payload = json.loads(capsys.readouterr().out)
+    by_id = {entry["rule_id"]: entry for entry in payload["rules"]}
+
+    calibrated = by_id["qp-calibrated"]
+    assert calibrated["status"] == "valid"
+    assert calibrated["calibration"]["script"] == "scripts/calibrate.py"
+    assert calibrated["calibration"]["rerun"].endswith(
+        "&& python3 scripts/calibrate.py --corpus docs/"
+    )
+    assert calibrated["calibration"]["rerun"].startswith(f"cd {repo}")
+    assert by_id["qp-missing-script"]["status"] == "invalid"
+    assert "does not exist" in by_id["qp-missing-script"]["error"]
+    assert by_id["qp-free-text-only"]["status"] == "valid"
+    assert "calibration" not in by_id["qp-free-text-only"]
+    assert payload["coverage"]["optional_keys"]["calibration_script"] is True
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ("calibration_script: scripts/calibrate.py\n", "must be given together"),
+        ("calibration_command: python3 x.py\n", "must be given together"),
+        ("calibration_script: ../outside.py\ncalibration_command: python3 ../outside.py\n",
+         "inside the repository"),
+        ("calibration_script: /abs/calibrate.py\ncalibration_command: python3 /abs/calibrate.py\n",
+         "inside the repository"),
+        ("calibration_script: scripts/calibrate.py\ncalibration_command: python3 other.py\n",
+         "must invoke calibration_script"),
+    ],
+)
+def test_an_unusable_calibration_reference_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], extra: str, message: str
+) -> None:
+    repo = tmp_path / "repo"
+    patterns_dir = repo / ".weave" / "patterns"
+    patterns_dir.mkdir(parents=True)
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "calibrate.py").write_text("", encoding="utf-8")
+    _calibrated_rule(patterns_dir, "qp-bad-calibration", extra)
+    args = argparse.Namespace(hot_zone=str(tmp_path / "hz"), path=str(repo), json=True)
+    with patch("weave_quality.__main__._DEFAULT_PATTERNS_DIR", tmp_path / "no-default-rules"):
+        assert cmd_patterns_validate(args) == 1
+        entry = json.loads(capsys.readouterr().out)["rules"][0]
+    assert entry["status"] == "invalid"
+    assert message in entry["error"]

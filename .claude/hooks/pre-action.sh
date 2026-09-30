@@ -28,7 +28,12 @@ _pa_source() {
 _pa_source wv-resolve-project || exit 0
 for _pa_lib in wv-validate wv-config wv-hook-common; do _pa_source "$_pa_lib" || true; done
 _pa_source wv-resolve-runtime || exit 0
-_hc_refresh
+command -v _hc_refresh >/dev/null 2>&1 || { echo "⚠ Weave guard inactive: wv-hook-common.sh could not be loaded — run ./install.sh" >&2; exit 0; }; _hc_refresh
+
+# Liveness heartbeat (wv-4efe06): the last tool call's time. Session start
+# compares it with stop-check's last stop record to tell a session that died
+# mid-turn from one that stopped and then ended without SessionEnd.
+[ -d "${_HC_HOT_ZONE:-}" ] && date +%s > "${_HC_HOT_ZONE}/.session_heartbeat" 2>/dev/null || true
 
 _hc_check_read_size "$TOOL" "$TOOL_INPUT" || exit 0
 _hc_check_installed_path "$TOOL" "$TOOL_INPUT" || exit $?

@@ -20,6 +20,7 @@ cmd_analyze() {
     case "$sub" in
         sessions) cmd_analyze_sessions "$@" ;;
         suites)   cmd_analyze_suites "$@" ;;
+        gates)    cmd_analyze_gates "$@" ;;
         checkpoints) cmd_analyze_checkpoints "$@" ;;
         help|--help|-h)
             echo "Usage: wv analyze <subcommand> [options]"
@@ -27,7 +28,8 @@ cmd_analyze() {
             echo "Subcommands:"
             echo "  sessions --call-stats   Show top wv commands by byte output"
             echo "  sessions --trace-eval   Observe state-aware traces from a WV_CALL_LOG JSONL file"
-            echo "  suites                  Per-suite run count + duration (total/avg/p95) + pass/fail"
+            echo "  suites                  Per-suite run count + duration (total/avg/p50/p95) + pass/fail"
+            echo "  gates                   Per-gate wall time by phase (p50/p90), estimate error"
             echo "                          Defaults to current repo; use --all to see all repos"
             echo "  checkpoints             Measure auto-checkpoint overlap with recorded wv calls"
             ;;
@@ -161,8 +163,66 @@ cmd_analyze_sessions() {
     # Parse JSONL and aggregate by cmd using python3 (available in runtime env)
     local result
     result=$(python3 - "$log_path" "$top_n" "$source_filter" "$since_epoch" "$include_sync" "$include_test" <<'PYEOF'
-import json, sys, time
+import json, os, re, sys, time
 from collections import defaultdict
+
+# The call log is append-only and never rotated, so it only grows: 649k lines
+# and 401MB on this host by 2026-09. Streaming and json.loads-ing every line and
+# only then testing the window made --since-days=1 cost the same as lifetime
+# (6787ms vs 8398ms measured), and the Stop hook pays that on every session end.
+# Timestamps are non-decreasing because entries are appended on completion, so
+# the window's first row can be found by seeking rather than by reading.
+_TS_RE = re.compile(r'"ts":\s*([0-9.]+)')
+
+
+def line_ts(raw):
+    """Timestamp of a log line, read without parsing the whole object."""
+    match = _TS_RE.search(raw[:200])
+    return float(match.group(1)) if match else None
+
+
+def window_start_offset(path, since, margin_bytes=1 << 20):
+    """Byte offset to start parsing from, or 0 to read everything.
+
+    Binary search for the first line at or after `since`, then rewind a margin.
+    Concurrent writers can interleave by milliseconds, so the first row at or
+    after the window is not necessarily the first row that belongs in it; the
+    margin absorbs that, and the per-row `ts < since` test below still decides
+    membership. Returning 0 keeps the previous whole-file behaviour exactly.
+    """
+    if since is None:
+        return 0
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return 0
+    if size <= margin_bytes:
+        return 0
+    lo, hi = 0, size
+    with open(path, "rb") as fh:
+        while lo < hi:
+            mid = (lo + hi) // 2
+            fh.seek(mid)
+            if mid:
+                fh.readline()  # discard the partial line the seek landed in
+            raw = fh.readline()
+            if not raw:
+                hi = mid
+                continue
+            ts = line_ts(raw.decode("utf-8", "replace"))
+            nxt = min(fh.tell(), hi)
+            if ts is None:
+                # An era-blind row carries no position in the window. Step past
+                # it rather than stalling; if it is the last probe, hi wins.
+                if nxt <= lo:
+                    break
+                lo = nxt
+            elif ts < since:
+                lo = nxt
+            else:
+                hi = mid
+    return max(0, lo - margin_bytes)
+
 
 log_path, top_n, source_filter = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 since_epoch = float(sys.argv[4]) if sys.argv[4] else None
@@ -182,7 +242,11 @@ excluded = {"sync_calls": 0, "sync_bytes": 0, "test_calls": 0, "test_bytes": 0, 
 min_ts = max_ts = None
 
 try:
+    start_offset = window_start_offset(log_path, since_epoch)
     with open(log_path, encoding="utf-8") as fh:
+        if start_offset:
+            fh.seek(start_offset)
+            fh.readline()  # the offset lands mid-line by construction
         for line in fh:
             line = line.strip()
             if not line:
@@ -303,6 +367,144 @@ if d.get('note'):
     printf "\nLog: %s\n" "$log_path"
 }
 
+# cmd_analyze_gates — wall time per gate invocation (wv-ffda33). Reads the gate
+# log the commit hooks write (one line per gate: phase, wall ms, estimate,
+# suites, outcome) and reports per phase p50/p90/max wall time, how far the
+# gate's own estimate was off, and which suites' estimates miss worst (from the
+# suite log's estimate_ms). History from before gate records existed has no
+# gate_id, so it is grouped by commit sha and labelled approximate, never mixed
+# into the exact figures.
+cmd_analyze_gates() {
+    local suite_log gate_log want_json="" since="" all_repos=0 mode
+    suite_log=$(_suite_log_path)
+    gate_log=$(_gate_log_path)
+    mode=$(wv_resolve_mode)
+    local cur_repo=""
+    cur_repo=$(basename "${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || echo "")}" 2>/dev/null || true)
+    for arg in "$@"; do
+        case "$arg" in
+            --json)       want_json=1 ;;
+            --since=*)    since="${arg#--since=}" ;;
+            --all)        all_repos=1 ;;
+            --log=*)      suite_log="${arg#--log=}" ;;
+            --gate-log=*) gate_log="${arg#--gate-log=}" ;;
+            --help|-h)
+                echo "Usage: wv analyze gates [--since=YYYY-MM-DD] [--all] [--json] [--log=<suite log>] [--gate-log=<gate log>]"
+                echo ""
+                echo "  Per phase (pre-commit, post-commit, make): gates, failures, wall time"
+                echo "  p50/p90/max, suites per gate, and estimate error (actual / estimate)."
+                echo "  Suites whose estimates miss worst come from the suite log's estimate_ms."
+                echo "  Suite runs recorded before gate records existed are grouped by commit"
+                echo "  and reported separately as approximate."
+                return 0
+                ;;
+        esac
+    done
+    [ "$mode" = "discover" ] || [ "$mode" = "bootstrap" ] && want_json=1
+    local repo_filter=""
+    [ "$all_repos" = "0" ] && repo_filter="$cur_repo"
+
+    local result
+    result=$(python3 - "$suite_log" "$gate_log" "$repo_filter" "$since" <<'PYEOF'
+import json, math, os, sys
+from collections import defaultdict
+
+suite_log, gate_log, repo_filter, since = sys.argv[1:5]
+
+def rows(path):
+    if not os.path.isfile(path):
+        return []
+    out = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                e = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if repo_filter and str(e.get("repo", "")) != repo_filter:
+                continue
+            if since and str(e.get("ts", "")) < since:
+                continue
+            out.append(e)
+    return out
+
+def pct(vals, q):
+    if not vals:
+        return None
+    s = sorted(vals)
+    return s[max(0, min(len(s) - 1, math.ceil(q * len(s)) - 1))]
+
+def secs(ms):
+    return None if ms is None else round(ms / 1000, 1)
+
+gates = rows(gate_log)
+by_phase = defaultdict(list)
+for g in gates:
+    by_phase[str(g.get("phase") or "unknown")].append(g)
+
+phases = []
+for phase, gs in sorted(by_phase.items()):
+    walls = [int(g.get("duration_ms") or 0) for g in gs]
+    ratios = [int(g["duration_ms"]) / int(g["estimate_ms"]) for g in gs
+              if g.get("estimate_ms") and int(g.get("estimate_ms") or 0) > 0]
+    phases.append({
+        "phase": phase,
+        "gates": len(gs),
+        "failed": sum(1 for g in gs if int(g.get("exit") or 0) != 0),
+        "wall_p50_s": secs(pct(walls, 0.5)),
+        "wall_p90_s": secs(pct(walls, 0.9)),
+        "wall_max_s": secs(max(walls) if walls else None),
+        "suites_p50": pct([len(g.get("suites") or []) for g in gs], 0.5),
+        "estimate_ratio_p50": round(pct(ratios, 0.5), 2) if ratios else None,
+        "estimated_gates": len(ratios),
+    })
+
+suite_rows = rows(suite_log)
+miss = defaultdict(list)
+for e in suite_rows:
+    est = e.get("estimate_ms")
+    if est and int(est) > 0 and int(e.get("duration_ms") or 0) > 0:
+        miss[str(e.get("suite"))].append(int(e["duration_ms"]) / int(est))
+worst = sorted(({"suite": s, "runs": len(r), "ratio_p50": round(pct(r, 0.5), 2)}
+                for s, r in miss.items()), key=lambda x: abs(math.log(x["ratio_p50"] or 1)), reverse=True)[:10]
+
+legacy = defaultdict(list)
+for e in suite_rows:
+    if not e.get("gate_id"):
+        legacy[str(e.get("sha", ""))].append(int(e.get("duration_ms") or 0))
+serial = [sum(v) for v in legacy.values()]
+longest = [max(v) for v in legacy.values() if v]
+approx = {
+    "commits": len(legacy),
+    "serial_p50_s": secs(pct(serial, 0.5)), "serial_p90_s": secs(pct(serial, 0.9)),
+    "serial_max_s": secs(max(serial) if serial else None),
+    "longest_suite_p50_s": secs(pct(longest, 0.5)), "longest_suite_p90_s": secs(pct(longest, 0.9)),
+    "note": "suite runs without gate_id grouped by sha; mixes phases, so approximate",
+}
+print(json.dumps({"phases": phases, "estimate_misses": worst, "approximate_by_commit": approx,
+                  "gate_log": gate_log, "suite_log": suite_log,
+                  "repo": repo_filter or "ALL", "since": since or None}))
+PYEOF
+    ) || return 1
+
+    if [ -n "$want_json" ]; then
+        echo "$result"
+        return 0
+    fi
+    echo "$result" | jq -r '
+        "Gate wall time (\(.repo)\(if .since then ", since \(.since)" else "" end))",
+        (if (.phases | length) == 0 then "  no gate records yet: the commit hooks write them from now on"
+         else (.phases[] | "  \(.phase): \(.gates) gates, \(.failed) failed, wall p50 \(.wall_p50_s)s p90 \(.wall_p90_s)s max \(.wall_max_s)s, suites p50 \(.suites_p50)" +
+               (if .estimate_ratio_p50 then ", actual/estimate p50 \(.estimate_ratio_p50)" else "" end)) end),
+        "",
+        "Suites whose estimates miss worst (actual/estimate, p50):",
+        (if (.estimate_misses | length) == 0 then "  none recorded yet"
+         else (.estimate_misses[] | "  \(.suite) \(.ratio_p50)x over \(.runs) runs") end),
+        "",
+        "Approximate, from suite runs recorded before gate ids (grouped by commit):",
+        "  \(.approximate_by_commit.commits) commits, serial p50 \(.approximate_by_commit.serial_p50_s)s p90 \(.approximate_by_commit.serial_p90_s)s max \(.approximate_by_commit.serial_max_s)s; longest suite p50 \(.approximate_by_commit.longest_suite_p50_s)s p90 \(.approximate_by_commit.longest_suite_p90_s)s"'
+}
+
 # cmd_analyze_suites — report over the durable suite-run history (LL2/LL3).
 # Reads the append-only JSONL written by `wv test-record` (WV_SUITE_LOG) and
 # aggregates per suite: run count, pass/fail counts, and total/avg/p95 duration_ms.
@@ -415,6 +617,16 @@ for suite, a in agg.items():
         "total_ms": a["total_ms"],
         "avg_ms": a["total_ms"] // a["runs"] if a["runs"] else 0,
         "p95_ms": p95(a["_durs"]),
+        # Median of measured runs only: 0 is the "unmeasured" sentinel, and the
+        # gate's estimates read this field (wv-ffda33).
+        "p50_ms": sorted(d for d in a["_durs"] if d > 0)[len([d for d in a["_durs"] if d > 0]) // 2]
+                  if any(d > 0 for d in a["_durs"]) else 0,
+        # The same median over the last 10 measured runs (log order): an
+        # all-history median lags a suite that is growing, and quoted
+        # test-hooks.sh at ~173s while it was running 480-700s (wv-8138ec).
+        "recent_p50_ms": sorted([d for d in a["_durs"] if d > 0][-10:])[
+                             len([d for d in a["_durs"] if d > 0][-10:]) // 2]
+                         if any(d > 0 for d in a["_durs"]) else 0,
         "last_ts": a["last_ts"],
         "last_sha": a["last_sha"],
     })

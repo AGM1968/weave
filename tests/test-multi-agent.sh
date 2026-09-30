@@ -352,7 +352,7 @@ echo "--- Corrupt delta handling ---"
 echo "THIS IS NOT SQL" > "$OBSERVER_DIR/.weave/deltas/$DELTA_DAY/9999999999-corrupt.sql"
 corrupt_output=$($WV load 2>&1)
 
-assert "Corrupt delta produces warning" 'echo "$corrupt_output" | grep -q "Skipped corrupt"' "warning about corrupt delta"
+assert "Corrupt delta produces warning" 'grep -q "Skipped corrupt" <<< "$corrupt_output"' "warning about corrupt delta"
 
 # Clean up corrupt file
 rm -f "$OBSERVER_DIR/.weave/deltas/$DELTA_DAY/9999999999-corrupt.sql"

@@ -153,7 +153,7 @@ echo "--- interactive confirmation prompt ---"
 rm -f "$marker"
 rc=0
 out=$(printf 'no\n' | "$WV" cutover 2>&1) || rc=$?
-[ "$rc" -ne 0 ] && [ ! -f "$marker" ] && printf '%s' "$out" | grep -qi "abort" \
+[ "$rc" -ne 0 ] && [ ! -f "$marker" ] && grep -qi "abort" <<< "$out" \
     && ok "declining the interactive prompt aborts without stamping" \
     || bad "declining the prompt should abort cleanly (rc=$rc): $out"
 

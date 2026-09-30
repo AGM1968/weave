@@ -61,7 +61,7 @@ assert_equals() {
 assert_contains() {
     local haystack="$1" needle="$2" message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if printf '%s' "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${GREEN}[PASS]${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -73,7 +73,7 @@ assert_contains() {
 assert_not_contains() {
     local haystack="$1" needle="$2" message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if printf '%s' "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${RED}[FAIL]${NC} $message (unexpected '$needle' in output)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     else

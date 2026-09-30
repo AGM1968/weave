@@ -70,7 +70,9 @@ check "an observation leaves the causal identity where it was" "$before" "$after
 # MUTATION DISPOSITION, derived from the two identities rather than declared.
 rm -f "$JOURNAL"
 WV_ATTEMPT_JOURNAL="$JOURNAL" "$WV" add "journal probe" --standalone >/dev/null 2>&1
-check "a mutation records its disposition" "call_started,mutation_disposition,call_completed" "$(events)"
+# Since wv-15422b each of add's four gates records its allow on a clean call.
+check "a mutation records its disposition" \
+  "call_started,policy_verdict,policy_verdict,policy_verdict,policy_verdict,mutation_disposition,call_completed" "$(events)"
 check "a mutation that changed the graph says so" "changed" "$(field mutation_disposition disposition)"
 check "the mutation's targets come from the registry" "brain_db" "$(field mutation_disposition mutation_targets)"
 check "the mutation's class comes from the registry" "mutation_attempt" "$(field mutation_disposition evidence_class)"
@@ -83,7 +85,7 @@ WV_ATTEMPT_JOURNAL="$JOURNAL" "$WV" add "orphan probe" >/dev/null 2>&1
 denied_rc=$?
 check "the orphan gate still denies" "1" "$denied_rc"
 check "the denied call records a policy verdict" \
-  "call_started,policy_verdict,mutation_disposition,call_completed" "$(events)"
+  "call_started,policy_verdict,policy_verdict,mutation_disposition,call_completed" "$(events)"
 check "the verdict names its rule" "orphan_prevention" "$(field policy_verdict rule)"
 check "the verdict is attached to the call it gated" \
   "$(jq -r 'select(.event=="call_started") | .call_id' < "$JOURNAL")" "$(field policy_verdict call_id)"
@@ -91,10 +93,24 @@ check "a denied mutation left the graph unchanged" "unchanged" "$(field mutation
 
 # CRASH. call_started is durable before dispatch, so a killed call is visibly
 # incomplete instead of absent.
+#
+# The victim is killed as soon as its start event is durable, rather than after
+# a fixed wait. The old form slept 2s and relied on `analyze sessions` still
+# running, which it only was because WV_CALL_LOG is unset here: wv-cmd-analyze.sh
+# then falls back to $HOME/.local/share/weave/wv_calls.jsonl, and on a developer
+# machine that file had grown unbounded (402MB) because nothing rotated it. Once
+# rotation bounds the log the command returns in milliseconds and the fixed wait
+# kills a corpse, so the call completes and the case fails. Killing on the
+# journal's own state removes both the sleep and the dependency on ambient size.
 rm -f "$JOURNAL"
-WV_ATTEMPT_JOURNAL="$JOURNAL" "$WV" analyze sessions >/dev/null 2>&1 &
+WV_ATTEMPT_JOURNAL="$JOURNAL" WV_CALL_LOG="$TEST_DIR/victim-calls.jsonl" \
+    "$WV" analyze sessions >/dev/null 2>&1 &
 victim=$!
-timeout 2 tail -f /dev/null
+for _ in $(seq 1 500); do
+    [ -s "$JOURNAL" ] && grep -q '"call_started"' "$JOURNAL" 2>/dev/null && break
+    kill -0 "$victim" 2>/dev/null || break
+    sleep 0.01
+done
 kill -9 "$victim" 2>/dev/null
 wait "$victim" 2>/dev/null
 check "a killed call leaves exactly its start" "call_started" "$(events)"
@@ -151,8 +167,11 @@ forgeries = {
     "unknown-event": {**started, "event": "call_maybe"},
     "verdict-without-invariant": {k: v for k, v in verdict.items() if k != "would_violate_invariant"},
     "verdict-without-rule": {k: v for k, v in verdict.items() if k != "rule"},
+    # Complete in every other respect, so only "countable needs state complete"
+    # can reject it.
     "countable-policy": {**next(e for e in events if e["event"] == "call_completed"),
-                         "policy": {"state": "partial", "countable": True, "verdicts": 1, "reason": "x"}},
+                         "policy": {"state": "partial", "countable": True, "verdicts": 1,
+                                    "applicable_rules": ["a", "b"], "evaluated_rules": ["a"], "reason": "x"}},
 }
 for name, event in forgeries.items():
     (out / f"forge-{name}.jsonl").write_text(json.dumps(event) + "\n")
@@ -221,21 +240,95 @@ else
     bad "the emitter requires exactly what the schema requires"
 fi
 
-# POLICY PROVENANCE. Silence is never an allow.
+# POLICY PROVENANCE. Silence is never an allow: a call is countable only when
+# every rule the policy contract applies to its operation recorded a durable
+# verdict, in evidence mode (wv-f3cb5e).
+pol() { jq -r --arg f "$1" 'select(.event=="call_completed") | .policy[$f] | if type=="array" then join(" ") else tostring end' < "$JOURNAL" | tail -1; }
 rm -f "$JOURNAL"
 WV_ATTEMPT_JOURNAL="$JOURNAL" "$WV" status >/dev/null 2>&1
-check "a call with no verdict records policy state unavailable" "unavailable" \
-  "$(jq -r 'select(.event=="call_completed") | .policy.state' < "$JOURNAL")"
-check "and is explicitly not countable" "false" \
-  "$(jq -r 'select(.event=="call_completed") | .policy.countable' < "$JOURNAL")"
+check "a call the contract applies no rule to has an empty applicable set" "" "$(pol applicable_rules)"
+check "outside evidence mode even a complete call is not countable" "complete/false" "$(pol state)/$(pol countable)"
 rm -f "$JOURNAL"
 WV_ATTEMPT_JOURNAL="$JOURNAL" "$WV" add "policy probe" >/dev/null 2>&1
-check "a call with a verdict records policy state partial" "partial" \
-  "$(jq -r 'select(.event=="call_completed") | .policy.state' < "$JOURNAL")"
-check "a verdict does not make the call countable" "false" \
-  "$(jq -r 'select(.event=="call_completed") | .policy.countable' < "$JOURNAL")"
-check "the verdict count is recorded" "1" \
-  "$(jq -r 'select(.event=="call_completed") | .policy.verdicts' < "$JOURNAL")"
+check "the applicable set comes from the policy contract" \
+  "active_add_requires_claim_readiness add_duplicate_check orphan_prevention reconstruct_never_overwrites" \
+  "$(pol applicable_rules)"
+# Claim readiness allows (the add is not active) before orphan prevention denies.
+check "the evaluated set is what the call recorded" "active_add_requires_claim_readiness orphan_prevention" \
+  "$(pol evaluated_rules)"
+check "a call whose applicable rules did not all speak is partial and not countable" "partial/false" \
+  "$(pol state)/$(pol countable)"
+check "the verdict count is recorded" "2" "$(pol verdicts)"
+rm -f "$JOURNAL"
+WV_EVIDENCE_MODE=1 WV_ATTEMPT_JOURNAL="$JOURNAL" "$WV" add "policy probe evidence" >/dev/null 2>&1
+check "evidence mode does not make a partial call countable" "partial/false" "$(pol state)/$(pol countable)"
+selfblock=$("$WV" add "self block probe" --force 2>/dev/null | tail -1)
+rm -f "$JOURNAL"
+WV_EVIDENCE_MODE=1 WV_ATTEMPT_JOURNAL="$JOURNAL" "$WV" block "$selfblock" --by="$selfblock" >/dev/null 2>&1
+check "every applicable rule speaking, in evidence mode, is countable" "complete/true" "$(pol state)/$(pol countable)"
+identity=$(jq -r 'select(.event=="call_started") | .policy_identity' < "$JOURNAL")
+check "events bind the policy contract identity" \
+  "sha256:$(python3 "$ROOT/scripts/weave_policy.py" identity | jq -r .identity_sha256)" "$identity"
+[ "$identity" != "$(jq -r 'select(.event=="call_started") | .registry_identity' < "$JOURNAL")" ] &&
+  ok "the policy identity is distinct from the registry identity" ||
+  bad "the policy identity is distinct from the registry identity"
+
+# Sets that disagree are never countable. Driven through the builder itself with
+# a forged marker or journal, since a well-behaved call cannot produce either.
+policy_with() {  # <operation> <marker-rules> <journal-rules>
+    WV_EVIDENCE_MODE=1 WV_ATTEMPT_JOURNAL="$TEST_DIR/forge-journal.jsonl" bash -c '
+        source "$1/scripts/lib/wv-policy-rules.sh"; source "$1/scripts/lib/wv-attempt-journal.sh"
+        wv_attempt_context forged-call w t test r "$2" "" mutation_attempt "[]" "" "" null "" "" ""
+        rm -f "$WV_ATTEMPT_JOURNAL" "$(_wv_attempt_verdict_marker)"
+        for r in $3; do echo "$r" >> "$(_wv_attempt_verdict_marker)"; done
+        for r in $4; do echo "{\"event\":\"policy_verdict\",\"call_id\":\"forged-call\",\"rule\":\"$r\"}" >> "$WV_ATTEMPT_JOURNAL"; done
+        wv_attempt_policy_json' _ "$ROOT" "$1" "$2" "$3" | jq -r '"\(.state)/\(.countable)"'
+}
+mkdir -p "$WV_HOT_ZONE/attempt-verdicts"
+check "matching sets, marker and journal agreeing, are countable" "complete/true" \
+  "$(policy_with block block_graph_acyclic block_graph_acyclic)"
+check "a verdict for a rule the operation does not carry is inconsistent" "inconsistent/false" \
+  "$(policy_with block "block_graph_acyclic orphan_prevention" "block_graph_acyclic orphan_prevention")"
+check "a marker naming a verdict the journal lacks is inconsistent" "inconsistent/false" \
+  "$(policy_with block block_graph_acyclic "")"
+check "a journal verdict the marker lost is inconsistent" "inconsistent/false" \
+  "$(policy_with block "" block_graph_acyclic)"
+
+# NEGATIVE CONTROLS on the marker. Each ends the call in evidence mode, and none
+# leaves a countable row behind.
+marker_rc=$(WV_EVIDENCE_MODE=1 WV_ATTEMPT_JOURNAL="$TEST_DIR/marker.jsonl" bash -c '
+    source "$1/scripts/lib/wv-attempt-journal.sh"
+    wv_attempt_context marker-call w t test r block "" mutation_attempt "[]" "" "" null "" "" ""
+    wv_attempt_verdicts_claim
+    chmod 444 "$(_wv_attempt_verdict_marker)"
+    wv_attempt_emit policy_verdict rule=block_graph_acyclic decision=deny would_violate_invariant=yes
+    echo survived' _ "$ROOT" 2>/dev/null; echo "rc=$?")
+check "a suppressed marker write ends the call" "rc=1" "$marker_rc"
+chmod 644 "$WV_HOT_ZONE/attempt-verdicts/marker-call" 2>/dev/null; rm -f "$WV_HOT_ZONE/attempt-verdicts/marker-call"
+reset_rc=$(WV_EVIDENCE_MODE=1 WV_ATTEMPT_JOURNAL="$TEST_DIR/reset.jsonl" WV_HOT_ZONE="$TEST_DIR/reset-hot" bash -c '
+    source "$1/scripts/lib/wv-attempt-journal.sh"
+    wv_attempt_context reset-call w t test r block "" mutation_attempt "[]" "" "" null "" "" ""
+    wv_attempt_verdicts_claim
+    chmod 555 "$(dirname "$(_wv_attempt_verdict_marker)")"
+    wv_attempt_verdicts_reset
+    echo survived' _ "$ROOT" 2>/dev/null; echo "rc=$?")
+chmod 755 "$TEST_DIR/reset-hot/attempt-verdicts" 2>/dev/null
+check "a verdict reset that fails ends the call" "rc=1" "$reset_rc"
+# A second call under an id another call holds: evidence mode refuses it before
+# call_started, and analytics mode runs the command but writes nothing under it.
+DUP="$TEST_DIR/dup.jsonl"
+mkdir -p "$WV_HOT_ZONE/attempt-verdicts" && : > "$WV_HOT_ZONE/attempt-verdicts/held-call-id"
+WV_EVIDENCE_MODE=1 WV_ATTEMPT_JOURNAL="$DUP" WV_CALL_ID=held-call-id "$WV" status >/dev/null 2>&1
+check "a call_id held by another call is refused in evidence mode" "1" "$?"
+WV_ATTEMPT_JOURNAL="$DUP" WV_CALL_ID=held-call-id "$WV" status >/dev/null 2>&1
+check "in analytics mode the command still runs" "0" "$?"
+check "and nothing is journaled under the shared id" "0" \
+  "$(cat "$DUP" 2>/dev/null | grep -c '"call_id":"held-call-id"' || true)"
+[ -f "$WV_HOT_ZONE/attempt-verdicts/held-call-id" ] && ok "the holder's marker is left intact" ||
+  bad "the holder's marker is left intact"
+rm -f "$WV_HOT_ZONE/attempt-verdicts/held-call-id"
+check "no negative control produced a countable row" "" \
+  "$(cat "$TEST_DIR"/marker.jsonl "$TEST_DIR"/reset.jsonl "$DUP" 2>/dev/null | jq -r 'select(.policy.countable==true) | .call_id')"
 check "no call is ever recorded as allowed by default" "" \
   "$(jq -r 'select(.decision=="allow") | .event' < "$JOURNAL")"
 

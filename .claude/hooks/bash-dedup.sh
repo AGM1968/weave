@@ -35,6 +35,7 @@
 set -e
 
 GRACE_PERIOD=120   # seconds before a pending lock is treated as stale
+SPAWN_WINDOW=10    # seconds a pending lock denies before its process can be seen
 
 INPUT=$(cat)
 TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
@@ -116,6 +117,14 @@ REPO_HASH=$(
 LOCK_DIR="/tmp/weave-bash-locks/${REPO_HASH}"
 mkdir -p "$LOCK_DIR"
 
+# Name the rule when denying (wv-664b7f). Loaded only past the fast exits, so
+# the common allow path pays nothing for it.
+_BD_HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+source "$_BD_HOOK_DIR/../lib/wv-hook-observe.sh" 2>/dev/null \
+    || source "$_BD_HOOK_DIR/../../scripts/lib/wv-hook-observe.sh" 2>/dev/null \
+    || source "${HOME}/.config/weave/lib/wv-hook-observe.sh" 2>/dev/null \
+    || _hc_observe() { return 0; }
+
 # ── Live background-lock scan (shared by the poller guard) ──────────────────────
 # Prints "<lock-key>|<original-cmd>" for the first running lock whose background
 # task is still alive, else nothing. Liveness is the same signal the lock
@@ -172,6 +181,7 @@ if [[ "$IS_POLLER" == "true" ]]; then
     if [[ -n "$_live" ]]; then
         _lkey="${_live%%|*}"
         _lcmd="${_live#*|}"
+        _hc_observe no_busy_wait_polling deny
         jq -n --arg key "$_lkey" --arg prev "$_lcmd" \
             '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("Busy-wait poller blocked: a background [\($key)] task is still running. Do not poll it with until/while+sleep — yield the turn and the harness will send a task-notification when it completes. Running: \($prev)")}}'
         exit 0
@@ -238,6 +248,24 @@ if [[ -f "$LOCK_FILE" ]]; then
         # or file was cleaned up. Fall through to TTL — safe, conservative.
     fi
 
+    # ── Liveness check for pending locks (wv-d3af9a) ──────────────────────────
+    # A command another PreToolUse hook blocks (e.g. the wv done verification
+    # gate) never starts, so PostToolUse never clears its pending lock, and that
+    # lock denied the corrected retry and every wv sync --gh for the whole grace
+    # period. Past SPAWN_WINDOW (which still covers two identical calls issued
+    # together, before either process exists) a pending lock denies only while
+    # its command is really running: the harness runs a tool command as
+    # `bash -c ... <command>`, so its first line shows in the process table.
+    # ps is captured first so the search cannot match its own grep.
+    if [[ "$LOCK_PHASE" == "pending" && "$LOCK_AGE" -ge "$SPAWN_WINDOW" ]]; then
+        _dd_needle=${PREV_CMD%%$'\n'*}
+        _dd_needle=${_dd_needle:0:80}
+        _dd_procs=$(ps -eo args= 2>/dev/null || true)
+        if [[ -n "$_dd_procs" && -n "$_dd_needle" ]] && ! grep -qF -- "$_dd_needle" <<< "$_dd_procs"; then
+            LOCK_AGE=$GRACE_PERIOD   # never started: stale
+        fi
+    fi
+
     if [[ "$LOCK_PHASE" == "pending" ]]; then
         THRESHOLD=$GRACE_PERIOD
         PHASE_LABEL="pending, blocked or slow-start"
@@ -247,6 +275,7 @@ if [[ -f "$LOCK_FILE" ]]; then
     fi
 
     if [[ "$LOCK_AGE" -lt "$THRESHOLD" ]]; then
+        _hc_observe no_duplicate_inflight_command deny
         jq -n --arg key "$LOCK_KEY" --arg prev "$PREV_CMD" \
                --argjson age "$LOCK_AGE" --arg phase "$PHASE_LABEL" \
             '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("Duplicate command blocked [\($key), \($age)s old, \($phase)]: already running — wait for the task-notification before re-issuing. Previous: \($prev)")}}'
@@ -271,6 +300,7 @@ fi
 
 # Race: another invocation just acquired the lock between our check and write
 PREV_CMD=$(sed -n '3p' "$LOCK_FILE" 2>/dev/null || echo "(unknown)")
+_hc_observe no_duplicate_inflight_command deny
 jq -n --arg key "$LOCK_KEY" --arg prev "$PREV_CMD" \
     '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("Duplicate command blocked [\($key)]: just acquired by concurrent call — wait for the task-notification. Previous: \($prev)")}}'
 exit 0

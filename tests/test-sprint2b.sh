@@ -75,7 +75,7 @@ assert_contains() {
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected to find: $needle"
-        echo "  In: $(echo "$haystack" | head -5)"
+        echo "  In: $(echo "$haystack" | sed -n '1,5p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
@@ -89,7 +89,7 @@ assert_not_contains() {
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected NOT to find: $needle"
-        echo "  In: $(echo "$haystack" | head -5)"
+        echo "  In: $(echo "$haystack" | sed -n '1,5p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
@@ -257,7 +257,9 @@ test_breadcrumbs() {
     local outside_dir
     outside_dir=$(mktemp -d)
     local drift_out
-    drift_out=$(cd "$outside_dir" && "$WV" doctor 2>&1 | grep "hook drift" || true)
+    # Without the suite's override: that hot zone belongs to the fixture repo and
+    # wv refuses it from anywhere else (wv-5e804e).
+    drift_out=$(cd "$outside_dir" && env -u WV_HOT_ZONE -u WV_DB "$WV" doctor 2>&1 | grep "hook drift" || true)
     rm -rf "$outside_dir"
     assert_not_contains "$drift_out" "drifted:" "doctor from outside git repo: no false hook-drift warning"
     assert_contains "$drift_out" "hook drift" "doctor from outside git repo: hook drift check still runs"
@@ -331,12 +333,63 @@ test_breadcrumbs() {
     assert_equals "0" "$orphan_after" "no orphaned nodes_fts entries remain after repair"
 
     # wv-a77603: cross-agent install-drift advisory rides the bootstrap JSON that
-    # every harness (Claude/Codex/Copilot) reads at session start. The isolated
-    # test env has no source-path pointer, so _wv_source_drift no-ops (consumer-
-    # safe) and advisories is an empty array.
-    local boot_adv
-    boot_adv=$("$WV" bootstrap --json 2>/dev/null | jq -c '.advisories' 2>/dev/null)
+    # every harness (Claude/Codex/Copilot) reads at session start. With no
+    # source-path pointer _wv_source_drift no-ops (consumer-safe) and advisories
+    # is an empty array. The config dir is stated, not assumed: inherited, the
+    # developer's real pointer made this red whenever the checkout held an
+    # uninstalled edit (wv-755543).
+    local boot_adv empty_cfg drift_cfg drift_home
+    empty_cfg=$(mktemp -d)
+    boot_adv=$(WV_CONFIG_DIR="$empty_cfg" "$WV" bootstrap --json 2>/dev/null | jq -c '.advisories' 2>/dev/null)
     assert_equals "[]" "$boot_adv" "bootstrap exposes advisories array; clean when no source-path (consumer-safe no-op)"
+    # ...and the same call does report drift when a pointer names a source tree
+    # whose installed copies are missing, so the clean case is not vacuous.
+    drift_cfg=$(mktemp -d); drift_home=$(mktemp -d)
+    mkdir -p "$drift_cfg/src/scripts/cmd"
+    echo 'edited' > "$drift_cfg/src/scripts/cmd/wv-cmd-probe.sh"
+    printf '%s\n' "$drift_cfg/src" > "$drift_cfg/source-path"
+    boot_adv=$(HOME="$drift_home" WV_CONFIG_DIR="$drift_cfg" "$WV" bootstrap --json 2>/dev/null | jq -c '.advisories' 2>/dev/null)
+    assert_contains "$boot_adv" "install drift" "bootstrap reports install drift when a source-path pointer names drifted sources"
+    rm -rf "$empty_cfg" "$drift_cfg" "$drift_home"
+}
+
+test_doctor_cold_start_hydrates() {
+    echo ""
+    echo "=== Doctor cold start ==="
+
+    setup_test_env
+    export WV_HOT_ZONE="$TEST_DIR/hotzone"
+    unset WV_DB
+    "$WV" init >/dev/null 2>&1
+    "$WV" add "persisted cold-start fixture" >/dev/null 2>&1
+    "$WV" sync >/dev/null 2>&1
+
+    rm -rf "$WV_HOT_ZONE"
+    local first_out first_rc=0 first_database first_hot_zone
+    first_out=$("$WV" doctor --json 2>/dev/null) || first_rc=$?
+    first_database=$(jq -r '.checks[] | select(.check=="database") | .status' <<<"$first_out")
+    first_hot_zone=$(jq -r '.checks[] | select(.check=="hot zone") | .status' <<<"$first_out")
+
+    rm -rf "$WV_HOT_ZONE"
+    "$WV" status >/dev/null 2>&1
+    local preceded_out preceded_rc=0 preceded_database preceded_hot_zone
+    preceded_out=$("$WV" doctor --json 2>/dev/null) || preceded_rc=$?
+    preceded_database=$(jq -r '.checks[] | select(.check=="database") | .status' <<<"$preceded_out")
+    preceded_hot_zone=$(jq -r '.checks[] | select(.check=="hot zone") | .status' <<<"$preceded_out")
+
+    assert_equals "$preceded_rc" "$first_rc" \
+        "doctor exit status does not depend on a preceding hydrating command"
+    assert_equals "pass" "$first_database" \
+        "doctor first command hydrates and checks the committed database"
+    assert_equals "$preceded_database" "$first_database" \
+        "database verdict is identical before and after a preceding command"
+    assert_equals "pass" "$first_hot_zone" \
+        "doctor first command reports the hydrated hot zone"
+    assert_equals "$preceded_hot_zone" "$first_hot_zone" \
+        "hot-zone verdict is identical before and after a preceding command"
+
+    export WV_HOT_ZONE="$TEST_DIR"
+    export WV_DB="$TEST_DIR/brain.db"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -638,6 +691,7 @@ main() {
 
     test_digest
     test_breadcrumbs
+    test_doctor_cold_start_hydrates
     test_learnings_filters
     test_learnings_modes
     test_validation_on_done

@@ -1,0 +1,297 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://weave.dev/contracts/policy-rules-v1.schema.json",
+  "$comment": "What may refuse a Weave operation. The capability registry declares what an operation touches; this declares which rules may deny or annotate it, where each rule is enforced, and what is not a policy decision at all. Structural rules live here; cross-artifact rules (operations exist in the registry, decisions fold onto the verdict schema, sites resolve in code) are checked by scripts/weave_policy.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "contract_version",
+    "references",
+    "rule_decisions",
+    "verdict_fold",
+    "enforcement_owners",
+    "non_policy_categories",
+    "completeness",
+    "denominator",
+    "coverage",
+    "rules",
+    "non_policy_sites"
+  ],
+  "properties": {
+    "schema": { "const": "weave.policy-rules.v1" },
+    "contract_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "references": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_registry", "verdict_schema", "node_field_registry"],
+      "properties": {
+        "capability_registry": { "$ref": "#/$defs/repo_path" },
+        "verdict_schema": { "$ref": "#/$defs/repo_path" },
+        "node_field_registry": { "$ref": "#/$defs/repo_path" }
+      }
+    },
+    "rule_decisions": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/token" }
+    },
+    "verdict_fold": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule_decision", "verdict"],
+        "properties": {
+          "rule_decision": { "$ref": "#/$defs/token" },
+          "verdict": { "$ref": "#/$defs/token" }
+        }
+      }
+    },
+    "enforcement_owners": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/token" }
+    },
+    "non_policy_categories": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category", "meaning"],
+        "properties": {
+          "category": { "$ref": "#/$defs/token" },
+          "meaning": { "type": "string", "minLength": 20 }
+        }
+      }
+    },
+    "completeness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["proven", "declared_only", "limit"],
+      "properties": {
+        "proven": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/token" } },
+        "declared_only": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/token" } },
+        "limit": { "type": "string", "minLength": 20 }
+      }
+    },
+    "denominator": {
+      "$comment": "What a counted call is, and which decisions are outside it by declaration rather than by where instrumentation happens to reach. Bound through the contract identity that every attempt-journal event carries as policy_identity.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "requires_event", "excluded_scopes", "rationale"],
+      "properties": {
+        "unit": { "const": "wv_call" },
+        "requires_event": { "const": "call_started" },
+        "excluded_scopes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "reason", "decided_by"],
+            "properties": {
+              "kind": { "$ref": "#/$defs/token" },
+              "reason": { "type": "string", "minLength": 20 },
+              "decided_by": { "type": "string", "pattern": "^wv-[a-f0-9]{4,6}$" }
+            }
+          }
+        },
+        "rationale": { "type": "string", "minLength": 20 }
+      }
+    },
+    "coverage": {
+      "$comment": "How every mutation-class operation in the capability registry resolves for policy totality (scripts/weave_policy.py totality), beyond the rules observed to decide in it: operations no rule refuses, and what is not yet countable. A gap names the node that closes it, and a gap that is already covered is an error, so the list cannot outlive its reason.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ungated", "gaps"],
+      "properties": {
+        "ungated": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["operation", "reason"],
+            "properties": {
+              "operation": { "type": "string", "minLength": 1 },
+              "suboperation": { "type": "string", "minLength": 1 },
+              "reason": { "type": "string", "minLength": 20 }
+            }
+          }
+        },
+        "gaps": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["rule", "reason", "node"],
+                "properties": {
+                  "rule": { "$ref": "#/$defs/token" },
+                  "reason": { "type": "string", "minLength": 20 },
+                  "node": { "type": "string", "pattern": "^wv-[a-f0-9]{4,6}$" }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["operation", "reason", "node"],
+                "properties": {
+                  "operation": { "type": "string", "minLength": 1 },
+                  "suboperation": { "type": "string", "minLength": 1 },
+                  "reason": { "type": "string", "minLength": 20 },
+                  "node": { "type": "string", "pattern": "^wv-[a-f0-9]{4,6}$" }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/rule" }
+    },
+    "non_policy_sites": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category", "summary", "sites"],
+        "properties": {
+          "category": { "$ref": "#/$defs/token" },
+          "summary": { "type": "string", "minLength": 10 },
+          "sites": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/site" } }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "token": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "repo_path": { "type": "string", "pattern": "^[A-Za-z0-9_.][A-Za-z0-9_./-]*$" },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_id", "summary", "basis", "decisions", "applies_to", "bypass", "sites"],
+      "properties": {
+        "rule_id": { "type": "string", "pattern": "^[a-z][a-z0-9_]{2,63}$" },
+        "summary": { "type": "string", "minLength": 10 },
+        "basis": { "enum": ["invariant", "heuristic"] },
+        "decisions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/token" }
+        },
+        "applies_to": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/scope" } },
+        "bypass": { "type": "array", "items": { "$ref": "#/$defs/bypass" } },
+        "sites": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/site" } },
+        "conflates": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/token" }
+        },
+        "notes": { "type": "string", "minLength": 10 }
+      }
+    },
+    "scope": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "operation"],
+          "properties": {
+            "kind": { "const": "operation" },
+            "operation": { "type": "string", "minLength": 1 },
+            "suboperation": { "type": "string" },
+            "condition": { "type": "string", "minLength": 2 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "field", "from", "to", "via"],
+          "properties": {
+            "kind": { "const": "transition" },
+            "field": { "$ref": "#/$defs/token" },
+            "from": { "$ref": "#/$defs/token" },
+            "to": { "$ref": "#/$defs/token" },
+            "via": {
+              "$comment": "The operations that can perform this transition. A call's applicable rule set is resolved from operations, so a transition that named none would apply to no call and a close that tripped it could still be counted.",
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "event"],
+          "properties": {
+            "kind": { "const": "host_event" },
+            "event": { "enum": ["PreToolUse", "Stop"] },
+            "tool_class": { "enum": ["edit", "read", "bash"] },
+            "intercepts": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "bypass": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name"],
+          "properties": {
+            "kind": { "const": "flag" },
+            "name": { "type": "string", "pattern": "^--[a-z][a-z0-9-]*$" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "value"],
+          "properties": {
+            "kind": { "const": "env" },
+            "name": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+            "value": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "how"],
+          "properties": {
+            "kind": { "const": "state" },
+            "how": { "type": "string", "minLength": 10 },
+            "recorded_as": {
+              "$comment": "The bypass value prefix an allow verdict records when this state let the call through, such as quality_exempt:. Absent when the state only means the rule does not fire.",
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]*:$"
+            }
+          }
+        }
+      ]
+    },
+    "site": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "path"],
+      "properties": {
+        "owner": { "$ref": "#/$defs/token" },
+        "path": { "$ref": "#/$defs/repo_path" },
+        "function": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+        "anchor": { "type": "string", "minLength": 4 },
+        "occurrences": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

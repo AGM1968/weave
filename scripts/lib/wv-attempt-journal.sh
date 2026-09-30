@@ -54,6 +54,8 @@ _WV_ATTEMPT_REGISTRY_IDENTITY=""
 _WV_ATTEMPT_REGISTRY_SCHEMA=""
 _WV_ATTEMPT_CAUSAL_BEFORE=""
 _WV_ATTEMPT_PARENT_CALL_ID=""
+_WV_ATTEMPT_POLICY_IDENTITY=""
+_WV_ATTEMPT_POLICY_SCHEMA=""
 
 wv_json_escape() {
     local value="${1:-}" result="" char escaped index code
@@ -99,7 +101,7 @@ wv_attempt_evidence_mode() {
 
 # Marker file, not a shell variable: a gate that runs inside a command
 # substitution increments a counter its parent never sees, and "no verdict" is
-# the one answer this must never get wrong.
+# the one answer this must never get wrong. One line per verdict, naming its rule.
 _wv_attempt_verdict_marker() {
     printf '%s/attempt-verdicts/%s' "${WV_HOT_ZONE:-${TMPDIR:-/tmp}}" "${_WV_ATTEMPT_CALL_ID:-unknown}"
 }
@@ -111,8 +113,126 @@ wv_attempt_verdict_count() {
     wc -l < "$marker" | tr -d ' '
 }
 
+# The rules this call recorded a verdict for, sorted and unique, one per line.
+wv_attempt_evaluated_rules() {
+    local marker
+    marker=$(_wv_attempt_verdict_marker)
+    [ -f "$marker" ] || return 0
+    sort -u "$marker"
+}
+
+# wv_attempt_verdicts_claim — take the marker for this call_id, exclusively.
+#
+# The marker is keyed only by call_id, so two calls sharing an id -- a harness
+# pinning WV_CALL_ID for concurrent calls, or a crashed call's id reused -- would
+# otherwise append to one file and each report the other's verdicts as its own.
+# Creating it with O_EXCL makes the second claimant fail instead of merging. In
+# evidence mode that ends the call; in analytics mode journaling is suppressed
+# for this call, since an event under a shared id is worse than no event.
+wv_attempt_verdicts_claim() {
+    local marker
+    wv_attempt_journal_enabled || return 0
+    marker=$(_wv_attempt_verdict_marker)
+    if { mkdir -p "$(dirname "$marker")" && (set -o noclobber; : > "$marker"); } 2>/dev/null; then
+        return 0
+    fi
+    if [ -e "$marker" ]; then
+        _WV_JOURNAL_SUPPRESSED=1
+        _wv_attempt_fail "call_id $_WV_ATTEMPT_CALL_ID is already held by another call; refusing to merge its verdict evidence"
+    else
+        _wv_attempt_fail "attempt verdict marker could not be created at $marker"
+    fi
+    return 1
+}
+
+_wv_attempt_rules_json() {
+    local rule first=1
+    printf '['
+    for rule in $1; do
+        [ "$first" -eq 1 ] || printf ','
+        first=0
+        printf '"%s"' "$(wv_json_escape "$rule")"
+    done
+    printf ']'
+}
+
+# Rules the journal itself holds a policy_verdict for under this call_id.
+_wv_attempt_journaled_rules() {
+    local path
+    path=$(wv_attempt_journal_path) || return 0
+    [ -f "$path" ] || return 0
+    grep -F "\"call_id\":\"$_WV_ATTEMPT_CALL_ID\"" "$path" | grep -F '"event":"policy_verdict"' |
+        sed -n 's/.*"rule":"\([a-z0-9_]*\)".*/\1/p' | sort -u
+}
+
+# wv_attempt_policy_json — the call's policy provenance, for call_completed.
+#
+# A call with no verdict is NOT an allow. applicable_rules is what the policy
+# contract says can decide inside this operation (the generated
+# _wv_policy_applicable); evaluated_rules is what this call recorded a verdict
+# for. The call is countable only when the two are equal, the journal itself
+# holds a verdict for every evaluated rule -- derived from the journal, not
+# taken from the marker's word -- and it ran in evidence mode, where no write
+# that failed can have been swallowed.
+wv_attempt_policy_json() {
+    local verdicts applicable evaluated journaled extra missing state reason countable=false
+    verdicts=$(wv_attempt_verdict_count)
+    evaluated=$(wv_attempt_evaluated_rules)
+    journaled=$(_wv_attempt_journaled_rules)
+    if declare -F _wv_policy_applicable >/dev/null; then
+        applicable=$(_wv_policy_applicable "$_WV_ATTEMPT_OPERATION" "$_WV_ATTEMPT_SUBOPERATION" |
+            tr ' ' '\n' | sed '/^$/d' | sort -u)
+        extra=$(comm -13 <(printf '%s\n' "$applicable" | sed '/^$/d') <(printf '%s\n' "$evaluated" | sed '/^$/d'))
+        missing=$(comm -23 <(printf '%s\n' "$applicable" | sed '/^$/d') <(printf '%s\n' "$evaluated" | sed '/^$/d'))
+    else
+        applicable="" extra="" missing=""
+        state="inconsistent"
+        reason="no policy projection was loaded, so the applicable rule set is unknown"
+    fi
+    if [ -n "${state:-}" ]; then
+        :
+    elif [ -n "$extra" ]; then
+        state="inconsistent"
+        reason="verdicts were recorded for rules the policy contract does not apply to this operation: ${extra//$'\n'/ }"
+    elif [ "$journaled" != "$evaluated" ]; then
+        state="inconsistent"
+        reason="the verdict marker and the journal disagree about which rules this call evaluated"
+    elif [ -n "$missing" ] && [ "${verdicts:-0}" -eq 0 ]; then
+        state="unavailable"
+        reason="no applicable rule recorded a verdict for this call, so silence is not an allow: ${missing//$'\n'/ }"
+    elif [ -n "$missing" ]; then
+        state="partial"
+        reason="applicable rules left no verdict for this call: ${missing//$'\n'/ }"
+    else
+        state="complete"
+        if ! wv_attempt_evidence_mode; then
+            reason="every applicable rule recorded a verdict, but outside evidence mode a failed write is swallowed, so the call is not countable"
+        elif [ -n "$applicable" ]; then
+            countable=true
+            reason="every rule the policy contract applies to this operation recorded a durable verdict"
+        else
+            countable=true
+            reason="the policy contract (policy_identity) applies no in-call rule to this operation"
+        fi
+    fi
+    printf '{"state":"%s","countable":%s,"verdicts":%s,"applicable_rules":%s,"evaluated_rules":%s,"reason":"%s"}' \
+        "$state" "$countable" "${verdicts:-0}" "$(_wv_attempt_rules_json "$applicable")" \
+        "$(_wv_attempt_rules_json "$evaluated")" "$(wv_json_escape "$reason")"
+}
+
+# wv_attempt_verdicts_reset — release this call's marker. A marker that cannot be
+# removed is reported, not ignored: it would block the id rather than leak into
+# the next call (the claim is exclusive), but it is still a write that failed.
 wv_attempt_verdicts_reset() {
-    rm -f "$(_wv_attempt_verdict_marker)" 2>/dev/null || true
+    local marker
+    wv_attempt_journal_enabled || return 0
+    [ -n "${_WV_JOURNAL_SUPPRESSED:-}" ] && return 0
+    marker=$(_wv_attempt_verdict_marker)
+    rm -f "$marker" 2>/dev/null
+    if [ -e "$marker" ]; then
+        _wv_attempt_fail "attempt verdict marker could not be removed at $marker"
+        return 1
+    fi
 }
 
 wv_attempt_context() {
@@ -133,6 +253,11 @@ wv_attempt_context() {
     # parent" from "this writer did not record parents", which is the difference
     # between a complete tree and an unknown one.
     _WV_ATTEMPT_PARENT_CALL_ID="${13:-}"
+    # The policy contract binds separately from the capability registry: one says
+    # what an operation touches, the other what may refuse it, and a reader must
+    # be able to tell which of the two changed between calls.
+    _WV_ATTEMPT_POLICY_IDENTITY="${14:-}"
+    _WV_ATTEMPT_POLICY_SCHEMA="${15:-}"
     export _WV_ATTEMPT_CALL_ID
 }
 
@@ -144,6 +269,7 @@ _wv_attempt_required_fields() {
     case "$1" in
         call_started) printf 'argv disposition' ;;
         policy_verdict) printf 'decision rule would_violate_invariant' ;;
+        non_policy_refusal) printf 'category detail' ;;
         mutation_disposition) printf 'causal_identity_after disposition exit_status' ;;
         call_completed) printf 'causal_identity_after disposition elapsed_ms exit_status policy' ;;
         *) return 1 ;;
@@ -167,8 +293,9 @@ _wv_attempt_fail() {
 # field that event requires, is a defect in the caller and is treated as one.
 wv_attempt_emit() {
     local event="$1"; shift
-    local required field pair key value body="" path line
+    local required field pair key value body="" path line rule=""
     wv_attempt_journal_enabled || return 0
+    [ -n "${_WV_JOURNAL_SUPPRESSED:-}" ] && return 0
     [ -n "${_WV_JOURNAL_BROKEN:-}" ] && return 1
 
     if ! required=$(_wv_attempt_required_fields "$event"); then
@@ -188,6 +315,7 @@ wv_attempt_emit() {
                 ;;
             *=*)
                 key="${pair%%=*}"; value="${pair#*=}"
+                [ "$key" = "rule" ] && rule="$value"
                 body+=",\"$key\":\"$(wv_json_escape "$value")\""
                 ;;
             *)
@@ -215,23 +343,58 @@ wv_attempt_emit() {
     [ -n "${_WV_ATTEMPT_PARENT_CALL_ID:-}" ] &&
         parent_json="\"$(wv_json_escape "$_WV_ATTEMPT_PARENT_CALL_ID")\""
 
-    line=$(printf '{"format":"%s","event":"%s","ts":"%s","call_id":"%s","parent_call_id":%s,"workflow_id":"%s","trace_id":"%s","source":"%s","repo_root":"%s","operation":"%s","suboperation":"%s","evidence_class":"%s","mutation_targets":%s,"registry_identity":"%s","registry_schema":"%s","causal_identity_before":%s%s}' \
+    line=$(printf '{"format":"%s","event":"%s","ts":"%s","call_id":"%s","parent_call_id":%s,"workflow_id":"%s","trace_id":"%s","source":"%s","repo_root":"%s","operation":"%s","suboperation":"%s","evidence_class":"%s","mutation_targets":%s,"registry_identity":"%s","registry_schema":"%s","policy_identity":"%s","policy_schema":"%s","causal_identity_before":%s%s}' \
         "$WV_ATTEMPT_JOURNAL_FORMAT" "$event" "$(date +%s.%6N)" \
         "$(wv_json_escape "$_WV_ATTEMPT_CALL_ID")" "$parent_json" "$(wv_json_escape "$_WV_ATTEMPT_WORKFLOW_ID")" \
         "$(wv_json_escape "$_WV_ATTEMPT_TRACE_ID")" "$(wv_json_escape "$_WV_ATTEMPT_SOURCE")" \
         "$(wv_json_escape "$_WV_ATTEMPT_REPO_ROOT")" "$(wv_json_escape "$_WV_ATTEMPT_OPERATION")" \
         "$(wv_json_escape "$_WV_ATTEMPT_SUBOPERATION")" "$(wv_json_escape "$_WV_ATTEMPT_EVIDENCE_CLASS")" \
         "${_WV_ATTEMPT_TARGETS:-[]}" "$(wv_json_escape "$_WV_ATTEMPT_REGISTRY_IDENTITY")" \
-        "$(wv_json_escape "$_WV_ATTEMPT_REGISTRY_SCHEMA")" "${_WV_ATTEMPT_CAUSAL_BEFORE:-null}" "$body")
+        "$(wv_json_escape "$_WV_ATTEMPT_REGISTRY_SCHEMA")" "$(wv_json_escape "$_WV_ATTEMPT_POLICY_IDENTITY")" \
+        "$(wv_json_escape "$_WV_ATTEMPT_POLICY_SCHEMA")" "${_WV_ATTEMPT_CAUSAL_BEFORE:-null}" "$body")
 
     if ! { mkdir -p "$(dirname "$path")" && printf '%s\n' "$line" >> "$path"; } 2>/dev/null; then
         _wv_attempt_fail "attempt journal write failed at $path"
         return 1
     fi
+    # The marker follows the durable journal line, never precedes it, so a rule
+    # it names is one the journal already holds. A marker that cannot be written
+    # would under-report the evaluated set, so it fails like the journal write.
     if [ "$event" = "policy_verdict" ]; then
         local marker
         marker=$(_wv_attempt_verdict_marker)
-        { mkdir -p "$(dirname "$marker")" && printf '%s\n' "$event" >> "$marker"; } 2>/dev/null || true
+        if ! printf '%s\n' "$rule" >> "$marker" 2>/dev/null; then
+            _wv_attempt_fail "attempt verdict marker write failed at $marker"
+            return 1
+        fi
     fi
     return 0
+}
+
+# wv_policy_verdict <rule_id> <decision> <would_violate_invariant> [bypass] [detail] [clause-json]
+#
+# What a gate records when it decides. rule_id is a contracts/policy-rules-v1.json
+# rule, never a function name or a message, and scripts/weave_policy.py requires
+# every command-gate rule to reach this at its declared site. A bypassed gate
+# records the decision it made (allow) with the flag or knob that caused it, so
+# an override is evidence rather than silence. clause is the typed values a
+# SQLite-owned rule decided on, copied from the close receipt. The result is
+# returned, never discarded: in evidence mode the emitter fails the call closed.
+wv_policy_verdict() {
+    local rule="$1" decision="$2" invariant="$3" bypass="${4:-}" detail="${5:-}" clause="${6:-}"
+    local fields=("rule=$rule" "decision=$decision" "would_violate_invariant=$invariant")
+    [ -n "$bypass" ] && fields+=("bypass=$bypass")
+    [ -n "$detail" ] && fields+=("detail=$detail")
+    [ -n "$clause" ] && fields+=("clause:=$clause")
+    wv_attempt_emit policy_verdict "${fields[@]}"
+}
+
+# wv_policy_refusal <category> <detail>
+#
+# A refusal that is not a policy decision: input_validation, expected_conflict
+# or infrastructure_failure (contracts/policy-rules-v1.json non_policy_categories).
+# Recording it is what keeps a malformed argument or a lost race from being
+# counted as a counterweight event, or from vanishing.
+wv_policy_refusal() {
+    wv_attempt_emit non_policy_refusal "category=$1" "detail=$2"
 }

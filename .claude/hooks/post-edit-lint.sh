@@ -51,6 +51,32 @@ if [[ "$FILE_PATH" =~ \.py$ ]]; then
     exit 0
 fi
 
+# _restore_generated_regions <original> <formatted> -- prints <formatted> with
+# every '<!-- BEGIN GENERATED ... -->' .. '<!-- END GENERATED ... -->' region
+# replaced by the same region from <original>, byte for byte. Those regions
+# belong to a generator whose --check compares them exactly; prettier reflowing
+# the workflow-classes block in templates/WORKFLOW.md turned make check red
+# after an unrelated prose edit (wv-5af710). Exits 3 without a result if the
+# regions do not pair up in order, so the caller leaves the file alone.
+_restore_generated_regions() {
+    awk '
+        NR == FNR {
+            if ($0 ~ /^<!-- BEGIN GENERATED/) { inside = 1; n++; head[n] = $0 }
+            if (inside) region[n] = region[n] $0 "\n"
+            if (inside && $0 ~ /^<!-- END GENERATED/) inside = 0
+            next
+        }
+        skipping { if ($0 ~ /^<!-- END GENERATED/) skipping = 0; next }
+        /^<!-- BEGIN GENERATED/ {
+            k++
+            if (k > n || $0 != head[k]) { bad = 1; exit }
+            printf "%s", region[k]; skipping = 1; next
+        }
+        { print }
+        END { if (bad || k != n) exit 3 }
+    ' "$1" "$2"
+}
+
 # Markdown and other supported files: run prettier — only within repo root
 # Guard prevents prettier from silently rewriting files outside the project
 # (e.g. ~/.claude/settings.json) which could strip fields it doesn't recognise.
@@ -59,7 +85,21 @@ if [[ "$FILE_PATH" =~ \.(md|json|yaml|yml|js|ts|css|html)$ ]]; then
     if [ -n "$REPO_ROOT" ] && [[ "$FILE_PATH" == "$REPO_ROOT"/* ]]; then
         if command -v prettier &> /dev/null && [ -f "$FILE_PATH" ]; then
             if ! prettier --check "$FILE_PATH" &> /dev/null; then
-                prettier --write "$FILE_PATH" &> /dev/null || true
+                FORMATTED=$(mktemp)
+                RESULT=$(mktemp)
+                # Format to a temp file and write back only a complete result, in
+                # place so the file keeps its mode.
+                if prettier "$FILE_PATH" > "$FORMATTED" 2>/dev/null; then
+                    if grep -q '^<!-- BEGIN GENERATED' "$FILE_PATH"; then
+                        _restore_generated_regions "$FILE_PATH" "$FORMATTED" > "$RESULT" || : > "$RESULT"
+                    else
+                        cp "$FORMATTED" "$RESULT"
+                    fi
+                    if [ -s "$RESULT" ] && ! cmp -s "$RESULT" "$FILE_PATH"; then
+                        cat "$RESULT" > "$FILE_PATH"
+                    fi
+                fi
+                rm -f "$FORMATTED" "$RESULT"
             fi
         fi
     fi

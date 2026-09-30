@@ -305,6 +305,29 @@ missed = [c for c in ('cutover','init','init-repo','repo-class','doctor','trails
 raise SystemExit(1 if missed else 0)
 PY"
 
+# wv-e07ee4: nothing fed resolve() a ref it must refuse, so dropping the raise
+# survived; a circular ref then loops forever, hence the timeout. The chained
+# control keeps a refusal from meaning a broken fixture.
+cat >"$TMP/ref-probe.py" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from weave_registry import resolve
+root = {"$defs": {"a": {"$ref": "#/$defs/b"}, "b": {"$ref": "#/$defs/a"},
+                  "c": {"$ref": "#/$defs/d"}, "d": {"type": "string"}}}
+if resolve({"$ref": "#/$defs/c"}, root) != {"type": "string"}:
+    raise SystemExit("control: a ref chain did not resolve")
+for ref in ("#/$defs/a", "other.json#/x"):
+    try:
+        resolve({"$ref": ref}, root)
+    except ValueError as exc:
+        if "unsupported or circular $ref" not in str(exc):
+            raise SystemExit(f"{ref}: wrong refusal: {exc}")
+    else:
+        raise SystemExit(f"{ref}: accepted")
+PY
+check "a circular or non-local \$ref is refused, not followed" \
+  "timeout 10 python3 '$TMP/ref-probe.py' '$ROOT/scripts'"
+
 echo ""
 echo "Results: $pass/$run passed"
 [ "$pass" -eq "$run" ]

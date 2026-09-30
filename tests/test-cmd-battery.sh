@@ -201,8 +201,10 @@ battery J hotzone    hotzone list --json
 # hotzone outside a git repo must hint, not stay silent (wv-b75fbe)
 TESTS_RUN=$((TESTS_RUN + 1))
 NONREPO=$(mktemp -d)
-hz_err=$( (cd "$NONREPO" && "$WV" hotzone list 2>&1 >/dev/null) || true )
-if echo "$hz_err" | grep -q "not inside a git repo"; then
+# Outside a repo means no override too: the suite's exported hot zone belongs to
+# its fixture repo, and wv refuses it anywhere else (wv-5e804e).
+hz_err=$( (cd "$NONREPO" && env -u WV_HOT_ZONE -u WV_DB "$WV" hotzone list 2>&1 >/dev/null) || true )
+if grep -q "not inside a git repo" <<< "$hz_err"; then
     echo -e "  ${GREEN}✓${NC} hotzone list outside a repo emits non-repo hint"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -223,6 +225,8 @@ battery R edge-types edge-types --stats
 battery R guide      guide --topic=discovery
 battery R config     config
 battery J repo-class repo-class --json
+# Full assertions live in test-context-policy.sh; here it must at least dispatch.
+battery H context-policy
 battery H hook
 battery H test-record
 battery H test-status

@@ -70,6 +70,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# A decoded JSON object. The registry and schema are arbitrary JSON, so values
+# stay Any; what this names is that the keys are strings.
+Json = dict[str, Any]
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REGISTRY = ROOT / "contracts" / "command-capabilities.json"
 DEFAULT_SCHEMA = ROOT / "contracts" / "command-capabilities-v1.schema.json"
@@ -101,19 +105,20 @@ SCHEMA_KEYWORDS = SCHEMA_ANNOTATIONS | {
     "type",
     "uniqueItems",
 }
-JSON_TYPES = {
-    "array": list,
-    "boolean": bool,
-    "integer": int,
-    "null": type(None),
-    "object": dict,
-    "string": str,
+JSON_TYPES: dict[str, tuple[type, ...]] = {
+    "array": (list,),
+    "boolean": (bool,),
+    "integer": (int,),
+    "null": (type(None),),
+    "number": (int, float),
+    "object": (dict,),
+    "string": (str,),
 }
 
 GENERATED_HEADER = "# GENERATED FROM contracts/command-capabilities.json -- DO NOT EDIT"
 
 
-def canonical(doc: dict) -> str:
+def canonical(doc: Json) -> str:
     return json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
 
 
@@ -121,7 +126,7 @@ def digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def key(rowdict: dict) -> tuple[str, str]:
+def key(rowdict: Json) -> tuple[str, str]:
     return (rowdict["operation"], rowdict.get("suboperation", ""))
 
 
@@ -135,11 +140,12 @@ def dispatch_commands(wv_path: Path) -> set[str]:
     return found
 
 
-def load(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+def load(path: Path) -> Json:
+    doc: Json = json.loads(path.read_text(encoding="utf-8"))
+    return doc
 
 
-def schema_keywords(schema: dict, seen: set[str] | None = None) -> set[str]:
+def schema_keywords(schema: Json, seen: set[str] | None = None) -> set[str]:
     """Every keyword used anywhere in the schema document."""
     seen = set() if seen is None else seen
     seen.update(schema)
@@ -157,7 +163,7 @@ def schema_keywords(schema: dict, seen: set[str] | None = None) -> set[str]:
     return seen
 
 
-def resolve(node: dict, root: dict) -> dict:
+def resolve(node: Json, root: Json) -> Json:
     """Follow local $refs. Only '#/'-anchored pointers exist in this contract."""
     followed: set[str] = set()
     while "$ref" in node:
@@ -172,7 +178,7 @@ def resolve(node: dict, root: dict) -> dict:
     return node
 
 
-def _apply_type(value: Any, node: dict, where: str, errors: list[str]) -> bool:
+def _apply_type(value: Any, node: Json, where: str, errors: list[str]) -> bool:
     """The type gate. Returns False when the value is the wrong type, in which
     case no other keyword is meaningful and the caller stops."""
     if "type" not in node:
@@ -182,7 +188,7 @@ def _apply_type(value: Any, node: dict, where: str, errors: list[str]) -> bool:
     # absence. Executing only the scalar form would have meant spelling that as
     # anyOf purely to suit this executor.
     names = node["type"] if isinstance(node["type"], list) else [node["type"]]
-    wanted = tuple(JSON_TYPES[name] for name in names)
+    wanted = tuple(kind for name in names for kind in JSON_TYPES[name])
     # JSON has no bool-as-integer: True is not 1 in a contract, whatever
     # Python's type hierarchy says.
     if not isinstance(value, wanted) or (isinstance(value, bool) and "boolean" not in names):
@@ -191,7 +197,7 @@ def _apply_type(value: Any, node: dict, where: str, errors: list[str]) -> bool:
     return True
 
 
-def _apply_scalar(value: Any, node: dict, where: str, errors: list[str]) -> None:
+def _apply_scalar(value: Any, node: Json, where: str, errors: list[str]) -> None:
     """Keywords that constrain a single value."""
     if "const" in node and value != node["const"]:
         errors.append(f"{where}: must be {node['const']!r}, got {value!r}")
@@ -208,7 +214,7 @@ def _apply_scalar(value: Any, node: dict, where: str, errors: list[str]) -> None
 
 
 def _apply_one_of(
-    value: Any, node: dict, root: dict, path: str, where: str, errors: list[str]
+    value: Any, node: Json, root: Json, path: str, where: str, errors: list[str]
 ) -> None:
     """Exactly one branch must accept, which is what makes the event-type union
     a discriminator rather than a list of suggestions."""
@@ -227,7 +233,7 @@ def _apply_one_of(
 
 
 def _apply_object(
-    value: dict, node: dict, root: dict, path: str, where: str, errors: list[str]
+    value: Json, node: Json, root: Json, path: str, where: str, errors: list[str]
 ) -> None:
     """required, additionalProperties and per-property descent."""
     properties = node.get("properties", {})
@@ -243,7 +249,7 @@ def _apply_object(
 
 
 def _apply_array(
-    value: list, node: dict, root: dict, path: str, where: str, errors: list[str]
+    value: list[Any], node: Json, root: Json, path: str, where: str, errors: list[str]
 ) -> None:
     """minItems, uniqueItems and per-item descent."""
     if len(value) < node.get("minItems", 0):
@@ -259,7 +265,7 @@ def _apply_array(
             apply_schema(item, item_schema, root, f"{path}[{index}]", errors)
 
 
-def apply_schema(value: Any, node: dict, root: dict, path: str, errors: list[str]) -> None:
+def apply_schema(value: Any, node: Json, root: Json, path: str, errors: list[str]) -> None:
     """Execute the schema document against a value, collecting every failure.
 
     Split by keyword group rather than kept as one chain: the groups are
@@ -279,7 +285,7 @@ def apply_schema(value: Any, node: dict, root: dict, path: str, errors: list[str
         _apply_array(value, node, root, path, where, errors)
 
 
-def _dominance_errors(seen: dict[tuple[str, str], dict]) -> list[str]:
+def _dominance_errors(seen: dict[tuple[str, str], Json]) -> list[str]:
     """DOMINANCE: the fallback row is never weaker than what it stands in for.
 
     This is what makes "conservative where flags alter effects" checkable rather
@@ -358,7 +364,7 @@ def validate(registry: Path, wv_path: Path, schema_path: Path = DEFAULT_SCHEMA) 
         ]
 
     rows = doc["commands"]
-    seen: dict[tuple[str, str], dict] = {}
+    seen: dict[tuple[str, str], Json] = {}
     for row in rows:
         # EXCLUSIVITY: serving a cached result and dropping the cache are
         # opposite dispositions, and a row claiming both classifies nothing.
@@ -419,7 +425,7 @@ def _branches(selected: list[str]) -> str:
     return "|".join(selected) if selected else ""
 
 
-def _shell_cache_predicates(subs: list[dict], base: list[dict]) -> list[str]:
+def _shell_cache_predicates(subs: list[Json], base: list[Json]) -> list[str]:
     """_wv_cap_serve and _wv_cap_invalidate: the run cache's two dispositions."""
     out: list[str] = []
     for name, field in (("_wv_cap_serve", "serve"), ("_wv_cap_invalidate", "invalidate")):
@@ -438,7 +444,7 @@ def _shell_cache_predicates(subs: list[dict], base: list[dict]) -> list[str]:
     return out
 
 
-def _shell_evidence_class(subs: list[dict], base: list[dict]) -> list[str]:
+def _shell_evidence_class(subs: list[Json], base: list[Json]) -> list[str]:
     """_wv_cap_evidence_class: how the counterweight classifies each row."""
     out = ["_wv_cap_evidence_class() {", '    case "${1}:${2-}" in']
     for cls in sorted(CLASS_RANK):
@@ -453,7 +459,7 @@ def _shell_evidence_class(subs: list[dict], base: list[dict]) -> list[str]:
     return out + ["    esac", "    return 1", "}", ""]
 
 
-def _shell_targets(subs: list[dict], base: list[dict]) -> list[str]:
+def _shell_targets(subs: list[Json], base: list[Json]) -> list[str]:
     """_wv_cap_targets: what a mutation may touch, which is what an attempt
     journal records. Class and cache alone cannot answer that."""
     out = ["_wv_cap_targets() {", '    case "${1}:${2-}" in']
@@ -467,7 +473,7 @@ def _shell_targets(subs: list[dict], base: list[dict]) -> list[str]:
     return out + ["    esac", "    return 1", "}", ""]
 
 
-def _shell_refines_and_known(subs: list[dict], base: list[dict]) -> list[str]:
+def _shell_refines_and_known(subs: list[Json], base: list[Json]) -> list[str]:
     """_wv_cap_refines: whether a row of its own exists for this (operation,
     suboperation). The journal records what dispatch resolved, and "the second
     word" is not that -- most second words are operands, not refinements.

@@ -140,14 +140,14 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected to find: $needle"
-        echo "  In: $(echo "$haystack" | head -3)"
+        echo "  In: $(echo "$haystack" | sed -n '1,3p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return 1
     fi

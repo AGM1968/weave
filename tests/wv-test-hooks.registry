@@ -29,3 +29,4 @@ WV_TEST_MODE | (master) | 1 | Master opt-in. Every hook below is inert without i
 WV_TEST_SYNC_STUB | scripts/cmd/wv-cmd-data.sh | ok,fail:state,fail:nodes,fail:edges | Stands in for a succeeding GitHub step so the post-sync projection and stamping path is reachable offline, and forces one projection to fail.
 WV_TEST_FAIL_ORPHAN_KINDS | scripts/cmd/wv-cmd-data.sh | 1 | Forces the orphan-kind classifier to fail as a whole, a branch unreachable from the CLI.
 WV_TEST_IMPACT_RACE | scripts/cmd/wv-cmd-graph.sh | 1 | Mutates the graph during the impact walk, the window the cache publication check exists to close.
+WV_TEST_POLICY_RACE | scripts/cmd/wv-cmd-core.sh | 1 | Loosens every close-policy input after the close transaction decides and before the decision is reported, the window a re-derived verdict would drift in.

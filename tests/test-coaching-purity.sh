@@ -156,6 +156,16 @@ else
         "    a scan with nothing to scan must not read as clean"
 fi
 
+# A missing package is refused by name and never reaches a COUNT line; without
+# the check it fell through to the empty-package report above (wv-e07ee4).
+python3 "$PURITY" "$TMP/definitely-absent" > "$TMP/out" 2>&1
+if grep -q 'not a package directory' "$TMP/out" && ! terminated; then
+    pass "a missing package fails closed"
+else
+    fail "a missing package fails closed" \
+        "    a package path that does not exist must stop the scan"
+fi
+
 # ── the inner boundary ────────────────────────────────────────────────────────
 # weave_quality/guides.py READS THE FILESYSTEM by design, so it is not held to
 # the pure package's rules. It is held to one: guide resolution may not acquire

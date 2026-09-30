@@ -23,8 +23,20 @@ if [ -z "$WV_PROJECT_DIR" ]; then
 fi
 export WV_PROJECT_DIR
 WV="$WV_PROJECT_DIR/scripts/wv"
-# Fallback to installed binary when not in the memory-system source repo
+# No wv in the project: pair these hooks with the CLI of the tree this resolver
+# came from -- scripts/lib/../wv in a source checkout -- before the installed
+# binary. Falling straight back to ~/.local/bin/wv made hooks run from a
+# checkout against a fixture project exercise INSTALLED code, so a source fix
+# never reached four suites and a source regression could pass (wv-706439).
+# An installed resolver (~/.config/weave/lib, ~/.local/lib/weave/lib) has no
+# sibling wv and still falls through to the installed binary.
 if [ ! -x "$WV" ]; then
-  WV="$HOME/.local/bin/wv"
+  _rp_tree_wv="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/wv"
+  if [ -x "$_rp_tree_wv" ] && [ -f "$_rp_tree_wv" ]; then
+    WV="$_rp_tree_wv"
+  else
+    WV="$HOME/.local/bin/wv"
+  fi
+  unset _rp_tree_wv
 fi
 export WV

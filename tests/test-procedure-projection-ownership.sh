@@ -178,6 +178,32 @@ printf '%s\n' '---' 'name: manual' '---' '# hand written' > "$NREPO/.claude/skil
 if bash "$PROJECT" --source="$N" --repo="$NREPO" 2>/dev/null; then echo "FAIL: late collision accepted"; exit 1; fi
 [ ! -e "$NREPO/.claude/skills/wv-first" ] || { echo "FAIL: earlier procedure mutated before late collision"; exit 1; }
 
+# --- P. AGENTS.md index is marker-gated and universal (wv-6ef83b) -----------
+P="$TMP/p"; PREPO="$TMP/prepo"; mkdir -p "$P" "$PREPO"
+mkproc "$P" codexonly '[codex]' 'visibility: shared'
+mkproc "$P" everywhere '[claude, codex, copilot]' 'visibility: shared' 'claude_skill: wv-everywhere'
+mkproc "$P" draftonly '[codex]' 'visibility: shared' 'status: draft'
+# no AGENTS.md: never created
+bash "$PROJECT" --source="$P" --repo="$PREPO"
+[ ! -e "$PREPO/AGENTS.md" ] || { echo "FAIL: projector created AGENTS.md"; exit 1; }
+# AGENTS.md without markers: byte-identical afterwards (user-owned)
+printf '%s\n' '# Our agents' 'hand text only' > "$PREPO/AGENTS.md"
+cp "$PREPO/AGENTS.md" "$TMP/agents.before"
+bash "$PROJECT" --source="$P" --repo="$PREPO"
+cmp -s "$PREPO/AGENTS.md" "$TMP/agents.before" || { echo "FAIL: AGENTS.md without markers was modified"; exit 1; }
+# AGENTS.md with markers: block refreshed, hand text kept, every shared ready
+# procedure listed whatever its adapters, drafts never
+printf '%s\n' '# Our agents' 'hand text above' '<!-- BEGIN WEAVE PROCEDURES -->' 'stale line' \
+    '<!-- END WEAVE PROCEDURES -->' 'hand text below' > "$PREPO/AGENTS.md"
+bash "$PROJECT" --source="$P" --repo="$PREPO" --agent=claude
+grep -qxF 'hand text above' "$PREPO/AGENTS.md" && grep -qxF 'hand text below' "$PREPO/AGENTS.md" \
+    || { echo "FAIL: AGENTS.md hand text not preserved"; exit 1; }
+! grep -qxF 'stale line' "$PREPO/AGENTS.md" || { echo "FAIL: AGENTS.md block not refreshed"; exit 1; }
+grep -qF 'wv guide --procedure=codexonly' "$PREPO/AGENTS.md" \
+    || { echo "FAIL: AGENTS.md index omits a codex-only procedure (must be universal, even for --agent=claude)"; exit 1; }
+grep -qF 'wv guide --procedure=everywhere' "$PREPO/AGENTS.md" || { echo "FAIL: AGENTS.md index omits a shared procedure"; exit 1; }
+! grep -qF 'wv guide --procedure=draftonly' "$PREPO/AGENTS.md" || { echo "FAIL: draft procedure listed in AGENTS.md"; exit 1; }
+
 # --- O. Repository-class guard precedes every direct projection write --------
 O="$TMP/o"; OREPO="$TMP/orepo"; mkdir -p "$O" "$OREPO"
 git -C "$OREPO" init -q
@@ -192,4 +218,4 @@ fi
 after=$(find "$OREPO" -path "$OREPO/.git" -prune -o -type f -print | sort)
 [ "$before" = "$after" ] || { echo "FAIL: repository-class refusal mutated projection target"; exit 1; }
 
-echo 'Results: 30/30 passed'
+echo 'Results: 35/35 passed'

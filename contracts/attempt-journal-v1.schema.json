@@ -65,11 +65,13 @@
       ]
     },
     "policy": {
-      "$comment": "The call's policy provenance, stated explicitly on every completion. countable is false while any dispatched gate can still decide without emitting a verdict: a call with no verdict is NOT an allow, and E1 must not read it as one. state is 'unavailable' when no gate spoke for this call and 'partial' when some did, and neither promotes to a countable allow until gate coverage is complete.",
+      "$comment": "The call's policy provenance, stated explicitly on every completion. applicable_rules is what the policy contract says can decide inside this operation (contracts/policy-rules-v1.json, host_event scopes excluded); evaluated_rules is what this call recorded a verdict for. A call with no verdict is NOT an allow. countable is true only when the two sets are equal, the journal itself holds a verdict for every evaluated rule, and the call ran in evidence mode; state is then 'complete'. 'unavailable' means no applicable rule spoke, 'partial' that some did not, and 'inconsistent' that a verdict names a rule the contract does not apply here or the marker and journal disagree.",
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "applicable_rules",
         "countable",
+        "evaluated_rules",
         "reason",
         "state",
         "verdicts"
@@ -77,21 +79,60 @@
       "properties": {
         "state": {
           "enum": [
+            "complete",
+            "inconsistent",
             "partial",
             "unavailable"
           ]
         },
         "countable": {
-          "const": false
+          "type": "boolean"
         },
         "verdicts": {
           "type": "integer",
           "minimum": 0
         },
+        "applicable_rules": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "evaluated_rules": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
         "reason": {
           "type": "string"
         }
-      }
+      },
+      "oneOf": [
+        {
+          "$comment": "A countable call: every applicable rule decided, durably.",
+          "properties": {
+            "countable": {
+              "const": true
+            },
+            "state": {
+              "const": "complete"
+            }
+          }
+        },
+        {
+          "$comment": "Anything short of that is recorded, never counted.",
+          "properties": {
+            "countable": {
+              "const": false
+            }
+          }
+        }
+      ]
     }
   },
   "type": "object",
@@ -105,6 +146,8 @@
     "mutation_targets",
     "operation",
     "parent_call_id",
+    "policy_identity",
+    "policy_schema",
     "registry_identity",
     "registry_schema",
     "repo_root",
@@ -123,6 +166,7 @@
         "call_completed",
         "call_started",
         "mutation_disposition",
+        "non_policy_refusal",
         "policy_verdict"
       ]
     },
@@ -190,6 +234,13 @@
     "registry_schema": {
       "type": "string"
     },
+    "policy_identity": {
+      "$comment": "The policy contract identity (scripts/weave_policy.py identity, sha256-prefixed), bound separately from registry_identity: the registry says what an operation touches, the policy contract what may refuse it, and a reader must be able to tell which one changed. Empty only when no policy projection was sourced.",
+      "type": "string"
+    },
+    "policy_schema": {
+      "type": "string"
+    },
     "causal_identity_before": {
       "$ref": "#/$defs/identity"
     },
@@ -235,8 +286,60 @@
         "yes"
       ]
     },
+    "bypass": {
+      "$comment": "The flag or knob that overrode a condition the rule would otherwise have denied. Present only on a bypassed verdict, whose decision records what was allowed.",
+      "type": "string",
+      "minLength": 1
+    },
     "detail": {
       "type": "string"
+    },
+    "clause": {
+      "$comment": "The values a SQLite-owned close rule decided on, copied from the close receipt that the same write transaction evaluated (scripts/lib/wv-db.sh _policy_close_receipt_sql). It is the decision's own record, never a diagnosis re-derived after it, so a later change to thresholds or exemptions cannot alter it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "threshold"
+      ],
+      "properties": {
+        "threshold": {
+          "type": "string",
+          "minLength": 1
+        },
+        "limit": {
+          "type": "number"
+        },
+        "actual": {
+          "type": "number"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "enum": [
+            "red",
+            "stale"
+          ]
+        },
+        "direction": {
+          "const": "deteriorating"
+        },
+        "reason": {
+          "enum": [
+            "stale_attempt",
+            "unattributed_file"
+          ]
+        }
+      }
+    },
+    "category": {
+      "$comment": "A refusal that is not a policy decision. The values are contracts/policy-rules-v1.json non_policy_categories; tests/test-policy-contract.sh keeps the two equal.",
+      "enum": [
+        "expected_conflict",
+        "infrastructure_failure",
+        "input_validation"
+      ]
     },
     "policy": {
       "$ref": "#/$defs/policy"
@@ -266,13 +369,30 @@
         },
         "decision": {},
         "rule": {},
-        "would_violate_invariant": {}
+        "would_violate_invariant": {},
+        "bypass": {},
+        "clause": {}
       },
       "required": [
         "decision",
         "event",
         "rule",
         "would_violate_invariant"
+      ]
+    },
+    {
+      "$comment": "A call refused for a reason that is not policy: malformed input, a lost race, or a failure to evaluate. Recorded so a refusal is never mistaken for a counterweight decision, and never for silence.",
+      "properties": {
+        "event": {
+          "const": "non_policy_refusal"
+        },
+        "category": {},
+        "detail": {}
+      },
+      "required": [
+        "category",
+        "detail",
+        "event"
       ]
     },
     {

@@ -35,8 +35,19 @@ explicitly reviewed candidates, marks verified stale references as `stale`, and 
 hash collisions as `superseded`. Contradictory candidates remain candidates and create a review
 signal; fuzzy overlap is reported, never applied automatically.
 
-Imports are idempotent: unchanged source hashes are skipped. The graph remains authoritative:
-import pulls in, crystallize curates, and render projects the active set back out.
+Imports are idempotent: unchanged source hashes are skipped. The graph remains authoritative: import
+pulls in, crystallize curates, and render projects the active set back out.
+
+Active memory is append-only for claims. When a claim changes, record the new one with
+`wv remember "<text>" --supersedes=<id>`: the old memory stays as `mem_status=superseded` with
+`superseded_by`, linked by a `supersedes` edge, and render shows only the successor, whose
+`verified_at` is the date of the new verification. Editing a claim in place leaves the old
+`verified_at` on new text. Only wording that does not change the claim (typos, prose-rule fixes) is
+edited in place. A session handoff is a trail (`wv trails save`), not a memory: it records the state
+at one moment, and that state moves on.
+
+After any memory change, re-render every projection together with `wv memory render --agent=all` and
+commit them with the graph state that produced them.
 
 ## JSON Contract
 
@@ -55,9 +66,9 @@ own lifecycle side effects. Refactors must preserve these machine-readable envel
   `source_kind`, `source_path`, and `repo_root`; scan observes evidence and does not create memory.
 - `wv memory import --source=<agent> --json` returns `{imported, count, skipped}` and creates
   `mem_status=candidate` nodes with provenance metadata. Re-importing the same source hash skips.
-- `wv memory crystallize --dry-run|--apply-reviewed --json` returns
-  `{mode, candidates, results}`. Each result has `id`, `action`, and `reviewed`; optional fields
-  (`duplicate_of`, `dup_kind`, `contradicts`, `stale_reason`, `finding`) appear only when relevant.
+- `wv memory crystallize --dry-run|--apply-reviewed --json` returns `{mode, candidates, results}`.
+  Each result has `id`, `action`, and `reviewed`; optional fields (`duplicate_of`, `dup_kind`,
+  `contradicts`, `stale_reason`, `finding`) appear only when relevant.
 
 Trail entries are evidence for this same lifecycle, not a parallel store. A reusable trail insight
 should become a candidate memory through the same provenance, deduplication, staleness, and review
@@ -71,11 +82,11 @@ memory, and never promote or mutate memory. Import/review/promotion stay under t
 
 ## Harness Surfaces
 
-| Harness | Scan | Import | Render target |
-| --- | --- | --- | --- |
-| Claude | yes | `--source=claude --path=<memory dir>` | `CLAUDE.md`, `.claude/MEMORY.md` |
-| Codex | yes | `--source=codex [--path=<DB>]` | `.codex/weave.json`, `.codex/MEMORY.md` |
-| Copilot | yes | unsupported | `.github/copilot-instructions.md` |
+| Harness | Scan | Import                                | Render target                           |
+| ------- | ---- | ------------------------------------- | --------------------------------------- |
+| Claude  | yes  | `--source=claude --path=<memory dir>` | `CLAUDE.md`, `.claude/MEMORY.md`        |
+| Codex   | yes  | `--source=codex [--path=<DB>]`        | `.codex/weave.json`, `.codex/MEMORY.md` |
+| Copilot | yes  | unsupported                           | `.github/copilot-instructions.md`       |
 
 Claude’s legacy `/weave` skill remains a hand-written orchestration facade. It forwards memory
 policy here through `wv guide --procedure=agent-memory`; it is not generated from or replaced by

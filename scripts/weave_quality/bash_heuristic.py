@@ -97,6 +97,12 @@ def _count_nesting(lines: list[str]) -> int:
 # Heredoc start: <<EOF, <<'EOF', <<"EOF", <<-EOF, etc.
 _HEREDOC_START = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
 
+# A line that ends a brace group with '; }', and a brace-group opener: '{'
+# followed by space, at line start or after a shell separator -- not '${' and
+# not a '{' inside a quoted jq or JSON literal.
+_ENDS_IN_CLOSE = re.compile(r";\s*\}$")
+_OPENS_GROUP = re.compile(r"(?:^|[\s;|&(])\{\s")
+
 # Heredoc end: the delimiter alone on a line (possibly with leading tabs for <<-)
 _HEREDOC_END_CACHE: dict[str, re.Pattern[str]] = {}
 
@@ -163,8 +169,11 @@ def _find_function_end(lines: list[str], start: int) -> int:
                 in_heredoc = None
             continue
 
-        # Check if this line starts a heredoc
-        heredoc_match = _HEREDOC_START.search(lines[j])
+        # Check if this line starts a heredoc. A comment that mentions one
+        # ("# an unquoted <<EOF ...") opens nothing: taking it as a start,
+        # with no terminator after it, skipped the rest of the file as heredoc
+        # body and measured db_init in wv-db.sh as the whole file (wv-592939).
+        heredoc_match = None if stripped.startswith("#") else _HEREDOC_START.search(lines[j])
         if heredoc_match:
             in_heredoc = heredoc_match.group(1)
 
@@ -184,14 +193,19 @@ def _find_function_end(lines: list[str], start: int) -> int:
             found_open = True
             continue
 
-        # Nested function definition — count opening brace
+        # Nested function definition — count opening brace, unless it closes
+        # on the same line: a nested one-liner opens nothing (wv-b0b2d4).
         if _FUNC_PATTERN.match(lines[j]):
-            if "{" in stripped:
+            if "{" in stripped and not stripped.endswith("}"):
                 depth += 1
             continue
 
-        # Standalone closing brace — structural function close
-        if stripped == "}":
+        # Standalone closing brace — structural function close. So is a line
+        # ending '; }' that opens no brace group of its own: the body of
+        # `f() { cmd "...` continued over lines and closed `...; }` (wv-b0b2d4,
+        # tests/test-data.sh _rowhash ran to EOF). A '{' inside a quoted string
+        # or ${...} is not a group opener, so jq and expansions stay inert.
+        if stripped == "}" or (_ENDS_IN_CLOSE.search(stripped) and not _OPENS_GROUP.search(stripped)):
             depth -= 1
             if found_open and depth <= 0:
                 return j

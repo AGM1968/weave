@@ -84,14 +84,14 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected to find: $needle"
-        echo "  In: $(echo "$haystack" | head -3)"
+        echo "  In: $(echo "$haystack" | sed -n '1,3p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return 1
     fi
@@ -190,33 +190,96 @@ assert_file_absent "$SENTINEL" "clean session cycle: no sentinel remains"
 echo ""
 echo "═══ Crash Detection ═══"
 
-# Test: Stale sentinel triggers crash detection warning
-setup_test_env
-write_fake_sentinel "2026-03-05T14:00:00Z" '["wv-aaa111"]'
-OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
-assert_contains "$OUTPUT" "CRASH DETECTED" "stale sentinel triggers crash warning"
-assert_contains "$OUTPUT" "2026-03-05T14:00:00Z" "crash warning includes timestamp"
-assert_contains "$OUTPUT" "wv-aaa111" "crash warning includes active node IDs"
+# wv-4efe06: the label comes from how the previous session ended - the last
+# tool call (pre-action heartbeat) against the last Stop (stop-check record) -
+# and the graph's active nodes at exit, not the list the sentinel captured when
+# that session started.
+claimed_node() {  # claimed_node <text> -> id of a node claimed in the test graph
+    local out id
+    out=$("$WV" add "$1" --standalone 2>/dev/null || true)
+    id=$(grep -oE 'wv-[0-9a-f]{6}' <<< "$out" || true)
+    id=${id%%$'\n'*}
+    "$WV" work "$id" >/dev/null 2>&1 || true
+    printf '%s' "$id"
+}
+signals() {  # signals <heartbeat-epoch|-> <stop-epoch|-> [outcome]
+    [ "$1" != "-" ] && echo "$1" > "$WV_HOT_ZONE/.session_heartbeat"
+    [ "$2" != "-" ] && echo "$2 ${3:-stopped}" > "$WV_HOT_ZONE/.session_laststop"
+    return 0
+}
+NOW=$(date +%s)
 
-# Test: Crash detection with multiple active nodes
+# False negative before: a node claimed AFTER the session started, then death
+# mid-turn. The start-time sentinel lists nothing; the graph still has the claim.
 setup_test_env
-write_fake_sentinel "2026-03-05T15:30:00Z" '["wv-aaa111", "wv-bbb222"]'
+write_fake_sentinel "2026-03-05T14:00:00Z" '[]'
+NODE_A=$(claimed_node "claimed mid-session")
+signals $((NOW - 60)) $((NOW - 600))
 OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
-assert_contains "$OUTPUT" "wv-aaa111" "multi-node crash lists first node"
-assert_contains "$OUTPUT" "wv-bbb222" "multi-node crash lists second node"
+assert_contains "$OUTPUT" "CRASH DETECTED" "a claim made after start, then death mid-turn, is a crash"
+assert_contains "$OUTPUT" "$NODE_A" "the crash names the node claimed after start"
+assert_contains "$OUTPUT" "$(date -u -d "@$((NOW - 60))" +%Y-%m-%dT%H:%M:%SZ)" \
+    "the crash reports the last activity, not the session's start"
 
-# Test: Empty active list — informational note, not CRASH DETECTED (wv-bd6184)
+# False positive before: the sentinel's start list names a node the session
+# later closed, and it stopped cleanly before dying. Not a crash.
+setup_test_env
+NODE_B=$(claimed_node "closed before exit")
+write_fake_sentinel "2026-03-05T15:30:00Z" "[\"$NODE_B\"]"
+"$WV" done "$NODE_B" --skip-verification >/dev/null 2>&1 || true
+signals $((NOW - 600)) $((NOW - 60)) stopped
+OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! grep -qF "CRASH DETECTED" <<< "$OUTPUT"; then
+    echo -e "${GREEN}✓${NC} a node closed before a clean stop is not reported as a crash"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "${RED}✗${NC} a node closed before a clean stop is not reported as a crash"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+assert_contains "$OUTPUT" "stopped cleanly" "a clean stop without SessionEnd is labelled as such"
+
+# Blocked exit: the last stop was refused over open work, then the session ended.
+setup_test_env
+NODE_C=$(claimed_node "open at blocked exit")
+write_fake_sentinel "2026-03-05T16:00:00Z" '[]'
+signals $((NOW - 600)) $((NOW - 60)) blocked
+OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
+assert_contains "$OUTPUT" "blocked by open work" "a stop blocked by open work is labelled as a blocked exit"
+assert_contains "$OUTPUT" "$NODE_C" "the blocked exit names the node still open"
+
+# The signals come from the real hooks: pre-action stamps a heartbeat on each
+# tool call, and stop-check records each Stop as blocked or stopped.
+setup_test_env
+rm -f "$WV_HOT_ZONE/.session_heartbeat" "$WV_HOT_ZONE/.session_laststop"
+echo '{"tool_name":"Read","tool_input":{"file_path":"/dev/null"}}' | bash "$HOOKS_DIR/pre-action.sh" >/dev/null 2>&1 || true
+assert_file_exists "$WV_HOT_ZONE/.session_heartbeat" "pre-action writes the liveness heartbeat"
+# A clean tree, so stop-check reaches its active-node check (the hot zone lives
+# inside this fixture repo and would otherwise read as an uncommitted change).
+echo "hot/" >> .gitignore
+git add -A >/dev/null 2>&1; git -c user.email=t@t -c user.name=t commit -qm fixture >/dev/null 2>&1 || true
+NODE_D=$(claimed_node "open at stop")
+echo '{}' | bash "$HOOKS_DIR/stop-check.sh" >/dev/null 2>&1 || true
+assert_equals "blocked" "$(cut -d' ' -f2 "$WV_HOT_ZONE/.session_laststop" 2>/dev/null)" "stop-check records a stop refused over open work as blocked"
+"$WV" done "$NODE_D" --skip-verification >/dev/null 2>&1 || true
+rm -f "$WV_HOT_ZONE/.stop_check_lock"
+echo '{}' | bash "$HOOKS_DIR/stop-check.sh" >/dev/null 2>&1 || true
+assert_equals "stopped" "$(cut -d' ' -f2 "$WV_HOT_ZONE/.session_laststop" 2>/dev/null)" "stop-check records an allowed stop as stopped"
+
+# A sentinel with no signals and nothing active (died while loading, or an
+# older sentinel): informational, not CRASH DETECTED (wv-bd6184).
 setup_test_env
 write_fake_sentinel "2026-03-05T16:00:00Z" '[]'
 OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
-assert_contains "$OUTPUT" "No active work to recover" "loading-phase crash (empty active) emits informational note"
+assert_contains "$OUTPUT" "No active work to recover" "a death with nothing active emits an informational note"
+assert_contains "$OUTPUT" "2026-03-05T16:00:00Z" "without signals the sentinel's own time is reported"
 
 # Test: No crash warning on clean start (no sentinel)
 setup_test_env
 rm -f "$SENTINEL"
 OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 TESTS_RUN=$((TESTS_RUN + 1))
-if ! echo "$OUTPUT" | grep -qF "CRASH DETECTED"; then
+if ! grep -qF "CRASH DETECTED" <<< "$OUTPUT"; then
     echo -e "${GREEN}✓${NC} clean start: no crash warning"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -312,7 +375,7 @@ setup_test_env
 OUTPUT=$("$WV" recover --session 2>/dev/null)
 assert_contains "$OUTPUT" "Active task" "recover --session shows active"
 TESTS_RUN=$((TESTS_RUN + 1))
-if ! echo "$OUTPUT" | grep -qF "Todo task"; then
+if ! grep -qF "Todo task" <<< "$OUTPUT"; then
     echo -e "${GREEN}✓${NC} recover --session excludes todo nodes"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -350,7 +413,7 @@ rm -f "$SENTINEL"
 OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 CONTEXT=$(echo "$OUTPUT" | jq -r '.hookSpecificOutput.additionalContext // .' 2>/dev/null || echo "$OUTPUT")
 TESTS_RUN=$((TESTS_RUN + 1))
-if ! echo "$CONTEXT" | grep -qF "nodes marked active"; then
+if ! grep -qF "nodes marked active" <<< "$CONTEXT"; then
     echo -e "${GREEN}✓${NC} no false reboot warning when no active nodes"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else

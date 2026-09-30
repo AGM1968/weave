@@ -21,6 +21,10 @@ export WV_CALL_SOURCE=hook
 
 _HC_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$_HC_LIB_DIR/wv-resolve-runtime.sh" 2>/dev/null || true
+# Every guard below names its contract rule when it decides (wv-664b7f). A stub
+# keeps the guards working if a partial install lacks the observer.
+source "$_HC_LIB_DIR/wv-hook-observe.sh" 2>/dev/null || true
+declare -F _hc_observe >/dev/null || _hc_observe() { return 0; }
 
 _hc_project_dir() {
     local project_dir="${WV_PROJECT_DIR:-}"
@@ -138,6 +142,7 @@ _hc_check_read_size() {
     [[ -n "$file_path" && -z "$limit" && -f "$file_path" ]] || return 0
     line_count=$(wc -l < "$file_path" 2>/dev/null || echo "0")
     [[ "$line_count" -gt 500 ]] || return 0
+    _hc_observe read_size_budget deny
     jq -n --arg path "$file_path" --arg lines "$line_count" \
         '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("File \($path) has \($lines) lines — too large to read whole. Grep for structure first, then read with offset+limit (e.g. limit=200). Context load policy: always grep first on files >500 lines.")}}'
     return 1
@@ -152,6 +157,7 @@ _hc_check_installed_path() {
     # VS Code sends camelCase (filePath); Claude Code sends snake_case (file_path)
     file_path=$(printf '%s' "$tool_input" | jq -r '.file_path // .filePath // empty' 2>/dev/null)
     [[ "$file_path" =~ \.local/(bin|lib/weave) ]] || return 0
+    _hc_observe edit_source_not_installed_copy deny
     cat >&2 <<EOF
 ERROR: Editing installed copy at $file_path
 Edit the SOURCE file instead:
@@ -327,6 +333,7 @@ _hc_check_phase() {
     fi
 
     if [ "$is_edit" = "true" ]; then
+        _hc_observe edit_blocked_in_phase deny
         cat >&2 <<EOF
 ⚠️  File edit blocked during Weave $phase phase.
 
@@ -371,6 +378,7 @@ _hc_check_active_node() {
     fi
 
     if [ "$_HC_ACTIVE_COUNT" = "0" ]; then
+        _hc_observe edit_requires_active_node deny
         cat >&2 <<EOF
 ⚠️  No active Weave node found (phase: execute).
 
@@ -414,6 +422,7 @@ _hc_check_stale_node() {
     stale_text=$(echo "${_HC_ACTIVE_NODES:-[]}" | jq -r '.[0].text // "[unknown]"' 2>/dev/null || echo "[unknown]")
 
     if [ "$node_epoch" -gt 0 ] && [ "$node_epoch" -lt "$session_epoch" ]; then
+        _hc_observe active_node_not_stale deny
         cat >&2 <<EOF
 ⚠️  Stale active node not claimed this session: $stale_id
 "$stale_text"
@@ -496,6 +505,7 @@ _hc_check_contradictions() {
     local contradictions contradiction_list
     contradictions=$(echo "$_HC_CONTEXT_PACK" | jq '.contradictions | length' 2>/dev/null || echo "0")
     if [ "$contradictions" -gt "0" ]; then
+        _hc_observe active_node_contradictions_resolved deny
         contradiction_list=$(echo "$_HC_CONTEXT_PACK" | jq -r '.contradictions[] | "  - \(.id): \(.text)"' 2>/dev/null || echo "")
         cat >&2 <<EOF
 🛑 HARD STOP: Contradictions detected for node $node_id
@@ -526,6 +536,7 @@ _hc_check_blockers() {
     local blockers blocker_list
     blockers=$(echo "$_HC_CONTEXT_PACK" | jq '[.blockers[] | select(.status != "done")] | length' 2>/dev/null || echo "0")
     if [ "$blockers" -gt "0" ]; then
+        _hc_observe active_node_not_blocked deny
         blocker_list=$(echo "$_HC_CONTEXT_PACK" | jq -r '.blockers[] | select(.status != "done") | "  - \(.id): \(.text)"' 2>/dev/null || echo "")
         cat >&2 <<EOF
 🛑 BLOCKED: Cannot proceed with node $node_id

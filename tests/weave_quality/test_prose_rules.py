@@ -269,6 +269,17 @@ def test_validation_rejects_invalid_rule_shapes(
         validate_pattern_rule(_write(tmp_path / "rule.yaml", body), "rule")
 
 
+def test_prose_loader_refuses_a_non_prose_language(tmp_path: Path) -> None:
+    """wv-e07ee4: every in-tree caller routes by language first, so only the
+    loader's own check stops a direct caller treating a code rule as prose."""
+    body = "id: rule\nlanguage: bash\nkind: regex\npatterns:\n  - x\n"
+    with pytest.raises(PatternRuleValidationError, match="unsupported prose language 'bash'"):
+        load_prose_rule(_write(tmp_path / "rule.yaml", body), "rule")
+    assert load_prose_rule(
+        _write(tmp_path / "rule.yaml", body.replace("bash", "prose")), "rule"
+    )["language"] == "prose"
+
+
 @pytest.mark.parametrize("key", ["paths", "exempt"])
 def test_validation_rejects_scalar_optional_lists(tmp_path: Path, key: str) -> None:
     body = (
@@ -492,6 +503,50 @@ def test_prose_matchers_exclude_inline_code_spans(tmp_path: Path) -> None:
         casual.stem, casual, doc, scan_id=1
     )] == [", so continue"]
     assert len(run_prose_rule("verification-test", verification, doc, scan_id=1)) == 3
+
+
+def test_a_masked_code_span_does_not_bridge_punctuation_into_a_match(tmp_path: Path) -> None:
+    # wv-87d003: masking code spans to spaces let \s cross them, so a list of
+    # code items read as a comma followed by a connective.
+    joiner = _rule(
+        tmp_path,
+        "id: comma-and\nlanguage: prose\nkind: regex\npatterns:\n  - ',\\s*and\\b'\n",
+    )
+    listed = _write(tmp_path / "list.md", "Read `cin`, `wind_speed_ms` and `cape` from the feed.\n")
+    assert not run_prose_rule("comma-and", joiner, listed, scan_id=1)
+
+    # The same words without code spans are a real match: the fix is about the
+    # span, not about suppressing the pattern.
+    plain = _write(tmp_path / "plain.md", "Read the wind, and then the cape.\n")
+    assert [f.match_text for f in run_prose_rule("comma-and", joiner, plain, scan_id=1)] == [", and"]
+
+    # A genuine match after a code span keeps its exact source column, and its
+    # reported text carries no masking character.
+    after = _write(tmp_path / "after.md", "Set `cin` first, and then read the feed.\n")
+    found = run_prose_rule("comma-and", joiner, after, scan_id=1)
+    assert [(f.line, f.col, f.match_text) for f in found] == [(1, 15, ", and")]
+
+
+def test_a_prose_match_cannot_combine_text_from_two_table_cells(tmp_path: Path) -> None:
+    # wv-e257e9: a table row was one scan unit, so any pattern that tolerates a
+    # pipe could join a joiner in one cell to text in the next. The pattern is
+    # pipe-tolerant on purpose: only separate cell units can stop it.
+    joiner = _rule(
+        tmp_path,
+        "id: comma-and\nlanguage: prose\nkind: regex\npatterns:\n  - ',[\\s|]*and\\b'\n",
+    )
+    split = _write(tmp_path / "split.md", "| Field | Note |\n|---|---|\n| wind, | and cape |\n")
+    assert not run_prose_rule("comma-and", joiner, split, scan_id=1)
+
+    # Inside one cell it still matches, at the cell's own source column.
+    same = _write(tmp_path / "same.md", "| Field | Note |\n|---|---|\n| x | wind, and cape |\n")
+    assert [(f.line, f.col, f.match_text) for f in run_prose_rule(
+        "comma-and", joiner, same, scan_id=1
+    )] == [(3, 10, ", and")]
+
+    # Ordinary prose is unchanged.
+    prose = _write(tmp_path / "prose.md", "Read the wind, and then the cape.\n")
+    assert len(run_prose_rule("comma-and", joiner, prose, scan_id=1)) == 1
 
 
 def test_multiline_inline_code_is_excluded_but_unmatched_backtick_is_literal(

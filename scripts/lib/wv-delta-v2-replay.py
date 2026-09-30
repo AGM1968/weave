@@ -50,6 +50,9 @@ A hard disposition rolls the whole batch back and exits non-zero, so the loader
 does not commit a partially-applied v2 batch. `--strict` additionally treats
 `precondition_conflict` and `ambiguous_same_lineage` as hard (used by
 cross-machine convergence validation).
+
+`--check OPS...` (first argument, no DB) runs only the static checks behind the
+three hard dispositions over every op and exits 2 if any fails (`wv doctor`).
 """
 
 from __future__ import annotations
@@ -72,6 +75,9 @@ NODE_KINDS = {"node_create", "node_patch", "node_delete"}
 EDGE_KINDS = {"edge_create", "edge_patch", "edge_delete"}
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 SHA_RE = re.compile(r"^[a-f0-9]{64}$")
+# contracts/delta-operation-v2.schema.json $defs.weight_value. float() alone also
+# accepts inf/nan/+5/1_000/" 5 ", none of which the schema admits (wv-99c85a).
+WEIGHT_RE = re.compile(r"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$")
 
 HARD_DISPOSITIONS = {"identity_hash_mismatch", "integrity_failed", "unsupported_version"}
 
@@ -180,11 +186,9 @@ def validate_edge_field_value(field: str, value: Any) -> None:
     if field == "weight":
         if not (value is None or isinstance(value, str)):
             raise IntegrityError("invalid weight value")
-        if isinstance(value, str):
-            try:
-                float(value)
-            except ValueError as exc:
-                raise IntegrityError("invalid weight value") from exc
+        # fullmatch: re.match's "$" would still admit a trailing newline.
+        if isinstance(value, str) and not WEIGHT_RE.fullmatch(value):
+            raise IntegrityError("invalid weight value")
     elif field == "context":
         if not (value is None or isinstance(value, str)):
             raise IntegrityError("invalid context value")
@@ -257,6 +261,12 @@ def _validate_patch_mutation(mutation: dict[str, Any], kind: str) -> None:
     validator = validate_node_field_value if kind == "node_patch" else validate_edge_field_value
     if set(fields) - allowed:
         raise UnsupportedVersion("unsupported field")
+    # A whole-metadata write already carries claimed_by/risk_level, so an op
+    # holding both forms is ambiguous; _apply_node_patch would drop the sugar
+    # write and still report `applied`. The writer emits one form or the other
+    # (node_patch_fields), and the schema forbids the pair (wv-99c85a).
+    if kind == "node_patch" and "metadata" in fields and fields.keys() & {"claimed_by", "risk_level"}:
+        raise IntegrityError("metadata patch cannot combine claimed_by/risk_level")
     for field, patch in fields.items():
         _validate_patch(patch, field, validator)
 
@@ -1228,7 +1238,42 @@ def _summary(results: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def check(op_paths: list[Path]) -> dict[str, Any]:
+    """Static pass over a catalog: every hard disposition decidable without a DB.
+
+    evaluate() stops at the first hard failure and rolls the whole batch back,
+    and `wv load` then warns and falls back to v1 unless WV_DELTA_V2_STRICT=1.
+    One bad committed op therefore disables v2 replay on every clone, on every
+    load, behind a warning scrolled past once. This is what `wv doctor` runs to
+    make that state persistent-visible (wv-99c85a). It validates EVERY op, so a
+    catalog with several bad ops lists them all, not just the first.
+    """
+    failures: list[dict[str, Any]] = []
+    seen: dict[str, str] = {}
+    for path in sorted(op_paths, key=lambda p: p.name):
+        failure: dict[str, Any] = {"path": str(path)}
+        try:
+            op = read_op(path)
+            op_id = str(op.get("operation_id", ""))
+            op_hash = str(op.get("operation_sha256", ""))
+            validate_op(op)
+            if seen.setdefault(op_id, op_hash) != op_hash:
+                failure["disposition"] = "identity_hash_mismatch"
+                failure["reason"] = f"operation_id {op_id} seen with a different hash"
+        except UnsupportedVersion as exc:
+            failure.update(disposition="unsupported_version", reason=str(exc))
+        except IntegrityError as exc:
+            failure.update(disposition="integrity_failed", reason=str(exc))
+        if "disposition" in failure:
+            failures.append(failure)
+    return {"checked": len(op_paths), "failures": failures}
+
+
 def main(argv: list[str]) -> int:
+    if argv[:1] == ["--check"]:
+        outcome = check([Path(p) for p in argv[1:]])
+        print(json.dumps(outcome, sort_keys=True, separators=(",", ":")))
+        return 2 if outcome["failures"] else 0
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("db", type=Path, help="SQLite graph database")
     parser.add_argument("operations", nargs="*", type=Path, help="Delta v2 operation JSON files")
@@ -1236,7 +1281,11 @@ def main(argv: list[str]) -> int:
                         help="skip operations whose lineage seq precedes this value")
     parser.add_argument("--strict", action="store_true",
                         help="treat precondition_conflict as a hard failure")
-    args = parser.parse_args(argv)
+    # Intermixed: wv load passes "db --cutover-seq N ops...". Before Python 3.12
+    # parse_args consumed both positionals at the first positional run and then
+    # rejected the operations after the option, aborting every cutover replay on
+    # 3.11 (wv-9d2036).
+    args = parser.parse_intermixed_args(argv)
     outcome = evaluate(args.db, args.operations, cutover_seq=args.cutover_seq, strict=args.strict)
     outcome["summary"] = _summary(outcome["results"])
     print(json.dumps(outcome, sort_keys=True, separators=(",", ":")))

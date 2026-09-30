@@ -445,12 +445,19 @@ test_memory_crystallize() {
     assert_equals "stale" "$(sqlite3 "$WV_DB" "SELECT json_extract(metadata,'\$.mem_status') FROM nodes WHERE id='$stale_id';")" "apply marks missing-path candidate stale"
     assert_equals "superseded" "$(sqlite3 "$WV_DB" "SELECT json_extract(metadata,'\$.mem_status') FROM nodes WHERE id='$dup_id';")" "apply marks identical re-import superseded"
     assert_equals "$clean_id" "$(sqlite3 "$WV_DB" "SELECT json_extract(metadata,'\$.superseded_by') FROM nodes WHERE id='$dup_id';")" "apply records superseded_by pointer"
-    assert_equals "1" "$(sqlite3 "$WV_DB" "SELECT count(*) FROM edges WHERE source='$clean_id' AND target='$dup_id' AND type='supersedes';")" "apply creates a supersedes edge"
+    # wv-fc6fc2: supersedes means the target replaces the source (the registry,
+    # and wv remember --supersedes), so the superseded duplicate is the source.
+    # This assertion used to pin the reverse direction.
+    assert_equals "1" "$(sqlite3 "$WV_DB" "SELECT count(*) FROM edges WHERE source='$dup_id' AND target='$clean_id' AND type='supersedes';")" "apply creates a supersedes edge from the superseded duplicate to its replacement"
+    assert_equals "0" "$(sqlite3 "$WV_DB" "SELECT count(*) FROM edges WHERE source='$clean_id' AND target='$dup_id' AND type='supersedes';")" "apply writes no reversed supersedes edge"
+    assert_contains "$(sqlite3 "$WV_DB" "SELECT json_extract(context,'\$.summary') FROM edges WHERE source='$dup_id' AND target='$clean_id' AND type='supersedes';")" "$clean_id supersedes $dup_id" "the edge summary names the replacement first"
 
     # Contradiction stays candidate (unresolved) and produces a finding + edge.
     assert_equals "candidate" "$(sqlite3 "$WV_DB" "SELECT json_extract(metadata,'\$.mem_status') FROM nodes WHERE id='$contra_id';")" "apply leaves contradiction candidate unresolved"
     assert_equals "1" "$(sqlite3 "$WV_DB" "SELECT count(*) FROM nodes WHERE json_extract(metadata,'\$.finding.violation_type')='memory_contradiction';")" "apply creates a contradiction finding"
     assert_equals "1" "$(sqlite3 "$WV_DB" "SELECT count(*) FROM edges WHERE source='$contra_id' AND type='contradicts';")" "apply creates a contradicts edge"
+    # wv-031d08: edge context is JSON for every writer (E5 applies json() to it)
+    assert_equals "0" "$(sqlite3 "$WV_DB" "SELECT count(*) FROM edges WHERE context IS NOT NULL AND context != '' AND json_valid(context) = 0;")" "crystallize edges carry JSON context"
 
     # Promoted memory now surfaces in active recall; stale/superseded do not.
     local recall
@@ -668,8 +675,79 @@ test_memory_overlap_guards() {
     assert_equals "" "$(printf '%s' "$dry" | jq -r --arg id "$short_id" '.results[]|select(.id==$id)|.duplicate_of // ""')" "fewer than three FTS terms proposes no overlap"
 }
 
+test_memory_supersede() {
+    echo ""
+    echo "Test: remember --supersedes appends a successor and tombstones the old (wv-ffaf3e)"
+    echo "============================================================"
+
+    setup_test_env
+
+    local old new old_meta new_meta edge block
+    old=$("$WV" remember "Placement follows the agent" --source-agent=test --json | jq -r '.id')
+    new=$("$WV" remember "Placement follows the runtime class" --supersedes="$old" --source-agent=test --json | jq -r '.id')
+    old_meta=$("$WV" show "$old" --json | jq -c '.metadata | if type == "string" then fromjson else . end')
+    new_meta=$("$WV" show "$new" --json | jq -c '.metadata | if type == "string" then fromjson else . end')
+    assert_equals "superseded" "$(jq -r '.mem_status' <<< "$old_meta")" "the old memory is marked superseded, not deleted"
+    assert_equals "$new" "$(jq -r '.superseded_by' <<< "$old_meta")" "the tombstone points at its successor"
+    assert_equals "Placement follows the agent" "$("$WV" show "$old" --json | jq -r '.text')" "the old claim's text is kept as written"
+    assert_equals "active" "$(jq -r '.mem_status' <<< "$new_meta")" "the successor is active"
+    assert_equals "$old" "$(jq -r '.supersedes' <<< "$new_meta")" "the successor names what it supersedes"
+    assert_contains "$(jq -r '.verified_at' <<< "$new_meta")" "T" "the successor carries its own verified_at"
+    edge=$("$WV" edges "$old" --json | jq -r --arg n "$new" '[.[] | select(.type=="supersedes" and .direction=="outbound" and .other_id==$n)] | length')
+    assert_equals "1" "$edge" "a supersedes edge links old to new (target supersedes source)"
+    assert_equals "1" "$(sqlite3 "$("$WV" hotzone db)" "SELECT json_valid(context) FROM edges WHERE source='$old' AND target='$new' AND type='supersedes';")" \
+        "the supersedes edge context is JSON (wv-031d08)"
+
+    "$WV" memory render --agent=claude --base-dir="$TEST_DIR" >/dev/null 2>&1
+    block=$(sed -n '/BEGIN WEAVE:MEMORY/,/END WEAVE:MEMORY/p' "$TEST_DIR/CLAUDE.md")
+    assert_contains "$block" "$new" "render lists the successor"
+    assert_not_contains "$block" "$old" "render omits the superseded memory"
+
+    assert_equals "1" "$("$WV" remember "second successor" --supersedes="$old" >/dev/null 2>&1; echo $?)" \
+        "a superseded memory cannot be superseded again (one live head per chain)"
+    local task
+    task=$("$WV" add "not a memory" --standalone --force 2>&1 | grep -oE 'wv-[0-9a-f]{6}' | tail -1)
+    assert_equals "1" "$("$WV" remember "x" --supersedes="$task" >/dev/null 2>&1; echo $?)" \
+        "a non-memory node cannot be superseded"
+    assert_equals "1" "$("$WV" remember "x" --supersedes=not-an-id >/dev/null 2>&1; echo $?)" \
+        "a malformed id is rejected"
+    assert_equals "superseded" "$("$WV" show "$old" --json | jq -r '.metadata | if type == "string" then fromjson else . end | .mem_status')" \
+        "rejected attempts leave the tombstone unchanged"
+}
+
+test_memory_agents_projection_marker_gated() {
+    echo ""
+    echo "Test: the agents projection (AGENTS.md) only refreshes an existing block (wv-6ef83b)"
+    echo "============================================================"
+
+    setup_test_env
+
+    local id out block
+    id=$("$WV" remember "fact for every harness" --source-agent=test --json | jq -r '.id')
+    # No AGENTS.md: not created, not reported
+    out=$("$WV" memory render --agent=all --base-dir="$TEST_DIR" --json)
+    assert_equals "false" "$(if [ -e "$TEST_DIR/AGENTS.md" ]; then echo true; else echo false; fi)" "render --agent=all does not create AGENTS.md"
+    assert_equals "0" "$(jq '[.paths[]? // .rendered[]? | select(.projection=="agents")] | length' <<< "$out")" "a skipped AGENTS.md is not reported as rendered"
+    # AGENTS.md without markers: byte-identical
+    printf '%s\n' '# Our agents' 'hand text only' > "$TEST_DIR/AGENTS.md"
+    cp "$TEST_DIR/AGENTS.md" "$TEST_DIR/agents.before"
+    "$WV" memory render --agent=all --base-dir="$TEST_DIR" >/dev/null 2>&1
+    assert_equals "0" "$(cmp -s "$TEST_DIR/AGENTS.md" "$TEST_DIR/agents.before"; echo $?)" "an AGENTS.md without markers is left untouched"
+    # AGENTS.md with markers: block filled, hand text kept
+    printf '%s\n' '# Our agents' 'hand text above' \
+        '<!-- ── BEGIN WEAVE:MEMORY ── managed by wv memory render, do not edit manually -->' \
+        '<!-- ── END WEAVE:MEMORY ── -->' 'hand text below' > "$TEST_DIR/AGENTS.md"
+    "$WV" memory render --agent=agents --base-dir="$TEST_DIR" >/dev/null 2>&1
+    block=$(sed -n '/BEGIN WEAVE:MEMORY/,/END WEAVE:MEMORY/p' "$TEST_DIR/AGENTS.md")
+    assert_contains "$block" "$id" "a marked AGENTS.md block lists the active memory"
+    assert_contains "$(cat "$TEST_DIR/AGENTS.md")" "hand text above" "hand text before the block is kept"
+    assert_contains "$(cat "$TEST_DIR/AGENTS.md")" "hand text below" "hand text after the block is kept"
+}
+
 test_memory_verify_prose
 test_memory_overlap_guards
+test_memory_supersede
+test_memory_agents_projection_marker_gated
 
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

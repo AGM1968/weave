@@ -29,7 +29,7 @@ echo ""
 
 # The two lists are read out of the entry point itself rather than re-declared
 # here: a copy would drift exactly as every other duplicated list in this repo has.
-known_line=$(grep -n -- '--json|--json-v2|--all|--count|--findings|' "$ROOT/scripts/wv" | head -1 | cut -d: -f1)
+known_line=$(grep -m1 -n -- '--json|--json-v2|--all|--count|--findings|' "$ROOT/scripts/wv" | cut -d: -f1)
 consumes_line=$(awk 'NR>'"$known_line"' && /--status\|--parent\|--subtree\|--text\|--metadata\|--metadata-file\|/{print NR; exit}' "$ROOT/scripts/wv")
 
 if [ -z "$known_line" ] || [ -z "$consumes_line" ]; then

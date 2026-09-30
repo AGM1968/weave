@@ -21,9 +21,12 @@ cmd_init() {
     local repo_root
     repo_root=$(dirname "$WEAVE_DIR")
     if [ -L "$WEAVE_DIR" ]; then
+        wv_policy_verdict init_refuses_symlinked_weave_dir deny yes "" \
+            "initialising through a symlink writes graph state outside the repository"
         echo "wv: refusing symlinked Weave directory: $WEAVE_DIR" >&2
         return 1
     fi
+    wv_policy_verdict init_refuses_symlinked_weave_dir allow no "" "the Weave directory is not a symlink"
     wv_repository_require_owned "$repo_root" "wv init" || return 1
 
     # Force reset: wipe everything and start fresh
@@ -33,10 +36,18 @@ cmd_init() {
             count=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COUNT(*) FROM nodes;" 2>/dev/null || echo "0")
         fi
         if [ "$count" -gt 0 ]; then
+            wv_policy_verdict init_preserves_existing_graph allow yes --force \
+                "reinitialised over a graph holding nodes"
             echo -e "${YELLOW}Destroying existing graph ($count nodes)...${NC}" >&2
+        else
+            wv_policy_verdict init_preserves_existing_graph allow no "" "no graph with nodes to destroy"
         fi
-        # Remove hot zone DB
-        rm -f "$WV_DB" 2>/dev/null || true
+        # Remove hot zone DB. The replacement may reuse the inode, so the
+        # db_ensure memo is cleared rather than trusted to notice. The WAL and
+        # shared-memory files go with it: a WAL left behind is replayed over
+        # the fresh database the next connection opens (wv-f241fa).
+        rm -f "$WV_DB" "$WV_DB-wal" "$WV_DB-shm" 2>/dev/null || true
+        _WV_DB_READY=""
         # Remove .weave/ state files (preserve archive/)
         rm -f "$WEAVE_DIR/state.sql" 2>/dev/null || true
         rm -f "$WEAVE_DIR/nodes.jsonl" 2>/dev/null || true
@@ -54,6 +65,7 @@ cmd_init() {
     # Reboot recovery: hot zone DB is gone but state.sql exists on disk
     if [ ! -f "$WV_DB" ] && [ -f "$WEAVE_DIR/state.sql" ]; then
         echo -e "${YELLOW}Hot zone database missing (likely reboot) — recovering from state.sql${NC}" >&2
+        wv_policy_verdict init_preserves_existing_graph allow no "" "rehydrates the committed graph rather than replacing it"
         cmd_load
         local count
         count=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COUNT(*) FROM nodes;" 2>/dev/null || echo "0")
@@ -69,12 +81,15 @@ cmd_init() {
         local count
         count=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COUNT(*) FROM nodes;" 2>/dev/null || echo "0")
         if [ "$count" -gt 0 ]; then
+            wv_policy_verdict init_preserves_existing_graph deny yes "" \
+                "initialising over a graph holding nodes destroys it"
             echo -e "${RED}Error: Database already exists with $count nodes.${NC}" >&2
             echo "Use 'wv init --force' to reinitialize (destroys existing data)." >&2
             echo "Use 'wv load' to reload from .weave/state.sql." >&2
             return 1
         fi
     fi
+    wv_policy_verdict init_preserves_existing_graph allow no "" "no graph with nodes to overwrite"
 
     mkdir -p "$WEAVE_DIR"
     db_init
@@ -129,35 +144,61 @@ _do_unblock_cascade() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 # _add_dedup_check — Warn if similar non-done nodes or exact recent done nodes exist.
-# Returns 1 if a likely duplicate is found.
+# Returns 1 if a likely duplicate is found. With a third argument (the bypass
+# flag in effect) it still evaluates, records the override, and returns 0.
 _add_dedup_check() {
     local text="$1"
     local duplicate_hint="${2:-Use --force to create anyway}"
+    local bypass="${3:-}"
     db_ensure
-    db_migrate_fts5 2>/dev/null || true
-    # Extract significant words (>4 chars) for token-based matching
-    local search_tokens
-    search_tokens=$(echo "$text" | tr -cs '[:alnum:]' ' ' | \
-        awk '{for(i=1;i<=NF;i++) if(length($i)>4) {printf "%s ", $i; c++; if(c>=5) exit}}')
-    search_tokens=$(echo "$search_tokens" | sed 's/[(){}*:^~"]//g' | xargs)
+    # Similar open nodes by IDF-weighted word overlap (wv-c2d02a): the share of
+    # the new text's rare-word weight that an open node also contains, flagged
+    # at 0.45. The previous rule ANDed the first five words longer than four
+    # characters in one FTS5 MATCH, so a rewording that changed one of them was
+    # never caught. On the graph's own history (11 real duplicate pairs, 80
+    # distinct open nodes) this catches 6/11 where that caught 5/11 - all five
+    # included - and wrongly flags 8/80 where that flagged 19/80. Weights count
+    # the new text as a document, as the measurement did; texts with fewer than
+    # two long words are not compared, and a match needs two shared long words.
+    # Prints id|text|status, best first.
     local similar=""
-    if [ -n "$search_tokens" ]; then
-        local token_count
-        token_count=$(echo "$search_tokens" | wc -w)
-        if [ "$token_count" -ge 2 ]; then
-            local fts_query
-            fts_query=$(echo "$search_tokens" | sed 's/ / AND /g')
-            similar=$(db_query "
-                SELECT n.id, n.text, n.status
-                FROM nodes_fts f
-                JOIN nodes n ON f.rowid = n.rowid
-                WHERE nodes_fts MATCH '$fts_query'
-                AND n.status != 'done'
-                LIMIT 3;
-            " 2>/dev/null || echo "")
-        fi
+    similar=$(python3 - "$WV_DB" "$text" <<'PY' 2>/dev/null || true
+import math, re, sqlite3, sys
+db_path, new_text = sys.argv[1], sys.argv[2]
+words = lambda t: {w.lower() for w in re.split(r"[^0-9A-Za-z]+", t or "") if len(w) > 4}
+new = words(new_text)
+if len(new) < 2:
+    sys.exit(0)
+rows = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True).execute(
+    "SELECT id, text, status FROM nodes").fetchall()
+df = {}
+for _, text, _ in rows:
+    for w in words(text):
+        df[w] = df.get(w, 0) + 1
+n_docs = len(rows) + 1
+idf = {w: math.log(n_docs / (1 + df.get(w, 0) + 1)) for w in new}
+total = sum(idf.values()) or 1.0
+scored = []
+for node_id, text, status in rows:
+    if status == "done":
+        continue
+    shared = new & words(text)
+    score = sum(idf[w] for w in shared) / total
+    # Two shared long words at least: in a small graph every word weighs about
+    # the same, so one common word ("active") scored 0.5 between distinct
+    # nodes. On the graph's history this guard changes neither number above.
+    if score >= 0.45 and len(shared) >= 2:
+        scored.append((score, node_id, text, status))
+for _, node_id, text, status in sorted(scored, reverse=True)[:3]:
+    print(f"{node_id}|{' '.join(text.split())}|{status}")
+PY
+)
+    if [ -n "$similar" ] && [ -n "$bypass" ]; then
+        wv_policy_verdict add_duplicate_check allow unknown "$bypass" "similar open node exists"
+        return 0
     fi
     if [ -n "$similar" ]; then
+        wv_policy_verdict add_duplicate_check deny unknown "" "similar open node exists"
         echo -e "${YELLOW}⚠ Similar active nodes exist:${NC}" >&2
         echo "$similar" | while IFS='|' read -r sid stext sstatus; do
             echo -e "  ${CYAN}$sid${NC} [$sstatus]: $stext" >&2
@@ -178,7 +219,12 @@ _add_dedup_check() {
         ORDER BY updated_at DESC, created_at DESC
         LIMIT 3;
     " 2>/dev/null || echo "")
+    if [ -n "$exact_done" ] && [ -n "$bypass" ]; then
+        wv_policy_verdict add_duplicate_check allow unknown "$bypass" "matching node closed within 30 days"
+        return 0
+    fi
     if [ -n "$exact_done" ]; then
+        wv_policy_verdict add_duplicate_check deny unknown "" "matching node closed within 30 days"
         echo -e "${YELLOW}⚠ Matching completed nodes exist:${NC}" >&2
         echo "$exact_done" | while IFS='|' read -r sid stext sstatus; do
             echo -e "  ${CYAN}$sid${NC} [$sstatus]: $stext" >&2
@@ -186,6 +232,10 @@ _add_dedup_check() {
         echo -e "${YELLOW}  ${duplicate_hint}${NC}" >&2
         return 1
     fi
+    # A gate that examined the call and let it through says so: silence is not
+    # an allow, and a call is countable only when every applicable rule spoke
+    # (wv-15422b).
+    wv_policy_verdict add_duplicate_check allow no "" "no similar open or recently closed node"
 
     return 0
 }
@@ -256,6 +306,10 @@ cmd_add() {
     local criteria=""
     local risks_flag=""
     local verification_plan=""
+    # --id reconstructs a node under an id the graph has lost, so a pushed
+    # Weave-ID trailer stops pointing at nothing (wv-0f1092). Empty for every
+    # ordinary add, which keeps generating a fresh id.
+    local reconstruct_id=""
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -271,7 +325,8 @@ cmd_add() {
             --criteria=*) criteria="${1#*=}" ;;
             --risks=*) risks_flag="${1#*=}" ;;
             --verification-plan=*) verification_plan="${1#*=}" ;;
-            --*) ;; # skip unrecognized flags
+            --id=*) reconstruct_id="${1#*=}" ;;
+            --*) _wv_reject_arg add "$1"; return 1 ;;
             *) text="$text $1" ;;
         esac
         shift
@@ -299,20 +354,12 @@ print(json.dumps(items))
         metadata=$(echo "$metadata" | jq --argjson c "$criteria_json" '. + {done_criteria: $c}' 2>/dev/null || echo "$metadata")
     fi
     if [ -n "$risks_flag" ]; then
-        case "$risks_flag" in
-            none|low|medium|high|critical) metadata=$(echo "$metadata" | jq --arg r "$risks_flag" '. + {risks: [], risk_level: $r}' 2>/dev/null || echo "$metadata") ;;
-            *)
-                # wv-cccf70: this case statement used to have no default --
-                # any value outside the enum (a typo, or a reasonable-
-                # looking freeform list like --risks="r1","r2") was
-                # silently accepted with exit 0 and stored nothing, the
-                # worst of both worlds (--criteria has no such enum and
-                # always persists, which is why the two flags looked
-                # asymmetric). Reject loudly instead.
-                echo -e "${RED}Error: --risks must be one of none|low|medium|high|critical (got: $risks_flag)${NC}" >&2
-                return 1
-                ;;
-        esac
+        # wv-cccf70: a value outside the enum used to be accepted silently and
+        # store nothing; wv-c0c51e: 'critical' was accepted and stored although
+        # the contract (and so the Delta v2 sidecar) does not admit it. The
+        # enum is the contract's, through the one validator.
+        validate_risk_level "$risks_flag" "--risks" || return 1
+        metadata=$(echo "$metadata" | jq --arg r "$risks_flag" '. + {risks: [], risk_level: $r}' 2>/dev/null || echo "$metadata")
     fi
     if [ "$standalone" = true ]; then
         metadata=$(echo "$metadata" | jq '. + {standalone: true}' 2>/dev/null || echo "$metadata")
@@ -346,11 +393,13 @@ print(json.dumps(items))
         echo -e "${RED}Error: invalid JSON in --metadata${NC}" >&2
         return 1
     fi
+    validate_metadata_risk_level "$metadata" "--metadata" || return 1
+    validate_metadata_canonical_numbers "$metadata" "--metadata" || return 1
 
     # Guard the direct create-and-claim path. `wv work` and the pre-claim hook
     # already require claim-ready metadata; direct `wv add --status=active`
     # should not bypass that gate unless the caller explicitly forces it.
-    if [ "$status" = "active" ] && [ "$force" != "true" ]; then
+    if [ "$status" = "active" ]; then
         local has_done_criteria has_risks
         has_done_criteria=$(echo "$metadata" | jq -r '
             if has("done_criteria") | not then "false"
@@ -361,7 +410,13 @@ print(json.dumps(items))
         ' 2>/dev/null || echo "false")
         has_risks=$(echo "$metadata" | jq -r 'has("risks")' 2>/dev/null || echo "false")
 
-        if [ "$has_done_criteria" != "true" ] || [ "$has_risks" != "true" ]; then
+        # Evaluated under --force too, so an override is recorded rather than silent.
+        if { [ "$has_done_criteria" != "true" ] || [ "$has_risks" != "true" ]; } && [ "$force" = "true" ]; then
+            wv_policy_verdict active_add_requires_claim_readiness allow yes --force \
+                "created active without claim-ready metadata"
+        elif [ "$has_done_criteria" != "true" ] || [ "$has_risks" != "true" ]; then
+            wv_policy_verdict active_add_requires_claim_readiness deny yes "" \
+                "an active node without done criteria and risks cannot be claimed honestly"
             echo -e "${RED}Error: direct active add requires claim-ready metadata${NC}" >&2
             if [ "$has_done_criteria" != "true" ]; then
                 echo -e "${CYAN}  Missing: done_criteria${NC}" >&2
@@ -373,14 +428,20 @@ print(json.dumps(items))
             echo -e "${CYAN}  Or:  wv add \"...\" && wv work <id>${NC}" >&2
             echo -e "${CYAN}  Use --force only for intentional low-level setup or tests${NC}" >&2
             return 1
+        else
+            wv_policy_verdict active_add_requires_claim_readiness allow no "" "created active with done criteria and risks"
         fi
+    else
+        wv_policy_verdict active_add_requires_claim_readiness allow no "" "not created active"
     fi
 
     # Orphan prevention: require --parent when active epics exist (skip with --force).
     # Runs before the node is created so a rejected `wv add` never prints a
     # confirmation for an id that gets rolled back (an agent parsing stdout would
     # otherwise record an id that no longer exists).
-    if [ -z "$parent" ] && [ "$force" != "true" ]; then
+    # Evaluated under --force/--standalone too: an override is recorded as a
+    # bypassed allow, so a counted campaign sees it rather than silence.
+    if [ -z "$parent" ]; then
         local node_type
         node_type=$(echo "$metadata" | jq -r '.type // "task"' 2>/dev/null || echo "task")
         if [ "$node_type" != "epic" ]; then
@@ -391,7 +452,12 @@ print(json.dumps(items))
                 AND json_extract(metadata,'\$.type') = 'epic'
                 ORDER BY created_at DESC LIMIT 3;
             " 2>/dev/null || true)
-            if [ -n "$active_epics" ]; then
+            if [ -n "$active_epics" ] && [ "$force" = "true" ]; then
+                local orphan_bypass="--force"
+                [ "$standalone" = "true" ] && orphan_bypass="--standalone"
+                wv_policy_verdict orphan_prevention allow yes "$orphan_bypass" \
+                    "created without a parent while an epic is open"
+            elif [ -n "$active_epics" ]; then
                 local epic_list
                 epic_list=$(echo "$active_epics" | tr '\n' ' ' | sed 's/ $//')
                 echo -e "${RED}Error: --parent required when active epics exist (use --force or --standalone to override)${NC}" >&2
@@ -401,11 +467,8 @@ print(json.dumps(items))
                 # supplies only what it alone knows -- and does NOT discard the
                 # result: a verdict that could not be written is the one event a
                 # counted campaign cannot do without.
-                wv_attempt_emit policy_verdict \
-                    rule=orphan_prevention \
-                    decision=deny \
-                    would_violate_invariant=yes \
-                    detail="a non-epic node created with no parent while an epic is open orphans it"
+                wv_policy_verdict orphan_prevention deny yes "" \
+                    "a non-epic node created with no parent while an epic is open orphans it"
                 echo -e "${CYAN}  Usage: wv add \"...\" --parent=<epic-id>${NC}" >&2
                 # Combined preflight: report every other unmet gate now, not on retry
                 if [ -z "$alias" ]; then
@@ -413,22 +476,61 @@ print(json.dumps(items))
                 fi
                 return 1
             fi
+            [ -n "$active_epics" ] || wv_policy_verdict orphan_prevention allow no "" "no open epic to orphan it from"
             # No active epics — just warn about missing alias
-            if [ -z "$alias" ]; then
+            if [ -z "$alias" ] && [ "$force" != "true" ]; then
                 echo -e "${YELLOW}⚠ No alias — use --alias=<name>${NC}" >&2
             fi
+        else
+            wv_policy_verdict orphan_prevention allow no "" "an epic needs no parent"
         fi
+    else
+        wv_policy_verdict orphan_prevention allow no "" "created under a parent"
     fi
 
-    # Dedup check: warn if similar non-done nodes exist (skip with --force or --parent)
-    # Child nodes naturally share vocabulary with their parent — skip for decomposition.
-    if [ "$force" != "true" ] && [ -z "$parent" ]; then
-        if ! _add_dedup_check "$text"; then
+    # Dedup check: refuse if similar non-done nodes exist (overridden by --force,
+    # which is recorded; not applied with --parent). Child nodes naturally share
+    # vocabulary with their parent — skip for decomposition.
+    if [ -z "$parent" ]; then
+        local dedup_bypass=""
+        [ "$force" = "true" ] && dedup_bypass="--force"
+        [ "$standalone" = "true" ] && dedup_bypass="--standalone"
+        if ! _add_dedup_check "$text" "" "$dedup_bypass"; then
             return 1
         fi
+    else
+        wv_policy_verdict add_duplicate_check allow no "" "not applied to a decomposition child"
     fi
 
-    local id=$(generate_id)
+    local id
+    if [ -n "$reconstruct_id" ]; then
+        # Reconstruction, not creation. The id comes from a commit trailer whose
+        # node the graph no longer has, so the checks are the inverse of the
+        # usual ones: the format must be a real node id (an ALIAS is not
+        # reconstructible and validate_id would resolve one against a live row),
+        # and the id must NOT already exist. Overwriting a live node here would
+        # turn a recovery into the second loss.
+        if [[ ! "$reconstruct_id" =~ ^wv-[a-f0-9]{4,6}$ ]]; then
+            wv_policy_refusal input_validation "--id is not a node id"
+            echo -e "${RED}Error: --id must be a node id of the form wv-XXXXXX, not an alias ('$reconstruct_id')${NC}" >&2
+            return 1
+        fi
+        local existing
+        existing=$(db_query "SELECT status FROM nodes WHERE id='$(sql_escape "$reconstruct_id")';" 2>/dev/null || echo "")
+        if [ -n "$existing" ]; then
+            wv_policy_verdict reconstruct_never_overwrites deny yes "" \
+                "reconstructing an id that still exists would overwrite a live node"
+            echo -e "${RED}Error: $reconstruct_id already exists (status: $existing) — refusing to overwrite${NC}" >&2
+            echo -e "${YELLOW}  --id reconstructs a node the graph has LOST. A live id is not lost.${NC}" >&2
+            echo -e "${YELLOW}  Inspect it with: wv show $reconstruct_id${NC}" >&2
+            return 1
+        fi
+        wv_policy_verdict reconstruct_never_overwrites allow no "" "the id is lost, not live"
+        id="$reconstruct_id"
+    else
+        wv_policy_verdict reconstruct_never_overwrites allow no "" "a new id, nothing to overwrite"
+        id=$(generate_id)
+    fi
     local original_text="$text"
     local original_metadata="$metadata"
 
@@ -452,11 +554,8 @@ print(json.dumps(items))
                 AND json_extract(metadata, '$.type') = 'finding'
                 AND json_extract(metadata, '$.promoted_at') IS NULL;" 2>/dev/null || true
 
-    if [ -n "$alias" ]; then
-        echo -e "${GREEN}✓${NC} $id ($alias): $original_text" >&2
-    else
-        echo -e "${GREEN}✓${NC} $id: $original_text" >&2
-    fi
+    # The creation line moved below the durability gate (wv-18841c) so it cannot
+    # announce a node that failed to persist. It stays ahead of the id on stdout.
 
     # Link to parent if --parent provided
     if [ -n "$parent" ]; then
@@ -489,14 +588,24 @@ print(json.dumps(items))
         _add_create_gh_issue "$id" "$original_text" "$original_metadata" "$alias"
     fi
 
+    # Durability gate (wv-18841c), after the parent link, the claim and the
+    # GitHub issue so it covers every mutation rather than only the INSERT.
+    # Unforced on purpose: within the throttle window auto_sync legitimately
+    # skips and reports success, and a skip is not a failure to announce.
+    persist_or_refuse "node $id" || return 1
+
+    if [ -n "$alias" ]; then
+        echo -e "${GREEN}✓${NC} $id ($alias): $original_text" >&2
+    else
+        echo -e "${GREEN}✓${NC} $id: $original_text" >&2
+    fi
+
     if [ "$format" = "json" ]; then
         jq -n --arg id "$id" --arg text "$original_text" --arg status "$status" \
             '{"id": $id, "text": $text, "status": $status}'
     else
         echo "$id"
     fi
-
-    auto_sync 2>/dev/null || true
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -506,11 +615,11 @@ print(json.dumps(items))
 _memory_usage() {
     cat >&2 <<'EOF'
 Usage:
-  wv remember <text> [--kind=project] [--scope=repo] [--source-agent=name] [--json]
+  wv remember <text> [--kind=project] [--scope=repo] [--source-agent=name] [--supersedes=<id>] [--json]
   wv memory recall [--agent=current|all|name] [--json]
       # --agent is caller provenance only; recall is agent-agnostic and never filters.
       # The resolved caller is echoed on stderr; stdout is the same memory set for every agent.
-  wv memory render [--agent=all|current|claude|claude-memory|copilot|codex|codex-memory|workflow] [--base-dir=DIR] [--path=PATH] [--json]
+  wv memory render [--agent=all|current|claude|claude-memory|copilot|codex|codex-memory|agents|workflow] [--base-dir=DIR] [--path=PATH] [--json]
   wv memory scan --source=claude|codex|copilot|all [--repo-root=DIR] [--json]
   wv memory import --source=claude --path=DIR [--repo-root=DIR] [--json]
   wv memory import --source=codex [--path=DB] [--repo-root=DIR] [--json]
@@ -602,6 +711,21 @@ PY
     mv "$tmp" "$path"
 }
 
+# AGENTS.md is the universal instructions file and, in a consumer repository,
+# the user's own (wv-6ef83b; never written by the projector since 04feaa432).
+# So the agents projection opts in by marker: it refreshes an existing
+# WEAVE:MEMORY block and otherwise leaves the file alone, never creating or
+# appending one. Returns 3 when skipped so the caller does not report a render.
+_memory_render_marked_only() {
+    local entries="$1" path="$2"
+    if [ -f "$path" ] && grep -qF -- "<!-- ── BEGIN WEAVE:MEMORY ──" "$path" \
+        && grep -qF -- "<!-- ── END WEAVE:MEMORY ── -->" "$path"; then
+        _memory_render_markdown_file "$entries" "$path"
+        return
+    fi
+    return 3
+}
+
 _memory_render_codex_json() {
     local entries="$1" path="$2"
     local target_dir tmp
@@ -656,6 +780,7 @@ _memory_projection_path() {
         codex) echo "$base_dir/.codex/weave.json" ;;
         codex-memory) echo "$base_dir/.codex/MEMORY.md" ;;
         copilot) echo "$base_dir/.github/copilot-instructions.md" ;;
+        agents) echo "$base_dir/AGENTS.md" ;;
         workflow) echo "$base_dir/WORKFLOW.md" ;;
         *) return 1 ;;
     esac
@@ -666,6 +791,7 @@ _memory_render_projection() {
     case "$projection" in
         codex) _memory_render_codex_json "$entries" "$path" ;;
         claude|claude-memory|codex-memory|copilot|workflow) _memory_render_markdown_file "$entries" "$path" ;;
+        agents) _memory_render_marked_only "$entries" "$path" ;;
         *)
             echo -e "${RED}Error: unsupported memory projection '$projection'${NC}" >&2
             return 1
@@ -919,7 +1045,7 @@ _memory_import_claude_dir() {
         local n_skipped; n_skipped=$(printf '%s\n' "$skipped" | jq 'length')
         [ "$n_skipped" -gt 0 ] && echo "⏭  Skipped $n_skipped already-imported file(s) (source_hash match)"
     fi
-    auto_sync 2>/dev/null || true
+    auto_sync_or_warn
 }
 
 _memory_import_codex() {
@@ -979,7 +1105,7 @@ _memory_import_codex() {
         local n_skipped; n_skipped=$(printf '%s\n' "$skipped" | jq 'length')
         [ "$n_skipped" -gt 0 ] && echo "⏭  Skipped $n_skipped already-imported row(s) (source_hash match)"
     fi
-    auto_sync 2>/dev/null || true
+    auto_sync_or_warn
 }
 
 # ── S4 crystallization ───────────────────────────────────────────────────────
@@ -1149,10 +1275,17 @@ _memory_patch_metadata() {
 }
 
 # Record a semantic edge between two memory/finding nodes (registered types only).
+# edges.context is JSON for every writer: readers apply json() to it, and a
+# plain string made the E5 causal identity query fail (wv-031d08).
 _memory_crystallize_edge() {
-    local source="$1" target="$2" type="$3"
+    local source="$1" target="$2" type="$3" context_sql
+    # A supersedes edge runs old -> new, so its sentence reads target-first
+    # ("<new> supersedes <old>"), as wv remember --supersedes words it.
+    context_sql=$(sql_escape "$(jq -nc --arg s "$source" --arg t "$target" --arg ty "$type" \
+        '{summary: (if $ty == "supersedes" then ($t + " supersedes " + $s) else ($s + " " + $ty + " " + $t) end),
+          source: "wv memory crystallize"}')")
     db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at)
-        VALUES ('$source', '$target', '$type', 1.0, 'wv memory crystallize', CURRENT_TIMESTAMP);" 2>/dev/null || true
+        VALUES ('$source', '$target', '$type', 1.0, '$context_sql', CURRENT_TIMESTAMP);" 2>/dev/null || true
 }
 
 # Create a finding node for an unresolved contradiction between a candidate and
@@ -1184,10 +1317,12 @@ cmd_remember() {
     local scope="repo"
     local source_agent=""
     local format="text"
+    local supersedes=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --kind=*) kind="${1#*=}" ;;
+            --supersedes=*) supersedes="${1#*=}" ;;
             --scope=*) scope="${1#*=}" ;;
             --source-agent=*) source_agent="${1#*=}" ;;
             --json) format="json" ;;
@@ -1224,12 +1359,37 @@ cmd_remember() {
     db_ensure
     db_migrate_fts5 2>/dev/null || true
 
-    local id metadata text_sql metadata_sql
+    # --supersedes=<id> (wv-ffaf3e): a changed claim is a new memory, never an
+    # edit. The old one is kept as mem_status=superseded with superseded_by, a
+    # tombstone pointing at its successor; render shows only active memory.
+    # Only an active memory can be superseded, so a chain has one live head.
+    local old_meta=""
+    if [ -n "$supersedes" ]; then
+        if ! validate_id "$supersedes" 2>/dev/null; then
+            echo -e "${RED}Error: --supersedes needs a node id, got '$supersedes'${NC}" >&2
+            return 1
+        fi
+        old_meta=$(db_query_json "SELECT metadata FROM nodes WHERE id='$supersedes';" 2>/dev/null \
+            | jq -c '.[0].metadata // empty | fromjson' 2>/dev/null || true)
+        if [ -z "$old_meta" ] || [ "$(jq -r '.type // ""' <<< "$old_meta")" != "memory" ]; then
+            echo -e "${RED}Error: $supersedes is not a memory node${NC}" >&2
+            return 1
+        fi
+        if [ "$(jq -r '.mem_status // "active"' <<< "$old_meta")" != "active" ]; then
+            echo -e "${RED}Error: $supersedes is $(jq -r '.mem_status' <<< "$old_meta"), not active; supersede the live memory in its chain${NC}" >&2
+            return 1
+        fi
+    fi
+
+    local id metadata text_sql metadata_sql now
     id=$(generate_id)
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     metadata=$(jq -nc \
         --arg kind "$kind" \
         --arg scope "$scope" \
         --arg source_agent "$source_agent" \
+        --arg now "$now" \
+        --arg supersedes "$supersedes" \
         '{
             type: "memory",
             kind: $kind,
@@ -1237,20 +1397,37 @@ cmd_remember() {
             mem_status: "active",
             source_agent: $source_agent,
             source_kind: "remember",
-            verified_at: (now | strftime("%Y-%m-%dT%H:%M:%SZ"))
-        }')
+            verified_at: $now
+        } + (if $supersedes != "" then {supersedes: $supersedes} else {} end)')
     text_sql=$(sql_escape "$text")
     metadata_sql=$(sql_escape "$metadata")
 
-    db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text_sql', 'done', '$metadata_sql');"
+    if [ -z "$supersedes" ]; then
+        db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text_sql', 'done', '$metadata_sql');"
+    else
+        # One transaction: successor, edge and tombstone land together or not
+        # at all. Edge direction follows the registry: target supersedes source.
+        local old_sql edge_context_sql
+        old_sql=$(sql_escape "$(jq -c --arg new "$id" --arg now "$now" \
+            '. + {mem_status: "superseded", superseded_by: $new, superseded_at: $now}' <<< "$old_meta")")
+        # JSON like every other edge writer (wv-031d08).
+        edge_context_sql=$(sql_escape "$(jq -nc --arg old "$supersedes" --arg new "$id" \
+            '{summary: ($new + " supersedes " + $old), source: "wv remember --supersedes"}')")
+        db_query "BEGIN IMMEDIATE;
+            INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text_sql', 'done', '$metadata_sql');
+            INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at)
+                VALUES ('$supersedes', '$id', 'supersedes', 1.0, '$edge_context_sql', CURRENT_TIMESTAMP);
+            UPDATE nodes SET metadata='$old_sql', updated_at=CURRENT_TIMESTAMP WHERE id='$supersedes';
+            COMMIT;"
+    fi
 
     if [ "$format" = "json" ]; then
         db_query_json_v2 "SELECT id, text, status, metadata FROM nodes WHERE id='$id';" | jq '.[0]'
     else
-        echo -e "${GREEN}✓${NC} Remembered $id"
+        echo -e "${GREEN}✓${NC} Remembered $id${supersedes:+ (supersedes $supersedes)}"
     fi
 
-    auto_sync 2>/dev/null || true
+    auto_sync_or_warn
 }
 
 cmd_memory() {
@@ -1322,12 +1499,13 @@ cmd_memory() {
 
             local projections=()
             case "$agent" in
-                all|native|container) projections=(claude claude-memory codex codex-memory copilot) ;;
+                all|native|container) projections=(claude claude-memory codex codex-memory copilot agents) ;;
                 claude) projections=(claude) ;;
                 claude-memory) projections=(claude-memory) ;;
                 codex) projections=(codex) ;;
                 codex-memory) projections=(codex-memory) ;;
                 copilot) projections=(copilot) ;;
+                agents) projections=(agents) ;;
                 workflow) projections=(workflow) ;;
                 *)
                     # When --agent=current resolves to a label with no dedicated
@@ -1337,10 +1515,10 @@ cmd_memory() {
                     # must not be stricter. An explicit unknown --agent=<name> is still
                     # a hard error (typo guard). See wv-872543 (F3).
                     if [ "$raw_agent" = "current" ]; then
-                        projections=(claude claude-memory codex codex-memory copilot)
+                        projections=(claude claude-memory codex codex-memory copilot agents)
                     else
                         echo -e "${RED}Error: unsupported memory projection '$agent'${NC}" >&2
-                        echo "Supported projections: all, current, claude, claude-memory, copilot, codex, codex-memory, workflow" >&2
+                        echo "Supported projections: all, current, claude, claude-memory, copilot, codex, codex-memory, agents, workflow" >&2
                         return 1
                     fi
                     ;;
@@ -1358,7 +1536,11 @@ cmd_memory() {
                 else
                     target_path=$(_memory_projection_path "$projection" "$base_dir") || return 1
                 fi
-                _memory_render_projection "$projection" "$entries" "$target_path" || return 1
+                local _render_rc=0
+                _memory_render_projection "$projection" "$entries" "$target_path" || _render_rc=$?
+                # 3 = marker-gated projection skipped (AGENTS.md without its block)
+                [ "$_render_rc" -eq 3 ] && continue
+                [ "$_render_rc" -eq 0 ] || return 1
                 rendered_paths=$(printf '%s\n' "$rendered_paths" | jq --arg projection "$projection" --arg path "$target_path" '. + [{projection: $projection, path: $path}]')
             done
 
@@ -1501,7 +1683,11 @@ cmd_memory() {
                             ;;
                         superseded)
                             _memory_patch_metadata "$cid" "$(jq -nc --arg s "$_cr_dup_id" '{mem_status:"superseded", superseded_by:$s}')"
-                            _memory_crystallize_edge "$_cr_dup_id" "$cid" "supersedes"
+                            # Registry: supersedes means the TARGET replaces the source,
+                            # so the superseded candidate is the source - as wv remember
+                            # --supersedes writes it (old -> new). This read the other
+                            # way round (wv-fc6fc2).
+                            _memory_crystallize_edge "$cid" "$_cr_dup_id" "supersedes"
                             ;;
                         contradicts)
                             finding_id=$(_memory_crystallize_finding "$cid" "$_cr_contradicts")
@@ -1530,7 +1716,7 @@ cmd_memory() {
             done
 
             if [ "$mode" = "apply-reviewed" ]; then
-                auto_sync 2>/dev/null || true
+                auto_sync_or_warn
             fi
 
             if [ "$format" = "json" ]; then
@@ -1595,7 +1781,7 @@ _store_node_commits() {
 
     local existing_primary
     existing_primary=$(echo "$cur_meta" | jq -r '.commit // empty' 2>/dev/null || echo "")
-    if [ -n "$existing_primary" ] && printf '%s\n' "$shas" | grep -qx -- "$existing_primary"; then
+    if [ -n "$existing_primary" ] && grep -qx -- "$existing_primary" <<< "$shas"; then
         primary_sha="$existing_primary"
     else
         primary_sha=$(printf '%s\n' "$shas" | head -1)
@@ -1688,16 +1874,26 @@ _done_refresh_file_metrics() {
     local id="$1"
     local scope_json="${2:-}"
 
-    [ "${WV_REQUIRE_QUALITY:-1}" = "0" ] && return 0
-
     # Read paths tracked for this node
     local paths_raw
     paths_raw=$(_done_quality_paths "$id" "$scope_json")
-    [ -z "$paths_raw" ] && return 0
+    if [ -z "$paths_raw" ]; then
+        wv_policy_verdict close_requires_quality_evidence allow no "" "the node tracks no files to judge"
+        return 0
+    fi
+
+    # The bypass is recorded once there is something it skips. Whether the
+    # evidence was actually missing is not evaluated, so the invariant is unknown.
+    if [ "${WV_REQUIRE_QUALITY:-1}" = "0" ]; then
+        wv_policy_verdict close_requires_quality_evidence allow unknown WV_REQUIRE_QUALITY=0 \
+            "quality evidence not required for this close"
+        return 0
+    fi
 
     # quality.db must exist when node_files is non-empty
     local quality_db="$WV_HOT_ZONE/quality.db"
     if [ ! -f "$quality_db" ]; then
+        wv_policy_verdict close_requires_quality_evidence deny yes "" "no quality database to judge the close"
         echo -e "${RED}Error: quality.db not found at $quality_db${NC}" >&2
         echo -e "  Run 'wv quality scan' before closing nodes that touch tracked files." >&2
         echo -e "  Set WV_REQUIRE_QUALITY=0 to bypass (test/legacy environments only)." >&2
@@ -1709,6 +1905,7 @@ _done_refresh_file_metrics() {
     latest_scan=$(sqlite3 -batch -cmd ".timeout 3000" "$quality_db" \
         "SELECT id FROM scan_meta ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
     if [ -z "$latest_scan" ]; then
+        wv_policy_verdict close_requires_quality_evidence deny yes "" "no quality scan to judge the close"
         echo -e "${RED}Error: quality.db has no scan data — run 'wv quality scan' first${NC}" >&2
         echo -e "  Set WV_REQUIRE_QUALITY=0 to bypass (test/legacy environments only)." >&2
         return 1
@@ -1740,6 +1937,7 @@ _done_refresh_file_metrics() {
             return 1
         fi
     done <<< "$paths_raw"
+    wv_policy_verdict close_requires_quality_evidence allow no "" "a quality scan covers the tracked files"
 }
 
 # _done_refresh_trend_signals — Sync brain.db file_trend from quality.db for
@@ -1823,16 +2021,29 @@ _done_refresh_test_status() {
     paths_raw=$(_done_quality_paths "$id" "$scope_json")
     [ -z "$paths_raw" ] && return 0
 
+    # Asked once: does git run a Weave pre-push gate here (heavy suites deferred)?
+    local deferral_on=0
+    command -v wv_prepush_gate_installed >/dev/null 2>&1 && wv_prepush_gate_installed && deferral_on=1
+
     local path
     while IFS= read -r path; do
         [ -z "$path" ] && continue
+        # A path outside the repository (older attributions recorded memory and
+        # scratch files absolute) has no test map entry that could ever be run,
+        # so it gets no verdict rather than a permanent "stale" (wv-67c7b6).
+        case "$path" in /*) continue ;; esac
         local path_esc cur_fp state
         path_esc=$(sql_escape "$path")
         cur_fp=$(_test_file_fingerprint "$path")
 
-        # Resolve suites for this path via the shared resolver (JSON -> names).
-        local suites
-        suites=$(_impact_suites_for_files "$path" 2>/dev/null | jq -r '.[].name' 2>/dev/null || echo "")
+        # Resolve suites for this path via the shared resolver (JSON -> names),
+        # keeping which are push-tier ([heavy], wv-862ac0). tests/run-all.sh is
+        # the meta-runner the gates skip and never record (wv-gate-pool.sh), so
+        # requiring its row made every file routed to it stale forever.
+        local suites suites_json heavy_suites
+        suites_json=$(_impact_suites_for_files "$path" 2>/dev/null || echo '[]')
+        suites=$(jq -r '.[].name | select(. != "tests/run-all.sh")' <<< "$suites_json" 2>/dev/null || echo "")
+        heavy_suites=" $(jq -r '[.[] | select(.tier == "heavy") | .name] | join(" ")' <<< "$suites_json" 2>/dev/null) "
 
         if [ -n "$suites" ]; then
             # A mapped path starts stale and becomes green only if every required
@@ -1855,11 +2066,21 @@ _done_refresh_test_status() {
             elif [ -n "$row_fp" ]; then
                 suite_state="stale"
             fi
-            # Precedence: red > stale > green > unknown.
+            # A push-tier suite runs at git push, not at commit (wv-862ac0), so
+            # when that gate is installed its missing or outdated row means
+            # "owed at push", not "stale": the push is refused until it is green
+            # for this content. Without the gate it is required here as before.
+            # A red row for the current content stays red (ultrareview #4575).
+            if [ "$suite_state" = "stale" ] && [ "$deferral_on" = "1" ] \
+                && [[ "$heavy_suites" == *" $suite "* ]]; then
+                suite_state="deferred"
+            fi
+            # Precedence: red > stale > deferred > green > unknown.
             case "$suite_state" in
-                red)   state="red" ;;
-                stale) [ "$state" != "red" ] && state="stale" ;;
-                green) { [ "$state" = "unknown" ]; } && state="green" ;;
+                red)      state="red" ;;
+                stale)    [ "$state" != "red" ] && state="stale" ;;
+                deferred) { [ "$state" = "green" ] || [ "$state" = "unknown" ]; } && state="deferred" ;;
+                green)    { [ "$state" = "unknown" ]; } && state="green" ;;
             esac
         done
 
@@ -1926,12 +2147,20 @@ _done_require_finding_metadata() {
     local id="$1" meta_json="$2"
     local node_type
     node_type=$(echo "$meta_json" | jq -r '.type // "task"' 2>/dev/null || echo "task")
-    [ "$node_type" != "finding" ] && return 0
+    if [ "$node_type" != "finding" ]; then
+        wv_policy_verdict finding_close_requires_violation_type allow no "" "not a finding"
+        return 0
+    fi
 
     local missing_fields
     missing_fields=$(_finding_missing_fields "$meta_json" | paste -sd ', ' - || true)
-    [ -z "$missing_fields" ] && return 0
+    if [ -z "$missing_fields" ]; then
+        wv_policy_verdict finding_close_requires_violation_type allow no "" "the finding carries a catalogued violation type"
+        return 0
+    fi
 
+    wv_policy_verdict finding_close_requires_violation_type deny yes "" \
+        "a finding without a catalogued violation_type cannot be promoted or coached"
     echo -e "${RED}Error: finding node requires violation_type before close${NC}" >&2
     echo -e "  Missing or invalid: $missing_fields" >&2
     echo -e "  Enum values: $_FINDING_VIOLATION_TYPES" >&2
@@ -2004,6 +2233,7 @@ _done_mark_pending_close() {
 
 _done_store_learning() {
     local id="$1" learning="$2" acknowledge_overlap="${3:-0}" no_overlap_check="${4:-0}"
+    local _overlap_spoke=false
     local explicit_decision="${5:-}" explicit_pattern="${6:-}" explicit_pitfall="${7:-}"
     _done_skip_learning=false
     _done_pending_close=false
@@ -2035,6 +2265,11 @@ _done_store_learning() {
                 contradiction=true
             fi
 
+            # Advisory whatever the caller does next: overlap is a quality
+            # heuristic that never blocks a close, so it is recorded, not denied.
+            _overlap_spoke=true
+            wv_policy_verdict learning_overlap_advisory advisory unknown "" \
+                "learning overlaps $fts_match$([ "$contradiction" = true ] && printf ' with opposite polarity')"
             if [ "$contradiction" = true ]; then
                 echo -e "${RED}⚠ Learning may CONTRADICT $fts_match (opposite polarity)${NC}" >&2
             else
@@ -2091,6 +2326,9 @@ _done_store_learning() {
             fi
         fi
     fi
+
+    [ "${_overlap_spoke:-false}" = true ] ||
+        wv_policy_verdict learning_overlap_advisory allow no "" "no overlapping learning found"
 
     if [ "$_done_skip_learning" = true ] || [ "$_done_pending_close" = true ]; then
         return 0
@@ -2310,90 +2548,199 @@ _done_write_trail() {
     } >> "$breadcrumb_file" 2>/dev/null || true
 }
 
-# _done_report_policy_violation — diagnose and print the GraphPolicyViolation JSON
-# for a failed close UPDATE (the DB trigger RAISE), or echo the raw error for a
-# non-policy failure. Distinguishes the three trigger clauses: mccabe_max,
-# trend_deteriorating, and test_gate. Extracted from cmd_done to keep that
-# function under the bash mccabe gate (debt: wv-89ca7c). Args: $1=id $2=error.
-_done_report_policy_violation() {
-    local id="$1" _done_err="$2" scope_json="${3:-}"
-    if ! echo "$_done_err" | grep -q "GraphPolicyViolation"; then
-        echo "$_done_err" >&2
-        return 0
-    fi
-    if echo "$_done_err" | grep -q "invalid completion scope"; then
-        echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"completion_scope\",\"detail\":\"invalid or stale completion scope\"}" >&2
-        return 0
-    fi
-    # wv-6657dd: last line of defence. cmd_done resyncs the policy tables before
-    # the close, so a block on a config-exempt path should be impossible; if one
-    # slips through anyway, name the drift instead of reporting stale policy as
-    # real debt.
-    _report_exempt_drift() {
-        _quality_conf_declares_exempt "$1" || return 0
-        echo -e "${YELLOW}  advisory: $1 is exempt in ${WEAVE_DIR}/quality.conf but the enforced quality_exempt table is stale — run 'wv load' to resync${NC}" >&2
-    }
-    local v_path v_actual v_limit v_threshold v_direction
-    local scope_filter=""
-    [ -n "$scope_json" ] && scope_filter="AND nf.path IN (SELECT value FROM json_each('$(sql_escape "$scope_json")'))"
-    local exempt_filter="AND NOT EXISTS (SELECT 1 FROM quality_exempt qe WHERE nf.path LIKE CASE WHEN qe.path_pattern LIKE '%/' THEN qe.path_pattern || '%' ELSE qe.path_pattern END)"
-    local _lang_coalesce="COALESCE((SELECT value FROM policy_thresholds WHERE key='mccabe_max_'||fm.language),(SELECT value FROM policy_thresholds WHERE key='mccabe_max'))"
-    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND fm.mccabe_max > $_lang_coalesce $exempt_filter LIMIT 1;" 2>/dev/null || echo "")
-    if [ -n "$v_path" ]; then
-        v_actual=$(db_query "SELECT fm.mccabe_max FROM node_files nf JOIN file_metrics fm ON fm.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND fm.mccabe_max > $_lang_coalesce $exempt_filter LIMIT 1;" 2>/dev/null || echo "0")
-        local v_lang
-        v_lang=$(db_query "SELECT fm.language FROM file_metrics fm WHERE fm.path='$(sql_escape "$v_path")';" 2>/dev/null || echo "")
-        local _threshold_key="mccabe_max"; [ -n "$v_lang" ] && _threshold_key="mccabe_max_${v_lang}"
-        v_limit=$(db_query "SELECT COALESCE((SELECT value FROM policy_thresholds WHERE key='${_threshold_key}'),(SELECT value FROM policy_thresholds WHERE key='mccabe_max'));" 2>/dev/null || echo "15")
-        v_threshold="$_threshold_key"
-        echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\"}" >&2
-        _report_exempt_drift "$v_path"
-        return 0
-    fi
-    # Not mccabe — distinguish trend (clause 2) from test (clause 3).
-    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND ft.direction='deteriorating' AND (SELECT value FROM policy_thresholds WHERE key='trend_deteriorating') >= 1 $exempt_filter LIMIT 1;" 2>/dev/null || echo "")
-    if [ -n "$v_path" ]; then
-        v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='trend_deteriorating';" 2>/dev/null || echo "1")
-        v_actual=1
-        v_direction=$(db_query "SELECT ft.direction FROM node_files nf JOIN file_trend ft ON ft.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND ft.direction='deteriorating' $exempt_filter LIMIT 1;" 2>/dev/null || echo "deteriorating")
-        v_threshold="trend_deteriorating"
-        echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\",\"direction\":\"$v_direction\"}" >&2
-        _report_exempt_drift "$v_path"
-        return 0
-    fi
-    # Test gate (clause 3): a red/stale file under test_gate>=block.
-    local v_state
-    local node_type_filter="AND COALESCE((SELECT json_extract(metadata, '$.type') FROM nodes WHERE id='$(sql_escape "$id")'),'') NOT IN ('finding','epic','session_history')"
-    v_path=$(db_query "SELECT nf.path FROM node_files nf JOIN file_test_status fts ON fts.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND fts.state IN ('red','stale') AND (SELECT value FROM policy_thresholds WHERE key='test_gate') >= 2 $node_type_filter $exempt_filter LIMIT 1;" 2>/dev/null || echo "unknown")
-    v_state=$(db_query "SELECT fts.state FROM node_files nf JOIN file_test_status fts ON fts.path = nf.path WHERE nf.node_id='$(sql_escape "$id")' $scope_filter AND fts.state IN ('red','stale') AND (SELECT value FROM policy_thresholds WHERE key='test_gate') >= 2 $node_type_filter $exempt_filter LIMIT 1;" 2>/dev/null || echo "red")
-    v_limit=$(db_query "SELECT value FROM policy_thresholds WHERE key='test_gate';" 2>/dev/null || echo "2")
-    v_actual=1
-    v_threshold="test_gate"
-    echo "GraphPolicyViolation: {\"error\":\"GraphPolicyViolation\",\"node_id\":\"$id\",\"threshold\":\"$v_threshold\",\"limit\":$v_limit,\"actual\":$v_actual,\"path\":\"$v_path\",\"state\":\"$v_state\"}" >&2
+# _done_close_txn <id> <status-guard> <proposed-metadata-expr> [set-clause]
+#
+# The close as one write transaction: evaluate the close receipt
+# (_policy_close_receipt_sql), then apply the UPDATE only when the receipt allows.
+# BEGIN IMMEDIATE holds the write lock from the evaluation to the commit, so no
+# threshold, exemption or metric can move between the decision and the close it
+# governs. Prints "receipt:<json>" when a clause denied, else one
+# "bypass:<json>" per clause the close passed only through quality_exempt
+# (_policy_close_bypass_sql), then "changes:<n>". The nodes_policy_check trigger
+# still guards the UPDATE, as a backstop only.
+#
+# Every path that sets status='done' closes through here (wv done, update,
+# quick, resolve), so none reaches the trigger without a receipt (wv-957fc8).
+# set-clause is the caller's full SET list and must set status='done' and, when
+# it changes metadata, the same expression passed as proposed-metadata-expr.
+_done_close_txn() {
+    local id="$1" guard="$2" proposed="$3" set="${4:-}" id_esc
+    id_esc=$(sql_escape "$id")
+    [ -n "$set" ] || set="status='done', metadata = $proposed, updated_at = CURRENT_TIMESTAMP"
+    db_query "BEGIN IMMEDIATE;
+        SELECT 'from:' || status FROM nodes WHERE id='$id_esc';
+        CREATE TEMP TABLE close_receipt AS $(_policy_close_receipt_sql "$id_esc" "$proposed");
+        SELECT 'receipt:' || receipt FROM temp.close_receipt WHERE receipt IS NOT NULL;
+        SELECT 'bypass:' || bypass FROM ($(_policy_close_bypass_sql "$id_esc" "$proposed"))
+        WHERE NOT EXISTS (SELECT 1 FROM temp.close_receipt WHERE receipt IS NOT NULL);
+        UPDATE nodes
+        SET $set
+        WHERE id='$id_esc' $guard
+          AND NOT EXISTS (SELECT 1 FROM temp.close_receipt WHERE receipt IS NOT NULL);
+        SELECT 'changes:' || changes();
+        COMMIT;" 2>&1
 }
 
-cmd_done() {
-    local id="${1:-}"
-    local reason=""
-    local learning=""
-    local decision=""
-    local pattern=""
-    local pitfall=""
-    local learning_file=""
-    local no_warn=0
-    local skip_verification=0
-    local acknowledge_overlap=0
-    local no_overlap_check=0
-    local format="text"
-    local verification_method=""
-    local verification_evidence=""
-    local verification_evidence_file=""
-    local no_gh=0
-    local allowed_tools_raw=""
-    local completion_files_raw=""
-    local completion_files_set=0
+# _done_policy_race_seam check|apply — test-only (WV_TEST_MODE=1 +
+# WV_TEST_POLICY_RACE=1, tests/wv-test-hooks.registry): loosen every
+# close-policy input after the close transaction has decided and before the
+# decision is reported. A report that re-derived the verdict from live policy
+# state would now name a different clause, or none. "check" validates the value
+# before the close runs, so an unrecognised one fails every close rather than
+# only the ones that reach the report.
+_done_policy_race_seam() {
+    [ -n "${WV_TEST_POLICY_RACE:-}" ] || return 0
+    if [ "${WV_TEST_MODE:-}" != "1" ]; then
+        [ "$1" = "check" ] && echo "wv done: WV_TEST_POLICY_RACE is set but WV_TEST_MODE=1 is not — ignoring it" >&2
+        return 0
+    fi
+    if [ "$WV_TEST_POLICY_RACE" != "1" ]; then
+        echo -e "${RED}Error: WV_TEST_POLICY_RACE='${WV_TEST_POLICY_RACE}' is not a recognised value (1)${NC}" >&2
+        return 1
+    fi
+    [ "$1" = "apply" ] || return 0
+    db_query "UPDATE policy_thresholds SET value = 1e9 WHERE key LIKE 'mccabe_max%';
+        UPDATE policy_thresholds SET value = 0 WHERE key IN ('trend_deteriorating', 'test_gate');
+        INSERT OR IGNORE INTO quality_exempt(path_pattern, reason) VALUES ('%', 'WV_TEST_POLICY_RACE');" >/dev/null
+}
 
-    shift || true
+# _done_record_policy_receipt <id> <receipt-json>
+#
+# Record a denying close receipt as the call's verdict, then print the
+# human-facing GraphPolicyViolation payload from the same receipt. Nothing here
+# queries policy state: the receipt already names the clause and the values it
+# was decided on, and a malformed completion scope is input validation rather
+# than a policy decision. Returns nonzero when the evidence could not be written.
+_done_record_policy_receipt() {
+    local id="$1" receipt="$2" rule clause reason rc=0
+    rule=$(jq -r '.rule' <<< "$receipt")
+    clause=$(jq -c '.clause' <<< "$receipt")
+    reason=$(jq -r '.clause.reason // ""' <<< "$receipt")
+    case "$rule" in
+        completion_scope_integrity)
+            if [ "$reason" = "malformed_scope" ]; then
+                wv_policy_refusal input_validation "the completion scope has no usable shape" || rc=1
+            else
+                wv_policy_verdict completion_scope_integrity deny yes "" "$reason" "$clause" || rc=1
+            fi ;;
+        close_complexity_ceiling)
+            wv_policy_verdict close_complexity_ceiling deny no "" "" "$clause" || rc=1 ;;
+        close_trend_not_deteriorating)
+            wv_policy_verdict close_trend_not_deteriorating deny no "" "" "$clause" || rc=1 ;;
+        close_tests_not_red)
+            wv_policy_verdict close_tests_not_red deny no "" "" "$clause" || rc=1 ;;
+        *)
+            wv_policy_refusal infrastructure_failure "the close receipt names no declared rule" || rc=1 ;;
+    esac
+    echo "GraphPolicyViolation: $(jq -c --arg id "$id" \
+        '{error: "GraphPolicyViolation", node_id: $id} + (.clause | del(.reason))
+         + (if .clause.reason then {detail: .clause.reason} else {} end)' <<< "$receipt")" >&2
+    # wv-6657dd: cmd_done resyncs the policy tables before the close, so a block
+    # on a config-exempt path should be impossible; if one slips through anyway,
+    # name the drift instead of reporting stale policy as real debt.
+    local path
+    path=$(jq -r '.clause.path // ""' <<< "$receipt")
+    if [ -n "$path" ] && _quality_conf_declares_exempt "$path"; then
+        echo -e "${YELLOW}  advisory: $path is exempt in ${WEAVE_DIR}/quality.conf but the enforced quality_exempt table is stale — run 'wv load' to resync${NC}" >&2
+    fi
+    return "$rc"
+}
+
+# _done_close <id> <status-guard> <proposed-metadata-expr> [set-clause]
+# Run the close transaction and classify its outcome: a denying receipt, the
+# trigger backstop firing (the receipt and trigger disagreed), any other
+# database failure, or a node that changed state first.
+_done_close() {
+    local id="$1" guard="$2" proposed="$3" set="${4:-}" out rc receipt
+    _done_policy_race_seam check || return 1
+    out=$(_done_close_txn "$id" "$guard" "$proposed" "$set")
+    rc=$?
+    _done_policy_race_seam apply
+    receipt=$(sed -n 's/^receipt://p' <<< "$out")
+    if [ -n "$receipt" ]; then
+        _done_record_policy_receipt "$id" "$receipt"
+        return 1
+    fi
+    if [ "$rc" -ne 0 ]; then
+        if grep -q "GraphPolicyViolation" <<< "$out"; then
+            wv_policy_refusal infrastructure_failure "the policy trigger refused a close its receipt allowed"
+        fi
+        echo "$out" >&2
+        return 1
+    fi
+    if [ "$(sed -n 's/^changes://p' <<< "$out")" != "1" ]; then
+        wv_policy_refusal expected_conflict "node changed state between the checks and the close"
+        echo -e "${RED}Error: node $id changed state before completion; audit was not written${NC}" >&2
+        return 1
+    fi
+    # The close has committed, so a failed bypass write cannot undo it: evidence
+    # mode fails the call closed inside the emitter, and outside it the caller
+    # must still finish the close it made.
+    local bypass bypassed=""
+    while IFS= read -r bypass; do
+        [ -n "$bypass" ] || continue
+        _done_record_policy_bypass "$bypass"
+        bypassed+=" $(jq -r '.rule' <<< "$bypass")"
+    done < <(sed -n 's/^bypass://p' <<< "$out")
+    # Every clause the receipt judged, and did not see bypassed, let the close
+    # through; say so, or the close is never countable (wv-15422b). The
+    # receipt only judges active -> done, so any other close did not engage it.
+    if [ "$(sed -n 's/^from://p' <<< "$out")" = "active" ]; then
+        _close_rules_passed "$bypassed"
+    else
+        _close_rules_not_engaged "not an active-to-done transition"
+    fi
+    return 0
+}
+
+# _close_rules_passed <bypassed-rules> — the receipt judged the close and no
+# clause denied it; a clause already recorded as bypassed is not repeated.
+_close_rules_passed() {
+    [[ " $1 " == *" close_complexity_ceiling "* ]] ||
+        wv_policy_verdict close_complexity_ceiling allow no "" "no touched file over its complexity ceiling"
+    [[ " $1 " == *" close_trend_not_deteriorating "* ]] ||
+        wv_policy_verdict close_trend_not_deteriorating allow no "" "no touched file on a gated deteriorating trend"
+    [[ " $1 " == *" close_tests_not_red "* ]] ||
+        wv_policy_verdict close_tests_not_red allow no "" "no touched file with a gated red or stale test"
+    wv_policy_verdict completion_scope_integrity allow no "" "the completion scope, if any, is valid"
+}
+
+# _close_rules_not_engaged <why> — a call whose operation can close a node
+# (update, bulk-update, quick, resolve, ...) but did not perform an
+# active-to-done close in this call. The close rules examined it and had
+# nothing to refuse; recorded so the call can be countable (wv-15422b).
+_close_rules_not_engaged() {
+    wv_policy_verdict close_complexity_ceiling allow no "" "$1"
+    wv_policy_verdict close_trend_not_deteriorating allow no "" "$1"
+    wv_policy_verdict close_tests_not_red allow no "" "$1"
+    wv_policy_verdict completion_scope_integrity allow no "" "$1"
+}
+
+# _done_record_policy_bypass <bypass-json>
+#
+# Record a close that a clause would have denied but for quality_exempt as that
+# rule's allow, with the exempt pattern as its bypass (wv-ef00f7), the way a
+# command gate records its override flag. Only called once the close committed,
+# so the allow names a close that happened.
+_done_record_policy_bypass() {
+    local rule bypass clause
+    rule=$(jq -r '.rule' <<< "$1")
+    bypass=$(jq -r '.bypass' <<< "$1")
+    clause=$(jq -c '.clause' <<< "$1")
+    case "$rule" in
+        close_complexity_ceiling)
+            wv_policy_verdict close_complexity_ceiling allow no "$bypass" "" "$clause" ;;
+        close_trend_not_deteriorating)
+            wv_policy_verdict close_trend_not_deteriorating allow no "$bypass" "" "$clause" ;;
+        close_tests_not_red)
+            wv_policy_verdict close_tests_not_red allow no "$bypass" "" "$clause" ;;
+        *)
+            wv_policy_refusal infrastructure_failure "the close bypass names no declared rule" ;;
+    esac
+}
+
+# _done_parse_args <args...> — cmd_done's flags into its locals (dynamic scope).
+_done_parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --reason=*) reason="${1#*=}" ;;
@@ -2413,15 +2760,20 @@ cmd_done() {
             --no-gh) no_gh=1 ;;
             --allowed-tools=*) allowed_tools_raw="${1#--allowed-tools=}" ;;
             --completion-files=*) completion_files_raw="${1#*=}"; completion_files_set=1 ;;
+            *) _wv_reject_arg "done" "$1"; return 1 ;;
         esac
         shift
     done
+}
 
+# _done_resolve_learning — read the option files and compose the structured
+# learning from --decision/--pattern/--pitfall, into cmd_done's locals.
+_done_resolve_learning() {
     if [ -n "$learning_file" ]; then
         local _raw_learning
         _raw_learning=$(_done_read_option_file "--learning-file" "$learning_file") || return 1
         # Newline-delimited structured form → pipe-delimited for existing parser
-        if echo "$_raw_learning" | grep -qE '^(decision|pattern|pitfall):'; then
+        if grep -qE '^(decision|pattern|pitfall):' <<< "$_raw_learning"; then
             local _ld _lp _lf
             _ld=$(echo "$_raw_learning" | grep '^decision:' | head -1 | sed 's/^decision:[[:space:]]*//')
             _lp=$(echo "$_raw_learning" | grep '^pattern:'  | head -1 | sed 's/^pattern:[[:space:]]*//')
@@ -2446,43 +2798,40 @@ cmd_done() {
         [ -n "$pattern" ] && learning="${learning:+$learning | }pattern: $pattern"
         [ -n "$pitfall" ] && learning="${learning:+$learning | }pitfall: $pitfall"
     fi
+    return 0
+}
 
-    if [ -z "$id" ]; then
-        echo -e "${RED}Error: node ID required${NC}" >&2
-        return 1
-    fi
-
-    # Validate ID format (SQL injection prevention)
-    validate_id "$id" || return 1
-
-    # wv-6657dd: the quality gate is a SQL trigger reading the quality_exempt
-    # and policy_thresholds TABLES, which only _load_quality_config writes. Sync
-    # them from .weave/quality.conf before the close can fire that trigger, so
-    # the gate enforces the committed policy rather than whatever was loaded
-    # last. Cheap: two file hashes, and a reload only when they changed.
-    _ensure_quality_config_fresh 2>/dev/null || true
-
+# _done_check_node — the node exists, is not already done, and is active when a
+# completion scope is given; sets cmd_done's node_status.
+_done_check_node() {
     # Verify node exists
-    local exists node_status
+    local exists
     exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
     if [ "$exists" = "0" ]; then
+        wv_policy_refusal input_validation "close names a node that does not exist"
         echo -e "${RED}Error: node $id not found${NC}" >&2
         return 1
     fi
     node_status=$(db_query "SELECT status FROM nodes WHERE id='$id';")
     if [ "$node_status" = "done" ]; then
+        wv_policy_refusal expected_conflict "node already closed"
         echo -e "${RED}Error: node $id is already done; completion audit was not changed${NC}" >&2
         return 1
     fi
     if [ "$completion_files_set" = "1" ] && [ "$node_status" != "active" ]; then
+        wv_policy_refusal input_validation "--completion-files on a node that is not active"
         echo -e "${RED}Error: --completion-files requires an active node (current: $node_status)${NC}" >&2
         return 1
     fi
+    return 0
+}
 
+# _done_build_scope — validate --completion-files and build cmd_done's
+# scope_json/scope_object/scope_esc.
+_done_build_scope() {
     # A completion scope narrows quality policy only; node_files remains an
     # append-only impact history. Require canonical repo-relative paths and
     # existing attribution before durably recording the audited scope.
-    local scope_json="" scope_object="" scope_esc=""
     if [ "$completion_files_set" = "1" ]; then
         scope_json='[]'
         local scope_path scope_count
@@ -2491,11 +2840,14 @@ cmd_done() {
             if [ -z "$scope_path" ] || [[ "$scope_path" = /* ]] || [[ "$scope_path" = ./* ]] ||
                [[ "$scope_path" = */ ]] || [[ "$scope_path" = *//* ]] ||
                [[ "/$scope_path/" = */./* ]] || [[ "/$scope_path/" = */../* ]]; then
+                wv_policy_refusal input_validation "--completion-files path is not normalized and repo-relative"
                 echo -e "${RED}Error: --completion-files requires nonempty normalized repo-relative paths (invalid: '$scope_path')${NC}" >&2
                 return 1
             fi
             scope_count=$(db_query "SELECT COUNT(*) FROM node_files WHERE node_id='$id' AND path='$(sql_escape "$scope_path")';" 2>/dev/null || echo 0)
             if [ "$scope_count" = "0" ]; then
+                wv_policy_verdict completion_scope_integrity deny yes "" \
+                    "completion scoped to a file the node never touched"
                 echo -e "${RED}Error: completion file '$scope_path' is not attributed to node $id${NC}" >&2
                 return 1
             fi
@@ -2505,7 +2857,12 @@ cmd_done() {
         scope_object=$(jq -cn --argjson files "$scope_json" --arg set_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg attempt_id "$(date +%s%N)-$$-$RANDOM" '{files:$files,set_at:$set_at,attempt_id:$attempt_id}')
         scope_esc=$(sql_escape "$scope_object")
     fi
+    return 0
+}
 
+# _done_write_verification — persist inline --verification-* metadata before
+# the close, so the pre-close hook sees it on any re-check.
+_done_write_verification() {
     # Write inline verification metadata immediately so the pre-close hook
     # sees it on any subsequent re-check (and for auditability).
     if [ -n "$verification_method" ] || [ -n "$verification_evidence" ]; then
@@ -2522,34 +2879,66 @@ cmd_done() {
             return 1
         fi
     fi
+    return 0
+}
 
-    local node_meta pending_reason pending_resume_cmd
-    node_meta=$(_done_read_metadata "$id")
+# _done_gate_pending — close_awaits_human_verification: returns 2 while the node
+# waits for human verification, unless --acknowledge-overlap; may restore the
+# pending learning into cmd_done's learning.
+_done_gate_pending() {
+    local pending_reason pending_resume_cmd
     pending_reason=$(echo "$node_meta" | jq -r '.pending_close.reason // empty' 2>/dev/null || echo "")
     pending_resume_cmd=$(echo "$node_meta" | jq -r '.pending_close.resume_command // empty' 2>/dev/null || echo "")
-    if [ -n "$pending_reason" ] && [ "$acknowledge_overlap" = "0" ]; then
+    if [ -n "$pending_reason" ] && [ "$acknowledge_overlap" = "1" ]; then
+        wv_policy_verdict close_awaits_human_verification allow yes --acknowledge-overlap \
+            "closed while waiting for human verification"
+    elif [ -n "$pending_reason" ]; then
+        wv_policy_verdict close_awaits_human_verification deny yes "" \
+            "the node is waiting for human verification"
         echo -e "${YELLOW}⚠ Node $id is waiting for human verification before close${NC}" >&2
         if [ -n "$pending_resume_cmd" ]; then
             echo -e "${YELLOW}  Resume with: $pending_resume_cmd${NC}" >&2
         fi
         return 2
     fi
+    [ -n "$pending_reason" ] ||
+        wv_policy_verdict close_awaits_human_verification allow no "" "not waiting for human verification"
     if [ "$acknowledge_overlap" = "1" ] && [ -z "$learning" ]; then
         learning=$(echo "$node_meta" | jq -r '.pending_close.learning // empty' 2>/dev/null || echo "")
     fi
+    return 0
+}
 
-    _done_require_finding_metadata "$id" "$node_meta" || return 1
-
+# _done_gate_learning — close_requires_learning, recording which bypass (if any)
+# let a learning-less close through.
+_done_gate_learning() {
     # Require --learning or --skip-verification for closure quality
     # Bypass: WV_REQUIRE_LEARNING=0 (for tests), --no-warn (for recovery/internal)
+    # A close with no learning records which bypass let it through.
+    if [ -z "$learning" ]; then
+        local learning_bypass=""
+        if [ "$skip_verification" != "0" ]; then learning_bypass="--skip-verification"
+        elif [ "$no_warn" != "0" ]; then learning_bypass="--no-warn"
+        elif [ "${WV_REQUIRE_LEARNING:-1}" != "1" ]; then learning_bypass="WV_REQUIRE_LEARNING=0"
+        fi
+        [ -n "$learning_bypass" ] && wv_policy_verdict close_requires_learning allow no "$learning_bypass" \
+            "closed without a learning"
+    else
+        wv_policy_verdict close_requires_learning allow no "" "the close records a learning"
+    fi
     if [ "${WV_REQUIRE_LEARNING:-1}" = "1" ] && [ -z "$learning" ] && [ "$skip_verification" = "0" ] && [ "$no_warn" = "0" ]; then
+        wv_policy_verdict close_requires_learning deny no "" "a close records what the next session would get wrong"
         echo -e "${RED}Error: --learning=\"...\" or --skip-verification required${NC}" >&2
         echo -e "  Capture what future sessions would get wrong without this:" >&2
         echo -e "  wv done $id --learning=\"...\" --verification-method=\"make check\" --verification-evidence=\"N passed\"" >&2
         echo -e "  wv done $id --skip-verification  # for trivial work" >&2
         return 1
     fi
+    return 0
+}
 
+# _done_warn_childless_epic — advisory for an epic closed with no implements children.
+_done_warn_childless_epic() {
     # Warn if closing an epic with no tracked children (implements edges)
     local node_type
     node_type=$(db_query "SELECT json_extract(metadata,'$.type') FROM nodes WHERE id='$id';" 2>/dev/null || true)
@@ -2561,7 +2950,12 @@ cmd_done() {
             echo -e "${YELLOW}  Future sessions cannot use wv context or wv path to navigate this epic's work${NC}" >&2
         fi
     fi
+    return 0
+}
 
+# _done_apply_learning_and_tools — store the learning (returns 2 when overlap
+# parks the close as pending) and any --allowed-tools.
+_done_apply_learning_and_tools() {
     # Store learning in metadata if provided
     if [ -n "$learning" ]; then
         # Strip ANSI escape codes (color sequences leak from terminal output)
@@ -2571,6 +2965,8 @@ cmd_done() {
         if [ "$_done_pending_close" = true ]; then
             return 2
         fi
+    else
+        wv_policy_verdict learning_overlap_advisory allow no "" "no learning to compare"
     fi
 
     # Write allowed_tools to metadata if supplied at close time
@@ -2582,55 +2978,11 @@ cmd_done() {
             db_query "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'), '\$.allowed_tools', json('$tools_esc')), updated_at=CURRENT_TIMESTAMP WHERE id='$(sql_escape "$id")';" 2>/dev/null || true
         fi
     fi
+    return 0
+}
 
-    # Refresh file_metrics and trend signals from quality.db before the gate UPDATE.
-    _done_refresh_file_metrics "$id" "$scope_json" || return 1
-    _done_refresh_trend_signals "$id" "$scope_json" || return 1
-    # Refresh test-correctness status from the ledger (best-effort; never blocks).
-    _done_refresh_test_status "$id" "$scope_json" || true
-
-    # === Close: update status, release claim, clear primary, aggregate commits ===
-    local _done_err _done_rc
-    local completion_metadata_expr="json_remove(COALESCE(metadata,'{}'), '$.claimed_by', '$.pending_close', '$.needs_human_verification', '$.completion_scope')"
-    if [ "$completion_files_set" = "1" ]; then
-        completion_metadata_expr="json_set(json_remove(COALESCE(metadata,'{}'), '$.claimed_by', '$.pending_close', '$.needs_human_verification'), '$.completion_scope', json('$scope_esc'))"
-    fi
-    if [ "${_WV_SHIP_DURABLE_CLOSE:-0}" = "1" ]; then
-        completion_metadata_expr="json_set($completion_metadata_expr, '$.ship_pending', json('true'), '$.ship_pending_mode', 'post_close')"
-    fi
-    local done_status_guard="AND status='$(sql_escape "$node_status")'"
-    _done_err=$(db_query "UPDATE nodes
-        SET status='done',
-            metadata = $completion_metadata_expr,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id='$id' $done_status_guard;
-        SELECT changes();" 2>&1)
-    _done_rc=$?
-    if [ "$_done_rc" -ne 0 ]; then
-        _done_report_policy_violation "$id" "$_done_err" "$scope_json"
-        return 1
-    fi
-    if [ "$(echo "$_done_err" | tail -1)" != "1" ]; then
-        echo -e "${RED}Error: node $id changed state before completion; audit was not written${NC}" >&2
-        return 1
-    fi
-
-    local primary
-    primary=$(get_primary_node 2>/dev/null || echo "")
-    if [ "$primary" = "$id" ]; then
-        clear_primary_node
-    fi
-
-    _store_node_commits "$id" 2>/dev/null || true
-    local parent_epic
-    parent_epic=$(db_query "SELECT target FROM edges WHERE source='$(sql_escape "$id")' AND type='implements' LIMIT 1;" 2>/dev/null || true)
-    if [ -n "$parent_epic" ]; then
-        _aggregate_epic_commits "$parent_epic" 2>/dev/null || true
-    fi
-
-    # Auto-unblock nodes that were only blocked by this one
-    _do_unblock_cascade "$id"
-
+# _done_report — the close's JSON or text report, including the stored learning keys.
+_done_report() {
     local historical_files policy_files scope_mode
     historical_files=$(db_query "SELECT COUNT(*) FROM node_files WHERE node_id='$(sql_escape "$id")';" 2>/dev/null || echo 0)
     policy_files="$historical_files"
@@ -2672,7 +3024,11 @@ cmd_done() {
             fi
         fi
     fi
+}
 
+# _done_post_close_advisories — write-time validation, the test_gate=warn
+# advisory and open findings; sets the closing phase between them.
+_done_post_close_advisories() {
     # Write-time validation warnings (stderr; suppress for --skip-verification / --json / --no-warn)
     if [ "$no_warn" != "1" ] && [ "${WV_NO_WARN:-0}" != "1" ] && [ "$skip_verification" != "1" ] && [ "$format" != "json" ]; then
         validate_on_done "$id"
@@ -2734,7 +3090,42 @@ cmd_done() {
             done <<< "$_open_findings"
         fi
     fi
+}
 
+# _done_commit_close — the close itself: status, released claim, completion
+# scope, primary, commit aggregation and the unblock cascade.
+_done_commit_close() {
+    # === Close: update status, release claim, clear primary, aggregate commits ===
+    local completion_metadata_expr="json_remove(COALESCE(metadata,'{}'), '$.claimed_by', '$.pending_close', '$.needs_human_verification', '$.completion_scope')"
+    if [ "$completion_files_set" = "1" ]; then
+        completion_metadata_expr="json_set(json_remove(COALESCE(metadata,'{}'), '$.claimed_by', '$.pending_close', '$.needs_human_verification'), '$.completion_scope', json('$scope_esc'))"
+    fi
+    if [ "${_WV_SHIP_DURABLE_CLOSE:-0}" = "1" ]; then
+        completion_metadata_expr="json_set($completion_metadata_expr, '$.ship_pending', json('true'), '$.ship_pending_mode', 'post_close')"
+    fi
+    local done_status_guard="AND status='$(sql_escape "$node_status")'"
+    _done_close "$id" "$done_status_guard" "$completion_metadata_expr" || return 1
+
+    local primary
+    primary=$(get_primary_node 2>/dev/null || echo "")
+    if [ "$primary" = "$id" ]; then
+        clear_primary_node
+    fi
+
+    _store_node_commits "$id" 2>/dev/null || true
+    local parent_epic
+    parent_epic=$(db_query "SELECT target FROM edges WHERE source='$(sql_escape "$id")' AND type='implements' LIMIT 1;" 2>/dev/null || true)
+    if [ -n "$parent_epic" ]; then
+        _aggregate_epic_commits "$parent_epic" 2>/dev/null || true
+    fi
+
+    # Auto-unblock nodes that were only blocked by this one
+    _do_unblock_cascade "$id"
+    return 0
+}
+
+# _done_post_close_notify — GitHub issue close, context cache and progress notification.
+_done_post_close_notify() {
     # === Post-close: GH issue, cache, notifications, trails ===
     [ "$no_gh" = "0" ] && _done_close_gh_issue "$id"
 
@@ -2750,9 +3141,95 @@ cmd_done() {
     else
         gh_notify "$id" "done"
     fi
+}
+
+cmd_done() {
+    local id="${1:-}"
+    local reason=""
+    local learning=""
+    local decision=""
+    local pattern=""
+    local pitfall=""
+    local learning_file=""
+    local no_warn=0
+    local skip_verification=0
+    local acknowledge_overlap=0
+    local no_overlap_check=0
+    local format="text"
+    local verification_method=""
+    local verification_evidence=""
+    local verification_evidence_file=""
+    local no_gh=0
+    local allowed_tools_raw=""
+    local completion_files_raw=""
+    local completion_files_set=0
+
+    shift || true
+    _done_parse_args "$@" || return 1
+
+    _done_resolve_learning || return 1
+
+    if [ -z "$id" ]; then
+        echo -e "${RED}Error: node ID required${NC}" >&2
+        return 1
+    fi
+
+    # Validate ID format (SQL injection prevention)
+    validate_id "$id" || return 1
+
+    # wv-6657dd: the quality gate is a SQL trigger reading the quality_exempt
+    # and policy_thresholds TABLES, which only _load_quality_config writes. Sync
+    # them from .weave/quality.conf before the close can fire that trigger, so
+    # the gate enforces the committed policy rather than whatever was loaded
+    # last. Cheap: two file hashes, and a reload only when they changed.
+    _ensure_quality_config_fresh 2>/dev/null || true
+
+    local node_status
+    _done_check_node || return 1
+
+    local scope_json="" scope_object="" scope_esc=""
+    _done_build_scope || return 1
+
+    _done_write_verification || return 1
+
+    local node_meta
+    node_meta=$(_done_read_metadata "$id")
+    _done_gate_pending || return $?
+
+    _done_require_finding_metadata "$id" "$node_meta" || return 1
+
+    _done_gate_learning || return 1
+
+    _done_warn_childless_epic
+
+    _done_apply_learning_and_tools || return $?
+
+    # Refresh file_metrics and trend signals from quality.db before the gate UPDATE.
+    _done_refresh_file_metrics "$id" "$scope_json" || return 1
+    _done_refresh_trend_signals "$id" "$scope_json" || return 1
+    # Refresh test-correctness status from the ledger (best-effort; never blocks).
+    _done_refresh_test_status "$id" "$scope_json" || true
+
+    _done_commit_close || return 1
+
+    # Durability gate (wv-18841c). Every mutation this closure makes to the graph
+    # is above this line; everything below reports it or acts on it. Refusing
+    # here is what keeps the GitHub issue open, the trail unwritten and the
+    # "✓ Closed" line unprinted when the closure did not reach state.sql — a
+    # closed issue over a vanished closure is worse than no closure at all.
+    persist_or_refuse "$id" --force || return 1
+
+    _done_report
+
+    _done_post_close_advisories
+
+    _done_post_close_notify
 
     _done_write_trail "$id"
-    auto_sync --force 2>/dev/null || true
+    # Second persist, for the post-close writes only (cache invalidation, the
+    # unblock cascade's own rows). The closure itself was already gated above,
+    # so a failure here cannot make a reported closure a lie — it warns.
+    auto_sync_or_warn --force
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2986,12 +3463,26 @@ USAGE
     echo ""
     echo -e "${GREEN}Bulk update:${NC} $updated updated, $failed failed (of $count total)"
 
-    auto_sync 2>/dev/null || true
+    auto_sync_or_warn
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_work — Claim a node and set up subagent context inheritance
 # ═══════════════════════════════════════════════════════════════════════════
+
+# _work_claim_failed <id> <format> <detail> — a claim that did not persist is an
+# infrastructure failure, not a policy decision or a lost race: record it as such
+# and say so, with no success banner and a nonzero exit (wv-03d775).
+_work_claim_failed() {
+    local id="$1" format="$2" detail="$3"
+    wv_policy_refusal infrastructure_failure "claim did not persist: $detail"
+    if [ "$format" = "json" ]; then
+        jq -n --arg id "$id" --arg detail "$detail" \
+            '{"ok": false, "error": "claim_not_persisted", "detail": $detail, "id": $id}' >&2
+    else
+        echo -e "${RED}✗ $id was not claimed: $detail${NC}" >&2
+    fi
+}
 
 cmd_work() {
     # Check for incomplete operations before claiming new work
@@ -3019,11 +3510,13 @@ cmd_work() {
             --reopen)   reopen=true ;;
             --json)     format="json" ;;
             --allowed-tools=*) allowed_tools_raw="${1#--allowed-tools=}" ;;
+            *) _wv_reject_arg work "$1"; return 1 ;;
         esac
         shift
     done
 
     if [ -z "$id" ]; then
+        wv_policy_refusal input_validation "claim names no node"
         echo -e "${RED}Error: node ID required${NC}" >&2
         echo "Usage: wv work <id> [--quiet] [--force] [--reopen] [--json] [--allowed-tools=t1,t2,...]" >&2
         echo "" >&2
@@ -3042,24 +3535,64 @@ cmd_work() {
     local exists
     exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
     if [ "$exists" = "0" ]; then
+        wv_policy_refusal input_validation "claim names a node that does not exist"
         echo -e "${RED}Error: node $id not found${NC}" >&2
         return 1
     fi
 
+    # Reservation guard (wv-0060db). A reserved node is the measured task for a
+    # counted capture: fixing it as ordinary work consumes the slot and cannot
+    # be undone, which is what happened to wv-5850d4 on 2026-08-17. The node
+    # already carried that warning in metadata and nothing read it.
+    #
+    # Deliberately NOT bypassed by --force. --force is the routine way to take a
+    # node another agent has claimed, so if it also cleared reservations the
+    # guard would be off in exactly the situation it is written for. The
+    # override is separate and explicit, and it names the capture in the log.
+    local _reserved _reserved_slot _reserved_note
+    _reserved=$(db_query "SELECT COALESCE(json_extract(metadata, '\$.e5_reserved'), json_extract(metadata, '\$.reserved'), '') FROM nodes WHERE id='$id';" 2>/dev/null | tr -d '[:space:]')
+    if [ "$_reserved" = "1" ] || [ "$_reserved" = "true" ]; then
+        if [ "${WV_ALLOW_RESERVED:-0}" != "1" ]; then
+            _reserved_slot=$(db_query "SELECT COALESCE(json_extract(metadata, '\$.e5_slot'), 'unnamed') FROM nodes WHERE id='$id';" 2>/dev/null)
+            _reserved_note=$(db_query "SELECT COALESCE(json_extract(metadata, '\$.reservation_note'), json_extract(metadata, '\$.RESERVED_DO_NOT_FIX'), '') FROM nodes WHERE id='$id';" 2>/dev/null)
+            wv_policy_verdict reserved_slot_claim deny yes "" \
+                "claiming a reserved node as ordinary work consumes its capture slot"
+            echo -e "${RED}Error: $id is RESERVED for counted capture slot ${_reserved_slot} — refusing to claim${NC}" >&2
+            [ -n "$_reserved_note" ] && echo -e "${YELLOW}  $_reserved_note${NC}" >&2
+            echo -e "${YELLOW}  Fixing it as ordinary work consumes the slot and cannot be undone.${NC}" >&2
+            echo -e "${YELLOW}  If this IS the counted capture: WV_ALLOW_RESERVED=1 wv work $id${NC}" >&2
+            echo -e "${YELLOW}  --force does not bypass a reservation.${NC}" >&2
+            return 1
+        fi
+        wv_policy_verdict reserved_slot_claim allow yes WV_ALLOW_RESERVED=1 \
+            "reserved node claimed for its counted capture"
+        echo -e "${YELLOW}⚠ Claiming RESERVED node $id under WV_ALLOW_RESERVED=1 — this consumes its capture slot${NC}" >&2
+    else
+        wv_policy_verdict reserved_slot_claim allow no "" "not a reserved node"
+    fi
+
     local current_status
     current_status=$(db_query "SELECT status FROM nodes WHERE id='$id';" 2>/dev/null | tr -d '[:space:]')
-    if [ "$current_status" = "done" ] && [ "$reopen" != true ]; then
+    if [ "$current_status" = "done" ] && [ "$reopen" = true ]; then
+        wv_policy_verdict reopen_requires_explicit_intent allow yes --reopen "done node reopened explicitly"
+    elif [ "$current_status" = "done" ]; then
+        wv_policy_verdict reopen_requires_explicit_intent deny yes "" "a claim would silently reopen a done node"
         echo -e "${RED}Error: node $id is done; use 'wv work $id --reopen' to explicitly reopen it${NC}" >&2
         return 1
+    else
+        wv_policy_verdict reopen_requires_explicit_intent allow no "" "not a done node"
     fi
 
     # Resolve agent identity (strip quotes for SQL safety)
     local agent_id
     agent_id="$(sql_escape "$(resolve_agent_id)")"
 
-    # Atomic CAS claim: succeeds only if unclaimed or already claimed by this agent
+    # Atomic CAS claim: succeeds only if unclaimed or already claimed by this agent.
+    # A write that fails or rolls back (an FTS trigger error, a locked database)
+    # must not be reported as a claim (wv-03d775): only a numeric changes() from
+    # a query that succeeded is a result, and success is re-read from the row.
     local claim_changes
-    claim_changes=$(db_query "
+    if ! claim_changes=$(db_query "
         UPDATE nodes
         SET metadata = json_set(COALESCE(metadata,'{}'), '$.claimed_by', '$agent_id'),
             status = 'active',
@@ -3068,20 +3601,32 @@ cmd_work() {
           AND (json_extract(metadata, '$.claimed_by') IS NULL
                OR json_extract(metadata, '$.claimed_by') = '$agent_id');
         SELECT changes();
-    ")
+    ") || [[ ! "$claim_changes" =~ ^[0-9]+$ ]]; then
+        _work_claim_failed "$id" "$format" "the claim write failed"
+        return 1
+    fi
 
-    if [ "$claim_changes" = "0" ]; then
+    if [ "$claim_changes" != "0" ]; then
+        wv_policy_verdict claim_ownership allow no "" "unclaimed, or already this agent's"
+    else
         # Claim lost — another agent holds it
         local holder
         holder=$(db_query "SELECT json_extract(metadata, '$.claimed_by') FROM nodes WHERE id='$id';")
         if [ "$force" = true ]; then
+            wv_policy_verdict claim_ownership allow yes --force "took over a claim held by another agent"
             [ "$format" != "json" ] && echo -e "${YELLOW}⚠ Overriding stale claim held by: $holder${NC}" >&2
-            db_query "UPDATE nodes
+            if ! db_query "UPDATE nodes
                 SET metadata = json_set(COALESCE(metadata,'{}'), '$.claimed_by', '$agent_id'),
                     status = 'active',
                     updated_at = CURRENT_TIMESTAMP
-                WHERE id = '$id';"
+                WHERE id = '$id';"; then
+                _work_claim_failed "$id" "$format" "the forced claim write failed"
+                return 1
+            fi
         else
+            # The CAS cannot tell a live holder from a race this call just lost,
+            # so the refusal is a conflict, not a counterweight decision.
+            wv_policy_refusal expected_conflict "claim lost: another agent holds the node"
             if [ "$format" = "json" ]; then
                 jq -n --arg id "$id" --arg holder "$holder" \
                     '{"ok": false, "error": "claimed_by_other", "holder": $holder, "id": $id}' >&2
@@ -3091,6 +3636,15 @@ cmd_work() {
             fi
             return 1
         fi
+    fi
+
+    # Report a claim only once the row says so.
+    local persisted
+    persisted=$(db_query "SELECT status || '|' || COALESCE(json_extract(metadata, '$.claimed_by'), '')
+        FROM nodes WHERE id='$id';" 2>/dev/null) || persisted=""
+    if [ "$persisted" != "active|$agent_id" ]; then
+        _work_claim_failed "$id" "$format" "the node did not persist as active and claimed (found: ${persisted:-nothing})"
+        return 1
     fi
 
     set_primary_node "$id"
@@ -3274,11 +3828,23 @@ cmd_ready() {
     # not blocked by the UNIFIED signal (status/deferral/edge). wv_blocking_reason
     # is the single source shared with cmd_context so a metadata-deferred node cannot
     # look ready here while the runtime sees it blocked — or vice versa (wv-f752a5).
+    # Reserved nodes are not ready work. A reservation says "this node is the
+    # measured task for a counted capture; fixing it as ordinary work consumes
+    # the slot" -- and until now that lived only as prose in metadata that
+    # nothing read, while the node sat in ready looking like an easy win. That
+    # is exactly how wv-5850d4 was consumed on 2026-08-17 (wv-0060db).
+    # --all still shows them, so the reservation hides work without losing it.
+    local reserved_pred="COALESCE(json_extract(n.metadata, '\$.e5_reserved'), json_extract(n.metadata, '\$.reserved'), 0) IN (1, 'true')"
     local ready_where="
         n.status = 'todo'
         AND COALESCE(json_extract(n.metadata, '\$.type'), '') NOT IN ('finding', 'memory')
         AND ($(wv_blocking_reason n)) IS NULL
     "
+    local reserved_filter=""
+    if [ "$show_all" = false ]; then
+        reserved_filter=" AND NOT ($reserved_pred)"
+    fi
+    ready_where="$ready_where $reserved_filter"
 
     # Default: hide nodes claimed by other agents; --all shows everything
     local claim_filter=""
@@ -3375,6 +3941,18 @@ cmd_ready() {
             local _limit_n="${_mode_limit##*LIMIT }"
             if [ "$_ready_total" -gt "$_limit_n" ] 2>/dev/null; then
                 echo -e "${DIM}  … showing ${_limit_n} of ${_ready_total} ready (use 'wv ready --json' or execute mode for all)${NC}"
+            fi
+        fi
+
+        # Reservation notice. Hiding reserved work SILENTLY would trade one
+        # invisible hazard for another: the operator running a counted capture
+        # needs to know the slot is there, and everyone else needs to know why
+        # the count does not match --all.
+        if [ "$show_all" = false ]; then
+            local _reserved_n
+            _reserved_n=$(db_query "$subtree_cte SELECT COUNT(*) FROM nodes n $subtree_join WHERE n.status='todo' AND ($reserved_pred);" 2>/dev/null || echo "0")
+            if [ "${_reserved_n:-0}" -gt 0 ] 2>/dev/null; then
+                echo -e "${DIM}  ${_reserved_n} reserved node(s) hidden (counted-capture slots; 'wv ready --all' to see them)${NC}"
             fi
         fi
 
@@ -3588,10 +4166,23 @@ cmd_list() {
     # Always-on alternatives footer (stderr): every wv list call reminds the agent
     # of cheaper targeted readers. Previously only fired when hitting the cap —
     # that meant low-node repos never saw the hint even though call frequency was high.
+    # The cap bounds output, not knowledge (wv-e174eb): an agent enumerating
+    # before wv add has to learn that rows are hidden and how many, or it files
+    # a duplicate of a node it never saw. The total counts matching rows, not
+    # returned ones, and the remedy keeps the same filters -- --all would also
+    # pull in every done node.
     _list_footer() {
-        local count="$1" hit_cap="$2" cap_n="$3"
+        local count="$1" hit_cap="$2" total=""
         if [ "$hit_cap" = true ]; then
-            echo "(showing $cap_n of $((count)) — use --all for full dump)" >&2
+            total=$(db_query "SELECT COUNT(*) FROM nodes $where_clause;" 2>/dev/null || echo "")
+            if ! [[ "$total" =~ ^[0-9]+$ ]]; then
+                echo "(showing $count — more may be hidden; rerun with a larger --limit=N)" >&2
+            elif [ "$total" -gt "$count" ]; then
+                echo "(showing $count of $total matching — $((total - count)) hidden; rerun with --limit=$total to see them)" >&2
+            fi
+            if ! [[ "$total" =~ ^[0-9]+$ ]] || [ "$total" -gt "$count" ]; then
+                echo "(a capped list is not evidence a node is absent — before wv add, run wv search \"<topic>\")" >&2
+            fi
         fi
         echo "(targeted reads: wv ready | wv query <preds> | wv search <topic>)" >&2
     }
@@ -4023,16 +4614,16 @@ Usage: wv update <id> [options]
 Update fields on an existing node.
 Done nodes cannot be reopened with update; use 'wv work <id> --reopen'.
 
-Options:
-  --status=<status>          Set status
-  --text=<text>              Replace node text
-  --alias=<alias>            Set alias (empty string clears it)
-  --metadata=<json>          Merge JSON into metadata
-  --metadata <json>          Merge JSON into metadata
-  --metadata-file=<path>     Read metadata JSON from file ('-' reads stdin)
-  --metadata-file <path>     Read metadata JSON from file ('-' reads stdin)
-  --remove-key=<key>         Remove one metadata key
-  --echo                     Print the updated node as JSON
+Options (a value starting with -- needs the = form; an unknown argument is
+an error, and nothing is written):
+  --status=<status>, --status <status>      Set status
+  --text=<text>, --text <text>              Replace node text
+  --alias=<alias>, --alias <alias>          Set alias (empty string clears it)
+  --metadata=<json>, --metadata <json>      Merge JSON into metadata
+  --metadata-file=<path>, --metadata-file <path>
+                                            Read metadata JSON from file ('-' reads stdin)
+  --remove-key=<key>, --remove-key <key>    Remove one metadata key
+  --echo                                    Print the updated node as JSON
 
 Examples:
   wv update wv-a1b2 --status=active
@@ -4073,6 +4664,9 @@ validate_update_metadata_json() {
         return 1
     fi
 
+    validate_metadata_risk_level "$metadata_payload" "$metadata_source" || return 1
+    validate_metadata_canonical_numbers "$metadata_payload" "$metadata_source" || return 1
+
     # Write-time enum guard: reject an explicitly-set off-enum finding.violation_type.
     # Close-time validation alone let invalid findings persist in the graph
     # (wv-43f077 historical:tooling, wv-f51319 measurement-gap — wv-01c378). Only fires
@@ -4110,6 +4704,7 @@ cmd_update() {
     validate_id "$id" || return 1
     
     local updates=""
+    local proposed_metadata="metadata"
     local echo_mode=false
     local metadata_supplied=false
     while [ $# -gt 0 ]; do
@@ -4119,6 +4714,21 @@ cmd_update() {
                 return 0
                 ;;
             --echo) echo_mode=true ;;
+            # Space-separated forms (wv-51605f): rewrite to the =-form and
+            # re-dispatch, so both forms share one validation path. A value that
+            # itself starts with -- is taken only in the =-form, so a missing
+            # value cannot swallow the next option.
+            --status|--text|--alias|--remove-key)
+                if [ $# -lt 2 ] || [[ "$2" == --* ]]; then
+                    echo -e "${RED}Error: $1 requires a value${NC}" >&2
+                    echo "Use $1 <value> or $1=<value>." >&2
+                    return 1
+                fi
+                local _opt="$1"
+                shift
+                set -- "$_opt=$1" "${@:2}"
+                continue
+                ;;
             --status=*)
                 local status="${1#*=}"
                 validate_status "$status" || return 1
@@ -4145,6 +4755,7 @@ cmd_update() {
                 # stored metadata when jq failed for any reason.
                 local metadata_esc="${metadata//\'/\'\'}"
                 updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
+                proposed_metadata="json_patch(COALESCE(metadata, '{}'), '$metadata_esc')"
                 metadata_supplied=true
                 ;;
             --metadata)
@@ -4163,6 +4774,7 @@ cmd_update() {
                 validate_update_metadata_json "$metadata" "--metadata" || return 1
                 local metadata_esc="${metadata//\'/\'\'}"
                 updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
+                proposed_metadata="json_patch(COALESCE(metadata, '{}'), '$metadata_esc')"
                 metadata_supplied=true
                 ;;
             --metadata-file=*)
@@ -4177,6 +4789,7 @@ cmd_update() {
                 validate_update_metadata_json "$metadata" "--metadata-file" || return 1
                 local metadata_esc="${metadata//\'/\'\'}"
                 updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
+                proposed_metadata="json_patch(COALESCE(metadata, '{}'), '$metadata_esc')"
                 metadata_supplied=true
                 ;;
             --metadata-file)
@@ -4197,6 +4810,7 @@ cmd_update() {
                 validate_update_metadata_json "$metadata" "--metadata-file" || return 1
                 local metadata_esc="${metadata//\'/\'\'}"
                 updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
+                proposed_metadata="json_patch(COALESCE(metadata, '{}'), '$metadata_esc')"
                 metadata_supplied=true
                 ;;
             --alias=*)
@@ -4226,10 +4840,17 @@ cmd_update() {
                 echo -e "${GREEN}✓${NC} Removed metadata key '${remove_key}' from $id"
                 return 0
                 ;;
+            *)
+                # No silent drops (wv-51605f): an argument the parser does not
+                # consume fails the command before anything is written.
+                echo -e "${RED}Error: unknown argument '$1' for wv update${NC}" >&2
+                echo "Run 'wv update --help' for usage." >&2
+                return 1
+                ;;
         esac
         shift
     done
-    
+
     if [ -z "$updates" ]; then
         echo -e "${RED}Error: no updates specified${NC}" >&2
         return 1
@@ -4243,12 +4864,23 @@ cmd_update() {
         local _cur_status
         _cur_status=$(db_query "SELECT status FROM nodes WHERE id='$id';" 2>/dev/null | tr -d '[:space:]') || true
         if [[ "$_cur_status" == "done" ]]; then
+            wv_policy_verdict reopen_requires_explicit_intent deny yes "" "an update would silently reopen a done node"
             echo -e "${RED}Error: cannot reopen a done node with update; use 'wv work $id --reopen'${NC}" >&2
             return 1
         fi
+        wv_policy_verdict reopen_requires_explicit_intent allow no "" "not a done node"
+    else
+        wv_policy_verdict reopen_requires_explicit_intent allow no "" "the update does not set active"
     fi
 
-    db_query "UPDATE nodes SET $updates WHERE id='$id';"
+    # A close through update is still a close: it is judged by the same receipt
+    # as wv done, in the same transaction as the write (wv-957fc8).
+    if [[ "$updates" == *"status='done'"* ]]; then
+        _done_close "$id" "" "$proposed_metadata" "$updates" || return 1
+    else
+        _close_rules_not_engaged "the update does not close the node"
+        db_query "UPDATE nodes SET $updates WHERE id='$id';"
+    fi
 
     # Every update can change the context payload (status, text, alias, or
     # metadata). Do not leave a same-session runtime consumer with stale state.
@@ -4277,7 +4909,7 @@ cmd_update() {
             return 1
         fi
     else
-        auto_sync 2>/dev/null || true
+        auto_sync_or_warn
     fi
 
     # Report success only after durability-critical metadata persistence passes.
@@ -4319,6 +4951,7 @@ cmd_touch() {
                     [ -n "$_tf" ] && files_list+=("$_tf")
                 done
                 ;;
+            *) _wv_reject_arg touch "$1"; return 1 ;;
         esac
         shift
     done
@@ -4345,6 +4978,8 @@ cmd_touch() {
             echo "Error: invalid JSON in --metadata" >&2
             return 1
         fi
+        validate_metadata_risk_level "$metadata" "--metadata" || return 1
+        validate_metadata_canonical_numbers "$metadata" "--metadata" || return 1
 
         local metadata_esc="${metadata//\'/\'\'}"
         db_query "UPDATE nodes SET metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
@@ -4436,7 +5071,7 @@ cmd_quick() {
         case "$1" in
             --learning=*) learning="${1#*=}" ;;
             --metadata=*) metadata="${1#*=}" ;;
-            --*) ;; # skip unrecognized flags
+            --*) _wv_reject_arg quick "$1"; return 1 ;;
             *) text="$text $1" ;;
         esac
         shift
@@ -4453,6 +5088,8 @@ cmd_quick() {
         echo -e "${RED}Error: invalid JSON in --metadata${NC}" >&2
         return 1
     fi
+    validate_metadata_risk_level "$metadata" "--metadata" || return 1
+    validate_metadata_canonical_numbers "$metadata" "--metadata" || return 1
 
     if ! _add_dedup_check "$text" "Use 'wv add \"...\" --force' for intentional repeat work"; then
         return 1
@@ -4511,8 +5148,15 @@ cmd_quick() {
         fi
     fi
 
-    # Step 3: Close the node + unblock cascade
-    db_query "UPDATE nodes SET status = 'done' WHERE id = '$id';"
+    # Step 3: Close the node + unblock cascade. The close is judged by the same
+    # receipt as wv done (wv-957fc8); a denied close leaves the node active,
+    # like a failed commit, rather than closing past the gate.
+    if ! _done_close "$id" "" "metadata" "status = 'done'"; then
+        echo -e "${RED}Error: close was refused — $id is left ACTIVE${NC}" >&2
+        cmd_sync 2>/dev/null || true
+        echo "$id"
+        return 1
+    fi
     _do_unblock_cascade "$id"
     echo -e "${GREEN}✓${NC} $id (quick-closed)" >&2
     echo "$id"
@@ -4628,6 +5272,8 @@ _ship_run() {
     # Reject incomplete input before creating any durable protocol state.
     if [ -z "$learning" ] && [ -z "$learning_file" ] && [ -z "$decision" ] &&
        [ -z "$pattern" ] && [ -z "$pitfall" ] && [ "$skip_verification" != true ]; then
+        # The bypass path is recorded by cmd_done, which ship delegates to.
+        wv_policy_verdict close_requires_learning deny no "" "a close records what the next session would get wrong"
         echo -e "${RED}Error: --learning=\"...\", --learning-file=PATH, or --skip-verification required${NC}" >&2
         echo "Usage: wv ship <id> --learning=\"decision: ... | pattern: ... | pitfall: ...\"" >&2
         return 1
@@ -4635,6 +5281,11 @@ _ship_run() {
     local ship_status
     ship_status=$(db_query "SELECT status FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null)
     if [ -z "$ship_status" ] || [ "$ship_status" = "done" ]; then
+        if [ -z "$ship_status" ]; then
+            wv_policy_refusal input_validation "ship names a node that does not exist"
+        else
+            wv_policy_refusal expected_conflict "node already closed"
+        fi
         echo -e "${RED}Error: ship requires an existing non-done node${NC}" >&2
         return 1
     fi
@@ -4768,6 +5419,10 @@ cmd_ship() {
             --verification-method=*) verification_method="${1#*=}" ;;
             --verification-evidence=*) verification_evidence="${1#*=}" ;;
             --verification-evidence-file=*) verification_evidence_file="${1#*=}" ;;
+            # GitHub sync is opt-in (--gh), so --no-gh restates the default;
+            # callers pass it, and refusing it would break them (wv-86a96a).
+            --no-gh) gh_flag=false ;;
+            *) _wv_reject_arg ship "$1"; return 1 ;;
         esac
         shift
     done
@@ -4948,6 +5603,7 @@ cmd_delete() {
     node_text=$(db_query "SELECT text FROM nodes WHERE id='$id';")
     node_status=$(db_query "SELECT status FROM nodes WHERE id='$id';")
     if [ -z "$node_text" ]; then
+        wv_policy_refusal input_validation "delete names a node that does not exist"
         echo -e "${RED}Error: node $id not found${NC}" >&2
         return 1
     fi
@@ -4955,9 +5611,12 @@ cmd_delete() {
     # Check for children (nodes that implement this one)
     local children
     children=$(db_query "SELECT source FROM edges WHERE target='$id' AND type='implements';")
-    if [ -n "$children" ] && [ "$force" != "true" ]; then
+    if [ -n "$children" ] && [ "$force" = "true" ]; then
+        wv_policy_verdict delete_preserves_children allow yes --force "deleted a node with children, orphaning them"
+    elif [ -n "$children" ]; then
         local child_count
         child_count=$(echo "$children" | wc -l)
+        wv_policy_verdict delete_preserves_children deny yes "" "deleting a node with children orphans them"
         echo -e "${RED}Error: node $id has $child_count child node(s):${NC}" >&2
         echo "$children" | while read -r child_id; do
             local child_text
@@ -4966,6 +5625,8 @@ cmd_delete() {
         done
         echo -e "${YELLOW}Use --force to delete anyway (children will be orphaned)${NC}" >&2
         return 1
+    else
+        wv_policy_verdict delete_preserves_children allow no "" "the node has no children"
     fi
 
     # Collect edge info for display
@@ -5007,11 +5668,16 @@ cmd_delete() {
     # Step 1: SQLite delete (archive + edges + node)
     journal_step 1 "sqlite_delete" "{\"id\":\"$id\"}"
 
-    # Archive node to JSONL before deletion
-    local archive_dir="$WEAVE_DIR/archive"
-    local archive_file="$archive_dir/$(date +%Y-%m-%d).jsonl"
-    mkdir -p "$archive_dir"
-    db_query_json "SELECT * FROM nodes WHERE id='$id'" | jq -c '.[]' >> "$archive_file" 2>/dev/null || true
+    # Archive node to JSONL before deletion, but not from a DB foreign to
+    # WEAVE_DIR (a WV_DB override with WEAVE_DIR from the working directory):
+    # that DB is not this repository's graph, and its rows do not belong in the
+    # repository's recovery archive (wv-5d5ef2, wv-7ab3cd).
+    if ! _wv_db_foreign_to_weave_dir; then
+        local archive_dir="$WEAVE_DIR/archive"
+        local archive_file="$archive_dir/$(date +%Y-%m-%d).jsonl"
+        mkdir -p "$archive_dir"
+        db_query_json "SELECT * FROM nodes WHERE id='$id'" | jq -c '.[]' >> "$archive_file" 2>/dev/null || true
+    fi
 
     # Collect connected nodes for cache invalidation
     local affected_nodes="$id"
@@ -5021,14 +5687,9 @@ cmd_delete() {
 
     # Capture lineage BEFORE the DELETEs so the deletion tombstones carry the
     # highest lineage each row held (wv-0d5e07).
-    local _del_agent _del_node_seq
+    local _del_agent _del_tombs
     _del_agent="$(resolve_agent_id 2>/dev/null || echo unknown)"
-    _del_node_seq=$(db_query "SELECT COALESCE(lineage_seq,0) FROM nodes WHERE id='$id';" 2>/dev/null || echo 0)
-    local _del_edge_tombs=""   # newline list of "source:target:type\tlineage_seq"
-    while IFS='|' read -r _es _et _ety _eseq; do
-        [ -n "$_es" ] || continue
-        _del_edge_tombs+="${_es}:${_et}:${_ety}	${_eseq:-0}"$'\n'
-    done < <(db_query "SELECT source, target, type, COALESCE(lineage_seq,0) FROM edges WHERE source='$id' OR target='$id';" 2>/dev/null)
+    _del_tombs=$(db_capture_tombstones "$id")
 
     # Delete edges first (no ON DELETE CASCADE)
     db_query "DELETE FROM edges WHERE source='$id' OR target='$id';"
@@ -5048,18 +5709,8 @@ cmd_delete() {
     # clone's _reconcile_tombstones drop the row again if the delta back-catalog
     # replays its creation. tombstones has no _warp trigger so this stays local
     # (delete is non-propagating), like the .prune_epoch it replaces.
-    db_write_tombstone node "$id" "${_del_node_seq:-0}" "$_del_agent"
-    while IFS=$'\t' read -r _etomb_id _etomb_seq; do
-        [ -n "$_etomb_id" ] || continue
-        db_write_tombstone edge "$_etomb_id" "${_etomb_seq:-0}" "$_del_agent"
-    done <<< "$_del_edge_tombs"
-    local _del_state_tmp
-    _del_state_tmp=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX")
-    if dump_state_sql "$WV_DB" "$_del_state_tmp" && [ -s "$_del_state_tmp" ]; then
-        mv "$_del_state_tmp" "$WEAVE_DIR/state.sql"
-    else
-        rm -f "$_del_state_tmp"
-    fi
+    db_write_tombstones "$_del_agent" <<< "$_del_tombs"
+    _redump_state_after_removal 1 || true
 
     # Step 2: Close matching GitHub issue if linked and no other node still owns it
     if [ "$close_gh" = "true" ] && [ -n "$gh_num" ] && [ "$gh_num" != "null" ]; then
@@ -5094,5 +5745,5 @@ cmd_delete() {
         invalidate_context_cache "$affected_id" 2>/dev/null || true
     done
 
-    auto_sync 2>/dev/null || true
+    auto_sync_or_warn
 }

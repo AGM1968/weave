@@ -125,6 +125,89 @@ probe_contains "abc" "a.c" \
     && fail "a regex metacharacter is matched literally" "    'a.c' matched 'abc'" \
     || pass "a regex metacharacter is matched literally"
 
+# ── 4. Early-exit pipelines under pipefail (wv-a70659) ──────────────────────
+# `writer | grep -q PAT` under pipefail returns 141 when the pattern MATCHES:
+# grep leaves at the first hit, the writer takes SIGPIPE, pipefail promotes it.
+# A match therefore reports failure -- never a false pass, but a timing-
+# dependent false failure, which is how it presented as the rc.12 "45 of 46"
+# flake. The fix throughout is the shape this very file uses above: capture,
+# then match on a herestring, so there is no writer process left to signal.
+PIPE_SCANNER="$SCRIPT_DIR/lib/pipe-safety-scan.py"
+PIPE_FIXTURE="$SCRIPT_DIR/fixtures/pipe-safety"
+
+assert_pipe_form() {
+    local label="$1" form="$2" out
+    out=$(python3 "$PIPE_SCANNER" "$PIPE_FIXTURE/unsafe.sh" 2>/dev/null || true)
+    if grep -qF -- "$form" <<<"$out"; then
+        pass "pipe scanner detects $label"
+    else
+        fail "pipe scanner detects $label" "    not reported: $form"
+    fi
+}
+assert_pipe_form "grep -q"            "grep -q 'needle'"
+assert_pipe_form "a bundled grep -qF" "grep -qF 'needle'"
+assert_pipe_form "grep -l"            "grep -l 'needle'"
+assert_pipe_form "grep -m N"          "grep -m 1 'needle'"
+assert_pipe_form "head -N"            "head -5"
+assert_pipe_form "head -n N"          "head -n 20"
+assert_pipe_form "sed with a q command" "sed 2q"
+assert_pipe_form "sed -n with ;q"     "sed -n '1p;q'"
+assert_pipe_form "the read builtin"   "read -r line"
+assert_pipe_form "a negated pipeline" "! producer | grep -q 'needle'"
+assert_pipe_form "a line-continued pipeline" "grep -q 'continued across lines'"
+# A trailing | continues the pipeline without a backslash (wv-29452e): the
+# scanner joined only backslashes, and such a pipeline flaked the pre-push gate.
+assert_pipe_form "a pipeline continued after a trailing |" "grep -q 'continued after a trailing pipe'"
+# Inside $( ): the substitution consumes the pipeline's status (x=$(w | grep -q P
+# && echo yes)); the scanner used to treat the whole $( ) as one opaque stage.
+assert_pipe_form "a pipeline inside a command substitution" "grep -q 'inside a substitution'"
+# A reader that is not the last stage still SIGPIPEs its writer (wv-7699b4): the
+# scanner judged only stages[-1], and test-core's `git log | grep -m1 | cut`
+# failed the rc.13 release aggregate with 141.
+assert_pipe_form "an early-exit reader mid-pipeline" "grep -m1 'mid-pipeline reader'"
+
+# Safe shapes must not be reported, and they are skipped because the rule does
+# not match them -- not by a list of exceptions.
+pipe_safe_out=$(python3 "$PIPE_SCANNER" "$PIPE_FIXTURE/safe.sh" 2>/dev/null || true)
+if grep -qF -- "safe.sh:" <<<"$pipe_safe_out"; then
+    fail "pipe scanner reports nothing for herestring, awk and consume-all readers"         "$(sed 's/^/    /' <<<"$pipe_safe_out")"
+else
+    pass "pipe scanner reports nothing for herestring, awk and consume-all readers"
+fi
+
+# Without pipefail the pipeline reports its last stage, so the bug cannot occur.
+pipe_nopf_out=$(python3 "$PIPE_SCANNER" "$PIPE_FIXTURE/nopipefail.sh" 2>/dev/null || true)
+if grep -qF -- "nopipefail.sh:" <<<"$pipe_nopf_out"; then
+    fail "pipe scanner skips files that do not set pipefail"         "$(sed 's/^/    /' <<<"$pipe_nopf_out")"
+else
+    pass "pipe scanner skips files that do not set pipefail"
+fi
+
+pipe_repo_out=$(python3 "$PIPE_SCANNER" "$REPO_ROOT/tests" "$REPO_ROOT/scripts" 2>/dev/null || true)
+pipe_repo_hits=$(grep -cE '^[^-].*:[0-9]+:' <<<"$pipe_repo_out" || true)
+if [ "${pipe_repo_hits:-0}" -eq 0 ]; then
+    pass "no early-exit pipeline under pipefail in tests or production shell"
+else
+    fail "no early-exit pipeline under pipefail in tests or production shell"         "$(grep -E '^[^-].*:[0-9]+:' <<<"$pipe_repo_out" | sed 's/^/    /')
+    capture first, then match on a herestring: grep -q PAT <<< \"\$value\""
+fi
+
+# The clean-repo claim above is only as wide as the files the walk selects: 1b's
+# guarantee, for this scanner. Inverting its suffix test dropped every
+# extensionless entry point (scripts/wv) and still read clean (wv-8fb6c6).
+PIPE_EXTLESS=$(mktemp -d)
+printf '#!/usr/bin/env bash\nset -o pipefail\nproducer | grep -q "extensionless"\n' > "$PIPE_EXTLESS/toolname"
+# A dotted name is decided by its suffix, even under a shell shebang.
+printf '#!/usr/bin/env bash\nset -o pipefail\nproducer | grep -q "dotted"\n' > "$PIPE_EXTLESS/helper.py"
+pipe_ext_out=$(python3 "$PIPE_SCANNER" "$PIPE_EXTLESS" 2>/dev/null || true)
+if grep -qF -- 'toolname:3:' <<<"$pipe_ext_out" && ! grep -qF -- 'helper.py' <<<"$pipe_ext_out"; then
+    pass "pipe scanner's walk reaches an extensionless shell file and skips other suffixes"
+else
+    fail "pipe scanner's walk reaches an extensionless shell file and skips other suffixes" \
+        "    scanned $PIPE_EXTLESS and reported: ${pipe_ext_out:-nothing}"
+fi
+rm -rf "$PIPE_EXTLESS"
+
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"
 if [ "$TESTS_FAILED" -gt 0 ]; then

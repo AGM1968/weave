@@ -152,7 +152,7 @@ for _l in $_call_lines; do
     [ -n "$_heredoc_end" ] && [ "$_l" -lt "$_heredoc_end" ] || true
 done
 # Calls before the heredoc's start are the installer's own; count those.
-_heredoc_start=$(grep -n 'wv-init-repo" << .INITEOF' "$INSTALL_SH" | head -1 | cut -d: -f1)
+_heredoc_start=$(grep -m1 -n 'wv-init-repo" << .INITEOF' "$INSTALL_SH" | cut -d: -f1)
 _own=0
 for _l in $_call_lines; do
     if [ -n "$_heredoc_start" ] && [ "$_l" -lt "$_heredoc_start" ]; then _own=$((_own + 1)); fi
@@ -173,6 +173,29 @@ if grep -q 'INSTALL_PROVENANCE' "$INSTALL_SH"; then
 else
     echo -e "  ${RED}✗${NC} install.sh records no install provenance — VERSION alone cannot say which fixes an install carries"
     TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# ── a sandboxed install must not rewrite the real repository's hooks ──────
+# The own-repo hook refresh finds .git/hooks from the working directory, so
+# suites that sandbox HOME and run install.sh from the repo root rewrote this
+# repository's live hooks mid-gate (wv-7f6c9d).
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qE '^[[:space:]]*if repo_hooks_refresh_allowed && ' "$INSTALL_SH"; then
+    echo -e "  ${GREEN}✓${NC} install.sh gates the own-repo hook refresh on repo_hooks_refresh_allowed"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "  ${RED}✗${NC} install.sh refreshes the current repo's .git/hooks without checking for a sandboxed HOME"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+eval "$(sed -n '/^repo_hooks_refresh_allowed() {/,/^}/p' "$INSTALL_SH")"
+mkdir -p "$TEST_DIR/fakehome"
+_allowed() { if ( HOME="$1" repo_hooks_refresh_allowed ) 2>/dev/null; then echo yes; else echo no; fi; }
+assert_equals "no" "$(_allowed "$TEST_DIR/fakehome")" "repo_hooks_refresh_allowed: a sandboxed HOME may not touch the repo's hooks"
+_real_home=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)
+if [ -n "$_real_home" ] && [ -d "$_real_home" ]; then
+    assert_equals "yes" "$(_allowed "$_real_home")" "repo_hooks_refresh_allowed: the account's real HOME may"
+    ln -s "$_real_home" "$TEST_DIR/homelink"
+    assert_equals "yes" "$(_allowed "$TEST_DIR/homelink")" "repo_hooks_refresh_allowed: a symlink to the real HOME may"
 fi
 
 echo ""

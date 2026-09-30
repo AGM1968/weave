@@ -308,6 +308,18 @@
         "invalidate": false,
         "serve": false
       },
+      "evidence_class": "administrative",
+      "mutation_targets": [
+        "repo_state",
+        "working_tree"
+      ],
+      "operation": "context-policy"
+    },
+    {
+      "cache": {
+        "invalidate": false,
+        "serve": false
+      },
       "evidence_class": "mutation_attempt",
       "mutation_targets": [
         "repo_state"

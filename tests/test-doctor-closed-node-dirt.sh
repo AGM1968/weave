@@ -82,7 +82,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${GREEN}[PASS]${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -96,7 +96,7 @@ assert_not_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${RED}[FAIL]${NC} $message (unexpected '$needle' in output)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     else
@@ -119,7 +119,7 @@ test_active_node_explains_dirt_passes() {
     echo "-- dirt matches a CURRENTLY ACTIVE node's touched_files -> doctor PASS"
     local id
     id=$("$WV" add "active owner" --status=active --force --criteria="c" --risks=low \
-        --metadata='{"touched_files":["own.txt"]}' 2>&1 | grep -oE 'wv-[0-9a-f]+' | head -1)
+        --metadata='{"touched_files":["own.txt"]}' 2>&1 | grep -oE 'wv-[0-9a-f]+' | sed -n 1p)
     echo "work in progress" > own.txt
     local out
     out=$("$WV" doctor 2>&1 || true)
@@ -132,7 +132,7 @@ test_done_node_match_warns_with_attribution() {
     echo "-- dirt matches a DONE node's touched_files, no active match -> doctor WARN with attribution"
     local id
     id=$("$WV" add "closed owner" --status=active --force --criteria="c" --risks=low \
-        --metadata='{"touched_files":["leftover.txt"]}' 2>&1 | grep -oE 'wv-[0-9a-f]+' | head -1)
+        --metadata='{"touched_files":["leftover.txt"]}' 2>&1 | grep -oE 'wv-[0-9a-f]+' | sed -n 1p)
     echo "seed" > seed.txt
     git add seed.txt
     git commit -q -m "feat: seed" -m "Weave-ID: $id"
@@ -159,10 +159,10 @@ test_mixed_dirt_does_not_false_pass() {
     # must not mask a second, unexplained dirty file.
     local active_id
     active_id=$("$WV" add "active partial owner" --status=active --force --criteria="c" --risks=low \
-        --metadata='{"touched_files":["active.txt"]}' 2>&1 | grep -oE 'wv-[0-9a-f]+' | head -1)
+        --metadata='{"touched_files":["active.txt"]}' 2>&1 | grep -oE 'wv-[0-9a-f]+' | sed -n 1p)
     local done_id
     done_id=$("$WV" add "closed partial owner" --status=active --force --criteria="c" --risks=low \
-        --metadata='{"touched_files":["leftover.txt"]}' 2>&1 | grep -oE 'wv-[0-9a-f]+' | head -1)
+        --metadata='{"touched_files":["leftover.txt"]}' 2>&1 | grep -oE 'wv-[0-9a-f]+' | sed -n 1p)
     echo "seed" > seed.txt
     git add seed.txt
     git commit -q -m "feat: seed" -m "Weave-ID: $done_id"
@@ -181,7 +181,7 @@ test_substring_owner_does_not_explain_longer_path() {
     echo "-- exact-path match only: a node owning \"foo\" must not explain dirt on \"foo.txt\""
     local id
     id=$("$WV" add "narrow owner" --status=active --force --criteria="c" --risks=low \
-        --metadata='{"touched_files":["foo"]}' 2>&1 | grep -oE 'wv-[0-9a-f]+' | head -1)
+        --metadata='{"touched_files":["foo"]}' 2>&1 | grep -oE 'wv-[0-9a-f]+' | sed -n 1p)
     echo "unrelated longer path" > foo.txt
     local out
     out=$("$WV" doctor 2>&1 || true)
@@ -199,6 +199,23 @@ test_json_mode_carries_the_same_advisory() {
     assert_contains "$out" '"status":"warn"' "doctor --json marks it warn"
 }
 
+test_staged_rename_attributes_the_old_path() {
+    echo "-- a staged rename away from a done node's file is still attributed to it (wv-b96ada)"
+    local id
+    id=$("$WV" add "renamed owner" --status=active --force --criteria="c" --risks=low \
+        --metadata='{"touched_files":["renamed-from.txt"]}' 2>&1 | grep -oE 'wv-[0-9a-f]+' | sed -n 1p)
+    echo "content" > renamed-from.txt
+    git add renamed-from.txt
+    git commit -q -m "feat: renamed-from" -m "Weave-ID: $id"
+    "$WV" done "$id" --verification-method=test --verification-evidence=pass --learning="decision: test" >/dev/null 2>&1 || true
+    # Staged rename: with rename detection on, 'git diff --cached --name-only'
+    # lists only renamed-to.txt and the done node's path drops out of view.
+    git mv renamed-from.txt renamed-to.txt
+    local out
+    out=$("$WV" doctor 2>&1 || true)
+    assert_contains "$out" "already-closed node(s)" "a staged rename away from a closed node's file is attributed to that node"
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
@@ -212,6 +229,7 @@ main() {
     setup_test_env; test_mixed_dirt_does_not_false_pass
     setup_test_env; test_substring_owner_does_not_explain_longer_path
     setup_test_env; test_json_mode_carries_the_same_advisory
+    setup_test_env; test_staged_rename_attributes_the_old_path
 
     echo ""
     echo "========================================"

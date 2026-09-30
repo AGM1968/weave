@@ -79,7 +79,7 @@ assert_contains() {
 
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -99,7 +99,7 @@ assert_not_contains() {
 
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    if ! echo "$haystack" | grep -qF -- "$needle"; then
+    if ! grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -800,6 +800,18 @@ EOF
     out=$("$WV" impact --suites --files=README.md 2>&1)
     assert_contains "$out" "test-default.sh" "suites: unmatched file falls to default (fail safe)"
 
+    # A changed suite runs itself even when a broader row covers tests/
+    # (wv-a8ab96). Only the suite's own exact row can redirect it, as for a
+    # suite another suite drives.
+    printf 'tests/ = tests/test-guard.sh\ntests/test-driven.sh = tests/test-driver.sh\n' \
+        >> "$TEST_DIR/.weave/test-map.conf"
+    out=$("$WV" impact --suites --files=tests/test-self.sh 2>&1)
+    assert_contains "$out" '"name":"tests/test-self.sh"' "suites: a test suite selects itself under a tests/ prefix row"
+    assert_contains "$out" "test-guard.sh" "suites: the tests/ prefix row still applies to the suite"
+    out=$("$WV" impact --suites --files=tests/test-driven.sh 2>&1)
+    assert_contains "$out" "test-driver.sh" "suites: a suite's own exact row is honoured"
+    assert_not_contains "$out" '"name":"tests/test-driven.sh"' "suites: a suite's own exact row can redirect it"
+
     # No conf at all + no default → empty (gate inert, surfaced by the hook).
     rm -f "$TEST_DIR/.weave/test-map.conf"
     out=$("$WV" impact --suites --files=src/whatever.go 2>&1)
@@ -893,7 +905,7 @@ test_discover() {
         "discover JSON: coaching is absent or a valid coaching-response envelope"
 
     coach_meta=$(printf '%s' '{"type":"finding","finding":{"violation_type":"code:swallowed-exception","root_cause":"r","proposed_fix":"f","policy":"advisory","guide":{"id":"swallowed-exception","language":"python","source":"package"},"quality":{"promotion_id":"cp-aaaa","occurrences":[{"anchor":{"path":"app.py","normalized_match":"except Exception: pass","normalized_context":"except Exception: pass"},"merged":false,"detectors":[{"rule_id":"bare-except-pass","finding_key":"qf-bbbb","disposition":"accepted_defect","scan_count":2}],"location":{"scan_id":1,"line":12}}]}}}')
-    coach_finding=$("$WV" add "Finding: code:swallowed-exception (1 occurrence)" --standalone --metadata="$coach_meta" --force 2>/dev/null | grep -o "wv-[0-9a-f]\{6\}" | head -1)
+    coach_finding=$("$WV" add "Finding: code:swallowed-exception (1 occurrence)" --standalone --metadata="$coach_meta" --force 2>/dev/null | grep -o "wv-[0-9a-f]\{6\}" | sed -n 1p)
     "$WV" link "$coach_finding" "$seed" --type=references >/dev/null 2>&1
     coached=$("$WV" discover "$seed" --json 2>/dev/null)
     assert_jq_true "$coached" '.coaching.format == "weave.coaching-response.v1" and (.coaching.blocks | length >= 1) and (.coaching.blocks[0].occurrence_count >= 1)' \

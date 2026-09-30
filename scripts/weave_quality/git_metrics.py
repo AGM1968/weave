@@ -11,7 +11,6 @@ Design decisions (from PROPOSAL-wv-quality.md):
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import subprocess
 from collections import Counter
@@ -31,10 +30,14 @@ _CO_CHANGE_MAX_COMMITS = 500
 
 
 def _git(args: list[str], cwd: str | Path) -> str:
-    """Run a git command, return stdout. Returns empty string on failure."""
+    """Run a git command, return stdout. Returns empty string on failure.
+
+    core.quotePath=false: every listing parsed here is keyed by path, and the
+    default C-quotes non-ASCII names into strings no file has (wv-99c85a).
+    """
     try:
         result = subprocess.run(
-            ["git"] + args,
+            ["git", "-c", "core.quotePath=false"] + args,
             cwd=str(cwd),
             capture_output=True,
             text=True,
@@ -68,12 +71,14 @@ def batch_blob_shas(repo: str | Path) -> dict[str, str]:
     - Empty repos (no HEAD): _git returns "", blob_map is empty.
     - Submodules: listed with type 'commit', won't match file paths.
     - Untracked files: not in ls-tree output, get("path", "") returns "".
+    - -z: without it core.quotePath C-quotes non-ASCII paths, keying them by a
+      name no file on disk has (wv-99c85a).
     """
-    out = _git(["ls-tree", "-r", "HEAD"], cwd=repo)
+    out = _git(["ls-tree", "-r", "-z", "HEAD"], cwd=repo)
     blob_map: dict[str, str] = {}
     if not out:
         return blob_map
-    for line in out.split("\n"):
+    for line in out.split("\0"):
         if "\t" not in line:
             continue
         meta, path = line.split("\t", 1)
@@ -83,16 +88,20 @@ def batch_blob_shas(repo: str | Path) -> dict[str, str]:
     return blob_map
 
 
-def _blob_sha_of_bytes(data: bytes) -> str:
-    """git's own object id for this content: sha1 of "blob <len>\\0" + bytes.
+def _worktree_blob_shas(repo: str | Path, rels: list[str]) -> dict[str, str]:
+    """git's own object ids for these working-tree files, via `git hash-object`.
 
-    Using git's exact formula rather than any convenient digest is what makes a
-    dirty-but-identical file hash equal to its HEAD blob, so reverting an edit
-    reads as unchanged instead of scheduling a scan forever.
+    git's id rather than any convenient digest is what makes a dirty file's key
+    equal its blob once committed, so the commit does not schedule a rescan.
+    hash-object applies the path's clean filters and eol conversion exactly as
+    `git add` would; the sha1 formula over raw bytes this replaced did not, and
+    diverged from HEAD for any repo with autocrlf or a filter (wv-99c85a).
+    Returns {} if git fails, so callers fall back to their mtime path.
     """
-    h = hashlib.sha1(b"blob %d\0" % len(data))  # noqa: S324 - object id, not a security hash
-    h.update(data)
-    return h.hexdigest()
+    if not rels:
+        return {}
+    shas = _git(["hash-object", "--", *rels], cwd=repo).split("\n")
+    return dict(zip(rels, shas)) if len(shas) == len(rels) else {}
 
 
 def working_tree_blob_shas(repo: str | Path) -> dict[str, str]:
@@ -114,19 +123,30 @@ def working_tree_blob_shas(repo: str | Path) -> dict[str, str]:
     mtime.
     """
     blob_map = batch_blob_shas(repo)
-    dirty = _git(["diff", "--name-only", "HEAD"], cwd=repo)
+    # -z: unquoted paths (core.quotePath would C-quote non-ASCII names, which
+    # then never match a real file). --no-renames: a renamed-away path must be
+    # listed so its stale HEAD SHA is dropped below (wv-a10e0f).
+    dirty = _git(["diff", "--name-only", "-z", "--no-renames", "HEAD"], cwd=repo)
     if not dirty:
         return blob_map
     root = Path(repo)
-    for rel in dirty.split("\n"):
-        rel = rel.strip()
+    present: list[str] = []
+    for rel in dirty.split("\0"):
         if not rel:
             continue
-        try:
-            blob_map[rel] = _blob_sha_of_bytes((root / rel).read_bytes())
-        except OSError:
+        if (root / rel).is_file():
+            present.append(rel)
+        else:
             # Deleted in the working tree: drop the stale HEAD SHA so the file
             # falls through to mtime rather than asserting committed content.
+            blob_map.pop(rel, None)
+    hashed = _worktree_blob_shas(repo, present)
+    for rel in present:
+        if rel in hashed:
+            blob_map[rel] = hashed[rel]
+        else:
+            # hash-object failed: never leave the HEAD SHA standing for a file
+            # known to differ from HEAD (wv-7fbfe1); fall through to mtime.
             blob_map.pop(rel, None)
     return blob_map
 

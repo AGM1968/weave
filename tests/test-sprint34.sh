@@ -98,13 +98,13 @@ strip_ansi() {
 assert_contains() {
     local haystack="$1" needle="$2" message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | strip_ansi | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$(strip_ansi <<< "$haystack")"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected to find: $needle"
-        echo "  In: $(echo "$haystack" | strip_ansi | head -5)"
+        echo "  In: $(echo "$haystack" | strip_ansi | sed -n '1,5p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
@@ -112,13 +112,13 @@ assert_contains() {
 assert_not_contains() {
     local haystack="$1" needle="$2" message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if ! echo "$haystack" | strip_ansi | grep -qF -- "$needle"; then
+    if ! grep -qF -- "$needle" <<< "$(strip_ansi <<< "$haystack")"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected NOT to find: $needle"
-        echo "  In: $(echo "$haystack" | strip_ansi | head -5)"
+        echo "  In: $(echo "$haystack" | strip_ansi | sed -n '1,5p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
@@ -562,6 +562,21 @@ test_duplicate_task_guards() {
     local quick_after
     quick_after=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE text='Task: document DISCOVERY_TOOLS constant';" 2>/dev/null)
     assert_equals "$quick_before" "$quick_after" "dedup: quick does not create duplicate node"
+
+    # wv-c2d02a: a reworded duplicate of an OPEN node. The previous rule ANDed
+    # the first five long words, so changing one ("command" -> "wrapper") hid
+    # it; the IDF-weighted overlap rule catches it. A real pair from the graph.
+    $WV add "feat(agent): add ship-agent non-interactive lifecycle command" >/dev/null 2>&1
+    $WV add "fix(install): prune stale skills from the config directory" >/dev/null 2>&1
+    local reworded_out reworded_count
+    reworded_out=$($WV add "Task: add ship-agent non-interactive lifecycle wrapper" 2>&1 || true)
+    assert_contains "$reworded_out" "Similar active nodes exist" "dedup: a reworded duplicate of an open node is caught"
+    reworded_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE text='Task: add ship-agent non-interactive lifecycle wrapper';" 2>/dev/null)
+    assert_equals "0" "$reworded_count" "dedup: the reworded duplicate is not created"
+    local distinct_count
+    $WV add "feat(query): typed metadata equality for booleans" >/dev/null 2>&1 || true
+    distinct_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE text='feat(query): typed metadata equality for booleans';" 2>/dev/null)
+    assert_equals "1" "$distinct_count" "dedup: distinct work sharing no rare words is not refused"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

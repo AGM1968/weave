@@ -385,6 +385,129 @@ _bootstrap_agent_info_json() {
         } | with_entries(select(.value != null))'
 }
 
+# ── Readiness (wv-814d33) ── Working on a broken framework makes no sense
+# (owner, 2026-09-24): make check red on main and a guard no route selected were
+# both found mid-commit, while bootstrap said nothing and health read 100/100.
+# Bootstrap is the step-0 surface every harness reads, so it now says whether
+# the framework is known green for HEAD and which open structural nodes come
+# first. Nothing runs here: the framework state is whatever `make check` last
+# recorded in the clone's git dir, which every agent sharing the clone sees.
+
+# _bootstrap_framework_json -> {state, commit, exit, at, target[, reason]} or
+# null. state: green | red | stale (recorded for another commit) | unverified
+# (passed with uncommitted changes) | unknown (checking repo, nothing recorded).
+# A repository whose Makefile does not record a result gets null, not noise.
+_bootstrap_framework_json() {
+    local top git_dir record head
+    top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo 'null'; return 0; }
+    git_dir=$(git -C "$top" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || { echo 'null'; return 0; }
+    record="$git_dir/weave-framework-check.json"
+    if [ ! -f "$record" ]; then
+        if grep -qs 'weave-framework-check' "$top/Makefile"; then
+            echo '{"state":"unknown","reason":"no make check result recorded in this clone"}'
+        else
+            echo 'null'
+        fi
+        return 0
+    fi
+    head=$(git -C "$top" rev-parse HEAD 2>/dev/null || echo "")
+    # The same code-tree hash the Makefile records (wv-92d7c1): HEAD's top-level
+    # tree without .weave/, so graph-only commits do not make a result stale.
+    # Records written before code_tree existed fall back to the commit.
+    local tree
+    tree=$(git -C "$top" ls-tree HEAD 2>/dev/null | awk -F'\t' '$2 != ".weave"' | git -C "$top" hash-object --stdin 2>/dev/null || echo "")
+    jq -c --arg head "$head" --arg tree "$tree" '
+        if (.exit | type) != "number" or (.commit | type) != "string" then
+            {state: "unknown", reason: "unreadable framework-check record"}
+        else
+            {commit, exit, at, target} + (
+                if (if (.code_tree // "") != "" then .code_tree != $tree else .commit != $head end) then {state: "stale"}
+                elif .exit != 0 then {state: "red"}
+                elif .dirty == true then {state: "unverified", reason: "passed with uncommitted changes"}
+                else {state: "green"} end)
+        end' "$record" 2>/dev/null ||
+        echo '{"state":"unknown","reason":"unreadable framework-check record"}'
+}
+
+# _bootstrap_structural_json -> [{id, text}] for open nodes marked
+# metadata.structural, oldest first. Structural work is fixed before feature work.
+_bootstrap_structural_json() {
+    local rows
+    rows=$(db_query_json "
+        SELECT id, substr(text, 1, 90) AS text FROM nodes
+        WHERE status != 'done'
+          AND json_extract(metadata, '\$.structural') IN (1, 'true')
+        ORDER BY created_at ASC;" 2>/dev/null)
+    echo "${rows:-[]}"
+}
+
+# _bootstrap_heavy_tier_json -> the push tier's state for the commits not yet
+# on the upstream (wv-862ac0), or null (no upstream, no [heavy] section):
+# {state, upstream, suites:[{suite, state}]}. A suite is green when the ledger
+# holds a green row for every unpushed file at its current content, red when a
+# row for that content failed, pending otherwise. state is the worst of them,
+# or clear when no heavy suite is owed. Nothing runs here; pre-push runs them.
+_bootstrap_heavy_tier_json() {
+    local top upstream files csv selected suite out st rows
+    top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo 'null'; return 0; }
+    grep -q '^\[heavy\]' "$WEAVE_DIR/test-map.conf" 2>/dev/null || { echo 'null'; return 0; }
+    upstream=$(git -C "$top" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) \
+        || { echo 'null'; return 0; }
+    # --no-renames, as pre-push lists the same range: a rename otherwise hid the
+    # old path, and this report said clear while pre-push owed its suites (wv-581bb0).
+    files=$(git -C "$top" log --format= --name-only --no-renames "$upstream..HEAD" 2>/dev/null | sort -u \
+        | wv_non_graph_state_paths)
+    if [ -z "$files" ]; then
+        jq -cn --arg u "$upstream" '{state: "clear", upstream: $u, suites: []}'
+        return 0
+    fi
+    csv=$(printf '%s\n' "$files" | paste -sd ',' -)
+    local file_args=()
+    mapfile -t file_args <<< "$files"
+    selected=$(_impact_suites_for_files "${file_args[@]}" 2>/dev/null \
+        | jq -r '.[] | select(.tier == "heavy") | .name' 2>/dev/null | sort)
+    out='[]'
+    while IFS= read -r suite; do
+        [ -n "$suite" ] || continue
+        rows=$(cmd_test_status "$suite" --files="$csv" 2>/dev/null | cut -f1)
+        if printf '%s\n' "$rows" | grep -qx red; then st=red
+        elif [ -n "$rows" ] && ! printf '%s\n' "$rows" | grep -qvx green; then st=green
+        else st=pending; fi
+        out=$(jq -c --arg s "$suite" --arg t "$st" '. + [{suite: $s, state: $t}]' <<< "$out")
+    done <<< "$selected"
+    jq -c --arg u "$upstream" '{upstream: $u, suites: .,
+        state: (if length == 0 then "clear"
+                elif any(.state == "red") then "red"
+                elif any(.state == "pending") then "pending"
+                else "green" end)}' <<< "$out"
+}
+
+# _bootstrap_readiness_advisories <framework_json> <structural_json>
+# [heavy_tier_json] -> a JSON array of advisory strings, framework first.
+_bootstrap_readiness_advisories() {
+    jq -cn --argjson fw "$1" --argjson st "$2" --argjson ht "${3:-null}" '
+        def short: (. // "") | .[0:9];
+        [
+            (if $fw == null then empty
+             elif $fw.state == "red" then
+                "framework red: \($fw.target // "make check") failed (exit \($fw.exit)) at HEAD \($fw.commit | short) - fix it before other work"
+             elif $fw.state == "stale" then
+                "framework unverified for HEAD: last \($fw.target // "make check") ran at \($fw.commit | short) and exited \($fw.exit) - run make check"
+             elif $fw.state == "unverified" then
+                "framework unverified: \($fw.target // "make check") passed at HEAD with uncommitted changes - commit or rerun"
+             elif $fw.state == "unknown" then
+                "framework unverified: \($fw.reason // "no result") - run make check"
+             else empty end),
+            ($st[] | "structural, fix first: \(.id) \(.text)"),
+            (if $ht == null then empty
+             elif $ht.state == "red" then
+                "heavy tier red for commits not on \($ht.upstream): \([$ht.suites[] | select(.state == "red") | .suite] | join(", ")) - the push will be refused; fix before other work"
+             elif $ht.state == "pending" then
+                "heavy tier pending for commits not on \($ht.upstream): \([$ht.suites[] | select(.state != "green") | .suite] | join(", ")) - git push runs them"
+             else empty end)
+        ]'
+}
+
 cmd_bootstrap() {
     local format="json"
     local learnings_limit=5
@@ -522,6 +645,14 @@ cmd_bootstrap() {
         concurrent_advisory=$(_wv_concurrent_session "$_cs_root" 2>/dev/null || echo "")
     fi
 
+    # ── Readiness (wv-814d33) ── first in advisories: fix the framework first.
+    local framework_json structural_json heavy_json readiness_advisories
+    framework_json=$(_bootstrap_framework_json)
+    structural_json=$(_bootstrap_structural_json)
+    heavy_json=$(_bootstrap_heavy_tier_json 2>/dev/null) || heavy_json='null'
+    [ -n "$heavy_json" ] || heavy_json='null'
+    readiness_advisories=$(_bootstrap_readiness_advisories "$framework_json" "$structural_json" "$heavy_json" 2>/dev/null || echo '[]')
+
     # ── Compose final JSON ──
     jq -n \
         --argjson status "$status_json" \
@@ -533,11 +664,16 @@ cmd_bootstrap() {
         --arg drift "$drift_advisory" \
         --arg quality "$quality_advisory" \
         --arg concurrent "$concurrent_advisory" \
+        --argjson framework "$framework_json" \
+        --argjson structural "$structural_json" \
+        --argjson readiness_adv "$readiness_advisories" \
+        --argjson heavy_tier "$heavy_json" \
         '{
             status: $status,
+            readiness: {framework: $framework, structural: $structural, heavy_tier: $heavy_tier, advisories: $readiness_adv},
             active_node: $active_node,
             context: $context,
-            advisories: ([$drift, $quality, $concurrent] | map(select(. != ""))),
+            advisories: ($readiness_adv + ([$drift, $quality, $concurrent] | map(select(. != "")))),
             ready: ($ready | map({id, text})),
             learnings: ($learnings | map(
                 (if .metadata and (.metadata | type) == "string"
@@ -1185,12 +1321,12 @@ score_learning() {
     # +2: Has categorized structure — either typed fields present or prefix in raw learning
     local has_typed
     has_typed=$(echo "$meta" | jq -r 'if (.decision != null or .pattern != null or .pitfall != null) then "yes" else "no" end' 2>/dev/null)
-    if [ "$has_typed" = "yes" ] || echo "$all_text" | grep -qiE '(pattern:|pitfall:|decision:|technique:)'; then
+    if [ "$has_typed" = "yes" ] || grep -qiE '(pattern:|pitfall:|decision:|technique:)' <<< "$all_text"; then
         score=$((score + 2))
     fi
 
     # +1: References a specific file or function (contains . or / or ())
-    if echo "$all_text" | grep -qE '(\.[a-z]{1,4}\b|/[a-z]|[a-z_]+\(\))'; then
+    if grep -qE '(\.[a-z]{1,4}\b|/[a-z]|[a-z_]+\(\))' <<< "$all_text"; then
         score=$((score + 1))
     fi
 
@@ -1374,7 +1510,8 @@ _hygiene_score() {
     # Component 4: call discipline = inverse of broad-call count from budget-tally.
     # Threshold matches WV_BUDGET_THRESHOLD default (20). Each call beyond it
     # costs 1 point; floored at 0 for runaway sessions.
-    local budget_file="$WV_HOT_ZONE/session-budget.json"
+    local budget_file
+    budget_file=$(wv_session_budget_file "$WV_HOT_ZONE")
     _h_wv_calls=0
     [ -f "$budget_file" ] && _h_wv_calls=$(jq -r '.calls // 0' "$budget_file" 2>/dev/null || echo 0)
     local threshold="${WV_BUDGET_THRESHOLD:-20}"
@@ -1594,7 +1731,23 @@ _detect_git_pending() {
           weave_dirty:$weave_dirty, outside_dirty:$outside_dirty}'
 }
 
+# cmd_recover — the recover operation's one exit for policy evidence. Only a
+# ship journal stuck at its close step can raise the fabrication question, and
+# _recover_ship records its own verdict there; every other outcome recovered
+# no close, which the rule records as its allow so the call can be countable
+# (wv-15422b).
 cmd_recover() {
+    _WV_RECOVER_CLOSE_DECIDED=false
+    local rc=0
+    _recover_run "$@" || rc=$?
+    # Only the recover operation records it: init runs recovery as a side
+    # effect of rehydrating, where this rule is not the call's to decide.
+    [ "$_WV_RECOVER_CLOSE_DECIDED" = true ] || [ "${_WV_ATTEMPT_OPERATION:-recover}" != "recover" ] ||
+        wv_policy_verdict recovery_never_fabricates_closure allow no "" "no close was recovered"
+    return "$rc"
+}
+
+_recover_run() {
     local json_mode=false
     local auto_mode=false
     local session_mode=false
@@ -1892,9 +2045,14 @@ _recover_ship() {
             ;;
         done)
             if [ "$recover_status" != "done" ] || [ "$recover_marker" != "1" ] || [ "$recover_mode" != "post_close" ]; then
+                _WV_RECOVER_CLOSE_DECIDED=true
+                wv_policy_verdict recovery_never_fabricates_closure deny yes "" \
+                    "the close was never durably recorded, so recovery would invent it"
                 echo -e "${RED}Error: close was not durably completed; refusing to manufacture closure ($recover_status/$recover_mode)${NC}" >&2
                 return 1
             fi
+            _WV_RECOVER_CLOSE_DECIDED=true
+            wv_policy_verdict recovery_never_fabricates_closure allow no "" "the close was durably recorded"
             echo "  Recovery: close completed atomically; re-run sync"
             local _recover_prev_skip_sync_commit="${_WV_SKIP_SYNC_COMMIT:-}"
             local _recover_prev_skip_sync_commit_set="${_WV_SKIP_SYNC_COMMIT+x}"
@@ -2256,12 +2414,12 @@ _doctor_install_provenance() {
     # provenance from there describes the working tree rather than any installed
     # copy. Hardcoding the default was wrong for a relocated install; using it
     # blindly is wrong in dev mode. Distinguish the two.
-    local _prov_dir="${WV_LIB_DIR:-${HOME}/.local/lib/weave}"
-    if [ -f "$_prov_dir/wv" ] || [ -f "$_prov_dir/../scripts/wv" ]; then
-        _prov_dir="${HOME}/.local/lib/weave"
-    fi
-    local prov="$_prov_dir/lib/INSTALL_PROVENANCE"
-    if [ ! -f "$prov" ]; then
+    # Resolution lives in wv_install_provenance_file (wv-config.sh) so doctor and
+    # wv --version can never describe different installs; the reasoning above is
+    # kept there with it.
+    local prov
+    prov=$(wv_install_provenance_file 2>/dev/null || true)
+    if [ -z "$prov" ] || [ ! -f "$prov" ]; then
         _doctor_record "install provenance" "warn" \
             "not recorded — re-run ./install.sh so this install can report which commit it came from"
         return 0
@@ -2385,23 +2543,66 @@ _doctor_record() {
     fi
 }
 
-# _doctor_check_modules — Check a directory for expected module files
-_doctor_check_modules() {
-    local label="$1" dir="$2" expected="$3"
-    local found=0 missing=""
-    for mod in $expected; do
-        if [ -f "$dir/$mod" ]; then
+# _doctor_entry_script — the wv script this process runs.
+_doctor_entry_script() {
+    if [ -f "$0" ]; then echo "$0"; else echo "${SCRIPT_DIR:-.}/wv"; fi
+}
+
+# _doctor_check_lib_refs <label> — every library a component names must exist.
+# The required set is read from the code, not typed: each wv-*.sh / wv-*.py
+# named outside a comment in the entry script, the libraries, the command
+# modules and the git-hook sources, less command modules (checked below by
+# what they define) and names whose parent path component is a hooks directory
+# however spelled (hooks/, $_hooks_dir/, ${HOOKS_DIR}/): hook files, not
+# libraries. $HOOK_DIR/../lib/wv-x.sh keeps lib/ as its parent and counts.
+# A new library is required the moment something loads it; a typed list had to
+# be remembered and was not (wv-587469).
+_doctor_check_lib_refs() {
+    local label="$1" entry refs r found=0 total=0 missing=""
+    entry=$(_doctor_entry_script)
+    refs=$(for f in "$entry" "$WV_LIB_DIR"/lib/*.sh "$WV_LIB_DIR"/cmd/*.sh "$WV_LIB_DIR"/hooks/*.sh; do
+               [ -f "$f" ] && grep -v '^[[:space:]]*#' "$f"
+           done 2>/dev/null | grep -oE '[^/[:space:]"'"'"']*/?wv-[a-z0-9-]+\.(sh|py)\b' \
+           | awk -F/ '{ parent = (NF > 1) ? tolower($(NF-1)) : ""
+                        name = $NF; sub(/^[^w]*/, "", name)
+                        if (parent !~ /hook/ && name ~ /^wv-/ && name !~ /^wv-cmd-/) print name }' | sort -u)
+    for r in $refs; do
+        total=$((total + 1))
+        if [ -f "$WV_LIB_DIR/lib/$r" ]; then
             found=$((found + 1))
         else
-            missing="${missing:+$missing, }$mod"
+            missing="${missing:+$missing, }$r"
         fi
     done
-    local total_expected
-    total_expected=$(echo "$expected" | wc -w | tr -d ' ')
-    if [ "$found" -eq "$total_expected" ]; then
-        _doctor_record "$label" "pass" "$found/$total_expected"
+    if [ -n "$missing" ]; then
+        _doctor_record "$label" "fail" "$found/$total referenced libraries present (missing: $missing)"
     else
-        _doctor_record "$label" "fail" "$found/$total_expected (missing: $missing)"
+        _doctor_record "$label" "pass" "$found/$total referenced libraries present"
+    fi
+}
+
+# _doctor_check_cmd_defs <label> — every cmd_* the dispatcher calls must be
+# defined by some module. With command modules loaded on first use, a missing
+# module shows only as its commands failing, so this is the check that names
+# it. Assignments and expansions (local cmd_func=..., $cmd_func) are not calls.
+_doctor_check_cmd_defs() {
+    local label="$1" entry calls c found=0 total=0 missing=""
+    entry=$(_doctor_entry_script)
+    calls=$(grep -v '^[[:space:]]*#' "$entry" 2>/dev/null \
+        | grep -oE '(^|[^$a-zA-Z0-9_{])cmd_[a-z0-9_]+[=]?' | grep -v '=$' \
+        | grep -oE 'cmd_[a-z0-9_]+' | sort -u)
+    for c in $calls; do
+        total=$((total + 1))
+        if grep -qE -- "^$c\(\)" "$entry" "$WV_LIB_DIR"/cmd/*.sh "$WV_LIB_DIR"/lib/*.sh 2>/dev/null; then
+            found=$((found + 1))
+        else
+            missing="${missing:+$missing, }$c"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        _doctor_record "$label" "fail" "$found/$total dispatched commands defined (undefined: $missing)"
+    else
+        _doctor_record "$label" "pass" "$found/$total dispatched commands defined"
     fi
 }
 
@@ -2465,9 +2666,9 @@ _doctor_check_codex_mcp() {
     has_lite=false
     has_inspect=false
     has_full=false
-    printf '%s\n' "$mcp_list" | grep -q '^weave-lite[[:space:]]' && has_lite=true
-    printf '%s\n' "$mcp_list" | grep -q '^weave-inspect[[:space:]]' && has_inspect=true
-    printf '%s\n' "$mcp_list" | grep -q '^weave[[:space:]]' && has_full=true
+    grep -q '^weave-lite[[:space:]]' <<< "$mcp_list" && has_lite=true
+    grep -q '^weave-inspect[[:space:]]' <<< "$mcp_list" && has_inspect=true
+    grep -q '^weave[[:space:]]' <<< "$mcp_list" && has_full=true
 
     if [ "$has_full" = true ] && { [ "$has_lite" = true ] || [ "$has_inspect" = true ]; }; then
         _doctor_record "codex mcp" "warn" "stale full weave MCP still registered alongside lite/inspect; remove it with: codex mcp remove weave"
@@ -2521,6 +2722,106 @@ _doctor_check_codex_hooks() {
     fi
 
     _doctor_record "codex hooks" "warn" ".codex/hooks.json covers SessionStart/PreToolUse/PostToolUse/Stop -- pending trust; review and trust with /hooks in Codex before it enforces"
+}
+
+# cmd_context_policy [--json] [--refresh] — the context load policy (HIGH/MEDIUM/
+# LOW) from repository size signals: the one computation every harness reads
+# (wv-f757a4). It lived only in the Claude SessionStart hook, whose script MCP
+# ran under a 5s timeout behind a ~55s wv load and whose agent-mode output never
+# carried the line MCP parsed, so MCP clients never saw it. Reads no graph and
+# runs no load. Cached for an hour in .weave/.context_policy (POLICY_CACHE
+# overrides, for tests); keeps the .weave/runtime.md block current.
+_context_policy_decide() {
+    local root="$1" nodes_file="$2" policy="MEDIUM" large_files jsonl_lines total_files
+    local -a reasons=()
+    large_files=$(cd "$root" && git ls-files -z '*.py' '*.ts' '*.js' '*.go' 2>/dev/null \
+        | xargs -0 -r stat -c %s 2>/dev/null | awk '$1 > 51200 {c++} END {print c+0}')
+    if [ "${large_files:-0}" -gt 10 ]; then
+        policy="LOW"; reasons+=("many large source files detected")
+    fi
+    if [ -f "$nodes_file" ]; then
+        jsonl_lines=$(wc -l < "$nodes_file" 2>/dev/null || echo 0)
+        if [ "$jsonl_lines" -gt 100 ]; then
+            policy="LOW"; reasons+=("large Weave history ($jsonl_lines nodes)")
+        fi
+    fi
+    total_files=$(git -C "$root" ls-files '*.py' '*.ts' '*.js' 2>/dev/null | wc -l)
+    if [ "$total_files" -gt 500 ] && [ "$policy" = "MEDIUM" ]; then
+        reasons+=("large codebase ($total_files source files)")
+    fi
+    if [ ${#reasons[@]} -eq 0 ]; then
+        policy="HIGH"; reasons+=("small/fresh workspace")
+    fi
+    printf '%s\n' "$policy" "${reasons[@]}"
+}
+
+_context_policy_runtime_md() {
+    local runtime_md="$1" policy="$2" begin="<!-- BEGIN WEAVE RUNTIME CONTEXT -->"
+    local end="<!-- END WEAVE RUNTIME CONTEXT -->" block tmp
+    [ -f "$runtime_md" ] || return 0
+    block="${begin}
+Current context policy: ${policy}
+Policy source: .weave/.context_policy
+This file is loaded into weave-runtime system prompts. Keep repo-specific instructions below this block.
+${end}"
+    tmp=$(mktemp) || return 0
+    if grep -qF -- "$begin" "$runtime_md"; then
+        awk -v begin="$begin" -v end="$end" -v block="$block" '
+            $0 == begin { print block; skip=1; next }
+            skip && $0 == end { skip=0; next }
+            skip { next }
+            { print }
+        ' "$runtime_md" > "$tmp"
+    else
+        { printf '%s\n\n' "$block"; cat "$runtime_md"; } > "$tmp"
+    fi
+    if cmp -s "$tmp" "$runtime_md"; then rm -f "$tmp"; else mv "$tmp" "$runtime_md"; fi
+}
+
+cmd_context_policy() {
+    local json=false refresh=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) json=true ;;
+            --refresh) refresh=true ;;
+            *) echo "wv context-policy: unknown argument: $1" >&2; return 2 ;;
+        esac
+        shift
+    done
+
+    local root weave_dir cache default_cache cached=false policy decided age
+    local -a reasons=()
+    root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    weave_dir="$root/.weave"
+    default_cache="$weave_dir/.context_policy"
+    cache="${POLICY_CACHE:-$default_cache}"
+
+    age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+    if [ "$refresh" = false ] && [ -s "$cache" ] && [ "$age" -lt 3600 ]; then
+        policy=$(head -1 "$cache")
+        mapfile -t reasons < <(tail -n +2 "$cache")
+        cached=true
+    else
+        decided=$(_context_policy_decide "$root" "$weave_dir/nodes.jsonl")
+        policy=$(head -1 <<< "$decided")
+        mapfile -t reasons < <(tail -n +2 <<< "$decided")
+        # An uninitialised repository gets no .weave/ created for a cache.
+        if [ "$cache" != "$default_cache" ] || [ -d "$weave_dir" ]; then
+            mkdir -p "$(dirname "$cache")" 2>/dev/null \
+                && printf '%s\n' "$policy" "${reasons[@]}" > "$cache" 2>/dev/null || true
+        fi
+    fi
+    _context_policy_runtime_md "$weave_dir/runtime.md" "$policy"
+
+    if [ "$json" = true ]; then
+        jq -n --arg policy "$policy" --argjson cached "$cached" \
+            '{policy: $policy, reasons: $ARGS.positional, cached: $cached, source: ".weave/.context_policy"}' \
+            --args "${reasons[@]}"
+    else
+        echo "policy: $policy"
+        [ ${#reasons[@]} -gt 0 ] && echo "reason: ${reasons[0]}"
+    fi
+    return 0
 }
 
 cmd_hotzone() {
@@ -3054,6 +3355,15 @@ _suite_log_path() {
     echo "${WV_SUITE_LOG:-${WV_SUITE_LOG_DEFAULT:-$HOME/.local/share/weave/suite_runs.jsonl}}"
 }
 
+# _durable_log_writable: false for a test run (WV_CALL_SOURCE=test) that has not
+# pointed the logs somewhere of its own. Suites that drive the commit hooks in
+# throwaway repos were appending their runs to the user's durable history
+# (repo "project" rows since May, and gate rows once wv-ffda33 added them).
+# Writers only: readers such as wv analyze still read whatever path is set.
+_durable_log_writable() {
+    [ "${WV_CALL_SOURCE:-}" != "test" ] || [ -n "${WV_SUITE_LOG:-}" ] || [ -n "${WV_GATE_LOG:-}" ]
+}
+
 # _suite_log_append <suite> <files_csv> <exit> <duration_ms> <sha>
 # One JSONL line per suite RUN (not per file). Best-effort: a logging failure must
 # never break a commit hook. jq -cn guarantees valid JSON + escaping, so a path
@@ -3061,7 +3371,8 @@ _suite_log_path() {
 # repo-relative paths + outcome metadata — never file content, env, or secrets —
 # and `repo` is a basename so no absolute $HOME/username path leaks (no PII).
 _suite_log_append() {
-    local suite="$1" files="$2" exit_code="$3" duration_ms="$4" sha="$5"
+    local suite="$1" files="$2" exit_code="$3" duration_ms="$4" sha="$5" estimate_ms="${6:-}"
+    _durable_log_writable || return 0
     local log_path; log_path=$(_suite_log_path)
     [ -n "$log_path" ] || return 0
     mkdir -p "$(dirname "$log_path")" 2>/dev/null || return 0
@@ -3069,8 +3380,11 @@ _suite_log_append() {
     # anyway so a stray value can never make --argjson abort the whole line.
     case "$exit_code" in ''|*[!0-9]*) exit_code=0 ;; esac
     case "$duration_ms" in ''|*[!0-9]*) duration_ms=0 ;; esac
+    case "$estimate_ms" in ''|*[!0-9]*) estimate_ms=null ;; esac
     local repo=""
     [ -n "${REPO_ROOT:-}" ] && repo=$(basename "$REPO_ROOT")
+    # phase/gate_id (wv-ffda33) come from the gate that ran the suite, so one
+    # gate's runs can be grouped exactly instead of guessed from a shared sha.
     jq -cn \
         --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --arg repo "$repo" \
@@ -3079,7 +3393,43 @@ _suite_log_append() {
         --argjson exit "$exit_code" \
         --argjson duration_ms "$duration_ms" \
         --arg sha "$sha" \
-        '{ts:$ts, repo:$repo, suite:$suite, files:$files, exit:$exit, duration_ms:$duration_ms, sha:$sha}' \
+        --arg phase "${WV_GATE_PHASE:-}" \
+        --arg gate_id "${WV_GATE_ID:-}" \
+        --argjson estimate_ms "$estimate_ms" \
+        '{ts:$ts, repo:$repo, suite:$suite, files:$files, exit:$exit, duration_ms:$duration_ms, sha:$sha}
+         + (if $phase != "" then {phase:$phase} else {} end)
+         + (if $gate_id != "" then {gate_id:$gate_id} else {} end)
+         + (if $estimate_ms != null then {estimate_ms:$estimate_ms} else {} end)' \
+        >> "$log_path" 2>/dev/null || true
+}
+
+# _gate_log_path: the per-gate log sits beside the suite log, so every isolation
+# that redirects WV_SUITE_LOG (tests set it) redirects this too (wv-ffda33).
+_gate_log_path() {
+    local suite_log; suite_log=$(_suite_log_path)
+    echo "${WV_GATE_LOG:-$(dirname "$suite_log")/gate_runs.jsonl}"
+}
+
+# _gate_log_append <phase> <gate_id> <exit> <duration_ms> <estimate_ms> <suites_csv> <sha>
+# One JSONL line per gate INVOCATION: its wall time, what it ran, what it
+# expected to take, and how it ended. Best-effort like the suite log.
+_gate_log_append() {
+    local phase="$1" gate_id="$2" exit_code="$3" duration_ms="$4" estimate_ms="$5" suites="$6" sha="$7"
+    _durable_log_writable || return 0
+    local log_path; log_path=$(_gate_log_path)
+    mkdir -p "$(dirname "$log_path")" 2>/dev/null || return 0
+    case "$exit_code" in ''|*[!0-9]*) exit_code=1 ;; esac
+    case "$duration_ms" in ''|*[!0-9]*) duration_ms=0 ;; esac
+    case "$estimate_ms" in ''|*[!0-9]*) estimate_ms=null ;; esac
+    local repo=""
+    [ -n "${REPO_ROOT:-}" ] && repo=$(basename "$REPO_ROOT")
+    jq -cn \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg repo "$repo" --arg phase "$phase" --arg gate_id "$gate_id" \
+        --argjson exit "$exit_code" --argjson duration_ms "$duration_ms" \
+        --argjson estimate_ms "$estimate_ms" --arg suites "$suites" --arg sha "$sha" \
+        '{ts:$ts, repo:$repo, phase:$phase, gate_id:$gate_id, exit:$exit, duration_ms:$duration_ms,
+          estimate_ms:$estimate_ms, suites:($suites | split(",") | map(select(. != ""))), sha:$sha}' \
         >> "$log_path" 2>/dev/null || true
 }
 
@@ -3099,7 +3449,8 @@ _suite_log_append() {
 cmd_test_record() {
     local suite="${1:-}"
     shift || true
-    local files="" exit_code="0" commit_sha="" duration_ms="0"
+    local files="" exit_code="0" commit_sha="" duration_ms="0" estimate_ms=""
+    local gate_mode=false gate_phase="${WV_GATE_PHASE:-}" gate_id="${WV_GATE_ID:-}" gate_suites=""
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -3107,13 +3458,28 @@ cmd_test_record() {
             --exit=*)     exit_code="${arg#--exit=}" ;;
             --commit=*)   commit_sha="${arg#--commit=}" ;;
             --duration=*) duration_ms="${arg#--duration=}" ;;
+            --estimate=*) estimate_ms="${arg#--estimate=}" ;;
+            --gate)       gate_mode=true ;;
+            --phase=*)    gate_phase="${arg#--phase=}" ;;
+            --gate-id=*)  gate_id="${arg#--gate-id=}" ;;
+            --suites=*)   gate_suites="${arg#--suites=}" ;;
             *) ;;
         esac
     done
 
     if [ -z "$suite" ]; then
-        echo "Usage: wv test-record <suite> [--files=a,b] [--exit=N] [--commit=SHA] [--duration=MS]" >&2
+        echo "Usage: wv test-record <suite> [--files=a,b] [--exit=N] [--commit=SHA] [--duration=MS] [--estimate=MS]" >&2
+        echo "       wv test-record gate --gate --phase=P --gate-id=ID --exit=N --duration=MS [--estimate=MS] [--suites=a,b]" >&2
         return 1
+    fi
+
+    # --gate records one gate invocation in the gate log and nothing else: a gate
+    # is not a suite, so it must not add a ledger row or a suite-log line.
+    if [ "$gate_mode" = true ]; then
+        [ -z "$commit_sha" ] && commit_sha=$(git rev-parse --short HEAD 2>/dev/null || echo "")
+        _gate_log_append "${gate_phase:-manual}" "$gate_id" "$exit_code" "$duration_ms" \
+            "$estimate_ms" "$gate_suites" "$commit_sha"
+        return 0
     fi
 
     # Coerce a non-numeric exit code to 1 (treat as failure) rather than corrupt the row.
@@ -3133,7 +3499,7 @@ cmd_test_record() {
 
     # Durable history: one append-only JSONL line per run, survives wv load (LL2).
     # The tmpfs upserts below remain the gate's current-state view.
-    _suite_log_append "$suite" "$files" "$exit_code" "$duration_ms" "$commit_sha"
+    _suite_log_append "$suite" "$files" "$exit_code" "$duration_ms" "$commit_sha" "$estimate_ms"
 
     if [ -z "$files" ]; then
         # Whole-suite run with no file set: one sentinel row keyed on HEAD.
@@ -3266,6 +3632,72 @@ _doctor_check_hot_zone_orphans() {
     fi
 }
 
+# _doctor_check_hot_zone_shadow — warn when this repo has a brain.db under a
+# placement root it does not resolve to (wv-854b4a). Placement follows the
+# runtime class (is_sandboxed_runtime), not the agent, so a second DB for the
+# same repo hash is another runtime class's zone or debris. An empty one is what
+# sqlite3 leaves after opening a guessed path; on 2026-09-25 that read as a
+# split brain. Reports only: placement is not changed here.
+# Args: live hot_zone path. WV_DOCTOR_PLACEMENT_ROOTS overrides the roots (tests).
+_doctor_check_hot_zone_shadow() {
+    local hot_zone="$1" repo_root repo_hash uid root cand found=0
+    repo_root="${WV_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+    [ -n "$repo_root" ] || return 0
+    repo_hash=$(echo "$repo_root" | md5sum | cut -c1-8)
+    uid=$(id -u 2>/dev/null || echo "$UID")
+    for root in ${WV_DOCTOR_PLACEMENT_ROOTS:-/tmp/weave-codex-${uid} /dev/shm/weave /tmp/weave-${uid}}; do
+        [ "$root/$repo_hash" = "$hot_zone" ] && continue
+        cand="$root/$repo_hash/brain.db"
+        [ -f "$cand" ] || continue
+        found=1
+        if [ ! -s "$cand" ]; then
+            _doctor_record "hot-zone shadow" "warn" \
+                "empty $cand (left by opening a guessed path); remove it. Live DB: $hot_zone/brain.db (wv hotzone db)"
+        else
+            _doctor_record "hot-zone shadow" "warn" \
+                "second brain.db for this repo at $cand; live DB is $hot_zone/brain.db (wv hotzone db). Another runtime class uses it or left it: placement follows is_sandboxed_runtime"
+        fi
+    done
+    [ "$found" -eq 0 ] && _doctor_record "hot-zone shadow" "pass" "no brain.db for this repo outside $hot_zone"
+    return 0
+}
+
+# _doctor_check_delta_v2_catalog — fail when a committed Delta v2 op carries a
+# hard disposition (wv-99c85a). wv load rolls the WHOLE v2 batch back on the
+# first one and, unless WV_DELTA_V2_STRICT=1, only warns and falls back to v1,
+# so one bad op silently disables v2 replay on every clone on every load. The
+# static pass (wv-delta-v2-replay.py --check) needs no database.
+_doctor_check_delta_v2_catalog() {
+    [ -n "${WEAVE_DIR:-}" ] && [ -d "$WEAVE_DIR/deltas" ] || return 0
+    local -a ops=()
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] && ops+=("$line")
+    done < <(find "$WEAVE_DIR/deltas" -path '*/v2/*.json' -type f 2>/dev/null)
+    [ "${#ops[@]}" -gt 0 ] || return 0
+
+    local replay_py="${WV_LIB_DIR:-$SCRIPT_DIR}/lib/wv-delta-v2-replay.py"
+    [ -f "$replay_py" ] || replay_py="$SCRIPT_DIR/lib/wv-delta-v2-replay.py"
+    if [ ! -f "$replay_py" ]; then
+        _doctor_record "delta v2 catalog" "warn" "replay evaluator not found; ${#ops[@]} op(s) unchecked"
+        return 0
+    fi
+    local out rc=0 verdict
+    out=$(python3 "$replay_py" --check "${ops[@]}" 2>/dev/null) || rc=$?
+    verdict=$(printf '%s' "$out" | jq -r '
+        if (.failures | length) == 0 then "ok"
+        else "\(.failures | length) of \(.checked) op(s) fail: \(.failures[0].path | split("/") | .[-1]) (\(.failures[0].disposition): \(.failures[0].reason))"
+        end' 2>/dev/null) || verdict=""
+    if [ "$rc" -eq 0 ] && [ "$verdict" = "ok" ]; then
+        _doctor_record "delta v2 catalog" "pass" "${#ops[@]} op(s) pass replay validation"
+    elif [ "$rc" -eq 2 ] && [ -n "$verdict" ]; then
+        _doctor_record "delta v2 catalog" "fail" \
+            "$verdict — wv load rolls back ALL v2 replay and falls back to v1 on every clone"
+    else
+        _doctor_record "delta v2 catalog" "warn" "replay --check could not run (rc=$rc)"
+    fi
+}
+
 # _doctor_check_install_drift — compare source scripts/ tree with installed ~/.local/lib/weave/.
 _doctor_check_install_drift() {
     local source_path_file="$HOME/.config/weave/source-path"
@@ -3353,6 +3785,13 @@ cmd_doctor() {
         shift
     done
 
+    # Only --repair writes repository scaffolding; say so rather than leave the
+    # ownership rule silent on every plain doctor (wv-15422b). Only the doctor
+    # operation records it: ship-agent runs doctor in-process as a readiness
+    # probe, where this rule is not the call's to decide.
+    if [ "$_dr_repair" != "true" ] && [ "${_WV_ATTEMPT_OPERATION:-doctor}" = "doctor" ]; then
+        wv_policy_verdict repository_write_requires_owned allow no "" "no repair requested, so nothing is written"
+    fi
     if [ "$_dr_repair" = "true" ]; then
         local _dr_repo_root _dr_persistent_root
         _dr_repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
@@ -3369,7 +3808,24 @@ cmd_doctor() {
 
     _dr_pass=0 _dr_fail=0 _dr_warn=0 _dr_total=0 _dr_results=""
 
+    # Match the cold-start contract of graph commands. A committed state.sql is
+    # the persistent authority after reboot or inside a fresh container; testing
+    # the absent cache instead made Doctor's result depend on whether another wv
+    # command happened to run first. Do not initialise an unconfigured repo here:
+    # hydration is limited to a real committed snapshot and the default DB path.
+    local _dr_hydration_failed=false
+    if command -v sqlite3 >/dev/null 2>&1 &&
+       [ -n "${WV_DB:-}" ] && [ ! -f "$WV_DB" ] &&
+       [ -z "${WV_DB_CUSTOM:-}" ] && [ -f "$WEAVE_DIR/state.sql" ]; then
+        db_ensure >/dev/null || _dr_hydration_failed=true
+    fi
+
     [ "$_dr_format" = "text" ] && echo "Weave Doctor — Installation Health"
+
+    if [ "$_dr_hydration_failed" = true ]; then
+        _doctor_record "database hydration" "fail" \
+            "could not restore the hot-zone database from .weave/state.sql"
+    fi
 
     # 1. sqlite3 present
     if command -v sqlite3 >/dev/null 2>&1; then
@@ -3461,6 +3917,8 @@ cmd_doctor() {
         fi
         # 8b. Orphan hot-zone count (dirs with no matching .repo_root owner)
         _doctor_check_hot_zone_orphans "$hot_zone"
+        # 8c. This repo's brain.db under a placement root it does not use
+        _doctor_check_hot_zone_shadow "$hot_zone"
     else
         _doctor_record "hot zone" "fail" "not found: $hot_zone"
     fi
@@ -3532,6 +3990,9 @@ cmd_doctor() {
             ;;
         esac
     fi
+
+    # 10a'. Delta v2 catalog integrity.
+    _doctor_check_delta_v2_catalog
 
     # 10b. FTS5 index integrity.
     #
@@ -3637,10 +4098,11 @@ cmd_doctor() {
     fi
 
     # 11-12. Module checks
-    _doctor_check_modules "lib modules" "$WV_LIB_DIR/lib" \
-        "wv-config.sh wv-db.sh wv-validate.sh wv-cache.sh wv-journal.sh wv-gh.sh wv-delta.sh wv-delta-catalog.sh wv-checkpoint-generation.sh wv-repository-class.sh wv-hook-common.sh wv-resolve-project.sh"
-    _doctor_check_modules "cmd modules" "$WV_LIB_DIR/cmd" \
-        "wv-cmd-core.sh wv-cmd-graph.sh wv-cmd-data.sh wv-cmd-ops.sh wv-cmd-quality.sh"
+    # Derived, not typed (wv-587469): the typed lists named 12 libraries and 5
+    # of the 10 command modules, so a missing findings/analyze/indexer/query/hook
+    # module, wv-gate-pool.sh or wv-checkpoint-ci.sh passed.
+    _doctor_check_lib_refs "lib modules"
+    _doctor_check_cmd_defs "cmd modules"
 
     # 12b. Hook-common wiring check (Sprint 1 pattern crystallization)
     local _doctor_hooks_total=0
@@ -3758,7 +4220,7 @@ cmd_doctor() {
             # check (e.g. a malformed local rule breaks patterns list
             # entirely, well before it would even reach shadow detection).
             _doctor_record "pattern-shadow" "warn" "could not evaluate managed-rule shadowing -- 'wv quality patterns list' failed (exit $_shadow_status); run it directly for detail"
-        elif echo "$_shadow_stderr" | grep -q "shadows an available"; then
+        elif grep -q "shadows an available" <<< "$_shadow_stderr"; then
             local _shadow_count
             _shadow_count=$(echo "$_shadow_stderr" | grep -c "shadows an available")
             _doctor_record "pattern-shadow" "warn" "$_shadow_count managed rule(s) shadowed by a local copy — run 'wv quality patterns list' for detail"
@@ -3858,10 +4320,12 @@ cmd_doctor() {
     # most recently closed node whose touched_files overlaps it, when one
     # exists.
     local _cd_dirty
+    # --no-renames (wv-b96ada): a staged rename lists only its new path, so the
+    # old path - the one a closed node touched - never reached attribution.
     _cd_dirty=$(
         {
-            git diff --name-only 2>/dev/null
-            git diff --cached --name-only 2>/dev/null
+            git diff --no-renames --name-only 2>/dev/null
+            git diff --no-renames --cached --name-only 2>/dev/null
             git ls-files --others --exclude-standard 2>/dev/null
         } | sort -u | grep -v '^$' \
           | grep -v '^\.weave/' \
@@ -4003,12 +4467,21 @@ cmd_doctor() {
             "$git_root/.git/hooks/prepare-commit-msg" \
             "Weave: append Weave-ID trailers" \
             "install -m 755 scripts/hooks/prepare-commit-msg-weave.sh .git/hooks/prepare-commit-msg"
+        # post-commit was retired (wv-56c823): a Weave copy still installed runs
+        # the dead deferred-suite queue on every commit. A custom hook is not ours.
+        local _dr_pc_hook
+        _dr_pc_hook="$(git rev-parse --git-path hooks 2>/dev/null)/post-commit"
+        if [ -f "$_dr_pc_hook" ] && grep -qF "Weave post-commit" "$_dr_pc_hook" 2>/dev/null; then
+            _doctor_record "post-commit hook" "warn" "retired Weave post-commit hook still installed — run ./install.sh (dev repo) or wv init-repo --update"
+        fi
+        # The heavy tier (wv-862ac0): without it installed, pre-commit runs the
+        # [heavy] suites itself, so a missing copy is slow, not unsafe.
         _doctor_check_git_hook \
-            "post-commit hook" \
-            "$git_root/scripts/hooks/post-commit-weave.sh" \
-            "$git_root/.git/hooks/post-commit" \
-            "Weave post-commit" \
-            "install -m 755 scripts/hooks/post-commit-weave.sh .git/hooks/post-commit"
+            "pre-push hook" \
+            "$git_root/scripts/hooks/pre-push-weave.sh" \
+            "$git_root/.git/hooks/pre-push" \
+            "Weave pre-push" \
+            "install -m 755 scripts/hooks/pre-push-weave.sh .git/hooks/pre-push"
     fi
 
     # 18. Ghost settings: check for chat.hooks.enabled in .vscode/settings.json
@@ -4028,7 +4501,7 @@ cmd_doctor() {
         if [ -n "$matcher" ]; then
             local missing_tools=""
             for tool in Edit Write Bash; do
-                echo "$matcher" | grep -q -- "$tool" || missing_tools="${missing_tools:+$missing_tools, }$tool"
+                grep -q -- "$tool" <<< "$matcher" || missing_tools="${missing_tools:+$missing_tools, }$tool"
             done
             if [ -z "$missing_tools" ]; then
                 _doctor_record "hook matchers" "pass" "Edit, Write, Bash covered"
@@ -5091,13 +5564,37 @@ cmd_health() {
     if [ "$fast" = "true" ]; then
         local cache_file="$WV_HOT_ZONE/.health_fast.json"
         local fast_ttl="${WV_HEALTH_FAST_TTL:-300}"
+
+        # Writability probe (wv-71d076). Everything the score is computed from
+        # describes the graph's SHAPE — counts, orphans, ghost edges — and none
+        # of it moves when the writer-lineage schema drifts. A hot zone that
+        # wv sync and wv commit-refs cannot persist to therefore scores 100/100,
+        # and session start reports that number at the top of every session.
+        # This is the classifier wv doctor already uses, and it costs two
+        # pragma_table_info reads.
+        local _hf_lineage
+        _hf_lineage=$(db_lineage_pair_verdict \
+            "$(db_lineage_shape nodes)" "$(db_lineage_shape edges)" 2>/dev/null || echo unknown)
+
         if [ -f "$cache_file" ]; then
             local _hf_now _hf_mtime _hf_age _hf_fresh=true
             _hf_now=$(date +%s)
             _hf_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
             _hf_age=$((_hf_now - _hf_mtime))
             [ "$_hf_age" -le "$fast_ttl" ] || _hf_fresh=false
-            if [ -f "$WV_RUN_CACHE_SENTINEL" ] && [ "$cache_file" -ot "$WV_RUN_CACHE_SENTINEL" ]; then
+            # Strictly newer than the write sentinel, as the run cache (wv-228099).
+            if [ -f "$WV_RUN_CACHE_SENTINEL" ] && ! [ "$cache_file" -nt "$WV_RUN_CACHE_SENTINEL" ]; then
+                _hf_fresh=false
+            fi
+            # The cache is invalidated by CLI writes and by time, and a schema
+            # drift is neither: a CLI upgrade or an out-of-band migration moves
+            # the verdict without touching the write sentinel. Without this the
+            # cached 100 outlives the drift for the whole TTL, which is exactly
+            # the stale reassurance this probe was added to remove. A cache
+            # written before the probe existed has no .lineage and is treated as
+            # a mismatch, so the first run after an upgrade recomputes.
+            if [ "$_hf_fresh" = "true" ] \
+               && [ "$(jq -r '.lineage // "unrecorded"' "$cache_file" 2>/dev/null)" != "$_hf_lineage" ]; then
                 _hf_fresh=false
             fi
             if [ "$_hf_fresh" = "true" ]; then
@@ -5105,31 +5602,59 @@ cmd_health() {
                     cat "$cache_file"
                 else
                     echo "Health: $(jq -r '.score' "$cache_file" 2>/dev/null)/100 (fast, cached)"
+                    jq -r '.recovery // empty' "$cache_file" 2>/dev/null \
+                        | while read -r _hf_rec; do
+                              echo "  graph is not writable — recover with: $_hf_rec" >&2
+                          done
                 fi
                 return 0
             fi
         fi
         _health_collect_metrics
         _health_compute_score
+
+        # A graph that cannot be written is not healthy at any shape score, so
+        # the verdict floors it rather than subtracting from it. The three
+        # tiers mirror wv doctor's, from the same classifier: canonical passes,
+        # preinit is benign (db_init has not run yet, which is the ordinary
+        # state of a fresh hot zone at session start), anything else fails.
+        # 'unknown' means the probe itself could not run; that is reported but
+        # does not floor, because a probe failure is not evidence of drift.
+        local _hf_score="${_h_health_score:-0}" _hf_recovery=""
+        case "$_hf_lineage" in
+            canonical|preinit|unknown) ;;
+            *)
+                _hf_score=0
+                _hf_recovery='rm -rf "$WV_HOT_ZONE" && wv load'
+                ;;
+        esac
+
         # Append to the same trend log as the full path (only on recompute —
-        # a cache hit means the DB is unchanged, so the data point is a duplicate)
+        # a cache hit means the DB is unchanged, so the data point is a duplicate).
+        # The floored score is what gets logged: the trend should show the drift,
+        # not the shape score that ignored it.
         if [ -d "$WEAVE_DIR" ]; then
             printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$(date -u +%Y-%m-%dT%H:%M:%S)" \
-                "$_h_health_score" "$_h_total_nodes" "$_h_total_edges" \
+                "$_hf_score" "$_h_total_nodes" "$_h_total_edges" \
                 "$_h_orphan_nodes" "$_h_ghost_edges" >> "$WEAVE_DIR/health.log"
         fi
         jq -n \
-            --arg score "${_h_health_score:-0}" \
+            --arg score "$_hf_score" \
             --arg nodes "${_h_total_nodes:-0}" \
             --arg edges "${_h_total_edges:-0}" \
             --arg orphans "${_h_orphan_nodes:-0}" \
-            '{"score":($score|tonumber),"total_nodes":($nodes|tonumber),"total_edges":($edges|tonumber),"orphan_nodes":($orphans|tonumber),"fast":true}' \
+            --arg lineage "$_hf_lineage" \
+            --arg recovery "$_hf_recovery" \
+            '{"score":($score|tonumber),"total_nodes":($nodes|tonumber),"total_edges":($edges|tonumber),"orphan_nodes":($orphans|tonumber),"fast":true,"lineage":$lineage}
+             + (if $recovery == "" then {} else {"recovery":$recovery} end)' \
             > "$cache_file.tmp" 2>/dev/null && mv "$cache_file.tmp" "$cache_file"
         if [ "$format" = "json" ]; then
-            cat "$cache_file" 2>/dev/null || jq -n --arg s "${_h_health_score:-0}" '{"score":($s|tonumber),"fast":true}'
+            cat "$cache_file" 2>/dev/null || jq -n --arg s "$_hf_score" '{"score":($s|tonumber),"fast":true}'
         else
-            echo "Health: ${_h_health_score}/100 (fast)"
+            echo "Health: ${_hf_score}/100 (fast)"
+            [ -n "$_hf_recovery" ] && \
+                echo "  graph is not writable (lineage=$_hf_lineage) — recover with: $_hf_recovery" >&2
         fi
         return 0
     fi
@@ -6362,8 +6887,8 @@ RUN checks and RECORD outcomes; wv done READS them and decides. It never invokes
 a linter or test runner — the close stays fast.
 
 Three surfaces:
-  pre-commit   hygiene gate (lint, active-node) + runs fast/impact suites + records
-  post-commit  runs deferred slow suites + records (advisory, never blocks)
+  pre-commit   hygiene gate (lint, active-node) + runs light impact suites + records
+  pre-push     runs the [heavy] suites the pushed commits owe + records; refuses red
   wv done      reads recorded signals; owns the gate (nodes_policy_check trigger)
 
 Pre-commit pytest behavior:
@@ -6506,6 +7031,13 @@ to reach for BEFORE editing, not after.
                         query  = predicate-exact ("status=done type=finding stale>=7")
                         Use search to locate; use query to pin and filter.
 
+  wv list               Enumeration, capped at 50 rows (100 with --status=done).
+                          The stderr footer gives the matching total and how
+                          many rows are hidden; --limit=N raises the cap, --all
+                          lifts it and adds done nodes. A capped list is not
+                          evidence a node is absent: before wv add, run
+                          wv search "<topic>".
+
   wv discover <id>      Unknown-taxonomy report for one node.
                           --json        emits known_knowns, known_unknowns,
                                         unknown_knowns, unknown_unknown_candidates
@@ -6532,7 +7064,8 @@ to reach for BEFORE editing, not after.
                           Window it (--since-days=1) for retro reading — unwindowed
                           output is a lifetime aggregate across instrumentation eras.
                           Prefer query or search over wv list for targeted reads;
-                          reserve wv list for full enumeration only.
+                          reserve wv list for enumeration, and read its footer
+                          for hidden rows (it caps at 50).
 
   wv cache              Prompt-cache health for the project.
                           --sessions=N, --all; ratio >65% OK / 35-65% LOW / <35% BAD
@@ -6642,13 +7175,13 @@ cmd_help_topic() {
             print_command_help "wv init [--force]" "Initialize the Weave database in the current hot zone, recovering synced state when available."
             ;;
         add)
-            print_command_help "wv add <text> [--status=STATUS] [--parent=<id>] [--gh] [--alias=<name>] [--metadata=<json>] [--force] [--standalone] [--criteria=<text>] [--risks=<level>] [--verification-plan=<text>]" "Create a node and print its id. Use --parent when an active epic exists, or --standalone for repo-level chores. --verification-plan records upfront what would count as done, surfaced again as a reminder if wv done is later blocked for missing verification."
+            print_command_help "wv add <text> [--status=STATUS] [--parent=<id>] [--gh] [--alias=<name>] [--metadata=<json>] [--force] [--standalone] [--criteria=<text>] [--risks=<level>] [--verification-plan=<text>] [--id=<wv-id>]" "Create a node and print its id. Use --parent when an active epic exists, or --standalone for repo-level chores. --verification-plan records upfront what would count as done, surfaced again as a reminder if wv done is later blocked for missing verification. --id reconstructs a node under an id the graph has lost, so a pushed Weave-ID trailer stops pointing at nothing; it refuses an alias and refuses to overwrite a live id."
             ;;
         remember)
-            print_command_help "wv remember <text> [--kind=project] [--scope=repo] [--source-agent=name] [--json]" "Capture a graph-native memory node using metadata.type=memory and metadata.mem_status=active."
+            print_command_help "wv remember <text> [--kind=project] [--scope=repo] [--source-agent=name] [--supersedes=<id>] [--json]" "Capture a graph-native memory node using metadata.type=memory and metadata.mem_status=active. To change a claim, do not edit the memory: --supersedes=<id> records the new one and keeps the old as mem_status=superseded with superseded_by, linked by a supersedes edge. Only an active memory can be superseded."
             ;;
         memory)
-            print_command_help "wv memory recall [--agent=current|all|name] [--json] | wv memory render [--agent=all|current|claude|claude-memory|copilot|codex|codex-memory|workflow] [--base-dir=DIR] [--path=PATH] [--json] | wv memory scan --source=claude|codex|copilot|all [--repo-root=DIR] [--json] | wv memory import --source=claude --path=DIR [--repo-root=DIR] [--json] | wv memory import --source=codex [--path=DB] [--repo-root=DIR] [--json] | wv memory crystallize [--dry-run|--apply-reviewed] [--repo-root=DIR] [--json]" "Recall graph-native memory, render repo-local projections, scan harness state, import Claude project memories or Codex memory-pipeline rows as mem_status=candidate nodes, or crystallize candidates (dedup/verify/mark, promote reviewed). Capture records dynamic agent provenance; graph recall is agent-agnostic. --path is only valid for one render projection or a single Codex memory DB import."
+            print_command_help "wv memory recall [--agent=current|all|name] [--json] | wv memory render [--agent=all|current|claude|claude-memory|copilot|codex|codex-memory|agents|workflow] [--base-dir=DIR] [--path=PATH] [--json] | wv memory scan --source=claude|codex|copilot|all [--repo-root=DIR] [--json] | wv memory import --source=claude --path=DIR [--repo-root=DIR] [--json] | wv memory import --source=codex [--path=DB] [--repo-root=DIR] [--json] | wv memory crystallize [--dry-run|--apply-reviewed] [--repo-root=DIR] [--json]" "Recall graph-native memory, render repo-local projections, scan harness state, import Claude project memories or Codex memory-pipeline rows as mem_status=candidate nodes, or crystallize candidates (dedup/verify/mark, promote reviewed). Capture records dynamic agent provenance; graph recall is agent-agnostic. --path is only valid for one render projection or a single Codex memory DB import. The agents projection (AGENTS.md, included in --agent=all) only refreshes an existing WEAVE:MEMORY block; a file without one is left untouched."
             ;;
         delete)
             print_command_help "wv delete <id> [--force] [--dry-run] [--no-gh]" "Delete a node and its edges. Use --dry-run to preview deletions and --force to execute them."
@@ -6684,7 +7217,7 @@ cmd_help_topic() {
             print_command_help "wv ready [--json | --json-v2] [--count] [--all] [--with-impact] [--findings] [--subtree=<id>] [--mode=bootstrap|discover|execute|full]" "List unblocked work. --with-impact ranks by blast radius (wv impact per node); --subtree=<id> scopes to a node's descendants; --findings includes the findings digest."
             ;;
         list)
-            print_command_help "wv list [--all] [--status=<status>] [--claimed-by=<agent-id>|current] [--json | --json-v2] [--mode=bootstrap|discover|execute|full]" "List nodes, excluding done by default. Use --claimed-by=current for nodes owned by this agent and --json-v2 for the lean parsed-metadata shape."
+            print_command_help "wv list [--all] [--limit=N] [--status=<status>] [--claimed-by=<agent-id>|current] [--json | --json-v2] [--mode=bootstrap|discover|execute|full]" "List nodes, excluding done by default. Output is capped at 50 rows (100 with --status=done); when the cap hides rows, a stderr footer gives the matching total and the --limit=N that shows them all. --all lifts the cap and includes done nodes. A capped list is not evidence a node is absent: check wv search \"<topic>\" before wv add. Use --claimed-by=current for nodes owned by this agent and --json-v2 for the lean parsed-metadata shape."
             ;;
         show)
             print_command_help "wv show <id> [--json | --json-v2] [--mode=bootstrap|discover|execute|full]" "Show node details in text or JSON. --json-v2 returns the lean parsed-metadata shape."
@@ -6805,8 +7338,15 @@ SEARCHHELP
             print_command_help "wv unarchive <id> [--dry-run] [--with-edges]" "Restore a pruned node from .weave/archive/ back into the live graph."
             ;;
         commit-refs)
-            print_command_help "wv commit-refs [--json] [--all] [--prune [--dry-run]]" \
+            print_command_help "wv commit-refs [--json] [--all] [--prune [--dry-run]] | --trailers [--json]" \
                 "Audit the commit SHAs recorded in node metadata against the pushed branch.
+
+--trailers runs the audit the other way round: Weave-ID trailers already pushed
+to the world that name a node this graph has no record of ever writing. Absence
+alone is not the finding, because pruned history is absent too, so an id is
+reported only when the tracked write log never wrote it; ids predating that log
+are separated as unadjudicable. Read-only and offline, and the repair it prints
+is wv add --id=<id>.
 
 Classes: reachable (ancestor of the pushed ref), pending (local only — unpushed
 or on another branch, not an orphan), unreachable (object exists but no ref
@@ -6845,8 +7385,12 @@ commits list from their children."
         version)
             print_command_help "wv version" "Print the installed Weave CLI version."
             ;;
+        context-policy)
+            print_command_help "wv context-policy [--json] [--refresh]" "Print the context load policy (HIGH/MEDIUM/LOW) and its reason, from repository size signals. The one source every harness reads: the Claude SessionStart hook and MCP weave_overview both call it. Cached an hour in .weave/.context_policy; keeps the .weave/runtime.md policy block current. Runs no load."
+            ;;
         hotzone)
             print_command_help "wv hotzone list [--json]" "List all hot-zones (active graph DB directories) with status, node count, and owner."
+            print_command_help "wv hotzone db" "Print this repository's resolved brain.db path. Read the graph DB through it (DB=\$(wv hotzone db); sqlite3 -readonly \"\$DB\"): placement follows the runtime class, not the agent, and sqlite3 on a guessed path creates an empty database there."
             print_command_help "wv hotzone gc [--dry-run]" "Remove orphan hot-zone directories (no matching live repo). Skips dirs newer than 1h."
             ;;
         *)
@@ -6928,6 +7472,7 @@ Commands:
   uninstall         Remove installed wv files (delegates to install.sh --uninstall)
   doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]
   hotzone <sub>     Hot-zone DB directories (list, gc) [--json] [--dry-run]
+  context-policy    Context load policy (HIGH/MEDIUM/LOW) and reason [--json] [--refresh]
   selftest          Round-trip smoke test in isolated environment [--json]
   test-record <suite> Record a test-suite run for verification freshness (used by git hooks)
   test-status <suite> Check whether every named file has a fresh green suite result

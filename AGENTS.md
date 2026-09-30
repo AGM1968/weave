@@ -51,29 +51,23 @@ wv search --code "query" --graph          # include active Weave nodes per file
 
 MCP equivalent: `weave_code_search` (parameters: `query`, `mode`, `limit`, `graph`).
 
-## Conditional discovery routing
+## Procedures
 
-Use the shared `discovery-routing` procedure when scope is uncertain or crosses nodes/modules:
+Procedures are the agent-neutral guidance every harness reads; run a procedure's fallback command for
+its full text. Discovery routing (the smallest route that resolves an uncertainty) is
+`wv guide --procedure=discovery-routing`. `wv init-repo --update` refreshes the index below, and
+only inside its markers; delete the markers to opt this file out.
 
-```bash
-# Locate graph work.
-wv search "auth"
-wv query status=active --format=json
+<!-- BEGIN WEAVE PROCEDURES -->
+<!-- END WEAVE PROCEDURES -->
 
-# Investigate uncertain or cross-node work.
-wv context wv-abc123 --json
-wv discover wv-abc123 --json
-wv impact wv-abc123 --json
+## Graph memory
 
-# Use these when their conditions apply.
-wv search --code "authentication" --graph
-wv impact --files=src/auth.py,src/session.py --json
-wv quality functions src/auth.py --json
-wv quality patterns scan src --json
-```
+`wv memory render --agent=all` refreshes this block from the graph, and only inside its markers.
+Change a claim with `wv remember --supersedes=<id>`, not by editing the block.
 
-`bootstrap` and `context` already provide bounded discovery; use direct `discover` when they surface
-material uncertainty. Canonical procedure: `wv guide --procedure=discovery-routing`.
+<!-- ── BEGIN WEAVE:MEMORY ── managed by wv memory render, do not edit manually -->
+<!-- ── END WEAVE:MEMORY ── -->
 
 ## Full documentation
 

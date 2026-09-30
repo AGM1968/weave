@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://weave.dev/contracts/hook-observation-v1.schema.json",
+  "$comment": "One host-hook policy decision, written by _hc_observe (scripts/lib/wv-hook-observe.sh) when WV_HOOK_OBSERVATIONS names a path. A host hook decides before wv is invoked, so the record carries no wv call identity and never enters the attempt journal or the E1 denominator (policy-rules-v1 denominator, wv-bd3041): additionalProperties is false precisely so no call_id, parent_call_id or workflow identity can be attached. It is evidence that a hook-owned rule decided, which policy totality needs (wv-664b7f), not a counted call.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "event", "hook", "hook_event", "rule", "decision", "policy_identity", "ts"],
+  "properties": {
+    "format": { "const": "weave.hook-observation.v1" },
+    "event": { "const": "hook_decision" },
+    "hook": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+$" },
+    "hook_event": { "enum": ["PreToolUse", "Stop"] },
+    "rule": { "type": "string", "pattern": "^[a-z][a-z0-9_]{2,63}$" },
+    "decision": { "enum": ["allow", "advisory", "deny"] },
+    "bypass": { "type": "string", "minLength": 1 },
+    "policy_identity": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "ts": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" }
+  }
+}

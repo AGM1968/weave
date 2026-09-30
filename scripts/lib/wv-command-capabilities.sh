@@ -9,9 +9,9 @@
 # the command-level row -- which validation guarantees is never weaker.
 
 WV_CAPABILITIES_SCHEMA="weave.command-capabilities.v1"
-WV_CAPABILITIES_SHA256="ef1005cfb8b6a298c8b04c445d0845a370706728dbb810cb5a040c67f9fa8084"
+WV_CAPABILITIES_SHA256="bb2808e75856202bfd6623498ec256fec65584a0ff6d4e11576791b55853b283"
 WV_CAPABILITIES_SCHEMA_SHA256="e0ce380f3281d49ee5d6b8bfab1f0d6cf9160d1544d526c8df1d1eab3e9ca4bb"
-WV_CAPABILITIES_IDENTITY="511dcf009d3cc6dbf0f5519e0d59e80a6bf64d7bc209d394b948ac5487578948"
+WV_CAPABILITIES_IDENTITY="159f47aff9c03c633e00326f7cda690d4fe1cea1622ff1694270ae99f64725b0"
 
 _wv_cap_serve() {
     case "${1}:${2-}" in
@@ -41,7 +41,7 @@ _wv_cap_evidence_class() {
         breadcrumbs:capsule|breadcrumbs:show|config:get|config:list|config:show|findings:list|hotzone:db|hotzone:list|memory:recall|memory:scan|quality:diff|quality:functions|quality:hotspots|quality:prose-shape|quality:structural-search|repo-class:audit|trails:capsule|trails:show) printf %s observation; return 0 ;;
     esac
     case "$1" in
-        hotzone|index|self-update|selftest|uninstall) printf %s administrative; return 0 ;;
+        context-policy|hotzone|index|self-update|selftest|uninstall) printf %s administrative; return 0 ;;
         add|allowed-tools|batch|batch-done|block|breadcrumbs|bulk-update|clean-ghosts|commit-refs|compact|config|cutover|delete|doctor|done|enrich-topology|findings|hook|import|init|init-repo|link|load|memory|plan|prune|quality|quick|recover|reindex|remember|repo-class|resolve|session-summary|ship|ship-agent|sync|test-record|touch|trails|unarchive|unlink|update|work) printf %s mutation_attempt; return 0 ;;
         analyze|audit-pitfalls|bootstrap|bootstrap-agent|cache|context|digest|discover|edge-types|edges|guide|health|impact|learnings|list|mcp-status|overview|path|pattern-audit|pending-close|preflight|query|ready|refs|related|search|show|status|test-status|tree|validate-finding) printf %s observation; return 0 ;;
     esac
@@ -105,6 +105,7 @@ _wv_cap_targets() {
         compact) printf %s "brain_db"; return 0 ;;
         config) printf %s "installation repo_state"; return 0 ;;
         context) printf %s ""; return 0 ;;
+        context-policy) printf %s "repo_state working_tree"; return 0 ;;
         cutover) printf %s "repo_state"; return 0 ;;
         delete) printf %s "brain_db"; return 0 ;;
         digest) printf %s ""; return 0 ;;
@@ -181,7 +182,7 @@ _wv_cap_refines() {
 
 _wv_cap_known() {
     case "$1" in
-        add|allowed-tools|analyze|audit-pitfalls|batch|batch-done|block|bootstrap|bootstrap-agent|breadcrumbs|bulk-update|cache|clean-ghosts|commit-refs|compact|config|context|cutover|delete|digest|discover|doctor|done|edge-types|edges|enrich-topology|findings|guide|health|hook|hotzone|impact|import|index|init|init-repo|learnings|link|list|load|mcp-status|memory|overview|path|pattern-audit|pending-close|plan|preflight|prune|quality|query|quick|ready|recover|refs|reindex|related|remember|repo-class|resolve|search|self-update|selftest|session-summary|ship|ship-agent|show|status|sync|test-record|test-status|touch|trails|tree|unarchive|uninstall|unlink|update|validate-finding|work) return 0 ;;
+        add|allowed-tools|analyze|audit-pitfalls|batch|batch-done|block|bootstrap|bootstrap-agent|breadcrumbs|bulk-update|cache|clean-ghosts|commit-refs|compact|config|context|context-policy|cutover|delete|digest|discover|doctor|done|edge-types|edges|enrich-topology|findings|guide|health|hook|hotzone|impact|import|index|init|init-repo|learnings|link|list|load|mcp-status|memory|overview|path|pattern-audit|pending-close|plan|preflight|prune|quality|query|quick|ready|recover|refs|reindex|related|remember|repo-class|resolve|search|self-update|selftest|session-summary|ship|ship-agent|show|status|sync|test-record|test-status|touch|trails|tree|unarchive|uninstall|unlink|update|validate-finding|work) return 0 ;;
     esac
     return 1
 }

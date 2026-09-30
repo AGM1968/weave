@@ -28,6 +28,34 @@ _query_resolve_key() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# _query_value_match <col> <value> — SQL that is true when <col> equals <value>
+# (wv-e99999). A metadata key reads through json_extract(), which returns a
+# JSON true as 1 and a JSON 216 as the integer 216, and neither equals a quoted
+# 'true' or '216': key=true and key=216 matched nothing and read as "no such
+# nodes". For a metadata key, true/false also match the JSON boolean and a
+# number also matches the JSON number; the string forms still match. Columns
+# (status, priority, ...) compare as before.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_query_value_match() {
+    local col="$1" v="$2" sv
+    sv="'$(printf '%s' "$v" | sed "s/'/''/g")'"
+    case "$col" in
+        "json_extract(n.metadata, '\$."*"')")
+            local path="${col#json_extract(n.metadata, }"; path="${path%)}"
+            case "$v" in
+                true|false)
+                    printf "(json_type(n.metadata, %s) = '%s' OR %s = %s)" "$path" "$v" "$col" "$sv"; return 0 ;;
+            esac
+            if [[ "$v" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+                printf "(%s = %s OR %s = %s)" "$col" "$v" "$col" "$sv"; return 0
+            fi
+            ;;
+    esac
+    printf "%s = %s" "$col" "$sv"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # _query_parse_predicate — parse one predicate string to SQL fragment
 # Returns empty string for MATCH predicates (handled by caller pre-scan).
 # ═══════════════════════════════════════════════════════════════════════════
@@ -69,8 +97,13 @@ _query_parse_predicate() {
     vals2=$(printf '%s' "$raw" | sed -n 's/^\([A-Za-z_][A-Za-z0-9_.]*\) IN (\(.*\))$/\2/p')
     if [ -n "$k2" ]; then
         local col; col=$(_query_resolve_key "$k2") || return 1
-        local lst; lst=$(printf '%s' "$vals2" | sed "s/,/','/g;s/^/'/;s/\$/'/" )
-        echo "$col IN ($lst)"
+        local _in_v _in_or=""
+        local -a _in_vals
+        IFS=',' read -ra _in_vals <<< "$vals2"
+        for _in_v in "${_in_vals[@]}"; do
+            _in_or="${_in_or:+$_in_or OR }$(_query_value_match "$col" "$_in_v")"
+        done
+        echo "($_in_or)"
         return 0
     fi
 
@@ -82,7 +115,9 @@ _query_parse_predicate() {
     if [ -n "$k" ] && [ -n "$op" ] && [ -n "$v" ]; then
         local col; col=$(_query_resolve_key "$k") || return 1
         case "$op" in
-            =|!=) printf "%s %s '%s'\n" "$col" "$op" "$(printf '%s' "$v" | sed "s/'/''/g")" ;;
+            =)  printf "%s\n" "$(_query_value_match "$col" "$v")" ;;
+            # A node without the key stays excluded, as NULL != 'x' always was.
+            !=) printf "(%s IS NOT NULL AND NOT %s)\n" "$col" "$(_query_value_match "$col" "$v")" ;;
             *)    printf "(%s) %s %s\n" "$col" "$op" "$v" ;;
         esac
         return 0
@@ -373,6 +408,10 @@ Predicates:
   key IN (a,b,c)    membership
   HAS key           metadata field is present (HAS learning = dual-schema aware)
   MATCH "expr"      FTS5 phrase search across all indexed columns
+
+For a metadata field, true/false match a JSON boolean or the string, and a
+number matches a JSON number or the numeric string (key!=value excludes nodes
+without the key).
 
 Keys: id, text, status, type, priority, alias, created_at, updated_at,
       stale (days since promoted_at — findings only), hygiene, or any metadata field

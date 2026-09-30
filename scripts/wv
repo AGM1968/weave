@@ -67,6 +67,9 @@ fi
 # how the counterweight classifies it. It is data, has no dependencies, and is
 # sourced first so every module below can consult it.
 source "$WV_LIB_DIR/lib/wv-command-capabilities.sh"
+# wv-policy-rules.sh is generated from contracts/policy-rules-v1.json: the policy
+# contract's identity and which rules can decide inside each operation.
+source "$WV_LIB_DIR/lib/wv-policy-rules.sh"
 source "$WV_LIB_DIR/lib/wv-config.sh"
 source "$WV_LIB_DIR/lib/wv-db.sh"
 source "$WV_LIB_DIR/lib/wv-validate.sh"
@@ -80,17 +83,53 @@ source "$WV_LIB_DIR/lib/wv-checkpoint-generation.sh"
 source "$WV_LIB_DIR/lib/wv-checkpoint-ci.sh"
 source "$WV_LIB_DIR/lib/wv-repository-class.sh"
 
-# Source command modules
-source "$WV_LIB_DIR/cmd/wv-cmd-core.sh"
-source "$WV_LIB_DIR/cmd/wv-cmd-graph.sh"
-source "$WV_LIB_DIR/cmd/wv-cmd-data.sh"
-source "$WV_LIB_DIR/cmd/wv-cmd-ops.sh"
-source "$WV_LIB_DIR/cmd/wv-cmd-quality.sh"
-source "$WV_LIB_DIR/cmd/wv-cmd-findings.sh"
-source "$WV_LIB_DIR/cmd/wv-cmd-analyze.sh"
-source "$WV_LIB_DIR/cmd/wv-cmd-indexer.sh"
-source "$WV_LIB_DIR/cmd/wv-cmd-query.sh"
-source "$WV_LIB_DIR/cmd/wv-cmd-hook.sh"
+# Command modules load on first use (wv-13a9ae). Parsing all ten (~25k lines)
+# cost ~75ms on every call whatever the command, most of it for modules the
+# command never touches. Each function a module defines at column 0 gets a
+# stub that sources the module -- replacing every stub it owns with the real
+# definition -- and re-dispatches, in the same shell. No function is defined
+# in two modules, so load order cannot change which definition wins, and no
+# module has top-level state another module reads. A module first reached
+# inside $(...) loads in that subshell only and again in the parent when the
+# parent reaches it: slower, never different. WV_AUTOLOAD_TRACE=1 reports
+# each load. WV_AUTOLOAD=0 sources every module up front, as before.
+_wv_autoload() {  # _wv_autoload <module> — source cmd/wv-cmd-<module>.sh once per shell
+    local __wv_al_flag="_WV_CMD_LOADED_$1"
+    [ -n "${!__wv_al_flag:-}" ] && return 0
+    printf -v "$__wv_al_flag" '%s' 1
+    [ -n "${WV_AUTOLOAD_TRACE:-}" ] && echo "wv autoload: $1 (subshell ${BASH_SUBSHELL})" >&2
+    # shellcheck source=/dev/null
+    source "$WV_LIB_DIR/cmd/wv-cmd-$1.sh"
+}
+_wv_autoload_call() {  # stub body: _wv_autoload_call <module> <function> [args...]
+    local __wv_al_mod="$1" __wv_al_fn="$2"
+    shift 2
+    _wv_autoload "$__wv_al_mod"
+    # A column-0 "name() {" inside a heredoc is not a definition: after the
+    # load it is still this stub. Drop it, so the call fails as it always did
+    # (command not found) instead of recursing.
+    if [[ "$(declare -f "$__wv_al_fn")" == *"_wv_autoload_call $__wv_al_mod $__wv_al_fn "* ]]; then
+        unset -f "$__wv_al_fn"
+    fi
+    "$__wv_al_fn" "$@"
+}
+if [ "${WV_AUTOLOAD:-1}" = "0" ]; then
+    # The same file set the stubs come from, never a typed list: a module added
+    # later must not exist only on the lazy path (ultrareview #4574).
+    for __wv_al_file in "$WV_LIB_DIR"/cmd/wv-cmd-*.sh; do
+        __wv_al_mod="${__wv_al_file##*/wv-cmd-}"
+        _wv_autoload "${__wv_al_mod%.sh}"
+    done
+else
+    while IFS=: read -r __wv_al_file __wv_al_fn; do
+        __wv_al_fn="${__wv_al_fn%()}"
+        __wv_al_mod="${__wv_al_file#wv-cmd-}"; __wv_al_mod="${__wv_al_mod%.sh}"
+        # Never shadow a function a library already defined.
+        declare -F "$__wv_al_fn" >/dev/null && continue
+        eval "$__wv_al_fn() { _wv_autoload_call $__wv_al_mod $__wv_al_fn \"\$@\"; }"
+    done < <(cd "$WV_LIB_DIR/cmd" && grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)' wv-cmd-*.sh)
+fi
+unset __wv_al_file __wv_al_fn __wv_al_mod
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Dispatcher
@@ -215,6 +254,7 @@ _wv_dispatch() {
         bootstrap-agent) cmd_bootstrap_agent "$@" ;;
         doctor)          cmd_doctor "$@" ;;
         hotzone)         cmd_hotzone "$@" ;;
+        context-policy)  cmd_context_policy "$@" ;;
         test-record)     cmd_test_record "$@" ;;
         test-status)     cmd_test_status "$@" ;;
         self-update)     cmd_self_update "$@" ;;
@@ -245,7 +285,17 @@ _wv_dispatch() {
         query)           cmd_query "$@" ;;
         hook)            cmd_hook "$@" ;;
         help|--help|-h)  cmd_help "$@" ;;
-        version|--version|-v) echo "wv $WV_VERSION" ;;
+        # The tag alone cannot tell two installs apart (wv-84447f). Append the
+        # build when this install recorded one; the leading "wv <version>" is
+        # unchanged so anything parsing the first two fields still works.
+        version|--version|-v)
+            _wv_build=$(wv_build_identity 2>/dev/null || true)
+            if [ -n "$_wv_build" ]; then
+                echo "wv $WV_VERSION (build $_wv_build)"
+            else
+                echo "wv $WV_VERSION"
+            fi
+            ;;
         
         *)
             echo -e "${RED}Unknown command: $cmd${NC}" >&2
@@ -515,7 +565,7 @@ SQL
     }
     _wv_nested_operation() {
         case "$1:$2" in
-            analyze:sessions|analyze:suites|config:enable|config:disable|config:get|config:set|hook:dispatch|quality:scan|quality:functions|quality:patterns|findings:promote|cache:clear|cache:stats)
+            analyze:sessions|analyze:suites|analyze:gates|config:enable|config:disable|config:get|config:set|hook:dispatch|quality:scan|quality:functions|quality:patterns|findings:promote|cache:clear|cache:stats)
                 return 0
                 ;;
         esac
@@ -600,24 +650,6 @@ SQL
         done
         printf ']'
     }
-    # The call's policy provenance, stated rather than implied. A call with no
-    # verdict is NOT an allow: until every gate that can decide emits rule,
-    # decision and would_violate_invariant, no call is countable on policy
-    # provenance, and saying so explicitly is the difference between missing
-    # evidence and fabricated evidence.
-    _wv_policy_json() {
-        local verdicts state reason
-        verdicts=$(wv_attempt_verdict_count)
-        if [ "${verdicts:-0}" -eq 0 ]; then
-            state="unavailable"
-            reason="no gate emitted a verdict for this call; gate coverage is incomplete, so silence is not an allow"
-        else
-            state="partial"
-            reason="the verdicts recorded for this call are complete, but gate coverage across wv is not, so the call is still not countable"
-        fi
-        printf '{"state":"%s","countable":false,"verdicts":%s,"reason":"%s"}' \
-            "$state" "${verdicts:-0}" "$(wv_json_escape "$reason")"
-    }
 
     # Provenance precedence: an explicit WV_CALL_SOURCE always wins (agent via
     # Claude Code settings.json, mcp via the MCP server, hook/sync/test via their
@@ -681,8 +713,11 @@ SQL
     wv_attempt_context "$_wv_call_id" "$_wv_workflow_id" "$_wv_trace_id" "$_wv_source" \
         "$_wv_repo_root" "$_wv_operation" "$_wv_suboperation" "$_wv_evidence_class" \
         "$_wv_targets" "${WV_CAPABILITIES_IDENTITY:+sha256:$WV_CAPABILITIES_IDENTITY}" \
-        "${WV_CAPABILITIES_SCHEMA:-}" "$_wv_graph_before" "$_wv_parent_call_id"
-    wv_attempt_verdicts_reset
+        "${WV_CAPABILITIES_SCHEMA:-}" "$_wv_graph_before" "$_wv_parent_call_id" \
+        "${WV_POLICY_IDENTITY:+sha256:$WV_POLICY_IDENTITY}" "${WV_POLICY_SCHEMA:-}"
+    # Claimed, not reset: a reset would silently adopt whatever another call
+    # holding the same id had already recorded.
+    wv_attempt_verdicts_claim || true
 
     # Durable before dispatch, so a call killed at any point after this leaves an
     # explicit incomplete attempt rather than silence.
@@ -690,6 +725,23 @@ SQL
 
     _wv_out=$(mktemp -t wv-calllog-XXXXXX)
     _wv_err=$(mktemp -t wv-calllog-err-XXXXXX)
+
+    # Size-bounded rotation for the analytics log. Without it the file only ever
+    # grows -- 401MB and 649k lines by 2026-09 on the first host to enable it,
+    # with no rotation anywhere in the tree -- and every reader pays for the
+    # whole history. One previous generation is kept, so the bound on disk is
+    # twice WV_CALL_LOG_MAX_BYTES. Best-effort like the append it guards: a
+    # failed rotation must never fail the command that triggered it, and two
+    # racing rotations at worst discard one generation of analytics.
+    _wv_rotate_call_log() {
+        local max="${WV_CALL_LOG_MAX_BYTES:-67108864}"
+        case "$max" in ''|*[!0-9]*) return 0 ;; esac
+        [ "$max" -gt 0 ] || return 0
+        local size
+        size=$(stat -c %s "$WV_CALL_LOG" 2>/dev/null) || return 0
+        [ "$size" -gt "$max" ] || return 0
+        mv -f "$WV_CALL_LOG" "$WV_CALL_LOG.1" 2>/dev/null || return 0
+    }
 
     # Everything after dispatch runs from an EXIT trap, not after `main` returns.
     # A command that calls exit directly -- wv config get on a missing key is one
@@ -726,8 +778,8 @@ SQL
         wv_attempt_emit call_completed disposition=complete \
             "exit_status:=$_wv_exit" "elapsed_ms:=$_wv_elapsed" \
             "causal_identity_after:=$_wv_graph_after" \
-            "policy:=$(_wv_policy_json)" || exit 1
-        wv_attempt_verdicts_reset
+            "policy:=$(wv_attempt_policy_json)" || exit 1
+        wv_attempt_verdicts_reset || true  # evidence mode exits inside; analytics swallows
 
         _wv_cmd="$_wv_operation"
         _wv_policy_revision=$(_wv_unavailable_json "no live host adapter emits an authoritative policy revision (wv-426134)")
@@ -740,6 +792,7 @@ SQL
         _wv_parent_json="null"
         [ -n "${_wv_parent_call_id:-}" ] &&
             _wv_parent_json="\"$(_wv_json_escape "$_wv_parent_call_id")\""
+        [[ -n "${WV_CALL_LOG:-}" ]] && _wv_rotate_call_log
         [[ -n "${WV_CALL_LOG:-}" ]] &&
         # Braced group: stderr is silenced before the >> open is attempted, so an
         # unwritable log path (read-only FS, missing dir) cannot leak bash errors.
@@ -750,11 +803,22 @@ SQL
     }
     trap '_wv_finalize' EXIT
 
+    # errexit stays ON across dispatch. Disabling it here meant that on any
+    # machine with WV_CALL_LOG set -- which config.env sets durably, so every
+    # call on such a host -- main ran without abort-on-error, while the
+    # untelemetered branch below ran with it. Enabling analytics silently
+    # changed failure semantics: 37 of the 39 db_ensure call sites ignore their
+    # return, so db_migrate_lineage's deliberate `return 1` (wv-db.sh:343) was
+    # swallowed and execution continued past a failed durability migration.
+    #
+    # Nothing here needs errexit off to report a status. _wv_finalize takes
+    # `local rc=$?` as its first statement, so when errexit aborts the shell the
+    # trap still records main's real exit code; the assignment below is only
+    # reached on success. main is already required to be errexit-clean by the
+    # `else` branch, which has always run it that way.
     _wv_exit=0
-    set +e
     main "$@" > >( tee "$_wv_out" ) 2> >( tee "$_wv_err" >&2 )
     _wv_exit=$?
-    set -e
     exit "$_wv_exit"
 else
     main "$@"

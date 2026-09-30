@@ -188,7 +188,7 @@ map_tool() {
         help=$("$WV" $cand --help 2>&1 || true)
         # Real subcommand help starts "Usage: wv <cmd>"; the global fallback
         # for unknown commands starts "Usage: wv <command>".
-        if echo "$help" | grep -qE -- "^Usage: wv $first"; then
+        if grep -qE -- "^Usage: wv $first" <<< "$help"; then
             echo "$cand"
             return 0
         fi
@@ -226,7 +226,7 @@ while read -r tool; do
     checked=$((checked + 1))
     while read -r gap; do
         [ -z "$gap" ] && continue
-        echo "$BASELINE" | grep -qxF -- "$gap" && continue
+        grep -qxF -- "$gap" <<< "$BASELINE" && continue
         new_gaps="$new_gaps$gap"$'\n'
     done < <(parity_gaps "$tool" "$cli_cmd" "$SCHEMA")
 done < <(jq -r '.[].name' "$SCHEMA")
@@ -255,7 +255,7 @@ call_out=$(printf '%s\n%s\n%s\n' \
     '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"weave_guide","arguments":{"topic":"workflow"}}}' \
     | timeout 20 node "$MCP_DIST" --scope=all 2>/dev/null \
     | jq -rs '[.[] | select(.id==3)][0].result.content[0].text // empty' || true)
-if [ -n "$call_out" ] && ! echo "$call_out" | grep -qi "^Error:"; then
+if [ -n "$call_out" ] && ! grep -qi "^Error:" <<< "$call_out"; then
     pass "tools/call executes a real command (weave_guide returned content)"
 else
     fail "tools/call executes a real command (weave_guide returned content)" "output: '${call_out:0:120}'"
@@ -286,7 +286,7 @@ fi
 
 # Control: the v1.51.0 fix holds — with_edges is exposed today.
 gaps=$(parity_gaps "weave_unarchive" "unarchive" "$SCHEMA")
-if ! echo "$gaps" | grep -qF -- "--with-edges"; then
+if ! grep -qF -- "--with-edges" <<< "$gaps"; then
     pass "control: weave_unarchive exposes --with-edges (v1.51.0 fix holds)"
 else
     fail "control: weave_unarchive exposes --with-edges (v1.51.0 fix holds)" "$gaps"
@@ -297,7 +297,7 @@ MUTILATED="$TEST_DIR/mutilated-schema.json"
 jq 'map(if .name == "weave_unarchive" then del(.inputSchema.properties.with_edges) else . end)' \
     "$SCHEMA" > "$MUTILATED"
 gaps=$(parity_gaps "weave_unarchive" "unarchive" "$MUTILATED")
-if echo "$gaps" | grep -qxF "weave_unarchive --with-edges"; then
+if grep -qxF "weave_unarchive --with-edges" <<< "$gaps"; then
     pass "red-test: removing with_edges from the schema is flagged (v1.51.0 bug shape)"
 else
     fail "red-test: removing with_edges from the schema is flagged (v1.51.0 bug shape)" "checker output: '$gaps'"

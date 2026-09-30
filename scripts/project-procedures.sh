@@ -7,6 +7,9 @@ SOURCE="${WV_CONFIG_DIR:-$HOME/.config/weave}/procedures"
 REPO="$(pwd)"
 AGENT="all"
 COPILOT_LINES=()
+# AGENTS.md is universal: its index lists every shared, ready procedure,
+# whatever adapters the procedure names (wv-6ef83b).
+AGENTS_LINES=()
 CODEX_IDS=()
 CLAUDE_SKILLS=()
 # Marker line embedded in every generated SKILL.md. Its presence is the single
@@ -75,7 +78,7 @@ project_one() {
     local visibility status
     visibility=$(awk -F': *' '/^visibility:/{print $2; exit}' "$file")
     visibility=${visibility:-local}
-    if [ "$visibility" = shared ] && printf '%s\n' "$OVERRIDE_LOCAL" | grep -qxF -- "$id"; then
+    if [ "$visibility" = shared ] && grep -qxF -- "$id" <<< "$OVERRIDE_LOCAL"; then
         visibility=local
     fi
     [ "$visibility" = shared ] || return 0
@@ -85,6 +88,7 @@ project_one() {
     status=$(awk -F': *' '/^status:/{print $2; exit}' "$file")
     [ "${status:-ready}" = ready ] || return 0
     body=$(awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' "$file")
+    AGENTS_LINES+=("- $id — $description: $fallback")
     local do_claude=false do_codex=false do_copilot=false
     if adapter_has "$adapters" claude && { [ "$AGENT" = "all" ] || [ "$AGENT" = "claude" ]; }; then do_claude=true; fi
     if adapter_has "$adapters" codex && { [ "$AGENT" = "all" ] || [ "$AGENT" = "codex" ]; }; then do_codex=true; fi
@@ -162,7 +166,7 @@ preflight_one() {
     adapters=$(awk -F': *' '/^adapters:/{print $2; exit}' "$file")
     claude_skill=$(awk -F': *' '/^claude_skill:/{print $2; exit}' "$file")
     visibility=$(awk -F': *' '/^visibility:/{print $2; exit}' "$file"); visibility=${visibility:-local}
-    if [ "$visibility" = shared ] && printf '%s\n' "$OVERRIDE_LOCAL" | grep -qxF -- "$id"; then visibility=local; fi
+    if [ "$visibility" = shared ] && grep -qxF -- "$id" <<< "$OVERRIDE_LOCAL"; then visibility=local; fi
     [ "$visibility" = shared ] || return 0
     status=$(awk -F': *' '/^status:/{print $2; exit}' "$file"); [ "${status:-ready}" = ready ] || return 0
     if adapter_has "$adapters" claude && { [ "$AGENT" = all ] || [ "$AGENT" = claude ]; }; then
@@ -199,6 +203,22 @@ write_copilot_projection() {
     fi
 }
 
+# AGENTS.md is user-owned in a consumer repository (04feaa432), so it opts in by
+# marker: an existing WEAVE PROCEDURES block is refreshed; a file without one,
+# or no file, is left alone. Runs for every --agent value, because AGENTS.md is
+# the file any harness reads.
+write_agents_projection() {
+    local agents="$REPO/AGENTS.md" block
+    [ -f "$agents" ] && grep -q 'BEGIN WEAVE PROCEDURES' "$agents" && grep -q 'END WEAVE PROCEDURES' "$agents" || return 0
+    block=$(printf '%s\n' '<!-- BEGIN WEAVE PROCEDURES -->' "${AGENTS_LINES[@]}" '<!-- END WEAVE PROCEDURES -->')
+    awk -v block="$block" '
+        /BEGIN WEAVE PROCEDURES/ { print block; skip=1; next }
+        /END WEAVE PROCEDURES/ && skip { skip=0; next }
+        !skip { print }
+    ' "$agents" > "$agents.tmp"
+    mv "$agents.tmp" "$agents"
+}
+
 # Prune Weave-managed Codex entries (managed:true) that are no longer in the
 # active set — a procedure deleted, demoted to local, or flipped to draft.
 # Manually-authored entries (no managed flag) are always preserved.
@@ -225,7 +245,7 @@ remove_stale_claude_procedures() {
         [ -f "$dir/SKILL.md" ] || continue
         grep -qF -- "$CLAUDE_MARKER" "$dir/SKILL.md" || continue
         name=$(basename "$dir")
-        if ! printf '%s\n' "${CLAUDE_SKILLS[@]:-}" | grep -qxF -- "$name"; then
+        if ! grep -qxF -- "$name" <<< "$(printf '%s\n' "${CLAUDE_SKILLS[@]:-}")"; then
             rm -rf "$dir"
         fi
     done
@@ -237,3 +257,4 @@ for procedure in "$SOURCE"/*.md; do project_one "$procedure"; done
 remove_stale_codex_procedures
 remove_stale_claude_procedures
 write_copilot_projection
+write_agents_projection

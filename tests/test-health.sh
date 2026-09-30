@@ -51,7 +51,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -68,7 +68,7 @@ assert_not_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${RED}✗${NC} $message"
         echo "    Should NOT contain: '$needle'"
         return 1
@@ -516,7 +516,7 @@ TESTS_RUN=$((TESTS_RUN + 1))
 
 # Text output should mention invalid statuses (exits non-zero for invalid statuses)
 text_output=$($WV health 2>&1) || true
-if echo "$text_output" | grep -q "invalid status"; then
+if grep -q "invalid status" <<< "$text_output"; then
     echo -e "  ${GREEN}✓${NC} health text output shows invalid status warning"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else

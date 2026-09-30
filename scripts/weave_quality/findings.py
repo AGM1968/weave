@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 _HISTORICAL_PATH_RE = re.compile(
@@ -596,6 +597,21 @@ def _historical_severity(text: str, score: int) -> str:
     return "medium" if score >= 6 else "low"
 
 
+def _catalogued_violation_types() -> set[str]:
+    """The violation_type values contracts/violation-vocabulary-v1.json admits.
+
+    Resolved beside the package when installed ($LIB_DIR/contracts), else from
+    the repository root, the same order __main__._contracts_dir uses.
+    """
+    here = Path(__file__).resolve()
+    for base in (here.parents[1], here.parents[2]):
+        catalog = base / "contracts" / "violation-vocabulary-v1.json"
+        if catalog.is_file():
+            types = json.loads(catalog.read_text(encoding="utf-8")).get("types", {})
+            return set(types) if isinstance(types, dict) else set()
+    return set()
+
+
 def _historical_violation_type(source_kind: str, signal_type: str, text: str) -> str:
     """Infer a violation type for a promoted finding."""
     if rule_match := _HISTORICAL_RULE_RE.search(text):
@@ -1056,6 +1072,22 @@ def cmd_findings_promote(args: argparse.Namespace) -> int:
         print("Error: --parent=<node-id> is required with --apply.", file=sys.stderr)
         return 1
 
+    # --violation-type files every promoted finding under one catalogued type
+    # (wv-db68df). Without it promote can only emit historical:* or an R<n>:
+    # rule code, so a class with a canonical type (code:vacuous-verification)
+    # could not be promoted through the tool at all.
+    violation_type = str(getattr(args, "violation_type", "") or "")
+    if violation_type:
+        catalogued = _catalogued_violation_types()
+        if violation_type not in catalogued:
+            print(
+                f"Error: --violation-type {violation_type!r} is not catalogued in "
+                "contracts/violation-vocabulary-v1.json. Catalogued: "
+                + ", ".join(sorted(catalogued)),
+                file=sys.stderr,
+            )
+            return 1
+
     rc, nodes_json = _wv_cmd("list", "--json", "--all")
     if rc != 0:
         print("Error: unable to load Weave nodes.", file=sys.stderr)
@@ -1087,6 +1119,9 @@ def cmd_findings_promote(args: argparse.Namespace) -> int:
     skipped_already_promoted = 0
     skipped_invalid = 0
     for candidate in selected_candidates:
+        finding_obj = candidate.get("finding")
+        if violation_type and isinstance(finding_obj, dict):
+            candidate["finding"] = {**finding_obj, "violation_type": violation_type}
         metadata = _historical_promotion_metadata(candidate, review_window)
         reviewed_entry = {**candidate, "metadata": metadata}
         if _historical_candidate_already_promoted(

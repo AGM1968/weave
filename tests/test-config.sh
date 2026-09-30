@@ -17,7 +17,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
 
 assert_contains() {
     local haystack="$1" needle="$2" msg="${3:-contains}"
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${GREEN}✓${NC} $msg"; TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         echo -e "  ${RED}✗${NC} $msg"; echo "    expected to contain: '$needle'"; echo "    actual: '$haystack'"
@@ -27,7 +27,7 @@ assert_contains() {
 
 assert_not_contains() {
     local haystack="$1" needle="$2" msg="${3:-not contains}"
-    if ! echo "$haystack" | grep -qF -- "$needle"; then
+    if ! grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${GREEN}✓${NC} $msg"; TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         echo -e "  ${RED}✗${NC} $msg"; echo "    expected NOT to contain: '$needle'"; echo "    actual: '$haystack'"

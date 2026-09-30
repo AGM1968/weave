@@ -35,6 +35,18 @@ source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null \
 _hc_refresh
 cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 
+# Record every Stop and how it ended (wv-4efe06): "blocked" when this hook
+# refuses the stop (exit 1), else "stopped". Session start reads it with the
+# pre-action heartbeat to tell a crash from a blocked exit from a clean stop
+# that skipped SessionEnd. An EXIT trap covers the many early exits below.
+_sc_record_stop() {
+    local rc=$?
+    [ -d "${_HC_HOT_ZONE:-}" ] && printf '%s %s\n' "$(date +%s)" \
+        "$([ "$rc" -eq 1 ] && echo blocked || echo stopped)" > "${_HC_HOT_ZONE}/.session_laststop" 2>/dev/null
+    return "$rc"
+}
+trap _sc_record_stop EXIT
+
 # Cooldown lock: after emitting a block, suppress re-blocking for 120s.
 # The dirty-state checks still run; only the hard block (exit 1) is suppressed.
 # This lets the agent make progress on sync commands without being blocked on
@@ -122,6 +134,9 @@ if [ -x "${_WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
         fi
         mkdir -p "$_SC_HOT_ZONE" 2>/dev/null || true
         date +%s > "$_SC_LOCK" 2>/dev/null || true
+        # wv-664b7f: hook-common loads the observer; a Stop decision says so.
+        _HC_HOOK_EVENT=Stop
+        declare -F _hc_observe >/dev/null && _hc_observe session_end_requires_no_active_node deny
         cat << EOF
 {
     "decision": "block",

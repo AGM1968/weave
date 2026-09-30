@@ -84,6 +84,7 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
         || source "${HOME}/.config/weave/lib/wv-hook-common.sh" 2>/dev/null \
         || true
     command -v _hc_refresh >/dev/null 2>&1 && _hc_refresh
+    declare -F _hc_observe >/dev/null || _hc_observe() { return 0; }
     if [ -x "$WV" ]; then
         _agent_hook_progress "load node metadata"
         NODE_JSON=$(_agent_hook_run "node-json" "$WV" show "$NODE_ID" --json 2>/dev/null) || {
@@ -116,6 +117,7 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
             # Keep explicit false values; jq's `//` treats false as empty.
             _VF_VALID=$(printf '%s' "$_VF_OUT" | jq -r 'if has("valid") then (.valid | tostring) else "true" end' 2>/dev/null || echo "true")
             if [[ "$_VF_VALID" != "true" ]]; then
+                _hc_observe finding_close_requires_violation_type deny
                 _VF_ERRORS=$(printf '%s' "$_VF_OUT" | jq -r '.errors | join(", ")' 2>/dev/null || echo "unknown")
                 _VF_ENUM="${FINDING_VIOLATION_TYPES:-}"
                 jq -n \
@@ -123,6 +125,19 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
                     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
                 exit 0
             fi
+        fi
+
+        # --skip-verification is checked BEFORE the attribution gate, not after
+        # it (wv-e22386). The flag is the operator saying "this close does not
+        # need the evidence path", and commit attribution is part of that path;
+        # denying on attribution first made the flag unreachable for exactly the
+        # closes it exists for, and the deny then advised an amend to satisfy a
+        # requirement the caller had already waived.
+        if [[ "$COMMAND" =~ --skip-verification ]]; then
+            # The override is recorded, not silent (wv-664b7f); a trivial node
+            # was never going to be asked for evidence, so there is nothing to bypass.
+            [[ "$IS_TRIVIAL" == "false" ]] && _hc_observe close_requires_verification_evidence allow --skip-verification
+            exit 0
         fi
 
         HAS_COMMIT_METADATA=$(echo "$NODE_META" | jq -r '((.commit // "") != "" or ((.commits // []) | length > 0))' 2>/dev/null || echo "false")
@@ -183,6 +198,7 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
                 OWN_DIRTY="$DIRTY_FILES"
             fi
             if [[ -n "$OWN_DIRTY" ]]; then
+                _hc_observe close_requires_committed_work deny
                 DIRTY_SAMPLE=$(echo "$OWN_DIRTY" | head -3 | paste -sd ', ' -)
                 jq -n \
                     --arg detail "Commit work before close. Non-.weave changes are still uncommitted: $DIRTY_SAMPLE. Run git add <files> && git commit while $NODE_ID is active, then retry wv done." \
@@ -201,8 +217,9 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
                 }
             fi
             if [[ -z "$ATTRIBUTED_COMMITS" ]]; then
+                _hc_observe close_requires_attributed_commit deny
                 jq -n \
-                    --arg detail "No commit attributed to $NODE_ID. Commit before close so prepare-commit-msg can add Weave-ID: $NODE_ID, or amend the latest work commit, then retry wv done." \
+                    --arg detail "No commit attributed to $NODE_ID. Make a commit while $NODE_ID is active so prepare-commit-msg adds the Weave-ID: $NODE_ID trailer, then retry wv done. If the work is already committed, add the trailer to a NEW commit (an empty one is fine: git commit --allow-empty) rather than amending — the earlier commit may already be pushed, and rewriting a pushed commit orphans the refs recorded against it. For a close that does not need the evidence path, use --skip-verification." \
                     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
                 exit 0
             fi
@@ -243,6 +260,7 @@ if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,
                 # PreToolUse soft deny (exit 0 + hookSpecificOutput JSON)
                 # Schema: hookSpecificOutput.permissionDecision (current API, not deprecated top-level)
                 # "deny" is lowercase — "DENY" silently fails (original bug)
+                _hc_observe close_requires_verification_evidence deny
                 jq -n \
                     --arg node "$NODE_ID" \
                     --arg detail "Run: wv done $NODE_ID --verification-method=\"make check\" --verification-evidence=\"all tests pass\" ... — or wv update $NODE_ID --metadata='{\"verification_method\":\"...\"}' first — or --skip-verification for trivial tasks.${_VF_PLAN_HINT}" \

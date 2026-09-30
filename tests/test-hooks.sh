@@ -82,7 +82,7 @@ assert_contains() {
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected to find: $needle"
-        echo "  In: $(echo "$haystack" | head -3)"
+        echo "  In: $(echo "$haystack" | sed -n '1,3p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
@@ -98,7 +98,7 @@ assert_not_contains() {
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected NOT to find: $needle"
-        echo "  In: $(echo "$haystack" | head -3)"
+        echo "  In: $(echo "$haystack" | sed -n '1,3p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
@@ -248,6 +248,40 @@ add_active_node "no-shrink node" >/dev/null 2>&1
 ( cd "$TEST_DIR/project" && git add .weave/ 2>/dev/null; git diff --cached --quiet -- .weave/ || git commit -q -m "graph" ) || true
 OUTPUT=$(bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 assert_not_contains "$OUTPUT" "shrank" "session-start: no regression warning when disk matches HEAD"
+
+# Session-start snapshot stages graph state only (wv-2e6341): it swept a
+# half-written test-map.conf row into a [skip ci] 'session-start state' commit
+# that ran none of the gates a config change selects. A graph change still
+# commits; the config edit stays in the tree; a staged config edit is caller
+# work and stops the snapshot. The shrink-guard cases above are unchanged.
+setup_test_env
+PROJ="$TEST_DIR/project"
+add_active_node "snapshot scope node" >/dev/null 2>&1
+"$WV" sync >/dev/null 2>&1 || true
+printf '[map]\nsrc/a.sh = tests/test-a.sh\n' > "$PROJ/.weave/test-map.conf"
+( cd "$PROJ" && git add -A .weave/ && git commit -q -m "graph + config" ) >/dev/null 2>&1 || true
+echo 'src/b.sh = tests/test-b.sh' >> "$PROJ/.weave/test-map.conf"
+echo "- snapshot scope trail $$" >> "$PROJ/.weave/trails.md"
+_SS_BASE=$(git -C "$PROJ" rev-parse HEAD)
+bash "$HOOKS_DIR/session-start-context.sh" >/dev/null 2>&1 || true
+assert_equals "committed" "$(git -C "$PROJ" diff --quiet "$_SS_BASE" HEAD -- .weave/trails.md && echo uncommitted || echo committed)" \
+    "session-start: the snapshot still commits graph state"
+# Captured first: piped into grep -q, a MATCH could SIGPIPE git log and pipefail
+# would report it as "absent" -- a pass on the very regression this guards.
+_ss_log=$(git -C "$PROJ" log --format= --name-only "$_SS_BASE..HEAD")
+assert_equals "absent" "$(grep -qx '.weave/test-map.conf' <<< "$_ss_log" && echo present || echo absent)" \
+    "session-start: a dirty test-map.conf is not swept into the snapshot"
+assert_equals " M .weave/test-map.conf" "$(git -C "$PROJ" status --porcelain -- .weave/test-map.conf)" \
+    "session-start: the test-map.conf edit stays in the working tree"
+
+git -C "$PROJ" add .weave/test-map.conf
+echo "- staged-config trail $$" >> "$PROJ/.weave/trails.md"
+_SS_BASE=$(git -C "$PROJ" rev-parse HEAD)
+bash "$HOOKS_DIR/session-start-context.sh" >/dev/null 2>&1 || true
+assert_equals "$_SS_BASE" "$(git -C "$PROJ" rev-parse HEAD)" \
+    "session-start: a staged test-map.conf stops the snapshot commit"
+assert_equals "M  .weave/test-map.conf" "$(git -C "$PROJ" status --porcelain -- .weave/test-map.conf)" \
+    "session-start: the staged test-map.conf stays staged"
 
 # --- pre-compact-context.sh ---
 echo ""
@@ -613,6 +647,27 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 with --skip-verification bypass on real Bash payload"
 
+# --skip-verification must be reachable for a node with NO commit attribution.
+# It used to be checked AFTER the attribution gate, so the gate denied first and
+# the flag never ran -- unreachable for exactly the closes it exists for. The
+# existing bypass case above gives the node {"commit":"deadbeef"}, which routes
+# around the attribution gate entirely, so it never covered this (wv-e22386).
+UNATTRIB_ID=$(add_active_node "Skip verification, no commit attribution" 2>/dev/null | tail -1)
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $UNATTRIB_ID --skip-verification\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "pre-close: --skip-verification exits 0 with no commit attribution"
+assert_not_contains "$OUTPUT" "No commit attributed" "pre-close: --skip-verification is reached before the attribution deny"
+
+# The attribution deny must not advise amending: the earlier commit may already
+# be pushed, and rewriting it orphans the refs recorded against it.
+NOAMEND_ID=$(add_active_node "Attribution deny wording" 2>/dev/null | tail -1)
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $NOAMEND_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+set -e
+assert_not_contains "$OUTPUT" "amend the latest work commit" "pre-close: deny no longer advises amending a possibly-pushed commit"
+
 # Finding nodes require violation_type (enum) even with --skip-verification
 FINDING_ID=$(add_active_node "Finding close test" --metadata='{"type":"finding"}' 2>/dev/null | tail -1)
 set +e
@@ -648,7 +703,7 @@ assert_contains "$OUTPUT" "finding.confidence" "pre-close: invalid optional fiel
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 # Should NOT warn when verification exists
 TESTS_RUN=$((TESTS_RUN + 1))
-if ! echo "$OUTPUT" | grep -q "Verification evidence required"; then
+if ! grep -q "Verification evidence required" <<< "$OUTPUT"; then
     echo -e "${GREEN}✓${NC} pre-close: silent when verification metadata present for real Bash payload"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -835,7 +890,7 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "bash-dedup: first call exits 0 (allow)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$OUTPUT" | grep -q '"deny"'; then
+if grep -q '"deny"' <<< "$OUTPUT"; then
     echo -e "${RED}✗${NC} bash-dedup: first call must not deny"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 else
@@ -862,6 +917,30 @@ else
     echo -e "${GREEN}✓${NC} bash-dedup-post: foreground completion clears lock"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 fi
+
+# wv-d3af9a: a command another PreToolUse hook blocked never started, so no
+# PostToolUse cleared its pending lock, which then denied the corrected retry
+# for the whole 120s grace period. Past the spawn window a pending lock denies
+# only while its command is actually running.
+dedup_pending() {  # dedup_pending <age-seconds> <locked-command>
+    printf '%s\npending\n%s\n' "$(( $(date +%s) - $1 ))" "$2" > "$DEDUP_LOCK_DIR/wv-sync.lock"
+}
+dedup_try() {
+    echo '{"tool_name":"Bash","tool_input":{"command":"wv sync --gh --retry-marker"}}' \
+        | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null || true
+}
+dedup_pending 30 "wv sync --gh --blocked-marker-$$"
+assert_not_contains "$(dedup_try)" '"deny"' "bash-dedup: a pending lock whose command never started does not deny the retry"
+dedup_pending 2 "wv sync --gh --blocked-marker-$$"
+assert_contains "$(dedup_try)" '"deny"' "bash-dedup: a pending lock inside the spawn window still denies"
+bash -c "exec -a 'wv sync --gh --live-marker-$$' sleep 30" &
+DEDUP_LIVE_PID=$!
+sleep 1
+dedup_pending 30 "wv sync --gh --live-marker-$$"
+assert_contains "$(dedup_try)" '"deny"' "bash-dedup: a pending lock whose command is running still denies"
+kill "$DEDUP_LIVE_PID" 2>/dev/null || true
+wait "$DEDUP_LIVE_PID" 2>/dev/null || true
+rm -f "$DEDUP_LOCK_DIR/wv-sync.lock"
 
 # Post hook: background command (via tool_input flag) does NOT clear lock
 echo '{"tool_name":"Bash","tool_input":{"command":"wv sync --gh","run_in_background":true},"tool_response":{"output":"Command running in background with ID: abc123.","success":true}}' \
@@ -1120,6 +1199,51 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
+# Regression (wv-5af710): prettier reflowed the generated workflow-classes block
+# in templates/WORKFLOW.md after a prose edit elsewhere in the file, so
+# gen-workflow-classes.sh --check failed and make check went red. Edit prose in
+# a copy of the real doc, run the hook, then run the generator's own check.
+if command -v prettier >/dev/null 2>&1; then
+    _pel_repo="$TEST_DIR/project"
+    mkdir -p "$_pel_repo/templates" "$_pel_repo/scripts/lib"
+    # .prettierrc is dev formatter config and does not ship; the public
+    # projection's aggregate aborted here under set -e. The reflow this case
+    # guards needs only the markdown wrap settings, so seed those when absent.
+    if [ -f "$PROJECT_ROOT/.prettierrc" ]; then
+        cp "$PROJECT_ROOT/.prettierrc" "$_pel_repo/"
+    else
+        printf '%s\n' '{"proseWrap":"always","overrides":[{"files":"*.md","options":{"proseWrap":"always","printWidth":100}}]}' \
+            > "$_pel_repo/.prettierrc"
+    fi
+    cp "$PROJECT_ROOT/scripts/gen-workflow-classes.sh" "$_pel_repo/scripts/"
+    cp "$PROJECT_ROOT/scripts/lib/wv-workflow-classes.gen.sh" "$_pel_repo/scripts/lib/"
+    cp "$PROJECT_ROOT/templates/workflow-classes.conf" "$PROJECT_ROOT/templates/WORKFLOW.md" "$_pel_repo/templates/"
+    _pel_doc="$_pel_repo/templates/WORKFLOW.md"
+    _pel_region() { sed -n '/^<!-- BEGIN GENERATED/,/^<!-- END GENERATED/p' "$1"; }
+    _pel_before=$(_pel_region "$_pel_doc")
+    assert_equals "0" "$(bash "$_pel_repo/scripts/gen-workflow-classes.sh" --check >/dev/null 2>&1; echo $?)" \
+        "post-edit-lint: the copied WORKFLOW.md projection starts current"
+    # A prose paragraph far past printWidth: prettier must wrap it, which proves
+    # the formatter ran rather than being skipped.
+    _pel_long="Prose edit outside the generated block$(printf ' word%.0s' $(seq 1 40))."
+    printf '\n%s\n' "$_pel_long" >> "$_pel_doc"
+    set +e
+    echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$_pel_doc\"}}" \
+        | (cd "$_pel_repo" && bash "$HOOKS_DIR/post-edit-lint.sh") >/dev/null 2>&1
+    EXIT_CODE=$?
+    set -e
+    assert_exit_code "0" "$EXIT_CODE" "post-edit-lint: exits 0 formatting WORKFLOW.md"
+    assert_equals "absent" "$(grep -qxF -- "$_pel_long" "$_pel_doc" && echo present || echo absent)" \
+        "post-edit-lint: prettier reformatted the edited prose"
+    assert_equals "$_pel_before" "$(_pel_region "$_pel_doc")" \
+        "post-edit-lint: the generated region is byte-identical after formatting"
+    assert_equals "0" "$(bash "$_pel_repo/scripts/gen-workflow-classes.sh" --check >/dev/null 2>&1; echo $?)" \
+        "post-edit-lint: gen-workflow-classes.sh --check stays green after a prose edit"
+    unset -f _pel_region
+else
+    echo -e "${YELLOW}⊘${NC} post-edit-lint: prettier not installed, generated-region test skipped"
+fi
+
 # --- stop-check.sh (clean state) ---
 echo ""
 echo "--- stop-check.sh ---"
@@ -1254,7 +1378,16 @@ chmod +x "$SPY_HOME/.local/bin/wv"
 
 # Force the commit path and require the automation env var in pre-commit.
 # Remove the source-repo symlink so the hook falls back to HOME/.local/bin/wv.
+# That fallback belongs to an INSTALLED hook only: one run from this checkout
+# pairs with the checkout's scripts/wv (wv-706439), so running $HOOKS_DIR here
+# executed the real CLI, never the spy, and the log was never written
+# (wv-5fd0b5). Run the hook from an installed layout under the spy HOME, whose
+# resolver has no sibling wv.
 rm -f "$TEST_DIR/project/scripts/wv"
+SPY_WEAVE="$SPY_HOME/.config/weave"
+mkdir -p "$SPY_WEAVE/hooks" "$SPY_WEAVE/lib"
+cp "$HOOKS_DIR/session-end-sync.sh" "$SPY_WEAVE/hooks/"
+cp "$PROJECT_ROOT"/scripts/lib/*.sh "$SPY_WEAVE/lib/"
 echo "checkpoint" >> "$TEST_DIR/project/.weave/breadcrumbs.md"
 cat > "$TEST_DIR/project/.git/hooks/pre-commit" <<'EOF'
 #!/bin/sh
@@ -1266,11 +1399,11 @@ chmod +x "$TEST_DIR/project/.git/hooks/pre-commit"
 
 set +e
 OUTPUT=$(HOME="$SPY_HOME" CLAUDE_PROJECT_DIR="$TEST_DIR/project" \
-    bash "$HOOKS_DIR/session-end-sync.sh" <<< '{"reason":"stubbed_session_end"}' 2>/dev/null)
+    bash "$SPY_WEAVE/hooks/session-end-sync.sh" <<< '{"reason":"stubbed_session_end"}' 2>/dev/null)
 EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "session-end: exits 0 with sync --gh stub + automation pre-commit"
-WV_CALLS=$(cat "$WV_LOG")
+WV_CALLS=$(cat "$WV_LOG" 2>/dev/null || echo "<spy never invoked>")
 assert_contains "$WV_CALLS" "sync --gh" "session-end: calls wv sync --gh"
 LAST_MSG=$(git -C "$TEST_DIR/project" log -1 --pretty=%s 2>/dev/null || true)
 assert_contains "$LAST_MSG" "auto-checkpoint" "session-end: auto-checkpoint commit succeeds without blanket bypass"
@@ -1362,6 +1495,235 @@ assert_contains "$OUTPUT" "tests/test-hooks.sh" "git pre-commit: selects tests/t
 QUEUE_FILE="$TEST_DIR/project/.git/.weave-deferred-suites"
 assert_equals "absent" "$(if [ -f "$QUEUE_FILE" ]; then echo present; else echo absent; fi)" "git pre-commit: no deferred queue written (test-core.sh excluded from pre-commit)"
 
+# wv-8138ec: the selected suites run as a bounded pool. Two planted suites
+# rendezvous — each writes its marker and waits for the other's — so they pass
+# only when they genuinely overlap; run one after the other, the first times
+# out. $2/$3 are each suite's exit code after the rendezvous; a suite that
+# fails prints a line the replay must carry.
+_pool_setup() {
+    setup_test_env
+    mkdir -p "$TEST_DIR/project/tests" "$TEST_DIR/project/src"
+    POOL_DIR="$TEST_DIR/pool"
+    mkdir -p "$POOL_DIR"
+    for _pool_s in a b; do
+        _pool_o=$([ "$_pool_s" = a ] && echo b || echo a)
+        _pool_rc=$([ "$_pool_s" = a ] && echo "$2" || echo "$3")
+        cat > "$TEST_DIR/project/tests/test-p$_pool_s.sh" <<EOF
+#!/bin/sh
+touch "$POOL_DIR/$_pool_s"
+n=0
+while [ ! -f "$POOL_DIR/$_pool_o" ] && [ \$n -lt ${POOL_WAIT:-100} ]; do sleep 0.1; n=\$((n + 1)); done
+[ -f "$POOL_DIR/$_pool_o" ] || { echo "✗ rendezvous timed out waiting for $_pool_o"; exit 3; }
+[ "$_pool_rc" = 0 ] || echo "✗ planted assertion in p$_pool_s"
+exit $_pool_rc
+EOF
+        chmod +x "$TEST_DIR/project/tests/test-p$_pool_s.sh"
+    done
+    git -C "$TEST_DIR/project" add tests/test-pa.sh tests/test-pb.sh
+    git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q -m "pool suites"
+    printf '[map]\nsrc/app.sh = tests/test-pa.sh tests/test-pb.sh\n' > "$TEST_DIR/project/.weave/test-map.conf"
+    printf '#!/bin/sh\necho %s\n' "$1" > "$TEST_DIR/project/src/app.sh"
+    git -C "$TEST_DIR/project" add src/app.sh
+    add_active_node "Suite pool task" --criteria="pool runs suites|pool reports failures" --risks=low >/dev/null 2>&1
+}
+_pool_run() {
+    set +e
+    OUTPUT=$(cd "$TEST_DIR/project" && WV_GATE_JOBS="$1" bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+    EXIT_CODE=$?
+    set -e
+}
+
+_pool_setup pool-green 0 0
+_pool_run 2
+assert_exit_code "0" "$EXIT_CODE" "suite pool: two suites that must overlap both pass at WV_GATE_JOBS=2"
+assert_contains "$OUTPUT" "running 2 suites, up to 2 at a time" "suite pool: announces the bound"
+assert_contains "$OUTPUT" "passed tests/test-pa.sh" "suite pool: reports suite a as it finishes"
+assert_contains "$OUTPUT" "passed tests/test-pb.sh" "suite pool: reports suite b as it finishes"
+
+_pool_setup pool-red 1 0
+_pool_run 2
+assert_exit_code "1" "$EXIT_CODE" "suite pool: one failing suite fails the gate"
+assert_contains "$OUTPUT" "✗ tests/test-pa.sh failed (exit 1)" "suite pool: the failure names its suite and exit code"
+assert_contains "$OUTPUT" "planted assertion in pa" "suite pool: the failing suite's own output is replayed"
+assert_contains "$OUTPUT" "full output: " "suite pool: the full captured output is kept on disk"
+assert_not_contains "$OUTPUT" "✗ tests/test-pb.sh failed" "suite pool: the passing sibling is not reported as failed"
+
+# Serial bound: the rendezvous cannot complete, so whichever suite launches
+# first fails (launch order is longest-first, and the cases above have just
+# measured both), and the one queued behind it must not start once the gate
+# has its verdict.
+POOL_WAIT=5 _pool_setup pool-serial 0 0
+_pool_run 1
+assert_exit_code "1" "$EXIT_CODE" "suite pool: WV_GATE_JOBS=1 runs suites one at a time"
+assert_contains "$OUTPUT" "rendezvous timed out waiting for" "suite pool: serial run replays the timeout line"
+assert_contains "$OUTPUT" "not run after the failure: tests/test-p" "suite pool: no suite starts after a failure"
+assert_equals "1" "$(find "$POOL_DIR" -type f | wc -l | tr -d ' ')" \
+    "suite pool: exactly one suite ran; the queued one really did not start"
+
+# The ledger lives in the live DB, and some suites read that DB (test-trailer-
+# refs.sh hashes it around its audit). So the pool writes no ledger row while a
+# suite is still running: pa finishes at once; pb hashes the DB, waits until
+# pa has finished and the pool has had time to reap it, and hashes again.
+setup_test_env
+mkdir -p "$TEST_DIR/project/tests" "$TEST_DIR/project/src"
+POOL_DIR="$TEST_DIR/pool"
+mkdir -p "$POOL_DIR"
+printf '#!/bin/sh\ntouch "%s/a-done"\nexit 0\n' "$POOL_DIR" > "$TEST_DIR/project/tests/test-pa.sh"
+cat > "$TEST_DIR/project/tests/test-pb.sh" <<EOF
+#!/bin/sh
+before=\$(cksum < "$WV_DB")
+n=0
+while [ ! -f "$POOL_DIR/a-done" ] && [ \$n -lt 100 ]; do sleep 0.1; n=\$((n + 1)); done
+sleep 3
+after=\$(cksum < "$WV_DB")
+[ "\$before" = "\$after" ] || { echo "✗ the live DB changed while this suite ran"; exit 1; }
+exit 0
+EOF
+chmod +x "$TEST_DIR/project/tests/test-pa.sh" "$TEST_DIR/project/tests/test-pb.sh"
+git -C "$TEST_DIR/project" add tests/test-pa.sh tests/test-pb.sh
+git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q -m "pool quiet suites"
+printf '[map]\nsrc/app.sh = tests/test-pa.sh tests/test-pb.sh\n' > "$TEST_DIR/project/.weave/test-map.conf"
+printf '#!/bin/sh\necho quiet\n' > "$TEST_DIR/project/src/app.sh"
+git -C "$TEST_DIR/project" add src/app.sh
+add_active_node "Suite pool quiet task" --criteria="pool runs suites|pool writes no ledger row mid-run" --risks=low >/dev/null 2>&1
+_pool_run 2
+assert_exit_code "0" "$EXIT_CODE" "suite pool: no ledger row is written while a sibling suite runs"
+assert_not_contains "$OUTPUT" "the live DB changed" "suite pool: the reading suite saw an unchanged DB"
+_pool_recorded() {
+    (cd "$TEST_DIR/project" && "$WV" test-status "$1" --files=src/app.sh --staged --quiet >/dev/null 2>&1) \
+        && echo yes || echo no
+}
+assert_equals "yes yes" "$(_pool_recorded tests/test-pa.sh) $(_pool_recorded tests/test-pb.sh)" \
+    "suite pool: both results are recorded once the pool drains"
+
+# Interrupted gate (ultrareview #4575): a suite that already finished keeps its
+# result; the one that was stopped records nothing. pa finishes at once, pb
+# sleeps; the gate gets SIGTERM while pb still runs.
+setup_test_env
+mkdir -p "$TEST_DIR/project/tests" "$TEST_DIR/project/src"
+POOL_DIR="$TEST_DIR/pool"
+mkdir -p "$POOL_DIR"
+printf '#!/bin/sh\ntouch "%s/a-done"\nexit 0\n' "$POOL_DIR" > "$TEST_DIR/project/tests/test-pa.sh"
+printf '#!/bin/sh\nsleep 37\nexit 0\n' > "$TEST_DIR/project/tests/test-pb.sh"
+chmod +x "$TEST_DIR/project/tests/test-pa.sh" "$TEST_DIR/project/tests/test-pb.sh"
+git -C "$TEST_DIR/project" add tests/test-pa.sh tests/test-pb.sh
+git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q -m "pool interrupt suites"
+printf '[map]\nsrc/app.sh = tests/test-pa.sh tests/test-pb.sh\n' > "$TEST_DIR/project/.weave/test-map.conf"
+printf '#!/bin/sh\necho interrupt\n' > "$TEST_DIR/project/src/app.sh"
+git -C "$TEST_DIR/project" add src/app.sh
+add_active_node "Suite pool interrupt task" --criteria="pool records finished results|stopped suites record nothing" --risks=low >/dev/null 2>&1
+( cd "$TEST_DIR/project" && WV_GATE_JOBS=2 exec bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" ) >/dev/null 2>&1 &
+_pool_gate=$!
+_pool_n=0
+while [ ! -f "$POOL_DIR/a-done" ] && [ "$_pool_n" -lt 200 ]; do sleep 0.1; _pool_n=$((_pool_n + 1)); done
+sleep 1
+# Under set -e: the killed gate's status (130) must not end this suite.
+kill -TERM "$_pool_gate" 2>/dev/null || true
+wait "$_pool_gate" 2>/dev/null || true
+assert_equals "yes no" "$(_pool_recorded tests/test-pa.sh) $(_pool_recorded tests/test-pb.sh)" \
+    "suite pool: an interrupted gate records the finished suite and not the stopped one"
+sleep 0.5
+# Anchored: an unanchored -f pattern also matches any shell whose command line
+# merely contains the text (the one running this suite, for instance).
+assert_equals "0" "$(pgrep -fc '^sleep 37$' 2>/dev/null || true)" \
+    "suite pool: an interrupted gate leaves none of the stopped suite's processes running"
+
+# Git runs the hook with GIT_INDEX_FILE set (a temporary index for
+# 'git commit -- <paths>'); a suite must not inherit it, or git in the suite's
+# own temp repository writes into this commit's index (wv-34ef3d).
+setup_test_env
+mkdir -p "$TEST_DIR/project/tests" "$TEST_DIR/project/src"
+cat > "$TEST_DIR/project/tests/test-pa.sh" <<'EOF'
+#!/bin/sh
+for v in GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX; do
+    eval "val=\${$v:-}"
+    [ -z "$val" ] || { echo "✗ $v leaked into the suite: $val"; exit 1; }
+done
+exit 0
+EOF
+chmod +x "$TEST_DIR/project/tests/test-pa.sh"
+git -C "$TEST_DIR/project" add tests/test-pa.sh
+git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q -m "env probe suite"
+printf '[map]\nsrc/app.sh = tests/test-pa.sh\n' > "$TEST_DIR/project/.weave/test-map.conf"
+printf '#!/bin/sh\necho env\n' > "$TEST_DIR/project/src/app.sh"
+git -C "$TEST_DIR/project" add src/app.sh
+add_active_node "Suite env isolation task" --criteria="suites start without git repository variables|hook still reads the staged index" --risks=low >/dev/null 2>&1
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && GIT_INDEX_FILE="$TEST_DIR/project/.git/index" GIT_PREFIX="" \
+    bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "suite pool: a suite does not inherit the commit's GIT_INDEX_FILE"
+assert_not_contains "$OUTPUT" "leaked into the suite" "suite pool: no git repository variable reaches the suite"
+
+# wv-a118d6: .weave/ configuration is gated like any other file; only graph
+# state skips selection. The hook used to drop every staged .weave/ path, so the
+# '.weave/test-map.conf = ...' row never fired and a map-only commit exited 0
+# with no suite. The project links this checkout's libs so the hook tests the
+# source allowlist, not whatever is installed. Each case writes a distinct map
+# so a green ledger row from the previous case cannot be reused.
+_a118_setup() {
+    setup_test_env
+    mkdir -p "$TEST_DIR/project/tests"
+    for _a118_lib in wv-config.sh wv-validate.sh wv-checkpoint-ci.sh; do
+        ln -sf "$PROJECT_ROOT/scripts/lib/$_a118_lib" "$TEST_DIR/project/scripts/lib/$_a118_lib"
+    done
+    A118_MARKER="$TEST_DIR/map-guard-ran"
+    rm -f "$A118_MARKER"
+    printf '#!/bin/sh\necho ran >> "%s"\nexit %s\n' "$A118_MARKER" "$1" > "$TEST_DIR/project/tests/test-map-guard.sh"
+    chmod +x "$TEST_DIR/project/tests/test-map-guard.sh"
+    git -C "$TEST_DIR/project" add tests/test-map-guard.sh
+    git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q -m "guard suite"
+    printf '[map]\n# case: %s\n.weave/test-map.conf = tests/test-map-guard.sh\n.weave/nodes.jsonl = tests/test-map-guard.sh\n.weave/state.sql = tests/test-map-guard.sh\n' \
+        "$2" > "$TEST_DIR/project/.weave/test-map.conf"
+}
+_a118_run() {
+    set +e
+    OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+    EXIT_CODE=$?
+    set -e
+}
+
+_a118_setup 0 map-only
+git -C "$TEST_DIR/project" add .weave/test-map.conf
+add_active_node "Map-only commit gate task" --criteria="map row fires|graph state skips" --risks=low >/dev/null 2>&1
+_a118_run
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: a map-only commit passes when its mapped suite passes"
+assert_contains "$OUTPUT" "running tests/test-map-guard.sh" \
+    "git pre-commit: a map-only commit runs the suite its own test-map row names"
+assert_equals "1" "$(wc -l < "$A118_MARKER" 2>/dev/null | tr -d ' ' || echo 0)" \
+    "git pre-commit: the map-only commit's suite executed once"
+
+_a118_setup 1 map-only-red
+git -C "$TEST_DIR/project" add .weave/test-map.conf
+add_active_node "Map-only red gate task" --criteria="failing map suite blocks" --risks=low >/dev/null 2>&1
+_a118_run
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: a failing suite mapped from test-map.conf blocks a map-only commit"
+
+_a118_setup 0 with-other-files
+mkdir -p "$TEST_DIR/project/src"
+echo 'echo hi' > "$TEST_DIR/project/src/other.sh"
+git -C "$TEST_DIR/project" add .weave/test-map.conf src/other.sh
+add_active_node "Map plus source gate task" --criteria="map row fires alongside source" --risks=low >/dev/null 2>&1
+_a118_run
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: test-map.conf staged with other files passes"
+assert_contains "$OUTPUT" "running tests/test-map-guard.sh" \
+    "git pre-commit: test-map.conf staged with other files still selects its mapped suite"
+
+# Graph state keeps skipping selection even when a map row names it.
+_a118_setup 1 graph-state
+git -C "$TEST_DIR/project" add -f .weave/test-map.conf
+git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q -m "map"
+echo '{"id":"wv-000001"}' > "$TEST_DIR/project/.weave/nodes.jsonl"
+echo '-- dump' > "$TEST_DIR/project/.weave/state.sql"
+git -C "$TEST_DIR/project" add -f .weave/nodes.jsonl .weave/state.sql
+_a118_run
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: a graph-state-only commit is allowed through"
+assert_not_contains "$OUTPUT" "running tests/test-map-guard.sh" \
+    "git pre-commit: graph-state files do not select suites, even with a map row"
+assert_equals "absent" "$(if [ -f "$A118_MARKER" ]; then echo present; else echo absent; fi)" \
+    "git pre-commit: no suite executed for a graph-state-only commit"
+
 # Verify scripts/cmd/*.sh changes do not trigger test-core.sh
 setup_test_env
 mkdir -p "$TEST_DIR/project/scripts/cmd" "$TEST_DIR/project/tests"
@@ -1408,10 +1770,14 @@ assert_contains "$OUTPUT" "impact gate inert: no .weave/test-map.conf found" \
 setup_test_env
 mkdir -p "$TEST_DIR/project/src"
 printf '[map]\nsrc/ = tests/test-graph.sh\n' > "$TEST_DIR/project/.weave/test-map.conf"
+# Commit the map first: a staged test-map.conf is itself a gated file
+# (wv-a118d6) and would be named as unmatched alongside docs.md.
+git -C "$TEST_DIR/project" add .weave/test-map.conf
+git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q -m "map"
 cat > "$TEST_DIR/project/docs.md" <<'EOF'
 # unrelated docs change, not covered by the src/ mapping above
 EOF
-git -C "$TEST_DIR/project" add docs.md .weave/test-map.conf
+git -C "$TEST_DIR/project" add docs.md
 add_active_node "Git hook unmatched-config task" --criteria="present-but-nonmatching config is distinguished|unmatched file is named" --risks=low >/dev/null 2>&1
 set +e
 OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
@@ -1489,17 +1855,18 @@ set -e
 assert_exit_code "1" "$EXIT_CODE" "git pre-commit: discover phase blocks non-.weave commit without active node"
 assert_contains "$OUTPUT" "No active Weave node" "git pre-commit: discover phase emits no-active-node message"
 
-# discover phase with only .weave/ files staged must pass (already handled by early exit)
+# discover phase with only graph state staged must pass (early exit). Graph
+# state, not any .weave/ file: configuration under .weave/ is gated (wv-a118d6).
 setup_test_env
 printf '%s' discover > "$WV_HOT_ZONE/.session_phase"
 mkdir -p "$TEST_DIR/project/.weave"
-echo "{}" > "$TEST_DIR/project/.weave/state.json"
-git -C "$TEST_DIR/project" add .weave/state.json
+echo "{}" > "$TEST_DIR/project/.weave/nodes.jsonl"
+git -C "$TEST_DIR/project" add -f .weave/nodes.jsonl
 set +e
 OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
 EXIT_CODE=$?
 set -e
-assert_exit_code "0" "$EXIT_CODE" "git pre-commit: discover phase allows .weave/-only commit"
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: discover phase allows a graph-state-only commit"
 
 setup_test_env
 HOOK_ID=$(add_active_node "Prepare hook task" --criteria="hook adds trailer|smoke passes" --risks=low 2>/dev/null | tail -1)
@@ -1517,6 +1884,24 @@ MSG_CONTENT=$(cat "$MSG_FILE")
 assert_contains "$MSG_CONTENT" "Weave-ID: $HOOK_ID" "prepare-commit-msg hook appends active Weave-ID"
 assert_contains "$MSG_CONTENT" "Weave-ID: $HOOK_ID_2" "prepare-commit-msg hook appends every current-agent active ID"
 assert_not_contains "$MSG_CONTENT" "Weave-ID: $FOREIGN_HOOK_ID" "prepare-commit-msg hook excludes foreign-agent active IDs"
+
+# A message ending in Co-Authored-By takes the rewrite branch: the trailer goes
+# above the co-author line, and the rewritten file replaces the message
+# (wv-8561b6: with '&& mv' flipped to '|| mv' the rewrite was discarded and
+# every suite still passed).
+printf 'hook smoke\n\nCo-Authored-By: Someone <someone@example.com>\n' > "$MSG_FILE"
+set +e
+(cd "$TEST_DIR/project" && sh "$PROJECT_ROOT/scripts/hooks/prepare-commit-msg-weave.sh" "$MSG_FILE" >/dev/null 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "prepare-commit-msg hook exits 0 on a co-authored message"
+ABOVE_COAUTHOR=$(awk '/^Co-Authored-By:/ {exit} {print}' "$MSG_FILE")
+assert_contains "$ABOVE_COAUTHOR" "Weave-ID: $HOOK_ID" \
+    "prepare-commit-msg hook writes the trailer above Co-Authored-By"
+assert_contains "$ABOVE_COAUTHOR" "Weave-ID: $HOOK_ID_2" \
+    "prepare-commit-msg hook writes every trailer above Co-Authored-By"
+assert_equals "0" "$(find "$TEST_DIR/project" -maxdepth 1 -name 'COMMIT_EDITMSG.wv*' | wc -l | tr -d ' ')" \
+    "prepare-commit-msg hook leaves no rewrite temp file behind"
 
 # ============================================================
 # INTEGRATION TEST: Full session lifecycle
@@ -1563,7 +1948,7 @@ assert_exit_code "0" "$EXIT_CODE" "lifecycle: close soft-denied without verifica
 "$WV" update "$TASK_ID" --metadata='{"verification":{"method":"test","command":"echo ok","result":"pass","evidence":"lifecycle test"}}' 2>/dev/null
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $TASK_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
 TESTS_RUN=$((TESTS_RUN + 1))
-if ! echo "$OUTPUT" | grep -q "Verification evidence required"; then
+if ! grep -q "Verification evidence required" <<< "$OUTPUT"; then
     echo -e "${GREEN}✓${NC} lifecycle: close allowed with verification"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -1588,25 +1973,38 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "lifecycle: stop-check passes with clean state"
 
 # 10. Session end
+# The stub replaces the project's scripts/wv, the first place the resolver
+# looks. A stub in HOME/.local/bin is never reached from a checkout hook, which
+# pairs with the checkout's own wv (wv-706439), so it silently ran the real CLI
+# -- sync --gh included -- against this fixture (wv-5fd0b5).
 LIFECYCLE_HOME="$TEST_DIR/lifecycle-home"
-mkdir -p "$LIFECYCLE_HOME/.local/bin"
-cat > "$LIFECYCLE_HOME/.local/bin/wv" <<'EOF'
+LIFECYCLE_LOG="$TEST_DIR/lifecycle-wv-calls.log"
+mkdir -p "$LIFECYCLE_HOME"
+rm -f "$TEST_DIR/project/scripts/wv"
+cat > "$TEST_DIR/project/scripts/wv" <<EOF
 #!/bin/sh
+echo "\$*" >> "$LIFECYCLE_LOG"
 exit 0
 EOF
-chmod +x "$LIFECYCLE_HOME/.local/bin/wv"
-rm -f "$TEST_DIR/project/scripts/wv"
+chmod +x "$TEST_DIR/project/scripts/wv"
 set +e
 OUTPUT=$(HOME="$LIFECYCLE_HOME" CLAUDE_PROJECT_DIR="$TEST_DIR/project" \
     bash "$HOOKS_DIR/session-end-sync.sh" <<< '{"reason":"lifecycle_test"}' 2>/dev/null)
 EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "lifecycle: session ends cleanly"
+assert_contains "$(cat "$LIFECYCLE_LOG" 2>/dev/null || echo "<stub never invoked>")" "sync --gh" \
+    "lifecycle: session end reaches the project's wv, not another copy"
 
 # 11. Pre-compact preserves context during lifecycle
 add_active_node "Another active task" 2>/dev/null
 OUTPUT=$(bash "$HOOKS_DIR/pre-compact-context.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "Active:" "lifecycle: pre-compact reports active work during session"
+
+# Put back the real wv the lifecycle stub replaced: later sections reach the
+# project's scripts/wv first, and context-guard now asks it for the policy
+# (wv-f757a4) -- against the stub every policy check read "unknown".
+ln -sf "$WV" "$TEST_DIR/project/scripts/wv"
 
 # ============================================================
 # Context-guard tests (S1.5 + S1.6)
@@ -1682,8 +2080,12 @@ echo ""
 echo "--- session-start: JSONL bridge (crash path) ---"
 setup_test_env
 
-# Plant a crash sentinel
-echo '{"ts":"2026-03-27T00:00:00Z","active":["wv-aabbcc"]}' > "$WV_HOT_ZONE/.session_sentinel"
+# Plant a crash sentinel over a real active node: the hook reports the graph's
+# active nodes at exit, not the sentinel's start-time list (wv-4efe06). No stop
+# record, so the previous session died mid-turn.
+add_active_node "Active at crash" >/dev/null 2>&1
+"$WV" sync 2>/dev/null || true
+echo '{"ts":"2026-03-27T00:00:00Z","active":[]}' > "$WV_HOT_ZONE/.session_sentinel"
 
 BRIDGE_HOME="$TEST_DIR/bridge-home"
 mkdir -p "$BRIDGE_HOME"
@@ -1735,14 +2137,16 @@ echo "--- session-start: JSONL bridge (degradation, no JSONL) ---"
 setup_test_env
 
 # Crash sentinel with no JSONL for this (unique temp) project path — bridge must degrade
-echo '{"ts":"2026-03-27T00:01:00Z","active":["wv-ccddee"]}' > "$WV_HOT_ZONE/.session_sentinel"
+add_active_node "Active at crash, no JSONL" >/dev/null 2>&1
+"$WV" sync 2>/dev/null || true
+echo '{"ts":"2026-03-27T00:01:00Z","active":[]}' > "$WV_HOT_ZONE/.session_sentinel"
 # _BRIDGE_SLUG dir was deleted above; isolated HOME has no JSONL for this slug
 
 OUTPUT=$(HOME="$BRIDGE_HOME" bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "CRASH DETECTED" "JSONL bridge: crash detected even without JSONL"
 # Must not contain "Last prompt:" when no JSONL available
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$OUTPUT" | grep -qF "Last prompt:"; then
+if grep -qF "Last prompt:" <<< "$OUTPUT"; then
     echo -e "${RED}✗${NC} JSONL bridge: degrades gracefully when no JSONL (unexpected Last prompt: found)"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 else
@@ -1876,12 +2280,19 @@ assert_contains "$META_FILES" "foo.py" "touched-files: active node metadata.touc
 NODE_FILE_PATH=$(sqlite3 "$TF_DB" "SELECT path FROM node_files WHERE node_id='wv-active1' AND path='foo.py';" 2>/dev/null)
 assert_equals "foo.py" "$NODE_FILE_PATH" "touched-files: node_files row written for active node"
 
+# 2b) A file outside the repository is not the node's work (wv-67c7b6): it got
+# attributed absolute, no test map could route it, and wv done read it stale.
+echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"/tmp/wv-outside-repo/notes.md\"},\"tool_response\":{\"success\":true}}" \
+    | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
+assert_equals "0" "$(sqlite3 "$TF_DB" "SELECT COUNT(*) FROM node_files WHERE path LIKE '/%';" 2>/dev/null)" \
+    "touched-files: a path outside the repository is not attributed to the node"
+
 # 3) Failed tool call: skipped
-echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/never.py\"},\"tool_response\":{\"success\":false}}" \
+echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project/never.py\"},\"tool_response\":{\"success\":false}}" \
     | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
 RING_CONTENT=$(cat "$RING_FILE" 2>/dev/null || echo "")
 TESTS_RUN=$((TESTS_RUN + 1))
-if ! echo "$RING_CONTENT" | grep -qF "never.py"; then
+if ! grep -qF "never.py" <<< "$RING_CONTENT"; then
     echo -e "${GREEN}✓${NC} touched-files: failed tool call is skipped"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -1908,7 +2319,7 @@ RING_LINES=$(wc -l < "$RING_FILE" 2>/dev/null || echo 0)
 assert_equals "3" "$RING_LINES" "touched-files: ring respects cap (last 3 of 5)"
 RING_CONTENT=$(cat "$RING_FILE" 2>/dev/null || echo "")
 TESTS_RUN=$((TESTS_RUN + 1))
-if ! echo "$RING_CONTENT" | grep -qF "file1.py"; then
+if ! grep -qF "file1.py" <<< "$RING_CONTENT"; then
     echo -e "${GREEN}✓${NC} touched-files: oldest path evicted"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -1921,7 +2332,7 @@ assert_contains "$RING_CONTENT" "file5.py" "touched-files: newest path retained"
 export WV_TOUCHED_NODE_CAP=2
 sqlite3 "$TF_DB" "UPDATE nodes SET metadata='{}' WHERE id='wv-active1';"
 for i in a b c d; do
-    echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/${i}.py\"},\"tool_response\":{\"success\":true}}" \
+    echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project/${i}.py\"},\"tool_response\":{\"success\":true}}" \
         | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
 done
 NODE_COUNT=$(sqlite3 "$TF_DB" "SELECT json_array_length(json_extract(metadata, '\$.touched_files')) FROM nodes WHERE id='wv-active1';" 2>/dev/null)
@@ -1946,12 +2357,12 @@ assert_touched_files_tool() {
     assert_contains "$tool_meta" "$expected_path" "touched-files: ${tool_name} participates in attribution"
 }
 
-assert_touched_files_tool "create_file" "filePath" "$TEST_DIR/vscode.py" "vscode.py"
-assert_touched_files_tool "replace_string_in_file" "filePath" "$TEST_DIR/replace.py" "replace.py"
-assert_touched_files_tool "insert_edit_into_file" "filePath" "$TEST_DIR/insert.py" "insert.py"
-assert_touched_files_tool "multi_replace_string_in_file" "filePath" "$TEST_DIR/multi.py" "multi.py"
-assert_touched_files_tool "NotebookEdit" "path" "$TEST_DIR/notebook.ipynb" "notebook.ipynb"
-assert_touched_files_tool "edit_notebook_file" "filePath" "$TEST_DIR/edit-notebook.ipynb" "edit-notebook.ipynb"
+assert_touched_files_tool "create_file" "filePath" "$TEST_DIR/project/vscode.py" "vscode.py"
+assert_touched_files_tool "replace_string_in_file" "filePath" "$TEST_DIR/project/replace.py" "replace.py"
+assert_touched_files_tool "insert_edit_into_file" "filePath" "$TEST_DIR/project/insert.py" "insert.py"
+assert_touched_files_tool "multi_replace_string_in_file" "filePath" "$TEST_DIR/project/multi.py" "multi.py"
+assert_touched_files_tool "NotebookEdit" "path" "$TEST_DIR/project/notebook.ipynb" "notebook.ipynb"
+assert_touched_files_tool "edit_notebook_file" "filePath" "$TEST_DIR/project/edit-notebook.ipynb" "edit-notebook.ipynb"
 
 # 8) Stale primary falls back to an active node and clears the stale stamp
 PRIMARY_FILE="$WV_HOT_ZONE/primary"
@@ -1960,7 +2371,7 @@ sqlite3 "$TF_DB" "UPDATE nodes SET updated_at=datetime('now', '-1 hour') WHERE i
 sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-active2', 'active', '{}', datetime('now'));"
 echo "wv-old-primary" > "$PRIMARY_FILE"
 sqlite3 "$TF_DB" "UPDATE nodes SET metadata='{}' WHERE id='wv-active2';"
-echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/fallback.py\"},\"tool_response\":{\"success\":true}}" \
+echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project/fallback.py\"},\"tool_response\":{\"success\":true}}" \
     | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
 FALLBACK_META=$(sqlite3 "$TF_DB" "SELECT json_extract(metadata, '\$.touched_files') FROM nodes WHERE id='wv-active2';" 2>/dev/null)
 assert_contains "$FALLBACK_META" "fallback.py" "touched-files: stale primary falls back to an active node"
@@ -2136,6 +2547,123 @@ assert_equals "" "$MC_CODE" "memory-capture: ignores non-memory file writes"
 MC_FAIL=$(printf '{"tool_name":"Write","tool_response":{"success":false},"tool_input":{"file_path":"%s/a.md"}}' "$mc_memdir" \
     | HOME="$mc_home" WV_PROJECT_DIR="$TEST_DIR/project" WV_HOT_ZONE="$TEST_DIR" bash "$HOOKS_DIR/post-memory-capture.sh" 2>/dev/null || true)
 assert_equals "" "$MC_FAIL" "memory-capture: skips on failed tool call"
+
+# 5. Opt-in import (WV_MEMORY_CAPTURE=1) runs the first EXECUTABLE wv candidate:
+# a project scripts/wv that is not executable is skipped for the checkout's own.
+# Neither the import path nor the candidate walk had a case (wv-e53f56: '&&'
+# flipped to '||' took the project's file, and '-z' flipped to '-n' exited
+# exactly when a wv was found; both survived every suite).
+mc_ck="$TEST_DIR/mc-checkout"
+mkdir -p "$mc_ck/.claude/hooks" "$mc_ck/scripts/lib"
+cp "$HOOKS_DIR/post-memory-capture.sh" "$mc_ck/.claude/hooks/"
+cp "$PROJECT_ROOT/scripts/lib/wv-resolve-project.sh" "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" \
+    "$PROJECT_ROOT/scripts/lib/wv-hook-common.sh" "$mc_ck/scripts/lib/"
+MC_LOG="$TEST_DIR/mc-import.log"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$MC_LOG" > "$mc_ck/scripts/wv"
+chmod +x "$mc_ck/scripts/wv"
+rm -f "$TEST_DIR/project/scripts/wv"
+printf '#!/bin/sh\nexit 0\n' > "$TEST_DIR/project/scripts/wv"
+chmod -x "$TEST_DIR/project/scripts/wv"
+printf '{"tool_name":"Write","tool_response":{"success":true},"tool_input":{"file_path":"%s/a.md"}}' "$mc_memdir" \
+    | HOME="$mc_home" WV_PROJECT_DIR="$TEST_DIR/project" WV_HOT_ZONE="$TEST_DIR" WV_MEMORY_CAPTURE=1 \
+      bash "$mc_ck/.claude/hooks/post-memory-capture.sh" >/dev/null 2>&1 || true
+assert_contains "$(cat "$MC_LOG" 2>/dev/null || echo "<no wv ran>")" "memory import --source=claude --path=$mc_memdir" \
+    "memory-capture: opt-in import runs the first executable wv, skipping a non-executable one"
+
+# ============================================================
+# Agent-hook branches the S0 re-measure found undriven (wv-e53f56)
+# ============================================================
+echo ""
+echo "--- agent-hook branches (wv-e53f56) ---"
+
+# context-guard: a Weave history over 100 nodes lowers the load policy, a small
+# one does not. The existing policy case ran without a nodes.jsonl at all, so
+# the history branch never executed and flipping '-gt 100' survived.
+setup_test_env
+export POLICY_CACHE="$TEST_DIR/.context_policy"
+for cg_n in 150 5; do
+    rm -f "$POLICY_CACHE"
+    seq 1 "$cg_n" | sed 's/.*/{}/' > "$TEST_DIR/project/.weave/nodes.jsonl"
+    bash "$HOOKS_DIR/context-guard.sh" >/dev/null 2>&1 || true
+    cg_policy=$(head -1 "$POLICY_CACHE" 2>/dev/null || echo "<no policy cached>")
+    if [ "$cg_n" -gt 100 ]; then
+        assert_equals "LOW" "$cg_policy" "context-guard: a ${cg_n}-node history lowers the policy to LOW"
+    else
+        assert_equals "HIGH" "$cg_policy" "context-guard: a ${cg_n}-node history keeps a small repo HIGH"
+    fi
+done
+
+# pre-compact: the checkpoint folds into a previous graph-only checkpoint, but
+# never amends a commit that carries code, and its message is the checkpoint
+# line with at most the skip-ci marker (flipping the marker's '&&' to '||'
+# appended the helper's name instead).
+# WV_DB is exported for this whole suite, and an overridden WV_DB makes wv sync
+# write nothing to .weave/, so the hook never had anything to commit here. It
+# resolves to the same file through WV_HOT_ZONE, so drop it for this block.
+setup_test_env
+cd "$TEST_DIR/project"
+pc_saved_wv_db="${WV_DB:-}"
+unset WV_DB
+# The hook's own 'wv sync' commits .weave/ as "sync state" when it can; the
+# checkpoint logic under test runs only when that commit was skipped (throttled
+# after a recent auto-checkpoint), so hold it off for the whole block.
+export _WV_SKIP_SYNC_COMMIT=1
+add_active_node "pre-compact amend fixture one" >/dev/null 2>&1
+"$WV" sync >/dev/null 2>&1 || true
+git add .weave && git commit -qm "chore(weave): auto-checkpoint 10:00" || true
+pc_count=$(git rev-list --count HEAD)
+add_active_node "pre-compact amend fixture two" >/dev/null 2>&1
+bash "$HOOKS_DIR/pre-compact-context.sh" >/dev/null 2>&1 || true
+assert_equals "$pc_count" "$(git rev-list --count HEAD)" \
+    "pre-compact: new graph state folds into a graph-only checkpoint"
+
+printf 'print(1)\n' > app.py
+add_active_node "pre-compact code fixture" >/dev/null 2>&1
+"$WV" sync >/dev/null 2>&1 || true
+git add app.py .weave && git commit -qm "chore(weave): auto-checkpoint 10:05" || true
+pc_code_head=$(git rev-parse HEAD)
+pc_count=$(git rev-list --count HEAD)
+add_active_node "pre-compact code fixture two" >/dev/null 2>&1
+bash "$HOOKS_DIR/pre-compact-context.sh" >/dev/null 2>&1 || true
+assert_equals "$((pc_count + 1))" "$(git rev-list --count HEAD)" \
+    "pre-compact: a checkpoint after a commit carrying code is a new commit"
+assert_equals "$pc_code_head" "$(git rev-parse HEAD~1)" \
+    "pre-compact: the commit carrying code keeps its hash"
+pc_msg=$(git log -1 --format=%s)
+if [[ "$pc_msg" =~ ^wip:\ pre-compact\ checkpoint\ [0-9]{2}:[0-9]{2}(\ \[skip\ ci\])?$ ]]; then pc_msg_ok=yes; else pc_msg_ok="$pc_msg"; fi
+assert_equals "yes" "$pc_msg_ok" "pre-compact: the checkpoint message carries at most the skip-ci marker"
+
+# With an upstream and only graph state unpushed, the checkpoint must carry the
+# skip-ci marker. Above, the range held app.py, so the marker was rightly empty
+# and flipping the helper's '&&' to '||' (which empties it always) survived.
+git init --bare -q "$TEST_DIR/pc-origin.git"
+git remote add origin "$TEST_DIR/pc-origin.git" 2>/dev/null || true
+git push -q -u origin HEAD 2>/dev/null || true
+add_active_node "pre-compact upstream fixture" >/dev/null 2>&1
+bash "$HOOKS_DIR/pre-compact-context.sh" >/dev/null 2>&1 || true
+pc_msg=$(git log -1 --format=%s)
+if [[ "$pc_msg" =~ ^wip:\ pre-compact\ checkpoint\ [0-9]{2}:[0-9]{2}\ \[skip\ ci\]$ ]]; then pc_msg_ok=yes; else pc_msg_ok="$pc_msg"; fi
+assert_equals "yes" "$pc_msg_ok" "pre-compact: a graph-only checkpoint over an upstream carries [skip ci]"
+unset _WV_SKIP_SYNC_COMMIT
+[ -n "$pc_saved_wv_db" ] && export WV_DB="$pc_saved_wv_db"
+
+# post-edit-lint: files in the typed modules get a mypy pass, others do not.
+setup_test_env
+cd "$TEST_DIR/project"
+if python3 -m mypy --version >/dev/null 2>&1; then
+    mkdir -p scripts/weave_quality scripts/other
+    printf 'x: int = "not an int"\n' > scripts/weave_quality/typed_probe.py
+    printf 'x: int = "not an int"\n' > scripts/other/typed_probe.py
+    pel_mod=$(printf '{"tool_name":"Edit","tool_response":{"success":true},"tool_input":{"file_path":"%s"}}' \
+        "$TEST_DIR/project/scripts/weave_quality/typed_probe.py" | bash "$HOOKS_DIR/post-edit-lint.sh" 2>/dev/null || true)
+    assert_contains "$pel_mod" "mypy type errors in scripts/weave_quality" \
+        "post-edit-lint: a type error in a typed module is reported"
+    pel_other=$(printf '{"tool_name":"Edit","tool_response":{"success":true},"tool_input":{"file_path":"%s"}}' \
+        "$TEST_DIR/project/scripts/other/typed_probe.py" | bash "$HOOKS_DIR/post-edit-lint.sh" 2>/dev/null || true)
+    assert_not_contains "$pel_other" "mypy" "post-edit-lint: a file outside the typed modules gets no mypy pass"
+else
+    echo "  (post-edit-lint mypy cases skipped: python3 has no mypy)"
+fi
 
 # ============================================================
 echo ""

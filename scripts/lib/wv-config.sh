@@ -16,6 +16,38 @@ else
     WV_VERSION="1.0.0"  # Fallback
 fi
 
+# wv_install_provenance_file — path to the INSTALL_PROVENANCE of the install
+# actually running, or empty.
+#
+# Shared by wv --version and wv doctor so the two can never describe different
+# installs. The resolution is not just "$WV_LIB_DIR/lib/...": honour WV_LIB_DIR
+# for a RELOCATED install, but not when it points at the source checkout, where
+# WV_LIB_DIR is scripts/ and reading provenance from there would describe the
+# working tree rather than any installed copy.
+wv_install_provenance_file() {
+    local dir="${WV_LIB_DIR:-${HOME}/.local/lib/weave}"
+    if [ -f "$dir/wv" ] || [ -f "$dir/../scripts/wv" ]; then
+        dir="${HOME}/.local/lib/weave"
+    fi
+    [ -f "$dir/lib/INSTALL_PROVENANCE" ] || return 1
+    printf '%s' "$dir/lib/INSTALL_PROVENANCE"
+}
+
+# wv_build_identity — the build this install came from, or empty.
+#
+# The release tag alone cannot tell two installs apart: this machine and the gpu
+# box both reported 1.71.0-rc.12 while running different persistence code, 72
+# commits apart (wv-84447f). `git describe` carries the commit and the dirty
+# marker, which is exactly the distinction the tag loses.
+wv_build_identity() {
+    local prov
+    prov=$(wv_install_provenance_file) || return 1
+    local desc
+    desc=$(grep -m1 '^describe=' "$prov" 2>/dev/null | cut -d= -f2-)
+    [ -n "$desc" ] && [ "$desc" != "unknown" ] || return 1
+    printf '%s' "$desc"
+}
+
 # SCRIPT_DIR is set by entry point, fall back if sourced directly
 SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
@@ -25,6 +57,9 @@ REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 if [ "$REPO_ROOT" = "$HOME" ] || [ "$REPO_ROOT" = "/root" ]; then
     REPO_ROOT=""
 fi
+# Whether the caller chose WEAVE_DIR or it follows the working directory: a
+# WV_DB override writes safely only into a .weave/ chosen with it (wv-7ab3cd).
+WEAVE_DIR_CUSTOM="${WEAVE_DIR:+1}"
 WEAVE_DIR="${WEAVE_DIR:-${REPO_ROOT:+$REPO_ROOT/.weave}}"
 
 # Cutover evidence, named here because two consumers need the same path before
@@ -81,23 +116,31 @@ WV_CALL_LOG_DEFAULT="${WV_CALL_LOG_DEFAULT:-$HOME/.local/share/weave/wv_calls.js
 # via `wv config set WV_SUITE_LOG <path>`. Reader: `wv analyze suites` (LL3).
 WV_SUITE_LOG_DEFAULT="${WV_SUITE_LOG_DEFAULT:-$HOME/.local/share/weave/suite_runs.jsonl}"
 
+# wv_session_budget_file <hot-zone> — the one location of the per-session wv
+# call tally, written by .claude/hooks/wv-budget-tally.sh and read by wv health
+# (wv-76bb48). The hook hardcoded /dev/shm/weave/<hash> while health read the
+# hot zone, so under a sandboxed runtime (hot zone /tmp/weave-codex-<uid>)
+# health never saw the file and scored call discipline 25/25 unearned. Beside
+# session-edits.json, the other session counter health reads. WV_BUDGET_DIR
+# still overrides the directory for both.
+wv_session_budget_file() {
+    printf '%s/session-budget.json\n' "${WV_BUDGET_DIR:-$1}"
+}
+
 _WV_ENV_OVERRIDE_HOT_ZONE=$(resolve_env_override_hot_zone)
 if [ -n "$_WV_ENV_OVERRIDE_HOT_ZONE" ] && ! hot_zone_matches_repo "$_WV_ENV_OVERRIDE_HOT_ZONE" "$REPO_ROOT"; then
     _WV_ENV_OVERRIDE_OWNER=$(read_hot_zone_owner "$_WV_ENV_OVERRIDE_HOT_ZONE")
     [ -z "$_WV_ENV_OVERRIDE_OWNER" ] && [ -n "${WV_PROJECT_DIR:-}" ] && _WV_ENV_OVERRIDE_OWNER="$WV_PROJECT_DIR"
 
-    # Shell-exported override leaks can persist across commands; warn once per
-    # shell session for the same leak/repo tuple to avoid noisy repeated output.
-    _WV_WARN_ONCE_DIR="${XDG_RUNTIME_DIR:-/tmp}"
-    [ -d "$_WV_WARN_ONCE_DIR" ] && [ -w "$_WV_WARN_ONCE_DIR" ] || _WV_WARN_ONCE_DIR="/tmp"
-    _WV_WARN_ONCE_KEY=$(printf '%s|%s|%s|%s' "$REPO_ROOT" "$_WV_ENV_OVERRIDE_HOT_ZONE" "${_WV_ENV_OVERRIDE_OWNER:-unknown}" "${PPID:-0}" | md5sum | cut -c1-16)
-    _WV_WARN_ONCE_FILE="${_WV_WARN_ONCE_DIR}/wv-leaked-override-${_WV_WARN_ONCE_KEY}.warned"
-    if [ ! -f "$_WV_WARN_ONCE_FILE" ]; then
-        echo "wv: ignoring leaked WV_HOT_ZONE/WV_DB override from ${_WV_ENV_OVERRIDE_OWNER:-another repo} (current repo: $REPO_ROOT)" >&2
-        : > "$_WV_WARN_ONCE_FILE" 2>/dev/null || true
-    fi
-
-    unset WV_HOT_ZONE WV_DB WV_PRIMARY_FILE
+    # Fails closed (wv-5e804e, owner ruling 2026-09-29). This used to drop the
+    # override and fall back to this repository's live graph, warning once per
+    # shell, so every later call -- a test harness, an MCP server -- wrote the
+    # live graph silently while believing it wrote the override. A caller that
+    # named a database must get that database or an error, never another one.
+    echo "wv: refusing to run: WV_HOT_ZONE/WV_DB names a hot zone owned by ${_WV_ENV_OVERRIDE_OWNER:-another repository}, not $REPO_ROOT" >&2
+    echo "    override: $_WV_ENV_OVERRIDE_HOT_ZONE" >&2
+    echo "    unset WV_HOT_ZONE WV_DB to use this repository's graph, or point them at a hot zone for it" >&2
+    return 1 2>/dev/null || exit 1
 fi
 
 # Set up hot zone and database paths
@@ -238,13 +281,24 @@ wv_set_phase() {
 }
 
 # _wv_source_drift — fast, cross-agent check: do edited Weave source files
-# (scripts/cmd|lib/*.sh, scripts/wv, scripts/context-guard.sh, .claude/hooks/*.sh)
+# (scripts/cmd|lib/*.sh, scripts/wv, .claude/hooks/*.sh)
 # differ from their installed copies? Echoes the drifted basenames (space-
 # separated) and returns 0 if any drift, 1 if clean. No-op (returns 1) in
 # consumer repos that have no source-path pointer. Because every harness —
 # Claude, Codex, Copilot — drives the same `wv` CLI and git pre-commit, this one
 # helper backs both the bootstrap drift advisory and the pre-commit self-heal,
 # so the "run ./install.sh after editing source" signal is agent-agnostic.
+# _wv_drift_cmp <source> <installed> — append the source's name to the caller's
+# $drifted when the installed copy is missing or differs. One comparison for
+# every source class (ultrareview #4574), so a change to how drift is judged
+# cannot reach some classes and not others.
+_wv_drift_cmp() {
+    local sm im
+    sm=$(md5sum "$1" 2>/dev/null | awk '{print $1}')
+    im=$(md5sum "$2" 2>/dev/null | awk '{print $1}')
+    [ -f "$2" ] && [ "$sm" = "$im" ] || drifted="${drifted:+$drifted }$(basename "$1")"
+}
+
 _wv_source_drift() {
     local cfg="${WV_CONFIG_DIR:-$HOME/.config/weave}"
     local src_pointer="$cfg/source-path"
@@ -252,25 +306,29 @@ _wv_source_drift() {
     local src_root; src_root=$(cat "$src_pointer" 2>/dev/null || echo "")
     [ -n "$src_root" ] && [ -d "$src_root/scripts" ] || return 1
     local lib_dir="$HOME/.local/lib/weave"
-    local drifted="" src rel installed sm im
+    local drifted="" src rel installed
     for src in "$src_root/scripts/cmd/"*.sh "$src_root/scripts/lib/"*.sh \
-               "$src_root/scripts/wv" "$src_root/scripts/context-guard.sh"; do
+               "$src_root/scripts/wv"; do
         [ -f "$src" ] || continue
         rel="${src#"$src_root/scripts/"}"
         installed="$lib_dir/$rel"
         [ "$rel" = "wv" ] && installed="$HOME/.local/bin/wv"
-        [ "$rel" = "context-guard.sh" ] && installed="$cfg/context-guard.sh"
-        sm=$(md5sum "$src" 2>/dev/null | awk '{print $1}')
-        im=$(md5sum "$installed" 2>/dev/null | awk '{print $1}')
-        [ -f "$installed" ] && [ "$sm" = "$im" ] || drifted="${drifted:+$drifted }$(basename "$src")"
+        _wv_drift_cmp "$src" "$installed"
+    done
+    # Git-hook sources (wv-ff2fb1): install.sh copies them to $lib_dir/hooks/,
+    # which wv init-repo --update vendors to consumers. Without this an edited
+    # hook never triggered the pre-commit self-heal, and consumers received the
+    # stale copy until someone ran ./install.sh by hand.
+    for src in "$src_root/scripts/hooks/"*-weave.sh; do
+        [ -f "$src" ] || continue
+        installed="$lib_dir/hooks/$(basename "$src")"
+        _wv_drift_cmp "$src" "$installed"
     done
     if [ -d "$src_root/.claude/hooks" ] && [ -d "$cfg/hooks" ]; then
         for src in "$src_root/.claude/hooks/"*.sh; do
             [ -f "$src" ] || continue
             installed="$cfg/hooks/$(basename "$src")"
-            sm=$(md5sum "$src" 2>/dev/null | awk '{print $1}')
-            im=$(md5sum "$installed" 2>/dev/null | awk '{print $1}')
-            [ -f "$installed" ] && [ "$sm" = "$im" ] || drifted="${drifted:+$drifted }$(basename "$src")"
+            _wv_drift_cmp "$src" "$installed"
         done
     fi
     [ -n "$drifted" ] || return 1

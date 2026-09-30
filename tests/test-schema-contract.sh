@@ -47,23 +47,53 @@ fail() {
 # prose like "UPDATE is best-effort" otherwise extracts English words.
 # Uppercase keywords + lowercase identifiers match this codebase's SQL style
 # (and skip Python's lowercase "from x import").
+# A schema-qualified reference names a table BEHIND a qualifier: SQLite resolves
+# `main.`, `temp.` and any alias introduced by `ATTACH DATABASE ... AS <alias>`
+# as a SCHEMA, so the table is the part after the dot. Matching only up to the
+# dot read the qualifier as the table and reported `main` and `pre` as unknown
+# tables (wv-4fd694). Aliases are collected PER FILE, because an ATTACH in one
+# script says nothing about another. An unrecognised qualifier is emitted whole
+# so a typo stays a violation instead of being silently stripped.
 extract_referenced() {
-    cat "$@" 2>/dev/null \
-        | grep -vE '^[[:space:]]*(#|//|\*|--)' \
-        | grep -oE '(FROM|JOIN|INTO|UPDATE)[[:space:]]+[a-z_][a-z0-9_]*' \
-        | awk '{print $2}' | sort -u || true
+    local f aliases ref qualifier table
+    for f in "$@"; do
+        aliases=$(grep -oiE 'ATTACH[[:space:]]+DATABASE[^;]*[[:space:]]AS[[:space:]]+[a-z_][a-z0-9_]*' "$f" 2>/dev/null \
+            | awk '{print tolower($NF)}' | sort -u)
+        grep -vE '^[[:space:]]*(#|//|\*|--)' "$f" 2>/dev/null \
+            | grep -oE '(FROM|JOIN|INTO|UPDATE)[[:space:]]+([a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*' \
+            | awk '{print $2}' \
+            | while read -r ref; do
+                case "$ref" in
+                    *.*)
+                        qualifier=${ref%%.*}
+                        table=${ref#*.}
+                        if [ "$qualifier" = "main" ] || [ "$qualifier" = "temp" ] \
+                            || grep -qxF -- "$qualifier" <<< "$aliases"; then
+                            printf '%s\n' "$table"
+                        else
+                            printf '%s\n' "$ref"
+                        fi
+                        ;;
+                    *) printf '%s\n' "$ref" ;;
+                esac
+            done
+    done | sort -u || true
 }
 
 # Names the codebase itself declares: tables (incl. temp/virtual), renames,
 # and CTEs ("name AS (").
 extract_declared() {
     {
+        # Declarations carry qualifiers too (`CREATE VIRTUAL TABLE temp.wv_fv`).
+        # Both sides must unqualify or they agree on the wrong name: matching up
+        # to the dot declared `temp` and referenced `temp`, so the real table was
+        # never checked either way (wv-4fd694).
         cat "$@" 2>/dev/null \
-            | grep -oE 'CREATE( TEMP| TEMPORARY)?( VIRTUAL)? TABLE( IF NOT EXISTS)? [a-z_][a-z0-9_]*' \
-            | awk '{print $NF}'
+            | grep -oE 'CREATE( TEMP| TEMPORARY)?( VIRTUAL)? TABLE( IF NOT EXISTS)? ([a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*' \
+            | awk '{print $NF}' | sed -E 's/^[a-z_][a-z0-9_]*\.//'
         cat "$@" 2>/dev/null \
-            | grep -oE 'RENAME TO [a-z_][a-z0-9_]*' \
-            | awk '{print $3}'
+            | grep -oE 'RENAME TO ([a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*' \
+            | awk '{print $NF}' | sed -E 's/^[a-z_][a-z0-9_]*\.//'
         cat "$@" 2>/dev/null \
             | grep -oE '[a-z_][a-z0-9_]*(\([a-z0-9_, ]*\))?[[:space:]]+AS[[:space:]]*\(' \
             | sed -E 's/\(.*//' | awk '{print $1}'
@@ -120,11 +150,11 @@ check_contract() {
     extract_referenced "$@" | while read -r ref; do
         [ -z "$ref" ] && continue
         grep -qxF -- "$ref" "$known_file" && continue
-        echo "$declared" | grep -qxF -- "$ref" && continue
-        echo "$BUILTIN" | grep -qxF -- "$ref" && continue
-        echo "$EXTERNAL" | grep -qxF -- "$ref" && continue
-        echo "$TRANSIENT" | grep -qxF -- "$ref" && continue
-        echo "$NOISE" | grep -qxF -- "$ref" && continue
+        grep -qxF -- "$ref" <<< "$declared" && continue
+        grep -qxF -- "$ref" <<< "$BUILTIN" && continue
+        grep -qxF -- "$ref" <<< "$EXTERNAL" && continue
+        grep -qxF -- "$ref" <<< "$TRANSIENT" && continue
+        grep -qxF -- "$ref" <<< "$NOISE" && continue
         echo "$ref"
     done
 }
@@ -215,7 +245,7 @@ cat > "$FIXTURE" <<'EOF'
 count=$(sqlite3 "$db" "SELECT COUNT(*) FROM quality_scans;")
 EOF
 red=$(check_contract "$KNOWN_FILE" "$FIXTURE")
-if echo "$red" | grep -qxF "quality_scans"; then
+if grep -qxF "quality_scans" <<< "$red"; then
     pass "red-test: invented table quality_scans is flagged (wv-031d20 bug shape)"
 else
     fail "red-test: invented table quality_scans is flagged (wv-031d20 bug shape)" "checker output: '$red'"
@@ -230,6 +260,41 @@ if [ -z "$green" ]; then
     pass "red-test control: real tables (nodes, scan_meta) pass clean"
 else
     fail "red-test control: real tables (nodes, scan_meta) pass clean" "false positives: '$green'"
+fi
+
+# Schema qualifiers (wv-4fd694). A qualifier is not a table, but unqualifying
+# must not become a way to smuggle an unknown table past the contract.
+cat > "$FIXTURE" <<'EOF'
+sqlite3 "$db" "ATTACH DATABASE '$pre_db' AS pre; SELECT id FROM pre.nodes;"
+sqlite3 "$db" "SELECT COUNT(*) FROM main.nodes;"
+sqlite3 "$db" "CREATE VIRTUAL TABLE temp.vocab USING fts5vocab(main, nodes_fts, instance);
+               SELECT count(DISTINCT doc) FROM temp.vocab;"
+EOF
+green=$(check_contract "$KNOWN_FILE" "$FIXTURE")
+if [ -z "$green" ]; then
+    pass "qualified refs resolve to their table (main./temp./ATTACH alias)"
+else
+    fail "qualified refs resolve to their table (main./temp./ATTACH alias)" "false positives: '$green'"
+fi
+
+cat > "$FIXTURE" <<'EOF'
+sqlite3 "$db" "ATTACH DATABASE '$pre_db' AS pre; SELECT id FROM pre.quality_scans;"
+EOF
+red=$(check_contract "$KNOWN_FILE" "$FIXTURE")
+if grep -qxF "quality_scans" <<< "$red"; then
+    pass "red-test: an invented table behind a known qualifier is still flagged"
+else
+    fail "red-test: an invented table behind a known qualifier is still flagged" "checker output: '$red'"
+fi
+
+cat > "$FIXTURE" <<'EOF'
+sqlite3 "$db" "SELECT id FROM typo.nodes;"
+EOF
+red=$(check_contract "$KNOWN_FILE" "$FIXTURE")
+if grep -qxF "typo.nodes" <<< "$red"; then
+    pass "red-test: an undeclared qualifier is reported whole, not stripped"
+else
+    fail "red-test: an undeclared qualifier is reported whole, not stripped" "checker output: '$red'"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

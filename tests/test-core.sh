@@ -238,7 +238,7 @@ test_init_recovery() {
 
 test_leaked_env_overrides_are_ignored_across_repos() {
     echo ""
-    echo "Test: leaked WV_HOT_ZONE/WV_DB overrides are ignored across repos"
+    echo "Test: a WV_HOT_ZONE/WV_DB override owned by another repo fails closed"
     echo "==============================================================="
 
     local source_repo target_repo old_hot old_db old_project
@@ -266,25 +266,29 @@ test_leaked_env_overrides_are_ignored_across_repos() {
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_repo_hot_zone \"\$(resolve_hot_zone)\" '$target_repo'" 2>/dev/null)
     target_db="$target_hot/brain.db"
 
-    output=$("$WV" add "Target repo node" --force 2>&1)
-    assert_contains "$output" "ignoring leaked WV_HOT_ZONE/WV_DB override" \
-        "foreign repo warns when leaked WV overrides are ignored"
+    # wv-5e804e: the override used to be dropped for the target repo's live
+    # graph, with one warning per shell; every later call then wrote the live
+    # graph silently. A named database is now that database or an error.
+    local rc refusals
+    output=$("$WV" add "Target repo node" --force 2>&1) && rc=0 || rc=$?
+    assert_equals "1" "$rc" "a write under a foreign override exits nonzero"
+    assert_contains "$output" "refusing to run: WV_HOT_ZONE/WV_DB names a hot zone owned by" \
+        "the refusal names the foreign override"
 
-    local warn_count
     output=$(
         "$WV" status 2>&1
         "$WV" status 2>&1
-    )
-    warn_count=$(printf '%s' "$output" | grep -c "ignoring leaked WV_HOT_ZONE/WV_DB override" || true)
-    assert_equals "1" "$warn_count" \
-        "foreign repo warning is emitted once per shell session"
+    ) || true
+    refusals=$(printf '%s' "$output" | grep -c "refusing to run: WV_HOT_ZONE/WV_DB" || true)
+    assert_equals "2" "$refusals" \
+        "every call refuses, not only the first in a shell"
 
     source_target_count=$(sqlite3 "$source_repo/hot/brain.db" "SELECT COUNT(*) FROM nodes WHERE text='Target repo node';" 2>/dev/null || echo "0")
     target_target_count=$(sqlite3 "$target_db" "SELECT COUNT(*) FROM nodes WHERE text='Target repo node';" 2>/dev/null || echo "0")
     assert_equals "0" "$source_target_count" \
-        "leaked overrides do not write into the source repo DB"
-    assert_equals "1" "$target_target_count" \
-        "leaked overrides fall back to the target repo DB"
+        "a refused call does not write the override's DB"
+    assert_equals "0" "$target_target_count" \
+        "a refused call does not fall back to the target repo's DB"
 
     export WV_HOT_ZONE="$old_hot"
     export WV_DB="$old_db"
@@ -429,7 +433,8 @@ test_add() {
     # --risks=<level> must always seed both risk_level AND risks:[] so the
     # pre-claim hook's has("risks") check passes on immediate claim.
     local risk_id risk_meta
-    for level in none low medium high critical; do
+    # The enum is the node-field contract's (wv-c0c51e); critical is refused.
+    for level in none low medium high; do
         risk_id=$("$WV" add "risks=$level" --risks="$level" --force 2>&1 | node_id_from_output)
         risk_meta=$("$WV" show "$risk_id" --json | jq -r '.metadata')
         assert_contains "$risk_meta" "\"risk_level\":\"$level\"" "--risks=$level sets risk_level"
@@ -443,7 +448,9 @@ test_add() {
     assert_fails "add rejects an out-of-enum --risks value" "$WV" add "bad risks" --risks="r1,r2" --force
     local bad_risks_out
     bad_risks_out=$("$WV" add "bad risks message" --risks="r1,r2" --force 2>&1) || true
-    assert_contains "$bad_risks_out" "none|low|medium|high|critical" "add --risks rejection names the valid enum"
+    assert_contains "$bad_risks_out" "none|low|medium|high" "add --risks rejection names the valid enum"
+    assert_fails "add rejects --risks=critical, which the node-field contract does not admit" \
+        "$WV" add "critical risks" --risks=critical --force
 
     # wv-734186: verification-method/verification-evidence were only ever
     # askable at wv done close time. --verification-plan lets "what would
@@ -582,9 +589,11 @@ test_done() {
     finding_full_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$finding_full_id" --skip-verification 2>&1)
     assert_contains "$finding_full_output" "Closed" "done accepts finding with full 5-field schema (backward compat)"
 
-    # Optional fields present but invalid are still rejected
+    # Optional fields present but invalid are still rejected. confidence is an
+    # integer, not 0.92: wv add now refuses any metadata float (wv-855394), which
+    # would stop this case before it reached the done-time type check.
     local finding_bad_id
-    finding_bad_id=$("$WV" add "Finding bad optional" --metadata='{"type":"finding","finding":{"violation_type":"repo:regression","confidence":0.92,"fixable":"yes"}}' --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | node_id_from_output)
+    finding_bad_id=$("$WV" add "Finding bad optional" --metadata='{"type":"finding","finding":{"violation_type":"repo:regression","confidence":92,"fixable":"yes"}}' --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | node_id_from_output)
     assert_fails "done rejects finding with invalid optional field types" \
         env WV_REQUIRE_LEARNING=1 "$WV" done "$finding_bad_id" --skip-verification
 
@@ -976,7 +985,21 @@ test_list() {
     json_err=$(cat "$TEST_DIR/list-json.err")
     json_count=$(echo "$json_out" | jq 'length' 2>/dev/null || echo 0)
     assert_equals "50" "$json_count" "list --json default cap returns 50 rows"
-    assert_contains "$json_err" "use --all for full dump" "list --json capped output warns on stderr"
+    # wv-e174eb: the footer reports the matching total, not the returned count
+    # ("showing 50 of 50" hid 37 open nodes), and the remedy keeps the filters
+    # rather than --all, which would add every done node.
+    local open_total
+    open_total=$("$WV" list --all --json 2>/dev/null | jq '[.[] | select(.status != "done")] | length')
+    assert_contains "$json_err" "showing 50 of $open_total matching" "list --json capped footer reports the matching total"
+    assert_contains "$json_err" "$((open_total - 50)) hidden" "list --json capped footer reports the hidden count"
+    assert_contains "$json_err" "--limit=$open_total" "list capped footer offers --limit=<total> as the remedy"
+    assert_not_contains "$json_err" "--all" "list capped footer does not send a non-done list to --all"
+    assert_contains "$json_err" "wv search" "list capped footer routes a pre-create check to wv search"
+    local lim_err
+    json_count=$("$WV" list --json --limit="$open_total" 2>"$TEST_DIR/list-lim.err" | jq 'length' 2>/dev/null || echo 0)
+    lim_err=$(cat "$TEST_DIR/list-lim.err")
+    assert_equals "$open_total" "$json_count" "list --limit=<total> returns every matching row"
+    assert_not_contains "$lim_err" "hidden" "list with an explicit sufficient --limit reports nothing hidden"
     json_count=$("$WV" list --json --all 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
     assert_success "list --json --all returns more than capped default" test "$json_count" -gt 50
 
@@ -1789,7 +1812,7 @@ SQL
 
     # --- Case 4: trigger payload is JSON with required keys ---
     local payload_valid
-    payload_valid=$(echo "$breach_out" | grep -o '{[^}]*}' | head -1 | python3 -c "
+    payload_valid=$(echo "$breach_out" | grep -o '{[^}]*}' | sed -n 1p | python3 -c "
 import sys, json
 try:
     d = json.loads(sys.stdin.read().strip())
@@ -1802,7 +1825,7 @@ except Exception as e:
         "trigger abort payload is JSON with error/threshold/actual/path keys"
 
     local breach_threshold
-    breach_threshold=$(echo "$breach_out" | grep -o '"threshold":"[^"]*"' | head -1 | cut -d '"' -f4)
+    breach_threshold=$(echo "$breach_out" | grep -o '"threshold":"[^"]*"' | sed -n 1p | cut -d '"' -f4)
     assert_equals "mccabe_max_py" "$breach_threshold" \
         "mccabe policy violation payload names the breached threshold"
 
@@ -1881,7 +1904,7 @@ SQL
         "trend policy violation payload includes the trend direction"
 
     local trend_threshold
-    trend_threshold=$(echo "$trend_out" | grep -o '"threshold":"[^"]*"' | head -1 | cut -d '"' -f4)
+    trend_threshold=$(echo "$trend_out" | grep -o '"threshold":"[^"]*"' | sed -n 1p | cut -d '"' -f4)
     assert_equals "trend_deteriorating" "$trend_threshold" \
         "trend policy violation payload names the breached threshold"
 
@@ -2795,9 +2818,13 @@ test_done_refresh_test_status() {
 
     # Invoke the consumer directly (WV_REQUIRE_QUALITY default so it runs).
     run_refresh() {
-        cd "$TEST_DIR" && WEAVE_DIR="$TEST_DIR/.weave" WV_DB="$WV_DB" bash -c "
+        # Without the gate's injected core.hooksPath=/dev/null (GIT_CONFIG_*):
+        # the refresh asks git where hooks live (is a pre-push gate installed?).
+        cd "$TEST_DIR" && WEAVE_DIR="$TEST_DIR/.weave" WV_DB="$WV_DB" \
+            env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 bash -c "
             source '$PROJECT_ROOT/scripts/lib/wv-validate.sh'
             source '$PROJECT_ROOT/scripts/lib/wv-db.sh'
+            source '$PROJECT_ROOT/scripts/lib/wv-checkpoint-ci.sh'
             source '$PROJECT_ROOT/scripts/cmd/wv-cmd-graph.sh'
             source '$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh'
             source '$PROJECT_ROOT/scripts/cmd/wv-cmd-core.sh'
@@ -2845,6 +2872,56 @@ test_done_refresh_test_status() {
     local st_all_green
     st_all_green=$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")
     assert_equals "green" "$st_all_green" "all mapped suites fresh and passing -> green"
+
+    # Push tier (wv-862ac0, ultrareview #4575): a [heavy] suite runs at git push,
+    # so with a Weave pre-push gate installed its missing row is "deferred", not
+    # stale. Without the gate it is required as before; a red row stays red; and
+    # a light suite's stale row still wins.
+    printf '[map]\nsrc/foo.sh = tests/test-foo.sh tests/test-heavy.sh\n[heavy]\ntests/test-heavy.sh\n' \
+        > "$TEST_DIR/.weave/test-map.conf"
+    (cd "$TEST_DIR" && "$WV" test-record "tests/test-foo.sh" --files="src/foo.sh" --exit=0 >/dev/null 2>&1)
+    local hooks_dir
+    hooks_dir="$(cd "$TEST_DIR" && env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 git rev-parse --git-path hooks)"
+    case "$hooks_dir" in /*) ;; *) hooks_dir="$TEST_DIR/$hooks_dir" ;; esac
+    rm -f "$hooks_dir/pre-push"
+    run_refresh "$nid"
+    assert_equals "stale" "$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")" \
+        "heavy suite without a row, no pre-push gate installed -> stale (required at commit)"
+    mkdir -p "$hooks_dir"; printf '#!/bin/sh\n# Weave pre-push hook\n' > "$hooks_dir/pre-push"
+    run_refresh "$nid"
+    assert_equals "deferred" "$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")" \
+        "heavy suite without a row, pre-push gate installed -> deferred (owed at push)"
+    (cd "$TEST_DIR" && "$WV" test-record "tests/test-heavy.sh" --files="src/foo.sh" --exit=1 >/dev/null 2>&1)
+    run_refresh "$nid"
+    assert_equals "red" "$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")" \
+        "heavy suite red for the current content stays red with the gate installed"
+    sqlite3 "$WV_DB" "DELETE FROM test_results WHERE suite='tests/test-heavy.sh';"
+    echo "edited-again" > "$TEST_DIR/src/foo.sh"
+    run_refresh "$nid"
+    assert_equals "stale" "$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")" \
+        "a light suite's stale row outranks a deferred heavy suite"
+    rm -f "$hooks_dir/pre-push"
+
+    # Evidence nothing can produce is not required (wv-67c7b6): tests/run-all.sh
+    # is the meta-runner the gates never run or record, and a path outside the
+    # repository (older attributions stored memory/scratch files absolute) can
+    # never be routed to a suite that runs it.
+    printf '[map]\nsrc/bar.sh = tests/run-all.sh tests/test-foo.sh\n[default]\ntests/test-foo.sh\n' \
+        > "$TEST_DIR/.weave/test-map.conf"
+    echo "bar" > "$TEST_DIR/src/bar.sh"
+    # It must exist: the real cases (memory files, scratch files) do.
+    mkdir -p /tmp/wv-outside-repo && echo "notes" > /tmp/wv-outside-repo/notes.md
+    (cd "$TEST_DIR" && "$WV" test-record "tests/test-foo.sh" --files="src/bar.sh" --exit=0 >/dev/null 2>&1)
+    sqlite3 "$WV_DB" "INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$nid', 'src/bar.sh');
+                      INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$nid', '/tmp/wv-outside-repo/notes.md');"
+    run_refresh "$nid"
+    assert_equals "green" "$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/bar.sh';")" \
+        "a file also routed to the run-all.sh meta-runner reads green when its real suites are green"
+    assert_equals "0" "$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM file_test_status WHERE path='/tmp/wv-outside-repo/notes.md';")" \
+        "a path outside the repository gets no test verdict"
+    rm -rf /tmp/wv-outside-repo
+    sqlite3 "$WV_DB" "DELETE FROM node_files WHERE node_id='$nid' AND path IN ('src/bar.sh', '/tmp/wv-outside-repo/notes.md');"
+    printf '[map]\nsrc/foo.sh = tests/test-foo.sh\n' > "$TEST_DIR/.weave/test-map.conf"
 
     # --- unknown: a path with no mapping has no required suite ---
     local nid2
@@ -3262,7 +3339,7 @@ test_stdin_never_blocks() {
     assert_contains "$out" "no input on stdin" "bulk-update on whitespace-only stdin shows usage"
 
     # A real pipe is still read and applied.
-    id=$("$WV" add "stdin probe target" 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+    id=$("$WV" add "stdin probe target" 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | sed -n 1p)
     out=$(echo "[{\"id\":\"$id\",\"alias\":\"stdin-probe\"}]" | timeout 8 "$WV" bulk-update 2>&1 || true)
 
     # This assertion carries the probe's other half: it must consume nothing.
@@ -3300,8 +3377,10 @@ test_quick_commits_only_staged() {
     printf 'v2\n' > staged.txt
     printf 'v2\n' > other.txt
     git add staged.txt >/dev/null 2>&1
-    id=$("$WV" quick "quick staged only" 2>/dev/null | grep -oE '^wv-[a-f0-9]+$' | head -1)
-    subject=$(git log --format='%H %s' | grep -m1 'quick staged only' | cut -d' ' -f1)
+    id=$("$WV" quick "quick staged only" 2>/dev/null | grep -oE '^wv-[a-f0-9]+$' | sed -n 1p)
+    # Capture the log first: `git log | grep -m1` SIGPIPEs git log whenever
+    # grep leaves early, and pipefail aborted this suite with 141 (wv-7699b4).
+    subject=$(grep -m1 'quick staged only' <<< "$(git log --format='%H %s')" | cut -d' ' -f1)
     changed=$(git show --name-only --format='' "$subject" | grep -c 'txt' || true)
     assert_equals "1" "$changed" "wv quick commits exactly the staged file"
     assert_contains "$(git show --name-only --format='' "$subject")" "staged.txt" "wv quick commits the staged file"
@@ -3320,7 +3399,7 @@ test_quick_commits_only_staged() {
     rc=0
     out=$("$WV" quick "quick failing commit" 2>&1) || rc=$?
     rm -f .git/index.lock
-    id=$(printf '%s\n' "$out" | grep -oE '^wv-[a-f0-9]+$' | head -1)
+    id=$(printf '%s\n' "$out" | grep -oE '^wv-[a-f0-9]+$' | sed -n 1p)
     assert_equals "1" "$rc" "a failed commit exits nonzero"
     assert_contains "$out" "left ACTIVE" "a failed commit says the node stays active"
     assert_equals "active" "$("$WV" show "$id" 2>/dev/null | awk '/^Status/{print $2}')" "a failed commit leaves the node active"
@@ -3330,7 +3409,7 @@ test_quick_commits_only_staged() {
     git reset -q >/dev/null 2>&1
     rc=0
     out=$("$WV" quick "quick nothing staged" 2>&1) || rc=$?
-    id=$(printf '%s\n' "$out" | grep -oE '^wv-[a-f0-9]+$' | head -1)
+    id=$(printf '%s\n' "$out" | grep -oE '^wv-[a-f0-9]+$' | sed -n 1p)
     assert_equals "0" "$rc" "nothing staged still exits zero"
     assert_equals "done" "$("$WV" show "$id" 2>/dev/null | awk '/^Status/{print $2}')" "nothing staged still closes the node"
 

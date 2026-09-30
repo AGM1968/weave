@@ -105,6 +105,72 @@ validate_status() {
     return 1
 }
 
+# Valid risk_level values. The authority is contracts/node-field-registry-v1.json
+# (fields.risk_level.value.enum). The Delta v2 writer (RISK_LEVELS in
+# wv-delta.sh) and replayer (wv-delta-v2-replay.py) enforce the same set, and
+# replay treats any other value as a hard integrity failure, so a value the
+# CLI stored outside it made every later update of that node degrade silently
+# to an SQL-only delta (wv-c0c51e). tests/test-risk-level-authority.sh pins all
+# four copies to the contract.
+VALID_RISK_LEVELS="none low medium high"
+
+# validate_risk_level <value> <source-label>
+validate_risk_level() {
+    local value="$1" source="${2:-risk_level}" valid
+    for valid in $VALID_RISK_LEVELS; do
+        [ "$value" = "$valid" ] && return 0
+    done
+    echo -e "${RED}Error: $source must be one of ${VALID_RISK_LEVELS// /|} (got: $value)${NC}" >&2
+    return 1
+}
+
+# validate_metadata_risk_level <metadata-json> <source-label>
+# Refuse a metadata document that sets a risk_level the contract does not
+# admit. Absent or null is fine; a patch that does not touch it is unaffected.
+validate_metadata_risk_level() {
+    local value
+    value=$(printf '%s' "$1" | jq -r 'if type == "object" and has("risk_level") and .risk_level != null
+        then (.risk_level | tostring) else empty end' 2>/dev/null) || return 0
+    [ -z "$value" ] || validate_risk_level "$value" "${2:-metadata} risk_level"
+}
+
+# _wv_reject_arg <command> <argument>
+# The default branch of a write-path argument parser (wv-86a96a): an argument
+# no branch consumed fails the command before it writes, instead of being
+# skipped while the success line prints (a typo such as --learnings= used to
+# close a node and drop the learning). Always returns 1.
+_wv_reject_arg() {
+    echo -e "${RED}Error: unknown argument '$2' for wv $1${NC}" >&2
+    echo "Run 'wv $1 --help' for usage." >&2
+    return 1
+}
+
+# validate_metadata_canonical_numbers <metadata-json> <source-label>
+# Refuse a metadata document holding a non-integer number (wv-855394).
+# weave.canonical-json.v1 admits integers only, so the Delta v2 sidecar encoder
+# rejects a float and every later write to the node degrades to an SQL-only
+# delta. Judged by Python's parser, the one the encoder uses: jq reads 1.0 and
+# 1e3 as integers, Python as floats. No python3 means no sidecar to protect.
+validate_metadata_canonical_numbers() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    local bad
+    bad=$(printf '%s' "$1" | python3 -c '
+import json, sys
+found = []
+def reject(token):
+    found.append(token)
+    return 0
+try:
+    json.loads(sys.stdin.read(), parse_float=reject, parse_constant=reject)
+except ValueError:
+    pass
+print(" ".join(found[:3]))
+' 2>/dev/null) || return 0
+    [ -z "$bad" ] && return 0
+    echo -e "${RED}Error: ${2:-metadata} holds a non-integer number ($bad); metadata numbers must be integers (weave.canonical-json.v1) - store a scaled integer (e.g. milliseconds) or a decimal string${NC}" >&2
+    return 1
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Edge Type Validation
 # ═══════════════════════════════════════════════════════════════════════════

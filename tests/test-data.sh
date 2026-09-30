@@ -454,7 +454,7 @@ $WV add "Task without any learning" >/dev/null 2>&1
 output=$($WV learnings 2>&1)
 # CLI has a bug where empty results produce no output (should say "No learnings recorded")
 # Accept either empty or the expected message  
-if [ -z "$output" ] || echo "$output" | grep -qF "No learnings"; then
+if [ -z "$output" ] || grep -qF "No learnings" <<< "$output"; then
     echo -e "  ${GREEN}✓${NC} learnings reports when empty (empty or message)"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -858,7 +858,7 @@ assert_equals "1" "$line_count" "search respects --limit"
 output=$($WV search "authentication" --status=done 2>&1)
 assert_contains "$output" "$node1" "status filter shows done nodes"
 # Note: output should NOT contain node2 since it's still todo
-if echo "$output" | grep -q -- "$node2"; then
+if grep -q -- "$node2" <<< "$output"; then
     TESTS_RUN=$((TESTS_RUN + 1))
     echo "  ✗ status filter excludes non-matching status (found $node2 unexpectedly)"
 else
@@ -879,6 +879,49 @@ assert_contains "$output" "No matches" "search with no results shows message"
 # Test search usage (no query)
 output=$($WV search 2>&1 || true)
 assert_contains "$output" "Usage" "search without query shows usage"
+
+# wv-92b72c: the alias is indexed. An alias sharing no word with its node's
+# text used to be unfindable, and its exact form returned unrelated nodes.
+alias_node=$($WV add "Tighten the header parser for malformed input" --alias=zebra-kite | tail -1)
+decoy_node=$($WV add "Zebra stripes and kite flying notes" | tail -1)
+output=$($WV search "zebra-kite" 2>&1)
+assert_contains "$output" "$alias_node" "search finds a node by an alias absent from its text"
+first=$($WV search "zebra-kite" --json 2>/dev/null | jq -r '.[0].id')
+assert_equals "$alias_node" "$first" "an exact alias ranks its node above text matches ($decoy_node)"
+$WV update "$alias_node" --alias=otter-lamp >/dev/null 2>&1
+first=$($WV search "otter-lamp" --json 2>/dev/null | jq -r '.[0].id')
+assert_equals "$alias_node" "$first" "a renamed alias is findable under its new name"
+assert_equals "0" "$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'alias:zebra';")" \
+    "a renamed alias leaves nothing of the old one in the index"
+
+# An index built before alias joined it: three columns and three-column
+# triggers. Search and reindex both upgrade it; a dropped table left with the
+# old triggers is upgraded too, since those triggers would omit alias.
+_fts_old_shape() {
+    sqlite3 "$WV_DB" "DROP TRIGGER IF EXISTS nodes_ai; DROP TRIGGER IF EXISTS nodes_ad; DROP TRIGGER IF EXISTS nodes_au;
+        DROP TABLE IF EXISTS nodes_fts;
+        CREATE VIRTUAL TABLE nodes_fts USING fts5(id, text, metadata, content=nodes, content_rowid=rowid, tokenize='porter unicode61');
+        CREATE TRIGGER nodes_ai AFTER INSERT ON nodes BEGIN INSERT INTO nodes_fts(rowid, id, text, metadata) VALUES (new.rowid, new.id, new.text, new.metadata); END;
+        CREATE TRIGGER nodes_ad AFTER DELETE ON nodes BEGIN INSERT INTO nodes_fts(nodes_fts, rowid, id, text, metadata) VALUES ('delete', old.rowid, old.id, old.text, old.metadata); END;
+        CREATE TRIGGER nodes_au AFTER UPDATE ON nodes BEGIN INSERT INTO nodes_fts(nodes_fts, rowid, id, text, metadata) VALUES ('delete', old.rowid, old.id, old.text, old.metadata); INSERT INTO nodes_fts(rowid, id, text, metadata) VALUES (new.rowid, new.id, new.text, new.metadata); END;
+        INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');"
+}
+_fts_has_alias() { sqlite3 "$WV_DB" "SELECT COUNT(*) FROM pragma_table_info('nodes_fts') WHERE name='alias';"; }
+_fts_old_shape
+assert_equals "0" "$(_fts_has_alias)" "fixture: the old three-column index is in place"
+first=$($WV search "otter-lamp" --json 2>/dev/null | jq -r '.[0].id')
+assert_equals "$alias_node" "$first" "search upgrades a three-column index and finds the alias"
+_fts_old_shape
+output=$($WV reindex 2>&1)
+assert_equals "1" "$(_fts_has_alias)" "reindex rebuilds a three-column index with the alias column"
+_fts_old_shape
+sqlite3 "$WV_DB" "DROP TABLE nodes_fts;"
+$WV reindex >/dev/null 2>&1
+$WV update "$alias_node" --alias=heron-dial >/dev/null 2>&1
+assert_equals "" "$(sqlite3 "$WV_DB" "INSERT INTO nodes_fts(nodes_fts) VALUES('integrity-check');" 2>&1)" \
+    "a dropped index left with old triggers is rebuilt consistently (integrity-check clean after an update)"
+first=$($WV search "heron-dial" --json 2>/dev/null | jq -r '.[0].id')
+assert_equals "$alias_node" "$first" "the alias written after that rebuild is searchable"
 
 echo ""
 
@@ -958,6 +1001,78 @@ if [ -f "$CP_DIR/.delta" ]; then
     TESTS_RUN=$((TESTS_RUN + _cp_r))
 fi
 rm -rf "$CP_DIR"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# checkpoint and sync commits carry graph state, not .weave/ config (wv-2e6341)
+# ═══════════════════════════════════════════════════════════════════════════
+# They staged all of .weave/, so a half-edited test-map.conf rode into an
+# auto-checkpoint or --no-verify sync-state commit that skipped every suite
+# a config change selects. An unstaged config edit must stay in the tree
+# while the graph is still committed; a staged one is caller work and stops
+# the commit, exactly like a staged file outside .weave/.
+echo "Testing checkpoint commits leave .weave/ config alone..."
+GS_DIR=$(mktemp -d)
+(
+    cd "$GS_DIR"
+    git init -q
+    git config user.email t@t && git config user.name t && git config commit.gpgsign false
+    export WV_HOT_ZONE="$GS_DIR/hz" \
+           WV_DB="$GS_DIR/hz/brain.db" \
+           WV_PROJECT_DIR="$GS_DIR" \
+           WEAVE_DIR="$GS_DIR/.weave" \
+           WV_CHECKPOINT_INTERVAL=0 \
+           WV_CHECKPOINT_PULL=0 \
+           WV_SYNC_INTERVAL=0
+    mkdir -p "$WV_HOT_ZONE"
+    touch README.md && git add README.md && git commit -q -m "init"
+    "$WV" init >/dev/null 2>&1
+    "$WV" add "seed" >/dev/null 2>&1
+    printf '[map]\nsrc/a.sh = tests/test-a.sh\n' > .weave/test-map.conf
+    git add -A .weave && git commit -q -m "graph + config" >/dev/null 2>&1 || true
+
+    _p=0 _r=0
+    _check() {  # <message> <condition-result>
+        _r=$((_r + 1))
+        if [ "$2" = yes ]; then
+            echo -e "  ${GREEN}✓${NC} $1"; _p=$((_p + 1))
+        else
+            echo -e "  ${RED}✗${NC} $1"
+        fi
+    }
+
+    # Unstaged config edit + a graph change: the graph is committed, the
+    # config edit is not.
+    echo 'src/b.sh = tests/test-b.sh' >> .weave/test-map.conf
+    _head=$(git rev-parse HEAD)
+    "$WV" add "graph change" >/dev/null 2>&1
+    "$WV" sync >/dev/null 2>&1 || true
+    _check "sync committed the graph change" \
+        "$([ "$(git rev-parse HEAD)" != "$_head" ] && echo yes || echo no)"
+    _check "test-map.conf is in none of the new commits" \
+        "$(git log --format= --name-only "$_head..HEAD" | grep -qx '.weave/test-map.conf' && echo no || echo yes)"
+    _check "the test-map.conf edit is still in the working tree" \
+        "$(git status --porcelain -- .weave/test-map.conf | grep -q '^ M' && echo yes || echo no)"
+
+    # Staged config edit: caller work, so the sync-state commit is skipped and
+    # the file stays staged.
+    git add .weave/test-map.conf
+    _head=$(git rev-parse HEAD)
+    "$WV" add "another graph change" >/dev/null 2>&1
+    "$WV" sync >/dev/null 2>&1 || true
+    _check "a staged test-map.conf stops the checkpoint commit" \
+        "$([ "$(git rev-parse HEAD)" = "$_head" ] && echo yes || echo no)"
+    _check "the staged test-map.conf is still staged" \
+        "$(git diff --cached --name-only | grep -qx '.weave/test-map.conf' && echo yes || echo no)"
+
+    echo "$_p $_r" > "$GS_DIR/.delta"
+)
+if [ -f "$GS_DIR/.delta" ]; then
+    read -r _gs_p _gs_r < "$GS_DIR/.delta"
+    TESTS_PASSED=$((TESTS_PASSED + _gs_p))
+    TESTS_RUN=$((TESTS_RUN + _gs_r))
+fi
+rm -rf "$GS_DIR"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1597,7 +1712,7 @@ SKIPCI_DIR=$(mktemp -d)
     # The checkpoint's own diff is still .weave/-only (staging discipline
     # unchanged) — only the marker is scoped, not what gets committed.
     _skipci_files=$(git diff HEAD~1 HEAD --name-only)
-    if ! echo "$_skipci_files" | grep -qv '^\.weave/'; then
+    if ! grep -qv '^\.weave/' <<< "$_skipci_files"; then
         echo -e "  ${GREEN}✓${NC} checkpoint commit itself stays .weave/-only"
         _p=$((_p + 1))
     else
@@ -1697,6 +1812,23 @@ CIFS_DIR=$(mktemp -d)
         _p=$((_p + 1))
     else
         echo -e "  ${RED}✗${NC} .weave/-only range unexpectedly produced: '$_cifs_marker'"
+    fi
+    _r=$((_r + 1))
+
+    # 5. A pushed source file moved INTO .weave/. With rename detection the
+    # range lists only the new .weave/ path, so the push looked .weave/-only and
+    # skipped CI for a commit that removed a source file (found by the
+    # git-listing-rename-blind rule, wv-581bb0; the staged listing got the same
+    # fix in cab911eeb).
+    git config diff.renames true
+    git push -q origin HEAD:release-track >/dev/null 2>&1 || true
+    git mv code.txt .weave/code.txt && git commit -q -m "chore: move code under .weave"
+    _cifs_marker=$(wv_checkpoint_ci_marker "$CIFS_DIR")
+    if [ -z "$_cifs_marker" ]; then
+        echo -e "  ${GREEN}✓${NC} a source file moved into .weave/ produces no [skip ci]"
+        _p=$((_p + 1))
+    else
+        echo -e "  ${RED}✗${NC} a source file moved into .weave/ wrongly produced: '$_cifs_marker'"
     fi
     _r=$((_r + 1))
 
@@ -2370,7 +2502,21 @@ if [ -f "$REPO_ROOT/.weave/causal-cutover" ] && \
     " 2>/dev/null | sha256sum | cut -d' ' -f1; }
     # (a) clone + full load: marker active, pre-cutover catalog skipped.
     _cln=$(mktemp -d); rm -rf "$_cln"
-    git clone -q "$REPO_ROOT" "$_cln" 2>/dev/null || true
+    # A failed clone used to be discarded: the load then reported an empty
+    # graph and the parity check compared two empty graphs and passed. Under
+    # the push gate's heavy pool the clone came back empty with its error
+    # unseen (wv-7f69b8); kept, it read "unable to write file": a full clone
+    # of this repository is about 900MB on a 3.9G /tmp tmpfs shared with the
+    # other heavy suites. Only .weave/ at HEAD is read, so the clone shares the
+    # source's objects and checks out nothing else (about 70MB, wv-249a4c).
+    _cln_rc=0
+    _cln_err=$( { git clone -q --shared --no-checkout "$REPO_ROOT" "$_cln" &&
+                  git -C "$_cln" checkout -q HEAD -- .weave; } 2>&1) || _cln_rc=$?
+    if [ "$_cln_rc" -ne 0 ] || [ ! -f "$_cln/.weave/state.sql" ]; then
+        assert_equals "cloned" "rc=$_cln_rc ${_cln_err:-no state.sql in the clone}" \
+            "a fresh clone of this repo succeeds and carries .weave/state.sql"
+        rm -rf "$_cln"
+    else
     _CN=(env -u WV_DB -u WV_DB_CUSTOM "WV_PROJECT_DIR=$_cln" "WV_HOT_ZONE=$_cln/hz" "WEAVE_DIR=$_cln/.weave"
          WV_REQUIRE_LEARNING=0 WV_REQUIRE_QUALITY=0 WV_AUTO_SYNC=0 WV_AGENT_ID=clone-diff)
     _cln_load=$("${_CN[@]}" "$WV" load 2>&1 || true)
@@ -2383,6 +2529,7 @@ if [ -f "$REPO_ROOT/.weave/causal-cutover" ] && \
     rm -rf "$_cln"
     assert_contains "$_cln_load" "pre-cutover delta(s)" "the clone load skips the pre-cutover back-catalog"
     assert_equals "$_bare_hash" "$_clone_hash" "a fresh clone loads to the same graph with or without the pre-cutover catalog"
+    fi
 else
     echo "-- durability: clone/state.sql parity test inert (marker uncommitted or state.sql lags HEAD)"
 fi
@@ -2912,8 +3059,9 @@ assert_equals "$(cat "$_lin_load/.before" 2>/dev/null)" "$(cat "$_lin_load/.afte
     "the existing database is left exactly as it was"
 rm -rf "$_lin_load"
 
-# End to end, against the symptom the consumer actually reported: the delta
-# lineage stamp fails, so sync aborts and nothing reaches the git layer.
+# End to end, against the consumer's already-hydrated partial hot zone. Prove
+# the missing edges lineage makes a lineage read impossible, then enter through
+# an ordinary graph command and require db_ensure to repair it before sync.
 _lin_out=$(mktemp -d)
 (
     cd "$_lin_out" && git init -q && git commit -q --allow-empty -m init
@@ -2933,33 +3081,56 @@ INSERT INTO edges_new(source,target,type,weight,context,created_at) SELECT sourc
 DROP TABLE edges;
 ALTER TABLE edges_new RENAME TO edges;
 SQLBREAK
-    _rc_before=0
-    WV_FORCE_SYNC=1 "${_LO[@]}" "$WV" sync >/dev/null 2>&1 || _rc_before=$?
-    printf '%s' "$_rc_before" > "$_lin_out/.rc_before"
-    # The consumer's other symptom, same cause one layer up: a prune mutates the
-    # hot DB, auto-sync cannot write state.sql, and commit-refs reports the
-    # mutation as not persisted. A commit sha no object database holds is an
-    # orphaned ref, which is what makes the node prunable.
-    _lin_node=$(sqlite3 "$_lin_out/hz/brain.db" "SELECT id FROM nodes LIMIT 1;" 2>/dev/null)
-    "${_LO[@]}" "$WV" update "$_lin_node" \
-        --metadata '{"commit":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}' >/dev/null 2>&1
-    "${_LO[@]}" "$WV" commit-refs --prune > "$_lin_out/.prune_before" 2>&1 || true
-    WV_DB="$_lin_out/hz/brain.db" bash -c "source '$REPO_ROOT/scripts/lib/wv-db.sh'; db_migrate_lineage" >/dev/null 2>&1
+    sqlite3 "$_lin_out/hz/brain.db" "
+        SELECT (SELECT group_concat(name) FROM (
+                    SELECT name FROM pragma_table_info('nodes')
+                    WHERE name LIKE 'lineage_%' ORDER BY cid))
+            || '/' ||
+               COALESCE((SELECT group_concat(name) FROM (
+                    SELECT name FROM pragma_table_info('edges')
+                    WHERE name LIKE 'lineage_%' ORDER BY cid)), 'absent');" \
+        > "$_lin_out/.shape_before_status"
+    _lineage_read_rc=0
+    sqlite3 "$_lin_out/hz/brain.db" "SELECT max(lineage_seq) FROM edges;" \
+        >/dev/null 2>&1 || _lineage_read_rc=$?
+    printf '%s' "$_lineage_read_rc" > "$_lin_out/.lineage_read_rc"
+    # A normal graph read enters through db_ensure. This is the upgrade path an
+    # already-hydrated consumer takes after installing a corrected CLI; requiring
+    # an explicit load or a hand-sourced migration leaves that consumer broken.
+    _status_rc=0
+    "${_LO[@]}" "$WV" status >/dev/null 2>&1 || _status_rc=$?
+    printf '%s' "$_status_rc" > "$_lin_out/.status_rc"
+    sqlite3 "$_lin_out/hz/brain.db" "
+        SELECT (SELECT group_concat(name) FROM (
+                    SELECT name FROM pragma_table_info('nodes')
+                    WHERE name LIKE 'lineage_%' ORDER BY cid))
+            || '/' ||
+               (SELECT group_concat(name) FROM (
+                    SELECT name FROM pragma_table_info('edges')
+                    WHERE name LIKE 'lineage_%' ORDER BY cid));" \
+        > "$_lin_out/.shape_after_status"
     _rc_after=0
     WV_FORCE_SYNC=1 "${_LO[@]}" "$WV" sync >/dev/null 2>&1 || _rc_after=$?
     printf '%s' "$_rc_after" > "$_lin_out/.rc_after"
-    # A second orphaned ref, because the failed prune already dropped the first
-    # one from the hot DB — the state the "NOT persisted" warning describes.
+    # A commit sha no object database holds is an orphaned ref, which makes this
+    # node prunable and proves the repaired path can persist a later mutation.
+    _lin_node=$(sqlite3 "$_lin_out/hz/brain.db" "SELECT id FROM nodes LIMIT 1;" 2>/dev/null)
     "${_LO[@]}" "$WV" update "$_lin_node" \
         --metadata '{"commit":"feedfacefeedfacefeedfacefeedfacefeedface"}' >/dev/null 2>&1
     sha256sum "$_lin_out/.weave/state.sql" | cut -d' ' -f1 > "$_lin_out/.state_before_prune"
     "${_LO[@]}" "$WV" commit-refs --prune > "$_lin_out/.prune_after" 2>&1 || true
     sha256sum "$_lin_out/.weave/state.sql" | cut -d' ' -f1 > "$_lin_out/.state_after_prune"
 ) >/dev/null 2>&1 || true
-assert_equals "1" "$(cat "$_lin_out/.rc_before" 2>/dev/null || echo missing)" \
-    "the fixture reproduces the reported outage: sync aborts on the partial schema"
-assert_equals "1" "$(grep -c 'NOT persisted' "$_lin_out/.prune_before" 2>/dev/null || true)" \
-    "commit-refs --prune reports a non-persisted mutation on the partial schema"
+assert_equals "lineage_actor,lineage_seq/absent" \
+    "$(cat "$_lin_out/.shape_before_status" 2>/dev/null || echo missing)" \
+    "the fixture starts in the reported nodes-canonical, edges-absent shape"
+assert_equals "1" "$([ "$(cat "$_lin_out/.lineage_read_rc" 2>/dev/null || echo 0)" -ne 0 ] && echo 1 || echo 0)" \
+    "the fixture cannot satisfy an edges lineage read before db_ensure"
+assert_equals "0" "$(cat "$_lin_out/.status_rc" 2>/dev/null || echo missing)" \
+    "an ordinary graph command repairs a supported partial schema during db_ensure"
+assert_equals "lineage_actor,lineage_seq/lineage_actor,lineage_seq" \
+    "$(cat "$_lin_out/.shape_after_status" 2>/dev/null || echo missing)" \
+    "db_ensure leaves both graph tables in canonical lineage order"
 assert_equals "0" "$(cat "$_lin_out/.rc_after" 2>/dev/null || echo missing)" \
     "sync persists again once the migration has repaired the partial schema"
 assert_equals "1" "$(grep -c 'and persisted' "$_lin_out/.prune_after" 2>/dev/null || true)" \

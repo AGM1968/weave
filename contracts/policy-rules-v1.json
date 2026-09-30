@@ -1,0 +1,1838 @@
+{
+  "schema": "weave.policy-rules.v1",
+  "contract_version": "1.11.1",
+  "references": {
+    "capability_registry": "contracts/command-capabilities.json",
+    "verdict_schema": "contracts/policy-v1.schema.json",
+    "node_field_registry": "contracts/node-field-registry-v1.json"
+  },
+  "rule_decisions": [
+    "allow",
+    "advisory",
+    "deny"
+  ],
+  "verdict_fold": [
+    {
+      "rule_decision": "deny",
+      "verdict": "deny"
+    },
+    {
+      "rule_decision": "advisory",
+      "verdict": "allow_with_advisories"
+    },
+    {
+      "rule_decision": "allow",
+      "verdict": "allow"
+    }
+  ],
+  "enforcement_owners": [
+    "command_gate",
+    "sqlite_trigger",
+    "host_hook"
+  ],
+  "non_policy_categories": [
+    {
+      "category": "input_validation",
+      "meaning": "The request is malformed or names something that does not exist; refusing it says nothing about whether the intended action was permitted."
+    },
+    {
+      "category": "expected_conflict",
+      "meaning": "A concurrent actor won a race or the target already changed state; the refusal is coordination, not judgement."
+    },
+    {
+      "category": "infrastructure_failure",
+      "meaning": "The system could not evaluate or persist the request; no policy was applied, so the refusal cannot count as one."
+    }
+  ],
+  "completeness": {
+    "proven": [
+      "sqlite_trigger",
+      "host_hook"
+    ],
+    "declared_only": [
+      "command_gate"
+    ],
+    "limit": "SQLite aborts and host-hook denials are detected mechanically and every one must be claimed here. Every declared command gate must emit its verdict through wv_policy_verdict at its declared site, and every emit must name a declared rule, a decision that rule declares, and a declared site. A command gate that emits nothing is still indistinguishable in code from input validation, so the set of command gates is complete only as far as a manual classification reached: instrumenting v1.0.0 found three gates it had missed."
+  },
+  "denominator": {
+    "unit": "wv_call",
+    "requires_event": "call_started",
+    "excluded_scopes": [
+      {
+        "kind": "host_event",
+        "reason": "A host hook that denies before wv is invoked leaves no wv call: there is no call_id, and any identity joining it to one would be minted by the hook itself, which is the self-declared evidence the attempt journal exists to remove. Such denials are outside the denominator by declaration, and are never written as wv call rows.",
+        "decided_by": "wv-bd3041"
+      }
+    ],
+    "rationale": "The E1 denominator is wv calls: a call counts only when the attempt journal holds its call_started event, written by wv before dispatch. wv calls a hook launches (source=hook, such as prune or load) are wv calls and stay in. What the exclusion costs: E1 does not measure the host-hook counterweight layer until hooks can carry an identity they did not create; until then that layer's effect is unmeasured, not zero."
+  },
+  "coverage": {
+    "ungated": [
+      {
+        "operation": "allowed-tools",
+        "reason": "Writes agent or host configuration outside the graph; no declared rule refuses it, and a malformed argument is input validation."
+      },
+      {
+        "operation": "batch",
+        "reason": "Runs each line as its own wv process, which mints a fresh call identity with batch as parent_call_id, so the line's rules decide in that child call and none in the batch call itself."
+      },
+      {
+        "operation": "breadcrumbs",
+        "reason": "Writes session notes (breadcrumbs, trails, summaries) that carry no graph invariant; no declared rule refuses it."
+      },
+      {
+        "operation": "breadcrumbs",
+        "suboperation": "clear",
+        "reason": "Writes session notes (breadcrumbs, trails, summaries) that carry no graph invariant; no declared rule refuses it."
+      },
+      {
+        "operation": "breadcrumbs",
+        "suboperation": "save",
+        "reason": "Writes session notes (breadcrumbs, trails, summaries) that carry no graph invariant; no declared rule refuses it."
+      },
+      {
+        "operation": "clean-ghosts",
+        "reason": "Rebuilds, restores or garbage-collects graph state from disk or policy rather than deciding on new work; no declared rule refuses it. Closes a load replays are declared as infrastructure failure, not decisions."
+      },
+      {
+        "operation": "commit-refs",
+        "reason": "Adds or removes an annotation, edge or attribution without changing node status; no declared rule refuses it."
+      },
+      {
+        "operation": "config",
+        "reason": "Writes agent or host configuration outside the graph; no declared rule refuses it, and a malformed argument is input validation."
+      },
+      {
+        "operation": "config",
+        "suboperation": "disable",
+        "reason": "Writes agent or host configuration outside the graph; no declared rule refuses it, and a malformed argument is input validation."
+      },
+      {
+        "operation": "config",
+        "suboperation": "enable",
+        "reason": "Writes agent or host configuration outside the graph; no declared rule refuses it, and a malformed argument is input validation."
+      },
+      {
+        "operation": "config",
+        "suboperation": "set",
+        "reason": "Writes agent or host configuration outside the graph; no declared rule refuses it, and a malformed argument is input validation."
+      },
+      {
+        "operation": "config",
+        "suboperation": "unset",
+        "reason": "Writes agent or host configuration outside the graph; no declared rule refuses it, and a malformed argument is input validation."
+      },
+      {
+        "operation": "enrich-topology",
+        "reason": "Adds or removes an annotation, edge or attribution without changing node status; no declared rule refuses it."
+      },
+      {
+        "operation": "findings",
+        "reason": "Derives or promotes records from existing graph state; no declared rule refuses it."
+      },
+      {
+        "operation": "findings",
+        "suboperation": "promote",
+        "reason": "Derives or promotes records from existing graph state; no declared rule refuses it."
+      },
+      {
+        "operation": "hook",
+        "reason": "Writes agent or host configuration outside the graph; no declared rule refuses it, and a malformed argument is input validation."
+      },
+      {
+        "operation": "import",
+        "reason": "Rebuilds, restores or garbage-collects graph state from disk or policy rather than deciding on new work; no declared rule refuses it. Closes a load replays are declared as infrastructure failure, not decisions."
+      },
+      {
+        "operation": "link",
+        "reason": "Adds or removes an annotation, edge or attribution without changing node status; no declared rule refuses it."
+      },
+      {
+        "operation": "load",
+        "reason": "Rebuilds, restores or garbage-collects graph state from disk or policy rather than deciding on new work; no declared rule refuses it. Closes a load replays are declared as infrastructure failure, not decisions."
+      },
+      {
+        "operation": "memory",
+        "reason": "Derives or promotes records from existing graph state; no declared rule refuses it."
+      },
+      {
+        "operation": "memory",
+        "suboperation": "crystallize",
+        "reason": "Derives or promotes records from existing graph state; no declared rule refuses it."
+      },
+      {
+        "operation": "memory",
+        "suboperation": "import",
+        "reason": "Derives or promotes records from existing graph state; no declared rule refuses it."
+      },
+      {
+        "operation": "memory",
+        "suboperation": "render",
+        "reason": "Derives or promotes records from existing graph state; no declared rule refuses it."
+      },
+      {
+        "operation": "plan",
+        "reason": "Derives or promotes records from existing graph state; no declared rule refuses it."
+      },
+      {
+        "operation": "prune",
+        "reason": "Rebuilds, restores or garbage-collects graph state from disk or policy rather than deciding on new work; no declared rule refuses it. Closes a load replays are declared as infrastructure failure, not decisions."
+      },
+      {
+        "operation": "quality",
+        "reason": "Derives or promotes records from existing graph state; no declared rule refuses it."
+      },
+      {
+        "operation": "quality",
+        "suboperation": "promote",
+        "reason": "Derives or promotes records from existing graph state; no declared rule refuses it."
+      },
+      {
+        "operation": "reindex",
+        "reason": "Rebuilds, restores or garbage-collects graph state from disk or policy rather than deciding on new work; no declared rule refuses it. Closes a load replays are declared as infrastructure failure, not decisions."
+      },
+      {
+        "operation": "remember",
+        "reason": "Adds or removes an annotation, edge or attribution without changing node status; no declared rule refuses it."
+      },
+      {
+        "operation": "repo-class",
+        "reason": "Reads or reports the repository class; only its set suboperation is refused, by owned_override_requires_acknowledgement."
+      },
+      {
+        "operation": "session-summary",
+        "reason": "Writes session notes (breadcrumbs, trails, summaries) that carry no graph invariant; no declared rule refuses it."
+      },
+      {
+        "operation": "test-record",
+        "reason": "Adds or removes an annotation, edge or attribution without changing node status; no declared rule refuses it."
+      },
+      {
+        "operation": "touch",
+        "reason": "Adds or removes an annotation, edge or attribution without changing node status; no declared rule refuses it."
+      },
+      {
+        "operation": "trails",
+        "reason": "Writes session notes (breadcrumbs, trails, summaries) that carry no graph invariant; no declared rule refuses it."
+      },
+      {
+        "operation": "trails",
+        "suboperation": "clear",
+        "reason": "Writes session notes (breadcrumbs, trails, summaries) that carry no graph invariant; no declared rule refuses it."
+      },
+      {
+        "operation": "trails",
+        "suboperation": "save",
+        "reason": "Writes session notes (breadcrumbs, trails, summaries) that carry no graph invariant; no declared rule refuses it."
+      },
+      {
+        "operation": "unarchive",
+        "reason": "Rebuilds, restores or garbage-collects graph state from disk or policy rather than deciding on new work; no declared rule refuses it. Closes a load replays are declared as infrastructure failure, not decisions."
+      },
+      {
+        "operation": "unlink",
+        "reason": "Adds or removes an annotation, edge or attribution without changing node status; no declared rule refuses it."
+      }
+    ],
+    "gaps": []
+  },
+  "rules": [
+    {
+      "rule_id": "orphan_prevention",
+      "summary": "A non-epic node may not be created without a parent while an epic is open, because it would be orphaned.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "add"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--force"
+        },
+        {
+          "kind": "flag",
+          "name": "--standalone"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_add",
+          "anchor": "wv_policy_verdict orphan_prevention",
+          "occurrences": 5
+        }
+      ]
+    },
+    {
+      "rule_id": "active_add_requires_claim_readiness",
+      "summary": "A node created directly as active must already carry done criteria and a risk assessment.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "add",
+          "condition": "--status=active"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--force"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_add",
+          "anchor": "wv_policy_verdict active_add_requires_claim_readiness",
+          "occurrences": 4
+        }
+      ]
+    },
+    {
+      "rule_id": "reconstruct_never_overwrites",
+      "summary": "Reconstructing a node by explicit id may not overwrite a node that still exists.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "add",
+          "condition": "--id=<node-id>"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_add",
+          "anchor": "wv_policy_verdict reconstruct_never_overwrites",
+          "occurrences": 3
+        }
+      ]
+    },
+    {
+      "rule_id": "init_preserves_existing_graph",
+      "summary": "Initialising may not replace a database that already holds nodes.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "init"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--force"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_init",
+          "anchor": "wv_policy_verdict init_preserves_existing_graph",
+          "occurrences": 5
+        }
+      ]
+    },
+    {
+      "rule_id": "close_requires_quality_evidence",
+      "summary": "A close may not proceed without quality scan data for the quality gates to judge; missing evidence fails closed.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "done"
+        },
+        {
+          "kind": "operation",
+          "operation": "ship"
+        },
+        {
+          "kind": "operation",
+          "operation": "ship-agent"
+        },
+        {
+          "kind": "operation",
+          "operation": "batch-done"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "env",
+          "name": "WV_REQUIRE_QUALITY",
+          "value": "0"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_refresh_file_metrics",
+          "anchor": "wv_policy_verdict close_requires_quality_evidence",
+          "occurrences": 5
+        }
+      ]
+    },
+    {
+      "rule_id": "finding_close_requires_violation_type",
+      "summary": "A finding node may not close without a catalogued violation_type.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "done"
+        },
+        {
+          "kind": "operation",
+          "operation": "ship"
+        },
+        {
+          "kind": "operation",
+          "operation": "ship-agent"
+        },
+        {
+          "kind": "operation",
+          "operation": "batch-done"
+        },
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "intercepts": "done"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_require_finding_metadata",
+          "anchor": "wv_policy_verdict finding_close_requires_violation_type",
+          "occurrences": 3
+        },
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/pre-close-verification.sh",
+          "anchor": "finding node requires violation_type before close"
+        }
+      ]
+    },
+    {
+      "rule_id": "completion_scope_integrity",
+      "summary": "A close may scope its completion only to files attributed to the node, under a fresh attempt identity.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "done",
+          "condition": "--completion-files"
+        },
+        {
+          "kind": "transition",
+          "field": "status",
+          "from": "active",
+          "to": "done",
+          "via": [
+            "batch-done",
+            "bulk-update",
+            "done",
+            "quick",
+            "resolve",
+            "ship",
+            "ship-agent",
+            "update"
+          ]
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_build_scope",
+          "anchor": "wv_policy_verdict completion_scope_integrity"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/lib/wv-db.sh",
+          "anchor": "GraphPolicyViolation: invalid completion scope"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_record_policy_receipt",
+          "anchor": "wv_policy_verdict completion_scope_integrity"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_close_rules_passed",
+          "anchor": "wv_policy_verdict completion_scope_integrity"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_close_rules_not_engaged",
+          "anchor": "wv_policy_verdict completion_scope_integrity"
+        }
+      ],
+      "notes": "The SQLite clause is split in the close receipt: a completion_scope with no usable shape (not an array, empty, a non-text or empty entry) is recorded as input_validation, while a stale attempt identity or a file the node never touched is a deny with clause.reason naming which. The trigger keeps one abort message because it is only the backstop."
+    },
+    {
+      "rule_id": "close_requires_learning",
+      "summary": "A close must record a learning unless it is declared trivial.",
+      "basis": "heuristic",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "done"
+        },
+        {
+          "kind": "operation",
+          "operation": "ship"
+        },
+        {
+          "kind": "operation",
+          "operation": "ship-agent"
+        },
+        {
+          "kind": "operation",
+          "operation": "batch-done"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--skip-verification"
+        },
+        {
+          "kind": "flag",
+          "name": "--no-warn"
+        },
+        {
+          "kind": "env",
+          "name": "WV_REQUIRE_LEARNING",
+          "value": "0"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_gate_learning",
+          "anchor": "wv_policy_verdict close_requires_learning",
+          "occurrences": 3
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_ship_run",
+          "anchor": "wv_policy_verdict close_requires_learning"
+        }
+      ]
+    },
+    {
+      "rule_id": "close_awaits_human_verification",
+      "summary": "A node marked as waiting for human verification may not close until that is acknowledged.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "done"
+        },
+        {
+          "kind": "operation",
+          "operation": "ship"
+        },
+        {
+          "kind": "operation",
+          "operation": "ship-agent"
+        },
+        {
+          "kind": "operation",
+          "operation": "batch-done"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--acknowledge-overlap"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_gate_pending",
+          "anchor": "wv_policy_verdict close_awaits_human_verification",
+          "occurrences": 3
+        }
+      ],
+      "notes": "The acknowledging flag is named for learning overlap, not for pending verification; recorded as observed rather than as intended."
+    },
+    {
+      "rule_id": "reserved_slot_claim",
+      "summary": "A node reserved for a counted evidence capture may not be claimed as ordinary work.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "work"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "env",
+          "name": "WV_ALLOW_RESERVED",
+          "value": "1"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_work",
+          "anchor": "wv_policy_verdict reserved_slot_claim",
+          "occurrences": 3
+        }
+      ]
+    },
+    {
+      "rule_id": "reopen_requires_explicit_intent",
+      "summary": "A done node may be reopened only by an explicit reopen, never implicitly by a claim or an update.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "work"
+        },
+        {
+          "kind": "operation",
+          "operation": "update"
+        },
+        {
+          "kind": "operation",
+          "operation": "bulk-update"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--reopen"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_work",
+          "anchor": "wv_policy_verdict reopen_requires_explicit_intent",
+          "occurrences": 3
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_update",
+          "anchor": "wv_policy_verdict reopen_requires_explicit_intent",
+          "occurrences": 3
+        }
+      ]
+    },
+    {
+      "rule_id": "claim_ownership",
+      "summary": "Taking over a node another agent has claimed requires an explicit override, which is recorded.",
+      "basis": "invariant",
+      "decisions": [
+        "allow"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "work"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--force"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_work",
+          "anchor": "wv_policy_verdict claim_ownership",
+          "occurrences": 2
+        }
+      ],
+      "notes": "Only the takeover is a policy event. A claim refused because another agent holds the node is recorded as expected_conflict: the atomic claim cannot tell a live holder from a race this call just lost."
+    },
+    {
+      "rule_id": "delete_preserves_children",
+      "summary": "A node with child nodes may not be deleted without explicit intent, because it would orphan them.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "delete"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--force"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_delete",
+          "anchor": "wv_policy_verdict delete_preserves_children",
+          "occurrences": 3
+        }
+      ]
+    },
+    {
+      "rule_id": "block_graph_acyclic",
+      "summary": "Blocking edges may not form a self-loop or a cycle.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "block"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-graph.sh",
+          "function": "cmd_block",
+          "anchor": "wv_policy_verdict block_graph_acyclic",
+          "occurrences": 3
+        }
+      ]
+    },
+    {
+      "rule_id": "sync_shrink_floor",
+      "summary": "A sync may not overwrite the committed graph with a dump far smaller than it, the signature of a wiped or partial hot zone.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "sync"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--force"
+        },
+        {
+          "kind": "env",
+          "name": "WV_FORCE_SYNC",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "WV_SYNC_FLOOR_RATIO",
+          "value": "0"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-data.sh",
+          "function": "_sync_floor_guard_ok",
+          "anchor": "wv_policy_verdict sync_shrink_floor",
+          "occurrences": 5
+        }
+      ],
+      "notes": "The floor guard also runs when another operation auto-syncs. There the sync is a side effect, not the call's operation: a refusal surfaces as that sync step's failure and is not recorded as a counted decision of the enclosing call (wv-15422b). Only an explicit wv sync records this rule's verdict."
+    },
+    {
+      "rule_id": "compact_waits_for_claims",
+      "summary": "Deltas may not be compacted while agents hold claims that may not have replayed them.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "compact"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--force"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-data.sh",
+          "function": "cmd_compact",
+          "anchor": "wv_policy_verdict compact_waits_for_claims",
+          "occurrences": 3
+        }
+      ]
+    },
+    {
+      "rule_id": "cutover_waits_for_claims",
+      "summary": "A causal cutover may not run while agents hold claims.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "cutover"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--force"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-data.sh",
+          "function": "cmd_cutover",
+          "anchor": "wv_policy_verdict cutover_waits_for_claims",
+          "occurrences": 3
+        }
+      ]
+    },
+    {
+      "rule_id": "recovery_never_fabricates_closure",
+      "summary": "Recovery may not complete a close that was never durably recorded.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "recover"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-ops.sh",
+          "function": "_recover_ship",
+          "anchor": "wv_policy_verdict recovery_never_fabricates_closure",
+          "occurrences": 2
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-ops.sh",
+          "function": "cmd_recover",
+          "anchor": "wv_policy_verdict recovery_never_fabricates_closure"
+        }
+      ]
+    },
+    {
+      "rule_id": "repository_write_requires_owned",
+      "summary": "Scaffolding and repair may write only into a repository classified as owned, never into vendored upstream code.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "init"
+        },
+        {
+          "kind": "operation",
+          "operation": "init-repo"
+        },
+        {
+          "kind": "operation",
+          "operation": "doctor",
+          "condition": "--repair"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "state",
+          "how": "classify the repository as owned with wv repo-class set owned"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/lib/wv-repository-class.sh",
+          "function": "wv_repository_require_owned",
+          "anchor": "wv_policy_verdict repository_write_requires_owned",
+          "occurrences": 2
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-ops.sh",
+          "function": "cmd_doctor",
+          "anchor": "wv_policy_verdict repository_write_requires_owned"
+        }
+      ]
+    },
+    {
+      "rule_id": "owned_override_requires_acknowledgement",
+      "summary": "Classifying a remote-bearing repository as owned against autodetection requires acknowledging it is an intentional fork.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "repo-class",
+          "suboperation": "set"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--acknowledge-upstream-fork"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/lib/wv-repository-class.sh",
+          "function": "wv_repository_class_set",
+          "anchor": "wv_policy_verdict owned_override_requires_acknowledgement",
+          "occurrences": 3
+        }
+      ]
+    },
+    {
+      "rule_id": "add_duplicate_check",
+      "summary": "A node whose text matches an open node, or one closed in the last 30 days, is refused as a likely duplicate.",
+      "basis": "heuristic",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "add"
+        },
+        {
+          "kind": "operation",
+          "operation": "quick"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--force"
+        },
+        {
+          "kind": "flag",
+          "name": "--standalone"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_add_dedup_check",
+          "anchor": "wv_policy_verdict add_duplicate_check",
+          "occurrences": 5
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_add",
+          "anchor": "wv_policy_verdict add_duplicate_check"
+        }
+      ],
+      "notes": "Not applied to an add with --parent: decomposition shares vocabulary with its parent by design. quick has no bypass."
+    },
+    {
+      "rule_id": "init_refuses_symlinked_weave_dir",
+      "summary": "Initialising through a symlinked Weave directory is refused, because it writes graph state outside the repository.",
+      "basis": "invariant",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "init"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_init",
+          "anchor": "wv_policy_verdict init_refuses_symlinked_weave_dir",
+          "occurrences": 2
+        }
+      ]
+    },
+    {
+      "rule_id": "learning_overlap_advisory",
+      "summary": "A learning that overlaps or contradicts an existing one is recorded as an advisory; it never blocks the close.",
+      "basis": "heuristic",
+      "decisions": [
+        "allow",
+        "advisory"
+      ],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "done"
+        },
+        {
+          "kind": "operation",
+          "operation": "ship"
+        },
+        {
+          "kind": "operation",
+          "operation": "ship-agent"
+        },
+        {
+          "kind": "operation",
+          "operation": "batch-done"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_store_learning",
+          "anchor": "wv_policy_verdict learning_overlap_advisory",
+          "occurrences": 2
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_apply_learning_and_tools",
+          "anchor": "wv_policy_verdict learning_overlap_advisory"
+        }
+      ]
+    },
+    {
+      "rule_id": "close_complexity_ceiling",
+      "summary": "A close may not complete while a file it touched exceeds the McCabe complexity threshold.",
+      "basis": "heuristic",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "transition",
+          "field": "status",
+          "from": "active",
+          "to": "done",
+          "via": [
+            "batch-done",
+            "bulk-update",
+            "done",
+            "quick",
+            "resolve",
+            "ship",
+            "ship-agent",
+            "update"
+          ]
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "state",
+          "how": "list the path in quality_exempt (recorded as allow with bypass=quality_exempt:<pattern>)",
+          "recorded_as": "quality_exempt:"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/lib/wv-db.sh",
+          "anchor": "GraphPolicyViolation: mccabe_max threshold exceeded"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_record_policy_receipt",
+          "anchor": "wv_policy_verdict close_complexity_ceiling"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_record_policy_bypass",
+          "anchor": "wv_policy_verdict close_complexity_ceiling"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_close_rules_passed",
+          "anchor": "wv_policy_verdict close_complexity_ceiling"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_close_rules_not_engaged",
+          "anchor": "wv_policy_verdict close_complexity_ceiling"
+        }
+      ]
+    },
+    {
+      "rule_id": "close_trend_not_deteriorating",
+      "summary": "A close may not complete while a file it touched is on a deteriorating quality trend.",
+      "basis": "heuristic",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "transition",
+          "field": "status",
+          "from": "active",
+          "to": "done",
+          "via": [
+            "batch-done",
+            "bulk-update",
+            "done",
+            "quick",
+            "resolve",
+            "ship",
+            "ship-agent",
+            "update"
+          ]
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "state",
+          "how": "list the path in quality_exempt (recorded as allow with bypass=quality_exempt:<pattern>)",
+          "recorded_as": "quality_exempt:"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/lib/wv-db.sh",
+          "anchor": "GraphPolicyViolation: trend_deteriorating threshold exceeded"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_record_policy_receipt",
+          "anchor": "wv_policy_verdict close_trend_not_deteriorating"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_record_policy_bypass",
+          "anchor": "wv_policy_verdict close_trend_not_deteriorating"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_close_rules_passed",
+          "anchor": "wv_policy_verdict close_trend_not_deteriorating"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_close_rules_not_engaged",
+          "anchor": "wv_policy_verdict close_trend_not_deteriorating"
+        }
+      ]
+    },
+    {
+      "rule_id": "close_tests_not_red",
+      "summary": "A code node may not close while a file it touched has a red or stale test result.",
+      "basis": "heuristic",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "transition",
+          "field": "status",
+          "from": "active",
+          "to": "done",
+          "via": [
+            "batch-done",
+            "bulk-update",
+            "done",
+            "quick",
+            "resolve",
+            "ship",
+            "ship-agent",
+            "update"
+          ]
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "state",
+          "how": "list the path in quality_exempt (recorded as allow with bypass=quality_exempt:<pattern>); finding, epic and session_history nodes are exempt by type",
+          "recorded_as": "quality_exempt:"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/lib/wv-db.sh",
+          "anchor": "GraphPolicyViolation: test_gate red/stale result"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_record_policy_receipt",
+          "anchor": "wv_policy_verdict close_tests_not_red"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_record_policy_bypass",
+          "anchor": "wv_policy_verdict close_tests_not_red"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_close_rules_passed",
+          "anchor": "wv_policy_verdict close_tests_not_red"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_close_rules_not_engaged",
+          "anchor": "wv_policy_verdict close_tests_not_red"
+        }
+      ]
+    },
+    {
+      "rule_id": "edit_source_not_installed_copy",
+      "summary": "An edit may not target the installed copy of Weave instead of its source.",
+      "basis": "invariant",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "tool_class": "edit"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": "scripts/lib/wv-hook-common.sh",
+          "function": "_hc_check_installed_path"
+        }
+      ]
+    },
+    {
+      "rule_id": "read_size_budget",
+      "summary": "A whole-file read of a large file must be bounded.",
+      "basis": "heuristic",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "tool_class": "read"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "state",
+          "how": "pass a line limit on the read"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": "scripts/lib/wv-hook-common.sh",
+          "function": "_hc_check_read_size"
+        }
+      ]
+    },
+    {
+      "rule_id": "edit_blocked_in_phase",
+      "summary": "Edits are refused while the session is in a discovery or closing phase.",
+      "basis": "invariant",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "tool_class": "edit"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": "scripts/lib/wv-hook-common.sh",
+          "function": "_hc_check_phase"
+        }
+      ]
+    },
+    {
+      "rule_id": "edit_requires_active_node",
+      "summary": "An edit requires an active node to attribute it to.",
+      "basis": "invariant",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "tool_class": "edit"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "state",
+          "how": "claim or create an active node first"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": "scripts/lib/wv-hook-common.sh",
+          "function": "_hc_check_active_node"
+        }
+      ]
+    },
+    {
+      "rule_id": "active_node_not_stale",
+      "summary": "An edit may not proceed under an active node that has gone stale.",
+      "basis": "heuristic",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "tool_class": "edit"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": "scripts/lib/wv-hook-common.sh",
+          "function": "_hc_check_stale_node"
+        }
+      ]
+    },
+    {
+      "rule_id": "active_node_contradictions_resolved",
+      "summary": "An edit may not proceed while the active node carries unresolved contradictions.",
+      "basis": "heuristic",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "tool_class": "edit"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": "scripts/lib/wv-hook-common.sh",
+          "function": "_hc_check_contradictions"
+        }
+      ]
+    },
+    {
+      "rule_id": "active_node_not_blocked",
+      "summary": "An edit may not proceed under an active node that is still blocked.",
+      "basis": "invariant",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "tool_class": "edit"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": "scripts/lib/wv-hook-common.sh",
+          "function": "_hc_check_blockers"
+        }
+      ]
+    },
+    {
+      "rule_id": "claim_requires_done_criteria",
+      "summary": "A node may not be claimed until it carries done criteria.",
+      "basis": "invariant",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "intercepts": "work"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/pre-claim-skills.sh",
+          "anchor": "Claim preflight for"
+        }
+      ]
+    },
+    {
+      "rule_id": "claim_requires_alias",
+      "summary": "A node may not be claimed until it carries an alias.",
+      "basis": "invariant",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "intercepts": "work"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/pre-claim-skills.sh",
+          "anchor": "Claim preflight for"
+        }
+      ]
+    },
+    {
+      "rule_id": "claim_premortem_advisory",
+      "summary": "A claim without a risk assessment is advised to record one.",
+      "basis": "heuristic",
+      "decisions": [
+        "advisory"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "intercepts": "work"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/pre-claim-skills.sh",
+          "anchor": "Claim preflight for"
+        }
+      ],
+      "notes": "Emitted inside the same deny message as the two claim gates, so an advisory can appear in a denied claim without being its cause."
+    },
+    {
+      "rule_id": "close_requires_verification_evidence",
+      "summary": "A close must cite how the work was verified unless declared trivial.",
+      "basis": "heuristic",
+      "decisions": [
+        "allow",
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "intercepts": "done"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--skip-verification"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/pre-close-verification.sh",
+          "anchor": "--verification-method=\\\"make check\\\""
+        },
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/pre-close-verification.sh",
+          "anchor": "The override is recorded, not silent"
+        }
+      ]
+    },
+    {
+      "rule_id": "close_requires_committed_work",
+      "summary": "A close may not proceed while the node's own files are uncommitted.",
+      "basis": "invariant",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "intercepts": "done"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/pre-close-verification.sh",
+          "anchor": "Commit work before close."
+        }
+      ]
+    },
+    {
+      "rule_id": "close_requires_attributed_commit",
+      "summary": "A close requires at least one commit attributed to the node.",
+      "basis": "invariant",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "intercepts": "done"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/pre-close-verification.sh",
+          "anchor": "No commit attributed to"
+        }
+      ]
+    },
+    {
+      "rule_id": "no_busy_wait_polling",
+      "summary": "A background task may not be polled with a sleep loop.",
+      "basis": "heuristic",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "tool_class": "bash"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/bash-dedup.sh",
+          "anchor": "Busy-wait poller blocked"
+        }
+      ]
+    },
+    {
+      "rule_id": "no_duplicate_inflight_command",
+      "summary": "A command identical to one still running may not be launched again.",
+      "basis": "heuristic",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "tool_class": "bash"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/bash-dedup.sh",
+          "anchor": "already running — wait for the task-notification"
+        },
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/bash-dedup.sh",
+          "anchor": "just acquired by concurrent call"
+        }
+      ]
+    },
+    {
+      "rule_id": "session_end_requires_no_active_node",
+      "summary": "A session may not end while a node is still active.",
+      "basis": "invariant",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "Stop"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "state",
+          "how": "a second stop inside the cooldown window is allowed with a note"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/stop-check.sh",
+          "anchor": "active node(s) still open"
+        }
+      ]
+    }
+  ],
+  "non_policy_sites": [
+    {
+      "category": "input_validation",
+      "summary": "A hook payload that cannot be parsed is refused before any rule runs.",
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": "scripts/lib/wv-hook-common.sh",
+          "function": "_hc_check_payload"
+        }
+      ]
+    },
+    {
+      "category": "infrastructure_failure",
+      "summary": "Pre-close verification that times out denies the close without evaluating it.",
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/pre-close-verification.sh",
+          "function": "_agent_hook_timeout_deny"
+        }
+      ]
+    },
+    {
+      "category": "infrastructure_failure",
+      "summary": "A close receipt or exemption bypass that names no declared rule, and the policy trigger refusing a close its receipt allowed, are the receipt and the trigger disagreeing: no single decision was made, so neither counts as one. A claim whose write failed or did not persist (wv-03d775) is likewise a failure, not a decision.",
+      "sites": [
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_record_policy_receipt",
+          "anchor": "wv_policy_refusal infrastructure_failure"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_record_policy_bypass",
+          "anchor": "wv_policy_refusal infrastructure_failure"
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_work_claim_failed",
+          "anchor": "wv_policy_refusal infrastructure_failure"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_close",
+          "anchor": "wv_policy_refusal infrastructure_failure"
+        }
+      ]
+    },
+    {
+      "category": "input_validation",
+      "summary": "Gate-family commands refuse a missing or unknown node, a malformed --id, and malformed or inapplicable --completion-files.",
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_add",
+          "anchor": "wv_policy_refusal input_validation"
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_check_node",
+          "anchor": "wv_policy_refusal input_validation",
+          "occurrences": 2
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_build_scope",
+          "anchor": "wv_policy_refusal input_validation"
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_work",
+          "anchor": "wv_policy_refusal input_validation",
+          "occurrences": 2
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_ship_run",
+          "anchor": "wv_policy_refusal input_validation"
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_delete",
+          "anchor": "wv_policy_refusal input_validation"
+        },
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_record_policy_receipt",
+          "anchor": "wv_policy_refusal input_validation"
+        }
+      ]
+    },
+    {
+      "category": "expected_conflict",
+      "summary": "A claim lost to another agent, a close of a node already closed, and a node that changed state mid-close are conflicts, not decisions.",
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "cmd_work",
+          "anchor": "wv_policy_refusal expected_conflict"
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_check_node",
+          "anchor": "wv_policy_refusal expected_conflict"
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_close",
+          "anchor": "wv_policy_refusal expected_conflict"
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_ship_run",
+          "anchor": "wv_policy_refusal expected_conflict"
+        }
+      ]
+    },
+    {
+      "category": "infrastructure_failure",
+      "summary": "Delta replay re-applies a close another actor already decided, so it is not a close decision of the load or sync call replaying it, and every close that is one (done, ship, batch-done, update, bulk-update, quick, resolve) is judged by the close receipt first. If the local close trigger refuses a replayed close, the replay failed; nothing was decided.",
+      "sites": [
+        {
+          "owner": "sqlite_trigger",
+          "path": "scripts/lib/wv-delta.sh",
+          "anchor": "status=excluded.status"
+        }
+      ]
+    }
+  ]
+}

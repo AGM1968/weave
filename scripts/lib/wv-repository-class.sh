@@ -182,10 +182,20 @@ wv_repository_class_set() {
         return 1
     }
     _wv_repository_autodetect "$repo" 0
-    if [ "$class" = "owned" ] && [ "$WV_REPO_AUTO_CLASS" != "owned" ] && [ "$acknowledge" != "1" ]; then
+    # This library also runs outside a wv call (install.sh, project-procedures.sh),
+    # where the attempt journal is not loaded and there is no call to attribute to.
+    if [ "$class" = "owned" ] && [ "$WV_REPO_AUTO_CLASS" != "owned" ] && [ "$acknowledge" = "1" ]; then
+        ! declare -F wv_policy_verdict >/dev/null || wv_policy_verdict owned_override_requires_acknowledgement \
+            allow yes --acknowledge-upstream-fork "classified a remote-bearing repository as owned"
+    elif [ "$class" = "owned" ] && [ "$WV_REPO_AUTO_CLASS" != "owned" ]; then
+        ! declare -F wv_policy_verdict >/dev/null || wv_policy_verdict owned_override_requires_acknowledgement \
+            deny yes "" "owning a remote-bearing repository needs an explicit fork acknowledgement"
         echo "wv: refusing owned override: $WV_REPO_AUTO_REASON" >&2
         echo "Re-run with --acknowledge-upstream-fork only if this remote-bearing repository is intentionally owned." >&2
         return 1
+    else
+        ! declare -F wv_policy_verdict >/dev/null || wv_policy_verdict owned_override_requires_acknowledgement \
+            allow no "" "no ownership override of a remote-bearing repository"
     fi
     git -C "$repo" config --local weave.repositoryClass "$class"
     git -C "$repo" config --local weave.repositoryClassRemoteFingerprint \
@@ -195,7 +205,13 @@ wv_repository_class_set() {
 wv_repository_require_owned() {
     local repo="$1" operation="${2:-repository write}" offline="${3:-0}"
     wv_repository_classify "$repo" "$offline"
-    [ "$WV_REPO_CLASS" = "owned" ] && return 0
+    if [ "$WV_REPO_CLASS" = "owned" ]; then
+        ! declare -F wv_policy_verdict >/dev/null || wv_policy_verdict repository_write_requires_owned \
+            allow no "" "the repository is owned"
+        return 0
+    fi
+    ! declare -F wv_policy_verdict >/dev/null || wv_policy_verdict repository_write_requires_owned \
+        deny yes "" "scaffolding a repository that is not owned writes into vendored code"
     echo "wv: refusing $operation in repository class '$WV_REPO_CLASS'" >&2
     echo "  evidence: $WV_REPO_REASON" >&2
     echo "  no repository scaffolding was written" >&2
@@ -209,7 +225,7 @@ wv_repository_require_owned() {
 wv_repository_audit_json() {
     local repo="$1" offline="${2:-0}" clean gate_passed remediation_required exposure_state
     local tmp_dir tracked_file markers_file history_file reachable_file residue_file rc=0
-    local marker_ere='WEAVE-MANAGED|BEGIN WEAVE|weave\.codex\.v1|weave-(session|lite|inspect)|Weave (pre-commit|post-commit|prepare-commit)'
+    local marker_ere='WEAVE-MANAGED|BEGIN WEAVE|weave\.codex\.v1|weave-(session|lite|inspect)|Weave (pre-commit|post-commit|prepare-commit|pre-push)'
     wv_repository_classify "$repo" "$offline"
     tmp_dir=$(mktemp -d) || return 1
     tracked_file="$tmp_dir/tracked"

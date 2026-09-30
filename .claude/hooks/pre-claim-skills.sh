@@ -31,6 +31,10 @@ if [[ "$COMMAND" =~ wv[[:space:]]update[[:space:]]wv-[0-9a-f]{4,6}.*--status=act
         || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" 2>/dev/null \
         || source "${HOME}/.config/weave/lib/wv-resolve-project.sh" 2>/dev/null \
         || exit 0
+    source "$HOOK_DIR/../lib/wv-hook-observe.sh" 2>/dev/null \
+        || source "$HOOK_DIR/../../scripts/lib/wv-hook-observe.sh" 2>/dev/null \
+        || source "${HOME}/.config/weave/lib/wv-hook-observe.sh" 2>/dev/null \
+        || _hc_observe() { return 0; }
     if [ -x "$WV" ]; then
         # wv show --json returns a compact object (not array) for single-ID queries.
         # Fail-open when node is missing or DB is unreadable — let wv work surface errors.
@@ -81,6 +85,10 @@ if [[ "$COMMAND" =~ wv[[:space:]]update[[:space:]]wv-[0-9a-f]{4,6}.*--status=act
             gates="${gates}[3] risks/premortem not set (advisory) — consider /pre-mortem, or --risks= on wv add; proceed if already assessed. "
         fi
         if [[ -n "$gates" ]]; then
+            # Each unmet gate is its own rule's decision (wv-664b7f).
+            [[ "$HAS_SHIP_IT" == "false" ]] && _hc_observe claim_requires_done_criteria deny
+            [[ -z "$NODE_ALIAS" ]] && _hc_observe claim_requires_alias deny
+            [[ "$HAS_PRE_MORTEM" == "false" ]] && _hc_observe claim_premortem_advisory advisory
             reason="Claim preflight for $NODE_ID ($NODE_TEXT) — unmet gates: $gates"
             reason="${reason}Satisfy all in one pass, then re-run the claim."
             [[ -n "$IMPACT_LINE" ]] && reason="$reason $IMPACT_LINE"

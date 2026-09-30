@@ -79,8 +79,13 @@ JSON
 fi
 
 # Opt-in import: create mem_status=candidate nodes (never active recall).
+# The project's own wv first, then the checkout this hook came from, before the
+# installed copy: a checkout's hook run against a project with no scripts/wv
+# must not fall through to installed code (wv-706439, wv-b60cd5). An installed
+# hook has no ../../scripts/wv beside it and skips that candidate.
 WV_BIN=""
-for cand in "$REPO_ROOT/scripts/wv" "$HOME/.local/bin/wv" "$(command -v wv 2>/dev/null || true)"; do
+for cand in "$REPO_ROOT/scripts/wv" "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)/scripts/wv" \
+    "$HOME/.local/bin/wv" "$(command -v wv 2>/dev/null || true)"; do
     if [ -n "$cand" ] && [ -x "$cand" ]; then WV_BIN="$cand"; break; fi
 done
 [ -z "$WV_BIN" ] && exit 0

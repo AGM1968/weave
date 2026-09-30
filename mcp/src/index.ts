@@ -961,6 +961,11 @@ const TOOLS: Tool[] = [
           description:
             "What would count as done, recorded upfront. Surfaced again as a reminder if wv done is later blocked for missing verification.",
         },
+        id: {
+          type: "string",
+          description:
+            "Reconstruct a node under an id the graph has LOST, so a pushed Weave-ID trailer stops pointing at nothing. Expects the literal wv-XXXXXX form: an alias cannot name a lost node. Refused if the id already exists, whatever its status — overwriting a live node would turn a recovery into a second loss. Omit for every ordinary add.",
+        },
       },
       required: ["text"],
     },
@@ -1094,6 +1099,12 @@ const TOOLS: Tool[] = [
         all: {
           type: "boolean",
           description: "Include done nodes (default: false)",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Maximum rows (default cap: 50, or 100 for status=done). The CLI reports how many rows the cap hides; raise it to see them.",
         },
         claimed_by: {
           type: "string",
@@ -2322,6 +2333,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     const criteria = args.criteria as string | undefined;
     const risks = args.risks as string | undefined;
     const verificationPlan = args.verification_plan as string | undefined;
+    const reconstructId = args.id as string | undefined;
     const cmd = ["add", text];
     if (status) cmd.push(`--status=${status}`);
     if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
@@ -2333,6 +2345,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     if (criteria) cmd.push(`--criteria=${criteria}`);
     if (risks) cmd.push(`--risks=${risks}`);
     if (verificationPlan) cmd.push(`--verification-plan=${verificationPlan}`);
+    if (reconstructId) cmd.push(`--id=${reconstructId}`);
     result = wv(cmd);
     // Enforcement warnings — suppress --gh nudge for child nodes (only epic needs a GH issue)
     const warnings: string[] = [];
@@ -2422,9 +2435,11 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     const all = args.all as boolean | undefined;
     const claimedBy = args.claimed_by as string | undefined;
     const mode = args.mode as ReadMode | undefined;
+    const limit = args.limit as number | undefined;
     const cmd = ["list", "--json-v2"];
     if (status) cmd.push(`--status=${status}`);
     if (all) cmd.push("--all");
+    if (limit !== undefined) cmd.push(`--limit=${limit}`);
     if (claimedBy) cmd.push(`--claimed-by=${claimedBy}`);
     result = wvRead(cmd, WV_TIMEOUT, mode);
     return result;
@@ -2656,39 +2671,16 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     } catch {
       /* skip */
     }
-    // Context load policy (replaces session-start hook injection)
-    // Try dev layout first (__dirname/../../scripts/), then installed (~/.config/weave/)
+    // Context load policy from `wv context-policy`, the computation every
+    // harness reads (wv-f757a4). This ran the Claude SessionStart hook, whose
+    // ~55s wv load outran the 5s timeout and whose agent-mode output never
+    // carried a "policy:" line, and a silent catch hid both; say so instead.
     try {
-      const devPath = `${__dirname}/../../scripts/context-guard.sh`;
-      const installedPath = `${process.env.HOME}/.config/weave/context-guard.sh`;
-      let scriptPath: string | undefined;
-      try {
-        accessSync(devPath, constants.X_OK);
-        scriptPath = devPath;
-      } catch {
-        /* not dev */
-      }
-      if (!scriptPath) {
-        try {
-          accessSync(installedPath, constants.X_OK);
-          scriptPath = installedPath;
-        } catch {
-          /* not installed */
-        }
-      }
-      if (scriptPath) {
-        const policy = execFileSync("bash", [scriptPath], {
-          encoding: "utf-8",
-          timeout: 5000,
-          env: { ...process.env, NO_COLOR: "1", WV_AGENT: "1" },
-        }).trim();
-        const policyLine = policy.split("\n").find((l) => l.startsWith("policy:"));
-        if (policyLine) parts.push("\n=== Context Policy ===\n" + policyLine);
-      } else {
-        parts.push("\n=== Context Policy ===\nUnavailable (context-guard.sh not found)");
-      }
-    } catch {
-      /* skip — context-guard.sh execution failed */
+      const out = JSON.parse(wv(["context-policy", "--json"])) as { policy?: string; reasons?: string[] };
+      const reason = out.reasons && out.reasons.length > 0 ? ` (${out.reasons[0]})` : "";
+      parts.push(`\n=== Context Policy ===\npolicy: ${out.policy ?? "unknown"}${reason}`);
+    } catch (err) {
+      parts.push(`\n=== Context Policy ===\nUnavailable (wv context-policy failed: ${String(err).split("\n")[0]})`);
     }
     result = parts.join("\n");
     return result;

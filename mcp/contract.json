@@ -1,6 +1,6 @@
 {
   "schema": "weave-mcp-contract.v1",
-  "version": "1.71.0-rc.12",
+  "version": "1.71.0-rc.13",
   "transport": "stdio",
   "default_scope": "all",
   "startup_report_schema": "weave-mcp-startup.v1",

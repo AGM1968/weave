@@ -73,7 +73,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${GREEN}[PASS]${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -118,7 +118,7 @@ test_phase_values_contains_all_values() {
     local phase_values
     phase_values=$(bash -c "source '$WV_VALIDATE' 2>/dev/null; echo \"\${PHASE_VALUES:-}\"")
     for val in execute discover closing; do
-        if echo "$phase_values" | grep -qw -- "$val"; then
+        if grep -qw -- "$val" <<< "$phase_values"; then
             echo -e "  ${GREEN}[PASS]${NC} PHASE_VALUES contains '$val'"
             TESTS_RUN=$((TESTS_RUN + 1))
             TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -250,7 +250,7 @@ test_doctor_flags_invalid_phase() {
     local output rc=0
     output=$("$WV" doctor 2>&1) || rc=$?
     # Check for the invalid value itself (not "phase" which may appear in path names)
-    if echo "$output" | grep -q "bogus-xphase\|invalid.*phase\|unknown.*phase"; then
+    if grep -q "bogus-xphase\|invalid.*phase\|unknown.*phase" <<< "$output"; then
         echo -e "  ${GREEN}[PASS]${NC} wv doctor flags invalid phase value"
         TESTS_RUN=$((TESTS_RUN + 1))
         TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -265,7 +265,7 @@ test_no_raw_phase_writes_in_source() {
     echo "-- no raw 'echo ... > .session_phase' calls outside wv_set_phase"
     local output rc=0
     output=$("$WV" pattern-audit 2>&1) || rc=$?
-    if [ "$rc" -eq 0 ] && echo "$output" | grep -q "Check 3 PASS"; then
+    if [ "$rc" -eq 0 ] && grep -q "Check 3 PASS" <<< "$output"; then
         echo -e "  ${GREEN}[PASS]${NC} no raw .session_phase writes"
         TESTS_RUN=$((TESTS_RUN + 1))
         TESTS_PASSED=$((TESTS_PASSED + 1))

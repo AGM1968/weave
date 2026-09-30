@@ -35,6 +35,24 @@ TEST_DIR="/tmp/wv-init-repo-test-$$"
 export WV_HOT_ZONE="$TEST_DIR/hotzone"
 export WV_DB="$TEST_DIR/hotzone/brain.db"
 
+# One hot zone per test repository, all under TEST_DIR. The first repository to
+# initialise a shared exported zone stamps it, and wv refuses it in every other
+# repository (wv-5e804e); before that, each later repository fell back silently
+# to a default hot zone outside TEST_DIR. An explicit per-call WV_HOT_ZONE (the
+# repo-class cases) is left alone.
+mkdir -p "$TEST_DIR/bin"
+cat > "$TEST_DIR/bin/wv" <<EOF
+#!/usr/bin/env bash
+if [ "\${WV_HOT_ZONE:-}" = "$TEST_DIR/hotzone" ]; then
+    root=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    WV_HOT_ZONE="$TEST_DIR/hotzone/\$(printf '%s' "\$root" | md5sum | cut -c1-12)"
+    export WV_HOT_ZONE WV_DB="\$WV_HOT_ZONE/brain.db"
+fi
+exec "$WV" "\$@"
+EOF
+chmod +x "$TEST_DIR/bin/wv"
+WV="$TEST_DIR/bin/wv"
+
 cleanup() {
     cd /tmp
     [ -d "$TEST_DIR" ] && rm -rf "$TEST_DIR"
@@ -86,13 +104,13 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected to find: $needle"
-        echo "  In: $(echo "$haystack" | head -5)"
+        echo "  In: $(echo "$haystack" | sed -n '1,5p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
@@ -102,13 +120,13 @@ assert_not_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if ! echo "$haystack" | grep -qF -- "$needle"; then
+    if ! grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Did NOT expect to find: $needle"
-        echo "  But found it in: $(echo "$haystack" | head -5)"
+        echo "  But found it in: $(echo "$haystack" | sed -n '1,5p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
@@ -179,7 +197,7 @@ assert_file_exists "$REPO/.weave/runtime.md"                "creates .weave/runt
 assert_file_exists "$REPO/.weave/patterns/managed/.manifest" "creates managed pattern manifest"
 assert_file_exists "$REPO/.weave/patterns/managed/prose-filler-phrases.yaml" "projects curated prose rules"
 assert_file_exists "$REPO/.git/hooks/pre-commit"            "installs actual pre-commit hook entrypoint"
-assert_file_exists "$REPO/.git/hooks/post-commit"           "installs actual post-commit hook entrypoint"
+assert_file_absent "$REPO/.git/hooks/post-commit"           "does not install the retired post-commit hook (wv-56c823)"
 assert_file_exists "$REPO/.git/hooks/prepare-commit-msg"    "installs actual prepare-commit-msg hook entrypoint"
 assert_file_absent "$REPO/.git/hooks/pre-commit-weave.sh"   "does not install source filename as git hook entrypoint"
 assert_contains "$(cat "$REPO/.weave/runtime.md")" "Agent Runtime Notes" "runtime.md includes agent runtime notes"
@@ -363,6 +381,22 @@ assert_not_contains "$(cat "$REPO_HOOK/.git/hooks/pre-commit" 2>/dev/null)" "# d
 if [ "$HOOK_INODE_BEFORE" != "$HOOK_INODE_AFTER" ]; then HOOK_REPLACE=rename; else HOOK_REPLACE=in-place; fi
 assert_equals "rename" "$HOOK_REPLACE" \
     "hook: replaced by rename (new inode), not rewritten under a running process"
+
+# --- AGENTS.md opts in by marker (wv-6ef83b) ---
+# A consumer AGENTS.md is user-owned: init-repo refreshes a WEAVE PROCEDURES
+# block it already carries and touches nothing else; one without the block is
+# preserved byte for byte (the codex case below).
+echo ""
+echo "--- AGENTS.md marker-gated procedure index ---"
+REPO_AGENTS=$(make_test_repo "agentsmd")
+printf '%s\n' '# Our agents' 'hand text above' '<!-- BEGIN WEAVE PROCEDURES -->' 'stale line' \
+    '<!-- END WEAVE PROCEDURES -->' 'hand text below' > "$REPO_AGENTS/AGENTS.md"
+(cd "$REPO_AGENTS" && "$WV" init-repo --agent=codex >/dev/null 2>&1) || true
+AGENTS_TEXT=$(cat "$REPO_AGENTS/AGENTS.md")
+assert_contains "$AGENTS_TEXT" "wv guide --procedure=discovery-routing" "agents: init-repo fills a marked AGENTS.md procedure index"
+assert_not_contains "$AGENTS_TEXT" "stale line" "agents: the managed block is replaced, not appended to"
+assert_contains "$AGENTS_TEXT" "hand text above" "agents: hand text before the block is kept"
+assert_contains "$AGENTS_TEXT" "hand text below" "agents: hand text after the block is kept"
 
 # --- --agent=codex creates Codex contract only ---
 echo ""
@@ -714,7 +748,7 @@ assert_contains "$GA7" "BEGIN WEAVE GITATTRIBUTES"    "gitattr upgrade: has BEGI
 assert_contains "$GA7" "-diff linguist-generated"      "gitattr upgrade: has -diff flag"
 assert_contains "$GA7" "deltas/**/*.sql merge=theirs"  "gitattr upgrade: has deltas entry"
 # Check no line is exactly the bare form (without -diff)
-if echo "$GA7" | grep -qxF '.weave/state.sql merge=ours'; then
+if grep -qxF '.weave/state.sql merge=ours' <<< "$GA7"; then
     TESTS_RUN=$((TESTS_RUN + 1))
     echo -e "${RED}✗${NC} gitattr upgrade: bare entry stripped"
     TESTS_FAILED=$((TESTS_FAILED + 1))
@@ -762,17 +796,17 @@ echo "--- vendor hook-source seeding ---"
 REPO10=$(make_test_repo "vendor-seed")
 cd "$REPO10"
 mkdir -p scripts/hooks
-# Simulate a repo scaffolded before post-commit-weave.sh existed: 2 of 3 sources.
+# Simulate a repo scaffolded before pre-push-weave.sh existed: 2 of 3 sources.
 _LIB_HOOKS_DIR="${LIB_DIR:-$HOME/.local/lib/weave}/hooks"
 if [ -f "$_LIB_HOOKS_DIR/pre-commit-weave.sh" ]; then
     cp "$_LIB_HOOKS_DIR/pre-commit-weave.sh" scripts/hooks/
     cp "$_LIB_HOOKS_DIR/prepare-commit-msg-weave.sh" scripts/hooks/
-    # post-commit-weave.sh intentionally absent
+    # pre-push-weave.sh intentionally absent
     "$WV" init-repo --update --agent=claude >/dev/null 2>&1
-    assert_file_exists "$REPO10/scripts/hooks/post-commit-weave.sh" \
+    assert_file_exists "$REPO10/scripts/hooks/pre-push-weave.sh" \
         "vendor seed: missing hook source is seeded on --update"
     # And it matches the canonical lib copy
-    if cmp -s "$_LIB_HOOKS_DIR/post-commit-weave.sh" "$REPO10/scripts/hooks/post-commit-weave.sh"; then
+    if cmp -s "$_LIB_HOOKS_DIR/pre-push-weave.sh" "$REPO10/scripts/hooks/pre-push-weave.sh"; then
         TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
         echo -e "${GREEN}✓${NC} vendor seed: seeded source matches canonical lib copy"
     else
@@ -783,6 +817,104 @@ else
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${YELLOW}⊘${NC} vendor seed: skipped (lib hooks not installed)"
 fi
+
+
+# --- install.sh --update keeps the Codex contract's memory entries (wv-2ab164) ---
+# _write_codex_contract rewrites .codex/weave.json whole, and memory.entries[]
+# is not in its template: wv memory render --agent=codex fills it from the
+# graph. So every --update silently emptied the Codex agent's memory until the
+# next render. --update now re-renders the entries from the graph.
+echo ""
+echo "--- codex memory entries survive --update ---"
+REPO_CX=$(make_test_repo "codex-memory")
+cd "$REPO_CX"
+"$WV" init-repo --agent=codex >/dev/null 2>&1
+"$WV" remember "codex memory fixture fact" >/dev/null 2>&1
+"$WV" memory render --agent=codex >/dev/null 2>&1
+CX_BEFORE=$(jq -r '.memory.entries | length' .codex/weave.json 2>/dev/null || echo missing)
+assert_equals "1" "$CX_BEFORE" "codex memory: render puts the graph memory in the contract (precondition)"
+"$WV" init-repo --update --agent=codex >/dev/null 2>&1
+assert_equals "$CX_BEFORE" "$(jq -r '.memory.entries | length' .codex/weave.json 2>/dev/null || echo missing)" \
+    "codex memory: --update keeps the contract's memory entries"
+assert_contains "$(jq -r '.memory.entries[].text // empty' .codex/weave.json 2>/dev/null)" "codex memory fixture fact" \
+    "codex memory: the kept entry is the graph's memory"
+# --- the skills a consumer gets are the skills install.sh installs (wv-b49316) ---
+# install.sh names its skills twice: WV_CONFIG_SKILLS (what it writes to CONFIG_DIR) and the SKILLS
+# array wv init-repo copies into a consumer. The breadcrumbs -> trails rename
+# reached only the first, so consumers kept a deprecated skill and never got
+# trails. The two lists must agree, and --update must deliver trails.
+echo ""
+echo "--- consumer skills match the installed skills ---"
+SK_CONFIG=$(sed -n '/^WV_CONFIG_SKILLS=(/,/)/p' "$PROJECT_ROOT/install.sh" \
+    | sed 's/^WV_CONFIG_SKILLS=(//; s/)//' | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')
+SK_ARRAY=$(grep -oE '^ +SKILLS=\([^)]*\)' "$PROJECT_ROOT/install.sh" | sed -n 1p \
+    | sed 's/.*(//; s/)//' | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')
+assert_equals "$SK_CONFIG" "$SK_ARRAY" "skills: the init-repo SKILLS array is the CONFIG_DIR skill set"
+if [ -f "${HOME}/.config/weave/skills/trails/SKILL.md" ]; then
+    REPO_SK=$(make_test_repo "skills-trails")
+    cd "$REPO_SK"
+    "$WV" init-repo --update --agent=claude >/dev/null 2>&1
+    assert_file_exists "$REPO_SK/.claude/skills/trails/SKILL.md" "skills: --update delivers trails to a consumer"
+    assert_equals "absent" "$([ -e "$REPO_SK/.claude/skills/breadcrumbs" ] && echo present || echo absent)" \
+        "skills: --update no longer delivers the deprecated breadcrumbs skill"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${YELLOW}⊘${NC} skills: delivery skipped (trails not installed)"
+fi
+
+# --- scripts/hooks/ vendor refresh is gated on --update/--force (wv-d6e9ba) ---
+# install.sh overwrote a differing vendored hook source on every run, so a plain
+# `wv init-repo` silently reverted a local hook edit. A differing source is now
+# refreshed only on --update/--force, with the notice the other gated copies
+# print; seeding a missing source stays ungated (wv-2adeef, above).
+echo ""
+echo "--- vendor hook-source refresh is gated ---"
+if [ -f "$_LIB_HOOKS_DIR/pre-commit-weave.sh" ]; then
+    REPO_VG=$(make_test_repo "vendor-gate")
+    cd "$REPO_VG"
+    mkdir -p scripts/hooks
+    cp "$_LIB_HOOKS_DIR/pre-commit-weave.sh" scripts/hooks/
+    cp "$_LIB_HOOKS_DIR/prepare-commit-msg-weave.sh" scripts/hooks/
+    printf '\n# local edit (wv-d6e9ba)\n' >> scripts/hooks/pre-commit-weave.sh
+    VG_EDITED=$(cksum < scripts/hooks/pre-commit-weave.sh)
+    VG_OUT=$("$WV" init-repo --agent=claude 2>&1)
+    assert_equals "$VG_EDITED" "$(cksum < scripts/hooks/pre-commit-weave.sh)" \
+        "vendor gate: a plain init-repo leaves a locally edited hook source alone"
+    assert_contains "$VG_OUT" "scripts/hooks/pre-commit-weave.sh (exists, use --update to overwrite)" \
+        "vendor gate: the skip prints the exists-use-update notice"
+    assert_file_exists "$REPO_VG/scripts/hooks/pre-push-weave.sh" \
+        "vendor gate: a missing hook source is still seeded without --update"
+    "$WV" init-repo --update --agent=claude >/dev/null 2>&1
+    if cmp -s "$_LIB_HOOKS_DIR/pre-commit-weave.sh" scripts/hooks/pre-commit-weave.sh; then
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} vendor gate: --update refreshes the edited source"
+    else
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} vendor gate: --update refreshes the edited source"
+    fi
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${YELLOW}⊘${NC} vendor gate: skipped (lib hooks not installed)"
+fi
+
+# The retired post-commit hook (wv-56c823): --update removes a Weave copy and
+# its vendored source, and leaves a custom post-commit hook alone.
+REPO_PC=$(make_test_repo "retire-postcommit")
+cd "$REPO_PC"
+mkdir -p scripts/hooks .git/hooks
+printf '#!/usr/bin/env bash\n# Weave post-commit hook: run deferred non-critical suites queued by pre-commit.\n' \
+    | tee .git/hooks/post-commit > scripts/hooks/post-commit-weave.sh
+chmod +x .git/hooks/post-commit scripts/hooks/post-commit-weave.sh
+"$WV" init-repo --update --agent=claude >/dev/null 2>&1
+assert_file_absent "$REPO_PC/.git/hooks/post-commit" "retired post-commit: a Weave copy is removed on --update"
+assert_file_absent "$REPO_PC/scripts/hooks/post-commit-weave.sh" "retired post-commit: its vendored source is removed on --update"
+REPO_PC_CUSTOM=$(make_test_repo "retire-postcommit-custom")
+cd "$REPO_PC_CUSTOM"
+mkdir -p .git/hooks
+printf '#!/bin/sh\necho "my own post-commit"\n' > .git/hooks/post-commit
+chmod +x .git/hooks/post-commit
+"$WV" init-repo --update --agent=claude >/dev/null 2>&1
+assert_file_exists "$REPO_PC_CUSTOM/.git/hooks/post-commit" "retired post-commit: a custom post-commit hook is left alone"
 
 # A single update must converge both the tracked source and its installed hook.
 # The old order installed .git/hooks/pre-commit from the stale tracked source,

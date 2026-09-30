@@ -70,7 +70,9 @@ wv_checkpoint_ci_marker() {
         return
     fi
     local log_output log_rc
-    log_output=$(git -C "$git_root" log --format= --name-only "$upstream..HEAD" 2>/dev/null)
+    # --no-renames: a source file moved into .weave/ listed only its new path,
+    # so the range read as .weave/-only and CI was skipped (wv-581bb0).
+    log_output=$(git -C "$git_root" log --format= --name-only --no-renames "$upstream..HEAD" 2>/dev/null)
     log_rc=$?
     if [ "$log_rc" -ne 0 ]; then
         # git log itself failed (bad range, corrupt repo, ...) — can't prove
@@ -84,4 +86,80 @@ wv_checkpoint_ci_marker() {
     else
         echo " [skip ci]"
     fi
+}
+
+# ── Graph state vs configuration (wv-2e6341) ──────────────────────────────────
+# Checkpoint and sync commits carry the graph: files wv rewrites on its own as
+# the graph changes. Everything else under .weave/ -- test-map.conf,
+# quality.conf, patterns/, causal-cutover, evidence/ -- is configuration someone
+# edits on purpose, and a change there selects pre-commit suites of its own.
+# Staging all of .weave/ swept an in-progress test-map row into a
+# 'session-start state' commit that skipped every one of those gates. This list
+# is an allowlist: a new file wv writes stays uncommitted (and the stop hook
+# says so) until it is added here, which is the safe direction.
+WV_GRAPH_STATE_PATHS=(
+    .weave/state.sql
+    .weave/nodes.jsonl
+    .weave/edges.jsonl
+    .weave/deltas
+    .weave/trails.md
+    .weave/breadcrumbs.md
+    .weave/runtime.md
+    .weave/quality-adjudications.jsonl
+)
+
+# wv_stage_graph_state <git-root>
+#   Stages additions, changes and deletions under the graph-state paths only.
+#   A path is passed to git add when it is tracked, or on disk and not ignored:
+#   one unmatched pathspec makes git add stage nothing, and an ignored one
+#   makes it fail after staging the rest.
+wv_stage_graph_state() {
+    local git_root="$1" path present=()
+    for path in "${WV_GRAPH_STATE_PATHS[@]}"; do
+        if [ -n "$(git -C "$git_root" ls-files -- "$path" 2>/dev/null | head -1)" ] \
+           || { [ -e "$git_root/$path" ] && ! git -C "$git_root" check-ignore -q -- "$path" 2>/dev/null; }; then
+            present+=("$path")
+        fi
+    done
+    [ "${#present[@]}" -gt 0 ] || return 0
+    git -C "$git_root" add -A -- "${present[@]}"
+}
+
+# wv_staged_non_graph_state <git-root>
+#   Prints staged paths that are not graph state, one per line: caller work,
+#   including .weave/ configuration. A checkpoint that finds any must not
+#   commit, or it absorbs that work.
+wv_staged_non_graph_state() {
+    local staged
+    # --no-renames: a caller file moved into .weave/ must still show its removal.
+    staged=$(git -C "$1" diff --cached --name-only --no-renames 2>/dev/null) || return 0
+    wv_non_graph_state_paths <<< "$staged"
+}
+
+# wv_prepush_gate_installed — true when git will run a Weave pre-push hook in
+# this repository (core.hooksPath respected). The two-tier gate (wv-862ac0)
+# defers [heavy] suites to that hook only when this holds, and wv done treats a
+# heavy suite with no fresh row as deferred rather than stale only when it
+# holds, so both sides of the deferral answer the question the same way.
+wv_prepush_gate_installed() {
+    local hook
+    hook="$(git rev-parse --git-path hooks 2>/dev/null)/pre-push"
+    [ -f "$hook" ] && grep -q "Weave pre-push" "$hook" 2>/dev/null
+}
+
+# wv_non_graph_state_paths — filter repo-relative paths on stdin to those
+# outside graph state, by the same allowlist. The pre-push gate (wv-862ac0)
+# classifies a pushed range's files with it, so its idea of "graph state" is
+# the one pre-commit and the checkpoint sites use.
+wv_non_graph_state_paths() {
+    local path prefix
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        for prefix in "${WV_GRAPH_STATE_PATHS[@]}"; do
+            if [ "$path" = "$prefix" ] || [[ "$path" == "$prefix"/* ]]; then
+                continue 2
+            fi
+        done
+        printf '%s\n' "$path"
+    done
 }

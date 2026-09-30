@@ -28,6 +28,7 @@ from unittest.mock import patch
 import pytest
 
 from weave_coaching import plan_promotions
+from weave_coaching.planner import PlannerError
 from weave_quality.__main__ import cmd_patterns_scan
 from weave_quality.coaching_evidence import (
     EvidenceError,
@@ -117,6 +118,19 @@ class TestPromotionInput:
         assert document["observations"] == []
         assert document["provider_rejections"] == []
         assert plan_promotions(document)["candidates"] == []
+
+    @pytest.mark.parametrize(
+        ("field", "error"),
+        [("format", "expected weave.coaching-promotion-input.v1"), ("catalog_version", "expected catalog")],
+    )
+    def test_a_foreign_input_or_catalog_is_refused(
+        self, scanned: Path, field: str, error: str
+    ) -> None:
+        """wv-e07ee4: the planner's only exceptions; nothing fed either."""
+        document = build_promotion_input(scanned, CATALOG, SCOPE, hot_zone=str(scanned))
+        document[field] = "weave.something-else.v1"
+        with pytest.raises(PlannerError, match=error):
+            plan_promotions(document)
 
     def test_accepted_evidence_becomes_a_candidate(self, scanned: Path) -> None:
         keys = _accept_everything(scanned)
@@ -286,6 +300,24 @@ class TestFailureModes:
         first = next(copied.glob("*.yaml"))
         first.write_text(first.read_text(encoding="utf-8") + "\n# tampered\n", encoding="utf-8")
         with pytest.raises(ValueError, match="differs from its manifest digest"):
+            _package_rule_manifest(copied)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("format", "weave.quality-default-patterns-manifest.v0"), ("rules", [])],
+    )
+    def test_package_manifest_of_another_format_is_refused(
+        self, tmp_path: Path, field: str, value: object
+    ) -> None:
+        # wv-e07ee4: a foreign format or a non-object rules map got past the
+        # key-set check and was trusted as the digest authority.
+        source = Path(__file__).resolve().parents[2] / "scripts/weave_quality/default_patterns"
+        copied = tmp_path / "default_patterns"
+        shutil.copytree(source, copied)
+        manifest = json.loads((copied / "manifest.json").read_text(encoding="utf-8"))
+        manifest[field] = value
+        (copied / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(ValueError, match="must use weave.quality-default-patterns-manifest.v1"):
             _package_rule_manifest(copied)
 
     def test_a_missing_database_is_refused(self, tmp_path: Path) -> None:

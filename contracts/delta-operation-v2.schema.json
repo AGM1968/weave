@@ -257,6 +257,10 @@
         "metadata": {
           "$ref": "#/$defs/metadata_patch"
         }
+      },
+      "$comment": "A whole-metadata write already carries claimed_by/risk_level, so one op may not hold both forms.",
+      "dependentSchemas": {
+        "metadata": { "properties": { "claimed_by": false, "risk_level": false } }
       }
     },
     "edge_patch_fields": {

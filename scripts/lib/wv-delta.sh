@@ -338,6 +338,114 @@ wv_lineage_seq_base() {
 # after this cycle's watermark was captured — deliberately left unprocessed by
 # the changeset — could still satisfy this stamp's field-diff and get its
 # lineage attributed to a batch it was never part of.
+# _wv_lineage_stamp_exec DB SEQ ACTOR_Q BOUND — the stamp UPDATE itself, split
+# out so a repair can re-run the identical statement rather than a paraphrase.
+_wv_lineage_stamp_exec() {
+    local db="$1" seq="$2" actor_q="$3" bound="$4"
+    sqlite3 -cmd ".timeout 5000" "$db" "
+UPDATE nodes SET lineage_seq=$seq, lineage_actor='$actor_q'
+ WHERE id IN (
+   SELECT row_id FROM _warp_changes
+   WHERE table_name='nodes'$bound AND (
+     operation='INSERT' OR (operation='UPDATE' AND (
+       json_extract(old_data,'\$.text')     IS NOT json_extract(new_data,'\$.text')     OR
+       json_extract(old_data,'\$.status')   IS NOT json_extract(new_data,'\$.status')   OR
+       json_extract(old_data,'\$.metadata') IS NOT json_extract(new_data,'\$.metadata') OR
+       json_extract(old_data,'\$.alias')    IS NOT json_extract(new_data,'\$.alias')
+     ))
+   ));
+UPDATE edges SET lineage_seq=$seq, lineage_actor='$actor_q'
+ WHERE (source || ':' || target || ':' || type) IN (
+   SELECT row_id FROM _warp_changes
+   WHERE table_name='edges'$bound AND (
+     operation='INSERT' OR (operation='UPDATE' AND (
+       json_extract(old_data,'\$.weight')  IS NOT json_extract(new_data,'\$.weight')  OR
+       json_extract(old_data,'\$.context') IS NOT json_extract(new_data,'\$.context')
+     ))
+   ));
+" 2>&1
+}
+
+# _wv_lineage_stamp_verdict DB — the writer-lineage pair verdict for DB, from the
+# canonical classifier rather than a reimplementation of the shape it checks.
+# db_lineage_shape reads $WV_DB, so the override is scoped to a subshell.
+_wv_lineage_stamp_verdict() {
+    (
+        WV_DB="$1"
+        local n e
+        n=$(db_lineage_shape nodes); e=$(db_lineage_shape edges)
+        # db_lineage_pair_verdict folds an unreadable shape into 'unrepairable',
+        # which is right for a repair decision and wrong for this one: a shape
+        # the classifier could not READ is not evidence of drift, and a readonly
+        # or locked database looks exactly like it from here. Separate the two
+        # before delegating, so only a shape actually observed to be broken is
+        # reported as unfixable.
+        case "$n$e" in *unknown*) printf 'unreadable'; return 0 ;; esac
+        db_lineage_pair_verdict "$n" "$e"
+    )
+}
+
+# _wv_lineage_stamp_diagnose DB SEQ ACTOR_Q BOUND ERR — decide what a stamp
+# failure means and say so. Returns 0 if a repair made the stamp succeed, 1 if a
+# later sync may legitimately get past it, 2 if it never will.
+#
+# Why it failed decides what the operator should do, and the old message said
+# nothing about that: the caller announced "will retry next sync" for every cause
+# alike (wv-c395a3). When the writer-lineage columns are missing, or in an order
+# ALTER TABLE cannot reach, every later sync fails here identically, so a
+# promised retry is reassurance for a permanent outage.
+_wv_lineage_stamp_recovery() {
+    echo "  run 'wv doctor' for the lineage schema check, then recover with:" >&2
+    echo "    rm -rf \"\$WV_HOT_ZONE\" && wv load" >&2
+}
+
+_wv_lineage_stamp_diagnose() {
+    local db="$1" seq="$2" actor_q="$3" bound="$4" err="$5"
+    case "$(_wv_lineage_stamp_verdict "$db")" in
+        canonical|preinit)
+            # The schema can carry the stamp, so this is contention, a lock, a
+            # full disk -- something a later cycle may genuinely get past.
+            echo "  the writer-lineage schema is intact, so this is not a schema fault; run 'wv doctor' if it repeats" >&2
+            return 1
+            ;;
+        unreadable)
+            # The classifier could not read the shape at all, which is what a
+            # readonly or locked database looks like from here. A probe that
+            # could not run is not evidence of drift (the same call made for
+            # wv health --fast), so this stays transient rather than being
+            # reported as an unrepairable schema.
+            echo "  the writer-lineage shape could not be read, so the cause is not known to be the schema; run 'wv doctor'" >&2
+            return 1
+            ;;
+        repairable)
+            # One migrate-and-retry. db_migrate_lineage appends what is missing,
+            # which is exactly the state this arm describes, so re-running the
+            # identical statement once is cheap and usually decisive.
+            if ( WV_DB="$db"; db_migrate_lineage ) >/dev/null 2>&1 \
+               && err=$(_wv_lineage_stamp_exec "$db" "$seq" "$actor_q" "$bound"); then
+                echo "  writer-lineage columns were missing; repaired in place and the stamp succeeded on retry" >&2
+                return 0
+            fi
+            echo "  writer-lineage columns were missing and could not be repaired: $err" >&2
+            _wv_lineage_stamp_recovery
+            return 2
+            ;;
+    esac
+    # reversed / seq-only / anything else the pair classifier refuses. Name the
+    # reason rather than implying a retry: ALTER TABLE can only APPEND a column,
+    # so a reversed or seq-first pair cannot be walked back to canonical in place.
+    echo "  the writer-lineage schema cannot carry this stamp and cannot be repaired in place:" >&2
+    echo "  ALTER TABLE can only append, so a reversed or seq-first column order is unreachable from here." >&2
+    echo "  Retrying will fail identically." >&2
+    _wv_lineage_stamp_recovery
+    return 2
+}
+
+# wv_lineage_stamp ... — exit status is three-valued, because the caller's
+# message depends on whether a retry can ever succeed (wv-c395a3):
+#   0  stamped (possibly after one migrate-and-retry)
+#   1  transient failure; the next sync may legitimately succeed
+#   2  the schema cannot carry the stamp; no number of retries will help
 wv_lineage_stamp() {
     local db="$1" actor_id="$2" seq="$3" max_id="${4:-}"
     case "$seq" in ''|*[!0-9]*) return 0 ;; esac
@@ -363,31 +471,9 @@ wv_lineage_stamp() {
     # returns non-zero so the caller (_wv_emit_deltas) aborts before the
     # dump, exactly like a wv_delta_changeset or compaction failure.
     local err
-    if ! err=$(sqlite3 -cmd ".timeout 5000" "$db" "
-UPDATE nodes SET lineage_seq=$seq, lineage_actor='$actor_q'
- WHERE id IN (
-   SELECT row_id FROM _warp_changes
-   WHERE table_name='nodes'$bound AND (
-     operation='INSERT' OR (operation='UPDATE' AND (
-       json_extract(old_data,'\$.text')     IS NOT json_extract(new_data,'\$.text')     OR
-       json_extract(old_data,'\$.status')   IS NOT json_extract(new_data,'\$.status')   OR
-       json_extract(old_data,'\$.metadata') IS NOT json_extract(new_data,'\$.metadata') OR
-       json_extract(old_data,'\$.alias')    IS NOT json_extract(new_data,'\$.alias')
-     ))
-   ));
-UPDATE edges SET lineage_seq=$seq, lineage_actor='$actor_q'
- WHERE (source || ':' || target || ':' || type) IN (
-   SELECT row_id FROM _warp_changes
-   WHERE table_name='edges'$bound AND (
-     operation='INSERT' OR (operation='UPDATE' AND (
-       json_extract(old_data,'\$.weight')  IS NOT json_extract(new_data,'\$.weight')  OR
-       json_extract(old_data,'\$.context') IS NOT json_extract(new_data,'\$.context')
-     ))
-   ));
-" 2>&1); then
-        echo "wv: warning: lineage stamp failed -- rows changed by this emission may not carry the lineage their delta claims: $err" >&2
-        return 1
-    fi
+    err=$(_wv_lineage_stamp_exec "$db" "$seq" "$actor_q" "$bound") && return 0
+    echo "wv: lineage stamp failed -- rows changed by this emission may not carry the lineage their delta claims: $err" >&2
+    _wv_lineage_stamp_diagnose "$db" "$seq" "$actor_q" "$bound" "$err"
 }
 
 # wv_delta_compact_batch DB — net multiple _warp_changes rows for the SAME
@@ -956,15 +1042,23 @@ FROM _warp_changes$_wc_bound ORDER BY id;
 # defaults to OUT_DIR/../.. (OUT_DIR is the per-day .../deltas/<date>/v2 dir).
 wv_delta_v2_write_operations() {
     local db="$1" out_dir="$2" actor_id="$3"
-    local deltas_root="${4:-}" max_id="${5:-}" manifest="${6:-}"
+    local deltas_root="${4:-}" max_id="${5:-}" manifest="${6:-}" lineage_seq="${7:-}"
     [ -n "$deltas_root" ] || deltas_root="${out_dir%/*/*}"
     case "$max_id" in *[!0-9]*) max_id="" ;; esac
     mkdir -p "$out_dir" || return 1
     local base
-    base=$(wv_lineage_seq_base "$db" "$deltas_root")
+    # LINEAGE_SEQ is the seq the caller already allocated for this emission
+    # (auto_sync stamps its v1 changeset with it). Reusing it keeps v1 and v2 on
+    # one number by construction and skips a second O(catalog) base scan that a
+    # concurrent writer could move between the two calls (wv-99c85a).
+    case "$lineage_seq" in
+        ''|*[!0-9]*|0) base=$(wv_lineage_seq_base "$db" "$deltas_root") ;;
+        *) base=$((lineage_seq - 1)) ;;
+    esac
     python3 - "$db" "$out_dir" "$actor_id" "$base" "$max_id" "$manifest" <<'PY'
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -1041,10 +1135,15 @@ def risk_level(metadata):
 
 def weight_str(value):
     # weave.canonical-json.v1 has no non-integer number form, so edge weight
-    # travels as repr(float(x)); replay parses it back with float().
+    # travels as repr(float(x)). Replay admits only the schema's weight_value
+    # pattern, which has no inf/nan form: emitting one would fail the whole v2
+    # batch on every clone, so refuse it here instead (wv-99c85a).
     if value is None:
         return None
-    return repr(float(value))
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("edge weight must be finite")
+    return repr(number)
 
 
 def node_patch_fields(old_data, new_data):

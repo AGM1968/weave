@@ -38,8 +38,24 @@ fi
 
 # The legacy enum is read from its definition rather than duplicated here: a
 # copy would drift exactly as the docstring and fallback lists this slice already
-# had to correct.
-LEGACY_ENUM=$(grep -E '^FINDING_VIOLATION_TYPES=' -- "$VALIDATE_LIB" | sed 's/^FINDING_VIOLATION_TYPES="//; s/"$//')
+# had to correct. Since the projection landed, wv-validate.sh keeps the
+# hand-written set only as the `: "${FINDING_VIOLATION_TYPES:=...}"` fallback;
+# the old `^FINDING_VIOLATION_TYPES=` read matched nothing, so the superset
+# check below compared the catalog against an empty list (wv-8afd23).
+LEGACY_ENUM=$(sed -n 's/^: "\${FINDING_VIOLATION_TYPES:=\(.*\)}"$/\1/p' -- "$VALIDATE_LIB")
+if [ -n "$LEGACY_ENUM" ]; then
+    pass "the hand-written legacy enum is found in wv-validate.sh"
+else
+    fail "the hand-written legacy enum is found in wv-validate.sh" "    no FINDING_VIOLATION_TYPES fallback in $VALIDATE_LIB"
+fi
+
+# The shell projection is generated; a hand edit or a catalog change without a
+# regeneration must fail here, since nothing else runs the generator's check.
+if gen_out=$(bash "$REPO_ROOT/scripts/gen-violation-vocabulary.sh" --check 2>&1); then
+    pass "wv-violation-vocabulary.gen.sh matches the catalog"
+else
+    fail "wv-violation-vocabulary.gen.sh matches the catalog" "    $gen_out"
+fi
 
 report=$(CATALOG="$CATALOG" LEGACY_ENUM="$LEGACY_ENUM" REPO_ROOT="$REPO_ROOT" PYTHONPATH="$REPO_ROOT/scripts" python3 - <<'PY'
 import copy

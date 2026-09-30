@@ -61,7 +61,7 @@ assert_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${GREEN}[PASS]${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -75,7 +75,7 @@ assert_not_contains() {
     local needle="$2"
     local message="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${RED}[FAIL]${NC} $message (unexpected '$needle' in output)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     else
@@ -86,7 +86,12 @@ assert_not_contains() {
 
 # Extract the wv-XXXXXX id from a `wv add` invocation.
 _add_node() {
-    "$WV" add "$1" --metadata="$2" 2>/dev/null | grep -oE 'wv-[a-f0-9]{6}' | head -1
+    # Capture, then match. Piping into `grep -o ... | head -1` under pipefail
+    # returns the writer's SIGPIPE 141 once head leaves, so a SUCCESSFUL add
+    # reported failure (wv-a70659).
+    local _out
+    _out=$("$WV" add "$1" --metadata="$2" 2>/dev/null)
+    [[ "$_out" =~ (wv-[a-f0-9]{6}) ]] && printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
 # ─── Tests ──────────────────────────────────────────────────────────────────

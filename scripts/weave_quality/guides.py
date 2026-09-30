@@ -276,6 +276,18 @@ def parse_guide(path: Path, source: str) -> Guide:
         if heading:
             raw = heading.group(1).strip()
             name = _normalize(raw).lower()
+            # A second heading for a section already seen used to reset it,
+            # silently discarding the first body (wv-76fc4a). Keyed on the
+            # resolved section, so two spellings of one section also collide.
+            if (name in SECTION_KEYS and SECTION_KEYS[name] in sections) or (
+                name not in SECTION_KEYS and name in extended
+            ):
+                raise GuideError(
+                    f"{path.name}: duplicate section {raw!r} — each section may appear once; "
+                    f"merge the two bodies under one heading",
+                    code,
+                    path,
+                )
             if name in SECTION_KEYS:
                 current = ("fixed", SECTION_KEYS[name])
                 sections[current[1]] = ""

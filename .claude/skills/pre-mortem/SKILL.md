@@ -1,12 +1,14 @@
 ---
 name: pre-mortem
-description: "Assesses failure scenarios and risk before significant tasks, then reorders implementation to address high-risk items first. Use when planning non-trivial or high-impact work."
+description:
+  "Assesses failure scenarios and risk before significant tasks, then reorders implementation to
+  address high-risk items first. Use when planning non-trivial or high-impact work."
 ---
 
 # Pre-Mortem — Risk Assessment Gate
 
-> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator. Use `/weave` instead
-> for the full graph-first workflow. Direct invocation is deprecated and may be removed in a future
+> **INTERNAL SKILL** — This skill is now part of the `/weave` orchestrator. Use `/weave` instead for
+> the full graph-first workflow. Direct invocation is deprecated and may be removed in a future
 > release.
 
 **Trigger:** When claiming a feature, epic, or any task touching risky domains (auth, payments,
@@ -213,9 +215,13 @@ This skill is called by:
   "blast_radius": ["affected systems/files/users"],
   "rollback_plan": "How to revert if needed",
   "pre_checks": ["Verification before starting"],
-  "risk_level": "low|medium|high|critical"
+  "risk_level": "low|medium|high"
 }
 ```
+
+`risk_level` takes only the node-field contract's values (`none|low|medium|high`); `wv` refuses any
+other. A scenario with critical impact records that in its own `impact` field, and the node's
+`risk_level` is `high`.
 
 ## Decision Gate
 

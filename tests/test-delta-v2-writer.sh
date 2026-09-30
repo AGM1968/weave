@@ -46,7 +46,7 @@ sqlite3 "$DB" "UPDATE nodes SET status='active', metadata='{\"claimed_by\":\"age
 written=$(wv_delta_v2_write_operations "$DB" "$OUT" "agent-a")
 [ "$written" = "1" ] && ok "writer emits one semantic node patch" || bad "writer emits one semantic node patch"
 
-op=$(find "$OUT" -name '*.json' -type f | sort | head -1)
+op=$(find "$OUT" -name '*.json' -type f | sort | sed -n 1p)
 [ -n "$op" ] && [ -s "$op" ] && ok "operation JSON sidecar exists" || bad "operation JSON sidecar exists"
 
 node "$ROOT/tests/validate-ipc-contract.mjs" >/dev/null
@@ -97,7 +97,7 @@ ok "operation hash and typed field patches match contract"
 first_hash=$(sha256sum "$op" | awk '{print $1}')
 rm -rf "$OUT"
 written_again=$(wv_delta_v2_write_operations "$DB" "$OUT" "agent-a")
-op_again=$(find "$OUT" -name '*.json' -type f | sort | head -1)
+op_again=$(find "$OUT" -name '*.json' -type f | sort | sed -n 1p)
 second_hash=$(sha256sum "$op_again" | awk '{print $1}')
 [ "$written_again" = "1" ] && [ "$first_hash" = "$second_hash" ] \
   && ok "operation identity and bytes are stable for unchanged change row" \
@@ -115,7 +115,7 @@ wv_delta_reset "$DB"
 sqlite3 "$DB" "UPDATE nodes SET text='revised body', updated_at=103 WHERE id='wv-v2';"
 rm -rf "$OUT"
 written_text=$(wv_delta_v2_write_operations "$DB" "$OUT" "agent-a")
-text_op=$(find "$OUT" -name '*.json' -type f | sort | head -1)
+text_op=$(find "$OUT" -name '*.json' -type f | sort | sed -n 1p)
 text_fields=$(python3 -c "import json,sys; print(','.join(sorted(json.load(open(sys.argv[1]))['payload']['mutation']['fields'])))" "$text_op" 2>/dev/null || echo "")
 [ "$written_text" = "1" ] && [ "$text_fields" = "text" ] \
   && ok "a text column edit emits a node_patch over text" \
@@ -135,7 +135,7 @@ sqlite3 "$DB" "DELETE FROM edges WHERE source='wv-src';"
 written_all=$(wv_delta_v2_write_operations "$DB" "$OUT" "agent-a")
 mapfile -t kinds < <(find "$OUT" -name '*.json' -type f | sort |
   xargs -r -n1 python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['payload']['mutation']['kind'])" | sort -u)
-have() { printf '%s\n' "${kinds[@]}" | grep -qx "$1"; }
+have() { grep -qx "$1" <<< "$(printf '%s\n' "${kinds[@]}")"; }
 have node_create && have node_delete && have edge_create && have edge_patch && have edge_delete \
   && ok "writer emits node_create/node_delete/edge_create/edge_patch/edge_delete" \
   || bad "writer emits every op kind (got: ${kinds[*]})"
@@ -157,6 +157,50 @@ sqlite3 "$DB" "INSERT INTO nodes(id,text,status,metadata,created_at,updated_at) 
 wv_delta_reset "$DB"
 rm -rf "$OUT"
 
+# wv-99c85a item 3: a caller-allocated lineage seq (7th arg) is what the ops carry,
+# so auto_sync's v1 changeset and its v2 sidecars share one number by construction.
+sqlite3 "$DB" "UPDATE nodes SET text='seq probe', updated_at=105 WHERE id='wv-v2';"
+wv_delta_v2_write_operations "$DB" "$OUT" "agent-a" "" "" "" 42 >/dev/null
+seq_op=$(find "$OUT" -name '*.json' -type f | sort | sed -n 1p)
+seq_got=$(python3 -c "import json,sys; o=json.load(open(sys.argv[1])); print(o['payload']['lineage']['seq'], o['actor_sequence'])" "$seq_op" 2>/dev/null || echo "")
+[ "$seq_got" = "42 42" ] && ok "a caller-allocated lineage seq is the seq every op carries" \
+  || bad "a caller-allocated lineage seq is the seq every op carries (got '$seq_got')"
+
+# wv-99c85a item 4: the schema forbids a node_patch holding both metadata and a
+# sugar field. Control: the metadata-only op the writer emits validates.
+wv_delta_reset "$DB"
+rm -rf "$OUT"
+sqlite3 "$DB" "UPDATE nodes SET metadata=json_set(metadata,'$.note','x'), updated_at=106 WHERE id='wv-v2';"
+wv_delta_v2_write_operations "$DB" "$OUT" "agent-a" >/dev/null
+meta_op=$(find "$OUT" -name '*.json' -type f | sort | sed -n 1p)
+schema_verdicts=$(node -e "const Ajv=require('$ROOT/mcp/node_modules/ajv/dist/2020.js').default; const fs=require('fs');
+  const ajv=new Ajv({strict:true,allErrors:true});
+  ajv.addSchema(JSON.parse(fs.readFileSync('$ROOT/contracts/delta-operation-v2.schema.json')));
+  const v=ajv.getSchema('https://weave.dev/contracts/delta-operation-v2.schema.json');
+  const op=JSON.parse(fs.readFileSync(process.argv[1]));
+  const out=[Object.keys(op.payload.mutation.fields).join('+'), v(op)];
+  for (const [k, p] of [['claimed_by', {expected: 'agent-a', value: null}], ['risk_level', {expected: 'high', value: 'low'}]]) {
+    const both=structuredClone(op); both.payload.mutation.fields[k]=p; out.push(v(both));
+  }
+  console.log(out.join(' '));" "$meta_op" 2>&1)
+[ "$schema_verdicts" = "metadata true false false" ] \
+  && ok "schema admits a metadata-only node_patch and refuses metadata with claimed_by or risk_level" \
+  || bad "schema admits a metadata-only node_patch and refuses metadata with claimed_by or risk_level (got '$schema_verdicts')"
+
+# wv-99c85a item 1: replay refuses a non-finite weight, so the writer must not
+# emit one; a poisoned op would roll back every clone's v2 batch.
+wv_delta_reset "$DB"
+rm -rf "$OUT"
+sqlite3 "$DB" "INSERT INTO edges(source,target,type,weight,context,created_at) VALUES('wv-src','wv-dst','blocks',9e999,'{}',120);"
+if wv_delta_v2_write_operations "$DB" "$OUT" "agent-a" >/dev/null 2>&1; then
+  bad "writer refuses a non-finite edge weight"
+else
+  ok "writer refuses a non-finite edge weight"
+fi
+sqlite3 "$DB" "DELETE FROM edges WHERE type='blocks';"
+wv_delta_reset "$DB"
+rm -rf "$OUT"
+
 CLI_REPO="$TMP/cli-repo"
 CLI_HOT="$TMP/cli-hot"
 mkdir -p "$CLI_REPO"
@@ -166,11 +210,14 @@ mkdir -p "$CLI_REPO"
   git config user.email test@example.com
   git config user.name Tester
   WV_HOT_ZONE="$CLI_HOT" WV_AUTO_CHECKPOINT=0 "$ROOT/scripts/wv" init >/dev/null
-  cli_node=$(
-    WV_HOT_ZONE="$CLI_HOT" WV_AUTO_CHECKPOINT=0 "$ROOT/scripts/wv" add "cli delta v2" --status=todo --criteria="c" --risks=low \
-      | grep -o 'wv-[a-f0-9]\{6\}' \
-      | head -1
+  # Capture, then match: `| grep -o | sed -n 1p` under pipefail returns the
+  # writer's SIGPIPE 141 the moment head leaves (wv-a70659).
+  cli_add_out=$(
+    WV_HOT_ZONE="$CLI_HOT" WV_AUTO_CHECKPOINT=0 "$ROOT/scripts/wv" add "cli delta v2" \
+      --status=todo --criteria="c" --risks=low
   )
+  cli_node=""
+  [[ "$cli_add_out" =~ (wv-[a-f0-9]{6}) ]] && cli_node="${BASH_REMATCH[1]}"
   # Delta v2 sidecars are on by default post-cutover (S4 wv-806a6b), so the
   # `wv add` above already emitted one. Clear the catalog and count only what
   # the single update below produces.
@@ -200,8 +247,8 @@ mkdir -p "$DUR_REPO"
   git config user.name Tester
   common=(WV_HOT_ZONE="$DUR_HOT" WV_AUTO_CHECKPOINT=0 WV_SYNC_INTERVAL=0 WV_DELTA_V2_WRITE=1)
   env "${common[@]}" "$ROOT/scripts/wv" init >/dev/null
-  n1=$(env "${common[@]}" "$ROOT/scripts/wv" add "durable one" --status=todo --criteria=c --risks=low | grep -o 'wv-[a-f0-9]\{6\}' | head -1)
-  n2=$(env "${common[@]}" "$ROOT/scripts/wv" add "durable two" --status=todo --criteria=c --risks=low | grep -o 'wv-[a-f0-9]\{6\}' | head -1)
+  n1=$(env "${common[@]}" "$ROOT/scripts/wv" add "durable one" --status=todo --criteria=c --risks=low | grep -o 'wv-[a-f0-9]\{6\}' | sed -n 1p)
+  n2=$(env "${common[@]}" "$ROOT/scripts/wv" add "durable two" --status=todo --criteria=c --risks=low | grep -o 'wv-[a-f0-9]\{6\}' | sed -n 1p)
   env "${common[@]}" "$ROOT/scripts/wv" update "$n1" --status=active --metadata '{"claimed_by":"agent-a"}' >/dev/null
   # Destroy the hot zone: brain.db, sqlite_sequence and all, exactly as a reboot
   # or `wv hotzone gc` would. Rebuild it from committed state.

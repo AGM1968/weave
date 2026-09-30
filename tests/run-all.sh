@@ -80,6 +80,8 @@ declare -a FAST_SUITES=(
     "test-procedure-projection-ownership.sh:Procedure Projection Ownership + Integrity"
     "test-procedure-visibility.sh:Procedure Visibility Contract"
     "test-hook-suite-cwd.sh:Hook Suite Deleted-CWD Regression"
+    "test-hook-stale-copy.sh:Git Hook Stale-Copy Guard"
+    "test-hook-duration.sh:Git Hook Duration Helper"
     "test-init-repo.sh:Init-Repo Tests"
     "test-install-ast-grep.sh:Install ast-grep Opt-in Tests"
     "test-install-file.sh:Install File Atomic-Replace Tests"
@@ -91,9 +93,23 @@ declare -a FAST_SUITES=(
     "test-delta-unit.sh:Delta Unit Tests"
     "test-delta-v2-writer.sh:Delta v2 Writer"
     "test-delta-v2-replay.sh:Delta v2 Replay Evaluator"
+    "test-delta-v2-replay-argv.sh:Delta v2 Replay Argv on Python 3.11"
+    "test-delta-v2-replay-validation.sh:Delta v2 Replay Edge Field Validation"
     "test-delta-catalog.sh:Delta Catalog Scanner"
     "test-tombstone-reconcile.sh:Deletion Tombstone Reconcile"
+    "test-removal-redump.sh:Delete/Prune Re-dump Guards"
     "test-delta-replay-order.sh:Delta Replay Lineage Ordering"
+    "test-load-fts-rebuild.sh:Load Re-derives nodes_fts After Replay"
+    "test-load-v1-replay-branch.sh:Load v1 Replay Success/Failure Branch"
+    "test-precommit-selfheal-isolation.sh:Pre-commit Self-heal Skips Test Runs"
+    "test-context-policy.sh:Context Load Policy Command"
+    "test-metadata-canonical-numbers.sh:Metadata Numbers Are Canonical Integers"
+    "test-update-arg-forms.sh:Update Applies or Refuses Every Argument"
+    "test-lib-guards.sh:Lib Guards the Routed Suites Missed"
+    "test-cli-guards.sh:CLI Guards the Routed Suites Missed"
+    "test-cli-unknown-args.sh:Write Paths Refuse Unknown Arguments"
+    "test-budget-location.sh:Call Tally Lands Where Hygiene Reads It"
+    "test-install-skill-prune.sh:Install Prunes Skills It No Longer Ships"
     "test-cutover.sh:Causal Cutover Marker"
     "test-checkpoint-generation.sh:Checkpoint Generation Builder"
     "test-analyze.sh:Analyze Command Tests"
@@ -105,16 +121,50 @@ declare -a FAST_SUITES=(
     "test-pattern-audit-check8.sh:Pattern-Audit Check 8 (quality DB owner)"
     "test-pattern-audit-check9.sh:Pattern-Audit Check 9 (memory authority owner)"
     "test-doctor-pattern-shadow.sh:Doctor Managed-Pattern-Rule Shadow Advisory"
+    "test-doctor-hotzone-shadow.sh:Doctor Hot-Zone Shadow Advisory"
+    "test-doctor-delta-v2-catalog.sh:Doctor Delta v2 Catalog Integrity"
     "test-doctor-closed-node-dirt.sh:Doctor Closed-Node Uncommitted-Dirt Attribution"
     "test-doctor-managed-pattern-completeness.sh:Doctor Managed-Pattern Completeness Advisory"
     "test-cmd-battery.sh:Command-Surface Battery"
     "test-schema-contract.sh:SQL-vs-Schema Contract"
+    "test-citation-drift.sh:Doc Citation Drift"
+    "test-policy-contract.sh:Policy Rules Contract"
+    "test-risk-level-authority.sh:risk_level Authority"
+    "test-work-claim-persistence.sh:Claim Persistence"
+    "test-run-all-counts.sh:Aggregate Test Counts"
+    "test-gate-measure.sh:Gate Measurement"
+    "test-policy-gates.sh:Command Gate Verdicts"
+    "test-policy-cells.sh:Policy Rule Cells"
+    "test-policy-countable.sh:Clean Calls Countable"
+    "test-policy-hooks.sh:Policy Host-Hook Cells"
+    "test-policy-totality.sh:Policy Totality"
     "test-mcp-parity.sh:MCP-vs-CLI Flag Parity"
     "test-agent-identity-parity.sh:Cross-Harness Agent-Identity Parity"
     "test-command-capabilities.sh:Command Capability Registry"
     "test-causal-identity.sh:Composite Causal Identity"
     "test-attempt-journal.sh:Attempt Journal"
     "test-telemetry-normalization.sh:Call-Log Operation Normalization"
+    "test-errexit-dispatch.sh:Errexit Dispatch Parity"
+    "test-autosync-visibility.sh:Auto-Sync Failure Visibility"
+    "test-durability-refusal.sh:Durability Refusal Surface"
+    "test-health-writability.sh:Health Writability Probe"
+    "test-edge-enum-lineage.sh:Edge Enum Rebuild Lineage Preservation"
+    "test-db-ensure-memo.sh:db_ensure Per-Process Memo"
+    "test-prepush-gate.sh:Two-Tier Commit Gate (pre-push heavy tier)"
+    "test-cli-autoload.sh:CLI Command-Module Autoload"
+    "test-source-drift.sh:Install Source Drift Detection"
+    "test-doctor-modules.sh:Doctor Derived Module Checks"
+    "test-lineage-stamp-recovery.sh:Lineage Stamp Failure Routing"
+    "test-load-dropped-nodes.sh:Load Dropped-Node Reporting"
+    "test-load-swap.sh:Live Database Changes Only Through SQLite"
+    "test-node-reconstruction.sh:Node Reconstruction Under A Lost Id"
+    "test-build-identity.sh:Build Identity In --version"
+    "test-reserved-slot-guard.sh:Reserved Counted-Capture Slot Guard"
+    "test-call-log-rotation.sh:Call-Log Rotation"
+    "test-analyze-window.sh:Analyze Window Bounding"
+    # On disk since the conservation baseline landed, named by no aggregate
+    # and by no skip line, so it ran only when the impact gate happened to
+    # select it (wv-30cfe8). 1.8s, offline, no opt-in reason.
     "test-output-budget.sh:Output Budget Golden Tests"
     "test-ipc-contract.sh:IPC Contract Validation"
     # Thirteen suites shipped to consumers with no aggregate -- source or
@@ -135,6 +185,7 @@ declare -a FAST_SUITES=(
     "test-journal.sh:Operation Journal"
     "test-phase-fsm.sh:Session Phase State Machine"
     "test-quality.sh:Quality Scan and Reset"
+    "test-quality-exempt-links.sh:Quality Exemptions Name Their Node"
     "test-test-hook-registry.sh:Production Fault-Injection Hook Inventory"
     "test-validate-finding.sh:Validate-Finding Golden Fixtures"
     "test-workflow-manifest.sh:Workflow Manifest Projections"
@@ -145,6 +196,16 @@ declare -a FAST_SUITES=(
 declare -a SLOW_SUITES=(
 )
 
+# Declared-and-never-run. This array executes nothing; it exists so that a
+# suite which deliberately does not run is STATED rather than merely absent,
+# and so that the release-closure guard can insist every tests/test-*.sh is
+# run, slow, or here. An entry must also be excluded from the release: a suite
+# this repository declines to run must not ship to a consumer who would run it.
+declare -a UNRUN_SUITES=(
+    # Routing shims for .weave/test-map.conf (wv-75d9c5): the pytest they run is
+    # make test's, so running them here would run it twice. Dev-only in the release.
+)
+
 declare -a SUITES=("${FAST_SUITES[@]}")
 if [ "$INCLUDE_SLOW" = true ]; then
     SUITES+=("${SLOW_SUITES[@]}")
@@ -152,6 +213,32 @@ fi
 
 # Results tracking
 declare -A RESULTS
+# Suites that ran but print no parseable test count (wv-40c851). They are
+# named, never folded into the total as 0/0, which silently understated it.
+UNCOUNTED_SUITES=()
+
+# _suite_counts <clean-output>: set PARSED_PASSED/PARSED_TESTS from a suite's
+# own summary; return 1 when it printed none. Two formats are in use:
+# "Results: X/Y passed" and "Tests: N | Passed: P | Failed: F".
+_suite_counts() {
+    local out="$1" line numbers
+    if grep -qE "[0-9]+/[0-9]+ passed" <<<"$out"; then
+        line=$(grep -E "[0-9]+/[0-9]+ passed" <<<"$out" | tail -1)
+        numbers=$(grep -oE '[0-9]+' <<<"$line")
+        PARSED_PASSED=${numbers%%$'\n'*}
+        PARSED_TESTS=$(sed -n '2p' <<<"$numbers")
+        return 0
+    fi
+    if grep -qE "Tests: *[0-9]+ *\| *Passed: *[0-9]+" <<<"$out"; then
+        line=$(grep -E "Tests: *[0-9]+ *\| *Passed: *[0-9]+" <<<"$out" | tail -1)
+        PARSED_TESTS=$(sed -E 's/.*Tests: *([0-9]+).*/\1/' <<<"$line")
+        PARSED_PASSED=$(sed -E 's/.*Passed: *([0-9]+).*/\1/' <<<"$line")
+        return 0
+    fi
+    PARSED_PASSED=0
+    PARSED_TESTS=0
+    return 1
+}
 declare -A TIMES
 TOTAL_PASSED=0
 TOTAL_TESTS=0
@@ -195,17 +282,13 @@ run_suite() {
     # tail -1 on the latter picks up "Failed: 0" as the test count.
     local clean_output
     clean_output=$(printf '%s' "$output" | sed 's/\x1b\[[0-9;]*m//g')
-    if grep -qE "[0-9]+/[0-9]+ passed" <<<"$clean_output"; then
-        local result_line result_numbers
-        result_line=$(grep -E "[0-9]+/[0-9]+ passed" <<<"$clean_output" | tail -1)
-        result_numbers=$(grep -oE '[0-9]+' <<<"$result_line")
-        passed=${result_numbers%%$'\n'*}
-        tests=$(sed -n '2p' <<<"$result_numbers")
-    else
-        passed=0
-        tests=0
-    fi
-    
+    local counted=true
+    _suite_counts "$clean_output" || { counted=false; UNCOUNTED_SUITES+=("$script"); }
+    passed=$PARSED_PASSED
+    tests=$PARSED_TESTS
+    local count_label="$passed/$tests tests"
+    [ "$counted" = true ] || count_label="no test count"
+
     RESULTS["$script"]="$passed/$tests"
     TIMES["$script"]="$duration"
     TOTAL_PASSED=$((TOTAL_PASSED + passed))
@@ -213,7 +296,7 @@ run_suite() {
     
     if [ "${exit_code:-0}" -ne 0 ]; then
         FAILED_SUITES+=("$name")
-        echo -e "  ${RED}✗${NC} $name: $passed/$tests tests (${duration}s)"
+        echo -e "  ${RED}✗${NC} $name: $count_label (${duration}s)"
         if [ "$VERBOSE" != true ]; then
             # Show failure output. awk, not `grep | head`: head leaves after ten
             # lines and the SIGPIPE that kills grep is this runner's own status
@@ -222,7 +305,7 @@ run_suite() {
             awk '/✗|FAIL|Error/ && shown < 10 { print "    " $0; shown++ }' <<<"$clean_output"
         fi
     else
-        echo -e "  ${GREEN}✓${NC} $name: $passed/$tests tests (${duration}s)"
+        echo -e "  ${GREEN}✓${NC} $name: $count_label (${duration}s)"
     fi
 }
 
@@ -287,22 +370,21 @@ if [ "$PARALLEL" = true ]; then
             # match while the writer is still writing, and the SIGPIPE that
             # follows becomes the pipeline's status under `set -o pipefail`.
             clean_output=$(printf '%s' "$output" | sed 's/\x1b\[[0-9;]*m//g')
-            if grep -qE "[0-9]+/[0-9]+ passed" <<<"$clean_output"; then
-                result_line=$(grep -E "[0-9]+/[0-9]+ passed" <<<"$clean_output" | tail -1)
-                result_numbers=$(grep -oE '[0-9]+' <<<"$result_line")
-                passed=${result_numbers%%$'\n'*}
-                tests=$(sed -n '2p' <<<"$result_numbers")
-            else
-                passed=0
-                tests=0
+            count_label=""
+            if ! _suite_counts "$clean_output"; then
+                UNCOUNTED_SUITES+=("$script")
+                count_label="no test count"
             fi
+            passed=$PARSED_PASSED
+            tests=$PARSED_TESTS
+            [ -n "$count_label" ] || count_label="$passed/$tests tests"
 
             TOTAL_PASSED=$((TOTAL_PASSED + passed))
             TOTAL_TESTS=$((TOTAL_TESTS + tests))
 
             if [ "$exit_code" -ne 0 ]; then
                 FAILED_SUITES+=("$name")
-                echo -e "  ${RED}✗${NC} $name: $passed/$tests tests"
+                echo -e "  ${RED}✗${NC} $name: $count_label"
                 # A COUNT IS NOT A DIAGNOSIS. This deleted the suite's output and
                 # printed only "45/46", so a single failing assertion inside a
                 # release --verify could not be identified afterwards at all --
@@ -359,6 +441,11 @@ echo -e "${CYAN}Summary${NC}"
 echo "═══════════════════════════════════════════════════════════════════════════"
 echo ""
 echo -e "  Total tests: ${GREEN}$TOTAL_PASSED${NC}/${YELLOW}$TOTAL_TESTS${NC} passed"
+if [ ${#UNCOUNTED_SUITES[@]} -gt 0 ]; then
+    # The total above covers only suites that print a count; these ran and are
+    # not in it, so they are named rather than counted as 0/0 (wv-40c851).
+    echo -e "  ${YELLOW}Not in the test total${NC} (${#UNCOUNTED_SUITES[@]} suite(s) print no test count): $(printf '%s ' "${UNCOUNTED_SUITES[@]}")"
+fi
 echo -e "  Total time:  ${TOTAL_TIME}s"
 echo ""
 
@@ -369,6 +456,10 @@ echo "executed-suites-total: ${#EXECUTED_SUITES[@]}"
 for _executed in "${EXECUTED_SUITES[@]}"; do
     echo "executed-suite: $_executed"
 done
+echo "uncounted-suites-total: ${#UNCOUNTED_SUITES[@]}"
+for _uncounted in "${UNCOUNTED_SUITES[@]}"; do
+    echo "uncounted-suite: $_uncounted"
+done
 echo ""
 
 if [ "$INCLUDE_SLOW" = false ] && [ ${#SLOW_SUITES[@]} -gt 0 ]; then
@@ -377,15 +468,31 @@ if [ "$INCLUDE_SLOW" = false ] && [ ${#SLOW_SUITES[@]} -gt 0 ]; then
     echo ""
 fi
 
+# What the verdict does NOT cover, carried onto the verdict line itself. The
+# notice above scrolls away; the last line is what a reader and a grep both
+# take as the result, and a bare "ALL TESTS PASSED" was read as the whole
+NOT_RUN=()
+if [ "$INCLUDE_SLOW" = false ] && [ ${#SLOW_SUITES[@]} -gt 0 ]; then
+    for _declared_suite in "${SLOW_SUITES[@]}"; do NOT_RUN+=("${_declared_suite%%:*}"); done
+fi
+if [ ${#UNRUN_SUITES[@]} -gt 0 ]; then
+    for _declared_suite in "${UNRUN_SUITES[@]}"; do NOT_RUN+=("${_declared_suite%%:*}"); done
+fi
+DECLARED_TOTAL=$(( ${#FAST_SUITES[@]} + ${#SLOW_SUITES[@]} + ${#UNRUN_SUITES[@]} ))
+SCOPE="${#EXECUTED_SUITES[@]}/${DECLARED_TOTAL} suites"
+if [ ${#NOT_RUN[@]} -gt 0 ]; then
+    SCOPE="$SCOPE; not run: ${NOT_RUN[*]}"
+fi
+
 if [ ${#FAILED_SUITES[@]} -gt 0 ]; then
     echo -e "  ${RED}Failed suites:${NC}"
     for suite in "${FAILED_SUITES[@]}"; do
         echo -e "    - $suite"
     done
     echo ""
-    echo -e "${RED}FAILED${NC}"
+    echo -e "${RED}FAILED${NC} — $SCOPE"
     exit 1
 else
-    echo -e "${GREEN}ALL TESTS PASSED${NC}"
+    echo -e "${GREEN}ALL TESTS PASSED${NC} — $SCOPE"
     exit 0
 fi

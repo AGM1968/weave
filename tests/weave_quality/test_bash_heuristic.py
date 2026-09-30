@@ -279,6 +279,70 @@ class TestFunctionCC:
         assert fn_cc[0].function_name == "my_func"
         assert fn_cc[0].complexity >= 2  # base + if
 
+    def test_comment_mentioning_heredoc_opens_none(self) -> None:
+        # wv-592939: '# ... <<EOF ...' in a comment was taken as a heredoc start
+        # with no terminator, so the first function swallowed the rest of the
+        # file (wv-db.sh db_init measured as lines 25-1391, CC 96).
+        source = _src("""
+            first_fn() {
+                sqlite3 db <<EOF
+            SELECT 1;
+            EOF
+                # the heredoc above is an unquoted <<EOF, hence this follow-up
+                echo done
+            }
+
+            second_fn() {
+                if [ -n "$1" ]; then
+                    echo "$1"
+                fi
+            }
+        """)
+        lines = source.splitlines()
+        assert _find_function_end(lines, 0) == 6
+        _, fn_cc = analyze_bash_source(source, "test.sh")
+        assert [f.function_name for f in fn_cc] == ["first_fn", "second_fn"]
+        first, second = fn_cc[0], fn_cc[1]
+        assert (first.line_start, first.line_end) == (1, 7)
+        assert first.complexity == 1  # second_fn's if is not counted here
+        assert second.line_start == 9
+
+    def test_multiline_body_closed_by_trailing_brace(self) -> None:
+        # wv-b0b2d4: `f() { cmd "...` continued over lines and closed `...; }`
+        # was never closed (tests/test-data.sh _rowhash ran to EOF), while a
+        # `|| { ...; }` group on one line must not close the function.
+        source = _src("""
+            rowhash() { sqlite3 "$1" "
+                SELECT id FROM nodes;
+            " | sha256sum; }
+            guarded() {
+                [ -f "$1" ] || { echo "missing"; return 1; }
+                jq '{a: 1 }' "$1"
+                if [ -n "$2" ]; then echo "$2"; fi
+            }
+        """)
+        lines = source.splitlines()
+        assert _find_function_end(lines, 0) == 2
+        assert _find_function_end(lines, 3) == 7
+        _, fn_cc = analyze_bash_source(source, "test.sh")
+        assert [(f.function_name, f.line_start, f.line_end) for f in fn_cc] == [
+            ("rowhash", 1, 3), ("guarded", 4, 8)]
+
+    def test_nested_one_liner_opens_nothing(self) -> None:
+        # wv-b0b2d4: a nested one-liner definition added depth and never closed
+        # it, so the enclosing function ran on (test_delta_stamp_* in test-core.sh).
+        source = _src("""
+            outer() {
+                helper() { printf '%s\\n' x; }
+                helper
+            }
+            later() {
+                echo later
+            }
+        """)
+        lines = source.splitlines()
+        assert _find_function_end(lines, 0) == 3
+
     def test_no_functions(self) -> None:
         source = _src("""
             echo "no functions here"

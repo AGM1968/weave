@@ -81,37 +81,28 @@ PYEOF
     fi
 fi
 
-# ── Crash detection: check for previous session's sentinel ──
-# Sentinel present = previous session did not fire SessionEnd (crash, terminal killed, etc.)
-# Distinguish: active nodes at exit → true crash needing recovery
-#              empty active list   → clean-close without SessionEnd (no recovery needed)
+# ── Crash detection: collect the previous session's exit signals ──
+# A sentinel only says SessionEnd did not run. Two more signals say how the
+# session actually ended (wv-4efe06):
+#   .session_heartbeat  epoch of the last tool call (pre-action.sh)
+#   .session_laststop   "<epoch> stopped|blocked" for the last Stop (stop-check.sh)
+# Activity after the last recorded stop means the session died mid-turn. The
+# label itself is chosen after `wv load` below, from the graph's active nodes
+# now -- the previous session's state at exit -- not the list this sentinel
+# captured when that session STARTED, which missed a later claim and kept a
+# node closed before the end.
 CRASH_WARNING=""
 HAD_SENTINEL=false
+_SS_HB=0; _SS_STOP_TS=0; _SS_STOP_OUTCOME=""; _SS_SENTINEL_TS="unknown"
 if [ -f "$SENTINEL" ]; then
     HAD_SENTINEL=true
-    CRASH_DATA=$(cat "$SENTINEL" 2>/dev/null || echo "{}")
-    CRASH_TS=$(echo "$CRASH_DATA" | jq -r '.ts // "unknown"' 2>/dev/null || echo "unknown")
-    CRASH_ACTIVE=$(echo "$CRASH_DATA" | jq -r '.active | join(", ")' 2>/dev/null || echo "")
-    CRASH_ACTIVE_COUNT=$(echo "$CRASH_DATA" | jq '.active | length' 2>/dev/null || echo "0")
-
-    if [ "${CRASH_ACTIVE_COUNT:-0}" -gt 0 ]; then
-        # True crash: active work was in progress at exit
-        _CRASH_MSG="CRASH RECOVERY: Session killed at ${CRASH_TS}. Active nodes at crash: ${CRASH_ACTIVE}."
-        [ -n "$_SS_LAST_PROMPT" ] && _CRASH_MSG="${_CRASH_MSG} Last prompt: '${_SS_LAST_PROMPT}'"
-        _CRASH_MSG="${_CRASH_MSG} Review and re-claim or close active nodes."
-
-        # Write to trails.md — meaningful recovery info
-        "$WV" trails save --message="$_CRASH_MSG" >/dev/null 2>&1 || true
-
-        CRASH_WARNING="CRASH DETECTED: session killed at ${CRASH_TS} with active work. Active at crash: ${CRASH_ACTIVE}."
-        [ -n "$_SS_LAST_PROMPT" ] && CRASH_WARNING="${CRASH_WARNING} Last prompt: '${_SS_LAST_PROMPT}'"
-        CRASH_WARNING="${CRASH_WARNING} Recovery trail saved."
-    else
-        # Clean-close without SessionEnd: no active work, just inform briefly
-        # (terminal closed after /close-session, or SessionEnd hook skipped)
-        CRASH_WARNING="Note: Previous session at ${CRASH_TS} closed without clean shutdown. No active work to recover."
-    fi
+    _SS_SENTINEL_TS=$(jq -r '.ts // "unknown"' "$SENTINEL" 2>/dev/null || echo "unknown")
+    _SS_HB=$(cat "${_SS_HOT_ZONE}/.session_heartbeat" 2>/dev/null || echo 0)
+    read -r _SS_STOP_TS _SS_STOP_OUTCOME < "${_SS_HOT_ZONE}/.session_laststop" 2>/dev/null || true
+    [[ "$_SS_HB" =~ ^[0-9]+$ ]] || _SS_HB=0
+    [[ "${_SS_STOP_TS:-}" =~ ^[0-9]+$ ]] || _SS_STOP_TS=0
 fi
+rm -f "${_SS_HOT_ZONE}/.session_heartbeat" "${_SS_HOT_ZONE}/.session_laststop" 2>/dev/null || true
 
 # ── Write minimal sentinel BEFORE wv load (crash-during-load detectable) ──
 mkdir -p "$_SS_HOT_ZONE" 2>/dev/null || true
@@ -160,13 +151,17 @@ if [ -z "$SS_REGRESSION" ]; then
     cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
     # wv-822bea/wv-179c49: hijack guard, same rule as auto_checkpoint/cmd_sync
     # in wv-cmd-data.sh — refuse to commit if the caller pre-staged anything
-    # outside .weave/, so a session-start checkpoint never silently absorbs
-    # (and, worse, [skip-ci-marks) unrelated in-progress work.
+    # outside graph state, so a session-start checkpoint never silently absorbs
+    # (and, worse, [skip-ci-marks) unrelated in-progress work. wv-2e6341: only
+    # graph state is staged, so .weave/ configuration such as test-map.conf
+    # stays in the tree for a commit that runs its gates. Without the helpers
+    # (lib not found) nothing is committed rather than all of .weave/.
+    command -v wv_stage_graph_state >/dev/null 2>&1 || exit 0
     if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
-        _SS_PRESTAGED=$(git diff --cached --name-only 2>/dev/null | grep -v '^\.weave/' || true)
+        _SS_PRESTAGED=$(wv_staged_non_graph_state "$PWD")
         [ -n "$_SS_PRESTAGED" ] && exit 0
     fi
-    git add .weave/ 2>/dev/null
+    wv_stage_graph_state "$PWD" 2>/dev/null
     if ! git diff --cached --quiet -- .weave/ 2>/dev/null; then
         # wv-e937f8: see session-end-sync.sh's identical comment. wv-179c49:
         # fail toward NOT skipping CI when the marker helper is unavailable
@@ -181,6 +176,42 @@ fi
 
 # ── Overwrite sentinel with full active node list ──
 ACTIVE_IDS=$("$WV" list --status=active --json 2>/dev/null | jq -c '[.[].id]' 2>/dev/null || echo "[]")
+
+# ── Label how the previous session ended (wv-4efe06) ──
+# ACTIVE_IDS is the graph's state at the previous session's exit: nothing in
+# this session has claimed anything yet.
+if [ "$HAD_SENTINEL" = true ]; then
+    _SS_ACTIVE=$(echo "$ACTIVE_IDS" | jq -r 'join(", ")' 2>/dev/null || echo "")
+    # Last-known-alive: the later of the last tool call and the last stop, else
+    # the sentinel's own start time (an older sentinel has neither signal).
+    _SS_ALIVE_EPOCH=$(( _SS_HB > _SS_STOP_TS ? _SS_HB : _SS_STOP_TS ))
+    if [ "$_SS_ALIVE_EPOCH" -gt 0 ]; then
+        _SS_ALIVE=$(date -u -d "@${_SS_ALIVE_EPOCH}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+            || date -u -r "${_SS_ALIVE_EPOCH}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$_SS_SENTINEL_TS")
+    else
+        _SS_ALIVE="$_SS_SENTINEL_TS"
+    fi
+    if [ "$_SS_STOP_TS" -eq 0 ] || [ "$_SS_HB" -gt "$_SS_STOP_TS" ]; then
+        # Tool activity after the last stop (or no stop at all): died mid-turn.
+        if [ -n "$_SS_ACTIVE" ]; then
+            _CRASH_MSG="CRASH RECOVERY: previous session died mid-turn (last activity ${_SS_ALIVE}). Active nodes: ${_SS_ACTIVE}."
+            [ -n "$_SS_LAST_PROMPT" ] && _CRASH_MSG="${_CRASH_MSG} Last prompt: '${_SS_LAST_PROMPT}'"
+            _CRASH_MSG="${_CRASH_MSG} Review and re-claim or close active nodes."
+            "$WV" trails save --message="$_CRASH_MSG" >/dev/null 2>&1 || true
+            CRASH_WARNING="CRASH DETECTED: previous session died mid-turn (last activity ${_SS_ALIVE}) with active work: ${_SS_ACTIVE}."
+            [ -n "$_SS_LAST_PROMPT" ] && CRASH_WARNING="${CRASH_WARNING} Last prompt: '${_SS_LAST_PROMPT}'"
+            CRASH_WARNING="${CRASH_WARNING} Recovery trail saved."
+        else
+            CRASH_WARNING="Note: previous session died mid-turn (last activity ${_SS_ALIVE}). No active work to recover."
+        fi
+    elif [ "$_SS_STOP_OUTCOME" = "blocked" ] || [ -n "$_SS_ACTIVE" ]; then
+        # Its last stop was refused over open work (or let through by the
+        # stop-check cooldown with work still open), then it ended anyway.
+        CRASH_WARNING="Note: previous session's last exit (${_SS_ALIVE}) was blocked by open work and it ended without SessionEnd. Still active: ${_SS_ACTIVE:-none}."
+    else
+        CRASH_WARNING="Note: previous session stopped cleanly at ${_SS_ALIVE} and ended without SessionEnd. No active work to recover."
+    fi
+fi
 jq -n \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson active "$ACTIVE_IDS" \
@@ -191,6 +222,20 @@ jq -n \
 # Get compressed work status using wv status (already formatted)
 STATUS=$("$WV" status 2>/dev/null || echo "Work: 0 active, 0 ready, 0 blocked.")
 CONTEXT="$STATUS"
+
+# Readiness (wv-814d33): whether the framework is known green for HEAD and which
+# open structural nodes come first, from wv bootstrap -- the same surface every
+# harness reads -- so this hook adds no second evaluator. WV_RUN_CACHE=0: the
+# run cache keys on HEAD and the framework record (wv-9e14fa) but not on install
+# drift, which moves with uncommitted source edits and ./install.sh, and session
+# start is read once. Empty when the framework is green and nothing is open.
+READINESS=$(WV_RUN_CACHE=0 "$WV" bootstrap --json 2>/dev/null \
+    | jq -r '.readiness.advisories // [] | .[]' 2>/dev/null || true)
+if [ -n "$READINESS" ]; then
+    CONTEXT="Readiness - fix before other work:
+$(printf '%s\n' "$READINESS" | sed 's/^/  - /')
+${CONTEXT}"
+fi
 
 # Prepend crash warning if detected
 if [ -n "$CRASH_WARNING" ]; then
@@ -223,6 +268,15 @@ if [ -n "$HEALTH_JSON" ]; then
     if [ -n "$HEALTH_SCORE" ]; then
         CONTEXT="${CONTEXT}
 Health: ${HEALTH_SCORE}/100"
+    fi
+    # A non-canonical writer-lineage verdict floors the score, but a bare 0/100
+    # does not tell the session what to do about it (wv-71d076). The recovery
+    # key is absent on a healthy graph and on older wv versions, so this adds a
+    # line only when there is a drift to act on.
+    HEALTH_RECOVERY=$(echo "$HEALTH_JSON" | jq -r '.recovery // empty' 2>/dev/null || true)
+    if [ -n "$HEALTH_RECOVERY" ]; then
+        CONTEXT="${CONTEXT}
+Graph is NOT writable — wv sync and wv commit-refs cannot persist. Recover with: ${HEALTH_RECOVERY}"
     fi
 fi
 

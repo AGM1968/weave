@@ -39,6 +39,9 @@ db_init() {
     chmod 700 "$WV_HOT_ZONE" 2>/dev/null || true
     umask "$prev_umask"
     validate_hot_size
+    # A fresh file may reuse a removed file's inode: its schema stamp is not
+    # evidence of anything (wv-048429).
+    rm -f "$WV_DB.ensured" 2>/dev/null || true
 
     local pragmas
     read -r WV_CACHE WV_MMAP <<< "$(select_pragmas)"
@@ -94,9 +97,11 @@ CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(source, type);
 CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(target, type);
 
 -- FTS5 full-text search index (Phase 2.1)
--- Uses porter stemmer + unicode for better search quality
+-- Uses porter stemmer + unicode for better search quality. alias is indexed
+-- so an exact alias finds its node even when no alias word is in the text
+-- (wv-92b72c); db_migrate_fts5 upgrades a three-column index in place.
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-    id, text, metadata,
+    id, text, metadata, alias,
     content=nodes,
     content_rowid=rowid,
     tokenize='porter unicode61'
@@ -104,20 +109,20 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
 
 -- Keep FTS in sync with nodes table
 CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
-    INSERT INTO nodes_fts(rowid, id, text, metadata)
-    VALUES (new.rowid, new.id, new.text, new.metadata);
+    INSERT INTO nodes_fts(rowid, id, text, metadata, alias)
+    VALUES (new.rowid, new.id, new.text, new.metadata, new.alias);
 END;
 
 CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
-    INSERT INTO nodes_fts(nodes_fts, rowid, id, text, metadata)
-    VALUES ('delete', old.rowid, old.id, old.text, old.metadata);
+    INSERT INTO nodes_fts(nodes_fts, rowid, id, text, metadata, alias)
+    VALUES ('delete', old.rowid, old.id, old.text, old.metadata, old.alias);
 END;
 
 CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
-    INSERT INTO nodes_fts(nodes_fts, rowid, id, text, metadata)
-    VALUES ('delete', old.rowid, old.id, old.text, old.metadata);
-    INSERT INTO nodes_fts(rowid, id, text, metadata)
-    VALUES (new.rowid, new.id, new.text, new.metadata);
+    INSERT INTO nodes_fts(nodes_fts, rowid, id, text, metadata, alias)
+    VALUES ('delete', old.rowid, old.id, old.text, old.metadata, old.alias);
+    INSERT INTO nodes_fts(rowid, id, text, metadata, alias)
+    VALUES (new.rowid, new.id, new.text, new.metadata, new.alias);
 END;
 
 -- node_files: repo-relative files attributed by the touched-files hook.
@@ -266,71 +271,10 @@ CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
     VALUES (new.id, new.content, new.file, new.line_start, new.line_end);
 END;
 
--- Trigger: gate active→done transitions on file quality metrics.
--- Fires BEFORE the UPDATE so the FTS AFTER UPDATE trigger never sees a
--- violating state. RAISE(ABORT, ...) requires a string literal — structured
--- JSON payload is built by cmd_done after catch.
--- quality_exempt patterns (trailing '/' = directory prefix) are excluded from the gate.
-CREATE TRIGGER IF NOT EXISTS nodes_policy_check
-BEFORE UPDATE OF status ON nodes
-WHEN NEW.status = 'done' AND OLD.status = 'active'
-BEGIN
-        SELECT CASE
-                WHEN json_type(NEW.metadata, '$.completion_scope.files') IS NOT NULL
-                     AND (
-                         json_type(NEW.metadata, '$.completion_scope.files') != 'array'
-                         OR json_array_length(NEW.metadata, '$.completion_scope.files') = 0
-                         OR COALESCE(json_extract(NEW.metadata, '$.completion_scope.attempt_id'), '') = ''
-                         OR json_extract(NEW.metadata, '$.completion_scope.attempt_id') IS json_extract(OLD.metadata, '$.completion_scope.attempt_id')
-                         OR EXISTS (
-                             SELECT 1 FROM json_each(NEW.metadata, '$.completion_scope.files') scoped
-                             WHERE scoped.type != 'text' OR scoped.value = ''
-                                OR NOT EXISTS (SELECT 1 FROM node_files nf WHERE nf.node_id=NEW.id AND nf.path=scoped.value)
-                         )
-                     ) THEN RAISE(ABORT, 'GraphPolicyViolation: invalid completion scope')
-                WHEN EXISTS (
-                        SELECT 1 FROM node_files nf
-                        JOIN file_metrics fm ON fm.path = nf.path
-                        WHERE nf.node_id = NEW.id
-                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
-                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
-                            AND fm.mccabe_max > COALESCE(
-                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
-                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
-                            )
-                            AND NOT EXISTS (
-                                SELECT 1 FROM quality_exempt qe
-                                WHERE nf.path LIKE
-                                    CASE WHEN qe.path_pattern LIKE '%/'
-                                         THEN qe.path_pattern || '%'
-                                         ELSE qe.path_pattern
-                                    END
-                            )
-                ) THEN RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded')
-                WHEN EXISTS (
-                        SELECT 1 FROM node_files nf
-                        JOIN file_trend ft ON ft.path = nf.path
-                        WHERE nf.node_id = NEW.id
-                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
-                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
-                            AND ft.direction = 'deteriorating'
-                            AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
-                            AND NOT EXISTS (
-                                SELECT 1 FROM quality_exempt qe
-                                WHERE nf.path LIKE
-                                    CASE WHEN qe.path_pattern LIKE '%/'
-                                         THEN qe.path_pattern || '%'
-                                         ELSE qe.path_pattern
-                                    END
-                            )
-                ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
-        END;
-END;
 EOF
-    # Authoritative trigger: recreate nodes_policy_check from the single-source
-    # emitter so a fresh DB has the complete (3-clause) trigger immediately, not
-    # only after the next db_ensure migration pass. The inline copy in the schema
-    # heredoc above is the bootstrap version; this supersedes it. (The heredoc is
+    # The close-policy trigger (nodes_policy_check) is created only from its
+    # single-source emitter, so a fresh DB has the complete trigger immediately
+    # rather than after the next db_ensure migration pass. (The heredoc above is
     # an unquoted <<EOF — it cannot call a function mid-body, hence this follow-up.)
     _policy_trigger_sql | sqlite3 "$WV_DB" 2>/dev/null || true
     # Writer lineage lives in a migration rather than the schema heredoc above so
@@ -365,6 +309,26 @@ MIGRATE
 
 # Migrate edges table CHECK constraint to allow newer edge types like resolves.
 # SQLite cannot ALTER an existing CHECK constraint, so rebuild the table in place.
+#
+# The rebuild below recreates edges from a hardcoded CREATE TABLE carrying only
+# the six columns db_init declares. The writer-lineage pair is NOT declared
+# there — db_migrate_lineage appends it with ALTER TABLE — so on a database that
+# predates the resolves CHECK but has already been lineage-migrated, the rebuild
+# dropped lineage_actor and lineage_seq from edges and left the pair verdict at
+# 'repairable', where sync and commit-refs cannot persist (wv-419ba1).
+#
+# Nothing repaired it inside that process: db_ensure runs db_migrate_lineage
+# BEFORE this function, and the pre-v1.2 hot-zone migration call site never runs
+# the lineage migration at all. A later db_ensure does repair it, which is why
+# this is latent rather than a permanent outage, and why it was never confirmed
+# as the trigger for the consumer loss report.
+#
+# The columns are restored by calling db_migrate_lineage, not by declaring them
+# in the CREATE TABLE above: sqlite stores the statement text verbatim and
+# state.sql is byte-compared by the auto_sync no-op guard, so a hand-written
+# equivalent differing by one space would churn every sync forever. Values are
+# carried across explicitly, because the restore appends columns at their
+# defaults and a legacy database's lineage bookkeeping is real data.
 db_migrate_edge_type_enum() {
     db_migrate_edges
 
@@ -372,6 +336,22 @@ db_migrate_edge_type_enum() {
     edges_sql=$(sqlite3 "$WV_DB" "SELECT sql FROM sqlite_master WHERE type='table' AND name='edges';" 2>/dev/null || true)
     if [[ "$edges_sql" == *"'resolves'"* ]]; then
         return 0
+    fi
+
+    # Snapshot the lineage pair before the rebuild destroys it. Only a canonical
+    # pair is carried across; a partial or reversed shape has no values worth
+    # preserving and db_migrate_lineage repairs what it can afterwards. The
+    # backup is dropped unconditionally below — a survivor would land in
+    # state.sql and become part of the portable graph.
+    local _edge_lineage_carry=0
+    if [ "$(db_lineage_shape edges)" = "canonical" ]; then
+        _edge_lineage_carry=1
+    fi
+    sqlite3 "$WV_DB" "DROP TABLE IF EXISTS _wv_edges_lineage_carry;" 2>/dev/null || true
+    if [ "$_edge_lineage_carry" = "1" ]; then
+        sqlite3 "$WV_DB" "CREATE TABLE _wv_edges_lineage_carry AS
+            SELECT source, target, type, lineage_actor, lineage_seq FROM edges;" 2>/dev/null \
+            || _edge_lineage_carry=0
     fi
 
     sqlite3 "$WV_DB" <<'MIGRATE'
@@ -400,6 +380,27 @@ CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(target, type);
 COMMIT;
 PRAGMA foreign_keys = ON;
 MIGRATE
+
+    # Re-append the writer-lineage pair through the canonical ALTER TABLE path,
+    # so the stored CREATE TABLE text is byte-identical to a normally-migrated
+    # database. Unconditional and idempotent: it is a no-op when the pair is
+    # already canonical, and repairs nodes too if that is what it finds.
+    db_migrate_lineage || {
+        sqlite3 "$WV_DB" "DROP TABLE IF EXISTS _wv_edges_lineage_carry;" 2>/dev/null || true
+        return 1
+    }
+
+    if [ "$_edge_lineage_carry" = "1" ]; then
+        sqlite3 "$WV_DB" "
+UPDATE edges SET
+    lineage_actor = COALESCE((SELECT c.lineage_actor FROM _wv_edges_lineage_carry c
+                              WHERE c.source = edges.source AND c.target = edges.target
+                                AND c.type = edges.type), lineage_actor),
+    lineage_seq   = COALESCE((SELECT c.lineage_seq   FROM _wv_edges_lineage_carry c
+                              WHERE c.source = edges.source AND c.target = edges.target
+                                AND c.type = edges.type), lineage_seq);" 2>/dev/null || true
+    fi
+    sqlite3 "$WV_DB" "DROP TABLE IF EXISTS _wv_edges_lineage_carry;" 2>/dev/null || true
 }
 
 # Migrate nodes table to add alias column (Sprint 3: human-readable aliases).
@@ -436,7 +437,8 @@ MIGRATE
 # Located from this file rather than from $WV_LIB_DIR: tests source wv-db.sh
 # directly, without wv-config.sh, and a module that only resolves under the full
 # entry point is a module the suites cannot reach.
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wv-db-lineage.sh"
+_WV_DB_SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$_WV_DB_SRC_DIR/wv-db-lineage.sh"
 
 # db_write_tombstone KIND ID [LINEAGE_SEQ] [LINEAGE_ACTOR] — record a cross-machine
 # deletion tombstone (epic delta-causality, wv-0d5e07). Called by wv delete and
@@ -473,6 +475,34 @@ db_write_tombstone() {
             > (tombstones.lineage_seq, tombstones.lineage_actor);"
 }
 
+# db_capture_tombstones NODE_ID — print the tombstones a removal of NODE_ID must
+# write, one "kind<TAB>ident<TAB>lineage_seq" line for the node and one per
+# incident edge. Run it BEFORE the DELETEs: each line carries the highest lineage
+# that row held. The one capture shared by wv delete and wv prune (wv-99c85a),
+# so a change to tombstone semantics cannot reach only one of them and reopen
+# wv-0d5e07's resurrection bug.
+db_capture_tombstones() {
+    local node_id="$1" esc seq es et ety eseq
+    [ -n "$node_id" ] || return 1
+    if command -v sql_escape >/dev/null 2>&1; then esc=$(sql_escape "$node_id"); else esc=${node_id//\'/\'\'}; fi
+    seq=$(db_query "SELECT COALESCE(lineage_seq,0) FROM nodes WHERE id='$esc';" 2>/dev/null || echo 0)
+    printf 'node\t%s\t%s\n' "$node_id" "${seq:-0}"
+    while IFS='|' read -r es et ety eseq; do
+        [ -n "$es" ] || continue
+        printf 'edge\t%s:%s:%s\t%s\n' "$es" "$et" "$ety" "${eseq:-0}"
+    done < <(db_query "SELECT source, target, type, COALESCE(lineage_seq,0) FROM edges WHERE source='$esc' OR target='$esc';" 2>/dev/null)
+}
+
+# db_write_tombstones ACTOR — write every "kind<TAB>ident<TAB>lineage_seq" line on
+# stdin (db_capture_tombstones output) as a tombstone recorded by ACTOR.
+db_write_tombstones() {
+    local actor="$1" kind ident seq
+    while IFS=$'\t' read -r kind ident seq; do
+        [ -n "$kind" ] || continue
+        db_write_tombstone "$kind" "$ident" "${seq:-0}" "$actor"
+    done
+}
+
 # Migrate to add FTS5 full-text search table (Phase 2.1).
 # Safe to run repeatedly — creates only if not exists.
 db_migrate_fts5() {
@@ -484,12 +514,43 @@ db_migrate_fts5() {
         # FTS5 not available, skip silently
         return 0
     fi
-    
+
+    # wv-92b72c: an index built before alias joined it has three columns, and
+    # CREATE ... IF NOT EXISTS below would keep it -- and would keep three-column
+    # sync triggers too, even over a table dropped and recreated with four,
+    # whose 'delete' then omits alias and corrupts the external-content index.
+    # Shape digits: table present, alias column present, stale triggers.
+    # Stale when the table lacks alias ("10?") or any sync trigger does
+    # ("??N", N>0). Drop table and triggers and let the CREATE below build the
+    # current form, all in one transaction, then rebuild: the index is
+    # external-content over nodes, so nothing is lost and no write slips
+    # between a dropped trigger and its replacement.
+    local fts_shape fts_begin="" fts_commit="" fts_rebuild="" fts_bail=""
+    fts_shape=$(sqlite3 "$WV_DB" "SELECT (SELECT COUNT(*) FROM sqlite_master WHERE name='nodes_fts')
+        || (SELECT COUNT(*) FROM pragma_table_info('nodes_fts') WHERE name='alias')
+        || (SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'
+            AND name IN ('nodes_ai','nodes_ad','nodes_au') AND sql NOT LIKE '%alias%');" 2>/dev/null || echo "")
+    if [[ "$fts_shape" == 10? ]] || [[ "$fts_shape" =~ ^..[1-9] ]]; then
+        fts_begin="BEGIN IMMEDIATE;
+DROP TRIGGER IF EXISTS nodes_ai;
+DROP TRIGGER IF EXISTS nodes_ad;
+DROP TRIGGER IF EXISTS nodes_au;
+DROP TABLE IF EXISTS nodes_fts;"
+        fts_rebuild="INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');"
+        fts_commit="COMMIT;"
+        # The CLI runs on past a failed statement, so a failed CREATE would
+        # still reach COMMIT with the old index dropped. -bail stops at the
+        # error and the open transaction rolls back on exit.
+        fts_bail="-bail"
+    fi
+
     # Create FTS5 table and triggers if they don't exist
-    sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
+    # shellcheck disable=SC2086  # $fts_bail is empty or one flag
+    sqlite3 $fts_bail "$WV_DB" <<MIGRATE 2>/dev/null || true
+$fts_begin
 -- FTS5 full-text search index
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-    id, text, metadata,
+    id, text, metadata, alias,
     content=nodes,
     content_rowid=rowid,
     tokenize='porter unicode61'
@@ -497,21 +558,23 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
 
 -- Keep FTS in sync with nodes table
 CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
-    INSERT INTO nodes_fts(rowid, id, text, metadata)
-    VALUES (new.rowid, new.id, new.text, new.metadata);
+    INSERT INTO nodes_fts(rowid, id, text, metadata, alias)
+    VALUES (new.rowid, new.id, new.text, new.metadata, new.alias);
 END;
 
 CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
-    INSERT INTO nodes_fts(nodes_fts, rowid, id, text, metadata)
-    VALUES ('delete', old.rowid, old.id, old.text, old.metadata);
+    INSERT INTO nodes_fts(nodes_fts, rowid, id, text, metadata, alias)
+    VALUES ('delete', old.rowid, old.id, old.text, old.metadata, old.alias);
 END;
 
 CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
-    INSERT INTO nodes_fts(nodes_fts, rowid, id, text, metadata)
-    VALUES ('delete', old.rowid, old.id, old.text, old.metadata);
-    INSERT INTO nodes_fts(rowid, id, text, metadata)
-    VALUES (new.rowid, new.id, new.text, new.metadata);
+    INSERT INTO nodes_fts(nodes_fts, rowid, id, text, metadata, alias)
+    VALUES ('delete', old.rowid, old.id, old.text, old.metadata, old.alias);
+    INSERT INTO nodes_fts(rowid, id, text, metadata, alias)
+    VALUES (new.rowid, new.id, new.text, new.metadata, new.alias);
 END;
+$fts_rebuild
+$fts_commit
 MIGRATE
 }
 
@@ -669,81 +732,23 @@ CREATE TABLE IF NOT EXISTS file_trend (
     path      TEXT PRIMARY KEY,
     direction TEXT NOT NULL DEFAULT 'stable'
 );
-
-CREATE TRIGGER IF NOT EXISTS nodes_policy_check
-BEFORE UPDATE OF status ON nodes
-WHEN NEW.status = 'done' AND OLD.status = 'active'
-BEGIN
-        SELECT CASE
-                WHEN EXISTS (
-                        SELECT 1 FROM node_files nf
-                        JOIN file_metrics fm ON fm.path = nf.path
-                        WHERE nf.node_id = NEW.id
-                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
-                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
-                            AND fm.mccabe_max > COALESCE(
-                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
-                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
-                            )
-                ) THEN RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded')
-                WHEN EXISTS (
-                        SELECT 1 FROM node_files nf
-                        JOIN file_trend ft ON ft.path = nf.path
-                        WHERE nf.node_id = NEW.id
-                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
-                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
-                            AND ft.direction = 'deteriorating'
-                            AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
-                ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
-        END;
-END;
-
 MIGRATE
     # Add language column to existing DBs — fails silently on new DBs (already in schema).
     sqlite3 "$WV_DB" "ALTER TABLE file_metrics ADD COLUMN language TEXT NOT NULL DEFAULT '';" 2>/dev/null || true
 }
 
-# Migrate policy trigger to language-aware COALESCE threshold lookup.
-# DROP + CREATE is required — CREATE TRIGGER IF NOT EXISTS does not replace
-# existing triggers, so existing DBs loaded before this code landed keep the
-# old single-threshold version until this migration runs.
-# Also seeds per-language threshold rows (INSERT OR IGNORE — idempotent).
+# Seed the per-language McCabe threshold rows (INSERT OR IGNORE — idempotent).
+# The language-aware trigger clause itself comes from _policy_trigger_sql.
 db_migrate_language_trigger() {
     sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_py', 25);
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_sh', 100);
 INSERT OR IGNORE INTO policy_thresholds(key, value) VALUES ('mccabe_max_ts', 15);
-
-DROP TRIGGER IF EXISTS nodes_policy_check;
-
-CREATE TRIGGER nodes_policy_check
-BEFORE UPDATE OF status ON nodes
-WHEN NEW.status = 'done' AND OLD.status = 'active'
-BEGIN
-        SELECT CASE
-                WHEN EXISTS (
-                        SELECT 1 FROM node_files nf
-                        JOIN file_metrics fm ON fm.path = nf.path
-                        WHERE nf.node_id = NEW.id
-                            AND fm.mccabe_max > COALESCE(
-                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
-                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
-                            )
-                ) THEN RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded')
-                WHEN EXISTS (
-                        SELECT 1 FROM node_files nf
-                        JOIN file_trend ft ON ft.path = nf.path
-                        WHERE nf.node_id = NEW.id
-                            AND ft.direction = 'deteriorating'
-                            AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
-                ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
-        END;
-END;
 MIGRATE
 }
 
-# Migrate to add quality_exempt table and update nodes_policy_check trigger to
-# respect exempt path patterns. DROP + CREATE required — IF NOT EXISTS does not replace.
+# Migrate to add the quality_exempt table. The trigger's exempt guard comes
+# from _policy_trigger_sql, which db_migrate_test_gate applies last.
 db_migrate_quality_exempt() {
     sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
 CREATE TABLE IF NOT EXISTS quality_exempt (
@@ -767,68 +772,140 @@ CREATE TABLE IF NOT EXISTS quality_config_sig (
     id        INTEGER PRIMARY KEY CHECK (id = 1),
     signature TEXT NOT NULL
 );
-
-DROP TRIGGER IF EXISTS nodes_policy_check;
-
-CREATE TRIGGER nodes_policy_check
-BEFORE UPDATE OF status ON nodes
-WHEN NEW.status = 'done' AND OLD.status = 'active'
-BEGIN
-        SELECT CASE
-                WHEN EXISTS (
-                        SELECT 1 FROM node_files nf
-                        JOIN file_metrics fm ON fm.path = nf.path
-                        WHERE nf.node_id = NEW.id
-                            AND fm.mccabe_max > COALESCE(
-                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
-                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
-                            )
-                            AND NOT EXISTS (
-                                SELECT 1 FROM quality_exempt qe
-                                WHERE nf.path LIKE
-                                    CASE WHEN qe.path_pattern LIKE '%/'
-                                         THEN qe.path_pattern || '%'
-                                         ELSE qe.path_pattern
-                                    END
-                            )
-                ) THEN RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded')
-                WHEN EXISTS (
-                        SELECT 1 FROM node_files nf
-                        JOIN file_trend ft ON ft.path = nf.path
-                        WHERE nf.node_id = NEW.id
-                            AND ft.direction = 'deteriorating'
-                            AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
-                            AND NOT EXISTS (
-                                SELECT 1 FROM quality_exempt qe
-                                WHERE nf.path LIKE
-                                    CASE WHEN qe.path_pattern LIKE '%/'
-                                         THEN qe.path_pattern || '%'
-                                         ELSE qe.path_pattern
-                                    END
-                            )
-                ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
-        END;
-END;
 MIGRATE
 }
 
-# _policy_trigger_sql — SINGLE SOURCE OF TRUTH for the nodes_policy_check trigger.
+# Close-policy clauses — SINGLE SOURCE OF TRUTH for both the nodes_policy_check
+# trigger and the close receipt (_policy_close_receipt_sql).
 #
-# The trigger had been hand-copied across several migrations (policy_tables,
-# language_trigger, quality_exempt); each DROP+CREATE that omitted a clause would
-# silently disable a shipped gate. This emitter collapses those copies to one
-# definition. New gate clauses are added HERE only, and exactly one migration —
-# the latest, db_migrate_test_gate — recreates the trigger from it. Earlier
-# migrations' inline copies are harmlessly overwritten because all migrations run
-# in sequence on every db_ensure and this one runs last. The invariant that all
-# three clauses fire is pinned by test_policy_trigger.
+# Each fragment is written against NEW and OLD. Inside the trigger those are the
+# row images; in the receipt they are CTEs holding the same images (the proposed
+# metadata and the current row), so both evaluate literally the same text. The
+# trigger had been hand-copied across several migrations, and a DROP+CREATE that
+# omitted a clause silently disabled a shipped gate; a verdict reconstructed by
+# re-running similar queries after the abort drifted the same way (wv-d7cd88).
 #
-# Clauses (all share the quality_exempt guard):
+# Clauses, in the order both consumers evaluate them:
+#   0. completion scope integrity                            — only with --completion-files
 #   1. mccabe_max breach (per-language threshold)            — always active
 #   2. trend deteriorating (gated by trend_deteriorating>=1) — off by default
 #   3. test red/stale     (gated by test_gate>=2 i.e. block) — off by default
+# Clauses 1-3 share the completion-scope filter and the quality_exempt guard.
+
+# Clause 0 splits three ways so the receipt can say which: a scope with no usable
+# shape (input validation), one without a fresh attempt identity, and one naming
+# a file the node never touched.
+_policy_scope_malformed_sql() {
+    cat <<'SQL'
+json_type(NEW.metadata, '$.completion_scope.files') != 'array'
+                         OR json_array_length(NEW.metadata, '$.completion_scope.files') = 0
+                         OR EXISTS (
+                             SELECT 1 FROM json_each(NEW.metadata, '$.completion_scope.files') scoped
+                             WHERE scoped.type != 'text' OR scoped.value = '')
+SQL
+}
+
+_policy_scope_stale_attempt_sql() {
+    cat <<'SQL'
+COALESCE(json_extract(NEW.metadata, '$.completion_scope.attempt_id'), '') = ''
+                         OR json_extract(NEW.metadata, '$.completion_scope.attempt_id') IS json_extract(OLD.metadata, '$.completion_scope.attempt_id')
+SQL
+}
+
+_policy_scope_unattributed_sql() {
+    cat <<'SQL'
+EXISTS (
+                             SELECT 1 FROM json_each(NEW.metadata, '$.completion_scope.files') scoped
+                             WHERE NOT EXISTS (SELECT 1 FROM node_files nf WHERE nf.node_id=NEW.id AND nf.path=scoped.value))
+SQL
+}
+
+_policy_scope_invalid_sql() {
+    cat <<SQL
+json_type(NEW.metadata, '\$.completion_scope.files') IS NOT NULL
+                     AND (($(_policy_scope_malformed_sql))
+                          OR ($(_policy_scope_stale_attempt_sql))
+                          OR $(_policy_scope_unattributed_sql))
+SQL
+}
+
+# Whether quality_exempt pattern qe covers the node file nf. A pattern ending in
+# / is a directory prefix.
+_policy_exempt_match_sql() {
+    cat <<'SQL'
+nf.path LIKE
+                                    CASE WHEN qe.path_pattern LIKE '%/'
+                                         THEN qe.path_pattern || '%'
+                                         ELSE qe.path_pattern
+                                    END
+SQL
+}
+
+# The filter and guard clauses 1-3 share: only files inside the completion scope
+# (when one is set), and never a path quality_exempt covers. With "exempt" the
+# guard inverts to only the paths quality_exempt covers: the breaches the
+# exemption let through, which the close records as its bypass (wv-ef00f7).
+_policy_file_guard_sql() {
+    local exists="NOT EXISTS"
+    [ "${1:-}" = "exempt" ] && exists="EXISTS"
+    cat <<SQL
+AND (json_type(NEW.metadata, '\$.completion_scope.files') IS NULL
+                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '\$.completion_scope.files')))
+                            AND $exists (
+                                SELECT 1 FROM quality_exempt qe
+                                WHERE $(_policy_exempt_match_sql)
+                            )
+SQL
+}
+
+_policy_mccabe_limit_sql() {
+    echo "COALESCE((SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language), (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max'))"
+}
+
+# Row sources: FROM ... WHERE for the files that breach each clause. An
+# optional "exempt" selects the breaching files quality_exempt covers instead.
+_policy_mccabe_rows_sql() {
+    cat <<SQL
+FROM node_files nf
+                        JOIN file_metrics fm ON fm.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND fm.mccabe_max > $(_policy_mccabe_limit_sql)
+                            $(_policy_file_guard_sql "${1:-}")
+SQL
+}
+
+_policy_trend_rows_sql() {
+    cat <<SQL
+FROM node_files nf
+                        JOIN file_trend ft ON ft.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND ft.direction = 'deteriorating'
+                            AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
+                            $(_policy_file_guard_sql "${1:-}")
+SQL
+}
+
+# Node-type exemption: non-code nodes are never test-gated, even if they accrue
+# node_files. COALESCE so NULL-type (legacy/context) nodes are still gated.
+_policy_test_rows_sql() {
+    cat <<SQL
+FROM node_files nf
+                        JOIN file_test_status fts ON fts.path = nf.path
+                        WHERE nf.node_id = NEW.id
+                            AND fts.state IN ('red', 'stale')
+                            AND (SELECT value FROM policy_thresholds WHERE key = 'test_gate') >= 2
+                            AND COALESCE(json_extract(NEW.metadata, '\$.type'), '') NOT IN ('finding', 'epic', 'session_history')
+                            $(_policy_file_guard_sql "${1:-}")
+SQL
+}
+
+# _policy_trigger_sql — the nodes_policy_check trigger, assembled from the clause
+# fragments above. Exactly one migration, the latest (db_migrate_test_gate),
+# applies it, and db_init applies it for a fresh DB. The trigger is the backstop:
+# cmd_done decides from the receipt first and never issues a close the receipt
+# denies, so the trigger firing on a cmd_done close means the two disagreed.
 _policy_trigger_sql() {
-    cat <<'TRIGGER'
+    cat <<TRIGGER
 DROP TRIGGER IF EXISTS nodes_policy_check;
 
 CREATE TRIGGER nodes_policy_check
@@ -836,78 +913,130 @@ BEFORE UPDATE OF status ON nodes
 WHEN NEW.status = 'done' AND OLD.status = 'active'
 BEGIN
         SELECT CASE
-                WHEN json_type(NEW.metadata, '$.completion_scope.files') IS NOT NULL
-                     AND (
-                         json_type(NEW.metadata, '$.completion_scope.files') != 'array'
-                         OR json_array_length(NEW.metadata, '$.completion_scope.files') = 0
-                         OR COALESCE(json_extract(NEW.metadata, '$.completion_scope.attempt_id'), '') = ''
-                         OR json_extract(NEW.metadata, '$.completion_scope.attempt_id') IS json_extract(OLD.metadata, '$.completion_scope.attempt_id')
-                         OR EXISTS (
-                             SELECT 1 FROM json_each(NEW.metadata, '$.completion_scope.files') scoped
-                             WHERE scoped.type != 'text' OR scoped.value = ''
-                                OR NOT EXISTS (SELECT 1 FROM node_files nf WHERE nf.node_id=NEW.id AND nf.path=scoped.value)
-                         )
-                     ) THEN RAISE(ABORT, 'GraphPolicyViolation: invalid completion scope')
-                WHEN EXISTS (
-                        SELECT 1 FROM node_files nf
-                        JOIN file_metrics fm ON fm.path = nf.path
-                        WHERE nf.node_id = NEW.id
-                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
-                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
-                            AND fm.mccabe_max > COALESCE(
-                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language),
-                                (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max')
-                            )
-                            AND NOT EXISTS (
-                                SELECT 1 FROM quality_exempt qe
-                                WHERE nf.path LIKE
-                                    CASE WHEN qe.path_pattern LIKE '%/'
-                                         THEN qe.path_pattern || '%'
-                                         ELSE qe.path_pattern
-                                    END
-                            )
+                WHEN $(_policy_scope_invalid_sql)
+                     THEN RAISE(ABORT, 'GraphPolicyViolation: invalid completion scope')
+                WHEN EXISTS (SELECT 1 $(_policy_mccabe_rows_sql)
                 ) THEN RAISE(ABORT, 'GraphPolicyViolation: mccabe_max threshold exceeded')
-                WHEN EXISTS (
-                        SELECT 1 FROM node_files nf
-                        JOIN file_trend ft ON ft.path = nf.path
-                        WHERE nf.node_id = NEW.id
-                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
-                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
-                            AND ft.direction = 'deteriorating'
-                            AND (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating') >= 1
-                            AND NOT EXISTS (
-                                SELECT 1 FROM quality_exempt qe
-                                WHERE nf.path LIKE
-                                    CASE WHEN qe.path_pattern LIKE '%/'
-                                         THEN qe.path_pattern || '%'
-                                         ELSE qe.path_pattern
-                                    END
-                            )
+                WHEN EXISTS (SELECT 1 $(_policy_trend_rows_sql)
                 ) THEN RAISE(ABORT, 'GraphPolicyViolation: trend_deteriorating threshold exceeded')
-                WHEN EXISTS (
-                        SELECT 1 FROM node_files nf
-                        JOIN file_test_status fts ON fts.path = nf.path
-                        WHERE nf.node_id = NEW.id
-                            AND (json_type(NEW.metadata, '$.completion_scope.files') IS NULL
-                                 OR nf.path IN (SELECT value FROM json_each(NEW.metadata, '$.completion_scope.files')))
-                            AND fts.state IN ('red', 'stale')
-                            AND (SELECT value FROM policy_thresholds WHERE key = 'test_gate') >= 2
-                            -- Node-type exemption: non-code nodes are never test-gated,
-                            -- even if they accrue node_files. COALESCE so NULL-type
-                            -- (legacy/context) nodes are still gated, not exempted.
-                            AND COALESCE(json_extract(NEW.metadata, '$.type'), '') NOT IN ('finding', 'epic', 'session_history')
-                            AND NOT EXISTS (
-                                SELECT 1 FROM quality_exempt qe
-                                WHERE nf.path LIKE
-                                    CASE WHEN qe.path_pattern LIKE '%/'
-                                         THEN qe.path_pattern || '%'
-                                         ELSE qe.path_pattern
-                                    END
-                            )
+                WHEN EXISTS (SELECT 1 $(_policy_test_rows_sql)
                 ) THEN RAISE(ABORT, 'GraphPolicyViolation: test_gate red/stale result')
         END;
 END;
 TRIGGER
+}
+
+# The values each clause decides on, as the receipt records them. Evaluated
+# over one breaching row of that clause's row source (nf, fm/ft/fts).
+_policy_mccabe_clause_sql() {
+    cat <<SQL
+json_object(
+            'threshold', CASE WHEN EXISTS (SELECT 1 FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language)
+                              THEN 'mccabe_max_' || fm.language ELSE 'mccabe_max' END,
+            'limit', $(_policy_mccabe_limit_sql), 'actual', fm.mccabe_max, 'path', nf.path)
+SQL
+}
+
+_policy_trend_clause_sql() {
+    cat <<'SQL'
+json_object(
+            'threshold', 'trend_deteriorating',
+            'limit', (SELECT value FROM policy_thresholds WHERE key = 'trend_deteriorating'),
+            'actual', 1, 'path', nf.path, 'direction', ft.direction)
+SQL
+}
+
+_policy_test_clause_sql() {
+    cat <<'SQL'
+json_object(
+            'threshold', 'test_gate',
+            'limit', (SELECT value FROM policy_thresholds WHERE key = 'test_gate'),
+            'actual', 1, 'path', nf.path, 'state', fts.state)
+SQL
+}
+
+# _policy_close_receipt_sql <escaped-node-id> <proposed-metadata-expr>
+#
+# One SELECT yielding the close receipt: NULL when every clause allows, else the
+# first denying clause as {"rule", "decision", "clause": {...}} — the rule is a
+# contracts/policy-rules-v1.json rule_id and clause carries the values the
+# decision was made on (threshold key, limit, actual, path, state or direction).
+# The receipt is the decision, not a diagnosis of one: cmd_done evaluates it in
+# the same write transaction as the close and guards the UPDATE on it, so it
+# names exactly the state the close was judged against. A non-Bash owner of the
+# transaction produces the same receipt from the same clauses; nothing parses
+# the trigger's error text. The proposed-metadata expression is evaluated
+# against the current row, as the UPDATE would evaluate it. Like the trigger's
+# WHEN, it judges only an active->done close: a todo or blocked node closed
+# directly is not gated, and a receipt that denied it would be stricter than
+# the backstop it is meant to agree with.
+_policy_close_receipt_sql() {
+    local id="$1" proposed="$2"
+    cat <<SQL
+WITH "NEW"(id, metadata) AS (SELECT id, $proposed FROM nodes WHERE id = '$id'),
+     "OLD"(id, metadata, status) AS (SELECT id, metadata, status FROM nodes WHERE id = '$id')
+SELECT COALESCE(
+    CASE WHEN $(_policy_scope_invalid_sql) THEN json_object(
+        'rule', 'completion_scope_integrity', 'decision', 'deny',
+        'clause', json_object('threshold', 'completion_scope', 'reason',
+            CASE WHEN $(_policy_scope_malformed_sql) THEN 'malformed_scope'
+                 WHEN $(_policy_scope_stale_attempt_sql) THEN 'stale_attempt'
+                 ELSE 'unattributed_file' END))
+    END,
+    (SELECT json_object(
+        'rule', 'close_complexity_ceiling', 'decision', 'deny', 'clause', $(_policy_mccabe_clause_sql))
+     $(_policy_mccabe_rows_sql)
+     ORDER BY nf.path LIMIT 1),
+    (SELECT json_object(
+        'rule', 'close_trend_not_deteriorating', 'decision', 'deny', 'clause', $(_policy_trend_clause_sql))
+     $(_policy_trend_rows_sql)
+     ORDER BY nf.path LIMIT 1),
+    (SELECT json_object(
+        'rule', 'close_tests_not_red', 'decision', 'deny', 'clause', $(_policy_test_clause_sql))
+     $(_policy_test_rows_sql)
+     ORDER BY nf.path LIMIT 1)
+) AS receipt
+FROM "NEW", "OLD"
+WHERE OLD.status = 'active'
+SQL
+}
+
+# _policy_close_bypass_sql <escaped-node-id> <proposed-metadata-expr>
+#
+# The exemptions a close relied on: one row per clause 1-3 whose only breaching
+# files are ones quality_exempt covers, as {"rule", "bypass", "clause"} where
+# bypass is quality_exempt:<pattern> and clause holds the same values a deny
+# would have. It uses the receipt's row sources with the exempt guard inverted,
+# so it cannot name a breach the trigger would judge differently. Meaningful
+# only when the receipt allows (a denying clause has a non-exempt breach, and
+# the close does not happen); _done_close_txn reads it only then. Without it an
+# exempted close was indistinguishable from one no clause examined (wv-ef00f7).
+_policy_close_bypass_sql() {
+    local id="$1" proposed="$2" pattern
+    pattern="(SELECT qe.path_pattern FROM quality_exempt qe WHERE $(_policy_exempt_match_sql) ORDER BY qe.path_pattern LIMIT 1)"
+    cat <<SQL
+WITH "NEW"(id, metadata) AS (SELECT id, $proposed FROM nodes WHERE id = '$id'),
+     "OLD"(id, metadata, status) AS (SELECT id, metadata, status FROM nodes WHERE id = '$id'),
+     bypassed(b) AS (
+    SELECT (SELECT json_object('rule', 'close_complexity_ceiling', 'bypass', 'quality_exempt:' || $pattern,
+                               'clause', $(_policy_mccabe_clause_sql))
+            $(_policy_mccabe_rows_sql exempt)
+            ORDER BY nf.path LIMIT 1) FROM "NEW", "OLD"
+    UNION ALL
+    SELECT (SELECT json_object('rule', 'close_trend_not_deteriorating', 'bypass', 'quality_exempt:' || $pattern,
+                               'clause', $(_policy_trend_clause_sql))
+            $(_policy_trend_rows_sql exempt)
+            ORDER BY nf.path LIMIT 1) FROM "NEW", "OLD"
+    UNION ALL
+    SELECT (SELECT json_object('rule', 'close_tests_not_red', 'bypass', 'quality_exempt:' || $pattern,
+                               'clause', $(_policy_test_clause_sql))
+            $(_policy_test_rows_sql exempt)
+            ORDER BY nf.path LIMIT 1)
+    FROM "NEW", "OLD"
+)
+SELECT b AS bypass FROM bypassed, "OLD"
+WHERE b IS NOT NULL AND OLD.status = 'active'
+SQL
 }
 
 # Migrate to add file_test_status + test_gate threshold and arm the trigger's
@@ -1006,15 +1135,12 @@ db_reindex_fts5() {
 
     echo "Rebuilding FTS5 index..." >&2
 
-    sqlite3 "$WV_DB" <<'REINDEX'
--- Ensure FTS table exists
-CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-    id, text, metadata,
-    content=nodes,
-    content_rowid=rowid,
-    tokenize='porter unicode61'
-);
+    # Create the table and triggers, or upgrade a three-column index to the
+    # current shape (wv-92b72c), before rebuilding: CREATE IF NOT EXISTS alone
+    # would rebuild an old index without its alias column.
+    db_migrate_fts5
 
+    sqlite3 "$WV_DB" <<'REINDEX'
 -- Rebuild entire index (FTS5 special command for content tables)
 INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');
 REINDEX
@@ -1043,7 +1169,56 @@ db_rebuild_fts() {
 # Database Ensure (with auto-prune)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# _wv_db_ensure_key — what db_ensure memoises: the DB path and its inode. A
+# replaced file (wv init --force, or a load replacing a corrupt one; another
+# process may do either mid-command) has a new inode, so it is ensured again.
+# A load that restores into the live file keeps the inode and clears the memo.
+_wv_db_ensure_key() {
+    local ino
+    ino=$(stat -c %i "$WV_DB" 2>/dev/null || stat -f %i "$WV_DB" 2>/dev/null) || return 1
+    printf '%s|%s' "$WV_DB" "$ino"
+}
+
+# _wv_db_schema_stamp — one checksum over what db_ensure's migrations depend on
+# and produce: the DB path and inode, the two files that define every
+# migration (this one and wv-db-lineage.sh), and the full schema text. Any of
+# them changing -- a CLI upgrade or edit, a replaced DB file, an out-of-band
+# schema change such as an older wv rebuilding the policy trigger -- changes
+# the stamp. Fails (prints nothing) when any input cannot be read.
+_wv_db_schema_stamp() {
+    local ino schema
+    ino=$(stat -c %i "$WV_DB" 2>/dev/null || stat -f %i "$WV_DB" 2>/dev/null) || return 1
+    [ -f "$_WV_DB_SRC_DIR/wv-db.sh" ] && [ -f "$_WV_DB_SRC_DIR/wv-db-lineage.sh" ] || return 1
+    schema=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" \
+        "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name;" 2>/dev/null) \
+        || return 1
+    [ -n "$schema" ] || return 1
+    { printf '%s|%s\n%s\n' "$WV_DB" "$ino" "$schema"
+      cat "$_WV_DB_SRC_DIR/wv-db.sh" "$_WV_DB_SRC_DIR/wv-db-lineage.sh"; } | cksum
+}
+
+# _wv_db_stamp_current — true when $WV_DB.ensured holds the stamp this DB and
+# this code produce now, i.e. some process already ran these migrations
+# against this exact schema and nothing has changed it since.
+_wv_db_stamp_current() {
+    local want have=""
+    [ -f "$WV_DB.ensured" ] || return 1
+    want=$(_wv_db_schema_stamp) || return 1
+    [ -n "$want" ] || return 1
+    read -r have < "$WV_DB.ensured" 2>/dev/null || return 1
+    [ "$have" = "$want" ]
+}
+
 db_ensure() {
+    # Per-process fast path (wv-3d6ed0). Without it every db_query re-ran the
+    # migration probes below, each its own sqlite3, at ~220ms per query; the
+    # flag was set and never read. Not exported: a nested wv is another process
+    # and ensures for itself. Code that rebuilds the DB under the same path
+    # clears _WV_DB_READY (cmd_init, cmd_load, selftest).
+    if [ -n "${_WV_DB_READY:-}" ] && [ -f "$WV_DB" ] \
+        && [ "$_WV_DB_READY" = "$(_wv_db_ensure_key)" ]; then
+        return 0
+    fi
     if [ ! -f "$WV_DB" ]; then
         # Migration: detect pre-v1.2 global hot zone layout
         # Old: /dev/shm/weave/brain.db (single DB for all repos)
@@ -1065,7 +1240,7 @@ db_ensure() {
                     db_migrate_alias
                     db_migrate_virtual_columns
                     db_migrate_fts5
-                    _WV_DB_READY=1
+                    _WV_DB_READY=$(_wv_db_ensure_key) || _WV_DB_READY=""
                     return 0
                 else
                     echo -e "${RED}Migration failed — continuing with normal init${NC}" >&2
@@ -1109,6 +1284,19 @@ db_ensure() {
 
     db_stamp_repo_owner
 
+    # Cross-process fast path (wv-048429). The first ensure in every wv process
+    # ran all ten migrations (~170ms of sqlite3 calls) even when another process
+    # had just run them against the same schema. The stamp is checked in one
+    # query; a mismatch or any read failure falls through to the migrations.
+    # Not covered: a data row a migration seeds (the test_gate threshold) and
+    # something later deletes without touching the schema -- it is re-seeded
+    # the next time the stamp changes, not on every call.
+    if _wv_db_stamp_current; then
+        _WV_DB_READY=$(_wv_db_ensure_key) || _WV_DB_READY=""
+        _wv_db_size_check
+        return 0
+    fi
+
     local schema_lock="$WV_HOT_ZONE/.schema.lock"
     if command -v flock >/dev/null 2>&1; then
         exec {schema_lock_fd}>"$schema_lock"
@@ -1117,8 +1305,30 @@ db_ensure() {
             exec {schema_lock_fd}>&-
             return 1
         }
+        # Check again under the lock (ultrareview #4574): processes that raced
+        # at a cold start all found no stamp and queued here; the first one
+        # migrated and stamped, so the rest have nothing left to do.
+        if _wv_db_stamp_current; then
+            flock -u "$schema_lock_fd" 2>/dev/null || true
+            exec {schema_lock_fd}>&-
+            _WV_DB_READY=$(_wv_db_ensure_key) || _WV_DB_READY=""
+            _wv_db_size_check
+            return 0
+        fi
     fi
 
+    # Existing hot-zone databases pass through db_ensure rather than db_init or
+    # cmd_load. Run the same lineage migration here so upgrading the CLI repairs
+    # a supported partial schema before any graph query or mutation reaches it.
+    # Failure is explicit: continuing would leave sync and commit-refs unable to
+    # persist, and the lock must be released before returning to the caller.
+    if ! db_migrate_lineage; then
+        if command -v flock >/dev/null 2>&1; then
+            flock -u "$schema_lock_fd" 2>/dev/null || true
+            exec {schema_lock_fd}>&-
+        fi
+        return 1
+    fi
     db_migrate_edge_type_enum
     db_migrate_policy_tables
     db_migrate_language_trigger
@@ -1131,11 +1341,27 @@ db_ensure() {
     # so the authoritative trigger (incl. the test clause) is the final state.
     db_migrate_test_gate
 
+    # Stamp under the lock, so no process reads a stamp for a half-migrated
+    # schema. A stamp that cannot be computed is removed, never left stale.
+    local _stamp
+    if _stamp=$(_wv_db_schema_stamp) && [ -n "$_stamp" ] \
+        && printf '%s\n' "$_stamp" > "$WV_DB.ensured.$$" 2>/dev/null; then
+        mv -f "$WV_DB.ensured.$$" "$WV_DB.ensured" 2>/dev/null || rm -f "$WV_DB.ensured.$$" "$WV_DB.ensured"
+    else
+        rm -f "$WV_DB.ensured.$$" "$WV_DB.ensured" 2>/dev/null || true
+    fi
+
     if command -v flock >/dev/null 2>&1; then
         flock -u "$schema_lock_fd" 2>/dev/null || true
         exec {schema_lock_fd}>&-
     fi
+    _WV_DB_READY=$(_wv_db_ensure_key) || _WV_DB_READY=""
+    _wv_db_size_check
+}
 
+# _wv_db_size_check — once per process tree (the flag is exported so pipe
+# subshells inherit it), warn about or prune an oversized DB.
+_wv_db_size_check() {
     # Check DB size once per process-tree — export so pipe subshells inherit the flag.
     # Destructive prune requires explicit opt-in: WV_AUTO_PRUNE=1.
     # WV_DISABLE_AUTOPRUNE=1 kept for backward compat (sync uses it).

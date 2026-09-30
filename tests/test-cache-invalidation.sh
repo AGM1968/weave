@@ -84,7 +84,7 @@ assert_contains() {
 
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    if echo "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         return 0
@@ -257,7 +257,7 @@ test_cmd_prune_invalidation() {
     # Artificially age the node
     # Database is at $WV_HOT_ZONE/brain.db (tmpfs location)
     local hot_zone
-    hot_zone=$(find /dev/shm -maxdepth 1 -type d -name "weave*" 2>/dev/null | head -1)
+    hot_zone=$(find /dev/shm -maxdepth 1 -type d -name "weave*" 2>/dev/null | sed -n 1p)
     if [ -z "$hot_zone" ]; then
         echo -e "${YELLOW}⊘${NC} Skipping prune test - cannot find hot zone in /dev/shm"
         return
@@ -311,7 +311,7 @@ test_cache_file_lifecycle() {
 
     # Check if cache file exists
     local cache_dir
-    cache_dir=$(find "$WV_HOT_ZONE" -type d -name "context_cache" 2>/dev/null | head -1)
+    cache_dir=$(find "$WV_HOT_ZONE" -type d -name "context_cache" 2>/dev/null | sed -n 1p)
 
     if [ -z "$cache_dir" ]; then
         echo -e "${YELLOW}⊘${NC} Cache directory not found - cache may not be enabled"
@@ -428,6 +428,140 @@ test_touch_invalidates_run_cache() {
     export WV_RUN_CACHE=0
 }
 
+# Test 8b/8c: the run cache keys on state outside the graph (wv-9e14fa)
+# Bootstrap's readiness verdict reads HEAD and the framework-check record that
+# make check writes to the git dir. Neither touches the write sentinel, so a
+# cached bootstrap served green for up to the TTL after make check recorded red
+# or HEAD moved past the checked commit. The TTL is raised so only the key can
+# make the second read fresh; each key has its own test so either regression
+# fails on its own.
+_run_cache_repo_setup() {
+    setup_test_env
+    export WV_RUN_CACHE=1 WV_RUN_CACHE_TTL=3600
+    git init -q . && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m one
+    RC_RECORD="$(git rev-parse --path-format=absolute --git-common-dir)/weave-framework-check.json"
+    _rc_write_record "$(git rev-parse HEAD)" 0
+}
+
+_rc_write_record() {
+    printf '{"commit":"%s","exit":%s,"at":"t","target":"make check"}\n' "$1" "$2" > "$RC_RECORD"
+}
+
+_rc_framework_state() {
+    "$WV" bootstrap --json | jq -r '.readiness.framework.state // "none"'
+}
+
+_run_cache_repo_teardown() {
+    export WV_RUN_CACHE=0
+    unset WV_RUN_CACHE_TTL RC_RECORD
+    cd "$PROJECT_ROOT" 2>/dev/null || true
+}
+
+test_run_cache_keys_on_framework_record() {
+    echo ""
+    echo "Test 8b: run cache keys on the framework-check record"
+    echo "====================================================="
+
+    _run_cache_repo_setup
+    assert_equals "green" "$(_rc_framework_state)" "primed: framework green for HEAD"
+    _rc_write_record "$(git rev-parse HEAD)" 2
+    assert_equals "red" "$(_rc_framework_state)" "a new framework-check record is not served from the cache"
+    _run_cache_repo_teardown
+}
+
+test_run_cache_keys_on_head() {
+    echo ""
+    echo "Test 8c: run cache keys on HEAD"
+    echo "==============================="
+
+    _run_cache_repo_setup
+    assert_equals "green" "$(_rc_framework_state)" "primed: framework green for HEAD"
+    git -c user.email=t@t -c user.name=t commit -q --allow-empty -m two
+    assert_equals "stale" "$(_rc_framework_state)" "a moved HEAD is not served from the cache"
+    _run_cache_repo_teardown
+}
+
+test_run_cache_keys_on_environment() {
+    echo ""
+    echo "Test 8d: run cache keys on the config dir, HOME and the upstream (wv-2d4482)"
+    echo "==========================================================================="
+
+    _run_cache_repo_setup
+    # The key function itself: bootstrap's advisories read all three, and none
+    # of them moves HEAD or touches the write sentinel.
+    _rc_key() {
+        bash -c "source '$PROJECT_ROOT/scripts/lib/wv-cache.sh'; _wv_run_cache_key bootstrap --json"
+    }
+    local base cfg home up
+    base=$(_rc_key)
+    cfg=$(WV_CONFIG_DIR="$TEST_DIR/other-config" _rc_key)
+    home=$(HOME="$TEST_DIR/other-home" _rc_key)
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [ "$base" != "$cfg" ] && [ "$base" != "$home" ]; then
+        echo -e "${GREEN}✓${NC} a different config dir or HOME is a different cache entry"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo -e "${RED}✗${NC} a different config dir or HOME is a different cache entry (base=$base cfg=$cfg home=$home)"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+    git branch -q upstream-probe
+    git branch -q --set-upstream-to=upstream-probe
+    base=$(_rc_key)
+    git update-ref refs/heads/upstream-probe \
+        "$(git -c user.email=t@t -c user.name=t commit-tree -m pushed "$(git rev-parse 'HEAD^{tree}')" -p HEAD)"
+    up=$(_rc_key)
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [ "$base" != "$up" ]; then
+        echo -e "${GREEN}✓${NC} a moved upstream is a different cache entry though HEAD did not move"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        echo -e "${RED}✗${NC} a moved upstream is a different cache entry though HEAD did not move"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+    _run_cache_repo_teardown
+}
+
+# Test 8e/8f: cache freshness is strict (wv-228099). Timestamps are coarse --
+# whole seconds for the context pack's clocks, a few ms for file mtimes -- so a
+# change in the same tick as the cache write must count as newer, not equal.
+# Both cases pin the tie explicitly rather than racing the clock.
+test_context_cache_same_second_change() {
+    echo ""
+    echo "Test 8e: a context pack written in the same second as a change is regenerated"
+    echo "============================================================================="
+
+    setup_test_env
+    local a b cache s
+    a=$("$WV" add "Same-second node A" --force 2>/dev/null | grep -oE 'wv-[0-9a-f]{6}' | sed -n 1p)
+    b=$("$WV" add "Same-second node B" --force 2>/dev/null | grep -oE 'wv-[0-9a-f]{6}' | sed -n 1p)
+    "$WV" context "$a" --json >/dev/null 2>&1
+    cache=$(find "$WV_HOT_ZONE/context_cache" -name "${a}-*.json" 2>/dev/null | sed -n 1p)
+    s=$(date +%s)
+    touch -d "@$s" "$cache"
+    sqlite3 "$("$WV" hotzone --db)" "INSERT INTO edges(source,target,type,weight,created_at) VALUES('$b','$a','contradicts',1.0,CURRENT_TIMESTAMP);
+                      UPDATE nodes SET updated_at = datetime($s, 'unixepoch') WHERE id = '$b';"
+    touch -d "@$s" "$cache"
+    assert_equals "1" "$("$WV" context "$a" --json 2>/dev/null | jq '.contradictions | length')" \
+        "a contradiction added in the cache's own second appears in the pack"
+}
+
+test_run_cache_equal_timestamp_is_stale() {
+    echo ""
+    echo "Test 8f: a run-cache entry no newer than the write sentinel is stale"
+    echo "===================================================================="
+
+    setup_test_env
+    local entry fresh
+    entry="$TEST_DIR/run-cache-entry"
+    : > "$entry"
+    fresh=$(WV_RUN_CACHE_TTL=3600 bash -c "
+        source '$PROJECT_ROOT/scripts/lib/wv-cache.sh'
+        : > \"\$WV_RUN_CACHE_SENTINEL\"
+        t=\$(date +%s); touch -d \"@\$t\" '$entry' \"\$WV_RUN_CACHE_SENTINEL\"
+        _wv_run_cache_is_fresh '$entry' && echo fresh || echo stale")
+    assert_equals "stale" "$fresh" "an entry with the sentinel's own timestamp is stale (a write in the same tick)"
+}
+
 # Test 9: a deletion invalidates the wv impact cache
 # Regression (release review 3): the cache was validated against a TIMESTAMP
 # clock, MAX(updated_at) over nodes and edges. A timestamp cannot see a DELETE,
@@ -527,7 +661,7 @@ test_impact_cache_not_published_when_walk_raced() {
     assert_equals "1" "$clean_files" "an undisturbed walk is published"
 
     local cache_path stored_seq db_seq
-    cache_path=$(find "$cache_dir" -name 'impact-*-v2.json' 2>/dev/null | head -1)
+    cache_path=$(find "$cache_dir" -name 'impact-*-v2.json' 2>/dev/null | sed -n 1p)
     stored_seq=$(head -n 1 "$cache_path" 2>/dev/null)
     db_seq=$(sqlite3 "$WV_HOT_ZONE/brain.db" \
         "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='_warp_changes'), 0);" 2>/dev/null)
@@ -620,7 +754,7 @@ test_uncommitted_edit_invalidates_function_rows() {
 
     "$WV" quality scan >/dev/null 2>&1 || true
     local before
-    before=$("$WV" quality functions src/sample.py 2>&1 | grep -oE 'CC=[0-9]+' | head -1 || true)
+    before=$("$WV" quality functions src/sample.py 2>&1 | grep -oE 'CC=[0-9]+' | sed -n 1p || true)
     assert_equals "CC=2" "$before" "baseline complexity is recorded"
 
     # Same function, far more branching -- and deliberately NOT committed.
@@ -640,7 +774,7 @@ PYEOF
 
     "$WV" quality scan >/dev/null 2>&1 || true
     local after
-    after=$("$WV" quality functions src/sample.py 2>&1 | grep -oE 'CC=[0-9]+' | head -1 || true)
+    after=$("$WV" quality functions src/sample.py 2>&1 | grep -oE 'CC=[0-9]+' | sed -n 1p || true)
     local changed="stale"
     [ -n "$after" ] && [ "$after" != "CC=2" ] && changed="updated"
     assert_equals "updated" "$changed" \
@@ -649,7 +783,7 @@ PYEOF
     # The stored span is the tell: a carried-forward row keeps the pre-edit one,
     # so a stale row is recognisable without knowing the right complexity.
     local span span_state
-    span=$("$WV" quality functions src/sample.py 2>&1 | grep -oE 'L:[0-9]+-[0-9]+' | head -1 || true)
+    span=$("$WV" quality functions src/sample.py 2>&1 | grep -oE 'L:[0-9]+-[0-9]+' | sed -n 1p || true)
     span_state="stale"
     [ -n "$span" ] && [ "$span" != "L:1-3" ] && span_state="refreshed"
     assert_equals "refreshed" "$span_state" "stored line span is refreshed with the value"
@@ -660,7 +794,7 @@ PYEOF
     printf 'def sample(a):\n    if a: return 1\n    return 0\n' > src/sample.py
     "$WV" quality scan >/dev/null 2>&1 || true
     local reverted
-    reverted=$("$WV" quality functions src/sample.py 2>&1 | grep -oE 'CC=[0-9]+' | head -1 || true)
+    reverted=$("$WV" quality functions src/sample.py 2>&1 | grep -oE 'CC=[0-9]+' | sed -n 1p || true)
     assert_equals "CC=2" "$reverted" "reverting to committed bytes returns the baseline"
 
     cd "$PROJECT_ROOT" 2>/dev/null || true
@@ -816,6 +950,11 @@ main() {
     test_cache_file_lifecycle
     test_v3_cache_upgrade_no_shadow
     test_touch_invalidates_run_cache
+    test_run_cache_keys_on_framework_record
+    test_run_cache_keys_on_head
+    test_run_cache_keys_on_environment
+    test_context_cache_same_second_change
+    test_run_cache_equal_timestamp_is_stale
     test_impact_cache_invalidated_by_unlink
     test_needs_sync_sees_deletion
     test_impact_cache_not_published_when_walk_raced

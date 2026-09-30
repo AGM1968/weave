@@ -389,6 +389,38 @@ PY
     echo "$destination/manifest.txt" >> "$MANIFEST"
 }
 
+# repo_hooks_refresh_allowed — may this run rewrite the CURRENT repository's
+# .git/hooks? Only when HOME is the account's real home. The hook directory is
+# found from the working directory, not from the install target, so a test
+# suite that sandboxes HOME/WV_LIB_DIR and runs install.sh from the repo root
+# otherwise rewrote the real repository's live hooks mid-gate, with whatever
+# the working tree held (wv-7f6c9d). A real ./install.sh and the pre-commit
+# self-heal both keep the real HOME. Returns 0 when allowed.
+repo_hooks_refresh_allowed() {
+    local real_home
+    real_home=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)
+    [ -n "$real_home" ] || real_home=$(eval echo "~$(id -un)" 2>/dev/null)
+    [ -n "$real_home" ] && [ -d "$real_home" ] && [ -d "${HOME:-}" ] || return 1
+    [ "$(cd "$HOME" && pwd -P)" = "$(cd "$real_home" && pwd -P)" ]
+}
+
+# remove_retired_git_hook <hook-name> <marker> — delete a Weave hook that is no
+# longer shipped, only when it carries that hook's Weave signature: a custom
+# hook of the same name is the user's and is left alone. The post-commit
+# deferred-suite queue was retired by wv-56c823 (nothing had written its queue
+# since e2d80d855; the two-tier gate, wv-862ac0, replaced it).
+remove_retired_git_hook() {
+    local hook_name="$1" marker="$2"
+    [ -d "${HOOK_DIR:-}" ] || return 0
+    local hook_dst="$HOOK_DIR/$hook_name"
+    [ -f "$hook_dst" ] || return 0
+    if grep -qF -- "$marker" "$hook_dst" 2>/dev/null; then
+        rm -f "$hook_dst" && echo -e "  ${GREEN}✓${NC} .git/hooks/$hook_name (retired Weave hook removed)"
+    else
+        echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (custom hook, left alone)"
+    fi
+}
+
 install_git_hook_from_repo() {
     local hook_path="$1"
     local marker="$2"
@@ -410,7 +442,7 @@ install_git_hook_from_repo() {
         # mistaken for a custom user hook and skipped (left stale, the friction
         # wv doctor flagged with a manual `install -m 755 ...`). A genuinely
         # custom hook (no Weave signature) is still preserved.
-        if grep -qE -- "$marker|# Weave (pre-commit|post-commit|prepare-commit)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
+        if grep -qE -- "$marker|# Weave (pre-commit|post-commit|prepare-commit|pre-push)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
             action="updated"
         else
             echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (custom hook exists, skipped)"
@@ -479,22 +511,13 @@ mkdir -p "$CONFIG_DIR"
 mkdir -p "$CONFIG_DIR/hooks"
 mkdir -p "$CONFIG_DIR/lib"
 mkdir -p "$CONFIG_DIR/agents"
-mkdir -p "$CONFIG_DIR/skills/trails"
-mkdir -p "$CONFIG_DIR/skills/close-session"
-mkdir -p "$CONFIG_DIR/skills/wv-decompose-work"
-mkdir -p "$CONFIG_DIR/skills/fix-issue"
-mkdir -p "$CONFIG_DIR/skills/pre-mortem"
-mkdir -p "$CONFIG_DIR/skills/wv-verify-complete"
-mkdir -p "$CONFIG_DIR/skills/resolve-refs"
-mkdir -p "$CONFIG_DIR/skills/wv-clarify-spec"
-mkdir -p "$CONFIG_DIR/skills/sanity-check"
-mkdir -p "$CONFIG_DIR/skills/ship-it"
-mkdir -p "$CONFIG_DIR/skills/wv-guard-scope"
-mkdir -p "$CONFIG_DIR/skills/wv-detect-loop"
-mkdir -p "$CONFIG_DIR/skills/weave-audit"
-mkdir -p "$CONFIG_DIR/skills/weave"
-mkdir -p "$CONFIG_DIR/skills/zero-in"
-mkdir -p "$CONFIG_DIR/skills/plan-agent"
+# The skills install.sh places in CONFIG_DIR - the ONE list the mkdir, copy,
+# download and prune steps below read (wv-f4a68b). Four hand-kept copies of it
+# drifted: the breadcrumbs -> trails rename reached only some of them.
+WV_CONFIG_SKILLS=(trails close-session wv-decompose-work fix-issue pre-mortem wv-verify-complete
+    resolve-refs wv-clarify-spec sanity-check ship-it wv-guard-scope wv-detect-loop weave-audit
+    weave zero-in plan-agent)
+for _wv_sk in "${WV_CONFIG_SKILLS[@]}"; do mkdir -p "$CONFIG_DIR/skills/$_wv_sk"; done
 
 # Record source path so wv self-update can find the dev clone later
 _WV_INSTALL_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -518,6 +541,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-validate.sh "$LIB_DIR/lib/wv-validate.sh"
     install_file ./scripts/lib/wv-cache.sh "$LIB_DIR/lib/wv-cache.sh"
     install_file ./scripts/lib/wv-command-capabilities.sh "$LIB_DIR/lib/wv-command-capabilities.sh"
+    install_file ./scripts/lib/wv-policy-rules.sh "$LIB_DIR/lib/wv-policy-rules.sh"
     install_file ./scripts/lib/wv-journal.sh "$LIB_DIR/lib/wv-journal.sh"
     install_file ./scripts/lib/wv-attempt-journal.sh "$LIB_DIR/lib/wv-attempt-journal.sh"
     install_file ./scripts/lib/wv-gh.sh "$LIB_DIR/lib/wv-gh.sh"
@@ -526,10 +550,12 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-delta-v2-replay.py "$LIB_DIR/lib/wv-delta-v2-replay.py"
     install_file ./scripts/lib/wv-checkpoint-generation.sh "$LIB_DIR/lib/wv-checkpoint-generation.sh"
     install_file ./scripts/lib/wv-checkpoint-ci.sh "$LIB_DIR/lib/wv-checkpoint-ci.sh"
+    install_file ./scripts/lib/wv-gate-pool.sh "$LIB_DIR/lib/wv-gate-pool.sh"
     install_file ./scripts/lib/wv-repository-class.sh "$LIB_DIR/lib/wv-repository-class.sh"
     install_file ./scripts/lib/wv-workflow-classes.gen.sh "$LIB_DIR/lib/wv-workflow-classes.gen.sh"
     install_file ./scripts/lib/wv-violation-vocabulary.gen.sh "$LIB_DIR/lib/wv-violation-vocabulary.gen.sh"
     install_file ./scripts/lib/wv-hook-common.sh "$LIB_DIR/lib/wv-hook-common.sh"
+    install_file ./scripts/lib/wv-hook-observe.sh "$LIB_DIR/lib/wv-hook-observe.sh"
     install_file ./scripts/lib/wv-resolve-project.sh "$LIB_DIR/lib/wv-resolve-project.sh"
     install_file ./scripts/lib/wv-resolve-runtime.sh "$LIB_DIR/lib/wv-resolve-runtime.sh"
     install_file ./scripts/lib/VERSION "$LIB_DIR/lib/VERSION"
@@ -638,8 +664,10 @@ if [ -f "./scripts/wv" ]; then
     # can refresh vendored scripts/hooks/ in consumer repos without network access
     mkdir -p "$LIB_DIR/hooks"
     install_file ./scripts/hooks/pre-commit-weave.sh "$LIB_DIR/hooks/pre-commit-weave.sh"
-    install_file ./scripts/hooks/post-commit-weave.sh "$LIB_DIR/hooks/post-commit-weave.sh"
+    # post-commit-weave.sh is retired (wv-56c823): drop an installed copy.
+    rm -f "$LIB_DIR/hooks/post-commit-weave.sh" 2>/dev/null || true
     install_file ./scripts/hooks/prepare-commit-msg-weave.sh "$LIB_DIR/hooks/prepare-commit-msg-weave.sh"
+    install_file ./scripts/hooks/pre-push-weave.sh "$LIB_DIR/hooks/pre-push-weave.sh"
 
     # Refresh THIS repository's git hooks too, when installing from inside one.
     #
@@ -654,14 +682,19 @@ if [ -f "./scripts/wv" ]; then
     #
     # It refreshes only Weave-managed hooks: a custom hook without a Weave
     # signature is preserved and skipped, per the marker check in the function.
-    if [ -d "$(git rev-parse --git-dir 2>/dev/null)/hooks" ] 2>/dev/null; then
+    # A sandboxed install (tests redirect HOME) leaves them alone: see
+    # repo_hooks_refresh_allowed.
+    if repo_hooks_refresh_allowed && [ -d "$(git rev-parse --git-dir 2>/dev/null)/hooks" ] 2>/dev/null; then
         HOOK_DIR="$(git rev-parse --git-dir 2>/dev/null)/hooks"
         install_git_hook_from_repo ./scripts/hooks/pre-commit-weave.sh "Weave pre-commit" "pre-commit"
-        install_git_hook_from_repo ./scripts/hooks/post-commit-weave.sh "Weave post-commit" "post-commit"
+        remove_retired_git_hook "post-commit" "Weave post-commit"
         install_git_hook_from_repo ./scripts/hooks/prepare-commit-msg-weave.sh "Weave: append Weave-ID trailers" "prepare-commit-msg"
+        install_git_hook_from_repo ./scripts/hooks/pre-push-weave.sh "Weave pre-push" "pre-push"
     fi
     # Scripts
-    cp ./scripts/context-guard.sh "$CONFIG_DIR/"
+    # context-guard.sh has one copy, the SessionStart hook under hooks/; the
+    # diverged scripts/ copy it replaced is dropped (wv-5cfbc1).
+    rm -f "$CONFIG_DIR/context-guard.sh" 2>/dev/null || true
     cp ./scripts/resolve-refs.sh "$CONFIG_DIR/"
     cp ./scripts/project-procedures.sh "$CONFIG_DIR/"
     cp ./scripts/gen-procedures.sh "$CONFIG_DIR/"
@@ -673,6 +706,8 @@ if [ -f "./scripts/wv" ]; then
     cp ./scripts/lib/wv-workflow-classes.gen.sh "$CONFIG_DIR/lib/wv-workflow-classes.gen.sh"
     cp ./scripts/lib/wv-violation-vocabulary.gen.sh "$CONFIG_DIR/lib/wv-violation-vocabulary.gen.sh"
     cp ./scripts/lib/wv-hook-common.sh "$CONFIG_DIR/lib/wv-hook-common.sh"
+    cp ./scripts/lib/wv-hook-observe.sh "$CONFIG_DIR/lib/wv-hook-observe.sh"
+    cp ./scripts/lib/wv-policy-rules.sh "$CONFIG_DIR/lib/wv-policy-rules.sh"
     cp ./scripts/lib/wv-checkpoint-ci.sh "$CONFIG_DIR/lib/wv-checkpoint-ci.sh"
     cp ./scripts/lib/wv-repository-class.sh "$CONFIG_DIR/lib/wv-repository-class.sh"
     # Claude hooks (all 9 — registered globally via ~/.claude/settings.json under Alt-A)
@@ -695,23 +730,10 @@ if [ -f "./scripts/wv" ]; then
     cp ./.claude/agents/epic-planner.md "$CONFIG_DIR/agents/"
     cp ./.claude/agents/learning-curator.md "$CONFIG_DIR/agents/"
     # Skills
-    cp ./.claude/skills/trails/SKILL.md "$CONFIG_DIR/skills/trails/"
-    cp ./.claude/skills/close-session/SKILL.md "$CONFIG_DIR/skills/close-session/"
-    cp ./.claude/skills/wv-decompose-work/SKILL.md "$CONFIG_DIR/skills/wv-decompose-work/"
-    cp ./.claude/skills/fix-issue/SKILL.md "$CONFIG_DIR/skills/fix-issue/"
-    cp ./.claude/skills/pre-mortem/SKILL.md "$CONFIG_DIR/skills/pre-mortem/"
-    cp ./.claude/skills/wv-verify-complete/SKILL.md "$CONFIG_DIR/skills/wv-verify-complete/"
-    cp ./.claude/skills/resolve-refs/SKILL.md "$CONFIG_DIR/skills/resolve-refs/"
-    cp ./.claude/skills/wv-clarify-spec/SKILL.md "$CONFIG_DIR/skills/wv-clarify-spec/"
-    cp ./.claude/skills/sanity-check/SKILL.md "$CONFIG_DIR/skills/sanity-check/"
-    cp ./.claude/skills/ship-it/SKILL.md "$CONFIG_DIR/skills/ship-it/"
-    cp ./.claude/skills/wv-guard-scope/SKILL.md "$CONFIG_DIR/skills/wv-guard-scope/"
-    cp ./.claude/skills/wv-detect-loop/SKILL.md "$CONFIG_DIR/skills/wv-detect-loop/"
-    cp ./.claude/skills/weave-audit/SKILL.md "$CONFIG_DIR/skills/weave-audit/"
+    for _wv_sk in "${WV_CONFIG_SKILLS[@]}"; do
+        cp "./.claude/skills/$_wv_sk/SKILL.md" "$CONFIG_DIR/skills/$_wv_sk/"
+    done
     cp ./.claude/skills/weave-audit/audit-report.sh "$CONFIG_DIR/skills/weave-audit/"
-    cp ./.claude/skills/weave/SKILL.md "$CONFIG_DIR/skills/weave/"
-    cp ./.claude/skills/zero-in/SKILL.md "$CONFIG_DIR/skills/zero-in/"
-    cp ./.claude/skills/plan-agent/SKILL.md "$CONFIG_DIR/skills/plan-agent/"
     # CLAUDE.md template (generic, not project-specific)
     cp ./templates/CLAUDE.md.template "$CONFIG_DIR/CLAUDE.md.template"
     # Workflow reference (compact wv cheatsheet for new repos)
@@ -749,6 +771,7 @@ else
     download_file "$REPO/scripts/lib/wv-validate.sh" "$LIB_DIR/lib/wv-validate.sh"
     download_file "$REPO/scripts/lib/wv-cache.sh" "$LIB_DIR/lib/wv-cache.sh"
     download_file "$REPO/scripts/lib/wv-command-capabilities.sh" "$LIB_DIR/lib/wv-command-capabilities.sh"
+    download_file "$REPO/scripts/lib/wv-policy-rules.sh" "$LIB_DIR/lib/wv-policy-rules.sh"
     download_file "$REPO/scripts/lib/wv-journal.sh" "$LIB_DIR/lib/wv-journal.sh"
     download_file "$REPO/scripts/lib/wv-attempt-journal.sh" "$LIB_DIR/lib/wv-attempt-journal.sh"
     download_file "$REPO/scripts/lib/wv-gh.sh" "$LIB_DIR/lib/wv-gh.sh"
@@ -756,10 +779,12 @@ else
     download_file "$REPO/scripts/lib/wv-delta-catalog.sh" "$LIB_DIR/lib/wv-delta-catalog.sh"
     download_file "$REPO/scripts/lib/wv-checkpoint-generation.sh" "$LIB_DIR/lib/wv-checkpoint-generation.sh"
     download_file "$REPO/scripts/lib/wv-checkpoint-ci.sh" "$LIB_DIR/lib/wv-checkpoint-ci.sh"
+    download_file "$REPO/scripts/lib/wv-gate-pool.sh" "$LIB_DIR/lib/wv-gate-pool.sh"
     download_file "$REPO/scripts/lib/wv-repository-class.sh" "$LIB_DIR/lib/wv-repository-class.sh"
     download_file "$REPO/scripts/lib/wv-workflow-classes.gen.sh" "$LIB_DIR/lib/wv-workflow-classes.gen.sh"
     download_file "$REPO/scripts/lib/wv-violation-vocabulary.gen.sh" "$LIB_DIR/lib/wv-violation-vocabulary.gen.sh"
     download_file "$REPO/scripts/lib/wv-hook-common.sh" "$LIB_DIR/lib/wv-hook-common.sh"
+    download_file "$REPO/scripts/lib/wv-hook-observe.sh" "$LIB_DIR/lib/wv-hook-observe.sh"
     download_file "$REPO/scripts/lib/wv-resolve-project.sh" "$LIB_DIR/lib/wv-resolve-project.sh"
     download_file "$REPO/scripts/lib/wv-resolve-runtime.sh" "$LIB_DIR/lib/wv-resolve-runtime.sh"
     download_file "$REPO/scripts/lib/VERSION" "$LIB_DIR/lib/VERSION"
@@ -791,8 +816,9 @@ else
     # Git hook sources (used by wv-init-repo --update refresh)
     mkdir -p "$LIB_DIR/hooks"
     download_file "$REPO/scripts/hooks/pre-commit-weave.sh" "$LIB_DIR/hooks/pre-commit-weave.sh"
-    download_file "$REPO/scripts/hooks/post-commit-weave.sh" "$LIB_DIR/hooks/post-commit-weave.sh"
+    rm -f "$LIB_DIR/hooks/post-commit-weave.sh" 2>/dev/null || true   # retired (wv-56c823)
     download_file "$REPO/scripts/hooks/prepare-commit-msg-weave.sh" "$LIB_DIR/hooks/prepare-commit-msg-weave.sh"
+    download_file "$REPO/scripts/hooks/pre-push-weave.sh" "$LIB_DIR/hooks/pre-push-weave.sh"
     # Python sync package (auto-discover modules from GitHub API)
     mkdir -p "$LIB_DIR/weave_gh"
     local py_modules
@@ -831,7 +857,7 @@ else
     mkdir -p "$LIB_DIR/weave_quality/default_patterns"
     rm -f "$LIB_DIR/weave_quality/default_patterns/prose-casual-register.yaml" \
         "$LIB_DIR/weave_quality/default_patterns/prose-number-free-verification.yaml"
-    for pattern_rule in subprocess-shell-true bare-except-pass unquoted-variable prose-register-review prose-emphasis-hedge; do
+    for pattern_rule in subprocess-shell-true bare-except-pass unquoted-variable prose-register-review prose-emphasis-hedge git-listing-rename-blind lookup-skips-beside-self live-db-file-operation; do
         download_file "$REPO/scripts/weave_quality/default_patterns/${pattern_rule}.yaml" \
             "$LIB_DIR/weave_quality/default_patterns/${pattern_rule}.yaml"
     done
@@ -844,7 +870,7 @@ else
     coaching_guides=$(curl -sSL "https://api.github.com/repos/AGM1968/weave/contents/scripts/weave_quality/guides?ref=main" \
         | jq -r '.[] | select(.name | endswith(".md")) | .name' 2>/dev/null)
     if [ -z "$coaching_guides" ]; then
-        coaching_guides="_clean.md _incomplete.md _uncoached.md register.md swallowed-exception.md swallowed-exception.python.md"
+        coaching_guides="_clean.md _incomplete.md _uncoached.md register.md swallowed-exception.md swallowed-exception.python.md vacuous-verification.md rename-blind-listing.md live-db-file-operation.md"
     fi
     for guide_file in $coaching_guides; do
         download_file "$REPO/scripts/weave_quality/guides/${guide_file}" \
@@ -881,7 +907,7 @@ else
     download_file "$REPO/scripts/weave_search/__main__.py" "$LIB_DIR/weave_search/__main__.py"
     download_file "$REPO/scripts/weave_search/graph.py" "$LIB_DIR/weave_search/graph.py"
     # Scripts
-    curl -sSL "$REPO/scripts/context-guard.sh" -o "$CONFIG_DIR/context-guard.sh"
+    rm -f "$CONFIG_DIR/context-guard.sh" 2>/dev/null || true   # one copy, under hooks/ (wv-5cfbc1)
     curl -sSL "$REPO/scripts/resolve-refs.sh" -o "$CONFIG_DIR/resolve-refs.sh"
     curl -sSL "$REPO/scripts/project-procedures.sh" -o "$CONFIG_DIR/project-procedures.sh"
     curl -sSL "$REPO/scripts/gen-procedures.sh" -o "$CONFIG_DIR/gen-procedures.sh"
@@ -893,6 +919,8 @@ else
     # Must land before wv-hook-common.sh sources it; absent here, hooks silently disable classification.
     curl -sSL "$REPO/scripts/lib/wv-workflow-classes.gen.sh" -o "$CONFIG_DIR/lib/wv-workflow-classes.gen.sh"
     curl -sSL "$REPO/scripts/lib/wv-hook-common.sh" -o "$CONFIG_DIR/lib/wv-hook-common.sh"
+    curl -sSL "$REPO/scripts/lib/wv-hook-observe.sh" -o "$CONFIG_DIR/lib/wv-hook-observe.sh"
+    curl -sSL "$REPO/scripts/lib/wv-policy-rules.sh" -o "$CONFIG_DIR/lib/wv-policy-rules.sh"
     curl -sSL "$REPO/scripts/lib/wv-checkpoint-ci.sh" -o "$CONFIG_DIR/lib/wv-checkpoint-ci.sh"
     curl -sSL "$REPO/scripts/lib/wv-repository-class.sh" -o "$CONFIG_DIR/lib/wv-repository-class.sh"
     # Claude hooks
@@ -915,22 +943,9 @@ else
     curl -sSL "$REPO/.claude/agents/epic-planner.md" -o "$CONFIG_DIR/agents/epic-planner.md"
     curl -sSL "$REPO/.claude/agents/learning-curator.md" -o "$CONFIG_DIR/agents/learning-curator.md"
     # Skills
-    curl -sSL "$REPO/.claude/skills/trails/SKILL.md" -o "$CONFIG_DIR/skills/trails/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/close-session/SKILL.md" -o "$CONFIG_DIR/skills/close-session/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/wv-decompose-work/SKILL.md" -o "$CONFIG_DIR/skills/wv-decompose-work/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/fix-issue/SKILL.md" -o "$CONFIG_DIR/skills/fix-issue/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/pre-mortem/SKILL.md" -o "$CONFIG_DIR/skills/pre-mortem/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/wv-verify-complete/SKILL.md" -o "$CONFIG_DIR/skills/wv-verify-complete/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/resolve-refs/SKILL.md" -o "$CONFIG_DIR/skills/resolve-refs/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/wv-clarify-spec/SKILL.md" -o "$CONFIG_DIR/skills/wv-clarify-spec/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/sanity-check/SKILL.md" -o "$CONFIG_DIR/skills/sanity-check/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/ship-it/SKILL.md" -o "$CONFIG_DIR/skills/ship-it/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/wv-guard-scope/SKILL.md" -o "$CONFIG_DIR/skills/wv-guard-scope/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/wv-detect-loop/SKILL.md" -o "$CONFIG_DIR/skills/wv-detect-loop/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/weave-audit/SKILL.md" -o "$CONFIG_DIR/skills/weave-audit/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/weave/SKILL.md" -o "$CONFIG_DIR/skills/weave/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/zero-in/SKILL.md" -o "$CONFIG_DIR/skills/zero-in/SKILL.md"
-    curl -sSL "$REPO/.claude/skills/plan-agent/SKILL.md" -o "$CONFIG_DIR/skills/plan-agent/SKILL.md"
+    for _wv_sk in "${WV_CONFIG_SKILLS[@]}"; do
+        curl -sSL "$REPO/.claude/skills/$_wv_sk/SKILL.md" -o "$CONFIG_DIR/skills/$_wv_sk/SKILL.md"
+    done
     curl -sSL "$REPO/.claude/skills/weave-audit/audit-report.sh" -o "$CONFIG_DIR/skills/weave-audit/audit-report.sh"
     # CLAUDE.md template (generic, not project-specific)
     curl -sSL "$REPO/templates/CLAUDE.md.template" -o "$CONFIG_DIR/CLAUDE.md.template"
@@ -965,9 +980,30 @@ else
     curl -sSL "$REPO/templates/AGENTS.md.template" -o "$CONFIG_DIR/AGENTS.md.template" 2>/dev/null || true
 fi
 
+# Prune CONFIG_DIR skills install.sh placed before and no longer ships
+# (wv-f4a68b); left alone they stayed resident forever. Only names install.sh
+# itself recorded are candidates, so a hand-written skill, or one another tool
+# placed, is never touched, and a procedure-projected skill (it carries the
+# WEAVE-MANAGED-SKILL marker) is kept even if listed. A CONFIG_DIR older than
+# the manifest is seeded with the skills retired before the manifest existed.
+_wv_sk_manifest="$CONFIG_DIR/skills/.weave-installed"
+if [ -f "$_wv_sk_manifest" ]; then
+    _wv_sk_prev=$(cat "$_wv_sk_manifest")
+else
+    _wv_sk_prev="breadcrumbs epic-breakdown prove-it rubber-duck stay-in-lane unstuck"
+fi
+for _wv_sk in $_wv_sk_prev; do
+    [[ "$_wv_sk" =~ ^[a-z0-9-]+$ ]] || continue
+    case " ${WV_CONFIG_SKILLS[*]} " in *" $_wv_sk "*) continue ;; esac
+    [ -d "$CONFIG_DIR/skills/$_wv_sk" ] || continue
+    grep -qF 'WEAVE-MANAGED-SKILL' "$CONFIG_DIR/skills/$_wv_sk/SKILL.md" 2>/dev/null && continue
+    rm -rf "${CONFIG_DIR:?}/skills/${_wv_sk:?}"
+    echo -e "  ${GREEN}✓${NC} skills/$_wv_sk (no longer shipped, removed)"
+done
+printf '%s\n' "${WV_CONFIG_SKILLS[@]}" > "$_wv_sk_manifest"
+
 chmod +x "$INSTALL_DIR/wv"
 chmod +x "$INSTALL_DIR/wv-test"
-chmod +x "$CONFIG_DIR/context-guard.sh"
 chmod +x "$CONFIG_DIR/resolve-refs.sh"
 chmod +x "$CONFIG_DIR/project-procedures.sh"
 chmod +x "$CONFIG_DIR/gen-procedures.sh"
@@ -1190,6 +1226,23 @@ if [ -n "$REPOSITORY_CLASS_ARG" ]; then
 fi
 wv_repository_require_owned "$REPO_ROOT" "wv init-repo" || exit 1
 
+# remove_retired_git_hook <hook-name> <marker> — delete a Weave hook that is no
+# longer shipped, only when it carries that hook's Weave signature: a custom
+# hook of the same name is the user's and is left alone. The post-commit
+# deferred-suite queue was retired by wv-56c823 (nothing had written its queue
+# since e2d80d855; the two-tier gate, wv-862ac0, replaced it).
+remove_retired_git_hook() {
+    local hook_name="$1" marker="$2"
+    [ -d "${HOOK_DIR:-}" ] || return 0
+    local hook_dst="$HOOK_DIR/$hook_name"
+    [ -f "$hook_dst" ] || return 0
+    if grep -qF -- "$marker" "$hook_dst" 2>/dev/null; then
+        rm -f "$hook_dst" && echo -e "  ${GREEN}✓${NC} .git/hooks/$hook_name (retired Weave hook removed)"
+    else
+        echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (custom hook, left alone)"
+    fi
+}
+
 install_git_hook_from_repo() {
     local hook_path="$1"
     local marker="$2"
@@ -1211,7 +1264,7 @@ install_git_hook_from_repo() {
         # mistaken for a custom user hook and skipped (left stale, the friction
         # wv doctor flagged with a manual `install -m 755 ...`). A genuinely
         # custom hook (no Weave signature) is still preserved.
-        if grep -qE -- "$marker|# Weave (pre-commit|post-commit|prepare-commit)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
+        if grep -qE -- "$marker|# Weave (pre-commit|post-commit|prepare-commit|pre-push)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
             action="updated"
         else
             echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (custom hook exists, skipped)"
@@ -1579,7 +1632,14 @@ fi
 _LIB_HOOKS="${LIB_DIR:-$HOME/.local/lib/weave}/hooks"
 if [ -d "$REPO_ROOT/scripts/hooks" ] && [ -d "$_LIB_HOOKS" ]; then
     _updated_vendor=0
-    for _hf in pre-commit-weave.sh post-commit-weave.sh prepare-commit-msg-weave.sh; do
+    # A vendored copy of a retired hook source goes too (wv-56c823), when it
+    # is Weave's (carries the Weave post-commit signature).
+    if [ -f "$REPO_ROOT/scripts/hooks/post-commit-weave.sh" ] \
+        && grep -qF "Weave post-commit" "$REPO_ROOT/scripts/hooks/post-commit-weave.sh" 2>/dev/null; then
+        rm -f "$REPO_ROOT/scripts/hooks/post-commit-weave.sh"
+        echo -e "  ${GREEN}✓${NC} scripts/hooks/post-commit-weave.sh (retired, removed)"
+    fi
+    for _hf in pre-commit-weave.sh prepare-commit-msg-weave.sh pre-push-weave.sh; do
         [ -f "$_LIB_HOOKS/$_hf" ] || continue
         if [ ! -f "$REPO_ROOT/scripts/hooks/$_hf" ]; then
             cp "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf"
@@ -1587,10 +1647,17 @@ if [ -d "$REPO_ROOT/scripts/hooks" ] && [ -d "$_LIB_HOOKS" ]; then
             echo -e "  ${GREEN}✓${NC} scripts/hooks/$_hf (seeded)"
             _updated_vendor=1
         elif ! cmp -s "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf" 2>/dev/null; then
-            cp "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf"
-            chmod +x "$REPO_ROOT/scripts/hooks/$_hf"
-            echo -e "  ${GREEN}✓${NC} scripts/hooks/$_hf (updated)"
-            _updated_vendor=1
+            # A differing source may be a local edit: refresh it only when asked,
+            # as every other copy that already exists is (wv-d6e9ba). Seeding a
+            # missing source above stays ungated.
+            if [ "$UPDATE_MODE" = "1" ]; then
+                cp "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf"
+                chmod +x "$REPO_ROOT/scripts/hooks/$_hf"
+                echo -e "  ${GREEN}✓${NC} scripts/hooks/$_hf (updated)"
+                _updated_vendor=1
+            else
+                echo -e "  ${YELLOW}⊘${NC} scripts/hooks/$_hf (exists, use --update to overwrite)"
+            fi
         fi
     done
     [ "$_updated_vendor" -eq 0 ] && true
@@ -1608,8 +1675,12 @@ install_git_hook_from_repo "./scripts/hooks/prepare-commit-msg-weave.sh" "Weave:
 # Git hook: pre-commit (enforce active Weave node)
 install_git_hook_from_repo "./scripts/hooks/pre-commit-weave.sh" "Weave pre-commit" "pre-commit"
 
-# Git hook: post-commit (run deferred non-critical suites)
-install_git_hook_from_repo "./scripts/hooks/post-commit-weave.sh" "Weave post-commit" "post-commit"
+# Git hook: post-commit -- retired (wv-56c823); remove a Weave copy, keep a custom one
+remove_retired_git_hook "post-commit" "Weave post-commit"
+
+# Git hook: pre-push (the heavy tier of the commit gate, wv-862ac0; exits at
+# once in a repository whose test map has no [heavy] section)
+install_git_hook_from_repo "./scripts/hooks/pre-push-weave.sh" "Weave pre-push" "pre-push"
 
 # .gitattributes: merge strategy + diff suppression for Weave state files
 # Uses BEGIN/END markers (like Makefile template) for reliable idempotent updates
@@ -1758,7 +1829,7 @@ if [ "$AGENT" = "claude" ]; then
     # User files (only overwritten with --force): CLAUDE.md, settings.local.json, settings.json
 
     # ── Skills (managed — always update) ──
-    SKILLS=(breadcrumbs close-session fix-issue plan-agent pre-mortem resolve-refs sanity-check ship-it weave weave-audit wv-clarify-spec wv-decompose-work wv-detect-loop wv-guard-scope wv-verify-complete zero-in)
+    SKILLS=(trails close-session fix-issue plan-agent pre-mortem resolve-refs sanity-check ship-it weave weave-audit wv-clarify-spec wv-decompose-work wv-detect-loop wv-guard-scope wv-verify-complete zero-in)
     for skill in "${SKILLS[@]}"; do
         if [ -f "$CONFIG_DIR/skills/$skill/SKILL.md" ]; then
             mkdir -p "$REPO_ROOT/.claude/skills/$skill"
@@ -2524,6 +2595,17 @@ CODEXHOOKSEOF
     if [ ! -f "$_CODEX_CONTRACT" ] || [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ] || [ "$CODEX_HOOKS" = "1" ]; then
         _write_codex_contract
         echo -e "  ${GREEN}✓${NC} .codex/weave.json"
+        # memory.entries[] is not part of this template: wv memory render
+        # --agent=codex fills it from the graph. Rewriting the contract without
+        # re-rendering emptied the Codex agent's memory on every --update
+        # (wv-2ab164). A repo with no graph yet renders an empty list.
+        if [ -x "$WV_BIN" ]; then
+            if (cd "$REPO_ROOT" && "$WV_BIN" memory render --agent=codex >/dev/null 2>&1); then
+                echo -e "  ${GREEN}✓${NC} .codex/weave.json memory entries (rendered from the graph)"
+            else
+                echo -e "  ${YELLOW}⚠${NC} .codex/weave.json memory entries not rendered - run: wv memory render --agent=codex"
+            fi
+        fi
     else
         echo -e "  ${YELLOW}⊘${NC} .codex/weave.json (already exists, use --update to refresh)"
     fi
@@ -2579,7 +2661,8 @@ fi
 done  # end for AGENT in AGENTS
 
 # Procedure bodies live in the installed config; this projects only the adapter
-# requested by init-repo and never writes user-owned AGENTS.md.
+# requested by init-repo. AGENTS.md stays user-owned: only a WEAVE PROCEDURES
+# block the file already carries is refreshed, never created (wv-6ef83b).
 if [ -x "$CONFIG_DIR/project-procedures.sh" ]; then
     "$CONFIG_DIR/project-procedures.sh" --repo="$REPO_ROOT" --agent="$AGENT_ARG"
 fi

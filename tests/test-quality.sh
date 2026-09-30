@@ -161,7 +161,7 @@ assert_contains() {
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected to find: $needle"
-        echo "  In: $(strip_ansi <<<"$haystack" | head -5)"
+        echo "  In: $(strip_ansi <<<"$haystack" | sed -n '1,5p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
@@ -177,7 +177,7 @@ assert_not_contains() {
     else
         echo -e "${RED}✗${NC} $message"
         echo "  Expected NOT to find: $needle"
-        echo "  In: $(strip_ansi <<<"$haystack" | head -5)"
+        echo "  In: $(strip_ansi <<<"$haystack" | sed -n '1,5p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
@@ -361,7 +361,7 @@ test_scan_json_first_run() {
     local head
     head=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin).get('git_head',''))" 2>/dev/null)
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$head" | grep -qE '^[0-9a-f]{7,40}$'; then
+    if grep -qE '^[0-9a-f]{7,40}$' <<< "$head"; then
         echo -e "${GREEN}✓${NC} git_head is a valid hex SHA"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -712,13 +712,23 @@ test_structural_zero_is_named() {
     assert_contains "$py_out" "n/a" \
         "an inapplicable prose rule is marked n/a rather than 0"
 
-    # The mirror must NOT regress: a markdown target keeps the plain header,
-    # because claiming "N of N applied" there would assert the ast-grep code
-    # rules ran on Markdown too.
+    # The mirror (wv-76fc4a): on a markdown target the ast-grep code rules
+    # have no file of their language, so they are named out of scope rather
+    # than counted as applied, and the prose rules are not.
     local md_out
     md_out=$("$WV" quality patterns scan "$tmp/probe.md" 2>&1 || true)
-    assert_not_contains "$md_out" "out of scope" \
-        "a markdown target reports no out-of-scope prose rules"
+    assert_contains "$md_out" "out of scope for this target" \
+        "a markdown target names the code rules it cannot apply"
+    assert_contains "$md_out" "bare-except-pass [" \
+        "a python code rule is listed on a markdown target"
+    local md_json
+    md_json=$("$WV" quality patterns scan "$tmp/probe.md" --json 2>/dev/null | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+oos = set(d.get('out_of_scope') or [])
+print('ok' if 'bare-except-pass' in oos and not any(r.startswith('prose-') for r in oos) else sorted(oos))
+" 2>/dev/null || true)
+    assert_equals "ok" "$md_json" "code rules, not prose rules, are out of scope on a markdown target"
 
     local json_ok
     json_ok=$("$WV" quality patterns scan "$tmp/probe.py" --json 2>/dev/null | python3 -c "

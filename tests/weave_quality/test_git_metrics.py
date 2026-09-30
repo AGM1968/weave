@@ -31,6 +31,7 @@ from weave_quality.git_metrics import (
     file_co_changes,
     git_blob_sha,
     git_head_sha,
+    working_tree_blob_shas,
 )
 from weave_quality.models import FileState, GitStats
 
@@ -268,8 +269,8 @@ class TestBatchBlobShas:
 
     def test_parses_ls_tree_output(self, tmp_path: Path) -> None:
         ls_tree = (
-            "100644 blob abc123def456abc123def456abc123def456abc123\tscripts/foo.py\n"
-            "100644 blob 111222333444555666777888999aaabbbcccdddee\tscripts/bar.py\n"
+            "100644 blob abc123def456abc123def456abc123def456abc123\tscripts/foo.py\0"
+            "100644 blob 111222333444555666777888999aaabbbcccdddee\tscripts/bar.py\0"
             "040000 tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\tscripts"
         )
         with patch("weave_quality.git_metrics._git", return_value=ls_tree):
@@ -279,11 +280,68 @@ class TestBatchBlobShas:
         assert "scripts/bar.py" in result
 
     def test_skips_lines_without_tab(self, tmp_path: Path) -> None:
-        ls_tree = "100644 blob abc123\nno-tab-here\n100644 blob def456\tother.py"
+        ls_tree = "100644 blob abc123\0no-tab-here\0100644 blob def456\tother.py"
         with patch("weave_quality.git_metrics._git", return_value=ls_tree):
             result = batch_blob_shas(tmp_path)
         assert "other.py" in result
         assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# working_tree_blob_shas — dirty files keyed by git's own object id (wv-99c85a)
+# ---------------------------------------------------------------------------
+
+
+def _scratch_repo(root: Path, *config: str) -> Path:
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    for item in ("user.name=Weave test", "user.email=weave-test@example.invalid",
+                 "commit.gpgsign=false", *config):
+        key, value = item.split("=", 1)
+        git("config", key, value)
+    return root
+
+
+def _commit_all(root: Path) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "c"], cwd=root, check=True, capture_output=True)
+
+
+class TestWorkingTreeBlobShas:
+    def test_dirty_key_equals_blob_the_commit_records_under_autocrlf(self, tmp_path: Path) -> None:
+        # autocrlf normalizes CRLF to LF on add, so the committed blob is NOT the
+        # sha1 of the raw on-disk bytes. The old hand-rolled formula keyed the
+        # dirty file by raw bytes and so never matched the blob it became.
+        repo = _scratch_repo(tmp_path, "core.autocrlf=true")
+        (repo / "a.py").write_bytes(b"x = 1\n")
+        _commit_all(repo)
+        (repo / "a.py").write_bytes(b"x = 1\r\ny = 2\r\n")
+        dirty_key = working_tree_blob_shas(repo)["a.py"]
+        _commit_all(repo)
+        assert dirty_key == batch_blob_shas(repo)["a.py"]
+
+    def test_non_ascii_dirty_path_is_hashed_not_dropped(self, tmp_path: Path) -> None:
+        # Without -z, core.quotePath C-quotes the name and the lookup misses.
+        repo = _scratch_repo(tmp_path)
+        (repo / "café.py").write_text("a = 1\n")
+        _commit_all(repo)
+        head_sha = batch_blob_shas(repo)["café.py"]
+        (repo / "café.py").write_text("a = 2\n")
+        key = working_tree_blob_shas(repo).get("café.py")
+        assert key and key != head_sha
+
+    def test_deleted_and_renamed_away_paths_fall_through_to_mtime(self, tmp_path: Path) -> None:
+        repo = _scratch_repo(tmp_path, "diff.renames=true")
+        (repo / "gone.py").write_text("g = 1\n")
+        (repo / "old.py").write_text("o = 1\n" * 20)
+        _commit_all(repo)
+        (repo / "gone.py").unlink()
+        subprocess.run(["git", "mv", "old.py", "new.py"], cwd=repo, check=True, capture_output=True)
+        result = working_tree_blob_shas(repo)
+        assert "gone.py" not in result
+        assert "old.py" not in result
 
 
 # ---------------------------------------------------------------------------

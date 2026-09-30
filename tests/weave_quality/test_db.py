@@ -14,6 +14,7 @@ import pytest
 from weave_quality.db import (
     ADJUDICATION_NUDGE_SCANS,
     _MAX_PATTERN_RUNS,
+    _migrate_v10_rebuild_pattern_tables,
     PatternMigrationConflictError,
     adjudicate_pattern_finding,
     begin_pattern_run,
@@ -1703,6 +1704,41 @@ class TestSchemaV10:
         assert "pattern_rule_runs_v9" not in tables
         assert [row[0] for row in findings] == ["qf-a"]
         assert [row[0] for row in receipts] == ["r"]
+
+    def test_a_failed_rebuild_rolls_back_and_raises(self, tmp_path: Path) -> None:
+        """wv-e07ee4: a failure mid-rebuild must reach the caller. Rolling back
+        and returning left a v9 database that init_db reported as migrated."""
+
+        class FailingRefill(sqlite3.Connection):  # pylint: disable=too-few-public-methods
+            def execute(self, sql, *args):  # type: ignore[override]
+                if sql.startswith("INSERT INTO pattern_findings"):
+                    raise sqlite3.OperationalError("disk I/O error (injected)")
+                return super().execute(sql, *args)
+
+        db_file = tmp_path / "quality.db"
+        raw = sqlite3.connect(str(db_file))
+        raw.executescript(_TRUE_V9_SCHEMA_SQL)
+        raw.close()
+
+        conn = sqlite3.connect(str(db_file), factory=FailingRefill)
+        conn.row_factory = sqlite3.Row
+        with pytest.raises(sqlite3.OperationalError, match="injected"):
+            _migrate_v10_rebuild_pattern_tables(conn)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        fk_targets = {
+            row["table"] for row in conn.execute("PRAGMA foreign_key_list(pattern_findings)")
+        }
+        findings = conn.execute("SELECT finding_key FROM pattern_findings").fetchall()
+        conn.close()
+
+        assert "pattern_findings_v9" not in tables
+        assert fk_targets == {"scan_meta"}
+        assert [row[0] for row in findings] == ["qf-a"]
 
     def test_rebuild_repair_is_idempotent_when_the_copy_already_completed(
         self, tmp_path: Path

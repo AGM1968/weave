@@ -15,7 +15,7 @@
 # Tunables:
 #   WV_BUDGET_THRESHOLD   — total wv call count that triggers broad advisory (default 20)
 #   WV_LIST_THRESHOLD     — wv list call count that triggers list-specific advisory (default 5)
-#   WV_BUDGET_DIR         — override budget dir (default /dev/shm/weave/<hash>)
+#   WV_BUDGET_DIR         — override budget dir (default: the resolved hot zone)
 
 set -e
 
@@ -34,16 +34,25 @@ echo "$CMD" | grep -qE '(^|[;&|][[:space:]]*)(\./scripts/)?wv[[:space:]]' || exi
 IS_LIST=false
 echo "$CMD" | grep -qE '(^|[;&|][[:space:]]*)(\./scripts/)?wv[[:space:]]+list([[:space:]]|$)' && IS_LIST=true
 
-# Per-repo budget file on tmpfs. NOTE: this is an INDEPENDENT ephemeral counter,
-# deliberately NOT the resolved hot-zone — it hardcodes /dev/shm/weave/<hash> and
-# only needs to be self-consistent across this session's tally reads/writes. Under
-# sandboxed runtimes (Claude Code/Codex) the real hot-zone is /tmp/weave-codex-*, so
-# this file legitimately lives elsewhere; if /dev/shm is absent the mkdir below no-ops.
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-REPO_HASH=$(echo "$REPO_ROOT" | md5sum 2>/dev/null | cut -c1-8 || echo "default")
-[[ -z "$REPO_HASH" ]] && REPO_HASH="default"
-BUDGET_DIR="${WV_BUDGET_DIR:-/dev/shm/weave/${REPO_HASH}}"
-BUDGET_FILE="${BUDGET_DIR}/session-budget.json"
+# The budget file lives where wv health reads it (wv-76bb48): the resolved hot
+# zone, through the one helper both sides call. This hook used to hardcode
+# /dev/shm/weave/<hash>, so under a sandboxed runtime (hot zone
+# /tmp/weave-codex-<uid>) health never found the file and scored 25/25 unearned.
+# Libraries load as pre-action.sh loads them, nearest the running hook first.
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+_bt_source() {
+    local lib="$1" dir
+    for dir in "$HOOK_DIR/../lib" "$HOOK_DIR/../../scripts/lib" "${HOME}/.config/weave/lib"; do
+        # shellcheck source=/dev/null
+        [ -r "$dir/$lib.sh" ] && . "$dir/$lib.sh" 2>/dev/null && return 0
+    done
+    return 1
+}
+for _bt_lib in wv-resolve-project wv-config wv-resolve-runtime; do _bt_source "$_bt_lib" || true; done
+# An advisory hook: without the resolver it counts nothing rather than guess.
+command -v wv_session_budget_file >/dev/null 2>&1 && command -v resolve_repo_hot_zone >/dev/null 2>&1 || exit 0
+BUDGET_FILE=$(wv_session_budget_file "$(resolve_repo_hot_zone "" "${WV_PROJECT_DIR:-}")")
+BUDGET_DIR="${BUDGET_FILE%/*}"
 mkdir -p "$BUDGET_DIR" 2>/dev/null || exit 0
 
 OUTPUT=$(echo "$INPUT" | jq -r '.tool_response.output // ""' 2>/dev/null)

@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -126,7 +127,10 @@ class TestExposure:
         _git(repo, "config", "user.name", "t")
         # Spaced deliberately: commits sharing a second give a zero median, which
         # is a different branch (asserted below) and would not test this one.
-        base = 1_787_000_000
+        # Relative to now: a fixed epoch aged out of the 30-day window and
+        # failed from about 2026-09-17, unseen because nothing ran this file
+        # (wv-840865).
+        base = int(time.time()) - 2 * 86_400
         for i in range(4):
             (repo / f"f{i}").write_text("x", encoding="utf-8")
             _git(repo, "add", "-A")
@@ -146,6 +150,18 @@ class TestExposure:
         # Every probability is a real fraction, never above certainty.
         assert all(0.0 <= p <= 1.0 for p in exposure["collision_probability"].values())
         assert exposure["collision_probability"]["90s"] == pytest.approx(0.1, abs=0.01)
+
+    def test_a_failed_git_log_stops_the_report(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """wv-e07ee4: outside a repository git log fails; carrying on read its
+        empty output as 'no checkpoints' and reported zero exposure."""
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+        monkeypatch.delenv("GIT_DIR", raising=False)
+        not_a_repo = tmp_path / "plain"
+        not_a_repo.mkdir()
+        with pytest.raises(SystemExit, match="git log failed in"):
+            report(not_a_repo, _log(tmp_path / "c.jsonl", []), days=30)
 
     def test_an_over_wide_window_is_clamped_not_silently_empty(self, tmp_path: Path) -> None:
         """git returns NO commits for a window reaching before the epoch, which
@@ -172,11 +188,18 @@ class TestExposure:
         _git(repo, "init", "-q")
         _git(repo, "config", "user.email", "t@t")
         _git(repo, "config", "user.name", "t")
+        # One explicit second for the whole burst: three real commits crossed a
+        # second boundary under load and failed make check (wv-dada89).
+        stamp = f"{int(time.time()) - 86_400} +0000"
         for i in range(3):
             (repo / f"f{i}").write_text("x", encoding="utf-8")
             _git(repo, "add", "-A")
-            _git(repo, "-c", "core.hooksPath=/dev/null", "commit", "-qm",
-                 f"chore(weave): auto-checkpoint {i}")
+            subprocess.run(
+                ["git", "-c", "core.hooksPath=/dev/null", "commit", "-qm",
+                 f"chore(weave): auto-checkpoint {i}"],
+                cwd=repo, check=True, capture_output=True,
+                env={**os.environ, "GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp},
+            )
         summary = report(repo, _log(tmp_path / "c.jsonl", []), days=30)
         exposure = summary["exposure"]
         assert exposure["collision_probability"] == {}
