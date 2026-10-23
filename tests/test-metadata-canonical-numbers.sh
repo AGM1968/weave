@@ -12,6 +12,7 @@ export WV_CALL_SOURCE=test
 # The same paths must refuse a risk_level outside the contract (wv-c0c51e):
 # wv touch and wv quick stored metadata with neither check.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WV="$ROOT/scripts/wv"
 run=0; pass=0

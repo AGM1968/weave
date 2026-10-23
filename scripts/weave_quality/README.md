@@ -322,7 +322,7 @@ return clamp(score, 0, 100)
 | ev threshold        | 4     | McCabe: ev > 4 = "troublesome" module      |
 | Gini threshold      | 0.7   | Concentration risk signal                  |
 
-**Calibration results (v1.13.0, earth-engine-analysis):**
+**Calibration results (v1.13.0, a consumer repository):**
 
 | v1.12.2 | v1.13.0 | Change                                     |
 | ------: | ------: | ------------------------------------------ |
@@ -474,7 +474,7 @@ Benchmark on memory-system repo (75 files: 32 Python + 43 Bash), v1.8.1:
 | `git_blob_sha` per file | 0.40s           | 0 (batched)    | eliminated  |
 | `ast.walk` calls        | 353,009         | 96,839         | 3.6×        |
 
-At scale (earth-engine-analysis, 175 Python files, v1.8.1): **5.5s total** — fewer than the 75-file
+At scale (a consumer repository, 175 Python files, v1.8.1): **5.5s total** — fewer than the 75-file
 pre-optimisation baseline.
 
 **Key optimisations:**

@@ -54,6 +54,7 @@ emit_doc_block() {
     local output="$1" class label enforcement
     printf '%s\n' '<!-- BEGIN GENERATED: workflow-classes -->' > "$output"
     printf '%s\n' '## Command Classes' '' >> "$output"
+    # shellcheck disable=SC2016  # backticks are Markdown code spans in the generated table
     printf '%s\n' 'This table is generated from `templates/workflow-classes.conf`. The pre-action hook uses the same compiled data.' '' >> "$output"
     printf '%s\n' '| Class | Members | Enforcement |' '| --- | --- | --- |' >> "$output"
     for class in bootstrap_allow close_gated hook_edit_tools claude_edit_exempt_prefixes; do
@@ -64,6 +65,7 @@ emit_doc_block() {
             hook_edit_tools) label='Pre-action hook adapter tool names'; enforcement='Require active-node check' ;;
             claude_edit_exempt_prefixes) label='Claude Code runtime path prefixes'; enforcement='Excluded from project-work enforcement' ;;
         esac
+        # shellcheck disable=SC2016  # backticks are Markdown code spans in the generated table
         printf '| %s | `%s` | %s |\n' "$label" "$(IFS=', '; echo "${values[*]}")" "$enforcement" >> "$output"
     done
     printf '%s\n' '<!-- END GENERATED: workflow-classes -->' >> "$output"

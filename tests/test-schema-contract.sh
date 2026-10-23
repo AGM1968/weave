@@ -11,6 +11,7 @@ export WV_CALL_SOURCE=test
 # Weave-ID: wv-0eb81a
 
 set -e
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Sandbox shells omit user tool dirs (poetry lives in ~/.local/bin); same
 # fallback as scripts/wv and the Makefile, needed for direct execution.

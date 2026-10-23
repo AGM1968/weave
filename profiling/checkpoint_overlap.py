@@ -81,7 +81,7 @@ def checkpoint_commits(repo: Path, days: int) -> list[dict[str, Any]]:
     return commits
 
 
-def load_calls(log_path: Path, since: float) -> list[dict[str, Any]]:
+def load_calls(log_path: Path, since: float) -> tuple[list[dict[str, Any]], int]:
     """Call rows in the window, with a usable start and duration.
 
     A row without both is not skipped quietly -- it is counted, because a
@@ -113,7 +113,7 @@ def load_calls(log_path: Path, since: float) -> list[dict[str, Any]]:
                 "exit_status": row.get("exit_status"),
             })
     calls.sort(key=lambda c: c["start"])
-    return calls, unusable  # type: ignore[return-value]
+    return calls, unusable
 
 
 def overlapping(calls: list[dict[str, Any]], starts: list[float], moment: float) -> list[dict[str, Any]]:
@@ -137,6 +137,7 @@ def overlapping(calls: list[dict[str, Any]], starts: list[float], moment: float)
 
 
 def report(repo: Path, log_path: Path, days: int) -> dict[str, Any]:
+    """Measure how many auto-checkpoint commits landed inside a wv call over the last `days` days."""
     clamped = min(days, MAX_WINDOW_DAYS)
     commits = checkpoint_commits(repo, days)
     if not commits:
@@ -201,6 +202,8 @@ def report(repo: Path, log_path: Path, days: int) -> dict[str, Any]:
         # exactly when it matters -- during a dense working session, when both
         # checkpoints and long operations are frequent.
         typical = statistics.median(intervals)
+    else:
+        typical = 0.0
     if intervals and typical > 0:
         summary["exposure"] = {
             "median_interval_seconds": int(typical),
@@ -219,15 +222,16 @@ def report(repo: Path, log_path: Path, days: int) -> dict[str, Any]:
             "median_interval_seconds": 0,
             "mean_interval_seconds": int(sum(intervals) / len(intervals)),
             "basis": "checkpoints share a timestamp; an interval-based rate is undefined",
-            "collision_probability": {},
+            "collision_probability": dict[str, float](),
         }
     summary["collisions"] = collisions
     return summary
 
 
 def render(summary: dict[str, Any]) -> str:
+    """Render a report() summary as the human-readable text block."""
     if not summary.get("checkpoints"):
-        return summary.get("note", "no checkpoints found")
+        return str(summary.get("note", "no checkpoints found"))
     lines = [
         f"auto-checkpoints in {summary['window_days']}d: {summary['checkpoints']}",
         f"  wv calls considered: {summary['calls_considered']}"
@@ -264,6 +268,7 @@ def render(summary: dict[str, Any]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse arguments, measure checkpoint overlap and print it as text or JSON."""
     parser = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
         epilog=(
@@ -279,8 +284,8 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--days", type=int, default=30,
-                        help="History window; clamped to %d days because git returns nothing for a\n"
-                             "window reaching before the epoch" % MAX_WINDOW_DAYS)
+                        help=f"History window; clamped to {MAX_WINDOW_DAYS} days because git returns nothing for a\n"
+                             "window reaching before the epoch")
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG,
                         help="WV_CALL_LOG JSONL; enable with: wv config enable session-analysis")
     parser.add_argument("--repo", type=Path, default=Path.cwd(),

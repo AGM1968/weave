@@ -13,6 +13,7 @@ export WV_CALL_SOURCE=test
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Colors
 RED='\033[0;31m'
@@ -57,6 +58,9 @@ setup_test_env() {
     "$WV" init >/dev/null 2>&1
 }
 
+# Assertions record a failure and return 0: under set -e a nonzero return
+# ended the suite at its first failed assertion, so every later result and
+# the summary went unreported (wv-75e31a). TESTS_FAILED decides the exit.
 assert_equals() {
     local expected="$1"
     local actual="$2"
@@ -73,7 +77,7 @@ assert_equals() {
         echo "  Expected: $expected"
         echo "  Actual:   $actual"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -93,7 +97,7 @@ assert_contains() {
         echo "  Expected to find: $needle"
         echo "  In: $haystack"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -195,7 +199,7 @@ test_cmd_done_invalidation() {
     assert_equals "1" "$before_count" "Blocked node has one blocker"
 
     # Complete blocker
-    "$WV" done "$blocker" --skip-verification >/dev/null 2>&1
+    "$WV" "done" "$blocker" --skip-verification >/dev/null 2>&1
 
     # Get context again - done blockers are filtered out by design
     # (see docs/WEAVE.md: "blockers (done nodes filtered out)")
@@ -252,7 +256,7 @@ test_cmd_prune_invalidation() {
     "$WV" block "$dep_node" --by="$old_node" >/dev/null 2>&1
 
     # Complete old node
-    "$WV" done "$old_node" --skip-verification >/dev/null 2>&1
+    "$WV" "done" "$old_node" --skip-verification >/dev/null 2>&1
 
     # Artificially age the node
     # Database is at $WV_HOT_ZONE/brain.db (tmpfs location)
@@ -706,7 +710,7 @@ test_impact_race_hook_is_gated_and_validated() {
     local seq_before seq_after rc
     seq_before=$(sqlite3 "$db" "$seq_q" 2>/dev/null)
     rc=0
-    WV_TEST_IMPACT_RACE=1 "$WV" impact "$src" --json >/dev/null 2>&1 || rc=$?
+    env -u WV_TEST_MODE WV_TEST_IMPACT_RACE=1 "$WV" impact "$src" --json >/dev/null 2>&1 || rc=$?
     seq_after=$(sqlite3 "$db" "$seq_q" 2>/dev/null)
     assert_equals "0" "$rc" "a valid race value without WV_TEST_MODE=1 does not fail the command"
     assert_equals "$seq_before" "$seq_after" "a valid race value without WV_TEST_MODE=1 mutates nothing"
@@ -840,7 +844,7 @@ test_done_gate_reads_post_edit_complexity() {
     "$WV" work "$blocked_node" >/dev/null 2>&1 || true
 
     local armed="not-armed"
-    "$WV" done "$blocked_node" --skip-verification >/dev/null 2>&1 || armed="armed"
+    "$WV" "done" "$blocked_node" --skip-verification >/dev/null 2>&1 || armed="armed"
     assert_equals "armed" "$armed" "the complexity gate blocks a close over committed high CC"
 
     # Same file, repaired, and deliberately NOT committed.
@@ -848,7 +852,7 @@ test_done_gate_reads_post_edit_complexity() {
     "$WV" quality scan >/dev/null 2>&1 || true
 
     local outcome="blocked"
-    if "$WV" done "$blocked_node" --skip-verification >/dev/null 2>&1; then
+    if "$WV" "done" "$blocked_node" --skip-verification >/dev/null 2>&1; then
         outcome="closed"
     fi
     assert_equals "closed" "$outcome" \
@@ -922,7 +926,7 @@ test_exempt_projection_survives_a_rebuilt_db() {
     printf '%s' "$real_sig" > "$WV_HOT_ZONE/.quality_conf_sig" 2>/dev/null || true
 
     local outcome="blocked"
-    if "$WV" done "$node" --skip-verification >/dev/null 2>&1; then
+    if "$WV" "done" "$node" --skip-verification >/dev/null 2>&1; then
         outcome="closed"
     fi
     assert_equals "closed" "$outcome" \
@@ -932,6 +936,151 @@ test_exempt_projection_survives_a_rebuilt_db() {
     restored=$(sqlite3 "$WV_HOT_ZONE/brain.db" \
         "SELECT COUNT(*) FROM quality_exempt;" 2>/dev/null || echo "0")
     assert_equals "1" "$restored" "the exemption was re-projected from the committed file"
+
+    cd "$PROJECT_ROOT" 2>/dev/null || true
+}
+
+# A git repository in the fresh test env, ready for quality scans.
+_quality_repo_setup() {
+    setup_test_env
+    git init -q . >/dev/null 2>&1 || true
+    git config user.email "test@test.com" || true
+    git config user.name "Test" || true
+    git config commit.gpgsign false || true
+    mkdir -p src
+}
+
+# Write a single function whose complexity is far above the Python ceiling.
+_write_high_cc() {
+    {
+        echo "def gate(a, b, c, d, e, f):"
+        for i in $(seq 1 30); do
+            echo "    if a and b or c and d or e and f: return $i"
+        done
+        echo "    return 0"
+    } > "$1"
+}
+
+_write_low_cc() {
+    printf 'def gate(a):\n    if a: return 1\n    return 0\n' > "$1"
+}
+
+# Add a node that tracks one file and claim it; prints the node id.
+_node_tracking() {
+    local node
+    node=$("$WV" add "$1" --standalone --criteria="c" --risks=low 2>/dev/null | tail -1)
+    sqlite3 "$WV_HOT_ZONE/brain.db" \
+        "INSERT OR REPLACE INTO node_files(node_id, path) VALUES('$node','$2');" \
+        >/dev/null 2>&1 || true
+    "$WV" work "$node" >/dev/null 2>&1 || true
+    printf '%s' "$node"
+}
+
+test_staleness_sees_the_working_tree() {
+    echo ""
+    echo "Test 15: scan staleness reports an uncommitted edit"
+    echo "==================================================="
+
+    # wv-fe9a6a. staleness_info compared only the scan's git_head with HEAD, so
+    # a scan taken before an uncommitted edit still reported stale:false -- the
+    # report claimed to describe code it had never read.
+    _quality_repo_setup
+    _write_low_cc src/sample.py
+    git add -A >/dev/null 2>&1 || true
+    git commit -qm "baseline" >/dev/null 2>&1 || true
+    "$WV" quality scan >/dev/null 2>&1 || true
+
+    # Baseline first: a report that always says stale would pass the next check.
+    local fresh
+    fresh=$("$WV" quality hotspots --json 2>/dev/null | jq -r '.stale' 2>/dev/null || echo "error")
+    assert_equals "false" "$fresh" "a scan of the current tree reports fresh"
+
+    _write_high_cc src/sample.py
+    local stale reason
+    stale=$("$WV" quality hotspots --json 2>/dev/null | jq -r '.stale' 2>/dev/null || echo "error")
+    reason=$("$WV" quality hotspots --json 2>/dev/null | jq -r '.staleness_reason // ""' 2>/dev/null || echo "error")
+    assert_equals "true" "$stale" "an uncommitted edit after the scan reports stale"
+    assert_equals "worktree_changed" "$reason" "the reason names the working tree, not HEAD"
+
+    cd "$PROJECT_ROOT" 2>/dev/null || true
+}
+
+test_untracked_same_second_edit_rescans() {
+    echo ""
+    echo "Test 16: an untracked edit with an unchanged mtime is rescanned"
+    echo "==============================================================="
+
+    # wv-fe9a6a. Untracked files had no blob SHA, so file_changed fell back to
+    # integer-second mtime: an edit landing in the same second as the scan (or
+    # any edit whose mtime is restored) was skipped and the old complexity kept.
+    # The mtime is pinned explicitly so the test does not depend on timing.
+    _quality_repo_setup
+    printf 'x = 1\n' > src/committed.py
+    git add -A >/dev/null 2>&1 || true
+    git commit -qm "baseline" >/dev/null 2>&1 || true
+
+    printf 'def sample(a):\n    if a: return 1\n    return 0\n' > src/new.py
+    "$WV" quality scan >/dev/null 2>&1 || true
+    local before
+    before=$("$WV" quality functions src/new.py 2>&1 | grep -oE 'CC=[0-9]+' | sed -n 1p || true)
+    assert_equals "CC=2" "$before" "baseline complexity of the untracked file is recorded"
+
+    local mtime
+    mtime=$(stat -c %Y src/new.py)
+    _write_high_cc src/new.py
+    touch -d "@$mtime" src/new.py
+    "$WV" quality scan >/dev/null 2>&1 || true
+    local after state="stale"
+    after=$("$WV" quality functions src/new.py 2>&1 | grep -oE 'CC=[0-9]+' | sed -n 1p || true)
+    [ -n "$after" ] && [ "$after" != "CC=2" ] && state="updated"
+    assert_equals "updated" "$state" "same-mtime content change is detected by hash"
+
+    cd "$PROJECT_ROOT" 2>/dev/null || true
+}
+
+test_done_gate_rescans_stale_files() {
+    echo ""
+    echo "Test 17: wv done rescans node files that changed since the scan"
+    echo "==============================================================="
+
+    # wv-fe9a6a. The gate took MAX(fn_cc) from the latest scan without asking
+    # whether that scan had read the file as it now is. Nothing rescans before
+    # wv done, so an edit after the last scan was judged by its old complexity in
+    # both directions, and a file created after the scan had no rows at all and
+    # read as CC 0. Each case below fails one way on the unfixed gate.
+    _quality_repo_setup
+    _write_low_cc src/worse.py
+    _write_high_cc src/better.py
+    git add -A >/dev/null 2>&1 || true
+    git commit -qm "baseline" >/dev/null 2>&1 || true
+    "$WV" quality scan >/dev/null 2>&1 || true
+
+    # Gate armed: an unedited high-CC file blocks, so a 'closed' below means the
+    # gate judged fresh data, not that it never fired.
+    local armed_node armed="not-armed"
+    armed_node=$(_node_tracking "armed" src/better.py)
+    "$WV" "done" "$armed_node" --skip-verification >/dev/null 2>&1 || armed="armed"
+    assert_equals "armed" "$armed" "the gate blocks a scanned high-CC file"
+
+    # No 'wv quality scan' after any of these edits.
+    _write_high_cc src/worse.py
+    _write_low_cc src/better.py
+    _write_high_cc src/fresh.py
+
+    local node outcome
+    node=$(_node_tracking "worse" src/worse.py)
+    outcome="closed"
+    "$WV" "done" "$node" --skip-verification >/dev/null 2>&1 || outcome="blocked"
+    assert_equals "blocked" "$outcome" "an unscanned regression is judged on its new complexity"
+
+    outcome="blocked"
+    "$WV" "done" "$armed_node" --skip-verification >/dev/null 2>&1 && outcome="closed"
+    assert_equals "closed" "$outcome" "an unscanned repair is judged on its new complexity"
+
+    node=$(_node_tracking "fresh" src/fresh.py)
+    outcome="closed"
+    "$WV" "done" "$node" --skip-verification >/dev/null 2>&1 || outcome="blocked"
+    assert_equals "blocked" "$outcome" "a file created after the scan is not read as CC 0"
 
     cd "$PROJECT_ROOT" 2>/dev/null || true
 }
@@ -962,6 +1111,9 @@ main() {
     test_uncommitted_edit_invalidates_function_rows
     test_done_gate_reads_post_edit_complexity
     test_exempt_projection_survives_a_rebuilt_db
+    test_staleness_sees_the_working_tree
+    test_untracked_same_second_edit_rescans
+    test_done_gate_rescans_stale_files
 
     # Summary
     echo ""

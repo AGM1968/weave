@@ -1,9 +1,11 @@
 #!/bin/bash
+# shellcheck disable=SC2016  # assert() evals its condition string, so every $ in it is meant to expand there, not here
 # Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
 export WV_CALL_SOURCE=test
 # test-multi-agent.sh — Integration tests for multi-agent delta merge (Sprint 1)
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -53,6 +55,9 @@ source "$REPO_ROOT/scripts/lib/wv-resolve-runtime.sh"
 date() {
     echo "1778349970123456789"
 }
+# The helper assigns by name; start both empty so a helper that sets nothing
+# fails the assertions below instead of reading a stale value.
+prefix_a="" prefix_b=""
 resolve_delta_filename_prefix prefix_a
 resolve_delta_filename_prefix prefix_b
 unset -f date

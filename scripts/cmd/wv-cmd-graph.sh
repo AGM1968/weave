@@ -36,8 +36,8 @@ cmd_block() {
 
     # Validate nodes exist
     local id_exists blocker_exists
-    id_exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';")
-    blocker_exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$blocker';")
+    id_exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$id';") || return 1
+    blocker_exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$blocker';") || return 1
     if [ "$id_exists" = "0" ]; then
         echo -e "${RED}Error: node $id not found${NC}" >&2
         return 1
@@ -56,7 +56,7 @@ cmd_block() {
 
     # Check for circular blocking (A blocks B, B blocks A)
     local reverse_exists
-    reverse_exists=$(db_query "SELECT COUNT(*) FROM edges WHERE source='$id' AND target='$blocker' AND type='blocks';")
+    reverse_exists=$(db_query "SELECT COUNT(*) FROM edges WHERE source='$id' AND target='$blocker' AND type='blocks';") || return 1
     if [ "$reverse_exists" != "0" ]; then
         wv_policy_verdict block_graph_acyclic deny yes "" "two nodes blocking each other can never become ready"
         echo -e "${RED}Error: circular block detected — $blocker is already blocked by $id${NC}" >&2
@@ -75,23 +75,29 @@ cmd_block() {
     # Auto-context: generate alias-based summary when no explicit context
     if [ "$context" = "{}" ]; then
         local src_label tgt_label
-        src_label=$(db_query "SELECT COALESCE(alias, substr(text,1,40)) FROM nodes WHERE id='$blocker';")
-        tgt_label=$(db_query "SELECT COALESCE(alias, substr(text,1,40)) FROM nodes WHERE id='$id';")
+        src_label=$(db_query "SELECT COALESCE(alias, substr(text,1,40)) FROM nodes WHERE id='$blocker';") || return 1
+        tgt_label=$(db_query "SELECT COALESCE(alias, substr(text,1,40)) FROM nodes WHERE id='$id';") || return 1
         context=$(jq -nc --arg s "$src_label" --arg t "$tgt_label" \
-            '{summary: ($s + " blocks " + $t), auto: true}')
+            '{summary: ($s + " blocks " + $t), auto: true}') || return 1
     fi
 
     local ctx_escaped="${context//\'/\'\'}"
 
+    # Dispatch runs in an OR-list: do not rely on implicit errexit. Both
+    # writes must commit together or the closed connection rolls them back.
+    local edge_sql
     if [ "$explicit_context" = "true" ]; then
-        db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
+        edge_sql="INSERT INTO edges (source, target, type, weight, context, created_at)
             VALUES ('$blocker', '$id', 'blocks', 1.0, '$ctx_escaped', CURRENT_TIMESTAMP)
             ON CONFLICT(source, target, type) DO UPDATE SET
                 context = excluded.context, created_at = CURRENT_TIMESTAMP;"
     else
-        db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$blocker', '$id', 'blocks', 1.0, '$ctx_escaped', CURRENT_TIMESTAMP);"
+        edge_sql="INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$blocker', '$id', 'blocks', 1.0, '$ctx_escaped', CURRENT_TIMESTAMP);"
     fi
-    db_query "UPDATE nodes SET status='blocked', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+    db_query "BEGIN IMMEDIATE;
+        $edge_sql
+        UPDATE nodes SET status='blocked', updated_at=CURRENT_TIMESTAMP WHERE id='$id';
+        COMMIT;" || return 1
 
     # Invalidate context cache for affected nodes
     invalidate_context_cache "$id" "$blocker"
@@ -165,14 +171,14 @@ cmd_link() {
 
     # Validate nodes exist
     local from_exists
-    from_exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$from';")
+    from_exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$from';") || return 1
     if [ "$from_exists" = "0" ]; then
         echo -e "${RED}Error: source node $from not found${NC}" >&2
         return 1
     fi
 
     local to_exists
-    to_exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$to';")
+    to_exists=$(db_query "SELECT COUNT(*) FROM nodes WHERE id='$to';") || return 1
     if [ "$to_exists" = "0" ]; then
         echo -e "${RED}Error: target node $to not found${NC}" >&2
         return 1
@@ -187,10 +193,10 @@ cmd_link() {
     # Auto-context: generate alias-based summary when no explicit context provided
     if [ "$context" = "{}" ]; then
         local src_label tgt_label
-        src_label=$(db_query "SELECT COALESCE(alias, substr(text,1,40)) FROM nodes WHERE id='$from';")
-        tgt_label=$(db_query "SELECT COALESCE(alias, substr(text,1,40)) FROM nodes WHERE id='$to';")
+        src_label=$(db_query "SELECT COALESCE(alias, substr(text,1,40)) FROM nodes WHERE id='$from';") || return 1
+        tgt_label=$(db_query "SELECT COALESCE(alias, substr(text,1,40)) FROM nodes WHERE id='$to';") || return 1
         context=$(jq -nc --arg s "$src_label" --arg t "$tgt_label" --arg e "$edge_type" \
-            '{summary: ($s + " " + $e + " " + $t), auto: true}')
+            '{summary: ($s + " " + $e + " " + $t), auto: true}') || return 1
     fi
 
     # Escape single quotes in context JSON for SQL
@@ -208,7 +214,7 @@ cmd_link() {
                 THEN edges.context
                 ELSE excluded.context
             END,
-            created_at = CURRENT_TIMESTAMP;"
+            created_at = CURRENT_TIMESTAMP;" || return 1
 
     # Invalidate context cache for affected  nodes
     invalidate_context_cache "$from" "$to"
@@ -256,13 +262,13 @@ cmd_unlink() {
 
     # Check edge exists
     local count
-    count=$(db_query "SELECT COUNT(*) FROM edges WHERE source='$from' AND target='$to' AND type='$edge_type';")
+    count=$(db_query "SELECT COUNT(*) FROM edges WHERE source='$from' AND target='$to' AND type='$edge_type';") || return 1
     if [ "$count" = "0" ]; then
         echo -e "${RED}Error: edge $from --[$edge_type]--> $to not found${NC}" >&2
         return 1
     fi
 
-    db_query "DELETE FROM edges WHERE source='$from' AND target='$to' AND type='$edge_type';"
+    db_query "DELETE FROM edges WHERE source='$from' AND target='$to' AND type='$edge_type';" || return 1
 
     # Evict context cache for both nodes
     invalidate_context_cache "$from" "$to"
@@ -1552,11 +1558,49 @@ cmd_tree() {
 # routing is unchanged, but each suite is emitted with "tier":"heavy" or
 # "light", and the pre-commit gate leaves heavy suites to the pre-push gate.
 # Reads .weave/test-times.json for estimated suite cost.
-# Outputs JSON: [{"name":"test-X.sh","last_cost_s":N,"tier":"light|heavy"}, ...]
+# Outputs JSON: [{"name":"test-X.sh","last_cost_s":N,"tier":"light|heavy",
+# "declared":true|false}, ...]. declared: a map row, pattern, [default] or
+# [scanners] entry selected it, so the suite is an obligation; false: only the
+# naming heuristic or a changed suite's own run did (wv-fb861c).
+# An [inputs] section ("suite = glob ...") is skipped here: it declares a
+# suite's complete input scope for result reuse, not a route (wv-f0bcc4).
+# With --routes first, prints the route table instead: one "<file>\t<suite>"
+# line per route, so a caller can invert it into each suite's inputs
+# (wv test-status --inputs, wv-cb4913). One router, two views.
+# _IMPACT_MAP_REVS (set by wv impact --map-rev=<rev>, repeatable) routes by
+# the map each named commit or tree holds in git instead of the working-tree
+# file, and unions the suites every map selects, so a transition keeps the
+# routes of both sides (F5, wv-fe8007). A suite is heavy only when every map
+# marks it heavy: a commit cannot move its own suite to the push tier.
 # ═══════════════════════════════════════════════════════════════════════════
 
+# _impact_map_at_rev <rev> — the .weave/test-map.conf blob <rev> holds:
+# prints "<blob id>" or "none" when the rev has no map; 1 when the rev or the
+# entry cannot be read, or the map is not a regular file. Never the working
+# tree, and never a link: a link's blob is a pathname, which parsed as a map
+# routed nothing (R4, wv-77b743).
+_impact_map_at_rev() {
+    local tree entry meta
+    [ -n "${REPO_ROOT:-}" ] || return 1
+    tree=$(git -C "$REPO_ROOT" rev-parse --verify --quiet "${1}^{tree}" 2>/dev/null) || return 1
+    entry=$(git -C "$REPO_ROOT" ls-tree --full-tree "$tree" -- .weave/test-map.conf 2>/dev/null) || return 1
+    if [ -z "$entry" ]; then echo none; return 0; fi
+    meta=${entry%%$'\t'*}
+    case "$meta" in
+        "100644 blob "* | "100755 blob "*) printf '%s\n' "${meta##* }" ;;
+        *)
+            echo "wv: .weave/test-map.conf at $1 is not a regular file (${meta%% *}); links are not followed" >&2
+            return 1 ;;
+    esac
+}
+
+# The revisions whose maps route (wv impact --map-rev); empty: the working tree.
+_IMPACT_MAP_REVS=()
+
 _impact_suites_for_files() {
-    if [ $# -eq 0 ]; then echo '[]'; return 0; fi
+    local _routes_only=false
+    if [ "${1:-}" = "--routes" ]; then _routes_only=true; shift; fi
+    if [ $# -eq 0 ]; then [ "$_routes_only" = true ] || echo '[]'; return 0; fi
 
     local map_conf="${WEAVE_DIR}/test-map.conf"
     local times_json="${WEAVE_DIR}/test-times.json"
@@ -1564,147 +1608,211 @@ _impact_suites_for_files() {
     local times_data='{}'
     [ -f "$times_json" ] && times_data=$(cat "$times_json" 2>/dev/null || echo '{}')
 
-    # Parse conf. Exact keys go in _fmap; pattern keys (containing glob
-    # metacharacters * ? [ , or ending in / for a directory prefix) are kept
-    # in insertion order in _pat_keys/_pat_vals so a consumer can map a whole
-    # subtree with one line (src/**/*.py = suite, or src/ = suite). A `* = suite`
-    # entry, or any suite tokens under a `[default]` section, become the
-    # fail-safe default applied when nothing else matches a file.
-    declare -A _fmap=()
-    local _pat_keys=() _pat_vals=()
-    local _default_suites=""
-    # [scanners] (wv-b21ca8): a suite that scans a whole tree, with the globs
-    # it scans. Additive: after a file resolves as usual, [default] included,
-    # every scanner whose scope matches it is added, so no row, heuristic or
-    # fail-safe changes. One registry, not a row per scanned file.
-    local _scan_suites=() _scan_scopes=()
-    declare -A _heavy=()
-    if [ -f "$map_conf" ]; then
-        local _in_default=false _in_scanners=false _in_heavy=false
-        while IFS= read -r line; do
-            # Strip leading whitespace; comments and blanks are noise
-            line="${line#"${line%%[![:space:]]*}"}"
-            [[ "$line" =~ ^# || -z "$line" ]] && continue
-            # Section headers toggle the [default] accumulator
-            if [[ "$line" =~ ^\[ ]]; then
-                _in_default=false; _in_scanners=false; _in_heavy=false
-                if [[ "$line" =~ ^\[default\] ]]; then _in_default=true; fi
-                if [[ "$line" =~ ^\[scanners\] ]]; then _in_scanners=true; fi
-                if [[ "$line" =~ ^\[heavy\] ]]; then _in_heavy=true; fi
-                continue
+    # The maps that route: the working-tree file, or each named revision's.
+    local -a _map_texts=() _map_labels=()
+    local _conf_text="" _conf_rc=0
+    if [ "${#_IMPACT_MAP_REVS[@]}" -gt 0 ]; then
+        local _rev _blob _blobs=" "
+        for _rev in "${_IMPACT_MAP_REVS[@]}"; do
+            if ! _blob=$(_impact_map_at_rev "$_rev"); then
+                echo "wv: cannot read .weave/test-map.conf at $_rev" >&2
+                return 1
             fi
-            if [ "$_in_heavy" = true ]; then
-                # Tier only: never a route, so a stray '=' line here is ignored
-                # rather than read as a mapping.
-                if [[ "$line" != *=* ]]; then
-                    local _h
-                    for _h in $line; do _heavy["$_h"]=1; done
-                fi
-                continue
+            # Two sides holding the same map route once.
+            case "$_blobs" in *" $_blob "*) continue ;; esac
+            _blobs+="$_blob "
+            _conf_text=""
+            if [ "$_blob" != none ]; then
+                _conf_text=$(git -C "$REPO_ROOT" cat-file blob "$_blob" 2>/dev/null) || {
+                    echo "wv: cannot read .weave/test-map.conf at $_rev" >&2
+                    return 1
+                }
             fi
-            if [[ "$line" != *=* ]]; then
-                # Bare suite tokens under [default]: treat as default suites
-                [ "$_in_default" = true ] && _default_suites="${_default_suites:+$_default_suites }$line"
-                continue
-            fi
-            local key="${line%%=*}"
-            local val="${line#*=}"
-            key="${key%"${key##*[![:space:]]}"}"  # rtrim key
-            key="${key#"${key%%[![:space:]]*}"}"  # ltrim key
-            val="${val#"${val%%[![:space:]]*}"}"  # ltrim val
-            if [ "$_in_scanners" = true ]; then
-                _scan_suites+=("$key"); _scan_scopes+=("$val")
-                continue
-            fi
-            if [ "$key" = "*" ]; then
-                _default_suites="${_default_suites:+$_default_suites }$val"
-            elif [[ "$key" == *[\*\?\[]* || "$key" == */ ]]; then
-                _pat_keys+=("$key"); _pat_vals+=("$val")
-            else
-                _fmap["$key"]="$val"
-            fi
-        done < "$map_conf"
+            _map_texts+=("$_conf_text"); _map_labels+=("$_rev:.weave/test-map.conf")
+        done
+    else
+        # A conf that exists but cannot be read is a failure, not an absent
+        # conf: the naming heuristic would route fewer suites than the conf
+        # says, and every gate would take that narrower set for the answer
+        # (wv-cf48a9). A dangling symlink, or a .weave/ that cannot be
+        # searched, is unavailable too, never absent (wv-b02828).
+        _conf_text=$(wv_config_read "$map_conf") || _conf_rc=$?
+        if [ "$_conf_rc" -ne 0 ] && [ "$_conf_rc" -ne 2 ]; then
+            echo "wv: cannot read $map_conf" >&2
+            return 1
+        fi
+        _map_texts+=("$_conf_text"); _map_labels+=("$map_conf")
     fi
 
-    # Collect matched suites (deduped). Exact and every matching glob/prefix
-    # entry are unioned, plus a changed test suite itself unless its own exact
-    # row says otherwise; only a file with no match uses the naming
-    # heuristic, then [default] as the fail-safe.
-    declare -A _seen=()
-    for f in "$@"; do
-        local suites=""
-        if [ -n "${_fmap[$f]+x}" ]; then
-            suites="${_fmap[$f]}"
-        fi
-        # Glob/prefix keys — union all matching patterns, including when an
-        # exact row exists. This is the monotonic routing invariant.
-        local _i
-        for _i in "${!_pat_keys[@]}"; do
-            local _pk="${_pat_keys[$_i]}"
-            if [[ "$_pk" == */ ]]; then
-                [[ "$f" == "$_pk"* ]] && suites="${suites:+$suites }${_pat_vals[$_i]}"
-            else
-                # unquoted RHS is intentional: glob-match the conf key
-                # shellcheck disable=SC2053
-                if [[ "$f" == $_pk ]]; then
-                    suites="${suites:+$suites }${_pat_vals[$_i]}"
+    declare -A _seen=() _heavy_maps=() _declared=()
+    local _mi _nmaps=${#_map_texts[@]}
+    for _mi in "${!_map_texts[@]}"; do
+        _conf_text=${_map_texts[$_mi]}
+        map_conf=${_map_labels[$_mi]}
+
+        # Parse conf. Exact keys go in _fmap; pattern keys (containing glob
+        # metacharacters * ? [ , or ending in / for a directory prefix) are kept
+        # in insertion order in _pat_keys/_pat_vals so a consumer can map a whole
+        # subtree with one line (src/**/*.py = suite, or src/ = suite). A `* = suite`
+        # entry, or any suite tokens under a `[default]` section, become the
+        # fail-safe default applied when nothing else matches a file.
+        declare -A _fmap=()
+        local _pat_keys=() _pat_vals=()
+        local _default_suites=""
+        # [scanners] (wv-b21ca8): a suite that scans a whole tree, with the globs
+        # it scans. Additive: after a file resolves as usual, [default] included,
+        # every scanner whose scope matches it is added, so no row, heuristic or
+        # fail-safe changes. One registry, not a row per scanned file.
+        local _scan_suites=() _scan_scopes=()
+        declare -A _heavy=()
+        if [ -n "$_conf_text" ]; then
+            local _in_default=false _in_scanners=false _in_heavy=false _in_inputs=false
+            while IFS= read -r line; do
+                # Strip leading whitespace; comments and blanks are noise
+                line="${line#"${line%%[![:space:]]*}"}"
+                [[ "$line" =~ ^# || -z "$line" ]] && continue
+                # Section headers toggle the [default] accumulator
+                if [[ "$line" =~ ^\[ ]]; then
+                    _in_default=false; _in_scanners=false; _in_heavy=false; _in_inputs=false
+                    if [[ "$line" =~ ^\[default\] ]]; then _in_default=true; fi
+                    if [[ "$line" =~ ^\[scanners\] ]]; then _in_scanners=true; fi
+                    if [[ "$line" =~ ^\[heavy\] ]]; then _in_heavy=true; fi
+                    if [[ "$line" =~ ^\[inputs\] ]]; then _in_inputs=true; fi
+                    continue
                 fi
+                # [inputs] declares a suite's complete input scope for result reuse
+                # (wv test-status --inputs, wv-f0bcc4). It is never a route.
+                [ "$_in_inputs" = true ] && continue
+                if [ "$_in_heavy" = true ]; then
+                    # Tier only: never a route, so a stray '=' line here is ignored
+                    # rather than read as a mapping.
+                    if [[ "$line" != *=* ]]; then
+                        local _h
+                        for _h in $line; do _heavy["$_h"]=1; done
+                    fi
+                    continue
+                fi
+                if [[ "$line" != *=* ]]; then
+                    # Bare suite tokens under [default]: treat as default suites
+                    [ "$_in_default" = true ] && _default_suites="${_default_suites:+$_default_suites }$line"
+                    continue
+                fi
+                local key="${line%%=*}"
+                local val="${line#*=}"
+                key="${key%"${key##*[![:space:]]}"}"  # rtrim key
+                key="${key#"${key%%[![:space:]]*}"}"  # ltrim key
+                val="${val#"${val%%[![:space:]]*}"}"  # ltrim val
+                if [ -z "$key" ]; then
+                    echo "wv: $map_conf: a mapping with no source path: $line" >&2
+                    return 1
+                fi
+                if [ "$_in_scanners" = true ]; then
+                    _scan_suites+=("$key"); _scan_scopes+=("$val")
+                    continue
+                fi
+                if [ "$key" = "*" ]; then
+                    _default_suites="${_default_suites:+$_default_suites }$val"
+                elif [[ "$key" == *[\*\?\[]* || "$key" == */ ]]; then
+                    _pat_keys+=("$key"); _pat_vals+=("$val")
+                else
+                    _fmap["$key"]="$val"
+                fi
+            done <<< "$_conf_text"
+        fi
+
+        # Collect matched suites (deduped). Exact and every matching glob/prefix
+        # entry are unioned, plus a changed test suite itself unless its own exact
+        # row says otherwise; only a file with no match uses the naming
+        # heuristic, then [default] as the fail-safe.
+        local _h
+        for _h in "${!_heavy[@]}"; do _heavy_maps["$_h"]=$(( ${_heavy_maps[$_h]:-0} + 1 )); done
+        for f in "$@"; do
+            # decl: what the map itself selects (rows, patterns, [default],
+            # [scanners]); the naming heuristic and a changed suite's own run
+            # are suggestions, not obligations (R3, wv-fb861c).
+            local suites="" decl=""
+            if [ -n "${_fmap[$f]+x}" ]; then
+                suites="${_fmap[$f]}"; decl="$suites"
             fi
-        done
-        # A changed suite runs itself. A broader glob or prefix row adds to
-        # that; only the suite's own exact row can redirect it, as for a suite
-        # another suite drives (wv-a8ab96).
-        if [[ "$f" == tests/test-*.sh && -z "${_fmap[$f]+x}" ]]; then
-            suites="${suites:+$suites }$f"
-        fi
-        if [ -z "$suites" ]; then
-            # Naming-convention heuristic (Weave's own layout)
-            case "$f" in
-                scripts/cmd/wv-cmd-*.sh)
-                    local base; base=$(basename "$f" .sh)
-                    suites="tests/test-${base#wv-cmd-}.sh" ;;
-                scripts/lib/*.sh | scripts/wv)
-                    suites="tests/test-hooks.sh tests/test-graph.sh" ;;
-                scripts/hooks/*)
-                    suites="tests/test-hooks.sh" ;;
-            esac
-        fi
-        # Fail safe: a configured [default] suite beats running nothing
-        [ -z "$suites" ] && suites="$_default_suites"
-        # Tree-wide scanners whose scope covers this file (wv-b21ca8)
-        local _si _scope _scopes
-        for _si in "${!_scan_suites[@]}"; do
-            # read -ra splits without pathname expansion: an unquoted
-            # $scopes would glob 'tests/*.sh' against the working directory
-            # and miss a file that does not exist yet.
-            read -ra _scopes <<< "${_scan_scopes[$_si]}"
-            for _scope in "${_scopes[@]}"; do
-                # unquoted RHS is intentional: glob-match the scope
-                # shellcheck disable=SC2053
-                if [[ "$f" == $_scope ]]; then
-                    suites="${suites:+$suites }${_scan_suites[$_si]}"
-                    break
+            # Glob/prefix keys — union all matching patterns, including when an
+            # exact row exists. This is the monotonic routing invariant.
+            local _i
+            for _i in "${!_pat_keys[@]}"; do
+                local _pk="${_pat_keys[$_i]}"
+                if [[ "$_pk" == */ ]]; then
+                    if [[ "$f" == "$_pk"* ]]; then
+                        suites="${suites:+$suites }${_pat_vals[$_i]}"; decl="${decl:+$decl }${_pat_vals[$_i]}"
+                    fi
+                else
+                    # unquoted RHS is intentional: glob-match the conf key
+                    # shellcheck disable=SC2053
+                    if [[ "$f" == $_pk ]]; then
+                        suites="${suites:+$suites }${_pat_vals[$_i]}"; decl="${decl:+$decl }${_pat_vals[$_i]}"
+                    fi
                 fi
             done
-        done
-        local s
-        for s in $suites; do
-            _seen["$s"]=1
+            # A changed suite runs itself. A broader glob or prefix row adds to
+            # that; only the suite's own exact row can redirect it, as for a suite
+            # another suite drives (wv-a8ab96).
+            if [[ "$f" == tests/test-*.sh && -z "${_fmap[$f]+x}" ]]; then
+                suites="${suites:+$suites }$f"
+            fi
+            if [ -z "$suites" ]; then
+                # Naming-convention heuristic (Weave's own layout)
+                case "$f" in
+                    scripts/cmd/wv-cmd-*.sh)
+                        local base; base=$(basename "$f" .sh)
+                        suites="tests/test-${base#wv-cmd-}.sh" ;;
+                    scripts/lib/*.sh | scripts/wv)
+                        suites="tests/test-hooks.sh tests/test-graph.sh" ;;
+                    scripts/hooks/*)
+                        suites="tests/test-hooks.sh" ;;
+                esac
+            fi
+            # Fail safe: a configured [default] suite beats running nothing
+            [ -z "$suites" ] && suites="$_default_suites" && decl="$_default_suites"
+            # Tree-wide scanners whose scope covers this file (wv-b21ca8)
+            local _si _scope _scopes
+            for _si in "${!_scan_suites[@]}"; do
+                # read -ra splits without pathname expansion: an unquoted
+                # $scopes would glob 'tests/*.sh' against the working directory
+                # and miss a file that does not exist yet.
+                read -ra _scopes <<< "${_scan_scopes[$_si]}"
+                for _scope in "${_scopes[@]}"; do
+                    # unquoted RHS is intentional: glob-match the scope
+                    # shellcheck disable=SC2053
+                    if [[ "$f" == $_scope ]]; then
+                        suites="${suites:+$suites }${_scan_suites[$_si]}"; decl="${decl:+$decl }${_scan_suites[$_si]}"
+                        break
+                    fi
+                done
+            done
+            local s
+            for s in $suites; do
+                [ "$_routes_only" = true ] && printf '%s\t%s\n' "$f" "$s"
+                _seen["$s"]=1
+            done
+            for s in $decl; do _declared["$s"]=1; done
         done
     done
+    [ "$_routes_only" = true ] && return 0
 
     # Emit JSON with cost. name = full suite path; cost lookup uses basename
     # (test-times.json is keyed by basename from serial-mode timing writes).
     local out='['
     local first=true
-    local suite
+    local suite suite_esc
     for suite in "${!_seen[@]}"; do
         local bname; bname=$(basename "$suite")
         local cost; cost=$(printf '%s' "$times_data" | jq -r --arg n "$bname" '.[$n] // 0' 2>/dev/null || echo 0)
-        local tier=light
-        [ -n "${_heavy[$suite]+x}" ] && tier=heavy
+        local tier=light declared=false
+        [ "${_heavy_maps[$suite]:-0}" -eq "$_nmaps" ] && tier=heavy
+        [ -n "${_declared[$suite]+x}" ] && declared=true
+        # Inside printf's arguments a failed escape would emit "name":"" with
+        # status 0, a suite no gate can run (wv-3e6d45, wv-cf48a9).
+        suite_esc=$(wv_json_escape "$suite") || return 1
         [ "$first" = "true" ] || out+=','
-        out+=$(printf '{"name":"%s","last_cost_s":%s,"tier":"%s"}' "$suite" "$cost" "$tier")
+        out+=$(printf '{"name":"%s","last_cost_s":%s,"tier":"%s","declared":%s}' "$suite_esc" "$cost" "$tier" "$declared")
         first=false
     done
     out+=']'
@@ -1816,6 +1924,9 @@ cmd_impact() {
             --quality)      include_quality=true ;;
             --files=*)
                 IFS=',' read -ra file_seeds <<< "${1#*=}" ;;
+            --map-rev=*)
+                [ -n "${1#*=}" ] || { echo -e "${RED}Error: --map-rev needs a revision${NC}" >&2; return 1; }
+                _IMPACT_MAP_REVS+=("${1#*=}") ;;
             -*)
                 echo -e "${RED}Error: unknown flag '$1'${NC}" >&2; return 1 ;;
             *)
@@ -1850,11 +1961,17 @@ cmd_impact() {
             # suites). Fall back to test-map.conf so suites still surface, and warn
             # that the graph blast radius is unknown — not zero.
             local _suites_json
-            _suites_json=$(_impact_suites_for_files "${file_seeds[@]}")
+            # A router failure is not "no suites affected" (wv-cf48a9).
+            _suites_json=$(_impact_suites_for_files "${file_seeds[@]}") || return 1
             if [ "$output_format" = "json" ]; then
-                printf '{"seeds":[],"impacted":[],"unblocked":[],"affected_suites":%s,"summary":{"total_impacted":0,"total_unblocked":0},"source":"files","graph_seed_matched":false,"files":[%s]}\n' \
-                    "$_suites_json" \
-                    "$(printf '"%s",' "${file_seeds[@]}" | sed 's/,$//')"
+                # jq builds the file list: a path holding a quote or backslash
+                # made printf's hand-built array invalid JSON. The suite list
+                # comes in on stdin, never argv, where a large payload hits
+                # E2BIG (test-commit-refs pins the rule).
+                printf '%s' "$_suites_json" | jq -c '{seeds: [], impacted: [], unblocked: [],
+                    affected_suites: ., summary: {total_impacted: 0, total_unblocked: 0},
+                    source: "files", graph_seed_matched: false, files: $ARGS.positional}' \
+                    --args "${file_seeds[@]}" || return 1
             else
                 # Distinguish "nothing records these files" from "only COMPLETED
                 # work records them". The second is common and the old message
@@ -2101,7 +2218,9 @@ cmd_impact() {
         fi
     done
     local suites_json='[]'
-    [ "${#_files[@]}" -gt 0 ] && suites_json=$(_impact_suites_for_files "${_files[@]}")
+    if [ "${#_files[@]}" -gt 0 ]; then
+        suites_json=$(_impact_suites_for_files "${_files[@]}") || return 1
+    fi
 
     # Summary
     local n_imp n_unbl n_suit total_s

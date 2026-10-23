@@ -6,6 +6,7 @@ export WV_CALL_SOURCE=test
 # Covers finding wv-e754b0 onboarding fixes.
 
 set -e
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -48,9 +49,15 @@ assert_eq() {
 # ── Isolated environment ────────────────────────────────────────────────────
 TEST_DIR=$(mktemp -d)
 TMPCFG=$(mktemp -d)
+export HOME="$TEST_DIR/home"
+mkdir -p "$HOME"
 export WV_CONFIG_DIR="$TMPCFG"
 export WV_HOT_ZONE="$TEST_DIR/hz"
 export WV_DB="$TEST_DIR/hz/brain.db"
+# `wv config enable session-analysis` writes this default into the fixture's
+# config.env. Left at its default it named the user's real log, and every call
+# after the enable appended to it (wv-6b0f57).
+export WV_CALL_LOG_DEFAULT="$TEST_DIR/wv_calls.jsonl"
 mkdir -p "$WV_HOT_ZONE"
 cleanup() { cd /tmp; rm -rf "$TEST_DIR" "$TMPCFG"; }
 trap cleanup EXIT
@@ -94,6 +101,22 @@ printf 'occupied\n' > "$bad_cfg"
 bad=$(WV_CONFIG_DIR="$bad_cfg" "$WV" config enable session-analysis 2>&1 || true)
 assert_contains "$bad" "cannot create config directory" "enable session-analysis reports config directory failure"
 assert_not_contains "$bad" "session-analysis enabled" "enable session-analysis does not report success after config failure"
+
+# Real filesystem refusals through the public CLI (also work when run as root).
+rc=0
+bad=$(WV_CONFIG_DIR="$bad_cfg" "$WV" config set WV_REFUSAL_TEST value 2>&1) || rc=$?
+assert_eq "1" "$rc" "set propagates config directory refusal"
+assert_not_contains "$bad" "effective next invocation" "refused set does not announce success"
+# /proc refuses regular temporary-file creation, including for root.
+before_config=$(cat "$TMPCFG/config.env")
+for operation in set unset; do
+    rc=0
+    bad=$(TMPDIR=/proc "$WV" config "$operation" WV_DELTA_RETAIN_DAYS 21 2>&1) || rc=$?
+    assert_eq "1" "$rc" "$operation propagates config temporary-file refusal"
+    assert_contains "$bad" "cannot create temporary config file" "$operation reaches temporary-file refusal"
+    assert_not_contains "$bad" "✓" "$operation refuses success announcement"
+    assert_eq "$before_config" "$(cat "$TMPCFG/config.env")" "$operation refusal preserves config bytes"
+done
 
 # ── verification gate (durable quality.conf [thresholds]) ───────────────────
 "$WV" config enable test-gate warn >/dev/null 2>&1

@@ -421,6 +421,42 @@ remove_retired_git_hook() {
     fi
 }
 
+# resolve_git_hook_dir <repo dir> — print the directory git runs this
+# repository's hooks from, or print why Weave will not install there and
+# return 1 (wv-76c726). Writing $REPO_ROOT/.git/hooks or git-dir/hooks missed
+# both cases git itself handles: in a linked worktree .git is a file and the
+# hooks live in the common dir, and core.hooksPath moves them elsewhere; the
+# install then returned 0 having installed nothing. core.hooksPath is reported,
+# not written to: it is usually a hook manager's tracked directory or a global
+# one every repository shares, neither of which is Weave's to change.
+resolve_git_hook_dir() {
+    local repo="$1" hooks hooks_path
+    hooks=$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null) && [ -n "$hooks" ] || {
+        echo "not a git repository: $repo"
+        return 1
+    }
+    hooks_path=$(git -C "$repo" config --get core.hooksPath 2>/dev/null || true)
+    if [ -n "$hooks_path" ]; then
+        echo "core.hooksPath is set ($hooks_path): git runs hooks only from there, which Weave does not write to. Call the Weave hooks from it, e.g. ${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks/pre-commit-weave.sh from its pre-commit"
+        return 1
+    fi
+    case "$hooks" in /*) ;; *) hooks="$(cd "$repo" && pwd -P)/$hooks" ;; esac
+    mkdir -p "$hooks" 2>/dev/null || { echo "cannot create $hooks"; return 1; }
+    printf '%s\n' "$hooks"
+}
+
+# set_hook_dir_or_report <repo dir> — set HOOK_DIR for install_git_hook_from_repo,
+# or say loudly that no Weave git hook is active and leave HOOK_DIR empty.
+set_hook_dir_or_report() {
+    local resolved
+    if resolved=$(resolve_git_hook_dir "$1"); then
+        HOOK_DIR="$resolved"
+    else
+        HOOK_DIR=""
+        echo -e "  ${YELLOW}⚠${NC} Weave git hooks NOT installed — no commit or push gate is active here: $resolved" >&2
+    fi
+}
+
 install_git_hook_from_repo() {
     local hook_path="$1"
     local marker="$2"
@@ -430,7 +466,8 @@ install_git_hook_from_repo() {
     hook_src_name=$(basename "$hook_path")
     [ -n "$hook_name" ] || hook_name="$hook_src_name"
 
-    if [ ! -d "$HOOK_DIR" ]; then
+    # set_hook_dir_or_report has already said why when HOOK_DIR is empty.
+    if [ -z "${HOOK_DIR:-}" ] || [ ! -d "$HOOK_DIR" ]; then
         return 0
     fi
 
@@ -442,10 +479,11 @@ install_git_hook_from_repo() {
         # mistaken for a custom user hook and skipped (left stale, the friction
         # wv doctor flagged with a manual `install -m 755 ...`). A genuinely
         # custom hook (no Weave signature) is still preserved.
-        if grep -qE -- "$marker|# Weave (pre-commit|post-commit|prepare-commit|pre-push)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
+        if grep -qE -- "$marker|# Weave (pre-commit|post-commit|prepare-commit|pre-push|reference-transaction)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
             action="updated"
         else
-            echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (custom hook exists, skipped)"
+            # Preserved, but say what that costs: this gate is not active.
+            echo -e "  ${YELLOW}⚠${NC} $hook_dst is a custom hook, kept as is — the Weave $hook_name gate is NOT active. Call ${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks/$hook_src_name from it to enable it." >&2
             return 0
         fi
     fi
@@ -550,14 +588,28 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-delta-v2-replay.py "$LIB_DIR/lib/wv-delta-v2-replay.py"
     install_file ./scripts/lib/wv-checkpoint-generation.sh "$LIB_DIR/lib/wv-checkpoint-generation.sh"
     install_file ./scripts/lib/wv-checkpoint-ci.sh "$LIB_DIR/lib/wv-checkpoint-ci.sh"
+    install_file ./scripts/lib/wv-shell-scope.sh "$LIB_DIR/lib/wv-shell-scope.sh"
+    install_file ./scripts/lib/wv-scratch.sh "$LIB_DIR/lib/wv-scratch.sh"
     install_file ./scripts/lib/wv-gate-pool.sh "$LIB_DIR/lib/wv-gate-pool.sh"
+    install_file ./scripts/lib/wv-gate-supervisor.py "$LIB_DIR/lib/wv-gate-supervisor.py"
+    install_file ./scripts/lib/wv-gate-suite.py "$LIB_DIR/lib/wv-gate-suite.py"
+    install_file ./scripts/lib/wv-gate-provision.json "$LIB_DIR/lib/wv-gate-provision.json"
+    install_file ./scripts/lib/wv-gate-paths.py "$LIB_DIR/lib/wv-gate-paths.py"
+    install_file ./scripts/lib/wv-gate-snapshot.sh "$LIB_DIR/lib/wv-gate-snapshot.sh"
+    install_file ./scripts/lib/wv-gate-lanes.sh "$LIB_DIR/lib/wv-gate-lanes.sh"
     install_file ./scripts/lib/wv-repository-class.sh "$LIB_DIR/lib/wv-repository-class.sh"
     install_file ./scripts/lib/wv-workflow-classes.gen.sh "$LIB_DIR/lib/wv-workflow-classes.gen.sh"
     install_file ./scripts/lib/wv-violation-vocabulary.gen.sh "$LIB_DIR/lib/wv-violation-vocabulary.gen.sh"
     install_file ./scripts/lib/wv-hook-common.sh "$LIB_DIR/lib/wv-hook-common.sh"
     install_file ./scripts/lib/wv-hook-observe.sh "$LIB_DIR/lib/wv-hook-observe.sh"
+    install_file ./scripts/lib/wv-pre-tool-use.sh "$LIB_DIR/lib/wv-pre-tool-use.sh"
+    install_file ./scripts/lib/wv-post-tool-use.sh "$LIB_DIR/lib/wv-post-tool-use.sh"
+    install_file ./scripts/lib/wv-attribution.sh "$LIB_DIR/lib/wv-attribution.sh"
+    install_file ./scripts/lib/wv-lifecycle-end.sh "$LIB_DIR/lib/wv-lifecycle-end.sh"
+    install_file ./scripts/lib/wv-session-start.sh "$LIB_DIR/lib/wv-session-start.sh"
     install_file ./scripts/lib/wv-resolve-project.sh "$LIB_DIR/lib/wv-resolve-project.sh"
     install_file ./scripts/lib/wv-resolve-runtime.sh "$LIB_DIR/lib/wv-resolve-runtime.sh"
+    install_file ./scripts/lib/wv-graph-diff.sh "$LIB_DIR/lib/wv-graph-diff.sh"
     install_file ./scripts/lib/VERSION "$LIB_DIR/lib/VERSION"
 
     # Install provenance. VERSION alone cannot answer "which fixes does this
@@ -668,6 +720,7 @@ if [ -f "./scripts/wv" ]; then
     rm -f "$LIB_DIR/hooks/post-commit-weave.sh" 2>/dev/null || true
     install_file ./scripts/hooks/prepare-commit-msg-weave.sh "$LIB_DIR/hooks/prepare-commit-msg-weave.sh"
     install_file ./scripts/hooks/pre-push-weave.sh "$LIB_DIR/hooks/pre-push-weave.sh"
+    install_file ./scripts/hooks/reference-transaction-weave.sh "$LIB_DIR/hooks/reference-transaction-weave.sh"
 
     # Refresh THIS repository's git hooks too, when installing from inside one.
     #
@@ -684,15 +737,17 @@ if [ -f "./scripts/wv" ]; then
     # signature is preserved and skipped, per the marker check in the function.
     # A sandboxed install (tests redirect HOME) leaves them alone: see
     # repo_hooks_refresh_allowed.
-    if repo_hooks_refresh_allowed && [ -d "$(git rev-parse --git-dir 2>/dev/null)/hooks" ] 2>/dev/null; then
-        HOOK_DIR="$(git rev-parse --git-dir 2>/dev/null)/hooks"
+    if repo_hooks_refresh_allowed && git rev-parse --git-dir >/dev/null 2>&1; then
+        set_hook_dir_or_report "$PWD"
         install_git_hook_from_repo ./scripts/hooks/pre-commit-weave.sh "Weave pre-commit" "pre-commit"
         remove_retired_git_hook "post-commit" "Weave post-commit"
         install_git_hook_from_repo ./scripts/hooks/prepare-commit-msg-weave.sh "Weave: append Weave-ID trailers" "prepare-commit-msg"
         install_git_hook_from_repo ./scripts/hooks/pre-push-weave.sh "Weave pre-push" "pre-push"
+        install_git_hook_from_repo ./scripts/hooks/reference-transaction-weave.sh "Weave reference-transaction" "reference-transaction"
     fi
     # Scripts
-    # context-guard.sh has one copy, the SessionStart hook under hooks/; the
+    # context-guard.sh has one copy, under hooks/ (an on-demand banner since
+    # wv-a523de folded its SessionStart line into wv hook dispatch); the
     # diverged scripts/ copy it replaced is dropped (wv-5cfbc1).
     rm -f "$CONFIG_DIR/context-guard.sh" 2>/dev/null || true
     cp ./scripts/resolve-refs.sh "$CONFIG_DIR/"
@@ -707,8 +762,14 @@ if [ -f "./scripts/wv" ]; then
     cp ./scripts/lib/wv-violation-vocabulary.gen.sh "$CONFIG_DIR/lib/wv-violation-vocabulary.gen.sh"
     cp ./scripts/lib/wv-hook-common.sh "$CONFIG_DIR/lib/wv-hook-common.sh"
     cp ./scripts/lib/wv-hook-observe.sh "$CONFIG_DIR/lib/wv-hook-observe.sh"
+    cp ./scripts/lib/wv-pre-tool-use.sh "$CONFIG_DIR/lib/wv-pre-tool-use.sh"
+    cp ./scripts/lib/wv-post-tool-use.sh "$CONFIG_DIR/lib/wv-post-tool-use.sh"
+    cp ./scripts/lib/wv-attribution.sh "$CONFIG_DIR/lib/wv-attribution.sh"
+    cp ./scripts/lib/wv-lifecycle-end.sh "$CONFIG_DIR/lib/wv-lifecycle-end.sh"
     cp ./scripts/lib/wv-policy-rules.sh "$CONFIG_DIR/lib/wv-policy-rules.sh"
     cp ./scripts/lib/wv-checkpoint-ci.sh "$CONFIG_DIR/lib/wv-checkpoint-ci.sh"
+    cp ./scripts/lib/wv-shell-scope.sh "$CONFIG_DIR/lib/wv-shell-scope.sh"
+    cp ./scripts/lib/wv-scratch.sh "$CONFIG_DIR/lib/wv-scratch.sh"
     cp ./scripts/lib/wv-repository-class.sh "$CONFIG_DIR/lib/wv-repository-class.sh"
     # Claude hooks (all 9 — registered globally via ~/.claude/settings.json under Alt-A)
     cp ./.claude/hooks/context-guard.sh "$CONFIG_DIR/hooks/"
@@ -779,14 +840,28 @@ else
     download_file "$REPO/scripts/lib/wv-delta-catalog.sh" "$LIB_DIR/lib/wv-delta-catalog.sh"
     download_file "$REPO/scripts/lib/wv-checkpoint-generation.sh" "$LIB_DIR/lib/wv-checkpoint-generation.sh"
     download_file "$REPO/scripts/lib/wv-checkpoint-ci.sh" "$LIB_DIR/lib/wv-checkpoint-ci.sh"
+    download_file "$REPO/scripts/lib/wv-shell-scope.sh" "$LIB_DIR/lib/wv-shell-scope.sh"
+    download_file "$REPO/scripts/lib/wv-scratch.sh" "$LIB_DIR/lib/wv-scratch.sh"
     download_file "$REPO/scripts/lib/wv-gate-pool.sh" "$LIB_DIR/lib/wv-gate-pool.sh"
+    download_file "$REPO/scripts/lib/wv-gate-supervisor.py" "$LIB_DIR/lib/wv-gate-supervisor.py"
+    download_file "$REPO/scripts/lib/wv-gate-suite.py" "$LIB_DIR/lib/wv-gate-suite.py"
+    download_file "$REPO/scripts/lib/wv-gate-provision.json" "$LIB_DIR/lib/wv-gate-provision.json"
+    download_file "$REPO/scripts/lib/wv-gate-paths.py" "$LIB_DIR/lib/wv-gate-paths.py"
+    download_file "$REPO/scripts/lib/wv-gate-snapshot.sh" "$LIB_DIR/lib/wv-gate-snapshot.sh"
+    download_file "$REPO/scripts/lib/wv-gate-lanes.sh" "$LIB_DIR/lib/wv-gate-lanes.sh"
     download_file "$REPO/scripts/lib/wv-repository-class.sh" "$LIB_DIR/lib/wv-repository-class.sh"
     download_file "$REPO/scripts/lib/wv-workflow-classes.gen.sh" "$LIB_DIR/lib/wv-workflow-classes.gen.sh"
     download_file "$REPO/scripts/lib/wv-violation-vocabulary.gen.sh" "$LIB_DIR/lib/wv-violation-vocabulary.gen.sh"
     download_file "$REPO/scripts/lib/wv-hook-common.sh" "$LIB_DIR/lib/wv-hook-common.sh"
     download_file "$REPO/scripts/lib/wv-hook-observe.sh" "$LIB_DIR/lib/wv-hook-observe.sh"
+    download_file "$REPO/scripts/lib/wv-pre-tool-use.sh" "$LIB_DIR/lib/wv-pre-tool-use.sh"
+    download_file "$REPO/scripts/lib/wv-post-tool-use.sh" "$LIB_DIR/lib/wv-post-tool-use.sh"
+    download_file "$REPO/scripts/lib/wv-attribution.sh" "$LIB_DIR/lib/wv-attribution.sh"
+    download_file "$REPO/scripts/lib/wv-lifecycle-end.sh" "$LIB_DIR/lib/wv-lifecycle-end.sh"
+    download_file "$REPO/scripts/lib/wv-session-start.sh" "$LIB_DIR/lib/wv-session-start.sh"
     download_file "$REPO/scripts/lib/wv-resolve-project.sh" "$LIB_DIR/lib/wv-resolve-project.sh"
     download_file "$REPO/scripts/lib/wv-resolve-runtime.sh" "$LIB_DIR/lib/wv-resolve-runtime.sh"
+    download_file "$REPO/scripts/lib/wv-graph-diff.sh" "$LIB_DIR/lib/wv-graph-diff.sh"
     download_file "$REPO/scripts/lib/VERSION" "$LIB_DIR/lib/VERSION"
     # A remote install has no source checkout, but it must still record WHAT it
     # installed -- otherwise doctor's "not recorded" warning can never be
@@ -819,6 +894,7 @@ else
     rm -f "$LIB_DIR/hooks/post-commit-weave.sh" 2>/dev/null || true   # retired (wv-56c823)
     download_file "$REPO/scripts/hooks/prepare-commit-msg-weave.sh" "$LIB_DIR/hooks/prepare-commit-msg-weave.sh"
     download_file "$REPO/scripts/hooks/pre-push-weave.sh" "$LIB_DIR/hooks/pre-push-weave.sh"
+    download_file "$REPO/scripts/hooks/reference-transaction-weave.sh" "$LIB_DIR/hooks/reference-transaction-weave.sh"
     # Python sync package (auto-discover modules from GitHub API)
     mkdir -p "$LIB_DIR/weave_gh"
     local py_modules
@@ -826,7 +902,7 @@ else
         | jq -r '.[] | select(.name | endswith(".py")) | .name' 2>/dev/null)
     if [ -z "$py_modules" ]; then
         # Fallback: hardcoded list if API is unavailable (rate-limited, offline)
-        py_modules="__init__.py models.py cli.py data.py rendering.py labels.py body.py phases.py notify.py __main__.py"
+        py_modules="__init__.py models.py cli.py data.py rendering.py labels.py body.py phases.py notify.py digest_cache.py repair_checkpoint.py __main__.py"
     fi
     for pyfile in $py_modules; do
         download_file "$REPO/scripts/weave_gh/${pyfile}" "$LIB_DIR/weave_gh/${pyfile}"
@@ -842,7 +918,7 @@ else
         # a module missing here installs a package that imports and then fails at
         # runtime, and this list had already drifted twice before that check
         # existed.
-        quality_modules="__init__.py __main__.py ast_cache.py bash_ast_grep.py bash_heuristic.py classification.py coaching_apply.py coaching_evidence.py db.py external_tools.py findings.py git_metrics.py guides.py hotspots.py models.py pattern_loader.py prose_rules.py prose_shape.py python_parser.py typescript_parser.py"
+        quality_modules="__init__.py __main__.py ast_cache.py bash_ast_grep.py bash_heuristic.py classification.py coaching_apply.py coaching_evidence.py db.py external_tools.py findings.py git_metrics.py guides.py hotspots.py listing.py models.py pattern_loader.py prose_rules.py prose_shape.py python_parser.py typescript_parser.py"
     fi
     for pyfile in $quality_modules; do
         download_file "$REPO/scripts/weave_quality/${pyfile}" "$LIB_DIR/weave_quality/${pyfile}"
@@ -870,7 +946,7 @@ else
     coaching_guides=$(curl -sSL "https://api.github.com/repos/AGM1968/weave/contents/scripts/weave_quality/guides?ref=main" \
         | jq -r '.[] | select(.name | endswith(".md")) | .name' 2>/dev/null)
     if [ -z "$coaching_guides" ]; then
-        coaching_guides="_clean.md _incomplete.md _uncoached.md register.md swallowed-exception.md swallowed-exception.python.md vacuous-verification.md rename-blind-listing.md live-db-file-operation.md"
+        coaching_guides="_clean.md _incomplete.md _uncoached.md register.md swallowed-exception.md swallowed-exception.python.md vacuous-verification.md rename-blind-listing.md live-db-file-operation.md unsafe-subprocess.md unquoted-expansion.md generated-vocabulary.md filler.md unearned-significance.md self-attested-virtue.md work-context-leakage.md punctuation-density.md malformed-markup.md citation-integrity.md metadata-formatting.md design-flaw.md"
     fi
     for guide_file in $coaching_guides; do
         download_file "$REPO/scripts/weave_quality/guides/${guide_file}" \
@@ -920,8 +996,14 @@ else
     curl -sSL "$REPO/scripts/lib/wv-workflow-classes.gen.sh" -o "$CONFIG_DIR/lib/wv-workflow-classes.gen.sh"
     curl -sSL "$REPO/scripts/lib/wv-hook-common.sh" -o "$CONFIG_DIR/lib/wv-hook-common.sh"
     curl -sSL "$REPO/scripts/lib/wv-hook-observe.sh" -o "$CONFIG_DIR/lib/wv-hook-observe.sh"
+    curl -sSL "$REPO/scripts/lib/wv-pre-tool-use.sh" -o "$CONFIG_DIR/lib/wv-pre-tool-use.sh"
+    curl -sSL "$REPO/scripts/lib/wv-post-tool-use.sh" -o "$CONFIG_DIR/lib/wv-post-tool-use.sh"
+    curl -sSL "$REPO/scripts/lib/wv-attribution.sh" -o "$CONFIG_DIR/lib/wv-attribution.sh"
+    curl -sSL "$REPO/scripts/lib/wv-lifecycle-end.sh" -o "$CONFIG_DIR/lib/wv-lifecycle-end.sh"
     curl -sSL "$REPO/scripts/lib/wv-policy-rules.sh" -o "$CONFIG_DIR/lib/wv-policy-rules.sh"
     curl -sSL "$REPO/scripts/lib/wv-checkpoint-ci.sh" -o "$CONFIG_DIR/lib/wv-checkpoint-ci.sh"
+    curl -sSL "$REPO/scripts/lib/wv-shell-scope.sh" -o "$CONFIG_DIR/lib/wv-shell-scope.sh"
+    curl -sSL "$REPO/scripts/lib/wv-scratch.sh" -o "$CONFIG_DIR/lib/wv-scratch.sh"
     curl -sSL "$REPO/scripts/lib/wv-repository-class.sh" -o "$CONFIG_DIR/lib/wv-repository-class.sh"
     # Claude hooks
     curl -sSL "$REPO/.claude/hooks/context-guard.sh" -o "$CONFIG_DIR/hooks/context-guard.sh"
@@ -1031,7 +1113,6 @@ merge_global_claude_settings() {
         --arg h "$hooks_dir" \
         '{
             "SessionStart": [{"matcher":"","hooks":[
-                {"type":"command","command":($h+"/context-guard.sh")},
                 {"type":"command","command":($h+"/session-start-context.sh")}
             ]}],
             "PreCompact": [{"matcher":"","hooks":[
@@ -1243,6 +1324,42 @@ remove_retired_git_hook() {
     fi
 }
 
+# resolve_git_hook_dir <repo dir> — print the directory git runs this
+# repository's hooks from, or print why Weave will not install there and
+# return 1 (wv-76c726). Writing $REPO_ROOT/.git/hooks or git-dir/hooks missed
+# both cases git itself handles: in a linked worktree .git is a file and the
+# hooks live in the common dir, and core.hooksPath moves them elsewhere; the
+# install then returned 0 having installed nothing. core.hooksPath is reported,
+# not written to: it is usually a hook manager's tracked directory or a global
+# one every repository shares, neither of which is Weave's to change.
+resolve_git_hook_dir() {
+    local repo="$1" hooks hooks_path
+    hooks=$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null) && [ -n "$hooks" ] || {
+        echo "not a git repository: $repo"
+        return 1
+    }
+    hooks_path=$(git -C "$repo" config --get core.hooksPath 2>/dev/null || true)
+    if [ -n "$hooks_path" ]; then
+        echo "core.hooksPath is set ($hooks_path): git runs hooks only from there, which Weave does not write to. Call the Weave hooks from it, e.g. ${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks/pre-commit-weave.sh from its pre-commit"
+        return 1
+    fi
+    case "$hooks" in /*) ;; *) hooks="$(cd "$repo" && pwd -P)/$hooks" ;; esac
+    mkdir -p "$hooks" 2>/dev/null || { echo "cannot create $hooks"; return 1; }
+    printf '%s\n' "$hooks"
+}
+
+# set_hook_dir_or_report <repo dir> — set HOOK_DIR for install_git_hook_from_repo,
+# or say loudly that no Weave git hook is active and leave HOOK_DIR empty.
+set_hook_dir_or_report() {
+    local resolved
+    if resolved=$(resolve_git_hook_dir "$1"); then
+        HOOK_DIR="$resolved"
+    else
+        HOOK_DIR=""
+        echo -e "  ${YELLOW}⚠${NC} Weave git hooks NOT installed — no commit or push gate is active here: $resolved" >&2
+    fi
+}
+
 install_git_hook_from_repo() {
     local hook_path="$1"
     local marker="$2"
@@ -1252,7 +1369,8 @@ install_git_hook_from_repo() {
     hook_src_name=$(basename "$hook_path")
     [ -n "$hook_name" ] || hook_name="$hook_src_name"
 
-    if [ ! -d "$HOOK_DIR" ]; then
+    # set_hook_dir_or_report has already said why when HOOK_DIR is empty.
+    if [ -z "${HOOK_DIR:-}" ] || [ ! -d "$HOOK_DIR" ]; then
         return 0
     fi
 
@@ -1264,10 +1382,11 @@ install_git_hook_from_repo() {
         # mistaken for a custom user hook and skipped (left stale, the friction
         # wv doctor flagged with a manual `install -m 755 ...`). A genuinely
         # custom hook (no Weave signature) is still preserved.
-        if grep -qE -- "$marker|# Weave (pre-commit|post-commit|prepare-commit|pre-push)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
+        if grep -qE -- "$marker|# Weave (pre-commit|post-commit|prepare-commit|pre-push|reference-transaction)|Weave: append Weave-ID|WV_SKIP_PRECOMMIT|wv-hook-common" "$hook_dst" 2>/dev/null; then
             action="updated"
         else
-            echo -e "  ${YELLOW}⊘${NC} .git/hooks/$hook_name (custom hook exists, skipped)"
+            # Preserved, but say what that costs: this gate is not active.
+            echo -e "  ${YELLOW}⚠${NC} $hook_dst is a custom hook, kept as is — the Weave $hook_name gate is NOT active. Call ${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks/$hook_src_name from it to enable it." >&2
             return 0
         fi
     fi
@@ -1534,7 +1653,9 @@ printf '\n%s\n' "$_WV_RUNTIME_PATH_NOTE"
 cat << 'RUNTIMECONTENTEOF'
 
 In sandbox agent shells (Codex/Copilot/Claude Code), Weave uses a persistent
-`/tmp/weave-codex-*` hot zone because `/dev/shm` is not stable across tool invocations.
+`/tmp/weave-hotzone-*` hot zone because `/dev/shm` is not stable across tool invocations.
+During the rename transition that name is an alias of the legacy `/tmp/weave-codex-*`
+directory, which stays the physical one; `wv doctor` reports which is physical.
 <!-- END WEAVE RUNTIME CONTENT -->
 RUNTIMECONTENTEOF
 }
@@ -1629,7 +1750,7 @@ fi
 # a hook was added (e.g. post-commit-weave.sh) installs the .git/hooks/ copy from
 # the LIB_DIR fallback but never gets the vendored source otherwise, leaving a
 # permanent source/installed asymmetry (wv-2adeef).
-_LIB_HOOKS="${LIB_DIR:-$HOME/.local/lib/weave}/hooks"
+_LIB_HOOKS="${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks"
 if [ -d "$REPO_ROOT/scripts/hooks" ] && [ -d "$_LIB_HOOKS" ]; then
     _updated_vendor=0
     # A vendored copy of a retired hook source goes too (wv-56c823), when it
@@ -1639,7 +1760,7 @@ if [ -d "$REPO_ROOT/scripts/hooks" ] && [ -d "$_LIB_HOOKS" ]; then
         rm -f "$REPO_ROOT/scripts/hooks/post-commit-weave.sh"
         echo -e "  ${GREEN}✓${NC} scripts/hooks/post-commit-weave.sh (retired, removed)"
     fi
-    for _hf in pre-commit-weave.sh prepare-commit-msg-weave.sh pre-push-weave.sh; do
+    for _hf in pre-commit-weave.sh prepare-commit-msg-weave.sh pre-push-weave.sh reference-transaction-weave.sh; do
         [ -f "$_LIB_HOOKS/$_hf" ] || continue
         if [ ! -f "$REPO_ROOT/scripts/hooks/$_hf" ]; then
             cp "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf"
@@ -1667,7 +1788,7 @@ fi
 # first leaves the executable one release behind whenever a consumer vendors a
 # stale source: the first pass copies that stale file into .git/hooks and only
 # then refreshes its source, so doctor requires a second update to converge.
-HOOK_DIR="$REPO_ROOT/.git/hooks"
+set_hook_dir_or_report "$REPO_ROOT"
 
 # Git hook: prepare-commit-msg (portable, awk-based)
 install_git_hook_from_repo "./scripts/hooks/prepare-commit-msg-weave.sh" "Weave: append Weave-ID trailers" "prepare-commit-msg"
@@ -1681,6 +1802,10 @@ remove_retired_git_hook "post-commit" "Weave post-commit"
 # Git hook: pre-push (the heavy tier of the commit gate, wv-862ac0; exits at
 # once in a repository whose test map has no [heavy] section)
 install_git_hook_from_repo "./scripts/hooks/pre-push-weave.sh" "Weave pre-push" "pre-push"
+
+# Git hook: reference-transaction (publishes only the tree the pre-commit gate
+# judged, wv-5f9d1c; passes every other ref update untouched)
+install_git_hook_from_repo "./scripts/hooks/reference-transaction-weave.sh" "Weave reference-transaction" "reference-transaction"
 
 # .gitattributes: merge strategy + diff suppression for Weave state files
 # Uses BEGIN/END markers (like Makefile template) for reliable idempotent updates
@@ -2277,20 +2402,53 @@ MCPEOF
         fi
     fi
 
-    # ── .github/hooks/ — VS Code native hook location (scaffold on init) ──
+    # ── .github/hooks/ — VS Code Local's native registrations (wv-971035) ──
     if [ ! -d "$REPO_ROOT/.github/hooks" ]; then
         mkdir -p "$REPO_ROOT/.github/hooks"
         cat > "$REPO_ROOT/.github/hooks/README.md" << 'GHHOOKSEOF'
 # VS Code Hooks
 
-This directory is the VS Code-native hook location (`chat.hookFilesLocations`).
-Place `*.json` hook configuration files here for team-shared VS Code hooks.
+`weave.json` registers the shared Weave guards for VS Code's **Local** harness.
+Review it with **Chat: Configure Hooks** in a trusted workspace. Local's
+`chat.useHooks` must be enabled. Run `wv init-repo --agent=copilot --update`
+to refresh this managed file; other JSON hook files are preserved.
 
-Global personal hooks live in `~/.claude/settings.json` and fire for all agents.
+These are native Local hooks, not Copilot Agent Host SDK registrations. Hook
+payloads, tool names and output decisions differ between harnesses. Inspect
+the Local agent debug logs to confirm the tools in use are classified by the
+shared guards; fixture parity does not prove that the live host fired a hook.
+
+Claude's personal hooks do not fire here by default. If `chat.useClaudeHooks`
+is enabled, avoid registering the same Weave guards twice.
+
+Reference: https://code.visualstudio.com/docs/agents/reference/hooks-reference
 GHHOOKSEOF
         echo -e "  ${GREEN}✓${NC} .github/hooks/ (VS Code hook directory scaffolded)"
+    fi
+    if [ ! -f "$REPO_ROOT/.github/hooks/weave.json" ] || [ "$UPDATE_MODE" = "1" ]; then
+        _vscode_hooks=$(cat <<'VSCODEHOOKSEOF'
+{
+  "hooks": {
+    "SessionStart": [{"type": "command", "command": "wv hook dispatch --event=SessionStart --format=vscode", "timeout": 30}],
+    "PreToolUse": [{"type": "command", "command": "wv hook dispatch --event=PreToolUse --format=vscode", "timeout": 30}],
+    "PostToolUse": [{"type": "command", "command": "wv hook dispatch --event=PostToolUse --format=vscode", "timeout": 30}],
+    "PreCompact": [{"type": "command", "command": "wv hook dispatch --event=PreCompact --format=vscode", "timeout": 30}],
+    "Stop": [{"type": "command", "command": "wv hook dispatch --event=Stop --format=vscode", "timeout": 30}]
+  }
+}
+VSCODEHOOKSEOF
+)
+        # Source checkouts must test their own CLI; consumer repos use PATH.
+        _vscode_wv=wv
+        if [ -x "$REPO_ROOT/scripts/wv" ] && [ -f "$REPO_ROOT/scripts/lib/wv-config.sh" ]; then
+            _vscode_wv='"$(git rev-parse --show-toplevel)/scripts/wv"'
+        fi
+        # shellcheck disable=SC2016  # $wv is a jq variable
+        jq --arg wv "$_vscode_wv" '.hooks[][] |= (.command |= sub("^wv "; $wv + " "))' \
+            <<<"$_vscode_hooks" > "$REPO_ROOT/.github/hooks/weave.json"
+        echo -e "  ${GREEN}✓${NC} .github/hooks/weave.json (VS Code Local hooks; review before use)"
     else
-        echo -e "  ${YELLOW}⊘${NC} .github/hooks/ (already exists)"
+        echo -e "  ${YELLOW}⊘${NC} .github/hooks/weave.json (already exists, use --update to refresh)"
     fi
 
     # ── copilot-instructions.md (marker-aware — preserves repo content outside markers) ──
@@ -2465,8 +2623,8 @@ if [ "$AGENT" = "codex" ]; then
     "fallback": "\$HOME/.local/bin/wv doctor --agent --json"
   },
   "runtime": {
-    "hot_zone": "codex",
-    "expected_prefix": "/tmp/weave-codex-\${uid}",
+    "hot_zone": "shared",
+    "expected_prefix": "/tmp/weave-hotzone-\${uid}",
     "prefer_repo_local_wv": true
   },
   "hooks": {
@@ -2542,7 +2700,7 @@ CODEXEOF
         "hooks": [
           {
             "type": "command",
-            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=SessionStart --json",
+            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=SessionStart --format=host",
             "timeout": 30,
             "statusMessage": "Loading Weave context"
           }
@@ -2555,7 +2713,7 @@ CODEXEOF
         "hooks": [
           {
             "type": "command",
-            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=PreToolUse --json",
+            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=PreToolUse --format=host",
             "timeout": 30,
             "statusMessage": "Checking Weave active node"
           }
@@ -2568,9 +2726,22 @@ CODEXEOF
         "hooks": [
           {
             "type": "command",
-            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=PostToolUse --json",
+            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=PostToolUse --format=host",
             "timeout": 30,
             "statusMessage": "Recording Weave edit context"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=PreCompact --format=host",
+            "timeout": 30,
+            "statusMessage": "Checkpointing Weave state"
           }
         ]
       }
@@ -2580,7 +2751,7 @@ CODEXEOF
         "hooks": [
           {
             "type": "command",
-            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=Stop --json",
+            "command": "\"$(git rev-parse --show-toplevel)/scripts/wv\" hook dispatch --event=Stop --format=host",
             "timeout": 30,
             "statusMessage": "Checking Weave close state"
           }
@@ -2713,6 +2884,13 @@ for _a in "${AGENTS[@]}"; do
         [ "$CODEX_HOOKS" != "1" ] || echo "  .codex/hooks.json — project lifecycle hooks (review/trust with /hooks)"
     fi
 done
+# Advisory only: ignored checkout paths cannot appear in a frozen suite tree.
+_gate_paths=""
+if _gate_paths=$(python3 -I "${REPO_CLASS_LIB%/*}/wv-gate-paths.py" "$REPO_ROOT" 2>&1); then
+    [ -z "$_gate_paths" ] || printf '  ⚠ gate ignored paths: %s\n' "$_gate_paths"
+else
+    printf '  ⚠ gate ignored paths: %s\n' "$_gate_paths"
+fi
 # Note whether code search index exists
 if [ -x "$(command -v wv 2>/dev/null)" ]; then
     _chunks_count=$(wv hotzone db 2>/dev/null | xargs -I{} sqlite3 {} "SELECT COUNT(*) FROM chunks" 2>/dev/null || echo "0")

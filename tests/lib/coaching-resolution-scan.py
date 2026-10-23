@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from weave_quality import guides  # noqa: E402
+from weave_quality import guides  # noqa: E402  # pylint: disable=wrong-import-position
 
 CATALOG = json.loads(Path("contracts/violation-vocabulary-v1.json").read_text(encoding="utf-8"))
 VIOLATION = "code:swallowed-exception"
@@ -154,7 +154,9 @@ def check() -> list[str]:
 
         # A malformed catalog is distinct from a well-formed catalog that does
         # not contain the requested type; neither may escape as a raw KeyError.
-        for malformed in ({}, {"types": []}, {"types": {VIOLATION: {}}}):
+        malformed_catalogs: tuple[dict[str, object], ...] = (
+            {}, {"types": []}, {"types": {VIOLATION: {}}})
+        for malformed in malformed_catalogs:
             try:
                 guides.resolve(VIOLATION, malformed, None, package_dir=package)
                 problems.append("a malformed catalog must be refused")

@@ -4,7 +4,7 @@ kind: regex
 violation_type: prose:unearned-significance
 severity: info
 provenance: >-
-  wv-efa6fb @nowcastr (2026-07-23 -- "stated directly in CDDIS's own
+  wv-efa6fb in a consumer graph (2026-07-23 -- "stated directly in CDDIS's own
   registration confirmation. This matters because RTKLIB's NTRIP client does
   not support HTTPS natively." merged into one clause in
   gnss_ppp_pipeline_scoping.md). Extended 2026-07-28 -- "the historical-

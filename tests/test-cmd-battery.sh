@@ -24,6 +24,7 @@ export WV_CALL_SOURCE=test
 # Weave-ID: wv-901b08
 
 set -e
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -132,7 +133,7 @@ sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'),
     WHERE id='$N_FIND';"
 "$WV" work "$N_APOS" >/dev/null 2>&1
 EXERCISED="$EXERCISED work"
-"$WV" done "$N_DONE" --learning="pattern: battery seed learning with O'Neil's apostrophe | pitfall: pipe" >/dev/null 2>&1
+"$WV" "done" "$N_DONE" --learning="pattern: battery seed learning with O'Neil's apostrophe | pitfall: pipe" >/dev/null 2>&1
 EXERCISED="$EXERCISED done"
 echo "  seeded: $N_PIPE $N_APOS $N_DONE $N_FIND"
 
@@ -179,7 +180,7 @@ battery W sync       sync
 battery W load       load
 # compact's active-agent guard correctly refuses while a node is claimed —
 # close the seeded active node so the dry-run exercises the normal path.
-"$WV" done "$N_APOS" --skip-verification >/dev/null 2>&1 || "$WV" done "$N_APOS" >/dev/null 2>&1
+"$WV" "done" "$N_APOS" --skip-verification >/dev/null 2>&1 || "$WV" "done" "$N_APOS" >/dev/null 2>&1
 battery R compact    compact --dry-run
 battery R prune      prune --dry-run
 battery R clean-ghosts clean-ghosts --dry-run
@@ -209,6 +210,48 @@ if grep -q "not inside a git repo" <<< "$hz_err"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo -e "  ${RED}✗${NC} hotzone list outside a repo is silent (no hint on stderr)"
+fi
+rm -rf "$NONREPO"
+
+# An existing global hot-zone parent used to hide an early-return omission.
+# Exercise both parent states privately, keeping diagnostics off JSON stdout.
+NONREPO=$(mktemp -d)
+mkdir "$NONREPO/outside"
+hz_env=(env -u WV_HOT_ZONE -u WV_DB -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE
+    "GIT_CEILING_DIRECTORIES=$NONREPO" WV_TEST_MODE=1 "WV_TEST_HOT_ZONE_ROOT=$NONREPO/root")
+hz_db=$( (cd "$NONREPO/outside" && "${hz_env[@]}" "$WV" hotzone db) )
+hz_parent=$(dirname "$(dirname "$hz_db")")
+for hz_state in missing existing; do
+    if [ "$hz_state" = existing ]; then
+        mkdir -p "$hz_parent"
+        chmod 700 "$hz_parent"
+    fi
+    for hz_format in text json; do
+        hz_args=(hotzone list)
+        if [ "$hz_format" = json ]; then hz_args+=(--json); fi
+        TESTS_RUN=$((TESTS_RUN + 1))
+        hz_rc=0
+        (cd "$NONREPO/outside" && "${hz_env[@]}" "$WV" "${hz_args[@]}") \
+            >"$NONREPO/out" 2>"$NONREPO/err" || hz_rc=$?
+        if [ "$hz_rc" -eq 0 ] && grep -q "not inside a git repo" "$NONREPO/err" \
+            && { [ "$hz_format" = text ] || jq -e 'type == "array"' "$NONREPO/out" >/dev/null; }; then
+            echo -e "  ${GREEN}✓${NC} hotzone $hz_format outside repo hints with $hz_state parent"
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+        else
+            echo -e "  ${RED}✗${NC} hotzone $hz_format outside repo lacks hint or valid output with $hz_state parent (rc=$hz_rc)"
+            cat "$NONREPO/err"
+        fi
+    done
+done
+TESTS_RUN=$((TESTS_RUN + 1))
+hz_rc=0
+"${hz_env[@]}" "$WV" hotzone list --json >"$NONREPO/out" 2>"$NONREPO/err" || hz_rc=$?
+if [ "$hz_rc" -eq 0 ] && ! grep -q "not inside a git repo" "$NONREPO/err" \
+    && jq -e 'type == "array"' "$NONREPO/out" >/dev/null; then
+    echo -e "  ${GREEN}✓${NC} hotzone inside repo keeps JSON valid without a non-repo hint"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "  ${RED}✗${NC} hotzone inside repo reports a false non-repo hint or invalid output"
 fi
 rm -rf "$NONREPO"
 battery R recover    recover

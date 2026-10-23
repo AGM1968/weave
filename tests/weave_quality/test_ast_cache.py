@@ -4,6 +4,8 @@
 
 import subprocess
 import time
+from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -37,19 +39,19 @@ def _make_fn_cc(path: str = "foo.py", scan_id: int = 1) -> list[FunctionCC]:
 
 
 @pytest.fixture()
-def cache(tmp_path):
+def cache(tmp_path: Path) -> Iterator[ASTCache]:
     c = ASTCache.open(tmp_path, scanner_version="1.0.0")
     yield c
     c.close()
 
 
-def test_miss_on_empty_cache(cache):
+def test_miss_on_empty_cache(cache: ASTCache) -> None:
     assert cache.get("abc123", "foo.py", 1, "production") is None
     assert cache.misses == 1
     assert cache.hits == 0
 
 
-def test_put_then_get_roundtrip(cache):
+def test_put_then_get_roundtrip(cache: ASTCache) -> None:
     entry = _make_entry()
     ck = _make_ck()
     fn_cc = _make_fn_cc()
@@ -76,7 +78,7 @@ def test_put_then_get_roundtrip(cache):
     assert cache.hits == 1
 
 
-def test_path_and_scan_id_injected_at_get(cache):
+def test_path_and_scan_id_injected_at_get(cache: ASTCache) -> None:
     entry = _make_entry(path="orig.py", scan_id=1)
     ck = _make_ck(path="orig.py", scan_id=1)
     fn_cc = _make_fn_cc(path="orig.py", scan_id=1)
@@ -95,7 +97,7 @@ def test_path_and_scan_id_injected_at_get(cache):
         assert fc.scan_id == 99
 
 
-def test_none_ck_roundtrips(cache):
+def test_none_ck_roundtrips(cache: ASTCache) -> None:
     entry = _make_entry()
     cache.put("sha003", entry, None, [])
     result = cache.get("sha003", "foo.py", 1, "production")
@@ -105,7 +107,7 @@ def test_none_ck_roundtrips(cache):
     assert got_fn_cc == []
 
 
-def test_scanner_version_isolation(tmp_path):
+def test_scanner_version_isolation(tmp_path: Path) -> None:
     c1 = ASTCache.open(tmp_path, scanner_version="1.0.0")
     c2 = ASTCache.open(tmp_path, scanner_version="2.0.0")
     entry = _make_entry()
@@ -120,13 +122,13 @@ def test_scanner_version_isolation(tmp_path):
     c2.close()
 
 
-def test_empty_blob_sha_is_noop(cache):
+def test_empty_blob_sha_is_noop(cache: ASTCache) -> None:
     entry = _make_entry()
     cache.put("", entry, None, [])
     assert cache.get("", "foo.py", 1, "production") is None
 
 
-def test_insert_or_replace(cache):
+def test_insert_or_replace(cache: ASTCache) -> None:
     entry_v1 = _make_entry()
     entry_v2 = FileEntry(
         path="foo.py", scan_id=1, language="python",
@@ -143,7 +145,7 @@ def test_insert_or_replace(cache):
     assert result[0].loc == 200
 
 
-def test_cache_persists_across_open(tmp_path):
+def test_cache_persists_across_open(tmp_path: Path) -> None:
     c = ASTCache.open(tmp_path, scanner_version="1.0.0")
     entry = _make_entry()
     c.put("sha006", entry, None, [])
@@ -156,7 +158,7 @@ def test_cache_persists_across_open(tmp_path):
     assert result[0].loc == 100
 
 
-def test_prune_removes_old_entries(tmp_path):
+def test_prune_removes_old_entries(tmp_path: Path) -> None:
     c = ASTCache.open(tmp_path, scanner_version="1.0.0")
     entry = _make_entry()
     c.put("sha_old", entry, None, [])
@@ -173,14 +175,14 @@ def test_prune_removes_old_entries(tmp_path):
     c.close()
 
 
-def test_open_falls_back_to_path_when_not_git(tmp_path):
+def test_open_falls_back_to_path_when_not_git(tmp_path: Path) -> None:
     # Not a git repo: cache lives at the given path's .weave/ (existing behavior).
     c = ASTCache.open(tmp_path, scanner_version="1.0.0")
     c.close()
     assert (tmp_path / ".weave" / "ast_cache.db").exists()
 
 
-def test_open_anchors_cache_at_git_toplevel(tmp_path):
+def test_open_anchors_cache_at_git_toplevel(tmp_path: Path) -> None:
     # Regression for wv-a94144: a subdir-scoped scan path must anchor the cache
     # at the git top-level, not drop a nested .weave/ in the subdir.
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)

@@ -1,13 +1,17 @@
 """Tests for weave_gh.phases — sync logic, reopen guards, and marker matching."""
+# pylint: disable=too-many-lines  # module size is a design limit (wv-237d25)
 
 from __future__ import annotations
 
 import json
 import subprocess
 from contextlib import contextmanager
-from typing import Any, Generator
+from typing import Any, Callable, Generator, ParamSpec, TypeVar, overload
 from unittest.mock import patch
 
+import pytest
+
+from weave_gh import phases
 from weave_gh.models import GitHubIssue, Mode, SyncStats, WeaveNode
 from weave_gh.models import Edge
 from weave_gh.phases import (
@@ -18,6 +22,7 @@ from weave_gh.phases import (
     _handle_new_issue,
     _invalid_assignees,
     _is_valid_assignee,
+    _run,
     _sync_assignee,
     _was_closed_by_weave,
     _WEAVE_CLOSE_MARKER,
@@ -27,11 +32,49 @@ from weave_gh.phases import (
     sync_github_to_weave,
     sync_weave_to_github,
 )
+from weave_gh.data import NodeFetchError
+from weave_gh.data import get_github_issues
+from weave_gh.digest_cache import compute_structural_digest
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+_T = TypeVar("_T")
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+_A = TypeVar("_A")
+_B = TypeVar("_B")
+
+
+def _callback(_contract: Callable[_P, object], callback: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Give a fake the real callee's parameter contract without wrapping it."""
+    return callback
+
+
+@overload
+def _positional_callback(
+    _contract: Callable[[_A], object], callback: Callable[[_A], _R]
+) -> Callable[[_A], _R]: ...
+
+
+@overload
+def _positional_callback(
+    _contract: Callable[[_A, _B], object], callback: Callable[[_A, _B], _R]
+) -> Callable[[_A, _B], _R]: ...
+
+
+def _positional_callback(_contract: object, callback: _T) -> _T:
+    """Context for positional-only fakes, whose parameter names intentionally differ."""
+    return callback
+
+
+def _logged(log: list[Any], entry: object, result: _T) -> _T:
+    """Record entry in log and return result: the side effect a stub lambda needs."""
+    log.append(entry)
+    return result
+
 
 
 def _node(
@@ -113,15 +156,15 @@ class TestReopenGuard:
     def _with_patches(self, **overrides: Any) -> Any:
         """Return a patch.multiple context with sensible defaults, overridable per-test."""
         base: dict[str, Any] = {
-            "get_edges_for_node": lambda _: [],
-            "render_issue_body": lambda *_a, **_k: "",
-            "should_update_body": lambda *_a: False,
-            "get_labels_for_node": lambda _: [],
-            "sync_issue_labels": lambda *_a, **_k: None,
-            "gh_cli": lambda *_a, **_k: "",
-            "build_close_comment": lambda *_a, **_k: "close",
-            "_backfill_gh_issue": lambda *_a, **_k: None,
-            "_was_closed_by_weave": lambda *_a: False,
+            "get_edges_for_node": _positional_callback(phases.get_edges_for_node, lambda _: []),
+            "render_issue_body": _callback(phases.render_issue_body, lambda *_a, **_k: ""),
+            "should_update_body": _positional_callback(phases.should_update_body, lambda *_a: False),
+            "get_labels_for_node": _positional_callback(phases.get_labels_for_node, lambda _: []),
+            "sync_issue_labels": _callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            "gh_cli": _callback(phases.gh_cli, lambda *_a, **_k: ""),
+            "build_close_comment": _callback(phases.build_close_comment, lambda *_a, **_k: "close"),
+            "_backfill_gh_issue": _callback(_backfill_gh_issue, lambda *_a, **_k: None),
+            "_was_closed_by_weave": _positional_callback(_was_closed_by_weave, lambda *_a: False),
         }
         base.update(overrides)
         return patch.multiple("weave_gh.phases", **base)
@@ -137,7 +180,7 @@ class TestReopenGuard:
         issues_by_num = {issue.number: issue}
         nodes_by_id = {node.id: node}
         with self._with_patches(
-            _was_closed_by_weave=lambda *_a: was_closed_by_weave,
+            _was_closed_by_weave=_positional_callback(_was_closed_by_weave, lambda *_a: was_closed_by_weave),
         ):
             _handle_existing_issue(
                 node,
@@ -269,11 +312,14 @@ class TestReopenGuard:
 
         with self._with_patches(
             render_issue_body=(
-                lambda *_a, **_k: "<!-- WEAVE:BEGIN hash=abc123 -->\nnew\n<!-- WEAVE:END -->"
+                _callback(
+                    phases.render_issue_body,
+                    lambda *_a, **_k: "<!-- WEAVE:BEGIN hash=abc123 -->\nnew\n<!-- WEAVE:END -->",
+                )
             ),
-            should_update_body=lambda *_a: True,  # body changed
-            extract_human_content=lambda _: "",
-            compose_issue_body=lambda h, w: w,
+            should_update_body=_positional_callback(phases.should_update_body, lambda *_a: True),  # body changed
+            extract_human_content=_positional_callback(phases.extract_human_content, lambda _: ""),
+            compose_issue_body=_positional_callback(phases.compose_issue_body, lambda h, w: w),
             gh_cli=mock_gh_cli,
         ):
             _handle_existing_issue(
@@ -304,15 +350,15 @@ class TestReopenGuard:
 
         with patch.multiple(
             "weave_gh.phases",
-            get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *_a, **_k: "",
-            should_update_body=lambda *_a: False,
-            get_labels_for_node=lambda _: [],
-            sync_issue_labels=lambda *_a, **_k: None,
-            gh_cli=lambda *_a, **_k: "",
-            build_close_comment=lambda *_a, **_k: "close",
-            _backfill_gh_issue=lambda *_a, **_k: None,
-            _was_closed_by_weave=lambda *_a: False,
+            get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _: []),
+            render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: ""),
+            should_update_body=_positional_callback(phases.should_update_body, lambda *_a: False),
+            get_labels_for_node=_positional_callback(phases.get_labels_for_node, lambda _: []),
+            sync_issue_labels=_callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            gh_cli=_callback(phases.gh_cli, lambda *_a, **_k: ""),
+            build_close_comment=_callback(phases.build_close_comment, lambda *_a, **_k: "close"),
+            _backfill_gh_issue=_callback(_backfill_gh_issue, lambda *_a, **_k: None),
+            _was_closed_by_weave=_positional_callback(_was_closed_by_weave, lambda *_a: False),
         ):
             _handle_existing_issue(
                 node,
@@ -433,6 +479,21 @@ class TestRefreshParentBody:
         ), patch("weave_gh.phases.get_repo", return_value="owner/repo"):
             yield
 
+    def test_failed_node_fetch_skips_refresh(self) -> None:
+        """A failed wv list skips the best-effort refresh instead of raising."""
+
+        gh_calls: list[tuple[object, ...]] = []
+        with patch.multiple(
+            "weave_gh.phases",
+            get_parent=_positional_callback(phases.get_parent, lambda _c: "wv-epic"),
+            gh_cli=_callback(phases.gh_cli, lambda *a, **_k: _logged(gh_calls, a, "")),
+        ), patch(
+            "weave_gh.data.get_weave_nodes",
+            side_effect=NodeFetchError("wv list failed"),
+        ):
+            assert refresh_parent_body("wv-task") is False
+        assert gh_calls == []
+
     def test_updates_parent_body_when_hash_changed(self) -> None:
         """Should update parent GH issue when child status changes content hash."""
         parent = _node("wv-epic", text="Epic task", status="active", gh_issue=100)
@@ -450,11 +511,11 @@ class TestRefreshParentBody:
 
         with self._with_repo(
             [parent, child],
-            get_parent=lambda _child_id: "wv-epic",
-            get_edges_for_node=lambda _nid: [edge],
-            render_issue_body=lambda *_a, **_k: (
+            get_parent=_positional_callback(phases.get_parent, lambda _child_id: "wv-epic"),
+            get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _nid: [edge]),
+            render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: (
                 "<!-- WEAVE:BEGIN hash=ccdd44556677 -->\nnew\n<!-- WEAVE:END -->"
-            ),
+            )),
             gh_cli=mock_gh_cli,
         ):
             result = refresh_parent_body("wv-task")
@@ -489,10 +550,10 @@ class TestRefreshParentBody:
 
         with self._with_repo(
             [parent],
-            get_parent=lambda _: "wv-epic",
-            get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *_a, **_k: body,
-            gh_cli=lambda *_a, **_kw: body,
+            get_parent=_positional_callback(phases.get_parent, lambda _: "wv-epic"),
+            get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _: []),
+            render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: body),
+            gh_cli=_callback(phases.gh_cli, lambda *_a, **_kw: body),
         ):
             assert refresh_parent_body("wv-task") is False
 
@@ -511,11 +572,11 @@ class TestRefreshParentBody:
 
         with self._with_repo(
             [parent, child],
-            get_parent=lambda _: "wv-epic",
-            get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *_a, **_k: (
+            get_parent=_positional_callback(phases.get_parent, lambda _: "wv-epic"),
+            get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _: []),
+            render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: (
                 "<!-- WEAVE:BEGIN hash=bb0099887766 -->\nnew\n<!-- WEAVE:END -->"
-            ),
+            )),
             gh_cli=mock_gh_cli,
         ):
             result = refresh_parent_body("wv-task", dry_run=True)
@@ -535,10 +596,13 @@ class TestSyncAssignee:
 
     def _ok_run(self, cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
         """Stub _run that always succeeds."""
+        del check  # success never raises
         return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
 
     def _fail_run(self, cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-        """Stub _run that always fails."""
+        """Stub _run that always fails; raises under check=True, as the real _run does."""
+        if check:
+            raise subprocess.CalledProcessError(1, cmd, "", "Not a collaborator")
         return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="Not a collaborator")
 
     def test_noop_when_unchanged(self) -> None:
@@ -546,9 +610,9 @@ class TestSyncAssignee:
         _invalid_assignees.discard("alice")
         calls: list[list[str]] = []
 
-        def _capture_ok(cmd: list[str], **_k: object) -> subprocess.CompletedProcess[str]:
+        def _capture_ok(cmd: list[str], **_k: bool) -> subprocess.CompletedProcess[str]:
             calls.append(cmd)
-            return self._ok_run(cmd)
+            return self._ok_run(cmd, **_k)
 
         with patch("weave_gh.phases._run", side_effect=_capture_ok):
             changed = _sync_assignee(1, "alice", ["alice"], "owner/repo")
@@ -560,9 +624,9 @@ class TestSyncAssignee:
         _invalid_assignees.discard("alice")
         calls: list[list[str]] = []
 
-        def _capture_ok(cmd: list[str], **_k: object) -> subprocess.CompletedProcess[str]:
+        def _capture_ok(cmd: list[str], **_k: bool) -> subprocess.CompletedProcess[str]:
             calls.append(cmd)
-            return self._ok_run(cmd)
+            return self._ok_run(cmd, **_k)
 
         with patch("weave_gh.phases._run", side_effect=_capture_ok):
             changed = _sync_assignee(1, "alice", [], "owner/repo")
@@ -575,9 +639,9 @@ class TestSyncAssignee:
         _invalid_assignees.discard("ghost")
         calls: list[list[str]] = []
 
-        def _capture_fail(cmd: list[str], **_k: object) -> subprocess.CompletedProcess[str]:
+        def _capture_fail(cmd: list[str], **_k: bool) -> subprocess.CompletedProcess[str]:
             calls.append(cmd)
-            return self._fail_run(cmd)
+            return self._fail_run(cmd, **_k)
 
         with patch("weave_gh.phases._run", side_effect=_capture_fail):
             changed = _sync_assignee(1, "ghost", [], "owner/repo")
@@ -595,8 +659,8 @@ class TestSyncAssignee:
             call_count += 1
             # First call: _is_valid_assignee succeeds; second call: edit fails
             if call_count == 1:
-                return self._ok_run(cmd)
-            return self._fail_run(cmd)
+                return self._ok_run(cmd, check=check)
+            return self._fail_run(cmd, check=check)
 
         with patch("weave_gh.phases._run", side_effect=_side_effect):
             changed = _sync_assignee(1, "alice", [], "owner/repo")
@@ -606,9 +670,9 @@ class TestSyncAssignee:
         """Should call gh issue edit --remove-assignee when desired is None."""
         calls: list[list[str]] = []
 
-        def _capture_ok(cmd: list[str], **_k: object) -> subprocess.CompletedProcess[str]:
+        def _capture_ok(cmd: list[str], **_k: bool) -> subprocess.CompletedProcess[str]:
             calls.append(cmd)
-            return self._ok_run(cmd)
+            return self._ok_run(cmd, **_k)
 
         with patch("weave_gh.phases._run", side_effect=_capture_ok):
             changed = _sync_assignee(1, None, ["alice"], "owner/repo")
@@ -617,7 +681,7 @@ class TestSyncAssignee:
 
     def test_remove_assignee_fails(self) -> None:
         """Should return False when remove-assignee call fails."""
-        with patch("weave_gh.phases._run", side_effect=lambda cmd, **_k: self._fail_run(cmd)):
+        with patch("weave_gh.phases._run", side_effect=self._fail_run):
             changed = _sync_assignee(1, None, ["alice"], "owner/repo")
         assert changed is False
 
@@ -625,9 +689,9 @@ class TestSyncAssignee:
         """Dry run should return True but not call _run."""
         calls: list[list[str]] = []
 
-        def _capture_ok(cmd: list[str], **_k: object) -> subprocess.CompletedProcess[str]:
+        def _capture_ok(cmd: list[str], **_k: bool) -> subprocess.CompletedProcess[str]:
             calls.append(cmd)
-            return self._ok_run(cmd)
+            return self._ok_run(cmd, **_k)
 
         with patch("weave_gh.phases._run", side_effect=_capture_ok):
             changed = _sync_assignee(1, "alice", [], "owner/repo", dry_run=True)
@@ -658,7 +722,7 @@ class TestIsValidAssignee:
         """Second call for a known-invalid user skips the API call."""
         _invalid_assignees.add("cached-bad")
         calls: list[object] = []
-        with patch("weave_gh.phases._run", side_effect=lambda *a, **k: calls.append(a)):
+        with patch("weave_gh.phases._run", side_effect=_callback(_run, lambda *a, **k: calls.append(a))):
             result = _is_valid_assignee("cached-bad", "owner/repo")
         assert result is False
         assert not calls
@@ -792,15 +856,15 @@ class TestHandleNewIssueBlockedStatus:
         gh_calls: list[str] = created_gh_issues if created_gh_issues is not None else []
         with patch.multiple(
             "weave_gh.phases",
-            get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *_a, **_k: "",
-            get_labels_for_node=lambda _: [],
-            sync_issue_labels=lambda *_a, **_k: None,
-            _backfill_gh_issue=lambda *_a, **_k: None,
-            gh_cli=lambda *_a, **_k: (
-                gh_calls.append("create"),  # type: ignore[func-returns-value]
-                "https://github.com/owner/repo/issues/999",
-            )[1],
+            get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _: []),
+            render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: ""),
+            get_labels_for_node=_positional_callback(phases.get_labels_for_node, lambda _: []),
+            sync_issue_labels=_callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            _backfill_gh_issue=_callback(_backfill_gh_issue, lambda *_a, **_k: None),
+            gh_cli=_callback(
+                phases.gh_cli,
+                lambda *_a, **_k: _logged(gh_calls, "create", "https://github.com/owner/repo/issues/999"),
+            ),
         ):
             _handle_new_issue(
                 node,
@@ -821,6 +885,17 @@ class TestHandleNewIssueBlockedStatus:
         calls: list[str] = []
 
         self._call(node, stats, created_gh_issues=calls)
+
+        assert stats.skipped == 0
+        assert stats.created_gh == 1
+
+    def test_blocked_external_node_creates_gh_issue(self) -> None:
+        """wv-e869e3: blocked-external is a CLI status (VALID_STATUSES) but the
+        creation path listed only four statuses and skipped it silently."""
+        node = _node("wv-b1e7", status="blocked-external")
+        stats = SyncStats()
+
+        self._call(node, stats)
 
         assert stats.skipped == 0
         assert stats.created_gh == 1
@@ -885,7 +960,7 @@ class TestBackfillGhIssue:
 
     def test_backfill_updates_in_memory(self) -> None:
         """Successful backfill updates node.metadata['gh_issue'] in-memory."""
-        node = _node("wv-new2")
+        node = _node("wv-bee2")
         with patch("weave_gh.phases._run"), patch(
             "weave_gh.phases._resolve_db_path", return_value="/tmp/test.db"
         ):
@@ -894,12 +969,24 @@ class TestBackfillGhIssue:
 
     def test_backfill_no_all_nodes(self) -> None:
         """When all_nodes is None, dedup guard is skipped and backfill proceeds."""
-        node = _node("wv-new3")
+        node = _node("wv-bee3")
         with patch("weave_gh.phases._run"), patch(
             "weave_gh.phases._resolve_db_path", return_value="/tmp/test.db"
         ):
             _backfill_gh_issue(node, 55, all_nodes=None)
         assert node.metadata["gh_issue"] == 55
+
+    @pytest.mark.parametrize("node_id", ["wv-new3", "x'; DROP TABLE nodes; --"])
+    def test_backfill_refuses_a_malformed_id(self, node_id: str) -> None:
+        """wv-e869e3: the id is interpolated into SQL, so only a validated id
+        may reach the UPDATE."""
+        node = _node(node_id)
+        with patch("weave_gh.phases._run") as run, patch(
+            "weave_gh.phases._resolve_db_path", return_value="/tmp/test.db"
+        ), pytest.raises(ValueError, match="malformed node id"):
+            _backfill_gh_issue(node, 55, all_nodes=None)
+        run.assert_not_called()
+        assert "gh_issue" not in node.metadata
 
 
 # ---------------------------------------------------------------------------
@@ -912,17 +999,17 @@ class TestSyncWeaveToGithub:
 
     def _patches(self, **overrides: Any) -> Any:
         base: dict[str, Any] = {
-            "get_edges_for_node": lambda _: [],
-            "render_issue_body": lambda *_a, **_k: "",
-            "should_update_body": lambda *_a: False,
-            "get_labels_for_node": lambda _: [],
-            "sync_issue_labels": lambda *_a, **_k: None,
-            "gh_cli": lambda *_a, **_k: "",
-            "build_close_comment": lambda *_a, **_k: "close",
-            "_backfill_gh_issue": lambda *_a, **_k: None,
-            "_was_closed_by_weave": lambda *_a: False,
-            "extract_human_content": lambda _: "",
-            "compose_issue_body": lambda h, w: w,
+            "get_edges_for_node": _positional_callback(phases.get_edges_for_node, lambda _: []),
+            "render_issue_body": _callback(phases.render_issue_body, lambda *_a, **_k: ""),
+            "should_update_body": _positional_callback(phases.should_update_body, lambda *_a: False),
+            "get_labels_for_node": _positional_callback(phases.get_labels_for_node, lambda _: []),
+            "sync_issue_labels": _callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            "gh_cli": _callback(phases.gh_cli, lambda *_a, **_k: ""),
+            "build_close_comment": _callback(phases.build_close_comment, lambda *_a, **_k: "close"),
+            "_backfill_gh_issue": _callback(_backfill_gh_issue, lambda *_a, **_k: None),
+            "_was_closed_by_weave": _positional_callback(_was_closed_by_weave, lambda *_a: False),
+            "extract_human_content": _positional_callback(phases.extract_human_content, lambda _: ""),
+            "compose_issue_body": _positional_callback(phases.compose_issue_body, lambda h, w: w),
         }
         base.update(overrides)
         return patch.multiple("weave_gh.phases", **base)
@@ -1060,12 +1147,12 @@ class TestHandleNewIssuePaths:
         **gh_override: Any,
     ) -> None:
         defaults: dict[str, Any] = {
-            "get_edges_for_node": lambda _: [],
-            "render_issue_body": lambda *_a, **_k: "",
-            "get_labels_for_node": lambda _: [],
-            "sync_issue_labels": lambda *_a, **_k: None,
-            "_backfill_gh_issue": lambda *_a, **_k: None,
-            "gh_cli": lambda *_a, **_k: "",
+            "get_edges_for_node": _positional_callback(phases.get_edges_for_node, lambda _: []),
+            "render_issue_body": _callback(phases.render_issue_body, lambda *_a, **_k: ""),
+            "get_labels_for_node": _positional_callback(phases.get_labels_for_node, lambda _: []),
+            "sync_issue_labels": _callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            "_backfill_gh_issue": _callback(_backfill_gh_issue, lambda *_a, **_k: None),
+            "gh_cli": _callback(phases.gh_cli, lambda *_a, **_k: ""),
         }
         defaults.update(gh_override)
         with patch.multiple("weave_gh.phases", **defaults):
@@ -1088,7 +1175,7 @@ class TestHandleNewIssuePaths:
         gh_calls: list[object] = []
         self._call(
             node, stats, dry_run=True,
-            gh_cli=lambda *_a, **_k: gh_calls.append(_a) or "",  # type: ignore[func-returns-value]
+            gh_cli=_callback(phases.gh_cli, lambda *_a, **_k: _logged(gh_calls, _a, "")),
         )
         assert stats.created_gh == 1
         assert not gh_calls
@@ -1102,12 +1189,12 @@ class TestHandleNewIssuePaths:
 
         with patch.multiple(
             "weave_gh.phases",
-            get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *_a, **_k: "",
-            get_labels_for_node=lambda _: [],
-            sync_issue_labels=lambda *_a, **_k: None,
-            gh_cli=lambda *_a, **_k: "",
-            _backfill_gh_issue=lambda *_a, **_k: backfill_calls.append(_a),
+            get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _: []),
+            render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: ""),
+            get_labels_for_node=_positional_callback(phases.get_labels_for_node, lambda _: []),
+            sync_issue_labels=_callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            gh_cli=_callback(phases.gh_cli, lambda *_a, **_k: ""),
+            _backfill_gh_issue=_callback(_backfill_gh_issue, lambda *_a, **_k: backfill_calls.append(_a)),
         ):
             _handle_new_issue(
                 node,
@@ -1139,12 +1226,12 @@ class TestHandleNewIssuePaths:
 
         with patch.multiple(
             "weave_gh.phases",
-            get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *_a, **_k: "",
-            get_labels_for_node=lambda _: [],
-            sync_issue_labels=lambda *_a, **_k: None,
-            build_close_comment=lambda *_a, **_k: "closed",
-            _backfill_gh_issue=lambda *_a, **_k: backfill_calls.append(_a),
+            get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _: []),
+            render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: ""),
+            get_labels_for_node=_positional_callback(phases.get_labels_for_node, lambda _: []),
+            sync_issue_labels=_callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            build_close_comment=_callback(phases.build_close_comment, lambda *_a, **_k: "closed"),
+            _backfill_gh_issue=_callback(_backfill_gh_issue, lambda *_a, **_k: backfill_calls.append(_a)),
             gh_cli=_record_gh_call,
         ):
             _handle_new_issue(
@@ -1176,12 +1263,12 @@ class TestHandleNewIssuePaths:
 
         with patch.multiple(
             "weave_gh.phases",
-            get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *_a, **_k: "",
-            get_labels_for_node=lambda _: [],
-            sync_issue_labels=lambda *_a, **_k: None,
-            gh_cli=lambda *_a, **_k: "",
-            _backfill_gh_issue=lambda *_a, **_k: backfill_calls.append(_a),
+            get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _: []),
+            render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: ""),
+            get_labels_for_node=_positional_callback(phases.get_labels_for_node, lambda _: []),
+            sync_issue_labels=_callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            gh_cli=_callback(phases.gh_cli, lambda *_a, **_k: ""),
+            _backfill_gh_issue=_callback(_backfill_gh_issue, lambda *_a, **_k: backfill_calls.append(_a)),
         ), patch("weave_gh.phases.log.info") as info:
             _handle_new_issue(
                 node,
@@ -1214,16 +1301,13 @@ class TestHandleNewIssuePaths:
 
         with patch.multiple(
             "weave_gh.phases",
-            get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *_a, **_k: "",
-            get_labels_for_node=lambda _: ["bug", "enhancement"],
-            sync_issue_labels=lambda *_a, **_k: None,
-            _backfill_gh_issue=lambda *_a, **_k: None,
-            _sync_assignee=lambda *_a, **_k: sync_calls.append(_a),
-            gh_cli=lambda *_a, **_k: (
-                gh_args.append(_a),  # type: ignore[func-returns-value]
-                "https://github.com/o/r/issues/1",
-            )[1],
+            get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _: []),
+            render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: ""),
+            get_labels_for_node=_positional_callback(phases.get_labels_for_node, lambda _: ["bug", "enhancement"]),
+            sync_issue_labels=_callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            _backfill_gh_issue=_callback(_backfill_gh_issue, lambda *_a, **_k: None),
+            _sync_assignee=_callback(_sync_assignee, lambda *_a, **_k: sync_calls.append(_a)),
+            gh_cli=_callback(phases.gh_cli, lambda *_a, **_k: _logged(gh_args, _a, "https://github.com/o/r/issues/1")),
         ):
             _handle_new_issue(
                 node,
@@ -1251,16 +1335,16 @@ class TestHandleNewIssuePaths:
 
         with patch.multiple(
             "weave_gh.phases",
-            get_edges_for_node=lambda _: [],
-            render_issue_body=lambda *_a, **_k: "",
-            get_labels_for_node=lambda _: [],
-            sync_issue_labels=lambda *_a, **_k: None,
-            _backfill_gh_issue=lambda *_a, **_k: None,
-            build_close_comment=lambda *_a, **_k: "closed",
-            gh_cli=lambda *_a, **_k: (
-                gh_calls.append(_a),  # type: ignore[func-returns-value]
-                "https://github.com/owner/repo/issues/42",
-            )[1],
+            get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _: []),
+            render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: ""),
+            get_labels_for_node=_positional_callback(phases.get_labels_for_node, lambda _: []),
+            sync_issue_labels=_callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            _backfill_gh_issue=_callback(_backfill_gh_issue, lambda *_a, **_k: None),
+            build_close_comment=_callback(phases.build_close_comment, lambda *_a, **_k: "closed"),
+            gh_cli=_callback(
+                phases.gh_cli,
+                lambda *_a, **_k: _logged(gh_calls, _a, "https://github.com/owner/repo/issues/42"),
+            ),
         ):
             _handle_new_issue(
                 node,
@@ -1296,17 +1380,17 @@ class TestHandleExistingIssuePaths:
         **overrides: Any,
     ) -> None:
         base: dict[str, Any] = {
-            "get_edges_for_node": lambda _: [],
-            "render_issue_body": lambda *_a, **_k: "",
-            "should_update_body": lambda *_a: False,
-            "get_labels_for_node": lambda _: [],
-            "sync_issue_labels": lambda *_a, **_k: None,
-            "gh_cli": lambda *_a, **_k: "",
-            "build_close_comment": lambda *_a, **_k: "close",
-            "_backfill_gh_issue": lambda *_a, **_k: None,
-            "_was_closed_by_weave": lambda *_a: False,
-            "extract_human_content": lambda _: "",
-            "compose_issue_body": lambda h, w: w,
+            "get_edges_for_node": _positional_callback(phases.get_edges_for_node, lambda _: []),
+            "render_issue_body": _callback(phases.render_issue_body, lambda *_a, **_k: ""),
+            "should_update_body": _positional_callback(phases.should_update_body, lambda *_a: False),
+            "get_labels_for_node": _positional_callback(phases.get_labels_for_node, lambda _: []),
+            "sync_issue_labels": _callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            "gh_cli": _callback(phases.gh_cli, lambda *_a, **_k: ""),
+            "build_close_comment": _callback(phases.build_close_comment, lambda *_a, **_k: "close"),
+            "_backfill_gh_issue": _callback(_backfill_gh_issue, lambda *_a, **_k: None),
+            "_was_closed_by_weave": _positional_callback(_was_closed_by_weave, lambda *_a: False),
+            "extract_human_content": _positional_callback(phases.extract_human_content, lambda _: ""),
+            "compose_issue_body": _positional_callback(phases.compose_issue_body, lambda h, w: w),
         }
         base.update(overrides)
         with patch.multiple("weave_gh.phases", **base):
@@ -1347,7 +1431,7 @@ class TestHandleExistingIssuePaths:
 
         self._call(
             node, issue, stats,
-            render_issue_body=lambda *_a, **_k: render_calls.append(_a) or "",  # type: ignore[func-returns-value]
+            render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: _logged(render_calls, _a, "")),
         )
         assert not render_calls
 
@@ -1381,14 +1465,14 @@ class TestHandleExistingIssuePaths:
             issue,
             stats,
             render_issue_body=(
-                lambda *_a, **_k: "<!-- WEAVE:BEGIN hash=new -->\n"
+                _callback(phases.render_issue_body, lambda *_a, **_k: "<!-- WEAVE:BEGIN hash=new -->\n"
                 "## Context\n\n"
                 "**Weave ID:** `wv-reimp-fix`\n"
-                "<!-- WEAVE:END -->"
+                "<!-- WEAVE:END -->")
             ),
-            should_update_body=lambda *_a: True,
-            extract_human_content=lambda _: "",
-            compose_issue_body=lambda _h, w: w,
+            should_update_body=_positional_callback(phases.should_update_body, lambda *_a: True),
+            extract_human_content=_positional_callback(phases.extract_human_content, lambda _: ""),
+            compose_issue_body=_positional_callback(phases.compose_issue_body, lambda _h, w: w),
             gh_cli=_record_gh_call,
         )
 
@@ -1404,7 +1488,7 @@ class TestHandleExistingIssuePaths:
 
         self._call(
             node, issue, stats, dry_run=True,
-            gh_cli=lambda *_a, **_k: (gh_calls.append(_a), "")[1],  # type: ignore[func-returns-value]
+            gh_cli=_callback(phases.gh_cli, lambda *_a, **_k: _logged(gh_calls, _a, "")),
         )
 
         assert stats.closed_gh == 1
@@ -1423,7 +1507,7 @@ class TestHandleExistingIssuePaths:
 
         self._call(
             node, issue, stats,
-            _sync_assignee=lambda *_a, **_k: (sync_calls.append(_a), False)[1],  # type: ignore[func-returns-value]
+            _sync_assignee=_callback(_sync_assignee, lambda *_a, **_k: _logged(sync_calls, _a, False)),
         )
 
         assert len(sync_calls) == 1
@@ -1440,7 +1524,7 @@ class TestHandleExistingIssuePaths:
 
         self._call(
             node, issue, stats,
-            _sync_assignee=lambda *_a, **_k: (sync_calls.append(_a), False)[1],  # type: ignore[func-returns-value]
+            _sync_assignee=_callback(_sync_assignee, lambda *_a, **_k: _logged(sync_calls, _a, False)),
         )
 
         assert not sync_calls
@@ -1454,11 +1538,14 @@ class TestHandleExistingIssuePaths:
 
         self._call(
             node, issue, stats, dry_run=True,
-            render_issue_body=lambda *_a, **_k: "<!-- WEAVE:BEGIN hash=new -->\nnew\n<!-- WEAVE:END -->",
-            should_update_body=lambda *_a: True,
-            extract_human_content=lambda _: "",
-            compose_issue_body=lambda h, w: w,
-            gh_cli=lambda *_a, **_k: (gh_calls.append(_a), "")[1],  # type: ignore[func-returns-value]
+            render_issue_body=_callback(
+                phases.render_issue_body,
+                lambda *_a, **_k: "<!-- WEAVE:BEGIN hash=new -->\nnew\n<!-- WEAVE:END -->",
+            ),
+            should_update_body=_positional_callback(phases.should_update_body, lambda *_a: True),
+            extract_human_content=_positional_callback(phases.extract_human_content, lambda _: ""),
+            compose_issue_body=_positional_callback(phases.compose_issue_body, lambda h, w: w),
+            gh_cli=_callback(phases.gh_cli, lambda *_a, **_k: _logged(gh_calls, _a, "")),
         )
 
         assert stats.updated_gh == 1
@@ -1679,6 +1766,196 @@ class TestSelectCandidates:
             result = select_candidates(nodes, mode=Mode.FAST, focus_node_id=None)
         assert result == []
 
+    def test_fast_mode_adds_done_node_with_open_issue(self) -> None:
+        """wv-e9f8f0: a done node whose mapped issue is still OPEN is a candidate
+        even when no node is active and no focus is given."""
+        closed = _node("wv-closed", status="done", gh_issue=4812)
+        synced = _node("wv-synced", status="done", gh_issue=4811)
+        todo = _node("wv-todo", status="todo", gh_issue=4810)
+        issues = [_issue(4812), _issue(4811, state="CLOSED"), _issue(4810)]
+        with patch("weave_gh.data.get_edges_for_node", return_value=[]):
+            result = select_candidates(
+                [closed, synced, todo], mode=Mode.FAST, focus_node_id=None,
+                issues=issues,
+            )
+        assert [n.id for n in result] == ["wv-closed"]
+
+    def test_fast_mode_drift_unions_with_focus_set(self) -> None:
+        focus = _node("wv-focus", status="active")
+        closed = _node("wv-closed", status="done", gh_issue=7)
+        with patch("weave_gh.data.get_edges_for_node", return_value=[]):
+            result = select_candidates(
+                [focus, closed], mode=Mode.FAST, focus_node_id="wv-focus",
+                issues=[_issue(7)],
+            )
+        assert {n.id for n in result} == {"wv-focus", "wv-closed"}
+
+
+# ---------------------------------------------------------------------------
+# wv-e9f8f0: close -> no active node -> default fast sync
+# ---------------------------------------------------------------------------
+
+
+class TestFastModeClosedNodeReconcile:
+    """A node closed without a GitHub sync must have its issue closed by the
+    next default fast sync, exactly as ``--node=<id>`` would."""
+
+    def _run(self, focus: str | None) -> tuple[SyncStats, list[tuple[str, ...]]]:
+        closed = _node("wv-closed", status="done", gh_issue=4812)
+        other = _node("wv-other", status="todo", gh_issue=4800)
+        nodes = [other, closed]
+        issues = [_issue(4800, body="b"), _issue(4812, body="b")]
+        calls: list[tuple[str, ...]] = []
+
+        def fake_gh(*args: str, **_k: Any) -> str:
+            calls.append(args)
+            return ""
+
+        stats = SyncStats()
+        with patch("weave_gh.data.get_edges_for_node", return_value=[]), \
+                patch.multiple(
+                    "weave_gh.phases",
+                    gh_cli=fake_gh,
+                    get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _: []),
+                    render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: "b"),
+                    should_update_body=_positional_callback(phases.should_update_body, lambda *_a: False),
+                    get_labels_for_node=_positional_callback(phases.get_labels_for_node, lambda _: []),
+                    sync_issue_labels=_callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+                    build_close_comment=_callback(phases.build_close_comment, lambda *_a, **_k: "close"),
+                    _backfill_gh_issue=_callback(_backfill_gh_issue, lambda *_a, **_k: None),
+                ):
+            sync_weave_to_github(
+                nodes, issues, "owner/repo", "https://github.com/owner/repo",
+                {n.id: n for n in nodes}, stats,
+                mode=Mode.FAST, focus_node_id=focus,
+            )
+        return stats, calls
+
+    def test_default_fast_sync_closes_mapped_issue(self) -> None:
+        stats, calls = self._run(focus=None)
+        assert stats.candidates == 1
+        assert stats.closed_gh == 1
+        assert ("issue", "close", "4812") in [c[:3] for c in calls]
+        assert not any(c[:2] == ("issue", "create") for c in calls)
+
+    def test_issue_beyond_old_fetch_limit_is_matched_not_recreated(self) -> None:
+        """wv-0d2d25: with 5200 issues the oldest lay past the old fixed limit
+        of 5000; fetched for real, it must reach Phase 1 and be matched."""
+
+        listing = json.dumps([
+            {"number": n, "title": f"t{n}", "state": "CLOSED", "body": "b",
+             "labels": [], "assignees": []}
+            for n in range(5200, 0, -1)
+        ])
+
+        def fetch_gh(*args: str, **_k: Any) -> str:
+            return "5200" if args[:2] == ("api", "graphql") else listing
+
+        with patch("weave_gh.data.gh_cli", side_effect=fetch_gh):
+            issues = get_github_issues("owner/repo")
+
+        old = _node("wv-old", status="done", gh_issue=1, text="t1")
+        calls: list[tuple[str, ...]] = []
+        stats = SyncStats()
+        with patch.multiple(
+            "weave_gh.phases",
+            gh_cli=_callback(phases.gh_cli, lambda *a, **_k: _logged(calls, a, "")),
+            get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _: []),
+            render_issue_body=_callback(phases.render_issue_body, lambda *_a, **_k: "b"),
+            should_update_body=_positional_callback(phases.should_update_body, lambda *_a: False),
+            get_labels_for_node=_positional_callback(phases.get_labels_for_node, lambda _: []),
+            sync_issue_labels=_callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            build_close_comment=_callback(phases.build_close_comment, lambda *_a, **_k: "close"),
+            _backfill_gh_issue=_callback(_backfill_gh_issue, lambda *_a, **_k: None),
+        ):
+            sync_weave_to_github(
+                [old], issues, "owner/repo", "https://github.com/owner/repo",
+                {old.id: old}, stats, mode=Mode.FULL,
+            )
+        assert stats.created_gh == 0
+        assert not any(c[:2] == ("issue", "create") for c in calls)
+
+    def test_default_and_focus_modes_reconcile_identically(self) -> None:
+        default_stats, default_calls = self._run(focus=None)
+        focus_stats, focus_calls = self._run(focus="wv-closed")
+        assert default_calls == focus_calls
+        assert default_stats.closed_gh == focus_stats.closed_gh == 1
+        assert default_stats.created_gh == focus_stats.created_gh == 0
+
+
+class TestSharedTextConvergence:
+    """wv-48d204: done nodes sharing one text each own an issue. A full sync
+    gave one issue per shared-text group per run (the in-run title map sent
+    the rest down the title-match skip), so it took as many runs as the
+    largest group to settle and moved HEAD every run."""
+
+    def _sync(
+        self, nodes: list[WeaveNode], issues: list[GitHubIssue],
+    ) -> tuple[SyncStats, list[GitHubIssue]]:
+        """One full Phase 1 pass against a fake GitHub that remembers what it
+        created as GitHub would: truncated title, rendered body."""
+        created: list[GitHubIssue] = []
+
+        def fake_gh(*args: str, **_k: Any) -> str:
+            if args[:2] == ("issue", "create"):
+                flags = dict(zip(args[2::2], args[3::2]))
+                num = 100 + len(issues) + len(created)
+                created.append(_issue(num, title=flags["--title"], state="OPEN", body=flags["--body"]))
+                return f"https://github.com/owner/repo/issues/{num}"
+            if args[:2] == ("issue", "close"):
+                for issue in created:
+                    if str(issue.number) == args[2]:
+                        issue.state = "CLOSED"
+            return ""
+
+        def fake_backfill(node: WeaveNode, gh_num: int, **_k: Any) -> None:
+            node.metadata["gh_issue"] = gh_num
+
+        def fake_render(node: WeaveNode, *_a: Any, **_k: Any) -> str:
+            return f"**Weave ID:** `{node.id}`"
+
+        stats = SyncStats()
+        with patch.multiple(
+            "weave_gh.phases",
+            gh_cli=fake_gh,
+            get_edges_for_node=_positional_callback(phases.get_edges_for_node, lambda _: []),
+            render_issue_body=fake_render,
+            should_update_body=_positional_callback(phases.should_update_body, lambda *_a: False),
+            get_labels_for_node=_positional_callback(phases.get_labels_for_node, lambda _: ["weave-synced"]),
+            sync_issue_labels=_callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            build_close_comment=_callback(phases.build_close_comment, lambda *_a, **_k: "close"),
+            _backfill_gh_issue=fake_backfill,
+            _was_closed_by_weave=_callback(_was_closed_by_weave, lambda *_a, **_k: True),
+        ):
+            sync_weave_to_github(
+                nodes, list(issues), "owner/repo", "https://github.com/owner/repo",
+                {n.id: n for n in nodes}, stats, mode=Mode.FULL,
+            )
+        return stats, issues + created
+
+    @pytest.mark.parametrize("text", ["shared short text", "task(E6 recapture): " + "x" * 300])
+    def test_one_full_sync_gives_each_node_its_issue(self, text: str) -> None:
+        nodes = [_node(f"wv-00000{i}", text=text, status="done") for i in range(3)]
+        first, issues = self._sync(nodes, [])
+        assert first.created_gh == 3
+        assert first.closed_gh == 3
+        assert sorted(n.gh_issue or 0 for n in nodes) == [100, 101, 102]
+
+        second, after = self._sync(nodes, issues)
+        assert second.created_gh == 0
+        assert second.closed_gh == 0
+        assert len(after) == 3
+
+    def test_unmapped_node_takes_unmarked_title_match(self) -> None:
+        """A weave-synced issue with no Weave ID marker (legacy body) is still
+        a title match: the shared-text rule only refuses another node's issue."""
+        node = _node("wv-000001", text="legacy title", status="done")
+        legacy = _issue(77, title="legacy title", state="CLOSED", body="no marker")
+        stats, after = self._sync([node], [legacy])
+        assert stats.created_gh == 0
+        assert node.gh_issue == 77
+        assert len(after) == 1
+
 
 # ---------------------------------------------------------------------------
 # Phase B: sync_weave_to_github — fast vs full traversal parity
@@ -1732,19 +2009,19 @@ class TestPhaseCDigestCache:
 
     def _patches(self, **overrides: Any) -> Any:
         base: dict[str, Any] = {
-            "get_edges_for_node": lambda _: [],
-            "render_issue_body": lambda *_a, **_k: (
+            "get_edges_for_node": _positional_callback(phases.get_edges_for_node, lambda _: []),
+            "render_issue_body": _callback(phases.render_issue_body, lambda *_a, **_k: (
                 "<!-- WEAVE:BEGIN hash=abc123 -->\nbody\n<!-- WEAVE:END -->"
-            ),
-            "should_update_body": lambda *_a: True,
-            "get_labels_for_node": lambda _: [],
-            "sync_issue_labels": lambda *_a, **_k: None,
-            "gh_cli": lambda *_a, **_k: "",
-            "build_close_comment": lambda *_a, **_k: "close",
-            "_backfill_gh_issue": lambda *_a, **_k: None,
-            "_was_closed_by_weave": lambda *_a: False,
-            "extract_human_content": lambda _: "",
-            "compose_issue_body": lambda h, w: w,
+            )),
+            "should_update_body": _positional_callback(phases.should_update_body, lambda *_a: True),
+            "get_labels_for_node": _positional_callback(phases.get_labels_for_node, lambda _: []),
+            "sync_issue_labels": _callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            "gh_cli": _callback(phases.gh_cli, lambda *_a, **_k: ""),
+            "build_close_comment": _callback(phases.build_close_comment, lambda *_a, **_k: "close"),
+            "_backfill_gh_issue": _callback(_backfill_gh_issue, lambda *_a, **_k: None),
+            "_was_closed_by_weave": _positional_callback(_was_closed_by_weave, lambda *_a: False),
+            "extract_human_content": _positional_callback(phases.extract_human_content, lambda _: ""),
+            "compose_issue_body": _positional_callback(phases.compose_issue_body, lambda h, w: w),
         }
         base.update(overrides)
         return patch.multiple("weave_gh.phases", **base)
@@ -1762,7 +2039,6 @@ class TestPhaseCDigestCache:
             return "x"
 
         # Pre-seed cache with the digest that compute_structural_digest will produce.
-        from weave_gh.digest_cache import compute_structural_digest
         digest = compute_structural_digest(node, {node.id: node}, [])
         cache: dict[str, Any] = {
             "schema": 2,
@@ -1852,18 +2128,20 @@ class TestPhaseDRepairCheckpoint:
 
     def _patches(self, **overrides: Any) -> Any:
         base: dict[str, Any] = {
-            "get_edges_for_node": lambda _: [],
-            "render_issue_body": lambda *_a, **_k: "",
-            "should_update_body": lambda *_a: False,
-            "get_labels_for_node": lambda _: [],
-            "sync_issue_labels": lambda *_a, **_k: None,
-            "gh_cli": lambda *_a, **_k: "",
-            "build_close_comment": lambda *_a, **_k: "close",
-            "_backfill_gh_issue": lambda *_a, **_k: None,
-            "_was_closed_by_weave": lambda *_a: False,
-            "extract_human_content": lambda _: "",
-            "compose_issue_body": lambda h, w: w,
-            "save_checkpoint": lambda *_a, **_k: None,  # avoid touching disk in tests
+            "get_edges_for_node": _positional_callback(phases.get_edges_for_node, lambda _: []),
+            "render_issue_body": _callback(phases.render_issue_body, lambda *_a, **_k: ""),
+            "should_update_body": _positional_callback(phases.should_update_body, lambda *_a: False),
+            "get_labels_for_node": _positional_callback(phases.get_labels_for_node, lambda _: []),
+            "sync_issue_labels": _callback(phases.sync_issue_labels, lambda *_a, **_k: None),
+            "gh_cli": _callback(phases.gh_cli, lambda *_a, **_k: ""),
+            "build_close_comment": _callback(phases.build_close_comment, lambda *_a, **_k: "close"),
+            "_backfill_gh_issue": _callback(_backfill_gh_issue, lambda *_a, **_k: None),
+            "_was_closed_by_weave": _positional_callback(_was_closed_by_weave, lambda *_a: False),
+            "extract_human_content": _positional_callback(phases.extract_human_content, lambda _: ""),
+            "compose_issue_body": _positional_callback(phases.compose_issue_body, lambda h, w: w),
+            "save_checkpoint": _callback(
+                phases.save_checkpoint, lambda *_a, **_k: None
+            ),  # avoid touching disk in tests
         }
         base.update(overrides)
         return patch.multiple("weave_gh.phases", **base)

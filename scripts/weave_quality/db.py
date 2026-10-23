@@ -28,6 +28,7 @@ import os
 import sqlite3
 import time
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .hotspots import HOTSPOT_THRESHOLD
@@ -597,12 +598,10 @@ class PatternMigrationConflictError(RuntimeError):
 
 
 def _backup_exists(conn: sqlite3.Connection, backup: str) -> bool:
-    return (
-        conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (backup,)
-        ).fetchone()
-        is not None
-    )
+    row: tuple[int] | None = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (backup,)
+    ).fetchone()
+    return row is not None
 
 
 def _merge_pattern_findings_backup(conn: sqlite3.Connection) -> None:
@@ -1455,7 +1454,7 @@ def _rows_to_function_cc(rows: list[Any]) -> list[FunctionCC]:
                 line_start=detail.get("line_start", 0),
                 line_end=detail.get("line_end", 0),
                 essential_complexity=detail.get("essential_complexity", 1.0),
-                is_dispatch=detail.get("is_dispatch", False),
+                is_dispatch=bool(detail.get("is_dispatch", False)),
             )
         )
     return results
@@ -1679,14 +1678,14 @@ def file_changed(
     `git ls-tree -r HEAD`, so every uncommitted edit carries its pre-edit SHA and
     this comparison silently reports "unchanged" (wv-7fbfe1).
 
-    Untracked files are absent from the map, arrive as "", and fall through to
-    mtime.
+    A current blob decides on its own: a stored row without one (an untracked
+    file recorded before wv-fe9a6a hashed them) is changed until rescanned, not
+    compared by mtime. Only a file with no current blob falls through to mtime.
     """
     fs = get_file_state(conn, path)
     if fs is None:
         return True  # Never scanned
-    # Blob SHA first (authoritative for working-tree content), else mtime
-    if current_blob and fs.git_blob:
+    if current_blob:
         return current_blob != fs.git_blob
     return current_mtime != fs.mtime
 
@@ -1704,8 +1703,54 @@ def is_stale(conn: sqlite3.Connection, current_head: str) -> bool:
     return scan.is_stale(current_head)
 
 
-def staleness_info(conn: sqlite3.Connection, current_head: str) -> dict[str, Any]:
-    """Return staleness details for reporting."""
+def worktree_drift(
+    conn: sqlite3.Connection,
+    root: str | Path,
+    candidates: Sequence[str],
+    blob_map: Mapping[str, str],
+    scanned: Sequence[str] = (),
+) -> dict[str, list[str]]:
+    """Name the files whose content differs from what the latest scan read.
+
+    `candidates` are files the scanner would scan now, `blob_map` their
+    working-tree SHAs (`working_tree_blob_shas` with them as `include`), and
+    `scanned` the paths the latest scan holds rows for. A file without a
+    current SHA cannot be shown to match and counts as changed: freshness is
+    proved from content, never presumed from a missing hash (wv-fe9a6a).
+    """
+    root_path = Path(root)
+    changed: list[str] = []
+    unscanned: list[str] = []
+    for rel in candidates:
+        fs = get_file_state(conn, rel)
+        if fs is None:
+            unscanned.append(rel)
+        elif not blob_map.get(rel) or blob_map[rel] != fs.git_blob:
+            changed.append(rel)
+    deleted = [rel for rel in scanned if not (root_path / rel).is_file()]
+    return {"changed": changed, "unscanned": unscanned, "deleted": deleted}
+
+
+def latest_scan_paths(conn: sqlite3.Connection) -> list[str]:
+    """Paths the latest scan holds file rows for."""
+    scan = latest_scan(conn)
+    if scan is None:
+        return []
+    rows = conn.execute("SELECT path FROM files WHERE scan_id = ?", (scan.id,)).fetchall()
+    return [r[0] for r in rows]
+
+
+def staleness_info(
+    conn: sqlite3.Connection,
+    current_head: str,
+    drift: Mapping[str, Sequence[str]] | None = None,
+) -> dict[str, Any]:
+    """Return staleness details for reporting.
+
+    A scan at HEAD is still stale when `drift` (from `worktree_drift`) names a
+    file: matching HEAD says nothing about uncommitted or untracked edits, which
+    is the state a repository is in whenever anyone asks (wv-fe9a6a).
+    """
     scan = latest_scan(conn)
     if scan is None:
         return {"stale": True, "reason": "no_scan_data", "scan": None}
@@ -1716,6 +1761,14 @@ def staleness_info(conn: sqlite3.Connection, current_head: str) -> dict[str, Any
             "scan_head": scan.git_head[:8],
             "current_head": current_head[:8],
             "scan_time": scan.scanned_at,
+        }
+    if drift and any(drift.values()):
+        return {
+            "stale": True,
+            "reason": "worktree_changed",
+            "scan_head": scan.git_head[:8],
+            "scan_time": scan.scanned_at,
+            **{k: list(v) for k, v in drift.items()},
         }
     return {
         "stale": False,
@@ -1816,7 +1869,7 @@ def replace_pattern_scan_results(
     conn: sqlite3.Connection,
     scan_id: int,
     findings: list[PatternFinding],
-    runs: list[dict[str, object]],
+    runs: Sequence[Mapping[str, object]],
 ) -> None:
     """Atomically replace findings and successful rule receipts for a scan."""
     old_keys = {
@@ -2211,6 +2264,15 @@ def pattern_adjudication_report(
 ) -> dict[str, object]:
     """Report per-rule precision and recurring waived finding identities.
 
+    The two rates use different denominators. decided_precision counts only
+    findings current in the newest covering scan. actionable_rate counts every
+    disposition durably recorded against this exact path in
+    pattern_finding_state, so repairing an accepted_defect (the finding stops
+    appearing) keeps it in its own numerator instead of removing it from both
+    sides (wv-7d2857). durable_decided_count / durable_accepted_defects expose
+    that denominator; a rule whose decided findings were all repaired still
+    reports, with findings == 0 and decided_precision None.
+
     path_prefix, when given, scopes the report to findings whose (repo-
     relative, posix) path equals it or falls under it -- normally the last
     scan target, so precision reflects what that scan actually covered
@@ -2257,14 +2319,13 @@ def pattern_adjudication_report(
         # establish a newer truth for this path.
         return int(str(row["scan_count"])) > 0
 
+    durable_rows = rows
     rows = [row for row in rows if is_current(row)]
     by_rule: dict[str, dict[str, object]] = {}
     recurring_waivers: list[dict[str, object]] = []
-    for row in rows:
-        if int(str(row["scan_count"])) == 0:
-            continue
-        rule_id = str(row["rule_id"])
-        summary = by_rule.setdefault(
+
+    def rule_summary(rule_id: str) -> dict[str, object]:
+        return by_rule.setdefault(
             rule_id,
             {
                 "findings": 0,
@@ -2275,11 +2336,19 @@ def pattern_adjudication_report(
                 "unresolved": 0,
                 "decided_count": 0,
                 "decided_precision": None,
+                "durable_accepted_defects": 0,
+                "durable_decided_count": 0,
                 "actionable_rate": None,
                 "max_scan_count": 0,
                 "needs_adjudication": False,
             },
         )
+
+    for row in rows:
+        if int(str(row["scan_count"])) == 0:
+            continue
+        rule_id = str(row["rule_id"])
+        summary = rule_summary(rule_id)
         summary["findings"] = int(str(summary["findings"])) + 1
         row_scan_count = int(str(row["scan_count"]))
         summary["occurrences"] = int(str(summary["occurrences"])) + row_scan_count
@@ -2305,14 +2374,30 @@ def pattern_adjudication_report(
                     "note": row["note"],
                 }
             )
+    # Durable dispositions: every recorded judgement, current or repaired.
+    # An inherited disposition is a projection of another path's row, not a
+    # record of its own, so counting it would count one judgement twice.
+    for row in durable_rows:
+        disposition = str(row["disposition"])
+        if disposition == "unresolved" or row.get("disposition_source") != "path":
+            continue
+        summary = rule_summary(str(row["rule_id"]))
+        summary["durable_decided_count"] = int(str(summary["durable_decided_count"])) + 1
+        if disposition == "accepted_defect":
+            summary["durable_accepted_defects"] = (
+                int(str(summary["durable_accepted_defects"])) + 1
+            )
     for summary in by_rule.values():
         decided = int(str(summary["decided_count"]))
         true_positives = int(str(summary["accepted_defects"])) + int(
             str(summary["waived"])
         )
         summary["decided_precision"] = true_positives / decided if decided else None
+        durable_decided = int(str(summary["durable_decided_count"]))
         summary["actionable_rate"] = (
-            int(str(summary["accepted_defects"])) / decided if decided else None
+            int(str(summary["durable_accepted_defects"])) / durable_decided
+            if durable_decided
+            else None
         )
         summary["needs_adjudication"] = (
             decided == 0 and int(str(summary["max_scan_count"])) >= ADJUDICATION_NUDGE_SCANS

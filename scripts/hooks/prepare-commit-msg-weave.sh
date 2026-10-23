@@ -20,6 +20,9 @@ esac
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || exit 0)
 WV="$(command -v wv 2>/dev/null || echo "$REPO_ROOT/scripts/wv")"
 [ ! -x "$WV" ] && exit 0
+# Tag this hook's wv calls as hook traffic, keeping a test run's tag (wv-f47c10;
+# see pre-commit-weave.sh).
+[ "${WV_CALL_SOURCE:-}" = "test" ] || { WV_CALL_SOURCE=hook; export WV_CALL_SOURCE; }
 
 ACTIVE_IDS=$("$WV" list --status=active --claimed-by=current --json 2>/dev/null | jq -r '.[].id' 2>/dev/null)
 [ -z "$ACTIVE_IDS" ] && exit 0

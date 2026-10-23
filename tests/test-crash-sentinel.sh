@@ -11,6 +11,7 @@ export WV_CALL_SOURCE=test
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Colors
 RED='\033[0;31m'
@@ -61,6 +62,9 @@ setup_test_env() {
     "$WV" init 2>/dev/null || true
 }
 
+# Assertions record a failure and return 0: under set -e a nonzero return
+# ended the suite at its first failed assertion, so every later result and
+# the summary went unreported (wv-75e31a). TESTS_FAILED decides the exit.
 assert_equals() {
     local expected="$1"
     local actual="$2"
@@ -75,7 +79,7 @@ assert_equals() {
         echo "  Expected: $expected"
         echo "  Actual:   $actual"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -93,7 +97,7 @@ assert_contains() {
         echo "  Expected to find: $needle"
         echo "  In: $(echo "$haystack" | sed -n '1,3p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -109,7 +113,7 @@ assert_file_exists() {
         echo -e "${RED}✗${NC} $message"
         echo "  File not found: $path"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -125,7 +129,7 @@ assert_file_absent() {
         echo -e "${RED}✗${NC} $message"
         echo "  File should not exist: $path"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -141,7 +145,7 @@ assert_success() {
         echo -e "${RED}✗${NC} $message"
         echo "  Command failed: $*"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -226,7 +230,7 @@ assert_contains "$OUTPUT" "$(date -u -d "@$((NOW - 60))" +%Y-%m-%dT%H:%M:%SZ)" \
 setup_test_env
 NODE_B=$(claimed_node "closed before exit")
 write_fake_sentinel "2026-03-05T15:30:00Z" "[\"$NODE_B\"]"
-"$WV" done "$NODE_B" --skip-verification >/dev/null 2>&1 || true
+"$WV" "done" "$NODE_B" --skip-verification >/dev/null 2>&1 || true
 signals $((NOW - 600)) $((NOW - 60)) stopped
 OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -261,7 +265,7 @@ git add -A >/dev/null 2>&1; git -c user.email=t@t -c user.name=t commit -qm fixt
 NODE_D=$(claimed_node "open at stop")
 echo '{}' | bash "$HOOKS_DIR/stop-check.sh" >/dev/null 2>&1 || true
 assert_equals "blocked" "$(cut -d' ' -f2 "$WV_HOT_ZONE/.session_laststop" 2>/dev/null)" "stop-check records a stop refused over open work as blocked"
-"$WV" done "$NODE_D" --skip-verification >/dev/null 2>&1 || true
+"$WV" "done" "$NODE_D" --skip-verification >/dev/null 2>&1 || true
 rm -f "$WV_HOT_ZONE/.stop_check_lock"
 echo '{}' | bash "$HOOKS_DIR/stop-check.sh" >/dev/null 2>&1 || true
 assert_equals "stopped" "$(cut -d' ' -f2 "$WV_HOT_ZONE/.session_laststop" 2>/dev/null)" "stop-check records an allowed stop as stopped"
@@ -386,7 +390,7 @@ fi
 # Test: done nodes not listed
 setup_test_env
 ID=$("$WV" add "Done task" --status=active --criteria="recover session fixture" --risks=low --force 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
-"$WV" done "$ID" --skip-verification 2>/dev/null || true
+"$WV" "done" "$ID" --skip-verification 2>/dev/null || true
 OUTPUT=$("$WV" recover --session 2>/dev/null)
 assert_contains "$OUTPUT" "No orphaned active nodes" "recover --session excludes done nodes"
 

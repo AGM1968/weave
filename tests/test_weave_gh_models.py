@@ -2,8 +2,22 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 
-from weave_gh.models import Edge, GitHubIssue, Mode, SyncStats, WeaveNode
+import pytest
+
+from weave_gh.models import (
+    NODE_ID_RE,
+    NODE_STATUSES,
+    Edge,
+    GitHubIssue,
+    Mode,
+    SyncStats,
+    WeaveNode,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +41,32 @@ class TestWeaveNodeGhIssue:
     def test_gh_issue_none_explicit(self) -> None:
         node = WeaveNode(id="n1", text="t", status="todo", metadata={"gh_issue": None})
         assert node.gh_issue is None
+
+    @pytest.mark.parametrize(
+        "bad", [True, False, 0, -1, 1.5, 2.0, "oops", "", "07", " 7", "-3", {}, [4]]
+    )
+    def test_malformed_gh_issue_raises(self, bad: object) -> None:
+        """wv-e869e3: int(True) is issue #1, so coercion updated or closed the
+        wrong issue; "oops" and {} raised untyped errors mid-sync."""
+        node = WeaveNode(id="n1", text="t", status="todo", metadata={"gh_issue": bad})
+        with pytest.raises(ValueError, match="gh_issue is"):
+            _ = node.gh_issue
+
+
+class TestCliContract:
+    """The status set and id shape match the CLI's own validators."""
+
+    VALIDATE_SH = (ROOT / "scripts" / "lib" / "wv-validate.sh").read_text(encoding="utf-8")
+
+    def test_statuses_equal_valid_statuses(self) -> None:
+        m = re.search(r'^VALID_STATUSES="([^"]*)"$', self.VALIDATE_SH, re.M)
+        assert m, "VALID_STATUSES not found in wv-validate.sh"
+        assert tuple(m.group(1).split()) == NODE_STATUSES
+
+    def test_id_pattern_equals_validate_id(self) -> None:
+        m = re.search(r'\[\[ "\$id" =~ \^(wv-[^$]+)\$ \]\]', self.VALIDATE_SH)
+        assert m, "validate_id pattern not found in wv-validate.sh"
+        assert m.group(1) == NODE_ID_RE.pattern
 
 
 class TestWeaveNodePriority:
@@ -275,7 +315,6 @@ class TestMode:
         assert Mode.parse("repair") is Mode.REPAIR
 
     def test_parse_invalid_raises(self) -> None:
-        import pytest
 
         with pytest.raises(ValueError, match="invalid sync mode"):
             Mode.parse("turbo")

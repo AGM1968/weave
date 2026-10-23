@@ -15,6 +15,7 @@ export WV_CALL_SOURCE=test
 # Exit codes: 0 all checks pass, 1 otherwise.
 
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -143,7 +144,7 @@ fi
 
 # ── the declared-section extension ────────────────────────────────────────────
 # The fixed four sections cannot express a violation type with named sub-forms
-# or a corpus exemplars block, which is the shape nowcast's register guide grew
+# or a corpus exemplars block, which is the shape one consumer's register guide grew
 # into. A guide may declare extra section names in frontmatter; the vocabulary
 # stays CLOSED around that declaration, and these controls are what says so.
 
@@ -192,7 +193,7 @@ extended_guide "Avoid" "Avoid"
 expect_problem "a declaration may not restate a fixed section" "never redefine it"
 
 # The four shipped guides carry no declaration and must keep loading unchanged;
-# earth-engine-analysis's six sit at exactly the fixed set for the same reason.
+# another consumer's six sit at exactly the fixed set for the same reason.
 # The package scan above already covers that, so what is left is schema drift:
 # a parser that grew the extension while the contract did not would go green on
 # every control here.
@@ -326,6 +327,112 @@ else
         && pass "an invalid project override fails closed" \
         || fail "an invalid project override fails closed" \
             "    invalid_override must be fail_closed, not a silent fall-through to the package guide"
+fi
+
+# ── doctor report (wv-7730bd): what wv doctor records, from the shipped code ──
+echo ""
+echo "doctor report"
+gdoc() {  # gdoc <project-root> [catalog] -> JSON on stdout, exit status in $GDOC_RC
+    GDOC_RC=0
+    PYTHONPATH="$ROOT/scripts" python3 -m weave_quality.guides doctor --project-root "$1" \
+        --package-dir "$ROOT/scripts/weave_quality/guides" ${2:+--catalog "$2"} > "$TMP/gdoc.json" 2>&1 || GDOC_RC=$?
+}
+dp="$TMP/doctor-proj"
+mkdir -p "$dp/.weave/guides"
+gdoc "$dp"
+[ "$GDOC_RC" -eq 0 ] && jq -e '.invalid == [] and .unresolved == [] and .fallback_only == [] and .canonical_types > 0' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: a project with no overrides reports every canonical type coached by its own guide" \
+    || fail "doctor: a project with no overrides reports every canonical type coached by its own guide" "$(cat "$TMP/gdoc.json")"
+# A Python-specific override that parses but coaches the wrong type: only a
+# resolution in its own language context selects it.
+sed 's/^violation_type: code:swallowed-exception$/violation_type: code:unsafe-subprocess/' \
+    "$ROOT/scripts/weave_quality/guides/swallowed-exception.python.md" > "$dp/.weave/guides/swallowed-exception.python.md"
+gdoc "$dp"
+[ "$GDOC_RC" -eq 0 ] && jq -e '.invalid == [] and (.unresolved | length) == 1
+    and .unresolved[0].violation_type == "code:swallowed-exception" and .unresolved[0].language == "python"' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: a parse-valid python override coaching the wrong type is unresolved in its own language" \
+    || fail "doctor: a parse-valid python override coaching the wrong type is unresolved in its own language" "$(cat "$TMP/gdoc.json")"
+jq -e '.fallback_only == [] and ([.unresolved[] | select(.language == null)] | length) == 0' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: ...while generic resolution of every canonical type stays healthy" \
+    || fail "doctor: ...while generic resolution of every canonical type stays healthy" "$(cat "$TMP/gdoc.json")"
+rm -f "$dp/.weave/guides/swallowed-exception.python.md"
+# A file that is not UTF-8 is one invalid guide, not a lost report.
+printf '\xff\xfe---\n' > "$dp/.weave/guides/filler.md"
+gdoc "$dp"
+[ "$GDOC_RC" -eq 0 ] && jq -e '[.invalid[] | select(.file == "filler.md" and (.error | test("UTF-8")))] | length == 1' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: a guide that is not UTF-8 is reported invalid, and the report survives" \
+    || fail "doctor: a guide that is not UTF-8 is reported invalid, and the report survives" "$(cat "$TMP/gdoc.json")"
+rm -f "$dp/.weave/guides/filler.md"
+# A project guide serving no catalogued type is reported unused.
+printf -- '---\nid: orphan-note\nviolation_type: code:swallowed-exception\nsummary: x\n---\n\n## Why\n\nx\n\n## Corrective move\n\nx\n' \
+    > "$dp/.weave/guides/orphan-note.md"
+gdoc "$dp"
+[ "$GDOC_RC" -eq 0 ] && jq -e '.unused == ["orphan-note.md"]' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: a project guide no catalogued type selects is reported unused" \
+    || fail "doctor: a project guide no catalogued type selects is reported unused" "$(cat "$TMP/gdoc.json")"
+rm -f "$dp/.weave/guides/orphan-note.md"
+# The seeded example is listed apart from unused, but only while its type is
+# uncatalogued: the same id coaching a real type is a misnamed guide.
+cp "$ROOT/templates/authoring/guides/example-violation.md" "$dp/.weave/guides/"
+gdoc "$dp"
+[ "$GDOC_RC" -eq 0 ] && jq -e '.unused == [] and .examples == ["example-violation.md"]' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: the seeded example guide is listed as an example, not unused" \
+    || fail "doctor: the seeded example guide is listed as an example, not unused" "$(cat "$TMP/gdoc.json")"
+sed -i 's/^violation_type: .*/violation_type: code:swallowed-exception/' "$dp/.weave/guides/example-violation.md"
+gdoc "$dp"
+jq -e '.unused == ["example-violation.md"] and .examples == []' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: the example id coaching a catalogued type is reported unused" \
+    || fail "doctor: the example id coaching a catalogued type is reported unused" "$(cat "$TMP/gdoc.json")"
+rm -f "$dp/.weave/guides/example-violation.md"
+# The report names the module copy that produced it, for the wrong-copy check.
+gdoc "$dp"
+jq -e --arg m "$(readlink -f "$ROOT/scripts/weave_quality/guides.py")" '.module == $m' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: the report names the module file that computed it" \
+    || fail "doctor: the report names the module file that computed it" "$(cat "$TMP/gdoc.json")"
+# A malformed catalogue fails the check; it is never an empty universe.
+for shape in '{}' '{"types":{"code:swallowed-exception":"malformed"}}' '{"types":{"x:y":{"status":"legacy","guide":"x"}}}' 'not json'; do
+    printf '%s' "$shape" > "$TMP/catalog.json"
+    gdoc "$dp" "$TMP/catalog.json"
+    [ "$GDOC_RC" -eq 2 ] && jq -e '.code == "catalog_unreadable"' "$TMP/gdoc.json" >/dev/null \
+        && pass "doctor: catalogue $shape fails with catalog_unreadable" \
+        || fail "doctor: catalogue $shape fails with catalog_unreadable" "    rc=$GDOC_RC $(cat "$TMP/gdoc.json")"
+done
+# One bad entry in an otherwise healthy catalogue fails the check too, never a
+# smaller universe (wv-b303c9). The real catalogue, with one entry rewritten.
+cat_with() {  # cat_with <jq filter on the swallowed-exception entry> -> $TMP/catalog.json
+    jq --arg t code:swallowed-exception ".types[\$t] |= ($1)" "$ROOT/contracts/violation-vocabulary-v1.json" > "$TMP/catalog.json"
+}
+n_canon=$(jq '[.types[] | select(.status == "canonical")] | length' "$ROOT/contracts/violation-vocabulary-v1.json")
+cat_with '.guide = "nonexistent-guide"'
+gdoc "$dp" "$TMP/catalog.json"
+[ "$GDOC_RC" -eq 0 ] && jq -e --argjson n "$n_canon" '.canonical_types == $n and .fallback_only == ["code:swallowed-exception"]' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: control: a canonical type whose guide is missing is reported fallback-only" \
+    || fail "doctor: control: a canonical type whose guide is missing is reported fallback-only" "    rc=$GDOC_RC $(cat "$TMP/gdoc.json")"
+cat_with '.status = "canoncial" | .guide = "nonexistent-guide"'
+gdoc "$dp" "$TMP/catalog.json"
+[ "$GDOC_RC" -eq 2 ] && jq -e '.code == "catalog_unreadable" and (.error | test("unsupported status"))' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: a misspelled status fails the catalogue instead of dropping the type" \
+    || fail "doctor: a misspelled status fails the catalogue instead of dropping the type" "    rc=$GDOC_RC $(cat "$TMP/gdoc.json")"
+cat_with '.status = "legacy"'
+gdoc "$dp" "$TMP/catalog.json"
+[ "$GDOC_RC" -eq 0 ] && jq -e --argjson n "$((n_canon - 1))" '.canonical_types == $n' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: control: a supported reclassification leaves coverage one type smaller" \
+    || fail "doctor: control: a supported reclassification leaves coverage one type smaller" "    rc=$GDOC_RC $(cat "$TMP/gdoc.json")"
+for g in 'Swallowed.Exception' '_uncoached' '../swallowed-exception'; do
+    cat_with ".guide = \"$g\""
+    gdoc "$dp" "$TMP/catalog.json"
+    [ "$GDOC_RC" -eq 2 ] && jq -e '.code == "catalog_unreadable" and (.error | test("guide basename"))' "$TMP/gdoc.json" >/dev/null \
+        && pass "doctor: catalogue guide basename $g fails the catalogue" \
+        || fail "doctor: catalogue guide basename $g fails the catalogue" "    rc=$GDOC_RC $(cat "$TMP/gdoc.json")"
+done
+# An unlistable guides directory fails the check rather than reading as empty.
+if [ "$(id -u)" -ne 0 ]; then
+    chmod 000 "$dp/.weave/guides"
+    gdoc "$dp"
+    chmod 755 "$dp/.weave/guides"
+    [ "$GDOC_RC" -eq 2 ] && jq -e '.error | test("cannot be")' "$TMP/gdoc.json" >/dev/null \
+        && pass "doctor: an unreadable guides directory fails the check" \
+        || fail "doctor: an unreadable guides directory fails the check" "    rc=$GDOC_RC $(cat "$TMP/gdoc.json")"
 fi
 
 echo ""

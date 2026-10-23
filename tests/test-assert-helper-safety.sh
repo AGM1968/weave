@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016  # the patterns under test are literal shell text containing $; they must not expand here
 # Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
 export WV_CALL_SOURCE=test
 # test-assert-helper-safety.sh — grep patterns that come from a variable must
@@ -21,6 +22,7 @@ export WV_CALL_SOURCE=test
 # Exit codes: 0 all checks pass, 1 otherwise.
 
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

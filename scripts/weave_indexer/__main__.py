@@ -1,7 +1,7 @@
 """CLI entry point for wv index — chunk code files and store in brain.db.
 
 Usage:
-  python -m weave_indexer [path]                 # Index path (default: WV_HOT_ZONE or .)
+  python -m weave_indexer [path]                 # Index path (default: the repository root)
   python -m weave_indexer [path] --no-embed      # Skip embedding (FTS-only)
   python -m weave_indexer [path] --ext=.py,.ts   # Restrict file extensions
   python -m weave_indexer [path] --json          # JSON summary output
@@ -17,6 +17,7 @@ import json
 import os
 import sqlite3
 import struct
+import subprocess
 import sys
 from pathlib import Path
 from typing import Iterator
@@ -42,11 +43,38 @@ def _is_excluded(part: str) -> bool:
     return part in _EXCLUDE_DIRS or part.startswith("venv")
 
 
-def _walk_files(root: Path, exts: frozenset[str]) -> Iterator[Path]:
+def _walk_files(root: Path, exts: frozenset[str], base: Path | None = None) -> Iterator[Path]:
+    """Yield indexable files under root.
+
+    Exclusions match path parts relative to `base` (default: root), never the
+    absolute path: a checkout under build/ or venv*/ indexed nothing (wv-31d0d0).
+    """
+    base = base or root
     for p in root.rglob("*"):
         if p.is_file() and p.suffix in exts:
-            if not any(_is_excluded(part) for part in p.parts):
+            if not any(_is_excluded(part) for part in p.relative_to(base).parts):
                 yield p
+
+
+def _resolve_scope(path: str | None) -> tuple[Path, Path]:
+    """Return (root, base): the directory to walk, and the one paths are stored against.
+
+    base is the git toplevel containing root, so a chunk's file is repo-relative
+    whichever directory was indexed. Without a path, root is that toplevel of
+    the cwd: the old default, WV_HOT_ZONE, is always set by wv and indexed tmpfs
+    (wv-31d0d0). Outside git, root and base are the given directory.
+    """
+    start = Path(path or ".").resolve()
+    probe = start if start.is_dir() else start.parent
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=probe, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        top = ""
+    base = Path(top).resolve() if top else start
+    return (start if path else base), base
 
 
 def _chunk_file(path: Path, chunk_size: int, overlap: int) -> Iterator[tuple[int, int, str]]:
@@ -83,11 +111,14 @@ def _upsert_chunks(
     db_path: str,
     chunks: list[tuple[str, int, int, str]],
     blobs: list[bytes | None],
-    root: Path | None = None,
+    scope: str | None = None,
 ) -> int:
-    """Clear existing chunks for each file, insert new ones, evict stale files under root.
+    """Clear existing chunks for each file, insert new ones, evict stale files in scope.
 
-    Returns the number of stale files evicted.
+    `scope` is the walked directory relative to the stored paths' base ("" for
+    all of it). Only files inside it are evicted: evicting everything not in
+    this walk deleted the whole index whenever a subdirectory was indexed
+    (wv-31d0d0). None evicts nothing. Returns the number of stale files evicted.
     """
     conn = sqlite3.connect(db_path)
     evicted = 0
@@ -101,10 +132,14 @@ def _upsert_chunks(
             [(c[0], c[1], c[2], c[3], blobs[i]) for i, c in enumerate(chunks)],
         )
         # Evict chunks not in this walk: covers deleted files, excluded dirs, and ext changes.
-        if root is not None:
+        if scope is not None:
             walked = {c[0] for c in chunks}
+            prefix = f"{scope}/" if scope else ""
             rows = conn.execute("SELECT DISTINCT file FROM chunks").fetchall()
-            stale = [r[0] for r in rows if r[0] not in walked]
+            stale = [
+                r[0] for r in rows
+                if r[0] not in walked and (r[0] == scope or r[0].startswith(prefix))
+            ]
             for f in stale:
                 conn.execute("DELETE FROM chunks WHERE file = ?", (f,))
             evicted = len(stale)
@@ -127,7 +162,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", dest="json_out")
     args = parser.parse_args(argv)
 
-    root = Path(args.path or os.environ.get("WV_HOT_ZONE") or ".").resolve()
+    root, base = _resolve_scope(args.path)
+    scope = "" if root == base else root.relative_to(base).as_posix()
     db_path = args.db or os.environ.get("WV_DB")
     if not db_path:
         print("error: WV_DB not set and --db not provided", file=sys.stderr)
@@ -140,13 +176,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # Collect and chunk
     all_chunks: list[tuple[str, int, int, str]] = []
-    for fpath in _walk_files(root, exts):
-        rel = str(fpath.relative_to(root))
+    for fpath in _walk_files(root, exts, base):
+        rel = fpath.relative_to(base).as_posix()
         for ls, le, content in _chunk_file(fpath, args.chunk_size, args.overlap):
             all_chunks.append((rel, ls, le, content))
 
     if not all_chunks:
-        msg = {"files": 0, "chunks": 0, "embedded": False}
+        # An empty walk still proves its subtree holds nothing: evict it.
+        evicted = _upsert_chunks(db_path, [], [], scope=scope)
+        msg = {"files": 0, "chunks": 0, "embedded": False, "evicted": evicted}
         if args.json_out:
             print(json.dumps(msg))
         else:
@@ -162,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         blobs = _try_encode(texts, args.model)
         embedded = blobs[0] is not None
 
-    evicted = _upsert_chunks(db_path, all_chunks, blobs, root=root)
+    evicted = _upsert_chunks(db_path, all_chunks, blobs, scope=scope)
 
     file_count = len({c[0] for c in all_chunks})
     msg = {"files": file_count, "chunks": len(all_chunks), "embedded": embedded, "evicted": evicted}

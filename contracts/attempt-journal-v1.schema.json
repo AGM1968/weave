@@ -336,6 +336,7 @@
     "category": {
       "$comment": "A refusal that is not a policy decision. The values are contracts/policy-rules-v1.json non_policy_categories; tests/test-policy-contract.sh keeps the two equal.",
       "enum": [
+        "content_verification",
         "expected_conflict",
         "infrastructure_failure",
         "input_validation"

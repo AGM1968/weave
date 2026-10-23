@@ -17,7 +17,8 @@ import configparser
 import sys
 from pathlib import Path
 
-from .prose_rules import validate_pattern_rule
+from .listing import directory_entries
+from .prose_rules import PatternRuleValidationError, validate_pattern_rule
 
 _DEFAULT_PATTERNS_DIR = Path(__file__).parent / "default_patterns"
 
@@ -65,22 +66,32 @@ def _load_pattern_rules(
         patterns_dir / "managed",
         patterns_dir,
     ):
-        if not rule_dir.is_dir():
-            continue
+        # A tier that is there but cannot be listed is an error, not an empty
+        # tier: glob read it as holding no rules, so every rule in it stopped
+        # running while scan, list and validate exited 0 (wv-4852bd). A tier
+        # that is not there has no rules, as before.
+        try:
+            strays = directory_entries(rule_dir, "*.yml")
+            rule_files = directory_entries(rule_dir, "*.yaml")
+        except OSError as exc:
+            raise PatternRuleValidationError(
+                f"{rule_dir}: rule directory cannot be listed "
+                f"({exc.strerror or exc}); its rules would not run"
+            ) from None
         # A rule file the loader will not read must SAY SO. Only *.yaml is
         # loaded, so a perfectly valid rule saved as .yml never ran and scan,
         # list and validate all stayed silent with exit 0 -- the author had no
         # way to learn their rule was inert. Reported rather than loaded:
         # silently activating files that were never executing would change gate
         # outcomes in existing repos without anyone asking for it.
-        for stray in sorted(rule_dir.glob("*.yml")):
+        for stray in strays:
             print(
                 f"patterns: ignoring {stray}: rule files must use the .yaml "
                 f"extension; rename it to {stray.with_suffix('.yaml').name} "
                 "for it to be loaded",
                 file=sys.stderr,
             )
-        for yf in sorted(rule_dir.glob("*.yaml")):
+        for yf in rule_files:
             rule_id = yf.stem
             language = validate_pattern_rule(yf, rule_id)
             if rule_id in conf_disabled:
@@ -94,7 +105,7 @@ def _load_pattern_rules(
                 # shared, curated ones) and skip the colliding file.
                 #
                 # Deliberately NOT last-tier-wins. Silently swapping a shared
-                # rule's definition is the trap the nowcast register hit, where
+                # rule's definition is the trap one consumer's register hit, where
                 # a local copy shadowed a managed rule and was never applied.
                 # `patterns validate` still reports the collision as invalid,
                 # so the loader degrading and the linter being strict agree

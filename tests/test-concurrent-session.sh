@@ -9,6 +9,7 @@
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -91,7 +92,9 @@ if _result=$(_wv_concurrent_session "$TEST_DIR/repo"); then
 else
     check "agent-named process with a cwd inside the repo triggers an advisory" false
 fi
+# shellcheck disable=SC2016  # $1/$2 expand in the bash -c child, passed as positional arguments
 check "advisory names the offending pid" bash -c '[[ "$1" == *"$2"* ]]' _ "$_result" "$FAKE_PID"
+# shellcheck disable=SC2016  # $1/$2 expand in the bash -c child, passed as positional arguments
 check "advisory references wv-fa566a for traceability" bash -c '[[ "$1" == *"wv-fa566a"* ]]' _ "$_result"
 kill "$FAKE_PID" 2>/dev/null || true
 wait "$FAKE_PID" 2>/dev/null || true

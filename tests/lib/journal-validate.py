@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from weave_registry import (  # noqa: E402
+from weave_registry import (  # noqa: E402  # pylint: disable=wrong-import-position
     SCHEMA_KEYWORDS,
     apply_schema,
     schema_keywords,

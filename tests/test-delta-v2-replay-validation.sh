@@ -8,6 +8,7 @@
 # E6 evidence pins.
 
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 export WV_CALL_SOURCE=test
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -172,11 +172,13 @@ def rule_definition_bindings(
     bindings: dict[str, dict[str, Any]] = {}
     causes: list[dict[str, str]] = []
     default_dir = Path(__file__).parent / "default_patterns"
+    package_rules: dict[str, str]
     try:
         package_rules, manifest_sha = _package_rule_manifest(default_dir)
         package_error = None
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        package_rules, manifest_sha, package_error = {}, "", str(exc)
+        package_rules = {}
+        manifest_sha, package_error = "", str(exc)
 
     for rule_id, rule_path, _language in rules:
         package_rule = rule_path.parent == default_dir

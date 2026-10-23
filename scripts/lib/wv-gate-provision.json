@@ -1,0 +1,78 @@
+{
+  "version": 1,
+  "compatibility": {
+    "tools": ["bash", "git", "python3"],
+    "commands": {"wv": "scripts/wv"},
+    "environment": {
+      "unset": ["PYTHON*", "POETRY_*", "PIP_*", "npm_config_*", "NPM_CONFIG_*", "VIRTUAL_ENV", "NODE_PATH", "NODE_OPTIONS"],
+      "path_markers": ["pyvenv.cfg"],
+      "inherit": {"RUSTUP_HOME": "~/.rustup"},
+      "set": {
+        "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
+        "POETRY_CACHE_DIR": "{cache}/poetry", "POETRY_CONFIG_DIR": "{cache}/poetry-config",
+        "POETRY_KEYRING_ENABLED": "false", "POETRY_VIRTUALENVS_IN_PROJECT": "true",
+        "npm_config_cache": "{cache}/npm", "CARGO_HOME": "{cache}/cargo",
+        "CARGO_TARGET_DIR": "{cache}/target"
+      }
+    },
+    "executors": {
+      "bash": {"requires": [], "run": []},
+      "pytest": {"requires": ["python-dev"], "run": ["{work}/.venv/bin/python3", "-m", "pytest", "-q", "--tb=short", "-p", "no:cacheprovider"]}
+    },
+    "recipes": {
+      "python-dev": {
+        "tools": ["poetry"], "inputs": ["pyproject.toml", "poetry.lock"],
+        "run": [["python3", "-m", "venv", "--without-pip", "{work}/.venv"],
+                ["bash", "-c", "export PATH=\"$VIRTUAL_ENV/bin:$PATH\"; exec poetry sync --only main,dev --no-root --no-interaction"]],
+        "env": {"VIRTUAL_ENV": "{work}/.venv"},
+        "outputs": [".venv"],
+        "provides": {"VIRTUAL_ENV": "{work}/.venv", "PATH": "{work}/.venv/bin"}
+      },
+      "node": {
+        "tools": ["node", "npm"], "inputs": ["mcp/package.json", "mcp/package-lock.json"],
+        "cwd": "mcp", "run": ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+      },
+      "mcp/dist": {
+        "tools": ["node", "npm"], "requires": ["node"], "inputs": ["mcp/**"],
+        "cwd": "mcp", "run": ["npm", "run", "--silent", "build"], "outputs": ["mcp/dist"]
+      },
+      "rust/ipc-shadow": {
+        "tools": ["cargo", "rustc"], "inputs": ["rust/ipc-shadow/Cargo.toml", "rust/ipc-shadow/Cargo.lock"],
+        "run": ["cargo", "fetch", "--locked", "--manifest-path", "rust/ipc-shadow/Cargo.toml"]
+      },
+      "rust/e7-shadow": {
+        "tools": ["cargo", "rustc"], "inputs": ["rust/e7-shadow/Cargo.toml", "rust/e7-shadow/Cargo.lock"],
+        "run": ["cargo", "fetch", "--locked", "--manifest-path", "rust/e7-shadow/Cargo.toml"]
+      }
+    }
+  },
+  "default": {"tools": ["bash", "git", "python3"], "dependencies": [], "artifacts": [], "history": "base"},
+  "suites": {
+    "tests/lib/run-pytest.sh": {"tools": ["poetry"], "dependencies": ["python-dev"], "executor": "pytest"},
+    "tests/test-gate-suite.sh": {"tools": ["poetry", "node", "npm"], "dependencies": ["python-dev"]},
+    "tests/test-gate-snapshot.sh": {"tools": ["poetry"], "dependencies": ["python-dev"]},
+    "tests/test-pytest-weave-gh.sh": {"tools": ["poetry"], "dependencies": ["python-dev"]},
+    "tests/test-pytest-weave-eval.sh": {"tools": ["poetry"], "dependencies": ["python-dev"]},
+    "tests/test-pytest-weave-search.sh": {"tools": ["poetry"], "dependencies": ["python-dev"]},
+    "tests/test-pytest-weave-indexer.sh": {"tools": ["poetry"], "dependencies": ["python-dev"]},
+    "tests/test-pytest-profiling.sh": {"tools": ["poetry"], "dependencies": ["python-dev"]},
+    "tests/test-pytest-s4e-check.sh": {"tools": ["poetry"], "dependencies": ["python-dev"]},
+    "tests/test-rust-e5-workflows.sh": {"tools": ["poetry"], "dependencies": ["python-dev"]},
+    "tests/test-schema-contract.sh": {"tools": ["poetry"], "dependencies": ["python-dev"]},
+    "tests/test-mcp-build-isolation.sh": {"tools": ["poetry", "node"]},
+    "tests/test-mcp-vitest.sh": {"tools": ["poetry", "node", "npm"], "dependencies": ["python-dev", "node"], "artifacts": ["mcp/dist"]},
+    "tests/test-mcp-parity.sh": {"tools": ["node", "npm"], "dependencies": ["node"], "artifacts": ["mcp/dist"]},
+    "tests/test-mcp-status-scopes.sh": {"tools": ["node", "npm"], "dependencies": ["node"], "artifacts": ["mcp/dist"]},
+    "tests/test-agent-identity-parity.sh": {"tools": ["node", "npm"], "dependencies": ["node"], "artifacts": ["mcp/dist"]},
+    "tests/test-ipc-contract.sh": {"tools": ["node", "npm"], "dependencies": ["node"]},
+    "tests/test-delta-v2-writer.sh": {"tools": ["node", "npm"], "dependencies": ["node"]},
+    "tests/test-coaching-contracts.sh": {"tools": ["node", "npm"], "dependencies": ["node"]},
+    "tests/test-coaching-fixtures.sh": {"tools": ["node", "npm"], "dependencies": ["node"]},
+    "tests/test-coaching-view.sh": {"tools": ["node", "npm"], "dependencies": ["node"]},
+    "tests/test-command-capabilities.sh": {"tools": ["node", "npm"], "dependencies": ["node"]},
+    "tests/test-attempt-journal.sh": {"tools": ["node", "npm"], "dependencies": ["node"]},
+    "tests/test-rust-ipc-shadow.sh": {"tools": ["cargo", "rustc"], "dependencies": ["rust/ipc-shadow"]},
+    "tests/test-rust-e7-shadow.sh": {"tools": ["cargo", "rustc", "node", "npm"], "dependencies": ["rust/e7-shadow", "node"]},
+    "tests/test-release.sh": {"tools": ["poetry", "node", "npm"], "dependencies": ["python-dev", "node"], "artifacts": ["mcp/dist"]}
+  }
+}

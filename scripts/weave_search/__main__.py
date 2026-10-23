@@ -19,7 +19,10 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from weave_search.graph import FileContext
 
 _DEFAULT_MODEL = "minishlab/potion-code-16M"
 _FTS_SPECIAL = re.compile(r'[()"\^*~:\-]')
@@ -529,6 +532,26 @@ def _load_vector_rows(  # pylint: disable=too-many-return-statements
     return typed_rows, None
 
 
+def _rank_vector_results(rows: list[VectorRow], scores: Any, limit: int) -> list[SearchResult]:
+    """Select the highest cosine scores and materialize their chunk results."""
+    import numpy as np  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+
+    k = min(limit, len(rows))
+    if k < len(rows):
+        top = np.argpartition(scores, -k)[-k:]
+        order = top[np.argsort(scores[top])[::-1]]
+    else:
+        order = np.argsort(scores)[::-1]
+
+    return [
+        SearchResult(
+            rows[i][0], rows[i][1], rows[i][2],
+            rows[i][3], rows[i][4], float(scores[i]), "vector",
+        )
+        for i in order
+    ]
+
+
 def execute_vector_search(  # pylint: disable=too-many-return-statements
     query: str,
     db_path: str,
@@ -584,21 +607,7 @@ def execute_vector_search(  # pylint: disable=too-many-return-statements
     if not np.all(np.isfinite(scores)):
         return SearchExecutionResult([], "failure", "invalid_vector_scores")
 
-    k = min(limit, len(rows))
-    if k < len(rows):
-        top = np.argpartition(scores, -k)[-k:]
-        order = top[np.argsort(scores[top])[::-1]]
-    else:
-        order = np.argsort(scores)[::-1]
-
-    results = [
-        SearchResult(
-            rows[i][0], rows[i][1], rows[i][2],
-            rows[i][3], rows[i][4], float(scores[i]), "vector",
-        )
-        for i in order
-    ]
-    return SearchExecutionResult(results, "success")
+    return SearchExecutionResult(_rank_vector_results(rows, scores, limit), "success")
 
 
 def vector_search(
@@ -691,7 +700,7 @@ def hybrid_search(
 
 def _print_json_results(
     results: list[SearchResult],
-    graph_ctx: dict[str, Any],
+    graph_ctx: dict[str, FileContext],
     filter_resolution: FilterResolution | None,
     readiness: dict[str, ReadinessSignal],
     execution: SearchExecutionResult,
@@ -708,7 +717,7 @@ def _print_json_results(
         }
         if graph_ctx:
             file_context = graph_ctx.get(result.file)
-            entry["weave_nodes"] = file_context.weave_nodes if file_context else []
+            entry["weave_nodes"] = file_context.weave_nodes if file_context else list[dict[str, str]]()
             entry["churn"] = file_context.churn if file_context else None
             entry["hotspot"] = file_context.hotspot if file_context else None
         out.append(entry)
@@ -830,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
     quality_db = args.quality_db or (f"{hot_zone}/quality.db" if hot_zone else None)
     readiness = collect_readiness(db_path, quality_db)
 
-    graph_ctx = {}
+    graph_ctx: dict[str, FileContext] = {}
     if args.graph and results:
         from weave_search.graph import enrich_results  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
         graph_ctx = enrich_results(results, db_path, quality_db)

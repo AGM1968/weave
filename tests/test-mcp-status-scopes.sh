@@ -2,6 +2,7 @@
 # Per-scope MCP process status contract: absence is unknown for client-managed
 # stdio servers, while multiple processes in one scope are stale duplicates.
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 export WV_CALL_SOURCE=test
 

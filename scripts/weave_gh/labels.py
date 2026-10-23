@@ -17,6 +17,7 @@ STATUS_LABELS: dict[str, tuple[str, str]] = {
     # status: (label_name, color_hex)
     "active": ("weave:active", "0e8a16"),
     "blocked": ("weave:blocked", "d93f0b"),
+    "blocked-external": ("weave:blocked", "d93f0b"),
 }
 
 # Type → GitHub label mapping

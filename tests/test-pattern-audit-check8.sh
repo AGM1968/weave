@@ -8,6 +8,7 @@ export WV_CALL_SOURCE=test
 # explicitly blessed helpers or the Python quality owner module.
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

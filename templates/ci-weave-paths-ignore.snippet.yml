@@ -3,7 +3,7 @@
 # Weave's auto-checkpoint hooks emit `chore(weave): … [skip ci]` commits. Relying
 # on that commit-message token is brittle: GitHub scans the WHOLE message for
 # `[skip ci]`, so a *real* commit whose message merely MENTIONS the token is also
-# skipped (observed in the earth-engine-analysis test-bed, wv-c834af: a deploy
+# skipped (observed in a consumer test-bed, wv-c834af: a deploy
 # commit documenting the gotcha silently self-skipped, and a trailing weave commit
 # at a push HEAD suppressed the code commits under it).
 #

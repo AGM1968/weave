@@ -6,7 +6,7 @@ severity: info
 policy: always-on-shared
 maturity: promotable
 provenance: >-
-  wv-cc46cc @nowcast, ported and retained by earth-engine-analysis. Derived
+  wv-cc46cc in a consumer graph, ported and retained by a second consumer. Derived
   from repeated AI-assisted technical-writing reviews; intended as an
   editorial prompt, not proof of machine authorship.
 message: >-

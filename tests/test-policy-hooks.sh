@@ -12,6 +12,7 @@ export WV_CALL_SOURCE=test
 # on the hook's own verdict (exit status or deny JSON), so a rule that is named
 # but no longer enforced fails here too.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WV="$ROOT/scripts/wv"
 HOOKS="$ROOT/.claude/hooks"
@@ -20,7 +21,7 @@ ok()  { run=$((run+1)); pass=$((pass+1)); echo "  ✓ $1"; }
 bad() { run=$((run+1)); echo "  ✗ $1"; [ -n "${2:-}" ] && echo "      $2"; }
 TMP=$(cd "$(mktemp -d /tmp/wv-policy-hooks-XXXXXX)" && pwd -P)
 P="$TMP/project"
-LOCKS="/tmp/weave-bash-locks/$(echo "$P" | md5sum | cut -c1-8)"
+LOCKS="/tmp/weave-bash-locks-$(id -u)/$(echo "$P" | md5sum | cut -c1-8)"
 trap 'rm -rf "$TMP" "$LOCKS"' EXIT
 # POLICY_HOOKS_OBSERVATIONS keeps the observations past this suite's exit, for
 # the totality check.
@@ -66,7 +67,8 @@ hookcell() {
     case "$expect" in
         exit2) [ "$rc" = 2 ] && decided=true ;;
         deny)  [ "$rc" = 0 ] && jq -e '.hookSpecificOutput.permissionDecision == "deny"' "$TMP/hook.out" >/dev/null 2>&1 && decided=true ;;
-        block) [ "$rc" = 1 ] && jq -e '.decision == "block"' "$TMP/hook.out" >/dev/null 2>&1 && decided=true ;;
+        # A Stop block is the JSON with exit 0, the shape both hosts honour (wv-25903d).
+        block) [ "$rc" = 0 ] && jq -e '.decision == "block"' "$TMP/hook.out" >/dev/null 2>&1 && decided=true ;;
         pass)  [ "$rc" = 0 ] && ! grep -q '"deny"' "$TMP/hook.out" && decided=true ;;
     esac
     if ! $decided; then

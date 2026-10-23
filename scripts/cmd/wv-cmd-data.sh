@@ -94,16 +94,23 @@ sys.stdout.write(pat.sub(fix, sys.stdin.read()))
 # transaction) just releases it. `.dump` on a table that does not exist
 # (a DB predating tombstones) emits an empty PRAGMA/BEGIN/COMMIT block and
 # does not abort the session, matching the prior per-call behavior.
+# The tables are WV_DURABLE_TABLES (lib/wv-graph-diff.sh), the one list wv
+# hotzone diff also compares, so the removal procedure's comparison covers
+# exactly what a sync keeps (wv-4898f7). Loaded beside this file when the
+# caller sourced this module alone.
 dump_state_sql() {
-    local db="$1" outfile="$2"
-    sqlite3 -cmd ".timeout 5000" "$db" <<'SQL' 2>/dev/null | strip_unistr > "$outfile"
-BEGIN;
-.dump nodes
-.dump edges
-.dump node_files
-.dump tombstones
-COMMIT;
-SQL
+    local db="$1" outfile="$2" table
+    if ! declare -p WV_DURABLE_TABLES >/dev/null 2>&1; then
+        # shellcheck source=/dev/null
+        source "$(dirname "${BASH_SOURCE[0]}")/../lib/wv-graph-diff.sh" || return 1
+    fi
+    {
+        echo "BEGIN;"
+        for table in "${WV_DURABLE_TABLES[@]}"; do
+            echo ".dump $table"
+        done
+        echo "COMMIT;"
+    } | sqlite3 -cmd ".timeout 5000" "$db" 2>/dev/null | strip_unistr > "$outfile"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -136,7 +143,9 @@ _wv_snapshot_db() {
 # $WV_DB. db_query_json itself stays coupled to $WV_DB (used throughout the
 # rest of the codebase for live queries); this is only for the export bundle.
 _wv_query_json_snapshot() {
-    sqlite3 -json -cmd ".timeout 5000" "$1" "$2"
+    local raw
+    raw=$(sqlite3 -json -cmd ".timeout 5000" "$1" "$2") || return $?
+    printf '%s\n' "${raw:-[]}"
 }
 
 # Human pattern-finding dispositions are the only non-rebuildable quality.db
@@ -945,7 +954,8 @@ auto_checkpoint() {
         local _git_root_guard prestaged
         _git_root_guard=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
         if [ -n "$_git_root_guard" ]; then
-            prestaged=$(wv_staged_non_graph_state "$_git_root_guard")
+            prestaged=$(wv_staged_non_graph_state "$_git_root_guard") \
+                || prestaged="(the staged files could not be listed)"
             if [ -n "$prestaged" ]; then
                 {
                     echo "wv: auto-checkpoint skipped — files outside graph state already staged by caller:"
@@ -1137,8 +1147,30 @@ _sync_gh() {
     if [ -n "$_sync_stub" ]; then
         _gh_rc=0
     else
-        PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_gh "${gh_args[@]}" 2>&1 | tee "$_gh_log"
+        PYTHONSAFEPATH=1 PYTHONPATH="$_wv_pypath" "$_wv_python3" -m weave_gh "${gh_args[@]}" 2>&1 | tee "$_gh_log"
         _gh_rc=${PIPESTATUS[0]}
+    fi
+    # An integrity refusal is not a pending network step: GitHub answered, and
+    # the issue or node list it would have acted on failed a completeness
+    # check. Retrying cannot help and a 0 would read as "synced", so it fails
+    # the command (wv-820b76). Every other failure stays non-fatal (wv-5a949b).
+    # Keep in step with EXIT_INTEGRITY in scripts/weave_gh/__main__.py.
+    local _WV_GH_EXIT_INTEGRITY=3
+    if [ "$_gh_rc" -eq "$_WV_GH_EXIT_INTEGRITY" ]; then
+        echo -e "${RED}✗ GitHub sync refused: an integrity check failed (see the error above).${NC}" >&2
+        echo -e "${RED}  GitHub was not updated from it; local .weave sync is complete.${NC}" >&2
+        rm -f "$_gh_log"
+        return "$_WV_GH_EXIT_INTEGRITY"
+    fi
+    # An unexpected exception (not a failed gh/wv command) is a bug or
+    # unanticipated data, and may follow GitHub writes (wv-e869e3).
+    # Keep in step with EXIT_INTERNAL in scripts/weave_gh/__main__.py.
+    local _WV_GH_EXIT_INTERNAL=4
+    if [ "$_gh_rc" -eq "$_WV_GH_EXIT_INTERNAL" ]; then
+        echo -e "${RED}✗ GitHub sync failed: weave_gh stopped on an unexpected exception (see the traceback above).${NC}" >&2
+        echo -e "${RED}  GitHub may be partly updated; local .weave sync is complete.${NC}" >&2
+        rm -f "$_gh_log"
+        return "$_WV_GH_EXIT_INTERNAL"
     fi
     if [ "$_gh_rc" -ne 0 ]; then
         _retry_cmd="wv sync --gh"
@@ -1264,6 +1296,28 @@ _sync_gh() {
 # cmd_sync — Persist database to git layer
 # ═══════════════════════════════════════════════════════════════════════════
 
+_sync_empty_graph() {
+    # No disk layer is created for an empty, uninitialized graph. cmd_sync
+    # owns format and journal state; a failed tracker drain still fails sync.
+    local _reset_ok=true
+    wv_delta_reset "$WV_DB" || _reset_ok=false
+    if [ "$format" = "json" ]; then
+        if [ "$_reset_ok" = true ]; then
+            jq -n '{"ok": true, "skipped": true, "reason": "empty_uninitialized"}'
+        else
+            jq -n '{"ok": false, "skipped": true, "reason": "empty_uninitialized", "warning": "change tracker drain failed, retained for next sync"}'
+        fi
+    else
+        echo -e "${YELLOW}Nothing to sync: graph is empty and .weave is not initialized${NC}" >&2
+    fi
+    if [ "$_sync_journaled" = true ]; then
+        journal_end
+        journal_clean
+    fi
+    [ "$_reset_ok" = true ] || return 1
+    return 0
+}
+
 cmd_sync() {
     local gh_sync=false
     local dry_run=false
@@ -1295,23 +1349,8 @@ cmd_sync() {
 
     db_ensure
     if ! _should_persist_weave_state; then
-        local _reset_ok=true
-        wv_delta_reset "$WV_DB" || _reset_ok=false
-        if [ "$format" = "json" ]; then
-            if [ "$_reset_ok" = true ]; then
-                jq -n '{"ok": true, "skipped": true, "reason": "empty_uninitialized"}'
-            else
-                jq -n '{"ok": false, "skipped": true, "reason": "empty_uninitialized", "warning": "change tracker drain failed, retained for next sync"}'
-            fi
-        else
-            echo -e "${YELLOW}Nothing to sync: graph is empty and .weave is not initialized${NC}" >&2
-        fi
-        if [ "$_sync_journaled" = true ]; then
-            journal_end
-            journal_clean
-        fi
-        [ "$_reset_ok" = true ] || return 1
-        return 0
+        _sync_empty_graph
+        return $?
     fi
     mkdir -p "$WEAVE_DIR"
 
@@ -1345,6 +1384,7 @@ cmd_sync() {
     local tmp_nodes=$(mktemp "$WEAVE_DIR/.nodes.jsonl.XXXXXX")
     local tmp_edges=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX")
     local _snap_db=""
+    # shellcheck disable=SC2016  # the trap body expands when the trap runs, not here
     _wv_exit_trap 'rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db" 2>/dev/null; _wv_discard_staged_deltas "$_sync_staging"'
 
     # Point-in-time snapshot (round 4 finding 5): state.sql and both JSONL
@@ -1519,15 +1559,23 @@ cmd_sync() {
         # after the caller finishes their commit. Override: WV_CHECKPOINT_ALL=1.
         if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
             local _sync_prestaged
-            _sync_prestaged=$(wv_staged_non_graph_state "$git_root")
+            _sync_prestaged=$(wv_staged_non_graph_state "$git_root") \
+                || _sync_prestaged="(the staged files could not be listed)"
             if [ -n "$_sync_prestaged" ]; then
                 {
                     echo "wv: sync-state commit skipped — files outside graph state already staged by caller:"
                     echo "$_sync_prestaged" | sed 's/^/  /'
                     echo "wv: finish your commit first, or set WV_CHECKPOINT_ALL=1 to override."
                 } >&2
-                [ "$_sync_journaled" = true ] && journal_complete "$_sync_commit_step"
-                [ "$_sync_journaled" = true ] && journal_end
+                # Close the journal the way the normal path does, safety trap
+                # first: left armed, it ended the journal a second time at exit
+                # and turned this successful sync into exit 1 (wv-b8abe2).
+                if [ "$_sync_journaled" = true ]; then
+                    _wv_exit_trap
+                    journal_complete "$_sync_commit_step"
+                    journal_end
+                    journal_clean
+                fi
                 return 0
             fi
         fi
@@ -1863,7 +1911,7 @@ print(" ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     # right -- but the next auto_sync would otherwise re-emit these rows as
     # a redundant delta, so it's worth a loud warning rather than silence.
     wv_delta_reset "$db" || echo -e "${YELLOW}⚠ Delta v2 replay: change tracker drain failed — next sync may re-emit these changes${NC}" >&2
-    db_rebuild_fts
+    db_rebuild_fts || return 1
     return 0
 }
 
@@ -1919,7 +1967,7 @@ SQL
     )
     if [ "${changed:-0}" -gt 0 ] 2>/dev/null; then
         wv_delta_reset "$db" 2>/dev/null || true
-        db_rebuild_fts 2>/dev/null || true
+        db_rebuild_fts || return 1
         echo -e "${YELLOW}ℹ${NC} Reconciled $changed resurrected row(s) against deletion tombstones" >&2
     fi
 }
@@ -2010,14 +2058,17 @@ _load_install_db() {
 
 cmd_load() {
     # Snapshot of the graph as it was before the replace, for the dropped-node
-    # diff at the end. Declared here so the cleanup trap below can reach it.
+    # diff at the end. Cleanup traps capture paths before these locals expire.
     local pre_load_db=""
-    # Security: create hot zone 0700 so sibling users cannot read state
-    # (see wv-db.sh db_init; same rationale).
+    # Security: create hot zone 0700 so sibling users cannot read state, in a
+    # base no other user controls (see wv-db.sh db_init; same rationale).
     local prev_umask
     prev_umask=$(umask)
     umask 077
-    mkdir -p "$WV_HOT_ZONE"
+    if ! hot_zone_ensure "$WV_HOT_ZONE"; then
+        umask "$prev_umask"
+        return 1
+    fi
     chmod 700 "$WV_HOT_ZONE" 2>/dev/null || true
     umask "$prev_umask"
 
@@ -2030,7 +2081,7 @@ cmd_load() {
     if [ -f "$WEAVE_DIR/state.sql" ]; then
         # Atomic load: import to temp DB first, validate, then replace
         local tmp_db=$(mktemp "$WV_HOT_ZONE/.brain.db.XXXXXX")
-        _wv_exit_trap 'rm -f "$tmp_db" 2>/dev/null'
+        _wv_exit_trap "$(printf 'rm -f -- %q 2>/dev/null' "$tmp_db")"
 
         # Import ignoring non-zero exit: sqlite3 exits 1 on benign runtime errors
         # (e.g. malformed JSON in a generated column during INSERT) even when all
@@ -2112,7 +2163,7 @@ cmd_load() {
             # snapshot: the migration and strict-v2-replay paths below both
             # return early, and without this the snapshot outlives them in the
             # hot zone.
-            _wv_exit_trap 'rm -f "$pre_load_db" 2>/dev/null'
+            _wv_exit_trap "$(printf 'rm -f -- %q 2>/dev/null' "$pre_load_db")"
         else
             rm -f "$tmp_db"
             _wv_exit_trap
@@ -2158,11 +2209,15 @@ EOF
         # MUST run last among policy migrations — authoritative trigger via emitter.
         db_migrate_test_gate
         # Rebuild FTS index from node data (selective dump excludes FTS tables)
-        db_rebuild_fts
+        db_rebuild_fts || return 1
         # Initialize delta change tracking on the freshly loaded DB (idempotent).
         # Triggers are not stored in state.sql (selective dump excludes them),
-        # so they must be reinstalled after every load.
-        wv_delta_init "$WV_DB"
+        # so they must be reinstalled after every load. Without them local
+        # changes are never captured, so a failed install fails the load.
+        if ! wv_delta_init "$WV_DB"; then
+            echo -e "${RED}Error: could not install delta change tracking on $WV_DB${NC}" >&2
+            return 1
+        fi
 
         # Delta v2 CAS replay (wv-ba9dc8) — runs BEFORE the v1 SQL replay so the
         # lineage it stamps is already in place when the lineage-guarded v1
@@ -2170,7 +2225,7 @@ EOF
         # writer defaults on post-cutover (S4 wv-806a6b); a pre-cutover catalog
         # carries no sidecars, so this is a no-op there.
         if ! _delta_v2_replay "$WEAVE_DIR" "$WV_DB"; then
-            echo -e "${RED}Error: Delta v2 replay failed under WV_DELTA_V2_STRICT${NC}" >&2
+            echo -e "${RED}Error: Delta v2 replay or node search index rebuild failed${NC}" >&2
             return 1
         fi
 
@@ -2259,18 +2314,13 @@ EOF
             delta_files=$(find "$WEAVE_DIR/deltas" -name '*.sql' -printf '%f\t%p\n' 2>/dev/null | sort | cut -f2)
             if [ -n "$delta_files" ]; then
                 local skipped=0 skipped_legacy=0 skipped_cutover=0 snapshot_max_epoch=0
-                snapshot_max_epoch=$(sqlite3 "$WV_DB" "
-                    SELECT COALESCE(MAX(
-                        CASE
-                            WHEN typeof(updated_at) IN ('integer','real') THEN CAST(updated_at AS INTEGER)
-                            WHEN CAST(updated_at AS TEXT) != ''
-                                 AND CAST(updated_at AS TEXT) NOT GLOB '*[^0-9]*'
-                            THEN CAST(updated_at AS INTEGER)
-                            ELSE CAST(strftime('%s', updated_at) AS INTEGER)
-                        END
-                    ), 0)
-                    FROM nodes;
-                " 2>/dev/null || echo "0")
+                # The replay clock: one definition, shared with wv hotzone
+                # diff, which reports it when two copies disagree (wv-8d4f7d).
+                if ! declare -F wv_replay_clock_sql >/dev/null 2>&1; then
+                    # shellcheck source=/dev/null
+                    source "$(dirname "${BASH_SOURCE[0]}")/../lib/wv-graph-diff.sh"
+                fi
+                snapshot_max_epoch=$(sqlite3 "$WV_DB" "$(wv_replay_clock_sql main)" 2>/dev/null || echo "0")
                 # Collect replayable delta paths into an array, then replay in a
                 # single batched sqlite3 call instead of N subprocesses.
                 local -a new_deltas=()
@@ -2430,7 +2480,7 @@ EOF
                         # 'rebuild' re-derives from nodes for an external-content
                         # table, so it discards orphans outright. Idempotent, and only
                         # paid when deltas actually replayed.
-                        db_rebuild_fts
+                        db_rebuild_fts || return 1
                         echo -e "${GREEN}✓${NC} Replayed $delta_count delta(s)" >&2
                     fi
                 fi
@@ -2451,7 +2501,7 @@ EOF
         # v1 catalog may have resurrected a node/edge that a delete recorded a
         # tombstone for. Runs unconditionally (a tombstone can arrive via state.sql
         # with no deltas present) and is idempotent.
-        _reconcile_tombstones "$WV_DB"
+        _reconcile_tombstones "$WV_DB" || return 1
 
         # AFTER the replay and the tombstone pass, so a node the deltas restore
         # or a delete intentionally removed is not reported as lost. What is left
@@ -2465,9 +2515,11 @@ EOF
 
         echo -e "${GREEN}✓${NC} Loaded from $WEAVE_DIR/state.sql" >&2
     else
-        db_init
         # Initialize delta change tracking (idempotent)
-        wv_delta_init "$WV_DB"
+        if ! db_init || ! wv_delta_init "$WV_DB"; then
+            echo -e "${RED}Error: could not initialise the Weave database at $WV_DB${NC}" >&2
+            return 1
+        fi
         echo -e "${YELLOW}No state.sql found, initialized empty database${NC}" >&2
     fi
 
@@ -2539,7 +2591,7 @@ cmd_clean_ghosts() {
         SELECT COUNT(*) FROM edges
         WHERE source NOT IN (SELECT id FROM nodes)
         OR target NOT IN (SELECT id FROM nodes);
-    ")
+    ") || return 1
 
     if [ "$ghost_count" -eq 0 ]; then
         echo "No ghost edges found."
@@ -2563,7 +2615,7 @@ cmd_clean_ghosts() {
         DELETE FROM edges
         WHERE source NOT IN (SELECT id FROM nodes)
         OR target NOT IN (SELECT id FROM nodes);
-    "
+    " || return 1
 
     echo -e "${GREEN}✓${NC} Deleted $ghost_count ghost edge(s)"
 }
@@ -3442,11 +3494,11 @@ cmd_cutover() {
     actor=$(resolve_agent_id 2>/dev/null || echo "unknown")
     created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     printf '{"schema":"weave.causal-cutover.v1","lineage_seq":%s,"actor":"%s","created_at":"%s"}\n' \
-        "$seq" "$actor" "$created" > "$marker"
+        "$seq" "$(wv_json_escape "$actor")" "$created" > "$marker"
 
     if $as_json; then
         printf '{"status":"stamped","lineage_seq":%s,"actor":"%s","created_at":"%s","marker":"%s"}\n' \
-            "$seq" "$actor" "$created" "$marker"
+            "$seq" "$(wv_json_escape "$actor")" "$created" "$(wv_json_escape "$marker")"
     else
         echo -e "${GREEN}✓${NC} Causal cutover stamped at lineage_seq $seq → $marker"
         echo "  Commit it to activate: git add .weave/causal-cutover && git commit"
@@ -4739,7 +4791,7 @@ cmd_import() {
             local sql_text="${text//\'/\'\'}"
             local sql_metadata="${metadata//\'/\'\'}"
 
-            db_query "INSERT OR IGNORE INTO nodes (id, text, status, metadata) VALUES ('$new_id', '$sql_text', '$status', '$sql_metadata');"
+            db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$new_id', '$sql_text', '$status', '$sql_metadata');" || return 1
             echo -e "${GREEN}✓${NC} $id → $new_id: $text"
         fi
         
@@ -5230,30 +5282,63 @@ _tr_flatten() {
     printf '%s' "$1" | tr '\n\r\t' '   ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
 }
 
-_trails_save() {
-    local breadcrumb_file="$1"
-    local message="$2"
-
-    # Guard: don't materialize WEAVE_DIR for empty/uninitialized repos — same
-    # boundary rule as cmd_sync. Without this, hooks running from ~ create ~/.weave/.
-    if ! _should_persist_weave_state; then
-        return 0
+_tr_structure_ok() {
+    # _trails_save owns the sentinel; validate only generated content, never
+    # headings or row counts forged inside a free-form note body.
+    local f="$1" last start gen manifest sec oldifs
+    last=$(tail -n 1 "$f" 2>/dev/null)
+    case "$last" in "$_TR_EOF_SENTINEL sections="*) ;; *) return 1 ;; esac
+    manifest=${last#"$_TR_EOF_SENTINEL sections="}
+    # Health is emitted unconditionally; its absence means a truncated manifest.
+    case "|$manifest|" in *"|## Health|"*) ;; *) return 1 ;; esac
+    # Only the region after the LAST notes marker is generated content.
+    start=$(grep -n '^<!-- /wv-notes -->$' "$f" 2>/dev/null | tail -n 1 | cut -d: -f1)
+    if [ -n "$start" ]; then
+        gen=$(tail -n "+$((start + 1))" "$f" 2>/dev/null)
+    else
+        gen=$(cat "$f" 2>/dev/null)
     fi
+    oldifs="$IFS"
+    IFS='|'
+    for sec in $manifest; do
+        [ -n "$sec" ] || continue
+        # heading@@N counts come from the query, not the row emission.
+        local want=""
+        case "$sec" in
+            *"@@"*)
+                want=${sec##*@@}
+                sec=${sec%@@*}
+                ;;
+        esac
+        if [ -n "$want" ]; then
+            local got
+            got=$(printf '%s\n' "$gen" | awk -v h="$sec" '
+                $0 == h { inside = 1; next }
+                inside && /^## / { inside = 0 }
+                inside && /^- \*\*/ { n++ }
+                END { print n + 0 }
+            ')
+            if [ "${got:-0}" -ne "$want" ] 2>/dev/null; then
+                IFS="$oldifs"
+                return 1
+            fi
+        fi
+        if [ "$sec" = "## Notes" ]; then
+            # Notes sits before the marker; check its heading in the whole file.
+            grep -qxF -- "$sec" "$f" || { IFS="$oldifs"; return 1; }
+        elif ! grep -qxF -- "$sec" <<< "$gen"; then
+            IFS="$oldifs"
+            return 1
+        fi
+    done
+    IFS="$oldifs"
+    return 0
+}
 
-    mkdir -p "$(dirname "$breadcrumb_file")"
-
-    # ── Serialise the whole read-modify-write ────────────────────────
-    # This function reads the existing notes, rebuilds the file and rewrites it.
-    # Unserialised, concurrent saves each read the same prior state and the last
-    # writer wins: a 20-way probe retained 1 of 20 notes. The lock is held
-    # across read, build and write, and the write itself is an atomic rename so
-    # no reader observes a half-written file.
+_trails_acquire_lock() {
+    # _trails_save owns the fd/directory bindings and releases them only after
+    # the whole read-modify-write, including validation and atomic publication.
     local _tr_lock="${breadcrumb_file}.lock"
-    local _tr_lock_fd="" _tr_lock_dir=""
-    # Fail closed: a timed-out flock must fall back to the directory lock, never
-    # continue unlocked. An earlier -w 15 with `|| true` did exactly that and
-    # still lost 5 of 20 concurrent notes, because each save holds the lock for
-    # the graph queries below and 20 of them do not fit in 15s.
     local _tr_lock_wait="${WV_TRAILS_LOCK_WAIT:-120}"
     [[ "$_tr_lock_wait" =~ ^[0-9]+$ ]] && [ "$_tr_lock_wait" -gt 0 ] || _tr_lock_wait=120
     # Exactly ONE mechanism is used, chosen by availability before any process
@@ -5287,6 +5372,25 @@ _trails_save() {
             sleep 0.05
         done
     fi
+    return 0
+}
+
+_trails_save() {
+    local breadcrumb_file="$1"
+    local message="$2"
+
+    # Guard: don't materialize WEAVE_DIR for empty/uninitialized repos — same
+    # boundary rule as cmd_sync. Without this, hooks running from ~ create ~/.weave/.
+    if ! _should_persist_weave_state; then
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$breadcrumb_file")"
+
+    # Serialise the whole read/build/write. Unlocked saves lost 19 of 20 notes;
+    # a timed-out lock never permits an unlocked or independently locked write.
+    local _tr_lock_fd="" _tr_lock_dir=""
+    _trails_acquire_lock || return 1
 
     # ── Notes are append-only (Finding M) ────────────────────────────────────
     # Every other section of this file is regenerated from the graph, so Notes
@@ -5590,65 +5694,6 @@ _trails_save() {
     # failure a byte check cannot see, because a skipped heading shortens the
     # body and the file then matches that shorter body exactly. Requiring only
     # Health left every other section unguarded.
-    _tr_structure_ok() {
-        local f="$1" last start gen manifest sec oldifs
-        last=$(tail -n 1 "$f" 2>/dev/null)
-        case "$last" in "$_TR_EOF_SENTINEL sections="*) ;; *) return 1 ;; esac
-        manifest=${last#"$_TR_EOF_SENTINEL sections="}
-        # Health is emitted unconditionally; its absence means a truncated manifest.
-        case "|$manifest|" in *"|## Health|"*) ;; *) return 1 ;; esac
-        # Only the region after the LAST notes marker is generated content, so a
-        # note body cannot forge a heading into it.
-        start=$(grep -n '^<!-- /wv-notes -->$' "$f" 2>/dev/null | tail -n 1 | cut -d: -f1)
-        if [ -n "$start" ]; then
-            gen=$(tail -n "+$((start + 1))" "$f" 2>/dev/null)
-        else
-            gen=$(cat "$f" 2>/dev/null)
-        fi
-        oldifs="$IFS"
-        IFS='|'
-        for sec in $manifest; do
-            [ -n "$sec" ] || continue
-            # A manifest entry may carry the item count the DB reported for that
-            # section, as `heading@@N`. Validating headings alone let a section
-            # whose BODY failed to emit publish silently: the heading was there,
-            # the rows were gone, and the save reported success. The count comes
-            # from the query that decided to emit the section, so it is
-            # independent of whatever the emission actually produced.
-            local want=""
-            case "$sec" in
-                *"@@"*)
-                    want=${sec##*@@}
-                    sec=${sec%@@*}
-                    ;;
-            esac
-            if [ -n "$want" ]; then
-                local got
-                got=$(printf '%s\n' "$gen" | awk -v h="$sec" '
-                    $0 == h { inside = 1; next }
-                    inside && /^## / { inside = 0 }
-                    inside && /^- \*\*/ { n++ }
-                    END { print n + 0 }
-                ')
-                if [ "${got:-0}" -ne "$want" ] 2>/dev/null; then
-                    IFS="$oldifs"
-                    return 1
-                fi
-            fi
-            if [ "$sec" = "## Notes" ]; then
-                # The Notes heading sits inside the notes block, BEFORE the
-                # marker, so it cannot be found in the generated region. It is
-                # checked against the whole file; forging it gains nothing,
-                # since a forged Notes heading is what the notes block is for.
-                grep -qxF -- "$sec" "$f" || { IFS="$oldifs"; return 1; }
-            elif ! grep -qxF -- "$sec" <<< "$gen"; then
-                IFS="$oldifs"
-                return 1
-            fi
-        done
-        IFS="$oldifs"
-        return 0
-    }
     if [ "$_tr_write_rc" -ne 0 ] || [ ! -s "$_tr_tmp" ] || ! _tr_structure_ok "$_tr_tmp"; then
         rm -f "$_tr_tmp" 2>/dev/null || true
         _trails_release_lock "${_tr_lock_fd:-}" "${_tr_lock_dir:-}"

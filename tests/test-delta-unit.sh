@@ -8,6 +8,7 @@ export WV_CALL_SOURCE=test
 # No wv CLI invocations — sources wv-delta.sh directly.
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -906,6 +907,20 @@ got=$(wv_lineage_seq_base "$CAT/no-such.db" "$CAT")
 [ "$got" = "12" ] && ok "the lineage base is the highest catalog sequence" \
     || fail "the lineage base is the highest catalog sequence" "got '$got'"
 rm -rf "$CAT"
+
+# wv_delta_init reports a failed install (wv-853f9f). It ended on an
+# assignment, so a sqlite3 that could not open the database returned 0 and the
+# memo claimed the triggers existed.
+echo ""
+echo "wv_delta_init failure"
+_WV_DELTA_INITED=""
+if wv_delta_init "/nonexistent-delta-unit-$$/brain.db" 2>/dev/null; then
+    fail "wv_delta_init returns nonzero when sqlite3 cannot open the database" "returned 0"
+else
+    ok "wv_delta_init returns nonzero when sqlite3 cannot open the database"
+fi
+[ -z "$_WV_DELTA_INITED" ] && ok "...and does not mark delta tracking installed" \
+    || fail "...and does not mark delta tracking installed" "_WV_DELTA_INITED=$_WV_DELTA_INITED"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 

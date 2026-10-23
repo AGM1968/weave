@@ -51,7 +51,7 @@ ID_PATTERN = re.compile(r"^_?[a-z0-9]+(-[a-z0-9]+)*$")
 _HEADING = re.compile(r"##\s+(.+?)\s*$")
 
 # The declared-extension separator. Pipe rather than comma because the section
-# names this exists to carry are prose -- nowcast's read "The appended negation,
+# names this exists to carry are prose -- one consumer's read "The appended negation,
 # a second form under this type" -- and a comma would split them mid-name.
 SECTION_DECLARATION_SEPARATOR = "|"
 # A declared name is prose, not an identifier, but it still has to be a name: no
@@ -206,13 +206,16 @@ def _declared_sections(path: Path, raw: str | None, code: str) -> dict[str, str]
     return declared
 
 
-def parse_guide(path: Path, source: str) -> Guide:
-    """Parse and validate one guide file. Raises :class:`GuideError`."""
-    code = "guide_override_invalid" if source == "project" else "guide_invalid"
+def _read_frontmatter(path: Path, code: str) -> tuple[str, dict[str, str], str]:
+    """Read a guide's text and flat frontmatter, returning the unparsed section body."""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise GuideError(f"{path}: cannot be read ({exc.strerror or exc})", code, path) from None
+    except UnicodeDecodeError as exc:
+        # A per-guide diagnostic, not a crash that loses every other result
+        # (wv-7730bd): the file is invalid, the run that reads it is not.
+        raise GuideError(f"{path.name}: not valid UTF-8 at byte {exc.start}", code, path) from None
 
     if not text.startswith("---\n"):
         raise GuideError(f"{path.name}: missing frontmatter opening fence", code, path)
@@ -238,6 +241,13 @@ def parse_guide(path: Path, source: str) -> Guide:
     for required in REQUIRED_FRONTMATTER:
         if not frontmatter.get(required):
             raise GuideError(f"{path.name}: frontmatter {required} is required", code, path)
+    return text, frontmatter, body
+
+
+def parse_guide(path: Path, source: str) -> Guide:
+    """Parse and validate one guide file. Raises :class:`GuideError`."""
+    code = "guide_override_invalid" if source == "project" else "guide_invalid"
+    text, frontmatter, body = _read_frontmatter(path, code)
 
     stem = path.name[: -len(".md")] if path.name.endswith(".md") else path.name
     parts = stem.split(".")
@@ -397,7 +407,17 @@ def resolve(
     guide_id = entry["guide"]
 
     for path, source in candidate_paths(guide_id, language, project_root, package_dir):
-        if not path.is_file():
+        try:
+            present = path.is_file()
+        except OSError as exc:
+            # An unreadable directory on the chain is not "no guide here": the
+            # guide that would win may be behind it (wv-7730bd).
+            raise GuideError(
+                f"{path}: cannot be checked ({exc.strerror or exc})",
+                "guide_override_invalid" if source == "project" else "guide_invalid",
+                path,
+            ) from None
+        if not present:
             continue
         guide = parse_guide(path, source)
         if source == "fallback":
@@ -437,3 +457,185 @@ def resolve_all(
         ).resolution()
         for violation_type in sorted(set(violation_types))
     }
+
+
+# The vocabulary contract's entry statuses and guide basename rule
+# (contracts/violation-vocabulary-v1.json guide_basename_rules.pattern; the
+# leading underscore is reserved for the presentation guides). Fixed here, not
+# read from the catalogue being checked, so a corrupted catalogue cannot
+# loosen its own rules.
+CATALOG_STATUSES = frozenset({"canonical", "compatibility", "legacy"})
+CATALOG_GUIDE_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+
+def validate_catalog(catalog: Any) -> list[str]:
+    """The catalogue's canonical types, after checking the structure doctor relies on.
+
+    A catalogue that is not an object with a non-empty `types` object, whose
+    entries each carry a supported `status` and a `guide` basename the
+    vocabulary contract allows, is rejected; so is one with no canonical type.
+    Invalid input must never become an empty universe that reports complete
+    (wv-7730bd), nor a smaller one: a misspelled status read as "not
+    canonical" dropped that type from coverage, and its missing guide with it
+    (wv-b303c9).
+    """
+    types = catalog.get("types") if isinstance(catalog, dict) else None
+    if not isinstance(types, dict) or not types:
+        raise GuideError("catalog has no types object", "catalog_unreadable")
+    for key, entry in types.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("status"), str) \
+                or not isinstance(entry.get("guide"), str) or not entry["guide"]:
+            raise GuideError(f"catalog entry {key!r} lacks a status or guide basename", "catalog_unreadable")
+        if entry["status"] not in CATALOG_STATUSES:
+            raise GuideError(f"catalog entry {key!r} has unsupported status {entry['status']!r} "
+                             f"(expected one of {', '.join(sorted(CATALOG_STATUSES))})", "catalog_unreadable")
+        if CATALOG_GUIDE_PATTERN.fullmatch(entry["guide"]) is None:
+            raise GuideError(f"catalog entry {key!r} has guide basename {entry['guide']!r}, "
+                             f"which does not match {CATALOG_GUIDE_PATTERN.pattern}", "catalog_unreadable")
+    canonical = sorted(k for k, v in types.items() if v["status"] == "canonical")
+    if not canonical:
+        raise GuideError("catalog declares no canonical type", "catalog_unreadable")
+    return canonical
+
+
+def _project_assets(project_root: Path | None, invalid: list[dict[str, str]]) -> list[Guide]:
+    """Every project guide under .weave/guides/ that parses; the rest go to INVALID."""
+    if project_root is None:
+        return []
+    project_dir = project_root / PROJECT_GUIDES
+    try:
+        if not project_dir.is_dir():
+            return []
+        # iterdir, not glob: glob swallows a permission error and reports an
+        # unlistable directory as one holding no guides.
+        paths = sorted(p for p in project_dir.iterdir() if p.suffix == ".md")
+    except OSError as exc:
+        raise GuideError(f"{project_dir}: cannot be listed ({exc.strerror or exc})",
+                         "guide_override_invalid", project_dir) from None
+    parsed: list[Guide] = []
+    for path in paths:
+        try:
+            parsed.append(parse_guide(path, "project"))
+        except GuideError as exc:
+            invalid.append({"file": path.name, "error": str(exc)})
+    return parsed
+
+
+# The worked guide init-repo seeds into every project
+# (templates/authoring/manifest.conf). Its type is deliberately not in the
+# vocabulary, so it resolves for nothing; doctor lists it apart from unused.
+SEEDED_EXAMPLE_ID = "example-violation"
+
+
+def doctor_report(
+    catalog: dict[str, Any],
+    project_root: Path | None = None,
+    package_dir: Path | None = None,
+) -> dict[str, Any]:
+    """What `wv doctor` records about coaching guides (wv-7730bd).
+
+    Computed with the shipped parser and resolver, never a second validator
+    that could drift from them. Raises GuideError when the catalogue or the
+    project guides directory cannot be read: that is a failed check, not a
+    report.
+      invalid        project guides parse_guide rejects, with the error
+      unresolved     resolutions that raise: each project guide is resolved
+                     in its own context (the catalogued type it serves, in
+                     its own language), and each canonical type generically.
+                     A parse-valid override coaching the wrong type fails
+                     here, as it would in a coaching run.
+      unused         project guides whose id is no catalogued guide basename:
+                     no resolution ever selects them
+      examples       the guide init-repo seeds to copy (SEEDED_EXAMPLE_ID),
+                     while its type is still uncatalogued: unused by design
+      fallback_only  canonical types that coach only through _uncoached
+    """
+    canonical = validate_catalog(catalog)
+    types = catalog["types"]
+    invalid: list[dict[str, str]] = []
+    unresolved: list[dict[str, Any]] = []
+    unused: list[str] = []
+    examples: list[str] = []
+    assets = _project_assets(project_root, invalid)
+    for guide in assets:
+        served = sorted(k for k, v in types.items() if v["guide"] == guide.id)
+        if not served:
+            name = f"{guide.id}.{guide.language}.md" if guide.language else f"{guide.id}.md"
+            seeded = guide.id == SEEDED_EXAMPLE_ID and guide.violation_type not in types
+            (examples if seeded else unused).append(name)
+        for violation_type in served:
+            try:
+                resolve(violation_type, catalog, guide.language, project_root, package_dir)
+            except GuideError as exc:
+                unresolved.append({"violation_type": violation_type, "language": guide.language,
+                                   "error": str(exc)})
+    fallback_only: list[str] = []
+    for violation_type in canonical:
+        try:
+            resolved = resolve(violation_type, catalog, None, project_root, package_dir)
+        except GuideError as exc:
+            entry = {"violation_type": violation_type, "language": None, "error": str(exc)}
+            if entry not in unresolved:
+                unresolved.append(entry)
+            continue
+        if resolved.missing_guide_id is not None:
+            fallback_only.append(violation_type)
+    return {
+        "project_guides_checked": len(assets) + len(invalid),
+        "invalid": invalid,
+        "unresolved": unresolved,
+        "unused": unused,
+        "examples": examples,
+        "canonical_types": len(canonical),
+        "fallback_only": fallback_only,
+    }
+
+
+def default_catalog() -> Path:
+    """The vocabulary, found as weave_quality finds it: beside the package when
+    installed ($LIB_DIR/contracts), else at the source checkout's root."""
+    installed = Path(__file__).resolve().parents[1] / "contracts" / "violation-vocabulary-v1.json"
+    if installed.is_file():
+        return installed
+    return Path(__file__).resolve().parents[2] / "contracts" / "violation-vocabulary-v1.json"
+
+
+def _main(argv: list[str]) -> int:
+    """`python3 -m weave_quality.guides doctor [--catalog F] [--project-root D] [--package-dir D]`."""
+    import argparse  # pylint: disable=import-outside-toplevel
+    import json  # pylint: disable=import-outside-toplevel
+
+    parser = argparse.ArgumentParser(prog="weave_quality.guides")
+    sub = parser.add_subparsers(dest="command", required=True)
+    doc = sub.add_parser("doctor", help="validate project guides and report coaching coverage as JSON")
+    doc.add_argument("--catalog", type=Path, default=None)
+    doc.add_argument("--project-root", type=Path)
+    doc.add_argument("--package-dir", type=Path)
+    args = parser.parse_args(argv)
+    # A report is printed only when the check could run. Anything that stops
+    # it (an unreadable or malformed catalogue, an unlistable guides directory)
+    # prints {"error": ...} and exits 2, so the caller fails closed instead of
+    # reading a partial or empty report as a pass.
+    catalog_path = args.catalog or default_catalog()
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        report = doctor_report(catalog, args.project_root, args.package_dir)
+    except GuideError as exc:
+        print(json.dumps({"error": str(exc), "code": exc.code}, sort_keys=True))
+        return 2
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        print(json.dumps({"error": f"{catalog_path}: {exc}", "code": "catalog_unreadable"}, sort_keys=True))
+        return 2
+    # Which copy produced the report, so the caller can refuse a report from a
+    # module other than the one it selected (wrong copy of the tool).
+    report["module"] = str(Path(__file__).resolve())
+    report["package_dir"] = str((args.package_dir or PACKAGE_GUIDES).resolve())
+    report["catalog"] = str(catalog_path.resolve())
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    raise SystemExit(_main(sys.argv[1:]))

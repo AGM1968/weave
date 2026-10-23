@@ -9,8 +9,8 @@
 # branch already includes its operation's rules.
 
 WV_POLICY_SCHEMA="weave.policy-rules.v1"
-WV_POLICY_CONTRACT_VERSION="1.11.1"
-WV_POLICY_IDENTITY="c5c89ab42be2fb19a4dfdcddd80245c005ec808d058f7160e3136c5ab87edaee"
+WV_POLICY_CONTRACT_VERSION="1.13.1"
+WV_POLICY_IDENTITY="b2ee8de64da4f4750849fda6635967b3622f188ed7130be8bab6968b4bcedc2e"
 
 _wv_policy_applicable() {
     case "${1}:${2-}" in

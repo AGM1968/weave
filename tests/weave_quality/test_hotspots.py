@@ -30,7 +30,7 @@ from weave_quality.models import FileEntry, FunctionCC, GitStats
 
 def _entry(
     filepath: str = "test.py",
-    complexity: int = 10,
+    complexity: float = 10,
     loc: int = 100,
     category: str = "production",
 ) -> FileEntry:

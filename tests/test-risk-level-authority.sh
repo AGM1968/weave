@@ -7,6 +7,7 @@ export WV_CALL_SOURCE=test
 # back to an SQL-only delta with only a stderr warning. The CLI now refuses any
 # value the contract does not admit, on every path that stores metadata.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WV="$ROOT/scripts/wv"
 run=0; pass=0

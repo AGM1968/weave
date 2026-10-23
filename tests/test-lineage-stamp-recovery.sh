@@ -22,6 +22,7 @@ export WV_CALL_SOURCE=test
 # before trusting a result. Without that a failure here reads as a pass against
 # the developer's live graph.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -208,6 +209,7 @@ fi
 # "a permanent fault never promises a retry" passes vacuously above, because the
 # stamp's own stderr never contained that sentence in the first place.
 
+# shellcheck disable=SC2016  # the pattern matches literal $ in the source text it reads
 caller_block=$(sed -n '/wv_lineage_stamp "\$db"/,/^    fi$/p' "$ROOT/scripts/cmd/wv-cmd-data.sh")
 if [ -z "$caller_block" ]; then
     bad "the stamp call site was located in wv-cmd-data.sh" "sed range matched nothing — did the call move?"

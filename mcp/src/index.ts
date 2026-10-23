@@ -276,12 +276,15 @@ function resolveProjectRoot(): string {
 // self-set with no known leak vector; CODEX_THREAD_ID/CODEX_CI can be
 // co-present with a genuine top-level Claude Code session and must not win
 // (wv-4d4c96 — that direction previously mislabeled real Claude sessions codex).
+// Claude's marker is CLAUDECODE=1, set in every process Claude Code starts;
+// CLAUDE_CODE_SSE_PORT is set only with an IDE attached and stays an alias
+// (wv-50640a).
 const AGENT_HARNESS_PRECEDENCE = ["copilot", "claude", "codex"] as const;
 type AgentHarness = (typeof AGENT_HARNESS_PRECEDENCE)[number] | "human";
 
 export function resolveAgentHarness(): AgentHarness {
   const present: Array<(typeof AGENT_HARNESS_PRECEDENCE)[number]> = [];
-  if (process.env.CLAUDE_CODE_SSE_PORT) present.push("claude");
+  if (process.env.CLAUDECODE === "1" || process.env.CLAUDE_CODE_SSE_PORT) present.push("claude");
   if (process.env.CODEX_THREAD_ID || process.env.CODEX_CI === "1") present.push("codex");
   if (process.env.COPILOT_AGENT === "1") present.push("copilot");
 
@@ -430,6 +433,10 @@ function isValidPatternListEntry(value: unknown): boolean {
   const entry = value as Record<string, unknown>;
   if (typeof entry.rule_id !== "string" || entry.rule_id.length === 0) return false;
   if (typeof entry.path !== "string" || entry.path.length === 0) return false;
+  return isValidPatternListStatus(entry);
+}
+
+function isValidPatternListStatus(entry: Record<string, unknown>): boolean {
   switch (entry.status) {
     case "not_run":
       return entry.hits === null && !("error" in entry);
@@ -456,16 +463,7 @@ function isValidPatternListEntry(value: unknown): boolean {
 const SHADOW_ADVISORY_RE =
   /^⚠ (\S+): \.weave\/patterns\/\1\.yaml shadows an available managed rule of the same id \(never applied\) — delete the local copy AND run 'wv init-repo --update' to sync the managed version, if this was a completed promotion$/;
 
-function wvQualityPatternsList(cmd: string[], patPath: string | undefined): string {
-  // wv-c9ea87 (external code review round 2): list's own scan and its
-  // internal report call each used to get an independent, fresh 60s
-  // timeout budget -- a slow scan followed by a report call that also
-  // stalls could block this single synchronous MCP request for close to
-  // 120s combined, well past what a calling client's own timeout expects.
-  // One shared deadline now covers the whole call; the report call only
-  // ever gets whatever's left of it, never a fresh budget of its own.
-  const deadline = Date.now() + PATTERNS_LIST_BUDGET_MS;
-  const result = spawnWv(cmd, PATTERNS_LIST_BUDGET_MS);
+function parsePatternListResult(result: ReturnType<typeof spawnWv>): { rules: unknown[]; shadowAdvisories: string[] } {
   if (result.error && result.status === null) {
     throw new Error(result.error.message || "wv command failed");
   }
@@ -500,6 +498,10 @@ function wvQualityPatternsList(cmd: string[], patPath: string | undefined): stri
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => SHADOW_ADVISORY_RE.test(line));
+  return { rules, shadowAdvisories };
+}
+
+function readPatternListScope(patPath: string | undefined, deadline: number): { scope: string | null; scopeError: string | null } {
   // scope comes from `report`'s own --json payload, which already computes
   // it from the SAME underlying source (latest_pattern_run's stored
   // target, or an explicit path) as list's own text-mode header — see
@@ -612,6 +614,15 @@ function wvQualityPatternsList(cmd: string[], patPath: string | undefined): stri
       }
     }
   }
+  return { scope, scopeError };
+}
+
+function wvQualityPatternsList(cmd: string[], patPath: string | undefined): string {
+  // wv-c9ea87: one shared deadline covers list and its internal report call.
+  // The report gets only the remaining budget, never a fresh timeout.
+  const deadline = Date.now() + PATTERNS_LIST_BUDGET_MS;
+  const { rules, shadowAdvisories } = parsePatternListResult(spawnWv(cmd, PATTERNS_LIST_BUDGET_MS));
+  const { scope, scopeError } = readPatternListScope(patPath, deadline);
   const payload: Record<string, unknown> = { rules, scope, shadow_advisories: shadowAdvisories };
   if (scopeError !== null) payload.scope_error = scopeError;
   return JSON.stringify(payload);
@@ -739,13 +750,18 @@ function wvQualityPatternsValidate(cmd: string[]): string {
     );
   }
   const stdout = stripAnsi(result.stdout?.trim() || "");
+  validatePatternRules(stdout, result.status, result.stderr);
+  return stdout;
+}
+
+function validatePatternRules(stdout: string, status: number | null, stderr: string): void {
   let payload: unknown;
   try {
     payload = JSON.parse(stdout);
   } catch {
     throw new Error(
-      `wv quality patterns validate produced malformed JSON (exit ${result.status}): ` +
-        (stdout.slice(0, 200) || result.stderr?.trim() || "(empty output)")
+      `wv quality patterns validate produced malformed JSON (exit ${status}): ` +
+        (stdout.slice(0, 200) || stderr?.trim() || "(empty output)")
     );
   }
   const rec = payload as { valid?: unknown; rules?: unknown; coverage?: unknown } | null;
@@ -766,30 +782,29 @@ function wvQualityPatternsValidate(cmd: string[]): string {
     !isValidPatternCoverage(rec.coverage)
   ) {
     throw new Error(
-      `wv quality patterns validate returned an unexpected payload shape (exit ${result.status}): ${stdout.slice(0, 200)}`
+      `wv quality patterns validate returned an unexpected payload shape (exit ${status}): ${stdout.slice(0, 200)}`
     );
   }
   const rules = rec.rules as unknown[];
   if (!rules.every(isValidPatternValidateEntry)) {
     throw new Error(
-      `wv quality patterns validate returned a rules[] entry with an unexpected shape (exit ${result.status}): ${stdout.slice(0, 200)}`
+      `wv quality patterns validate returned a rules[] entry with an unexpected shape (exit ${status}): ${stdout.slice(0, 200)}`
     );
   }
   const allEntriesValid = rules.every((entry) => (entry as { status: string }).status === "valid");
   if (rec.valid !== allEntriesValid) {
     throw new Error(
       `wv quality patterns validate's top-level "valid" (${rec.valid}) disagrees with its own rules[] statuses ` +
-        `(exit ${result.status}): ${stdout.slice(0, 200)}`
+        `(exit ${status}): ${stdout.slice(0, 200)}`
     );
   }
   const expectedStatus = rec.valid ? 0 : 1;
-  if (result.status !== expectedStatus) {
+  if (status !== expectedStatus) {
     throw new Error(
-      `wv quality patterns validate exit code (${result.status}) disagrees with its own payload ` +
+      `wv quality patterns validate exit code (${status}) disagrees with its own payload ` +
         `(valid: ${rec.valid}) -- expected exit ${expectedStatus}`
     );
   }
-  return stdout;
 }
 
 // wv-67a6e5 (external code review round 3, finding 7): cmd_patterns_report's
@@ -2298,6 +2313,109 @@ function normalizeStatus(status: string | undefined): string | undefined {
   return COMPAT_MAP[status] ?? status;
 }
 
+// Typed learnings form the structured prefix; raw learning remains context.
+function composeLearning(args: Record<string, unknown>): string | undefined {
+  let learning = args.learning as string | undefined;
+  const decision = args.decision as string | undefined;
+  const pattern = args.pattern as string | undefined;
+  const pitfall = args.pitfall as string | undefined;
+  if (decision || pattern || pitfall) {
+    const parts: string[] = [];
+    if (decision) parts.push(`decision: ${decision}`);
+    if (pattern) parts.push(`pattern: ${pattern}`);
+    if (pitfall) parts.push(`pitfall: ${pitfall}`);
+    const structured = parts.join(" | ");
+    learning = learning ? `${structured} | ${learning}` : structured;
+  }
+  return learning;
+}
+
+function nodeCreationWarnings(gh: boolean | undefined, parent: string | undefined, alias: string | undefined): string[] {
+  // Child nodes need no --gh nudge: only their epic needs a GitHub issue.
+  const warnings: string[] = [];
+  if (!gh && !parent) warnings.push("WARNING: No --gh flag. Node has no GitHub issue. Use gh=true for traceability.");
+  if (!alias) warnings.push("WARNING: No alias set. Use alias parameter for readable node names.");
+  return warnings;
+}
+
+function syncSessionGraph(gh: boolean, mode: string | undefined): string[] {
+  const parts: string[] = [];
+  try {
+    const syncCmd = gh && MCP_ALLOW_NETWORK ? ["sync", "--gh"] : ["sync"];
+    if (mode) syncCmd.push(`--mode=${mode}`);
+    parts.push("=== Sync ===\n" + wv(syncCmd, WV_LIFECYCLE_TIMEOUT));
+    if (gh && !MCP_ALLOW_NETWORK) {
+      parts.push("\n=== GitHub Sync ===\n" + mcpNetworkFallback(`wv sync --gh${mode ? ` --mode=${mode}` : ""}`));
+    }
+  } catch (e) {
+    parts.push("=== Sync ===\nError: " + (e as Error).message);
+  }
+  return parts;
+}
+
+function validatePatternPromotion(args: Record<string, unknown>): void {
+  const canonical = args.canonical as boolean | undefined;
+  const applyPlan = args.apply as boolean | undefined;
+  const patDryRun = args.dry_run as boolean | undefined;
+  const planFile = args.plan_file as string | undefined;
+  const patParent = args.parent as string | undefined;
+  if (applyPlan && !canonical) {
+    throw new Error("weave_quality_patterns promote: apply requires canonical");
+  }
+  if (applyPlan && patDryRun) {
+    throw new Error("weave_quality_patterns promote: apply and dry_run are mutually exclusive");
+  }
+  if (applyPlan && !planFile) {
+    throw new Error("weave_quality_patterns promote: apply requires plan_file");
+  }
+  // The read-only inspect scope refuses both canonical apply and legacy
+  // promote without dry_run. Review remains available; CLI behavior is unchanged.
+  const mutates = applyPlan || (!canonical && !patDryRun);
+  if (mutates && ACTIVE_SCOPE === "inspect") {
+    throw new Error(
+      "weave_quality_patterns promote: this call creates Weave nodes and is not available in " +
+        'the read-only "inspect" scope. Review here (canonical defaults to dry-run, and legacy ' +
+        "promote accepts dry_run), then run the mutating call from the graph scope, which " +
+        "authorizes mutation."
+    );
+  }
+  // Apply takes its parent from the reviewed plan; planning requires a parent.
+  // The CLI refuses an explicit parent that disagrees with the plan.
+  if (!patParent && !applyPlan) {
+    throw new Error("weave_quality_patterns promote requires parent");
+  }
+}
+
+function appendPatternPromotion(cmd: string[], args: Record<string, unknown>): void {
+  const canonical = args.canonical as boolean | undefined;
+  const applyPlan = args.apply as boolean | undefined;
+  const patDryRun = args.dry_run as boolean | undefined;
+  const planFile = args.plan_file as string | undefined;
+  const patParent = args.parent as string | undefined;
+  const language = args.language as string | undefined;
+  validatePatternPromotion(args);
+  if (patParent) cmd.push(`--parent=${patParent}`);
+  if (patDryRun) cmd.push("--dry-run");
+  if (canonical) cmd.push("--canonical");
+  if (applyPlan) cmd.push("--apply");
+  if (planFile) cmd.push(`--plan-file=${planFile}`);
+  if (language) cmd.push(`--language=${language}`);
+}
+
+function appendPatternShow(cmd: string[], args: Record<string, unknown>): void {
+  // Unlike scan/list/validate/report, show's positional argument is a rule id;
+  // its repository root travels as --path, not as the positional argument.
+  const ruleId = args.rule_id as string | undefined;
+  const showAll = args.all as boolean | undefined;
+  const patPath = args.path as string | undefined;
+  if (!ruleId && !showAll) {
+    throw new Error("weave_quality_patterns show requires rule_id or all=true");
+  }
+  if (ruleId) cmd.push(ruleId);
+  if (showAll) cmd.push("--all");
+  if (patPath) cmd.push(`--path=${patPath}`);
+}
+
 // Tool handlers
 // ── Tool dispatch table ──────────────────────────────────────────────────────
 // Each handler returns either the result text or, for enforcement paths
@@ -2347,10 +2465,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     if (verificationPlan) cmd.push(`--verification-plan=${verificationPlan}`);
     if (reconstructId) cmd.push(`--id=${reconstructId}`);
     result = wv(cmd);
-    // Enforcement warnings — suppress --gh nudge for child nodes (only epic needs a GH issue)
-    const warnings: string[] = [];
-    if (!gh && !parent) warnings.push("WARNING: No --gh flag. Node has no GitHub issue. Use gh=true for traceability.");
-    if (!alias) warnings.push("WARNING: No alias set. Use alias parameter for readable node names.");
+    const warnings = nodeCreationWarnings(gh, parent, alias);
     if (warnings.length) result += "\n\n" + warnings.join("\n");
     return result;
   },
@@ -2358,23 +2473,12 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   weave_done: (args) => {
     let result: string;
     const id = args.id as string;
-    let learning = args.learning as string | undefined;
+    const learning = composeLearning(args);
     const decision = args.decision as string | undefined;
     const pattern = args.pattern as string | undefined;
     const pitfall = args.pitfall as string | undefined;
     const noWarn = args.no_warn as boolean | undefined;
     const noOverlapCheck = args.no_overlap_check as boolean | undefined;
-
-    // Compose pipe-delimited learning string from typed params
-    // Merge: typed params compose structured prefix; raw learning appended as context
-    if (decision || pattern || pitfall) {
-      const parts: string[] = [];
-      if (decision) parts.push(`decision: ${decision}`);
-      if (pattern) parts.push(`pattern: ${pattern}`);
-      if (pitfall) parts.push(`pitfall: ${pitfall}`);
-      const structured = parts.join(" | ");
-      learning = learning ? `${structured} | ${learning}` : structured;
-    }
 
     const verificationMethod = args.verification_method as string | undefined;
     const verificationEvidence = args.verification_evidence as string | undefined;
@@ -2397,20 +2501,8 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   weave_batch_done: (args) => {
     let result: string;
     const ids = args.ids as string[];
-    let learning = args.learning as string | undefined;
-    const decision = args.decision as string | undefined;
-    const pattern = args.pattern as string | undefined;
-    const pitfall = args.pitfall as string | undefined;
+    const learning = composeLearning(args);
     const noWarn = args.no_warn as boolean | undefined;
-
-    if (decision || pattern || pitfall) {
-      const parts: string[] = [];
-      if (decision) parts.push(`decision: ${decision}`);
-      if (pattern) parts.push(`pattern: ${pattern}`);
-      if (pitfall) parts.push(`pitfall: ${pitfall}`);
-      const structured = parts.join(" | ");
-      learning = learning ? `${structured} | ${learning}` : structured;
-    }
 
     const cmd = ["batch-done", ...ids];
     if (learning) cmd.push(`--learning=${learning}`);
@@ -2604,23 +2696,9 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   weave_ship: (args) => {
     let result: string;
     const id = args.id as string;
-    let learning = args.learning as string | undefined;
-    const decision = args.decision as string | undefined;
-    const pattern = args.pattern as string | undefined;
-    const pitfall = args.pitfall as string | undefined;
+    const learning = composeLearning(args);
     const gh = args.gh as boolean | undefined;
     const noOverlapCheck = args.no_overlap_check as boolean | undefined;
-
-    // Compose pipe-delimited learning string from typed params
-    // Merge: typed params compose structured prefix; raw learning appended as context
-    if (decision || pattern || pitfall) {
-      const parts: string[] = [];
-      if (decision) parts.push(`decision: ${decision}`);
-      if (pattern) parts.push(`pattern: ${pattern}`);
-      if (pitfall) parts.push(`pitfall: ${pitfall}`);
-      const structured = parts.join(" | ");
-      learning = learning ? `${structured} | ${learning}` : structured;
-    }
 
     const verificationMethod = args.verification_method as string | undefined;
     const verificationEvidence = args.verification_evidence as string | undefined;
@@ -2885,19 +2963,8 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     let result: string;
     const gh = (args.gh as boolean) ?? false;
     const mode = args.mode as string | undefined;
-    const parts: string[] = [];
-
     // 1. Sync graph (+ optional GH)
-    try {
-      const syncCmd = gh && MCP_ALLOW_NETWORK ? ["sync", "--gh"] : ["sync"];
-      if (mode) syncCmd.push(`--mode=${mode}`);
-      parts.push("=== Sync ===\n" + wv(syncCmd, WV_LIFECYCLE_TIMEOUT));
-      if (gh && !MCP_ALLOW_NETWORK) {
-        parts.push("\n=== GitHub Sync ===\n" + mcpNetworkFallback(`wv sync --gh${mode ? ` --mode=${mode}` : ""}`));
-      }
-    } catch (e) {
-      parts.push("=== Sync ===\nError: " + (e as Error).message);
-    }
+    const parts = syncSessionGraph(gh, mode);
 
     // 2. Check uncommitted files
     try {
@@ -3167,8 +3234,6 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   weave_quality_patterns: (args) => {
     const subcommand = args.subcommand as string;
     const patPath = args.path as string | undefined;
-    const patParent = args.parent as string | undefined;
-    const patDryRun = args.dry_run as boolean | undefined;
     const findingKey = args.finding_key as string | undefined;
     const disposition = args.disposition as string | undefined;
     const note = args.note as string | undefined;
@@ -3180,18 +3245,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     if (subcommand === "scan" || subcommand === "list" || subcommand === "validate" || subcommand === "report") {
       if (patPath) cmd.push(patPath);
     } else if (subcommand === "show") {
-      // show is the one subcommand whose POSITIONAL is not a path: it is a
-      // rule id, so the repository root travels as --path instead. Passing a
-      // repo root positionally here would be read as a rule id and rejected
-      // as unknown, which is why this cannot share the branch above.
-      const ruleId = args.rule_id as string | undefined;
-      const showAll = args.all as boolean | undefined;
-      if (!ruleId && !showAll) {
-        throw new Error("weave_quality_patterns show requires rule_id or all=true");
-      }
-      if (ruleId) cmd.push(ruleId);
-      if (showAll) cmd.push("--all");
-      if (patPath) cmd.push(`--path=${patPath}`);
+      appendPatternShow(cmd, args);
     } else if (subcommand === "adjudicate") {
       if (!findingKey || !disposition) {
         throw new Error("weave_quality_patterns adjudicate requires finding_key and disposition");
@@ -3199,49 +3253,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
       cmd.push(findingKey, disposition);
       if (note) cmd.push(`--note=${note}`);
     } else if (subcommand === "promote") {
-      const canonical = args.canonical as boolean | undefined;
-      const applyPlan = args.apply as boolean | undefined;
-      const planFile = args.plan_file as string | undefined;
-      const language = args.language as string | undefined;
-
-      if (applyPlan && !canonical) {
-        throw new Error("weave_quality_patterns promote: apply requires canonical");
-      }
-      if (applyPlan && patDryRun) {
-        throw new Error("weave_quality_patterns promote: apply and dry_run are mutually exclusive");
-      }
-      if (applyPlan && !planFile) {
-        throw new Error("weave_quality_patterns promote: apply requires plan_file");
-      }
-      // A scope whose published contract is "read-only observation and query"
-      // must not write nodes and edges. Both mutating paths are refused here:
-      // canonical apply, and legacy promote without dry_run. Reviewing is still
-      // available -- canonical defaults to dry-run, and legacy accepts dry_run --
-      // so inspect keeps everything it could honestly offer.
-      //
-      // CLI behaviour is untouched: this is an MCP surface boundary, not a
-      // change to what `wv` does when a human runs it.
-      const mutates = applyPlan || (!canonical && !patDryRun);
-      if (mutates && ACTIVE_SCOPE === "inspect") {
-        throw new Error(
-          "weave_quality_patterns promote: this call creates Weave nodes and is not available in " +
-            'the read-only "inspect" scope. Review here (canonical defaults to dry-run, and legacy ' +
-            "promote accepts dry_run), then run the mutating call from the graph scope, which " +
-            "authorizes mutation."
-        );
-      }
-      // Apply takes its review parent from the reviewed plan, so parent is
-      // required for planning only. Passing both is refused by the CLI itself
-      // when they disagree.
-      if (!patParent && !applyPlan) {
-        throw new Error("weave_quality_patterns promote requires parent");
-      }
-      if (patParent) cmd.push(`--parent=${patParent}`);
-      if (patDryRun) cmd.push("--dry-run");
-      if (canonical) cmd.push("--canonical");
-      if (applyPlan) cmd.push("--apply");
-      if (planFile) cmd.push(`--plan-file=${planFile}`);
-      if (language) cmd.push(`--language=${language}`);
+      appendPatternPromotion(cmd, args);
     }
     if (subcommand === "list") {
       return wvQualityPatternsList(cmd, patPath);

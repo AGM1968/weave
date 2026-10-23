@@ -42,10 +42,11 @@ def test_state_retries_turns_and_fallback_grouping(tmp_path: Path) -> None:
 def test_missing_fields_and_unavailable_identity_are_explicit(tmp_path: Path) -> None:
     """Legacy omissions remain unavailable rather than becoming zero observations."""
     unavailable = {"status": "unavailable", "reason": "old row"}
+    no_args: list[str] = []
     rows = [
-        {"trace_id": "t", "cmd": "wv context", "argv": [], "exit_status": 0,
+        {"trace_id": "t", "cmd": "wv context", "argv": no_args, "exit_status": 0,
          "graph_identity_after": unavailable},
-        {"trace_id": "t", "cmd": "wv context", "argv": [], "graph_identity_before": IDENTITY_A},
+        {"trace_id": "t", "cmd": "wv context", "argv": no_args, "graph_identity_before": IDENTITY_A},
         {"cmd": "wv status"},
     ]
     result = evaluate(_write(tmp_path, rows))
@@ -302,6 +303,7 @@ def test_invalid_usage_row_does_not_taint_a_valid_event_id(tmp_path: Path) -> No
 def test_usage_invalid_reasons_are_itemized(tmp_path: Path) -> None:
     """Every schema rejection contributes one stable invalid-reason count."""
     calls = _write(tmp_path, [{"trace_id": "t"}])
+    empty_usage: dict[str, int] = {}
     provenance = {"host": "codex", "adapter": "session-export", "adapter_version": "1",
                   "provider": "openai", "model": "gpt-test"}
     usage_path = tmp_path / "invalid-usage.jsonl"
@@ -313,14 +315,14 @@ def test_usage_invalid_reasons_are_itemized(tmp_path: Path) -> None:
             {"format": "weave.provider-usage", "version": "1"},
             {"format": "weave.provider-usage"},
             {"format": "weave.provider-usage", "version": 1, "usage_event_id": "missing-trace",
-             "usage_kind": "incremental", "provenance": provenance, "usage": {}},
+             "usage_kind": "incremental", "provenance": provenance, "usage": empty_usage},
             {"format": "weave.provider-usage", "version": 1, "trace_id": "t",
-             "usage_kind": "incremental", "provenance": provenance, "usage": {}},
+             "usage_kind": "incremental", "provenance": provenance, "usage": empty_usage},
             {"format": "weave.provider-usage", "version": 1, "trace_id": "t",
-             "usage_event_id": "kind", "usage_kind": "snapshot", "provenance": provenance, "usage": {}},
+             "usage_event_id": "kind", "usage_kind": "snapshot", "provenance": provenance, "usage": empty_usage},
             {"format": "weave.provider-usage", "version": 1, "trace_id": "t",
              "usage_event_id": "provenance", "usage_kind": "incremental",
-             "provenance": {"host": "codex"}, "usage": {}},
+             "provenance": {"host": "codex"}, "usage": empty_usage},
         ]) + "\n",
         encoding="utf-8",
     )

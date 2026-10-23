@@ -7,6 +7,7 @@
 # PASS-only stub borrows a suite the public release keeps: this file ships, and
 # a Rust evidence suite name here trips the release leak guard (wv-eeaded).
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 run=0; pass=0
 ok()  { run=$((run+1)); pass=$((pass+1)); echo "  ✓ $1"; }
@@ -15,6 +16,8 @@ TMP=$(mktemp -d /tmp/wv-run-all-counts-XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/tests" "$TMP/.weave"
 cp "$ROOT/tests/run-all.sh" "$TMP/tests/run-all.sh"
+mkdir -p "$TMP/scripts/lib"
+cp "$ROOT/scripts/lib/wv-scratch.sh" "$TMP/scripts/lib/wv-scratch.sh"
 printf '#!/bin/bash\necho "Results: 3/3 passed"\n' > "$TMP/tests/test-policy-cells.sh"
 printf '#!/bin/bash\necho "Tests: 5 | Passed: 5 | Failed: 0"\n' > "$TMP/tests/test-quality.sh"
 printf '#!/bin/bash\necho "Violation vocabulary: PASS"\n' > "$TMP/tests/test-violation-vocabulary.sh"
@@ -39,6 +42,20 @@ if [[ "$out" == *"Violation Vocabulary Contract: no test count"* ]] && [[ "$out"
 else
     bad "a suite with no parseable count is named, never counted as 0/0" "$(grep -E 'Contract|Total|uncounted|Not in' <<< "$out")"
 fi
+
+# Capacity is checked before any suite starts, in serial and parallel mode.
+printf '#!/bin/bash\ntouch "%s/probe"\necho "Results: 3/3 passed"\n' "$TMP" > "$TMP/tests/test-policy-cells.sh"
+for mode in --serial --parallel; do
+    rm -f "$TMP/probe"
+    rc=0
+    out=$(WV_SCRATCH_MIN_KB=999999999999 bash "$TMP/tests/run-all.sh" "$mode" --suite=test-policy-cells 2>&1) || rc=$?
+    run=$((run+1))
+    if [ "$rc" -ne 0 ] && [ ! -e "$TMP/probe" ] && [[ "$out" == *"insufficient capacity before expensive work"* ]]; then
+        pass=$((pass+1)); echo "  ✓ $mode refuses capacity before starting a suite"
+    else
+        echo "  FAIL: $mode capacity preflight (rc=$rc): $out"
+    fi
+done
 
 echo "Results: $pass/$run passed"
 [ "$pass" -eq "$run" ]

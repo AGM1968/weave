@@ -1,5 +1,6 @@
 id: unquoted-variable
 language: bash
+violation_type: code:unquoted-expansion
 message: "Unquoted variable expansion (SC2086) causes word-splitting and glob expansion. Quote with double quotes."
 severity: warning
 rule:

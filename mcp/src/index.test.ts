@@ -20,14 +20,61 @@ const CONTRACT = JSON.parse(readFileSync(resolve(__dirname, "../contract.json"),
   environment: { required: string[] };
 };
 
-// Graph-isolation env injected into every spawned wv / MCP-server process so the
-// suite never mutates the developer's live Weave graph. The "Weave MCP Server"
-// block points this at a throwaway WV_DB/WV_HOT_ZONE in beforeAll and resets it
-// in afterAll; an explicit per-test WV_DB (e.g. the code-search fixture) still
-// wins because it is spread after this. Without it, createTrackedNode /
-// createActiveNodeDirect wrote fixtures into the real graph and any interrupted
-// teardown left active nodes behind.
-let GRAPH_ENV: NodeJS.ProcessEnv = {};
+// A private DB alone is insufficient: git and context-policy resolve the
+// project from cwd, and config.env can override graph/runtime settings.
+// Keep the default fixture alive for startup and scope tests too (wv-e3f867).
+function fixtureEnv(dir: string, hotZone = join(dir, "hot-zone")): NodeJS.ProcessEnv {
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key]) => !/^(WV_|GIT_)/.test(key) && !["WEAVE_DIR", "REPO_ROOT", "POLICY_CACHE"].includes(key)
+    )
+  );
+  return {
+    ...env,
+    WV_PROJECT_ROOT: dir,
+    WV_PROJECT_DIR: dir,
+    WEAVE_DIR: join(dir, ".weave"),
+    WV_HOT_ZONE: hotZone,
+    WV_DB: join(hotZone, "brain.db"),
+    WV_CONFIG_DIR: join(dir, "config"),
+    WV_PATH: resolve(__dirname, "../../scripts/wv"),
+    WV_CLI: resolve(__dirname, "../../scripts/wv"),
+    WV_LIB_DIR: resolve(__dirname, "../../scripts"),
+    WV_TEST_SUITE: "1",
+    WV_AUTO_CHECKPOINT: "0",
+    WV_AUTO_SYNC: "0",
+    WV_AGENT: "1",
+    NO_COLOR: "1",
+    PYTHONDONTWRITEBYTECODE: "1",
+  };
+}
+
+function createProjectFixture(prefix: string) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  // TMPDIR may itself be inside a checkout: do not inherit its git root.
+  const git = spawnSync("git", ["init", "-q", dir], { env: fixtureEnv(dir), encoding: "utf-8" });
+  if (git.status !== 0) throw new Error(git.stderr || "failed to initialise fixture repository");
+  return {
+    dir,
+    hotZone: join(dir, "hot-zone"),
+    env: fixtureEnv(dir),
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+const graphFixture = createProjectFixture("weave-mcp-graph-");
+const GRAPH_ENV = graphFixture.env;
+
+beforeAll(() => {
+  const result = spawnSync(GRAPH_ENV.WV_PATH!, ["init"], {
+    cwd: graphFixture.dir,
+    env: GRAPH_ENV,
+    encoding: "utf-8",
+  });
+  if (result.status !== 0) throw new Error(result.stderr || "failed to initialise fixture graph");
+});
+
+afterAll(() => graphFixture.cleanup());
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -56,11 +103,9 @@ class MCPTestClient {
   constructor(extraArgs: string[] = [], extraEnv: NodeJS.ProcessEnv = {}, cwd?: string) {
     this.server = spawn("node", [SERVER_PATH, ...extraArgs], {
       stdio: ["pipe", "pipe", "pipe"],
-      cwd,
+      cwd: cwd || extraEnv.WV_PROJECT_ROOT || graphFixture.dir,
       env: {
-        ...process.env,
-        WV_PATH: resolve(__dirname, "../../scripts/wv"),
-        ...GRAPH_ENV,
+        ...fixtureEnv(extraEnv.WV_PROJECT_ROOT || cwd || graphFixture.dir),
         ...extraEnv,
       },
     });
@@ -251,21 +296,9 @@ function readLoggedCommands(logPath: string): string[] {
   }
 }
 
-function deleteNodeDirect(id: string): void {
-  spawnSync(resolve(__dirname, "../../scripts/wv"), ["delete", id, "--force"], {
-    stdio: "ignore",
-    env: {
-      ...process.env,
-      ...GRAPH_ENV,
-      NO_COLOR: "1",
-      WV_AGENT: "1",
-    },
-  });
-}
-
 function createCodeSearchFixtureDb(): { dbPath: string; hotZone: string; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), "weave-mcp-search-"));
-  const dbPath = join(dir, "brain.db");
+  const fixture = createProjectFixture("weave-mcp-search-");
+  const dbPath = join(fixture.dir, "brain.db");
   spawnSync(
     "sqlite3",
     [dbPath, "CREATE TABLE chunks (id INTEGER PRIMARY KEY); CREATE TABLE node_files (node_id TEXT, path TEXT);"],
@@ -275,35 +308,21 @@ function createCodeSearchFixtureDb(): { dbPath: string; hotZone: string; cleanup
   );
   return {
     dbPath,
-    hotZone: dir,
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    hotZone: fixture.dir,
+    cleanup: fixture.cleanup,
   };
 }
 
-// wv-6cd72e: a throwaway repo root (own hot zone, own .weave/patterns/) for
-// weave_quality_patterns contract/parity tests -- passed as MCPTestClient's
-// `cwd` so resolveProjectRoot() falls through to process.cwd() inside the
-// spawned server, and _resolve_repo (Python) in turn falls through the same
-// way (no REPO_ROOT env, no enclosing git repo under system tmp) to ITS OWN
-// process.cwd() -- both land on `dir` without any env-var wiring needed.
+// wv-6cd72e: rule receipts and graph/config writes belong to this project.
 function createQualityPatternsFixture(): {
   dir: string;
   hotZone: string;
   env: NodeJS.ProcessEnv;
   cleanup: () => void;
 } {
-  const dir = mkdtempSync(join(tmpdir(), "weave-mcp-qpatterns-"));
-  const hotZone = mkdtempSync(join(tmpdir(), "weave-mcp-qpatterns-hz-"));
-  mkdirSync(join(dir, ".weave", "patterns"), { recursive: true });
-  return {
-    dir,
-    hotZone,
-    env: { WV_HOT_ZONE: hotZone },
-    cleanup: () => {
-      rmSync(dir, { recursive: true, force: true });
-      rmSync(hotZone, { recursive: true, force: true });
-    },
-  };
+  const fixture = createProjectFixture("weave-mcp-qpatterns-");
+  mkdirSync(join(fixture.dir, ".weave", "patterns"), { recursive: true });
+  return fixture;
 }
 
 function createActiveNodeDirectWithEnv(text: string, extraEnv: NodeJS.ProcessEnv): string {
@@ -312,8 +331,9 @@ function createActiveNodeDirectWithEnv(text: string, extraEnv: NodeJS.ProcessEnv
     ["add", text, "--status=active", "--standalone", "--criteria=guard ok", "--risks=low"],
     {
       encoding: "utf-8",
+      cwd: extraEnv.WV_PROJECT_ROOT || graphFixture.dir,
       env: {
-        ...process.env,
+        ...GRAPH_ENV,
         ...extraEnv,
         NO_COLOR: "1",
         WV_AGENT: "1",
@@ -329,29 +349,18 @@ function createActiveNodeDirectWithEnv(text: string, extraEnv: NodeJS.ProcessEnv
 }
 
 function createActiveNodeDirect(text: string): string {
-  const result = spawnSync(
-    resolve(__dirname, "../../scripts/wv"),
-    ["add", text, "--status=active", "--standalone", "--criteria=guard ok", "--risks=low"],
-    {
-      encoding: "utf-8",
-      env: {
-        ...process.env,
-        ...GRAPH_ENV,
-        NO_COLOR: "1",
-        WV_AGENT: "1",
-      },
-    }
-  );
-
-  if (result.status !== 0) {
-    throw new Error(result.stderr?.trim() || result.stdout?.trim() || "failed to create active node");
-  }
-
-  return extractNodeId(`${result.stdout || ""}\n${result.stderr || ""}`);
+  return createActiveNodeDirectWithEnv(text, GRAPH_ENV);
 }
 
 describe("resolveAgentHarness / resolveAgentId cross-harness parity (wv-4d4c96 / wv-5fbc6c)", () => {
-  const MARKER_VARS = ["WV_AGENT_ID", "CLAUDE_CODE_SSE_PORT", "CODEX_THREAD_ID", "CODEX_CI", "COPILOT_AGENT"] as const;
+  const MARKER_VARS = [
+    "WV_AGENT_ID",
+    "CLAUDECODE",
+    "CLAUDE_CODE_SSE_PORT",
+    "CODEX_THREAD_ID",
+    "CODEX_CI",
+    "COPILOT_AGENT",
+  ] as const;
   let saved: Record<string, string | undefined>;
 
   beforeAll(() => {
@@ -381,6 +390,12 @@ describe("resolveAgentHarness / resolveAgentId cross-harness parity (wv-4d4c96 /
     expect(resolveAgentHarness()).toBe("copilot");
     setMarkers({});
     expect(resolveAgentHarness()).toBe("human");
+  });
+
+  it("resolves claude from CLAUDECODE alone, as a plain-terminal session sets it (wv-50640a)", () => {
+    setMarkers({ CLAUDECODE: "1" });
+    expect(resolveAgentHarness()).toBe("claude");
+    expect(resolveAgentId()).toMatch(/^claude-/);
   });
 
   it("claude wins the claude/codex tie, matching the bash and python fixes (wv-4d4c96)", () => {
@@ -455,10 +470,9 @@ describe("Weave MCP startup health", () => {
   it("emits structured startup health and exits without starting stdio", () => {
     const result = spawnSync("node", [SERVER_PATH, "--scope=lite", "--health-check"], {
       encoding: "utf-8",
+      cwd: graphFixture.dir,
       env: {
-        ...process.env,
-        WV_PATH: resolve(__dirname, "../../scripts/wv"),
-        WV_PROJECT_ROOT: resolve(__dirname, "../.."),
+        ...GRAPH_ENV,
         WV_AGENT_ID: "mcp-test-agent",
       },
     });
@@ -476,16 +490,16 @@ describe("Weave MCP startup health", () => {
     expect(payload.scope).toBe("lite");
     expect(payload.tools).toBe(CONTRACT.scopes.lite.tool_count);
     expect(payload.agent_id).toBe("mcp-test-agent");
-    expect(payload.project_root).toBe(resolve(__dirname, "../.."));
+    expect(payload.project_root).toBe(graphFixture.dir);
     expect(payload.wv_path).toBe(resolve(__dirname, "../../scripts/wv"));
     expect(payload.code).toBeNull();
     expect(payload.detail).toBeNull();
   });
 
   it("reports invalid_scope with a stable exit code and health-check code/detail", () => {
-    const env = { ...process.env, WV_PATH: resolve(__dirname, "../../scripts/wv") };
+    const env = GRAPH_ENV;
 
-    const plain = spawnSync("node", [SERVER_PATH, "--scope=bogus"], { encoding: "utf-8", env });
+    const plain = spawnSync("node", [SERVER_PATH, "--scope=bogus"], { cwd: graphFixture.dir, encoding: "utf-8", env });
     if (plain.error?.message.includes("EPERM")) {
       console.warn("Skipping invalid-scope subprocess assertion: nested node spawn is blocked by this sandbox");
       return;
@@ -493,7 +507,11 @@ describe("Weave MCP startup health", () => {
     expect(plain.status).toBe(2);
     expect(plain.stderr).toContain('Invalid scope "bogus"');
 
-    const health = spawnSync("node", [SERVER_PATH, "--scope=bogus", "--health-check"], { encoding: "utf-8", env });
+    const health = spawnSync("node", [SERVER_PATH, "--scope=bogus", "--health-check"], {
+      cwd: graphFixture.dir,
+      encoding: "utf-8",
+      env,
+    });
     expect(health.status).toBe(2);
     const payload = JSON.parse(health.stdout.trim()) as Record<string, unknown>;
     expect(payload.status).toBe("fail");
@@ -503,12 +521,11 @@ describe("Weave MCP startup health", () => {
 
   it("reports bad_project_root with a stable exit code and health-check code/detail", () => {
     const env = {
-      ...process.env,
-      WV_PATH: resolve(__dirname, "../../scripts/wv"),
+      ...GRAPH_ENV,
       WV_PROJECT_ROOT: "/nonexistent-project-root-xyz",
     };
 
-    const plain = spawnSync("node", [SERVER_PATH, "--scope=lite"], { encoding: "utf-8", env });
+    const plain = spawnSync("node", [SERVER_PATH, "--scope=lite"], { cwd: graphFixture.dir, encoding: "utf-8", env });
     if (plain.error?.message.includes("EPERM")) {
       console.warn("Skipping bad-project-root subprocess assertion: nested node spawn is blocked by this sandbox");
       return;
@@ -516,7 +533,11 @@ describe("Weave MCP startup health", () => {
     expect(plain.status).toBe(4);
     expect(plain.stderr).toContain("/nonexistent-project-root-xyz");
 
-    const health = spawnSync("node", [SERVER_PATH, "--scope=lite", "--health-check"], { encoding: "utf-8", env });
+    const health = spawnSync("node", [SERVER_PATH, "--scope=lite", "--health-check"], {
+      cwd: graphFixture.dir,
+      encoding: "utf-8",
+      env,
+    });
     expect(health.status).toBe(4);
     const payload = JSON.parse(health.stdout.trim()) as Record<string, unknown>;
     expect(payload.status).toBe("fail");
@@ -543,8 +564,9 @@ describe("Weave MCP startup health", () => {
       }
       const result = spawnSync("node", [join(isolatedDist, "index.js"), "--scope=lite", "--health-check"], {
         encoding: "utf-8",
+        cwd: graphFixture.dir,
         env: {
-          ...process.env,
+          ...GRAPH_ENV,
           HOME: fakeHome,
           NODE_PATH: resolve(__dirname, "../node_modules"),
           WV_PATH: "",
@@ -568,8 +590,6 @@ describe("Weave MCP startup health", () => {
 
 describe("Weave MCP Server", () => {
   let client: MCPTestClient;
-  let isolatedDir: string;
-  const createdNodeIds: string[] = [];
 
   async function createTrackedNode(text: string, metadata?: Record<string, unknown>): Promise<string> {
     const addResponse = await client.request("tools/call", {
@@ -580,7 +600,6 @@ describe("Weave MCP Server", () => {
     const addResult = addResponse.result as { isError?: boolean; content: { text: string }[] };
     expect(addResult.isError).not.toBe(true);
     const id = extractNodeId(addResult.content[0].text);
-    createdNodeIds.push(id);
     if (metadata) {
       await client.request("tools/call", {
         name: "weave_update",
@@ -591,50 +610,24 @@ describe("Weave MCP Server", () => {
   }
 
   beforeAll(() => {
-    // Point the whole block at a throwaway graph so no test writes to the live
-    // Weave DB. Materialize the schema first so wv commands operate on a real DB.
-    isolatedDir = mkdtempSync(join(tmpdir(), "weave-mcp-graph-"));
-    // WEAVE_DIR too: wv takes .weave/ from the working directory's repository,
-    // not from WV_DB, so without it any .weave/ write from these processes
-    // lands in the repository hosting the suite. wv delete re-dumped the
-    // throwaway graph over its state.sql that way (wv-9acb57, fixed in wv by
-    // wv-5d5ef2); this keeps the next such writer out as well.
-    GRAPH_ENV = {
-      WV_DB: join(isolatedDir, "brain.db"),
-      WV_HOT_ZONE: isolatedDir,
-      WEAVE_DIR: join(isolatedDir, ".weave"),
-    };
-    spawnSync(resolve(__dirname, "../../scripts/wv"), ["init"], {
-      stdio: "ignore",
-      cwd: isolatedDir,
-      env: { ...process.env, ...GRAPH_ENV, NO_COLOR: "1", WV_AGENT: "1" },
-    });
     client = new MCPTestClient();
   });
 
   afterAll(async () => {
     await client.close();
-    // Best-effort node deletes are kept for symmetry, but teardown no longer
-    // depends on them: dropping the isolated dir removes the whole throwaway DB,
-    // so an interrupted cleanup can never leave nodes in the live graph.
-    for (const id of [...createdNodeIds].reverse()) {
-      deleteNodeDirect(id);
-    }
-    GRAPH_ENV = {};
-    rmSync(isolatedDir, { recursive: true, force: true });
+    // The file-level fixture owns all graph state; remove it once rather
+    // than running a CLI deletion for every node before discarding the DB.
   }, 60_000);
 
-  // wv-9acb57: an override wv judges to belong to another repository is
-  // discarded as a leak, silently after the first warning in a shell, and the
-  // call then runs against the hosting repository's live graph. Assert that wv,
-  // spawned the way this block spawns it, resolves the throwaway graph.
+  // A private graph must also have a private repository.
   it("resolves the throwaway graph for wv spawned like this block's helpers", () => {
     const result = spawnSync(resolve(__dirname, "../../scripts/wv"), ["hotzone", "db"], {
+      cwd: graphFixture.dir,
       encoding: "utf-8",
-      env: { ...process.env, ...GRAPH_ENV, NO_COLOR: "1", WV_AGENT: "1" },
+      env: GRAPH_ENV,
     });
     expect(result.status).toBe(0);
-    expect(result.stdout.trim().split("\n").pop()).toBe(join(isolatedDir, "brain.db"));
+    expect(result.stdout.trim().split("\n").pop()).toBe(join(graphFixture.hotZone, "brain.db"));
   });
 
   describe("tools/list", () => {
@@ -774,6 +767,8 @@ describe("Weave MCP Server", () => {
     });
 
     it("weave_overview should return composed overview sections", async () => {
+      const policyPath = join(graphFixture.dir, ".weave", ".context_policy");
+      rmSync(policyPath, { force: true });
       const response = await client.request("tools/call", {
         name: "weave_overview",
         arguments: {},
@@ -787,6 +782,9 @@ describe("Weave MCP Server", () => {
       // wv-f757a4: the policy section was silently absent (hook script under a
       // 5s timeout, no "policy:" line in its agent output); it must carry a level.
       expect(result.content[0].text).toMatch(/=== Context Policy ===\npolicy: (HIGH|MEDIUM|LOW)/);
+      // wv-e3f867: policy follows the server's project, not merely WV_DB or
+      // WEAVE_DIR. It must be freshly written inside the disposable project.
+      expect(existsSync(policyPath)).toBe(true);
     });
 
     it("weave_context should return JSON context for a node", async () => {
@@ -1081,7 +1079,7 @@ describe("Weave MCP Server", () => {
       });
       // The node text should be the literal backtick string, not file contents
       const result = response.result as { content: { text: string }[] };
-      createdNodeIds.push(extractNodeId(result.content[0].text));
+      extractNodeId(result.content[0].text);
       expect(result.content[0].text).not.toContain("root:");
     });
 
@@ -1098,7 +1096,6 @@ describe("Weave MCP Server", () => {
       const addResult = addResponse.result as { isError?: boolean; content: { text: string }[] };
       expect(addResult.isError).not.toBe(true);
       const nodeId = extractNodeId(addResult.content[0].text);
-      createdNodeIds.push(nodeId);
 
       const showResponse = await client.request("tools/call", {
         name: "weave_show",
@@ -1345,10 +1342,11 @@ describe("Weave MCP Server", () => {
       const runWv = (argv: string[]) =>
         spawnSync(wvBin, argv, {
           cwd: fixture.dir,
-          env: { ...process.env, ...fixture.env },
+          env: fixture.env,
           encoding: "utf-8",
         });
-      const runGit = (argv: string[]) => spawnSync("git", argv, { cwd: fixture.dir, encoding: "utf-8" });
+      const runGit = (argv: string[]) =>
+        spawnSync("git", argv, { cwd: fixture.dir, env: fixture.env, encoding: "utf-8" });
 
       // A real repository with the rule COMMITTED: canonical promotion binds
       // each active rule to a tracked blob at HEAD, so an uncommitted rule
@@ -1957,7 +1955,8 @@ describe("Weave MCP Server", () => {
       // unnoticed -- here the MCP server's own cwd is a genuinely
       // unrelated directory, exposing the mismatch.
       const fixture = createQualityPatternsFixture();
-      const mcpCwd = mkdtempSync(join(tmpdir(), "weave-mcp-unrelated-cwd-"));
+      const unrelated = createProjectFixture("weave-mcp-unrelated-cwd-");
+      const mcpCwd = unrelated.dir;
       writeFileSync(
         join(fixture.dir, ".weave", "patterns", "test-lexicon-rule.yaml"),
         "id: test-lexicon-rule\nlanguage: prose\nkind: regex\npatterns:\n  - forbidden\n",
@@ -1974,12 +1973,14 @@ describe("Weave MCP Server", () => {
         {
           cwd: fixture.dir,
           encoding: "utf-8",
-          env: { ...process.env, ...fixture.env, NO_COLOR: "1", WV_AGENT: "1" },
+          env: fixture.env,
         }
       );
       expect(scanResult.status).toBe(0);
 
-      const patternsClient = new MCPTestClient([], fixture.env, mcpCwd);
+      // Share this test's private receipt DB, not its project root: the test
+      // distinguishes path scoping from the server's unrelated working dir.
+      const patternsClient = new MCPTestClient([], fixtureEnv(mcpCwd, fixture.hotZone), mcpCwd);
       try {
         const response = await patternsClient.request("tools/call", {
           name: "weave_quality_patterns",
@@ -1995,7 +1996,7 @@ describe("Weave MCP Server", () => {
         expect(payload.scope).toBe("doc.md");
       } finally {
         await patternsClient.close();
-        rmSync(mcpCwd, { recursive: true, force: true });
+        unrelated.cleanup();
         fixture.cleanup();
       }
     });
@@ -2501,31 +2502,31 @@ exec ${JSON.stringify(realWvPath)} "$@"
     );
 
     it("weave_quality_patterns list's internal report call only gets what's left of the shared budget, not a fresh one (wv-c9ea87)", async () => {
-      // wv-c9ea87 (external code review round 2): the primary list call
-      // and its internal report call each used to get an independent,
-      // fresh 60s timeout -- a slow primary call followed by a report call
-      // that also stalls could block one synchronous MCP request for
-      // close to 120s combined. WV_MCP_PATTERNS_LIST_BUDGET_MS lets this
-      // test observe the shared-budget behavior in milliseconds instead of
-      // waiting anywhere near a real 60s: the primary call alone (300ms)
-      // already exhausts a 400ms shared budget, so report must be SKIPPED
-      // entirely -- not given a fresh budget that would let its own 1s
-      // sleep complete.
+      // Advance the server's clock after list succeeds, exhausting the shared
+      // budget without depending on sleeps, startup or CPU contention. A fresh
+      // report budget must fail even if its subprocess happens to time out.
       const fixture = createQualityPatternsFixture();
       const dir = mkdtempSync(join(tmpdir(), "weave-mcp-fakewv-budget-"));
       const wvPath = join(dir, "wv-fake.sh");
+      const clockMarker = join(dir, "primary-finished");
+      const reportMarker = join(dir, "report-ran");
+      const clockPreload = join(dir, "clock.cjs");
+      writeFileSync(clockPreload, `const fs = require("fs");
+const now = Date.now;
+Date.now = () => now() + (fs.existsSync(${JSON.stringify(clockMarker)}) ? 1000 : 0);
+`);
       const realWvPath = resolve(__dirname, "../../scripts/wv");
       writeFileSync(
         wvPath,
         `#!/bin/sh
 case "$*" in
   *"quality patterns list"*)
-    sleep 0.3
+    : > ${JSON.stringify(clockMarker)}
     printf '%s' '[{"rule_id":"r","path":"/tmp/r.yaml","status":"not_run","hits":null}]'
     exit 0
     ;;
   *"quality patterns report"*)
-    sleep 4
+    : > ${JSON.stringify(reportMarker)}
     printf '%s' '{"scope":null}'
     exit 0
     ;;
@@ -2537,25 +2538,31 @@ exec ${JSON.stringify(realWvPath)} "$@"
       chmodSync(wvPath, 0o755);
       const patternsClient = new MCPTestClient(
         [],
-        { ...fixture.env, WV_PATH: wvPath, WV_MCP_PATTERNS_LIST_BUDGET_MS: "400" },
+        {
+          ...fixture.env,
+          WV_PATH: wvPath,
+          WV_MCP_PATTERNS_LIST_BUDGET_MS: "400",
+          NODE_OPTIONS: [fixture.env.NODE_OPTIONS, `--require=${JSON.stringify(clockPreload)}`].filter(Boolean).join(" "),
+        },
         fixture.dir
       );
       try {
-        const start = Date.now();
         const response = await patternsClient.request("tools/call", {
           name: "weave_quality_patterns",
           arguments: { subcommand: "list" },
         });
-        const elapsed = Date.now() - start;
         expect(response.error).toBeUndefined();
         const result = response.result as { content: { text: string }[] };
-        const payload = JSON.parse(result.content[0].text) as { scope: string | null; scope_error?: string };
-        expect(payload.scope_error).toContain("budget");
-        // A wide margin below primary(300ms) + report(4000ms) combined --
-        // proves report never actually ran (a fresh-budget report call
-        // would have pushed this past ~4300ms). Generous enough to absorb
-        // process-spawn/stdio overhead without becoming flaky.
-        expect(elapsed).toBeLessThan(3000);
+        const payload = JSON.parse(result.content[0].text) as {
+          rules: { rule_id: string }[];
+          scope: string | null;
+          scope_error?: string;
+        };
+        expect(payload.rules.map((rule) => rule.rule_id)).toEqual(["r"]);
+        expect(payload.scope).toBeNull();
+        // "budget" alone also matches the fake executable's directory name.
+        expect(payload.scope_error).toContain("budget was exhausted before its internal report call could run");
+        expect(existsSync(reportMarker)).toBe(false);
       } finally {
         await patternsClient.close();
         rmSync(dir, { recursive: true, force: true });
@@ -2565,7 +2572,7 @@ exec ${JSON.stringify(realWvPath)} "$@"
 
     it("weave_code_search reports readiness when chunks or graph context are missing", async () => {
       const fixture = createCodeSearchFixtureDb();
-      const searchClient = new MCPTestClient([], { WV_DB: fixture.dbPath, WV_HOT_ZONE: fixture.hotZone });
+      const searchClient = new MCPTestClient([], fixtureEnv(fixture.hotZone, fixture.hotZone), fixture.hotZone);
 
       try {
         const response = await searchClient.request("tools/call", {
@@ -2597,9 +2604,9 @@ exec ${JSON.stringify(realWvPath)} "$@"
     });
 
     it("weave_preflight blocks policy-sensitive nodes when quality prerequisites are missing", async () => {
-      const dir = mkdtempSync(join(tmpdir(), "weave-mcp-preflight-"));
-      const dbPath = join(dir, "brain.db");
-      const env = { WV_DB: dbPath, WV_HOT_ZONE: dir, WV_PROJECT_ROOT: resolve(__dirname, "../..") };
+      const fixture = createProjectFixture("weave-mcp-preflight-");
+      const env = fixture.env;
+      const dbPath = env.WV_DB!;
       const createdId = createActiveNodeDirectWithEnv("test-policy-preflight", env);
       const resolvedNodeId =
         spawnSync(
@@ -2632,7 +2639,7 @@ exec ${JSON.stringify(realWvPath)} "$@"
         expect(result.content[0].text).toContain("wv quality scan . --json");
       } finally {
         await preflightClient.close();
-        rmSync(dir, { recursive: true, force: true });
+        fixture.cleanup();
       }
     });
 
@@ -2653,11 +2660,10 @@ exec ${JSON.stringify(realWvPath)} "$@"
     });
 
     it("weave_edit_guard honors WV_PROJECT_ROOT outside repo cwd", async () => {
-      const nodeId = createActiveNodeDirect("test-edit-guard-project-root");
-      createdNodeIds.push(nodeId);
+      createActiveNodeDirect("test-edit-guard-project-root");
 
       const outsideRepoCwd = mkdtempSync(join(tmpdir(), "weave-mcp-cwd-"));
-      const rootAwareClient = new MCPTestClient([], { WV_PROJECT_ROOT: resolve(__dirname, "../..") }, outsideRepoCwd);
+      const rootAwareClient = new MCPTestClient([], { WV_PROJECT_ROOT: graphFixture.dir }, outsideRepoCwd);
 
       try {
         const response = await rootAwareClient.request("tools/call", {
@@ -2777,7 +2783,7 @@ exec ${JSON.stringify(realWvPath)} "$@"
           name: "weave_add",
           arguments: { text: "status alias add", status: "in_progress", standalone: true },
         });
-        createdNodeIds.push(extractNodeId((addResponse.result as { content: { text: string }[] }).content[0].text));
+        extractNodeId((addResponse.result as { content: { text: string }[] }).content[0].text);
 
         await loggedClient.request("tools/call", {
           name: "weave_status",
@@ -3058,7 +3064,15 @@ describe("Weave MCP Server telemetry source tagging", () => {
     // Fresh WV_CONFIG_DIR: config.env is sourced with set -a and would
     // override the ambient WV_CALL_LOG with the user's real log path.
     const cfgDir = mkdtempSync(join(tmpdir(), "wv-srctag-cfg-"));
+    const fixture = createProjectFixture("wv-srctag-graph-");
+    const graphEnv = { ...fixture.env, WV_CONFIG_DIR: cfgDir };
+    spawnSync(resolve(__dirname, "../../scripts/wv"), ["init"], {
+      stdio: "ignore",
+      cwd: fixture.dir,
+      env: graphEnv,
+    });
     const tagged = new MCPTestClient([], {
+      ...graphEnv,
       WV_CALL_LOG: logPath,
       WV_CALL_SOURCE: "agent",
       WV_CONFIG_DIR: cfgDir,
@@ -3082,6 +3096,7 @@ describe("Weave MCP Server telemetry source tagging", () => {
       await tagged.close();
       rmSync(logPath, { force: true });
       rmSync(cfgDir, { recursive: true, force: true });
+      fixture.cleanup();
     }
   }, 60_000);
 });

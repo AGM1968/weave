@@ -20,6 +20,7 @@ export WV_CALL_SOURCE=test
 #   1 - Unexpected failure
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -234,7 +235,7 @@ test_done_transition_sets_closing() {
     id=$("$WV" add "test task" 2>/dev/null | tail -1)
     "$WV" update "$id" --alias=phase-test2 2>/dev/null
     WV_SKIP_PRECOMMIT=1 "$WV" work "$id" 2>/dev/null || true
-    WV_SKIP_PRECOMMIT=1 "$WV" done "$id" --skip-verification 2>/dev/null || true
+    WV_SKIP_PRECOMMIT=1 "$WV" "done" "$id" --skip-verification 2>/dev/null || true
     local phase
     phase=$(cat "$TEST_DIR/.session_phase" 2>/dev/null || echo "")
     # Transition already works (raw echo in cmd_done); assert_equals now.

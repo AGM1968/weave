@@ -6,7 +6,7 @@ severity: info
 policy: always-on-shared
 maturity: promotable
 provenance: >-
-  wv-cc46cc and wv-61b858 @nowcast, ported and retained by earth-engine-analysis. Chat artifacts and session deixis
+  wv-cc46cc and wv-61b858 in a consumer graph, ported and retained by a second consumer. Chat artifacts and session deixis
   survived into documents even though their readers share neither context. Corpus-supported 2026-09-02 (wv-f3a558):
   zero occurrences in 986,291 words of peer-reviewed papers, against 1.99 per 10,000 in this repository. A
   construction published technical writing never uses is the strongest case a prohibition can have, and the rule is

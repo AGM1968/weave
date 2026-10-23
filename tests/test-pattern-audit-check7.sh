@@ -19,6 +19,7 @@ export WV_CALL_SOURCE=test
 # Weave-ID: wv-14492b
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -122,6 +123,7 @@ assert_contains "$C7_STATUS" "fail" "JSON reports function_tail_returns fail"
 assert_contains "$C7_COUNT"  "1"    "JSON counts exactly the one bad tail"
 
 echo "--- Check 7: clean fixture passes ---"
+# shellcheck disable=SC2016  # the sed script rewrites literal shell source
 sed -i 's/^    \[ -n "$x" \] \&\& echo "$x"$/    if [ -n "$x" ]; then echo "$x"; fi/' "$TEST_DIR/scripts/fixture.sh"
 AUDIT_OUT2=$("$WV" pattern-audit 2>&1 | grep 'Check 7' || true)
 assert_contains "$AUDIT_OUT2" "Check 7 PASS" "Check 7 passes after the tail is converted to if/fi"

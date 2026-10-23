@@ -12,15 +12,22 @@ export WV_CALL_SOURCE=test
 # marker) are never removed. A CONFIG_DIR older than the manifest is seeded
 # with the skills retired before it existed.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 run=0; pass=0
 ok()  { run=$((run+1)); pass=$((pass+1)); echo "  ✓ $1"; }
 bad() { run=$((run+1)); echo "  ✗ $1"; [ -n "${2:-}" ] && echo "      $2"; }
 check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$2], got [$3]"; fi; }
 
-T=$(mktemp -d /tmp/wv-skill-prune-XXXXXX)
+T=$(bash "$ROOT/scripts/lib/wv-scratch.sh") || exit 1
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/home" "$T/bin" "$T/lib" "$T/config/skills"
+# Provenance commands can refresh an index; give them private source and a
+# Git discovery boundary, not the checkout another gate reads (wv-6900e1).
+mkdir -p "$T/src"
+git -C "$ROOT" ls-files -z | (cd "$ROOT" && tar --null -T - --ignore-failed-read -cf - 2>/dev/null) | tar -x -C "$T/src" || exit 1
+git -C "$T/src" init -q || exit 1
+ROOT="$T/src"
 SK="$T/config/skills"
 install_here() {
     (cd "$ROOT" && HOME="$T/home" CLAUDE_CONFIG_DIR="$T/home/.claude" WV_INSTALL_DIR="$T/bin" \

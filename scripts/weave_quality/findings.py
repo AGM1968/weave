@@ -1094,7 +1094,7 @@ def cmd_findings_promote(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        loaded_nodes = json.loads(nodes_json) if nodes_json else []
+        loaded_nodes = json.loads(nodes_json) if nodes_json else list[dict[str, object]]()
     except json.JSONDecodeError:
         print("Error: unable to parse Weave node list.", file=sys.stderr)
         return 1

@@ -24,6 +24,7 @@ single quotes, and a trailing `$` end-anchor: none can become an option.
 import os
 import re
 import sys
+from collections.abc import Iterator
 
 EXPANSION = re.compile(r'\$\{?[A-Za-z_]')
 GREP = re.compile(r'(?<![-\w])grep\b')
@@ -32,14 +33,15 @@ BINDS_PATTERN = re.compile(r'^-[a-zA-Z]*[ef]$')
 SHEBANG = re.compile(rb'^#!.*\b(?:ba|da|k|z)?sh\b')
 
 
-def logical_lines(path):
+def logical_lines(path: str) -> Iterator[tuple[int, str]]:
     """Yield (first_physical_line_number, joined_line).
 
     A trailing backslash continues the command, so the invocation is only whole
     once the continuations are joined.
     """
-    buf, start = "", None
-    with open(path, errors='replace') as fh:
+    buf = ""
+    start: int | None = None
+    with open(path, encoding='utf-8', errors='replace') as fh:
         for n, raw in enumerate(fh, 1):
             line = raw.rstrip('\n')
             if start is None:
@@ -53,13 +55,13 @@ def logical_lines(path):
         yield start or 1, buf
 
 
-def _cut_outside_quotes(text):
+def _cut_outside_quotes(text: str) -> str:
     """Truncate at the first |, ;, & or ) that is NOT inside quotes.
 
     Splitting blindly cut composite patterns such as "$a|$b" in half, which both
     truncated the report and hid the second half from tokenisation.
     """
-    q = None
+    q: str | None = None
     for i, ch in enumerate(text):
         if q:
             if ch == q:
@@ -71,18 +73,18 @@ def _cut_outside_quotes(text):
     return text
 
 
-def invocations(line):
+def invocations(line: str) -> Iterator[tuple[bool, str]]:
     for m in GREP.finditer(line):
         head, args = line[:m.start()], line[m.end():]
         yield bool(GIT_BEFORE.search(head)), _cut_outside_quotes(args)
 
 
-def unsafe(line):
-    hits = []
+def unsafe(line: str) -> list[str]:
+    hits: list[str] = []
     for is_git, args in invocations(line):
         toks = re.findall(r'"[^"]*"|\'[^\']*\'|\S+', args)
         barrier = False
-        pattern = None
+        pattern: str | None = None
         skip_next = False
         for t in toks:
             if skip_next:            # value of -e/-f: the pattern is bound
@@ -107,7 +109,7 @@ def unsafe(line):
     return hits
 
 
-def is_shell(path):
+def is_shell(path: str) -> bool:
     if path.endswith('.sh'):
         return True
     if '.' in os.path.basename(path):
@@ -119,8 +121,8 @@ def is_shell(path):
         return False
 
 
-def scan(roots):
-    files = []
+def scan(roots: list[str]) -> list[tuple[str, int, str]]:
+    files: list[str] = []
     for r in roots:
         if os.path.isfile(r):
             files.append(r)
@@ -134,7 +136,7 @@ def scan(roots):
                     p = os.path.join(d, f)
                     if is_shell(p):
                         files.append(p)
-    out = []
+    out: list[tuple[str, int, str]] = []
     for f in sorted(set(files)):
         for n, line in logical_lines(f):
             if line.lstrip().startswith('#'):
@@ -144,9 +146,14 @@ def scan(roots):
     return out
 
 
-if __name__ == '__main__':
-    hits = scan(sys.argv[1:])
-    for f, i, h in hits:
-        print(f"{f}:{i}: {h[:100]}")
+def main(argv: list[str]) -> int:
+    """Report every hit in the given paths; exit 1 if there are any."""
+    hits = scan(argv)
+    for path, line, text in hits:
+        print(f"{path}:{line}: {text[:100]}")
     print(f"--- {len(hits)} unsafe site(s)")
-    sys.exit(1 if hits else 0)
+    return 1 if hits else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

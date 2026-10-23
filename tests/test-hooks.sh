@@ -12,6 +12,7 @@ export WV_CALL_SOURCE=test
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Colors
 RED='\033[0;31m'
@@ -820,7 +821,7 @@ assert_contains "$OUTPUT" "Commit work before close" "pre-close: still denies cl
 rm -f "$TEST_DIR/project/scoped-own.txt"
 git -C "$TEST_DIR/project" rm -q scope-seed.txt >/dev/null 2>&1 || true
 git -C "$TEST_DIR/project" commit -q -m "chore: clean up scoping test fixture" >/dev/null 2>&1 || true
-"$WV" done "$SCOPE_ID" --skip-verification 2>/dev/null || true  # cleanup
+"$WV" "done" "$SCOPE_ID" --skip-verification 2>/dev/null || true  # cleanup
 
 # wv-822bea/wv-37e2e0: metadata.touched_files is capped at 50 entries
 # (wv-touched-files.sh's WV_TOUCHED_NODE_CAP); node_files is the same
@@ -852,7 +853,72 @@ assert_contains "$OUTPUT" "Commit work before close" "pre-close: 51st touched fi
 rm -f "$TEST_DIR/project/cap-file-51.txt"
 git -C "$TEST_DIR/project" rm -q cap-seed.txt >/dev/null 2>&1 || true
 git -C "$TEST_DIR/project" commit -q -m "chore: clean up cap test fixture" >/dev/null 2>&1 || true
-"$WV" done "$CAP_ID" --skip-verification 2>/dev/null || true  # cleanup
+"$WV" "done" "$CAP_ID" --skip-verification 2>/dev/null || true  # cleanup
+
+# wv-cdafa1: inside an E5 capture window (WV_WORKFLOW_ID set) the attribution
+# hook queues the edit instead of writing the graph. Close verification runs
+# before wv done applies the queue, so it must count a queued path as the
+# node's own. touched_files names another file, so the gate is in its scoped
+# mode, where a file it does not know is foreign and lets the close through.
+QUEUE_ID=$(add_active_node "queued attribution close node" \
+    --metadata='{"verification":{"method":"test","result":"pass"},"touched_files":["queue-other.txt"]}' 2>/dev/null | tail -1)
+echo "seed" > "$TEST_DIR/project/queue-seed.txt"
+git -C "$TEST_DIR/project" add queue-seed.txt
+git -C "$TEST_DIR/project" commit -q -m "feat: queue test seed" -m "Weave-ID: $QUEUE_ID"
+echo "own work, queued" > "$TEST_DIR/project/queued-own.txt"
+echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project/queued-own.txt\"},\"tool_response\":{\"success\":true}}" \
+    | WV_WORKFLOW_ID=e5-test bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
+assert_equals "0" "$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM node_files WHERE node_id='$QUEUE_ID' AND path='queued-own.txt';")" \
+    "attribution queue: an edit in a capture window does not write the graph"
+assert_contains "$(cat "$(dirname "$WV_DB")/attribution-queue" 2>/dev/null)" "queued-own.txt" \
+    "attribution queue: the edit waits in the queue beside the DB"
+set +e
+OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $QUEUE_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
+set -e
+assert_contains "$OUTPUT" "Commit work before close" "pre-close: a queued, unapplied edit is still the node's own"
+rm -f "$TEST_DIR/project/queued-own.txt" "$(dirname "$WV_DB")/attribution-queue"
+git -C "$TEST_DIR/project" rm -q queue-seed.txt >/dev/null 2>&1 || true
+git -C "$TEST_DIR/project" commit -q -m "chore: clean up queue test fixture" >/dev/null 2>&1 || true
+"$WV" "done" "$QUEUE_ID" --skip-verification 2>/dev/null || true  # cleanup
+
+# wv-cdafa1: counted admission keeps only source=agent call-log rows and needs
+# each row's graph_identity_before to equal the previous row's after. An agent
+# read, an Edit through the hook, an agent read, then an agent mutation: in a
+# window the read leaves the queue alone and the mutation applies it, so the
+# chain holds. Outside a window the hook writes at once, between two agent
+# rows, which is the break the queue exists to prevent -- the control that
+# shows the chain assertion can fail.
+_chain_run() {  # <window: 1|0> <file>
+    local id log window="$1" file="$2"
+    log="$TEST_DIR/chain-$file.jsonl"
+    rm -f "$log"
+    # The real config.env sets WV_CALL_LOG and beats the environment, so these
+    # agent rows would land in the user's own call log; give wv an empty one.
+    local WV_CONFIG_DIR="$TEST_DIR/chain-config"
+    mkdir -p "$WV_CONFIG_DIR"
+    export WV_CONFIG_DIR
+    id=$(add_active_node "attribution chain node $file" --metadata='{"verification":{"method":"test","result":"pass"}}' 2>/dev/null | tail -1)
+    WV_CALL_LOG="$log" WV_CALL_SOURCE=agent "$WV" status >/dev/null 2>&1 || true
+    echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project/$file\"},\"tool_response\":{\"success\":true}}" \
+        | if [ "$window" = 1 ]; then WV_WORKFLOW_ID=e5-test bash "$HOOKS_DIR/wv-touched-files.sh"; \
+          else env -u WV_WORKFLOW_ID bash "$HOOKS_DIR/wv-touched-files.sh"; fi >/dev/null 2>&1 || true
+    WV_CALL_LOG="$log" WV_CALL_SOURCE=agent "$WV" show "$id" --json >/dev/null 2>&1 || true
+    CHAIN_AFTER_READ=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM node_files WHERE node_id='$id' AND path='$file';")
+    WV_CALL_LOG="$log" WV_CALL_SOURCE=agent "$WV" update "$id" --metadata='{"chain_probe":1}' >/dev/null 2>&1 || true
+    CHAIN_AFTER_MUTATION=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM node_files WHERE node_id='$id' AND path='$file';")
+    CHAIN_ROWS=$(jq -s '[.[] | select(.source == "agent" and .parent_call_id == null)] | length' "$log" 2>/dev/null)
+    CHAIN_BREAKS=$(jq -s '[.[] | select(.source == "agent" and .parent_call_id == null)] as $r
+        | [range(1; $r | length) | select($r[.].graph_identity_before != $r[. - 1].graph_identity_after)] | length' "$log" 2>/dev/null)
+    "$WV" "done" "$id" --skip-verification >/dev/null 2>&1 || true
+}
+_chain_run 1 chain-window.txt
+assert_equals "3" "$CHAIN_ROWS" "attribution chain: three agent rows were logged in the window"
+assert_equals "0" "$CHAIN_AFTER_READ" "attribution chain: an agent read leaves the queued edit unapplied"
+assert_equals "1" "$CHAIN_AFTER_MUTATION" "attribution chain: the agent's next mutation applies the queued edit"
+assert_equals "0" "$CHAIN_BREAKS" "attribution chain: an Edit in a capture window leaves the agent identity chain unbroken"
+_chain_run 0 chain-direct.txt
+assert_equals "1" "$CHAIN_AFTER_READ" "attribution chain: outside a window the edit is written at once"
+assert_equals "1" "$CHAIN_BREAKS" "attribution chain: outside a window the direct write breaks the chain (control)"
 
 # wv-734186: verification_method/verification_evidence were only ever
 # askable at THIS close-time gate -- wv add --verification-plan lets it be
@@ -866,9 +932,9 @@ git -C "$TEST_DIR/project" commit -q -m "feat: plan seed" -m "Weave-ID: $PLAN_ID
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $PLAN_ID\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 assert_contains "$OUTPUT" 'Recorded plan: \"run pytest tests/foo.py\"' \
     "pre-close: surfaces a recorded --verification-plan as a reminder"
-"$WV" done "$PLAN_ID" --skip-verification 2>/dev/null || true  # cleanup
+"$WV" "done" "$PLAN_ID" --skip-verification 2>/dev/null || true  # cleanup
 
-"$WV" done "$ID2" --skip-verification 2>/dev/null || true  # cleanup
+"$WV" "done" "$ID2" --skip-verification 2>/dev/null || true  # cleanup
 
 # Non-matching command
 OUTPUT=$(echo '{"command":"wv list"}' | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null || true)
@@ -879,8 +945,9 @@ echo ""
 echo "--- bash-dedup.sh / bash-dedup-post.sh ---"
 setup_test_env
 
-DEDUP_LOCK_DIR="/tmp/weave-bash-locks/$(echo "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | md5sum 2>/dev/null | cut -c1-8 || echo default)"
-mkdir -p "$DEDUP_LOCK_DIR"
+DEDUP_LOCK_DIR="/tmp/weave-bash-locks-$(id -u)/$(echo "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | md5sum 2>/dev/null | cut -c1-8 || echo default)"
+# 700 like the hook makes it: a base left 775 by the umask is refused (wv-80be32).
+(umask 077 && mkdir -p "$DEDUP_LOCK_DIR")
 
 # First call: lock is absent — should allow (exit 0, no denial output)
 rm -f "$DEDUP_LOCK_DIR/wv-sync.lock"
@@ -1098,11 +1165,11 @@ else
 fi
 rm -f "$DEDUP_LOCK_DIR/git-commit.lock"
 
-# Pattern-table parity: every lock key classified by bash-dedup.sh must also
-# appear in bash-dedup-post.sh, or its lock is never cleared/promoted.
+# Pattern-table parity: every lock key the dedup guard (wv-pre-tool-use.sh) classifies must also
+# appear in the release guard (wv-post-tool-use.sh), or its lock is never cleared/promoted.
 TESTS_RUN=$((TESTS_RUN + 1))
-PRE_KEYS=$(grep -oP 'LOCK_KEY="\K[a-z-]+' "$HOOKS_DIR/bash-dedup.sh" | sort -u)
-POST_KEYS=$(grep -oP '^_handle_lock "\K[a-z-]+' "$HOOKS_DIR/bash-dedup-post.sh" | sort -u)
+PRE_KEYS=$(grep -oP 'LOCK_KEY="\K[a-z-]+' "$PROJECT_ROOT/scripts/lib/wv-pre-tool-use.sh" | sort -u)
+POST_KEYS=$(grep -oP '^[[:space:]]*_handle_lock "\K[a-z-]+' "$PROJECT_ROOT/scripts/lib/wv-post-tool-use.sh" | sort -u)
 MISSING_KEYS=$(comm -23 <(echo "$PRE_KEYS") <(echo "$POST_KEYS"))
 if [[ -z "$MISSING_KEYS" ]]; then
     echo -e "${GREEN}✓${NC} bash-dedup: pre/post lock-key tables are in sync"
@@ -1198,6 +1265,13 @@ else
     echo -e "${RED}✗${NC} post-edit-lint: should skip lint on tool failure (got: $OUTPUT)"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
+
+# The install nudge is an advisory, so it must reach the agent: both hosts read
+# PostToolUse context only from hookSpecificOutput.additionalContext (wv-09aa6f).
+OUTPUT=$(jq -cn --arg p "$PROJECT_ROOT/scripts/wv" '{tool_name:"Edit",tool_input:{file_path:$p},tool_response:{success:true}}' \
+    | (cd "$PROJECT_ROOT" && bash "$HOOKS_DIR/post-edit-lint.sh") 2>/dev/null || true)
+assert_contains "$(jq -r '.hookSpecificOutput.additionalContext // empty' <<<"$OUTPUT" 2>/dev/null)" "Edited installed source" \
+    "post-edit-lint: the install nudge is hookSpecificOutput.additionalContext"
 
 # Regression (wv-5af710): prettier reflowed the generated workflow-classes block
 # in templates/WORKFLOW.md after a prose edit elsewhere in the file, so
@@ -1323,8 +1397,33 @@ set +e
 OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
-assert_exit_code "1" "$EXIT_CODE" "stop-check: hard-blocks on this session's own active node"
-assert_contains "$OUTPUT" '"decision": "block"' "stop-check: emits block decision JSON for own active node"
+# The block is the JSON with exit 0: Codex reads exit 1 as a failed hook and
+# plain text as invalid Stop output (wv-25903d, wv-5b774a).
+assert_exit_code "0" "$EXIT_CODE" "stop-check: hard-blocks on this session's own active node"
+assert_equals "block" "$(printf '%s' "$OUTPUT" | jq -r '.decision' 2>/dev/null)" \
+    "stop-check: emits block decision JSON for own active node"
+
+# A dirty tree must not skip the block (wv-fd81b5): the soft warnings used to
+# exit before the active-node check, so in-flight work could end the session.
+rm -f "$(WV_PROJECT_DIR="$TEST_DIR/project" "$WV" hotzone --db 2>/dev/null | xargs dirname 2>/dev/null)/.stop_check_lock" 2>/dev/null || true
+echo "mid-edit" > "$TEST_DIR/project/mid-edit.txt"
+set +e
+STDERR_TMP=$(mktemp)
+OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>"$STDERR_TMP")
+EXIT_CODE=$?
+STDERR_OUT=$(cat "$STDERR_TMP"); rm -f "$STDERR_TMP"
+set -e
+assert_exit_code "0" "$EXIT_CODE" "stop-check: exits 0 with an active node and a dirty tree"
+assert_equals "block" "$(printf '%s' "$OUTPUT" | jq -r '.decision' 2>/dev/null)" \
+    "stop-check: blocks on its own active node even with uncommitted changes"
+# Inside the cooldown the second stop is allowed and the soft warning still runs.
+set +e
+STDERR_OUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>&1 1>/dev/null)
+OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>/dev/null)
+set -e
+assert_equals "" "$OUTPUT" "stop-check: a second stop inside the cooldown is not blocked"
+assert_contains "$STDERR_OUT" "uncommitted" "stop-check: the cooldown stop still warns about uncommitted changes"
+rm -f "$TEST_DIR/project/mid-edit.txt"
 
 # --- session-end-sync.sh ---
 echo ""
@@ -1412,18 +1511,8 @@ assert_contains "$LAST_MSG" "auto-checkpoint" "session-end: auto-checkpoint comm
 echo ""
 echo "--- repo-managed git hooks ---"
 
-# Structural regression (wv-fa566a follow-up): the install-drift self-heal
-# subshell must not let a caller's exported test/dev-isolation vars (e.g.
-# this very suite's WV_LIB_DIR="$PROJECT_ROOT/scripts") leak into the real
-# ./install.sh it shells out to — that previously redirected the MCP build
-# into an untracked scripts/mcp/ tree instead of ~/.local/lib/weave/mcp. A
-# full dynamic run is slow/network-dependent (npm install); assert the
-# unset guard is present in source instead.
-SELF_HEAL_BLOCK=$(sed -n '/Self-heal install drift/,/^fi$/p' "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh")
-assert_contains "$SELF_HEAL_BLOCK" "unset WV_LIB_DIR" \
-    "pre-commit self-heal unsets WV_LIB_DIR before shelling out to install.sh"
-assert_contains "$SELF_HEAL_BLOCK" "unset WV_LIB_DIR WV_CONFIG_DIR WV_HOT_ZONE WV_DB WV_PROJECT_DIR" \
-    "pre-commit self-heal clears all known test-isolation vars, not just one"
+# Installation is now explicit; test-precommit-selfheal-isolation.sh drives
+# real hook callers and verifies that no installer runs (wv-801b89).
 
 setup_test_env
 mkdir -p "$TEST_DIR/project/tests"
@@ -1442,24 +1531,23 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "git pre-commit: exits 0 with active node and passing shell smoke"
 assert_contains "$OUTPUT" "running tests/test-graph.sh" "git pre-commit: streams shell-test progress"
-assert_contains "$OUTPUT" "checking for an active Weave node" "git pre-commit: streams active-node check"
+assert_contains "$OUTPUT" "checking for an active Weave claim held by this actor" "git pre-commit: streams active-node check"
 assert_equals "1" "$(wc -l < "$FRESH_SUITE_RUNS" | tr -d ' ')" \
     "git pre-commit: first unknown result executes the real suite"
 
-# Repeating the hook against the identical staged tree reuses the exact green
-# ledger row instead of executing an expensive suite twice.
+# This fixture is a consumer: even identical staged bytes must rerun because
+# checkout tools can change. Frozen reuse is covered by test-gate-input-reuse.sh.
 set +e
 OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
 EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "git pre-commit: fresh green result exits 0"
-assert_contains "$OUTPUT" "reusing fresh green result for tests/test-graph.sh" \
-    "git pre-commit: names exact staged-result reuse"
-assert_equals "1" "$(wc -l < "$FRESH_SUITE_RUNS" | tr -d ' ')" \
-    "git pre-commit: fresh green result does not execute the suite again"
+assert_contains "$OUTPUT" "checkout inputs are mutable: reuse disabled" \
+    "git pre-commit: explains why consumer results cannot be reused"
+assert_equals "2" "$(wc -l < "$FRESH_SUITE_RUNS" | tr -d ' ')" \
+    "git pre-commit: fresh green consumer result still executes the suite again"
 
-# Any staged-byte change invalidates the row and falls through to the unchanged
-# suite execution path.
+# Staged-byte changes also execute the suite.
 printf '# changed\n' >> "$TEST_DIR/project/tests/test-graph.sh"
 git -C "$TEST_DIR/project" add tests/test-graph.sh
 set +e
@@ -1469,8 +1557,47 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "git pre-commit: stale result reruns and passes"
 assert_contains "$OUTPUT" "running tests/test-graph.sh" \
     "git pre-commit: stale result falls through to real suite execution"
-assert_equals "2" "$(wc -l < "$FRESH_SUITE_RUNS" | tr -d ' ')" \
+assert_equals "3" "$(wc -l < "$FRESH_SUITE_RUNS" | tr -d ' ')" \
     "git pre-commit: stale staged bytes execute the suite exactly once"
+
+# wv-5da0e8: a routed file edited while its suite runs. The result describes the
+# content the suite started on, so staging the edited file and committing again
+# must run the suite, not reuse a row fingerprinted after the edit.
+setup_test_env
+mkdir -p "$TEST_DIR/project/tests" "$TEST_DIR/project/src"
+MIDRUN_RUNS="$TEST_DIR/midrun-runs"
+cat > "$TEST_DIR/project/tests/test-mid.sh" <<EOF
+#!/bin/sh
+echo run >> "$MIDRUN_RUNS"
+[ "\$(wc -l < "$MIDRUN_RUNS")" -eq 1 ] && echo '# edited mid-run' >> "$TEST_DIR/project/src/app.sh"
+exit 0
+EOF
+chmod +x "$TEST_DIR/project/tests/test-mid.sh"
+git -C "$TEST_DIR/project" add tests/test-mid.sh
+git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q -m "mid-run suite"
+printf '[map]\nsrc/app.sh = tests/test-mid.sh\n' > "$TEST_DIR/project/.weave/test-map.conf"
+# The gate routes by the map git holds (F5, wv-fe8007), so HEAD carries it.
+git -C "$TEST_DIR/project" add -f .weave/test-map.conf
+git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q --allow-empty -m "route the suites"
+printf '#!/bin/sh\necho start\n' > "$TEST_DIR/project/src/app.sh"
+git -C "$TEST_DIR/project" add src/app.sh
+add_active_node "Mid-run edit task" --criteria="edited file is not certified|next gate reruns" --risks=low >/dev/null 2>&1
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: the mid-run suite passes"
+assert_contains "$(cat "$TEST_DIR/project/src/app.sh")" "edited mid-run" \
+    "git pre-commit: the suite really edited the routed file during its run"
+git -C "$TEST_DIR/project" add src/app.sh
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_not_contains "$OUTPUT" "reusing fresh green result for tests/test-mid.sh" \
+    "git pre-commit: content edited mid-run is not reused as tested"
+assert_equals "2" "$(wc -l < "$MIDRUN_RUNS" | tr -d ' ')" \
+    "git pre-commit: content edited mid-run runs the suite again"
 
 setup_test_env
 mkdir -p "$TEST_DIR/project/scripts/hooks" "$TEST_DIR/project/tests"
@@ -1511,6 +1638,7 @@ _pool_setup() {
         cat > "$TEST_DIR/project/tests/test-p$_pool_s.sh" <<EOF
 #!/bin/sh
 touch "$POOL_DIR/$_pool_s"
+echo "\${WV_GATE_LANE_JOBS-unset}" > "$POOL_DIR/$_pool_s.lanejobs"
 n=0
 while [ ! -f "$POOL_DIR/$_pool_o" ] && [ \$n -lt ${POOL_WAIT:-100} ]; do sleep 0.1; n=\$((n + 1)); done
 [ -f "$POOL_DIR/$_pool_o" ] || { echo "✗ rendezvous timed out waiting for $_pool_o"; exit 3; }
@@ -1522,6 +1650,9 @@ EOF
     git -C "$TEST_DIR/project" add tests/test-pa.sh tests/test-pb.sh
     git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q -m "pool suites"
     printf '[map]\nsrc/app.sh = tests/test-pa.sh tests/test-pb.sh\n' > "$TEST_DIR/project/.weave/test-map.conf"
+    # The gate routes by the map git holds (F5, wv-fe8007), so HEAD carries it.
+    git -C "$TEST_DIR/project" add -f .weave/test-map.conf
+    git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q --allow-empty -m "route the suites"
     printf '#!/bin/sh\necho %s\n' "$1" > "$TEST_DIR/project/src/app.sh"
     git -C "$TEST_DIR/project" add src/app.sh
     add_active_node "Suite pool task" --criteria="pool runs suites|pool reports failures" --risks=low >/dev/null 2>&1
@@ -1548,49 +1679,122 @@ assert_contains "$OUTPUT" "planted assertion in pa" "suite pool: the failing sui
 assert_contains "$OUTPUT" "full output: " "suite pool: the full captured output is kept on disk"
 assert_not_contains "$OUTPUT" "✗ tests/test-pb.sh failed" "suite pool: the passing sibling is not reported as failed"
 
+# wv-4666cb: each suite row carries when that suite started and exited, read by
+# its worker, and the gate row when the gate started, so a failure's time is
+# measured rather than taken from ts, which is written after the last suite.
+# pb outlives the failing pa by 2s: a time taken at drain would give pa pb's end.
+_pool_setup pool-times 1 0
+sed -i 's/^exit 0$/sleep 2; exit 0/' "$TEST_DIR/project/tests/test-pb.sh"
+git -C "$TEST_DIR/project" add tests/test-pb.sh
+_pt_log="$TEST_DIR/times/suite_runs.jsonl"
+mkdir -p "$TEST_DIR/times"
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && WV_SUITE_LOG="$_pt_log" WV_GATE_LOG='' WV_GATE_JOBS=2 \
+    bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "1" "$EXIT_CODE" "suite times: the planted failure fails the gate"
+_pt_row() { jq -c --arg s "$1" 'select(.suite == $s)' "$_pt_log" 2>/dev/null | tail -1; }
+_pt_a=$(_pt_row tests/test-pa.sh)
+_pt_b=$(_pt_row tests/test-pb.sh)
+_pt_g=$(tail -1 "$TEST_DIR/times/gate_runs.jsonl" 2>/dev/null)
+assert_equals "true true" \
+    "$(jq -r '((.started_ms|type) == "number" and (.ended_ms|type) == "number" and .ended_ms >= .started_ms
+               and ((.ended_ms - .started_ms - .duration_ms) | fabs) <= 1000) | tostring' <<< "$_pt_a$_pt_b" | paste -sd ' ')" \
+    "suite times: both suite rows carry a start and an exit that agree with their duration"
+assert_equals "true" \
+    "$(jq -nr --argjson a "${_pt_a:-null}" --argjson b "${_pt_b:-null}" '($b.ended_ms - $a.ended_ms) >= 1500 | tostring' 2>/dev/null)" \
+    "suite times: the failing suite's exit is its own, not its longer sibling's"
+assert_equals "true" \
+    "$(jq -nr --argjson a "${_pt_a:-null}" --argjson b "${_pt_b:-null}" --argjson g "${_pt_g:-null}" '
+        ($g.started_ms|type) == "number"
+        and $g.started_ms <= ([$a.started_ms, $b.started_ms] | min)
+        and ($g.started_ms + $g.duration_ms + 5) >= ([$a.ended_ms, $b.ended_ms] | max)
+        and ($a.ended_ms - $g.started_ms) < $g.duration_ms | tostring' 2>/dev/null)" \
+    "suite times: the gate row's start precedes its suites, so first-failure time is pa.ended_ms - gate.started_ms"
+
+# wv-c909ff: a commit with no claim is refused before the pool, not after it.
+# The same suites route as above; the setup's claim is returned to todo.
+_pool_setup pool-noclaim 0 0
+for _nc_id in $("$WV" list --status=active --json 2>/dev/null | jq -r '.[].id'); do
+    "$WV" update "$_nc_id" --status=todo >/dev/null 2>&1
+done
+assert_equals "0" "$("$WV" list --status=active --json 2>/dev/null | jq 'length')" \
+    "no claim: (precondition) no node is active"
+_pool_run 2
+assert_exit_code "1" "$EXIT_CODE" "no claim: the commit is refused"
+assert_contains "$OUTPUT" "No active Weave node" "no claim: for the missing claim"
+assert_contains "$OUTPUT" "active Weave claim held by this actor (before the suites)" \
+    "no claim: by the check made before the suites"
+assert_not_contains "$OUTPUT" "running 2 suites" "no claim: the pool never launches"
+assert_equals "0" "$(find "$POOL_DIR" -type f ! -name '*.lanejobs' | wc -l | tr -d ' ')" \
+    "no claim: no routed suite started"
+
 # Serial bound: the rendezvous cannot complete, so whichever suite launches
-# first fails (launch order is longest-first, and the cases above have just
-# measured both), and the one queued behind it must not start once the gate
-# has its verdict.
+# first fails, and the one queued behind it must not start once the gate has
+# its verdict.
 POOL_WAIT=5 _pool_setup pool-serial 0 0
 _pool_run 1
 assert_exit_code "1" "$EXIT_CODE" "suite pool: WV_GATE_JOBS=1 runs suites one at a time"
 assert_contains "$OUTPUT" "rendezvous timed out waiting for" "suite pool: serial run replays the timeout line"
 assert_contains "$OUTPUT" "not run after the failure: tests/test-p" "suite pool: no suite starts after a failure"
-assert_equals "1" "$(find "$POOL_DIR" -type f | wc -l | tr -d ' ')" \
+assert_equals "1" "$(find "$POOL_DIR" -type f ! -name '*.lanejobs' | wc -l | tr -d ' ')" \
     "suite pool: exactly one suite ran; the queued one really did not start"
 
-# The ledger lives in the live DB, and some suites read that DB (test-trailer-
-# refs.sh hashes it around its audit). So the pool writes no ledger row while a
-# suite is still running: pa finishes at once; pb hashes the DB, waits until
-# pa has finished and the pool has had time to reap it, and hashes again.
+# A candidate lane's share of the bound (wv-d7af8d): WV_GATE_LANE_JOBS wins
+# over WV_GATE_JOBS, which config.env could set, and no suite inherits it.
+POOL_WAIT=5 _pool_setup pool-lane-share 0 0
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && WV_GATE_JOBS=2 WV_GATE_LANE_JOBS=1 bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "1" "$EXIT_CODE" "suite pool: a lane share of 1 runs suites one at a time though WV_GATE_JOBS=2"
+assert_not_contains "$OUTPUT" "up to 2 at a time" "suite pool: the lane share, not WV_GATE_JOBS, is the bound"
+_pool_setup pool-lane-share-2 0 0
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && WV_GATE_JOBS=1 WV_GATE_LANE_JOBS=2 bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "suite pool: a lane share of 2 lets the two suites overlap"
+assert_contains "$OUTPUT" "running 2 suites, up to 2 at a time" "suite pool: announces the lane share as its bound"
+assert_equals "unset unset" "$(cat "$POOL_DIR/a.lanejobs" "$POOL_DIR/b.lanejobs" 2>/dev/null | paste -sd ' ')" \
+    "suite pool: no suite inherits the lane share"
+
+# Consumer outcomes are history, not readiness. Recording still waits for the
+# pool to drain: pa finishes at once; pb hashes the explicit history log, waits
+# until pa has finished and the pool has had time to reap it, and hashes again.
 setup_test_env
 mkdir -p "$TEST_DIR/project/tests" "$TEST_DIR/project/src"
 POOL_DIR="$TEST_DIR/pool"
 mkdir -p "$POOL_DIR"
+: > "$TEST_DIR/pool-suite-runs.jsonl"
 printf '#!/bin/sh\ntouch "%s/a-done"\nexit 0\n' "$POOL_DIR" > "$TEST_DIR/project/tests/test-pa.sh"
 cat > "$TEST_DIR/project/tests/test-pb.sh" <<EOF
 #!/bin/sh
-before=\$(cksum < "$WV_DB")
+before=\$(cksum < "$TEST_DIR/pool-suite-runs.jsonl")
 n=0
 while [ ! -f "$POOL_DIR/a-done" ] && [ \$n -lt 100 ]; do sleep 0.1; n=\$((n + 1)); done
 sleep 3
-after=\$(cksum < "$WV_DB")
-[ "\$before" = "\$after" ] || { echo "✗ the live DB changed while this suite ran"; exit 1; }
+after=\$(cksum < "$TEST_DIR/pool-suite-runs.jsonl")
+[ "\$before" = "\$after" ] || { echo "✗ checkout history changed while this suite ran"; exit 1; }
 exit 0
 EOF
 chmod +x "$TEST_DIR/project/tests/test-pa.sh" "$TEST_DIR/project/tests/test-pb.sh"
 git -C "$TEST_DIR/project" add tests/test-pa.sh tests/test-pb.sh
 git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q -m "pool quiet suites"
 printf '[map]\nsrc/app.sh = tests/test-pa.sh tests/test-pb.sh\n' > "$TEST_DIR/project/.weave/test-map.conf"
+# The gate routes by the map git holds (F5, wv-fe8007), so HEAD carries it.
+git -C "$TEST_DIR/project" add -f .weave/test-map.conf
+git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q --allow-empty -m "route the suites"
 printf '#!/bin/sh\necho quiet\n' > "$TEST_DIR/project/src/app.sh"
 git -C "$TEST_DIR/project" add src/app.sh
-add_active_node "Suite pool quiet task" --criteria="pool runs suites|pool writes no ledger row mid-run" --risks=low >/dev/null 2>&1
-_pool_run 2
-assert_exit_code "0" "$EXIT_CODE" "suite pool: no ledger row is written while a sibling suite runs"
-assert_not_contains "$OUTPUT" "the live DB changed" "suite pool: the reading suite saw an unchanged DB"
+add_active_node "Suite pool quiet task" --criteria="pool runs suites|pool writes no history row mid-run" --risks=low >/dev/null 2>&1
+WV_SUITE_LOG="$TEST_DIR/pool-suite-runs.jsonl" _pool_run 2
+assert_exit_code "0" "$EXIT_CODE" "suite pool: no history row is written while a sibling suite runs"
+assert_not_contains "$OUTPUT" "checkout history changed" "suite pool: the reading suite saw unchanged history"
 _pool_recorded() {
-    (cd "$TEST_DIR/project" && "$WV" test-status "$1" --files=src/app.sh --staged --quiet >/dev/null 2>&1) \
+    jq -se --arg suite "$1" 'any(.[]; .suite == $suite and .execution_mode == "checkout" and .exit == 0)' \
+        "$TEST_DIR/pool-suite-runs.jsonl" >/dev/null 2>&1 \
         && echo yes || echo no
 }
 assert_equals "yes yes" "$(_pool_recorded tests/test-pa.sh) $(_pool_recorded tests/test-pb.sh)" \
@@ -1609,10 +1813,14 @@ chmod +x "$TEST_DIR/project/tests/test-pa.sh" "$TEST_DIR/project/tests/test-pb.s
 git -C "$TEST_DIR/project" add tests/test-pa.sh tests/test-pb.sh
 git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q -m "pool interrupt suites"
 printf '[map]\nsrc/app.sh = tests/test-pa.sh tests/test-pb.sh\n' > "$TEST_DIR/project/.weave/test-map.conf"
+# The gate routes by the map git holds (F5, wv-fe8007), so HEAD carries it.
+git -C "$TEST_DIR/project" add -f .weave/test-map.conf
+git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q --allow-empty -m "route the suites"
 printf '#!/bin/sh\necho interrupt\n' > "$TEST_DIR/project/src/app.sh"
 git -C "$TEST_DIR/project" add src/app.sh
 add_active_node "Suite pool interrupt task" --criteria="pool records finished results|stopped suites record nothing" --risks=low >/dev/null 2>&1
-( cd "$TEST_DIR/project" && WV_GATE_JOBS=2 exec bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" ) >/dev/null 2>&1 &
+( cd "$TEST_DIR/project" && WV_SUITE_LOG="$TEST_DIR/pool-suite-runs.jsonl" WV_GATE_JOBS=2 \
+    exec bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" ) >/dev/null 2>&1 &
 _pool_gate=$!
 _pool_n=0
 while [ ! -f "$POOL_DIR/a-done" ] && [ "$_pool_n" -lt 200 ]; do sleep 0.1; _pool_n=$((_pool_n + 1)); done
@@ -1645,6 +1853,9 @@ chmod +x "$TEST_DIR/project/tests/test-pa.sh"
 git -C "$TEST_DIR/project" add tests/test-pa.sh
 git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q -m "env probe suite"
 printf '[map]\nsrc/app.sh = tests/test-pa.sh\n' > "$TEST_DIR/project/.weave/test-map.conf"
+# The gate routes by the map git holds (F5, wv-fe8007), so HEAD carries it.
+git -C "$TEST_DIR/project" add -f .weave/test-map.conf
+git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null commit -q --allow-empty -m "route the suites"
 printf '#!/bin/sh\necho env\n' > "$TEST_DIR/project/src/app.sh"
 git -C "$TEST_DIR/project" add src/app.sh
 add_active_node "Suite env isolation task" --criteria="suites start without git repository variables|hook still reads the staged index" --risks=low >/dev/null 2>&1
@@ -1789,7 +2000,8 @@ assert_contains "$OUTPUT" "impact gate inert: .weave/test-map.conf exists but ma
 assert_contains "$OUTPUT" "Unmatched: docs.md" \
     "git pre-commit: impact-inert message names the actual unmatched file"
 
-# shellcheck gate reads the STAGED BLOB, not the working tree (wv-d6c692).
+# The shellcheck gate reads the STAGED BLOB, not the working tree (wv-d6c692).
+# (A comment opening with the bare word "shellcheck" is parsed as a directive.)
 # Naming staged files and letting shellcheck read them off disk checks whatever
 # is in the worktree, so a dirty index behind a clean worktree committed content
 # that was never linted. This stages a finding, then cleans the worktree.
@@ -1843,6 +2055,152 @@ else
     echo -e "  ${YELLOW}-${NC} shellcheck unavailable — NUL-safety gate tests skipped"
 fi
 
+# Repo-declared shellcheck scope (wv-b9ce14, wv-7608e6). Adopted only by a
+# tracked .weave/shellcheck.conf; selection by extension or STAGED shebang with
+# the declared exclusions; otherwise the fixed patterns, unchanged.
+sc_hook() {  # sc_hook [env...] -> OUTPUT, EXIT_CODE
+    set +e
+    OUTPUT=$(cd "$TEST_DIR/project" && env "$@" bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+    EXIT_CODE=$?
+    set -e
+}
+sc_reset() { git -C "$TEST_DIR/project" reset -q >/dev/null 2>&1 || true; }
+SC_CONF=$'[scope]\nmode = derived\n[exclude]\ntests/fixtures/\n'
+setup_test_env
+if command -v shellcheck >/dev/null 2>&1; then
+    P="$TEST_DIR/project"
+    cp "$PROJECT_ROOT/.shellcheckrc" "$P/.shellcheckrc" 2>/dev/null || true
+    mkdir -p "$P/tests/fixtures/scan" "$P/bin"
+
+    # Unadopted, with an unrelated scripts/shell-files.sh: the fixed patterns.
+    printf '#!/bin/bash\necho unrelated\n' > "$P/scripts/shell-files.sh"
+    printf '#!/bin/bash\necho $(ls)\n' > "$P/tests/test-unlinted.sh"
+    git -C "$P" add scripts/shell-files.sh tests/test-unlinted.sh
+    sc_hook
+    assert_not_contains "$OUTPUT" "STAGED content" \
+        "git pre-commit: without .weave/shellcheck.conf a tests/ script is outside the fixed patterns"
+    printf '#!/bin/bash\necho $(ls)\n' > "$P/scripts/legacy.sh"; git -C "$P" add scripts/legacy.sh
+    sc_hook
+    assert_contains "$OUTPUT" "SC2046" "git pre-commit: without a declaration the fixed patterns still lint scripts/*.sh"
+    sc_reset; rm -f "$P/scripts/legacy.sh"
+
+    # Adopted: tests/ and an extensionless shebang script are linted, fixtures are not.
+    printf '%s' "$SC_CONF" > "$P/.weave/shellcheck.conf"
+    git -C "$P" add -f .weave/shellcheck.conf tests/test-unlinted.sh
+    sc_hook
+    assert_exit_code "1" "$EXIT_CODE" "git pre-commit: an adopted scope lints a staged tests/ script"
+    assert_contains "$OUTPUT" "SC2046" "git pre-commit: ...and reports its finding"
+    sc_reset; git -C "$P" add -f .weave/shellcheck.conf
+    printf '#!/usr/bin/env bash\necho $(ls)\n' > "$P/bin/tool"; git -C "$P" add bin/tool
+    sc_hook
+    assert_contains "$OUTPUT" "SC2046" "git pre-commit: an adopted scope lints an extensionless shebang script"
+    # Staged bytes decide: the worktree copy turning into Python changes nothing.
+    printf '#!/usr/bin/env python3\nprint(1)\n' > "$P/bin/tool"
+    sc_hook
+    assert_contains "$OUTPUT" "SC2046" "git pre-commit: the STAGED shebang is the one judged"
+    sc_reset; rm -f "$P/bin/tool"; git -C "$P" add -f .weave/shellcheck.conf
+    printf '#!/bin/bash\necho $(ls)\n' > "$P/tests/fixtures/scan/unsafe.sh"; git -C "$P" add -f tests/fixtures/scan/unsafe.sh
+    sc_hook
+    assert_not_contains "$OUTPUT" "STAGED content" "git pre-commit: a declared exclusion is not linted"
+    sc_reset
+
+    # A declaration that cannot be read fails closed.
+    printf '[scope]\nmode = everything\n' > "$P/.weave/shellcheck.conf"
+    git -C "$P" add -f .weave/shellcheck.conf
+    sc_hook
+    assert_exit_code "1" "$EXIT_CODE" "git pre-commit: a malformed scope declaration refuses the commit"
+    assert_contains "$OUTPUT" "staged .weave/shellcheck.conf" "git pre-commit: ...and names the declaration"
+    sc_reset
+
+    # One policy: what the hook lints is what the shared selection function
+    # (scripts/lib/wv-shell-scope.sh, which make's helper also applies; see
+    # tests/test-shell-files.sh) picks among the staged files. A stub linter
+    # on PATH records the hook's arguments.
+    printf '%s' "$SC_CONF" > "$P/.weave/shellcheck.conf"
+    printf '#!/bin/sh\necho ok\n' > "$P/bin/tool"; printf 'echo lib\n' > "$P/lib.bash"
+    printf '#!/usr/bin/env python3\nprint(1)\n' > "$P/bin/pytool"
+    git -C "$P" add -f .weave/shellcheck.conf tests/test-unlinted.sh tests/fixtures/scan/unsafe.sh bin/tool bin/pytool lib.bash
+    mkdir -p "$TEST_DIR/sc-stub"
+    printf '#!/bin/sh\n[ "$1" = --severity=warning ] && shift\n[ "$1" = -- ] && shift\nprintf "%%s\\n" "$@" >> "%s"\n' \
+        "$TEST_DIR/sc-args" > "$TEST_DIR/sc-stub/shellcheck"; chmod +x "$TEST_DIR/sc-stub/shellcheck"
+    : > "$TEST_DIR/sc-args"
+    sc_hook PATH="$TEST_DIR/sc-stub:$PATH"
+    HOOK_SEL=$(LC_ALL=C sort "$TEST_DIR/sc-args")
+    POLICY_SEL=$(cd "$P" && bash -c 'source "$1"; wv_shell_scope_read_conf .weave/shellcheck.conf >/dev/null || exit 1
+        git diff --cached --name-only --diff-filter=ACMR -z | wv_shell_scope_select . | tr "\0" "\n"' _ \
+        "$PROJECT_ROOT/scripts/lib/wv-shell-scope.sh" | LC_ALL=C sort)
+    assert_equals "$POLICY_SEL" "$HOOK_SEL" "git pre-commit: the hook lints exactly what the shared selection picks (one policy)"
+    assert_equals $'bin/tool\nlib.bash\ntests/test-unlinted.sh' "$HOOK_SEL" "git pre-commit: ...which is the extension-or-shebang set minus exclusions"
+    sc_reset
+
+    # A commit cannot narrow or drop the declaration that lints it (wv-49b687):
+    # with HEAD declaring the scope, deleting it or excluding the file in the
+    # same commit still lints the file; the next commit is judged by the new one.
+    rm -f "$P/bin/tool" "$P/bin/pytool" "$P/lib.bash"
+    printf '%s' "$SC_CONF" > "$P/.weave/shellcheck.conf"
+    git -C "$P" add -f .weave/shellcheck.conf && git -C "$P" -c core.hooksPath=/dev/null commit -q -m "adopt scope"
+    git -C "$P" rm -q --cached .weave/shellcheck.conf; git -C "$P" add tests/test-unlinted.sh
+    sc_hook
+    # No claim is held here, so the exit status alone is not the lint's; the
+    # finding is the evidence.
+    assert_contains "$OUTPUT" "SC2046" "git pre-commit: deleting the declaration in the same commit still lints under HEAD's"
+    sc_reset
+    printf '%s' "$SC_CONF" > "$P/.weave/shellcheck.conf"; printf 'tests/\n' >> "$P/.weave/shellcheck.conf"
+    git -C "$P" add -f .weave/shellcheck.conf tests/test-unlinted.sh
+    sc_hook
+    assert_contains "$OUTPUT" "SC2046" "git pre-commit: excluding a file in the same commit still lints it under HEAD's declaration"
+    sc_reset
+    printf '[scope]\nmode = derived\n' > "$P/.weave/shellcheck.conf"
+    git -C "$P" add -f .weave/shellcheck.conf tests/fixtures/scan/unsafe.sh
+    sc_hook
+    assert_contains "$OUTPUT" "SC2046" "git pre-commit: ...and a file only the staged declaration selects is linted too (the union)"
+    sc_reset
+    printf '%s' "$SC_CONF" > "$P/.weave/shellcheck.conf"
+    # An unreadable HEAD declaration never blocks the commit repairing it, and
+    # applies meanwhile with no exclusions, the strictest reading.
+    printf '[scope]\nmode = everything\n' > "$P/.weave/shellcheck.conf"
+    git -C "$P" add -f .weave/shellcheck.conf && git -C "$P" -c core.hooksPath=/dev/null commit -q -m "broken scope"
+    printf '%s' "$SC_CONF" > "$P/.weave/shellcheck.conf"
+    git -C "$P" add -f .weave/shellcheck.conf tests/fixtures/scan/unsafe.sh
+    sc_hook
+    assert_not_contains "$OUTPUT" "shellcheck gate:" "git pre-commit: an unreadable HEAD declaration does not refuse the commit repairing it"
+    assert_contains "$OUTPUT" "SC2046" "git pre-commit: ...and applies with no exclusions meanwhile"
+    sc_reset
+    git -C "$P" add -f .weave/shellcheck.conf && git -C "$P" -c core.hooksPath=/dev/null commit -q -m "repair scope"
+
+    # .shellcheckrc is read from git, not the working tree, and HEAD's applies
+    # as well when this commit changes it (wv-49b687).
+    # Untracked everywhere, the working-tree copy is not configuration: the
+    # working tree is not what is committed (wv-e929cf, which reversed the
+    # earlier rule that it applied as local configuration).
+    printf '#!/bin/bash\necho $(ls)\n' > "$P/scripts/rc.sh"
+    printf 'disable=SC2046\n' > "$P/.shellcheckrc"
+    git -C "$P" add scripts/rc.sh
+    sc_hook
+    assert_contains "$OUTPUT" "SC2046" "git pre-commit: an untracked .shellcheckrc does not relax the gate"
+    sc_reset
+    # A tracked rc that suppresses nothing; this repository's own .shellcheckrc
+    # does not ship, so the release projection has none to copy (wv-c6366c).
+    printf '# tracked baseline: suppresses nothing\n' > "$P/.shellcheckrc"
+    git -C "$P" add -f .shellcheckrc && git -C "$P" -c core.hooksPath=/dev/null commit -q -m "track .shellcheckrc"
+    printf 'disable=SC2046\n' > "$P/.shellcheckrc"
+    git -C "$P" add scripts/rc.sh
+    sc_hook
+    assert_contains "$OUTPUT" "SC2046" "git pre-commit: once tracked, an unstaged .shellcheckrc suppression does not relax the gate"
+    git -C "$P" add -f .shellcheckrc
+    sc_hook
+    assert_contains "$OUTPUT" "SC2046" "git pre-commit: a suppression staged with the code it suppresses is refused"
+    assert_contains "$OUTPUT" "under HEAD's shellcheck configuration" "git pre-commit: ...naming HEAD's configuration"
+    sc_reset
+    git -C "$P" add -f .shellcheckrc && git -C "$P" -c core.hooksPath=/dev/null commit -q -m "suppress SC2046"
+    git -C "$P" add scripts/rc.sh
+    sc_hook
+    assert_not_contains "$OUTPUT" "STAGED content" "git pre-commit: once committed on its own, the suppression applies"
+    sc_reset; rm -f "$P/scripts/rc.sh"
+else
+    echo -e "  ${YELLOW}-${NC} shellcheck unavailable — declared-scope gate tests skipped"
+fi
+
 # discover phase with non-.weave file staged must block (no active node bypass)
 setup_test_env
 printf '%s' discover > "$WV_HOT_ZONE/.session_phase"
@@ -1867,6 +2225,135 @@ OUTPUT=$(cd "$TEST_DIR/project" && bash "$PROJECT_ROOT/scripts/hooks/pre-commit-
 EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "git pre-commit: discover phase allows a graph-state-only commit"
+
+# Admission is per actor (wv-99d559): an active node claimed by SOMEONE ELSE no
+# longer admits a commit. Identities are explicit: the suite itself may run
+# under any harness's markers.
+setup_test_env
+echo "# content" > "$TEST_DIR/project/admit.sh"
+git -C "$TEST_DIR/project" add admit.sh
+FOREIGN_ADMIT_ID=$(WV_AGENT_ID="codex-other-host-user" add_active_node "Foreign admission task" 2>/dev/null | tail -1)
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && WV_AGENT_ID="claude-this-host-user" bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: another agent's claim does not admit this actor's commit"
+assert_contains "$OUTPUT" "No active Weave node is claimed by claude-this-host-user" \
+    "git pre-commit: the refusal names the committing actor"
+assert_contains "$OUTPUT" "$FOREIGN_ADMIT_ID  claimed by codex-other-host-user" \
+    "git pre-commit: the refusal names who holds the active claim"
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && env -u WV_AGENT_ID -u CLAUDECODE -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID \
+    -u CODEX_CI -u COPILOT_AGENT bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: an agent's claim does not admit a human's commit either"
+(cd "$TEST_DIR/project" && WV_AGENT_ID="claude-this-host-user" "$WV" work "$FOREIGN_ADMIT_ID" --force >/dev/null 2>&1) || true
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && WV_AGENT_ID="claude-this-host-user" bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: after wv work --force the taking-over actor is admitted"
+assert_not_contains "$OUTPUT" "No active Weave node is claimed by" "git pre-commit: no refusal once the claim is held"
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && WV_AGENT_ID="codex-other-host-user" bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: the previous holder is no longer admitted after the takeover"
+assert_not_contains "$OUTPUT" "linked worktree" "git pre-commit: an ordinary checkout's refusal carries no worktree note"
+
+# A linked worktree keeps its own graph (owner decision wv-d88fed): a claim in
+# the main checkout does not admit a commit there, so both claim refusals say
+# so and name the main checkout. The worktree gets its own hot zone, as wv
+# resolves one per checkout.
+setup_test_env
+WT_DIR="$TEST_DIR/linked"
+git -C "$TEST_DIR/project" worktree add -q --detach "$WT_DIR"
+mkdir -p "$WT_DIR/scripts/lib"
+for f in wv lib/wv-resolve-project.sh lib/wv-resolve-runtime.sh; do ln -sf "$TEST_DIR/project/scripts/$f" "$WT_DIR/scripts/$f"; done
+wt_env() { (cd "$WT_DIR" && WV_HOT_ZONE="$TEST_DIR/wtzone" WV_DB="$TEST_DIR/wtzone/brain.db" \
+    WV_PROJECT_DIR="$WT_DIR" CLAUDE_PROJECT_DIR="$WT_DIR" "$@"); }
+wt_env "$WV" load >/dev/null 2>&1 || true
+echo "# content" > "$WT_DIR/wt.sh"
+git -C "$WT_DIR" add wt.sh
+set +e
+OUTPUT=$(wt_env bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: a linked worktree with no claim of its own is refused"
+assert_contains "$OUTPUT" "No active Weave node — commit blocked" "git pre-commit: ...by the no-claim box"
+assert_contains "$OUTPUT" "This is a linked worktree of:" "git pre-commit: ...which says it is a linked worktree"
+assert_contains "$OUTPUT" "     $(cd "$TEST_DIR/project" && pwd -P)" "git pre-commit: ...names the main checkout"
+assert_contains "$OUTPUT" "In this worktree run wv load, then claim:" "git pre-commit: ...and says to load and claim there"
+WT_FOREIGN_ID=$(wt_env env WV_AGENT_ID="codex-other-host-user" bash -c "$(declare -f add_active_node); WV='$WV'; add_active_node 'Worktree foreign task'" 2>/dev/null | tail -1)
+set +e
+OUTPUT=$(wt_env env WV_AGENT_ID="claude-this-host-user" bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: another actor's claim in the worktree does not admit this actor"
+assert_contains "$OUTPUT" "$WT_FOREIGN_ID  claimed by codex-other-host-user" "git pre-commit: ...the not-mine refusal lists it"
+assert_contains "$OUTPUT" "This is a linked worktree of:" "git pre-commit: ...and carries the worktree note"
+git -C "$TEST_DIR/project" worktree remove --force "$WT_DIR" 2>/dev/null || true
+
+# Former exemptions no longer admit substantive content (wv-68aeff): with no
+# claim, every one of them is refused; graph state alone still passes.
+ex_hook() {  # ex_hook [env...] -> OUTPUT, EXIT_CODE (no node is claimed)
+    set +e
+    OUTPUT=$(cd "$TEST_DIR/project" && env "$@" bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+    EXIT_CODE=$?
+    set -e
+}
+ex_reset() { git -C "$TEST_DIR/project" reset -q >/dev/null 2>&1 || true; }
+setup_test_env
+P="$TEST_DIR/project"
+printf 'x = 1\n' > "$P/tracked.py"
+git -C "$P" add tracked.py && git -C "$P" -c core.hooksPath=/dev/null commit -q -m "tracked file"
+echo "# substantive" > "$P/work.sh"
+
+git -C "$P" add work.sh; ex_hook WV_STYLE_COMMIT=1
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: WV_STYLE_COMMIT=1 no longer admits substantive content"
+ex_reset
+printf 'x  =  1\n' > "$P/tracked.py"; git -C "$P" add tracked.py; ex_hook
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: a whitespace-only diff is not admitted without a claim"
+assert_not_contains "$OUTPUT" "Whitespace-only change" "git pre-commit: ...and the shortcut message is gone"
+ex_reset; git -C "$P" checkout -q -- tracked.py
+git -C "$P" add work.sh; ex_hook WV_AUTO_CHECKPOINT_ACTIVE=1
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: WV_AUTO_CHECKPOINT_ACTIVE=1 is not authority for substantive content"
+ex_reset
+echo '{}' > "$P/.weave/nodes.jsonl"; git -C "$P" add -f .weave/nodes.jsonl; ex_hook WV_AUTO_CHECKPOINT_ACTIVE=1
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: a graph-state-only checkpoint still passes"
+ex_hook
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: ...with or without the flag"
+ex_reset
+printf '%s' closing > "$WV_HOT_ZONE/.session_phase"
+git -C "$P" add work.sh; ex_hook
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: the closing phase no longer waives admission for substantive work"
+ex_reset
+printf '%s' closing > "$WV_HOT_ZONE/.session_phase"
+git -C "$P" add -f .weave/nodes.jsonl; ex_hook
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: a graph-state commit in the closing phase still passes"
+ex_reset
+
+# No wv: refused in a Weave-managed repository, admitted elsewhere.
+mv "$P/scripts/wv" "$TEST_DIR/wv.aside"
+git -C "$P" add -f .weave/nodes.jsonl && git -C "$P" -c core.hooksPath=/dev/null commit -q -m "track .weave"
+git -C "$P" add work.sh; ex_hook PATH=/usr/bin:/bin
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: with no wv, a Weave-managed repository refuses substantive content"
+assert_contains "$OUTPUT" "so this Weave-managed repository cannot check the staged changes" "git pre-commit: ...saying why"
+ex_reset
+echo '{"x":1}' > "$P/.weave/nodes.jsonl"; git -C "$P" add -f .weave/nodes.jsonl; ex_hook PATH=/usr/bin:/bin
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: with no wv, graph state still passes"
+ex_reset
+# Managed is HEAD or the index (wv-49b687): staging the deletion of .weave/
+# with the code does not remove the refusal from the same commit.
+git -C "$P" rm -q -r --cached .weave; git -C "$P" add work.sh; ex_hook PATH=/usr/bin:/bin
+assert_exit_code "1" "$EXIT_CODE" "git pre-commit: with no wv, staging .weave/'s deletion with code is still refused"
+assert_contains "$OUTPUT" "so this Weave-managed repository cannot check the staged changes" "git pre-commit: ...by the same refusal"
+ex_reset
+git -C "$P" rm -q -r --cached .weave && git -C "$P" -c core.hooksPath=/dev/null commit -q -m "untrack .weave"
+git -C "$P" add work.sh; ex_hook PATH=/usr/bin:/bin
+assert_exit_code "0" "$EXIT_CODE" "git pre-commit: with no wv, a repository that tracks no .weave/ is admitted"
+ex_reset; mv "$TEST_DIR/wv.aside" "$P/scripts/wv"
 
 setup_test_env
 HOOK_ID=$(add_active_node "Prepare hook task" --criteria="hook adds trailer|smoke passes" --risks=low 2>/dev/null | tail -1)
@@ -1902,6 +2389,113 @@ assert_contains "$ABOVE_COAUTHOR" "Weave-ID: $HOOK_ID_2" \
     "prepare-commit-msg hook writes every trailer above Co-Authored-By"
 assert_equals "0" "$(find "$TEST_DIR/project" -maxdepth 1 -name 'COMMIT_EDITMSG.wv*' | wc -l | tr -d ' ')" \
     "prepare-commit-msg hook leaves no rewrite temp file behind"
+
+# Git hooks tag their wv calls source=hook (wv-f47c10). A commit from a Claude
+# session inherits WV_CALL_SOURCE=agent, and the e5-c02 capture logged 27 gate
+# calls as agent calls. A stub wv first on PATH (the hooks resolve wv with
+# command -v) records the tag of every call. Each hook must make at least one
+# call, or an empty log would pass vacuously. A test run's tag must survive.
+TAG_DIR="$TEST_DIR/hook-source-tag"
+mkdir -p "$TAG_DIR/bin" "$TAG_DIR/repo/.weave" "$TAG_DIR/repo/src"
+cat > "$TAG_DIR/bin/wv" <<'EOF'
+#!/bin/sh
+printf '%s\n' "${WV_CALL_SOURCE:-unset}" >> "$WV_STUB_LOG"
+echo '[]'
+EOF
+chmod +x "$TAG_DIR/bin/wv"
+(
+    cd "$TAG_DIR/repo" && git init -q && git config user.name "Hook Test" \
+        && git config user.email "hook-test@example.com" && git config commit.gpgsign false \
+        && git commit -q --allow-empty -m init
+    printf '[heavy]\nsrc/ = tests/none.sh\n' > .weave/test-map.conf
+    # Committed with the pushed file: pre-push reads the pushed commits' maps
+    # from git (wv-418d4c), so an uncommitted map would owe nothing.
+    echo pushed > src/pushed.sh && git add src/pushed.sh && git add -f .weave/test-map.conf && git commit -q -m pushed
+    echo staged > src/staged.sh && git add src/staged.sh
+)
+_hook_call_tags() {  # <inherited WV_CALL_SOURCE> <hook>: distinct tags logged
+    : > "$TAG_DIR/log"
+    (
+        cd "$TAG_DIR/repo" || exit 1
+        export PATH="$TAG_DIR/bin:$PATH" WV_STUB_LOG="$TAG_DIR/log" WV_CALL_SOURCE="$1"
+        case "$2" in
+            pre-commit) bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" ;;
+            prepare-commit-msg)
+                echo msg > "$TAG_DIR/msg"
+                sh "$PROJECT_ROOT/scripts/hooks/prepare-commit-msg-weave.sh" "$TAG_DIR/msg" ;;
+            pre-push)
+                bash "$PROJECT_ROOT/scripts/hooks/pre-push-weave.sh" origin unused \
+                    < <(printf 'refs/heads/main %s refs/heads/main %040d\n' "$(git rev-parse HEAD)" 0) ;;
+        esac
+    ) >/dev/null 2>&1
+    sort -u "$TAG_DIR/log" | paste -sd ',' -
+}
+for _tag_hook in pre-commit prepare-commit-msg pre-push; do
+    assert_equals "hook" "$(_hook_call_tags agent "$_tag_hook")" \
+        "git $_tag_hook: wv calls are tagged hook, not the inherited agent tag"
+    assert_equals "test" "$(_hook_call_tags test "$_tag_hook")" \
+        "git $_tag_hook: a test run's WV_CALL_SOURCE=test tag survives"
+done
+
+# Agent-host guards tag their own wv calls hook at entry (wv-a093ea). The claim
+# preflight never loaded wv-hook-common, so its wv show/wv impact inherited
+# WV_CALL_SOURCE=agent from Claude Code's settings and the S4e rehearsal logged
+# them as agent work. The other guards loaded hook-common with `|| true`, so a
+# failed load did the same. A stub wv in the fixture project (wv-resolve-project
+# prefers it) records each call's tag; the "broken" layout is a copy of
+# scripts/lib whose wv-hook-common fails to load, with an empty HOME so no
+# installed copy stands in.
+GUARD_TAG_DIR="$TEST_DIR/guard-source-tag"
+mkdir -p "$GUARD_TAG_DIR/project/.weave" "$GUARD_TAG_DIR/project/scripts" "$GUARD_TAG_DIR/home"
+cat > "$GUARD_TAG_DIR/project/scripts/wv" <<'EOF'
+#!/bin/sh
+printf '%s\n' "${WV_CALL_SOURCE:-unset}" >> "$WV_STUB_LOG"
+case "$1" in
+    show) echo '{"id":"wv-abc123","text":"t","alias":"a","status":"active","metadata":"{\"done_criteria\":[\"c\"],\"risks\":[]}"}' ;;
+    *) echo '{}' ;;
+esac
+EOF
+chmod +x "$GUARD_TAG_DIR/project/scripts/wv"
+cp -R "$PROJECT_ROOT/scripts/lib" "$GUARD_TAG_DIR/broken-lib"
+echo 'return 1' > "$GUARD_TAG_DIR/broken-lib/wv-hook-common.sh"
+_guard_call_tags() {  # <inherited WV_CALL_SOURCE> <adapter|broken> <guard> <command>
+    : > "$GUARD_TAG_DIR/log"
+    (
+        cd "$GUARD_TAG_DIR/project" || exit 1
+        export WV_STUB_LOG="$GUARD_TAG_DIR/log" WV_CALL_SOURCE="$1" \
+            WV_PROJECT_DIR="$GUARD_TAG_DIR/project" CLAUDE_PROJECT_DIR="$GUARD_TAG_DIR/project"
+        _input=$(jq -cn --arg c "$4" --arg cwd "$GUARD_TAG_DIR/project" \
+            '{tool_name:"Bash",tool_input:{command:$c},cwd:$cwd}')
+        if [ "$2" = adapter ]; then
+            printf '%s' "$_input" | bash "$HOOKS_DIR/pre-claim-skills.sh"
+        else
+            export HOME="$GUARD_TAG_DIR/home"
+            # shellcheck source=/dev/null
+            . "$GUARD_TAG_DIR/broken-lib/wv-pre-tool-use.sh" && "$3" "$_input"
+        fi
+    ) >/dev/null 2>&1
+    sort -u "$GUARD_TAG_DIR/log" | paste -sd ',' -
+}
+assert_equals "hook" "$(_guard_call_tags agent adapter wv_ptu_claim_guard 'wv work wv-abc123')" \
+    "claim preflight (Claude adapter): wv show/impact tagged hook, not the inherited agent tag"
+assert_equals "test" "$(_guard_call_tags test adapter wv_ptu_claim_guard 'wv work wv-abc123')" \
+    "claim preflight (Claude adapter): a test run's WV_CALL_SOURCE=test tag survives"
+assert_equals "hook" "$(_guard_call_tags agent broken wv_ptu_claim_guard 'wv work wv-abc123')" \
+    "claim preflight: calls tagged hook when wv-hook-common cannot load"
+assert_equals "hook" "$(_guard_call_tags agent broken wv_ptu_close_guard 'wv done wv-abc123')" \
+    "close verification: calls tagged hook when wv-hook-common cannot load"
+
+# Every subshell guard in the three host-neutral hook libraries sets the tag as
+# its entry, so a guard added later cannot rely on hook-common's side effect.
+_untagged_guards=""
+for _guard_lib in wv-pre-tool-use wv-post-tool-use wv-lifecycle-end; do
+    _untagged_guards="$_untagged_guards$(awk '
+        /^wv_[a-z_]+\(\) *\( *$/ { name = $1; sub(/\(\).*/, "", name); n = 0; next }
+        name != "" { n++; if ($0 ~ /_tag_hook$/) { name = ""; next } if (n >= 3) { print name; name = "" } }
+    ' "$PROJECT_ROOT/scripts/lib/$_guard_lib.sh")"
+done
+assert_equals "" "$_untagged_guards" \
+    "every hook guard in pre-tool-use/post-tool-use/lifecycle-end tags hook within its first lines"
 
 # ============================================================
 # INTEGRATION TEST: Full session lifecycle
@@ -1957,7 +2551,7 @@ else
 fi
 
 # 7. Complete the node
-"$WV" done "$TASK_ID" 2>/dev/null
+"$WV" "done" "$TASK_ID" 2>/dev/null
 TASK_STATUS=$("$WV" show "$TASK_ID" --json 2>/dev/null | jq -r '.status')
 assert_equals "done" "$TASK_STATUS" "lifecycle: node completed"
 
@@ -2207,7 +2801,8 @@ echo '{"tool_name":"Bash","tool_input":{"command":"wv ready"},"tool_response":{"
     | bash "$HOOKS_DIR/wv-budget-tally.sh" >/dev/null 2>&1 || true
 OUTPUT=$(echo '{"tool_name":"Bash","tool_input":{"command":"./scripts/wv learnings"},"tool_response":{"output":"longer output text"}}' \
     | bash "$HOOKS_DIR/wv-budget-tally.sh" 2>&1 || true)
-assert_contains "$OUTPUT" "additionalContext" "budget-tally: threshold call emits additionalContext"
+assert_equals "PostToolUse" "$(jq -r '.hookSpecificOutput.hookEventName // empty' <<<"$OUTPUT" 2>/dev/null)" "budget-tally: threshold call emits hookSpecificOutput"
+assert_contains "$(jq -r '.hookSpecificOutput.additionalContext // empty' <<<"$OUTPUT" 2>/dev/null)" "wv called 3x" "budget-tally: the advisory is the additionalContext both hosts read"
 assert_contains "$OUTPUT" "wv called 3x" "budget-tally: advisory mentions call count"
 assert_contains "$OUTPUT" "narrower queries" "budget-tally: advisory suggests narrower queries"
 
@@ -2217,6 +2812,13 @@ OUTPUT=$(echo '{"tool_name":"Bash","tool_input":{"command":"wv show wv-abc"},"to
 assert_equals "" "$OUTPUT" "budget-tally: advisory fires only once per session"
 CALLS=$(jq -r '.calls' "$BUDGET_FILE")
 assert_equals "4" "$CALLS" "budget-tally: 4th call still counted after advisory"
+
+# Claude Code's Bash result carries stdout and stderr, never an output field, so
+# the byte tally read nothing from a real call (wv-461da4). 5 + 2 bytes here.
+BYTES_BEFORE=$(jq -r '.bytes' "$BUDGET_FILE")
+echo '{"tool_name":"Bash","tool_input":{"command":"wv status"},"tool_response":{"stdout":"12345","stderr":"ab","interrupted":false,"isImage":false,"noOutputExpected":false}}' \
+    | bash "$HOOKS_DIR/wv-budget-tally.sh" >/dev/null 2>&1 || true
+assert_equals "$((BYTES_BEFORE + 7))" "$(jq -r '.bytes' "$BUDGET_FILE")" "budget-tally: counts the bytes of a real Claude Bash result (stdout + stderr)"
 
 # 6) WV_NONINTERACTIVE suppresses advisory across the threshold
 rm -f "$BUDGET_FILE"
@@ -2451,19 +3053,28 @@ for hook in "${!HOOK_EVENTS[@]}"; do
 
     case "$event" in
         PreToolUse)
-            if grep -qE '"decision"[[:space:]]*:[[:space:]]*"block"|decision:[[:space:]]*"block"' "$path"; then
+            # An adapter's output is the guard it calls (wv-d3fbcb): read that
+            # guard's body from the library along with the adapter, or a deny
+            # emitted there is invisible here and the check passes vacuously.
+            src=$(cat "$path")
+            guard=$(grep -m1 -oE 'wv_ptu_[a-z]+_guard' "$path" || true)
+            if [ -n "$guard" ]; then
+                src+=$'\n'$(awk -v f="$guard" '$0 ~ "^" f "\\(\\) \\($" { p = 1 } p { print } p && /^\)$/ { exit }' \
+                    "$PROJECT_ROOT/scripts/lib/wv-pre-tool-use.sh")
+            fi
+            if grep -qE '"decision"[[:space:]]*:[[:space:]]*"block"|decision:[[:space:]]*"block"' <<<"$src"; then
                 schema_check "$hook ($event): no deprecated flat decision schema" 1
             else
                 schema_check "$hook ($event): no deprecated flat decision schema" 0
             fi
 
-            if grep -q 'hookSpecificOutput' "$path"; then
-                if grep -q 'PreToolUse' "$path" && grep -q 'permissionDecision' "$path"; then
+            if grep -q 'hookSpecificOutput' <<<"$src"; then
+                if grep -q 'PreToolUse' <<<"$src" && grep -q 'permissionDecision' <<<"$src"; then
                     schema_check "$hook ($event): uses hookSpecificOutput.permissionDecision" 0
                 else
                     schema_check "$hook ($event): hookSpecificOutput missing PreToolUse+permissionDecision" 1
                 fi
-                if grep -qE 'permissionDecision[^"]*"DENY"' "$path"; then
+                if grep -qE 'permissionDecision[^"]*"DENY"' <<<"$src"; then
                     schema_check "$hook ($event): permissionDecision value is lowercase 'deny'" 1
                 else
                     schema_check "$hook ($event): permissionDecision value is lowercase 'deny'" 0
@@ -2472,7 +3083,30 @@ for hook in "${!HOOK_EVENTS[@]}"; do
                 schema_check "$hook ($event): no JSON emission (exit-code-only is acceptable)" 0
             fi
             ;;
-        PostToolUse|Stop)
+        PostToolUse)
+            # As for PreToolUse: an adapter's output is the guard it calls, so
+            # read that guard's body from the library along with the adapter.
+            src=$(cat "$path")
+            guard=$(grep -m1 -oE 'wv_potu_[a-z_]+_guard' "$path" || true)
+            if [ -n "$guard" ]; then
+                src+=$'\n'$(awk -v f="$guard" '$0 ~ "^" f "\\(\\) \\($" { p = 1 } p { print } p && /^\)$/ { exit }' \
+                    "$PROJECT_ROOT/scripts/lib/wv-post-tool-use.sh")
+            fi
+            if grep -q 'permissionDecision' <<<"$src"; then
+                schema_check "$hook ($event): does not use permissionDecision (PreToolUse-only)" 1
+            else
+                schema_check "$hook ($event): does not use permissionDecision (PreToolUse-only)" 0
+            fi
+            # Both hosts read PostToolUse context only from
+            # hookSpecificOutput.additionalContext; a top-level one is ignored by
+            # Claude Code and rejected by Codex (wv-09aa6f).
+            if grep -qE '\{\\?"?additionalContext' <<<"$src"; then
+                schema_check "$hook ($event): no top-level additionalContext" 1
+            else
+                schema_check "$hook ($event): no top-level additionalContext" 0
+            fi
+            ;;
+        Stop)
             if grep -q 'permissionDecision' "$path"; then
                 schema_check "$hook ($event): does not use permissionDecision (PreToolUse-only)" 1
             else
@@ -2527,7 +3161,7 @@ printf '# m\n\ndurable fact about the resolver path\n' > "$mc_memdir/a.md"
 # 1. Matching repo slug, dry default -> advisory + import suggestion, no graph write.
 MC_OUT=$(printf '{"tool_name":"Write","tool_response":{"success":true},"tool_input":{"file_path":"%s/a.md"}}' "$mc_memdir" \
     | HOME="$mc_home" WV_PROJECT_DIR="$TEST_DIR/project" WV_HOT_ZONE="$TEST_DIR" bash "$HOOKS_DIR/post-memory-capture.sh" 2>/dev/null || true)
-assert_contains "$MC_OUT" "additionalContext" "memory-capture: emits additionalContext advisory for repo-scoped write"
+assert_contains "$(jq -r '.hookSpecificOutput.additionalContext // empty' <<<"$MC_OUT" 2>/dev/null)" "Repo-scoped Claude memory write" "memory-capture: emits the advisory as hookSpecificOutput.additionalContext"
 assert_contains "$MC_OUT" "wv memory import" "memory-capture: advisory points at graph import"
 assert_not_contains "$MC_OUT" "permissionDecision" "memory-capture: PostToolUse hook does not gate (no permissionDecision)"
 
@@ -2557,7 +3191,7 @@ mc_ck="$TEST_DIR/mc-checkout"
 mkdir -p "$mc_ck/.claude/hooks" "$mc_ck/scripts/lib"
 cp "$HOOKS_DIR/post-memory-capture.sh" "$mc_ck/.claude/hooks/"
 cp "$PROJECT_ROOT/scripts/lib/wv-resolve-project.sh" "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" \
-    "$PROJECT_ROOT/scripts/lib/wv-hook-common.sh" "$mc_ck/scripts/lib/"
+    "$PROJECT_ROOT/scripts/lib/wv-hook-common.sh" "$PROJECT_ROOT/scripts/lib/wv-post-tool-use.sh" "$mc_ck/scripts/lib/"
 MC_LOG="$TEST_DIR/mc-import.log"
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$MC_LOG" > "$mc_ck/scripts/wv"
 chmod +x "$mc_ck/scripts/wv"
@@ -2569,6 +3203,24 @@ printf '{"tool_name":"Write","tool_response":{"success":true},"tool_input":{"fil
       bash "$mc_ck/.claude/hooks/post-memory-capture.sh" >/dev/null 2>&1 || true
 assert_contains "$(cat "$MC_LOG" 2>/dev/null || echo "<no wv ran>")" "memory import --source=claude --path=$mc_memdir" \
     "memory-capture: opt-in import runs the first executable wv, skipping a non-executable one"
+
+# A project-local CLI must not replace the CLI paired with the hook library:
+# inside a protected lane it would execute working-tree bytes (wv-971035).
+: > "$MC_LOG"
+MC_DECOY_LOG="$TEST_DIR/mc-decoy.log"
+cat > "$TEST_DIR/project/scripts/wv" <<EOF
+#!/bin/sh
+if [ "\$1 \$2" = 'memory import' ]; then printf 'wrong-copy\n' >> "$MC_DECOY_LOG"; fi
+exit 0
+EOF
+chmod +x "$TEST_DIR/project/scripts/wv"
+printf '{"tool_name":"Write","tool_response":{"success":true},"tool_input":{"file_path":"%s/a.md"}}' "$mc_memdir" \
+    | HOME="$mc_home" WV_PROJECT_DIR="$TEST_DIR/project" WV_HOT_ZONE="$TEST_DIR" WV_MEMORY_CAPTURE=1 \
+      bash "$mc_ck/.claude/hooks/post-memory-capture.sh" >/dev/null 2>&1 || true
+assert_contains "$(cat "$MC_LOG" 2>/dev/null || echo "<no wv ran>")" "memory import --source=claude --path=$mc_memdir" \
+    "memory-capture: the library's own CLI wins over a project-local decoy"
+assert_equals "" "$(cat "$MC_DECOY_LOG" 2>/dev/null || true)" \
+    "memory-capture: project-local decoy never imports"
 
 # ============================================================
 # Agent-hook branches the S0 re-measure found undriven (wv-e53f56)
@@ -2647,22 +3299,25 @@ assert_equals "yes" "$pc_msg_ok" "pre-compact: a graph-only checkpoint over an u
 unset _WV_SKIP_SYNC_COMMIT
 [ -n "$pc_saved_wv_db" ] && export WV_DB="$pc_saved_wv_db"
 
-# post-edit-lint: files in the typed modules get a mypy pass, others do not.
+# post-edit-lint: files in the typed modules get a Pyrefly pass, others do not.
 setup_test_env
 cd "$TEST_DIR/project"
-if python3 -m mypy --version >/dev/null 2>&1; then
+if command -v pyrefly >/dev/null 2>&1; then
     mkdir -p scripts/weave_quality scripts/other
+    printf 'project-includes = ["scripts"]\n' > pyrefly.toml
     printf 'x: int = "not an int"\n' > scripts/weave_quality/typed_probe.py
     printf 'x: int = "not an int"\n' > scripts/other/typed_probe.py
     pel_mod=$(printf '{"tool_name":"Edit","tool_response":{"success":true},"tool_input":{"file_path":"%s"}}' \
         "$TEST_DIR/project/scripts/weave_quality/typed_probe.py" | bash "$HOOKS_DIR/post-edit-lint.sh" 2>/dev/null || true)
-    assert_contains "$pel_mod" "mypy type errors in scripts/weave_quality" \
+    assert_contains "$pel_mod" "Pyrefly type errors in scripts/weave_quality" \
         "post-edit-lint: a type error in a typed module is reported"
+    assert_contains "$pel_mod" "bad-assignment" \
+        "post-edit-lint: the checker diagnosed the planted assignment, not a setup failure"
     pel_other=$(printf '{"tool_name":"Edit","tool_response":{"success":true},"tool_input":{"file_path":"%s"}}' \
         "$TEST_DIR/project/scripts/other/typed_probe.py" | bash "$HOOKS_DIR/post-edit-lint.sh" 2>/dev/null || true)
-    assert_not_contains "$pel_other" "mypy" "post-edit-lint: a file outside the typed modules gets no mypy pass"
+    assert_not_contains "$pel_other" "Pyrefly" "post-edit-lint: a file outside the typed modules gets no type-check pass"
 else
-    echo "  (post-edit-lint mypy cases skipped: python3 has no mypy)"
+    echo "  (post-edit-lint Pyrefly cases skipped: pyrefly is not on PATH)"
 fi
 
 # ============================================================

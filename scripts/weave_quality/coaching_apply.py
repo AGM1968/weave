@@ -187,7 +187,7 @@ def existing_edges(node_id: str, run: Runner) -> set[tuple[str, str]]:
     if code != 0:
         raise ApplyError(f"could not read edges for {node_id}: {out}", "read_failed")
     try:
-        rows = json.loads(out) if out else []
+        rows = json.loads(out) if out else list[dict[str, str]]()
     except json.JSONDecodeError as exc:
         raise ApplyError(f"edges returned malformed JSON: {exc}", "read_failed") from None
     return {

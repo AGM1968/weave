@@ -16,6 +16,7 @@ export WV_CALL_SOURCE=test
 # rather than driven through the CLI: pointing WV_LIB_DIR at a fixture breaks
 # the binary outright, because it sources its command modules from there.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

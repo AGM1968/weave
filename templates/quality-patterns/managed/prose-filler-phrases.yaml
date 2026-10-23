@@ -6,7 +6,7 @@ severity: info
 policy: always-on-shared
 maturity: promotable
 provenance: >-
-  wv-cc46cc @nowcast, ported and retained by earth-engine-analysis. Each phrase has a shorter exact equivalent and does
+  wv-cc46cc in a consumer graph, ported and retained by a second consumer. Each phrase has a shorter exact equivalent and does
   not encode a project-specific register stance. Calibrated 2026-09-02 (wv-961a15) against 84 peer-reviewed papers,
   986,291 words. The five retained phrases occur 17 times there, 0.172 per 10,000, so writing that cleared external
   editorial review effectively does not use them. "in order to" was REMOVED by that measurement: 118 of the rule's 135

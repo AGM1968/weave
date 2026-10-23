@@ -17,8 +17,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from weave_coaching import view  # noqa: E402
-from weave_quality import guides as guide_resolver  # noqa: E402
+from weave_coaching import view  # noqa: E402  # pylint: disable=wrong-import-position
+from weave_quality import guides as guide_resolver  # noqa: E402  # pylint: disable=wrong-import-position
 
 CATALOG = json.loads(
     Path("contracts/violation-vocabulary-v1.json").read_text(encoding="utf-8")
@@ -30,7 +30,8 @@ def anchor(path: str, match: str) -> dict[str, object]:
     return {"path": path, "normalized_match": match, "normalized_context": match}
 
 
-def occurrence(path: str, match: str, line: int | None, rule: str = "bare-except-pass"):
+def occurrence(path: str, match: str, line: int | None,
+               rule: str = "bare-except-pass") -> dict[str, object]:
     entry: dict[str, object] = {
         "anchor": anchor(path, match),
         "detectors": [{"rule_id": rule, "finding_key": "qf-" + "a" * 64,
@@ -42,23 +43,37 @@ def occurrence(path: str, match: str, line: int | None, rule: str = "bare-except
 
 
 def finding(occurrences: list[dict[str, object]], **extra: object) -> dict[str, object]:
-    base = {"violation_type": VIOLATION, "occurrences": occurrences}
+    base: dict[str, object] = {"violation_type": VIOLATION, "occurrences": occurrences}
     base.update(extra)
     return base
 
 
-def check(out_dir: Path) -> list[str]:
+def _check_refusals(guides: dict[str, dict[str, object]], complete: dict[str, str]) -> list[str]:
     problems: list[str] = []
-    guide = guide_resolver.resolve(VIOLATION, CATALOG, "python").content()
-    guides = {VIOLATION: guide}
-    complete = {"state": "complete"}
+    try:
+        view.render_response([finding([occurrence("a.py", "x", 1)])], {}, complete)
+        problems.append("a finding with no resolved guide must be refused")
+    except view.ViewError:
+        pass
+    try:
+        view.render_response([], guides, {"state": "incomplete", "causes": []})
+        problems.append("an incomplete snapshot with no causes must be refused")
+    except view.ViewError:
+        pass
+    return problems
 
-    def emit(name: str, response: dict[str, object]) -> None:
-        (out_dir / f"{name}.json").write_text(json.dumps(response, indent=2) + "\n")
 
+def _emit(out_dir: Path, name: str, response: dict[str, object]) -> None:
+    (out_dir / f"{name}.json").write_text(json.dumps(response, indent=2) + "\n")
+
+
+def _check_complete_states(
+    out_dir: Path, guides: dict[str, dict[str, object]], complete: dict[str, str]
+) -> list[str]:
+    problems: list[str] = []
     # 1. Nothing to report, and the clean message is qualified.
     clean = view.render_response([], guides, complete)
-    emit("clean", clean)
+    _emit(out_dir, "clean", clean)
     if clean["state"] != "complete_clean":
         problems.append(f"an empty complete run must be complete_clean, got {clean['state']}")
     if "causes" in clean:
@@ -69,16 +84,24 @@ def check(out_dir: Path) -> list[str]:
     # 2. Findings present: no clean message may ride along.
     single = view.render_response([finding([occurrence("a.py", "except Exception: pass", 12)])],
                                   guides, complete)
-    emit("with-findings", single)
+    _emit(out_dir, "with-findings", single)
     if single["state"] != "complete_with_findings":
         problems.append(f"findings must yield complete_with_findings, got {single['state']}")
     if "clean_message" in single:
         problems.append("a response with findings may not carry a clean message")
+    return problems
+
+
+def check(out_dir: Path) -> list[str]:
+    guide = guide_resolver.resolve(VIOLATION, CATALOG, "python").content()
+    guides = {VIOLATION: guide}
+    complete = {"state": "complete"}
+    problems = _check_complete_states(out_dir, guides, complete)
 
     # 3. Bounded sampling reports the TRUE total, not the sample size.
     many = [occurrence(f"f{i}.py", f"except Exception: pass  # {i}", i + 1) for i in range(9)]
     bounded = view.render_response([finding(many)], guides, complete, limit=3)
-    emit("bounded", bounded)
+    _emit(out_dir, "bounded", bounded)
     block = bounded["blocks"][0]
     if block["occurrence_count"] != 9:
         problems.append(f"occurrence_count must be the true total, got {block['occurrence_count']}")
@@ -92,7 +115,7 @@ def check(out_dir: Path) -> list[str]:
 
     # 4. Complete JSON keeps every occurrence when nothing is trimmed.
     unbounded = view.render_response([finding(many)], guides, complete, limit=None)
-    emit("unbounded", unbounded)
+    _emit(out_dir, "unbounded", unbounded)
     if len(unbounded["blocks"][0]["occurrences"]) != 9:
         problems.append("an untrimmed response must retain every occurrence")
     if unbounded["blocks"][0].get("sampled") or unbounded.get("bounded"):
@@ -102,7 +125,7 @@ def check(out_dir: Path) -> list[str]:
     file_scoped = view.render_response(
         [finding([occurrence("whole.md", "document-scope observation", None)])], guides, complete
     )
-    emit("file-scope", file_scoped)
+    _emit(out_dir, "file-scope", file_scoped)
     rendered = file_scoped["blocks"][0]["occurrences"][0]
     if rendered.get("shape") != "file" or "line" in rendered:
         problems.append("a locationless occurrence must render as file shape with no line")
@@ -117,7 +140,7 @@ def check(out_dir: Path) -> list[str]:
             {"reason": "receipt_failed", "rule_id": "unquoted-variable",
              "detail": "rule execution failed", "remedy": "wv quality patterns scan"}]},
     )
-    emit("incomplete", partial)
+    _emit(out_dir, "incomplete", partial)
     if partial["state"] != "incomplete":
         problems.append("an incomplete snapshot must produce state=incomplete even with findings")
     if "clean_message" in partial:
@@ -138,23 +161,14 @@ def check(out_dir: Path) -> list[str]:
         {"repo:hygiene": fallback},
         complete,
     )
-    emit("uncoached", uncoached)
+    _emit(out_dir, "uncoached", uncoached)
     if not uncoached["blocks"][0]["guide"].get("names_missing_guide"):
         problems.append("the fallback must declare that a specific guide is missing")
     if "No specific guide exists" not in view.render_text(uncoached):
         problems.append("fallback text must name the missing guide rather than imply none is needed")
 
     # 8. Refusals: data that cannot be rendered honestly is refused, not patched.
-    try:
-        view.render_response([finding([occurrence("a.py", "x", 1)])], {}, complete)
-        problems.append("a finding with no resolved guide must be refused")
-    except view.ViewError:
-        pass
-    try:
-        view.render_response([], guides, {"state": "incomplete", "causes": []})
-        problems.append("an incomplete snapshot with no causes must be refused")
-    except view.ViewError:
-        pass
+    problems.extend(_check_refusals(guides, complete))
 
     # 9. Occurrence sampling alone is not a text budget: guide prose, paths,
     # content, blocks and causes can each be large. Exercise multibyte text so
@@ -167,7 +181,7 @@ def check(out_dir: Path) -> list[str]:
         {VIOLATION: large_guide},
         complete,
     )
-    emit("oversized-text", oversized)
+    _emit(out_dir, "oversized-text", oversized)
     oversized_text = view.render_text(oversized)
     if len(oversized_text.encode("utf-8")) > view.MAX_TEXT_BYTES:
         problems.append("default text rendering exceeds its UTF-8 byte budget")

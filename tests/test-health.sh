@@ -9,6 +9,7 @@ export WV_CALL_SOURCE=test
 # Each test uses isolated WV_DB via reset_db() to prevent pollution.
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -46,6 +47,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Assertions record a failure and return 0: under set -e a nonzero return
+# ended the suite at its first failed assertion, so every later result and
+# the summary went unreported (wv-75e31a). TESTS_FAILED decides the exit.
 assert_contains() {
     local haystack="$1"
     local needle="$2"
@@ -59,7 +63,7 @@ assert_contains() {
         echo -e "  ${RED}✗${NC} $message"
         echo "    Expected to contain: '$needle'"
         echo "    Got: '$haystack'"
-        return 1
+        return 0
     fi
 }
 
@@ -71,7 +75,7 @@ assert_not_contains() {
     if grep -qF -- "$needle" <<< "$haystack"; then
         echo -e "  ${RED}✗${NC} $message"
         echo "    Should NOT contain: '$needle'"
-        return 1
+        return 0
     else
         echo -e "  ${GREEN}✓${NC} $message"
         TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -92,7 +96,7 @@ assert_equals() {
         echo -e "  ${RED}✗${NC} $message"
         echo "    Expected: '$expected'"
         echo "    Got: '$actual'"
-        return 1
+        return 0
     fi
 }
 
@@ -107,7 +111,7 @@ assert_succeeds() {
     else
         echo -e "  ${RED}✗${NC} $message"
         echo "    Command failed: $*"
-        return 1
+        return 0
     fi
 }
 
@@ -127,7 +131,7 @@ assert_json_field() {
         echo -e "  ${RED}✗${NC} $message"
         echo "    Expected $field = '$expected'"
         echo "    Got: '$actual'"
-        return 1
+        return 0
     fi
 }
 

@@ -8,16 +8,27 @@
 # Database Initialization
 # ═══════════════════════════════════════════════════════════════════════════
 
+# db_stamp_repo_owner <repo> — record <repo> as the hot zone's owning
+# repository in .repo_root. db_ensure passes REPO_ROOT; wv init passes the
+# owner it can name (wv-29e416).
 db_stamp_repo_owner() {
-    [ -n "${REPO_ROOT:-}" ] || return 0
+    local repo="${1:-}"
+    [ -n "$repo" ] || return 0
     [ -n "${WV_HOT_ZONE:-}" ] || return 0
 
     local owner_file canonical_repo_root
     owner_file=$(resolve_hot_zone_owner_file "$WV_HOT_ZONE")
     [ -n "$owner_file" ] || return 0
 
-    canonical_repo_root=$(canonicalize_runtime_path "$REPO_ROOT")
-    mkdir -p "$WV_HOT_ZONE" 2>/dev/null || true
+    canonical_repo_root=$(canonicalize_runtime_path "$repo")
+    hot_zone_ensure "$WV_HOT_ZONE" || return 0
+    # .gate_pool (wv-7061a0): the commit gate's suite pool that ran this wv,
+    # so a pool's leak guard can tell a zone its own suites made in the live
+    # root from a sibling pool's. Written before .repo_root: the guard judges
+    # a zone only once .repo_root exists, and must then find the tag.
+    if [ -n "${WV_GATE_POOL_TAG:-}" ]; then
+        printf '%s\n' "$WV_GATE_POOL_TAG" > "${owner_file%/*}/.gate_pool" 2>/dev/null || true
+    fi
     printf '%s\n' "$canonical_repo_root" > "$owner_file" 2>/dev/null || true
     chmod 600 "$owner_file" 2>/dev/null || true
 }
@@ -26,7 +37,10 @@ db_init() {
     # Security: hot zone may be under /dev/shm or /tmp (shared-mount parents).
     # Create 700/600 so other local users cannot read the graph. `umask 077`
     # covers the DB file; explicit chmod covers existing dirs that predate
-    # this change. See security review L5 (2026-04-19).
+    # this change. See security review L5 (2026-04-19). hot_zone_ensure
+    # refuses a base another user could control, and never chmods one; the
+    # chmod below touches only the per-repo leaf, which a verified base
+    # guarantees is ours (wv-80be32).
     #
     # Do not create $WEAVE_DIR here. db_init backs both explicit initialization
     # and read-ish paths like `wv health`, `wv status`, and session-start
@@ -35,7 +49,10 @@ db_init() {
     local prev_umask
     prev_umask=$(umask)
     umask 077
-    mkdir -p "$WV_HOT_ZONE"
+    if ! hot_zone_ensure "$WV_HOT_ZONE"; then
+        umask "$prev_umask"
+        return 1
+    fi
     chmod 700 "$WV_HOT_ZONE" 2>/dev/null || true
     umask "$prev_umask"
     validate_hot_size
@@ -277,6 +294,13 @@ EOF
     # rather than after the next db_ensure migration pass. (The heredoc above is
     # an unquoted <<EOF — it cannot call a function mid-body, hence this follow-up.)
     _policy_trigger_sql | sqlite3 "$WV_DB" 2>/dev/null || true
+    # The heredoc's own status is not the test: on a SQLite without FTS5 its FTS
+    # statements fail while the rest succeeds. What must hold is a database that
+    # opens and has the core table (wv-b98794).
+    if ! sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COUNT(*) FROM nodes;" >/dev/null 2>&1; then
+        echo "wv: could not create the Weave database at $WV_DB" >&2
+        return 1
+    fi
     # Writer lineage lives in a migration rather than the schema heredoc above so
     # that a fresh database and a migrated one produce identical CREATE TABLE
     # text — see db_migrate_lineage for why that matters to state.sql.
@@ -440,7 +464,7 @@ MIGRATE
 _WV_DB_SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$_WV_DB_SRC_DIR/wv-db-lineage.sh"
 
-# db_write_tombstone KIND ID [LINEAGE_SEQ] [LINEAGE_ACTOR] — record a cross-machine
+# db_tombstone_sql KIND ID [LINEAGE_SEQ] [LINEAGE_ACTOR] — SQL for a cross-machine
 # deletion tombstone (epic delta-causality, wv-0d5e07). Called by wv delete and
 # wv prune in place of the machine-local .weave/.prune_epoch. KIND is 'node' or
 # 'edge'; ID is the node id, or the "source:target:type" identity for an edge
@@ -455,7 +479,7 @@ source "$_WV_DB_SRC_DIR/wv-db-lineage.sh"
 # (resolve_agent_id) — kept for parity with the Delta v2 tombstone shape. Omitted
 # args fall to the pre-cutover floor (0, ''). ON CONFLICT keeps the higher
 # (seq, actor) so a re-delete never regresses an existing tombstone.
-db_write_tombstone() {
+db_tombstone_sql() {
     local kind="$1" ident="$2" lseq="${3:-0}" lactor="${4:-}"
     [ "$kind" = "node" ] || [ "$kind" = "edge" ] || return 1
     [ -n "$ident" ] || return 1
@@ -466,13 +490,19 @@ db_write_tombstone() {
     else
         esc_id=${ident//\'/\'\'}; esc_actor=${lactor//\'/\'\'}
     fi
-    db_query "INSERT INTO tombstones(kind, id, lineage_seq, lineage_actor)
+    printf '%s\n' "INSERT INTO tombstones(kind, id, lineage_seq, lineage_actor)
         VALUES ('$kind', '$esc_id', $lseq, '$esc_actor')
         ON CONFLICT(kind, id) DO UPDATE SET
             lineage_seq = excluded.lineage_seq,
             lineage_actor = excluded.lineage_actor
         WHERE (excluded.lineage_seq, excluded.lineage_actor)
             > (tombstones.lineage_seq, tombstones.lineage_actor);"
+}
+
+db_write_tombstone() {
+    local sql
+    sql=$(db_tombstone_sql "$@") || return 1
+    db_query "$sql"
 }
 
 # db_capture_tombstones NODE_ID — print the tombstones a removal of NODE_ID must
@@ -482,25 +512,32 @@ db_write_tombstone() {
 # so a change to tombstone semantics cannot reach only one of them and reopen
 # wv-0d5e07's resurrection bug.
 db_capture_tombstones() {
-    local node_id="$1" esc seq es et ety eseq
+    local node_id="$1" esc seq es et ety eseq edges
     [ -n "$node_id" ] || return 1
     if command -v sql_escape >/dev/null 2>&1; then esc=$(sql_escape "$node_id"); else esc=${node_id//\'/\'\'}; fi
-    seq=$(db_query "SELECT COALESCE(lineage_seq,0) FROM nodes WHERE id='$esc';" 2>/dev/null || echo 0)
+    seq=$(db_query "SELECT COALESCE(lineage_seq,0) FROM nodes WHERE id='$esc';") || return 1
+    edges=$(db_query "SELECT source, target, type, COALESCE(lineage_seq,0) FROM edges WHERE source='$esc' OR target='$esc';") || return 1
     printf 'node\t%s\t%s\n' "$node_id" "${seq:-0}"
     while IFS='|' read -r es et ety eseq; do
         [ -n "$es" ] || continue
         printf 'edge\t%s:%s:%s\t%s\n' "$es" "$et" "$ety" "${eseq:-0}"
-    done < <(db_query "SELECT source, target, type, COALESCE(lineage_seq,0) FROM edges WHERE source='$esc' OR target='$esc';" 2>/dev/null)
+    done <<< "$edges"
 }
 
-# db_write_tombstones ACTOR — write every "kind<TAB>ident<TAB>lineage_seq" line on
-# stdin (db_capture_tombstones output) as a tombstone recorded by ACTOR.
-db_write_tombstones() {
+# Build tombstone statements so a removal can commit them in its own transaction.
+db_tombstones_sql() {
     local actor="$1" kind ident seq
     while IFS=$'\t' read -r kind ident seq; do
         [ -n "$kind" ] || continue
-        db_write_tombstone "$kind" "$ident" "${seq:-0}" "$actor"
+        db_tombstone_sql "$kind" "$ident" "${seq:-0}" "$actor" || return 1
     done
+}
+
+# db_write_tombstones ACTOR — write db_capture_tombstones output from stdin.
+db_write_tombstones() {
+    local sql
+    sql=$(db_tombstones_sql "$1") || return 1
+    db_query "$sql"
 }
 
 # Migrate to add FTS5 full-text search table (Phase 2.1).
@@ -1160,9 +1197,16 @@ REINDEX
 # Rebuild FTS silently on load (called after importing selective state.sql
 # which excludes FTS tables).  Uses the existing migrate + rebuild path.
 db_rebuild_fts() {
-    db_migrate_fts5
+    db_migrate_fts5 || return 1
+    if ! sqlite3 -cmd ".timeout 5000" "$WV_DB" \
+        "INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');"; then
+        echo "Error: could not rebuild the node search index" >&2
+        return 1
+    fi
+    # The plain integrity check does not compare an external-content index
+    # against nodes; a missing document can pass it and break the next UPDATE.
     sqlite3 -cmd ".timeout 5000" "$WV_DB" \
-        "INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');" 2>/dev/null || true
+        "INSERT INTO nodes_fts(nodes_fts,rank) VALUES('integrity-check',1);"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1209,6 +1253,30 @@ _wv_db_stamp_current() {
     [ "$have" = "$want" ]
 }
 
+# _wv_db_schema_missing — print each schema object the migrations create that is
+# absent (type:name, one per line); empty output means complete. The FTS objects
+# are expected only where SQLite has FTS5, as their migrations skip otherwise.
+# The migrations swallow their own sqlite3 errors (2>/dev/null || true), so this
+# is the only evidence that they all took effect: a stamp written over one that
+# failed certified the gap to every later process (wv-e90d62).
+_wv_db_schema_missing() {
+    sqlite3 -cmd ".timeout 5000" "$WV_DB" "
+        WITH want(key, fts) AS (VALUES
+            ('table:nodes', 0), ('table:edges', 0), ('table:policy_thresholds', 0),
+            ('table:node_files', 0), ('table:file_metrics', 0), ('table:file_trend', 0),
+            ('table:quality_exempt', 0), ('table:quality_config_sig', 0),
+            ('table:chunks', 0), ('table:test_results', 0), ('table:file_test_status', 0),
+            ('trigger:nodes_policy_check', 0),
+            ('table:nodes_learning_fts', 1), ('trigger:nodes_learning_ai', 1),
+            ('trigger:nodes_learning_ad', 1), ('trigger:nodes_learning_au', 1),
+            ('table:chunks_fts', 1), ('trigger:chunks_ai', 1),
+            ('trigger:chunks_ad', 1), ('trigger:chunks_au', 1))
+        SELECT key FROM want
+        WHERE (fts = 0 OR sqlite_compileoption_used('ENABLE_FTS5'))
+          AND key NOT IN (SELECT type || ':' || name FROM sqlite_master)
+        ORDER BY key;" 2>/dev/null || echo "unreadable"
+}
+
 db_ensure() {
     # Per-process fast path (wv-3d6ed0). Without it every db_query re-ran the
     # migration probes below, each its own sqlite3, at ~220ms per query; the
@@ -1230,8 +1298,7 @@ db_ensure() {
             if [ "$old_nodes" -gt 0 ] 2>/dev/null; then
                 echo -e "${YELLOW}Found pre-v1.2 global database: $old_global_db ($old_nodes nodes)${NC}" >&2
                 echo -e "${YELLOW}Migrating to per-repo path: $WV_DB${NC}" >&2
-                mkdir -p "$(dirname "$WV_DB")"
-                if cp "$old_global_db" "$WV_DB" 2>/dev/null; then
+                if hot_zone_ensure "${WV_DB%/*}" && cp "$old_global_db" "$WV_DB" 2>/dev/null; then
                     echo -e "${GREEN}✓ Migrated $old_nodes nodes to $WV_DB${NC}" >&2
                     echo -e "${YELLOW}Old database kept at $old_global_db — remove manually when ready${NC}" >&2
                     # Run schema migrations on the copied DB
@@ -1254,9 +1321,9 @@ db_ensure() {
             # conflicts that occur when db_init runs before importing state.sql
             # (SQLite .dump uses plain CREATE TABLE, not CREATE TABLE IF NOT EXISTS)
             echo -e "${YELLOW}Weave database not found at $WV_DB${NC}" >&2
-            cmd_load
+            cmd_load || return 1
         else
-            db_init
+            db_init || return 1
             # Safety net: warn if .weave/ has data but we just created an empty DB
             if [ -z "$WV_DB_CUSTOM" ] && [ -d "$WEAVE_DIR" ]; then
                 local has_data=false
@@ -1282,7 +1349,7 @@ db_ensure() {
         fi
     fi
 
-    db_stamp_repo_owner
+    db_stamp_repo_owner "${REPO_ROOT:-}"
 
     # Cross-process fast path (wv-048429). The first ensure in every wv process
     # ran all ten migrations (~170ms of sqlite3 calls) even when another process
@@ -1342,9 +1409,12 @@ db_ensure() {
     db_migrate_test_gate
 
     # Stamp under the lock, so no process reads a stamp for a half-migrated
-    # schema. A stamp that cannot be computed is removed, never left stale.
+    # schema. A stamp that cannot be computed is removed, never left stale, and
+    # a schema missing an object the migrations create is not stamped at all,
+    # so the next process migrates again (wv-e90d62).
     local _stamp
-    if _stamp=$(_wv_db_schema_stamp) && [ -n "$_stamp" ] \
+    if [ -z "$(_wv_db_schema_missing)" ] \
+        && _stamp=$(_wv_db_schema_stamp) && [ -n "$_stamp" ] \
         && printf '%s\n' "$_stamp" > "$WV_DB.ensured.$$" 2>/dev/null; then
         mv -f "$WV_DB.ensured.$$" "$WV_DB.ensured" 2>/dev/null || rm -f "$WV_DB.ensured.$$" "$WV_DB.ensured"
     else
@@ -1435,13 +1505,18 @@ _wv_db_size_check() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 db_query() {
-    db_ensure
+    db_ensure || return 1
     sqlite3 -batch -cmd ".timeout 5000" "$WV_DB" "$1"
 }
 
+# sqlite3 -json prints nothing, not [], for zero rows. Callers then hand jq
+# empty input, and a --json command printed nothing at all (wv-fea2e9), so an
+# empty result is [] here, as db_query_json_v2 already does.
 db_query_json() {
-    db_ensure
-    sqlite3 -json -cmd ".timeout 5000" "$WV_DB" "$1"
+    db_ensure || return 1
+    local raw
+    raw=$(sqlite3 -json -cmd ".timeout 5000" "$WV_DB" "$1") || return $?
+    printf '%s\n' "${raw:-[]}"
 }
 
 # db_query_json_v2 — lean JSON shape for --json-v2 flag:
@@ -1452,7 +1527,7 @@ db_query_json() {
 #     and appear in every consumer record (weave_gh, the active-node hook, MCP)
 #   - null/empty fields omitted
 db_query_json_v2() {
-    db_ensure
+    db_ensure || return 1
     local raw
     raw=$(sqlite3 -json -cmd ".timeout 5000" "$WV_DB" "$1") || return $?
     [ -z "$raw" ] && echo "[]" && return

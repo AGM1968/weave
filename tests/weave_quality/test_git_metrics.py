@@ -343,6 +343,19 @@ class TestWorkingTreeBlobShas:
         assert "gone.py" not in result
         assert "old.py" not in result
 
+    def test_included_untracked_file_is_keyed_by_its_blob(self, tmp_path: Path) -> None:
+        # wv-fe9a6a: unhashed, an untracked file fell back to integer-second
+        # mtime. Its key must be the blob it would become, and only when asked.
+        repo = _scratch_repo(tmp_path)
+        (repo / "tracked.py").write_text("t = 1\n")
+        _commit_all(repo)
+        (repo / "loose.py").write_text("u = 1\n")
+        assert "loose.py" not in working_tree_blob_shas(repo)
+        key = working_tree_blob_shas(repo, include=["loose.py", "missing.py"])
+        assert "missing.py" not in key
+        _commit_all(repo)
+        assert key["loose.py"] == batch_blob_shas(repo)["loose.py"]
+
 
 # ---------------------------------------------------------------------------
 # file_churn / file_age_days — error branches

@@ -22,6 +22,7 @@ export WV_CALL_SOURCE=test
 # create the temp file it writes state.sql through. That is a real auto_sync
 # failure rather than a stubbed one.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -74,6 +75,66 @@ if grep -q "Closed" <<<"$base_out"; then
 else
     bad "wv done prints its closure when persistence works" "stdout was: [${base_out:0:120}]"
 fi
+
+# A successful sync cannot make a rejected INSERT into a created node.
+# This differs from the unwritable projection cases below (wv-ccd364).
+sqlite3 "$WV_HOT_ZONE/brain.db" "CREATE TRIGGER test_add_refused BEFORE INSERT ON nodes
+    WHEN NEW.alias='rejected-sql'
+    BEGIN SELECT RAISE(ABORT, 'simulated insert failure'); END;"
+sql_add_out=$("$WV" add "rejected SQL node" --standalone --alias=rejected-sql --json 2>"$TEST_DIR/sql-add.err")
+sql_add_rc=$?
+check "wv add fails when its INSERT fails" "1" "$sql_add_rc"
+check "a rejected INSERT creates no node" "0" \
+    "$(sqlite3 "$WV_HOT_ZONE/brain.db" "SELECT count(*) FROM nodes WHERE alias='rejected-sql';")"
+if [ -z "$sql_add_out" ] && ! grep -qE '✓ wv-[0-9a-f]+' "$TEST_DIR/sql-add.err"; then
+    ok "a rejected INSERT prints neither a creation line nor a JSON node"
+else
+    bad "a rejected INSERT prints neither a creation line nor a JSON node" "$sql_add_out $(cat "$TEST_DIR/sql-add.err")"
+fi
+sqlite3 "$WV_HOT_ZONE/brain.db" "DROP TRIGGER test_add_refused;"
+
+# Other node writers must honor the same SQL refusal, including batch wrappers.
+sqlite3 "$WV_HOT_ZONE/brain.db" "CREATE TRIGGER test_insert_refused BEFORE INSERT ON nodes
+    WHEN NEW.text IN ('refused memory', 'refused import')
+    BEGIN SELECT RAISE(ABORT, 'simulated insert failure'); END;"
+out=$("$WV" remember 'refused memory' 2>&1); rc=$?
+check "remember refuses a failed INSERT" "1" "$rc"
+check "remember creates no refused row" "0" "$(sqlite3 "$WV_HOT_ZONE/brain.db" "SELECT count(*) FROM nodes WHERE text='refused memory';")"
+if [[ "$out" != *Remembered* ]]; then ok "remember prints no false success"; else bad "remember prints no false success" "$out"; fi
+printf '%s\n' '{"id":"source","text":"refused import","status":"todo","metadata":{}}' > "$TEST_DIR/import.jsonl"
+out=$("$WV" import "$TEST_DIR/import.jsonl" 2>&1); rc=$?
+check "import refuses a failed INSERT" "1" "$rc"
+check "import creates no refused row" "0" "$(sqlite3 "$WV_HOT_ZONE/brain.db" "SELECT count(*) FROM nodes WHERE text='refused import';")"
+if [[ "$out" != *'✓'* ]]; then ok "import prints no false success"; else bad "import prints no false success" "$out"; fi
+sqlite3 "$WV_HOT_ZONE/brain.db" "DROP TRIGGER test_insert_refused;"
+
+batch_id=$("$WV" add 'batch refusal target' --standalone --metadata='{"hold":true}' 2>/dev/null | tail -1)
+sqlite3 "$WV_HOT_ZONE/brain.db" "CREATE TRIGGER test_hold_refused BEFORE UPDATE ON nodes
+    WHEN OLD.id='$batch_id' AND json_extract(NEW.metadata,'$.hold') IS NOT json_extract(OLD.metadata,'$.hold')
+    BEGIN SELECT RAISE(ABORT, 'simulated hold failure'); END;"
+for patch in '"remove-keys":["hold"]' '"metadata":{"hold":false}'; do
+    out=$(printf '[{"id":"%s",%s}]' "$batch_id" "$patch" | "$WV" bulk-update 2>&1); rc=$?
+    check "bulk-update propagates $patch refusal" "1" "$rc"
+    check "bulk-update retains hold after $patch refusal" "1" "$(sqlite3 "$WV_HOT_ZONE/brain.db" "SELECT json_extract(metadata,'$.hold') FROM nodes WHERE id='$batch_id';")"
+    if [[ "$out" == *'0 updated, 1 failed'* ]]; then ok "bulk-update counts $patch refusal"; else bad "bulk-update counts $patch refusal" "$out"; fi
+done
+sqlite3 "$WV_HOT_ZONE/brain.db" "DROP TRIGGER test_hold_refused;"
+out=$(printf '[{"id":"%s","remove-keys":["hold"]}]' "$batch_id" | "$WV" bulk-update 2>&1); rc=$?
+check "bulk-update succeeds after refusal removed" "0" "$rc"
+check "bulk-update actually removes hold on retry" "0" "$(sqlite3 "$WV_HOT_ZONE/brain.db" "SELECT json_type(metadata,'$.hold') IS NOT NULL FROM nodes WHERE id='$batch_id';")"
+out=$("$WV" batch-done wv-deadbe --no-gh 2>&1); rc=$?
+check "batch-done propagates failed closure" "1" "$rc"
+
+sqlite3 "$WV_HOT_ZONE/brain.db" "INSERT INTO edges(source,target,type) VALUES('$batch_id','wv-deadbe','relates_to');
+    CREATE TRIGGER test_ghost_refused BEFORE DELETE ON edges WHEN OLD.target='wv-deadbe'
+    BEGIN SELECT RAISE(ABORT, 'simulated ghost failure'); END;"
+out=$("$WV" clean-ghosts 2>&1); rc=$?
+check "clean-ghosts refuses failed DELETE" "1" "$rc"
+check "clean-ghosts retains refused edge" "1" "$(sqlite3 "$WV_HOT_ZONE/brain.db" "SELECT count(*) FROM edges WHERE target='wv-deadbe';")"
+if [[ "$out" != *'Deleted '* ]]; then ok "clean-ghosts prints no false success"; else bad "clean-ghosts prints no false success" "$out"; fi
+sqlite3 "$WV_HOT_ZONE/brain.db" "DROP TRIGGER test_ghost_refused;"
+"$WV" clean-ghosts >/dev/null 2>&1
+check "clean-ghosts removes edge on retry" "0" "$(sqlite3 "$WV_HOT_ZONE/brain.db" "SELECT count(*) FROM edges WHERE target='wv-deadbe';")"
 
 # ── wv add refuses ─────────────────────────────────────────────────────────────
 

@@ -44,6 +44,7 @@ export WV_CALL_SOURCE=test
 #   1 - Unexpected failure
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -125,7 +126,7 @@ test_active_node_explains_dirt_passes() {
     out=$("$WV" doctor 2>&1 || true)
     assert_contains "$out" "closed-node-dirt" "doctor emits a closed-node-dirt check"
     assert_contains "$out" "explained by currently active node" "doctor treats active node's own dirt as ordinary, not a warning"
-    "$WV" done "$id" --skip-verification >/dev/null 2>&1 || true
+    "$WV" "done" "$id" --skip-verification >/dev/null 2>&1 || true
 }
 
 test_done_node_match_warns_with_attribution() {
@@ -136,7 +137,7 @@ test_done_node_match_warns_with_attribution() {
     echo "seed" > seed.txt
     git add seed.txt
     git commit -q -m "feat: seed" -m "Weave-ID: $id"
-    "$WV" done "$id" --verification-method=test --verification-evidence=pass --learning="decision: test" >/dev/null 2>&1 || true
+    "$WV" "done" "$id" --verification-method=test --verification-evidence=pass --learning="decision: test" >/dev/null 2>&1 || true
     echo "leftover from that closed session" > leftover.txt
     local out
     out=$("$WV" doctor 2>&1 || true)
@@ -166,7 +167,7 @@ test_mixed_dirt_does_not_false_pass() {
     echo "seed" > seed.txt
     git add seed.txt
     git commit -q -m "feat: seed" -m "Weave-ID: $done_id"
-    "$WV" done "$done_id" --verification-method=test --verification-evidence=pass --learning="decision: test" >/dev/null 2>&1 || true
+    "$WV" "done" "$done_id" --verification-method=test --verification-evidence=pass --learning="decision: test" >/dev/null 2>&1 || true
     echo "in progress" > active.txt
     echo "leftover from closed session" > leftover.txt
     local out
@@ -174,7 +175,7 @@ test_mixed_dirt_does_not_false_pass() {
     assert_contains "$out" "closed-node-dirt" "doctor emits a closed-node-dirt check"
     assert_not_contains "$out" "explained by currently active node(s) own work" "doctor does not false-pass the mixed set on the active match alone"
     assert_contains "$out" "already-closed node(s)" "doctor still surfaces the done-owned remainder"
-    "$WV" done "$active_id" --skip-verification >/dev/null 2>&1 || true
+    "$WV" "done" "$active_id" --skip-verification >/dev/null 2>&1 || true
 }
 
 test_substring_owner_does_not_explain_longer_path() {
@@ -187,7 +188,7 @@ test_substring_owner_does_not_explain_longer_path() {
     out=$("$WV" doctor 2>&1 || true)
     assert_contains "$out" "closed-node-dirt" "doctor emits a closed-node-dirt check"
     assert_not_contains "$out" "explained by currently active node" "doctor does not let \"foo\" ownership substring-match \"foo.txt\""
-    "$WV" done "$id" --skip-verification >/dev/null 2>&1 || true
+    "$WV" "done" "$id" --skip-verification >/dev/null 2>&1 || true
 }
 
 test_json_mode_carries_the_same_advisory() {
@@ -207,7 +208,7 @@ test_staged_rename_attributes_the_old_path() {
     echo "content" > renamed-from.txt
     git add renamed-from.txt
     git commit -q -m "feat: renamed-from" -m "Weave-ID: $id"
-    "$WV" done "$id" --verification-method=test --verification-evidence=pass --learning="decision: test" >/dev/null 2>&1 || true
+    "$WV" "done" "$id" --verification-method=test --verification-evidence=pass --learning="decision: test" >/dev/null 2>&1 || true
     # Staged rename: with rename detection on, 'git diff --cached --name-only'
     # lists only renamed-to.txt and the done node's path drops out of view.
     git mv renamed-from.txt renamed-to.txt

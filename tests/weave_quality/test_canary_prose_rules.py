@@ -1,4 +1,4 @@
-"""Upstream known-answer canary from earth-engine-analysis audit wv-7a8d45."""
+"""Upstream known-answer canary from consumer audit wv-7a8d45."""
 
 # pylint: disable=missing-class-docstring,missing-function-docstring
 

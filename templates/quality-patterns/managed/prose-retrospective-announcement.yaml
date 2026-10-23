@@ -6,7 +6,7 @@ severity: info
 policy: always-on-shared
 maturity: promotable
 provenance: >-
-  wv-1accdd @nowcast (2026-07-18), ported and retained by earth-engine-analysis. A retrospective achievement
+  wv-1accdd in a consumer graph (2026-07-18), ported and retained by a second consumer. A retrospective achievement
   announcement was removed from stakeholder prose in favor of the current technical fact. Corpus-supported 2026-09-02
   (wv-f3a558): zero occurrences in 986,291 words of peer-reviewed papers, against 0.72 per 10,000 in this repository.
   Absent from published writing and present in ours, which is the strongest evidence a prohibition can carry.

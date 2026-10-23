@@ -16,11 +16,12 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 FIXTURES = Path("tests/fixtures/coaching/v1")
 
 
-def derived_promotion_id(candidate: dict, scope: dict) -> str:
+def derived_promotion_id(candidate: dict[str, Any], scope: dict[str, Any]) -> str:
     guide = candidate["guide"]
     payload = json.dumps(
         [
@@ -36,7 +37,58 @@ def derived_promotion_id(candidate: dict, scope: dict) -> str:
     return "cp-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def check_case(name: str, catalog: dict) -> list[str]:
+def _check_candidates(
+    name: str, plan_doc: dict[str, Any], catalog: dict[str, Any]
+) -> tuple[list[str], set[str]]:
+    problems: list[str] = []
+    plan_keys: set[str] = set()
+    for candidate in plan_doc["candidates"]:
+        expected = derived_promotion_id(candidate, plan_doc["scope"])
+        if candidate["promotion_id"] != expected:
+            problems.append(
+                f"{name}: promotion_id does not match its specified derivation "
+                f"(expected {expected})"
+            )
+        if candidate["violation_type"] not in catalog["types"]:
+            problems.append(f"{name}: violation_type is not catalogued")
+        else:
+            catalogued_guide = catalog["types"][candidate["violation_type"]]["guide"]
+            if candidate["guide"]["id"] != catalogued_guide:
+                problems.append(
+                    f"{name}: guide id {candidate['guide']['id']!r} is not the catalogued "
+                    f"guide for {candidate['violation_type']}"
+                )
+
+        detector_rules = {
+            detector["rule_id"]
+            for occurrence in candidate["occurrences"]
+            for detector in occurrence["detectors"]
+        }
+        if set(candidate["rule_definition_bindings"]) != detector_rules:
+            problems.append(f"{name}: candidate bindings do not match contributing rules")
+
+        for occurrence in candidate["occurrences"]:
+            detectors = occurrence["detectors"]
+            plan_keys.update(d["finding_key"] for d in detectors)
+            rules = [d["rule_id"] for d in detectors]
+            merged = occurrence.get("merged", False)
+
+            if merged and len(detectors) < 2:
+                problems.append(f"{name}: an occurrence claims merged with one detector record")
+            if merged and len(set(rules)) != len(rules):
+                problems.append(
+                    f"{name}: a merged occurrence repeats a rule; merging is across rules only"
+                )
+            if not merged and len(detectors) > 1:
+                problems.append(
+                    f"{name}: an unmerged occurrence carries several detector records"
+                )
+            if occurrence.get("merge_declined") and merged:
+                problems.append(f"{name}: an occurrence is both merged and merge_declined")
+    return problems, plan_keys
+
+
+def check_case(name: str, catalog: dict[str, Any]) -> list[str]:
     problems: list[str] = []
     input_doc = json.loads((FIXTURES / "cases" / f"{name}.input.json").read_text(encoding="utf-8"))
     plan_doc = json.loads((FIXTURES / "cases" / f"{name}.plan.json").read_text(encoding="utf-8"))
@@ -81,51 +133,8 @@ def check_case(name: str, catalog: dict) -> list[str]:
     rejected_input_keys = {
         r["detector"]["finding_key"] for r in input_doc["provider_rejections"]
     }
-    plan_keys: set[str] = set()
-
-    for candidate in plan_doc["candidates"]:
-        expected = derived_promotion_id(candidate, plan_doc["scope"])
-        if candidate["promotion_id"] != expected:
-            problems.append(
-                f"{name}: promotion_id does not match its specified derivation "
-                f"(expected {expected})"
-            )
-        if candidate["violation_type"] not in catalog["types"]:
-            problems.append(f"{name}: violation_type is not catalogued")
-        else:
-            catalogued_guide = catalog["types"][candidate["violation_type"]]["guide"]
-            if candidate["guide"]["id"] != catalogued_guide:
-                problems.append(
-                    f"{name}: guide id {candidate['guide']['id']!r} is not the catalogued "
-                    f"guide for {candidate['violation_type']}"
-                )
-
-        detector_rules = {
-            detector["rule_id"]
-            for occurrence in candidate["occurrences"]
-            for detector in occurrence["detectors"]
-        }
-        if set(candidate["rule_definition_bindings"]) != detector_rules:
-            problems.append(f"{name}: candidate bindings do not match contributing rules")
-
-        for occurrence in candidate["occurrences"]:
-            detectors = occurrence["detectors"]
-            plan_keys.update(d["finding_key"] for d in detectors)
-            rules = [d["rule_id"] for d in detectors]
-            merged = occurrence.get("merged", False)
-
-            if merged and len(detectors) < 2:
-                problems.append(f"{name}: an occurrence claims merged with one detector record")
-            if merged and len(set(rules)) != len(rules):
-                problems.append(
-                    f"{name}: a merged occurrence repeats a rule; merging is across rules only"
-                )
-            if not merged and len(detectors) > 1:
-                problems.append(
-                    f"{name}: an unmerged occurrence carries several detector records"
-                )
-            if occurrence.get("merge_declined") and merged:
-                problems.append(f"{name}: an occurrence is both merged and merge_declined")
+    candidate_problems, plan_keys = _check_candidates(name, plan_doc, catalog)
+    problems.extend(candidate_problems)
 
     if input_keys != plan_keys:
         lost = sorted(input_keys - plan_keys)

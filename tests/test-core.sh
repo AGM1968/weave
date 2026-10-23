@@ -10,6 +10,7 @@ export WV_CALL_SOURCE=test
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Colors
 RED='\033[0;31m'
@@ -56,6 +57,9 @@ setup_test_env() {
     git init -q
 }
 
+# Assertions record a failure and return 0: under set -e a nonzero return
+# ended the suite at its first failed assertion, so every later result and
+# the summary went unreported (wv-75e31a). TESTS_FAILED decides the exit.
 assert_equals() {
     local expected="$1"
     local actual="$2"
@@ -72,7 +76,7 @@ assert_equals() {
         echo "  Expected: $expected"
         echo "  Actual:   $actual"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -92,7 +96,7 @@ assert_contains() {
         echo "  Expected to find: $needle"
         echo "  In: $haystack"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -112,7 +116,7 @@ assert_not_contains() {
         echo "  Expected NOT to find: $needle"
         echo "  In: $haystack"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -130,7 +134,7 @@ assert_success() {
         echo -e "${RED}✗${NC} $message"
         echo "  Command failed: $*"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -148,7 +152,7 @@ assert_fails() {
         echo -e "${RED}✗${NC} $message"
         echo "  Expected command to fail: $*"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -309,47 +313,71 @@ test_codex_runtime_uses_tmp_hot_zone() {
     echo "Test: Codex runtime uses persistent /tmp hot zone"
     echo "================================================"
 
-    local repo hot expected_prefix
+    local repo hot uid zone_root
     repo=$(mktemp -d)
     cd "$repo"
     git init -q
 
-    expected_prefix="/tmp/weave-codex-$(id -u)/"
-    hot=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CODEX_THREAD_ID -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT CODEX_CI=1 \
+    # The /tmp zone under either of its names (wv-95bddf): which one a process
+    # is given depends on what this host's /tmp holds, not on the marker.
+    uid=$(id -u)
+    zone_root=""
+    if [ "${WV_TEST_MODE:-}" = "1" ] && [[ "${WV_TEST_HOT_ZONE_ROOT:-}" == /* ]]; then
+        zone_root="${WV_TEST_HOT_ZONE_ROOT%/}"
+    fi
+    _in_tmp_zone() {
+        case "$1" in
+            "$zone_root/tmp/weave-hotzone-$uid/"*|"$zone_root/tmp/weave-codex-$uid/"*) echo "in the /tmp zone" ;;
+            *) echo "$1" ;;
+        esac
+    }
+    hot=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CODEX_THREAD_ID -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE CODEX_CI=1 \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_repo_hot_zone \"\$(resolve_hot_zone)\" '$repo'" 2>/dev/null)
 
-    assert_contains "$hot" "$expected_prefix" \
-        "Codex hot zone resolves under /tmp/weave-codex-\$uid"
+    assert_equals "in the /tmp zone" "$(_in_tmp_zone "$hot")" \
+        "Codex hot zone resolves under the /tmp zone"
 
     local hot_thread
-    hot_thread=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT CODEX_THREAD_ID=thread-1 \
+    hot_thread=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE CODEX_THREAD_ID=thread-1 \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_repo_hot_zone \"\$(resolve_hot_zone)\" '$repo'" 2>/dev/null)
-    assert_contains "$hot_thread" "$expected_prefix" \
-        "Codex hot zone resolves under /tmp/weave-codex-\$uid when CODEX_THREAD_ID is set"
+    assert_equals "in the /tmp zone" "$(_in_tmp_zone "$hot_thread")" \
+        "Codex hot zone resolves under the /tmp zone when CODEX_THREAD_ID is set"
 
     local hot_agent
-    hot_agent=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CODEX_CI -u CODEX_THREAD_ID -u CLAUDE_CODE_SSE_PORT COPILOT_AGENT=1 \
+    hot_agent=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CODEX_CI -u CODEX_THREAD_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE COPILOT_AGENT=1 \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_repo_hot_zone \"\$(resolve_hot_zone)\" '$repo'" 2>/dev/null)
-    assert_contains "$hot_agent" "$expected_prefix" \
-        "Agent sandbox hot zone resolves under /tmp/weave-codex-\$uid when COPILOT_AGENT=1"
+    assert_equals "in the /tmp zone" "$(_in_tmp_zone "$hot_agent")" \
+        "Agent sandbox hot zone resolves under the /tmp zone when COPILOT_AGENT=1"
 
     local label
-    label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_THREAD_ID -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT CODEX_CI=1 \
+    label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_THREAD_ID -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE CODEX_CI=1 \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_runtime_label" 2>/dev/null)
     assert_equals "codex" "$label" \
         "runtime label reports codex when CODEX_CI=1"
 
     local thread_label
-    thread_label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT CODEX_THREAD_ID=thread-1 \
+    thread_label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE CODEX_THREAD_ID=thread-1 \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_runtime_label" 2>/dev/null)
     assert_equals "codex" "$thread_label" \
         "runtime label reports codex when CODEX_THREAD_ID is set"
 
     local agent_label
-    agent_label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_CI -u CODEX_THREAD_ID -u CLAUDE_CODE_SSE_PORT COPILOT_AGENT=1 \
+    agent_label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_CI -u CODEX_THREAD_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE COPILOT_AGENT=1 \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_runtime_label" 2>/dev/null)
     assert_equals "codex" "$agent_label" \
         "runtime label reports codex for agent sandbox sessions"
+
+    # wv-21698b: CLAUDECODE=1 is set in every process Claude Code starts; the
+    # IDE-only CLAUDE_CODE_SSE_PORT left terminal sessions labelled native.
+    local claude_label native_label
+    claude_label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_CI -u CODEX_THREAD_ID -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT CLAUDECODE=1 _WV_CONTAINER=no \
+        bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_runtime_label" 2>/dev/null)
+    assert_equals "codex" "$claude_label" \
+        "runtime label reports the agent class for a terminal Claude Code session"
+    native_label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_CI -u CODEX_THREAD_ID -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE _WV_CONTAINER=no \
+        bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_runtime_label" 2>/dev/null)
+    assert_equals "native" "$native_label" \
+        "runtime label reports native with every marker cleared"
 
     rm -rf "$repo" "$hot" 2>/dev/null || true
 }
@@ -480,7 +508,7 @@ test_done() {
 
     # Mark done
     local output
-    output=$("$WV" done "$id" 2>&1)
+    output=$("$WV" "done" "$id" 2>&1)
     assert_contains "$output" "Closed" "done outputs completion message"
 
     # Verify status changed
@@ -490,7 +518,7 @@ test_done() {
 
     # Done with learning
     id=$("$WV" add "Task with learning" --force 2>&1 | node_id_from_output)
-    output=$("$WV" done "$id" --learning="pattern: always test your code" 2>&1)
+    output=$("$WV" "done" "$id" --learning="pattern: always test your code" 2>&1)
     assert_contains "$output" "Closed" "done with learning succeeds"
 
     # Verify learning was captured in metadata
@@ -499,10 +527,10 @@ test_done() {
     assert_contains "$show_meta" "always test your code" "done --learning stores in metadata"
 
     # Regression (wv-a0a219): documented explicit learning flags were accepted
-    # but discarded. Cover both nowcast probes that exposed the silent loss.
+    # but discarded. Cover both consumer probes that exposed the silent loss.
     local explicit_id explicit_output explicit_meta flags_only_id flags_only_output flags_only_meta
     explicit_id=$("$WV" add "Task with explicit learning fields" --force 2>&1 | node_id_from_output)
-    explicit_output=$("$WV" done "$explicit_id" --learning="hygiene: explicit fields survive" \
+    explicit_output=$("$WV" "done" "$explicit_id" --learning="hygiene: explicit fields survive" \
         --decision="choose the direct parser" --pattern="persist every documented flag" \
         --pitfall="successful closes can hide discarded values" 2>&1)
     explicit_meta=$("$WV" show "$explicit_id" --json 2>&1)
@@ -514,7 +542,7 @@ test_done() {
     assert_contains "$explicit_meta" "hygiene: explicit fields survive" "done keeps plain --learning with explicit fields"
 
     flags_only_id=$("$WV" add "Task with explicit fields only" --force 2>&1 | node_id_from_output)
-    flags_only_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$flags_only_id" \
+    flags_only_output=$(WV_REQUIRE_LEARNING=1 "$WV" "done" "$flags_only_id" \
         --decision="flags count as learning" --pattern="flags-only closes retain metadata" \
         --pitfall="never close successfully with empty fields" 2>&1)
     flags_only_meta=$("$WV" show "$flags_only_id" --json 2>&1)
@@ -532,7 +560,7 @@ test_done() {
     printf '%s\n' '12 passed in agent-safe close flow' > "$evidence_file"
 
     file_done_id=$("$WV" add "Task with file inputs" --force 2>&1 | node_id_from_output)
-    file_done_output=$("$WV" done "$file_done_id" --learning-file="$learning_file" --verification-method="make check" --verification-evidence-file="$evidence_file" 2>&1)
+    file_done_output=$("$WV" "done" "$file_done_id" --learning-file="$learning_file" --verification-method="make check" --verification-evidence-file="$evidence_file" 2>&1)
     assert_contains "$file_done_output" "Closed" "done accepts file-based learning/evidence inputs"
 
     file_done_meta=$("$WV" show "$file_done_id" --json 2>&1)
@@ -544,30 +572,30 @@ test_done() {
     # node still closed with no evidence stored.
     local apos_id apos_output apos_meta
     apos_id=$("$WV" add "Task with apostrophe evidence" --force 2>&1 | node_id_from_output)
-    apos_output=$("$WV" done "$apos_id" --learning="pattern: escape user text in SQL" --verification-method="it's a manual check" --verification-evidence="user's apostrophe survives the round-trip" 2>&1)
+    apos_output=$("$WV" "done" "$apos_id" --learning="pattern: escape user text in SQL" --verification-method="it's a manual check" --verification-evidence="user's apostrophe survives the round-trip" 2>&1)
     assert_contains "$apos_output" "Closed" "done with apostrophes in verification text succeeds"
     apos_meta=$("$WV" show "$apos_id" --json 2>&1)
     assert_contains "$apos_meta" "apostrophe survives the round-trip" "apostrophe verification evidence present after close"
     assert_contains "$apos_meta" "a manual check" "apostrophe verification method present after close"
 
     # Done on non-existent node fails
-    assert_fails "done on non-existent node fails" "$WV" done "wv-0000"
+    assert_fails "done on non-existent node fails" "$WV" "done" "wv-0000"
 
     # Learning gate: wv done requires --learning or --skip-verification
     id=$("$WV" add "Task needing learning" --force 2>&1 | node_id_from_output)
     assert_fails "done rejects bare close when learning required" \
-        env WV_REQUIRE_LEARNING=1 "$WV" done "$id"
+        env WV_REQUIRE_LEARNING=1 "$WV" "done" "$id"
 
     # Same node succeeds with --skip-verification
     local sv_exit=0
-    WV_REQUIRE_LEARNING=1 "$WV" done "$id" --skip-verification >/dev/null 2>&1 || sv_exit=$?
+    WV_REQUIRE_LEARNING=1 "$WV" "done" "$id" --skip-verification >/dev/null 2>&1 || sv_exit=$?
     assert_equals "0" "$sv_exit" "done accepts --skip-verification"
 
     # Finding nodes: only violation_type (enum) required; rest optional
     local finding_id finding_output
     finding_id=$("$WV" add "Finding needing schema" --metadata='{"type":"finding"}' --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | node_id_from_output)
     assert_fails "done rejects finding with no violation_type" \
-        env WV_REQUIRE_LEARNING=1 "$WV" done "$finding_id" --skip-verification
+        env WV_REQUIRE_LEARNING=1 "$WV" "done" "$finding_id" --skip-verification
 
     # Write-time enum guard (wv-dc9f3e): off-enum violation_type rejected at UPDATE,
     # not only at close — closes the gap that let invalid findings persist (wv-43f077).
@@ -576,17 +604,17 @@ test_done() {
 
     # Invalid value never got written, so the node still lacks a violation_type and done fails.
     assert_fails "done rejects finding with no valid violation_type" \
-        env WV_REQUIRE_LEARNING=1 "$WV" done "$finding_id" --skip-verification
+        env WV_REQUIRE_LEARNING=1 "$WV" "done" "$finding_id" --skip-verification
 
     # Minimal shape (violation_type only) accepted
     "$WV" update "$finding_id" --metadata='{"type":"finding","finding":{"violation_type":"repo:hygiene"}}' >/dev/null 2>&1
-    finding_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$finding_id" --skip-verification 2>&1)
+    finding_output=$(WV_REQUIRE_LEARNING=1 "$WV" "done" "$finding_id" --skip-verification 2>&1)
     assert_contains "$finding_output" "Closed" "done accepts finding with only violation_type (minimal shape)"
 
     # Full shape still accepted
     local finding_full_id finding_full_output
     finding_full_id=$("$WV" add "Finding full schema" --metadata='{"type":"finding","finding":{"violation_type":"test:gap","root_cause":"missing coverage","proposed_fix":"add test","confidence":"high","fixable":true}}' --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | node_id_from_output)
-    finding_full_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$finding_full_id" --skip-verification 2>&1)
+    finding_full_output=$(WV_REQUIRE_LEARNING=1 "$WV" "done" "$finding_full_id" --skip-verification 2>&1)
     assert_contains "$finding_full_output" "Closed" "done accepts finding with full 5-field schema (backward compat)"
 
     # Optional fields present but invalid are still rejected. confidence is an
@@ -595,17 +623,17 @@ test_done() {
     local finding_bad_id
     finding_bad_id=$("$WV" add "Finding bad optional" --metadata='{"type":"finding","finding":{"violation_type":"repo:regression","confidence":92,"fixable":"yes"}}' --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | node_id_from_output)
     assert_fails "done rejects finding with invalid optional field types" \
-        env WV_REQUIRE_LEARNING=1 "$WV" done "$finding_bad_id" --skip-verification
+        env WV_REQUIRE_LEARNING=1 "$WV" "done" "$finding_bad_id" --skip-verification
 
     # Non-interactive overlap: close proceeds and skips overlap advisory writes entirely
     local seed_id overlap_id overlap_learning overlap_exit overlap_output overlap_meta
     overlap_learning="decision: keep overlap prompts resumable | pattern: store pending close state | pitfall: tty prompts hang unattended flows"
     seed_id=$("$WV" add "Seed overlap learning" --force 2>&1 | node_id_from_output)
-    WV_REQUIRE_LEARNING=1 "$WV" done "$seed_id" --learning="$overlap_learning" >/dev/null 2>&1
+    WV_REQUIRE_LEARNING=1 "$WV" "done" "$seed_id" --learning="$overlap_learning" >/dev/null 2>&1
 
     overlap_id=$("$WV" add "Overlap advisory" --force 2>&1 | node_id_from_output)
     overlap_exit=0
-    overlap_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$overlap_id" --learning="$overlap_learning" 2>&1) || overlap_exit=$?
+    overlap_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" "done" "$overlap_id" --learning="$overlap_learning" 2>&1) || overlap_exit=$?
     assert_equals "0" "$overlap_exit" "done succeeds non-interactively when overlap detected"
     assert_not_contains "$overlap_output" "Overlap noted in metadata" "done skips overlap advisory output in non-interactive mode"
 
@@ -616,7 +644,7 @@ test_done() {
     local finding_overlap_id finding_overlap_exit finding_overlap_output finding_overlap_meta
     finding_overlap_id=$("$WV" add "Finding overlap advisory" --metadata='{"type":"finding","verification":{"method":"test","result":"pass"},"finding":{"violation_type":"design:flaw","root_cause":"runtime wv_done wrapper validates finding metadata types and presence before allowing close","proposed_fix":"agents must set confidence as one of high|medium|low (string) and fixable as boolean before closing a finding node","confidence":"high","fixable":true}}' --force 2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | node_id_from_output)
     finding_overlap_exit=0
-    finding_overlap_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$finding_overlap_id" --learning="$overlap_learning" 2>&1) || finding_overlap_exit=$?
+    finding_overlap_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" "done" "$finding_overlap_id" --learning="$overlap_learning" 2>&1) || finding_overlap_exit=$?
     assert_equals "0" "$finding_overlap_exit" "done succeeds for finding nodes when overlap is advisory"
     assert_contains "$finding_overlap_output" "Closed" "finding overlap advisory still closes the node"
     finding_overlap_meta=$("$WV" show "$finding_overlap_id" --json 2>&1)
@@ -630,7 +658,7 @@ test_done() {
     src_adv_finding=$("$WV" add "Finding refs source" --standalone --force \
         --metadata="{\"type\":\"finding\",\"source_node\":\"$src_adv_id\",\"finding\":{\"violation_type\":\"repo:hygiene\"}}" \
         2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | node_id_from_output)
-    src_adv_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$src_adv_id" --skip-verification 2>&1)
+    src_adv_output=$(WV_REQUIRE_LEARNING=1 "$WV" "done" "$src_adv_id" --skip-verification 2>&1)
     assert_contains "$src_adv_output" "Open findings referencing this node" "done: advisory fires when open findings reference source_node"
     assert_contains "$src_adv_output" "$src_adv_finding" "done: advisory names the finding ID"
     assert_contains "$src_adv_output" "Closed" "done: still closes despite advisory"
@@ -643,8 +671,8 @@ test_done() {
         --metadata="{\"type\":\"finding\",\"source_node\":\"$src_clean_id\",\"finding\":{\"violation_type\":\"repo:hygiene\"}}" \
         2>&1 | sed -n 's/.*\(wv-[0-9a-f]\{6\}\).*/\1/p' | node_id_from_output)
     "$WV" work "$src_clean_finding" >/dev/null 2>&1
-    WV_REQUIRE_LEARNING=1 "$WV" done "$src_clean_finding" --skip-verification >/dev/null 2>&1
-    src_clean_output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$src_clean_id" --skip-verification 2>&1)
+    WV_REQUIRE_LEARNING=1 "$WV" "done" "$src_clean_finding" --skip-verification >/dev/null 2>&1
+    src_clean_output=$(WV_REQUIRE_LEARNING=1 "$WV" "done" "$src_clean_id" --skip-verification 2>&1)
     assert_not_contains "$src_clean_output" "Open findings" "done: no advisory when all referencing findings are closed"
 
     local ship_id ship_exit ship_output ship_meta ship_remote ship_status
@@ -748,7 +776,7 @@ test_done() {
         '{"needs_human_verification": true, "pending_close": {"reason": "learning_overlap", "overlap_with": "wv-fake", "learning": "test", "created_at": "2026-01-01T00:00:00Z", "resume_command": ("wv done " + $node + " --acknowledge-overlap")}}')
     "$WV" update "$legacy_id" --metadata="$legacy_meta" >/dev/null 2>&1
     legacy_exit=0
-    legacy_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$legacy_id" --acknowledge-overlap 2>&1) || legacy_exit=$?
+    legacy_output=$(WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" "done" "$legacy_id" --acknowledge-overlap 2>&1) || legacy_exit=$?
     assert_equals "0" "$legacy_exit" "done clears legacy pending_close with --acknowledge-overlap"
     assert_contains "$legacy_output" "Closed" "acknowledge-overlap closes legacy stuck node"
 }
@@ -772,7 +800,7 @@ test_done_stores_commit_hashes() {
     git add commit-linked.txt
     git commit -m "feat: commit-linked close" -m "Weave-ID: $id" -q
 
-    output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$id" --learning="decision: commit before done | pattern: use Weave-ID trailers for commit attribution | pitfall: unattributed commits never reach node metadata" 2>&1)
+    output=$(WV_REQUIRE_LEARNING=1 "$WV" "done" "$id" --learning="decision: commit before done | pattern: use Weave-ID trailers for commit attribution | pitfall: unattributed commits never reach node metadata" 2>&1)
     assert_contains "$output" "Closed" "done succeeds when the work commit is attributed"
 
     head_sha=$(git rev-parse HEAD)
@@ -806,7 +834,7 @@ test_done_prefers_implementation_commit_over_checkpoint() {
     git commit --allow-empty -m "chore(weave): auto-checkpoint 15:32 [skip ci]" -m "Weave-ID: $id" -q
     checkpoint_sha=$(git rev-parse HEAD)
 
-    output=$(WV_REQUIRE_LEARNING=1 "$WV" done "$id" --learning="decision: keep work commits primary | pattern: relegate auto-checkpoints behind implementation commits | pitfall: raw git log order can promote checkpoint noise" 2>&1)
+    output=$(WV_REQUIRE_LEARNING=1 "$WV" "done" "$id" --learning="decision: keep work commits primary | pattern: relegate auto-checkpoints behind implementation commits | pitfall: raw git log order can promote checkpoint noise" 2>&1)
     assert_contains "$output" "Closed" "done succeeds when checkpoint and implementation commits are both attributed"
 
     node_json=$("$WV" show "$id" --json 2>&1)
@@ -1103,7 +1131,7 @@ test_ready() {
     assert_equals "2" "$output" "ready --count returns correct count"
 
     # Complete a blocker and verify blocked node becomes ready
-    "$WV" done "$id1" >/dev/null 2>&1
+    "$WV" "done" "$id1" >/dev/null 2>&1
     output=$("$WV" ready 2>&1)
     assert_contains "$output" "$id3" "ready shows newly unblocked node"
 }
@@ -1124,7 +1152,7 @@ test_status() {
     "$WV" add "Task 2" --status=active --criteria="status shows active work" --risks=low --force >/dev/null 2>&1
     local id3
     id3=$("$WV" add "Task 3" --force 2>&1 | node_id_from_output)
-    "$WV" done "$id3" >/dev/null 2>&1
+    "$WV" "done" "$id3" >/dev/null 2>&1
 
     # Status shows summary
     local output
@@ -1245,7 +1273,15 @@ CODEXFAKE
     assert_contains "$codex_hooks_detail" "PostToolUse" \
         "doctor --agent names the missing Codex hook events"
 
-    printf '%s\n' '{"hooks":{"SessionStart":[{}],"PreToolUse":[{}],"PostToolUse":[{}],"Stop":[{}]}}' > .codex/hooks.json
+    # wv-25903d: a Stop that dispatches with --json blocks with exit 1, which
+    # Codex reads as a failed hook.
+    printf '%s\n' '{"hooks":{"SessionStart":[{}],"PreToolUse":[{}],"PostToolUse":[{}],"PreCompact":[{}],"Stop":[{"hooks":[{"type":"command","command":"wv hook dispatch --event=Stop --json"}]}]}}' > .codex/hooks.json
+    doctor_json=$("$WV" doctor --agent --json 2>&1)
+    codex_hooks_detail=$(echo "$doctor_json" | jq -r '.checks[] | select(.check=="codex hooks") | .detail // empty' 2>/dev/null || echo "")
+    assert_contains "$codex_hooks_detail" "Stop dispatch without --format=host" \
+        "doctor --agent flags a Codex Stop hook that cannot block"
+
+    printf '%s\n' '{"hooks":{"SessionStart":[{}],"PreToolUse":[{}],"PostToolUse":[{}],"PreCompact":[{}],"Stop":[{}]}}' > .codex/hooks.json
     doctor_json=$("$WV" doctor --agent --json 2>&1)
     codex_hooks_detail=$(echo "$doctor_json" | jq -r '.checks[] | select(.check=="codex hooks") | .detail // empty' 2>/dev/null || echo "")
     assert_contains "$codex_hooks_detail" "pending trust" \
@@ -1311,7 +1347,9 @@ test_ready_relevance_boost() {
     local _repo_root _repo_hash ring_dir ring_file
     _repo_root=$(git rev-parse --show-toplevel)
     _repo_hash=$(echo "$_repo_root" | md5sum | cut -c1-8)
-    ring_dir="/dev/shm/weave/${_repo_hash}"
+    # The reader uses the resolved hot zone, as the writer does (wv-b831e3);
+    # a fixed /dev/shm path also created a live base outside the test.
+    ring_dir="$WV_HOT_ZONE"
     ring_file="$ring_dir/recent-edits.txt"
     mkdir -p "$ring_dir"
     rm -f "$ring_file"
@@ -1362,14 +1400,14 @@ test_done_contradiction() {
     # Shared search terms: "decision Poetry Python" (both nodes); polarities differ.
     local seed_id
     seed_id=$("$WV" add "Seed Poetry decision" --force 2>&1 | node_id_from_output)
-    WV_REQUIRE_LEARNING=1 "$WV" done "$seed_id" \
+    WV_REQUIRE_LEARNING=1 "$WV" "done" "$seed_id" \
         --learning="decision Poetry Python projects always prefer use it" \
         >/dev/null 2>&1
 
     # Same-polarity follow-up (positive vs positive) should NOT trigger contradiction.
     local same_id same_meta
     same_id=$("$WV" add "Same direction Poetry note" --force 2>&1 | node_id_from_output)
-    WV_REQUIRE_LEARNING=1 "$WV" done "$same_id" \
+    WV_REQUIRE_LEARNING=1 "$WV" "done" "$same_id" \
         --learning="decision Poetry Python projects always keep using it should" \
         >/dev/null 2>&1
     same_meta=$("$WV" show "$same_id" --json 2>&1)
@@ -1381,7 +1419,7 @@ test_done_contradiction() {
     # Opposite-polarity (negative: avoid/never/do not) SHOULD trigger contradiction.
     local opp_id opp_out opp_meta
     opp_id=$("$WV" add "Opposite Poetry pitfall" --force 2>&1 | node_id_from_output)
-    opp_out=$(WV_REQUIRE_LEARNING=1 "$WV" done "$opp_id" \
+    opp_out=$(WV_REQUIRE_LEARNING=1 "$WV" "done" "$opp_id" \
         --learning="decision Poetry Python projects avoid never adopt do not" 2>&1)
     assert_contains "$opp_out" "Closed" "opposite-polarity learning still closes node (advisory not blocking)"
     opp_meta=$("$WV" show "$opp_id" --json 2>&1)
@@ -1393,7 +1431,7 @@ test_done_contradiction() {
     # --no-overlap-check bypasses entirely (no metadata field written)
     local skip_id skip_meta
     skip_id=$("$WV" add "Skip overlap check" --force 2>&1 | node_id_from_output)
-    WV_REQUIRE_LEARNING=1 "$WV" done "$skip_id" \
+    WV_REQUIRE_LEARNING=1 "$WV" "done" "$skip_id" \
         --learning="decision Poetry Python projects avoid never adopt" \
         --no-overlap-check >/dev/null 2>&1
     skip_meta=$("$WV" show "$skip_id" --json 2>&1)
@@ -1503,6 +1541,84 @@ test_update_metadata_merge() {
     assert_contains "$update_help" "--metadata-file <path>" "wv update --help documents safer file-backed metadata"
 }
 
+# wv quick and wv touch store text, learning, metadata and intent exactly as
+# given: quick once SQL-escaped before jq (apostrophes stored doubled, in the
+# commit message too), and touch --intent pre-escaped quotes for jq and
+# replaced invalid --metadata with the intent alone (wv-7730bd widening).
+test_quick_touch_roundtrip() {
+    echo ""
+    echo "Test: wv quick / wv touch store values as given"
+    echo "==============================================="
+
+    setup_test_env
+    "$WV" init >/dev/null 2>&1
+    git config user.email t@example.invalid && git config user.name t && git config core.hooksPath /dev/null
+
+    local qid meta subject tid rc=0
+    echo x > quick.txt && git add quick.txt
+    qid=$("$WV" quick "don't double" --learning="it's kept" --metadata='{"note":"O'\''Donovan"}' 2>&1 | node_id_from_output)
+    meta=$("$WV" show "$qid" --json | jq -r '.metadata | (if type=="string" then fromjson else . end) | .learning + "|" + .note')
+    assert_equals "it's kept|O'Donovan" "$meta" "quick: learning and metadata apostrophes stored once"
+    assert_equals "don't double" "$("$WV" show "$qid" --json | jq -r '.text')" "quick: node text apostrophe stored once"
+    # Searched, not read from -1: an auto-checkpoint may follow quick's commit.
+    subject=$(git log --format=%s | grep -Fx -e "don't double" -e "don''t double" || true)
+    assert_equals "don't double" "$subject" "quick: commit message apostrophe not doubled"
+
+    tid=$("$WV" add "touch target" --force 2>&1 | node_id_from_output)
+    "$WV" touch "$tid" --metadata='{"k":1}' --intent='say "hi" a\b' >/dev/null 2>&1
+    meta=$("$WV" show "$tid" --json | jq -r '.metadata | (if type=="string" then fromjson else . end) | .current_intent + "|" + (.k|tostring)')
+    assert_equals 'say "hi" a\b|1' "$meta" "touch: intent merged into metadata verbatim"
+    "$WV" touch "$tid" --metadata='{bad json' --intent='replaced' >/dev/null 2>&1 || rc=$?
+    assert_equals "1" "$rc" "touch: invalid --metadata with --intent is rejected"
+    meta=$("$WV" show "$tid" --json | jq -r '.metadata | (if type=="string" then fromjson else . end) | .current_intent')
+    assert_equals 'say "hi" a\b' "$meta" "touch: rejected call leaves the stored intent unchanged"
+
+    # Metadata is one JSON object (wv-2c1be6). An empty --metadata= read as
+    # absent, and json_patch replaced the stored object with [1], "x" or null;
+    # several values exited 0 and stored nothing.
+    local v cmd got before
+    before=$("$WV" show "$tid" --json | jq -c '.metadata | (if type=="string" then fromjson else . end)')
+    for v in '' '[1]' 'null' '{"a":1} {"b":2}'; do
+        for cmd in update touch touch-intent; do
+            # Each case starts from the same object, so one case's damage
+            # cannot fail the next.
+            sqlite3 "$WV_DB" "UPDATE nodes SET metadata='$before' WHERE id='$tid';"
+            rc=0
+            case "$cmd" in
+                update) "$WV" update "$tid" --metadata="$v" >/dev/null 2>&1 || rc=$? ;;
+                touch) "$WV" touch "$tid" --metadata="$v" >/dev/null 2>&1 || rc=$? ;;
+                touch-intent) "$WV" touch "$tid" --metadata="$v" --intent=after >/dev/null 2>&1 || rc=$? ;;
+            esac
+            got=$("$WV" show "$tid" --json | jq -c '.metadata | (if type=="string" then fromjson else . end)')
+            assert_equals "1 $before" "$rc $got" "$cmd --metadata='$v' is refused and changes nothing"
+        done
+        rc=0
+        "$WV" add "non-object metadata" --force --metadata="$v" >/dev/null 2>&1 || rc=$?
+        assert_equals "1" "$rc" "add --metadata='$v' is refused"
+    done
+    # The supplied value is validated before --criteria/--risks merge into it:
+    # null + {done_criteria: ...} is an object (wv-9034a6).
+    local n_before n_after
+    for v in 'null' '[1]' ''; do
+        n_before=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE text='sugar target';")
+        rc=0
+        "$WV" add "sugar target" --force --metadata="$v" --criteria="c1|c2" --risks=low >/dev/null 2>&1 || rc=$?
+        n_after=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE text='sugar target';")
+        assert_equals "1 $n_before" "$rc $n_after" "add --metadata='$v' with --criteria/--risks is refused and creates no node"
+    done
+    local sid
+    sid=$("$WV" add "sugar control" --force --metadata='{"k":1}' --criteria="c1|c2" --risks=low 2>&1 | node_id_from_output)
+    meta=$("$WV" show "$sid" --json | jq -c '.metadata | (if type=="string" then fromjson else . end) | [.k, .done_criteria, .risk_level]')
+    assert_equals '[1,["c1","c2"],"low"]' "$meta" "control: an object with --criteria/--risks keeps all three"
+
+    rc=0
+    "$WV" touch "$tid" --intent= --files=quick.txt >/dev/null 2>&1 || rc=$?
+    assert_equals "1" "$rc" "touch: an empty --intent= is refused, not dropped"
+    "$WV" touch "$tid" --intent=after >/dev/null 2>&1
+    meta=$("$WV" show "$tid" --json | jq -r '.metadata | (if type=="string" then fromjson else . end) | "\(.current_intent)|\(.k)"')
+    assert_equals "after|1" "$meta" "control: --intent alone still merges into the stored object"
+}
+
 test_update_metadata_portability() {
     echo ""
     echo "Test: wv update --metadata portable snapshot and delta replay"
@@ -1522,7 +1638,9 @@ test_update_metadata_portability() {
     local -a source_env=(env -u WV_DB -u WV_DB_CUSTOM
         "WV_PROJECT_DIR=$source_repo" "WV_HOT_ZONE=$source_hot"
         WV_REQUIRE_LEARNING=0 WV_AUTO_CHECKPOINT=0 WV_AUTO_SYNC=1 WV_SYNC_INTERVAL=60)
-    "${source_env[@]}" "$WV" init >/dev/null 2>&1
+    # Inside source_repo: run from the caller's cwd, init depended on whatever
+    # repository the previous test left there.
+    (cd "$source_repo" && "${source_env[@]}" "$WV" init >/dev/null 2>&1)
 
     local id
     id=$(cd "$source_repo" && "${source_env[@]}" "$WV" add "portable metadata" \
@@ -1620,7 +1738,7 @@ test_help_surfaces() {
     root_help=$("$WV" --help 2>&1)
 
     local expected_commands=(
-        init add remember memory delete done ship ship-agent batch-done bulk-update work preflight recover bootstrap bootstrap-agent
+        init add remember memory delete "done" ship ship-agent batch-done bulk-update work preflight recover bootstrap bootstrap-agent
         overview cache pending-close ready list show status update touch allowed-tools quick
         hook
         block link unlink resolve related edges path tree plan enrich-topology context discover search
@@ -1727,7 +1845,7 @@ test_orphan_prevention() {
 
     # No active epics — task allowed without --parent (the gap that let wv-2efef5 exist)
     # Mark the epic done so no active epics remain
-    "$WV" done "$epic_id" >/dev/null 2>&1
+    "$WV" "done" "$epic_id" >/dev/null 2>&1
     local free_id
     free_id=$("$WV" add "No-parent task when no active epics" --force 2>&1 | node_id_from_output)
     assert_contains "$free_id" "wv-" "add without --parent allowed when no active epics exist"
@@ -1746,7 +1864,7 @@ test_findings_promote() {
 
     local source_id parent_id output all_nodes
     source_id=$("$WV" add "Investigate install hook drift" --force 2>&1 | node_id_from_output)
-    "$WV" done "$source_id" \
+    "$WV" "done" "$source_id" \
         --learning="pitfall: hooks copied by install.sh but not wired into settings.json; add settings wiring in install.sh" \
         >/dev/null 2>&1
 
@@ -1801,7 +1919,7 @@ INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$breach_id', 'src/comp
 SQL
 
     local breach_out
-    breach_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$breach_id" 2>&1 || true)
+    breach_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$breach_id" 2>&1 || true)
     assert_contains "$breach_out" "GraphPolicyViolation" \
         "done is blocked when mccabe_max exceeds threshold"
 
@@ -1840,7 +1958,7 @@ INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$clean_id', 'src/simpl
 SQL
 
     local clean_out
-    clean_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$clean_id" 2>&1)
+    clean_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$clean_id" 2>&1)
     assert_contains "$clean_out" "Closed" \
         "done succeeds when per-language mccabe_max is within threshold"
 
@@ -1853,7 +1971,7 @@ INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('scripts
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$bash_id', 'scripts/run.sh');
 SQL
     local bash_ok_out
-    bash_ok_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$bash_id" 2>&1)
+    bash_ok_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$bash_id" 2>&1)
     assert_contains "$bash_ok_out" "Closed" \
         "done succeeds for bash file with CC=80 < mccabe_max_sh=100"
 
@@ -1866,14 +1984,14 @@ INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('install
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$bash_breach_id', 'install.sh');
 SQL
     local bash_breach_out
-    bash_breach_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$bash_breach_id" 2>&1 || true)
+    bash_breach_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$bash_breach_id" 2>&1 || true)
     assert_contains "$bash_breach_out" "GraphPolicyViolation" \
         "done is blocked for bash file with CC=120 > mccabe_max_sh=100"
 
     # --- Case 3: FTS search still works after trigger addition (no regression) ---
     local search_id
     search_id=$("$WV" add "Policy trigger regression check node" --force 2>&1 | node_id_from_output)
-    WV_REQUIRE_QUALITY=0 "$WV" done "$search_id" >/dev/null 2>&1
+    WV_REQUIRE_QUALITY=0 "$WV" "done" "$search_id" >/dev/null 2>&1
     local search_out
     search_out=$("$WV" search "regression check" 2>&1)
     assert_contains "$search_out" "regression" \
@@ -1895,7 +2013,7 @@ INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$trend_id', 'src/trend
 SQL
 
     local trend_out
-    trend_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$trend_id" 2>&1 || true)
+    trend_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$trend_id" 2>&1 || true)
     assert_contains "$trend_out" "GraphPolicyViolation" \
         "done is blocked when deteriorating trend gate is enabled"
     assert_contains "$trend_out" '"path":"src/trending.py"' \
@@ -1934,7 +2052,7 @@ INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('install
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$exempt_id', 'install.sh');
 SQL
     local exempt_out
-    exempt_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$exempt_id" 2>&1)
+    exempt_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$exempt_id" 2>&1)
     assert_contains "$exempt_out" "Closed" \
         "done succeeds for exempt path (install.sh) even when file_metrics has CC=168 > sh=100"
 
@@ -1947,7 +2065,7 @@ INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('archive
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$arch_id', 'archive/tests/old_test.py');
 SQL
     local arch_out
-    arch_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$arch_id" 2>&1)
+    arch_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$arch_id" 2>&1)
     assert_contains "$arch_out" "Closed" \
         "done succeeds for file under exempt directory prefix (archive/)"
 
@@ -1966,7 +2084,7 @@ INSERT OR REPLACE INTO file_test_status(path, state) VALUES ('src/untested.py', 
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$tg_id', 'src/untested.py');
 SQL
     local tg_out
-    tg_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$tg_id" 2>&1 || true)
+    tg_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$tg_id" 2>&1 || true)
     assert_contains "$tg_out" "GraphPolicyViolation" \
         "done blocked when test_gate=block and a touched file is red"
     assert_contains "$tg_out" '"threshold":"test_gate"' \
@@ -1980,7 +2098,7 @@ SQL
     # --- Case 8b: same red file is INERT when test_gate=off (default 0) ---
     sqlite3 "$WV_DB" "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES ('test_gate', 0);"
     local tg_out2
-    tg_out2=$(WV_REQUIRE_QUALITY=0 "$WV" done "$tg_id" 2>&1)
+    tg_out2=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$tg_id" 2>&1)
     assert_contains "$tg_out2" "Closed" \
         "done succeeds on a red file when test_gate=off (gate inert by default)"
 
@@ -1994,7 +2112,7 @@ INSERT OR REPLACE INTO file_test_status(path, state) VALUES ('src/unknownst.py',
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$tgu_id', 'src/unknownst.py');
 SQL
     local tgu_out
-    tgu_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$tgu_id" 2>&1)
+    tgu_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$tgu_id" 2>&1)
     assert_contains "$tgu_out" "Closed" \
         "done succeeds when test state is unknown (non-blocking) even at test_gate=block"
 
@@ -2008,7 +2126,7 @@ INSERT OR REPLACE INTO file_test_status(path, state) VALUES ('src/warnme.py', 'r
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$warn_id', 'src/warnme.py');
 SQL
     local warn_out
-    warn_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$warn_id" --learning="x" 2>&1)
+    warn_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$warn_id" --learning="x" 2>&1)
     assert_contains "$warn_out" "Closed" \
         "test_gate=warn does not block the close (advisory only)"
     assert_contains "$warn_out" "test_gate=warn" \
@@ -2023,7 +2141,7 @@ INSERT OR REPLACE INTO file_test_status(path, state) VALUES ('src/skipme.py', 'r
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$warn_id2', 'src/skipme.py');
 SQL
     local warn_out2
-    warn_out2=$(WV_REQUIRE_QUALITY=0 "$WV" done "$warn_id2" --skip-verification 2>&1)
+    warn_out2=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$warn_id2" --skip-verification 2>&1)
     assert_contains "$warn_out2" "Closed" \
         "--skip-verification still closes at test_gate=warn"
     assert_not_contains "$warn_out2" "test_gate=warn" \
@@ -2040,7 +2158,7 @@ INSERT OR REPLACE INTO file_test_status(path, state) VALUES ('src/epicfile.py', 
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$epic_id', 'src/epicfile.py');
 SQL
     local epic_out
-    epic_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$epic_id" --skip-verification 2>&1)
+    epic_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$epic_id" --skip-verification 2>&1)
     assert_contains "$epic_out" "Closed" \
         "node-type exemption: an epic with a red touched file closes even at test_gate=block"
 
@@ -2071,7 +2189,7 @@ test_trend_signal_wiring() {
 INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$skip_id', 'src/trend_file.py');
 SQL
     local skip_out
-    skip_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$skip_id" --skip-verification 2>&1)
+    skip_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$skip_id" --skip-verification 2>&1)
     assert_contains "$skip_out" "Closed" \
         "wv done succeeds with trend refresh skipped (WV_REQUIRE_QUALITY=0)"
 
@@ -2165,7 +2283,7 @@ test_wv_index_command() {
 
     # --- Case 1: basic indexing produces chunks ---
     mkdir -p "$TEST_DIR/src"
-    printf '%s\n' $(seq 1 60 | awk '{print "x = " $1}') > "$TEST_DIR/src/sample.py"
+    seq 1 60 | awk '{print "x = " $1}' > "$TEST_DIR/src/sample.py"
     local idx_out
     idx_out=$("$WV" index "$TEST_DIR/src" --no-embed --ext=.py 2>&1)
     local chunk_count
@@ -2438,7 +2556,7 @@ INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$noq_id', 'src/feature.
 SQL
 
     local noq_out noq_rc
-    noq_out=$("$WV" done "$noq_id" 2>&1 || true)
+    noq_out=$("$WV" "done" "$noq_id" 2>&1 || true)
     noq_rc=$("$WV" show "$noq_id" --json 2>/dev/null | jq -r '.status' 2>/dev/null || echo "active")
     assert_contains "$noq_out" "quality.db not found" \
         "wv done fails loudly when quality.db is absent and node_files is non-empty"
@@ -2460,7 +2578,7 @@ SQL
     sqlite3 "$quality_db" "CREATE TABLE IF NOT EXISTS file_metrics (path TEXT NOT NULL, scan_id INTEGER NOT NULL, metric TEXT NOT NULL, value REAL, detail TEXT, PRIMARY KEY(path, scan_id, metric));"
 
     local noscan_out noscan_rc
-    noscan_out=$("$WV" done "$noscan_id" 2>&1 || true)
+    noscan_out=$("$WV" "done" "$noscan_id" 2>&1 || true)
     noscan_rc=$("$WV" show "$noscan_id" --json 2>/dev/null | jq -r '.status' 2>/dev/null || echo "active")
     assert_contains "$noscan_out" "no scan data" \
         "wv done fails loudly when quality.db exists but has no scans"
@@ -2485,7 +2603,7 @@ INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$ok_id', 'src/feature.p
 SQL
 
     local ok_out
-    ok_out=$("$WV" done "$ok_id" 2>&1)
+    ok_out=$("$WV" "done" "$ok_id" 2>&1)
     assert_contains "$ok_out" "Closed" \
         "wv done succeeds when per-function CC max is within threshold"
 
@@ -2503,7 +2621,7 @@ SQL
     "$WV" work "$bash_id" >/dev/null 2>&1
     sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$bash_id', 'scripts/run.sh');"
     local bash_out
-    bash_out=$("$WV" done "$bash_id" 2>&1)
+    bash_out=$("$WV" "done" "$bash_id" 2>&1)
     assert_contains "$bash_out" "Closed" \
         "wv done succeeds for bash file with no fn_cc:* entries (mccabe_max=0)"
     local bash_max bash_lang
@@ -2571,7 +2689,7 @@ SQL
     "$WV" link "$det_id" "$parent" --type=implements >/dev/null 2>&1
     "$WV" work "$det_id" >/dev/null 2>&1
     sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$det_id', 'src/deteriorating.py');"
-    det_out=$("$WV" done "$det_id" --learning="$warning_learning" 2>&1)
+    det_out=$("$WV" "done" "$det_id" --learning="$warning_learning" 2>&1)
     assert_contains "$det_out" "Complexity trend deteriorating: src/deteriorating.py" \
         "wv done warns when a touched file trend is deteriorating"
     det_trend=$(sqlite3 "$WV_DB" "SELECT direction FROM file_trend WHERE path='src/deteriorating.py';" 2>/dev/null)
@@ -2583,7 +2701,7 @@ SQL
     "$WV" link "$stable_id" "$parent" --type=implements >/dev/null 2>&1
     "$WV" work "$stable_id" >/dev/null 2>&1
     sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$stable_id', 'src/stable.py');"
-    stable_out=$("$WV" done "$stable_id" --learning="$warning_learning" 2>&1)
+    stable_out=$("$WV" "done" "$stable_id" --learning="$warning_learning" 2>&1)
     assert_not_contains "$stable_out" "Complexity trend" \
         "wv done stays quiet for stable trend paths"
     stable_trend=$(sqlite3 "$WV_DB" "SELECT direction FROM file_trend WHERE path='src/stable.py';" 2>/dev/null)
@@ -2595,7 +2713,7 @@ SQL
     "$WV" link "$ref_id" "$parent" --type=implements >/dev/null 2>&1
     "$WV" work "$ref_id" >/dev/null 2>&1
     sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$ref_id', 'src/refactored.py');"
-    ref_out=$("$WV" done "$ref_id" --learning="$warning_learning" 2>&1)
+    ref_out=$("$WV" "done" "$ref_id" --learning="$warning_learning" 2>&1)
     assert_not_contains "$ref_out" "Complexity trend" \
         "wv done stays quiet for refactored trend paths"
     ref_trend=$(sqlite3 "$WV_DB" "SELECT direction FROM file_trend WHERE path='src/refactored.py';" 2>/dev/null)
@@ -2633,7 +2751,7 @@ test_allowed_tools() {
         "wv work --allowed-tools persists tool list as JSON array"
 
     # --- Case 3: wv done --allowed-tools updates the list at close time ---
-    WV_REQUIRE_QUALITY=0 "$WV" done "$node_id" --allowed-tools=read,write >/dev/null 2>&1
+    WV_REQUIRE_QUALITY=0 "$WV" "done" "$node_id" --allowed-tools=read,write >/dev/null 2>&1
 
     local done_tools
     done_tools=$(sqlite3 "$WV_DB" "SELECT json_extract(metadata, '\$.allowed_tools') FROM nodes WHERE id='$node_id';")
@@ -2774,6 +2892,31 @@ test_test_results_ledger() {
     "$WV" test-status "tests/test-status.sh" --files=,, --quiet >/dev/null 2>&1 || status_usage_rc=$?
     assert_equals "2" "$status_usage_rc" "test-status rejects a file list with no real paths"
 
+    # --- a result holds only for the content the suite started on (wv-5da0e8) ---
+    echo "start-a" > "$TEST_DIR/a.sh"
+    echo "start-b" > "$TEST_DIR/b.sh"
+    local start_fps fp_line
+    start_fps="$TEST_DIR/start.fps"
+    "$WV" test-status --fingerprints --files="a.sh,b.sh" > "$start_fps" 2>/dev/null || true
+    fp_line=$(awk -F'\t' '$2 == "a.sh" { print $1 }' "$start_fps")
+    assert_equals "$(git hash-object a.sh)" "$fp_line" "test-status --fingerprints prints test-record's fingerprint"
+    assert_equals "2" "$(wc -l < "$start_fps" | tr -d ' ')" "test-status --fingerprints prints one line per file"
+    echo "edited-mid-run" > "$TEST_DIR/a.sh"
+    "$WV" test-record "tests/test-mid.sh" --files="a.sh,b.sh" --exit=0 \
+        --start-fingerprints="$start_fps" >/dev/null 2>&1
+    assert_fails "a file edited during the run is not recorded green" \
+        "$WV" test-status "tests/test-mid.sh" --files="a.sh" --quiet
+    assert_success "an unchanged file from the same run is recorded green" \
+        "$WV" test-status "tests/test-mid.sh" --files="b.sh" --quiet
+    echo "start-a" > "$TEST_DIR/a.sh"
+    assert_fails "the mid-run row matches no content, not even the start content" \
+        "$WV" test-status "tests/test-mid.sh" --files="a.sh" --quiet
+    : > "$TEST_DIR/empty.fps"
+    "$WV" test-record "tests/test-nosnap.sh" --files="b.sh" --exit=0 \
+        --start-fingerprints="$TEST_DIR/empty.fps" >/dev/null 2>&1
+    assert_fails "a file missing from the start snapshot is not recorded green" \
+        "$WV" test-status "tests/test-nosnap.sh" --files="b.sh" --quiet
+
     # --- durable history survives a simulated wv load (LL2) ---
     # The disk JSONL log is independent of the tmpfs table: wiping the DB (what
     # wv load does) must not lose history.
@@ -2825,11 +2968,19 @@ test_done_refresh_test_status() {
             source '$PROJECT_ROOT/scripts/lib/wv-validate.sh'
             source '$PROJECT_ROOT/scripts/lib/wv-db.sh'
             source '$PROJECT_ROOT/scripts/lib/wv-checkpoint-ci.sh'
+            source '$PROJECT_ROOT/scripts/lib/wv-attempt-journal.sh'
             source '$PROJECT_ROOT/scripts/cmd/wv-cmd-graph.sh'
             source '$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh'
             source '$PROJECT_ROOT/scripts/cmd/wv-cmd-core.sh'
             _done_refresh_test_status '$1'
-        " 2>/dev/null
+        " 2>"$TEST_DIR/refresh.err"
+        # The sourcing above is partial, so it must include every helper the
+        # refresh reaches: wv_json_escape (wv-attempt-journal.sh, which
+        # scripts/wv always sources) was missing and the state read 'unknown'
+        # (wv-3e6d45). The resolver call inside the refresh discards its own
+        # stderr, so that failure is not visible here; errors the refresh does
+        # not swallow (a failed source, a missing top-level function) are.
+        if [ -s "$TEST_DIR/refresh.err" ]; then sed 's/^/  refresh stderr: /' "$TEST_DIR/refresh.err"; fi
     }
 
     # --- green: ledger fingerprint matches current content + exit 0 ---
@@ -2888,6 +3039,13 @@ test_done_refresh_test_status() {
     assert_equals "stale" "$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")" \
         "heavy suite without a row, no pre-push gate installed -> stale (required at commit)"
     mkdir -p "$hooks_dir"; printf '#!/bin/sh\n# Weave pre-push hook\n' > "$hooks_dir/pre-push"
+    # git skips a hook without the execute bit, so a marked one that cannot run
+    # is no gate to defer to (wv-ecae1c).
+    chmod -x "$hooks_dir/pre-push"
+    run_refresh "$nid"
+    assert_equals "stale" "$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")" \
+        "heavy suite without a row, marked pre-push hook not executable -> stale (git would not run it)"
+    chmod +x "$hooks_dir/pre-push"
     run_refresh "$nid"
     assert_equals "deferred" "$(sqlite3 "$WV_DB" "SELECT state FROM file_test_status WHERE path='src/foo.sh';")" \
         "heavy suite without a row, pre-push gate installed -> deferred (owed at push)"
@@ -3043,7 +3201,7 @@ CONF
 INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('src/hot.py', 99, 'py');
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$hot_id', 'src/hot.py');
 SQL
-    hot_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$hot_id" 2>&1 || true)
+    hot_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$hot_id" 2>&1 || true)
     assert_contains "$hot_out" "GraphPolicyViolation" \
         "baseline: gate blocks a breaching non-exempt path"
 
@@ -3066,7 +3224,7 @@ CONF2
     # non-zero, and under `set -e` a bare capture would abort the whole suite
     # instead of letting the assertion report which behaviour regressed.
     local resync_out
-    resync_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$hot_id" 2>&1 || true)
+    resync_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$hot_id" 2>&1 || true)
     assert_contains "$resync_out" "Closed" \
         "wv done honours an exemption added to quality.conf since the last load"
     assert_not_contains "$resync_out" "GraphPolicyViolation" \
@@ -3085,7 +3243,7 @@ CONF2
 INSERT OR REPLACE INTO file_metrics(path, mccabe_max, language) VALUES ('src/other.py', 99, 'py');
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$thr_id', 'src/other.py');
 SQL
-    thr_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$thr_id" 2>&1 || true)
+    thr_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$thr_id" 2>&1 || true)
     assert_contains "$thr_out" "GraphPolicyViolation" \
         "baseline: CC=99 breaches mccabe_max_py=30"
 
@@ -3097,7 +3255,7 @@ src/hot.py
 [thresholds]
 mccabe_max_py = 500
 CONF3
-    thr_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$thr_id" 2>&1 || true)
+    thr_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$thr_id" 2>&1 || true)
     assert_contains "$thr_out" "Closed" \
         "wv done honours a [thresholds] change made since the last load"
     local synced_thr
@@ -3128,15 +3286,21 @@ test_agent_identity_resolution() {
     local claude codex copilot human
     claude=$(env -u WV_AGENT_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
              CLAUDE_CODE_SSE_PORT=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
-    codex=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u COPILOT_AGENT \
+    codex=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u COPILOT_AGENT \
              CODEX_CI=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
-    copilot=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI \
+    copilot=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI \
              COPILOT_AGENT=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
-    human=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+    human=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
              bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
     assert_contains "$claude" "claude-" "claude marker -> claude- identity"
     assert_contains "$codex" "codex-" "codex marker -> codex- identity"
     assert_contains "$copilot" "copilot-" "copilot marker -> copilot- identity"
+    # Claude Code sets CLAUDECODE=1 in every process; CLAUDE_CODE_SSE_PORT only
+    # with an IDE attached, so a plain-terminal session resolved human (wv-50640a).
+    local claude_cli
+    claude_cli=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+             CLAUDECODE=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    assert_contains "$claude_cli" "claude-" "CLAUDECODE=1 alone (no IDE) -> claude- identity"
 
     # 3. human shell does not collapse onto an agent identity
     assert_contains "$human" "human-" "bare shell -> human- identity (not host-user)"
@@ -3251,10 +3415,10 @@ test_done_completion_scope() {
       INSERT INTO file_metrics(path,mccabe_max,language) VALUES('clean.sh',1,'sh'),('historical.sh',999,'sh');"
 
     rc=0
-    WV_REQUIRE_QUALITY=0 "$WV" done "$id" --skip-verification >/dev/null 2>&1 || rc=$?
+    WV_REQUIRE_QUALITY=0 "$WV" "done" "$id" --skip-verification >/dev/null 2>&1 || rc=$?
     assert_equals "1" "$rc" "done without completion scope retains all-node_files gate"
 
-    scoped_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files=clean.sh --skip-verification 2>&1)
+    scoped_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$id" --completion-files=clean.sh --skip-verification 2>&1)
     assert_contains "$scoped_out" "explicit (1 policy / 2 historical files)" "done reports explicit and historical completion counts"
     meta=$("$WV" show "$id" --json | jq -r '.metadata')
     assert_contains "$meta" '"completion_scope"' "done records completion scope metadata"
@@ -3264,24 +3428,24 @@ test_done_completion_scope() {
 
     id=$("$WV" add "invalid scoped close" --force 2>&1 | node_id_from_output)
     sqlite3 "$WV_DB" "INSERT INTO node_files(node_id,path) VALUES('$id','clean.sh');"
-    assert_fails "completion scope requires active status" env WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files=clean.sh --skip-verification
-    assert_fails "completion scope rejects non-attributed path" env WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files=other.sh --skip-verification
-    assert_fails "completion scope rejects non-normalized path" env WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files=./clean.sh --skip-verification
-    assert_fails "completion scope rejects empty selection" env WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files= --skip-verification
+    assert_fails "completion scope requires active status" env WV_REQUIRE_QUALITY=0 "$WV" "done" "$id" --completion-files=clean.sh --skip-verification
+    assert_fails "completion scope rejects non-attributed path" env WV_REQUIRE_QUALITY=0 "$WV" "done" "$id" --completion-files=other.sh --skip-verification
+    assert_fails "completion scope rejects non-normalized path" env WV_REQUIRE_QUALITY=0 "$WV" "done" "$id" --completion-files=./clean.sh --skip-verification
+    assert_fails "completion scope rejects empty selection" env WV_REQUIRE_QUALITY=0 "$WV" "done" "$id" --completion-files= --skip-verification
 
     id=$("$WV" add "persisted scope cannot authorize close" --status=active --criteria="scope is fresh" --risks=low --force 2>&1 | node_id_from_output)
     sqlite3 "$WV_DB" "INSERT INTO node_files(node_id,path) VALUES('$id','clean.sh'),('$id','historical.sh');
       UPDATE nodes SET metadata=json_set(metadata,'\$.completion_scope',json('{\"files\":[\"clean.sh\"],\"attempt_id\":\"injected\"}')) WHERE id='$id';"
     assert_fails "persisted completion scope cannot authorize a direct status transition" sqlite3 "$WV_DB" "UPDATE nodes SET status='done' WHERE id='$id';"
-    assert_fails "plain done ignores persisted completion scope" env WV_REQUIRE_QUALITY=0 "$WV" done "$id" --skip-verification
+    assert_fails "plain done ignores persisted completion scope" env WV_REQUIRE_QUALITY=0 "$WV" "done" "$id" --skip-verification
 
     id=$("$WV" add "json scoped close" --status=active --criteria="scope is reported" --risks=low --force 2>&1 | node_id_from_output)
     sqlite3 "$WV_DB" "INSERT INTO node_files(node_id,path) VALUES('$id','clean.sh');"
-    json_out=$(WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files=clean.sh --skip-verification --json)
+    json_out=$(WV_REQUIRE_QUALITY=0 "$WV" "done" "$id" --completion-files=clean.sh --skip-verification --json)
     assert_equals "explicit" "$(jq -r '.completion_scope.mode' <<< "$json_out")" "JSON done reports explicit scope mode"
     assert_equals "1" "$(jq -r '.completion_scope.policy_files' <<< "$json_out")" "JSON done reports policy file count"
     meta=$("$WV" show "$id" --json | jq -c '.metadata | fromjson | .completion_scope')
-    assert_fails "already-done node rejects completion audit rewrite" env WV_REQUIRE_QUALITY=0 "$WV" done "$id" --completion-files=clean.sh --skip-verification
+    assert_fails "already-done node rejects completion audit rewrite" env WV_REQUIRE_QUALITY=0 "$WV" "done" "$id" --completion-files=clean.sh --skip-verification
     assert_equals "$meta" "$("$WV" show "$id" --json | jq -c '.metadata | fromjson | .completion_scope')" "rejected re-close preserves completion audit"
 }
 
@@ -3421,6 +3585,25 @@ test_quick_commits_only_staged() {
     assert_contains "$out" "Nothing staged" "unstaged-only says nothing was staged"
     assert_equals "1" "$(git diff --quiet other.txt; echo $?)" "unstaged-only leaves the file dirty"
     assert_equals "0" "$(git log --oneline -- other.txt | grep -c 'quick unstaged only' || true)" "unstaged-only never commits the file"
+
+    # 5. A refused node creation must stop BEFORE committing the caller's work.
+    # The eventual close already refuses an absent node; exit status alone
+    # would miss that quick committed the staged file before reaching it.
+    printf 'v4\n' > staged.txt
+    git add staged.txt
+    local before
+    before=$(git rev-parse HEAD)
+    sqlite3 "$WV_DB" "CREATE TRIGGER test_quick_insert_refused BEFORE INSERT ON nodes
+        WHEN NEW.text='quick rejected creation'
+        BEGIN SELECT RAISE(ABORT, 'simulated quick insert failure'); END;"
+    rc=0
+    out=$("$WV" quick "quick rejected creation" 2>&1) || rc=$?
+    assert_equals "1" "$rc" "quick refuses a failed node INSERT"
+    assert_equals "$before" "$(git rev-parse HEAD)" "a refused creation leaves HEAD unchanged"
+    assert_equals "staged.txt" "$(git diff --cached --name-only -- staged.txt)" "a refused creation leaves caller work staged"
+    assert_equals "0" "$(sqlite3 "$WV_DB" "SELECT count(*) FROM nodes WHERE text='quick rejected creation';")" "a refused creation leaves no node"
+    assert_not_contains "$out" "(active)" "a refused creation does not announce an active node"
+    sqlite3 "$WV_DB" "DROP TRIGGER test_quick_insert_refused;"
 }
 
 
@@ -3469,6 +3652,7 @@ main() {
     test_ready_relevance_boost
     test_done_contradiction
     test_update_metadata_merge
+    test_quick_touch_roundtrip
     test_update_metadata_portability
     test_help_surfaces
     test_discover_cache_classification

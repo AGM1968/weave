@@ -15,6 +15,7 @@ export WV_CALL_SOURCE=test
 # Weave-ID: wv-0eb81a
 
 set -e
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -147,6 +148,32 @@ TEST_DIR=$(mktemp -d)
 trap 'cd /tmp && rm -rf "$TEST_DIR"' EXIT
 SCHEMA="$TEST_DIR/mcp-schema.json"
 
+# The server runs against a FIXTURE project, never the repository's own graph
+# (wv-a160a4): in place it used to read the operator's live graph, and from any
+# other path (a snapshot) it opened a new live hot zone. Graph, config and call
+# logs are the suite's own, and WV_PATH pins the CHECKOUT's wv: the server
+# otherwise prefers ~/.local/bin/wv, the installed copy, over the code under test.
+FIX="$TEST_DIR/proj"
+mkdir -p "$FIX" "$TEST_DIR/hz" "$TEST_DIR/cfg"
+git -C "$FIX" init -q
+MCP_ENV=(env -u WV_CALL_LOG -u WV_MCP_CALL_LOG -u WV_PROJECT_ROOT
+    WV_PATH="$WV" WV_PROJECT_DIR="$FIX" WV_HOT_ZONE="$TEST_DIR/hz" WV_DB="$TEST_DIR/hz/brain.db"
+    WV_CONFIG_DIR="$TEST_DIR/cfg" WV_AGENT_ID=mcp-parity-test WV_AUTO_CHECKPOINT=0)
+(cd "$FIX" && "${MCP_ENV[@]}" "$WV" init >/dev/null 2>&1 \
+    && "${MCP_ENV[@]}" "$WV" add "mcp parity fixture node" --standalone --force >/dev/null 2>&1) \
+    || { fail "fixture graph created" "wv init/add failed in $FIX"; echo "Results: $TESTS_PASSED/$TESTS_RUN passed"; exit 1; }
+mcp_server() { (cd "$FIX" && "${MCP_ENV[@]}" timeout 20 node "$MCP_DIST" --scope=all 2>/dev/null); }
+
+# The server must resolve the checkout's wv, not an installed copy.
+startup=$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"parity-test","version":"0"}}}' \
+    | (cd "$FIX" && "${MCP_ENV[@]}" WV_MCP_STARTUP_REPORT=1 timeout 20 node "$MCP_DIST" --scope=all 2>&1 >/dev/null) \
+    | grep -m1 '"event":"weave_mcp_startup"' || true)
+if [ "$(jq -r '.wv_path // empty' <<< "$startup" 2>/dev/null)" = "$WV" ]; then
+    pass "the server resolves the checkout's wv ($WV)"
+else
+    fail "the server resolves the checkout's wv" "startup report: '${startup:0:200}'"
+fi
+
 if [ ! -f "$MCP_DIST" ]; then
     fail "mcp/dist/index.js exists" "run: npm --prefix mcp run build"
     echo ""
@@ -158,7 +185,7 @@ printf '%s\n%s\n%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"parity-test","version":"0"}}}' \
     '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-    | timeout 20 node "$MCP_DIST" --scope=all 2>/dev/null \
+    | mcp_server \
     | jq -s '[.[] | select(.id==2)][0].result.tools' > "$SCHEMA" || true
 
 tool_count=$(jq 'length' "$SCHEMA" 2>/dev/null || echo 0)
@@ -185,7 +212,7 @@ map_tool() {
         first=${cand%% *}
         # Multi-word commands expand intentionally.
         # shellcheck disable=SC2086
-        help=$("$WV" $cand --help 2>&1 || true)
+        help=$(cd "$FIX" && "${MCP_ENV[@]}" "$WV" $cand --help 2>&1 || true)
         # Real subcommand help starts "Usage: wv <cmd>"; the global fallback
         # for unknown commands starts "Usage: wv <command>".
         if grep -qE -- "^Usage: wv $first" <<< "$help"; then
@@ -201,7 +228,7 @@ map_tool() {
 parity_gaps() {
     local tool="$1" cli_cmd="$2" schema_file="$3" cli_flags props
     # shellcheck disable=SC2086
-    cli_flags=$("$WV" $cli_cmd --help 2>&1 | grep -oE '\-\-[a-z][a-z-]*' | sort -u || true)
+    cli_flags=$(cd "$FIX" && "${MCP_ENV[@]}" "$WV" $cli_cmd --help 2>&1 | grep -oE '\-\-[a-z][a-z-]*' | sort -u || true)
     props=$(jq -r --arg t "$tool" \
         '.[] | select(.name==$t) | .inputSchema.properties // {} | keys[]' \
         "$schema_file" | sed 's/_/-/g; s/^/--/' | sort -u)
@@ -253,7 +280,7 @@ call_out=$(printf '%s\n%s\n%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"parity-test","version":"0"}}}' \
     '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
     '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"weave_guide","arguments":{"topic":"workflow"}}}' \
-    | timeout 20 node "$MCP_DIST" --scope=all 2>/dev/null \
+    | mcp_server \
     | jq -rs '[.[] | select(.id==3)][0].result.content[0].text // empty' || true)
 if [ -n "$call_out" ] && ! grep -qi "^Error:" <<< "$call_out"; then
     pass "tools/call executes a real command (weave_guide returned content)"
@@ -261,23 +288,25 @@ else
     fail "tools/call executes a real command (weave_guide returned content)" "output: '${call_out:0:120}'"
 fi
 
-# DB-read smoke: weave_query routes through the read path against the live
-# graph — catches read-path breakage (e.g. wvRead --mode appended to a
-# command that rejects it) that the shell-out smoke above cannot see.
+# DB-read smoke: weave_query routes through the read path against the fixture
+# graph, catching read-path breakage (e.g. wvRead --mode appended to a command
+# that rejects it) that the shell-out smoke above cannot see. The reply must
+# carry the fixture node, so the read demonstrably reached a graph.
 query_out=$(printf '%s\n%s\n%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"parity-test","version":"0"}}}' \
     '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"weave_query","arguments":{"predicates":["status=done"],"limit":1}}}' \
-    | timeout 20 node "$MCP_DIST" --scope=all 2>/dev/null \
+    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"weave_query","arguments":{"predicates":["status=todo"],"limit":5}}}' \
+    | mcp_server \
     | jq -rs '[.[] | select(.id==4)][0].result.content[0].text // empty' || true)
 # Structural assertion only: the failure shape is an Error:-prefixed reply
 # (e.g. "Error: unknown option: --mode=discover"). Never grep result CONTENT
 # for the error string — node text/evidence in the graph may legitimately
 # quote it (self-referential false positive, found on dev 2026-06-12).
-if [ -n "$query_out" ] && ! printf '%s' "$query_out" | head -1 | grep -qE "^Error:"; then
-    pass "tools/call weave_query reads the graph (no Error reply)"
+if [ -n "$query_out" ] && ! printf '%s' "$query_out" | head -1 | grep -qE "^Error:" \
+    && grep -qF "mcp parity fixture node" <<< "$query_out"; then
+    pass "tools/call weave_query reads the fixture graph (its node returned, no Error reply)"
 else
-    fail "tools/call weave_query reads the graph (no Error reply)" "output: '${query_out:0:120}'"
+    fail "tools/call weave_query reads the fixture graph (its node returned, no Error reply)" "output: '${query_out:0:160}'"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

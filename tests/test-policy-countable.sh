@@ -9,6 +9,7 @@
 # examined the call and let it through, and this suite drives one clean call
 # through every mutation-class operation that has applicable rules.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 run=0; pass=0
 ok()  { run=$((run+1)); pass=$((pass+1)); echo "  ✓ $1"; }

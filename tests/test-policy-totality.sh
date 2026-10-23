@@ -8,6 +8,7 @@
 # separate repositories), never read from a file that could predate the code it
 # describes.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 POLICY="$ROOT/scripts/weave_policy.py"
 CONTRACT="$ROOT/contracts/policy-rules-v1.json"
@@ -57,7 +58,13 @@ jq -e '.operations.covered | map(.operation) | index("block")' "$TMP/report.json
     bad "an operation whose every rule was decided is covered" "$(jq -c '.operations.covered' "$TMP/report.json")"
 # wv-49b339 and wv-664b7f: every rule of every owner is exercised, command and
 # SQLite gates through the journals and host hooks through their observations.
-open_rules=$(jq -r '[.rules | to_entries[] | select(.value.state != "exercised") | .key] | join(",")' "$TMP/report.json")
+# Git-hook rules have no evidence channel by declaration (wv-3477f0): they are
+# outside evidence, and exactly they are, so the state cannot hide anything else.
+open_rules=$(jq -r '[.rules | to_entries[] | select(.value.state != "exercised" and .value.state != "outside_evidence") | .key] | join(",")' "$TMP/report.json")
+outside=$(jq -r '[.rules | to_entries[] | select(.value.state == "outside_evidence") | .key] | sort | join(",")' "$TMP/report.json")
+git_only=$(jq -r '[.rules[] | select([.sites[].owner] | unique == ["git_hook"]) | .rule_id] | sort | join(",")' "$ROOT/contracts/policy-rules-v1.json")
+[ -n "$git_only" ] && [ "$outside" = "$git_only" ] && ok "outside evidence is exactly the git-hook-only rules ($outside)" ||
+    bad "outside evidence is exactly the git-hook-only rules" "outside=$outside git_only=$git_only"
 [ -z "$open_rules" ] && ok "every declared rule is exercised, whatever enforces it" ||
     bad "every declared rule is exercised, whatever enforces it" "open: $open_rules"
 jq -e '.complete' "$TMP/report.json" >/dev/null && ok "policy totality is complete: no gap is declared or needed" ||

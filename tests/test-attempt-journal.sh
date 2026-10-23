@@ -10,6 +10,7 @@ export WV_CALL_SOURCE=test
 # classification rather than the command word, and that evidence mode fails the
 # call closed rather than dropping a write it could not make.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -443,8 +444,13 @@ check "a command that exits directly still records completion" "call_started,cal
 rm -f "$JOURNAL"
 WV_ATTEMPT_JOURNAL="$JOURNAL" "$WV" analyze sessions >/dev/null 2>&1 &
 killed=$!
-timeout 2 tail -f /dev/null
+# Kill once the call has journaled its start, not after a fixed delay: under
+# load (parallel gate lanes) the call had not started within 2s and no journal
+# existed (wv-c9d6b7). Bounded, so a call that never journals fails here.
+timeout 60 bash -c 'until grep -qs "\"call_started\"" "$1"; do sleep 0.1; done' _ "$JOURNAL"
+check "the call journaled its start before the kill" "0" "$?"
 kill -9 "$killed" 2>/dev/null
+check "...and was still running when killed" "0" "$?"
 wait "$killed" 2>/dev/null
 check "a SIGKILLed call leaves an attributable incomplete attempt" "incomplete" \
   "$(field call_started disposition)"

@@ -64,7 +64,7 @@ gh_notify() {
     fi
 
     local _gh_log="${WV_HOT_ZONE}/gh_notify.log"
-    PYTHONPATH="$_gh_pypath" "$_gh_python3" -m weave_gh --notify "$node_id" "$event" "${extra_args[@]}" 2>>"$_gh_log" || true
+    PYTHONSAFEPATH=1 PYTHONPATH="$_gh_pypath" "$_gh_python3" -m weave_gh --notify "$node_id" "$event" "${extra_args[@]}" 2>>"$_gh_log" || true
 }
 
 _refresh_parent_gh() {
@@ -95,5 +95,5 @@ _refresh_parent_gh() {
         _gh_python3=python3
     fi
 
-    PYTHONPATH="$_gh_pypath" "$_gh_python3" -m weave_gh --refresh-parent "$child_id" 2>/dev/null || true
+    PYTHONSAFEPATH=1 PYTHONPATH="$_gh_pypath" "$_gh_python3" -m weave_gh --refresh-parent "$child_id" 2>/dev/null || true
 }

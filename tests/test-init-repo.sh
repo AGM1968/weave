@@ -13,6 +13,7 @@ export WV_CALL_SOURCE=test
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Colors
 RED='\033[0;31m'
@@ -47,6 +48,13 @@ if [ "\${WV_HOT_ZONE:-}" = "$TEST_DIR/hotzone" ]; then
     root=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
     WV_HOT_ZONE="$TEST_DIR/hotzone/\$(printf '%s' "\$root" | md5sum | cut -c1-12)"
     export WV_HOT_ZONE WV_DB="\$WV_HOT_ZONE/brain.db"
+fi
+# The commit gate injects core.hooksPath=/dev/null through GIT_CONFIG_* so
+# nested commits run no hooks. init-repo must see each fixture repository's own
+# config: it installs hooks only where git runs them and reports core.hooksPath
+# instead (wv-76c726), so the injection would read as every fixture's setting.
+if [ "\${1:-}" = "init-repo" ]; then
+    unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 fi
 exec "$WV" "\$@"
 EOF
@@ -190,6 +198,7 @@ assert_file_exists "$REPO/CLAUDE.md"                        "copies CLAUDE.md fr
 # install location instead.
 assert_not_contains "$(cat "$REPO/CLAUDE.md")" './scripts/wv"' \
     "scaffolded CLAUDE.md does not ship the dead ./scripts/wv fallback"
+# shellcheck disable=SC2016  # the expected text contains a literal $ reference
 assert_contains "$(cat "$REPO/CLAUDE.md")" '$HOME/.local/bin/wv' \
     "scaffolded CLAUDE.md wv() fallback points at the real global install path"
 assert_file_exists "$REPO/.claude/settings.local.json"      "creates settings.local.json"
@@ -201,7 +210,7 @@ assert_file_absent "$REPO/.git/hooks/post-commit"           "does not install th
 assert_file_exists "$REPO/.git/hooks/prepare-commit-msg"    "installs actual prepare-commit-msg hook entrypoint"
 assert_file_absent "$REPO/.git/hooks/pre-commit-weave.sh"   "does not install source filename as git hook entrypoint"
 assert_contains "$(cat "$REPO/.weave/runtime.md")" "Agent Runtime Notes" "runtime.md includes agent runtime notes"
-assert_contains "$(cat "$REPO/.weave/runtime.md")" "/tmp/weave-codex-*" "runtime.md documents Codex hot zone"
+assert_contains "$(cat "$REPO/.weave/runtime.md")" "/tmp/weave-hotzone-*" "runtime.md documents the /tmp hot zone by its neutral name"
 # Release review 3 (wv-89f85b): a fresh consumer's runtime.md contradicted
 # itself about where wv lives. The session-start code fence hardcoded
 # ./scripts/wv -- which a consumer repo does not have, so the fallback did not
@@ -218,6 +227,7 @@ RUNTIME_SESSION_START=$(awk '
     in_fence && /^```/ { exit }
     in_fence { print }
 ' "$REPO/.weave/runtime.md")
+# shellcheck disable=SC2016  # the expected text contains a literal $ reference
 assert_contains "$RUNTIME_SESSION_START" '$HOME/.local/bin/wv' \
     "runtime.md session-start fallback points at the installed binary"
 assert_not_contains "$RUNTIME_SESSION_START" './scripts/wv' \
@@ -282,7 +292,25 @@ OUTPUT=$("$WV" init-repo --agent=copilot 2>&1)
 assert_file_exists "$REPO3/.mcp.json"                       "copilot: creates .mcp.json"
 assert_file_exists "$REPO3/.github/copilot-instructions.md" "copilot: creates copilot-instructions.md"
 assert_file_exists "$REPO3/.github/hooks/README.md"         "copilot: scaffolds .github/hooks/"
+assert_file_exists "$REPO3/.github/hooks/weave.json"        "copilot: registers executable VS Code Local hooks"
 assert_file_exists "$REPO3/.weave/runtime.md"               "copilot: creates .weave/runtime.md scaffold"
+VSCODE_HOOKS=$(cat "$REPO3/.github/hooks/weave.json" 2>/dev/null || true)
+assert_equals 'PostToolUse PreCompact PreToolUse SessionStart Stop' \
+    "$(jq -r '.hooks | keys | join(" ")' <<<"$VSCODE_HOOKS")" "copilot: all five Local lifecycle events registered"
+assert_equals true "$(jq -r '[.hooks[][] | .type == "command" and (.command | startswith("wv hook dispatch ")) and (.command | endswith(" --format=vscode"))] | length == 5 and all' <<<"$VSCODE_HOOKS")" \
+    "copilot: consumer hooks use installed wv and Local output"
+
+# Existing directories must gain the managed file without losing other hooks.
+printf '{"hooks":{}}\n' > "$REPO3/.github/hooks/team.json"
+printf 'local custom hook\n' > "$REPO3/.github/hooks/weave.json"
+OUTPUT=$("$WV" init-repo --agent=copilot 2>&1)
+assert_equals 'local custom hook' "$(cat "$REPO3/.github/hooks/weave.json")" "copilot: init preserves an existing managed hook file"
+OUTPUT=$("$WV" init-repo --agent=copilot --update 2>&1)
+assert_equals "$VSCODE_HOOKS" "$(cat "$REPO3/.github/hooks/weave.json")" "copilot: --update refreshes managed hooks in an existing directory"
+assert_equals '{"hooks":{}}' "$(cat "$REPO3/.github/hooks/team.json")" "copilot: --update preserves team hooks"
+rm "$REPO3/.github/hooks/weave.json"
+OUTPUT=$("$WV" init-repo --agent=copilot 2>&1)
+assert_file_exists "$REPO3/.github/hooks/weave.json" "copilot: existing hook directory still gains missing registrations"
 
 # Verify mcp.json points to MCP server and uses VS Code 'servers' key (not 'mcpServers')
 MCP_JSON=$(cat "$REPO3/.mcp.json")
@@ -293,6 +321,7 @@ assert_contains "$MCP_JSON" '"weave-inspect"'               "copilot: mcp.json h
 assert_not_contains "$MCP_JSON" '"weave-graph"'             "copilot: mcp.json does not ship weave-graph"
 assert_contains "$MCP_JSON" 'index.js'                      "copilot: mcp.json points to index.js"
 assert_contains "$MCP_JSON" '"WV_AGENT_ID"'                 "copilot: mcp.json pins explicit Weave agent identity"
+# shellcheck disable=SC2016  # the expected text contains a literal $ reference
 assert_contains "$MCP_JSON" 'copilot-${workspaceFolderBasename}' "copilot: mcp.json uses workspace-scoped Copilot identity"
 assert_not_contains "$MCP_JSON" '"mcpServers"'              "copilot: mcp.json uses 'servers' not 'mcpServers'"
 assert_not_contains "$MCP_JSON" '"inputs"'                  "copilot: mcp.json has no 'inputs' key"
@@ -338,20 +367,25 @@ REPO_FB=$(make_test_repo "copilot-fallback-consumer")
 cd "$REPO_FB"
 "$WV" init-repo --agent=copilot >/dev/null 2>&1
 COP_FB=$(cat "$REPO_FB/.github/copilot-instructions.md")
+# shellcheck disable=SC2016  # the expected text contains a literal $ reference
 assert_contains "$COP_FB" 'wv() { "$HOME/.local/bin/wv" "$@"; }' "copilot fallback: consumer repo falls back to the installed binary"
 assert_not_contains "$COP_FB" 'wv() { ./scripts/wv "$@"; }' "copilot fallback: consumer repo is not sent to a nonexistent ./scripts/wv"
 
 # (b) a weave source checkout does vendor scripts/wv, so it must be preferred
-REPO_FB2=$(make_test_repo "copilot-fallback-source")
+REPO_FB2=$(make_test_repo "copilot fallback source")
 mkdir -p "$REPO_FB2/scripts/lib"
-printf '#!/bin/sh\n' > "$REPO_FB2/scripts/wv"
+printf '#!/bin/sh\nprintf "source-hook:%%s\\n" "$*"\n' > "$REPO_FB2/scripts/wv"
 chmod +x "$REPO_FB2/scripts/wv"
 touch "$REPO_FB2/scripts/lib/wv-config.sh"
 cd "$REPO_FB2"
 "$WV" init-repo --agent=copilot >/dev/null 2>&1
 COP_FB2=$(cat "$REPO_FB2/.github/copilot-instructions.md")
 assert_contains "$COP_FB2" 'wv() { ./scripts/wv "$@"; }' "copilot fallback: source checkout prefers the repo-local wrapper"
+# shellcheck disable=SC2016  # the expected text contains a literal $ reference
 assert_not_contains "$COP_FB2" 'wv() { "$HOME/.local/bin/wv" "$@"; }' "copilot fallback: source checkout is not sent to the installed binary"
+VSCODE_COMMAND=$(jq -r '.hooks.PreToolUse[0].command' "$REPO_FB2/.github/hooks/weave.json")
+assert_equals 'source-hook:hook dispatch --event=PreToolUse --format=vscode' \
+    "$(bash -c "$VSCODE_COMMAND")" "copilot: generated Local command runs source CLI with spaces in the repository path"
 
 cp "$COP_STUB_BACKUP" "$COP_STUB"
 
@@ -416,6 +450,7 @@ assert_contains "$CODEX_JSON" '"noninteractive_close": "./scripts/wv ship-agent"
 assert_contains "$CODEX_JSON" '"local_first": "./scripts/wv sync"' "codex: contract names local-first sync"
 assert_contains "$CODEX_JSON" '"external_network": "./scripts/wv sync --gh"' "codex: contract names external GitHub sync"
 assert_contains "$CODEX_JSON" '"requires_sandbox_approval": true' "codex: contract marks GitHub sync approval"
+# shellcheck disable=SC2016  # the expected text contains a literal $ reference
 assert_contains "$CODEX_JSON" '"fallback": "$HOME/.local/bin/wv bootstrap-agent --json"' "codex: bootstrap fallback is portable"
 assert_contains "$CODEX_JSON" '"authority": "weave-graph"' "codex: memory contract marks graph authority"
 assert_contains "$CODEX_JSON" '"command": "./scripts/wv memory recall --agent=all --json"' "codex: memory recall is graph-wide"
@@ -441,12 +476,12 @@ assert_file_absent "$REPO_CODEX/.claude/settings.json"       "codex-only: no .cl
 assert_file_absent "$REPO_CODEX/.github/copilot-instructions.md" "codex-only: no copilot-instructions.md"
 
 printf '%s\n' '{"schema":"stale"}' > "$REPO_CODEX/.codex/weave.json"
-"$WV" init-repo --agent=codex --update 2>&1 >/dev/null
+"$WV" init-repo --agent=codex --update >/dev/null
 CODEX_SCHEMA=$(jq -r '.schema' "$REPO_CODEX/.codex/weave.json")
 assert_equals "weave.codex.v1" "$CODEX_SCHEMA"               "codex: --update refreshes contract"
 
 printf '%s\n' '{"custom":true}' > "$REPO_CODEX/.codex/weave.json"
-"$WV" init-repo --agent=codex --force 2>&1 >/dev/null
+"$WV" init-repo --agent=codex --force >/dev/null
 CODEX_SCHEMA=$(jq -r '.schema' "$REPO_CODEX/.codex/weave.json")
 assert_equals "weave.codex.v1" "$CODEX_SCHEMA"               "codex: --force refreshes contract"
 
@@ -464,20 +499,25 @@ fi
 CODEXFAKE
 chmod +x "$FAKE_BIN/codex"
 CODEX_MCP_LOG="$TEST_DIR/codex-mcp.log" PATH="$FAKE_BIN:$PATH" \
-    "$WV" init-repo --agent=codex --force --codex-mcp 2>&1 >/dev/null
+    "$WV" init-repo --agent=codex --force --codex-mcp >/dev/null
 assert_contains "$(cat "$TEST_DIR/codex-mcp.log")" "mcp remove weave" "codex: --codex-mcp prunes stale full MCP registration"
 assert_contains "$(cat "$TEST_DIR/codex-mcp.log")" "mcp add weave-lite" "codex: --codex-mcp registers lite MCP by default"
 assert_contains "$(cat "$TEST_DIR/codex-mcp.log")" "--scope=lite" "codex: default MCP registration uses lite scope"
 
 CODEX_MCP_LOG="$TEST_DIR/codex-mcp-full.log" PATH="$FAKE_BIN:$PATH" \
-    "$WV" init-repo --agent=codex --force --codex-mcp=full 2>&1 >/dev/null
+    "$WV" init-repo --agent=codex --force --codex-mcp=full >/dev/null
 assert_contains "$(cat "$TEST_DIR/codex-mcp-full.log")" "mcp add weave" "codex: full MCP registration is explicit"
 assert_contains "$(cat "$TEST_DIR/codex-mcp-full.log")" "--scope=all" "codex: full MCP registration uses all scope"
 
 OUTPUT=$("$WV" init-repo --agent=codex --force --codex-hooks 2>&1)
 assert_file_exists "$REPO_CODEX/.codex/hooks.json"             "codex: --codex-hooks generates project hooks"
 assert_contains "$(cat "$REPO_CODEX/.codex/hooks.json")" '"PreToolUse"' "codex: hook config includes edit guard"
-assert_contains "$(cat "$REPO_CODEX/.codex/hooks.json")" 'hook dispatch --event=PostToolUse --json' "codex: hook config calls shared dispatcher"
+assert_contains "$(cat "$REPO_CODEX/.codex/hooks.json")" 'hook dispatch --event=PostToolUse --format=host' "codex: hook config calls shared dispatcher"
+# Codex blocks only on exit 2 with a stderr reason or exit 0 with deny JSON;
+# --json's exit 1 reads as a failed hook, so the guard must use --format=host (wv-5b774a).
+assert_contains "$(cat "$REPO_CODEX/.codex/hooks.json")" 'hook dispatch --event=PreToolUse --format=host' "codex: edit guard answers in a shape Codex honours"
+assert_contains "$(cat "$REPO_CODEX/.codex/hooks.json")" 'hook dispatch --event=Stop --format=host' "codex: stop guard answers in a shape Codex honours (wv-25903d)"
+assert_contains "$(cat "$REPO_CODEX/.codex/hooks.json")" 'hook dispatch --event=PreCompact --format=host' "codex: hook config checkpoints before compaction"
 assert_contains "$(cat "$REPO_CODEX/.codex/weave.json")" '"enabled": 1' "codex: opt-in contract records hooks enabled"
 assert_contains "$OUTPUT" 'Review and trust these project hooks with /hooks' "codex: opt-in prints trust guidance"
 
@@ -505,7 +545,7 @@ REPO5=$(make_test_repo "update")
 cd "$REPO5"
 
 # First init
-"$WV" init-repo --agent=all 2>&1 >/dev/null
+"$WV" init-repo --agent=all >/dev/null
 
 # A project-owned top-level rule must survive managed updates unchanged.
 mkdir -p "$REPO5/.weave/patterns"
@@ -540,7 +580,7 @@ assert_contains "$(cat "$REPO5/.weave/patterns/managed/.overridden")" \
     "prose-ai-vocabulary.yaml" \
     "--update: records the shadowed managed rule id in .overridden"
 PATTERN_HASH_BEFORE=$(find "$REPO5/.weave/patterns" -type f -print0 | sort -z | xargs -0 sha256sum)
-"$WV" init-repo --agent=all --update 2>&1 >/dev/null
+"$WV" init-repo --agent=all --update >/dev/null
 PATTERN_HASH_AFTER=$(find "$REPO5/.weave/patterns" -type f -print0 | sort -z | xargs -0 sha256sum)
 assert_equals "$PATTERN_HASH_BEFORE" "$PATTERN_HASH_AFTER" \
     "--update: managed pattern projection is idempotent"
@@ -666,7 +706,7 @@ cd "$REPO5"
 # --update should strip ghost setting from .vscode/settings.json
 if [ -d "$REPO5/.vscode" ]; then
     echo '{"chat.hooks.enabled": true, "other.setting": 42}' > "$REPO5/.vscode/settings.json"
-    "$WV" init-repo --agent=copilot --update 2>&1 >/dev/null
+    "$WV" init-repo --agent=copilot --update >/dev/null
     if [ -f "$REPO5/.vscode/settings.json" ]; then
         VS5=$(cat "$REPO5/.vscode/settings.json")
         assert_not_contains "$VS5" 'chat.hooks.enabled'     "--update: strips ghost setting from .vscode/settings.json"
@@ -677,7 +717,7 @@ fi
 
 # --update should prepend Weave block but preserve user content
 echo "my custom content" > "$REPO5/CLAUDE.md"
-"$WV" init-repo --update 2>&1 >/dev/null
+"$WV" init-repo --update >/dev/null
 assert_contains "$(cat "$REPO5/CLAUDE.md")" "BEGIN WEAVE CLAUDE.MD"  "--update: prepends Weave block to CLAUDE.md"
 assert_contains "$(cat "$REPO5/CLAUDE.md")" "my custom content"  "--update: preserves user content in CLAUDE.md"
 
@@ -693,7 +733,7 @@ If 0 active nodes, use wv status to find active node first.
 
 Keep this custom instruction.'
 printf '%s\n' "$PRE_MARKER_STUB" > "$REPO5/.github/copilot-instructions.md"
-"$WV" init-repo --agent=copilot --update 2>&1 >/dev/null
+"$WV" init-repo --agent=copilot --update >/dev/null
 COPILOT_PM=$(cat "$REPO5/.github/copilot-instructions.md")
 assert_contains "$COPILOT_PM" "BEGIN WEAVE COPILOT.MD"      "--update pre-marker: adds markers"
 assert_contains "$COPILOT_PM" "Keep this custom instruction." "--update pre-marker: preserves custom content"
@@ -797,7 +837,7 @@ REPO10=$(make_test_repo "vendor-seed")
 cd "$REPO10"
 mkdir -p scripts/hooks
 # Simulate a repo scaffolded before pre-push-weave.sh existed: 2 of 3 sources.
-_LIB_HOOKS_DIR="${LIB_DIR:-$HOME/.local/lib/weave}/hooks"
+_LIB_HOOKS_DIR="$WV_LIB_DIR/hooks"
 if [ -f "$_LIB_HOOKS_DIR/pre-commit-weave.sh" ]; then
     cp "$_LIB_HOOKS_DIR/pre-commit-weave.sh" scripts/hooks/
     cp "$_LIB_HOOKS_DIR/prepare-commit-msg-weave.sh" scripts/hooks/
@@ -850,7 +890,7 @@ SK_CONFIG=$(sed -n '/^WV_CONFIG_SKILLS=(/,/)/p' "$PROJECT_ROOT/install.sh" \
 SK_ARRAY=$(grep -oE '^ +SKILLS=\([^)]*\)' "$PROJECT_ROOT/install.sh" | sed -n 1p \
     | sed 's/.*(//; s/)//' | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')
 assert_equals "$SK_CONFIG" "$SK_ARRAY" "skills: the init-repo SKILLS array is the CONFIG_DIR skill set"
-if [ -f "${HOME}/.config/weave/skills/trails/SKILL.md" ]; then
+if [ -f "$WV_CONFIG_DIR/skills/trails/SKILL.md" ]; then
     REPO_SK=$(make_test_repo "skills-trails")
     cd "$REPO_SK"
     "$WV" init-repo --update --agent=claude >/dev/null 2>&1
@@ -1233,6 +1273,90 @@ assert_equals "reachable_exposure" "$(jq -r '.exposure_state' <<< "$AGENT_AUDIT_
     "repo-class audit: markerless managed-agent history is actionable"
 assert_equals "true" "$(jq -r --arg sha "$AGENT_EXPOSURE_COMMIT" '.reachable_exposure.history_commits | index($sha) != null' <<< "$AGENT_AUDIT_JSON")" \
     "repo-class audit: markerless managed-agent exposure identifies the commit"
+
+# S0 provisioning diagnostics are advisory and never execute the suite scripts.
+REPO_GATE_PATHS=$(make_test_repo gate-paths)
+cd "$REPO_GATE_PATHS"
+mkdir -p .weave checks
+printf 'venv_ee/\n.private/\n' > .gitignore
+cat > .weave/test-map.conf <<'EOF'
+[map]
+src/ = checks/unconditional.sh
+[default]
+checks/default.sh
+[scanners]
+checks/scanner.sh = scripts/**
+[heavy]
+checks/not-routed.sh
+[inputs]
+checks/not-routed.sh = src/**
+EOF
+cat > checks/unconditional.sh <<'EOF'
+touch suite-was-executed
+source venv_ee/bin/activate
+EOF
+cat > checks/default.sh <<'EOF'
+ACTIVATE=".private/bin/activate"
+if [ -f "$ACTIVATE" ]; then source "$ACTIVATE"; fi
+EOF
+cat > checks/scanner.sh <<'EOF'
+# .private/comment-only is not a literal script argument.
+PY=.private/bin/python
+"$PY" -m pytest
+EOF
+cat > checks/not-routed.sh <<'EOF'
+source .private/not-routed
+EOF
+OUTPUT=$("$WV" init-repo --agent=codex 2>&1)
+assert_contains "$OUTPUT" 'gate ignored paths:' "init-repo emits the advisory without refusing setup"
+assert_contains "$OUTPUT" 'venv_ee/bin/activate' "init-repo identifies unconditional ignored activation"
+DOCTOR_JSON=$("$WV" doctor --json 2>/dev/null || true)
+GATE_PATH_STATUS=$(jq -r '.checks[] | select(.check == "gate ignored paths") | .status' <<< "$DOCTOR_JSON")
+GATE_PATH_DETAIL=$(jq -r '.checks[] | select(.check == "gate ignored paths") | .detail' <<< "$DOCTOR_JSON")
+assert_equals warn "$GATE_PATH_STATUS" "doctor reports ignored paths as WARN, not FAIL"
+assert_contains "$GATE_PATH_DETAIL" 'checks/default.sh:' "default suites are inspected"
+assert_contains "$GATE_PATH_DETAIL" '.private/bin/activate' "guarded activation assignment is inspected"
+assert_contains "$GATE_PATH_DETAIL" 'checks/scanner.sh:' "scanner suites are inspected"
+assert_contains "$GATE_PATH_DETAIL" '.private/bin/python' "literal interpreter assignment is inspected"
+assert_not_contains "$GATE_PATH_DETAIL" 'comment-only' "comments do not invent ignored-path references"
+assert_not_contains "$GATE_PATH_DETAIL" 'not-routed' "heavy and input entries alone do not create routes"
+assert_file_absent "$REPO_GATE_PATHS/suite-was-executed" "diagnostics never execute routed scripts"
+OUTPUT=$("$WV" doctor 2>/dev/null || true)
+assert_contains "$OUTPUT" 'gate ignored paths:' "text doctor emits the same advisory"
+assert_contains "$OUTPUT" 'venv_ee/bin/activate' "text doctor identifies the literal ignored path"
+# A symlinked declaration or suite must not read outside this repository.
+cp .weave/test-map.conf "$TEST_DIR/outside-map.conf"
+mv .weave/test-map.conf .weave/test-map.saved
+ln -s "$TEST_DIR/outside-map.conf" .weave/test-map.conf
+DOCTOR_JSON=$("$WV" doctor --json 2>/dev/null || true)
+GATE_PATH_DETAIL=$(jq -r '.checks[] | select(.check == "gate ignored paths") | .detail' <<< "$DOCTOR_JSON")
+assert_contains "$GATE_PATH_DETAIL" 'test-map.conf is outside the repository' "outside declarations are refused before reading"
+rm .weave/test-map.conf
+mv .weave/test-map.saved .weave/test-map.conf
+printf 'source .private/outside-script\n' > "$TEST_DIR/outside-suite.sh"
+rm checks/unconditional.sh
+ln -s "$TEST_DIR/outside-suite.sh" checks/unconditional.sh
+DOCTOR_JSON=$("$WV" doctor --json 2>/dev/null || true)
+GATE_PATH_DETAIL=$(jq -r '.checks[] | select(.check == "gate ignored paths") | .detail' <<< "$DOCTOR_JSON")
+assert_contains "$GATE_PATH_DETAIL" 'checks/unconditional.sh: routed script unavailable' "outside suite symlinks are not followed"
+assert_not_contains "$GATE_PATH_DETAIL" 'outside-script' "outside suite contents are not inspected"
+rm checks/unconditional.sh
+printf 'source "${ENVIRONMENT}/bin/activate"\n' > checks/unconditional.sh
+printf 'echo safe\n' > checks/default.sh
+printf 'echo safe\n' > checks/scanner.sh
+DOCTOR_JSON=$("$WV" doctor --json 2>/dev/null || true)
+GATE_PATH_STATUS=$(jq -r '.checks[] | select(.check == "gate ignored paths") | .status' <<< "$DOCTOR_JSON")
+assert_equals pass "$GATE_PATH_STATUS" "removing ignored references clears the advisory"
+GATE_PATH_DETAIL=$(jq -r '.checks[] | select(.check == "gate ignored paths") | .detail' <<< "$DOCTOR_JSON")
+assert_contains "$GATE_PATH_DETAIL" 'computed paths are not evaluated' "a clean literal scan does not certify dynamic paths"
+
+# Exercise doctor with the installed CLI too, not only the checkout wrapper.
+printf 'source .private/bin/activate\n' > checks/unconditional.sh
+GATE_PATH_ZONE="$TEST_DIR/hotzone/$(printf '%s' "$REPO_GATE_PATHS" | md5sum | cut -c1-12)"
+DOCTOR_JSON=$(WV_HOT_ZONE="$GATE_PATH_ZONE" WV_DB="$GATE_PATH_ZONE/brain.db" \
+    "$TEST_INSTALL/bin/wv" doctor --json 2>/dev/null || true)
+GATE_PATH_DETAIL=$(jq -r '.checks[] | select(.check == "gate ignored paths") | .detail' <<< "$DOCTOR_JSON")
+assert_contains "$GATE_PATH_DETAIL" '.private/bin/activate' "installed doctor uses the shipped scanner"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""

@@ -2,6 +2,7 @@
 # Regression tests for the opt-in Delta v2 operation writer.
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 export WV_CALL_SOURCE=test
 
@@ -107,7 +108,7 @@ wv_delta_reset "$DB"
 sqlite3 "$DB" "UPDATE nodes SET updated_at=102 WHERE id='wv-v2';"
 rm -rf "$OUT"
 written_noop=$(wv_delta_v2_write_operations "$DB" "$OUT" "agent-a")
-[ "$written_noop" = "0" ] && [ ! -d "$OUT" -o -z "$(find "$OUT" -type f -print -quit 2>/dev/null)" ] \
+[ "$written_noop" = "0" ] && { [ ! -d "$OUT" ] || [ -z "$(find "$OUT" -type f -print -quit 2>/dev/null)" ]; } \
   && ok "an updated_at-only touch emits no Delta v2 operation" \
   || bad "an updated_at-only touch emits no Delta v2 operation"
 

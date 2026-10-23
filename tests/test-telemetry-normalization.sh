@@ -10,6 +10,7 @@ export WV_CALL_SOURCE=test
 # months while every call line recorded <redacted:N>, which is how the E1
 # denominator came to be missing two mutating commands.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -75,6 +76,7 @@ check "a command the registry declares needs no allowlist edit" "wv fictional-co
 "$WV" fictional-command >/dev/null 2>&1
 check "and is redacted again against the real registry" "wv <redacted:17>" "$(logged)"
 
+# shellcheck disable=SC2016  # the pattern matches literal $ in the source text it reads
 check "scripts/wv keeps no operation allowlist of its own" "1" \
   "$(grep -c '_wv_cap_known "$operation"' "$WV")"
 

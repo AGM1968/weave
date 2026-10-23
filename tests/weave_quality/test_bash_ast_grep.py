@@ -52,7 +52,6 @@ class TestAstGrepAvailable:
     def test_resolve_tool_checks_common_user_bins(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import weave_quality.external_tools as tools  # pylint: disable=import-outside-toplevel
 
         fake_home = tmp_path / "home"
         fake_bin = fake_home / ".cargo" / "bin"
@@ -61,8 +60,11 @@ class TestAstGrepAvailable:
         fake_tool.write_text("#!/bin/sh\n", encoding="utf-8")
         fake_tool.chmod(0o755)
 
-        monkeypatch.setattr(tools.shutil, "which", lambda _: None)
-        monkeypatch.setattr(tools.Path, "home", lambda: fake_home)
+        def absent_from_path(_: str) -> None:
+            """Make lookup use the home-directory fallback."""
+
+        monkeypatch.setattr("weave_quality.external_tools.shutil.which", absent_from_path)
+        monkeypatch.setattr("weave_quality.external_tools.Path.home", lambda: fake_home)
         assert resolve_tool("ast-grep") == str(fake_tool)
 
 

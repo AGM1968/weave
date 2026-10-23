@@ -30,14 +30,17 @@ is_container() {
 }
 
 is_sandboxed_runtime() {
-    # PLACEMENT axis only (not identity). Sandboxed agent shells (Codex/Copilot/
-    # Claude Code) do not reliably persist /dev/shm between tool invocations; route
-    # them to the persistent /tmp zone. This is a deliberate OR across harnesses —
-    # it answers "where does the hot zone live", NOT "which agent is acting".
-    # For agent identity (claimed_by, delta provenance) use resolve_agent_id, which
-    # keeps Claude/Codex/Copilot/human distinct. (wv-727175)
+    # RUNTIME-CLASS axis (not identity): is this an agent harness shell? A
+    # deliberate OR across harnesses, read by resolve_runtime_label. It no longer
+    # decides hot-zone placement: resolve_hot_zone adopts the zone holding the
+    # repository's database, else the /tmp zone, for every process (wv-b831e3).
+    # CLAUDECODE=1 is Claude Code's marker in every process it starts;
+    # CLAUDE_CODE_SSE_PORT is set only with an IDE attached (wv-50640a), so it
+    # is kept as an alias (wv-21698b). For agent identity (claimed_by, delta
+    # provenance) use resolve_agent_id, which keeps the harnesses distinct.
     [ -n "${CODEX_THREAD_ID:-}" ] || [ "${CODEX_CI:-}" = "1" ] \
-        || [ "${COPILOT_AGENT:-}" = "1" ] || [ -n "${CLAUDE_CODE_SSE_PORT:-}" ]
+        || [ "${COPILOT_AGENT:-}" = "1" ] || [ "${CLAUDECODE:-}" = "1" ] \
+        || [ -n "${CLAUDE_CODE_SSE_PORT:-}" ]
 }
 
 # Backward-compatible alias — the name conflated placement with the Codex harness;
@@ -67,6 +70,11 @@ is_codex_runtime() {
 # silently dropping GitHub assignee sync (wv-4d4c96). Claude now wins the
 # claude/codex tie; copilot's marker (COPILOT_AGENT=1) is set by neither Claude
 # nor Codex and has no known leak vector, so it keeps top precedence.
+#
+# Claude Code's marker is CLAUDECODE=1, which it sets in every process it starts.
+# CLAUDE_CODE_SSE_PORT, the marker before wv-50640a, is set only when an IDE is
+# attached, so a session started from a plain terminal resolved human; it stays
+# accepted as an alias. is_sandboxed_runtime reads both (wv-21698b).
 resolve_agent_harness() {
     if [ -n "${_WV_AGENT_HARNESS:-}" ]; then
         printf '%s\n' "$_WV_AGENT_HARNESS"
@@ -74,7 +82,7 @@ resolve_agent_harness() {
     fi
 
     local present=""
-    [ -n "${CLAUDE_CODE_SSE_PORT:-}" ] && present="${present} claude"
+    { [ "${CLAUDECODE:-}" = "1" ] || [ -n "${CLAUDE_CODE_SSE_PORT:-}" ]; } && present="${present} claude"
     { [ -n "${CODEX_THREAD_ID:-}" ] || [ "${CODEX_CI:-}" = "1" ]; } && present="${present} codex"
     [ "${COPILOT_AGENT:-}" = "1" ] && present="${present} copilot"
     present="${present# }"
@@ -201,59 +209,449 @@ hot_zone_matches_repo() {
     [ "$owner" = "$repo_root" ]
 }
 
-# Cross-platform hot zone detection
+# ── Hot-zone base safety (wv-80be32) ─────────────────────────────────────────
+# Every base resolve_hot_zone can return sits in a world-writable sticky
+# directory (/tmp, /dev/shm, macOS $TMPDIR), so another local user can create
+# it first. Whoever controls the base can swap the per-repo directory inside it
+# for one holding their own brain.db. A base is usable only when it is a real
+# directory owned by this uid with no group or other write. Once it is, the
+# sticky parent stops others renaming or deleting it, and only this uid can
+# change its entries, so the per-repo leaf needs no check of its own.
+# hot_zone_ensure is the one function here that creates anything; it acts
+# only when called (the source-only contract above is about source time).
+
+# ── The /tmp zone's two names (wv-95bddf) ────────────────────────────────────
+# The /tmp zone is named /tmp/weave-hotzone-<uid>: it names the storage, not an
+# agent. Its old name, /tmp/weave-codex-<uid>, made two investigations read it
+# as a Codex-only zone. Old binaries create and use only the old name, so
+# while hosts run mixed versions the legacy directory stays the physical one
+# and the neutral name is at most a symlink to it, which hot_zone_ensure adds
+# (owner decision 2026-10-05). Nothing here moves or renames live storage.
+# A neutral name that is a real directory is what a deliberate relocation
+# leaves; it is then used directly. Beside a real legacy directory it comes
+# first only when it alone holds databases: otherwise the legacy directory
+# stays the authority, and a new repository lands there rather than making a
+# second populated zone. Both names as separate directories that both hold
+# databases is refused: that is two sets of graphs, and nothing here picks.
+
+# _hot_zone_tmp_names — set _HZ_NEUTRAL and _HZ_LEGACY, the /tmp zone's two
+# names. Under WV_TEST_MODE=1, WV_TEST_HOT_ZONE_ROOT (an absolute path)
+# prefixes them and the other zones (_HZ_ROOT) so tests can populate them
+# without touching live ones.
+_hot_zone_tmp_names() {
+    _HZ_ROOT=""
+    if [ -n "${WV_TEST_HOT_ZONE_ROOT:-}" ]; then
+        if [ "${WV_TEST_MODE:-}" = "1" ] && [ "${WV_TEST_HOT_ZONE_ROOT:0:1}" = "/" ]; then
+            _HZ_ROOT="${WV_TEST_HOT_ZONE_ROOT%/}"
+        elif [ -z "${_HZ_TEST_ROOT_WARNED:-}" ]; then
+            _HZ_TEST_ROOT_WARNED=1
+            echo "wv: WV_TEST_HOT_ZONE_ROOT needs WV_TEST_MODE=1 and an absolute path; ignoring it." >&2
+        fi
+    fi
+    _HZ_NEUTRAL="${_HZ_ROOT}/tmp/weave-hotzone-${UID}"
+    _HZ_LEGACY="${_HZ_ROOT}/tmp/weave-codex-${UID}"
+}
+
+# _hot_zone_populated <dir> — true when <dir> holds a non-empty */brain.db.
+_hot_zone_populated() {
+    local db
+    for db in "$1"/*/brain.db; do
+        [ -s "$db" ] && return 0
+    done
+    return 1
+}
+
+# _hot_zone_linux_zones — set _HZ_ZONES to the Linux hot zones placement picks
+# from (wv-b831e3): first the /tmp zone every process uses by default, then the
+# adopt-only legacy zones, which are used only while one already holds a repo's
+# database. The /tmp zone is listed under the name that reaches its physical
+# directory (see above); _HZ_TMP_CONFLICT is set when its two names are
+# separate directories that both hold databases.
+_hot_zone_linux_zones() {
+    _hot_zone_tmp_names
+    _HZ_TMP_CONFLICT=""
+    if [ -L "$_HZ_NEUTRAL" ]; then
+        # The alias: one zone under two names. hot_zone_check verifies it.
+        _HZ_ZONES=("$_HZ_NEUTRAL")
+    elif [ -e "$_HZ_NEUTRAL" ]; then
+        if [ -d "$_HZ_LEGACY" ] && [ ! -L "$_HZ_LEGACY" ]; then
+            if ! _hot_zone_populated "$_HZ_NEUTRAL"; then
+                # The legacy directory stays the authority (wv-6f2eed).
+                _HZ_ZONES=("$_HZ_LEGACY" "$_HZ_NEUTRAL")
+            else
+                _HZ_ZONES=("$_HZ_NEUTRAL" "$_HZ_LEGACY")
+                _hot_zone_populated "$_HZ_LEGACY" && _HZ_TMP_CONFLICT=1
+            fi
+        else
+            _HZ_ZONES=("$_HZ_NEUTRAL")
+        fi
+    elif [ -e "$_HZ_LEGACY" ] || [ -L "$_HZ_LEGACY" ]; then
+        # Only the legacy name: hot_zone_ensure adds the alias on first use.
+        _HZ_ZONES=("$_HZ_LEGACY")
+    else
+        # Neither: hot_zone_ensure creates the legacy directory and the alias.
+        _HZ_ZONES=("$_HZ_NEUTRAL")
+    fi
+    _HZ_ZONES+=("${_HZ_ROOT}/dev/shm/weave" "${_HZ_ROOT}/tmp/weave-${UID}")
+}
+
+# _hot_zone_inventory <dir> [<other dir>] — print one line per populated
+# */brain.db in <dir>: the hash directory and the repository its .repo_root
+# names, marked when <other dir> holds a copy of the same repository, since two
+# copies may have diverged and need reconciling, not just syncing (wv-a73141).
+_hot_zone_inventory() {
+    local db dir owner mark
+    for db in "$1"/*/brain.db; do
+        [ -s "$db" ] || continue
+        dir="${db%/brain.db}"
+        owner=$(read_hot_zone_owner "$dir")
+        mark=""
+        [ -n "${2:-}" ] && [ -s "$2/${dir##*/}/brain.db" ] && mark="  [IN BOTH ZONES: reconcile, step 3]"
+        echo "      ${dir}  (${owner:-repository unknown})${mark}"
+    done
+}
+
+# _hot_zone_pair <base> — set _HZ_ALIAS_TARGET to the legacy directory when
+# <base> is the neutral name (the one symlink target it may have), and
+# _HZ_ALIAS_NAME to the neutral name when <base> is the legacy directory (the
+# alias hot_zone_ensure adds beside it). Both empty for any other base.
+_hot_zone_pair() {
+    local base="${1%/}"
+    _HZ_ALIAS_TARGET=""
+    _HZ_ALIAS_NAME=""
+    _hot_zone_tmp_names
+    case "$base" in
+        "$_HZ_NEUTRAL") _HZ_ALIAS_TARGET="$_HZ_LEGACY" ;;
+        "$_HZ_LEGACY") _HZ_ALIAS_NAME="$_HZ_NEUTRAL" ;;
+        "/tmp/weave-hotzone-${UID}") _HZ_ALIAS_TARGET="/tmp/weave-codex-${UID}" ;;
+        "/tmp/weave-codex-${UID}") _HZ_ALIAS_NAME="/tmp/weave-hotzone-${UID}" ;;
+    esac
+}
+
+# _hot_zone_bases — set _HZ_BASES to every base directory resolve_hot_zone can
+# return that lives in a shared parent, plus the bash-dedup lock base
+# (resolve_bash_lock_dir). No forks: wv runs this on every call.
+# Under WV_TEST_MODE=1, WV_TEST_HOT_ZONE_BASE (an absolute path) adds one base
+# so tests can drive the guard without touching a live one; it can only add,
+# never remove. Set without WV_TEST_MODE=1, or relative, it is ignored with a
+# warning, once per process (tests/wv-test-hooks.registry).
+_hot_zone_bases() {
+    _HZ_BASES=("/tmp/weave-hotzone-${UID}" "/tmp/weave-codex-${UID}" "/tmp/weave-${UID}"
+        "/dev/shm/weave" "/tmp/weave-bash-locks-${UID}")
+    if [ -n "${WV_TEST_HOT_ZONE_ROOT:-}" ]; then
+        _hot_zone_tmp_names
+        _HZ_BASES+=("$_HZ_NEUTRAL" "$_HZ_LEGACY" "${_HZ_ROOT}/dev/shm/weave"
+            "${_HZ_ROOT}/tmp/weave-${UID}")
+    fi
+    case "${OSTYPE:-}" in
+        darwin*) _HZ_BASES+=("${TMPDIR:-/tmp}/weave-${UID}") ;;
+    esac
+    [ -n "${WV_TEST_HOT_ZONE_BASE:-}" ] || return 0
+    if [ "${WV_TEST_MODE:-}" = "1" ] && [ "${WV_TEST_HOT_ZONE_BASE:0:1}" = "/" ]; then
+        _HZ_BASES+=("$WV_TEST_HOT_ZONE_BASE")
+    elif [ -z "${_HZ_TEST_BASE_WARNED:-}" ]; then
+        _HZ_TEST_BASE_WARNED=1
+        if [ "${WV_TEST_MODE:-}" != "1" ]; then
+            echo "wv: WV_TEST_HOT_ZONE_BASE is set but WV_TEST_MODE=1 is not; ignoring it." >&2
+        else
+            echo "wv: WV_TEST_HOT_ZONE_BASE='${WV_TEST_HOT_ZONE_BASE}' is not an absolute path; ignoring it." >&2
+        fi
+    fi
+}
+
+# hot_zone_known_bases — print _HZ_BASES, one per line.
+hot_zone_known_bases() {
+    _hot_zone_bases
+    printf '%s\n' "${_HZ_BASES[@]}"
+}
+
+# hot_zone_guarded_base <path> — print the known shared-parent base <path> is
+# or lies under, else nothing. Applies whether the path was resolved or named
+# by WV_HOT_ZONE: a path inside a shared base is unsafe either way.
+hot_zone_guarded_base() {
+    local path="${1%/}" candidate
+    [ -n "$path" ] || return 0
+    _hot_zone_bases
+    for candidate in "${_HZ_BASES[@]}"; do
+        candidate="${candidate%/}"
+        if [ "$path" = "$candidate" ] || [ "${path#"$candidate"/}" != "$path" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+}
+
+# resolve_bash_lock_dir <repo-hash> — the bash-dedup lock directory for a repo.
+# Per uid and guarded like a hot-zone base: the uid-less /tmp/weave-bash-locks
+# it replaces could be created first by another user (wv-80be32).
+resolve_bash_lock_dir() {
+    printf '/tmp/weave-bash-locks-%s/%s\n' "$UID" "$1"
+}
+
+# _hot_zone_owner_mode <path> — print "<uid> <octal mode>" of <path> itself,
+# never of a symlink's target (stat does not follow links by default).
+_hot_zone_owner_mode() {
+    case "${OSTYPE:-}" in
+        darwin*|*bsd*) stat -f '%u %Lp' -- "$1" 2>/dev/null ;;
+        *) stat -c '%u %a' -- "$1" 2>/dev/null ;;
+    esac
+}
+
+# hot_zone_dir_problem <path> [<alias-target>] — print why <path> may not be a
+# hot-zone base, or nothing when it may. An absent path is not a problem: the
+# caller creates it. A symlink is refused unless <alias-target> is given, the
+# link is this uid's, it points exactly at <alias-target>, and the target
+# passes the same check (the one alias a rename migration may leave, wv-95bddf).
+# An absent target is, like an absent path, for hot_zone_ensure to create: a
+# removed legacy directory must not leave the neutral name unusable.
+hot_zone_dir_problem() {
+    local path="$1" alias_target="${2:-}" meta owner mode target
+    if [ -L "$path" ]; then
+        if [ -z "$alias_target" ]; then
+            echo "is a symlink"
+            return 0
+        fi
+        meta=$(_hot_zone_owner_mode "$path")
+        owner="${meta%% *}"
+        if [ "$owner" != "$UID" ]; then
+            echo "is a symlink owned by uid ${owner:-unknown}, not ${UID}"
+            return 0
+        fi
+        target=$(readlink -- "$path" 2>/dev/null)
+        if [ "$target" != "$alias_target" ]; then
+            echo "is a symlink to ${target:-nothing}, not ${alias_target}"
+            return 0
+        fi
+        [ -e "$alias_target" ] || [ -L "$alias_target" ] || return 0
+        if [ -L "$alias_target" ]; then
+            echo "is a symlink to ${alias_target}, which is not a real directory"
+            return 0
+        fi
+        meta=$(hot_zone_dir_problem "$alias_target")
+        [ -n "$meta" ] && echo "is a symlink to ${alias_target}, which ${meta}"
+        return 0
+    fi
+    [ -e "$path" ] || return 0
+    if [ ! -d "$path" ]; then
+        echo "is not a directory"
+        return 0
+    fi
+    meta=$(_hot_zone_owner_mode "$path")
+    owner="${meta%% *}"
+    mode="${meta##* }"
+    if [ -z "$meta" ] || ! [[ "$mode" =~ ^[0-7]+$ ]]; then
+        echo "could not be inspected"
+    elif [ "$owner" != "$UID" ]; then
+        echo "is owned by uid ${owner}, not ${UID}"
+    elif (( 8#$mode & 8#022 )); then
+        echo "is writable by group or others (mode ${mode})"
+    fi
+}
+
+# hot_zone_report_problem <base> <problem> — explain a refused base on stderr.
+hot_zone_report_problem() {
+    local base="$1" problem="$2"
+    echo "wv: refusing to use hot-zone base ${base}: it ${problem}." >&2
+    echo "    Another local user who controls it could swap this repository's graph for theirs (wv-80be32)." >&2
+    case "$problem" in
+        "is writable by group or others"*)
+            echo "    It is yours: run  chmod go-w '${base}'  and retry." >&2 ;;
+        *)
+            echo "    Remove it as its owner or root, or set WV_HOT_ZONE to a private directory." >&2 ;;
+    esac
+}
+
+# hot_zone_check <hot-zone> — return 1, after explaining, when the hot zone's
+# guarded base exists and fails hot_zone_dir_problem. One stat per call.
+hot_zone_check() {
+    local base problem
+    base=$(hot_zone_guarded_base "$1")
+    [ -n "$base" ] || return 0
+    _hot_zone_pair "$base"
+    problem=$(hot_zone_dir_problem "$base" "$_HZ_ALIAS_TARGET")
+    [ -z "$problem" ] && return 0
+    hot_zone_report_problem "$base" "$problem"
+    return 1
+}
+
+# _hot_zone_symlink <target> <name> — create <name> -> <target>, never following
+# or entering whatever <name> already is (wv-5cd5a4). The callers check that
+# <name> is absent first, but another process can create it in between, and a
+# plain ln -s then treats the new alias (a link to a directory) as a destination
+# directory: two first uses racing left legacy/weave-codex-<uid> -> legacy.
+# -n refuses to follow an existing link and GNU -T an existing directory, so a
+# loser fails with EEXIST and its caller judges what is there instead.
+_hot_zone_symlink() {
+    case "${OSTYPE:-}" in
+        linux*) ln -snT -- "$1" "$2" 2>/dev/null ;;
+        *) ln -sn -- "$1" "$2" 2>/dev/null ;;
+    esac
+}
+
+# _hot_zone_mkdir <path> [<alias-target>] — create one directory, mode 700,
+# and verify what is there afterwards without following links. A path that
+# already exists, or that another process creates first, gets the same
+# verification. With <alias-target> (the neutral name, wv-95bddf), an absent
+# <path> becomes a symlink to <alias-target>, which is created first: the
+# neutral name is never created as a real directory while old binaries can
+# still create the legacy one beside it.
+_hot_zone_mkdir() {
+    local path="$1" alias_target="${2:-}" problem
+    if [ -n "$alias_target" ] && [ -L "$path" ] && [ ! -e "$alias_target" ] && [ ! -L "$alias_target" ]; then
+        # The alias outlived its legacy directory: recreate the directory.
+        problem=$(_hot_zone_mkdir "$alias_target")
+        if [ -n "$problem" ]; then
+            echo "would alias ${alias_target}, which ${problem}"
+            return 0
+        fi
+    elif [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        if [ -n "$alias_target" ]; then
+            problem=$(_hot_zone_mkdir "$alias_target")
+            if [ -n "$problem" ]; then
+                echo "would alias ${alias_target}, which ${problem}"
+                return 0
+            fi
+            _hot_zone_symlink "$alias_target" "$path" || true
+        else
+            ( umask 077 && mkdir -- "$path" ) 2>/dev/null || true
+        fi
+    fi
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        echo "could not be created"
+        return 0
+    fi
+    hot_zone_dir_problem "$path" "$alias_target"
+}
+
+# hot_zone_ensure <path> — create <path> for use. Under a guarded base, the
+# base and the per-repo directory below it are each created with mkdir under
+# umask 077 and verified without following links; anything deeper is inside a
+# verified directory of ours and is created 700 in one step. Any failure is
+# explained and returns 1, and nothing is chmodded. Outside a guarded base (a
+# WV_HOT_ZONE the caller chose), <path> is created 700 as before.
+hot_zone_ensure() {
+    local path="${1%/}" base rest leaf problem
+    [ -n "$path" ] || return 1
+    base=$(hot_zone_guarded_base "$path")
+    if [ -z "$base" ]; then
+        # An explicit status: a bare return in a function called from a trap
+        # (wv_finalize on EXIT) returns the status from before the trap.
+        ( umask 077 && mkdir -p -- "$path" )
+        return $?
+    fi
+    _hot_zone_pair "$base"
+    problem=$(_hot_zone_mkdir "$base" "$_HZ_ALIAS_TARGET")
+    if [ -n "$problem" ]; then
+        hot_zone_report_problem "$base" "$problem"
+        return 1
+    fi
+    # The legacy directory in use and no neutral name yet: add the alias, so
+    # the next resolution reaches this directory by the neutral name. Best
+    # effort; whatever is there instead, including an alias another process
+    # created first, is judged when it is resolved.
+    if [ -n "$_HZ_ALIAS_NAME" ] && [ ! -e "$_HZ_ALIAS_NAME" ] && [ ! -L "$_HZ_ALIAS_NAME" ]; then
+        _hot_zone_symlink "$base" "$_HZ_ALIAS_NAME" || true
+    fi
+    [ "$path" = "$base" ] && return 0
+    rest="${path#"$base"/}"
+    leaf="${base}/${rest%%/*}"
+    problem=$(_hot_zone_mkdir "$leaf")
+    if [ -n "$problem" ]; then
+        echo "wv: refusing to use hot zone ${leaf}: it ${problem} (wv-80be32)." >&2
+        return 1
+    fi
+    [ "$path" = "$leaf" ] && return 0
+    ( umask 077 && mkdir -p -- "$path" )
+}
+
+# _hot_zone_repo_hash <repo-root> — the per-repo directory name. Must match
+# weave_gh/data.py _repo_hash: md5 of the path plus echo's newline.
+_hot_zone_repo_hash() {
+    echo "$1" | md5sum | cut -c1-8
+}
+
+# resolve_hot_zone [<repo-root>] — print the hot-zone base for this process.
+#
+# Linux placement (owner ruling 2026-10-06, wv-b831e3): the zone already
+# holding a non-empty brain.db for this repository is the authority, whichever
+# zone that is. When none does, every process -- human shell, agent, container
+# -- uses the /tmp zone. Which process starts first after a boot no longer
+# decides, and neither does an agent marker. When more than one zone holds
+# one, this explains on stderr, still prints the /tmp zone (hooks keep a path
+# for their session files), and returns 1; wv refuses to run on that.
+# Without a repository root, the /tmp zone. Which of the /tmp zone's two names
+# is printed, and when its two names are refused, is set out above
+# _hot_zone_tmp_names (wv-95bddf).
 resolve_hot_zone() {
     if [ -n "${WV_HOT_ZONE:-}" ]; then
         echo "${WV_HOT_ZONE}"
-        return
+        return 0
     fi
 
-    # Per-UID fallback dirs avoid shared-parent /tmp/weave races on multi-user
-    # hosts (security review L1, 2026-04-19). /dev/shm/weave still uses the
-    # classic name because /dev/shm is already 1777 and weave creates its own
-    # 700-mode subdir there.
-    local uid
-    local min_shm_kb="${WV_MIN_SHM:-102400}"
+    local repo_root="${1:-}" uid="${UID}"
     local weave_dir="${WEAVE_DIR:-${WV_PROJECT_DIR:-$PWD}/.weave}"
-
-    uid=$(id -u 2>/dev/null || echo "$UID")
-    case "$(uname -s)" in
-        Linux*)
-            # NOTE: `/tmp/weave-codex-${uid}` is the shared SANDBOXED-RUNTIME zone for
-            # ALL sandboxed harnesses — Codex, Copilot, AND Claude Code (which trips
-            # is_sandboxed_runtime via CLAUDE_CODE_SSE_PORT). The `-codex` name is
-            # historical (Codex-first-class era), not a Codex-only marker. Only a
-            # non-sandboxed native/human shell uses /dev/shm/weave below. Do not assume
-            # "Claude Code -> /dev/shm"; placement follows is_sandboxed_runtime.
-            if is_sandboxed_runtime; then
-                echo "/tmp/weave-codex-${uid}"
-            elif [ -d "/tmp/weave-codex-${uid}" ]; then
-                # Follow an already-established sandbox zone even without the env
-                # signal. The CLI/sync (which see CLAUDE_CODE_SSE_PORT) create this
-                # dir; harness-spawned hooks lack that env var, so without this they
-                # split to /dev/shm and never see the CLI's phase/DB. Keying off the
-                # dir's existence is a filesystem signal both contexts share. (wv-d6af2f)
-                echo "/tmp/weave-codex-${uid}"
-            elif is_container; then
-                echo "wv: container detected, using /tmp (safe default)" >&2
-                echo "/tmp/weave-${uid}"
-            elif [ -d "/dev/shm" ] && [ -w "/dev/shm" ] && check_free_space "/dev/shm"; then
-                echo "/dev/shm/weave"
-            else
-                [ -d "/dev/shm" ] && [ -w "/dev/shm" ] && \
-                    echo "wv: /dev/shm has <${min_shm_kb}KB free, falling back to /tmp" >&2
-                echo "/tmp/weave-${uid}"
-            fi
-            ;;
-        Darwin*)
+    case "${OSTYPE:-}" in
+        linux*) ;;
+        darwin*)
             echo "${TMPDIR:-/tmp}/weave-${uid}"
-            ;;
-        MINGW*|CYGWIN*|MSYS*)
+            return 0 ;;
+        msys*|cygwin*|win32*)
             echo "${TEMP:-/tmp}/weave-${uid}"
-            ;;
+            return 0 ;;
         *)
             echo "$weave_dir"
-            ;;
+            return 0 ;;
+    esac
+
+    _hot_zone_linux_zones
+    local default_zone="${_HZ_ZONES[0]}"
+    if [ -z "$repo_root" ] || [ "$repo_root" = "/" ]; then
+        echo "$default_zone"
+        return 0
+    fi
+    if [ -n "$_HZ_TMP_CONFLICT" ]; then
+        {
+            echo "wv: refusing to choose a hot zone: ${_HZ_NEUTRAL} and ${_HZ_LEGACY} are separate directories and both hold databases (wv-95bddf)."
+            echo "    Until a relocation, the neutral name may only be a symlink to the legacy directory. Databases found:"
+            _hot_zone_inventory "$_HZ_NEUTRAL" "$_HZ_LEGACY"
+            _hot_zone_inventory "$_HZ_LEGACY" "$_HZ_NEUTRAL"
+            echo "    Remove nothing yet: each may be the only copy of its repository's graph, and they need not be this repository's."
+            echo "    1. Stop every wv process and agent session on this host."
+            echo "    2. Back up every database listed, outside both zones: sqlite3 <brain.db> \".backup '<file>'\" (never cp)."
+            echo "    3. A repository in both zones has two copies that may have diverged, and syncing both does not merge"
+            echo "       them (wv-a73141). Run wv hotzone diff <legacy copy> <neutral copy>, carry every change the legacy"
+            echo "       copy lacks into it with WV_HOT_ZONE=<legacy hash dir> wv ...; rerun it until every difference left is one you chose to drop."
+            echo "    4. In each repository listed, run WV_HOT_ZONE=<its hash dir, the legacy one if in both> wv sync."
+            echo "    5. Only then remove ${_HZ_NEUTRAL}; the legacy directory stays the authority, and wv load rebuilds"
+            echo "       the rest from .weave/. The backups are the way back if a step went wrong."
+        } >&2
+        echo "$default_zone"
+        return 1
+    fi
+    local repo_hash zone
+    local -a holders=()
+    repo_hash=$(_hot_zone_repo_hash "$repo_root")
+    for zone in "${_HZ_ZONES[@]}"; do
+        [ -s "${zone}/${repo_hash}/brain.db" ] && holders+=("$zone")
+    done
+    case "${#holders[@]}" in
+        0) echo "$default_zone" ;;
+        1) echo "${holders[0]}" ;;
+        *)
+            echo "wv: refusing to choose a database: ${repo_root} has one in more than one hot zone (wv-b831e3):" >&2
+            for zone in "${holders[@]}"; do
+                echo "    ${zone}/${repo_hash}/brain.db" >&2
+            done
+            {
+                echo "    Remove nothing yet: the copies may have diverged, and syncing both does not merge them (wv-a73141)."
+                echo "    1. Stop every wv process and agent session on this host."
+                echo "    2. Back up each, outside every zone: sqlite3 <brain.db> \".backup '<file>'\" (never cp)."
+                echo "    3. Run wv hotzone diff <copy you keep> <other copy>; carry every change the kept copy lacks into it"
+                echo "       with WV_HOT_ZONE=<zone>/${repo_hash} wv ...; rerun it until every difference left is one you chose to drop."
+                echo "    4. WV_HOT_ZONE=<zone of the kept copy>/${repo_hash} wv sync, then remove the other <zone>/${repo_hash}."
+            } >&2
+            echo "$default_zone"
+            return 1 ;;
     esac
 }
 
@@ -266,10 +664,8 @@ resolve_repo_hot_zone() {
 
     local base_hot_zone="${1:-}"
     local repo_root="${2:-${WV_PROJECT_DIR:-}}"
+    local rc=0
 
-    if [ -z "$base_hot_zone" ]; then
-        base_hot_zone=$(resolve_hot_zone)
-    fi
     if [ -z "$repo_root" ]; then
         repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
         # Reject home dir — same boundary as wv-config.sh.
@@ -277,14 +673,17 @@ resolve_repo_hot_zone() {
             repo_root=""
         fi
     fi
+    if [ -z "$base_hot_zone" ]; then
+        # Placement is per repository (wv-b831e3); a conflict is passed on.
+        base_hot_zone=$(resolve_hot_zone "$repo_root") || rc=$?
+    fi
 
     if [ -n "$repo_root" ] && [ "$repo_root" != "/" ]; then
-        local repo_hash
-        repo_hash=$(echo "$repo_root" | md5sum | cut -c1-8)
-        echo "${base_hot_zone}/${repo_hash}"
+        echo "${base_hot_zone}/$(_hot_zone_repo_hash "$repo_root")"
     else
         echo "$base_hot_zone"
     fi
+    return "$rc"
 }
 
 resolve_unix_clock_parts() {

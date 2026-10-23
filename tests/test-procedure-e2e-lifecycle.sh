@@ -12,10 +12,17 @@
 # (install changes only CONFIG_DIR; consumer projections change only on --update)
 # across every adapter (claude skill, codex contract, copilot instructions).
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 TMP=$(mktemp -d)
 trap 'cd /tmp; rm -rf "$TMP"' EXIT
+# Every wv this suite runs works on its fixture repository; its hot zone goes
+# under $TMP through the resolver's test root. With default placement each run
+# left a directory in the LIVE hot zone owned by the deleted $TMP/repo
+# (wv-e200f6).
+export WV_TEST_MODE=1 WV_TEST_HOT_ZONE_ROOT="$TMP/zones"
+mkdir -p "$TMP/zones/tmp"
 
 SOURCE="$TMP/source"
 CONFIG="$TMP/config"
@@ -38,8 +45,9 @@ mkdir -p "$SOURCE" "$REPO"
 # running at the time. A file that appears or vanishes mid-copy fails cp, and
 # under set -e that ends the suite before its first assertion -- which is how
 # this pair reported 0/0 in the aggregate while passing standalone.
+# Amp review/measurement scratch is volatile too (wv-9c0896).
 rsync -a --exclude=.git --exclude=.weave --exclude=node_modules \
-    --exclude=__pycache__ --exclude=dist "$ROOT/" "$SOURCE/"
+    --exclude=__pycache__ --exclude=dist --exclude='/.amp/in/' "$ROOT/" "$SOURCE/"
 
 # Fixture procedure declaring all three adapters. The version marker is embedded
 # in BOTH the body (observable in the claude skill) AND the description (observable

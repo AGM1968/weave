@@ -11,6 +11,7 @@
 # gate and its --force override, and the interactive confirmation prompt.
 
 set -eu
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 export WV_CALL_SOURCE=test
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,7 +58,7 @@ json_out=$("$WV" cutover --yes --json 2>/dev/null) || rc=$?
 # ─────────────────────────────────────────────────────────────────────────
 echo "--- do tracked work to advance lineage ---"
 id1=$("$WV" add "cutover node one" --status=active --criteria=c --risks=low 2>&1 | grep -oE 'wv-[a-f0-9]{6}' | head -1)
-"$WV" done "$id1" --skip-verification >/dev/null 2>&1 || true
+"$WV" "done" "$id1" --skip-verification >/dev/null 2>&1 || true
 "$WV" sync >/dev/null 2>&1
 seq_now=$(sqlite3 "$WV_DB" "SELECT COALESCE(MAX(lineage_seq),0) FROM nodes;" 2>/dev/null || echo 0)
 [ "${seq_now:-0}" -ge 1 ] 2>/dev/null \
@@ -120,7 +121,7 @@ status_field=$(printf '%s' "$json_out" | python3 -c "import json,sys; print(json
 # ─────────────────────────────────────────────────────────────────────────
 echo "--- --force restamps at the current high-water ---"
 id2=$("$WV" add "cutover node two" --status=active --criteria=c --risks=low 2>&1 | grep -oE 'wv-[a-f0-9]{6}' | head -1)
-"$WV" done "$id2" --skip-verification >/dev/null 2>&1 || true
+"$WV" "done" "$id2" --skip-verification >/dev/null 2>&1 || true
 "$WV" sync >/dev/null 2>&1
 rc=0
 out=$("$WV" cutover --yes --force 2>&1) || rc=$?
@@ -146,7 +147,7 @@ out=$("$WV" cutover --yes --force 2>&1) || rc=$?
 [ "$rc" -eq 0 ] && [ -f "$marker" ] \
     && ok "--force overrides the active-claim coordination gate" \
     || bad "--force should override the claim gate (rc=$rc): $out"
-"$WV" done "$id3" --skip-verification >/dev/null 2>&1 || true
+"$WV" "done" "$id3" --skip-verification >/dev/null 2>&1 || true
 
 # ─────────────────────────────────────────────────────────────────────────
 echo "--- interactive confirmation prompt ---"

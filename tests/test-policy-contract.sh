@@ -4,6 +4,7 @@
 # a scratch copy of the tree, never the real one.
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOL="$ROOT/scripts/weave_policy.py"
@@ -22,7 +23,16 @@ fresh() {
   cp -r "$ROOT/contracts" "$TMP/t/contracts"
   cp -r "$ROOT/scripts/lib" "$ROOT/scripts/cmd" "$TMP/t/scripts/"
   cp "$ROOT/scripts/wv" "$TMP/t/scripts/wv"
+  cp -r "$ROOT/scripts/hooks" "$TMP/t/scripts/hooks"
   cp -r "$ROOT/.claude/hooks" "$TMP/t/.claude/hooks"
+}
+passes() {  # passes <label>: validation must still succeed
+  if python3 "$TOOL" validate --root "$TMP/t" --contract "$TMP/t/contracts/policy-rules-v1.json" \
+      --schema "$TMP/t/contracts/policy-rules-v1.schema.json" >/dev/null 2>&1; then
+    ok "$1"
+  else
+    bad "$1"
+  fi
 }
 check() {  # check <expected-substring> <label>: validation must fail naming it
   local out
@@ -50,7 +60,7 @@ if python3 "$TOOL" validate --json > "$TMP/report.json"; then
 else
   bad "the contract validates against the code as it stands"; jq -r '.errors[]' "$TMP/report.json" >&2
 fi
-jq -e '.detected.sqlite_trigger > 0 and .detected.host_hook > 0 and .detected.emitted_verdicts > 0' \
+jq -e '.detected.sqlite_trigger > 0 and .detected.host_hook > 0 and .detected.git_hook > 0 and .detected.emitted_verdicts > 0' \
   "$TMP/report.json" >/dev/null \
   && ok "the completeness scan finds sites in every detectable class (it is not vacuously valid)" \
   || bad "the completeness scan finds sites in every detectable class (it is not vacuously valid)"
@@ -60,6 +70,30 @@ check "SQLite abort claimed by no rule" "a new SQLite abort that no rule claims 
 
 fresh; printf 'jq -n %s\n' "'{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\"}}'" >> "$TMP/t/.claude/hooks/stop-check.sh"
 check "hook denial claimed by no rule" "a new hook denial that no rule claims fails validation"
+
+# GIT HOOKS ARE A PROVEN OWNER (wv-3477f0): a git hook refuses by exiting
+# non-zero, and every such exit must be claimed by a rule or a category.
+fresh; printf '[ -f /nonexistent ] && exit 1\n' >> "$TMP/t/scripts/hooks/pre-commit-weave.sh"
+check "git hook refusal claimed by no rule" "a new pre-commit refusal that no rule claims fails validation"
+# The final launch-order refusal has a declared anchor; plant this distinct
+# refusal beyond its window, not accidentally inside the declared site's span.
+fresh; { printf '    :\n%.0s' $(seq 1 12); printf 'if false; then\n    exit "$rc"\nfi\n'; } \
+  >> "$TMP/t/scripts/hooks/pre-push-weave.sh"
+check "git hook refusal claimed by no rule" "a variable-status exit in pre-push is a refusal too"
+# Planted in a function of its own, past the anchor window of every claimed site.
+fresh; { printf '_probe() {\n'; printf '    :\n%.0s' $(seq 1 12); printf '    some_step || exit 1\n}\n'; } \
+  >> "$TMP/t/scripts/lib/wv-gate-pool.sh"
+check "git hook refusal claimed by no rule" "the suite pool the hooks source is scanned as well"
+fresh; printf 'echo "(exit $rc, 3s)"\nexit 0\n' >> "$TMP/t/scripts/hooks/pre-commit-weave.sh"
+passes "an exit status quoted in a message, and exit 0, are not refusals"
+# Source-only blocks never ship (wv-1c1e15), so the contract, which ships, does
+# not claim what they refuse; their markers must still balance.
+fresh; printf '# BEGIN source-only: probe\n[ -f /nonexistent ] && exit 1\n# END source-only\n' >> "$TMP/t/scripts/hooks/pre-push-weave.sh"
+passes "a refusal inside a source-only block is outside the contract, as it is outside the release"
+fresh; printf '# BEGIN source-only: probe\n' >> "$TMP/t/scripts/hooks/pre-push-weave.sh"
+check "is never closed" "an unclosed source-only block fails validation instead of hiding the rest of the hook"
+fresh; sed -i 's/Continue that work as yourself:/Carry on as yourself:/' "$TMP/t/scripts/hooks/pre-commit-weave.sh"
+check "occurs 0 time(s)" "the commit-admission site moving away from its anchor fails validation"
 
 fresh; printf '_probe() {\n    wv_attempt_emit policy_verdict \\\n        rule=invented_rule decision=deny\n}\n' >> "$TMP/t/scripts/cmd/wv-cmd-graph.sh"
 check "does not declare" "an emitted verdict naming an undeclared rule fails validation"
@@ -157,7 +191,7 @@ fi
 applies() { bash -c 'source "$1/scripts/lib/wv-policy-rules.sh"; _wv_policy_applicable "$2" "${3:-}"' _ "$ROOT" "$@"; }
 case " $(applies update) " in *" close_complexity_ceiling "*) ok "a transition applies to the operations it names via" ;;
   *) bad "a transition applies to the operations it names via" ;; esac
-case " $(applies done) " in *" edit_requires_active_node "*|*" close_requires_committed_work "*)
+case " $(applies "done") " in *" edit_requires_active_node "*|*" close_requires_committed_work "*)
   bad "host_event rules stay out of the in-call set" ;; *) ok "host_event rules stay out of the in-call set" ;; esac
 case " $(applies repo-class set) " in *" owned_override_requires_acknowledgement "*) ok "a suboperation scope applies to its suboperation" ;;
   *) bad "a suboperation scope applies to its suboperation" ;; esac
@@ -174,8 +208,26 @@ python3 - "$ROOT/contracts/policy-rules-v1.json" <<'PY' && ok "the contract decl
 import json, sys
 d = json.load(open(sys.argv[1]))["denominator"]
 assert d["unit"] == "wv_call" and d["requires_event"] == "call_started"
-assert [(e["kind"], e["decided_by"]) for e in d["excluded_scopes"]] == [("host_event", "wv-bd3041")]
+assert [(e["kind"], e["decided_by"]) for e in d["excluded_scopes"]] == [("host_event", "wv-bd3041"), ("git_event", "wv-3477f0")]
 PY
+# A git-hook rule decides outside any wv call: only a git_hook site may enforce
+# its git_event scope, it may not also be an in-call gate, and git hooks are
+# held to the same no-journal rule as host hooks.
+fresh; edit_contract '
+r = next(r for r in c["rules"] if r["rule_id"] == "commit_admission")
+r["sites"] = [dict(s, owner="host_hook") for s in r["sites"]]'
+check "an excluded git_event scope with no git_hook site" "a git_event scope must be enforced by a git_hook site"
+fresh; edit_contract '
+r = next(r for r in c["rules"] if r["rule_id"] == "commit_admission")
+r["sites"].append({"owner": "command_gate", "path": "scripts/cmd/wv-cmd-graph.sh", "anchor": "wv_policy_verdict block_graph_acyclic"})'
+check "outside the denominator but enforced in-call" "a git-hook rule may not also be an in-call gate"
+fresh; edit_contract 'c["denominator"]["excluded_scopes"].append(dict(c["denominator"]["excluded_scopes"][0], kind="mystery_event"))'
+check "which no out-of-call owner decides" "an exclusion must name a kind some out-of-call owner decides"
+fresh; printf 'WV_ATTEMPT_JOURNAL=/tmp/x wv status\n' >> "$TMP/t/scripts/hooks/pre-push-weave.sh"
+check "a hook writes the attempt journal" "a git hook that writes the attempt journal fails validation"
+case " $(bash -c 'source "$1/scripts/lib/wv-policy-rules.sh"; _wv_policy_applicable "$2"' _ "$ROOT" "done") " in
+  *" commit_admission "*|*" push_requires_settled_e6_debt "*) bad "git_event rules stay out of the in-call set" ;;
+  *) ok "git_event rules stay out of the in-call set" ;; esac
 fresh; edit_contract 'c["denominator"]["excluded_scopes"].append(dict(c["denominator"]["excluded_scopes"][0], kind="operation"))'
 check "which decide inside a wv call" "an exclusion cannot reach scopes that decide inside a wv call"
 fresh; edit_contract '
@@ -192,11 +244,11 @@ check "bypasses the close receipt" "a close written as a bare UPDATE fails valid
 
 # wv-664b7f: a hook-owned rule names itself when its hook decides, with a
 # decision it declares, from a line a declared site claims.
-fresh; sed -i '/_hc_observe no_busy_wait_polling deny/d' "$TMP/t/.claude/hooks/bash-dedup.sh"
+fresh; sed -i '/_hc_observe no_busy_wait_polling deny/d' "$TMP/t/scripts/lib/wv-pre-tool-use.sh"
 check "no_busy_wait_polling: its hook decides without naming it" "a hook rule that stops observing itself fails validation"
 fresh; sed -i 's/_hc_observe read_size_budget deny/_hc_observe orphan_prevention deny/' "$TMP/t/scripts/lib/wv-hook-common.sh"
 check "observes orphan_prevention, which no host_hook site enforces" "a hook observing an in-call rule fails validation"
-fresh; sed -i 's/_hc_observe claim_premortem_advisory advisory/_hc_observe claim_premortem_advisory deny/' "$TMP/t/.claude/hooks/pre-claim-skills.sh"
+fresh; sed -i 's/_hc_observe claim_premortem_advisory advisory/_hc_observe claim_premortem_advisory deny/' "$TMP/t/scripts/lib/wv-pre-tool-use.sh"
 check "observes deny for claim_premortem_advisory" "a hook observing an undeclared decision fails validation"
 
 echo "Results: $pass/$run passed"

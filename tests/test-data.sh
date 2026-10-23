@@ -5,13 +5,17 @@ export WV_CALL_SOURCE=test
 # Weave-ID: wv-4b44
 
 set -e
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WV="$REPO_ROOT/scripts/wv"
 
 # Isolated test environment
-TEST_DIR=$(mktemp -d)
+SCRATCH=$(bash "$REPO_ROOT/scripts/lib/wv-scratch.sh")
+export TMPDIR="$SCRATCH"
+unset WV_SCRATCH_ROOT
+TEST_DIR="$SCRATCH/repo"
 export WV_HOT_ZONE="$TEST_DIR/hot"
 export WV_DB="$TEST_DIR/hot/brain.db"
 export WV_REQUIRE_LEARNING=0
@@ -173,7 +177,7 @@ assert_not_empty() {
 }
 
 cleanup() {
-    rm -rf "$TEST_DIR"
+    rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
 
@@ -277,7 +281,7 @@ old_node=$($WV add "Old completed task" | tail -1)
 new_node=$($WV add "Recent task" | tail -1)
 
 # Mark old node as done
-$WV done "$old_node" >/dev/null 2>&1
+$WV "done" "$old_node" >/dev/null 2>&1
 
 # Backdate the old node's updated_at to make it prunable
 sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-72 hours') WHERE id='$old_node';"
@@ -316,7 +320,7 @@ assert_contains "$show_new" "Recent task" "recent task not pruned"
 # Verify durable finding evidence is not pruned by generic done-node maintenance
 reset_db
 finding_node=$($WV add "Finding: durable evidence should remain live" --force --metadata='{"type":"finding","finding":{"violation_type":"test:gap"}}' | tail -1)
-$WV done "$finding_node" --skip-verification >/dev/null 2>&1
+$WV "done" "$finding_node" --skip-verification >/dev/null 2>&1
 sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-72 hours') WHERE id='$finding_node';"
 output=$($WV prune --age=48h --dry-run 2>&1)
 if ! grep -q -- "$finding_node" <<<"$output"; then
@@ -333,7 +337,7 @@ assert_equals "1" "$finding_count" "prune keeps durable finding node live"
 # Test prune with custom age
 reset_db
 node3=$($WV add "Task for age test" | tail -1)
-$WV done "$node3" >/dev/null 2>&1
+$WV "done" "$node3" >/dev/null 2>&1
 sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-10 days') WHERE id='$node3';"
 
 output=$($WV prune --age=7d --dry-run 2>&1)
@@ -350,7 +354,7 @@ assert_contains "$output" "No nodes to prune" "prune reports nothing to prune"
 reset_db
 gh_node=$($WV add "GH-linked task" | tail -1)
 $WV update "$gh_node" --metadata='{"gh_issue":9999}'
-$WV done "$gh_node" >/dev/null 2>&1
+$WV "done" "$gh_node" >/dev/null 2>&1
 sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-72 hours') WHERE id='$gh_node';"
 # Verify metadata is readable before prune
 gh_num=$(sqlite3 "$WV_DB" "SELECT json_extract(metadata, '\$.gh_issue') FROM nodes WHERE id='$gh_node';")
@@ -365,7 +369,7 @@ echo "Testing: unarchive command"
 
 reset_db
 prune_node=$($WV add "Old task for unarchive test" | tail -1)
-$WV done "$prune_node" >/dev/null 2>&1
+$WV "done" "$prune_node" >/dev/null 2>&1
 sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-72 hours') WHERE id='$prune_node';"
 $WV prune --age=48h >/dev/null 2>&1
 
@@ -754,7 +758,7 @@ $WV block "$node3" --by="$node2" >/dev/null 2>&1  # task blocked by feature
 $WV link "$node2" "$node1" --type=implements >/dev/null 2>&1  # feature implements epic
 
 # Mark one done with learning metadata
-$WV done "$node3" >/dev/null 2>&1
+$WV "done" "$node3" >/dev/null 2>&1
 $WV update "$node3" --metadata='{"type":"task","pattern":"check for null before access"}'
 
 # Sync
@@ -800,7 +804,7 @@ node3=$($WV add "Add unit tests for API" | tail -1)
 node4=$($WV add "Update documentation" | tail -1)
 
 # Mark one as done
-$WV done "$node1" >/dev/null 2>&1
+$WV "done" "$node1" >/dev/null 2>&1
 
 # Test reindex command
 output=$($WV reindex 2>&1)
@@ -940,6 +944,7 @@ CP_DIR=$(mktemp -d)
     export WV_HOT_ZONE="$CP_DIR/hz" \
            WV_DB="$CP_DIR/hz/brain.db" \
             WV_PROJECT_DIR="$CP_DIR" \
+           WEAVE_DIR="$CP_DIR/.weave" \
            WV_CHECKPOINT_INTERVAL=0 \
            WV_CHECKPOINT_PULL=0 \
            WV_SYNC_INTERVAL=0
@@ -1202,7 +1207,9 @@ SNAP_DIR=$(mktemp -d)
     # path used to source wv-cmd-data.sh next.
     _wv_config_lib="$REPO_ROOT/scripts/lib/wv-config.sh"
     _wv_cmd_data_lib="$REPO_ROOT/scripts/cmd/wv-cmd-data.sh"
+    # shellcheck source=/dev/null
     source "$_wv_config_lib" >/dev/null 2>&1 || true
+    # shellcheck source=/dev/null
     source "$_wv_cmd_data_lib" >/dev/null 2>&1
 
     sqlite3 "$WV_DB" "INSERT INTO nodes(id,text,status,created_at,updated_at) VALUES('wv-snap-a','before',1,1,1);"
@@ -1282,8 +1289,11 @@ FAIL_DIR=$(mktemp -d)
     _wv_config_lib="$REPO_ROOT/scripts/lib/wv-config.sh"
     _wv_delta_lib="$REPO_ROOT/scripts/lib/wv-delta.sh"
     _wv_cmd_data_lib="$REPO_ROOT/scripts/cmd/wv-cmd-data.sh"
+    # shellcheck source=/dev/null
     source "$_wv_config_lib" >/dev/null 2>&1 || true
+    # shellcheck source=/dev/null
     source "$_wv_delta_lib"
+    # shellcheck source=/dev/null
     source "$_wv_cmd_data_lib" >/dev/null 2>&1
     wv_delta_init "$WV_DB"
 
@@ -1345,6 +1355,7 @@ SQL
     # shadow/restore for a redefined function -- leaving wv_lineage_stamp
     # entirely undefined for every test that runs after this one. Re-source
     # the lib instead, which cleanly restores the real definition.
+    # shellcheck source=/dev/null
     source "$_wv_delta_lib"
 
     # --- Round 5 finding: a lineage-stamp failure discarded the WHOLE day's
@@ -1379,6 +1390,7 @@ SQL
     wv_lineage_stamp() { echo "SIMULATED lineage stamp failure" >&2; return 1; }
     _emit_rc3=0
     _wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "test-agent" >/dev/null 2>/tmp/wv-f5a-stderr.$$ || _emit_rc3=$?
+    # shellcheck source=/dev/null
     source "$_wv_delta_lib"
     _hist_count_after=$(find "$_v2_dir" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
     if [ "$_emit_rc3" -ne 0 ] && [ "$_hist_count_after" = "$_hist_count" ]; then
@@ -1415,6 +1427,7 @@ SQL
     _emit_rc5=0
     _wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "test-agent" >/dev/null 2>/tmp/wv-f5b-stderr.$$ || _emit_rc5=$?
     unset WV_DELTA_V2_STRICT
+    # shellcheck source=/dev/null
     source "$_wv_delta_lib"
     _sql_left=$(find "$WEAVE_DIR/deltas" -maxdepth 2 -name '*.sql' 2>/dev/null | wc -l | tr -d ' ')
     _json_left=$(find "$WEAVE_DIR/deltas" -name "$(printf '%012d' "$_expected_seq")-*.json*" 2>/dev/null | wc -l | tr -d ' ')
@@ -1458,6 +1471,7 @@ SQL
     _emit_rc6=0
     _wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "test-agent" >/dev/null 2>/tmp/wv-f5c-stderr.$$ || _emit_rc6=$?
     unset WV_DELTA_V2_STRICT
+    # shellcheck source=/dev/null
     source "$_wv_delta_lib"
     _other_survives=0
     [ -f "$_other_actor_sidecar" ] && _other_survives=1
@@ -1495,6 +1509,8 @@ SQL
         # same for every call and only $1 identifies the file.
         # shellcheck disable=SC2317
         mv() {
+            # _failglob is a glob by design: it picks which file's move fails.
+            # shellcheck disable=SC2254
             case "$1" in
                 $_failglob) return 1 ;;
                 *) command mv "$@" ;;
@@ -1641,6 +1657,7 @@ SQL
     # would ever reach wv_delta_reset. A subshell scopes both overrides
     # cleanly without touching the rest of the fixture.
     ( export WV_AUTO_SYNC=1 WV_DB_CUSTOM=""; auto_sync --force >/dev/null 2>/tmp/wv-freset-stderr.$$ ) || _sync_rc=$?
+    # shellcheck source=/dev/null
     source "$_wv_delta_lib"
     if [ "$_sync_rc" -ne 0 ] && [ ! -f "$WV_HOT_ZONE/.last_sync" ]; then
         echo -e "  ${GREEN}✓${NC} auto_sync does not stamp .last_sync when wv_delta_reset fails, so the throttle does not suppress a retry (deep-review finding)"
@@ -1975,7 +1992,7 @@ rm -f "$WEAVE_DIR/breadcrumbs.md"
 # is exactly the codex leak shape (scratch graph, real repo cwd).
 printf '# Trails\n\npre-existing trail body\n' > "$WEAVE_DIR/trails.md"
 leak_id=$($WV add "trail isolation probe" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
-$WV done "$leak_id" --no-warn >/dev/null 2>&1
+$WV "done" "$leak_id" --no-warn >/dev/null 2>&1
 leak_trails=$(cat "$WEAVE_DIR/trails.md" 2>/dev/null)
 assert_not_contains "$leak_trails" "Completed" "wv done with custom WV_DB does not append repo trail"
 assert_contains "$leak_trails" "pre-existing trail body" "repo trails.md content untouched by isolated done"
@@ -2149,6 +2166,7 @@ if [ -f "$tr_lib/cmd/wv-cmd-data.sh" ]; then
     cp -r "$tr_lib/cmd" "$tr_lib/cmd-body" 2>/dev/null || true
     sed -i 's|^        echo "## Health"$|        echo "## Health" >\&2|' "$tr_lib/cmd/wv-cmd-data.sh" || true
     # Body loss: the row emission FAILS outright, leaving the heading intact.
+    # shellcheck disable=SC2016  # the pattern matches literal $ in the source text it reads
     sed -i 's|^                echo "- \*\*\$nid\*\* (\$ntype): \$ntext"$|                false|' "$tr_lib/cmd-body/wv-cmd-data.sh" || true
 
     # An active node is required, or the Active Work section is never emitted
@@ -2676,7 +2694,7 @@ assert_contains "$_sync_out" "not a recognised value" "the rejection names the o
 # Without the master opt-in the hook is inert, so a stray value in a real
 # environment cannot divert a real sync. No stamps means no bypass happened.
 rm -f "$_syncdir/hz/.last_gh_sync" "$_syncdir/hz/.last_gh_sync_seq"
-"${_SY[@]}" WV_TEST_SYNC_STUB=ok "$WV" sync --gh </dev/null >/dev/null 2>&1 || true
+env -u WV_TEST_MODE "${_SY[@]}" WV_TEST_SYNC_STUB=ok "$WV" sync --gh </dev/null >/dev/null 2>&1 || true
 _sync_stamps=$(ls "$_syncdir/hz/.last_gh_sync" "$_syncdir/hz/.last_gh_sync_seq" 2>/dev/null | wc -l | tr -d ' ')
 assert_equals "0" "$_sync_stamps" "WV_TEST_SYNC_STUB is inert without WV_TEST_MODE=1"
 
@@ -2755,11 +2773,15 @@ assert_equals "|0" "$_lin_default" "a row written without lineage takes the dete
 
 # The columns must survive the snapshot, or they cannot travel between agents.
 _lin_dump=$(mktemp)
-WV_DB="$WV_DB" bash -c "
-    source '$REPO_ROOT/scripts/lib/wv-db.sh'
-    source '$REPO_ROOT/scripts/cmd/wv-cmd-data.sh'
-    dump_state_sql '$WV_DB' '$_lin_dump'
-" >/dev/null 2>&1 || true
+# Paths travel as arguments, not spliced into the script text, and are read
+# before sourcing (a sourced library may reset the positional parameters).
+_lin_db="$WV_DB"
+WV_DB="$_lin_db" bash -c '
+    root=$1 db=$2 out=$3
+    source "$root/scripts/lib/wv-db.sh"
+    source "$root/scripts/cmd/wv-cmd-data.sh"
+    dump_state_sql "$db" "$out"
+' _ "$REPO_ROOT" "$_lin_db" "$_lin_dump" >/dev/null 2>&1 || true
 _lin_in_dump=$(grep -c "lineage_seq" "$_lin_dump" 2>/dev/null || true)
 assert_equals "1" "$([ "${_lin_in_dump:-0}" -ge 1 ] && echo 1 || echo 0)" "lineage columns appear in dump_state_sql output"
 rm -f "$_lin_dump"

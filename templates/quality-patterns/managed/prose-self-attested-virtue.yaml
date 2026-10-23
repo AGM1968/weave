@@ -6,7 +6,7 @@ severity: info
 policy: always-on-shared
 maturity: promotable
 provenance: >-
-  wv-d74573 @nowcast (2026-07-29). A user correction on "honest interval"
+  wv-d74573 in a consumer graph (2026-07-29). A user correction on "honest interval"
   led to a repository sweep that found 12 instances across seven documents.
   Each adjudicated instance had a more precise technical replacement.
 message: >-

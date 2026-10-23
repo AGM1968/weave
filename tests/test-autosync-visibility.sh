@@ -22,6 +22,7 @@ export WV_CALL_SOURCE=test
 #     The failure is injected by making WEAVE_DIR unwritable, so auto_sync
 #     cannot create its state.sql temp file.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

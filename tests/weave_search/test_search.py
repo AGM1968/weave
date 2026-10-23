@@ -7,7 +7,9 @@ import json
 import sqlite3
 import struct
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -233,7 +235,13 @@ class TestVectorSearch:
         imports: list[str] = []
         real_import = builtins.__import__
 
-        def tracking_import(name, global_ns=None, local_ns=None, fromlist=(), level=0):
+        def tracking_import(
+            name: str,
+            global_ns: Mapping[str, object] | None = None,
+            local_ns: Mapping[str, object] | None = None,
+            fromlist: Sequence[str] = (),
+            level: int = 0,
+        ) -> ModuleType:
             if name in {"numpy", "model2vec"}:
                 imports.append(name)
             return real_import(name, global_ns, local_ns, fromlist, level)
@@ -314,7 +322,13 @@ class TestHybridSearch:
         imports: list[str] = []
         real_import = builtins.__import__
 
-        def tracking_import(name, global_ns=None, local_ns=None, fromlist=(), level=0):
+        def tracking_import(
+            name: str,
+            global_ns: Mapping[str, object] | None = None,
+            local_ns: Mapping[str, object] | None = None,
+            fromlist: Sequence[str] = (),
+            level: int = 0,
+        ) -> ModuleType:
             if name in {"numpy", "model2vec"}:
                 imports.append(name)
             return real_import(name, global_ns, local_ns, fromlist, level)

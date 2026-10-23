@@ -3,6 +3,7 @@
 # copy additions. Otherwise a removed procedure remains in CONFIG_DIR and keeps
 # projecting into consumer repos on later init/update runs.
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP=$(mktemp -d)
@@ -20,8 +21,9 @@ mkdir -p "$SOURCE" "$REPO"
 # running at the time. A file that appears or vanishes mid-copy fails cp, and
 # under set -e that ends the suite before its first assertion -- which is how
 # this pair reported 0/0 in the aggregate while passing standalone.
+# Amp review/measurement scratch is volatile too (wv-9c0896).
 rsync -a --exclude=.git --exclude=.weave --exclude=node_modules \
-    --exclude=__pycache__ --exclude=dist "$ROOT/" "$SOURCE/"
+    --exclude=__pycache__ --exclude=dist --exclude='/.amp/in/' "$ROOT/" "$SOURCE/"
 
 PROC="$SOURCE/templates/procedures/zzz-install-reconcile.md"
 ASSET="$SOURCE/templates/procedures/zzz-install-reconcile.txt"

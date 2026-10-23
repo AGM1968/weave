@@ -7,7 +7,7 @@ severity: info
 policy: always-on-shared
 maturity: promotable
 provenance: >-
-  AC-5 from earth-engine-analysis canary wv-7a8d45. Bare URLs produced
+  AC-5 from a consumer canary wv-7a8d45. Bare URLs produced
   unbreakable Pandoc output and overfull boxes while links and autolinks did not.
 message: >-
   Bare URL in prose. Use a Markdown link or angle-bracket autolink so renderers

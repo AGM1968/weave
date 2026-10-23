@@ -22,6 +22,14 @@
 # Constants
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Hot-zone directories are created through the base guard (wv-80be32). wv
+# loads the resolver first; a caller sourcing this file alone gets it from
+# beside this file (it has no side effects on source).
+if ! declare -F hot_zone_ensure >/dev/null; then
+    # shellcheck source=/dev/null
+    . "${BASH_SOURCE[0]%/*}/wv-resolve-runtime.sh"
+fi
+
 _WV_JOURNAL_FILE="${WV_HOT_ZONE}/ops.journal"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -42,8 +50,8 @@ _journal_ts() {
 # Args: JSON string (pre-formatted)
 _journal_append() {
     local line="$1"
-    # Ensure directory exists
-    mkdir -p "$(dirname "$_WV_JOURNAL_FILE")" 2>/dev/null || true
+    # Ensure directory exists, through the hot-zone base guard (wv-80be32)
+    [ -d "${_WV_JOURNAL_FILE%/*}" ] || hot_zone_ensure "${_WV_JOURNAL_FILE%/*}" 2>/dev/null || true
     printf '%s\n' "$line" >> "$_WV_JOURNAL_FILE"
 }
 
@@ -109,8 +117,11 @@ journal_complete() {
 
 # journal_end
 # Mark the current operation as fully complete. Unsets _WV_IN_JOURNAL.
+# A no-op when no operation is open: an exit trap that ends the journal again
+# after a path already did must not fail the command it guards (wv-b8abe2).
 #
 journal_end() {
+    [ -n "${_WV_CURRENT_OP_ID:-}" ] || return 0
     _journal_append "{\"event\":\"end\",\"op\":\"$_WV_CURRENT_OP_TYPE\",\"op_id\":\"$_WV_CURRENT_OP_ID\",\"ts\":\"$(_journal_ts)\"}" || return $?
 
     unset _WV_IN_JOURNAL

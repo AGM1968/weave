@@ -6,6 +6,7 @@ export WV_CALL_SOURCE=test
 # Weave-ID: wv-fc4ac2
 
 set -e
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -154,8 +155,8 @@ assert_contains "$FAIL_WARN" "could not classify orphan refs" "a failed classifi
 # 1. Without the master opt-in, a VALID value is inert: the real classifier
 #    runs, so the orphan is classified rather than forced to unknown, and no
 #    failure notice is printed.
-INERT_OUT=$(WV_TEST_FAIL_ORPHAN_KINDS=1 $WV commit-refs --json 2>/dev/null)
-INERT_ERR=$(WV_TEST_FAIL_ORPHAN_KINDS=1 $WV commit-refs --json 2>&1 >/dev/null)
+INERT_OUT=$(env -u WV_TEST_MODE WV_TEST_FAIL_ORPHAN_KINDS=1 $WV commit-refs --json 2>/dev/null)
+INERT_ERR=$(env -u WV_TEST_MODE WV_TEST_FAIL_ORPHAN_KINDS=1 $WV commit-refs --json 2>&1 >/dev/null)
 assert_equals "0" "$(echo "$INERT_OUT" | jq -r '.totals.orphaned_unknown')" \
     "a valid classifier value without WV_TEST_MODE=1 leaves classification real"
 case "$INERT_ERR" in
@@ -513,7 +514,7 @@ STALE=$("${GIT[@]}" rev-parse HEAD)
 sqlite3 "$WV_DB" "UPDATE nodes SET metadata = json_set('{}', '\$.commits', json_array('$STALE')) WHERE id='$CHILD';"
 sqlite3 "$WV_DB" "UPDATE nodes SET metadata = json_set('{}', '\$.commits', json_array('$LIVE')) WHERE id='$SECOND';"
 
-$WV done "$SECOND" --skip-verification >/dev/null 2>&1 || true
+$WV "done" "$SECOND" --skip-verification >/dev/null 2>&1 || true
 EPIC_COMMITS=$(sqlite3 "$WV_DB" "SELECT COALESCE(json_extract(metadata,'\$.commits'),'[]') FROM nodes WHERE id='$EPIC';")
 assert_contains "$EPIC_COMMITS" "$LIVE" "epic aggregates the live child ref"
 if [[ "$EPIC_COMMITS" == *"$STALE"* ]]; then

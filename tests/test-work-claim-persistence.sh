@@ -9,6 +9,7 @@ export WV_CALL_SOURCE=test
 # failing write here, because the defect is in how the result is read, not in
 # what made the write fail.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WV="$ROOT/scripts/wv"
 run=0; pass=0

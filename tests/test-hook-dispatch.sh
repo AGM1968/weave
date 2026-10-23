@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Focused regression coverage for the host-neutral hook dispatch facade.
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 # Every check below is silent, so a failure used to leave an empty log: the
 # rc.13 verify aggregate recorded exit 1 with no output at all. Name the line.
 trap 'echo "hook dispatch: FAILED at line $LINENO: $BASH_COMMAND" >&2' ERR

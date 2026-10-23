@@ -8,6 +8,7 @@
 # and -- until wv-cache.sh is migrated -- that the registry still agrees with the
 # live Bash lists it will replace.
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOL="$ROOT/scripts/weave_registry.py"
 REGISTRY="$ROOT/contracts/command-capabilities.json"

@@ -568,63 +568,69 @@ validateResponse(
 // done_criteria/risks/risk_level (node) and blocked_reason (envelope) were added to
 // cmd_context's actual output (wv-cccf70) -- bumping the schema/fixture together
 // wouldn't have caught that drift, so also sample a REAL `wv context --json
-// --mode=bootstrap` payload from the live graph and validate it against the same
-// contract. Node id and bounds are derived at runtime, not hard-coded, so this
-// doesn't pin the test to one node that could later be closed/deleted.
+// --mode=bootstrap` payload produced by the CLI under test and validate it against
+// the same contract.
+//
+// Fixture-first (wv-a160a4): the payload comes from a disposable graph seeded
+// here, never the ambient one. Sampling the ambient graph read the operator's live
+// graph in place, and opened a new live hot zone when the suite ran from any other
+// path. The seeded node carries what the drift was in: done_criteria, risks and
+// risk level, and a blocker, so the payload includes blockers and blocked_reason.
 {
   const wvBin = path.join(root, "scripts/wv");
-  // Sample the ambient graph when there is one -- a real node carries the
-  // richness this check exists for. When there is not, seed a disposable graph
-  // rather than fail: this suite is retained in the public projection, where
-  // the ambient graph is always empty, and "there is nothing to sample" is a
-  // property of the environment, not of the contract under test.
   const runWv = (args, env) =>
-    execFileSync(wvBin, args, { encoding: "utf8", env: { ...process.env, ...(env ?? {}) } });
-  let wvEnv = {};
-  let liveNodeId = JSON.parse(runWv(["query", "--limit=1", "--format=json"]))[0]?.id;
-  let seeded = null;
-  if (!liveNodeId) {
-    seeded = fs.mkdtempSync(path.join(os.tmpdir(), "ipc-contract-graph-"));
-    wvEnv = {
-      WV_PROJECT_DIR: seeded,
-      WV_HOT_ZONE: path.join(seeded, "hot"),
-      WEAVE_DIR: path.join(seeded, ".weave"),
-      WV_CONFIG_DIR: path.join(seeded, "config"),
-      WV_REQUIRE_LEARNING: "0",
-      WV_AGENT_ID: "ipc-contract-fixture",
-    };
+    execFileSync(wvBin, args, {
+      encoding: "utf8", env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"],
+    });
+  const seeded = fs.mkdtempSync(path.join(os.tmpdir(), "ipc-contract-graph-"));
+  const wvEnv = {
+    WV_PROJECT_DIR: seeded,
+    WV_HOT_ZONE: path.join(seeded, "hot"),
+    WV_DB: path.join(seeded, "hot", "brain.db"),
+    WEAVE_DIR: path.join(seeded, ".weave"),
+    WV_CONFIG_DIR: path.join(seeded, "config"),
+    WV_REQUIRE_LEARNING: "0",
+    WV_AUTO_CHECKPOINT: "0",
+    WV_AGENT_ID: "ipc-contract-fixture",
+    WV_CALL_LOG: "",
+  };
+  try {
     fs.mkdirSync(wvEnv.WV_CONFIG_DIR, { recursive: true });
     execFileSync("git", ["init", "-q", seeded]);
     execFileSync("git", ["-C", seeded, "config", "user.email", "test@test.com"]);
     execFileSync("git", ["-C", seeded, "config", "user.name", "Test"]);
     runWv(["init"], wvEnv);
-    // Criteria and risks on purpose: the drift this check caught last time was
-    // in exactly those fields, so an empty probe node would not have caught it.
-    runWv(
+    const idOf = (out) => out.match(/wv-[0-9a-f]{6}/)?.[0];
+    const liveNodeId = idOf(runWv(
       ["add", "ipc contract fixture", "--standalone",
        "--criteria=the contract payload carries done_criteria|and risks",
        "--risks=low"],
       wvEnv
+    ));
+    const blockerId = idOf(runWv(["add", "ipc contract blocker", "--standalone"], wvEnv));
+    assert(liveNodeId && blockerId, "live IPC contract check could not seed its fixture graph");
+    runWv(["block", liveNodeId, `--by=${blockerId}`], wvEnv);
+    const liveResult = JSON.parse(
+      runWv(["context", liveNodeId, "--json", "--mode=bootstrap"], wvEnv)
     );
-    liveNodeId = JSON.parse(runWv(["query", "--limit=1", "--format=json"], wvEnv))[0]?.id;
+    // Healthy control: the payload must carry the seeded richness, or the
+    // contract check below would validate a shape that never had it.
+    assert(liveResult.blockers.length >= 1, "seeded context payload carries no blocker");
+    const liveLimit = Math.max(10, Math.min(200, liveResult.blockers.length || 1));
+    const liveRequest = structuredClone(read(path.join(fixtures, "valid/context-request.json")));
+    liveRequest.payload.node_id = liveNodeId;
+    liveRequest.payload.limit = liveLimit;
+    const liveEnvelope = structuredClone(read(path.join(fixtures, "valid/context-response.json")));
+    liveEnvelope.result = liveResult;
+    liveEnvelope.bounds.limit = liveLimit;
+    liveEnvelope.bounds.returned = liveResult.blockers.length;
+    liveEnvelope.bounds.total_known = liveResult.blockers.length;
+    liveEnvelope.bounds.truncated = false;
+    liveEnvelope.bounds.continuation = null;
+    validateResponse(liveRequest, liveEnvelope, `live context response (${liveNodeId}, bootstrap mode)`);
+  } finally {
+    fs.rmSync(seeded, { recursive: true, force: true });
   }
-  assert(liveNodeId, "live IPC contract check could not obtain a node to sample");
-  const liveResult = JSON.parse(
-    runWv(["context", liveNodeId, "--json", "--mode=bootstrap"], wvEnv)
-  );
-  const liveLimit = Math.max(10, Math.min(200, liveResult.blockers.length || 1));
-  const liveRequest = structuredClone(read(path.join(fixtures, "valid/context-request.json")));
-  liveRequest.payload.node_id = liveNodeId;
-  liveRequest.payload.limit = liveLimit;
-  const liveEnvelope = structuredClone(read(path.join(fixtures, "valid/context-response.json")));
-  liveEnvelope.result = liveResult;
-  liveEnvelope.bounds.limit = liveLimit;
-  liveEnvelope.bounds.returned = liveResult.blockers.length;
-  liveEnvelope.bounds.total_known = liveResult.blockers.length;
-  liveEnvelope.bounds.truncated = false;
-  liveEnvelope.bounds.continuation = null;
-  validateResponse(liveRequest, liveEnvelope, `live context response (${liveNodeId}, bootstrap mode)`);
-  if (seeded) fs.rmSync(seeded, { recursive: true, force: true });
 }
 validateResponse(
   read(path.join(fixtures, "valid/preflight-request.json")),

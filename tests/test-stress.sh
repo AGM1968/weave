@@ -16,6 +16,7 @@ export WV_CALL_SOURCE=test
 #   1 - Unexpected test failures
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -91,6 +92,9 @@ trap 'teardown_test_env' EXIT
 # Test Helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Assertions record a failure and return 0: under set -e a nonzero return
+# ended the suite at its first failed assertion, so every later result and
+# the summary went unreported (wv-75e31a). TESTS_FAILED decides the exit.
 assert_equals() {
     local expected="$1"
     local actual="$2"
@@ -106,7 +110,7 @@ assert_equals() {
         echo "    Actual:   $actual"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         FAILURES+=("$message")
-        return 1
+        return 0
     fi
 }
 
@@ -125,7 +129,7 @@ assert_not_equals() {
         echo "    Actual:       $actual"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         FAILURES+=("$message")
-        return 1
+        return 0
     fi
 }
 
@@ -144,7 +148,7 @@ assert_contains() {
         echo "    In: $(echo "$haystack" | sed -n '1,5p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         FAILURES+=("$message")
-        return 1
+        return 0
     fi
 }
 
@@ -163,7 +167,7 @@ assert_not_contains() {
         echo "    In: $(echo "$haystack" | sed -n '1,5p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         FAILURES+=("$message")
-        return 1
+        return 0
     fi
 }
 
@@ -179,7 +183,7 @@ assert_success() {
         echo -e "  ${RED}✗${NC} $message (exit code: $exit_code)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         FAILURES+=("$message")
-        return 1
+        return 0
     fi
 }
 
@@ -195,7 +199,7 @@ assert_fails() {
         echo -e "  ${RED}✗${NC} $message (expected failure, got exit 0)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         FAILURES+=("$message")
-        return 1
+        return 0
     fi
 }
 
@@ -259,7 +263,7 @@ test_sync_roundtrip_fidelity() {
     id3=$(get_id "$("$WV" add "task with metadata" --metadata='{"key":"value","nested":{"a":1}}' 2>&1)")
     "$WV" link "$id2" "$id1" --type=implements >/dev/null 2>&1
     "$WV" link "$id3" "$id2" --type=implements >/dev/null 2>&1
-    "$WV" done "$id3" --learning="Test learning with 'quotes' and special chars" >/dev/null 2>&1
+    "$WV" "done" "$id3" --learning="Test learning with 'quotes' and special chars" >/dev/null 2>&1
 
     # Capture full state before round-trip
     local before_nodes before_edges
@@ -847,12 +851,14 @@ test_shell_metacharacters() {
     TESTS_PASSED=$((TESTS_PASSED + 1))
 
     # Backticks
+    # shellcheck disable=SC2016  # the literal backticks and $ are the node text under test
     "$WV" add 'Run `ls -la`' >/dev/null 2>&1 || true
     TESTS_RUN=$((TESTS_RUN + 1))
     echo -e "  ${GREEN}✓${NC} Backticks in node text"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 
     # Dollar sign
+    # shellcheck disable=SC2016  # the literal backticks and $ are the node text under test
     "$WV" add 'Costs $100' >/dev/null 2>&1 || true
     TESTS_RUN=$((TESTS_RUN + 1))
     echo -e "  ${GREEN}✓${NC} Dollar sign in node text"
@@ -997,7 +1003,7 @@ test_update_status_validation() {
     assert_fails "wv update rejects invalid status 'banana'" "$exit_code"
 
     # Valid statuses should work
-    for valid_status in todo active done blocked blocked-external; do
+    for valid_status in todo active "done" blocked blocked-external; do
         local v_exit=0
         "$WV" update "$id" --status="$valid_status" >/dev/null 2>&1 || v_exit=$?
         assert_equals "0" "$v_exit" "wv update accepts status=$valid_status" || true
@@ -1023,7 +1029,7 @@ test_add_status_validation() {
     assert_fails "wv add rejects status with quote-breakout payload" "$exit_code"
 
     # Valid statuses still work.
-    for valid_status in todo active done blocked blocked-external; do
+    for valid_status in todo active "done" blocked blocked-external; do
         local v_exit=0
         if [ "$valid_status" = "active" ]; then
             "$WV" add "m1 valid $valid_status" --status="$valid_status" \
@@ -1073,7 +1079,7 @@ test_prune_age_zero_guard() {
     for i in $(seq 1 5); do
         local id
         id=$(get_id "$("$WV" add "prune test $i" 2>&1)")
-        "$WV" done "$id" >/dev/null 2>&1
+        "$WV" "done" "$id" >/dev/null 2>&1
     done
 
     # Fixed: wv-bea8 — wv prune rejects zero/invalid age
@@ -1119,7 +1125,7 @@ test_ready_json_empty() {
     # All nodes done — ready should return []
     local id
     id=$(get_id "$("$WV" add "will be done" 2>&1)")
-    "$WV" done "$id" >/dev/null 2>&1
+    "$WV" "done" "$id" >/dev/null 2>&1
 
     # Fixed: wv-ab49 — wv ready --json returns [] when empty
     local result

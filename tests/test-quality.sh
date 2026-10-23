@@ -11,6 +11,7 @@ export WV_CALL_SOURCE=test
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Colors
 RED='\033[0;31m'
@@ -795,7 +796,7 @@ delta, before = d['delta'], d['baseline']['profile']
 # The signature: joins converted to terminators rather than into another
 # relationship. Sentences up, coordinators down, subordinate and phrase
 # continuations NOT taking up the slack, and the word count roughly flat.
-# Flatness is proportional -- dropping "and" costs a word per split, which is
+# Flatness is proportional -- dropping 'and' costs a word per split, which is
 # 0.07% of a 23k-word document and 5.6% of a small fixture.
 words_moved = abs(delta['words']) / max(before['words'], 1)
 ok = (delta['sentences'] > 0

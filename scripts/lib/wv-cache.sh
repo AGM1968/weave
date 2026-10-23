@@ -8,6 +8,14 @@
 # Context Cache Invalidation
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Hot-zone directories are created through the base guard (wv-80be32). wv
+# loads the resolver first; a caller sourcing this file alone gets it from
+# beside this file (it has no side effects on source).
+if ! declare -F hot_zone_ensure >/dev/null; then
+    # shellcheck source=/dev/null
+    . "${BASH_SOURCE[0]%/*}/wv-resolve-runtime.sh"
+fi
+
 invalidate_context_cache() {
     # Invalidate context cache for affected nodes when edges change
     # Called by: cmd_block, cmd_link, cmd_done, cmd_resolve, cmd_refs, cmd_prune
@@ -120,7 +128,8 @@ wv_run_cache_wrap() {
     local dispatch_func="$1"
     shift
 
-    mkdir -p "$WV_RUN_CACHE_DIR" 2>/dev/null || true
+    # Under the hot zone: create through the base guard (wv-80be32).
+    [ -d "$WV_RUN_CACHE_DIR" ] || hot_zone_ensure "$WV_RUN_CACHE_DIR" 2>/dev/null || true
 
     local key cache_file
     key=$(_wv_run_cache_key "$@")

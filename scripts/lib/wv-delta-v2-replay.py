@@ -64,6 +64,7 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 
@@ -93,14 +94,15 @@ CREATE TABLE IF NOT EXISTS tombstones (
 
 
 class IntegrityError(ValueError):
-    pass
+    """Raised when an operation, or the graph it is replayed into, fails an integrity check."""
 
 
 class UnsupportedVersion(ValueError):
-    pass
+    """Raised for an operation format, mutation kind or field this evaluator does not support."""
 
 
 def canonical(value: Any) -> str:
+    """Serialize a JSON-compatible value canonically (sorted keys, no whitespace) for hashing."""
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -119,10 +121,12 @@ def canonical(value: Any) -> str:
 
 
 def sha256_text(text: str) -> str:
+    """Hex SHA-256 of a text's UTF-8 bytes."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def read_op(path: Path) -> dict[str, Any]:
+    """Read one operation sidecar, which must be a JSON object."""
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -142,7 +146,7 @@ def _require_int(value: Any, label: str) -> int:
     return value
 
 
-def _validate_patch(patch: Any, field: str, validator) -> None:
+def _validate_patch(patch: Any, field: str, validator: Callable[[str, Any], None]) -> None:
     if not isinstance(patch, dict) or set(patch) != {"expected", "value"}:
         raise IntegrityError(f"invalid {field} patch")
     validator(field, patch["expected"])
@@ -150,6 +154,7 @@ def _validate_patch(patch: Any, field: str, validator) -> None:
 
 
 def validate_node_field_value(field: str, value: Any) -> None:
+    """Check a patched node field's value against that field's allowed values."""
     if field == "status":
         if value not in STATUSES:
             raise IntegrityError("invalid status value")
@@ -183,6 +188,7 @@ def weight_str(value: Any) -> str | None:
 
 
 def validate_edge_field_value(field: str, value: Any) -> None:
+    """Check a patched edge field's value against that field's allowed values."""
     if field == "weight":
         if not (value is None or isinstance(value, str)):
             raise IntegrityError("invalid weight value")
@@ -197,6 +203,7 @@ def validate_edge_field_value(field: str, value: Any) -> None:
 
 
 def validate_lineage(payload: dict[str, Any]) -> tuple[int, str]:
+    """Return the payload's (seq, actor) lineage, which must hold exactly those two keys."""
     lineage = payload.get("lineage")
     if not isinstance(lineage, dict) or set(lineage) != {"seq", "actor"}:
         raise IntegrityError("invalid lineage")
@@ -272,6 +279,7 @@ def _validate_patch_mutation(mutation: dict[str, Any], kind: str) -> None:
 
 
 def validate_op(op: dict[str, Any]) -> None:
+    """Validate an operation's envelope, payload, lineage and hash before it may be applied."""
     _validate_envelope(op)
 
     payload = op.get("payload")
@@ -296,6 +304,8 @@ def validate_op(op: dict[str, Any]) -> None:
         raise IntegrityError("unexpected payload keys")
 
     kind = mutation.get("kind")
+    if not isinstance(kind, str):
+        raise UnsupportedVersion("unsupported mutation")
     _validate_entity(entity, kind)
 
     if kind in ("node_create", "edge_create"):
@@ -321,6 +331,7 @@ def _validate_timestamp(value: Any) -> None:
 # ---------------------------------------------------------------------------
 
 def metadata_from_raw(raw: Any) -> dict[str, Any]:
+    """Parse a node's stored metadata JSON, treating anything but an object as empty."""
     if not raw:
         return {}
     try:
@@ -335,6 +346,7 @@ def _dumps(value: Any) -> str:
 
 
 def node_current_fields(conn: sqlite3.Connection, node_id: str) -> dict[str, Any] | None:
+    """Return a node's current CAS-relevant fields, or None if the node does not exist."""
     row = conn.execute(
         "SELECT status, metadata, text, alias FROM nodes WHERE id = ?", (node_id,)
     ).fetchone()
@@ -354,6 +366,7 @@ def node_current_fields(conn: sqlite3.Connection, node_id: str) -> dict[str, Any
 
 
 def edge_current_fields(conn: sqlite3.Connection, key: tuple[str, str, str]) -> dict[str, Any] | None:
+    """Return an edge's current weight and context, or None if the edge does not exist."""
     row = conn.execute(
         "SELECT weight, context FROM edges WHERE source = ? AND target = ? AND type = ?", key
     ).fetchone()
@@ -362,13 +375,27 @@ def edge_current_fields(conn: sqlite3.Connection, key: tuple[str, str, str]) -> 
     return {"weight": weight_str(row[0]), "context": row[1]}
 
 
-def _row_lineage(conn: sqlite3.Connection, table: str, where: str, params: tuple) -> tuple[int, str] | None:
+def _row_lineage(conn: sqlite3.Connection, table: str, where: str, params: tuple[Any, ...]) -> tuple[int, str] | None:
     row = conn.execute(
         f"SELECT lineage_seq, lineage_actor FROM {table} WHERE {where}", params
     ).fetchone()
     if row is None:
         return None
     return int(row[0]), row[1] or ""
+
+
+def _existing_row_lineage(conn: sqlite3.Connection, table: str, where: str,
+                          params: tuple[Any, ...]) -> tuple[int, str]:
+    """Lineage of a row the caller has just read as present.
+
+    The callers read the row's fields first, on the same connection, and
+    return early when it is missing, so a None here means the store changed
+    under the read: refuse rather than compare against nothing (wv-4dcf9c).
+    """
+    lineage = _row_lineage(conn, table, where, params)
+    if lineage is None:
+        raise IntegrityError(f"{table} row read as present has no lineage")
+    return lineage
 
 
 def _tombstone_lineage(conn: sqlite3.Connection, kind: str, ident: str) -> tuple[int, str] | None:
@@ -396,6 +423,7 @@ def _write_tombstone(conn: sqlite3.Connection, kind: str, ident: str, lineage: t
 # ---------------------------------------------------------------------------
 
 def apply_op(conn: sqlite3.Connection, op: dict[str, Any], cutover_seq: int | None) -> str:
+    """Apply one validated operation by mutation kind and return its outcome."""
     payload = op["payload"]
     mutation = payload["mutation"]
     kind = mutation["kind"]
@@ -429,12 +457,12 @@ def _lineage_after(candidate: tuple[int, str], current: tuple[int, str]) -> bool
     return current[0] == 0 or candidate > current
 
 
-def _apply_node_create(conn, node_id, row, lineage) -> str:
+def _apply_node_create(conn: sqlite3.Connection, node_id: str, row: dict[str, Any], lineage: tuple[int, str]) -> str:
     tomb = _tombstone_lineage(conn, "node", node_id)
-    if tomb is not None and not (lineage > tomb):
+    if tomb is not None and not lineage > tomb:
         return "skipped_superseded"
     current = node_current_fields(conn, node_id)
-    row_lineage = None if current is None else _row_lineage(conn, "nodes", "id = ?", (node_id,))
+    row_lineage = None if current is None else _existing_row_lineage(conn, "nodes", "id = ?", (node_id,))
     # Does this create actually win against the target row? A nonexistent
     # target always yields (a plain INSERT); an existing one only yields under
     # the same guard the caller checks below. Computed up front because the
@@ -445,7 +473,7 @@ def _apply_node_create(conn, node_id, row, lineage) -> str:
     # alias, and unlike the v1 SQL path there is no separate lineage-guarded
     # UPDATE to leave the steal half-done -- here it is fully committed before
     # the create's own guard is even evaluated.
-    target_wins = current is None or _lineage_after(lineage, row_lineage)
+    target_wins = row_lineage is None or _lineage_after(lineage, row_lineage)
     # The holder clause is checked separately from target_wins: the holder of
     # a contested alias is a DIFFERENT row from the target (an absent target
     # says nothing about the holder), so gating the clear on target_wins alone
@@ -526,11 +554,11 @@ def _apply_node_create(conn, node_id, row, lineage) -> str:
     return "applied"
 
 
-def _apply_node_patch(conn, node_id, fields, lineage) -> str:
+def _apply_node_patch(conn: sqlite3.Connection, node_id: str, fields: dict[str, Any], lineage: tuple[int, str]) -> str:
     current = node_current_fields(conn, node_id)
     if current is None:
         return "precondition_conflict"
-    row_lineage = _row_lineage(conn, "nodes", "id = ?", (node_id,))
+    row_lineage = _existing_row_lineage(conn, "nodes", "id = ?", (node_id,))
     if all(current[field] == patch["value"] for field, patch in fields.items()):
         # Already satisfied: no business field changes, but the row's own
         # lineage must still be advanced when this op is causally AFTER it
@@ -570,7 +598,7 @@ def _apply_node_patch(conn, node_id, fields, lineage) -> str:
     # nothing: SQLite drops the row from the partial index on its own.
     # `write_alias` tracks what actually lands in the SET list below; CAS
     # checks above already ran against the untouched `fields`.
-    write_alias = fields.get("alias")
+    write_alias: dict[str, object] | None = fields.get("alias")
     new_alias = write_alias["value"] if write_alias is not None else current["alias"]
     new_status = fields["status"]["value"] if "status" in fields else current["status"]
     old_status = current["status"]
@@ -645,9 +673,10 @@ def _apply_node_patch(conn, node_id, fields, lineage) -> str:
     return "applied"
 
 
-def _apply_edge_create(conn, key, ident, row, lineage) -> str:
+def _apply_edge_create(conn: sqlite3.Connection, key: tuple[str, str, str], ident: str, row: dict[str, Any],
+                       lineage: tuple[int, str]) -> str:
     tomb = _tombstone_lineage(conn, "edge", ident)
-    if tomb is not None and not (lineage > tomb):
+    if tomb is not None and not lineage > tomb:
         return "skipped_superseded"
     current = edge_current_fields(conn, key)
     weight_sql = None if row["weight"] is None else float(row["weight"])
@@ -658,7 +687,7 @@ def _apply_edge_create(conn, key, ident, row, lineage) -> str:
             (*key, weight_sql, row["context"], row["created_at"], lineage[0], lineage[1]),
         )
         return "applied"
-    row_lineage = _row_lineage(conn, "edges", "source = ? AND target = ? AND type = ?", key)
+    row_lineage = _existing_row_lineage(conn, "edges", "source = ? AND target = ? AND type = ?", key)
     same = current["weight"] == weight_str(row["weight"]) and current["context"] == row["context"]
     if same and row_lineage == lineage:
         return "already_satisfied"
@@ -672,11 +701,12 @@ def _apply_edge_create(conn, key, ident, row, lineage) -> str:
     return "applied"
 
 
-def _apply_edge_patch(conn, key, fields, lineage) -> str:
+def _apply_edge_patch(conn: sqlite3.Connection, key: tuple[str, str, str], fields: dict[str, Any],
+                      lineage: tuple[int, str]) -> str:
     current = edge_current_fields(conn, key)
     if current is None:
         return "precondition_conflict"
-    row_lineage = _row_lineage(conn, "edges", "source = ? AND target = ? AND type = ?", key)
+    row_lineage = _existing_row_lineage(conn, "edges", "source = ? AND target = ? AND type = ?", key)
     if all(current[field] == patch["value"] for field, patch in fields.items()):
         # See _apply_node_patch (round 4 finding 6): advance the row's own
         # lineage even when no field value changes, so a stale op below this
@@ -715,7 +745,8 @@ def _apply_edge_patch(conn, key, fields, lineage) -> str:
     return "applied"
 
 
-def _apply_delete(conn, tomb_kind, table, where, params, ident, lineage) -> str:
+def _apply_delete(conn: sqlite3.Connection, tomb_kind: str, table: str, where: str, params: tuple[Any, ...],
+                  ident: str, lineage: tuple[int, str]) -> str:
     row_lineage = _row_lineage(conn, table, where, params)
     if row_lineage is None:
         _write_tombstone(conn, tomb_kind, ident, lineage)
@@ -731,7 +762,7 @@ def _apply_delete(conn, tomb_kind, table, where, params, ident, lineage) -> str:
 # Batch
 # ---------------------------------------------------------------------------
 
-def _entity_key(entity: dict[str, Any]) -> tuple:
+def _entity_key(entity: dict[str, Any]) -> tuple[str, ...]:
     if entity.get("kind") == "node":
         return ("node", entity["id"])
     return ("edge", entity["source"], entity["target"], entity["type"])
@@ -792,7 +823,7 @@ def _create_field_value(kind: str, row: dict[str, Any], key: str) -> Any:
     if key in ("text", "status", "alias"):
         return row.get(key)
     meta = row.get("metadata")
-    meta = meta if isinstance(meta, dict) else {}
+    meta = meta if isinstance(meta, dict) else dict[str, object]()
     if key == "metadata":
         return meta
     if key == "claimed_by":
@@ -806,7 +837,7 @@ def _create_field_value(kind: str, row: dict[str, Any], key: str) -> Any:
 
 def _gather_lineage_entries(
     op_paths: list[Path],
-) -> tuple[list[tuple[str, str, str, tuple, tuple, dict[str, Any] | None]], dict[str, set[str]]]:
+) -> tuple[list[tuple[str, str, str, tuple[Any, ...], tuple[Any, ...], dict[str, Any] | None]], dict[str, set[str]]]:
     """Parse+validate every op for collision analysis.
 
     Every op is validated (hash, envelope, mutation shape) before it can ever
@@ -827,7 +858,7 @@ def _gather_lineage_entries(
     against a sibling patch's `expected`.
     """
     op_hashes: dict[str, set[str]] = {}
-    entries: list[tuple[str, str, str, tuple, tuple, dict[str, Any] | None]] = []
+    entries: list[tuple[str, str, str, tuple[Any, ...], tuple[Any, ...], dict[str, Any] | None]] = []
     for path in op_paths:
         try:
             op = read_op(path)
@@ -851,15 +882,15 @@ def _gather_lineage_entries(
             if op_id:
                 op_hashes.setdefault(op_id, set()).add(op_hash)
             entries.append((str(path), op_id, str(kind), entity_key, lineage, data))
-        except Exception:
-            continue
+        except (IntegrityError, UnsupportedVersion):
+            continue  # evaluate() re-validates and reports it
     return entries, op_hashes
 
 
 def _group_by_lineage(
-    entries: list[tuple[str, str, str, tuple, tuple, dict[str, Any] | None]],
+    entries: list[tuple[str, str, str, tuple[Any, ...], tuple[Any, ...], dict[str, Any] | None]],
     op_hashes: dict[str, set[str]],
-) -> dict[tuple, list[tuple[str, str, str, dict[str, Any] | None]]]:
+) -> dict[tuple[Any, ...], list[tuple[str, str, str, dict[str, Any] | None]]]:
     """Group entries by (entity, lineage), excluding hash-mismatched op_ids.
 
     Round 5 finding: an operation_id reused with a DIFFERENT hash is
@@ -875,7 +906,7 @@ def _group_by_lineage(
     always reaches evaluate()'s real, hard check instead.
     """
     mismatched_ids = {op_id for op_id, hashes in op_hashes.items() if len(hashes) > 1}
-    groups: dict[tuple, list[tuple[str, str, str, dict[str, Any] | None]]] = {}
+    groups: dict[tuple[Any, ...], list[tuple[str, str, str, dict[str, Any] | None]]] = {}
     for path_str, op_id, kind, entity_key, lineage, data in entries:
         if op_id and op_id in mismatched_ids:
             continue
@@ -914,7 +945,8 @@ def _create_patch_collision(
     return False, ""
 
 
-def _patch_patch_collision(fields_i: dict, fields_j: dict, column_map: dict) -> tuple[bool, str]:
+def _patch_patch_collision(fields_i: dict[str, Any], fields_j: dict[str, Any],
+                           column_map: dict[str, str]) -> tuple[bool, str]:
     """Two patches on the SAME (entity, lineage), checked column by column.
 
     Round 5 finding: comparing keys across ALL shared columns at once forced
@@ -925,8 +957,8 @@ def _patch_patch_collision(fields_i: dict, fields_j: dict, column_map: dict) -> 
     own key-and-expected transition on its own, not lumped in with every
     other shared column.
     """
-    cols_i = {column_map.get(f) for f in fields_i} - {None}
-    cols_j = {column_map.get(f) for f in fields_j} - {None}
+    cols_i = {c for f in fields_i if (c := column_map.get(f)) is not None}
+    cols_j = {c for f in fields_j if (c := column_map.get(f)) is not None}
 
     # Deep-review finding: two ops are only a safe, semantically-identical
     # duplicate -- not a real collision -- if they touch the EXACT SAME set
@@ -966,7 +998,9 @@ def _patch_patch_collision(fields_i: dict, fields_j: dict, column_map: dict) -> 
     return False, ""
 
 
-def _pair_collision(kind_i: str, fields_i: Any, kind_j: str, fields_j: Any, column_map: dict) -> tuple[bool, str]:
+def _pair_collision(
+    kind_i: str, fields_i: Any, kind_j: str, fields_j: Any, column_map: dict[str, str]
+) -> tuple[bool, str]:
     """Whether one (kind, fields) pair sharing an (entity, lineage) collides.
 
     (a) node_create/edge_create carries a `row`, not `expected`/`value`
@@ -1006,13 +1040,11 @@ def _pair_collision(kind_i: str, fields_i: Any, kind_j: str, fields_j: Any, colu
 
 
 def _group_collision_note(
-    members: list[tuple[str, str, str, dict[str, Any] | None]], column_map: dict
+    members: list[tuple[str, str, str, dict[str, Any] | None]], column_map: dict[str, str]
 ) -> str:
     """Pairwise scan of a lineage group; empty string if no pair collides."""
-    for i in range(len(members)):
-        for j in range(i + 1, len(members)):
-            _, id_i, kind_i, fields_i = members[i]
-            _, id_j, kind_j, fields_j = members[j]
+    for i, (_, id_i, kind_i, fields_i) in enumerate(members):
+        for _, id_j, kind_j, fields_j in members[i + 1:]:
             # A repeated operation_id is a legitimate duplicate/retry
             # (handled separately by evaluate()'s `seen` dedup), not a
             # collision -- it is not a SECOND op racing the first, it is the
@@ -1026,7 +1058,7 @@ def _group_collision_note(
 
 
 def _group_cycle_note(
-    members: list[tuple[str, str, str, dict[str, Any] | None]], column_map: dict
+    members: list[tuple[str, str, str, dict[str, Any] | None]], column_map: dict[str, str]
 ) -> str:
     """Detect a 3+-way cyclic expected/value chain the pairwise scan misses.
 
@@ -1120,6 +1152,7 @@ def evaluate(
     cutover_seq: int | None = None,
     strict: bool = False,
 ) -> dict[str, Any]:
+    """Replay operations into the graph in one transaction and return each one's outcome and whether it aborted."""
     # Multi-pass, fixed-point dispatch. Every op in one emission carries the
     # SAME lineage tuple by design (wv-cdb45a/wv-4a05e7's writer contract), so
     # a catalog can legitimately contain a genuine causal CHAIN for one entity
@@ -1153,7 +1186,7 @@ def evaluate(
     seen: dict[str, str] = {}
     results_by_path: dict[str, dict[str, Any]] = {}
     aborted = False
-    try:
+    try:  # pylint: disable=too-many-nested-blocks  # wv-237d25
         # Same-lineage collisions (round 4 finding 4) are resolved up front,
         # outside the fixed-point loop below: a colliding op has no
         # `expected` state it could ever converge to (that is what makes it
@@ -1270,6 +1303,7 @@ def check(op_paths: list[Path]) -> dict[str, Any]:
 
 
 def main(argv: list[str]) -> int:
+    """Check operation files (--check) or replay them into a graph, printing the outcome as JSON."""
     if argv[:1] == ["--check"]:
         outcome = check([Path(p) for p in argv[1:]])
         print(json.dumps(outcome, sort_keys=True, separators=(",", ":")))

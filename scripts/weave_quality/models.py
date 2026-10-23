@@ -16,6 +16,7 @@ import ast
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
+from collections.abc import Mapping, Sequence
 from typing import Any, NotRequired, TypedDict
 
 
@@ -104,7 +105,7 @@ class FileEntry:
         )
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "FileEntry":
+    def from_dict(cls, d: Mapping[str, Any]) -> "FileEntry":
         """Reconstruct from a DB row dict."""
         return cls(
             path=d["path"],
@@ -248,7 +249,7 @@ class CKMetrics:
         ]
 
     @classmethod
-    def from_rows(cls, rows: list[dict[str, Any]]) -> "CKMetrics | None":
+    def from_rows(cls, rows: Sequence[Mapping[str, Any]]) -> "CKMetrics | None":
         """Reconstruct from EAV rows (all for same path/scan_id)."""
         if not rows:
             return None
@@ -290,7 +291,7 @@ class GitStats:
         )
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "GitStats":
+    def from_dict(cls, d: Mapping[str, Any]) -> "GitStats":
         """Reconstruct from a DB row dict."""
         return cls(
             path=d["path"],
@@ -336,7 +337,7 @@ class FileState:
         )
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "FileState":
+    def from_dict(cls, d: Mapping[str, Any]) -> "FileState":
         """Deserialize from plain dict."""
         return cls(
             path=d["path"],

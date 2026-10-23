@@ -1,16 +1,12 @@
 {
   "schema": "weave.policy-rules.v1",
-  "contract_version": "1.11.1",
+  "contract_version": "1.13.1",
   "references": {
     "capability_registry": "contracts/command-capabilities.json",
     "verdict_schema": "contracts/policy-v1.schema.json",
     "node_field_registry": "contracts/node-field-registry-v1.json"
   },
-  "rule_decisions": [
-    "allow",
-    "advisory",
-    "deny"
-  ],
+  "rule_decisions": ["allow", "advisory", "deny"],
   "verdict_fold": [
     {
       "rule_decision": "deny",
@@ -25,11 +21,7 @@
       "verdict": "allow"
     }
   ],
-  "enforcement_owners": [
-    "command_gate",
-    "sqlite_trigger",
-    "host_hook"
-  ],
+  "enforcement_owners": ["command_gate", "sqlite_trigger", "host_hook", "git_hook"],
   "non_policy_categories": [
     {
       "category": "input_validation",
@@ -42,17 +34,16 @@
     {
       "category": "infrastructure_failure",
       "meaning": "The system could not evaluate or persist the request; no policy was applied, so the refusal cannot count as one."
+    },
+    {
+      "category": "content_verification",
+      "meaning": "The staged or pushed content failed a declared check (a suite, a linter, a scan); the refusal judges the content, not whether the actor may act, and passing it grants nothing."
     }
   ],
   "completeness": {
-    "proven": [
-      "sqlite_trigger",
-      "host_hook"
-    ],
-    "declared_only": [
-      "command_gate"
-    ],
-    "limit": "SQLite aborts and host-hook denials are detected mechanically and every one must be claimed here. Every declared command gate must emit its verdict through wv_policy_verdict at its declared site, and every emit must name a declared rule, a decision that rule declares, and a declared site. A command gate that emits nothing is still indistinguishable in code from input validation, so the set of command gates is complete only as far as a manual classification reached: instrumenting v1.0.0 found three gates it had missed."
+    "proven": ["sqlite_trigger", "host_hook", "git_hook"],
+    "declared_only": ["command_gate"],
+    "limit": "SQLite aborts, host-hook denials and refusing exits of the Weave git hooks are detected mechanically and every one must be claimed here. Every declared command gate must emit its verdict through wv_policy_verdict at its declared site, and every emit must name a declared rule, a decision that rule declares, and a declared site. A command gate that emits nothing is still indistinguishable in code from input validation, so the set of command gates is complete only as far as a manual classification reached: instrumenting v1.0.0 found three gates it had missed. Git-hook refusals inside '# BEGIN source-only' blocks (the evidence lab's E6 gates) are outside this contract as they are outside the release, which cuts them."
   },
   "denominator": {
     "unit": "wv_call",
@@ -62,6 +53,11 @@
         "kind": "host_event",
         "reason": "A host hook that denies before wv is invoked leaves no wv call: there is no call_id, and any identity joining it to one would be minted by the hook itself, which is the self-declared evidence the attempt journal exists to remove. Such denials are outside the denominator by declaration, and are never written as wv call rows.",
         "decided_by": "wv-bd3041"
+      },
+      {
+        "kind": "git_event",
+        "reason": "A Weave git hook decides whether a commit or push proceeds outside any wv call. The wv subprocesses it runs are not proof of the commit's outcome: git can still fail, or the hook be skipped, after they return, and nothing joins them to a commit identity. Git events stay outside the denominator until an independently grounded event identity exists, and their rules are reported as outside evidence rather than exercised or gapped.",
+        "decided_by": "wv-3477f0"
       }
     ],
     "rationale": "The E1 denominator is wv calls: a call counts only when the attempt journal holds its call_started event, written by wv before dispatch. wv calls a hook launches (source=hook, such as prune or load) are wv calls and stay in. What the exclusion costs: E1 does not measure the host-hook counterweight layer until hooks can carry an identity they did not create; until then that layer's effect is unmeasured, not zero."
@@ -241,10 +237,7 @@
       "rule_id": "orphan_prevention",
       "summary": "A non-epic node may not be created without a parent while an epic is open, because it would be orphaned.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -275,10 +268,7 @@
       "rule_id": "active_add_requires_claim_readiness",
       "summary": "A node created directly as active must already carry done criteria and a risk assessment.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -306,10 +296,7 @@
       "rule_id": "reconstruct_never_overwrites",
       "summary": "Reconstructing a node by explicit id may not overwrite a node that still exists.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -332,10 +319,7 @@
       "rule_id": "init_preserves_existing_graph",
       "summary": "Initialising may not replace a database that already holds nodes.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -362,10 +346,7 @@
       "rule_id": "close_requires_quality_evidence",
       "summary": "A close may not proceed without quality scan data for the quality gates to judge; missing evidence fails closed.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -398,6 +379,13 @@
           "function": "_done_refresh_file_metrics",
           "anchor": "wv_policy_verdict close_requires_quality_evidence",
           "occurrences": 5
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_quality_ensure_fresh",
+          "anchor": "wv_policy_verdict close_requires_quality_evidence",
+          "occurrences": 2
         }
       ]
     },
@@ -405,10 +393,7 @@
       "rule_id": "finding_close_requires_violation_type",
       "summary": "A finding node may not close without a catalogued violation_type.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -443,7 +428,7 @@
         },
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/pre-close-verification.sh",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
           "anchor": "finding node requires violation_type before close"
         }
       ]
@@ -452,10 +437,7 @@
       "rule_id": "completion_scope_integrity",
       "summary": "A close may scope its completion only to files attributed to the node, under a fresh attempt identity.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -467,16 +449,7 @@
           "field": "status",
           "from": "active",
           "to": "done",
-          "via": [
-            "batch-done",
-            "bulk-update",
-            "done",
-            "quick",
-            "resolve",
-            "ship",
-            "ship-agent",
-            "update"
-          ]
+          "via": ["batch-done", "bulk-update", "done", "quick", "resolve", "ship", "ship-agent", "update"]
         }
       ],
       "bypass": [],
@@ -517,10 +490,7 @@
       "rule_id": "close_requires_learning",
       "summary": "A close must record a learning unless it is declared trivial.",
       "basis": "heuristic",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -574,10 +544,7 @@
       "rule_id": "close_awaits_human_verification",
       "summary": "A node marked as waiting for human verification may not close until that is acknowledged.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -617,10 +584,7 @@
       "rule_id": "reserved_slot_claim",
       "summary": "A node reserved for a counted evidence capture may not be claimed as ordinary work.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -648,10 +612,7 @@
       "rule_id": "reopen_requires_explicit_intent",
       "summary": "A done node may be reopened only by an explicit reopen, never implicitly by a claim or an update.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -693,9 +654,7 @@
       "rule_id": "claim_ownership",
       "summary": "Taking over a node another agent has claimed requires an explicit override, which is recorded.",
       "basis": "invariant",
-      "decisions": [
-        "allow"
-      ],
+      "decisions": ["allow"],
       "applies_to": [
         {
           "kind": "operation",
@@ -723,10 +682,7 @@
       "rule_id": "delete_preserves_children",
       "summary": "A node with child nodes may not be deleted without explicit intent, because it would orphan them.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -753,10 +709,7 @@
       "rule_id": "block_graph_acyclic",
       "summary": "Blocking edges may not form a self-loop or a cycle.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -778,10 +731,7 @@
       "rule_id": "sync_shrink_floor",
       "summary": "A sync may not overwrite the committed graph with a dump far smaller than it, the signature of a wiped or partial hot zone.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -819,10 +769,7 @@
       "rule_id": "compact_waits_for_claims",
       "summary": "Deltas may not be compacted while agents hold claims that may not have replayed them.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -849,10 +796,7 @@
       "rule_id": "cutover_waits_for_claims",
       "summary": "A causal cutover may not run while agents hold claims.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -879,10 +823,7 @@
       "rule_id": "recovery_never_fabricates_closure",
       "summary": "Recovery may not complete a close that was never durably recorded.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -910,10 +851,7 @@
       "rule_id": "repository_write_requires_owned",
       "summary": "Scaffolding and repair may write only into a repository classified as owned, never into vendored upstream code.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -955,10 +893,7 @@
       "rule_id": "owned_override_requires_acknowledgement",
       "summary": "Classifying a remote-bearing repository as owned against autodetection requires acknowledging it is an intentional fork.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -986,10 +921,7 @@
       "rule_id": "add_duplicate_check",
       "summary": "A node whose text matches an open node, or one closed in the last 30 days, is refused as a likely duplicate.",
       "basis": "heuristic",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -1031,10 +963,7 @@
       "rule_id": "init_refuses_symlinked_weave_dir",
       "summary": "Initialising through a symlinked Weave directory is refused, because it writes graph state outside the repository.",
       "basis": "invariant",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "operation",
@@ -1056,10 +985,7 @@
       "rule_id": "learning_overlap_advisory",
       "summary": "A learning that overlaps or contradicts an existing one is recorded as an advisory; it never blocks the close.",
       "basis": "heuristic",
-      "decisions": [
-        "allow",
-        "advisory"
-      ],
+      "decisions": ["allow", "advisory"],
       "applies_to": [
         {
           "kind": "operation",
@@ -1099,26 +1025,14 @@
       "rule_id": "close_complexity_ceiling",
       "summary": "A close may not complete while a file it touched exceeds the McCabe complexity threshold.",
       "basis": "heuristic",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "transition",
           "field": "status",
           "from": "active",
           "to": "done",
-          "via": [
-            "batch-done",
-            "bulk-update",
-            "done",
-            "quick",
-            "resolve",
-            "ship",
-            "ship-agent",
-            "update"
-          ]
+          "via": ["batch-done", "bulk-update", "done", "quick", "resolve", "ship", "ship-agent", "update"]
         }
       ],
       "bypass": [
@@ -1164,26 +1078,14 @@
       "rule_id": "close_trend_not_deteriorating",
       "summary": "A close may not complete while a file it touched is on a deteriorating quality trend.",
       "basis": "heuristic",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "transition",
           "field": "status",
           "from": "active",
           "to": "done",
-          "via": [
-            "batch-done",
-            "bulk-update",
-            "done",
-            "quick",
-            "resolve",
-            "ship",
-            "ship-agent",
-            "update"
-          ]
+          "via": ["batch-done", "bulk-update", "done", "quick", "resolve", "ship", "ship-agent", "update"]
         }
       ],
       "bypass": [
@@ -1229,26 +1131,14 @@
       "rule_id": "close_tests_not_red",
       "summary": "A code node may not close while a file it touched has a red or stale test result.",
       "basis": "heuristic",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "transition",
           "field": "status",
           "from": "active",
           "to": "done",
-          "via": [
-            "batch-done",
-            "bulk-update",
-            "done",
-            "quick",
-            "resolve",
-            "ship",
-            "ship-agent",
-            "update"
-          ]
+          "via": ["batch-done", "bulk-update", "done", "quick", "resolve", "ship", "ship-agent", "update"]
         }
       ],
       "bypass": [
@@ -1294,9 +1184,7 @@
       "rule_id": "edit_source_not_installed_copy",
       "summary": "An edit may not target the installed copy of Weave instead of its source.",
       "basis": "invariant",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1317,9 +1205,7 @@
       "rule_id": "read_size_budget",
       "summary": "A whole-file read of a large file must be bounded.",
       "basis": "heuristic",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1345,9 +1231,7 @@
       "rule_id": "edit_blocked_in_phase",
       "summary": "Edits are refused while the session is in a discovery or closing phase.",
       "basis": "invariant",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1368,9 +1252,7 @@
       "rule_id": "edit_requires_active_node",
       "summary": "An edit requires an active node to attribute it to.",
       "basis": "invariant",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1396,9 +1278,7 @@
       "rule_id": "active_node_not_stale",
       "summary": "An edit may not proceed under an active node that has gone stale.",
       "basis": "heuristic",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1419,9 +1299,7 @@
       "rule_id": "active_node_contradictions_resolved",
       "summary": "An edit may not proceed while the active node carries unresolved contradictions.",
       "basis": "heuristic",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1442,9 +1320,7 @@
       "rule_id": "active_node_not_blocked",
       "summary": "An edit may not proceed under an active node that is still blocked.",
       "basis": "invariant",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1465,9 +1341,7 @@
       "rule_id": "claim_requires_done_criteria",
       "summary": "A node may not be claimed until it carries done criteria.",
       "basis": "invariant",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1479,7 +1353,7 @@
       "sites": [
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/pre-claim-skills.sh",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
           "anchor": "Claim preflight for"
         }
       ]
@@ -1488,9 +1362,7 @@
       "rule_id": "claim_requires_alias",
       "summary": "A node may not be claimed until it carries an alias.",
       "basis": "invariant",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1502,7 +1374,7 @@
       "sites": [
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/pre-claim-skills.sh",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
           "anchor": "Claim preflight for"
         }
       ]
@@ -1511,9 +1383,7 @@
       "rule_id": "claim_premortem_advisory",
       "summary": "A claim without a risk assessment is advised to record one.",
       "basis": "heuristic",
-      "decisions": [
-        "advisory"
-      ],
+      "decisions": ["advisory"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1525,7 +1395,7 @@
       "sites": [
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/pre-claim-skills.sh",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
           "anchor": "Claim preflight for"
         }
       ],
@@ -1535,10 +1405,7 @@
       "rule_id": "close_requires_verification_evidence",
       "summary": "A close must cite how the work was verified unless declared trivial.",
       "basis": "heuristic",
-      "decisions": [
-        "allow",
-        "deny"
-      ],
+      "decisions": ["allow", "deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1555,12 +1422,12 @@
       "sites": [
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/pre-close-verification.sh",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
           "anchor": "--verification-method=\\\"make check\\\""
         },
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/pre-close-verification.sh",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
           "anchor": "The override is recorded, not silent"
         }
       ]
@@ -1569,9 +1436,7 @@
       "rule_id": "close_requires_committed_work",
       "summary": "A close may not proceed while the node's own files are uncommitted.",
       "basis": "invariant",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1583,7 +1448,7 @@
       "sites": [
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/pre-close-verification.sh",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
           "anchor": "Commit work before close."
         }
       ]
@@ -1592,9 +1457,7 @@
       "rule_id": "close_requires_attributed_commit",
       "summary": "A close requires at least one commit attributed to the node.",
       "basis": "invariant",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1606,7 +1469,7 @@
       "sites": [
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/pre-close-verification.sh",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
           "anchor": "No commit attributed to"
         }
       ]
@@ -1615,9 +1478,7 @@
       "rule_id": "no_busy_wait_polling",
       "summary": "A background task may not be polled with a sleep loop.",
       "basis": "heuristic",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1629,7 +1490,7 @@
       "sites": [
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/bash-dedup.sh",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
           "anchor": "Busy-wait poller blocked"
         }
       ]
@@ -1638,9 +1499,7 @@
       "rule_id": "no_duplicate_inflight_command",
       "summary": "A command identical to one still running may not be launched again.",
       "basis": "heuristic",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1652,12 +1511,12 @@
       "sites": [
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/bash-dedup.sh",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
           "anchor": "already running — wait for the task-notification"
         },
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/bash-dedup.sh",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
           "anchor": "just acquired by concurrent call"
         }
       ]
@@ -1666,9 +1525,7 @@
       "rule_id": "session_end_requires_no_active_node",
       "summary": "A session may not end while a node is still active.",
       "basis": "invariant",
-      "decisions": [
-        "deny"
-      ],
+      "decisions": ["deny"],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1684,10 +1541,94 @@
       "sites": [
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/stop-check.sh",
+          "path": "scripts/lib/wv-lifecycle-end.sh",
           "anchor": "active node(s) still open"
         }
       ]
+    },
+    {
+      "rule_id": "commit_admission",
+      "summary": "A commit proceeds only under an active node claimed by the actor committing it.",
+      "basis": "invariant",
+      "decisions": ["deny"],
+      "applies_to": [
+        {
+          "kind": "git_event",
+          "event": "pre-commit"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--no-verify"
+        },
+        {
+          "kind": "env",
+          "name": "WV_SKIP_PRECOMMIT",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "WV_PRECOMMIT_RUNNING",
+          "value": "1"
+        },
+        {
+          "kind": "state",
+          "how": "nothing is staged, or only graph state as the hook's classifier decides it (state.sql, nodes/edges jsonl, deltas, trails); never all of .weave/, and with the classifier missing, nothing counts as graph state"
+        },
+        {
+          "kind": "state",
+          "how": "no executable wv is found and neither HEAD nor the index tracks .weave/ (not Weave-managed)"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "Continue that work as yourself:"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "Bypass: git commit --no-verify"
+        }
+      ],
+      "notes": "Identity source: wv list --status=active --claimed-by=current, which resolves the actor as resolve_agent_id does for the Weave-ID trailers: WV_AGENT_ID if set, otherwise <harness>-<host>-<user> from the committing process's environment, with human when no agent harness is detected. One identity policy for admission and attribution; they remain separate hooks and queries. Failure behaviour: a listing that fails reads as no claim, so admission fails closed. Continuing another actor's node is wv work <id> --force, which claim_ownership records as a takeover; it is not a bypass. The guarantee is actor-owned admission, not session isolation: sessions resolving one identity admit each other's commits unless each sets WV_AGENT_ID (wv-d7f53e). With no node active at all the second site refuses (the discover-phase message). Removed as exemptions (wv-68aeff): WV_AUTO_CHECKPOINT_ACTIVE and WV_STYLE_COMMIT (a flag is not authority), the whitespace-only shortcut (git diff -w cannot show semantic equivalence), and the closing phase (repository-shared; the graph commit it existed for is graph state). With no wv in a Weave-managed repository a substantive commit is refused. A commit cannot remove its own enforcement prerequisite (wv-49b687): Weave management, the shellcheck scope declaration, .shellcheckrc, the memory-parity map row and the release leak checker count when HEAD or the index has them, so staging their deletion or relaxation does not disable them for that commit."
+    },
+    {
+      "rule_id": "push_heavy_tier_tests_pushed_tip",
+      "summary": "The heavy tier a push owes runs against exactly the commit being pushed.",
+      "basis": "invariant",
+      "decisions": ["deny"],
+      "applies_to": [
+        {
+          "kind": "git_event",
+          "event": "pre-push"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "flag",
+          "name": "--no-verify"
+        },
+        {
+          "kind": "state",
+          "how": "no executable wv, no [heavy] section in the test map, or no pushed file selects a heavy suite"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "so what is tested is what is pushed."
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "Commit or stash them, then push again."
+        }
+      ],
+      "notes": "A ref that is not HEAD, or tracked files differing from the tip, would have the heavy tier test something other than what is pushed."
     }
   ],
   "non_policy_sites": [
@@ -1708,7 +1649,7 @@
       "sites": [
         {
           "owner": "host_hook",
-          "path": ".claude/hooks/pre-close-verification.sh",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
           "function": "_agent_hook_timeout_deny"
         }
       ]
@@ -1831,6 +1772,504 @@
           "owner": "sqlite_trigger",
           "path": "scripts/lib/wv-delta.sh",
           "anchor": "status=excluded.status"
+        }
+      ]
+    },
+    {
+      "category": "content_verification",
+      "summary": "Pre-commit checks of the staged content: memory projections, ruff, pytest, shellcheck, the prose gate, the release leak guard, the gate role contract and the candidate lanes of changed gate files.",
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "checking staged projections"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "tests/test-memory-projection-parity.sh\" --subject"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "Fix with: ruff check --fix"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "pytest tests failed"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "Project-wide suppressions live in .shellcheckrc"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "python3 -E \"$_PC_SCRIPTS/prose-gate.py\""
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "tests/test-shipped-test-refs.sh\" --scan"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "the staged scripts/ holds a link or submodule"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "${_GATE_ROLES_WHY:-the gate role contract could not be checked}"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "gate_entry_points_preflight || exit 1"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "gate_lanes_run \"${_wv_lane_file%/*}\""
+        }
+      ]
+    },
+    {
+      "category": "content_verification",
+      "summary": "The suite pool shared by both hooks refuses when a selected suite fails.",
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/lib/wv-gate-pool.sh",
+          "anchor": "not run after the failure"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/lib/wv-gate-pool.sh",
+          "anchor": "does not exist — refusing rather than counting it as passed"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/lib/wv-gate-pool.sh",
+          "function": "gate_pool_require_present"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "_pc_suites_json=$(gate_pool_require_present"
+        }
+      ]
+    },
+    {
+      "category": "infrastructure_failure",
+      "summary": "The shared gate could not select a suite launch order or its bounded worker was cancelled; neither is a policy judgement or permission to admit unchecked content.",
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "_pc_launch=$(gate_pool_launch_order"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "_pp_launch=$(gate_pool_launch_order"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/lib/wv-gate-pool.sh",
+          "function": "gate_run_bounded"
+        }
+      ]
+    },
+    {
+      "category": "infrastructure_failure",
+      "summary": "The pre-commit gate could not evaluate the staged content (a read, temp directory, materialisation or library failed), so it refuses rather than admit unchecked.",
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "cannot list frozen focused pytest targets"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "cannot create focused pytest scratch"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "_pc_memory_filter='[.[]"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "memory parity: could not create a frozen subject"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "memory parity: frozen graph and projections must be readable regular files"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "memory parity: could not materialise the frozen graph and projections"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "refusing to commit unlinted content"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "prose gate: could not create a temp directory"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "prose gate: could not materialise the staged index"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "release leak guard: could not create a temp directory"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "release leak guard: could not materialise the staged index"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "the suite pool (wv-gate-pool.sh) was not found"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not resolve the suites for the staged files"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not list the staged files ($1)"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "the frozen-candidate library (wv-gate-snapshot.sh) was not found"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not record the index as a tree or resolve HEAD"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "the execution-mode guard was not found"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "the index or HEAD changed while the gate ran"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not record the judged tree for the reference-transaction hook"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not read HEAD's tree to find its committed gate"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not list HEAD's scripts/, the committed gate"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "which the protected gate does not follow"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not create a directory for HEAD's committed gate"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not copy HEAD's committed gate"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "the committed gate has no scripts/wv beside its hook"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not prepare the committed wv"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not read the committed gate's lane mark"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not mark the copy of HEAD's committed gate"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "HEAD moved between copying its committed gate"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not list the staged scripts/"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not read the candidate lane's mark"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not read the recovery run's execution tree mark"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "not the protected lane's"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "the committed gate has no candidate-lane library"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/reference-transaction-weave.sh",
+          "anchor": "is not the tree the pre-commit gate judged"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "is not a regular file — the gate does not follow links"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not read .weave/test-map.conf from the frozen"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not read .weave/test-map-retired.conf from the frozen base"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not read the suite selection"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "so this Weave-managed repository cannot check the staged changes."
+        }
+      ]
+    },
+    {
+      "category": "infrastructure_failure",
+      "summary": "The pre-push gate could not judge the push (gate libraries missing, suite selection unresolvable).",
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "the gate libraries (wv-gate-pool.sh, wv-checkpoint-ci.sh) were not found"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": ".weave/test-map.conf exists but cannot be read, so the heavy tier this push owes is unknown"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": ".weave/ cannot be searched, so whether a test map exists is unknown"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not resolve the suites for $_pp_lref"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not list the commits $_pp_lref pushes"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not read HEAD's tree to find its committed gate"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not list HEAD's scripts/, the committed gate"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "which the protected gate does not follow"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not create a directory for HEAD's committed gate"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not copy HEAD's committed gate"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "the committed gate has no scripts/wv beside its hook"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not prepare the committed wv"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not read the committed gate's lane mark"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not mark the copy of HEAD's committed gate"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "HEAD moved between copying its committed gate"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not read the test maps of the commits $_pp_lref pushes"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not read the suite selection"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not read the pushed tree's retirement catalogue"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "the pushed tree's .weave/test-map-retired.conf is not a regular file"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "could not compare the working tree with the pushed tip"
+        }
+      ]
+    },
+    {
+      "category": "infrastructure_failure",
+      "summary": "The suite pool could not validate protected and candidate provisioning declarations or establish per-suite execution modes, freeze its subject, create private scratch or establish execution inputs, or was interrupted. It refuses rather than admit unchecked content.",
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/lib/wv-gate-pool.sh",
+          "function": "gate_pool_execution_mode"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/lib/wv-gate-pool.sh",
+          "anchor": "cannot freeze pushed suite inputs"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/lib/wv-gate-pool.sh",
+          "anchor": "cannot freeze staged suite inputs"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/lib/wv-gate-pool.sh",
+          "anchor": "cannot create a suite output directory"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/lib/wv-gate-pool.sh",
+          "anchor": "cannot create private suite scratch"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/lib/wv-gate-pool.sh",
+          "anchor": "cannot establish frozen suite inputs"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/lib/wv-gate-pool.sh",
+          "anchor": "trap '_pc_reap; _pc_pool_kill; _pc_record_all;"
+        }
+      ]
+    },
+    {
+      "category": "content_verification",
+      "summary": "Where HEAD carries the hook, the installed copy runs HEAD's committed gate from a private copy and returns its verdict unchanged (S2a, wv-1f98b6); each refusal in that verdict is claimed at its own site above.",
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "env -u WV_LIB_DIR -u WV_CLI bash \"$_wv_d/tree/scripts/hooks/pre-commit-weave.sh\""
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "env -u WV_LIB_DIR -u WV_CLI bash \"$_wv_d/tree/scripts/hooks/pre-push-weave.sh\""
+        }
+      ]
+    },
+    {
+      "category": "content_verification",
+      "summary": "Recovery (S2c, wv-0af8f0): for a commit shaped as a recovery record or as a recorded repair, the installed copy runs HEAD's gate first and acts only on its refusal. That refusal stands unless the record, validated by the installed code, admits the commit (and for a repair, the recorded replacement gate passes a negative control and admits it); every refusal on that path goes through _pcr_refuse, a near miss returns HEAD's own status, and _pcr_run's child shell exits with the status of the bounded run it reports. A recovery admission is traceability, not approval.",
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "function": "_pcr_refuse"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "function": "_pcr_main"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "function": "_pcr_run"
         }
       ]
     }

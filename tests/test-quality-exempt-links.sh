@@ -7,6 +7,7 @@
 # its decomposition plan, non-product paths at the decision that scoped them out.
 # The repository's shell ceiling may only move down from the schema default.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 run=0; pass=0
 ok()  { run=$((run+1)); pass=$((pass+1)); echo "  ✓ $1"; }

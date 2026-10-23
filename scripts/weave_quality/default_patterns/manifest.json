@@ -1,13 +1,13 @@
 {
   "format": "weave.quality-default-patterns-manifest.v1",
   "rules": {
-    "bare-except-pass.yaml": "a541403f1a67f5045acfc4913855c4e73d0d68f0badc4e1d579a3cf7d38c9777",
+    "bare-except-pass.yaml": "b8e20c7ce1a7b42c5cc7658a0f327ad215a3df55829e7a306eed42e27145880b",
     "git-listing-rename-blind.yaml": "489c47999374a99b03c95b1daf6dd39d370452526e8df46b59a20f8634393d77",
     "live-db-file-operation.yaml": "28b254655afba4faad88594daaa646481db53db0c5372a27f51458eed179f319",
     "lookup-skips-beside-self.yaml": "7ab6c64f63344ed6a4d03a15af05bd6ff2e8e8c4d87c5e8e7fd5cf0cc260acfa",
-    "prose-emphasis-hedge.yaml": "a567296be5641dfb3513ccffe9cfe44a93716e3267f33e4f12051ca90c761c75",
-    "prose-register-review.yaml": "01a67582a309aebf00a34e1ead9c9b793cbc5362c54baee7e2feaf83f98485d7",
-    "subprocess-shell-true.yaml": "b63a6401ce11b67b8c7fa7fe0b4dc5f69848d24ebb3cc9d8bdc5b8bb35280768",
-    "unquoted-variable.yaml": "3d9105cb90d208ca32c6a3f112707f03b2d4f8e764cf892b99e89bb733625019"
+    "prose-emphasis-hedge.yaml": "ceae00f71030f87161fdf6d5b9526876118a8dbc8c63968541af3d010072f569",
+    "prose-register-review.yaml": "941a411d6cfa42fcfcf045625b95a2048445667d0e1efebc936ffdd47f635885",
+    "subprocess-shell-true.yaml": "c5c12ca316ac47f2d0b081535326f81fa29de012bbc38f0e2c8f7099432324e2",
+    "unquoted-variable.yaml": "35a0df346c2b61d490c441cd0e1958278170b6491ecc37a7aa2820284340865f"
   }
 }

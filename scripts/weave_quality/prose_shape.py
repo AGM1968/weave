@@ -34,6 +34,8 @@ import re
 import statistics as st
 from pathlib import Path
 
+from weave_quality.listing import iter_tree
+
 _MASK = "\x00"
 
 # How a sentence continues after a comma. Three different relationships, so the
@@ -127,7 +129,11 @@ def profile_texts(texts: list[str]) -> dict[str, float | int]:
 
 
 def markdown_files(target: Path) -> list[Path]:
-    """The .md files under target, or target itself when it is one."""
+    """The .md files under target, or target itself when it is one.
+
+    Raises OSError on a directory it cannot list: rglob skipped one, and the
+    profile described a smaller corpus than the one named (wv-4852bd).
+    """
     if target.is_file():
         return [target] if target.suffix.lower() == ".md" else []
-    return sorted(p for p in target.rglob("*.md") if p.is_file())
+    return sorted(p for p in iter_tree(target) if p.name.endswith(".md") and p.is_file())

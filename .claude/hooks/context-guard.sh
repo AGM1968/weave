@@ -1,10 +1,14 @@
 #!/bin/bash
-# context-guard.sh - Claude Code SessionStart adapter for the context load policy
+# context-guard.sh - on-demand view of the context load policy
 #
 # The policy itself is `wv context-policy` (wv-f757a4): the one computation every
-# harness reads, MCP weave_overview included. This adapter adds only what is
-# specific to a Claude Code session start: `wv load`, `wv status`, the banner
-# and the stale-findings advisory.
+# harness reads, MCP weave_overview included. This script adds a human banner,
+# `wv load`/`wv status` and the stale-findings advisory.
+#
+# No longer a registered SessionStart hook (wv-a523de): its compact
+# "Weave: ... | policy=... | current=..." line is now the first line of the
+# context `wv hook dispatch --event=SessionStart` emits for every host. Running
+# both in one Claude matcher group raced two `wv load`s at every session start.
 
 set -e
 

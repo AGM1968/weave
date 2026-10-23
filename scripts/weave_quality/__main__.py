@@ -79,7 +79,10 @@ from weave_quality.db import (
     upsert_ck_metrics,
     upsert_complexity_trend,
     upsert_file_state,
+    latest_scan_paths,
+    worktree_drift,
 )
+from weave_quality.listing import directory_entries
 from weave_quality.git_metrics import (
     working_tree_blob_shas,
     build_file_state,
@@ -99,7 +102,7 @@ from weave_quality.hotspots import (
     hotspot_summary,
 )
 from weave_quality.findings import cmd_findings_promote
-from weave_quality.models import CKMetrics, FileEntry, FunctionCC, GitStats, PatternFinding
+from weave_quality.models import CKMetrics, FileEntry, FunctionCC, GitStats, PatternFinding, ScanMeta
 from weave_quality.prose_rules import (
     PROSE_LANGUAGES,
     PatternRuleExecutionError,
@@ -220,7 +223,7 @@ def _resolve_repo(path: str | None) -> str:
     """Resolve the target repository root.
 
     Uses the given path, or WV_REPO_ROOT_OVERRIDE env, or REPO_ROOT env, or
-    git rev-parse. Critical: when run from earth-engine-analysis/, scanner
+    git rev-parse. Critical: when run from a consumer repository, scanner
     must target THAT repo, not memory-system/ where wv is installed.
 
     wv-20adef (external code review round 2): the bash `wv` entry point's
@@ -365,6 +368,25 @@ def _discover_files(repo: str, exclude_globs: list[str] | None = None) -> list[s
                 files.append(rel_path)
 
     return sorted(files)
+
+
+def _worktree_drift(
+    conn: sqlite3.Connection, repo: str, paths: list[str] | None = None
+) -> dict[str, list[str]]:
+    """Files whose content differs from what the latest scan read (wv-fe9a6a).
+
+    Candidates come from `_discover_files` so freshness judges exactly the set
+    a scan would read: a gitignored or [exclude]d path is never "unscanned".
+    With `paths`, only those are judged, which is what the wv done gate asks.
+    """
+    discovered = _discover_files(repo, exclude_globs=_load_config_excludes(repo))
+    scanned = latest_scan_paths(conn)
+    if paths is not None:
+        wanted = set(paths)
+        discovered = [p for p in discovered if p in wanted]
+        scanned = [p for p in scanned if p in wanted]
+    blob_map = working_tree_blob_shas(repo, include=discovered)
+    return worktree_drift(conn, repo, discovered, blob_map, scanned)
 
 
 # ---------------------------------------------------------------------------
@@ -553,12 +575,12 @@ def _scan_files(
 def _carry_forward_unchanged(
     conn: sqlite3.Connection,
     scan_id: int,
-    prev_scan: object,
+    prev_scan: ScanMeta,
     files_unchanged: list[str],
     classify_overrides: dict[str, list[str]] | None,
 ) -> list[FileEntry]:
     """Carry FileEntry and file_metrics rows forward from prev_scan for unchanged files."""
-    prev_entries = get_file_entries(conn, prev_scan.id)  # type: ignore[attr-defined]
+    prev_entries = get_file_entries(conn, prev_scan.id)
     prev_by_path = {e.path: e for e in prev_entries}
     carried: list[FileEntry] = []
 
@@ -589,7 +611,7 @@ def _carry_forward_unchanged(
             fm_rows = conn.execute(
                 "SELECT path, metric, value, detail FROM file_metrics"
                 " WHERE scan_id = ? AND path = ?",
-                (prev_scan.id, rel_path),  # type: ignore[attr-defined]
+                (prev_scan.id, rel_path),
             ).fetchall()
             for row in fm_rows:
                 conn.execute(
@@ -640,46 +662,103 @@ def _print_scan_result(
 # ---------------------------------------------------------------------------
 
 
-def cmd_scan(args: argparse.Namespace) -> int:
-    """Execute wv quality scan."""
-    repo = _resolve_repo(args.path)
-    conn = init_db(args.hot_zone)
-    start_time = time.monotonic()
+def _scan_paths(args: argparse.Namespace) -> tuple[str, Path]:
+    """Separate the scan target from the repository owning the selected DB."""
+    selected_repo = getattr(args, "repo", None)
+    raw_target = args.path or selected_repo or _resolve_repo(None)
+    if not raw_target:
+        raise ValueError("no repository selected; run wv from the target repository")
+    target = Path(raw_target).resolve()
+    if not target.is_file() and not target.is_dir():
+        raise ValueError(f"scan target does not exist: {target}")
+    if selected_repo:
+        repo = Path(selected_repo).resolve()
+    else:
+        directory = target.parent if target.is_file() else target
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"], cwd=directory,
+                capture_output=True, text=True, check=True,
+            )
+            repo = Path(result.stdout.strip()).resolve()
+        except (OSError, subprocess.CalledProcessError):
+            repo = directory
+    if not target.is_relative_to(repo):
+        raise ValueError(
+            f"scan target {target} is outside selected repository {repo}; "
+            "run wv from the target repository to select its database"
+        )
+    return str(repo), target
 
-    cli_excludes: list[str] = getattr(args, "exclude", [])
-    all_files = _discover_files(repo, exclude_globs=_load_config_excludes(repo) + cli_excludes)
 
-    head = git_head_sha(repo)
-    scan_id = begin_scan(conn, head, scanner_version=_SCANNER_VERSION)
-
+def _partition_scan_files(
+    conn: sqlite3.Connection, repo: str, all_files: list[str],
+    selected: set[str], blob_map: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    """Choose files to analyze or carry forward, refreshing all on version drift."""
     prev_for_version = previous_scan(conn)
+    previous_paths = (
+        {e.path for e in get_file_entries(conn, prev_for_version.id)}
+        if prev_for_version is not None else set()
+    )
     version_changed = (
         prev_for_version is not None
         and _SCANNER_VERSION
         and prev_for_version.scanner_version != _SCANNER_VERSION
     )
-    if version_changed:
+    if version_changed and prev_for_version is not None:
         log.info(
             "Scanner version changed (%s → %s); forcing full re-scan",
-            prev_for_version.scanner_version or "unknown",  # type: ignore[union-attr]
+            prev_for_version.scanner_version or "unknown",
             _SCANNER_VERSION,
         )
 
-    # Working-tree SHAs, not HEAD's: an uncommitted edit has to be visible
-    # to both file_changed and the AST cache (wv-7fbfe1).
-    blob_map = working_tree_blob_shas(repo)
     files_to_scan: list[str] = []
     files_unchanged: list[str] = []
     for rel_path in all_files:
+        if rel_path not in selected and not version_changed:
+            files_unchanged.append(rel_path)
+            continue
         abs_path = os.path.join(repo, rel_path)
         try:
             mtime = int(os.path.getmtime(abs_path))
         except OSError:
             mtime = 0
-        if version_changed or file_changed(conn, rel_path, mtime, blob_map.get(rel_path, "")):
+        if (version_changed or rel_path not in previous_paths
+                or file_changed(conn, rel_path, mtime, blob_map.get(rel_path, ""))):
             files_to_scan.append(rel_path)
         else:
             files_unchanged.append(rel_path)
+    return files_to_scan, files_unchanged
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    """Execute wv quality scan."""
+    try:
+        repo, target = _scan_paths(args)
+    except (OSError, ValueError) as error:
+        if args.json:
+            print(json.dumps({"error": "invalid_scan_target", "detail": str(error)}))
+        else:
+            print(f"quality scan: {error}", file=sys.stderr)
+        return 1
+    conn = init_db(args.hot_zone)
+    start_time = time.monotonic()
+
+    cli_excludes: list[str] = getattr(args, "exclude", [])
+    all_files = _discover_files(repo, exclude_globs=_load_config_excludes(repo) + cli_excludes)
+    selected = {p for p in all_files if (Path(repo) / p).is_relative_to(target)}
+
+    head = git_head_sha(repo)
+    scan_id = begin_scan(conn, head, scanner_version=_SCANNER_VERSION)
+
+    # Working-tree SHAs, not HEAD's: an uncommitted edit has to be visible
+    # to both file_changed and the AST cache (wv-7fbfe1).
+    # Untracked files are hashed too, or they fall back to mtime (wv-fe9a6a).
+    blob_map = working_tree_blob_shas(repo, include=all_files)
+    files_to_scan, files_unchanged = _partition_scan_files(
+        conn, repo, all_files, selected, blob_map,
+    )
 
     classify_overrides = load_classify_overrides(repo)
 
@@ -729,9 +808,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     all_fn_cc = get_all_function_cc(conn, scan_id)
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
-    # entries already includes carry-forward rows (extended above); use len(all_files)
-    # to avoid double-counting files_unchanged.
-    finish_scan(conn, scan_id, len(all_files), duration_ms,
+    # A scoped refresh retains prior out-of-scope rows, not unscanned files.
+    finish_scan(conn, scan_id, len(entries), duration_ms,
                 bash_cc_backend=bash_backend, ts_cc_backend=ts_backend)
     conn.commit()
     conn.close()
@@ -743,7 +821,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
         print(json.dumps({
             "scan_id": scan_id,
             "git_head": head,
-            "files_scanned": len(all_files),
+            "target": target.relative_to(repo).as_posix(),
+            "files_scanned": len(selected),
+            "files_total": len(entries),
             "files_changed": len(files_to_scan),
             "languages": lang_counts,
             "category_counts": category_counts,
@@ -754,7 +834,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             "ts_cc_backend": ts_backend,
         }))
     else:
-        print(f"Scanning {repo}...", file=sys.stderr)
+        print(f"Scanning {target} (repository {repo})...", file=sys.stderr)
         _print_scan_result(lang_counts, files_to_scan, duration_ms, summary,
                            bash_cc_backend=bash_backend, ts_cc_backend=ts_backend)
 
@@ -897,6 +977,29 @@ def cmd_functions(args: argparse.Namespace) -> int:  # noqa: PLR0912
     return 0
 
 
+def cmd_freshness(args: argparse.Namespace) -> int:
+    """Execute wv quality freshness -- did the latest scan read these files?
+
+    Prints {"stale", "changed", "unscanned", "deleted"} as JSON. Judges content
+    only, not HEAD: a commit that changes no scanned byte leaves every metric
+    true. Exit 0 whether fresh or stale; nonzero only when it cannot answer.
+    """
+    if not db_exists(args.hot_zone):
+        print(_MSG_NO_DB, file=sys.stderr)
+        return 1
+    conn = init_db(args.hot_zone)
+    try:
+        if latest_scan(conn) is None:
+            print(_MSG_NO_SCAN, file=sys.stderr)
+            return 1
+        repo = _resolve_repo(args.repo)
+        drift = _worktree_drift(conn, repo, list(args.paths) if args.paths else None)
+    finally:
+        conn.close()
+    print(json.dumps({"stale": any(drift.values()), **drift}))
+    return 0
+
+
 def cmd_hotspots(args: argparse.Namespace) -> int:
     """Execute wv quality hotspots -- ranked hotspot report."""
     hot_zone = args.hot_zone
@@ -910,8 +1013,13 @@ def cmd_hotspots(args: argparse.Namespace) -> int:
     conn = init_db(hot_zone)
     current_head = _get_current_head()
 
-    # Staleness warning
-    stale = staleness_info(conn, current_head)
+    # Staleness warning. Drift is only worth computing for a scan at HEAD: one
+    # behind HEAD is already stale (wv-fe9a6a).
+    scan_now = latest_scan(conn)
+    drift = None
+    if scan_now is not None and not scan_now.is_stale(current_head):
+        drift = _worktree_drift(conn, _resolve_repo(None))
+    stale = staleness_info(conn, current_head, drift)
 
     # Get latest scan data
     scan = latest_scan(conn)
@@ -988,6 +1096,13 @@ def cmd_hotspots(args: argparse.Namespace) -> int:
                 "-- run 'wv quality scan' to refresh\n",
                 file=sys.stderr,
             )
+        elif stale.get("stale") and stale.get("reason") == "worktree_changed":
+            n = sum(len(stale.get(k, [])) for k in ("changed", "unscanned", "deleted"))
+            print(
+                f"[WARN] {n} file(s) changed since the scan "
+                "-- run 'wv quality scan' to refresh\n",
+                file=sys.stderr,
+            )
 
         if not ranked:
             print("No hotspots found above threshold.", file=sys.stderr)
@@ -1016,6 +1131,14 @@ def cmd_hotspots(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Diff helpers
 # ---------------------------------------------------------------------------
+
+
+def _delta_of(item: dict[str, object]) -> float:
+    """Sort key for a categorized change: its rounded complexity delta."""
+    delta = item["delta"]
+    if not isinstance(delta, (int, float)):
+        raise TypeError(f"change item delta is {type(delta).__name__}, not a number")
+    return float(delta)
 
 
 def _categorize_file_changes(
@@ -1061,8 +1184,8 @@ def _categorize_file_changes(
             else:
                 degraded.append(item)
 
-    improved.sort(key=lambda x: x["delta"])  # type: ignore[arg-type,return-value]
-    degraded.sort(key=lambda x: x["delta"], reverse=True)  # type: ignore[arg-type,return-value]
+    improved.sort(key=_delta_of)
+    degraded.sort(key=_delta_of, reverse=True)
     return improved, degraded, new_files, removed_files
 
 
@@ -1703,6 +1826,8 @@ def cmd_health_info(args: argparse.Namespace) -> None:
     entries = get_file_entries(conn, scan.id)
     all_stats = get_git_stats(conn)
     all_fn_cc = get_all_function_cc(conn, scan.id)
+    repo = _resolve_repo(None)
+    freshness = staleness_info(conn, git_head_sha(repo), _worktree_drift(conn, repo))
     conn.close()
 
     score = compute_quality_score(entries, all_stats, all_fn_cc)
@@ -1717,6 +1842,7 @@ def cmd_health_info(args: argparse.Namespace) -> None:
                 "total_files": len(entries),
                 "git_head": scan.git_head,
                 "scanned_at": scan.scanned_at,
+                "stale": freshness["stale"],
             }
         )
     )
@@ -2123,6 +2249,16 @@ def _run_pattern_rule(
     if proc.returncode not in (0, 1):
         detail = proc.stderr.strip()[:500] or f"exit {proc.returncode}"
         raise PatternRuleExecutionError(f"{rule_path}: ast-grep failed on {target}: {detail}")
+    # A directory ast-grep cannot list is reported on stderr ("ERROR: <dir>:
+    # Permission denied") while it exits 0 with whatever it did reach: a
+    # partial scan that read as complete (wv-4852bd). Parse errors and binary
+    # files print nothing there. (An unreadable FILE is skipped with no
+    # message at all; that is not detectable from here.)
+    unlisted = [line for line in proc.stderr.splitlines() if line.startswith("ERROR:")]
+    if unlisted:
+        raise PatternRuleExecutionError(
+            f"{rule_path}: ast-grep could not read all of {target}: {unlisted[0][:300]}"
+        )
     if not proc.stdout.strip():
         return []
     try:
@@ -2367,6 +2503,11 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
             PatternRuleExecutionError(f"target does not exist: {target}"), args.json
         )
 
+    # Restore only an empty cache. Warm scans and a prior wv load must retain
+    # local decisions that have not yet been exported by wv sync.
+    if latest_pattern_run(conn) is None and not pattern_finding_states(conn):
+        import_pattern_adjudications(conn, repo / ".weave" / "quality-adjudications.jsonl")
+
     if not rules:
         # Every invocation gets its own pattern_runs lifecycle row, even a
         # zero-rule one -- otherwise report/list keep presenting an earlier
@@ -2462,7 +2603,7 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
     }
     conn.close()
 
-    summary = {r: sum(1 for f in all_findings if f.rule_id == r) for r, _, _ in rules}
+    summary = {r: final_hits_by_rule.get(r, 0) for r, _, _ in rules}
     # wv-c71833: by_rule (== stored receipt hits == patterns list count for
     # this scan) vs. what each rule itself matched before same-start-location
     # collision suppression -- only present as its own key so by_rule's
@@ -2716,6 +2857,13 @@ def cmd_patterns_report(args: argparse.Namespace) -> int:
         return 0
     scope_suffix = f" (scope: {scope_label})" if scope_label is not None else ""
     print(f"Pattern adjudication report{scope_suffix}:")
+    # The rates divide by different populations; name each denominator so a
+    # durable actionable_rate cannot be read as a current-scan one (wv-7d2857).
+    print(
+        "  decided_precision is over findings in the current scan (decided_count);"
+        " actionable_rate is over every durable disposition, repaired findings"
+        " included (durable_decided_count)."
+    )
     by_rule = report["by_rule"]
     assert isinstance(by_rule, dict)
     needs_adjudication: list[str] = []
@@ -2733,8 +2881,9 @@ def cmd_patterns_report(args: argparse.Namespace) -> int:
             nudge = " [needs adjudication]"
         print(
             f"  {rule_id}: decided_precision={precision_text} "
-            f"actionable_rate={actionable_text} "
             f"decided_count={summary['decided_count']} "
+            f"actionable_rate={actionable_text} "
+            f"durable_decided_count={summary['durable_decided_count']} "
             f"findings={summary['findings']} occurrences={summary['occurrences']} "
             f"unresolved={summary['unresolved']}{nudge}"
         )
@@ -2800,8 +2949,8 @@ def _candidate_pattern_files(repo: Path) -> list[Path]:
     patterns_dir = repo / ".weave" / "patterns"
     files: list[Path] = []
     for rule_dir in (_DEFAULT_PATTERNS_DIR, patterns_dir / "managed", patterns_dir):
-        if rule_dir.is_dir():
-            files.extend(sorted(rule_dir.glob("*.yaml")))
+        # Raises OSError on a tier it cannot list; glob read one as empty.
+        files.extend(directory_entries(rule_dir, "*.yaml"))
     return files
 
 
@@ -2817,8 +2966,7 @@ def _stray_yml_pattern_files(repo: Path) -> list[Path]:
     patterns_dir = repo / ".weave" / "patterns"
     files: list[Path] = []
     for rule_dir in (_DEFAULT_PATTERNS_DIR, patterns_dir / "managed", patterns_dir):
-        if rule_dir.is_dir():
-            files.extend(sorted(rule_dir.glob("*.yml")))
+        files.extend(directory_entries(rule_dir, "*.yml"))
     return files
 
 
@@ -2937,12 +3085,13 @@ def cmd_patterns_validate(args: argparse.Namespace) -> int:
         # wv-0065a6 (external code review round 3, finding 8): repo itself
         # passed _non_directory_repo_root_error's check above, but a
         # *tier* directory under it (e.g. .weave/patterns/ made
-        # unreadable, not just missing) can still raise PermissionError
-        # out of rule_dir.is_dir()/.glob() -- an uncaught traceback
-        # instead of the structured error this command otherwise
-        # promises. A genuinely ABSENT tier directory still stays a
-        # silent, valid skip (rule_dir.is_dir() returning False, not
-        # raising) -- only inaccessibility is treated as an error.
+        # unreadable, not just missing) raises PermissionError out of the
+        # listing -- an uncaught traceback instead of the structured error
+        # this command otherwise promises. A genuinely ABSENT tier
+        # directory still stays a silent, valid skip; only inaccessibility
+        # is an error. glob never raised here: it read an unlistable tier
+        # as empty, so this branch only fired for an unsearchable parent
+        # (wv-4852bd).
         detail = f"could not enumerate pattern rule directories under {repo} ({exc.strerror or exc})"
         if args.json:
             print(json.dumps({"error": "invalid_repo_root", "detail": detail}))
@@ -3079,7 +3228,7 @@ def cmd_patterns_list(args: argparse.Namespace) -> int:
             print(f"patterns: {detail}", file=sys.stderr)
         return 1
 
-    receipts = (
+    receipts: dict[str, dict[str, object]] = (
         {str(row["rule_id"]): row for row in pattern_rule_runs(conn, run.id)}
         if run is not None
         else {}
@@ -3167,7 +3316,7 @@ def _rule_matcher_spec(rule: dict[str, object]) -> dict[str, object]:
     """What a rule actually searches for, as the ENGINE searches for it.
 
     Consumers reimplement this from the rule YAML because nothing exposes it,
-    and two unrelated repositories (earth-engine-analysis, nowcast) each got it
+    and two unrelated consumer repositories each got it
     wrong in a different way. The failures are worth naming, because each one
     is a thing the YAML alone cannot tell you:
 
@@ -3349,15 +3498,22 @@ def cmd_prose_shape(args: argparse.Namespace) -> int:
     if not target.exists():
         return _show_error("target_missing", f"no such path: {target}", args.json)
 
-    files = markdown_files(target)
+    texts: list[str] = []
+    try:
+        files = markdown_files(target)
+        texts = [f.read_text(encoding="utf-8", errors="replace") for f in files]
+    except OSError as exc:
+        return _show_error(
+            "target_unreadable",
+            f"cannot read {exc.filename or target} ({exc.strerror or exc})",
+            args.json,
+        )
     if not files:
         return _show_error(
             "no_markdown", f"no .md files under {target}", args.json
         )
 
-    current = profile_texts(
-        [f.read_text(encoding="utf-8", errors="replace") for f in files]
-    )
+    current = profile_texts(texts)
     payload: dict[str, object] = {
         "target": str(target),
         "files": len(files),
@@ -3722,6 +3878,7 @@ def main() -> int:  # pragma: no cover
     scan_parser.add_argument(
         "path", nargs="?", help="Path to scan (default: repo root)"
     )
+    scan_parser.add_argument("--repo", help="Repository owning the selected hot zone")
     scan_parser.add_argument("--json", action="store_true", help="JSON output")
     scan_parser.add_argument(
         "--exclude",
@@ -3729,6 +3886,15 @@ def main() -> int:  # pragma: no cover
         default=[],
         help="Exclude files matching glob (repeatable)",
     )
+
+    # freshness
+    freshness_parser = sub.add_parser(
+        "freshness", help="Files whose content changed since the latest scan (JSON)"
+    )
+    freshness_parser.add_argument(
+        "paths", nargs="*", help="Repo-relative paths to judge (default: every scannable file)"
+    )
+    freshness_parser.add_argument("--repo", default=None, help="Repository root")
 
     # hotspots
     hotspots_parser = sub.add_parser("hotspots", help="Ranked hotspot report")
@@ -3885,6 +4051,7 @@ def main() -> int:  # pragma: no cover
     _dispatch = {
         "scan": cmd_scan,
         "hotspots": cmd_hotspots,
+        "freshness": cmd_freshness,
         "diff": cmd_diff,
         "promote": cmd_promote,
         "findings-promote": cmd_findings_promote,

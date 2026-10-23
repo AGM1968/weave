@@ -7,7 +7,7 @@ policy: always-on-shared
 maturity: promotable
 match_scope: line
 provenance: >-
-  wv-3324fd @earth-engine-analysis (2026-07-23). Consecutive bold-label
+  wv-3324fd in a consumer graph (2026-07-23). Consecutive bold-label
   metadata lines collapsed into an unreadable run-on when Pandoc joined the
   adjacent Markdown lines. Adjudicated as a structural rendering defect.
 message: >-

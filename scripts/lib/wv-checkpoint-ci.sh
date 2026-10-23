@@ -2,7 +2,7 @@
 # wv-checkpoint-ci.sh — decide whether a weave-authored checkpoint/sync commit
 # may safely carry GitHub's native [skip ci] push-skip marker.
 #
-# wv-e937f8 (external audit, earth-engine-analysis dev.3 session, cross-
+# wv-e937f8 (external audit, a consumer repository's dev.3 session, cross-
 # referenced against this repo's own wv-4637d2-equivalent history): GitHub
 # applies [skip ci] to the WHOLE PUSH when the marker appears in the commit
 # at the push's TIP, not just that commit's own diff. Every checkpoint site
@@ -128,11 +128,13 @@ wv_stage_graph_state() {
 # wv_staged_non_graph_state <git-root>
 #   Prints staged paths that are not graph state, one per line: caller work,
 #   including .weave/ configuration. A checkpoint that finds any must not
-#   commit, or it absorbs that work.
+#   commit, or it absorbs that work. Returns 1 when the index cannot be listed:
+#   that is not "nothing staged", and every caller treats it as staged work
+#   (wv-9c6ae1). It returned 0 with no output, which a checkpoint read as safe.
 wv_staged_non_graph_state() {
     local staged
     # --no-renames: a caller file moved into .weave/ must still show its removal.
-    staged=$(git -C "$1" diff --cached --name-only --no-renames 2>/dev/null) || return 0
+    staged=$(git -C "$1" diff --cached --name-only --no-renames 2>/dev/null) || return 1
     wv_non_graph_state_paths <<< "$staged"
 }
 
@@ -141,10 +143,31 @@ wv_staged_non_graph_state() {
 # defers [heavy] suites to that hook only when this holds, and wv done treats a
 # heavy suite with no fresh row as deferred rather than stale only when it
 # holds, so both sides of the deferral answer the question the same way.
+# Executable, not merely present: git skips a hook without the execute bit, so
+# a marked but non-executable file deferred heavy suites to a gate that never
+# ran (wv-ecae1c). An unresolvable hooks dir is "not installed", not /pre-push.
 wv_prepush_gate_installed() {
-    local hook
-    hook="$(git rev-parse --git-path hooks 2>/dev/null)/pre-push"
-    [ -f "$hook" ] && grep -q "Weave pre-push" "$hook" 2>/dev/null
+    local hooks
+    hooks="$(git rev-parse --git-path hooks 2>/dev/null)" && [ -n "$hooks" ] || return 1
+    [ -f "$hooks/pre-push" ] && [ -x "$hooks/pre-push" ] \
+        && grep -q "Weave pre-push" "$hooks/pre-push" 2>/dev/null
+}
+
+# wv_reftx_gate_installed — true when git will run the Weave
+# reference-transaction hook here, which binds a commit's publication to the
+# tree the pre-commit gate judged (R1, wv-5f9d1c). git runs that hook from 2.28;
+# an older git, or a missing, non-executable or foreign hook, is "not
+# installed", and pre-commit then states that its admission is check-then-use.
+wv_reftx_gate_installed() {
+    local hooks v major minor
+    v=$(git version 2>/dev/null) || return 1
+    v=${v#git version }
+    major=${v%%.*}; minor=${v#*.}; minor=${minor%%.*}
+    case "$major$minor" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$major" -gt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -ge 28 ]; } || return 1
+    hooks="$(git rev-parse --git-path hooks 2>/dev/null)" && [ -n "$hooks" ] || return 1
+    [ -f "$hooks/reference-transaction" ] && [ -x "$hooks/reference-transaction" ] \
+        && grep -q "Weave reference-transaction" "$hooks/reference-transaction" 2>/dev/null
 }
 
 # wv_non_graph_state_paths — filter repo-relative paths on stdin to those
@@ -162,4 +185,35 @@ wv_non_graph_state_paths() {
         done
         printf '%s\n' "$path"
     done
+}
+
+# wv_path_absent <path> — the path is observably absent: nothing is at it, and
+# its nearest existing ancestor is a directory this process can search. An
+# unsearchable ancestor hides whether the path exists, and a test of it fails
+# the same way a missing one does, so that is not absence (wv-3fab34).
+wv_path_absent() {
+    local d="$1"
+    [ -e "$d" ] || [ -L "$d" ] && return 1
+    while d=$(dirname -- "$d"); do
+        [ -e "$d" ] && break
+        [ "$d" = / ] || [ "$d" = . ] && return 1
+    done
+    [ -d "$d" ] && [ -x "$d" ]
+}
+
+# wv_config_read <path> — print a configuration file a gate depends on.
+#   0  present: its content is on stdout
+#   2  absent: observably nothing at the path (wv_path_absent)
+#   1  unavailable: an entry that cannot be read -- unreadable, a directory,
+#      a dangling symlink -- or a path whose existence cannot be observed
+# Absent and unavailable used to be one answer: a dangling or unreadable
+# test-map.conf read as no configuration, and the gates routed by heuristics
+# or skipped the heavy tier (wv-b02828).
+wv_config_read() {
+    if [ -e "$1" ] || [ -L "$1" ]; then
+        cat -- "$1" 2>/dev/null || return 1
+        return 0
+    fi
+    wv_path_absent "$1" && return 2
+    return 1
 }

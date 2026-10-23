@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from weave_quality.guides import (  # noqa: E402
+from weave_quality.guides import (  # noqa: E402  # pylint: disable=wrong-import-position
     PRESENTATION_IDS,
     PRESENTATION_VIOLATION,
     GuideError,

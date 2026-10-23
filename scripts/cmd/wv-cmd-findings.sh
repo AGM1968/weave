@@ -113,6 +113,8 @@ cmd_findings_list() {
         limit_clause="LIMIT $limit"
     fi
 
+    db_ensure || return $?
+
     local total
     total=$(db_query "SELECT COUNT(*) FROM nodes n WHERE json_extract(n.metadata, '\$.type') = 'finding' $fixable_clause;" 2>/dev/null || echo 0)
     : "${total:=0}"
@@ -150,13 +152,13 @@ cmd_findings_list() {
             $fixable_clause
             $stale_clause
             ORDER BY n.created_at DESC
-            $limit_clause;")
+            $limit_clause;") || return $?
         [ -z "$results" ] && echo "[]" || echo "$results"
         return
     fi
 
     local rows
-    rows=$(db_query "$query")
+    rows=$(db_query "$query") || return $?
 
     if [ -z "$rows" ]; then
         echo "No finding nodes found." >&2

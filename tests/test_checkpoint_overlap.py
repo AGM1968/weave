@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+from typing import Any
 import time
 from pathlib import Path
 
@@ -19,7 +20,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "profiling"))
 
-from checkpoint_overlap import classification, report  # noqa: E402
+from checkpoint_overlap import classification, report  # noqa: E402  # pylint: disable=wrong-import-position
 
 
 def _git(repo: Path, *argv: str) -> None:
@@ -42,7 +43,7 @@ def repo_with_checkpoint(tmp_path: Path) -> tuple[Path, int]:
     return repo, int(stamp)
 
 
-def _log(path: Path, rows: list[dict]) -> Path:
+def _log(path: Path, rows: list[dict[str, Any]]) -> Path:
     path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
     return path
 

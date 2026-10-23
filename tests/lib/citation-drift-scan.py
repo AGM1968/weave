@@ -27,6 +27,8 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any
+from collections.abc import Iterator
 
 NODE_ID = re.compile(r"\bwv-[0-9a-f]{6}\b")
 # Present-tense assertions that the cited node is not finished.
@@ -56,13 +58,15 @@ BLOCK_START = re.compile(r"^\s*(?:$|#|[-*+] |\d+\. )")
 CLAUSE_END = re.compile(r"[.;!?](?=\s|$)")
 
 
-def blocks(text: str):
+def blocks(text: str) -> Iterator[tuple[int, str]]:
     """Yield (first_line_number, block_text) for each block of the document."""
-    start, current = 1, []
+    start = 1
+    current: list[str] = []
     for number, line in enumerate(text.split("\n"), 1):
         if BLOCK_START.match(line) and current:
             yield start, "\n".join(current)
-            start, current = number, []
+            start = number
+            current = []
         if line.strip():
             if not current:
                 start = number
@@ -84,7 +88,8 @@ CLOSED_STATUS = "done"
 def status_column() -> str:
     """The nodes column holding status, and proof the closed value still exists."""
     field = json.loads(FIELD_REGISTRY.read_text(encoding="utf-8"))["fields"]["status"]
-    kind, _, column = field["storage"].partition(":")
+    storage: str = field["storage"]
+    kind, _, column = storage.partition(":")
     if kind != "column" or not re.fullmatch(r"[a-z_]+", column):
         raise SystemExit(f"{FIELD_REGISTRY.name}: status is no longer a plain column "
                          f"({field['storage']}); update this scanner")
@@ -100,7 +105,7 @@ def load_status(db: Path) -> dict[str, str]:
         return dict(conn.execute(f"SELECT id, {column} FROM nodes"))
 
 
-def scan(root: Path, status: dict[str, str]) -> dict:
+def scan(root: Path, status: dict[str, str]) -> dict[str, Any]:
     drift = []
     scanned = cited_done = 0
     for path in sorted((root / "docs").glob("**/*.md")):

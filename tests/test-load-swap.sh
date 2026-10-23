@@ -14,6 +14,7 @@ export WV_CALL_SOURCE=test
 # REPO_ROOT as a leaked override and refuses to run (wv-5e804e), so the fixture runs
 # with its own directory as cwd.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -142,6 +143,82 @@ EOF
 # a nodes table no query could read, which the count below catches.
 check "init --force leaves a database passing integrity_check" "ok" "$(integrity)"
 check "init --force leaves an empty, readable graph" "0" "$(nodes)"
+
+# 5. A failed cold-load FTS rebuild is a refused load, not a usable graph.
+# Reject only the explicit rebuild invocation; every other SQLite operation
+# uses the real binary, so schema/import failures cannot satisfy this test.
+fixture
+"$WV" sync >/dev/null 2>&1
+rm -rf "$WV_HOT_ZONE"
+mkdir -p "$TEST_DIR/bin"
+export WV_REAL_SQLITE
+WV_REAL_SQLITE=$(command -v sqlite3)
+export WV_REBUILD_LOG="$TEST_DIR/rebuild.log"
+cat > "$TEST_DIR/bin/sqlite3" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+    if [ "$arg" = "INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');" ]; then
+        echo 'injected FTS rebuild refusal' >> "$WV_REBUILD_LOG"
+        exit 73
+    fi
+done
+exec "$WV_REAL_SQLITE" "$@"
+EOF
+chmod +x "$TEST_DIR/bin/sqlite3"
+load_out=$(PATH="$TEST_DIR/bin:$PATH" "$WV" load 2>&1)
+load_rc=$?
+[ -s "$WV_REBUILD_LOG" ] && ok "cold-load probe reached the exact rebuild" || bad "cold-load probe reached the exact rebuild"
+[ "$load_rc" -ne 0 ] && ok "cold load refuses a failed FTS rebuild" || bad "cold load refuses a failed FTS rebuild" "rc=$load_rc"
+if [[ "$load_out" != *'Loaded from'* ]]; then ok "failed rebuild prints no load success"; else bad "failed rebuild prints no load success" "$load_out"; fi
+"$WV" load >/dev/null 2>&1
+check "load retries successfully after rebuild refusal removed" "0" "$?"
+fts_out=$(sqlite3 "$WV_DB" "INSERT INTO nodes_fts(nodes_fts,rank) VALUES('integrity-check',1); UPDATE nodes SET text=text;" 2>&1)
+check "recovered cold load has a content-consistent writable index" "0" "$?"
+[ -z "$fts_out" ] || echo "  SQLite output: $fts_out"
+
+# The warm refusal allocates a pre-load snapshot. EXIT cleanup must use its
+# actual path, not a function-local variable that is gone when the trap fires.
+load_out=$(PATH="$TEST_DIR/bin:$PATH" "$WV" load 2>&1)
+load_rc=$?
+[ "$load_rc" -ne 0 ] && ok "warm load refuses a failed FTS rebuild" || bad "warm load refuses a failed FTS rebuild" "rc=$load_rc"
+leftovers=("$WV_HOT_ZONE"/.preload.db.*)
+[ ! -e "${leftovers[0]}" ] && ok "refused load cleans pre-load snapshots" || bad "refused load cleans pre-load snapshots" "${leftovers[*]}"
+"$WV" load >/dev/null 2>&1
+check "warm load recovers after rebuild refusal removed" "0" "$?"
+
+# An ordinary read also hydrates a missing database. It must not continue
+# against the partly restored graph when that implicit load was refused.
+# Leave WV_DB unset for these commands: an explicit DB opts out of hydration.
+for format in text json json-v2; do
+    "$WV" sync >/dev/null 2>&1
+    rm -rf "$WV_HOT_ZONE"
+    : > "$WV_REBUILD_LOG"
+    args=(list --all)
+    [ "$format" = text ] || args+=("--$format")
+    env -u WV_DB PATH="$TEST_DIR/bin:$PATH" WV_RUN_CACHE=0 \
+        "$WV" "${args[@]}" > "$TEST_DIR/read.out" 2> "$TEST_DIR/read.err"
+    read_rc=$?
+    [ -s "$WV_REBUILD_LOG" ] && ok "$format read reached implicit rebuild" || bad "$format read reached implicit rebuild"
+    [ "$read_rc" -ne 0 ] && ok "$format read refuses failed hydration" || bad "$format read refuses failed hydration" "rc=$read_rc"
+    [ ! -s "$TEST_DIR/read.out" ] && ok "$format refused read prints no graph" || bad "$format refused read prints no graph" "$(cat "$TEST_DIR/read.out")"
+    grep -q 'could not rebuild the node search index' "$TEST_DIR/read.err" \
+        && ok "$format read explains hydration refusal" || bad "$format read explains hydration refusal"
+    "$WV" load >/dev/null 2>&1
+    check "$format read fixture recovers" "0" "$?"
+
+    rm -rf "$WV_HOT_ZONE"
+    env -u WV_DB WV_RUN_CACHE=0 "$WV" "${args[@]}" \
+        > "$TEST_DIR/read.out" 2> "$TEST_DIR/read.err"
+    check "$format healthy implicit load succeeds" "0" "$?"
+    if [ "$format" = text ]; then
+        check "$format healthy cold read returns every saved node" "3" "$(grep -c 'swap node' "$TEST_DIR/read.out")"
+    else
+        check "$format healthy cold read returns every saved node" "3" "$(jq length "$TEST_DIR/read.out")"
+    fi
+    sqlite3 "$WV_DB" "INSERT INTO nodes_fts(nodes_fts,rank) VALUES('integrity-check',1); UPDATE nodes SET text=text;" \
+        > "$TEST_DIR/fts.out" 2>&1
+    check "$format healthy cold graph is indexed and writable" "0" "$?"
+done
 
 echo ""
 echo "  $pass/$run passed"

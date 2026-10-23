@@ -17,9 +17,19 @@ import math
 import re
 import sys
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple, TypeVar
 
 from .models import ASTAnalysis, CKMetrics, FileEntry, FunctionCC, FunctionDetail
+
+if TYPE_CHECKING:
+    from typing_extensions import override
+else:
+    # Keep the scanner stdlib-only on Python 3.11; override is a static contract.
+    _Method = TypeVar("_Method")
+
+    def override(method: _Method) -> _Method:
+        """Leave visitor methods unchanged at runtime."""
+        return method
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +95,7 @@ class _ComplexityVisitor(ast.NodeVisitor):
         self.self_attrs: set[str] = set()
         self.call_count: int = 0
 
+    @override
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802  # pylint: disable=invalid-name
         """Stop recursion at nested function boundaries in per_function mode."""
         if not self._per_function:
@@ -109,27 +120,32 @@ class _ComplexityVisitor(ast.NodeVisitor):
     if sys.version_info >= (3, 10):
         visit_match_case = _enter_branch
 
+    @override
     def visit_BoolOp(self, node: ast.BoolOp) -> None:  # noqa: N802  # pylint: disable=invalid-name
         """Count each and/or as a branch path."""
         self.complexity += len(node.values) - 1
         self.generic_visit(node)
 
+    @override
     def visit_Assert(self, node: ast.Assert) -> None:  # noqa: N802  # pylint: disable=invalid-name
         """Count assert as a branch."""
         self.complexity += 1
         self.generic_visit(node)
 
+    @override
     def visit_comprehension(self, node: ast.comprehension) -> None:
         """Count comprehensions and their if-clauses."""
         self.complexity += 1
         self.complexity += len(node.ifs)
         self.generic_visit(node)
 
+    @override
     def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802  # pylint: disable=invalid-name,missing-function-docstring
         if type(node.value) is ast.Name and node.value.id == "self":  # pylint: disable=unidiomatic-typecheck
             self.self_attrs.add(node.attr)
         self.generic_visit(node)
 
+    @override
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802  # pylint: disable=invalid-name,missing-function-docstring
         self.call_count += 1
         self.generic_visit(node)
@@ -302,11 +318,13 @@ class _EssentialComplexityVisitor(ast.NodeVisitor):
             ev += len(set(self._return_depths)) - 1
         return float(ev)
 
+    @override
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
         """Don't descend into nested functions."""
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
+    @override
     def visit_For(self, node: ast.For) -> None:  # noqa: N802
         """Track loop nesting depth for complexity accounting."""
         old = self._in_loop
@@ -319,26 +337,31 @@ class _EssentialComplexityVisitor(ast.NodeVisitor):
     visit_While = visit_For  # type: ignore[assignment]
     visit_AsyncFor = visit_For  # type: ignore[assignment]
 
+    @override
     def visit_Break(self, node: ast.Break) -> None:  # noqa: N802
         """Count break as non-reducible when inside a loop."""
         if self._in_loop:
             self._non_reducible += 1
 
+    @override
     def visit_Continue(self, node: ast.Continue) -> None:  # noqa: N802
         """Count continue as non-reducible when inside a nested loop."""
         if self._in_loop and self._depth > 1:
             self._non_reducible += 1
 
+    @override
     def visit_Return(self, node: ast.Return) -> None:  # noqa: N802
         """Record current depth for multi-return unstructured-flow analysis."""
         self._return_depths.append(self._depth)
 
+    @override
     def visit_If(self, node: ast.If) -> None:  # noqa: N802
         """Increment depth for conditional branch complexity."""
         self._depth += 1
         self.generic_visit(node)
         self._depth -= 1
 
+    @override
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802
         """Count bare-raise as non-reducible; track depth for return analysis."""
         for child in ast.walk(node):

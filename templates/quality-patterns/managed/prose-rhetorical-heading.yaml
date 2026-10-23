@@ -7,7 +7,7 @@ severity: info
 policy: always-on-shared
 maturity: promotable
 provenance: >-
-  AC-1 from earth-engine-analysis canary wv-7a8d45. Seven cited papers used
+  AC-1 from a consumer canary wv-7a8d45. Seven cited papers used
   no question, wh-clause, or explainer heading among 62 headings.
 message: >-
   Rhetorical or explanatory heading. Name the section's technical content

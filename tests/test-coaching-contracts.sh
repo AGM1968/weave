@@ -10,6 +10,7 @@ export WV_CALL_SOURCE=test
 # Exit codes: 0 all checks pass, 1 otherwise.
 
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

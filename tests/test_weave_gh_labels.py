@@ -85,6 +85,11 @@ class TestGetLabelsForNode:
         labels = get_labels_for_node(node)
         assert "weave:blocked" in labels
 
+    def test_blocked_external_status_label(self) -> None:
+        """wv-e869e3: blocked-external is blocked work and is labelled so."""
+        node = WeaveNode(id="n1", text="t", status="blocked-external")
+        assert "weave:blocked" in get_labels_for_node(node)
+
     def test_done_no_status_label(self) -> None:
         """Done nodes should NOT have weave:active or weave:blocked."""
         node = WeaveNode(id="n1", text="t", status="done")

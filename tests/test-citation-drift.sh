@@ -5,6 +5,7 @@
 # read, so the suite's verdict cannot depend on what this repository closed today.
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOL="$ROOT/tests/lib/citation-drift-scan.py"

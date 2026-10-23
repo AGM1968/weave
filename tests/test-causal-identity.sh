@@ -10,6 +10,7 @@ export WV_CALL_SOURCE=test
 # misses an input is worse than none -- it reports "nothing changed" about a
 # change it cannot see.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -136,6 +137,53 @@ cache="$WV_HOT_ZONE/delta-catalog-digest"
 cached_before=$(cat "$cache")
 "$WV" status >/dev/null 2>&1
 check "an unchanged catalog reuses the cached digest" "$cached_before" "$(cat "$cache")"
+
+# The hit path takes the file count from the entry instead of re-reading the
+# listing (wv-78e154). A planted wrong count surfacing in the identity proves a
+# hit really serves the entry; an entry in the older two-field form is a miss
+# that is rewritten without moving the identity.
+delta_sig="" delta_digest="" delta_count=""
+read -r delta_sig delta_digest delta_count < "$cache" || true
+[[ "${delta_count:-}" =~ ^[0-9]+$ ]] && ok "the delta cache entry records the file count" \
+  || bad "the delta cache entry records the file count" "entry: $(cat "$cache")"
+catalog_identity=$(identity)
+printf '%s %s %s\n' "$delta_sig" "$delta_digest" 999 > "$cache"
+differs "a matching signature serves the cached count" "$catalog_identity" "$(identity)"
+printf '%s %s\n' "$delta_sig" "$delta_digest" > "$cache"
+check "a two-field entry is recomputed to the same identity" "$catalog_identity" "$(identity)"
+check "and rewritten with its count" "$delta_sig $delta_digest $delta_count" "$(cat "$cache")"
+
+# GRAPH-ROWS CACHE (wv-78e154). The row dump is reused while the database file
+# is unchanged. A planted digest under a matching key shows that a hit serves
+# the entry, so the write after it is what has to move the value back.
+rows_cache="$WV_HOT_ZONE/graph-rows-digest"
+rm -f "$rows_cache"
+WV_IDENTITY_RACY_NS=0 "$WV" status >/dev/null 2>&1
+rows_truth=$(tail -1 "$WV_CALL_LOG" | jq -r '.graph_identity_after.value')
+rows_db="" rows_key="" rows_digest=""
+IFS=$'\t' read -r rows_db rows_key rows_digest < "$rows_cache" 2>/dev/null || true
+check "the rows cache names the database it describes" "$db" "$rows_db"
+check "an unchanged graph keeps its value through the cache" "$rows_truth" "$(identity)"
+printf '%s\t%s\t%064d\n' "$rows_db" "$rows_key" 0 > "$rows_cache"
+planted=$(identity)
+differs "a matching database key serves the cached digest" "$rows_truth" "$planted"
+sqlite3 "$db" "UPDATE nodes SET text = text || ' (rows cache probe)' WHERE id = '${probe:-wv-probe}';"
+after_write=$(identity)
+rm -f "$rows_cache"
+check "a graph write invalidates the cached digest" "$(identity)" "$after_write"
+differs "and the value moved with the write" "$rows_truth" "$after_write"
+
+# Racy-clean (as in git's index): file times move in coarse ticks, so a
+# database written inside the margin is not stored, or a second write in the
+# same tick would be served the first write's digest.
+rm -f "$rows_cache"
+sqlite3 "$db" "UPDATE nodes SET text = text || '.' WHERE id = '${probe:-wv-probe}';"
+WV_IDENTITY_RACY_NS=60000000000 "$WV" status >/dev/null 2>&1
+[ ! -e "$rows_cache" ] && ok "a database written inside the racy margin is not cached" \
+  || bad "a database written inside the racy margin is not cached" "entry: $(cat "$rows_cache")"
+WV_IDENTITY_RACY_NS=0 "$WV" status >/dev/null 2>&1
+[ -s "$rows_cache" ] && ok "outside the margin it is" \
+  || bad "outside the margin it is" "no cache at $rows_cache"
 
 # ONE VALUE. The log line carries a single identity per side, not a set of
 # per-component hashes -- the growing-ad-hoc-hash shape this replaced.

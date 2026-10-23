@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -37,6 +38,37 @@ class Mode(str, Enum):
             ) from exc
 
 
+# Node statuses the CLI accepts. Keep equal to VALID_STATUSES in
+# scripts/lib/wv-validate.sh; tests/test_weave_gh_models.py checks the two.
+NODE_STATUSES = ("todo", "active", "done", "blocked", "blocked-external")
+
+# Node id shape the CLI generates and validate_id accepts. Ids are interpolated
+# into SQL by _backfill_gh_issue, so nothing else may reach it (wv-e869e3).
+NODE_ID_RE = re.compile(r"wv-[a-f0-9]{4,6}")
+
+_GH_ISSUE_STR_RE = re.compile(r"[1-9][0-9]*")
+
+
+def parse_gh_issue(value: Any) -> int | None:
+    """Return a ``metadata.gh_issue`` value as an issue number.
+
+    None is no mapping. A positive int, or its canonical decimal string, is an
+    issue number. Anything else raises ValueError: ``int(True)`` is issue #1,
+    so coercing would update or close the wrong issue (wv-e869e3).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"gh_issue is {value!r}, expected a positive int")
+    if isinstance(value, int):
+        if value < 1:
+            raise ValueError(f"gh_issue is {value}, expected a positive int")
+        return value
+    if isinstance(value, str) and _GH_ISSUE_STR_RE.fullmatch(value):
+        return int(value)
+    raise ValueError(f"gh_issue is {value!r}, expected a positive int")
+
+
 @dataclass
 class WeaveNode:
     """A node in the Weave graph."""
@@ -49,9 +81,8 @@ class WeaveNode:
 
     @property
     def gh_issue(self) -> int | None:
-        """Linked GitHub issue number, or None."""
-        v = self.metadata.get("gh_issue")
-        return int(v) if v is not None else None
+        """Linked GitHub issue number, or None; ValueError if malformed."""
+        return parse_gh_issue(self.metadata.get("gh_issue"))
 
     @property
     def priority(self) -> int:
@@ -81,7 +112,8 @@ class WeaveNode:
     @property
     def no_sync(self) -> bool:
         """Whether this node is excluded from GH sync."""
-        return self.metadata.get("no_sync", False) is True
+        value: object = self.metadata.get("no_sync", False)
+        return value is True
 
     @property
     def claimed_by(self) -> str | None:

@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "about": "Role contract for the protected commit gate (boundary rules 1, 2 and 4; S2b, wv-7ee8fe). The gate reads HEAD's copy, never the candidate's. enforcement: path prefixes whose files the gate runs from HEAD's protected copy; each changed file under one is also judged in its own lane, which holds it as staged with HEAD's other files. invoking: files that decide how suites run or whether a recorded result is reused, including every library loaded into the hook's shell, whose environment the suites inherit; a lane changing one reruns its suites. entry_points: the git hooks among the enforcement files and the event each serves; a lane runs only the pre-commit hook, so a commit changing another entry point is refused until a repair record can admit it (S2c). external: repository paths outside enforcement that enforcement files name through REPO_ROOT, each with the role it plays.",
+  "enforcement": [
+    "scripts/"
+  ],
+  "shared": [],
+  "invoking": [
+    "scripts/hooks/pre-commit-weave.sh",
+    "scripts/lib/wv-gate-pool.sh",
+    "scripts/lib/wv-gate-supervisor.py",
+    "scripts/lib/wv-gate-suite.py",
+    "scripts/lib/wv-gate-provision.json",
+    "scripts/lib/wv-scratch.sh",
+    "scripts/lib/wv-gate-snapshot.sh",
+    "scripts/lib/wv-gate-lanes.sh",
+    "scripts/wv",
+    "scripts/cmd/wv-cmd-ops.sh",
+    "scripts/cmd/wv-cmd-graph.sh",
+    "scripts/lib/wv-validate.sh",
+    "scripts/lib/wv-violation-vocabulary.gen.sh",
+    "scripts/lib/wv-config.sh",
+    "scripts/lib/wv-resolve-runtime.sh",
+    "scripts/lib/wv-checkpoint-ci.sh",
+    "scripts/lib/wv-shell-scope.sh"
+  ],
+  "entry_points": {
+    "scripts/hooks/pre-commit-weave.sh": "pre-commit",
+    "scripts/hooks/pre-push-weave.sh": "pre-push",
+    "scripts/hooks/prepare-commit-msg-weave.sh": "prepare-commit-msg",
+    "scripts/hooks/reference-transaction-weave.sh": "reference-transaction"
+  },
+  "external": {
+    ".weave": "graph and gate configuration, read from the frozen candidate",
+    ".weave/gate-provision.json": "suite provisioning and adoption from the protected base; candidate declaration validated before mode selection",
+    ".weave/test-map.conf": "suite routing, read from the frozen candidate",
+    ".weave/test-map-retired.conf": "retired suites, read from the frozen candidate",
+    ".venv/bin/python3": "mutable checkout interpreter for consumer focused pytest only; never used for self-hosting frozen execution or reusable readiness",
+    "tests/lib/run-pytest.sh": "focused pytest suite identifier only; execution and locked provisioning belong to the protected backend and policy",
+    "tests/weave_indexer": "python test package from the frozen candidate",
+    "tests/weave_quality": "python test package from the frozen candidate",
+    "mcp/contract.json": "MCP contract, read by wv commands outside the gate",
+    "mcp/dist/index.js": "MCP build output, read by wv commands outside the gate",
+    "install.sh": "installer, run by the install-drift self-heal outside a lane"
+  }
+}

@@ -12,25 +12,26 @@ import json
 import os
 import sqlite3
 import subprocess
-from collections.abc import Generator
+from collections.abc import Generator, Mapping, Sequence
+from typing import Any
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from weave_quality.__main__ import (
-    _DEFAULT_PATTERNS_DIR,
     _discover_files,
     _finding_id,
     _get_current_head,
     _load_config_excludes,
-    _load_pattern_rules,
     _stale_managed_pattern_ids,
     _resolve_repo,
     _rule_source,
     _run_pattern_rule,
     _shadowed_managed_pattern_ids,
     _wv_cmd,
+    cmd_adjudications_export,
+    cmd_adjudications_import,
     cmd_context_files,
     cmd_diff,
     cmd_findings_promote,
@@ -46,6 +47,7 @@ from weave_quality.__main__ import (
     cmd_reset,
     cmd_scan,
 )
+from weave_quality.pattern_loader import _DEFAULT_PATTERNS_DIR, _load_pattern_rules
 from weave_quality.db import (
     ADJUDICATION_NUDGE_SCANS,
     begin_pattern_run,
@@ -171,7 +173,9 @@ class TestPatternScanHonoursExempt:
         rule.write_text("id: r1\n")
         paths = ["vendor/lib.py", "gen.py", "local_only.py", "excluded_only.py",
                  "src/kept.py", "vendorish.py", "src/gen.py"]
-        def found(_rule_id, _rule_path, _target, scan_id, _repo, _language):
+        def found(
+            _rule_id: str, _rule_path: Path, _target: Path, scan_id: int, _repo: Path, _language: str
+        ) -> list[PatternFinding]:
             return [PatternFinding(path=p, scan_id=scan_id, rule_id="r1", line=1, match_text="x")
                     for p in paths]
         conn = init_db(hot_zone=str(tmp_path))
@@ -201,7 +205,9 @@ class TestPatternScanHonoursExempt:
         src.mkdir()
         rule = tmp_path / "rule.yml"
         rule.write_text("id: r1\n")
-        def found(_rule_id, _rule_path, _target, scan_id, _repo, _language):
+        def found(
+            _rule_id: str, _rule_path: Path, _target: Path, scan_id: int, _repo: Path, _language: str
+        ) -> list[PatternFinding]:
             return [PatternFinding(path=p, scan_id=scan_id, rule_id="r1", line=1, match_text="x")
                     for p in ("vendor/a.py", "b.py")]
         conn = init_db(hot_zone=str(tmp_path))
@@ -230,7 +236,9 @@ class TestPatternScanHonoursExempt:
         )
         rule = tmp_path / "rule.yml"
         rule.write_text("id: r1\n")
-        def found(_rule_id, _rule_path, _target, scan_id, _repo, _language):
+        def found(
+            _rule_id: str, _rule_path: Path, _target: Path, scan_id: int, _repo: Path, _language: str
+        ) -> list[PatternFinding]:
             return [PatternFinding(path="scripts/cmd/ops.sh", scan_id=scan_id, rule_id="r1",
                                    line=1, match_text="x")]
         conn = init_db(hot_zone=str(tmp_path))
@@ -258,7 +266,7 @@ class TestPatternScanReachesDotDirectories:
         rule = tmp_path / "rule.yml"
         rule.write_text("id: r1\n")
         seen: list[list[str]] = []
-        def fake_run(cmd, **_kwargs):
+        def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
             seen.append(list(cmd))
             return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
         with (
@@ -272,7 +280,7 @@ class TestPatternScanReachesDotDirectories:
         rule = tmp_path / "rule.yml"
         rule.write_text("id: r1\n")
         seen: list[list[str]] = []
-        def fake_run(cmd, **_kwargs):
+        def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
             seen.append(list(cmd))
             return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
         with (
@@ -290,7 +298,7 @@ class TestPatternRuleAstGrepFailure:
     def test_ast_grep_error_exit_raises_with_its_stderr(self, tmp_path: Path) -> None:
         rule = tmp_path / "rule.yml"
         rule.write_text("id: r1\n")
-        def fake_run(cmd, **_kwargs):
+        def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(cmd, 2, stdout="", stderr="bad rule syntax")
         with (
             patch("weave_quality.__main__.ast_grep_bin", return_value="ast-grep"),
@@ -302,7 +310,7 @@ class TestPatternRuleAstGrepFailure:
     def test_ast_grep_no_match_exit_is_not_a_failure(self, tmp_path: Path) -> None:
         rule = tmp_path / "rule.yml"
         rule.write_text("id: r1\n")
-        def fake_run(cmd, **_kwargs):
+        def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
         with (
             patch("weave_quality.__main__.ast_grep_bin", return_value="ast-grep"),
@@ -465,7 +473,7 @@ class TestCmdPatternsScan:
         (target / "x.py").write_text("pass\n", encoding="utf-8")
         rule = tmp_path / "r.yaml"
         rule.write_text("id: r\nlanguage: python\n", encoding="utf-8")
-        matches = [{"file": str(target / "x.py"), "range": {"start": {}}, "text": "m"}]
+        matches = [{"file": str(target / "x.py"), "range": {"start": dict[str, int]()}, "text": "m"}]
         args = argparse.Namespace(hot_zone=str(tmp_path), path=str(target), json=True)
 
         with (
@@ -849,10 +857,12 @@ class TestCmdPatternsScan:
             }
         ]
 
+    @pytest.mark.parametrize("cache_route", ["warm", "reset", "loaded"])
     def test_repeated_matches_have_distinct_position_independent_keys(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
+        cache_route: str,
     ) -> None:
         hotzone = tmp_path / "hotzone"
         doc = tmp_path / "doc.md"
@@ -872,6 +882,7 @@ class TestCmdPatternsScan:
                 "weave_quality.__main__._load_pattern_rules",
                 return_value=[("prose-test", rule, "prose")],
             ),
+            patch("weave_quality.db.time.strftime", return_value="2026-10-20T00:00:00"),
         ):
             assert cmd_patterns_scan(scan_args) == 0
             first = json.loads(capsys.readouterr().out)
@@ -887,6 +898,28 @@ class TestCmdPatternsScan:
             )
             assert cmd_patterns_adjudicate(adjudicate_args) == 0
             capsys.readouterr()
+            assert cmd_adjudications_export(
+                argparse.Namespace(
+                    hot_zone=str(hotzone),
+                    path=str(tmp_path / ".weave/quality-adjudications.jsonl"),
+                )
+            ) == 0
+            if cache_route != "warm":
+                assert cmd_reset(argparse.Namespace(hot_zone=str(hotzone))) == 0
+            if cache_route == "loaded":
+                assert cmd_adjudications_import(
+                    argparse.Namespace(
+                        hot_zone=str(hotzone),
+                        path=str(tmp_path / ".weave/quality-adjudications.jsonl"),
+                    )
+                ) == 0
+            if cache_route != "reset":
+                # A newer unsynced decision must win, even within the same
+                # timestamp second as the saved waiver, including after load
+                # but before the first scan in a rebuilt cache.
+                adjudicate_args.disposition = "accepted_defect"
+                assert cmd_patterns_adjudicate(adjudicate_args) == 0
+                capsys.readouterr()
 
             doc.write_text(
                 "Introductory material moved here.\n\n"
@@ -900,8 +933,11 @@ class TestCmdPatternsScan:
         assert [match["finding_key"] for match in second["matches"]] == first_keys
         assert [match["disposition"] for match in second["matches"]] == [
             "unresolved",
-            "waived",
+            "waived" if cache_route == "reset" else "accepted_defect",
         ]
+        assert [match["scan_count"] for match in second["matches"]] == (
+            [2, 2] if cache_route == "warm" else [1, 1]
+        )
 
     def test_report_scopes_to_last_scan_target_by_default(
         self,
@@ -909,7 +945,7 @@ class TestCmdPatternsScan:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """Report defaults to the last scan's target, not the whole cross-scan
-        history -- the earth-engine-analysis Part 4 finding that a per-target
+        history -- a consumer audit's Part 4 finding that a per-target
         adjudication view beats a global last-scan count."""
         hotzone = tmp_path / "hotzone"
         conn = init_db(hot_zone=str(hotzone))
@@ -1004,8 +1040,15 @@ class TestCmdPatternsScan:
             assert cmd_patterns_report(report_args) == 0
             after_edit = json.loads(capsys.readouterr().out)
             assert after_edit["scope"] == "docs"
-            assert not after_edit["by_rule"]
             assert after_edit["finding_count"] == 0
+            # The repaired accepted_defect leaves the precision denominator but
+            # still counts toward actionable_rate (wv-7d2857).
+            repaired = after_edit["by_rule"]["prose-test"]
+            assert (
+                repaired["findings"], repaired["decided_count"],
+                repaired["durable_decided_count"], repaired["actionable_rate"],
+            ) == (0, 0, 1, 1.0)
+            assert repaired["decided_precision"] is None
 
             # An explicit path argument overrides the last scan's target.
             other_report_args = argparse.Namespace(
@@ -1028,7 +1071,7 @@ class TestCmdPatternsScan:
         rule ids independently flagging the identical (path, line, col)
         inflated the scan total and the by_rule summary with what is, from
         a reader's perspective, one finding counted twice -- reproduced
-        exactly in earth-engine-analysis with the built-in
+        exactly in a consumer repository with the built-in
         prose-casual-register and a project-local prose-consequence-so both
         firing on the same comma-plus-'so' text. The higher-maturity rule
         (promotable) must win over the lower one (candidate); the loser
@@ -1421,6 +1464,10 @@ class TestCmdPatternsScan:
             text = capsys.readouterr().out
             assert "prose-test: decided_precision=unavailable" in text
             assert "actionable_rate=unavailable" in text
+            # Each rate names its own denominator (wv-7d2857).
+            assert "decided_precision=unavailable decided_count=0 " in text
+            assert "actionable_rate=unavailable durable_decided_count=0 " in text
+            assert "over every durable disposition" in text
             assert "[needs adjudication]" in text
             needs_line = next(
                 line for line in text.splitlines() if line.startswith("Needs adjudication")
@@ -2320,7 +2367,7 @@ def test_validate_all_valid_returns_zero_and_text_output_lists_unused_surface(
 
 class TestRunPatternRuleAstGrepContainment:
     @staticmethod
-    def _mock_completed(matches: list[dict[str, object]]) -> subprocess.CompletedProcess[str]:
+    def _mock_completed(matches: Sequence[Mapping[str, object]]) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(
             args=["ast-grep"], returncode=0, stdout=json.dumps(matches), stderr=""
         )
@@ -2422,7 +2469,7 @@ class TestRunPatternRuleAstGrepContainment:
         target.mkdir()
         real = target / "x.py"
         real.write_text("pass\n", encoding="utf-8")
-        matches = [{"file": str(real), "range": {"start": {}}, "text": "m"}]
+        matches = [{"file": str(real), "range": {"start": dict[str, int]()}, "text": "m"}]
         with (
             patch("weave_quality.__main__.ast_grep_bin", return_value="/usr/bin/ast-grep"),
             patch("subprocess.run", return_value=self._mock_completed(matches)),
@@ -5227,6 +5274,72 @@ class TestCmdScanCategory:
         assert prod_entry is not None, "src/app.py not found in scan"
         assert prod_entry.category == "production"
 
+    @pytest.mark.parametrize("target", ["tests", "tests/test_foo.py"])
+    def test_scoped_scan_keeps_repo_paths_and_other_results(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str], target: str,
+    ) -> None:
+        repo = self._build_repo(tmp_path)
+        monkeypatch.chdir(repo)
+        (repo / ".weave").mkdir()
+        (repo / ".weave/quality.conf").write_text(
+            "[exclude]\ntests/excluded.py\n[classify]\ngenerated = tests/\n"
+        )
+        (repo / "tests/excluded.py").write_text("excluded = True\n")
+        args = _make_scan_args(str(tmp_path), path=str(repo / target))
+        args.repo = str(repo)
+        assert cmd_scan(args) == 0
+        conn = init_db(str(tmp_path))
+        scan = latest_scan(conn)
+        assert scan is not None
+        assert [(e.path, e.category) for e in get_file_entries(conn, scan.id)] == [
+            ("tests/test_foo.py", "generated")
+        ]
+        conn.close()
+        capsys.readouterr()
+        cmd_health_info(_make_health_args(str(tmp_path)))
+        assert json.loads(capsys.readouterr().out)["stale"] is True
+
+        assert cmd_scan(_make_scan_args(str(tmp_path), str(repo))) == 0
+        capsys.readouterr()
+        cmd_health_info(_make_health_args(str(tmp_path)))
+        assert json.loads(capsys.readouterr().out)["stale"] is False
+        (repo / "src/app.py").write_text("def main():\n    return 42\n")
+        args.json = True
+        assert cmd_scan(args) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["files_changed"] == 0
+        assert result["files_total"] == 3
+        conn = init_db(str(tmp_path))
+        scan = latest_scan(conn)
+        assert scan is not None
+        assert {e.path for e in get_file_entries(conn, scan.id)} == {
+            "tests/test_foo.py", "scripts/run.sh", "src/app.py"
+        }
+        conn.close()
+        capsys.readouterr()
+        cmd_health_info(_make_health_args(str(tmp_path)))
+        assert json.loads(capsys.readouterr().out)["stale"] is True
+        assert cmd_scan(_make_scan_args(str(tmp_path), str(repo))) == 0
+        capsys.readouterr()
+        cmd_health_info(_make_health_args(str(tmp_path)))
+        assert json.loads(capsys.readouterr().out)["stale"] is False
+
+    def test_foreign_scan_target_refused_before_database_write(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        repo = self._build_repo(tmp_path)
+        other = tmp_path / "other"
+        other.mkdir()
+        (other / "foreign.py").write_text("foreign = True\n")
+        zone = tmp_path / "private-zone"
+        args = _make_scan_args(str(zone), str(other))
+        args.repo = str(repo)
+        args.json = True
+        assert cmd_scan(args) == 1
+        assert json.loads(capsys.readouterr().out)["error"] == "invalid_scan_target"
+        assert not db_path(str(zone)).exists()
+
 
 class TestDiscoverFiles:
     """Tests for _discover_files file discovery and filtering."""
@@ -6295,7 +6408,7 @@ def test_adjudication_survives_relocation_but_does_not_bleed(
     original = tmp_path / "original.md"
     original.write_text("The pipeline yields a genuine result here.\n", encoding="utf-8")
 
-    def scan(target: Path) -> dict[str, object]:
+    def scan(target: Path) -> dict[str, Any]:
         args = argparse.Namespace(hot_zone=str(hotzone), path=str(target), json=True)
         with (
             patch("weave_quality.__main__._resolve_repo", return_value=str(tmp_path)),
@@ -6305,7 +6418,8 @@ def test_adjudication_survives_relocation_but_does_not_bleed(
             ),
         ):
             assert cmd_patterns_scan(args) == 0
-        return json.loads(capsys.readouterr().out)
+        report: dict[str, Any] = json.loads(capsys.readouterr().out)
+        return report
 
     first = scan(original)
     original_key = first["matches"][0]["finding_key"]
@@ -6341,7 +6455,7 @@ def test_adjudication_survives_relocation_but_does_not_bleed(
     assert other_match["disposition"] == "unresolved"
     assert other_match["disposition_source"] == "path"
 
-def test_stray_yml_rule_is_reported_not_silently_ignored(tmp_path, capsys):
+def test_stray_yml_rule_is_reported_not_silently_ignored(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """A rule the loader will not read must say so.
 
     Only *.yaml is loaded, so a perfectly valid rule saved as .yml never ran

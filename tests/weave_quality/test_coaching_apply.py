@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -30,7 +31,7 @@ PROMOTION_ID = "cp-" + "a" * 64
 PARENT = "wv-44e524"
 
 
-def candidate(occurrence_paths: list[str]) -> dict:
+def candidate(occurrence_paths: list[str]) -> dict[str, Any]:
     return {
         "promotion_id": PROMOTION_ID,
         "violation_type": "code:swallowed-exception",
@@ -66,7 +67,8 @@ def plan(occurrence_paths: list[str]) -> bytes:
 class FakeWv:
     """A scriptable `wv`. Records every invocation; fails what it is told to."""
 
-    def __init__(self, findings: list[dict] | None = None, edges: list[dict] | None = None,
+    def __init__(self, findings: list[dict[str, Any]] | None = None,
+                 edges: list[dict[str, Any]] | None = None,
                  fail: dict[str, tuple[int, str]] | None = None) -> None:
         self.findings = findings or []
         self.edges = edges or []
@@ -92,21 +94,26 @@ class FakeWv:
         return [c for c in self.calls if c[0] == verb]
 
 
-@pytest.fixture()
-def writer(tmp_path: Path):
-    written: list[dict] = []
+class PatchWriter:  # pylint: disable=too-few-public-methods
+    """A metadata writer that keeps every patch it was handed, in order."""
 
-    def write(patch: dict) -> str:
-        written.append(patch)
-        path = tmp_path / f"patch{len(written)}.json"
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.written: list[dict[str, Any]] = []
+
+    def __call__(self, patch: dict[str, Any]) -> str:
+        self.written.append(patch)
+        path = self.directory / f"patch{len(self.written)}.json"
         path.write_text(json.dumps(patch), encoding="utf-8")
         return str(path)
 
-    write.written = written  # type: ignore[attr-defined]
-    return write
+
+@pytest.fixture()
+def writer(tmp_path: Path) -> PatchWriter:
+    return PatchWriter(tmp_path)
 
 
-def existing_node(occurrence_paths: list[str], extra: dict | None = None) -> dict:
+def existing_node(occurrence_paths: list[str], extra: dict[str, Any] | None = None) -> dict[str, Any]:
     metadata = {
         "type": "finding",
         "finding": {
@@ -158,7 +165,7 @@ class TestMergePatch:
 
 
 class TestIdempotency:
-    def test_no_existing_node_creates_and_links(self, writer) -> None:
+    def test_no_existing_node_creates_and_links(self, writer: PatchWriter) -> None:
         wv = FakeWv(findings=[])
         result = apply_plan(plan(["a.py"]), run=wv, metadata_writer=writer)
 
@@ -167,7 +174,7 @@ class TestIdempotency:
         link = wv.commands("link")[0]
         assert link[1:] == ("wv-abc123", PARENT, "--type=references")
 
-    def test_one_existing_node_updates_in_place(self, writer) -> None:
+    def test_one_existing_node_updates_in_place(self, writer: PatchWriter) -> None:
         wv = FakeWv(findings=[existing_node(["a.py", "b.py"])],
                     edges=[{"source": "wv-abc123", "target": PARENT, "type": "references"}])
         result = apply_plan(plan(["a.py"]), run=wv, metadata_writer=writer)
@@ -178,7 +185,7 @@ class TestIdempotency:
         patch = writer.written[0]
         assert patch["finding"]["quality"]["decided_precision"] is None
 
-    def test_two_existing_nodes_fail_closed_without_mutating(self, writer) -> None:
+    def test_two_existing_nodes_fail_closed_without_mutating(self, writer: PatchWriter) -> None:
         duplicate = {**existing_node(["a.py"]), "id": "wv-def456"}
         wv = FakeWv(findings=[existing_node(["a.py"]), duplicate])
 
@@ -188,7 +195,7 @@ class TestIdempotency:
         assert caught.value.code == "ambiguous_promotion_id"
         assert not wv.commands("add") and not wv.commands("update") and not wv.commands("link")
 
-    def test_a_second_apply_of_the_same_plan_changes_nothing(self, writer) -> None:
+    def test_a_second_apply_of_the_same_plan_changes_nothing(self, writer: PatchWriter) -> None:
         """Re-running a reviewed plan must be inert, not additive."""
         wv = FakeWv(findings=[], edges=[])
         apply_plan(plan(["a.py"]), run=wv, metadata_writer=writer)
@@ -206,7 +213,7 @@ class TestIdempotency:
 
 
 class TestFailureHandling:
-    def test_a_failed_link_raises_and_keeps_the_node(self, writer) -> None:
+    def test_a_failed_link_raises_and_keeps_the_node(self, writer: PatchWriter) -> None:
         """The node stays. Deleting it would discard a real audit record and,
         on a transient failure, the only evidence the attempt happened."""
         wv = FakeWv(findings=[], edges=[], fail={"link": (1, "edge target not found")})
@@ -218,7 +225,7 @@ class TestFailureHandling:
         assert len(wv.commands("add")) == 1
         assert not [c for c in wv.calls if c[0] == "delete"]
 
-    def test_a_retry_after_a_failed_link_repairs_the_same_node(self, writer) -> None:
+    def test_a_retry_after_a_failed_link_repairs_the_same_node(self, writer: PatchWriter) -> None:
         wv = FakeWv(
             findings=[existing_node(["a.py"])],
             edges=[],  # the link never landed
@@ -229,14 +236,14 @@ class TestFailureHandling:
         assert result["applied"][0]["links_repaired"] == [(PARENT, "references")]
         assert not wv.commands("add")
 
-    def test_a_failed_update_is_reported_not_swallowed(self, writer) -> None:
+    def test_a_failed_update_is_reported_not_swallowed(self, writer: PatchWriter) -> None:
         wv = FakeWv(findings=[existing_node(["a.py", "b.py"])],
                     fail={"update": (1, "GraphPolicyViolation")})
         with pytest.raises(ApplyError) as caught:
             apply_plan(plan(["a.py"]), run=wv, metadata_writer=writer)
         assert caught.value.code == "update_failed"
 
-    def test_an_incomplete_snapshot_cannot_be_applied(self, writer) -> None:
+    def test_an_incomplete_snapshot_cannot_be_applied(self, writer: PatchWriter) -> None:
         document = json.loads(plan(["a.py"]))
         document["snapshot"] = {"state": "incomplete",
                                 "causes": [{"reason": "receipt_failed", "rule_id": "r"}]}
@@ -244,7 +251,7 @@ class TestFailureHandling:
             apply_plan(json.dumps(document).encode(), run=FakeWv(), metadata_writer=writer)
         assert caught.value.code == "incomplete_snapshot"
 
-    def test_a_document_that_is_not_a_plan_is_refused_before_any_call(self, writer) -> None:
+    def test_a_document_that_is_not_a_plan_is_refused_before_any_call(self, writer: PatchWriter) -> None:
         # wv-e07ee4: without this check a foreign document with a complete
         # snapshot reached the graph writes.
         document = json.loads(plan(["a.py"]))
@@ -257,7 +264,7 @@ class TestFailureHandling:
 
 
 class TestPlanBytes:
-    def test_the_digest_travels_into_the_node(self, writer) -> None:
+    def test_the_digest_travels_into_the_node(self, writer: PatchWriter) -> None:
         raw = plan(["a.py"])
         wv = FakeWv(findings=[], edges=[])
         result = apply_plan(raw, run=wv, metadata_writer=writer)
@@ -266,14 +273,14 @@ class TestPlanBytes:
         created = json.loads(wv.commands("add")[0][2].removeprefix("--metadata="))
         assert created["coaching"]["reviewed_plan_sha256"] == plan_digest(raw)
 
-    def test_review_parent_comes_from_the_plan(self, writer) -> None:
+    def test_review_parent_comes_from_the_plan(self, writer: PatchWriter) -> None:
         """Apply acts on the scope that was reviewed, not on an argument."""
         wv = FakeWv(findings=[], edges=[])
         result = apply_plan(plan(["a.py"]), run=wv, metadata_writer=writer)
         assert result["review_parent"] == PARENT
         assert wv.commands("link")[0][2] == PARENT
 
-    def test_reformatted_plan_bytes_are_a_different_digest(self, writer) -> None:
+    def test_reformatted_plan_bytes_are_a_different_digest(self, writer: PatchWriter) -> None:
         """The bytes are the unit. A semantically equal re-serialisation is not
         the reviewed artifact, and must not silently pass as it."""
         raw = plan(["a.py"])

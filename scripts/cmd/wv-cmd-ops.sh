@@ -21,9 +21,15 @@
 #     ready: [{id, text}, ...],
 #     learnings: [{id, text, learning}, ...] }
 
+# The project's own wv, for the operator to run; bootstrap reports the path and
+# never runs it. The commit gate refuses a changed gate file that names gate
+# code under the working tree's root, since a lane would run the commit's
+# bytes (S2b review N1, wv-c424ed); a path only reported is not that, so it is
+# joined from the root and a relative name.
 _bootstrap_repo_wv_path() {
     [ -n "${REPO_ROOT:-}" ] || return 0
-    canonicalize_runtime_path "$REPO_ROOT/scripts/wv"
+    local rel=scripts/wv
+    canonicalize_runtime_path "$REPO_ROOT/$rel"
 }
 
 _bootstrap_invoked_wv_path() {
@@ -135,7 +141,11 @@ _wv_agent_python_exec_module() {
         return 127
     fi
 
-    PYTHONPATH="$pypath" "$python_command" -m "$module" "$@"
+    # PYTHONSAFEPATH: 'python -m' otherwise puts the cwd first on sys.path, so a
+    # weave_* directory in the caller's project shadows the selected copy (wrong
+    # copy of the tool). Honoured from 3.11; older interpreters ignore it, and
+    # wv doctor's guide-validity check compares the module that actually ran.
+    PYTHONSAFEPATH=1 PYTHONPATH="$pypath" "$python_command" -m "$module" "$@"
 }
 
 _bootstrap_shell_token() {
@@ -265,7 +275,7 @@ _bootstrap_codex_json() {
     local wv_token telemetry_log telemetry_token
     wv_token=$(_bootstrap_shell_token "$wv_command")
     # Use the durable config.env path when set; fall back to the persistent default.
-    # The hot-zone path (/tmp/weave-codex-*) was previously used here but is ephemeral
+    # The /tmp hot-zone path was previously used here but is ephemeral
     # and diverges from WV_CALL_LOG — two writers, two paths, no coordination.
     telemetry_log="${WV_CALL_LOG:-${WV_CALL_LOG_DEFAULT:-$HOME/.local/share/weave/wv_calls.jsonl}}"
     telemetry_token=$(_bootstrap_shell_token "$telemetry_log")
@@ -443,39 +453,119 @@ _bootstrap_structural_json() {
 
 # _bootstrap_heavy_tier_json -> the push tier's state for the commits not yet
 # on the upstream (wv-862ac0), or null (no upstream, no [heavy] section):
-# {state, upstream, suites:[{suite, state}]}. A suite is green when the ledger
-# holds a green row for every unpushed file at its current content, red when a
-# row for that content failed, pending otherwise. state is the worst of them,
-# or clear when no heavy suite is owed. Nothing runs here; pre-push runs them.
+# {state, upstream, suites:[{suite, state}]}. Green/red describe a previous
+# frozen attempt for this tip, not current execution eligibility: bootstrap
+# cannot reproduce the hook's protected installation and environment. Only
+# pre-push's exact snapshot-key lookup authorizes reuse (wv-bbeff4).
+# State is the worst observation, clear when nothing is owed, unknown when
+# commits or suites cannot be listed. Nothing runs here; pre-push runs them.
 _bootstrap_heavy_tier_json() {
-    local top upstream files csv selected suite out st rows
+    local top upstream files selected suite out st rows
     top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo 'null'; return 0; }
-    grep -q '^\[heavy\]' "$WEAVE_DIR/test-map.conf" 2>/dev/null || { echo 'null'; return 0; }
+    # An unavailable map is not one without [heavy]: it says unknown (wv-b02828).
+    local map_text map_rc=0
+    map_text=$(wv_config_read "$WEAVE_DIR/test-map.conf") || map_rc=$?
+    [ "$map_rc" -eq 2 ] && { echo 'null'; return 0; }
     upstream=$(git -C "$top" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) \
         || { echo 'null'; return 0; }
-    # --no-renames, as pre-push lists the same range: a rename otherwise hid the
-    # old path, and this report said clear while pre-push owed its suites (wv-581bb0).
-    files=$(git -C "$top" log --format= --name-only --no-renames "$upstream..HEAD" 2>/dev/null | sort -u \
-        | wv_non_graph_state_paths)
-    if [ -z "$files" ]; then
+    # A listing or routing failure is "unknown", never "clear": clear tells the
+    # operator nothing is owed at push (wv-cf48a9).
+    local unknown='{state: "unknown", upstream: $u, suites: [], reason: $r}'
+    if [ "$map_rc" -ne 0 ]; then
+        jq -cn --arg u "$upstream" --arg r ".weave/test-map.conf cannot be read" "$unknown"
+        return 0
+    fi
+    # What pre-push owes, selected as it selects (follow-up review F3,
+    # wv-ade029): each unpushed commit's files, routed by the maps that commit
+    # and its parents hold. The working-tree map alone dropped a suite an
+    # earlier commit deferred once a later one removed [heavy]. No tier at all
+    # (null) only when no map, in the working tree or any of those commits,
+    # declares one; the header is read as the router reads it (wv-ee5e36).
+    local commits ids c p text heavy=no any_files=no
+    commits=$(git -C "$top" rev-list "$upstream..HEAD" 2>/dev/null) || {
+        jq -cn --arg u "$upstream" --arg r "git rev-list $upstream..HEAD failed" "$unknown"
+        return 0
+    }
+    grep -qE '^[[:space:]]*\[heavy\]' <<< "$map_text" && heavy=yes
+    if [ "$heavy" = no ] && [ -n "$commits" ]; then
+        # shellcheck disable=SC2086  # a commit list, split on purpose
+        ids=$(git -C "$top" rev-list --no-walk=unsorted --parents $commits 2>/dev/null) || {
+            jq -cn --arg u "$upstream" --arg r "the unpushed commits' parents could not be listed" "$unknown"
+            return 0
+        }
+        for c in $(tr ' ' '\n' <<< "$ids" | sort -u); do
+            git -C "$top" cat-file -e "$c:.weave/test-map.conf" 2>/dev/null || continue
+            text=$(git -C "$top" cat-file blob "$c:.weave/test-map.conf" 2>/dev/null) || {
+                jq -cn --arg u "$upstream" --arg r "the test map at ${c:0:12} could not be read" "$unknown"
+                return 0
+            }
+            grep -qE '^[[:space:]]*\[heavy\]' <<< "$text" && { heavy=yes; break; }
+        done
+    fi
+    [ "$heavy" = yes ] || { echo 'null'; return 0; }
+    local files parents routed heavy_now
+    local -a file_args=() revs=()
+    selected=""
+    # Load the router before naming the maps: loading it sets _IMPACT_MAP_REVS
+    # to (), which wiped the revisions set ahead of the first call, and that
+    # call routed by the working-tree map instead.
+    _wv_autoload graph
+    for c in $commits; do
+        files=$(git -C "$top" diff-tree --root -m -r --no-commit-id --name-only --no-renames "$c" 2>/dev/null) \
+            && parents=$(git -C "$top" rev-parse "$c^@" 2>/dev/null) || {
+            jq -cn --arg u "$upstream" --arg r "commit ${c:0:12} could not be read" "$unknown"
+            return 0
+        }
+        files=$(sort -u <<< "$files" | wv_non_graph_state_paths)
+        [ -n "$files" ] || continue
+        any_files=yes
+        mapfile -t file_args <<< "$files"
+        revs=("$c")
+        for p in $parents; do revs+=("$p"); done
+        if ! routed=$(_IMPACT_MAP_REVS=("${revs[@]}"); _impact_suites_for_files "${file_args[@]}" 2>/dev/null) \
+            || ! heavy_now=$(jq -r '.[] | select(.tier == "heavy") | .name' <<< "$routed" 2>/dev/null); then
+            jq -cn --arg u "$upstream" --arg r "the suite selection could not be resolved (wv impact --suites)" "$unknown"
+            return 0
+        fi
+        selected+="$heavy_now"$'\n'
+    done
+    if [ "$any_files" = no ]; then
         jq -cn --arg u "$upstream" '{state: "clear", upstream: $u, suites: []}'
         return 0
     fi
-    csv=$(printf '%s\n' "$files" | paste -sd ',' -)
-    local file_args=()
-    mapfile -t file_args <<< "$files"
-    selected=$(_impact_suites_for_files "${file_args[@]}" 2>/dev/null \
-        | jq -r '.[] | select(.tier == "heavy") | .name' 2>/dev/null | sort)
+    selected=$(grep . <<< "$selected" | sort -u)
+    # Observations never populate or substitute for @inputs reuse records.
+    # Match the full frozen subject conservatively, including both the index
+    # and worktree: opposite staged/unstaged edits must not cancel out here.
+    local tree base input_base clean=false
+    if ! tree=$(git -C "$top" rev-parse 'HEAD^{tree}' 2>/dev/null) \
+        || ! base=$(git -C "$top" rev-parse 'HEAD^{commit}' 2>/dev/null) \
+        || ! input_base=$(git -C "$top" merge-base HEAD "$upstream" 2>/dev/null); then
+        jq -cn --arg u "$upstream" --arg r "the frozen readiness subject could not be resolved" "$unknown"
+        return 0
+    fi
+    if git -C "$top" diff --quiet --ignore-submodules=none \
+        && git -C "$top" diff --cached --quiet "$base" --ignore-submodules=none; then
+        clean=true
+    fi
     out='[]'
-    while IFS= read -r suite; do
-        [ -n "$suite" ] || continue
-        rows=$(cmd_test_status "$suite" --files="$csv" 2>/dev/null | cut -f1)
-        if printf '%s\n' "$rows" | grep -qx red; then st=red
-        elif [ -n "$rows" ] && ! printf '%s\n' "$rows" | grep -qvx green; then st=green
-        else st=pending; fi
-        out=$(jq -c --arg s "$suite" --arg t "$st" '. + [{suite: $s, state: $t}]' <<< "$out")
-    done <<< "$selected"
+    if [ -n "$selected" ]; then
+        rows=$(db_query_json "SELECT suite, fingerprint, exit_code FROM test_results
+            WHERE path='@snapshot-observation:prepush';" 2>/dev/null) || rows='[]'
+        while IFS= read -r suite; do
+            [ -n "$suite" ] || continue
+            st=$(jq -r --arg s "$suite" --arg t "$tree" --arg b "$base" --arg u "$input_base" \
+                --argjson clean "$clean" '
+                .[] | select(.suite == $s) | (.fingerprint | fromjson) as $o
+                | select($clean and $o.tree == $t and $o.base == $b and $o.input_base == $u
+                    and ($o.key | test("^snapshot-v1:[0-9a-f]{64}$")))
+                | if .exit_code == 0 then "green" else "red" end' <<< "${rows:-[]}" 2>/dev/null)
+            case "$st" in green|red) ;; *) st=pending ;; esac
+            out=$(jq -c --arg s "$suite" --arg t "$st" '. + [{suite: $s, state: $t}]' <<< "$out")
+        done <<< "$selected"
+    fi
     jq -c --arg u "$upstream" '{upstream: $u, suites: .,
+        basis: "snapshot-observation", execution_inputs: "unverified",
         state: (if length == 0 then "clear"
                 elif any(.state == "red") then "red"
                 elif any(.state == "pending") then "pending"
@@ -501,9 +591,13 @@ _bootstrap_readiness_advisories() {
             ($st[] | "structural, fix first: \(.id) \(.text)"),
             (if $ht == null then empty
              elif $ht.state == "red" then
-                "heavy tier red for commits not on \($ht.upstream): \([$ht.suites[] | select(.state == "red") | .suite] | join(", ")) - the push will be refused; fix before other work"
+                "heavy tier red for commits not on \($ht.upstream): \([$ht.suites[] | select(.state == "red") | .suite] | join(", ")) - last frozen attempt failed; fix before other work; git push revalidates"
+             elif $ht.state == "green" then
+                "heavy tier last passed for this tip; current execution inputs are unverified - git push checks exact reuse eligibility"
              elif $ht.state == "pending" then
                 "heavy tier pending for commits not on \($ht.upstream): \([$ht.suites[] | select(.state != "green") | .suite] | join(", ")) - git push runs them"
+             elif $ht.state == "unknown" then
+                "heavy tier unknown for commits not on \($ht.upstream): \($ht.reason // "no reason given") - git push refuses until it resolves"
              else empty end)
         ]'
 }
@@ -613,7 +707,7 @@ cmd_bootstrap() {
     # at session start, so surface it here (Claude/Codex/Copilot alike).
     local drift_files drift_advisory=""
     if drift_files=$(_wv_source_drift); then
-        drift_advisory="install drift: edited source not reinstalled (${drift_files}) — run ./install.sh (dev repo) or 'wv init-repo --update' (consumer) before committing, or the pre-commit drift gate fails"
+        drift_advisory="install drift: edited source not reinstalled (${drift_files}) — source commits do not install; run ./install.sh (dev repo) or 'wv init-repo --update' (consumer) explicitly when updating the installed runtime is intended"
     fi
 
     # ── Cross-agent quality-scan advisory ── the quality gate (_done_refresh_*)
@@ -2531,7 +2625,9 @@ _doctor_record() {
         warn) _dr_warn=$((_dr_warn + 1)) ;;
     esac
     if [ "$_dr_format" = "json" ]; then
-        _dr_results="${_dr_results:+$_dr_results,}$(printf '{"check":"%s","status":"%s","detail":"%s"}' "$name" "$status" "$detail")"
+        # Details carry paths, commands and error text: escaped, or one quote
+        # in a detail makes the whole --json report unparsable.
+        _dr_results="${_dr_results:+$_dr_results,}$(printf '{"check":"%s","status":"%s","detail":"%s"}' "$name" "$status" "$(wv_json_escape "$detail")")"
     else
         local icon
         case "$status" in
@@ -2588,6 +2684,7 @@ _doctor_check_lib_refs() {
 _doctor_check_cmd_defs() {
     local label="$1" entry calls c found=0 total=0 missing=""
     entry=$(_doctor_entry_script)
+    # shellcheck disable=SC2016  # the bracket expression [^$...] matches a literal $ in source text
     calls=$(grep -v '^[[:space:]]*#' "$entry" 2>/dev/null \
         | grep -oE '(^|[^$a-zA-Z0-9_{])cmd_[a-z0-9_]+[=]?' | grep -v '=$' \
         | grep -oE 'cmd_[a-z0-9_]+' | sort -u)
@@ -2713,7 +2810,7 @@ _doctor_check_codex_hooks() {
     fi
 
     local missing="" ev
-    for ev in SessionStart PreToolUse PostToolUse Stop; do
+    for ev in SessionStart PreToolUse PostToolUse PreCompact Stop; do
         jq -e --arg ev "$ev" '(.hooks[$ev] // []) | length > 0' "$hooks_file" >/dev/null 2>&1 || missing="${missing:+$missing, }$ev"
     done
     if [ -n "$missing" ]; then
@@ -2721,7 +2818,20 @@ _doctor_check_codex_hooks() {
         return
     fi
 
-    _doctor_record "codex hooks" "warn" ".codex/hooks.json covers SessionStart/PreToolUse/PostToolUse/Stop -- pending trust; review and trust with /hooks in Codex before it enforces"
+    # A blocking event that still runs dispatch with --json blocks with exit 1,
+    # which Codex reads as a failed hook, so the guard is advisory only
+    # (wv-5b774a); the generated config uses --format=host.
+    local advisory=""
+    for ev in PreToolUse Stop; do
+        jq -e --arg ev "$ev" '[.hooks[$ev][]?.hooks[]?.command // empty | select(test("hook dispatch") and (test("--format=host") | not))] | length > 0' \
+            "$hooks_file" >/dev/null 2>&1 && advisory="${advisory:+$advisory, }$ev"
+    done
+    if [ -n "$advisory" ]; then
+        _doctor_record "codex hooks" "warn" ".codex/hooks.json is stale, $advisory dispatch without --format=host cannot block in Codex -- regenerate with wv init-repo --agent=codex --codex-hooks --force"
+        return
+    fi
+
+    _doctor_record "codex hooks" "warn" ".codex/hooks.json covers SessionStart/PreToolUse/PostToolUse/PreCompact/Stop -- pending trust; review and trust with /hooks in Codex before it enforces"
 }
 
 # cmd_context_policy [--json] [--refresh] — the context load policy (HIGH/MEDIUM/
@@ -2906,6 +3016,9 @@ cmd_hotzone() {
             local hot_zone hz_parent
             hot_zone=$(resolve_repo_hot_zone)
             hz_parent=$(dirname "$hot_zone")
+            if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+                echo "note: not inside a git repo — the hot-zone parent resolves repo-relatively; cd into a repo to see its family" >&2
+            fi
             if [ ! -d "$hz_parent" ]; then
                 if [ "$as_json" = true ]; then echo "[]"; else echo "Hot-zone parent $hz_parent not found."; fi
                 return 0
@@ -2941,18 +3054,21 @@ cmd_hotzone() {
                 # always name the scanned parent so empty output is diagnosable.
                 echo "(no hot-zone dirs under $hz_parent)" >&2
             fi
-            if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
-                echo "note: not inside a git repo — the hot-zone parent resolves repo-relatively; cd into a repo to see its family" >&2
-            fi
             ;;
         db|--db)
             # Print the resolved brain.db path so agents/scripts never hand-roll
-            # /dev/shm vs /tmp/weave-codex paths in raw sqlite3 (finding wv-f752a5:
+            # /dev/shm vs /tmp/weave-hotzone paths in raw sqlite3 (finding wv-f752a5:
             # a guessed path errors and — in a parallel tool batch — cancels its
             # siblings). Use: DB=$(wv hotzone --db); sqlite3 "$DB" "..."
             local hot_zone
             hot_zone=$(resolve_repo_hot_zone)
             echo "${WV_DB:-$hot_zone/brain.db}"
+            ;;
+        diff)
+            # Normally dispatched by scripts/wv before placement is resolved
+            # (wv-757de1); reached here only when cmd_hotzone is called
+            # directly. lib/wv-graph-diff.sh holds the comparison (wv-4898f7).
+            wv_graph_diff "$@"
             ;;
         *)
             echo "Usage: wv hotzone <subcommand>"
@@ -2961,6 +3077,7 @@ cmd_hotzone() {
             echo "  gc [--dry-run]   Remove orphan hot-zone dirs (no .repo_root or dead owner)"
             echo "  list             Show all hot-zone dirs with owner + node count"
             echo "  db               Print the resolved brain.db path (for raw sqlite3)"
+            echo "  diff <db> <db>   Compare two copies of one graph, read-only (before removing either)"
             ;;
     esac
 }
@@ -2988,6 +3105,205 @@ _test_file_fingerprint_staged() {
     [ -z "$h" ] && h="missing"
     printf '%s' "$h"
 }
+
+# ── Input keys (wv-cb4913, gate-latency S5; wv-f0bcc4) ── The gate reuses a
+# suite's result when the bytes the suite reads are the bytes it was green on.
+# A file that differs from a base commit is keyed by its mode and blob; every
+# other file is pinned by the base itself. A suite's key hashes the base, the
+# test-map.conf the router reads, the suite's own file, and its keyed changes:
+#   - a suite with a complete input scope declared under [inputs] in
+#     test-map.conf: the changed files in that scope or routed to it, so a
+#     retry after a one-file fix reruns only the suites that file feeds;
+#   - any other suite: every changed file. Routing is not an input manifest:
+#     a route records that a suite caught a planted break in a file, not that
+#     the suite reads nothing else (scripts/weave_quality/__main__.py selects
+#     test-quality.sh and imports prose_shape.py, which routes elsewhere), and
+#     a fresh gate runs a selected suite against every staged file.
+# An [inputs] scope is a claim of completeness; declare one only with evidence
+# of what the suite reads.
+
+# The newest input-key rows test-record keeps per suite.
+_TEST_INPUT_ROWS=20
+
+# _test_input_base — the commit input keys are relative to: the merge-base with
+# the upstream, so a commit landing on top of a green run does not reset every
+# key; else HEAD; else the empty tree (unborn branch).
+_test_input_base() {
+    local up mb
+    if up=$(git rev-parse --verify -q '@{u}' 2>/dev/null) && [ -n "$up" ] \
+        && mb=$(git merge-base HEAD "$up" 2>/dev/null) && [ -n "$mb" ]; then
+        printf '%s\n' "$mb"
+        return 0
+    fi
+    git rev-parse --verify -q HEAD 2>/dev/null || git hash-object -t tree /dev/null
+}
+
+# _test_input_scopes — "<suite>\t<globs>" for each [inputs] entry of the
+# working-tree test-map.conf.
+_test_input_scopes() {
+    awk '/^[[:space:]]*\[/ { sec = $0; gsub(/[[:space:]]/, "", sec); next }
+         sec == "[inputs]" && /=/ && !/^[[:space:]]*#/ {
+             k = $0; sub(/[[:space:]]*=.*/, "", k); gsub(/^[[:space:]]+/, "", k)
+             v = $0; sub(/^[^=]*=[[:space:]]*/, "", v)
+             print k "\t" v }' "$WEAVE_DIR/test-map.conf" 2>/dev/null
+}
+
+# _test_input_keys <staged|worktree> <suite>... — prints "<key>\t<suite>" per
+# suite. staged keys what the commit carries: the index's mode and blob, and
+# missing for a path the index lacks even if it is still on disk, since the
+# commit will not have it. worktree keys what a suite started now would read.
+# A result recorded with a worktree key matches a staged key only when the
+# index holds exactly the files tested, modes included.
+#
+# Absence is an input ("missing"); failing to observe is not. Each acquisition
+# -- the index listing, every blob hash, the key hash itself -- is checked and
+# its output validated, and any failure makes the key uncomputable (return 1),
+# so the caller runs the suite. Read as missing or unreadable, a failed
+# listing or a short hash batch minted the same key for different content
+# (wv-3fab34).
+_test_input_keys() {
+    local mode="$1"; shift
+    [ $# -gt 0 ] || return 0
+    local top base changed paths routes conf_fp suite p g fm scopes keyed
+    top=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+    base=$(_test_input_base) || return 1
+    # Every input below is required: a listing, conf hash or route table that
+    # failed would key a suite on fewer inputs than it has, and a green result
+    # for the narrower key would be reused (wv-cf48a9). The key is then
+    # uncomputable and the caller runs the suite. PIPESTATUS carries git's
+    # status out past tr.
+    local cached=()
+    [ "$mode" = staged ] && cached=(--cached)
+    changed=$(git -C "$top" diff "${cached[@]}" --name-only --no-renames -z "$base" 2>/dev/null \
+        | tr '\0' '\n'; exit "${PIPESTATUS[0]}") || return 1
+    # Graph state is never routed by either gate, so it is no suite's input.
+    changed=$(printf '%s\n' "$changed" | wv_non_graph_state_paths)
+    # The router reads the working-tree conf in both modes, so that is what
+    # decides which inputs a suite has.
+    local conf_rc=0
+    wv_config_read "$WEAVE_DIR/test-map.conf" >/dev/null || conf_rc=$?
+    case "$conf_rc" in
+        0) conf_fp=$(git hash-object -- "$WEAVE_DIR/test-map.conf" 2>/dev/null) || return 1
+           _test_input_is_blob "$conf_fp" || return 1 ;;
+        2) conf_fp=missing ;;
+        *) return 1 ;;
+    esac
+    paths=$({ printf '%s\n' "$changed"; printf '%s\n' "$@"; } | grep -v '^$' | LC_ALL=C sort -u)
+    # c[path] = "<mode> <blob>", or unset for missing. The index's entries
+    # first: the staged content, and the worktree's mode when core.fileMode
+    # is off (git then ignores the executable bit, so must this).
+    declare -A c=() idx=()
+    local m b listing
+    listing=$(git -C "$top" ls-files -s -z -- 2>/dev/null | tr '\0' '\n'; exit "${PIPESTATUS[0]}") || return 1
+    while IFS=$'\t' read -r fm p; do
+        [ -n "$p" ] || continue
+        # "<mode> <blob> <stage>": anything else is a listing this cannot trust.
+        [[ "$fm" =~ ^[0-7]{6}\ [0-9a-f]{40}([0-9a-f]{24})?\ [0-3]$ ]] || return 1
+        read -r m b _ <<< "$fm"
+        idx["$p"]="$m $b"
+    done < <(awk -F'\t' 'NR == FNR { want[$0] = 1; next } ($2 in want)' <(printf '%s\n' "$paths") - <<< "$listing")
+    if [ "$mode" = staged ]; then
+        for p in "${!idx[@]}"; do c["$p"]="${idx[$p]}"; done
+    else
+        local filemode regular=() blobs=() i d
+        filemode=$(git -C "$top" config --bool core.fileMode 2>/dev/null || echo true)
+        # git diff cannot see into a directory it cannot search: a file added
+        # since the base under one is listed as nothing at all, and every key
+        # then omits it. So each directory holding a tracked file must be
+        # observable -- searchable, or observably absent.
+        while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            if [ -d "$top/$d" ]; then
+                [ -x "$top/$d" ] || return 1
+            elif ! wv_path_absent "$top/$d"; then
+                return 1
+            fi
+        done < <(cut -f2 <<< "$listing" | sed -n 's|/[^/]*$||p' | LC_ALL=C sort -u)
+        local target hash
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            if [ -L "$top/$p" ]; then
+                target=$(readlink -- "$top/$p") || return 1
+                hash=$(printf '%s' "$target" | tr -d '\n' | git hash-object --stdin 2>/dev/null) || return 1
+                _test_input_is_blob "$hash" || return 1
+                c["$p"]="120000 $hash"
+            elif [ -f "$top/$p" ]; then
+                regular+=("$p")
+            elif ! wv_path_absent "$top/$p"; then
+                # A directory or special file where a file was, or a path
+                # whose absence cannot be observed: not "missing".
+                return 1
+            fi
+        done <<< "$paths"
+        if [ "${#regular[@]}" -gt 0 ]; then
+            local hashed
+            hashed=$(printf '%s\n' "${regular[@]}" | git -C "$top" hash-object --stdin-paths 2>/dev/null; \
+                exit "${PIPESTATUS[1]}") || return 1
+            mapfile -t blobs <<< "$hashed"
+            # One blob per requested path, each a blob id: a short batch left
+            # the rest keyed by a sentinel whatever their content.
+            [ "${#blobs[@]}" -eq "${#regular[@]}" ] || return 1
+            for i in "${!regular[@]}"; do
+                _test_input_is_blob "${blobs[$i]}" || return 1
+                p="${regular[$i]}"
+                if [ "$filemode" = false ]; then
+                    fm="${idx[$p]%% *}"; fm="${fm:-100644}"
+                elif [ -x "$top/$p" ]; then
+                    fm=100755
+                else
+                    fm=100644
+                fi
+                c["$p"]="$fm ${blobs[$i]}"
+            done
+        fi
+    fi
+    routes=""
+    if [ -n "$changed" ]; then
+        local changed_args=()
+        mapfile -t changed_args <<< "$changed"
+        routes=$(_impact_suites_for_files --routes "${changed_args[@]}") || return 1
+    fi
+    declare -A scope=()
+    while IFS=$'\t' read -r suite g; do
+        [ -n "$suite" ] && scope["$suite"]="$g"
+    done < <(_test_input_scopes)
+    for suite in "$@"; do
+        [ -n "$suite" ] || continue
+        if [ -n "${scope[$suite]+x}" ]; then
+            # Declared: changed files in the scope, plus any routed to it.
+            read -ra scopes <<< "${scope[$suite]}"
+            keyed=$( {
+                awk -F'\t' -v s="$suite" '$2 == s { print $1 }' <<< "$routes"
+                while IFS= read -r p; do
+                    [ -n "$p" ] || continue
+                    for g in "${scopes[@]}"; do
+                        # unquoted RHS is intentional: glob-match the scope
+                        # shellcheck disable=SC2053
+                        if { [[ "$g" == */ ]] && [[ "$p" == "$g"* ]]; } || [[ "$p" == $g ]]; then
+                            printf '%s\n' "$p"; break
+                        fi
+                    done
+                done <<< "$changed"
+            } )
+        else
+            keyed="$changed"
+        fi
+        local key
+        key=$( {
+            printf 'base %s\nconf %s\n' "$base" "$conf_fp"
+            { printf '%s\n' "$suite"; printf '%s\n' "$keyed"; } | grep -v '^$' | LC_ALL=C sort -u \
+                | while IFS= read -r p; do printf '%s\t%s\n' "${c[$p]:-missing}" "$p"; done
+        } | git hash-object --stdin 2>/dev/null) || return 1
+        _test_input_is_blob "$key" || return 1
+        printf '%s\t%s\n' "$key" "$suite"
+    done
+}
+
+# _test_input_is_blob <id> — a full SHA-1 or SHA-256 object id.
+_test_input_is_blob() {
+    [[ "$1" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_config — front door for the two durable opt-in seams (finding wv-e754b0)
@@ -3113,6 +3429,7 @@ _scaffold_test_map() {
     local repo_root; repo_root=$(dirname "$WEAVE_DIR")
     # Header common to all stacks
     local body
+    # shellcheck disable=SC2016  # template text written into a generated test-map; its $(...) is for that file
     body='# .weave/test-map.conf — source file to test suite mapping
 # Format ([map] section, INI-style):
 #   source_file = suite [suite ...]
@@ -3138,6 +3455,7 @@ _scaffold_test_map() {
 
     if [ -f "$repo_root/pyproject.toml" ] || [ -f "$repo_root/setup.cfg" ] || [ -f "$repo_root/setup.py" ]; then
         added=1
+        # shellcheck disable=SC2016  # template text written into a generated test-map; its $(...) is for that file
         body+='# Python (pyproject.toml / setup.cfg detected)
 # Create a wrapper that sets up the env and runs pytest, e.g. scripts/run-tests.sh:
 #   #!/usr/bin/env bash
@@ -3153,6 +3471,7 @@ _scaffold_test_map() {
 
     if [ -f "$repo_root/Cargo.toml" ]; then
         added=1
+        # shellcheck disable=SC2016  # template text written into a generated test-map; its $(...) is for that file
         body+='# Rust (Cargo.toml detected)
 # Create a wrapper, e.g. scripts/run-tests.sh:
 #   #!/usr/bin/env bash
@@ -3166,6 +3485,7 @@ _scaffold_test_map() {
 
     if [ -f "$repo_root/package.json" ]; then
         added=1
+        # shellcheck disable=SC2016  # template text written into a generated test-map; its $(...) is for that file
         body+='# Node.js (package.json detected)
 # Create a wrapper, e.g. scripts/run-tests.sh:
 #   #!/usr/bin/env bash
@@ -3325,10 +3645,12 @@ cmd_config() {
             fi ;;
         set)
             if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then echo "wv config set: need KEY VALUE" >&2; return 1; fi
-            if _config_env_set "$1" "$2"; then echo -e "${GREEN}✓${NC} set $1 (effective next invocation)"; fi ;;
+            _config_env_set "$1" "$2" || return $?
+            echo -e "${GREEN}✓${NC} set $1 (effective next invocation)" ;;
         unset)
             if [ -z "${1:-}" ]; then echo "wv config unset: need a KEY" >&2; return 1; fi
-            _config_env_unset "$1"; echo -e "${GREEN}✓${NC} unset $1" ;;
+            _config_env_unset "$1" || return $?
+            echo -e "${GREEN}✓${NC} unset $1" ;;
         enable)
             case "${1:-}" in
                 session-analysis) _config_enable_session_analysis ;;
@@ -3372,6 +3694,7 @@ _durable_log_writable() {
 # and `repo` is a basename so no absolute $HOME/username path leaks (no PII).
 _suite_log_append() {
     local suite="$1" files="$2" exit_code="$3" duration_ms="$4" sha="$5" estimate_ms="${6:-}"
+    local started_ms="${7:-}" ended_ms="${8:-}"
     _durable_log_writable || return 0
     local log_path; log_path=$(_suite_log_path)
     [ -n "$log_path" ] || return 0
@@ -3381,6 +3704,11 @@ _suite_log_append() {
     case "$exit_code" in ''|*[!0-9]*) exit_code=0 ;; esac
     case "$duration_ms" in ''|*[!0-9]*) duration_ms=0 ;; esac
     case "$estimate_ms" in ''|*[!0-9]*) estimate_ms=null ;; esac
+    # started_ms/ended_ms (wv-4666cb): when the suite started and exited, epoch
+    # ms, as the gate's worker read them. ts is when this line is written, which
+    # for a gate is after its last suite ends. Unknown is absent, never 0.
+    case "$started_ms" in ''|0|*[!0-9]*) started_ms=null ;; esac
+    case "$ended_ms" in ''|0|*[!0-9]*) ended_ms=null ;; esac
     local repo=""
     [ -n "${REPO_ROOT:-}" ] && repo=$(basename "$REPO_ROOT")
     # phase/gate_id (wv-ffda33) come from the gate that ran the suite, so one
@@ -3395,11 +3723,17 @@ _suite_log_append() {
         --arg sha "$sha" \
         --arg phase "${WV_GATE_PHASE:-}" \
         --arg gate_id "${WV_GATE_ID:-}" \
+        --arg execution_mode "${WV_GATE_EXECUTION_MODE:-}" \
         --argjson estimate_ms "$estimate_ms" \
+        --argjson started_ms "$started_ms" \
+        --argjson ended_ms "$ended_ms" \
         '{ts:$ts, repo:$repo, suite:$suite, files:$files, exit:$exit, duration_ms:$duration_ms, sha:$sha}
          + (if $phase != "" then {phase:$phase} else {} end)
          + (if $gate_id != "" then {gate_id:$gate_id} else {} end)
-         + (if $estimate_ms != null then {estimate_ms:$estimate_ms} else {} end)' \
+         + (if $execution_mode != "" then {execution_mode:$execution_mode} else {} end)
+         + (if $estimate_ms != null then {estimate_ms:$estimate_ms} else {} end)
+         + (if $started_ms != null then {started_ms:$started_ms} else {} end)
+         + (if $ended_ms != null then {ended_ms:$ended_ms} else {} end)' \
         >> "$log_path" 2>/dev/null || true
 }
 
@@ -3410,26 +3744,34 @@ _gate_log_path() {
     echo "${WV_GATE_LOG:-$(dirname "$suite_log")/gate_runs.jsonl}"
 }
 
-# _gate_log_append <phase> <gate_id> <exit> <duration_ms> <estimate_ms> <suites_csv> <sha>
+# _gate_log_append <phase> <gate_id> <exit> <duration_ms> <estimate_ms> <suites_csv> <sha> [started_ms]
 # One JSONL line per gate INVOCATION: its wall time, what it ran, what it
 # expected to take, and how it ended. Best-effort like the suite log.
+# started_ms (wv-4666cb) is the gate's start in epoch ms, the origin its suites'
+# ended_ms are measured from; absent where unknown.
 _gate_log_append() {
     local phase="$1" gate_id="$2" exit_code="$3" duration_ms="$4" estimate_ms="$5" suites="$6" sha="$7"
+    local started_ms="${8:-}"
     _durable_log_writable || return 0
     local log_path; log_path=$(_gate_log_path)
     mkdir -p "$(dirname "$log_path")" 2>/dev/null || return 0
     case "$exit_code" in ''|*[!0-9]*) exit_code=1 ;; esac
     case "$duration_ms" in ''|*[!0-9]*) duration_ms=0 ;; esac
     case "$estimate_ms" in ''|*[!0-9]*) estimate_ms=null ;; esac
+    case "$started_ms" in ''|0|*[!0-9]*) started_ms=null ;; esac
     local repo=""
     [ -n "${REPO_ROOT:-}" ] && repo=$(basename "$REPO_ROOT")
     jq -cn \
         --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --arg repo "$repo" --arg phase "$phase" --arg gate_id "$gate_id" \
+        --arg execution_mode "${WV_GATE_EXECUTION_MODE:-}" \
         --argjson exit "$exit_code" --argjson duration_ms "$duration_ms" \
         --argjson estimate_ms "$estimate_ms" --arg suites "$suites" --arg sha "$sha" \
+        --argjson started_ms "$started_ms" \
         '{ts:$ts, repo:$repo, phase:$phase, gate_id:$gate_id, exit:$exit, duration_ms:$duration_ms,
-          estimate_ms:$estimate_ms, suites:($suites | split(",") | map(select(. != ""))), sha:$sha}' \
+          estimate_ms:$estimate_ms, suites:($suites | split(",") | map(select(. != ""))), sha:$sha}
+         + (if $execution_mode != "" then {execution_mode:$execution_mode} else {} end)
+         + (if $started_ms != null then {started_ms:$started_ms} else {} end)' \
         >> "$log_path" 2>/dev/null || true
 }
 
@@ -3449,12 +3791,22 @@ _gate_log_append() {
 cmd_test_record() {
     local suite="${1:-}"
     shift || true
+    # Mode is supplied by the recorder, never inherited from a parent gate.
+    # Nested tests that record manual observations retain their own semantics.
+    local WV_GATE_EXECUTION_MODE=""
     local files="" exit_code="0" commit_sha="" duration_ms="0" estimate_ms=""
     local gate_mode=false gate_phase="${WV_GATE_PHASE:-}" gate_id="${WV_GATE_ID:-}" gate_suites=""
+    local start_fps="" start_given=false inputs_key="" started_ms="" ended_ms="" snapshot_plan=""
     local arg
     for arg in "$@"; do
         case "$arg" in
             --files=*)    files="${arg#--files=}" ;;
+            --started-ms=*) started_ms="${arg#--started-ms=}" ;;
+            --ended-ms=*)   ended_ms="${arg#--ended-ms=}" ;;
+            --inputs-key=*) inputs_key="${arg#--inputs-key=}" ;;
+            --snapshot-plan=*) snapshot_plan="${arg#--snapshot-plan=}" ;;
+            --execution-mode=*) WV_GATE_EXECUTION_MODE="${arg#--execution-mode=}" ;;
+            --start-fingerprints=*) start_fps="${arg#--start-fingerprints=}"; start_given=true ;;
             --exit=*)     exit_code="${arg#--exit=}" ;;
             --commit=*)   commit_sha="${arg#--commit=}" ;;
             --duration=*) duration_ms="${arg#--duration=}" ;;
@@ -3468,17 +3820,22 @@ cmd_test_record() {
     done
 
     if [ -z "$suite" ]; then
-        echo "Usage: wv test-record <suite> [--files=a,b] [--exit=N] [--commit=SHA] [--duration=MS] [--estimate=MS]" >&2
-        echo "       wv test-record gate --gate --phase=P --gate-id=ID --exit=N --duration=MS [--estimate=MS] [--suites=a,b]" >&2
+        echo "Usage: wv test-record <suite> [--files=a,b] [--exit=N] [--commit=SHA] [--duration=MS] [--estimate=MS] [--started-ms=EPOCH_MS] [--ended-ms=EPOCH_MS]" >&2
+        echo "       wv test-record gate --gate --phase=P --gate-id=ID --exit=N --duration=MS [--estimate=MS] [--suites=a,b] [--started-ms=EPOCH_MS]" >&2
         return 1
     fi
 
     # --gate records one gate invocation in the gate log and nothing else: a gate
     # is not a suite, so it must not add a ledger row or a suite-log line.
+    case "$WV_GATE_EXECUTION_MODE" in
+        ''|frozen|checkout) ;;
+        mixed) [ "$gate_mode" = true ] || { echo "wv test-record: invalid execution mode" >&2; return 1; } ;;
+        *) echo "wv test-record: invalid execution mode" >&2; return 1 ;;
+    esac
     if [ "$gate_mode" = true ]; then
         [ -z "$commit_sha" ] && commit_sha=$(git rev-parse --short HEAD 2>/dev/null || echo "")
         _gate_log_append "${gate_phase:-manual}" "$gate_id" "$exit_code" "$duration_ms" \
-            "$estimate_ms" "$gate_suites" "$commit_sha"
+            "$estimate_ms" "$gate_suites" "$commit_sha" "$started_ms"
         return 0
     fi
 
@@ -3499,7 +3856,45 @@ cmd_test_record() {
 
     # Durable history: one append-only JSONL line per run, survives wv load (LL2).
     # The tmpfs upserts below remain the gate's current-state view.
-    _suite_log_append "$suite" "$files" "$exit_code" "$duration_ms" "$commit_sha" "$estimate_ms"
+    _suite_log_append "$suite" "$files" "$exit_code" "$duration_ms" "$commit_sha" "$estimate_ms" \
+        "$started_ms" "$ended_ms"
+    # Mutable checkout tools are not captured by any content key. Keep the
+    # measured outcome, but never certify per-file, legacy or frozen readiness.
+    [ "$WV_GATE_EXECUTION_MODE" != checkout ] || return 0
+
+    # --inputs-key=K: the suite's input key when it started (wv test-status
+    # --inputs), recorded at path '@inputs:K' for the gate's reuse check
+    # (wv-cb4913). One row per key, latest outcome wins, so returning to bytes
+    # that already passed (a reverted fix) is recognised; the newest
+    # _TEST_INPUT_ROWS per suite are kept. The caller passes changed-during-run
+    # when the key moved under the suite: that run describes no key, so it
+    # records none.
+    if [ -n "$inputs_key" ] && [ "$inputs_key" != changed-during-run ]; then
+        db_query "INSERT OR REPLACE INTO test_results(suite, path, fingerprint, exit_code, ran_at, commit_sha, duration_ms)
+                  VALUES ('$suite_esc', '@inputs:$(sql_escape "$inputs_key")', '$(sql_escape "$inputs_key")', $exit_code, datetime('now'), '$commit_esc', $duration_ms);
+                  DELETE FROM test_results WHERE suite='$suite_esc' AND path LIKE '@inputs:%'
+                      AND rowid NOT IN (SELECT rowid FROM test_results WHERE suite='$suite_esc' AND path LIKE '@inputs:%'
+                                        ORDER BY ran_at DESC, rowid DESC LIMIT $_TEST_INPUT_ROWS);" \
+                  >/dev/null 2>&1 || true
+    fi
+
+    # Advisory observation only: its namespace is deliberately outside
+    # @inputs, so no reuse reader can admit it. Bind it to the already-frozen
+    # plan rather than reading live HEAD after a potentially lengthy run.
+    if [ -n "$snapshot_plan" ]; then
+        local observation
+        observation=$(jq -ec --arg s "$suite" --arg k "$inputs_key" '
+            . as $p | .suites[$s] as $s
+            | select($s.identity.context == "prepush" and $s.key == $k
+                and ($k | test("^snapshot-v1:[0-9a-f]{64}$")))
+            | {tree: $p.tree, base: $p.base, input_base: $s.identity.input_base, key: $k}
+            ' "$snapshot_plan" 2>/dev/null) || observation=""
+        if [ -n "$observation" ]; then
+            db_query "INSERT OR REPLACE INTO test_results(suite, path, fingerprint, exit_code, ran_at, commit_sha, duration_ms)
+                VALUES ('$suite_esc', '@snapshot-observation:prepush', '$(sql_escape "$observation")',
+                    $exit_code, datetime('now'), '$commit_esc', $duration_ms);" >/dev/null 2>&1 || true
+        fi
+    fi
 
     if [ -z "$files" ]; then
         # Whole-suite run with no file set: one sentinel row keyed on HEAD.
@@ -3513,10 +3908,22 @@ cmd_test_record() {
 
     # One row per file. printf '%s\n' guarantees a trailing newline so `read` does
     # not drop the last field.
-    local f fp
+    # --start-fingerprints=FILE holds the "<fp>\t<path>" lines `wv test-status
+    # --fingerprints` printed before the suite started (wv-5da0e8). The result is
+    # true only of that content: a file whose bytes now differ, or that the
+    # snapshot lacks, changed during the run or was never captured, so its row
+    # gets a fingerprint no content can match and reads as stale, never green.
+    local f fp start_fp
     while IFS= read -r f; do
         [ -z "$f" ] && continue
         fp=$(_test_file_fingerprint "$f")
+        if [ "$start_given" = true ]; then
+            start_fp=$(awk -F'\t' -v p="$f" '$2 == p { print $1; exit }' "$start_fps" 2>/dev/null || true)
+            if [ "$start_fp" != "$fp" ]; then
+                echo "wv test-record: $f changed during the $suite run; not recorded as tested" >&2
+                fp="changed-during-run"
+            fi
+        fi
         db_query "INSERT OR REPLACE INTO test_results(suite, path, fingerprint, exit_code, ran_at, commit_sha, duration_ms)
                   VALUES ('$suite_esc', '$(sql_escape "$f")', '$(sql_escape "$fp")', $exit_code, datetime('now'), '$commit_esc', $duration_ms);" \
                   >/dev/null 2>&1 || true
@@ -3534,24 +3941,86 @@ cmd_test_record() {
 #
 # --staged compares against index blobs and is the pre-commit form. Without it,
 # the command compares the working tree, matching wv done's freshness consumer.
+#
+# wv test-status --fingerprints --files=a,b prints "<fp>\t<path>" per file, the
+# working-tree fingerprint test-record would write. A gate takes it before its
+# suites start and hands it to test-record --start-fingerprints (wv-5da0e8).
+#
+# wv test-status --inputs --suites=a,b [--staged] prints "<state>\t<key>\t<suite>"
+# per suite: each suite's input key (_test_input_keys) and the state of the
+# '@inputs:<key>' ledger row for it: green, red (the latest run on those exact
+# inputs failed), stale (rows only for other inputs) or unknown. One call answers the whole gate's reuse
+# question (wv-cb4913): the per-file form costs a process per file per suite.
 cmd_test_status() {
-    local suite="${1:-}"
-    shift || true
-    local files="" staged=false quiet=false arg
+    local suite="" files="" staged=false quiet=false fingerprints=false arg
+    local inputs=false suites="" snapshot_plan=""
     for arg in "$@"; do
         case "$arg" in
             --files=*) files="${arg#--files=}" ;;
+            --suites=*) suites="${arg#--suites=}" ;;
+            --snapshot-plan=*) snapshot_plan="${arg#--snapshot-plan=}" ;;
+            --inputs) inputs=true ;;
             --staged) staged=true ;;
             --quiet) quiet=true ;;
-            *)
+            --fingerprints) fingerprints=true ;;
+            -*)
                 echo "wv test-status: unknown option '$arg'" >&2
                 return 2
+                ;;
+            *)
+                if [ -n "$suite" ]; then
+                    echo "wv test-status: unexpected argument '$arg'" >&2
+                    return 2
+                fi
+                suite="$arg"
                 ;;
         esac
     done
 
+    if [ "$fingerprints" = true ] && [ -n "$files" ]; then
+        local fp_file
+        while IFS= read -r fp_file; do
+            [ -z "$fp_file" ] && continue
+            printf '%s\t%s\n' "$(_test_file_fingerprint "$fp_file")" "$fp_file"
+        done < <(printf '%s\n' "$files" | tr ',' '\n')
+        return 0
+    fi
+
+    if [ "$inputs" = true ]; then
+        local suite_list=() keys rows mode=worktree
+        IFS=',' read -ra suite_list <<< "$suites"
+        if [ -n "$suite" ] || [ "${#suite_list[@]}" -eq 0 ]; then
+            echo "Usage: wv test-status --inputs --suites=a,b [--staged]" >&2
+            return 2
+        fi
+        [ "$staged" = true ] && mode=staged
+        if [ -n "$snapshot_plan" ]; then
+            keys=$(jq -er --arg suites "$suites" '
+                .suites as $plan | $suites | split(",")[] as $suite
+                | $plan[$suite].key as $key
+                | if ($key | type == "string" and test("^snapshot-v1:[0-9a-f]{64}$"))
+                  then [$key, $suite] | @tsv else error("missing frozen suite key") end
+                ' "$snapshot_plan") || return 1
+        else
+            keys=$(_test_input_keys "$mode" "${suite_list[@]}") || return 1
+        fi
+        [ -n "$keys" ] || return 1
+        rows=$(db_query "SELECT suite || char(9) || fingerprint || char(9) || exit_code
+                         FROM test_results WHERE path LIKE '@inputs:%';" 2>/dev/null || true)
+        awk -F'\t' 'NR == FNR { if (NF == 3) { seen[$1] = 1; ex[$1 "\t" $2] = $3 } next }
+            NF == 2 {
+                st = "unknown"
+                if (($2 "\t" $1) in ex) st = (ex[$2 "\t" $1] == "0") ? "green" : "red"
+                else if ($2 in seen) st = "stale"
+                print st "\t" $1 "\t" $2
+            }' <(printf '%s\n' "$rows") - <<< "$keys"
+        return 0
+    fi
+
     if [ -z "$suite" ] || [ -z "$files" ]; then
         echo "Usage: wv test-status <suite> --files=a,b [--staged] [--quiet]" >&2
+        echo "       wv test-status --fingerprints --files=a,b" >&2
+        echo "       wv test-status --inputs --suites=a,b [--staged]" >&2
         return 2
     fi
 
@@ -3595,6 +4064,12 @@ cmd_test_status() {
 # Records pass/warn via _doctor_record. Shared by pre-commit and prepare-commit-msg checks.
 _doctor_check_git_hook() {
     local label="$1" src="$2" installed="$3" grep_pattern="$4" install_cmd="$5"
+    # git skips a hook without the execute bit: a current copy it will not run
+    # is no gate at all (wv-76c726, the doctor side of wv-ecae1c).
+    if [ -f "$installed" ] && [ ! -x "$installed" ] && grep -q -- "$grep_pattern" "$installed" 2>/dev/null; then
+        _doctor_record "$label" "warn" "installed but not executable, so git skips it — chmod +x $installed"
+        return 0
+    fi
     if [ -f "$installed" ]; then
         if [ -f "$src" ] && cmp -s "$src" "$installed" 2>/dev/null; then
             _doctor_record "$label" "pass" "Weave hook installed and current"
@@ -3633,32 +4108,97 @@ _doctor_check_hot_zone_orphans() {
 }
 
 # _doctor_check_hot_zone_shadow — warn when this repo has a brain.db under a
-# placement root it does not resolve to (wv-854b4a). Placement follows the
-# runtime class (is_sandboxed_runtime), not the agent, so a second DB for the
-# same repo hash is another runtime class's zone or debris. An empty one is what
-# sqlite3 leaves after opening a guessed path; on 2026-09-25 that read as a
+# placement root it does not resolve to (wv-854b4a). Placement adopts the zone
+# already holding this repo's database (wv-b831e3), and wv refuses to run when
+# two non-empty ones exist, so what this can still see is an empty one: what
+# sqlite3 leaves after opening a guessed path, which on 2026-09-25 read as a
 # split brain. Reports only: placement is not changed here.
+# Candidates are compared by file identity, not path: the /tmp zone's neutral
+# name is a symlink to its legacy directory (wv-95bddf), so one live database
+# has two paths, and advising removal of either would remove the live graph
+# (wv-6f2eed). A file two names reach is reported once.
 # Args: live hot_zone path. WV_DOCTOR_PLACEMENT_ROOTS overrides the roots (tests).
 _doctor_check_hot_zone_shadow() {
-    local hot_zone="$1" repo_root repo_hash uid root cand found=0
+    local hot_zone="$1" repo_root repo_hash uid root cand seen also="" found=0
+    local -a reported=()
     repo_root="${WV_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}"
     [ -n "$repo_root" ] || return 0
     repo_hash=$(echo "$repo_root" | md5sum | cut -c1-8)
     uid=$(id -u 2>/dev/null || echo "$UID")
-    for root in ${WV_DOCTOR_PLACEMENT_ROOTS:-/tmp/weave-codex-${uid} /dev/shm/weave /tmp/weave-${uid}}; do
+    for root in ${WV_DOCTOR_PLACEMENT_ROOTS:-/tmp/weave-hotzone-${uid} /tmp/weave-codex-${uid} /dev/shm/weave /tmp/weave-${uid}}; do
         [ "$root/$repo_hash" = "$hot_zone" ] && continue
         cand="$root/$repo_hash/brain.db"
         [ -f "$cand" ] || continue
+        if [ "$cand" -ef "$hot_zone/brain.db" ]; then
+            also="$cand"
+            continue
+        fi
+        for seen in "${reported[@]}"; do
+            [ "$cand" -ef "$seen" ] && continue 2
+        done
+        reported+=("$cand")
         found=1
         if [ ! -s "$cand" ]; then
             _doctor_record "hot-zone shadow" "warn" \
                 "empty $cand (left by opening a guessed path); remove it. Live DB: $hot_zone/brain.db (wv hotzone db)"
         else
             _doctor_record "hot-zone shadow" "warn" \
-                "second brain.db for this repo at $cand; live DB is $hot_zone/brain.db (wv hotzone db). Another runtime class uses it or left it: placement follows is_sandboxed_runtime"
+                "second brain.db for this repo at $cand; live DB is $hot_zone/brain.db (wv hotzone db). Placement adopts the zone holding a database (wv-b831e3). Remove neither yet: the copies may have diverged and syncing both does not merge them (wv-a73141). Back up both (sqlite3 <db> \".backup '<file>'\"), run wv hotzone diff $hot_zone/brain.db $cand, carry what the live copy lacks into it, then remove the other"
         fi
     done
-    [ "$found" -eq 0 ] && _doctor_record "hot-zone shadow" "pass" "no brain.db for this repo outside $hot_zone"
+    [ "$found" -eq 0 ] && _doctor_record "hot-zone shadow" "pass" \
+        "no brain.db for this repo outside $hot_zone${also:+ (also reached as $also: the same file, not a copy)}"
+    return 0
+}
+
+# _doctor_check_hot_zone_names — report both names of the /tmp zone and which
+# one is the physical directory (wv-7e1e49). During the rename transition the
+# legacy name stays physical and the neutral name is an alias to it
+# (wv-95bddf); a reader should not have to infer that from ls. Reports only:
+# hot_zone_check and hot_zone_ensure decide what is used or refused, and the
+# alias verdict is theirs, hot_zone_dir_problem, so the two cannot disagree
+# (wv-9d2cd2: a looser comparison here passed an alias the guard refuses).
+_doctor_check_hot_zone_names() {
+    case "${OSTYPE:-}" in darwin*) return 0 ;; esac
+    type _hot_zone_linux_zones >/dev/null 2>&1 || return 0
+    _hot_zone_linux_zones
+    local n="$_HZ_NEUTRAL" l="$_HZ_LEGACY" problem
+    if [ -L "$n" ]; then
+        problem=$(hot_zone_dir_problem "$n" "$l")
+        if [ -n "$problem" ]; then
+            _doctor_record "hot-zone names" "warn" \
+                "$n $problem; wv refuses it as a hot-zone base"
+        elif [ ! -e "$l" ] && [ ! -L "$l" ]; then
+            _doctor_record "hot-zone names" "pass" \
+                "$n is an alias of $l, which is absent; the next wv call that opens the zone recreates it as the physical directory"
+        else
+            _doctor_record "hot-zone names" "pass" \
+                "physical: $l (legacy name, kept while hosts run mixed versions); $n is an alias of it"
+        fi
+    elif [ -d "$n" ] && [ -d "$l" ] && [ ! -L "$l" ]; then
+        if [ -n "$_HZ_TMP_CONFLICT" ]; then
+            _doctor_record "hot-zone names" "warn" \
+                "$n and $l are separate directories that both hold databases; wv refuses to pick one"
+        elif _hot_zone_populated "${_HZ_ZONES[0]}"; then
+            _doctor_record "hot-zone names" "pass" \
+                "physical: ${_HZ_ZONES[0]} (the one holding databases); $n and $l are separate directories"
+        else
+            _doctor_record "hot-zone names" "pass" \
+                "physical: ${_HZ_ZONES[0]} (neither holds a database, so the legacy directory is the default authority); $n and $l are separate directories"
+        fi
+    elif [ -d "$n" ]; then
+        if [ -L "$l" ]; then
+            _doctor_record "hot-zone names" "pass" "physical: $n; legacy name $l is a symlink"
+        else
+            _doctor_record "hot-zone names" "pass" "physical: $n; legacy name $l absent"
+        fi
+    elif [ -d "$l" ] && [ ! -L "$l" ]; then
+        _doctor_record "hot-zone names" "pass" \
+            "physical: $l (legacy name); the alias $n is added on the next wv call that opens the zone"
+    else
+        _doctor_record "hot-zone names" "pass" \
+            "neither $n nor $l exists; first use creates $l and the alias $n"
+    fi
     return 0
 }
 
@@ -3757,8 +4297,12 @@ _doctor_check_verification() {
 
     # 3. test-map required for the gate to classify anything when live.
     if [ "$tg" != "0" ]; then
-        if [ -f "$tmap" ]; then
+        local tmap_rc=0
+        wv_config_read "$tmap" >/dev/null || tmap_rc=$?
+        if [ "$tmap_rc" -eq 0 ]; then
             _doctor_record "test-map" "pass" ".weave/test-map.conf present"
+        elif [ "$tmap_rc" -ne 2 ]; then
+            _doctor_record "test-map" "fail" ".weave/test-map.conf exists but cannot be read (unreadable, a directory, or a dangling symlink) — every gate refuses until it can"
         else
             _doctor_record "test-map" "warn" ".weave/test-map.conf absent — touched files classify 'unknown', gate inert even when on. See: wv guide --topic=verification"
         fi
@@ -3827,6 +4371,41 @@ cmd_doctor() {
             "could not restore the hot-zone database from .weave/state.sql"
     fi
 
+    # Keep check order stable; helpers share this call's repair/format state
+    # through Bash's dynamic scope (wv-813b05).
+    _doctor_check_prerequisites
+    _doctor_check_storage
+    _doctor_check_repository_state
+    _doctor_check_surfaces
+
+    if [ "$_dr_agent" = true ]; then
+        _doctor_check_agent_env
+        _doctor_check_codex_mcp
+        _doctor_check_codex_hooks
+    fi
+
+    # Summary
+    if [ "$_dr_format" = "json" ]; then
+        local overall="pass"
+        [ "$_dr_fail" -gt 0 ] && overall="fail"
+        printf '{"overall":"%s","passed":%d,"failed":%d,"warnings":%d,"total":%d,"checks":[%s]}\n' \
+            "$overall" "$_dr_pass" "$_dr_fail" "$_dr_warn" "$_dr_total" "$_dr_results"
+    else
+        echo ""
+        if [ "$_dr_fail" -gt 0 ]; then
+            echo -e "Result: ${RED}${_dr_pass}/${_dr_total} passed${NC} (${_dr_fail} failed, ${_dr_warn} warnings)"
+        elif [ "$_dr_warn" -gt 0 ]; then
+            echo -e "Result: ${GREEN}${_dr_pass}/${_dr_total} passed${NC} (${_dr_warn} warnings)"
+        else
+            echo -e "Result: ${GREEN}${_dr_pass}/${_dr_total} passed${NC}"
+        fi
+    fi
+
+    [ "$_dr_fail" -gt 0 ] && return 1
+    return 0
+}
+
+_doctor_check_prerequisites() {
     # 1. sqlite3 present
     if command -v sqlite3 >/dev/null 2>&1; then
         local sq_ver
@@ -3885,6 +4464,10 @@ cmd_doctor() {
         _doctor_record "structural_scan" "warn" "disabled (ast-grep not found — install manually or run ./install.sh --with-ast-grep)"
     fi
 
+    return 0
+}
+
+_doctor_check_storage() {
     # 7. Hot zone exists
     local hot_zone="${WV_HOT_ZONE:-}"
     if [ -z "$hot_zone" ]; then
@@ -3919,6 +4502,8 @@ cmd_doctor() {
         _doctor_check_hot_zone_orphans "$hot_zone"
         # 8c. This repo's brain.db under a placement root it does not use
         _doctor_check_hot_zone_shadow "$hot_zone"
+        # 8d. The /tmp zone's two names and which is physical
+        _doctor_check_hot_zone_names
     else
         _doctor_record "hot zone" "fail" "not found: $hot_zone"
     fi
@@ -3996,33 +4581,23 @@ cmd_doctor() {
 
     # 10b. FTS5 index integrity.
     #
-    # Two probes, because they catch different things and the cheap one is blind
-    # to the failure this repo actually hits:
-    #
-    #   'integrity-check' validates the index against ITSELF. It passed during
-    #   both live incidents (wv-44993d 2026-08-08, again 2026-08-27) while
-    #   UPDATE nodes was throwing SQLITE_CORRUPT graph-wide, so on its own it is
-    #   not a detector for this class.
-    #
-    #   The orphan probe compares index docids against real node rowids. That is
-    #   the actual divergence: nodes_fts is external-content over a TEXT-primary-key
-    #   table, so an INSERT OR REPLACE (delta replay) moves the rowid, and with
-    #   recursive_triggers OFF the implicit delete never fires nodes_ad -- stranding
-    #   an index entry at the old rowid. Silent until nodes_au trips on it.
-    #   Root cause and the load-path fix: wv-d2e6c6.
+    # rank=1 compares the external-content index WITH nodes, detecting missing
+    # entries as well as stale ones (wv-ccd364). The plain self-check passed
+    # both missing-entry and orphan incidents. Keep the orphan probe to name
+    # the stranded-rowid class caused by INSERT OR REPLACE (wv-d2e6c6).
     if [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ]; then
-        local fts5_ok fts5_orphans
+        local fts5_ok fts5_orphans fts5_rc=0
         fts5_ok=$(sqlite3 "$WV_DB" \
-            "INSERT INTO nodes_fts(nodes_fts) VALUES('integrity-check');" 2>&1)
+            "INSERT INTO nodes_fts(nodes_fts,rank) VALUES('integrity-check',1);" 2>&1) || fts5_rc=$?
         fts5_orphans=$(sqlite3 "$WV_DB" \
             "CREATE VIRTUAL TABLE temp.wv_fv USING fts5vocab(main, nodes_fts, instance);
              SELECT count(DISTINCT doc) FROM temp.wv_fv
              WHERE doc NOT IN (SELECT rowid FROM nodes);" 2>/dev/null || echo "")
         [ -n "$fts5_orphans" ] || fts5_orphans=0
-        if [ -z "$fts5_ok" ] && [ "$fts5_orphans" -eq 0 ] 2>/dev/null; then
-            _doctor_record "FTS5 index" "pass" "integrity OK; no orphaned index entries"
+        if [ "$fts5_rc" -eq 0 ] && [ -z "$fts5_ok" ] && [ "$fts5_orphans" -eq 0 ] 2>/dev/null; then
+            _doctor_record "FTS5 index" "pass" "integrity OK; index agrees with node content"
         else
-            local _fts5_why="corrupt"
+            local _fts5_why="corrupt or inconsistent with node content"
             [ "$fts5_orphans" -gt 0 ] 2>/dev/null \
                 && _fts5_why="${fts5_orphans} orphaned index entries (rowids with no node)"
             if [ "$_dr_repair" = "true" ]; then
@@ -4030,15 +4605,15 @@ cmd_doctor() {
                 # so it discards orphans outright.
                 sqlite3 "$WV_DB" \
                     "INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');" 2>/dev/null
-                local fts5_recheck fts5_orphans_recheck
+                local fts5_recheck fts5_orphans_recheck fts5_recheck_rc=0
                 fts5_recheck=$(sqlite3 "$WV_DB" \
-                    "INSERT INTO nodes_fts(nodes_fts) VALUES('integrity-check');" 2>&1)
+                    "INSERT INTO nodes_fts(nodes_fts,rank) VALUES('integrity-check',1);" 2>&1) || fts5_recheck_rc=$?
                 fts5_orphans_recheck=$(sqlite3 "$WV_DB" \
                     "CREATE VIRTUAL TABLE temp.wv_fv2 USING fts5vocab(main, nodes_fts, instance);
                      SELECT count(DISTINCT doc) FROM temp.wv_fv2
                      WHERE doc NOT IN (SELECT rowid FROM nodes);" 2>/dev/null || echo "")
                 [ -n "$fts5_orphans_recheck" ] || fts5_orphans_recheck=0
-                if [ -z "$fts5_recheck" ] && [ "$fts5_orphans_recheck" -eq 0 ] 2>/dev/null; then
+                if [ "$fts5_recheck_rc" -eq 0 ] && [ -z "$fts5_recheck" ] && [ "$fts5_orphans_recheck" -eq 0 ] 2>/dev/null; then
                     _doctor_record "FTS5 index" "pass" "repaired (rebuilt)"
                 else
                     _doctor_record "FTS5 index" "fail" "repair failed — manual: wv reindex"
@@ -4097,12 +4672,46 @@ cmd_doctor() {
         fi
     fi
 
+    return 0
+}
+
+_doctor_check_repository_state() {
+    # Ownership is actor identity, not session isolation. Other actors may be
+    # working legitimately; even --repair must leave their claims untouched.
+    local claim_actor claim_rows
+    claim_actor=$(resolve_agent_id)
+    if [ ! -f "${WV_DB:-}" ]; then
+        _doctor_record "claim ownership" "warn" "current actor: $claim_actor; unavailable: no active database"
+    elif ! claim_rows=$(db_query "SELECT id || ': ' || json_extract(metadata, '$.claimed_by')
+        FROM nodes WHERE status='active'
+        AND COALESCE(json_extract(metadata, '$.claimed_by'), '') != ''
+        AND json_extract(metadata, '$.claimed_by') != '$(sql_escape "$claim_actor")'
+        ORDER BY id;" 2>/dev/null); then
+        _doctor_record "claim ownership" "warn" "current actor: $claim_actor; unavailable: active claim query failed"
+    elif [ -n "$claim_rows" ]; then
+        _doctor_record "claim ownership" "warn" "current actor: $claim_actor; active claims held by other actors (advisory):
+$claim_rows
+Inspect before explicitly authorizing per-node takeover with wv work ID --force; reservations still apply. No claims migrated."
+    else
+        _doctor_record "claim ownership" "pass" "current actor: $claim_actor; no active claims held by other actors"
+    fi
+
     # 11-12. Module checks
     # Derived, not typed (wv-587469): the typed lists named 12 libraries and 5
     # of the 10 command modules, so a missing findings/analyze/indexer/query/hook
     # module, wv-gate-pool.sh or wv-checkpoint-ci.sh passed.
     _doctor_check_lib_refs "lib modules"
     _doctor_check_cmd_defs "cmd modules"
+
+    # S0 provisioning advisory: inspect literals, never execute routed scripts.
+    local gate_paths
+    if ! gate_paths=$(python3 -I "$WV_LIB_DIR/lib/wv-gate-paths.py" "$REPO_ROOT" 2>&1); then
+        _doctor_record "gate ignored paths" "warn" "$gate_paths"
+    elif [ -n "$gate_paths" ]; then
+        _doctor_record "gate ignored paths" "warn" "$gate_paths"
+    else
+        _doctor_record "gate ignored paths" "pass" "no literal ignored-path references found; computed paths are not evaluated"
+    fi
 
     # 12b. Hook-common wiring check (Sprint 1 pattern crystallization)
     local _doctor_hooks_total=0
@@ -4277,21 +4886,78 @@ cmd_doctor() {
         fi
     fi
 
-    # Every catalogued violation type resolves to a guide or to the explicit
-    # _uncoached fallback. A missing fallback means a catalogued type with no
-    # guide of its own would coach nothing at all -- the single outcome the
-    # fallback exists to prevent. Recorded unconditionally: a completeness check
-    # that silently skips is indistinguishable from one that passed.
-    local _gc_pkg="$REPO_ROOT/scripts/weave_quality/guides"
-    [ -d "$_gc_pkg" ] || _gc_pkg="${WV_LIB_DIR:-}/weave_quality/guides"
-    if [ -d "$_gc_pkg" ]; then
-        if [ -f "$_gc_pkg/_uncoached.md" ]; then
-            _doctor_record "guide-completeness" "pass" "the _uncoached fallback ships, so every catalogued violation type coaches"
-        else
-            _doctor_record "guide-completeness" "warn" "_uncoached.md is absent from $_gc_pkg — a catalogued type with no guide of its own would coach nothing"
-        fi
+    # Guide validity and coaching completeness (wv-7730bd), computed by the
+    # shipped parser and resolver ('python3 -m weave_quality.guides doctor') from
+    # the module copy coaching selects, against this project's root -- never a
+    # second validator in shell. Validity (every .weave/guides/*.md parses and
+    # resolves where it is selected) is recorded apart from guide-shadow, a
+    # preference, and from completeness, the canonical types that coach only
+    # through _uncoached. Both records fail closed: a nonzero exit, output that
+    # is not a complete report, or a report from a module copy other than the
+    # one selected is a failed check, never a skipped one. Complete means every
+    # entry has its shape too, and the verdicts come from the arrays' lengths:
+    # judged by the rendered names, invalid:[{}] or fallback_only:[null]
+    # rendered nothing and both records passed (wv-13dec1).
+    local _gd_pypath _gd_out _gd_rc=0 _gd_err="" _gd_want _gd_got
+    _gd_pypath="$(_wv_python_module_path weave_quality 2>/dev/null)"
+    _gd_out=$(_wv_agent_python_exec_module weave_quality.guides "$_gd_pypath" \
+        doctor --project-root "$REPO_ROOT" 2>/dev/null) || _gd_rc=$?
+    if [ "$_gd_rc" -ne 0 ]; then
+        _gd_err="guides doctor exited $_gd_rc: $(printf '%s' "$_gd_out" | jq -r '.error // "no error reported"' 2>/dev/null || printf 'no error reported')"
+    elif ! printf '%s' "$_gd_out" | jq -e '
+            def str: type == "string" and length > 0;
+            def count: type == "number" and . >= 0 and . == floor;
+            (.canonical_types | count) and .canonical_types > 0
+            and (.project_guides_checked | count)
+            and (.invalid | type == "array"
+                and all(.[]; type == "object" and (.file | str) and (.error | str)))
+            and (.unresolved | type == "array"
+                and all(.[]; type == "object" and (.violation_type | str)
+                    and (.language == null or (.language | str)) and (.error | str)))
+            and all(.unused, .examples, .fallback_only; type == "array" and all(.[]; str))
+            and (.module | str)' >/dev/null 2>&1; then
+        _gd_err="guides doctor printed no complete report"
     else
-        _doctor_record "guide-completeness" "warn" "no coaching guides directory resolved (looked in $_gc_pkg)"
+        _gd_want=$(readlink -f "$_gd_pypath/weave_quality/guides.py" 2>/dev/null || true)
+        _gd_got=$(printf '%s' "$_gd_out" | jq -r '.module')
+        [ -n "$_gd_want" ] && [ "$_gd_got" = "$_gd_want" ] \
+            || _gd_err="guides doctor ran $_gd_got, not the selected copy ${_gd_want:-(unresolved under $_gd_pypath)}"
+    fi
+    local _gd_bad _gd_unused _gd_n _gd_canon _gd_fallback _gd_dead _gd_counts
+    local _gd_nbad _gd_nunused _gd_nfallback
+    if [ -z "$_gd_err" ]; then
+        # One read, checked: a failed extraction is a failed check, not a
+        # zero count.
+        _gd_counts=$(printf '%s' "$_gd_out" | jq -r '[(.invalid | length) + (.unresolved | length),
+            (.unused | length), (.fallback_only | length),
+            ([.unresolved[] | select(.language == null)] | length),
+            .project_guides_checked, .canonical_types] | @tsv' 2>/dev/null) \
+            && read -r _gd_nbad _gd_nunused _gd_nfallback _gd_dead _gd_n _gd_canon <<< "$_gd_counts" \
+            && [ -n "$_gd_canon" ] \
+            || _gd_err="guides doctor report could not be read"
+    fi
+    if [ -n "$_gd_err" ]; then
+        _doctor_record "guide-validity" "fail" "$_gd_err"
+        _doctor_record "guide-completeness" "fail" "not computed: $_gd_err"
+    else
+        _gd_bad=$(printf '%s' "$_gd_out" | jq -r '[(.invalid[] | .file),
+            (.unresolved[] | .violation_type + (if .language then " (" + .language + ")" else "" end))] | join(", ")')
+        _gd_unused=$(printf '%s' "$_gd_out" | jq -r '.unused | join(", ")')
+        if [ "$_gd_nbad" -gt 0 ]; then
+            _doctor_record "guide-validity" "fail" "coaching would fail for: $_gd_bad — run 'python3 -m weave_quality.guides doctor --project-root .' for each error"
+        elif [ "$_gd_nunused" -gt 0 ]; then
+            _doctor_record "guide-validity" "warn" "project guide(s) no catalogued type selects: $_gd_unused — rename to the vocabulary's guide basename or remove"
+        else
+            _doctor_record "guide-validity" "pass" "$_gd_n project guide(s) checked; each parses and resolves where it is selected"
+        fi
+        _gd_fallback=$(printf '%s' "$_gd_out" | jq -r '.fallback_only | join(", ")')
+        if [ "$_gd_dead" -gt 0 ]; then
+            _doctor_record "guide-completeness" "fail" "$_gd_dead of $_gd_canon canonical violation type(s) resolve to no guide (see guide-validity)"
+        elif [ "$_gd_nfallback" -gt 0 ]; then
+            _doctor_record "guide-completeness" "warn" "canonical violation type(s) coaching only through the _uncoached fallback: $_gd_fallback"
+        else
+            _doctor_record "guide-completeness" "pass" "all $_gd_canon canonical violation types coach through a guide of their own"
+        fi
     fi
 
     # 14a-quater. Procedure visibility semantic-drift advisory: local is the
@@ -4397,6 +5063,10 @@ cmd_doctor() {
         _doctor_record "git sync" "pass" "clean"
     fi
 
+    return 0
+}
+
+_doctor_check_surfaces() {
     # ── Surface-contract checks ──────────────────────────────────────────────
 
     # 15. Hook source vs installed drift: compare .claude/hooks/ with ~/.config/weave/hooks/
@@ -4454,23 +5124,34 @@ cmd_doctor() {
     # 17. Git commit hooks installed and match the repo-managed Weave versions
     local git_root
     git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    # Checked where git runs hooks from (wv-76c726): $git_root/.git/hooks is
+    # wrong in a linked worktree (.git is a file) and under core.hooksPath.
+    local _dr_hooks="" _dr_hooks_path=""
     if [ -n "$git_root" ]; then
+        _dr_hooks=$(git -C "$git_root" rev-parse --git-path hooks 2>/dev/null || true)
+        case "$_dr_hooks" in ""|/*) ;; *) _dr_hooks="$git_root/$_dr_hooks" ;; esac
+        _dr_hooks_path=$(git -C "$git_root" config --get core.hooksPath 2>/dev/null || true)
+        if [ -n "$_dr_hooks_path" ]; then
+            _doctor_record "hooks path" "warn" "core.hooksPath=$_dr_hooks_path: git runs hooks only from there and install.sh does not write to it — call the Weave hooks from it"
+        fi
+    fi
+    if [ -n "$git_root" ] && [ -n "$_dr_hooks" ]; then
         _doctor_check_git_hook \
             "pre-commit hook" \
             "$git_root/scripts/hooks/pre-commit-weave.sh" \
-            "$git_root/.git/hooks/pre-commit" \
+            "$_dr_hooks/pre-commit" \
             "Weave pre-commit" \
-            "install -m 755 scripts/hooks/pre-commit-weave.sh .git/hooks/pre-commit"
+            "install -m 755 scripts/hooks/pre-commit-weave.sh $_dr_hooks/pre-commit"
         _doctor_check_git_hook \
             "prepare-commit-msg hook" \
             "$git_root/scripts/hooks/prepare-commit-msg-weave.sh" \
-            "$git_root/.git/hooks/prepare-commit-msg" \
+            "$_dr_hooks/prepare-commit-msg" \
             "Weave: append Weave-ID trailers" \
-            "install -m 755 scripts/hooks/prepare-commit-msg-weave.sh .git/hooks/prepare-commit-msg"
+            "install -m 755 scripts/hooks/prepare-commit-msg-weave.sh $_dr_hooks/prepare-commit-msg"
         # post-commit was retired (wv-56c823): a Weave copy still installed runs
         # the dead deferred-suite queue on every commit. A custom hook is not ours.
         local _dr_pc_hook
-        _dr_pc_hook="$(git rev-parse --git-path hooks 2>/dev/null)/post-commit"
+        _dr_pc_hook="$_dr_hooks/post-commit"
         if [ -f "$_dr_pc_hook" ] && grep -qF "Weave post-commit" "$_dr_pc_hook" 2>/dev/null; then
             _doctor_record "post-commit hook" "warn" "retired Weave post-commit hook still installed — run ./install.sh (dev repo) or wv init-repo --update"
         fi
@@ -4479,9 +5160,17 @@ cmd_doctor() {
         _doctor_check_git_hook \
             "pre-push hook" \
             "$git_root/scripts/hooks/pre-push-weave.sh" \
-            "$git_root/.git/hooks/pre-push" \
+            "$_dr_hooks/pre-push" \
             "Weave pre-push" \
-            "install -m 755 scripts/hooks/pre-push-weave.sh .git/hooks/pre-push"
+            "install -m 755 scripts/hooks/pre-push-weave.sh $_dr_hooks/pre-push"
+        # Binds a commit's publication to the tree pre-commit judged
+        # (wv-5f9d1c): without it, pre-commit admission is check-then-use.
+        _doctor_check_git_hook \
+            "reference-transaction hook" \
+            "$git_root/scripts/hooks/reference-transaction-weave.sh" \
+            "$_dr_hooks/reference-transaction" \
+            "Weave reference-transaction" \
+            "install -m 755 scripts/hooks/reference-transaction-weave.sh $_dr_hooks/reference-transaction"
     fi
 
     # 18. Ghost settings: check for chat.hooks.enabled in .vscode/settings.json
@@ -4533,30 +5222,6 @@ cmd_doctor() {
     # 22. Verification-gate layer (P6) — repo-scoped; no-op outside a repo.
     _doctor_check_verification
 
-    if [ "$_dr_agent" = true ]; then
-        _doctor_check_agent_env
-        _doctor_check_codex_mcp
-        _doctor_check_codex_hooks
-    fi
-
-    # Summary
-    if [ "$_dr_format" = "json" ]; then
-        local overall="pass"
-        [ "$_dr_fail" -gt 0 ] && overall="fail"
-        printf '{"overall":"%s","passed":%d,"failed":%d,"warnings":%d,"total":%d,"checks":[%s]}\n' \
-            "$overall" "$_dr_pass" "$_dr_fail" "$_dr_warn" "$_dr_total" "$_dr_results"
-    else
-        echo ""
-        if [ "$_dr_fail" -gt 0 ]; then
-            echo -e "Result: ${RED}${_dr_pass}/${_dr_total} passed${NC} (${_dr_fail} failed, ${_dr_warn} warnings)"
-        elif [ "$_dr_warn" -gt 0 ]; then
-            echo -e "Result: ${GREEN}${_dr_pass}/${_dr_total} passed${NC} (${_dr_warn} warnings)"
-        else
-            echo -e "Result: ${GREEN}${_dr_pass}/${_dr_total} passed${NC}"
-        fi
-    fi
-
-    [ "$_dr_fail" -gt 0 ] && return 1
     return 0
 }
 
@@ -4604,7 +5269,7 @@ _mcp_scope_statuses() { # contract_path process_lines
             status="running"
         fi
         entries="${entries:+$entries,}$(printf '{"scope":"%s","expected":%s,"running":%d,"duplicate":%s,"status":"%s"}' \
-            "$scope" "$expected" "$running" "$duplicate" "$status")"
+            "$(wv_json_escape "$scope")" "$expected" "$running" "$duplicate" "$status")"
     done < <(jq -r '.scopes | keys[]' "$contract_path")
 
     printf '[%s]\n' "$entries"
@@ -4631,7 +5296,7 @@ cmd_mcp_status() {
             warn) warn=$((warn + 1)) ;;
         esac
         if [ "$format" = "json" ]; then
-            results="${results:+$results,}$(printf '{"check":"%s","status":"%s","detail":"%s"}' "$name" "$status" "$detail")"
+            results="${results:+$results,}$(printf '{"check":"%s","status":"%s","detail":"%s"}' "$name" "$status" "$(wv_json_escape "$detail")")"
         else
             local icon
             case "$status" in
@@ -4831,7 +5496,7 @@ _selftest_check() {
         local status="fail"
     fi
     if [ "$_st_format" = "json" ]; then
-        _st_results="${_st_results:+$_st_results,}$(printf '{"test":"%s","status":"%s","detail":"%s"}' "$name" "$status" "$detail")"
+        _st_results="${_st_results:+$_st_results,}$(printf '{"test":"%s","status":"%s","detail":"%s"}' "$name" "$status" "$(wv_json_escape "$detail")")"
     else
         local icon
         [ "$status" = "pass" ] && icon="${GREEN}✓${NC}" || icon="${RED}✗${NC}"
@@ -5180,6 +5845,21 @@ _health_collect_metrics() {
         _h_db_size_kb=$(du -k "$WV_DB" 2>/dev/null | cut -f1)
         _h_db_size_kb="${_h_db_size_kb:-0}"
     fi
+    _health_check_fts
+}
+
+# Probe content as well as index structure, without db_ensure repairing the
+# evidence first. Also runs before fast-cache lookup: out-of-band damage does
+# not touch the CLI write sentinel. A refused probe cannot certify health.
+_health_check_fts() {
+    _h_fts_integrity=preinit
+    [ -f "$WV_DB" ] || return 0
+    if sqlite3 -cmd ".timeout 5000" "$WV_DB" \
+        "INSERT INTO nodes_fts(nodes_fts,rank) VALUES('integrity-check',1);" >/dev/null 2>&1; then
+        _h_fts_integrity=ok
+    else
+        _h_fts_integrity=failed
+    fi
 }
 
 # Compute health score from collected metrics. Sets _h_health_score, _h_issues,
@@ -5249,6 +5929,11 @@ _health_compute_score() {
     if [ "$_h_health_score" -lt 0 ]; then _h_health_score=0; fi
     if [ "$_h_health_score" -gt 100 ]; then _h_health_score=100; fi
 
+    if [ "$_h_fts_integrity" = failed ]; then
+        _h_health_score=0
+        _h_issues="${_h_issues}fts_integrity:failed,"
+    fi
+
     # Status icon/text
     if [ "$_h_health_score" -ge 90 ]; then
         _h_status_icon="✅"; _h_status_text="healthy"
@@ -5268,6 +5953,7 @@ _health_collect_quality() {
     _h_quality_files=0
     _h_quality_head=""
     _h_quality_scanned=""
+    _h_quality_stale="false"
     local quality_json
     local _hz_args=()
     if [ -n "$WV_HOT_ZONE" ]; then _hz_args=("--hot-zone" "$WV_HOT_ZONE"); fi
@@ -5280,6 +5966,7 @@ _health_collect_quality() {
             _h_quality_files=$(echo "$quality_json" | jq -r '.total_files')
             _h_quality_head=$(echo "$quality_json" | jq -r '.git_head')
             _h_quality_scanned=$(echo "$quality_json" | jq -r '.scanned_at')
+            _h_quality_stale=$(echo "$quality_json" | jq -r '.stale == true')
         fi
     fi
 }
@@ -5369,13 +6056,15 @@ _health_format_json() {
             --argjson files "$_h_quality_files" \
             --arg git_head "$_h_quality_head" \
             --arg scanned_at "$_h_quality_scanned" \
-            '{available: true, score: $score, hotspot_count: $hotspots, total_files: $files, git_head: $git_head, scanned_at: $scanned_at}')
+            --argjson stale "$_h_quality_stale" \
+            '{available: true, score: $score, hotspot_count: $hotspots, total_files: $files, git_head: $git_head, scanned_at: $scanned_at, stale: $stale}')
     else
         quality_obj='{"available":false}'
     fi
     # shellcheck disable=SC1010  # 'done' is a jq arg name, not the bash keyword
     jq -n \
         --arg status "$_h_status_text" \
+        --arg fts_integrity "$_h_fts_integrity" \
         --argjson score "$_h_health_score" \
         --argjson total_nodes "$_h_total_nodes" \
         --argjson active "$_h_active" \
@@ -5409,6 +6098,7 @@ _health_format_json() {
         --argjson gh_duplicate_issues "$_h_gh_duplicate_issues" \
         '{
             status: $status,
+            fts_integrity: $fts_integrity,
             score: $score,
             nodes: {
                 total: $total_nodes,
@@ -5460,6 +6150,9 @@ _health_format_text() {
     echo -e "${CYAN}Weave Health Check${NC} $_h_status_icon"
     echo ""
     echo -e "${CYAN}Score:${NC} $_h_health_score/100 ($_h_status_text)"
+    if [ "$_h_fts_integrity" = failed ]; then
+        echo "  FTS5 index check failed or unavailable — run: wv doctor"
+    fi
     echo ""
     echo -e "${CYAN}Nodes:${NC}"
     echo "  Total: $_h_total_nodes"
@@ -5484,6 +6177,9 @@ _health_format_text() {
         echo "  Score: $_h_quality_score/100"
         echo "  Hotspots: $_h_quality_hotspots files above threshold"
         echo "  Last scan: $_h_quality_scanned (${_h_quality_head:0:7})"
+        if [ "$_h_quality_stale" = "true" ]; then
+            echo "  Scan is stale or incomplete; run: wv quality scan"
+        fi
     else
         echo "  no scan data"
     fi
@@ -5575,6 +6271,7 @@ cmd_health() {
         local _hf_lineage
         _hf_lineage=$(db_lineage_pair_verdict \
             "$(db_lineage_shape nodes)" "$(db_lineage_shape edges)" 2>/dev/null || echo unknown)
+        _health_check_fts
 
         if [ -f "$cache_file" ]; then
             local _hf_now _hf_mtime _hf_age _hf_fresh=true
@@ -5597,17 +6294,23 @@ cmd_health() {
                && [ "$(jq -r '.lineage // "unrecorded"' "$cache_file" 2>/dev/null)" != "$_hf_lineage" ]; then
                 _hf_fresh=false
             fi
+            if [ "$_hf_fresh" = "true" ] \
+               && [ "$(jq -r '.fts_integrity // "unrecorded"' "$cache_file" 2>/dev/null)" != "$_h_fts_integrity" ]; then
+                _hf_fresh=false
+            fi
             if [ "$_hf_fresh" = "true" ]; then
                 if [ "$format" = "json" ]; then
-                    cat "$cache_file"
+                    cat "$cache_file" || return 1
                 else
                     echo "Health: $(jq -r '.score' "$cache_file" 2>/dev/null)/100 (fast, cached)"
                     jq -r '.recovery // empty' "$cache_file" 2>/dev/null \
                         | while read -r _hf_rec; do
-                              echo "  graph is not writable — recover with: $_hf_rec" >&2
+                              echo "  graph is not writable or could not be verified — inspect with: $_hf_rec" >&2
                           done
+                    [ "$_h_fts_integrity" != failed ] || echo "  FTS5 index check failed or unavailable — run: wv doctor" >&2
                 fi
-                return 0
+                [ "$_h_fts_integrity" != failed ]
+                return $?
             fi
         fi
         _health_collect_metrics
@@ -5625,9 +6328,14 @@ cmd_health() {
             canonical|preinit|unknown) ;;
             *)
                 _hf_score=0
+                # shellcheck disable=SC2016  # a recovery command printed for the user to run, literal by design
                 _hf_recovery='rm -rf "$WV_HOT_ZONE" && wv load'
                 ;;
         esac
+        if [ "$_h_fts_integrity" = failed ]; then
+            _hf_score=0
+            [ -n "$_hf_recovery" ] || _hf_recovery='wv doctor'
+        fi
 
         # Append to the same trend log as the full path (only on recompute —
         # a cache hit means the DB is unchanged, so the data point is a duplicate).
@@ -5639,24 +6347,31 @@ cmd_health() {
                 "$_hf_score" "$_h_total_nodes" "$_h_total_edges" \
                 "$_h_orphan_nodes" "$_h_ghost_edges" >> "$WEAVE_DIR/health.log"
         fi
-        jq -n \
+        local _hf_json
+        _hf_json=$(jq -n \
             --arg score "$_hf_score" \
             --arg nodes "${_h_total_nodes:-0}" \
             --arg edges "${_h_total_edges:-0}" \
             --arg orphans "${_h_orphan_nodes:-0}" \
             --arg lineage "$_hf_lineage" \
+            --arg fts_integrity "$_h_fts_integrity" \
             --arg recovery "$_hf_recovery" \
-            '{"score":($score|tonumber),"total_nodes":($nodes|tonumber),"total_edges":($edges|tonumber),"orphan_nodes":($orphans|tonumber),"fast":true,"lineage":$lineage}
-             + (if $recovery == "" then {} else {"recovery":$recovery} end)' \
-            > "$cache_file.tmp" 2>/dev/null && mv "$cache_file.tmp" "$cache_file"
+            '{"score":($score|tonumber),"total_nodes":($nodes|tonumber),"total_edges":($edges|tonumber),"orphan_nodes":($orphans|tonumber),"fast":true,"lineage":$lineage,"fts_integrity":$fts_integrity}
+             + (if $recovery == "" then {} else {"recovery":$recovery} end)') || return 1
+        # Cache storage is optional; its refusal must not substitute an older
+        # healthy payload for the verdict just computed.
+        { printf '%s\n' "$_hf_json" > "$cache_file.tmp" && mv "$cache_file.tmp" "$cache_file"; } 2>/dev/null \
+            || rm -f "$cache_file.tmp" 2>/dev/null
         if [ "$format" = "json" ]; then
-            cat "$cache_file" 2>/dev/null || jq -n --arg s "$_hf_score" '{"score":($s|tonumber),"fast":true}'
+            printf '%s\n' "$_hf_json"
         else
             echo "Health: ${_hf_score}/100 (fast)"
             [ -n "$_hf_recovery" ] && \
-                echo "  graph is not writable (lineage=$_hf_lineage) — recover with: $_hf_recovery" >&2
+                echo "  graph is not writable or could not be verified (lineage=$_hf_lineage) — inspect with: $_hf_recovery" >&2
+            [ "$_h_fts_integrity" != failed ] || echo "  FTS5 index check failed or unavailable — run: wv doctor" >&2
         fi
-        return 0
+        [ "$_h_fts_integrity" != failed ]
+        return $?
     fi
 
     # Collect all metrics, compute score, gather quality info
@@ -5681,9 +6396,9 @@ cmd_health() {
 
     # Format output
     if [ "$format" = "json" ]; then
-        _health_format_json "$strict"
-        # JSON callers parse the output — exit 0 unless --strict
-        if [ "$_h_invalid_statuses" -gt 0 ] || [ "$_h_contradictions" -gt 0 ]; then
+        _health_format_json "$strict" || return 1
+        # JSON callers parse the output — warnings exit 0 unless --strict.
+        if [ "$_h_fts_integrity" = failed ] || [ "$_h_invalid_statuses" -gt 0 ] || [ "$_h_contradictions" -gt 0 ]; then
             return 1
         fi
         if [ "$strict" = true ] && [ "$_h_health_score" -lt 100 ]; then
@@ -5697,8 +6412,8 @@ cmd_health() {
     # Exit code logic:
     # - Default: exit 0 (warnings are informational, not errors)
     # - --strict: exit 1 if score < 100 (for CI fail-on-warning)
-    # - Always exit 1 for true errors: invalid statuses, contradictions
-    if [ "$_h_invalid_statuses" -gt 0 ] || [ "$_h_contradictions" -gt 0 ]; then
+    # - Always exit 1 for failed index checks, invalid statuses, contradictions
+    if [ "$_h_fts_integrity" = failed ] || [ "$_h_invalid_statuses" -gt 0 ] || [ "$_h_contradictions" -gt 0 ]; then
         return 1
     fi
     if [ "$strict" = true ] && [ "$_h_health_score" -lt 100 ]; then
@@ -6435,6 +7150,7 @@ cmd_pattern_audit() {
     # definition line. A '|| ...' alternative on the tail makes it safe.
     local _pa7_scope="$_project_root/scripts"
     if [ -d "$_pa7_scope" ]; then
+        # shellcheck disable=SC2016  # $0 and $n are awk fields inside the awk program
         local _pa7_awk='
 /^(function[ \t]+)?[A-Za-z_][A-Za-z0-9_]*\(\)[ \t]*\{[ \t]*(#.*)?$/ {
     fname=$0; sub(/\(\).*/,"",fname); sub(/^function[ \t]+/,"",fname)
@@ -6489,6 +7205,7 @@ infunc {
     # justify a new blessed owner here.
     local _pa8_scope="$_project_root/scripts"
     if [ -d "$_pa8_scope" ]; then
+        # shellcheck disable=SC2016  # $0 and $n are awk fields inside the awk program
         local _pa8_awk='
 function allowed(fn) {
     return fn == "_bootstrap_agent_tools_json" ||
@@ -6547,6 +7264,7 @@ function allowed(fn) {
     # authoritative memory. New readers must justify a blessed entry here.
     local _pa9_scope="$_project_root/scripts"
     if [ -d "$_pa9_scope" ]; then
+        # shellcheck disable=SC2016  # $0 and $n are awk fields inside the awk program
         local _pa9_awk='
 function allowed(fn) {
     return fn == "_memory_scan_claude" ||
@@ -7106,7 +7824,7 @@ print_command_help() {
     printf 'Usage: %s\n\n%s\n' "$usage" "$summary"
 }
 
-cmd_help_topic() {
+_help_delegate_topic() {
     local topic="${1:-}"
     shift || true
 
@@ -7155,6 +7873,17 @@ cmd_help_topic() {
             ;;
         hook)
             cmd_hook --help
+            ;;
+    esac
+}
+
+cmd_help_topic() {
+    local topic="${1:-}"
+    shift || true
+
+    case "$topic" in
+        bootstrap|bootstrap-agent|bulk-update|cache|enrich-topology|quality|findings|analyze|index|query|hook)
+            _help_delegate_topic "$topic" "$@"
             ;;
         validate-finding)
             print_command_help "wv validate-finding <id>" "Validate finding metadata for a node. Exit 0 = valid; exit 1 = invalid. Outputs JSON {valid, errors[]}. Used by pre-close-verification hook to enforce violation_type and optional field constraints before a finding node can be closed."
@@ -7390,8 +8119,9 @@ commits list from their children."
             ;;
         hotzone)
             print_command_help "wv hotzone list [--json]" "List all hot-zones (active graph DB directories) with status, node count, and owner."
-            print_command_help "wv hotzone db" "Print this repository's resolved brain.db path. Read the graph DB through it (DB=\$(wv hotzone db); sqlite3 -readonly \"\$DB\"): placement follows the runtime class, not the agent, and sqlite3 on a guessed path creates an empty database there."
+            print_command_help "wv hotzone db" "Print this repository's resolved brain.db path. Read the graph DB through it (DB=\$(wv hotzone db); sqlite3 -readonly \"\$DB\"): placement adopts the zone already holding this repository's database, else the /tmp zone (wv-b831e3), and sqlite3 on a guessed path creates an empty database there."
             print_command_help "wv hotzone gc [--dry-run]" "Remove orphan hot-zone directories (no matching live repo). Skips dirs newer than 1h."
+            print_command_help "wv hotzone diff <brain.db> <brain.db>" "Compare two copies of one repository's graph, read-only, over every table a sync keeps (nodes, edges, file attribution, tombstones): rows only in one, or differing. Run it before removing either copy of a repository found in two hot zones: syncing both does not merge them (wv-a73141). It needs no hot zone, so it runs even where placement is refused (wv-757de1). Exit 0 identical, 1 different, 2 unusable arguments."
             ;;
         *)
             echo "Unknown help topic: $topic" >&2
@@ -7471,7 +8201,7 @@ Commands:
   self-update       Refresh installed wv from the dev clone recorded at install time
   uninstall         Remove installed wv files (delegates to install.sh --uninstall)
   doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]
-  hotzone <sub>     Hot-zone DB directories (list, gc) [--json] [--dry-run]
+  hotzone <sub>     Hot-zone DB directories (list, db, diff, gc) [--json] [--dry-run]
   context-policy    Context load policy (HIGH/MEDIUM/LOW) and reason [--json] [--refresh]
   selftest          Round-trip smoke test in isolated environment [--json]
   test-record <suite> Record a test-suite run for verification freshness (used by git hooks)

@@ -10,6 +10,7 @@ export WV_CALL_SOURCE=test
 # reached the GitHub projection stale. Every value option now takes both forms,
 # and an unknown argument fails the command before anything is written.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WV="$ROOT/scripts/wv"
 run=0; pass=0
@@ -58,6 +59,28 @@ out=$(w update "$id" --text 2>&1); rc=$?
 out=$(w update "$id" --text --status=todo 2>&1); rc=$?
 [ "$rc" != 0 ] && [ "$(col text)" = "equals-text" ] &&
     ok "a value option does not swallow the next option as its value" || bad "a value option does not swallow the next option as its value" "rc=$rc text=$(col text) $out"
+
+echo "=== rejected writes are not reported as applied ==="
+w update "$id" --metadata='{"hold":true}' >/dev/null 2>&1
+# Reject the requested changes, not lineage bookkeeping during sync: otherwise
+# a later sync failure can accidentally hide the unchecked write (wv-ccd364).
+sqlite3 "$DB" "CREATE TRIGGER test_update_refused BEFORE UPDATE ON nodes
+    WHEN OLD.id='$id' AND (NEW.text IS NOT OLD.text OR
+        json_extract(NEW.metadata,'$.hold') IS NOT json_extract(OLD.metadata,'$.hold'))
+    BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END;"
+out=$(w update "$id" --text='rejected text' 2>&1); rc=$?
+[ "$rc" != 0 ] && [[ "$out" != *"Updated:"* ]] && [ "$(col text)" = "equals-text" ] &&
+    ok "a rejected text write fails without reporting success" || bad "a rejected text write fails without reporting success" "rc=$rc $out"
+out=$(w update "$id" --metadata='{"hold":false}' --echo 2>&1); rc=$?
+[ "$rc" != 0 ] && [ "$(col "json_extract(metadata,'$.hold')")" = 1 ] &&
+    ok "a rejected metadata write fails with --echo" || bad "a rejected metadata write fails with --echo" "rc=$rc $out"
+out=$(w update "$id" --remove-key=hold 2>&1); rc=$?
+[ "$rc" != 0 ] && [[ "$out" != *"Removed metadata key"* ]] && [ "$(col "json_extract(metadata,'$.hold')")" = 1 ] &&
+    ok "a rejected key removal fails without reporting success" || bad "a rejected key removal fails without reporting success" "rc=$rc $out"
+sqlite3 "$DB" "DROP TRIGGER test_update_refused;"
+out=$(w update "$id" --text='persisted text' --metadata='{"hold":false}' 2>&1); rc=$?
+[ "$rc" = 0 ] && [ "$(col text)" = "persisted text" ] && [ "$(col "json_extract(metadata,'$.hold')")" = 0 ] &&
+    ok "an ordinary update persists after the failure is removed" || bad "an ordinary update persists after the failure is removed" "rc=$rc $out"
 
 echo "Results: $pass/$run passed"
 [ "$pass" -eq "$run" ]

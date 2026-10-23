@@ -14,10 +14,11 @@ Checks, beyond the schema:
     state transition names a field and values the node field registry declares;
   - every site resolves: its file exists, its function exists, and its anchor
     occurs exactly the declared number of times;
-  - completeness for the site classes code makes detectable: every SQLite abort
-    and every host-hook denial is claimed by a rule or a non-policy entry, and
-    every emitted policy verdict names a declared rule. Command gates that emit
-    nothing are not detectable and the contract says so (completeness.limit).
+  - completeness for the site classes code makes detectable: every SQLite abort,
+    every host-hook denial and every refusing exit of a Weave git hook is
+    claimed by a rule or a non-policy entry, and every emitted policy verdict
+    names a declared rule. Command gates that emit nothing are not detectable
+    and the contract says so (completeness.limit).
 
 Usage:
   python3 scripts/weave_policy.py validate [--json]
@@ -31,9 +32,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from collections.abc import Iterator
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent))
@@ -67,10 +70,23 @@ EMIT_ANCHORS = ("wv_policy_verdict ", "wv_policy_refusal ", "rule=")
 CLOSE_WRITE = re.compile(r"UPDATE\s+nodes\s+SET\b[^;]*\bstatus\s*=\s*'done'", re.IGNORECASE)
 JOURNAL_WRITE = re.compile(r"wv_attempt_emit|wv_policy_verdict|wv_policy_refusal|WV_ATTEMPT_JOURNAL")
 FUNCTION_DEF = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{")
-HOOK_FILES = (".claude/hooks/*.sh", "scripts/lib/wv-hook-common.sh")
+HOOK_FILES = (".claude/hooks/*.sh", "scripts/lib/wv-hook-common.sh", "scripts/lib/wv-pre-tool-use.sh",
+              "scripts/lib/wv-lifecycle-end.sh")
 # What a hook records when it decides (scripts/lib/wv-hook-observe.sh,
 # wv-664b7f): _hc_observe <rule> <decision> [bypass]. It never carries a call id.
 HOOK_OBSERVE = re.compile(r"\b_hc_observe\s+([a-z][a-z0-9_]*)\s+([a-z]+)")
+# Weave git hooks and the suite pool they source (wv-3477f0). A refusal is a
+# non-zero exit in command position (statement start, or after ; | & { then
+# else do), with a literal 1.. or a variable status; "(exit $rc" in a message
+# is text, not a refusal.
+GIT_HOOK_FILES = ("scripts/hooks/*-weave.sh", "scripts/lib/wv-gate-pool.sh")
+GIT_REFUSAL = re.compile(r"(?:^|[;&|{]|\bthen\b|\belse\b|\bdo\b)\s*exit\s+(?:[1-9][0-9]*|\"?\$)")
+# The markers build-release.sh cuts on, matched the way it matches them.
+SOURCE_ONLY_BEGIN = re.compile(r"^\s*# BEGIN source-only\b")
+SOURCE_ONLY_END = re.compile(r"^\s*# END source-only\b")
+# Which enforcement owner decides a scope kind the denominator excludes: such a
+# decision happens outside any wv call, so only that owner may make it.
+OUT_OF_CALL_OWNERS = {"host_event": "host_hook", "git_event": "git_hook"}
 SQL_FILES = ("scripts/lib/*.sh", "scripts/cmd/*.sh")
 EMIT_FILES = ("scripts/lib/*.sh", "scripts/cmd/*.sh", "scripts/wv")
 ANCHOR_WINDOW = 8
@@ -98,7 +114,7 @@ def _functions(lines: list[str]) -> list[str | None]:
 class Source:
     """One file's lines and the function each belongs to."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path) -> None:
         self.lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
         self.owner = _functions(self.lines)
 
@@ -116,7 +132,7 @@ class Source:
 class Checker:
     """One validation pass: loaded artifacts, source cache, claimed sites, errors."""
 
-    def __init__(self, contract: Json, root: Path):
+    def __init__(self, contract: Json, root: Path) -> None:
         self.contract = contract
         self.root = root
         self.errors: list[str] = []
@@ -256,16 +272,22 @@ class Checker:
         for entry in self.contract["denominator"]["excluded_scopes"]:
             if entry["kind"] in {"operation", "transition"}:
                 self.errors.append(f"denominator excludes {entry['kind']} scopes, which decide inside a wv call")
+            elif entry["kind"] not in OUT_OF_CALL_OWNERS:
+                self.errors.append(f"denominator excludes {entry['kind']} scopes, which no out-of-call "
+                                   "owner decides")
         outside = outside_denominator(self.contract)
         for rule in self.contract["rules"]:
             owners = {site["owner"] for site in rule["sites"]}
             kinds = {scope["kind"] for scope in rule["applies_to"]}
-            if kinds & excluded and "host_hook" not in owners:
-                self.errors.append(f"rule {rule['rule_id']}: an excluded scope with no host_hook site")
-            if rule["rule_id"] in outside and owners != {"host_hook"}:
+            for kind in sorted(kinds & excluded):
+                owner = OUT_OF_CALL_OWNERS.get(kind)
+                if owner and owner not in owners:
+                    self.errors.append(f"rule {rule['rule_id']}: an excluded {kind} scope with no {owner} site")
+            allowed = {OUT_OF_CALL_OWNERS[k] for k in kinds if k in OUT_OF_CALL_OWNERS}
+            if rule["rule_id"] in outside and not owners <= allowed:
                 self.errors.append(f"rule {rule['rule_id']}: outside the denominator but enforced in-call "
-                                   f"by {sorted(owners - {'host_hook'})}")
-        for rel, src in self.files(HOOK_FILES):
+                                   f"by {sorted(owners - allowed)}")
+        for rel, src in self.files(HOOK_FILES + GIT_HOOK_FILES):
             for i, line in enumerate(src.lines):
                 if not _is_comment(line) and JOURNAL_WRITE.search(line):
                     self.errors.append(f"{rel}:{i + 1}: a hook writes the attempt journal; a hook denial "
@@ -281,10 +303,27 @@ class Checker:
         return False
 
     def files(self, patterns: tuple[str, ...]) -> Iterator[tuple[str, Source]]:
-        """Existing files matching PATTERNS, as (repo-relative path, parsed source)."""
+        """Existing files matching PATTERNS, as (repo-relative path, parsed source).
+
+        Each pattern is one directory level, "dir/<glob>". A directory that is
+        there but cannot be listed is an error, not an empty match: glob read
+        one as holding nothing, and every enforcement site in it went
+        unchecked while the contract validated (wv-4852bd).
+        """
         for pattern in patterns:
-            for path in sorted(self.root.glob(pattern)):
-                rel = path.relative_to(self.root).as_posix()
+            parent, _, name = pattern.rpartition("/")
+            try:
+                entries = sorted(os.listdir(self.root / parent))
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError as exc:
+                self.errors.append(f"{parent or '.'}/: cannot be listed ({exc.strerror or exc}); "
+                                   f"the sites in {pattern} would go unchecked")
+                continue
+            for entry in entries:
+                if not fnmatchcase(entry, name):
+                    continue
+                rel = f"{parent}/{entry}" if parent else entry
                 src = self.source(rel)
                 if src is not None:
                     yield rel, src
@@ -315,6 +354,40 @@ class Checker:
                     found += 1
                     if not self.covered(rel, i, src):
                         self.errors.append(f"{rel}:{i + 1}: hook denial claimed by no rule or non-policy entry")
+        return found
+
+    def scan_git_hooks(self) -> int:
+        """Every refusing exit of a Weave git hook must be claimed (wv-3477f0).
+
+        A git hook refuses by exiting non-zero, so each such exit is an
+        enforcement site: a policy rule, or a non-policy category (a check the
+        content failed, or a gate that could not run). An unclaimed one is a
+        refusal the contract does not know about. Returns how many were found.
+        """
+        found = 0
+        for rel, src in self.files(GIT_HOOK_FILES):
+            inside = False
+            for i, line in enumerate(src.lines):
+                # Source-only blocks (the evidence lab, wv-1c1e15) never ship:
+                # build-release.sh cuts them, so the contract, which ships,
+                # describes the product without them. Markers must balance.
+                if SOURCE_ONLY_BEGIN.match(line):
+                    if inside:
+                        self.errors.append(f"{rel}:{i + 1}: nested '# BEGIN source-only'")
+                    inside = True
+                    continue
+                if SOURCE_ONLY_END.match(line):
+                    if not inside:
+                        self.errors.append(f"{rel}:{i + 1}: '# END source-only' without a BEGIN")
+                    inside = False
+                    continue
+                if inside or _is_comment(line) or not GIT_REFUSAL.search(line):
+                    continue
+                found += 1
+                if not self.covered(rel, i, src):
+                    self.errors.append(f"{rel}:{i + 1}: git hook refusal claimed by no rule or non-policy entry")
+            if inside:
+                self.errors.append(f"{rel}: '# BEGIN source-only' is never closed")
         return found
 
     def scan_observations(self) -> int:
@@ -405,6 +478,7 @@ def validate(contract_path: Path = DEFAULT_CONTRACT, schema_path: Path = DEFAULT
     detected = {
         "sqlite_trigger": checker.scan_sqlite(),
         "host_hook": checker.scan_hooks(),
+        "git_hook": checker.scan_git_hooks(),
         "emitted_verdicts": checker.scan_emits(),
         "hook_observations": checker.scan_observations(),
     }
@@ -582,7 +656,7 @@ def _observed_cells(journals: list[Path]) -> tuple[dict[str, set[tuple[str, str]
             continue
         for raw in lines:
             try:
-                event = json.loads(raw) if raw.strip() else {}
+                event = json.loads(raw) if raw.strip() else dict[str, object]()
             except json.JSONDecodeError:
                 continue  # the denominator check reports it
             if event.get("event") == "policy_verdict":
@@ -661,6 +735,58 @@ def _registry_operations(registry_path: Path) -> tuple[list[tuple[str, str]], li
     return pairs, errors
 
 
+def _operation_coverage(operations: list[tuple[str, str]], contract: Json,
+                        rules: dict[str, Json]) -> tuple[dict[str, list[Json]], list[str]]:
+    """Classify registry operations using observed rule states and declared gaps."""
+    coverage = contract["coverage"]
+    ungated = {key(entry) for entry in coverage["ungated"]}
+    op_gaps = {key(entry): entry["node"] for entry in coverage["gaps"] if "operation" in entry}
+    table = applicability(contract)
+    errors: list[str] = []
+    result: dict[str, list[Json]] = {"covered": [], "ungated": [], "gap": [], "uncovered": []}
+    for pair in sorted(set(operations)):
+        name = pair[0] + (f":{pair[1]}" if pair[1] else "")
+        applicable = sorted(table.get((pair[0], ""), set()) | (table.get(pair, set()) if pair[1] else set()))
+        pending = [r for r in applicable if rules[r]["state"] != "exercised"]
+        if pair in op_gaps:
+            result["gap"].append({"operation": name, "node": op_gaps[pair], "rules": applicable})
+            if not pending and applicable:
+                errors.append(f"operation {name} is covered but still declared a gap ({op_gaps[pair]})")
+        elif not applicable:
+            if pair in ungated:
+                result["ungated"].append({"operation": name})
+            else:
+                result["uncovered"].append({"operation": name, "rules": []})
+                errors.append(f"operation {name} has no applicable rule and is not declared ungated")
+        elif pair in ungated:
+            errors.append(f"operation {name} is declared ungated but {', '.join(applicable)} can decide in it")
+        elif not pending:
+            result["covered"].append({"operation": name, "rules": applicable})
+        elif all(rules[r]["state"] == "gap" for r in pending):
+            result["gap"].append({"operation": name, "rules": applicable,
+                                  "node": sorted({rules[r]["node"] for r in pending})})
+        else:
+            result["uncovered"].append({"operation": name, "rules": applicable})
+    for pair in sorted((ungated | set(op_gaps)) - set(operations)):
+        errors.append(f"coverage declares {pair[0]}{':' + pair[1] if pair[1] else ''}, "
+                      "which is not a mutation-class registry operation")
+    return result, errors
+
+
+# Owners whose decisions have no evidence channel at all: a host hook writes
+# hook observations, a git hook writes nothing a commit's outcome could be
+# grounded in (wv-3477f0).
+NO_EVIDENCE_OWNERS = {"git_hook"}
+
+
+def _outside_evidence(rule: Json, contract: Json) -> bool:
+    """Whether RULE is enforced only by an owner with no evidence channel, at
+    scopes the denominator excludes by declaration."""
+    owners = {site["owner"] for site in rule["sites"]}
+    kinds = {scope["kind"] for scope in rule["applies_to"]}
+    return bool(owners) and owners <= NO_EVIDENCE_OWNERS and kinds <= excluded_kinds(contract)
+
+
 def totality_report(journals: list[Path], contract_path: Path = DEFAULT_CONTRACT,
                     registry_path: Path | None = None, root: Path = ROOT,
                     hook_observations: list[Path] | None = None) -> Json:
@@ -691,13 +817,19 @@ def totality_report(journals: list[Path], contract_path: Path = DEFAULT_CONTRACT
                               f"not this contract's {identity}")
     errors += _hook_cells(hook_observations or [], contract, identity, seen)
     coverage = contract["coverage"]
-    ungated = {key(entry) for entry in coverage["ungated"]}
-    op_gaps = {key(entry): entry["node"] for entry in coverage["gaps"] if "operation" in entry}
     rule_gaps = {entry["rule"]: entry["node"] for entry in coverage["gaps"] if "rule" in entry}
 
     rules: dict[str, Json] = {}
     for rule in contract["rules"]:
         rid = rule["rule_id"]
+        if _outside_evidence(rule, contract):
+            # A git hook decides outside any wv call, and nothing it runs is
+            # proof of the commit's outcome, so no journal or observation can
+            # exercise the rule (wv-3477f0). Reported, never counted or gapped.
+            rules[rid] = {"state": "outside_evidence"}
+            if rid in rule_gaps:
+                errors.append(f"rule {rid} is outside evidence by declaration but still declared a gap")
+            continue
         missing = [_cell_label(c) for c in rule_cells(rule) if not _cell_observed(c, seen.get(rid, set()))]
         if not missing:
             rules[rid] = {"state": "exercised"}
@@ -709,34 +841,8 @@ def totality_report(journals: list[Path], contract_path: Path = DEFAULT_CONTRACT
             rules[rid] = {"state": "unexercised", "missing": missing}
             errors.append(f"rule {rid} has no observed verdict for {', '.join(missing)} and no declared gap")
 
-    table = applicability(contract)
-    result: dict[str, list[Json]] = {"covered": [], "ungated": [], "gap": [], "uncovered": []}
-    for pair in sorted(set(operations)):
-        name = pair[0] + (f":{pair[1]}" if pair[1] else "")
-        applicable = sorted(table.get((pair[0], ""), set()) | (table.get(pair, set()) if pair[1] else set()))
-        pending = [r for r in applicable if rules[r]["state"] != "exercised"]
-        if pair in op_gaps:
-            result["gap"].append({"operation": name, "node": op_gaps[pair], "rules": applicable})
-            if not pending and applicable:
-                errors.append(f"operation {name} is covered but still declared a gap ({op_gaps[pair]})")
-        elif not applicable:
-            if pair in ungated:
-                result["ungated"].append({"operation": name})
-            else:
-                result["uncovered"].append({"operation": name, "rules": []})
-                errors.append(f"operation {name} has no applicable rule and is not declared ungated")
-        elif pair in ungated:
-            errors.append(f"operation {name} is declared ungated but {', '.join(applicable)} can decide in it")
-        elif not pending:
-            result["covered"].append({"operation": name, "rules": applicable})
-        elif all(rules[r]["state"] == "gap" for r in pending):
-            result["gap"].append({"operation": name, "rules": applicable,
-                                  "node": sorted({rules[r]["node"] for r in pending})})
-        else:
-            result["uncovered"].append({"operation": name, "rules": applicable})
-    for pair in sorted((ungated | set(op_gaps)) - set(operations)):
-        errors.append(f"coverage declares {pair[0]}{':' + pair[1] if pair[1] else ''}, "
-                      "which is not a mutation-class registry operation")
+    result, operation_errors = _operation_coverage(operations, contract, rules)
+    errors += operation_errors
     for rid in sorted(set(rule_gaps) - set(rules)):
         errors.append(f"coverage declares a gap for rule {rid}, which the contract does not declare")
 
@@ -841,7 +947,8 @@ def main() -> int:
         print(f"wrote {args.artifact}")
         return 0
     if args.command == "check":
-        if not args.artifact.is_file() or args.artifact.read_text(encoding="utf-8") != shell(args.contract, args.schema):
+        current = args.artifact.read_text(encoding="utf-8") if args.artifact.is_file() else None
+        if current != shell(args.contract, args.schema):
             print(f"x {args.artifact} differs from the policy contract -- regenerate with: "
                   "python3 scripts/weave_policy.py generate", file=sys.stderr)
             return 1

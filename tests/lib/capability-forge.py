@@ -16,17 +16,20 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
+from collections.abc import Callable
 
 
-def row(doc: dict, operation: str, sub: str | None = None) -> dict:
-    for candidate in doc["commands"]:
+def row(doc: dict[str, Any], operation: str, sub: str | None = None) -> dict[str, Any]:
+    commands: list[dict[str, Any]] = doc["commands"]
+    for candidate in commands:
         if candidate["operation"] == operation and candidate.get("suboperation") == sub:
             return candidate
     raise SystemExit(f"forge: no row for {operation}:{sub}")
 
 
 # name -> (keyword broken, mutation)
-FORGERIES = {
+FORGERIES: dict[str, Callable[[dict[str, Any]], object]] = {
     # uniqueItems on mutation_targets
     "dup-targets": lambda d: row(d, "add").__setitem__(
         "mutation_targets", row(d, "add")["mutation_targets"] + [row(d, "add")["mutation_targets"][0]]

@@ -10,6 +10,7 @@ export WV_CALL_SOURCE=test
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Colors
 RED='\033[0;31m'
@@ -28,7 +29,10 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WV="$PROJECT_ROOT/scripts/wv"
 
 # Test environment
-TEST_DIR="/tmp/wv-graph-test-$$"
+SCRATCH=$(bash "$PROJECT_ROOT/scripts/lib/wv-scratch.sh")
+export TMPDIR="$SCRATCH"
+unset WV_SCRATCH_ROOT
+TEST_DIR="$SCRATCH/repo"
 export WV_HOT_ZONE="$TEST_DIR"
 export WV_DB="$TEST_DIR/brain.db"
 export WV_REQUIRE_LEARNING=0
@@ -36,8 +40,8 @@ export WV_PROJECT_DIR="$TEST_DIR"
 
 # Cleanup function
 cleanup() {
-    if [ -d "$TEST_DIR" ]; then
-        rm -rf "$TEST_DIR"
+    if [ -d "$SCRATCH" ]; then
+        rm -rf "$SCRATCH"
     fi
 }
 trap cleanup EXIT
@@ -52,6 +56,9 @@ setup_test_env() {
     "$WV" init >/dev/null 2>&1
 }
 
+# Assertions record a failure and return 0: under set -e a nonzero return
+# ended the suite at its first failed assertion, so every later result and
+# the summary went unreported (wv-75e31a). TESTS_FAILED decides the exit.
 assert_equals() {
     local expected="$1"
     local actual="$2"
@@ -68,7 +75,7 @@ assert_equals() {
         echo "  Expected: $expected"
         echo "  Actual:   $actual"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -88,7 +95,7 @@ assert_contains() {
         echo "  Expected to find: $needle"
         echo "  In: $haystack"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -108,7 +115,7 @@ assert_not_contains() {
         echo "  Expected NOT to find: $needle"
         echo "  In: $haystack"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -128,7 +135,7 @@ assert_jq_true() {
         echo "  jq expr failed: $jq_expr"
         echo "  JSON: $json_input"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -146,7 +153,7 @@ assert_success() {
         echo -e "${RED}✗${NC} $message"
         echo "  Command failed: $*"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -164,7 +171,7 @@ assert_fails() {
         echo -e "${RED}✗${NC} $message"
         echo "  Expected command to fail: $*"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -222,7 +229,7 @@ test_block() {
     assert_not_contains "$output" "Blockers cleared:" "no cleared heading while the blocker is open"
 
     "$WV" work "$blocker" >/dev/null 2>&1
-    "$WV" done "$blocker" --skip-verification >/dev/null 2>&1
+    "$WV" "done" "$blocker" --skip-verification >/dev/null 2>&1
     output=$("$WV" show "$target" 2>&1)
     assert_contains "$output" "Blockers cleared:" "a completed blocker renders as cleared"
     assert_not_contains "$output" "Blocked by:" "a completed blocker no longer renders as blocking"
@@ -436,6 +443,15 @@ test_edges() {
     output=$("$WV" edges "$node1" --json 2>&1)
     assert_contains "$output" "[" "edges --json outputs JSON"
 
+    # No matching edge is an empty array, not empty output (wv-fea2e9): a
+    # caller's jq length check read nothing and 'test "" = 0' failed.
+    local lonely
+    lonely=$("$WV" add "Lonely" --force 2>&1 | node_id_from_output)
+    assert_equals "[]" "$("$WV" edges "$lonely" --json 2>/dev/null)" \
+        "edges --json prints [] for a node with no edges"
+    assert_equals "[]" "$("$WV" edges "$node1" --type=blocks --json 2>/dev/null)" \
+        "edges --type --json prints [] when no edge of that type matches"
+
     # Edges requires node ID
     assert_fails "edges requires node ID" "$WV" edges
 
@@ -539,7 +555,7 @@ test_impact() {
     leaf=$("$WV" add "Leaf todo" --force 2>&1 | node_id_from_output)
     "$WV" block "$mid" --by="$root" >/dev/null 2>&1
     "$WV" block "$leaf" --by="$mid" >/dev/null 2>&1
-    "$WV" done "$mid" --learning="decision: test" >/dev/null 2>&1
+    "$WV" "done" "$mid" --learning="decision: test" >/dev/null 2>&1
 
     out=$("$WV" impact "$root" --include-done 2>&1)
     assert_contains "$out" "Leaf todo" "done-intermediate: leaf reachable via done mid with --include-done"
@@ -550,7 +566,7 @@ test_impact() {
     dseed=$("$WV" add "Done seed" --force 2>&1 | node_id_from_output)
     dchild=$("$WV" add "Child of done" --force 2>&1 | node_id_from_output)
     "$WV" block "$dchild" --by="$dseed" >/dev/null 2>&1
-    "$WV" done "$dseed" --learning="decision: test" >/dev/null 2>&1
+    "$WV" "done" "$dseed" --learning="decision: test" >/dev/null 2>&1
 
     assert_fails "done-seed+fwd: errors on done seed with default direction" "$WV" impact "$dseed"
 
@@ -1087,6 +1103,7 @@ test_context_oversized_payload() {
     {
         echo '#!/bin/bash'
         echo 'for a in "$@"; do'
+        # shellcheck disable=SC2016  # writes a script whose $ expands when that script runs
         echo '    if [ "$a" = "--slurpfile" ]; then'
         echo '        echo "forced compose failure" >&2'
         echo '        exit 5'
@@ -1114,6 +1131,72 @@ test_context_oversized_payload() {
 }
 
 # ============================================================================
+# Mutation refusal through the public dispatcher (wv-ccd364). Each trigger
+# lives only in setup_test_env's disposable repository, never the live graph.
+test_graph_mutation_refusal() {
+    local scenario source target out rc sql success
+    for scenario in block_insert block_update link_insert link_update unlink_delete; do
+        setup_test_env
+        source=$("$WV" add "Refusal source" --force 2>&1 | node_id_from_output)
+        target=$("$WV" add "Refusal target" --force 2>&1 | node_id_from_output)
+        local -a args
+        case "$scenario" in
+            block_insert|block_update)
+                args=(block "$target" --by="$source")
+                success="is now blocked by"
+                if [ "$scenario" = block_insert ]; then
+                    sql="BEFORE INSERT ON edges"
+                else
+                    sql="BEFORE UPDATE OF status ON nodes WHEN NEW.id='$target' AND NEW.status='blocked'"
+                fi
+                ;;
+            link_insert|link_update)
+                args=(link "$source" "$target" --type=relates_to --weight=0.5)
+                success="Linked:"
+                sql="BEFORE INSERT ON edges"
+                if [ "$scenario" = link_update ]; then
+                    "$WV" link "$source" "$target" --type=relates_to --context='{"summary":"keep explicit"}' >/dev/null 2>&1
+                    sql="BEFORE UPDATE ON edges"
+                fi
+                ;;
+            unlink_delete)
+                "$WV" link "$source" "$target" --type=relates_to >/dev/null 2>&1
+                args=(unlink "$source" "$target" --type=relates_to)
+                success="Unlinked:"
+                sql="BEFORE DELETE ON edges"
+                ;;
+        esac
+        local before
+        before=$(sqlite3 "$WV_DB" "SELECT source,target,type,weight,context,created_at FROM edges; SELECT id,status,updated_at FROM nodes ORDER BY id;")
+        sqlite3 "$WV_DB" "CREATE TRIGGER refuse_graph $sql BEGIN SELECT RAISE(ABORT, 'forced graph refusal'); END;"
+        rc=0
+        out=$("$WV" "${args[@]}" 2>&1) || rc=$?
+        assert_equals "1" "$rc" "$scenario: refusal exits 1"
+        assert_contains "$out" "forced graph refusal" "$scenario: real SQLite refusal surfaced"
+        assert_not_contains "$out" "$success" "$scenario: no success announcement"
+        assert_equals "$before" "$(sqlite3 "$WV_DB" "SELECT source,target,type,weight,context,created_at FROM edges; SELECT id,status,updated_at FROM nodes ORDER BY id;")" "$scenario: no partial graph mutation"
+        sqlite3 "$WV_DB" "DROP TRIGGER refuse_graph;"
+        rc=0
+        out=$("$WV" "${args[@]}" 2>&1) || rc=$?
+        assert_equals "0" "$rc" "$scenario: retry succeeds"
+        assert_contains "$out" "$success" "$scenario: retry announces success"
+        case "$scenario" in
+            block_*)
+                assert_equals "1|blocked" "$(sqlite3 "$WV_DB" "SELECT count(*), (SELECT status FROM nodes WHERE id='$target') FROM edges WHERE source='$source' AND target='$target' AND type='blocks';")" "$scenario: retry commits edge and status"
+                ;;
+            link_*)
+                assert_equals "0.5" "$(sqlite3 "$WV_DB" "SELECT weight FROM edges WHERE source='$source' AND target='$target';")" "$scenario: retry commits weight"
+                if [ "$scenario" = link_update ]; then
+                    assert_equals "keep explicit" "$(sqlite3 "$WV_DB" "SELECT json_extract(context,'$.summary') FROM edges;")" "$scenario: auto upsert preserves explicit context"
+                fi
+                ;;
+            unlink_delete)
+                assert_equals "0" "$(sqlite3 "$WV_DB" 'SELECT count(*) FROM edges;')" "$scenario: retry deletes edge"
+                ;;
+        esac
+    done
+}
+
 # Main
 # ============================================================================
 main() {
@@ -1123,6 +1206,7 @@ main() {
 
     test_block
     test_link
+    test_graph_mutation_refusal
     test_resolve
     test_related
     test_edges

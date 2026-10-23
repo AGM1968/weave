@@ -1,6 +1,18 @@
 #!/bin/bash
 # wv-cmd-hook.sh -- host-neutral lifecycle hook facade.
 
+# The PreToolUse and PostToolUse guards; side-effect free on source (wv-d3fbcb,
+# wv-594381). Beside this module when it is loaded on its own, without wv's
+# WV_LIB_DIR.
+# shellcheck disable=SC1091
+source "${WV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/lib/wv-pre-tool-use.sh"
+# shellcheck disable=SC1091
+source "${WV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/lib/wv-post-tool-use.sh"
+# The Stop, SessionEnd and PreCompact implementations; side-effect free on
+# source (wv-25903d).
+# shellcheck disable=SC1091
+source "${WV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/lib/wv-lifecycle-end.sh"
+
 _hook_decision_json() {
     local decision="$1" event="$2" reason="${3:-}" active_node="${4:-}"
     jq -n \
@@ -17,66 +29,105 @@ _hook_active_id() {
     "${WV:-${WV_CLI:-$SCRIPT_DIR/wv}}" list --status=active --json-v2 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null
 }
 
-_hook_input_paths() {
-    local tool="$1" tool_input="$2" path patch
-    path=$(printf '%s' "$tool_input" | jq -r '.file_path // .filePath // .path // empty' 2>/dev/null)
-    [ -z "$path" ] || printf '%s\n' "$path"
+_hook_input_paths() { _ptu_input_paths "$@"; }
 
-    [ "$tool" = "apply_patch" ] || return 0
-    patch=$(printf '%s' "$tool_input" | jq -r '.patchText // .patch // empty' 2>/dev/null)
-    [ -n "$patch" ] || return 0
-    printf '%s\n' "$patch" | sed -nE \
-        's/^\*\*\* (Add File|Update File|Delete File|Move to): (.*)$/\2/p'
-}
+# _hook_pre_tool_use <input> <format> — run the PreToolUse guards in
+# scripts/lib/wv-pre-tool-use.sh, the implementation Claude Code's hooks call
+# in-process, and report the first one that decides. Bash dedup runs last, so
+# a call another guard refuses never takes its lock; PostToolUse dispatch
+# releases the lock once the command has run (wv-594381).
+#
+# host: the deciding guard's own output and exit status, which Claude Code and
+#   Codex both honour (exit 2 with the reason on stderr, or exit 0 with
+#   permissionDecision=deny JSON). The --json exit 1 block is not one Codex
+#   honours: it reads any exit but 0 and 2 as a failed hook (wv-5b774a).
+# json: the decision JSON, with the guard's own message as the reason.
+_hook_pre_tool_use() {
+    local input="$1" format="$2" guard notes err out rc reason active_id
+    local decided="" err_all="" faulted=false
+    notes=$(mktemp -t wv-ptu-notes-XXXXXX)
+    err=$(mktemp -t wv-ptu-err-XXXXXX)
+    for guard in edit claim close dedup; do
+        : > "$err"
+        set +e
+        out=$(_PTU_NOTES="$notes" WV_PTU_RECHECK_STAMP=1 "wv_ptu_${guard}_guard" "$input" 2>"$err")
+        rc=$?
+        set -e
+        if [ "$rc" -eq 2 ] || printf '%s' "$out" \
+            | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
+            decided="$guard"
+            break
+        fi
+        [ "$rc" -eq 0 ] || faulted=true
+        err_all="${err_all}$(cat "$err")"
+    done
+    active_id=$(awk -F'\t' '$1 == "active_node" && $2 != "" { v = $2 } END { print v }' "$notes")
+    rm -f "$notes"
 
-_hook_repo_relative_path() {
-    local path="$1" root
-    root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-    case "$path" in
-        "$root"/*) printf '%s\n' "${path#"$root"/}" ;;
-        *) printf '%s\n' "$path" ;;
-    esac
-}
+    if [ "$format" = "host" ]; then
+        if [ -n "$decided" ]; then
+            cat "$err" >&2
+            [ -z "$out" ] || printf '%s\n' "$out"
+            rm -f "$err"
+            return "$rc"
+        fi
+        rm -f "$err"
+        [ -z "$err_all" ] || printf '%s\n' "$err_all" >&2
+        return 0
+    fi
 
-# _hook_installed_path_hit — mirror _hc_check_installed_path (check #1 in the
-# dispatch_hook order from docs/PROPOSAL-wv-pattern-crystallization.md), but
-# scan every path _hook_input_paths can extract, including apply_patch patch
-# headers which have no file_path/filePath field for _hc_check_installed_path
-# to read. Requires _WF_HOOK_EDIT_TOOLS/_wf_in_list from wv-hook-common.sh.
-# Prints the offending path and returns 0 on a hit; returns 1 when clean.
-_hook_installed_path_hit() {
-    local tool="$1" tool_input="$2" path
-    _wf_in_list "$tool" "${_WF_HOOK_EDIT_TOOLS[@]}" || [ "$tool" = "apply_patch" ] || return 1
-    while IFS= read -r path; do
-        [ -n "$path" ] || continue
-        case "$path" in
-            *.local/bin/*|*.local/lib/weave/*) printf '%s\n' "$path"; return 0 ;;
-        esac
-    done < <(_hook_input_paths "$tool" "$tool_input")
-    return 1
+    if [ -n "$decided" ]; then
+        if [ "$rc" -eq 2 ]; then
+            reason=$(sed -e 's/[[:space:]]*$//' "$err")
+        else
+            reason=$(printf '%s' "$out" | jq -r '.hookSpecificOutput.permissionDecisionReason // ""')
+        fi
+        rm -f "$err"
+        _hook_decision_json block PreToolUse "$reason" "$active_id"
+        return 1
+    fi
+    rm -f "$err"
+    if [ "$faulted" = true ]; then
+        # A guard that failed without deciding: the hook it replaced exited
+        # nonzero, which neither host reads as a block.
+        _hook_decision_json hook_error PreToolUse "$(printf '%s' "$err_all" | sed -e 's/[[:space:]]*$//')" "$active_id"
+        return 0
+    fi
+    _hook_decision_json allow PreToolUse "" "$active_id"
 }
 
 cmd_hook_dispatch() {
-    local event="" input tool tool_input tool_succeeded active_id path paths_csv=""
+    local event="" input active_id format="json" vscode=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --event=*) event="${1#*=}" ;;
             --json) ;;
+            # host: what Claude Code and Codex both read: hookSpecificOutput for
+            # SessionStart and PostToolUse, the guard's own exit and output for
+            # PreToolUse, {"decision":"block"} with exit 0 for Stop, the snapshot
+            # as plain text for PreCompact, nothing for SessionEnd.
+            # VS Code Local shares the tool decisions but requires a nested
+            # Stop decision and JSON (not plain text) for PreCompact.
+            --format=json|--format=host|--format=vscode) format="${1#*=}" ;;
             --help|-h)
-                echo "Usage: wv hook dispatch --event=SessionStart|PreToolUse|PostToolUse|Stop [--json]"
+                echo "Usage: wv hook dispatch --event=SessionStart|PreToolUse|PostToolUse|Stop|SessionEnd|PreCompact [--json] [--format=json|host|vscode]"
                 return 0 ;;
             *) echo "Error: unknown hook dispatch option '$1'" >&2; return 1 ;;
         esac
         shift
     done
-    case "$event" in SessionStart|PreToolUse|PostToolUse|Stop) ;; *)
-        echo "Error: --event must be SessionStart, PreToolUse, PostToolUse, or Stop" >&2; return 1 ;;
+    case "$event" in SessionStart|PreToolUse|PostToolUse|Stop|SessionEnd|PreCompact) ;; *)
+        echo "Error: --event must be SessionStart, PreToolUse, PostToolUse, Stop, SessionEnd, or PreCompact" >&2; return 1 ;;
     esac
+    if [ "$format" = vscode ]; then
+        vscode=true
+        format=host
+    fi
 
     # Infrastructure fault (no jq): fail open — this is a tooling problem, not a
     # policy decision, and _hook_decision_json itself needs jq.
     if ! command -v jq >/dev/null 2>&1; then
-        printf '{"decision":"hook_error","event":"%s","reason":"jq unavailable; failing open (infrastructure fault)"}\n' "$event"
+        printf '{"decision":"hook_error","event":"%s","reason":"jq unavailable; failing open (infrastructure fault)"}\n' "$(wv_json_escape "$event")"
         return 0
     fi
 
@@ -88,24 +139,23 @@ cmd_hook_dispatch() {
         raw_input_empty=true
         input='{}'
     fi
-    if ! printf '%s' "$input" | jq -e 'type == "object"' >/dev/null 2>&1; then
-        # Payload malformation: for the mutation-gating event we cannot prove the
-        # event is not a mutation, so fail closed (wv-692c2d). Advisory/lifecycle
-        # events keep the fail-open posture.
-        if [ "$event" = "PreToolUse" ]; then
-            _hook_decision_json block "$event" "Malformed hook payload (invalid_required_field: payload must be a JSON object); failing closed for mutation gating"
-            return 1
+    if [ "$event" = "PreToolUse" ]; then
+        if [ "$raw_input_empty" = true ]; then
+            [ "$format" = "host" ] || _hook_decision_json allow "$event"
+            return 0
         fi
+        # The guards judge the payload themselves, a malformed one included:
+        # the edit guard fails it closed (wv-692c2d).
+        local ptu_rc=0
+        _hook_pre_tool_use "$input" "$format" || ptu_rc=$?
+        return "$ptu_rc"
+    fi
+    if ! printf '%s' "$input" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        # Advisory and lifecycle events fail open on a malformed payload; the
+        # mutation-gating event (PreToolUse) failed it closed above.
         _hook_decision_json hook_error "$event" "Invalid hook JSON; failing open"
         return 0
     fi
-    tool=$(printf '%s' "$input" | jq -r '.tool_name // .tool // empty' 2>/dev/null)
-    tool_input=$(printf '%s' "$input" | jq -c '.tool_input // .input // {}' 2>/dev/null || echo '{}')
-    tool_succeeded=$(printf '%s' "$input" | jq -r '
-        if (.tool_response | type) == "object" and (.tool_response | has("success")) then .tool_response.success
-        elif (.response | type) == "object" and (.response | has("success")) then .response.success
-        else true
-        end' 2>/dev/null || echo true)
 
     case "$event" in
         SessionStart)
@@ -113,120 +163,98 @@ cmd_hook_dispatch() {
             # shellcheck disable=SC1091
             source "$WV_LIB_DIR/lib/wv-hook-common.sh"
             _hc_refresh
-            # Mirrors .claude/hooks/session-start-context.sh: stamp the epoch
-            # PreToolUse's stale-node check compares against, and reset phase
-            # so edits require an explicit claim this session.
-            date +%s > "${_HC_HOT_ZONE}/.session_epoch" 2>/dev/null || true
-            wv_set_phase "discover" "${_HC_HOT_ZONE}" 2>/dev/null || true
-            active_id=$(_hook_active_id)
-            _hook_decision_json allow "$event" "" "$active_id"
-            ;;
-        PreToolUse)
-            # Resolved from WV_LIB_DIR in dev and installed layouts.
-            # shellcheck disable=SC1091
-            source "$WV_LIB_DIR/lib/wv-hook-common.sh"
-            _hc_refresh
-            # _hc_refresh now guarantees WV is set (wv-dfaa75) — see its own
-            # comment for why _hc_check_active_node needs this.
-
-            # Order matches dispatch_hook in docs/PROPOSAL-wv-pattern-crystallization.md
-            # (installed-path guard, then classify/should-check, then phase, then
-            # active/stale node) — the same order Claude's pre-action.sh runs in.
-            local installed_hit
-            if installed_hit=$(_hook_installed_path_hit "$tool" "$tool_input"); then
-                _hook_decision_json block "$event" "Editing installed Weave copy at $installed_hit; edit the source in scripts/ instead"
-                return 1
-            fi
-
-            if [ "$tool" = "apply_patch" ]; then
-                _hc_classify_tool Edit "$tool_input"
+            local context=""
+            if [ "$raw_input_empty" = true ]; then
+                # Manual invocation: stamp the epoch PreToolUse's stale-node check
+                # compares against and reset phase, nothing more -- no sentinel,
+                # no load, no commit.
+                date +%s > "${_HC_HOT_ZONE}/.session_epoch" 2>/dev/null || true
+                wv_set_phase "discover" "${_HC_HOT_ZONE}" 2>/dev/null || true
             else
-                _hc_classify_tool "$tool" "$tool_input"
+                # A host session start: the one implementation every host runs
+                # (wv-a523de), including the epoch stamp and phase reset.
+                # shellcheck disable=SC1091
+                source "$WV_LIB_DIR/lib/wv-session-start.sh"
+                context=$(wv_session_start_context "$input")
             fi
-            if [ "${_HC_MALFORMED:-false}" = true ] && [ "$raw_input_empty" = false ]; then
-                _hook_decision_json block "$event" "Malformed hook payload (${_HC_MALFORMED_REASON}); failing closed for mutation gating"
-                return 1
+            active_id=$(_hook_active_id)
+            if [ "$format" = "host" ]; then
+                jq -n --arg ctx "$context" \
+                    '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}'
+            elif [ -n "$context" ]; then
+                _hook_decision_json allow "$event" "" "$active_id" | jq --arg ctx "$context" '. + {context: $ctx}'
+            else
+                _hook_decision_json allow "$event" "" "$active_id"
             fi
-            if [ "${_HC_BYPASS_CMD:-false}" = true ] || [ "${_HC_SHOULD_CHECK:-false}" = false ]; then
-                _hook_decision_json allow "$event"
-                return 0
-            fi
-
-            local phase_rc=0
-            _hc_check_phase 2>/dev/null || phase_rc=$?
-            if [ "$phase_rc" -eq 2 ]; then
-                _hook_decision_json block "$event" "File edit blocked during Weave ${_HC_PHASE:-discover} phase; claim work with wv work <id> first"
-                return 1
-            elif [ "$phase_rc" -eq 1 ]; then
-                _hook_decision_json allow "$event"
-                return 0
-            fi
-
-            if ! _hc_check_active_node >/dev/null 2>&1; then
-                _hook_decision_json block "$event" "No active Weave node for edit-class tool"
-                return 1
-            fi
-            active_id=$(printf '%s' "${_HC_ACTIVE_NODES:-[]}" | jq -r '.[0].id // empty' 2>/dev/null)
-
-            if ! _hc_check_stale_node 2>/dev/null; then
-                _hook_decision_json block "$event" "Active Weave node $active_id predates this session; re-claim with wv work $active_id" "$active_id"
-                return 1
-            fi
-
-            if ! _hc_resolve_primary_node; then
-                _hook_decision_json allow "$event"
-                return 0
-            fi
-            active_id="$_HC_NODE_ID"
-            if ! _hc_check_context_pack "$active_id" >/dev/null 2>&1; then
-                _hook_decision_json block "$event" "Context Pack generation failed for active Weave node $active_id" "$active_id"
-                return 1
-            fi
-            # Unlike Claude's pre-action.sh, dispatch may be the only policy gate
-            # in mixed-host sessions. A prior context stamp is not authority to
-            # skip graph policy here; rehydrate and check the current graph.
-            if [ "${_HC_CONTEXT_STAMP_HIT:-false}" = true ]; then
-                _HC_CONTEXT_PACK=$("$WV" context "$active_id" --json 2>/dev/null || echo "")
-                if [ -z "$_HC_CONTEXT_PACK" ]; then
-                    _hook_decision_json block "$event" "Context Pack generation failed for active Weave node $active_id" "$active_id"
-                    return 1
-                fi
-            fi
-            if ! _hc_check_contradictions "$active_id" >/dev/null 2>&1; then
-                _hook_decision_json block "$event" "Contradictions detected for active Weave node $active_id" "$active_id"
-                return 1
-            fi
-            if ! _hc_check_blockers "$active_id" >/dev/null 2>&1; then
-                _hook_decision_json block "$event" "Active Weave node $active_id is blocked by incomplete work" "$active_id"
-                return 1
-            fi
-
-            _hook_decision_json allow "$event" "" "$active_id"
             ;;
         PostToolUse)
+            local ptu_out ptu_ctx ptu_all="" ptu_guard
+            # Attribution, the dedup lock release, the wv budget tally, the
+            # linter and memory capture: the guards Claude Code's PostToolUse
+            # hooks call in-process (wv-594381). A guard's failure is not the
+            # tool call's, so each one fails open.
+            for ptu_guard in touched dedup_release budget lint memory; do
+                ptu_out=$("wv_potu_${ptu_guard}_guard" "$input" 2>/dev/null) || true
+                ptu_ctx=$(printf '%s' "$ptu_out" | jq -r '.hookSpecificOutput.additionalContext // empty' 2>/dev/null) || ptu_ctx=""
+                [ -z "$ptu_ctx" ] || ptu_all="${ptu_all:+$ptu_all
+}$ptu_ctx"
+            done
             active_id=$(_hook_active_id)
-            if [ "$tool_succeeded" != "false" ] && [ -n "$active_id" ]; then
-                while IFS= read -r path; do
-                    [ -n "$path" ] || continue
-                    path=$(_hook_repo_relative_path "$path")
-                    case ",$paths_csv," in
-                        *",$path,"*) ;;
-                        *) paths_csv="${paths_csv:+$paths_csv,}$path" ;;
-                    esac
-                done < <(_hook_input_paths "$tool" "$tool_input")
-                if [ -n "$paths_csv" ]; then
-                    "${WV:-${WV_CLI:-$SCRIPT_DIR/wv}}" touch "$active_id" --files="$paths_csv" >/dev/null 2>&1 || true
-                fi
+            if [ "$format" = "host" ]; then
+                [ -z "$ptu_all" ] || _potu_context "$ptu_all"
+            elif [ -n "$ptu_all" ]; then
+                _hook_decision_json allow "$event" "" "$active_id" | jq --arg ctx "$ptu_all" '. + {context: $ctx}'
+            else
+                _hook_decision_json allow "$event" "" "$active_id"
             fi
-            _hook_decision_json allow "$event" "" "$active_id"
             ;;
         Stop)
-            active_id=$(_hook_active_id)
-            if [ -n "$active_id" ]; then
-                _hook_decision_json block "$event" "Active Weave node must be closed or explicitly deferred" "$active_id"
+            # The guard Claude Code's stop-check.sh calls in-process (wv-25903d):
+            # its block is {"decision":"block"} with exit 0, the shape Codex
+            # honours, where --json's exit 1 reads as a failed hook (wv-5b774a).
+            # Its soft warnings go to stderr on both formats.
+            local stop_out stop_reason
+            stop_out=$(wv_stop_guard "$input") || true
+            if [ "$format" = "host" ]; then
+                if [ -n "$stop_out" ]; then
+                    if [ "$vscode" = true ]; then
+                        printf '%s' "$stop_out" | jq '{hookSpecificOutput: ({hookEventName: "Stop"} + .)}'
+                    else
+                        printf '%s\n' "$stop_out"
+                    fi
+                fi
+                return 0
+            fi
+            stop_reason=$(printf '%s' "$stop_out" | jq -r 'select(.decision == "block") | .reason // empty' 2>/dev/null) || stop_reason=""
+            if [ -n "$stop_reason" ]; then
+                _hook_decision_json block "$event" "$stop_reason" "$(_hook_active_id)"
                 return 1
             fi
             _hook_decision_json allow "$event"
+            ;;
+        SessionEnd|PreCompact)
+            # Empty stdin is a manual invocation (see above): no prune, sync,
+            # commit or push for it.
+            if [ "$raw_input_empty" = true ]; then
+                [ "$format" = "host" ] || _hook_decision_json allow "$event"
+                return 0
+            fi
+            # Each function loads wv-hook-common and the staging helpers itself.
+            if [ "$event" = "SessionEnd" ]; then
+                # Neither host lets SessionEnd block, so it only reports.
+                wv_session_end_sync "$input" || true
+                [ "$format" = "host" ] || _hook_decision_json allow "$event"
+            else
+                local snapshot
+                snapshot=$(wv_pre_compact_context "$input") || true
+                if [ "$vscode" = true ]; then
+                    [ -z "$snapshot" ] || jq -n --arg message "$snapshot" '{systemMessage: $message}'
+                elif [ "$format" = "host" ]; then
+                    [ -z "$snapshot" ] || printf '%s\n' "$snapshot"
+                else
+                    _hook_decision_json allow "$event" | jq --arg ctx "$snapshot" '. + {context: $ctx}'
+                fi
+            fi
             ;;
     esac
 }
@@ -427,7 +455,7 @@ cmd_hook() {
         dispatch) shift; cmd_hook_dispatch "$@" ;;
         normalize) shift; cmd_hook_normalize "$@" ;;
         --help|-h|"")
-            echo "Usage: wv hook dispatch --event=SessionStart|PreToolUse|PostToolUse|Stop [--json]"
+            echo "Usage: wv hook dispatch --event=SessionStart|PreToolUse|PostToolUse|Stop|SessionEnd|PreCompact [--json]"
             echo "       wv hook normalize --host=claude|codex|mcp|cli --event=<raw event> [--json]" ;;
         *) echo "Error: unknown hook command '${1:-}'" >&2; return 1 ;;
     esac

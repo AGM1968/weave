@@ -9,8 +9,11 @@ import re
 import subprocess
 from pathlib import Path
 
+# (routes, globs, fallback, ordered rows) as parse_map returns them
+RouteMap = tuple[dict[str, set[str]], list[tuple[str, set[str]]], set[str], list[tuple[str, list[str]]]]
 
-def parse_map(path: Path) -> tuple[dict[str, set[str]], list[tuple[str, set[str]]], set[str], list[tuple[str, list[str]]]]:
+
+def parse_map(path: Path) -> RouteMap:
     exact: dict[str, set[str]] = {}
     patterns: list[tuple[str, set[str]]] = []
     defaults: set[str] = set()
@@ -57,11 +60,11 @@ def heuristic(path: str) -> set[str]:
     return set()
 
 
-def selected(path: str, mapping: tuple[dict[str, set[str]], list[tuple[str, set[str]]], set[str], list[tuple[str, list[str]]]]) -> set[str]:
+def selected(path: str, mapping: RouteMap) -> set[str]:
     return targeted(path, mapping) or mapping[2]
 
 
-def targeted(path: str, mapping: tuple[dict[str, set[str]], list[tuple[str, set[str]]], set[str], list[tuple[str, list[str]]]]) -> set[str]:
+def targeted(path: str, mapping: RouteMap) -> set[str]:
     """Routing that names this path, excluding the catch-all fallback.
 
     The invariant is that a map edit must not silently remove a suite that was

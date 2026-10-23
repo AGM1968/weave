@@ -29,6 +29,7 @@ cmd_quality() {
     case "$subcmd" in
         scan)    cmd_quality_scan "$@" ;;
         hotspots) cmd_quality_hotspots "$@" ;;
+        freshness) cmd_quality_freshness "$@" ;;
         functions) cmd_quality_functions "$@" ;;
         diff)    cmd_quality_diff "$@" ;;
         reset)   cmd_quality_reset "$@" ;;
@@ -44,6 +45,7 @@ Subcommands:
   scan [path]    Scan codebase for quality metrics [--exclude=<glob>]
   reset          Delete quality.db for recovery
   hotspots       Ranked hotspot report
+  freshness [p…] Files changed since the latest scan, by content (JSON)
   functions [p]  Per-function CC report for a file or directory
   diff           Delta report vs previous scan
   promote        Create Weave nodes from findings (--parent=<id> required)
@@ -63,10 +65,12 @@ Options:
 
 Quality gate (enforced on wv done):
   wv done blocks if a file linked to the node has a function above the
-  language CC threshold: Python=25, Bash=100, TypeScript=15.
+  language CC threshold: Python=25, Bash=100, TypeScript=15. It judges the
+  files as they are on disk: a linked file changed since the last scan is
+  rescanned first, committed or not.
 
   To identify violations:    wv quality functions <file>
-  To rescan after a fix:     wv quality scan   (commit first — uses git blob SHAs)
+  To check scan currency:    wv quality freshness [path...]
   To exempt a path, add to .weave/quality.conf:
     [exempt]
     install.sh       # full path
@@ -162,7 +166,7 @@ cmd_quality_scan() {
     # Build Python args
     local py_args=()
     [ -n "$WV_HOT_ZONE" ] && py_args+=("--hot-zone" "$WV_HOT_ZONE")
-    py_args+=("scan")
+    py_args+=("scan" "--repo" "$REPO_ROOT")
     [ -n "$scan_path" ] && py_args+=("$scan_path")
     [ -n "$json_flag" ] && py_args+=("$json_flag")
     [ ${#exclude_args[@]} -gt 0 ] && py_args+=("${exclude_args[@]}")
@@ -216,6 +220,36 @@ cmd_quality_functions() {
     [ -n "$json_flag" ] && py_args+=("$json_flag")
 
     _wv_quality_python "${py_args[@]}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_quality_freshness — wv quality freshness [path...]
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_quality_freshness() {
+    local -a paths=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) ;;  # output is always JSON
+            --help|-h)
+                echo "Usage: wv quality freshness [path...]  (JSON: stale, changed, unscanned, deleted)" >&2
+                return 0
+                ;;
+            --) shift; paths+=("$@"); break ;;
+            -*)
+                echo -e "${RED}Unexpected option: $1${NC}" >&2
+                return 1
+                ;;
+            *) paths+=("$1") ;;
+        esac
+        shift
+    done
+
+    local py_args=()
+    [ -n "$WV_HOT_ZONE" ] && py_args+=("--hot-zone" "$WV_HOT_ZONE")
+    py_args+=("freshness")
+    [ -n "${REPO_ROOT:-}" ] && py_args+=("--repo" "$REPO_ROOT")
+    _wv_quality_python "${py_args[@]}" -- "${paths[@]+"${paths[@]}"}"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -16,6 +16,7 @@ export WV_CALL_SOURCE=test
 # Weave-ID: wv-5fbc6c
 
 set -e
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -50,14 +51,14 @@ fi
 
 bash_identity() {
     # $1.. = env assignments, e.g. CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1
-    env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+    env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
         "$@" bash -c "source '$RUNTIME_LIB'; resolve_agent_id" 2>/dev/null
 }
 
 mcp_identity() {
     # $1.. = env assignments
     local out
-    out=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+    out=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
         "$@" WV_PATH="$REPO_ROOT/scripts/wv" WV_PROJECT_ROOT="$REPO_ROOT" \
         node "$MCP_DIST" --scope=lite --health-check 2>/dev/null)
     echo "$out" | jq -r '.agent_id'
@@ -95,6 +96,7 @@ echo "==========================================================================
 
 declare -a SCENARIOS=(
     "claude alone|CLAUDE_CODE_SSE_PORT=1"
+    "claude via CLAUDECODE alone (wv-50640a)|CLAUDECODE=1"
     "codex alone|CODEX_CI=1"
     "copilot alone|COPILOT_AGENT=1"
     "human (no markers)|"

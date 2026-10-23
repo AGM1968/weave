@@ -10,6 +10,7 @@ export WV_CALL_SOURCE=test
 # write path now refuses an unknown option or a stray positional before it
 # writes. wv add and wv quick still join bare words into the node text.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WV="$ROOT/scripts/wv"
 run=0; pass=0

@@ -42,7 +42,14 @@ from weave_gh.labels import (
     parse_gh_labels_to_metadata,
     sync_issue_labels,
 )
-from weave_gh.models import GitHubIssue, Mode, SyncStats, WeaveNode
+from weave_gh.models import (
+    NODE_ID_RE,
+    NODE_STATUSES,
+    GitHubIssue,
+    Mode,
+    SyncStats,
+    WeaveNode,
+)
 from weave_gh.rendering import build_close_comment, render_issue_body
 
 from weave_gh.body import parse_gh_body_description, parse_issue_template_fields
@@ -236,6 +243,11 @@ def _backfill_gh_issue(
             )
             return
 
+    # The id is interpolated into SQL below; get_weave_nodes admits only
+    # validated ids, and nothing else may reach here (wv-e869e3).
+    if not NODE_ID_RE.fullmatch(node.id):
+        raise ValueError(f"refusing to backfill gh_issue for malformed node id {node.id!r}")
+
     # Atomic: json_set only touches the gh_issue key, no read-modify-write race
     db = _resolve_db_path()
     _run(
@@ -290,6 +302,7 @@ def select_candidates(
     *,
     mode: Mode = Mode.FULL,
     focus_node_id: str | None = None,
+    issues: list[GitHubIssue] | None = None,
 ) -> list[WeaveNode]:
     """Pick the subset of nodes Phase 1 should walk for ``mode``.
 
@@ -299,6 +312,12 @@ def select_candidates(
     - ``FAST`` without ``focus_node_id`` degrades to the union of impacted
       sets for every currently ``active`` node, so the session-end hook still
       converges body state for in-flight work without scanning the whole graph.
+    - ``FAST`` also adds every ``done`` node whose mapped issue is still OPEN
+      in ``issues`` (wv-e9f8f0). The issue list is the durable record of what
+      the last sync pushed; without this, a node closed without a GitHub sync
+      left its issue open whenever no node was active, because neither branch
+      above reached it. The check is an in-memory set lookup, so Phase 1 only
+      walks the drifted nodes, never every done node.
     - Order from the input list is preserved so downstream duplicate detection
       keeps deterministic behaviour.
     """
@@ -313,6 +332,12 @@ def select_candidates(
         for n in nodes:
             if n.status == "active":
                 impacted |= compute_impacted_node_ids(n.id)
+
+    if issues:
+        open_issues = {i.number for i in issues if i.state == "OPEN"}
+        impacted |= {
+            n.id for n in nodes if n.status == "done" and n.gh_issue in open_issues
+        }
 
     return [n for n in nodes if n.id in impacted]
 
@@ -342,7 +367,9 @@ def sync_weave_to_github(
 
     Returns the updated issues list (including newly created).
     """
-    candidates = select_candidates(nodes, mode=mode, focus_node_id=focus_node_id)
+    candidates = select_candidates(
+        nodes, mode=mode, focus_node_id=focus_node_id, issues=issues
+    )
     stats.candidates = len(candidates)
     if mode is Mode.FAST:
         return _fast_traversal(
@@ -449,6 +476,26 @@ def _build_candidate_dedup_context(
         n.gh_issue for n in all_nodes if n.gh_issue is not None and n.status == "done"
     }
     return duplicate_groups, warn_dupes, done_gh_issues
+
+
+_WEAVE_ID_MARKER_RE = re.compile(r"\*\*Weave ID(?::\*\*|\*\*:) `(wv-[0-9a-f]+)`")
+
+
+def _gh_title(text: str) -> str:
+    """The title GitHub holds for a node: max 256 chars, full text goes in body."""
+    return text if len(text) <= 256 else text[:253] + "..."
+
+
+def _issue_names_other_node(issue: GitHubIssue, node_id: str) -> bool:
+    """True when the issue body carries a Weave ID marker for a different node.
+
+    Such an issue belongs to that node, whatever its title. Nodes that share a
+    text each own an issue; treating one's issue as the other's made a full
+    sync create one issue per shared-text group per run, so it needed as many
+    runs as the largest group to converge, moving HEAD every time (wv-48d204).
+    """
+    match = _WEAVE_ID_MARKER_RE.search(issue.body)
+    return match is not None and match.group(1) != node_id
 
 
 def _find_gh_match_by_body(node_id: str, issues: list[GitHubIssue]) -> int | None:
@@ -575,14 +622,20 @@ def _handle_new_issue(
     dry_run: bool = False,
 ) -> None:
     """Handle a Weave node that has no matching GH issue."""
-    if node.status not in ("todo", "active", "done", "blocked"):
+    if node.status not in NODE_STATUSES:
         stats.skipped += 1
         return
 
+    # GitHub titles max 256 chars — truncate with ellipsis, full text goes in body
+    gh_title = _gh_title(node.text)
+
     # Dedup guard: only backfill from title match if the GH issue has
     # the weave-synced label (prevents false matches on coincidental titles)
-    if node.text in issues_by_title:
-        existing = issues_by_title[node.text]
+    # and does not name another node in its body.
+    existing = issues_by_title.get(gh_title)
+    if existing is not None and _issue_names_other_node(existing, node.id):
+        existing = None
+    if existing is not None:
         if "weave-synced" in existing.labels:
             claimants = _existing_gh_issue_claimants(
                 node, existing.number, all_nodes=all_nodes
@@ -639,8 +692,6 @@ def _handle_new_issue(
         stats.created_gh += 1
         return
 
-    # GitHub titles max 256 chars — truncate with ellipsis, full text goes in body
-    gh_title = node.text if len(node.text) <= 256 else node.text[:253] + "..."
     log.info("  ➕ Creating GH issue: %s — %s", node.id, gh_title)
 
     label_args: list[str] = []
@@ -666,10 +717,10 @@ def _handle_new_issue(
             log.info("     ✓ Created: #%d", new_num)
 
             # Add to tracking
-            new_issue = GitHubIssue(new_num, node.text, "OPEN", weave_body, labels)
+            new_issue = GitHubIssue(new_num, gh_title, "OPEN", weave_body, labels)
             issues.append(new_issue)
             issues_by_num[new_num] = new_issue
-            issues_by_title[node.text] = new_issue
+            issues_by_title[gh_title] = new_issue
 
             # Backfill metadata
             _backfill_gh_issue(node, new_num, all_nodes=all_nodes)
@@ -1041,7 +1092,10 @@ def refresh_parent_body(child_id: str, *, dry_run: bool = False) -> bool:
     and updates the GH issue if the content hash changed. Returns True if
     the parent was updated.
     """
-    from weave_gh.data import get_weave_nodes  # pylint: disable=import-outside-toplevel
+    from weave_gh.data import (  # pylint: disable=import-outside-toplevel
+        NodeFetchError,
+        get_weave_nodes,
+    )
 
     # Find parent via implements edge
     parent_id = get_parent(child_id)
@@ -1049,7 +1103,11 @@ def refresh_parent_body(child_id: str, *, dry_run: bool = False) -> bool:
         return False
 
     # Get all nodes to build nodes_by_id for rendering
-    nodes = get_weave_nodes()
+    try:
+        nodes = get_weave_nodes()
+    except NodeFetchError as e:
+        log.warning("  ⚠ Parent refresh skipped: %s", e)
+        return False
     nodes_by_id = {n.id: n for n in nodes}
 
     parent = nodes_by_id.get(parent_id)

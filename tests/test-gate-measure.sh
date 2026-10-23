@@ -5,6 +5,7 @@
 # keeping history from before gate ids apart as approximate. All logs live in a
 # temp dir via WV_SUITE_LOG, so the user's durable history is never touched.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 export WV_CALL_SOURCE=test
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WV="$(cd "$SCRIPT_DIR/.." && pwd)/scripts/wv"
@@ -55,6 +56,26 @@ check "the worst-estimated suite is named with its ratio" "tests/test-a.sh true"
 check "only runs without a gate id count as approximate history" "1" \
     "$(jq -r '.approximate_by_commit.commits' <<< "$out")"
 check "--since filters by timestamp" "0" "$("$WV" analyze gates --json --since=2999-01-01 2>/dev/null | jq -r '.phases | length')"
+
+# ── when a suite started and exited, and when its gate started (wv-4666cb) ──
+# After the analyze checks above, so these records cannot move their counts.
+# ts is when a line is written, which for a gate is after its last suite: a
+# failure's own time can only come from started_ms/ended_ms.
+"$WV" test-record tests/test-when.sh --exit=1 --duration=1500 \
+    --started-ms=1792000000000 --ended-ms=1792000001500 >/dev/null 2>&1
+check "a suite record carries the suite's start and exit in epoch ms" "1792000000000 1792000001500" \
+    "$(tail -1 "$SUITES" | jq -r '"\(.started_ms) \(.ended_ms)"')"
+"$WV" test-record tests/test-when.sh --exit=0 --duration=5 >/dev/null 2>&1
+check "a suite record without them keeps the old shape" "false false" \
+    "$(tail -1 "$SUITES" | jq -r '"\(has("started_ms")) \(has("ended_ms"))"')"
+"$WV" test-record tests/test-when.sh --exit=0 --duration=5 --started-ms=- --ended-ms=0 >/dev/null 2>&1
+check "an unknown time (date without %N) or 0 is absent, not recorded as 0" "false false" \
+    "$(tail -1 "$SUITES" | jq -r '"\(has("started_ms")) \(has("ended_ms"))"')"
+"$WV" test-record gate --gate --phase=when --gate-id=g4 --exit=1 --duration=3000 \
+    --started-ms=1791999999000 >/dev/null 2>&1
+check "a gate record carries its start in epoch ms" "1791999999000" "$(tail -1 "$GATES" | jq -r '.started_ms')"
+"$WV" test-record gate --gate --phase=when --gate-id=g5 --exit=0 --duration=5 >/dev/null 2>&1
+check "a gate record without one has no started_ms" "false" "$(tail -1 "$GATES" | jq -r 'has("started_ms")')"
 
 # ── analyze suites p50 ignores the unmeasured sentinel ──
 for d in 0 0 0 300 500; do "$WV" test-record tests/test-c.sh --exit=0 --duration=$d >/dev/null 2>&1; done

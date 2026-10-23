@@ -17,6 +17,7 @@ export WV_CALL_SOURCE=test
 # Exit codes: 0 all checks pass, 1 otherwise.
 
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -42,6 +43,7 @@ fi
 # hand-written set only as the `: "${FINDING_VIOLATION_TYPES:=...}"` fallback;
 # the old `^FINDING_VIOLATION_TYPES=` read matched nothing, so the superset
 # check below compared the catalog against an empty list (wv-8afd23).
+# shellcheck disable=SC2016  # the pattern matches literal $ in the source text it reads
 LEGACY_ENUM=$(sed -n 's/^: "\${FINDING_VIOLATION_TYPES:=\(.*\)}"$/\1/p' -- "$VALIDATE_LIB")
 if [ -n "$LEGACY_ENUM" ]; then
     pass "the hand-written legacy enum is found in wv-validate.sh"
@@ -57,7 +59,8 @@ else
     fail "wv-violation-vocabulary.gen.sh matches the catalog" "    $gen_out"
 fi
 
-report=$(CATALOG="$CATALOG" LEGACY_ENUM="$LEGACY_ENUM" REPO_ROOT="$REPO_ROOT" PYTHONPATH="$REPO_ROOT/scripts" python3 - <<'PY'
+vv_pythonpath="$REPO_ROOT/scripts"
+report=$(CATALOG="$CATALOG" LEGACY_ENUM="$LEGACY_ENUM" REPO_ROOT="$REPO_ROOT" PYTHONPATH="$vv_pythonpath" python3 - <<'PY'
 import copy
 import json
 import os

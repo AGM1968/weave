@@ -23,7 +23,7 @@ visibility: shared
   src/ = scripts/test-impacted.sh
   ```
 
-  Origin (earth-engine-analysis test-bed): cut a localized change from 6.2s/1385 tests to ~1.1s. It
+  Origin (a consumer test-bed): cut a localized change from 6.2s/1385 tests to ~1.1s. It
   is never overwritten on `--update` — it carries per-repo edits.
 
 - **`.weave/ci-weave-paths-ignore.snippet.yml`** (refreshed on `--update`) — reference snippet

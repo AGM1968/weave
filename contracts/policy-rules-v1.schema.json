@@ -241,6 +241,16 @@
             "tool_class": { "enum": ["edit", "read", "bash"] },
             "intercepts": { "type": "string", "minLength": 1 }
           }
+        },
+        {
+          "$comment": "A Weave git hook deciding whether a commit or push proceeds (wv-3477f0). It runs outside any wv call, so the denominator excludes it by declaration and only a git_hook site may enforce it.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "event"],
+          "properties": {
+            "kind": { "const": "git_event" },
+            "event": { "enum": ["pre-commit", "pre-push"] }
+          }
         }
       ]
     },

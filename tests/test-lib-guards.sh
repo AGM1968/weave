@@ -15,6 +15,7 @@ export WV_CALL_SOURCE=test
 # binary reaches some of them more than once per process, which can repair
 # what one call broke (see test-edge-enum-lineage.sh).
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -103,6 +104,7 @@ check "HOME is never the project root" "" "${out%%|*}"
 echo "wv-gh: gh_notify and _refresh_parent_gh hand off to weave_gh"
 G="$T/gh"; B="$G/bin"; mkdir -p "$B" "$G/hot"
 printf '#!/bin/sh\nexit 0\n' > "$B/gh"
+# shellcheck disable=SC2016  # writes a script whose $ expands when that script runs
 printf '#!/bin/sh\nprintf "%%s|%%s\\n" "$PYTHONPATH" "$*" >> "%s"\n' "$G/calls" > "$B/python3"
 chmod +x "$B/gh" "$B/python3"
 # notify <shell code> -> the calls the stub python3 recorded
@@ -144,7 +146,7 @@ S="$T/stamp"; mkdir -p "$S/repo" "$S/hot"
 out=$(cd "$S/repo" && WV_HOT_ZONE="$S/hot" bash -c "
 source '$ROOT/scripts/lib/wv-config.sh' >/dev/null 2>&1
 source '$ROOT/scripts/lib/wv-db.sh' >/dev/null 2>&1
-REPO_ROOT='$S/repo'; db_stamp_repo_owner; cat '$S/hot/.repo_root' 2>/dev/null")
+db_stamp_repo_owner '$S/repo'; cat '$S/hot/.repo_root' 2>/dev/null")
 check "the owner file names the repository" "$(cd "$S/repo" && pwd -P)" "$out"
 
 # is_container decides hot-zone placement; CI is one of its signals. On a host

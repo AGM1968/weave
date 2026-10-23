@@ -19,6 +19,7 @@ export WV_CALL_SOURCE=test
 # WV_HOT_ZONE that does not match REPO_ROOT, so the helpers run with the
 # fixture directory as cwd, and the suite checks the isolation held.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -163,6 +164,47 @@ sleep 0.5
 fresh "db_ensure >/dev/null 2>&1" >/dev/null
 wait "$holder"
 check "a process that waited on the schema lock and finds the stamp current does not migrate" "0" "$(seeded)"
+
+# A migration that fails is not stamped as done (wv-e90d62). The migrations
+# swallow their own sqlite3 errors (2>/dev/null || true), so on 2026-09-29 a
+# learning-index migration that failed once was stamped anyway, and every later
+# process took the stamp's word that the schema was complete. A sqlite3 shim
+# fails that one migration once, as a transient SQLITE_BUSY would; the next
+# fresh process must recreate the index rather than trust the stamp.
+echo ""
+echo "db_ensure does not stamp a schema a migration failed to complete"
+
+FAIL_FLAG="$TEST_DIR/fail-learning-fts-once"
+FAILSHIM="$TEST_DIR/failshim"; mkdir -p "$FAILSHIM"
+REAL_SQLITE=$(command -v sqlite3)
+# Only a script-on-stdin call (the database as the sole argument, as the
+# migration heredocs are) is inspected; every query-as-argument call passes
+# straight through, so the probes db_ensure runs first see a real sqlite3.
+cat > "$FAILSHIM/sqlite3" <<EOF
+#!/bin/sh
+if [ -f "$FAIL_FLAG" ] && [ \$# -eq 1 ]; then
+    in=\$(cat)
+    case "\$in" in
+        *"CREATE VIRTUAL TABLE IF NOT EXISTS nodes_learning_fts"*) rm -f "$FAIL_FLAG"; exit 1 ;;
+    esac
+    printf '%s\n' "\$in" | exec "$REAL_SQLITE" "\$@"
+fi
+exec "$REAL_SQLITE" "\$@"
+EOF
+chmod +x "$FAILSHIM/sqlite3"
+learning_fts() { sqlite3 "$WV_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='nodes_learning_fts';" 2>/dev/null; }
+
+fresh "db_ensure >/dev/null 2>&1" </dev/null >/dev/null
+sqlite3 "$WV_DB" "DROP TABLE IF EXISTS nodes_learning_fts;"
+touch "$FAIL_FLAG"
+(cd "$TEST_DIR" && PATH="$FAILSHIM:$PATH" bash -c "
+source '$ROOT/scripts/lib/wv-config.sh' 2>/dev/null
+source '$LIB/wv-db.sh' 2>/dev/null
+db_ensure >/dev/null 2>&1" </dev/null)
+check "the injected migration failure fired" "fired" "$([ -f "$FAIL_FLAG" ] && echo armed || echo fired)"
+check "...and left the learning index missing" "0" "$(learning_fts)"
+fresh "db_ensure >/dev/null 2>&1" </dev/null >/dev/null
+check "the next process recreates what the failed migration left out" "1" "$(learning_fts)"
 
 echo ""
 echo "Results: $pass/$run passed"

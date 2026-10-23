@@ -6,7 +6,7 @@ severity: info
 policy: always-on-shared
 maturity: observed
 provenance: >-
-  PR-1b residue from earth-engine-analysis verification wv-0f3523. The broad number-free motif was retired at 0.000
+  PR-1b residue from a consumer verification wv-0f3523. The broad number-free motif was retired at 0.000
   measured precision; this narrower rule watches explicitly reassuring verification phrases without matching
   technical noun senses such as independent closure dimensions. Corpus-supported 2026-09-02 (wv-f3a558): zero
   occurrences in 986,291 words of peer-reviewed papers. It also fires on nothing in this repository, so the rule is

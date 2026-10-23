@@ -1,77 +1,55 @@
 # Weave
 
-Weave is a local-first work, memory, and policy graph for coding agents. It gives Claude Code,
-Codex, Copilot, MCP clients, CI, and human operators one durable workflow built around the `wv`
-command.
+Weave is a local-first work, memory, and policy graph for coding agents. Claude Code, Codex,
+Copilot, MCP clients, CI, and human operators share one workflow through the `wv` command.
 
-Weave stores project state in `.weave/`, uses SQLite for fast local queries, and projects durable
-graph state into Git so work, decisions, dependencies, and learnings survive across sessions and
-machines.
+Project state lives in `.weave/`. SQLite serves local queries. Graph state is projected into Git,
+where work, decisions, dependencies, and learnings persist across sessions and machines.
 
-> **Release status:** 1.71 is the supported Bash/Python LTS maintenance line. The current 1.71
-> release is a prerelease; v1.70.3 remains the latest stable release.
+1.71 is the supported maintenance line and its current release is a prerelease. v1.70.3 is the
+latest stable release.
 
-## What Weave Provides
+## Features
 
 - graph-backed tasks with criteria, risks, blockers, dependencies, and aliases;
-- explicit claim, preflight, verification, completion, and recovery workflows;
+- claim, preflight, verification, completion, and recovery workflows;
 - durable decisions, patterns, pitfalls, trails, and context packs;
 - impact-selected tests and policy checks tied to touched files;
 - Git and optional GitHub issue synchronization;
 - shared workflow surfaces for Claude Code, Codex, Copilot, CLI, and MCP clients;
 - repository health, graph audits, code search, and prose-quality diagnostics;
-- reviewed promotion of accepted quality findings into tracked remediation work, with the guidance
-  for each rendered the same way wherever it appears.
+- reviewed promotion of quality findings into tracked remediation work.
 
 ## Requirements
 
 - Linux or macOS;
 - Bash, Git, SQLite 3, `jq`, and Python 3.11+;
-- Node.js 20+ only when installing the optional MCP server;
-- GitHub CLI (`gh`) only when using GitHub synchronization.
+- Node.js 20+ for the optional MCP server;
+- GitHub CLI (`gh`) for GitHub synchronization.
 
-Check dependencies without installing:
-
-```bash
-./install.sh --check-deps
-```
+Check dependencies with `./install.sh --check-deps`.
 
 ## Install
 
-### Latest stable release
+Latest stable release:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/AGM1968/weave/v1.70.3/install.sh | bash
 ```
 
-Ensure `~/.local/bin` is on `PATH`, then confirm the installation:
+A prerelease: download the source archive from its
+[GitHub release](https://github.com/AGM1968/weave/releases), then:
 
 ```bash
-wv --version
-wv selftest
-```
-
-### A specific prerelease
-
-Download the source archive attached to the desired
-[GitHub release](https://github.com/AGM1968/weave/releases), extract it, and install from that
-directory:
-
-```bash
-tar -xzf weave-1.71.0-rc.8.tar.gz
-cd weave-1.71.0-rc.8
+tar -xzf weave-1.71.0-rc.14.tar.gz
+cd weave-1.71.0-rc.14
 ./install.sh --verify
 ```
 
-Install the optional MCP server with:
-
-```bash
-./install.sh --with-mcp
-```
+Add `--with-mcp` to install the MCP server. With `~/.local/bin` on `PATH`, confirm the install with
+`wv --version` and `wv selftest`.
 
 ## Start Using Weave
-
-Initialize an owned project repository:
 
 ```bash
 cd /path/to/your-project
@@ -79,77 +57,53 @@ wv init-repo --agent=all
 wv bootstrap --json
 ```
 
-Use `--agent=claude`, `--agent=codex`, or `--agent=copilot` when only one host integration should
-be projected. Weave checks repository ownership before writing managed files; inspect uncertain
-repositories with `wv repo-class --json` rather than forcing initialization.
+`--agent=claude`, `--agent=codex`, or `--agent=copilot` projects a single host integration. Weave
+checks repository ownership before writing managed files; `wv repo-class --json` reports a
+repository's class.
 
-A minimal work cycle:
+A work cycle:
 
 ```bash
-# Create and claim work.
-wv add "Fix session recovery" \
-  --status=active \
-  --criteria="recovery test passes|failure mode documented" \
-  --risks=medium
-
-# Inspect the active context and readiness gates.
-wv bootstrap --json
+wv add "Fix session recovery" --status=active \
+  --criteria="recovery test passes|failure mode documented" --risks=medium
 wv preflight <node-id> --json
 
-# Attribute changed files, commit the implementation, and close with reusable learning.
-wv touch <node-id> --files=src/recovery.py,tests/test_recovery.py
 git add src/recovery.py tests/test_recovery.py
 git commit -m "fix: recover interrupted sessions"
-wv done <node-id> \
-  --learning="decision: ... | pattern: ... | pitfall: ..."
+wv done <node-id> --learning="decision: ... | pattern: ... | pitfall: ..."
 
-# Persist graph state and optionally synchronize linked GitHub issues.
 wv sync --gh
 git add .weave/
 git diff --cached --quiet || git commit -m "chore(weave): sync state"
 git push
 ```
 
-Run `wv help`, `wv help <command>`, or `wv guide --topic=workflow` for command guidance.
+`wv help <command>` and `wv guide --topic=workflow` describe each command.
+
+## Commit and Push Gates
+
+`wv init-repo` installs pre-commit and pre-push hooks. A commit requires an active claim held by the
+committing actor. The hooks run the suites `.weave/test-map.conf` routes to the changed files, in
+the checkout, and record each gate in `~/.local/share/weave/gate_runs.jsonl`. Declared suite
+provisioning (`.weave/gate-provision.json`) is reserved for Weave's own repository in this release.
 
 ## Updating
 
-For stable installations:
-
 ```bash
-wv self-update
-```
-
-After updating Weave, refresh managed integration files in each owned project:
-
-```bash
-wv init-repo --agent=all --update
+wv self-update                      # installs the release marked Latest
+wv init-repo --agent=all --update   # in each project
 wv load
-wv bootstrap --json
+wv doctor
 ```
 
-Prereleases are opt-in and are not installed automatically while an older release remains marked
-Latest. Install a prerelease archive explicitly as shown above.
+`wv doctor` reports the current actor and active claims held by other actors; review them before
+taking one over with `wv work <id> --force`. Install a prerelease from its archive as shown above.
 
 ## Data and Repository Boundaries
 
-- Project graph data lives under `.weave/` in the project repository.
-- Runtime databases and caches are local implementation details; durable projections are the Git
-  synchronization surface.
-- Do not initialize vendored or third-party repositories. Use `wv repo-class --json` when ownership
-  is unclear.
-- Review `.weave/` changes like any other project state before pushing them.
+- Project graph data lives under `.weave/` in the project repository and is reviewed and committed
+  like other project state.
+- Runtime databases and caches are local; the committed `.weave/` projection is what synchronizes.
+- Initialize only repositories you own.
 
-## Maintenance Status
-
-Weave 1.71 is active and supported for correctness, security, durability, compatibility, and
-installer fixes. It is not feature-frozen and this repository is not being archived.
-
-A possible successor implementation is being evaluated separately. It is not part of this release,
-has no authority over Weave repositories, and does not change the support status of this LTS line.
-Archival would require a public replacement, documented migration and rollback, compatible graph
-loading without semantic loss, successful canaries, and a final maintenance release announcing the
-transition. Those conditions have not been met.
-
-See [CHANGELOG.md](CHANGELOG.md) for release-specific changes and
-[LICENSE](LICENSE) for licensing terms.
+See [CHANGELOG.md](CHANGELOG.md) for release changes and [LICENSE](LICENSE) for licensing terms.

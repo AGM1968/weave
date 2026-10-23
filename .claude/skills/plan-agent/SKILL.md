@@ -212,7 +212,7 @@ These are the highest-value automation opportunities identified from dogfooding:
 ## Example Invocation
 
 ```text
-/plan-agent earth-engine-analysis --since=2025-06-01
+/plan-agent my-project --since=2025-06-01
 
 Phase 1: AUDIT
   Found 180 commits since 2025-06-01

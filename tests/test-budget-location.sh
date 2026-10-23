@@ -5,13 +5,14 @@ export WV_CALL_SOURCE=test
 #
 # .claude/hooks/wv-budget-tally.sh wrote /dev/shm/weave/<hash>/session-budget.json
 # while the call-discipline component read $WV_HOT_ZONE/session-budget.json. Under
-# a sandboxed runtime the hot zone is /tmp/weave-codex-<uid>/<hash>, so the score
+# a sandboxed runtime the hot zone is /tmp/weave-hotzone-<uid>/<hash>, so the score
 # never saw the file and awarded 25/25 however many calls were made. The existing
 # check in test-sprint34.sh plants the file in the hot zone itself, so it tests
 # the reader alone and could not see the mismatch. This suite drives the real
 # hook and then reads the score, under each runtime class, with no hot-zone
 # override: the resolution itself is what is under test.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WV="$ROOT/scripts/wv"
 HOOK="$ROOT/.claude/hooks/wv-budget-tally.sh"
@@ -20,18 +21,25 @@ ok()  { run=$((run+1)); pass=$((pass+1)); echo "  ✓ $1"; }
 bad() { run=$((run+1)); echo "  ✗ $1"; [ -n "${2:-}" ] && echo "      $2"; }
 
 T=$(mktemp -d /tmp/wv-budget-loc-XXXXXX)
+# The zone bases' parents, as on a real host; the resolver creates the bases.
+mkdir -p "$T/zone-root/tmp" "$T/zone-root/dev/shm"
 ZONES=()
 cleanup() { rm -rf "$T"; for z in "${ZONES[@]}"; do [ -n "$z" ] && rm -rf "$z"; done; }
 trap cleanup EXIT
 
 # as_runtime <native|sandboxed> <cmd...> — run with only that class's marker set
-# and every hot-zone override removed, in the scratch repo.
+# and every hot-zone override removed, in the scratch repo. Placement still
+# resolves for real, but under a zone root inside $T (WV_TEST_HOT_ZONE_ROOT), not
+# the live one: zones made in the live root are visible to every gate pool
+# running meanwhile, and a sibling candidate lane's leak guard (wv-e200f6) read
+# this suite's in-flight zones as leaked and refused a commit (wv-4666cb).
 as_runtime() {
     local rt="$1"; shift
     local -a marker=()
     [ "$rt" = sandboxed ] && marker=(CLAUDE_CODE_SSE_PORT=1)
     (cd "$R" && env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u WEAVE_DIR -u WV_BUDGET_DIR \
-        -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT \
+        -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE \
+        WV_TEST_MODE=1 WV_TEST_HOT_ZONE_ROOT="$T/zone-root" \
         WV_CONFIG_DIR="$T/cfg-$rt" WV_AUTO_CHECKPOINT=0 WV_NONINTERACTIVE=1 "${marker[@]}" "$@")
 }
 
@@ -47,6 +55,8 @@ for rt in native sandboxed; do
     # to /tmp); what is under test is that writer and reader agree on it.
     [ -n "$db" ] && ok "the CLI resolves a hot zone under the $rt runtime ($zone)" ||
         bad "the CLI resolves a hot zone under the $rt runtime" "no db path"
+    [[ "$zone" == "$T/zone-root/"* ]] && ok "the $rt zone is under this suite's zone root, not the live one" ||
+        bad "the $rt zone is under this suite's zone root, not the live one" "zone: $zone"
     # 25 wv calls through the real hook: 5 past the default threshold of 20.
     for _ in $(seq 25); do
         printf '{"tool_name":"Bash","tool_input":{"command":"wv status"},"tool_response":{"output":"x"}}' |

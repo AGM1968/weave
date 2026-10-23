@@ -70,12 +70,25 @@ source "$WV_LIB_DIR/lib/wv-command-capabilities.sh"
 # wv-policy-rules.sh is generated from contracts/policy-rules-v1.json: the policy
 # contract's identity and which rules can decide inside each operation.
 source "$WV_LIB_DIR/lib/wv-policy-rules.sh"
+# wv-graph-diff.sh: the durable table list and wv hotzone diff, no dependencies.
+source "$WV_LIB_DIR/lib/wv-graph-diff.sh"
+# wv hotzone diff runs before placement is resolved (wv-757de1): it is how a
+# repository whose database sits in two hot zones compares the copies, and
+# wv-config.sh refuses every command in exactly that state. It reads two
+# databases it is given, read-only, and needs no hot zone, so it never
+# reaches the refusal; every other command still does.
+if [ "${1:-}" = "hotzone" ] && [ "${2:-}" = "diff" ]; then
+    shift 2
+    wv_graph_diff "$@"
+    exit $?
+fi
 source "$WV_LIB_DIR/lib/wv-config.sh"
 source "$WV_LIB_DIR/lib/wv-db.sh"
 source "$WV_LIB_DIR/lib/wv-validate.sh"
 source "$WV_LIB_DIR/lib/wv-cache.sh"
 source "$WV_LIB_DIR/lib/wv-journal.sh"
 source "$WV_LIB_DIR/lib/wv-attempt-journal.sh"
+source "$WV_LIB_DIR/lib/wv-attribution.sh"
 source "$WV_LIB_DIR/lib/wv-gh.sh"
 source "$WV_LIB_DIR/lib/wv-delta.sh"
 source "$WV_LIB_DIR/lib/wv-delta-catalog.sh"
@@ -305,6 +318,19 @@ _wv_dispatch() {
     esac
 }
 
+# _wv_resolve_call_source -- the call's provenance tag, before `wv hook` retags
+# itself: WV_CALL_SOURCE when set, agent for a Codex or Copilot exec marker,
+# otherwise shell. The precedence is explained where the call log records it.
+_wv_resolve_call_source() {
+    if [[ -n "${WV_CALL_SOURCE:-}" ]]; then
+        printf '%s' "$WV_CALL_SOURCE"
+    elif [[ -n "${CODEX_THREAD_ID:-}" || "${CODEX_CI:-}" == "1" || "${COPILOT_AGENT:-}" == "1" ]]; then
+        printf agent
+    else
+        printf shell
+    fi
+}
+
 main() {
     local cmd="${1:-help}"
 
@@ -319,6 +345,16 @@ main() {
     if [ "${WV_RUN_CACHE:-1}" = "1" ] && _wv_cap_serve "$cmd" ""; then
         wv_run_cache_wrap _wv_dispatch "$@"
         return $?
+    fi
+
+    # Attribution queued during an E5 capture window lands in the agent's next
+    # mutation-class call, after the call log recorded graph_identity_before, so
+    # the graph moves inside that agent row (wv-cdafa1). A read must not apply
+    # it: E5 takes any row that moved the identity as a mutation.
+    if [ -n "${WV_DB:-}" ] && [ "$cmd" != "hook" ] \
+        && [ "$(_wv_resolve_call_source)" = "agent" ] \
+        && [ "$(_wv_cap_evidence_class "$cmd" "" 2>/dev/null)" = "mutation_attempt" ]; then
+        wv_attribution_apply "$WV_DB" || true
     fi
 
     local rc=0
@@ -347,7 +383,8 @@ main() {
 #                (MCP-server child CLI call; kept separate so server fan-out does not
 #                inflate agent stats), "shell" (unproven origin: interactive terminal or
 #                an unattesting harness), "hook" (lifecycle hook), "sync" (wv sync --gh /
-#                weave_gh), "test" (suite runs via run-all.sh or the pre-commit gate).
+#                weave_gh), "test" (suite runs via run-all.sh or the pre-commit gate; under
+#                WV_TEST_SUITE=1 the user's config.env cannot log them, wv-6b0f57).
 # Callers set WV_CALL_SOURCE before invoking wv to tag their traffic; when unset, a Codex
 # or Copilot host marker attests "agent", otherwise the default is "shell".
 # Authoritative taxonomy + readiness-gate policy: docs/TELEMETRY-SOURCE-CONTRACT.md
@@ -428,7 +465,7 @@ if [[ -n "${WV_CALL_LOG:-}" ]] || wv_attempt_journal_enabled; then
         fi
     }
     _wv_identity_delta_frontier_line() {
-        local root="$1" cache listing signature count digest cached_signature cached_digest
+        local root="$1" cache listing signature count digest cached_signature cached_digest cached_count
         if [ ! -d "$root" ]; then
             printf 'delta_catalog_frontier\tabsent\n'
             return 0
@@ -452,35 +489,68 @@ if [[ -n "${WV_CALL_LOG:-}" ]] || wv_attempt_journal_enabled; then
         # to leave one behind -- identity drift with no graph change behind it.
         # Only published files belong in a frontier that describes what this
         # machine can hand to another.
+        #
+        # The hit path hashes the walk straight off the pipe and takes the file
+        # count from the cache entry: holding the 800 KB listing in a shell
+        # variable and piping it out twice more cost as much as the walk itself
+        # (wv-78e154). The same signature means the same listing, so the same
+        # count. A miss runs the full computation and stores all three.
+        cache="${WV_HOT_ZONE:-${TMPDIR:-/tmp}}/delta-catalog-digest"
+        if [ -r "$cache" ]; then
+            read -r cached_signature cached_digest cached_count < "$cache" 2>/dev/null || true
+            if [ -n "${cached_signature:-}" ] && [ -n "${cached_digest:-}" ] && [[ "${cached_count:-}" =~ ^[0-9]+$ ]]; then
+                signature=$(LC_ALL=C find -P "$root" -type f -not -path '*/.staging-*' -printf '%P\t%s\t%T@\n' 2>/dev/null \
+                    | LC_ALL=C sort | sha256sum | awk '{print $1}') || return 1
+                if [ "$signature" = "$cached_signature" ]; then
+                    printf 'delta_catalog_frontier\tpresent\t%s\t%s\n' "$cached_count" "$cached_digest"
+                    return 0
+                fi
+            fi
+        fi
         listing=$(LC_ALL=C find -P "$root" -type f -not -path '*/.staging-*' -printf '%P\t%s\t%T@\n' 2>/dev/null | LC_ALL=C sort) || return 1
         count=$(printf '%s\n' "$listing" | grep -c . || true)
         signature=$(printf '%s\n' "$listing" | sha256sum | awk '{print $1}') || return 1
-        cache="${WV_HOT_ZONE:-${TMPDIR:-/tmp}}/delta-catalog-digest"
-        if [ -r "$cache" ]; then
-            read -r cached_signature cached_digest < "$cache" 2>/dev/null || true
-            if [ "${cached_signature:-}" = "$signature" ] && [ -n "${cached_digest:-}" ]; then
-                printf 'delta_catalog_frontier\tpresent\t%s\t%s\n' "$count" "$cached_digest"
+        digest=$( (cd "$root" && LC_ALL=C find -P . -type f -not -path '*/.staging-*' -printf '%P\0' 2>/dev/null | LC_ALL=C sort -z | xargs -0 -r sha256sum) \
+            | awk '{printf "%s\t%s\n", $2, $1}' | LC_ALL=C sort | sha256sum | awk '{print $1}') || return 1
+        { mkdir -p "$(dirname "$cache")" && printf '%s %s %s\n' "$signature" "$digest" "$count" > "$cache"; } 2>/dev/null || true
+        printf 'delta_catalog_frontier\tpresent\t%s\t%s\n' "$count" "$digest"
+    }
+    # The database key of the graph-rows cache: "<dev>:<ino> <size> <mtime_ns>
+    # <ctime_ns>" of $WV_DB, or nothing while the WAL holds frames. With the WAL
+    # empty the main file is the whole database, so its stat moves with every
+    # committed write. ctime is in the key because no userspace call can set it:
+    # a copy that restores an old mtime still moves ctime.
+    _wv_identity_db_key() {
+        local wal_size key
+        wal_size=$(stat -c %s -- "$WV_DB-wal" 2>/dev/null || echo 0)
+        [ "$wal_size" = 0 ] || return 1
+        key=$(stat -c '%d:%i %s %.9Y %.9Z' -- "$WV_DB" 2>/dev/null) || return 1
+        printf '%s\n' "${key//./}"
+    }
+    # graph_rows digest: a 4 MB dump and hash of every row on a 1700-node graph,
+    # about 160 ms, paid twice per call, which made a logged wv call cost about
+    # 720 ms against 100 ms unlogged (wv-78e154). The digest is reused while the
+    # database file is unchanged; the value is the same bytes either way, since
+    # E5 admission recomputes it from the rows and chains it across every call.
+    #
+    # Stored only when it cannot be stale. The key is read before and after the
+    # dump and must match, so a write landing mid-dump is not cached under either
+    # key. File times here are coarse (4 ms ticks on this tmpfs), so two writes
+    # in one tick can share an mtime; as in git's racy-clean index, a key whose
+    # ctime is not at least WV_IDENTITY_RACY_NS older than the first stat is not
+    # stored, and any later write then lands on a later tick than the key holds.
+    _wv_identity_graph_rows() {
+        local cache key key_after cached_db cached_key cached_rows started ctime snapshot rows
+        cache="${WV_HOT_ZONE:-${TMPDIR:-/tmp}}/graph-rows-digest"
+        started=$(date +%s%N)
+        if key=$(_wv_identity_db_key) && [ -r "$cache" ]; then
+            IFS=$'\t' read -r cached_db cached_key cached_rows < "$cache" 2>/dev/null || true
+            if [ "${cached_db:-}" = "$WV_DB" ] && [ "${cached_key:-}" = "$key" ] \
+                && [[ "${cached_rows:-}" =~ ^[a-f0-9]{64}$ ]]; then
+                printf '%s\n' "$cached_rows"
                 return 0
             fi
         fi
-        digest=$( (cd "$root" && LC_ALL=C find -P . -type f -not -path '*/.staging-*' -printf '%P\0' 2>/dev/null | LC_ALL=C sort -z | xargs -0 -r sha256sum) \
-            | awk '{printf "%s\t%s\n", $2, $1}' | LC_ALL=C sort | sha256sum | awk '{print $1}') || return 1
-        { mkdir -p "$(dirname "$cache")" && printf '%s %s\n' "$signature" "$digest" > "$cache"; } 2>/dev/null || true
-        printf 'delta_catalog_frontier\tpresent\t%s\t%s\n' "$count" "$digest"
-    }
-    _wv_causal_identity_json() {
-        local weave_dir="${WEAVE_DIR:-}"
-        if [[ -z "${WV_DB:-}" || ! -f "$WV_DB" ]] \
-            || ! command -v sqlite3 >/dev/null 2>&1 \
-            || ! command -v sha256sum >/dev/null 2>&1; then
-            _wv_unavailable_json "WV_DB not resolvable or causal identity tools unavailable"
-            return 0
-        fi
-        if [[ -z "$weave_dir" || ! -d "$weave_dir" ]]; then
-            _wv_unavailable_json "repository .weave directory not resolvable"
-            return 0
-        fi
-        local snapshot rows components identity
         snapshot=$(sqlite3 -readonly "$WV_DB" 2>/dev/null <<'SQL'
 BEGIN;
 SELECT json_array('node', id, text, status, json(metadata), alias, created_at, updated_at,
@@ -495,12 +565,33 @@ SELECT json_array('tombstone', kind, id, lineage_seq, lineage_actor)
 FROM tombstones ORDER BY kind, id;
 COMMIT;
 SQL
-        ) || {
-            _wv_unavailable_json "causal identity query failed"
+        ) || return 1
+        rows=$(printf '%s' "$snapshot" | sha256sum | awk '{print $1}') || return 1
+        [[ "$rows" =~ ^[a-f0-9]{64}$ ]] || return 1
+        if [ -n "${key:-}" ] && key_after=$(_wv_identity_db_key) && [ "$key_after" = "$key" ]; then
+            ctime="${key##* }"
+            if [ $((started - ctime)) -ge "${WV_IDENTITY_RACY_NS:-100000000}" ]; then
+                { printf '%s\t%s\t%s\n' "$WV_DB" "$key" "$rows" > "$cache.$$" \
+                    && mv -f "$cache.$$" "$cache"; } 2>/dev/null || rm -f "$cache.$$" 2>/dev/null
+            fi
+        fi
+        printf '%s\n' "$rows"
+    }
+    _wv_causal_identity_json() {
+        local weave_dir="${WEAVE_DIR:-}"
+        if [[ -z "${WV_DB:-}" || ! -f "$WV_DB" ]] \
+            || ! command -v sqlite3 >/dev/null 2>&1 \
+            || ! command -v sha256sum >/dev/null 2>&1; then
+            _wv_unavailable_json "WV_DB not resolvable or causal identity tools unavailable"
             return 0
-        }
-        rows=$(printf '%s' "$snapshot" | sha256sum | awk '{print $1}') || {
-            _wv_unavailable_json "causal identity hashing failed"
+        fi
+        if [[ -z "$weave_dir" || ! -d "$weave_dir" ]]; then
+            _wv_unavailable_json "repository .weave directory not resolvable"
+            return 0
+        fi
+        local rows components identity
+        rows=$(_wv_identity_graph_rows) || {
+            _wv_unavailable_json "causal identity query failed"
             return 0
         }
         components=$(
@@ -659,14 +750,19 @@ SQL
     # markers are present only inside model-driven exec, never a human terminal, so
     # tagging agent here is honest attestation, not shell-as-agent. MCP children keep
     # mcp because the server sets WV_CALL_SOURCE=mcp, which this branch never reaches.
-    # Marker set mirrors weave_gh/data.py _is_codex_runtime() minus CLAUDE_CODE_SSE_PORT
-    # (Claude already attests via explicit env). Contract: docs/TELEMETRY-SOURCE-CONTRACT.md
-    if [[ -n "${WV_CALL_SOURCE:-}" ]]; then
-        _wv_source="$WV_CALL_SOURCE"
-    elif [[ -n "${CODEX_THREAD_ID:-}" || "${CODEX_CI:-}" == "1" || "${COPILOT_AGENT:-}" == "1" ]]; then
-        _wv_source="agent"
-    else
-        _wv_source="shell"
+    # Marker set: Codex and Copilot only; Claude attests via explicit env. (It once
+    # mirrored weave_gh _is_codex_runtime, removed when placement stopped reading
+    # agent markers, wv-b831e3.) Contract: docs/TELEMETRY-SOURCE-CONTRACT.md
+    _wv_source=$(_wv_resolve_call_source)
+    # `wv hook` is the harness-neutral lifecycle-hook entry (Codex .codex/hooks.json,
+    # and the Claude adapters as they move behind it). A host never tags it: Claude
+    # hooks inherit WV_CALL_SOURCE=agent from settings.json and Codex hooks carry
+    # CODEX_THREAD_ID, so both landed as agent traffic (wv-b2f8a8). Tag it here,
+    # once for every host, and export so the wv calls it spawns inherit hook. A
+    # test run keeps its tag.
+    if [ "${1:-}" = "hook" ] && [ "$_wv_source" != "test" ]; then
+        _wv_source="hook"
+        export WV_CALL_SOURCE=hook
     fi
     _wv_repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
     # BEFORE dispatch, and exported: a gate that runs inside the call needs an

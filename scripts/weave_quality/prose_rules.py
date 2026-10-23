@@ -18,8 +18,10 @@ import os
 import re
 from fnmatch import fnmatch
 from pathlib import Path
+from collections.abc import Callable, Sequence
 from typing import Iterator
 
+from weave_quality.listing import iter_tree
 from weave_quality.models import PatternFinding
 
 PROSE_LANGUAGES = {"prose", "markdown"}
@@ -588,6 +590,10 @@ def _iter_text_files(target: Path, include: list[str], repo: Path) -> list[Path]
     subdirectory, or a single file (the target and repo coincide only for a
     repo-root scan). A single-file target is filtered too, instead of
     bypassing `paths:` entirely.
+
+    Raises OSError on a directory under target it cannot list: rglob walked
+    past one, and the rule reported clean over files it never read
+    (wv-4852bd).
     """
     if target.is_file():
         if target.suffix.lower() not in _TEXT_SUFFIXES:
@@ -598,7 +604,7 @@ def _iter_text_files(target: Path, include: list[str], repo: Path) -> list[Path]
             return []
         return [target]
     files: list[Path] = []
-    for path in sorted(target.rglob("*")):
+    for path in sorted(iter_tree(target)):
         if not path.is_file() or path.suffix.lower() not in _TEXT_SUFFIXES:
             continue
         if _SKIP_PARTS.intersection(path.parts):
@@ -638,11 +644,18 @@ def code_rule_out_of_scope(language: str, target: Path) -> bool:
         return False
     if target.is_file():
         return target.suffix.lower() not in suffixes
-    for path in target.rglob("*"):
-        if ".git" in path.parts:
-            continue
-        if path.is_file() and path.suffix.lower() in suffixes:
-            return False
+    # Out of scope is a claim that nothing here could match. A directory that
+    # cannot be listed may hold files of the language, so the claim is not
+    # made: rglob walked past it, and a skipped rule read as out of scope
+    # (wv-4852bd).
+    try:
+        for path in iter_tree(target):
+            if ".git" in path.parts:
+                continue
+            if path.is_file() and path.suffix.lower() in suffixes:
+                return False
+    except OSError:
+        return False
     return True
 
 
@@ -656,7 +669,7 @@ def prose_rule_out_of_scope(
     `docs/*.md`, `docs/**/*.md` and `*.md`, so scanning a `.py` or `.sh` file
     reports each of them at 0 -- a STRUCTURAL zero, indistinguishable in the
     output from a file that was examined and found clean (wv-33733d; the same
-    defect nowcast recorded as its Finding J).
+    defect a consumer audit recorded as its Finding J).
 
     Early-exit rather than counting: the answer only needs one eligible file.
     The expensive direction is proving a scope empty, which is precisely the
@@ -675,15 +688,20 @@ def prose_rule_out_of_scope(
         return not any(
             fnmatch(_repo_relative_posix(target, resolved_repo), glob) for glob in include
         )
-    for path in target.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in _TEXT_SUFFIXES:
-            continue
-        if _SKIP_PARTS.intersection(path.parts):
-            continue
-        if include and not any(
-            fnmatch(_repo_relative_posix(path, resolved_repo), glob) for glob in include
-        ):
-            continue
+    # As in code_rule_out_of_scope: an unlistable directory may hold files in
+    # scope, so out of scope is not claimed (wv-4852bd).
+    try:
+        for path in iter_tree(target):
+            if not path.is_file() or path.suffix.lower() not in _TEXT_SUFFIXES:
+                continue
+            if _SKIP_PARTS.intersection(path.parts):
+                continue
+            if include and not any(
+                fnmatch(_repo_relative_posix(path, resolved_repo), glob) for glob in include
+            ):
+                continue
+            return False
+    except OSError:
         return False
     return True
 
@@ -2117,7 +2135,7 @@ def _verbatim_container_transition(
     return container, prior_quote_depth, resets_span, False
 
 
-def _verbatim_exempt_lines(source_lines: list[str]) -> set[int]:
+def _verbatim_exempt_lines(source_lines: Sequence[str]) -> set[int]:
     """Return 1-indexed lines an author has explicitly opted out of every rule.
 
     A paired HTML-comment marker (`<!-- wv-quality:verbatim-start -->` ...
@@ -2360,6 +2378,44 @@ def _verbatim_exempt_lines(source_lines: list[str]) -> set[int]:
     return exempt
 
 
+def _continue_raw_list(
+    list_stack: list[_ListItemContext],
+    kind: str,
+    line: str,
+    probe: str,
+    quote_depth: int,
+    virtual_offset: int,
+) -> tuple[str, str]:
+    """Attach a raw line to its list owner, retrying surviving ancestors."""
+    assert list_stack
+    container = "list"
+    while True:
+        continuation = _list_item_continuation(
+            list_stack[-1], kind, line, probe, quote_depth, virtual_offset
+        )
+        if continuation is not None:
+            list_stack[-1].has_paragraph = True
+            break
+        # Retry the SAME line against the surviving ancestor: kind is
+        # container-sensitive and must not remain classified under a popped
+        # item. Since wv-9d8474, only a quote depth/indent mismatch can fail;
+        # an owned lazy line always attaches, even without an open paragraph.
+        list_stack.pop()
+        container = "list" if list_stack else ""
+        kind = _paragraph_interrupt_kind(
+            line,
+            probe,
+            quote_depth,
+            container,
+            virtual_offset,
+            list_stack[-1].content_col if list_stack else None,
+            list_stack[-1].has_paragraph if list_stack else False,
+        )
+        if not (container == "list" and kind in ("quote", "lazy")):
+            break
+    return kind, container
+
+
 def _scan_lines_raw(source_lines: list[str], rule: dict[str, object]) -> list[_ScanLine]:
     """Line-scope path: one _ScanLine per raw source line, unreflowed.
 
@@ -2492,36 +2548,9 @@ def _scan_lines_raw(source_lines: list[str], rule: dict[str, object]) -> list[_S
             if opened_block:
                 continue
         elif container == "list" and kind in ("quote", "lazy"):
-            assert list_stack
-            while True:
-                continuation = _list_item_continuation(
-                    list_stack[-1], kind, line, probe, quote_depth, virtual_offset
-                )
-                if continuation is not None:
-                    list_stack[-1].has_paragraph = True
-                    break
-                # This item's own continuation fails -- pop just it and
-                # reclassify the SAME physical line fresh against
-                # whatever ancestor survives, same reasoning as
-                # _scan_lines' identical retry (an outer item may still
-                # be legitimately open; `kind` is container-sensitive
-                # and must not stay stale once the container changes).
-                # Since wv-9d8474, kind=="lazy" can no longer reach this
-                # pop at all (see _list_item_continuation) -- only a
-                # "quote" depth/indent mismatch still can.
-                list_stack.pop()
-                container = "list" if list_stack else ""
-                kind = _paragraph_interrupt_kind(
-                    line,
-                    probe,
-                    quote_depth,
-                    container,
-                    virtual_offset,
-                    list_stack[-1].content_col if list_stack else None,
-                    list_stack[-1].has_paragraph if list_stack else False,
-                )
-                if not (container == "list" and kind in ("quote", "lazy")):
-                    break
+            kind, container = _continue_raw_list(
+                list_stack, kind, line, probe, quote_depth, virtual_offset
+            )
         elif kind == "blank":
             # Ends the CURRENT paragraph, but not necessarily the
             # enclosing list item -- see _scan_lines' identical
@@ -2991,9 +3020,119 @@ def _open_list_item(
     return list_ctx, content, source_col, opened_block
 
 
-def _scan_lines(  # pylint: disable=too-many-statements,too-many-branches
-    text: str, rule: dict[str, object]
-) -> list[_ScanLine]:
+def _scan_heading_lines(source_lines: list[str], units: list[_ScanLine]) -> list[_ScanLine]:
+    """Project visible heading content from paragraph units, retaining source columns."""
+    headings: list[_ScanLine] = []
+    for scan_line in units:
+        if len(scan_line.starts) != 1:
+            continue
+        _offset, lineno, _source_col = scan_line.starts[0]
+        raw = source_lines[lineno - 1]
+        probe, _quote_depth, _virtual_offset = _dequote(raw)
+        match = _MARKDOWN_HEADING_RE.match(probe)
+        if match is None:
+            continue
+        prefix = len(raw) - len(probe) + match.end()
+        end = len(raw)
+        closing = re.search(r"[ \t]+#+[ \t]*$", raw[prefix:])
+        if closing is not None:
+            end = prefix + closing.start()
+        headings.append(
+            _ScanLine(scan_line.text[prefix:end], ((0, lineno, prefix),), len(headings))
+        )
+    return headings
+
+
+def _start_list_paragraph(
+    list_stack: list[_ListItemContext],
+    paragraph: list[tuple[int, str, int]],
+    flush: Callable[[], None],
+    fence_state: _FenceState,
+    html_state: _HtmlBlockState,
+    lineno: int,
+    line: str,
+    probe: str,
+    quote_depth: int,
+    virtual_offset: int,
+) -> list[_ListItemContext]:
+    """Start a list item while preserving its owning ancestors across paragraph flush."""
+    # wv-98984a: materialize residual quote-tab spaces before matching the
+    # marker, then translate its offsets back to the original probe.
+    structural = _materialize_quote_tab(line, probe, virtual_offset)
+    list_match = _MARKDOWN_LIST_RE.match(structural)
+    assert list_match is not None  # kind=="list" implies a marker match
+    preserved_ancestors = list_stack
+    flush()
+    list_stack, _container = _restore_owned_list_stack(
+        preserved_ancestors, clear_has_paragraph=True
+    )
+    # _open_list_item uses the captured group's offset, not line.index:
+    # duplicated text such as "1. 1" must not locate the ordinal's digit.
+    new_ctx, content, source_col, opened_block = _open_list_item(
+        fence_state, html_state, list_match, line, probe, quote_depth,
+        virtual_offset, len(structural) - len(probe),
+    )
+    list_stack.append(new_ctx)
+    # A leaf block or empty marker seeds no paragraph for lazy continuation.
+    if not opened_block and content:
+        paragraph.append((lineno, content, source_col))
+    return list_stack
+
+
+def _continue_list_paragraph(
+    list_stack: list[_ListItemContext],
+    paragraph: list[tuple[int, str, int]],
+    flush: Callable[[], None],
+    kind: str,
+    lineno: int,
+    line: str,
+    probe: str,
+    quote_depth: int,
+    virtual_offset: int,
+) -> tuple[bool, str, list[_ListItemContext], str]:
+    """Attach prose to its list owner, flushing a closed item before retrying an ancestor.
+
+    Each failed attempt pops one frame, so retries terminate. A lazy line
+    always attaches (wv-9d8474); only quote depth/indent mismatches fail.
+    Return the stack explicitly because flush resets the caller's binding.
+    """
+    assert list_stack
+    container = "list"
+    while True:
+        continuation = _list_item_continuation(
+            list_stack[-1], kind, line, probe, quote_depth, virtual_offset
+        )
+        if continuation is not None:
+            content, source_col = continuation
+            paragraph.append((lineno, content, source_col))
+            list_stack[-1].has_paragraph = True
+            return True, kind, list_stack, container
+        # wv-a7a166: a popped item's own paragraph is a closed block, not
+        # text to merge into the surviving ancestor's next paragraph. Save
+        # the surviving stack before flush and restore its paragraph flags.
+        popped = list_stack.pop()
+        if popped.has_paragraph:
+            surviving = list_stack
+            flush()
+            list_stack, container = _restore_owned_list_stack(
+                surviving, clear_has_paragraph=False
+            )
+        else:
+            container = "list" if list_stack else ""
+        kind = _paragraph_interrupt_kind(
+            line,
+            probe,
+            quote_depth,
+            container,
+            virtual_offset,
+            list_stack[-1].content_col if list_stack else None,
+            list_stack[-1].has_paragraph if list_stack else False,
+        )
+        if not (container == "list" and kind in ("quote", "lazy")):
+            return False, kind, list_stack, container
+
+
+def _scan_lines(text: str, rule: dict[str, object]) -> list[_ScanLine]:
     """Return raw lines or Markdown prose paragraphs with source mappings."""
     source_lines = text.splitlines()
     default_scope = _default_match_scope(rule)
@@ -3002,29 +3141,7 @@ def _scan_lines(  # pylint: disable=too-many-statements,too-many-branches
         return _scan_lines_raw(source_lines, rule)
     if match_scope == "heading":
         paragraph_rule = {**rule, "match_scope": "paragraph"}
-        headings: list[_ScanLine] = []
-        for scan_line in _scan_lines(text, paragraph_rule):
-            if len(scan_line.starts) != 1:
-                continue
-            _offset, lineno, _source_col = scan_line.starts[0]
-            raw = source_lines[lineno - 1]
-            probe, _quote_depth, _virtual_offset = _dequote(raw)
-            match = _MARKDOWN_HEADING_RE.match(probe)
-            if match is None:
-                continue
-            prefix = len(raw) - len(probe) + match.end()
-            end = len(raw)
-            closing = re.search(r"[ \t]+#+[ \t]*$", raw[prefix:])
-            if closing is not None:
-                end = prefix + closing.start()
-            headings.append(
-                _ScanLine(
-                    scan_line.text[prefix:end],
-                    ((0, lineno, prefix),),
-                    len(headings),
-                )
-            )
-        return headings
+        return _scan_heading_lines(source_lines, _scan_lines(text, paragraph_rule))
 
     verbatim_exempt = _verbatim_exempt_lines(source_lines)
     out: list[_ScanLine] = []
@@ -3226,119 +3343,17 @@ def _scan_lines(  # pylint: disable=too-many-statements,too-many-branches
             continue
 
         if kind == "list":
-            # wv-98984a: a marker immediately preceded by a residual
-            # quote-tab is unrecognizable against probe's own literal
-            # tab character -- match against the materialized view
-            # instead (a no-op when there's nothing to materialize).
-            structural = _materialize_quote_tab(line, probe, virtual_offset)
-            list_match = _MARKDOWN_LIST_RE.match(structural)
-            assert list_match is not None  # kind=="list" implies a marker match
-            # list_stack is already trimmed to this marker's own owning
-            # ancestor chain (the pop above ran against this SAME line,
-            # before its kind was even known) -- preserve those ancestors
-            # across flush() (which would otherwise unconditionally wipe
-            # the stack) so the new item nests under them instead of
-            # discarding them, the fix _pop_unowned_list_frames exists
-            # for.
-            preserved_ancestors = list_stack
-            flush()
-            list_stack, container = _restore_owned_list_stack(
-                preserved_ancestors, clear_has_paragraph=True
+            list_stack = _start_list_paragraph(
+                list_stack, paragraph, flush, fence_state, html_state,
+                lineno, line, probe, quote_depth, virtual_offset,
             )
             container = "list"
-            # NOT line.index(content): if content duplicates a structural
-            # marker elsewhere on the line (e.g. "1. 1" -- the captured
-            # "1" also matches the ordinal's own digit), index() would
-            # return that marker's position instead of the captured
-            # content's real one -- see _open_list_item.
-            new_ctx, content, source_col, opened_block = _open_list_item(
-                fence_state,
-                html_state,
-                list_match,
-                line,
-                probe,
-                quote_depth,
-                virtual_offset,
-                len(structural) - len(probe),
-            )
-            list_stack.append(new_ctx)
-            if opened_block:
-                continue
-            # A blank/empty item ("-" alone) seeds NO paragraph at all --
-            # nothing for a later lazy line to continue (see
-            # _ListItemContext) -- so nothing is appended for it either;
-            # flush() on an empty `paragraph` is already a safe no-op.
-            if content:
-                paragraph.append((lineno, content, source_col))
             continue
 
         if container == "list" and kind in ("quote", "lazy"):
-            assert list_stack
-            attached = False
-            while True:
-                continuation = _list_item_continuation(
-                    list_stack[-1], kind, line, probe, quote_depth, virtual_offset
-                )
-                if continuation is not None:
-                    content, source_col = continuation
-                    paragraph.append((lineno, content, source_col))
-                    list_stack[-1].has_paragraph = True
-                    attached = True
-                    break
-                # THIS item's own continuation fails -- pop just it (an
-                # OUTER ancestor may still be legitimately open, see
-                # _pop_unowned_list_frames) and reclassify the SAME
-                # physical line fresh against whatever survives, instead
-                # of reusing the kind computed under the frame that just
-                # ended: _paragraph_interrupt_kind is container-
-                # sensitive (code vs lazy in particular) -- a "quote"
-                # line whose depth/indent no longer matches this item
-                # must be reclassified once nothing owns it, or it
-                # wrongly reflows as prose instead of being dropped as
-                # indented code. Since wv-9d8474, kind=="lazy" can no
-                # longer reach this pop at all (see
-                # _list_item_continuation) -- an owned-but-paragraph-less
-                # lazy line now always attaches as a fresh paragraph
-                # instead of falling through to here. Bounded: each
-                # failed attempt pops one frame, so this terminates in at
-                # most len(list_stack) + 1 iterations.
-                #
-                # wv-a7a166 (external code review finding 2): popping the
-                # failing frame alone, with no flush(), let its own
-                # accumulated paragraph text keep growing in `paragraph`
-                # even once a DIFFERENT (surviving ancestor) item starts
-                # receiving new content on the next successful iteration
-                # -- CommonMark treats the popped item's paragraph as a
-                # COMPLETE, already-closed block the instant it stops
-                # owning this line, distinct from whatever the surviving
-                # ancestor accumulates next (which starts fresh per
-                # wv-9d8474 if that ancestor's own paragraph was already
-                # closed). Flush only when there was something of the
-                # popped item's OWN to separate out -- skipping the
-                # surviving-stack save/restore entirely when nothing
-                # needs flushing keeps this identical to the pre-fix
-                # behavior for the (far more common) has_paragraph=False
-                # pop.
-                popped = list_stack.pop()
-                if popped.has_paragraph:
-                    surviving = list_stack
-                    flush()
-                    list_stack, container = _restore_owned_list_stack(
-                        surviving, clear_has_paragraph=False
-                    )
-                else:
-                    container = "list" if list_stack else ""
-                kind = _paragraph_interrupt_kind(
-                    line,
-                    probe,
-                    quote_depth,
-                    container,
-                    virtual_offset,
-                    list_stack[-1].content_col if list_stack else None,
-                    list_stack[-1].has_paragraph if list_stack else False,
-                )
-                if not (container == "list" and kind in ("quote", "lazy")):
-                    break
+            attached, kind, list_stack, container = _continue_list_paragraph(
+                list_stack, paragraph, flush, kind, lineno, line, probe, quote_depth, virtual_offset
+            )
             if attached:
                 continue
             # Every enclosing item was exhausted without one continuing
@@ -3748,7 +3763,13 @@ def run_prose_rule(
     severity = str(rule.get("severity", "info"))
     findings: list[PatternFinding] = []
     effective_repo = repo if repo is not None else (target if target.is_dir() else target.parent)
-    for path in _iter_text_files(target, include, effective_repo):
+    try:
+        candidates = _iter_text_files(target, include, effective_repo)
+    except OSError as exc:
+        raise PatternRuleExecutionError(
+            f"{rule_path}: cannot list target {exc.filename or target}: {exc.strerror or exc}"
+        ) from exc
+    for path in candidates:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:

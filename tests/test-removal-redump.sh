@@ -14,6 +14,7 @@
 #   1 - One or more tests failed
 
 set -eu
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 export WV_CALL_SOURCE=test
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WV="$(cd "$SCRIPT_DIR/.." && pwd)/scripts/wv"
@@ -102,6 +103,67 @@ cp "$WEAVE_DIR/state.sql" "$TEST_DIR/state.before-partial"
 err=$("$WV" delete "$R3" --force 2>&1 >/dev/null || true)
 check "the re-dump is refused and state.sql kept" cmp -s "$TEST_DIR/state.before-partial" "$WEAVE_DIR/state.sql"
 check "the refusal says why" sh -c "printf '%s' \"\$1\" | grep -q 'state.sql kept'" _ "$err"
+
+echo "=== a rejected delete keeps the whole graph operation intact ==="
+# Fresh graphs keep one failed attempt from satisfying another's preconditions.
+# Fail each stage: stopping only after the node DELETE loses earlier edge/file
+# deletions; continuing after an earlier error can delete the node anyway.
+for table in edges node_files nodes tombstones; do
+    D="$TEST_DIR/refused-$table"
+    mkdir -p "$D"
+    d_env() { env WV_PROJECT_DIR="$D" WEAVE_DIR="$D/.weave" WV_HOT_ZONE="$D/hot" WV_DB="$D/hot/brain.db" "$@"; }
+    d_env "$WV" init >/dev/null 2>&1
+    target=$(d_env "$WV" add "delete failure target" --standalone 2>/dev/null | tail -1)
+    peer=$(d_env "$WV" add "delete failure survivor" --standalone 2>/dev/null | tail -1)
+    d_env "$WV" link "$target" "$peer" --type=relates_to >/dev/null 2>&1
+    d_env "$WV" touch "$target" --files=src/target.sh >/dev/null 2>&1
+    d_env "$WV" sync >/dev/null 2>&1
+    cp "$D/.weave/state.sql" "$D/before.sql"
+    operation=DELETE
+    [ "$table" != tombstones ] || operation=INSERT
+    sqlite3 "$D/hot/brain.db" "CREATE TRIGGER test_delete_refused BEFORE $operation ON $table
+        BEGIN SELECT RAISE(ABORT, 'simulated $table delete failure'); END;"
+    rc=0
+    out=$(d_env "$WV" delete "$target" --no-gh 2>&1) || rc=$?
+    check "$table refusal returns failure" test "$rc" != 0
+    check "$table refusal prints no deletion success" sh -c '! printf "%s" "$1" | grep -q "Deleted:"' _ "$out"
+    rows=$(sqlite3 "$D/hot/brain.db" "SELECT
+        (SELECT count(*) FROM nodes) || '|' ||
+        (SELECT count(*) FROM edges) || '|' ||
+        (SELECT count(*) FROM node_files) || '|' ||
+        (SELECT count(*) FROM tombstones);")
+    check "$table refusal preserves nodes, edges, files and no tombstones" test "$rows" = '2|1|1|0'
+    [ "$rows" = '2|1|1|0' ] || echo "    observed nodes|edges|files|tombstones: $rows"
+    check "$table refusal leaves portable state unchanged" cmp -s "$D/before.sql" "$D/.weave/state.sql"
+    sqlite3 "$D/hot/brain.db" "DROP TRIGGER test_delete_refused;"
+    rc=0
+    d_env "$WV" delete "$target" --no-gh >/dev/null 2>&1 || rc=$?
+    check "$table retry succeeds after removing the fault" test "$rc" = 0
+    rows=$(sqlite3 "$D/hot/brain.db" "SELECT
+        (SELECT count(*) FROM nodes) || '|' ||
+        (SELECT count(*) FROM edges) || '|' ||
+        (SELECT count(*) FROM node_files) || '|' ||
+        (SELECT count(*) FROM tombstones);")
+    check "$table retry removes target and links, keeps peer and writes tombstones" test "$rows" = '1|0|0|2'
+done
+
+if [ "$(id -u)" != 0 ]; then
+    echo "=== portable-state refusal is not a successful deletion ==="
+    target=$(d_env "$WV" add 'portable deletion target' --standalone 2>/dev/null | tail -1)
+    d_env "$WV" sync >/dev/null 2>&1
+    cp "$D/.weave/state.sql" "$D/before-portable.sql"
+    chmod 500 "$D/.weave"
+    rc=0
+    out=$(d_env "$WV" delete "$target" --no-gh 2>&1) || rc=$?
+    chmod 700 "$D/.weave"
+    check "portable-state refusal returns failure" test "$rc" != 0
+    check "portable-state refusal prints no deletion success" sh -c '! printf "%s" "$1" | grep -q "Deleted:"' _ "$out"
+    check "portable-state refusal preserves previous snapshot" cmp -s "$D/before-portable.sql" "$D/.weave/state.sql"
+    check "portable-state refusal retains the local deletion tombstone" test "$(sqlite3 "$D/hot/brain.db" "SELECT count(*) FROM tombstones WHERE kind='node' AND id='$target';")" = 1
+    check "portable-state refusal names the recovery command" sh -c 'printf "%s" "$1" | grep -q "wv sync"' _ "$out"
+    d_env "$WV" sync >/dev/null 2>&1
+    check "sync recovers durable deletion after permission repair" sh -c '! grep -q "^INSERT INTO nodes VALUES('\''$1'\''" "$2" && grep -q "^INSERT INTO tombstones.*$1" "$2"' _ "$target" "$D/.weave/state.sql"
+fi
 
 echo ""
 echo "Results: $pass/$run passed"

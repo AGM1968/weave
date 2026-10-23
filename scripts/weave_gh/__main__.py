@@ -15,11 +15,23 @@ import os
 import signal
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
+from types import FrameType
+from typing import TextIO
 
 from weave_gh import log
-from weave_gh.data import get_repo, get_repo_url, get_weave_nodes, get_github_issues
+from weave_gh.data import (
+    HotZoneConflictError,
+    HotZoneUnsafeError,
+    IssueFetchError,
+    _resolve_db_path,
+    NodeFetchError,
+    confirm_mapped_issues_absent,
+    get_github_issues,
+    get_repo,
+    get_repo_url,
+    get_weave_nodes,
+)
 from weave_gh.digest_cache import load_cache, save_cache
 from weave_gh.repair_checkpoint import (
     RECOMMENDED_REPAIR_CMD,
@@ -28,7 +40,7 @@ from weave_gh.repair_checkpoint import (
     save_checkpoint,
 )
 from weave_gh.labels import ensure_labels
-from weave_gh.models import Mode, SyncStats
+from weave_gh.models import Mode, SyncStats, WeaveNode
 from weave_gh.notify import notify
 from weave_gh.phases import (
     refresh_parent_body,
@@ -37,6 +49,18 @@ from weave_gh.phases import (
     sync_weave_to_github,
 )
 from weave_gh.cli import wv_cli
+
+# Exit status for a sync refused because an issue or node list failed an
+# integrity check. wv sync --gh fails on it; any other nonzero status (network,
+# auth, sandbox) stays a non-fatal "GitHub step pending" (wv-5a949b, wv-820b76).
+# Keep in step with _WV_GH_EXIT_INTEGRITY in scripts/cmd/wv-cmd-data.sh.
+EXIT_INTEGRITY = 3
+
+# Exit status for an exception that is not a failed gh/wv command: a bug, or
+# data no check anticipated. It may follow GitHub writes, and an exit 1 would
+# be read as a pending network step, so wv sync --gh fails on it (wv-e869e3).
+# Keep in step with _WV_GH_EXIT_INTERNAL in scripts/cmd/wv-cmd-data.sh.
+EXIT_INTERNAL = 4
 
 
 def main() -> None:
@@ -121,21 +145,30 @@ def main() -> None:
     )
 
 
-def _acquire_sync_lock() -> object:
-    """Acquire an exclusive lock to prevent concurrent syncs.
+def _acquire_sync_lock(lock_dir: Path) -> TextIO:
+    """Acquire an exclusive lock to prevent concurrent syncs of one graph.
+
+    lock_dir is the directory of the graph database being synced (its hot
+    zone), so the lock is per graph and per user. It was one machine-wide
+    $TMPDIR/weave/sync.lock: syncs of unrelated repositories excluded each
+    other, and the loser's exit 1 reads as a pending network step, so its
+    GitHub sync was silently skipped (wv-0ae4cb). It could never guard GitHub
+    across machines either; that is weave_gh's dedupe.
 
     Writes the current PID to the lock file so stale locks (from dead
     processes) can be detected and recovered automatically.
 
     Returns the open file handle (keeps lock alive until process exits).
     """
-    lock_dir = Path(tempfile.gettempdir()) / "weave"
-    lock_dir.mkdir(exist_ok=True)
     lock_path = lock_dir / "sync.lock"
 
-    def _try_acquire(path: Path) -> object:
+    def _try_acquire(path: Path) -> TextIO | None:
         # Avoid truncating the holder PID before we actually own the flock.
-        fh = open(path, "a+", encoding="utf-8")  # noqa: SIM115  # pylint: disable=consider-using-with
+        try:
+            fh = open(path, "a+", encoding="utf-8")  # noqa: SIM115  # pylint: disable=consider-using-with
+        except OSError as e:
+            log.error("Error: cannot open the sync lock %s: %s. Sync aborted.", path, e)
+            sys.exit(1)
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -179,6 +212,30 @@ def _acquire_sync_lock() -> object:
     sys.exit(1)
 
 
+def _check_hot_zone() -> str:
+    """Return the graph DB path, or exit EXIT_INTEGRITY when the hot zone's
+    base is unsafe (wv-80be32) or more than one zone holds this repository's
+    database (wv-b831e3).
+
+    wv refuses both before weave_gh starts; this covers a direct
+    ``python -m weave_gh``, which would otherwise read and backfill that DB.
+    """
+    try:
+        return _resolve_db_path()
+    except (HotZoneUnsafeError, HotZoneConflictError) as e:
+        log.error("Error: %s. Sync aborted before any GitHub write.", e)
+        sys.exit(EXIT_INTEGRITY)
+
+
+def _fetch_nodes() -> list[WeaveNode]:
+    """Fetch every Weave node, or exit 1 rather than sync against a partial list."""
+    try:
+        return get_weave_nodes()
+    except NodeFetchError as e:
+        log.error("Error: %s. Sync aborted.", e)
+        sys.exit(EXIT_INTEGRITY)
+
+
 def _run_full_sync(
     *,
     dry_run: bool = False,
@@ -193,7 +250,9 @@ def _run_full_sync(
       because they iterate every GitHub issue / Weave node and would defeat
       the bounded-cost guarantee of fast mode.
     """
-    _sync_lock = _acquire_sync_lock()  # noqa: F841 — held for process lifetime
+    # The graph is resolved (and its zone checked) first: the lock lives beside it.
+    db_path = _check_hot_zone()
+    _sync_lock = _acquire_sync_lock(Path(db_path).parent)  # noqa: F841 — held for process lifetime
     # Prevent auto-prune during sync (wv CLI calls would trigger db_ensure)
     os.environ["WV_DISABLE_AUTOPRUNE"] = "1"
     _log_mode_banner(mode)
@@ -221,18 +280,31 @@ def _run_full_sync(
 
     repo_url = get_repo_url()
 
+    # Fetch both sides before the first GitHub write (ensure_labels): a list
+    # that cannot be proven complete must stop the sync with nothing written.
+    log.info("📋 Fetching GitHub issues...")
+    try:
+        issues = get_github_issues(repo)
+    except IssueFetchError as e:
+        log.error("Error: %s. Sync aborted before any GitHub write.", e)
+        sys.exit(1 if e.transport else EXIT_INTEGRITY)
+    log.info("   Found %d GitHub issues", len(issues))
+
+    log.info("📋 Fetching Weave nodes...")
+    nodes = _fetch_nodes()
+    log.info("   Found %d nodes", len(nodes))
+
+    # Counts prove cardinality, not membership: a node whose mapped issue the
+    # listing omitted would get a replacement created. Look each one up first.
+    try:
+        confirm_mapped_issues_absent(repo, nodes, issues)
+    except IssueFetchError as e:
+        log.error("Error: %s. Sync aborted before any GitHub write.", e)
+        sys.exit(1 if e.transport else EXIT_INTEGRITY)
+
     # Ensure labels exist
     log.info("🏷️  Ensuring labels...")
     ensure_labels(repo)
-
-    # Fetch both sides
-    log.info("📋 Fetching Weave nodes...")
-    nodes = get_weave_nodes()
-    log.info("   Found %d nodes", len(nodes))
-
-    log.info("📋 Fetching GitHub issues...")
-    issues = get_github_issues(repo)
-    log.info("   Found %d GitHub issues", len(issues))
 
     nodes_by_id = {n.id: n for n in nodes}
     stats = SyncStats(mode=mode, total_nodes=len(nodes), candidates=len(nodes))
@@ -264,14 +336,15 @@ def _run_full_sync(
     if mode is Mode.FAST:
         log.info(
             "⏭  Skipping Phase 2 and Phase 3 — fast mode bounds work to the "
-            "focus impacted set. Run --mode=full for full reconcile."
+            "focus impacted set plus done nodes with open issues. Run "
+            "--mode=full for full reconcile."
         )
     else:
         # Phase 2: GitHub → Weave (re-fetch nodes after phase 1 updates)
         log.info("")
         log.info("🔍 Phase 2: GitHub → Weave...")
         stats.current_phase = "phase-2-github-to-weave"
-        nodes = get_weave_nodes()
+        nodes = _fetch_nodes()
         nodes = sync_github_to_weave(
             nodes,
             issues,
@@ -284,7 +357,7 @@ def _run_full_sync(
         log.info("")
         log.info("🔍 Phase 3: Closed GH issues → Weave...")
         stats.current_phase = "phase-3-closed-to-weave"
-        nodes = get_weave_nodes()
+        nodes = _fetch_nodes()
         sync_closed_to_weave(nodes, issues, stats, dry_run=dry_run)
 
     stats.current_phase = "complete"
@@ -331,7 +404,7 @@ def _install_interrupt_handler() -> None:
     behaviour so the process still exits.
     """
 
-    def _handler(signum, _frame):  # type: ignore[no-untyped-def]
+    def _handler(signum: int, _frame: FrameType | None) -> None:
         sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
         sys.stderr.write(
             f"\n⚠  Repair sync interrupted ({sig_name}). "
@@ -351,5 +424,20 @@ def _install_interrupt_handler() -> None:
             pass
 
 
+def _entry() -> None:
+    """Run :func:`main`, mapping an unexpected exception to EXIT_INTERNAL.
+
+    A failed gh or wv command (CalledProcessError, OSError) keeps Python's
+    exit 1, which wv sync --gh treats as a pending network step (wv-5a949b).
+    """
+    try:
+        main()
+    except (subprocess.CalledProcessError, OSError):
+        raise
+    except Exception:  # pylint: disable=broad-exception-caught
+        log.exception("Error: weave_gh stopped on an unexpected exception.")
+        sys.exit(EXIT_INTERNAL)
+
+
 if __name__ == "__main__":
-    main()
+    _entry()

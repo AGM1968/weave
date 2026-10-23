@@ -3,6 +3,7 @@
 export WV_CALL_SOURCE=test
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -16,7 +17,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WV="$PROJECT_ROOT/scripts/wv"
 
-TEST_DIR="/tmp/wv-memory-test-$$"
+SCRATCH=$(bash "$PROJECT_ROOT/scripts/lib/wv-scratch.sh")
+export TMPDIR="$SCRATCH"
+unset WV_SCRATCH_ROOT
+TEST_DIR="$SCRATCH/repo"
 export WV_HOT_ZONE="$TEST_DIR/hot"
 export WV_DB="$WV_HOT_ZONE/brain.db"
 export WV_REQUIRE_LEARNING=0
@@ -25,7 +29,7 @@ export WV_PROJECT_DIR="$TEST_DIR"
 export WV_SUITE_LOG="$TEST_DIR/suite_runs.jsonl"
 
 cleanup() {
-    rm -rf "$TEST_DIR"
+    rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
 
@@ -191,6 +195,21 @@ test_remember_recall_ready_and_render() {
     dynamic_agent=$(WV_OPERATING_AGENT=copilot "$WV" remember "Dynamic agent identity" --json | jq -r '.metadata.source_agent')
     assert_equals "copilot" "$dynamic_agent" "remember resolves operating agent dynamically"
 
+    # Memory provenance takes its harness from resolve_agent_harness, the ladder
+    # claimed_by uses, so the two agree when markers collide; it kept its own
+    # codex-first copy until wv-50640a. CLAUDECODE=1 alone is Claude Code.
+    local _no_agent=(-u WV_OPERATING_AGENT -u WV_AGENT_NAME -u WV_AGENT_ID -u CLAUDE_PROJECT_DIR
+        -u CLAUDECODE -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT)
+    local tie_agent tie_claim
+    tie_agent=$(env "${_no_agent[@]}" CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 \
+        "$WV" remember "Marker tie provenance" --json 2>/dev/null | jq -r '.metadata.source_agent')
+    tie_claim=$(env "${_no_agent[@]}" CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 \
+        bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_agent_id" 2>/dev/null)
+    assert_equals "${tie_claim%%-*}" "$tie_agent" "remember and claimed_by agree on a claude/codex marker tie"
+    assert_equals "claude" "$(env "${_no_agent[@]}" CLAUDECODE=1 \
+        "$WV" remember "CLAUDECODE provenance" --json 2>/dev/null | jq -r '.metadata.source_agent')" \
+        "remember resolves CLAUDECODE=1 alone as claude"
+
     recall_json=$("$WV" memory recall --agent=codex --json)
     assert_contains "$recall_json" "Use WORKFLOW.md as the canonical bridge" "memory recall returns active memories"
 
@@ -217,6 +236,7 @@ test_remember_recall_ready_and_render() {
     assert_equals "" "$ready_text" "ready text excludes type=memory"
 
     mkdir -p "$TEST_DIR/.codex"
+    # shellcheck disable=SC2016  # the expected text contains a literal $ reference
     printf '%s\n' '{"schema":"weave.codex.v1","bootstrap":{"command":"./scripts/wv bootstrap-agent --json","fallback":"$HOME/.local/bin/wv bootstrap-agent --json"}}' > "$TEST_DIR/.codex/weave.json"
     local render_json rendered_authority rendered_command rendered_count
     render_json=$("$WV" memory render --agent=codex --path="$TEST_DIR/.codex/weave.json" --json)
@@ -607,8 +627,11 @@ test_memory_verify_prose() {
     # standing in for a consumer repo. Flags belonging to OTHER tools must not be
     # checked at all, a real wv flag must resolve against wv's own surface
     # (WV_LIB_DIR, not $repo_root/scripts), and a bogus wv flag must still fire.
+    # shellcheck disable=SC2016  # backticks are Markdown code spans, not command substitution
     printf '# t\n\nRunning `uv sync --all-extras` pulls the XPU build; use `uv sync --extra cpu`.\n' > "$mem_dir/foreignflags.md"
+    # shellcheck disable=SC2016  # backticks are Markdown code spans, not command substitution
     printf '# t\n\nPrefer `wv remember "<text>" --kind=project` over editing the index.\n' > "$mem_dir/wvflag.md"
+    # shellcheck disable=SC2016  # backticks are Markdown code spans, not command substitution
     printf '# t\n\nClose with `wv done <id> --frobnicate-widget` to record it.\n' > "$mem_dir/bogusflag.md"
     "$WV" memory import --source=claude --path="$mem_dir" --repo-root="$TEST_DIR" --json >/dev/null 2>&1
 

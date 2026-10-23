@@ -38,6 +38,14 @@
 [ -n "${_WV_ATTEMPT_JOURNAL_LOADED:-}" ] && return 0
 _WV_ATTEMPT_JOURNAL_LOADED=1
 
+# Journal and marker directories are created through the hot-zone base guard
+# (wv-80be32). wv loads the resolver first; a caller sourcing this file alone
+# gets it from beside this file (it has no side effects on source).
+if ! declare -F hot_zone_ensure >/dev/null; then
+    # shellcheck source=/dev/null
+    . "${BASH_SOURCE[0]%/*}/wv-resolve-runtime.sh"
+fi
+
 WV_ATTEMPT_JOURNAL_FORMAT="weave.attempt-journal.v1"
 
 # Envelope fields, in emission order. Set by wv_attempt_context before dispatch.
@@ -133,7 +141,7 @@ wv_attempt_verdicts_claim() {
     local marker
     wv_attempt_journal_enabled || return 0
     marker=$(_wv_attempt_verdict_marker)
-    if { mkdir -p "$(dirname "$marker")" && (set -o noclobber; : > "$marker"); } 2>/dev/null; then
+    if { hot_zone_ensure "${marker%/*}" && (set -o noclobber; : > "$marker"); } 2>/dev/null; then
         return 0
     fi
     if [ -e "$marker" ]; then
@@ -353,7 +361,7 @@ wv_attempt_emit() {
         "$(wv_json_escape "$_WV_ATTEMPT_REGISTRY_SCHEMA")" "$(wv_json_escape "$_WV_ATTEMPT_POLICY_IDENTITY")" \
         "$(wv_json_escape "$_WV_ATTEMPT_POLICY_SCHEMA")" "${_WV_ATTEMPT_CAUSAL_BEFORE:-null}" "$body")
 
-    if ! { mkdir -p "$(dirname "$path")" && printf '%s\n' "$line" >> "$path"; } 2>/dev/null; then
+    if ! { hot_zone_ensure "${path%/*}" && printf '%s\n' "$line" >> "$path"; } 2>/dev/null; then
         _wv_attempt_fail "attempt journal write failed at $path"
         return 1
     fi

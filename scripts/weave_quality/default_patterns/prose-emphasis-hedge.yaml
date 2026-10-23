@@ -5,7 +5,7 @@ severity: info
 policy: always-on-shared
 maturity: promotable
 provenance: >-
-  wv-9c9fc1@nowcastr.
+  wv-9c9fc1 in a consumer graph.
 message: >-
   Emphasis-as-reassurance. State the quantity and its verification procedure
   and let the numbers carry conviction; replace the hedge with the specific

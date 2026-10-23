@@ -10,6 +10,7 @@ export WV_CALL_SOURCE=test
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Colors
 RED='\033[0;31m'
@@ -332,6 +333,23 @@ test_breadcrumbs() {
          SELECT count(DISTINCT doc) FROM temp.t_fv2 WHERE doc NOT IN (SELECT rowid FROM nodes);" 2>/dev/null)
     assert_equals "0" "$orphan_after" "no orphaned nodes_fts entries remain after repair"
 
+    # Missing entries are the opposite divergence (wv-ccd364): neither the
+    # self-check nor the orphan probe sees an empty external-content index.
+    sqlite3 "$WV_DB" "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');"
+    local missing_out missing_status missing_rc=0
+    missing_out=$("$WV" doctor --json 2>/dev/null) || missing_rc=$?
+    missing_status=$(echo "$missing_out" | jq -r '.checks[] | select(.check=="FTS5 index") | .status')
+    assert_equals "fail" "$missing_status" "doctor detects missing nodes_fts entries"
+    assert_equals "1" "$missing_rc" "doctor refuses a graph with missing FTS entries"
+    local missing_repair missing_repair_status content_rc=0 update_rc=0
+    missing_repair=$("$WV" doctor --repair --json 2>/dev/null)
+    missing_repair_status=$(echo "$missing_repair" | jq -r '.checks[] | select(.check=="FTS5 index") | .status')
+    assert_equals "pass" "$missing_repair_status" "doctor --repair rebuilds missing nodes_fts entries"
+    sqlite3 "$WV_DB" "INSERT INTO nodes_fts(nodes_fts,rank) VALUES('integrity-check',1);" 2>/dev/null || content_rc=$?
+    assert_equals "0" "$content_rc" "repaired index agrees with node content"
+    "$WV" update "$orphan_target" --text='repaired missing index control' >/dev/null 2>&1 || update_rc=$?
+    assert_equals "0" "$update_rc" "node updates work after missing-entry repair"
+
     # wv-a77603: cross-agent install-drift advisory rides the bootstrap JSON that
     # every harness (Claude/Codex/Copilot) reads at session start. With no
     # source-path pointer _wv_source_drift no-ops (consumer-safe) and advisories
@@ -411,10 +429,10 @@ test_learnings_filters() {
     id4=$($WV add "DB migration" 2>&1 | node_id_from_output)
 
     # Mark all as done (id1-3 already have learning metadata, id4 gets --learning)
-    $WV done "$id1" --no-warn >/dev/null 2>&1
-    $WV done "$id2" --no-warn >/dev/null 2>&1
-    $WV done "$id3" --no-warn >/dev/null 2>&1
-    $WV done "$id4" --learning="Always backup first" --no-warn >/dev/null 2>&1
+    $WV "done" "$id1" --no-warn >/dev/null 2>&1
+    $WV "done" "$id2" --no-warn >/dev/null 2>&1
+    $WV "done" "$id3" --no-warn >/dev/null 2>&1
+    $WV "done" "$id4" --learning="Always backup first" --no-warn >/dev/null 2>&1
 
     # Basic learnings (no filter)
     local output
@@ -493,7 +511,7 @@ test_learnings_modes() {
     local id i json_output count
     for i in $(seq 1 12); do
         id=$($WV add "Learning node $i" --metadata="{\"learning\":\"Learning $i\"}" 2>&1 | node_id_from_output)
-        $WV done "$id" --no-warn >/dev/null 2>&1
+        $WV "done" "$id" --no-warn >/dev/null 2>&1
     done
 
     json_output=$($WV learnings --json --mode=bootstrap 2>/dev/null)
@@ -534,7 +552,7 @@ test_validation_on_done() {
 
     # Complete without learning — should show validation warnings on stderr
     local full_output
-    full_output=$($WV done "$id1" 2>&1)
+    full_output=$($WV "done" "$id1" 2>&1)
     assert_contains "$full_output" "learning" "done without learning shows learning warning"
     assert_contains "$full_output" "Orphan" "done without edges shows orphan warning"
 
@@ -547,7 +565,7 @@ test_validation_on_done() {
     $WV link "$child" "$parent" --type=implements >/dev/null 2>&1
 
     local done_output
-    done_output=$($WV done "$child" --learning="Learned something" 2>&1)
+    done_output=$($WV "done" "$child" --learning="Learned something" 2>&1)
     assert_not_contains "$done_output" "No learning" "done with learning suppresses learning warning"
     assert_not_contains "$done_output" "Orphan" "done with edges suppresses orphan warning"
 
@@ -557,7 +575,7 @@ test_validation_on_done() {
     local orphan
     orphan=$($WV add "Another orphan" 2>&1 | node_id_from_output)
 
-    done_output=$($WV done "$orphan" --no-warn 2>&1)
+    done_output=$($WV "done" "$orphan" --no-warn 2>&1)
     assert_not_contains "$done_output" "Validation" "done --no-warn suppresses all warnings"
     assert_not_contains "$done_output" "learning" "done --no-warn suppresses learning warning"
 }
@@ -582,7 +600,7 @@ test_breadcrumbs_rich() {
     # Create a node with learning (via metadata since done doesn't support --decision)
     local done_id
     done_id=$($WV add "Completed work" --metadata='{"decision":"Important decision"}' 2>&1 | node_id_from_output)
-    $WV done "$done_id" --no-warn >/dev/null 2>&1
+    $WV "done" "$done_id" --no-warn >/dev/null 2>&1
 
     # Create an active node
     local active_id
@@ -692,6 +710,7 @@ main() {
     test_digest
     test_breadcrumbs
     test_doctor_cold_start_hydrates
+    test_doctor_claim_ownership
     test_learnings_filters
     test_learnings_modes
     test_validation_on_done
@@ -710,6 +729,60 @@ main() {
         echo -e "${GREEN}ALL TESTS PASSED${NC}"
         exit 0
     fi
+}
+
+test_doctor_claim_ownership() {
+    setup_test_env
+    git init -q
+    "$WV" init >/dev/null 2>&1
+    local db before out detail rc mode
+    db=$("$WV" hotzone db)
+    sqlite3 "$db" "INSERT INTO nodes(id,text,status,metadata) VALUES
+      ('wv-aa0001','historical','active','{\"claimed_by\":\"human-old-host-user\"}'),
+      ('wv-aa0002','parallel','active','{\"claimed_by\":\"codex-other-host-user\"}'),
+      ('wv-aa0003','own','active',json_object('claimed_by','custom''current actor')),
+      ('wv-aa0004','unclaimed','active','{}'),
+      ('wv-aa0005','todo','todo','{\"claimed_by\":\"foreign-todo\"}');"
+    "$WV" reindex >/dev/null 2>&1
+    before=$(sqlite3 "$db" 'SELECT id,status,metadata FROM nodes ORDER BY id;')
+    for mode in '' '--repair'; do
+        rc=0
+        out=$(WV_AGENT_ID="custom'current actor" "$WV" doctor --json $mode 2>/dev/null) || rc=$?
+        detail=$(jq -r '.checks[] | select(.check=="claim ownership") | .detail' <<<"$out")
+        assert_equals "0" "$rc" "foreign ownership is advisory ($mode)"
+        assert_equals "warn" "$(jq -r '.checks[] | select(.check=="claim ownership") | .status' <<<"$out")" "foreign ownership warns ($mode)"
+        assert_contains "$detail" "custom'current actor" "current custom actor is explicit ($mode)"
+        assert_contains "$detail" 'wv-aa0001: human-old-host-user' "historical holder listed exactly ($mode)"
+        assert_contains "$detail" 'wv-aa0002: codex-other-host-user' "legitimate parallel holder listed exactly ($mode)"
+        assert_not_contains "$detail" 'wv-aa0003' "own claim excluded ($mode)"
+        assert_not_contains "$detail" 'wv-aa0004' "unclaimed active excluded ($mode)"
+        assert_not_contains "$detail" 'wv-aa0005' "foreign todo excluded ($mode)"
+        assert_equals "$before" "$(sqlite3 "$db" 'SELECT id,status,metadata FROM nodes ORDER BY id;')" "doctor never mutates claim state ($mode)"
+    done
+    out=$(WV_AGENT_ID="custom'current actor" "$WV" doctor 2>/dev/null)
+    assert_contains "$out" 'wv-aa0001: human-old-host-user' 'text doctor lists foreign ownership'
+    sqlite3 "$db" "UPDATE nodes SET status='done' WHERE id IN ('wv-aa0001','wv-aa0002');"
+    out=$(WV_AGENT_ID="custom'current actor" "$WV" doctor --json 2>/dev/null)
+    assert_equals 'pass' "$(jq -r '.checks[] | select(.check=="claim ownership") | .status' <<<"$out")" 'no foreign claims is healthy'
+    # Fail the required ownership read through the public CLI, not a private helper.
+    mkdir -p "$TEST_DIR/bin"
+    local real_sqlite
+    real_sqlite=$(command -v sqlite3)
+    cat > "$TEST_DIR/bin/sqlite3" <<'SQLITE'
+#!/usr/bin/env bash
+for arg in "$@"; do
+    if [[ "$arg" == SELECT* && "$arg" == *claimed_by* && "$arg" == *"FROM nodes"* && "$arg" == *active* ]]; then
+        echo 'injected ownership read failure' >&2
+        exit 1
+    fi
+done
+exec "$REAL_SQLITE" "$@"
+SQLITE
+    chmod +x "$TEST_DIR/bin/sqlite3"
+    out=$(PATH="$TEST_DIR/bin:$PATH" REAL_SQLITE="$real_sqlite" "$WV" doctor --json 2>/dev/null || true)
+    detail=$(jq -r '.checks[] | select(.check=="claim ownership") | .detail' <<<"$out")
+    assert_contains "$detail" 'unavailable' 'failed required ownership read is explicit'
+    assert_equals 'warn' "$(jq -r '.checks[] | select(.check=="claim ownership") | .status' <<<"$out")" 'failed required read is not healthy'
 }
 
 main "$@"

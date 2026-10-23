@@ -16,6 +16,7 @@ export WV_CALL_SOURCE=test
 # shape would be auto-migrated and the assertion would pass for the wrong
 # reason — it would be testing the migration, not the probe.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -38,6 +39,14 @@ export WV_CONFIG_DIR="$TEST_DIR/config"; mkdir -p "$WV_CONFIG_DIR"
 export WV_AUTO_CHECKPOINT=0
 mkdir -p "$WEAVE_DIR"
 cd "$TEST_DIR" || exit 1
+
+for mode in normal fast; do
+    args=(health --json)
+    [ "$mode" = normal ] || args+=(--fast)
+    empty=$("$WV" "${args[@]}" 2>/dev/null)
+    check "$mode empty graph verifies its index" "ok" "$(jq -r '.fts_integrity // "missing"' <<<"$empty")"
+    check "$mode empty graph stays healthy" "100" "$(jq -r '.score' <<<"$empty")"
+done
 
 "$WV" add "health probe node" >/dev/null 2>&1
 DB="$WV_HOT_ZONE/brain.db"
@@ -71,6 +80,80 @@ if [ -f "$CACHE" ]; then
 else
     bad "fast cache was written" "no file at $CACHE"
 fi
+
+# Remove only the indexed document, not its node. Ordinary SQLite integrity
+# still passes, and an external-content COUNT(*) still sees the node.
+sqlite3 "$DB" "INSERT INTO nodes_fts(nodes_fts,rowid,id,text,metadata,alias)
+    SELECT 'delete',rowid,id,text,metadata,alias FROM nodes;"
+check "missing FTS content passes ordinary SQLite integrity" "ok" "$(sqlite3 "$DB" 'PRAGMA integrity_check;')"
+for mode in normal fast; do
+    args=(health)
+    [ "$mode" = normal ] || args+=(--fast)
+    damaged=$("$WV" "${args[@]}" --json 2>/dev/null)
+    damaged_rc=$?
+    [ "$damaged_rc" -ne 0 ] && ok "$mode health refuses missing index content" || bad "$mode health refuses missing index content" "rc=$damaged_rc"
+    check "$mode missing index cannot retain a healthy score" "0" "$(jq -r '.score' <<<"$damaged")"
+    check "$mode reports failed index verification" "failed" "$(jq -r '.fts_integrity // "missing"' <<<"$damaged")"
+    text=$("$WV" "${args[@]}" 2>&1)
+    text_rc=$?
+    [ "$text_rc" -ne 0 ] && ok "$mode text health refuses missing index content" || bad "$mode text health refuses missing index content" "rc=$text_rc"
+    if [[ "$text" = *FTS5* && "$text" = *'wv doctor'* ]]; then
+        ok "$mode text explains index verification and recovery"
+    else
+        bad "$mode text explains index verification and recovery" "$text"
+    fi
+done
+check "health did not repair missing index content" "0" "$(sqlite3 "$DB" "CREATE VIRTUAL TABLE temp.v USING fts5vocab(main,nodes_fts,instance); SELECT count(DISTINCT doc) FROM temp.v;")"
+check "health retained the graph node" "1" "$(sqlite3 "$DB" 'SELECT count(*) FROM nodes;')"
+sqlite3 "$DB" "INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');"
+recovered=$("$WV" health --fast --json 2>/dev/null)
+check "repaired index invalidates the cached failure" "ok" "$(jq -r '.fts_integrity // "missing"' <<<"$recovered")"
+check "repaired graph recovers its previous score" "$healthy_score" "$(jq -r '.score' <<<"$recovered")"
+
+# Refuse only the content-level integrity probe. A read failure is not proof
+# of corruption, but neither is it a verified healthy index or a cache hit.
+mkdir -p "$TEST_DIR/bin"
+export WV_HEALTH_SQLITE WV_HEALTH_PROBE_LOG="$TEST_DIR/probe.log"
+WV_HEALTH_SQLITE=$(command -v sqlite3)
+cat > "$TEST_DIR/bin/sqlite3" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+    if [ "$arg" = "INSERT INTO nodes_fts(nodes_fts,rank) VALUES('integrity-check',1);" ]; then
+        echo refused >> "$WV_HEALTH_PROBE_LOG"
+        exit 73
+    fi
+done
+exec "$WV_HEALTH_SQLITE" "$@"
+EOF
+# Retain the old healthy cache by refusing only its publication. Even when
+# cache storage fails, the emitted verdict must come from this invocation.
+export WV_HEALTH_MV WV_HEALTH_CACHE="$CACHE" WV_HEALTH_MV_LOG="$TEST_DIR/cache-publish.log"
+WV_HEALTH_MV=$(command -v mv)
+cat > "$TEST_DIR/bin/mv" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+    if [ "$arg" = "$WV_HEALTH_CACHE" ]; then
+        echo refused >> "$WV_HEALTH_MV_LOG"
+        exit 73
+    fi
+done
+exec "$WV_HEALTH_MV" "$@"
+EOF
+chmod +x "$TEST_DIR/bin/sqlite3" "$TEST_DIR/bin/mv"
+for mode in normal fast; do
+    args=(health --json)
+    [ "$mode" = normal ] || args+=(--fast)
+    : > "$WV_HEALTH_PROBE_LOG"
+    unavailable=$(PATH="$TEST_DIR/bin:$PATH" "$WV" "${args[@]}" 2>/dev/null)
+    unavailable_rc=$?
+    [ -s "$WV_HEALTH_PROBE_LOG" ] && ok "$mode unavailable probe was reached" || bad "$mode unavailable probe was reached"
+    [ "$unavailable_rc" -ne 0 ] && ok "$mode refuses unavailable index verification" || bad "$mode refuses unavailable index verification" "rc=$unavailable_rc"
+    check "$mode unavailable index cannot score healthy" "0" "$(jq -r '.score' <<<"$unavailable")"
+    check "$mode unavailable verification is explicit" "failed" "$(jq -r '.fts_integrity // "missing"' <<<"$unavailable")"
+done
+[ -s "$WV_HEALTH_MV_LOG" ] && ok "fast cache publication was refused" || bad "fast cache publication was refused"
+check "the old healthy cache remains after refused publication" "$healthy_score" "$(jq -r '.score' "$CACHE")"
+"$WV" health --fast --json >/dev/null 2>&1
 
 # Reverse the lineage column order on edges: ALTER TABLE appends only, so this
 # shape is unreachable by repair and db_ensure cannot mask it.

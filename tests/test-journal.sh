@@ -12,6 +12,7 @@ export WV_CALL_SOURCE=test
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Colors
 RED='\033[0;31m'
@@ -58,6 +59,9 @@ setup_test_env() {
     source "$PROJECT_ROOT/scripts/lib/wv-journal.sh"
 }
 
+# Assertions record a failure and return 0: under set -e a nonzero return
+# ended the suite at its first failed assertion, so every later result and
+# the summary went unreported (wv-75e31a). TESTS_FAILED decides the exit.
 assert_equals() {
     local expected="$1"
     local actual="$2"
@@ -72,7 +76,7 @@ assert_equals() {
         echo "  Expected: $expected"
         echo "  Actual:   $actual"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -90,7 +94,7 @@ assert_contains() {
         echo "  Expected to find: $needle"
         echo "  In: $haystack"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -106,7 +110,7 @@ assert_success() {
         echo -e "${RED}✗${NC} $message"
         echo "  Command failed: $*"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -122,7 +126,7 @@ assert_fails() {
         echo -e "${RED}✗${NC} $message"
         echo "  Expected failure but succeeded: $*"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -359,6 +363,46 @@ assert_equals "1" "${_WV_IN_JOURNAL:-0}" \
 journal_end
 assert_equals "" "${_WV_IN_JOURNAL:-}" \
     "_WV_IN_JOURNAL unset after nested end"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# A second journal_end is a no-op (wv-b8abe2)
+# ═══════════════════════════════════════════════════════════════════════════
+# An exit trap ends the journal again after a path has already ended it. Under
+# set -u that second end died on the unset op variables, so `wv sync` exited 1
+# after a successful dump whenever the caller had files staged.
+
+_je_lines=$(wc -l < "$WV_HOT_ZONE/ops.journal" 2>/dev/null || echo 0)
+_je_rc=0
+( set -u; journal_end ) || _je_rc=$?
+assert_equals "0" "$_je_rc" "journal_end with no open operation succeeds under set -u"
+assert_equals "$_je_lines" "$(wc -l < "$WV_HOT_ZONE/ops.journal" 2>/dev/null || echo 0)" \
+    "...and appends nothing"
+
+_sync_repo="$TEST_DIR/sync-repo"
+mkdir -p "$_sync_repo" "$TEST_DIR/sync-hot" "$TEST_DIR/sync-cfg"
+(
+    cd "$_sync_repo" && git init -q . && git config user.name t && git config user.email t@t \
+        && git config commit.gpgsign false && printf 'x\n' > a && git add a \
+        && git -c core.hooksPath=/dev/null commit -qm base
+) >/dev/null 2>&1
+_sync() {
+    (cd "$_sync_repo" && env -u WV_AUTO_CHECKPOINT_ACTIVE WV_HOT_ZONE="$TEST_DIR/sync-hot" \
+        WV_DB="$TEST_DIR/sync-hot/brain.db" WV_CONFIG_DIR="$TEST_DIR/sync-cfg" \
+        WV_PROJECT_DIR="$_sync_repo" WV_AUTO_SYNC=0 WV_AUTO_CHECKPOINT=0 "$WV" "$@")
+}
+_sync init >/dev/null 2>&1 || true
+_sync add "staged-sync probe" --standalone --force --criteria="a" --risks=low >/dev/null 2>&1 || true
+printf 'y\n' > "$_sync_repo/a"
+git -C "$_sync_repo" add a
+_sync_rc=0
+_sync_out=$(_sync sync 2>&1) || _sync_rc=$?
+assert_equals "0" "$_sync_rc" "wv sync with a caller file staged exits 0"
+assert_equals "1" "$(grep -c 'staged-sync probe' "$_sync_repo/.weave/nodes.jsonl" 2>/dev/null || echo 0)" \
+    "...after dumping the graph"
+assert_equals "1" "$(grep -c 'sync-state commit skipped' <<< "$_sync_out")" \
+    "...through the staged-caller branch"
+assert_equals "a" "$(git -C "$_sync_repo" diff --cached --name-only)" \
+    "...leaving the caller's staging alone"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Summary

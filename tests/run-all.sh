@@ -10,11 +10,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Tag suite-driven wv calls so call-stats can separate them from real traffic.
-# (config.env force-enables WV_CALL_LOG even under test env overrides, so suite
-# runs DO write to the user's durable call log — tag them rather than pollute
-# source=shell/agent.)
-export WV_CALL_SOURCE=test
+# Tag suite-driven wv calls so call-stats can separate them from real traffic,
+# and keep them out of the user's durable call log: under WV_TEST_SUITE=1 the
+# user's config.env cannot enable WV_CALL_LOG (wv-6b0f57). Each suite exports
+# the marker itself too, for when it runs on its own.
+export WV_CALL_SOURCE=test WV_TEST_SUITE=1
 
 # Colors
 RED='\033[0;31m'
@@ -56,6 +56,7 @@ done
 # Fast tier — runs by default (~25s parallel, ~880s serial)
 declare -a FAST_SUITES=(
     "test-core.sh:Core Commands"
+    "test-scratch-resources.sh:Scratch Capacity and Ownership"
     "test-violation-vocabulary.sh:Violation Vocabulary Contract"
     "test-coaching-contracts.sh:Coaching Contract Schemas"
     "test-coaching-guides.sh:Coaching Guide Assets"
@@ -72,6 +73,7 @@ declare -a FAST_SUITES=(
     "test-stress.sh:Stress Tests"
     "test-hooks.sh:Hook Tests"
     "test-codex-hooks.sh:Codex Hook Dispatch Tests"
+    "test-hook-parity.sh:Claude/Codex Hook Parity Tests"
     "test-guide-procedure.sh:Procedure Guide Contract"
     "test-procedure-contracts.sh:Procedure Contract Validation"
     "test-procedure-lifecycle.sh:Procedure Delivery Lifecycle"
@@ -106,6 +108,10 @@ declare -a FAST_SUITES=(
     "test-metadata-canonical-numbers.sh:Metadata Numbers Are Canonical Integers"
     "test-update-arg-forms.sh:Update Applies or Refuses Every Argument"
     "test-lib-guards.sh:Lib Guards the Routed Suites Missed"
+    "test-hot-zone-base.sh:Hot-zone Bases Another User Could Control Are Refused"
+    "test-hot-zone-placement.sh:Hot-zone Placement Adopts the Zone Holding the Database"
+    "test-hot-zone-reconcile.sh:Divergent Copies of One Graph Are Reconciled Before Removal"
+    "test-gate-zone-guard.sh:The Gate Fails a Suite That Leaks Into the Live Hot Zone"
     "test-cli-guards.sh:CLI Guards the Routed Suites Missed"
     "test-cli-unknown-args.sh:Write Paths Refuse Unknown Arguments"
     "test-budget-location.sh:Call Tally Lands Where Hygiene Reads It"
@@ -125,6 +131,7 @@ declare -a FAST_SUITES=(
     "test-doctor-delta-v2-catalog.sh:Doctor Delta v2 Catalog Integrity"
     "test-doctor-closed-node-dirt.sh:Doctor Closed-Node Uncommitted-Dirt Attribution"
     "test-doctor-managed-pattern-completeness.sh:Doctor Managed-Pattern Completeness Advisory"
+    "test-doctor-guides.sh:Doctor Guide Validity and Completeness"
     "test-cmd-battery.sh:Command-Surface Battery"
     "test-schema-contract.sh:SQL-vs-Schema Contract"
     "test-citation-drift.sh:Doc Citation Drift"
@@ -151,6 +158,15 @@ declare -a FAST_SUITES=(
     "test-edge-enum-lineage.sh:Edge Enum Rebuild Lineage Preservation"
     "test-db-ensure-memo.sh:db_ensure Per-Process Memo"
     "test-prepush-gate.sh:Two-Tier Commit Gate (pre-push heavy tier)"
+    "test-gate-input-reuse.sh:Input-Keyed Suite Reuse"
+    "test-gate-snapshot.sh:Frozen Gate Candidate"
+    "test-protected-dispatcher.sh:Protected Dispatcher"
+    "test-gate-lanes.sh:Gate Candidate Lanes"
+    "test-gate-recovery.sh:Gate Recovery"
+    "test-gate-pool-order.sh:Gate Pool Launch Order And Lane Shares"
+    "test-shellcheck-gate.sh:Shellcheck Gate Policy Transitions"
+    "test-resolver-failure.sh:Suite Resolver Failure"
+    "test-assert-continue.sh:Assertions Never Abort A Suite"
     "test-cli-autoload.sh:CLI Command-Module Autoload"
     "test-source-drift.sh:Install Source Drift Detection"
     "test-doctor-modules.sh:Doctor Derived Module Checks"
@@ -182,6 +198,8 @@ declare -a FAST_SUITES=(
     "test-gh-issue-body-bug.sh:Parent-Add Child-ID Regression"
     "test-hook-common.sh:Shared Hook Library"
     "test-hook-dispatch.sh:Host-Neutral Hook Dispatch"
+    "test-consumer-shellcheck.sh:Vendored Shell Files Under Consumer Lint"
+    "test-git-hook-install.sh:Git Hooks Install Where Git Runs Them"
     "test-journal.sh:Operation Journal"
     "test-phase-fsm.sh:Session Phase State Machine"
     "test-quality.sh:Quality Scan and Reset"
@@ -327,6 +345,13 @@ if [ -n "$SUITE_FILTER" ]; then
 fi
 
 # Run suites
+RUN_SCRATCH=$(bash "$SCRIPT_DIR/../scripts/lib/wv-scratch.sh")
+trap 'rm -rf "$RUN_SCRATCH"' EXIT
+mkdir "$RUN_SCRATCH/tmp"
+export TMPDIR="$RUN_SCRATCH/tmp"
+# The explicit root is consumed at the runner boundary; nested fixtures may
+# choose their own TMPDIR without an outer override defeating their isolation.
+unset WV_SCRATCH_ROOT
 START_TIME=$(date +%s)
 
 if [ "$PARALLEL" = true ]; then
@@ -349,7 +374,7 @@ if [ "$PARALLEL" = true ]; then
 
         for ((i=batch_start; i<batch_end; i++)); do
             script="${SUITES[$i]%%:*}"
-            (bash "$SCRIPT_DIR/$script" > "/tmp/wv-test-${run_id}-$script.out" 2>&1) &
+            (bash "$SCRIPT_DIR/$script" > "$RUN_SCRATCH/wv-test-${run_id}-$script.out" 2>&1) &
             PIDS+=($!)
         done
 
@@ -362,7 +387,7 @@ if [ "$PARALLEL" = true ]; then
             wait "$pid" && exit_code=0 || exit_code=$?
             EXECUTED_SUITES+=("$script")
 
-            suite_log="/tmp/wv-test-${run_id}-$script.out"
+            suite_log="$RUN_SCRATCH/wv-test-${run_id}-$script.out"
             output=$(cat "$suite_log" 2>/dev/null || echo "")
 
             # Parse results (strip ANSI codes first). Normalize once, then match
@@ -394,7 +419,7 @@ if [ "$PARALLEL" = true ]; then
                 # `grep | head`, because a reader that leaves early is the bug
                 # this whole change is about.
                 awk '/✗|FAIL|Error/ && shown < 10 { print "    " $0; shown++ }' <<<"$clean_output"
-                failed_log="${WV_TEST_FAILED_LOG_DIR:-/tmp}/wv-test-failed-${run_id}-$script.out"
+                failed_log="${WV_TEST_FAILED_LOG_DIR:-$(dirname "$RUN_SCRATCH")}/wv-test-failed-${run_id}-$script.out"
                 if mv "$suite_log" "$failed_log" 2>/dev/null; then
                     echo "    full output: $failed_log"
                 fi

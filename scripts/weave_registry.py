@@ -119,14 +119,17 @@ GENERATED_HEADER = "# GENERATED FROM contracts/command-capabilities.json -- DO N
 
 
 def canonical(doc: Json) -> str:
+    """Serialize a JSON document in the registry's canonical form (sorted keys, two-space indent)."""
     return json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
 
 
 def digest(text: str) -> str:
+    """Hex SHA-256 of a text's UTF-8 bytes."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def key(rowdict: Json) -> tuple[str, str]:
+    """Identity of a registry row: its (operation, suboperation) pair."""
     return (rowdict["operation"], rowdict.get("suboperation", ""))
 
 
@@ -141,6 +144,7 @@ def dispatch_commands(wv_path: Path) -> set[str]:
 
 
 def load(path: Path) -> Json:
+    """Read and parse a JSON file."""
     doc: Json = json.loads(path.read_text(encoding="utf-8"))
     return doc
 
@@ -319,6 +323,7 @@ def _dominance_errors(seen: dict[tuple[str, str], Json]) -> list[str]:
 
 
 def validate(registry: Path, wv_path: Path, schema_path: Path = DEFAULT_SCHEMA) -> list[str]:
+    """Validate the registry against its schema and the wv dispatcher; return every error found."""
     try:
         raw = registry.read_text(encoding="utf-8")
         doc = json.loads(raw)
@@ -462,15 +467,20 @@ def _shell_evidence_class(subs: list[Json], base: list[Json]) -> list[str]:
 def _shell_targets(subs: list[Json], base: list[Json]) -> list[str]:
     """_wv_cap_targets: what a mutation may touch, which is what an attempt
     journal records. Class and cache alone cannot answer that."""
-    out = ["_wv_cap_targets() {", '    case "${1}:${2-}" in']
-    for row in subs:
-        targets = " ".join(row["mutation_targets"])
-        out.append(f'        {row["operation"]}:{row["suboperation"]}) printf %s "{targets}"; return 0 ;;')
-    out += ["    esac", '    case "$1" in']
-    for row in base:
-        targets = " ".join(row["mutation_targets"])
-        out.append(f'        {row["operation"]}) printf %s "{targets}"; return 0 ;;')
-    return out + ["    esac", "    return 1", "}", ""]
+    out = ["_wv_cap_targets() {"]
+    # Keep suboperation precedence and exact target order while grouping rows
+    # with identical results, as the class/cache projections already do.
+    for selector, rows in (('${1}:${2-}', subs), ('$1', base)):
+        groups: dict[str, list[str]] = {}
+        for row in rows:
+            targets = " ".join(row["mutation_targets"])
+            branch = f'{row["operation"]}:{row["suboperation"]}' if rows is subs else row["operation"]
+            groups.setdefault(targets, []).append(branch)
+        out.append(f'    case "{selector}" in')
+        for targets, branches in groups.items():
+            out.append(f'        {_branches(branches)}) printf %s "{targets}"; return 0 ;;')
+        out.append("    esac")
+    return out + ["    return 1", "}", ""]
 
 
 def _shell_refines_and_known(subs: list[Json], base: list[Json]) -> list[str]:
@@ -495,6 +505,7 @@ def _shell_refines_and_known(subs: list[Json], base: list[Json]) -> list[str]:
 
 
 def shell(registry: Path, schema_path: Path = DEFAULT_SCHEMA) -> str:
+    """Generate the shell projection of the registry, stamped with its contract identity."""
     doc = load(registry)
     identity = contract_identity(registry, schema_path)
     rows = doc["commands"]
@@ -527,6 +538,7 @@ def shell(registry: Path, schema_path: Path = DEFAULT_SCHEMA) -> str:
 
 
 def main(argv: list[str]) -> int:
+    """Run validate, digest, identity, generate or check on the registry, per the first argument."""
     root = ROOT
     registry = DEFAULT_REGISTRY
     wv_path = root / "scripts" / "wv"

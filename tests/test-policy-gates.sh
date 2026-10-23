@@ -10,6 +10,7 @@ export WV_CALL_SOURCE=test
 # (tests/test-policy-contract.sh). This suite drives a representative set end to
 # end; the per-rule allow/deny/advisory/bypass matrix belongs to policy totality.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WV="$ROOT/scripts/wv"
 run=0; pass=0
@@ -80,25 +81,25 @@ j work "$child"
 expect "a lost claim is an expected conflict, not a denial" work non_policy_refusal expected_conflict - -
 j work "$child" --force
 expect "a takeover records the override" work policy_verdict claim_ownership allow --force
-j done "$child" --skip-verification
-expect "a close without a learning names its bypass" done policy_verdict close_requires_learning allow --skip-verification
+j "done" "$child" --skip-verification
+expect "a close without a learning names its bypass" "done" policy_verdict close_requires_learning allow --skip-verification
 j work "$child"
 expect "claiming a done node without --reopen is denied" work policy_verdict reopen_requires_explicit_intent deny -
 j work "$child" --reopen
 expect "an explicit reopen is recorded" work policy_verdict reopen_requires_explicit_intent allow --reopen
-j done "$child" --skip-verification
-j done "$child" --skip-verification
-expect "closing a closed node is an expected conflict" done non_policy_refusal expected_conflict - -
+j "done" "$child" --skip-verification
+j "done" "$child" --skip-verification
+expect "closing a closed node is an expected conflict" "done" non_policy_refusal expected_conflict - -
 
 # Advisory is its own outcome: a close whose learning overlaps an earlier one
 # proceeds, and records advisory rather than allow.
 first=$("$WV" add "overlap first node" --parent="$epic" 2>/dev/null | tail -1)
 "$WV" work "$first" >/dev/null 2>&1
-"$WV" done "$first" --learning="pattern: quartz lanterns guide the harbour ferry at dusk" >/dev/null 2>&1
+"$WV" "done" "$first" --learning="pattern: quartz lanterns guide the harbour ferry at dusk" >/dev/null 2>&1
 second=$("$WV" add "overlap second node" --parent="$epic" 2>/dev/null | tail -1)
 "$WV" work "$second" >/dev/null 2>&1
-j done "$second" --learning="pattern: quartz lanterns guide the harbour ferry at dusk"
-expect "an overlapping learning is advisory, distinct from allow" done policy_verdict learning_overlap_advisory advisory -
+j "done" "$second" --learning="pattern: quartz lanterns guide the harbour ferry at dusk"
+expect "an overlapping learning is advisory, distinct from allow" "done" policy_verdict learning_overlap_advisory advisory -
 
 echo "=== SQLite-owned close rules leave the decision's own receipt ==="
 # wv-d7cd88: the close transaction evaluates the clauses and records the receipt
@@ -113,8 +114,8 @@ close_clause() {
     node=$("$WV" add "sqlite clause $rule" --parent="$epic" 2>/dev/null | tail -1)
     "$WV" work "$node" >/dev/null 2>&1
     sq "${setup//@ID@/$node}"
-    out=$(env WV_ATTEMPT_JOURNAL="$JOURNAL" "$@" "$WV" done "$node" --skip-verification 2>&1)
-    expect "$label" done policy_verdict "$rule" deny -
+    out=$(env WV_ATTEMPT_JOURNAL="$JOURNAL" "$@" "$WV" "done" "$node" --skip-verification 2>&1)
+    expect "$label" "done" policy_verdict "$rule" deny -
     local clause
     clause=$(jq -c --arg r "$rule" 'select(.event=="policy_verdict" and .rule==$r) | .clause' "$JOURNAL" | tail -1)
     if jq -e "$check" <<< "$clause" >/dev/null; then
@@ -165,13 +166,13 @@ sq "DELETE FROM quality_exempt WHERE reason='WV_TEST_POLICY_RACE';
 # opt-in, and an unrecognised value refuses the close instead of being ignored.
 n=$("$WV" add "race seam gating probe" --parent="$epic" 2>/dev/null | tail -1)
 "$WV" work "$n" >/dev/null 2>&1
-bogus=$(WV_TEST_MODE=1 WV_TEST_POLICY_RACE=yes "$WV" done "$n" --skip-verification 2>&1)
+bogus=$(WV_TEST_MODE=1 WV_TEST_POLICY_RACE=yes "$WV" "done" "$n" --skip-verification 2>&1)
 if [ "$(sq "SELECT status FROM nodes WHERE id='$n';")" = "active" ] && [[ "$bogus" == *"not a recognised value"* ]]; then
     ok "an unrecognised WV_TEST_POLICY_RACE value refuses the close"
 else
     bad "an unrecognised WV_TEST_POLICY_RACE value refuses the close" "$bogus"
 fi
-ungated=$(WV_TEST_POLICY_RACE=1 "$WV" done "$n" --skip-verification 2>&1)
+ungated=$(env -u WV_TEST_MODE WV_TEST_POLICY_RACE=1 "$WV" "done" "$n" --skip-verification 2>&1)
 if [ "$(sq "SELECT status FROM nodes WHERE id='$n';")" = "done" ] && [[ "$ungated" == *"ignoring it"* ]] &&
     [ "$(sq "SELECT value FROM policy_thresholds WHERE key='mccabe_max_py';")" = "25.0" ]; then
     ok "without WV_TEST_MODE=1 the seam is ignored with a warning and moves nothing"
@@ -212,8 +213,8 @@ sq "DELETE FROM file_metrics WHERE path='src/raced.py';
     CREATE TRIGGER test_disagreeing_backstop BEFORE UPDATE OF status ON nodes
     WHEN NEW.status='done' AND OLD.status='active'
     BEGIN SELECT RAISE(ABORT, 'GraphPolicyViolation: disagreeing backstop'); END;"
-j done "$LAST_NODE" --skip-verification
-expect "a trigger refusing a close the receipt allowed is infrastructure failure" done non_policy_refusal infrastructure_failure - -
+j "done" "$LAST_NODE" --skip-verification
+expect "a trigger refusing a close the receipt allowed is infrastructure failure" "done" non_policy_refusal infrastructure_failure - -
 if [ "$(sq "SELECT status FROM nodes WHERE id='$LAST_NODE';")" = "active" ]; then
     ok "the disagreeing close did not commit"
 else
@@ -277,7 +278,7 @@ sq "DROP TRIGGER test_quick_backstop;"
 # node closed directly was never gated and must not start being denied.
 t=$("$WV" add "todo close probe" --parent="$epic" 2>/dev/null | tail -1)
 sq "INSERT OR REPLACE INTO node_files(node_id,path) VALUES('$t','src/complex.py');"
-j done "$t" --skip-verification
+j "done" "$t" --skip-verification
 [ "$(sq "SELECT status FROM nodes WHERE id='$t';")" = "done" ] &&
     ok "a todo node closes without the active-close gate, as the trigger allows" ||
     bad "a todo node closes without the active-close gate, as the trigger allows"
@@ -290,7 +291,7 @@ printf '\n[exempt]\nsrc/exempt/\n' >> "$WEAVE_DIR/quality.conf"
 # The next close resyncs the changed quality.conf, which also drops metrics
 # already stored under the exempt path, so it runs before any breach is seeded.
 n=$("$WV" add "exempt config load" --parent="$epic" 2>/dev/null | tail -1)
-"$WV" work "$n" >/dev/null 2>&1; "$WV" done "$n" --skip-verification >/dev/null 2>&1
+"$WV" work "$n" >/dev/null 2>&1; "$WV" "done" "$n" --skip-verification >/dev/null 2>&1
 [ "$(sq "SELECT COUNT(*) FROM quality_exempt WHERE path_pattern='src/exempt/';")" = "1" ] &&
     ok "the exempt pattern is loaded" || bad "the exempt pattern is loaded"
 # rule_event <operation> <rule> -> "decision bypass path call_id" of the last such verdict
@@ -308,10 +309,10 @@ exempt_node() {  # exempt_node <text> <setup-sql-with-@ID@> -> an active node
 n=$(exempt_node "exempt complexity probe" \
     "INSERT OR REPLACE INTO file_metrics(path,mccabe_max,language) VALUES('src/exempt/big.py',40,'py');
      INSERT OR REPLACE INTO node_files(node_id,path) VALUES('@ID@','src/exempt/big.py');")
-j done "$n" --skip-verification
+j "done" "$n" --skip-verification
 [ "$(sq "SELECT status FROM nodes WHERE id='$n';")" = "done" ] &&
     ok "an exempt-only breach still closes" || bad "an exempt-only breach still closes"
-got=$(rule_event done close_complexity_ceiling)
+got=$(rule_event "done" close_complexity_ceiling)
 [ "${got% *}" = "allow quality_exempt:src/exempt/ src/exempt/big.py" ] &&
     ok "an exempt-only breach records allow naming the exempt pattern" ||
     bad "an exempt-only breach records allow naming the exempt pattern" "$got"
@@ -324,8 +325,8 @@ jq -e '.threshold=="mccabe_max_py" and .limit==25 and .actual==40' <<< "$clause"
 n=$(exempt_node "mixed exempt probe" \
     "INSERT OR REPLACE INTO file_metrics(path,mccabe_max,language) VALUES('src/exempt/big.py',40,'py'),('src/plain.py',40,'py');
      INSERT OR REPLACE INTO node_files(node_id,path) VALUES('@ID@','src/exempt/big.py'),('@ID@','src/plain.py');")
-j done "$n" --skip-verification
-got=$(rule_event done close_complexity_ceiling)
+j "done" "$n" --skip-verification
+got=$(rule_event "done" close_complexity_ceiling)
 [ "${got% *}" = "deny - src/plain.py" ] &&
     ok "a non-exempt breach still denies with the same receipt" ||
     bad "a non-exempt breach still denies with the same receipt" "$got"
@@ -352,7 +353,7 @@ sq "UPDATE policy_thresholds SET value=0 WHERE key='trend_deteriorating';"
 # A close with no breach at all records no close-rule verdict: allow means an
 # exemption was used, not that a clause looked.
 n=$(exempt_node "clean close probe" "SELECT 1;")
-j done "$n" --skip-verification
+j "done" "$n" --skip-verification
 call=$(jq -r 'select(.operation=="done" and .event=="call_started") | .call_id' "$JOURNAL" | tail -1)
 if jq -e --arg c "$call" 'select(.call_id==$c and .event=="policy_verdict" and (.rule // "" | test("^close_(complexity|trend|tests)")))' "$JOURNAL" >/dev/null; then
     bad "a clean close records no exemption bypass"
@@ -400,7 +401,7 @@ if out=$(python3 "$ROOT/scripts/weave_policy.py" denominator "$JOURNAL"); then
 else
     bad "every real gate verdict this suite produced is inside the denominator" "$(jq -c .errors <<< "$out")"
 fi
-[ "$(jq -r '.excluded_scopes | join(",")' <<< "$report")" = "host_event" ] &&
+[ "$(jq -r '.excluded_scopes | join(",")' <<< "$report")" = "git_event,host_event" ] &&
     ok "the report states the exclusion it counted under" || bad "the report states the exclusion it counted under"
 # Forgeries: the hook denial folded in under a synthesized call_id, first with
 # no call_started, then with one manufactured for it.

@@ -1,5 +1,6 @@
 id: bare-except-pass
 language: python
+violation_type: code:swallowed-exception
 message: "Silenced exception hides errors. Log the exception or handle specifically."
 severity: warning
 rule:

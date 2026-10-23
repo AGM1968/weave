@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
-# test-precommit-selfheal-isolation.sh — a test run never reinstalls the host
-# through the pre-commit install-drift self-heal (wv-75937a).
+# test-precommit-selfheal-isolation.sh — source admission never installs the host
+# (wv-801b89; historical test-run isolation regression wv-75937a).
 #
-# The self-heal reads source-path from the config dir and runs that checkout's
-# ./install.sh against the REAL HOME (it unsets the isolation vars on purpose).
-# A suite that commits inside its fixture runs the hook, so a test run
-# reinstalled the host from the working tree: the cloud probe wv-0b9d5c could
-# not keep a planted mutant out of the install while tests/test-hooks.sh ran,
-# and a mutant hook installed that way broke the probing agent's own hooks.
+# Source drift remains visible, but installation is an explicit operation.
+# Normal, agent and test callers must all leave the installed runtime alone.
 #
 # Driven against the real hook with a temp HOME, config dir and source tree
 # whose install.sh is a stub that only records it ran.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -23,8 +20,10 @@ bad() { run=$((run+1)); echo "  ✗ $1"; [ -n "${2:-}" ] && echo "      $2"; }
 
 T=$(mktemp -d /tmp/wv-selfheal-XXXXXX)
 trap 'rm -rf "$T"' EXIT
-SRC="$T/src"; H="$T/home"; CFG="$T/cfg"; REPO="$T/repo"; MARK="$T/installed"
-mkdir -p "$SRC/scripts/lib" "$H/.local/lib/weave/lib" "$CFG" "$REPO" "$T/hot"
+SRC="$T/src"; H="$T/home"; CFG="$T/cfg"; REPO="$T/repo"; MARK="$T/installed"; SUITE_MARK="$T/suite-ran"
+mkdir -p "$SRC/scripts/lib" "$H/.local/lib/weave/lib" "$CFG" "$REPO" "$T/hot" "$T/bin"
+printf '#!/bin/sh\nexec "%s/scripts/wv" "$@"\n' "$ROOT" > "$T/bin/wv"
+chmod +x "$T/bin/wv"
 printf '%s\n' "$SRC" > "$CFG/source-path"
 # Drift: a source lib the temp HOME has no installed copy of.
 echo 'lib' > "$SRC/scripts/lib/wv-x.sh"
@@ -32,8 +31,16 @@ printf '#!/bin/sh\necho ran >> "%s"\n' "$MARK" > "$SRC/install.sh"
 chmod +x "$SRC/install.sh"
 
 git -C "$REPO" init -q
+mkdir -p "$REPO/.weave" "$REPO/checks"
+printf '[map]\nfile.txt = checks/probe.sh\nchecks/probe.sh = checks/probe.sh\n.weave/test-map.conf = checks/probe.sh\n' \
+    > "$REPO/.weave/test-map.conf"
+printf '#!/bin/sh\nprintf ran > "%s"\n[ ! -f "%s/fail-suite" ]\n' "$SUITE_MARK" "$T" > "$REPO/checks/probe.sh"
 echo x > "$REPO/file.txt"
-git -C "$REPO" add file.txt
+git -C "$REPO" add file.txt .weave/test-map.conf checks/probe.sh
+( cd "$REPO" && env -u WV_LIB_DIR -u WV_DB -u WV_PROJECT_DIR \
+    HOME="$H" WV_CONFIG_DIR="$CFG" WV_HOT_ZONE="$T/hot" WV_AUTO_SYNC=0 WV_AUTO_CHECKPOINT=0 \
+    "$ROOT/scripts/wv" add "source admission fixture" --status=active --force --criteria="c1|c2" --risks=low \
+    >"$T/claim.out" 2>&1 ) || { cat "$T/claim.out"; exit 1; }
 
 # precondition: the fixture really is drifted, or both cases prove nothing.
 drift=$(HOME="$H" WV_CONFIG_DIR="$CFG" bash -c "
@@ -44,25 +51,41 @@ case "$drift" in *drifted) ok "the fixture source tree is drifted from the temp 
 
 # run_hook <WV_CALL_SOURCE value or empty> — the real hook, from the fixture repo.
 run_hook() {
-    rm -f "$MARK"
+    rm -f "$MARK" "$SUITE_MARK"
+    RC=0
     ( cd "$REPO" && env -u WV_CALL_SOURCE -u WV_PRECOMMIT_RUNNING -u WV_SKIP_PRECOMMIT \
         -u WV_LIB_DIR -u WV_DB -u WV_PROJECT_DIR \
-        HOME="$H" WV_CONFIG_DIR="$CFG" WV_HOT_ZONE="$T/hot" WV_HOOK_PROGRESS=0 \
-        ${1:+WV_CALL_SOURCE=$1} bash "$HOOK" ) >"$T/hook.out" 2>&1 || true
+        PATH="$T/bin:$PATH" HOME="$H" WV_CONFIG_DIR="$CFG" WV_HOT_ZONE="$T/hot" WV_HOOK_PROGRESS=0 \
+        ${1:+WV_CALL_SOURCE=$1} bash "$HOOK" ) >"$T/hook.out" 2>&1 || RC=$?
 }
 
-echo "pre-commit self-heal under a test run"
-run_hook test
-[ -f "$MARK" ] && bad "a hook run under WV_CALL_SOURCE=test does not run install.sh" "$(head -5 "$T/hook.out")" \
-    || ok "a hook run under WV_CALL_SOURCE=test does not run install.sh"
-grep -qF 'install drift' "$T/hook.out" \
-    && ok "it still reports the drift" \
-    || bad "it still reports the drift" "$(head -5 "$T/hook.out")"
+for caller in test agent ""; do
+    echo "pre-commit source admission (${caller:-normal})"
+    run_hook "$caller"
+    if [ -f "$MARK" ]; then
+        bad "${caller:-normal} caller does not run install.sh" "$(head -5 "$T/hook.out")"
+    else
+        ok "${caller:-normal} caller does not run install.sh"
+    fi
+    grep -qF 'install drift' "$T/hook.out" \
+        && ok "${caller:-normal} caller still reports drift" \
+        || bad "${caller:-normal} caller still reports drift" "$(head -5 "$T/hook.out")"
+    [ "$RC" -eq 0 ] && ok "${caller:-normal} caller admits healthy source despite drift" \
+        || bad "${caller:-normal} caller admits healthy source despite drift" "status=$RC: $(tail -5 "$T/hook.out")"
+    [ -f "$SUITE_MARK" ] && ok "${caller:-normal} caller runs the routed suite" \
+        || bad "${caller:-normal} caller runs the routed suite" "$(tail -5 "$T/hook.out")"
+done
 
-echo "pre-commit self-heal outside a test run"
+touch "$T/fail-suite"
 run_hook ""
-[ -f "$MARK" ] && ok "a hook run outside a test still self-heals via install.sh" \
-    || bad "a hook run outside a test still self-heals via install.sh" "$(head -5 "$T/hook.out")"
+[ "$RC" -eq 1 ] && grep -qF 'probe.sh failed' "$T/hook.out" \
+    && ok "a failing routed suite still refuses admission" \
+    || bad "a failing routed suite still refuses admission" "status=$RC: $(tail -8 "$T/hook.out")"
+if [ -f "$MARK" ]; then
+    bad "refused source does not run install.sh" "installer marker exists"
+else
+    ok "refused source does not run install.sh"
+fi
 
 echo ""
 echo "Results: $pass/$run passed"

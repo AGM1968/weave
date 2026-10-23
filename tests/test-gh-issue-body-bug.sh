@@ -9,6 +9,7 @@ export WV_CALL_SOURCE=test
 # which overwrote the caller's $id variable with the last node ID in the loop (parent ID).
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # This suite had NO isolation: it called whatever `wv` was on PATH, against
 # whatever graph was ambient, and created and deleted nodes there. That was

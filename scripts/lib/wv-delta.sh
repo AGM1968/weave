@@ -136,7 +136,8 @@ END;
 # changes (e.g. new columns added to trigger JSON objects). The table itself
 # uses CREATE TABLE IF NOT EXISTS (preserving in-flight changes).
 # Called by: cmd_init, cmd_load (after state.sql import and after db_init),
-# and wv_delta_has_changes (self-healing path).
+# and wv_delta_has_changes (self-healing path). Returns sqlite3's status, and
+# marks tracking installed only when the install succeeded (wv-853f9f).
 wv_delta_init() {
     local db="$1"
     sqlite3 -cmd ".timeout 5000" "$db" "
@@ -147,7 +148,7 @@ DROP TRIGGER IF EXISTS _warp_nodes_delete;
 DROP TRIGGER IF EXISTS _warp_edges_insert;
 DROP TRIGGER IF EXISTS _warp_edges_update;
 DROP TRIGGER IF EXISTS _warp_edges_delete;
-${_WV_DELTA_TRIGGERS_NODES}${_WV_DELTA_TRIGGERS_EDGES}"
+${_WV_DELTA_TRIGGERS_NODES}${_WV_DELTA_TRIGGERS_EDGES}" || return 1
     _WV_DELTA_INITED=1
 }
 

@@ -11,6 +11,7 @@ export WV_CALL_SOURCE=test
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Colors
 RED='\033[0;31m'
@@ -207,7 +208,7 @@ test_tree() {
     assert_not_contains "$tree_depth1" "Task: Create login form" "tree --depth=1: hides depth 2"
 
     # Active filter — mark epic done, create and claim a second active root
-    $WV done "$epic_id" >/dev/null 2>&1
+    $WV "done" "$epic_id" >/dev/null 2>&1
     local active_epic
     active_epic=$($WV add "Epic: Active project" 2>/dev/null | tail -1)
     $WV work "$active_epic" >/dev/null 2>&1
@@ -467,7 +468,7 @@ test_aliases() {
     # Done via alias
     local id2
     id2=$($WV add "Deploy hotfix" --alias=deploy 2>/dev/null | tail -1)
-    $WV done deploy >/dev/null 2>&1
+    $WV "done" deploy >/dev/null 2>&1
     local status
     status=$($WV show "$id2" --json 2>&1 | jq -r '.status' 2>/dev/null)
     assert_equals "done" "$status" "alias: done resolves alias"
@@ -502,7 +503,7 @@ test_aliases() {
     assert_equals "1" "$alias_count" "alias: uniqueness enforced for active nodes"
 
     # Alias reuse — allowed when prior node is done
-    $WV done "$id4" --learning="test" --no-overlap-check 2>/dev/null || true
+    $WV "done" "$id4" --learning="test" --no-overlap-check 2>/dev/null || true
     local id4_reuse
     id4_reuse=$($WV add "Reuse after done" --alias=tests 2>/dev/null | tail -1)
     local reuse_count
@@ -536,7 +537,7 @@ test_duplicate_task_guards() {
 
     local first_id
     first_id=$($WV add "Task: document DISCOVERY_TOOLS constant" 2>/dev/null | tail -1)
-    $WV done "$first_id" --learning="already documented" --no-overlap-check >/dev/null 2>&1
+    $WV "done" "$first_id" --learning="already documented" --no-overlap-check >/dev/null 2>&1
 
     local dup_add_out
     dup_add_out=$($WV add "Task: document DISCOVERY_TOOLS constant" 2>&1 || true)
@@ -551,7 +552,7 @@ test_duplicate_task_guards() {
     local forced_count
     forced_count=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE text='Task: document DISCOVERY_TOOLS constant';" 2>/dev/null)
     assert_equals "2" "$forced_count" "dedup: add --force still allows intentional duplicate"
-    $WV done "$forced_id" --learning="forced duplicate for test" --no-overlap-check >/dev/null 2>&1
+    $WV "done" "$forced_id" --learning="forced duplicate for test" --no-overlap-check >/dev/null 2>&1
 
     local quick_before
     quick_before=$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE text='Task: document DISCOVERY_TOOLS constant';" 2>/dev/null)
@@ -592,7 +593,7 @@ test_explicit_reopen() {
 
     local id
     id=$($WV add "Task: reopen fixture" 2>/dev/null | tail -1)
-    $WV done "$id" --learning="fixture for explicit reopen semantics" --no-overlap-check >/dev/null 2>&1
+    $WV "done" "$id" --learning="fixture for explicit reopen semantics" --no-overlap-check >/dev/null 2>&1
 
     local update_out
     update_out=$($WV update "$id" --status=active 2>&1 || true)
@@ -640,7 +641,7 @@ test_learning_hygiene() {
     # No learning — no score
     local id1
     id1=$($WV add "Simple task" 2>/dev/null | tail -1)
-    $WV done "$id1" >/dev/null 2>&1
+    $WV "done" "$id1" >/dev/null 2>&1
     local score1
     score1=$($WV show "$id1" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene // "null"' 2>/dev/null)
     assert_equals "null" "$score1" "quality: no learning = no score"
@@ -648,7 +649,7 @@ test_learning_hygiene() {
     # Short learning (>20 chars, no prefix, no code ref) = 1 point
     local id2
     id2=$($WV add "Task with short learning" 2>/dev/null | tail -1)
-    $WV done "$id2" --learning="always check the edge cases first" >/dev/null 2>&1
+    $WV "done" "$id2" --learning="always check the edge cases first" >/dev/null 2>&1
     local score2
     score2=$($WV show "$id2" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene' 2>/dev/null)
     assert_equals "1" "$score2" "quality: length >20 chars = 1 point"
@@ -656,7 +657,7 @@ test_learning_hygiene() {
     # Categorized prefix (pattern:) = +2, plus length >20 = +1 = 3
     local id3
     id3=$($WV add "Task with pattern learning" 2>/dev/null | tail -1)
-    $WV done "$id3" --learning="pattern: Use recursive CTE for tree traversal in SQLite" >/dev/null 2>&1
+    $WV "done" "$id3" --learning="pattern: Use recursive CTE for tree traversal in SQLite" >/dev/null 2>&1
     local score3
     score3=$($WV show "$id3" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene' 2>/dev/null)
     assert_equals "3" "$score3" "quality: length + categorized prefix = 3"
@@ -664,7 +665,7 @@ test_learning_hygiene() {
     # All bonuses: prefix + length + code reference = 4
     local id4
     id4=$($WV add "Task with full quality" 2>/dev/null | tail -1)
-    $WV done "$id4" --learning="pattern: Use validate_status() from wv-validate.sh for enum checking" >/dev/null 2>&1
+    $WV "done" "$id4" --learning="pattern: Use validate_status() from wv-validate.sh for enum checking" >/dev/null 2>&1
     local score4
     score4=$($WV show "$id4" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene' 2>/dev/null)
     assert_equals "4" "$score4" "quality: length + prefix + code ref = 4"
@@ -672,7 +673,7 @@ test_learning_hygiene() {
     # Pitfall prefix also scores +2
     local id5
     id5=$($WV add "Task with pitfall" 2>/dev/null | tail -1)
-    $WV done "$id5" --learning="pitfall: Never use echo with arrays, causes word splitting" >/dev/null 2>&1
+    $WV "done" "$id5" --learning="pitfall: Never use echo with arrays, causes word splitting" >/dev/null 2>&1
     local score5
     score5=$($WV show "$id5" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene' 2>/dev/null)
     assert_equals "3" "$score5" "quality: pitfall prefix scores same as pattern"
@@ -680,7 +681,7 @@ test_learning_hygiene() {
     # Bench H4: inline learning with a file path reference scores 4 (wv-51b9ca)
     local id_h4
     id_h4=$($WV add "Task with file-ref learning" 2>/dev/null | tail -1)
-    $WV done "$id_h4" --learning="pattern: Use scripts/cmd/wv-cmd-core.sh for all core logic" \
+    $WV "done" "$id_h4" --learning="pattern: Use scripts/cmd/wv-cmd-core.sh for all core logic" \
         --skip-verification >/dev/null 2>&1
     local score_h4
     score_h4=$($WV show "$id_h4" --json 2>&1 | jq -r '.metadata | fromjson | .learning_hygiene' 2>/dev/null)
@@ -693,7 +694,7 @@ test_learning_hygiene() {
     printf 'pattern: walk implements edges via scripts/cmd/wv-cmd-graph.sh\npitfall: never skip edge validation\n' > "$lf_b1"
     local id_b1
     id_b1=$($WV add "Task with newline-form learning-file" 2>/dev/null | tail -1)
-    $WV done "$id_b1" --learning-file="$lf_b1" --skip-verification >/dev/null 2>&1
+    $WV "done" "$id_b1" --learning-file="$lf_b1" --skip-verification >/dev/null 2>&1
     rm -f "$lf_b1"
     local b1_meta score_b1 b1_pattern b1_pitfall
     b1_meta=$($WV show "$id_b1" --json 2>&1 | jq -r '.metadata | fromjson' 2>/dev/null)
@@ -820,7 +821,7 @@ test_session_summary() {
     # Create and complete a node with learning
     local id1
     id1=$($WV add "Test task" 2>/dev/null | tail -1)
-    $WV done "$id1" --learning="pattern: test pattern" >/dev/null 2>&1
+    $WV "done" "$id1" --learning="pattern: test pattern" >/dev/null 2>&1
 
     # Summary shows deltas
     local summary
@@ -850,7 +851,7 @@ test_session_summary() {
     local id2 id3
     id2=$($WV add "Task 2" 2>/dev/null | tail -1)
     id3=$($WV add "Task 3" 2>/dev/null | tail -1)
-    $WV done "$id2" >/dev/null 2>&1
+    $WV "done" "$id2" >/dev/null 2>&1
 
     json_out=$($WV session-summary --json 2>&1)
     assert_json_field "$json_out" ".nodes_created" "3" "session-summary: 3 total created"
@@ -901,8 +902,8 @@ test_session_summary_hygiene() {
 
     # --- Component 3: learning discipline ---
     # Close one with structured learning, one without.
-    $WV done "$id1" --learning="decision: do X | pattern: pattern" >/dev/null 2>&1
-    $WV done "$id2" >/dev/null 2>&1
+    $WV "done" "$id1" --learning="decision: do X | pattern: pattern" >/dev/null 2>&1
+    $WV "done" "$id2" >/dev/null 2>&1
     json_out=$($WV session-summary --json 2>&1)
     assert_json_field "$json_out" ".hygiene.learning_discipline" "12" "learning_discipline = 25 * 1/2 = 12"
 
@@ -973,9 +974,9 @@ test_learnings_dedup() {
     # Create identical learnings
     local id1 id2
     id1=$($WV add "Task A" 2>/dev/null | tail -1)
-    $WV done "$id1" --learning="pattern: Always use recursive CTE for tree traversal in SQLite databases" >/dev/null 2>&1
+    $WV "done" "$id1" --learning="pattern: Always use recursive CTE for tree traversal in SQLite databases" >/dev/null 2>&1
     id2=$($WV add "Task B" 2>/dev/null | tail -1)
-    $WV done "$id2" --learning="pattern: Always use recursive CTE for tree traversal in SQLite databases" >/dev/null 2>&1
+    $WV "done" "$id2" --learning="pattern: Always use recursive CTE for tree traversal in SQLite databases" >/dev/null 2>&1
 
     # Should detect duplicates
     local dedup_out
@@ -998,7 +999,7 @@ test_learnings_dedup() {
     # Dissimilar learnings — should NOT be flagged
     local id3
     id3=$($WV add "Task C" 2>/dev/null | tail -1)
-    $WV done "$id3" --learning="pitfall: Never use global variables for configuration management in large applications" >/dev/null 2>&1
+    $WV "done" "$id3" --learning="pitfall: Never use global variables for configuration management in large applications" >/dev/null 2>&1
 
     dedup_json=$($WV learnings --dedup --json 2>&1)
     pair_count=$(echo "$dedup_json" | jq 'length' 2>/dev/null)
@@ -1007,7 +1008,7 @@ test_learnings_dedup() {
     # Case insensitive
     local id4
     id4=$($WV add "Task D" 2>/dev/null | tail -1)
-    $WV done "$id4" --learning="PATTERN: ALWAYS USE RECURSIVE CTE FOR TREE TRAVERSAL IN SQLITE DATABASES" >/dev/null 2>&1
+    $WV "done" "$id4" --learning="PATTERN: ALWAYS USE RECURSIVE CTE FOR TREE TRAVERSAL IN SQLITE DATABASES" >/dev/null 2>&1
 
     dedup_json=$($WV learnings --dedup --json 2>&1)
     pair_count=$(echo "$dedup_json" | jq 'length' 2>/dev/null)
@@ -1025,10 +1026,10 @@ test_learnings_dedup() {
     $WV init >/dev/null 2>&1
     local id5
     id5=$($WV add "Unique A" 2>/dev/null | tail -1)
-    $WV done "$id5" --learning="decision: Chose PostgreSQL for relational data storage needs" >/dev/null 2>&1
+    $WV "done" "$id5" --learning="decision: Chose PostgreSQL for relational data storage needs" >/dev/null 2>&1
     local id6
     id6=$($WV add "Unique B" 2>/dev/null | tail -1)
-    $WV done "$id6" --learning="pitfall: Always sanitize user input before database queries" >/dev/null 2>&1
+    $WV "done" "$id6" --learning="pitfall: Always sanitize user input before database queries" >/dev/null 2>&1
 
     local no_dup_out
     no_dup_out=$($WV learnings --dedup 2>&1)
@@ -1054,7 +1055,7 @@ test_resolve_first_id() {
     # Flags pass through correctly with alias resolution
     local id1
     id1=$($WV add "Learning test node" --alias=learn-test 2>/dev/null | tail -1)
-    $WV done learn-test --learning="pattern: always test your code thoroughly" >/dev/null 2>&1
+    $WV "done" learn-test --learning="pattern: always test your code thoroughly" >/dev/null 2>&1
 
     # Verify the learning was captured — "pattern: ..." is parsed into the .pattern field
     local learning
@@ -1131,7 +1132,7 @@ test_checkpoint_trailers() {
     assert_contains "$commit_msg" "Weave-ID: $id2" "checkpoint: switched primary shows in trailer"
 
     # Complete primary — falls back to remaining active (id1)
-    $WV done "$id2" >/dev/null 2>&1
+    $WV "done" "$id2" >/dev/null 2>&1
     rm -f "$WV_HOT_ZONE/.last_checkpoint"
     $WV sync >/dev/null 2>&1
 
@@ -1140,7 +1141,7 @@ test_checkpoint_trailers() {
     assert_contains "$commit_msg" "Weave-ID: $id1" "checkpoint: remaining active node falls back as trailer"
 
     # No active nodes — no trailers
-    $WV done "$id1" >/dev/null 2>&1
+    $WV "done" "$id1" >/dev/null 2>&1
     $WV add "Just a todo" >/dev/null 2>&1  # status=todo, not active
     rm -f "$WV_HOT_ZONE/.last_checkpoint"
     $WV sync >/dev/null 2>&1
@@ -1220,7 +1221,7 @@ test_learning_undelimited_marker_warning() {
     local id1 out1
     id1=$($WV add "undelimited test" --standalone --force 2>/dev/null | tail -1)
     $WV work "$id1" >/dev/null 2>&1
-    out1=$($WV done "$id1" --skip-verification \
+    out1=$($WV "done" "$id1" --skip-verification \
         --learning="Decision: some prose here. pattern: more prose with no pipe. pitfall: even more" 2>&1)
     assert_contains "$out1" "no '|' between them" "done --learning: warns on undelimited multi-marker prose"
     assert_contains "$out1" "wv update" "done --learning: names the fix-up command"
@@ -1232,7 +1233,7 @@ test_learning_undelimited_marker_warning() {
     local id2 out2
     id2=$($WV add "delimited test" --standalone --force 2>/dev/null | tail -1)
     $WV work "$id2" >/dev/null 2>&1
-    out2=$($WV done "$id2" --skip-verification \
+    out2=$($WV "done" "$id2" --skip-verification \
         --learning="decision: x | pattern: y | pitfall: z" 2>&1)
     assert_not_contains "$out2" "no '|' between them" "done --learning: silent when markers are properly '|'-delimited"
 
@@ -1240,7 +1241,7 @@ test_learning_undelimited_marker_warning() {
     local id3 out3
     id3=$($WV add "single marker test" --standalone --force 2>/dev/null | tail -1)
     $WV work "$id3" >/dev/null 2>&1
-    out3=$($WV done "$id3" --skip-verification --learning="decision: just one thing" 2>&1)
+    out3=$($WV "done" "$id3" --skip-verification --learning="decision: just one thing" 2>&1)
     assert_not_contains "$out3" "no '|' between them" "done --learning: silent for a single marker with nothing to split"
 }
 

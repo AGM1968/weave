@@ -12,6 +12,7 @@ export WV_CALL_SOURCE=test
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Colors
 RED='\033[0;31m'
@@ -117,6 +118,9 @@ setup_remote_tracking() {
     git push -u origin "$branch_name" -q >/dev/null 2>&1 || true
 }
 
+# Assertions record a failure and return 0: under set -e a nonzero return
+# ended the suite at its first failed assertion, so every later result and
+# the summary went unreported (wv-75e31a). TESTS_FAILED decides the exit.
 assert_equals() {
     local expected="$1"
     local actual="$2"
@@ -131,7 +135,7 @@ assert_equals() {
         echo "  Expected: $expected"
         echo "  Actual:   $actual"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -149,7 +153,7 @@ assert_contains() {
         echo "  Expected to find: $needle"
         echo "  In: $(echo "$haystack" | sed -n '1,3p')"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -165,7 +169,7 @@ assert_success() {
         echo -e "${RED}✗${NC} $message"
         echo "  Command failed: $*"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -181,7 +185,7 @@ assert_fails() {
         echo -e "${RED}✗${NC} $message"
         echo "  Expected failure but succeeded: $*"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
+        return 0
     fi
 }
 
@@ -236,14 +240,160 @@ exec /usr/bin/python3 "$@"
 PYEOF
 chmod +x "$fake_bin/python3"
 
+# _sync_gh calls /usr/bin/python3 directly when VIRTUAL_ENV is set, which
+# would bypass this fake; unset it so the fake is what runs.
 gh_output=""
 gh_exit=0
-gh_output=$(PATH="$fake_bin:$PATH" "$WV" sync --gh 2>&1) || gh_exit=$?
+gh_output=$(env -u VIRTUAL_ENV PATH="$fake_bin:$PATH" "$WV" sync --gh 2>&1) || gh_exit=$?
 assert_equals "0" "$gh_exit" "sync --gh remains non-fatal when GH is sandbox-blocked"
 assert_contains "$gh_output" "Synced to" "sync --gh still performs local .weave sync"
 assert_contains "$gh_output" "GitHub sync did not complete" "sync --gh explains external failure"
 assert_contains "$gh_output" "local .weave sync is complete" "sync --gh distinguishes local and external sync"
 assert_contains "$gh_output" "network/SSH approval" "sync --gh gives sandbox approval guidance"
+
+# ─── GH sync integrity refusal is fatal (wv-820b76) ─────────────────────
+# weave_gh exits 3 when an issue or node list fails an integrity check. That
+# is not a pending network step, so wv sync --gh must fail on it while still
+# completing the local .weave sync. The output names a repository and an API
+# host on purpose: the exit status, not the wording, decides the verdict.
+
+echo ""
+echo -e "${CYAN}--- GH sync integrity refusal ---${NC}"
+setup_test_env
+add_output=$("$WV" add "test node for gh integrity refusal" 2>/dev/null)
+integrity_node=""
+[[ "$add_output" =~ (wv-[a-f0-9]{4,6}) ]] && integrity_node="${BASH_REMATCH[1]}"
+assert_contains "$integrity_node" "wv-" "integrity refusal fixture node was created"
+
+fake_bin="$TEST_DIR/fake-bin-integrity"
+mkdir -p "$fake_bin"
+cat > "$fake_bin/python3" <<'PYEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-m" ] && [ "${2:-}" = "weave_gh" ]; then
+    echo "Error: gh issue list repeated 1 issue number(s) in owner/repository (api.github.com). Sync aborted before any GitHub write."
+    exit 3
+fi
+exec /usr/bin/python3 "$@"
+PYEOF
+chmod +x "$fake_bin/python3"
+
+gh_output=""
+gh_exit=0
+gh_output=$(env -u VIRTUAL_ENV PATH="$fake_bin:$PATH" "$WV" sync --gh 2>&1) || gh_exit=$?
+assert_equals "1" "$gh_exit" "sync --gh exits nonzero on an integrity refusal"
+assert_contains "$gh_output" "Synced to" "integrity refusal still performs local .weave sync"
+assert_contains "$gh_output" "GitHub sync refused" "integrity refusal is reported as a refusal"
+assert_contains "$gh_output" "local .weave sync is complete" "integrity refusal distinguishes local sync"
+assert_equals "0" "$(grep -c 'network/SSH approval' <<< "$gh_output")" \
+    "integrity refusal gives no network-retry guidance"
+
+# An unexpected exception exits 4 (wv-e869e3): a bug or unanticipated data,
+# possibly after GitHub writes, so it fails the command too.
+sed -i 's/^    exit 3$/    exit 4/' "$fake_bin/python3"
+gh_output=""
+gh_exit=0
+gh_output=$(env -u VIRTUAL_ENV PATH="$fake_bin:$PATH" "$WV" sync --gh 2>&1) || gh_exit=$?
+assert_equals "1" "$gh_exit" "sync --gh exits nonzero on an unexpected weave_gh exception"
+assert_contains "$gh_output" "unexpected exception" "unexpected exception is reported as such"
+assert_contains "$gh_output" "may be partly updated" "unexpected exception does not claim GitHub is untouched"
+
+# End to end: the REAL weave_gh against a fake gh. Pins the exit-status
+# contract between weave_gh and _sync_gh, which the fake python3 above cannot,
+# and proves no GitHub write was attempted. The fake serves the issue list
+# from gh-listing.json, the count queries, in order, from gh-counts (one per
+# line, the last repeating), and issue view from gh-view.json (not found when
+# absent). Every call is logged; only reads may appear (see gh_writes).
+gh_bin="$TEST_DIR/fake-bin-gh"
+mkdir -p "$gh_bin"
+gh_calls="$TEST_DIR/gh-calls.log"
+gh_listing="$TEST_DIR/gh-listing.json"
+gh_counts="$TEST_DIR/gh-counts"
+gh_view="$TEST_DIR/gh-view.json"
+cat > "$gh_bin/gh" <<GHEOF
+#!/usr/bin/env bash
+echo "\$*" >> "$gh_calls"
+case "\$1 \$2" in
+    "repo view")
+        case "\$*" in *url*) echo "https://github.com/owner/repo" ;; *) echo "owner/repo" ;; esac ;;
+    "api graphql")
+        head -n 1 "$gh_counts"
+        [ "\$(wc -l < "$gh_counts")" -gt 1 ] && sed -i 1d "$gh_counts"
+        exit 0 ;;
+    "issue list") cat "$gh_listing" ;;
+    "issue view")
+        if [ -f "$gh_view" ]; then cat "$gh_view"; exit 0; fi
+        echo "GraphQL: Could not resolve to an issue or pull request with the number of \$3. (repository.issue)" >&2
+        exit 1 ;;
+    *) exit 1 ;;
+esac
+GHEOF
+chmod +x "$gh_bin/gh"
+
+# gh_writes: logged calls that are not reads. A graphql call is a read only
+# when it is the issue count query; any mutation is a write.
+gh_writes() {
+    awk '/^(repo view|issue list|issue view)( |$)/ {next}
+         /^api graphql / && /totalCount/ && !/mutation/ {next}
+         {n++} END {print n+0}' "$gh_calls"
+}
+
+issue_row() {  # issue_row <number> -> one well-formed gh issue list row
+    printf '{"number":%s,"title":"t","state":"OPEN","body":"","labels":[],"assignees":[]}' "$1"
+}
+
+# run_refusal <label> <counts> <listing> <expected message> [<issue view json>]
+# GH_SERVED names the call that must have been served (default: issue list).
+run_refusal() {
+    local label="$1"
+    : > "$gh_calls"
+    printf '%s\n' $2 > "$gh_counts"
+    printf '%s' "$3" > "$gh_listing"
+    rm -f "$gh_view"
+    [ -n "${5:-}" ] && printf '%s' "$5" > "$gh_view"
+    gh_output=""
+    gh_exit=0
+    gh_output=$(PATH="$gh_bin:$PATH" "$WV" sync --gh 2>&1) || gh_exit=$?
+    assert_equals "1" "$gh_exit" "real weave_gh, $label: fails sync --gh"
+    assert_contains "$gh_output" "$4" "real weave_gh, $label: names the fault"
+    assert_contains "$gh_output" "GitHub sync refused" "real weave_gh, $label: reported as a refusal"
+    assert_contains "$(cat "$gh_calls")" "${GH_SERVED:-issue list}" \
+        "real weave_gh, $label: the fake gh served ${GH_SERVED:-issue list}"
+    assert_equals "0" "$(gh_writes)" "real weave_gh, $label: no GitHub write attempted"
+}
+
+# The write detector itself: a mutation passed as a graphql call, or any
+# other command, counts as a write; the count query and listings do not.
+: > "$gh_calls"
+printf '%s\n' "repo view --json nameWithOwner" "issue list --repo o/r" "issue view 9 --repo o/r" \
+    "api graphql -f query=query { repository { issues { totalCount } } }" > "$gh_calls"
+assert_equals "0" "$(gh_writes)" "gh_writes: reads are not writes"
+printf '%s\n' "api graphql -f query=mutation { closeIssue(input: {}) { issue { totalCount } } }" \
+    "issue close 9" "label create weave:active" >> "$gh_calls"
+assert_equals "3" "$(gh_writes)" "gh_writes: a mutation and other commands are writes"
+
+# Length matches the count of 2, but #2 repeats where #1 belongs.
+run_refusal "repeated number" "2" "[$(issue_row 2),$(issue_row 2)]" "repeated 1 issue number"
+# A row carrying only its number used to raise a raw KeyError: exit 1, which
+# _sync_gh reads as a non-fatal transport failure (wv-1d88c3).
+run_refusal "malformed row" "1" '[{"number":1}]' "row 0 is malformed"
+# Count 2, then #3 is created: [#3, #2] matches the stale count with #1
+# missing; the count read after listing exposes it (wv-1d88c3).
+run_refusal "count race" "2 3" "[$(issue_row 3),$(issue_row 2)]" "counted 2 before listing and 3 after"
+# A negative count let an empty listing pass as complete (wv-e869e3).
+GH_SERVED="api graphql" run_refusal "negative count" "-1" "[]" "is negative: -1"
+
+# Node-side contract faults and the membership lookup need graph state: a
+# mapped gh_issue on the test node.
+# gh_issue true was coerced to #1, so the sync acted on the wrong issue.
+"$WV" update "$integrity_node" --metadata '{"gh_issue":true}' >/dev/null 2>&1
+run_refusal "gh_issue true" "1" "[$(issue_row 1)]" "gh_issue is True"
+# Equal counts with a swapped member: #9 is mapped, the list omits it, and it
+# exists. Phase 1 would have created a replacement issue.
+"$WV" update "$integrity_node" --metadata '{"gh_issue":9}' >/dev/null 2>&1
+run_refusal "omitted mapped issue" "1" "[$(issue_row 1)]" "exists in owner/repo but the issue list omitted it" \
+    '{"url":"https://github.com/owner/repo/issues/9"}'
+assert_contains "$(cat "$gh_calls")" "issue view 9" "real weave_gh, omitted mapped issue: #9 was looked up"
+"$WV" update "$integrity_node" --remove-key=gh_issue >/dev/null 2>&1
 
 # ─── Journal wrapping in cmd_delete ─────────────────────────────────────
 
@@ -304,7 +454,7 @@ node_id=$("$WV" add "ship crash test" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
 journal_begin "ship" "{\"id\":\"$node_id\",\"gh\":false}"
 journal_step 1 "done"
 # Actually do the done
-"$WV" done "$node_id" >/dev/null 2>&1
+"$WV" "done" "$node_id" >/dev/null 2>&1
 journal_complete 1
 journal_step 2 "sync"
 # CRASH HERE — sync never completed
@@ -360,7 +510,7 @@ assert_fails "markerless target-state race does not poison recovery" journal_has
 # Invalid ship targets are rejected before any marker or journal is created.
 setup_test_env
 node_id=$("$WV" add "already completed ship target" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
-"$WV" done "$node_id" --skip-verification >/dev/null 2>&1
+"$WV" "done" "$node_id" --skip-verification >/dev/null 2>&1
 ship_rc=0
 "$WV" ship "$node_id" --skip-verification --no-gh >/dev/null 2>&1 || ship_rc=$?
 assert_equals "1" "$ship_rc" "ship rejects an already-done node before protocol start"
@@ -567,11 +717,11 @@ setup_test_env
 
 seed_id=$("$WV" add "seed pending-close learning" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
 overlap_learning="decision: keep overlap prompts resumable | pattern: store pending close state | pitfall: tty prompts hang unattended flows"
-WV_REQUIRE_LEARNING=1 "$WV" done "$seed_id" --learning="$overlap_learning" >/dev/null 2>&1
+WV_REQUIRE_LEARNING=1 "$WV" "done" "$seed_id" --learning="$overlap_learning" >/dev/null 2>&1
 
 node_id=$("$WV" add "pending close test" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
 pending_close_exit=0
-WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" done "$node_id" --learning="$overlap_learning" >/dev/null 2>&1 || pending_close_exit=$?
+WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" "done" "$node_id" --learning="$overlap_learning" >/dev/null 2>&1 || pending_close_exit=$?
 assert_equals "0" "$pending_close_exit" "done succeeds non-interactively when overlap detected (advisory only)"
 
 # Recovery of legacy pending_close nodes (nodes stuck under old blocking behavior)

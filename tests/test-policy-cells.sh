@@ -11,6 +11,7 @@ export WV_CALL_SOURCE=test
 # journals. Each cell asserts on the verdicts of its own call only: the journal
 # lines that call appended, bound to that call's call_started.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WV="$ROOT/scripts/wv"
 run=0; pass=0
@@ -179,6 +180,7 @@ shrink() {  # shrink [env...] -- sync against the full committed state.sql
     in_repo "$S" env "$@" "$WV" sync
 }
 cell "a sync that would shrink the committed graph is denied" sync_shrink_floor deny - shrink WV_CELLS=1
+# shellcheck disable=SC2016  # $1/$2 expand in the bash -c child, passed as positional arguments
 cell "--force records the shrink" sync_shrink_floor allow --force \
     bash -c 'cp "$1" "$2/.weave/state.sql"; cd "$2" && WEAVE_DIR="$2/.weave" WV_HOT_ZONE="$2/hot" WV_CONFIG_DIR="$2/config" "$3" sync --force' _ "$TMP/full-state.sql" "$S" "$WV"
 cell "WV_FORCE_SYNC=1 records the shrink" sync_shrink_floor allow WV_FORCE_SYNC=1 shrink WV_FORCE_SYNC=1

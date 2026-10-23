@@ -1,174 +1,25 @@
 #!/bin/bash
-# Stop hook: session-end guard.
+# Stop hook: Claude Code adapter for the session-end guard. The guard is
+# wv_stop_guard in scripts/lib/wv-lifecycle-end.sh; Codex reaches the same guard
+# through wv hook dispatch --event=Stop --format=host (wv-25903d). It runs
+# in-process here rather than through wv, which would add a wv start to every
+# response.
 #
-# Hard block:
-#   Active node exists → genuine in-flight work
-#
-# Soft warn (does not block):
-#   Uncommitted changes, unpushed commits, unsaved weave state
-#
-# No network calls — wv sync / git push run in session-end-sync or manually.
-# Auto-push was removed (wv-52bf05): wv sync --gh has no timeout, causing
-# indefinite stalls on every response when network is slow.
-
-set -e
+# Hard block: an active node claimed by this agent, as {"decision":"block"}
+# with exit 0. Soft warn on stderr: uncommitted changes, unpushed commits,
+# unsaved weave state. No network calls.
 
 INPUT=$(cat)
-STOP_HOOK_ACTIVE=$(echo "$INPUT" | jq -r '.stop_hook_active // false')
-
-# Prevent infinite loops
-if [ "$STOP_HOOK_ACTIVE" = "true" ]; then
-    exit 0
-fi
-
-# Resolve project directory
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-# shellcheck disable=SC1091
-source "$HOOK_DIR/../lib/wv-resolve-project.sh" 2>/dev/null \
-    || source "$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh" 2>/dev/null \
-    || source "${HOME}/.config/weave/lib/wv-resolve-project.sh" 2>/dev/null \
-    || exit 0
-source "$HOOK_DIR/../lib/wv-hook-common.sh" 2>/dev/null \
-    || source "$HOOK_DIR/../../scripts/lib/wv-hook-common.sh" 2>/dev/null \
-    || source "${HOME}/.config/weave/lib/wv-hook-common.sh" 2>/dev/null \
-    || true
-_hc_refresh
-cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
-
-# Record every Stop and how it ended (wv-4efe06): "blocked" when this hook
-# refuses the stop (exit 1), else "stopped". Session start reads it with the
-# pre-action heartbeat to tell a crash from a blocked exit from a clean stop
-# that skipped SessionEnd. An EXIT trap covers the many early exits below.
-_sc_record_stop() {
-    local rc=$?
-    [ -d "${_HC_HOT_ZONE:-}" ] && printf '%s %s\n' "$(date +%s)" \
-        "$([ "$rc" -eq 1 ] && echo blocked || echo stopped)" > "${_HC_HOT_ZONE}/.session_laststop" 2>/dev/null
-    return "$rc"
-}
-trap _sc_record_stop EXIT
-
-# Cooldown lock: after emitting a block, suppress re-blocking for 120s.
-# The dirty-state checks still run; only the hard block (exit 1) is suppressed.
-# This lets the agent make progress on sync commands without being blocked on
-# every response, while still enforcing a clean state after cooldown expires.
-_SC_HOT_ZONE="${_HC_HOT_ZONE}"
-_SC_LOCK="${_SC_HOT_ZONE}/.stop_check_lock"
-_SC_IN_COOLDOWN=false
-if [ -f "$_SC_LOCK" ]; then
-    _sc_lock_ts=$(cat "$_SC_LOCK" 2>/dev/null || echo 0)
-    _sc_now=$(date +%s)
-    if [ $((_sc_now - _sc_lock_ts)) -lt 120 ]; then
-        _SC_IN_COOLDOWN=true
-    fi
-fi
-
-# Warn on active nodes that haven't been updated recently (crash/abandon signal).
-# Nodes active for >30 min with no update suggest a crashed or abandoned session.
-if [ -x "${WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
-    _WV="${WV:-wv}"
-    # Use `list --status=active --json` (db_query_json) — it carries updated_at;
-    # `query --format=json` (json-v2) strips timestamps for leanness. Active-node
-    # count is tiny in practice, so the list default cap is not a concern here.
-    IDLE_NODES=$("$_WV" list --status=active --json 2>/dev/null | jq -r --argjson cutoff "$(date -d '30 minutes ago' +%s 2>/dev/null || date -v-30M +%s 2>/dev/null || echo 0)" \
-        '.[] | select(.updated_at != null) | select((.updated_at | strptime("%Y-%m-%d %H:%M:%S") | mktime) < $cutoff) | "  \(.id): \(.text[:60])"' 2>/dev/null || true)
-    if [ -n "$IDLE_NODES" ]; then
-        echo "Note: active node(s) with no update in >30 min — possible abandoned work:" >&2
-        echo "$IDLE_NODES" >&2
-        echo "  Close with: wv done <id> --skip-verification" >&2
-    fi
-fi
-
-# Check for uncommitted changes (exclude .weave/ — infrastructure files
-# auto-committed by auto_checkpoint/session-end-sync, not user work)
-UNCOMMITTED=$(git status --porcelain 2>/dev/null | grep -vc '\.weave/' || true)
-
-if [ "$UNCOMMITTED" -gt 0 ]; then
-    # Soft warning: stderr message + exit 0 (does not block)
-    echo "Note: $UNCOMMITTED uncommitted change(s). Commit and push before ending your session." >&2
-    exit 0
-fi
-
-# Check for dirty .weave/ state (sync not yet run — breadcrumbs/nodes still local).
-# Exclude .weave/deltas/ — delta files are auto-committed by auto_checkpoint and
-# should not trigger the weave-dirty warning on every response.
-WEAVE_DIRTY=$(git status --porcelain 2>/dev/null | grep '\.weave/' | grep -vc '\.weave/deltas/' || true)
-# Check if we're ahead of origin
-# shellcheck disable=SC1083  # @{u} is a git refspec, not a literal brace
-AHEAD=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
-
-# Soft warn on unsaved weave state (does not block — auto-checkpoint handles this)
-if [ "$WEAVE_DIRTY" -gt 0 ] && [ "$AHEAD" -eq 0 ]; then
-    # If an earlier sync was interrupted, .weave/repair-checkpoint.json exists;
-    # recommend --mode=repair so the resume picks up from the last node.
-    if [ -f .weave/repair-checkpoint.json ]; then
-        echo "Note: unsaved weave state and prior sync interrupted. Run: wv sync --gh --mode=repair && git add .weave/ && git commit -m 'chore(weave): sync state [skip ci]' && git push" >&2
-    else
-        echo "Note: unsaved weave state. Run: wv sync --gh && git add .weave/ && git commit -m 'chore(weave): sync state [skip ci]' && git push" >&2
-    fi
-    exit 0
-fi
-
-# Check for active nodes claimed by THIS agent — genuine in-flight work, hard
-# block regardless. Scoped by claimed_by, not a raw global count: a sandboxed
-# Claude Code session and a sandboxed Codex session on the same repo share one
-# hot zone (wv-86ea58), so an active node claimed by a DIFFERENT agent is that
-# agent's in-flight work, not this session's, and must not block this session
-# from ending. Unclaimed nodes still count (defensive default).
-if [ -x "${_WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
-    _WV="${_WV:-wv}"
-    _SC_SELF=""
-    if command -v resolve_agent_id >/dev/null 2>&1; then
-        _SC_SELF=$(resolve_agent_id 2>/dev/null || echo "")
-    fi
-    if [ -n "$_SC_SELF" ]; then
-        ACTIVE_COUNT=$("$_WV" query status=active --format=json 2>/dev/null \
-            | jq --arg me "$_SC_SELF" '[.[] | select((.metadata.claimed_by // $me) == $me)] | length' 2>/dev/null || echo "0")
-    else
-        # Agent identity unavailable — fall back to the pre-fix global count.
-        ACTIVE_COUNT=$("$_WV" query status=active --format=json 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
-    fi
-    if [ "$ACTIVE_COUNT" -gt 0 ]; then
-        if [ "$_SC_IN_COOLDOWN" = true ]; then
-            echo "Note: $ACTIVE_COUNT active node(s) — close with wv done before ending session (cooldown active)." >&2
-            exit 0
-        fi
-        mkdir -p "$_SC_HOT_ZONE" 2>/dev/null || true
-        date +%s > "$_SC_LOCK" 2>/dev/null || true
-        # wv-664b7f: hook-common loads the observer; a Stop decision says so.
-        _HC_HOOK_EVENT=Stop
-        declare -F _hc_observe >/dev/null && _hc_observe session_end_requires_no_active_node deny
-        cat << EOF
-{
-    "decision": "block",
-    "reason": "$ACTIVE_COUNT active node(s) still open — close with: wv done <id> --learning=\"...\" before ending session"
-}
-EOF
-        exit 1
-    fi
-fi
-
-# Unpushed commits — soft warn only, no network calls in hook
-if [ "$AHEAD" -gt 0 ]; then
-    if [ "$WEAVE_DIRTY" -gt 0 ]; then
-        echo "Note: $AHEAD unpushed commit(s) + unsaved weave state. Run: /close-session (or wv sync --gh && git add .weave/ && git commit && git push)" >&2
-    else
-        echo "Note: $AHEAD unpushed commit(s). Run: git push (or /close-session)" >&2
-    fi
-    exit 0
-fi
-
-# Retro: surface call-stats if session analysis is enabled and a log exists
-if [ -x "${_WV:-wv}" ] || command -v wv >/dev/null 2>&1; then
-    _WV="${_WV:-wv}"
-    _CALL_STATS=$("$_WV" analyze sessions --call-stats --top=3 --since-days=1 --json 2>/dev/null || true)
-    if echo "$_CALL_STATS" | jq -e '.call_stats | length > 0' >/dev/null 2>&1; then
-        _TOP_CMD=$(echo "$_CALL_STATS" | jq -r '.call_stats[0] | "\(.cmd) (\(.calls) calls, ~\(.approx_tokens|tostring) tok)"' 2>/dev/null || true)
-        if [ -n "$_TOP_CMD" ]; then
-            echo "Retro: top command today: $_TOP_CMD. Full report: wv analyze sessions --call-stats --since-days=1" >&2
-        fi
-    fi
-fi
-
-# State is clean — clear any stale cooldown lock so the next session isn't skipped
-rm -f "$_SC_LOCK" 2>/dev/null || true
-exit 0
+# The directory without forking: this runs after every response.
+HOOK_DIR="${BASH_SOURCE[0]:-$0}"
+case "$HOOK_DIR" in */*) HOOK_DIR="${HOOK_DIR%/*}" ;; *) HOOK_DIR=. ;; esac
+# Nearest copy first; a copy that fails to load falls through to the next.
+for _le_dir in "$HOOK_DIR/../lib" "$HOOK_DIR/../../scripts/lib" "${HOME}/.config/weave/lib"; do
+    [ -r "$_le_dir/wv-lifecycle-end.sh" ] || continue
+    # shellcheck source=/dev/null
+    . "$_le_dir/wv-lifecycle-end.sh" 2>/dev/null && declare -F wv_stop_guard >/dev/null && break
+    unset _WV_LIFECYCLE_END_LOADED
+done
+declare -F wv_stop_guard >/dev/null || exit 0
+wv_stop_guard "$INPUT"
+exit $?

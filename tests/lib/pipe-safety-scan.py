@@ -27,6 +27,8 @@ last stage's own status and the bug cannot occur.
 import os
 import re
 import sys
+from pathlib import Path
+from collections.abc import Iterator
 
 PIPEFAIL = re.compile(r'set\s+-[a-zA-Z]*o\s+pipefail|set\s+-o\s+pipefail')
 SHEBANG = re.compile(rb'^#!.*\b(?:ba|da|k|z)?sh\b')
@@ -45,7 +47,7 @@ EARLY_EXIT = (
 )
 
 
-def logical_lines(path):
+def logical_lines(path: str) -> Iterator[tuple[int, str]]:
     """Yield (first_physical_line, joined_line).
 
     A trailing backslash continues the line, and so does a trailing single `|`:
@@ -53,8 +55,9 @@ def logical_lines(path):
     Joining only backslashes left every two-line early-exit pipeline unscanned,
     and one of them flaked the pre-push gate (wv-29452e).
     """
-    buf, start = "", None
-    with open(path, errors='replace') as fh:
+    buf = ""
+    start: int | None = None
+    with open(path, encoding='utf-8', errors='replace') as fh:
         for n, raw in enumerate(fh, 1):
             line = raw.rstrip('\n')
             if start is None:
@@ -72,13 +75,16 @@ def logical_lines(path):
         yield start or 1, buf
 
 
-def split_top_level(text, seps):
+def split_top_level(text: str, seps: tuple[str, ...]) -> list[str]:
     """Split on `seps` that are outside quotes, parens and braces.
 
     Segmenting on a bare `;` cut sed -n '1p;q' in half, so the q command landed
     in its own fragment and the stage stopped looking like sed at all.
     """
-    out, buf, quote, depth = [], "", None, 0
+    out: list[str] = []
+    buf = ""
+    quote: str | None = None
+    depth = 0
     i = 0
     while i < len(text):
         ch = text[i]
@@ -110,13 +116,16 @@ def split_top_level(text, seps):
     return out
 
 
-def split_pipeline(text):
+def split_pipeline(text: str) -> list[str]:
     """Top-level pipeline stages, honouring quotes, parens and ||.
 
     A `|` inside 'a|b', inside $( ), or doubled as || is not a stage boundary.
     Splitting naively cut grep -E 'x|y' in half and invented stages.
     """
-    stages, buf, quote, depth = [], "", None, 0
+    stages: list[str] = []
+    buf = ""
+    quote: str | None = None
+    depth = 0
     i = 0
     while i < len(text):
         ch = text[i]
@@ -149,14 +158,14 @@ def split_pipeline(text):
     return [s.strip() for s in stages]
 
 
-def strip_comment(text):
+def strip_comment(text: str) -> str:
     """Drop a trailing # comment that is not inside quotes.
 
     Without this the scanner read prose. `producer | sed 's/a/b/'  # no q
     command` matched the sed-with-q rule on the word "q" in the comment --
     a false positive produced by the scanner's own fixture.
     """
-    quote = None
+    quote: str | None = None
     for i, ch in enumerate(text):
         if quote:
             if ch == quote:
@@ -168,7 +177,7 @@ def strip_comment(text):
     return text
 
 
-def substitution_bodies(text):
+def substitution_bodies(text: str) -> list[str]:
     """The bodies of every $( ) in text, nested ones included; not $(( )).
 
     split_pipeline treats a $( ) as one opaque stage, which is right for the
@@ -177,7 +186,8 @@ def substitution_bodies(text):
     status pipefail corrupts. It hid a real instance (found 2026-09-26 while
     widening the ultrareview fixes).
     """
-    out, i = [], 0
+    out: list[str] = []
+    i = 0
     while True:
         j = text.find('$(', i)
         if j < 0:
@@ -185,7 +195,8 @@ def substitution_bodies(text):
         if text.startswith('$((', j):
             i = j + 3
             continue
-        k, depth, quote = j + 2, 1, None
+        k, depth = j + 2, 1
+        quote: str | None = None
         while k < len(text) and depth:
             ch = text[k]
             if quote:
@@ -205,15 +216,15 @@ def substitution_bodies(text):
         i = j + 2
 
 
-def unsafe_stage(stage):
+def unsafe_stage(stage: str) -> bool:
     return any(p.search(stage) for p in EARLY_EXIT)
 
 
-def scan_file(path):
-    text = open(path, errors='replace').read()
+def scan_file(path: str) -> list[tuple[int, str]]:
+    text = Path(path).read_text(encoding='utf-8', errors='replace')
     if not PIPEFAIL.search(text):
         return []
-    hits = []
+    hits: list[tuple[int, str]] = []
     for n, line in logical_lines(path):
         stripped = line.strip()
         if stripped.startswith('#') or '|' not in stripped:
@@ -239,7 +250,7 @@ def scan_file(path):
     return hits
 
 
-def is_shell(path):
+def is_shell(path: str) -> bool:
     if path.endswith('.sh'):
         return True
     if '.' in os.path.basename(path):
@@ -251,8 +262,8 @@ def is_shell(path):
         return False
 
 
-def scan(roots):
-    files = []
+def scan(roots: list[str]) -> list[tuple[str, int, str]]:
+    files: list[str] = []
     for r in roots:
         if os.path.isfile(r):
             files.append(r)
@@ -265,16 +276,21 @@ def scan(roots):
                 p = os.path.join(d, f)
                 if is_shell(p):
                     files.append(p)
-    out = []
+    out: list[tuple[str, int, str]] = []
     for f in sorted(set(files)):
         for n, pipeline in scan_file(f):
             out.append((f, n, pipeline))
     return out
 
 
-if __name__ == '__main__':
-    hits = scan(sys.argv[1:])
-    for f, i, h in hits:
-        print(f"{f}:{i}: {h[:120]}")
+def main(argv: list[str]) -> int:
+    """Report every hit in the given paths; exit 1 if there are any."""
+    hits = scan(argv)
+    for path, line, text in hits:
+        print(f"{path}:{line}: {text[:120]}")
     print(f"--- {len(hits)} early-exit pipeline(s) under pipefail")
-    sys.exit(1 if hits else 0)
+    return 1 if hits else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

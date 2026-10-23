@@ -22,6 +22,7 @@ export WV_CALL_SOURCE=test
 #   1 - Unexpected failure
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -165,7 +166,7 @@ test_hot_zone_path_matches_wv() {
         TESTS_XFAIL=$((TESTS_XFAIL + 1))
         return
     }
-    # Canonical resolver path (runtime-aware: /dev/shm on native, /tmp on codex/container)
+    # Canonical resolver path (the zone holding the repo's DB, else /tmp; wv-b831e3)
     local wv_zone
     wv_zone=$(bash -c "
         export WV_PROJECT_DIR='$TEST_DIR'
@@ -204,21 +205,26 @@ test_default_phase_when_file_missing() {
 }
 
 test_codex_zone_followed_without_env_signal() {
-    echo "-- resolve_hot_zone follows an existing codex zone even without env signal (wv-d6af2f)"
+    echo "-- resolve_hot_zone follows an existing legacy /tmp zone even without env signal (wv-d6af2f)"
     local uid; uid=$(id -u)
     local codex_dir="/tmp/weave-codex-${uid}"
     local created=0
     [ -d "$codex_dir" ] || { mkdir -p "$codex_dir" && created=1; }
     # Scrub every codex env signal to mimic a harness-spawned hook process.
     local zone
-    zone=$(env -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+    zone=$(env -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
                -u WV_HOT_ZONE -u WV_DB bash -c "
         source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh' 2>/dev/null
         resolve_hot_zone
     " 2>/dev/null || echo "")
     # Only remove the dir if this test created it; rmdir is a no-op on a live (non-empty) zone.
     [ "$created" = "1" ] && rmdir "$codex_dir" 2>/dev/null
-    assert_equals "$codex_dir" "$zone" "hook-context resolve_hot_zone follows existing codex zone via filesystem signal"
+    # By either of the /tmp zone's names: the neutral one once this host has
+    # the alias (wv-95bddf); tests/test-hot-zone-placement.sh pins which.
+    case "$zone" in
+        "/tmp/weave-hotzone-${uid}") zone="$codex_dir" ;;
+    esac
+    assert_equals "$codex_dir" "$zone" "hook-context resolve_hot_zone follows the existing legacy /tmp zone via filesystem signal"
 }
 
 test_db_preflight_graceful_when_missing() {
@@ -246,7 +252,18 @@ test_all_hooks_source_common() {
             TESTS_XFAIL=$((TESTS_XFAIL + 1))
             continue
         fi
-        if grep -q "wv-hook-common" "$hook_path" 2>/dev/null; then
+        # Code, not comments: an adapter that only mentions the library in a
+        # comment would pass vacuously. A PreToolUse, PostToolUse or Stop
+        # adapter loads it through the guard library it sources (wv-d3fbcb,
+        # wv-594381, wv-25903d), so read that too.
+        local code guard_lib
+        code=$(grep -v '^[[:space:]]*#' "$hook_path" 2>/dev/null)
+        for guard_lib in wv-pre-tool-use wv-post-tool-use wv-lifecycle-end; do
+            if grep -qF -- "$guard_lib.sh" <<<"$code"; then
+                code+=$'\n'$(grep -v '^[[:space:]]*#' "$PROJECT_ROOT/scripts/lib/$guard_lib.sh" 2>/dev/null)
+            fi
+        done
+        if grep -q "wv-hook-common" <<<"$code"; then
             echo -e "  ${GREEN}[PASS]${NC} $hook_rel sources wv-hook-common"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
@@ -312,6 +329,7 @@ test_pre_action_resolves_installed_libs() {
        "$PROJECT_ROOT"/scripts/lib/wv-config.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-hook-common.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-resolve-runtime.sh \
+       "$PROJECT_ROOT"/scripts/lib/wv-pre-tool-use.sh \
        "$fake_home/.config/weave/lib/" 2>/dev/null
     cp "$PROJECT_ROOT/.claude/hooks/pre-action.sh" "$sandbox/elsewhere/pre-action.sh"
 
@@ -319,8 +337,8 @@ test_pre_action_resolves_installed_libs() {
     # verdict comes from _hc_classify_tool + _hc_check_payload, so a hook that
     # failed to source them could not produce it.
     set +e
-    echo '{"tool_input":{"file_path":"x.py"}}' \
-        | env HOME="$fake_home" bash "$sandbox/elsewhere/pre-action.sh" >/dev/null 2>&1
+    env HOME="$fake_home" bash "$sandbox/elsewhere/pre-action.sh" \
+        < <(echo '{"tool_input":{"file_path":"x.py"}}') >/dev/null 2>&1
     rc=$?
     set -e
     rm -rf "$sandbox"
@@ -352,8 +370,12 @@ test_pre_action_falls_through_broken_library() {
        "$PROJECT_ROOT"/scripts/lib/wv-config.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-hook-common.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-resolve-runtime.sh \
+       "$PROJECT_ROOT"/scripts/lib/wv-pre-tool-use.sh \
        "$fake_home/.config/weave/lib/" 2>/dev/null
     cp "$PROJECT_ROOT/.claude/hooks/pre-action.sh" "$sandbox/hooks/pre-action.sh"
+    # The guard library sits beside the broken copy, so the search the guard
+    # makes for its own libraries (wv-pre-tool-use.sh) meets the broken one first.
+    cp "$PROJECT_ROOT/scripts/lib/wv-pre-tool-use.sh" "$sandbox/lib/"
     # Nearest candidate ($HOOK_DIR/../lib): readable, and broken in the way the
     # caller asks for. "syntax" dies before running anything; "guard" is the
     # nastier one — it sets the library's own double-source guard and THEN fails,
@@ -365,8 +387,8 @@ test_pre_action_falls_through_broken_library() {
     esac
 
     set +e
-    echo '{"tool_input":{"file_path":"x.py"}}' \
-        | env HOME="$fake_home" bash "$sandbox/hooks/pre-action.sh" >/dev/null 2>&1
+    env HOME="$fake_home" bash "$sandbox/hooks/pre-action.sh" \
+        < <(echo '{"tool_input":{"file_path":"x.py"}}') >/dev/null 2>&1
     rc=$?
     set -e
     rm -rf "$sandbox"

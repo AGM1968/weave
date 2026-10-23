@@ -9,6 +9,7 @@
 #   - resources removed from a contract are reconciled out of the skill dir
 #   - validate-before-mutate: unsafe paths / collisions / bad adapters rejected
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GEN="$ROOT/scripts/gen-procedures.sh"

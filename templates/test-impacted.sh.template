@@ -13,7 +13,7 @@
 # with no staged sources. The test tree must mirror the source tree by DIRECTORY
 # (filenames need not match — e.g. sampling/transect.py -> test_transect_sampler.py).
 #
-# Origin: earth-engine-analysis test-bed (wv-f67f6f) — full unit suite 6.2s/1385
+# Origin: a consumer test-bed (wv-f67f6f) — full unit suite 6.2s/1385
 # tests -> ~1.1s for a single-directory change. Orthogonal to the test-map
 # glob/prefix support (wv-d74631, mapping terseness) and impact suite selection
 # (wv-7dd6a5): this scopes the runner WITHIN a selected suite.

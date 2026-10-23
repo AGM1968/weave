@@ -16,6 +16,7 @@ export WV_CALL_SOURCE=test
 # Exit codes: 0 all checks pass, 1 otherwise.
 
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -27,10 +28,11 @@ TESTS_RUN=0; TESTS_PASSED=0; TESTS_FAILED=0
 pass() { TESTS_RUN=$((TESTS_RUN+1)); TESTS_PASSED=$((TESTS_PASSED+1)); echo -e "  ${GREEN}✓${NC} $1"; }
 fail() { TESTS_RUN=$((TESTS_RUN+1)); TESTS_FAILED=$((TESTS_FAILED+1)); echo -e "  ${RED}✗${NC} $1"; [ -n "${2:-}" ] && echo "    $2"; }
 
-# Production sources: everything shipped, excluding the suite itself.
+# Production sources: everything shipped, excluding the suite itself, and the
+# release builder, whose seams can skip a release gate (wv-cfa8ee).
 scan_production() {
     grep -rho "WV_TEST_[A-Z0-9_]*" \
-        "$REPO_ROOT/scripts" "$REPO_ROOT/install.sh" 2>/dev/null \
+        "$REPO_ROOT/scripts" "$REPO_ROOT/install.sh" "$REPO_ROOT/build-release.sh" 2>/dev/null \
         | sort -u
 }
 

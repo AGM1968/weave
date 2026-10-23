@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from typing import Any
 from collections.abc import Generator
 from pathlib import Path
+from typing_extensions import override
 
 import pytest
 
@@ -56,6 +58,7 @@ from weave_quality.db import (
     upsert_complexity_trend,
     upsert_file_entry,
     upsert_git_stats,
+    worktree_drift,
 )
 from weave_quality.models import (
     CKMetrics,
@@ -71,6 +74,12 @@ from weave_quality.models import (
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+def _adjudication_report(db: sqlite3.Connection, path_prefix: str | None = None) -> dict[str, Any]:
+    """pattern_adjudication_report, read as the JSON document it is: the
+    function returns dict[str, object], which these assertions index into."""
+    return pattern_adjudication_report(db, path_prefix=path_prefix)
+
 
 
 @pytest.fixture()
@@ -367,6 +376,53 @@ class TestFileState:
         )
         assert file_changed(db, "a.py", 100, "") is False
         assert file_changed(db, "a.py", 200, "") is True
+
+    def test_file_changed_blob_beats_matching_mtime(self, db: sqlite3.Connection) -> None:
+        # wv-fe9a6a: a row stored without a blob (an untracked file before they
+        # were hashed) is changed once a blob exists, even at the same mtime.
+        bulk_upsert_file_state(db, [FileState(path="a.py", mtime=100, git_blob="")])
+        assert file_changed(db, "a.py", 100, "aaa") is True
+
+
+# ---------------------------------------------------------------------------
+# Worktree drift (wv-fe9a6a)
+# ---------------------------------------------------------------------------
+
+
+class TestWorktreeDrift:
+    def test_classifies_changed_unscanned_deleted(
+        self, db: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        for name in ("same.py", "edited.py", "new.py", "nohash.py"):
+            (tmp_path / name).write_text("x = 1\n")
+        bulk_upsert_file_state(
+            db,
+            [
+                FileState(path="same.py", git_blob="s1"),
+                FileState(path="edited.py", git_blob="e1"),
+                FileState(path="nohash.py", git_blob="n1"),
+            ],
+        )
+        drift = worktree_drift(
+            db,
+            tmp_path,
+            ["same.py", "edited.py", "new.py", "nohash.py"],
+            {"same.py": "s1", "edited.py": "e2", "new.py": "w1"},
+            scanned=["same.py", "gone.py"],
+        )
+        assert drift == {
+            "changed": ["edited.py", "nohash.py"],
+            "unscanned": ["new.py"],
+            "deleted": ["gone.py"],
+        }
+
+    def test_staleness_info_reports_drift_at_head(self, db: sqlite3.Connection) -> None:
+        begin_scan(db, "abc123")
+        assert staleness_info(db, "abc123", {"changed": [], "unscanned": []})["stale"] is False
+        info = staleness_info(db, "abc123", {"changed": ["a.py"], "unscanned": []})
+        assert info["stale"] is True
+        assert info["reason"] == "worktree_changed"
+        assert info["changed"] == ["a.py"]
 
 
 # ---------------------------------------------------------------------------
@@ -1283,7 +1339,7 @@ class TestSchemaV9:
             ("qf-stable",),
         ).fetchall()
         assert [tuple(row) for row in history] == [("waived", "accepted wording")]
-        report = pattern_adjudication_report(db)
+        report = _adjudication_report(db)
         assert report["by_rule"]["prose-test"]["decided_precision"] == 1.0
         assert report["by_rule"]["prose-test"]["actionable_rate"] == 0.0
         assert report["by_rule"]["prose-test"]["decided_count"] == 1
@@ -1422,14 +1478,14 @@ class TestSchemaV9:
             finding.scan_id = sid
             replace_pattern_scan_results(db, sid, [finding], [run])
 
-        below_threshold = pattern_adjudication_report(db)
+        below_threshold = _adjudication_report(db)
         assert below_threshold["by_rule"]["prose-test"]["needs_adjudication"] is False
 
         sid = begin_pattern_run(db, "aaa", ".")
         finding.scan_id = sid
         replace_pattern_scan_results(db, sid, [finding], [run])
 
-        at_threshold = pattern_adjudication_report(db)
+        at_threshold = _adjudication_report(db)
         summary = at_threshold["by_rule"]["prose-test"]
         assert summary["max_scan_count"] == ADJUDICATION_NUDGE_SCANS
         assert summary["needs_adjudication"] is True
@@ -1437,7 +1493,7 @@ class TestSchemaV9:
         # A single disposition silences the nudge even though scan_count
         # keeps climbing -- there's human signal now.
         adjudicate_pattern_finding(db, "qf-unresolved", "waived")
-        decided = pattern_adjudication_report(db)
+        decided = _adjudication_report(db)
         assert decided["by_rule"]["prose-test"]["needs_adjudication"] is False
 
     def test_adjudication_report_scopes_by_path_prefix(
@@ -1466,20 +1522,20 @@ class TestSchemaV9:
         adjudicate_pattern_finding(db, "qf-docs", "accepted_defect")
         adjudicate_pattern_finding(db, "qf-scripts", "false_positive")
 
-        unscoped = pattern_adjudication_report(db)
+        unscoped = _adjudication_report(db)
         assert unscoped["by_rule"]["prose-test"]["decided_count"] == 2
 
-        scoped = pattern_adjudication_report(db, path_prefix="docs")
+        scoped = _adjudication_report(db, path_prefix="docs")
         assert scoped["by_rule"]["prose-test"]["decided_count"] == 1
         assert scoped["by_rule"]["prose-test"]["decided_precision"] == 1.0
         assert scoped["by_rule"]["prose-test"]["actionable_rate"] == 1.0
 
-        exact_file_scope = pattern_adjudication_report(db, path_prefix="docs/a.md")
+        exact_file_scope = _adjudication_report(db, path_prefix="docs/a.md")
         assert exact_file_scope["by_rule"]["prose-test"]["decided_count"] == 1
 
         # A prefix that only shares characters (not a path segment) must not match --
         # "doc" should not pull in "docs/a.md".
-        near_miss = pattern_adjudication_report(db, path_prefix="doc")
+        near_miss = _adjudication_report(db, path_prefix="doc")
         assert not near_miss["by_rule"]
 
     def test_replacement_reconciles_disappeared_occurrence_without_losing_disposition(
@@ -1503,7 +1559,7 @@ class TestSchemaV9:
         assert absent["first_seen_scan_id"] is None
         assert absent["last_seen_scan_id"] is None
         assert absent["disposition"] == "waived"
-        assert pattern_adjudication_report(db)["finding_count"] == 0
+        assert _adjudication_report(db)["finding_count"] == 0
 
         sid2 = begin_pattern_run(db, "bbb", ".")
         finding.scan_id = sid2
@@ -1511,7 +1567,7 @@ class TestSchemaV9:
         reappeared = pattern_finding_states(db, [finding.finding_key])[0]
         assert reappeared["scan_count"] == 1
         assert reappeared["disposition"] == "waived"
-        assert not pattern_adjudication_report(db)["recurring_waivers"]
+        assert not _adjudication_report(db)["recurring_waivers"]
 
     def test_new_completed_rescan_excludes_disappeared_key_from_precision(
         self, db: sqlite3.Connection
@@ -1530,7 +1586,7 @@ class TestSchemaV9:
         assert adjudicate_pattern_finding(
             db, finding.finding_key, "false_positive"
         ) is not None
-        assert pattern_adjudication_report(db)["by_rule"]["prose-test"][
+        assert _adjudication_report(db)["by_rule"]["prose-test"][
             "decided_precision"
         ] == 0.0
 
@@ -1538,9 +1594,14 @@ class TestSchemaV9:
         replace_pattern_scan_results(db, second_scan, [], [])
         finish_pattern_run(db, second_scan, files_count=0, duration_ms=1)
 
-        report = pattern_adjudication_report(db)
+        report = _adjudication_report(db)
         assert report["finding_count"] == 0
-        assert not report["by_rule"]
+        # Out of the precision denominator, still a durable disposition.
+        summary = report["by_rule"]["prose-test"]
+        assert summary["decided_count"] == 0
+        assert summary["decided_precision"] is None
+        assert summary["durable_decided_count"] == 1
+        assert summary["actionable_rate"] == 0.0
         dormant = pattern_finding_states(db, [finding.finding_key])[0]
         assert dormant["disposition"] == "false_positive"
         assert dormant["scan_count"] == 1
@@ -1550,13 +1611,100 @@ class TestSchemaV9:
         replace_pattern_scan_results(db, third_scan, [finding], [])
         finish_pattern_run(db, third_scan, files_count=1, duration_ms=1)
 
-        reappeared = pattern_adjudication_report(db)
+        reappeared = _adjudication_report(db)
         summary = reappeared["by_rule"]["prose-test"]
         assert summary["decided_count"] == 1
         assert summary["decided_precision"] == 0.0
         state = pattern_finding_states(db, [finding.finding_key])[0]
         assert state["disposition"] == "false_positive"
         assert state["scan_count"] == 2
+
+    def test_repaired_accepted_defect_counts_toward_actionable_rate_only(
+        self, db: sqlite3.Connection
+    ) -> None:
+        # wv-7d2857: repairing an accepted_defect must not remove it from its
+        # own actionable_rate numerator. decided_precision stays scoped to the
+        # current scan, so the repaired finding leaves that denominator.
+        sid = begin_pattern_run(db, "aaa", "docs")
+        repaired = PatternFinding(
+            path="docs/a.md",
+            scan_id=sid,
+            rule_id="prose-test",
+            finding_key="qf-repaired",
+            match_text="actually",
+            context_text="This is actually verified.",
+        )
+        kept = PatternFinding(
+            path="docs/b.md",
+            scan_id=sid,
+            rule_id="prose-test",
+            finding_key="qf-kept",
+            match_text="actually",
+            context_text="This is actually fine here.",
+        )
+        replace_pattern_scan_results(db, sid, [repaired, kept], [])
+        finish_pattern_run(db, sid, files_count=2, duration_ms=1)
+        assert adjudicate_pattern_finding(db, "qf-repaired", "accepted_defect")
+        assert adjudicate_pattern_finding(db, "qf-kept", "false_positive")
+        before = _adjudication_report(db)["by_rule"]["prose-test"]
+        assert before["decided_count"] == 2
+        assert before["decided_precision"] == 0.5
+        assert before["actionable_rate"] == 0.5
+
+        # The defect is fixed: the scan no longer produces the finding.
+        replace_pattern_scan_results(db, sid, [kept], [])
+        state = pattern_finding_states(db, ["qf-repaired"])[0]
+        assert state["scan_count"] == 0
+        assert state["disposition"] == "accepted_defect"
+        assert db.execute(
+            "SELECT COUNT(*) FROM pattern_findings WHERE finding_key = ?",
+            ("qf-repaired",),
+        ).fetchone()[0] == 0
+
+        after = _adjudication_report(db)["by_rule"]["prose-test"]
+        assert after["accepted_defects"] == 0
+        assert after["decided_count"] == 1
+        assert after["decided_precision"] == 0.0
+        assert after["durable_accepted_defects"] == 1
+        assert after["durable_decided_count"] == 2
+        assert after["actionable_rate"] == 0.5
+
+        # Repaired by a later completed rescan rather than a replaced one.
+        second = begin_pattern_run(db, "bbb", "docs")
+        kept.scan_id = second
+        replace_pattern_scan_results(db, second, [kept], [])
+        finish_pattern_run(db, second, files_count=1, duration_ms=1)
+        rescanned = _adjudication_report(db)["by_rule"]["prose-test"]
+        assert rescanned["decided_precision"] == 0.0
+        assert rescanned["actionable_rate"] == 0.5
+
+    def test_rule_with_only_repaired_dispositions_keeps_actionable_rate(
+        self, db: sqlite3.Connection
+    ) -> None:
+        sid = begin_pattern_run(db, "aaa", ".")
+        finding = PatternFinding(
+            path="a.md",
+            scan_id=sid,
+            rule_id="prose-test",
+            finding_key="qf-only",
+            match_text="actually",
+            context_text="This is actually verified.",
+        )
+        replace_pattern_scan_results(db, sid, [finding], [])
+        assert adjudicate_pattern_finding(db, "qf-only", "accepted_defect")
+        replace_pattern_scan_results(db, sid, [], [])
+
+        report = _adjudication_report(db)
+        assert report["finding_count"] == 0
+        summary = report["by_rule"]["prose-test"]
+        assert summary["findings"] == 0
+        assert summary["decided_count"] == 0
+        assert summary["decided_precision"] is None
+        assert summary["needs_adjudication"] is False
+        assert summary["actionable_rate"] == 1.0
+        # path_prefix scopes the durable count the same way it scopes findings.
+        elsewhere = _adjudication_report(db, path_prefix="docs")
+        assert "prose-test" not in elsewhere["by_rule"]
 
     def test_narrow_rescan_does_not_stale_findings_outside_its_target(
         self, db: sqlite3.Connection
@@ -1578,7 +1726,7 @@ class TestSchemaV9:
         replace_pattern_scan_results(db, docs_scan, [], [])
         finish_pattern_run(db, docs_scan, files_count=0, duration_ms=1)
 
-        report = pattern_adjudication_report(db, path_prefix="other")
+        report = _adjudication_report(db, path_prefix="other")
         assert report["finding_count"] == 1
         assert report["by_rule"]["prose-test"]["decided_precision"] == 1.0
 
@@ -1710,7 +1858,8 @@ class TestSchemaV10:
         and returning left a v9 database that init_db reported as migrated."""
 
         class FailingRefill(sqlite3.Connection):  # pylint: disable=too-few-public-methods
-            def execute(self, sql, *args):  # type: ignore[override]
+            @override
+            def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
                 if sql.startswith("INSERT INTO pattern_findings"):
                     raise sqlite3.OperationalError("disk I/O error (injected)")
                 return super().execute(sql, *args)

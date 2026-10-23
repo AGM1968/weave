@@ -5,14 +5,20 @@
 # .git/hooks/ holds COPIES of scripts/hooks/*-weave.sh, refreshed only by
 # install.sh or wv init-repo. A copy that fell behind its source kept gating
 # commits with old logic and said nothing (this repo's own pre-commit was found
-# 30 lines behind). Each hook now compares itself with the repository's source
-# and, when they differ, announces it and runs the source instead.
+# 30 lines behind). prepare-commit-msg compares itself with the repository's
+# source and, when they differ, announces it and runs the source instead.
+#
+# pre-commit and pre-push no longer hop to the working tree (S2a, wv-1f98b6):
+# where HEAD carries the hook they run HEAD's committed copy, and say so when
+# the installed copy differs from it; with no committed hook they run
+# themselves. tests/test-protected-dispatcher.sh covers the protection.
 #
 # Exit codes:
 #   0 - All tests passed
 #   1 - One or more tests failed
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -60,6 +66,8 @@ export PATH="$FAKE_BIN:$PATH"
 new_repo() {
     local dir="$1" h
     git init -q "$dir"
+    mkdir -p "$dir/.git/lib"
+    cp -R "$REPO_ROOT/scripts/lib/." "$dir/.git/lib/"
     for h in "${HOOKS[@]}"; do
         install -m 755 "$REPO_ROOT/scripts/hooks/$h-weave.sh" "$dir/.git/hooks/$h"
     done
@@ -79,11 +87,27 @@ _err=$(cd "$STALE" && git -c core.hooksPath="$STALE/.git/hooks" -c user.name=t -
     commit -q --allow-empty -m "probe" 2>&1 >/dev/null)
 rc=$?
 set -e
+if [ "$rc" -ne 0 ]; then printf '%s\n' "$_err" >&2; fi
 assert_equals "0" "$rc" "stale copies: commit succeeds"
-for h in "${HOOKS[@]}"; do
-    assert_equals "1" "$(grep -cxF -- "$h source ran" "$LOG" || true)" "stale $h copy runs the repository source exactly once"
-    assert_equals "1" "$(printf '%s\n' "$_err" | grep -cF -- "Weave $h: installed hook differs" || true)" "stale $h copy announces the drift"
-done
+assert_equals "1" "$(grep -cxF -- "prepare-commit-msg source ran" "$LOG" || true)" "stale prepare-commit-msg copy runs the repository source exactly once"
+assert_equals "1" "$(printf '%s\n' "$_err" | grep -cF -- "Weave prepare-commit-msg: installed hook differs" || true)" "stale prepare-commit-msg copy announces the drift"
+assert_equals "0" "$(grep -cxF -- "pre-commit source ran" "$LOG" || true)" "no committed pre-commit (unborn HEAD): the working-tree source is not run"
+
+# ── a committed pre-commit runs from HEAD, never the working tree ─────────
+git -C "$STALE" add scripts/hooks
+git -C "$STALE" -c core.hooksPath=/dev/null -c user.name=t -c user.email=t@t commit -q -m "commit the sources"
+printf '#!/usr/bin/env bash\necho "pre-commit working tree ran" >> "%s"\n' "$LOG" > "$STALE/scripts/hooks/pre-commit-weave.sh"
+: > "$LOG"
+set +e
+_err=$(cd "$STALE" && git -c core.hooksPath="$STALE/.git/hooks" -c user.name=t -c user.email=t@t \
+    commit -q --allow-empty -m "probe 2" 2>&1 >/dev/null)
+rc=$?
+set -e
+assert_equals "0" "$rc" "committed pre-commit: commit succeeds"
+assert_equals "1" "$(grep -cxF -- "pre-commit source ran" "$LOG" || true)" "the installed copy runs HEAD's committed pre-commit exactly once"
+assert_equals "0" "$(grep -cxF -- "pre-commit working tree ran" "$LOG" || true)" "...never the working tree's"
+assert_equals "1" "$(printf '%s\n' "$_err" | grep -cF -- "Weave pre-commit: running HEAD's committed gate" || true)" "...and says the copy differs from it"
+git -C "$STALE" checkout -q -- scripts/hooks
 
 # ── a current copy runs itself, silently ──────────────────────────────────
 CURRENT="$TEST_DIR/current"
@@ -116,17 +140,21 @@ set -e
 assert_equals "0" "$(grep -c "source ran" "$LOG" || true)" "WV_HOOK_REEXEC set: the source is not executed again"
 assert_equals "" "$_err" "WV_HOOK_REEXEC set: no drift warning"
 
-# ── pre-push carries the same guard (wv-862ac0) ───────────────────────────
+# ── pre-push runs HEAD's committed copy too (wv-862ac0, S2a) ──────────────
 : > "$LOG"
 install -m 755 "$REPO_ROOT/scripts/hooks/pre-push-weave.sh" "$STALE/.git/hooks/pre-push"
 printf '#!/usr/bin/env bash\necho "pre-push source ran" >> "%s"\n' "$LOG" > "$STALE/scripts/hooks/pre-push-weave.sh"
+git -C "$STALE" add scripts/hooks/pre-push-weave.sh
+git -C "$STALE" -c core.hooksPath=/dev/null -c user.name=t -c user.email=t@t commit -q -m "commit pre-push"
+printf '#!/usr/bin/env bash\necho "pre-push working tree ran" >> "%s"\n' "$LOG" > "$STALE/scripts/hooks/pre-push-weave.sh"
 set +e
 _err=$(cd "$STALE" && ./.git/hooks/pre-push origin "$TEST_DIR/remote" </dev/null 2>&1 >/dev/null)
 rc=$?
 set -e
-assert_equals "0" "$rc" "stale pre-push copy: exits 0 via the source"
-assert_equals "1" "$(grep -cxF -- "pre-push source ran" "$LOG" || true)" "stale pre-push copy runs the repository source exactly once"
-assert_equals "1" "$(printf '%s\n' "$_err" | grep -cF -- "Weave pre-push: installed hook differs" || true)" "stale pre-push copy announces the drift"
+assert_equals "0" "$rc" "stale pre-push copy: exits 0 via HEAD's committed copy"
+assert_equals "1" "$(grep -cxF -- "pre-push source ran" "$LOG" || true)" "stale pre-push copy runs HEAD's committed pre-push exactly once"
+assert_equals "0" "$(grep -cxF -- "pre-push working tree ran" "$LOG" || true)" "...never the working tree's"
+assert_equals "1" "$(printf '%s\n' "$_err" | grep -cF -- "Weave pre-push: running HEAD's committed gate" || true)" "...and says the copy differs from it"
 
 echo ""
 echo "========================================"

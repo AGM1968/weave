@@ -14,10 +14,12 @@ fi
 _WV_HOOK_COMMON_LOADED=1
 
 # Tag all wv calls from hook context so wv analyze --source=hook can isolate them.
-# Unconditional: the Claude Code session env carries WV_CALL_SOURCE=agent
-# (settings.json), which hooks inherit — a lifecycle hook is infrastructure,
-# not model-driven traffic, so it must override the inherited tag.
-export WV_CALL_SOURCE=hook
+# Overrides any inherited tag but test: the Claude Code session env carries
+# WV_CALL_SOURCE=agent (settings.json), which hooks inherit — a lifecycle hook
+# is infrastructure, not model-driven traffic. A test run keeps its tag, as
+# scripts/wv does for `wv hook` (wv-b2f8a8); the Stop dispatch loads this file
+# since wv-25903d, so a test's nested calls would otherwise log as hook.
+[ "${WV_CALL_SOURCE:-}" = "test" ] || export WV_CALL_SOURCE=hook
 
 _HC_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$_HC_LIB_DIR/wv-resolve-runtime.sh" 2>/dev/null || true
@@ -40,7 +42,9 @@ _hc_project_dir() {
 _hc_hot_zone() {
     local project_dir="$1"
     local repo_hash
-    repo_hash=$(printf '%s' "$project_dir" | md5sum | cut -c1-8)
+    # echo, not printf: the newline is part of the hash every other caller
+    # computes (_hot_zone_repo_hash, weave_gh _repo_hash; wv-1ba440).
+    repo_hash=$(echo "$project_dir" | md5sum | cut -c1-8)
 
     if type resolve_repo_hot_zone >/dev/null 2>&1; then
         resolve_repo_hot_zone "${WV_HOT_ZONE:-}" "$project_dir"
@@ -50,7 +54,9 @@ _hc_hot_zone() {
     if [ -n "${WV_HOT_ZONE:-}" ]; then
         printf '%s\n' "$WV_HOT_ZONE"
     else
-        printf '/dev/shm/weave/%s\n' "$repo_hash"
+        # Resolver unavailable: the default placement zone (wv-b831e3), by
+        # its legacy name, which is the physical directory (wv-95bddf).
+        printf '/tmp/weave-codex-%s/%s\n' "${UID}" "$repo_hash"
     fi
 }
 
@@ -76,7 +82,9 @@ _hc_phase_value() {
 
 _hc_refresh() {
     _HC_PROJECT_DIR=$(_hc_project_dir)
-    _HC_REPO_HASH=$(printf '%s' "$_HC_PROJECT_DIR" | md5sum | cut -c1-8)
+    # Same form as the bash-dedup lock writer (wv-pre-tool-use.sh), so session
+    # start clears the directory the locks are in (wv-1ba440).
+    _HC_REPO_HASH=$(echo "$_HC_PROJECT_DIR" | md5sum | cut -c1-8)
     _HC_HOT_ZONE=$(_hc_hot_zone "$_HC_PROJECT_DIR")
     _HC_DB=$(_hc_db_path "$_HC_HOT_ZONE")
     _HC_PHASE=$(_hc_phase_value "$_HC_HOT_ZONE")

@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import struct
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -184,3 +185,75 @@ class TestMain:
         conn.close()
         assert not any(".git" in f for f in files)
         assert any("real.py" in f for f in files)
+
+
+def _git_repo(root: Path) -> Path:
+    root.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
+    (root / "a.py").write_text("a = 1\n")
+    (root / "sub").mkdir()
+    (root / "sub" / "b.py").write_text("b = 1\n")
+    return root
+
+
+def _indexed(db: Path) -> set[str]:
+    conn = sqlite3.connect(str(db))
+    files = {r[0] for r in conn.execute("SELECT DISTINCT file FROM chunks").fetchall()}
+    conn.close()
+    return files
+
+
+class TestIndexScope:
+    """wv-31d0d0: root selection, stored paths and eviction stay inside the walk."""
+
+    def test_default_root_is_the_repository_not_the_hot_zone(
+        self, tmp_path: Path, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # wv always exports WV_HOT_ZONE, so defaulting to it indexed tmpfs.
+        repo = _git_repo(tmp_path / "repo")
+        (tmp_path / "hot").mkdir()
+        monkeypatch.setenv("WV_DB", str(tmp_db))
+        monkeypatch.setenv("WV_HOT_ZONE", str(tmp_path / "hot"))
+        monkeypatch.chdir(repo / "sub")
+        assert main(["--no-embed", "--ext=.py"]) == 0
+        assert _indexed(tmp_db) == {"a.py", "sub/b.py"}
+
+    def test_subdir_index_keeps_other_chunks_and_repo_relative_paths(
+        self, tmp_path: Path, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = _git_repo(tmp_path / "repo")
+        monkeypatch.setenv("WV_DB", str(tmp_db))
+        main(["--no-embed", "--ext=.py", str(repo)])
+        main(["--no-embed", "--ext=.py", str(repo / "sub")])
+        assert _indexed(tmp_db) == {"a.py", "sub/b.py"}
+
+    def test_subdir_index_evicts_only_inside_the_subtree(
+        self, tmp_path: Path, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = _git_repo(tmp_path / "repo")
+        (repo / "sub" / "c.py").write_text("c = 1\n")
+        monkeypatch.setenv("WV_DB", str(tmp_db))
+        main(["--no-embed", "--ext=.py", str(repo)])
+        (repo / "sub" / "c.py").unlink()
+        main(["--no-embed", "--ext=.py", str(repo / "sub")])
+        assert _indexed(tmp_db) == {"a.py", "sub/b.py"}
+
+    def test_empty_walk_still_evicts_its_subtree(
+        self, tmp_path: Path, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = _git_repo(tmp_path / "repo")
+        monkeypatch.setenv("WV_DB", str(tmp_db))
+        main(["--no-embed", "--ext=.py", str(repo)])
+        (repo / "sub" / "b.py").unlink()
+        assert main(["--no-embed", "--ext=.py", str(repo / "sub")]) == 0
+        assert _indexed(tmp_db) == {"a.py"}
+
+    def test_excluded_name_above_the_repo_does_not_hide_it(
+        self, tmp_path: Path, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Exclusions matched absolute path parts, so a checkout under build/
+        # or venv*/ indexed nothing.
+        repo = _git_repo(tmp_path / "build" / "repo")
+        monkeypatch.setenv("WV_DB", str(tmp_db))
+        main(["--no-embed", "--ext=.py", str(repo)])
+        assert _indexed(tmp_db) == {"a.py", "sub/b.py"}

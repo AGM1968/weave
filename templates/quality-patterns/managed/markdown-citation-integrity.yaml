@@ -6,7 +6,7 @@ severity: warning
 policy: always-on-shared
 maturity: promotable
 provenance: >-
-  AC-4 from earth-engine-analysis canary wv-7a8d45. A mechanical body-to-
+  AC-4 from a consumer canary wv-7a8d45. A mechanical body-to-
   bibliography join found three unresolved citations and eighteen entries
   without publication years in one academic document.
 message: >-

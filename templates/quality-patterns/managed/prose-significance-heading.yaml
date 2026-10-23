@@ -7,7 +7,7 @@ severity: info
 policy: always-on-shared
 maturity: promotable
 provenance: >-
-  AC-2 from earth-engine-analysis canary wv-7a8d45. Significance scaffolding
+  AC-2 from a consumer canary wv-7a8d45. Significance scaffolding
   moved into a comma-appended heading clause that existing prose rules missed.
 message: >-
   Significance scaffold appended to a heading. Name the technical content or

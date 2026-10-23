@@ -3,6 +3,7 @@
 # harness reads (wv-f757a4): the Claude SessionStart hook and MCP weave_overview
 # both call it. Driven against this checkout's scripts/wv in fixture repos.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 export WV_CALL_SOURCE=test
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

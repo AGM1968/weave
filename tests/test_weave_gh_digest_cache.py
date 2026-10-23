@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from weave_gh.digest_cache import (
     DIGEST_SCHEMA,
@@ -118,29 +119,29 @@ class TestIsCacheHitAndUpdate:
         assert is_cache_hit({"schema": DIGEST_SCHEMA, "entries": {}}, 5, "wv-a", "d") is False
 
     def test_hit_after_update(self) -> None:
-        cache: dict = {"schema": DIGEST_SCHEMA, "entries": {}}
+        cache: dict[str, Any] = {"schema": DIGEST_SCHEMA, "entries": {}}
         update_cache(cache, 5, "wv-a", "deadbeef", body_hash="abc123")
         assert is_cache_hit(cache, 5, "wv-a", "deadbeef") is True
 
     def test_miss_on_digest_change(self) -> None:
-        cache: dict = {"schema": DIGEST_SCHEMA, "entries": {}}
+        cache: dict[str, Any] = {"schema": DIGEST_SCHEMA, "entries": {}}
         update_cache(cache, 5, "wv-a", "deadbeef", body_hash="abc123")
         assert is_cache_hit(cache, 5, "wv-a", "feedface") is False
 
     def test_miss_on_node_id_change(self) -> None:
-        cache: dict = {"schema": DIGEST_SCHEMA, "entries": {}}
+        cache: dict[str, Any] = {"schema": DIGEST_SCHEMA, "entries": {}}
         update_cache(cache, 5, "wv-a", "deadbeef", body_hash="abc123")
         assert is_cache_hit(cache, 5, "wv-b", "deadbeef") is False
 
     def test_miss_without_cached_body_hash(self) -> None:
-        cache: dict = {
+        cache: dict[str, Any] = {
             "schema": DIGEST_SCHEMA,
             "entries": {"5": {"node_id": "wv-a", "digest": "deadbeef"}},
         }
         assert is_cache_hit(cache, 5, "wv-a", "deadbeef") is False
 
     def test_miss_when_issue_body_hash_differs(self) -> None:
-        cache: dict = {"schema": DIGEST_SCHEMA, "entries": {}}
+        cache: dict[str, Any] = {"schema": DIGEST_SCHEMA, "entries": {}}
         update_cache(cache, 5, "wv-a", "deadbeef", body_hash="abc123")
         body = "<!-- WEAVE:BEGIN hash=def456 -->\nold\n<!-- WEAVE:END -->"
         assert (
@@ -149,7 +150,7 @@ class TestIsCacheHitAndUpdate:
         )
 
     def test_hit_when_issue_body_hash_matches(self) -> None:
-        cache: dict = {"schema": DIGEST_SCHEMA, "entries": {}}
+        cache: dict[str, Any] = {"schema": DIGEST_SCHEMA, "entries": {}}
         update_cache(cache, 5, "wv-a", "deadbeef", body_hash="abc123")
         body = "<!-- WEAVE:BEGIN hash=abc123 -->\ncurrent\n<!-- WEAVE:END -->"
         assert is_cache_hit(cache, 5, "wv-a", "deadbeef", issue_body=body) is True

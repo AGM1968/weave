@@ -2,6 +2,7 @@
 # test-install-ast-grep.sh — installer must not download optional ast-grep by default.
 
 set -euo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -50,8 +51,17 @@ SH
 
 echo "=== Install ast-grep opt-in tests ==="
 
-tmp=$(mktemp -d)
+tmp=$(bash "$PROJECT_ROOT/scripts/lib/wv-scratch.sh")
 trap 'rm -rf "$tmp"' EXIT
+
+# Install current tracked bytes from a private source, including its own Git
+# discovery boundary: describe --dirty refreshes an index even with optional
+# locks disabled (wv-6900e1).
+mkdir -p "$tmp/src"
+git -C "$PROJECT_ROOT" ls-files -z | (cd "$PROJECT_ROOT" && tar --null -T - --ignore-failed-read -cf - 2>/dev/null) | tar -x -C "$tmp/src"
+git -C "$tmp/src" init -q
+PROJECT_ROOT="$tmp/src"
+cd "$PROJECT_ROOT"
 
 stub_bin="$tmp/bin"
 install_dir="$tmp/install-bin"
@@ -76,9 +86,9 @@ WV_INSTALL_DIR="$install_dir" \
 WV_LIB_DIR="$lib_dir" \
 WV_CONFIG_DIR="$config_dir" \
 SKIP_AST_GREP=0 \
-bash "$PROJECT_ROOT/install.sh" --no-mcp >/tmp/wv-install-ast-default.out 2>&1
+bash "$PROJECT_ROOT/install.sh" --no-mcp >"$tmp/default.out" 2>&1
 
-default_out=$(cat /tmp/wv-install-ast-default.out)
+default_out=$(cat "$tmp/default.out")
 default_calls=$(cat "$WV_STUB_LOG")
 
 assert_contains "$default_out" "no download attempted" "default install reports ast-grep skipped without download"
@@ -95,11 +105,11 @@ HOME="$home_dir" \
 WV_INSTALL_DIR="$install_dir" \
 WV_LIB_DIR="$lib_dir" \
 WV_CONFIG_DIR="$config_dir" \
-bash "$PROJECT_ROOT/install.sh" --no-mcp --with-ast-grep >/tmp/wv-install-ast-optin.out 2>&1
+bash "$PROJECT_ROOT/install.sh" --no-mcp --with-ast-grep >"$tmp/optin.out" 2>&1
 rc=$?
 set -e
 
-optin_out=$(cat /tmp/wv-install-ast-optin.out)
+optin_out=$(cat "$tmp/optin.out")
 optin_calls=$(cat "$WV_STUB_LOG")
 
 assert_equals "0" "$rc" "explicit ast-grep install failure remains non-fatal"

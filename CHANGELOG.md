@@ -4,6 +4,39 @@
 
 ## Unreleased
 
+## [1.71.0-rc.14] - 2026-10-22
+
+### Changed
+
+- **Review claim ownership when upgrading.** Commits require an active claim held by the
+  committing actor. A Claude Code terminal with `CLAUDECODE=1` can now resolve to a Claude
+  actor instead of the older `human-<host>-<user>` identity. `wv doctor` reports the current
+  actor and exact active claim IDs and holders belonging to other actors, in text and JSON.
+  The diagnostic is advisory: other actors may legitimately be working. Inspect each claim
+  before explicitly authorizing takeover with `wv work ID --force`; reservations still apply.
+  Doctor never migrates claims, even with `--repair`. Actor ownership is not session isolation.
+- **Your gate suites keep running in your checkout.** The commit and push gates can now run a suite
+  against a frozen snapshot of the staged tree in a private environment, but only for suites a
+  repository names in `.weave/gate-provision.json`. Without that file, every suite your
+  `.weave/test-map.conf` routes runs as before, in your checkout, on both gates, and is rerun each
+  time rather than reused. Each gate record in `~/.local/share/weave/gate_runs.jsonl` now carries
+  an `execution_mode` field.
+- **`.weave/gate-provision.json` is reserved for Weave's own repository in this release.**
+  Declared provisioning for other repositories follows measurement against their own gate times.
+  Removing a committed declaration, or a suite from one, requires a retirement record, and `wv`
+  has no command that writes one yet.
+
+### Fixed
+
+- **A commit refused in a linked worktree says what to do.** Each linked worktree has its own Weave
+  graph: a claim made in the main checkout does not admit a commit in the worktree. The commit
+  refusal in a worktree now names the main checkout and says to run `wv load` there and claim a
+  node with `wv work <id>` or `wv add "..." --status=active`.
+- **Vendored hooks pass your shellcheck.** rc.13's `.claude/hooks/post-edit-lint.sh` assigned a
+  variable it never read. A repository whose pre-commit hook runs shellcheck with default rules
+  refused any commit staging the file (SC2034). The assignment is removed. After upgrading, run
+  `wv init-repo --update` to refresh the copy in your repository.
+
 ## [1.71.0-rc.13] - 2026-09-30
 
 rc.13 replaces the rc.12 release archive, which carried a `.git` directory it should not have; the
@@ -504,8 +537,9 @@ release remains frozen; this candidate is distributed from the private source re
   `wv trails save` with no message at all removed the section outright. Growth is bounded by
   `WV_TRAILS_NOTES_CAP` (default 20, oldest dropped first). Notes written before this release are
   preserved and labelled `### (undated,...)` on first append. The section is delimited by an
-  explicit `<!-- /wv-notes -->` marker, so a note whose body contains its own `## ` headings is no
-  longer truncated. The section end is resolved from the _last_ marker in the file and reserved
+  explicit `<!-- /wv-notes -->` marker, so a note whose body contains its own `##`
+  (heading-marker) headings is no longer truncated. The section end is resolved from the
+  _last_ marker in the file and reserved
   markers appearing in note text are neutralised on write, so a note that itself contains
   `<!-- /wv-notes -->` cannot truncate the notes above it. Entries are counted for the cap by a
   generated `<!-- wv-note -->` marker rather than by `###` headings, so a note containing its own
@@ -640,7 +674,8 @@ release remains frozen; this candidate is distributed from the private source re
 
 - **`wv trails save` durability, properly this time** — the previous fix took the status of a
   redirected compound, which is its LAST command, so an earlier failed write followed by successful
-  output still returned 0; and its `^Nodes: ` integrity check could be satisfied by a crafted note,
+  output still returned 0; and its `^Nodes:` (with its trailing space) integrity check could be
+  satisfied by a crafted note,
   since notes are written before the generated sections. `set -e` is not a usable remedy here:
   measured, errexit reads as on inside the subshell, a failing command runs, and execution continues
   — bash suppresses errexit for the dynamic extent of a command in a condition context and subshells
@@ -859,7 +894,7 @@ selftest-verified artifact, before publishing.
 ## [1.71.0-dev.4] - 2026-08-11
 
 Private corrective preview for installation on owned machines, folding in an external code review
-round of the earth-engine-analysis consumer repo (dev.3). Seven findings fixed after independent
+round of a consumer repository (dev.3). Seven findings fixed after independent
 validation against current HEAD; two audit claims found already stale or not reproducible were left
 untouched. This version is not a public release.
 
@@ -1032,8 +1067,8 @@ not grant Rust mutation authority or claim cross-machine causal durability.
   config) baked in the resolved absolute path to `MCP_SERVER`/`WV_BIN` at generation time instead of
   a portable `${env:HOME}` form. Any repo scaffolded or force-updated on one machine shipped a path
   that only resolved there, ENOENT-ing every MCP server spawn on any other machine/user that cloned
-  it — traced as the root cause of VS Code extension-host crashes in `weave-runtime`, `warp`, and
-  `insar`. Now emits `${env:HOME}`-relative paths whenever the resolved path sits under `$HOME`;
+  it — traced as the root cause of VS Code extension-host crashes in `weave-runtime` and two other
+  repositories. Now emits `${env:HOME}`-relative paths whenever the resolved path sits under `$HOME`;
   non-standard installs (`WV_LIB_DIR` override, dev-mode repo-relative paths) are unaffected.
 - **MCP server version drift** — `mcp/src/index.ts` hardcoded its reported version as a literal
   string in two places instead of reading `package.json`, so the version reported by
@@ -1380,7 +1415,7 @@ not grant Rust mutation authority or claim cross-machine causal durability.
 ### Added
 
 - **Scaffold-sync wiring for the pre-commit test gate** — the two consumer-proven gate improvements
-  (test-bed: earth-engine-analysis) now auto-inherit via `wv init-repo` / scaffolding sync instead
+  (proven in a consumer test-bed) now auto-inherit via `wv init-repo` / scaffolding sync instead
   of being copy-paste-only templates:
   - `scripts/test-impacted.sh` — a fast, impact-scoped pre-commit test runner is seeded if-absent
     (executable). It runs the test command on ONLY the staged sources' mirror test dirs (nearest
@@ -4150,7 +4185,7 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 
 | Repo                  | v1.12.2 | v1.13.0 | Target |
 | --------------------- | ------: | ------: | -----: |
-| earth-engine-analysis |   0/100 |  38/100 |  30-50 |
+| consumer repository   |   0/100 |  38/100 |  30-50 |
 | memory-system         | 100/100 |  79/100 |  50-80 |
 
 Cross-validation against radon/mccabe 0.7.0: 5/8 production library functions exact match, 3/8
@@ -4322,7 +4357,7 @@ within ±2 (BoolOp counting — intentional divergence documented in `docs/CC-ME
   deduplicated via parent-class flag on per-function CC results.
 - **Inline ownership computation** — `_compute_ownership()` dead first scan removed, author counts
   pre-computed during `_batch_git_stats` pass. Eliminates O(files × log_size) scaling bug.
-- **Overall: 6.5s → 2.4s (2.7×)** on memory-system (75 files). earth-engine-analysis (175 files)
+- **Overall: 6.5s → 2.4s (2.7×)** on memory-system (75 files). A consumer repository (175 files)
   scans in 5.5s. Subprocess calls reduced from ~654 to 5 (131×).
 
 ### Fixed

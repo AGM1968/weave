@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # _wv_source_drift (scripts/lib/wv-config.sh): which edited sources are not
-# installed. It drives the pre-commit self-heal (./install.sh) and the
-# bootstrap drift advisory, so a source it does not compare is one whose edits
+# installed. It drives the pre-commit and bootstrap drift advisories,
+# so a source it does not compare is one whose edits
 # never reach the installed copy -- or consumers, for the git-hook sources that
 # wv init-repo --update vendors from ~/.local/lib/weave/hooks (wv-ff2fb1).
 # Driven directly against a temp source tree, HOME and config dir.
 set -uo pipefail
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 export WV_CALL_SOURCE=test
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -8,7 +8,7 @@ severity: info
 policy: always-on-shared
 maturity: promotable
 provenance: >-
-  QP-2 and AC-2 from earth-engine-analysis canary wv-7a8d45. Three or more
+  QP-2 and AC-2 from a consumer canary wv-7a8d45. Three or more
   em dashes in one paragraph was the motivating density case; the audited
   reference corpus and calibration document were quiet at this threshold.
 message: >-

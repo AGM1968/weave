@@ -300,7 +300,7 @@ def build_commit_links(node_id: str, repo_url: str = "") -> str:
             ],
             check=False,
         )
-        shas = result.stdout.strip().split("\n") if result.stdout.strip() else []
+        shas: list[str] = result.stdout.strip().split("\n") if result.stdout.strip() else []
         # Fallback: search by Weave-ID trailer
         if not shas:
             result = _run(

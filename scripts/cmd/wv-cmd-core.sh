@@ -9,6 +9,46 @@
 # cmd_init — Initialize Weave directory
 # ═══════════════════════════════════════════════════════════════════════════
 
+# _init_database — create the database and its change tracking, or say why not.
+# init reported '✓ Initialized' after sqlite could not open the file (wv-b98794).
+_init_database() {
+    if db_init && wv_delta_init "$WV_DB"; then
+        local owner
+        owner=$(_init_zone_owner)
+        [ -z "$owner" ] || db_stamp_repo_owner "$owner"
+        return 0
+    fi
+    echo -e "${RED}Error: could not initialise the Weave database at $WV_DB${NC}" >&2
+    return 1
+}
+
+# _init_zone_owner — the repository a zone fresh from wv init belongs to
+# (wv-29e416), printed only when init can name it without guessing: the
+# working directory's git toplevel, unless WV_PROJECT_DIR names somewhere
+# else. Otherwise nothing, and the zone stays unstamped until the first later
+# command's db_ensure stamps the repository that actually uses it. An
+# unstamped zone reads as an orphan to wv hotzone gc and is not judged by the
+# gate's live-zone leak guard, but a wrong stamp is worse: the owner check
+# (wv-5e804e) refuses every later call from the real owner. That is why the
+# first attempt, 0bbc6c7e6, was backed out (wv-db641c): it stamped REPO_ROOT,
+# which outside a repository is the bare working directory, and the MCP suite
+# inits from a scratch directory and uses the zone from elsewhere. Callers
+# disagree in both directions when WV_PROJECT_DIR differs from the toplevel:
+# test-core inits from one repository and uses the zone from WV_PROJECT_DIR,
+# test-commit-refs and test-data set WV_PROJECT_DIR to a parent and use the
+# zone from the toplevel. Neither can be preferred, so neither is stamped.
+_init_zone_owner() {
+    local top
+    top=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+    top=$(canonicalize_runtime_path "$top")
+    case "$top" in "" | "$HOME" | /root) return 0 ;; esac
+    if [ -n "${WV_PROJECT_DIR:-}" ] &&
+        [ "$(canonicalize_runtime_path "$WV_PROJECT_DIR")" != "$top" ]; then
+        return 0
+    fi
+    printf '%s\n' "$top"
+}
+
 cmd_init() {
     local force=false
     while [ $# -gt 0 ]; do
@@ -55,8 +95,7 @@ cmd_init() {
         rm -f "$WEAVE_DIR/health.log" 2>/dev/null || true
         rm -rf "$WEAVE_DIR/cache" 2>/dev/null || true
         mkdir -p "$WEAVE_DIR"
-        db_init
-        wv_delta_init "$WV_DB"
+        _init_database || return 1
         echo -e "${GREEN}✓ Initialized Weave at $WEAVE_DIR (clean slate)${NC}"
         echo "  Hot zone: $WV_HOT_ZONE"
         return
@@ -92,8 +131,7 @@ cmd_init() {
     wv_policy_verdict init_preserves_existing_graph allow no "" "no graph with nodes to overwrite"
 
     mkdir -p "$WEAVE_DIR"
-    db_init
-    wv_delta_init "$WV_DB"
+    _init_database || return 1
     echo -e "${GREEN}✓ Initialized Weave at $WEAVE_DIR${NC}"
     echo "  Hot zone: $WV_HOT_ZONE"
 }
@@ -293,6 +331,42 @@ _add_create_gh_issue() {
 # cmd_add — Add a new node
 # ═══════════════════════════════════════════════════════════════════════════
 
+_add_prepare_metadata() {
+    # cmd_add owns the option locals; merge their projections into metadata
+    # before parent/JSON validation, preserving validation and warning order.
+    # The caller has validated the supplied --metadata as one object. A merge
+    # that fails is an error: it used to keep the metadata without the flag,
+    # so --criteria or --risks vanished from a node created with exit 0
+    # (wv-9034a6).
+    if [ -n "$criteria" ]; then
+        local criteria_json
+        criteria_json=$(printf '%s' "$criteria" | python3 -c "
+import sys, json
+raw = sys.stdin.read()
+items = [s.strip() for s in raw.split('|') if s.strip()]
+print(json.dumps(items))
+" 2>/dev/null) || { echo -e "${RED}Error: could not parse --criteria${NC}" >&2; return 1; }
+        metadata=$(echo "$metadata" | jq --argjson c "$criteria_json" '. + {done_criteria: $c}' 2>/dev/null) \
+            || { echo -e "${RED}Error: could not merge --criteria into --metadata${NC}" >&2; return 1; }
+    fi
+    if [ -n "$risks_flag" ]; then
+        # wv-cccf70 / wv-c0c51e: use the contract enum, including under --force.
+        validate_risk_level "$risks_flag" "--risks" || return 1
+        metadata=$(echo "$metadata" | jq --arg r "$risks_flag" '. + {risks: [], risk_level: $r}' 2>/dev/null) \
+            || { echo -e "${RED}Error: could not merge --risks into --metadata${NC}" >&2; return 1; }
+    fi
+    if [ "$standalone" = true ]; then
+        metadata=$(echo "$metadata" | jq '. + {standalone: true}' 2>/dev/null) \
+            || { echo -e "${RED}Error: could not merge --standalone into --metadata${NC}" >&2; return 1; }
+    fi
+    # wv-734186: upfront verification intent is separate from close evidence.
+    if [ -n "$verification_plan" ]; then
+        metadata=$(echo "$metadata" | jq --arg vp "$verification_plan" '. + {verification_plan: $vp}' 2>/dev/null) \
+            || { echo -e "${RED}Error: could not merge --verification-plan into --metadata${NC}" >&2; return 1; }
+    fi
+    return 0
+}
+
 cmd_add() {
     local text="$1"
     local status="todo"
@@ -340,41 +414,15 @@ cmd_add() {
 
     validate_status "$status" || return 1
 
+    # The supplied --metadata is validated before the flags merge into it:
+    # null + {done_criteria: ...} is an object, so validating only the merged
+    # result admitted --metadata=null with --criteria (wv-9034a6).
+    validate_metadata_object "$metadata" "--metadata" || return 1
+
     # Merge --criteria and --risks into metadata before JSON validation.
     # --criteria="c1|c2|c3"  → done_criteria: ["c1","c2","c3"]
     # --risks=<level>         → risk_level + risks: [] (all levels seed empty list so pre-claim hook's has("risks") check passes)
-    if [ -n "$criteria" ]; then
-        local criteria_json
-        criteria_json=$(printf '%s' "$criteria" | python3 -c "
-import sys, json
-raw = sys.stdin.read()
-items = [s.strip() for s in raw.split('|') if s.strip()]
-print(json.dumps(items))
-" 2>/dev/null || echo "[]")
-        metadata=$(echo "$metadata" | jq --argjson c "$criteria_json" '. + {done_criteria: $c}' 2>/dev/null || echo "$metadata")
-    fi
-    if [ -n "$risks_flag" ]; then
-        # wv-cccf70: a value outside the enum used to be accepted silently and
-        # store nothing; wv-c0c51e: 'critical' was accepted and stored although
-        # the contract (and so the Delta v2 sidecar) does not admit it. The
-        # enum is the contract's, through the one validator.
-        validate_risk_level "$risks_flag" "--risks" || return 1
-        metadata=$(echo "$metadata" | jq --arg r "$risks_flag" '. + {risks: [], risk_level: $r}' 2>/dev/null || echo "$metadata")
-    fi
-    if [ "$standalone" = true ]; then
-        metadata=$(echo "$metadata" | jq '. + {standalone: true}' 2>/dev/null || echo "$metadata")
-    fi
-    # wv-734186: verification-method/verification-evidence were only ever
-    # askable at wv done close time -- "what would count as done" is worth
-    # answering before starting, not discovered as a fresh question once
-    # the work is already finished. --verification-plan is deliberately a
-    # SEPARATE field from the close-time verification_method/
-    # verification_evidence (which report what actually happened) -- it
-    # records the upfront intent, and pre-close-verification.sh's own
-    # rejection hint surfaces it back at close time as a reminder.
-    if [ -n "$verification_plan" ]; then
-        metadata=$(echo "$metadata" | jq --arg vp "$verification_plan" '. + {verification_plan: $vp}' 2>/dev/null || echo "$metadata")
-    fi
+    _add_prepare_metadata || return 1
 
     # Validate parent if provided
     if [ -n "$parent" ]; then
@@ -393,6 +441,7 @@ print(json.dumps(items))
         echo -e "${RED}Error: invalid JSON in --metadata${NC}" >&2
         return 1
     fi
+    validate_metadata_object "$metadata" "--metadata" || return 1
     validate_metadata_risk_level "$metadata" "--metadata" || return 1
     validate_metadata_canonical_numbers "$metadata" "--metadata" || return 1
 
@@ -545,7 +594,10 @@ print(json.dumps(items))
     if [ -n "$alias" ]; then
         alias_sql="'$(sql_escape "$alias")'"
     fi
-    db_query "INSERT INTO nodes (id, text, status, metadata, alias) VALUES ('$id', '$text', '$status', '$metadata', $alias_sql);"
+    if ! db_query "INSERT INTO nodes (id, text, status, metadata, alias) VALUES ('$id', '$text', '$status', '$metadata', $alias_sql);"; then
+        echo -e "${RED}Error: could not create node $id${NC}" >&2
+        return 1
+    fi
 
     # Stamp promoted_at on finding nodes (cannot use SQL trigger — virtual column +
     # warp session trigger interaction crashes SQLite 3.46)
@@ -627,16 +679,22 @@ Usage:
 EOF
 }
 
+# The harness comes from resolve_agent_harness, the one marker ladder claimed_by
+# also uses, so memory provenance and claims agree when markers collide; this
+# function kept its own codex>copilot>claude copy until wv-50640a.
+# CLAUDE_PROJECT_DIR is set only in Claude Code hook processes and still counts
+# as claude when the resolver finds no marker.
 _memory_operating_agent() {
+    local harness=""
+    command -v resolve_agent_harness >/dev/null 2>&1 \
+        && harness=$(resolve_agent_harness 2>/dev/null)
     if [ -n "${WV_OPERATING_AGENT:-}" ]; then
         echo "$WV_OPERATING_AGENT"
     elif [ -n "${WV_AGENT_NAME:-}" ]; then
         echo "$WV_AGENT_NAME"
-    elif [ -n "${CODEX_THREAD_ID:-}" ] || [ "${CODEX_CI:-}" = "1" ]; then
-        echo "codex"
-    elif [ "${COPILOT_AGENT:-}" = "1" ]; then
-        echo "copilot"
-    elif [ -n "${CLAUDE_PROJECT_DIR:-}" ] || [ -n "${CLAUDE_CODE_SSE_PORT:-}" ]; then
+    elif [ -n "$harness" ] && [ "$harness" != "human" ]; then
+        echo "$harness"
+    elif [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
         echo "claude"
     elif command -v resolve_runtime_label >/dev/null 2>&1; then
         resolve_runtime_label 2>/dev/null || echo "native"
@@ -1403,7 +1461,7 @@ cmd_remember() {
     metadata_sql=$(sql_escape "$metadata")
 
     if [ -z "$supersedes" ]; then
-        db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text_sql', 'done', '$metadata_sql');"
+        db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text_sql', 'done', '$metadata_sql');" || return 1
     else
         # One transaction: successor, edge and tombstone land together or not
         # at all. Edge direction follows the registry: target supersedes source.
@@ -1418,7 +1476,7 @@ cmd_remember() {
             INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at)
                 VALUES ('$supersedes', '$id', 'supersedes', 1.0, '$edge_context_sql', CURRENT_TIMESTAMP);
             UPDATE nodes SET metadata='$old_sql', updated_at=CURRENT_TIMESTAMP WHERE id='$supersedes';
-            COMMIT;"
+            COMMIT;" || return 1
     fi
 
     if [ "$format" = "json" ]; then
@@ -1428,6 +1486,46 @@ cmd_remember() {
     fi
 
     auto_sync_or_warn
+}
+
+_memory_import_command() {
+    local source="" path="" repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    local format="text"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --source=*) source="${1#*=}" ;;
+            --path=*) path="${1#*=}" ;;
+            --repo-root=*) repo_root="${1#*=}" ;;
+            --json) format="json" ;;
+            --help|-h)
+                _memory_usage
+                return 0
+                ;;
+            *)
+                echo -e "${RED}Error: unknown option $1${NC}" >&2
+                _memory_usage
+                return 1
+                ;;
+        esac
+        shift
+    done
+    case "$source" in
+        claude)
+            if [ -z "$path" ]; then
+                echo -e "${RED}Error: --path required for Claude memory import${NC}" >&2
+                return 1
+            fi
+            _memory_import_claude_dir "$path" "$repo_root" "$format"
+            ;;
+        codex)
+            _memory_import_codex "$path" "$repo_root" "$format"
+            ;;
+        *)
+            echo -e "${RED}Error: memory import supports --source=claude|codex${NC}" >&2
+            return 1
+            ;;
+    esac
 }
 
 cmd_memory() {
@@ -1582,43 +1680,7 @@ cmd_memory() {
             fi
             ;;
         import)
-            local source="" path="" repo_root
-            repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-            local format="text"
-            while [ $# -gt 0 ]; do
-                case "$1" in
-                    --source=*) source="${1#*=}" ;;
-                    --path=*) path="${1#*=}" ;;
-                    --repo-root=*) repo_root="${1#*=}" ;;
-                    --json) format="json" ;;
-                    --help|-h)
-                        _memory_usage
-                        return 0
-                        ;;
-                    *)
-                        echo -e "${RED}Error: unknown option $1${NC}" >&2
-                        _memory_usage
-                        return 1
-                        ;;
-                esac
-                shift
-            done
-            case "$source" in
-                claude)
-                    if [ -z "$path" ]; then
-                        echo -e "${RED}Error: --path required for Claude memory import${NC}" >&2
-                        return 1
-                    fi
-                    _memory_import_claude_dir "$path" "$repo_root" "$format"
-                    ;;
-                codex)
-                    _memory_import_codex "$path" "$repo_root" "$format"
-                    ;;
-                *)
-                    echo -e "${RED}Error: memory import supports --source=claude|codex${NC}" >&2
-                    return 1
-                    ;;
-            esac
+            _memory_import_command "$@"
             ;;
         crystallize)
             local mode="dry-run"
@@ -1870,6 +1932,57 @@ _done_quality_paths() {
     db_query "SELECT path FROM node_files WHERE node_id='$(sql_escape "$id")' $scope_clause;" 2>/dev/null || echo ""
 }
 
+# _done_quality_stale_paths — print the node's non-exempt paths whose content
+# differs from what the latest scan read (one per line). Nonzero when freshness
+# cannot be judged. Paths the scanner never reads (docs, ignored, [exclude]d)
+# are never stale: weave_quality freshness judges the scanner's own file set.
+_done_quality_stale_paths() {
+    local -a judged=()
+    local path out
+    while IFS= read -r path; do
+        [ -z "$path" ] && continue
+        _is_quality_exempt "$path" && continue
+        judged+=("$path")
+    done <<< "$1"
+    [ ${#judged[@]} -eq 0 ] && return 0
+    local -a py_args=(--hot-zone "$WV_HOT_ZONE" freshness)
+    [ -n "${REPO_ROOT:-}" ] && py_args+=(--repo "$REPO_ROOT")
+    out=$(_wv_quality_python "${py_args[@]}" -- "${judged[@]}" 2>/dev/null) || return 1
+    # A missing list cannot be iterated and fails jq: no answer, not "fresh".
+    jq -r '(.changed + .unscanned + .deleted)[]' <<< "$out" 2>/dev/null
+}
+
+# _done_quality_ensure_fresh — the gate must judge the files as they are now.
+#
+# wv-fe9a6a: the gate read MAX(fn_cc) from the latest scan without asking whether
+# that scan had read the file as it now is. Nothing rescans before wv done, so an
+# edit after the last scan was judged by its old complexity in both directions,
+# and a file created after the scan had no rows and read as CC 0. Same class as
+# wv-7fbfe1 and wv-785ba1: a gate reading a projection that can lag its source.
+# A stale node file triggers one incremental scan (~2s); still stale after it,
+# or unable to tell, the close is refused rather than judged on old data.
+_done_quality_ensure_fresh() {
+    local paths_raw="$1" stale
+    if ! stale=$(_done_quality_stale_paths "$paths_raw"); then
+        wv_policy_verdict close_requires_quality_evidence deny yes "" "quality scan freshness could not be judged"
+        echo -e "${RED}Error: could not tell whether the quality scan is current for this node's files${NC}" >&2
+        echo -e "  Run 'wv quality scan' and retry; WV_REQUIRE_QUALITY=0 bypasses (test/legacy only)." >&2
+        return 1
+    fi
+    [ -z "$stale" ] && return 0
+    echo -e "${YELLOW}quality: $(wc -l <<< "$stale" | tr -d ' ') node file(s) changed since the last scan; rescanning${NC}" >&2
+    local -a scan_args=(--hot-zone "$WV_HOT_ZONE" scan)
+    [ -n "${REPO_ROOT:-}" ] && scan_args+=("$REPO_ROOT")
+    _wv_quality_python "${scan_args[@]}" --json >/dev/null 2>&1 || true
+    if ! stale=$(_done_quality_stale_paths "$paths_raw") || [ -n "$stale" ]; then
+        wv_policy_verdict close_requires_quality_evidence deny yes "" "the quality scan does not describe this node's files"
+        echo -e "${RED}Error: the quality scan is not current for:${NC}" >&2
+        sed 's/^/  /' <<< "$stale" >&2
+        echo -e "  Run 'wv quality scan' and retry; WV_REQUIRE_QUALITY=0 bypasses (test/legacy only)." >&2
+        return 1
+    fi
+}
+
 _done_refresh_file_metrics() {
     local id="$1"
     local scope_json="${2:-}"
@@ -1910,6 +2023,11 @@ _done_refresh_file_metrics() {
         echo -e "  Set WV_REQUIRE_QUALITY=0 to bypass (test/legacy environments only)." >&2
         return 1
     fi
+
+    _done_quality_ensure_fresh "$paths_raw" || return 1
+    # A rescan above records a new scan; judge that one.
+    latest_scan=$(sqlite3 -batch -cmd ".timeout 3000" "$quality_db" \
+        "SELECT id FROM scan_meta ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
 
     # Upsert mccabe_max + language from quality.db into brain.db for each tracked path.
     # Source: MAX(fn_cc:*) per-function CC from file_metrics (Python AST / bash heuristic).
@@ -2001,6 +2119,7 @@ print('deteriorating' if s>0.03 else ('refactored' if s<-0.03 else 'stable'))
 #   no match         -> stale   (file changed since the recorded run)
 #   mapped + no row  -> stale   (required evidence is absent)
 #   no map           -> unknown (non-blocking — no suite is required)
+#   resolver failed  -> stale   (required evidence cannot be established)
 # Aggregate across suites with precedence red > stale > green > unknown.
 #
 # Best-effort by design: ALWAYS returns 0. The test gate is inert by default
@@ -2041,8 +2160,17 @@ _done_refresh_test_status() {
         # the meta-runner the gates skip and never record (wv-gate-pool.sh), so
         # requiring its row made every file routed to it stale forever.
         local suites suites_json heavy_suites
-        suites_json=$(_impact_suites_for_files "$path" 2>/dev/null || echo '[]')
-        suites=$(jq -r '.[].name | select(. != "tests/run-all.sh")' <<< "$suites_json" 2>/dev/null || echo "")
+        # A resolver failure is not "no suite maps here": read that way the
+        # path was unknown, which no gate blocks on (wv-cf48a9, wv-3e6d45).
+        # It is stale -- required evidence that cannot be established -- and
+        # the resolver's own stderr says why.
+        if ! suites_json=$(_impact_suites_for_files "$path") \
+            || ! suites=$(jq -r '.[].name | select(. != "tests/run-all.sh")' <<< "$suites_json" 2>/dev/null); then
+            echo "wv done: could not resolve the test suites for $path; recording it stale" >&2
+            db_query "INSERT INTO file_test_status(path, state) VALUES('$path_esc', 'stale')
+                ON CONFLICT(path) DO UPDATE SET state = excluded.state;" >/dev/null 2>&1 || true
+            continue
+        fi
         heavy_suites=" $(jq -r '[.[] | select(.tier == "heavy") | .name] | join(" ")' <<< "$suites_json" 2>/dev/null) "
 
         if [ -n "$suites" ]; then
@@ -2309,8 +2437,10 @@ _done_store_learning() {
                 local cur_meta new_meta jq_filter
                 cur_meta=$(_done_read_metadata "$id")
                 if [ "$contradiction" = true ]; then
+                    # shellcheck disable=SC2016  # $overlap_id is a jq variable bound by --arg
                     jq_filter='. + {learning_overlap_noted: $overlap_id, learning_contradiction_noted: $overlap_id}'
                 else
+                    # shellcheck disable=SC2016  # $overlap_id is a jq variable bound by --arg
                     jq_filter='. + {learning_overlap_noted: $overlap_id}'
                 fi
                 new_meta=$(echo "$cur_meta" | jq \
@@ -2645,6 +2775,7 @@ _done_record_policy_receipt() {
     fi
     return "$rc"
 }
+
 
 # _done_close <id> <status-guard> <proposed-metadata-expr> [set-clause]
 # Run the close transaction and classify its outcome: a denying receipt, the
@@ -3274,6 +3405,7 @@ cmd_batch_done() {
 
     echo ""
     echo -e "${GREEN}Batch complete:${NC} $closed closed, $failed failed (of ${#ids[@]} total)"
+    [ "$failed" -eq 0 ]
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3431,17 +3563,25 @@ USAGE
         fi
 
         # Handle remove-keys array
-        local remove_keys
+        local remove_keys removal_failed=0
         remove_keys=$(echo "$item" | jq -r '.["remove-keys"]? // empty | .[]?' 2>/dev/null)
         if [ -n "$remove_keys" ]; then
             while IFS= read -r key; do
                 if ! validate_metadata_key "$key"; then
-                    echo -e "${RED}Skipping invalid key '$key' for $item_id${NC}" >&2
-                    continue
+                    removal_failed=1
+                    break
                 fi
                 # Direct SQL remove (cmd_update --remove-key returns early after first key)
-                db_query "UPDATE nodes SET metadata = json_remove(metadata, '\$.${key}'), updated_at=CURRENT_TIMESTAMP WHERE id='$item_id';"
+                if ! db_query "UPDATE nodes SET metadata = json_remove(metadata, '\$.${key}'), updated_at=CURRENT_TIMESTAMP WHERE id='$item_id';"; then
+                    removal_failed=1
+                    break
+                fi
             done <<< "$remove_keys"
+        fi
+        if [ "$removal_failed" -ne 0 ]; then
+            echo -e "${RED}Failed to update $item_id${NC}" >&2
+            failed=$((failed + 1))
+            continue
         fi
 
         # Apply the update if there are fields beyond just id and remove-keys
@@ -3464,6 +3604,7 @@ USAGE
     echo -e "${GREEN}Bulk update:${NC} $updated updated, $failed failed (of $count total)"
 
     auto_sync_or_warn
+    [ "$failed" -eq 0 ]
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3868,7 +4009,9 @@ cmd_ready() {
     _repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
     _repo_hash=$(echo "$_repo_root" | md5sum 2>/dev/null | cut -c1-8 || echo "default")
     [ -z "$_repo_hash" ] && _repo_hash="default"
-    _ring_file="${WV_TOUCHED_DIR:-/dev/shm/weave/${_repo_hash}}/recent-edits.txt"
+    # The writer (wv-post-tool-use.sh) uses the resolved hot zone; a fixed
+    # /dev/shm path missed it whenever placement chose the /tmp zone (wv-b831e3).
+    _ring_file="${WV_TOUCHED_DIR:-${WV_HOT_ZONE:-/dev/shm/weave/${_repo_hash}}}/recent-edits.txt"
     if [ -f "$_ring_file" ]; then
         local _items=() _line _esc
         while IFS= read -r _line; do
@@ -4189,7 +4332,7 @@ cmd_list() {
 
     if [ "$format" = "json-v2" ]; then
         local results
-        results=$(db_query_json_v2 "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
+        results=$(db_query_json_v2 "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;") || return 1
         [ -z "$results" ] && echo "[]" || echo "$results"
         local json_count cap_n="$_LIST_DEFAULT_LIMIT"
         [ "$status_filter" = "done" ] && cap_n="$_LIST_DONE_LIMIT"
@@ -4199,7 +4342,7 @@ cmd_list() {
         _list_footer "$json_count" "$hit_cap" "$cap_n"
     elif [ "$format" = "json" ]; then
         local results
-        results=$(db_query_json "SELECT id, text, status, metadata, alias, created_at, updated_at FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
+        results=$(db_query_json "SELECT id, text, status, metadata, alias, created_at, updated_at FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;") || return 1
         [ -z "$results" ] && echo "[]" || echo "$results"
         local json_count cap_n="$_LIST_DEFAULT_LIMIT"
         [ "$status_filter" = "done" ] && cap_n="$_LIST_DONE_LIMIT"
@@ -4209,8 +4352,10 @@ cmd_list() {
         _list_footer "$json_count" "$hit_cap" "$cap_n"
     else
         # Text mode: exclude metadata to avoid multiline JSON breaking pipe-delimited parsing
-        local row_count=0
+        local row_count=0 results
+        results=$(db_query "SELECT id, text, status FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;") || return 1
         while IFS='|' read -r id text status; do
+            [ -n "$id" ] || continue
             local color="$NC"
             case "$status" in
                 active) color="$GREEN" ;;
@@ -4220,7 +4365,7 @@ cmd_list() {
             esac
             echo -e "${color}[$status]${NC} $id: $text"
             row_count=$((row_count + 1))
-        done < <(db_query "SELECT id, text, status FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;")
+        done <<< "$results"
         local cap_n="$_LIST_DEFAULT_LIMIT"
         [ "$status_filter" = "done" ] && cap_n="$_LIST_DONE_LIMIT"
         local hit_cap=false
@@ -4650,6 +4795,21 @@ read_update_metadata_source() {
     cat -- "$source_path"
 }
 
+# validate_metadata_object <json> <source> — metadata is exactly one JSON
+# object. jq '.' alone accepted [1], "x", null, an empty value and several
+# values: json_patch then REPLACED the node's metadata with a non-object (RFC
+# 7396), stored null or '', or failed in SQL after the command had exited 0
+# (wv-2c1be6). Slurping counts the values, so every one of those is refused.
+validate_metadata_object() {
+    local metadata_payload="$1"
+    local metadata_source="$2"
+    if ! printf '%s' "$metadata_payload" | jq -s -e 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1; then
+        echo -e "${RED}Error: ${metadata_source} must be one JSON object${NC}" >&2
+        echo "Hint: use ${metadata_source} '{\"key\":\"value\"}'." >&2
+        return 1
+    fi
+}
+
 validate_update_metadata_json() {
     local metadata_payload="$1"
     local metadata_source="$2"
@@ -4663,6 +4823,7 @@ validate_update_metadata_json() {
         echo "Hint: use --metadata '{\"key\":\"value\"}' for inline JSON or --metadata-file <path> to avoid shell quoting issues." >&2
         return 1
     fi
+    validate_metadata_object "$metadata_payload" "$metadata_source" || return 1
 
     validate_metadata_risk_level "$metadata_payload" "$metadata_source" || return 1
     validate_metadata_canonical_numbers "$metadata_payload" "$metadata_source" || return 1
@@ -4829,7 +4990,10 @@ cmd_update() {
                 fi
                 validate_metadata_key "$remove_key" || return 1
                 # Use json_remove to atomically remove a single metadata key
-                db_query "UPDATE nodes SET metadata = json_remove(metadata, '\$.${remove_key}'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+                if ! db_query "UPDATE nodes SET metadata = json_remove(metadata, '\$.${remove_key}'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"; then
+                    echo -e "${RED}Error: could not remove metadata key '${remove_key}' from $id${NC}" >&2
+                    return 1
+                fi
                 # Metadata carries criteria, learnings, and handoff state. Persist
                 # it immediately: a throttled sync can otherwise leave the change
                 # only in the hot-zone DB, absent from state.sql and deltas.
@@ -4879,7 +5043,10 @@ cmd_update() {
         _done_close "$id" "" "$proposed_metadata" "$updates" || return 1
     else
         _close_rules_not_engaged "the update does not close the node"
-        db_query "UPDATE nodes SET $updates WHERE id='$id';"
+        if ! db_query "UPDATE nodes SET $updates WHERE id='$id';"; then
+            echo -e "${RED}Error: could not update node $id${NC}" >&2
+            return 1
+        fi
     fi
 
     # Every update can change the context payload (status, text, alias, or
@@ -4937,13 +5104,13 @@ cmd_touch() {
 
     validate_id "$id" || return 1
     
-    local metadata=""
-    local intent=""
+    local metadata="" metadata_given=false
+    local intent="" intent_given=false
     local -a files_list=()
     while [ $# -gt 0 ]; do
         case "$1" in
-            --metadata=*) metadata="${1#--metadata=}" ;;
-            --intent=*)   intent="${1#--intent=}" ;;
+            --metadata=*) metadata="${1#--metadata=}"; metadata_given=true ;;
+            --intent=*)   intent="${1#--intent=}"; intent_given=true ;;
             --files=*)
                 # Comma-separated list of repo-relative file paths to attribute
                 IFS=',' read -ra _tf_arr <<< "${1#--files=}"
@@ -4956,14 +5123,24 @@ cmd_touch() {
         shift
     done
 
+    # A supplied option is validated whatever its value: an empty --metadata=
+    # read as absent, so --intent then wrote over input that was never JSON
+    # (wv-2c1be6). {} stands in only when --metadata was not given.
+    if [ "$metadata_given" = true ]; then
+        validate_metadata_object "$metadata" "--metadata" || return 1
+    fi
+    if [ "$intent_given" = true ] && [ -z "$intent" ]; then
+        echo "Error: --intent needs text" >&2
+        return 1
+    fi
+
     # --intent is sugar for --metadata='{"current_intent":"..."}'
+    # jq takes the raw intent: escaping it first stored the backslashes.
     if [ -n "$intent" ]; then
-        local intent_esc="${intent//\"/\\\"}"
-        if [ -n "$metadata" ]; then
-            # Merge intent into provided metadata
-            metadata=$(echo "$metadata" | jq --arg i "$intent_esc" '. + {current_intent: $i}' 2>/dev/null || echo "{\"current_intent\":\"$intent_esc\"}")
-        else
-            metadata="{\"current_intent\":\"$intent_esc\"}"
+        [ "$metadata_given" = true ] || metadata='{}'
+        if ! metadata=$(printf '%s' "$metadata" | jq -c --arg i "$intent" '. + {current_intent: $i}' 2>/dev/null); then
+            echo "Error: invalid JSON in --metadata" >&2
+            return 1
         fi
     fi
 
@@ -4973,16 +5150,15 @@ cmd_touch() {
     fi
 
     if [ -n "$metadata" ]; then
-        # Validate JSON
-        if ! echo "$metadata" | jq '.' >/dev/null 2>&1; then
-            echo "Error: invalid JSON in --metadata" >&2
-            return 1
-        fi
         validate_metadata_risk_level "$metadata" "--metadata" || return 1
         validate_metadata_canonical_numbers "$metadata" "--metadata" || return 1
 
         local metadata_esc="${metadata//\'/\'\'}"
-        db_query "UPDATE nodes SET metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+        # A failed write is a failed touch, not exit 0 with nothing stored.
+        if ! db_query "UPDATE nodes SET metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"; then
+            echo "Error: could not update metadata for $id" >&2
+            return 1
+        fi
         invalidate_context_cache "$id"
     fi
 
@@ -5088,6 +5264,7 @@ cmd_quick() {
         echo -e "${RED}Error: invalid JSON in --metadata${NC}" >&2
         return 1
     fi
+    validate_metadata_object "$metadata" "--metadata" || return 1
     validate_metadata_risk_level "$metadata" "--metadata" || return 1
     validate_metadata_canonical_numbers "$metadata" "--metadata" || return 1
 
@@ -5097,17 +5274,20 @@ cmd_quick() {
 
     local id=$(generate_id)
 
-    # Escape single quotes
-    text="${text//\'/\'\'}"
-    metadata="${metadata//\'/\'\'}"
-    learning="${learning//\'/\'\'}"
-
-    # Step 1: Create node as ACTIVE (so pre-commit hook passes)
+    # Step 1: Create node as ACTIVE (so pre-commit hook passes). The JSON is
+    # built from the raw values and SQL-escaped once, at the INSERT: escaping
+    # before jq stored every apostrophe doubled ("don''t"), in the commit
+    # message as well as the node, because text was escaped in place.
     local now_meta
-    now_meta=$(echo "$metadata" | jq -c --arg l "$learning" '. + {learning: $l}' 2>/dev/null || echo "{\"learning\":\"$learning\"}")
-    now_meta="${now_meta//\'/\'\'}"
+    if ! now_meta=$(printf '%s' "$metadata" | jq -c --arg l "$learning" '. + {learning: $l}'); then
+        echo -e "${RED}Error: could not merge --learning into --metadata${NC}" >&2
+        return 1
+    fi
 
-    db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text', 'active', '$now_meta');"
+    if ! db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '${text//\'/\'\'}', 'active', '${now_meta//\'/\'\'}');"; then
+        echo -e "${RED}Error: could not create node $id — no commit attempted${NC}" >&2
+        return 1
+    fi
     echo -e "${GREEN}✓${NC} $id: $text (active)" >&2
 
     # Step 2: Commit staged changes if any exist
@@ -5687,30 +5867,39 @@ cmd_delete() {
 
     # Capture lineage BEFORE the DELETEs so the deletion tombstones carry the
     # highest lineage each row held (wv-0d5e07).
-    local _del_agent _del_tombs
+    local _del_agent _del_tombs _del_tomb_sql
     _del_agent="$(resolve_agent_id 2>/dev/null || echo unknown)"
-    _del_tombs=$(db_capture_tombstones "$id")
+    _del_tombs=$(db_capture_tombstones "$id") || return 1
+    _del_tomb_sql=$(db_tombstones_sql "$_del_agent" <<< "$_del_tombs") || return 1
 
-    # Delete edges first (no ON DELETE CASCADE)
-    db_query "DELETE FROM edges WHERE source='$id' OR target='$id';"
-    db_query "DELETE FROM node_files WHERE node_id='$id';"
-    # Delete node
-    db_query "DELETE FROM nodes WHERE id='$id';"
+    # The deletion and its cross-machine tombstones must land together. A
+    # refused tombstone must not leave an unrecorded deletion, and a refused
+    # DELETE must not leave a tombstone that will later remove the kept node.
+    if ! db_query "BEGIN IMMEDIATE;
+        $_del_tomb_sql
+        DELETE FROM edges WHERE source='$id' OR target='$id';
+        DELETE FROM node_files WHERE node_id='$id';
+        DELETE FROM nodes WHERE id='$id';
+        COMMIT;"; then
+        echo -e "${RED}Error: could not delete node $id${NC}" >&2
+        return 1
+    fi
 
-    echo -e "${GREEN}✓${NC} Deleted: $id ($node_text)"
-    [ "$edge_count" -gt 0 ] && echo "  Removed $edge_count edge(s)"
-
-    journal_complete 1
-
-    # Record cross-machine deletion tombstones + re-dump state.sql immediately
+    # Re-dump state.sql with the tombstones immediately
     # (D-3/D-4 fix, wv-0d5e07). auto_sync is throttled and may not fire, leaving
     # state.sql stale with the deleted node; wv load would then resurrect it. The
     # tombstone rows (node + every incident edge) travel in state.sql and let each
     # clone's _reconcile_tombstones drop the row again if the delta back-catalog
     # replays its creation. tombstones has no _warp trigger so this stays local
     # (delete is non-propagating), like the .prune_epoch it replaces.
-    db_write_tombstones "$_del_agent" <<< "$_del_tombs"
-    _redump_state_after_removal 1 || true
+    if ! _redump_state_after_removal 1; then
+        echo -e "${RED}Error: deletion remains in the hot-zone database; state.sql was not persisted — run 'wv sync'${NC}" >&2
+        return 1
+    fi
+    journal_complete 1
+
+    echo -e "${GREEN}✓${NC} Deleted: $id ($node_text)"
+    [ "$edge_count" -gt 0 ] && echo "  Removed $edge_count edge(s)"
 
     # Step 2: Close matching GitHub issue if linked and no other node still owns it
     if [ "$close_gh" = "true" ] && [ -n "$gh_num" ] && [ "$gh_num" != "null" ]; then

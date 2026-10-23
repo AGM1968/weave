@@ -94,6 +94,25 @@ WV_MAX_DB_SIZE=${WV_MAX_DB_SIZE:-52428800}
 # `wv` call reads the same file the interactive shell does, so CLI and hook paths
 # can never disagree (resolves the WV_CALL_LOG env-inheritance split-brain).
 # Managed via `wv config`. Safe + zero-overhead when the file is absent.
+#
+# Except inside a test suite (wv-6b0f57). Under WV_TEST_SUITE=1 with no
+# WV_CONFIG_DIR in the environment, config.env is the user's own, and it cannot
+# turn on the call log: WV_CALL_LOG keeps whatever the environment gave it, or
+# stays unset. Suites exported WV_HOT_ZONE/WV_DB but not WV_CONFIG_DIR, so every
+# wv call they made appended to the user's durable log (12k+ rows from temp
+# repositories by 2026-10-07, enough to force a rotation). A suite that tests
+# config.env-driven logging names its own config directory and is unaffected.
+# Not WV_TEST_MODE: suites switch that off to test the unarmed seams, and this
+# has to hold for the whole run, across the mcp and sync children that retag
+# WV_CALL_SOURCE. "In the environment" means exported: the line below sets
+# WV_CONFIG_DIR as a plain variable, and a suite that sources this file twice
+# in one shell (test-durability.sh does) would otherwise read its own default
+# back as a choice and let the user's config.env in on the second pass.
+_wv_cfg_from_env=""
+[ -n "${WV_CONFIG_DIR:-}" ] && [[ "$(declare -p WV_CONFIG_DIR 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]] &&
+    _wv_cfg_from_env=1
+_wv_env_call_log_set="${WV_CALL_LOG+1}"
+_wv_env_call_log="${WV_CALL_LOG-}"
 WV_CONFIG_DIR="${WV_CONFIG_DIR:-$HOME/.config/weave}"
 _wv_env_file="$WV_CONFIG_DIR/config.env"
 if [ -f "$_wv_env_file" ]; then
@@ -102,7 +121,14 @@ if [ -f "$_wv_env_file" ]; then
     . "$_wv_env_file" 2>/dev/null || true
     set +a
 fi
-unset _wv_env_file
+if [ "${WV_TEST_SUITE:-}" = "1" ] && [ -z "$_wv_cfg_from_env" ]; then
+    if [ -n "$_wv_env_call_log_set" ]; then
+        WV_CALL_LOG="$_wv_env_call_log"
+    else
+        unset WV_CALL_LOG
+    fi
+fi
+unset _wv_env_file _wv_cfg_from_env _wv_env_call_log_set _wv_env_call_log
 
 # Canonical default path for the opt-in session-analysis call log. Shared by the
 # `wv analyze sessions` reader and `wv config enable session-analysis` so the
@@ -119,7 +145,7 @@ WV_SUITE_LOG_DEFAULT="${WV_SUITE_LOG_DEFAULT:-$HOME/.local/share/weave/suite_run
 # wv_session_budget_file <hot-zone> — the one location of the per-session wv
 # call tally, written by .claude/hooks/wv-budget-tally.sh and read by wv health
 # (wv-76bb48). The hook hardcoded /dev/shm/weave/<hash> while health read the
-# hot zone, so under a sandboxed runtime (hot zone /tmp/weave-codex-<uid>)
+# hot zone, so under a sandboxed runtime (hot zone /tmp/weave-hotzone-<uid>)
 # health never saw the file and scored call discipline 25/25 unearned. Beside
 # session-edits.json, the other session counter health reads. WV_BUDGET_DIR
 # still overrides the directory for both.
@@ -146,11 +172,25 @@ fi
 # Set up hot zone and database paths
 # Per-repo namespace: hash the repo root to isolate each repo's hot zone.
 # This prevents multiple repos from sharing a single brain.db on tmpfs.
-_WV_BASE_HOT_ZONE=$(resolve_hot_zone)
+# Placement is per repository (wv-b831e3): the zone already holding this
+# repo's database wins, else the /tmp zone. When more than one holds one,
+# resolve_hot_zone explains and fails, and wv refuses below rather than pick;
+# an explicit WV_HOT_ZONE or WV_DB names the database and settles it.
+_WV_PLACEMENT_CONFLICT=""
+_WV_BASE_HOT_ZONE=$(resolve_hot_zone "$REPO_ROOT") || _WV_PLACEMENT_CONFLICT=1
 WV_HOT_ZONE="${WV_HOT_ZONE:-$(resolve_repo_hot_zone "$_WV_BASE_HOT_ZONE" "$REPO_ROOT")}"
 WV_DB_CUSTOM="${WV_DB:+1}"
 WV_DB="${WV_DB:-$(resolve_db "$WV_HOT_ZONE")}"
 WV_PRIMARY_FILE="${WV_PRIMARY_FILE:-$(resolve_primary_file "$WV_HOT_ZONE")}"
+
+# Fails closed before any use (wv-80be32): a hot zone inside a shared-parent
+# base another user could have created first is refused, never chmodded.
+if ! hot_zone_check "$WV_HOT_ZONE" || { [ -n "$WV_DB_CUSTOM" ] && ! hot_zone_check "${WV_DB%/*}"; }; then
+    return 1 2>/dev/null || exit 1
+fi
+if [ -n "$_WV_PLACEMENT_CONFLICT" ] && [ -z "$_WV_ENV_OVERRIDE_HOT_ZONE" ]; then
+    return 1 2>/dev/null || exit 1
+fi
 
 # Primary active node helpers
 # The "primary" node is the most recently claimed via `wv work`.
@@ -286,8 +326,8 @@ wv_set_phase() {
 # separated) and returns 0 if any drift, 1 if clean. No-op (returns 1) in
 # consumer repos that have no source-path pointer. Because every harness —
 # Claude, Codex, Copilot — drives the same `wv` CLI and git pre-commit, this one
-# helper backs both the bootstrap drift advisory and the pre-commit self-heal,
-# so the "run ./install.sh after editing source" signal is agent-agnostic.
+# helper backs both bootstrap and pre-commit drift advisories. Installation
+# is explicit; source admission does not update the installed runtime.
 # _wv_drift_cmp <source> <installed> — append the source's name to the caller's
 # $drifted when the installed copy is missing or differs. One comparison for
 # every source class (ultrareview #4574), so a change to how drift is judged
@@ -316,9 +356,8 @@ _wv_source_drift() {
         _wv_drift_cmp "$src" "$installed"
     done
     # Git-hook sources (wv-ff2fb1): install.sh copies them to $lib_dir/hooks/,
-    # which wv init-repo --update vendors to consumers. Without this an edited
-    # hook never triggered the pre-commit self-heal, and consumers received the
-    # stale copy until someone ran ./install.sh by hand.
+    # which wv init-repo --update vendors to consumers. Report edited hooks
+    # too, so source drift stays visible until an explicit installation.
     for src in "$src_root/scripts/hooks/"*-weave.sh; do
         [ -f "$src" ] || continue
         installed="$lib_dir/hooks/$(basename "$src")"

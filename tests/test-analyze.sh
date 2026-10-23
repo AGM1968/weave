@@ -5,6 +5,7 @@ export WV_CALL_SOURCE=test
 # Weave-ID: wv-ad7df8
 
 set -e
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -243,6 +244,10 @@ assert_not_contains "$output" "wv newcmd" "--source=test excludes other sources"
 output=$(WV_MODE=discover $WV analyze sessions --call-stats --log="$WLOG" --source=agent 2>&1)
 assert_contains "$output" "wv agentcmd" "--source=agent isolates agent traffic"
 
+# Test W14b: hook-common keeps a test run's tag (wv-25903d, as scripts/wv does)
+kept=$(WV_CALL_SOURCE="test" bash -c 'source "'"$REPO_ROOT"'/scripts/lib/wv-hook-common.sh" 2>/dev/null; echo "$WV_CALL_SOURCE"')
+assert_eq "test" "$kept" "wv-hook-common.sh keeps a test run's tag"
+
 # Test W14: hook-common forces WV_CALL_SOURCE=hook even when session env says agent
 hooked=$(WV_CALL_SOURCE=agent bash -c 'source "'"$REPO_ROOT"'/scripts/lib/wv-hook-common.sh" 2>/dev/null; echo "$WV_CALL_SOURCE"')
 if [ "$hooked" = "hook" ]; then
@@ -452,7 +457,11 @@ assert_contains "$trace_fallback_ok" "true" "trace correlation falls back to gen
 GRAPH_REPO="$ISOCONF/graph-repo"
 GRAPH_CONFIG="$ISOCONF/graph-config"
 GRAPH_LOG="$ISOCONF/graph-calls.jsonl"
-mkdir -p "$GRAPH_REPO" "$GRAPH_CONFIG"
+mkdir -p "$GRAPH_REPO" "$GRAPH_CONFIG" "$ISOCONF/zones/tmp"
+# The fixture repository's hot zone goes under $ISOCONF through the resolver's
+# test root. With default placement each run left a directory in the LIVE hot
+# zone owned by the deleted graph-repo (wv-e200f6; found by the gate's guard).
+export WV_TEST_MODE=1 WV_TEST_HOT_ZONE_ROOT="$ISOCONF/zones"
 git -C "$GRAPH_REPO" init -q
 (cd "$GRAPH_REPO" && WV_CONFIG_DIR="$GRAPH_CONFIG" $WV init >/dev/null 2>&1)
 (cd "$GRAPH_REPO" && WV_CONFIG_DIR="$GRAPH_CONFIG" WV_CALL_LOG="$GRAPH_LOG" $WV add "telemetry mutation" --force >/dev/null 2>&1)
@@ -475,6 +484,7 @@ assert_contains "$subtree_split_row" '"argv":["ready","--subtree","wv-abc123"]' 
 (cd "$GRAPH_REPO" && WV_CONFIG_DIR="$GRAPH_CONFIG" WV_CALL_LOG="$GRAPH_LOG" $WV analyze sessions --call-stats --log="$TRACELOG" --json >/dev/null 2>&1)
 analyze_row=$(tail -1 "$GRAPH_LOG" 2>/dev/null || true)
 assert_contains "$analyze_row" '"argv":["analyze","sessions","--call-stats","--log=<redacted:' "analyze mode and log option remain visible while path is redacted"
+unset WV_TEST_MODE WV_TEST_HOT_ZONE_ROOT
 rm -rf "$ISOCONF"
 
 echo ""
@@ -529,6 +539,29 @@ assert_contains "$src" '"source":"hook"' "hook override beats Copilot marker"
 # Test 33: spurious COPILOT_AGENT value (not "1") does not attest agent
 src=$(adapter_source COPILOT_AGENT=0)
 assert_contains "$src" '"source":"shell"' "COPILOT_AGENT=0 does not attest agent"
+
+# Tests 34-36: wv hook is the neutral lifecycle-hook entry and tags itself hook
+# whatever the host attested (wv-b2f8a8): Codex's hooks.json carries
+# CODEX_THREAD_ID, Claude adapters inherit WV_CALL_SOURCE=agent. The Stop event
+# also spawns a nested wv call, which must inherit hook. Prints the distinct
+# sources of every row the dispatch logged.
+dispatch_sources() {
+    local conf log
+    conf=$(mktemp -d)
+    log="$conf/calls.jsonl"
+    echo '{"session_id":"s","hook_event_name":"Stop"}' \
+        | env -u WV_CALL_SOURCE -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+            WV_CONFIG_DIR="$conf" WV_CALL_LOG="$log" "$@" \
+            "$WV" hook dispatch --event=Stop --json >/dev/null 2>&1
+    jq -r '.source' "$log" 2>/dev/null | sort -u | paste -sd ',' -
+    rm -rf "$conf"
+}
+assert_eq "hook" "$(dispatch_sources CODEX_THREAD_ID=thr_abc123)" \
+    "wv hook dispatch under a Codex marker logs hook, nested calls included"
+assert_eq "hook" "$(dispatch_sources WV_CALL_SOURCE=agent)" \
+    "wv hook dispatch inheriting Claude's agent tag logs hook, nested calls included"
+assert_eq "test" "$(dispatch_sources WV_CALL_SOURCE=test)" \
+    "wv hook dispatch keeps a test run's tag"
 
 echo ""
 

@@ -9,6 +9,7 @@
 # an unrelated agent's not-yet-replayed work is never skipped.
 
 set -eu
+export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 export WV_CALL_SOURCE=test
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -92,7 +93,7 @@ node_present "$C" && ok "reload: unrelated un-replayed node C was applied (no ep
 
 # ── 3b. wv prune also tombstones (not .prune_epoch) and the row survives reload ─
 P=$("$WV" add "tombstone P — to be pruned" --status=todo | tail -1)
-"$WV" done "$P" >/dev/null 2>&1
+"$WV" "done" "$P" >/dev/null 2>&1
 sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now','-72 hours') WHERE id='$P';"
 "$WV" prune --age=48h >/dev/null 2>&1
 [ ! -e "$WEAVE_DIR/.prune_epoch" ] && ok "wv prune does not create .weave/.prune_epoch" \

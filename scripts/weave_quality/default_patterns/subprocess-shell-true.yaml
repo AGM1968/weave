@@ -1,5 +1,6 @@
 id: subprocess-shell-true
 language: python
+violation_type: code:unsafe-subprocess
 message: "subprocess called with shell=True enables shell injection. Prefer list args without shell=True."
 severity: warning
 rule:

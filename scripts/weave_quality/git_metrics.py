@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import subprocess
 from collections import Counter
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -104,7 +105,9 @@ def _worktree_blob_shas(repo: str | Path, rels: list[str]) -> dict[str, str]:
     return dict(zip(rels, shas)) if len(shas) == len(rels) else {}
 
 
-def working_tree_blob_shas(repo: str | Path) -> dict[str, str]:
+def working_tree_blob_shas(
+    repo: str | Path, include: Iterable[str] = ()
+) -> dict[str, str]:
     """Blob SHAs describing what is ON DISK, not what HEAD holds.
 
     `batch_blob_shas` reads `git ls-tree -r HEAD`, so its SHA for a tracked file
@@ -118,24 +121,27 @@ def working_tree_blob_shas(repo: str | Path) -> dict[str, str]:
 
     Every uncommitted edit is invisible under the HEAD map, which is the state a
     repository is in exactly when the gate runs. One `git diff` names the dirty
-    tracked files and their real content is hashed here. Untracked files are
-    absent from ls-tree, keep the empty string, and continue to fall through to
-    mtime.
+    tracked files and their real content is hashed here.
+
+    Untracked files are absent from ls-tree. Those named in `include` are
+    hashed too: left keyless they fell through to integer-second mtime, so an
+    edit landing in the scan's own second was never rescanned (wv-fe9a6a).
     """
     blob_map = batch_blob_shas(repo)
+    root = Path(repo)
+    present: list[str] = [
+        rel for rel in include if rel not in blob_map and (root / rel).is_file()
+    ]
     # -z: unquoted paths (core.quotePath would C-quote non-ASCII names, which
     # then never match a real file). --no-renames: a renamed-away path must be
     # listed so its stale HEAD SHA is dropped below (wv-a10e0f).
     dirty = _git(["diff", "--name-only", "-z", "--no-renames", "HEAD"], cwd=repo)
-    if not dirty:
-        return blob_map
-    root = Path(repo)
-    present: list[str] = []
     for rel in dirty.split("\0"):
         if not rel:
             continue
         if (root / rel).is_file():
-            present.append(rel)
+            if rel not in present:
+                present.append(rel)
         else:
             # Deleted in the working tree: drop the stale HEAD SHA so the file
             # falls through to mtime rather than asserting committed content.

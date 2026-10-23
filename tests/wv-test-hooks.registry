@@ -24,9 +24,16 @@
 # that executes the fault, so an unrecognised value was accepted on a cache hit
 # and on a sweep with no orphans respectively -- the ordinary fast paths.
 #
+# WV_TEST_SUITE is the one exception to the master opt-in, and it is not a
+# fault hook: it only takes behaviour away, never diverts it, so a stray value
+# in a real environment can do no more than stop that shell's analytics.
+#
 # format: NAME | owning file | allowed values | purpose
 WV_TEST_MODE | (master) | 1 | Master opt-in. Every hook below is inert without it.
+WV_TEST_SUITE | scripts/lib/wv-config.sh | 1 | Not gated on WV_TEST_MODE, which suites switch off to test the unarmed seams. Marks a suite run: the user's config.env cannot enable WV_CALL_LOG for it (an explicit WV_CALL_LOG or WV_CONFIG_DIR still applies), so suite wv calls stay out of the durable call log (wv-6b0f57). Every suite exports it bar a named exemption, and so does the gate pool's worker.
 WV_TEST_SYNC_STUB | scripts/cmd/wv-cmd-data.sh | ok,fail:state,fail:nodes,fail:edges | Stands in for a succeeding GitHub step so the post-sync projection and stamping path is reachable offline, and forces one projection to fail.
 WV_TEST_FAIL_ORPHAN_KINDS | scripts/cmd/wv-cmd-data.sh | 1 | Forces the orphan-kind classifier to fail as a whole, a branch unreachable from the CLI.
 WV_TEST_IMPACT_RACE | scripts/cmd/wv-cmd-graph.sh | 1 | Mutates the graph during the impact walk, the window the cache publication check exists to close.
+WV_TEST_HOT_ZONE_BASE | scripts/lib/wv-resolve-runtime.sh | an absolute path | Adds one directory to the hot-zone bases the wv-80be32 guard checks, so tests drive it on a private base instead of a live one. It can only add a base, never remove one; weave_gh/data.py honours it the same way.
+WV_TEST_HOT_ZONE_ROOT | scripts/lib/wv-resolve-runtime.sh | an absolute path | Prefixes the three Linux placement zones (wv-b831e3) so tests can populate them in a private tree; the prefixed zones are also guarded bases. weave_gh/data.py honours it the same way.
 WV_TEST_POLICY_RACE | scripts/cmd/wv-cmd-core.sh | 1 | Loosens every close-policy input after the close transaction decides and before the decision is reported, the window a re-derived verdict would drift in.
