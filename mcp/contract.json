@@ -1,6 +1,6 @@
 {
   "schema": "weave-mcp-contract.v1",
-  "version": "1.71.0-rc.14",
+  "version": "1.71.0-rc.15",
   "transport": "stdio",
   "default_scope": "all",
   "startup_report_schema": "weave-mcp-startup.v1",
@@ -40,7 +40,7 @@
   ],
   "scopes": {
     "all": {
-      "tool_count": 46,
+      "tool_count": 48,
       "purpose": "Full backward-compatible MCP surface for general work",
       "intended_clients": ["copilot-chat", "general-mcp"],
       "start_when": "Use as the default server for general interactive work or when a client cannot select narrower scoped servers.",
@@ -54,21 +54,21 @@
       "configured_by_default": false
     },
     "session": {
-      "tool_count": 12,
+      "tool_count": 14,
       "purpose": "Workflow lifecycle surface for claim, guard, close, and session handoff",
       "intended_clients": ["copilot-chat", "workflow-subagent"],
       "start_when": "Use for agents whose primary job is claim, edit guard, close, recovery, or session handoff.",
       "configured_by_default": true
     },
     "lite": {
-      "tool_count": 7,
+      "tool_count": 9,
       "purpose": "Minimal task-tracking surface for constrained contexts",
       "intended_clients": ["copilot-chat", "codex-optional", "constrained-context-agent"],
       "start_when": "Use where context budget is tight and only bootstrap/status/work/done/edit-guard basics are needed.",
       "configured_by_default": true
     },
     "inspect": {
-      "tool_count": 23,
+      "tool_count": 24,
       "purpose": "Read-only observation, search, health, and quality inspection surface",
       "intended_clients": ["copilot-chat", "read-only-subagent", "review-subagent"],
       "start_when": "Use for research, review, audit, search, health, quality, and other read-only inspection workflows.",

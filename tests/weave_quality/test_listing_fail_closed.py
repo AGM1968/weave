@@ -15,6 +15,7 @@ import argparse
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -31,7 +32,7 @@ from weave_quality.__main__ import (
 )
 from weave_quality.db import init_db
 from weave_quality.external_tools import ast_grep_bin
-from weave_quality.listing import directory_entries, iter_tree
+from weave_quality.listing import directory_entries, iter_tree, repo_files
 from weave_quality.pattern_loader import _load_pattern_rules
 from weave_quality.prose_rules import (
     PatternRuleExecutionError,
@@ -231,6 +232,170 @@ def test_code_rule_scan_refuses_an_unlistable_directory(tmp_path: Path, locked: 
         _run_pattern_rule("bare-call", rule, target, 1, target, "python")
 
 
+@pytest.mark.skipif(not ast_grep_bin(), reason="ast-grep not installed")
+def test_code_rule_scan_refuses_an_unreadable_file_of_its_language(tmp_path: Path) -> None:
+    """wv-0da129: ast-grep skips an unreadable file with no message and exit 0.
+
+    Its skippedFileCount also counts empty and binary files, which are
+    readable and must not refuse the scan; the control holds both.
+    """
+    target = tmp_path / "src"
+    target.mkdir()
+    (target / "a.py").write_text("x()\n")
+    (target / "empty.py").write_text("")
+    (target / "blob.py").write_bytes(bytes(range(256)) * 16)
+    rule = tmp_path / "bare-call.yaml"
+    rule.write_text(CODE_RULE)
+    found = _run_pattern_rule("bare-call", rule, target, 1, target, "python")
+    assert [f.path for f in found] == ["a.py"]  # control: empty and binary skips are not refused
+    shut = target / "shut.py"
+    shut.write_text("x()\n")
+    shut.chmod(0)
+    try:
+        with pytest.raises(PatternRuleExecutionError, match="could not read, so the scan is incomplete"):
+            _run_pattern_rule("bare-call", rule, target, 1, target, "python")
+        # A file of another language is not the rule's concern.
+        shut.chmod(0o644)
+        (target / "notes.sh").write_text("echo\n")
+        (target / "notes.sh").chmod(0)
+        assert [f.path for f in _run_pattern_rule("bare-call", rule, target, 1, target, "python")] \
+            == ["a.py", "shut.py"]
+    finally:
+        shut.chmod(0o644)
+        if (target / "notes.sh").exists():
+            (target / "notes.sh").chmod(0o644)
+
+
+@pytest.mark.skipif(not ast_grep_bin(), reason="ast-grep not installed")
+def test_code_rule_findings_do_not_follow_ast_grep_completion_order(tmp_path: Path) -> None:
+    """ast-grep reports files in the order its parallel workers finish, which
+    varied run to run, so the assertion above flaked under a loaded gate
+    (wv-d94b8a). Fed ast-grep's own output in reverse, the result is the same."""
+    target = tmp_path / "src"
+    target.mkdir()
+    for name in ("a.py", "b.py"):
+        (target / name).write_text("x()\nx()\n")
+    rule = tmp_path / "bare-call.yaml"
+    rule.write_text(CODE_RULE)
+    real_run = subprocess.run
+    captured: list[subprocess.CompletedProcess[str]] = []
+
+    # Both wrappers stand in for the scanner's own subprocess.run call and
+    # forward its keyword arguments, check= among them, unchanged.
+    def capture(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        proc = real_run(*args, **kwargs)  # type: ignore[call-overload]  # pylint: disable=subprocess-run-check
+        if "scan" in list(args[0]):  # type: ignore[call-overload]
+            captured.append(proc)
+        return proc
+
+    with patch("weave_quality.__main__.subprocess.run", side_effect=capture):
+        forward = _run_pattern_rule("bare-call", rule, target, 1, target, "python")
+    assert [(f.path, f.line) for f in forward] == [("a.py", 1), ("a.py", 2), ("b.py", 1), ("b.py", 2)]
+    scan = captured[-1]
+    reversed_out = json.dumps(list(reversed(json.loads(scan.stdout))))
+
+    def replay(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "scan" in list(args[0]):  # type: ignore[call-overload]
+            return subprocess.CompletedProcess(scan.args, scan.returncode, reversed_out, scan.stderr)
+        return real_run(*args, **kwargs)  # type: ignore[call-overload]  # pylint: disable=subprocess-run-check
+
+    with patch("weave_quality.__main__.subprocess.run", side_effect=replay):
+        backward = _run_pattern_rule("bare-call", rule, target, 1, target, "python")
+    assert [(f.path, f.line) for f in backward] == [(f.path, f.line) for f in forward]
+
+
+@pytest.mark.skipif(not ast_grep_bin(), reason="ast-grep not installed")
+def test_code_rule_scan_in_a_repository_follows_what_ast_grep_walks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inside a repository ast-grep honours .gitignore and skips hidden
+    directories, so an unreadable file there is not refused; one it walks is.
+    A hook's GIT_DIR must not point the listing at another repository."""
+    for key in list(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key)
+    target = tmp_path / "repo"
+    (target / ".hidden").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(target)], check=True)
+    (target / ".gitignore").write_text("ignored.py\n")
+    (target / "a.py").write_text("x()\n")
+    (target / "empty.py").write_text("")  # a skip ast-grep counts, so the check runs
+    locked = [target / "ignored.py", target / ".hidden" / "h.py"]
+    for path in locked:
+        path.write_text("x()\n")
+        path.chmod(0)
+    rule = tmp_path / "bare-call.yaml"
+    rule.write_text(CODE_RULE)
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere"))
+    try:
+        found = _run_pattern_rule("bare-call", rule, target, 1, target, "python")
+        assert [f.path for f in found] == ["a.py"]  # control
+        shut = target / "shut.py"
+        shut.write_text("x()\n")
+        shut.chmod(0)
+        locked.append(shut)
+        with pytest.raises(PatternRuleExecutionError, match="1 file"):
+            _run_pattern_rule("bare-call", rule, target, 1, target, "python")
+    finally:
+        for path in locked:
+            path.chmod(0o644)
+
+
+def _prose_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """A repository with a tracked, an untracked and an ignored finding."""
+    for key in list(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key)
+    target = tmp_path / "repo"
+    (target / "build").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(target)], check=True)
+    (target / ".gitignore").write_text("build/\n")
+    (target / "tracked.md").write_text("a genuine claim\n")
+    subprocess.run(["git", "-C", str(target), "add", "tracked.md", ".gitignore"], check=True)
+    (target / "untracked.md").write_text("another genuine claim\n")
+    (target / "build" / "out.md").write_text("a genuine build artefact\n")
+    rule = tmp_path / "emphasis.yaml"
+    rule.write_text(PROSE_RULE)
+    # A hook's GIT_DIR must not point the listing at another repository.
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere"))
+    return target, rule
+
+
+def test_prose_scan_in_a_repository_reads_gits_set_not_ignored_trees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A root prose scan walked every ignored tree once per rule: 1,965 files
+    read to scan 247 here, over 11 minutes, with the ignored trees' findings
+    reported (wv-c309a8). Inside a repository the set is git's: tracked plus
+    untracked, not ignored. Scope claims and prose shape read the same set."""
+    target, rule = _prose_repo(tmp_path, monkeypatch)
+    found = sorted(f.path for f in run_prose_rule("emphasis", rule, target, 1, target))
+    assert found == ["tracked.md", "untracked.md"]
+    assert [p.name for p in markdown_files(target)] == ["tracked.md", "untracked.md"]
+    for name in ("tracked.md", "untracked.md"):
+        (target / name).unlink()
+    # Only the ignored tree holds markdown now: nothing in scope, nothing read.
+    assert prose_rule_out_of_scope(rule, target, target) is True
+    assert run_prose_rule("emphasis", rule, target, 1, target) == []
+
+
+def test_repository_listing_refuses_an_unreadable_untracked_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, locked: list[Path],
+) -> None:
+    """git lists past an untracked directory it cannot open with a warning and
+    exit 0; the listing must refuse, not report clean (wv-4852bd)."""
+    target, rule = _prose_repo(tmp_path, monkeypatch)
+    (target / "shut").mkdir()
+    (target / "shut" / "b.md").write_text("a genuine claim\n")
+    assert "shut/b.md" in {f.path for f in run_prose_rule("emphasis", rule, target, 1, target)}
+    lock(locked, target / "shut")
+    with pytest.raises(OSError, match="could not open directory"):
+        repo_files(target)
+    with pytest.raises(PatternRuleExecutionError, match="cannot list target"):
+        run_prose_rule("emphasis", rule, target, 1, target)
+    assert prose_rule_out_of_scope(rule, target, target) is False
+
+
 # ── prose shape ─────────────────────────────────────────────────────────────
 
 
@@ -266,25 +431,25 @@ def test_policy_scan_reports_an_unlistable_directory(tmp_path: Path, locked: lis
     assert any("cannot be listed" in e for e in checker.errors)
 
 
+# ── coaching evidence: the default-rule inventory ───────────────────────────
+
+
+def test_coaching_manifest_refuses_an_unlistable_rule_directory(tmp_path: Path, locked: list[Path]) -> None:
+    from weave_quality.coaching_evidence import _package_rule_manifest  # pylint: disable=import-outside-toplevel
+    copied = tmp_path / "default_patterns"
+    copied.mkdir()
+    for path in directory_entries(REPO_ROOT / "scripts" / "weave_quality" / "default_patterns"):
+        (copied / path.name).write_bytes(path.read_bytes())
+    _package_rule_manifest(copied)  # control
+    # Searchable but not listable: the manifest still reads by name, so only
+    # the listing can fail. glob read it as empty and blamed the manifest.
+    copied.chmod(0o311)
+    locked.append(copied)
+    with pytest.raises(PermissionError):
+        _package_rule_manifest(copied)
+
+
 # ── the E6 implementation closure and graph snapshot ────────────────────────
 
-
-def test_e6_closure_and_snapshot_refuse_an_unlistable_directory(tmp_path: Path, locked: list[Path]) -> None:
-    e6 = _module("e6_durability_under_test", REPO_ROOT / "scripts" / "weave_evidence" / "e6_durability.py")
-    for rel in e6.EXPLICIT_IMPLEMENTATION_SOURCES:
-        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / rel).write_text("x\n")
-    for sub in ("scripts/lib", "scripts/cmd"):
-        (tmp_path / sub).mkdir(parents=True, exist_ok=True)
-        (tmp_path / sub / "m.sh").write_text("echo\n")
-    (tmp_path / ".weave" / "deep").mkdir(parents=True)
-    (tmp_path / ".weave" / "deep" / "state.sql").write_text("x\n")
-    paths = {row["path"] for row in e6.implementation_sources(tmp_path)}
-    assert {"scripts/lib/m.sh", "scripts/cmd/m.sh"} <= paths  # control
-    assert [f["path"] for f in e6.graph_snapshot(tmp_path)["files"]] == [".weave/deep/state.sql"]
-    lock(locked, tmp_path / "scripts" / "cmd")
-    with pytest.raises(e6.BatteryError, match="cannot list"):
-        e6.implementation_sources(tmp_path)
-    lock(locked, tmp_path / ".weave" / "deep")
-    with pytest.raises(e6.BatteryError, match="cannot list"):
-        e6.graph_snapshot(tmp_path)
+# The evidence runners and the release aggregate do not ship, so neither do
+# these tests (wv-43d08d).

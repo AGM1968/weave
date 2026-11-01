@@ -21,7 +21,7 @@ from pathlib import Path
 from collections.abc import Callable, Sequence
 from typing import Iterator
 
-from weave_quality.listing import iter_tree
+from weave_quality.listing import repo_files
 from weave_quality.models import PatternFinding
 
 PROSE_LANGUAGES = {"prose", "markdown"}
@@ -604,10 +604,14 @@ def _iter_text_files(target: Path, include: list[str], repo: Path) -> list[Path]
             return []
         return [target]
     files: list[Path] = []
-    for path in sorted(iter_tree(target)):
-        if not path.is_file() or path.suffix.lower() not in _TEXT_SUFFIXES:
+    # git's set inside a repository, not a walk that read every ignored tree
+    # once per rule (wv-c309a8). Skip parts are matched below the target, so
+    # a checkout under a directory named "archive" is not skipped whole.
+    for rel in sorted(repo_files(target)):
+        path = target / rel
+        if path.suffix.lower() not in _TEXT_SUFFIXES or not path.is_file():
             continue
-        if _SKIP_PARTS.intersection(path.parts):
+        if _SKIP_PARTS.intersection(rel.parts):
             continue
         if include and not any(
             fnmatch(_repo_relative_posix(path, repo), glob) for glob in include
@@ -648,11 +652,14 @@ def code_rule_out_of_scope(language: str, target: Path) -> bool:
     # cannot be listed may hold files of the language, so the claim is not
     # made: rglob walked past it, and a skipped rule read as out of scope
     # (wv-4852bd).
+    # The same listing the scan reads (wv-c309a8): a file in an ignored tree
+    # put a rule in scope that then read nothing there.
     try:
-        for path in iter_tree(target):
-            if ".git" in path.parts:
+        for rel in repo_files(target):
+            if ".git" in rel.parts:
                 continue
-            if path.is_file() and path.suffix.lower() in suffixes:
+            path = target / rel
+            if path.suffix.lower() in suffixes and path.is_file():
                 return False
     except OSError:
         return False
@@ -690,11 +697,13 @@ def prose_rule_out_of_scope(
         )
     # As in code_rule_out_of_scope: an unlistable directory may hold files in
     # scope, so out of scope is not claimed (wv-4852bd).
+    # The listing _iter_text_files reads, so scope and scan agree (wv-c309a8).
     try:
-        for path in iter_tree(target):
-            if not path.is_file() or path.suffix.lower() not in _TEXT_SUFFIXES:
+        for rel in repo_files(target):
+            path = target / rel
+            if path.suffix.lower() not in _TEXT_SUFFIXES or not path.is_file():
                 continue
-            if _SKIP_PARTS.intersection(path.parts):
+            if _SKIP_PARTS.intersection(rel.parts):
                 continue
             if include and not any(
                 fnmatch(_repo_relative_posix(path, resolved_repo), glob) for glob in include

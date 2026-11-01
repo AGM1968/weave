@@ -79,6 +79,9 @@ validate_procedure() {
     visibility=$(awk -F': *' '/^visibility:/{print $2; exit}' "$file")
     status=$(awk -F': *' '/^status:/{print $2; exit}' "$file")
     [[ "$id" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "procedure $file: missing/invalid id" >&2; return 1; }
+    # wv guide finds a repository procedure by its file name, and a repository
+    # procedure replaces the package one with the same id (wv-fc71f0).
+    [ "$(basename "$file")" = "$id.md" ] || { echo "procedure $file: file name must be $id.md" >&2; return 1; }
     [ "$fallback" = "wv guide --procedure=$id" ] || { echo "procedure $file: fallback must be wv guide --procedure=$id" >&2; return 1; }
     [ -n "$description" ] || { echo "procedure $file: description must be non-empty" >&2; return 1; }
     [ -n "$adapters" ] || { echo "procedure $file: adapters required" >&2; return 1; }

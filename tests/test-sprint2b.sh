@@ -670,7 +670,7 @@ POETRYFAKE
     resolved=$(REPO_ROOT="$TEST_DIR" PATH="$TEST_DIR/fake-bin:/usr/bin:/bin" \
         bash -c 'source "$1"; source "$2"; _bootstrap_python_command' _ \
         "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" \
-        "$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh")
+        "$PROJECT_ROOT/scripts/cmd/wv-cmd-python.sh")
     assert_equals "$expected_system_python" "$resolved" \
         "uv repository with unavailable virtualenv falls back to an existing interpreter"
 
@@ -678,7 +678,7 @@ POETRYFAKE
         PATH="$TEST_DIR/fake-bin:/usr/bin:/bin" \
         bash -c 'source "$1"; source "$2"; _wv_agent_python_exec_module resolver_probe "$3"' _ \
         "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" \
-        "$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh" "$TEST_DIR/modules")
+        "$PROJECT_ROOT/scripts/cmd/wv-cmd-python.sh" "$TEST_DIR/modules")
     assert_equals "module ran" "$output" \
         "agent module executes without invoking a repository package manager"
     assert_equals "false" "$([ -e "$marker" ] && echo true || echo false)" \
@@ -694,7 +694,7 @@ PYTHONFAKE
     resolved=$(REPO_ROOT="$TEST_DIR" PATH="$TEST_DIR/fake-bin:/usr/bin:/bin" \
         bash -c 'source "$1"; source "$2"; _bootstrap_python_command' _ \
         "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" \
-        "$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh")
+        "$PROJECT_ROOT/scripts/cmd/wv-cmd-python.sh")
     assert_equals "$TEST_DIR/.venv/bin/python3" "$resolved" \
         "Poetry repository uses its existing virtualenv interpreter directly"
 }

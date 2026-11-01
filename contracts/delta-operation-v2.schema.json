@@ -22,7 +22,7 @@
     },
     "status_value": {
       "type": "string",
-      "enum": ["todo", "ready", "active", "blocked", "done"]
+      "enum": ["todo", "ready", "active", "blocked", "blocked-external", "done"]
     },
     "claimed_by_value": {
       "oneOf": [

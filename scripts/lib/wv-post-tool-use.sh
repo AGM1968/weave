@@ -418,22 +418,28 @@ wv_potu_budget_guard() (
 # - Other files: prettier (auto-format if supported)
 
 # _restore_generated_regions <original> <formatted> -- prints <formatted> with
-# every '<!-- BEGIN GENERATED ... -->' .. '<!-- END GENERATED ... -->' region
-# replaced by the same region from <original>, byte for byte. Those regions
-# belong to a generator whose --check compares them exactly; prettier reflowing
-# the workflow-classes block in templates/WORKFLOW.md turned make check red
-# after an unrelated prose edit (wv-5af710). Exits 3 without a result if the
-# regions do not pair up in order, so the caller leaves the file alone.
+# every generated region replaced by the same region from <original>, byte for
+# byte. Those regions belong to a generator whose --check compares them
+# exactly; prettier reflowing the workflow-classes block in templates/WORKFLOW.md
+# turned make check red after an unrelated prose edit (wv-5af710). Every marker
+# family a generator writes counts: '<!-- BEGIN GENERATED', the init-repo and
+# procedure blocks '<!-- BEGIN WEAVE', and the '<!-- ── BEGIN WEAVE' blocks of
+# CLAUDE.md, AGENTS.md and copilot-instructions.md. Only the first was known,
+# so an edit to CLAUDE.md reflowed its managed blocks and the commit gate
+# refused the file as projection drift (wv-89e3dd). Exits 3 without a result
+# if the regions do not pair up in order, so the caller leaves the file alone.
+_WV_POTU_REGION_BEGIN='^<!-- (── )?BEGIN (GENERATED|WEAVE)'
+_WV_POTU_REGION_END='^<!-- (── )?END (GENERATED|WEAVE)'
 _restore_generated_regions() {
-    awk '
+    awk -v begin="$_WV_POTU_REGION_BEGIN" -v end="$_WV_POTU_REGION_END" '
         NR == FNR {
-            if ($0 ~ /^<!-- BEGIN GENERATED/) { inside = 1; n++; head[n] = $0 }
+            if ($0 ~ begin) { inside = 1; n++; head[n] = $0 }
             if (inside) region[n] = region[n] $0 "\n"
-            if (inside && $0 ~ /^<!-- END GENERATED/) inside = 0
+            if (inside && $0 ~ end) inside = 0
             next
         }
-        skipping { if ($0 ~ /^<!-- END GENERATED/) skipping = 0; next }
-        /^<!-- BEGIN GENERATED/ {
+        skipping { if ($0 ~ end) skipping = 0; next }
+        $0 ~ begin {
             k++
             if (k > n || $0 != head[k]) { bad = 1; exit }
             printf "%s", region[k]; skipping = 1; next
@@ -491,7 +497,7 @@ _potu_lint_one() (
                     # Format to a temp file and write back only a complete result, in
                     # place so the file keeps its mode.
                     if prettier "$FILE_PATH" > "$FORMATTED" 2>/dev/null; then
-                        if grep -q '^<!-- BEGIN GENERATED' "$FILE_PATH"; then
+                        if grep -qE -- "$_WV_POTU_REGION_BEGIN" "$FILE_PATH"; then
                             _restore_generated_regions "$FILE_PATH" "$FORMATTED" > "$RESULT" || : > "$RESULT"
                         else
                             cp "$FORMATTED" "$RESULT"
@@ -611,6 +617,14 @@ wv_potu_memory_guard() (
     fi
 
     MEMORY_DIR="${FILE_PATH%/*}"
+
+    # A repository that keeps Claude memory outside the graph by recorded
+    # choice is told nothing and imports nothing: the committed choice outranks
+    # a user-level WV_MEMORY_CAPTURE (wv-27131a, ruling D3 on wv-80fa17).
+    if _potu_source wv-checkpoint-ci \
+            && wv_memory_outside_graph "$REPO_ROOT/.weave" claude >/dev/null 2>&1; then
+        exit 0
+    fi
 
     # Default is dry: record an advisory the agent/operator can act on, no graph
     # write. Opt in with WV_MEMORY_CAPTURE=1 to import as candidate.

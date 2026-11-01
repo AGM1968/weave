@@ -53,6 +53,7 @@ counted "wv add --status=active" add "an active countable node" --standalone --s
 a=$(node "work target" wt); b=$(node "block target" bt)
 counted "wv work" work "$a"
 counted "wv block" block "$b" --by="$a"
+counted "wv link" link "$a" "$b" --type=relates_to
 counted "wv update" update "$b" --text="changed text"
 c=$(node "done target" dt); w work "$c" >/dev/null
 counted "wv done" done "$c" --learning="pattern: a distinctive zebra phrase" --verification-method=m --verification-evidence=e
@@ -76,6 +77,8 @@ k=$(node "bulk target" bkt); printf '[{"id":"%s","status":"todo"}]' "$k" > "$TMP
 STDIN="$TMP/bulk.json" counted "wv bulk-update" bulk-update
 r1=$(node "resolve one" r1); r2=$(node "resolve two" r2)
 counted "wv resolve --defer" resolve "$r1" "$r2" --defer
+r3=$(node "resolve three" r3); r4=$(node "resolve four" r4)
+counted "wv resolve --winner" resolve "$r3" "$r4" --winner="$r3"
 F="$TMP/fresh"; mkdir -p "$F/cfg"; git -C "$F" init -q .
 before=$(wc -l < "$J")
 (cd "$F" && WEAVE_DIR="$F/.weave" WV_HOT_ZONE="$F/hot" WV_CONFIG_DIR="$F/cfg" WV_EVIDENCE_MODE=1 \

@@ -165,9 +165,10 @@ class TestParseGhLabelsToMetadata:
         meta = parse_gh_labels_to_metadata(["P4"])
         assert meta["priority"] == 4
 
-    def test_type_from_bug(self) -> None:
+    def test_bug_label_is_not_a_kind(self) -> None:
+        # bug is a change type, which wv refuses as metadata.type (wv-f7dfd3).
         meta = parse_gh_labels_to_metadata(["bug"])
-        assert meta["type"] == "bug"
+        assert "type" not in meta
 
     def test_type_from_enhancement(self) -> None:
         meta = parse_gh_labels_to_metadata(["enhancement"])

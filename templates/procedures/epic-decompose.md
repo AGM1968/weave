@@ -15,10 +15,10 @@ all break silently. Always link sub-tasks at creation time:
 
 ```bash
 # 1. Create the epic
-EPIC=$(wv add "Epic: big feature" --metadata='{"type":"epic","priority":1}')
+EPIC=$(wv add "Epic: big feature" --kind=epic --metadata='{"priority":1}')
 
 # 2. Create features linked to the epic — --parent creates the implements edge
-FEAT=$(wv add "Feature: sub-capability" --metadata='{"type":"feature"}' --parent=$EPIC)
+FEAT=$(wv add "Feature: sub-capability" --kind=feature --parent=$EPIC)
 
 # 3. Create tasks linked to their feature — set criteria at creation time
 TASK=$(wv add "task(S1): specific work" --parent=$FEAT \

@@ -44,6 +44,7 @@ from weave_gh.labels import (
 )
 from weave_gh.models import (
     NODE_ID_RE,
+    NODE_KINDS,
     NODE_STATUSES,
     GitHubIssue,
     Mode,
@@ -986,8 +987,11 @@ def sync_github_to_weave(
 
             # Parse issue template form fields (### Type, ### Priority, etc.)
             form = parse_issue_template_fields(issue.body)
-            if "type" in form:
-                meta["type"] = form["type"]
+            # Only a node kind becomes metadata.type (wv-f7dfd3); a change
+            # type such as bug stays on the issue as its label.
+            form_type = str(form.get("type", "")).strip().lower()
+            if form_type in NODE_KINDS:
+                meta["type"] = form_type
             if "priority" in form:
                 # Extract P-number: "P1 (high)" → 1
                 p_match = re.match(r"P(\d)", form["priority"])

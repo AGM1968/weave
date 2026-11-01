@@ -12,7 +12,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WV="$ROOT/scripts/wv"
 run=0; pass=0
 ok()  { run=$((run+1)); pass=$((pass+1)); echo "  ✓ $1"; }
-bad() { run=$((run+1)); echo "  ✗ $1"; [ -n "${2:-}" ] && echo "      $2"; }
+bad() { run=$((run+1)); echo "  ✗ $1"; [ -n "${2:-}" ] && echo "      $2"; return 0; }
 TMP=$(mktemp -d /tmp/wv-risk-level-XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 

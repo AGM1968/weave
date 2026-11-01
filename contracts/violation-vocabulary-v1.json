@@ -37,8 +37,6 @@
     "code:unsafe-subprocess": {"guide": "unsafe-subprocess", "status": "canonical", "summary": "A subprocess invocation lets the shell reinterpret its arguments."},
     "code:unquoted-expansion": {"guide": "unquoted-expansion", "status": "canonical", "summary": "An unquoted expansion re-splits and globs its own value."},
     "code:vacuous-verification": {"guide": "vacuous-verification", "status": "canonical", "summary": "A check that exists and reads as coverage but cannot fail on the defect it names."},
-    "code:rename-blind-listing": {"guide": "rename-blind-listing", "status": "canonical", "summary": "A path listing that follows renames drops the old path where the old path decides the outcome."},
-    "code:live-db-file-operation": {"guide": "live-db-file-operation", "status": "canonical", "summary": "A file-level operation on a live SQLite database bypasses its WAL and can corrupt it."},
     "prose:generated-vocabulary": {"guide": "generated-vocabulary", "status": "canonical", "summary": "High-frequency generated-text vocabulary decorates instead of informing."},
     "prose:filler": {"guide": "filler", "status": "canonical", "summary": "Filler and hedging phrases that carry no claim."},
     "prose:unearned-significance": {"guide": "unearned-significance", "status": "canonical", "summary": "Headings or scaffolding that announce importance the content does not carry."},

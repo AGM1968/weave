@@ -178,6 +178,22 @@ resolve_hot_zone_owner_file() {
     [ -n "$hot_zone" ] && echo "${hot_zone}/.repo_root" || true
 }
 
+# wv_shared_worktree_main <dir> <other-dir> — when the two directories are
+# checkouts of one repository (the same git common dir) and <dir> is a linked
+# worktree, print the main checkout; else print nothing. A linked worktree keeps
+# its own graph (owner ruling wv-d88fed), so the refusals that send an agent
+# back to "the" graph name the main checkout and say so (wv-ca1f94).
+wv_shared_worktree_main() {
+    local dir="$1" other="$2" common other_common gd
+    [ -n "$dir" ] && [ -n "$other" ] && [ -d "$dir" ] && [ -d "$other" ] || return 0
+    common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+    other_common=$(git -C "$other" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+    [ "$common" = "$other_common" ] || return 0
+    gd=$(git -C "$dir" rev-parse --path-format=absolute --absolute-git-dir 2>/dev/null) || return 0
+    [ "$gd" != "$common" ] || return 0
+    git -C "$dir" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p'
+}
+
 read_hot_zone_owner() {
     local hot_zone="$1"
     local owner_file

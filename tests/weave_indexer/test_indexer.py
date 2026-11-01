@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import struct
 import subprocess
@@ -257,3 +258,95 @@ class TestIndexScope:
         monkeypatch.setenv("WV_DB", str(tmp_db))
         main(["--no-embed", "--ext=.py", str(repo)])
         assert _indexed(tmp_db) == {"a.py", "sub/b.py"}
+
+
+class TestGitFileSet:
+    """wv-cfff36: the index holds the files git counts as the project, not every file on disk."""
+
+    def test_ignored_files_are_not_indexed(
+        self, tmp_path: Path, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The live leak: a scratch copy excluded through .git/info/exclude, not .gitignore.
+        repo = _git_repo(tmp_path / "repo")
+        (repo / ".gitignore").write_text("ignored.py\n")
+        (repo / "ignored.py").write_text("x = 1\n")
+        (repo / "scratch" / "copy").mkdir(parents=True)
+        (repo / "scratch" / "copy" / "a.py").write_text("a = 1\n")
+        (repo / ".git" / "info" / "exclude").write_text("/scratch/\n")
+        monkeypatch.setenv("WV_DB", str(tmp_db))
+        main(["--no-embed", "--ext=.py", str(repo)])
+        assert _indexed(tmp_db) == {"a.py", "sub/b.py"}
+
+    def test_tracked_and_untracked_files_are_both_indexed(
+        self, tmp_path: Path, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # _git_repo commits nothing; add one so both halves of the listing are exercised.
+        repo = _git_repo(tmp_path / "repo")
+        subprocess.run(["git", "add", "a.py"], cwd=repo, check=True, capture_output=True)
+        monkeypatch.setenv("WV_DB", str(tmp_db))
+        main(["--no-embed", "--ext=.py", str(repo)])
+        assert _indexed(tmp_db) == {"a.py", "sub/b.py"}
+
+    def test_a_hook_environment_does_not_redirect_the_listing(
+        self, tmp_path: Path, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Under another repository's GIT_DIR, git reads that repository's ignore
+        # rules, so this repository's excluded scratch file would be indexed.
+        repo = _git_repo(tmp_path / "repo")
+        (repo / "scratch.py").write_text("s = 1\n")
+        (repo / ".git" / "info" / "exclude").write_text("/scratch.py\n")
+        other = _git_repo(tmp_path / "other")
+        monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+        monkeypatch.setenv("GIT_INDEX_FILE", str(other / ".git" / "index"))
+        monkeypatch.setenv("WV_DB", str(tmp_db))
+        main(["--no-embed", "--ext=.py", str(repo)])
+        assert _indexed(tmp_db) == {"a.py", "sub/b.py"}
+
+    def test_extensionless_scripts_index_by_shebang(
+        self, tmp_path: Path, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = _git_repo(tmp_path / "repo")
+        (repo / "tool").write_text("#!/usr/bin/env bash\necho hi\n")
+        (repo / "pytool").write_text("#!/usr/bin/python3 -I\nprint(1)\n")
+        (repo / "VERSION").write_text("1.0\n")
+        (repo / "data").write_text("#!not a script\n")
+        monkeypatch.setenv("WV_DB", str(tmp_db))
+        main(["--no-embed", "--ext=.sh,.py", str(repo)])
+        assert _indexed(tmp_db) == {"a.py", "sub/b.py", "tool", "pytool"}
+        main(["--no-embed", "--ext=.py", str(repo)])
+        assert _indexed(tmp_db) == {"a.py", "sub/b.py", "pytool"}
+
+    def test_outside_git_every_file_is_walked(
+        self, tmp_path: Path, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        plain = tmp_path / "plain"
+        (plain / "sub").mkdir(parents=True)
+        (plain / "a.py").write_text("a = 1\n")
+        (plain / "sub" / "b.py").write_text("b = 1\n")
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+        monkeypatch.setenv("WV_DB", str(tmp_db))
+        main(["--no-embed", "--ext=.py", str(plain)])
+        assert _indexed(tmp_db) == {"a.py", "sub/b.py"}
+
+
+# wv-c6c7cf: outside git the candidate walk used rglob, which walked past a
+# directory it could not list without a word, so the index was partial and
+# nothing said so. One unreadable directory need not stop the index; it is named.
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root reads a mode-000 directory")
+def test_candidates_outside_git_name_an_unlistable_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from weave_indexer.__main__ import _candidates  # pylint: disable=import-outside-toplevel
+    (tmp_path / "open").mkdir()
+    (tmp_path / "open" / "a.py").write_text("x = 1\n")
+    (tmp_path / "shut").mkdir()
+    (tmp_path / "shut" / "b.py").write_text("y = 2\n")
+    (tmp_path / "shut").chmod(0)
+    try:
+        found = {p.relative_to(tmp_path).as_posix() for p in _candidates(tmp_path)}
+    finally:
+        (tmp_path / "shut").chmod(0o755)
+    assert "open/a.py" in found  # the readable part is still indexed
+    assert "shut/b.py" not in found
+    err = capsys.readouterr().err
+    assert "cannot list" in err and "shut" in err

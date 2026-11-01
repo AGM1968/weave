@@ -46,8 +46,10 @@ from weave_quality.__main__ import (
     cmd_promote,
     cmd_reset,
     cmd_scan,
+    score_baseline_note,
 )
 from weave_quality.pattern_loader import _DEFAULT_PATTERNS_DIR, _load_pattern_rules
+from weave_quality.prose_rules import PatternRuleValidationError
 from weave_quality.db import (
     ADJUDICATION_NUDGE_SCANS,
     begin_pattern_run,
@@ -340,6 +342,7 @@ class TestCmdPatternsScan:
             "findings": 0,
             "by_rule": {},
             "matches": [],
+            "invalid_rules": [],
         }
 
     def test_no_rules_scan_rejects_a_nonexistent_target(
@@ -921,10 +924,15 @@ class TestCmdPatternsScan:
                 assert cmd_patterns_adjudicate(adjudicate_args) == 0
                 capsys.readouterr()
 
+            # Both paragraphs move down and the second is reflowed. A repeated
+            # match is keyed by the words around it within its paragraph
+            # (wv-0f8658), so moving and reflowing keep both keys; rewriting a
+            # repeated match's own paragraph asks for a fresh decision, which
+            # test_repaired_repeated_match_leaves_its_neighbours_verdicts covers.
             doc.write_text(
                 "Introductory material moved here.\n\n"
-                "The first revised paragraph has a genuine result.\n\n"
-                "The second revised paragraph also has a genuine result.\n",
+                "A genuine first result.\n\n"
+                "A genuine\nsecond result.\n",
                 encoding="utf-8",
             )
             assert cmd_patterns_scan(scan_args) == 0
@@ -938,6 +946,122 @@ class TestCmdPatternsScan:
         assert [match["scan_count"] for match in second["matches"]] == (
             [2, 2] if cache_route == "warm" else [1, 1]
         )
+
+    def test_repaired_repeated_match_leaves_its_neighbours_verdicts(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """wv-0f8658: four matches of one text, two accepted and two false
+        positives. Repairing the first renumbered the rest under ordinal-only
+        keys, so each took its neighbour's verdict and the repaired defect's
+        own record was overwritten. Each must keep its own; the repaired one
+        stays as a decided record; a survivor left unique keeps its verdict
+        through the change of key form, in the exported ledger too."""
+        hotzone = tmp_path / "hotzone"
+        ledger = tmp_path / ".weave/quality-adjudications.jsonl"
+        doc = tmp_path / "doc.md"
+        names = ["alpha", "beta", "gamma", "delta"]
+        doc.write_text("".join(f"We test a genuine {n} here.\n\n" for n in names), encoding="utf-8")
+        rule = tmp_path / "prose-test.yaml"
+        rule.write_text(
+            "id: prose-test\nlanguage: prose\nkind: lexicon\nterms:\n  - genuine\n",
+            encoding="utf-8",
+        )
+        scan_args = argparse.Namespace(hot_zone=str(hotzone), path=str(doc), json=True)
+
+        def scan() -> dict[str, str]:
+            """Rescan; return each present finding's line context -> disposition."""
+            assert cmd_patterns_scan(scan_args) == 0
+            out = json.loads(capsys.readouterr().out)
+            conn = init_db(hot_zone=str(hotzone))
+            rows = {str(r["finding_key"]): str(r["context_text"]) for r in pattern_finding_states(conn)}
+            conn.close()
+            return {rows[m["finding_key"]].split()[4]: m["disposition"] for m in out["matches"]}
+
+        def report() -> dict[str, Any]:
+            assert cmd_patterns_report(argparse.Namespace(hot_zone=str(hotzone), json=True)) == 0
+            counts: dict[str, Any] = json.loads(capsys.readouterr().out)["by_rule"]["prose-test"]
+            return counts
+
+        with (
+            patch("weave_quality.__main__._resolve_repo", return_value=str(tmp_path)),
+            patch(
+                "weave_quality.__main__._load_pattern_rules",
+                return_value=[("prose-test", rule, "prose")],
+            ),
+        ):
+            assert cmd_patterns_scan(scan_args) == 0
+            first = json.loads(capsys.readouterr().out)
+            keys = [m["finding_key"] for m in first["matches"]]
+            assert len(set(keys)) == 4
+            for key, verdict in zip(keys, ["accepted_defect"] * 2 + ["false_positive"] * 2):
+                assert cmd_patterns_adjudicate(argparse.Namespace(
+                    hot_zone=str(hotzone), finding_key=key, disposition=verdict, note=None, json=True,
+                )) == 0
+            capsys.readouterr()
+
+            doc.write_text(doc.read_text(encoding="utf-8").replace("a genuine alpha", "an alpha"),
+                           encoding="utf-8")
+            assert scan() == {"beta": "accepted_defect", "gamma": "false_positive",
+                              "delta": "false_positive"}
+            counts = report()
+            assert (counts["accepted_defects"], counts["decided_count"]) == (1, 3)
+            assert (counts["durable_accepted_defects"], counts["durable_decided_count"]) == (2, 4)
+
+            for name in ("beta", "gamma"):
+                doc.write_text(doc.read_text(encoding="utf-8").replace(f"a genuine {name}", f"a {name}"),
+                               encoding="utf-8")
+            assert scan() == {"delta": "false_positive"}
+            counts = report()
+            assert (counts["false_positives"], counts["decided_precision"]) == (1, 0.0)
+            assert (counts["durable_accepted_defects"], counts["durable_decided_count"]) == (2, 4)
+
+            assert cmd_adjudications_export(argparse.Namespace(hot_zone=str(hotzone), path=str(ledger))) == 0
+            capsys.readouterr()
+            states = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+            states = [r for r in states if r["type"] == "state"]
+            assert sorted(r["context_text"].split()[4] for r in states) == sorted(names)
+            assert cmd_reset(argparse.Namespace(hot_zone=str(hotzone))) == 0
+            assert scan() == {"delta": "false_positive"}  # rebuilt from the ledger alone
+
+    def test_rewriting_a_repeated_matchs_paragraph_asks_for_a_fresh_decision(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The cost the owner accepted for wv-0f8658: a repeated match is told
+        apart by the words around it, so rewriting them makes a new finding.
+        Its neighbour keeps its verdict; nothing is misattributed."""
+        hotzone = tmp_path / "hotzone"
+        doc = tmp_path / "doc.md"
+        doc.write_text("A genuine first result.\n\nA genuine second result.\n", encoding="utf-8")
+        rule = tmp_path / "prose-test.yaml"
+        rule.write_text(
+            "id: prose-test\nlanguage: prose\nkind: lexicon\nterms:\n  - genuine\n",
+            encoding="utf-8",
+        )
+        scan_args = argparse.Namespace(hot_zone=str(hotzone), path=str(doc), json=True)
+        with (
+            patch("weave_quality.__main__._resolve_repo", return_value=str(tmp_path)),
+            patch(
+                "weave_quality.__main__._load_pattern_rules",
+                return_value=[("prose-test", rule, "prose")],
+            ),
+        ):
+            assert cmd_patterns_scan(scan_args) == 0
+            keys = [m["finding_key"] for m in json.loads(capsys.readouterr().out)["matches"]]
+            for key in keys:
+                assert cmd_patterns_adjudicate(argparse.Namespace(
+                    hot_zone=str(hotzone), finding_key=key, disposition="waived", note=None, json=True,
+                )) == 0
+            capsys.readouterr()
+            doc.write_text("A genuine first result.\n\nThe rewritten text has a genuine claim.\n",
+                           encoding="utf-8")
+            assert cmd_patterns_scan(scan_args) == 0
+            second = json.loads(capsys.readouterr().out)["matches"]
+        assert second[0]["finding_key"] == keys[0] and second[0]["disposition"] == "waived"
+        assert second[1]["finding_key"] not in keys and second[1]["disposition"] == "unresolved"
 
     def test_report_scopes_to_last_scan_target_by_default(
         self,
@@ -1706,11 +1830,13 @@ class TestCmdPatternsScan:
 
         assert "not a complete successful snapshot" in capsys.readouterr().err
 
-    def test_malformed_rule_fails_scan_and_list(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
+
+class TestInvalidRuleContainment:
+    """One rule file that breaks the contract is skipped and named; every other rule runs (wv-d0e4d6)."""
+
+    @staticmethod
+    def _repo_with_broken_rule(tmp_path: Path) -> tuple[Path, Path]:
+        """A repository with one malformed local rule beside one that works."""
         conn = init_db(hot_zone=str(tmp_path / "hotzone"))
         begin_scan(conn, "abc")
         conn.commit()
@@ -1724,19 +1850,116 @@ class TestCmdPatternsScan:
             "patterns:\n  - broken\n",
             encoding="utf-8",
         )
+        (patterns / "local-fires.yaml").write_text(
+            "id: local-fires\nlanguage: prose\nkind: regex\npatterns:\n  - zebrafish\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "doc.md").write_text("A zebrafish swims.\n", encoding="utf-8")
+        return tmp_path, broken
+
+    def test_loader_skips_the_broken_rule_and_keeps_every_other(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        repo, broken = self._repo_with_broken_rule(tmp_path)
+        invalid: list[tuple[str, Path, str]] = []
+
+        ids = {rule_id for rule_id, _, _ in _load_pattern_rules(repo, set(), invalid)}
+
+        shipped = {path.stem for path in _DEFAULT_PATTERNS_DIR.glob("*.yaml")}
+        assert shipped | {"local-fires"} <= ids and "broken" not in ids
+        assert [(rule_id, path) for rule_id, path, _ in invalid] == [("broken", broken)]
+        assert invalid[0][2].startswith("broken.yaml:5: nested mapping unsupported")
+        assert f"patterns: ignoring {broken}: invalid rule, not applied" in capsys.readouterr().err
+
+    def test_malformed_rule_is_skipped_and_every_other_rule_runs(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """wv-d0e4d6: one malformed local rule used to fail scan and list, taking
+        every shipped and local rule down with it, so a consumer's prose gate
+        refused every markdown commit. It is now skipped and named; the rest run."""
+        repo, broken = self._repo_with_broken_rule(tmp_path)
         args = argparse.Namespace(
-            hot_zone=str(tmp_path / "hotzone"),
-            path=str(tmp_path),
-            json=False,
+            hot_zone=str(tmp_path / "hotzone"), path=str(repo / "doc.md"), json=True
         )
 
-        with patch("weave_quality.__main__._resolve_repo", return_value=str(tmp_path)):
-            assert cmd_patterns_list(args) == 1
-            assert cmd_patterns_scan(args) == 1
+        with patch("weave_quality.__main__._resolve_repo", return_value=str(repo)):
+            assert cmd_patterns_scan(args) == 0
+            captured = capsys.readouterr()
+            report = json.loads(captured.out)
+            assert cmd_patterns_list(args) == 0
 
-        error = capsys.readouterr().err
-        assert str(broken) in error
-        assert "nested mapping unsupported" in error
+        assert report["by_rule"]["local-fires"] == 1
+        assert "broken" not in report["by_rule"]
+        shipped = {path.stem for path in _DEFAULT_PATTERNS_DIR.glob("*.yaml")}
+        assert shipped <= set(report["by_rule"])
+        assert [entry["rule_id"] for entry in report["invalid_rules"]] == ["broken"]
+        assert report["invalid_rules"][0]["path"] == str(broken)
+        assert "nested mapping unsupported" in report["invalid_rules"][0]["error"]
+        assert f"patterns: ignoring {broken}: invalid rule, not applied" in captured.err
+
+    def test_text_scan_names_the_skipped_rule(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        repo, broken = self._repo_with_broken_rule(tmp_path)
+        args = argparse.Namespace(
+            hot_zone=str(tmp_path / "hotzone"), path=str(repo / "doc.md"), json=False
+        )
+
+        with patch("weave_quality.__main__._resolve_repo", return_value=str(repo)):
+            assert cmd_patterns_scan(args) == 0
+
+        out = capsys.readouterr().out
+        assert "1 invalid rule file(s) not applied" in out
+        assert f"{broken}: broken.yaml:5: nested mapping unsupported" in out
+
+    def test_validate_stays_strict_about_the_skipped_rule(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        repo, broken = self._repo_with_broken_rule(tmp_path)
+        args = argparse.Namespace(hot_zone=str(tmp_path / "hotzone"), path=str(repo), json=False)
+
+        with patch("weave_quality.__main__._resolve_repo", return_value=str(repo)):
+            assert cmd_patterns_validate(args) == 1
+
+        captured = capsys.readouterr()
+        assert str(broken) in captured.out + captured.err
+
+    def test_a_disabled_malformed_rule_is_not_loaded_or_reported(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        repo, _broken = self._repo_with_broken_rule(tmp_path)
+        invalid: list[tuple[str, Path, str]] = []
+
+        ids = {rule_id for rule_id, _, _ in _load_pattern_rules(repo, {"broken"}, invalid)}
+
+        assert "local-fires" in ids and "broken" not in ids
+        assert not invalid
+        assert "broken.yaml" not in capsys.readouterr().err
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+    def test_an_unreadable_rule_still_fails_the_load(self, tmp_path: Path) -> None:
+        """A file the loader cannot read is not a known-bad rule: it cannot say what
+        it lost, so it fails closed as before (wv-dc2e44)."""
+        repo, broken = self._repo_with_broken_rule(tmp_path)
+        broken.unlink()
+        unreadable = repo / ".weave" / "patterns" / "unreadable.yaml"
+        unreadable.write_text("id: unreadable\nlanguage: prose\n", encoding="utf-8")
+        unreadable.chmod(0)
+        try:
+            with pytest.raises(PatternRuleValidationError, match="unreadable.yaml"):
+                _load_pattern_rules(repo, set(), [])
+        finally:
+            unreadable.chmod(0o644)
 
 
 def test_patterns_list_rejects_a_file_path_as_repo_root(
@@ -2058,15 +2281,26 @@ def test_pattern_loader_skips_duplicate_id_without_aborting_the_load(
     assert str(collider) in err
 
 
-def test_pattern_loader_validates_disabled_rules(tmp_path: Path) -> None:
+def test_a_disabled_broken_rule_is_skipped_by_the_loader_and_reported_by_validate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Disabling a rule is how a repository steps around a broken one, so the
+    loader does not read it (wv-d0e4d6); `patterns validate` still reads every
+    file and reports it."""
     patterns = tmp_path / ".weave" / "patterns"
     patterns.mkdir(parents=True)
     (patterns / "disabled-broken.yaml").write_text(
         "id: disabled-broken\nlanguage: prose\nkind: regex\npatterns:\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="missing or empty 'patterns'"):
-        _load_pattern_rules(tmp_path, {"disabled-broken"})
+    ids = {rule_id for rule_id, _, _ in _load_pattern_rules(tmp_path, {"disabled-broken"})}
+    assert "disabled-broken" not in ids
+
+    args = argparse.Namespace(hot_zone=str(tmp_path / "hz"), path=str(tmp_path), json=False)
+    with patch("weave_quality.__main__._resolve_repo", return_value=str(tmp_path)):
+        assert cmd_patterns_validate(args) == 1
+    captured = capsys.readouterr()
+    assert "missing or empty 'patterns'" in captured.out + captured.err
 
 
 def test_shadowed_managed_pattern_ids_reads_overridden_marker(
@@ -4841,6 +5075,58 @@ class TestCmdHealthInfo:
         assert "total_files" in data
         assert "git_head" in data
         assert "scanned_at" in data
+
+    def test_score_at_the_recorded_baseline_carries_the_note(
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """health-info places its score against quality.conf [baseline] (wv-0f2438)."""
+        scan_id = begin_scan(db, str(tmp_path))
+        _populate_scan(db, scan_id, [_entry("a.py", scan_id, complexity=5.0)], [_stats("a.py", churn=1)])
+        finish_scan(db, scan_id, 1, 100)
+        cmd_health_info(_make_health_args(str(tmp_path)))
+        score = json.loads(capsys.readouterr().out)["score"]
+
+        _write_baseline(tmp_path, f"score = {score}\nruling = wv-000001\nreason = probe reason\n")
+        with patch("weave_quality.__main__._resolve_repo", return_value=tmp_path):
+            cmd_health_info(_make_health_args(str(tmp_path)))
+        note = json.loads(capsys.readouterr().out)["baseline_note"]
+        assert note == (f"Note: {score}/100 is the accepted baseline (wv-000001): probe reason. "
+                        "Not a regression; it moves when thresholds are recalibrated.")
+
+
+def _write_baseline(repo: Path, body: str) -> None:
+    (repo / ".weave").mkdir(exist_ok=True)
+    (repo / ".weave" / "quality.conf").write_text(f"[thresholds]\nscore = 55\n\n[baseline]\n{body}")
+
+
+class TestScoreBaselineNote:
+    """A bare 0/100 read as a regression to agents and humans (wv-0f2438)."""
+
+    def test_equal_score_is_named_the_baseline(self, tmp_path: Path) -> None:
+        _write_baseline(tmp_path, "score = 0\nruling = wv-4c1279\n")
+        note = score_baseline_note(tmp_path, 0)
+        assert note.startswith("Note: 0/100 is the accepted baseline (wv-4c1279).")
+        assert "Not a regression" in note
+
+    def test_other_score_names_the_baseline_and_direction(self, tmp_path: Path) -> None:
+        _write_baseline(tmp_path, "score = 40\nruling = wv-4c1279\n")
+        assert score_baseline_note(tmp_path, 55) == "Note: above the accepted baseline of 40/100 (wv-4c1279)."
+        assert score_baseline_note(tmp_path, 12) == "Note: below the accepted baseline of 40/100 (wv-4c1279)."
+
+    def test_no_baseline_no_note(self, tmp_path: Path) -> None:
+        assert score_baseline_note(tmp_path, 0) == ""
+        # A score key in another section is not a baseline.
+        (tmp_path / ".weave").mkdir()
+        (tmp_path / ".weave" / "quality.conf").write_text("[thresholds]\nscore = 0\n")
+        assert score_baseline_note(tmp_path, 0) == ""
+
+    def test_malformed_score_is_no_baseline(self, tmp_path: Path) -> None:
+        for bad in ("zero", "-1", "101", ""):
+            _write_baseline(tmp_path, f"score = {bad}\n")
+            assert score_baseline_note(tmp_path, 0) == "", bad
 
 
 # ---------------------------------------------------------------------------

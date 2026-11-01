@@ -68,7 +68,7 @@ from collections.abc import Callable
 from typing import Any
 
 
-STATUSES = {"todo", "ready", "active", "blocked", "done"}
+STATUSES = {"todo", "ready", "active", "blocked", "blocked-external", "done"}
 RISK_LEVELS = {"none", "low", "medium", "high"}
 NODE_PATCH_FIELDS = {"status", "claimed_by", "risk_level", "text", "alias", "metadata"}
 EDGE_PATCH_FIELDS = {"weight", "context"}

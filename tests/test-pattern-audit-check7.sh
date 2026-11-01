@@ -128,6 +128,26 @@ sed -i 's/^    \[ -n "$x" \] \&\& echo "$x"$/    if [ -n "$x" ]; then echo "$x";
 AUDIT_OUT2=$("$WV" pattern-audit 2>&1 | grep 'Check 7' || true)
 assert_contains "$AUDIT_OUT2" "Check 7 PASS" "Check 7 passes after the tail is converted to if/fi"
 
+echo "--- Check 7: a name() ( ... ) function is checked too (wv-b80a86) ---"
+# Before, a subshell-body definition was not recognised, so its tail was never read.
+cat > "$TEST_DIR/scripts/subshell.sh" <<'EOF'
+#!/bin/bash
+
+subshell_tail_fn() (
+    local x="$1"
+    [ -n "$x" ] && echo "$x"
+)
+
+subshell_safe_fn() (
+    [ -n "${1:-}" ] || return 0
+    echo "$1"
+)
+EOF
+AUDIT_SUB=$("$WV" pattern-audit 2>&1 | grep -A6 'Check 7' || true)
+assert_contains     "$AUDIT_SUB" "subshell_tail_fn" "a bare tail in a subshell-body function is flagged"
+assert_not_contains "$AUDIT_SUB" "subshell_safe_fn" "a subshell-body function with a safe tail is not"
+rm -f "$TEST_DIR/scripts/subshell.sh"
+
 echo "--- Check 7: missing scripts dir warns, does not fail ---"
 rm -rf "$TEST_DIR/scripts"
 AUDIT_OUT3=$("$WV" pattern-audit 2>&1 | grep 'Check 7' || true)

@@ -107,7 +107,7 @@ If verification is not possible:
 
 1. Document why (no tests, environment issue, etc.)
 2. Add `metadata.verification.method = "deferred"`
-3. Create follow-up node: `wv add "Add tests for <area>" --metadata='{"type":"task"}'`
+3. Create follow-up node: `wv add "Add tests for <area>" --kind=task`
 4. Proceed with explicit acknowledgment of verification gap
 
 ## Integration

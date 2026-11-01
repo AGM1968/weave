@@ -11,6 +11,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WV="$REPO_ROOT/scripts/wv"
 
+# Every wv call resolves its hot zone under a private root. Run from the
+# repository, wv used, and in a gate's frozen tree created, that tree's zone in
+# the LIVE base, which the gate's guard refused (wv-0ee3f4); wv-e200f6 had
+# isolated only the graph-repo section below.
+SUITE_ZONES=$(mktemp -d /tmp/wv-analyze-zones-XXXXXX)
+mkdir -p "$SUITE_ZONES/tmp"
+export WV_TEST_MODE=1 WV_TEST_HOT_ZONE_ROOT="$SUITE_ZONES"
+# One trap for every temporary this suite makes: each section used to replace
+# the trap before it, dropping the earlier files from the cleanup.
+cleanup() {
+    rm -f "${LOG:-}" "${WLOG:-}" "${TRACELOG:-}" "${USAGELOG:-}" "${SUITELOG:-}"
+    rm -rf "$SUITE_ZONES" "${ISOCONF:-}"
+}
+trap cleanup EXIT
+
 # Counter for tests
 TESTS_RUN=0
 TESTS_PASSED=0
@@ -70,7 +85,6 @@ assert_eq() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 LOG=$(mktemp)
-trap 'rm -f "$LOG"' EXIT
 
 # Write 3 synthetic entries: wv show (largest), wv status, wv ready
 cat >"$LOG" <<'EOF'
@@ -265,7 +279,6 @@ echo "════════════════════════�
 
 TRACELOG=$(mktemp)
 USAGELOG=$(mktemp)
-trap 'rm -f "$LOG" "$WLOG" "$TRACELOG" "$USAGELOG"' EXIT
 cat >"$TRACELOG" <<'EOF'
 {"ts":1,"trace_id":"trace-a","call_id":"a1","turn_id":"turn-1","cmd":"wv query","argv":["query","x"],"exit_status":0,"graph_identity_before":{"kind":"sqlite_graph_fingerprint","value":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"graph_identity_after":{"kind":"sqlite_graph_fingerprint","value":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
 {"ts":2,"trace_id":"trace-a","call_id":"a2","cmd":"wv query","argv":["query","x"],"exit_status":0,"graph_identity_before":{"kind":"sqlite_graph_fingerprint","value":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"graph_identity_after":{"kind":"sqlite_graph_fingerprint","value":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}
@@ -316,7 +329,6 @@ echo ""
 # Synthetic suite history: test-core 3 runs (1 fail, durs 180k/200k/160k),
 # test-graph 2 runs (durs 35k/40k). nearest-rank p95 of core = 200000.
 SUITELOG=$(mktemp)
-trap 'rm -f "$LOG" "$WLOG" "$SUITELOG"' EXIT
 cat >"$SUITELOG" <<'EOF'
 {"ts":"2026-05-31T10:00:00Z","repo":"r","suite":"tests/test-core.sh","files":"a.sh","exit":0,"duration_ms":180000,"sha":"aaa1"}
 {"ts":"2026-05-31T10:05:00Z","repo":"r","suite":"tests/test-core.sh","files":"b.sh","exit":1,"duration_ms":200000,"sha":"aaa2"}
@@ -484,7 +496,7 @@ assert_contains "$subtree_split_row" '"argv":["ready","--subtree","wv-abc123"]' 
 (cd "$GRAPH_REPO" && WV_CONFIG_DIR="$GRAPH_CONFIG" WV_CALL_LOG="$GRAPH_LOG" $WV analyze sessions --call-stats --log="$TRACELOG" --json >/dev/null 2>&1)
 analyze_row=$(tail -1 "$GRAPH_LOG" 2>/dev/null || true)
 assert_contains "$analyze_row" '"argv":["analyze","sessions","--call-stats","--log=<redacted:' "analyze mode and log option remain visible while path is redacted"
-unset WV_TEST_MODE WV_TEST_HOT_ZONE_ROOT
+export WV_TEST_HOT_ZONE_ROOT="$SUITE_ZONES"  # back to the suite-wide root
 rm -rf "$ISOCONF"
 
 echo ""

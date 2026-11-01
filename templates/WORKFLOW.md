@@ -65,7 +65,7 @@ This table is generated from `templates/workflow-classes.conf`. The pre-action h
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | `wv ready`                 | List unblocked work                                                                                                    | `--json`, `--count`                                                                                            |
 | `wv work <id>`             | Claim node (sets active); use `--reopen` for done nodes                                                                | `[--reopen]` to explicitly reopen a done node back to tracked work                                             |
-| `wv add "<text>"`          | Create node                                                                                                            | `--gh`, `--status=`, `--parent=`, `--alias=`, `--standalone`                                                   |
+| `wv add "<text>"`          | Create node                                                                                                            | `--gh`, `--status=`, `--parent=`, `--kind=`, `--alias=`, `--standalone`                                                   |
 | `wv done <id>`             | Complete node (auto-closes linked GH issue)                                                                            | `--learning="..."`, `--no-overlap-check`, `--no-gh`                                                            |
 | `wv ship <id>`             | Done + sync in one step; pending Git sync is surfaced separately                                                       | `--learning="..."`, `--no-gh`, `--no-overlap-check`                                                            |
 | `wv update <id>`           | Modify node                                                                                                            | `--status=`, `--text=`, `--alias=`, `--metadata=`, `--metadata-file=`, `--echo`                                |
@@ -133,6 +133,12 @@ from `orphan_nodes` and reports them separately as `intentional_standalones`.
 
 Lifecycle: `todo` → `active` → `done`. Set `blocked` via `wv block`.
 
+Each node has a kind: epic, feature, task, finding, decision, plan, memory or session_history. Set
+it with `--kind=` on `wv add` or `wv update`; without it, the kind comes from the text prefix
+(`epic(`, `Plan:`), else task. A change type such as `fix` or `refactor` belongs in the text prefix,
+not the kind. A node does not close while an `implements` child is still open, unless the child is
+parked (`metadata.deferred` with a `deferred_reason`) or resolved.
+
 ## Context Packs
 
 Run `wv context <id> --json` before starting complex work:
@@ -165,22 +171,29 @@ is projected into each harness's native surface (Claude skill, `.codex/weave.jso
 instructions). Every procedure resolves anywhere via its fallback command, which serves the
 installed canonical body — so a pointer never breaks after `wv init-repo`.
 
-| Procedure        | Description                                                              | Fallback                              |
-| ---------------- | ------------------------------------------------------------------------ | ------------------------------------- |
-| `session`        | Session-context management — 5-option framework, rewind, compact, phases | `wv guide --procedure=session`        |
-| `agent-memory`   | Agent memory model and per-agent memory surfaces                         | `wv guide --procedure=agent-memory`   |
-| `repair`         | Turn workflow defects into tracked remediation                           | `wv guide --procedure=repair`         |
-| `subagents`      | Delegate bounded work with inherited graph context                       | `wv guide --procedure=subagents`      |
-| `rules`          | Advisory workflow discipline                                             | `wv guide --procedure=rules`          |
-| `epic-decompose` | Break an epic into features and tasks with parent edges and blocking     | `wv guide --procedure=epic-decompose` |
-| `quality-gate`   | Recover from a GraphPolicyViolation (CC threshold) blocking `wv done`    | `wv guide --procedure=quality-gate`   |
-| `graph-hygiene`  | Health checks, pruning, orphan classification, stale-node cleanup        | `wv guide --procedure=graph-hygiene`  |
-| `precommit-gate` | Impact-scoped pre-commit test gate + CI `.weave/` hygiene                | `wv guide --procedure=precommit-gate` |
-| `code-search`    | Two-surface code/graph search and `wv ready` re-ranking                  | `wv guide --procedure=code-search`    |
-| `discovery-routing` | Conditional graph, code, impact, and inspection routing                 | `wv guide --procedure=discovery-routing` |
-| `blindspot-pass` | Unknown-taxonomy pass before implementation with release and MCP probes  | `wv guide --procedure=blindspot-pass` |
+| Procedure           | Description                                                              | Fallback                                 |
+| ------------------- | ------------------------------------------------------------------------ | ---------------------------------------- |
+| `session`           | Session-context management — 5-option framework, rewind, compact, phases | `wv guide --procedure=session`           |
+| `agent-memory`      | Agent memory model and per-agent memory surfaces                         | `wv guide --procedure=agent-memory`      |
+| `repair`            | Turn workflow defects into tracked remediation                           | `wv guide --procedure=repair`            |
+| `subagents`         | Delegate bounded work with inherited graph context                       | `wv guide --procedure=subagents`         |
+| `rules`             | Advisory workflow discipline                                             | `wv guide --procedure=rules`             |
+| `epic-decompose`    | Break an epic into features and tasks with parent edges and blocking     | `wv guide --procedure=epic-decompose`    |
+| `quality-gate`      | Recover from a GraphPolicyViolation (CC threshold) blocking `wv done`    | `wv guide --procedure=quality-gate`      |
+| `graph-hygiene`     | Health checks, pruning, orphan classification, stale-node cleanup        | `wv guide --procedure=graph-hygiene`     |
+| `precommit-gate`    | Impact-scoped pre-commit test gate + CI `.weave/` hygiene                | `wv guide --procedure=precommit-gate`    |
+| `code-search`       | Two-surface code/graph search and `wv ready` re-ranking                  | `wv guide --procedure=code-search`       |
+| `discovery-routing` | Conditional graph, code, impact, and inspection routing                  | `wv guide --procedure=discovery-routing` |
+| `blindspot-pass`    | Unknown-taxonomy pass before implementation with release and MCP probes  | `wv guide --procedure=blindspot-pass`    |
 
 All procedure bodies live only in their canonical file and are reachable through their fallback.
+
+A repository can author its own procedures in `.weave/procedures/<id>.md`, under the same contract
+(the file name is the id). They are this repository's lessons and conventions, never shipped and
+never installed for other repositories. `wv guide --procedure=<id>` reads the repository's file
+first; one with a package procedure's id replaces it here. A repository procedure without
+`visibility: shared` is read only through its fallback; a shared one projects into this repository's
+surfaces on `wv init-repo --update`, and `wv doctor` reports a projection that is out of date.
 
 ## GitHub Integration
 
@@ -216,6 +229,27 @@ wv done <id> --learning="decision: what was chosen | pattern: reusable technique
 ```
 
 Good learnings are specific, actionable, and scoped to a concrete context.
+
+## Memory
+
+Durable cross-agent memory lives in the graph. Each harness also keeps memory of its own (Claude
+memory files, Codex's memory store, Copilot's); that is evidence about one host's sessions, which
+`wv memory scan` and `wv memory import` bring in as candidates for review.
+
+```bash
+wv bootstrap --json                   # .memory: one index line per active memory
+wv memory recall --agent=all --json   # the full text; read it before relying on a memory
+wv remember "<text>"                  # capture durable project knowledge every agent needs
+wv memory review <id> --verdict=promote|merge|reject|verify --reason="<why>"
+wv memory review <id> --verdict=graduate --reason="<why>" --target=<repo path>  # a repo surface carries it now
+```
+
+Remember what every agent working here needs: rules, hazards, architecture facts, owner rulings.
+Leave out advice about one harness's own tools, which belongs in that host's memory, and
+point-in-time status, which the graph's nodes already hold. Write the first sentence to stand on its
+own: the projections and `wv bootstrap` show it as the memory's index line. MCP clients use
+`weave_bootstrap`, `weave_memory_recall` and `weave_remember`. Procedure:
+`wv guide --procedure=agent-memory`.
 
 ## Enforcement
 

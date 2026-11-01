@@ -116,7 +116,7 @@ If during implementation you discover:
 ```bash
 # Discovered new work during implementation
 
-wv add "Handle edge case: expired session" --metadata='{"type":"task","priority":2}'
+wv add "Handle edge case: expired session" --kind=task --metadata='{"priority":2}'
 # Don't add to current task's done_criteria
 ```
 

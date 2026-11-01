@@ -33,12 +33,32 @@ unlinked() {
     done < "$1"
 }
 
+# The checker's own contract runs on fixtures, so it holds in a tree without a
+# graph or a quality.conf too, such as the release projection (wv-771f0e).
+echo "=== the check fails closed ==="
+printf '{"id":"wv-abc123","text":"plan(fixture): decompose new-debt.sh"}\n' > "$TMP/nodes.jsonl"
+printf '[exempt]\nscripts/new-debt.sh  # plan wv-abc123\n' > "$TMP/linked.conf"
+[ -z "$(unlinked "$TMP/linked.conf" "$TMP/nodes.jsonl")" ] &&
+    ok "(control) an exemption naming a node the graph holds is accepted" ||
+    bad "(control) an exemption naming a node the graph holds is accepted"
+printf '[exempt]\nscripts/new-debt.sh  # CC is structural\n' > "$TMP/no-ref.conf"
+[[ "$(unlinked "$TMP/no-ref.conf" "$TMP/nodes.jsonl")" == "scripts/new-debt.sh names no node" ]] &&
+    ok "an exemption that names no node is refused" || bad "an exemption that names no node is refused"
+printf '[exempt]\nscripts/new-debt.sh  # plan wv-000000\n' > "$TMP/bad-ref.conf"
+[[ "$(unlinked "$TMP/bad-ref.conf" "$TMP/nodes.jsonl")" == *"names wv-000000, which the graph does not hold" ]] &&
+    ok "an exemption naming a node the graph does not hold is refused" ||
+    bad "an exemption naming a node the graph does not hold is refused"
+printf '[exempt]\n# a comment naming nothing\n\n[thresholds]\nnot_an_entry = 1\n' > "$TMP/comments.conf"
+[ -z "$(unlinked "$TMP/comments.conf" "$TMP/nodes.jsonl")" ] &&
+    ok "comments, blank lines and other sections are not entries" ||
+    bad "comments, blank lines and other sections are not entries"
+
 CONF="$ROOT/.weave/quality.conf"
 NODES="$ROOT/.weave/nodes.jsonl"
 if [ ! -f "$CONF" ]; then
-    echo "  - no .weave/quality.conf in this tree; not asserted"
-    echo "Results: 0/0 passed"
-    exit 0
+    echo "  - no .weave/quality.conf in this tree; the repository's exemptions are not asserted"
+    echo "Results: $pass/$run passed"
+    [ "$pass" -eq "$run" ]; exit
 fi
 
 echo "=== every exemption names its node ==="
@@ -56,19 +76,6 @@ elif [ -n "$default" ] && [ "$ceiling" -le "$default" ]; then
 else
     bad "the repository shell ceiling ($ceiling) is at or below the schema default (${default:-unknown})"
 fi
-
-echo "=== the check fails closed ==="
-printf '[exempt]\nscripts/new-debt.sh  # CC is structural\n' > "$TMP/no-ref.conf"
-[[ "$(unlinked "$TMP/no-ref.conf" "$NODES")" == "scripts/new-debt.sh names no node" ]] &&
-    ok "an exemption that names no node is refused" || bad "an exemption that names no node is refused"
-printf '[exempt]\nscripts/new-debt.sh  # plan wv-000000\n' > "$TMP/bad-ref.conf"
-[[ "$(unlinked "$TMP/bad-ref.conf" "$NODES")" == *"names wv-000000, which the graph does not hold" ]] &&
-    ok "an exemption naming a node the graph does not hold is refused" ||
-    bad "an exemption naming a node the graph does not hold is refused"
-printf '[exempt]\n# a comment naming nothing\n\n[thresholds]\nnot_an_entry = 1\n' > "$TMP/comments.conf"
-[ -z "$(unlinked "$TMP/comments.conf" "$NODES")" ] &&
-    ok "comments, blank lines and other sections are not entries" ||
-    bad "comments, blank lines and other sections are not entries"
 
 echo "Results: $pass/$run passed"
 [ "$pass" -eq "$run" ]

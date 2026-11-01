@@ -278,6 +278,19 @@ PY
     return 0
 }
 
+# _add_link_parent <id> <parent> — link a node wv add just created to its parent.
+# A failed link fails the add, naming the node and the repair (wv-0ad534); the
+# old caller printed "Linked to parent" whether or not cmd_link succeeded.
+_add_link_parent() {
+    local id="$1" parent="$2" link_err link_rc=0
+    link_err=$(cmd_link "$id" "$parent" --type=implements 2>&1 >/dev/null) || link_rc=$?
+    [ "$link_rc" -eq 0 ] && return 0
+    echo -e "${RED}Error: created $id but could not link it to parent $parent${NC}" >&2
+    [ -n "$link_err" ] && printf '  %s\n' "$link_err" >&2
+    echo "  Repair: wv link $id $parent --type=implements" >&2
+    return 1
+}
+
 # _add_create_gh_issue — Create a GitHub issue linked to a Weave node
 _add_create_gh_issue() {
     local id="$1" text="$2" metadata="$3" alias="$4"
@@ -288,7 +301,7 @@ _add_create_gh_issue() {
     fi
     local priority type_label priority_label
     priority=$(echo "$metadata" | jq -r '.priority // 2' 2>/dev/null || echo "2")
-    case "$(echo "$metadata" | jq -r '.type // "task"' 2>/dev/null)" in
+    case "$(echo "$metadata" | jq -r '.node_kind // .type // "task"' 2>/dev/null)" in
         bug) type_label="bug" ;; feature) type_label="enhancement" ;; *) type_label="task" ;;
     esac
     case "$priority" in
@@ -380,6 +393,7 @@ cmd_add() {
     local criteria=""
     local risks_flag=""
     local verification_plan=""
+    local kind_flag=""
     # --id reconstructs a node under an id the graph has lost, so a pushed
     # Weave-ID trailer stops pointing at nothing (wv-0f1092). Empty for every
     # ordinary add, which keeps generating a fresh id.
@@ -399,6 +413,7 @@ cmd_add() {
             --criteria=*) criteria="${1#*=}" ;;
             --risks=*) risks_flag="${1#*=}" ;;
             --verification-plan=*) verification_plan="${1#*=}" ;;
+            --kind=*) kind_flag="${1#*=}" ;;
             --id=*) reconstruct_id="${1#*=}" ;;
             --*) _wv_reject_arg add "$1"; return 1 ;;
             *) text="$text $1" ;;
@@ -408,7 +423,7 @@ cmd_add() {
 
     if [ -z "$text" ]; then
         echo -e "${RED}Error: text required${NC}" >&2
-        echo "Usage: wv add \"task description\" [--status=todo|active|done|blocked] [--parent=<id>] [--gh] [--force] [--standalone] [--criteria=\"c1|c2\"] [--risks=low|medium|high|none] [--verification-plan=\"...\"]" >&2
+        echo "Usage: wv add \"task description\" [--status=todo|active|done|blocked] [--parent=<id>] [--gh] [--force] [--standalone] [--criteria=\"c1|c2\"] [--risks=low|medium|high|none] [--kind=<kind>] [--verification-plan=\"...\"]" >&2
         return 1
     fi
 
@@ -444,6 +459,9 @@ cmd_add() {
     validate_metadata_object "$metadata" "--metadata" || return 1
     validate_metadata_risk_level "$metadata" "--metadata" || return 1
     validate_metadata_canonical_numbers "$metadata" "--metadata" || return 1
+    # Every node is created with a kind (wv-f7dfd3), stored as node_kind and
+    # mirrored to type; the orphan check below reads it.
+    metadata=$(wv_kind_create_metadata "$metadata" "$text" "$kind_flag" "--metadata") || return 1
 
     # Guard the direct create-and-claim path. `wv work` and the pre-claim hook
     # already require claim-ready metadata; direct `wv add --status=active`
@@ -492,13 +510,13 @@ cmd_add() {
     # bypassed allow, so a counted campaign sees it rather than silence.
     if [ -z "$parent" ]; then
         local node_type
-        node_type=$(echo "$metadata" | jq -r '.type // "task"' 2>/dev/null || echo "task")
+        node_type=$(echo "$metadata" | jq -r '.node_kind // "task"' 2>/dev/null || echo "task")
         if [ "$node_type" != "epic" ]; then
             local active_epics
             active_epics=$(db_query "
                 SELECT id FROM nodes
                 WHERE status IN ('todo','active')
-                AND json_extract(metadata,'\$.type') = 'epic'
+                AND $(wv_kind_sql) = 'epic'
                 ORDER BY created_at DESC LIMIT 3;
             " 2>/dev/null || true)
             if [ -n "$active_epics" ] && [ "$force" = "true" ]; then
@@ -603,16 +621,17 @@ cmd_add() {
     # warp session trigger interaction crashes SQLite 3.46)
     db_query "UPDATE nodes SET metadata = json_patch(COALESCE(metadata,'{}'), json_object('promoted_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')))
               WHERE id = '$id'
-                AND json_extract(metadata, '$.type') = 'finding'
+                AND $(wv_kind_sql) = 'finding'
                 AND json_extract(metadata, '$.promoted_at') IS NULL;" 2>/dev/null || true
 
     # The creation line moved below the durability gate (wv-18841c) so it cannot
     # announce a node that failed to persist. It stays ahead of the id on stdout.
 
-    # Link to parent if --parent provided
+    # Link to parent if --parent provided. The report waits for the creation
+    # line (wv-0ad534): printed first, "Linked to parent <parent>" made the
+    # parent's id the first one in a merged capture.
     if [ -n "$parent" ]; then
-        cmd_link "$id" "$parent" --type=implements 2>/dev/null
-        echo -e "${GREEN}✓${NC} Linked to parent $parent" >&2
+        _add_link_parent "$id" "$parent" || return 1
     fi
 
     # Creating a node directly in active status IS a claim (Pattern B: WorkClaimed
@@ -651,6 +670,7 @@ cmd_add() {
     else
         echo -e "${GREEN}✓${NC} $id: $original_text" >&2
     fi
+    [ -n "$parent" ] && echo -e "${GREEN}✓${NC} $id implements parent $parent" >&2
 
     if [ "$format" = "json" ]; then
         jq -n --arg id "$id" --arg text "$original_text" --arg status "$status" \
@@ -676,6 +696,10 @@ Usage:
   wv memory import --source=claude --path=DIR [--repo-root=DIR] [--json]
   wv memory import --source=codex [--path=DB] [--repo-root=DIR] [--json]
   wv memory crystallize [--dry-run|--apply-reviewed] [--repo-root=DIR] [--json]
+  wv memory review <id> --verdict=promote|merge|reject|verify --reason=TEXT [--target=<active id>] [--json]
+  wv memory review <active id> --verdict=graduate --reason=TEXT --target=<repo path> [--json]
+      # target: .weave/procedures/<id>.md, .weave/guides/<id>.md, .weave/patterns/<id>.yaml or a tracked .md
+  wv memory review --apply [--dry-run] [--json]
 EOF
 }
 
@@ -712,14 +736,44 @@ _memory_resolve_agent() {
     fi
 }
 
+# _memory_recall_json [graduated] — the active memories, which every projection
+# and bootstrap render. With "graduated", recall also returns the memories a
+# repository surface now carries (wv-a8f91e): out of the projections, but their
+# text and graduated_to stay one recall away.
 _memory_recall_json() {
+    local statuses="'active'"
+    [ "${1:-}" = graduated ] && statuses="'active','graduated'"
     db_query_json_v2 "
         SELECT id, text, status, metadata
         FROM nodes
-        WHERE json_extract(metadata, '\$.type') = 'memory'
-          AND COALESCE(json_extract(metadata, '\$.mem_status'), 'active') = 'active'
+        WHERE $(wv_kind_sql) = 'memory'
+          AND COALESCE(json_extract(metadata, '\$.mem_status'), 'active') IN ($statuses)
         ORDER BY created_at ASC, id ASC;
     "
+}
+
+# The projections carry an index, not the memories' full text (wv-91f0ca).
+# Every harness that loads more than one projection paid for each full copy:
+# Copilot loads copilot-instructions.md, AGENTS.md and CLAUDE.md, three copies
+# of ~25 KB, and AGENTS.md sat 116 bytes under Codex's 32 KiB read limit with
+# the block at its tail. One line per memory: metadata.hook when set, else the
+# first sentence, cut at a word boundary near 160 characters. A memory with
+# metadata.resident = "full" keeps its whole text in every projection. The
+# full text is one command away: wv memory recall --agent=all --json.
+# Each entry keeps the {id, text, metadata.verified_at} shape every renderer
+# and the parity suite read; text is what the projection shows.
+_memory_index_entries() {
+    jq -c '
+        def first_sentence: (capture("^(?<s>.*?(?<!e\\.g)(?<!i\\.e)(?<!etc)(?<!vs)(?<!cf)(?<!\\$)[.!?])(\\s|$)").s // .);
+        def clip: if length > 160 then (.[0:160] | sub("\\s+\\S*$"; "")) + " …" else . end;
+        [ .[] | (.metadata // {}) as $m
+          | ($m.resident == "full") as $full
+          | {
+              id,
+              text: (if $full then .text else ($m.hook // (.text | first_sentence) | clip) end),
+              index: ($full | not),
+              metadata: {verified_at: $m.verified_at, mem_status: ($m.mem_status // "active")}
+            } ]'
 }
 
 _memory_markdown_block() {
@@ -730,6 +784,8 @@ _memory_markdown_block() {
             "## WEAVE:MEMORY",
             "",
             "Authority: weave graph. Capture records dynamic agent provenance, but recall is agent-agnostic. Lifecycle field: metadata.mem_status. Recall: `wv memory recall --agent=all --json`. Capture: `wv remember <text>`.",
+            "",
+            "Each line is an index entry. Read a memory in full with `wv memory recall --agent=all --json` or `wv show <id>` before relying on it.",
             "",
             (if length == 0 then "_No active graph memory._" else (.[] | "- [`\(.id)`] \(.text) (verified: \(.metadata.verified_at // "unknown"))") end),
             "<!-- ── END WEAVE:MEMORY ── -->"
@@ -793,8 +849,10 @@ _memory_render_codex_json() {
         printf '%s\n' '{"schema":"weave.codex.v1"}' > "$path"
     fi
     tmp=$(mktemp "$target_dir/.weave-memory.XXXXXX")
-    if ! jq --argjson entries "$entries" '
-        . + {
+    # Entries grow with the graph's memories: --slurpfile, not argv (wv-200d36).
+    if ! jq --slurpfile entries <(printf '%s' "$entries") '
+        $entries[0] as $entries
+        | . + {
             memory: {
                 authority: "weave-graph",
                 lifecycle_field: "metadata.mem_status",
@@ -829,6 +887,13 @@ _memory_render_codex_json() {
     fi
     mv "$tmp" "$path"
 }
+
+# The projections --agent=all writes: the files a harness loads. .claude/MEMORY.md
+# and .codex/MEMORY.md are no harness's instruction file (Claude Code reads its
+# own ~/.claude/projects/<slug>/memory/MEMORY.md, Codex its ~/.codex/memories),
+# so they left the set (wv-91f0ca); --agent=claude-memory|codex-memory still
+# renders one on request.
+_MEMORY_AGNOSTIC_PROJECTIONS=(claude codex copilot agents)
 
 _memory_projection_path() {
     local projection="$1" base_dir="$2"
@@ -880,7 +945,7 @@ _memory_scan_claude() {
         | jq -Rn --arg repo_root "$repo_root" '
             [inputs | {
                 source_agent: "claude",
-                source_kind: (if test("\\.md$") then "memory_file" else "session" end),
+                source_kind: (if test("/MEMORY\\.md$") then "memory_index" elif test("\\.md$") then "memory_file" else "session" end),
                 source_path: .,
                 repo_root: $repo_root
             }]
@@ -911,12 +976,15 @@ _memory_scan_codex() {
                         FROM '$table'
                         WHERE cwd = '$(sql_escape "$repo_root")';
                     " 2>/dev/null || echo '[]')
+                    # Observations and thread rows grow with the Codex stores:
+                    # files, not argv, past which execve fails E2BIG (wv-200d36).
                     observations=$(jq -nc \
-                        --argjson obs "$observations" \
-                        --argjson rows "${rows:-[]}" \
+                        --slurpfile obs <(printf '%s' "$observations") \
+                        --slurpfile rows <(printf '%s' "${rows:-[]}") \
                         --arg source_path "$db" \
                         --arg repo_root "$repo_root" \
-                        '$obs + ($rows | map({
+                        '$obs[0] as $obs | $rows[0] as $rows
+                        | $obs + ($rows | map({
                             source_agent: "codex",
                             source_kind: "thread_db",
                             source_path: $source_path,
@@ -927,17 +995,18 @@ _memory_scan_codex() {
                             repo_root: $repo_root
                         }))')
                     repo_thread_ids=$(jq -nc \
-                        --argjson ids "$repo_thread_ids" \
-                        --argjson rows "${rows:-[]}" \
-                        '($ids + ($rows | map((.id // .thread_id // .conversation_id // "") | tostring) | map(select(length > 0)))) | unique')
+                        --slurpfile ids <(printf '%s' "$repo_thread_ids") \
+                        --slurpfile rows <(printf '%s' "${rows:-[]}") \
+                        '$ids[0] as $ids | $rows[0] as $rows
+                        | ($ids + ($rows | map((.id // .thread_id // .conversation_id // "") | tostring) | map(select(length > 0)))) | unique')
                     while IFS= read -r row; do
                         rollout=$(printf '%s' "$row" | jq -r '.rollout_path // empty')
                         [ -n "$rollout" ] && [ -f "$rollout" ] || continue
                         observations=$(jq -nc \
-                            --argjson obs "$observations" \
+                            --slurpfile obs <(printf '%s' "$observations") \
                             --arg source_path "$rollout" \
                             --arg repo_root "$repo_root" \
-                            '$obs + [{
+                            '$obs[0] as $obs | $obs + [{
                                 source_agent: "codex",
                                 source_kind: "rollout",
                                 source_path: $source_path,
@@ -966,7 +1035,7 @@ _memory_scan_codex() {
                     ;;
                 *" thread_id "*)
                     memrows=$(sqlite3 -json "$db" "SELECT rowid, * FROM stage1_outputs;" 2>/dev/null \
-                        | jq -c --argjson ids "$repo_thread_ids" '[.[] | select((.thread_id // "" | tostring) as $t | $ids | index($t))]' 2>/dev/null || echo '[]')
+                        | jq -c --slurpfile ids <(printf '%s' "$repo_thread_ids") '$ids[0] as $ids | [.[] | select((.thread_id // "" | tostring) as $t | $ids | index($t))]' 2>/dev/null || echo '[]')
                     ;;
                 *)
                     # No repo identity in this table shape. Skip rather than
@@ -975,11 +1044,12 @@ _memory_scan_codex() {
                     ;;
             esac
             observations=$(jq -nc \
-                --argjson obs "$observations" \
-                --argjson rows "${memrows:-[]}" \
+                --slurpfile obs <(printf '%s' "$observations") \
+                --slurpfile rows <(printf '%s' "${memrows:-[]}") \
                 --arg source_path "$db" \
                 --arg repo_root "$repo_root" \
-                '$obs + ($rows | map({
+                '$obs[0] as $obs | $rows[0] as $rows
+                | $obs + ($rows | map({
                     source_agent: "codex",
                     source_kind: "memory_db",
                     source_path: $source_path,
@@ -1008,10 +1078,10 @@ _memory_scan_copilot() {
         fi
         wsdir=$(dirname "$wsjson")
         observations=$(jq -nc \
-            --argjson obs "$observations" \
+            --slurpfile obs <(printf '%s' "$observations") \
             --arg source_path "$wsjson" \
             --arg repo_root "$repo_root" \
-            '$obs + [{
+            '$obs[0] as $obs | $obs + [{
                 source_agent: "copilot",
                 source_kind: "workspace",
                 source_path: $source_path,
@@ -1020,9 +1090,9 @@ _memory_scan_copilot() {
         files=$(find "$wsdir" -type f \( -path "*/chatSessions/*.jsonl" -o -path "*/chatEditingSessions/*/state.json" \) -print 2>/dev/null | sort)
         if [ -n "$files" ]; then
             observations=$(printf '%s\n' "$files" | jq -Rn \
-                --argjson obs "$observations" \
+                --slurpfile obs <(printf '%s' "$observations") \
                 --arg repo_root "$repo_root" \
-                '$obs + [inputs | {
+                '$obs[0] as $obs | $obs + [inputs | {
                     source_agent: "copilot",
                     source_kind: (if test("chatSessions/.*\\.jsonl$") then "chat" else "editing_state" end),
                     source_path: .,
@@ -1052,6 +1122,101 @@ _memory_scan_sources() {
     esac
 }
 
+# A source imported before with other content (wv-99990b). Prints one
+# "id|mem_status" row per live import (candidate or active) of the same source:
+# the file for Claude, the DB row's path and thread for Codex. A second argument,
+# even an empty one, keys on the thread as well.
+_memory_earlier_imports() {
+    local path_sql session_clause=""
+    path_sql=$(sql_escape "$1")
+    if [ "$#" -ge 2 ]; then
+        session_clause="AND COALESCE(json_extract(metadata,'\$.source_session'),'')='$(sql_escape "$2")'"
+    fi
+    db_query "SELECT id || '|' || COALESCE(json_extract(metadata,'\$.mem_status'),'active') FROM nodes
+        WHERE $(wv_kind_sql) = 'memory' AND json_extract(metadata,'\$.source_path')='$path_sql' $session_clause
+          AND COALESCE(json_extract(metadata,'\$.mem_status'),'active') IN ('candidate','active')
+        ORDER BY created_at, id;" 2>/dev/null
+}
+
+# _memory_revised_ids <rows> -- the active memories among earlier imports, one
+# id per line: a new candidate names them so review revises the memory rather
+# than promoting a second copy beside it.
+_memory_revised_ids() {
+    printf '%s\n' "$1" | awk -F'|' '$2 == "active" && $1 != "" {print $1}'
+}
+
+# _memory_supersede_earlier <new-id> <rows> -- supersedes the earlier candidates
+# so one source has one live candidate; prints one JSON line per superseded id.
+_memory_supersede_earlier() {
+    local new_id="$1" rows="$2" old_id old_status now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    while IFS='|' read -r old_id old_status; do
+        [ "$old_status" = candidate ] || continue
+        _memory_patch_metadata "$old_id" "$(jq -nc --arg new "$new_id" --arg now "$now" \
+            '{mem_status: "superseded", superseded_by: $new, superseded_at: $now, superseded_reason: "source changed"}')"
+        jq -nc --arg old "$old_id" --arg new "$new_id" '{id: $old, superseded_by: $new}'
+    done <<< "$rows"
+}
+
+# The import results grow with the source: one entry per memory file or Codex
+# row. They are kept as JSON lines in files and read back with --slurpfile,
+# never passed as an --argjson payload, which fails with E2BIG past 128 KiB
+# (tests/test-argjson-payload.sh).
+_memory_import_report() {
+    local acc="$1" format="$2" unit="$3"
+    if [ "$format" = "json" ]; then
+        jq -n --slurpfile imported "$acc/imported" --slurpfile skipped "$acc/skipped" --slurpfile superseded "$acc/superseded" \
+            '{imported: $imported, count: ($imported | length),
+              skipped: ([$skipped[] | select(.reason != "index")] | length),
+              skipped_index: ([$skipped[] | select(.reason == "index")] | length),
+              reshaped: [$skipped[] | .reshaped // empty],
+              superseded: $superseded}'
+    else
+        jq -r '"✓ Imported \(.source_path) -> \(.id)"' "$acc/imported"
+        jq -r '"↻ Superseded earlier import \(.id) -> \(.superseded_by) (source changed)"' "$acc/superseded"
+        jq -r 'select(.reshaped) | "↻ Reshaped legacy import \(.reshaped) (frontmatter moved to the hook)"' "$acc/skipped"
+        local n_skipped; n_skipped=$(jq -s '[.[] | select(.reason != "index")] | length' "$acc/skipped")
+        [ "$n_skipped" -gt 0 ] && echo "⏭  Skipped $n_skipped already-imported $unit (source_hash match)"
+    fi
+    return 0
+}
+
+# A Claude memory file is YAML frontmatter (name, description, metadata) and a
+# body. The body is the memory and the description is its one-line hook. The
+# import used to keep the frontmatter in the text and cut the body at 20 lines:
+# index lines read '--- name: …', crystallize's overlap check matched on
+# frontmatter words, and promoted memories lost their tails (wv-b3d2b6).
+# Prints {name, hook, text}; text is the whole body on one line.
+_memory_claude_file_parts() {
+    awk '
+        NR == 1 && $0 == "---" { fm = 1; next }
+        fm && $0 == "---" { fm = 0; next }
+        fm && /^name:/ { sub(/^name:[ \t]*/, ""); name = $0; next }
+        fm && /^description:/ { sub(/^description:[ \t]*/, ""); desc = $0; next }
+        fm || /^#/ || /^[ \t]*$/ || $0 == "---" { next }
+        { body = body " " $0 }
+        END { print name; print desc; print body }' "$1" \
+    | jq -Rsc 'def unquote: if test("^\".*\"$") then .[1:-1] | gsub("\\\\\""; "\"")
+                            elif test("^'"'"'.*'"'"'$") then .[1:-1] else . end;
+               def squash: gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; "");
+               split("\n") | {name: (.[0] | unquote), hook: (.[1] | unquote | squash), text: (.[2] | squash)}'
+}
+
+# An import made before wv-b3d2b6 still carries its frontmatter. When its file
+# is unchanged (same source_hash) and its text was not edited since, rewrite
+# the text and hook in place; prints the id it reshaped.
+_memory_reshape_legacy_import() {
+    local hash="$1" parts="$2" id text_sql
+    id=$(db_query "SELECT id FROM nodes WHERE json_extract(metadata,'\$.source_hash')='$hash'
+                     AND substr(text, 1, 4) = '--- ' LIMIT 1;" 2>/dev/null)
+    [ -n "$id" ] || return 0
+    text_sql=$(sql_escape "$(jq -r '.text' <<< "$parts")")
+    [ -n "$text_sql" ] || return 0
+    db_query "UPDATE nodes SET text='$text_sql', updated_at=CURRENT_TIMESTAMP WHERE id='$id';"
+    _memory_patch_metadata "$id" "$(jq -c '{source_name: .name} + (if .hook != "" then {hook: .hook} else {} end)' <<< "$parts")"
+    echo "$id"
+}
+
 _memory_import_claude_dir() {
     local path="$1" repo_root="$2" format="$3"
     if [ ! -d "$path" ]; then
@@ -1061,24 +1226,41 @@ _memory_import_claude_dir() {
     db_ensure
     db_migrate_fts5 2>/dev/null || true
 
-    local imported='[]' skipped='[]' file text id hash metadata text_sql metadata_sql
+    local acc file parts text id hash metadata text_sql metadata_sql earlier reshaped
+    acc=$(mktemp -d) || return 1
+    : > "$acc/imported"; : > "$acc/skipped"; : > "$acc/superseded"
     while IFS= read -r file; do
         [ -f "$file" ] || continue
-        text=$(sed '/^#/d; /^$/d' "$file" | head -20 | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')
+        # MEMORY.md is Claude's index of the memory files, one line per file,
+        # not a memory of its own; importing it made a candidate of the index
+        # (wv-99990b).
+        if [ "$(basename "$file")" = MEMORY.md ]; then
+            jq -nc --arg path "$file" '{source_path: $path, reason: "index"}' >> "$acc/skipped"
+            continue
+        fi
+        parts=$(_memory_claude_file_parts "$file")
+        text=$(jq -r '.text' <<< "$parts")
         [ -n "$text" ] || text=$(basename "$file")
         hash=$(_memory_file_hash "$file")
         # Idempotency: skip if a memory node with this source_hash already exists.
         if [ -n "$(db_query "SELECT 1 FROM nodes WHERE json_extract(metadata,'\$.source_hash')='$hash' LIMIT 1;" 2>/dev/null)" ]; then
-            skipped=$(printf '%s\n' "$skipped" | jq --arg path "$file" '. + [{source_path: $path}]')
+            reshaped=$(_memory_reshape_legacy_import "$hash" "$parts")
+            jq -nc --arg path "$file" --arg id "$reshaped" \
+                '{source_path: $path, reason: "source_hash match"} + (if $id != "" then {reshaped: $id} else {} end)' >> "$acc/skipped"
             continue
         fi
+        earlier=$(_memory_earlier_imports "$file")
         id=$(generate_id)
         metadata=$(jq -nc \
             --arg repo_root "$repo_root" \
             --arg source_path "$file" \
             --arg source_hash "$hash" \
+            --arg revises "$(_memory_revised_ids "$earlier")" \
+            --arg name "$(jq -r '.name' <<< "$parts")" \
+            --arg hook "$(jq -r '.hook' <<< "$parts")" \
             '{
                 type: "memory",
+                node_kind: "memory",
                 kind: "project",
                 scope: "repo",
                 mem_status: "candidate",
@@ -1088,21 +1270,19 @@ _memory_import_claude_dir() {
                 source_hash: $source_hash,
                 repo_root: $repo_root,
                 observed_at: (now | strftime("%Y-%m-%dT%H:%M:%SZ"))
-            }')
+            } + ($revises | split("\n") | map(select(length > 0))
+                 | if length > 0 then {revises: .} else {} end)
+              + (if $name != "" then {source_name: $name} else {} end)
+              + (if $hook != "" then {hook: $hook} else {} end)')
         text_sql=$(sql_escape "$text")
         metadata_sql=$(sql_escape "$metadata")
         db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text_sql', 'done', '$metadata_sql');"
-        imported=$(printf '%s\n' "$imported" | jq --arg id "$id" --arg path "$file" '. + [{id: $id, source_path: $path}]')
+        jq -nc --arg id "$id" --arg path "$file" '{id: $id, source_path: $path}' >> "$acc/imported"
+        _memory_supersede_earlier "$id" "$earlier" >> "$acc/superseded"
     done < <(find "$path" -maxdepth 1 -type f -name "*.md" -print 2>/dev/null | sort)
 
-    if [ "$format" = "json" ]; then
-        jq -n --argjson imported "$imported" --argjson skipped "$skipped" \
-            '{imported: $imported, count: ($imported | length), skipped: ($skipped | length)}'
-    else
-        printf '%s\n' "$imported" | jq -r '.[] | "✓ Imported \(.source_path) -> \(.id)"'
-        local n_skipped; n_skipped=$(printf '%s\n' "$skipped" | jq 'length')
-        [ "$n_skipped" -gt 0 ] && echo "⏭  Skipped $n_skipped already-imported file(s) (source_hash match)"
-    fi
+    _memory_import_report "$acc" "$format" "file(s)"
+    rm -rf "$acc"
     auto_sync_or_warn
 }
 
@@ -1111,13 +1291,15 @@ _memory_import_codex() {
     db_ensure
     db_migrate_fts5 2>/dev/null || true
 
-    local observations imported='[]' skipped='[]'
+    local observations
     observations=$(_memory_scan_codex "$repo_root") || return 1
     if [ -n "$path" ]; then
         observations=$(printf '%s\n' "$observations" | jq --arg path "$path" '[.[] | select(.source_path == $path)]')
     fi
 
-    local obs text source_path source_session hash id metadata text_sql metadata_sql
+    local acc obs text source_path source_session hash id metadata text_sql metadata_sql earlier
+    acc=$(mktemp -d) || return 1
+    : > "$acc/imported"; : > "$acc/skipped"; : > "$acc/superseded"
     while IFS= read -r obs; do
         [ -n "$obs" ] || continue
         text=$(printf '%s\n' "$obs" | jq -r '.excerpt // empty' | head -20 | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')
@@ -1127,17 +1309,21 @@ _memory_import_codex() {
         hash=$(printf '%s' "$repo_root|$source_path|$source_session|$text" | sha256sum | awk '{print $1}')
         # Idempotency: skip if a memory node with this source_hash already exists.
         if [ -n "$(db_query "SELECT 1 FROM nodes WHERE json_extract(metadata,'\$.source_hash')='$hash' LIMIT 1;" 2>/dev/null)" ]; then
-            skipped=$(printf '%s\n' "$skipped" | jq --arg path "$source_path" '. + [{source_path: $path}]')
+            jq -nc --arg path "$source_path" '{source_path: $path, reason: "source_hash match"}' >> "$acc/skipped"
             continue
         fi
+        # A thread whose output Codex rewrote: same row path and thread.
+        earlier=$(_memory_earlier_imports "$source_path" "$source_session")
         id=$(generate_id)
         metadata=$(jq -nc \
             --arg repo_root "$repo_root" \
             --arg source_path "$source_path" \
             --arg source_session "$source_session" \
             --arg source_hash "$hash" \
+            --arg revises "$(_memory_revised_ids "$earlier")" \
             '{
                 type: "memory",
+                node_kind: "memory",
                 kind: "project",
                 scope: "repo",
                 mem_status: "candidate",
@@ -1148,21 +1334,18 @@ _memory_import_codex() {
                 source_hash: $source_hash,
                 repo_root: $repo_root,
                 observed_at: (now | strftime("%Y-%m-%dT%H:%M:%SZ"))
-            }')
+            } + ($revises | split("\n") | map(select(length > 0))
+                 | if length > 0 then {revises: .} else {} end)')
         text_sql=$(sql_escape "$text")
         metadata_sql=$(sql_escape "$metadata")
         db_query "INSERT INTO nodes (id, text, status, metadata) VALUES ('$id', '$text_sql', 'done', '$metadata_sql');"
-        imported=$(printf '%s\n' "$imported" | jq --arg id "$id" --arg path "$source_path" --arg session "$source_session" '. + [{id: $id, source_path: $path, source_session: $session}]')
+        jq -nc --arg id "$id" --arg path "$source_path" --arg session "$source_session" \
+            '{id: $id, source_path: $path, source_session: $session}' >> "$acc/imported"
+        _memory_supersede_earlier "$id" "$earlier" >> "$acc/superseded"
     done < <(printf '%s\n' "$observations" | jq -c '.[] | select(.source_agent == "codex" and .source_kind == "memory_db")')
 
-    if [ "$format" = "json" ]; then
-        jq -n --argjson imported "$imported" --argjson skipped "$skipped" \
-            '{imported: $imported, count: ($imported | length), skipped: ($skipped | length)}'
-    else
-        printf '%s\n' "$imported" | jq -r '.[] | "✓ Imported \(.source_path) -> \(.id)"'
-        local n_skipped; n_skipped=$(printf '%s\n' "$skipped" | jq 'length')
-        [ "$n_skipped" -gt 0 ] && echo "⏭  Skipped $n_skipped already-imported row(s) (source_hash match)"
-    fi
+    _memory_import_report "$acc" "$format" "row(s)"
+    rm -rf "$acc"
     auto_sync_or_warn
 }
 
@@ -1176,7 +1359,7 @@ _memory_candidates_json() {
     db_query_json_v2 "
         SELECT id, text, metadata
         FROM nodes
-        WHERE json_extract(metadata, '\$.type') = 'memory'
+        WHERE $(wv_kind_sql) = 'memory'
           AND json_extract(metadata, '\$.mem_status') = 'candidate'
         ORDER BY created_at ASC, id ASC;
     "
@@ -1211,7 +1394,7 @@ _memory_crystallize_dedup_one() {
         hmatch=$(db_query "
             SELECT n2.id FROM nodes n2, nodes self
             WHERE self.id = '$id' AND n2.id != self.id
-              AND json_extract(n2.metadata,'\$.type')='memory'
+              AND $(wv_kind_sql n2)='memory'
               AND json_extract(n2.metadata,'\$.source_hash')='$hash'
               AND n2.rowid < self.rowid
             LIMIT 1;" 2>/dev/null || true)
@@ -1248,8 +1431,8 @@ _memory_crystallize_dedup_one() {
         WHERE nodes_fts MATCH '$terms'
           AND f.id != '$id'
           AND ( json_extract(n.metadata,'\$.learning') IS NOT NULL
-                OR json_extract(n.metadata,'\$.type')='finding'
-                OR ( json_extract(n.metadata,'\$.type')='memory'
+                OR $(wv_kind_sql n)='finding'
+                OR ( $(wv_kind_sql n)='memory'
                      AND COALESCE(json_extract(n.metadata,'\$.mem_status'),'active')='active'
                      AND COALESCE(json_extract(n.metadata,'\$.kind'),'') = '$cand_kind_esc' ) )
         ORDER BY rank
@@ -1264,7 +1447,11 @@ _memory_crystallize_dedup_one() {
                      | (if $l and ($l | length) > 0 then $l else (.text // "") end)' 2>/dev/null || echo "")
         npol=$(_done_polarity "$text")
         opol=$(_done_polarity "$other")
-        if [ "$npol" != "0" ] && [ "$opol" != "0" ] && [ "$npol" != "$opol" ]; then
+        # A closed finding for the pair is a resolved review: the claims were
+        # read side by side and found compatible, so it no longer holds the
+        # candidate back (wv-b3d2b6).
+        if [ "$npol" != "0" ] && [ "$opol" != "0" ] && [ "$npol" != "$opol" ] \
+            && [ "$(_memory_contradiction_finding "$id" "$fmatch" closed)" = "" ]; then
             _cr_contradicts="$fmatch"
         fi
     fi
@@ -1346,14 +1533,30 @@ _memory_crystallize_edge() {
         VALUES ('$source', '$target', '$type', 1.0, '$context_sql', CURRENT_TIMESTAMP);" 2>/dev/null || true
 }
 
+# _memory_contradiction_finding <cand> <other> open|closed -- prints the id of the
+# contradiction finding filed for the pair in that state, if any.
+_memory_contradiction_finding() {
+    local state_sql="status != 'done'"
+    [ "$3" = closed ] && state_sql="status = 'done'"
+    db_query "SELECT id FROM nodes WHERE $state_sql
+                AND json_extract(metadata,'\$.finding.violation_type') = 'memory_contradiction'
+                AND json_extract(metadata,'\$.finding.root_cause') = 'candidate memory $1 contradicts $2'
+              LIMIT 1;" 2>/dev/null || true
+}
+
 # Create a finding node for an unresolved contradiction between a candidate and
 # an existing memory/learning/finding.
 _memory_crystallize_finding() {
     local cand="$1" other="$2" id metadata text_sql metadata_sql
+    # One finding per pair: every --apply-reviewed run used to file another
+    # (wv-b3d2b6).
+    id=$(_memory_contradiction_finding "$cand" "$other" open)
+    if [ -n "$id" ]; then echo "$id"; return 0; fi
     id=$(generate_id)
     metadata=$(jq -nc --arg cand "$cand" --arg other "$other" \
         '{
             type: "finding",
+            node_kind: "finding",
             finding: {
                 violation_type: "memory_contradiction",
                 root_cause: ("candidate memory " + $cand + " contradicts " + $other),
@@ -1429,7 +1632,7 @@ cmd_remember() {
         fi
         old_meta=$(db_query_json "SELECT metadata FROM nodes WHERE id='$supersedes';" 2>/dev/null \
             | jq -c '.[0].metadata // empty | fromjson' 2>/dev/null || true)
-        if [ -z "$old_meta" ] || [ "$(jq -r '.type // ""' <<< "$old_meta")" != "memory" ]; then
+        if [ -z "$old_meta" ] || [ "$(jq -r '.node_kind // .type // ""' <<< "$old_meta")" != "memory" ]; then
             echo -e "${RED}Error: $supersedes is not a memory node${NC}" >&2
             return 1
         fi
@@ -1450,6 +1653,7 @@ cmd_remember() {
         --arg supersedes "$supersedes" \
         '{
             type: "memory",
+            node_kind: "memory",
             kind: $kind,
             scope: $scope,
             mem_status: "active",
@@ -1486,6 +1690,309 @@ cmd_remember() {
     fi
 
     auto_sync_or_warn
+}
+
+# ── Review (wv-de2e83) ───────────────────────────────────────────────────────
+# A reviewer's verdict on a candidate memory, and its application. Promotion
+# reads metadata.reviewed, which no command set, so none of 106 imported
+# candidates ever became active (wv-5408a3). Recording a verdict sets only
+# metadata.review: crystallize --apply-reviewed promotes any reviewed keep
+# candidate, so reviewed is written by --apply, never by the verdict itself.
+#   promote  apply sets reviewed; crystallize's own checks still run before
+#            the candidate turns active
+#   merge    the substance belongs in an existing active memory: apply
+#            supersedes the candidate onto it and lists it in the target's
+#            merge_from, which marks the target's text for amendment
+#   reject   apply retires the candidate (mem_status=rejected) with the reason
+#   verify   a claim to check first: apply leaves it a candidate
+#   graduate the one verdict on an ACTIVE memory (wv-a8f91e): --target names
+#            the repository surface that now carries the lesson; apply checks
+#            the target again and sets mem_status=graduated with graduated_to,
+#            which drops the memory from every projection but not from recall
+_MEMORY_REVIEW_VERDICTS="promote merge reject verify graduate"
+
+_memory_review_command() {
+    local id="" verdict="" reason="" target="" apply=false dry=false format="text"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --verdict=*) verdict="${1#*=}" ;;
+            --reason=*) reason="${1#*=}" ;;
+            --target=*) target="${1#*=}" ;;
+            --apply) apply=true ;;
+            --dry-run) dry=true ;;
+            --json) format="json" ;;
+            --help|-h) _memory_usage; return 0 ;;
+            -*) echo -e "${RED}Error: unknown option $1${NC}" >&2; _memory_usage; return 1 ;;
+            *)
+                if [ -n "$id" ]; then
+                    echo -e "${RED}Error: one memory id per review${NC}" >&2
+                    return 1
+                fi
+                id="$1"
+                ;;
+        esac
+        shift
+    done
+    db_ensure
+
+    if [ "$apply" = true ]; then
+        if [ -n "$id$verdict$reason$target" ]; then
+            echo -e "${RED}Error: --apply applies the recorded verdicts; it takes no id, verdict, reason or target${NC}" >&2
+            return 1
+        fi
+        _memory_review_apply "$dry" "$format"
+        return
+    fi
+    if [ "$dry" = true ]; then
+        echo -e "${RED}Error: --dry-run goes with --apply${NC}" >&2
+        return 1
+    fi
+
+    validate_id "$id" || return 1
+    case " $_MEMORY_REVIEW_VERDICTS " in
+        *" $verdict "*) ;;
+        *) echo -e "${RED}Error: --verdict must be one of: ${_MEMORY_REVIEW_VERDICTS// /, }${NC}" >&2; return 1 ;;
+    esac
+    if [ -z "${reason//[[:space:]]/}" ]; then
+        echo -e "${RED}Error: --reason is required: a verdict without its reason cannot be checked later${NC}" >&2
+        return 1
+    fi
+    local meta
+    meta=$(db_query_json "SELECT metadata FROM nodes WHERE id='$id' AND $(wv_kind_sql) = 'memory';" 2>/dev/null \
+        | jq -c '.[0].metadata // empty | fromjson? // empty')
+    if [ -z "$meta" ]; then
+        echo -e "${RED}Error: $id is not a memory node${NC}" >&2
+        return 1
+    fi
+    local mem_status reviewable=candidate
+    mem_status=$(jq -r '.mem_status // "active"' <<< "$meta")
+    [ "$verdict" = graduate ] && reviewable=active
+    if [ "$mem_status" != "$reviewable" ]; then
+        echo -e "${RED}Error: $id is $mem_status, not $reviewable; --verdict=$verdict applies to $reviewable memories${NC}" >&2
+        return 1
+    fi
+    # A memory promoted by review turns active with its verdict applied, and may
+    # graduate later: that earlier review does not block this one.
+    if [ "$verdict" != graduate ] && [ "$(jq -r '.review.applied // false' <<< "$meta")" = true ]; then
+        echo -e "${RED}Error: $id's verdict was already applied${NC}" >&2
+        return 1
+    fi
+    if [ "$verdict" = merge ]; then
+        validate_id "$target" || return 1
+        if [ "$target" = "$id" ] || [ -z "$(db_query "SELECT 1 FROM nodes WHERE id='$target' AND $(wv_kind_sql) = 'memory'
+                AND COALESCE(json_extract(metadata,'\$.mem_status'),'active') = 'active';" 2>/dev/null)" ]; then
+            echo -e "${RED}Error: --target must be another active memory; $target is not${NC}" >&2
+            return 1
+        fi
+    elif [ "$verdict" = graduate ]; then
+        target=$(_memory_graduate_target "$target") || return 1
+    elif [ -n "$target" ]; then
+        echo -e "${RED}Error: --target goes with --verdict=merge or --verdict=graduate${NC}" >&2
+        return 1
+    fi
+
+    local patch
+    patch=$(jq -nc --arg v "$verdict" --arg r "$reason" --arg t "$target" \
+        --arg by "$(resolve_agent_id 2>/dev/null || echo unknown)" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{review: ({verdict: $v, reason: $r, by: $by, at: $at, applied: false} + (if $t == "" then {} else {target: $t} end))}')
+    # Replace the review object whole: a merge into the old one would keep a
+    # stale target after a change of verdict.
+    _memory_patch_metadata "$id" '{"review": null}'
+    _memory_patch_metadata "$id" "$patch"
+    if [ "$format" = json ]; then
+        jq -c --arg id "$id" '{id: $id} + .' <<< "$patch"
+    else
+        echo "✓ Recorded $verdict for $id${target:+ -> $target}; apply with: wv memory review --apply"
+    fi
+    auto_sync_or_warn
+}
+
+# _memory_review_apply <dry-run true|false> <format>
+_memory_review_apply() {
+    local dry="$1" format="$2" acc row cid verdict reason target now status merge_from why
+    acc=$(mktemp -d) || return 1
+    : > "$acc/results"
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local rows=()
+    mapfile -t rows < <(db_query_json "SELECT id, metadata FROM nodes
+            WHERE $(wv_kind_sql) = 'memory'
+              AND (json_extract(metadata,'\$.mem_status') = 'candidate'
+                   OR (COALESCE(json_extract(metadata,'\$.mem_status'),'active') = 'active'
+                       AND json_extract(metadata,'\$.review.verdict') = 'graduate'))
+              AND json_extract(metadata,'\$.review.verdict') IS NOT NULL
+              AND COALESCE(json_extract(metadata,'\$.review.applied'), 0) = 0
+            ORDER BY id;" 2>/dev/null \
+        | jq -r '.[] | (.metadata | fromjson? // {}) as $m | [.id, $m.review.verdict, ($m.review.reason // "" | gsub("\t";" ")), ($m.review.target // "")] | @tsv')
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r cid verdict reason target <<< "$row"
+        [ -n "$cid" ] || continue
+        status="applied"
+        case "$verdict" in
+            promote)
+                [ "$dry" = true ] || _memory_patch_metadata "$cid" "$(jq -nc --arg t "$now" \
+                    '{reviewed: true, review: {applied: true, applied_at: $t}}')"
+                ;;
+            merge)
+                if [ -z "$(db_query "SELECT 1 FROM nodes WHERE id='$target' AND $(wv_kind_sql) = 'memory'
+                        AND COALESCE(json_extract(metadata,'\$.mem_status'),'active') = 'active';" 2>/dev/null)" ]; then
+                    status="refused: target $target is no longer an active memory; review again"
+                elif [ "$dry" != true ]; then
+                    _memory_patch_metadata "$cid" "$(jq -nc --arg s "$target" --arg t "$now" \
+                        '{mem_status: "superseded", superseded_by: $s, superseded_at: $t, superseded_reason: "merged by review", review: {applied: true, applied_at: $t}}')"
+                    _memory_crystallize_edge "$cid" "$target" "supersedes"
+                    merge_from=$(db_query_json "SELECT metadata FROM nodes WHERE id='$target';" 2>/dev/null \
+                        | jq -c --arg c "$cid" '{merge_from: ((.[0].metadata | fromjson? // {}) | (.merge_from // []) + [$c] | unique)}')
+                    _memory_patch_metadata "$target" "$merge_from"
+                fi
+                ;;
+            reject)
+                [ "$dry" = true ] || _memory_patch_metadata "$cid" "$(jq -nc --arg r "$reason" --arg t "$now" \
+                    '{mem_status: "rejected", rejected_reason: $r, rejected_at: $t, review: {applied: true, applied_at: $t}}')"
+                ;;
+            graduate)
+                # The target was checked when recorded; it may have moved or
+                # stopped parsing since.
+                if ! why=$(_memory_graduate_target "$target" 2>&1 >/dev/null); then
+                    status="refused: ${why#Error: }; review again"
+                elif [ "$dry" != true ]; then
+                    _memory_patch_metadata "$cid" "$(jq -nc --arg g "$target" --arg r "$reason" --arg t "$now" \
+                        '{mem_status: "graduated", graduated_to: $g, graduated_reason: $r, graduated_at: $t, review: {applied: true, applied_at: $t}}')"
+                fi
+                ;;
+            verify)
+                status="pending: verify the claim, then record promote, merge or reject"
+                ;;
+            *)
+                status="refused: unknown verdict $verdict"
+                ;;
+        esac
+        jq -nc --arg id "$cid" --arg v "$verdict" --arg t "$target" --arg s "$status" \
+            '{id: $id, verdict: $v, status: $s} + (if $t == "" then {} else {target: $t} end)' >> "$acc/results"
+    done
+
+    if [ "$format" = json ]; then
+        jq -s --arg mode "$([ "$dry" = true ] && echo dry-run || echo apply)" \
+            '{mode: $mode, results: ., applied: ([.[] | select(.status == "applied")] | length),
+              pending: ([.[] | select(.status | startswith("pending"))] | length),
+              refused: ([.[] | select(.status | startswith("refused"))] | length)}' "$acc/results"
+    else
+        jq -r '"\(.verdict)\t\(.id)\(if .target then " -> " + .target else "" end)\t\(.status)"' "$acc/results"
+        jq -rs --arg dry "$dry" '"\(length) verdict(s)\(if $dry == "true" then " (dry run, nothing written)" else "" end); merge targets to amend: \([.[] | select(.verdict == "merge" and .status == "applied") | .target] | unique | join(", ") | if . == "" then "none" else . end)"' "$acc/results"
+    fi
+    rm -rf "$acc"
+    [ "$dry" = true ] || auto_sync_or_warn
+}
+
+# wv memory crystallize, moved out of cmd_memory unchanged (wv-de2e83 kept
+# cmd_memory under the shell complexity limit).
+_memory_crystallize_command() {
+    local mode="dry-run"
+    local format="text"
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) mode="dry-run" ;;
+            --apply-reviewed) mode="apply-reviewed" ;;
+            --repo-root=*) repo_root="${1#*=}" ;;
+            --json) format="json" ;;
+            --help|-h)
+                _memory_usage
+                return 0
+                ;;
+            *)
+                echo -e "${RED}Error: unknown option $1${NC}" >&2
+                _memory_usage
+                return 1
+                ;;
+        esac
+        shift
+    done
+    db_ensure
+    db_migrate_fts5 2>/dev/null || true
+
+    local candidates report='[]'
+    local cid ctext chash creviewed action now
+    candidates=$(_memory_candidates_json)
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Read candidate rows into an array first so the db_query/sqlite3 calls
+    # inside the loop body cannot consume the feeding fd (1-iteration bug).
+    local cand_rows=() line
+    mapfile -t cand_rows < <(printf '%s' "$candidates" | jq -r '.[] | [.id, (.text // "" | gsub("\t";" ")), (.metadata.source_hash // ""), ((.metadata.reviewed // false) | tostring)] | @tsv')
+    for line in "${cand_rows[@]}"; do
+        IFS=$'\t' read -r cid ctext chash creviewed <<<"$line"
+        [ -n "$cid" ] || continue
+        _memory_crystallize_dedup_one "$cid" "$ctext" "$chash"
+        _memory_crystallize_verify_one "$ctext" "$repo_root"
+
+        # Deterministic signals win; fuzzy overlap is advisory only.
+        action="keep"
+        if [ -n "$_cr_stale_reason" ]; then
+            action="stale"
+        elif [ "$_cr_dup_kind" = "source_hash" ]; then
+            action="superseded"
+        elif [ -n "$_cr_contradicts" ]; then
+            action="contradicts"
+        elif [ "$creviewed" = "true" ]; then
+            action="promote"
+        elif [ -n "$_cr_dup_id" ]; then
+            action="overlap"
+        fi
+
+        local finding_id=""
+        if [ "$mode" = "apply-reviewed" ]; then
+            case "$action" in
+                stale)
+                    _memory_patch_metadata "$cid" "$(jq -nc --arg r "$_cr_stale_reason" '{mem_status:"stale", stale_reason:$r}')"
+                    ;;
+                superseded)
+                    _memory_patch_metadata "$cid" "$(jq -nc --arg s "$_cr_dup_id" '{mem_status:"superseded", superseded_by:$s}')"
+                    # Registry: supersedes means the TARGET replaces the source,
+                    # so the superseded candidate is the source. This read the
+                    # other way round (wv-fc6fc2). The candidate is newer than
+                    # the memory that replaces it; its superseded_by, set above,
+                    # is what declares that direction (contracts/edge-types-v1.json).
+                    _memory_crystallize_edge "$cid" "$_cr_dup_id" "supersedes"
+                    ;;
+                contradicts)
+                    finding_id=$(_memory_crystallize_finding "$cid" "$_cr_contradicts")
+                    ;;
+                promote)
+                    _memory_patch_metadata "$cid" "$(jq -nc --arg t "$now" '{mem_status:"active", verified_at:$t}')"
+                    ;;
+            esac
+        fi
+
+        # The report grows by one row per candidate memory (wv-200d36).
+        report=$(jq -nc --slurpfile r <(printf '%s' "$report") \
+            --arg id "$cid" --arg action "$action" \
+            --arg dup "$_cr_dup_id" --arg dupk "$_cr_dup_kind" \
+            --arg contra "$_cr_contradicts" --arg stale "$_cr_stale_reason" \
+            --arg reviewed "$creviewed" --arg finding "$finding_id" \
+            '$r[0] as $r | $r + [{
+                id: $id,
+                action: $action,
+                reviewed: ($reviewed == "true"),
+                duplicate_of: (if $dup == "" then null else $dup end),
+                dup_kind: (if $dupk == "" then null else $dupk end),
+                contradicts: (if $contra == "" then null else $contra end),
+                stale_reason: (if $stale == "" then null else $stale end),
+                finding: (if $finding == "" then null else $finding end)
+            } | with_entries(select(.value != null))]')
+    done
+
+    if [ "$mode" = "apply-reviewed" ]; then
+        auto_sync_or_warn
+    fi
+
+    if [ "$format" = "json" ]; then
+        jq -n --arg mode "$mode" --slurpfile report <(printf '%s' "$report") \
+            '$report[0] as $report | {mode: $mode, candidates: ($report | length), results: $report}'
+    else
+        printf '%s\n' "$report" | jq -r '.[] | "\(.action)\t\(.id)\(if .stale_reason then "  ("+.stale_reason+")" elif .duplicate_of then "  (->"+.duplicate_of+")" else "" end)"'
+        printf '%s candidate(s), mode=%s\n' "$(printf '%s' "$report" | jq 'length')" "$mode"
+    fi
 }
 
 _memory_import_command() {
@@ -1553,8 +2060,9 @@ cmd_memory() {
                 shift
             done
             agent=$(_memory_resolve_agent "$agent")
+            wv_require_graph || return 1
             local memories
-            memories=$(_memory_recall_json)
+            memories=$(_memory_recall_json graduated)
             # --agent is caller/provenance context, never a filter: recall is
             # agent-agnostic and returns the same active graph memory set for
             # every agent value. Report the resolved caller on stderr so the flag
@@ -1565,7 +2073,8 @@ cmd_memory() {
             if [ "$format" = "json" ]; then
                 printf '%s\n' "$memories"
             else
-                printf '%s\n' "$memories" | jq -r '.[] | "\(.id): \(.text)"'
+                printf '%s\n' "$memories" | jq -r '.[] | (.metadata | if type == "string" then (fromjson? // {}) else (. // {}) end) as $m
+                    | "\(.id): \(.text)\(if $m.mem_status == "graduated" then " [graduated to \($m.graduated_to)]" else "" end)"'
             fi
             ;;
         render)
@@ -1597,7 +2106,7 @@ cmd_memory() {
 
             local projections=()
             case "$agent" in
-                all|native|container) projections=(claude claude-memory codex codex-memory copilot agents) ;;
+                all|native|container) projections=("${_MEMORY_AGNOSTIC_PROJECTIONS[@]}") ;;
                 claude) projections=(claude) ;;
                 claude-memory) projections=(claude-memory) ;;
                 codex) projections=(codex) ;;
@@ -1613,7 +2122,7 @@ cmd_memory() {
                     # must not be stricter. An explicit unknown --agent=<name> is still
                     # a hard error (typo guard). See wv-872543 (F3).
                     if [ "$raw_agent" = "current" ]; then
-                        projections=(claude claude-memory codex codex-memory copilot agents)
+                        projections=("${_MEMORY_AGNOSTIC_PROJECTIONS[@]}")
                     else
                         echo -e "${RED}Error: unsupported memory projection '$agent'${NC}" >&2
                         echo "Supported projections: all, current, claude, claude-memory, copilot, codex, codex-memory, agents, workflow" >&2
@@ -1627,7 +2136,7 @@ cmd_memory() {
             fi
 
             local entries rendered_paths='[]' projection target_path
-            entries=$(_memory_recall_json)
+            entries=$(_memory_recall_json | _memory_index_entries) || return 1
             for projection in "${projections[@]}"; do
                 if [ "$path_supplied" = true ]; then
                     target_path="$path"
@@ -1643,8 +2152,10 @@ cmd_memory() {
             done
 
             if [ "$format" = "json" ]; then
-                jq -n --arg agent "$agent" --argjson paths "$rendered_paths" --argjson entries "$entries" \
-                    '{projection: $agent, paths: $paths, path: ($paths[0].path // null), entries: ($entries | length)}'
+                jq -n --arg agent "$agent" --slurpfile paths <(printf '%s' "$rendered_paths") \
+                    --slurpfile entries <(printf '%s' "$entries") \
+                    '$paths[0] as $paths | $entries[0] as $entries
+                    | {projection: $agent, paths: $paths, path: ($paths[0].path // null), entries: ($entries | length)}'
             else
                 printf '%s\n' "$rendered_paths" | jq -r '.[] | "✓ Rendered graph memory to \(.path)"'
             fi
@@ -1682,112 +2193,11 @@ cmd_memory() {
         import)
             _memory_import_command "$@"
             ;;
+        review)
+            _memory_review_command "$@"
+            ;;
         crystallize)
-            local mode="dry-run"
-            local format="text"
-            local repo_root
-            repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-            while [ $# -gt 0 ]; do
-                case "$1" in
-                    --dry-run) mode="dry-run" ;;
-                    --apply-reviewed) mode="apply-reviewed" ;;
-                    --repo-root=*) repo_root="${1#*=}" ;;
-                    --json) format="json" ;;
-                    --help|-h)
-                        _memory_usage
-                        return 0
-                        ;;
-                    *)
-                        echo -e "${RED}Error: unknown option $1${NC}" >&2
-                        _memory_usage
-                        return 1
-                        ;;
-                esac
-                shift
-            done
-            db_ensure
-            db_migrate_fts5 2>/dev/null || true
-
-            local candidates report='[]'
-            local cid ctext chash creviewed action now
-            candidates=$(_memory_candidates_json)
-            now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-            # Read candidate rows into an array first so the db_query/sqlite3 calls
-            # inside the loop body cannot consume the feeding fd (1-iteration bug).
-            local cand_rows=() line
-            mapfile -t cand_rows < <(printf '%s' "$candidates" | jq -r '.[] | [.id, (.text // "" | gsub("\t";" ")), (.metadata.source_hash // ""), ((.metadata.reviewed // false) | tostring)] | @tsv')
-            for line in "${cand_rows[@]}"; do
-                IFS=$'\t' read -r cid ctext chash creviewed <<<"$line"
-                [ -n "$cid" ] || continue
-                _memory_crystallize_dedup_one "$cid" "$ctext" "$chash"
-                _memory_crystallize_verify_one "$ctext" "$repo_root"
-
-                # Deterministic signals win; fuzzy overlap is advisory only.
-                action="keep"
-                if [ -n "$_cr_stale_reason" ]; then
-                    action="stale"
-                elif [ "$_cr_dup_kind" = "source_hash" ]; then
-                    action="superseded"
-                elif [ -n "$_cr_contradicts" ]; then
-                    action="contradicts"
-                elif [ "$creviewed" = "true" ]; then
-                    action="promote"
-                elif [ -n "$_cr_dup_id" ]; then
-                    action="overlap"
-                fi
-
-                local finding_id=""
-                if [ "$mode" = "apply-reviewed" ]; then
-                    case "$action" in
-                        stale)
-                            _memory_patch_metadata "$cid" "$(jq -nc --arg r "$_cr_stale_reason" '{mem_status:"stale", stale_reason:$r}')"
-                            ;;
-                        superseded)
-                            _memory_patch_metadata "$cid" "$(jq -nc --arg s "$_cr_dup_id" '{mem_status:"superseded", superseded_by:$s}')"
-                            # Registry: supersedes means the TARGET replaces the source,
-                            # so the superseded candidate is the source - as wv remember
-                            # --supersedes writes it (old -> new). This read the other
-                            # way round (wv-fc6fc2).
-                            _memory_crystallize_edge "$cid" "$_cr_dup_id" "supersedes"
-                            ;;
-                        contradicts)
-                            finding_id=$(_memory_crystallize_finding "$cid" "$_cr_contradicts")
-                            ;;
-                        promote)
-                            _memory_patch_metadata "$cid" "$(jq -nc --arg t "$now" '{mem_status:"active", verified_at:$t}')"
-                            ;;
-                    esac
-                fi
-
-                report=$(jq -nc --argjson r "$report" \
-                    --arg id "$cid" --arg action "$action" \
-                    --arg dup "$_cr_dup_id" --arg dupk "$_cr_dup_kind" \
-                    --arg contra "$_cr_contradicts" --arg stale "$_cr_stale_reason" \
-                    --arg reviewed "$creviewed" --arg finding "$finding_id" \
-                    '$r + [{
-                        id: $id,
-                        action: $action,
-                        reviewed: ($reviewed == "true"),
-                        duplicate_of: (if $dup == "" then null else $dup end),
-                        dup_kind: (if $dupk == "" then null else $dupk end),
-                        contradicts: (if $contra == "" then null else $contra end),
-                        stale_reason: (if $stale == "" then null else $stale end),
-                        finding: (if $finding == "" then null else $finding end)
-                    } | with_entries(select(.value != null))]')
-            done
-
-            if [ "$mode" = "apply-reviewed" ]; then
-                auto_sync_or_warn
-            fi
-
-            if [ "$format" = "json" ]; then
-                jq -n --arg mode "$mode" --argjson report "$report" \
-                    '{mode: $mode, candidates: ($report | length), results: $report}'
-            else
-                printf '%s\n' "$report" | jq -r '.[] | "\(.action)\t\(.id)\(if .stale_reason then "  ("+.stale_reason+")" elif .duplicate_of then "  (->"+.duplicate_of+")" else "" end)"'
-                printf '%s candidate(s), mode=%s\n' "$(printf '%s' "$report" | jq 'length')" "$mode"
-            fi
+            _memory_crystallize_command "$@"
             ;;
         --help|-h|"")
             _memory_usage
@@ -1853,7 +2263,7 @@ _store_node_commits() {
     [ "$shas_json" = "[]" ] && return 0
 
     local patch_json
-    patch_json=$(jq -cn --arg primary "$primary_sha" --argjson s "$shas_json" '{commit: $primary, commits: $s}' 2>/dev/null || echo "")
+    patch_json=$(jq -cn --arg primary "$primary_sha" --slurpfile s <(printf '%s' "$shas_json") '{commit: $primary, commits: $s[0]}' 2>/dev/null || echo "")
     [ -z "$patch_json" ] && return 0
     patch_json="${patch_json//\'/\'\'}"
     db_query "UPDATE nodes SET metadata=json_patch(COALESCE(metadata, '{}'), '$patch_json') WHERE id='$(sql_escape "$id")';"
@@ -1887,7 +2297,8 @@ _aggregate_epic_commits() {
     epic_meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='$(sql_escape "$epic_id")';" 2>/dev/null || echo "[]")
     epic_meta=$(echo "$epic_meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
     [[ "$epic_meta" != "{"* ]] && epic_meta="{}"
-    updated=$(echo "$epic_meta" | jq --argjson s "$all_shas" '. + {commits: $s}' 2>/dev/null || echo "$epic_meta")
+    # An epic's union of child commits grows with the epic (wv-200d36).
+    updated=$(echo "$epic_meta" | jq --slurpfile s <(printf '%s' "$all_shas") '. + {commits: $s[0]}' 2>/dev/null || echo "$epic_meta")
     updated="${updated//\'/\'\'}"
     db_query "UPDATE nodes SET metadata='$updated' WHERE id='$(sql_escape "$epic_id")';"
 }
@@ -2274,7 +2685,7 @@ _finding_missing_fields() {
 _done_require_finding_metadata() {
     local id="$1" meta_json="$2"
     local node_type
-    node_type=$(echo "$meta_json" | jq -r '.type // "task"' 2>/dev/null || echo "task")
+    node_type=$(echo "$meta_json" | jq -r '.node_kind // .type // "task"' 2>/dev/null || echo "task")
     if [ "$node_type" != "finding" ]; then
         wv_policy_verdict finding_close_requires_violation_type allow no "" "not a finding"
         return 0
@@ -2292,9 +2703,32 @@ _done_require_finding_metadata() {
     echo -e "${RED}Error: finding node requires violation_type before close${NC}" >&2
     echo -e "  Missing or invalid: $missing_fields" >&2
     echo -e "  Enum values: $_FINDING_VIOLATION_TYPES" >&2
-    echo -e "  Minimal: wv update $id --metadata='{\"finding\":{\"violation_type\":\"repo:hygiene\"}}'" >&2
+    echo -e "  An observation with no defect class: wv update $id --metadata='{\"finding\":{\"violation_type\":\"historical:finding\"}}'" >&2
     echo -e "  Full:    wv update $id --metadata='{\"finding\":{\"violation_type\":\"repo:hygiene\",\"root_cause\":\"...\",\"proposed_fix\":\"...\",\"confidence\":\"high\",\"fixable\":true}}'" >&2
     return 1
+}
+
+# _done_release_own_claim — after a refused finding close, hand the node back:
+# a consumer whose observation had no catalogued category was left holding an
+# active claim, which blocks the session end (wv-61e8ca, ruling D2 on
+# wv-80fa17). Only this agent's claim is released; anyone else's is untouched.
+_done_release_own_claim() {
+    local id="$1" agent_id
+    agent_id="$(sql_escape "$(resolve_agent_id)")"
+    local released
+    released=$(db_query "
+        UPDATE nodes
+        SET metadata = json_remove(COALESCE(metadata,'{}'), '$.claimed_by'),
+            status = 'todo',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = '$id' AND status = 'active'
+          AND json_extract(metadata, '$.claimed_by') = '$agent_id';
+        SELECT changes();" 2>/dev/null || echo "")
+    if [ "$released" = "1" ]; then
+        echo -e "  Claim released: $id is back to todo. Set the category and close it again." >&2
+    elif [ "$released" != "0" ]; then
+        echo -e "${YELLOW}⚠ Could not release the claim on $id; it is still active${NC}" >&2
+    fi
 }
 
 _done_read_option_file() {
@@ -2667,7 +3101,9 @@ _done_write_trail() {
         label="$id ($node_alias)"
     fi
     local unblocked
-    unblocked=$(db_query "SELECT id FROM nodes WHERE status='todo' AND id IN (SELECT target FROM edges WHERE source='$id' AND type='blocks');" 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
+    # Unblocked means ready now, by the shared signal: a target a deferral or
+    # another open blocker still holds is not reported (wv-31d8c2).
+    unblocked=$(db_query "SELECT n.id FROM nodes n WHERE n.status='todo' AND ($(wv_blocking_reason n)) IS NULL AND n.id IN (SELECT target FROM edges WHERE source='$id' AND type='blocks');" 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
     local next_ready
     next_ready=$(cmd_ready --json 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || true)
     {
@@ -2777,6 +3213,41 @@ _done_record_policy_receipt() {
 }
 
 
+# _done_children_gate <id> — refuse to close a node over an open implements
+# child that nothing accounts for (ontology S2, wv-76b361; 2.0 plan ordering
+# rule 4). A child is accounted for when it is closed, parked (metadata.deferred
+# with a deferred_reason), linked by a resolves edge, or has another implements
+# parent still open (wv_unaccounted_child_sql). Every close path reaches it.
+_done_children_gate() {
+    local id="$1" id_esc open
+    id_esc=$(sql_escape "$id")
+    if ! open=$(db_query "SELECT c.id || ' [' || c.status || '] ' || substr(c.text, 1, 60)
+            FROM edges e JOIN nodes c ON c.id = e.source
+            WHERE e.type = 'implements' AND e.target = '$id_esc' AND $(wv_unaccounted_child_sql c "'$id_esc'")
+            ORDER BY c.id;"); then
+        wv_policy_refusal infrastructure_failure "could not read the node's open children"
+        echo -e "${RED}Error: could not read $id's open children${NC}" >&2
+        return 1
+    fi
+    if [ -z "$open" ]; then
+        wv_policy_verdict close_children_accounted allow no "" "no open child is unaccounted for"
+        return 0
+    fi
+    wv_policy_verdict close_children_accounted deny yes "" "open children: $(cut -d' ' -f1 <<< "$open" | tr '\n' ' ' | sed 's/ $//')"
+    echo -e "${RED}Error: $id has open children that nothing accounts for:${NC}" >&2
+    sed 's/^/  /' <<< "$open" >&2
+    echo "  For each: close it; park it (wv update <child> --metadata='{\"deferred\":true,\"deferred_reason\":\"...\"}');" >&2
+    echo "  move it under an open parent (wv link <child> <parent> --type=implements, then wv unlink <child> $id --type=implements);" >&2
+    echo "  or link it to its finding (wv link <child> <finding> --type=resolves)." >&2
+    return 1
+}
+
+# _close_children_not_engaged <why> — a call whose operation can close a node
+# but closed none; the children rule examined it and had nothing to refuse.
+_close_children_not_engaged() {
+    wv_policy_verdict close_children_accounted allow no "" "$1"
+}
+
 # _done_close <id> <status-guard> <proposed-metadata-expr> [set-clause]
 # Run the close transaction and classify its outcome: a denying receipt, the
 # trigger backstop firing (the receipt and trigger disagreed), any other
@@ -2784,6 +3255,13 @@ _done_record_policy_receipt() {
 _done_close() {
     local id="$1" guard="$2" proposed="$3" set="${4:-}" out rc receipt
     _done_policy_race_seam check || return 1
+    _done_children_gate "$id" || return 1
+    # The same condition guards the UPDATE, so a child reopened after the gate
+    # stops the close instead of slipping under it.
+    local id_esc
+    id_esc=$(sql_escape "$id")
+    guard="$guard AND NOT EXISTS (SELECT 1 FROM edges ce JOIN nodes c ON c.id = ce.source
+        WHERE ce.type = 'implements' AND ce.target = '$id_esc' AND $(wv_unaccounted_child_sql c "'$id_esc'"))"
     out=$(_done_close_txn "$id" "$guard" "$proposed" "$set")
     rc=$?
     _done_policy_race_seam apply
@@ -2985,7 +3463,7 @@ _done_build_scope() {
             scope_json=$(jq -c --arg p "$scope_path" '. + [$p] | unique' <<< "$scope_json")
         done
         [ "$(jq 'length' <<< "$scope_json")" -gt 0 ] || { echo -e "${RED}Error: --completion-files cannot be empty${NC}" >&2; return 1; }
-        scope_object=$(jq -cn --argjson files "$scope_json" --arg set_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg attempt_id "$(date +%s%N)-$$-$RANDOM" '{files:$files,set_at:$set_at,attempt_id:$attempt_id}')
+        scope_object=$(jq -cn --slurpfile files <(printf '%s' "$scope_json") --arg set_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg attempt_id "$(date +%s%N)-$$-$RANDOM" '{files:$files[0],set_at:$set_at,attempt_id:$attempt_id}')
         scope_esc=$(sql_escape "$scope_object")
     fi
     return 0
@@ -3072,7 +3550,7 @@ _done_gate_learning() {
 _done_warn_childless_epic() {
     # Warn if closing an epic with no tracked children (implements edges)
     local node_type
-    node_type=$(db_query "SELECT json_extract(metadata,'$.type') FROM nodes WHERE id='$id';" 2>/dev/null || true)
+    node_type=$(db_query "SELECT $(wv_kind_sql) FROM nodes WHERE id='$id';" 2>/dev/null || true)
     if [ "$node_type" = "epic" ]; then
         local child_count
         child_count=$(db_query "SELECT COUNT(*) FROM edges WHERE target='$id' AND type='implements';" 2>/dev/null || echo "0")
@@ -3185,7 +3663,7 @@ _done_post_close_advisories() {
                   AND (json_type(n.metadata, '\$.completion_scope.files') IS NULL
                        OR nf.path IN (SELECT value FROM json_each(n.metadata, '\$.completion_scope.files')))
                   AND fts.state IN ('red','stale')
-                  AND COALESCE((SELECT json_extract(metadata, '\$.type') FROM nodes WHERE id='$(sql_escape "$id")'), '') NOT IN ('finding','epic','session_history')
+                  AND COALESCE((SELECT $(wv_kind_sql) FROM nodes WHERE id='$(sql_escape "$id")'), '') NOT IN ('finding','epic','session_history')
                   AND NOT EXISTS (
                       SELECT 1 FROM quality_exempt qe
                       WHERE nf.path LIKE CASE WHEN qe.path_pattern LIKE '%/' THEN qe.path_pattern || '%' ELSE qe.path_pattern END
@@ -3211,7 +3689,7 @@ _done_post_close_advisories() {
             SELECT id || ' — ' || substr(text, 1, 60)
             FROM nodes
             WHERE json_extract(metadata, '\$.source_node') = '$id'
-              AND json_extract(metadata, '\$.type') = 'finding'
+              AND $(wv_kind_sql) = 'finding'
               AND status != 'done';
         " 2>/dev/null || true)
         if [ -n "$_open_findings" ]; then
@@ -3318,6 +3796,15 @@ cmd_done() {
     local node_status
     _done_check_node || return 1
 
+    # Before anything below writes to the node: a refused finding close leaves
+    # it as it was, less this agent's claim (wv-61e8ca). This ran after
+    # _done_write_verification, so a refusal still persisted the
+    # --verification-* metadata of a close that never happened.
+    if ! _done_require_finding_metadata "$id" "$(_done_read_metadata "$id")"; then
+        _done_release_own_claim "$id"
+        return 1
+    fi
+
     local scope_json="" scope_object="" scope_esc=""
     _done_build_scope || return 1
 
@@ -3326,8 +3813,6 @@ cmd_done() {
     local node_meta
     node_meta=$(_done_read_metadata "$id")
     _done_gate_pending || return $?
-
-    _done_require_finding_metadata "$id" "$node_meta" || return 1
 
     _done_gate_learning || return 1
 
@@ -3571,6 +4056,12 @@ USAGE
                     removal_failed=1
                     break
                 fi
+                case "$key" in
+                    node_kind|type)
+                        echo -e "${RED}Error: the node kind cannot be removed; use --kind=<kind> to change it${NC}" >&2
+                        removal_failed=1
+                        break ;;
+                esac
                 # Direct SQL remove (cmd_update --remove-key returns early after first key)
                 if ! db_query "UPDATE nodes SET metadata = json_remove(metadata, '\$.${key}'), updated_at=CURRENT_TIMESTAMP WHERE id='$item_id';"; then
                     removal_failed=1
@@ -3900,10 +4391,12 @@ _ready_enrich_impact() {
     for nid in "${ids[@]}"; do
         local imp
         imp=$("$WV_CLI" impact --json "$nid" 2>/dev/null || echo 'null')
-        impact_arr=$(printf '%s' "$impact_arr" | jq --argjson x "$imp" '. + [$x]' 2>/dev/null || echo "$impact_arr")
+        # One impact walk can itself pass the argv limit; through a file, and
+        # an empty reply appends null so the indices stay aligned (wv-200d36).
+        impact_arr=$(printf '%s' "$impact_arr" | jq --slurpfile x <(printf '%s' "$imp") '. + [$x[0]]' 2>/dev/null || echo "$impact_arr")
     done
-    printf '%s' "$nodes_json" | jq --argjson impacts "$impact_arr" \
-        '[range(length) as $i | .[$i] + {impact: $impacts[$i]}]' 2>/dev/null || echo "$nodes_json"
+    printf '%s' "$nodes_json" | jq --slurpfile impacts <(printf '%s' "$impact_arr") \
+        '$impacts[0] as $impacts | [range(length) as $i | .[$i] + {impact: $impacts[$i]}]' 2>/dev/null || echo "$nodes_json"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3930,6 +4423,9 @@ cmd_ready() {
             --findings)    show_findings=true ;;
             --mode=*)      mode_arg="${1#--mode=}" ;;
             --with-impact) with_impact=true ;;
+            # An option no arm reads is refused: 'wv ready --impact' printed
+            # ready work with no impact and exit 0 (wv-d1e926, wv-016983).
+            -*)            _wv_reject_arg ready "$1"; return 1 ;;
         esac
         shift
     done
@@ -3978,7 +4474,7 @@ cmd_ready() {
     local reserved_pred="COALESCE(json_extract(n.metadata, '\$.e5_reserved'), json_extract(n.metadata, '\$.reserved'), 0) IN (1, 'true')"
     local ready_where="
         n.status = 'todo'
-        AND COALESCE(json_extract(n.metadata, '\$.type'), '') NOT IN ('finding', 'memory')
+        AND COALESCE($(wv_kind_sql n), '') NOT IN ('finding', 'memory')
         AND ($(wv_blocking_reason n)) IS NULL
     "
     local reserved_filter=""
@@ -4109,7 +4605,7 @@ cmd_ready() {
                        n.text,
                        n.status
                 FROM nodes n
-                WHERE json_extract(n.metadata, '$.type') = 'finding'
+                WHERE $(wv_kind_sql n) = 'finding'
                   AND json_extract(n.metadata, '$.finding.fixable') = 1
                   AND n.status != 'done'
                   AND NOT EXISTS (
@@ -4196,6 +4692,7 @@ cmd_list() {
             --json-v2) format="json-v2" ;;
             --all) all=true ;;
             --mode=*) mode_arg="${1#*=}" ;;
+            -*) _wv_reject_arg list "$1"; return 1 ;;  # wv-016983
         esac
         shift
     done
@@ -4265,9 +4762,9 @@ cmd_list() {
 
     if [ -n "$type_filter" ]; then
         if [ -n "$filters" ]; then
-            filters="$filters AND type = '$type_filter'"
+            filters="$filters AND $(wv_kind_sql) = '$type_filter'"
         else
-            filters="type = '$type_filter'"
+            filters="$(wv_kind_sql) = '$type_filter'"
         fi
     fi
 
@@ -4420,10 +4917,98 @@ _render_trails() {
     fi
 }
 
+# _node_snapshot_line <root> <rev> <path> <id> — the node's {status, updated_at}
+# in a committed .weave/nodes.jsonl, or nothing when the revision lacks it.
+_node_snapshot_line() {
+    local snap line
+    snap=$(git -C "$1" show "$2:$3" 2>/dev/null) || return 0
+    line=$(grep -F "\"id\":\"$4\"" <<< "$snap") || return 0
+    jq -c --arg id "$4" 'select(.id == $id) | {status, updated_at}' <<< "$line" 2>/dev/null
+}
+
+# _node_close_time <id> <created_at> — when the node last closed, derived from
+# the committed graph rather than stored a second time (wv-90036a). No row
+# records a close: updated_at moves on any later edit, and the delta log is
+# netted per sync and deleted by wv compact. Git keeps every committed
+# .weave/nodes.jsonl, so the newest commit whose snapshot shows the node done
+# while its parent's does not is the close; the node's updated_at in that
+# snapshot is the close transaction's own timestamp unless an edit followed it
+# before the snapshot, and the two commit times bound it either way. Prints one
+# JSON object. Opt-in from wv show: the walk costs up to seconds per node.
+_node_close_time() {
+    local id="$1" created="$2" root rel commit cur prev
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+        jq -nc '{closed_at: null, reason: "not a git repository: no committed graph history to derive it from"}'
+        return 0
+    }
+    rel=$(realpath --relative-to="$root" "$WEAVE_DIR/nodes.jsonl" 2>/dev/null) || rel=".weave/nodes.jsonl"
+    local last="" first_seen=""
+    while IFS= read -r commit; do
+        [ -n "$commit" ] || continue
+        last="$commit"
+        cur=$(_node_snapshot_line "$root" "$commit" "$rel" "$id")
+        [ "$(jq -r '.status // ""' <<< "${cur:-{\}}")" = "done" ] || continue
+        prev=$(_node_snapshot_line "$root" "$commit^" "$rel" "$id")
+        if [ -z "$prev" ]; then
+            # Absent from the parent is the node's first appearance (created
+            # and closed between two snapshots) only in the oldest commit of
+            # its history. Later, it is a prune or a clobber it came back
+            # from: wv prune archives done nodes out of the graph and a restore
+            # brings them back, which would read as a close at the restore.
+            first_seen="$commit"
+            continue
+        fi
+        [ "$(jq -r '.status // ""' <<< "$prev")" != "done" ] || continue
+        _node_close_result "$root" "$commit" "$cur" \
+            "first committed snapshot showing the node done after one showing it open; exact unless an edit followed the close before that snapshot" "$rel"
+        return 0
+    # --since takes the full UTC created_at: a bare date reads as that date at
+    # the current time of day and drops the morning's commits. --text because
+    # Weave's attributes mark nodes.jsonl -diff, which -G would skip. Merge
+    # commits stay undiffed: the branch commit that closed the node is walked
+    # anyway, and a merge diffed against main would read as the close.
+    done < <(git -C "$root" log -s --text --format=%H \
+        --since="$created +0000" -G"\"id\":\"$id\"" -- "$rel" 2>/dev/null)
+    if [ -n "$first_seen" ] && [ "$first_seen" = "$last" ]; then
+        _node_close_result "$root" "$first_seen" "$(_node_snapshot_line "$root" "$first_seen" "$rel" "$id")" \
+            "the node first appears in a committed snapshot already done: created and closed between two snapshots" "$rel"
+        return 0
+    fi
+    jq -nc '{closed_at: null, reason: "no committed snapshot shows this node turning done (not yet committed, or the history is shallow)"}'
+}
+
+# _node_close_result <root> <commit> <snapshot-line> <source> <path> — the
+# close-time object: the node's updated_at in that snapshot, and the window it
+# fell in. The window opens at the newest updated_at in the parent's snapshot,
+# the last write that snapshot captured, not at the parent's commit time: a
+# commit is dated after its pre-commit gate, minutes after its snapshot was
+# taken, and a close in those minutes would fall outside a commit-time window.
+_node_close_result() {
+    local after
+    after=$(git -C "$1" show "$2^:$5" 2>/dev/null | jq -rs 'map(.updated_at // empty) | max // ""' 2>/dev/null)
+    jq -nc --argjson cur "$3" --arg commit "$(git -C "$1" rev-parse --short "$2")" \
+        --arg after "$after" \
+        --arg before "$(TZ=UTC git -C "$1" log -1 --format=%cd --date=format-local:'%Y-%m-%d %H:%M:%S' "$2")" --arg source "$4" \
+        '{closed_at: $cur.updated_at, commit: $commit, after: $after, before: $before,
+          within_window: ($cur.updated_at > $after and $cur.updated_at <= $before), source: $source}'
+}
+
+# _show_close_json <id> — the close-time object for wv show --close-time.
+_show_close_json() {
+    local row
+    row=$(db_query "SELECT status || '|' || created_at FROM nodes WHERE id='$(sql_escape "$1")';")
+    if [ "${row%%|*}" = "done" ]; then
+        _node_close_time "$1" "${row#*|}"
+    else
+        jq -nc '{closed_at: null, reason: "not closed"}'
+    fi
+}
+
 cmd_show() {
     local id="${1:-}"
     local format="text"
     local mode_arg=""
+    local close_time=false
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -4431,6 +5016,8 @@ cmd_show() {
             --json)    format="json" ;;
             --json-v2) format="json-v2" ;;
             --mode=*)  mode_arg="${1#--mode=}" ;;
+            --close-time) close_time=true ;;
+            -*) _wv_reject_arg show "$1"; return 1 ;;  # wv-016983
         esac
         shift
     done
@@ -4457,13 +5044,20 @@ cmd_show() {
     if [ "$format" = "json-v2" ]; then
         local _result
         _result=$(db_query_json_v2 "$query")
+        if [ "$close_time" = true ]; then
+            _result=$(jq -c --argjson c "$(_show_close_json "$id")" 'map(. + {close_time: $c})' <<< "$_result")
+        fi
         if [ "$mode" = "bootstrap" ] || [ "$mode" = "discover" ]; then
             echo "$_result" | jq '[.[] | del(.metadata.current_intent)]'
         else
             echo "$_result"
         fi
     elif [ "$format" = "json" ]; then
-        db_query_json "$query" | jq -c '.[0] // empty'
+        if [ "$close_time" = true ]; then
+            db_query_json "$query" | jq -c --argjson c "$(_show_close_json "$id")" '(.[0] // empty) + {close_time: $c}'
+        else
+            db_query_json "$query" | jq -c '.[0] // empty'
+        fi
     else
         # Use unit separator — node text can contain '|'
         db_ensure
@@ -4495,6 +5089,19 @@ cmd_show() {
                 echo -e "${CYAN}Created:${NC}  $created"
                 echo -e "${CYAN}Updated:${NC}  $updated"
                 _render_trails "$metadata"
+            fi
+            if [ "$close_time" = true ]; then
+                local _close
+                if [ "$status" = "done" ]; then
+                    _close=$(_node_close_time "$id" "$created")
+                    if [ "$(jq -r '.closed_at // ""' <<< "$_close")" != "" ]; then
+                        echo -e "${CYAN}Closed:${NC}   $(jq -r '"\(.closed_at) UTC (snapshot \(.commit), committed between \(.after // "the first commit") and \(.before))"' <<< "$_close")"
+                    else
+                        echo -e "${CYAN}Closed:${NC}   unknown — $(jq -r '.reason' <<< "$_close")"
+                    fi
+                else
+                    echo -e "${CYAN}Closed:${NC}   not closed"
+                fi
             fi
         done
         
@@ -4538,18 +5145,27 @@ cmd_status() {
         case "$1" in
             --json)    format="json" ;;
             --mode=*)  mode_arg="${1#--mode=}" ;;
+            -*) _wv_reject_arg status "$1"; return 1 ;;  # wv-016983
         esac
         shift
     done
     local mode
     mode=$(wv_resolve_mode "$mode_arg")
 
-    # Compact status for context injection (~50 tokens)
-    local active=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active';")
-    local ready=$(cmd_ready --count)
-    local blocked=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='blocked';")
-    local pending_close=$(db_query "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '$.needs_human_verification') = 1;")
-    local stale=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND datetime(updated_at) < datetime('now', '-24 hours');")
+    # Compact status for context injection (~50 tokens). Declared apart from
+    # the reads (wv-90083c): `local x=$(...)` reported the local's status, so a
+    # graph that could not be read printed blank counts, or zeros as JSON, and
+    # exited 0.
+    wv_require_graph || return 1
+    local active ready blocked pending_close stale
+    if ! { active=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active';") \
+        && ready=$(cmd_ready --count) \
+        && blocked=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='blocked';") \
+        && pending_close=$(db_query "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '$.needs_human_verification') = 1;") \
+        && stale=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND datetime(updated_at) < datetime('now', '-24 hours');"); }; then
+        echo -e "${RED}Error: could not read the graph's counts from $WV_DB${NC}" >&2
+        return 1
+    fi
     : "${stale:=0}"
 
     # Sync-state: compare DB mtime vs last successful `wv sync --gh` timestamp
@@ -4700,6 +5316,7 @@ cmd_pending_close() {
         esac
         shift
     done
+    wv_require_graph || return 1
 
     if [ "$count_only" = true ]; then
         db_query "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '$.needs_human_verification') = 1;"
@@ -4764,6 +5381,8 @@ an error, and nothing is written):
   --status=<status>, --status <status>      Set status
   --text=<text>, --text <text>              Replace node text
   --alias=<alias>, --alias <alias>          Set alias (empty string clears it)
+  --kind=<kind>, --kind <kind>              Set the node kind (epic|feature|task|finding|
+                                            decision|plan|memory|session_history)
   --metadata=<json>, --metadata <json>      Merge JSON into metadata
   --metadata-file=<path>, --metadata-file <path>
                                             Read metadata JSON from file ('-' reads stdin)
@@ -4868,6 +5487,7 @@ cmd_update() {
     local proposed_metadata="metadata"
     local echo_mode=false
     local metadata_supplied=false
+    local metadata_patch="" kind_flag=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --help|-h)
@@ -4879,7 +5499,7 @@ cmd_update() {
             # re-dispatch, so both forms share one validation path. A value that
             # itself starts with -- is taken only in the =-form, so a missing
             # value cannot swallow the next option.
-            --status|--text|--alias|--remove-key)
+            --status|--text|--alias|--remove-key|--kind)
                 if [ $# -lt 2 ] || [[ "$2" == --* ]]; then
                     echo -e "${RED}Error: $1 requires a value${NC}" >&2
                     echo "Use $1 <value> or $1=<value>." >&2
@@ -4908,15 +5528,7 @@ cmd_update() {
                     return 1
                 fi
                 validate_update_metadata_json "$metadata" "--metadata" || return 1
-                # Merge atomically via SQL json_patch (RFC 7396) — applies the new
-                # JSON as a merge patch to the row's current metadata in a single
-                # UPDATE. COALESCE handles NULL. Parity with the --remove-key path
-                # above (which uses json_remove). Previous implementation shelled out
-                # to jq with a silent "|| echo $metadata" fallback that overwrote the
-                # stored metadata when jq failed for any reason.
-                local metadata_esc="${metadata//\'/\'\'}"
-                updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
-                proposed_metadata="json_patch(COALESCE(metadata, '{}'), '$metadata_esc')"
+                metadata_patch="$metadata"
                 metadata_supplied=true
                 ;;
             --metadata)
@@ -4933,9 +5545,7 @@ cmd_update() {
                 fi
                 local metadata="$1"
                 validate_update_metadata_json "$metadata" "--metadata" || return 1
-                local metadata_esc="${metadata//\'/\'\'}"
-                updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
-                proposed_metadata="json_patch(COALESCE(metadata, '{}'), '$metadata_esc')"
+                metadata_patch="$metadata"
                 metadata_supplied=true
                 ;;
             --metadata-file=*)
@@ -4948,9 +5558,7 @@ cmd_update() {
                 local metadata=""
                 metadata=$(read_update_metadata_source "$metadata_file") || return 1
                 validate_update_metadata_json "$metadata" "--metadata-file" || return 1
-                local metadata_esc="${metadata//\'/\'\'}"
-                updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
-                proposed_metadata="json_patch(COALESCE(metadata, '{}'), '$metadata_esc')"
+                metadata_patch="$metadata"
                 metadata_supplied=true
                 ;;
             --metadata-file)
@@ -4969,10 +5577,12 @@ cmd_update() {
                 local metadata=""
                 metadata=$(read_update_metadata_source "$metadata_file") || return 1
                 validate_update_metadata_json "$metadata" "--metadata-file" || return 1
-                local metadata_esc="${metadata//\'/\'\'}"
-                updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
-                proposed_metadata="json_patch(COALESCE(metadata, '{}'), '$metadata_esc')"
+                metadata_patch="$metadata"
                 metadata_supplied=true
+                ;;
+            --kind=*)
+                kind_flag="${1#*=}"
+                validate_node_kind "$kind_flag" "--kind" || return 1
                 ;;
             --alias=*)
                 local alias="${1#*=}"
@@ -4989,6 +5599,11 @@ cmd_update() {
                     return 1
                 fi
                 validate_metadata_key "$remove_key" || return 1
+                case "$remove_key" in
+                    node_kind|type)
+                        echo -e "${RED}Error: the node kind cannot be removed; use --kind=<kind> to change it${NC}" >&2
+                        return 1 ;;
+                esac
                 # Use json_remove to atomically remove a single metadata key
                 if ! db_query "UPDATE nodes SET metadata = json_remove(metadata, '\$.${remove_key}'), updated_at=CURRENT_TIMESTAMP WHERE id='$id';"; then
                     echo -e "${RED}Error: could not remove metadata key '${remove_key}' from $id${NC}" >&2
@@ -5014,6 +5629,29 @@ cmd_update() {
         esac
         shift
     done
+
+    # The metadata patch is staged so --kind can join it (wv-f7dfd3): a patch
+    # touching node_kind or type is mirrored and validated before it is merged.
+    # The merge is one SQL json_patch (RFC 7396) on the row's current metadata,
+    # COALESCE handling NULL, in parity with --remove-key's json_remove. (An
+    # earlier jq merge with a silent "|| echo $metadata" fallback overwrote the
+    # stored metadata whenever jq failed.)
+    if [ -n "$kind_flag" ]; then
+        [ "$metadata_supplied" = true ] || metadata_patch='{}'
+        if ! printf '%s' "$metadata_patch" | jq -e --arg k "$kind_flag" \
+            '[.node_kind, .type] | map(select(. != null)) | all(. == $k)' >/dev/null 2>&1; then
+            echo -e "${RED}Error: --kind=$kind_flag disagrees with the kind in --metadata${NC}" >&2
+            return 1
+        fi
+        metadata_patch=$(printf '%s' "$metadata_patch" | jq -c --arg k "$kind_flag" '. + {node_kind: $k, type: $k}') || return 1
+        metadata_supplied=true
+    fi
+    if [ "$metadata_supplied" = true ]; then
+        metadata_patch=$(wv_kind_patch_metadata "$metadata_patch" "--metadata") || return 1
+        local metadata_esc="${metadata_patch//\'/\'\'}"
+        updates="${updates}metadata=json_patch(COALESCE(metadata, '{}'), '$metadata_esc'),"
+        proposed_metadata="json_patch(COALESCE(metadata, '{}'), '$metadata_esc')"
+    fi
 
     if [ -z "$updates" ]; then
         echo -e "${RED}Error: no updates specified${NC}" >&2
@@ -5043,6 +5681,7 @@ cmd_update() {
         _done_close "$id" "" "$proposed_metadata" "$updates" || return 1
     else
         _close_rules_not_engaged "the update does not close the node"
+        _close_children_not_engaged "the update does not close the node"
         if ! db_query "UPDATE nodes SET $updates WHERE id='$id';"; then
             echo -e "${RED}Error: could not update node $id${NC}" >&2
             return 1
@@ -5063,7 +5702,7 @@ cmd_update() {
     if [ "$metadata_supplied" = true ]; then
         db_query "UPDATE nodes SET metadata = json_patch(COALESCE(metadata,'{}'), json_object('promoted_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')))
                   WHERE id = '$id'
-                    AND json_extract(metadata, '$.type') = 'finding'
+                    AND $(wv_kind_sql) = 'finding'
                     AND json_extract(metadata, '$.promoted_at') IS NULL;" 2>/dev/null || true
     fi
 
@@ -5152,6 +5791,7 @@ cmd_touch() {
     if [ -n "$metadata" ]; then
         validate_metadata_risk_level "$metadata" "--metadata" || return 1
         validate_metadata_canonical_numbers "$metadata" "--metadata" || return 1
+        metadata=$(wv_kind_patch_metadata "$metadata" "--metadata") || return 1
 
         local metadata_esc="${metadata//\'/\'\'}"
         # A failed write is a failed touch, not exit 0 with nothing stored.
@@ -5267,6 +5907,7 @@ cmd_quick() {
     validate_metadata_object "$metadata" "--metadata" || return 1
     validate_metadata_risk_level "$metadata" "--metadata" || return 1
     validate_metadata_canonical_numbers "$metadata" "--metadata" || return 1
+    metadata=$(wv_kind_create_metadata "$metadata" "$text" "" "--metadata") || return 1
 
     if ! _add_dedup_check "$text" "Use 'wv add \"...\" --force' for intentional repeat work"; then
         return 1
@@ -5274,12 +5915,16 @@ cmd_quick() {
 
     local id=$(generate_id)
 
-    # Step 1: Create node as ACTIVE (so pre-commit hook passes). The JSON is
-    # built from the raw values and SQL-escaped once, at the INSERT: escaping
-    # before jq stored every apostrophe doubled ("don''t"), in the commit
-    # message as well as the node, because text was escaped in place.
+    # Step 1: Create node as ACTIVE and CLAIMED by this actor, so the
+    # pre-commit hook admits the commit: since 7eff88740 it admits a commit
+    # only under a claim held by the committer, and an unclaimed active node
+    # refused every quick commit (wv-bb7589). The JSON is built from the raw
+    # values and SQL-escaped once, at the INSERT: escaping before jq stored
+    # every apostrophe doubled ("don''t"), in the commit message as well as the
+    # node, because text was escaped in place.
     local now_meta
-    if ! now_meta=$(printf '%s' "$metadata" | jq -c --arg l "$learning" '. + {learning: $l}'); then
+    if ! now_meta=$(printf '%s' "$metadata" | jq -c --arg l "$learning" --arg a "$(resolve_agent_id)" \
+            '. + {learning: $l, claimed_by: $a}'); then
         echo -e "${RED}Error: could not merge --learning into --metadata${NC}" >&2
         return 1
     fi
@@ -5330,8 +5975,10 @@ cmd_quick() {
 
     # Step 3: Close the node + unblock cascade. The close is judged by the same
     # receipt as wv done (wv-957fc8); a denied close leaves the node active,
-    # like a failed commit, rather than closing past the gate.
-    if ! _done_close "$id" "" "metadata" "status = 'done'"; then
+    # like a failed commit, rather than closing past the gate. The claim ends
+    # with the close, as in wv done.
+    local unclaimed="json_remove(COALESCE(metadata, '{}'), '\$.claimed_by')"
+    if ! _done_close "$id" "" "$unclaimed" "status = 'done', metadata = $unclaimed"; then
         echo -e "${RED}Error: close was refused — $id is left ACTIVE${NC}" >&2
         cmd_sync 2>/dev/null || true
         echo "$id"
@@ -5720,20 +6367,20 @@ cmd_ship_agent() {
         jq -n \
             --arg status "$result_status" \
             --arg node_id "$id" \
-            --arg ship_output "$ship_output" \
-            --argjson doctor "$doctor_json" \
+            --rawfile ship_output <(printf '%s' "$ship_output") \
+            --slurpfile doctor <(printf '%s' "$doctor_json") \
             --argjson ship_rc "$ship_rc" \
             --argjson doctor_rc "$doctor_rc" \
-            --argjson node "$node_json" \
+            --slurpfile node <(printf '%s' "$node_json") \
             '{
                 status: $status,
                 node_id: $node_id,
                 noninteractive: true,
                 agent_mode: true,
-                doctor: $doctor,
+                doctor: $doctor[0],
                 ship_exit_code: $ship_rc,
                 doctor_exit_code: $doctor_rc,
-                node: $node,
+                node: $node[0],
                 ship_output: $ship_output
             }'
         if [ "$doctor_rc" -ne 0 ]; then
@@ -5935,4 +6582,169 @@ cmd_delete() {
     done
 
     auto_sync_or_warn
+}
+
+# Moved unchanged from wv-cmd-ops.sh (wv-c153c4), so wv done no longer loads that module.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# validate_on_done — Write-time validation warnings when closing a node
+# ═══════════════════════════════════════════════════════════════════════════
+
+validate_on_done() {
+    local id="${1:-}"
+    local suppress_warn="${WV_NO_WARN:-0}"
+
+    # Suppressed by env or --no-warn
+    [ "$suppress_warn" = "1" ] && return 0
+
+    local warnings=""
+
+    # Check: no learning captured
+    local has_learning
+    has_learning=$(db_query "
+        SELECT COUNT(*) FROM nodes WHERE id='$id'
+        AND (json_extract(metadata, '\$.decision') IS NOT NULL
+          OR json_extract(metadata, '\$.pattern') IS NOT NULL
+          OR json_extract(metadata, '\$.pitfall') IS NOT NULL
+          OR json_extract(metadata, '\$.learning') IS NOT NULL);
+    " 2>/dev/null || echo "0")
+    if [ "$has_learning" = "0" ]; then
+        warnings="${warnings}\n  ⚠ No learning captured — consider: --learning=\"...\""
+    fi
+
+    # Check: no verification evidence
+    # Suppressed when: (a) verification_method metadata is set, or (b) learning string
+    # contains implicit verification keywords (test, passed, verified, lint, etc.)
+    local has_verification
+    has_verification=$(db_query "
+        SELECT COUNT(*) FROM nodes WHERE id='$id'
+        AND json_extract(metadata, '\$.verification_method') IS NOT NULL;
+    " 2>/dev/null || echo "0")
+    if [ "$has_verification" = "0" ]; then
+        local learning_text has_implicit kw
+        learning_text=$(db_query "
+            SELECT LOWER(
+                COALESCE(json_extract(metadata, '\$.learning'), '') || ' ' ||
+                COALESCE(json_extract(metadata, '\$.decision'), '') || ' ' ||
+                COALESCE(json_extract(metadata, '\$.pattern'),  '') || ' ' ||
+                COALESCE(json_extract(metadata, '\$.pitfall'),  '')
+            )
+            FROM nodes WHERE id='$id';
+        " 2>/dev/null || echo "")
+        has_implicit=false
+        for kw in "test" "passed" "verified" "lint" "clean" "make check" "pytest" "ruff" "mypy" "shellcheck"; do
+            if [[ "$learning_text" == *"$kw"* ]]; then
+                has_implicit=true
+                break
+            fi
+        done
+        if [ "$has_implicit" = false ]; then
+            warnings="${warnings}\n  ⚠ No verification evidence — consider: wv update $id --metadata='{\"verification_method\":\"tests passed\"}'"
+        fi
+    fi
+
+    local node_meta node_type finding_missing
+    node_meta=$(_done_read_metadata "$id")
+    node_type=$(echo "$node_meta" | jq -r '.node_kind // .type // "task"' 2>/dev/null || echo "task")
+    if [ "$node_type" = "finding" ]; then
+        finding_missing=$(_finding_missing_fields "$node_meta" | paste -sd ', ' - || true)
+        if [ -n "$finding_missing" ]; then
+            warnings="${warnings}\n  ⚠ Incomplete finding schema — missing or invalid ${finding_missing}"
+        fi
+    fi
+
+    # Check: orphan node (no edges)
+    # Findings are capture-and-park by design — orphan warning is noise for
+    # them. wv-cccf70: same reasoning extends to a node explicitly created
+    # with --standalone (metadata.standalone=true) -- that flag IS the
+    # declaration that no edges are expected; warning about the exact state
+    # it creates trains the reader to ignore validation hints.
+    if [ "$node_type" != "finding" ]; then
+        local edge_count is_standalone
+        edge_count=$(db_query "
+            SELECT COUNT(*) FROM edges
+            WHERE source='$id' OR target='$id';
+        " 2>/dev/null || echo "0")
+        is_standalone=$(echo "$node_meta" | jq -r '.standalone // false' 2>/dev/null || echo "false")
+        if [ "$edge_count" = "0" ] && [ "$is_standalone" != "true" ]; then
+            warnings="${warnings}\n  ⚠ Orphan node — no edges. Consider: wv link $id <parent> --type=implements"
+        fi
+    fi
+
+    # Check: touched files with deteriorating complexity trend
+    local trend_rows trend_path trend_direction
+    trend_rows=$(db_query "
+        SELECT nf.path || '|' || ft.direction
+        FROM node_files nf
+        JOIN nodes n ON n.id=nf.node_id
+        JOIN file_trend ft ON ft.path = nf.path
+        WHERE nf.node_id='$id'
+          AND (json_type(n.metadata, '\$.completion_scope.files') IS NULL
+               OR nf.path IN (SELECT value FROM json_each(n.metadata, '\$.completion_scope.files')))
+          AND ft.direction='deteriorating'
+        ORDER BY nf.path;
+    " 2>/dev/null || true)
+    if [ -n "$trend_rows" ]; then
+        while IFS='|' read -r trend_path trend_direction; do
+            [ -z "$trend_path" ] && continue
+            warnings="${warnings}\n  ⚠ Complexity trend ${trend_direction}: ${trend_path}"
+        done <<< "$trend_rows"
+    fi
+
+    # Check: metadata size guard — large metadata (>50KB) causes sqlite3 -json to hang during sync
+    local meta_size
+    meta_size=$(db_query "
+        SELECT LENGTH(COALESCE(metadata, '{}')) FROM nodes WHERE id='$id';
+    " 2>/dev/null || echo "0")
+    if [ "$meta_size" -gt 51200 ] 2>/dev/null; then
+        warnings="${warnings}\n  ⚠ Metadata is ${meta_size} bytes (>50KB) — may cause wv sync to hang. Check for escape accumulation in learning strings."
+    fi
+
+    # Print warnings if any
+    if [ -n "$warnings" ]; then
+        echo -e "${YELLOW}Validation hints:${NC}${warnings}" >&2
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# score_learning — Heuristic quality score for learning metadata
+# ═══════════════════════════════════════════════════════════════════════════
+
+score_learning() {
+    local id="${1:-}"
+    local score=0
+
+    local meta
+    meta=$(db_query "SELECT json(metadata) FROM nodes WHERE id='$id';" 2>/dev/null)
+    [ -z "$meta" ] && return
+
+    # Collect all learning text (decision + pattern + pitfall + learning)
+    local all_text
+    all_text=$(echo "$meta" | jq -r '[.decision, .pattern, .pitfall, .learning] | map(select(. != null)) | join(" ")' 2>/dev/null)
+    [ -z "$all_text" ] && return
+
+    # +1: Length > 20 chars (not a stub)
+    if [ ${#all_text} -gt 20 ]; then
+        score=$((score + 1))
+    fi
+
+    # +2: Has categorized structure — either typed fields present or prefix in raw learning
+    local has_typed
+    has_typed=$(echo "$meta" | jq -r 'if (.decision != null or .pattern != null or .pitfall != null) then "yes" else "no" end' 2>/dev/null)
+    if [ "$has_typed" = "yes" ] || grep -qiE '(pattern:|pitfall:|decision:|technique:)' <<< "$all_text"; then
+        score=$((score + 2))
+    fi
+
+    # +1: References a specific file or function (contains . or / or ())
+    if grep -qE '(\.[a-z]{1,4}\b|/[a-z]|[a-z_]+\(\))' <<< "$all_text"; then
+        score=$((score + 1))
+    fi
+
+    # Store score in metadata
+    local new_meta
+    new_meta=$(echo "$meta" | jq --argjson s "$score" '. + {learning_hygiene: $s}' 2>/dev/null)
+    if [ -n "$new_meta" ]; then
+        new_meta="${new_meta//\'/\'\'}"
+        db_query "UPDATE nodes SET metadata='$new_meta' WHERE id='$id';" 2>/dev/null
+    fi
 }

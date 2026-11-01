@@ -932,6 +932,9 @@ test_discover() {
     assert_jq_true "$ctx_coached" '.discovery.coaching.format == "weave.coaching-response.v1"' \
         "context discover-mode: inherits the coaching projection from discovery"
 
+    # The impacted child stays open for the reverse-impact assertions, so it is
+    # parked: a parent does not close over an unaccounted open child (wv-76b361).
+    "$WV" update "$impacted" --metadata='{"deferred":true,"deferred_reason":"fixture: seed closes over it"}' >/dev/null 2>&1
     "$WV" update "$seed" --status=done >/dev/null 2>&1
     done_out=$("$WV" discover "$seed" --json --depth=2 --limit=5 2>&1)
     assert_jq_true "$done_out" '.seed.status == "done" and .sources.impact.direction == "rev" and .sources.impact.available == true' "discover JSON: done seeds use explicit reverse impact"
@@ -999,6 +1002,62 @@ test_unified_blocking() {
         "ready: deferred-todo node excluded (agrees with context)"
     assert_jq_true "$ready_json" "all(.[]; .id != \"$target\")" \
         "ready: edge-blocked node excluded (agrees with context)"
+
+    # wv-31d8c2: bootstrap's ready rows are wv ready's, not a second predicate.
+    # Its hand-written query admitted parked, reserved, memory and foreign-claimed
+    # nodes, so step 0 of every session advertised work wv ready hid.
+    local reserved_node memory_node claimed_node boot
+    reserved_node=$("$WV" add "reserved capture slot" --force --metadata='{"e5_reserved":true}' 2>&1 | node_id_from_output)
+    memory_node=$("$WV" add "a remembered fact" --force --kind=memory 2>&1 | node_id_from_output)
+    claimed_node=$("$WV" add "claimed elsewhere" --force --metadata='{"claimed_by":"another-agent"}' 2>&1 | node_id_from_output)
+    boot=$("$WV" bootstrap --json --ready=50 2>/dev/null)
+    assert_jq_true "$boot" "any(.ready[]; .id == \"$ready_node\")" \
+        "bootstrap: plain todo node is ready"
+    local excluded
+    for excluded in "$deferred_node" "$target" "$edge_target" "$reserved_node" "$memory_node" "$claimed_node"; do
+        assert_jq_true "$boot" "all(.ready[]; .id != \"$excluded\")" \
+            "bootstrap: $excluded excluded (agrees with wv ready)"
+    done
+    assert_equals "$("$WV" ready --json-v2 2>/dev/null | jq -c '[.[].id]')" "$(echo "$boot" | jq -c '[.ready[].id]')" \
+        "bootstrap: ready rows equal wv ready's, in its order"
+    assert_equals "$("$WV" ready --json-v2 2>/dev/null | jq -c '[.[:2][].id]')" \
+        "$("$WV" bootstrap --json --ready=2 2>/dev/null | jq -c '[.ready[].id]')" \
+        "bootstrap --ready=2: wv ready's first two rows"
+    assert_contains "$("$WV" bootstrap --json --ready=x 2>&1)" "--ready" \
+        "bootstrap: a non-numeric --ready is refused"
+
+    # wv-31d8c2 widening: the completion trail's "Unblocked:" line named every
+    # todo target of the closed node's blocks edges, including one a deferral
+    # or another open blocker still holds. Driven directly: wv done skips the
+    # trail under this suite's custom WV_DB.
+    local closer freed parked held other_blocker trail
+    closer=$("$WV" add "closing blocker" --force 2>&1 | node_id_from_output)
+    freed=$("$WV" add "freed target" --force 2>&1 | node_id_from_output)
+    parked=$("$WV" add "parked target" --force 2>&1 | node_id_from_output)
+    held=$("$WV" add "still-held target" --force 2>&1 | node_id_from_output)
+    other_blocker=$("$WV" add "other open blocker" --force 2>&1 | node_id_from_output)
+    "$WV" block "$freed" --by="$closer" >/dev/null 2>&1
+    "$WV" block "$parked" --by="$closer" >/dev/null 2>&1
+    "$WV" update "$parked" --metadata='{"deferred":true}' >/dev/null 2>&1
+    "$WV" block "$held" --by="$closer" >/dev/null 2>&1
+    "$WV" block "$held" --by="$other_blocker" >/dev/null 2>&1
+    "$WV" update "$held" --status=todo >/dev/null 2>&1
+    "$WV" "done" "$closer" --no-warn --skip-verification >/dev/null 2>&1
+    mkdir -p "$TEST_DIR/.weave"
+    : > "$TEST_DIR/.weave/trails.md"
+    (cd "$TEST_DIR" && WEAVE_DIR="$TEST_DIR/.weave" WV_DB="$WV_DB" bash -c "
+        source '$PROJECT_ROOT/scripts/lib/wv-validate.sh'
+        source '$PROJECT_ROOT/scripts/lib/wv-db.sh'
+        source '$PROJECT_ROOT/scripts/lib/wv-attempt-journal.sh'
+        source '$PROJECT_ROOT/scripts/cmd/wv-cmd-graph.sh'
+        source '$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh'
+        source '$PROJECT_ROOT/scripts/cmd/wv-cmd-core.sh'
+        _done_write_trail '$closer'
+    ")
+    trail=$(grep '^- Unblocked:' "$TEST_DIR/.weave/trails.md" || true)
+    assert_contains "$trail" "$freed" "trail: a target with no other hold is reported unblocked"
+    assert_not_contains "$trail" "$parked" "trail: a deferred target is not reported unblocked"
+    assert_not_contains "$trail" "$held" "trail: a target another open blocker holds is not reported unblocked"
 }
 
 # ============================================================================

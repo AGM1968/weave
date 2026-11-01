@@ -116,7 +116,7 @@ cmd_findings_list() {
     db_ensure || return $?
 
     local total
-    total=$(db_query "SELECT COUNT(*) FROM nodes n WHERE json_extract(n.metadata, '\$.type') = 'finding' $fixable_clause;" 2>/dev/null || echo 0)
+    total=$(db_query "SELECT COUNT(*) FROM nodes n WHERE $(wv_kind_sql n) = 'finding' $fixable_clause;" 2>/dev/null || echo 0)
     : "${total:=0}"
 
     local query="
@@ -138,7 +138,7 @@ cmd_findings_list() {
             END AS age_days,
             n.text
         FROM nodes n
-        WHERE json_extract(n.metadata, '$.type') = 'finding'
+        WHERE $(wv_kind_sql n) = 'finding'
         $fixable_clause
         $stale_clause
         ORDER BY n.created_at DESC
@@ -148,7 +148,7 @@ cmd_findings_list() {
     if [ "$format" = "json" ]; then
         local results
         results=$(db_query_json "SELECT n.id, n.text, n.status, n.metadata FROM nodes n
-            WHERE json_extract(n.metadata, '$.type') = 'finding'
+            WHERE $(wv_kind_sql n) = 'finding'
             $fixable_clause
             $stale_clause
             ORDER BY n.created_at DESC
@@ -329,7 +329,7 @@ cmd_validate_finding() {
     local meta_json
     meta_json=$(printf '%s' "$meta_raw" | jq -r '.' 2>/dev/null || echo "{}")
     local node_type
-    node_type=$(printf '%s' "$meta_json" | jq -r '.type // "task"' 2>/dev/null || echo "task")
+    node_type=$(printf '%s' "$meta_json" | jq -r '.node_kind // .type // "task"' 2>/dev/null || echo "task")
 
     if [ "$node_type" != "finding" ]; then
         printf '{"valid":true,"errors":[],"note":"not a finding node"}\n'

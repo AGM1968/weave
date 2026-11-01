@@ -133,6 +133,27 @@ gate_changed() {
         "$base" "$index" 2>/dev/null
 }
 
+# gate_renamed — the moves between base and index, as NUL-separated
+# old-path/new-path pairs, by git's default similarity. gate_changed stays
+# rename-blind so a removed path still routes; this is for a check whose
+# baseline belongs to the old path: a git mv'd document carries its findings
+# with it, so judging the new path against an empty baseline reported them all
+# as added (wv-7f1794).
+gate_renamed() {
+    local base index
+    base=$(gate_side_tree base) && index=$(gate_side_tree index) || return 1
+    # -z --name-status prints status, old, new as three NUL-terminated fields;
+    # pipefail so a diff-tree failure is the function's, not hidden by the loop.
+    (
+        set -o pipefail
+        git diff-tree -r -z -M --name-status --diff-filter=R "$base" "$index" 2>/dev/null \
+            | while IFS= read -r -d '' _gr_status && IFS= read -r -d '' _gr_old \
+                  && IFS= read -r -d '' _gr_new; do
+                printf '%s\0%s\0' "$_gr_old" "$_gr_new"
+            done
+    )
+}
+
 gate_ls() {
     local tree side=$1
     shift

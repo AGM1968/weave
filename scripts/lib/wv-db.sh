@@ -690,7 +690,7 @@ db_migrate_finding_promoted_at() {
 UPDATE nodes
 SET metadata = json_patch(COALESCE(metadata, '{}'),
       json_object('promoted_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')))
-WHERE json_extract(metadata, '$.type') = 'finding'
+WHERE COALESCE(json_extract(metadata, '$.node_kind'), json_extract(metadata, '$.type')) = 'finding'
   AND json_extract(metadata, '$.promoted_at') IS NULL;
 BACKFILL
 }
@@ -899,6 +899,24 @@ _policy_mccabe_limit_sql() {
     echo "COALESCE((SELECT value FROM policy_thresholds WHERE key = 'mccabe_max_' || fm.language), (SELECT value FROM policy_thresholds WHERE key = 'mccabe_max'))"
 }
 
+# _policy_file_mccabe <quality_db> <scan_id> <path> — "<cc> <language>": the
+# file's largest function complexity in that quality scan and the language
+# that picks its limit, as wv done writes them into file_metrics for the
+# mccabe clause. scripts/gate-preflight.sh reads the same pair (wv-b7fdee).
+_policy_file_mccabe() {
+    local path_esc lang val
+    path_esc=$(printf '%s' "$3" | sed "s/'/''/g")
+    case "$3" in
+        *.py)       lang="py" ;;
+        *.sh)       lang="sh" ;;
+        *.ts|*.tsx) lang="ts" ;;
+        *)          lang=""   ;;
+    esac
+    val=$(sqlite3 -batch -cmd ".timeout 3000" "$1" \
+        "SELECT COALESCE(CAST(MAX(value) AS INTEGER), 0) FROM file_metrics WHERE path='$path_esc' AND scan_id=$2 AND metric LIKE 'fn_cc:%';" 2>/dev/null) || val=""
+    printf '%s %s\n' "${val:-0}" "$lang"
+}
+
 # Row sources: FROM ... WHERE for the files that breach each clause. An
 # optional "exempt" selects the breaching files quality_exempt covers instead.
 _policy_mccabe_rows_sql() {
@@ -931,7 +949,7 @@ FROM node_files nf
                         WHERE nf.node_id = NEW.id
                             AND fts.state IN ('red', 'stale')
                             AND (SELECT value FROM policy_thresholds WHERE key = 'test_gate') >= 2
-                            AND COALESCE(json_extract(NEW.metadata, '\$.type'), '') NOT IN ('finding', 'epic', 'session_history')
+                            AND COALESCE(json_extract(NEW.metadata, '\$.node_kind'), json_extract(NEW.metadata, '\$.type'), '') NOT IN ('finding', 'epic', 'session_history')
                             $(_policy_file_guard_sql "${1:-}")
 SQL
 }
@@ -1277,6 +1295,30 @@ _wv_db_schema_missing() {
         ORDER BY key;" 2>/dev/null || echo "unreadable"
 }
 
+# _wv_db_ensure_failed — record that this process could not open the graph.
+# Test hook (wv-90083c): a command that prints its 2>/dev/null-silenced or
+# empty-default report after this must exit nonzero, and the suite that holds
+# every command to that needs to see the failure whatever the caller did with
+# db_ensure's message. Inert unless WV_TEST_MODE=1 and WV_TEST_DB_ENSURE_LOG set.
+_wv_db_ensure_failed() {
+    [ "${WV_TEST_MODE:-}" = "1" ] && [ -n "${WV_TEST_DB_ENSURE_LOG:-}" ] \
+        && printf '%s\n' "$WV_DB" >> "$WV_TEST_DB_ENSURE_LOG" 2>/dev/null
+    return 0
+}
+
+# wv_require_graph — db_ensure for a command that reports from the graph, with
+# the refusal said aloud (wv-90083c). Callers must check it: main runs the
+# dispatch as `_wv_dispatch "$@" || rc=$?`, which suspends errexit for every
+# command, so a bare db_ensure that fails lets the report print empty counts.
+# Every db_query runs db_ensure first, so a graph db_ensure refuses is one these
+# commands cannot read; cmd_health, which probes such a graph directly, has its
+# own rule.
+wv_require_graph() {
+    db_ensure && return 0
+    echo -e "${RED}Error: cannot open the graph database ($WV_DB); not reporting from it${NC}" >&2
+    return 1
+}
+
 db_ensure() {
     # Per-process fast path (wv-3d6ed0). Without it every db_query re-ran the
     # migration probes below, each its own sqlite3, at ~220ms per query; the
@@ -1321,9 +1363,9 @@ db_ensure() {
             # conflicts that occur when db_init runs before importing state.sql
             # (SQLite .dump uses plain CREATE TABLE, not CREATE TABLE IF NOT EXISTS)
             echo -e "${YELLOW}Weave database not found at $WV_DB${NC}" >&2
-            cmd_load || return 1
+            cmd_load || { _wv_db_ensure_failed; return 1; }
         else
-            db_init || return 1
+            db_init || { _wv_db_ensure_failed; return 1; }
             # Safety net: warn if .weave/ has data but we just created an empty DB
             if [ -z "$WV_DB_CUSTOM" ] && [ -d "$WEAVE_DIR" ]; then
                 local has_data=false
@@ -1370,6 +1412,7 @@ db_ensure() {
         flock -w 10 "$schema_lock_fd" || {
             echo -e "${RED}Error: timed out waiting for Weave schema migration lock${NC}" >&2
             exec {schema_lock_fd}>&-
+            _wv_db_ensure_failed
             return 1
         }
         # Check again under the lock (ultrareview #4574): processes that raced
@@ -1429,74 +1472,60 @@ db_ensure() {
     _wv_db_size_check
 }
 
+# _wv_db_graph_bytes <file-size> — bytes the graph occupies in brain.db, leaving
+# out the code-search index (wv index: chunks, its FTS shadow tables and
+# idx_chunks_file), which wv prune cannot shrink and wv index rebuilds
+# (wv-dc5486). dbstat walks only the graph's own b-trees (~20ms); a sqlite3
+# built without it falls back to the file size less the index's row payload,
+# an overestimate, so the fallback can warn early but never prunes for the index.
+_wv_db_graph_bytes() {
+    local file_size="$1" bytes
+    bytes=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat
+        WHERE aggregate = TRUE AND name IN (SELECT name FROM sqlite_master WHERE rootpage > 0
+            AND name != 'chunks' AND name NOT LIKE 'chunks\_%' ESCAPE '\' AND name != 'idx_chunks_file');" 2>/dev/null)
+    if [[ "$bytes" =~ ^[0-9]+$ ]]; then
+        echo "$bytes"
+        return 0
+    fi
+    bytes=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" \
+        "SELECT COALESCE(SUM(length(content) + COALESCE(length(embedding), 0)), 0) FROM chunks;" 2>/dev/null)
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    echo $(( file_size > bytes ? file_size - bytes : 0 ))
+}
+
 # _wv_db_size_check — once per process tree (the flag is exported so pipe
-# subshells inherit it), warn about or prune an oversized DB.
+# subshells inherit it), warn about or prune a graph over WV_MAX_DB_SIZE.
+# The graph is judged, not the file: the code index can be most of the file,
+# and pruning nodes for it deleted graph work that freed nothing (wv-dc5486).
+# Destructive prune requires explicit opt-in (WV_AUTO_PRUNE=1) and runs wv
+# prune itself, so it keeps prune's exclusions (findings, memories, unaddressed
+# pitfalls), its archive and tombstones, and its refusal on a foreign DB.
+# WV_DISABLE_AUTOPRUNE=1 kept for backward compat (sync uses it).
 _wv_db_size_check() {
-    # Check DB size once per process-tree — export so pipe subshells inherit the flag.
-    # Destructive prune requires explicit opt-in: WV_AUTO_PRUNE=1.
-    # WV_DISABLE_AUTOPRUNE=1 kept for backward compat (sync uses it).
-    if [ -z "${_WV_SIZE_CHECKED:-}" ] && [ -f "$WV_DB" ] && [ -z "${WV_DISABLE_AUTOPRUNE:-}" ]; then
-        export _WV_SIZE_CHECKED=1
-        local db_size
-        db_size=$(stat -c%s "$WV_DB" 2>/dev/null || stat -f%z "$WV_DB" 2>/dev/null || echo 0)
-        if [ "$db_size" -gt "$WV_MAX_DB_SIZE" ] 2>/dev/null; then
-            if [ "${WV_AUTO_PRUNE:-0}" != "1" ]; then
-                # Warn only — no destructive action without opt-in.
-                echo "wv: database is $(( db_size / 1048576 ))MB (limit $(( WV_MAX_DB_SIZE / 1048576 ))MB) — run 'wv prune --age=7d' or set WV_AUTO_PRUNE=1 to auto-prune" >&2
-            else
-                echo "wv: database is $(( db_size / 1048576 ))MB (limit $(( WV_MAX_DB_SIZE / 1048576 ))MB), auto-pruning..." >&2
-                # Inline aggressive prune — archive done nodes >24h.
-                # Dedup: skip IDs already in today's archive file.
-                local archive_dir="$WEAVE_DIR/archive"
-                mkdir -p "$archive_dir"
-                local archive_file="$archive_dir/$(date +%Y-%m-%d).jsonl"
-                local already_archived=""
-                if [ -f "$archive_file" ]; then
-                    already_archived=$(jq -r '.id' "$archive_file" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
-                fi
-                local exclude_clause=""
-                if [ -n "$already_archived" ]; then
-                    exclude_clause=" AND id NOT IN ($(echo "$already_archived" | sed "s/,/','/g; s/^/'/; s/$/'/"  ))"
-                fi
-                sqlite3 -json "$WV_DB" "SELECT * FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours')${exclude_clause}" 2>/dev/null \
-                    | jq -c '.[]' >> "$archive_file" 2>/dev/null || true
-                sqlite3 "$WV_DB" ".timeout 5000
-                    DELETE FROM edges WHERE source IN (SELECT id FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours'))
-                       OR target IN (SELECT id FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours'));
-                    DELETE FROM node_files WHERE node_id IN (SELECT id FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours'));
-                    DELETE FROM nodes WHERE status='done' AND updated_at < datetime('now', '-24 hours');
-                    VACUUM;
-                " 2>/dev/null
-                local _prune_rc=$?
-                if [ "$_prune_rc" -ne 0 ]; then
-                    echo "wv: auto-prune failed (database locked?)" >&2
-                fi
-                # If DB still over cap, only evict chunks if doing so would actually bring it under limit.
-                # Chunks are a re-creatable index but evicting them when graph itself is the bloat is
-                # pointless — it destroys search without freeing enough space.
-                local db_size_after
-                db_size_after=$(stat -c%s "$WV_DB" 2>/dev/null || stat -f%z "$WV_DB" 2>/dev/null || echo 0)
-                if [ "$db_size_after" -gt "$WV_MAX_DB_SIZE" ] 2>/dev/null; then
-                    local chunks_bytes
-                    chunks_bytes=$(sqlite3 "$WV_DB" ".timeout 5000
-                        SELECT COALESCE(SUM(length(content) + COALESCE(length(embedding), 0) + 50), 0) FROM chunks;" 2>/dev/null || echo 0)
-                    if [ "$(( db_size_after - chunks_bytes ))" -le "$WV_MAX_DB_SIZE" ] 2>/dev/null; then
-                        echo "wv: node prune insufficient ($(( db_size_after / 1048576 ))MB), evicting chunks index..." >&2
-                        sqlite3 "$WV_DB" ".timeout 5000
-                            DELETE FROM chunks;
-                            INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');
-                            VACUUM;
-                        " 2>/dev/null || echo "wv: chunks eviction failed (database locked?)" >&2
-                        echo "wv: chunks index evicted — re-run wv index to restore search" >&2
-                    else
-                        echo "wv: database over limit ($(( db_size_after / 1048576 ))MB) — run 'wv prune --age=7d' to free space" >&2
-                    fi
-                fi
-                # Clear entire context cache after auto-prune (can't track specific affected nodes)
-                rm -rf "$WV_HOT_ZONE/context_cache" 2>/dev/null || true
-                echo "wv: context cache cleared after auto-prune" >&2
-            fi
-        fi
+    [ -z "${_WV_SIZE_CHECKED:-}" ] && [ -f "$WV_DB" ] && [ -z "${WV_DISABLE_AUTOPRUNE:-}" ] || return 0
+    export _WV_SIZE_CHECKED=1
+    local db_size graph_bytes limit_mb
+    db_size=$(stat -c%s "$WV_DB" 2>/dev/null || stat -f%z "$WV_DB" 2>/dev/null || echo 0)
+    # The graph is part of the file, so a file under the limit needs no query.
+    [ "$db_size" -gt "$WV_MAX_DB_SIZE" ] 2>/dev/null || return 0
+    graph_bytes=$(_wv_db_graph_bytes "$db_size")
+    [ "$graph_bytes" -gt "$WV_MAX_DB_SIZE" ] 2>/dev/null || return 0
+    limit_mb=$(( WV_MAX_DB_SIZE / 1048576 ))
+    if [ "${WV_AUTO_PRUNE:-0}" != "1" ]; then
+        echo "wv: graph data is $(( graph_bytes / 1048576 ))MB (limit ${limit_mb}MB) — run 'wv prune --age=7d' or set WV_AUTO_PRUNE=1 to auto-prune" >&2
+        return 0
+    fi
+    echo "wv: graph data is $(( graph_bytes / 1048576 ))MB (limit ${limit_mb}MB), auto-pruning done nodes older than 24h..." >&2
+    if ! declare -F cmd_prune >/dev/null; then
+        echo "wv: auto-prune needs the wv command set; run 'wv prune --age=7d'" >&2
+        return 0
+    fi
+    cmd_prune --age=24h >&2 || echo "wv: auto-prune failed" >&2
+    # Clear entire context cache after auto-prune (can't track specific affected nodes)
+    rm -rf "$WV_HOT_ZONE/context_cache" 2>/dev/null || true
+    graph_bytes=$(_wv_db_graph_bytes "$db_size")
+    if [ "$graph_bytes" -gt "$WV_MAX_DB_SIZE" ] 2>/dev/null; then
+        echo "wv: graph data still $(( graph_bytes / 1048576 ))MB (limit ${limit_mb}MB) after auto-prune — run 'wv prune --age=7d' to free more" >&2
     fi
 }
 
@@ -1517,6 +1546,148 @@ db_query_json() {
     local raw
     raw=$(sqlite3 -json -cmd ".timeout 5000" "$WV_DB" "$1") || return $?
     printf '%s\n' "${raw:-[]}"
+}
+
+# wv_kind_sql [alias] — the SQL expression for a node's kind (ontology S1,
+# wv-f7dfd3): metadata.node_kind, then its one-release mirror metadata.type, so
+# a graph the backfill has not reached reads as it did before. Every query that
+# branches on kind uses this rather than the type column or '$.type'.
+wv_kind_sql() {
+    local m="${1:+$1.}metadata"
+    printf "COALESCE(json_extract(%s, '\$.node_kind'), json_extract(%s, '\$.type'))" "$m" "$m"
+}
+
+# _wv_finding_prefix_sql <alias> — the node's text opens with a finding or gap
+# prefix (finding(, Finding:, gap( ...). Read alongside the kind while open
+# finding( nodes are still typed task (ontology D2).
+_wv_finding_prefix_sql() {
+    local t="ltrim($1.text)"
+    printf "(%s LIKE 'finding(%%' OR %s LIKE 'finding:%%' OR %s LIKE 'gap(%%' OR %s LIKE 'gap:%%')" "$t" "$t" "$t" "$t"
+}
+
+# wv_edge_violations_sql <candidates-select> — the edge invariants (ontology S2,
+# wv-76b361; contracts/edge-types-v1.json, pinned by tests/test-edge-invariants.sh).
+# <candidates-select> yields (source, target, type): one proposed edge for wv link
+# and wv block, or every stored edge for wv doctor, so the write-time refusal and
+# the report judge by the same query. One row per broken invariant, as
+# (invariant, source, target, type). Acyclicity asks whether the target already
+# reaches the source over edges of the same type, which for a stored edge means
+# it lies on a cycle. A tie on created_at is not backwards. supersedes runs old
+# -> new, except that a source whose superseded_by names the target declares
+# the direction itself (crystallize dedup, resolve --winner with an older winner).
+wv_edge_violations_sql() {
+    cat <<SQL
+WITH RECURSIVE cand(source, target, type) AS ($1),
+reach(type, start, node) AS (
+    SELECT type, target, target FROM cand WHERE type IN ('blocks', 'implements')
+    UNION
+    SELECT r.type, r.start, e.target FROM reach r
+    JOIN edges e ON e.source = r.node AND e.type = r.type
+)
+SELECT 'no_self_edge' AS invariant, c.source AS source, c.target AS target, c.type AS type
+FROM cand c WHERE c.source = c.target
+UNION ALL
+SELECT 'endpoints_exist', c.source, c.target, c.type FROM cand c
+WHERE NOT EXISTS (SELECT 1 FROM nodes WHERE id = c.source)
+   OR NOT EXISTS (SELECT 1 FROM nodes WHERE id = c.target)
+UNION ALL
+SELECT 'acyclic', c.source, c.target, c.type FROM cand c
+WHERE c.type IN ('blocks', 'implements') AND c.source != c.target
+  AND EXISTS (SELECT 1 FROM reach r WHERE r.type = c.type AND r.start = c.target AND r.node = c.source)
+UNION ALL
+SELECT 'target_newer_or_declared', c.source, c.target, c.type
+FROM cand c JOIN nodes s ON s.id = c.source JOIN nodes t ON t.id = c.target
+WHERE c.type = 'supersedes' AND c.source != c.target AND t.created_at < s.created_at
+  AND COALESCE(json_extract(s.metadata, '\$.superseded_by'), '') != t.id
+UNION ALL
+SELECT 'memory_superseded_by', c.source, c.target, c.type
+FROM cand c JOIN nodes s ON s.id = c.source JOIN nodes t ON t.id = c.target
+WHERE c.type = 'supersedes' AND $(wv_kind_sql s) = 'memory'
+  AND COALESCE(json_extract(s.metadata, '\$.superseded_by'), '') != t.id
+UNION ALL
+SELECT 'finding_endpoint', c.source, c.target, c.type
+FROM cand c JOIN nodes s ON s.id = c.source JOIN nodes t ON t.id = c.target
+WHERE c.type = 'resolves'
+  AND COALESCE($(wv_kind_sql s), '') != 'finding' AND COALESCE($(wv_kind_sql t), '') != 'finding'
+  AND NOT $(_wv_finding_prefix_sql s) AND NOT $(_wv_finding_prefix_sql t)
+UNION ALL
+SELECT 'source_newer', c.source, c.target, c.type
+FROM cand c JOIN nodes s ON s.id = c.source JOIN nodes t ON t.id = c.target
+WHERE c.type = 'addresses' AND s.created_at < t.created_at
+SQL
+}
+
+# wv_pitfall_resolver_edges_sql — (pitfall, resolver) pairs, the one definition
+# of "this pitfall is addressed" for audit-pitfalls, health, status and prune. A
+# node that addresses or implements the pitfall is the edge's source; one that
+# replaces it through supersedes is the target, since the target replaces the
+# source (contracts/edge-types-v1.json). Those readers took the supersedes
+# target as the addressed pitfall, the edge read backwards (wv-76b361).
+wv_pitfall_resolver_edges_sql() {
+    cat <<'SQL'
+SELECT target AS pitfall, source AS resolver FROM edges WHERE type IN ('addresses', 'implements')
+UNION ALL
+SELECT source AS pitfall, target AS resolver FROM edges WHERE type = 'supersedes'
+SQL
+}
+
+# wv_edge_violation <source> <target> <type> — the invariants one proposed edge
+# would break, space-separated (empty when none). IDs must be validated first.
+# Returns nonzero when the graph could not be read, so a caller fails closed.
+wv_edge_violation() {
+    local out
+    out=$(db_query "SELECT DISTINCT invariant FROM ($(wv_edge_violations_sql \
+        "SELECT '$1', '$2', '$3'"));" 2>&1) || {
+        echo -e "${RED}Error: could not check the edge's invariants: $out${NC}" >&2
+        return 1
+    }
+    printf '%s' "$out" | tr '\n' ' ' | sed 's/ $//'
+}
+
+# wv_parked_predicate <alias> — CANONICAL "parked": metadata.deferred with a
+# deferred_reason. A parked node keeps status todo by design (the 2.0 plan parks
+# work by flag and resumes it by clearing the flag); wv_blocking_reason keeps it
+# out of ready, close-children counts it as accounted, and the node-state check
+# does not ask its status to change (wv-5515e9).
+wv_parked_predicate() {
+    local n="${1:-n}"
+    cat <<SQL
+(json_extract(${n}.metadata, '\$.deferred') IN (1, 'true')
+ AND COALESCE(json_extract(${n}.metadata, '\$.deferred_reason'), '') != '')
+SQL
+}
+
+# wv_deferral_divergent_sql <alias> — the node-state divergence that wv doctor
+# (node-state) and pattern-audit Check 6 both report: todo, carrying deferral
+# metadata, not parked, and with no open blocks edge, so its status claims a
+# readiness its metadata denies. One definition, so the two reports cannot
+# disagree on which nodes they count.
+wv_deferral_divergent_sql() {
+    local n="${1:-n}"
+    cat <<SQL
+(${n}.status = 'todo'
+  AND $(wv_deferral_metadata_predicate "$n")
+  AND NOT $(wv_parked_predicate "$n")
+  AND NOT EXISTS (
+      SELECT 1 FROM edges _de JOIN nodes _db ON _de.source = _db.id
+      WHERE _de.target = ${n}.id AND _de.type = 'blocks' AND _db.status != 'done'))
+SQL
+}
+
+# wv_unaccounted_child_sql <child-alias> <parent-id-expr> — the child is open and
+# nothing accounts for it: not parked (metadata.deferred with a deferred_reason),
+# not linked by a resolves edge, and with no other implements parent still open.
+# wv done refuses to close a parent over such a child; wv doctor lists closed
+# parents that already have one (ontology S2, 2.0 plan ordering rule 4).
+wv_unaccounted_child_sql() {
+    local c="$1" p="$2"
+    cat <<SQL
+($c.status != 'done'
+  AND NOT $(wv_parked_predicate "$c")
+  AND NOT EXISTS (SELECT 1 FROM edges r WHERE r.type = 'resolves' AND (r.source = $c.id OR r.target = $c.id))
+  AND NOT EXISTS (SELECT 1 FROM edges o JOIN nodes op ON op.id = o.target
+                  WHERE o.type = 'implements' AND o.source = $c.id AND o.target != $p AND op.status != 'done'))
+SQL
 }
 
 # db_query_json_v2 — lean JSON shape for --json-v2 flag:

@@ -4,34 +4,142 @@
 
 ## Unreleased
 
+## [1.71.0-rc.15] - 2026-11-01
+
+### Upgrading
+
+- Run `wv init-repo --update`, then `wv memory render --agent=all` once. Delete `.claude/MEMORY.md`
+  and `.codex/MEMORY.md` if you have them; no harness reads them.
+- Run `wv kind backfill` to see the kind each existing node would get, then
+  `wv kind backfill --apply`. It refuses to apply when the change would alter `wv ready`.
+- Run `wv doctor`. It now names the exact fault in each project guide, every stored edge that breaks
+  its rule, and every closed parent over an open child. Each section below says what changed.
+
+### Added
+
+- **Your repository can declare its own violation types.** A rule in `.weave/patterns/<id>.yaml`
+  with `violation_type: project:<name>` admits that type in your repository only, coached by
+  `.weave/guides/<name>[.<language>].md`. Metadata updates, the close check,
+  `wv findings promote --violation-type`, the guide check in `wv doctor` and coaching accept it; any
+  other repository refuses it.
+- **Your repository can author its own procedures.** A file `.weave/procedures/<id>.md` that follows
+  the procedure contract (its file name is its id) is read by `wv guide --procedure=<id>` and the
+  MCP `weave_guide` tool before the package copy, and replaces a package procedure of the same id.
+  It stays in your repository. A procedure that fails the contract is an error, not a fall back to
+  the package copy. `wv init-repo --update` projects them into the Claude skill, Codex, Copilot and
+  `AGENTS.md` surfaces beside the package procedures, and `wv doctor` validates them.
+- **A memory can graduate into your repository.**
+  `wv memory review <id> --verdict=graduate --target=<path>` records that a memory's lesson now
+  lives in a procedure, a guide, a pattern rule or a tracked Markdown document. The target must
+  parse under its surface's contract. `wv memory review --apply` marks the memory graduated; it
+  leaves every projection and `wv bootstrap`, and `wv memory recall` still returns it.
+- **`wv memory review` records and applies a verdict on a candidate memory:** promote, merge, reject
+  or verify, each with a reason. Until now no command could promote an imported candidate.
+- **`wv doctor` checks the memory block.** The rendered block is measured against
+  `.weave/policy.conf` `[memory] block_budget_bytes` (default 8192); over budget, doctor names
+  candidates to graduate. It also flags memories holding dated state or citing a node that is done
+  or missing. Both are warnings and change nothing.
+- **You can keep a harness's memory outside the graph, by recorded choice.** In
+  `.weave/policy.conf`, `[memory]` `outside_graph = claude` (or `codex`, comma-separated) with a
+  `reason` makes `wv doctor` report the reason instead of advising an import, and stops the Claude
+  memory hook from importing. A choice without a reason records nothing.
+- **Every node has a kind:** epic, feature, task, finding, decision, plan, memory or
+  session_history. `wv add` and `wv update` take `--kind`, as do the MCP `weave_add` and
+  `weave_update` tools. Without it, the kind comes from `metadata.type`, then the text prefix
+  (`epic(`, `Plan:`), then task. `wv ready`, `wv query type=` and `wv list --type` read it.
+- **Every edge type has a rule, and it is enforced.** No self-edges; `blocks` and `implements` have
+  no cycles; `supersedes` runs old to new; `resolves` has a finding at one end. `wv link` and
+  `wv block` refuse an edge that breaks its rule.
+- **A node does not close over open work.** `wv done`, `wv ship`, `wv quick`, `wv resolve` and
+  `wv update --status=done` refuse while an `implements` child is open, unless the child is parked
+  (`metadata.deferred` with a `deferred_reason`), resolved, or under another open parent.
+- **`wv show <id> --close-time`** says when a done node last closed, from the committed graph
+  history. The MCP `weave_show` tool takes `close_time`.
+- **`wv init-repo` proposes a gate declaration** from the lockfiles it finds (Poetry, uv, npm, pnpm,
+  yarn, Cargo) as `.weave/gate-provision.proposed.json`, checked by the gate's own loader. It never
+  adopts it: rename it to `.weave/gate-provision.json` to have those suites run in a private
+  environment from the next commit. `wv analyze gates` and `wv doctor` report which routes still run
+  in your checkout.
+- **Graph memory reaches every runtime.** `wv bootstrap --json` carries the active memories'
+  one-line index and the recall command. MCP clients get it through `weave_bootstrap`, and two new
+  MCP tools, `weave_memory_recall` and `weave_remember`, recall full text and capture a memory.
+  `WORKFLOW.md` has a Memory section on what belongs in graph memory.
+
+### Changed
+
+- **Memory projections carry an index, not every memory's full text.** Each memory renders as one
+  line (its `metadata.hook`, or its first sentence, with its verified date), which keeps `CLAUDE.md`
+  and `AGENTS.md` well inside what a harness reads. Set `metadata.resident` to `full` to keep a
+  memory's whole text. `--agent=all` no longer writes `.claude/MEMORY.md` or `.codex/MEMORY.md`.
+- **`metadata.type` must be a node kind.** A change type such as `bug` or `refactor` belongs in the
+  text prefix, and is refused as `metadata.type`. Importing a GitHub issue no longer copies its
+  `bug` label into the node.
+- **Four Weave-specific default rules no longer ship:** `live-db-file-operation`,
+  `lookup-skips-beside-self`, `git-listing-rename-blind` and `sqlite-dot-command-swallows-sql`. Each
+  described Weave's own code, not yours. Their violation types left the shipped vocabulary, and the
+  installers remove the retired rules and guides.
+- **`wv doctor` says what is wrong with a project guide, all at once.** Each guide error names the
+  field, section or line, and every fault is listed in one run. A section name may now hold a colon.
+  The format is in `.weave/guides.README.md`: frontmatter `id`, `violation_type`, `summary`, and
+  optionally `language` and `sections` (separated by `|`, not commas); body `## Why` and
+  `## Corrective move`, optionally `## Expected outcome` and `## Avoid`; each section once. A
+  frontmatter key written twice is refused.
+- **`wv commit-refs` says why each ref is orphaned** (amended, rebased, reset, dropped, not in this
+  clone) before it offers `--prune`.
+- **The `test-impacted.sh` template assumes no language.** `RUNNER` must be set. An existing
+  `scripts/test-impacted.sh` is not overwritten.
+- **A refusal in a linked worktree says so.** It names the worktree, which keeps its own graph: load
+  and claim there.
+- **The database size warning ignores the code index**, which `wv index.` can make most of the
+  database.
+
+### Fixed
+
+- **`wv quick` commits again.** Since rc.14 the commit gate refused every `wv quick` with staged
+  changes and left its node active.
+- **One broken rule file no longer stops every pattern rule.** A rule in `.weave/patterns` that
+  broke the rule contract made every scan refuse, and the pre-commit prose gate then refused every
+  Markdown commit. The file is now skipped and named, on stderr, as `invalid_rules` in `--json`, and
+  on each commit the prose gate scans; every other rule runs. `wv quality patterns validate` still
+  reports it, and a rule file that cannot be read still fails the scan.
+- **`WV_AUTO_PRUNE=1` prunes.** It ran none of its SQL. It now runs `wv prune`, keeping findings,
+  memories and unaddressed pitfalls.
+- **`wv resolve --winner` and `--merge` write their edges the right way round**, and `wv learnings`
+  and the health and prune readers read `supersedes` from the right end.
+- **`wv memory import` stores a memory's body, with its description as the hook,** keeps one live
+  candidate per source file, and no longer imports Claude's `MEMORY.md` index as a memory.
+- **The Bash duplicate guard allows a corrected retry at once** after another hook refused the first
+  command.
+- **Coaching picks each finding's guide by its own language.**
+
 ## [1.71.0-rc.14] - 2026-10-22
 
 ### Changed
 
-- **Review claim ownership when upgrading.** Commits require an active claim held by the
-  committing actor. A Claude Code terminal with `CLAUDECODE=1` can now resolve to a Claude
-  actor instead of the older `human-<host>-<user>` identity. `wv doctor` reports the current
-  actor and exact active claim IDs and holders belonging to other actors, in text and JSON.
-  The diagnostic is advisory: other actors may legitimately be working. Inspect each claim
-  before explicitly authorizing takeover with `wv work ID --force`; reservations still apply.
-  Doctor never migrates claims, even with `--repair`. Actor ownership is not session isolation.
+- **Review claim ownership when upgrading.** Commits require an active claim held by the committing
+  actor. A Claude Code terminal with `CLAUDECODE=1` can now resolve to a Claude actor instead of the
+  older `human-<host>-<user>` identity. `wv doctor` reports the current actor and exact active claim
+  IDs and holders belonging to other actors, in text and JSON. The diagnostic is advisory: other
+  actors may legitimately be working. Inspect each claim before explicitly authorizing takeover with
+  `wv work ID --force`; reservations still apply. Doctor never migrates claims, even with
+  `--repair`. Actor ownership is not session isolation.
 - **Your gate suites keep running in your checkout.** The commit and push gates can now run a suite
   against a frozen snapshot of the staged tree in a private environment, but only for suites a
   repository names in `.weave/gate-provision.json`. Without that file, every suite your
   `.weave/test-map.conf` routes runs as before, in your checkout, on both gates, and is rerun each
-  time rather than reused. Each gate record in `~/.local/share/weave/gate_runs.jsonl` now carries
-  an `execution_mode` field.
-- **`.weave/gate-provision.json` is reserved for Weave's own repository in this release.**
-  Declared provisioning for other repositories follows measurement against their own gate times.
-  Removing a committed declaration, or a suite from one, requires a retirement record, and `wv`
-  has no command that writes one yet.
+  time rather than reused. Each gate record in `~/.local/share/weave/gate_runs.jsonl` now carries an
+  `execution_mode` field.
+- **`.weave/gate-provision.json` is reserved for Weave's own repository in this release.** Declared
+  provisioning for other repositories follows measurement against their own gate times. Removing a
+  committed declaration, or a suite from one, requires a retirement record, and `wv` has no command
+  that writes one yet.
 
 ### Fixed
 
 - **A commit refused in a linked worktree says what to do.** Each linked worktree has its own Weave
   graph: a claim made in the main checkout does not admit a commit in the worktree. The commit
-  refusal in a worktree now names the main checkout and says to run `wv load` there and claim a
-  node with `wv work <id>` or `wv add "..." --status=active`.
+  refusal in a worktree now names the main checkout and says to run `wv load` there and claim a node
+  with `wv work <id>` or `wv add "..." --status=active`.
 - **Vendored hooks pass your shellcheck.** rc.13's `.claude/hooks/post-edit-lint.sh` assigned a
   variable it never read. A repository whose pre-commit hook runs shellcheck with default rules
   refused any commit staging the file (SC2034). The assignment is removed. After upgrading, run
@@ -537,13 +645,12 @@ release remains frozen; this candidate is distributed from the private source re
   `wv trails save` with no message at all removed the section outright. Growth is bounded by
   `WV_TRAILS_NOTES_CAP` (default 20, oldest dropped first). Notes written before this release are
   preserved and labelled `### (undated,...)` on first append. The section is delimited by an
-  explicit `<!-- /wv-notes -->` marker, so a note whose body contains its own `##`
-  (heading-marker) headings is no longer truncated. The section end is resolved from the
-  _last_ marker in the file and reserved
-  markers appearing in note text are neutralised on write, so a note that itself contains
-  `<!-- /wv-notes -->` cannot truncate the notes above it. Entries are counted for the cap by a
-  generated `<!-- wv-note -->` marker rather than by `###` headings, so a note containing its own
-  subheadings is never split across the cap boundary.
+  explicit `<!-- /wv-notes -->` marker, so a note whose body contains its own `##` (heading-marker)
+  headings is no longer truncated. The section end is resolved from the _last_ marker in the file
+  and reserved markers appearing in note text are neutralised on write, so a note that itself
+  contains `<!-- /wv-notes -->` cannot truncate the notes above it. Entries are counted for the cap
+  by a generated `<!-- wv-note -->` marker rather than by `###` headings, so a note containing its
+  own subheadings is never split across the cap boundary.
 - **`wv trails save` is serialised** — the read-modify-write is held under a per-repository lock
   (`flock`, falling back to a directory lock; wait bounded by `WV_TRAILS_LOCK_WAIT`, default 120s)
   and the file is replaced by atomic rename. Concurrent saves previously each read the same prior
@@ -675,15 +782,14 @@ release remains frozen; this candidate is distributed from the private source re
 - **`wv trails save` durability, properly this time** — the previous fix took the status of a
   redirected compound, which is its LAST command, so an earlier failed write followed by successful
   output still returned 0; and its `^Nodes:` (with its trailing space) integrity check could be
-  satisfied by a crafted note,
-  since notes are written before the generated sections. `set -e` is not a usable remedy here:
-  measured, errexit reads as on inside the subshell, a failing command runs, and execution continues
-  — bash suppresses errexit for the dynamic extent of a command in a condition context and subshells
-  inherit that. The body is now generated once and written once, and three independent conditions
-  are checked: write status, byte-exactness against the generated content, and structural
-  completeness validated only in the region after the last `<!-- /wv-notes -->` marker, which a note
-  cannot write into. Verified against middle-generation failure, final-write failure, and both with
-  forged markers in the note.
+  satisfied by a crafted note, since notes are written before the generated sections. `set -e` is
+  not a usable remedy here: measured, errexit reads as on inside the subshell, a failing command
+  runs, and execution continues — bash suppresses errexit for the dynamic extent of a command in a
+  condition context and subshells inherit that. The body is now generated once and written once, and
+  three independent conditions are checked: write status, byte-exactness against the generated
+  content, and structural completeness validated only in the region after the last
+  `<!-- /wv-notes -->` marker, which a note cannot write into. Verified against middle-generation
+  failure, final-write failure, and both with forged markers in the note.
 
 - **The staged-shell gate lints the staged blob** — it named staged files and let `shellcheck` read
   them from the working tree, so a dirty index behind a clean worktree committed content that was
@@ -894,9 +1000,9 @@ selftest-verified artifact, before publishing.
 ## [1.71.0-dev.4] - 2026-08-11
 
 Private corrective preview for installation on owned machines, folding in an external code review
-round of a consumer repository (dev.3). Seven findings fixed after independent
-validation against current HEAD; two audit claims found already stale or not reproducible were left
-untouched. This version is not a public release.
+round of a consumer repository (dev.3). Seven findings fixed after independent validation against
+current HEAD; two audit claims found already stale or not reproducible were left untouched. This
+version is not a public release.
 
 ### Fixed
 
@@ -1068,8 +1174,9 @@ not grant Rust mutation authority or claim cross-machine causal durability.
   a portable `${env:HOME}` form. Any repo scaffolded or force-updated on one machine shipped a path
   that only resolved there, ENOENT-ing every MCP server spawn on any other machine/user that cloned
   it — traced as the root cause of VS Code extension-host crashes in `weave-runtime` and two other
-  repositories. Now emits `${env:HOME}`-relative paths whenever the resolved path sits under `$HOME`;
-  non-standard installs (`WV_LIB_DIR` override, dev-mode repo-relative paths) are unaffected.
+  repositories. Now emits `${env:HOME}`-relative paths whenever the resolved path sits under
+  `$HOME`; non-standard installs (`WV_LIB_DIR` override, dev-mode repo-relative paths) are
+  unaffected.
 - **MCP server version drift** — `mcp/src/index.ts` hardcoded its reported version as a literal
   string in two places instead of reading `package.json`, so the version reported by
   `weave_bootstrap`/health-check could silently go stale after a release bump (already true for the
@@ -1415,8 +1522,8 @@ not grant Rust mutation authority or claim cross-machine causal durability.
 ### Added
 
 - **Scaffold-sync wiring for the pre-commit test gate** — the two consumer-proven gate improvements
-  (proven in a consumer test-bed) now auto-inherit via `wv init-repo` / scaffolding sync instead
-  of being copy-paste-only templates:
+  (proven in a consumer test-bed) now auto-inherit via `wv init-repo` / scaffolding sync instead of
+  being copy-paste-only templates:
   - `scripts/test-impacted.sh` — a fast, impact-scoped pre-commit test runner is seeded if-absent
     (executable). It runs the test command on ONLY the staged sources' mirror test dirs (nearest
     existing ancestor), falling back to the full suite when nothing resolves. Edit the CONFIG block
@@ -4183,10 +4290,10 @@ Onboarding-audit remediation release (docs/findings/AUDIT-2026-06-11-onboarding.
 
 ### Calibration results
 
-| Repo                  | v1.12.2 | v1.13.0 | Target |
-| --------------------- | ------: | ------: | -----: |
-| consumer repository   |   0/100 |  38/100 |  30-50 |
-| memory-system         | 100/100 |  79/100 |  50-80 |
+| Repo                | v1.12.2 | v1.13.0 | Target |
+| ------------------- | ------: | ------: | -----: |
+| consumer repository |   0/100 |  38/100 |  30-50 |
+| memory-system       | 100/100 |  79/100 |  50-80 |
 
 Cross-validation against radon/mccabe 0.7.0: 5/8 production library functions exact match, 3/8
 within ±2 (BoolOp counting — intentional divergence documented in `docs/CC-METHODOLOGY.md`).

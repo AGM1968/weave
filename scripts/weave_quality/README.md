@@ -209,19 +209,26 @@ wv quality patterns promote --top=N --parent=wv-xxxxxx   # create nodes from top
 ```
 
 Point-in-time findings are stored in `pattern_findings` and retained for 2 scans. Each match also
-receives a stable `qf-...` identity derived from its rule, repository-relative path, normalized
-match, and same-match occurrence ordinal. The source context remains stored for review but is not
-part of identity, so an unrelated edit to the line does not orphan its disposition. Durable finding
-state and append-only human disposition history survive point-in-time replacement and pruning.
-`wv sync` atomically projects those human records to `.weave/quality-adjudications.jsonl`; current
-state for deleted paths is pruned while its append-only history remains, and `wv load` merges live
-state into a fresh hot zone. Ephemeral findings, scan IDs, occurrences, and recurrence counts are
-deliberately excluded and rediscovered from source. `accepted_defect` and `waived` count as
-confirmed findings for reported `decided_precision`, `false_positive` counts against it, and
-`unresolved` remains outside that explicitly named denominator. `actionable_rate` uses the same
-decided denominator but counts only `accepted_defect`, distinguishing an accurate review prompt with
-many legitimate waivers from a finding that usually warrants a change. Scanner output is
-unadjudicated evidence by default, not a defect count.
+receives a stable `qf-...` identity derived from its rule, repository-relative path and normalized
+match. The source context remains stored for review but is not part of identity, so an unrelated
+edit to the line does not orphan its disposition. When the same match occurs more than once in a
+file, each one's identity also includes the words around it within its paragraph and an ordinal
+among matches sharing them: ordinal alone renumbered the later matches when one was repaired, and
+each took its neighbour's disposition (wv-0f8658). Moving or reflowing such a match keeps its
+identity; rewriting the words around it makes it a new finding to adjudicate. When a match becomes
+unique or stops being unique, its identity changes form and the scan carries its disposition over
+from the record with the same rule, path, match and line context; `pattern_finding_rekeys` records
+the move so the projection below is written under the new key. Durable finding state and append-only
+human disposition history survive point-in-time replacement and pruning. `wv sync` atomically
+projects those human records to `.weave/quality-adjudications.jsonl`; current state for deleted
+paths is pruned while its append-only history remains, and `wv load` merges live state into a fresh
+hot zone. Ephemeral findings, scan IDs, occurrences, and recurrence counts are deliberately excluded
+and rediscovered from source. `accepted_defect` and `waived` count as confirmed findings for
+reported `decided_precision`, `false_positive` counts against it, and `unresolved` remains outside
+that explicitly named denominator. `actionable_rate` uses the same decided denominator but counts
+only `accepted_defect`, distinguishing an accurate review prompt with many legitimate waivers from a
+finding that usually warrants a change. Scanner output is unadjudicated evidence by default, not a
+defect count.
 
 ---
 
@@ -522,6 +529,7 @@ pattern_findings -- scan_id, finding_key, rule_id, path, line, col, match_text, 
 pattern_finding_state -- stable identity, latest disposition, first/last scan, scan count
 pattern_finding_occurrences -- unique finding_key + scan_id recurrence ledger
 pattern_finding_disposition_history -- append-only human adjudication events
+pattern_finding_rekeys -- old_key -> new_key for findings whose identity changed form
 ```
 
 Per-function CC is stored in `file_metrics` using EAV pattern:

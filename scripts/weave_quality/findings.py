@@ -598,18 +598,24 @@ def _historical_severity(text: str, score: int) -> str:
 
 
 def _catalogued_violation_types() -> set[str]:
-    """The violation_type values contracts/violation-vocabulary-v1.json admits.
+    """The violation_type values contracts/violation-vocabulary-v1.json admits,
+    with the project: types this repository's detectors declare (wv-60bf88).
 
     Resolved beside the package when installed ($LIB_DIR/contracts), else from
     the repository root, the same order __main__._contracts_dir uses.
     """
+    from .guides import project_types  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+
+    toplevel = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
+                              text=True, check=False).stdout.strip()
+    declared = set(project_types(Path(toplevel))) if toplevel else set()
     here = Path(__file__).resolve()
     for base in (here.parents[1], here.parents[2]):
         catalog = base / "contracts" / "violation-vocabulary-v1.json"
         if catalog.is_file():
             types = json.loads(catalog.read_text(encoding="utf-8")).get("types", {})
-            return set(types) if isinstance(types, dict) else set()
-    return set()
+            return (set(types) if isinstance(types, dict) else set()) | declared
+    return declared
 
 
 def _historical_violation_type(source_kind: str, signal_type: str, text: str) -> str:
@@ -1078,7 +1084,13 @@ def cmd_findings_promote(args: argparse.Namespace) -> int:
     # could not be promoted through the tool at all.
     violation_type = str(getattr(args, "violation_type", "") or "")
     if violation_type:
-        catalogued = _catalogued_violation_types()
+        from .guides import GuideError  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+
+        try:
+            catalogued = _catalogued_violation_types()
+        except GuideError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         if violation_type not in catalogued:
             print(
                 f"Error: --violation-type {violation_type!r} is not catalogued in "

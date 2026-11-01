@@ -94,8 +94,11 @@ gate_pool_require_present() {
 gate_pool_estimates() {
     local hist
     hist=$("$WV" analyze suites --json 2>/dev/null || echo '{}')
-    jq -c --argjson h "$hist" '
-        (($h.suites // []) | map({key: .suite, value: (((.recent_p50_ms // .p50_ms) // 0) / 1000 | floor)}) | from_entries) as $m
+    # One history row per suite, growing with the catalogue: a file, not argv,
+    # where E2BIG would drop every estimate through the fallback (wv-200d36).
+    jq -c --slurpfile h <(printf '%s' "$hist") '
+        $h[0] as $h
+        | (($h.suites // []) | map({key: .suite, value: (((.recent_p50_ms // .p50_ms) // 0) / 1000 | floor)}) | from_entries) as $m
         | map(.last_cost_s = (if ($m[.name] // 0) > 0 then $m[.name] else (.last_cost_s // 0) end))' \
         <<< "$1" 2>/dev/null || printf '%s' "$1"
 }
@@ -431,6 +434,18 @@ gate_pool_suite_mode() {
     jq -r --arg s "$1" '
         if .policy == null then .default_mode
         elif (.policy.suites | has($s)) then "frozen" else "checkout" end' <<< "$_GATE_PROVISION"
+}
+
+# gate_pool_suite_modes <suites-csv> — "suite=mode,..." for the gate record:
+# each selected route's provisioning mode, reused receipts included, so the
+# gate log can count routes still in checkout mode (transition rule 5, S4
+# wv-0ee3f4). Empty before the declaration is read.
+gate_pool_suite_modes() {
+    [ -n "${_GATE_PROVISION:-}" ] && [ -n "$1" ] || return 0
+    jq -r --arg csv "$1" '. as $p | $csv | split(",") | map(select(. != ""))
+        | map(. as $s | $s + "=" + (if $p.policy == null then $p.default_mode
+                         elif ($p.policy.suites | has($s)) then "frozen" else "checkout" end))
+        | join(",")' <<< "$_GATE_PROVISION" 2>/dev/null || true
 }
 
 # run_hook_suites — reads "<idx>\t<suite>\t<cost_s>" lines (idx = selection

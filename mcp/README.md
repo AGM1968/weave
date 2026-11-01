@@ -29,7 +29,7 @@ node mcp/dist/index.js --scope=inspect  # read-only operations only
 
 ## Scope System
 
-The `--scope` flag partitions the 46 available tools into focused subsets. This is designed for **VS
+The `--scope` flag partitions the 48 available tools into focused subsets. This is designed for **VS
 Code's multi-server MCP architecture**, where each Copilot subagent can be given a different server
 with only the tools it needs — reducing context window usage and preventing cross-concern tool
 confusion.
@@ -39,10 +39,10 @@ confusion.
 | Scope       | Tools                                                                                                                                                                                                                                                                                                                                                                                                                          | Purpose                                    |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------ |
 | **graph**   | `weave_add`, `weave_link`, `weave_unlink`, `weave_block`, `weave_unarchive`, `weave_done`, `weave_batch_done`, `weave_list`, `weave_resolve`, `weave_update`, `weave_touch`, `weave_record_edit`, `weave_delete`, `weave_quality_patterns` (14)                                                                                                                                                                                                          | Create/modify/delete nodes and edges       |
-| **session** | `weave_work`, `weave_ready`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_close_session`, `weave_trails`, `weave_breadcrumbs` (deprecated alias), `weave_plan`, `weave_edit_guard` (12)                                                                                                                                                                                           | Workflow lifecycle management              |
-| **lite**    | `weave_overview`, `weave_bootstrap`, `weave_guide`, `weave_edit_guard`, `weave_status`, `weave_work`, `weave_done` (7)                                                                                                                                                                                                                                                                                                         | Minimal task-tracking surface              |
-| **inspect** | `weave_context`, `weave_search`, `weave_query`, `weave_status`, `weave_ready`, `weave_impact`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`, `weave_structural_search`, `weave_quality_patterns`, `weave_findings`, `weave_code_search`, `weave_index` (23) | Read-only observation and query            |
-| **all**     | All 46 tools                                                                                                                                                                                                                                                                                                                                                                                                                   | Full access (default, backward-compatible) |
+| **session** | `weave_work`, `weave_ready`, `weave_ship`, `weave_recover`, `weave_quick`, `weave_overview`, `weave_bootstrap`, `weave_close_session`, `weave_trails`, `weave_breadcrumbs` (deprecated alias), `weave_plan`, `weave_edit_guard`, `weave_memory_recall`, `weave_remember` (14)                                                                                                                                                                                           | Workflow lifecycle management              |
+| **lite**    | `weave_overview`, `weave_bootstrap`, `weave_guide`, `weave_edit_guard`, `weave_status`, `weave_work`, `weave_done`, `weave_memory_recall`, `weave_remember` (9)                                                                                                                                                                                                                                                                                                         | Minimal task-tracking surface              |
+| **inspect** | `weave_context`, `weave_search`, `weave_query`, `weave_status`, `weave_ready`, `weave_impact`, `weave_health`, `weave_preflight`, `weave_bootstrap`, `weave_sync`, `weave_tree`, `weave_learnings`, `weave_guide`, `weave_show`, `weave_quality_scan`, `weave_quality_hotspots`, `weave_quality_diff`, `weave_quality_functions`, `weave_structural_search`, `weave_quality_patterns`, `weave_findings`, `weave_code_search`, `weave_index`, `weave_memory_recall` (24) | Read-only observation and query            |
+| **all**     | All 48 tools                                                                                                                                                                                                                                                                                                                                                                                                                   | Full access (default, backward-compatible) |
 
 ### Scope lifecycle
 
@@ -239,18 +239,18 @@ Optional local additions if you want stricter scope isolation:
   "mcpServers": {
     "weave": {
       "command": "node",
-      "args": ["/path/to/memory-system/mcp/dist/index.js"],
+      "args": ["/path/to/weave/mcp/dist/index.js"],
       "env": {
-        "WV_PATH": "/path/to/memory-system/scripts/wv",
+        "WV_PATH": "/path/to/weave/scripts/wv",
         "WV_PROJECT_ROOT": "/path/to/your/repo",
         "WV_AGENT_ID": "mcp-your-repo"
       }
     },
     "weave-inspect": {
       "command": "node",
-      "args": ["/path/to/memory-system/mcp/dist/index.js", "--scope=inspect"],
+      "args": ["/path/to/weave/mcp/dist/index.js", "--scope=inspect"],
       "env": {
-        "WV_PATH": "/path/to/memory-system/scripts/wv",
+        "WV_PATH": "/path/to/weave/scripts/wv",
         "WV_PROJECT_ROOT": "/path/to/your/repo",
         "WV_AGENT_ID": "mcp-your-repo"
       }
@@ -275,7 +275,7 @@ Optional local additions if you want stricter scope isolation:
 | `weave_resolve`    | Resolve conflicting nodes (winner/merge/defer strategy)                                                                                                                                                                               | `ids`, `strategy`    |
 | `weave_delete`     | Permanently remove a node (requires `force=true`)                                                                                                                                                                                     | `id`, `force`        |
 
-### Session scope — workflow lifecycle (12 tools)
+### Session scope — workflow lifecycle (14 tools)
 
 | Tool                  | Description                                                                                                                                    | Required params |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
@@ -285,13 +285,15 @@ Optional local additions if you want stricter scope isolation:
 | `weave_recover`       | Resume incomplete ship/sync/delete operations                                                                                                  | —               |
 | `weave_quick`         | Quick-add a node and immediately start working on it                                                                                           | `text`          |
 | `weave_overview`      | Status + health + context policy + ready work                                                                                                  | —               |
-| `weave_bootstrap`     | Single-call session snapshot: status + context + ready + learnings                                                                             | —               |
+| `weave_bootstrap`     | Single-call session snapshot: status + context + ready + learnings + memory index                                                                             | —               |
 | `weave_trails`        | Save, show, or clear session trails (append-only handoff notes)                                                                                | —               |
 | `weave_plan`          | Import markdown plan as epic + tasks with GH issues                                                                                            | `file`          |
 | `weave_close_session` | Bounded local sync + repo-status check + unpushed commit/active-node warnings                                                                  | —               |
 | `weave_edit_guard`    | Pre-edit guard: require an active node before edits                                                                                            | —               |
+| `weave_memory_recall` | Active graph memories in full; `weave_bootstrap` carries their one-line index |
+| `weave_remember`      | Capture a durable, cross-agent memory into the graph |
 
-### Inspect scope — read-only queries (23 tools)
+### Inspect scope — read-only queries (24 tools)
 
 | Tool                      | Description                                                             | Required params |
 | ------------------------- | ----------------------------------------------------------------------- | --------------- |
@@ -317,6 +319,7 @@ Optional local additions if you want stricter scope isolation:
 | `weave_structural_search` | Structural code search via ast-grep patterns                            | `pattern`       |
 | `weave_code_search`       | Semantic code search via local index                                    | `query`         |
 | `weave_index`             | Build or update the local code search index                             | —               |
+| `weave_memory_recall`     | Active graph memories in full (read-only) |
 
 `weave_quality_patterns` is published in both `inspect` and `graph`. Its reading subcommands
 (scan, list, validate, report, adjudicate, and canonical promote's dry-run) work in either.

@@ -102,6 +102,7 @@ harness() {
         source '$ROOT/scripts/lib/wv-attempt-journal.sh'
         source '$ROOT/scripts/cmd/wv-cmd-graph.sh'
         source '$ROOT/scripts/cmd/wv-cmd-ops.sh'
+        source '$ROOT/scripts/cmd/wv-cmd-gate.sh'
         source '$ROOT/scripts/cmd/wv-cmd-core.sh'
         if [ \"\$FAIL_RESOLVER\" = 1 ]; then
             _impact_suites_for_files() { echo 'injected resolver failure' >&2; return 1; }

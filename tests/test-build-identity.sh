@@ -107,6 +107,19 @@ fi
 check "the running binary reports its own release tag" \
     "$(cat "$ROOT/scripts/lib/VERSION" | tr -d '[:space:]')" "$(awk '{print $2}' <<<"$real_out")"
 
+# The E5 preflight parses this line into a release token it matches against a
+# declared one; when the build suffix arrived it parsed the whole line and every
+# preflight failed (wv-a9cccf). That suite takes ~12 minutes and no change to
+# scripts/wv or wv-config.sh selects it, so the parse is pinned here (wv-0dfeb6).
+# A checkout's wv reads provenance from $HOME's install, so the fixture HOME
+# carries one: without it the line has no build suffix and the old parse passes.
+mkdir -p "$TEST_DIR/home/.local/lib/weave/lib"
+cp "$TEST_DIR/laptop/lib/INSTALL_PROVENANCE" "$TEST_DIR/home/.local/lib/weave/lib/"
+e5_line=$(HOME="$TEST_DIR/home" "$ROOT/scripts/wv" --version 2>/dev/null)
+check "the fixture install gives the real --version line a build suffix" "yes" \
+    "$(grep -q ' (build v1.71.0-rc.12-72-g9dd266526)$' <<<"$e5_line" && echo yes || echo "no: $e5_line")"
+# The E5 runner does not ship, so neither does this check (wv-43d08d).
+
 # ── doctor and --version resolve the SAME install ─────────────────────────────
 #
 # Two independent resolutions could describe different installs, which is the

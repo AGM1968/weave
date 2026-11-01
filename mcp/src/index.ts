@@ -25,7 +25,9 @@
  *   weave_work     - Claim a node to work on
  *   weave_ship     - Complete + sync in one step; pending Git sync is surfaced separately
  *   weave_overview - Session start overview (status + digest + trails)
- *   weave_bootstrap - Single-call session context (status + context + ready + learnings)
+ *   weave_bootstrap - Single-call session context (status + context + ready + learnings + memory index)
+ *   weave_memory_recall - Active graph memories in full (bootstrap carries their index)
+ *   weave_remember  - Capture a cross-agent memory into the graph
  *   weave_show     - Single-node detail view
  *   weave_touch   - Fire-and-forget metadata write (zero token cost)
  *   weave_delete   - Permanently remove a node (requires force)
@@ -85,6 +87,8 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_breadcrumbs",
     "weave_plan",
     "weave_edit_guard",
+    "weave_memory_recall",
+    "weave_remember",
   ],
   lite: [
     "weave_overview",
@@ -94,6 +98,8 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_status",
     "weave_work",
     "weave_done",
+    "weave_memory_recall",
+    "weave_remember",
   ],
   inspect: [
     "weave_context",
@@ -119,6 +125,7 @@ export const SCOPE_TOOLS: Record<Exclude<Scope, "all">, string[]> = {
     "weave_findings",
     "weave_code_search",
     "weave_index",
+    "weave_memory_recall",
   ],
 };
 
@@ -257,6 +264,17 @@ const STATUS_SCHEMA_VALUES = [
   "blocked-external",
   "in-progress",
   "in_progress",
+] as const;
+// The kinds a command may write: contracts/node-kinds-v1.json command_writable (wv-f7dfd3).
+const NODE_KIND_SCHEMA_VALUES = [
+  "epic",
+  "feature",
+  "task",
+  "finding",
+  "decision",
+  "plan",
+  "memory",
+  "session_history",
 ] as const;
 const READ_MODES = ["bootstrap", "discover", "execute", "full"] as const;
 const LEARNING_CATEGORIES = ["decision", "pattern", "pitfall", "learning"] as const;
@@ -501,7 +519,10 @@ function parsePatternListResult(result: ReturnType<typeof spawnWv>): { rules: un
   return { rules, shadowAdvisories };
 }
 
-function readPatternListScope(patPath: string | undefined, deadline: number): { scope: string | null; scopeError: string | null } {
+function readPatternListScope(
+  patPath: string | undefined,
+  deadline: number
+): { scope: string | null; scopeError: string | null } {
   // scope comes from `report`'s own --json payload, which already computes
   // it from the SAME underlying source (latest_pattern_run's stored
   // target, or an explicit path) as list's own text-mode header — see
@@ -971,6 +992,12 @@ const TOOLS: Tool[] = [
           type: "string",
           description: "Risk level for the work (e.g., 'low', 'medium', 'high').",
         },
+        kind: {
+          type: "string",
+          enum: [...NODE_KIND_SCHEMA_VALUES],
+          description:
+            "Node kind. Omitted, it comes from metadata.type, then the text prefix (epic(, plan( ...), then task. A change type (fix, docs ...) stays in the text prefix.",
+        },
         verification_plan: {
           type: "string",
           description:
@@ -1138,7 +1165,8 @@ const TOOLS: Tool[] = [
   },
   {
     name: "weave_link",
-    description: "Create a semantic edge between two nodes.",
+    description:
+      "Create a semantic edge between two nodes. An edge that breaks its type's invariant is refused (contracts/edge-types-v1.json): implements runs child -> parent, supersedes old -> new, addresses from the newer node, resolves needs a finding at one end, and blocks and implements may not form a cycle.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1161,6 +1189,7 @@ const TOOLS: Tool[] = [
             "references",
             "obsoletes",
             "addresses",
+            "resolves",
           ],
           description: "Edge type",
         },
@@ -1201,6 +1230,7 @@ const TOOLS: Tool[] = [
             "references",
             "obsoletes",
             "addresses",
+            "resolves",
           ],
           description: "Edge type to remove",
         },
@@ -1531,7 +1561,7 @@ const TOOLS: Tool[] = [
   {
     name: "weave_bootstrap",
     description:
-      "Single-call session context for agents. Returns status, active node with full context pack, ready work, and recent learnings in one JSON blob. Use this instead of calling status+list+show+context+ready+learnings separately.",
+      "Single-call session context for agents. Returns status, active node with full context pack, ready work, recent learnings and the graph memory index (one line per active memory; weave_memory_recall gives the full text) in one JSON blob. Use this instead of calling status+list+show+context+ready+learnings separately.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1691,6 +1721,52 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "weave_memory_recall",
+    description:
+      "Recall the graph's active memories in full (id, text, metadata) as JSON. wv bootstrap carries a one-line index of the same set; call this for the full text before relying on a memory. Recall is agent-agnostic: agent is caller provenance only and never filters.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent: {
+          type: "string",
+          description: "Caller label for provenance (default: current); the returned set is the same for every agent",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "weave_remember",
+    description:
+      "Capture a durable, cross-agent memory into the graph (type=memory, mem_status=active). For project knowledge every agent needs, not host-session notes or point-in-time status, which the graph's nodes already hold.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: {
+          type: "string",
+          description: "The memory, written so its first sentence works as its index line",
+        },
+        kind: {
+          type: "string",
+          description: "Memory kind (default: project)",
+        },
+        scope: {
+          type: "string",
+          description: "Memory scope (default: repo)",
+        },
+        source_agent: {
+          type: "string",
+          description: "Override the recorded source agent (default: resolved from the caller)",
+        },
+        supersedes: {
+          type: "string",
+          description: "Id of the active memory this one replaces; the old one is kept as superseded",
+        },
+      },
+      required: ["text"],
+    },
+  },
+  {
     name: "weave_learnings",
     description:
       "Query captured learnings as JSON. Defaults to discover-mode bounded output for agent callers; use recent or mode to widen or narrow the result set explicitly.",
@@ -1763,6 +1839,11 @@ const TOOLS: Tool[] = [
         alias: {
           type: "string",
           description: "Human-readable alias",
+        },
+        kind: {
+          type: "string",
+          enum: [...NODE_KIND_SCHEMA_VALUES],
+          description: "Set the node kind (stored as metadata.node_kind, mirrored to metadata.type)",
         },
         remove_key: {
           type: "string",
@@ -1887,7 +1968,7 @@ const TOOLS: Tool[] = [
         },
         procedure: {
           type: "string",
-          description: "Installed canonical procedure id. Mutually exclusive with topic; returns the procedure body.",
+          description: "Procedure id: the repository's own (.weave/procedures/<id>.md, which replaces a package procedure of the same id) or an installed one. Mutually exclusive with topic; returns the procedure body.",
         },
       },
       required: [],
@@ -1934,6 +2015,11 @@ const TOOLS: Tool[] = [
         id: {
           type: "string",
           description: "Node ID (wv-XXXXXX) or alias",
+        },
+        close_time: {
+          type: "boolean",
+          description:
+            "Add close_time: when a done node last closed, derived from the committed graph history (closed_at, the commit, the window it fell in). Walks git history, so it can take seconds.",
         },
       },
       required: ["id"],
@@ -2330,7 +2416,11 @@ function composeLearning(args: Record<string, unknown>): string | undefined {
   return learning;
 }
 
-function nodeCreationWarnings(gh: boolean | undefined, parent: string | undefined, alias: string | undefined): string[] {
+function nodeCreationWarnings(
+  gh: boolean | undefined,
+  parent: string | undefined,
+  alias: string | undefined
+): string[] {
   // Child nodes need no --gh nudge: only their epic needs a GitHub issue.
   const warnings: string[] = [];
   if (!gh && !parent) warnings.push("WARNING: No --gh flag. Node has no GitHub issue. Use gh=true for traceability.");
@@ -2451,6 +2541,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     const criteria = args.criteria as string | undefined;
     const risks = args.risks as string | undefined;
     const verificationPlan = args.verification_plan as string | undefined;
+    const kind = args.kind as string | undefined;
     const reconstructId = args.id as string | undefined;
     const cmd = ["add", text];
     if (status) cmd.push(`--status=${status}`);
@@ -2462,6 +2553,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     else if (force) cmd.push("--force");
     if (criteria) cmd.push(`--criteria=${criteria}`);
     if (risks) cmd.push(`--risks=${risks}`);
+    if (kind) cmd.push(`--kind=${kind}`);
     if (verificationPlan) cmd.push(`--verification-plan=${verificationPlan}`);
     if (reconstructId) cmd.push(`--id=${reconstructId}`);
     result = wv(cmd);
@@ -3029,6 +3121,27 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     return result;
   },
 
+  weave_memory_recall: (args) => {
+    const agent = args.agent as string | undefined;
+    const cmd = ["memory", "recall", "--json"];
+    if (agent) cmd.push(`--agent=${agent}`);
+    return wv(cmd);
+  },
+
+  weave_remember: (args) => {
+    const text = args.text as string;
+    const kind = args.kind as string | undefined;
+    const scope = args.scope as string | undefined;
+    const sourceAgent = args.source_agent as string | undefined;
+    const supersedes = args.supersedes as string | undefined;
+    const cmd = ["remember", text, "--json"];
+    if (kind) cmd.push(`--kind=${kind}`);
+    if (scope) cmd.push(`--scope=${scope}`);
+    if (sourceAgent) cmd.push(`--source-agent=${sourceAgent}`);
+    if (supersedes) cmd.push(`--supersedes=${supersedes}`);
+    return wv(cmd);
+  },
+
   weave_learnings: (args) => {
     let result: string;
     const grep = args.grep as string | undefined;
@@ -3060,6 +3173,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     const metadata = args.metadata as Record<string, unknown> | undefined;
     const alias = args.alias as string | undefined;
     const removeKey = args.remove_key as string | undefined;
+    const kind = args.kind as string | undefined;
 
     // --remove-key is a standalone operation (returns immediately)
     if (removeKey) {
@@ -3071,6 +3185,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     if (text) cmd.push(`--text=${text}`);
     if (metadata) cmd.push(`--metadata=${JSON.stringify(metadata)}`);
     if (alias) cmd.push(`--alias=${alias}`);
+    if (kind) cmd.push(`--kind=${kind}`);
     result = wv(cmd);
     return result;
   },
@@ -3156,7 +3271,9 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   weave_show: (args) => {
     let result: string;
     const id = args.id as string;
-    result = wv(["show", id, "--json-v2"]);
+    const cmd = ["show", id, "--json-v2"];
+    if (args.close_time === true) cmd.push("--close-time");
+    result = wv(cmd, args.close_time === true ? 120_000 : undefined);
     return result;
   },
 

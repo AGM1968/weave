@@ -1,0 +1,16 @@
+id: listing-glob-fails-open
+language: python
+violation_type: code:swallowed-exception
+message:
+  "pathlib glob()/rglob() (and glob.glob) read a directory they cannot list as one holding nothing: on Python 3.13 a
+  mode-000 directory globs to [] and rglob walks past an unreadable subtree without an error. Where the listing decides
+  what is checked, loaded or hashed, the failure passes silently. Use weave_quality.listing.directory_entries or
+  iter_tree, Path.iterdir(), or os.walk(onerror=...) that raises; disposition the finding where an empty answer is
+  harmless."
+severity: warning
+rule:
+  any:
+    - pattern: $DIR.glob($$$ARGS)
+    - pattern: $DIR.rglob($$$ARGS)
+ignores:
+  - "**/tests/**"

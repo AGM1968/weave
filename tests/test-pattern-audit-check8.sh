@@ -113,6 +113,25 @@ rm -f "$TEST_DIR/scripts/cmd/bad-quality.sh"
 AUDIT_OUT2=$("$WV" pattern-audit 2>&1 | grep 'Check 8' || true)
 assert_contains "$AUDIT_OUT2" "Check 8 PASS" "Check 8 passes when only blessed helpers remain"
 
+echo "--- Check 8: a name() ( ... ) function owns its own probes (wv-b80a86) ---"
+# Before, a subshell-body definition was not recognised, so its probe was
+# charged to the function above it; above a blessed helper that passed.
+cat > "$TEST_DIR/scripts/cmd/subshell-quality.sh" <<'EOF'
+#!/bin/bash
+
+_preflight_policy_readiness() {
+    sqlite3 "$WV_HOT_ZONE/quality.db" "SELECT id FROM scan_meta LIMIT 1;"
+}
+
+rogue_probe() (
+    sqlite3 "$WV_HOT_ZONE/quality.db" "SELECT id FROM quality_scans LIMIT 1;"
+)
+EOF
+AUDIT_SUB=$("$WV" pattern-audit 2>&1 | grep -A6 'Check 8' || true)
+assert_contains "$AUDIT_SUB" "Check 8 FAIL" "a probe in a subshell-body function below a blessed helper is flagged"
+assert_contains "$AUDIT_SUB" ":rogue_probe:" "and charged to that function, not the blessed one above it"
+rm -f "$TEST_DIR/scripts/cmd/subshell-quality.sh"
+
 echo "--- Check 8: missing scripts dir warns, does not fail ---"
 rm -rf "$TEST_DIR/scripts"
 AUDIT_OUT3=$("$WV" pattern-audit 2>&1 | grep 'Check 8' || true)

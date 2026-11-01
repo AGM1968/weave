@@ -119,6 +119,45 @@ def load_classify_overrides(repo: str) -> dict[str, list[str]]:
     return overrides
 
 
+def load_score_baseline(repo: str) -> tuple[int, str, str] | None:
+    """Read the [baseline] section of .weave/quality.conf.
+
+    The accepted quality score while thresholds await recalibration, with the
+    node that ruled it and why (wv-0f2438). A bare score read as a regression
+    to agents and humans alike. Example::
+
+        [baseline]
+        score = 0
+        ruling = wv-4c1279
+        reason = R2 promoted scripts/cmd and scripts/lib to production
+
+    Returns ``(score, ruling, reason)``, or None when the file or section is
+    absent or ``score`` is not an integer 0-100.
+    """
+    conf = Path(repo) / ".weave" / "quality.conf"
+    if not conf.exists():
+        return None
+
+    values: dict[str, str] = {}
+    in_section = False
+    for raw_line in conf.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            in_section = line.lower() == "[baseline]"
+            continue
+        if not in_section or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip().lower()] = value.partition("#")[0].strip()
+
+    score = values.get("score", "")
+    if not score.isdigit() or int(score) > 100:
+        return None
+    return int(score), values.get("ruling", ""), values.get("reason", "")
+
+
 def _match_override(rel_path: str, prefixes: list[str]) -> bool:
     """Return True if rel_path matches any of the given prefix strings.
 

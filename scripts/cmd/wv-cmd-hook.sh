@@ -44,7 +44,7 @@ _hook_input_paths() { _ptu_input_paths "$@"; }
 # json: the decision JSON, with the guard's own message as the reason.
 _hook_pre_tool_use() {
     local input="$1" format="$2" guard notes err out rc reason active_id
-    local decided="" err_all="" faulted=false
+    local decided="" err_all="" faulted=false ctx ctx_all=""
     notes=$(mktemp -t wv-ptu-notes-XXXXXX)
     err=$(mktemp -t wv-ptu-err-XXXXXX)
     for guard in edit claim close dedup; do
@@ -60,6 +60,14 @@ _hook_pre_tool_use() {
         fi
         [ "$rc" -eq 0 ] || faulted=true
         err_all="${err_all}$(cat "$err")"
+        # A guard that does not decide may still advise, as the claim preflight
+        # does for missing risks (wv-6e4798); dropping its output here lost the
+        # advice for every host that reaches the guards through dispatch.
+        if [ -n "$out" ]; then
+            ctx=$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext // empty' 2>/dev/null) || ctx=""
+            [ -z "$ctx" ] || ctx_all="${ctx_all:+$ctx_all
+}$ctx"
+        fi
     done
     active_id=$(awk -F'\t' '$1 == "active_node" && $2 != "" { v = $2 } END { print v }' "$notes")
     rm -f "$notes"
@@ -73,6 +81,8 @@ _hook_pre_tool_use() {
         fi
         rm -f "$err"
         [ -z "$err_all" ] || printf '%s\n' "$err_all" >&2
+        [ -z "$ctx_all" ] || jq -n --arg ctx "$ctx_all" \
+            '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $ctx}}'
         return 0
     fi
 
@@ -90,7 +100,12 @@ _hook_pre_tool_use() {
     if [ "$faulted" = true ]; then
         # A guard that failed without deciding: the hook it replaced exited
         # nonzero, which neither host reads as a block.
-        _hook_decision_json hook_error PreToolUse "$(printf '%s' "$err_all" | sed -e 's/[[:space:]]*$//')" "$active_id"
+        _hook_decision_json hook_error PreToolUse "$(printf '%s' "$err_all" | sed -e 's/[[:space:]]*$//')" "$active_id" \
+            | jq -c --arg ctx "$ctx_all" 'if $ctx == "" then . else . + {context: $ctx} end'
+        return 0
+    fi
+    if [ -n "$ctx_all" ]; then
+        _hook_decision_json allow PreToolUse "" "$active_id" | jq -c --arg ctx "$ctx_all" '. + {context: $ctx}'
         return 0
     fi
     _hook_decision_json allow PreToolUse "" "$active_id"

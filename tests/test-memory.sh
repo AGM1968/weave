@@ -265,11 +265,14 @@ test_remember_recall_ready_and_render() {
     local all_render_json all_render_count
     all_render_json=$("$WV" memory render --agent=all --base-dir="$TEST_DIR" --json)
     all_render_count=$(printf '%s' "$all_render_json" | jq '.paths | length')
-    assert_equals "5" "$all_render_count" "render all writes five repo-local projections"
+    assert_equals "3" "$all_render_count" "render all writes the loaded projections (CLAUDE.md, weave.json, copilot; AGENTS.md is marker-gated)"
     assert_equals "universal" "$(cat "$TEST_DIR/AGENTS.md")" "render all does not touch AGENTS.md"
     assert_contains "$(cat "$TEST_DIR/CLAUDE.md")" "verified:" "CLAUDE projection includes verified_at"
-    assert_contains "$(cat "$TEST_DIR/.claude/MEMORY.md")" "$memory_id" "Claude MEMORY projection includes source node id"
-    assert_contains "$(cat "$TEST_DIR/.codex/MEMORY.md")" "$memory_id" "Codex MEMORY projection includes source node id"
+    # wv-91f0ca: no harness loads these two, so render all no longer writes them.
+    assert_equals "absent absent" "$([ -e "$TEST_DIR/.claude/MEMORY.md" ] && echo present || echo absent) $([ -e "$TEST_DIR/.codex/MEMORY.md" ] && echo present || echo absent)" "render all writes no .claude/MEMORY.md or .codex/MEMORY.md"
+    "$WV" memory render --agent=claude-memory --base-dir="$TEST_DIR" --json >/dev/null
+    assert_contains "$(cat "$TEST_DIR/.claude/MEMORY.md")" "$memory_id" "an explicit claude-memory render still writes it"
+    rm -f "$TEST_DIR/.claude/MEMORY.md"
     assert_contains "$(cat "$TEST_DIR/.github/copilot-instructions.md")" "$memory_id" "Copilot projection includes source node id"
     assert_equals "weave-graph" "$(jq -r '.memory.authority' "$TEST_DIR/.codex/weave.json")" "Codex contract projection marks graph authority"
     assert_equals "$memory_id" "$(jq -r --arg id "$memory_id" '.memory.entries[] | select(.id == $id) | .id' "$TEST_DIR/.codex/weave.json")" "Codex contract entries include source node id"
@@ -376,6 +379,30 @@ test_memory_scan_and_import() {
     assert_equals "1" "$(printf '%s' "$claude_reimport" | jq -r '.skipped')" "Claude re-import reports skipped count"
     assert_equals "$claude_candidates_before" "$claude_candidates_after" "Claude re-import does not duplicate candidate nodes"
 
+    # wv-99990b: Claude's MEMORY.md index is not a memory, and an edited file
+    # leaves one live candidate, not the old import beside the new one.
+    local index_import edited_import first_file new_id old_status
+    printf '%s\n' '- [Note](note.md) — an index line' > "$claude_memory_dir/MEMORY.md"
+    index_import=$(HOME="$fake_home" "$WV" memory import --source=claude --path="$claude_memory_dir" --repo-root="$TEST_DIR" --json)
+    assert_equals "0 1" "$(jq -r '"\(.count) \(.skipped_index)"' <<< "$index_import")" "Claude import skips the MEMORY.md index"
+    assert_equals "0" "$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata,'\$.source_path') LIKE '%/MEMORY.md';")" "no candidate is made of the index"
+    assert_equals "memory_index" "$(HOME="$fake_home" "$WV" memory scan --source=claude --repo-root="$TEST_DIR" --json | jq -r '[.[] | select(.source_path | endswith("/MEMORY.md"))][0].source_kind')" "scan labels the index apart from memory files"
+    first_file=$(printf '%s' "$import_json" | jq -r '.imported[0].source_path')
+    printf '\nEdited after the first import.\n' >> "$first_file"
+    edited_import=$(HOME="$fake_home" "$WV" memory import --source=claude --path="$claude_memory_dir" --repo-root="$TEST_DIR" --json)
+    new_id=$(jq -r '.imported[0].id' <<< "$edited_import")
+    old_status=$("$WV" show "$imported_id" --json-v2 | jq -r '.[0].metadata | "\(.mem_status) \(.superseded_by)"')
+    assert_equals "1" "$(jq -r '.count' <<< "$edited_import")" "an edited file is imported again"
+    assert_equals "superseded $new_id" "$old_status" "the earlier candidate is superseded by the new import"
+    assert_equals "1" "$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata,'\$.source_path')='$first_file' AND json_extract(metadata,'\$.mem_status')='candidate';")" "one live candidate per source file"
+    # An active memory from the same file is named for review, not superseded.
+    sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(metadata,'\$.mem_status','active') WHERE id='$new_id';"
+    printf '\nEdited a second time.\n' >> "$first_file"
+    edited_import=$(HOME="$fake_home" "$WV" memory import --source=claude --path="$claude_memory_dir" --repo-root="$TEST_DIR" --json)
+    assert_equals "active [\"$new_id\"]" "$("$WV" show "$new_id" --json-v2 | jq -r '.[0].metadata.mem_status') $("$WV" show "$(jq -r '.imported[0].id' <<< "$edited_import")" --json-v2 | jq -c '.[0].metadata.revises')" "a changed source names the active memory it revises and leaves it active"
+    sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(metadata,'\$.mem_status','superseded') WHERE id='$new_id';"
+    rm -f "$claude_memory_dir/MEMORY.md"
+
     local codex_import_json codex_id codex_show recall_after_codex ready_after_codex
     codex_import_json=$(HOME="$fake_home" "$WV" memory import --source=codex --repo-root="$TEST_DIR" --json)
     codex_id=$(printf '%s' "$codex_import_json" | jq -r '.imported[0].id')
@@ -404,6 +431,14 @@ test_memory_scan_and_import() {
     assert_equals "0" "$(printf '%s' "$codex_reimport" | jq -r '.count')" "Codex re-import is idempotent (no new candidates)"
     assert_equals "1" "$(printf '%s' "$codex_reimport" | jq -r '.skipped')" "Codex re-import reports skipped count"
     assert_equals "$codex_candidates_before" "$codex_candidates_after" "Codex re-import does not duplicate candidate nodes"
+
+    # wv-99990b: Codex rewrote the thread's output; one live candidate per thread.
+    local codex_edited codex_new
+    sqlite3 "$fake_home/.codex/memories_1.sqlite" "UPDATE stage1_outputs SET output='codex extracted memory candidate, revised' WHERE thread_id='t1';"
+    codex_edited=$(HOME="$fake_home" "$WV" memory import --source=codex --repo-root="$TEST_DIR" --json)
+    codex_new=$(jq -r '.imported[0].id' <<< "$codex_edited")
+    assert_equals "superseded $codex_new" "$("$WV" show "$codex_id" --json-v2 | jq -r '.[0].metadata | "\(.mem_status) \(.superseded_by)"')" "a revised Codex output supersedes the thread's earlier candidate"
+    assert_equals "1" "$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata,'\$.source_agent')='codex' AND json_extract(metadata,'\$.mem_status')='candidate';")" "one live Codex candidate per thread"
 }
 
 test_memory_crystallize() {
@@ -478,6 +513,12 @@ test_memory_crystallize() {
     assert_equals "1" "$(sqlite3 "$WV_DB" "SELECT count(*) FROM edges WHERE source='$contra_id' AND type='contradicts';")" "apply creates a contradicts edge"
     # wv-031d08: edge context is JSON for every writer (E5 applies json() to it)
     assert_equals "0" "$(sqlite3 "$WV_DB" "SELECT count(*) FROM edges WHERE context IS NOT NULL AND context != '' AND json_valid(context) = 0;")" "crystallize edges carry JSON context"
+    # wv-b3d2b6: a second run files no second finding, and closing the finding
+    # resolves the pair so the candidate is no longer held back.
+    "$WV" memory crystallize --apply-reviewed --repo-root="$TEST_DIR" --json >/dev/null 2>&1 || true
+    assert_equals "1" "$(sqlite3 "$WV_DB" "SELECT count(*) FROM nodes WHERE json_extract(metadata,'\$.finding.violation_type')='memory_contradiction';")" "a repeat run files no duplicate contradiction finding"
+    sqlite3 "$WV_DB" "UPDATE nodes SET status='done' WHERE json_extract(metadata,'\$.finding.violation_type')='memory_contradiction';"
+    assert_equals "overlap" "$("$WV" memory crystallize --dry-run --repo-root="$TEST_DIR" --json 2>/dev/null | jq -r --arg id "$contra_id" '.results[]|select(.id==$id)|.action')" "a closed finding resolves the pair"
 
     # Promoted memory now surfaces in active recall; stale/superseded do not.
     local recall
@@ -507,6 +548,42 @@ test_memory_doctor_authority() {
     HOME="$fake_home" "$WV" memory import --source=claude --path="$memdir" --repo-root="$TEST_DIR" --json >/dev/null 2>&1
     after=$(HOME="$fake_home" "$WV" doctor 2>&1 | grep -i "memory authority" || true)
     assert_contains "$after" "all represented in graph" "doctor passes once the memory file is imported"
+}
+
+test_memory_doctor_authority_policy() {
+    echo ""
+    echo "Test: doctor honours a recorded memory-authority choice (wv-27131a)"
+    echo "==================================================================="
+
+    setup_test_env
+
+    local fake_home slug memdir out
+    fake_home="$TEST_DIR/dh-home-policy"
+    slug=$(printf '%s' "$TEST_DIR" | tr '/' '-')
+    memdir="$fake_home/.claude/projects/$slug/memory"
+    mkdir -p "$memdir"
+    printf '%s\n' "# Memory" "A field note this repository keeps in Claude memory." > "$memdir/note.md"
+
+    # The import advice names the alternative, so the choice is discoverable.
+    out=$(HOME="$fake_home" "$WV" doctor 2>&1 | grep -i "memory authority" || true)
+    assert_contains "$out" ".weave/policy.conf [memory]" "the import advice names the recorded-choice alternative"
+
+    printf '[memory]\n# kept by choice\noutside_graph = claude\nreason = field notes stay in Claude memory\n' > .weave/policy.conf
+    out=$(HOME="$fake_home" "$WV" doctor --json 2>/dev/null | jq -r '.checks[] | select(.check == "memory authority") | .status + " " + .detail')
+    assert_contains "$out" "pass Claude memory kept outside the graph by choice (.weave/policy.conf): field notes stay in Claude memory" \
+        "a recorded choice passes and reports its reason"
+    assert_not_contains "$out" "dual authority risk" "a recorded choice silences the import advice"
+
+    printf '[memory]\noutside_graph = claude\n' > .weave/policy.conf
+    out=$(HOME="$fake_home" "$WV" doctor --json 2>/dev/null | jq -r '.checks[] | select(.check == "memory authority") | .status + " " + .detail')
+    assert_contains "$out" "warn" "a choice without a reason does not pass"
+    assert_contains "$out" "records no choice without a reason" "doctor asks for the reason"
+    assert_contains "$out" "dual authority risk" "without a reason the import advice stands"
+
+    printf '[memory]\noutside_graph = claude, copilot\nreason = r\n' > .weave/policy.conf
+    out=$(HOME="$fake_home" "$WV" doctor --json 2>/dev/null | jq -r '.checks[] | select(.check == "memory authority") | .status + " " + .detail')
+    assert_contains "$out" "warn" "an unknown harness name warns"
+    assert_contains "$out" "outside_graph names 'copilot'" "doctor names the unknown harness"
 }
 
 test_memory_doctor_authority_codex() {
@@ -593,7 +670,9 @@ test_memory_render_current_unknown_fallback() {
     rc=$?
     assert_equals "0" "$rc" "render --agent=current with an unknown operating-agent label succeeds"
     count=$(printf '%s' "$out" | jq '.paths | length')
-    assert_equals "5" "$count" "unknown current renders the full projection set"
+    # wv-91f0ca: the agnostic set is CLAUDE.md, weave.json, copilot and the
+    # marker-gated AGENTS.md (skipped here, no block).
+    assert_equals "3" "$count" "unknown current renders the full projection set"
 
     # A known operating agent still renders only its own surface.
     local claude_paths
@@ -658,6 +737,7 @@ test_remember_recall_ready_and_render
 test_memory_scan_and_import
 test_memory_crystallize
 test_memory_doctor_authority
+test_memory_doctor_authority_policy
 test_memory_doctor_authority_codex
 test_memory_recall_agent_observable
 test_memory_render_current_unknown_fallback
@@ -729,7 +809,7 @@ test_memory_supersede() {
     assert_equals "1" "$("$WV" remember "second successor" --supersedes="$old" >/dev/null 2>&1; echo $?)" \
         "a superseded memory cannot be superseded again (one live head per chain)"
     local task
-    task=$("$WV" add "not a memory" --standalone --force 2>&1 | grep -oE 'wv-[0-9a-f]{6}' | tail -1)
+    task=$("$WV" add "not a memory" --standalone --force 2>&1 | sed -nE 's/^✓ (wv-[0-9a-f]{6}): .*/\1/p')
     assert_equals "1" "$("$WV" remember "x" --supersedes="$task" >/dev/null 2>&1; echo $?)" \
         "a non-memory node cannot be superseded"
     assert_equals "1" "$("$WV" remember "x" --supersedes=not-an-id >/dev/null 2>&1; echo $?)" \
@@ -767,7 +847,265 @@ test_memory_agents_projection_marker_gated() {
     assert_contains "$(cat "$TEST_DIR/AGENTS.md")" "hand text below" "hand text after the block is kept"
 }
 
+test_memory_render_index() {
+    echo ""
+    echo "Test: projections carry an index, not full bodies (wv-91f0ca)"
+    echo "============================================================="
+    setup_test_env
+    local long hooked full long_id hooked_id full_id block json
+    long="First sentence of a long memory, e.g. with an abbreviation. SECOND-SENTENCE-BODY must stay out of the projection."
+    long_id=$("$WV" remember "$long" --source-agent=test --json | jq -r '.id')
+    hooked_id=$("$WV" remember "HOOKED-BODY text the hook replaces. More." --source-agent=test --json | jq -r '.id')
+    "$WV" update "$hooked_id" --metadata='{"hook":"The author-written hook"}' >/dev/null 2>&1
+    full="A rule kept resident in full. FULL-SECOND-SENTENCE stays visible."
+    full_id=$("$WV" remember "$full" --source-agent=test --json | jq -r '.id')
+    "$WV" update "$full_id" --metadata='{"resident":"full"}' >/dev/null 2>&1
+    printf '# Claude\n' > "$TEST_DIR/CLAUDE.md"
+    "$WV" memory render --agent=all --base-dir="$TEST_DIR" --json >/dev/null 2>&1 || true
+    block=$(sed -n '/BEGIN WEAVE:MEMORY/,/END WEAVE:MEMORY/p' "$TEST_DIR/CLAUDE.md")
+    assert_contains "$block" "- [\`$long_id\`] First sentence of a long memory, e.g. with an abbreviation. (verified:" "the index line is the first sentence, past an abbreviation"
+    assert_equals "0" "$(grep -c 'SECOND-SENTENCE-BODY' <<< "$block" || true)" "the rest of the body stays out of the projection"
+    assert_contains "$block" "- [\`$hooked_id\`] The author-written hook (verified:" "metadata.hook replaces the derived line"
+    assert_equals "0" "$(grep -c 'HOOKED-BODY' <<< "$block" || true)" "a hooked memory shows none of its body"
+    assert_contains "$block" "FULL-SECOND-SENTENCE stays visible" "resident=full keeps the whole text"
+    assert_contains "$block" "Read a memory in full with" "the block says where the full text is"
+    json=$(jq -c --arg id "$long_id" '.memory.entries[] | select(.id == $id) | {text, index}' "$TEST_DIR/.codex/weave.json")
+    assert_equals '{"text":"First sentence of a long memory, e.g. with an abbreviation.","index":true}' "$json" "weave.json carries the same index entry"
+    assert_equals "$long" "$("$WV" memory recall --agent=all --json | jq -r --arg id "$long_id" '.[] | select(.id == $id) | .text')" "recall still returns the full text"
+    # wv-bff31b: bootstrap carries the same index on the agnostic path.
+    local boot
+    boot=$("$WV" bootstrap --json 2>/dev/null | jq -c '.memory')
+    assert_equals "3 wv memory recall --agent=all --json" "$(jq -r '"\(.count) \(.recall)"' <<< "$boot")" "bootstrap reports the active memory count and the recall command"
+    assert_equals '{"text":"First sentence of a long memory, e.g. with an abbreviation.","full":false}' "$(jq -c --arg id "$long_id" '.entries[] | select(.id == $id) | {text, full}' <<< "$boot")" "bootstrap carries the index line, not the body"
+    assert_equals "true" "$(jq -r --arg id "$full_id" '.entries[] | select(.id == $id) | .full' <<< "$boot")" "bootstrap marks a resident=full memory"
+}
+
+test_memory_review() {
+    echo ""
+    echo "Test: memory review verdicts (wv-de2e83)"
+    echo "========================================"
+    setup_test_env
+    local target mem_dir p m r v u out rc
+    target=$("$WV" remember "deployment rule kept as the merge target" --source-agent=test --json 2>/dev/null | jq -r '.id')
+    mem_dir="$TEST_DIR/review-mem"
+    mkdir -p "$mem_dir"
+    for f in promote merge reject verify unreviewed; do
+        printf '# t\n\nCandidate destined for %s review.\n' "$f" > "$mem_dir/$f.md"
+    done
+    "$WV" memory import --source=claude --path="$mem_dir" --repo-root="$TEST_DIR" --json >/dev/null 2>&1 || true
+    _rid() { sqlite3 "$WV_DB" "SELECT id FROM nodes WHERE json_extract(metadata,'\$.source_path') LIKE '%review-mem/$1.md';"; }
+    _rmeta() { "$WV" show "$1" --json-v2 2>/dev/null | jq -c ".[0].metadata | $2" 2>/dev/null || true; }
+    p=$(_rid promote); m=$(_rid merge); r=$(_rid reject); v=$(_rid verify); u=$(_rid unreviewed)
+
+    # Refusals: each leaves the candidate untouched.
+    for args in "$p --verdict=promote" "$p --verdict=keep --reason=x" "$m --verdict=merge --reason=x" \
+        "$m --verdict=merge --reason=x --target=$p" "$p --verdict=promote --reason=x --target=$target" \
+        "$target --verdict=reject --reason=x"; do
+        rc=0
+        # shellcheck disable=SC2086  # deliberate word splitting of the argument set
+        "$WV" memory review $args >/dev/null 2>&1 || rc=$?
+        assert_equals "refused" "$([ "$rc" -ne 0 ] && echo refused || echo accepted)" "review refuses: $args"
+    done
+    assert_equals "null" "$(_rmeta "$p" .review)" "a refused review records nothing"
+
+    # Recording a verdict never sets reviewed, so crystallize cannot promote early.
+    "$WV" memory review "$p" --verdict=promote --reason="durable rule" >/dev/null 2>&1 || true
+    "$WV" memory review "$m" --verdict=merge --reason="same subject" --target="$target" >/dev/null 2>&1 || true
+    "$WV" memory review "$r" --verdict=merge --reason="first thought" --target="$target" >/dev/null 2>&1 || true
+    "$WV" memory review "$r" --verdict=reject --reason="point-in-time status" >/dev/null 2>&1 || true
+    "$WV" memory review "$v" --verdict=verify --reason="claim unchecked" >/dev/null 2>&1 || true
+    assert_equals '{"verdict":"merge","target":"'"$target"'","applied":false}' "$(_rmeta "$m" '{verdict: .review.verdict, target: .review.target, applied: .review.applied}')" "a merge verdict records its target, unapplied"
+    assert_equals "null" "$(_rmeta "$r" .review.target)" "a changed verdict drops the old target"
+    assert_equals "0" "$("$WV" memory crystallize --dry-run --json | jq '[.results[] | select(.reviewed)] | length')" "recorded verdicts mark nothing reviewed"
+
+    # A dry run reports and writes nothing.
+    out=$("$WV" memory review --apply --dry-run --json 2>/dev/null) || true
+    assert_equals "4 dry-run" "$(jq -r '"\(.results | length) \(.mode)"' <<< "$out")" "dry run lists the four recorded verdicts"
+    assert_equals '"candidate"' "$(_rmeta "$r" .mem_status)" "dry run leaves the reject a candidate"
+
+    out=$("$WV" memory review --apply --json 2>/dev/null) || true
+    assert_equals "3 1 0" "$(jq -r '"\(.applied) \(.pending) \(.refused)"' <<< "$out")" "apply: three applied, verify pending"
+    assert_equals '{"s":"candidate","rv":true,"a":true}' "$(_rmeta "$p" '{s: .mem_status, rv: .reviewed, a: .review.applied}')" "promote: reviewed and applied, still a candidate"
+    assert_equals '{"s":"superseded","by":"'"$target"'"}' "$(_rmeta "$m" '{s: .mem_status, by: .superseded_by}')" "merge: superseded onto its target"
+    assert_equals '["'"$m"'"]' "$(_rmeta "$target" .merge_from)" "merge: the target lists the candidate for amendment"
+    assert_equals '{"s":"rejected","why":"point-in-time status"}' "$(_rmeta "$r" '{s: .mem_status, why: .rejected_reason}')" "reject: retired with its reason"
+    assert_equals "0" "$("$WV" memory recall --agent=all --json | jq --arg r "$r" '[.[] | select(.id == $r)] | length')" "a rejected candidate is not recalled"
+    assert_equals '{"s":"candidate","a":false}' "$(_rmeta "$v" '{s: .mem_status, a: .review.applied}')" "verify: still a candidate, unapplied"
+    assert_equals '{"s":"candidate","rv":null}' "$(_rmeta "$u" '{s: .mem_status, rv: .review}')" "an unreviewed candidate is untouched"
+
+    # Applying again changes nothing; an applied verdict cannot be re-recorded.
+    out=$("$WV" memory review --apply --json 2>/dev/null) || true
+    assert_equals "0 1" "$(jq -r '"\(.applied) \(.pending)"' <<< "$out")" "re-apply is idempotent"
+    rc=0; "$WV" memory review "$p" --verdict=reject --reason=x >/dev/null 2>&1 || rc=$?
+    assert_equals "refused" "$([ "$rc" -ne 0 ] && echo refused || echo accepted)" "an applied verdict cannot be re-recorded"
+
+    # End to end: crystallize promotes the reviewed candidate after its own checks.
+    "$WV" memory crystallize --apply-reviewed --json >/dev/null 2>&1 || true
+    assert_equals '"active"' "$(_rmeta "$p" .mem_status)" "crystallize --apply-reviewed promotes the reviewed candidate"
+    unset -f _rid _rmeta
+}
+
+test_memory_graduate() {
+    echo ""
+    echo "Test: graduate verdict moves a lesson out of the projections (wv-a8f91e)"
+    echo "========================================================================"
+    setup_test_env
+    local cfg g d e k c out rc args block
+    # The procedure contract is checked by the gen-procedures.sh in
+    # WV_CONFIG_DIR: give it this checkout's copy, never the installed one.
+    cfg="$TEST_DIR/cfg"
+    mkdir -p "$cfg" .weave/procedures .weave/patterns docs
+    cp "$PROJECT_ROOT/scripts/gen-procedures.sh" "$cfg/"
+    chmod +x "$cfg/gen-procedures.sh"
+    _gw() { WV_CONFIG_DIR="$cfg" "$WV" "$@"; }
+    _gmeta() { "$WV" show "$1" --json-v2 2>/dev/null | jq -c ".[0].metadata | $2" 2>/dev/null || true; }
+    g=$("$WV" remember "House lesson now carried by a procedure" --source-agent=test --json | jq -r '.id')
+    d=$("$WV" remember "House lesson now carried by a repo doc" --source-agent=test --json | jq -r '.id')
+    e=$("$WV" remember "House lesson whose detector breaks before apply" --source-agent=test --json | jq -r '.id')
+    k=$("$WV" remember "Lesson that stays a memory" --source-agent=test --json | jq -r '.id')
+    c=$("$WV" remember "Lesson still under review" --source-agent=test --json | jq -r '.id')
+    sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(metadata,'\$.mem_status','candidate') WHERE id='$c';"
+    printf '%s\n' '---' 'id: house' 'description: house procedure' 'fallback: "wv guide --procedure=house"' \
+        'adapters: [claude]' 'visibility: local' 'claude_skill: house' '---' '# House' > .weave/procedures/house.md
+    printf '%s\n' 'id: rule' 'language: bash' 'severity: warning' 'message: m' 'rule:' '  pattern: rm -rf $X' > .weave/patterns/rule.yaml
+    printf '%s\n' 'id: other' 'language: bash' 'rule:' '  pattern: x' > .weave/patterns/broken.yaml
+    printf '# Lessons\n' > docs/lessons.md
+    printf '#!/bin/sh\n' > tool.sh
+    printf 'outside\n' > "$SCRATCH/outside.md"
+    ln -s "$SCRATCH/outside.md" docs/escape.md
+    printf 'untracked\n' > docs/untracked.md
+    git add docs/lessons.md docs/escape.md tool.sh
+
+    for args in "$g --verdict=graduate --reason=x" \
+        "$g --verdict=graduate --reason=x --target=$SCRATCH/outside.md" \
+        "$g --verdict=graduate --reason=x --target=../outside.md" \
+        "$g --verdict=graduate --reason=x --target=docs/escape.md" \
+        "$g --verdict=graduate --reason=x --target=docs/untracked.md" \
+        "$g --verdict=graduate --reason=x --target=tool.sh" \
+        "$g --verdict=graduate --reason=x --target=.weave/patterns/broken.yaml" \
+        "$g --verdict=graduate --reason=x --target=.weave/procedures/missing.md" \
+        "$c --verdict=graduate --reason=x --target=docs/lessons.md" \
+        "$g --verdict=reject --reason=x"; do
+        rc=0
+        # shellcheck disable=SC2086  # deliberate word splitting of the argument set
+        _gw memory review $args >/dev/null 2>&1 || rc=$?
+        assert_equals "refused" "$([ "$rc" -ne 0 ] && echo refused || echo accepted)" "graduate refuses: ${args#* }"
+    done
+    assert_equals "null" "$(_gmeta "$g" .review)" "a refused graduate records nothing"
+
+    _gw memory review "$g" --verdict=graduate --reason="the procedure carries it" --target=.weave/procedures/house.md >/dev/null 2>&1 || true
+    _gw memory review "$d" --verdict=graduate --reason="the doc carries it" --target=./docs/../docs/lessons.md >/dev/null 2>&1 || true
+    _gw memory review "$e" --verdict=graduate --reason="the detector carries it" --target=.weave/patterns/rule.yaml >/dev/null 2>&1 || true
+    assert_equals '{"s":"active","v":"graduate","t":"docs/lessons.md","a":false}' \
+        "$(_gmeta "$d" '{s: .mem_status, v: .review.verdict, t: .review.target, a: .review.applied}')" \
+        "a graduate verdict records the canonical target and leaves the memory active"
+
+    # The target is checked again when the verdict is applied.
+    printf '%s\n' 'id: renamed' 'language: bash' 'rule:' '  pattern: x' > .weave/patterns/rule.yaml
+    out=$(_gw memory review --apply --json 2>/dev/null) || true
+    assert_equals "2 0 1" "$(jq -r '"\(.applied) \(.pending) \(.refused)"' <<< "$out")" "apply: two graduated, one refused"
+    assert_contains "$(jq -r --arg e "$e" '.results[] | select(.id == $e) | .status' <<< "$out")" "refused:" "a target that stopped parsing is refused at apply"
+    assert_equals '{"s":"graduated","to":".weave/procedures/house.md","a":true}' \
+        "$(_gmeta "$g" '{s: .mem_status, to: .graduated_to, a: .review.applied}')" "graduate: mem_status=graduated with graduated_to"
+    assert_equals '{"s":"active","a":false}' "$(_gmeta "$e" '{s: .mem_status, a: .review.applied}')" "a refused graduate stays active, unapplied"
+
+    # Every projection drops a graduated memory; recall keeps it.
+    printf '# Claude\n' > CLAUDE.md
+    "$WV" memory render --agent=all --base-dir="$TEST_DIR" --json >/dev/null 2>&1 || true
+    block=$(sed -n '/BEGIN WEAVE:MEMORY/,/END WEAVE:MEMORY/p' CLAUDE.md)
+    assert_not_contains "$block" "$g" "CLAUDE.md drops the graduated memory"
+    assert_not_contains "$block" "$d" "CLAUDE.md drops the doc-graduated memory"
+    assert_contains "$block" "$k" "CLAUDE.md keeps an active memory"
+    assert_equals "0" "$(jq --arg g "$g" '[.memory.entries[] | select(.id == $g)] | length' .codex/weave.json)" ".codex/weave.json drops the graduated memory"
+    assert_equals "0" "$("$WV" bootstrap --json 2>/dev/null | jq --arg g "$g" '[.memory.entries[] | select(.id == $g)] | length')" "bootstrap drops the graduated memory"
+    out=$("$WV" memory recall --agent=all --json 2>/dev/null)
+    assert_equals '"docs/lessons.md"' "$(jq -c --arg d "$d" '.[] | select(.id == $d) | (.metadata | if type == "string" then fromjson else . end) | .graduated_to' <<< "$out")" "recall still returns a graduated memory with graduated_to"
+    assert_equals "0" "$(jq --arg c "$c" '[.[] | select(.id == $c)] | length' <<< "$out")" "recall still leaves out candidates"
+
+    out=$(_gw memory review --apply --json 2>/dev/null) || true
+    assert_equals "0 1" "$(jq -r '"\(.applied) \(.refused)"' <<< "$out")" "re-apply touches no graduated memory"
+    unset -f _gw _gmeta
+}
+
+test_memory_budget() {
+    echo ""
+    echo "Test: doctor memory budget and expiry are advisory (wv-986c3d)"
+    echo "=============================================================="
+    setup_test_env
+    local long carried dated missing plain done_id out check
+    mkdir -p .weave/procedures
+    printf '# House rule\n' > .weave/procedures/house-rule.md
+    done_id=$("$WV" add "finished work a memory cites" --json 2>/dev/null | jq -r '.id')
+    sqlite3 "$WV_DB" "UPDATE nodes SET status='done' WHERE id='$done_id';"
+    long=$("$WV" remember "A long rule kept resident. $(printf 'LONG-BODY %.0s' $(seq 1 60))" --source-agent=test --json | jq -r '.id')
+    "$WV" update "$long" --metadata='{"resident":"full"}' >/dev/null 2>&1
+    carried=$("$WV" remember "Run the house-rule procedure before closing." --source-agent=test --json | jq -r '.id')
+    dated=$("$WV" remember "Vendor access is pending as of 2026-01-02, see $done_id." --source-agent=test --json | jq -r '.id')
+    missing=$("$WV" remember "Lesson recorded under wv-abc123, since removed." --source-agent=test --json | jq -r '.id')
+    plain=$("$WV" remember "A settled rule with no date." --source-agent=test --json | jq -r '.id')
+    sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(metadata,'\$.verified_at','2025-01-01T00:00:00Z') WHERE id='$plain';"
+    check() { jq -r --arg c "$1" '.checks[] | select(.check == $c) | "\(.status) \(.detail)"' <<< "$out"; }
+
+    printf '[memory]\nblock_budget_bytes = 600\n' > .weave/policy.conf
+    out=$("$WV" doctor --json 2>/dev/null) || true
+    assert_contains "$(check "memory budget")" "warn " "an over-budget block warns"
+    assert_contains "$(check "memory budget")" "600-byte budget" "the warning names the budget"
+    assert_contains "$(check "memory budget")" "$carried (house-rule)" "a memory a repo procedure carries is a candidate"
+    assert_contains "$(check "memory budget")" "$long" "the longest memory is a candidate"
+    assert_contains "$(check "memory budget")" "$plain (2025-01-01)" "the oldest verified memory is a candidate"
+    assert_contains "$(check "memory expiry")" "warn " "time-bound memories warn"
+    assert_contains "$(check "memory expiry")" "$dated (pending, as of 2026-01-02; cites done $done_id)" "dated state with a done citation is flagged"
+    assert_contains "$(check "memory expiry")" "$missing (cites wv-abc123, not in the graph)" "a citation missing from the graph is flagged"
+    assert_not_contains "$(check "memory expiry")" "$plain" "a settled memory is not flagged"
+    assert_equals "active active" "$(sqlite3 "$WV_DB" "SELECT group_concat(json_extract(metadata,'\$.mem_status'), ' ') FROM nodes WHERE id IN ('$dated','$missing');")" "flagged memories are not retired"
+
+    printf '[memory]\nblock_budget_bytes = 1000000\n' > .weave/policy.conf
+    out=$("$WV" doctor --json 2>/dev/null) || true
+    assert_contains "$(check "memory budget")" "pass " "a block under budget passes"
+    printf '[memory]\nblock_budget_bytes = lots\n' > .weave/policy.conf
+    out=$("$WV" doctor --json 2>/dev/null) || true
+    assert_contains "$(check "memory budget")" "block_budget_bytes = lots is not a byte count" "a malformed budget is reported, not ignored"
+    unset -f check
+}
+
+test_memory_import_frontmatter() {
+    echo ""
+    echo "Test: Claude import keeps the body, not the frontmatter (wv-b3d2b6)"
+    echo "==================================================================="
+    setup_test_env
+    local mem_dir file id out legacy n
+    mem_dir="$TEST_DIR/fm-mem"
+    mkdir -p "$mem_dir"
+    file="$mem_dir/rule.md"
+    {
+        printf -- '---\nname: rule-name\ndescription: "Hook line with \\"quotes\\" from the description"\nmetadata:\n  type: feedback\n---\n\n'
+        for n in $(seq 1 24); do printf 'Body line %s.\n' "$n"; done
+        printf '**How to apply:** TAIL-PAST-LINE-TWENTY survives the import.\n'
+    } > "$file"
+    out=$("$WV" memory import --source=claude --path="$mem_dir" --repo-root="$TEST_DIR" --json 2>/dev/null) || true
+    id=$(jq -r '.imported[0].id // empty' <<< "$out")
+    assert_equals "Body line 1." "$(sqlite3 "$WV_DB" "SELECT substr(text, 1, 12) FROM nodes WHERE id='$id';")" "the text starts at the body, not the frontmatter"
+    assert_contains "$(sqlite3 "$WV_DB" "SELECT text FROM nodes WHERE id='$id';")" "TAIL-PAST-LINE-TWENTY" "the body is not cut at 20 lines"
+    assert_equals 'Hook line with "quotes" from the description|rule-name' "$(sqlite3 "$WV_DB" "SELECT json_extract(metadata,'\$.hook') || '|' || json_extract(metadata,'\$.source_name') FROM nodes WHERE id='$id';")" "the description becomes the hook"
+
+    # A pre-wv-b3d2b6 import of an unchanged file is reshaped in place; one whose
+    # text was edited since is left alone.
+    legacy="--- name: rule-name description: old shape Body line 1."
+    sqlite3 "$WV_DB" "UPDATE nodes SET text='$legacy', metadata=json_remove(metadata,'\$.hook','\$.source_name') WHERE id='$id';"
+    out=$("$WV" memory import --source=claude --path="$mem_dir" --repo-root="$TEST_DIR" --json 2>/dev/null) || true
+    assert_equals "0 1 [\"$id\"]" "$(jq -r '"\(.count) \(.skipped) \(.reshaped)"' <<< "$out")" "re-import creates nothing and reports the reshape"
+    assert_equals "Body line 1.|Hook line with \"quotes\" from the description" "$(sqlite3 "$WV_DB" "SELECT substr(text, 1, 12) || '|' || json_extract(metadata,'\$.hook') FROM nodes WHERE id='$id';")" "re-import reshapes the legacy text and sets the hook"
+    sqlite3 "$WV_DB" "UPDATE nodes SET text='Edited by the owner.' WHERE id='$id';"
+    "$WV" memory import --source=claude --path="$mem_dir" --repo-root="$TEST_DIR" --json >/dev/null 2>&1 || true
+    assert_equals "Edited by the owner." "$(sqlite3 "$WV_DB" "SELECT text FROM nodes WHERE id='$id';")" "an edited node is not reshaped"
+}
+
 test_memory_verify_prose
+test_memory_import_frontmatter
+test_memory_review
+test_memory_graduate
+test_memory_budget
+test_memory_render_index
 test_memory_overlap_guards
 test_memory_supersede
 test_memory_agents_projection_marker_gated

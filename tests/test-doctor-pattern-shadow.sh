@@ -130,7 +130,11 @@ test_no_managed_dir_skips_check() {
 }
 
 test_delegate_failure_never_reports_pass() {
-    echo "-- delegated 'patterns list' fails (malformed local rule) → doctor WARN, never PASS (wv-92ca0e)"
+    echo "-- delegated 'patterns list' fails (unreadable local rule) → doctor WARN, never PASS (wv-92ca0e)"
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "  (skipped: root reads a mode-000 file)"
+        return 0
+    fi
     mkdir -p .weave/patterns/managed
     echo "shadowed-rule.yaml" > .weave/patterns/managed/.overridden
     cat > .weave/patterns/shadowed-rule.yaml <<'EOF'
@@ -140,15 +144,43 @@ kind: regex
 patterns:
   - absent
 EOF
-    # Unrelated rule, malformed independently of the shadow fixture --
-    # breaks _load_pattern_rules entirely, before shadow detection would
-    # even run.
-    printf 'id: [unclosed\n' > .weave/patterns/broken-rule.yaml
+    # Unrelated rule the loader cannot read -- it cannot say which rules it
+    # lost, so the load fails before shadow detection would even run.
+    printf 'id: unreadable-rule\nlanguage: prose\n' > .weave/patterns/unreadable-rule.yaml
+    chmod 000 .weave/patterns/unreadable-rule.yaml
     local out
     out=$("$WV" doctor 2>&1 || true)
+    chmod 644 .weave/patterns/unreadable-rule.yaml
     assert_contains "$out" "pattern-shadow" "doctor still emits a pattern-shadow check"
     assert_contains "$out" "could not evaluate managed-rule shadowing" "doctor reports the evaluation failure"
     assert_not_contains "$out" "pattern-shadow: no managed-rule shadowing detected" "never reports pass for an unevaluated check"
+}
+
+test_malformed_rule_does_not_stop_shadow_detection() {
+    echo "-- a malformed local rule is skipped; shadowing is still evaluated (wv-d0e4d6)"
+    mkdir -p .weave/patterns/managed
+    mkdir -p "$WV_CONFIG_DIR/quality-patterns/managed"
+    echo "shadowed-rule.yaml" > .weave/patterns/managed/.overridden
+    echo "shadowed-rule.yaml" > "$WV_CONFIG_DIR/quality-patterns/managed/manifest.txt"
+    cat > "$WV_CONFIG_DIR/quality-patterns/managed/shadowed-rule.yaml" <<'EOF'
+id: shadowed-rule
+language: prose
+kind: regex
+patterns:
+  - managed
+EOF
+    cat > .weave/patterns/shadowed-rule.yaml <<'EOF'
+id: shadowed-rule
+language: prose
+kind: regex
+patterns:
+  - absent
+EOF
+    printf 'id: [unclosed\n' > .weave/patterns/broken-rule.yaml
+    local out
+    out=$("$WV" doctor 2>&1 || true)
+    assert_contains "$out" "managed rule(s) shadowed by a local copy" "shadowing is still detected beside a malformed rule"
+    assert_not_contains "$out" "could not evaluate managed-rule shadowing" "a malformed rule no longer makes the check unevaluable"
 }
 
 test_json_mode_carries_the_same_advisory() {
@@ -178,6 +210,7 @@ main() {
     setup_test_env; test_no_local_rule_passes
     setup_test_env; test_no_managed_dir_skips_check
     setup_test_env; test_delegate_failure_never_reports_pass
+    setup_test_env; test_malformed_rule_does_not_stop_shadow_detection
     setup_test_env; test_json_mode_carries_the_same_advisory
 
     echo ""

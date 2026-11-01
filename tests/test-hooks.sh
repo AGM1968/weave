@@ -540,6 +540,24 @@ assert_contains "$OUTPUT" "/ship-it" "pre-claim: suggests ship-it when done_crit
 # ID is missing criteria AND alias AND risks — every gate must appear in a single deny.
 assert_contains "$OUTPUT" "alias" "pre-claim combined: alias gate reported alongside done_criteria"
 assert_contains "$OUTPUT" "pre-mortem" "pre-claim combined: premortem advisory reported alongside done_criteria"
+# wv-6e4798: the advisory rides with the deny under its own heading, never among
+# the requirements the agent is told to satisfy.
+assert_contains "$OUTPUT" "required before claiming: [1] done_criteria" "pre-claim combined: requirements are headed as required"
+assert_contains "$OUTPUT" "Advisory, does not block the claim: risks/premortem" "pre-claim combined: the risks advisory is headed apart from the requirements"
+_req_part=$(printf '%s' "$OUTPUT" | jq -r '.hookSpecificOutput.permissionDecisionReason // ""' | sed 's/Advisory, does not block the claim:.*//')
+assert_equals "0" "$(grep -c 'risks/premortem' <<< "$_req_part" || true)" "pre-claim combined: the requirement list does not name risks/premortem"
+
+# wv-6e4798: criteria and alias set, risks absent. The advisory alone never
+# denies: it returns as context and the host's normal flow decides the claim.
+# This denied on every retry while the test above it asserted only exit 0.
+ID_ADV=$("$WV" add "Claim test advisory only" --alias=claim-adv --metadata='{"done_criteria":["c1"]}' --force 2>/dev/null | tail -1)
+set +e
+OUTPUT_ADV=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID_ADV\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
+EXIT_CODE_ADV=$?
+set -e
+assert_exit_code "0" "$EXIT_CODE_ADV" "pre-claim advisory-only: exits 0"
+assert_equals "null" "$(printf '%s' "$OUTPUT_ADV" | jq -r '.hookSpecificOutput.permissionDecision // "null"' 2>/dev/null)" "pre-claim advisory-only: no permission decision, so the claim is not denied"
+assert_contains "$(printf '%s' "$OUTPUT_ADV" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)" "not a requirement; the claim proceeds: risks/premortem not set" "pre-claim advisory-only: the advice returns as additionalContext"
 
 # Node with done_criteria but no risks → tiered advisory
 ID2=$("$WV" add "Claim test criteria-only" --metadata='{"done_criteria":["c1"]}' --force 2>/dev/null | tail -1)
@@ -589,7 +607,7 @@ set +e
 OUTPUT_IMP=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv work $ID_SEED\"}}" | bash "$HOOKS_DIR/pre-claim-skills.sh" 2>/dev/null)
 EXIT_CODE_IMP=$?
 set -e
-assert_exit_code "0" "$EXIT_CODE_IMP" "pre-claim: exits 0 (advisory, never blocks) with impact data"
+assert_exit_code "0" "$EXIT_CODE_IMP" "pre-claim: exits 0 with impact data (a deny here: the node has no alias)"
 assert_contains "$OUTPUT_IMP" "pre-mortem" "pre-claim: still suggests pre-mortem when risks/premortem absent"
 assert_contains "$OUTPUT_IMP" "Blast radius (wv impact)" "pre-claim: advisory grounded in wv impact blast radius (wv-cd5ddb)"
 assert_contains "$OUTPUT_IMP" "1 impacted" "pre-claim: advisory reports real impacted count"
@@ -992,21 +1010,41 @@ fi
 dedup_pending() {  # dedup_pending <age-seconds> <locked-command>
     printf '%s\npending\n%s\n' "$(( $(date +%s) - $1 ))" "$2" > "$DEDUP_LOCK_DIR/wv-sync.lock"
 }
-dedup_try() {
-    echo '{"tool_name":"Bash","tool_input":{"command":"wv sync --gh --retry-marker"}}' \
+dedup_try() {  # dedup_try [command]
+    jq -nc --arg c "${1:-wv sync --gh --retry-marker}" '{tool_name:"Bash",tool_input:{command:$c}}' \
         | bash "$HOOKS_DIR/bash-dedup.sh" 2>/dev/null || true
 }
 dedup_pending 30 "wv sync --gh --blocked-marker-$$"
 assert_not_contains "$(dedup_try)" '"deny"' "bash-dedup: a pending lock whose command never started does not deny the retry"
+# wv-5362e2: the spawn window denied a corrected retry 8s after another hook
+# refused the first call. Inside the window only an identical call (two issued
+# together, before either process exists) denies unchecked.
 dedup_pending 2 "wv sync --gh --blocked-marker-$$"
-assert_contains "$(dedup_try)" '"deny"' "bash-dedup: a pending lock inside the spawn window still denies"
+assert_not_contains "$(dedup_try)" '"deny"' "bash-dedup: inside the spawn window a corrected retry of a refused call is allowed"
+dedup_pending 2 "wv sync --gh --retry-marker"
+DEDUP_OUT=$(dedup_try)
+assert_contains "$DEDUP_OUT" '"deny"' "bash-dedup: inside the spawn window an identical call still denies"
+assert_contains "$DEDUP_OUT" 'if another hook refused it, it never ran, so re-issue it once the lock is 10s old' "bash-dedup: the unchecked deny names the refusal case and the wait"
+assert_not_contains "$DEDUP_OUT" 'already running' "bash-dedup: the unchecked deny does not claim the call is running"
 bash -c "exec -a 'wv sync --gh --live-marker-$$' sleep 30" &
 DEDUP_LIVE_PID=$!
 sleep 1
 dedup_pending 30 "wv sync --gh --live-marker-$$"
 assert_contains "$(dedup_try)" '"deny"' "bash-dedup: a pending lock whose command is running still denies"
+dedup_pending 2 "wv sync --gh --live-marker-$$"
+DEDUP_OUT=$(dedup_try)
+assert_contains "$DEDUP_OUT" '"deny"' "bash-dedup: inside the spawn window a different call still denies while the locked one runs"
+assert_contains "$DEDUP_OUT" 'already running' "bash-dedup: a checked deny says the call is running"
 kill "$DEDUP_LIVE_PID" 2>/dev/null || true
 wait "$DEDUP_LIVE_PID" 2>/dev/null || true
+rm -f "$DEDUP_LOCK_DIR/wv-sync.lock"
+# The lock keeps one line per field: a multi-line command stores its first line,
+# so it cannot spill into the task-id line, and an identical call still matches.
+DEDUP_MULTI=$'wv sync --gh --multi-marker\ngit status'
+dedup_try "$DEDUP_MULTI" >/dev/null
+assert_equals "3" "$(wc -l < "$DEDUP_LOCK_DIR/wv-sync.lock" | tr -d ' ')" "bash-dedup: a multi-line command takes a three-line lock"
+assert_equals "wv sync --gh --multi-marker" "$(sed -n 3p "$DEDUP_LOCK_DIR/wv-sync.lock")" "bash-dedup: the lock stores the command's first line"
+assert_contains "$(dedup_try "$DEDUP_MULTI")" '"deny"' "bash-dedup: an identical multi-line call inside the spawn window denies"
 rm -f "$DEDUP_LOCK_DIR/wv-sync.lock"
 
 # Post hook: background command (via tool_input flag) does NOT clear lock
@@ -1313,7 +1351,47 @@ if command -v prettier >/dev/null 2>&1; then
         "post-edit-lint: the generated region is byte-identical after formatting"
     assert_equals "0" "$(bash "$_pel_repo/scripts/gen-workflow-classes.sh" --check >/dev/null 2>&1; echo $?)" \
         "post-edit-lint: gen-workflow-classes.sh --check stays green after a prose edit"
-    unset -f _pel_region
+    # The same for every managed-block marker family (wv-89e3dd): an edit to
+    # CLAUDE.md reflowed its '<!-- ── BEGIN WEAVE' blocks, which the commit gate
+    # then refused as projection drift. A consumer's CLAUDE.md carries two of
+    # them. The fixture takes the init-repo block from this checkout's CLAUDE.md
+    # and writes the WEAVE:MEMORY block in `wv memory render`'s shape, because
+    # the public CLAUDE.md has no memory block (memories never ship, wv-ab5f6c)
+    # and copying the whole file failed the release projection (wv-a1fc6e). The
+    # memory block keeps what prettier would change: no blank line after the
+    # heading and index lines past printWidth.
+    _pel_claude="$_pel_repo/CLAUDE.md"
+    _pel_managed() { sed -n "/^<!-- ── BEGIN WEAVE$2/,/^<!-- ── END WEAVE$2/p" "$1"; }
+    {
+        _pel_managed "$PROJECT_ROOT/CLAUDE.md" ' CLAUDE.MD'
+        printf '\n# Project\n\nProject notes outside every managed block.\n\n'
+        printf '%s\n' \
+            '<!-- ── BEGIN WEAVE:MEMORY ── managed by wv memory render, do not edit manually -->' \
+            '## WEAVE:MEMORY' \
+            '' \
+            'Authority: weave graph. Recall: `wv memory recall --agent=all --json`. Capture: `wv remember <text>`.' \
+            '' \
+            "- [\`wv-000001\`] A fixture memory index entry long enough to pass printWidth$(printf ' word%.0s' $(seq 1 25)) (verified: 2026-11-01T00:00:00Z)" \
+            "- [\`wv-000002\`] A second entry, so the block holds a list prettier would rewrap$(printf ' word%.0s' $(seq 1 25)) (verified: 2026-11-01T00:00:00Z)" \
+            '' \
+            '<!-- ── END WEAVE:MEMORY ── -->'
+    } > "$_pel_claude"
+    _pel_init=$(_pel_managed "$_pel_claude" ' CLAUDE.MD')
+    _pel_memory=$(_pel_managed "$_pel_claude" ':MEMORY')
+    assert_equals "yes" "$([ -n "$_pel_init" ] && [ -n "$_pel_memory" ] && echo yes || echo no)" \
+        "post-edit-lint: the CLAUDE.md fixture carries both managed blocks"
+    printf '\n%s\n' "$_pel_long" >> "$_pel_claude"
+    set +e
+    echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$_pel_claude\"}}" \
+        | (cd "$_pel_repo" && bash "$HOOKS_DIR/post-edit-lint.sh") >/dev/null 2>&1
+    set -e
+    assert_equals "absent" "$(grep -qxF -- "$_pel_long" "$_pel_claude" && echo present || echo absent)" \
+        "post-edit-lint: prettier reformatted the prose appended to CLAUDE.md"
+    assert_equals "$_pel_init" "$(_pel_managed "$_pel_claude" ' CLAUDE.MD')" \
+        "post-edit-lint: CLAUDE.md's init-repo block is byte-identical after formatting"
+    assert_equals "$_pel_memory" "$(_pel_managed "$_pel_claude" ':MEMORY')" \
+        "post-edit-lint: CLAUDE.md's WEAVE:MEMORY block is byte-identical after formatting"
+    unset -f _pel_region _pel_managed
 else
     echo -e "${YELLOW}⊘${NC} post-edit-lint: prettier not installed, generated-region test skipped"
 fi
@@ -3181,6 +3259,23 @@ assert_equals "" "$MC_CODE" "memory-capture: ignores non-memory file writes"
 MC_FAIL=$(printf '{"tool_name":"Write","tool_response":{"success":false},"tool_input":{"file_path":"%s/a.md"}}' "$mc_memdir" \
     | HOME="$mc_home" WV_PROJECT_DIR="$TEST_DIR/project" WV_HOT_ZONE="$TEST_DIR" bash "$HOOKS_DIR/post-memory-capture.sh" 2>/dev/null || true)
 assert_equals "" "$MC_FAIL" "memory-capture: skips on failed tool call"
+
+# 4b. The repository keeps Claude memory outside the graph by recorded choice
+# (wv-27131a): no advisory, no pending record. Without a reason it records no
+# choice, and the advisory returns.
+mkdir -p "$TEST_DIR/project/.weave"
+printf '[memory]\noutside_graph = claude\nreason = field notes stay in Claude memory\n' > "$TEST_DIR/project/.weave/policy.conf"
+rm -f "$TEST_DIR/memory-capture-pending.tsv"
+MC_KEPT=$(printf '{"tool_name":"Write","tool_response":{"success":true},"tool_input":{"file_path":"%s/a.md"}}' "$mc_memdir" \
+    | HOME="$mc_home" WV_PROJECT_DIR="$TEST_DIR/project" WV_HOT_ZONE="$TEST_DIR" bash "$HOOKS_DIR/post-memory-capture.sh" 2>/dev/null || true)
+assert_equals "" "$MC_KEPT" "memory-capture: silent when policy.conf keeps Claude memory outside the graph"
+assert_equals "absent" "$([ -e "$TEST_DIR/memory-capture-pending.tsv" ] && echo present || echo absent)" \
+    "memory-capture: records no pending import under that choice"
+printf '[memory]\noutside_graph = claude\n' > "$TEST_DIR/project/.weave/policy.conf"
+MC_NOREASON=$(printf '{"tool_name":"Write","tool_response":{"success":true},"tool_input":{"file_path":"%s/a.md"}}' "$mc_memdir" \
+    | HOME="$mc_home" WV_PROJECT_DIR="$TEST_DIR/project" WV_HOT_ZONE="$TEST_DIR" bash "$HOOKS_DIR/post-memory-capture.sh" 2>/dev/null || true)
+assert_contains "$MC_NOREASON" "Repo-scoped Claude memory write" "memory-capture: a choice without a reason is no choice"
+rm -f "$TEST_DIR/project/.weave/policy.conf"
 
 # 5. Opt-in import (WV_MEMORY_CAPTURE=1) runs the first EXECUTABLE wv candidate:
 # a project scripts/wv that is not executable is skipped for the checkout's own.

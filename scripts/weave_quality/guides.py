@@ -55,8 +55,21 @@ _HEADING = re.compile(r"##\s+(.+?)\s*$")
 # a second form under this type" -- and a comma would split them mid-name.
 SECTION_DECLARATION_SEPARATOR = "|"
 # A declared name is prose, not an identifier, but it still has to be a name: no
-# markup, no newline, and short enough to render as a heading on any surface.
-SECTION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ,.'()/-]{0,79}$")
+# markup, no newline, and short enough to render as a heading on any surface. A
+# colon is prose too ("Procedure: author-comparable review", wv-964548); the
+# frontmatter reader splits a line on its first colon only. The two coaching
+# schemas carry the same pattern, and tests/test-coaching-guides.sh holds them
+# to it.
+SECTION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ,.:'()/-]{0,79}$")
+SECTION_NAME_RULE = (
+    "a name starts with a letter or digit, then holds up to 79 letters, digits, spaces "
+    "or , . : ' ( ) / -; separate names with |"
+)
+
+
+def _comma_hint(*labels: str) -> str:
+    """A comma is valid inside a name, so a comma-separated list reads as one."""
+    return " (a comma does not separate names; use |)" if any("," in label for label in labels) else ""
 
 # Ranges that cover the pictographs and dingbats house style keeps out of docs.
 _EMOJI = re.compile("[←-⯿☀-➿\U0001f000-\U0001faff]")
@@ -66,13 +79,28 @@ class GuideError(Exception):
     """A guide could not be read or does not satisfy the contract.
 
     Carries the typed cause the coaching response reports, so a caller can
-    render `guide_override_invalid` without re-deriving why.
+    render `guide_override_invalid` without re-deriving why. `errors` holds
+    every contract violation found in one file, in file order; the message is
+    them all, joined. A guide that stopped at its first fault took one doctor
+    run per fault to repair (wv-273b2d).
     """
 
-    def __init__(self, message: str, code: str, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        code: str,
+        path: Path | None = None,
+        errors: tuple[str, ...] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.path = path
+        self.errors = errors or (message,)
+
+    @classmethod
+    def collected(cls, problems: list[str], code: str, path: Path) -> "GuideError":
+        """One error carrying every violation `parse_guide` collected."""
+        return cls("; ".join(problems), code, path, tuple(problems))
 
 
 @dataclass(frozen=True)
@@ -159,7 +187,9 @@ def _normalize(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split())
 
 
-def _declared_sections(path: Path, raw: str | None, code: str) -> dict[str, str]:
+def _declared_sections(
+    path: Path, raw: str | None, problems: list[str]
+) -> tuple[dict[str, str], set[str]]:
     """The extra section names this one guide may carry, keyed by match name.
 
     The fixed vocabulary stays closed: a heading outside `SECTION_KEYS` is still
@@ -169,45 +199,54 @@ def _declared_sections(path: Path, raw: str | None, code: str) -> dict[str, str]
     up across unrelated repositories is a construction that has earned a place
     in the fixed set. Promotion moves a name from here to `SECTION_KEYS`; it is
     not something a consumer can do to itself by writing a guide.
+
+    Violations go to `problems`. Returns the admissible names and the rejected
+    ones: a heading for a rejected name was already reported here, and is
+    skipped rather than reported a second time as undeclared.
     """
     if raw is None:
-        return {}
+        return {}, set()
     if not raw.strip():
-        raise GuideError(
-            f"{path.name}: frontmatter 'sections' is present but declares nothing; omit it",
-            code,
-            path,
+        problems.append(
+            f"{path.name}: frontmatter 'sections' is present but declares nothing; omit it"
         )
+        return {}, set()
 
     declared: dict[str, str] = {}
+    rejected: set[str] = set()
     for item in raw.split(SECTION_DECLARATION_SEPARATOR):
         label = _normalize(item)
         if not label:
-            raise GuideError(
-                f"{path.name}: frontmatter 'sections' has an empty entry", code, path
-            )
-        if not SECTION_NAME_PATTERN.fullmatch(label):
-            raise GuideError(
-                f"{path.name}: declared section {label!r} is not a section name", code, path
-            )
+            problems.append(f"{path.name}: frontmatter 'sections' has an empty entry")
+            continue
         name = label.lower()
+        if not SECTION_NAME_PATTERN.fullmatch(label):
+            problems.append(
+                f"{path.name}: declared section {label!r} is not a section name: "
+                f"{SECTION_NAME_RULE}{_comma_hint(label)}"
+            )
+            rejected.add(name)
+            continue
         if name in SECTION_KEYS:
-            raise GuideError(
+            problems.append(
                 f"{path.name}: declared section {label!r} is already a fixed section; a "
-                f"declaration may extend the vocabulary, never redefine it",
-                code,
-                path,
+                f"declaration may extend the vocabulary, never redefine it"
             )
+            continue
         if name in declared:
-            raise GuideError(
-                f"{path.name}: declared section {label!r} appears twice", code, path
-            )
+            problems.append(f"{path.name}: declared section {label!r} appears twice")
+            continue
         declared[name] = label
-    return declared
+    return declared, rejected
 
 
-def _read_frontmatter(path: Path, code: str) -> tuple[str, dict[str, str], str]:
-    """Read a guide's text and flat frontmatter, returning the unparsed section body."""
+def _read_frontmatter(path: Path, code: str, problems: list[str]) -> tuple[str, dict[str, str], str]:
+    """Read a guide's text and flat frontmatter, returning the unparsed section body.
+
+    Raises only when there is no frontmatter to read: an unreadable file or a
+    missing fence. A bad line is reported to `problems` and skipped, so the
+    rest of the guide is still checked.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -229,54 +268,37 @@ def _read_frontmatter(path: Path, code: str) -> tuple[str, dict[str, str], str]:
         if not line.strip():
             continue
         if line[0] in " \t":
-            raise GuideError(f"{path.name}:{lineno}: nested frontmatter is unsupported", code, path)
+            problems.append(f"{path.name}:{lineno}: nested frontmatter is unsupported")
+            continue
         key, sep, value = line.partition(":")
         if not sep:
-            raise GuideError(f"{path.name}:{lineno}: expected 'key: value'", code, path)
+            problems.append(f"{path.name}:{lineno}: expected 'key: value'")
+            continue
         key = key.strip()
         if key not in ALLOWED_FRONTMATTER:
-            raise GuideError(f"{path.name}:{lineno}: unknown frontmatter {key!r}", code, path)
+            problems.append(f"{path.name}:{lineno}: unknown frontmatter {key!r}")
+            continue
+        # A repeated key used to keep the last value and drop the first
+        # without a word, as a repeated heading once did (wv-76fc4a).
+        if key in frontmatter:
+            problems.append(f"{path.name}:{lineno}: frontmatter {key!r} appears twice")
+            continue
         frontmatter[key] = value.strip()
 
     for required in REQUIRED_FRONTMATTER:
         if not frontmatter.get(required):
-            raise GuideError(f"{path.name}: frontmatter {required} is required", code, path)
+            problems.append(f"{path.name}: frontmatter {required} is required")
     return text, frontmatter, body
 
 
-def parse_guide(path: Path, source: str) -> Guide:
-    """Parse and validate one guide file. Raises :class:`GuideError`."""
-    code = "guide_override_invalid" if source == "project" else "guide_invalid"
-    text, frontmatter, body = _read_frontmatter(path, code)
+def _read_sections(
+    path: Path, body: str, declared: dict[str, str], rejected: set[str], problems: list[str]
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """The fixed sections, the declared ones and their labels, from a guide body.
 
-    stem = path.name[: -len(".md")] if path.name.endswith(".md") else path.name
-    parts = stem.split(".")
-    if len(parts) > 2:
-        raise GuideError(f"{path.name}: at most one .<language> suffix is allowed", code, path)
-    file_id = parts[0]
-    file_language = parts[1] if len(parts) == 2 else None
-
-    if frontmatter["id"] != file_id:
-        raise GuideError(
-            f"{path.name}: frontmatter id {frontmatter['id']!r} does not match filename "
-            f"{file_id!r}",
-            code,
-            path,
-        )
-    if not ID_PATTERN.fullmatch(file_id):
-        raise GuideError(f"{path.name}: id {file_id!r} is not a valid guide basename", code, path)
-
-    declared_language = frontmatter.get("language") or None
-    if declared_language != file_language:
-        raise GuideError(
-            f"{path.name}: frontmatter language {declared_language!r} does not match filename "
-            f"{file_language!r}",
-            code,
-            path,
-        )
-
-    declared = _declared_sections(path, frontmatter.get("sections"), code)
-
+    Violations go to `problems`. A heading for a name `_declared_sections`
+    already refused is skipped without a second report.
+    """
     sections: dict[str, str] = {}
     extended: dict[str, str] = {}
     labels: dict[str, str] = {}
@@ -286,19 +308,20 @@ def parse_guide(path: Path, source: str) -> Guide:
         if heading:
             raw = heading.group(1).strip()
             name = _normalize(raw).lower()
+            # A body that cannot be kept is skipped, not appended to whatever
+            # section came before it.
+            current = None
             # A second heading for a section already seen used to reset it,
             # silently discarding the first body (wv-76fc4a). Keyed on the
             # resolved section, so two spellings of one section also collide.
             if (name in SECTION_KEYS and SECTION_KEYS[name] in sections) or (
                 name not in SECTION_KEYS and name in extended
             ):
-                raise GuideError(
+                problems.append(
                     f"{path.name}: duplicate section {raw!r} — each section may appear once; "
-                    f"merge the two bodies under one heading",
-                    code,
-                    path,
+                    f"merge the two bodies under one heading"
                 )
-            if name in SECTION_KEYS:
+            elif name in SECTION_KEYS:
                 current = ("fixed", SECTION_KEYS[name])
                 sections[current[1]] = ""
             elif name in declared:
@@ -308,12 +331,10 @@ def parse_guide(path: Path, source: str) -> Guide:
                 current = ("extended", name)
                 extended[name] = ""
                 labels[name] = _normalize(raw)
-            else:
-                raise GuideError(
+            elif name not in rejected:
+                problems.append(
                     f"{path.name}: unknown section {raw!r} — a section outside the fixed set must "
-                    f"be declared in frontmatter 'sections'",
-                    code,
-                    path,
+                    f"be declared in frontmatter 'sections'{_comma_hint(*declared.values())}"
                 )
             continue
         if current is None:
@@ -321,27 +342,68 @@ def parse_guide(path: Path, source: str) -> Guide:
         kind, key = current
         target = sections if kind == "fixed" else extended
         target[key] = (target[key] + "\n" + line).strip()
+    return sections, extended, labels
+
+
+def parse_guide(path: Path, source: str) -> Guide:
+    """Parse and validate one guide file. Raises :class:`GuideError`.
+
+    Every violation in the file is collected and raised together, so one run
+    names all of them. Only a file with no readable frontmatter stops at the
+    first fault, because nothing after it can be checked.
+    """
+    code = "guide_override_invalid" if source == "project" else "guide_invalid"
+    problems: list[str] = []
+    text, frontmatter, body = _read_frontmatter(path, code, problems)
+
+    stem = path.name[: -len(".md")] if path.name.endswith(".md") else path.name
+    parts = stem.split(".")
+    file_id = parts[0]
+    file_language = parts[1] if len(parts) == 2 else None
+
+    if frontmatter.get("id") and frontmatter["id"] != file_id:
+        problems.append(
+            f"{path.name}: frontmatter id {frontmatter['id']!r} does not match filename "
+            f"{file_id!r}"
+        )
+    if not ID_PATTERN.fullmatch(file_id):
+        problems.append(f"{path.name}: id {file_id!r} is not a valid guide basename")
+
+    if len(parts) > 2:
+        # No language can be read from the name, so there is none to compare.
+        problems.append(f"{path.name}: at most one .<language> suffix is allowed")
+    else:
+        declared_language = frontmatter.get("language") or None
+        if declared_language != file_language:
+            problems.append(
+                f"{path.name}: frontmatter language {declared_language!r} does not match "
+                f"filename {file_language!r}"
+            )
+
+    declared, rejected = _declared_sections(path, frontmatter.get("sections"), problems)
+    sections, extended, labels = _read_sections(path, body, declared, rejected, problems)
 
     for required in REQUIRED_SECTIONS:
         if not sections.get(required):
-            raise GuideError(f"{path.name}: section {required} is required", code, path)
+            problems.append(f"{path.name}: section {required} is required")
 
     # A declaration the body never uses is drift in the direction the loud
     # failure above cannot see: the frontmatter widens what the file may contain
     # and nothing narrows it back when the content goes away.
     for name, label in declared.items():
         if name not in extended:
-            raise GuideError(
+            problems.append(
                 f"{path.name}: frontmatter declares section {label!r} but the body has "
-                f"no such heading",
-                code,
-                path,
+                f"no such heading{_comma_hint(label)}"
             )
-        if not extended[name]:
-            raise GuideError(f"{path.name}: declared section {label!r} is empty", code, path)
+        elif not extended[name]:
+            problems.append(f"{path.name}: declared section {label!r} is empty")
 
     if _EMOJI.search(text):
-        raise GuideError(f"{path.name}: guides use text markers, not emoji", code, path)
+        problems.append(f"{path.name}: guides use text markers, not emoji")
+
+    if problems:
+        raise GuideError.collected(problems, code, path)
 
     return Guide(
         id=file_id,
@@ -467,6 +529,54 @@ def resolve_all(
 CATALOG_STATUSES = frozenset({"canonical", "compatibility", "legacy"})
 CATALOG_GUIDE_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
+# A repository declares its own violation types (wv-60bf88, memory graduation
+# S2): a detector under .weave/patterns/<id>.yaml whose top-level
+# violation_type is project:<name>. The type exists in that repository only and
+# is coached by .weave/guides/<name>[.<language>].md, a catalogued type's guide
+# by its basename. The shipped vocabulary never holds a project: type, so one
+# repository's lesson cannot reach another's. wv-validate.sh reads the same
+# declaration for the shell's write and close checks.
+PROJECT_PREFIX = "project:"
+PROJECT_PATTERNS = Path(".weave") / "patterns"
+_PROJECT_DECLARATION = re.compile(r"^violation_type:\s*(project:\S*)\s*$")
+
+
+def project_types(project_root: Path | None) -> dict[str, dict[str, str]]:
+    """The project:<name> types the repository's own detectors declare, as catalogue entries."""
+    if project_root is None:
+        return {}
+    directory = project_root / PROJECT_PATTERNS
+    declared: dict[str, dict[str, str]] = {}
+    try:
+        # iterdir, not glob: glob reports an unlistable directory as empty.
+        paths = sorted(p for p in directory.iterdir() if p.suffix == ".yaml") if directory.is_dir() else []
+        for path in paths:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                match = _PROJECT_DECLARATION.match(line)
+                if match is None:
+                    continue
+                name = match.group(1)[len(PROJECT_PREFIX):]
+                if CATALOG_GUIDE_PATTERN.fullmatch(name) is None:
+                    raise GuideError(f"{path.name}: {match.group(1)!r} is not project:<name> with <name> "
+                                     f"matching {CATALOG_GUIDE_PATTERN.pattern}", "catalog_unreadable", path)
+                declared[match.group(1)] = {"status": "project", "guide": name}
+                break
+    except (OSError, UnicodeDecodeError) as exc:
+        raise GuideError(f"{directory}: cannot be read ({exc})", "catalog_unreadable", directory) from None
+    return declared
+
+
+def with_project_types(catalog: dict[str, Any], project_root: Path | None) -> dict[str, Any]:
+    """The catalogue with the repository's declared types merged in, refusing a shipped project: type."""
+    types = catalog.get("types") if isinstance(catalog, dict) else None
+    if not isinstance(types, dict):
+        raise GuideError("catalog types must be an object", "catalog_unreadable")
+    shipped = sorted(k for k in types if k.startswith(PROJECT_PREFIX))
+    if shipped:
+        raise GuideError(f"catalog holds {', '.join(shipped)}: project: types are declared by a "
+                         "repository, never shipped", "catalog_unreadable")
+    return {**catalog, "types": {**types, **project_types(project_root)}}
+
 
 def validate_catalog(catalog: Any) -> list[str]:
     """The catalogue's canonical types, after checking the structure doctor relies on.
@@ -498,7 +608,7 @@ def validate_catalog(catalog: Any) -> list[str]:
     return canonical
 
 
-def _project_assets(project_root: Path | None, invalid: list[dict[str, str]]) -> list[Guide]:
+def _project_assets(project_root: Path | None, invalid: list[dict[str, Any]]) -> list[Guide]:
     """Every project guide under .weave/guides/ that parses; the rest go to INVALID."""
     if project_root is None:
         return []
@@ -517,7 +627,7 @@ def _project_assets(project_root: Path | None, invalid: list[dict[str, str]]) ->
         try:
             parsed.append(parse_guide(path, "project"))
         except GuideError as exc:
-            invalid.append({"file": path.name, "error": str(exc)})
+            invalid.append({"file": path.name, "error": str(exc), "errors": list(exc.errors)})
     return parsed
 
 
@@ -538,7 +648,8 @@ def doctor_report(
     that could drift from them. Raises GuideError when the catalogue or the
     project guides directory cannot be read: that is a failed check, not a
     report.
-      invalid        project guides parse_guide rejects, with the error
+      invalid        project guides parse_guide rejects, with the error and
+                     `errors`, every violation in the file
       unresolved     resolutions that raise: each project guide is resolved
                      in its own context (the catalogued type it serves, in
                      its own language), and each canonical type generically.
@@ -551,8 +662,11 @@ def doctor_report(
       fallback_only  canonical types that coach only through _uncoached
     """
     canonical = validate_catalog(catalog)
+    # The shipped catalogue is validated alone; the repository's own types join
+    # it after, so a project guide serving one is used, not unused.
+    catalog = with_project_types(catalog, project_root)
     types = catalog["types"]
-    invalid: list[dict[str, str]] = []
+    invalid: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     unused: list[str] = []
     examples: list[str] = []

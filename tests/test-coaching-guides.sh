@@ -192,6 +192,67 @@ new_case
 extended_guide "Avoid" "Avoid"
 expect_problem "a declaration may not restate a fixed section" "never redefine it"
 
+# A consumer's filler guide (wv-964548): a colon in a declared name was refused
+# with "is not a section name", which named no rule, and its comma-separated
+# declaration read as one name. Owner ruling 2026-10-29: colons are prose.
+new_case
+extended_guide "Procedure: author-comparable review" "Procedure: author-comparable review"
+expect_clean "a declared name may hold a colon"
+
+new_case
+extended_guide "Exemplars *from* the corpus" "Exemplars *from* the corpus"
+expect_problem "a refused name states what a name may hold" "separate names with |"
+
+new_case
+extended_guide "Navigation pointers, Procedure: review" "Navigation pointers"
+expect_problem "a comma-separated declaration is told to use |" "(a comma does not separate names; use |)"
+
+# Violations are collected, not raised at the first (wv-273b2d), so a refused
+# declaration's heading must not be reported a second time as undeclared.
+new_case
+extended_guide "Exemplars *from* the corpus" "Exemplars *from* the corpus"
+scan "$TMP/case"; out=$(cat "$TMP/out")
+if grep -qF "separate names with |" <<< "$out" && ! grep -qF "must be declared in frontmatter" <<< "$out"; then
+    pass "a refused declaration is reported once, not again at its heading"
+else
+    fail "a refused declaration is reported once, not again at its heading" "$(sed 's/^/    /' <<< "$out")"
+fi
+
+# A repeated frontmatter key kept the last value and dropped the first.
+new_case
+sed 's|^summary: \(.*\)$|summary: \1\nsummary: a second summary|' "$GUIDES/swallowed-exception.md" \
+    > "$TMP/case/swallowed-exception.md"
+expect_problem "a repeated frontmatter key is rejected" "frontmatter 'summary' appears twice"
+
+# The parser's name pattern and both coaching schemas' label patterns are one
+# rule written three times; they move together or not at all.
+parity=$(python3 - "$ROOT" <<'PY_PARITY'
+import json, sys
+sys.path.insert(0, f"{sys.argv[1]}/scripts")
+from weave_quality.guides import SECTION_NAME_PATTERN
+guide = json.load(open(f"{sys.argv[1]}/contracts/coaching-guide-v1.schema.json"))
+response = json.load(open(f"{sys.argv[1]}/contracts/coaching-response-v1.schema.json"))
+found = []
+def walk(node):
+    if isinstance(node, dict):
+        label = node.get("label")
+        if isinstance(label, dict) and "pattern" in label:
+            found.append(label["pattern"])
+        for value in node.values():
+            walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            walk(value)
+walk(guide); walk(response)
+print("PARITY_OK" if len(found) == 2 and set(found) == {SECTION_NAME_PATTERN.pattern} else f"PARITY_BAD {found}")
+PY_PARITY
+)
+if [ "$parity" = "PARITY_OK" ]; then
+    pass "the schemas' label pattern is the parser's section-name pattern"
+else
+    fail "the schemas' label pattern is the parser's section-name pattern" "    $parity"
+fi
+
 # The four shipped guides carry no declaration and must keep loading unchanged;
 # another consumer's six sit at exactly the fixed set for the same reason.
 # The package scan above already covers that, so what is left is schema drift:
@@ -363,6 +424,25 @@ gdoc "$dp"
     && pass "doctor: a guide that is not UTF-8 is reported invalid, and the report survives" \
     || fail "doctor: a guide that is not UTF-8 is reported invalid, and the report survives" "$(cat "$TMP/gdoc.json")"
 rm -f "$dp/.weave/guides/filler.md"
+# Three faults in one override are three violations in one run, not the first
+# of them (wv-273b2d). The coaching path resolves through the same parser, so it
+# refuses with the same three: the unresolved entry is resolve()'s own error.
+printf -- '---\nid: swallowed-exception\ntitle: Old title\nviolation_type: code:swallowed-exception\nsummary: x\n---\n\n## Why\n\nx\n\n## Corrective move\n\nx\n\n## Avoid\n\na\n\n## Avoid\n\nb\n\n## Extra\n\nc\n' \
+    > "$dp/.weave/guides/swallowed-exception.md"
+gdoc "$dp"
+[ "$GDOC_RC" -eq 0 ] && jq -e '.invalid | length == 1 and (.[0].errors | length == 3
+    and (.[0] | test(":3: unknown frontmatter .title.$")) and (.[1] | test("duplicate section .Avoid."))
+    and (.[2] | test("unknown section .Extra.")))' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: a guide with three faults reports all three, in file order" \
+    || fail "doctor: a guide with three faults reports all three, in file order" "$(cat "$TMP/gdoc.json")"
+# Equality alone held before the fix too, both sides carrying the first fault.
+[ "$GDOC_RC" -eq 0 ] && jq -e '.invalid[0].error as $e
+    | [.unresolved[] | select(.violation_type == "code:swallowed-exception" and .language == null)]
+    | length == 1 and .[0].error == $e
+    and ($e | test("frontmatter .title.") and test("section .Avoid.") and test("section .Extra."))' "$TMP/gdoc.json" >/dev/null \
+    && pass "doctor: the coaching resolution refuses the guide with the same three" \
+    || fail "doctor: the coaching resolution refuses the guide with the same three" "$(cat "$TMP/gdoc.json")"
+rm -f "$dp/.weave/guides/swallowed-exception.md"
 # A project guide serving no catalogued type is reported unused.
 printf -- '---\nid: orphan-note\nviolation_type: code:swallowed-exception\nsummary: x\n---\n\n## Why\n\nx\n\n## Corrective move\n\nx\n' \
     > "$dp/.weave/guides/orphan-note.md"

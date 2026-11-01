@@ -96,6 +96,14 @@ add_in "$R" "delete child probe" --parent="$parent" >/dev/null
 cell "--force records deleting a node with children" delete_preserves_children allow --force \
     w delete "$parent" --force
 
+echo "=== edge invariants and closure ==="
+e1=$(add_in "$R" "edge cell one" --parent="$epic"); e2=$(add_in "$R" "edge cell two" --parent="$epic")
+cell "a self-edge is denied" edge_write_invariants deny - w link "$e1" "$e1" --type=relates_to
+cell "an edge that keeps its invariant is allowed" edge_write_invariants allow - w link "$e1" "$e2" --type=relates_to
+ep=$(add_in "$R" "closure cell parent" --parent="$epic"); add_in "$R" "closure cell child" --parent="$ep" >/dev/null
+cell "closing over an open child is denied" close_children_accounted deny - w done "$ep" --skip-verification --no-warn
+cell "closing a childless node is allowed" close_children_accounted allow - w done "$e2" --skip-verification --no-warn
+
 echo "=== done ==="
 active() {  # active <text> [metadata] -> a claimed node
     local n

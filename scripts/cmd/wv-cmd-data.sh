@@ -287,8 +287,12 @@ _wv_emit_deltas() {
     # staging v2/ dir, so nothing lands in the real tree until publish below.
     # The 7th arg hands over this cycle's lineage_seq so v2 carries the v1 number.
     if [ "${WV_DELTA_V2_WRITE:-1}" = "1" ]; then
-        if ! wv_delta_v2_write_operations "$db" "$staging_dir/v2" "$agent_id" "$weave_dir/deltas" "$watermark" "" "$lineage_seq" >/dev/null; then
-            echo "wv: warning: Delta v2 sidecar write failed; SQL delta remains authoritative" >&2
+        # The warning names the writer's error: a bare "failed" sent wv-38825f
+        # hunting for a traceback that a piped tail had already cut.
+        if ! wv_delta_v2_write_operations "$db" "$staging_dir/v2" "$agent_id" "$weave_dir/deltas" "$watermark" "" "$lineage_seq" >/dev/null 2>"$staging_dir/v2.err"; then
+            local v2_cause
+            v2_cause=$(grep -v '^[[:space:]]*$' "$staging_dir/v2.err" 2>/dev/null | tail -1)
+            echo "wv: warning: Delta v2 sidecar write failed (${v2_cause:-no error output}); SQL delta remains authoritative" >&2
             if [ "${WV_DELTA_V2_STRICT:-0}" = "1" ]; then
                 rm -rf "$staging_dir"
                 printf '%s\n' "$watermark"
@@ -548,7 +552,7 @@ _sync_floor_guard_ok() {
 # not chosen with it, so WEAVE_DIR is the working directory's repository and the
 # DB is some other graph. An override paired with an explicit WEAVE_DIR (a test
 # graph and its own .weave/) is consistent (wv-7ab3cd).
-_wv_db_foreign_to_weave_dir() {
+_wv_db_foreign_to_weave_dir() { # predicate
     [ -n "${WV_DB_CUSTOM:-}" ] && [ -z "${WEAVE_DIR_CUSTOM:-}" ]
 }
 
@@ -592,7 +596,7 @@ _should_persist_weave_state() {
     fi
 
     local node_count edge_count
-    node_count=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '\$.type') IS NOT 'session_history';" 2>/dev/null || echo "0")
+    node_count=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COUNT(*) FROM nodes WHERE $(wv_kind_sql) IS NOT 'session_history';" 2>/dev/null || echo "0")
     edge_count=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COUNT(*) FROM edges;" 2>/dev/null || echo "0")
 
     [ "$node_count" -gt 0 ] || [ "$edge_count" -gt 0 ]
@@ -1034,13 +1038,10 @@ Weave-ID: $first_active"
         # Collapse consecutive weave-auto commits: amend the previous commit when
         # it's (a) an unpushed, (b) .weave/-only checkpoint. This keeps each
         # push boundary to exactly one weave commit instead of N per session.
-        local _cp_branch _cp_local _cp_remote _cp_last_msg _cp_last_nw_files
+        local _cp_branch _cp_local _cp_remote
         _cp_branch=$(git -C "$git_root" branch --show-current 2>/dev/null || echo "main")
         _cp_local=$(git -C "$git_root" rev-parse HEAD 2>/dev/null || echo "")
         _cp_remote=$(git -C "$git_root" rev-parse "origin/$_cp_branch" 2>/dev/null || echo "none")
-        _cp_last_msg=$(git -C "$git_root" log -1 --format='%s' 2>/dev/null || echo "")
-        _cp_last_nw_files=$(git -C "$git_root" diff HEAD~1 HEAD --name-only 2>/dev/null \
-            | grep -v '^\.weave/' | grep -v '^$' || true)
 
         # Skip-when-at-origin guard: if HEAD == remote (nothing unpushed), creating a new
         # checkpoint commit here would interleave noise before the NEXT real commit.
@@ -1050,7 +1051,13 @@ Weave-ID: $first_active"
         # Unstage .weave/ so it doesn't pollute the caller's index.
         # Exception: no remote ("none") — always checkpoint in that case.
         if [ "$_cp_local" = "$_cp_remote" ] && [ "$_cp_remote" != "none" ]; then
-            git -C "$git_root" reset HEAD -- .weave/ >/dev/null 2>&1 || true
+            # The memory projections staged beside the graph go back too; their
+            # rendered content stays in the tree for the commit that takes them.
+            # One reset per path: a pathspec git does not know fails the whole call.
+            local _cp_path
+            for _cp_path in .weave/ "${WV_MEMORY_PROJECTION_PATHS[@]}"; do
+                git -C "$git_root" reset -q HEAD -- "$_cp_path" >/dev/null 2>&1 || true
+            done
             return 0
         fi
 
@@ -1061,9 +1068,9 @@ Weave-ID: $first_active"
         local _cp_skip_ci
         _cp_skip_ci=$(wv_checkpoint_ci_marker "$git_root")
 
-        if [ "$_cp_local" != "$_cp_remote" ] \
-           && [[ "$_cp_last_msg" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] \
-           && [ -z "$_cp_last_nw_files" ]; then
+        # wv_checkpoint_amendable: an unpushed .weave/-only checkpoint that no
+        # in-flight push is publishing (wv-13db30).
+        if wv_checkpoint_amendable "$git_root"; then
             # Amend with fresh timestamp + trailers so Weave-ID stays current
             git -C "$git_root" commit --amend \
                 -m "chore(weave): auto-checkpoint $ts${_cp_skip_ci}${trailers}" \
@@ -1583,24 +1590,16 @@ cmd_sync() {
         # configuration must reach a commit that runs it (wv-2e6341).
         wv_stage_graph_state "$git_root" >/dev/null 2>&1 || true
         if ! git -C "$git_root" diff --cached --quiet 2>/dev/null; then
-            local _sync_now _sync_branch _sync_local_head _sync_remote_head
-            local _sync_last_msg _sync_last_nw_files
+            local _sync_now
             _sync_now=$(date +%s)
-            _sync_branch=$(git -C "$git_root" branch --show-current 2>/dev/null || echo "main")
-            _sync_local_head=$(git -C "$git_root" rev-parse HEAD 2>/dev/null || echo "")
-            _sync_remote_head=$(git -C "$git_root" rev-parse "origin/$_sync_branch" 2>/dev/null || echo "none")
-            _sync_last_msg=$(git -C "$git_root" log -1 --format='%s' 2>/dev/null || echo "")
-            _sync_last_nw_files=$(git -C "$git_root" diff HEAD~1 HEAD --name-only 2>/dev/null \
-                | grep -v '^\.weave/' | grep -v '^$' || true)
 
             # wv-e937f8: see auto_checkpoint's identical comment above.
             local _sync_skip_ci
             _sync_skip_ci=$(wv_checkpoint_ci_marker "$git_root")
 
-            # Amend if last commit is an unpushed weave-only checkpoint (same rule as auto_checkpoint).
-            if [ "$_sync_local_head" != "$_sync_remote_head" ] \
-               && [[ "$_sync_last_msg" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] \
-               && [ -z "$_sync_last_nw_files" ]; then
+            # Amend if last commit is an unpushed weave-only checkpoint no
+            # in-flight push is publishing (the rule auto_checkpoint applies).
+            if wv_checkpoint_amendable "$git_root"; then
                 git -C "$git_root" commit --amend --no-edit \
                     --no-verify --quiet 2>/dev/null || \
                 git -C "$git_root" commit \
@@ -2791,15 +2790,22 @@ _commit_refs_scan() {
     ' "$workdir/pairs" > "$workdir/rows"
 }
 
-# _commit_refs_print_detail <workdir> <rows-file> — print one line per ref,
-# tagged checkpoint / regular / unknown.
-#
-# Subjects are resolved in ONE batched `git log --stdin` rather than a call per
-# ref: `--all` over this repo's own graph is ~1900 refs, and the per-ref form
-# took 21s where the batched form takes under a second.
-# _commit_refs_kinds <workdir> <rows-file> — emit "<recorded_ref>\t<kind>",
-# kind being checkpoint | regular | unknown. Subjects are resolved in ONE
-# batched `git log --stdin`; a per-ref call took 21s over this graph.
+# _commit_refs_kinds <workdir> <rows-file> — emit
+# "<recorded_ref>\t<kind>\t<reason>\t<why>" for each "<node>\t<ref>\t<class>" row.
+# kind is checkpoint | regular | unknown. An orphan also carries why it is one
+# (wv-6d53ec): the sweep offered --prune for refs it never explained, so a
+# provenance loss could not be told from the churn of an amend.
+#   amended      unreachable; a reachable commit has its author, author date and
+#                parent, which is what `git commit --amend` leaves
+#   rebased      a reachable commit has its author, author date and subject
+#   reset        unreachable, still in HEAD's reflog: a reset or rebase dropped it
+#   dropped      no ref or reflog reaches it: reset, squashed, or its branch deleted
+#   not_in_clone not in this object database: made in another clone and never
+#                pushed here, or garbage-collected after it was replaced
+#   ambiguous    an abbreviation several objects share
+#   not_a_commit the recorded value names no commit
+# Git is asked in batches, never once per ref: a per-ref call over this graph
+# took 21s.
 _commit_refs_kinds() {
     local workdir="$1" src="$2"
 
@@ -2811,60 +2817,86 @@ _commit_refs_kinds() {
 
     : > "$workdir/kind_subjects"
     if [ -s "$workdir/kind_oids" ]; then
-        git log --no-walk --stdin --format='%H%x09%s' < "$workdir/kind_oids" \
+        git log --no-walk --stdin --date=raw --format='%H%x09%ae %ad%x09%P%x09%s' < "$workdir/kind_oids" \
             > "$workdir/kind_subjects" 2>/dev/null || : > "$workdir/kind_subjects"
     fi
+    # The replacement index and the reflog are read only when an unreachable
+    # ref needs them.
+    : > "$workdir/kind_reachable"; : > "$workdir/kind_reflog"
+    if awk -F'\t' '$3 == "unreachable" { found = 1; exit } END { exit !found }' "$src"; then
+        git log --all --date=raw --format='%ae %ad%x09%H%x09%P%x09%s' > "$workdir/kind_reachable" 2>/dev/null \
+            || : > "$workdir/kind_reachable"
+        git reflog --format=%H > "$workdir/kind_reflog" 2>/dev/null || : > "$workdir/kind_reflog"
+    fi
 
-    awk -F'\t' -v oidmap="$workdir/oidmap" -v subjects="$workdir/kind_subjects" '
+    awk -F'\t' -v oidmap="$workdir/oidmap" -v subjects="$workdir/kind_subjects" \
+        -v reach="$workdir/kind_reachable" -v reflog="$workdir/kind_reflog" -v resolved="$workdir/resolved" '
         BEGIN {
             while ((getline line < oidmap) > 0)   { split(line, f, "\t"); M[f[1]] = f[2] }
-            while ((getline line < subjects) > 0) { split(line, f, "\t"); S[f[1]] = f[2] }
+            # What cat-file said of each recorded ref: commit, tree, ambiguous, missing.
+            while ((getline line < resolved) > 0) { n = split(line, f, " "); T[f[1]] = f[n] }
+            while ((getline line < subjects) > 0) {
+                split(line, f, "\t"); KEY[f[1]] = f[2]; PAR[f[1]] = f[3]; S[f[1]] = f[4]
+            }
+            # The newest reachable commit (git log lists newest first) per author,
+            # author date and parent (an amend), and per author, author date and
+            # subject (a rebase). Author and date alone are only second-precise.
+            while ((getline line < reach) > 0) {
+                split(line, f, "\t")
+                if (!((f[1] SUBSEP f[3]) in AM)) AM[f[1] SUBSEP f[3]] = f[2]
+                if (!((f[1] SUBSEP f[4]) in RB)) RB[f[1] SUBSEP f[4]] = f[2]
+            }
+            while ((getline line < reflog) > 0) { RL[line] = 1 }
         }
         {
-            kind = "unknown"
-            if ($2 in M) {
-                subject = S[M[$2]]
+            kind = "unknown"; reason = ""; why = ""
+            oid = ($2 in M) ? M[$2] : ""
+            if (oid != "") {
+                subject = S[oid]
                 if (subject ~ /^chore\(weave\): auto-checkpoint/ ||
                     subject ~ /^chore\(weave\): sync state/ ||
                     subject ~ /^chore\(weave\): session-start state/) { kind = "checkpoint" }
                 else if (subject != "") { kind = "regular" }
             }
-            print $2 "\t" kind
+            if ($3 == "unreachable") {
+                k = KEY[oid]
+                if (k != "" && ((k SUBSEP PAR[oid]) in AM)) {
+                    reason = "amended"; why = "amended: now " substr(AM[k SUBSEP PAR[oid]], 1, 9)
+                } else if (k != "" && ((k SUBSEP S[oid]) in RB)) {
+                    reason = "rebased"; why = "rebased: now " substr(RB[k SUBSEP S[oid]], 1, 9)
+                } else if (oid in RL) {
+                    reason = "reset"; why = "dropped by a reset or rebase (still in the reflog)"
+                } else {
+                    reason = "dropped"; why = "no ref or reflog reaches it: reset, squashed, or its branch deleted"
+                }
+            } else if ($3 == "missing") {
+                if (T[$2] == "ambiguous") {
+                    reason = "ambiguous"; why = "an abbreviation several objects share: record the full id"
+                } else if (T[$2] != "missing" && T[$2] != "") {
+                    reason = "not_a_commit"; why = "names a " T[$2] ", not a commit"
+                } else if ($2 ~ /^[0-9a-f]+$/ && length($2) >= 4) {
+                    reason = "not_in_clone"
+                    why = "not in this clone: made in another clone and never pushed, or garbage-collected after it was replaced"
+                } else {
+                    reason = "not_a_commit"; why = "not a commit id"
+                }
+            }
+            print $2 "\t" kind "\t" reason "\t" why
         }
     ' "$src"
 }
 
+# _commit_refs_print_detail <workdir> <rows-file> — one line per ref: node, ref,
+# class, kind, and for an orphan why it is one. Reuses _commit_refs_kinds, of
+# which this was a copy.
 _commit_refs_print_detail() {
     local workdir="$1" src="$2"
-
-    awk 'NF >= 3 && $3 == "commit" { print $1 "\t" $2 }' "$workdir/resolved" > "$workdir/oidmap"
-
-    awk -F'\t' -v oidmap="$workdir/oidmap" '
-        BEGIN { while ((getline line < oidmap) > 0) { split(line, f, "\t"); M[f[1]] = f[2] } }
-        { if ($2 in M) print M[$2] }
-    ' "$src" | sort -u > "$workdir/detail_oids"
-
-    : > "$workdir/subjects"
-    if [ -s "$workdir/detail_oids" ]; then
-        git log --no-walk --stdin --format='%H%x09%s' < "$workdir/detail_oids" \
-            > "$workdir/subjects" 2>/dev/null || : > "$workdir/subjects"
-    fi
-
-    awk -F'\t' -v oidmap="$workdir/oidmap" -v subjects="$workdir/subjects" '
-        BEGIN {
-            while ((getline line < oidmap) > 0)   { split(line, f, "\t"); M[f[1]] = f[2] }
-            while ((getline line < subjects) > 0) { split(line, f, "\t"); S[f[1]] = f[2] }
-        }
+    _commit_refs_kinds "$workdir" "$src" > "$workdir/detail_kinds" 2>/dev/null || : > "$workdir/detail_kinds"
+    awk -F'\t' -v kinds="$workdir/detail_kinds" '
+        BEGIN { while ((getline line < kinds) > 0) { split(line, f, "\t"); K[f[1]] = f[2]; W[f[1]] = f[4] } }
         {
-            kind = "unknown"
-            if ($2 in M) {
-                subject = S[M[$2]]
-                if (subject ~ /^chore\(weave\): auto-checkpoint/ ||
-                    subject ~ /^chore\(weave\): sync state/ ||
-                    subject ~ /^chore\(weave\): session-start state/) { kind = "checkpoint" }
-                else if (subject != "") { kind = "regular" }
-            }
-            printf "  %-12s %-40s %-11s %s\n", $1, $2, $3, kind
+            kind = ($2 in K) ? K[$2] : "unknown"
+            printf "  %-12s %-40s %-11s %-10s %s\n", $1, $2, $3, kind, W[$2]
         }
     ' "$src"
 }
@@ -3101,6 +3133,7 @@ cmd_commit_refs() {
         echo "wv commit-refs: not a git repository — nothing to verify refs against" >&2
         return 1
     fi
+    wv_require_graph || return 1
 
     local pushed_ref degraded=false
     pushed_ref=$(_commit_refs_pushed_ref) || { pushed_ref=""; degraded=true; }
@@ -3228,10 +3261,17 @@ cmd_commit_refs() {
         # The rows go to jq through a FILE, never through an argv-sized argument:
         # --argjson with this repository's ~1900 refs blows the per-argument limit
         # (E2BIG), and the old form swallowed it, exiting 0 with empty stdout.
-        if ! awk -F'\t' '{print $1 "\t" $2 "\t" $3}' "$detail_src" \
+        # An orphan row carries its kind and why it is orphaned (wv-6d53ec).
+        [ -f "$workdir/orphan_kinds" ] || : > "$workdir/orphan_kinds"
+        if ! awk -F'\t' -v kinds="$workdir/orphan_kinds" '
+                BEGIN { while ((getline line < kinds) > 0) { split(line, f, "\t"); K[f[1]] = f[2]; R[f[1]] = f[3]; W[f[1]] = f[4] } }
+                { print $1 "\t" $2 "\t" $3 "\t" K[$2] "\t" R[$2] "\t" W[$2] }' "$detail_src" \
             | jq -R -s '
                 [ split("\n")[] | select(length > 0) | split("\t")
-                  | {node: .[0], ref: .[1], class: .[2]} ]' > "$workdir/refs.json" 2>/dev/null; then
+                  | {node: .[0], ref: .[1], class: .[2]}
+                    + (if (.[3] // "") != "" then {kind: .[3]} else {} end)
+                    + (if (.[4] // "") != "" then {reason: .[4], why: .[5]} else {} end) ]' \
+                > "$workdir/refs.json" 2>/dev/null; then
             echo "wv commit-refs: failed to serialize ref rows" >&2
             rm -rf "$workdir"
             return 1
@@ -3299,6 +3339,11 @@ cmd_commit_refs() {
             echo ""
             _commit_refs_print_detail "$workdir" "$detail_src"
         fi
+        # Offered after the reasons, so a ref is removed knowing why (wv-6d53ec).
+        if [ "$prune" != true ] && [ "$((unreachable + missing))" -gt 0 ]; then
+            echo ""
+            echo "Remove the orphaned refs from their nodes: wv commit-refs --prune (preview: wv commit-refs --prune --dry-run)"
+        fi
     fi
 
     if [ "$prune" = true ] && [ "$format" = "text" ]; then
@@ -3351,7 +3396,9 @@ cmd_compact() {
 
     # Coordination gate: refuse to compact while other agents hold active claims.
     # Deleting delta files that a concurrent agent hasn't replayed causes silent
-    # divergence — those changes are permanently lost for that agent.
+    # divergence — those changes are permanently lost for that agent. An
+    # unreadable graph read as zero claims and let deletion proceed (wv-90083c).
+    wv_require_graph || return 1
     local active_claims
     active_claims=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND json_extract(metadata, '\$.claimed_by') IS NOT NULL;" 2>/dev/null || echo "0")
     if [ "$active_claims" -gt 0 ] && [ "$force" = true ]; then
@@ -3522,7 +3569,8 @@ cmd_prune() {
         esac
         shift
     done
-    
+    wv_require_graph || return 1
+
     # Validate age format: must be Nh or Nd (numeric hours or days)
     local age_num age_unit
     case "$age" in
@@ -3567,14 +3615,11 @@ cmd_prune() {
         WHERE status = 'done'
         $age_clause
         $orphan_clause
-        AND COALESCE(json_extract(metadata, '\$.type'), '') NOT IN ('finding', 'memory')
+        AND COALESCE($(wv_kind_sql), '') NOT IN ('finding', 'memory')
         AND id NOT IN (
             SELECT n.id FROM nodes n
             WHERE json_extract(n.metadata, '\$.pitfall') IS NOT NULL
-            AND n.id NOT IN (
-                SELECT e.target FROM edges e
-                WHERE e.type IN ('addresses', 'implements', 'supersedes')
-            )
+            AND n.id NOT IN (SELECT pitfall FROM ($(wv_pitfall_resolver_edges_sql)))
         );
     ")
     
@@ -3829,7 +3874,10 @@ cmd_unarchive() {
                 echo "  --with-edges   Also reconstruct edges whose other endpoint is live"
                 return 0
                 ;;
-            wv-*) node_id="$1" ;;
+            wv-*)
+                # A second id replaced the first, which was never restored (wv-51bd63).
+                [ -z "$node_id" ] || { _wv_reject_arg unarchive "$1"; return 1; }
+                node_id="$1" ;;
             *)
                 echo -e "${RED}Error: unknown argument: $1${NC}" >&2
                 echo "Usage: wv unarchive <id> [--dry-run] [--with-edges]" >&2
@@ -3980,6 +4028,7 @@ cmd_learnings() {
         esac
         shift
     done
+    wv_require_graph || return 1
     local mode
     mode=$(wv_resolve_mode "$mode_arg")
 
@@ -4106,14 +4155,17 @@ cmd_learnings() {
     fi
 
     # wv-18b8f5 (external code review round 3 re-audit): wv resolve rewrites
-    # a contradicts edge into a supersedes edge (winner -> loser, wv-cmd-
-    # graph.sh's cmd_resolve) and that protects wv preflight, but a
-    # retracted learning kept printing verbatim here with no marker -- the
-    # text is deliberately KEPT (not mutated), so it must be KEPT AND
-    # LABELLED. One query up front (loser id -> winner id) covers both
-    # formatters below without a per-row query in the fast text path.
+    # a contradicts edge into a supersedes edge and that protects wv
+    # preflight, but a retracted learning kept printing verbatim here with no
+    # marker -- the text is deliberately KEPT (not mutated), so it must be
+    # KEPT AND LABELLED. One query up front (loser id -> winner id) covers
+    # both formatters below without a per-row query in the fast text path.
+    # The target replaces the source (contracts/edge-types-v1.json), so the
+    # loser is the source; this read winner -> loser, which matched what
+    # resolve wrote and labelled every remember --supersedes successor as
+    # superseded by its predecessor (wv-76b361).
     local superseded_map
-    superseded_map=$(db_query_json "SELECT target AS loser, source AS winner FROM edges WHERE type='supersedes';" 2>/dev/null | \
+    superseded_map=$(db_query_json "SELECT source AS loser, target AS winner FROM edges WHERE type='supersedes';" 2>/dev/null | \
         jq -c '[.[] | {(.loser): .winner}] | add // {}' 2>/dev/null || echo '{}')
 
     # Fast path: single jq call formats all output (avoids N*9 subprocess spawns)
@@ -4136,7 +4188,9 @@ _learnings_format_text() {
     printf -v _cyan '%b' "$CYAN"
     printf -v _nc '%b' "$NC"
     echo "$results" | jq -r --arg G "$_green" --arg Y "$_yellow" \
-        --arg C "$_cyan" --arg N "$_nc" --argjson SUP "$superseded_map" '
+        --arg C "$_cyan" --arg N "$_nc" --slurpfile SUP <(printf '%s' "$superseded_map") '
+        # Every supersedes edge in the graph: a file, not argv (wv-200d36).
+        $SUP[0] as $SUP |
         .[] |
         .id as $id | .text as $text |
         ($SUP[$id] // null) as $winner |
@@ -4234,7 +4288,7 @@ _learnings_format_graph() {
         if [ -n "$_lg_winner" ]; then
             echo -e "  ${YELLOW}[SUPERSEDED by $_lg_winner]${NC} — retained verbatim below, not authoritative"
             local _lg_rationale
-            _lg_rationale=$(db_query_json "SELECT context FROM edges WHERE type='supersedes' AND source='$_lg_winner' AND target='$id';" 2>/dev/null | \
+            _lg_rationale=$(db_query_json "SELECT context FROM edges WHERE type='supersedes' AND source='$id' AND target='$_lg_winner';" 2>/dev/null | \
                 jq -r '.[0].context // "" | (try fromjson catch {}).reason // empty' 2>/dev/null)
             [ -n "$_lg_rationale" ] && echo "    Rationale: $_lg_rationale"
         fi
@@ -4463,7 +4517,7 @@ _refs_link() {
 }
 
 cmd_refs() {
-    local input=""
+    local input="" input_given=0
     local source_file=""
     local max_refs=10
     local output_format="text"
@@ -4472,16 +4526,23 @@ cmd_refs() {
     local interactive=false
 
     # Parse arguments: wv refs <file>, wv refs -t "text", or stdin
+    # A second input replaced the first, and an unknown option was read as the
+    # text to scan; both are refused (wv-51bd63).
     while [ $# -gt 0 ]; do
         case "$1" in
-            -t) shift; input="$1" ;;
+            -t)
+                [ "$input_given" = 0 ] || { _wv_reject_arg refs "$1"; return 1; }
+                shift; input="${1:-}"; input_given=1 ;;
             --max=*) max_refs="${1#*=}" ;;
             --output=*) output_format="${1#*=}" ;;
             --json) output_format="json" ;;
             --link) link_mode=true ;;
             --from=*) from_node="${1#*=}" ;;
             --interactive) interactive=true ;;
+            -*) _wv_reject_arg refs "$1"; return 1 ;;
             *)
+                [ "$input_given" = 0 ] || { _wv_reject_arg refs "$1"; return 1; }
+                input_given=1
                 if [ -f "$1" ]; then
                     source_file="$1"
                     input=$(cat "$1")
@@ -4586,8 +4647,12 @@ cmd_batch() {
         case "$1" in
             --dry-run) dry_run=true ;;
             --stop-on-error) stop_on_error=true ;;
-            --*) ;;
-            *) file="$1" ;;
+            # A mistyped --dry-run was skipped and every command ran for real;
+            # a second file replaced the first, which never ran (wv-51bd63).
+            -*) _wv_reject_arg batch "$1"; return 1 ;;
+            *)
+                [ -z "$file" ] || { _wv_reject_arg batch "$1"; return 1; }
+                file="$1" ;;
         esac
         shift
     done
@@ -4629,14 +4694,39 @@ cmd_batch() {
             continue
         fi
 
-        # Parse the line as a wv command (strip leading "wv " if present)
-        local cmd_line="$line"
-        cmd_line="${cmd_line#wv }"
+        # Split the line by shell quoting rules, with no expansion. An unquoted
+        # $line word-split on spaces, kept quotes as literal text ('add "a b"'
+        # stored "a b" with its quotes) and expanded a * against the working
+        # directory (wv-aa42a9). shlex quotes like the shell and expands nothing.
+        # The first field is a status word so a parse error survives mapfile.
+        local -a argv=()
+        mapfile -d '' -t argv < <(printf '%s' "$line" | python3 -c '
+import shlex, sys
+try:
+    args = shlex.split(sys.stdin.read())
+except ValueError as e:
+    args = ["err", str(e)]
+else:
+    args = ["ok"] + (args[1:] if args[:1] == ["wv"] else args)
+sys.stdout.write("".join(a + "\0" for a in args))
+')
+        if [ "${argv[0]:-}" != "ok" ] || [ "${#argv[@]}" -lt 2 ]; then
+            echo -e "${RED}✗ Line $total failed:${NC} $line (${argv[1]:-empty command})" >&2
+            failed=$((failed + 1))
+            if [ "$stop_on_error" = true ]; then
+                echo -e "${RED}Stopping on error (--stop-on-error)${NC}" >&2
+                break
+            fi
+            continue
+        fi
 
-        # Execute via the main dispatch (call ourselves)
+        # Execute via the main dispatch (call ourselves). stdin is closed: the
+        # loop reads the batch from fd 0, so a command that reads stdin (refs
+        # with no argument) consumed the remaining lines and they never ran,
+        # while the summary counted only the lines it saw (wv-aa42a9).
         local script_path
         script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/wv"
-        if bash "$script_path" $cmd_line 2>&1; then
+        if bash "$script_path" "${argv[@]:1}" </dev/null 2>&1; then
             success=$((success + 1))
         else
             echo -e "${RED}✗ Line $total failed:${NC} $line" >&2
@@ -4941,8 +5031,8 @@ cmd_search() {
         echo "Usage: wv search <query> [--limit=N] [--json] [--status=STATUS]" >&2
         return 1
     fi
-    
-    db_ensure
+
+    wv_require_graph || return 1
 
     # Ensure FTS5 table exists (migration for existing DBs)
     db_migrate_fts5
@@ -4982,7 +5072,7 @@ cmd_search() {
     local type_clause=""
     if [ -n "$type_filter" ]; then
         local safe_type="${type_filter//\'/\'\'}"
-        type_clause="AND json_extract(n.metadata, '\$.type') = '$safe_type'"
+        type_clause="AND $(wv_kind_sql n) = '$safe_type'"
     fi
 
     local learning_clause=""
@@ -5158,8 +5248,13 @@ cmd_trails() {
         case "$1" in
             --message=*|--msg=*) message="${1#*=}"; message_given=1 ;;
             --json=*) entry_json="${1#*=}"; json_given=1 ;;
-            save|show|clear|capsule) action="$1" ;;
-            wv-*) target_id="$1" ;;
+            # The action is $1, so a second action word, a second id, or any
+            # unmatched word (--message "x" saved an empty trail) is refused
+            # instead of replacing or dropping what came first (wv-51bd63).
+            wv-*)
+                [ -z "$target_id" ] || { _wv_reject_arg trails "$1"; return 1; }
+                target_id="$1" ;;
+            *) _wv_reject_arg trails "$1"; return 1 ;;
         esac
         shift
     done
@@ -5537,7 +5632,7 @@ _trails_save() {
                 local meta_raw
                 meta_raw=$(echo "$row" | jq -r '.metadata // "{}"')
                 [[ "$meta_raw" != "{"* ]] && meta_raw=$(echo "$meta_raw" | jq -r '.' 2>/dev/null || echo "{}")
-                ntype=$(_tr_flatten "$(echo "$meta_raw" | jq -r '.type // "task"' 2>/dev/null)")
+                ntype=$(_tr_flatten "$(echo "$meta_raw" | jq -r '.node_kind // .type // "task"' 2>/dev/null)")
                 echo "- **$nid** ($ntype): $ntext"
             done
             echo ""
@@ -6011,8 +6106,12 @@ cmd_plan() {
             --dry-run)  dry_run=true ;;
             --gh)       create_gh=true ;;
             --template) show_template=true ;;
-            --*)        ;; # skip unrecognized flags
-            *)          file="$1" ;;
+            # A mistyped --dry-run was skipped and the plan was imported; a
+            # second file replaced the first (wv-51bd63).
+            -*)         _wv_reject_arg plan "$1"; return 1 ;;
+            *)
+                [ -z "$file" ] || { _wv_reject_arg plan "$1"; return 1; }
+                file="$1" ;;
         esac
         shift
     done
@@ -6270,4 +6369,190 @@ EOF
     fi
 
     echo -e "${GREEN}✓${NC} Topology enrichment complete for epic $epic_id ($action_count actions)"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# cmd_kind — the typed node kind (ontology S1, wv-f7dfd3)
+# ═══════════════════════════════════════════════════════════════════════════
+
+cmd_kind_help() {
+    cat <<'EOF'
+Usage: wv kind backfill [--apply] [--json]
+
+Give every node a kind (metadata.node_kind, mirrored to metadata.type) by the
+backfill rule in contracts/node-kinds-v1.json: node_kind, then type (a type
+outside the kinds becomes task), then the text prefix (epic(, plan:, ...; any
+other prefix is a task), then unknown.
+
+Without --apply nothing is written; the report gives counts by kind and by
+source, the types outside the kinds, the nodes whose prefix names another kind,
+and what the backfill does to wv ready. --apply refuses when wv ready would
+change, since no kind the backfill writes is meant to hide or surface work.
+EOF
+}
+
+cmd_kind() {
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        backfill) _kind_backfill "$@" ;;
+        --help|-h|help|"") cmd_kind_help ;;
+        *)
+            echo -e "${RED}Error: unknown kind subcommand '$sub'${NC}" >&2
+            echo "Run 'wv kind --help' for usage." >&2
+            return 1 ;;
+    esac
+}
+
+# _kind_ready_ids — the ids wv ready --all lists, sorted, one per line.
+_kind_ready_ids() {
+    local out
+    out=$(cmd_ready --all --json 2>/dev/null) || return 1
+    printf '%s' "$out" | jq -r '.[].id' | sort
+}
+
+_kind_backfill() {
+    local apply=false format=text
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --apply) apply=true ;;
+            --json) format=json ;;
+            --help|-h) cmd_kind_help; return 0 ;;
+            *) _wv_reject_arg "kind backfill" "$1"; return 1 ;;
+        esac
+        shift
+    done
+    db_ensure || return 1
+
+    local work rc=0
+    work=$(mktemp -d "${TMPDIR:-/tmp}/wv-kind-backfill.XXXXXX") || return 1
+    _kind_backfill_run "$work" "$apply" "$format" || rc=$?
+    rm -rf "$work"
+    return "$rc"
+}
+
+_kind_backfill_run() {
+    local work="$1" apply="$2" format="$3"
+    local plan sql="$work/backfill.sql" copy="$work/copy.db"
+    plan=$(db_query_json "SELECT id, text, status, metadata FROM nodes;" \
+        | jq -c "$WV_KIND_JQ_DEFS"' [.[] | wv_backfill_kind]') || {
+        echo -e "${RED}Error: could not read the nodes to plan the backfill${NC}" >&2
+        return 1
+    }
+
+    # One transaction. json_set keeps every other key, and updated_at is left
+    # alone: recording a node's kind is not an edit of the node.
+    local jq_sql
+    jq_sql=$(cat <<'JQ'
+def sq: "'" + gsub("'"; "''") + "'";
+"BEGIN IMMEDIATE;",
+(.[] | select(.write)
+ | "UPDATE nodes SET metadata = json_set(COALESCE(metadata, '{}'), '$.node_kind', \(.kind | sq), '$.type', \(.kind | sq)) WHERE id = \(.id | sq);"),
+"COMMIT;"
+JQ
+)
+    jq -r "$jq_sql" <<< "$plan" > "$sql" || return 1
+
+    # Judge the effect on wv ready on a copy, so --apply can refuse before the
+    # live graph changes. The copy is taken through SQLite (.backup), never by
+    # copying the file under a live connection.
+    local before after
+    if ! sqlite3 -cmd ".timeout 5000" "$WV_DB" ".backup '$copy'" \
+        || ! sqlite3 -batch -cmd ".timeout 5000" "$copy" < "$sql" >/dev/null; then
+        echo -e "${RED}Error: could not rehearse the backfill on a copy of the graph${NC}" >&2
+        return 1
+    fi
+    before=$(_kind_ready_ids) || { echo -e "${RED}Error: could not list wv ready${NC}" >&2; return 1; }
+    after=$(WV_DB="$copy"; WV_DB_CUSTOM=1; _WV_DB_READY=""; _kind_ready_ids) || {
+        echo -e "${RED}Error: could not list wv ready on the rehearsal copy${NC}" >&2
+        return 1
+    }
+
+    local summary
+    summary=$(jq -c --arg before "$before" --arg after "$after" '
+        ($before | split("\n") | map(select(length > 0))) as $b
+        | ($after | split("\n") | map(select(length > 0))) as $a
+        | {nodes: length,
+           to_write: (map(select(.write)) | length),
+           by_kind: (group_by(.kind) | map({key: .[0].kind, value: length}) | from_entries),
+           by_source: (group_by(.source) | map({key: .[0].source, value: length}) | from_entries),
+           type_outside_kinds: [.[] | select(.source == "type_outside_kinds") | {id, status, type}],
+           mirror_mismatches: [.[] | select(.mirror_mismatch) | {id, status, kind, type}],
+           disagreements: [.[] | select(.disagrees) | {id, status, prefix, kind}],
+           ready: {before: ($b | length), after: ($a | length), added: ($a - $b), removed: ($b - $a)},
+           applied: false}' <<< "$plan") || return 1
+
+    local ready_changed to_write refused=false
+    ready_changed=$(jq -r '(.ready.added + .ready.removed) | length' <<< "$summary")
+    to_write=$(jq -r '.to_write' <<< "$summary")
+    if [ "$apply" = true ] && [ "$ready_changed" != 0 ]; then
+        refused=true
+    elif [ "$apply" = true ] && [ "$to_write" != 0 ]; then
+        if ! sqlite3 -batch -cmd ".timeout 5000" "$WV_DB" < "$sql" >/dev/null; then
+            echo -e "${RED}Error: the backfill transaction failed; nothing was written${NC}" >&2
+            return 1
+        fi
+        # shellcheck disable=SC2046  # one id per word
+        invalidate_context_cache $(jq -r '.[] | select(.write) | .id' <<< "$plan")
+        if ! auto_sync --force; then
+            echo -e "${RED}Error: kinds were written locally, but portable sync failed; resolve the error and run 'wv sync'${NC}" >&2
+            return 1
+        fi
+        summary=$(jq -c '.applied = true' <<< "$summary")
+    fi
+
+    if [ "$format" = json ]; then
+        printf '%s\n' "$summary"
+    else
+        jq -r --arg apply "$apply" '
+            def counts: to_entries | sort_by(-.value) | map("\(.key) \(.value)") | join(", ");
+            (if .applied then "Node kind backfill: applied"
+             elif $apply == "true" then "Node kind backfill: refused"
+             else "Node kind backfill: dry run (--apply writes)" end),
+            "  nodes: \(.nodes), to write: \(.to_write)",
+            "  by kind:   \(.by_kind | counts)",
+            "  by source: \(.by_source | counts)",
+            (if (.type_outside_kinds | length) > 0 then
+                "  type outside the kinds, written as task: "
+                + (.type_outside_kinds | map("\(.id) (\(.type))") | join(", ")) else empty end),
+            (if (.mirror_mismatches | length) > 0 then
+                "  node_kind and type disagreed, type rewritten to node_kind: "
+                + (.mirror_mismatches | map("\(.id) (\(.type) -> \(.kind))") | join(", ")) else empty end),
+            (if (.disagreements | length) > 0 then
+                "  prefix names another kind: \(.disagreements | length) (\(.disagreements | map(select(.status != "done")) | length) open)",
+                (.disagreements | map(select(.status != "done")) | .[] | "    \(.id) [\(.status)] \(.prefix) -> \(.kind)")
+             else empty end),
+            (if ((.ready.added + .ready.removed) | length) == 0 then
+                "  wv ready: unchanged (\(.ready.before) nodes)"
+             else
+                "  wv ready: would change, \(.ready.before) -> \(.ready.after) nodes",
+                (.ready.added[] | "    + \(.)"), (.ready.removed[] | "    - \(.)")
+             end)' <<< "$summary"
+    fi
+
+    if [ "$refused" = true ]; then
+        echo -e "${RED}Error: the backfill would change wv ready; nothing was written${NC}" >&2
+        echo "  A kind that hides or surfaces work is a mapping question for the owner (D2, wv-f7dfd3)." >&2
+        return 1
+    fi
+}
+
+# _save_session_snapshot — session activity tracking for wv load.
+# Moved unchanged from wv-cmd-ops.sh (wv-c153c4), so wv load no longer loads that module.
+_save_session_snapshot() {
+    local snapshot="$WV_HOT_ZONE/.session_snapshot"
+    local total done_count learnings
+    # Exclude internal session_history singleton from counts so cross-session
+    # delta math (cmd_session_summary) is not skewed by the hygiene record.
+    total=$(db_query "SELECT COUNT(*) FROM nodes WHERE $(wv_kind_sql) IS NOT 'session_history';" 2>/dev/null || echo 0)
+    done_count=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='done' AND $(wv_kind_sql) IS NOT 'session_history';" 2>/dev/null || echo 0)
+    learnings=$(db_query "
+        SELECT COUNT(*) FROM nodes
+        WHERE (json_extract(metadata, '\$.learning') IS NOT NULL
+           OR json_extract(metadata, '\$.decision') IS NOT NULL
+           OR json_extract(metadata, '\$.pattern') IS NOT NULL
+           OR json_extract(metadata, '\$.pitfall') IS NOT NULL)
+          AND $(wv_kind_sql) IS NOT 'session_history';
+    " 2>/dev/null || echo 0)
+    printf '%s\t%s\t%s\t%s\n' "$(date -u +%s)" "$total" "$done_count" "$learnings" > "$snapshot"
 }

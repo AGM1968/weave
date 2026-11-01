@@ -140,8 +140,8 @@
         "reason": "Rebuilds, restores or garbage-collects graph state from disk or policy rather than deciding on new work; no declared rule refuses it. Closes a load replays are declared as infrastructure failure, not decisions."
       },
       {
-        "operation": "link",
-        "reason": "Adds or removes an annotation, edge or attribution without changing node status; no declared rule refuses it."
+        "operation": "kind",
+        "reason": "Records each node's kind from its own metadata and text without changing node status; its refusal when wv ready would change is a consistency check on the mapping, and no declared rule refuses it."
       },
       {
         "operation": "load",
@@ -728,6 +728,84 @@
       ]
     },
     {
+      "rule_id": "edge_write_invariants",
+      "summary": "An edge may not break its type's invariant (contracts/edge-types-v1.json): no self-edge, acyclic blocks and implements, supersedes old to new unless declared, resolves to a finding, addresses from the newer node.",
+      "basis": "invariant",
+      "decisions": ["allow", "deny"],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "link"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-graph.sh",
+          "function": "cmd_link",
+          "anchor": "wv_policy_verdict edge_write_invariants",
+          "occurrences": 2
+        }
+      ]
+    },
+    {
+      "rule_id": "close_children_accounted",
+      "summary": "A node may not close over an open implements child that is not parked, linked by resolves, or under another open parent.",
+      "basis": "invariant",
+      "decisions": ["allow", "deny"],
+      "applies_to": [
+        {
+          "kind": "operation",
+          "operation": "done"
+        },
+        {
+          "kind": "operation",
+          "operation": "ship"
+        },
+        {
+          "kind": "operation",
+          "operation": "ship-agent"
+        },
+        {
+          "kind": "operation",
+          "operation": "batch-done"
+        },
+        {
+          "kind": "operation",
+          "operation": "update"
+        },
+        {
+          "kind": "operation",
+          "operation": "bulk-update"
+        },
+        {
+          "kind": "operation",
+          "operation": "quick"
+        },
+        {
+          "kind": "operation",
+          "operation": "resolve"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_children_gate",
+          "anchor": "wv_policy_verdict close_children_accounted",
+          "occurrences": 2
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_close_children_not_engaged",
+          "anchor": "wv_policy_verdict close_children_accounted"
+        }
+      ]
+    },
+    {
       "rule_id": "sync_shrink_floor",
       "summary": "A sync may not overwrite the committed graph with a dump far smaller than it, the signature of a wiped or partial hot zone.",
       "basis": "invariant",
@@ -834,14 +912,14 @@
       "sites": [
         {
           "owner": "command_gate",
-          "path": "scripts/cmd/wv-cmd-ops.sh",
+          "path": "scripts/cmd/wv-cmd-recover.sh",
           "function": "_recover_ship",
           "anchor": "wv_policy_verdict recovery_never_fabricates_closure",
           "occurrences": 2
         },
         {
           "owner": "command_gate",
-          "path": "scripts/cmd/wv-cmd-ops.sh",
+          "path": "scripts/cmd/wv-cmd-recover.sh",
           "function": "cmd_recover",
           "anchor": "wv_policy_verdict recovery_never_fabricates_closure"
         }
@@ -1512,7 +1590,7 @@
         {
           "owner": "host_hook",
           "path": "scripts/lib/wv-pre-tool-use.sh",
-          "anchor": "already running — wait for the task-notification"
+          "anchor": "Duplicate command blocked [\\($key), \\($age)s old"
         },
         {
           "owner": "host_hook",
@@ -1677,6 +1755,12 @@
           "anchor": "wv_policy_refusal infrastructure_failure"
         },
         {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_done_children_gate",
+          "anchor": "wv_policy_refusal infrastructure_failure"
+        },
+        {
           "owner": "sqlite_trigger",
           "path": "scripts/cmd/wv-cmd-core.sh",
           "function": "_done_close",
@@ -1777,8 +1861,13 @@
     },
     {
       "category": "content_verification",
-      "summary": "Pre-commit checks of the staged content: memory projections, ruff, pytest, shellcheck, the prose gate, the release leak guard, the gate role contract and the candidate lanes of changed gate files.",
+      "summary": "Pre-commit checks of the staged content: memory projections, ruff, pyrefly, pytest, shellcheck, the prose gate, the release leak guard, the gate role contract and the candidate lanes of changed gate files.",
       "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "Check with: make typecheck"
+        },
         {
           "owner": "git_hook",
           "path": "scripts/hooks/pre-commit-weave.sh",
@@ -1931,6 +2020,21 @@
           "owner": "git_hook",
           "path": "scripts/hooks/pre-commit-weave.sh",
           "anchor": "prose gate: could not materialise the staged index"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "pyrefly: could not create a temp directory"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "pyrefly: could not materialise the staged index"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "this tree configures $1 but none was found"
         },
         {
           "owner": "git_hook",

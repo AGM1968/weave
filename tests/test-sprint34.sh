@@ -171,9 +171,11 @@ test_tree() {
     # Create hierarchy: epic -> feature -> task
     local epic_id feature_id task1_id task2_id
     epic_id=$($WV add "Epic: Build auth system" 2>/dev/null | tail -1)
-    feature_id=$($WV add "Feature: Login flow" 2>/dev/null | tail -1)
-    task1_id=$($WV add "Task: Create login form" 2>/dev/null | tail -1)
-    task2_id=$($WV add "Task: Add JWT tokens" 2>/dev/null | tail -1)
+    # "Epic:" makes the root an epic (wv-f7dfd3), so its children are created
+    # with --force and linked below, as the orphan guard would otherwise refuse.
+    feature_id=$($WV add "Feature: Login flow" --force 2>/dev/null | tail -1)
+    task1_id=$($WV add "Task: Create login form" --force 2>/dev/null | tail -1)
+    task2_id=$($WV add "Task: Add JWT tokens" --force 2>/dev/null | tail -1)
 
     # Link: feature implements epic, tasks implement feature
     $WV link "$feature_id" "$epic_id" --type=implements >/dev/null 2>&1
@@ -207,7 +209,10 @@ test_tree() {
     assert_contains "$tree_depth1" "Feature: Login flow" "tree --depth=1: shows depth 1"
     assert_not_contains "$tree_depth1" "Task: Create login form" "tree --depth=1: hides depth 2"
 
-    # Active filter — mark epic done, create and claim a second active root
+    # Active filter — mark epic done, create and claim a second active root.
+    # Its feature is parked first: a parent does not close over an unaccounted
+    # open child (wv-76b361).
+    $WV update "$feature_id" --metadata='{"deferred":true,"deferred_reason":"fixture: the epic closes over it"}' >/dev/null 2>&1
     $WV "done" "$epic_id" >/dev/null 2>&1
     local active_epic
     active_epic=$($WV add "Epic: Active project" 2>/dev/null | tail -1)
@@ -220,7 +225,7 @@ test_tree() {
 
     # Orphan nodes (no implements edges) become roots
     local orphan_id
-    orphan_id=$($WV add "Orphan task" 2>/dev/null | tail -1)
+    orphan_id=$($WV add "Orphan task" --force 2>/dev/null | tail -1)
     local tree_orphan
     tree_orphan=$($WV tree 2>&1)
     assert_contains "$tree_orphan" "Orphan task" "tree: orphan nodes appear as roots"

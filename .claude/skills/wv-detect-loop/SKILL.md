@@ -135,7 +135,7 @@ Recognize you're in a loop when:
 
 ```bash
 # Create investigation node
-wv add "Investigate: understand X behavior" --metadata='{"type":"task","priority":1}'
+wv add "Investigate: understand X behavior" --kind=task --metadata='{"priority":1}'
 wv block <current-node> --by=<investigation-node>
 ```
 
@@ -143,16 +143,16 @@ wv block <current-node> --by=<investigation-node>
 
 ```bash
 # Split into smaller pieces
-wv add "Subtask: isolate the failing component" --metadata='{"type":"task"}'
-wv add "Subtask: fix isolated issue" --metadata='{"type":"task"}'
-wv add "Subtask: integrate fix" --metadata='{"type":"task"}'
+wv add "Subtask: isolate the failing component" --kind=task
+wv add "Subtask: fix isolated issue" --kind=task
+wv add "Subtask: integrate fix" --kind=task
 ```
 
 ### Path 3: Need Help
 
 ```bash
 # Create blocker for external input
-wv add "Blocked: need input on X" --metadata='{"type":"blocker"}'
+wv add "Blocked: need input on X" --kind=task
 wv block <current-node> --by=<blocker-node>
 ```
 

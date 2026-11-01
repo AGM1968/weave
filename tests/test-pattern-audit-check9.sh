@@ -111,6 +111,26 @@ rm -f "$TEST_DIR/scripts/cmd/bad-memory.sh"
 AUDIT_OUT2=$("$WV" pattern-audit 2>&1 | grep 'Check 9' || true)
 assert_contains "$AUDIT_OUT2" "Check 9 PASS" "Check 9 passes when only blessed helpers read harness stores"
 
+echo "--- Check 9: a name() ( ... ) function owns its own reads (wv-b80a86) ---"
+# Before, a subshell-body definition was not recognised, so its read was
+# charged to the function above it; above a blessed helper that passed.
+setup_test_env
+cat > "$TEST_DIR/scripts/cmd/subshell-memory.sh" <<'EOF'
+#!/bin/bash
+
+_memory_scan_claude() {
+    find "$HOME/.claude/projects/$slug" -name '*.md'
+}
+
+rogue_guard() (
+    cat "$HOME/.claude/projects/$slug/memory/notes.md"
+)
+EOF
+AUDIT_SUB=$("$WV" pattern-audit 2>&1 | grep -A8 'Check 9' || true)
+assert_contains "$AUDIT_SUB" "Check 9 FAIL" "a read in a subshell-body function below a blessed helper is flagged"
+assert_contains "$AUDIT_SUB" ":rogue_guard:" "and charged to that function, not the blessed one above it"
+rm -f "$TEST_DIR/scripts/cmd/subshell-memory.sh"
+
 echo "--- Check 9: missing scripts dir warns, does not fail ---"
 rm -rf "$TEST_DIR/scripts"
 AUDIT_OUT3=$("$WV" pattern-audit 2>&1 | grep 'Check 9' || true)

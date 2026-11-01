@@ -414,12 +414,14 @@ test_add() {
     assert_contains "$show_output" "active" "add --status sets correct status"
 
     # Add with metadata
-    output=$("$WV" add "Task with metadata" --metadata='{"priority":1,"type":"bug"}' --force 2>&1)
+    # type is the node kind's mirror (wv-f7dfd3), so it must be a kind; a change
+    # type such as bug is refused there and belongs in the text prefix.
+    output=$("$WV" add "Task with metadata" --metadata='{"priority":1,"type":"feature","area":"bugs"}' --force 2>&1)
     id=$(echo "$output" | node_id_from_output)
     show_output=$("$WV" show "$id" --json 2>&1)
     # Metadata is JSON-encoded in the output, so quotes are escaped
     assert_contains "$show_output" 'priority' "add --metadata stores JSON"
-    assert_contains "$show_output" 'bug' "add --metadata stores all fields"
+    assert_contains "$show_output" 'bugs' "add --metadata stores all fields"
 
     # Add with --standalone persists durable standalone intent
     output=$("$WV" add "Standalone task" --standalone --force 2>&1)
@@ -610,6 +612,33 @@ test_done() {
     "$WV" update "$finding_id" --metadata='{"type":"finding","finding":{"violation_type":"repo:hygiene"}}' >/dev/null 2>&1
     finding_output=$(WV_REQUIRE_LEARNING=1 "$WV" "done" "$finding_id" --skip-verification 2>&1)
     assert_contains "$finding_output" "Closed" "done accepts finding with only violation_type (minimal shape)"
+
+    # A refused finding close hands this agent's claim back and writes nothing
+    # else (wv-61e8ca, ruling D2): the consumer was left holding an active
+    # claim, and --verification-* metadata of the refused close was persisted.
+    local claimed_finding refusal row
+    claimed_finding=$("$WV" add "Finding claimed then refused" --metadata='{"type":"finding"}' --force 2>&1 | node_id_from_output)
+    "$WV" work "$claimed_finding" >/dev/null 2>&1
+    refusal=$(WV_REQUIRE_LEARNING=1 "$WV" "done" "$claimed_finding" --skip-verification \
+        --verification-method=probe --verification-evidence=probe-evidence 2>&1 || true)
+    row=$("$WV" show "$claimed_finding" --json 2>/dev/null | jq -r '[.status, (.metadata | fromjson? // . | .claimed_by // "none")] | join("|")')
+    assert_equals "todo|none" "$row" "a refused finding close releases this agent's claim"
+    row=$("$WV" show "$claimed_finding" --json 2>/dev/null | jq -r '.metadata | fromjson? // . | .verification_method // "none"')
+    assert_equals "none" "$row" "a refused finding close persists no verification metadata"
+    # The suggestion itself, not the enum list, which always named the value.
+    assert_contains "$refusal" '{"finding":{"violation_type":"historical:finding"}}' "a refused finding close suggests the observation category"
+    assert_contains "$refusal" "Claim released" "a refused finding close says the claim was released"
+    "$WV" update "$claimed_finding" --metadata='{"finding":{"violation_type":"historical:finding"}}' >/dev/null 2>&1
+    finding_output=$(WV_REQUIRE_LEARNING=1 "$WV" "done" "$claimed_finding" --skip-verification 2>&1)
+    assert_contains "$finding_output" "Closed" "the suggested category closes the finding"
+
+    # Another agent's claim is not this agent's to release.
+    local foreign_finding
+    foreign_finding=$("$WV" add "Finding claimed by another agent" --metadata='{"type":"finding"}' --force 2>&1 | node_id_from_output)
+    WV_AGENT_ID=other-agent "$WV" work "$foreign_finding" >/dev/null 2>&1
+    WV_REQUIRE_LEARNING=1 "$WV" "done" "$foreign_finding" --skip-verification >/dev/null 2>&1 || true
+    row=$("$WV" show "$foreign_finding" --json 2>/dev/null | jq -r '[.status, (.metadata | fromjson? // . | .claimed_by // "none")] | join("|")')
+    assert_equals "active|other-agent" "$row" "a refused finding close leaves another agent's claim alone"
 
     # Full shape still accepted
     local finding_full_id finding_full_output
@@ -1844,7 +1873,9 @@ test_orphan_prevention() {
     assert_contains "$forced_id" "wv-" "add with --force bypasses orphan guard"
 
     # No active epics — task allowed without --parent (the gap that let wv-2efef5 exist)
-    # Mark the epic done so no active epics remain
+    # Mark the epic done so no active epics remain (its child first: a parent
+    # does not close over an open child, wv-76b361)
+    "$WV" "done" "$child_id" >/dev/null 2>&1
     "$WV" "done" "$epic_id" >/dev/null 2>&1
     local free_id
     free_id=$("$WV" add "No-parent task when no active epics" --force 2>&1 | node_id_from_output)
@@ -1881,7 +1912,10 @@ test_findings_promote() {
 
     all_nodes=$("$WV" list --all --json 2>/dev/null)
     assert_contains "$all_nodes" 'historical_finding_id' "promoted finding stores idempotency metadata"
-    assert_contains "$all_nodes" '"type\": \"finding\"' "promoted finding is stored as finding node"
+    local promoted_findings
+    promoted_findings=$(printf '%s' "$all_nodes" | jq '[.[] | (.metadata | if type == "string" then fromjson else . end)
+        | select(.historical_finding_id != null and .type == "finding" and .node_kind == "finding")] | length' 2>/dev/null)
+    assert_equals "1" "$promoted_findings" "promoted finding is stored as finding node"
 }
 
 # ============================================================================
@@ -2150,10 +2184,9 @@ SQL
     # --- Case 9c: node-type exemption — an epic with a red file closes even at block ---
     sqlite3 "$WV_DB" "INSERT OR REPLACE INTO policy_thresholds(key, value) VALUES ('test_gate', 2);"
     local epic_id
-    epic_id=$("$WV" add "Epic touching a red file" --force 2>&1 | node_id_from_output)
+    epic_id=$("$WV" add "Epic touching a red file" --kind=epic --force 2>&1 | node_id_from_output)
     "$WV" work "$epic_id" >/dev/null 2>&1
     sqlite3 "$WV_DB" <<SQL
-UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'), '\$.type', 'epic') WHERE id='$epic_id';
 INSERT OR REPLACE INTO file_test_status(path, state) VALUES ('src/epicfile.py', 'red');
 INSERT OR REPLACE INTO node_files(node_id, path) VALUES ('$epic_id', 'src/epicfile.py');
 SQL
@@ -2971,6 +3004,7 @@ test_done_refresh_test_status() {
             source '$PROJECT_ROOT/scripts/lib/wv-attempt-journal.sh'
             source '$PROJECT_ROOT/scripts/cmd/wv-cmd-graph.sh'
             source '$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh'
+            source '$PROJECT_ROOT/scripts/cmd/wv-cmd-gate.sh'
             source '$PROJECT_ROOT/scripts/cmd/wv-cmd-core.sh'
             _done_refresh_test_status '$1'
         " 2>"$TEST_DIR/refresh.err"

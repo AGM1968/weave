@@ -11,14 +11,14 @@ export WV_CALL_SOURCE=test
 #   - Hot-zone path resolution matches wv's own resolution
 #   - Default phase (execute) when .session_phase missing
 #   - DB pre-flight: exits 0 gracefully when brain.db missing
-#   - All 7 hooks source wv-hook-common.sh (static check)
+#   - All 7 hooks load wv-hook-common.sh, directly or through the library an
+#     adapter sources (static check), and wv doctor and pattern-audit Check 4
+#     apply the same rule (wv-b80a86)
 #   - Hooks that resolve the project have installed-path resolver fallbacks
 #   - install.sh includes wv-hook-common.sh in both copy blocks
 #
-# Until wv-0ab403 lands, structural tests run as EXPECT-FAIL.
-#
 # Exit codes:
-#   0 - All tests passed (or expected failures recorded)
+#   0 - All tests passed
 #   1 - Unexpected failure
 
 set -euo pipefail
@@ -32,7 +32,6 @@ NC='\033[0m'
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
-TESTS_XFAIL=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -106,19 +105,6 @@ assert_contains() {
     fi
 }
 
-assert_xfail() {
-    local expected="$1"
-    local actual="$2"
-    local message="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [ "$expected" = "$actual" ]; then
-        echo -e "  ${GREEN}[PASS]${NC} $message (FIXED — was EXPECT-FAIL)"
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-    else
-        echo -e "  ${YELLOW}[XFAIL]${NC} $message (wv-0ab403 not yet landed)"
-        TESTS_XFAIL=$((TESTS_XFAIL + 1))
-    fi
-}
 
 # ─── Tests ────────────────────────────────────────────────────────────────────
 
@@ -129,17 +115,17 @@ test_hook_common_file_exists() {
         echo -e "  ${GREEN}[PASS]${NC} wv-hook-common.sh exists"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
-        echo -e "  ${YELLOW}[XFAIL]${NC} wv-hook-common.sh not yet created (wv-0ab403 pending)"
-        TESTS_XFAIL=$((TESTS_XFAIL + 1))
+        echo -e "  ${RED}[FAIL]${NC} wv-hook-common.sh does not exist"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
 
 test_hook_common_sources_without_error() {
     echo "-- wv-hook-common.sh sources without error"
     [ -f "$HOOK_COMMON" ] || {
-        echo -e "  ${YELLOW}[XFAIL]${NC} hook-common not yet created — skip source test"
+        echo -e "  ${RED}[FAIL]${NC} wv-hook-common.sh does not exist — cannot source it"
         TESTS_RUN=$((TESTS_RUN + 1))
-        TESTS_XFAIL=$((TESTS_XFAIL + 1))
+        TESTS_FAILED=$((TESTS_FAILED + 1))
         return
     }
     local rc=0
@@ -161,9 +147,9 @@ test_hot_zone_path_matches_wv() {
     echo "-- hot-zone path resolution matches wv CLI"
     setup_test_env
     [ -f "$HOOK_COMMON" ] || {
-        echo -e "  ${YELLOW}[XFAIL]${NC} hook-common not yet created — skip path test"
+        echo -e "  ${RED}[FAIL]${NC} wv-hook-common.sh does not exist — cannot resolve its path"
         TESTS_RUN=$((TESTS_RUN + 1))
-        TESTS_XFAIL=$((TESTS_XFAIL + 1))
+        TESTS_FAILED=$((TESTS_FAILED + 1))
         return
     }
     # Canonical resolver path (the zone holding the repo's DB, else /tmp; wv-b831e3)
@@ -207,7 +193,14 @@ test_default_phase_when_file_missing() {
 test_codex_zone_followed_without_env_signal() {
     echo "-- resolve_hot_zone follows an existing legacy /tmp zone even without env signal (wv-d6af2f)"
     local uid; uid=$(id -u)
-    local codex_dir="/tmp/weave-codex-${uid}"
+    # The commit gate runs suites with WV_TEST_HOT_ZONE_ROOT, which the resolver
+    # honours under WV_TEST_MODE=1 and which this case does not scrub, so the
+    # zone it plants and expects is under that root, as resolve_hot_zone's is.
+    local root=""
+    if [ "${WV_TEST_MODE:-}" = "1" ] && [ "${WV_TEST_HOT_ZONE_ROOT:0:1}" = "/" ]; then
+        root="${WV_TEST_HOT_ZONE_ROOT%/}"
+    fi
+    local codex_dir="${root}/tmp/weave-codex-${uid}"
     local created=0
     [ -d "$codex_dir" ] || { mkdir -p "$codex_dir" && created=1; }
     # Scrub every codex env signal to mimic a harness-spawned hook process.
@@ -217,13 +210,16 @@ test_codex_zone_followed_without_env_signal() {
         source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh' 2>/dev/null
         resolve_hot_zone
     " 2>/dev/null || echo "")
-    # Only remove the dir if this test created it; rmdir is a no-op on a live (non-empty) zone.
-    [ "$created" = "1" ] && rmdir "$codex_dir" 2>/dev/null
     # By either of the /tmp zone's names: the neutral one once this host has
-    # the alias (wv-95bddf); tests/test-hot-zone-placement.sh pins which.
-    case "$zone" in
-        "/tmp/weave-hotzone-${uid}") zone="$codex_dir" ;;
-    esac
+    # the alias (wv-95bddf); tests/test-hot-zone-placement.sh pins which. The
+    # name must lead to the planted directory: mapping the neutral name onto it
+    # unconditionally passed when no legacy zone existed and the resolver chose
+    # the neutral one by default (wv-60edf8).
+    local physical=""
+    [ -n "$zone" ] && physical=$(readlink -f "$zone" 2>/dev/null || true)
+    [ -n "$physical" ] && [ "$physical" = "$(readlink -f "$codex_dir")" ] && zone="$codex_dir"
+    # Only remove the dir if this test created it; rmdir is a no-op on a live (non-empty) zone.
+    [ "$created" = "1" ] && { rmdir "$codex_dir" 2>/dev/null || true; }
     assert_equals "$codex_dir" "$zone" "hook-context resolve_hot_zone follows the existing legacy /tmp zone via filesystem signal"
 }
 
@@ -248,8 +244,8 @@ test_all_hooks_source_common() {
         local hook_path="$PROJECT_ROOT/$hook_rel"
         TESTS_RUN=$((TESTS_RUN + 1))
         if [ ! -f "$hook_path" ]; then
-            echo -e "  ${YELLOW}[XFAIL]${NC} hook not found: $hook_rel"
-            TESTS_XFAIL=$((TESTS_XFAIL + 1))
+            echo -e "  ${RED}[FAIL]${NC} hook not found: $hook_rel"
+            TESTS_FAILED=$((TESTS_FAILED + 1))
             continue
         fi
         # Code, not comments: an adapter that only mentions the library in a
@@ -267,10 +263,48 @@ test_all_hooks_source_common() {
             echo -e "  ${GREEN}[PASS]${NC} $hook_rel sources wv-hook-common"
             TESTS_PASSED=$((TESTS_PASSED + 1))
         else
-            echo -e "  ${YELLOW}[XFAIL]${NC} $hook_rel does not source wv-hook-common (wv-0ab403 pending)"
-            TESTS_XFAIL=$((TESTS_XFAIL + 1))
+            echo -e "  ${RED}[FAIL]${NC} $hook_rel does not load wv-hook-common, directly or through its library"
+            TESTS_FAILED=$((TESTS_FAILED + 1))
         fi
     done
+}
+
+# wv-b80a86: wv doctor and pattern-audit Check 4 judge hook wiring with one
+# helper, _hook_common_unwired, which must agree with the static rule above:
+# executable lines only, following the library an adapter sources. Before,
+# both grepped the adapter file alone, so the four thin adapters failed and
+# pre-action.sh passed on a comment.
+test_hook_common_rule_shared() {
+    echo "-- doctor and Check 4 share the hook-common rule"
+    local ops="$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh" fx home rel out
+    unwired() {  # unwired <root>: the helper, under pipefail, with no installed fallback
+        HOME="$home" bash -c 'set -euo pipefail; source "$1"; _hook_common_unwired "$2"' _ "$ops" "$1" | paste -sd' ' -
+    }
+    fx=$(mktemp -d /tmp/wv-hc-rule-XXXXXX); home="$fx/home"
+    mkdir -p "$home" "$fx/.claude/hooks" "$fx/scripts/lib"
+    assert_equals "" "$(unwired "$PROJECT_ROOT")" "the live hooks all pass the shared rule, as the static check says"
+    for rel in "${HOOKS_NEEDING_COMMON[@]}"; do
+        printf '#!/bin/bash\nsource "$HOME/.config/weave/lib/wv-hook-common.sh"\n' > "$fx/$rel"
+    done
+    printf '#!/bin/bash\nfor d in x; do . "$d/wv-guard.sh"; done\n' > "$fx/.claude/hooks/pre-action.sh"
+    printf '#!/bin/bash\n_src wv-hook-common\n' > "$fx/scripts/lib/wv-guard.sh"
+    printf '#!/bin/bash\n# loads wv-hook-common, says the comment\nexit 0\n' > "$fx/.claude/hooks/stop-check.sh"
+    printf '#!/bin/bash\n. "$d/wv-plain.sh"\n' > "$fx/.claude/hooks/session-end-sync.sh"
+    printf '#!/bin/bash\n# wv-hook-common in a comment only\n:\n' > "$fx/scripts/lib/wv-plain.sh"
+    printf '#!/bin/bash\n. "$d/wv-big.sh"\n' > "$fx/.claude/hooks/wv-touched-files.sh"
+    { printf '_src wv-hook-common\n'; for _ in $(seq 6000); do printf 'filler_line_padding_padding\n'; done; } > "$fx/scripts/lib/wv-big.sh"
+    out=$(unwired "$fx")
+    assert_equals ".claude/hooks/session-end-sync.sh .claude/hooks/stop-check.sh" "$out" \
+        "unwired: a comment-only hook and an adapter whose library does not load it, nothing else"
+    assert_equals "0" "$(grep -c 'wv-touched-files' <<< "$out")" \
+        "a library whose match precedes 120 KB passes under pipefail (no SIGPIPE false negative)"
+    git -C "$fx" init -q
+    out=$(cd "$fx" && HOME="$home" WV_HOT_ZONE="$fx/hot" WV_CONFIG_DIR="$fx/cfg" "$WV" pattern-audit --json 2>/dev/null \
+        | jq -c '.pattern_audit.findings[] | select(.check == "hook_common_sourcing") | [.status, .count]')
+    assert_equals '["fail",2]' "$out" "pattern-audit Check 4 reports the same two hooks"
+    assert_equals "2" "$(grep -c '_hook_common_unwired "' "$ops")" \
+        "doctor and Check 4 call the one helper (no second copy of the rule)"
+    rm -rf "$fx"
 }
 
 test_install_sh_ships_hook_common() {
@@ -281,8 +315,8 @@ test_install_sh_ships_hook_common() {
         echo -e "  ${GREEN}[PASS]${NC} install.sh references wv-hook-common.sh"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
-        echo -e "  ${YELLOW}[XFAIL]${NC} install.sh does not ship wv-hook-common.sh (wv-0ab403 pending)"
-        TESTS_XFAIL=$((TESTS_XFAIL + 1))
+        echo -e "  ${RED}[FAIL]${NC} install.sh does not ship wv-hook-common.sh"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
 
@@ -405,11 +439,6 @@ test_pre_action_falls_through_broken_library() {
 # ─── Per-check unit tests (t6) ────────────────────────────────────────────────
 # One allow path + one deny/block path per _hc_check_* function.
 
-_hc_xfail() {
-    echo -e "  ${YELLOW}[XFAIL]${NC} $1"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_XFAIL=$((TESTS_XFAIL + 1))
-}
 
 test_hc_check_installed_path_allow() {
     echo "-- _hc_check_installed_path: allow non-installed path"
@@ -631,7 +660,6 @@ test_hc_check_contradictions_block_present() {
 
 main() {
     echo "test-hook-common.sh"
-    echo "  NOTE: Structural tests run as EXPECT-FAIL until wv-0ab403 lands."
     echo "  Per-check unit tests (t6) run against the extracted _hc_check_* functions."
     echo ""
     test_hook_common_file_exists
@@ -641,6 +669,7 @@ main() {
     test_codex_zone_followed_without_env_signal
     test_db_preflight_graceful_when_missing
     test_all_hooks_source_common
+    test_hook_common_rule_shared
     test_hooks_have_installed_resolver_fallback
     test_pre_action_resolves_installed_libs
     test_pre_action_falls_through_broken_library syntax
@@ -668,9 +697,6 @@ main() {
     echo ""
     echo "========================================"
     echo "Results: $TESTS_PASSED/$TESTS_RUN passed"
-    if [ "$TESTS_XFAIL" -gt 0 ]; then
-        echo "  ($TESTS_XFAIL expected failures — promote to assert_equals when wv-0ab403 lands)"
-    fi
     echo "========================================"
 
     [ "$TESTS_FAILED" -eq 0 ] || exit 1

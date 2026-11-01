@@ -162,6 +162,45 @@ test_blocked_until_past_passes() {
     assert_not_contains "$out" "Check 6 FAIL" "no FAIL for a past blocked_until"
 }
 
+# wv-5515e9: a parked node (deferred with a deferred_reason) keeps status todo by
+# design — the 2.0 plan parks work by flag, and ontology S2 counts it as an
+# accounted child — so neither report asks its status to change. All 35 parked
+# nodes on the live graph were reported as divergent before this.
+test_parked_passes() {
+    echo "-- todo + deferred + deferred_reason (parked) → Check 6 PASS, doctor pass"
+    local out
+    _add_node "parked under a decision" '{"deferred":true,"deferred_reason":"parked until 2.0","deferred_by":"wv-000000"}' >/dev/null
+    out=$("$WV" pattern-audit 2>&1 || true)
+    assert_contains "$out" "Check 6 PASS" "a parked node is not a divergence"
+    assert_not_contains "$out" "Check 6 FAIL" "no FAIL for a parked node"
+    out=$("$WV" doctor 2>&1 || true)
+    assert_contains "$out" "no deferral-metadata-vs-status divergence" "doctor passes node-state for a parked node"
+}
+
+test_deferred_empty_reason_fails() {
+    echo "-- todo + deferred with an EMPTY deferred_reason → not parked → Check 6 FAIL"
+    local id out
+    id=$(_add_node "deferred, reason left blank" '{"deferred":true,"deferred_reason":""}')
+    out=$("$WV" pattern-audit 2>&1 || true)
+    assert_contains "$out" "Check 6 FAIL" "a blank reason does not park a node"
+    assert_contains "$out" "$id" "the unparked node id is listed"
+    out=$("$WV" doctor 2>&1 || true)
+    assert_contains "$out" "1 node(s) carry deferral metadata" "doctor counts the unparked node, and only it"
+}
+
+test_parked_beside_divergent_counts_one() {
+    echo "-- one parked + one divergent → both reports count exactly the divergent one"
+    local parked divergent out
+    parked=$(_add_node "parked" '{"deferred":true,"deferred_reason":"parked"}')
+    divergent=$(_add_node "blocked_on only" '{"blocked_on":"vendor"}')
+    out=$("$WV" pattern-audit 2>&1 || true)
+    assert_contains "$out" "Check 6 FAIL: 1 node(s)" "Check 6 counts one node"
+    assert_contains "$out" "$divergent" "the divergent node is listed"
+    assert_not_contains "$out" "    $parked" "the parked node is not listed"
+    out=$("$WV" doctor 2>&1 || true)
+    assert_contains "$out" "1 node(s) carry deferral metadata" "doctor counts the same one node"
+}
+
 test_hotzone_db_prints_resolved_path() {
     echo "-- wv hotzone db prints the resolved brain.db path"
     local dbpath
@@ -189,6 +228,9 @@ main() {
     setup_test_env; test_blocked_external_status_passes
     setup_test_env; test_blocks_edge_passes
     setup_test_env; test_doctor_node_state_advisory
+    setup_test_env; test_parked_passes
+    setup_test_env; test_deferred_empty_reason_fails
+    setup_test_env; test_parked_beside_divergent_counts_one
     setup_test_env; test_hotzone_db_prints_resolved_path
 
     echo ""

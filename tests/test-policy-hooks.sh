@@ -121,6 +121,10 @@ for cell in "claim_requires_done_criteria deny" "claim_requires_alias deny" "cla
     set -- $cell
     hookcell "a claim without $1 records $2" "$1" "$2" - deny pre-claim-skills.sh "$(bash_of "wv work $bare")"
 done
+# The advisory alone records advisory and lets the claim through (wv-6e4798).
+advised=$(node "hook claim advisory probe" --alias=claim-advised --criteria="c1")
+hookcell "a claim missing only risks records advisory and is not denied" claim_premortem_advisory advisory - pass \
+    pre-claim-skills.sh "$(bash_of "wv work $advised")"
 
 echo "=== close preflight ==="
 finding=$(node "hook finding probe" --metadata='{"type":"finding"}')

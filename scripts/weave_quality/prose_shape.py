@@ -34,7 +34,7 @@ import re
 import statistics as st
 from pathlib import Path
 
-from weave_quality.listing import iter_tree
+from weave_quality.listing import repo_files
 
 _MASK = "\x00"
 
@@ -132,8 +132,12 @@ def markdown_files(target: Path) -> list[Path]:
     """The .md files under target, or target itself when it is one.
 
     Raises OSError on a directory it cannot list: rglob skipped one, and the
-    profile described a smaller corpus than the one named (wv-4852bd).
+    profile described a smaller corpus than the one named (wv-4852bd). Inside
+    a repository the set is git's, not a walk through ignored trees (wv-c309a8).
     """
     if target.is_file():
         return [target] if target.suffix.lower() == ".md" else []
-    return sorted(p for p in iter_tree(target) if p.name.endswith(".md") and p.is_file())
+    return sorted(
+        target / rel for rel in repo_files(target)
+        if rel.name.endswith(".md") and (target / rel).is_file()
+    )

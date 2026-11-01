@@ -219,6 +219,68 @@ assert_equals "0" "$(echo "$OUT" | jq -r '.refs | length')" "no orphan row for a
 # a prune matching on the resolved form would not match the stored string.
 ALL=$($WV commit-refs --all --json 2>/dev/null)
 assert_equals "$SHORT" "$(echo "$ALL" | jq -r '.refs[0].ref')" "--all reports the recorded (abbreviated) form"
+TEXT=$($WV commit-refs 2>/dev/null)
+case "$TEXT" in *"wv commit-refs --prune"*) HINT=offered ;; *) HINT=none ;; esac
+assert_equals "none" "$HINT" "no prune is offered when nothing is orphaned"
+
+# ── each orphan says why it is one (wv-6d53ec) ─────────────────────────────
+# The sweep offered --prune for 68 refs it never explained (rc.14 consumer
+# audit K7), so an amend's churn could not be told from a provenance loss.
+# Dates are pinned: the replacement match is second-precise.
+setup_repo
+at() { GIT_AUTHOR_DATE="$1 +0000" GIT_COMMITTER_DATE="$1 +0000" "${GIT[@]}" "${@:2}"; }
+N_AM=$($WV add "task: amended" 2>/dev/null | tail -1)
+N_RB=$($WV add "task: rebased" 2>/dev/null | tail -1)
+N_RS=$($WV add "task: reset" 2>/dev/null | tail -1)
+N_DR=$($WV add "task: dropped" 2>/dev/null | tail -1)
+N_MS=$($WV add "task: missing" 2>/dev/null | tail -1)
+N_BL=$($WV add "task: blob" 2>/dev/null | tail -1)
+echo a > a.txt; "${GIT[@]}" add a.txt
+at 1700000001 commit -qm "work: a"
+record_ref "$N_AM" "$("${GIT[@]}" rev-parse HEAD)"
+# An amend keeps the author date and the parent; only the committer moves.
+GIT_COMMITTER_DATE="1700000002 +0000" "${GIT[@]}" commit -q --amend -m "work: a, reworded"
+SHA_AM_NOW=$("${GIT[@]}" rev-parse --short=9 HEAD)
+echo b > b.txt; "${GIT[@]}" add b.txt
+at 1700000010 commit -qm "work: b"
+SHA_RB=$("${GIT[@]}" rev-parse HEAD)
+record_ref "$N_RB" "$SHA_RB"
+"${GIT[@]}" reset -q --hard HEAD~1
+echo c > c.txt; "${GIT[@]}" add c.txt
+at 1700000011 commit -qm "work: c"
+# A cherry-pick keeps the author, author date and subject on a new parent.
+GIT_COMMITTER_DATE="1700000012 +0000" "${GIT[@]}" cherry-pick "$SHA_RB" >/dev/null
+SHA_RB_NOW=$("${GIT[@]}" rev-parse --short=9 HEAD)
+echo d > d.txt; "${GIT[@]}" add d.txt
+at 1700000020 commit -qm "work: d"
+record_ref "$N_RS" "$("${GIT[@]}" rev-parse HEAD)"
+"${GIT[@]}" reset -q --hard HEAD~1
+# commit-tree writes no reflog entry: nothing at all reaches this commit. It
+# shares its author date with the reachable "work: c": author and date alone
+# would call it rebased; its parent and subject say it was replaced by nothing.
+record_ref "$N_DR" "$(echo "work: e" | at 1700000011 commit-tree "HEAD^{tree}" -p HEAD)"
+record_ref "$N_MS" "0123456789012345678901234567890123456789"
+record_ref "$N_BL" "$(echo blob | "${GIT[@]}" hash-object -w --stdin)"
+"${GIT[@]}" push -q origin main
+
+OUT=$($WV commit-refs --json 2>/dev/null)
+reason_of() { echo "$OUT" | jq -r --arg n "$1" '[.refs[] | select(.node == $n)][0] | "\(.reason) | \(.why)"'; }
+assert_equals "amended | amended: now $SHA_AM_NOW" "$(reason_of "$N_AM")" "an amended ref names the commit that replaced it"
+assert_equals "rebased | rebased: now $SHA_RB_NOW" "$(reason_of "$N_RB")" "a rebased ref names its copy on the new parent"
+assert_contains "$(reason_of "$N_RS")" "reset | dropped by a reset or rebase (still in the reflog)" "a reset ref is found in the reflog"
+assert_contains "$(reason_of "$N_DR")" "dropped | no ref or reflog reaches it" "a ref nothing reaches is dropped"
+assert_contains "$(reason_of "$N_MS")" "not_in_clone | not in this clone" "an absent object is not in this clone"
+assert_contains "$(reason_of "$N_BL")" "not_a_commit | names a blob, not a commit" "a blob id is not a commit"
+assert_equals "6" "$(echo "$OUT" | jq '[.refs[] | select(.reason)] | length')" "every orphan carries a reason"
+
+TEXT=$($WV commit-refs 2>/dev/null)
+assert_contains "$TEXT" "amended: now $SHA_AM_NOW" "the text report states why"
+LAST=$(printf '%s\n' "$TEXT" | grep -v '^$' | tail -1)
+assert_contains "$LAST" "wv commit-refs --prune" "prune is offered after the reasons"
+
+DOC=$($WV doctor --json 2>/dev/null | jq -r '.checks[] | select(.check == "commit refs") | .detail')
+assert_contains "$DOC" "1 amended, 1 dropped, 1 not a commit, 1 not in this clone, 1 rebased, 1 reset — inspect" \
+    "doctor counts the orphans by reason before offering the prune"
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════════════════"
@@ -475,16 +537,9 @@ if [ -s "$TEST_DIR/big.json" ]; then
     fi
     TESTS_RUN=$((TESTS_RUN + 1))
 fi
-# No composer may name a JSON payload variable in --argjson.
-#
-# The pattern is SINGLE-quoted deliberately. Written in double quotes, the `\$`
-# collapses to a bare `$`, which ERE reads as an end-of-line anchor — the check
-# then matches nothing and passes unconditionally, which is exactly how the
-# first version of this assertion survived a deliberately reintroduced payload.
-# `grep -c` prints 0 AND exits 1 when there is no match, so `|| echo 0` appends
-# a second zero and the comparison never equals "0".
-_argjson_hits=$(grep -cE -- '--argjson [a-z_]+ "\$[a-z_]*(json|rows)"' "$REPO_ROOT/scripts/cmd/wv-cmd-graph.sh" 2>/dev/null || true)
-assert_equals "0" "$_argjson_hits" "no composer passes a JSON payload through --argjson"
+# The structural rule that no composer passes a payload through --argjson lives
+# in tests/test-argjson-payload.sh: the grep that stood here read one module and
+# only names ending in json or rows, so other modules kept the shape (wv-200d36).
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════════════════"

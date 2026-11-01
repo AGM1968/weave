@@ -68,6 +68,23 @@ bash "$PROJECT" --source="$C" --repo="$CREPO"
 [ "$(jq -r '[.procedures[].id] | index("liveproc")' "$CREPO/.codex/weave.json")" = "null" ] || { echo "FAIL: demoted codex entry not removed"; exit 1; }
 ! grep -qF 'wv guide --procedure=liveproc' "$CREPO/.github/copilot-instructions.md" || { echo "FAIL: demoted copilot line not removed"; exit 1; }
 
+# --- C2. generated frontmatter is YAML even when the description holds ': ' --
+# Written bare, 'description: Establish ...: reproduce ...' failed a strict
+# parser, which then dropped every field of the skill (wv-ed1dbb).
+C2="$TMP/c2"; C2REPO="$TMP/c2repo"; mkdir -p "$C2" "$C2REPO"
+printf '%s\n' '---' 'id: colonproc' 'description:' \
+    '  "Hold a fix: reproduce the cause, then a\path; use when: closing"' \
+    'fallback: "wv guide --procedure=colonproc"' 'adapters: [claude]' 'visibility: shared' \
+    'claude_skill: wv-colonproc' '---' '# colonproc body' > "$C2/colonproc.md"
+bash "$PROJECT" --source="$C2" --repo="$C2REPO"
+python3 -I - "$C2REPO/.claude/skills/wv-colonproc/SKILL.md" <<'PY' || { echo "FAIL: generated SKILL.md frontmatter is not YAML"; exit 1; }
+import sys, yaml
+front = open(sys.argv[1], encoding="utf-8").read().split("---", 2)[1]
+data = yaml.safe_load(front)
+assert data["name"] == "wv-colonproc", data
+assert data["description"] == "Hold a fix: reproduce the cause, then a\\path; use when: closing", data
+PY
+
 # --- D. collision protection: hand-written skill is never overwritten/removed --
 D="$TMP/d"; DREPO="$TMP/drepo"; mkdir -p "$D" "$DREPO/.claude/skills/manual"
 printf '%s\n' '---' 'name: manual' 'description: hand written' '---' '# do not touch' > "$DREPO/.claude/skills/manual/SKILL.md"

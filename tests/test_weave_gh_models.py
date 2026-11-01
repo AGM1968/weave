@@ -133,6 +133,17 @@ class TestWeaveNodeIsTest:
         assert node.is_test is True
 
 
+class TestWeaveNodeKind:
+    def test_node_kind_wins_over_type(self) -> None:
+        node = WeaveNode(id="n1", text="task(x): t", status="todo",
+                         metadata={"node_kind": "epic", "type": "task"})
+        assert node.node_type == "epic"
+
+    def test_type_mirror_read_when_no_node_kind(self) -> None:
+        node = WeaveNode(id="n1", text="t", status="todo", metadata={"type": "feature"})
+        assert node.node_type == "feature"
+
+
 class TestWeaveNodeClaimedBy:
     def test_missing(self) -> None:
         node = WeaveNode(id="n1", text="t", status="todo")

@@ -259,7 +259,12 @@ _gate_repair_template() {
     new=$(git rev-parse -q --verify "$(gate_side_tree index):$1" 2>/dev/null) || new="<the index has none>"
     bm=$(_gate_repair_mode "$(gate_side_tree base)" "$1") || bm="<HEAD has no regular file>"
     rm=$(_gate_repair_mode "$(gate_side_tree index)" "$1") || rm="<the index has no regular file>"
-    if [ "$kind" = retirement ]; then new=""; rm=000000; fi
+    # A retirement that deletes the file names no replacement; one that keeps
+    # the file and stops naming a suite names the staged bytes, as
+    # gate_repair_record matches them (wv-cc36c7: this blanked both).
+    if [ "$kind" = retirement ] && ! git rev-parse -q --verify "$(gate_side_tree index):$1" >/dev/null 2>&1; then
+        new=""; rm=000000
+    fi
     jq -n --arg p "$1" --arg o "$old" --arg n "$new" --arg bm "$bm" --arg rm "$rm" --arg k "$kind" \
         '{version: 2, kind: $k, path: $p, baseline: $o, replacement: $n,
           baseline_mode: $bm, replacement_mode: $rm,

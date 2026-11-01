@@ -3,7 +3,7 @@
   "fields": {
     "status": {
       "storage": "column:status",
-      "value": { "enum": ["todo", "ready", "active", "blocked", "done"] },
+      "value": { "enum": ["todo", "ready", "active", "blocked", "blocked-external", "done"] },
       "absent": "not_allowed"
     },
     "claimed_by": {

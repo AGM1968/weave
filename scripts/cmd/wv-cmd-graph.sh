@@ -54,12 +54,13 @@ cmd_block() {
         return 1
     fi
 
-    # Check for circular blocking (A blocks B, B blocks A)
-    local reverse_exists
-    reverse_exists=$(db_query "SELECT COUNT(*) FROM edges WHERE source='$id' AND target='$blocker' AND type='blocks';") || return 1
-    if [ "$reverse_exists" != "0" ]; then
-        wv_policy_verdict block_graph_acyclic deny yes "" "two nodes blocking each other can never become ready"
-        echo -e "${RED}Error: circular block detected — $blocker is already blocked by $id${NC}" >&2
+    # Check for circular blocking at any length, not only A <-> B (ontology S2):
+    # the blocked node must not already reach its blocker over blocks edges.
+    local violation
+    violation=$(wv_edge_violation "$blocker" "$id" blocks) || return 1
+    if [[ " $violation " == *" acyclic "* ]]; then
+        wv_policy_verdict block_graph_acyclic deny yes "" "nodes blocking each other in a cycle can never become ready"
+        echo -e "${RED}Error: circular block detected — $id already blocks $blocker, directly or through other nodes${NC}" >&2
         return 1
     fi
     wv_policy_verdict block_graph_acyclic allow no "" "the edge closes no cycle"
@@ -106,6 +107,29 @@ cmd_block() {
 
     # Live progress notification to GitHub
     gh_notify "$id" "block" --blocker="$blocker"
+}
+
+# _link_explain_violation <from> <to> <type> <invariants> — say which invariant
+# the refused edge breaks and what would satisfy it.
+_link_explain_violation() {
+    local from="$1" to="$2" type="$3" inv
+    echo -e "${RED}Error: $from --[$type]--> $to breaks the $type invariant: $4${NC}" >&2
+    for inv in $4; do
+        case "$inv" in
+            no_self_edge) echo "  An edge must join two different nodes." >&2 ;;
+            acyclic) echo "  $to already reaches $from over $type edges, so this edge would close a cycle." >&2 ;;
+            target_newer_or_declared)
+                echo "  supersedes runs old -> new: $to is older than $from. Swap the arguments, or, when the older" >&2
+                echo "  node really replaces the newer one, set $from's superseded_by to $to first." >&2 ;;
+            memory_superseded_by)
+                echo "  $from is a memory: set its superseded_by to $to first (wv remember --supersedes does both)." >&2 ;;
+            finding_endpoint)
+                echo "  resolves joins work to its finding: one end must be a finding (kind finding, or a finding(/gap( prefix)." >&2 ;;
+            source_newer)
+                echo "  addresses runs from the newer node to the older pitfall it addresses: swap the arguments." >&2 ;;
+            endpoints_exist) echo "  Both endpoints must exist." >&2 ;;
+        esac
+    done
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -189,6 +213,17 @@ cmd_link() {
         echo -e "${RED}Error: invalid JSON in --context${NC}" >&2
         return 1
     fi
+
+    # Edge invariants (ontology S2, wv-76b361; contracts/edge-types-v1.json).
+    # Stored edges that already break one are wv doctor's to report (D4).
+    local violation
+    violation=$(wv_edge_violation "$from" "$to" "$edge_type") || return 1
+    if [ -n "$violation" ]; then
+        wv_policy_verdict edge_write_invariants deny yes "" "$violation"
+        _link_explain_violation "$from" "$to" "$edge_type" "$violation"
+        return 1
+    fi
+    wv_policy_verdict edge_write_invariants allow no "" "the edge keeps its type's invariants"
 
     # Auto-context: generate alias-based summary when no explicit context provided
     if [ "$context" = "{}" ]; then
@@ -315,6 +350,13 @@ cmd_resolve() {
         return 1
     fi
 
+    validate_id "$node1" || return 1
+    validate_id "$node2" || return 1
+    if [ "$node1" = "$node2" ]; then
+        echo -e "${RED}Error: a node cannot be resolved against itself${NC}" >&2
+        return 1
+    fi
+
     # Validate nodes exist
     for nid in "$node1" "$node2"; do
         local exists
@@ -366,20 +408,24 @@ cmd_resolve() {
 
             # Close the loser first, through the same receipt as wv done
             # (wv-957fc8): a refused close must leave the graph unchanged, not
-            # rewire the contradiction around a node that is still open.
-            _done_close "$loser" "" "metadata" "status='done', updated_at=CURRENT_TIMESTAMP" || return 1
+            # rewire the contradiction around a node that is still open. The
+            # loser records its replacement, which is what lets an older winner
+            # supersede it (contracts/edge-types-v1.json).
+            local superseded="json_set(COALESCE(metadata, '{}'), '\$.superseded_by', '$winner')"
+            _done_close "$loser" "" "$superseded" \
+                "status='done', metadata = $superseded, updated_at=CURRENT_TIMESTAMP" || return 1
 
             # Remove contradiction edge
             db_query "DELETE FROM edges WHERE type='contradicts' AND ((source='$node1' AND target='$node2') OR (source='$node2' AND target='$node1'));"
 
-            # Add supersedes edge: winner supersedes loser
+            # Add supersedes edge: the target replaces the source, so loser -> winner
             if [ "$has_rationale" = "true" ]; then
                 db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
-                    VALUES ('$winner', '$loser', 'supersedes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP)
+                    VALUES ('$loser', '$winner', 'supersedes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP)
                     ON CONFLICT(source, target, type) DO UPDATE SET
                         context = excluded.context, created_at = CURRENT_TIMESTAMP;"
             else
-                db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$winner', '$loser', 'supersedes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
+                db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$loser', '$winner', 'supersedes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
             fi
 
             echo -e "${GREEN}✓${NC} Resolved: $winner supersedes $loser"
@@ -401,24 +447,25 @@ cmd_resolve() {
             local merged_text="Merged: $(db_query "SELECT text FROM nodes WHERE id='$node1';" | head -1) + $(db_query "SELECT text FROM nodes WHERE id='$node2';" | head -1)"
             local new_id=$(generate_id)
 
-            db_query "INSERT INTO nodes (id, text, status, metadata, created_at) VALUES ('$new_id', '$merged_text', 'todo', '{}', CURRENT_TIMESTAMP);"
+            db_query "INSERT INTO nodes (id, text, status, metadata, created_at) VALUES ('$new_id', '$merged_text', 'todo', '{\"node_kind\":\"task\",\"type\":\"task\"}', CURRENT_TIMESTAMP);"
 
             # Remove contradiction edge
             db_query "DELETE FROM edges WHERE type='contradicts' AND ((source='$node1' AND target='$node2') OR (source='$node2' AND target='$node1'));"
 
-            # Add obsoletes edges: both nodes obsoleted by merger
+            # Add obsoletes edges: the target makes the source obsolete, so
+            # each original -> the merged node
             if [ "$has_rationale" = "true" ]; then
                 db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
-                    VALUES ('$new_id', '$node1', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP)
+                    VALUES ('$node1', '$new_id', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP)
                     ON CONFLICT(source, target, type) DO UPDATE SET
                         context = excluded.context, created_at = CURRENT_TIMESTAMP;"
                 db_query "INSERT INTO edges (source, target, type, weight, context, created_at)
-                    VALUES ('$new_id', '$node2', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP)
+                    VALUES ('$node2', '$new_id', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP)
                     ON CONFLICT(source, target, type) DO UPDATE SET
                         context = excluded.context, created_at = CURRENT_TIMESTAMP;"
             else
-                db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$new_id', '$node1', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
-                db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$new_id', '$node2', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
+                db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$node1', '$new_id', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
+                db_query "INSERT OR IGNORE INTO edges (source, target, type, weight, context, created_at) VALUES ('$node2', '$new_id', 'obsoletes', 1.0, '$resolve_ctx_escaped', CURRENT_TIMESTAMP);"
             fi
 
             echo -e "${GREEN}✓${NC} Resolved: created merged node $new_id (obsoletes $node1 and $node2)"
@@ -428,6 +475,7 @@ cmd_resolve() {
         defer)
             # A deferral closes nothing, so the close rules have nothing to judge.
             _close_rules_not_engaged "a deferred resolution closes neither node"
+            _close_children_not_engaged "a deferred resolution closes neither node"
             # Remove contradiction edge
             db_query "DELETE FROM edges WHERE type='contradicts' AND ((source='$node1' AND target='$node2') OR (source='$node2' AND target='$node1'));"
 
@@ -473,6 +521,7 @@ cmd_related() {
             --direction=*) direction="${1#*=}" ;;
             --depth=*)     depth="${1#*=}" ;;
             --json)        output_format="json" ;;
+            -*)            _wv_reject_arg related "$1"; return 1 ;;  # wv-016983
         esac
         shift
     done
@@ -627,6 +676,9 @@ cmd_edges() {
         case "$1" in
             --type=*) edge_type="${1#*=}"; edge_type="${edge_type//-/_}" ;;
             --json) output_format="json" ;;
+            # The guide listed --direction= and --depth= here, which are
+            # related's; edges dropped them without a word (wv-016983).
+            -*) _wv_reject_arg edges "$1"; return 1 ;;
         esac
         shift
     done
@@ -720,6 +772,7 @@ cmd_path() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --format=*) format="${1#*=}" ;;
+            -*) _wv_reject_arg path "$1"; return 1 ;;  # wv-016983
         esac
         shift
     done
@@ -853,8 +906,12 @@ cmd_context() {
         case "$1" in
             --json)   format="json" ;;
             --mode=*) mode_arg="${1#--mode=}" ;;
-            --*) ;; # skip other flags
-            *) [ -z "$id" ] && id="$1" ;; # first non-flag arg is ID
+            # An option no arm reads is refused, not skipped (wv-016983).
+            -*) _wv_reject_arg context "$1"; return 1 ;;
+            # One id: a second was dropped while the first's context printed (wv-51bd63).
+            *)
+                [ -z "$id" ] || { _wv_reject_arg context "$1"; return 1; }
+                id="$1" ;;
         esac
         shift
     done
@@ -1045,7 +1102,7 @@ cmd_context() {
           )
         WHERE e.type = 'resolves'
           AND n.id != '$id'
-          AND json_extract(n.metadata, '$.type') = 'finding'
+          AND $(wv_kind_sql n) = 'finding'
         ORDER BY n.updated_at DESC
         LIMIT 1;
     ")
@@ -1272,10 +1329,17 @@ cmd_tree() {
             --depth=*)   max_depth="${1#*=}" ;;
             --json)      json_output=true ;;
             --mermaid)   mermaid_output=true ;;
-            --root=*)    root_filter="${1#*=}" ;;
+            # One root, by --root= or positionally: a second replaced the
+            # first, whose tree was never shown (wv-51bd63).
+            --root=*)
+                [ -z "$root_filter" ] || { _wv_reject_arg tree "$1"; return 1; }
+                root_filter="${1#*=}" ;;
             --all)       node_cap=0 ;;
-            --*)         ;;
-            *)           root_filter="$1" ;;
+            # 'wv tree --mermiad' printed the default tree as if honoured (wv-016983).
+            -*)          _wv_reject_arg tree "$1"; return 1 ;;
+            *)
+                [ -z "$root_filter" ] || { _wv_reject_arg tree "$1"; return 1; }
+                root_filter="$1" ;;
         esac
         shift
     done
@@ -1286,7 +1350,7 @@ cmd_tree() {
         ''|*[!0-9]*) node_cap=50 ;;
     esac
 
-    db_ensure
+    wv_require_graph || return 1
 
     # Resolve root filter before building any queries — same pattern as the mermaid path.
     # When --root is specified, CTE anchors at that node instead of the top-level heuristic.
@@ -1315,7 +1379,7 @@ cmd_tree() {
     local tree_cte="
         WITH RECURSIVE tree AS (
             SELECT n.id, n.text, n.status,
-                   json_extract(n.metadata, '\$.type') as node_type,
+                   $(wv_kind_sql n) as node_type,
                    0 as depth,
                    n.id as root_id
             FROM nodes n
@@ -1325,7 +1389,7 @@ cmd_tree() {
 
             -- Children: nodes that implement a parent already in the tree
             SELECT n.id, n.text, n.status,
-                   json_extract(n.metadata, '\$.type') as node_type,
+                   $(wv_kind_sql n) as node_type,
                    t.depth + 1,
                    t.root_id
             FROM nodes n
@@ -1336,7 +1400,7 @@ cmd_tree() {
     local tree_cte_alias="
         WITH RECURSIVE tree AS (
             SELECT n.id, n.text, n.status, n.alias,
-                   json_extract(n.metadata, '\$.type') as node_type,
+                   $(wv_kind_sql n) as node_type,
                    0 as depth,
                    n.id as root_id
             FROM nodes n
@@ -1345,7 +1409,7 @@ cmd_tree() {
             UNION ALL
 
             SELECT n.id, n.text, n.status, n.alias,
-                   json_extract(n.metadata, '\$.type') as node_type,
+                   $(wv_kind_sql n) as node_type,
                    t.depth + 1,
                    t.root_id
             FROM nodes n
@@ -2391,7 +2455,7 @@ cmd_discover() {
         JOIN edges e ON (e.source=f.id AND e.target='$(sql_escape "$sid")')
                     OR (e.target=f.id AND e.source='$(sql_escape "$sid")')
         WHERE f.status != 'done'
-          AND (f.type='finding' OR json_extract(f.metadata, '\$.type')='finding')
+          AND $(wv_kind_sql f) = 'finding'
         ORDER BY f.updated_at DESC
         LIMIT $limit;
     ")
@@ -2750,7 +2814,7 @@ SELECT i.node_id,
        (SELECT COUNT(*) FROM edges
         WHERE source = i.node_id AND type = 'blocks')                AS blocks_count,
        (json_extract(n.metadata, '$.done_criteria') IS NULL)         AS missing_criteria,
-       json_extract(n.metadata, '$.type')                            AS node_type
+       $(wv_kind_sql n)                            AS node_type
 FROM impact i
 JOIN nodes n ON n.id = i.node_id
 WHERE i.depth > 0

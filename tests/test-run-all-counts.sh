@@ -22,26 +22,32 @@ printf '#!/bin/bash\necho "Results: 3/3 passed"\n' > "$TMP/tests/test-policy-cel
 printf '#!/bin/bash\necho "Tests: 5 | Passed: 5 | Failed: 0"\n' > "$TMP/tests/test-quality.sh"
 printf '#!/bin/bash\necho "Violation vocabulary: PASS"\n' > "$TMP/tests/test-violation-vocabulary.sh"
 
-# run_one <filter> -> the copied aggregate's output for that one suite
-run_one() { (cd "$TMP" && bash tests/run-all.sh --serial --suite="$1" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'); }
+# run_one <mode> <filter> -> the copied aggregate's output for that one suite.
+# Both modes print their own per-suite line; the release --verify runs the
+# parallel one, which printed a no-count suite as 0/0 (wv-0be4c5).
+run_one() { (cd "$TMP" && bash tests/run-all.sh "$1" --suite="$2" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'); }
 
-out=$(run_one test-policy-cells)
-[[ "$out" == *"Policy Rule Cells: 3/3 tests"* ]] && [[ "$out" == *"Total tests: 3/3 passed"* ]] &&
-    ok "a Results: X/Y suite is counted" || bad "a Results: X/Y suite is counted" "$(grep -E 'Cells|Total' <<< "$out")"
+for mode in --serial --parallel; do
+    out=$(run_one "$mode" test-policy-cells)
+    [[ "$out" == *"Policy Rule Cells: 3/3 tests"* ]] && [[ "$out" == *"Total tests: 3/3 passed"* ]] &&
+        ok "$mode: a Results: X/Y suite is counted" ||
+        bad "$mode: a Results: X/Y suite is counted" "$(grep -E 'Cells|Total' <<< "$out")"
 
-out=$(run_one "Quality Scan and Reset")
-[[ "$out" == *"Quality Scan and Reset: 5/5 tests"* ]] && [[ "$out" == *"Total tests: 5/5 passed"* ]] &&
-    ok "a Tests: N | Passed: P suite is counted, not read as 0/0" ||
-    bad "a Tests: N | Passed: P suite is counted, not read as 0/0" "$(grep -E 'Quality|Total' <<< "$out")"
+    out=$(run_one "$mode" "Quality Scan and Reset")
+    [[ "$out" == *"Quality Scan and Reset: 5/5 tests"* ]] && [[ "$out" == *"Total tests: 5/5 passed"* ]] &&
+        ok "$mode: a Tests: N | Passed: P suite is counted, not read as 0/0" ||
+        bad "$mode: a Tests: N | Passed: P suite is counted, not read as 0/0" "$(grep -E 'Quality|Total' <<< "$out")"
 
-out=$(run_one test-violation-vocabulary)
-if [[ "$out" == *"Violation Vocabulary Contract: no test count"* ]] && [[ "$out" != *"Contract: 0/0"* ]] &&
-    [[ "$out" == *"Not in the test total"*"test-violation-vocabulary.sh"* ]] &&
-    grep -qx "uncounted-suite: test-violation-vocabulary.sh" <<< "$out"; then
-    ok "a suite with no parseable count is named, never counted as 0/0"
-else
-    bad "a suite with no parseable count is named, never counted as 0/0" "$(grep -E 'Contract|Total|uncounted|Not in' <<< "$out")"
-fi
+    out=$(run_one "$mode" test-violation-vocabulary)
+    if [[ "$out" == *"Violation Vocabulary Contract: no test count"* ]] && [[ "$out" != *"Contract: 0/0"* ]] &&
+        [[ "$out" == *"Not in the test total"*"test-violation-vocabulary.sh"* ]] &&
+        grep -qx "uncounted-suite: test-violation-vocabulary.sh" <<< "$out"; then
+        ok "$mode: a suite with no parseable count is named, never counted as 0/0"
+    else
+        bad "$mode: a suite with no parseable count is named, never counted as 0/0" \
+            "$(grep -E 'Contract|Total|uncounted|Not in' <<< "$out")"
+    fi
+done
 
 # Capacity is checked before any suite starts, in serial and parallel mode.
 printf '#!/bin/bash\ntouch "%s/probe"\necho "Results: 3/3 passed"\n' "$TMP" > "$TMP/tests/test-policy-cells.sh"

@@ -586,7 +586,10 @@ EOF
             --language)   shift; language="${1:-}" ;;
             --note=*)     note="${1#--note=}" ;;
             --note)       shift; note="${1:-}" ;;
-            --help|-h)    ;;
+            # An empty arm here dropped the flag and ran the subcommand: 'scan
+            # --help' scanned the whole repository (rc.14 consumer audit K8,
+            # wv-561071).
+            --help|-h)    cmd_quality_patterns help; return 0 ;;
             -*)
                 echo -e "${RED}Unexpected option: $1${NC}" >&2
                 return 1
@@ -601,6 +604,15 @@ EOF
     local py_args=()
     [ -n "$WV_HOT_ZONE" ] && py_args+=("--hot-zone" "$WV_HOT_ZONE")
     py_args+=("patterns" "$subcmd")
+    # Every subcommand but adjudicate takes at most one positional. 'scan A B'
+    # scanned A alone and reported it as the whole result, so a multi-path
+    # prose check skipped every path after the first (wv-51bd63). A scan
+    # records one target, so the extra is refused rather than looped over.
+    if [ "$subcmd" != "adjudicate" ] && [ "${#positional[@]}" -gt 1 ]; then
+        _wv_reject_arg "quality patterns $subcmd" "${positional[1]}"
+        echo "It takes one path; run it once per path." >&2
+        return 1
+    fi
     if [ "$subcmd" = "adjudicate" ]; then
         if [ "${#positional[@]}" -ne 2 ]; then
             echo -e "${RED}Error: adjudicate requires FINDING_KEY and DISPOSITION${NC}" >&2

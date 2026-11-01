@@ -159,7 +159,7 @@ case "\$1 \$2" in
 esac
 EOF
 chmod +x "$B/gh"
-PATH="$B:$PATH" module wv-cmd-ops.sh "_recover_delete '{\"gh_issue\":7,\"id\":\"wv-000001\"}' gh_close true" >/dev/null
+PATH="$B:$PATH" module wv-cmd-recover.sh "_recover_delete '{\"gh_issue\":7,\"id\":\"wv-000001\"}' gh_close true" >/dev/null
 check "issue #7 is closed in the named repository" "issue close 7 --repo owner/repo" "$(cat "$T/gh.log" 2>/dev/null)"
 
 echo "wv init: a database it cannot create is a failure, not '✓ Initialized' (wv-b98794)"

@@ -61,7 +61,7 @@ Break the epic into 3-7 major features:
 - Each feature should be a cohesive piece of functionality
 - Features should be relatively independent when possible
 - Features represent days/weeks of work
-- Use metadata: `{"type":"feature","priority":1-5}`
+- Use `--kind=feature` and metadata `{"priority":1-5}`
 
 ### 3. Break Features into Tasks
 
@@ -70,7 +70,7 @@ For each feature, create 3-10 tasks:
 - Each task should be atomic (single unit of work)
 - Tasks should be completable in hours, not days
 - Tasks should have clear acceptance criteria
-- Use metadata: `{"type":"task","priority":1-5}`
+- Use `--kind=task` and metadata `{"priority":1-5}`
 
 ### 4. Create Weave Nodes
 
@@ -80,16 +80,16 @@ For each feature, create 3-10 tasks:
 
 ```bash
 # Create epic first — all features and tasks must link back to it
-EPIC=$(wv add "Epic: $ARGUMENTS" --metadata='{"type":"epic","priority":1}')
+EPIC=$(wv add "Epic: $ARGUMENTS" --kind=epic --metadata='{"priority":1}')
 
 # Create features — each linked to the epic via --parent
-FEAT1=$(wv add "Feature: [first major capability]" --metadata='{"type":"feature","priority":1}' --parent=$EPIC)
-FEAT2=$(wv add "Feature: [second major capability]" --metadata='{"type":"feature","priority":2}' --parent=$EPIC)
+FEAT1=$(wv add "Feature: [first major capability]" --kind=feature --metadata='{"priority":1}' --parent=$EPIC)
+FEAT2=$(wv add "Feature: [second major capability]" --kind=feature --metadata='{"priority":2}' --parent=$EPIC)
 # ... more features
 
 # Create tasks for feature 1 — each linked to its feature via --parent
-TASK1=$(wv add "Task: [specific implementation]" --metadata='{"type":"task","priority":1}' --parent=$FEAT1)
-TASK2=$(wv add "Task: [specific implementation]" --metadata='{"type":"task","priority":2}' --parent=$FEAT1)
+TASK1=$(wv add "Task: [specific implementation]" --kind=task --metadata='{"priority":1}' --parent=$FEAT1)
+TASK2=$(wv add "Task: [specific implementation]" --kind=task --metadata='{"priority":2}' --parent=$FEAT1)
 # ... more tasks
 # Repeat for other features, linking to $FEAT2, $FEAT3, etc.
 ```
@@ -318,7 +318,7 @@ wv block $FEATURE --by=$TASK3
 When multiple features depend on common groundwork:
 
 ```bash
-FOUNDATION=$(wv add "Task: Set up shared infrastructure" --metadata='{"type":"task","priority":1}')
+FOUNDATION=$(wv add "Task: Set up shared infrastructure" --kind=task --metadata='{"priority":1}')
 
 wv block $FEAT1 --by=$FOUNDATION
 wv block $FEAT2 --by=$FOUNDATION

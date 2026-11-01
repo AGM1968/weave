@@ -52,7 +52,7 @@ _le_tag_hook() {
 # configuration stays in the tree, and without the helpers nothing is committed.
 # Prints nothing; returns 0 whether or not it committed.
 _le_checkpoint_commit() {
-    local message="$1" no_verify="${2:-}" prestaged="" branch local_head remote_head last_msg last_nw skip_ci
+    local message="$1" no_verify="${2:-}" prestaged="" skip_ci
     if ! command -v wv_stage_graph_state >/dev/null 2>&1; then
         prestaged="checkpoint helpers unavailable"
     elif [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
@@ -62,22 +62,16 @@ _le_checkpoint_commit() {
     [ -z "$prestaged" ] || return 0
     wv_stage_graph_state "$PWD" 2>/dev/null || true
     git diff --cached --quiet 2>/dev/null && return 0
-    branch=$(git branch --show-current 2>/dev/null || echo "main")
-    local_head=$(git rev-parse HEAD 2>/dev/null || echo "")
-    remote_head=$(git rev-parse "origin/$branch" 2>/dev/null || echo "none")
-    last_msg=$(git log -1 --format='%s' 2>/dev/null || echo "")
-    # --no-renames: a file moved into .weave/ would otherwise list only under
-    # its new path, and the commit would read as .weave-only (wv-b60cd5).
-    last_nw=$(git diff --no-renames HEAD~1 HEAD --name-only 2>/dev/null | grep -v '^\.weave/' | grep -v '^$' || true)
     # wv-e937f8: [skip ci] applies to the whole PUSH at its tip, not just this
     # commit's own (always .weave-only) diff -- omit it when the unpushed range
     # ahead of upstream already carries non-.weave/ work. wv-179c49: fail toward
     # NOT skipping CI when the marker helper is unavailable or fails.
     skip_ci=$(command -v wv_checkpoint_ci_marker >/dev/null 2>&1 \
         && wv_checkpoint_ci_marker "$PWD" || echo "")
-    if [ "$local_head" != "$remote_head" ] \
-       && [[ "$last_msg" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] \
-       && [ -z "$last_nw" ]; then
+    # The shared rule (wv-checkpoint-ci.sh): an unpushed weave-only checkpoint
+    # that no in-flight push is publishing (wv-13db30). Without the helper,
+    # never amend.
+    if command -v wv_checkpoint_amendable >/dev/null 2>&1 && wv_checkpoint_amendable "$PWD"; then
         # HEAD is an unpushed weave-only checkpoint -- safe to amend.
         WV_AUTO_CHECKPOINT_ACTIVE=1 git commit --amend --no-edit ${no_verify:+"$no_verify"} >/dev/null 2>&1 || \
             WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "$message $(date +%H:%M)${skip_ci}" ${no_verify:+"$no_verify"} >/dev/null 2>&1 || true
@@ -328,7 +322,7 @@ wv_pre_compact_context() (
 
     # Active nodes with full text: what is being worked on right now.
     ACTIVE=$(sqlite3 -json "$local_db" "
-        SELECT id, text, json_extract(metadata, '$.type') as type
+        SELECT id, text, COALESCE(json_extract(metadata, '$.node_kind'), json_extract(metadata, '$.type')) as type
         FROM nodes WHERE status='active'
         ORDER BY updated_at DESC LIMIT 5;
     " 2>/dev/null | jq -c '.' 2>/dev/null) || ACTIVE="[]"

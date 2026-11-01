@@ -1,0 +1,67 @@
+{
+  "format": "weave.edge-types.v1",
+  "direction": "an edge runs source -> target, as wv link <source> <target> --type=<type> writes it",
+  "enforcement": {
+    "write": "wv link refuses an edge that breaks an invariant (policy rule edge_write_invariants); wv block refuses a blocks cycle (block_graph_acyclic)",
+    "report": "wv doctor lists stored edges that break one; existing violations are reported, never refused on read (ontology D4)",
+    "query": "wv_edge_violations_sql in scripts/lib/wv-db.sh, shared by the write check and the report"
+  },
+  "common": [
+    { "id": "no_self_edge", "rule": "source and target differ" },
+    { "id": "endpoints_exist", "rule": "both endpoints are nodes in the graph" }
+  ],
+  "types": {
+    "blocks": {
+      "meaning": "Workflow dependency (target blocked by source)",
+      "invariants": [{ "id": "acyclic", "rule": "the target does not already reach the source over blocks edges" }]
+    },
+    "relates_to": {
+      "meaning": "General semantic relationship",
+      "invariants": []
+    },
+    "implements": {
+      "meaning": "Source implements target (child -> parent)",
+      "invariants": [{ "id": "acyclic", "rule": "the target does not already reach the source over implements edges" }]
+    },
+    "contradicts": {
+      "meaning": "Target contradicts source",
+      "invariants": []
+    },
+    "supersedes": {
+      "meaning": "Target supersedes/replaces source (old -> new)",
+      "invariants": [
+        {
+          "id": "target_newer_or_declared",
+          "rule": "target.created_at >= source.created_at, or the source's metadata.superseded_by names the target"
+        },
+        { "id": "memory_superseded_by", "rule": "a memory source carries metadata.superseded_by = target" }
+      ]
+    },
+    "references": {
+      "meaning": "Target references/mentions source",
+      "invariants": []
+    },
+    "obsoletes": {
+      "meaning": "Target makes source obsolete",
+      "invariants": []
+    },
+    "addresses": {
+      "meaning": "Source addresses/fixes pitfall in target",
+      "invariants": [{ "id": "source_newer", "rule": "source.created_at >= target.created_at" }]
+    },
+    "resolves": {
+      "meaning": "Links a task or fix with its finding handoff",
+      "invariants": [
+        {
+          "id": "finding_endpoint",
+          "rule": "source or target has kind finding, or a finding/gap text prefix (finding(, Finding:, gap()"
+        }
+      ]
+    }
+  },
+  "closure": {
+    "rule": "a node closes only when each open implements child is parked (metadata.deferred with a deferred_reason), linked by a resolves edge, or has another implements parent still open",
+    "write": "every close path (policy rule close_children_accounted)",
+    "report": "wv doctor lists closed parents over such children"
+  }
+}

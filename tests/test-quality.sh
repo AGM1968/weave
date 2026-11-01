@@ -822,6 +822,60 @@ print(d['added_since_baseline'])
 }
 test_prose_shape_reads_a_split_sweep
 
+# wv-a6b418: a root scan after a subdirectory scan declared every file scanned
+# but stored a report only for the changed one, because carry-forward copied
+# from the subdirectory scan, which held no root files. 'wv quality functions'
+# then answered "No scanned files found" for every unchanged file. Fixed in
+# d868368d2; this drives the public CLI, on a database never reset.
+test_root_subdirectory_root_scan_keeps_every_report() {
+    local tmp="$TEST_DIR/rootsub" out f n
+    rm -rf "$tmp"; mkdir -p "$tmp/r/src" "$tmp/r/scripts" "$tmp/hot"
+    rs() { (cd "$tmp/r" && WEAVE_DIR="$tmp/r/.weave" WV_HOT_ZONE="$tmp/hot" WV_DB="$tmp/hot/brain.db" \
+        WV_AUTO_CHECKPOINT=0 "$WV" "$@"); }
+    git -C "$tmp/r" init -q
+    printf 'def alpha(x):\n    if x:\n        return 1\n    return 2\n' > "$tmp/r/src/a.py"
+    printf 'def beta():\n    return 3\n' > "$tmp/r/top.py"
+    printf 'gamma() {\n  if [ -n "$1" ]; then echo y; fi\n}\n' > "$tmp/r/scripts/b.sh"
+    git -C "$tmp/r" add -A
+    git -C "$tmp/r" -c core.hooksPath=/dev/null -c user.email=t@t -c user.name=t commit -qm init
+    rs init >/dev/null 2>&1
+    rs quality scan --json >/dev/null 2>&1
+    rs quality scan scripts --json >/dev/null 2>&1
+    printf 'def beta():\n    return 4\n' > "$tmp/r/top.py"
+    out=$(rs quality scan --json 2>/dev/null) || true
+    assert_json_field "$out" "files_changed" "1" "the second root scan rescans only the edited file"
+    assert_json_field "$out" "files_total" "3" "...and reports all three files"
+    n=$(sqlite3 "$tmp/hot/quality.db" "SELECT COUNT(*) FROM files WHERE scan_id=(SELECT MAX(id) FROM scan_meta)") || true
+    assert_equals "3" "$n" "...and stores a report for each of them"
+    for f in src/a.py top.py scripts/b.sh; do
+        out=$(rs quality functions "$f" 2>&1) || true
+        assert_contains "$out" "CC=" "wv quality functions $f answers after root, scripts, root"
+    done
+    rm -rf "$tmp"
+}
+test_root_subdirectory_root_scan_keeps_every_report
+
+# wv-561071 (rc.14 consumer audit K8): 'wv quality patterns scan --help' ran a
+# repository-wide scan, because the patterns option loop had an empty --help
+# arm. Every quality subcommand's --help prints usage, exits 0 quickly, and
+# leaves no scan behind in quality.db.
+test_every_quality_help_prints_usage_and_does_no_work() {
+    cd "$TEST_DIR" || return
+    local line out rc
+    for line in "prose-shape" "scan" "functions" "freshness" "hotspots" "diff" "promote" \
+            "structural-search" "patterns scan" "patterns list" "patterns show" \
+            "patterns adjudicate" "patterns report" "patterns validate" "patterns promote"; do
+        rm -f "$WV_HOT_ZONE/quality.db"
+        rc=0
+        # shellcheck disable=SC2086  # a subcommand line, split on purpose
+        out=$(timeout 20 "$WV" quality $line --help 2>&1) || rc=$?
+        assert_equals "0" "$rc" "wv quality $line --help exits 0"
+        assert_contains "$out" "Usage:" "...and prints its usage"
+        assert_equals "no" "$([ -e "$WV_HOT_ZONE/quality.db" ] && echo yes || echo no)" "...and leaves no scan in quality.db"
+    done
+}
+test_every_quality_help_prints_usage_and_does_no_work
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Results
 # ═══════════════════════════════════════════════════════════════════════════

@@ -569,6 +569,18 @@
     },
     {
       "cache": {
+        "invalidate": true,
+        "serve": false
+      },
+      "evidence_class": "mutation_attempt",
+      "mutation_targets": [
+        "brain_db",
+        "repo_state"
+      ],
+      "operation": "kind"
+    },
+    {
+      "cache": {
         "invalidate": false,
         "serve": false
       },

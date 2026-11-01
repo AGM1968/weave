@@ -10,6 +10,7 @@ export WV_CALL_SOURCE=test
 #   - healthy project, seeded example only, orphan guide (pass / pass / warn)
 #   - an invalid guide whose filename carries a double quote: validity fails
 #     and 'wv doctor --json' still parses (detail escaping)
+#   - one guide with three faults names all three in one run (wv-273b2d)
 #   - a python override coaching the wrong type fails in its own language
 #   - a weave_quality/ decoy in the project root does not shadow the selected
 #     copy (PYTHONSAFEPATH), and where an interpreter ignores that, the
@@ -152,6 +153,38 @@ test_invalid_guide_with_quote_in_name() {
     assert_contains "$(check_detail "$out" guide-validity)" 'bad"name.md' "detail carries the file name intact"
 }
 
+test_invalid_guide_names_the_field() {
+    echo "-- a consumer's pre-rc.14 guides -> validity fail names each failing field (wv-ba21bd)"
+    # A repeated heading parsed until rc.13 (the second body replaced the first),
+    # and an unknown frontmatter key went unread until rc.14's doctor parsed
+    # every project guide. The detail listed file names only.
+    printf -- '---\nid: legacy-note\nviolation_type: repo:hygiene\nsummary: x\n---\n\n## Why\n\nx\n\n## Corrective move\n\nx\n\n## Avoid\n\na\n\n## Avoid\n\nb\n' \
+        > .weave/guides/legacy-note.md
+    printf -- '---\nid: titled-note\ntitle: Old title\nviolation_type: repo:hygiene\nsummary: x\n---\n\n## Why\n\nx\n\n## Corrective move\n\nx\n' \
+        > .weave/guides/titled-note.md
+    local out detail
+    out=$(doctor_json)
+    detail=$(check_detail "$out" guide-validity)
+    assert_eq "fail" "$(check_status "$out" guide-validity)" "invalid guides fail validity"
+    assert_contains "$detail" "legacy-note.md: duplicate section 'Avoid'" "detail names the repeated section"
+    assert_contains "$detail" "titled-note.md:3: unknown frontmatter 'title'" "detail names the unknown frontmatter key and its line"
+}
+
+test_three_faults_in_one_run() {
+    echo "-- one guide with three faults -> one doctor run names all three (wv-273b2d)"
+    # The parser stopped at its first fault, so a consumer's filler.md surfaced
+    # its three one run at a time: fix one, run again, meet the next.
+    printf -- '---\nid: three-faults\ntitle: Old title\nviolation_type: repo:hygiene\nsummary: x\n---\n\n## Why\n\nx\n\n## Corrective move\n\nx\n\n## Avoid\n\na\n\n## Avoid\n\nb\n\n## Extra\n\nc\n' \
+        > .weave/guides/three-faults.md
+    local out detail
+    out=$(doctor_json)
+    detail=$(check_detail "$out" guide-validity)
+    assert_eq "fail" "$(check_status "$out" guide-validity)" "the guide fails validity"
+    assert_contains "$detail" "three-faults.md:3: unknown frontmatter 'title'" "first fault: the unknown frontmatter key"
+    assert_contains "$detail" "three-faults.md: duplicate section 'Avoid'" "second fault: the repeated section"
+    assert_contains "$detail" "three-faults.md: unknown section 'Extra'" "third fault: the undeclared heading"
+}
+
 test_wrong_type_python_override() {
     echo "-- a parse-valid python override coaching the wrong type -> validity fail in its own language"
     sed 's/^violation_type: code:swallowed-exception$/violation_type: code:unsafe-subprocess/' \
@@ -217,7 +250,10 @@ test_malformed_entries_fail_closed() {
     out=$(doctor_json)
     assert_eq "pass pass" "$(check_status "$out" guide-validity) $(check_status "$out" guide-completeness)" \
         "control: the rewriting wrapper alone changes nothing"
+    # An entry without its violations, or with none, renders nothing to fix.
     for f in '.invalid = [{}]' '.invalid = [42]' '.fallback_only = [null]' \
+        '.invalid = [{"file": "broken.md", "error": "bad guide"}]' \
+        '.invalid = [{"file": "broken.md", "error": "bad guide", "errors": []}]' \
         '.unresolved = [{"violation_type": "code:x", "language": null, "error": ""}]' \
         '.examples = [""]' '.project_guides_checked = -1' '.canonical_types = 1.5'; do
         mutate_report "$f"
@@ -230,11 +266,11 @@ test_malformed_entries_fail_closed() {
 
 test_wellformed_invalid_entry_fails_validity() {
     echo "-- a well-formed invalid entry -> validity fail, completeness unaffected"
-    mutate_report '.invalid = [{"file": "broken.md", "error": "bad guide"}]'
+    mutate_report '.invalid = [{"file": "broken.md", "error": "bad guide", "errors": ["bad guide"]}]'
     local out
     out=$(doctor_json)
     assert_eq "fail" "$(check_status "$out" guide-validity)" "a reported invalid guide fails validity"
-    assert_contains "$(check_detail "$out" guide-validity)" "coaching would fail for: broken.md" "detail names the guide"
+    assert_contains "$(check_detail "$out" guide-validity)" "coaching would fail for: broken.md: bad guide" "detail names the guide and its error"
     assert_eq "pass" "$(check_status "$out" guide-completeness)" "completeness still passes"
 }
 
@@ -248,6 +284,8 @@ main() {
     setup_test_env; test_seeded_example_passes
     setup_test_env; test_orphan_guide_warns
     setup_test_env; test_invalid_guide_with_quote_in_name
+    setup_test_env; test_invalid_guide_names_the_field
+    setup_test_env; test_three_faults_in_one_run
     setup_test_env; test_wrong_type_python_override
     setup_test_env; test_cwd_decoy_does_not_shadow
     setup_test_env; test_decoy_that_runs_is_refused

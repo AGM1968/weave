@@ -220,6 +220,14 @@ CREATE TABLE IF NOT EXISTS pattern_finding_disposition_history (
     FOREIGN KEY(finding_key) REFERENCES pattern_finding_state(finding_key)
 );
 
+-- A finding whose key changed form (wv-0f8658). Export and import read it to
+-- translate adjudication records still under the old key.
+CREATE TABLE IF NOT EXISTS pattern_finding_rekeys (
+    old_key    TEXT PRIMARY KEY,
+    new_key    TEXT NOT NULL,
+    rekeyed_at TEXT NOT NULL
+);
+
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_files_scan ON files(scan_id);
 CREATE INDEX IF NOT EXISTS idx_files_complexity ON files(complexity DESC);
@@ -1865,6 +1873,100 @@ def content_key_for(rule_id: str, match_text: str, context_text: str) -> str:
     return "qc-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+def unique_finding_key_for(rule_id: str, path: str, match: str) -> str:
+    """The key of a match whose text is unique in its file.
+
+    Byte-for-byte the key such a finding has always had (the ordinal is 1),
+    so adjudications recorded under it stay attached and an edit around the
+    match leaves it alone.
+    """
+    identity = json.dumps([rule_id, path, match, 1], ensure_ascii=False, separators=(",", ":"))
+    return "qf-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def finding_key_for(rule_id: str, path: str, match: str, anchor: str, ordinal: int) -> str:
+    """The key of one of several matches of the same text in a file.
+
+    Ordinal alone told them apart, so repairing one renumbered every later
+    one and each took its neighbour's verdict (wv-0f8658). The anchor (the
+    words around the match) does not move when another one is repaired, and
+    the ordinal now counts only matches sharing it.
+    """
+    identity = json.dumps(
+        [rule_id, path, match, anchor, ordinal], ensure_ascii=False, separators=(",", ":")
+    )
+    return "qf-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+# Tables whose rows name a finding by key; moving a finding moves all of them.
+_FINDING_KEY_CHILD_TABLES = (
+    "pattern_finding_occurrences", "pattern_finding_disposition_history", "pattern_findings",
+)
+
+
+def _move_finding(conn: sqlite3.Connection, old: str, new: str, now: str) -> None:
+    """Re-key one finding's state, occurrences, history and scan rows."""
+    # The state row is the parent of history's foreign key, so it is copied
+    # under the new key before its children move, then removed. Columns are
+    # named because _migrate_v11 appended content_key: order differs by age.
+    columns = ("content_key, rule_id, path, match_text, context_text, first_seen_scan_id, "
+               "last_seen_scan_id, scan_count, disposition, note, adjudicated_at, updated_at")
+    conn.execute(
+        f"INSERT INTO pattern_finding_state (finding_key, {columns}) "
+        f"SELECT ?, {columns} FROM pattern_finding_state WHERE finding_key = ?",
+        (new, old),
+    )
+    for table in _FINDING_KEY_CHILD_TABLES:
+        conn.execute(f"UPDATE {table} SET finding_key = ? WHERE finding_key = ?", (new, old))
+    conn.execute("DELETE FROM pattern_finding_state WHERE finding_key = ?", (old,))
+    # Kept flat: a key in use again is no longer moved, and earlier moves to
+    # OLD now end at NEW, so a group that grows and shrinks back never
+    # leaves a cycle that would translate a live key to a dead one.
+    conn.execute("DELETE FROM pattern_finding_rekeys WHERE old_key = ?", (new,))
+    conn.execute("UPDATE pattern_finding_rekeys SET new_key = ? WHERE new_key = ?", (new, old))
+    conn.execute(
+        "INSERT OR REPLACE INTO pattern_finding_rekeys (old_key, new_key, rekeyed_at) VALUES (?, ?, ?)",
+        (old, new, now),
+    )
+
+
+def _carry_moved_findings(conn: sqlite3.Connection, findings: list[PatternFinding]) -> None:
+    """Give a finding whose key changed form the record it had under the old one.
+
+    A key changes form when its match stops or starts being unique in the
+    file, and every key changed when wv-0f8658 replaced the ordinal-only
+    identity. A finding with nothing stored under its key takes over the row
+    of a finding no longer present with the same rule, path, match and line
+    context. Matching by content, never by a computed old key, is what keeps
+    a neighbour's verdict from being taken.
+    """
+    current = {finding.finding_key for finding in findings}
+    claimed: set[str] = set()
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    for finding in findings:
+        new = finding.finding_key
+        if conn.execute("SELECT 1 FROM pattern_finding_state WHERE finding_key = ?", (new,)).fetchone():
+            continue
+        candidates = conn.execute(
+            "SELECT finding_key FROM pattern_finding_state WHERE rule_id = ? AND path = ? "
+            "AND match_text = ? AND context_text = ? ORDER BY finding_key",
+            (finding.rule_id, finding.path, finding.match_text, finding.context_text),
+        ).fetchall()
+        old = next((str(row[0]) for row in candidates
+                    if str(row[0]) not in current and str(row[0]) not in claimed), None)
+        if old is not None:
+            claimed.add(old)
+            _move_finding(conn, old, new, now)
+
+
+def _rekey_map(conn: sqlite3.Connection) -> dict[str, str]:
+    """Legacy finding keys this database has moved, mapped to their keys."""
+    return {
+        str(row[0]): str(row[1])
+        for row in conn.execute("SELECT old_key, new_key FROM pattern_finding_rekeys").fetchall()
+    }
+
+
 def replace_pattern_scan_results(
     conn: sqlite3.Connection,
     scan_id: int,
@@ -1872,6 +1974,7 @@ def replace_pattern_scan_results(
     runs: Sequence[Mapping[str, object]],
 ) -> None:
     """Atomically replace findings and successful rule receipts for a scan."""
+    _carry_moved_findings(conn, findings)
     old_keys = {
         str(row[0])
         for row in conn.execute(
@@ -2101,9 +2204,20 @@ def _projection_state_path_exists(record: dict[str, object], projection: Path) -
     return candidate.is_file()
 
 
+def _translated(record: dict[str, object], rekeys: Mapping[str, str]) -> dict[str, object]:
+    """A projection record under the key its finding has now (wv-0f8658)."""
+    key = str(record["finding_key"])
+    return {**record, "finding_key": rekeys[key]} if key in rekeys else record
+
+
 def export_pattern_adjudications(conn: sqlite3.Connection, path: Path) -> int:
-    """Atomically merge durable human adjudications into a JSONL projection."""
-    existing = _read_adjudication_projection(path)
+    """Atomically merge durable human adjudications into a JSONL projection.
+
+    A record still under a legacy key this database has moved is written
+    under the new key, so the projection holds one record per finding.
+    """
+    rekeys = _rekey_map(conn)
+    existing = [_translated(record, rekeys) for record in _read_adjudication_projection(path)]
     states = {
         str(record["finding_key"]): record
         for record in existing
@@ -2172,7 +2286,8 @@ def import_pattern_adjudications(conn: sqlite3.Connection, path: Path) -> int:
     """Merge a durable adjudication projection into an initialized quality DB."""
     states: dict[str, dict[str, object]] = {}
     histories: dict[str, dict[str, object]] = {}
-    for record in _read_adjudication_projection(path):
+    rekeys = _rekey_map(conn)
+    for record in (_translated(record, rekeys) for record in _read_adjudication_projection(path)):
         key = str(record["finding_key"])
         if record["type"] == "state":
             current = states.get(key)

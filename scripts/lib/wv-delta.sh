@@ -1071,7 +1071,7 @@ try:
 except (TypeError, ValueError):
     seq = 1
 
-STATUSES = {"todo", "ready", "active", "blocked", "done"}
+STATUSES = {"todo", "ready", "active", "blocked", "blocked-external", "done"}
 RISK_LEVELS = {"none", "low", "medium", "high"}
 META_SUGAR = ("claimed_by", "risk_level")
 

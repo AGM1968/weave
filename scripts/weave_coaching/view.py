@@ -146,10 +146,12 @@ def render_response(
     incomplete = snapshot.get("state") != "complete"
     blocks: list[dict[str, Any]] = []
     for finding in findings:
-        violation_type = finding["violation_type"]
-        guide = guides.get(violation_type)
+        # A finding may name its guide: findings of one type in different
+        # languages are coached by different guides.
+        guide_key = finding.get("guide_key") or finding["violation_type"]
+        guide = guides.get(guide_key)
         if guide is None:
-            raise ViewError(f"no resolved guide supplied for {violation_type!r}")
+            raise ViewError(f"no resolved guide supplied for {guide_key!r}")
         blocks.append(_coaching_block(finding, guide, limit))
 
     response: dict[str, Any] = {"format": RESPONSE_FORMAT, "blocks": blocks}

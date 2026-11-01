@@ -12,6 +12,7 @@
 #   cmd/wv-cmd-graph.sh— block, link, resolve, related, edges, path, context
 #   cmd/wv-cmd-data.sh — batch, plan, enrich-topology, sync, load, compact, prune, unarchive, clean-ghosts, commit-refs, learnings, refs, import, search, reindex, trails (alias: breadcrumbs)
 #   cmd/wv-cmd-ops.sh  — doctor, recover, selftest, mcp-status, health, cache, preflight, digest, overview, session-summary, audit-pitfalls, pattern-audit, edge-types, guide, init-repo, help
+#   cmd/wv-cmd-gate.sh — config, test-record, test-status (the commands the commit gate runs)
 #   cmd/wv-cmd-quality.sh — quality
 #   cmd/wv-cmd-findings.sh — findings
 
@@ -251,6 +252,7 @@ _wv_dispatch() {
         compact)     cmd_compact "$@" ;;
         cutover)     cmd_cutover "$@" ;;
         prune)       cmd_prune "$@" ;;
+        kind)        cmd_kind "$@" ;;
         unarchive)   cmd_unarchive "$@" ;;
         clean-ghosts) cmd_clean_ghosts "$@" ;;
         commit-refs) cmd_commit_refs "$@" ;;

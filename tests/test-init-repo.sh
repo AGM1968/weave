@@ -878,6 +878,29 @@ assert_equals "$CX_BEFORE" "$(jq -r '.memory.entries | length' .codex/weave.json
     "codex memory: --update keeps the contract's memory entries"
 assert_contains "$(jq -r '.memory.entries[].text // empty' .codex/weave.json 2>/dev/null)" "codex memory fixture fact" \
     "codex memory: the kept entry is the graph's memory"
+# --- --update turns a full-text memory block into the index (wv-91f0ca) ---
+# The projections now carry one line per memory. A consumer upgraded with
+# --update had its old full-text block until a memory changed; --update now
+# re-renders a block that is there, and adds none where the user has none.
+echo ""
+echo "--- --update refreshes an existing memory block to the index ---"
+REPO_MI=$(make_test_repo "memory-index")
+cd "$REPO_MI"
+"$WV" init-repo --agent=claude >/dev/null 2>&1
+"$WV" remember "Index fixture first sentence. MEMORY-INDEX-SECOND-SENTENCE belongs to the full text only." >/dev/null 2>&1
+printf '%s\n' '<!-- ── BEGIN WEAVE:MEMORY ── managed by wv memory render, do not edit manually -->' \
+    '## WEAVE:MEMORY' '' '- [`wv-000000`] an old full-text entry MEMORY-INDEX-SECOND-SENTENCE (verified: unknown)' \
+    '<!-- ── END WEAVE:MEMORY ── -->' >> CLAUDE.md
+"$WV" init-repo --update --agent=claude >/dev/null 2>&1
+MI_BLOCK=$(sed -n '/BEGIN WEAVE:MEMORY/,/END WEAVE:MEMORY/p' CLAUDE.md)
+assert_contains "$MI_BLOCK" "Index fixture first sentence." "memory index: --update re-renders the existing block from the graph"
+assert_equals "0" "$(grep -c 'MEMORY-INDEX-SECOND-SENTENCE' <<< "$MI_BLOCK" || true)" "memory index: the block carries the index, not the full text"
+REPO_MN=$(make_test_repo "memory-noblock")
+cd "$REPO_MN"
+"$WV" init-repo --agent=claude >/dev/null 2>&1
+"$WV" remember "A memory in a repo whose CLAUDE.md has no block" >/dev/null 2>&1
+"$WV" init-repo --update --agent=claude >/dev/null 2>&1
+assert_equals "0" "$(grep -c 'WEAVE:MEMORY' CLAUDE.md || true)" "memory index: --update adds no block to a CLAUDE.md without one"
 # --- the skills a consumer gets are the skills install.sh installs (wv-b49316) ---
 # install.sh names its skills twice: WV_CONFIG_SKILLS (what it writes to CONFIG_DIR) and the SKILLS
 # array wv init-repo copies into a consumer. The breadcrumbs -> trails rename
@@ -1357,6 +1380,53 @@ DOCTOR_JSON=$(WV_HOT_ZONE="$GATE_PATH_ZONE" WV_DB="$GATE_PATH_ZONE/brain.db" \
     "$TEST_INSTALL/bin/wv" doctor --json 2>/dev/null || true)
 GATE_PATH_DETAIL=$(jq -r '.checks[] | select(.check == "gate ignored paths") | .detail' <<< "$DOCTOR_JSON")
 assert_contains "$GATE_PATH_DETAIL" '.private/bin/activate' "installed doctor uses the shipped scanner"
+
+# --- gate provisioning proposal (S4, wv-0ee3f4) ---
+# init-repo proposes a declaration from the lockfiles it finds and never writes
+# .weave/gate-provision.json: adopting a suite is the repository's decision.
+echo ""
+echo "--- gate provisioning proposal ---"
+REPO_PROP=$(make_test_repo "provision-proposal")
+cd "$REPO_PROP"
+mkdir -p web tests
+printf '[tool.poetry]\n' > pyproject.toml; printf '# lock\n' > poetry.lock
+printf '{}\n' > web/package.json; printf '{}\n' > web/package-lock.json
+printf '#!/usr/bin/env bash\n' > tests/test-unit.sh
+mkdir -p .weave && printf '[map]\nsrc/ = tests/test-unit.sh\n' > .weave/test-map.conf
+OUTPUT=$("$WV" init-repo --agent=codex 2>&1)
+assert_file_exists "$REPO_PROP/.weave/gate-provision.proposed.json" "proposal: written beside the declaration"
+assert_equals "absent" "$([ -e "$REPO_PROP/.weave/gate-provision.json" ] && echo present || echo absent)" \
+    "proposal: the declaration itself is never written"
+assert_contains "$OUTPUT" "gate-provision.proposed.json" "proposal: init-repo says where it is"
+assert_equals "node-npm-web python-poetry" \
+    "$(jq -r '.recipes | keys | join(" ")' .weave/gate-provision.proposed.json 2>/dev/null)" \
+    "proposal: one recipe per locked toolchain"
+assert_equals '["python-poetry","node-npm-web"]' \
+    "$(jq -c '.suites["tests/test-unit.sh"].recipes' .weave/gate-provision.proposed.json 2>/dev/null)" \
+    "proposal: the mapped suite is offered every detected recipe"
+# The gate's own loader admits the proposal once it is adopted: committed, it
+# is the base tree's declaration, which is what decides adoption (rule 1).
+cp .weave/gate-provision.proposed.json .weave/gate-provision.json
+git add -f .weave/gate-provision.json tests/test-unit.sh pyproject.toml poetry.lock web >/dev/null 2>&1
+# Its own identity: the gate runs suites with an isolated HOME and no git config.
+git -c user.email=t@t -c user.name=t -c core.hooksPath=/dev/null commit -qm "adopt the proposal" >/dev/null 2>&1
+if PROP_DECL=$(python3 -I "$TEST_INSTALL/lib/lib/wv-gate-suite.py" --declarations \
+        --policy "$TEST_INSTALL/lib/lib/wv-gate-provision.json" --repo "$REPO_PROP" --tree "HEAD^{tree}" \
+        --base HEAD 2>&1); then
+    assert_equals "true" "$(jq -r '.policy.suites | has("tests/test-unit.sh")' <<< "$PROP_DECL" 2>/dev/null)" \
+        "proposal: the gate's loader admits it once adopted"
+else
+    assert_equals "admitted" "refused: $PROP_DECL" "proposal: the gate's loader admits it once adopted"
+fi
+OUTPUT=$("$WV" init-repo --agent=codex --update 2>&1)
+assert_not_contains "$OUTPUT" "gate-provision.proposed.json (review" "proposal: no new proposal once a declaration exists"
+REPO_UNLOCKED=$(make_test_repo "provision-unlocked")
+cd "$REPO_UNLOCKED"
+printf 'requests==2.0\n' > requirements.txt; mkdir -p scripts; printf '#!/usr/bin/env bash\n' > scripts/test-impacted.sh
+OUTPUT=$("$WV" init-repo --agent=codex 2>&1)
+assert_equals "absent" "$([ -e "$REPO_UNLOCKED/.weave/gate-provision.proposed.json" ] && echo present || echo absent)" \
+    "proposal: an unlocked manifest proposes nothing"
+assert_contains "$OUTPUT" "requirements.txt is a name-and-version list" "proposal: and says why"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""

@@ -38,7 +38,9 @@ def _disabled_patterns(conf_path: Path) -> set[str]:
 
 
 def _load_pattern_rules(
-    repo: Path, conf_disabled: set[str]
+    repo: Path,
+    conf_disabled: set[str],
+    invalid: list[tuple[str, Path, str]] | None = None,
 ) -> list[tuple[str, Path, str]]:
     """Return [(rule_id, rule_path, language)] for all active pattern rules.
 
@@ -47,6 +49,14 @@ def _load_pattern_rules(
       2. <repo>/.weave/patterns/managed/*.yaml (projected by wv init-repo)
       3. <repo>/.weave/patterns/*.yaml (user-defined rules)
     Rules whose id appears in conf_disabled are skipped.
+
+    A rule file that breaks the rule contract is skipped with a warning and
+    appended to `invalid` as (rule_id, rule_path, error) when the caller
+    passes a list. One malformed rule used to raise here and take every rule
+    in the repository down with it, shipped ones included, so the prose gate
+    refused every markdown commit (wv-d0e4d6). A file that cannot be read,
+    or a tier that cannot be listed, still raises: the loader cannot tell
+    which rules it lost.
 
     language is captured here from validate_pattern_rule's own return value
     (it already reads and parses the file to validate it) instead of being
@@ -93,8 +103,11 @@ def _load_pattern_rules(
             )
         for yf in rule_files:
             rule_id = yf.stem
-            language = validate_pattern_rule(yf, rule_id)
+            # A disabled rule is never run, so its contents cannot break a load.
             if rule_id in conf_disabled:
+                continue
+            language = _rule_language_or_skip(yf, rule_id, invalid)
+            if language is None:
                 continue
             if rule_id in seen:
                 # Finding N: this used to raise, which aborted the whole load
@@ -121,3 +134,30 @@ def _load_pattern_rules(
             seen[rule_id] = yf
             rules.append((rule_id, yf, language))
     return rules
+
+
+def _rule_language_or_skip(
+    rule_path: Path, rule_id: str, invalid: list[tuple[str, Path, str]] | None
+) -> str | None:
+    """Validate one rule file and return its language, or None when it is skipped as invalid.
+
+    Same blast-radius reasoning as the duplicate-id case in _load_pattern_rules:
+    skip the one file, keep every other rule running, and say so (wv-d0e4d6).
+    `patterns validate` stays strict and lists every such file. A file that
+    cannot be read raises: the loader cannot say which rule it lost.
+    """
+    try:
+        return validate_pattern_rule(rule_path, rule_id)
+    except PatternRuleValidationError as exc:
+        if isinstance(exc.__cause__, OSError):
+            raise
+        error = str(exc).removeprefix(f"{rule_path}: ")
+    print(
+        f"patterns: ignoring {rule_path}: invalid rule, not applied ({error}); "
+        "every other rule still runs "
+        "(run 'wv quality patterns validate' to list every invalid rule)",
+        file=sys.stderr,
+    )
+    if invalid is not None:
+        invalid.append((rule_id, rule_path, error))
+    return None

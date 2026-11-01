@@ -395,7 +395,8 @@ cmd_analyze_gates() {
                 echo "  p50/p90/max, suites per gate, and estimate error (actual / estimate)."
                 echo "  Suites whose estimates miss worst come from the suite log's estimate_ms."
                 echo "  Suite runs recorded before gate records existed are grouped by commit"
-                echo "  and reported separately as approximate."
+                echo "  and reported separately as approximate. Provisioning counts each route's"
+                echo "  mode (frozen or checkout) from the newest gate record that names it."
                 return 0
                 ;;
         esac
@@ -481,7 +482,27 @@ approx = {
     "longest_suite_p50_s": secs(pct(longest, 0.5)), "longest_suite_p90_s": secs(pct(longest, 0.9)),
     "note": "suite runs without gate_id grouped by sha; mixes phases, so approximate",
 }
+# Provisioning (transition rule 5, wv-0ee3f4): each route's mode from the
+# newest gate record that names it. Records written before gate records carried
+# provisioning are counted, not guessed from the gate-wide execution_mode.
+latest = {}
+recorded = 0
+for g in sorted(gates, key=lambda x: str(x.get("ts", ""))):
+    modes = g.get("provisioning")
+    if not isinstance(modes, dict):
+        continue
+    recorded += 1
+    for suite, m in modes.items():
+        if m in ("frozen", "checkout"):
+            latest[str(suite)] = m
+checkout_routes = sorted(s for s, m in latest.items() if m == "checkout")
+provisioning = {
+    "routes": len(latest), "frozen": sum(1 for m in latest.values() if m == "frozen"),
+    "checkout": len(checkout_routes), "checkout_routes": checkout_routes,
+    "gates_recorded": recorded, "gates_without_record": len(gates) - recorded,
+}
 print(json.dumps({"phases": phases, "estimate_misses": worst, "approximate_by_commit": approx,
+                  "provisioning": provisioning,
                   "gate_log": gate_log, "suite_log": suite_log,
                   "repo": repo_filter or "ALL", "since": since or None}))
 PYEOF
@@ -502,7 +523,12 @@ PYEOF
          else (.estimate_misses[] | "  \(.suite) \(.ratio_p50)x over \(.runs) runs") end),
         "",
         "Approximate, from suite runs recorded before gate ids (grouped by commit):",
-        "  \(.approximate_by_commit.commits) commits, serial p50 \(.approximate_by_commit.serial_p50_s)s p90 \(.approximate_by_commit.serial_p90_s)s max \(.approximate_by_commit.serial_max_s)s; longest suite p50 \(.approximate_by_commit.longest_suite_p50_s)s p90 \(.approximate_by_commit.longest_suite_p90_s)s"'
+        "  \(.approximate_by_commit.commits) commits, serial p50 \(.approximate_by_commit.serial_p50_s)s p90 \(.approximate_by_commit.serial_p90_s)s max \(.approximate_by_commit.serial_max_s)s; longest suite p50 \(.approximate_by_commit.longest_suite_p50_s)s p90 \(.approximate_by_commit.longest_suite_p90_s)s",
+        "",
+        "Provisioning mode per route (newest gate record naming it):",
+        (if .provisioning.gates_recorded == 0 then "  no gate record carries per-route modes yet"
+         else "  \(.provisioning.routes) routes: \(.provisioning.frozen) frozen, \(.provisioning.checkout) in checkout mode (from \(.provisioning.gates_recorded) gate records)" end),
+        (.provisioning.checkout_routes[] | "    checkout: \(.)")'
 }
 
 # cmd_analyze_suites — report over the durable suite-run history (LL2/LL3).

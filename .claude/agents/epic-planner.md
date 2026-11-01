@@ -100,38 +100,38 @@ Blockers are separate: they control readiness and completion order.
 ```bash
 # 1. Create the epic.
 EPIC=$(wv add "Epic: <outcome>" \
-  --metadata='{"type":"epic","priority":1}' \
+  --kind=epic --metadata='{"priority":1}' \
   --criteria="<epic done check 1>|<epic done check 2>" \
   --risks=medium)
 
 # 2. Create features under the epic. --parent creates the hierarchy edge.
 FEAT_SETUP=$(wv add "Feature: <cohesive capability>" \
-  --metadata='{"type":"feature","priority":1}' \
+  --kind=feature --metadata='{"priority":1}' \
   --criteria="<feature done check>" \
   --risks=low \
   --parent=$EPIC)
 
 FEAT_VERIFY=$(wv add "Feature: <second capability>" \
-  --metadata='{"type":"feature","priority":2}' \
+  --kind=feature --metadata='{"priority":2}' \
   --criteria="<feature done check>" \
   --risks=medium \
   --parent=$EPIC)
 
 # 3. Create tasks under their feature. --parent is still mandatory.
 TASK_A=$(wv add "Task: <atomic implementation work>" \
-  --metadata='{"type":"task","priority":1}' \
+  --kind=task --metadata='{"priority":1}' \
   --criteria="<specific verification>" \
   --risks=low \
   --parent=$FEAT_SETUP)
 
 TASK_B=$(wv add "Task: <next atomic implementation work>" \
-  --metadata='{"type":"task","priority":2}' \
+  --kind=task --metadata='{"priority":2}' \
   --criteria="<specific verification>" \
   --risks=low \
   --parent=$FEAT_SETUP)
 
 TASK_C=$(wv add "Task: <verification or integration work>" \
-  --metadata='{"type":"task","priority":1}' \
+  --kind=task --metadata='{"priority":1}' \
   --criteria="<specific verification>" \
   --risks=medium \
   --parent=$FEAT_VERIFY)
@@ -270,7 +270,7 @@ Shared foundation:
 
 ```bash
 FOUNDATION=$(wv add "Task: set up shared foundation" --parent=$EPIC \
-  --metadata='{"type":"task","priority":1}' \
+  --kind=task --metadata='{"priority":1}' \
   --criteria="<foundation check>" --risks=medium)
 wv block $FEAT_A --by=$FOUNDATION
 wv block $FEAT_B --by=$FOUNDATION
@@ -280,7 +280,7 @@ Integration convergence:
 
 ```bash
 INTEGRATION=$(wv add "Feature: integration and release verification" --parent=$EPIC \
-  --metadata='{"type":"feature","priority":1}' \
+  --kind=feature --metadata='{"priority":1}' \
   --criteria="<release checks>" --risks=medium)
 wv block $INTEGRATION --by=$FEAT_A
 wv block $INTEGRATION --by=$FEAT_B

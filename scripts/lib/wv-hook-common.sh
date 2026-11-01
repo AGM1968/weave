@@ -401,6 +401,20 @@ Useful compound helpers:
 
 This ensures graph-first workflow with Context Pack generation.
 EOF
+        # A linked worktree keeps its own graph (wv-d88fed): a claim held in
+        # the main checkout does not count here (wv-ca1f94).
+        local _hc_top _hc_main
+        _hc_top=$(git rev-parse --show-toplevel 2>/dev/null) || _hc_top=""
+        _hc_main=$(wv_shared_worktree_main "$_hc_top" "$_hc_top" 2>/dev/null) || _hc_main=""
+        if [ -n "$_hc_main" ]; then
+            cat >&2 <<EOF
+
+This is a linked worktree of $_hc_main, and it keeps its own Weave graph:
+a claim in the main checkout does not count here. In this worktree run
+  wv load
+then claim: wv work <id>  |  wv add "..." --status=active
+EOF
+        fi
         return 2
     fi
     return 0

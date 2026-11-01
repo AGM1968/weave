@@ -6,7 +6,7 @@ from typing import Any
 
 from weave_gh import log
 from weave_gh.cli import gh_cli
-from weave_gh.models import WeaveNode
+from weave_gh.models import NODE_KINDS, WeaveNode
 
 # ---------------------------------------------------------------------------
 # Label constants
@@ -166,7 +166,7 @@ def parse_gh_labels_to_metadata(labels: list[str]) -> dict[str, Any]:
     for wtype, glabel in TYPE_LABELS.items():
         reverse_type.setdefault(glabel, wtype)
     for label in labels:
-        if label in reverse_type:
+        if label in reverse_type and reverse_type[label] in NODE_KINDS:
             meta["type"] = reverse_type[label]
             break
 

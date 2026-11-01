@@ -91,10 +91,16 @@ if [ "$rc" -ne 0 ]; then printf '%s\n' "$_err" >&2; fi
 assert_equals "0" "$rc" "stale copies: commit succeeds"
 assert_equals "1" "$(grep -cxF -- "prepare-commit-msg source ran" "$LOG" || true)" "stale prepare-commit-msg copy runs the repository source exactly once"
 assert_equals "1" "$(printf '%s\n' "$_err" | grep -cF -- "Weave prepare-commit-msg: installed hook differs" || true)" "stale prepare-commit-msg copy announces the drift"
+# wv-376de3 (audit K3): ./install.sh exists only in Weave's own tree.
+assert_equals "1" "$(printf '%s\n' "$_err" | grep -cF -- "refresh with wv self-update, then wv init-repo --update" || true)" "...naming a consumer's refresh where there is no install.sh"
 assert_equals "0" "$(grep -cxF -- "pre-commit source ran" "$LOG" || true)" "no committed pre-commit (unborn HEAD): the working-tree source is not run"
 
 # ── a committed pre-commit runs from HEAD, never the working tree ─────────
-git -C "$STALE" add scripts/hooks
+# A committed gate is the hook and the wv beside it (wv-9da519): hook sources
+# alone are what wv init-repo seeds into a consumer, which runs its installed
+# copy. The stub hooks here never call it.
+printf '#!/bin/sh\nexit 0\n' > "$STALE/scripts/wv"; chmod +x "$STALE/scripts/wv"
+git -C "$STALE" add scripts/hooks scripts/wv
 git -C "$STALE" -c core.hooksPath=/dev/null -c user.name=t -c user.email=t@t commit -q -m "commit the sources"
 printf '#!/usr/bin/env bash\necho "pre-commit working tree ran" >> "%s"\n' "$LOG" > "$STALE/scripts/hooks/pre-commit-weave.sh"
 : > "$LOG"
@@ -108,6 +114,13 @@ assert_equals "1" "$(grep -cxF -- "pre-commit source ran" "$LOG" || true)" "the 
 assert_equals "0" "$(grep -cxF -- "pre-commit working tree ran" "$LOG" || true)" "...never the working tree's"
 assert_equals "1" "$(printf '%s\n' "$_err" | grep -cF -- "Weave pre-commit: running HEAD's committed gate" || true)" "...and says the copy differs from it"
 git -C "$STALE" checkout -q -- scripts/hooks
+# ...and in Weave's own tree (HEAD tracking install.sh and scripts/wv) the
+# stale prepare-commit-msg notice names ./install.sh (wv-376de3).
+touch "$STALE/install.sh"; printf 'msg\n' > "$TEST_DIR/own-msg"
+git -C "$STALE" add install.sh
+git -C "$STALE" -c core.hooksPath=/dev/null -c user.name=t -c user.email=t@t commit -q -m "own tree"
+_err=$(cd "$STALE" && ./.git/hooks/prepare-commit-msg "$TEST_DIR/own-msg" message 2>&1 >/dev/null)
+assert_equals "1" "$(printf '%s\n' "$_err" | grep -cF -- "running the source (refresh with ./install.sh)" || true)" "in Weave's own tree the stale notice names ./install.sh"
 
 # ── a current copy runs itself, silently ──────────────────────────────────
 CURRENT="$TEST_DIR/current"

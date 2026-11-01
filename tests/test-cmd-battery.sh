@@ -21,6 +21,8 @@ export WV_CALL_SOURCE=test
 #   W  write      — same contract as R, against scratch data only
 #   H  help-only  — `wv <cmd> --help` rc==0 (commands needing heavy fixtures;
 #                   still catches dispatch breakage and parse-time errors)
+#   D  denied     — a write a gate must refuse: rc!=0, output free of error
+#                   markers (the refusal is the gate's, not a crash)
 # Weave-ID: wv-901b08
 
 set -e
@@ -87,7 +89,11 @@ battery() {
     set -e
 
     local fail=""
-    [ "$rc" -ne 0 ] && fail="rc=$rc"
+    if [ "$tier" = "D" ]; then
+        [ "$rc" -eq 0 ] && fail="rc=0, expected a refusal"
+    elif [ "$rc" -ne 0 ]; then
+        fail="rc=$rc"
+    fi
     if grep -qE -- "$ERROR_MARKERS" "$out_f" "$err_f" 2>/dev/null; then
         fail="${fail:+$fail, }error marker: $(grep -hoE -- "$ERROR_MARKERS" "$out_f" "$err_f" | head -1)"
     fi
@@ -128,7 +134,7 @@ if [ -z "$N_PIPE" ] || [ -z "$N_APOS" ] || [ -z "$N_DONE" ] || [ -z "$N_FIND" ];
 fi
 sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'),'\$.gh_issue', 4242) WHERE id='$N_DONE';"
 sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'),
-    '\$.type','finding','\$.promoted_at',datetime('now','-2 days'),
+    '\$.node_kind','finding','\$.type','finding','\$.promoted_at',datetime('now','-2 days'),
     '\$.finding', json('{\"fixable\":true,\"confidence\":\"high\",\"violation_type\":\"test:gap\"}'))
     WHERE id='$N_FIND';"
 "$WV" work "$N_APOS" >/dev/null 2>&1
@@ -161,6 +167,11 @@ battery H ship-agent
 echo "--- graph ---"
 battery W block      block "$N_PIPE" --by="$N_DONE"
 battery W link       link "$N_FIND" "$N_PIPE" --type=relates_to
+# Edge invariants (ontology S2): realistic writes are admitted, broken ones refused.
+battery W link       link "$N_PIPE" "$N_FIND" --type=resolves
+battery W link       link "$N_PIPE" "$N_DONE" --type=supersedes
+battery D link       link "$N_APOS" "$N_APOS" --type=relates_to
+battery D link       link "$N_PIPE" "$N_APOS" --type=resolves
 battery W unlink     unlink "$N_FIND" "$N_PIPE" --type=relates_to
 # resolve is contradiction resolution — needs a two-node contradiction fixture
 battery H resolve
@@ -183,6 +194,8 @@ battery W load       load
 "$WV" "done" "$N_APOS" --skip-verification >/dev/null 2>&1 || "$WV" "done" "$N_APOS" >/dev/null 2>&1
 battery R compact    compact --dry-run
 battery R prune      prune --dry-run
+# Full assertions live in test-node-kind.sh; the dry run writes nothing.
+battery J kind       kind backfill --json
 battery R clean-ghosts clean-ghosts --dry-run
 battery J commit-refs commit-refs --json
 battery R learnings  learnings
@@ -273,7 +286,7 @@ battery H context-policy
 battery H hook
 battery H test-record
 battery H test-status
-battery H selftest
+battery R selftest   selftest
 
 echo "--- quality / analysis / query ---"
 battery W quality    quality scan

@@ -241,9 +241,20 @@ assert_xfail_exit() {
     fi
 }
 
-# Utility: get last line (node ID) from wv add output
+# get_id <wv add output> — the id wv add reports creating, from its
+# "✓ wv-xxxxxx: <text>" line. Scraping any id from the output read a refused
+# add's message ("Active epic(s): wv-…") as the new node, so 4.1.1 round-tripped
+# one node and a self-link until wv link refused self-links and the suite died
+# silently (wv-f5a3be). A failed add now fails here, with its output.
 get_id() {
-    echo "$1" | grep -oE 'wv-[a-f0-9]{4,6}' | tail -1
+    local id
+    id=$(sed -nE 's/^✓ (wv-[a-f0-9]{6}): .*/\1/p' <<< "$1")
+    if [ -z "$id" ]; then
+        echo "get_id: wv add created no node:" >&2
+        sed 's/^/    /' <<< "$1" >&2
+        return 1
+    fi
+    printf '%s\n' "$id"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -259,10 +270,8 @@ test_sync_roundtrip_fidelity() {
     # Build a representative graph
     local id1 id2 id3
     id1=$(get_id "$("$WV" add "parent epic" --metadata='{"type":"epic"}' 2>&1)")
-    id2=$(get_id "$("$WV" add "child feature" --metadata='{"type":"feature"}' 2>&1)")
-    id3=$(get_id "$("$WV" add "task with metadata" --metadata='{"key":"value","nested":{"a":1}}' 2>&1)")
-    "$WV" link "$id2" "$id1" --type=implements >/dev/null 2>&1
-    "$WV" link "$id3" "$id2" --type=implements >/dev/null 2>&1
+    id2=$(get_id "$("$WV" add "child feature" --metadata='{"type":"feature"}' --parent="$id1" 2>&1)")
+    id3=$(get_id "$("$WV" add "task with metadata" --metadata='{"key":"value","nested":{"a":1}}' --parent="$id2" 2>&1)")
     "$WV" "done" "$id3" --learning="Test learning with 'quotes' and special chars" >/dev/null 2>&1
 
     # Capture full state before round-trip

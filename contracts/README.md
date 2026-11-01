@@ -16,6 +16,14 @@ service implementation and it does not advertise mutation support.
 - `canonical-json-v1.json` defines the canonical byte form used for Delta v2 operation hashes.
 - `node-field-registry-v1.json` defines the semantic node fields available to Delta v2 `node_patch`
   CAS.
+- `node-kinds-v1.json` enumerates node kinds (`metadata.node_kind`, mirrored to `metadata.type` for
+  one release), the kinds a command may write, the creation precedence and the backfill mapping
+  (ontology S1, `wv-f7dfd3`). It is not a Delta v2 field: kind travels inside metadata patches.
+- `edge-types-v1.json` states each edge type's meaning and direction and the invariant it carries
+  (no self-edge, acyclic `blocks`/`implements`, `supersedes` old to new unless declared, `resolves`
+  to a finding, `addresses` from the newer node), plus the close rule over open `implements`
+  children (ontology S2, `wv-76b361`). `wv link` and every close path refuse a violation;
+  `wv doctor` reports stored ones.
 - `delta-operation-v2.schema.json` defines immutable, integrity-checked semantic operations with
   field-level CAS across all six changeset arms (`node_create`/`node_patch`/`node_delete`,
   `edge_create`/`edge_patch`/`edge_delete`), each carrying a Lamport `lineage`.

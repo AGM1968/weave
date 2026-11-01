@@ -595,6 +595,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-gate-suite.py "$LIB_DIR/lib/wv-gate-suite.py"
     install_file ./scripts/lib/wv-gate-provision.json "$LIB_DIR/lib/wv-gate-provision.json"
     install_file ./scripts/lib/wv-gate-paths.py "$LIB_DIR/lib/wv-gate-paths.py"
+    install_file ./scripts/lib/wv-gate-propose.py "$LIB_DIR/lib/wv-gate-propose.py"
     install_file ./scripts/lib/wv-gate-snapshot.sh "$LIB_DIR/lib/wv-gate-snapshot.sh"
     install_file ./scripts/lib/wv-gate-lanes.sh "$LIB_DIR/lib/wv-gate-lanes.sh"
     install_file ./scripts/lib/wv-repository-class.sh "$LIB_DIR/lib/wv-repository-class.sh"
@@ -635,6 +636,13 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/cmd/wv-cmd-graph.sh "$LIB_DIR/cmd/wv-cmd-graph.sh"
     install_file ./scripts/cmd/wv-cmd-data.sh "$LIB_DIR/cmd/wv-cmd-data.sh"
     install_file ./scripts/cmd/wv-cmd-ops.sh "$LIB_DIR/cmd/wv-cmd-ops.sh"
+    install_file ./scripts/cmd/wv-cmd-gate.sh "$LIB_DIR/cmd/wv-cmd-gate.sh"
+    install_file ./scripts/cmd/wv-cmd-python.sh "$LIB_DIR/cmd/wv-cmd-python.sh"
+    install_file ./scripts/cmd/wv-cmd-hotzone.sh "$LIB_DIR/cmd/wv-cmd-hotzone.sh"
+    install_file ./scripts/cmd/wv-cmd-gitstate.sh "$LIB_DIR/cmd/wv-cmd-gitstate.sh"
+    install_file ./scripts/cmd/wv-cmd-procedures.sh "$LIB_DIR/cmd/wv-cmd-procedures.sh"
+    install_file ./scripts/cmd/wv-cmd-graduate.sh "$LIB_DIR/cmd/wv-cmd-graduate.sh"
+    install_file ./scripts/cmd/wv-cmd-recover.sh "$LIB_DIR/cmd/wv-cmd-recover.sh"
     install_file ./scripts/cmd/wv-cmd-quality.sh "$LIB_DIR/cmd/wv-cmd-quality.sh"
     install_file ./scripts/cmd/wv-cmd-findings.sh "$LIB_DIR/cmd/wv-cmd-findings.sh"
     install_file ./scripts/cmd/wv-cmd-analyze.sh "$LIB_DIR/cmd/wv-cmd-analyze.sh"
@@ -672,6 +680,13 @@ if [ -f "./scripts/wv" ]; then
     # this directory non-recursively, which is also why a guide basename may
     # never contain a dot or a slash.
     mkdir -p "$LIB_DIR/weave_quality/guides"
+    # A guide that left the package (wv-6d72de) is pruned like a pattern above,
+    # or the installed copy would coach on after its type is gone.
+    for installed_guide in "$LIB_DIR"/weave_quality/guides/*.md; do
+        [ -f "$installed_guide" ] || continue
+        [ -f "./scripts/weave_quality/guides/$(basename "$installed_guide")" ] \
+            || rm -f "$installed_guide"
+    done
     for guide in ./scripts/weave_quality/guides/*.md; do
         install_file "$guide" "$LIB_DIR/weave_quality/guides/$(basename "$guide")"
     done
@@ -847,6 +862,7 @@ else
     download_file "$REPO/scripts/lib/wv-gate-suite.py" "$LIB_DIR/lib/wv-gate-suite.py"
     download_file "$REPO/scripts/lib/wv-gate-provision.json" "$LIB_DIR/lib/wv-gate-provision.json"
     download_file "$REPO/scripts/lib/wv-gate-paths.py" "$LIB_DIR/lib/wv-gate-paths.py"
+    download_file "$REPO/scripts/lib/wv-gate-propose.py" "$LIB_DIR/lib/wv-gate-propose.py"
     download_file "$REPO/scripts/lib/wv-gate-snapshot.sh" "$LIB_DIR/lib/wv-gate-snapshot.sh"
     download_file "$REPO/scripts/lib/wv-gate-lanes.sh" "$LIB_DIR/lib/wv-gate-lanes.sh"
     download_file "$REPO/scripts/lib/wv-repository-class.sh" "$LIB_DIR/lib/wv-repository-class.sh"
@@ -880,6 +896,13 @@ else
     download_file "$REPO/scripts/cmd/wv-cmd-graph.sh" "$LIB_DIR/cmd/wv-cmd-graph.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-data.sh" "$LIB_DIR/cmd/wv-cmd-data.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-ops.sh" "$LIB_DIR/cmd/wv-cmd-ops.sh"
+    download_file "$REPO/scripts/cmd/wv-cmd-gate.sh" "$LIB_DIR/cmd/wv-cmd-gate.sh"
+    download_file "$REPO/scripts/cmd/wv-cmd-python.sh" "$LIB_DIR/cmd/wv-cmd-python.sh"
+    download_file "$REPO/scripts/cmd/wv-cmd-hotzone.sh" "$LIB_DIR/cmd/wv-cmd-hotzone.sh"
+    download_file "$REPO/scripts/cmd/wv-cmd-gitstate.sh" "$LIB_DIR/cmd/wv-cmd-gitstate.sh"
+    download_file "$REPO/scripts/cmd/wv-cmd-procedures.sh" "$LIB_DIR/cmd/wv-cmd-procedures.sh"
+    download_file "$REPO/scripts/cmd/wv-cmd-graduate.sh" "$LIB_DIR/cmd/wv-cmd-graduate.sh"
+    download_file "$REPO/scripts/cmd/wv-cmd-recover.sh" "$LIB_DIR/cmd/wv-cmd-recover.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-quality.sh" "$LIB_DIR/cmd/wv-cmd-quality.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-findings.sh" "$LIB_DIR/cmd/wv-cmd-findings.sh"
     download_file "$REPO/scripts/cmd/wv-cmd-analyze.sh" "$LIB_DIR/cmd/wv-cmd-analyze.sh"
@@ -931,9 +954,19 @@ else
     done
     # Default pattern rules
     mkdir -p "$LIB_DIR/weave_quality/default_patterns"
+    # Retired defaults moved into memory-system's own .weave/patterns:
+    # live-db-file-operation and lookup-skips-beside-self (wv-6d72de),
+    # git-listing-rename-blind and sqlite-dot-command-swallows-sql (wv-ca97ce).
     rm -f "$LIB_DIR/weave_quality/default_patterns/prose-casual-register.yaml" \
-        "$LIB_DIR/weave_quality/default_patterns/prose-number-free-verification.yaml"
-    for pattern_rule in subprocess-shell-true bare-except-pass unquoted-variable prose-register-review prose-emphasis-hedge git-listing-rename-blind lookup-skips-beside-self live-db-file-operation; do
+        "$LIB_DIR/weave_quality/default_patterns/prose-number-free-verification.yaml" \
+        "$LIB_DIR/weave_quality/default_patterns/live-db-file-operation.yaml" \
+        "$LIB_DIR/weave_quality/default_patterns/lookup-skips-beside-self.yaml" \
+        "$LIB_DIR/weave_quality/default_patterns/git-listing-rename-blind.yaml" \
+        "$LIB_DIR/weave_quality/default_patterns/sqlite-dot-command-swallows-sql.yaml" \
+        "$LIB_DIR/weave_quality/guides/live-db-file-operation.md" \
+        "$LIB_DIR/weave_quality/guides/rename-blind-listing.md" \
+        "$LIB_DIR/weave_quality/guides/swallowed-sql.md"
+    for pattern_rule in subprocess-shell-true bare-except-pass unquoted-variable prose-register-review prose-emphasis-hedge listing-glob-fails-open; do
         download_file "$REPO/scripts/weave_quality/default_patterns/${pattern_rule}.yaml" \
             "$LIB_DIR/weave_quality/default_patterns/${pattern_rule}.yaml"
     done
@@ -946,7 +979,7 @@ else
     coaching_guides=$(curl -sSL "https://api.github.com/repos/AGM1968/weave/contents/scripts/weave_quality/guides?ref=main" \
         | jq -r '.[] | select(.name | endswith(".md")) | .name' 2>/dev/null)
     if [ -z "$coaching_guides" ]; then
-        coaching_guides="_clean.md _incomplete.md _uncoached.md register.md swallowed-exception.md swallowed-exception.python.md vacuous-verification.md rename-blind-listing.md live-db-file-operation.md unsafe-subprocess.md unquoted-expansion.md generated-vocabulary.md filler.md unearned-significance.md self-attested-virtue.md work-context-leakage.md punctuation-density.md malformed-markup.md citation-integrity.md metadata-formatting.md design-flaw.md"
+        coaching_guides="_clean.md _incomplete.md _uncoached.md register.md swallowed-exception.md swallowed-exception.python.md vacuous-verification.md unsafe-subprocess.md unquoted-expansion.md generated-vocabulary.md filler.md unearned-significance.md self-attested-virtue.md work-context-leakage.md punctuation-density.md malformed-markup.md citation-integrity.md metadata-formatting.md design-flaw.md"
     fi
     for guide_file in $coaching_guides; do
         download_file "$REPO/scripts/weave_quality/guides/${guide_file}" \
@@ -1298,6 +1331,21 @@ CONFIG_DIR="${WV_CONFIG_DIR:-$HOME/.config/weave}"
 MCP_SERVER="${WV_LIB_DIR:-$HOME/.local/lib/weave}/mcp/dist/index.js"
 WV_BIN_DIR=$(cd "$(dirname "$0")" && pwd)
 WV_BIN="$WV_BIN_DIR/wv"
+
+# _refresh_memory_projection <projection> <file> -- on --update, re-render the
+# graph's memory index into a projection that already carries a WEAVE:MEMORY
+# block, so an upgrade replaces the old full-text block with the index
+# (wv-91f0ca). A file without the block is the user's, and is left alone.
+_refresh_memory_projection() {
+    local projection="$1" file="$2"
+    [ "$UPDATE_MODE" = "1" ] && [ -x "$WV_BIN" ] && [ -f "$file" ] || return 0
+    grep -qF -- '<!-- ── BEGIN WEAVE:MEMORY ──' "$file" || return 0
+    if (cd "$REPO_ROOT" && "$WV_BIN" memory render --agent="$projection" --path="$file" >/dev/null 2>&1); then
+        echo -e "  ${GREEN}✓${NC} ${file#"$REPO_ROOT"/} memory index (rendered from the graph)"
+    else
+        echo -e "  ${YELLOW}⚠${NC} ${file#"$REPO_ROOT"/} memory index not rendered - run: wv memory render --agent=$projection"
+    fi
+}
 REPO_CLASS_LIB="${WV_LIB_DIR:-$HOME/.local/lib/weave}/lib/wv-repository-class.sh"
 [ -f "$REPO_CLASS_LIB" ] || { echo "wv-init-repo: repository classification helper missing: $REPO_CLASS_LIB" >&2; exit 1; }
 # shellcheck source=scripts/lib/wv-repository-class.sh
@@ -2095,6 +2143,7 @@ AGENTSEOF
         else
             echo -e "  ${YELLOW}⊘${NC} CLAUDE.md (exists without Weave block — use --update to prepend)"
         fi
+        _refresh_memory_projection claude "$REPO_ROOT/CLAUDE.md"
     fi
 
     # ── settings.json (permissions only — NO hooks key, Alt-A) ──
@@ -2218,6 +2267,7 @@ SETTINGSEOF
             echo -e "  ${YELLOW}⊘${NC} scripts/test-impacted.sh (exists — edited per repo, not overwritten)"
         fi
     fi
+
 
     # ── .weave/ci-weave-paths-ignore.snippet.yml (CI hygiene reference snippet) ──
     # Reference doc, not auto-applied: editing a consumer's workflows automatically
@@ -2597,6 +2647,7 @@ COPILOTEOF
     else
         echo -e "  ${YELLOW}⊘${NC} .github/copilot-instructions.md (exists without Weave block — use --update to prepend)"
     fi
+    _refresh_memory_projection copilot "$_cop_dst"
 
 fi
 
@@ -2830,6 +2881,23 @@ CODEXHOOKSEOF
 fi
 
 done  # end for AGENT in AGENTS
+
+# ── .weave/gate-provision.proposed.json (gate provisioning S4, wv-0ee3f4) ──
+# A declaration proposed from the lockfiles found, never the declaration itself:
+# adopting a suite is the repository's decision (transition rule 1), so the
+# proposal sits beside .weave/gate-provision.json for review, and only while no
+# declaration exists. Agent-neutral: the gate reads gate-provision.json alone.
+_gp_propose="${REPO_CLASS_LIB%/*}/wv-gate-propose.py"
+if [ -f "$_gp_propose" ] && [ ! -e "$REPO_ROOT/.weave/gate-provision.json" ]; then
+    _gp_notes=$(mktemp)
+    if _gp_out=$(python3 -I "$_gp_propose" "$REPO_ROOT" 2>"$_gp_notes") && [ -n "$_gp_out" ]; then
+        mkdir -p "$REPO_ROOT/.weave"
+        printf '%s\n' "$_gp_out" > "$REPO_ROOT/.weave/gate-provision.proposed.json"
+        echo -e "  ${GREEN}✓${NC} .weave/gate-provision.proposed.json (review it; renamed to gate-provision.json, its suites run frozen from the next commit)"
+    fi
+    sed 's/^/  ⊘ /' "$_gp_notes"
+    rm -f "$_gp_notes"
+fi
 
 # Procedure bodies live in the installed config; this projects only the adapter
 # requested by init-repo. AGENTS.md stays user-owned: only a WEAVE PROCEDURES

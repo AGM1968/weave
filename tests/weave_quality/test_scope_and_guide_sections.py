@@ -96,3 +96,30 @@ class TestGuideDuplicateSections:
                 "## The second form\n\ntwo\n")
         with pytest.raises(GuideError, match="duplicate section 'The second form'"):
             parse_guide(_guide(tmp_path, body, sections="The second form"), "shipped")
+
+
+class TestGuideReportsEveryViolation:
+    """wv-273b2d: a guide's faults surfaced one run at a time."""
+
+    def test_three_faults_are_raised_together_in_file_order(self, tmp_path: Path) -> None:
+        # A comma where | separates names, a section the body never declared,
+        # and a missing required section.
+        body = "## Why\n\nw\n\n## Exemplars\n\ne\n\n## Steps\n\ns\n\n## Extra\n\nx\n"
+        with pytest.raises(GuideError) as raised:
+            parse_guide(_guide(tmp_path, body, sections="Exemplars, Steps"), "project")
+        errors = raised.value.errors
+        assert raised.value.code == "guide_override_invalid"
+        assert [e.split(": ", 1)[1].split(" ")[:3] for e in errors] == [
+            ["unknown", "section", "'Exemplars'"],
+            ["unknown", "section", "'Steps'"],
+            ["unknown", "section", "'Extra'"],
+            ["section", "corrective_move", "is"],
+            ["frontmatter", "declares", "section"],
+        ]
+        assert str(raised.value) == "; ".join(errors)
+
+    def test_a_single_fault_reads_as_before(self, tmp_path: Path) -> None:
+        with pytest.raises(GuideError) as raised:
+            parse_guide(_guide(tmp_path, "## Why\n\nw\n"), "shipped")
+        assert raised.value.errors == ("sample.md: section corrective_move is required",)
+        assert str(raised.value) == "sample.md: section corrective_move is required"

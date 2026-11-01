@@ -39,8 +39,65 @@ _DEFAULT_OVERLAP_LINES = 10
 _DEFAULT_MODEL = "minishlab/potion-code-16M"
 
 
+# Interpreter named on an extensionless file's shebang -> the extension it indexes as.
+_SHEBANG_EXTS = {"sh": ".sh", "bash": ".sh", "python": ".py", "python3": ".py"}
+
+# A hook's GIT_DIR or GIT_INDEX_FILE would point git at another repository.
+_GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")
+
+
+def _git(args: list[str], cwd: Path) -> str | None:
+    """Run git in cwd's own repository; None when git is missing or cwd is outside one."""
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_VARS}
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, env=env, capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def _is_excluded(part: str) -> bool:
     return part in _EXCLUDE_DIRS or part.startswith("venv")
+
+
+def _index_ext(path: Path) -> str:
+    """The extension a file indexes as: its suffix, else the one its shebang implies."""
+    if path.suffix:
+        return path.suffix
+    try:
+        with path.open("rb") as fh:
+            first = fh.readline(256).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    if not first.startswith("#!"):
+        return ""
+    words = first[2:].split()
+    if words and Path(words[0]).name == "env":
+        words = [w for w in words[1:] if not w.startswith("-")]
+    return _SHEBANG_EXTS.get(Path(words[0]).name, "") if words else ""
+
+
+def _candidates(root: Path) -> Iterator[Path]:
+    """Files under root that git counts as the project: tracked plus untracked, not ignored.
+
+    Walking the filesystem indexed ignored scratch copies of the repository,
+    which outnumbered the real source three to one (wv-cfff36). Outside git,
+    every file under root.
+    """
+    listing = _git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], root)
+    if listing is None:
+        # rglob walked past a directory it could not list without a word, so
+        # the index was partial and said nothing (wv-c6c7cf). One unreadable
+        # directory need not stop the index; it must be named.
+        def _unlisted(exc: OSError) -> None:
+            print(f"wv index: cannot list {exc.filename}: {exc.strerror or exc}; its files are not indexed",
+                  file=sys.stderr)
+        for dirpath, dirnames, filenames in os.walk(root, onerror=_unlisted):
+            yield from (Path(dirpath) / name for name in dirnames + filenames)
+        return
+    for rel in sorted(set(listing.split("\0")) - {""}):
+        yield root / rel
 
 
 def _walk_files(root: Path, exts: frozenset[str], base: Path | None = None) -> Iterator[Path]:
@@ -50,8 +107,8 @@ def _walk_files(root: Path, exts: frozenset[str], base: Path | None = None) -> I
     absolute path: a checkout under build/ or venv*/ indexed nothing (wv-31d0d0).
     """
     base = base or root
-    for p in root.rglob("*"):
-        if p.is_file() and p.suffix in exts:
+    for p in _candidates(root):
+        if p.is_file() and _index_ext(p) in exts:
             if not any(_is_excluded(part) for part in p.relative_to(base).parts):
                 yield p
 
@@ -66,13 +123,7 @@ def _resolve_scope(path: str | None) -> tuple[Path, Path]:
     """
     start = Path(path or ".").resolve()
     probe = start if start.is_dir() else start.parent
-    try:
-        top = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=probe, capture_output=True, text=True, check=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        top = ""
+    top = (_git(["rev-parse", "--show-toplevel"], probe) or "").strip()
     base = Path(top).resolve() if top else start
     return (start if path else base), base
 

@@ -218,6 +218,71 @@ if [ "$checks" -ne 7 ]; then
     fail "validator reports every expected check" "    expected 7 check records, got $checks"
 fi
 
+# wv-60bf88 (memory graduation S2): a repository declares its own violation
+# types. project:<name> is admitted, and coached by the repository's own guide
+# .weave/guides/<name>[.<language>].md, only where a detector under
+# .weave/patterns declares it.
+echo ""
+echo "=== repository-declared violation types ==="
+WV="$REPO_ROOT/scripts/wv"
+SCRATCH=$(bash "$REPO_ROOT/scripts/lib/wv-scratch.sh")
+trap 'rm -rf "$SCRATCH"' EXIT
+export TMPDIR="$SCRATCH" WV_REQUIRE_LEARNING=0 WV_RUN_CACHE=0
+in_repo() { local dir="$1"; shift; (cd "$dir" && WV_HOT_ZONE="$dir/hot" WV_DB="$dir/hot/brain.db" WV_PROJECT_DIR="$dir" "$WV" "$@"); }
+guide() { # file id language marker
+    { printf '%s\n' '---' "id: $2" 'violation_type: project:house-db' "summary: house rule $4"
+      [ -z "$3" ] || printf 'language: %s\n' "$3"
+      printf '%s\n' '---' '' '## Why' '' "$4 explains the cost." '' '## Corrective move' '' 'Use the CLI.'; } > "$1"
+}
+A="$SCRATCH/declaring"; B="$SCRATCH/other"
+for dir in "$A" "$B"; do mkdir -p "$dir" && (cd "$dir" && git init -q) && in_repo "$dir" init >/dev/null 2>&1; done
+mkdir -p "$A/.weave/patterns" "$A/.weave/guides"
+printf '%s\n' 'id: house-db-rm' 'language: bash' 'violation_type: project:house-db' 'severity: warning' \
+    'message: the live DB is changed only through SQLite' 'rule:' '  pattern: rm $X' > "$A/.weave/patterns/house-db-rm.yaml"
+guide "$A/.weave/guides/house-db.md" house-db "" GENERIC-GUIDE-MARKER
+guide "$A/.weave/guides/house-db.bash.md" house-db bash BASH-GUIDE-MARKER
+finding_meta() { # language
+    jq -nc --arg l "$1" '{finding: ({violation_type: "project:house-db", fixable: true,
+        quality: {occurrences: [{anchor: {path: "x.sh", normalized_match: "rm $WV_DB"}, location: {line: 3},
+                                 detectors: [{rule_id: "house-db-rm"}]}]}} + (if $l == "" then {} else {guide: {language: $l}} end))}'
+}
+# The type is enforced where it is set (wv update --metadata) and at close
+# (validate-finding); wv add does not check it.
+bash_id=$(in_repo "$A" add "finding: deploy script deletes the live graph database with rm" --kind=finding --json 2>/dev/null | jq -r '.id // empty')
+plain_id=$(in_repo "$A" add "finding: installer cleanup unlinks brain.db while agents run" --kind=finding --json 2>/dev/null | jq -r '.id // empty')
+other_id=$(in_repo "$B" add "finding: a consumer repository borrows another's house type" --kind=finding --json 2>/dev/null | jq -r '.id // empty')
+if in_repo "$A" update "$bash_id" --metadata="$(finding_meta bash)" >/dev/null 2>&1 \
+    && in_repo "$A" update "$plain_id" --metadata="$(finding_meta "")" >/dev/null 2>&1; then
+    pass "the declaring repository admits project:house-db"
+else
+    fail "the declaring repository admits project:house-db"
+fi
+[ "$(in_repo "$A" validate-finding "$bash_id" 2>/dev/null | jq -r '.valid')" = true ] \
+    && pass "a project:house-db finding validates for close where it is declared" \
+    || fail "a project:house-db finding validates for close where it is declared"
+other=$(in_repo "$B" update "$other_id" --metadata="$(finding_meta "")" 2>&1) && other_rc=0 || other_rc=$?
+[ "$other_rc" -ne 0 ] && pass "another repository rejects project:house-db" \
+    || fail "another repository rejects project:house-db" "    $other"
+# Past the write guard, as a hand edit or an older client would be.
+sqlite3 "$B/hot/brain.db" "UPDATE nodes SET metadata=json_set(metadata,'\$.finding',json('$(finding_meta "" | jq -c .finding)')) WHERE id='$other_id';"
+[ "$(in_repo "$B" validate-finding "$other_id" 2>/dev/null | jq -r '.valid')" = false ] \
+    && pass "another repository refuses to close a project:house-db finding" \
+    || fail "another repository refuses to close a project:house-db finding"
+detail=$(in_repo "$A" findings list --detail --all 2>&1)
+case "$detail" in *BASH-GUIDE-MARKER*) pass "findings list --detail renders the repository's bash guide" ;;
+    *) fail "findings list --detail renders the repository's bash guide" "$(sed 's/^/    /; 12q' <<< "$detail")" ;; esac
+case "$detail" in *GENERIC-GUIDE-MARKER*) pass "a finding with no language gets the generic guide" ;;
+    *) fail "a finding with no language gets the generic guide" ;; esac
+ready=$(in_repo "$A" ready --findings 2>&1)
+case "$ready" in *GUIDE-MARKER*) pass "wv ready coaches with the repository guide" ;;
+    *) fail "wv ready coaches with the repository guide" "$(printf '%s\n' "$ready" | sed 's/^/    /' | tail -12)" ;; esac
+# discover coaches the findings linked to its seed.
+task_id=$(in_repo "$A" add "task: move the deploy script off rm" --json 2>/dev/null | jq -r '.id // empty')
+in_repo "$A" link "$bash_id" "$task_id" --type=relates_to >/dev/null 2>&1
+discover=$(in_repo "$A" discover "$task_id" --json 2>/dev/null | jq -r '.coaching.blocks[]?.guide | tostring' 2>/dev/null)
+case "$discover" in *MARKER*) pass "wv discover coaches with the repository guide" ;;
+    *) fail "wv discover coaches with the repository guide" "    coaching: ${discover:-none}" ;; esac
+
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"
 [ "$TESTS_FAILED" -eq 0 ]

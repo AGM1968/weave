@@ -6,6 +6,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 SOURCE="${WV_CONFIG_DIR:-$HOME/.config/weave}/procedures"
 REPO="$(pwd)"
 AGENT="all"
+OUT=""
 COPILOT_LINES=()
 # AGENTS.md is universal: its index lists every shared, ready procedure,
 # whatever adapters the procedure names (wv-6ef83b).
@@ -21,10 +22,15 @@ for arg in "$@"; do
     case "$arg" in
         --source=*) SOURCE="${arg#*=}" ;;
         --repo=*) REPO="${arg#*=}" ;;
+        --out=*) OUT="${arg#*=}" ;;
         --agent=all|--agent=claude|--agent=codex|--agent=copilot) AGENT="${arg#*=}" ;;
-        *) echo "Usage: $0 [--source=<dir>] [--repo=<dir>] [--agent=claude|codex|copilot|all]" >&2; exit 2 ;;
+        *) echo "Usage: $0 [--source=<dir>] [--repo=<dir>] [--out=<dir>] [--agent=claude|codex|copilot|all]" >&2; exit 2 ;;
     esac
 done
+# The agent surfaces are written under OUT, the repository by default. wv doctor
+# projects into a scratch copy of them and compares, so the projection format
+# lives here only (wv-fc71f0).
+OUT="${OUT:-$REPO}"
 
 REPO_CLASS_LIB="$SELF_DIR/lib/wv-repository-class.sh"
 [ -f "$REPO_CLASS_LIB" ] || { echo "project-procedures: repository classification helper missing: $REPO_CLASS_LIB" >&2; exit 1; }
@@ -37,6 +43,29 @@ wv_repository_require_owned "$REPO" "procedure projection" || exit 1
 GEN="$SELF_DIR/gen-procedures.sh"
 [ -x "$GEN" ] || { echo "project-procedures: validator not found at $GEN; refusing to project unvalidated contracts" >&2; exit 1; }
 "$GEN" --source="$SOURCE" --check >/dev/null
+
+# A repository may author its own procedures in .weave/procedures (delivery
+# taxonomy R3, wv-fc71f0). The same contract validates them; they project into
+# this repository only, and one with a package procedure's id replaces it here
+# (owner and judge panel, docs/findings/judge-repo-procedures-2026-10-30/).
+shopt -s nullglob
+REPO_FILES=("$REPO/.weave/procedures"/*.md)
+REPO_IDS=""
+if [ "${#REPO_FILES[@]}" -gt 0 ]; then
+    "$GEN" --source="$REPO/.weave/procedures" --check >/dev/null
+    REPO_IDS=$(awk -F': *' 'FNR == 1 { seen = 0 } /^id:/ && !seen { print $2; seen = 1 }' "${REPO_FILES[@]}")
+fi
+PROCEDURES=()
+for procedure in "$SOURCE"/*.md; do
+    grep -qxF -- "$(awk -F': *' '/^id:/{print $2; exit}' "$procedure")" <<< "$REPO_IDS" || PROCEDURES+=("$procedure")
+done
+PROCEDURES+=("${REPO_FILES[@]}")
+# Each source checks its own skill names; the combined set must too, or two
+# procedures would write one skill directory.
+if [ "${#PROCEDURES[@]}" -gt 0 ]; then
+    dupes=$(awk -F': *' '/^claude_skill:/{print $2}' "${PROCEDURES[@]}" | sort | uniq -d)
+    [ -z "$dupes" ] || { echo "project-procedures: claude_skill shared by a repository and a package procedure: $(echo "$dupes" | tr '\n' ' ')" >&2; exit 1; }
+fi
 
 # Exact-token adapter membership (validated to claude|codex|copilot above), so
 # a value like 'notcodex' never matches by substring.
@@ -96,14 +125,14 @@ project_one() {
 
     # Collision preflight — decide BEFORE mutating any adapter surface for this
     # procedure, so a hand-authored artifact is never partially overwritten.
-    local skill_dir="$REPO/.claude/skills/$claude_skill" skill_md
+    local skill_dir="$OUT/.claude/skills/$claude_skill" skill_md
     skill_md="$skill_dir/SKILL.md"
     if [ "$do_claude" = true ] && [ -f "$skill_md" ] && ! grep -qF -- "$CLAUDE_MARKER" "$skill_md"; then
         echo "procedure $id: refusing to overwrite hand-written skill '$claude_skill'" >&2
         return 1
     fi
-    if [ "$do_codex" = true ] && [ -f "$REPO/.codex/weave.json" ] \
-        && [ "$(jq --arg id "$id" '[.procedures[]? | select(.id == $id and (.managed != true))] | length' "$REPO/.codex/weave.json")" != 0 ]; then
+    if [ "$do_codex" = true ] && [ -f "$OUT/.codex/weave.json" ] \
+        && [ "$(jq --arg id "$id" '[.procedures[]? | select(.id == $id and (.managed != true))] | length' "$OUT/.codex/weave.json")" != 0 ]; then
         echo "procedure $id: refusing to overwrite hand-authored Codex entry '$id'" >&2
         return 1
     fi
@@ -115,7 +144,11 @@ project_one() {
         # Stage under the destination parent (same filesystem) so the final swap is
         # an atomic rename and the live projection survives a copy failure.
         staging=$(mktemp -d "$parent/.weave-staging.XXXXXX")
-        printf '%s\n' '---' "name: $claude_skill" "description: $description" '---' '' "$CLAUDE_MARKER" '' "$body" > "$staging/SKILL.md"
+        # A YAML double-quoted scalar. Written bare, a description holding ': '
+        # is not YAML, and a strict parser drops every field (wv-ed1dbb).
+        local yaml_description=${description//\\/\\\\}
+        yaml_description=${yaml_description//\"/\\\"}
+        printf '%s\n' '---' "name: $claude_skill" "description: \"$yaml_description\"" '---' '' "$CLAUDE_MARKER" '' "$body" > "$staging/SKILL.md"
         while IFS='|' read -r resource executable; do
             [ -n "$resource" ] || continue
             cp "$(dirname "$file")/$resource" "$staging/$(basename "$resource")" || { copy_ok=false; break; }
@@ -144,13 +177,13 @@ project_one() {
     fi
     if [ "$do_codex" = true ]; then
         CODEX_IDS+=("$id")
-        mkdir -p "$REPO/.codex"
-        [ -f "$REPO/.codex/weave.json" ] || printf '%s\n' '{"schema":"weave.codex.v1"}' > "$REPO/.codex/weave.json"
+        mkdir -p "$OUT/.codex"
+        [ -f "$OUT/.codex/weave.json" ] || printf '%s\n' '{"schema":"weave.codex.v1"}' > "$OUT/.codex/weave.json"
         tmp=$(mktemp)
         jq --arg id "$id" --arg description "$description" --arg fallback "$fallback" \
             '.procedures = ((.procedures // []) | map(select(.id != $id)) + [{id:$id,description:$description,fallback:$fallback,managed:true}])' \
-            "$REPO/.codex/weave.json" > "$tmp"
-        mv "$tmp" "$REPO/.codex/weave.json"
+            "$OUT/.codex/weave.json" > "$tmp"
+        mv "$tmp" "$OUT/.codex/weave.json"
     fi
     if [ "$do_copilot" = true ]; then
         COPILOT_LINES+=("- $id — $description: $fallback")
@@ -170,15 +203,15 @@ preflight_one() {
     [ "$visibility" = shared ] || return 0
     status=$(awk -F': *' '/^status:/{print $2; exit}' "$file"); [ "${status:-ready}" = ready ] || return 0
     if adapter_has "$adapters" claude && { [ "$AGENT" = all ] || [ "$AGENT" = claude ]; }; then
-        skill_md="$REPO/.claude/skills/$claude_skill/SKILL.md"
+        skill_md="$OUT/.claude/skills/$claude_skill/SKILL.md"
         if [ -f "$skill_md" ] && ! grep -qF -- "$CLAUDE_MARKER" "$skill_md"; then
             echo "procedure $id: refusing to overwrite hand-written skill '$claude_skill'" >&2
             return 1
         fi
     fi
     if adapter_has "$adapters" codex && { [ "$AGENT" = all ] || [ "$AGENT" = codex ]; } \
-        && [ -f "$REPO/.codex/weave.json" ] \
-        && [ "$(jq --arg id "$id" '[.procedures[]? | select(.id == $id and (.managed != true))] | length' "$REPO/.codex/weave.json")" != 0 ]; then
+        && [ -f "$OUT/.codex/weave.json" ] \
+        && [ "$(jq --arg id "$id" '[.procedures[]? | select(.id == $id and (.managed != true))] | length' "$OUT/.codex/weave.json")" != 0 ]; then
         echo "procedure $id: refusing to overwrite hand-authored Codex entry '$id'" >&2
         return 1
     fi
@@ -186,8 +219,8 @@ preflight_one() {
 
 write_copilot_projection() {
     { [ "$AGENT" = "all" ] || [ "$AGENT" = "copilot" ]; } || return 0
-    mkdir -p "$REPO/.github"
-    local copilot="$REPO/.github/copilot-instructions.md" block
+    mkdir -p "$OUT/.github"
+    local copilot="$OUT/.github/copilot-instructions.md" block
     block=$(printf '%s\n' '<!-- BEGIN WEAVE PROCEDURES -->' "${COPILOT_LINES[@]}" '<!-- END WEAVE PROCEDURES -->')
     if [ ! -f "$copilot" ]; then
         printf '%s\n' "$block" > "$copilot"
@@ -208,7 +241,7 @@ write_copilot_projection() {
 # or no file, is left alone. Runs for every --agent value, because AGENTS.md is
 # the file any harness reads.
 write_agents_projection() {
-    local agents="$REPO/AGENTS.md" block
+    local agents="$OUT/AGENTS.md" block
     [ -f "$agents" ] && grep -q 'BEGIN WEAVE PROCEDURES' "$agents" && grep -q 'END WEAVE PROCEDURES' "$agents" || return 0
     block=$(printf '%s\n' '<!-- BEGIN WEAVE PROCEDURES -->' "${AGENTS_LINES[@]}" '<!-- END WEAVE PROCEDURES -->')
     awk -v block="$block" '
@@ -224,14 +257,14 @@ write_agents_projection() {
 # Manually-authored entries (no managed flag) are always preserved.
 remove_stale_codex_procedures() {
     { [ "$AGENT" = "all" ] || [ "$AGENT" = "codex" ]; } || return 0
-    [ -f "$REPO/.codex/weave.json" ] || return 0
+    [ -f "$OUT/.codex/weave.json" ] || return 0
     local active tmp
     active=$(printf '%s\n' "${CODEX_IDS[@]:-}" | jq -R . | jq -s 'map(select(. != ""))')
     tmp=$(mktemp)
     jq --argjson active "$active" \
         '.procedures = ((.procedures // []) | map(.id as $pid | select((.managed != true) or (($active | index($pid)) != null))))' \
-        "$REPO/.codex/weave.json" > "$tmp"
-    mv "$tmp" "$REPO/.codex/weave.json"
+        "$OUT/.codex/weave.json" > "$tmp"
+    mv "$tmp" "$OUT/.codex/weave.json"
 }
 
 # Prune Weave-managed skills (marker-bearing) that are no longer in the active
@@ -239,9 +272,9 @@ remove_stale_codex_procedures() {
 # without the marker are hand-written and never touched.
 remove_stale_claude_procedures() {
     { [ "$AGENT" = "all" ] || [ "$AGENT" = "claude" ]; } || return 0
-    [ -d "$REPO/.claude/skills" ] || return 0
+    [ -d "$OUT/.claude/skills" ] || return 0
     local dir name
-    for dir in "$REPO/.claude/skills"/*/; do
+    for dir in "$OUT/.claude/skills"/*/; do
         [ -f "$dir/SKILL.md" ] || continue
         grep -qF -- "$CLAUDE_MARKER" "$dir/SKILL.md" || continue
         name=$(basename "$dir")
@@ -251,9 +284,8 @@ remove_stale_claude_procedures() {
     done
 }
 
-shopt -s nullglob
-for procedure in "$SOURCE"/*.md; do preflight_one "$procedure"; done
-for procedure in "$SOURCE"/*.md; do project_one "$procedure"; done
+for procedure in "${PROCEDURES[@]}"; do preflight_one "$procedure"; done
+for procedure in "${PROCEDURES[@]}"; do project_one "$procedure"; done
 remove_stale_codex_procedures
 remove_stale_claude_procedures
 write_copilot_projection

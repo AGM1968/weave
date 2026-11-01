@@ -1,0 +1,33 @@
+{
+  "format": "weave.node-kinds.v1",
+  "storage": "metadata.$.node_kind",
+  "mirror": {
+    "storage": "metadata.$.type",
+    "rule": "every write of node_kind writes type to the same value; readers take node_kind, then type",
+    "until": "one release after rc.15 (wv-f7dfd3)"
+  },
+  "kinds": ["epic", "feature", "task", "finding", "decision", "plan", "memory", "session_history", "unknown"],
+  "command_writable": ["epic", "feature", "task", "finding", "decision", "plan", "memory", "session_history"],
+  "create": {
+    "precedence": ["--kind", "metadata.node_kind", "metadata.type", "text_prefix", "default"],
+    "type_outside_kinds": "refuse",
+    "default": "task"
+  },
+  "backfill": {
+    "precedence": ["metadata.node_kind", "metadata.type", "text_prefix", "no_evidence"],
+    "text_prefix_syntax": "a leading word followed by ( or :, compared in lower case (epic(, Plan:)",
+    "type_outside_kinds": "task",
+    "text_prefix": {
+      "epic": "epic",
+      "feature": "feature",
+      "decision": "decision",
+      "decide": "decision",
+      "plan": "plan",
+      "proposal": "plan",
+      "spec": "plan",
+      "milestone": "plan"
+    },
+    "other_text_prefix": "task",
+    "no_evidence": "unknown"
+  }
+}

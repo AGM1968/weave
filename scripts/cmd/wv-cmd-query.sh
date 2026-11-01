@@ -13,8 +13,10 @@ _query_resolve_key() {
     local key="$1"
     case "$key" in
         id|text|status|created_at|updated_at|alias) echo "n.$key" ;;
-        # Virtual generated columns — faster than json_extract
-        type)     echo "n.type" ;;
+        # The node kind (wv-f7dfd3): node_kind, then its type mirror. kind is
+        # the memory category, an ordinary metadata key.
+        type|node_kind) wv_kind_sql n ;;
+        # Virtual generated column — faster than json_extract
         priority) echo "n.priority" ;;
         # Computed: days since promoted_at (finding-specific; NULL for non-findings)
         stale)    echo "(julianday('now') - julianday(json_extract(n.metadata, '\$.promoted_at')))" ;;
@@ -321,7 +323,7 @@ _render_include_finding() {
     # Note: has_fix requires JOIN to edges — not available here; omitted (Phase 1 known gap)
     echo "$rows" | jq -r --arg Y "$_yellow" --arg C "$_cyan" --arg N "$_nc" '
         .[] | select(
-            ((.metadata // "{}") | if type == "string" then fromjson else . end) | .type == "finding"
+            ((.metadata // "{}") | if type == "string" then fromjson else . end) | (.node_kind // .type) == "finding"
         ) |
         .id as $id | .text as $text |
         ((.metadata // "{}") | if type == "string" then fromjson else . end) as $m |
@@ -413,7 +415,8 @@ For a metadata field, true/false match a JSON boolean or the string, and a
 number matches a JSON number or the numeric string (key!=value excludes nodes
 without the key).
 
-Keys: id, text, status, type, priority, alias, created_at, updated_at,
+Keys: id, text, status, type (the node kind; node_kind is the same), priority, alias,
+      created_at, updated_at,
       stale (days since promoted_at — findings only), hygiene, or any metadata field
       edge-type=<type>   nodes that have edges of a given type (e.g. edge-type=blocks)
       edge-type!=<type>  nodes that lack edges of a given type

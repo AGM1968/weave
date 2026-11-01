@@ -55,10 +55,14 @@ fi
 if [ -z "$_PP_LANE_BASE" ]; then
     _wv_base=$(git rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null) || _wv_base=""
     _wv_self=""
-    if [ -n "$_wv_base" ] && ! _wv_self=$(git ls-tree "$_wv_base" -- scripts/hooks/pre-push-weave.sh 2>/dev/null); then
+    # A committed gate is the hook AND the wv it runs (wv-9da519): a consumer
+    # tracking the hook sources wv init-repo seeds has no scripts/wv and takes
+    # the installed copy's lane. pre-commit-weave.sh says why in full.
+    if [ -n "$_wv_base" ] && ! _wv_self=$(git ls-tree "$_wv_base" -- scripts/hooks/pre-push-weave.sh scripts/wv 2>/dev/null); then
         echo "✗ Weave pre-push: could not read HEAD's tree to find its committed gate — refusing" >&2
         exit 1
     fi
+    [ "$(grep -cE $'\t(scripts/hooks/pre-push-weave\\.sh|scripts/wv)$' <<< "$_wv_self" || true)" = 2 ] || _wv_self=""
     if [ -n "$_wv_self" ]; then
         if ! _wv_ls=$(git ls-tree -r "$_wv_base" -- scripts 2>/dev/null); then
             echo "✗ Weave pre-push: could not list HEAD's scripts/, the committed gate — refusing" >&2
@@ -98,6 +102,14 @@ if [ -z "$_PP_LANE_BASE" ]; then
 fi
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+# The refresh a message names (wv-376de3); pre-commit-weave.sh says why.
+_pp_refresh_cmd() {
+    if [ "$(git ls-tree HEAD -- install.sh scripts/wv 2>/dev/null | wc -l)" -eq 2 ]; then
+        printf './install.sh'
+    else
+        printf 'wv self-update, then wv init-repo --update'
+    fi
+}
 # In the protected lane, wv, the libraries and the E6 validator come from the
 # copy this hook runs from and nowhere else (_PP_SCRIPTS).
 if [ -n "$_PP_LANE_BASE" ]; then
@@ -167,7 +179,7 @@ if ! command -v run_hook_suites >/dev/null 2>&1 || ! command -v gate_pool_estima
     || ! command -v gate_pool_launch_order >/dev/null 2>&1 || ! command -v wv_non_graph_state_paths >/dev/null 2>&1 \
     || ! command -v gate_pool_require_present >/dev/null 2>&1 \
     || ! command -v gate_pool_execution_mode >/dev/null 2>&1; then
-    echo "✗ Weave pre-push: the gate libraries (wv-gate-pool.sh, wv-checkpoint-ci.sh) were not found — refresh with ./install.sh" >&2
+    echo "✗ Weave pre-push: the gate libraries (wv-gate-pool.sh, wv-checkpoint-ci.sh) were not found — refresh with $(_pp_refresh_cmd)" >&2
     exit 1
 fi
 
@@ -176,6 +188,12 @@ fi
 # remote's name, used to exclude what it already has when the remote sha is
 # unknown here (a new branch, or a remote tip never fetched).
 _pp_zero="0000000000000000000000000000000000000000"
+# Record what this push publishes before the gate runs for minutes, so no
+# checkpoint amends a commit in flight (wv-13db30). Best-effort, never refuses.
+if command -v wv_push_inflight_record >/dev/null 2>&1; then
+    # shellcheck disable=SC2046  # one word per pushed commit
+    wv_push_inflight_record "$REPO_ROOT" $(awk -v z="$_pp_zero" 'NF >= 2 && $2 != z { print $2 }' <<< "$_pp_stdin")
+fi
 _pp_head=$(git rev-parse HEAD 2>/dev/null || echo "")
 gate_pool_execution_mode "$_pp_head"
 # The protected lane gates the commit its gate was copied from (S2a).
@@ -279,11 +297,13 @@ while read -r _pp_lref _pp_lsha _pp_rref _pp_rsha; do
             echo "✗ Weave pre-push: could not resolve the suites for $_pp_lref (commit ${_pp_c:0:12}, wv impact --suites failed)" >&2
             exit 1
         }
-        _pp_ref_json=$(jq -c --argjson c "$_pp_c_json" '. + $c' <<< "$_pp_ref_json") || exit 1
+        _pp_ref_json=$(jq -c --slurpfile c <(printf '%s' "$_pp_c_json") '. + $c[0]' <<< "$_pp_ref_json") || exit 1
     done
     _pp_ref_heavy=$(jq -r '[.[].name] | unique | .[]' <<< "$_pp_ref_json")
     [ -n "$_pp_ref_heavy" ] || continue
-    _pp_heavy_all=$(jq -c --argjson c "$_pp_ref_json" '. + $c' <<< "$_pp_heavy_all") || exit 1
+    # One entry per heavy suite per pushed commit: a long unpushed branch grows
+    # this past the argv limit, so it travels as a file (wv-200d36).
+    _pp_heavy_all=$(jq -c --slurpfile c <(printf '%s' "$_pp_ref_json") '. + $c[0]' <<< "$_pp_heavy_all") || exit 1
     # The sha on stdin is what the ref points at: for an annotated tag that is
     # the tag object, never equal to HEAD. Compare the commit it names.
     _pp_commit=$(git rev-parse --verify --quiet "${_pp_lsha}^{commit}" 2>/dev/null || echo "$_pp_lsha")
@@ -363,10 +383,12 @@ WV_GATE_ID="pp-$(date +%s%N 2>/dev/null || date +%s)-$$"
 export WV_GATE_ID
 _pp_gate_t0=$(date +%s%N 2>/dev/null || echo 0)
 _pp_gate_finish() {
-    local rc=$?
+    local rc=$? suites
+    suites=$(jq -r '[.[].name] | join(",")' <<< "$_pp_heavy_json" 2>/dev/null)
     "$WV" test-record gate --gate --exit="$rc" --duration="$(hook_duration_ms "$_pp_gate_t0")" \
         --execution-mode="${WV_GATE_EXECUTION_MODE:-}" \
-        --suites="$(jq -r '[.[].name] | join(",")' <<< "$_pp_heavy_json" 2>/dev/null)" >/dev/null 2>&1 || true
+        --suite-modes="$(gate_pool_suite_modes "$suites")" \
+        --suites="$suites" >/dev/null 2>&1 || true
     return "$rc"
 }
 trap _pp_gate_finish EXIT

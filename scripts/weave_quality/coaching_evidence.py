@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from . import guides
+from .listing import directory_entries
 # The CLI's own definition of which rules are active, shared rather than
 # re-derived: deriving it separately would let this adapter and the scan that
 # produced the receipts disagree about the rule set they are discussing.
@@ -120,7 +121,9 @@ def _package_rule_manifest(default_dir: Path) -> tuple[dict[str, str], str]:
     if value["format"] != PACKAGE_MANIFEST_FORMAT or not isinstance(value["rules"], dict):
         raise ValueError(f"default pattern manifest must use {PACKAGE_MANIFEST_FORMAT}")
     rules = value["rules"]
-    on_disk = {path.name for path in default_dir.glob("*.yaml")}
+    # An unlistable directory raises here; glob read it as empty and the
+    # mismatch below blamed the manifest (wv-c6c7cf).
+    on_disk = {path.name for path in directory_entries(default_dir, "*.yaml")}
     if set(rules) != on_disk:
         raise ValueError("default pattern manifest is not the exact .yaml inventory")
     for name, digest in rules.items():

@@ -2893,3 +2893,58 @@ class TestSchemaV10:
         assert conn.execute(
             "SELECT 1 FROM pattern_findings WHERE scan_id = 99"
         ).fetchone() is None
+
+
+_CARRY_RUN = {
+    "rule_id": "prose-test", "definition_hash": "abc", "rule_path": "/r.yaml",
+    "target": "/repo", "hits": 1, "ran_at": "2026-10-28T00:00:00",
+}
+
+
+def _carry_finding(scan_id: int, key: str, context: str = "A genuine result.") -> PatternFinding:
+    return PatternFinding(path="docs/a.md", scan_id=scan_id, rule_id="prose-test", line=1,
+                          match_text="genuine", finding_key=key, context_text=context)
+
+
+def test_a_finding_whose_key_changed_form_keeps_its_record(db: sqlite3.Connection, tmp_path: Path) -> None:
+    """wv-0f8658: a key changes form when a match becomes or stops being
+    unique. The record moves by content (rule, path, match, line context),
+    never to a finding with other text or while the old key is still present,
+    and the ledger is then written under the new key only."""
+    sid = begin_pattern_run(db, "a", ".")
+    replace_pattern_scan_results(db, sid, [_carry_finding(sid, "qf-old")], [_CARRY_RUN])
+    assert adjudicate_pattern_finding(db, "qf-old", "waived", "kept") is not None
+    ledger = tmp_path / "ledger.jsonl"
+    export_pattern_adjudications(db, ledger)
+
+    # Other text, or the old key still present: nothing moves. (Stored
+    # dispositions are read: pattern_finding_states also shows a verdict
+    # inherited from identical content, which is Finding K, not a move.)
+    sid = begin_pattern_run(db, "b", ".")
+    replace_pattern_scan_results(db, sid, [_carry_finding(sid, "qf-other", "Other text.")], [_CARRY_RUN])
+    sid = begin_pattern_run(db, "c", ".")
+    replace_pattern_scan_results(
+        db, sid, [_carry_finding(sid, "qf-old"), _carry_finding(sid, "qf-twin")], [_CARRY_RUN])
+    keys = dict(db.execute("SELECT finding_key, disposition FROM pattern_finding_state").fetchall())
+    assert keys["qf-old"] == "waived" and keys["qf-twin"] == "unresolved"
+
+    # Same text under a new key, the old one gone: the record moves.
+    sid = begin_pattern_run(db, "d", ".")
+    replace_pattern_scan_results(db, sid, [_carry_finding(sid, "qf-new")], [_CARRY_RUN])
+    keys = dict(db.execute("SELECT finding_key, disposition FROM pattern_finding_state").fetchall())
+    assert "qf-old" not in keys and keys["qf-new"] == "waived"
+    history = db.execute("SELECT finding_key FROM pattern_finding_disposition_history").fetchall()
+    assert [row[0] for row in history] == ["qf-new"]
+
+    export_pattern_adjudications(db, ledger)
+    records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    assert {r["finding_key"] for r in records} == {"qf-new"}
+
+    # Moving back (the match is unique again) leaves no cycle in the map.
+    sid = begin_pattern_run(db, "e", ".")
+    replace_pattern_scan_results(db, sid, [_carry_finding(sid, "qf-old")], [_CARRY_RUN])
+    assert dict(db.execute("SELECT old_key, new_key FROM pattern_finding_rekeys").fetchall()) == {
+        "qf-new": "qf-old"}
+    export_pattern_adjudications(db, ledger)
+    records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    assert {r["finding_key"] for r in records} == {"qf-old"}

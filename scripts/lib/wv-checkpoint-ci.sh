@@ -45,6 +45,81 @@
 # skipping it — a spuriously-run CI check costs nothing but a bit of compute,
 # a spuriously-skipped one silently hides a real regression from review.
 
+# ── A checkpoint never rewrites a commit a push is publishing (wv-13db30) ──
+# The three checkpoint writers (auto_checkpoint, wv sync, the session-end
+# checkpoint) collapse consecutive graph-only checkpoints by amending HEAD when
+# it is not yet on the upstream ref. That ref moves only when a push completes,
+# and the pre-push gate runs for minutes first: a checkpoint in that window
+# amended the very commit being pushed, and main was left diverged from what
+# had just been published. The pre-push hook now records what it publishes, and
+# HEAD is not amendable while a recorded push may still be publishing it.
+
+# wv_push_inflight_file <git-root> — where that record lives: the git common
+# dir, shared by worktrees and never part of a tree.
+wv_push_inflight_file() {
+    local dir
+    dir=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+    printf '%s/weave-push-inflight\n' "$dir"
+}
+
+# wv_push_inflight_record <git-root> <commit>... — the pre-push hook records
+# the commits it is about to publish, before its gate runs. One line,
+# "<epoch> <commit>...", replaced by the next push. Never fails the push.
+wv_push_inflight_record() {
+    local root=$1 file
+    shift
+    [ "$#" -gt 0 ] || return 0
+    file=$(wv_push_inflight_file "$root") || return 0
+    { printf '%s' "$(date +%s)"; printf ' %s' "$@"; printf '\n'; } > "$file.$$" 2>/dev/null \
+        && mv -f "$file.$$" "$file" 2>/dev/null || rm -f "$file.$$" 2>/dev/null
+    return 0
+}
+
+# wv_push_publishing <git-root> <commit> — 0 while a recorded push may still be
+# publishing <commit>: the record is younger than WV_PUSH_INFLIGHT_TTL seconds
+# (default 3600, longer than any heavy tier), it names <commit> or a descendant
+# of it, and the upstream ref does not yet contain that pushed commit. A push
+# that completed moved the upstream, so its record stops counting; one that
+# failed leaves the record, and checkpoints then add commits instead of
+# amending until it ages out, which costs a commit and never a rewrite.
+wv_push_publishing() {
+    local root=$1 commit=$2 file stamp pushed upstream
+    file=$(wv_push_inflight_file "$root") || return 1
+    [ -f "$file" ] || return 1
+    read -r stamp pushed < "$file" 2>/dev/null || return 1
+    [[ "$stamp" =~ ^[0-9]+$ ]] || return 1
+    [ $(( $(date +%s) - stamp )) -lt "${WV_PUSH_INFLIGHT_TTL:-3600}" ] || return 1
+    upstream=$(git -C "$root" rev-parse -q --verify '@{u}' 2>/dev/null) || upstream=""
+    local p
+    for p in $pushed; do
+        [ "$commit" = "$p" ] || git -C "$root" merge-base --is-ancestor "$commit" "$p" 2>/dev/null || continue
+        [ -n "$upstream" ] && git -C "$root" merge-base --is-ancestor "$p" "$upstream" 2>/dev/null && continue
+        return 0
+    done
+    return 1
+}
+
+# wv_checkpoint_amendable <git-root> — 0 when HEAD may be amended by the next
+# checkpoint: it is not on origin/<branch>, it is a weave checkpoint commit,
+# it changes only .weave/, and no recorded push may be publishing it. The one
+# rule all three checkpoint writers apply; they each carried a copy, and only
+# one of the copies listed renames correctly (wv-b60cd5).
+wv_checkpoint_amendable() {
+    local root=$1 branch head remote msg nw
+    branch=$(git -C "$root" branch --show-current 2>/dev/null) || branch=""
+    [ -n "$branch" ] || branch=main
+    head=$(git -C "$root" rev-parse HEAD 2>/dev/null) || return 1
+    remote=$(git -C "$root" rev-parse "origin/$branch" 2>/dev/null) || remote=none
+    [ "$head" != "$remote" ] || return 1
+    msg=$(git -C "$root" log -1 --format='%s' 2>/dev/null) || return 1
+    [[ "$msg" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] || return 1
+    # --no-renames: a file moved into .weave/ would otherwise list only under
+    # its new path, and the commit would read as .weave-only (wv-b60cd5).
+    nw=$(git -C "$root" diff --no-renames HEAD~1 HEAD --name-only 2>/dev/null) || return 1
+    [ -z "$(grep -v '^\.weave/' <<< "$nw" | grep -v '^$')" ] || return 1
+    ! wv_push_publishing "$root" "$head"
+}
+
 # wv_checkpoint_ci_marker <git-root>
 #   Echoes " [skip ci]" (leading space, ready to append to a commit subject)
 #   only when the upstream resolves AND every path touched anywhere in the
@@ -122,7 +197,79 @@ wv_stage_graph_state() {
         fi
     done
     [ "${#present[@]}" -gt 0 ] || return 0
-    git -C "$git_root" add -A -- "${present[@]}"
+    git -C "$git_root" add -A -- "${present[@]}" || return
+    wv_stage_memory_projections "$git_root"
+}
+
+# ── Memory projections ride with the graph (wv-0cd718) ────────────────────────
+# The committed projections render the graph's active memories. A commit whose
+# graph changes that set must carry fresh projections, and the pre-commit gate
+# checks it (wv-ff0419), but checkpoint and sync commits skip the gate: four
+# memories reached HEAD that way on 2026-10-26..29 with no projection listing
+# them, and the next commit to stage CLAUDE.md was refused for it.
+WV_MEMORY_PROJECTION_PATHS=(
+    CLAUDE.md
+    AGENTS.md
+    .codex/weave.json
+    .github/copilot-instructions.md
+)
+WV_ACTIVE_MEMORY_FILTER='[.[] | .metadata |= (if type == "string" then fromjson else . // {} end)
+    | select((.metadata.node_kind // .metadata.type) == "memory" and (.metadata.mem_status // "active") == "active")
+    | {id, text, verified_at: .metadata.verified_at, hook: .metadata.hook, resident: .metadata.resident}] | sort_by(.id)'
+
+# wv_stage_memory_projections <git-root>
+#   When the staged graph's active memories differ from HEAD's, renders HEAD's
+#   projections afresh in a scratch copy and stages the result beside the
+#   graph. A working file that is neither HEAD's nor that render holds an edit
+#   of its own; nothing is written or staged then, with a warning, because a
+#   checkpoint must not commit someone's edit. Returns 0 either way: a
+#   checkpoint is never refused for this.
+wv_stage_memory_projections() {
+    local git_root="$1" old new path scratch tracked=()
+    [ "${_WV_MEMORY_RENDERING:-0}" = 1 ] && return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    # Same blob, same memories: skip the two whole-graph reads (~0.4 s here).
+    git -C "$git_root" diff --cached --quiet HEAD -- .weave/nodes.jsonl 2>/dev/null && return 0
+    old=$(git -C "$git_root" show HEAD:.weave/nodes.jsonl 2>/dev/null | jq -sc "$WV_ACTIVE_MEMORY_FILTER" 2>/dev/null) || return 0
+    new=$(git -C "$git_root" show :.weave/nodes.jsonl 2>/dev/null | jq -sc "$WV_ACTIVE_MEMORY_FILTER" 2>/dev/null) || return 0
+    [ "$old" != "$new" ] || return 0
+    # Only a projection that already carries the memory block takes part: a
+    # render appends a block to a file without one, and a consumer's CLAUDE.md
+    # or copilot-instructions.md without it is the user's (wv-91f0ca).
+    for path in "${WV_MEMORY_PROJECTION_PATHS[@]}"; do
+        case "$path" in
+            *.json) git -C "$git_root" show "HEAD:$path" 2>/dev/null | jq -e '.memory' >/dev/null 2>&1 || continue ;;
+            *) grep -qF -- '<!-- ── BEGIN WEAVE:MEMORY ──' <<< "$(git -C "$git_root" show "HEAD:$path" 2>/dev/null)" || continue ;;
+        esac
+        tracked+=("$path")
+    done
+    [ "${#tracked[@]}" -gt 0 ] || return 0
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/wv-projections.XXXXXX") || return 0
+    for path in "${tracked[@]}"; do
+        mkdir -p "$scratch/$(dirname "$path")" 2>/dev/null
+        git -C "$git_root" show "HEAD:$path" > "$scratch/$path" 2>/dev/null || { rm -rf "$scratch"; return 0; }
+    done
+    # The render must not checkpoint again, or it would land back here.
+    if ! (cd "$git_root" && _WV_MEMORY_RENDERING=1 WV_AUTO_CHECKPOINT=0 \
+            "${WV_CLI:-wv}" memory render --agent=all --base-dir="$scratch" >/dev/null 2>&1); then
+        rm -rf "$scratch"
+        echo "wv: active memories changed and 'wv memory render --agent=all' failed; the memory projections stay stale until it runs" >&2
+        return 0
+    fi
+    for path in "${tracked[@]}"; do
+        if ! cmp -s "$git_root/$path" "$scratch/$path" \
+            && ! git -C "$git_root" diff --quiet HEAD -- "$path" 2>/dev/null; then
+            rm -rf "$scratch"
+            echo "wv: active memories changed, but $path has an edit of its own; run 'wv memory render --agent=all' and commit the projections with it" >&2
+            return 0
+        fi
+    done
+    for path in "${tracked[@]}"; do
+        cat "$scratch/$path" > "$git_root/$path"
+    done
+    rm -rf "$scratch"
+    git -C "$git_root" add -- "${tracked[@]}" 2>/dev/null || true
+    return 0
 }
 
 # wv_staged_non_graph_state <git-root>
@@ -191,7 +338,7 @@ wv_non_graph_state_paths() {
 # its nearest existing ancestor is a directory this process can search. An
 # unsearchable ancestor hides whether the path exists, and a test of it fails
 # the same way a missing one does, so that is not absence (wv-3fab34).
-wv_path_absent() {
+wv_path_absent() { # predicate
     local d="$1"
     [ -e "$d" ] || [ -L "$d" ] && return 1
     while d=$(dirname -- "$d"); do
@@ -216,4 +363,38 @@ wv_config_read() {
     fi
     wv_path_absent "$1" && return 2
     return 1
+}
+
+# wv_policy_value <text> <section> <key> — one key of .weave/policy.conf, the
+# repository's policy settings (wv-27131a): ini sections, `key = value` on one
+# line, `#` starts a comment, the last assignment wins. Prints nothing when unset.
+wv_policy_value() {
+    awk -v want="[$2]" -v key="$3" '
+        { sub(/#.*/, ""); gsub(/^[ \t]+|[ \t]+$/, "") }
+        /^\[/ { in_section = ($0 == want); next }
+        in_section && index($0, "=") {
+            k = substr($0, 1, index($0, "=") - 1); v = substr($0, index($0, "=") + 1)
+            gsub(/[ \t]+$/, "", k); gsub(/^[ \t]+/, "", v)
+            if (k == key) value = v
+        }
+        END { print value }' <<< "$1"
+}
+
+# wv_memory_outside_graph <weave_dir> <harness> — the repository keeps this
+# harness's memory outside the graph by choice: [memory] outside_graph names it
+# (comma or space separated) and reason is set (ruling D3 on wv-80fa17).
+#   0  kept outside by choice: the reason is on stdout
+#   1  not kept outside: no policy.conf, or the harness is not named
+#   2  .weave/policy.conf cannot be read
+#   3  named without a reason, which records no choice
+wv_memory_outside_graph() {
+    local text rc=0 names reason
+    text=$(wv_config_read "$1/policy.conf") || rc=$?
+    [ "$rc" -eq 2 ] && return 1
+    [ "$rc" -eq 0 ] || return 2
+    names=$(wv_policy_value "$text" memory outside_graph)
+    case " ${names//,/ } " in *" $2 "*) ;; *) return 1 ;; esac
+    reason=$(wv_policy_value "$text" memory reason)
+    [ -n "$reason" ] || return 3
+    printf '%s\n' "$reason"
 }

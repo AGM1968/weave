@@ -628,6 +628,35 @@ assert_not_contains "$output" "Usage: wv <command>" "batch does not execute a wh
 batch_node=$(echo 'add "batch stdin still works"' | timeout 8 $WV batch 2>&1 || true)
 assert_contains "$batch_node" "Batch complete" "batch still reads a piped command list"
 
+# A batch line is split by shell quoting rules with nothing expanded
+# (wv-aa42a9). The line ran as an unquoted $cmd_line: quotes were stored as
+# text, a * expanded against the working directory, and a command reading
+# stdin consumed the rest of the batch file, which never ran.
+touch "$TEST_DIR/batch-glob-a.txt" "$TEST_DIR/batch-glob-b.txt"
+cat > "$TEST_DIR/batch-quote.txt" <<'EOF'
+add "batchq quoted words"
+wv add batchq star batch-glob-*.txt here
+refs
+add 'batchq after refs'
+add "batchq it's \"escaped\" # not a comment"
+add 'batchq unbalanced
+EOF
+set +e
+output=$(cd "$TEST_DIR" && timeout 15 $WV batch "$TEST_DIR/batch-quote.txt" 2>&1)
+batch_quote_rc=$?
+set -e
+batch_texts=$($WV list --all --json 2>/dev/null | jq -r '.[].text | select(startswith("batchq"))' | sort)
+expected_texts=$(printf '%s\n' 'batchq after refs' "batchq it's \"escaped\" # not a comment" \
+    'batchq quoted words' 'batchq star batch-glob-*.txt here')
+assert_equals "$expected_texts" "$batch_texts" "batch stores quoted, globbed and escaped lines as the shell would quote them, unexpanded"
+assert_contains "$output" "(of 6)" "batch runs every line after one that reads stdin"
+assert_contains "$output" "No closing quotation" "batch names an unbalanced quote"
+assert_equals "1" "$batch_quote_rc" "batch exits nonzero when a line fails to parse"
+
+output=$($WV batch --help 2>&1)
+assert_contains "$output" "shell" "batch --help states the line format"
+assert_contains "$output" "no globs" "batch --help states that nothing is expanded"
+
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2257,7 +2286,7 @@ echo ""
 echo "--- findings list pipe-in-text parsing ---"
 pf_id=$($WV add "finding with embedded pipe char in body text" --force 2>/dev/null | grep -oP 'wv-[a-f0-9]+' | head -1)
 sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'),
-    '\$.type','finding',
+    '\$.type','finding', '\$.node_kind','finding',
     '\$.promoted_at',datetime('now','-3 days'),
     '\$.finding', json('{\"fixable\":\"1\",\"confidence\":\"high\",\"violation_type\":\"repo:hygiene\"}')),
     text='finding: glob gap — needs install.sh entry | calibration: false positive'

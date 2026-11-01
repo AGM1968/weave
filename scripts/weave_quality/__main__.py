@@ -18,12 +18,14 @@ Invoked by the Bash wrapper: wv-cmd-quality.sh
 from __future__ import annotations
 
 import argparse
+import bisect
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import sqlite3
 import subprocess
@@ -38,12 +40,14 @@ import tempfile
 from weave_quality.ast_cache import ASTCache
 from weave_quality.bash_ast_grep import analyze_bash_file_best, ast_grep_available, batch_cc_lines
 from weave_quality.bash_heuristic import detect_bash
-from weave_quality.classification import classify_file, load_classify_overrides
+from weave_quality.classification import classify_file, load_classify_overrides, load_score_baseline
 from weave_quality.external_tools import ast_grep_bin
 from weave_quality.typescript_parser import analyze_typescript_file
 from weave_quality.db import (
     ADJUDICATION_NUDGE_SCANS,
     adjudicate_pattern_finding,
+    finding_key_for,
+    unique_finding_key_for,
     begin_pattern_run,
     begin_scan,
     bulk_upsert_co_changes,
@@ -82,7 +86,7 @@ from weave_quality.db import (
     latest_scan_paths,
     worktree_drift,
 )
-from weave_quality.listing import directory_entries
+from weave_quality.listing import directory_entries, repo_files
 from weave_quality.git_metrics import (
     working_tree_blob_shas,
     build_file_state,
@@ -115,6 +119,7 @@ from weave_quality.prose_rules import (
     _string_list,
     _word_regex,
     load_prose_rule,
+    CODE_LANGUAGE_SUFFIXES,
     code_rule_out_of_scope,
     prose_rule_out_of_scope,
     run_prose_rule,
@@ -631,6 +636,7 @@ def _print_scan_result(
     summary: dict[str, object],
     bash_cc_backend: str = "regex",
     ts_cc_backend: str = "unavailable",
+    baseline_note: str = "",
 ) -> None:
     """Print human-readable scan summary to stderr."""
     for lang, count in sorted(lang_counts.items()):
@@ -655,6 +661,27 @@ def _print_scan_result(
         backend_parts.append(f"ts={ts_cc_backend}")
     print(f"  CC backend: {', '.join(backend_parts)}", file=sys.stderr)
     print(f"\nQuality score: {summary.get('quality_score', 100)}/100", file=sys.stderr)
+    if baseline_note:
+        print(f"  {baseline_note}", file=sys.stderr)
+
+
+def score_baseline_note(repo: str | Path, score: int) -> str:
+    """One line placing a score against the [baseline] in quality.conf.
+
+    Empty when no baseline is recorded, so a repository that never accepted a
+    score is not told it has one (wv-0f2438).
+    """
+    baseline = load_score_baseline(str(repo))
+    if baseline is None:
+        return ""
+    base_score, ruling, reason = baseline
+    ruling_part = f" ({ruling})" if ruling else ""
+    reason_part = f": {reason}" if reason else ""
+    if score == base_score:
+        return (f"Note: {score}/100 is the accepted baseline{ruling_part}{reason_part}. "
+                "Not a regression; it moves when thresholds are recalibrated.")
+    direction = "above" if score > base_score else "below"
+    return f"Note: {direction} the accepted baseline of {base_score}/100{ruling_part}."
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +842,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     conn.close()
 
     summary = hotspot_summary(entries, git_stats, all_fn_cc)
+    score = summary.get("quality_score", 100)
+    baseline_note = score_baseline_note(repo, score) if isinstance(score, int) else ""
 
     if args.json:
         category_counts = dict(Counter(e.category for e in entries))
@@ -829,14 +858,16 @@ def cmd_scan(args: argparse.Namespace) -> int:
             "category_counts": category_counts,
             "duration_ms": duration_ms,
             "hotspots_above_threshold": summary.get("hotspot_count", 0),
-            "quality_score": summary.get("quality_score", 100),
+            "quality_score": score,
+            "baseline_note": baseline_note,
             "bash_cc_backend": bash_backend,
             "ts_cc_backend": ts_backend,
         }))
     else:
         print(f"Scanning {target} (repository {repo})...", file=sys.stderr)
         _print_scan_result(lang_counts, files_to_scan, duration_ms, summary,
-                           bash_cc_backend=bash_backend, ts_cc_backend=ts_backend)
+                           bash_cc_backend=bash_backend, ts_cc_backend=ts_backend,
+                           baseline_note=baseline_note)
 
     return 0
 
@@ -1477,11 +1508,8 @@ def _cmd_promote_patterns_canonical(args: argparse.Namespace) -> int:
         print(json.dumps(result) if args.json else _format_apply(result))
         return 0
 
-    catalog_path = _contracts_dir() / "violation-vocabulary-v1.json"
-    try:
-        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        print(f"Error: cannot read {catalog_path}: {exc}", file=sys.stderr)
+    catalog = _load_catalog(repo)
+    if catalog is None:
         return 1
 
     scope = {"target": ".", "review_parent": args.parent}
@@ -1532,11 +1560,9 @@ def cmd_coaching_render(args: argparse.Namespace) -> int:
 
     wanted = {n.strip() for n in args.node_ids.split(",") if n.strip()} if args.node_ids else None
 
-    catalog_path = _contracts_dir() / "violation-vocabulary-v1.json"
-    try:
-        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        print(f"Error: cannot read {catalog_path}: {exc}", file=sys.stderr)
+    repo = Path(_resolve_repo(None))
+    catalog = _load_catalog(repo)
+    if catalog is None:
         return 1
 
     findings: list[dict[str, Any]] = []
@@ -1552,14 +1578,19 @@ def cmd_coaching_render(args: argparse.Namespace) -> int:
             continue
         if wanted is not None and str(node.get("id")) not in wanted:
             continue
-        try:
-            guide = resolve(violation_type, catalog, finding.get("guide", {}).get("language"),
-                            project_root=Path(_resolve_repo(None)))
-        except GuideError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        guides[violation_type] = guide.content()
+        # One guide per type AND language: keyed by type alone, the last
+        # finding resolved set the guide for every finding of that type, so a
+        # language variant reached none or all of them (wv-60bf88).
+        language = finding.get("guide", {}).get("language")
+        guide_key = f"{violation_type}.{language}" if language else violation_type
+        if guide_key not in guides:
+            try:
+                guides[guide_key] = resolve(violation_type, catalog, language, project_root=repo).content()
+            except GuideError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
         findings.append({
+            "guide_key": guide_key,
             "violation_type": violation_type,
             "node_id": str(node.get("id")),
             "occurrences": occurrences,
@@ -1589,6 +1620,21 @@ def _load_node_metadata_local(node: dict[str, Any]) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return metadata if isinstance(metadata, dict) else {}
+
+
+def _load_catalog(repo: Path) -> dict[str, Any] | None:
+    """The violation vocabulary with the repository's own project: types merged
+    in (wv-60bf88), or None after printing why it cannot be read."""
+    from .guides import GuideError, with_project_types  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+
+    catalog_path = _contracts_dir() / "violation-vocabulary-v1.json"
+    try:
+        return with_project_types(json.loads(catalog_path.read_text(encoding="utf-8")), repo)
+    except OSError as exc:
+        print(f"Error: cannot read {catalog_path}: {exc}", file=sys.stderr)
+    except GuideError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+    return None
 
 
 def _contracts_dir() -> Path:
@@ -1838,6 +1884,7 @@ def cmd_health_info(args: argparse.Namespace) -> None:
             {
                 "available": True,
                 "score": score,
+                "baseline_note": score_baseline_note(repo, score),
                 "hotspot_count": hotspot_count,
                 "total_files": len(entries),
                 "git_head": scan.git_head,
@@ -2101,10 +2148,81 @@ def _normalise_finding_identity_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split())
 
 
+# Words kept on each side of a match in its identity anchor (wv-0f8658).
+_ANCHOR_WORDS = 3
+
+
+class _SourceWords:  # pylint: disable=too-few-public-methods
+    """One source file's lines and words, with the paragraph each word is in."""
+
+    def __init__(self, text: str) -> None:
+        self.lines = text.splitlines()
+        breaks = [m.start() for m in re.finditer(r"\n[ \t]*\n", text)]
+        self.words = [(m.start(), m.end(), m.group(), bisect.bisect_right(breaks, m.start()))
+                      for m in re.finditer(r"\S+", text)]
+        self.word_starts = [word[0] for word in self.words]
+        self.line_starts = [0]
+        for line in text.splitlines(keepends=True):
+            self.line_starts.append(self.line_starts[-1] + len(line))
+
+    def anchor(self, line: int, col: int, match: str) -> str:
+        """The words just before and just after a match at LINE:COL, within its paragraph.
+
+        Whitespace-insensitive, so reflowing keeps it; bounded by blank
+        lines, so moving or editing other paragraphs does not change it.
+        """
+        if not 0 < line < len(self.line_starts):
+            return ""
+        line_len = len(self.lines[line - 1]) if line <= len(self.lines) else 0
+        offset = self.line_starts[line - 1] + min(max(col, 0), line_len)
+        first = bisect.bisect_right(self.word_starts, offset) - 1
+        if first < 0 or offset >= self.words[first][1]:
+            first += 1
+        if first >= len(self.words):
+            return ""
+        paragraph = self.words[first][3]
+        after = first + max(1, len(match.split()))
+        before = [w[2] for w in self.words[max(0, first - _ANCHOR_WORDS):first] if w[3] == paragraph]
+        following = [w[2] for w in self.words[after:after + _ANCHOR_WORDS] if w[3] == paragraph]
+        return (_normalise_finding_identity_text(" ".join(before)) + "\x1f"
+                + _normalise_finding_identity_text(" ".join(following)))
+
+
+def _finding_label(source: Path, repo: Path) -> str:
+    """The path a finding is keyed and reported under."""
+    # os.path.abspath, not Path.resolve() -- resolve() follows symlinks,
+    # which would key a symlinked file's finding identity/report path on
+    # its target's location rather than the name it was actually scanned
+    # under, and could fold a real file and a symlink to it into a
+    # collision (or split one file's own identity across two labels).
+    try:
+        return Path(os.path.abspath(str(source))).relative_to(Path(os.path.abspath(str(repo)))).as_posix()
+    except ValueError:
+        # Outside repo (a test fixture, or any --path pointed elsewhere):
+        # the target-relative label alone (e.g. "a.md") isn't a stable
+        # identity -- two distinct files under different external
+        # targets can share it, colliding their finding_key and
+        # adjudication history. Use the lexical absolute source path
+        # instead; _report_scope scopes reports against this same form.
+        return Path(os.path.abspath(str(source))).as_posix()
+
+
 def _attach_pattern_finding_identities(
     findings: list[PatternFinding], target: Path, repo: Path
 ) -> None:
-    """Bind findings to rule, path, normalized match, and match ordinal.
+    """Bind findings to rule, path, normalized match and, when needed, anchor.
+
+    A match whose text is unique in its file keeps the identity it always
+    had (rule, path, match, ordinal 1), so edits around it and reflow leave
+    its key alone. Several matches of the same text used to be told apart by
+    ordinal alone, so repairing one renumbered every later one and each took
+    its neighbour's verdict (wv-0f8658); they now carry their anchor (the
+    words around the match) and an ordinal among matches sharing it.
+
+    When a group grows or shrinks a finding's key changes form, and
+    replace_pattern_scan_results carries its verdict across by content.
+    Identity stays a function of the file alone, so a committed
+    adjudication resolves the same on every clone.
 
     A source-read failure (deleted mid-scan, permission denied, ...) is
     NOT swallowed here -- it propagates to the caller (cmd_patterns_scan),
@@ -2114,46 +2232,31 @@ def _attach_pattern_finding_identities(
     finding whose context could never actually be read still get recorded
     as a successful, correctly-identified finding.
     """
-    source_cache: dict[str, list[str]] = {}
-    occurrence_counts: dict[tuple[str, str, str], int] = {}
+    source_cache: dict[str, _SourceWords] = {}
+    placed: list[tuple[PatternFinding, tuple[str, str, str], str]] = []
+    group_sizes: dict[tuple[str, str, str], int] = {}
     for finding in findings:
         source = target / finding.path if target.is_dir() else target
         cache_key = str(source)
         if cache_key not in source_cache:
-            source_cache[cache_key] = source.read_text(
-                encoding="utf-8", errors="replace"
-            ).splitlines()
-        lines = source_cache[cache_key]
+            source_cache[cache_key] = _SourceWords(source.read_text(encoding="utf-8", errors="replace"))
+        words = source_cache[cache_key]
+        lines = words.lines
         context = lines[finding.line - 1] if 0 < finding.line <= len(lines) else finding.match_text
-        # os.path.abspath, not Path.resolve() -- resolve() follows symlinks,
-        # which would key a symlinked file's finding identity/report path on
-        # its target's location rather than the name it was actually scanned
-        # under, and could fold a real file and a symlink to it into a
-        # collision (or split one file's own identity across two labels).
-        try:
-            finding.path = (
-                Path(os.path.abspath(str(source)))
-                .relative_to(Path(os.path.abspath(str(repo))))
-                .as_posix()
-            )
-        except ValueError:
-            # Outside repo (a test fixture, or any --path pointed elsewhere):
-            # the target-relative label alone (e.g. "a.md") isn't a stable
-            # identity -- two distinct files under different external
-            # targets can share it, colliding their finding_key and
-            # adjudication history. Use the lexical absolute source path
-            # instead; _report_scope scopes reports against this same form.
-            finding.path = Path(os.path.abspath(str(source))).as_posix()
+        finding.path = _finding_label(source, repo)
         normalized_match = _normalise_finding_identity_text(finding.match_text)
         finding.context_text = _normalise_finding_identity_text(context)
-        occurrence = (finding.rule_id, finding.path, normalized_match)
-        occurrence_counts[occurrence] = occurrence_counts.get(occurrence, 0) + 1
-        identity = json.dumps(
-            [*occurrence, occurrence_counts[occurrence]],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        finding.finding_key = "qf-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        group = (finding.rule_id, finding.path, normalized_match)
+        group_sizes[group] = group_sizes.get(group, 0) + 1
+        placed.append((finding, group, words.anchor(finding.line, finding.col, normalized_match)))
+    ordinals: dict[tuple[str, ...], int] = {}
+    for finding, group, anchor in placed:
+        if group_sizes[group] == 1:
+            finding.finding_key = unique_finding_key_for(*group)
+            continue
+        anchored = (*group, anchor)
+        ordinals[anchored] = ordinals.get(anchored, 0) + 1
+        finding.finding_key = finding_key_for(*anchored, ordinals[anchored])
 
 
 def _pattern_execution_error(exc: PatternRuleExecutionError, json_out: bool) -> int:
@@ -2215,6 +2318,41 @@ def _validate_ast_grep_match(match: dict[str, object], rule_path: Path, target: 
 _SCANNED_DOT_DIRS = (".claude",)
 
 
+def _ast_grep_files(target: Path) -> list[Path]:
+    """The files ast-grep walks under directory TARGET, by its own rules.
+
+    It honours .gitignore inside a repository, so there the set is git's
+    (tracked plus untracked, not ignored): walking the tree instead stat'd
+    every file under .venv once per rule, 8 s a rule on this repository.
+    Outside a repository it is every file. Hidden entries are dropped
+    except the dot-directories passed by name. The listing is repo_files,
+    which prose rules share (wv-c309a8).
+    """
+    relative = repo_files(target)
+    return [
+        target / rel for rel in relative
+        if not any(part.startswith(".") and part not in _SCANNED_DOT_DIRS for part in rel.parts)
+    ]
+
+
+def _unreadable_code_files(target: Path, language: str) -> list[Path]:
+    """Files of LANGUAGE that ast-grep would scan under TARGET and cannot read.
+
+    ast-grep skips an unreadable file without a message (wv-0da129). Empty,
+    binary and oversized files, which it also skips, are readable and not
+    reported. A language with no suffix map reports nothing: what it would
+    scan is not known here.
+    """
+    suffixes = CODE_LANGUAGE_SUFFIXES.get(language)
+    if suffixes is None:
+        return []
+    candidates = [target] if target.is_file() else _ast_grep_files(target)
+    return sorted(
+        path for path in candidates
+        if path.suffix.lower() in suffixes and path.is_file() and not os.access(path, os.R_OK)
+    )
+
+
 def _run_pattern_rule(
     rule_id: str, rule_path: Path, target: Path, scan_id: int, repo: Path, language: str
 ) -> list[PatternFinding]:
@@ -2233,7 +2371,7 @@ def _run_pattern_rule(
     ast_grep = ast_grep_bin()
     if not ast_grep:
         return []
-    cmd = [ast_grep, "scan", "--rule", str(rule_path), "--json", str(target)]
+    cmd = [ast_grep, "scan", "--rule", str(rule_path), "--json", "--inspect", "summary", str(target)]
     # ast-grep skips dot-directories when it walks a directory, so no bash rule
     # ever reached .claude/hooks/*.sh (wv-b60cd5). Naming the directory makes
     # ast-grep scan it; hidden trees in general (.git, .venv) stay unscanned.
@@ -2252,13 +2390,24 @@ def _run_pattern_rule(
     # A directory ast-grep cannot list is reported on stderr ("ERROR: <dir>:
     # Permission denied") while it exits 0 with whatever it did reach: a
     # partial scan that read as complete (wv-4852bd). Parse errors and binary
-    # files print nothing there. (An unreadable FILE is skipped with no
-    # message at all; that is not detectable from here.)
+    # files print nothing there.
     unlisted = [line for line in proc.stderr.splitlines() if line.startswith("ERROR:")]
     if unlisted:
         raise PatternRuleExecutionError(
             f"{rule_path}: ast-grep could not read all of {target}: {unlisted[0][:300]}"
         )
+    # An unreadable FILE is skipped with no message and exit 0, and the
+    # summary's skippedFileCount also counts empty, binary and oversized files,
+    # so a skip is only a hint (wv-0da129). Only then are the language's files
+    # under the target checked, and the scan refused if one cannot be read.
+    skipped = re.search(r"skippedFileCount=(\d+)", proc.stderr)
+    if skipped and int(skipped.group(1)) > 0:
+        unreadable = _unreadable_code_files(target, language)
+        if unreadable:
+            raise PatternRuleExecutionError(
+                f"{rule_path}: ast-grep skipped {len(unreadable)} file(s) under {target} it could not "
+                f"read, so the scan is incomplete: {unreadable[0]}"
+            )
     if not proc.stdout.strip():
         return []
     try:
@@ -2316,6 +2465,10 @@ def _run_pattern_rule(
                 severity="warning",
             )
         )
+    # ast-grep scans files in parallel and reports them in completion order,
+    # which varied run to run (3 of 60 on a two-file fixture), so a scan's
+    # output did too. Report in path, line, column order (wv-d94b8a).
+    findings.sort(key=lambda f: (f.path, f.line, f.col))
     return findings
 
 
@@ -2469,28 +2622,16 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
     conn = init_db(args.hot_zone)
 
     conf_disabled = _disabled_patterns(repo / ".weave" / "quality.conf")
+    # Rules skipped for breaking the contract (wv-d0e4d6). Every report names
+    # them, so a scan never reads as covering a rule it did not apply.
+    invalid: list[tuple[str, Path, str]] = []
     try:
-        rules = _load_pattern_rules(repo, conf_disabled)
+        rules = _load_pattern_rules(repo, conf_disabled, invalid)
     except PatternRuleValidationError as exc:
         conn.close()
         return _pattern_rule_error(exc, args.json)
-    prose_rules = [
-        (rule_id, rule_path, language)
-        for rule_id, rule_path, language in rules
-        if language in PROSE_LANGUAGES
-    ]
-    code_rules = [
-        (rule_id, rule_path, language)
-        for rule_id, rule_path, language in rules
-        if language not in PROSE_LANGUAGES
-    ]
-    if code_rules and not ast_grep_available():
-        print(
-            f"patterns: skipping {len(code_rules)} code rule(s) "
-            "(ast-grep not found; run ./install.sh); prose rules still run",
-            file=sys.stderr,
-        )
-        rules = prose_rules
+    invalid_rules = _invalid_rule_entries(invalid)
+    rules = _runnable_rules(rules)
 
     # Canonicalize and validate the target before the no-rules branch below
     # -- a zero-rule invocation (every rule disabled, or only code rules
@@ -2516,21 +2657,7 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
         run_id = begin_pattern_run(conn, git_head_sha(repo), canonical_target)
         finish_pattern_run(conn, run_id, files_count=0, duration_ms=0)
         conn.close()
-        msg = "No pattern rules found."
-        print(
-            json.dumps(
-                {
-                    "rules": 0,
-                    "rules_run": 0,
-                    "findings": 0,
-                    "by_rule": {},
-                    "matches": [],
-                }
-            )
-            if args.json
-            else msg
-        )
-        return 0
+        return _emit_no_rules_scan(args, invalid_rules)
 
     # Pattern scans get their own lifecycle id, independent of scan_meta (the
     # complexity-scan sequence) -- a rescan or an unrelated `wv quality scan`
@@ -2574,19 +2701,7 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
     # produced, independent of what any other rule also matched at the same
     # spot; that is an intrinsic property of the rule, not a duplicate.
     all_findings = _suppress_same_span_findings(all_findings, rules)
-
-    # wv-c71833: the receipt's persisted "hits" must agree with what this
-    # same invocation reports in by_rule and stores in pattern_findings --
-    # otherwise `patterns scan`, `patterns list`, and a rule's own receipt
-    # read as three different counts for the same run. Overwrite each
-    # successful run's hits from the (possibly deduped) all_findings that
-    # actually landed in the store; raw_hits_by_rule (captured above, before
-    # dedup) still carries what the rule itself matched for the scan output.
-    final_hits_by_rule: dict[str, int] = {}
-    for pf in all_findings:
-        final_hits_by_rule[pf.rule_id] = final_hits_by_rule.get(pf.rule_id, 0) + 1
-    for run in successful_runs:
-        run["hits"] = final_hits_by_rule.get(str(run["rule_id"]), 0)
+    final_hits_by_rule = _reconcile_rule_hits(all_findings, successful_runs)
 
     replace_pattern_scan_results(conn, run_id, all_findings, successful_runs)
     finish_pattern_run(
@@ -2595,14 +2710,31 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
         files_count=len({finding.path for finding in all_findings}),
         duration_ms=int((time.time() - started) * 1000),
     )
-    finding_states = {
-        str(row["finding_key"]): row
-        for row in pattern_finding_states(
-            conn, sorted({finding.finding_key for finding in all_findings})
-        )
-    }
+    finding_states = _finding_states_for(conn, all_findings)
     conn.close()
 
+    return _report_pattern_scan(
+        args, rules, all_findings, finding_states, final_hits_by_rule, raw_hits_by_rule,
+        target, repo, invalid_rules,
+    )
+
+
+def _report_pattern_scan(
+    args: argparse.Namespace,
+    rules: list[tuple[str, Path, str]],
+    all_findings: list[PatternFinding],
+    finding_states: dict[str, dict[str, object]],
+    final_hits_by_rule: dict[str, int],
+    raw_hits_by_rule: dict[str, int],
+    target: Path,
+    repo: Path,
+    invalid_rules: list[dict[str, str]],
+) -> int:
+    """Build the per-rule counts and sources for a finished scan and render it.
+
+    final_hits_by_rule is what was stored after same-span suppression;
+    raw_hits_by_rule is what each rule matched before it.
+    """
     summary = {r: final_hits_by_rule.get(r, 0) for r, _, _ in rules}
     # wv-c71833: by_rule (== stored receipt hits == patterns list count for
     # this scan) vs. what each rule itself matched before same-start-location
@@ -2610,13 +2742,70 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
     # values keep meaning exactly one thing (the reported/stored count).
     raw_hits = {r: raw_hits_by_rule.get(r, 0) for r, _, _ in rules}
     rule_sources = {r: _rule_source(path) for r, path, _ in rules}
+    return _emit_pattern_scan(
+        args, rules, all_findings, finding_states, summary, raw_hits, rule_sources,
+        _out_of_scope_rules(rules, summary, target, repo), invalid_rules,
+    )
 
-    # A rule with no eligible file under the target reported zero because it
-    # never ran, not because the file is clean: a prose rule outside its
-    # paths: (wv-33733d), a code rule with no file of its language (wv-76fc4a).
-    # Only computed for rules that found nothing, so a scan with findings pays
-    # nothing for it.
-    out_of_scope = sorted(
+
+def _runnable_rules(rules: list[tuple[str, Path, str]]) -> list[tuple[str, Path, str]]:
+    """Drop the code rules when ast-grep is missing, saying so; prose rules always run."""
+    code_rules = [rule for rule in rules if rule[2] not in PROSE_LANGUAGES]
+    if not code_rules or ast_grep_available():
+        return rules
+    print(
+        f"patterns: skipping {len(code_rules)} code rule(s) "
+        "(ast-grep not found; run ./install.sh); prose rules still run",
+        file=sys.stderr,
+    )
+    return [rule for rule in rules if rule[2] in PROSE_LANGUAGES]
+
+
+def _reconcile_rule_hits(
+    all_findings: list[PatternFinding], successful_runs: list[dict[str, object]]
+) -> dict[str, int]:
+    """Set each run's stored hits to the findings that landed, and return them by rule.
+
+    wv-c71833: the receipt's persisted "hits" must agree with what this
+    same invocation reports in by_rule and stores in pattern_findings --
+    otherwise `patterns scan`, `patterns list`, and a rule's own receipt
+    read as three different counts for the same run. Overwrite each
+    successful run's hits from the (possibly deduped) all_findings that
+    actually landed in the store; the caller's raw_hits_by_rule (captured
+    before dedup) still carries what the rule itself matched for the scan output.
+    """
+    final_hits_by_rule: dict[str, int] = {}
+    for pf in all_findings:
+        final_hits_by_rule[pf.rule_id] = final_hits_by_rule.get(pf.rule_id, 0) + 1
+    for run in successful_runs:
+        run["hits"] = final_hits_by_rule.get(str(run["rule_id"]), 0)
+    return final_hits_by_rule
+
+
+def _finding_states_for(
+    conn: sqlite3.Connection, all_findings: list[PatternFinding]
+) -> dict[str, dict[str, object]]:
+    """The stored adjudication state of each finding this scan produced, by finding_key."""
+    return {
+        str(row["finding_key"]): row
+        for row in pattern_finding_states(
+            conn, sorted({finding.finding_key for finding in all_findings})
+        )
+    }
+
+
+def _out_of_scope_rules(
+    rules: list[tuple[str, Path, str]], summary: dict[str, int], target: Path, repo: Path
+) -> list[str]:
+    """Rules that found nothing because no file under the target is theirs to read.
+
+    A rule with no eligible file under the target reported zero because it
+    never ran, not because the file is clean: a prose rule outside its
+    paths: (wv-33733d), a code rule with no file of its language (wv-76fc4a).
+    Only computed for rules that found nothing, so a scan with findings pays
+    nothing for it.
+    """
+    return sorted(
         rule_id
         for rule_id, rule_path, language in rules
         if not summary.get(rule_id)
@@ -2625,10 +2814,43 @@ def cmd_patterns_scan(args: argparse.Namespace) -> int:
              else code_rule_out_of_scope(language, target))
     )
 
-    return _emit_pattern_scan(
-        args, rules, all_findings, finding_states, summary, raw_hits, rule_sources,
-        out_of_scope,
-    )
+
+def _invalid_rule_entries(invalid: list[tuple[str, Path, str]]) -> list[dict[str, str]]:
+    """The loader's skipped rule files as report entries."""
+    return [
+        {"rule_id": rule_id, "path": str(rule_path), "error": error}
+        for rule_id, rule_path, error in invalid
+    ]
+
+
+def _emit_no_rules_scan(args: argparse.Namespace, invalid_rules: list[dict[str, str]]) -> int:
+    """Report a scan that had no rule to run, in the same shape as any other scan."""
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "rules": 0,
+                    "rules_run": 0,
+                    "findings": 0,
+                    "by_rule": {},
+                    "matches": [],
+                    "invalid_rules": invalid_rules,
+                }
+            )
+        )
+    else:
+        print("No pattern rules found.")
+        _print_invalid_rules(invalid_rules)
+    return 0
+
+
+def _print_invalid_rules(invalid_rules: list[dict[str, str]]) -> None:
+    """Name each rule a text scan skipped as invalid (wv-d0e4d6)."""
+    if not invalid_rules:
+        return
+    print(f"  {len(invalid_rules)} invalid rule file(s) not applied; fix or remove them:")
+    for entry in invalid_rules:
+        print(f"    {entry['path']}: {entry['error']}")
 
 
 def _emit_pattern_scan(
@@ -2643,9 +2865,11 @@ def _emit_pattern_scan(
     raw_hits: dict[str, int],
     rule_sources: dict[str, str],
     out_of_scope: list[str] | None = None,
+    invalid_rules: list[dict[str, str]] | None = None,
 ) -> int:
     """Render one scan's result as JSON or as the per-rule text report."""
     out_of_scope = out_of_scope or []
+    invalid_rules = invalid_rules or []
     out_of_scope_set = set(out_of_scope)
     total = len(all_findings)
     matches = [
@@ -2685,6 +2909,9 @@ def _emit_pattern_scan(
                     # by_rule zero means "never ran", not "found nothing".
                     "out_of_scope": out_of_scope,
                     "matches": matches,
+                    # Rule files skipped for breaking the rule contract; they
+                    # are not in rules and found nothing because they never ran.
+                    "invalid_rules": invalid_rules,
                 }
             )
         )
@@ -2702,6 +2929,7 @@ def _emit_pattern_scan(
             )
         else:
             print(f"Pattern scan complete: {len(rules)} rules, {total} findings")
+        _print_invalid_rules(invalid_rules)
         for rule_id, count in sorted(summary.items(), key=lambda x: -x[1]):
             if rule_id in out_of_scope_set:
                 print(

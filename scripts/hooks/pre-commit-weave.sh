@@ -37,6 +37,21 @@ hook_duration_ms() {
 # Allow explicit bypass
 [ "${WV_SKIP_PRECOMMIT:-0}" = "1" ] && exit 0
 
+# PREFLIGHT (wv-b7fdee). scripts/gate-preflight.sh runs this gate over a
+# temporary index holding the working change, so a refusal costs seconds
+# instead of a gate run. It judges as for a commit, except that it reports a
+# missing claim instead of refusing, runs only the selected light suites
+# measured at WV_GATE_PREFLIGHT_FAST_S seconds or less unless
+# WV_GATE_PREFLIGHT_SUITES=1, records no gate measurement, never enters
+# recovery, and ends after the candidate lanes without binding a commit.
+# Read once and unset, so a suite that tests this hook does not inherit it;
+# the copies this hook runs itself (HEAD's, each lane's) are handed it.
+_PC_PREFLIGHT=${WV_GATE_PREFLIGHT:-0}
+_PC_PREFLIGHT_SUITES=${WV_GATE_PREFLIGHT_SUITES:-0}
+_PC_PREFLIGHT_FAST_S=${WV_GATE_PREFLIGHT_FAST_S:-20}
+unset WV_GATE_PREFLIGHT WV_GATE_PREFLIGHT_SUITES WV_GATE_PREFLIGHT_FAST_S
+_pc_preflight() { [ "$_PC_PREFLIGHT" = 1 ]; }
+
 # PROTECTED DISPATCHER (S2a, wv-1f98b6; boundary rule 3, wv-ecf877). Where HEAD
 # carries this hook (the Weave source repository), the gate is HEAD's committed
 # scripts/ tree run from a private copy: this hook, the suite pool, the
@@ -691,10 +706,16 @@ _pcr_main() {
 if [ -z "$_PC_LANE_BASE" ]; then
     _wv_base=$(git rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null) || _wv_base=""
     _wv_self=""
-    if [ -n "$_wv_base" ] && ! _wv_self=$(git ls-tree "$_wv_base" -- scripts/hooks/pre-commit-weave.sh 2>/dev/null); then
+    # A committed gate is the hook AND the wv it runs (wv-9da519). wv init-repo
+    # --update seeds the hook sources into a consumer's scripts/hooks/; tracked
+    # there, the hook alone selected this lane, which then refused every commit
+    # for want of scripts/wv. A consumer without scripts/wv takes the installed
+    # copy's lane below. Here, a commit deleting scripts/wv is refused.
+    if [ -n "$_wv_base" ] && ! _wv_self=$(git ls-tree "$_wv_base" -- scripts/hooks/pre-commit-weave.sh scripts/wv 2>/dev/null); then
         echo "✗ Weave pre-commit: could not read HEAD's tree to find its committed gate — refusing" >&2
         exit 1
     fi
+    [ "$(grep -cE $'\t(scripts/hooks/pre-commit-weave\\.sh|scripts/wv)$' <<< "$_wv_self" || true)" = 2 ] || _wv_self=""
     if [ -n "$_wv_self" ]; then
         if ! _wv_ls=$(git ls-tree -r "$_wv_base" -- scripts 2>/dev/null); then
             echo "✗ Weave pre-commit: could not list HEAD's scripts/, the committed gate — refusing" >&2
@@ -727,8 +748,9 @@ if [ -z "$_PC_LANE_BASE" ]; then
             echo "✗ Weave pre-commit: could not mark the copy of HEAD's committed gate — refusing" >&2
             exit 1
         fi
-        _pcr_main "$@"
-        WV_HOOK_REEXEC=1 \
+        _pc_preflight || _pcr_main "$@"
+        WV_HOOK_REEXEC=1 WV_GATE_PREFLIGHT="$_PC_PREFLIGHT" WV_GATE_PREFLIGHT_SUITES="$_PC_PREFLIGHT_SUITES" \
+            WV_GATE_PREFLIGHT_FAST_S="$_PC_PREFLIGHT_FAST_S" \
             env -u WV_LIB_DIR -u WV_CLI bash "$_wv_d/tree/scripts/hooks/pre-commit-weave.sh" "$@"
         exit $?
     fi
@@ -739,6 +761,17 @@ fi
 # In the protected lane, wv, the libraries and the python checkers come from
 # the copy this hook runs from and nowhere else (_PC_SCRIPTS).
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || exit 0)
+# The refresh a message names (wv-376de3): ./install.sh exists only in Weave's
+# own tree, read from HEAD like the lane (install.sh and scripts/wv tracked); a
+# consumer refreshes its install, then its hooks, with wv. Inline, because the
+# messages that need it are the ones for missing libraries.
+_pc_refresh_cmd() {
+    if [ "$(git ls-tree HEAD -- install.sh scripts/wv 2>/dev/null | wc -l)" -eq 2 ]; then
+        printf './install.sh'
+    else
+        printf 'wv self-update, then wv init-repo --update'
+    fi
+}
 if [ -n "$_PC_LANE_BASE" ]; then
     _PC_SCRIPTS=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd) || _PC_SCRIPTS=""
     if [ -z "$_PC_SCRIPTS" ] || [ ! -x "$_PC_SCRIPTS/wv" ]; then
@@ -839,7 +872,7 @@ _pc_list_failed() {
 # was committed unjudged; _pc_admit refuses that. WV_GATE_BASE is the base a
 # history-sensitive suite judges against (wv-bab095, tests/lib/gate-base.sh).
 if ! command -v gate_freeze >/dev/null 2>&1; then
-    echo "✗ Weave pre-commit: the frozen-candidate library (wv-gate-snapshot.sh) was not found — refresh with ./install.sh" >&2
+    echo "✗ Weave pre-commit: the frozen-candidate library (wv-gate-snapshot.sh) was not found — refresh with $(_pc_refresh_cmd)" >&2
     exit 1
 fi
 if ! gate_freeze; then
@@ -953,8 +986,14 @@ _pc_admit() {
     if [ -n "$_PC_CAND_PATH" ]; then
         exit 0
     fi
-    if [ -n "$_PC_LANE_BASE" ] && ! gate_lanes_run "${_wv_lane_file%/*}"; then
+    if [ -n "$_PC_LANE_BASE" ] && ! WV_GATE_PREFLIGHT="$_PC_PREFLIGHT" \
+        WV_GATE_PREFLIGHT_SUITES="$_PC_PREFLIGHT_SUITES" WV_GATE_PREFLIGHT_FAST_S="$_PC_PREFLIGHT_FAST_S" \
+        gate_lanes_run "${_wv_lane_file%/*}"; then
         exit 1
+    fi
+    if _pc_preflight; then
+        echo "✓ Weave preflight: the gate admits this change; nothing was committed" >&2
+        exit 0
     fi
     _pc_bind
     exit 0
@@ -1010,8 +1049,8 @@ done
 if grep -Fxq '.weave/nodes.jsonl' <<< "$STAGED_FILES" \
     && grep -qE '^[^#].*=.*tests/test-memory-projection-parity.sh' <<< "$_pc_maps"; then
     _pc_memory_filter='[.[] | .metadata |= (if type == "string" then fromjson else . // {} end)
-        | select(.metadata.type == "memory" and (.metadata.mem_status // "active") == "active")
-        | {id, text, verified_at: .metadata.verified_at}] | sort_by(.id)'
+        | select((.metadata.node_kind // .metadata.type) == "memory" and (.metadata.mem_status // "active") == "active")
+        | {id, text, verified_at: .metadata.verified_at, hook: .metadata.hook, resident: .metadata.resident}] | sort_by(.id)'
     _pc_old_memory=$(gate_show base .weave/nodes.jsonl 2>/dev/null | jq -sc "$_pc_memory_filter") || exit 1
     _pc_new_memory=$(gate_show index .weave/nodes.jsonl 2>/dev/null | jq -sc "$_pc_memory_filter") || exit 1
     if [ "$_pc_old_memory" != "$_pc_new_memory" ]; then
@@ -1023,7 +1062,7 @@ if grep -Fxq '.weave/nodes.jsonl' <<< "$STAGED_FILES" \
         fi
         # Keep the entire graph, including delta catalog and replay markers.
         # A link would read mutable bytes outside this frozen subject.
-        _pc_memory_roots=(.weave CLAUDE.md .claude/MEMORY.md .codex/MEMORY.md
+        _pc_memory_roots=(.weave CLAUDE.md
             .github/copilot-instructions.md AGENTS.md .codex/weave.json)
         if ! _pc_memory_modes=$(git ls-tree -r "$WV_GATE_TREE" -- "${_pc_memory_roots[@]}" 2>/dev/null) \
             || grep -qvE '^100(644|755) blob ' <<< "$_pc_memory_modes"; then
@@ -1062,7 +1101,7 @@ else
     # gated. Treating all of .weave/ as graph state would pass configuration
     # (test-map.conf, quality.conf, shellcheck.conf) ungated (wv-68aeff).
     NON_WEAVE_FILES="$STAGED_FILES"
-    echo "Weave pre-commit: graph-state helper not found (wv-checkpoint-ci.sh) — every staged file is gated, graph state included; refresh with ./install.sh" >&2
+    echo "Weave pre-commit: graph-state helper not found (wv-checkpoint-ci.sh) — every staged file is gated, graph state included; refresh with $(_pc_refresh_cmd)" >&2
 fi
 # The only content admitted without a claim: graph state, as the classifier
 # above decides it. The checkpointers commit exactly that and pass here; the
@@ -1101,11 +1140,12 @@ _pc_gate_finish() {
     local rc=$?
     "$WV" test-record gate --gate --exit="$rc" --duration="$(hook_duration_ms "$_pc_gate_t0")" \
         --execution-mode="${WV_GATE_EXECUTION_MODE:-}" \
+        --suite-modes="$(gate_pool_suite_modes "$_pc_gate_suites")" \
         --estimate="$_pc_gate_estimate_ms" --suites="$_pc_gate_suites" \
         --started-ms="$(_pc_ns_to_ms "$_pc_gate_t0" 2>/dev/null)" >/dev/null 2>&1 || true
     return "$rc"
 }
-[ -n "$_PC_CAND_PATH" ] || trap _pc_gate_finish EXIT
+[ -n "$_PC_CAND_PATH" ] || _pc_preflight || trap _pc_gate_finish EXIT
 
 # Admission (execute phase only): an active node CLAIMED BY THE COMMITTING
 # ACTOR. Counting every active node let one agent's claim admit another
@@ -1193,6 +1233,19 @@ EOF
     fi
 }
 
+# _pc_claim <when> — the claim check; a preflight reports a missing claim once
+# instead of refusing, since it commits nothing and the rest of the gate still
+# has refusals to find.
+_pc_claim() {
+    if ! _pc_preflight; then
+        _pc_require_claim "$1"
+    elif [ -z "${_PC_CLAIM_SEEN:-}" ]; then
+        _PC_CLAIM_SEEN=1
+        ( _pc_require_claim "$1" ) \
+            || echo "⚠ Weave preflight: a commit now would be refused for want of a claim (above); the gate continues" >&2
+    fi
+}
+
 # ── Install-drift advisory (cross-agent) ──
 # Source admission does not deploy the working tree (wv-801b89). Drift stays
 # visible, but installation is an explicit operation after source review.
@@ -1216,15 +1269,50 @@ while IFS= read -r -d '' _pc_py; do
     esac
 done < "$_pc_py_paths"
 rm -f "$_pc_py_paths"
+
+# Python dev tools read the staged bytes and never execute them, so the
+# checkout's own environment is no authority problem: the frozen tree is the
+# input. In Weave's own tree (the protected lane) a tool is found in the
+# repository's .venv first, where make check runs it, then on PATH. ruff sat
+# behind `command -v ruff`, and with ruff only in .venv the lint step was
+# skipped without a word on every commit (wv-e7a3b2). A consumer's pre-commit
+# is unchanged: PATH only.
+_pc_dev_tool() {  # _pc_dev_tool <name>: its command, or empty when none
+    if [ -n "$_PC_LANE_BASE" ] && [ -x "$REPO_ROOT/.venv/bin/$1" ]; then
+        printf '%s\n' "$REPO_ROOT/.venv/bin/$1"
+    else
+        command -v "$1" 2>/dev/null || true
+    fi
+}
+_pc_declares() {  # _pc_declares <tool>: the staged tree configures it
+    local _pc_cfg _pc_project
+    for _pc_cfg in "$1.toml" ".$1.toml"; do
+        [ -z "$(gate_ls index "$_pc_cfg" | tr -d '\0')" ] || return 0
+    done
+    # Captured first: grep -q ending a pipe early fails it under pipefail.
+    _pc_project=$(gate_show index pyproject.toml 2>/dev/null) || return 1
+    grep -q "^\[tool\.$1[].]" <<< "$_pc_project"
+}
+# In Weave's own tree a configured tool that cannot be found refuses: a
+# skipped check is not a passed one.
+_pc_dev_tool_missing() {  # _pc_dev_tool_missing <name>
+    echo "✗ Weave pre-commit: this tree configures $1 but none was found in .venv/bin or on PATH — install the dev dependencies (poetry install)" >&2
+    exit 1
+}
+
 if [ "${#STAGED_PY_FILES[@]}" -gt 0 ]; then
-    if command -v ruff > /dev/null 2>&1; then
+    _pc_ruff=$(_pc_dev_tool ruff)
+    if [ -z "$_pc_ruff" ] && [ -n "$_PC_LANE_BASE" ] && _pc_declares ruff; then
+        _pc_dev_tool_missing ruff
+    fi
+    if [ -n "$_pc_ruff" ]; then
         hook_progress "running ruff on staged Python files..."
         # Freeze both source and configuration (wv-3080d7). Keep Ruff's native
         # nested discovery/merging, but only repository-relative, regular,
         # tracked inheritance is authority. A root fallback prevents discovery
         # above the snapshot or in the user's configuration directory.
         # -I also prevents a working-tree module shadowing the parser itself.
-        if ! RUFF_OUT=$(python3 -I - "$WV_GATE_TREE" "${STAGED_PY_FILES[@]}" 2>&1 <<'PY'
+        if ! RUFF_OUT=$(python3 -I - "$_pc_ruff" "$WV_GATE_TREE" "${STAGED_PY_FILES[@]}" 2>&1 <<'PY'
 import os
 import posixpath
 import subprocess
@@ -1237,7 +1325,7 @@ def git(*args):
     return subprocess.check_output(["git", "--no-replace-objects", *args])
 
 try:
-    tree, *paths = sys.argv[1:]
+    ruff, tree, *paths = sys.argv[1:]
     entries = {}
     for entry in git("ls-tree", "-r", "-z", "--full-tree", tree).split(b"\0"):
         if entry:
@@ -1313,7 +1401,7 @@ try:
             (root / ".ruff.toml").write_text("", encoding="utf-8")
         env = os.environ.copy()
         env.pop("RUFF_OUTPUT_FILE", None)
-        sys.exit(subprocess.call(["ruff", "check", "--no-fix", "--no-fix-only",
+        sys.exit(subprocess.call([ruff, "check", "--no-fix", "--no-fix-only",
                  "--cache-dir", str(Path(scratch) / "cache"), "--", *paths], cwd=root, env=env))
 except (OSError, ValueError, subprocess.CalledProcessError) as error:
     print(f"ruff frozen inputs: {error}", file=sys.stderr)
@@ -1328,6 +1416,57 @@ PY
             echo "" >&2
             exit 1
         fi
+    fi
+fi
+
+# Type check staged Python with pyrefly (wv-e7a3b2; owner ruling D4 on
+# wv-80fa17): the staged files, as ruff runs, about 1.5 s on a typical set.
+# 60543bb01 committed four pyrefly errors that only the next make check saw.
+# The staged files are checked, not their unstaged importers: cross-file
+# breakage stays with make check. Weave's own tree only, so a consumer's
+# pre-commit is unchanged. The input is the frozen index, every tracked
+# Python file and pyrefly configuration, so imports resolve against the
+# commit's bytes; the interpreter beside the tool supplies site-packages.
+if [ "${#STAGED_PY_FILES[@]}" -gt 0 ] && [ -n "$_PC_LANE_BASE" ] && _pc_declares pyrefly; then
+    _pc_pyrefly=$(_pc_dev_tool pyrefly)
+    [ -n "$_pc_pyrefly" ] || _pc_dev_tool_missing pyrefly
+    _pc_pyrefly_py="$(dirname "$_pc_pyrefly")/python3"
+    [ -x "$_pc_pyrefly_py" ] || _pc_pyrefly_py=$(command -v python3 2>/dev/null || true)
+    hook_progress "running pyrefly on staged Python files..."
+    _pc_pyrefly_dir=$(mktemp -d "${TMPDIR:-/tmp}/wv-pyrefly.XXXXXX" 2>/dev/null) || _pc_pyrefly_dir=""
+    # Checked before any --prefix is built, as the prose gate does: an empty
+    # value would materialise the index over the filesystem root.
+    if [ -z "$_pc_pyrefly_dir" ] || [ ! -d "$_pc_pyrefly_dir" ]; then
+        echo "✗ pyrefly: could not create a temp directory — refusing to commit unchecked content" >&2
+        exit 1
+    fi
+    _pc_pyrefly_inputs=()
+    while IFS= read -r -d '' _pc_f; do
+        case "$_pc_f" in
+            *.py|*.pyi|pyproject.toml|*/pyproject.toml|pyrefly.toml|*/pyrefly.toml)
+                _pc_pyrefly_inputs+=("$_pc_f") ;;
+        esac
+    done < <(gate_ls index)
+    wait $! || { rm -rf "$_pc_pyrefly_dir"; _pc_list_failed "files for the pyrefly check"; }
+    if ! gate_materialise index "$_pc_pyrefly_dir" "${_pc_pyrefly_inputs[@]}"; then
+        rm -rf "$_pc_pyrefly_dir"
+        echo "✗ pyrefly: could not materialise the staged index — refusing to commit unchecked content" >&2
+        exit 1
+    fi
+    _pc_pyrefly_args=(check)
+    [ -z "$_pc_pyrefly_py" ] || _pc_pyrefly_args+=(--python-interpreter-path "$_pc_pyrefly_py")
+    _pc_pyrefly_rc=0
+    PYREFLY_OUT=$(cd "$_pc_pyrefly_dir" && "$_pc_pyrefly" "${_pc_pyrefly_args[@]}" \
+        -- "${STAGED_PY_FILES[@]}" 2>&1) || _pc_pyrefly_rc=$?
+    rm -rf "$_pc_pyrefly_dir"
+    if [ "$_pc_pyrefly_rc" -ne 0 ]; then
+        echo "" >&2
+        echo "✗ pyrefly type errors in staged files:" >&2
+        echo "$PYREFLY_OUT" >&2
+        echo "" >&2
+        echo "  Check with: make typecheck  (then re-stage)" >&2
+        echo "" >&2
+        exit 1
     fi
 fi
 
@@ -1676,9 +1815,16 @@ if [ "${#_pc_md_files[@]}" -gt 0 ] && [ -n "$_PC_LANE_BASE" ] && [ -f "$_PC_SCRI
     fi
     # HEAD baseline. A path absent here is a new file and baselines to empty,
     # which prose-gate.py handles; an unborn HEAD leaves the dir empty entirely.
+    # A moved file baselines to its old path's HEAD bytes: the findings it
+    # carried there are inherited, not added (wv-7f1794).
+    declare -A _pc_md_from=()
+    while IFS= read -r -d '' _pc_old && IFS= read -r -d '' _pc_new; do
+        _pc_md_from["$_pc_new"]=$_pc_old
+    done < <(gate_renamed)
+    wait $! || _pc_list_failed "renames for the prose scan"
     for _pc_f in "${_pc_md_files[@]}"; do
         mkdir -p "$_pc_md_dir/head/$(dirname "$_pc_f")" 2>/dev/null || true
-        gate_show base "$_pc_f" > "$_pc_md_dir/head/$_pc_f" 2>/dev/null || \
+        gate_show base "${_pc_md_from[$_pc_f]:-$_pc_f}" > "$_pc_md_dir/head/$_pc_f" 2>/dev/null || \
             rm -f "$_pc_md_dir/head/$_pc_f" 2>/dev/null || true
     done
     _pc_md_rc=0
@@ -1742,7 +1888,7 @@ if [ -n "$_pc_files_csv" ]; then
     # on and pass with no suite run (found by ultrareview follow-up).
     if ! command -v run_hook_suites >/dev/null 2>&1 || ! command -v gate_pool_estimates >/dev/null 2>&1 \
         || ! command -v gate_pool_launch_order >/dev/null 2>&1 || ! command -v gate_pool_require_present >/dev/null 2>&1; then
-        echo "✗ Weave pre-commit: the suite pool (wv-gate-pool.sh) was not found — refresh with ./install.sh" >&2
+        echo "✗ Weave pre-commit: the suite pool (wv-gate-pool.sh) was not found — refresh with $(_pc_refresh_cmd)" >&2
         exit 1
     fi
     # A failed or unreadable selection refuses the commit, as pre-push does:
@@ -1800,8 +1946,18 @@ if [ -n "$_pc_files_csv" ]; then
             hook_progress "no Weave pre-push gate installed — running heavy-tier suites here: $_pc_heavy"
         fi
     fi
+    # A preflight runs, by default, only the light suites the gate has
+    # measured as quick; WV_GATE_PREFLIGHT_SUITES=1 runs every light one.
+    if _pc_preflight && [ "$_PC_PREFLIGHT_SUITES" != 1 ]; then
+        _pc_light_all=$(jq 'length' <<< "$_pc_suites_json" 2>/dev/null || echo 0)
+        _pc_suites_json=$(jq -c --argjson s "$_PC_PREFLIGHT_FAST_S" \
+            '[.[] | select((.last_cost_s // 0) > 0 and .last_cost_s <= $s)]' <<< "$_pc_suites_json" 2>/dev/null || echo '[]')
+        hook_progress "preflight: $(jq 'length' <<< "$_pc_suites_json") of $_pc_light_all selected light suite(s) are measured at ${_PC_PREFLIGHT_FAST_S}s or less and run; --suites runs them all"
+    fi
     _pc_light_count=$(printf '%s' "$_pc_suites_json" | jq 'length' 2>/dev/null || echo 0)
-    if [ "${_pc_suite_count:-0}" -gt 0 ] && [ "${_pc_light_count:-0}" -eq 0 ]; then
+    if [ "${_pc_suite_count:-0}" -gt 0 ] && [ "${_pc_light_count:-0}" -eq 0 ] && _pc_preflight; then
+        :
+    elif [ "${_pc_suite_count:-0}" -gt 0 ] && [ "${_pc_light_count:-0}" -eq 0 ]; then
         hook_progress "every selected suite is heavy-tier; nothing to run before commit"
     elif [ "${_pc_suite_count:-0}" -gt 0 ]; then
         _pc_gate_suites=$(printf '%s' "$_pc_suites_json" | jq -r '[.[].name] | join(",")' 2>/dev/null || echo "")
@@ -1836,7 +1992,7 @@ if [ -n "$_pc_files_csv" ]; then
         # The claim is checked before the suites, not only after them
         # (wv-c909ff), and after the cheap static checks above, whose fixtures
         # commit without one and read the claim refusal as "every check passed".
-        _pc_require_claim "before the suites"
+        _pc_claim "before the suites"
         run_hook_suites <<< "$_pc_launch"
     else
         # No suite matched any staged source file — the impact gate is inert for
@@ -1873,12 +2029,12 @@ _PC_REPO_HASH=$(echo "$REPO_ROOT" | md5sum | cut -c1-8)
 _PC_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_PC_REPO_HASH}}"
 _PC_PHASE=$(cat "${_PC_HOT_ZONE}/.session_phase" 2>/dev/null || echo "execute")
 
-if [ "$_PC_PHASE" = "closing" ] && [ -z "$_PC_CAND_PATH" ]; then
+if [ "$_PC_PHASE" = "closing" ] && [ -z "$_PC_CAND_PATH" ] && ! _pc_preflight; then
     command -v wv_set_phase >/dev/null 2>&1 && { wv_set_phase "discover" "$_PC_HOT_ZONE" || true; }
 fi
 
 # Admission decides: the claim check again (_pc_require_claim, defined with
 # its rationale before the suites), since a claim can change while they run.
-_pc_require_claim "at admission"
+_pc_claim "at admission"
 
 _pc_admit

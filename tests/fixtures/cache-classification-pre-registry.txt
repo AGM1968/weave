@@ -87,3 +87,4 @@ work 0 1
 # Commands added after the migration have no retired-list entry; each is pinned
 # here from its registry row when it is introduced.
 context-policy 0 0
+kind 0 1

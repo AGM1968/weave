@@ -122,6 +122,20 @@ check "...after running the routed suite" "1" "$(runs probe)"
 check "...which inherited no hook marker from the gate" "unset" "$(cat "$MARK/reexec" 2>/dev/null)"
 reset_marks; touch "$MARK/fail"; stage_src; gate
 check "(control) a failing suite refuses the commit" "1" "$RC"
+# wv-9da519: the lane needs scripts/wv as well as the hook, so a commit that
+# drops scripts/wv would hand the next commit to the installed copy. It is
+# enforcement, and deleting it needs a retirement record HEAD does not hold.
+git reset -q HEAD -- src/a.sh; git checkout -q -- src/a.sh
+git rm -q scripts/wv; reset_marks; gate
+check "a commit deleting scripts/wv is refused" "1" "$RC"
+# Whichever check refuses first (a gate file naming the missing path, or the
+# deletion without a retirement record), the refusal names scripts/wv.
+if grep -qE 'scripts/wv.*refusing|deleting enforcement scripts/wv' <<< "$OUT"; then
+    ok "...by the protected gate, naming scripts/wv"
+else
+    bad "...by the protected gate, naming scripts/wv" "$(tail -3 <<< "$OUT")"
+fi
+git reset -q HEAD -- scripts/wv; restore
 
 echo "an unstaged edit to the dispatcher cannot weaken or skip the gate"
 # tamper <name> <file> <text> — append <text> to a working-tree dispatcher file,
@@ -300,7 +314,22 @@ check "an external enforcement link is refused, not followed" "1" "$RC"
 has "...by the protected-copy check" "$OUT" "is not a regular file"
 
 echo "consumers: no committed hook, the installed copy runs itself"
-C="$T/consumer"; newrepo "$C"; cd "$C" || exit 1
+# consumer_env <repo> — the repository's own hot zone and a claimed node. Sharing
+# the work fixture's zone made wv refuse it as another repository's, so the gate
+# failed before any suite ran and an expected refusal passed for that reason.
+# The installed copy in .git/hooks finds its libraries where install.sh puts
+# them, ~/.local/lib/weave/lib: a private HOME holds this checkout's there. The
+# caller's HOME made these cases run whatever Weave that HOME had installed,
+# and a gate run with none refused for want of libraries, which the expected
+# refusal below could not tell from a failing suite.
+consumer_env() {
+    export HOME="$T/home"
+    mkdir -p "$HOME/.local/lib/weave" && ln -sfn "$ROOT/scripts/lib" "$HOME/.local/lib/weave/lib"
+    export WV_HOT_ZONE="$T/hz-$(basename "$1")" WV_DB="$T/hz-$(basename "$1")/brain.db" WV_PROJECT_DIR="$1"
+    mkdir -p "$WV_HOT_ZONE"
+    wv add "consumer fixture node" --status=active --force --criteria="c1|c2" --risks=low >/dev/null 2>&1
+}
+C="$T/consumer"; newrepo "$C"; cd "$C" || exit 1; consumer_env "$C"
 mkdir -p src tests .weave scripts/hooks
 cp "$W/tests/test-probe.sh" tests/
 printf '[map]\nsrc/ = tests/test-probe.sh\n' > .weave/test-map.conf
@@ -312,8 +341,50 @@ printf '#!/usr/bin/env bash\necho "working-tree hook ran"\nexit 0\n' > scripts/h
 reset_marks; touch "$MARK/fail"; printf '#!/bin/sh\necho c2\n' > src/c.sh; git add src/c.sh
 OUT=$(./.git/hooks/pre-commit 2>&1); RC=$?
 check "the installed copy gates a consumer commit itself" "1" "$RC"
+check "...by running the routed suite" "1" "$(runs probe)"
 hasnt "...and never runs a working-tree hook" "$OUT" "working-tree hook ran"
 hasnt "...nor a committed-gate copy" "$OUT" "committed gate"
+
+# wv-9da519 (rc.14 consumer audit K1): wv init-repo --update seeds the hook
+# sources into a consumer's scripts/hooks/, and the consumer tracks them. HEAD
+# then carried scripts/hooks/<hook>.sh, the hooks took the protected lane, and
+# refused every commit and push because no scripts/wv sits beside the hook. The
+# first commit after the upgrade passed (HEAD did not track them yet), so a
+# one-commit canary missed it: this case commits twice and pushes.
+echo "consumers: tracked hook sources without scripts/wv take the consumer lane"
+V="$T/vendoring"; newrepo "$V"; cd "$V" || exit 1; consumer_env "$V"
+git init -q --bare "$T/vendoring.git"; git remote add origin "$T/vendoring.git"
+mkdir -p src tests .weave scripts/hooks
+cp "$W/tests/test-probe.sh" tests/
+printf '[map]\nsrc/ = tests/test-probe.sh\n' > .weave/test-map.conf
+printf '#!/bin/sh\necho v\n' > src/v.sh
+git add -A && git -c core.hooksPath=/dev/null commit -q -m consumer
+install -m 755 "$ROOT/scripts/hooks/pre-commit-weave.sh" .git/hooks/pre-commit
+install -m 755 "$ROOT/scripts/hooks/pre-push-weave.sh" .git/hooks/pre-push
+install -m 755 "$ROOT/scripts/hooks/pre-commit-weave.sh" scripts/hooks/pre-commit-weave.sh
+install -m 755 "$ROOT/scripts/hooks/pre-push-weave.sh" scripts/hooks/pre-push-weave.sh
+reset_marks; printf '#!/bin/sh\necho v1\n' > src/v.sh; git add -A
+OUT=$(git commit -q -m "vendor the hook sources" 2>&1); RC=$?
+check "the commit that starts tracking the hook sources is admitted" "0" "$RC"
+reset_marks; touch "$MARK/fail"; printf '#!/bin/sh\necho v2\n' > src/v.sh; git add src/v.sh
+OUT=$(./.git/hooks/pre-commit 2>&1); RC=$?
+check "the next commit is gated by the installed copy, which refuses a failing suite" "1" "$RC"
+check "...because the suite ran" "1" "$(runs probe)"
+hasnt "...not refused for a missing scripts/wv" "$OUT" "no scripts/wv beside its hook"
+reset_marks; printf '#!/bin/sh\necho v3\n' > src/v.sh; git add src/v.sh
+OUT=$(git commit -q -m "second commit after vendoring" 2>&1); RC=$?
+check "a healthy second commit is admitted" "0" "$RC"
+OUT=$(git push -q origin main 2>&1); RC=$?
+check "the push after it is admitted" "0" "$RC"
+hasnt "...and pre-push did not refuse for a missing scripts/wv" "$OUT" "no scripts/wv beside its hook"
+# wv-376de3 (audit K3): a consumer whose installed libraries are missing was
+# told to run ./install.sh, which exists only in Weave's own tree.
+printf '#!/bin/sh\necho v4\n' > src/v.sh; git add src/v.sh
+OUT=$(HOME="$T/no-install" ./.git/hooks/pre-commit 2>&1); RC=$?
+check "a consumer with no installed libraries is refused" "1" "$RC"
+has "...and told the consumer's refresh" "$OUT" "refresh with wv self-update, then wv init-repo --update"
+hasnt "...not ./install.sh" "$OUT" "./install.sh"
+git reset -q -- src/v.sh
 
 echo
 echo "protected dispatcher: $pass/$run passed"

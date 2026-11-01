@@ -349,6 +349,24 @@ def read_declaration(repo: Path, revision: str, env: dict[str, str],
     return entry, declaration_policy(document, catalog_path)
 
 
+def retirement_refusal(code: int, removed: list[str], template: str) -> str:
+    """Say what an unadmitted removal of adopted suites needs (wv-cc36c7).
+
+    The refusal used to print the internal check's shell script. A consumer
+    could not tell that a record admits the removal, where it goes, or what it
+    must say; the record is printed here with the exact bytes it must name.
+    """
+    what = ("stops declaring " + ", ".join(removed)) if removed else "removes .weave/gate-provision.json"
+    if code == 3:
+        return (f"this commit {what}; a retirement record matches, but its one use cannot be "
+                "established in a shallow or partial clone: fetch complete history and commit again")
+    if code != 1:
+        return f"this commit {what}, and the gate could not establish whether a retirement record admits it"
+    return (f"this commit {what}, which adopted suites cannot do silently (transition rule 4). "
+            "Commit a retirement record under .weave/gate-repairs/ first, on its own, then commit this "
+            "change; the record admits these exact bytes once. Fill in reason and verification:\n" + template)
+
+
 def declaration_plan(repo: Path, tree: str, base: str | None, env: dict[str, str],
                      catalog_path: Path | None = None) -> dict[str, Any]:
     """Validate both sides before selecting per-suite mode from the base alone."""
@@ -365,12 +383,18 @@ def declaration_plan(repo: Path, tree: str, base: str | None, env: dict[str, str
         # Use the existing exact-byte, mode-bound, one-use history check;
         # staged records, shallow history and replay cannot admit removal.
         library = Path(__file__).resolve().parent
-        run(["bash", "-c", '''
-source "$1/wv-gate-snapshot.sh" || exit
-source "$1/wv-gate-lanes.sh" || exit
+        checked = subprocess.run(["bash", "-c", '''
+source "$1/wv-gate-snapshot.sh" || exit 2
+source "$1/wv-gate-lanes.sh" || exit 2
 WV_GATE_TREE=$2 WV_GATE_BASE=$3
-gate_repair_record .weave/gate-provision.json retirement
-''', "provision-retirement", str(library), tree, baseline], repo, env, capture=True)
+gate_repair_record .weave/gate-provision.json retirement >/dev/null; rc=$?
+[ "$rc" -ne 1 ] || _gate_repair_template .weave/gate-provision.json retirement
+exit "$rc"
+''', "provision-retirement", str(library), tree, baseline], cwd=repo, env=env, check=False, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if checked.returncode:
+            raise SuiteError(retirement_refusal(checked.returncode, sorted(removed) if candidate else [],
+                                                checked.stdout.strip()))
     legacy = old is None and "scripts/hooks/pre-commit-weave.sh" in tree_entries(repo, baseline, env)
     if legacy and run(["git", "log", "-1", "--format=%H", baseline, "--", ".weave/gate-provision.json"],
                       repo, env, capture=True):
@@ -688,10 +712,26 @@ def stage_artifacts(cache: Path, artifacts: list[dict[str, str]], recipe: dict[s
     return hashes
 
 
+def _output_entries(path: Path) -> list[Path]:
+    """Every entry under PATH, sorted, as rglob("*") yields them.
+
+    rglob walked past a directory it could not list, so the fingerprint left
+    out whatever that directory held and a change there went unseen
+    (wv-c6c7cf); this raises SuiteError instead. Symlinked directories are
+    yielded, not entered.
+    """
+    def unlisted(exc: OSError) -> None:
+        raise SuiteError(f"cannot list installed output {exc.filename}: {exc.strerror or exc}") from exc
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(path, onerror=unlisted):
+        found.extend(Path(dirpath) / name for name in dirnames + filenames)
+    return sorted(found)
+
+
 def output_digest(path: Path) -> str:
     """Fingerprint installed bytes, link targets and permissions before the suite."""
     entries = []
-    paths = [path, *sorted(path.rglob("*"))] if path.is_dir() else [path]
+    paths = [path, *_output_entries(path)] if path.is_dir() else [path]
     for item in paths:
         mode = item.lstat().st_mode
         if stat.S_ISLNK(mode):

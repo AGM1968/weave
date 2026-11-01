@@ -106,7 +106,7 @@ wv_ptu_edit_guard() (
     _ptu_source wv-resolve-project || exit 0
     for _lib in wv-validate wv-config wv-hook-common; do _ptu_source "$_lib" || true; done
     _ptu_source wv-resolve-runtime || exit 0
-    command -v _hc_refresh >/dev/null 2>&1 || { echo "⚠ Weave guard inactive: wv-hook-common.sh could not be loaded — run ./install.sh" >&2; exit 0; }; _hc_refresh
+    command -v _hc_refresh >/dev/null 2>&1 || { _ptu_root=$(git rev-parse --show-toplevel 2>/dev/null); _ptu_fix="wv self-update, then wv init-repo --update"; [ "$(git -C "$_ptu_root" ls-tree HEAD -- install.sh scripts/wv 2>/dev/null | wc -l)" -eq 2 ] && _ptu_fix="./install.sh"; echo "⚠ Weave guard inactive: wv-hook-common.sh could not be loaded — run $_ptu_fix (wv-376de3)" >&2; exit 0; }; _hc_refresh
 
     # Liveness heartbeat (wv-4efe06): the last tool call's time. Session start
     # compares it with stop-check's last stop record to tell a session that died
@@ -228,31 +228,45 @@ wv_ptu_claim_guard() (
             fi
 
             # Combined preflight (wv-7c28f4): evaluate ALL gates and report every
-            # unmet one in a single deny, instead of serial discovery across retries.
-            # Gate set and decisions are unchanged:
-            #   done_criteria missing → deny (node is unplanned)
-            #   alias missing         → deny (graph unreadable without short names)
-            #   premortem/risks missing → advisory (deny once, proceed allowed)
-            gates=""
+            # unmet one in a single answer, instead of serial discovery across retries.
+            #   done_criteria missing   → required: deny (node is unplanned)
+            #   alias missing           → required: deny (graph unreadable without short names)
+            #   premortem/risks missing → advisory: never denies (wv-6e4798)
+            # The advisory was listed among the "unmet gates" of the deny and told
+            # the agent to satisfy all of them, and with no other gate unmet it
+            # denied on its own on every retry: an advisory that blocked. It now
+            # rides along with a deny under its own heading, or comes back as
+            # context on a claim that proceeds.
+            required="" advisory=""
             if [[ "$HAS_SHIP_IT" == "false" ]]; then
-                gates="${gates}[1] done_criteria not set — run /ship-it, use --criteria= on wv add, or: wv update $NODE_ID --metadata='{\"done_criteria\":[...]}'. "
+                required="${required}[1] done_criteria not set — run /ship-it, use --criteria= on wv add, or: wv update $NODE_ID --metadata='{\"done_criteria\":[...]}'. "
             fi
             if [[ -z "$NODE_ALIAS" ]]; then
-                gates="${gates}[2] alias not set — graph is unreadable without short names: wv update $NODE_ID --alias=<short-name>. "
+                required="${required}[2] alias not set — graph is unreadable without short names: wv update $NODE_ID --alias=<short-name>. "
             fi
             if [[ "$HAS_PRE_MORTEM" == "false" ]]; then
-                gates="${gates}[3] risks/premortem not set (advisory) — consider /pre-mortem, or --risks= on wv add; proceed if already assessed. "
+                advisory="risks/premortem not set — consider /pre-mortem, or record them with --risks= on wv add or wv update $NODE_ID --metadata='{\"risks\":[...]}'."
             fi
-            if [[ -n "$gates" ]]; then
-                # Each unmet gate is its own rule's decision (wv-664b7f).
-                [[ "$HAS_SHIP_IT" == "false" ]] && _hc_observe claim_requires_done_criteria deny
-                [[ -z "$NODE_ALIAS" ]] && _hc_observe claim_requires_alias deny
-                [[ "$HAS_PRE_MORTEM" == "false" ]] && _hc_observe claim_premortem_advisory advisory
-                reason="Claim preflight for $NODE_ID ($NODE_TEXT) — unmet gates: $gates"
-                reason="${reason}Satisfy all in one pass, then re-run the claim."
+            # Each unmet gate is its own rule's decision (wv-664b7f).
+            [[ "$HAS_SHIP_IT" == "false" ]] && _hc_observe claim_requires_done_criteria deny
+            [[ -z "$NODE_ALIAS" ]] && _hc_observe claim_requires_alias deny
+            [[ -n "$advisory" ]] && _hc_observe claim_premortem_advisory advisory
+            if [[ -n "$required" ]]; then
+                reason="Claim preflight for $NODE_ID ($NODE_TEXT) — required before claiming: $required"
+                reason="${reason}Satisfy these, then re-run the claim."
+                [[ -n "$advisory" ]] && reason="$reason Advisory, does not block the claim: $advisory"
                 [[ -n "$IMPACT_LINE" ]] && reason="$reason $IMPACT_LINE"
                 jq -n --arg reason "$reason" \
                     '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":$reason}}'
+                exit 0
+            fi
+            if [[ -n "$advisory" ]]; then
+                # No decision, only context: the host's normal permission flow
+                # decides the claim, and the advice reaches the agent beside it.
+                context="Claim preflight advisory for $NODE_ID, not a requirement; the claim proceeds: $advisory"
+                [[ -n "$IMPACT_LINE" ]] && context="$context $IMPACT_LINE"
+                jq -n --arg context "$context" \
+                    '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":$context}}'
                 exit 0
             fi
         fi
@@ -349,7 +363,7 @@ wv_ptu_close_guard() (
             }
             NODE_TEXT=$(echo "$NODE_JSON" | jq -r '.text // empty' 2>/dev/null || echo "")
             NODE_META=$(echo "$NODE_JSON" | jq -r '.metadata // "{}"' 2>/dev/null || echo "{}")
-            NODE_TYPE=$(echo "$NODE_META" | jq -r '.type // "unknown"' 2>/dev/null || echo "unknown")
+            NODE_TYPE=$(echo "$NODE_META" | jq -r '.node_kind // .type // "unknown"' 2>/dev/null || echo "unknown")
             # Node not in local DB (e.g. command targets a remote machine via SSH) — allow passthrough.
             NODE_EXISTS=$(echo "$NODE_JSON" | jq -r '.id // empty' 2>/dev/null || echo "")
             if [[ -z "$NODE_EXISTS" ]]; then
@@ -735,6 +749,9 @@ wv_ptu_dedup_guard() (
     fi
 
     LOCK_FILE="${LOCK_DIR}/${LOCK_KEY}.lock"
+    # The lock keeps one line per field, so it stores the command's first line;
+    # a multi-line command would otherwise spill into the task-id line.
+    CMD_LINE1=${CMD%%$'\n'*}
 
     # ── Check for existing lock ────────────────────────────────────────────────
     # Lock file format (4 lines):
@@ -794,18 +811,25 @@ wv_ptu_dedup_guard() (
         # A command another PreToolUse hook blocks (e.g. the wv done verification
         # gate) never starts, so PostToolUse never clears its pending lock, and that
         # lock denied the corrected retry and every wv sync --gh for the whole grace
-        # period. Past SPAWN_WINDOW (which still covers two identical calls issued
-        # together, before either process exists) a pending lock denies only while
-        # its command is really running: the harness runs a tool command as
-        # `bash -c ... <command>`, so its first line shows in the process table.
+        # period. A pending lock denies only while its command is really running:
+        # the harness runs a tool command as `bash -c ... <command>`, so its first
+        # line shows in the process table. Inside SPAWN_WINDOW an identical command
+        # still denies unchecked, since two identical calls issued together arrive
+        # before either process exists; a different command is checked at once, so
+        # a retry corrected after a refusal is not denied for 10s (wv-5362e2).
         # ps is captured first so the search cannot match its own grep.
-        if [[ "$LOCK_PHASE" == "pending" && "$LOCK_AGE" -ge "$SPAWN_WINDOW" ]]; then
+        _dd_reason="already running — wait for the task-notification before re-issuing"
+        if [[ "$LOCK_PHASE" == "pending" ]] && { [[ "$LOCK_AGE" -ge "$SPAWN_WINDOW" ]] || [[ "$PREV_CMD" != "$CMD_LINE1" ]]; }; then
             _dd_needle=${PREV_CMD%%$'\n'*}
             _dd_needle=${_dd_needle:0:80}
             _dd_procs=$(ps -eo args= 2>/dev/null || true)
             if [[ -n "$_dd_procs" && -n "$_dd_needle" ]] && ! grep -qF -- "$_dd_needle" <<< "$_dd_procs"; then
                 LOCK_AGE=$GRACE_PERIOD   # never started: stale
             fi
+        elif [[ "$LOCK_PHASE" == "pending" ]]; then
+            # Unchecked, so the deny must not claim the earlier call is running.
+            # Constant text: the age is in the bracket, so the reason has no clock.
+            _dd_reason="the identical call has not been seen running yet; if another hook refused it, it never ran, so re-issue it once the lock is ${SPAWN_WINDOW}s old"
         fi
 
         if [[ "$LOCK_PHASE" == "pending" ]]; then
@@ -819,8 +843,8 @@ wv_ptu_dedup_guard() (
         if [[ "$LOCK_AGE" -lt "$THRESHOLD" ]]; then
             _hc_observe no_duplicate_inflight_command deny
             jq -n --arg key "$LOCK_KEY" --arg prev "$PREV_CMD" \
-                   --argjson age "$LOCK_AGE" --arg phase "$PHASE_LABEL" \
-                '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("Duplicate command blocked [\($key), \($age)s old, \($phase)]: already running — wait for the task-notification before re-issuing. Previous: \($prev)")}}'
+                   --argjson age "$LOCK_AGE" --arg phase "$PHASE_LABEL" --arg reason "$_dd_reason" \
+                '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("Duplicate command blocked [\($key), \($age)s old, \($phase)]: \($reason). Previous: \($prev)")}}'
             exit 0
         fi
         # Lock expired or stale pending — clear before atomic acquisition
@@ -834,7 +858,7 @@ wv_ptu_dedup_guard() (
 
     LOCK_CONTENT="$(date +%s)
 pending
-${CMD}"
+${CMD_LINE1}"
 
     if (set -o noclobber; printf '%s\n' "$LOCK_CONTENT" > "$LOCK_FILE") 2>/dev/null; then
         exit 0  # Lock acquired — allow command

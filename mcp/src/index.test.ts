@@ -766,6 +766,35 @@ describe("Weave MCP Server", () => {
       expect(result.content[0].text).toBeTruthy();
     });
 
+    it("weave_remember captures a memory that weave_memory_recall and weave_bootstrap return (wv-bff31b)", async () => {
+      const remembered = await client.request("tools/call", {
+        name: "weave_remember",
+        arguments: { text: "MCP memory fixture first sentence. MCP-MEMORY-BODY only in recall." },
+      });
+      expect(remembered.error).toBeUndefined();
+      const id = JSON.parse((remembered.result as { content: { text: string }[] }).content[0].text).id as string;
+      expect(id).toMatch(/^wv-[0-9a-f]+$/);
+
+      const recalled = await client.request("tools/call", { name: "weave_memory_recall", arguments: {} });
+      expect(recalled.error).toBeUndefined();
+      const memories = JSON.parse((recalled.result as { content: { text: string }[] }).content[0].text) as {
+        id: string;
+        text: string;
+      }[];
+      expect(memories.find((m) => m.id === id)?.text).toContain("MCP-MEMORY-BODY");
+
+      const boot = await client.request("tools/call", { name: "weave_bootstrap", arguments: {} });
+      expect(boot.error).toBeUndefined();
+      const memory = JSON.parse((boot.result as { content: { text: string }[] }).content[0].text).memory as {
+        count: number;
+        recall: string;
+        entries: { id: string; text: string }[];
+      };
+      expect(memory.recall).toBe("wv memory recall --agent=all --json");
+      const entry = memory.entries.find((e) => e.id === id);
+      expect(entry?.text).toBe("MCP memory fixture first sentence.");
+    });
+
     it("weave_overview should return composed overview sections", async () => {
       const policyPath = join(graphFixture.dir, ".weave", ".context_policy");
       rmSync(policyPath, { force: true });
@@ -3048,8 +3077,11 @@ describe("Weave MCP Server --scope=inspect", () => {
         "weave_quality_patterns",
         "weave_code_search",
         "weave_index",
+        "weave_memory_recall",
       ])
     );
+    // inspect is read-only: recall, never capture (wv-bff31b).
+    expect(toolNames).not.toContain("weave_remember");
     expect(tools).toHaveLength(CONTRACT.scopes.inspect.tool_count);
   });
 });

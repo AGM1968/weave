@@ -13,6 +13,11 @@
 # with no staged sources. The test tree must mirror the source tree by DIRECTORY
 # (filenames need not match — e.g. sampling/transect.py -> test_transect_sampler.py).
 #
+# The core assumes no language (wv-0ee3f4): declare RUNNER for yours. When the
+# gate runs this suite frozen, the recipes in .weave/gate-provision.json provide
+# its toolchain (PATH, VIRTUAL_ENV); ACTIVATE is only for manual runs and is
+# skipped when the gate has provided an environment.
+#
 # Origin: a consumer test-bed (wv-f67f6f) — full unit suite 6.2s/1385
 # tests -> ~1.1s for a single-directory change. Orthogonal to the test-map
 # glob/prefix support (wv-d74631, mapping terseness) and impact suite selection
@@ -22,16 +27,23 @@ cd "$(git rev-parse --show-toplevel)"
 
 # ---- CONFIG (edit per repo) ------------------------------------------------
 SRC_PREFIX="src/"                  # staged paths under here are impact-scoped
-SRC_REGEX='^src/.*\.py$'           # which staged files count as sources
-TEST_ROOT="tests/unit"             # root of the mirror test tree
-ACTIVATE="venv/bin/activate"       # sourced if it exists (virtualenv); else skipped
+SRC_REGEX='^src/'                  # which staged files count as sources
+TEST_ROOT="tests"                  # root of the mirror test tree
+ACTIVATE=""                        # manual runs only, e.g. ".venv/bin/activate"
 RUN_ENV=()                         # extra env, e.g. RUN_ENV=(DATABASE_URL="postgresql://...")
-RUNNER=(python -m pytest)          # base test command
-RUNNER_ARGS=(-q --tb=short -m "not integration and not slow")
+RUNNER=()                          # base test command, required; for example:
+#   RUNNER=(python -m pytest)      RUNNER_ARGS=(-q --tb=short)   SRC_REGEX='^src/.*\.py$'
+#   RUNNER=(npx vitest run)        RUNNER_ARGS=()                SRC_REGEX='^src/.*\.[jt]sx?$'
+#   RUNNER=(cargo test --)         RUNNER_ARGS=()                SRC_REGEX='^src/.*\.rs$'
+RUNNER_ARGS=()
 # ---------------------------------------------------------------------------
 
+if [ "${#RUNNER[@]}" -eq 0 ]; then
+    echo "[impact] RUNNER is not set: declare this repository's test command in the CONFIG block of $0" >&2
+    exit 2
+fi
 # shellcheck source=/dev/null
-[ -n "$ACTIVATE" ] && [ -f "$ACTIVATE" ] && . "$ACTIVATE"
+[ -z "${VIRTUAL_ENV:-}" ] && [ -n "$ACTIVATE" ] && [ -f "$ACTIVATE" ] && . "$ACTIVATE"
 
 run_full() {
     echo "[impact] full suite (no localized target resolved)"

@@ -104,8 +104,8 @@ expect_error "deleting a verdict emission turns the check red" "rule sync_shrink
     "$TMP/no-shrink-verdict.jsonl"
 expect_error "no journal at all proves no coverage" "has no observed verdict"
 expect_error "an operation with no rule and no declaration is silently uncovered" \
-    "operation link has no applicable rule and is not declared ungated" \
-    "$JOURNAL" "$CELLS" --contract "$(contract_with '.coverage.ungated |= map(select(.operation != "link"))')"
+    "operation unlink has no applicable rule and is not declared ungated" \
+    "$JOURNAL" "$CELLS" --contract "$(contract_with '.coverage.ungated |= map(select(.operation != "unlink"))')"
 expect_error "an operation declared ungated that a rule governs is a contradiction" \
     "operation delete is declared ungated" \
     "$JOURNAL" --contract "$(contract_with '.coverage.ungated += [{"operation":"delete","reason":"a deliberately wrong declaration"}]')"

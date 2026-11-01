@@ -424,7 +424,9 @@ f3=$($WV add "Fix via supersedes")
 
 $WV link "$f1" "$p1" --type=addresses >/dev/null 2>&1
 $WV link "$f2" "$p2" --type=implements >/dev/null 2>&1
-$WV link "$f3" "$p3" --type=supersedes >/dev/null 2>&1
+# supersedes runs old -> new: the fix replaces the pitfall, so the pitfall is
+# the source (contracts/edge-types-v1.json; written fix -> pitfall until wv-76b361)
+$WV link "$p3" "$f3" --type=supersedes >/dev/null 2>&1
 
 # All should be addressed (--all: default omits addressed entries)
 json_output=$($WV audit-pitfalls --all --json 2>&1)

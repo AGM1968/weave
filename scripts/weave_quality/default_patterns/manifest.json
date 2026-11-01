@@ -2,9 +2,7 @@
   "format": "weave.quality-default-patterns-manifest.v1",
   "rules": {
     "bare-except-pass.yaml": "b8e20c7ce1a7b42c5cc7658a0f327ad215a3df55829e7a306eed42e27145880b",
-    "git-listing-rename-blind.yaml": "489c47999374a99b03c95b1daf6dd39d370452526e8df46b59a20f8634393d77",
-    "live-db-file-operation.yaml": "28b254655afba4faad88594daaa646481db53db0c5372a27f51458eed179f319",
-    "lookup-skips-beside-self.yaml": "7ab6c64f63344ed6a4d03a15af05bd6ff2e8e8c4d87c5e8e7fd5cf0cc260acfa",
+    "listing-glob-fails-open.yaml": "e0abc5b3313458bee2880a3b89666fc6bb2b885940ea17d17766bc5d8983c1f4",
     "prose-emphasis-hedge.yaml": "ceae00f71030f87161fdf6d5b9526876118a8dbc8c63968541af3d010072f569",
     "prose-register-review.yaml": "941a411d6cfa42fcfcf045625b95a2048445667d0e1efebc936ffdd47f635885",
     "subprocess-shell-true.yaml": "c5c12ca316ac47f2d0b081535326f81fa29de012bbc38f0e2c8f7099432324e2",

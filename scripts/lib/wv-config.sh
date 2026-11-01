@@ -165,7 +165,16 @@ if [ -n "$_WV_ENV_OVERRIDE_HOT_ZONE" ] && ! hot_zone_matches_repo "$_WV_ENV_OVER
     # named a database must get that database or an error, never another one.
     echo "wv: refusing to run: WV_HOT_ZONE/WV_DB names a hot zone owned by ${_WV_ENV_OVERRIDE_OWNER:-another repository}, not $REPO_ROOT" >&2
     echo "    override: $_WV_ENV_OVERRIDE_HOT_ZONE" >&2
-    echo "    unset WV_HOT_ZONE WV_DB to use this repository's graph, or point them at a hot zone for it" >&2
+    _wv_worktree_main=$(wv_shared_worktree_main "$REPO_ROOT" "${_WV_ENV_OVERRIDE_OWNER:-}")
+    if [ -n "$_wv_worktree_main" ]; then
+        # A linked worktree of the zone owner's repository (wv-ca1f94): the
+        # agent usually exported the main checkout's zone to share its graph.
+        echo "    this is a linked worktree of $_wv_worktree_main, and a linked worktree keeps its own" >&2
+        echo "    graph (wv-d88fed): a claim in the main checkout does not admit work here. In this" >&2
+        echo "    worktree: unset WV_HOT_ZONE WV_DB, then wv load, then wv work <id> (or wv add ... --status=active)" >&2
+    else
+        echo "    unset WV_HOT_ZONE WV_DB to use this repository's graph, or point them at a hot zone for it" >&2
+    fi
     return 1 2>/dev/null || exit 1
 fi
 

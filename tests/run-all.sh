@@ -81,6 +81,7 @@ declare -a FAST_SUITES=(
     "test-procedure-install-reconcile.sh:Procedure Install Reconciliation"
     "test-procedure-projection-ownership.sh:Procedure Projection Ownership + Integrity"
     "test-procedure-visibility.sh:Procedure Visibility Contract"
+    "test-repo-procedures.sh:Repository-Owned Procedures"
     "test-hook-suite-cwd.sh:Hook Suite Deleted-CWD Regression"
     "test-hook-stale-copy.sh:Git Hook Stale-Copy Guard"
     "test-hook-duration.sh:Git Hook Duration Helper"
@@ -137,6 +138,16 @@ declare -a FAST_SUITES=(
     "test-citation-drift.sh:Doc Citation Drift"
     "test-policy-contract.sh:Policy Rules Contract"
     "test-risk-level-authority.sh:risk_level Authority"
+    "test-status-authority.sh:status Authority"
+    "test-node-kind.sh:Node Kind Authority"
+    "test-edge-invariants.sh:Edge Invariants"
+    "test-db-size-guard.sh:DB Size Guard"
+    "test-quick-commit-hook.sh:Quick Commit Under Hook"
+    "test-close-time.sh:Derived Close Time"
+    "test-worktree-guidance.sh:Worktree Guidance"
+    "test-gate-provisioning-report.sh:Gate Provisioning Report"
+    "test-provision-retirement.sh:Provisioning Retirement"
+    "test-checkpoint-push-race.sh:Checkpoint Push Race"
     "test-work-claim-persistence.sh:Claim Persistence"
     "test-run-all-counts.sh:Aggregate Test Counts"
     "test-gate-measure.sh:Gate Measurement"
@@ -196,6 +207,7 @@ declare -a FAST_SUITES=(
     "test-cache-invalidation.sh:Context Cache Invalidation"
     "test-durability.sh:Durable Execution and Recovery"
     "test-gh-issue-body-bug.sh:Parent-Add Child-ID Regression"
+    "test-unreadable-graph.sh:Unreadable Graph Is Not Reported"
     "test-hook-common.sh:Shared Hook Library"
     "test-hook-dispatch.sh:Host-Neutral Hook Dispatch"
     "test-consumer-shellcheck.sh:Vendored Shell Files Under Consumer Lint"
@@ -424,7 +436,7 @@ if [ "$PARALLEL" = true ]; then
                     echo "    full output: $failed_log"
                 fi
             else
-                echo -e "  ${GREEN}✓${NC} $name: $passed/$tests tests"
+                echo -e "  ${GREEN}✓${NC} $name: $count_label"
                 rm -f "$suite_log"
             fi
         done

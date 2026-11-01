@@ -82,6 +82,38 @@ if ! "$WV" show "$child_id" >/dev/null 2>&1; then
     exit 1
 fi
 
+# wv-0ad534: stdout and JSON were always unambiguous, but a capture that merges
+# stderr and takes the first id read the parent: "Linked to parent <parent>"
+# came before "✓ <child>: <text>". The created line now leads, the link line
+# names the child first, and stdout and JSON are unchanged.
+fail() { echo "❌ FAIL: $1"; [ -n "${2:-}" ] && printf '    %s\n' "$2"; exit 1; }
+merged=$("$WV" add "Merged probe $$-$timestamp" --parent="$parent_id" --force 2>&1)
+out_id=$(node_id_from <<< "$merged")
+first_id=$(grep -oE 'wv-[a-f0-9]{6}' <<< "$merged" | sed -n 1p)
+[ -n "$out_id" ] && [ "$out_id" != "$parent_id" ] || fail "merged capture has a child id" "$merged"
+[ "$first_id" = "$out_id" ] || fail "the first id in a merged capture is the created node" "$merged"
+grep -qxF -- "✓ $out_id implements parent $parent_id" <<< "$merged" \
+    || fail "the link line names the child before the parent" "$merged"
+stdout_only=$("$WV" add "Stdout probe $$-$timestamp" --parent="$parent_id" --force 2>/dev/null)
+[[ "$stdout_only" =~ ^wv-[a-f0-9]{6}$ ]] || fail "stdout is the bare child id and nothing else" "$stdout_only"
+json_keys=$("$WV" add "Json probe $$-$timestamp" --parent="$parent_id" --force --json 2>/dev/null | jq -c 'keys')
+[ "$json_keys" = '["id","status","text"]' ] || fail "the JSON shape is unchanged" "$json_keys"
+echo "✓ a merged capture reads the child first; stdout and JSON unchanged"
+
+# A link that fails is not reported as made. The parent exists and validates;
+# the database refuses any implements edge into it.
+sqlite3 "$WV_DB" "CREATE TRIGGER zz_refuse_link BEFORE INSERT ON edges
+    WHEN NEW.target = '$parent_id' AND NEW.type = 'implements'
+    BEGIN SELECT RAISE(ABORT, 'link refused by test trigger'); END;"
+rc=0
+refused=$("$WV" add "Refused link $$-$timestamp" --parent="$parent_id" --force 2>&1) || rc=$?
+sqlite3 "$WV_DB" "DROP TRIGGER zz_refuse_link;"
+[ "$rc" -ne 0 ] || fail "wv add exits nonzero when the parent link fails" "$refused"
+grep -q 'implements parent' <<< "$refused" && fail "a failed link is not reported as made" "$refused"
+grep -qF -- "could not link it to parent $parent_id" <<< "$refused" \
+    || fail "the failure names the parent and the created node" "$refused"
+echo "✓ a failed parent link is refused, not reported as made"
+
 echo "✓ All checks passed"
 
 # Cleanup

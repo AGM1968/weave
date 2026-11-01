@@ -7,6 +7,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+# The node kinds a command may write: contracts/node-kinds-v1.json
+# command_writable (ontology S1, wv-f7dfd3); tests/test-node-kind.sh pins it.
+# A GitHub type label or form value outside it (bug, audit ...) names a change
+# type, not a kind, and wv refuses it as metadata.type.
+NODE_KINDS = frozenset(
+    {"epic", "feature", "task", "finding", "decision", "plan", "memory", "session_history"}
+)
+
 
 class Mode(str, Enum):
     """Sync execution mode.
@@ -94,8 +102,8 @@ class WeaveNode:
 
     @property
     def node_type(self) -> str:
-        """Node type (task, feature, epic, bug, etc.)."""
-        explicit = self.metadata.get("type")
+        """Node type: the node kind (node_kind, then its type mirror), else the text."""
+        explicit = self.metadata.get("node_kind") or self.metadata.get("type")
         if explicit:
             return str(explicit)
         if self.text.startswith("Epic:"):

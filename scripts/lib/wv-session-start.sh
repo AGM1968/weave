@@ -232,9 +232,9 @@ wv_session_start_context() {
     fi
     jq -n \
         --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --argjson active "$active_ids" \
+        --slurpfile active <(printf '%s' "$active_ids") \
         --argjson pid $$ \
-        '{ts: $ts, active: $active, pid: $pid}' \
+        '{ts: $ts, active: $active[0], pid: $pid}' \
         > "$sentinel" 2>/dev/null || rm -f "$sentinel"
 
     # Compressed work status (already formatted)

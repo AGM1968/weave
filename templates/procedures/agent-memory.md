@@ -24,6 +24,9 @@ wv memory scan --source=claude|codex|copilot|all
 wv memory import --source=claude --path=<DIR>
 wv memory import --source=codex [--path=<DB>]
 wv memory crystallize --dry-run
+wv memory review <id> --verdict=promote|merge|reject|verify --reason=<why> [--target=<active id>]
+wv memory review <active id> --verdict=graduate --reason=<why> --target=<repo path>
+wv memory review --apply [--dry-run]
 wv memory crystallize --apply-reviewed
 wv memory recall [--agent=current|all|<name>]
 wv memory render --agent=all|current|<agent>
@@ -32,11 +35,33 @@ wv memory render --agent=all|current|<agent>
 Imported memory starts as `mem_status=candidate`; it is excluded from both `recall` and `ready`.
 `crystallize --dry-run` classifies candidates without mutation. `--apply-reviewed` promotes only
 explicitly reviewed candidates, marks verified stale references as `stale`, and marks exact source
-hash collisions as `superseded`. Contradictory candidates remain candidates and create a review
-signal; fuzzy overlap is reported, never applied automatically.
+hash collisions as `superseded`. Contradictory candidates remain candidates and get one finding per
+pair; read both claims, correct or supersede the stale one, or close the finding when they agree,
+and the next run no longer holds the candidate back. Fuzzy overlap is reported, never applied
+automatically.
 
-Imports are idempotent: unchanged source hashes are skipped. The graph remains authoritative: import
-pulls in, crystallize curates, and render projects the active set back out.
+A reviewer records a verdict on each candidate with `wv memory review`. Recording changes nothing
+else; `review --apply` acts on the recorded verdicts. `promote` marks the candidate reviewed; the
+next `crystallize --apply-reviewed` then promotes it after its own checks. `merge` supersedes the
+candidate onto an existing active memory and lists it in that memory's `merge_from`, whose text the
+reviewer then amends. `reject` retires the candidate (`mem_status=rejected`) with its reason.
+`verify` leaves it a candidate until the claim is checked and a final verdict recorded.
+
+`graduate` is the one verdict on an active memory: the lesson now lives in one of the repository's
+own surfaces, named by `--target`. That is a procedure in `.weave/procedures/<id>.md`, a guide in
+`.weave/guides/<id>.md`, a detector in `.weave/patterns/<id>.yaml`, or a Markdown document git
+tracks. The target must resolve inside the repository and parse under its surface's contract, when
+the verdict is recorded and again when it is applied. Apply sets `mem_status=graduated` and
+`graduated_to`: render and `wv bootstrap` drop the memory, and `recall` still returns it.
+
+`wv doctor` warns when the rendered memory block exceeds `.weave/policy.conf`
+`[memory] block_budget_bytes` (default 8192) and names graduation candidates. It also flags memories
+that may hold time-bound state (pending or dated language, a cited node now done or gone) for
+re-verification. Neither warning changes a memory.
+
+Imports are idempotent: unchanged source hashes are skipped, Claude's `MEMORY.md` index is not
+imported, and a changed source supersedes its earlier candidate. The graph remains authoritative:
+import pulls in, crystallize curates, and render projects the active set back out.
 
 Active memory is append-only for claims. When a claim changes, record the new one with
 `wv remember "<text>" --supersedes=<id>`: the old memory stays as `mem_status=superseded` with
@@ -82,11 +107,17 @@ memory, and never promote or mutate memory. Import/review/promotion stay under t
 
 ## Harness Surfaces
 
-| Harness | Scan | Import                                | Render target                           |
-| ------- | ---- | ------------------------------------- | --------------------------------------- |
-| Claude  | yes  | `--source=claude --path=<memory dir>` | `CLAUDE.md`, `.claude/MEMORY.md`        |
-| Codex   | yes  | `--source=codex [--path=<DB>]`        | `.codex/weave.json`, `.codex/MEMORY.md` |
-| Copilot | yes  | unsupported                           | `.github/copilot-instructions.md`       |
+| Harness | Scan | Import                                | Render target                                                                 |
+| ------- | ---- | ------------------------------------- | ----------------------------------------------------------------------------- |
+| Claude  | yes  | `--source=claude --path=<memory dir>` | `CLAUDE.md`                                                                   |
+| Codex   | yes  | `--source=codex [--path=<DB>]`        | `.codex/weave.json`, `AGENTS.md` (when it has the block)                      |
+| Copilot | yes  | unsupported                           | `.github/copilot-instructions.md` (it also reads `AGENTS.md` and `CLAUDE.md`) |
+
+The projections carry an index: one line per memory, its `metadata.hook` or else its first sentence.
+A memory with `metadata.resident` set to `full` keeps its whole text. Read any memory in full with
+`wv memory recall --agent=all --json` or `wv show <id>`. `.claude/MEMORY.md` and `.codex/MEMORY.md`
+are no harness's instruction file and `--agent=all` no longer writes them; `--agent=claude-memory`
+or `--agent=codex-memory` still renders one on request.
 
 Claude’s legacy `/weave` skill remains a hand-written orchestration facade. It forwards memory
 policy here through `wv guide --procedure=agent-memory`; it is not generated from or replaced by

@@ -50,10 +50,25 @@ When yours outgrows them, name the extra headings in frontmatter, pipe-separated
 
     sections: The appended negation|Clause accretion|Exemplars from the corpus
 
+Separate names with `|`, not a comma: a comma is part of a name. A name starts with a letter or
+digit and holds up to 80 letters, digits, spaces and `, . : ' ( ) / -`.
+
 The vocabulary stays closed around that declaration. A heading you did not declare is an error, a
 declaration the body never uses is an error, a declaration may not restate one of the four fixed
 names, and a declared section may not be empty. Declared sections render after the fixed four, in
 the order your file puts them.
+
+## This repository's own violation types
+
+A lesson that holds only here can have a violation type of its own. Declare it on a detector in
+`.weave/patterns/<id>.yaml` with a top-level line:
+
+    violation_type: project:<name>
+
+`<name>` is lowercase letters and digits joined by single hyphens. The type is coached by
+`<name>.md` here, or `<name>.<language>.md`, which resolve as above; with neither, findings fall
+back to `_uncoached`. The type exists in this repository only: a finding elsewhere may not set it,
+and the shipped vocabulary never holds a `project:` type.
 
 ## Promotion
 
@@ -74,7 +89,7 @@ this directory:
 
 - `guide-validity` fails when a guide here does not parse, or parses but does not resolve where it
   is selected (for example a `.python.md` override whose `violation_type` names a different type),
-  and warns about a guide no catalogued type selects.
+  and warns about a guide no catalogued or declared type selects.
 - `guide-completeness` warns about canonical types that coach only through the `_uncoached`
   fallback.
 

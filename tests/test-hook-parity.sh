@@ -158,11 +158,12 @@ _wv_in() {
 }
 ACTIVE_ID=$(_wv_in "$BASE" add "Parity active node" --status=active --criteria="c1" --risks=low --force --json 2>/dev/null | jq -r '.id')
 BARE_ID=$(_wv_in "$BASE" add "Parity claim probe" --force --json 2>/dev/null | jq -r '.id')
+ADVISED_ID=$(_wv_in "$BASE" add "Parity advisory probe" --alias=parity-advised --criteria="c1" --force --json 2>/dev/null | jq -r '.id')
 CLOSE_ID=$(_wv_in "$BASE" add "Parity close probe" --criteria="c1" --risks=low --force \
     --metadata='{"commit":"0000000"}' --json 2>/dev/null | jq -r '.id')
 printf 'execute' > "$BASE/hot/.session_phase"
 rm -f "$BASE/hot/.session_epoch" "$BASE/hot/primary"
-check "the fixture has its nodes" test -n "$ACTIVE_ID" -a -n "$BARE_ID" -a -n "$CLOSE_ID"
+check "the fixture has its nodes" test -n "$ACTIVE_ID" -a -n "$BARE_ID" -a -n "$ADVISED_ID" -a -n "$CLOSE_ID"
 
 # _copy <setup> -- a fresh copy of the fixture, with <setup> run in it; prints
 # its dir. It runs in a command substitution, so no counter could name it.
@@ -300,6 +301,13 @@ parity "a write in the discover phase" PreToolUse \
 check "a write in the discover phase is denied" grep -q '^decision=deny.*discover' <<<"$PARITY_CLAUDE"
 parity "a claim of an unplanned node" PreToolUse "$(bash_of "wv work $BARE_ID")"
 check "a claim of an unplanned node is denied by the claim preflight" grep -qF -- "decision=deny|json|Claim preflight for $BARE_ID" <<<"$PARITY_CLAUDE"
+# wv-6e4798: missing risks alone is advice, not a requirement. Every host gets
+# the claim through with the advice as context; dispatch used to drop the
+# output of a guard that did not decide.
+parity "a claim missing only risks" PreToolUse "$(bash_of "wv work $ADVISED_ID")"
+check "a claim missing only risks is allowed" grep -qx 'decision=allow' <<<"$PARITY_CLAUDE"
+check "a claim missing only risks carries the advice as context" \
+    grep -qF -- "Claim preflight advisory for $ADVISED_ID, not a requirement; the claim proceeds" <<<"$PARITY_CLAUDE"
 parity "a close without verification evidence" PreToolUse "$(bash_of "wv done $CLOSE_ID")" \
     "sqlite3 \"\$C/hot/brain.db\" \"UPDATE nodes SET status='active' WHERE id='$CLOSE_ID';\""
 check "a close without verification evidence is denied" grep -qF -- "decision=deny|json|Run: wv done $CLOSE_ID" <<<"$PARITY_CLAUDE"

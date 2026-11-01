@@ -209,7 +209,7 @@ wv prune --age=168
 ```bash
 # Add default type to nodes without one
 for id in $(wv list --json --all | jq -r '.[] | select(.type == null) | .id'); do
-  wv update $id --metadata='{"type":"task","priority":3}'
+  wv update $id --kind=task --metadata='{"priority":3}'
   echo "Added default metadata to $id"
 done
 ```

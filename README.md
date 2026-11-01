@@ -18,7 +18,10 @@ latest stable release.
 - Git and optional GitHub issue synchronization;
 - shared workflow surfaces for Claude Code, Codex, Copilot, CLI, and MCP clients;
 - repository health, graph audits, code search, and prose-quality diagnostics;
-- reviewed promotion of quality findings into tracked remediation work.
+- reviewed promotion of quality findings into tracked remediation work;
+- repository-authored procedures, pattern rules, violation types and coaching guides that stay in
+  that repository;
+- graph memory shared by every host, with review, recall and graduation into repository surfaces.
 
 ## Requirements
 
@@ -41,8 +44,8 @@ A prerelease: download the source archive from its
 [GitHub release](https://github.com/AGM1968/weave/releases), then:
 
 ```bash
-tar -xzf weave-1.71.0-rc.14.tar.gz
-cd weave-1.71.0-rc.14
+tar -xzf weave-<version>.tar.gz
+cd weave-<version>
 ./install.sh --verify
 ```
 
@@ -84,8 +87,13 @@ git push
 
 `wv init-repo` installs pre-commit and pre-push hooks. A commit requires an active claim held by the
 committing actor. The hooks run the suites `.weave/test-map.conf` routes to the changed files, in
-the checkout, and record each gate in `~/.local/share/weave/gate_runs.jsonl`. Declared suite
-provisioning (`.weave/gate-provision.json`) is reserved for Weave's own repository in this release.
+your checkout, and record each gate in `~/.local/share/weave/gate_runs.jsonl`.
+
+`wv init-repo` proposes a suite declaration from your lockfiles as
+`.weave/gate-provision.proposed.json`. It is never adopted for you: rename it to
+`.weave/gate-provision.json` to run those suites against a snapshot of the staged tree in a private
+environment. `wv analyze gates` reports which routes still run in the checkout. Removing an adopted
+suite later needs a retirement record, which the refusal prints.
 
 ## Updating
 
@@ -98,6 +106,7 @@ wv doctor
 
 `wv doctor` reports the current actor and active claims held by other actors; review them before
 taking one over with `wv work <id> --force`. Install a prerelease from its archive as shown above.
+Each release's Upgrading notes in [CHANGELOG.md](CHANGELOG.md) list any one-time steps.
 
 ## Data and Repository Boundaries
 

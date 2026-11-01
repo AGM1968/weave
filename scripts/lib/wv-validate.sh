@@ -88,7 +88,10 @@ validate_metadata_key() {
 # Status Validation
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Valid node statuses (tight enum)
+# Valid node statuses (tight enum). Every one must be in the status enum of
+# contracts/node-field-registry-v1.json, which the Delta v2 writer and replayer
+# enforce: blocked-external was outside it, so each move into or out of it lost
+# its v2 sidecar (wv-38825f). tests/test-status-authority.sh pins the copies.
 VALID_STATUSES="todo active done blocked blocked-external"
 
 # Validate node status against allowed enum
@@ -132,6 +135,114 @@ validate_metadata_risk_level() {
     value=$(printf '%s' "$1" | jq -r 'if type == "object" and has("risk_level") and .risk_level != null
         then (.risk_level | tostring) else empty end' 2>/dev/null) || return 0
     [ -z "$value" ] || validate_risk_level "$value" "${2:-metadata} risk_level"
+}
+
+# Node kinds (ontology S1, wv-f7dfd3). The authority is contracts/node-kinds-v1.json;
+# tests/test-node-kind.sh pins these copies to it. The kind is stored in
+# metadata.node_kind (metadata.kind is already the memory category) and mirrored
+# to metadata.type for one release, so the generated type column, and an older
+# wv reading the same committed graph, agree with it. unknown is written only by
+# the backfill: it records that a node carried no evidence of its kind.
+VALID_NODE_KINDS="epic feature task finding decision plan memory session_history unknown"
+WRITABLE_NODE_KINDS="epic feature task finding decision plan memory session_history"
+
+# jq definitions shared by creation and the backfill. A text prefix is a leading
+# word followed by ( or :, in any case (epic(, Fix:). wv_prefix_kind maps a
+# node's text to the kind its prefix names, or null when the text has none; a
+# prefix the map does not name (fix(, docs:, finding( ...) is a task (D1, D2).
+# wv_kinds is every kind, unknown included, so a second backfill keeps it.
+# wv_backfill_kind applies the backfill precedence to one node row:
+# node_kind, then type (a value outside the kinds becomes task), then the text
+# prefix, then unknown. disagrees marks a prefix that names a different kind;
+# mirror_mismatch marks a type an older wv changed without node_kind.
+WV_KIND_JQ_DEFS='
+def wv_kinds: ["epic", "feature", "task", "finding", "decision", "plan", "memory", "session_history", "unknown"];
+def wv_kind_prefix_map: {epic: "epic", feature: "feature", decision: "decision", decide: "decision",
+    plan: "plan", proposal: "plan", spec: "plan", milestone: "plan"};
+def wv_text_prefix: ([(. // "") | ascii_downcase | capture("^\\s*(?<p>[a-z_-]+)[(:]")][0].p // null);
+def wv_prefix_kind: wv_text_prefix as $p | if $p == null then null else (wv_kind_prefix_map[$p] // "task") end;
+def wv_backfill_kind:
+    (.metadata | if type == "string" then (fromjson? // {}) else (. // {}) end) as $m
+    | (.text | wv_text_prefix) as $p
+    | (.text | wv_prefix_kind) as $pk
+    | (if ($m.node_kind | type) == "string" and (wv_kinds | index($m.node_kind)) != null
+          then {kind: $m.node_kind, source: "node_kind"}
+       elif $m.type != null then
+          (if (wv_kinds | index($m.type | tostring)) != null then {kind: ($m.type | tostring), source: "type"}
+           else {kind: "task", source: "type_outside_kinds"} end)
+       elif $pk != null then {kind: $pk, source: "text_prefix"}
+       else {kind: "unknown", source: "no_evidence"} end) as $r
+    | {id, status, prefix: $p, type: $m.type, kind: $r.kind, source: $r.source,
+       write: ($m.node_kind != $r.kind or $m.type != $r.kind),
+       mirror_mismatch: ($m.node_kind != null and $m.type != null and $m.node_kind != $m.type),
+       disagrees: ($p != null and ((((wv_kinds | index($p)) != null) and $p != $r.kind)
+                                   or ($pk != "task" and $pk != $r.kind)))};
+'
+
+# validate_node_kind <value> <source-label> — a kind a command may write.
+validate_node_kind() {
+    local value="$1" source="${2:-kind}" valid
+    for valid in $WRITABLE_NODE_KINDS; do
+        [ "$value" = "$valid" ] && return 0
+    done
+    echo -e "${RED}Error: $source must be one of ${WRITABLE_NODE_KINDS// /|} (got: $value)${NC}" >&2
+    echo "  A change type (fix, bug, refactor, docs ...) belongs in the text prefix, not the kind." >&2
+    return 1
+}
+
+# wv_kind_patch_metadata <metadata-json> <source-label>
+# Normalise a metadata document that touches the kind: node_kind or type alone
+# is mirrored to the other, the two must agree, the value must be writable, and
+# neither may be null (a merge patch would remove it). A document touching
+# neither is echoed unchanged.
+wv_kind_patch_metadata() {
+    local metadata="$1" source="${2:-metadata}" verdict kind
+    verdict=$(printf '%s' "$metadata" | jq -c '
+        (has("node_kind")) as $hk | (has("type")) as $ht
+        | if ($hk | not) and ($ht | not) then {touch: false}
+          elif ($hk and .node_kind == null) or ($ht and .type == null) then {error: "null"}
+          elif $hk and $ht and .node_kind != .type then {error: "conflict", node_kind: .node_kind, type: .type}
+          else {touch: true, kind: ((if $hk then .node_kind else .type end) | tostring)} end') || {
+        echo -e "${RED}Error: could not read the kind in ${source}${NC}" >&2
+        return 1
+    }
+    case "$(jq -r '.error // (if .touch then "touch" else "none" end)' <<< "$verdict")" in
+        none) printf '%s\n' "$metadata"; return 0 ;;
+        null)
+            echo -e "${RED}Error: ${source} cannot remove the node kind (node_kind/type set to null)${NC}" >&2
+            return 1 ;;
+        conflict)
+            echo -e "${RED}Error: ${source} sets node_kind and type to different values ($(jq -r '"\(.node_kind) vs \(.type)"' <<< "$verdict"))${NC}" >&2
+            echo "  type mirrors node_kind; set one of them, or use --kind=<kind>." >&2
+            return 1 ;;
+    esac
+    kind=$(jq -r '.kind' <<< "$verdict")
+    validate_node_kind "$kind" "${source} node kind" || return 1
+    printf '%s' "$metadata" | jq -c --arg k "$kind" '. + {node_kind: $k, type: $k}'
+}
+
+# wv_kind_create_metadata <metadata-json> <text> <kind-flag> <source-label>
+# The metadata a new node is stored with: its kind is --kind, else the
+# metadata's node_kind or type, else the kind the text prefix names, else task
+# (contracts/node-kinds-v1.json create.precedence).
+wv_kind_create_metadata() {
+    local metadata="$1" text="$2" kind_flag="$3" source="${4:-metadata}" kind
+    if [ -n "$kind_flag" ]; then
+        validate_node_kind "$kind_flag" "--kind" || return 1
+        if ! printf '%s' "$metadata" | jq -e --arg k "$kind_flag" \
+            '[.node_kind, .type] | map(select(. != null)) | all(. == $k)' >/dev/null 2>&1; then
+            echo -e "${RED}Error: --kind=$kind_flag disagrees with the kind in ${source}${NC}" >&2
+            return 1
+        fi
+        printf '%s' "$metadata" | jq -c --arg k "$kind_flag" '. + {node_kind: $k, type: $k}'
+        return
+    fi
+    if printf '%s' "$metadata" | jq -e 'has("node_kind") or has("type")' >/dev/null 2>&1; then
+        wv_kind_patch_metadata "$metadata" "$source"
+        return
+    fi
+    kind=$(jq -rn --arg t "$text" "$WV_KIND_JQ_DEFS"' $t | wv_prefix_kind // "task"') || return 1
+    printf '%s' "$metadata" | jq -c --arg k "$kind" '. + {node_kind: $k, type: $k}'
 }
 
 # _wv_reject_arg <command> <argument>
@@ -201,6 +312,26 @@ if [ -f "$_wv_vocabulary_projection" ]; then
 fi
 unset _wv_vocabulary_projection
 : "${FINDING_VIOLATION_TYPES:=historical:defect upstream:management-gap upstream:logic-bug upstream:schema-drift repo:hygiene repo:regression test:gap design:flaw measurement-gap}"
+# A repository's own types (wv-60bf88): each top-level .weave/patterns/*.yaml
+# declaring violation_type: project:<name> adds it, in this repository only.
+# Builtins only, as every wv call sources this file; weave_quality's
+# guides.project_types reads the same declaration for coaching.
+if [ -n "${REPO_ROOT:-}" ] && [ -d "$REPO_ROOT/.weave/patterns" ]; then
+    for _wv_pattern_file in "$REPO_ROOT"/.weave/patterns/*.yaml; do
+        [ -f "$_wv_pattern_file" ] || continue
+        mapfile -t _wv_pattern_lines < "$_wv_pattern_file" || continue
+        for _wv_pattern_line in "${_wv_pattern_lines[@]}"; do
+            if [[ "$_wv_pattern_line" =~ ^violation_type:[[:space:]]*(project:[a-z0-9]+(-[a-z0-9]+)*)[[:space:]]*$ ]]; then
+                case " $FINDING_VIOLATION_TYPES " in
+                    *" ${BASH_REMATCH[1]} "*) ;;
+                    *) FINDING_VIOLATION_TYPES+=" ${BASH_REMATCH[1]}" ;;
+                esac
+                break
+            fi
+        done
+    done
+    unset _wv_pattern_file _wv_pattern_lines _wv_pattern_line
+fi
 
 # Valid session phase values — single source of truth.
 # Written via wv_set_phase(); read by pre-action.sh + context-guard.sh.
