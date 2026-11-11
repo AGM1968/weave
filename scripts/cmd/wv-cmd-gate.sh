@@ -680,15 +680,29 @@ _gate_log_path() {
 }
 
 # _gate_log_append <phase> <gate_id> <exit> <duration_ms> <estimate_ms> <suites_csv> <sha> [started_ms]
+#                  [suite_modes] [lanes_json] [lanes_ms] [lanes_started_ms]
+#                  [pressure_start] [pressure_end]
 # One JSONL line per gate INVOCATION: its wall time, what it ran, what it
 # expected to take, and how it ended. Best-effort like the suite log.
 # started_ms (wv-4666cb) is the gate's start in epoch ms, the origin its suites'
 # ended_ms are measured from; absent where unknown. suite_modes ("suite=mode,...")
 # becomes provisioning: {suite: frozen|checkout}, each selected route's mode,
 # which wv analyze gates and wv doctor count (transition rule 5, wv-0ee3f4).
+# lanes_json (wv-3dbc11) is the candidate lanes' [{path, reused, ms, jobs, rc}];
+# with lanes_ms (their wall time) and lanes_started_ms it makes the time after
+# the protected pass attributable: protected_ms = lanes_started_ms - started_ms.
+# A gate that ran no lane carries none of these fields.
+# pressure_start and pressure_end (wv-58b10e) are "cpu,io": the host's
+# cumulative PSI some-stall totals in microseconds when the gate started and
+# ended (gate_pressure_totals, wv-gate-pool.sh). Together they become pressure: {cpu_some_ms, io_some_ms, cpu_some_share, io_some_share},
+# the time some task stalled on CPU or IO during the gate and its share of the
+# gate's wall time. The gate's own parallel suites contend too, so a share is
+# host load including the gate, not interference alone. Absent where either
+# reading is missing or the counters went backwards.
 _gate_log_append() {
     local phase="$1" gate_id="$2" exit_code="$3" duration_ms="$4" estimate_ms="$5" suites="$6" sha="$7"
-    local started_ms="${8:-}" suite_modes="${9:-}"
+    local started_ms="${8:-}" suite_modes="${9:-}" lanes="${10:-}" lanes_ms="${11:-}" lanes_started_ms="${12:-}"
+    local pressure_start="${13:-}" pressure_end="${14:-}" pressure=null
     _durable_log_writable || return 0
     local log_path; log_path=$(_gate_log_path)
     mkdir -p "$(dirname "$log_path")" 2>/dev/null || return 0
@@ -696,6 +710,19 @@ _gate_log_append() {
     case "$duration_ms" in ''|*[!0-9]*) duration_ms=0 ;; esac
     case "$estimate_ms" in ''|*[!0-9]*) estimate_ms=null ;; esac
     case "$started_ms" in ''|0|*[!0-9]*) started_ms=null ;; esac
+    case "$lanes_ms" in ''|*[!0-9]*) lanes_ms=null ;; esac
+    case "$lanes_started_ms" in ''|0|*[!0-9]*) lanes_started_ms=null ;; esac
+    jq -e 'type == "array" and length > 0' >/dev/null 2>&1 <<< "$lanes" || lanes=null
+    if [[ "$pressure_start" =~ ^[0-9]+,[0-9]+$ ]] && [[ "$pressure_end" =~ ^[0-9]+,[0-9]+$ ]]; then
+        pressure=$(jq -cn --arg s "$pressure_start" --arg e "$pressure_end" --argjson d "$duration_ms" '
+            ($s | split(",") | map(tonumber)) as $a | ($e | split(",") | map(tonumber)) as $b
+            | if $b[0] < $a[0] or $b[1] < $a[1] then null
+              else (($b[0] - $a[0]) / 1000 | floor) as $c | (($b[1] - $a[1]) / 1000 | floor) as $i
+                   | {cpu_some_ms:$c, io_some_ms:$i}
+                     + (if $d > 0 then {cpu_some_share:($c / $d * 1000 | round / 1000),
+                                        io_some_share:($i / $d * 1000 | round / 1000)} else {} end)
+              end') || pressure=null
+    fi
     local repo=""
     [ -n "${REPO_ROOT:-}" ] && repo=$(basename "$REPO_ROOT")
     jq -cn \
@@ -705,12 +732,21 @@ _gate_log_append() {
         --argjson exit "$exit_code" --argjson duration_ms "$duration_ms" \
         --argjson estimate_ms "$estimate_ms" --arg suites "$suites" --arg sha "$sha" \
         --argjson started_ms "$started_ms" --arg suite_modes "$suite_modes" \
+        --argjson lanes "$lanes" --argjson lanes_ms "$lanes_ms" --argjson lanes_started_ms "$lanes_started_ms" \
+        --argjson pressure "$pressure" \
         '{ts:$ts, repo:$repo, phase:$phase, gate_id:$gate_id, exit:$exit, duration_ms:$duration_ms,
           estimate_ms:$estimate_ms, suites:($suites | split(",") | map(select(. != ""))), sha:$sha}
          + (if $execution_mode != "" then {execution_mode:$execution_mode} else {} end)
          + (if $started_ms != null then {started_ms:$started_ms} else {} end)
          + ($suite_modes | split(",") | map(select(test("^[^=]+=(frozen|checkout)$")) | split("="))
-            | if length > 0 then {provisioning: (map({key: .[0], value: .[1]}) | from_entries)} else {} end)' \
+            | if length > 0 then {provisioning: (map({key: .[0], value: .[1]}) | from_entries)} else {} end)
+         + (if $lanes != null then {lanes:$lanes} else {} end)
+         + (if $lanes != null and $lanes_ms != null then {lanes_ms:$lanes_ms} else {} end)
+         + (if $lanes != null and $lanes_started_ms != null then {lanes_started_ms:$lanes_started_ms}
+              + (if $started_ms != null and $lanes_started_ms >= $started_ms
+                 then {protected_ms:($lanes_started_ms - $started_ms)} else {} end)
+            else {} end)
+         + (if $pressure != null then {pressure:$pressure} else {} end)' \
         >> "$log_path" 2>/dev/null || true
 }
 
@@ -736,6 +772,7 @@ cmd_test_record() {
     local files="" exit_code="0" commit_sha="" duration_ms="0" estimate_ms=""
     local gate_mode=false gate_phase="${WV_GATE_PHASE:-}" gate_id="${WV_GATE_ID:-}" gate_suites="" gate_suite_modes=""
     local start_fps="" start_given=false inputs_key="" started_ms="" ended_ms="" snapshot_plan=""
+    local gate_lanes="" gate_lanes_ms="" gate_lanes_started_ms="" gate_pressure_start="" gate_pressure_end=""
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -755,13 +792,18 @@ cmd_test_record() {
             --gate-id=*)  gate_id="${arg#--gate-id=}" ;;
             --suites=*)   gate_suites="${arg#--suites=}" ;;
             --suite-modes=*) gate_suite_modes="${arg#--suite-modes=}" ;;
+            --lanes=*)    gate_lanes="${arg#--lanes=}" ;;
+            --lanes-ms=*) gate_lanes_ms="${arg#--lanes-ms=}" ;;
+            --lanes-started-ms=*) gate_lanes_started_ms="${arg#--lanes-started-ms=}" ;;
+            --pressure-start=*) gate_pressure_start="${arg#--pressure-start=}" ;;
+            --pressure-end=*) gate_pressure_end="${arg#--pressure-end=}" ;;
             *) ;;
         esac
     done
 
     if [ -z "$suite" ]; then
         echo "Usage: wv test-record <suite> [--files=a,b] [--exit=N] [--commit=SHA] [--duration=MS] [--estimate=MS] [--started-ms=EPOCH_MS] [--ended-ms=EPOCH_MS]" >&2
-        echo "       wv test-record gate --gate --phase=P --gate-id=ID --exit=N --duration=MS [--estimate=MS] [--suites=a,b] [--started-ms=EPOCH_MS]" >&2
+        echo "       wv test-record gate --gate --phase=P --gate-id=ID --exit=N --duration=MS [--estimate=MS] [--suites=a,b] [--started-ms=EPOCH_MS] [--lanes=JSON --lanes-ms=MS --lanes-started-ms=EPOCH_MS] [--pressure-start=CPU_US,IO_US --pressure-end=CPU_US,IO_US]" >&2
         return 1
     fi
 
@@ -775,7 +817,8 @@ cmd_test_record() {
     if [ "$gate_mode" = true ]; then
         [ -z "$commit_sha" ] && commit_sha=$(git rev-parse --short HEAD 2>/dev/null || echo "")
         _gate_log_append "${gate_phase:-manual}" "$gate_id" "$exit_code" "$duration_ms" \
-            "$estimate_ms" "$gate_suites" "$commit_sha" "$started_ms" "$gate_suite_modes"
+            "$estimate_ms" "$gate_suites" "$commit_sha" "$started_ms" "$gate_suite_modes" \
+            "$gate_lanes" "$gate_lanes_ms" "$gate_lanes_started_ms" "$gate_pressure_start" "$gate_pressure_end"
         return 0
     fi
 

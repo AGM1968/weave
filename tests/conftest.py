@@ -24,7 +24,7 @@ def _weave_gh_hot_zone_check_off(request: Any, monkeypatch: Any) -> None:
     """
     if not request.node.path.name.startswith("test_weave_gh"):
         return
-    import weave_gh.data  # pylint: disable=import-outside-toplevel
+    import weave_gh.data  # pylint: disable=import-outside-toplevel  # noqa: PLC0415
 
     def allow_hot_zone(*_a: object) -> None:
         """Isolate unit tests from the live graph's hot-zone check."""

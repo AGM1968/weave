@@ -1,6 +1,8 @@
 ---
 id: blindspot-pass
-description: "Run a bounded unknown-taxonomy pass before implementation; separate facts, known gaps, prior learnings, and candidate blind spots."
+description:
+  "Run a bounded unknown-taxonomy pass before implementation; separate facts, known gaps, prior
+  learnings, and candidate blind spots."
 fallback: "wv guide --procedure=blindspot-pass"
 adapters: [claude, codex, copilot]
 visibility: shared
@@ -25,10 +27,14 @@ cross-surface risk.
    - `unknown_unknown_candidates`: impact-derived or heuristic candidates that need probes.
 5. Probe candidates cheaply before promoting them. Do not create a blocking finding from a candidate
    unless evidence lands.
+   - When the task fixes a failure that has gone on for a long time, list every step that runs after
+     the failure point. None of them has run since the failure began: each is a candidate. Run each
+     one unstubbed, under adverse conditions (an unreachable remote, the host's time budget, a cold
+     cache), before closing. See the long-standing failure example below.
 6. If evidence confirms a real defect or risk, promote it to `type=finding` metadata and use a
    `blocks` edge only after the finding has meaning, probe, evidence, and valid `finding.*` fields.
-7. Close with a learning that records the transition: dismissed, promoted to finding, resolved,
-   or promoted to procedure.
+7. Close with a learning that records the transition: dismissed, promoted to finding, resolved, or
+   promoted to procedure.
 
 ## Release Example
 
@@ -40,6 +46,15 @@ wv discover <release-node> --json |
 If the report surfaces a release-note sanitizer candidate, probe with the release dry-run or fake
 `gh` wrapper before publishing. A clean probe dismisses the candidate. A leaked node id promotes it
 to a finding and may block the release node.
+
+## Long-standing Failure Example
+
+The session-end routine was killed by a 1.5 s host budget on every exit for eight months
+(wv-a32e69). Fixing the kill meant its later steps would run again for the first time since. Listing
+them showed the local sync's auto-checkpoint pull: run against an unreachable remote it took 33 s
+(five retries with backoff), past the new 30 s budget. The fix passed `WV_CHECKPOINT_PULL=0` and the
+suite gained a case that runs the routine itself against an unreachable remote. Without the list,
+the fix would have replaced one silent kill with another.
 
 ## MCP Example
 

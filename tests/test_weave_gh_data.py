@@ -91,6 +91,22 @@ class TestGetWeaveNodes:
     def test_empty_graph_returns_empty(self, _mock: Any) -> None:
         assert get_weave_nodes() == []
 
+    @patch("weave_gh.data.wv_cli", return_value="[]")
+    def test_all_nodes_by_default(self, mock: Any) -> None:
+        get_weave_nodes()
+        mock.assert_called_once_with("list", "--all", "--json-v2")
+
+    @patch("weave_gh.data.wv_cli", return_value="[]")
+    def test_ids_list_only_those_nodes(self, mock: Any) -> None:
+        """wv-26fd0b: a caller needing a few nodes asks wv list --ids, not every node."""
+        get_weave_nodes(ids=["wv-aaaaaa", "wv-bbbbbb"])
+        mock.assert_called_once_with("list", "--ids=wv-aaaaaa,wv-bbbbbb", "--json-v2")
+
+    @patch("weave_gh.data.wv_cli", return_value="[]")
+    def test_empty_ids_reads_nothing(self, mock: Any) -> None:
+        assert not get_weave_nodes(ids=[])
+        mock.assert_not_called()
+
     @pytest.mark.parametrize(
         "reply",
         ["", "not-json", '{"not": "a list"}', subprocess.CalledProcessError(1, "wv")],

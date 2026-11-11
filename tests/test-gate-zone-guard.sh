@@ -93,14 +93,17 @@ EOF
 # holder: a sibling pool's suite (wv-7061a0). It makes a temp repository's
 # zone, says so, and holds it until released, then removes both, as
 # test-budget-location.sh did while another lane's guard read its zones.
+# Its hold bound is minutes, not seconds: under a loaded gate (four lanes on
+# four slots) this pool's own run outlasted a 60 s hold, and the sibling's
+# zone was gone before the precondition looked.
 cat > "$FAKE/tests/holder.sh" <<EOF
 export WV_TEST_HOT_ZONE_ROOT="$T/zones"
 d=\$(mktemp -d); r="\$d/repo"; mkdir -p "\$r"; git -C "\$r" init -q
 (cd "\$r" && WV_CONFIG_DIR="\$d/cfg" "$ROOT/scripts/wv" init >/dev/null 2>&1)
 (cd "\$r" && WV_CONFIG_DIR="\$d/cfg" "$ROOT/scripts/wv" status >/dev/null 2>&1)
 z=\$(cd "\$r" && WV_CONFIG_DIR="\$d/cfg" "$ROOT/scripts/wv" hotzone db 2>/dev/null); z=\${z%/*}
-printf '%s\n' "\$z" > "$T/held"
-n=0; while [ ! -f "$T/release" ] && [ \$n -lt 600 ]; do sleep 0.1; n=\$((n + 1)); done
+printf '%s\n' "\$z" > "$T/held.tmp" && mv "$T/held.tmp" "$T/held"
+n=0; while [ ! -f "$T/release" ] && [ \$n -lt 6000 ]; do sleep 0.1; n=\$((n + 1)); done
 rm -rf "\$d" "\$z"
 EOF
 # waiter: this pool's suite, which runs while the sibling's zone is held.
@@ -173,6 +176,10 @@ echo "== a sibling pool's in-flight zone does not fail this pool (wv-7061a0)"
 rm -f "$T/held" "$T/release"
 gate holder.sh > "$T/sibling.out" 2>&1 &
 _zg_sib=$!
+# The sibling must hold its zone before this pool starts; under load its pool
+# took longer than the waiter's own 60 s wait, which then failed this pool
+# for want of a precondition, not a defect (lane of wv-58b10e, 2026-11-05).
+n=0; while [ ! -f "$T/held" ] && kill -0 "$_zg_sib" 2>/dev/null && [ $n -lt 6000 ]; do sleep 0.1; n=$((n + 1)); done
 out=$(gate waiter.sh)
 check "(precondition) the sibling's zone was live, its owner present, while this pool ran" "present present" \
     "$(z=$(cat "$T/held" 2>/dev/null); [ -n "$z" ] && [ -d "$z" ] && echo present || echo absent) $(z=$(cat "$T/held" 2>/dev/null); o=$(cat "$z/.repo_root" 2>/dev/null); [ -n "$o" ] && [ -d "$o" ] && echo present || echo absent)"

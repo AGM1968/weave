@@ -57,7 +57,8 @@ json_out=$("$WV" cutover --yes --json 2>/dev/null) || rc=$?
 
 # ─────────────────────────────────────────────────────────────────────────
 echo "--- do tracked work to advance lineage ---"
-id1=$("$WV" add "cutover node one" --status=active --criteria=c --risks=low 2>&1 | sed -nE 's/^✓ (wv-[a-f0-9]{6}): .*/\1/p')
+id1_out=$("$WV" add "cutover node one" --status=active --criteria=c --risks=low 2>&1)
+id1=$(sed -nE 's/^✓ (wv-[a-f0-9]{6}): .*/\1/;T;p;q' <<< "$id1_out")
 "$WV" "done" "$id1" --skip-verification >/dev/null 2>&1 || true
 "$WV" sync >/dev/null 2>&1
 seq_now=$(sqlite3 "$WV_DB" "SELECT COALESCE(MAX(lineage_seq),0) FROM nodes;" 2>/dev/null || echo 0)
@@ -120,7 +121,8 @@ status_field=$(printf '%s' "$json_out" | python3 -c "import json,sys; print(json
 
 # ─────────────────────────────────────────────────────────────────────────
 echo "--- --force restamps at the current high-water ---"
-id2=$("$WV" add "cutover node two" --status=active --criteria=c --risks=low 2>&1 | sed -nE 's/^✓ (wv-[a-f0-9]{6}): .*/\1/p')
+id2_out=$("$WV" add "cutover node two" --status=active --criteria=c --risks=low 2>&1)
+id2=$(sed -nE 's/^✓ (wv-[a-f0-9]{6}): .*/\1/;T;p;q' <<< "$id2_out")
 "$WV" "done" "$id2" --skip-verification >/dev/null 2>&1 || true
 "$WV" sync >/dev/null 2>&1
 rc=0
@@ -133,7 +135,8 @@ new_seq=$(sed -n 's/.*"lineage_seq"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1
 # ─────────────────────────────────────────────────────────────────────────
 echo "--- active-claim coordination gate ---"
 rm -f "$marker"
-id3=$("$WV" add "claimed during cutover attempt" --status=todo --criteria=c --risks=low 2>&1 | sed -nE 's/^✓ (wv-[a-f0-9]{6}): .*/\1/p')
+id3_out=$("$WV" add "claimed during cutover attempt" --status=todo --criteria=c --risks=low 2>&1)
+id3=$(sed -nE 's/^✓ (wv-[a-f0-9]{6}): .*/\1/;T;p;q' <<< "$id3_out")
 "$WV" work "$id3" >/dev/null 2>&1
 "$WV" sync >/dev/null 2>&1
 rc=0

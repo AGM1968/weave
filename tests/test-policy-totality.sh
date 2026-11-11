@@ -35,7 +35,9 @@ for suite in gates cells hooks; do
     if wait "${!pid_var}"; then
         ok "the $suite suite ran green ($(tail -1 "$TMP/$suite.log"))"
     else
-        bad "the $suite suite ran green" "$(grep '✗' "$TMP/$suite.log" | sed -n '1,5p')"
+        # Each failure with the detail lines its suite printed under it: the
+        # check name alone left a CI-only schema failure undiagnosable (rc.16).
+        bad "the $suite suite ran green" "$(grep -A3 '✗' "$TMP/$suite.log" | sed -n '1,20p')"
     fi
 done
 python3 "$POLICY" totality "$JOURNAL" "$CELLS" --hook-observations "$HOOKS" --summary "$SUMMARY" >"$TMP/report.json"

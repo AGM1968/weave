@@ -51,14 +51,14 @@ fi
 
 bash_identity() {
     # $1.. = env assignments, e.g. CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1
-    env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+    env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT -u PI_SESSION_ID -u AMP_CURRENT_THREAD_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SESSION_ID -u WV_SESSION_IDENTITY -u WV_SESSION_ID \
         "$@" bash -c "source '$RUNTIME_LIB'; resolve_agent_id" 2>/dev/null
 }
 
 mcp_identity() {
     # $1.. = env assignments
     local out
-    out=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+    out=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT -u PI_SESSION_ID -u AMP_CURRENT_THREAD_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SESSION_ID -u WV_SESSION_IDENTITY -u WV_SESSION_ID \
         "$@" WV_PATH="$REPO_ROOT/scripts/wv" WV_PROJECT_ROOT="$REPO_ROOT" \
         node "$MCP_DIST" --scope=lite --health-check 2>/dev/null)
     echo "$out" | jq -r '.agent_id'
@@ -81,7 +81,9 @@ claimed_by = sys.argv[1]
 _current_gh_login.cache_clear()
 node = WeaveNode(id="wv-test", text="t", status="active", metadata={"claimed_by": claimed_by})
 ok = subprocess.CompletedProcess([], returncode=0, stdout="octocat\n", stderr="")
-host, user = claimed_by.rsplit("-", 2)[-2:] if claimed_by.count("-") >= 2 else (claimed_by, "")
+import re
+base = re.sub(r"-(?:h[0-9a-f]{16}|s[A-Za-z0-9]{1,12})$", "", claimed_by)  # session suffix (wv-99978b, wv-24d57b)
+host, user = base.rsplit("-", 2)[-2:] if base.count("-") >= 2 else (base, "")
 with patch("weave_gh.phases.socket.gethostname", return_value=host), \
      patch("weave_gh.phases.getpass.getuser", return_value=user), \
      patch("weave_gh.phases._run", return_value=ok):
@@ -95,13 +97,33 @@ echo "Test: bash vs MCP identity parity (same env, same machine -> same string)"
 echo "==========================================================================="
 
 declare -a SCENARIOS=(
-    "claude alone|CLAUDE_CODE_SSE_PORT=1"
+    "IDE port alone is not claude (wv-08d7f9)|CLAUDE_CODE_SSE_PORT=1"
+    "codex with an inherited IDE port (wv-08d7f9)|CLAUDE_CODE_SSE_PORT=1 CODEX_THREAD_ID=01a12cd8-e777-7f00-a22c-5bdd105db0ba"
+    "claude in an IDE terminal|CLAUDE_CODE_SSE_PORT=1 CLAUDECODE=1 AI_AGENT=claude-code_2-1-318_agent CLAUDE_CODE_SESSION_ID=abc"
+    "pi with an inherited IDE port (wv-08d7f9)|CLAUDE_CODE_SSE_PORT=1 AI_AGENT=pi PI_SESSION_ID=019a5e2c-7d10-7000-8000-000000000001"
+    "amp with an inherited IDE port (wv-08d7f9)|CLAUDE_CODE_SSE_PORT=1 AI_AGENT=amp AMP_CURRENT_THREAD_ID=T-01a1a749-e3b6-723b-bd6c-86427007bbbe"
+    "pi inside claude: AI_AGENT outranks CLAUDECODE|CLAUDECODE=1 AI_AGENT=pi PI_SESSION_ID=p1"
+    "unknown AI_AGENT label, agnostic channel|AI_AGENT=Foo.Bar/9 WV_SESSION_ID=z"
+    "AI_AGENT label with no session channel|AI_AGENT=constructor"
+    "pi, session id missing|AI_AGENT=pi"
     "claude via CLAUDECODE alone (wv-50640a)|CLAUDECODE=1"
     "codex alone|CODEX_CI=1"
     "copilot alone|COPILOT_AGENT=1"
     "human (no markers)|"
-    "claude+codex ambiguous (wv-4d4c96: claude must win)|CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1"
-    "all three ambiguous (copilot must win)|CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 COPILOT_AGENT=1"
+    "claude+codex ambiguous (wv-4d4c96: claude must win)|CLAUDECODE=1 CODEX_CI=1"
+    "all ambiguous (copilot must win)|CLAUDECODE=1 CODEX_CI=1 COPILOT_AGENT=1 AI_AGENT=pi"
+    "claude session (wv-99978b)|CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=e2bbbaf2-606c-462b-8c2e-2d4305df0616"
+    "codex session (wv-99978b)|CODEX_THREAD_ID=019a-bc12-34"
+    "claude session, junk id digested whole|CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=a/b..c-d"
+    "codex UUIDv7 thread (wv-24d57b)|CODEX_THREAD_ID=01a12cd8-e777-7f00-a22c-5bdd105db0ba"
+    "codex UUIDv7 thread, same millisecond|CODEX_THREAD_ID=01a12cd8-e777-7a11-b33c-0123456789ab"
+    "claude session, opted out|CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=abc WV_SESSION_IDENTITY=0"
+    "claude session, explicit id wins|CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=abc WV_AGENT_ID=me"
+    "claude, session id missing|CLAUDECODE=1"
+    "copilot stays actor-owned|COPILOT_AGENT=1 CLAUDE_CODE_SESSION_ID=abc"
+    "agnostic channel, any host (WV_SESSION_ID)|WV_SESSION_ID=amp-T-1234"
+    "agnostic channel on copilot|COPILOT_AGENT=1 WV_SESSION_ID=xyz"
+    "agnostic channel wins over harness default|CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=abc WV_SESSION_ID=def"
 )
 
 for scenario in "${SCENARIOS[@]}"; do
@@ -118,14 +140,39 @@ for scenario in "${SCENARIOS[@]}"; do
     fi
 done
 
+# wv-24d57b: the session part digests the WHOLE id. Two UUIDv7 thread ids from
+# one millisecond share their first 12 characters (the timestamp), and ids that
+# differ only in separators reduce to one alnum string; each pair must split,
+# in bash and in MCP, and a known vector pins the digest across languages.
+for pair in "CODEX_THREAD_ID=01a12cd8-e777-7f00-a22c-5bdd105db0ba|CODEX_THREAD_ID=01a12cd8-e777-7a11-b33c-0123456789ab" \
+            "WV_SESSION_ID=a-b|WV_SESSION_ID=ab"; do
+    x="${pair%%|*}"; y="${pair#*|}"
+    if [ "$(bash_identity "$x")" != "$(bash_identity "$y")" ] && [ "$(mcp_identity "$x")" != "$(mcp_identity "$y")" ]; then
+        pass "distinct owners for $x and $y (bash and MCP)"
+    else
+        fail "distinct owners for $x and $y" "bash: $(bash_identity "$x") / $(bash_identity "$y")"
+    fi
+done
+vec=$(bash_identity CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=aaaaaaaa-1111-2222-3333-444444444444)
+if [[ "$vec" == *-h61eef8f68895bbdc ]]; then
+    pass "known vector: sha256(aaaaaaaa-1111-2222-3333-444444444444)[:16] = 61eef8f68895bbdc"
+else
+    fail "known vector for the session digest" "got: $vec"
+fi
+
 echo ""
 echo "Test: python recognizes bash-produced harness-prefixed identities as local"
 echo "============================================================================"
 
-for harness in claude codex copilot human; do
-    ident=$(bash_identity CLAUDE_CODE_SSE_PORT="$([ "$harness" = claude ] && echo 1)" \
-                            CODEX_CI="$([ "$harness" = codex ] && echo 1)" \
-                            COPILOT_AGENT="$([ "$harness" = copilot ] && echo 1)")
+for harness in claude codex copilot human pi amp foobar9; do
+    case "$harness" in
+        claude)  ident=$(bash_identity CLAUDECODE=1) ;;
+        codex)   ident=$(bash_identity CODEX_CI=1) ;;
+        copilot) ident=$(bash_identity COPILOT_AGENT=1) ;;
+        human)   ident=$(bash_identity) ;;
+        foobar9) ident=$(bash_identity AI_AGENT=Foo.Bar/9) ;;
+        *)       ident=$(bash_identity AI_AGENT="$harness") ;;
+    esac
     case "$ident" in
         "$harness"-*) : ;;
         *) fail "sanity: bash produced a $harness-prefixed identity" "got: $ident"; continue ;;
@@ -135,6 +182,54 @@ for harness in claude codex copilot human; do
         pass "python recognizes '$ident' ($harness) as a local claim"
     else
         fail "python recognizes '$ident' ($harness) as a local claim" "got: $recognized"
+    fi
+done
+
+echo ""
+echo "Test: session identity (wv-99978b) — format, python recognition, fail closed"
+echo "============================================================================="
+
+for envstr in "CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=e2bbbaf2-606c-462b-8c2e-2d4305df0616" \
+              "CODEX_THREAD_ID=019a-bc12-34" "WV_SESSION_ID=amp-T-1234" \
+              "AI_AGENT=pi PI_SESSION_ID=019a5e2c-7d10-7000-8000-000000000001" \
+              "AI_AGENT=amp AMP_CURRENT_THREAD_ID=T-01a1a755-4c7b-77b4-9982-053d0b097bbb"; do
+    # shellcheck disable=SC2086  # envstr is a controlled, script-local word list
+    ident=$(bash_identity $envstr)
+    if [[ "$ident" =~ ^[a-z0-9]{1,24}-.+-.+-h[0-9a-f]{16}$ ]]; then
+        pass "bash qualifies the session with a whole-id digest: $ident"
+    else
+        fail "bash qualifies the session" "got: $ident"
+    fi
+    recognized=$(python_recognizes_local "$ident")
+    if [ "$recognized" = "true" ]; then
+        pass "python recognizes session claim '$ident' as local"
+    else
+        fail "python recognizes session claim '$ident' as local" "got: $recognized"
+    fi
+done
+
+bash_require() {
+    env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT -u PI_SESSION_ID -u AMP_CURRENT_THREAD_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+        -u CLAUDE_CODE_SESSION_ID -u WV_SESSION_IDENTITY -u WV_SESSION_ID \
+        "$@" bash -c "set -euo pipefail; source '$RUNTIME_LIB'; require_agent_id" 2>/dev/null
+}
+for envstr in "CLAUDECODE=1" "CODEX_CI=1" "CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=..--" "WV_SESSION_ID=" \
+              "AI_AGENT=pi" "AI_AGENT=amp"; do
+    # shellcheck disable=SC2086
+    if out=$(bash_require $envstr); then
+        fail "require_agent_id refuses an unverifiable session ($envstr)" "got: $out"
+    else
+        pass "require_agent_id refuses an unverifiable session ($envstr)"
+    fi
+done
+for envstr in "" "COPILOT_AGENT=1" "CLAUDECODE=1 WV_SESSION_IDENTITY=0" "CLAUDECODE=1 WV_AGENT_ID=me" \
+              "CLAUDE_CODE_SSE_PORT=1" "CLAUDE_CODE_SSE_PORT=1 CODEX_THREAD_ID=t1" \
+              "CLAUDE_CODE_SSE_PORT=1 AI_AGENT=pi PI_SESSION_ID=p1" "AI_AGENT=constructor"; do
+    # shellcheck disable=SC2086
+    if out=$(bash_require $envstr) && [ -n "$out" ]; then
+        pass "require_agent_id admits an actor-owned identity (${envstr:-human}): $out"
+    else
+        fail "require_agent_id admits an actor-owned identity (${envstr:-human})"
     fi
 done
 

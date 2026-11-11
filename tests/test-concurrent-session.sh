@@ -100,6 +100,38 @@ kill "$FAKE_PID" 2>/dev/null || true
 wait "$FAKE_PID" 2>/dev/null || true
 FAKE_PID=""
 
+# ── pi and Amp run with comm `pi` / `amp` (observed, wv-d09cee): exact match ──
+for _agent in pi amp; do
+    cp /bin/sleep "$TEST_DIR/fake-bin/$_agent"
+    (cd "$TEST_DIR/repo" && exec "$TEST_DIR/fake-bin/$_agent" 30) &
+    FAKE_PID=$!
+    sleep 0.3
+    if _result=$(_wv_concurrent_session "$TEST_DIR/repo") && [[ "$_result" == *"pid $FAKE_PID"* ]]; then
+        check "live $_agent process with a cwd inside the repo triggers an advisory" true
+    else
+        check "live $_agent process with a cwd inside the repo triggers an advisory" false
+    fi
+    kill "$FAKE_PID" 2>/dev/null || true
+    wait "$FAKE_PID" 2>/dev/null || true
+    FAKE_PID=""
+done
+
+# ── A name that merely starts with pi/amp (pip, ampd) is not an agent ──
+for _lookalike in pip ampd; do
+    cp /bin/sleep "$TEST_DIR/fake-bin/$_lookalike"
+    (cd "$TEST_DIR/repo" && exec "$TEST_DIR/fake-bin/$_lookalike" 30) &
+    FAKE_PID=$!
+    sleep 0.3
+    if _wv_concurrent_session "$TEST_DIR/repo" >/dev/null; then
+        check "$_lookalike process (pi/amp prefix only) does not trigger an advisory" false
+    else
+        check "$_lookalike process (pi/amp prefix only) does not trigger an advisory" true
+    fi
+    kill "$FAKE_PID" 2>/dev/null || true
+    wait "$FAKE_PID" 2>/dev/null || true
+    FAKE_PID=""
+done
+
 # ── Own process tree (ancestor chain) must never self-flag ──
 _self_result=""
 if _self_result=$(cd "$TEST_DIR/repo" && _wv_concurrent_session "$TEST_DIR/repo"); then

@@ -4,12 +4,20 @@
  * Tests the MCP server by spawning it and sending JSON-RPC requests over stdio.
  */
 
+import { createHash } from "crypto";
 import { spawn, spawnSync, ChildProcess } from "child_process";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { findWvCandidates, resolveAgentHarness, resolveAgentId, resolvePatternsListBudgetMs } from "./index";
+import {
+  findWvCandidates,
+  refuseOwnershipInSessionMode,
+  resolveAgentHarness,
+  resolveAgentId,
+  resolvePatternsListBudgetMs,
+  sessionIdentityApplies,
+} from "./index";
 
 const SERVER_PATH = resolve(__dirname, "../dist/index.js");
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -26,7 +34,14 @@ const CONTRACT = JSON.parse(readFileSync(resolve(__dirname, "../contract.json"),
 function fixtureEnv(dir: string, hotZone = join(dir, "hot-zone")): NodeJS.ProcessEnv {
   const env = Object.fromEntries(
     Object.entries(process.env).filter(
-      ([key]) => !/^(WV_|GIT_)/.test(key) && !["WEAVE_DIR", "REPO_ROOT", "POLICY_CACHE"].includes(key)
+      // Harness markers are stripped too: the suite runs from inside agent
+      // sessions, and an inherited CLAUDECODE/CODEX_* would switch on session
+      // identity and its MCP ownership refusal (wv-99978b), so results would
+      // depend on who ran them. Session mode is tested with explicit markers.
+      ([key]) =>
+        !/^(WV_|GIT_|CLAUDE_CODE_|CODEX_)/.test(key) &&
+        // AI_AGENT names the harness too (wv-08d7f9).
+        !["WEAVE_DIR", "REPO_ROOT", "POLICY_CACHE", "CLAUDECODE", "COPILOT_AGENT", "AI_AGENT"].includes(key)
     )
   );
   return {
@@ -360,6 +375,12 @@ describe("resolveAgentHarness / resolveAgentId cross-harness parity (wv-4d4c96 /
     "CODEX_THREAD_ID",
     "CODEX_CI",
     "COPILOT_AGENT",
+    "CLAUDE_CODE_SESSION_ID",
+    "WV_SESSION_IDENTITY",
+    "WV_SESSION_ID",
+    "AI_AGENT",
+    "PI_SESSION_ID",
+    "AMP_CURRENT_THREAD_ID",
   ] as const;
   let saved: Record<string, string | undefined>;
 
@@ -382,7 +403,7 @@ describe("resolveAgentHarness / resolveAgentId cross-harness parity (wv-4d4c96 /
   }
 
   it("resolves each harness alone", () => {
-    setMarkers({ CLAUDE_CODE_SSE_PORT: "1" });
+    setMarkers({ CLAUDECODE: "1" });
     expect(resolveAgentHarness()).toBe("claude");
     setMarkers({ CODEX_CI: "1" });
     expect(resolveAgentHarness()).toBe("codex");
@@ -398,14 +419,44 @@ describe("resolveAgentHarness / resolveAgentId cross-harness parity (wv-4d4c96 /
     expect(resolveAgentId()).toMatch(/^claude-/);
   });
 
+  it("an inherited CLAUDE_CODE_SSE_PORT is not a Claude marker (wv-08d7f9)", () => {
+    setMarkers({ CLAUDE_CODE_SSE_PORT: "1" });
+    expect(resolveAgentHarness()).toBe("human");
+    setMarkers({ CLAUDE_CODE_SSE_PORT: "1", CODEX_THREAD_ID: "t1" });
+    expect(resolveAgentHarness()).toBe("codex");
+    expect(sessionIdentityApplies()).toBe(true);
+  });
+
+  it("AI_AGENT names the harness and outranks claude and codex (wv-08d7f9)", () => {
+    setMarkers({ AI_AGENT: "claude-code_2-1-318_agent" });
+    expect(resolveAgentHarness()).toBe("claude");
+    setMarkers({ CLAUDE_CODE_SSE_PORT: "1", AI_AGENT: "pi", PI_SESSION_ID: "p1" });
+    expect(resolveAgentHarness()).toBe("pi");
+    expect(resolveAgentId()).toMatch(/^pi-.+-h[0-9a-f]{16}$/);
+    setMarkers({ AI_AGENT: "amp", AMP_CURRENT_THREAD_ID: "T-1" });
+    expect(resolveAgentId()).toMatch(/^amp-.+-h[0-9a-f]{16}$/);
+    setMarkers({ CLAUDECODE: "1", AI_AGENT: "pi" });
+    expect(resolveAgentHarness()).toBe("pi");
+    setMarkers({ AI_AGENT: "Foo.Bar/9" });
+    expect(resolveAgentHarness()).toBe("foobar9");
+    setMarkers({ AI_AGENT: "human" });
+    expect(resolveAgentHarness()).toBe("human");
+  });
+
+  it("an AI_AGENT label never reaches the object prototype", () => {
+    setMarkers({ AI_AGENT: "constructor" });
+    expect(resolveAgentHarness()).toBe("constructor");
+    expect(sessionIdentityApplies()).toBe(false);
+  });
+
   it("claude wins the claude/codex tie, matching the bash and python fixes (wv-4d4c96)", () => {
-    setMarkers({ CLAUDE_CODE_SSE_PORT: "1", CODEX_CI: "1" });
+    setMarkers({ CLAUDECODE: "1", CODEX_CI: "1" });
     expect(resolveAgentHarness()).toBe("claude");
     expect(resolveAgentId()).toMatch(/^claude-/);
   });
 
   it("copilot still wins a three-way tie", () => {
-    setMarkers({ CLAUDE_CODE_SSE_PORT: "1", CODEX_CI: "1", COPILOT_AGENT: "1" });
+    setMarkers({ CLAUDECODE: "1", CODEX_CI: "1", COPILOT_AGENT: "1", AI_AGENT: "pi" });
     expect(resolveAgentHarness()).toBe("copilot");
     expect(resolveAgentId()).toMatch(/^copilot-/);
   });
@@ -416,8 +467,84 @@ describe("resolveAgentHarness / resolveAgentId cross-harness parity (wv-4d4c96 /
   });
 
   it("produces the <harness>-<host>-<user> format scripts/weave_gh/phases.py recognizes as local", () => {
-    setMarkers({ CLAUDE_CODE_SSE_PORT: "1" });
+    setMarkers({ CLAUDECODE: "1" });
     expect(resolveAgentId()).toMatch(/^claude-.+-.+$/);
+  });
+
+  // Session identity (wv-99978b, wv-24d57b): -h<first 16 hex of sha256(whole id)>.
+  const h16 = (id: string) => createHash("sha256").update(id, "utf8").digest("hex").slice(0, 16);
+  it("appends -h<digest16> of the whole session id when the harness carries one", () => {
+    const sid = "e2bbbaf2-606c-462b-8c2e-2d4305df0616";
+    setMarkers({ CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: sid });
+    expect(resolveAgentId()).toMatch(new RegExp(`^claude-.+-.+-h${h16(sid)}$`));
+    expect(sessionIdentityApplies()).toBe(true);
+    setMarkers({ CODEX_THREAD_ID: "019a-bc12-34" });
+    expect(resolveAgentId()).toMatch(new RegExp(`^codex-.+-.+-h${h16("019a-bc12-34")}$`));
+  });
+
+  it("two UUIDv7 thread ids from one millisecond resolve two owners (wv-24d57b)", () => {
+    setMarkers({ CODEX_THREAD_ID: "01a12cd8-e777-7f00-a22c-5bdd105db0ba" });
+    const a = resolveAgentId();
+    setMarkers({ CODEX_THREAD_ID: "01a12cd8-e777-7a11-b33c-0123456789ab" });
+    expect(resolveAgentId()).not.toBe(a);
+    // Separators are part of the id: "a-b" and "ab" are different sessions.
+    setMarkers({ WV_SESSION_ID: "a-b" });
+    const sep = resolveAgentId();
+    setMarkers({ WV_SESSION_ID: "ab" });
+    expect(resolveAgentId()).not.toBe(sep);
+  });
+
+  it("WV_SESSION_ID is the harness-agnostic channel and wins over the harness default", () => {
+    setMarkers({ WV_SESSION_ID: "amp-T-1234" });
+    expect(resolveAgentId()).toMatch(new RegExp(`^human-.+-.+-h${h16("amp-T-1234")}$`));
+    setMarkers({ COPILOT_AGENT: "1", WV_SESSION_ID: "xyz" });
+    expect(resolveAgentId()).toMatch(new RegExp(`^copilot-.+-.+-h${h16("xyz")}$`));
+    setMarkers({ CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "abc", WV_SESSION_ID: "def" });
+    expect(resolveAgentId()).toMatch(new RegExp(`-h${h16("def")}$`));
+    // Declared but empty: still session mode, so MCP ownership stays refused.
+    setMarkers({ WV_SESSION_ID: "" });
+    expect(sessionIdentityApplies()).toBe(true);
+    expect(refuseOwnershipInSessionMode("weave_work", { id: "wv-000000" })?.isError).toBe(true);
+  });
+
+  it("WV_SESSION_IDENTITY=0, WV_AGENT_ID, copilot and human stay actor-owned", () => {
+    setMarkers({ CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "abc", WV_SESSION_IDENTITY: "0" });
+    expect(resolveAgentId()).not.toMatch(/-h[0-9a-f]{16}$/);
+    expect(sessionIdentityApplies()).toBe(false);
+    setMarkers({ CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "abc", WV_AGENT_ID: "me" });
+    expect(resolveAgentId()).toBe("me");
+    expect(sessionIdentityApplies()).toBe(false);
+    setMarkers({ COPILOT_AGENT: "1" });
+    expect(sessionIdentityApplies()).toBe(false);
+    setMarkers({});
+    expect(sessionIdentityApplies()).toBe(false);
+  });
+
+  it("refuses ownership-changing calls in session mode and keeps reads (wv-116cbd)", () => {
+    setMarkers({ CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "abc" });
+    for (const t of [
+      "weave_work",
+      "weave_done",
+      "weave_batch_done",
+      "weave_ship",
+      "weave_quick",
+      "weave_close_session",
+    ]) {
+      expect(refuseOwnershipInSessionMode(t, { id: "wv-000000" })?.isError).toBe(true);
+    }
+    expect(refuseOwnershipInSessionMode("weave_add", { text: "x", status: "active" })?.isError).toBe(true);
+    expect(refuseOwnershipInSessionMode("weave_add", { text: "x" })).toBeNull();
+    expect(refuseOwnershipInSessionMode("weave_update", { id: "wv-000000", status: "done" })?.isError).toBe(true);
+    expect(
+      refuseOwnershipInSessionMode("weave_update", { id: "wv-000000", metadata: { claimed_by: "x" } })?.isError
+    ).toBe(true);
+    expect(refuseOwnershipInSessionMode("weave_update", { id: "wv-000000", text: "t" })).toBeNull();
+    expect(refuseOwnershipInSessionMode("weave_status", {})).toBeNull();
+    // A harness session with no id is still session mode: MCP cannot verify it either.
+    setMarkers({ CLAUDECODE: "1" });
+    expect(refuseOwnershipInSessionMode("weave_work", { id: "wv-000000" })?.isError).toBe(true);
+    setMarkers({ CLAUDECODE: "1", WV_SESSION_IDENTITY: "0" });
+    expect(refuseOwnershipInSessionMode("weave_work", { id: "wv-000000" })).toBeNull();
   });
 });
 
@@ -929,6 +1056,21 @@ describe("Weave MCP Server", () => {
       expect(node).not.toHaveProperty("updated_at");
     });
 
+    it("weave_list with ids returns exactly those nodes (wv-26fd0b)", async () => {
+      const first = await createTrackedNode("test-list-ids-a", { probe: "list-ids" });
+      const second = await createTrackedNode("test-list-ids-b", { probe: "list-ids" });
+      await createTrackedNode("test-list-ids-c", { probe: "list-ids" });
+      const response = await client.request("tools/call", {
+        name: "weave_list",
+        arguments: { ids: [first, second] },
+      });
+
+      expect(response.error).toBeUndefined();
+      const result = response.result as { content: { text: string }[] };
+      const nodes = JSON.parse(result.content[0].text) as { id: string }[];
+      expect(nodes.map((n) => n.id).sort()).toEqual([first, second].sort());
+    });
+
     it("weave_search should search nodes", async () => {
       const response = await client.request("tools/call", {
         name: "weave_search",
@@ -1099,6 +1241,31 @@ describe("Weave MCP Server", () => {
           expect.stringContaining("done wv-0000 --completion-files=scripts/example.py,tests/test-example.sh"),
         ])
       );
+    });
+
+    it("a session-mode server refuses weave_done without running wv (wv-99978b, wv-116cbd)", async () => {
+      const wrapper = createLoggedWvWrapper();
+      const sessionClient = new MCPTestClient([], {
+        WV_PATH: wrapper.wvPath,
+        CLAUDECODE: "1",
+        CLAUDE_CODE_SESSION_ID: "e2bbbaf2-606c-462b-8c2e-2d4305df0616",
+      });
+      let result: { isError?: boolean; content: { text: string }[] };
+      let commands: string[] = [];
+      try {
+        const response = await sessionClient.request("tools/call", {
+          name: "weave_done",
+          arguments: { id: "wv-0000" },
+        });
+        result = response.result as typeof result;
+        commands = readLoggedCommands(wrapper.logPath);
+      } finally {
+        await sessionClient.close();
+        wrapper.cleanup();
+      }
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("changes ownership");
+      expect(commands.some((c) => c.startsWith("done "))).toBe(false);
     });
 
     it("weave_add with backtick injection should not execute", async () => {
@@ -2540,10 +2707,13 @@ exec ${JSON.stringify(realWvPath)} "$@"
       const clockMarker = join(dir, "primary-finished");
       const reportMarker = join(dir, "report-ran");
       const clockPreload = join(dir, "clock.cjs");
-      writeFileSync(clockPreload, `const fs = require("fs");
+      writeFileSync(
+        clockPreload,
+        `const fs = require("fs");
 const now = Date.now;
 Date.now = () => now() + (fs.existsSync(${JSON.stringify(clockMarker)}) ? 1000 : 0);
-`);
+`
+      );
       const realWvPath = resolve(__dirname, "../../scripts/wv");
       writeFileSync(
         wvPath,
@@ -2571,7 +2741,9 @@ exec ${JSON.stringify(realWvPath)} "$@"
           ...fixture.env,
           WV_PATH: wvPath,
           WV_MCP_PATTERNS_LIST_BUDGET_MS: "400",
-          NODE_OPTIONS: [fixture.env.NODE_OPTIONS, `--require=${JSON.stringify(clockPreload)}`].filter(Boolean).join(" "),
+          NODE_OPTIONS: [fixture.env.NODE_OPTIONS, `--require=${JSON.stringify(clockPreload)}`]
+            .filter(Boolean)
+            .join(" "),
         },
         fixture.dir
       );
@@ -2632,7 +2804,7 @@ exec ${JSON.stringify(realWvPath)} "$@"
       }
     });
 
-    it("weave_preflight blocks policy-sensitive nodes when quality prerequisites are missing", async () => {
+    it("weave_preflight does not block when quality.db has no scan data: wv done scans in place (wv-f4f431)", async () => {
       const fixture = createProjectFixture("weave-mcp-preflight-");
       const env = fixture.env;
       const dbPath = env.WV_DB!;
@@ -2663,9 +2835,9 @@ exec ${JSON.stringify(realWvPath)} "$@"
         });
 
         const result = response.result as { content: { text: string }[]; isError?: boolean };
-        expect(result.isError).toBe(true);
-        expect(result.content[0].text).toContain("not policy-ready");
-        expect(result.content[0].text).toContain("wv quality scan . --json");
+        expect(result.isError).not.toBe(true);
+        expect(result.content[0].text).not.toContain("not policy-ready");
+        expect(result.content[0].text).toContain("scan_on_close");
       } finally {
         await preflightClient.close();
         fixture.cleanup();

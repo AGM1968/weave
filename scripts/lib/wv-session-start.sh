@@ -58,6 +58,125 @@ _ss_summary_line() {
         "${active:-0}" "${ready:-0}" "${blocked:-0}" "$policy" "${current:-none}"
 }
 
+# _ss_stamp_begin -- the SessionStart completion stamp (wv-ca3ffe), when
+# wv-hook-common is loaded. Helpers keep wv_session_start_context's branch
+# count inside the mccabe_max_sh policy.
+_ss_stamp_begin() {
+    declare -F wv_hook_run_begin >/dev/null || return 0
+    wv_hook_run_begin SessionStart
+}
+
+# _ss_unfinished_hooks_note <hot_zone> -- one line, newline-terminated, when
+# lifecycle hooks started and never finished in the last 7 days (wv-ca3ffe): a
+# host timeout or a kill cuts a hook short without telling anyone (wv-a32e69).
+_ss_unfinished_hooks_note() {
+    declare -F wv_hook_unfinished_runs >/dev/null || return 0
+    local unfinished
+    unfinished=$(wv_hook_unfinished_runs "$1" | awk '{printf "%s%s x%s", (NR > 1 ? ", " : ""), $1, $2}')
+    [ -n "$unfinished" ] || return 0
+    printf 'Hooks: unfinished lifecycle runs in the last 7 days: %s (cut short by a host timeout or a kill); see wv doctor.\n' "$unfinished"
+}
+
+# _ss_commit_snapshot <project_dir> -- commit graph state written during
+# session start; its body is a subshell, so exit leaves only the helper. Split out of
+# wv_session_start_context to keep its branch count inside mccabe_max_sh.
+_ss_commit_snapshot() {
+    (
+        set +e
+        cd "$1" 2>/dev/null || exit 0
+        # wv-822bea/wv-179c49: hijack guard, same rule as auto_checkpoint/cmd_sync
+        # in wv-cmd-data.sh — refuse to commit if the caller pre-staged anything
+        # outside graph state, so a session-start checkpoint never silently absorbs
+        # (and, worse, [skip-ci-marks) unrelated in-progress work. wv-2e6341: only
+        # graph state is staged, so .weave/ configuration such as test-map.conf
+        # stays in the tree for a commit that runs its gates. Without the helpers
+        # (lib not found) nothing is committed rather than all of .weave/.
+        command -v wv_stage_graph_state >/dev/null 2>&1 || exit 0
+        # wv-99d4d2: the fourth self-made commit. WV_AUTO_CHECKPOINT=0 and the
+        # hold file stop it as they stop auto_checkpoint, sync's final commit
+        # and the lifecycle checkpoint (wv-fbbdff). A hook runs in the
+        # harness's environment, so here the hold file is the switch that holds.
+        # wv-checkpoint-ci.sh defines it beside wv_stage_graph_state, checked above.
+        wv_auto_commit_enabled "$PWD" || exit 0
+        if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
+            local prestaged
+            # A failed listing is not "nothing staged" (wv-9c6ae1).
+            prestaged=$(wv_staged_non_graph_state "$PWD") || exit 0
+            [ -n "$prestaged" ] && exit 0
+        fi
+        wv_stage_graph_state "$PWD" 2>/dev/null
+        if ! git diff --cached --quiet -- .weave/ 2>/dev/null; then
+            # wv-e937f8: see session-end-sync.sh's identical comment. wv-179c49:
+            # fail toward NOT skipping CI when the marker helper is unavailable
+            # or fails — the old " [skip ci]" fallback here defaulted to the
+            # unsafe direction on the exact failure mode this exists to prevent.
+            local skip_ci
+            skip_ci=$(command -v wv_checkpoint_ci_marker >/dev/null 2>&1 \
+                && wv_checkpoint_ci_marker "$PWD" || echo "")
+            WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): session-start state${skip_ci}" >/dev/null 2>&1
+        fi
+    )
+}
+
+# The code-search index lives in the hot zone by design and is never serialised
+# to .weave/, so a reboot or a fresh zone leaves it empty and wv search --code
+# finds nothing until it is rebuilt (wv-ecbe60). Session start rebuilds it
+# detached and never waits. Skipped inside a counted E5 window (WV_WORKFLOW_ID),
+# under test suites unless WV_SESSION_INDEX=1, and when WV_SESSION_INDEX=0.
+
+# _ss_code_index_mode <project_dir> <hot_zone> -- what to build, as
+# "<state> <mode> <head>": state empty|stale, mode fts|embed. Prints nothing
+# when the index is populated and was built for HEAD, or must not be built here.
+# Empty builds without embeddings (BM25, seconds); stale rebuilds in the mode it
+# was built in, so a refresh never strips embeddings.
+_ss_code_index_mode() {
+    local head built state mode
+    [ "${WV_SESSION_INDEX:-}" != 0 ] && [ -z "${WV_WORKFLOW_ID:-}" ] || return 0
+    [ -z "${WV_TEST_SUITE:-}" ] || [ "${WV_SESSION_INDEX:-}" = 1 ] || return 0
+    head=$(git -C "$1" rev-parse HEAD 2>/dev/null) || return 0
+    # empty: no chunks; stale: chunks but no definition table (an index made
+    # before wv-35b5bd), rebuilt rather than reported current; built: both.
+    built=$(sqlite3 "${WV_DB:-$2/brain.db}" "SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM chunks) THEN 'empty'
+        WHEN NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='code_symbols') THEN 'stale'
+        ELSE 'built' END, CASE WHEN EXISTS(SELECT 1 FROM chunks WHERE embedding IS NOT NULL) THEN 'embed' ELSE 'fts' END;" 2>/dev/null) || return 0
+    state=${built%%|*} mode=${built#*|}
+    if [ "$state" = built ]; then
+        [ "$(cat "$2/.code_index_head" 2>/dev/null)" != "$head" ] || return 0
+        state=stale
+    fi
+    printf '%s %s %s\n' "$state" "$mode" "$head"
+}
+
+# _ss_code_index_launch <project_dir> <hot_zone> <mode> <head> -- start the
+# build detached; 1 when another build holds the lock. A build killed mid-run
+# leaves its lock: one older than ten minutes is stale.
+_ss_code_index_launch() {
+    local lock="$2/.code_index.lock" no_embed=--no-embed
+    find "$lock" -maxdepth 0 -type d -mmin +10 -exec rmdir {} \; 2>/dev/null || true
+    mkdir "$lock" 2>/dev/null || return 1
+    [ "$3" = embed ] && no_embed=""
+    (
+        trap 'rmdir "$lock" 2>/dev/null' EXIT
+        # shellcheck disable=SC2086  # an empty $no_embed is no argument
+        "$WV" index "$1" $no_embed --json > "$2/.code_index.log" 2>&1 \
+            && printf '%s\n' "$4" > "$2/.code_index_head"
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
+# _ss_code_index_refresh <project_dir> <hot_zone> -- one line, newline-terminated,
+# when the code-search index needs (re)building, after starting that build.
+_ss_code_index_refresh() {
+    local state mode head
+    read -r state mode head < <(_ss_code_index_mode "$1" "$2") || return 0
+    _ss_code_index_launch "$1" "$2" "$mode" "$head" || return 0
+    if [ "$state" = stale ]; then
+        printf 'Code index: out of date (older HEAD or no definition table); refreshing in the background.\n'
+    else
+        printf 'Code index: empty in this hot zone; building it in the background (BM25, a few seconds), then wv search --code works.\n'
+    fi
+}
+
 # wv_session_start_context <payload_json> -- run session start and print the
 # context text for the host to inject. Never fails: hook infrastructure fails open.
 wv_session_start_context() {
@@ -101,6 +220,7 @@ wv_session_start_context() {
     # node closed before the end.
     local crash_warning="" had_sentinel=false
     local hb=0 stop_ts=0 stop_outcome="" sentinel_ts="unknown"
+    _ss_stamp_begin
     if [ -f "$sentinel" ]; then
         had_sentinel=true
         sentinel_ts=$(jq -r '.ts // "unknown"' "$sentinel" 2>/dev/null || echo "unknown")
@@ -157,37 +277,7 @@ wv_session_start_context() {
     # migrations). Without this, the stop-hook fires on the first response with
     # "unsaved weave state" for changes the agent didn't cause. Skipped on regression
     # so a stale dump can never overwrite the committed graph.
-    if [ -z "$regression" ]; then
-    (
-        set +e
-        cd "$project_dir" 2>/dev/null || exit 0
-        # wv-822bea/wv-179c49: hijack guard, same rule as auto_checkpoint/cmd_sync
-        # in wv-cmd-data.sh — refuse to commit if the caller pre-staged anything
-        # outside graph state, so a session-start checkpoint never silently absorbs
-        # (and, worse, [skip-ci-marks) unrelated in-progress work. wv-2e6341: only
-        # graph state is staged, so .weave/ configuration such as test-map.conf
-        # stays in the tree for a commit that runs its gates. Without the helpers
-        # (lib not found) nothing is committed rather than all of .weave/.
-        command -v wv_stage_graph_state >/dev/null 2>&1 || exit 0
-        if [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
-            local prestaged
-            # A failed listing is not "nothing staged" (wv-9c6ae1).
-            prestaged=$(wv_staged_non_graph_state "$PWD") || exit 0
-            [ -n "$prestaged" ] && exit 0
-        fi
-        wv_stage_graph_state "$PWD" 2>/dev/null
-        if ! git diff --cached --quiet -- .weave/ 2>/dev/null; then
-            # wv-e937f8: see session-end-sync.sh's identical comment. wv-179c49:
-            # fail toward NOT skipping CI when the marker helper is unavailable
-            # or fails — the old " [skip ci]" fallback here defaulted to the
-            # unsafe direction on the exact failure mode this exists to prevent.
-            local skip_ci
-            skip_ci=$(command -v wv_checkpoint_ci_marker >/dev/null 2>&1 \
-                && wv_checkpoint_ci_marker "$PWD" || echo "")
-            WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "chore(weave): session-start state${skip_ci}" >/dev/null 2>&1
-        fi
-    ) || true
-    fi
+    [ -n "$regression" ] || _ss_commit_snapshot "$project_dir" || true
 
     # ── Overwrite sentinel with full active node list ──
     local active_ids
@@ -261,6 +351,15 @@ ${context}"
         context="${crash_warning}
 ${context}"
     fi
+
+    # Lifecycle hooks that started and never finished (wv-ca3ffe).
+    context="$(_ss_unfinished_hooks_note "$hot_zone")
+${context}"
+    # The code-search index, rebuilt detached when empty or stale (wv-ecbe60).
+    context="${context}
+$(_ss_code_index_refresh "$project_dir" "$hot_zone")"
+    context="${context%$'\n'}"
+    context="${context#$'\n'}"
 
     # Graph-regression warning if the shrink guard fired
     if [ -n "$regression" ]; then

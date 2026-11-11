@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 
+import json
+import subprocess
 from unittest.mock import patch
 from typing import Any
 
@@ -202,11 +204,44 @@ class TestParseGhLabelsToMetadata:
 # ---------------------------------------------------------------------------
 
 
+def _creates(mock_gh: Any) -> list[str]:
+    return [c[0][2] for c in mock_gh.call_args_list if c[0][:2] == ("label", "create")]
+
+
 class TestEnsureLabels:
     @patch("weave_gh.labels.gh_cli", return_value="")
     def test_calls_gh_for_each_label(self, mock_gh: Any) -> None:
+        # An empty repo lists no labels, so every one is created.
         ensure_labels("owner/repo")
-        assert mock_gh.call_count == len(ENSURE_LABELS)
+        assert _creates(mock_gh) == [name for name, _, _ in ENSURE_LABELS]
+
+    def test_lists_once_and_creates_only_missing(self) -> None:
+        """wv-5c1223: one listing, then a create only for absent names (case-blind)."""
+        present = [{"name": n.upper()} for n, _, _ in ENSURE_LABELS if n != "epic"]
+        with patch("weave_gh.labels.gh_cli", return_value=json.dumps(present)) as mock_gh:
+            ensure_labels("owner/repo")
+        assert mock_gh.call_args_list[0][0][:2] == ("label", "list")
+        assert _creates(mock_gh) == ["epic"]
+
+    def test_untrusted_listing_attempts_every_create(self) -> None:
+        def gh(*args: str, **_kwargs: object) -> str:
+            if args[:2] == ("label", "list"):
+                raise subprocess.CalledProcessError(1, ["gh"])
+            return ""
+        with patch("weave_gh.labels.gh_cli", side_effect=gh) as mock_gh:
+            ensure_labels("owner/repo")
+        assert _creates(mock_gh) == [name for name, _, _ in ENSURE_LABELS]
+
+    def test_limit_filling_listing_is_not_trusted(self) -> None:
+        full = [{"name": f"l{i}"} for i in range(999)] + [{"name": "epic"}]
+        with patch("weave_gh.labels.gh_cli", return_value=json.dumps(full)) as mock_gh:
+            ensure_labels("owner/repo")
+        assert len(_creates(mock_gh)) == len(ENSURE_LABELS)
+
+    @patch("weave_gh.labels.gh_cli", return_value="[]")
+    def test_dry_run_creates_nothing(self, mock_gh: Any) -> None:
+        ensure_labels("owner/repo", dry_run=True)
+        assert not _creates(mock_gh)
 
     @patch("weave_gh.labels.gh_cli", return_value="")
     def test_creates_weave_synced(self, mock_gh: Any) -> None:

@@ -583,6 +583,61 @@ fi
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════════════════"
+echo "Epic aggregation keeps the epic's own commits"
+echo "═══════════════════════════════════════════════════════════════════════════"
+
+# A child close replaced the epic's commits with the children's union, dropping
+# the epic's own direct refs (wv-ece542 lost 13 on 2026-11-09, wv-3c1663). The
+# epic keeps its own live refs; its own stale refs still go through the filter.
+setup_repo
+EPIC=$($WV add "epic: own commits" 2>/dev/null | tail -1)
+CHILD=$($WV add "task: child" --parent="$EPIC" 2>/dev/null | tail -1)
+
+echo own > own.txt
+"${GIT[@]}" add own.txt
+"${GIT[@]}" commit -qm "work: epic own"
+OWN=$("${GIT[@]}" rev-parse HEAD)
+echo kid > kid.txt
+"${GIT[@]}" add kid.txt
+"${GIT[@]}" commit -qm "work: child"
+KID=$("${GIT[@]}" rev-parse HEAD)
+"${GIT[@]}" push -q origin main
+echo gone > gone.txt
+"${GIT[@]}" add gone.txt
+"${GIT[@]}" commit -qm "work: epic stale"
+OWN_STALE=$("${GIT[@]}" rev-parse HEAD)
+"${GIT[@]}" reset -q --hard "$KID"
+
+sqlite3 "$WV_DB" "UPDATE nodes SET metadata = json_set(COALESCE(metadata,'{}'), '\$.commits', json_array('$OWN', '$OWN_STALE')) WHERE id='$EPIC';"
+sqlite3 "$WV_DB" "UPDATE nodes SET metadata = json_set('{}', '\$.commits', json_array('$KID')) WHERE id='$CHILD';"
+
+$WV "done" "$CHILD" --skip-verification >/dev/null 2>&1 || true
+EPIC_COMMITS=$(sqlite3 "$WV_DB" "SELECT COALESCE(json_extract(metadata,'\$.commits'),'[]') FROM nodes WHERE id='$EPIC';")
+assert_contains "$EPIC_COMMITS" "$OWN" "epic keeps its own commit after a child close"
+assert_contains "$EPIC_COMMITS" "$KID" "epic gains the child's commit"
+if [[ "$EPIC_COMMITS" == *"$OWN_STALE"* ]]; then
+    echo -e "  ${RED}✗${NC} epic kept its own stale ref"
+    TESTS_RUN=$((TESTS_RUN + 1))
+else
+    echo -e "  ${GREEN}✓${NC} epic's own stale ref is filtered"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    TESTS_RUN=$((TESTS_RUN + 1))
+fi
+
+# Same class at the epic's own close: _store_node_commits wrote only the SHAs
+# git log attributes to the epic, replacing the aggregated child union.
+"${GIT[@]}" commit -q --allow-empty -m "work: epic close
+
+Weave-ID: $EPIC"
+CLOSE_SHA=$("${GIT[@]}" rev-parse HEAD)
+$WV "done" "$EPIC" --skip-verification >/dev/null 2>&1 || true
+EPIC_COMMITS=$(sqlite3 "$WV_DB" "SELECT COALESCE(json_extract(metadata,'\$.commits'),'[]') FROM nodes WHERE id='$EPIC';")
+assert_contains "$EPIC_COMMITS" "$CLOSE_SHA" "epic close records its own Weave-ID commit"
+assert_contains "$EPIC_COMMITS" "$KID" "epic close keeps the aggregated child commit"
+assert_contains "$EPIC_COMMITS" "$OWN" "epic close keeps its earlier own commit"
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════════════════"
 echo "Doctor advisory"
 echo "═══════════════════════════════════════════════════════════════════════════"
 

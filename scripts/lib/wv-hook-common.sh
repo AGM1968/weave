@@ -75,9 +75,10 @@ _hc_db_path() {
     fi
 }
 
+# This owner's phase (wv-43d6be): another session's phase never applies here.
 _hc_phase_value() {
     local hot_zone="$1"
-    cat "${hot_zone}/.session_phase" 2>/dev/null || echo "execute"
+    cat "$(resolve_phase_file "$hot_zone")" 2>/dev/null || echo "execute"
 }
 
 _hc_refresh() {
@@ -370,7 +371,10 @@ EOF
 _hc_check_active_node() {
     local new_total="${1:-}" with_active="${2:-}" edits_file="${3:-}"
 
-    _HC_ACTIVE_NODES=$("$WV" list --status=active --json 2>/dev/null || echo "[]")
+    # Only the caller's own claims admit an edit (owner ruling 2026-11-04,
+    # wv-43d6be): another session's active node never does, and an
+    # unverifiable session has none (list --claimed-by=current refuses it).
+    _HC_ACTIVE_NODES=$("$WV" list --status=active --claimed-by=current --json 2>/dev/null || echo "[]")
     _HC_ACTIVE_COUNT=$(echo "$_HC_ACTIVE_NODES" | jq 'length' 2>/dev/null || echo "0")
 
     if [ -n "$new_total" ] && [ -n "$edits_file" ]; then
@@ -387,6 +391,8 @@ _hc_check_active_node() {
 
     if [ "$_HC_ACTIVE_COUNT" = "0" ]; then
         _hc_observe edit_requires_active_node deny
+        # Name the cause when it is identity, not a missing claim.
+        if agent_identity_unverified 2>/dev/null; then require_agent_id >/dev/null || true; fi
         cat >&2 <<EOF
 ⚠️  No active Weave node found (phase: execute).
 
@@ -473,7 +479,8 @@ EOF
 _hc_resolve_primary_node() {
     _HC_NODE_ID=""
     if [ "${_HC_ACTIVE_COUNT:-0}" -gt "1" ]; then
-        local primary_file="${_HC_HOT_ZONE}/primary"
+        local primary_file
+        primary_file=$(resolve_primary_file "$_HC_HOT_ZONE") || true
         if [ -f "$primary_file" ]; then
             _HC_NODE_ID=$(cat "$primary_file" 2>/dev/null || echo "")
         fi
@@ -496,7 +503,8 @@ _hc_resolve_primary_node() {
 #   1 → generation failed; caller: exit 1
 _hc_check_context_pack() {
     local node_id="$1"
-    local stamp="${_HC_HOT_ZONE}/.context_checked_${node_id}"
+    local stamp
+    stamp=$(resolve_context_stamp "$node_id" "$_HC_HOT_ZONE") || true
     _HC_CONTEXT_STAMP_HIT=false
 
     if [ -f "$stamp" ]; then
@@ -572,6 +580,70 @@ EOF
         return 2
     fi
     return 0
+}
+
+# ── Lifecycle hook completion stamps (wv-ca3ffe) ──
+# A host kills a hook that overruns its budget without telling anyone: the
+# session-end routine died on every exit for eight months unnoticed (wv-a32e69).
+# Each lifecycle routine (SessionStart, Stop, PreCompact, SessionEnd) stamps
+# "begin" when it starts and "end <status>" from an EXIT trap into
+# <hot zone>/hook-runs.log. SIGKILL leaves no end; TERM/INT/HUP leave a status
+# of 128 or more. Both count as unfinished once the process is gone.
+# Line format: <epoch> <event> begin|end <pid> [<status>]
+
+# wv_hook_run_begin <event> -- stamp the start and arm the end stamp. Call from
+# inside the routine's own subshell: the trap replaces any EXIT trap there.
+wv_hook_run_begin() {
+    local event="$1" hz="${_HC_HOT_ZONE:-${WV_HOT_ZONE:-}}"
+    [ -n "$hz" ] && [ -d "$hz" ] || return 0
+    # Never arm an EXIT trap in the caller's own shell: only in a subshell.
+    [ "${BASH_SUBSHELL:-0}" -gt 0 ] || return 0
+    _WV_HOOK_RUN_LOG="$hz/hook-runs.log"
+    _WV_HOOK_RUN_EVENT="$event"
+    printf '%s %s begin %s\n' "$(date +%s)" "$event" "${BASHPID:-$$}" >> "$_WV_HOOK_RUN_LOG" 2>/dev/null || return 0
+    # A routine that sets its own EXIT trap later must call wv_hook_run_end
+    # from it (wv_stop_guard does).
+    trap wv_hook_run_end EXIT
+    # Keep the log bounded: the newest 400 lines once it passes 600.
+    if [ "$(wc -l < "$_WV_HOOK_RUN_LOG" 2>/dev/null || echo 0)" -gt 600 ]; then
+        tail -n 400 "$_WV_HOOK_RUN_LOG" > "$_WV_HOOK_RUN_LOG.tmp.$$" 2>/dev/null &&
+            mv -f "$_WV_HOOK_RUN_LOG.tmp.$$" "$_WV_HOOK_RUN_LOG" 2>/dev/null
+        rm -f "$_WV_HOOK_RUN_LOG.tmp.$$" 2>/dev/null
+    fi
+    return 0
+}
+
+# wv_hook_run_end [<status>] -- the end stamp, once per run; returns the status.
+# shellcheck disable=SC2120  # called bare from the EXIT trap, with a status from wv_stop_guard
+wv_hook_run_end() {
+    local rc="${1:-$?}"
+    if [ -n "${_WV_HOOK_RUN_LOG:-}" ] && [ -n "${_WV_HOOK_RUN_EVENT:-}" ]; then
+        printf '%s %s end %s %s\n' "$(date +%s)" "$_WV_HOOK_RUN_EVENT" "${BASHPID:-$$}" "$rc" \
+            >> "$_WV_HOOK_RUN_LOG" 2>/dev/null || true
+        _WV_HOOK_RUN_EVENT=""
+    fi
+    return "$rc"
+}
+
+# wv_hook_unfinished_runs [<hot zone>] [<window seconds>] -- "Event count" for
+# each lifecycle event with runs in the window (default 7 days) that began but
+# did not finish: no end stamp and the process is gone, or an end status of 128
+# or more (killed by a signal). Prints nothing when every run finished.
+wv_hook_unfinished_runs() {
+    local hz="${1:-${_HC_HOT_ZONE:-${WV_HOT_ZONE:-}}}" window="${2:-604800}" log
+    log="$hz/hook-runs.log"
+    [ -n "$hz" ] && [ -s "$log" ] || return 0
+    local event pid
+    awk -v since="$(( $(date +%s) - window ))" '
+        $1 < since { next }
+        $3 == "begin" { open[$2" "$4] = 1; next }
+        $3 == "end" { k = $2" "$4; if (k in open) { delete open[k]; if ($5 + 0 >= 128) print $2, $4, "killed" } }
+        END { for (k in open) print k, "open" }
+    ' "$log" 2>/dev/null | while read -r event pid state; do
+        # An open run whose process still lives is running, not unfinished.
+        if [ "$state" = open ] && kill -0 "$pid" 2>/dev/null; then continue; fi
+        printf '%s\n' "$event"
+    done | sort | uniq -c | awk '{print $2, $1}'
 }
 
 # Initialize on source so simple hooks can consume _HC_* without extra boilerplate.

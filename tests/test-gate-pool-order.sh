@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Suite launch order and the candidate lanes' share of the pool bound
 # (wv-d7af8d). Units of scripts/lib/wv-gate-pool.sh and wv-gate-lanes.sh:
-#   - suites measured at GATE_POOL_FAST_S (20s) or less launch first, each
-#     group longest first, unmeasured counted as longest in the slow group;
-#   - lanes running together split WV_GATE_JOBS, the remainder to the first,
-#     never holding more than it between them and each holding at least one;
-#   - hook_gate_jobs takes a lane's share before WV_GATE_JOBS.
+#   - suites launch longest first, unmeasured counted as longest; no cheap
+#     suite jumps ahead (cheap-first measured worse, wv-ab1889);
+#   - candidate lanes draw suites from one gate-wide budget of WV_GATE_JOBS
+#     slots (wv-428a92): never more at once, a freed slot goes to a suite
+#     waiting in any lane, a dead or interrupted holder frees its slot, and
+#     the wait is not counted as the suite's cost;
+#   - hook_gate_jobs takes a lane's bound before WV_GATE_JOBS.
 set -uo pipefail
 export WV_TEST_SUITE=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,36 +27,162 @@ hook_duration_ms() { echo 0; }
 
 order() { gate_pool_launch_order "$1" | cut -f2 | paste -sd ' ' -; }
 
-echo "launch order: the fast group first, each group longest first"
-check "the threshold is 20s" "20" "$GATE_POOL_FAST_S"
-check "mixed costs" "d b c a e" "$(order '[{"name":"a","last_cost_s":300},{"name":"b","last_cost_s":5},{"name":"c","last_cost_s":0},{"name":"d","last_cost_s":20},{"name":"e","last_cost_s":21}]')"
-check "20s is fast, 21s is not" "x y" "$(order '[{"name":"y","last_cost_s":21},{"name":"x","last_cost_s":20}]')"
-check "an unmeasured suite is slow and goes first among the slow" "f u s" "$(order '[{"name":"s","last_cost_s":30},{"name":"u"},{"name":"f","last_cost_s":3}]')"
-check "with no fast suite the order is longest first, as before" "u a b" "$(order '[{"name":"b","last_cost_s":40},{"name":"u","last_cost_s":0},{"name":"a","last_cost_s":90}]')"
-check "the index keeps the selection order" "2 0 1" "$(gate_pool_launch_order '[{"name":"a","last_cost_s":90},{"name":"b","last_cost_s":40},{"name":"c","last_cost_s":2}]' | cut -f1 | paste -sd ' ' -)"
+echo "launch order: longest first, unmeasured first (wv-ab1889)"
+check "no cheap-first threshold remains" "unset" "${GATE_POOL_FAST_S-unset}"
+check "mixed costs" "c a e d b" "$(order '[{"name":"a","last_cost_s":300},{"name":"b","last_cost_s":5},{"name":"c","last_cost_s":0},{"name":"d","last_cost_s":20},{"name":"e","last_cost_s":21}]')"
+check "a 20s suite does not jump ahead of a 21s one" "y x" "$(order '[{"name":"y","last_cost_s":21},{"name":"x","last_cost_s":20}]')"
+check "an unmeasured suite counts as longest" "u s f" "$(order '[{"name":"s","last_cost_s":30},{"name":"u"},{"name":"f","last_cost_s":3}]')"
+check "with no cheap suite the order is the same" "u a b" "$(order '[{"name":"b","last_cost_s":40},{"name":"u","last_cost_s":0},{"name":"a","last_cost_s":90}]')"
+check "the index keeps the selection order" "0 1 2" "$(gate_pool_launch_order '[{"name":"a","last_cost_s":90},{"name":"b","last_cost_s":40},{"name":"c","last_cost_s":2}]' | cut -f1 | paste -sd ' ' -)"
 
-echo "lane shares of the pool bound"
-budgets() { local i out=""; for ((i = 0; i < $2; i++)); do out+="$(gate_lanes_job_budget "$1" "$2" "$i") "; done; echo "${out% }"; }
-check "4 jobs, 1 lane" "4" "$(budgets 4 1)"
-check "4 jobs, 2 lanes" "2 2" "$(budgets 4 2)"
-check "4 jobs, 3 lanes: the remainder to the first" "2 1 1" "$(budgets 4 3)"
-check "4 jobs, 4 lanes" "1 1 1 1" "$(budgets 4 4)"
-check "4 jobs, 6 lanes: 4 run together, one job each" "1 1 1 1 1 1" "$(budgets 4 6)"
-check "1 job, 3 lanes" "1 1 1" "$(budgets 1 3)"
-check "6 jobs, 4 lanes" "2 2 1 1" "$(budgets 6 4)"
-# Lanes running together never hold more than the bound: with fewer lanes
-# than jobs all run at once; with more, each holds one.
-over=0
-for j in 1 2 3 4 5 6 8; do for l in 1 2 3 4 5 7 9; do
-    together=$(( l < j ? l : j )); sum=0; min=99
-    for ((i = 0; i < together; i++)); do b=$(gate_lanes_job_budget "$j" "$l" "$i"); sum=$((sum + b)); [ "$b" -lt "$min" ] && min=$b; done
-    { [ "$sum" -le "$j" ] && [ "$min" -ge 1 ]; } || over=$((over + 1))
-done; done
-check "over 49 combinations no set of lanes running together exceeds the bound or holds none" "0" "$over"
+echo "candidate lanes share one budget of slots (wv-428a92)"
+SUP="$ROOT/scripts/lib/wv-gate-supervisor.py"
+ST=$(mktemp -d)
+gate_lanes_slots "$ST/s2" 2
+check "the budget is one slot file per job" "0 1" "$(ls "$ST/s2" | paste -sd ' ')"
+# slot_job <slots> <name> <seconds> [stop-file] — one supervised suite stand-in
+# taking a slot, logging its start and end in epoch ns to $ST/events.
+slot_job() {
+    WV_GATE_SLOTS="$1" WV_GATE_SLOT_STAMP="$ST/$2.stamp" WV_GATE_SLOT_STOP="${4:-}" \
+        python3 -I "$SUP" "$2" 60 bash -c '
+            echo "S $(date +%s%N) $1" >> "$2/events"
+            sleep "$3"
+            echo "E $(date +%s%N) $1" >> "$2/events"' _ "$2" "$ST" "$3"
+}
+# peak [prefix] — the most jobs (whose names start with prefix) running at once.
+peak() {
+    sort -k2,2n "$ST/events" | awk -v p="${1:-}" 'index($3, p) == 1 {
+        n += ($1 == "S") ? 1 : -1; if (n > m) m = n } END { print m + 0 }'
+}
+: > "$ST/events"
+for j in a1 a2 a3 b1 b2 b3; do slot_job "$ST/s2" "$j" 0.4 & done; wait
+check "six jobs from two lanes on 2 slots: at most 2 ran at once, and 2 did (actual overlap)" "2" "$(peak)"
+check "...and every job ran" "6" "$(grep -c '^E ' "$ST/events")"
+# Asymmetric lanes: lane a has one short suite, lane b three long ones. With
+# fixed shares b would run its three one at a time on its single job; with a
+# shared budget the slot a frees goes to b, so b's own suites overlap.
+: > "$ST/events"
+slot_job "$ST/s2" a-short 0.2 &
+for j in 1 2 3; do slot_job "$ST/s2" "b-long$j" 0.8 & done; wait
+check "asymmetric lanes: the long lane takes the slot the short one freed (b overlaps itself)" "2" "$(peak b-)"
+check "...still never more than 2 at once" "2" "$(peak)"
+stamp=$(cat "$ST/a-short.stamp" 2>/dev/null)
+check "a holder stamps the slot it took and when, in epoch ns" "yes" \
+    "$([[ "$stamp" =~ ^[01]\ [0-9]{18,}$ ]] && echo yes || echo no)"
+rc=0; out=$(WV_GATE_SLOTS="$ST/s2" WV_GATE_SLOT_STAMP="$ST/env.stamp" WV_GATE_SLOT_STOP="$ST/nostop" \
+    python3 -I "$SUP" env 60 bash -c 'echo "${WV_GATE_SLOTS-unset} ${WV_GATE_SLOT_STAMP-unset} ${WV_GATE_SLOT_STOP-unset}"') || rc=$?
+check "the slot settings do not reach the command, so a gate it runs budgets on its own" "0 unset unset unset" "$rc $out"
 
-echo "the pool bound takes a lane's share first"
+echo "a dead or interrupted slot holder never strands the budget"
+gate_lanes_slots "$ST/s1" 1
+# Worker failure: the holder is SIGKILLed; the kernel drops its flock.
+WV_GATE_SLOTS="$ST/s1" WV_GATE_SLOT_STAMP="$ST/k.stamp" \
+    python3 -I "$SUP" holder 60 bash -c 'echo $$ > "$1"; exec sleep 30' _ "$ST/k.child" &
+kpid=$!
+for _ in $(seq 100); do [ -s "$ST/k.child" ] && break; sleep 0.05; done
+WV_GATE_SLOTS="$ST/s1" WV_GATE_SLOT_STAMP="$ST/w.stamp" python3 -I "$SUP" waiter 60 touch "$ST/w.ran" &
+wpid=$!
+sleep 0.3
+check "(control) the waiter has not started while the slot is held" "no" "$([ -e "$ST/w.ran" ] && echo yes || echo no)"
+kill -KILL "$kpid"; wait "$kpid" 2>/dev/null
+kill -KILL "$(cat "$ST/k.child")" 2>/dev/null || true
+t0=$(date +%s%N); rc=0; wait "$wpid" || rc=$?
+check "a SIGKILLed holder frees its slot: the waiter runs, within 5s" "0 yes yes" \
+    "$rc $([ -e "$ST/w.ran" ] && echo yes || echo no) $([ $(( ($(date +%s%N) - t0) / 1000000 )) -lt 5000 ] && echo yes || echo no)"
+# Interruption while waiting: TERM before a slot is held runs nothing.
+WV_GATE_SLOTS="$ST/s1" WV_GATE_SLOT_STAMP="$ST/h.stamp" python3 -I "$SUP" holder 60 sleep 1.5 &
+hpid=$!
+for _ in $(seq 100); do [ -s "$ST/h.stamp" ] && break; sleep 0.05; done
+WV_GATE_SLOTS="$ST/s1" WV_GATE_SLOT_STAMP="$ST/t.stamp" python3 -I "$SUP" term 60 touch "$ST/t.ran" &
+tpid=$!
+WV_GATE_SLOTS="$ST/s1" WV_GATE_SLOT_STAMP="$ST/p.stamp" WV_GATE_SLOT_STOP="$ST/stop" \
+    python3 -I "$SUP" stopped 60 touch "$ST/p.ran" &
+ppid_=$!
+sleep 0.3
+kill -TERM "$tpid"; rc=0; wait "$tpid" || rc=$?
+check "TERM while waiting: exit 143, the command never ran, no slot stamped" "143 no no" \
+    "$rc $([ -e "$ST/t.ran" ] && echo yes || echo no) $([ -e "$ST/t.stamp" ] && echo yes || echo no)"
+: > "$ST/stop"; rc=0; wait "$ppid_" || rc=$?
+check "the pool's stop flag while waiting: exit 125 (not started), the command never ran" "125 no" \
+    "$rc $([ -e "$ST/p.ran" ] && echo yes || echo no)"
+wait "$hpid"
+rc=0; out=$(WV_GATE_SLOTS="$ST/s1" WV_GATE_SLOT_STAMP="$ST/after.stamp" timeout 5 python3 -I "$SUP" after 60 echo ran) || rc=$?
+check "after all of that the one slot is free again (nothing leaked)" "0 ran" "$rc $out"
+# The deadline bounds the command, not the wait for a slot.
+WV_GATE_SLOTS="$ST/s1" WV_GATE_SLOT_STAMP="$ST/d1.stamp" python3 -I "$SUP" holder 60 sleep 1.5 &
+hpid=$!
+for _ in $(seq 100); do [ -s "$ST/d1.stamp" ] && break; sleep 0.05; done
+rc=0; WV_GATE_SLOTS="$ST/s1" WV_GATE_SLOT_STAMP="$ST/d2.stamp" python3 -I "$SUP" quick 1 true 2>/dev/null || rc=$?
+check "a 1s deadline is not spent waiting 1.5s for the slot" "0" "$rc"
+wait "$hpid"
+
+echo "the pool under shared slots: the wait is not the suite's cost, and a stopped waiter is not a failure"
+mkdir -p "$ST/repo/tests"; git -C "$ST/repo" init -q
+printf '#!/bin/sh\necho "${WV_GATE_SLOTS-unset} ${WV_GATE_SLOT_STAMP-unset} ${WV_GATE_SLOT_STOP-unset}" > %q\n' \
+    "$ST/seen" > "$ST/repo/tests/test-quick.sh"
+cat > "$ST/wv-stub" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$ST/calls.log"
+case "\$1" in test-status) exit 1 ;; *) exit 0 ;; esac
+STUB
+chmod +x "$ST/wv-stub"
+WV_GATE_SLOTS="$ST/s1" WV_GATE_SLOT_STAMP="$ST/pool-h.stamp" python3 -I "$SUP" holder 60 sleep 1.5 &
+hpid=$!
+for _ in $(seq 100); do [ -s "$ST/pool-h.stamp" ] && break; sleep 0.05; done
+: > "$ST/calls.log"
+rc=0; out=$(
+    export REPO_ROOT="$ST/repo" WV="$ST/wv-stub" WV_GATE_JOBS=2 WV_GATE_SLOTS="$ST/s1"
+    _pc_pool_reuse=off
+    hook_duration_ms() { local t1; t1=$(date +%s%N); echo $(( (t1 - $1) / 1000000 )); }
+    git -C "$REPO_ROOT" add -A
+    export WV_GATE_TREE=$(git -C "$REPO_ROOT" write-tree)
+    unset WV_GATE_BASE
+    run_hook_suites <<< "0	tests/test-quick.sh	1" 2>&1) || rc=$?
+wait "$hpid"
+dur=$(sed -n 's/^test-record tests\/test-quick.sh .*--duration=\([0-9]*\).*/\1/p' "$ST/calls.log")
+check "a suite that waited 1.5s for its slot passes" "0" "$rc"
+check "...and is recorded from when it took the slot, well under the wait" "yes" \
+    "$([ -n "$dur" ] && [ "$dur" -lt 1000 ] && echo yes || echo "no (duration=${dur:-none})")"
+check "...and the suite itself never sees the slot settings" "unset unset unset" "$(cat "$ST/seen" 2>/dev/null)"
+# Boundary rule 4: a lane runs this pool against HEAD's other gate files, so
+# against a supervisor that may pass every variable through. The pool's own
+# command must still keep the slot settings out of the suite, or a frozen
+# suite's execution environment differs from the one its plan described
+# (2026-11-03, the wv-gate-pool.sh lane of wv-428a92's first gate).
+rm -f "$ST/seen"
+rc=0; (
+    export REPO_ROOT="$ST/repo" WV="$ST/wv-stub" WV_GATE_JOBS=1 WV_GATE_SLOTS="$ST/s1"
+    _pc_pool_reuse=off _pc_pool_record=0
+    gate_run_bounded() { shift 2; "$@"; }   # a supervisor that strips nothing
+    git -C "$REPO_ROOT" add -A
+    export WV_GATE_TREE=$(git -C "$REPO_ROOT" write-tree)
+    unset WV_GATE_BASE
+    run_hook_suites <<< "0	tests/test-quick.sh	1"
+) >/dev/null 2>&1 || rc=$?
+check "...even under a supervisor that passes every variable through" "0 unset unset unset" "$rc $(cat "$ST/seen" 2>/dev/null)"
+# A waiter the stop flag turned back (rc "skip") is listed as not run, not
+# FAILED, is never recorded, and does not fail the pool by itself.
+skip_case() (
+    _pc_out_dir="$ST/reap"; rm -rf "$_pc_out_dir"; mkdir -p "$_pc_out_dir"
+    _pc_q_suite=([0]=tests/test-fails.sh [1]=tests/test-waited.sh) _pc_run_pid=([0]=1 [1]=2)
+    _pc_q_mode=([0]=checkout [1]=checkout)
+    _pc_run_done=() _pc_run_dur=() _pc_run_start=() _pc_run_end=() _pc_pool_failed=0 skipped=""
+    hook_progress() { echo "$*"; }
+    printf '3 10 1 2\n' > "$_pc_out_dir/0.rc"; printf 'skip 0 - -\n' > "$_pc_out_dir/1.rc"
+    WV="$ST/wv-stub"; : > "$ST/calls.log"
+    _pc_reap; _pc_record_all
+    echo "failed=$_pc_pool_failed stop=$([ -e "$_pc_out_dir/stop" ] && echo yes || echo no) skipped=[$skipped]"
+    echo "recorded=$(grep -c '^test-record' "$ST/calls.log")"
+)
+out=$(skip_case)
+check "a failure raises the stop flag for waiters" "failed=1 stop=yes skipped=[tests/test-waited.sh]" "$(grep '^failed=' <<< "$out")"
+check "...the stopped waiter is not reported FAILED" "0" "$(grep -c 'FAILED tests/test-waited.sh' <<< "$out")"
+check "...and only the suite that ran is recorded" "recorded=1" "$(grep '^recorded=' <<< "$out")"
+rm -rf "$ST"
+
+echo "the pool bound takes a lane's bound first"
 check "WV_GATE_JOBS alone" "3" "$(WV_GATE_JOBS=3 hook_gate_jobs)"
-check "a lane share wins over WV_GATE_JOBS" "1" "$(WV_GATE_JOBS=3 WV_GATE_LANE_JOBS=1 hook_gate_jobs)"
+check "a lane's bound wins over WV_GATE_JOBS" "1" "$(WV_GATE_JOBS=3 WV_GATE_LANE_JOBS=1 hook_gate_jobs)"
 check "neither set: 4" "4" "$(env -u WV_GATE_JOBS -u WV_GATE_LANE_JOBS bash -c '. "$1/scripts/lib/wv-gate-pool.sh"; hook_gate_jobs' _ "$ROOT")"
 
 echo "a lane's pool settings do not reach a gate its suite runs (nested boundary, wv-6900e1)"

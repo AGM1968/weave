@@ -41,10 +41,14 @@ class NodeFetchError(RuntimeError):
     """
 
 
-def get_weave_nodes() -> list[WeaveNode]:
-    """Fetch all Weave nodes; raises :class:`NodeFetchError` on failure."""
+def get_weave_nodes(ids: list[str] | None = None) -> list[WeaveNode]:
+    """Fetch all Weave nodes, or only ``ids`` (``wv list --ids``, wv-26fd0b);
+    raises :class:`NodeFetchError` on failure."""
+    args = ["list", "--all", "--json-v2"] if ids is None else ["list", f"--ids={','.join(ids)}", "--json-v2"]
+    if ids is not None and not ids:
+        return []
     try:
-        raw = wv_cli("list", "--all", "--json-v2")
+        raw = wv_cli(*args)
         data = json.loads(raw)
     except (subprocess.CalledProcessError, OSError) as e:
         raise NodeFetchError(f"wv list failed: {e}") from e

@@ -1,6 +1,7 @@
 ---
 id: rules
-description: "Advisory workflow discipline: graph intent, verification, scoped sessions, and safe retries."
+description:
+  "Advisory workflow discipline: graph intent, verification, scoped sessions, and safe retries."
 fallback: "wv guide --procedure=rules"
 adapters: [codex, copilot]
 visibility: shared
@@ -11,8 +12,11 @@ status: ready
 
 Enforced invariants remain in hooks and the CLI; this procedure covers the judgment around them.
 
-- Track work before edits, create follow-up nodes for untracked fixes, and record intent in the graph.
+- Track work before edits, create follow-up nodes for untracked fixes, and record intent in the
+  graph.
 - Load `wv context <id> --json` before complex work and verify assumptions before relying on them.
-- Capture structured learnings for non-trivial work; commit incrementally; sync and push at session end.
+- Capture structured learnings for non-trivial work; commit incrementally; run
+  `wv sync --gh && git push` before the session ends, since no hook does it.
 - Keep sessions bounded to related work. Do not bypass hooks or duplicate long-running commands.
-- When decomposing a proposal, use its sprint labels verbatim and set criteria/risks before claiming.
+- When decomposing a proposal, use its sprint labels verbatim and set criteria/risks before
+  claiming.

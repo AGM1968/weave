@@ -29,6 +29,9 @@ export WV_HOOK_OBSERVATIONS="${POLICY_HOOKS_OBSERVATIONS:-$TMP/observations.json
 : > "$WV_HOOK_OBSERVATIONS"
 export WV_HOT_ZONE="$TMP/hot" WV_DB="$TMP/hot/brain.db" WV_CONFIG_DIR="$TMP/config"
 export CLAUDE_PROJECT_DIR="$P" WV_PROJECT_DIR="$P"
+# Session-local state is per owner (wv-43d6be): pin one owner, whatever
+# session runs this suite.
+export WV_AGENT_ID=test-policy-hooks-agent
 export WV_REQUIRE_LEARNING=0 WV_REQUIRE_QUALITY=0
 mkdir -p "$P/src" "$WV_HOT_ZONE" "$WV_CONFIG_DIR"
 cd "$P" || exit 1
@@ -50,7 +53,7 @@ claim() {  # claim <id> — the only active node from here on
         [ "$other" = "$1" ] || "$WV" update "$other" --status=todo >/dev/null 2>&1
     done
     "$WV" work "$1" >/dev/null 2>&1
-    rm -f "$WV_HOT_ZONE"/.context_checked_* "$WV_HOT_ZONE/.session_epoch" "$WV_HOT_ZONE/.session_phase"
+    rm -f "$WV_HOT_ZONE"/owners/*/.context_checked_* "$WV_HOT_ZONE/.session_epoch" "$WV_HOT_ZONE"/owners/*/.session_phase
 }
 edit_of() { jq -cn --arg p "$1" '{tool_name:"Edit",tool_input:{file_path:$p,old_string:"a",new_string:"b"}}'; }
 bash_of() { jq -cn --arg c "$1" --arg cwd "$P" '{tool_name:"Bash",tool_input:{command:$c},cwd:$cwd}'; }
@@ -95,10 +98,10 @@ hookcell "editing with no active node is denied" edit_requires_active_node deny 
     "$(edit_of "$P/src/app.py")"
 work=$(node "hook edit probe" --criteria="c1" --risks=low)
 claim "$work"
-printf '%s' discover > "$WV_HOT_ZONE/.session_phase"
+mkdir -p "$WV_HOT_ZONE/owners/$WV_AGENT_ID" && printf '%s' discover > "$WV_HOT_ZONE/owners/$WV_AGENT_ID/.session_phase"
 hookcell "editing in the discover phase is denied" edit_blocked_in_phase deny - exit2 pre-action.sh \
     "$(edit_of "$P/src/app.py")"
-rm -f "$WV_HOT_ZONE/.session_phase"
+rm -f "$WV_HOT_ZONE/owners/$WV_AGENT_ID/.session_phase"
 echo $(( $(date +%s) + 3600 )) > "$WV_HOT_ZONE/.session_epoch"
 hookcell "editing under a node from an earlier session is denied" active_node_not_stale deny - exit2 pre-action.sh \
     "$(edit_of "$P/src/app.py")"
@@ -110,10 +113,49 @@ hookcell "editing under an unresolved contradiction is denied" active_node_contr
 sqlite3 "$WV_DB" "DELETE FROM edges WHERE type='contradicts';"
 blocker=$(node "hook blocker")
 sqlite3 "$WV_DB" "INSERT INTO edges(source,target,type,weight,created_at) VALUES('$blocker','$work','blocks',1.0,CURRENT_TIMESTAMP);"
-rm -f "$WV_HOT_ZONE"/.context_checked_*
+rm -f "$WV_HOT_ZONE"/owners/*/.context_checked_*
 hookcell "editing a node with an open blocker is denied" active_node_not_blocked deny - exit2 pre-action.sh \
     "$(edit_of "$P/src/app.py")"
 sqlite3 "$WV_DB" "DELETE FROM edges WHERE type='blocks';"
+
+echo "=== an edit is judged by the graph of the checkout its file is in (wv-455739) ==="
+# The hook's cwd is $P, whose graph has $work active. An edit to a file in a
+# second Weave checkout used to be judged against $P's graph and admitted on
+# that claim -- how a peer session's claim admitted edits in a linked worktree.
+claim "$work"  # a clean claim here, which would admit an edit in $P
+Q="$TMP/other"
+mkdir -p "$Q/src"
+q_env() { (cd "$Q" && env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CLAUDE_PROJECT_DIR "$@"); }
+(cd "$Q" && git init -q . && git config user.email t@t && git config user.name t && git config commit.gpgsign false)
+# $Q's graph sits at the default placement, as a real second checkout's does:
+# the guard drops pinned zones when it moves to the file's checkout. Under the
+# gate's test mode that placement is inside WV_TEST_HOT_ZONE_ROOT, whose tmp/
+# parent the runner does not create and wv will not (wv-80be32); create it
+# private (wv-bc1cd3).
+[ -z "${WV_TEST_HOT_ZONE_ROOT:-}" ] || (umask 077 && mkdir -p "$WV_TEST_HOT_ZONE_ROOT/tmp")
+q_env "$WV" init >/dev/null 2>&1
+echo "print('q')" > "$Q/src/q.py"
+Q_ZONE=$(dirname "$(q_env "$WV" hotzone db 2>/dev/null)")
+case "$Q_ZONE" in /tmp/weave-*/?*) trap 'rm -rf "$TMP" "$LOCKS" "$Q_ZONE"' EXIT ;; esac
+# Without $Q's database the guard cannot judge and lets the edit through
+# (wv-187945), which would read here as the defect itself.
+if [ -s "$Q_ZONE/brain.db" ]; then
+    ok "fixture: the second checkout has its own graph at $Q_ZONE"
+else
+    bad "fixture: the second checkout has its own graph" "no brain.db at '$Q_ZONE'"
+fi
+hookcell "an edit in another checkout with no claim there is denied, though the cwd checkout has one" \
+    edit_requires_active_node deny - exit2 pre-action.sh "$(edit_of "$Q/src/q.py")"
+qwork=$(first_id "$(q_env "$WV" add "q edit probe" --standalone --alias=q-probe --criteria=c1 --risks=low 2>/dev/null)")
+q_env "$WV" work "$qwork" >/dev/null 2>&1
+rm -f "$Q_ZONE"/owners/*/.context_checked_* "$Q_ZONE/.session_epoch" "$Q_ZONE"/owners/*/.session_phase
+printf '%s' "$(edit_of "$Q/src/q.py")" | bash "$HOOKS/pre-action.sh" > "$TMP/hook.out" 2> "$TMP/hook.err"
+q_rc=$?
+if [ "$q_rc" = 0 ] && ! grep -q '"deny"' "$TMP/hook.out"; then
+    ok "with a claim in that checkout the edit is admitted"
+else
+    bad "with a claim in that checkout the edit is admitted" "rc=$q_rc $(head -c 300 "$TMP/hook.out" "$TMP/hook.err" | tr '\n' ' ')"
+fi
 
 echo "=== claim preflight ==="
 bare=$(node "hook claim probe")

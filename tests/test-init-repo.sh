@@ -538,6 +538,40 @@ assert_file_exists "$REPO4/.codex/weave.json"               "all: creates Codex 
 SETTINGS4=$(cat "$REPO4/.claude/settings.json")
 assert_not_contains "$SETTINGS4" '"hooks"'                  "all: settings.json has NO hooks key"
 
+# --- rc.15 rollout findings: the proposal is not graph dirt, a decline is
+# durable, and an update reports what it added (wv-0f6962, wv-ef9ba9) ---
+echo ""
+echo "--- --update: proposal dirt, decline, additions ---"
+REPO4B=$(make_test_repo "rollout")
+cd "$REPO4B"
+OUTPUT=$("$WV" init-repo --agent=claude --update 2>&1)
+assert_contains "$OUTPUT" "Added by this update (not present before" \
+    "--update on a never-scaffolded repository says it added files"
+# The count the summary reports equals the files that appeared (the fixture
+# started empty), and the list names them. Which file sorts into the printed
+# 40 varies by platform: an assertion on one name failed on ubuntu-26.04 (rc.16).
+_added_n=$(grep -oE 'beyond a refresh\): [0-9]+ file' <<< "$OUTPUT" | grep -oE '[0-9]+')
+_actual_n=$(cd "$REPO4B" && find . -path ./.git -prune -o -type f -print | wc -l | tr -d ' ')
+assert_equals "$_actual_n" "${_added_n:-none}" "--update: the added count is every file that appeared"
+assert_contains "$OUTPUT" "  + " "--update: names the added files"
+OUTPUT=$("$WV" init-repo --agent=claude --update 2>&1)
+assert_not_contains "$OUTPUT" "Added by this update" \
+    "--update on an already-scaffolded repository reports no additions"
+if git -C "$REPO4B" check-ignore -q .weave/gate-provision.proposed.json; then
+    echo -e "  ${GREEN}✓${NC} the proposal path is ignored in the consumer .gitignore"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo -e "  ${RED}✗${NC} the proposal path should be ignored in the consumer .gitignore"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+printf '{}\n' > "$REPO4B/.weave/gate-provision.proposed.json"
+printf 'declined 2026-11-10: no frozen suites wanted here\n' > "$REPO4B/.weave/gate-provision.declined"
+OUTPUT=$("$WV" init-repo --agent=claude --update 2>&1)
+assert_contains "$OUTPUT" "declined by .weave/gate-provision.declined" \
+    "--update respects a durable decline"
+assert_file_absent "$REPO4B/.weave/gate-provision.proposed.json" \
+    "--update removes the proposal a decline supersedes"
+
 # --- --update refreshes managed files ---
 echo ""
 echo "--- --update ---"
@@ -797,6 +831,31 @@ else
     echo -e "${GREEN}✓${NC} gitattr upgrade: bare entry stripped"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 fi
+
+# --- runtime ignores: one list, and committed runtime state named (wv-9a54da) ---
+echo ""
+echo "--- gitignore: runtime ignores ---"
+REPO8=$(make_test_repo "runtime-ignores")
+cd "$REPO8"
+mkdir -p .weave
+printf 'a.sql\n' > .weave/.applied_deltas
+printf '{}\n' > .weave/sync-digest-cache.json
+printf 'graph\n' > .weave/state.sql
+git add -A && git -c user.name=t -c user.email=t@t commit -qm "consumer committed runtime state"
+OUT8=$("$WV" init-repo --update --agent=claude 2>&1)
+GI8=$(cat "$REPO8/.gitignore")
+# shellcheck source=scripts/lib/wv-runtime-ignores.sh
+source "$PROJECT_ROOT/scripts/lib/wv-runtime-ignores.sh"
+missing8=""
+while IFS= read -r entry; do
+    grep -qxF -- "$entry" <<< "$GI8" || missing8="$missing8 $entry"
+done < <(wv_runtime_ignores)
+assert_equals "" "$missing8" "runtime ignores: every canonical entry is in the consumer .gitignore"
+assert_contains "$OUT8" "git rm --cached -- .weave/.applied_deltas .weave/sync-digest-cache.json" \
+    "runtime ignores: already-tracked runtime files are named with the command that untracks them"
+assert_not_contains "$OUT8" "git rm --cached -- .weave/state.sql" "runtime ignores: graph state is not named"
+assert_equals ".weave/.applied_deltas" "$(git ls-files .weave/.applied_deltas)" \
+    "runtime ignores: init-repo leaves the index to the operator"
 
 # --- .gitattributes: preserves user entries ---
 echo ""
@@ -1347,6 +1406,32 @@ assert_file_absent "$REPO_GATE_PATHS/suite-was-executed" "diagnostics never exec
 OUTPUT=$("$WV" doctor 2>/dev/null || true)
 assert_contains "$OUTPUT" 'gate ignored paths:' "text doctor emits the same advisory"
 assert_contains "$OUTPUT" 'venv_ee/bin/activate' "text doctor identifies the literal ignored path"
+
+# An ignored gate declaration never reaches a commit (wv-bca9ec): the gate
+# reads it from committed blobs only, so git add skips it and the repository
+# stays on its default with no message.
+REPO_DECL_IGNORED=$(make_test_repo decl-ignored)
+cd "$REPO_DECL_IGNORED"
+mkdir -p .weave checks
+printf '*.json\n' > .gitignore
+printf 'docs/ = checks/docs.sh\n' > .weave/test-map.conf
+printf 'exit 0\n' > checks/docs.sh
+printf '{"version": 3, "default": {"mode": "checkout"}, "recipes": {}, "suites": {}}\n' > .weave/gate-provision.json
+OUTPUT=$("$WV" init-repo --agent=codex 2>&1)
+assert_contains "$OUTPUT" '.weave/gate-provision.json is ignored by .gitignore:1:*.json' \
+    "init-repo names the rule that ignores the gate declaration"
+assert_contains "$OUTPUT" '!.weave/gate-provision.json' "init-repo gives the exception line"
+DECL_DETAIL=$(jq -r '.checks[] | select(.check == "gate ignored paths") | .detail' <<< "$("$WV" doctor --json 2>/dev/null || true)")
+assert_contains "$DECL_DETAIL" '.weave/gate-provision.json is ignored' "doctor warns about the ignored declaration"
+printf '!.weave/gate-provision.json\n' >> .gitignore
+DECL_DETAIL=$(jq -r '.checks[] | select(.check == "gate ignored paths") | .detail' <<< "$("$WV" doctor --json 2>/dev/null || true)")
+assert_not_contains "$DECL_DETAIL" 'gate-provision.json' "with the exception, no declaration warning"
+printf '*.json\n' > .gitignore
+git add -f .weave/gate-provision.json
+DECL_DETAIL=$(jq -r '.checks[] | select(.check == "gate ignored paths") | .detail' <<< "$("$WV" doctor --json 2>/dev/null || true)")
+assert_not_contains "$DECL_DETAIL" 'gate-provision.json' "a tracked declaration is not reported as ignored"
+cd "$REPO_GATE_PATHS"
+
 # A symlinked declaration or suite must not read outside this repository.
 cp .weave/test-map.conf "$TEST_DIR/outside-map.conf"
 mv .weave/test-map.conf .weave/test-map.saved
@@ -1427,6 +1512,70 @@ OUTPUT=$("$WV" init-repo --agent=codex 2>&1)
 assert_equals "absent" "$([ -e "$REPO_UNLOCKED/.weave/gate-provision.proposed.json" ] && echo present || echo absent)" \
     "proposal: an unlocked manifest proposes nothing"
 assert_contains "$OUTPUT" "requirements.txt is a name-and-version list" "proposal: and says why"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Host hook contract (wv-0f70b5): every hook Weave registers, for every host,
+# carries an explicit timeout inside that host's cap. A hook without one runs on
+# the host's default budget, which the host can change without notice (Claude
+# Code 2.1.74 cut SessionEnd to 1.5 s and the session-end routine failed on
+# every exit for eight months, wv-a32e69). Reads the files this checkout's
+# install.sh and init-repo generate, not install.sh's source text.
+echo ""
+echo "--- host hook contract ---"
+REPO_HOOKS=$(make_test_repo "host-hooks")
+cd "$REPO_HOOKS"
+"$WV" init-repo --agent=codex,copilot --codex-hooks >/dev/null 2>&1 || true
+# untimed <config>: "Event:command" for each hook without a numeric timeout > 0.
+untimed() {
+    jq -r '.hooks // {} | to_entries[] | .key as $ev
+        | .value[]? | (if has("hooks") then .hooks[]? else . end)
+        | select((.timeout | type) != "number" or .timeout <= 0)
+        | "\($ev):\(.command)"' "$1" 2>&1
+}
+# over_cap <config> <event> <cap>: timeouts of <event> above <cap>.
+over_cap() {
+    jq -r --arg ev "$2" --argjson cap "$3" '[.hooks[$ev][]? | (if has("hooks") then .hooks[]? else . end)
+        | .timeout | select(type == "number" and . > $cap)] | map(tostring) | join(" ")' "$1" 2>&1
+}
+for cfg in "$TEST_INSTALL/home/.claude/settings.json" "$REPO_HOOKS/.codex/hooks.json" "$REPO_HOOKS/.github/hooks/weave.json"; do
+    assert_file_exists "$cfg" "host hooks: $(basename "$(dirname "$cfg")")/$(basename "$cfg") is generated"
+    assert_equals "true" "$(jq -r '(.hooks // {}) | length > 0' "$cfg" 2>/dev/null)" \
+        "host hooks: $(basename "$(dirname "$cfg")")/$(basename "$cfg") registers hooks"
+    assert_equals "" "$(untimed "$cfg")" \
+        "host hooks: every hook in $(basename "$(dirname "$cfg")")/$(basename "$cfg") has an explicit timeout"
+done
+# Documented caps: Claude Code raises the SessionEnd budget to a hook's timeout
+# only up to 60 s; Codex 0.146.0 clamps SessionEnd to 3 s (default 1 s).
+assert_equals "" "$(over_cap "$TEST_INSTALL/home/.claude/settings.json" SessionEnd 60)" \
+    "host hooks: Claude Code SessionEnd timeout is within its 60 s cap"
+assert_equals "" "$(over_cap "$REPO_HOOKS/.codex/hooks.json" SessionEnd 3)" \
+    "host hooks: Codex SessionEnd timeout, if registered, is within its 3 s cap"
+# The checker itself refuses an untimed hook, so the contract cannot pass vacuously.
+printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"x"}]}],"PreCompact":[{"type":"command","command":"y","timeout":0}]}}\n' \
+    > "$REPO_HOOKS/untimed.json"
+assert_equals "Stop:x PreCompact:y" "$(untimed "$REPO_HOOKS/untimed.json" | sort -r | tr '\n' ' ' | sed 's/ $//')" \
+    "host hooks: the contract check flags a hook with no timeout or a zero one"
+
+# wv doctor --agent reports each host's version and hook budgets, and flags a
+# version that changed since the last run. Fake hosts on PATH keep it hermetic.
+HOST_BIN="$TEST_DIR/fake-hosts"
+mkdir -p "$HOST_BIN"
+printf '#!/bin/sh\necho "codex-cli 0.146.0"\n' > "$HOST_BIN/codex"
+chmod +x "$HOST_BIN/codex"
+DOC_CFG="$TEST_DIR/doctor-config"
+mkdir -p "$DOC_CFG"
+DOC_OUT=$(PATH="$HOST_BIN:$PATH" WV_DOCTOR_HOSTS=codex WV_CONFIG_DIR="$DOC_CFG" "$WV" doctor --agent --json 2>/dev/null || true)
+DOC_ROW=$(jq -r '[.checks[] | select(.check == "host hooks") | .detail | select(startswith("codex "))][0] // ""' <<<"$DOC_OUT" 2>/dev/null)
+assert_contains "$DOC_ROW" "codex 0.146.0" "doctor: records the host version"
+assert_contains "$DOC_ROW" "SessionStart=120" "doctor: reports per-event hook budgets"
+assert_equals '0.146.0' "$(jq -r '.codex // ""' "$DOC_CFG/host-versions.json" 2>/dev/null)" \
+    "doctor: keeps the version it saw"
+printf '#!/bin/sh\necho "codex-cli 0.147.0"\n' > "$HOST_BIN/codex"
+DOC_OUT=$(PATH="$HOST_BIN:$PATH" WV_DOCTOR_HOSTS=codex WV_CONFIG_DIR="$DOC_CFG" "$WV" doctor --agent --json 2>/dev/null || true)
+DOC_ROW=$(jq -r '[.checks[] | select(.check == "host hooks" and (.detail | startswith("codex ")))][0] | "\(.status) \(.detail)"' <<<"$DOC_OUT" 2>/dev/null)
+assert_contains "$DOC_ROW" "warn codex 0.147.0" "doctor: a changed host version warns"
+assert_contains "$DOC_ROW" "changed from 0.146.0" "doctor: and names the version it changed from"
+cd "$PROJECT_ROOT"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""

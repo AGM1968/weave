@@ -59,6 +59,62 @@ from weave_gh.body import parse_gh_body_description, parse_issue_template_fields
 # Used to detect Weave-closed issues and prevent phantom reopens.
 _WEAVE_CLOSE_MARKER = "Completed. Weave node"
 
+# Issue creation policy (owner ruling 2026-11-10 on wv-cb8268). The first full
+# sync of 2026-11-01 created 178 issues, 149 closed at once, for memory nodes
+# and long-done nodes that had never had one. A memory node never gets an
+# issue: memories graduate project-locally. A done node with no gh_issue never
+# gets one: an issue tracks open work, and a node created with --gh carries its
+# issue from birth. Before Phase 1 writes anything, a sync counts the issues it
+# may create and refuses above WV_GH_CREATE_LIMIT (default 25) unless --yes.
+DEFAULT_CREATE_LIMIT = 25
+
+
+class CreationLimitExceeded(Exception):
+    """A sync would create more issues than the limit allows without --yes."""
+
+    def __init__(self, planned: list[WeaveNode], limit: int) -> None:
+        self.planned = planned
+        self.limit = limit
+        super().__init__(f"{len(planned)} issue(s) to create, limit {limit}")
+
+
+def creation_skip_reason(node: WeaveNode) -> str | None:
+    """Why ``node`` must not get a new GitHub issue, or None when it may."""
+    if node.node_type == "memory":
+        return "memory node"
+    if node.status == "done" and not node.gh_issue:
+        return "done node with no issue"
+    return None
+
+
+def create_limit_from_env() -> int:
+    """WV_GH_CREATE_LIMIT as a non-negative int; the default when unset or invalid."""
+    raw = os.getenv("WV_GH_CREATE_LIMIT", "")
+    if raw.isdigit():
+        return int(raw)
+    if raw:
+        log.warning("⚠️  WV_GH_CREATE_LIMIT=%r is not a whole number; using %d", raw, DEFAULT_CREATE_LIMIT)
+    return DEFAULT_CREATE_LIMIT
+
+
+def planned_creations(candidates: list[WeaveNode], issues: list[GitHubIssue]) -> list[WeaveNode]:
+    """The candidates Phase 1 may create an issue for: an upper bound, since a
+    weave-synced title match found later backfills instead of creating."""
+    issue_numbers = {i.number for i in issues}
+    planned: list[WeaveNode] = []
+    for node in candidates:
+        if node.is_test or node.no_sync or node.node_type == "finding":
+            continue
+        if node.status not in NODE_STATUSES or creation_skip_reason(node):
+            continue
+        if node.gh_issue and node.gh_issue in issue_numbers:
+            continue
+        if _find_gh_match_by_body(node.id, issues) is not None:
+            continue
+        planned.append(node)
+    return planned
+
+
 # Cache of known-invalid assignee logins to avoid repeated failed API calls.
 _invalid_assignees: set[str] = set()
 _REIMPORTED_PRESERVE_MARKERS = ("## Tasks", "## Dependency Graph", "```mermaid")
@@ -83,10 +139,14 @@ def _current_gh_login() -> str | None:
 
 
 # Harnesses resolve_agent_id() (scripts/lib/wv-resolve-runtime.sh) prefixes onto
-# claimed_by as <harness>-<host>-<user>. Kept in sync manually; there is no single
+# claimed_by as <harness>-<host>-<user>, plus -h<digest16> for a harness session
+# (wv-99978b, wv-24d57b, _is_local_session_claim). Kept in sync manually; there is no single
 # source both languages import from. See docs/AGENT-IDENTITY-CONTRACT.md for the
 # full contract this module is obligated to recognize (wv-5fbc6c).
-_AGENT_HARNESSES = ("claude", "codex", "copilot", "human")
+# The harness label is open (wv-08d7f9): AI_AGENT names it, reduced to
+# [a-z0-9] and at most 24 characters (_wv_ai_agent_label), so pi, amp or a
+# future harness prefixes claimed_by without a change here.
+_AGENT_HARNESS_LABEL = r"[a-z0-9]{1,24}"
 
 
 def _desired_assignee_for_node(node: WeaveNode) -> str | None:
@@ -103,17 +163,34 @@ def _desired_assignee_for_node(node: WeaveNode) -> str | None:
 
     host_user = f"{socket.gethostname()}-{getpass.getuser()}"
     local_agent_ids = {
-        value
-        for value in (
-            os.getenv("WV_AGENT_ID"),
-            host_user,
-            *(f"{harness}-{host_user}" for harness in _AGENT_HARNESSES),
-        )
-        if value
+        value for value in (os.getenv("WV_AGENT_ID"), host_user) if value
     }
-    if node.claimed_by in local_agent_ids:
+    harness_claim = re.fullmatch(
+        rf"{_AGENT_HARNESS_LABEL}-{re.escape(host_user)}", node.claimed_by
+    )
+    if (
+        node.claimed_by in local_agent_ids
+        or harness_claim is not None
+        or _is_local_session_claim(node.claimed_by, host_user)
+    ):
         return _current_gh_login()
     return node.claimed_by
+
+
+def _is_local_session_claim(claimed_by: str, host_user: str) -> bool:
+    """True for a session-qualified local claim (wv-99978b, wv-24d57b).
+
+    resolve_agent_id() appends ``-h<digest16>`` -- the first 16 hex of sha256
+    over the whole session id -- to ``<harness>-<host>-<user>`` when the
+    harness carries a session id, so any session of this host and user maps to
+    the GH login. Claims written before wv-24d57b carry the legacy
+    ``-s<sid12>`` (1 to 12 characters of [A-Za-z0-9]) and still map.
+    """
+    pattern = (
+        rf"{_AGENT_HARNESS_LABEL}-{re.escape(host_user)}"
+        r"-(?:h[0-9a-f]{16}|s[A-Za-z0-9]{1,12})"
+    )
+    return re.fullmatch(pattern, claimed_by) is not None
 
 
 def _is_valid_assignee(login: str, repo: str) -> bool:
@@ -356,6 +433,7 @@ def sync_weave_to_github(
     focus_node_id: str | None = None,
     cache: dict[str, Any] | None = None,
     checkpoint: dict[str, Any] | None = None,
+    assume_yes: bool = False,
 ) -> list[GitHubIssue]:
     """Create/update/close GitHub issues from Weave nodes.
 
@@ -366,12 +444,22 @@ def sync_weave_to_github(
     ``cache`` is the structural-digest cache (Phase C). When provided, body
     rendering is skipped for nodes whose digest matches the cached entry.
 
+    Before any write, the issues this pass may create are counted and printed;
+    above WV_GH_CREATE_LIMIT (default 25) the pass raises
+    :class:`CreationLimitExceeded` unless ``assume_yes`` (wv-cb8268).
+
     Returns the updated issues list (including newly created).
     """
     candidates = select_candidates(
         nodes, mode=mode, focus_node_id=focus_node_id, issues=issues
     )
     stats.candidates = len(candidates)
+    planned = planned_creations(candidates, issues)
+    if planned:
+        limit = create_limit_from_env()
+        log.info("   This pass may create up to %d GitHub issue(s).", len(planned))
+        if len(planned) > limit and not assume_yes and not dry_run:
+            raise CreationLimitExceeded(planned, limit)
     if mode is Mode.FAST:
         return _fast_traversal(
             nodes,
@@ -683,7 +771,15 @@ def _handle_new_issue(
             existing.number,
         )
 
-    # Create new GH issue
+    # Create new GH issue -- unless the creation policy rules it out (wv-cb8268).
+    # Checked here, after the title-match backfill above, so a done or memory
+    # node still adopts an existing weave-synced issue; it only never gets a
+    # new one.
+    skip_reason = creation_skip_reason(node)
+    if skip_reason:
+        log.debug("  ⏭ No issue for %s (%s)", node.id, skip_reason)
+        stats.skipped += 1
+        return
     edges = get_edges_for_node(node.id)
     weave_body = render_issue_body(node, nodes_by_id, edges)
     labels = get_labels_for_node(node)
@@ -773,10 +869,16 @@ def _handle_existing_issue(  # pylint: disable=too-many-arguments,too-many-local
 
     about_to_close = node.status == "done" and issue.state == "OPEN"
 
-    # Always update body if content changed — even for already-closed issues.
-    # wv done closes GH issues directly but doesn't refresh the parent epic
-    # body, so checkboxes and Mermaid graphs go stale. By updating bodies
-    # unconditionally here, wv sync --gh catches up on any missed updates.
+    # Update the body if content changed. wv done closes GH issues directly but
+    # doesn't refresh the parent epic body, so an OPEN epic's checkboxes and
+    # Mermaid graph go stale; a sync catches them up here.
+    #
+    # A CLOSED issue of a done node is history and is never rewritten (owner
+    # decision 2026-11-10, wv-092ea6): after the 2026-11-09 prune a full sync
+    # would have rewritten 698 issue bodies, 632 of them closed, only to drop
+    # links to pruned relatives whose issues still exist. A node closing in this
+    # pass still gets its final body, since its issue is OPEN until the close
+    # below, and a node that is not done (a reopen) still updates.
     edges = get_edges_for_node(node.id)
 
     # Guard: nodes re-imported from GitHub (source=github) can lack child/edge
@@ -789,7 +891,9 @@ def _handle_existing_issue(  # pylint: disable=too-many-arguments,too-many-local
         e.target == node.id and e.edge_type == "implements" for e in edges
     )
     _preserve_structured_body = _reimported_body_has_structured_sections(issue.body)
-    if _is_reimported and not _has_children and _preserve_structured_body:
+    if issue.state == "CLOSED" and node.status == "done":
+        log.debug("  ⏭ #%d is closed history (%s); body kept", gh_match, node.id)
+    elif _is_reimported and not _has_children and _preserve_structured_body:
         log.info(
             "  ⏭ Skipping body update for re-imported node %s"
             " (no children; preserving structured sections)",
@@ -1078,6 +1182,9 @@ def sync_closed_to_weave(
                         node.id,
                         "--skip-verification",
                         "--acknowledge-overlap",
+                        # The issue closed outside this checkout; staged files
+                        # here are not this node's unfinished commit (wv-b026bb).
+                        "--force",
                         "--learning=closed via GH issue sync (Phase 3)",
                         check=False,
                     )
@@ -1096,7 +1203,7 @@ def refresh_parent_body(child_id: str, *, dry_run: bool = False) -> bool:
     and updates the GH issue if the content hash changed. Returns True if
     the parent was updated.
     """
-    from weave_gh.data import (  # pylint: disable=import-outside-toplevel
+    from weave_gh.data import (  # pylint: disable=import-outside-toplevel  # noqa: PLC0415
         NodeFetchError,
         get_weave_nodes,
     )
@@ -1106,9 +1213,13 @@ def refresh_parent_body(child_id: str, *, dry_run: bool = False) -> bool:
     if not parent_id:
         return False
 
-    # Get all nodes to build nodes_by_id for rendering
+    # The body renders the parent and the nodes on its edges (its own parent,
+    # blockers, children), so only those are read: every node took 2.6 s of a
+    # 7 s refresh on this graph (wv-26fd0b).
+    edges = get_edges_for_node(parent_id)
+    needed = sorted({parent_id} | {e.source for e in edges} | {e.target for e in edges})
     try:
-        nodes = get_weave_nodes()
+        nodes = get_weave_nodes(ids=needed)
     except NodeFetchError as e:
         log.warning("  ⚠ Parent refresh skipped: %s", e)
         return False
@@ -1139,8 +1250,7 @@ def refresh_parent_body(child_id: str, *, dry_run: bool = False) -> bool:
     if not raw:
         return False
 
-    # Re-render and compare
-    edges = get_edges_for_node(parent_id)
+    # Re-render and compare (edges were read above)
     new_weave_block = render_issue_body(parent, nodes_by_id, edges)
 
     if not should_update_body(raw, new_weave_block):

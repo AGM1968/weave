@@ -422,6 +422,38 @@ def test_citation_integrity_bounds_reference_section_and_scans_later_body(
     assert [(item.line, item.match_text) for item in found] == [(8, "Missing, 2024")]
 
 
+REFERENCES_DOC = (
+    "Surface Soil Moisture drives the model.\n\n"  # line 1: body
+    "## References\n"  # line 3: heading
+    "Yue, J. (2019). Surface Soil Moisture retrieval. https://example.org/a\n\n"  # line 4
+    'Kim, S. (2021). "Surface Soil Moisture from radar".\n\n'  # line 6
+    "## Annex A\n"  # line 8: same level, closes the section
+    "Surface Soil Moisture again.\n"  # line 9: later body
+)
+
+
+@pytest.mark.parametrize("scope", ["paragraph", "line"])
+def test_regex_prose_rule_skips_references_section(tmp_path: Path, scope: str) -> None:
+    """wv-c557db: a regex prose rule does not fire on citation entries or
+    quoted titles inside the References section, and still scans the body
+    before and after it."""
+    rule_path = _rule(
+        tmp_path,
+        "id: noun-stack\nlanguage: prose\nkind: regex\nseverity: info\n"
+        f"match_scope: {scope}\npatterns:\n  - 'surface soil moisture'\n",
+    )
+    doc = _write(tmp_path / "doc.md", REFERENCES_DOC)
+    found = run_prose_rule("noun-stack", rule_path, doc, scan_id=1)
+    assert [item.line for item in found] == [1, 9]
+
+
+def test_markdown_markup_rule_still_scans_references_section(tmp_path: Path) -> None:
+    rule_path = MANAGED_PATTERNS / "markdown-bare-url.yaml"
+    doc = _write(tmp_path / "doc.md", REFERENCES_DOC)
+    found = run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
+    assert [item.line for item in found] == [4]
+
+
 @pytest.mark.parametrize("token", ["D1.2", "D4.5", "P29", "wv-e321fd", "mo"])
 def test_citation_integrity_rejects_code_like_pseudo_authors(
     tmp_path: Path, token: str
@@ -655,6 +687,26 @@ def test_regex_rule_exempts_legitimate_compound_terms(tmp_path: Path) -> None:
     found = run_prose_rule(rule_path.stem, rule_path, doc, scan_id=1)
     assert len(found) == 1
     assert found[0].match_text == "honest"
+
+
+@pytest.mark.parametrize("kind_body", ["kind: regex\npatterns:\n  - 'soil'", "kind: lexicon\nterms:\n  - soil"])
+@pytest.mark.parametrize("entry", ["surface soil moisture", "surface-soil-moisture"])
+def test_exempt_entry_treats_hyphen_and_space_as_equivalent(
+    tmp_path: Path, kind_body: str, entry: str
+) -> None:
+    """wv-fa7684: one exempt entry covers every hyphen/space variant of the
+    phrase; a bare "soil" outside the phrase still fires."""
+    rule_path = _rule(
+        tmp_path,
+        f"id: soil\nlanguage: prose\n{kind_body}\nseverity: info\nexempt:\n  - '{entry}'\n",
+    )
+    doc = _write(
+        tmp_path / "doc.md",
+        "Surface soil moisture, surface-soil moisture, surface soil-moisture and "
+        "Surface-Soil-Moisture all agree.\n\nBare soil is different.\n",
+    )
+    found = run_prose_rule("soil", rule_path, doc, scan_id=1)
+    assert [(item.line, item.match_text) for item in found] == [(3, "soil")]
 
 
 def test_prose_regex_matches_across_soft_wrap_and_maps_source_line(tmp_path: Path) -> None:

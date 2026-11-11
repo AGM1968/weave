@@ -142,10 +142,14 @@ _wv_snapshot_db() {
 # arbitrary DB file (a snapshot from _wv_snapshot_db) rather than the global
 # $WV_DB. db_query_json itself stays coupled to $WV_DB (used throughout the
 # rest of the codebase for live queries); this is only for the export bundle.
+#
+# Streams rather than holding the result in a shell variable: the nodes
+# export is ~5 MB, and the capture cost ~200 ms a projection (wv-5c1223).
+# Every caller pipes into `jq -c '.[]'` under pipefail, so sqlite3's status
+# still decides, and an empty table -- no output, where the capture printed
+# "[]" -- yields the same empty projection.
 _wv_query_json_snapshot() {
-    local raw
-    raw=$(sqlite3 -json -cmd ".timeout 5000" "$1" "$2") || return $?
-    printf '%s\n' "${raw:-[]}"
+    sqlite3 -json -cmd ".timeout 5000" "$1" "$2"
 }
 
 # Human pattern-finding dispositions are the only non-rebuildable quality.db
@@ -258,8 +262,14 @@ _wv_emit_deltas() {
 
     # Lineage stamp for everything emitted this cycle (wv-cdb45a): one Lamport
     # tick past the durable high-water.
-    local lineage_seq
-    lineage_seq=$(( $(wv_lineage_seq_base "$db" "$weave_dir/deltas") + 1 ))
+    local lineage_seq lineage_base
+    if ! lineage_base=$(wv_lineage_seq_base "$db" "$weave_dir/deltas"); then
+        rm -rf "$staging_dir"
+        echo "wv: failed to read the lineage high-water" >&2
+        printf '%s\n' "$watermark"
+        return 1
+    fi
+    lineage_seq=$(( lineage_base + 1 ))
     if ! wv_delta_changeset "$db" "$agent_id" "$lineage_seq" "$watermark" > "$staged_delta"; then
         rm -rf "$staging_dir"
         echo "wv: failed to generate portable delta" >&2
@@ -454,11 +464,14 @@ _wv_discard_staged_deltas() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# auto_sync — Throttled auto-persist after mutating commands
+# auto_sync — publish after every mutating command
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Auto-sync interval in seconds (default 60). Set WV_AUTO_SYNC=0 to disable.
-WV_SYNC_INTERVAL="${WV_SYNC_INTERVAL:-60}"
+# Set WV_AUTO_SYNC=0 to disable (test isolation, scratch loads). There is no
+# interval: WV_SYNC_INTERVAL used to skip a sync within 60 s of the last one,
+# and the skipped change stayed unpublished with stale lineage until whatever
+# published next, possibly a hook's reload inside an E5 window, moved the
+# causal identity (wv-851fb4; owner ruling 2026-11-05: publish everywhere).
 WV_AUTO_SYNC="${WV_AUTO_SYNC:-1}"
 # Auto-checkpoint: WIP git commit after sync. Set WV_AUTO_CHECKPOINT=0 to disable.
 WV_AUTO_CHECKPOINT="${WV_AUTO_CHECKPOINT:-1}"
@@ -466,6 +479,87 @@ WV_AUTO_CHECKPOINT="${WV_AUTO_CHECKPOINT:-1}"
 # Rate-limits git commits across auto_sync, explicit sync, and hook paths.
 # Set to 0 for aggressive commits (original behavior).
 WV_CHECKPOINT_INTERVAL="${WV_CHECKPOINT_INTERVAL:-600}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Repository maintenance lock and its pending fence (wv-28ef47, docs/PROPOSAL-delta-retention.md Stage A).
+#
+# One lock file per working tree, in its git directory, so it is never
+# tracked: <git-dir>/weave-maintenance/lock. Catalog maintenance
+# (wv compact --pre-cutover) holds it exclusive from its first precondition
+# check until its commit lands, and through --resume and --abort. Writers that
+# publish into .weave/ hold it shared: the delta publish step of auto_sync,
+# wv sync, and, in this repository, E5 capture-start (which takes the same
+# lock with fcntl, sharing flock(2) semantics on Linux).
+#
+# The lock alone is not enough. A maintenance process that dies releases its
+# lock but leaves a half-removed catalog. So maintenance writes a pending
+# record (<git-dir>/weave-maintenance/pending.json) before its first removal
+# and deletes it only once the commit or abort is complete; every shared
+# taker refuses while that record exists. A writer therefore never publishes
+# onto a partial catalog, whether maintenance is running or has crashed.
+#
+# The lock coordinates participating wv processes only. Raw git commands,
+# older wv binaries and other worktrees do not take it; maintenance
+# revalidates its pinned state before publishing instead, and external
+# mutation during maintenance is unsupported.
+#
+# A process holds its shared lock until it exits: wv runs one command per
+# process, and an explicit release would need a release on every return path.
+
+# wv_maint_dir -- print <git-dir>/weave-maintenance for the project's working
+# tree, or nothing when the project is not a git checkout (nothing to fence).
+# WV_MAINT_DIR overrides it, so a suite that runs capture-start against this
+# checkout registers its windows in scratch, not in the real git directory.
+wv_maint_dir() {
+    if [ -n "${WV_MAINT_DIR:-}" ]; then printf '%s\n' "$WV_MAINT_DIR"; return 0; fi
+    local project="${WV_PROJECT_DIR:-}" gitdir
+    [ -n "$project" ] || project="$(dirname "${WEAVE_DIR:-.weave}")"
+    gitdir=$(git -C "$project" rev-parse --absolute-git-dir 2>/dev/null) || return 0
+    [ -n "$gitdir" ] && printf '%s/weave-maintenance\n' "$gitdir"
+}
+
+# wv_maint_pending_refusal DIR WHO -- print the refusal for a pending
+# maintenance transaction and return 1, or return 0 when none is pending.
+wv_maint_pending_refusal() {
+    local dir="$1" who="$2"
+    [ -f "$dir/pending.json" ] || return 0
+    echo "wv: $who refused: a catalog maintenance transaction is pending ($dir/pending.json)." >&2
+    echo "  The delta catalog may be partly removed. Finish or undo it first:" >&2
+    echo "    wv compact --pre-cutover --resume    or    wv compact --pre-cutover --abort" >&2
+    return 1
+}
+
+# wv_maint_shared_enter WHO -- take the maintenance lock shared for the rest of
+# this process, then refuse when a maintenance transaction is pending. Waits
+# up to WV_MAINT_LOCK_WAIT seconds (default 600) for a running maintenance to
+# finish, then fails: a writer that cannot be ordered after maintenance must
+# not publish.
+wv_maint_shared_enter() {
+    local who="${1:-writer}" dir lock wait="${WV_MAINT_LOCK_WAIT:-600}"
+    dir=$(wv_maint_dir)
+    [ -n "$dir" ] || return 0
+    lock="$dir/lock"
+    # Descendants of the maintenance process (its scratch loads) run under the
+    # exclusive hold it already took; re-taking it would deadlock on itself.
+    [ "${WV_MAINT_HOLDER:-}" = "$lock" ] && return 0
+    if [ -z "${_WV_MAINT_SHARED_FD:-}" ] || [ "${_WV_MAINT_SHARED_LOCK:-}" != "$lock" ]; then
+        command -v flock >/dev/null 2>&1 || {
+            echo "wv: $who refused: flock is unavailable, so the maintenance lock cannot be taken" >&2
+            return 1
+        }
+        (umask 077 && mkdir -p "$dir") || return 1
+        local fd
+        exec {fd}>>"$lock" || return 1
+        if ! flock -s -w "$wait" "$fd"; then
+            exec {fd}>&-
+            echo "wv: $who refused: catalog maintenance held the lock for over ${wait}s ($lock)" >&2
+            return 1
+        fi
+        _WV_MAINT_SHARED_FD=$fd
+        _WV_MAINT_SHARED_LOCK=$lock
+    fi
+    wv_maint_pending_refusal "$dir" "$who"
+}
 
 # _delta_compact — delete delta files older than WV_DELTA_RETAIN_DAYS (default 30).
 # SAFETY: only call manually (via `wv compact`) when all agents have loaded the
@@ -556,6 +650,20 @@ _wv_db_foreign_to_weave_dir() { # predicate
     [ -n "${WV_DB_CUSTOM:-}" ] && [ -z "${WEAVE_DIR_CUSTOM:-}" ]
 }
 
+# _wv_fence_explain WHAT MISSING — the writer fence's message (wv-aac412):
+# what happened, the compaction records this database was not loaded under,
+# and the recovery, which wv load performs (auto_sync's fenced path publishes
+# unsynced changes as deltas before the reload replays them).
+_wv_fence_explain() {
+    {
+        echo -e "${YELLOW}⚠${NC}  wv: $1: this database was loaded before a compaction in ${WEAVE_DIR:-.weave}/compaction/:"
+        printf '%s\n' "$2" | sed 's/^/      /'
+        echo "    Writing state.sql from it would drop changes whose deleted delta files it never read."
+        echo "    Recover with 'wv load': it publishes this database's unsynced changes as deltas,"
+        echo "    then reloads the current state.sql and replays them."
+    } >&2
+}
+
 # _redump_state_after_removal <removed-node-count> — re-dump state.sql after
 # wv delete / wv prune removed nodes from the live DB, so wv load cannot
 # resurrect them (wv-0d5e07). Two cases must not reach the file (wv-5d5ef2):
@@ -568,6 +676,11 @@ _redump_state_after_removal() {
     local removed="${1:-0}"
     _wv_db_foreign_to_weave_dir && return 0
     [ -d "$WEAVE_DIR" ] || return 0
+    local _fenced
+    if ! _fenced=$(wv_compaction_fence "$WV_DB" "$WEAVE_DIR"); then
+        _wv_fence_explain "state.sql kept" "$_fenced"
+        return 1
+    fi
     local tmp_sql
     tmp_sql=$(mktemp "$WEAVE_DIR/.state.sql.XXXXXX") || return 1
     if ! dump_state_sql "$WV_DB" "$tmp_sql" || [ ! -s "$tmp_sql" ]; then
@@ -675,8 +788,8 @@ _publish_weave_bundle() {
 }
 
 auto_sync() {
-    local _force=false
-    for _arg in "$@"; do [ "$_arg" = "--force" ] && _force=true; done
+    # --force is still accepted from older callers; with no throttle it changes
+    # nothing (wv-851fb4).
 
     # Disabled by env var
     [ "$WV_AUTO_SYNC" = "0" ] && return 0
@@ -687,18 +800,11 @@ auto_sync() {
     # Skip for custom DB paths (test isolation)
     [ -n "$WV_DB_CUSTOM" ] && return 0
 
-    # Check throttle: sync at most once per interval (bypassed by --force)
+    # The stamp records when this hot zone last published; nothing gates on it.
     local stamp_file="$WV_HOT_ZONE/.last_sync"
     local now agent_id
     now=$(date +%s)
     agent_id="$(resolve_agent_id)"
-    if [ "$_force" = false ] && [ -f "$stamp_file" ]; then
-        local last_sync
-        last_sync=$(cat "$stamp_file" 2>/dev/null || echo "0")
-        if [ $(( now - last_sync )) -lt "$WV_SYNC_INTERVAL" ]; then
-            return 0  # Too soon, skip
-        fi
-    fi
 
     # O(1) change detection: if _warp_changes is empty, nothing happened since
     # the last sync — skip the dump entirely. No I/O, no git noise.
@@ -731,11 +837,31 @@ auto_sync() {
     # it; every step downstream (the dump, the final reset) uses THIS value,
     # not the pre-check one above.
     local _sync_emitted _sync_watermark _sync_staging
+    # Publishing into .weave/ waits for catalog maintenance and refuses while
+    # one is pending (wv-28ef47); the tracker keeps the rows for the next sync.
+    wv_maint_shared_enter "the auto-sync publish" || return 1
     if ! _sync_emitted=$(_wv_emit_deltas "$WV_DB" "$WEAVE_DIR" "$agent_id"); then
         return 1
     fi
     _sync_watermark=$(printf '%s\n' "$_sync_emitted" | sed -n '1p')
     _sync_staging=$(printf '%s\n' "$_sync_emitted" | sed -n '2p')
+
+    # Writer fence (wv-aac412): a database loaded before a compaction in the
+    # tree must not write state.sql. Its own changes are still real, so they
+    # publish as deltas only, which any load (cmd_load's pre-flight calls this
+    # very function) replays over the newer state.sql: the documented recovery.
+    local _fenced
+    if ! _fenced=$(wv_compaction_fence "$WV_DB" "$WEAVE_DIR"); then
+        _wv_fence_explain "state.sql not written; this change is published as a delta only" "$_fenced"
+        if ! _wv_publish_staged_deltas "$_sync_staging"; then
+            echo "wv: delta publication failed; change tracker left pending for the next sync" >&2
+            return 1
+        fi
+        wv_delta_reset "$WV_DB" "$_sync_watermark" || return 1
+        echo "$now" > "$stamp_file"
+        auto_checkpoint "$now"
+        return 0
+    fi
 
     # Full dump to state.sql — kept as the authoritative snapshot and audit trail.
     # Deltas complement the dump; they are not a replacement. state.sql is what
@@ -916,7 +1042,7 @@ persist_or_refuse() {
 # Throttled independently from sync (default 5 min).
 
 auto_checkpoint() {
-    [ "$WV_AUTO_CHECKPOINT" = "0" ] && return 0
+    wv_auto_commit_enabled "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" || return 0
 
     local now="${1:-$(date +%s)}"
     local cp_stamp="$WV_HOT_ZONE/.last_checkpoint"
@@ -971,28 +1097,43 @@ auto_checkpoint() {
         fi
     fi
 
-    # Pull remote changes first to prevent divergence races.
-    # --rebase keeps history linear; --autostash handles our dirty .weave/ files.
-    # Detect rebase conflicts instead of silently swallowing — a dirty rebase
-    # state makes all subsequent git operations fail cryptically.
+    # Bring in remote changes first, fast-forward only (wv-2f32a7). A checkpoint
+    # never rewrites history: it used to 'pull --rebase', which on 2026-11-09
+    # silently rebased 8 unpushed commits and flattened a deliberate merge, and
+    # under a rebase the .weave/ merge drivers swap sides ('ours' is upstream).
+    # A branch behind its upstream is fast-forwarded (--autostash carries our
+    # dirty .weave/ files); one that has diverged is left alone with a warning,
+    # for its owner to reconcile. The retries cover a fetch that fails on the
+    # network, not a divergence, which retrying cannot change.
     # Set WV_CHECKPOINT_PULL=0 to disable pull entirely (for team repos).
+    # Unstaged edits outside graph state skip the pull: --autostash would
+    # stash and re-apply someone else's in-progress files (wv-fbbdff).
+    local _cp_unstaged=""
     if [ "${WV_CHECKPOINT_PULL:-1}" = "1" ]; then
+        _cp_unstaged=$(wv_unstaged_non_graph_state "$git_root") \
+            || _cp_unstaged="(the working tree could not be listed)"
+        [ -n "$_cp_unstaged" ] && \
+            echo "wv: auto-checkpoint pull skipped -- unstaged edits outside graph state would be autostashed" >&2
+    fi
+    if [ "${WV_CHECKPOINT_PULL:-1}" = "1" ] && [ -z "$_cp_unstaged" ]; then
         # Only attempt pull if a remote is configured (avoids backoff in test envs)
         if git -C "$git_root" rev-parse --verify '@{u}' >/dev/null 2>&1; then
-            local attempt
+            local attempt _cp_ahead _cp_behind
             for attempt in 1 2 3 4 5; do
-                if git -C "$git_root" pull --rebase --autostash --quiet >/dev/null 2>&1; then
-                    break
-                fi
-                # Check if we're stuck in a rebase
-                if [ -d "$git_root/.git/rebase-merge" ] || [ -d "$git_root/.git/rebase-apply" ]; then
-                    git -C "$git_root" rebase --abort 2>/dev/null || true
-                    echo "wv: auto-checkpoint pull had conflicts, aborted rebase" >&2
-                    break  # Don't retry rebase conflicts — they won't self-resolve
-                fi
+                git -C "$git_root" fetch --quiet >/dev/null 2>&1 && break
                 # Exponential backoff with jitter for contention
                 [ "$attempt" -lt 5 ] && sleep $(( (2 ** attempt) + RANDOM % 3 ))
             done
+            _cp_ahead=$(git -C "$git_root" rev-list --count '@{u}..HEAD' 2>/dev/null) || _cp_ahead=""
+            _cp_behind=$(git -C "$git_root" rev-list --count 'HEAD..@{u}' 2>/dev/null) || _cp_behind=""
+            if [ -z "$_cp_ahead" ] || [ -z "$_cp_behind" ]; then
+                echo "wv: auto-checkpoint could not compare this branch with its upstream; no pull" >&2
+            elif [ "$_cp_behind" -gt 0 ] && [ "$_cp_ahead" -gt 0 ]; then
+                echo "wv: auto-checkpoint left history alone: this branch and its upstream have diverged ($_cp_ahead local, $_cp_behind remote commit(s)); reconcile them yourself" >&2
+            elif [ "$_cp_behind" -gt 0 ]; then
+                git -C "$git_root" merge --ff-only --autostash --quiet '@{u}' >/dev/null 2>&1 \
+                    || echo "wv: auto-checkpoint could not fast-forward to its upstream; no pull" >&2
+            fi
         fi
     fi
 
@@ -1009,27 +1150,13 @@ auto_checkpoint() {
     # Only commit if there are staged changes
     if ! git -C "$git_root" diff --cached --quiet 2>/dev/null; then
         # Include primary Weave ID as trailer for commit-to-node tracing
-        local primary
-        primary=$(get_primary_node 2>/dev/null || echo "")
-        local trailers=""
-        # Verify primary is still active
-        if [ -n "$primary" ]; then
-            local pstatus
-            pstatus=$(db_query "SELECT status FROM nodes WHERE id='$primary';" 2>/dev/null || echo "")
-            if [ "$pstatus" != "active" ]; then
-                clear_primary_node 2>/dev/null || true
-                primary=""
-            fi
-        fi
+        # This owner's primary, else its newest claim: never another session's
+        # active node (wv-43d6be, wv-1caf6c).
+        local primary trailers=""
+        primary=$(resolve_active_primary "$WV_DB" "$WV_HOT_ZONE" 2>/dev/null || echo "")
         if [ -n "$primary" ]; then
             trailers="
 Weave-ID: $primary"
-        else
-            # No primary set — fall back to first active node
-            local first_active
-            first_active=$(db_query "SELECT id FROM nodes WHERE status='active' LIMIT 1;" 2>/dev/null || echo "")
-            [ -n "$first_active" ] && trailers="
-Weave-ID: $first_active"
         fi
 
         local ts
@@ -1095,6 +1222,7 @@ _sync_gh() {
     local dry_run="$1"
     local mode="${2:-}"
     local focus_node="${3:-}"
+    local assume_yes="${4:-false}"
     if ! command -v python3 >/dev/null 2>&1; then
         echo -e "${YELLOW}Warning: python3 not found — cannot run GH sync${NC}" >&2
         return 0
@@ -1102,6 +1230,7 @@ _sync_gh() {
     echo ""
     local gh_args=()
     [ "$dry_run" = true ] && gh_args+=("--dry-run")
+    [ "$assume_yes" = true ] && gh_args+=("--yes")
     [ -n "$mode" ] && gh_args+=("--mode=$mode")
     [ -n "$focus_node" ] && gh_args+=("--node=$focus_node")
     # Resolve weave_gh location: follow symlinks to find source dir
@@ -1332,9 +1461,11 @@ cmd_sync() {
     local gh_mode=""
     local gh_node=""
     local force=false
+    local gh_yes=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --gh) gh_sync=true ;;
+            --yes|-y) gh_yes=true ;;
             --dry-run) dry_run=true ;;
             --force) force=true ;;
             --json) format="json" ;;
@@ -1346,6 +1477,12 @@ cmd_sync() {
         esac
         shift
     done
+
+    # Catalog maintenance fence (wv-28ef47): wait for a running compaction,
+    # refuse while one is pending. A dry run publishes nothing.
+    if [ "$dry_run" != true ]; then
+        wv_maint_shared_enter "wv sync" || return 1
+    fi
 
     # Journal wrapping (only when not called from within another journal op)
     local _sync_journaled=false
@@ -1360,6 +1497,16 @@ cmd_sync() {
         return $?
     fi
     mkdir -p "$WEAVE_DIR"
+
+    # Writer fence (wv-aac412): refuse before emitting anything. wv load is the
+    # recovery: its pre-flight publishes this database's unsynced changes as
+    # deltas (auto_sync's fenced path), then reloads and replays them.
+    local _fenced
+    if [ "$dry_run" != true ] && ! _fenced=$(wv_compaction_fence "$WV_DB" "$WEAVE_DIR"); then
+        _wv_fence_explain "Sync refused" "$_fenced"
+        [ "$_sync_journaled" = true ] && journal_end
+        return 1
+    fi
 
     # Step 1: Dump to disk
     [ "$_sync_journaled" = true ] && journal_step 1 "dump"
@@ -1524,7 +1671,7 @@ cmd_sync() {
         # status. Discarding it left `wv sync --gh` reporting success while it
         # had just cleared its own stamps and told the user to run again --
         # and every scripted caller read that 0 as "synced".
-        if ! _sync_gh "$dry_run" "$gh_mode" "$gh_node"; then
+        if ! _sync_gh "$dry_run" "$gh_mode" "$gh_node" "$gh_yes"; then
             [ "$_sync_journaled" = true ] && journal_complete 2
             return 1
         fi
@@ -1556,8 +1703,11 @@ cmd_sync() {
     # Uses --no-verify to bypass pre-commit hook (no active node needed for .weave/-only commits).
     # Only commits if .weave/ is still dirty after auto_checkpoint (e.g., GH sync changed state).
     # Throttled: skip if auto_checkpoint already committed recently (prevents double-commit).
-    local git_root
+    # WV_AUTO_CHECKPOINT=0 and the hold file cover this commit too (wv-fbbdff):
+    # the caller commits .weave/ itself, as the documented workflow does.
+    local git_root=""
     git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    [ -n "$git_root" ] && ! wv_auto_commit_enabled "$git_root" && git_root=""
     if [ -n "$git_root" ] && [ -d "$git_root/.weave" ]; then
         # Hijack guard: same rule as auto_checkpoint — if the caller pre-staged
         # anything outside .weave/, absorbing it into a generic "sync state"
@@ -1830,6 +1980,37 @@ _causal_cutover_seq() {
     printf '%s\n' "$seq"
 }
 
+# _delta_classify — read delta paths on stdin, one per line, and print for each
+#   <path> US <legacy> US <statement> US <garbage> US <first line>
+# in input order (US = 0x1f), reading every file once (wv-12dce0). The flags
+# are the three greps cmd_load ran per file, and the first line is its head -n1:
+#   legacy     a line matching ^INSERT OR REPLACE INTO nodes, any case
+#   statement  a line matching ^(INSERT|UPDATE|REPLACE|DELETE|BEGIN|PRAGMA), any case
+#   garbage    a line that is not blank, a -- comment or a one-line /* */ comment
+# Forking them cost ~14,400 grep and ~6,400 head processes on a 17k-file
+# catalog, most of a cold load. Paths come in on stdin and are opened with
+# getline, never named as operands: an operand containing "=" is an awk
+# variable assignment. A file that cannot be read reports no flags, as the
+# greps did. Exits nonzero when it printed nothing for some path.
+_delta_classify() {
+    awk 'BEGIN { US = sprintf("%c", 31) }
+    {
+        f = $0; n = 0; legacy = 0; stmt = 0; garbage = 0; first = ""
+        while ((getline line < f) > 0) {
+            n++
+            if (n == 1) first = line
+            lc = tolower(line)
+            if (lc ~ /^insert or replace into nodes/) legacy = 1
+            if (lc ~ /^(insert|update|replace|delete|begin|pragma)/) stmt = 1
+            if (line !~ /^[[:space:]]*(--.*|\/\*.*\*\/)?$/) garbage = 1
+        }
+        close(f)
+        print f US legacy US stmt US garbage US first
+        printed++
+    }
+    END { if (printed != NR) exit 1 }'
+}
+
 # _delta_v2_replay WEAVE_DIR DB — dispatch the Delta v2 CAS replay (wv-ba9dc8).
 #
 # The actual causality fix. wv-delta-v2-replay.py applies every committed
@@ -1854,11 +2035,11 @@ _delta_v2_replay() {
     local v2_root="$weave_dir/deltas"
     [ -d "$v2_root" ] || return 0
 
+    # mapfile, not a read loop (wv-12dce0): read takes a pipe one byte at a
+    # time, ~3 s over 9k sidecar paths. find prints no empty path, so the
+    # list is the same.
     local -a v2_ops=()
-    local line
-    while IFS= read -r line; do
-        [ -n "$line" ] && v2_ops+=("$line")
-    done < <(find "$v2_root" -path '*/v2/*.json' -type f -printf '%f\t%p\n' 2>/dev/null \
+    mapfile -t v2_ops < <(find "$v2_root" -path '*/v2/*.json' -type f -printf '%f\t%p\n' 2>/dev/null \
         | LC_ALL=C sort | cut -f2)
     [ "${#v2_ops[@]}" -gt 0 ] || return 0
 
@@ -1866,6 +2047,7 @@ _delta_v2_replay() {
     [ -f "$replay_py" ] || replay_py="$SCRIPT_DIR/lib/wv-delta-v2-replay.py"
     if [ ! -f "$replay_py" ]; then
         echo -e "${YELLOW}⚠ Delta v2 replay evaluator not found — skipping v2 dispatch${NC}" >&2
+        wv_load_gap "v2 evaluator not found"
         return 0
     fi
 
@@ -1874,10 +2056,13 @@ _delta_v2_replay() {
     cutover_seq=$(_causal_cutover_seq)
     [ -n "$cutover_seq" ] && args+=(--cutover-seq "$cutover_seq")
     [ "${WV_DELTA_V2_STRICT:-0}" = "1" ] && args+=(--strict)
-    args+=("${v2_ops[@]}")
+    # The operation list goes on stdin: it grows with the catalog, and as
+    # arguments it exceeded the kernel's limit from long checkout paths, so the
+    # replayer never started (rc=126, wv-a05dcd).
+    args+=(--ops-from=-)
 
     local out rc=0
-    out=$(python3 "$replay_py" "${args[@]}" 2>&1) || rc=$?
+    out=$(printf '%s\n' "${v2_ops[@]}" | python3 "$replay_py" "${args[@]}" 2>&1) || rc=$?
     local summary
     summary=$(printf '%s\n' "$out" | tail -1 | python3 -c '
 import json, sys
@@ -1892,6 +2077,29 @@ print(" ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     if [ "$rc" -ne 0 ]; then
         echo -e "${YELLOW}⚠ Delta v2 replay aborted (rc=$rc) — v2 batch rolled back${NC}" >&2
         [ -n "$summary" ] && echo -e "${YELLOW}  dispositions: $summary${NC}" >&2
+        # The operation that aborted the batch, and why (wv-5e5f18): the counts
+        # alone named nothing, so a hard failure could not be traced.
+        # The first one is carried into the recorded reason, so bootstrap and
+        # doctor can name it too (wv-2f55dd).
+        local hard first_hard=""
+        hard=$(printf '%s\n' "$out" | tail -1 | python3 -c '
+import json, os, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+for r in d.get("results", []):
+    if r.get("disposition") in ("integrity_failed", "identity_hash_mismatch", "unsupported_version"):
+        p = r.get("path", "?")
+        print("{}\t{}\t{}\t{}".format(r.get("disposition"), p, os.path.basename(os.path.dirname(os.path.dirname(p))) + "/" + os.path.basename(p), r.get("reason", "no reason")))
+' 2>/dev/null) || hard=""
+        if [ -n "$hard" ]; then
+            while IFS=$'\t' read -r h_disp h_path h_short h_reason; do
+                echo "  $h_disp: $h_path ($h_reason)" >&2
+                [ -n "$first_hard" ] || first_hard="$h_short ($h_reason)"
+            done <<< "$hard"
+        fi
+        wv_load_gap "v2 replay aborted (rc=$rc)${first_hard:+: $first_hard}"
         if [ "${WV_DELTA_V2_STRICT:-0}" = "1" ]; then
             return 1
         fi
@@ -1903,6 +2111,26 @@ print(" ".join(f"{k}={v}" for k, v in sorted(counts.items())))
             *applied=*|*precondition_conflict=*|*skipped_superseded=*|*skipped_pre_cutover=*|*ambiguous_same_lineage=*)
                 echo -e "${GREEN}✓${NC} Delta v2 replay: $summary" >&2 ;;
         esac
+    fi
+    # Writes that lost a fork between two graphs (wv-898c73): named one per
+    # line, since a count among thousands of benign conflicts named nothing.
+    local lost
+    lost=$(printf '%s\n' "$out" | tail -1 | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+for w in d.get("lost_writes", []):
+    diff = w.get("differs")
+    shown = ",".join(diff) if isinstance(diff, list) else json.dumps(diff, sort_keys=True)
+    seq = (w.get("lineage") or [None])[0]
+    print("%s %s: %s (lineage %s)" % (w.get("entity"), w.get("field"), shown, seq))
+' 2>/dev/null || true)
+    if [ -n "$lost" ]; then
+        echo -e "${YELLOW}⚠ Delta v2 replay: $(printf '%s\n' "$lost" | wc -l) write(s) from another graph lost a conflict on the same field and were not applied:${NC}" >&2
+        printf '%s\n' "$lost" | sed 's/^/    /' >&2
+        echo -e "${YELLOW}  The graph kept its own value. Re-apply a lost value with wv update if it should win; once the field is edited again this stops (wv-898c73).${NC}" >&2
     fi
     # Replay fired the change-tracking triggers and touched node text/metadata;
     # clear the tracker and re-derive FTS exactly as the v1 replay path does.
@@ -2051,6 +2279,332 @@ _load_install_db() {
     return 1
 }
 
+# _load_v1_replay — cmd_load's v1 phase (wv-c92ac9): replay the committed v1
+# SQL deltas over the imported snapshot, with tombstones held during the batch.
+# Moved out of cmd_load unchanged (it shares no locals with the phases around
+# it; its only output is wv_load_gap), so cmd_load reads as its phase order:
+# import, migrate, v2 dispatch, v1 replay, reconcile, acknowledge.
+_load_v1_replay() {
+        # Delta replay — multi-agent merge
+        #
+        # After loading state.sql (the last full snapshot from any agent), apply
+        # all delta files from .weave/deltas/ in chronological order. Each delta
+        # file contains INSERT OR REPLACE / DELETE statements emitted by
+        # wv_delta_changeset on a previous sync cycle (by this or another agent).
+        # Replaying them brings the DB forward to the union of all agents' changes.
+        #
+        # Ordering: files are sorted by filename. The prefix format is
+        # <epoch>-<subsec>-<seq>-..., so lexical sort preserves epoch-seconds,
+        # then subsecond order, then per-process same-timestamp emission order.
+        # This gives deterministic same-second replay while keeping the first
+        # field compatible with the prune-epoch filter below.
+        #
+        # FK OFF during replay: a delta from agent B may INSERT an edge that
+        # references a node only present in a later-sorted delta from agent A.
+        # Disabling FK constraints for the replay batch avoids false rejections.
+        # PRAGMA foreign_keys is a no-op inside a transaction, so it must be
+        # applied outside any transaction wrapper.
+        #
+        # Prune epoch filter — LEGACY (wv-0d5e07). wv delete / wv prune no longer
+        # write .weave/.prune_epoch; deletion intent now travels as `tombstones`
+        # rows in state.sql, enforced by _reconcile_tombstones after replay. A
+        # .prune_epoch left on disk by an older release is still honoured for the
+        # per-file skip below for one release. When a causal-cutover marker exists
+        # it already skips every pre-cutover no-lineage delta (a strict superset of
+        # what the epoch cutoff covered), so the legacy file is migrated away;
+        # otherwise it is kept and the operator is told to stamp `wv cutover`.
+        # This runs regardless of whether any deltas exist so a straggler file is
+        # always cleaned up once a cutover marker is in place.
+        local prune_epoch=0
+        if [ -f "$WEAVE_DIR/.prune_epoch" ]; then
+            prune_epoch=$(cat "$WEAVE_DIR/.prune_epoch" 2>/dev/null || echo "0")
+            if [ -f "$WEAVE_DIR/causal-cutover" ]; then
+                rm -f "$WEAVE_DIR/.prune_epoch"
+                echo -e "${YELLOW}ℹ${NC} Migrated legacy .weave/.prune_epoch → superseded by causal-cutover + tombstones" >&2
+            else
+                echo -e "${YELLOW}⚠${NC} .weave/.prune_epoch is legacy (wv-0d5e07) — honoured this load; stamp 'wv cutover' to retire it" >&2
+            fi
+        fi
+        if [ -d "$WEAVE_DIR/deltas" ]; then
+            local delta_files delta_count=0
+            # Causal cutover marker (wv-2448dd), parsed by the shared helper.
+            # `.weave/causal-cutover` is a committed operator declaration — written
+            # once by `wv cutover` when every agent has synced — naming the
+            # lineage_seq at which this graph became causal. Once it exists, a v1
+            # SQL delta that carries no lineage statement predates the cutover and
+            # must not alter any row, regardless of its filename epoch or embedded
+            # updated_at (post-cutover deltas carry lineage_seq guards and still
+            # replay). A delta file is SQL executed against the DB and cannot write
+            # this sibling file, so the marker cannot be forged from the catalog.
+            local cutover_seq=""
+            cutover_seq=$(_causal_cutover_seq)
+            # Applied-deltas manifest (.weave/.applied_deltas): one basename per line.
+            # Keep writing it for observability, but do NOT trust it to skip replay.
+            #
+            # We have observed real graph regressions where state.sql and the live DB
+            # fell behind deltas that the manifest effectively treated as already
+            # incorporated. Full replay is idempotent by design, so correctness wins:
+            # always replay every non-pruned delta on load until a stronger trust model
+            # exists than mtime comparisons plus a local manifest.
+            #
+            # Authoritative-drop rejected (wv-c7b34e, D-4 rec-4): "drop live rows
+            # absent from state.sql ∪ replayed deltas" is either a no-op or data loss.
+            # The pre-flight auto_sync --force puts every live row into state.sql
+            # before the rebuild, so when the flush succeeds the absent set is empty;
+            # when the flush fails or is floor-guarded, the absent rows are exactly
+            # the unsynced work most needing preservation. Absence is not a deletion
+            # signal — deletion intent travels via the tombstones table (written by
+            # cmd_delete/cmd_prune + immediate state.sql dump, enforced after replay
+            # by _reconcile_tombstones) and DELETE statements in deltas.
+            local manifest="$WEAVE_DIR/.applied_deltas"
+            # Truncate manifest before replay. If replay fails, the manifest stays
+            # empty — guaranteeing all deltas are retried on the next wv load.
+            # On success, the manifest is written post-replay with the exact delta
+            # basenames replayed during this load. Truncate-before is correct: the window
+            # where the manifest is empty (between truncation and successful write)
+            # only matters if the process is killed mid-replay, in which case we
+            # want a retry anyway.
+            : > "$manifest"
+            # Initial iteration order is by filename; the REPLAY order is set
+            # below by parsed lineage (wv-5a2627), not this lexical epoch sort.
+            delta_files=$(find "$WEAVE_DIR/deltas" -name '*.sql' -printf '%f\t%p\n' 2>/dev/null | sort | cut -f2)
+            if [ -n "$delta_files" ]; then
+                local skipped=0 skipped_legacy=0 skipped_cutover=0 snapshot_max_epoch=0
+                # The replay clock: one definition, shared with wv hotzone
+                # diff, which reports it when two copies disagree (wv-8d4f7d).
+                if ! declare -F wv_replay_clock_sql >/dev/null 2>&1; then
+                    # shellcheck source=/dev/null
+                    source "$(dirname "${BASH_SOURCE[0]}")/../lib/wv-graph-diff.sh"
+                fi
+                snapshot_max_epoch=$(sqlite3 "$WV_DB" "$(wv_replay_clock_sql main)" 2>/dev/null || echo "0")
+                # Collect replayable delta paths into an array, then replay in a
+                # single batched sqlite3 call instead of N subprocesses.
+                local -a new_deltas=()
+                local -a new_names=()
+                # wv-5a2627: sort survivors by the lineage each delta carries.
+                # Key fields are joined by US (0x1f) — NOT a tab: `read`/`sort`
+                # with an IFS-whitespace delimiter collapse an empty actor field
+                # and shift the path out of position. The header read runs once
+                # per SURVIVING delta (after the skips), not once per file.
+                local -a _replay_keys=()
+                local _US=$'\x1f'
+                # Every file read once, by one process (wv-12dce0): the flags
+                # below were three greps and a head per file. The classifier
+                # must answer for every path; if it cannot, nothing replays and
+                # the load says so, as a failed replay does (the manifest stays
+                # empty, so the next load retries every delta).
+                local _classified _c_legacy _c_stmt _c_garbage _c_head _replay_key
+                if ! _classified=$(printf '%s\n' "$delta_files" | _delta_classify) \
+                    || [ "$(printf '%s\n' "$_classified" | wc -l)" -ne "$(printf '%s\n' "$delta_files" | wc -l)" ]; then
+                    echo -e "${YELLOW}⚠ Delta classification failed — no delta replayed; will retry on next load${NC}" >&2
+                    wv_load_gap "v1 delta classification failed"
+                    _classified=""
+                fi
+                while IFS=$'\x1f' read -r delta _c_legacy _c_stmt _c_garbage _c_head; do
+                    [ -n "$delta" ] || continue
+                    if [ -s "$delta" ]; then
+                        # bash builtins replace basename + grep -oP subprocesses
+                        local delta_name delta_ts
+                        delta_name="${delta##*/}"
+                        delta_ts="${delta_name%%-*}"
+                        # Prune epoch filter
+                        if [ "$delta_ts" -le "$prune_epoch" ] 2>/dev/null; then
+                            skipped=$((skipped + 1))
+                            continue
+                        fi
+                        # Legacy back-catalog delta guard: pre-wv-875c72 node
+                        # deltas used unconditional INSERT OR REPLACE. If such a
+                        # delta predates the loaded checkpoint, replaying it can
+                        # revert newer state.sql. Current generated deltas use
+                        # ON CONFLICT with a freshness WHERE and stay replayable.
+                        if [ "$_c_legacy" = 1 ] \
+                            && [ "${delta_ts:-0}" -le "${snapshot_max_epoch:-0}" ] 2>/dev/null; then
+                            skipped_legacy=$((skipped_legacy + 1))
+                            continue
+                        fi
+                        # Pre-validate: a valid delta has at least one replayable
+                        # SQL statement. A file whose only content is comment lines
+                        # is an intentional no-op — the changeset generator emits
+                        # "-- no-op UPDATE on node/edge ..." (wv-delta.sh) when an
+                        # UPDATE would change nothing — so it is benign and skipped
+                        # silently. The benign set also covers the wv-5a2627
+                        # `/* weave-lineage seq=N actor=A */` block-comment header:
+                        # auto_sync now drops a header-only no-op before commit
+                        # (wv-253abd), but consumer catalogs may already hold one,
+                        # and it must skip silently rather than warn on every load.
+                        # Only non-comment, non-blank garbage (e.g. a file truncated
+                        # mid-fsync) is genuinely corrupt.
+                        if [ "$_c_stmt" != 1 ]; then
+                            if [ "$_c_garbage" = 1 ]; then
+                                echo -e "${YELLOW}⚠ Skipped corrupt delta: ${delta_name}${NC}" >&2
+                                wv_load_gap "v1 corrupt delta skipped: ${delta_name}"
+                            fi
+                            continue
+                        fi
+                        # Parse the lineage header (wv-5a2627) up front:
+                        # `/* weave-lineage seq=<n> actor=<a> */` on line 1, emitted
+                        # by wv_delta_changeset iff seq>0 -- i.e. for every genuine
+                        # post-cutover emission. No header (legacy / pre-lineage /
+                        # hand-written) sorts first at seq 0; path is the final
+                        # tie-break so the old back-catalog keeps its filename-epoch
+                        # order and same-lineage emissions stay deterministic.
+                        local _hl _lseq _lactor _has_lineage_header=0
+                        _hl="$_c_head"
+                        if [ "${_hl#/\* weave-lineage seq=}" != "$_hl" ]; then
+                            _has_lineage_header=1
+                            _lseq=${_hl#/\* weave-lineage seq=}
+                            _lactor=${_lseq#* actor=}
+                            _lactor=${_lactor% \*/}
+                            _lseq=${_lseq%% actor=*}
+                        else
+                            _lseq=0; _lactor=
+                        fi
+                        case "$_lseq" in ''|*[!0-9]*) _lseq=0 ;; esac
+                        # Pre-cutover back-catalog guard (wv-2448dd): with the
+                        # causal cutover marker in place, a delta with no lineage
+                        # header was emitted before the graph became causal, and is
+                        # skipped regardless of filename epoch or embedded timestamp.
+                        # The classifier is the SAME structural signal the ordering
+                        # above already trusts -- not a whole-file grep for the
+                        # substring "lineage_seq=". A body-wide grep also matches
+                        # that substring appearing inside a quoted node text or
+                        # metadata VALUE (this epic's own nodes describe the feature
+                        # in prose), which would misclassify a genuinely pre-cutover,
+                        # unguarded delta as post-cutover and let it replay.
+                        if [ -n "$cutover_seq" ] && [ "$_has_lineage_header" -eq 0 ]; then
+                            skipped_cutover=$((skipped_cutover + 1))
+                            continue
+                        fi
+                        printf -v _replay_key '%018d%s%s%s%s%s%s' "$_lseq" "$_US" "$_lactor" "$_US" "$delta" "$_US" "$delta_name"
+                        _replay_keys+=("$_replay_key")
+                        delta_count=$((delta_count + 1))
+                    fi
+                done <<< "$_classified"
+                if [ "$delta_count" -gt 0 ]; then
+                    # Materialise the lineage-ordered replay list (wv-5a2627):
+                    # numeric on seq, then actor, then path.
+                    local _k_seq _k_actor _k_path _k_name
+                    while IFS=$'\x1f' read -r _k_seq _k_actor _k_path _k_name; do
+                        [ -n "$_k_path" ] || continue
+                        new_deltas+=("$_k_path")
+                        new_names+=("$_k_name")
+                    done < <(printf '%s\n' "${_replay_keys[@]}" | LC_ALL=C sort -t$'\x1f' -k1,1 -k2,2 -k3,3)
+                    # Single batched sqlite3 call: wrap FK toggle + all deltas in one
+                    # transaction — per-statement auto-commit costs ~1 fsync each;
+                    # a single transaction reduces N commits to 1.
+                    #
+                    # .bail on: abort on first error and return non-zero exit code,
+                    # which rolls back the transaction and prevents partial replay.
+                    # Manifest is only written after this succeeds.
+                    #
+                    # No FTS filter: wv_delta_changeset never emits nodes_fts or
+                    # sqlite_sequence rows. Filtering multiline SQL by line prefix
+                    # is unsafe against data values that start with those strings.
+                    local replay_rc=0
+                    # The guard below names the lineage columns and tombstones, so
+                    # it is emitted only where the imported database has them: a
+                    # pre-lineage state.sql is migrated after replay, and a guard
+                    # naming absent columns aborted its whole replay (wv-c14ccf).
+                    # Such a database holds no tombstone to honour.
+                    local _tomb_guard=0
+                    [ "$(sqlite3 -batch "$WV_DB" "SELECT
+                        (SELECT count(*) FROM pragma_table_info('nodes') WHERE name IN ('lineage_seq','lineage_actor'))
+                      + (SELECT count(*) FROM pragma_table_info('edges') WHERE name IN ('lineage_seq','lineage_actor'))
+                      + (SELECT count(*) FROM pragma_table_info('tombstones') WHERE name IN ('lineage_seq','lineage_actor'));" 2>/dev/null)" = 6 ] \
+                        && _tomb_guard=1
+                    {
+                        echo ".bail on"
+                        echo "PRAGMA foreign_keys = OFF;"
+                        # Tombstones hold during replay, not only after it
+                        # (wv-c14ccf): a write to a node or edge its tombstone
+                        # dominates (lineage 0, or (seq, actor) at or below the
+                        # tombstone's, the _reconcile_tombstones rule) is a no-op,
+                        # so a tombstoned node's old close never reaches the
+                        # close-policy trigger. Session-scoped TEMP triggers.
+                        [ "$_tomb_guard" = 1 ] && cat <<'GUARD'
+CREATE TEMP TRIGGER _wv_replay_tomb_node_ins BEFORE INSERT ON main.nodes
+WHEN EXISTS (SELECT 1 FROM tombstones t WHERE t.kind = 'node' AND t.id = NEW.id
+    AND (COALESCE(NEW.lineage_seq, 0) = 0
+         OR (NEW.lineage_seq, COALESCE(NEW.lineage_actor, '')) <= (t.lineage_seq, t.lineage_actor)))
+BEGIN SELECT RAISE(IGNORE); END;
+CREATE TEMP TRIGGER _wv_replay_tomb_node_upd BEFORE UPDATE ON main.nodes
+WHEN EXISTS (SELECT 1 FROM tombstones t WHERE t.kind = 'node' AND t.id = NEW.id
+    AND (COALESCE(NEW.lineage_seq, 0) = 0
+         OR (NEW.lineage_seq, COALESCE(NEW.lineage_actor, '')) <= (t.lineage_seq, t.lineage_actor)))
+BEGIN SELECT RAISE(IGNORE); END;
+CREATE TEMP TRIGGER _wv_replay_tomb_edge_ins BEFORE INSERT ON main.edges
+WHEN EXISTS (SELECT 1 FROM tombstones t WHERE t.kind = 'edge'
+    AND t.id = NEW.source || ':' || NEW.target || ':' || NEW.type
+    AND (COALESCE(NEW.lineage_seq, 0) = 0
+         OR (NEW.lineage_seq, COALESCE(NEW.lineage_actor, '')) <= (t.lineage_seq, t.lineage_actor)))
+BEGIN SELECT RAISE(IGNORE); END;
+GUARD
+                        echo "BEGIN;"
+                        cat "${new_deltas[@]}"
+                        echo "COMMIT;"
+                        echo "PRAGMA foreign_keys = ON;"
+                    } | sqlite3 "$WV_DB" || replay_rc=$?
+                    if [ "$replay_rc" -ne 0 ]; then
+                        # state.sql was already imported and the DB is valid.
+                        # Warn but continue — returning non-zero here would cause
+                        # callers that check $? to treat a successful load as failed.
+                        # Don't update manifest: failed deltas will be retried on the
+                        # next wv load (manifest was truncated to empty at line 601,
+                        # so all deltas re-qualify if this load fails).
+                        echo -e "${YELLOW}⚠ Delta replay failed (rc=$replay_rc) — will retry on next load${NC}" >&2
+                        wv_load_gap "v1 replay rolled back (rc=$replay_rc)"
+                        sqlite3 "$WV_DB" "PRAGMA foreign_keys = ON;" 2>/dev/null || true
+                    else
+                        # Manifest written only after successful replay
+                        printf '%s\n' "${new_names[@]}" >> "$manifest"
+                        # Reset the change log after replay: the INSERT/UPDATE statements
+                        # fired the triggers, so _warp_changes now contains every
+                        # replayed operation. Without this reset, the next auto_sync
+                        # would emit a delta containing all of them — snowballing the
+                        # same changes across all agents indefinitely. The load itself
+                        # already succeeded (state.sql imported, replay applied), so a
+                        # drain failure here doesn't undo that -- but it must not pass
+                        # silently given exactly what it risks.
+                        wv_delta_reset "$WV_DB" || echo -e "${YELLOW}⚠ Post-replay change tracker drain failed — next sync may re-emit replayed changes${NC}" >&2
+                        # Re-derive nodes_fts AFTER replay, not only before it.
+                        #
+                        # db_rebuild_fts ran earlier against the state.sql import, so
+                        # the index was consistent at that point. Replay then applies
+                        # INSERT OR REPLACE INTO nodes. For a TEXT-PRIMARY-KEY table
+                        # the rowid is implicit, so REPLACE deletes the conflicting
+                        # row (new rowid) — and SQLite only fires DELETE triggers for
+                        # that implicit delete when recursive_triggers is ON, which it
+                        # is not (it is set nowhere in this codebase). So nodes_ad
+                        # never runs, nodes_ai does, and every replaced node strands an
+                        # orphaned nodes_fts entry at its old rowid.
+                        #
+                        # Orphans are invisible to both PRAGMA integrity_check and
+                        # FTS5 'integrity-check' — they surface only later, as
+                        # SQLITE_CORRUPT from the nodes_au sync trigger on ANY
+                        # UPDATE to nodes, which takes out wv done graph-wide
+                        # (wv-44993d 2026-08-08, again 2026-08-27; root cause wv-d2e6c6).
+                        #
+                        # 'rebuild' re-derives from nodes for an external-content
+                        # table, so it discards orphans outright. Idempotent, and only
+                        # paid when deltas actually replayed.
+                        db_rebuild_fts || return 1
+                        echo -e "${GREEN}✓${NC} Replayed $delta_count delta(s)" >&2
+                    fi
+                fi
+                sqlite3 "$WV_DB" "PRAGMA foreign_keys = ON;" 2>/dev/null || true
+                if [ "$skipped" -gt 0 ]; then
+                    echo -e "${YELLOW}ℹ${NC} Skipped $skipped pre-prune delta(s)" >&2
+                fi
+                if [ "$skipped_legacy" -gt 0 ]; then
+                    echo -e "${YELLOW}ℹ${NC} Skipped $skipped_legacy legacy pre-checkpoint delta(s)" >&2
+                fi
+                if [ "$skipped_cutover" -gt 0 ]; then
+                    echo -e "${YELLOW}ℹ${NC} Skipped $skipped_cutover pre-cutover delta(s) (causal cutover @ lineage_seq $cutover_seq)" >&2
+                fi
+            fi
+        fi
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_load — Load database from git layer
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2085,6 +2639,20 @@ cmd_load() {
         # Import ignoring non-zero exit: sqlite3 exits 1 on benign runtime errors
         # (e.g. malformed JSON in a generated column during INSERT) even when all
         # rows are imported. Validate the DB state instead of trusting the exit code.
+        # The compactions this load runs under are read BEFORE state.sql: one a
+        # pull adds meanwhile stays unrecorded, so the writer fence errs toward
+        # refusing (wv-aac412).
+        local _load_epochs
+        _load_epochs=$(wv_compaction_epochs "$WEAVE_DIR") || _load_epochs=""
+        # The catalog this attempt reads, digested in the background while
+        # state.sql imports, and awaited before any delta is read (wv-4e35c0).
+        # The same digest after the load is the acknowledgement's race check.
+        WV_LOAD_GAPS=()
+        local _ack_digest_file _ack_digest_pid _ack_before=""
+        _ack_digest_file=$(mktemp "$WV_HOT_ZONE/.load-digest.XXXXXX")
+        _wv_exit_trap "$(printf 'rm -f -- %q %q 2>/dev/null' "$tmp_db" "$_ack_digest_file")"
+        wv_load_catalog_digest "$WEAVE_DIR" > "$_ack_digest_file" 2>/dev/null &
+        _ack_digest_pid="$!"
         strip_unistr < "$WEAVE_DIR/state.sql" | sqlite3 "$tmp_db" 2>/dev/null; true
         if sqlite3 "$tmp_db" "SELECT COUNT(*) FROM nodes;" >/dev/null 2>&1; then
             # Validate edges table exists and has data
@@ -2223,284 +2791,39 @@ EOF
         # statements run (they become no-ops for anything v2 advanced). The
         # writer defaults on post-cutover (S4 wv-806a6b); a pre-cutover catalog
         # carries no sidecars, so this is a no-op there.
+        if wait "$_ack_digest_pid"; then
+            _ack_before=$(cat "$_ack_digest_file" 2>/dev/null)
+        fi
+        rm -f "$_ack_digest_file"
+        wv_load_attempt_begin "$WV_DB" >/dev/null 2>&1 \
+            || wv_load_gap "load attempt could not be recorded"
         if ! _delta_v2_replay "$WEAVE_DIR" "$WV_DB"; then
             echo -e "${RED}Error: Delta v2 replay or node search index rebuild failed${NC}" >&2
             return 1
         fi
 
-        # Delta replay — multi-agent merge
-        #
-        # After loading state.sql (the last full snapshot from any agent), apply
-        # all delta files from .weave/deltas/ in chronological order. Each delta
-        # file contains INSERT OR REPLACE / DELETE statements emitted by
-        # wv_delta_changeset on a previous sync cycle (by this or another agent).
-        # Replaying them brings the DB forward to the union of all agents' changes.
-        #
-        # Ordering: files are sorted by filename. The prefix format is
-        # <epoch>-<subsec>-<seq>-..., so lexical sort preserves epoch-seconds,
-        # then subsecond order, then per-process same-timestamp emission order.
-        # This gives deterministic same-second replay while keeping the first
-        # field compatible with the prune-epoch filter below.
-        #
-        # FK OFF during replay: a delta from agent B may INSERT an edge that
-        # references a node only present in a later-sorted delta from agent A.
-        # Disabling FK constraints for the replay batch avoids false rejections.
-        # PRAGMA foreign_keys is a no-op inside a transaction, so it must be
-        # applied outside any transaction wrapper.
-        #
-        # Prune epoch filter — LEGACY (wv-0d5e07). wv delete / wv prune no longer
-        # write .weave/.prune_epoch; deletion intent now travels as `tombstones`
-        # rows in state.sql, enforced by _reconcile_tombstones after replay. A
-        # .prune_epoch left on disk by an older release is still honoured for the
-        # per-file skip below for one release. When a causal-cutover marker exists
-        # it already skips every pre-cutover no-lineage delta (a strict superset of
-        # what the epoch cutoff covered), so the legacy file is migrated away;
-        # otherwise it is kept and the operator is told to stamp `wv cutover`.
-        # This runs regardless of whether any deltas exist so a straggler file is
-        # always cleaned up once a cutover marker is in place.
-        local prune_epoch=0
-        if [ -f "$WEAVE_DIR/.prune_epoch" ]; then
-            prune_epoch=$(cat "$WEAVE_DIR/.prune_epoch" 2>/dev/null || echo "0")
-            if [ -f "$WEAVE_DIR/causal-cutover" ]; then
-                rm -f "$WEAVE_DIR/.prune_epoch"
-                echo -e "${YELLOW}ℹ${NC} Migrated legacy .weave/.prune_epoch → superseded by causal-cutover + tombstones" >&2
-            else
-                echo -e "${YELLOW}⚠${NC} .weave/.prune_epoch is legacy (wv-0d5e07) — honoured this load; stamp 'wv cutover' to retire it" >&2
-            fi
-        fi
-        if [ -d "$WEAVE_DIR/deltas" ]; then
-            local delta_files delta_count=0
-            # Causal cutover marker (wv-2448dd), parsed by the shared helper.
-            # `.weave/causal-cutover` is a committed operator declaration — written
-            # once by `wv cutover` when every agent has synced — naming the
-            # lineage_seq at which this graph became causal. Once it exists, a v1
-            # SQL delta that carries no lineage statement predates the cutover and
-            # must not alter any row, regardless of its filename epoch or embedded
-            # updated_at (post-cutover deltas carry lineage_seq guards and still
-            # replay). A delta file is SQL executed against the DB and cannot write
-            # this sibling file, so the marker cannot be forged from the catalog.
-            local cutover_seq=""
-            cutover_seq=$(_causal_cutover_seq)
-            # Applied-deltas manifest (.weave/.applied_deltas): one basename per line.
-            # Keep writing it for observability, but do NOT trust it to skip replay.
-            #
-            # We have observed real graph regressions where state.sql and the live DB
-            # fell behind deltas that the manifest effectively treated as already
-            # incorporated. Full replay is idempotent by design, so correctness wins:
-            # always replay every non-pruned delta on load until a stronger trust model
-            # exists than mtime comparisons plus a local manifest.
-            #
-            # Authoritative-drop rejected (wv-c7b34e, D-4 rec-4): "drop live rows
-            # absent from state.sql ∪ replayed deltas" is either a no-op or data loss.
-            # The pre-flight auto_sync --force puts every live row into state.sql
-            # before the rebuild, so when the flush succeeds the absent set is empty;
-            # when the flush fails or is floor-guarded, the absent rows are exactly
-            # the unsynced work most needing preservation. Absence is not a deletion
-            # signal — deletion intent travels via the tombstones table (written by
-            # cmd_delete/cmd_prune + immediate state.sql dump, enforced after replay
-            # by _reconcile_tombstones) and DELETE statements in deltas.
-            local manifest="$WEAVE_DIR/.applied_deltas"
-            # Truncate manifest before replay. If replay fails, the manifest stays
-            # empty — guaranteeing all deltas are retried on the next wv load.
-            # On success, the manifest is written post-replay with the exact delta
-            # basenames replayed during this load. Truncate-before is correct: the window
-            # where the manifest is empty (between truncation and successful write)
-            # only matters if the process is killed mid-replay, in which case we
-            # want a retry anyway.
-            : > "$manifest"
-            # Initial iteration order is by filename; the REPLAY order is set
-            # below by parsed lineage (wv-5a2627), not this lexical epoch sort.
-            delta_files=$(find "$WEAVE_DIR/deltas" -name '*.sql' -printf '%f\t%p\n' 2>/dev/null | sort | cut -f2)
-            if [ -n "$delta_files" ]; then
-                local skipped=0 skipped_legacy=0 skipped_cutover=0 snapshot_max_epoch=0
-                # The replay clock: one definition, shared with wv hotzone
-                # diff, which reports it when two copies disagree (wv-8d4f7d).
-                if ! declare -F wv_replay_clock_sql >/dev/null 2>&1; then
-                    # shellcheck source=/dev/null
-                    source "$(dirname "${BASH_SOURCE[0]}")/../lib/wv-graph-diff.sh"
-                fi
-                snapshot_max_epoch=$(sqlite3 "$WV_DB" "$(wv_replay_clock_sql main)" 2>/dev/null || echo "0")
-                # Collect replayable delta paths into an array, then replay in a
-                # single batched sqlite3 call instead of N subprocesses.
-                local -a new_deltas=()
-                local -a new_names=()
-                # wv-5a2627: sort survivors by the lineage each delta carries.
-                # Key fields are joined by US (0x1f) — NOT a tab: `read`/`sort`
-                # with an IFS-whitespace delimiter collapse an empty actor field
-                # and shift the path out of position. The header read runs once
-                # per SURVIVING delta (after the skips), not once per file.
-                local -a _replay_keys=()
-                local _US=$'\x1f'
-                while IFS= read -r delta; do
-                    if [ -s "$delta" ]; then
-                        # bash builtins replace basename + grep -oP subprocesses
-                        local delta_name delta_ts
-                        delta_name="${delta##*/}"
-                        delta_ts="${delta_name%%-*}"
-                        # Prune epoch filter
-                        if [ "$delta_ts" -le "$prune_epoch" ] 2>/dev/null; then
-                            skipped=$((skipped + 1))
-                            continue
-                        fi
-                        # Legacy back-catalog delta guard: pre-wv-875c72 node
-                        # deltas used unconditional INSERT OR REPLACE. If such a
-                        # delta predates the loaded checkpoint, replaying it can
-                        # revert newer state.sql. Current generated deltas use
-                        # ON CONFLICT with a freshness WHERE and stay replayable.
-                        if grep -qiE '^INSERT OR REPLACE INTO nodes' "$delta" 2>/dev/null \
-                            && [ "${delta_ts:-0}" -le "${snapshot_max_epoch:-0}" ] 2>/dev/null; then
-                            skipped_legacy=$((skipped_legacy + 1))
-                            continue
-                        fi
-                        # Pre-validate: a valid delta has at least one replayable
-                        # SQL statement. A file whose only content is comment lines
-                        # is an intentional no-op — the changeset generator emits
-                        # "-- no-op UPDATE on node/edge ..." (wv-delta.sh) when an
-                        # UPDATE would change nothing — so it is benign and skipped
-                        # silently. The benign set also covers the wv-5a2627
-                        # `/* weave-lineage seq=N actor=A */` block-comment header:
-                        # auto_sync now drops a header-only no-op before commit
-                        # (wv-253abd), but consumer catalogs may already hold one,
-                        # and it must skip silently rather than warn on every load.
-                        # Only non-comment, non-blank garbage (e.g. a file truncated
-                        # mid-fsync) is genuinely corrupt.
-                        if ! grep -qiE "^(INSERT|UPDATE|REPLACE|DELETE|BEGIN|PRAGMA)" "$delta" 2>/dev/null; then
-                            if grep -qvE '^[[:space:]]*(--.*|/\*.*\*/)?$' "$delta" 2>/dev/null; then
-                                echo -e "${YELLOW}⚠ Skipped corrupt delta: ${delta_name}${NC}" >&2
-                            fi
-                            continue
-                        fi
-                        # Parse the lineage header (wv-5a2627) up front:
-                        # `/* weave-lineage seq=<n> actor=<a> */` on line 1, emitted
-                        # by wv_delta_changeset iff seq>0 -- i.e. for every genuine
-                        # post-cutover emission. No header (legacy / pre-lineage /
-                        # hand-written) sorts first at seq 0; path is the final
-                        # tie-break so the old back-catalog keeps its filename-epoch
-                        # order and same-lineage emissions stay deterministic.
-                        local _hl _lseq _lactor _has_lineage_header=0
-                        _hl=$(head -n1 "$delta" 2>/dev/null)
-                        if [ "${_hl#/\* weave-lineage seq=}" != "$_hl" ]; then
-                            _has_lineage_header=1
-                            _lseq=${_hl#/\* weave-lineage seq=}
-                            _lactor=${_lseq#* actor=}
-                            _lactor=${_lactor% \*/}
-                            _lseq=${_lseq%% actor=*}
-                        else
-                            _lseq=0; _lactor=
-                        fi
-                        case "$_lseq" in ''|*[!0-9]*) _lseq=0 ;; esac
-                        # Pre-cutover back-catalog guard (wv-2448dd): with the
-                        # causal cutover marker in place, a delta with no lineage
-                        # header was emitted before the graph became causal, and is
-                        # skipped regardless of filename epoch or embedded timestamp.
-                        # The classifier is the SAME structural signal the ordering
-                        # above already trusts -- not a whole-file grep for the
-                        # substring "lineage_seq=". A body-wide grep also matches
-                        # that substring appearing inside a quoted node text or
-                        # metadata VALUE (this epic's own nodes describe the feature
-                        # in prose), which would misclassify a genuinely pre-cutover,
-                        # unguarded delta as post-cutover and let it replay.
-                        if [ -n "$cutover_seq" ] && [ "$_has_lineage_header" -eq 0 ]; then
-                            skipped_cutover=$((skipped_cutover + 1))
-                            continue
-                        fi
-                        _replay_keys+=("$(printf '%018d%s%s%s%s%s%s' "$_lseq" "$_US" "$_lactor" "$_US" "$delta" "$_US" "$delta_name")")
-                        delta_count=$((delta_count + 1))
-                    fi
-                done <<< "$delta_files"
-                if [ "$delta_count" -gt 0 ]; then
-                    # Materialise the lineage-ordered replay list (wv-5a2627):
-                    # numeric on seq, then actor, then path.
-                    local _k_seq _k_actor _k_path _k_name
-                    while IFS=$'\x1f' read -r _k_seq _k_actor _k_path _k_name; do
-                        [ -n "$_k_path" ] || continue
-                        new_deltas+=("$_k_path")
-                        new_names+=("$_k_name")
-                    done < <(printf '%s\n' "${_replay_keys[@]}" | LC_ALL=C sort -t$'\x1f' -k1,1 -k2,2 -k3,3)
-                    # Single batched sqlite3 call: wrap FK toggle + all deltas in one
-                    # transaction — per-statement auto-commit costs ~1 fsync each;
-                    # a single transaction reduces N commits to 1.
-                    #
-                    # .bail on: abort on first error and return non-zero exit code,
-                    # which rolls back the transaction and prevents partial replay.
-                    # Manifest is only written after this succeeds.
-                    #
-                    # No FTS filter: wv_delta_changeset never emits nodes_fts or
-                    # sqlite_sequence rows. Filtering multiline SQL by line prefix
-                    # is unsafe against data values that start with those strings.
-                    local replay_rc=0
-                    {
-                        echo ".bail on"
-                        echo "PRAGMA foreign_keys = OFF;"
-                        echo "BEGIN;"
-                        cat "${new_deltas[@]}"
-                        echo "COMMIT;"
-                        echo "PRAGMA foreign_keys = ON;"
-                    } | sqlite3 "$WV_DB" || replay_rc=$?
-                    if [ "$replay_rc" -ne 0 ]; then
-                        # state.sql was already imported and the DB is valid.
-                        # Warn but continue — returning non-zero here would cause
-                        # callers that check $? to treat a successful load as failed.
-                        # Don't update manifest: failed deltas will be retried on the
-                        # next wv load (manifest was truncated to empty at line 601,
-                        # so all deltas re-qualify if this load fails).
-                        echo -e "${YELLOW}⚠ Delta replay failed (rc=$replay_rc) — will retry on next load${NC}" >&2
-                        sqlite3 "$WV_DB" "PRAGMA foreign_keys = ON;" 2>/dev/null || true
-                    else
-                        # Manifest written only after successful replay
-                        printf '%s\n' "${new_names[@]}" >> "$manifest"
-                        # Reset the change log after replay: the INSERT/UPDATE statements
-                        # fired the triggers, so _warp_changes now contains every
-                        # replayed operation. Without this reset, the next auto_sync
-                        # would emit a delta containing all of them — snowballing the
-                        # same changes across all agents indefinitely. The load itself
-                        # already succeeded (state.sql imported, replay applied), so a
-                        # drain failure here doesn't undo that -- but it must not pass
-                        # silently given exactly what it risks.
-                        wv_delta_reset "$WV_DB" || echo -e "${YELLOW}⚠ Post-replay change tracker drain failed — next sync may re-emit replayed changes${NC}" >&2
-                        # Re-derive nodes_fts AFTER replay, not only before it.
-                        #
-                        # db_rebuild_fts ran earlier against the state.sql import, so
-                        # the index was consistent at that point. Replay then applies
-                        # INSERT OR REPLACE INTO nodes. For a TEXT-PRIMARY-KEY table
-                        # the rowid is implicit, so REPLACE deletes the conflicting
-                        # row (new rowid) — and SQLite only fires DELETE triggers for
-                        # that implicit delete when recursive_triggers is ON, which it
-                        # is not (it is set nowhere in this codebase). So nodes_ad
-                        # never runs, nodes_ai does, and every replaced node strands an
-                        # orphaned nodes_fts entry at its old rowid.
-                        #
-                        # Orphans are invisible to both PRAGMA integrity_check and
-                        # FTS5 'integrity-check' — they surface only later, as
-                        # SQLITE_CORRUPT from the nodes_au sync trigger on ANY
-                        # UPDATE to nodes, which takes out wv done graph-wide
-                        # (wv-44993d 2026-08-08, again 2026-08-27; root cause wv-d2e6c6).
-                        #
-                        # 'rebuild' re-derives from nodes for an external-content
-                        # table, so it discards orphans outright. Idempotent, and only
-                        # paid when deltas actually replayed.
-                        db_rebuild_fts || return 1
-                        echo -e "${GREEN}✓${NC} Replayed $delta_count delta(s)" >&2
-                    fi
-                fi
-                sqlite3 "$WV_DB" "PRAGMA foreign_keys = ON;" 2>/dev/null || true
-                if [ "$skipped" -gt 0 ]; then
-                    echo -e "${YELLOW}ℹ${NC} Skipped $skipped pre-prune delta(s)" >&2
-                fi
-                if [ "$skipped_legacy" -gt 0 ]; then
-                    echo -e "${YELLOW}ℹ${NC} Skipped $skipped_legacy legacy pre-checkpoint delta(s)" >&2
-                fi
-                if [ "$skipped_cutover" -gt 0 ]; then
-                    echo -e "${YELLOW}ℹ${NC} Skipped $skipped_cutover pre-cutover delta(s) (causal cutover @ lineage_seq $cutover_seq)" >&2
-                fi
-            fi
-        fi
+        # Delta replay — multi-agent merge: the v1 SQL back-catalog, after the
+        # v2 dispatch above and before the tombstone reconcile below (wv-c92ac9).
+        _load_v1_replay
 
         # Enforce cross-machine deletion tombstones AFTER both delta blocks: the
         # v1 catalog may have resurrected a node/edge that a delete recorded a
         # tombstone for. Runs unconditionally (a tombstone can arrive via state.sql
         # with no deltas present) and is idempotent.
         _reconcile_tombstones "$WV_DB" || return 1
+
+        # This database now holds the state.sql of every compaction read above,
+        # so its own dumps pass the writer fence (wv-aac412). A failed record
+        # leaves the fence closed, which only refuses dumps until the next load.
+        wv_compaction_mark_absorbed "$WV_DB" "$_load_epochs" || true
+
+        # Close the load attempt (wv-4e35c0): an acknowledgement only when
+        # every input applied and the catalog did not move underneath. A failed
+        # attempt is reported once; the warnings above already named each gap.
+        local _ack_reasons
+        if ! _ack_reasons=$(wv_load_attempt_finish "$WV_DB" "$WEAVE_DIR" "$_ack_before" 2>&1 >/dev/null); then
+            echo -e "${YELLOW}ℹ${NC} Load not acknowledged: ${_ack_reasons:-could not record the attempt}" >&2
+        fi
 
         # AFTER the replay and the tombstone pass, so a node the deltas restore
         # or a delete intentionally removed is not reported as lost. What is left
@@ -3377,6 +3700,18 @@ cmd_compact() {
     local dry_run=false
     local force=false
 
+    # Stage A of docs/PROPOSAL-delta-retention.md: its own transaction, lock and
+    # recovery (wv-28ef47), never mixed with the age-based mode below.
+    case " $* " in
+        *" --pre-cutover "*)
+            local _a; local -a _pc_args=()
+            for _a in "$@"; do [ "$_a" = "--pre-cutover" ] || _pc_args+=("$_a"); done
+            # shellcheck source=/dev/null
+            source "${WV_LIB_DIR:-$SCRIPT_DIR}/lib/wv-compact-pre-cutover.sh" || return 1
+            cmd_compact_pre_cutover "${_pc_args[@]}"
+            return ;;
+    esac
+
     while [ $# -gt 0 ]; do
         case "$1" in
             --older-than=*) older_than="${1#*=}" ;;
@@ -3552,24 +3887,111 @@ cmd_cutover() {
     fi
 }
 
+# _prune_tombstone_floor_seq — the highest lineage seq under any v2 delta
+# directory dated 90 or more days ago, or 0 when there is none. The tombstone
+# table carries no timestamp (adding one would change the CREATE TABLE text
+# that state.sql byte-compares between a fresh and a migrated database), so a
+# tombstone's age is read from the dated catalog: a seq at or below the floor
+# was written at least 90 days ago.
+_prune_tombstone_floor_seq() {
+    local cutoff floor=0 day seq f
+    cutoff=$(date -u -d '90 days ago' +%Y-%m-%d 2>/dev/null) || cutoff=$(date -u -v-90d +%Y-%m-%d)
+    [ -d "$WEAVE_DIR/deltas" ] || { echo 0; return 0; }
+    for day in "$WEAVE_DIR"/deltas/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
+        [ -d "$day/v2" ] || continue
+        [[ "$(basename "$day")" < "$cutoff" || "$(basename "$day")" == "$cutoff" ]] || continue
+        for f in "$day"/v2/[0-9]*.json; do
+            [ -e "$f" ] || continue
+            seq=${f##*/}; seq=${seq%%-*}; seq=$((10#$seq))
+            [ "$seq" -gt "$floor" ] && floor=$seq
+        done
+    done
+    echo "$floor"
+}
+
+# _prune_compact_tombstones DRY_RUN — wv prune --compact-tombstones (prune
+# policy P3, wv-3937eb; templates/procedures/prune-policy.md). A tombstone is
+# compacted only when every rostered clone's watermark is above its lineage
+# seq AND it is below the 90-day floor; the roster check must pass (an
+# undeclared writer may still replay) and WV_TOMBSTONE_COMPACTION=1 must be
+# set (consumers ship with it off). Seq 0 tombstones (pre-cutover, age
+# unknown) are never compacted.
+_prune_compact_tombstones() {
+    local dry_run="$1"
+    if [ "${WV_TOMBSTONE_COMPACTION:-0}" != "1" ]; then
+        echo -e "${RED}Error: tombstone compaction is off (set WV_TOMBSTONE_COMPACTION=1 in a repository whose clones are rostered with watermarks; see wv guide --procedure=prune-policy)${NC}" >&2
+        return 1
+    fi
+    local roster_py="${WV_LIB_DIR:-$SCRIPT_DIR}/lib/wv-clone-roster.py"
+    [ -f "$roster_py" ] || roster_py="${WV_LIB_DIR:-$SCRIPT_DIR}/wv-clone-roster.py"
+    local unaccounted
+    if ! unaccounted=$(python3 "$roster_py" check "$WEAVE_DIR" 2>&1); then
+        echo -e "${RED}Error: the clone roster does not account for every writer; nothing compacted${NC}" >&2
+        [ -n "$unaccounted" ] && echo "$unaccounted" | sed 's/^/  /' >&2
+        return 1
+    fi
+    local watermark
+    if ! watermark=$(python3 "$roster_py" watermark "$WEAVE_DIR" 2>&1); then
+        echo -e "${RED}Error: every rostered clone needs a watermark line before tombstones compact; nothing compacted${NC}" >&2
+        [ -n "$watermark" ] && echo "$watermark" | sed 's/^/  /' >&2
+        return 1
+    fi
+    local floor
+    floor=$(_prune_tombstone_floor_seq)
+    local where="lineage_seq > 0 AND lineage_seq < $watermark AND lineage_seq <= $floor"
+    local n
+    n=$(db_query "SELECT count(*) FROM tombstones WHERE $where;") || return 1
+    echo "tombstones: $(db_query "SELECT count(*) FROM tombstones;") held; lowest clone watermark $watermark; 90-day floor at lineage seq $floor"
+    if [ "${n:-0}" -eq 0 ]; then
+        echo "No tombstone to compact."
+        return 0
+    fi
+    if [ "$dry_run" = true ]; then
+        echo -e "${YELLOW}Would compact $n tombstone(s)${NC}"
+        return 0
+    fi
+    db_query "BEGIN IMMEDIATE; DELETE FROM tombstones WHERE $where; COMMIT;" || {
+        echo -e "${RED}Error: compaction refused by the database; nothing compacted${NC}" >&2
+        return 1
+    }
+    _redump_state_after_removal "$n" || true
+    echo -e "${GREEN}✓${NC} Compacted $n tombstone(s)"
+    return 0
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # cmd_prune — Archive old done nodes
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_prune() {
-    local age="48 hours"
+    # Prune policy (owner ruling 2026-11-10, wv-3937eb; design note in
+    # templates/procedures/prune-policy.md). A prune is an explicit command: it
+    # never runs from a hook or a session end (the 2026-11-09 session-end prune
+    # removed 615 nodes live work still cited, wv-5e5f18). The default age is
+    # 30 days: 48 hours is what selected those 615.
+    if [ "${WV_CALL_SOURCE:-}" = "hook" ]; then
+        echo -e "${RED}Error: wv prune does not run from a hook or a session end; run it yourself (wv prune --dry-run first)${NC}" >&2
+        return 1
+    fi
+    local age="30 days"
     local dry_run=false
     local orphans_only=false
-    
+    local compact=false
+
     while [ $# -gt 0 ]; do
         case "$1" in
             --age=*) age="${1#*=}" ;;
             --dry-run) dry_run=true ;;
             --orphans-only) orphans_only=true ;;
+            --compact-tombstones) compact=true ;;
         esac
         shift
     done
     wv_require_graph || return 1
+    if [ "$compact" = true ]; then
+        _prune_compact_tombstones "$dry_run"
+        return $?
+    fi
 
     # Validate age format: must be Nh or Nd (numeric hours or days)
     local age_num age_unit
@@ -3609,44 +4031,102 @@ cmd_prune() {
         orphan_clause="AND id NOT IN (SELECT source FROM edges) AND id NOT IN (SELECT target FROM edges)"
     fi
 
-    # Find candidates (skip unaddressed pitfalls — they must persist until resolved)
-    local candidates=$(db_query "
-        SELECT id, text, updated_at FROM nodes
-        WHERE status = 'done'
-        $age_clause
-        $orphan_clause
-        AND COALESCE($(wv_kind_sql), '') NOT IN ('finding', 'memory')
-        AND id NOT IN (
-            SELECT n.id FROM nodes n
-            WHERE json_extract(n.metadata, '\$.pitfall') IS NOT NULL
-            AND n.id NOT IN (SELECT pitfall FROM ($(wv_pitfall_resolver_edges_sql)))
-        );
-    ")
-    
-    if [ -z "$candidates" ]; then
-        echo "No nodes to prune."
-        return
-    fi
-    
-    # Dedup against today's archive BEFORE dry-run so --dry-run reflects actual
-    # candidates (F6 fix). Read-only here; mkdir deferred until after dry-run gate.
-    local archive_dir="$WEAVE_DIR/archive"
-    local archive_file="$archive_dir/$(date +%Y-%m-%d).jsonl"
-    if [ -f "$archive_file" ]; then
-        local already_archived
-        already_archived=$(jq -r '.id' "$archive_file" 2>/dev/null | sort -u)
-        if [ -n "$already_archived" ]; then
-            candidates=$(echo "$candidates" | awk -F'|' -v skip="$already_archived" '
-                BEGIN { n = split(skip, arr, "\n"); for (i=1;i<=n;i++) seen[arr[i]]=1 }
-                { if (!seen[$1]) print }
-            ')
+    # Selection. base: done nodes past the age (or orphans). Each exclusion is
+    # one row of excl(id, why), so --dry-run can say what each rule kept:
+    #   - finding and memory nodes (by kind or text prefix): a finding is the
+    #     record of a defect, a memory graduates project-locally (wv-ab5f6c);
+    #   - epic, plan and decision nodes: the record of intent and rulings;
+    #   - a node whose pitfall no resolver edge has addressed;
+    #   - a node a live node still references: an edge INTO it from a node
+    #     outside base, or its id in that node's text or metadata. The reference
+    #     direction is what `wv impact` reads; a done node's own edge out to a
+    #     live parent does not keep it.
+    # tombstones has no _warp trigger, so this whole selection is read-only.
+    local kind_sql
+    kind_sql=$(wv_kind_sql b)
+    local prune_cte="
+        WITH base AS (
+            SELECT id, text, updated_at, metadata FROM nodes
+            WHERE status = 'done'
+            $age_clause
+            $orphan_clause
+        ),
+        excl AS (
+            SELECT b.id, 'finding or memory' AS why FROM base b
+            WHERE COALESCE($kind_sql, '') IN ('finding', 'memory')
+               OR $(_wv_finding_prefix_sql b)
+            UNION ALL
+            SELECT b.id, 'epic, plan or decision' FROM base b
+            WHERE COALESCE($kind_sql, '') IN ('epic', 'plan', 'decision')
+               OR ltrim(b.text) LIKE 'epic(%' OR ltrim(b.text) LIKE 'plan(%'
+               OR ltrim(b.text) LIKE 'decision(%'
+            UNION ALL
+            SELECT b.id, 'unresolved pitfall' FROM base b
+            WHERE json_extract(b.metadata, '\$.pitfall') IS NOT NULL
+              AND b.id NOT IN (SELECT pitfall FROM ($(wv_pitfall_resolver_edges_sql)))
+            UNION ALL
+            SELECT b.id, 'referenced by a live node' FROM base b
+            WHERE EXISTS (SELECT 1 FROM edges e
+                          WHERE e.target = b.id AND e.source NOT IN (SELECT id FROM base))
+               OR EXISTS (SELECT 1 FROM nodes m
+                          WHERE m.id NOT IN (SELECT id FROM base)
+                            AND (instr(m.text, b.id) > 0 OR instr(COALESCE(m.metadata, ''), b.id) > 0))
+        )"
+    local candidates
+    candidates=$(db_query "$prune_cte
+        SELECT id, text, updated_at FROM base
+        WHERE id NOT IN (SELECT id FROM excl)
+        ORDER BY updated_at;") || { echo -e "${RED}Error: prune could not read the graph; nothing pruned${NC}" >&2; return 1; }
+    local kept
+    kept=$(db_query "$prune_cte
+        SELECT why || ': ' || count(DISTINCT id) FROM excl GROUP BY why ORDER BY why;")
+
+    # A node whose GitHub issue is still open is not pruned (owner ruling
+    # 2026-11-10): an open issue is live work's claim on it. The gh calls are
+    # per candidate with an issue, as the issue-closing loop before this ruling
+    # was; a gh that cannot answer keeps the node (fail closed).
+    if [ -n "$candidates" ] && command -v gh >/dev/null 2>&1; then
+        local repo="" _with_issue
+        _with_issue=$(echo "$candidates" | cut -d'|' -f1 | while read -r id; do
+            [ -n "$id" ] || continue
+            local gh_num
+            gh_num=$(db_query "SELECT json_extract(metadata, '\$.gh_issue') FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null)
+            [ -n "$gh_num" ] && [ "$gh_num" != "null" ] && printf '%s %s\n' "$id" "$gh_num"
+        done)
+        if [ -n "$_with_issue" ]; then
+            repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
+            local _open_ids="" _open_n=0 id gh_num gh_state
+            while read -r id gh_num; do
+                [ -n "$id" ] || continue
+                if [ -n "$repo" ]; then
+                    gh_state=$(gh issue view "$gh_num" --repo "$repo" --json state -q '.state' 2>/dev/null || echo "")
+                else
+                    gh_state=""
+                fi
+                if [ "$gh_state" != "CLOSED" ]; then
+                    _open_ids+="$id"$'\n'; _open_n=$((_open_n + 1))
+                fi
+            done <<< "$_with_issue"
+            if [ "$_open_n" -gt 0 ]; then
+                candidates=$(awk -v ids="$_open_ids" 'BEGIN{n=split(ids,a,"\n"); for(i=1;i<=n;i++) if(a[i]!="") skip[a[i]]=1} {split($0,f,"|"); if(!(f[1] in skip)) print}' <<< "$candidates")
+                kept="${kept:+$kept$'\n'}open or unverified GitHub issue: $_open_n"
+            fi
         fi
     fi
 
     if [ -z "$candidates" ]; then
-        echo "No new nodes to prune (all candidates already archived today)."
-        return
+        echo "No nodes to prune."
+        [ -n "$kept" ] && echo "$kept" | sed 's/^/  kept — /'
+        return 0
     fi
+    
+    # Today's archive dedups the archive WRITE below, never the candidates: a node
+    # still in the graph is not pruned, whatever the archive says. Filtering the
+    # candidates by it made a prune whose transaction failed, or a node a replay
+    # resurrected, unprunable for the rest of the day, reported as "already
+    # archived" with exit 0 (wv-aec7de).
+    local archive_dir="$WEAVE_DIR/archive"
+    local archive_file="$archive_dir/$(date +%Y-%m-%d).jsonl"
 
     local count
     count=$(echo "$candidates" | wc -l)
@@ -3656,7 +4136,8 @@ cmd_prune() {
         echo "$candidates" | while IFS='|' read -r id text updated; do
             echo "  $id: $text (updated: $updated)"
         done
-        return
+        [ -n "$kept" ] && echo "$kept" | sed 's/^/  kept — /'
+        return 0
     fi
 
     # Export to archive, but not from a DB foreign to WEAVE_DIR: its rows are not
@@ -3665,7 +4146,10 @@ cmd_prune() {
     ids=$(echo "$candidates" | cut -d'|' -f1 | while read -r _id; do printf '%s,' "$(sql_escape "$_id")"; done | sed 's/,$//')
     if ! _wv_db_foreign_to_weave_dir; then
         mkdir -p "$archive_dir"
-        db_query_json "SELECT * FROM nodes WHERE id IN ('${ids//,/\',\'}')" | jq -c '.[]' >> "$archive_file"
+        # Append only rows today's archive does not already hold.
+        db_query_json "SELECT * FROM nodes WHERE id IN ('${ids//,/\',\'}')" \
+            | jq -c --slurpfile have <(jq -c '.id' "$archive_file" 2>/dev/null | jq -s '.' 2>/dev/null || echo '[]') \
+                '($have[0] // []) as $h | .[] | select(.id as $i | $h | index($i) | not)' >> "$archive_file"
     fi
 
     # Collect nodes affected by edge deletion for cache invalidation
@@ -3678,29 +4162,7 @@ cmd_prune() {
     connected_targets=$(db_query "SELECT DISTINCT target FROM edges WHERE source IN ('${ids//,/\',\'}');" | tr '\n' ' ')
     affected_nodes="$affected_nodes $connected_sources $connected_targets"
 
-    # Close linked GitHub issues before deleting nodes.
-    # Pre-state-check guards against spam-commenting already-closed issues (F2 fix).
-    if command -v gh >/dev/null 2>&1; then
-        local repo
-        repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
-        if [ -n "$repo" ]; then
-            echo "$candidates" | cut -d'|' -f1 | while read -r id; do
-                local gh_num
-                gh_num=$(db_query "SELECT json_extract(metadata, '\$.gh_issue') FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null)
-                if [ -n "$gh_num" ] && [ "$gh_num" != "null" ]; then
-                    local gh_state
-                    gh_state=$(gh issue view "$gh_num" --repo "$repo" --json state -q '.state' 2>/dev/null || echo "")
-                    if [ "$gh_state" = "OPEN" ]; then
-                        gh issue close "$gh_num" --repo "$repo" \
-                            --comment "Pruned from Weave graph (node \`$id\` archived after ${age})." \
-                            >/dev/null 2>&1 && \
-                            echo -e "  ${GREEN}✓${NC} Closed GitHub issue #$gh_num ($id)" >&2 || \
-                            echo -e "  ${YELLOW}⚠${NC} Could not close GitHub issue #$gh_num ($id)" >&2
-                    fi
-                fi
-            done
-        fi
-    fi
+    # No issue is closed here: a candidate with an open issue was kept above.
 
     # Capture the lineage of every node (and its incident edges) BEFORE the
     # DELETEs run, so the tombstones written below carry the highest lineage each
@@ -3708,11 +4170,20 @@ cmd_prune() {
     # state.sql (wv-0d5e07), replacing the gitignored .weave/.prune_epoch.
     local _prune_agent
     _prune_agent="$(resolve_agent_id 2>/dev/null || echo unknown)"
-    local _tomb_pairs=""   # db_capture_tombstones lines for every candidate
+    local _tomb_pairs="" _tomb_one   # db_capture_tombstones lines for every candidate
     while read -r id; do
         [ -n "$id" ] || continue
-        _tomb_pairs+="$(db_capture_tombstones "$id")"$'\n'
+        if ! _tomb_one=$(db_capture_tombstones "$id"); then
+            echo -e "${RED}Error: could not read the lineage of $id; nothing pruned${NC}" >&2
+            return 1
+        fi
+        _tomb_pairs+="${_tomb_one}"$'\n'
     done < <(echo "$candidates" | cut -d'|' -f1)
+    local _tomb_sql
+    if ! _tomb_sql=$(db_tombstones_sql "$_prune_agent" <<< "$_tomb_pairs"); then
+        echo -e "${RED}Error: could not build the prune tombstones; nothing pruned${NC}" >&2
+        return 1
+    fi
 
     # Delete nodes and orphaned edges in a single atomic transaction.
     # DELETEs must NOT leak into delta files. Prune decisions are local:
@@ -3723,7 +4194,15 @@ cmd_prune() {
     # The transaction wraps both the DELETEs and the _warp_changes reset in one
     # sqlite3 invocation — no window for a concurrent auto_sync to snapshot the
     # trigger-generated rows between DELETE and reset.
-    local prune_sql="BEGIN TRANSACTION;"
+    #
+    # The cross-machine tombstones (one per pruned node and incident edge) land in
+    # the SAME transaction, as wv delete's do: on 2026-11-09 they were a separate,
+    # unchecked call, failed while the DELETEs succeeded, and every fresh load then
+    # resurrected 615 pruned nodes (wv-aec7de). tombstones has no _warp trigger,
+    # so these INSERTs do not leak into deltas — prune stays non-propagating; the
+    # rows travel only via state.sql and each clone's _reconcile_tombstones
+    # re-enforces them after replay. A refused transaction prunes nothing.
+    local prune_sql="BEGIN IMMEDIATE;"$'\n'"$_tomb_sql"$'\n'
     while read -r id; do
         local esc_id
         esc_id="$(sql_escape "$id")"
@@ -3732,13 +4211,10 @@ cmd_prune() {
         prune_sql+="DELETE FROM nodes WHERE id='$esc_id';"
     done < <(echo "$candidates" | cut -d'|' -f1)
     prune_sql+="DELETE FROM _warp_changes;COMMIT;"
-    db_query "$prune_sql"
-
-    # Record a cross-machine deletion tombstone per pruned node and incident edge.
-    # tombstones has no _warp trigger, so these INSERTs do not leak into deltas —
-    # prune stays non-propagating; the tombstone rows travel only via state.sql
-    # and each clone's _reconcile_tombstones re-enforces them after replay.
-    db_write_tombstones "$_prune_agent" <<< "$_tomb_pairs"
+    if ! db_query "$prune_sql"; then
+        echo -e "${RED}Error: prune refused by the database; nothing pruned, no tombstones written (the archive at $archive_file lists what it would have removed)${NC}" >&2
+        return 1
+    fi
 
     # Re-dump state.sql so it no longer contains pruned nodes.
     # Without this, wv load would resurrect them from the stale snapshot.
@@ -3749,6 +4225,8 @@ cmd_prune() {
     invalidate_context_cache $affected_nodes
 
     echo -e "${GREEN}✓${NC} Pruned $count nodes → $archive_file"
+    [ -n "$kept" ] && echo "$kept" | sed 's/^/  kept — /'
+    return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4783,6 +5261,7 @@ cmd_import() {
         echo "Usage: wv import <file.jsonl> [--filter=\"id=xxx\"] [--dry-run]" >&2
         return 1
     fi
+    wv_credential_refuse_file "wv import $file" "$file" || return 1  # wv-320587
     
     db_ensure
     
@@ -6131,6 +6610,7 @@ cmd_plan() {
         echo -e "${RED}Error: file '$file' not found${NC}" >&2
         return 1
     fi
+    wv_credential_refuse_file "wv plan $file" "$file" || return 1  # wv-320587
 
     if [ -z "$sprint" ]; then
         echo -e "${RED}Error: --sprint=N required${NC}" >&2

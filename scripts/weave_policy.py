@@ -75,11 +75,14 @@ HOOK_FILES = (".claude/hooks/*.sh", "scripts/lib/wv-hook-common.sh", "scripts/li
 # What a hook records when it decides (scripts/lib/wv-hook-observe.sh,
 # wv-664b7f): _hc_observe <rule> <decision> [bypass]. It never carries a call id.
 HOOK_OBSERVE = re.compile(r"\b_hc_observe\s+([a-z][a-z0-9_]*)\s+([a-z]+)")
-# Weave git hooks and the suite pool they source (wv-3477f0). A refusal is a
+# Weave git hooks, the recovery module the pre-commit hook sources in the
+# source repository (wv-669900; build-release.sh strips it and projects its
+# sites out of the shipped contract), and the suite pool they source
+# (wv-3477f0). A refusal is a
 # non-zero exit in command position (statement start, or after ; | & { then
 # else do), with a literal 1.. or a variable status; "(exit $rc" in a message
 # is text, not a refusal.
-GIT_HOOK_FILES = ("scripts/hooks/*-weave.sh", "scripts/lib/wv-gate-pool.sh")
+GIT_HOOK_FILES = ("scripts/hooks/*-weave.sh", "scripts/hooks/pre-commit-recovery.sh", "scripts/lib/wv-gate-pool.sh")
 GIT_REFUSAL = re.compile(r"(?:^|[;&|{]|\bthen\b|\belse\b|\bdo\b)\s*exit\s+(?:[1-9][0-9]*|\"?\$)")
 # The markers build-release.sh cuts on, matched the way it matches them.
 SOURCE_ONLY_BEGIN = re.compile(r"^\s*# BEGIN source-only\b")

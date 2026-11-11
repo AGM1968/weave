@@ -1,12 +1,16 @@
 {
   "schema": "weave.policy-rules.v1",
-  "contract_version": "1.13.1",
+  "contract_version": "1.14.0",
   "references": {
     "capability_registry": "contracts/command-capabilities.json",
     "verdict_schema": "contracts/policy-v1.schema.json",
     "node_field_registry": "contracts/node-field-registry-v1.json"
   },
-  "rule_decisions": ["allow", "advisory", "deny"],
+  "rule_decisions": [
+    "allow",
+    "advisory",
+    "deny"
+  ],
   "verdict_fold": [
     {
       "rule_decision": "deny",
@@ -21,7 +25,12 @@
       "verdict": "allow"
     }
   ],
-  "enforcement_owners": ["command_gate", "sqlite_trigger", "host_hook", "git_hook"],
+  "enforcement_owners": [
+    "command_gate",
+    "sqlite_trigger",
+    "host_hook",
+    "git_hook"
+  ],
   "non_policy_categories": [
     {
       "category": "input_validation",
@@ -41,8 +50,14 @@
     }
   ],
   "completeness": {
-    "proven": ["sqlite_trigger", "host_hook", "git_hook"],
-    "declared_only": ["command_gate"],
+    "proven": [
+      "sqlite_trigger",
+      "host_hook",
+      "git_hook"
+    ],
+    "declared_only": [
+      "command_gate"
+    ],
     "limit": "SQLite aborts, host-hook denials and refusing exits of the Weave git hooks are detected mechanically and every one must be claimed here. Every declared command gate must emit its verdict through wv_policy_verdict at its declared site, and every emit must name a declared rule, a decision that rule declares, and a declared site. A command gate that emits nothing is still indistinguishable in code from input validation, so the set of command gates is complete only as far as a manual classification reached: instrumenting v1.0.0 found three gates it had missed. Git-hook refusals inside '# BEGIN source-only' blocks (the evidence lab's E6 gates) are outside this contract as they are outside the release, which cuts them."
   },
   "denominator": {
@@ -237,7 +252,10 @@
       "rule_id": "orphan_prevention",
       "summary": "A non-epic node may not be created without a parent while an epic is open, because it would be orphaned.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -268,7 +286,10 @@
       "rule_id": "active_add_requires_claim_readiness",
       "summary": "A node created directly as active must already carry done criteria and a risk assessment.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -296,7 +317,10 @@
       "rule_id": "reconstruct_never_overwrites",
       "summary": "Reconstructing a node by explicit id may not overwrite a node that still exists.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -319,7 +343,10 @@
       "rule_id": "init_preserves_existing_graph",
       "summary": "Initialising may not replace a database that already holds nodes.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -346,7 +373,10 @@
       "rule_id": "close_requires_quality_evidence",
       "summary": "A close may not proceed without quality scan data for the quality gates to judge; missing evidence fails closed.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -378,7 +408,7 @@
           "path": "scripts/cmd/wv-cmd-core.sh",
           "function": "_done_refresh_file_metrics",
           "anchor": "wv_policy_verdict close_requires_quality_evidence",
-          "occurrences": 5
+          "occurrences": 4
         },
         {
           "owner": "command_gate",
@@ -393,7 +423,10 @@
       "rule_id": "finding_close_requires_violation_type",
       "summary": "A finding node may not close without a catalogued violation_type.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -437,7 +470,10 @@
       "rule_id": "completion_scope_integrity",
       "summary": "A close may scope its completion only to files attributed to the node, under a fresh attempt identity.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -449,7 +485,16 @@
           "field": "status",
           "from": "active",
           "to": "done",
-          "via": ["batch-done", "bulk-update", "done", "quick", "resolve", "ship", "ship-agent", "update"]
+          "via": [
+            "batch-done",
+            "bulk-update",
+            "done",
+            "quick",
+            "resolve",
+            "ship",
+            "ship-agent",
+            "update"
+          ]
         }
       ],
       "bypass": [],
@@ -490,7 +535,10 @@
       "rule_id": "close_requires_learning",
       "summary": "A close must record a learning unless it is declared trivial.",
       "basis": "heuristic",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -544,7 +592,10 @@
       "rule_id": "close_awaits_human_verification",
       "summary": "A node marked as waiting for human verification may not close until that is acknowledged.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -584,7 +635,10 @@
       "rule_id": "reserved_slot_claim",
       "summary": "A node reserved for a counted evidence capture may not be claimed as ordinary work.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -612,7 +666,10 @@
       "rule_id": "reopen_requires_explicit_intent",
       "summary": "A done node may be reopened only by an explicit reopen, never implicitly by a claim or an update.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -652,9 +709,12 @@
     },
     {
       "rule_id": "claim_ownership",
-      "summary": "Taking over a node another agent has claimed requires an explicit override, which is recorded.",
+      "summary": "Taking over a node another agent has claimed requires an explicit override, which is recorded; a claim under an unverifiable session identity is refused.",
       "basis": "invariant",
-      "decisions": ["allow"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -665,6 +725,10 @@
         {
           "kind": "flag",
           "name": "--force"
+        },
+        {
+          "kind": "flag",
+          "name": "--continue"
         }
       ],
       "sites": [
@@ -674,15 +738,25 @@
           "function": "cmd_work",
           "anchor": "wv_policy_verdict claim_ownership",
           "occurrences": 2
+        },
+        {
+          "owner": "command_gate",
+          "path": "scripts/cmd/wv-cmd-core.sh",
+          "function": "_work_claim_held_by_other",
+          "anchor": "wv_policy_verdict claim_ownership",
+          "occurrences": 2
         }
       ],
-      "notes": "Only the takeover is a policy event. A claim refused because another agent holds the node is recorded as expected_conflict: the atomic claim cannot tell a live holder from a race this call just lost."
+      "notes": "The takeover (--force) and the continuation of this actor's own pre-session coarse claim (--continue) are policy events, each appended to metadata.claim_history; --continue on anyone else's claim is denied, and so is any claim when a harness that carries a session id did not supply it (wv-99978b). A claim refused because another agent holds the node is recorded as expected_conflict: the atomic claim cannot tell a live holder from a race this call just lost."
     },
     {
       "rule_id": "delete_preserves_children",
       "summary": "A node with child nodes may not be deleted without explicit intent, because it would orphan them.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -709,7 +783,10 @@
       "rule_id": "block_graph_acyclic",
       "summary": "Blocking edges may not form a self-loop or a cycle.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -731,7 +808,10 @@
       "rule_id": "edge_write_invariants",
       "summary": "An edge may not break its type's invariant (contracts/edge-types-v1.json): no self-edge, acyclic blocks and implements, supersedes old to new unless declared, resolves to a finding, addresses from the newer node.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -753,7 +833,10 @@
       "rule_id": "close_children_accounted",
       "summary": "A node may not close over an open implements child that is not parked, linked by resolves, or under another open parent.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -809,7 +892,10 @@
       "rule_id": "sync_shrink_floor",
       "summary": "A sync may not overwrite the committed graph with a dump far smaller than it, the signature of a wiped or partial hot zone.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -847,7 +933,10 @@
       "rule_id": "compact_waits_for_claims",
       "summary": "Deltas may not be compacted while agents hold claims that may not have replayed them.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -874,7 +963,10 @@
       "rule_id": "cutover_waits_for_claims",
       "summary": "A causal cutover may not run while agents hold claims.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -901,7 +993,10 @@
       "rule_id": "recovery_never_fabricates_closure",
       "summary": "Recovery may not complete a close that was never durably recorded.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -929,7 +1024,10 @@
       "rule_id": "repository_write_requires_owned",
       "summary": "Scaffolding and repair may write only into a repository classified as owned, never into vendored upstream code.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -961,7 +1059,7 @@
         },
         {
           "owner": "command_gate",
-          "path": "scripts/cmd/wv-cmd-ops.sh",
+          "path": "scripts/cmd/wv-cmd-doctor.sh",
           "function": "cmd_doctor",
           "anchor": "wv_policy_verdict repository_write_requires_owned"
         }
@@ -971,7 +1069,10 @@
       "rule_id": "owned_override_requires_acknowledgement",
       "summary": "Classifying a remote-bearing repository as owned against autodetection requires acknowledging it is an intentional fork.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -999,7 +1100,10 @@
       "rule_id": "add_duplicate_check",
       "summary": "A node whose text matches an open node, or one closed in the last 30 days, is refused as a likely duplicate.",
       "basis": "heuristic",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -1041,7 +1145,10 @@
       "rule_id": "init_refuses_symlinked_weave_dir",
       "summary": "Initialising through a symlinked Weave directory is refused, because it writes graph state outside the repository.",
       "basis": "invariant",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -1063,7 +1170,10 @@
       "rule_id": "learning_overlap_advisory",
       "summary": "A learning that overlaps or contradicts an existing one is recorded as an advisory; it never blocks the close.",
       "basis": "heuristic",
-      "decisions": ["allow", "advisory"],
+      "decisions": [
+        "allow",
+        "advisory"
+      ],
       "applies_to": [
         {
           "kind": "operation",
@@ -1103,14 +1213,26 @@
       "rule_id": "close_complexity_ceiling",
       "summary": "A close may not complete while a file it touched exceeds the McCabe complexity threshold.",
       "basis": "heuristic",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "transition",
           "field": "status",
           "from": "active",
           "to": "done",
-          "via": ["batch-done", "bulk-update", "done", "quick", "resolve", "ship", "ship-agent", "update"]
+          "via": [
+            "batch-done",
+            "bulk-update",
+            "done",
+            "quick",
+            "resolve",
+            "ship",
+            "ship-agent",
+            "update"
+          ]
         }
       ],
       "bypass": [
@@ -1156,14 +1278,26 @@
       "rule_id": "close_trend_not_deteriorating",
       "summary": "A close may not complete while a file it touched is on a deteriorating quality trend.",
       "basis": "heuristic",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "transition",
           "field": "status",
           "from": "active",
           "to": "done",
-          "via": ["batch-done", "bulk-update", "done", "quick", "resolve", "ship", "ship-agent", "update"]
+          "via": [
+            "batch-done",
+            "bulk-update",
+            "done",
+            "quick",
+            "resolve",
+            "ship",
+            "ship-agent",
+            "update"
+          ]
         }
       ],
       "bypass": [
@@ -1209,14 +1343,26 @@
       "rule_id": "close_tests_not_red",
       "summary": "A code node may not close while a file it touched has a red or stale test result.",
       "basis": "heuristic",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "transition",
           "field": "status",
           "from": "active",
           "to": "done",
-          "via": ["batch-done", "bulk-update", "done", "quick", "resolve", "ship", "ship-agent", "update"]
+          "via": [
+            "batch-done",
+            "bulk-update",
+            "done",
+            "quick",
+            "resolve",
+            "ship",
+            "ship-agent",
+            "update"
+          ]
         }
       ],
       "bypass": [
@@ -1262,7 +1408,9 @@
       "rule_id": "edit_source_not_installed_copy",
       "summary": "An edit may not target the installed copy of Weave instead of its source.",
       "basis": "invariant",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1283,7 +1431,9 @@
       "rule_id": "read_size_budget",
       "summary": "A whole-file read of a large file must be bounded.",
       "basis": "heuristic",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1309,7 +1459,9 @@
       "rule_id": "edit_blocked_in_phase",
       "summary": "Edits are refused while the session is in a discovery or closing phase.",
       "basis": "invariant",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1330,7 +1482,9 @@
       "rule_id": "edit_requires_active_node",
       "summary": "An edit requires an active node to attribute it to.",
       "basis": "invariant",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1356,7 +1510,9 @@
       "rule_id": "active_node_not_stale",
       "summary": "An edit may not proceed under an active node that has gone stale.",
       "basis": "heuristic",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1377,7 +1533,9 @@
       "rule_id": "active_node_contradictions_resolved",
       "summary": "An edit may not proceed while the active node carries unresolved contradictions.",
       "basis": "heuristic",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1398,7 +1556,9 @@
       "rule_id": "active_node_not_blocked",
       "summary": "An edit may not proceed under an active node that is still blocked.",
       "basis": "invariant",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1419,7 +1579,9 @@
       "rule_id": "claim_requires_done_criteria",
       "summary": "A node may not be claimed until it carries done criteria.",
       "basis": "invariant",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1440,7 +1602,9 @@
       "rule_id": "claim_requires_alias",
       "summary": "A node may not be claimed until it carries an alias.",
       "basis": "invariant",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1461,7 +1625,9 @@
       "rule_id": "claim_premortem_advisory",
       "summary": "A claim without a risk assessment is advised to record one.",
       "basis": "heuristic",
-      "decisions": ["advisory"],
+      "decisions": [
+        "advisory"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1483,7 +1649,10 @@
       "rule_id": "close_requires_verification_evidence",
       "summary": "A close must cite how the work was verified unless declared trivial.",
       "basis": "heuristic",
-      "decisions": ["allow", "deny"],
+      "decisions": [
+        "allow",
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1514,7 +1683,9 @@
       "rule_id": "close_requires_committed_work",
       "summary": "A close may not proceed while the node's own files are uncommitted.",
       "basis": "invariant",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1535,7 +1706,9 @@
       "rule_id": "close_requires_attributed_commit",
       "summary": "A close requires at least one commit attributed to the node.",
       "basis": "invariant",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1556,7 +1729,9 @@
       "rule_id": "no_busy_wait_polling",
       "summary": "A background task may not be polled with a sleep loop.",
       "basis": "heuristic",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1577,7 +1752,9 @@
       "rule_id": "no_duplicate_inflight_command",
       "summary": "A command identical to one still running may not be launched again.",
       "basis": "heuristic",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1603,7 +1780,9 @@
       "rule_id": "session_end_requires_no_active_node",
       "summary": "A session may not end while a node is still active.",
       "basis": "invariant",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "host_event",
@@ -1614,6 +1793,10 @@
         {
           "kind": "state",
           "how": "a second stop inside the cooldown window is allowed with a note"
+        },
+        {
+          "kind": "state",
+          "how": "when the guard cannot load, the retry stop (stop_hook_active) is allowed with a warning, so a broken install cannot trap a session (wv-c7d114)"
         }
       ],
       "sites": [
@@ -1621,6 +1804,11 @@
           "owner": "host_hook",
           "path": "scripts/lib/wv-lifecycle-end.sh",
           "anchor": "active node(s) still open"
+        },
+        {
+          "owner": "host_hook",
+          "path": ".claude/hooks/stop-check.sh",
+          "anchor": "The Weave stop guard could not load"
         }
       ]
     },
@@ -1628,7 +1816,9 @@
       "rule_id": "commit_admission",
       "summary": "A commit proceeds only under an active node claimed by the actor committing it.",
       "basis": "invariant",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "git_event",
@@ -1671,13 +1861,15 @@
           "anchor": "Bypass: git commit --no-verify"
         }
       ],
-      "notes": "Identity source: wv list --status=active --claimed-by=current, which resolves the actor as resolve_agent_id does for the Weave-ID trailers: WV_AGENT_ID if set, otherwise <harness>-<host>-<user> from the committing process's environment, with human when no agent harness is detected. One identity policy for admission and attribution; they remain separate hooks and queries. Failure behaviour: a listing that fails reads as no claim, so admission fails closed. Continuing another actor's node is wv work <id> --force, which claim_ownership records as a takeover; it is not a bypass. The guarantee is actor-owned admission, not session isolation: sessions resolving one identity admit each other's commits unless each sets WV_AGENT_ID (wv-d7f53e). With no node active at all the second site refuses (the discover-phase message). Removed as exemptions (wv-68aeff): WV_AUTO_CHECKPOINT_ACTIVE and WV_STYLE_COMMIT (a flag is not authority), the whitespace-only shortcut (git diff -w cannot show semantic equivalence), and the closing phase (repository-shared; the graph commit it existed for is graph state). With no wv in a Weave-managed repository a substantive commit is refused. A commit cannot remove its own enforcement prerequisite (wv-49b687): Weave management, the shellcheck scope declaration, .shellcheckrc, the memory-parity map row and the release leak checker count when HEAD or the index has them, so staging their deletion or relaxation does not disable them for that commit."
+      "notes": "Identity source: wv list --status=active --claimed-by=current, which resolves the actor as resolve_agent_id does for the Weave-ID trailers: WV_AGENT_ID if set, otherwise <harness>-<host>-<user>-s<sid12> when the harness carries a session id (Claude Code, Codex; WV_SESSION_IDENTITY=0 turns this off), else <harness>-<host>-<user> from the committing process's environment, with human when no agent harness is detected. A harness session whose id is missing fails the listing (wv-99978b). One identity policy for admission and attribution; they remain separate hooks and queries. Failure behaviour: a listing that fails reads as no claim, so admission fails closed. Continuing another actor's node is wv work <id> --force, which claim_ownership records as a takeover; it is not a bypass. Admission is session-owned where the harness carries a session id, and actor-owned for a human shell, Copilot or WV_SESSION_IDENTITY=0 (wv-99978b, design wv-d7f53e). A pre-session coarse claim is resumed with wv work <id> --continue. With no node active at all the second site refuses (the discover-phase message). Removed as exemptions (wv-68aeff): WV_AUTO_CHECKPOINT_ACTIVE and WV_STYLE_COMMIT (a flag is not authority), the whitespace-only shortcut (git diff -w cannot show semantic equivalence), and the closing phase (repository-shared; the graph commit it existed for is graph state). With no wv in a Weave-managed repository a substantive commit is refused. A commit cannot remove its own enforcement prerequisite (wv-49b687): Weave management, the shellcheck scope declaration, .shellcheckrc, the memory-parity map row and the release leak checker count when HEAD or the index has them, so staging their deletion or relaxation does not disable them for that commit."
     },
     {
       "rule_id": "push_heavy_tier_tests_pushed_tip",
       "summary": "The heavy tier a push owes runs against exactly the commit being pushed.",
       "basis": "invariant",
-      "decisions": ["deny"],
+      "decisions": [
+        "deny"
+      ],
       "applies_to": [
         {
           "kind": "git_event",
@@ -1825,7 +2017,7 @@
         {
           "owner": "command_gate",
           "path": "scripts/cmd/wv-cmd-core.sh",
-          "function": "cmd_work",
+          "function": "_work_claim_held_by_other",
           "anchor": "wv_policy_refusal expected_conflict"
         },
         {
@@ -1974,8 +2166,13 @@
     },
     {
       "category": "infrastructure_failure",
-      "summary": "The pre-commit gate could not evaluate the staged content (a read, temp directory, materialisation or library failed), so it refuses rather than admit unchecked.",
+      "summary": "The pre-commit gate could not evaluate the staged content (a read, temp directory, materialisation, library or the recovery module failed, or that module was run instead of sourced), so it refuses rather than admit unchecked.",
       "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "the gate lock library (wv-gate-hold.sh) was not found"
+        },
         {
           "owner": "git_hook",
           "path": "scripts/hooks/pre-commit-weave.sh",
@@ -2005,6 +2202,11 @@
           "owner": "git_hook",
           "path": "scripts/hooks/pre-commit-weave.sh",
           "anchor": "memory parity: could not materialise the frozen graph and projections"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "memory parity: could not copy the parity checker for this check"
         },
         {
           "owner": "git_hook",
@@ -2045,6 +2247,11 @@
           "owner": "git_hook",
           "path": "scripts/hooks/pre-commit-weave.sh",
           "anchor": "release leak guard: could not materialise the staged index"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "release leak guard: could not copy the release policy for this check"
         },
         {
           "owner": "git_hook",
@@ -2124,6 +2331,11 @@
         {
           "owner": "git_hook",
           "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "from the committed gate's copy"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
           "anchor": "could not read the committed gate's lane mark"
         },
         {
@@ -2190,6 +2402,16 @@
           "owner": "git_hook",
           "path": "scripts/hooks/pre-commit-weave.sh",
           "anchor": "so this Weave-managed repository cannot check the staged changes."
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "the recovery module is missing beside this hook"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not load the recovery module"
         }
       ]
     },
@@ -2197,6 +2419,11 @@
       "category": "infrastructure_failure",
       "summary": "The pre-push gate could not judge the push (gate libraries missing, suite selection unresolvable).",
       "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "the gate lock library (wv-gate-hold.sh) was not found"
+        },
         {
           "owner": "git_hook",
           "path": "scripts/hooks/pre-push-weave.sh",
@@ -2357,23 +2584,18 @@
       ]
     },
     {
-      "category": "content_verification",
-      "summary": "Recovery (S2c, wv-0af8f0): for a commit shaped as a recovery record or as a recorded repair, the installed copy runs HEAD's gate first and acts only on its refusal. That refusal stands unless the record, validated by the installed code, admits the commit (and for a repair, the recorded replacement gate passes a negative control and admits it); every refusal on that path goes through _pcr_refuse, a near miss returns HEAD's own status, and _pcr_run's child shell exits with the status of the bounded run it reports. A recovery admission is traceability, not approval.",
+      "category": "expected_conflict",
+      "summary": "Another Weave gate holds this checkout (wv-c5500d): the pre-commit or pre-push gate refuses to start beside it, naming the holder. One gate at a time per checkout is a conflict over shared git state and scratch, not a judgement of the content.",
       "sites": [
         {
           "owner": "git_hook",
-          "path": "scripts/hooks/pre-commit-weave.sh",
-          "function": "_pcr_refuse"
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "wv_gate_hold_acquire pre-push \"$_pp_subject\" || exit 1"
         },
         {
           "owner": "git_hook",
           "path": "scripts/hooks/pre-commit-weave.sh",
-          "function": "_pcr_main"
-        },
-        {
-          "owner": "git_hook",
-          "path": "scripts/hooks/pre-commit-weave.sh",
-          "function": "_pcr_run"
+          "anchor": "wv_gate_hold_acquire pre-commit \"commit on"
         }
       ]
     }

@@ -205,7 +205,7 @@ test_codex_zone_followed_without_env_signal() {
     [ -d "$codex_dir" ] || { mkdir -p "$codex_dir" && created=1; }
     # Scrub every codex env signal to mimic a harness-spawned hook process.
     local zone
-    zone=$(env -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+    zone=$(env -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
                -u WV_HOT_ZONE -u WV_DB bash -c "
         source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh' 2>/dev/null
         resolve_hot_zone
@@ -276,7 +276,7 @@ test_all_hooks_source_common() {
 # pre-action.sh passed on a comment.
 test_hook_common_rule_shared() {
     echo "-- doctor and Check 4 share the hook-common rule"
-    local ops="$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh" fx home rel out
+    local ops="$PROJECT_ROOT/scripts/cmd/wv-cmd-doctor.sh" fx home rel out
     unwired() {  # unwired <root>: the helper, under pipefail, with no installed fallback
         HOME="$home" bash -c 'set -euo pipefail; source "$1"; _hook_common_unwired "$2"' _ "$ops" "$1" | paste -sd' ' -
     }
@@ -434,6 +434,59 @@ test_pre_action_falls_through_broken_library() {
         echo -e "  ${RED}[FAIL]${NC} expected 2 (block) with a ${1:-syntax}-broken nearest library, got rc=$rc"
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
+}
+
+# The edit guard fails closed (wv-187945, owner ruling 2026-11-03). It exited 0
+# with a warning whenever it could not run, so a half-installed library or a
+# missing graph database admitted every edit with no claim. Now an edit to a
+# file in a Weave checkout is blocked with the fix named; a read, or an edit in
+# no Weave checkout, still passes.
+test_edit_guard_fails_closed() {
+    echo "-- the edit guard fails closed when it cannot run"
+    local sandbox proj plain fake_home rc err
+    sandbox=$(mktemp -d)
+    proj="$sandbox/proj" plain="$sandbox/plain" fake_home="$sandbox/home"
+    mkdir -p "$proj/.weave" "$plain" "$fake_home/.config/weave/lib" "$sandbox/hooks" "$sandbox/lib"
+    git -C "$proj" init -q
+    _fc_case() {  # _fc_case <label> <expected rc> <hook> <payload> [stderr needle]
+        TESTS_RUN=$((TESTS_RUN + 1))
+        set +e
+        err=$( (cd "$proj" && env -u WV_PROJECT_DIR -u CLAUDE_PROJECT_DIR HOME="$fake_home" \
+            bash "$3" <<< "$4") 2>&1 >/dev/null)
+        rc=$?
+        set -e
+        if [ "$rc" = "$2" ] && { [ -z "${5:-}" ] || grep -qF -- "$5" <<< "$err"; }; then
+            echo -e "  ${GREEN}[PASS]${NC} $1"
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+        else
+            echo -e "  ${RED}[FAIL]${NC} $1 (rc=$rc, expected $2; stderr: ${err:0:200})"
+            TESTS_FAILED=$((TESTS_FAILED + 1))
+        fi
+    }
+    _fc_edit() { jq -cn --arg t "$1" --arg p "$2" '{tool_name:$t,tool_input:{file_path:$p,old_string:"a",new_string:"b"}}'; }
+
+    # 1. No guard library anywhere: the adapter alone decides.
+    cp "$PROJECT_ROOT/.claude/hooks/pre-action.sh" "$sandbox/hooks/pre-action.sh"
+    _fc_case "no guard library: an edit in a Weave checkout is blocked" 2 \
+        "$sandbox/hooks/pre-action.sh" "$(_fc_edit Edit "$proj/app.py")" "Edits in $proj are blocked"
+    _fc_case "no guard library: an edit outside any Weave checkout passes" 0 \
+        "$sandbox/hooks/pre-action.sh" "$(_fc_edit Edit "$plain/notes.txt")"
+    _fc_case "no guard library: a read passes" 0 \
+        "$sandbox/hooks/pre-action.sh" "$(_fc_edit Read "$proj/app.py")"
+
+    # 2. The guard loads but wv-hook-common does not.
+    cp "$PROJECT_ROOT/scripts/lib/wv-pre-tool-use.sh" "$PROJECT_ROOT/scripts/lib/wv-resolve-project.sh" \
+       "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" "$sandbox/lib/"
+    _fc_case "no wv-hook-common: an edit in a Weave checkout is blocked" 2 \
+        "$sandbox/hooks/pre-action.sh" "$(_fc_edit Write "$proj/app.py")" "wv-hook-common.sh could not be loaded"
+    _fc_case "no wv-hook-common: a read passes" 0 \
+        "$sandbox/hooks/pre-action.sh" "$(_fc_edit Read "$proj/app.py")"
+
+    # 3. Every library loads, but the project's graph database is missing.
+    _fc_case "a missing graph database blocks an edit and says how to load it" 2 \
+        "$PROJECT_ROOT/.claude/hooks/pre-action.sh" \
+        "$(_fc_edit Edit "$proj/app.py")" "run any wv command"
+    rm -rf "$sandbox"
 }
 
 # ─── Per-check unit tests (t6) ────────────────────────────────────────────────
@@ -674,6 +727,7 @@ main() {
     test_pre_action_resolves_installed_libs
     test_pre_action_falls_through_broken_library syntax
     test_pre_action_falls_through_broken_library guard
+    test_edit_guard_fails_closed
     test_install_sh_ships_hook_common
 
     echo ""

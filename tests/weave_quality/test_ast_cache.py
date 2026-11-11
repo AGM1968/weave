@@ -164,11 +164,11 @@ def test_prune_removes_old_entries(tmp_path: Path) -> None:
     c.put("sha_old", entry, None, [])
     # Backdate the entry via flush + direct SQL (testing internal state intentionally)
     c.flush()
-    c._conn.execute(  # pylint: disable=protected-access
+    c._conn.execute(  # pylint: disable=protected-access  # noqa: SLF001
         "UPDATE ast_result_cache SET cached_at = ? WHERE blob_sha = ?",
         (int(time.time()) - 100 * 86400, "sha_old"),
     )
-    c._conn.commit()  # pylint: disable=protected-access
+    c._conn.commit()  # pylint: disable=protected-access  # noqa: SLF001
     deleted = c.prune()
     assert deleted == 1
     assert c.get("sha_old", "foo.py", 1, "production") is None

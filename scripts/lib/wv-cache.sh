@@ -32,9 +32,12 @@ invalidate_context_cache() {
         done
     fi
 
-    # Also clear pre-action.sh first-call-only stamps so context is re-checked
+    # Also clear the first-call-only stamps so context is re-checked. Stamps are
+    # per owner (wv-43d6be) and a graph change invalidates every owner's; the
+    # root form predates owner directories.
     for node_id in $affected_ids; do
-        rm -f "$WV_HOT_ZONE/.context_checked_${node_id}" 2>/dev/null
+        rm -f "$WV_HOT_ZONE/.context_checked_${node_id}" \
+            "$WV_HOT_ZONE"/owners/*/".context_checked_${node_id}" 2>/dev/null
     done
 }
 

@@ -770,12 +770,16 @@ test_doctor_claim_ownership() {
     real_sqlite=$(command -v sqlite3)
     cat > "$TEST_DIR/bin/sqlite3" <<'SQLITE'
 #!/usr/bin/env bash
-for arg in "$@"; do
+# db_query sends SQL on stdin (wv-aec7de): read it when the last argument is the DB file.
+sql=""; from_stdin=0
+if [ "$#" -gt 0 ] && [ -f "${!#}" ]; then sql=$(cat); from_stdin=1; fi
+for arg in "$@" "$sql"; do
     if [[ "$arg" == SELECT* && "$arg" == *claimed_by* && "$arg" == *"FROM nodes"* && "$arg" == *active* ]]; then
         echo 'injected ownership read failure' >&2
         exit 1
     fi
 done
+[ "$from_stdin" = 1 ] && exec "$REAL_SQLITE" "$@" <<< "$sql"
 exec "$REAL_SQLITE" "$@"
 SQLITE
     chmod +x "$TEST_DIR/bin/sqlite3"

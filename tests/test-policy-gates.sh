@@ -81,6 +81,18 @@ j work "$child"
 expect "a lost claim is an expected conflict, not a denial" work non_policy_refusal expected_conflict - -
 j work "$child" --force
 expect "a takeover records the override" work policy_verdict claim_ownership allow --force
+# Session identity (wv-99978b). WV_SESSION_ID pins a session whatever runs the
+# suite; set but empty, it is a declared session that cannot be verified.
+sess=$("$WV" add "session claims" --force 2>/dev/null | tail -1)
+WV_SESSION_IDENTITY=1 WV_SESSION_ID='' j work "$sess"
+expect "a claim under an unverifiable session is denied" work policy_verdict claim_ownership deny -
+"$WV" update "$sess" --metadata='{"claimed_by":"another-agent"}' >/dev/null 2>&1
+WV_SESSION_IDENTITY=1 WV_SESSION_ID=gates1 j work "$sess" --continue
+expect "--continue on another actor's claim is denied" work policy_verdict claim_ownership deny --continue
+coarse=$(env -u WV_AGENT_ID bash -c "source '$ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_agent_coarse_id")
+"$WV" update "$sess" --metadata="{\"claimed_by\":\"$coarse\"}" >/dev/null 2>&1
+WV_SESSION_IDENTITY=1 WV_SESSION_ID=gates1 j work "$sess" --continue
+expect "--continue of the actor's own coarse claim records the override" work policy_verdict claim_ownership allow --continue
 j "done" "$child" --skip-verification
 expect "a close without a learning names its bypass" "done" policy_verdict close_requires_learning allow --skip-verification
 j work "$child"

@@ -470,15 +470,17 @@ source "$_WV_DB_SRC_DIR/wv-db-lineage.sh"
 # 'edge'; ID is the node id, or the "source:target:type" identity for an edge
 # (the join key wv-delta-v2-replay.py::_apply_delete also tombstones on).
 #
-# LINEAGE_SEQ is the deleted row's own lineage_seq at delete time — the highest
-# lineage that row can carry — so any delta that later replays its creation or an
-# earlier patch lands at or below the tombstone and _reconcile_tombstones removes
-# it, while a recreate stamped after the delete carries a strictly greater
-# lineage_seq and survives (the reconcile orders on seq alone for these v1-written
-# rows). LINEAGE_ACTOR is provenance — the agent performing the delete
-# (resolve_agent_id) — kept for parity with the Delta v2 tombstone shape. Omitted
-# args fall to the pre-cutover floor (0, ''). ON CONFLICT keeps the higher
-# (seq, actor) so a re-delete never regresses an existing tombstone.
+# (LINEAGE_SEQ, LINEAGE_ACTOR) is the deleted row's own lineage at delete time —
+# the highest lineage that row can carry — so any delta that later replays its
+# creation or an earlier patch lands at or below the tombstone and
+# _reconcile_tombstones (and the v1 replay guard) removes it, while a recreate
+# stamped after the delete carries a strictly greater lineage and survives. Both
+# compare (seq, actor) tuples, so the actor must be the ROW's: the deleting
+# agent's actor beside the row's seq let a row whose actor sorts after it outrank
+# its own tombstone (wv-f01b33). Callers pass the deleter's actor only for a row
+# that carried none. Omitted args fall to the pre-cutover floor (0, ''). ON
+# CONFLICT keeps the higher (seq, actor) so a re-delete never regresses an
+# existing tombstone.
 db_tombstone_sql() {
     local kind="$1" ident="$2" lseq="${3:-0}" lactor="${4:-}"
     [ "$kind" = "node" ] || [ "$kind" = "edge" ] || return 1
@@ -515,21 +517,29 @@ db_capture_tombstones() {
     local node_id="$1" esc seq es et ety eseq edges
     [ -n "$node_id" ] || return 1
     if command -v sql_escape >/dev/null 2>&1; then esc=$(sql_escape "$node_id"); else esc=${node_id//\'/\'\'}; fi
-    seq=$(db_query "SELECT COALESCE(lineage_seq,0) FROM nodes WHERE id='$esc';") || return 1
-    edges=$(db_query "SELECT source, target, type, COALESCE(lineage_seq,0) FROM edges WHERE source='$esc' OR target='$esc';") || return 1
-    printf 'node\t%s\t%s\n' "$node_id" "${seq:-0}"
-    while IFS='|' read -r es et ety eseq; do
+    # The row's own (seq, actor): reconcile and replay compare (seq, actor)
+    # tuples, so stamping the deleter's actor beside the row's seq let a row
+    # whose actor sorts after the deleter's outrank its own tombstone
+    # (wv-f01b33). The tab-separated lines carry the actor as a fourth column.
+    local row nactor eactor
+    row=$(db_query "SELECT COALESCE(lineage_seq,0) || char(9) || COALESCE(lineage_actor,'') FROM nodes WHERE id='$esc';") || return 1
+    IFS=$'\t' read -r seq nactor <<< "$row"
+    edges=$(db_query "SELECT source, target, type, COALESCE(lineage_seq,0), COALESCE(lineage_actor,'') FROM edges WHERE source='$esc' OR target='$esc';") || return 1
+    printf 'node\t%s\t%s\t%s\n' "$node_id" "${seq:-0}" "${nactor:-}"
+    while IFS='|' read -r es et ety eseq eactor; do
         [ -n "$es" ] || continue
-        printf 'edge\t%s:%s:%s\t%s\n' "$es" "$et" "$ety" "${eseq:-0}"
+        printf 'edge\t%s:%s:%s\t%s\t%s\n' "$es" "$et" "$ety" "${eseq:-0}" "${eactor:-}"
     done <<< "$edges"
 }
 
 # Build tombstone statements so a removal can commit them in its own transaction.
 db_tombstones_sql() {
-    local actor="$1" kind ident seq
-    while IFS=$'\t' read -r kind ident seq; do
+    local actor="$1" kind ident seq row_actor
+    while IFS=$'\t' read -r kind ident seq row_actor; do
         [ -n "$kind" ] || continue
-        db_tombstone_sql "$kind" "$ident" "${seq:-0}" "$actor" || return 1
+        # The row's own actor when captured (wv-f01b33); ACTOR only for a row
+        # that carried none.
+        db_tombstone_sql "$kind" "$ident" "${seq:-0}" "${row_actor:-$actor}" || return 1
     done
 }
 
@@ -1228,7 +1238,7 @@ db_rebuild_fts() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Database Ensure (with auto-prune)
+# Database Ensure (with the graph size warning)
 # ═══════════════════════════════════════════════════════════════════════════
 
 # _wv_db_ensure_key — what db_ensure memoises: the DB path and its inode. A
@@ -1494,13 +1504,14 @@ _wv_db_graph_bytes() {
 }
 
 # _wv_db_size_check — once per process tree (the flag is exported so pipe
-# subshells inherit it), warn about or prune a graph over WV_MAX_DB_SIZE.
+# subshells inherit it), warn about a graph over WV_MAX_DB_SIZE.
 # The graph is judged, not the file: the code index can be most of the file,
 # and pruning nodes for it deleted graph work that freed nothing (wv-dc5486).
-# Destructive prune requires explicit opt-in (WV_AUTO_PRUNE=1) and runs wv
-# prune itself, so it keeps prune's exclusions (findings, memories, unaddressed
-# pitfalls), its archive and tombstones, and its refusal on a foreign DB.
-# WV_DISABLE_AUTOPRUNE=1 kept for backward compat (sync uses it).
+# It only warns. WV_AUTO_PRUNE=1 used to run 'wv prune --age=24h' from
+# whichever command tripped the check; under the prune policy a prune is
+# explicit (typed, or the release step) with a 30-day default, so the switch
+# is retired and announces that it does not prune (owner ruling 2026-11-10, wv-ee5690).
+# WV_DISABLE_AUTOPRUNE=1 still skips the check (sync and suites set it).
 _wv_db_size_check() {
     [ -z "${_WV_SIZE_CHECKED:-}" ] && [ -f "$WV_DB" ] && [ -z "${WV_DISABLE_AUTOPRUNE:-}" ] || return 0
     export _WV_SIZE_CHECKED=1
@@ -1511,31 +1522,25 @@ _wv_db_size_check() {
     graph_bytes=$(_wv_db_graph_bytes "$db_size")
     [ "$graph_bytes" -gt "$WV_MAX_DB_SIZE" ] 2>/dev/null || return 0
     limit_mb=$(( WV_MAX_DB_SIZE / 1048576 ))
-    if [ "${WV_AUTO_PRUNE:-0}" != "1" ]; then
-        echo "wv: graph data is $(( graph_bytes / 1048576 ))MB (limit ${limit_mb}MB) — run 'wv prune --age=7d' or set WV_AUTO_PRUNE=1 to auto-prune" >&2
-        return 0
+    echo "wv: graph data is $(( graph_bytes / 1048576 ))MB (limit ${limit_mb}MB) — preview with 'wv prune --dry-run', then run 'wv prune'" >&2
+    if [ "${WV_AUTO_PRUNE:-0}" = "1" ]; then
+        echo "wv: WV_AUTO_PRUNE is retired and does not prune; a prune runs only when you type it (wv guide --procedure=prune-policy)" >&2
     fi
-    echo "wv: graph data is $(( graph_bytes / 1048576 ))MB (limit ${limit_mb}MB), auto-pruning done nodes older than 24h..." >&2
-    if ! declare -F cmd_prune >/dev/null; then
-        echo "wv: auto-prune needs the wv command set; run 'wv prune --age=7d'" >&2
-        return 0
-    fi
-    cmd_prune --age=24h >&2 || echo "wv: auto-prune failed" >&2
-    # Clear entire context cache after auto-prune (can't track specific affected nodes)
-    rm -rf "$WV_HOT_ZONE/context_cache" 2>/dev/null || true
-    graph_bytes=$(_wv_db_graph_bytes "$db_size")
-    if [ "$graph_bytes" -gt "$WV_MAX_DB_SIZE" ] 2>/dev/null; then
-        echo "wv: graph data still $(( graph_bytes / 1048576 ))MB (limit ${limit_mb}MB) after auto-prune — run 'wv prune --age=7d' to free more" >&2
-    fi
+    return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Query Helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
+# SQL reaches sqlite3 on stdin, never as an argument: Linux caps one argument at
+# 131,072 bytes, and a prune's tombstone SQL (853,597 bytes for 615 nodes) failed
+# at execve with E2BIG while its smaller DELETEs ran, so the tombstones were lost
+# and every fresh load resurrected the pruned nodes (wv-aec7de, wv-5e5f18).
+# -bail keeps the argument form's contract: stop at the first error, exit nonzero.
 db_query() {
     db_ensure || return 1
-    sqlite3 -batch -cmd ".timeout 5000" "$WV_DB" "$1"
+    printf '%s\n' "$1" | sqlite3 -batch -bail -cmd ".timeout 5000" "$WV_DB"
 }
 
 # sqlite3 -json prints nothing, not [], for zero rows. Callers then hand jq
@@ -1544,7 +1549,7 @@ db_query() {
 db_query_json() {
     db_ensure || return 1
     local raw
-    raw=$(sqlite3 -json -cmd ".timeout 5000" "$WV_DB" "$1") || return $?
+    raw=$(printf '%s\n' "$1" | sqlite3 -json -bail -cmd ".timeout 5000" "$WV_DB") || return $?
     printf '%s\n' "${raw:-[]}"
 }
 

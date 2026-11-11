@@ -102,6 +102,30 @@ d=$(doctor_check "$A")
 check "doctor passes after re-projection" contains "$d" '"status":"pass"'
 check "doctor is silent where a repo authors no procedures" test "$(doctor_check "$B")" = null
 
+# wv-5505c2: a repository with no procedures of its own (the usual consumer) still
+# has the package procedures projected, and doctor compares them: an install that
+# changed a package procedure without wv init-repo --update left them stale and
+# doctor silent.
+package_check() { doctor_json "$1" | jq -c '[.checks[] | select(.check == "procedure-projections")][0] // null'; }
+d=$(package_check "$B")
+check "doctor passes current package projections in a repo without its own procedures" contains "$d" '"status":"pass"'
+procedure "$CONFIG/procedures" session wv-session '# Package session, revised by an install'
+d=$(package_check "$B")
+check "doctor warns when a package procedure changed and the repo was not re-projected" contains "$d" '"status":"warn"'
+check "...naming the stale surface" contains "$d" '.claude/skills'
+check "...without writing it" lacks "$(cat "$B/.claude/skills/wv-session/SKILL.md")" 'revised by an install'
+check "projector refreshes the second repo" project "$B"
+d=$(package_check "$B")
+check "doctor passes after the repo is re-projected" contains "$d" '"status":"pass"'
+procedure "$CONFIG/procedures" session wv-session '# Package session'
+check "projector restores the second repo" project "$B"
+# A third repository gets a hot zone of its own: the suite's shared one stays
+# bound to repo A, which the cases below still use.
+C="$TMP/repo-c"; mkdir -p "$C/.weave"; git -C "$C" init -q
+(umask 077 && mkdir -p "$TMP/hotzone-c")
+check "doctor is silent in a repo with no managed projection at all" \
+    test "$(WV_HOT_ZONE="$TMP/hotzone-c" package_check "$C")" = null
+
 # Contract failures: an invalid repo procedure is an error, never a fallback.
 printf '%s\n' '---' 'id: verify' 'description: broken' '---' '# no adapters' > "$A/.weave/procedures/verify.md"
 out=$(guide "$A" verify || true)

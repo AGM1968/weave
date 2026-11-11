@@ -246,12 +246,12 @@ check "an undeclared operation is reported unknown" "
 check "wv sources the generated projection before dispatching" \
   "grep -q 'source \"\$WV_LIB_DIR/lib/wv-command-capabilities.sh\"' '$ROOT/scripts/wv'"
 check "the retired cache classifiers are gone from wv-cache.sh" \
-  "! grep -qE '_wv_run_cache_is_(read|write|exempt)_cmd' '$ROOT/scripts/lib/wv-cache.sh' '$ROOT/scripts/wv' '$ROOT/scripts/cmd/wv-cmd-ops.sh'"
+  "! grep -qE '_wv_run_cache_is_(read|write|exempt)_cmd' '$ROOT/scripts/lib/wv-cache.sh' '$ROOT/scripts/wv' '$ROOT/scripts/cmd/wv-cmd-ops.sh' '$ROOT/scripts/cmd/wv-cmd-doctor.sh' '$ROOT/scripts/cmd/wv-cmd-health.sh' '$ROOT/scripts/cmd/wv-cmd-help.sh' '$ROOT/scripts/cmd/wv-cmd-orient.sh'"
 check "the dispatcher classifies at command level through the registry" \
   "grep -q '_wv_cap_serve \"\$cmd\" \"\"' '$ROOT/scripts/wv' &&
    grep -q '_wv_cap_invalidate \"\$cmd\" \"\"' '$ROOT/scripts/wv'"
 check "pattern-audit totality reads the registry" \
-  "grep -q '_wv_cap_known \"\$cmd\"' '$ROOT/scripts/cmd/wv-cmd-ops.sh'"
+  "grep -q '_wv_cap_known \"\$cmd\"' '$ROOT/scripts/cmd/wv-cmd-doctor.sh'"
 
 # Cache behaviour must be unchanged by the migration. The registry is compared
 # against the classification the retired lists produced, pinned here as data:

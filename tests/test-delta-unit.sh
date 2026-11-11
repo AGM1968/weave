@@ -906,7 +906,100 @@ mkdir -p "$CAT/2026-09-01/v2" "$CAT/2026-09-02/v2"
 got=$(wv_lineage_seq_base "$CAT/no-such.db" "$CAT")
 [ "$got" = "12" ] && ok "the lineage base is the highest catalog sequence" \
     || fail "the lineage base is the highest catalog sequence" "got '$got'"
+
+# One awk replaced the per-file shell loop (wv-5c1223). Its readings of the
+# names, against what the loop decided:
+: > "$CAT/2026-09-02/v2/9-short.json"                     # width varies: 12 > 9
+: > "$CAT/2026-09-02/v2/abc-dddd.json"                    # not a number: skipped
+: > "$CAT/2026-09-02/v2/000000000099.txt"                 # not a sidecar: skipped
+: > "$CAT/2026-09-02/v2/80"$'\n'"0-eeee.json"             # "80\n0" is no number
+mkdir -p "$CAT/.hidden/v2"; : > "$CAT/.hidden/v2/000000000500-ffff.json"  # glob skips dot dirs
+got=$(wv_lineage_seq_base "$CAT/no-such.db" "$CAT")
+[ "$got" = "12" ] && ok "the base skips names that are not a sequence" \
+    || fail "the base skips names that are not a sequence" "got '$got'"
+: > "$CAT/2026-09-02/v2/00000000000000000000000000041-gggg.json"
+got=$(wv_lineage_seq_base "$CAT/no-such.db" "$CAT")
+[ "$got" = "41" ] && ok "a zero-padded sequence wider than 19 digits reads as its number" \
+    || fail "a zero-padded sequence wider than 19 digits reads as its number" "got '$got'"
+# A dangling symlink counts: a base too high only skips numbers, one too low
+# could reuse a published sequence.
+ln -s "$CAT/nowhere" "$CAT/2026-09-02/v2/000000000077-hhhh.json"
+got=$(wv_lineage_seq_base "$CAT/no-such.db" "$CAT")
+[ "$got" = "77" ] && ok "a dangling sidecar link still raises the base" \
+    || fail "a dangling sidecar link still raises the base" "got '$got'"
 rm -rf "$CAT"
+
+# Clock floor (Stage B prereq 2, wv-5575bb). The review's counterexample: the
+# newest op deleted an entity, so rows top out at 5 and its seq 100 lived only
+# in the sidecar name and the tombstone. Deleting the sidecar dropped the base
+# from 100 to 5, and the next write would reuse spent sequence numbers.
+FL=$(mktemp -d /tmp/delta-floor-XXXXXX)
+mkdir -p "$FL/.weave/deltas/2026-09-01/v2"
+sqlite3 "$FL/brain.db" "
+    CREATE TABLE nodes(id TEXT PRIMARY KEY, lineage_seq INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE edges(source TEXT, target TEXT, lineage_seq INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE tombstones(kind TEXT, id TEXT, lineage_seq INTEGER, lineage_actor TEXT,
+                            PRIMARY KEY(kind, id));
+    INSERT INTO nodes VALUES ('wv-keep01', 5);
+    INSERT INTO tombstones VALUES ('node', 'wv-gone01', 100, 'peer');"
+: > "$FL/.weave/deltas/2026-09-01/v2/000000000005-aaaa.json"
+: > "$FL/.weave/deltas/2026-09-01/v2/000000000100-bbbb.json"
+D="$FL/.weave/deltas"
+got=$(wv_lineage_seq_base "$FL/brain.db" "$D")
+[ "$got" = "100" ] && ok "the fixture's base is the delete op's seq" \
+    || fail "the fixture's base is the delete op's seq" "got '$got'"
+rm -f "$D/2026-09-01/v2/000000000100-bbbb.json"
+got=$(wv_lineage_seq_base "$FL/brain.db" "$D")
+[ "$got" = "100" ] && ok "deleting the top sidecar leaves the base at 100 (tombstone term)" \
+    || fail "deleting the top sidecar leaves the base at 100 (tombstone term)" "got '$got'"
+
+# A DB without the tombstones table still reads the rows' high-water: the
+# tombstone term must not fail the whole graph read to 0.
+sqlite3 "$FL/old.db" "CREATE TABLE nodes(id TEXT, lineage_seq INTEGER);
+    CREATE TABLE edges(source TEXT, lineage_seq INTEGER);
+    INSERT INTO nodes VALUES ('wv-old001', 42);"
+got=$(wv_lineage_seq_base "$FL/old.db")
+[ "$got" = "42" ] && ok "a DB predating tombstones keeps its rows' high-water" \
+    || fail "a DB predating tombstones keeps its rows' high-water" "got '$got'"
+
+# The committed floor: a seq held by no row and no tombstone (a lost write, or
+# a state.sql lagging this actor's own committed ops) survives only in its
+# sidecar. A compaction records the largest seq it deletes before deleting, so
+# the base, and with it the next emission (base + 1), never goes back.
+: > "$D/2026-09-01/v2/000000000250-cccc.json"
+: > "$D/2026-09-01/v2/000000000180-dddd.json"
+before=$(wv_lineage_seq_base "$FL/brain.db" "$D")
+wv_lineage_seq_floor_record "$FL/.weave" 20260901T000000Z-test 250 \
+    && rm -f "$D"/2026-09-01/v2/000000000250-cccc.json "$D"/2026-09-01/v2/000000000180-dddd.json
+got=$(wv_lineage_seq_base "$FL/brain.db" "$D")
+[ "$before" = "250" ] && [ "$got" = "250" ] \
+    && ok "no sequence reuse after compaction: the floor holds the deleted seq" \
+    || fail "no sequence reuse after compaction: the floor holds the deleted seq" "before '$before' after '$got'"
+[ "$(cat "$FL/.weave/compaction/20260901T000000Z-test.seq-floor")" = "250" ] \
+    && [ -z "$(find "$FL/.weave/compaction" -name '.seq-floor.*')" ] \
+    && ok "the floor record is one number, with no temp file left" \
+    || fail "the floor record is one number, with no temp file left"
+
+# Two clones compacting concurrently add two records; the floor is their max.
+printf '0000000000000000000000000310\n' > "$FL/.weave/compaction/20260902T000000Z-peer.seq-floor"
+got=$(wv_lineage_seq_floor "$D")
+[ "$got" = "310" ] && ok "the floor is the max over every record, zero padding read as a number" \
+    || fail "the floor is the max over every record, zero padding read as a number" "got '$got'"
+[ "$(wv_lineage_seq_base "$FL/brain.db" "$D")" = "310" ] \
+    && ok "the base takes the floor when it is the highest term" \
+    || fail "the base takes the floor when it is the highest term"
+
+# A record the reader cannot trust refuses, rather than reading the floor low.
+printf 'abc\n' > "$FL/.weave/compaction/20260903T000000Z-bad.seq-floor"
+rc=0; got=$(wv_lineage_seq_base "$FL/brain.db" "$D" 2>/dev/null) || rc=$?
+[ "$rc" -ne 0 ] && [ -z "$got" ] && ok "a malformed floor record fails the base read" \
+    || fail "a malformed floor record fails the base read" "rc=$rc got '$got'"
+rm -f "$FL/.weave/compaction/20260903T000000Z-bad.seq-floor"
+rc=0; wv_lineage_seq_floor_record "$FL/.weave" 20260904T000000Z-x "12a" 2>/dev/null || rc=$?
+[ "$rc" -ne 0 ] && [ ! -e "$FL/.weave/compaction/20260904T000000Z-x.seq-floor" ] \
+    && ok "a non-numeric floor is never recorded" \
+    || fail "a non-numeric floor is never recorded" "rc=$rc"
+rm -rf "$FL"
 
 # wv_delta_init reports a failed install (wv-853f9f). It ended on an
 # assignment, so a sqlite3 that could not open the database returned 0 and the

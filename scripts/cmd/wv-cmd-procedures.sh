@@ -3,7 +3,7 @@
 #
 # Commands: (helpers)
 # Sourced by: wv entry point (autoloaded on first use)
-# Dependencies: wv-config.sh (REPO_ROOT); wv-cmd-ops.sh (_doctor_record)
+# Dependencies: wv-config.sh (REPO_ROOT); wv-cmd-doctor.sh (_doctor_record)
 #
 # Repository-owned procedures live in .weave/procedures (wv-fc71f0, memory
 # graduation S1). Kept out of wv-cmd-ops.sh so a change here routes only to the
@@ -40,7 +40,7 @@ _wv_repo_procedure_file() {
 # reported. Silent when the repository has no procedures of its own.
 _doctor_repo_procedures() {
     local root="$1" src="$1/.weave/procedures" config_dir="${WV_CONFIG_DIR:-$HOME/.config/weave}"
-    local out file id count=0 replaced="" stale="" tmp rel marker='WEAVE-MANAGED-SKILL'
+    local out file id count=0 replaced="" stale=""
     compgen -G "$src/*.md" >/dev/null || return 0
     if [ ! -x "$config_dir/gen-procedures.sh" ] || [ ! -x "$config_dir/project-procedures.sh" ]; then
         _doctor_record "repo-procedures" "fail" "procedure validator or projector not installed in $config_dir — run ./install.sh"
@@ -55,25 +55,12 @@ _doctor_repo_procedures() {
         id=$(basename "$file" .md)
         [ -f "$config_dir/procedures/$id.md" ] && replaced="${replaced:+$replaced, }$id"
     done
-    tmp=$(mktemp -d) || return 0
-    for rel in .claude/skills .codex/weave.json .github/copilot-instructions.md AGENTS.md; do
-        [ -e "$root/$rel" ] || continue
-        mkdir -p "$tmp/$(dirname "$rel")"
-        cp -a "$root/$rel" "$tmp/$rel"
-    done
-    if ! out=$("$config_dir/project-procedures.sh" --repo="$root" --out="$tmp" --agent=all 2>&1 >/dev/null); then
-        rm -rf "$tmp"
-        _doctor_record "repo-procedures" "fail" "projection refused: $(printf '%s' "$out" | head -2 | tr '\n' ' ')"
+    # The comparison is the doctor module's (_doctor_projection_stale, shared with
+    # the package-projection check, wv-5505c2).
+    if ! stale=$(_doctor_projection_stale "$root" "$config_dir"); then
+        _doctor_record "repo-procedures" "fail" "projection refused: $stale"
         return 0
     fi
-    grep -rqsF -- "$marker" "$root/.claude/skills" && ! diff -rq "$tmp/.claude/skills" "$root/.claude/skills" >/dev/null 2>&1 \
-        && stale=".claude/skills"
-    [ -f "$root/.codex/weave.json" ] && jq -e '[.procedures[]? | select(.managed == true)] | length > 0' "$root/.codex/weave.json" >/dev/null 2>&1 \
-        && ! cmp -s "$tmp/.codex/weave.json" "$root/.codex/weave.json" && stale="${stale:+$stale, }.codex/weave.json"
-    for rel in .github/copilot-instructions.md AGENTS.md; do
-        grep -qsF 'BEGIN WEAVE PROCEDURES' "$root/$rel" && ! cmp -s "$tmp/$rel" "$root/$rel" && stale="${stale:+$stale, }$rel"
-    done
-    rm -rf "$tmp"
     if [ -n "$stale" ]; then
         _doctor_record "repo-procedures" "warn" "projection out of date in $stale — run: wv init-repo --update"
     else

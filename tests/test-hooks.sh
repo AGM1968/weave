@@ -12,6 +12,10 @@ export WV_CALL_SOURCE=test
 #   1 - One or more tests failed
 
 set -euo pipefail
+# Hooks read their input with $(cat). A hook run here without a pipe must see
+# EOF, not wait on whatever stdin launched the suite: from a background job it
+# blocked session-start-context.sh until killed.
+exec </dev/null
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 # Colors
@@ -44,6 +48,10 @@ TEST_DIR="/tmp/wv-hooks-test-$$"
 export WV_HOT_ZONE="$TEST_DIR"
 export WV_DB="$TEST_DIR/brain.db"
 export WV_REQUIRE_LEARNING=0
+# Session-local state is per owner (wv-43d6be): pin one owner, whatever
+# session runs this suite, and resolve its hot-zone directory on demand.
+export WV_AGENT_ID=test-hooks-agent
+owner_dir() { local d="$WV_HOT_ZONE/owners/$WV_AGENT_ID"; mkdir -p "$d"; printf '%s' "$d"; }
 export CLAUDE_PROJECT_DIR="$TEST_DIR/project"
 export WV_PROJECT_DIR="$TEST_DIR/project"
 
@@ -283,6 +291,25 @@ assert_equals "$_SS_BASE" "$(git -C "$PROJ" rev-parse HEAD)" \
     "session-start: a staged test-map.conf stops the snapshot commit"
 assert_equals "M  .weave/test-map.conf" "$(git -C "$PROJ" status --porcelain -- .weave/test-map.conf)" \
     "session-start: the staged test-map.conf stays staged"
+git -C "$PROJ" reset -q -- .weave/test-map.conf
+
+# The session-start snapshot honours the auto-commit switch (wv-99d4d2): it was
+# the one self-made commit wv-fbbdff left reading neither WV_AUTO_CHECKPOINT=0
+# nor the hold file, so a release holding HEAD still could still be moved.
+_SS_HOLD="$PROJ/$(git -C "$PROJ" rev-parse --git-path weave-autocommit-hold)"
+echo "- held trail $$" >> "$PROJ/.weave/trails.md"
+_SS_BASE=$(git -C "$PROJ" rev-parse HEAD)
+WV_AUTO_CHECKPOINT=0 bash "$HOOKS_DIR/session-start-context.sh" >/dev/null 2>&1 || true
+assert_equals "$_SS_BASE" "$(git -C "$PROJ" rev-parse HEAD)" \
+    "session-start: WV_AUTO_CHECKPOINT=0 stops the snapshot commit"
+touch "$_SS_HOLD"
+env -u WV_AUTO_CHECKPOINT bash "$HOOKS_DIR/session-start-context.sh" >/dev/null 2>&1 || true
+assert_equals "$_SS_BASE" "$(git -C "$PROJ" rev-parse HEAD)" \
+    "session-start: the hold file stops the snapshot commit with no variable set"
+rm -f "$_SS_HOLD"
+env -u WV_AUTO_CHECKPOINT bash "$HOOKS_DIR/session-start-context.sh" >/dev/null 2>&1 || true
+assert_equals "committed" "$(git -C "$PROJ" diff --quiet "$_SS_BASE" HEAD -- .weave/trails.md && echo uncommitted || echo committed)" \
+    "session-start: control: with the hold file gone the snapshot commits"
 
 # --- pre-compact-context.sh ---
 echo ""
@@ -348,7 +375,7 @@ assert_exit_code "0" "$EXIT_CODE" "pre-action: empty stdin stays a no-op, not a 
 echo ""
 echo "--- pre-action.sh (discover phase blocks edits) ---"
 setup_test_env
-printf '%s' discover > "$WV_HOT_ZONE/.session_phase"
+printf '%s' discover > "$(owner_dir)/.session_phase"
 
 set +e
 OUTPUT=$(echo '{"tool_name":"Edit","tool_input":{"file_path":"test.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>&1)
@@ -469,19 +496,19 @@ echo "--- pre-action.sh (context cache S2.1-S2.3) ---"
 setup_test_env
 TASK_ID=$(add_active_node "Cache test" 2>/dev/null | tail -1)
 # Clear any existing stamp
-rm -f "$WV_HOT_ZONE/.context_checked_"* 2>/dev/null || true
+rm -f "$(owner_dir)/.context_checked_"* 2>/dev/null || true
 set +e
 OUTPUT=$(echo '{"tool_name":"Edit","tool_input":{"file_path":"test.py"}}' | bash "$HOOKS_DIR/pre-action.sh" 2>/dev/null)
 EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "cache: first call passes (cache miss)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if [ -f "$WV_HOT_ZONE/.context_checked_${TASK_ID}" ]; then
+if [ -f "$(owner_dir)/.context_checked_${TASK_ID}" ]; then
     echo -e "${GREEN}✓${NC} cache: stamp file created after first call"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo -e "${RED}✗${NC} cache: stamp file created after first call"
-    echo "  Expected $WV_HOT_ZONE/.context_checked_${TASK_ID} to exist"
+    echo "  Expected $(owner_dir)/.context_checked_${TASK_ID} to exist"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
@@ -496,7 +523,7 @@ assert_exit_code "0" "$EXIT_CODE" "cache: second call passes (cache hit)"
 source "$PROJECT_ROOT/scripts/lib/wv-cache.sh"
 invalidate_context_cache "$TASK_ID"
 TESTS_RUN=$((TESTS_RUN + 1))
-if [ ! -f "$WV_HOT_ZONE/.context_checked_${TASK_ID}" ]; then
+if [ ! -f "$(owner_dir)/.context_checked_${TASK_ID}" ]; then
     echo -e "${GREEN}✓${NC} cache: stamp cleared by invalidate_context_cache"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -512,12 +539,12 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "cache: call after invalidation passes (re-check)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if [ -f "$WV_HOT_ZONE/.context_checked_${TASK_ID}" ]; then
+if [ -f "$(owner_dir)/.context_checked_${TASK_ID}" ]; then
     echo -e "${GREEN}✓${NC} cache: stamp re-created after invalidation"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo -e "${RED}✗${NC} cache: stamp re-created after invalidation"
-    echo "  Expected $WV_HOT_ZONE/.context_checked_${TASK_ID} to exist"
+    echo "  Expected $(owner_dir)/.context_checked_${TASK_ID} to exist"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
@@ -1503,6 +1530,100 @@ assert_equals "" "$OUTPUT" "stop-check: a second stop inside the cooldown is not
 assert_contains "$STDERR_OUT" "uncommitted" "stop-check: the cooldown stop still warns about uncommitted changes"
 rm -f "$TEST_DIR/project/mid-edit.txt"
 
+# --- stop-check.sh: an open node waiting on visible background work (wv-e229c8) ---
+# A node held open while its own gate or push runs is not abandoned work: the
+# stop is allowed with a note naming the process, and no cooldown is armed, so
+# a long wait never turns into a block on every turn. Nothing in flight, or
+# another owner's gate, still blocks.
+echo ""
+echo "--- stop-check.sh (in-flight gate or push) ---"
+SC_LOCK="$(WV_PROJECT_DIR="$TEST_DIR/project" "$WV" hotzone --db 2>/dev/null | xargs dirname 2>/dev/null)/.stop_check_lock"
+SC_HOLDER="$TEST_DIR/project/$(git -C "$TEST_DIR/project" rev-parse --git-path weave-gate.holder.json)"
+HOLD_LIB="$PROJECT_ROOT/scripts/lib/wv-gate-hold.sh"
+# start_holder <agent id>: a gate holding this checkout's lock, as the hooks take it.
+start_holder() {
+    rm -f "$SC_HOLDER"
+    WV_AGENT_ID="$1" bash -c 'cd "$2" && . "$1" && wv_gate_hold_acquire pre-commit "test gate" && exec sleep 60' \
+        _ "$HOLD_LIB" "$TEST_DIR/project" &
+    HOLD_PID=$!
+    for _ in $(seq 50); do [ -s "$SC_HOLDER" ] && break; sleep 0.1; done
+}
+stop_holder() { kill "$HOLD_PID" 2>/dev/null; wait "$HOLD_PID" 2>/dev/null || true; rm -f "$SC_HOLDER"; }
+
+# run_stop: one stop from a clean cooldown; stdout in OUTPUT, stderr in STDERR_OUT.
+run_stop() {
+    local err
+    rm -f "$SC_LOCK"
+    err=$(mktemp)
+    set +e
+    OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/stop-check.sh" 2>"$err")
+    set -e
+    STDERR_OUT=$(cat "$err"); rm -f "$err"
+}
+
+start_holder "$WV_AGENT_ID"
+run_stop
+assert_equals "" "$OUTPUT" "stop-check: an open node waiting on its own live gate is not blocked"
+assert_contains "$STDERR_OUT" "pre-commit gate pid $HOLD_PID" "stop-check: the allowed stop names the gate process"
+assert_equals "absent" "$([ -e "$SC_LOCK" ] && echo present || echo absent)" \
+    "stop-check: waiting on a live gate arms no cooldown"
+stop_holder
+
+start_holder "another-owner-agent"
+run_stop
+assert_equals "block" "$(printf '%s' "$OUTPUT" | jq -r '.decision' 2>/dev/null)" \
+    "stop-check: another owner's gate does not excuse this session's open node"
+stop_holder
+
+run_stop
+assert_equals "block" "$(printf '%s' "$OUTPUT" | jq -r '.decision' 2>/dev/null)" \
+    "stop-check: an open node with nothing in flight still blocks"
+
+# A push whose gate has finished but which is still talking to its remote holds
+# no gate lock; the running git push for this checkout is what the node waits on.
+SLOW_REMOTE="$TEST_DIR/slow-remote.git"
+git init -q --bare "$SLOW_REMOTE"
+printf '#!/bin/sh\necho $$ > hook.pid\nexec sleep 60\n' > "$SLOW_REMOTE/hooks/pre-receive"
+chmod +x "$SLOW_REMOTE/hooks/pre-receive"
+git -C "$TEST_DIR/project" -c core.hooksPath=/dev/null push -q "$SLOW_REMOTE" HEAD:refs/heads/slow >/dev/null 2>&1 &
+PUSH_PID=$!
+for _ in $(seq 50); do [ -s "$SLOW_REMOTE/hook.pid" ] && break; sleep 0.1; done
+run_stop
+assert_equals "" "$OUTPUT" "stop-check: an open node waiting on a running git push is not blocked"
+assert_contains "$STDERR_OUT" "git pid $PUSH_PID" "stop-check: the allowed stop names the git push"
+kill "$(cat "$SLOW_REMOTE/hook.pid" 2>/dev/null)" "$PUSH_PID" 2>/dev/null || true
+wait "$PUSH_PID" 2>/dev/null || true
+rm -f "$SC_LOCK"
+
+# --- stop-check.sh: a guard that cannot load does not pass silently (wv-c7d114) ---
+# A copy of the hook with no loadable lib anywhere it looks: the nearest copy is
+# half-installed (defines no wv_stop_guard), the repo and HOME copies are absent.
+echo ""
+echo "--- stop-check.sh (guard cannot load) ---"
+_sc_broken="$TEST_DIR/broken-guard"
+mkdir -p "$_sc_broken/hooks" "$_sc_broken/lib" "$_sc_broken/home"
+cp "$HOOKS_DIR/stop-check.sh" "$_sc_broken/hooks/stop-check.sh"
+echo ': half-installed' > "$_sc_broken/lib/wv-lifecycle-end.sh"
+set +e
+STDERR_TMP=$(mktemp)
+OUTPUT=$(echo '{}' | HOME="$_sc_broken/home" bash "$_sc_broken/hooks/stop-check.sh" 2>"$STDERR_TMP")
+EXIT_CODE=$?
+STDERR_OUT=$(cat "$STDERR_TMP"); rm -f "$STDERR_TMP"
+set -e
+assert_exit_code "0" "$EXIT_CODE" "stop-check: an unloadable guard still exits 0 (Stop blocks are JSON)"
+assert_equals "block" "$(printf '%s' "$OUTPUT" | jq -r '.decision' 2>/dev/null)" \
+    "stop-check: an unloadable guard blocks the first stop instead of passing silently"
+assert_contains "$STDERR_OUT" "could not be loaded" "stop-check: an unloadable guard warns on stderr"
+set +e
+STDERR_TMP=$(mktemp)
+OUTPUT=$(echo '{"stop_hook_active": true}' | HOME="$_sc_broken/home" bash "$_sc_broken/hooks/stop-check.sh" 2>"$STDERR_TMP")
+EXIT_CODE=$?
+STDERR_OUT=$(cat "$STDERR_TMP"); rm -f "$STDERR_TMP"
+set -e
+assert_exit_code "0" "$EXIT_CODE" "stop-check: the retry after an unloadable-guard block exits 0"
+assert_equals "" "$OUTPUT" "stop-check: the retry is allowed, so a broken install cannot trap a session"
+assert_contains "$STDERR_OUT" "could not be loaded" "stop-check: the allowed retry still warns on stderr"
+
 # --- session-end-sync.sh ---
 echo ""
 echo "--- session-end-sync.sh ---"
@@ -1540,15 +1661,18 @@ else
     fi
 fi
 
-# Verify session-end uses `wv sync --gh` and commit automation via
-# WV_AUTO_CHECKPOINT_ACTIVE rather than a blanket --no-verify bypass.
+# Verify session-end runs only its local steps (a local sync, the
+# checkpoint commit through WV_AUTO_CHECKPOINT_ACTIVE rather than a blanket
+# --no-verify bypass): no GitHub sync and no push, which the host cut off at
+# exit and left a half-finished journal behind (wv-a32e69).
 setup_test_env
 SPY_HOME="$TEST_DIR/home"
 mkdir -p "$SPY_HOME/.local/bin"
 WV_LOG="$TEST_DIR/wv-calls.log"
+# The spy records WV_CHECKPOINT_PULL too: session end must not pull (wv-a32e69).
 cat > "$SPY_HOME/.local/bin/wv" <<EOF
 #!/bin/sh
-echo "\$*" >> "$WV_LOG"
+echo "pull=\${WV_CHECKPOINT_PULL:-unset} \$*" >> "$WV_LOG"
 exit 0
 EOF
 chmod +x "$SPY_HOME/.local/bin/wv"
@@ -1573,15 +1697,31 @@ echo "missing WV_AUTO_CHECKPOINT_ACTIVE" >&2
 exit 1
 EOF
 chmod +x "$TEST_DIR/project/.git/hooks/pre-commit"
+# A remote it could push to, so "pushes nothing" is observed, not assumed.
+SPY_REMOTE="$TEST_DIR/spy-remote.git"
+git init -q --bare "$SPY_REMOTE"
+git -C "$TEST_DIR/project" remote add origin "$SPY_REMOTE" 2>/dev/null \
+    || git -C "$TEST_DIR/project" remote set-url origin "$SPY_REMOTE"
+# Name the branch main with origin/main upstream, so a bare `git push` would
+# succeed: otherwise push.default=simple refuses it and "pushes nothing" passes
+# whatever the routine does.
+git -C "$TEST_DIR/project" branch -q -M main
+git -C "$TEST_DIR/project" push -q -u origin main 2>/dev/null
+SPY_REMOTE_BEFORE=$(git -C "$SPY_REMOTE" rev-parse main 2>/dev/null)
 
 set +e
 OUTPUT=$(HOME="$SPY_HOME" CLAUDE_PROJECT_DIR="$TEST_DIR/project" \
     bash "$SPY_WEAVE/hooks/session-end-sync.sh" <<< '{"reason":"stubbed_session_end"}' 2>/dev/null)
 EXIT_CODE=$?
 set -e
-assert_exit_code "0" "$EXIT_CODE" "session-end: exits 0 with sync --gh stub + automation pre-commit"
+assert_exit_code "0" "$EXIT_CODE" "session-end: exits 0 with a stub wv + automation pre-commit"
 WV_CALLS=$(cat "$WV_LOG" 2>/dev/null || echo "<spy never invoked>")
-assert_contains "$WV_CALLS" "sync --gh" "session-end: calls wv sync --gh"
+# Prune is an explicit command only (owner ruling 2026-11-09, wv-68c882).
+assert_not_contains "$WV_CALLS" "prune" "session-end: does not prune"
+assert_contains "$WV_CALLS" "pull=0 sync" "session-end: flushes state.sql with a local wv sync that does not pull"
+assert_not_contains "$WV_CALLS" "--gh" "session-end: runs no GitHub sync"
+assert_equals "$SPY_REMOTE_BEFORE" "$(git -C "$SPY_REMOTE" rev-parse main 2>/dev/null)" \
+    "session-end: pushes nothing"
 LAST_MSG=$(git -C "$TEST_DIR/project" log -1 --pretty=%s 2>/dev/null || true)
 assert_contains "$LAST_MSG" "auto-checkpoint" "session-end: auto-checkpoint commit succeeds without blanket bypass"
 
@@ -1818,6 +1958,23 @@ assert_contains "$OUTPUT" "rendezvous timed out waiting for" "suite pool: serial
 assert_contains "$OUTPUT" "not run after the failure: tests/test-p" "suite pool: no suite starts after a failure"
 assert_equals "1" "$(find "$POOL_DIR" -type f ! -name '*.lanejobs' | wc -l | tr -d ' ')" \
     "suite pool: exactly one suite ran; the queued one really did not start"
+
+# Keep going (wv-7df799, gate-preflight.sh --keep-going): the same serial run
+# starts the queued suite after the first failure, and replays both failures.
+# Both suites plant a failure: run serially, the first times out on the
+# rendezvous, and the second (finding the first's marker) fails its assertion.
+POOL_WAIT=5 _pool_setup pool-keep-going 1 1
+set +e
+OUTPUT=$(cd "$TEST_DIR/project" && WV_GATE_KEEP_GOING=1 WV_GATE_JOBS=1 \
+    bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_exit_code "1" "$EXIT_CODE" "keep going: the gate still fails"
+assert_not_contains "$OUTPUT" "not run after the failure" "keep going: no suite is skipped after a failure"
+assert_equals "2" "$(find "$POOL_DIR" -type f ! -name '*.lanejobs' | wc -l | tr -d ' ')" \
+    "keep going: both queued suites ran"
+assert_contains "$OUTPUT" "✗ tests/test-pa.sh failed" "keep going: the first failure is replayed"
+assert_contains "$OUTPUT" "✗ tests/test-pb.sh failed" "keep going: and the second, with its own entry"
 
 # A candidate lane's share of the bound (wv-d7af8d): WV_GATE_LANE_JOBS wins
 # over WV_GATE_JOBS, which config.env could set, and no suite inherits it.
@@ -2281,7 +2438,7 @@ fi
 
 # discover phase with non-.weave file staged must block (no active node bypass)
 setup_test_env
-printf '%s' discover > "$WV_HOT_ZONE/.session_phase"
+printf '%s' discover > "$(owner_dir)/.session_phase"
 echo "# content" > "$TEST_DIR/project/src.sh"
 git -C "$TEST_DIR/project" add src.sh
 set +e
@@ -2294,7 +2451,7 @@ assert_contains "$OUTPUT" "No active Weave node" "git pre-commit: discover phase
 # discover phase with only graph state staged must pass (early exit). Graph
 # state, not any .weave/ file: configuration under .weave/ is gated (wv-a118d6).
 setup_test_env
-printf '%s' discover > "$WV_HOT_ZONE/.session_phase"
+printf '%s' discover > "$(owner_dir)/.session_phase"
 mkdir -p "$TEST_DIR/project/.weave"
 echo "{}" > "$TEST_DIR/project/.weave/nodes.jsonl"
 git -C "$TEST_DIR/project" add -f .weave/nodes.jsonl
@@ -2321,7 +2478,7 @@ assert_contains "$OUTPUT" "No active Weave node is claimed by claude-this-host-u
 assert_contains "$OUTPUT" "$FOREIGN_ADMIT_ID  claimed by codex-other-host-user" \
     "git pre-commit: the refusal names who holds the active claim"
 set +e
-OUTPUT=$(cd "$TEST_DIR/project" && env -u WV_AGENT_ID -u CLAUDECODE -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID \
+OUTPUT=$(cd "$TEST_DIR/project" && env -u WV_AGENT_ID -u CLAUDECODE -u AI_AGENT -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID \
     -u CODEX_CI -u COPILOT_AGENT bash "$PROJECT_ROOT/scripts/hooks/pre-commit-weave.sh" 2>&1)
 EXIT_CODE=$?
 set -e
@@ -2403,11 +2560,11 @@ assert_exit_code "0" "$EXIT_CODE" "git pre-commit: a graph-state-only checkpoint
 ex_hook
 assert_exit_code "0" "$EXIT_CODE" "git pre-commit: ...with or without the flag"
 ex_reset
-printf '%s' closing > "$WV_HOT_ZONE/.session_phase"
+printf '%s' closing > "$(owner_dir)/.session_phase"
 git -C "$P" add work.sh; ex_hook
 assert_exit_code "1" "$EXIT_CODE" "git pre-commit: the closing phase no longer waives admission for substantive work"
 ex_reset
-printf '%s' closing > "$WV_HOT_ZONE/.session_phase"
+printf '%s' closing > "$(owner_dir)/.session_phase"
 git -C "$P" add -f .weave/nodes.jsonl; ex_hook
 assert_exit_code "0" "$EXIT_CODE" "git pre-commit: a graph-state commit in the closing phase still passes"
 ex_reset
@@ -2665,7 +2822,7 @@ OUTPUT=$(HOME="$LIFECYCLE_HOME" CLAUDE_PROJECT_DIR="$TEST_DIR/project" \
 EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "lifecycle: session ends cleanly"
-assert_contains "$(cat "$LIFECYCLE_LOG" 2>/dev/null || echo "<stub never invoked>")" "sync --gh" \
+assert_contains "$(cat "$LIFECYCLE_LOG" 2>/dev/null || echo "<stub never invoked>")" "sync" \
     "lifecycle: session end reaches the project's wv, not another copy"
 
 # 11. Pre-compact preserves context during lifecycle
@@ -2933,7 +3090,7 @@ TF_DB="$TEST_DIR/touched-brain.db"
 rm -f "$TF_DB"
 sqlite3 "$TF_DB" "CREATE TABLE nodes (id TEXT PRIMARY KEY, status TEXT, metadata TEXT, updated_at DATETIME);"
 sqlite3 "$TF_DB" "CREATE TABLE node_files (node_id TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (node_id, path));"
-sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-active1', 'active', '{}', datetime('now'));"
+sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-active1', 'active', '{\"claimed_by\":\"test-hooks-agent\"}', datetime('now'));"
 sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-todo1', 'todo', '{}', datetime('now'));"
 export WV_DB="$TF_DB"
 
@@ -3010,7 +3167,7 @@ assert_contains "$RING_CONTENT" "file5.py" "touched-files: newest path retained"
 
 # 6) Node cap on metadata.touched_files
 export WV_TOUCHED_NODE_CAP=2
-sqlite3 "$TF_DB" "UPDATE nodes SET metadata='{}' WHERE id='wv-active1';"
+sqlite3 "$TF_DB" "UPDATE nodes SET metadata='{\"claimed_by\":\"test-hooks-agent\"}' WHERE id='wv-active1';"
 for i in a b c d; do
     echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project/${i}.py\"},\"tool_response\":{\"success\":true}}" \
         | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
@@ -3026,7 +3183,7 @@ assert_touched_files_tool() {
     local expected_path="$4"
     local tool_meta
 
-    sqlite3 "$TF_DB" "UPDATE nodes SET metadata='{}' WHERE id='wv-active1';"
+    sqlite3 "$TF_DB" "UPDATE nodes SET metadata='{\"claimed_by\":\"test-hooks-agent\"}' WHERE id='wv-active1';"
     jq -nc \
         --arg tool_name "$tool_name" \
         --arg input_key "$input_key" \
@@ -3045,12 +3202,12 @@ assert_touched_files_tool "NotebookEdit" "path" "$TEST_DIR/project/notebook.ipyn
 assert_touched_files_tool "edit_notebook_file" "filePath" "$TEST_DIR/project/edit-notebook.ipynb" "edit-notebook.ipynb"
 
 # 8) Stale primary falls back to an active node and clears the stale stamp
-PRIMARY_FILE="$WV_HOT_ZONE/primary"
+PRIMARY_FILE="$(owner_dir)/primary"
 sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-old-primary', 'done', '{}', datetime('now', '-1 hour'));"
 sqlite3 "$TF_DB" "UPDATE nodes SET updated_at=datetime('now', '-1 hour') WHERE id='wv-active1';"
-sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-active2', 'active', '{}', datetime('now'));"
+sqlite3 "$TF_DB" "INSERT INTO nodes VALUES ('wv-active2', 'active', '{\"claimed_by\":\"test-hooks-agent\"}', datetime('now'));"
 echo "wv-old-primary" > "$PRIMARY_FILE"
-sqlite3 "$TF_DB" "UPDATE nodes SET metadata='{}' WHERE id='wv-active2';"
+sqlite3 "$TF_DB" "UPDATE nodes SET metadata='{\"claimed_by\":\"test-hooks-agent\"}' WHERE id='wv-active2';"
 echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project/fallback.py\"},\"tool_response\":{\"success\":true}}" \
     | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
 FALLBACK_META=$(sqlite3 "$TF_DB" "SELECT json_extract(metadata, '\$.touched_files') FROM nodes WHERE id='wv-active2';" 2>/dev/null)
@@ -3073,7 +3230,7 @@ CANON_DB="$CANON_HOT/brain.db"
 rm -f "$CANON_DB"
 sqlite3 "$CANON_DB" "CREATE TABLE nodes (id TEXT PRIMARY KEY, status TEXT, metadata TEXT, updated_at DATETIME);"
 sqlite3 "$CANON_DB" "CREATE TABLE node_files (node_id TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (node_id, path));"
-sqlite3 "$CANON_DB" "INSERT INTO nodes VALUES ('wv-canon1', 'active', '{}', datetime('now'));"
+sqlite3 "$CANON_DB" "INSERT INTO nodes VALUES ('wv-canon1', 'active', '{\"claimed_by\":\"test-hooks-agent\"}', datetime('now'));"
 echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project/canon.py\"},\"tool_response\":{\"success\":true}}" \
     | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
 CANON_RING_CONTENT=$(cat "$CANON_HOT/recent-edits.txt" 2>/dev/null || echo "")

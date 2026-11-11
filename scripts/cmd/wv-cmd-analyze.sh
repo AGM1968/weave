@@ -375,7 +375,7 @@ if d.get('note'):
 # gate_id, so it is grouped by commit sha and labelled approximate, never mixed
 # into the exact figures.
 cmd_analyze_gates() {
-    local suite_log gate_log want_json="" since="" all_repos=0 mode
+    local suite_log gate_log want_json="" since="" all_repos=0 mode max_stall=""
     suite_log=$(_suite_log_path)
     gate_log=$(_gate_log_path)
     mode=$(wv_resolve_mode)
@@ -388,8 +388,9 @@ cmd_analyze_gates() {
             --all)        all_repos=1 ;;
             --log=*)      suite_log="${arg#--log=}" ;;
             --gate-log=*) gate_log="${arg#--gate-log=}" ;;
+            --max-stall=*) max_stall="${arg#--max-stall=}" ;;
             --help|-h)
-                echo "Usage: wv analyze gates [--since=YYYY-MM-DD] [--all] [--json] [--log=<suite log>] [--gate-log=<gate log>]"
+                echo "Usage: wv analyze gates [--since=YYYY-MM-DD] [--all] [--json] [--log=<suite log>] [--gate-log=<gate log>] [--max-stall=<share>]"
                 echo ""
                 echo "  Per phase (pre-commit, post-commit, make): gates, failures, wall time"
                 echo "  p50/p90/max, suites per gate, and estimate error (actual / estimate)."
@@ -397,20 +398,30 @@ cmd_analyze_gates() {
                 echo "  Suite runs recorded before gate records existed are grouped by commit"
                 echo "  and reported separately as approximate. Provisioning counts each route's"
                 echo "  mode (frozen or checkout) from the newest gate record that names it."
+                echo "  Host pressure: gates recorded with PSI stall deltas report the share of"
+                echo "  wall time some task stalled on CPU and on IO (p50/p90); the gate's own"
+                echo "  suites contend too, so a share is host load including the gate."
+                echo "  --max-stall=<share> leaves out every gate whose CPU or IO share exceeds"
+                echo "  it (0-1), and its suite runs; gates without a pressure record are kept"
+                echo "  and counted as unmeasured."
                 return 0
                 ;;
         esac
     done
+    if [ -n "$max_stall" ] && ! [[ "$max_stall" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
+        echo "wv analyze gates: invalid --max-stall value: '$max_stall' (expected a share from 0 to 1)" >&2
+        return 1
+    fi
     [ "$mode" = "discover" ] || [ "$mode" = "bootstrap" ] && want_json=1
     local repo_filter=""
     [ "$all_repos" = "0" ] && repo_filter="$cur_repo"
 
     local result
-    result=$(python3 - "$suite_log" "$gate_log" "$repo_filter" "$since" <<'PYEOF'
+    result=$(python3 - "$suite_log" "$gate_log" "$repo_filter" "$since" "$max_stall" <<'PYEOF'
 import json, math, os, sys
 from collections import defaultdict
 
-suite_log, gate_log, repo_filter, since = sys.argv[1:5]
+suite_log, gate_log, repo_filter, since, max_stall = sys.argv[1:6]
 
 def rows(path):
     if not os.path.isfile(path):
@@ -438,10 +449,79 @@ def pct(vals, q):
 def secs(ms):
     return None if ms is None else round(ms / 1000, 1)
 
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+# Host pressure (wv-58b10e): a gate row's PSI stall shares, or None for rows
+# written without them. --max-stall drops gates above the share from every
+# figure, their suite runs included; unmeasured gates stay and are counted.
+def stall(g, kind):
+    p = g.get("pressure")
+    return num(p.get(kind + "_some_share")) if isinstance(p, dict) else None
+
 gates = rows(gate_log)
+stall_filter = None
+excluded_ids = set()
+if max_stall:
+    limit = float(max_stall)
+    kept = []
+    for g in gates:
+        shares = [v for v in (stall(g, "cpu"), stall(g, "io")) if v is not None]
+        if shares and max(shares) > limit:
+            excluded_ids.add(str(g.get("gate_id", "")))
+        else:
+            kept.append(g)
+    stall_filter = {"max_share": limit, "excluded": len(gates) - len(kept),
+                    "unmeasured_kept": sum(1 for g in kept if stall(g, "cpu") is None)}
+    gates = kept
 by_phase = defaultdict(list)
 for g in gates:
     by_phase[str(g.get("phase") or "unknown")].append(g)
+
+def stall_stats(gs):
+    cpu = [v for v in (stall(g, "cpu") for g in gs) if v is not None]
+    io = [v for v in (stall(g, "io") for g in gs) if v is not None]
+    return {"pressure_gates": len(cpu),
+            "cpu_stall_p50": pct(cpu, 0.5), "cpu_stall_p90": pct(cpu, 0.9),
+            "io_stall_p50": pct(io, 0.5), "io_stall_p90": pct(io, 0.9)}
+
+# Candidate lanes (wv-3dbc11): they write no suite rows, so their time is read
+# from the gate record. Rows written before it carry no lanes_ms and are left
+# out of every lane figure, never counted as zero.
+# Lane figures are segmented by scheduler revision (wv-428a92) and never
+# blended: a gate's scheduler is the one its lane rows name, and rows written
+# before lanes named one ran fixed shares of WV_GATE_JOBS. The top-level lane
+# figures describe the newest revision in the window; lane_schedulers carries
+# every revision on its own, so a before/after reads straight off it.
+def lane_scheduler(g):
+    for lane in g.get("lanes") or []:
+        if isinstance(lane, dict) and lane.get("scheduler"):
+            return str(lane["scheduler"])
+    return "fixed-share"
+
+def lane_figures(lg):
+    lane_ms = [num(g["lanes_ms"]) for g in lg]
+    walls = sum(int(g.get("duration_ms") or 0) for g in lg)
+    prot = [num(g.get("protected_ms")) for g in lg if num(g.get("protected_ms")) is not None]
+    return {
+        "lane_gates": len(lg),
+        "lanes_p50_s": secs(pct(lane_ms, 0.5)), "lanes_p90_s": secs(pct(lane_ms, 0.9)),
+        "lanes_share_of_wall": round(sum(lane_ms) / walls, 2) if walls > 0 else None,
+        "protected_p50_s": secs(pct(prot, 0.5)), "protected_p90_s": secs(pct(prot, 0.9)),
+    }
+
+def lane_stats(gs):
+    lg = [g for g in gs if num(g.get("lanes_ms")) is not None]
+    groups = defaultdict(list)
+    for g in lg:
+        groups[lane_scheduler(g)].append(g)
+    revisions = sorted(groups, key=lambda s: max(str(g.get("ts", "")) for g in groups[s]))
+    newest = revisions[-1] if revisions else None
+    return {
+        **lane_figures(groups[newest] if newest else []),
+        "lane_scheduler": newest,
+        "lane_schedulers": [{"scheduler": s, **lane_figures(groups[s])} for s in revisions],
+    }
 
 phases = []
 for phase, gs in sorted(by_phase.items()):
@@ -458,9 +538,25 @@ for phase, gs in sorted(by_phase.items()):
         "suites_p50": pct([len(g.get("suites") or []) for g in gs], 0.5),
         "estimate_ratio_p50": round(pct(ratios, 0.5), 2) if ratios else None,
         "estimated_gates": len(ratios),
+        **lane_stats(gs),
+        **stall_stats(gs),
     })
 
-suite_rows = rows(suite_log)
+lane_paths = defaultdict(lambda: {"runs": 0, "reran": 0, "ms": 0})
+for g in gates:
+    for lane in g.get("lanes") or []:
+        if not isinstance(lane, dict) or num(lane.get("ms")) is None:
+            continue
+        lp = lane_paths[str(lane.get("path"))]
+        lp["runs"] += 1
+        lp["reran"] += 0 if lane.get("reused") else 1
+        lp["ms"] += num(lane["ms"])
+costly_lanes = sorted(({"path": p, "runs": v["runs"], "reran": v["reran"], "total_s": secs(v["ms"]),
+                        "mean_s": secs(v["ms"] / v["runs"])} for p, v in lane_paths.items()),
+                      key=lambda x: x["total_s"] or 0, reverse=True)[:10]
+
+suite_rows = [e for e in rows(suite_log)
+              if not e.get("gate_id") or str(e["gate_id"]) not in excluded_ids]
 miss = defaultdict(list)
 for e in suite_rows:
     est = e.get("estimate_ms")
@@ -502,7 +598,7 @@ provisioning = {
     "gates_recorded": recorded, "gates_without_record": len(gates) - recorded,
 }
 print(json.dumps({"phases": phases, "estimate_misses": worst, "approximate_by_commit": approx,
-                  "provisioning": provisioning,
+                  "provisioning": provisioning, "costly_lanes": costly_lanes, "stall_filter": stall_filter,
                   "gate_log": gate_log, "suite_log": suite_log,
                   "repo": repo_filter or "ALL", "since": since or None}))
 PYEOF
@@ -514,10 +610,15 @@ PYEOF
     fi
     echo "$result" | jq -r '
         "Gate wall time (\(.repo)\(if .since then ", since \(.since)" else "" end))",
+        (if .stall_filter then "  leaving out \(.stall_filter.excluded) gate(s) whose CPU or IO stall exceeded \(.stall_filter.max_share * 100 | floor)% of wall; \(.stall_filter.unmeasured_kept) kept without a pressure record" else empty end),
         (if (.phases | length) == 0 then "  no gate records yet: the commit hooks write them from now on"
          else (.phases[] | "  \(.phase): \(.gates) gates, \(.failed) failed, wall p50 \(.wall_p50_s)s p90 \(.wall_p90_s)s max \(.wall_max_s)s, suites p50 \(.suites_p50)" +
-               (if .estimate_ratio_p50 then ", actual/estimate p50 \(.estimate_ratio_p50)" else "" end)) end),
+               (if .estimate_ratio_p50 then ", actual/estimate p50 \(.estimate_ratio_p50)" else "" end) +
+               (if (.pressure_gates // 0) > 0 then "\n    host stall over \(.pressure_gates) gates: CPU p50 \(.cpu_stall_p50 * 100 | floor)% p90 \(.cpu_stall_p90 * 100 | floor)%, IO p50 \(.io_stall_p50 * 100 | floor)% p90 \(.io_stall_p90 * 100 | floor)% of wall" else "" end) +
+               ([(.lane_schedulers // [])[] | "\n    candidate lanes (\(.scheduler)) in \(.lane_gates) gates: lanes p50 \(.lanes_p50_s)s p90 \(.lanes_p90_s)s, \((.lanes_share_of_wall // 0) * 100 | floor)% of their wall; protected pass p50 \(.protected_p50_s)s p90 \(.protected_p90_s)s"] | join(""))) end),
         "",
+        (if (.costly_lanes | length) > 0 then "Candidate lanes costing most (total over the window):",
+            (.costly_lanes[] | "  \(.path) \(.total_s)s over \(.runs) lanes, \(.reran) reran their suites"), "" else empty end),
         "Suites whose estimates miss worst (actual/estimate, p50):",
         (if (.estimate_misses | length) == 0 then "  none recorded yet"
          else (.estimate_misses[] | "  \(.suite) \(.ratio_p50)x over \(.runs) runs") end),

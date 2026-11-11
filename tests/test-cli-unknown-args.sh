@@ -172,5 +172,38 @@ out=$(w show "$a" --help 2>&1); rc=$?
 [ "$rc" != 0 ] && [[ "$out" == *"wv show --help"* ]] && ok "--help after an id is refused, pointing at wv show --help" \
     || bad "--help after an id is refused, pointing at wv show --help" "rc=$rc $out"
 
+# 'wv add --criteria=a --criteria=b' kept only b and printed the plain success
+# line, so the first criterion vanished unseen (wv-776e45). A repeated flag is
+# either accumulated or refused naming the pipe form, and wv add says how many
+# criteria it stored so a drop shows where it happens.
+echo "=== repeated --criteria is kept or refused, and the stored count is reported ==="
+out=$(w add "two criteria" --standalone "--criteria=first" "--criteria=second" 2>&1); rc=$?
+crit=$(q "SELECT json_extract(metadata, '\$.done_criteria') FROM nodes WHERE text='two criteria'")
+if [ "$rc" = 0 ] && [ "$crit" = '["first","second"]' ]; then
+    ok "repeated --criteria keeps both criteria"
+elif [ "$rc" != 0 ] && [ -z "$crit" ] && [[ "$out" == *"c1|c2"* ]]; then
+    ok "repeated --criteria is refused naming the pipe-separated form"
+else
+    bad "repeated --criteria is kept or refused" "rc=$rc stored=${crit:-none} $(echo "$out" | tail -2)"
+fi
+out=$(w add "three criteria" --standalone "--criteria=a|b|c" 2>&1); rc=$?
+[ "$rc" = 0 ] && [[ "$out" == *"3 done criteria stored"* ]] &&
+    ok "wv add reports how many criteria it stored" ||
+    bad "wv add reports how many criteria it stored" "rc=$rc $(echo "$out" | tail -2)"
+
+# wv-26fd0b: a caller needing a few nodes names them, rather than reading all.
+echo "=== wv list --ids lists exactly the named nodes ==="
+w "done" "$b" --skip-verification >/dev/null 2>&1
+c=$(new "node c")
+out=$(w list --ids="$a,$b" --json-v2 2>/dev/null); rc=$?
+got=$(jq -r '[.[].id] | sort | join(",")' <<< "$out" 2>/dev/null)
+want=$(printf '%s\n%s\n' "$a" "$b" | sort | paste -sd, -)
+[ "$rc" = 0 ] && [ "$got" = "$want" ] && ok "--ids returns the named nodes, a done one included, and no other" \
+    || bad "--ids returns the named nodes, a done one included, and no other" "rc=$rc got=$got want=$want (c=$c)"
+refused "--ids refuses an entry that is not a node id" "x;drop" list "--ids=$a,x;drop"
+out=$(w list --ids= 2>&1); rc=$?
+[ "$rc" != 0 ] && [[ "$out" == *"at least one node id"* ]] && ok "--ids with no id is an error, not every node" \
+    || bad "--ids with no id is an error, not every node" "rc=$rc $(echo "$out" | tail -1)"
+
 echo "Results: $pass/$run passed"
 [ "$pass" -eq "$run" ]

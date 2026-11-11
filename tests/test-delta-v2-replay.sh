@@ -1374,6 +1374,188 @@ status_after=$(cd "$REPO" && WV_HOT_ZONE="$HOT" WV_AUTO_CHECKPOINT=0 "$ROOT/scri
 [ "$status_after" = "blocked" ] && ok "wv load applies a committed v2 node_patch sidecar" || bad "wv load applies a committed v2 node_patch sidecar (status=$status_after)"
 grep -q "Delta v2 replay:" <<< "$load_err" && ok "wv load reports v2 dispositions on stderr" || bad "wv load reports v2 dispositions on stderr"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# wv-898c73: two graphs (linked worktrees, two machines) editing one field
+# leave two ops from the same preimage; after the merge one is refused, and
+# that loss was one precondition_conflict among thousands. The replay names it
+# (lost_writes) and wv load prints it. Not named: a status lifecycle that
+# re-enters its start, a stale op later ops built on, and a fork whose field
+# was edited again afterwards.
+LW_DB="$TMP/lost-writes.db"
+LW_OPS="$TMP/lost-writes-ops"
+mkdir -p "$LW_OPS"
+sqlite3 "$LW_DB" "
+CREATE TABLE nodes(id TEXT PRIMARY KEY, text TEXT, status TEXT DEFAULT 'todo', metadata TEXT DEFAULT '{}',
+    alias TEXT UNIQUE, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    lineage_actor TEXT NOT NULL DEFAULT '', lineage_seq INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE edges(source TEXT, target TEXT, type TEXT, weight REAL, context TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, lineage_actor TEXT NOT NULL DEFAULT '',
+    lineage_seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(source, target, type));
+INSERT INTO nodes(id,text,status,metadata,lineage_actor,lineage_seq) VALUES
+  ('wv-fork','fork','todo','{\"a\":1,\"p\":\"main\"}','agent-a',10),
+  ('wv-past','past','todo','{\"a\":1,\"p\":\"main\",\"q\":1}','agent-a',12),
+  ('wv-seq','seq','done','{}','agent-a',5),
+  ('wv-stale','c','todo','{}','agent-a',2);
+"
+python3 - "$LW_OPS" <<'PY'
+import hashlib, json, pathlib, sys, uuid
+out = pathlib.Path(sys.argv[1])
+def canonical(v):
+    if v is None: return "null"
+    if isinstance(v, bool): return "true" if v else "false"
+    if isinstance(v, int): return str(v)
+    if isinstance(v, str): return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(v, list): return "[" + ",".join(canonical(x) for x in v) + "]"
+    if isinstance(v, dict): return "{" + ",".join(canonical(str(k)) + ":" + canonical(v[k]) for k in sorted(v)) + "}"
+    raise TypeError(type(v).__name__)
+def write(name, node_id, mutation, seq):
+    doc = {"format": "weave.delta.v2", "operation_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "lw-" + name)),
+           "actor_id": "agent-a", "actor_sequence": seq, "canonicalization": "weave.canonical-json.v1",
+           "payload": {"entity": {"kind": "node", "id": node_id}, "lineage": {"seq": seq, "actor": "agent-a"},
+                       "mutation": mutation}}
+    doc["operation_sha256"] = hashlib.sha256(canonical(doc).encode()).hexdigest()
+    (out / name).write_text(canonical(doc) + "\n", encoding="utf-8")
+def patch(field, expected, value):
+    return {"kind": "node_patch", "fields": {field: {"expected": expected, "value": value}}}
+base, main, branch = {"a": 1}, {"a": 1, "p": "main"}, {"a": 1, "p": "branch"}
+# A fork: main and a worktree branch both edited wv-fork's metadata from base.
+write("fork-main.json", "wv-fork", patch("metadata", base, main), 10)
+write("fork-branch.json", "wv-fork", patch("metadata", base, branch), 9)
+# The same fork, but main edited the field again afterwards: the conflict is past.
+write("past-main.json", "wv-past", patch("metadata", base, main), 10)
+write("past-branch.json", "wv-past", patch("metadata", base, branch), 9)
+write("past-later.json", "wv-past", patch("metadata", main, {"a": 1, "p": "main", "q": 1}), 12)
+# A lifecycle: created todo, todo->blocked, blocked->todo, todo->active (done since).
+write("seq-create.json", "wv-seq", {"kind": "node_create", "row": {"text": "seq", "status": "todo",
+      "metadata": {}, "alias": None, "created_at": "2026-07-19 00:00:00"}}, 1)
+write("seq-1.json", "wv-seq", patch("status", "todo", "blocked"), 2)
+write("seq-2.json", "wv-seq", patch("status", "blocked", "todo"), 3)
+write("seq-3.json", "wv-seq", patch("status", "todo", "active"), 4)
+# A stale chain: a->b, then b->c; the a->b op is refused but was built on.
+write("stale-1.json", "wv-stale", patch("text", "a", "b"), 1)
+write("stale-2.json", "wv-stale", patch("text", "b", "c"), 2)
+PY
+lw=$(python3 "$REPLAY" "$LW_DB" "$LW_OPS"/*.json) || true
+lw_named=$(printf '%s' "$lw" | jq -c '[(.lost_writes // [])[] | [.entity, .field, .differs]]')
+[ "$lw_named" = '[["wv-fork","metadata",["p"]]]' ] \
+    && ok "a write that lost a two-graph fork is named, and only that one (wv-898c73)" \
+    || bad "a write that lost a two-graph fork is named, and only that one (got $lw_named)"
+[ "$(disp "$lw" "$LW_OPS/fork-branch.json")" = "precondition_conflict" ] \
+    && ok "...the losing op's disposition is unchanged" \
+    || bad "...the losing op's disposition is unchanged (got $(disp "$lw" "$LW_OPS/fork-branch.json"))"
+[ "$(sqlite3 "$LW_DB" "SELECT json_extract(metadata,'\$.p') FROM nodes WHERE id='wv-fork';")" = "main" ] \
+    && ok "...and the graph keeps its own value" || bad "...and the graph keeps its own value"
+
+# wv-cf6f29: metadata, claimed_by and risk_level are three keys on ONE column.
+# A whole-metadata patch and a claimed_by patch that start from the same column
+# state are a fork even though their `expected` values differ in shape; grouping
+# forks by key alone never paired them (probe B6, wv-9fe18d). Not a fork: a
+# sugar sibling whose start disagrees with the metadata start, or a fork whose
+# column was edited again afterwards through another key.
+LWC_DB="$TMP/lost-writes-column.db"
+LWC_OPS="$TMP/lost-writes-column-ops"
+mkdir -p "$LWC_OPS"
+sqlite3 "$LWC_DB" "
+CREATE TABLE nodes(id TEXT PRIMARY KEY, text TEXT, status TEXT DEFAULT 'todo', metadata TEXT DEFAULT '{}',
+    alias TEXT UNIQUE, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    lineage_actor TEXT NOT NULL DEFAULT '', lineage_seq INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE edges(source TEXT, target TEXT, type TEXT, weight REAL, context TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, lineage_actor TEXT NOT NULL DEFAULT '',
+    lineage_seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(source, target, type));
+INSERT INTO nodes(id,text,status,metadata,lineage_actor,lineage_seq) VALUES
+  ('wv-col1','col1','active','{\"a\":1,\"claimed_by\":\"agent-b\"}','agent-b',10),
+  ('wv-col2','col2','active','{\"a\":1,\"claimed_by\":\"agent-b\"}','agent-b',10),
+  ('wv-col3','col3','active','{\"a\":1}','agent-b',11),
+  ('wv-col4','col4','active','{\"a\":1,\"claimed_by\":\"agent-b\"}','agent-b',10),
+  ('wv-col5','col5','done','{\"a\":2,\"learning\":\"kept?\"}','agent-a',30),
+  ('wv-col6','col6','done','{\"a\":2}','agent-a',30);
+"
+python3 - "$LWC_OPS" <<'PY'
+import hashlib, json, pathlib, sys, uuid
+out = pathlib.Path(sys.argv[1])
+def canonical(v):
+    if v is None: return "null"
+    if isinstance(v, bool): return "true" if v else "false"
+    if isinstance(v, int): return str(v)
+    if isinstance(v, str): return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(v, list): return "[" + ",".join(canonical(x) for x in v) + "]"
+    if isinstance(v, dict): return "{" + ",".join(canonical(str(k)) + ":" + canonical(v[k]) for k in sorted(v)) + "}"
+    raise TypeError(type(v).__name__)
+def write(name, node_id, field, expected, value, seq, actor):
+    mutation = {"kind": "node_patch", "fields": {field: {"expected": expected, "value": value}}}
+    doc = {"format": "weave.delta.v2", "operation_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "lwc-" + name)),
+           "actor_id": actor, "actor_sequence": seq, "canonicalization": "weave.canonical-json.v1",
+           "payload": {"entity": {"kind": "node", "id": node_id}, "lineage": {"seq": seq, "actor": actor},
+                       "mutation": mutation}}
+    doc["operation_sha256"] = hashlib.sha256(canonical(doc).encode()).hexdigest()
+    (out / name).write_text(canonical(doc) + "\n", encoding="utf-8")
+base, learned = {"a": 1}, {"a": 1, "learning": "kept?"}
+# col1: a claim won; the metadata edit from the same column state lost.
+write("col1-claim.json", "wv-col1", "claimed_by", None, "agent-b", 10, "agent-b")
+write("col1-meta.json", "wv-col1", "metadata", base, learned, 9, "agent-a")
+# col2: a metadata write that set the claim won; the claimed_by edit lost.
+write("col2-meta.json", "wv-col2", "metadata", base, {"a": 1, "claimed_by": "agent-b"}, 10, "agent-b")
+write("col2-claim.json", "wv-col2", "claimed_by", None, "agent-a", 9, "agent-a")
+# col3: col1's fork, then the claim was released: the column was edited past it.
+write("col3-claim.json", "wv-col3", "claimed_by", None, "agent-b", 10, "agent-b")
+write("col3-meta.json", "wv-col3", "metadata", base, learned, 9, "agent-a")
+write("col3-release.json", "wv-col3", "claimed_by", "agent-b", None, 11, "agent-b")
+# col4: the claim started from another holder, not from the metadata start.
+write("col4-claim.json", "wv-col4", "claimed_by", "agent-z", "agent-b", 10, "agent-b")
+write("col4-meta.json", "wv-col4", "metadata", base, learned, 9, "agent-a")
+# col5: a metadata edit, then a later claim under another actor id (the actor
+# id format changed between sessions on the real catalog, wv-776e45); the row
+# has moved on outside v2 since. The claim's None start matches both sides of
+# the edit, so it pairs as a fork; the edit's own change (learning) is still
+# in the row: not a loss.
+write("col5-meta.json", "wv-col5", "metadata", base, learned, 20, "agent-a")
+write("col5-claim.json", "wv-col5", "claimed_by", None, "agent-b", 21, "agent-b")
+# col6: the same sequence, but the row was rewritten outside v2 since and no
+# longer holds the edit. One actor at a later seq: still not a fork.
+write("col6-meta.json", "wv-col6", "metadata", base, learned, 20, "agent-a")
+write("col6-claim.json", "wv-col6", "claimed_by", None, "agent-a", 21, "agent-a")
+PY
+lwc=$(python3 "$REPLAY" "$LWC_DB" "$LWC_OPS"/*.json) || true
+lwc_named=$(printf '%s' "$lwc" | jq -c '[(.lost_writes // [])[] | [.entity, .field, .differs]] | sort')
+lwc_want='[["wv-col1","metadata",["claimed_by","learning"]],["wv-col2","claimed_by",{"current":"agent-b","value":"agent-a"}]]'
+[ "$lwc_named" = "$lwc_want" ] \
+    && ok "a fork across metadata and claimed_by on one column is named, both ways (wv-cf6f29)" \
+    || bad "a fork across metadata and claimed_by on one column is named, both ways (got $lwc_named)"
+lwc_disp=$(printf '%s' "$lwc" | jq -r '[.results[] | select(.path | test("col[3-6]-meta")) | .disposition] | join(",")')
+[ "$lwc_disp" = "precondition_conflict,precondition_conflict,precondition_conflict,precondition_conflict" ] \
+    && ok "...an edited-past or non-matching cross-key sibling is refused but not named" \
+    || bad "...an edited-past or non-matching cross-key sibling is refused but not named (got $lwc_disp)"
+
+# wv load names it: two ops from one preimage on the dispatch target's text.
+python3 - "$V2DIR" "$TGT" <<'PY'
+import hashlib, json, pathlib, sys, uuid
+out, tgt = pathlib.Path(sys.argv[1]), sys.argv[2]
+def canonical(v):
+    if v is None: return "null"
+    if isinstance(v, bool): return "true" if v else "false"
+    if isinstance(v, int): return str(v)
+    if isinstance(v, str): return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(v, list): return "[" + ",".join(canonical(x) for x in v) + "]"
+    if isinstance(v, dict): return "{" + ",".join(canonical(str(k)) + ":" + canonical(v[k]) for k in sorted(v)) + "}"
+    raise TypeError(type(v).__name__)
+for name, value, seq in (("fork-side-a", "side a", 999990), ("fork-side-b", "side b", 999991)):
+    doc = {"format": "weave.delta.v2", "operation_id": str(uuid.uuid5(uuid.NAMESPACE_URL, name)),
+           "actor_id": "dispatch-test", "actor_sequence": seq, "canonicalization": "weave.canonical-json.v1",
+           "payload": {"entity": {"kind": "node", "id": tgt}, "lineage": {"seq": seq, "actor": "dispatch-test"},
+                       "mutation": {"kind": "node_patch",
+                                    "fields": {"text": {"expected": "dispatch target", "value": value}}}}}
+    doc["operation_sha256"] = hashlib.sha256(canonical(doc).encode()).hexdigest()
+    (out / f"{seq:012d}-{doc['operation_id']}.json").write_text(canonical(doc) + "\n")
+PY
+rm -rf "$HOT"
+fork_err=$(cd "$REPO" && WV_HOT_ZONE="$HOT" WV_AUTO_CHECKPOINT=0 "$ROOT/scripts/wv" load 2>&1 >/dev/null)
+if grep -q "lost a conflict on the same field" <<< "$fork_err" && grep -qF -- "$TGT text" <<< "$fork_err"; then
+    ok "wv load names a write that lost a two-graph fork"
+else
+    bad "wv load names a write that lost a two-graph fork (stderr: ${fork_err:0:300})"
+fi
+rm -f "$V2DIR"/000000999990-*.json "$V2DIR"/000000999991-*.json
+
 # Hard failure: a corrupt v2 op rolls back and, under strict, fails the load.
 printf '{"format":"weave.delta.v2","garbage":true}\n' > "$V2DIR/000000999998-corrupt.json"
 rm -rf "$HOT"

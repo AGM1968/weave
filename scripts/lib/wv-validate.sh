@@ -412,3 +412,65 @@ stdin_has_input() {
         waited=$((waited + 1))
     done
 }
+
+# Credential shapes refused in graph text (wv-320587). Graph text is committed
+# to .weave/ and mirrored to GitHub issues by wv sync --gh, so a token pasted
+# into a node, a learning or a memory is published twice. Each entry is
+# "<shape><TAB><ERE>"; order matters only for naming (sk-ant- before sk-).
+# Shapes are whole tokens of a known form, not bare prefixes: the graph talks
+# about ghp_ and AKIA without holding one. Every write path that persists free
+# text runs this list (wv-320587 records the scope).
+_WV_CREDENTIAL_SHAPES=(
+    "github_token	(^|[^A-Za-z0-9_])(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}([^A-Za-z0-9]|$)"
+    "github_pat	github_pat_[A-Za-z0-9_]{60,}"
+    "anthropic_key	sk-ant-[A-Za-z0-9_-]{20,}"
+    "openai_key	(^|[^A-Za-z0-9_-])sk-(proj-|svcacct-)?[A-Za-z0-9_-]{32,}"
+    "aws_access_key	(^|[^A-Z0-9])(AKIA|ASIA)[0-9A-Z]{16}([^A-Z0-9]|$)"
+    "private_key	-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----"
+    "slack_token	xox[abprs]-[A-Za-z0-9-]{10,}"
+    "google_api_key	AIza[0-9A-Za-z_-]{35}"
+    "url_credentials	[A-Za-z][A-Za-z0-9+.-]*://[^/[:space:]:@\"'<>]+:[^/[:space:]@\"'<>]+@[A-Za-z0-9.-]+"
+    "bearer_token	[Bb]earer[[:space:]]+[A-Za-z0-9._~+/-]{24,}=*"
+)
+
+# wv_credential_regex — every shape as one ERE alternation, for scanning many
+# lines in one grep (wv doctor's graph sweep).
+wv_credential_regex() {
+    local entry any=""
+    for entry in "${_WV_CREDENTIAL_SHAPES[@]}"; do any="${any:+$any|}(${entry#*$'\t'})"; done
+    printf '%s\n' "$any"
+}
+
+# wv_credential_shape <text> — print the first credential shape <text> holds
+# and return 0, or return 1. One grep over every shape first, so text with no
+# credential (nearly every call) costs one process.
+wv_credential_shape() {
+    local entry
+    grep -qE -- "$(wv_credential_regex)" <<< "$1" 2>/dev/null || return 1
+    for entry in "${_WV_CREDENTIAL_SHAPES[@]}"; do
+        if grep -qE -- "${entry#*$'\t'}" <<< "$1" 2>/dev/null; then
+            printf '%s\n' "${entry%%$'\t'*}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# wv_credential_refuse <where> <text> — 0 when <text> holds no credential;
+# else name the shape (never the value) on stderr and return 1. Refused, not
+# redacted: the caller retries without the secret, and stored text is never
+# silently different from what was written.
+wv_credential_refuse() {
+    local shape
+    shape=$(wv_credential_shape "$2") || return 0
+    echo -e "${RED:-}Error: $1 holds a credential-shaped string ($shape); refused.${NC:-}" >&2
+    echo "  Graph text is committed to .weave/ and mirrored to GitHub issues. Remove the secret and retry (wv-320587)." >&2
+    return 1
+}
+
+# wv_credential_refuse_file <where> <path> — wv_credential_refuse over a file's
+# content; an unreadable file is left to the caller's own error.
+wv_credential_refuse_file() {
+    [ -r "$2" ] || return 0
+    wv_credential_refuse "$1" "$(cat -- "$2" 2>/dev/null)"
+}

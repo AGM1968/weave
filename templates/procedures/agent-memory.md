@@ -54,6 +54,20 @@ tracks. The target must resolve inside the repository and parse under its surfac
 the verdict is recorded and again when it is applied. Apply sets `mem_status=graduated` and
 `graduated_to`: render and `wv bootstrap` drop the memory, and `recall` still returns it.
 
+When to record or graduate a lesson: "improve continuously" with no trigger never fires. Act when
+one of these happens, in the session it happens:
+
+- A rule existed and was broken anyway. Restating it more firmly does not help; graduate it into a
+  step that must produce something (a node, a test, a detector), because a preference loses to
+  momentum and a required artifact does not.
+- Two rules conflicted and the conversation settled which one wins. Write that ruling down, or the
+  next session settles it again.
+- A defect class came back after being fixed once. The first fix repaired one place while the lesson
+  applied everywhere: graduate the class (a detector under `.weave/patterns/` is the strongest
+  form).
+- A review found something an earlier step of the workflow was meant to find. Treat it as a workflow
+  defect: record which step should have found it.
+
 `wv doctor` warns when the rendered memory block exceeds `.weave/policy.conf`
 `[memory] block_budget_bytes` (default 8192) and names graduation candidates. It also flags memories
 that may hold time-bound state (pending or dated language, a cited node now done or gone) for

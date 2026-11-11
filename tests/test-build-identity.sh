@@ -126,11 +126,11 @@ check "the fixture install gives the real --version line a build suffix" "yes" \
 # failure this node is about one level up. Pinned structurally: doctor must use
 # the shared helper rather than rebuilding the path.
 
-ops="$ROOT/scripts/cmd/wv-cmd-ops.sh"
+ops="$ROOT/scripts/cmd/wv-cmd-doctor.sh"
 if grep -q "wv_install_provenance_file" "$ops"; then
     ok "doctor resolves provenance through the shared helper"
 else
-    bad "doctor resolves provenance through the shared helper" "no call in wv-cmd-ops.sh"
+    bad "doctor resolves provenance through the shared helper" "no call in wv-cmd-doctor.sh"
 fi
 if grep -qE '_prov_dir=.*WV_LIB_DIR' "$ops"; then
     bad "doctor no longer rebuilds the provenance path itself" "found a local _prov_dir resolution"

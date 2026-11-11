@@ -68,7 +68,9 @@ jq -e '.detected.sqlite_trigger > 0 and .detected.host_hook > 0 and .detected.gi
 fresh; printf "SELECT RAISE(ABORT, 'GraphPolicyViolation: new unclaimed gate');\n" >> "$TMP/t/scripts/lib/wv-db.sh"
 check "SQLite abort claimed by no rule" "a new SQLite abort that no rule claims fails validation"
 
-fresh; printf 'jq -n %s\n' "'{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\"}}'" >> "$TMP/t/.claude/hooks/stop-check.sh"
+# A hook no site claims: stop-check.sh now holds a claimed denial near its end
+# (wv-c7d114), inside whose anchor window an appended line would fall.
+fresh; printf 'jq -n %s\n' "'{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\"}}'" >> "$TMP/t/.claude/hooks/session-end-sync.sh"
 check "hook denial claimed by no rule" "a new hook denial that no rule claims fails validation"
 
 # GIT HOOKS ARE A PROVEN OWNER (wv-3477f0): a git hook refuses by exiting

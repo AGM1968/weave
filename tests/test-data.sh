@@ -1017,7 +1017,10 @@ CP_DIR=$(mktemp -d)
     git remote add origin "$CP_DIR/remote.git" >/dev/null 2>&1 || true
     git push -q -u origin "$(git branch --show-current)" >/dev/null 2>&1 || true
     echo "pull-path work" > feature2.txt && git add feature2.txt
-    WV_CHECKPOINT_PULL=1 WV_CHECKPOINT_INTERVAL=0 "$WV" add "trigger pull checkpoint" >/dev/null 2>&1 || true
+    # wv sync runs auto_checkpoint itself; a lone wv add can return before any
+    # checkpoint does, which left this assertion true with no pull attempted.
+    "$WV" add "trigger pull checkpoint" >/dev/null 2>&1 || true
+    WV_CHECKPOINT_PULL=1 WV_CHECKPOINT_INTERVAL=0 "$WV" sync >/dev/null 2>&1 || true
     _staged2=$(git diff --cached --name-only | grep '^feature2.txt$' || true)
     if [ -n "$_staged2" ]; then
         echo -e "  ${GREEN}✓${NC} guard (pull on): autostash did not unstage feature2.txt"
@@ -1035,6 +1038,139 @@ if [ -f "$CP_DIR/.delta" ]; then
     TESTS_RUN=$((TESTS_RUN + _cp_r))
 fi
 rm -rf "$CP_DIR"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WV_AUTO_CHECKPOINT=0 stops every self-made commit; no autostash over edits
+# (wv-fbbdff)
+# ═══════════════════════════════════════════════════════════════════════════
+# Two sessions on one checkout (wv-ecf03c): one session held its .weave/
+# commit, the other's wv sync committed it anyway -- the switch only reached
+# auto_checkpoint, not sync's final commit or the lifecycle checkpoints -- and
+# the checkpoint pull ran `git pull --autostash` over whatever the other
+# session had unstaged.
+echo "Testing WV_AUTO_CHECKPOINT=0 and the autostash guard..."
+AC_DIR=$(mktemp -d)
+(
+    cd "$AC_DIR"
+    git init -q -b main
+    git config user.email t@t && git config user.name t && git config commit.gpgsign false
+    export WV_HOT_ZONE="$AC_DIR/hz" \
+           WV_DB="$AC_DIR/hz/brain.db" \
+           WV_PROJECT_DIR="$AC_DIR" \
+           WEAVE_DIR="$AC_DIR/.weave" \
+           WV_CHECKPOINT_INTERVAL=0 \
+           WV_CHECKPOINT_PULL=0 \
+           WV_SYNC_INTERVAL=0
+    mkdir -p "$WV_HOT_ZONE"
+    echo base > README.md && git add README.md && git commit -q -m "init"
+    "$WV" init >/dev/null 2>&1
+    "$WV" add "seed" >/dev/null 2>&1
+    "$WV" sync >/dev/null 2>&1 || true
+
+    _p=0 _r=0
+    _check() {  # <message> <yes|no>
+        _r=$((_r + 1))
+        if [ "$2" = yes ]; then
+            echo -e "  ${GREEN}✓${NC} $1"; _p=$((_p + 1))
+        else
+            echo -e "  ${RED}✗${NC} $1"
+        fi
+    }
+    _yes() { if "$@"; then echo yes; else echo no; fi; }
+
+    # 1. wv sync with the switch off: no commit by either path, graph left dirty.
+    _head=$(git rev-parse HEAD)
+    WV_AUTO_CHECKPOINT=0 "$WV" add "held change" >/dev/null 2>&1
+    WV_AUTO_CHECKPOINT=0 "$WV" sync >/dev/null 2>&1 || true
+    _check "WV_AUTO_CHECKPOINT=0 wv sync makes no commit" \
+        "$(_yes test "$(git rev-parse HEAD)" = "$_head")"
+    _check "the held graph change is left in the tree for the caller" \
+        "$(_yes test -n "$(git status --porcelain -- .weave)")"
+    # Control: the same sync with the switch on commits it.
+    "$WV" sync >/dev/null 2>&1 || true
+    _check "control: wv sync with the switch on commits the graph" \
+        "$(_yes test "$(git rev-parse HEAD)" != "$_head")"
+
+    # 2. The lifecycle checkpoint (session end, pre-compact) honours it too.
+    # Its own uncommitted graph-state change, made without wv sync, so this
+    # case does not depend on case 1 having left anything uncommitted.
+    echo "- lifecycle probe" >> .weave/trails.md
+    _head=$(git rev-parse HEAD)
+    _le() {  # _HC_HOT_ZONE: where the lifecycle checkpoint stamps its commit
+        _HC_HOT_ZONE="$WV_HOT_ZONE" \
+        bash -c '. "$1/scripts/lib/wv-checkpoint-ci.sh"; . "$1/scripts/lib/wv-lifecycle-end.sh"
+                 _le_checkpoint_commit "chore(weave): auto-checkpoint"' _ "$REPO_ROOT"
+    }
+    WV_AUTO_CHECKPOINT=0 _le
+    _check "WV_AUTO_CHECKPOINT=0 stops the lifecycle checkpoint commit" \
+        "$(_yes test "$(git rev-parse HEAD)" = "$_head")"
+    git reset -q
+    _le
+    _check "control: the lifecycle checkpoint commits with the switch on" \
+        "$(_yes test "$(git rev-parse HEAD)" != "$_head")"
+
+    # 2b. The hold file stops them with no variable in the environment: harness
+    # hooks never inherit an agent's export (wv-99d4d2), but they see the file.
+    _hold=$(git rev-parse --git-path weave-autocommit-hold)
+    touch "$_hold"
+    "$WV" add "held by file" >/dev/null 2>&1
+    _head=$(git rev-parse HEAD)
+    env -u WV_AUTO_CHECKPOINT "$WV" sync >/dev/null 2>&1 || true
+    _check "the hold file stops wv sync's commit with no WV_AUTO_CHECKPOINT set" \
+        "$(_yes test "$(git rev-parse HEAD)" = "$_head")"
+    echo "- held probe" >> .weave/trails.md
+    _le
+    _check "the hold file stops the lifecycle checkpoint" \
+        "$(_yes test "$(git rev-parse HEAD)" = "$_head")"
+    rm -f "$_hold"
+    git reset -q
+    "$WV" sync >/dev/null 2>&1 || true
+    _check "control: with the hold file gone, wv sync commits" \
+        "$(_yes test "$(git rev-parse HEAD)" != "$_head")"
+
+    # 3. An unstaged edit outside graph state stops the checkpoint pull; with
+    # none, the pull runs (the control that makes the first assertion mean it).
+    git clone -q --bare "$AC_DIR" "$AC_DIR/remote.git" >/dev/null 2>&1
+    git remote add origin "$AC_DIR/remote.git"
+    git fetch -q origin && git branch -q -u origin/main
+    git clone -q "$AC_DIR/remote.git" "$AC_DIR/peer" >/dev/null 2>&1
+    (cd "$AC_DIR/peer" && git config user.email p@p && git config user.name p \
+        && echo upstream > upstream.txt && git add upstream.txt \
+        && git commit -q -m "upstream work" && git push -q origin main) >/dev/null 2>&1
+    _upstream=$(git -C "$AC_DIR/peer" rev-parse HEAD)
+    # wv sync is the trigger: it runs auto_checkpoint itself, while a lone
+    # wv add can return before any checkpoint does.
+    echo "someone else's edit" >> README.md
+    "$WV" add "pull trigger one" >/dev/null 2>&1
+    _err=$(WV_CHECKPOINT_PULL=1 "$WV" sync 2>&1 >/dev/null || true)
+    git fetch -q origin
+    _check "unstaged edit outside .weave/: the checkpoint did not pull" \
+        "$(_yes bash -c '! git merge-base --is-ancestor "$1" HEAD' _ "$_upstream")"
+    _check "the unstaged edit is untouched in the tree" \
+        "$(_yes grep -q "someone else's edit" README.md)"
+    _check "the skipped pull says why" \
+        "$(_yes grep -q 'pull skipped' <<< "$_err")"
+    git checkout -q -- README.md
+    "$WV" add "pull trigger two" >/dev/null 2>&1
+    # The pull is fast-forward only (wv-2f32a7): by now this branch has its own
+    # checkpoint commit as well as the peer's upstream one, so the pull runs,
+    # fetches, and leaves the diverged history alone, saying so. That it ran at
+    # all is what makes the skipped case above mean something.
+    _err=$(WV_CHECKPOINT_PULL=1 "$WV" sync 2>&1 >/dev/null || true)
+    _check "control: with no unstaged edits the checkpoint pull runs (it fetched upstream)" \
+        "$(_yes test "$(git rev-parse origin/main)" = "$_upstream")"
+    _check "control: and, the branch having diverged, leaves history alone and says so" \
+        "$(_yes bash -c '! git merge-base --is-ancestor "$1" HEAD && grep -q diverged <<< "$2"' _ "$_upstream" "$_err")"
+
+    echo "$_p $_r" > "$AC_DIR/.delta"
+)
+if [ -f "$AC_DIR/.delta" ]; then
+    read -r _ac_p _ac_r < "$AC_DIR/.delta"
+    TESTS_PASSED=$((TESTS_PASSED + _ac_p))
+    TESTS_RUN=$((TESTS_RUN + _ac_r))
+fi
+rm -rf "$AC_DIR"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════

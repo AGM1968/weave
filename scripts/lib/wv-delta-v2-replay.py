@@ -101,8 +101,46 @@ class UnsupportedVersion(ValueError):
     """Raised for an operation format, mutation kind or field this evaluator does not support."""
 
 
+_PLAIN_SCALARS = (str, int, bool, type(None))
+
+
+def _plain_json(value: Any) -> bool:
+    """True when every value is exactly None, bool, int, str, list or a str-keyed dict.
+
+    For exactly those types json.dumps with sorted keys, compact separators and
+    ensure_ascii=False writes the same bytes _canonical_slow does, in C; a cold
+    load spent most of its replay time in the recursive version (wv-12dce0).
+    Anything else, a float included, goes to _canonical_slow, which keeps its
+    own error for it.
+    """
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        kind = type(item)
+        if kind in _PLAIN_SCALARS:
+            continue
+        if kind is list:
+            stack.extend(item)
+        elif kind is dict:
+            # Exact type on purpose: a str subclass may serialise differently
+            # from the slow path, so isinstance would admit it (wv-427169).
+            if any(type(key) is not str for key in item):  # pylint: disable=unidiomatic-typecheck
+                return False
+            stack.extend(item.values())
+        else:
+            return False
+    return True
+
+
 def canonical(value: Any) -> str:
     """Serialize a JSON-compatible value canonically (sorted keys, no whitespace) for hashing."""
+    if _plain_json(value):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return _canonical_slow(value)
+
+
+def _canonical_slow(value: Any) -> str:
+    """The reference serializer: recursive, and the one that rejects unsupported types."""
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -1146,6 +1184,209 @@ def _detect_lineage_collisions(op_paths: list[Path]) -> dict[str, tuple[str, str
     return collisions
 
 
+def _field_difference(current: Any, value: Any) -> Any:
+    """The part of a lost write worth naming: changed keys for an object field, else both values."""
+    if isinstance(current, dict) and isinstance(value, dict):
+        return sorted(k for k in set(current) | set(value) if current.get(k) != value.get(k))
+    return {"current": current, "value": value}
+
+
+# One patch of the node metadata column, by key: (field, lineage, expected, value), raw.
+_ColumnPatch = tuple[str, tuple[int, str], Any, Any]
+
+
+def _metadata_view(meta: Any, field: str) -> Any:
+    """What a `field` patch's CAS sees of a whole metadata object (claimed_by/risk_level normalized)."""
+    return _create_field_value("node_create", {"metadata": meta}, field)
+
+
+def _cross_key_fork(field: str, start: Any, value: Any, lineage: tuple[int, str], other: _ColumnPatch) -> bool:
+    """True when `other`, a patch of the same metadata column through another key, forked from `start`.
+
+    A whole-metadata patch and a claimed_by/risk_level patch are siblings when
+    the sugar patch started from the metadata start's view of its key and moved
+    it. Two sugar keys never fork each other: each one's CAS reads only its own
+    key, so they commute (wv-cf6f29).
+
+    A sugar key sees only a projection, so its start can match both sides of
+    the metadata patch (claimed_by None before and after a learning edit): it
+    may have come after the patch rather than beside it. That ambiguous pair is
+    not a fork when it is one actor's sequence (the same actor, a later seq):
+    on this repository's catalog that is `wv update --metadata` then `wv work`.
+    Sequences across actors are left to _metadata_change_kept.
+    """
+    o_field, o_lineage, o_start, o_value = other
+    if o_field == field or "metadata" not in (field, o_field):
+        return False
+    if field == "metadata":
+        forked = _metadata_view(start, o_field) == o_start and o_value != o_start
+        ambiguous = _metadata_view(value, o_field) == o_start
+        first, second = lineage, o_lineage
+    else:
+        forked = _metadata_view(o_start, field) == start and _metadata_view(o_value, field) != start
+        ambiguous = _metadata_view(o_start, field) == value
+        first, second = o_lineage, lineage
+    if not forked:
+        return False
+    return not (ambiguous and first[1] == second[1] and second[0] > first[0])
+
+
+def _has_fork_sibling(same_key_values: int, field: str, patch: dict[str, Any], lineage: tuple[int, str],
+                      column: list[_ColumnPatch]) -> bool:
+    """True when another op wrote a different value from this patch's start, through any key of its column."""
+    if same_key_values >= 2:
+        return True
+    return any(_cross_key_fork(field, patch.get("expected"), patch["value"], lineage, other) for other in column)
+
+
+def _edited_since(field: str, start: Any, lineage: tuple[int, str],
+                  same_key: list[tuple[tuple[int, str], Any]], column: list[_ColumnPatch]) -> bool:
+    """True when a later patch of the field, or of its column through another key, started from elsewhere."""
+    frozen = _freeze(start)
+    if any(lin > lineage and exp != frozen for lin, exp in same_key):
+        return True
+    return _column_edited_since(field, start, lineage, column)
+
+
+def _metadata_change_kept(field: str, current: Any, start: Any, value: Any) -> bool:
+    """True when every key a whole-metadata patch changed still holds its value in the row.
+
+    The patch was refused only because the row moved on (later keys written
+    outside v2, a claim), not because its own change was lost. On this
+    repository's catalog the cross-key fork test first named six sequences
+    (a `wv update --metadata`, then a later `wv work` claim) as losses: the
+    same-actor test cleared five, and this one the sixth, whose actor id changed
+    format between the two sessions (wv-cf6f29).
+    """
+    if field != "metadata" or not (isinstance(current, dict) and isinstance(start, dict) and isinstance(value, dict)):
+        return False
+    changed = {k for k in set(start) | set(value) if start.get(k) != value.get(k)}
+    return all(current.get(k) == value.get(k) for k in changed)
+
+
+def _column_edited_since(field: str, start: Any, lost_lineage: tuple[int, str],
+                         column: list[_ColumnPatch]) -> bool:
+    """True when a later patch through another key of the column started from somewhere else."""
+    for o_field, o_lineage, o_start, _ in column:
+        if o_field == field or o_lineage <= lost_lineage or "metadata" not in (field, o_field):
+            continue
+        seen = _metadata_view(start, o_field) if field == "metadata" else start
+        theirs = o_start if field == "metadata" else _metadata_view(o_start, field)
+        if seen != theirs:
+            return True
+    return False
+
+
+def _lost_writes(conn: sqlite3.Connection, op_paths: list[Path],
+                 results_by_path: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Refused patches that forked from another op's starting value and lost.
+
+    Most precondition_conflict refusals are by design: state.sql is already
+    ahead of an old op. Two graphs editing one field (linked worktrees, two
+    machines) leave a different trace: two ops on that field start from the
+    SAME `expected` and write DIFFERENT values -- a fork -- and the side that
+    lost the merge was one count among thousands of benign refusals, named
+    nowhere (wv-898c73). A refused patch is reported when all five hold:
+    another op forked from its `expected`; that `expected` was written by at
+    most one op (a value re-entered later, like a status returning to todo,
+    lets siblings be sequential); no op in the catalog started from its value
+    (nothing built on it); the target holds something else; and no later
+    patch of that field started from anywhere but the fork. The op stays in
+    the catalog for good, so without the last test every load would repeat
+    the warning forever: it names the loss on the loads after the merge, and
+    stops once the field has been edited past it.
+    Measured on this repository's catalog (9,486 ops): "nothing built on it"
+    alone flagged 779 old ops whose fields later changed outside v2; adding
+    the fork test left 9, of which 8 were status histories such as
+    todo->blocked, blocked->todo, todo->active, whose done transition left no
+    v2 op. The re-entry test leaves the one real loss. A two-graph status
+    conflict from a re-entered status is missed: the cost of not naming every
+    lifecycle as a conflict. Reported, never changed: which side should win
+    is the owner's call, and the merge that chose it already happened.
+    The fork and edited-since tests also look across the keys of the node
+    metadata column (metadata, claimed_by, risk_level, see _NODE_PATCH_COLUMN):
+    a whole-metadata edit that lost to a claim from the same column state was
+    otherwise never paired with it (wv-cf6f29). The re-entry and built-on tests
+    stay per key.
+    """
+    ops: list[tuple[str, dict[str, Any]]] = []
+    for path in op_paths:
+        try:
+            ops.append((str(path), read_op(path)))
+        except (OSError, ValueError, IntegrityError, UnsupportedVersion):
+            continue
+    # (entity, field, expected) -> every value written from that preimage. A
+    # key present at all means some op started from that value: built on it.
+    # (entity, field, value) -> how many ops wrote that value: a preimage
+    # written more than once was re-entered, so siblings from it can be
+    # sequential (todo->blocked, blocked->todo, todo->active), not a fork.
+    from_preimage: dict[tuple[Any, ...], set[Any]] = {}
+    writes: dict[tuple[Any, ...], int] = {}
+    # (entity, field) -> [(lineage, expected)] of every patch, for "edited since".
+    patches: dict[tuple[Any, ...], list[tuple[tuple[int, str], Any]]] = {}
+    # node entity -> every patch of its metadata column, through any of its keys.
+    columns: dict[tuple[Any, ...], list[_ColumnPatch]] = {}
+    for _, op in ops:
+        mutation = op["payload"]["mutation"]
+        key = _entity_key(op["payload"]["entity"])
+        if mutation["kind"] in ("node_patch", "edge_patch"):
+            lineage = (op["payload"]["lineage"]["seq"], op["payload"]["lineage"]["actor"])
+            for field, patch in mutation["fields"].items():
+                value = _freeze(patch["value"])
+                start = _freeze(patch.get("expected"))
+                from_preimage.setdefault((key, field, start), set()).add(value)
+                writes[(key, field, value)] = writes.get((key, field, value), 0) + 1
+                patches.setdefault((key, field), []).append((lineage, start))
+                if mutation["kind"] == "node_patch" and _NODE_PATCH_COLUMN[field] == "metadata":
+                    columns.setdefault(key, []).append((field, lineage, patch.get("expected"), patch["value"]))
+        elif mutation["kind"] in ("node_create", "edge_create"):
+            # A create writes its row's fields too: a status a node was created
+            # with and later returned to has been written twice.
+            for field, value in mutation.get("row", {}).items():
+                frozen = _freeze(value)
+                writes[(key, field, frozen)] = writes.get((key, field, frozen), 0) + 1
+    lost: list[dict[str, Any]] = []
+    for path, op in ops:
+        if results_by_path.get(path, {}).get("disposition") != "precondition_conflict":
+            continue
+        payload = op["payload"]
+        mutation = payload["mutation"]
+        if mutation["kind"] not in ("node_patch", "edge_patch"):
+            continue
+        key = _entity_key(payload["entity"])
+        if mutation["kind"] == "node_patch":
+            current = node_current_fields(conn, payload["entity"]["id"])
+        else:
+            current = edge_current_fields(conn, (key[1], key[2], key[3]))
+        if current is None:
+            continue
+        for field, patch in mutation["fields"].items():
+            value = _freeze(patch["value"])
+            if _freeze(current[field]) == value:
+                continue
+            if (key, field, value) in from_preimage:
+                continue  # some op continued from this value: history, not a loss
+            start = _freeze(patch.get("expected"))
+            column: list[_ColumnPatch] = columns.get(key, []) if mutation["kind"] == "node_patch" else []
+            lost_lineage = (payload["lineage"]["seq"], payload["lineage"]["actor"])
+            if not _has_fork_sibling(len(from_preimage.get((key, field, start), ())), field, patch,
+                                     lost_lineage, column):
+                continue  # no sibling wrote a different value from the same start
+            if _metadata_change_kept(field, current[field], patch.get("expected"), patch["value"]):
+                continue  # its own change is in the row: refused because the row moved on, not lost
+            if writes.get((key, field, start), 0) > 1:
+                continue  # the start was re-entered: the siblings can be sequential
+            if _edited_since(field, patch.get("expected"), lost_lineage, patches.get((key, field), []), column):
+                continue  # the field was edited again after the fork: the conflict is past
+            lost.append({
+                "entity": ":".join(key[1:]), "field": field,
+                "differs": _field_difference(current[field], patch["value"]),
+                "lineage": [payload["lineage"]["seq"], payload["lineage"]["actor"]],
+                "operation_id": str(op.get("operation_id", "")),
+            })
+    return lost
+
+
 def evaluate(
     db_path: Path,
     op_paths: list[Path],
@@ -1186,7 +1427,7 @@ def evaluate(
     seen: dict[str, str] = {}
     results_by_path: dict[str, dict[str, Any]] = {}
     aborted = False
-    try:  # pylint: disable=too-many-nested-blocks  # wv-237d25
+    try:  # pylint: disable=too-many-nested-blocks  # wv-237d25  # noqa: PLR1702
         # Same-lineage collisions (round 4 finding 4) are resolved up front,
         # outside the fixed-point loop below: a colliding op has no
         # `expected` state it could ever converge to (that is what makes it
@@ -1251,6 +1492,7 @@ def evaluate(
             for r in results_by_path.values()
         ):
             aborted = True
+        lost: list[dict[str, Any]] = [] if aborted else _lost_writes(conn, op_paths, results_by_path)
         if aborted:
             conn.rollback()
         else:
@@ -1261,7 +1503,7 @@ def evaluate(
     finally:
         conn.close()
     results = [results_by_path[str(p)] for p in op_paths if str(p) in results_by_path]
-    return {"results": results, "aborted": aborted}
+    return {"results": results, "aborted": aborted, "lost_writes": lost}
 
 
 def _summary(results: list[dict[str, Any]]) -> dict[str, int]:
@@ -1302,15 +1544,34 @@ def check(op_paths: list[Path]) -> dict[str, Any]:
     return {"checked": len(op_paths), "failures": failures}
 
 
+def _ops_from(source: str) -> list[Path]:
+    """Operation paths listed one per line in SOURCE ('-' reads stdin).
+
+    The catalog grows with the graph: passed as arguments, a long checkout path
+    times 3,500 operations already exceeded the kernel's argument limit and
+    execve failed (rc=126) before replay started (wv-a05dcd).
+    """
+    text = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
+    return [Path(line) for line in text.splitlines() if line.strip()]
+
+
 def main(argv: list[str]) -> int:
     """Check operation files (--check) or replay them into a graph, printing the outcome as JSON."""
     if argv[:1] == ["--check"]:
-        outcome = check([Path(p) for p in argv[1:]])
+        rest = argv[1:]
+        if rest[:1] and rest[0].startswith("--ops-from="):
+            paths = _ops_from(rest[0].split("=", 1)[1]) + [Path(p) for p in rest[1:]]
+        else:
+            paths = [Path(p) for p in rest]
+        outcome = check(paths)
         print(json.dumps(outcome, sort_keys=True, separators=(",", ":")))
         return 2 if outcome["failures"] else 0
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("db", type=Path, help="SQLite graph database")
     parser.add_argument("operations", nargs="*", type=Path, help="Delta v2 operation JSON files")
+    parser.add_argument("--ops-from", default=None, metavar="FILE",
+                        help="read operation paths one per line from FILE ('-' for stdin), "
+                             "in addition to any given as arguments")
     parser.add_argument("--cutover-seq", type=int, default=None,
                         help="skip operations whose lineage seq precedes this value")
     parser.add_argument("--strict", action="store_true",
@@ -1320,7 +1581,8 @@ def main(argv: list[str]) -> int:
     # rejected the operations after the option, aborting every cutover replay on
     # 3.11 (wv-9d2036).
     args = parser.parse_intermixed_args(argv)
-    outcome = evaluate(args.db, args.operations, cutover_seq=args.cutover_seq, strict=args.strict)
+    operations = list(args.operations) + (_ops_from(args.ops_from) if args.ops_from else [])
+    outcome = evaluate(args.db, operations, cutover_seq=args.cutover_seq, strict=args.strict)
     outcome["summary"] = _summary(outcome["results"])
     print(json.dumps(outcome, sort_keys=True, separators=(",", ":")))
     return 2 if outcome["aborted"] else 0

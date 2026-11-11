@@ -152,6 +152,15 @@ check "an owed heavy suite runs at push and the push passes" "0" "$RC"
 check "...it ran once" "1" "$(runs heavy)"
 check "...with the real tip as base, not the inherited one" "$(git rev-parse HEAD)" "$(base_seen heavy)"
 has "...and the hook says the tier is green" "$OUT" "heavy tier green for"
+# Host pressure over the push gate (wv-58b10e); none where the kernel has no PSI.
+check "...and its gate record carries the host's CPU and IO stall where the kernel has PSI" \
+    "$([ -r /proc/pressure/cpu ] && [ -r /proc/pressure/io ] && echo true || echo false)" \
+    "$(tail -1 "$WV_GATE_LOG" | jq -r '.phase == "pre-push" and (.pressure | type == "object" and has("cpu_some_share"))')"
+# The gate's start in epoch ms, as pre-commit rows carry (wv-d0f107): ts is the
+# end, so started_ms + duration_ms lands on it (to the second ts is written in).
+check "...and its gate record carries when the gate started, consistent with its end and duration" "true" \
+    "$(tail -1 "$WV_GATE_LOG" | jq -r '.phase == "pre-push" and (.started_ms | type == "number")
+        and (((.ts | fromdateiso8601) * 1000 - .started_ms - .duration_ms) | fabs < 2000)')"
 hasnt "...the light suite is not re-run at push" "$(runs light)" "1"
 reset_runs; prepush
 check "a retried push of the same content passes" "0" "$RC"

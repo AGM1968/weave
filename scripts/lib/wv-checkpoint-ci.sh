@@ -285,6 +285,53 @@ wv_staged_non_graph_state() {
     wv_non_graph_state_paths <<< "$staged"
 }
 
+# wv_unstaged_non_graph_state <git-root>
+#   Prints tracked paths outside graph state that have unstaged edits.
+#   `git pull --rebase --autostash` stashes these and re-applies them, which in
+#   a checkout someone else is editing (another agent session, the user's
+#   editor) rewrites their files under them and strands the edits in a stash
+#   when the re-apply conflicts (wv-fbbdff). A checkpoint pull that finds any
+#   is skipped. Returns 1 when the tree cannot be listed; callers treat that as
+#   edits present.
+wv_unstaged_non_graph_state() {
+    local changed
+    changed=$(git -C "$1" diff --name-only --no-renames 2>/dev/null) || return 1
+    wv_non_graph_state_paths <<< "$changed"
+}
+
+# wv_auto_commit_enabled [<git-root>] -- false when Weave must make no commit
+# on its own: auto_checkpoint, wv sync's final sync-state commit, and the
+# session-end and pre-compact checkpoints. Only auto_checkpoint read
+# WV_AUTO_CHECKPOINT, so the switch stopped one path of three and a session
+# holding its .weave/ commit still had it made for it (wv-fbbdff).
+#   Two ways to turn them off: WV_AUTO_CHECKPOINT=0 in the environment, or the
+# hold file `$(git rev-parse --git-path weave-autocommit-hold)` existing. The
+# variable reaches only the processes that inherit it; harness hooks run in the
+# harness's environment, so an agent's export never reached a hook's wv calls
+# (wv-99d4d2). The file is seen by every process in that checkout (a linked
+# worktree has its own), so one session can hold the checkout for all of them.
+#   A third: a commit or push gate holding the checkout (wv-c5500d's lock). A
+# checkpoint made or amended under a running gate moves HEAD beneath it
+# (2026-11-09: an amend landed mid-gate); it waits for the next checkpoint
+# instead (wv-2f32a7). The gate's own shell never calls this.
+wv_auto_commit_enabled() { # predicate
+    [ "${WV_AUTO_CHECKPOINT:-1}" != "0" ] || return 1
+    local hold root="${1:-.}"
+    hold=$(git -C "$root" rev-parse --git-path weave-autocommit-hold 2>/dev/null) || return 0
+    case "$hold" in /*) ;; *) hold="$root/$hold" ;; esac
+    [ ! -e "$hold" ] || return 1
+    if ! declare -F wv_gate_hold_status >/dev/null; then
+        # shellcheck source=/dev/null
+        [ -r "$(dirname "${BASH_SOURCE[0]}")/wv-gate-hold.sh" ] \
+            && . "$(dirname "${BASH_SOURCE[0]}")/wv-gate-hold.sh" 2>/dev/null
+    fi
+    if declare -F wv_gate_hold_status >/dev/null \
+        && [ -n "$(cd "$root" 2>/dev/null && wv_gate_hold_status)" ]; then
+        return 1
+    fi
+    return 0
+}
+
 # wv_prepush_gate_installed — true when git will run a Weave pre-push hook in
 # this repository (core.hooksPath respected). The two-tier gate (wv-862ac0)
 # defers [heavy] suites to that hook only when this holds, and wv done treats a

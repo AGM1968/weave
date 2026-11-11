@@ -3398,7 +3398,7 @@ class TestCmdPromote:
         assert isinstance(data["promoted"], list)
 
 
-class TestCmdFindingsPromote:  # pylint: disable=too-many-public-methods
+class TestCmdFindingsPromote:  # pylint: disable=too-many-public-methods  # noqa: PLR0904
     def test_apply_requires_parent(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:

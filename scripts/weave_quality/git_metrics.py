@@ -25,6 +25,48 @@ log = logging.getLogger(__name__)
 # D3: bounded window for co-change analysis
 _CO_CHANGE_MAX_COMMITS = 500
 
+# Co-change looks for files people edit together (wv-552b86). Two kinds of
+# commit say nothing about that, yet made up the top pairs: Weave's graph state
+# (each sync adds delta files beside the node and state dumps) and bulk changes
+# (regenerated fixtures, sweeping renames or reformats). Graph-state paths are
+# dropped first; a commit still touching more files than the cap is then left
+# out whole. The changeset-size cap also bounds the per-commit pairing, which
+# is quadratic in the files a commit touches.
+_CO_CHANGE_MAX_FILES = 30
+# Graph state is WV_GRAPH_STATE_PATHS in scripts/lib/wv-checkpoint-ci.sh, the
+# files wv rewrites on its own (a test holds the two lists equal). The rest of
+# .weave/ -- test-map.conf, quality.conf, patterns/ -- is configuration people
+# edit, and its co-change with source is real.
+_GRAPH_STATE_PATHS = (
+    ".weave/state.sql",
+    ".weave/nodes.jsonl",
+    ".weave/edges.jsonl",
+    ".weave/deltas",
+    ".weave/trails.md",
+    ".weave/breadcrumbs.md",
+    ".weave/runtime.md",
+    ".weave/quality-adjudications.jsonl",
+)
+
+
+def _is_graph_state(path: str) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in _GRAPH_STATE_PATHS)
+
+
+
+# Each commit opens with this marker. No git path starts with "/", so a file
+# name can never read as one. -z keeps every path exactly as named.
+_CO_CHANGE_MARK = "/COMMIT/"
+_CO_CHANGE_LOG_ARGS = [
+    "log",
+    f"-{_CO_CHANGE_MAX_COMMITS}",
+    "--since=6 months ago",
+    "--no-merges",
+    "-z",
+    f"--format=format:{_CO_CHANGE_MARK}",
+    "--name-only",
+]
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -216,40 +258,42 @@ def build_git_stats(repo: str | Path, filepath: str) -> GitStats:
 def _parse_co_change_log(
     log_output: str,
 ) -> tuple[Counter[tuple[str, str]], dict[str, Counter[str]]]:
-    """Parse batched git log into co-change pair counts and per-file co-change maps.
+    """Parse batched `git log -z` output into co-change pair counts and per-file maps.
+
+    The input is _CO_CHANGE_LOG_ARGS output: each commit is the marker and a
+    newline, then its paths, each ending in NUL.
 
     Returns:
         pair_counts: Counter of (path_a, path_b) sorted pairs across all commits.
         per_file: dict mapping each filepath to a Counter of co-changed files.
 
-    Both structures are derived from a single parse pass so compute_co_changes
-    and file_co_changes share the same data without additional subprocess calls.
+    per_file is derived from pair_counts, so the pairing is done once.
     """
     pair_counts: Counter[tuple[str, str]] = Counter()
-    per_file: dict[str, Counter[str]] = {}
-    current_files: list[str] = []
+    current_files: set[str] = set()
 
     def _flush() -> None:
-        files = sorted(set(current_files))
+        files = sorted(f for f in current_files if not _is_graph_state(f))
+        if len(files) > _CO_CHANGE_MAX_FILES:
+            return
         for i, file_a in enumerate(files):
             for file_b in files[i + 1 :]:
                 pair_counts[(file_a, file_b)] += 1
-        # Build per-file co-change map
-        for f in files:
-            if f not in per_file:
-                per_file[f] = Counter()
-            for other in files:
-                if other != f:
-                    per_file[f][other] += 1
 
-    for line in log_output.split("\n"):
-        if line.startswith("COMMIT_SEP"):
+    for token in log_output.split("\0"):
+        if token.startswith(_CO_CHANGE_MARK):
             _flush()
-            current_files = []
-        elif line.strip():
-            current_files.append(line.strip())
+            current_files = set()
+            token = token[len(_CO_CHANGE_MARK) :].removeprefix("\n")
+        if token:
+            current_files.add(token)
 
     _flush()  # final commit
+
+    per_file: dict[str, Counter[str]] = {}
+    for (file_a, file_b), count in pair_counts.items():
+        per_file.setdefault(file_a, Counter())[file_b] += count
+        per_file.setdefault(file_b, Counter())[file_a] += count
     return pair_counts, per_file
 
 
@@ -258,22 +302,13 @@ def compute_co_changes(repo: str | Path, top_n: int = 5) -> list[CoChange]:
 
     D3 decision: bounded to last 500 commits or 6 months, whichever is less.
     D4 decision: --no-merges excludes merge commits that inflate pairs.
+    Graph paths and bulk commits are left out (_CO_CHANGE_MAX_FILES).
     Returns the top_n pairs by co-change count.
 
     Performance: single git log call replaces N per-SHA diff-tree calls
     (was ~500 subprocess spawns, now 1).
     """
-    out = _git(
-        [
-            "log",
-            f"-{_CO_CHANGE_MAX_COMMITS}",
-            "--since=6 months ago",
-            "--no-merges",
-            "--format=COMMIT_SEP%n",
-            "--name-only",
-        ],
-        cwd=repo,
-    )
+    out = _git(_CO_CHANGE_LOG_ARGS, cwd=repo)
     if not out:
         return []
 
@@ -310,17 +345,7 @@ def file_co_changes(repo: str | Path, filepath: str, top_n: int = 5) -> list[str
         return [f for f, _ in co_files.most_common(top_n)]
 
     # Fallback: single git log call for this file's commits
-    out = _git(
-        [
-            "log",
-            f"-{_CO_CHANGE_MAX_COMMITS}",
-            "--since=6 months ago",
-            "--no-merges",
-            "--format=COMMIT_SEP%n",
-            "--name-only",
-        ],
-        cwd=repo,
-    )
+    out = _git(_CO_CHANGE_LOG_ARGS, cwd=repo)
     if not out:
         return []
 

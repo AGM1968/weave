@@ -101,7 +101,8 @@ harness() {
         source '$ROOT/scripts/lib/wv-checkpoint-ci.sh'
         source '$ROOT/scripts/lib/wv-attempt-journal.sh'
         source '$ROOT/scripts/cmd/wv-cmd-graph.sh'
-        source '$ROOT/scripts/cmd/wv-cmd-ops.sh'
+        source '$ROOT/scripts/cmd/wv-cmd-orient.sh'
+        source '$ROOT/scripts/cmd/wv-cmd-doctor.sh'
         source '$ROOT/scripts/cmd/wv-cmd-gate.sh'
         source '$ROOT/scripts/cmd/wv-cmd-core.sh'
         if [ \"\$FAIL_RESOLVER\" = 1 ]; then

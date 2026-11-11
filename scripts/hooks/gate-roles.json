@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "about": "Role contract for the protected commit gate (boundary rules 1, 2 and 4; S2b, wv-7ee8fe). The gate reads HEAD's copy, never the candidate's. enforcement: path prefixes whose files the gate runs from HEAD's protected copy; each changed file under one is also judged in its own lane, which holds it as staged with HEAD's other files. invoking: files that decide how suites run or whether a recorded result is reused, including every library loaded into the hook's shell, whose environment the suites inherit; a lane changing one reruns its suites. entry_points: the git hooks among the enforcement files and the event each serves; a lane runs only the pre-commit hook, so a commit changing another entry point is refused until a repair record can admit it (S2c). external: repository paths outside enforcement that enforcement files name through REPO_ROOT, each with the role it plays.",
+  "about": "Role contract for the protected commit gate (boundary rules 1, 2 and 4; S2b, wv-7ee8fe). The gate reads HEAD's copy, never the candidate's. enforcement: path prefixes whose files the gate runs from HEAD's protected copy; each changed file under one is also judged in its own lane, which holds it as staged with HEAD's other files. invoking: files that decide how suites run or whether a recorded result is reused, including every library loaded into the hook's shell, whose environment the suites inherit; a lane changing one reruns its suites. entry_points: the git hooks among the enforcement files and the event each serves; a lane runs only the pre-commit hook, so a commit changing another entry point is refused until a repair record can admit it (S2c). external: repository paths outside enforcement that enforcement files name through REPO_ROOT, each with the role it plays. check_authority: for each check a lane may share, the external enforcement files only that check reads; each is copied for that check alone and is absent from every other stage (R-a, wv-a75d98), so a lane changing one reruns its check and shares the protected pass's suite results.",
   "enforcement": [
     "scripts/"
   ],
@@ -14,6 +14,7 @@
     "scripts/lib/wv-scratch.sh",
     "scripts/lib/wv-gate-snapshot.sh",
     "scripts/lib/wv-gate-lanes.sh",
+    "scripts/lib/wv-gate-hold.sh",
     "scripts/wv",
     "scripts/cmd/wv-cmd-gate.sh",
     "scripts/cmd/wv-cmd-graph.sh",

@@ -43,6 +43,7 @@ from weave_gh.labels import ensure_labels
 from weave_gh.models import Mode, SyncStats, WeaveNode
 from weave_gh.notify import notify
 from weave_gh.phases import (
+    CreationLimitExceeded,
     refresh_parent_body,
     sync_closed_to_weave,
     sync_github_to_weave,
@@ -107,6 +108,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Create GitHub issues even when more than WV_GH_CREATE_LIMIT "
+            "(default 25) are planned; without it such a sync refuses before "
+            "any write (wv-cb8268)."
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -142,6 +152,7 @@ def main() -> None:
         dry_run=args.dry_run,
         mode=Mode.parse(args.mode),
         focus_node_id=args.node or os.getenv("WV_ACTIVE"),
+        assume_yes=args.yes,
     )
 
 
@@ -241,6 +252,7 @@ def _run_full_sync(
     dry_run: bool = False,
     mode: Mode = Mode.FULL,
     focus_node_id: str | None = None,
+    assume_yes: bool = False,
 ) -> None:
     """Execute the bidirectional sync.
 
@@ -304,7 +316,7 @@ def _run_full_sync(
 
     # Ensure labels exist
     log.info("🏷️  Ensuring labels...")
-    ensure_labels(repo)
+    ensure_labels(repo, dry_run=dry_run)
 
     nodes_by_id = {n.id: n for n in nodes}
     stats = SyncStats(mode=mode, total_nodes=len(nodes), candidates=len(nodes))
@@ -314,19 +326,39 @@ def _run_full_sync(
     log.info("🔍 Phase 1: Weave → GitHub...")
     stats.current_phase = "phase-1-weave-to-github"
     digest_cache = load_cache()
-    issues = sync_weave_to_github(
-        nodes,
-        issues,
-        repo,
-        repo_url,
-        nodes_by_id,
-        stats,
-        dry_run=dry_run,
-        mode=mode,
-        focus_node_id=focus_node_id,
-        cache=digest_cache,
-        checkpoint=repair_checkpoint,
-    )
+    try:
+        issues = sync_weave_to_github(
+            nodes,
+            issues,
+            repo,
+            repo_url,
+            nodes_by_id,
+            stats,
+            dry_run=dry_run,
+            mode=mode,
+            focus_node_id=focus_node_id,
+            cache=digest_cache,
+            checkpoint=repair_checkpoint,
+            assume_yes=assume_yes,
+        )
+    except CreationLimitExceeded as e:
+        # Refused before Phase 1's first write (labels aside). Retrying gives
+        # the same answer, so this is an integrity refusal, not a pending step.
+        log.error(
+            "Error: this sync would create %d GitHub issue(s), above the limit of %d. "
+            "Nothing was created.",
+            len(e.planned),
+            e.limit,
+        )
+        for node in e.planned[:20]:
+            log.error("   %s [%s] %s", node.id, node.status, node.text[:80])
+        if len(e.planned) > 20:
+            log.error("   ... and %d more", len(e.planned) - 20)
+        log.error(
+            "   Review them (wv sync --gh --dry-run), then re-run with --yes, "
+            "or raise WV_GH_CREATE_LIMIT."
+        )
+        sys.exit(EXIT_INTEGRITY)
     if not dry_run:
         save_cache(digest_cache)
         if mode is Mode.REPAIR and repair_checkpoint is not None:
@@ -434,7 +466,7 @@ def _entry() -> None:
         main()
     except (subprocess.CalledProcessError, OSError):
         raise
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:  # pylint: disable=broad-exception-caught  # noqa: BLE001
         log.exception("Error: weave_gh stopped on an unexpected exception.")
         sys.exit(EXIT_INTERNAL)
 

@@ -17,6 +17,15 @@
 #   shared       exact enforcement files also serving as product; any change
 #                needs an exact prior record and still runs its candidate lane
 #   external     paths outside enforcement that enforcement files name
+#   check_authority
+#                optional; for each check a lane may share, the external
+#                enforcement files only that check reads (lane review S1,
+#                wv-a75d98). A declared file that is not invoking shares the
+#                protected pass's suite results in its lane; its own check
+#                still runs there. Absent or malformed (any type error,
+#                unknown check, or a check naming a file it does not own):
+#                the whole declaration is ignored and every external file
+#                reruns; the contract stays valid and the gate says so.
 #
 #   gate_roles_check        rules 1 and 2; on refusal sets _GATE_ROLES_WHY,
 #                           returns 1
@@ -75,6 +84,32 @@ _gate_roles_valid() {
              and ([to_entries[] | select(.value == "pre-commit") | .key]
                   | . == [] or . == ["scripts/hooks/pre-commit-weave.sh"]))
     ' >/dev/null 2>&1
+}
+
+# _GATE_AUTHORITY_JQ — jq definition of `authority`: the contract's
+# check_authority when it is well formed, else {} (lane review S1, wv-a75d98).
+# Well formed: an object whose keys are known checks, each holding a non-empty
+# subset of the files that check alone reads. Anything else is not a
+# declaration at all, so every external file reruns its suites; a malformed
+# field never shares and never refuses.
+_GATE_AUTHORITY_JQ='def authority:
+    {"release-leak-guard": ["build-release.sh", "tests/lib/release-leak-pattern.ere",
+                            "tests/test-shipped-test-refs.sh"],
+     "memory-projection": ["tests/test-memory-projection-parity.sh"]} as $own
+    | (.check_authority // {}) as $a
+    | if ($a | type) == "object"
+         and ($a | all(to_entries[]; $own[.key] as $o
+              | $o != null and (.value | type) == "array" and (.value | length) > 0
+              and (.value | all(.[]; type == "string")) and (.value - $o) == []))
+      then $a else {} end;'
+
+# _gate_authority_note <json> <whose> — say when a contract carries a
+# check_authority the gate ignores.
+_gate_authority_note() {
+    if jq -e "$_GATE_AUTHORITY_JQ"' .check_authority != null and authority != .check_authority' \
+        >/dev/null 2>&1 <<< "$1"; then
+        echo "⚠ Weave pre-commit: $2 gate role contract's check_authority is malformed, so it is ignored: every external enforcement file reruns every suite (wv-a75d98)" >&2
+    fi
 }
 
 # _gate_roles_side <side> — the contract's bytes on that side; 1 absent or
@@ -386,11 +421,15 @@ gate_roles_check() {
     esac
     # Rule 1: a later commit must not lose what this one is checked under. An
     # enforcement prefix, invoking file or entry point the candidate drops is a
-    # demotion.
+    # demotion, and so is a file it newly lets a check share (wv-a75d98).
     lost=$(jq -rn --argjson b "$base_json" --argjson i "$idx_json" \
-        '(($b.enforcement - $i.enforcement) + ($b.invoking - $i.invoking)
+        "$_GATE_AUTHORITY_JQ"'
+         def shares($c): [$c | authority | to_entries[] | .key as $k
+             | .value[] | "the full rerun of \(.) (now shared through check_authority \($k))"];
+         (($b.enforcement - $i.enforcement) + ($b.invoking - $i.invoking)
           + (($b.shared // []) - ($i.shared // []))
-          + (($b.entry_points // {} | keys) - ($i.entry_points // {} | keys)))[0] // empty') || {
+          + (($b.entry_points // {} | keys) - ($i.entry_points // {} | keys))
+          + (shares($i) - shares($b)))[0] // empty') || {
         _GATE_ROLES_WHY="could not compare the gate role contracts"; return 1; }
     if [ -n "$lost" ] && ! rec=$(gate_repair_record "$GATE_ROLES_PATH"); then
         _GATE_ROLES_WHY="the staged gate role contract drops $lost, which weakens what later commits are checked under; that needs a record (S2c, wv-d2995e)"
@@ -524,6 +563,8 @@ gate_roles_check() {
     if [ -n "$rec" ]; then
         echo "⚠ Weave pre-commit: role transition is covered by $rec; traceability, not approval, and the current gate still judges this commit" >&2
     fi
+    _gate_authority_note "$base_json" "HEAD's"
+    _gate_authority_note "$idx_json" "the staged"
     _GATE_ROLES_JSON=$base_json _GATE_ROLES_IDX_JSON=$idx_json
 }
 
@@ -557,25 +598,31 @@ gate_lanes_changed() {
     return 0
 }
 
-# gate_lanes_job_budget <jobs> <lanes> <i> — lane i's share of the pool bound.
-# Lanes run up to <jobs> at a time and each runs a suite pool of its own; with
-# the whole bound each, 3 lanes ran 12 suite jobs on 4 CPUs, no faster than 4
-# would but with every suite contended (wv-d7af8d). At most min(jobs, lanes)
-# lanes run together; they split <jobs>, the remainder going to the first, so
-# lanes running together never hold more than <jobs> jobs, and each holds one.
-gate_lanes_job_budget() {
-    local jobs=$1 lanes=$2 i=$3 together
-    together=$(( lanes < jobs ? lanes : jobs ))
-    [ "$together" -ge 1 ] || together=1
-    echo $(( jobs / together + ( i % together < jobs % together ? 1 : 0 ) ))
+# gate_lanes_slots <dir> <jobs> — the gate-wide suite budget (wv-428a92):
+# <jobs> slot files that every lane's suites take one of before they launch
+# (wv-gate-supervisor.py holds the flock). Lanes each running a pool of the
+# whole bound once ran 12 suite jobs on 4 CPUs (wv-d7af8d); fixed shares fixed
+# that but left a slot idle whenever its lane finished early or had fewer
+# suites than its share. With shared slots each lane may queue up to <jobs>
+# suites, and whichever lane has one waiting takes the next free slot.
+GATE_LANES_SCHEDULER="shared-slots"
+gate_lanes_slots() {
+    local dir=$1 jobs=$2 s
+    mkdir "$dir" || { echo "gate_lanes_slots: create $dir (status $?) — refusing" >&2; return 1; }
+    for ((s = 0; s < jobs; s++)); do
+        : > "$dir/$s" || { echo "gate_lanes_slots: create slot $s in $dir (status $?) — refusing" >&2; return 1; }
+    done
 }
 
-# _gate_lane_build <dir> <tar> <path> — the execution envelope with <path> staged.
+# _gate_lane_build <dir> <tar> <path> — the execution envelope with <path>
+# staged. An external gate file is never placed in it: the check that reads
+# one takes the lane's copy from the frozen tree (R-a, wv-a75d98).
 _gate_lane_build() {
     local d=$1 tar=$2 f=$3 blob rc=0 mode tree
     mkdir -p "$d/tree" || { echo "_gate_lane_build: create $d/tree (status $?) — refusing" >&2; return 1; }
     tar -xf "$tar" -C "$d/tree" || { echo "_gate_lane_build: extract $tar (status $?) — refusing" >&2; return 1; }
     rm -f "$d/tree/$f" || { echo "_gate_lane_build: remove $f (status $?) — refusing" >&2; return 1; }
+    case "$f" in scripts/*) ;; *) return 0 ;; esac
     blob=$(gate_blob index "$f") || rc=$?
     case "$rc" in
         0)
@@ -594,8 +641,8 @@ gate_lanes_run() {
     local work=$1 root t0 jobs i n=0 running=0 failed=0 reuse f ev tree saved _gl_pid=""
     local logs=""
     shift
-    local -a files=() pids=() reuses=() budgets=()
-    _GATE_LANES_DONE=""
+    local -a files=() pids=() reuses=()
+    _GATE_LANES_DONE="" _GATE_LANES_RUNS="" _GATE_LANES_MS="" _GATE_LANES_T0=""
     _gate_read_paths files gate_lanes_changed \
         || { echo "✗ Weave pre-commit: could not list the changed gate files (admission, status $?) — refusing" >&2; return 1; }
     [ "${#files[@]}" -gt 0 ] || return 0
@@ -622,7 +669,8 @@ gate_lanes_run() {
     if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 3 ]; }; then
         jobs=1
     fi
-    hook_progress "candidate lanes: ${#files[@]} changed gate file(s), each judged in its own lane holding it as staged and HEAD's other files (boundary rule 4), sharing $jobs suite job(s)..."
+    gate_lanes_slots "$root/slots" "$jobs" || return 1
+    hook_progress "candidate lanes: ${#files[@]} changed gate file(s), each judged in its own lane holding it as staged and HEAD's other files (boundary rule 4), sharing $jobs suite slot(s)..."
     # Finish preparation before launching any lane: a later setup refusal
     # cannot leave an earlier lane running without a supervisor to await it.
     for i in "${!files[@]}"; do
@@ -635,8 +683,16 @@ gate_lanes_run() {
             echo "✗ Weave pre-commit: this commit deletes the gate's hook ($f); retiring the gate needs a record (S2c, wv-d2995e) — refusing" >&2
             return 1
         fi
-        reuse=1
-        jq -e --arg f "$f" '.invoking | index($f) != null' >/dev/null 2>&1 <<< "$_GATE_ROLES_JSON" && reuse=0
+        # An external file shares the protected pass's suite results only when
+        # HEAD's contract declares the one check that reads it; anything else,
+        # including a contract whose check_authority is absent or malformed,
+        # reruns (N6, wv-a75d98).
+        reuse=0
+        case "$f" in
+            scripts/*) jq -e --arg f "$f" '.invoking | index($f) == null' ;;
+            *) jq -e --arg f "$f" "$_GATE_AUTHORITY_JQ"' (.invoking | index($f) == null)
+                    and ([authority[][]] | index($f) != null)' ;;
+        esac >/dev/null 2>&1 <<< "$_GATE_ROLES_JSON" && reuse=1
         # The lane mark is history (HEAD); a recovery run's lanes also carry
         # its execution tree, the code they were built from.
         if [ -n "${_PC_EXEC_TREE:-}" ]; then
@@ -648,7 +704,6 @@ gate_lanes_run() {
         printf 'path=%s\ntree=%s\nreuse=%s\n' "$f" "$WV_GATE_TREE" "$reuse" > "$root/$i/weave-gate-candidate" \
             || { echo "gate_lanes_run: mark candidate for $f (status $?) — refusing" >&2; return 1; }
         reuses[i]=$reuse
-        budgets[i]=$(gate_lanes_job_budget "$jobs" "${#files[@]}" "$i")
     done
     saved=$(trap -p INT TERM HUP)
     trap 'for _gl_pid in "${pids[@]}"; do kill -TERM "$_gl_pid" 2>/dev/null || true; done; for _gl_pid in "${pids[@]}"; do wait "$_gl_pid" 2>/dev/null || true; done; exit 130' INT TERM HUP
@@ -661,7 +716,7 @@ gate_lanes_run() {
             lt0=$(date +%s%N 2>/dev/null || echo 0)
             gate_run_bounded "candidate lane ${files[$i]}" "${WV_GATE_LANE_TIMEOUT:-7200}" \
                 env -u WV_LIB_DIR -u WV_CLI -u WV_PRECOMMIT_RUNNING -u WV_SKIP_PRECOMMIT WV_HOOK_REEXEC=1 \
-                WV_GATE_LANE_JOBS="${budgets[i]}" \
+                WV_GATE_LANE_JOBS="$jobs" WV_GATE_SLOTS="$root/slots" WV_GATE_SC_LOCK="$root/shellcheck.lock" \
                 bash "$root/$i/tree/scripts/hooks/pre-commit-weave.sh" "$@" > "$root/$i/out" 2>&1
             echo "$?" > "$root/$i/rc"
             hook_duration_ms "$lt0" > "$root/$i/ms"
@@ -676,7 +731,7 @@ gate_lanes_run() {
         n=$((n + 1))
         # Per-lane cost, so a lane that reruns its suites is measured on its
         # own rather than hidden in the total (wv-7ee8fe).
-        hook_progress "candidate lane ${files[$i]}: $([ "${reuses[$i]}" = 1 ] && echo "reused HEAD's suite results" || echo "reran its suites") with up to ${budgets[$i]} suite job(s) in $(cat "$root/$i/ms" 2>/dev/null || echo "?")ms"
+        hook_progress "candidate lane ${files[$i]}: $([ "${reuses[$i]}" = 1 ] && echo "reused HEAD's suite results" || echo "reran its suites") from $jobs shared suite slot(s) in $(cat "$root/$i/ms" 2>/dev/null || echo "?")ms"
         if [ "$(cat "$root/$i/rc" 2>/dev/null)" = "0" ]; then
             _GATE_LANES_DONE="${_GATE_LANES_DONE:+$_GATE_LANES_DONE,}${files[$i]}"
             continue
@@ -699,7 +754,18 @@ gate_lanes_run() {
             sed 's/\x1b\[[0-9;]*m//g' "$root/$i/out" 2>/dev/null | grep -v '^Weave pre-commit: ' | grep . | tail -20 | sed 's/^/    /'
         } >&2
     done
-    hook_progress "candidate lanes: $((n - failed)) of $n admitted in $(hook_duration_ms "$t0")ms"
+    _GATE_LANES_MS=$(hook_duration_ms "$t0")
+    hook_progress "candidate lanes: $((n - failed)) of $n admitted in ${_GATE_LANES_MS}ms"
+    # For the gate record (wv-3dbc11): lanes write no suite rows of their own,
+    # so without this their time is the unattributed tail of the gate's wall
+    # time (wv-241d5f). One object per lane, the ms and rc the lines above print.
+    _GATE_LANES_T0=$t0
+    _GATE_LANES_RUNS=$(for i in "${!files[@]}"; do
+        jq -cn --arg path "${files[$i]}" --arg reused "${reuses[$i]}" --arg ms "$(cat "$root/$i/ms" 2>/dev/null)" \
+            --arg jobs "$jobs" --arg rc "$(cat "$root/$i/rc" 2>/dev/null)" --arg sched "$GATE_LANES_SCHEDULER" \
+            '{path:$path, reused:($reused == "1"), ms:($ms | tonumber? // null),
+              jobs:($jobs | tonumber? // null), rc:($rc | tonumber? // null), scheduler:$sched}'
+    done | jq -cs '.' 2>/dev/null) || _GATE_LANES_RUNS=""
     rm -rf "$root"
     [ "$failed" -eq 0 ]
 }

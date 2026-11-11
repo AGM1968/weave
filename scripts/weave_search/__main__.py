@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from weave_search import definitions
+
 if TYPE_CHECKING:
     from weave_search.graph import FileContext
 
@@ -478,7 +480,7 @@ def fts_search(
     return execute_fts_search(query, db_path, limit, allowed_files).results
 
 
-def _load_vector_rows(  # pylint: disable=too-many-return-statements
+def _load_vector_rows(  # pylint: disable=too-many-return-statements  # noqa: PLR0911
     db_path: str,
     allowed_files: set[str] | None,
 ) -> tuple[list[VectorRow], str | None]:
@@ -552,7 +554,7 @@ def _rank_vector_results(rows: list[VectorRow], scores: Any, limit: int) -> list
     ]
 
 
-def execute_vector_search(  # pylint: disable=too-many-return-statements
+def execute_vector_search(  # pylint: disable=too-many-return-statements  # noqa: PLR0911
     query: str,
     db_path: str,
     limit: int = 10,
@@ -698,12 +700,13 @@ def hybrid_search(
     ).results
 
 
-def _print_json_results(
+def _print_json_results(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     results: list[SearchResult],
     graph_ctx: dict[str, FileContext],
     filter_resolution: FilterResolution | None,
     readiness: dict[str, ReadinessSignal],
     execution: SearchExecutionResult,
+    definition: definitions.DefinitionLookup,
 ) -> None:
     out = []
     for result in results:
@@ -724,6 +727,7 @@ def _print_json_results(
     print(json.dumps({
         "results": out,
         "execution": execution.disposition(),
+        **({"definition": definition.to_dict()} if definition.status != "not_identifier" else {}),
         **({"filter": filter_resolution.to_dict()} if filter_resolution else {}),
         "readiness": {key: signal.to_dict() for key, signal in readiness.items()},
     }))
@@ -844,10 +848,13 @@ def main(argv: list[str] | None = None) -> int:
         from weave_search.graph import enrich_results  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
         graph_ctx = enrich_results(results, db_path, quality_db)
 
+    definition = definitions.lookup(db_path, args.query)
     if args.json_out:
-        _print_json_results(results, graph_ctx, filter_resolution, readiness, execution)
+        _print_json_results(results, graph_ctx, filter_resolution, readiness, execution, definition)
         return 0
 
+    for line in definitions.format_text(definition):
+        print(line)
     _print_text_results(
         args.query,
         args.mode,

@@ -331,38 +331,38 @@ test_codex_runtime_uses_tmp_hot_zone() {
             *) echo "$1" ;;
         esac
     }
-    hot=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CODEX_THREAD_ID -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE CODEX_CI=1 \
+    hot=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CODEX_THREAD_ID -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT CODEX_CI=1 \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_repo_hot_zone \"\$(resolve_hot_zone)\" '$repo'" 2>/dev/null)
 
     assert_equals "in the /tmp zone" "$(_in_tmp_zone "$hot")" \
         "Codex hot zone resolves under the /tmp zone"
 
     local hot_thread
-    hot_thread=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE CODEX_THREAD_ID=thread-1 \
+    hot_thread=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT CODEX_THREAD_ID=thread-1 \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_repo_hot_zone \"\$(resolve_hot_zone)\" '$repo'" 2>/dev/null)
     assert_equals "in the /tmp zone" "$(_in_tmp_zone "$hot_thread")" \
         "Codex hot zone resolves under the /tmp zone when CODEX_THREAD_ID is set"
 
     local hot_agent
-    hot_agent=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CODEX_CI -u CODEX_THREAD_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE COPILOT_AGENT=1 \
+    hot_agent=$(env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u CODEX_CI -u CODEX_THREAD_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT COPILOT_AGENT=1 \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_repo_hot_zone \"\$(resolve_hot_zone)\" '$repo'" 2>/dev/null)
     assert_equals "in the /tmp zone" "$(_in_tmp_zone "$hot_agent")" \
         "Agent sandbox hot zone resolves under the /tmp zone when COPILOT_AGENT=1"
 
     local label
-    label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_THREAD_ID -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE CODEX_CI=1 \
+    label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_THREAD_ID -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT CODEX_CI=1 \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_runtime_label" 2>/dev/null)
     assert_equals "codex" "$label" \
         "runtime label reports codex when CODEX_CI=1"
 
     local thread_label
-    thread_label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE CODEX_THREAD_ID=thread-1 \
+    thread_label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT CODEX_THREAD_ID=thread-1 \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_runtime_label" 2>/dev/null)
     assert_equals "codex" "$thread_label" \
         "runtime label reports codex when CODEX_THREAD_ID is set"
 
     local agent_label
-    agent_label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_CI -u CODEX_THREAD_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE COPILOT_AGENT=1 \
+    agent_label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_CI -u CODEX_THREAD_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT COPILOT_AGENT=1 \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_runtime_label" 2>/dev/null)
     assert_equals "codex" "$agent_label" \
         "runtime label reports codex for agent sandbox sessions"
@@ -374,7 +374,7 @@ test_codex_runtime_uses_tmp_hot_zone() {
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_runtime_label" 2>/dev/null)
     assert_equals "codex" "$claude_label" \
         "runtime label reports the agent class for a terminal Claude Code session"
-    native_label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_CI -u CODEX_THREAD_ID -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE _WV_CONTAINER=no \
+    native_label=$(env -u WV_HOT_ZONE -u WV_DB -u CODEX_CI -u CODEX_THREAD_ID -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT _WV_CONTAINER=no \
         bash -c "source '$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_runtime_label" 2>/dev/null)
     assert_equals "native" "$native_label" \
         "runtime label reports native with every marker cleared"
@@ -988,7 +988,8 @@ test_work() {
     assert_contains "$output" "\"id\": \"$id\"" "context falls back to primary node"
 
     # Context without primary or WV_ACTIVE shows usage
-    rm -f "$WV_HOT_ZONE/primary" 2>/dev/null || true
+    # The primary is per owner (wv-43d6be): clear every owner's.
+    rm -f "$WV_HOT_ZONE"/owners/*/primary 2>/dev/null || true
     output=$("$WV" context --json 2>&1 || true)
     assert_contains "$output" "wv work" "context without ID suggests wv work"
 
@@ -1032,6 +1033,24 @@ test_list() {
     output=$("$WV" list --json 2>/dev/null)
     assert_contains "$output" "[" "list --json outputs JSON array"
     assert_contains "$output" '"id"' "list --json includes id field"
+
+    # wv-ad58d1: a lower priority number is more urgent and unset is the
+    # normal priority-2 band (docs/PROPOSAL-wv-logical-work-order.md), so
+    # P0 lists before unset and unset before P4, in every output format.
+    local p0_id p4_id order
+    p4_id=$("$WV" add "Priority four task" --status=todo --force 2>&1 | node_id_from_output)
+    p0_id=$("$WV" add "Priority zero task" --status=todo --force 2>&1 | node_id_from_output)
+    "$WV" update "$p4_id" --metadata='{"priority":4}' >/dev/null 2>&1
+    "$WV" update "$p0_id" --metadata='{"priority":0}' >/dev/null 2>&1
+    for fmt in --json --json-v2; do
+        order=$("$WV" list --status=todo "$fmt" 2>/dev/null |
+            jq -r --arg a "$p0_id" --arg b "$id1" --arg c "$p4_id" \
+                '[.[] | .id | select(. == $a or . == $b or . == $c)] | join(",")')
+        assert_equals "$p0_id,$id1,$p4_id" "$order" "list $fmt orders P0, then unset, then P4"
+    done
+    order=$("$WV" list --status=todo 2>/dev/null |
+        grep -oE -- "$p0_id|$id1|$p4_id" | paste -sd, -)
+    assert_equals "$p0_id,$id1,$p4_id" "$order" "list text orders P0, then unset, then P4"
 
     # Default list cap applies to JSON too, but must not be silent.
     for i in $(seq 1 55); do
@@ -1232,7 +1251,7 @@ test_bootstrap_agent() {
         "bootstrap-agent exposes conditional discovery routing"
     local spaced_wv spaced_routing
     spaced_wv="$TEST_DIR/wv with spaces"
-    spaced_routing=$(bash -c 'source "$1"; _bootstrap_agent_tools_json "$2"' _ "$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh" "$spaced_wv")
+    spaced_routing=$(bash -c 'source "$1"; _bootstrap_agent_tools_json "$2"' _ "$PROJECT_ROOT/scripts/cmd/wv-cmd-orient.sh" "$spaced_wv")
     assert_equals "$spaced_wv" "$(echo "$spaced_routing" | jq -r '.discovery_routing.uncertain_or_cross_node[0].argv_template[0]' 2>/dev/null || echo failed)" \
         "bootstrap-agent keeps raw executable path in argv templates"
     assert_equals "true" "$(echo "$bootstrap_json" | jq -r '.agent.tools.ast_grep | has("ready")' 2>/dev/null || echo false)" \
@@ -2510,7 +2529,7 @@ test_preflight_policy_readiness() {
     assert_equals "false" "$(echo "$idle_json" | jq -r '.policy_readiness.blocking' 2>/dev/null || echo true)" \
         "wv preflight does not block when no tracked files exist"
 
-    # --- Case 2: tracked files without quality.db block policy-sensitive completion ---
+    # --- Case 2: tracked files without quality.db: policy-sensitive, the close will scan ---
     local blocked_id blocked_json
     blocked_id=$("$WV" add "Blocked policy preflight node" --force 2>&1 | node_id_from_output)
     "$WV" work "$blocked_id" >/dev/null 2>&1
@@ -2518,12 +2537,14 @@ test_preflight_policy_readiness() {
     blocked_json=$("$WV" preflight "$blocked_id" 2>/dev/null)
     assert_equals "true" "$(echo "$blocked_json" | jq -r '.policy_readiness.policy_sensitive' 2>/dev/null || echo false)" \
         "wv preflight marks tracked-file nodes as policy-sensitive"
-    assert_equals "true" "$(echo "$blocked_json" | jq -r '.policy_readiness.blocking' 2>/dev/null || echo false)" \
-        "wv preflight blocks policy-sensitive completion when quality.db is missing"
-    assert_equals "missing" "$(echo "$blocked_json" | jq -r '.policy_readiness.quality.status' 2>/dev/null || echo unknown)" \
-        "wv preflight reports missing quality prerequisites"
+    # wv done scans an empty hot zone itself (wv-f4f431), so preflight, which the
+    # MCP close obeys, must not block on it.
+    assert_equals "false" "$(echo "$blocked_json" | jq -r '.policy_readiness.blocking' 2>/dev/null || echo true)" \
+        "wv preflight does not block when quality.db is missing: the close scans in place"
+    assert_equals "scan_on_close" "$(echo "$blocked_json" | jq -r '.policy_readiness.quality.status' 2>/dev/null || echo unknown)" \
+        "wv preflight reports that the close will scan"
     assert_contains "$(echo "$blocked_json" | jq -r '.policy_readiness.hint' 2>/dev/null || echo '')" "wv quality scan . --json" \
-        "wv preflight suggests a copy-pasteable quality scan command when policy readiness blocks"
+        "wv preflight still suggests a copy-pasteable quality scan command"
 
     # --- Case 3: quality scan data clears the policy_readiness block ---
     sqlite3 "$WV_HOT_ZONE/quality.db" "CREATE TABLE scan_meta (id INTEGER PRIMARY KEY); INSERT INTO scan_meta(id) VALUES (1);" 2>/dev/null
@@ -2578,7 +2599,9 @@ test_p2_quality_refresh() {
     setup_test_env
     "$WV" init >/dev/null 2>&1
 
-    # --- Case 1: quality.db absent + node_files pre-seeded → loud failure ---
+    # --- Case 1: quality.db absent (a reboot cleared the hot zone) → the close
+    # scans in place and succeeds (wv-f4f431; it refused before) ---
+    local quality_db="$WV_HOT_ZONE/quality.db"
     local noq_id
     noq_id=$("$WV" add "Node needing quality check" --force 2>&1 | node_id_from_output)
     "$WV" work "$noq_id" >/dev/null 2>&1
@@ -2588,35 +2611,49 @@ test_p2_quality_refresh() {
 INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$noq_id', 'src/feature.py');
 SQL
 
-    local noq_out noq_rc
+    local noq_out
     noq_out=$("$WV" "done" "$noq_id" 2>&1 || true)
-    noq_rc=$("$WV" show "$noq_id" --json 2>/dev/null | jq -r '.status' 2>/dev/null || echo "active")
-    assert_contains "$noq_out" "quality.db not found" \
-        "wv done fails loudly when quality.db is absent and node_files is non-empty"
-    assert_equals "active" "$noq_rc" \
-        "node stays active when quality.db is absent"
+    assert_contains "$noq_out" "scanning now" \
+        "wv done scans in place when quality.db is absent"
+    assert_equals "done" "$("$WV" show "$noq_id" --json 2>/dev/null | jq -r '.status' 2>/dev/null)" \
+        "the close succeeds after the in-place scan"
+    assert_equals "yes" "$(sqlite3 "$quality_db" 'SELECT COUNT(*) > 0 FROM scan_meta;' 2>/dev/null | sed 's/^1$/yes/')" \
+        "the in-place scan left scan data in quality.db"
 
-    # --- Case 2: quality.db with no scans → loud failure ---
+    # --- Case 2: quality.db with schema but no scans → scans in place too ---
+    rm -f "$quality_db" "$quality_db"-wal "$quality_db"-shm
     local noscan_id
     noscan_id=$("$WV" add "Node needing scan data" --force 2>&1 | node_id_from_output)
     "$WV" work "$noscan_id" >/dev/null 2>&1
-
     sqlite3 "$WV_DB" <<SQL
 INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$noscan_id', 'src/feature.py');
 SQL
+    sqlite3 "$quality_db" "CREATE TABLE IF NOT EXISTS scan_meta (id INTEGER PRIMARY KEY, scanned_at TEXT, git_head TEXT, files_count INTEGER, duration_ms INTEGER, scanner_version TEXT);"
+    local noscan_out
+    noscan_out=$("$WV" "done" "$noscan_id" 2>&1 || true)
+    assert_contains "$noscan_out" "scanning now" \
+        "wv done scans in place when quality.db has no scan data"
+    assert_equals "done" "$("$WV" show "$noscan_id" --json 2>/dev/null | jq -r '.status' 2>/dev/null)" \
+        "the close succeeds after scanning an empty quality.db"
 
-    # Create quality.db with schema but no scan rows.
-    local quality_db="$WV_HOT_ZONE/quality.db"
+    # --- Case 2b: the in-place scan cannot produce data → loud refusal ---
+    rm -f "$quality_db" "$quality_db"-wal "$quality_db"-shm
+    mkdir "$quality_db"  # a directory where the database belongs: the scan cannot write it
+    local noqdb_id
+    noqdb_id=$("$WV" add "Node whose scan fails" --force 2>&1 | node_id_from_output)
+    "$WV" work "$noqdb_id" >/dev/null 2>&1
+    sqlite3 "$WV_DB" "INSERT OR IGNORE INTO node_files(node_id, path) VALUES ('$noqdb_id', 'src/feature.py');"
+    local noqdb_out
+    noqdb_out=$("$WV" "done" "$noqdb_id" 2>&1 || true)
+    assert_contains "$noqdb_out" "the quality scan produced no data" \
+        "wv done refuses when the in-place scan produces nothing"
+    assert_equals "active" "$("$WV" show "$noqdb_id" --json 2>/dev/null | jq -r '.status' 2>/dev/null)" \
+        "node stays active when the in-place scan produces nothing"
+    rmdir "$quality_db"
+
+    # Hand-built quality.db for the metric cases below.
     sqlite3 "$quality_db" "CREATE TABLE IF NOT EXISTS scan_meta (id INTEGER PRIMARY KEY, scanned_at TEXT, git_head TEXT, files_count INTEGER, duration_ms INTEGER, scanner_version TEXT);"
     sqlite3 "$quality_db" "CREATE TABLE IF NOT EXISTS file_metrics (path TEXT NOT NULL, scan_id INTEGER NOT NULL, metric TEXT NOT NULL, value REAL, detail TEXT, PRIMARY KEY(path, scan_id, metric));"
-
-    local noscan_out noscan_rc
-    noscan_out=$("$WV" "done" "$noscan_id" 2>&1 || true)
-    noscan_rc=$("$WV" show "$noscan_id" --json 2>/dev/null | jq -r '.status' 2>/dev/null || echo "active")
-    assert_contains "$noscan_out" "no scan data" \
-        "wv done fails loudly when quality.db exists but has no scans"
-    assert_equals "active" "$noscan_rc" \
-        "node stays active when quality.db has no scan data"
 
     # --- Case 3: quality.db with fn_cc:* rows → mccabe_max = MAX per-function CC ---
     sqlite3 "$quality_db" "INSERT INTO scan_meta(id, scanned_at, git_head) VALUES(1, '2026-01-01T00:00:00', 'abc1234');"
@@ -3003,7 +3040,6 @@ test_done_refresh_test_status() {
             source '$PROJECT_ROOT/scripts/lib/wv-checkpoint-ci.sh'
             source '$PROJECT_ROOT/scripts/lib/wv-attempt-journal.sh'
             source '$PROJECT_ROOT/scripts/cmd/wv-cmd-graph.sh'
-            source '$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh'
             source '$PROJECT_ROOT/scripts/cmd/wv-cmd-gate.sh'
             source '$PROJECT_ROOT/scripts/cmd/wv-cmd-core.sh'
             _done_refresh_test_status '$1'
@@ -3316,24 +3352,44 @@ test_agent_identity_resolution() {
          bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
     assert_equals "explicit-id" "$id" "explicit WV_AGENT_ID wins over markers"
 
-    # 2. each harness yields a distinct identity prefix when exported alone
+    # 2. each harness yields a distinct identity prefix when exported alone.
+    # N unsets every identity marker, the neutral AI_AGENT included, so the
+    # suite resolves the same whichever harness runs it (wv-08d7f9).
+    local -a N=(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT
+        -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u WV_SESSION_ID)
     local claude codex copilot human
-    claude=$(env -u WV_AGENT_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
-             CLAUDE_CODE_SSE_PORT=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
-    codex=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u COPILOT_AGENT \
-             CODEX_CI=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
-    copilot=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI \
-             COPILOT_AGENT=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
-    human=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
-             bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    claude=$("${N[@]}" CLAUDECODE=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    codex=$("${N[@]}" CODEX_CI=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    copilot=$("${N[@]}" COPILOT_AGENT=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    human=$("${N[@]}" bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
     assert_contains "$claude" "claude-" "claude marker -> claude- identity"
     assert_contains "$codex" "codex-" "codex marker -> codex- identity"
     assert_contains "$copilot" "copilot-" "copilot marker -> copilot- identity"
+
+    # An IDE-enabled terminal exports CLAUDE_CODE_SSE_PORT to every harness it
+    # starts; it is not a Claude marker (wv-08d7f9). Alone it is a human shell,
+    # and Codex launched there resolves codex.
+    local sse_only codex_sse
+    sse_only=$("${N[@]}" CLAUDE_CODE_SSE_PORT=1 bash -c "source '$L'; resolve_agent_harness" 2>/dev/null)
+    assert_equals "human" "$sse_only" "CLAUDE_CODE_SSE_PORT alone -> human, not claude (wv-08d7f9)"
+    codex_sse=$("${N[@]}" CLAUDE_CODE_SSE_PORT=1 CODEX_THREAD_ID=t1 bash -c "source '$L'; resolve_agent_harness" 2>&1)
+    assert_equals "codex" "$codex_sse" "Codex with an inherited CLAUDE_CODE_SSE_PORT -> codex, no ambiguity (wv-08d7f9)"
+
+    # AI_AGENT names the harness (wv-08d7f9): Claude Code's versioned value keeps
+    # claude; any other value is its own [a-z0-9] label.
+    local ai_claude ai_pi ai_odd ai_human
+    ai_claude=$("${N[@]}" AI_AGENT=claude-code_2-1-318_agent bash -c "source '$L'; resolve_agent_harness" 2>/dev/null)
+    ai_pi=$("${N[@]}" CLAUDE_CODE_SSE_PORT=1 AI_AGENT=pi bash -c "source '$L'; resolve_agent_harness" 2>/dev/null)
+    ai_odd=$("${N[@]}" AI_AGENT='Foo.Bar/9' bash -c "source '$L'; resolve_agent_harness" 2>/dev/null)
+    ai_human=$("${N[@]}" AI_AGENT=human bash -c "source '$L'; resolve_agent_harness" 2>/dev/null)
+    assert_equals "claude" "$ai_claude" "AI_AGENT=claude-code_* -> claude"
+    assert_equals "pi" "$ai_pi" "AI_AGENT=pi with an inherited IDE port -> pi"
+    assert_equals "foobar9" "$ai_odd" "AI_AGENT is reduced to a lowercase [a-z0-9] label"
+    assert_equals "human" "$ai_human" "AI_AGENT=human names no harness"
     # Claude Code sets CLAUDECODE=1 in every process; CLAUDE_CODE_SSE_PORT only
     # with an IDE attached, so a plain-terminal session resolved human (wv-50640a).
     local claude_cli
-    claude_cli=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
-             CLAUDECODE=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
+    claude_cli=$("${N[@]}" CLAUDECODE=1 bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
     assert_contains "$claude_cli" "claude-" "CLAUDECODE=1 alone (no IDE) -> claude- identity"
 
     # 3. human shell does not collapse onto an agent identity
@@ -3346,21 +3402,27 @@ test_agent_identity_resolution() {
     # Claude wins the claude/codex tie (wv-4d4c96): a genuine top-level Claude Code
     # session with a stray Codex marker must not be mislabeled codex-<host>-<user>.
     local warn
-    warn=$(env -u WV_AGENT_ID -u COPILOT_AGENT CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 \
+    warn=$("${N[@]}" CLAUDECODE=1 CODEX_CI=1 \
            bash -c "source '$L'; resolve_agent_id >/dev/null" 2>&1)
     assert_contains "$warn" "ambiguous" "co-present markers emit an ambiguity diagnostic"
     assert_contains "$warn" "Set WV_AGENT_ID=claude-" "ambiguity diagnostic suggests claude, not codex, on a claude/codex tie"
 
     local claude_wins
-    claude_wins=$(env -u WV_AGENT_ID -u COPILOT_AGENT CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 \
+    claude_wins=$("${N[@]}" CLAUDECODE=1 CODEX_CI=1 \
                   bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
     assert_contains "$claude_wins" "claude-" "claude+codex co-present resolves to claude, not codex (wv-4d4c96)"
 
-    # 5. copilot still wins over both when all three are co-present (unchanged)
+    # AI_AGENT is set by the innermost agent, so pi started from a Claude Code
+    # shell (inherited CLAUDECODE=1) resolves pi, with the diagnostic.
+    local pi_in_claude
+    pi_in_claude=$("${N[@]}" CLAUDECODE=1 AI_AGENT=pi bash -c "source '$L'; resolve_agent_harness" 2>/dev/null)
+    assert_equals "pi" "$pi_in_claude" "AI_AGENT outranks an inherited CLAUDECODE (wv-08d7f9)"
+
+    # 5. copilot still wins over every other marker when co-present (unchanged)
     local copilot_wins
-    copilot_wins=$(env -u WV_AGENT_ID CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 COPILOT_AGENT=1 \
+    copilot_wins=$("${N[@]}" CLAUDECODE=1 CODEX_CI=1 COPILOT_AGENT=1 AI_AGENT=pi \
                    bash -c "source '$L'; resolve_agent_id" 2>/dev/null)
-    assert_contains "$copilot_wins" "copilot-" "copilot still wins a three-way tie"
+    assert_contains "$copilot_wins" "copilot-" "copilot still wins a multi-way tie"
 }
 
 test_delta_filename_carries_identity() {

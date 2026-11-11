@@ -104,23 +104,20 @@ gate_pool_estimates() {
 }
 
 # gate_pool_launch_order <suites-json> — the "<idx>\t<suite>\t<cost_s>" lines
-# run_hook_suites reads. Suites measured at GATE_POOL_FAST_S or less go first,
-# then the rest; within each group longest first (unmeasured count as
-# longest), so the slowest suite is not the one left running alone at the end.
-# idx keeps the selection order for the replay. Callers feed it through a
-# herestring, not <(...): `wait -n` in the pool can also be satisfied by a
-# process substitution.
-# Why the fast group first (wv-d7af8d): after a failure no new suite starts but
-# running ones finish, so a cheap suite launched last reported its failure
-# only after the long suites ended. 47 of 54 failed gates from 2026-10-01 to
-# 10-14 failed on a suite with a median of 60s or less. Simulated on those and
-# 234 green gates, 20s first cut failure verdicts by 43% for 4.4% longer green
-# runs; 60s was a net loss. That is a simulation until gates measure it.
-GATE_POOL_FAST_S=20
+# run_hook_suites reads, longest first (unmeasured count as longest), so the
+# slowest suite is not the one left running alone at the end. idx keeps the
+# selection order for the replay. Callers feed it through a herestring, not
+# <(...): `wait -n` in the pool can also be satisfied by a process substitution.
+# Not cheap-first (owner ruling 2026-11-07, wv-ab1889): c2edd58d6 launched
+# suites measured at 20s or less first, on a simulation that it would cut
+# failed-gate verdicts by 43%. Measured over the window stated in advance (52
+# failed and 222 green gates, each replayed under both orders), it made first
+# failures 9.3% later and green gates 2.9% longer: 19 of 52 failures were in
+# suites over 60s, which cheap-first starts later
+# (docs/findings/launch-order-measure-2026-11-07).
 gate_pool_launch_order() {
-    jq -r --argjson fast "$GATE_POOL_FAST_S" 'to_entries
-        | sort_by((.value.last_cost_s // 0) as $c
-            | [(if $c > 0 and $c <= $fast then 0 else 1 end), (if $c <= 0 then -1e9 else -$c end)])
+    jq -r 'to_entries
+        | sort_by((.value.last_cost_s // 0) as $c | (if $c <= 0 then -1e9 else -$c end))
         | .[] | [.key, .value.name, ((.value.last_cost_s // 0) | tostring)] | join("\t")' \
         <<< "$1" || { echo "gate_pool_launch_order: decode/order selection (status $?) — refusing" >&2; return 1; }
 }
@@ -296,8 +293,14 @@ gate_run_bounded() {
 # <end>": the suite's start and exit in epoch ms, read here as it starts and
 # exits (wv-4666cb). The suite log's ts is the drain time, written after the
 # last suite ends, so a failure's own time can only come from these.
+#
+# Under a candidate lane's shared slots (WV_GATE_SLOTS, wv-428a92) the
+# supervisor waits for a slot before it launches the suite and stamps when it
+# took one; the suite is timed from that stamp, so the ledger and the gate
+# record never count the wait as the suite's cost. A supervisor stopped while
+# waiting (exit 125, no stamp) ran nothing: the result is "skip", not a failure.
 _pc_suite_worker() {
-    local _w_t0 _w_t1 _w_rc
+    local _w_t0 _w_t1 _w_rc _w_slot _w_acq
     local WV_GATE_EXECUTION_MODE="${_pc_q_mode[$1]}"
     local plan_args=()
     [ "$WV_GATE_EXECUTION_MODE" != frozen ] || plan_args=(--plan "$_pc_out_dir/plan.json")
@@ -324,12 +327,21 @@ _pc_suite_worker() {
         WV_GATE_BASE="$_pc_suite_base" \
         WV_GATE_POOL_TAG="$_pc_pool_tag" \
         TMPDIR="$_pc_out_dir/scratch" \
+        WV_GATE_SLOT_STAMP="$_pc_out_dir/$1.slot" \
+        WV_GATE_SLOT_STOP="$_pc_out_dir/stop" \
         gate_run_bounded "$2" "${WV_GATE_TIMEOUT:-1800}" \
-        env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_SCRATCH_ROOT \
+        env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_GATE_SLOTS -u WV_GATE_SLOT_STAMP -u WV_GATE_SLOT_STOP -u WV_SCRATCH_ROOT \
         "${_pc_snapshot_args[@]}" "${plan_args[@]}" \
         --work "$_pc_out_dir/scratch/$1" --provenance "$_pc_out_dir/$1.identity.json" \
         "$2" </dev/null >"$_pc_out_dir/$1.out" 2>&1
     _w_rc=$?
+    if [ -s "$_pc_out_dir/$1.slot" ]; then
+        read -r _w_slot _w_acq < "$_pc_out_dir/$1.slot" || _w_acq=""
+        case "$_w_acq" in ''|*[!0-9]*) ;; *) _w_t0=$_w_acq ;; esac
+    elif [ "$_w_rc" = 125 ] && [ -n "${WV_GATE_SLOTS:-}" ]; then
+        printf 'skip 0 - -\n' > "$_pc_out_dir/$1.rc.tmp" && mv "$_pc_out_dir/$1.rc.tmp" "$_pc_out_dir/$1.rc"
+        return 0
+    fi
     if [ "$_w_rc" = 0 ] && [ "$WV_GATE_EXECUTION_MODE" = frozen ] \
         && ! jq -e --arg suite "$2" --slurpfile plan "$_pc_out_dir/plan.json" \
         '.suite == $suite and .tree == $plan[0].tree and .base == $plan[0].base
@@ -358,9 +370,19 @@ _pc_reap() {
         _pc_run_end[$i]="$end"
         if [ "$rc" = "0" ]; then
             hook_progress "passed ${_pc_q_suite[$i]} ($(( dur / 1000 ))s)"
+        elif [ "$rc" = "skip" ]; then
+            # Launched, but stopped while waiting for a shared slot: it ran nothing.
+            skipped="${skipped:+$skipped, }${_pc_q_suite[$i]}"
         else
             hook_progress "FAILED ${_pc_q_suite[$i]} (exit $rc, $(( dur / 1000 ))s)"
-            _pc_pool_failed=1
+            # WV_GATE_KEEP_GOING=1 (gate-preflight.sh --keep-going, wv-7df799):
+            # run every selected suite and report all failures at once. The
+            # verdict is unchanged: it comes from every suite's result below.
+            if [ "${WV_GATE_KEEP_GOING:-0}" != "1" ]; then
+                _pc_pool_failed=1
+                # Workers still waiting for a shared slot must not start now.
+                : > "$_pc_out_dir/stop"
+            fi
         fi
     done
 }
@@ -373,7 +395,7 @@ _pc_record_all() {
     local plan_args=()
     [ "${_pc_pool_record:-1}" = "0" ] && return 0
     for i in $(printf '%s\n' "${!_pc_run_done[@]}" | sort -n); do
-        [ "${_pc_run_done[$i]}" = "lost" ] && continue
+        case "${_pc_run_done[$i]}" in lost|skip) continue ;; esac
         est=""
         [ "${_pc_q_cost[$i]:-0}" -gt 0 ] 2>/dev/null && est=$(( _pc_q_cost[$i] * 1000 ))
         key=""
@@ -436,6 +458,62 @@ gate_pool_suite_mode() {
         elif (.policy.suites | has($s)) then "frozen" else "checkout" end' <<< "$_GATE_PROVISION"
 }
 
+# gate_pool_mode_reason — why this gate's suites run as they do. A mode named
+# without its cause left a consumer guessing which file to change (wv-1bc77b).
+gate_pool_mode_reason() {
+    jq -r 'if .policy == null then
+             (if .default_mode == "frozen"
+              then "legacy self-host: no .weave/gate-provision.json at the base, which carries scripts/hooks/pre-commit-weave.sh and scripts/wv"
+              else "no .weave/gate-provision.json at the base" end)
+           elif (.policy.suites | length) == 0 then ".weave/gate-provision.json at the base adopts no suites"
+           else ".weave/gate-provision.json at the base adopts \(.policy.suites | length) suite(s); the rest run in the checkout" end' \
+        <<< "$_GATE_PROVISION"
+}
+
+# gate_pool_frozen_reason <suite> — why this one suite ran frozen: the legacy
+# self-host default, or the base's declaration and the recipes it names.
+gate_pool_frozen_reason() {
+    local recipes=""
+    if jq -e '.policy == null' <<< "$_GATE_PROVISION" >/dev/null; then
+        gate_pool_mode_reason
+        return
+    fi
+    recipes=$(git -C "$REPO_ROOT" show "${_pc_suite_base:-HEAD}:.weave/gate-provision.json" 2>/dev/null \
+        | jq -r --arg s "$1" '.suites[$s].recipes // [] | join(", ")' 2>/dev/null) || recipes=""
+    printf '.weave/gate-provision.json at the base adopts it%s\n' "${recipes:+, with recipes $recipes}"
+}
+
+# gate_pool_frozen_rerun <suite> — a command that repeats the frozen run: the
+# same tree, base and private environment. "bash <suite>" runs the checkout,
+# whose untracked inputs and local tools can pass what the snapshot failed.
+gate_pool_frozen_rerun() {
+    local cmd
+    cmd=$(printf 'WV_GATE_CONTEXT=%q WV_TEST_SUITE=1 python3 -I %q --repo %q --tree %q' \
+        "${_pc_pool_context:-precommit}" "$_GATE_SUITE_LIB/wv-gate-suite.py" "$REPO_ROOT" "$_pc_suite_tree")
+    [ -z "$_pc_suite_base" ] || cmd+=$(printf ' --base %q' "$_pc_suite_base")
+    [ -z "${_PC_EXEC_TREE:-}" ] || cmd+=$(printf ' --authority %q' "$_PC_EXEC_TREE")
+    cmd+=$(printf ' --mode auto --policy %q' "$_GATE_SUITE_LIB/wv-gate-provision.json")
+    # shellcheck disable=SC2016 # the printed command expands mktemp when the user runs it
+    printf '%s --work "$(mktemp -d)/run" --provenance /dev/null %q\n' "$cmd" "$1"
+}
+
+# gate_pressure_totals — "cpu,io": the host's cumulative PSI some-stall totals
+# in microseconds, read at a gate's start and end for its record (wv-58b10e);
+# nothing where the kernel exposes no PSI. WV_PRESSURE_DIR stands in for
+# /proc/pressure in tests.
+gate_pressure_totals() {
+    local d="${WV_PRESSURE_DIR:-/proc/pressure}" kind line total out=""
+    for kind in cpu io; do
+        total=""
+        while IFS= read -r line; do
+            case "$line" in "some "*total=*) total=${line##*total=} ;; esac
+        done 2>/dev/null < "$d/$kind" || return 0
+        [[ "$total" =~ ^[0-9]+$ ]] || return 0
+        out+="${out:+,}$total"
+    done
+    printf '%s\n' "$out"
+}
+
 # gate_pool_suite_modes <suites-csv> — "suite=mode,..." for the gate record:
 # each selected route's provisioning mode, reused receipts included, so the
 # gate log can count routes still in checkout mode (transition rule 5, S4
@@ -472,7 +550,7 @@ run_hook_suites() {
         _pc_suite_base=$(git -C "$REPO_ROOT" rev-parse --verify --quiet 'HEAD^{commit}') || _pc_suite_base=""
     fi
     gate_pool_execution_mode "$_pc_suite_tree"
-    hook_progress "execution mode: $WV_GATE_EXECUTION_MODE"
+    hook_progress "execution mode: $WV_GATE_EXECUTION_MODE ($(gate_pool_mode_reason))"
     _pc_snapshot_args=(python3 -I "$_GATE_SUITE_LIB/wv-gate-suite.py" --repo "$REPO_ROOT"
         --tree "$_pc_suite_tree" --mode auto --policy "$_GATE_SUITE_LIB/wv-gate-provision.json")
     [ -z "$_pc_suite_base" ] || _pc_snapshot_args+=(--base "$_pc_suite_base")
@@ -514,7 +592,7 @@ run_hook_suites() {
     for idx in "${cand[@]}"; do names+=("${_pc_q_suite[$idx]}"); done
     if [ "${#frozen_names[@]}" -gt 0 ] && ! WV_GATE_CONTEXT="${_pc_pool_context:-precommit}" \
         PYTHONDONTWRITEBYTECODE=1 \
-        env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_SCRATCH_ROOT \
+        env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_GATE_SLOTS -u WV_GATE_SLOT_STAMP -u WV_GATE_SLOT_STOP -u WV_SCRATCH_ROOT \
         "${_pc_snapshot_args[@]}" --describe --work "$_pc_out_dir/scratch/description" \
         --provenance "$_pc_out_dir/plan.json" "${names[@]}"; then
         echo "✗ Weave gate: cannot establish frozen suite inputs — refusing" >&2
@@ -624,15 +702,24 @@ run_hook_suites() {
     # Replay failures in selection order, with the lines that name the failing
     # assertions. The full output stays on disk; passing suites' output does not.
     for i in $(printf '%s\n' "${!_pc_run_pid[@]}" | sort -n); do
-        [ "${_pc_run_done[$i]}" = "0" ] && continue
+        case "${_pc_run_done[$i]}" in 0|skip) continue ;; esac
         failed_any=1
+        # Named for the push outcome record (wv-c5500d).
+        _GATE_POOL_FAILED="${_GATE_POOL_FAILED:+$_GATE_POOL_FAILED }${_pc_q_suite[$i]}"
         echo "" >&2
         if [ "${_pc_run_done[$i]}" = "lost" ]; then
             echo "✗ ${_pc_q_suite[$i]} failed — it exited without reporting a result" >&2
         else
-            echo "✗ ${_pc_q_suite[$i]} failed (exit ${_pc_run_done[$i]}) — run manually to see details:" >&2
+            echo "✗ ${_pc_q_suite[$i]} failed (exit ${_pc_run_done[$i]})" >&2
         fi
-        echo "  bash ${_pc_q_suite[$i]}" >&2
+        if [ "${_pc_q_mode[$i]}" = frozen ]; then
+            echo "  it ran frozen, in a snapshot of the commit, not the checkout:" >&2
+            echo "  $(gate_pool_frozen_reason "${_pc_q_suite[$i]}")" >&2
+            echo "  bash ${_pc_q_suite[$i]} runs the checkout and can pass where this failed; to repeat the frozen run:" >&2
+            echo "    $(gate_pool_frozen_rerun "${_pc_q_suite[$i]}")" >&2
+        else
+            echo "  run manually to see details: bash ${_pc_q_suite[$i]}" >&2
+        fi
         if [ -s "$_pc_out_dir/$i.out" ]; then
             if grep -qiE 'No space left on device|database or disk is full|ENOSPC' "$_pc_out_dir/$i.out"; then
                 echo "  RESOURCE: failed suite output reports exhausted storage; scratch=$_pc_out_dir/scratch" >&2
@@ -649,6 +736,7 @@ run_hook_suites() {
     untagged=$(sed -n 's/^untagged\t//p' <<< "$leaks")
     leaks=$(grep -v '^untagged	' <<< "$leaks")
     for i in $(printf '%s\n' "${!_pc_run_pid[@]}" | sort -n); do
+        [ "${_pc_run_done[$i]}" = skip ] && continue
         ran="${ran:+$ran, }${_pc_q_suite[$i]}"
     done
     if [ -n "$rows" ]; then

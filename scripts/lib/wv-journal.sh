@@ -284,8 +284,8 @@ journal_clear_stale() {
 
     [ ! -f "$_WV_JOURNAL_FILE" ] || [ ! -s "$_WV_JOURNAL_FILE" ] && return 1
 
-    local stale_ts
-    stale_ts=$(jq -rs '
+    local stale stale_ts stale_op
+    stale=$(jq -rs '
         group_by(.op_id) |
         map(select(
             (map(select(.event == "begin")) | length > 0) and
@@ -294,11 +294,12 @@ journal_clear_stale() {
         if length == 0 then empty
         else
           sort_by(map(select(.event == "begin"))[0].ts) | first |
-          map(select(.event == "begin"))[0].ts
+          map(select(.event == "begin"))[0] | "\(.ts) \(.op // "unknown")"
         end
     ' "$_WV_JOURNAL_FILE" 2>/dev/null || echo "")
 
-    [ -z "$stale_ts" ] && return 1
+    [ -z "$stale" ] && return 1
+    stale_ts=${stale%% *} stale_op=${stale#* }
 
     local now op_ts age_seconds
     now=$(date -u +%s 2>/dev/null || echo "0")
@@ -307,6 +308,11 @@ journal_clear_stale() {
 
     if [ "$age_seconds" -gt "$max_age" ] 2>/dev/null; then
         : > "$_WV_JOURNAL_FILE"
+        # Clearing hides a failed operation, so record what was cleared
+        # (wv-ca3ffe): the caller reports it and wv doctor counts the log.
+        _WV_CLEARED_OP="$stale_op started $stale_ts ($((age_seconds / 60)) min ago)"
+        printf '%s %s %s\n' "$now" "$stale_op" "$age_seconds" \
+            >> "$(dirname "$_WV_JOURNAL_FILE")/cleared-ops.log" 2>/dev/null || true
         return 0
     fi
     return 1

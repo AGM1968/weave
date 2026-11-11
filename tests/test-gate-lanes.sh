@@ -91,6 +91,10 @@ HELPER_EOF
 git add -A && git -c core.hooksPath=/dev/null commit -q -m fixture
 wv add "gate lanes fixture node" --status=active --force --criteria="c1|c2" --risks=low >/dev/null 2>&1
 install -m 755 "$ROOT/scripts/hooks/pre-commit-weave.sh" .git/hooks/pre-commit
+# The recovery module beside it, where this checkout has one (wv-669900); the
+# name is assembled because the release strips that file.
+_gl_rec=pre-commit-"recovery.sh"
+[ ! -f "$ROOT/scripts/hooks/$_gl_rec" ] || install -m 644 "$ROOT/scripts/hooks/$_gl_rec" ".git/hooks/$_gl_rec"
 
 HOOK=scripts/hooks/pre-commit-weave.sh
 HELPER=scripts/lib/wv-fixture-helper.sh
@@ -170,6 +174,13 @@ check "(control) a product commit is admitted" "0" "$RC"
 [ "$RC" = 0 ] || printf '%s\n' "$OUT" | tail -25 | sed 's/^/      | /'
 hasnt "...and runs no candidate lane" "$OUT" "candidate lanes"
 check "...after the routed suite ran once" "1" "$(runs probe)"
+check "...and its gate record carries no lane fields (wv-3dbc11)" "false false false" \
+    "$(tail -1 "$WV_GATE_LOG" | jq -r '"\(has("lanes")) \(has("lanes_ms")) \(has("protected_ms"))"')"
+# The hook reads the host's PSI at the gate's start and end (wv-58b10e); a
+# kernel without PSI records none.
+check "...and the host's CPU and IO stall over the gate where the kernel has PSI" \
+    "$([ -r /proc/pressure/cpu ] && [ -r /proc/pressure/io ] && echo true || echo false)" \
+    "$(tail -1 "$WV_GATE_LOG" | jq -r '.pressure | type == "object" and has("cpu_some_share") and has("io_some_ms")')"
 
 echo "a changed gate file runs as written, in its own lane"
 reset_all; fresh scripts/lib/wv-cache.sh
@@ -178,18 +189,28 @@ gate
 check "a harmless edit to a gate file is admitted" "0" "$RC"
 has "...after its lane admitted it" "$OUT" "candidate lanes: 1 of 1 admitted"
 hasnt "...claiming no run it cannot show (R2)" "$OUT" "as written in"
-hasre "...timing that lane on its own, as reusing" "$OUT" "candidate lane scripts/lib/wv-cache\.sh: reused HEAD's suite results with up to [0-9]+ suite job\(s\) in [0-9]+ms$"
+hasre "...timing that lane on its own, as reusing" "$OUT" "candidate lane scripts/lib/wv-cache\.sh: reused HEAD's suite results from [0-9]+ shared suite slot\(s\) in [0-9]+ms$"
 check "...reusing the suite the protected lane just ran" "1" "$(runs probe)"
 check "...with one suite ledger row, the protected lane's" "$((_gl_suites + 1))" "$(lines "$WV_SUITE_LOG")"
 check "...and one gate record" "$((_gl_gates + 1))" "$(lines "$WV_GATE_LOG")"
+# The lane writes no suite row, so the gate record is where its time lives
+# (wv-3dbc11, wv-241d5f): the ms the hook printed, and the pass before it.
+_gl_ms=$(printf '%s\n' "$OUT" | sed -n 's/.*candidate lane scripts\/lib\/wv-cache\.sh: .* in \([0-9]*\)ms$/\1/p' | tail -1)
+check "...recording that lane in the gate record, as printed" "scripts/lib/wv-cache.sh true 0 ${_gl_ms:-unprinted}" \
+    "$(tail -1 "$WV_GATE_LOG" | jq -r '.lanes | if length == 1 then .[0] | "\(.path) \(.reused) \(.rc) \(.ms)" else "lanes: \(length)" end')"
+check "...with the lanes' wall and the protected pass before them" "true" \
+    "$(tail -1 "$WV_GATE_LOG" | jq -r '.lanes_ms >= .lanes[0].ms and .protected_ms >= 0
+        and .lanes_started_ms == .started_ms + .protected_ms and .protected_ms + .lanes_ms <= .duration_ms + 1')"
 
 reset_all; fresh scripts/lib/wv-gate-pool.sh
 _gl_suites=$(lines "$WV_SUITE_LOG")
 gate
 check "an edit to the code that runs suites is admitted" "0" "$RC"
 check "...and its lane runs the suite again, reusing nothing" "2" "$(runs probe)"
-hasre "...timing that lane on its own, as a rerun" "$OUT" "candidate lane scripts/lib/wv-gate-pool\.sh: reran its suites with up to [0-9]+ suite job\(s\) in [0-9]+ms$"
+hasre "...timing that lane on its own, as a rerun" "$OUT" "candidate lane scripts/lib/wv-gate-pool\.sh: reran its suites from [0-9]+ shared suite slot\(s\) in [0-9]+ms$"
 check "...while recording only the protected lane's row" "$((_gl_suites + 1))" "$(lines "$WV_SUITE_LOG")"
+check "...and the gate record names that lane as a rerun" "scripts/lib/wv-gate-pool.sh false" \
+    "$(tail -1 "$WV_GATE_LOG" | jq -r '.lanes[0] | "\(.path) \(.reused)"')"
 
 echo "R3 (wv-838349): every library loaded into the hook's shell reruns its suites"
 # Derived, not listed: the hook, followed through what each library it loads
@@ -270,11 +291,14 @@ reset_all; fresh scripts/lib/wv-cache.sh; fresh scripts/lib/wv-journal.sh; fresh
 WV_GATE_JOBS=4 gate
 check "three changed gate files are admitted" "0" "$RC"
 has "...each in its own lane" "$OUT" "candidate lanes: 3 of 3 admitted"
-check "...each timed on its own line" "3" "$(grep -cE "candidate lane scripts/lib/[a-z-]+\.sh: reused HEAD's suite results with up to [0-9]+ suite job\(s\) in [0-9]+ms$" <<< "$OUT")"
-# The lanes split the fixture's pool bound rather than each taking it all
-# (wv-d7af8d): three lanes run together, so their shares sum to 4.
-check "...sharing the bound: three lanes hold 4 suite jobs between them" "4" \
-    "$(grep -oE "candidate lane scripts/lib/[a-z-]+\.sh: reused HEAD's suite results with up to [0-9]+" <<< "$OUT" | grep -oE '[0-9]+$' | awk '{ s += $1 } END { print s }')"
+check "...each timed on its own line" "3" "$(grep -cE "candidate lane scripts/lib/[a-z-]+\.sh: reused HEAD's suite results from [0-9]+ shared suite slot\(s\) in [0-9]+ms$" <<< "$OUT")"
+# The lanes draw on one gate-wide budget rather than each taking the bound
+# (wv-d7af8d) or a fixed share of it (wv-428a92): every lane names the same 4
+# slots, and the gate record says which scheduler ran them.
+check "...sharing the bound: all three lanes draw on the same 4 slots" "4 4 4" \
+    "$(grep -oE "candidate lane scripts/lib/[a-z-]+\.sh: reused HEAD's suite results from [0-9]+" <<< "$OUT" | grep -oE '[0-9]+$' | paste -sd ' ')"
+check "...and the gate record names the shared-slot scheduler for each lane" "shared-slots shared-slots shared-slots" \
+    "$(tail -1 "$WV_GATE_LOG" | jq -r '[.lanes[].scheduler] | join(" ")')"
 
 echo "a candidate gate that cannot admit its own commit is refused"
 reset_all
@@ -862,9 +886,13 @@ reset_all; fresh scripts/lib/wv-config.sh
 rm -rf "$T/one"; mkdir -p "$T/one/tree"; git archive HEAD scripts | tar -xf - -C "$T/one/tree"
 git rev-parse HEAD > "$T/one/weave-gate-lane"
 printf 'path=scripts/lib/wv-config.sh\ntree=%s\nreuse=1\n' "$(git rev-parse 'HEAD^{tree}')" > "$T/one/weave-gate-candidate"
+# shellcheck source=tests/fixtures/gate-lanes/external-guard.sh
+source "$SCRIPT_DIR/fixtures/gate-lanes/external-guard.sh" || exit 1
+_eg_plant "$T/one/tree"
 OUT=$(env -u WV_LIB_DIR -u WV_CLI bash "$T/one/tree/$HOOK" 2>&1); RC=$?
 check "a lane that froze another tree is refused" "1" "$RC"
 has "...saying so" "$OUT" "not the protected lane's"
+_eg_check "$T/one/tree"
 
 echo "a candidate that stalls before its suite pool is bounded and leaves evidence"
 reset_all

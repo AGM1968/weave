@@ -487,8 +487,10 @@ pre-optimisation baseline.
 **Key optimisations:**
 
 - **Batch blob SHAs** — single `git ls-tree -r HEAD` replaces one `git hash-object` per file
-- **Batch co-changes** — single `git log --name-only --format=COMMIT_SEP` replaces one
-  `git diff-tree` per commit SHA (was 500+ spawns)
+- **Batch co-changes** — single `git log -z --name-only` replaces one `git diff-tree` per commit SHA
+  (was 500+ spawns). Graph-state files (`WV_GRAPH_STATE_PATHS`) are left out, and so is any commit
+  still touching more than 30 files, the usual changeset-size cap. Both say nothing about which
+  files people edit together, and they had filled every top pair.
 - **Single-pass AST** — `_single_pass_ast()` collects CC, ev, function list, imports, and class
   nodes in one walk; eliminates 4 of 7 redundant top-level `ast.walk` calls
 - **Batch git stats** — single `git log` pass for churn/authors/ownership (established in v1.7.1)

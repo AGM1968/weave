@@ -24,6 +24,20 @@
 _WV_PRE_TOOL_USE_LOADED=1
 _PTU_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# _ptu_install_wait -- once per process, wait (up to 10 s) while an
+# ./install.sh holds $CONFIG_DIR/.install-in-progress, so the libraries below
+# all come from one side of the install (wv-f854f6; the lock is described in
+# install.sh). The installer's own children carry WV_INSTALLING and skip.
+_ptu_install_wait() {
+    [ -z "${WV_INSTALLING:-}" ] && [ -z "${_WV_INSTALL_WAITED:-}" ] || return 0
+    _WV_INSTALL_WAITED=1
+    local lock="${WV_CONFIG_DIR:-${HOME}/.config/weave}/.install-in-progress" i=0
+    while [ "$i" -lt 100 ] && [ -f "$lock" ] && kill -0 "$(cat "$lock" 2>/dev/null)" 2>/dev/null; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+}
+
 # _ptu_source <lib> -- load a library from beside this file, then from the
 # installed locations. Readable is not loadable, and a copy that dies part way
 # has already set its double-source guard: leaving it set makes every fallback
@@ -31,6 +45,7 @@ _PTU_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # _hc_* call with 127, which PreToolUse reads as ALLOW (wv-769c69).
 _ptu_source() {
     local lib="$1" dir guard
+    _ptu_install_wait
     for dir in "$_PTU_LIB_DIR" "${HOME}/.config/weave/lib" "${HOME}/.local/lib/weave/lib"; do
         [ -r "$dir/$lib.sh" ] || continue
         # shellcheck source=/dev/null
@@ -75,7 +90,7 @@ _ptu_terminal_payload() {
 # patchText and patch are older shapes, still read.
 _ptu_input_paths() {
     local tool="$1" tool_input="$2" path patch
-    path=$(printf '%s' "$tool_input" | jq -r '.file_path // .filePath // .path // empty' 2>/dev/null)
+    path=$(printf '%s' "$tool_input" | jq -r '.file_path // .filePath // .notebook_path // .path // empty' 2>/dev/null)
     [ -z "$path" ] || printf '%s\n' "$path"
 
     [ "$tool" = "apply_patch" ] || return 0
@@ -83,6 +98,50 @@ _ptu_input_paths() {
     [ -n "$patch" ] || return 0
     printf '%s\n' "$patch" | sed -nE \
         's/^\*\*\* (Add File|Update File|Delete File|Move to): (.*)$/\2/p'
+}
+
+# _ptu_edit_repo <tool> <tool_input> -- the git toplevel of the checkout the
+# call's first path is in, when that checkout keeps a Weave graph; else nothing.
+# A path that does not exist yet (Write creates it) is placed by its nearest
+# existing ancestor.
+_ptu_edit_repo() {
+    local p d top
+    p=$(_ptu_input_paths "$1" "$2" | head -n 1)
+    [ -n "$p" ] || return 0
+    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+    d=$(dirname -- "$p")
+    while [ ! -d "$d" ] && [ "$d" != / ]; do d=$(dirname -- "$d"); done
+    top=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || return 0
+    [ -n "$top" ] && [ -d "$top/.weave" ] && printf '%s\n' "$top"
+    return 0
+}
+
+# _ptu_fail_closed <reason> -- the edit guard could not run. It used to exit 0
+# with a warning, so a half-installed library or a missing graph database
+# admitted every edit with no claim (wv-187945). Owner ruling 2026-11-03: an
+# edit to a file in a Weave checkout is blocked (exit 2) with the fix named;
+# a non-edit tool, or a file in no Weave checkout, passes with the warning,
+# since there is no claim to enforce there. Reads TOOL, TOOL_INPUT and
+# _ptu_repo (the edited file's checkout) from the guard. The fix is Bash, which
+# this guard does not block.
+_ptu_fail_closed() {
+    local reason="$1" root fix="wv self-update, then wv init-repo --update"
+    case "${TOOL:-}" in
+        Edit|Write|MultiEdit|NotebookEdit|apply_patch) ;;
+        *) echo "⚠ Weave guard inactive: $reason" >&2; exit 0 ;;
+    esac
+    root="${_ptu_repo:-}"
+    if [ -z "$root" ] && [ -z "$(_ptu_input_paths "$TOOL" "${TOOL_INPUT:-}")" ]; then
+        root=$(git rev-parse --show-toplevel 2>/dev/null) || root=""
+    fi
+    if [ -z "$root" ] || [ ! -d "$root/.weave" ]; then
+        echo "⚠ Weave guard inactive: $reason" >&2
+        exit 0
+    fi
+    [ "$(git -C "$root" ls-tree HEAD -- install.sh scripts/wv 2>/dev/null | wc -l)" -eq 2 ] && fix="./install.sh"
+    echo "🛑 Weave edit guard could not run: $reason." >&2
+    echo "   Edits in $root are blocked until it can. Fix: $fix (wv-187945)." >&2
+    exit 2
 }
 
 # ─── Edit guard (was pre-action.sh) ──────────────────────────────────────────
@@ -102,11 +161,26 @@ wv_ptu_edit_guard() (
     TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
     TOOL_INPUT=$(echo "$INPUT" | jq -r '.tool_input // empty' 2>/dev/null)
 
+    # Judge the edit against the graph of the checkout the file is in, not the
+    # hook's cwd (wv-455739). A harness pinned to one checkout guarded an edit
+    # in a linked worktree with the first checkout's graph, so a peer's claim
+    # there admitted it. When they differ, run from the file's checkout and let
+    # project and hot zone resolve afresh -- both resolvers read the cwd.
+    _ptu_repo=$(_ptu_edit_repo "$TOOL" "$TOOL_INPUT")
+    if [ -n "$_ptu_repo" ] && [ "$_ptu_repo" != "$(git rev-parse --show-toplevel 2>/dev/null)" ]; then
+        cd "$_ptu_repo" || _ptu_fail_closed "cannot enter $_ptu_repo"
+        unset WV_PROJECT_DIR WV_HOT_ZONE WV_DB
+    fi
+
     # Order matters: wv-resolve-project sets the WV_PROJECT_DIR wv-resolve-runtime reads.
-    _ptu_source wv-resolve-project || exit 0
+    # A library that will not load fails closed for an edit (wv-187945).
+    _ptu_source wv-resolve-project || _ptu_fail_closed "wv-resolve-project.sh could not be loaded"
     for _lib in wv-validate wv-config wv-hook-common; do _ptu_source "$_lib" || true; done
-    _ptu_source wv-resolve-runtime || exit 0
-    command -v _hc_refresh >/dev/null 2>&1 || { _ptu_root=$(git rev-parse --show-toplevel 2>/dev/null); _ptu_fix="wv self-update, then wv init-repo --update"; [ "$(git -C "$_ptu_root" ls-tree HEAD -- install.sh scripts/wv 2>/dev/null | wc -l)" -eq 2 ] && _ptu_fix="./install.sh"; echo "⚠ Weave guard inactive: wv-hook-common.sh could not be loaded — run $_ptu_fix (wv-376de3)" >&2; exit 0; }; _hc_refresh
+    _ptu_source wv-resolve-runtime || _ptu_fail_closed "wv-resolve-runtime.sh could not be loaded"
+    declare -F wv_adopt_hook_session_id >/dev/null && wv_adopt_hook_session_id "${1:-}"
+    command -v _hc_refresh >/dev/null 2>&1 \
+        || _ptu_fail_closed "wv-hook-common.sh could not be loaded (wv-376de3)"
+    _hc_refresh
 
     # Liveness heartbeat (wv-4efe06): the last tool call's time. Session start
     # compares it with stop-check's last stop record to tell a session that died
@@ -131,9 +205,12 @@ wv_ptu_edit_guard() (
     [ "${_HC_BYPASS_CMD:-false}" = true ] && exit 0
     [ "${_HC_SHOULD_CHECK:-false}" = false ] && exit 0
 
-    if [ -z "${WV_PROJECT_DIR:-}" ] || [ ! -d "${WV_PROJECT_DIR}/.weave" ] || [ ! -x "$WV" ]; then exit 0; fi
-
-    _hc_db_preflight || exit 0
+    # No Weave project here is a decision, not a failure: nothing to enforce.
+    if [ -z "${WV_PROJECT_DIR:-}" ] || [ ! -d "${WV_PROJECT_DIR}/.weave" ]; then exit 0; fi
+    # A Weave project the guard cannot judge fails closed for an edit (wv-187945).
+    [ -x "$WV" ] || _ptu_fail_closed "no runnable wv for ${WV_PROJECT_DIR} (looked for ${WV})"
+    _hc_db_preflight \
+        || _ptu_fail_closed "the graph database ${_HC_DB:-} is missing; run any wv command (e.g. wv status) to load it"
     _hc_init_hygiene_tally "$TOOL"
 
     PHASE_RC=0  # _hc_check_phase: 2 blocks the edit, other nonzero means stop-and-allow
@@ -149,13 +226,17 @@ wv_ptu_edit_guard() (
     _hc_check_context_pack "$_HC_NODE_ID" || exit $?
     if [ "${_HC_CONTEXT_STAMP_HIT:-false}" = true ]; then
         [ "${WV_PTU_RECHECK_STAMP:-0}" = 1 ] || exit 0
-        rm -f "${_HC_HOT_ZONE}/.context_checked_${_HC_NODE_ID}" 2>/dev/null || true
+        rm -f "$(resolve_context_stamp "$_HC_NODE_ID" "$_HC_HOT_ZONE")" 2>/dev/null || true
         _hc_check_context_pack "$_HC_NODE_ID" || exit $?
     fi
     _hc_check_contradictions "$_HC_NODE_ID" || exit $?
     _hc_check_blockers "$_HC_NODE_ID" || exit $?
 
-    touch "${_HC_HOT_ZONE}/.context_checked_${_HC_NODE_ID}" 2>/dev/null || true
+    # The stamp is this owner's (wv-43d6be): it never satisfies another session.
+    local _ptu_stamp
+    if _ptu_stamp=$(resolve_context_stamp "$_HC_NODE_ID" "$_HC_HOT_ZONE"); then
+        { (umask 077 && mkdir -p "${_ptu_stamp%/*}") && touch "$_ptu_stamp"; } 2>/dev/null || true
+    fi
     exit 0
 )
 

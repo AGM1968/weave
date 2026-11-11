@@ -102,6 +102,8 @@ cmd_block() {
 
     # Invalidate context cache for affected nodes
     invalidate_context_cache "$id" "$blocker"
+    # Publish the change, as every mutating command does (wv-851fb4).
+    auto_sync_or_warn >&2
 
     echo -e "${GREEN}✓${NC} $id is now blocked by $blocker"
 
@@ -253,6 +255,8 @@ cmd_link() {
 
     # Invalidate context cache for affected  nodes
     invalidate_context_cache "$from" "$to"
+    # Publish the change, as every mutating command does (wv-851fb4).
+    auto_sync_or_warn >&2
 
     echo -e "${GREEN}✓${NC} Linked: $from --[$edge_type]--> $to (weight: $weight)" >&2
 }
@@ -307,6 +311,8 @@ cmd_unlink() {
 
     # Evict context cache for both nodes
     invalidate_context_cache "$from" "$to"
+    # Publish the change, as every mutating command does (wv-851fb4).
+    auto_sync_or_warn >&2
 
     echo -e "${GREEN}✓${NC} Unlinked: $from --[$edge_type]--> $to" >&2
 }
@@ -501,6 +507,8 @@ cmd_resolve() {
 
     # Invalidate context cache for affected nodes
     invalidate_context_cache "$node1" "$node2" "${winner:-}" "${new_id:-}"
+    # Publish the change, as every mutating command does (wv-851fb4).
+    auto_sync_or_warn >&2
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

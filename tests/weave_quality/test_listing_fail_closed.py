@@ -435,7 +435,7 @@ def test_policy_scan_reports_an_unlistable_directory(tmp_path: Path, locked: lis
 
 
 def test_coaching_manifest_refuses_an_unlistable_rule_directory(tmp_path: Path, locked: list[Path]) -> None:
-    from weave_quality.coaching_evidence import _package_rule_manifest  # pylint: disable=import-outside-toplevel
+    from weave_quality.coaching_evidence import _package_rule_manifest  # pylint: disable=import-outside-toplevel  # noqa: PLC0415
     copied = tmp_path / "default_patterns"
     copied.mkdir()
     for path in directory_entries(REPO_ROOT / "scripts" / "weave_quality" / "default_patterns"):

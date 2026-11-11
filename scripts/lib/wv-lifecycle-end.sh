@@ -20,10 +20,24 @@
 _WV_LIFECYCLE_END_LOADED=1
 _LE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# _le_install_wait -- once per process, wait (up to 10 s) while an
+# ./install.sh holds $CONFIG_DIR/.install-in-progress (wv-f854f6; the lock is
+# described in install.sh). The installer's own children skip it.
+_le_install_wait() {
+    [ -z "${WV_INSTALLING:-}" ] && [ -z "${_WV_INSTALL_WAITED:-}" ] || return 0
+    _WV_INSTALL_WAITED=1
+    local lock="${WV_CONFIG_DIR:-${HOME}/.config/weave}/.install-in-progress" i=0
+    while [ "$i" -lt 100 ] && [ -f "$lock" ] && kill -0 "$(cat "$lock" 2>/dev/null)" 2>/dev/null; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+}
+
 # _le_source <lib> -- load a library from beside this file, then from the
 # installed locations, falling through a copy that fails to load.
 _le_source() {
     local lib="$1" dir guard rc
+    _le_install_wait
     for dir in "$_LE_LIB_DIR" "${HOME}/.config/weave/lib" "${HOME}/.local/lib/weave/lib"; do
         [ -r "$dir/$lib.sh" ] || continue
         rc=0
@@ -52,14 +66,8 @@ _le_tag_hook() {
 # configuration stays in the tree, and without the helpers nothing is committed.
 # Prints nothing; returns 0 whether or not it committed.
 _le_checkpoint_commit() {
-    local message="$1" no_verify="${2:-}" prestaged="" skip_ci
-    if ! command -v wv_stage_graph_state >/dev/null 2>&1; then
-        prestaged="checkpoint helpers unavailable"
-    elif [ "${WV_CHECKPOINT_ALL:-0}" != "1" ]; then
-        # A failed listing is not "nothing staged" (wv-9c6ae1).
-        prestaged=$(wv_staged_non_graph_state "$PWD") || prestaged="staged files could not be listed"
-    fi
-    [ -z "$prestaged" ] || return 0
+    local message="$1" no_verify="${2:-}" skip_ci
+    _le_checkpoint_may_commit || return 0
     wv_stage_graph_state "$PWD" 2>/dev/null || true
     git diff --cached --quiet 2>/dev/null && return 0
     # wv-e937f8: [skip ci] applies to the whole PUSH at its tip, not just this
@@ -68,18 +76,79 @@ _le_checkpoint_commit() {
     # NOT skipping CI when the marker helper is unavailable or fails.
     skip_ci=$(command -v wv_checkpoint_ci_marker >/dev/null 2>&1 \
         && wv_checkpoint_ci_marker "$PWD" || echo "")
-    # The shared rule (wv-checkpoint-ci.sh): an unpushed weave-only checkpoint
-    # that no in-flight push is publishing (wv-13db30). Without the helper,
-    # never amend.
-    if command -v wv_checkpoint_amendable >/dev/null 2>&1 && wv_checkpoint_amendable "$PWD"; then
-        # HEAD is an unpushed weave-only checkpoint -- safe to amend.
-        WV_AUTO_CHECKPOINT_ACTIVE=1 git commit --amend --no-edit ${no_verify:+"$no_verify"} >/dev/null 2>&1 || \
-            WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "$message $(date +%H:%M)${skip_ci}" ${no_verify:+"$no_verify"} >/dev/null 2>&1 || true
-    else
-        WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "$message $(date +%H:%M)${skip_ci}" ${no_verify:+"$no_verify"} >/dev/null 2>&1 || true
-    fi
+    _le_checkpoint_write "$message $(date +%H:%M)${skip_ci}" "$no_verify"
     # Stamp the checkpoint so auto_checkpoint sees this commit.
     date +%s > "${_HC_HOT_ZONE:-}/.last_checkpoint" 2>/dev/null || true
+}
+
+# _le_checkpoint_may_commit -- true when a checkpoint may commit here: the
+# switches allow it, the helpers are loaded, and nothing outside graph state
+# is already staged (wv-c35b61, split out of _le_checkpoint_commit).
+_le_checkpoint_may_commit() {
+    local prestaged
+    # WV_AUTO_CHECKPOINT=0 or the hold file stop this commit as they stop
+    # auto_checkpoint (wv-fbbdff). The variable is read directly so it holds
+    # without the helpers too; without them nothing is committed anyway.
+    [ "${WV_AUTO_CHECKPOINT:-1}" != "0" ] || return 1
+    if command -v wv_auto_commit_enabled >/dev/null 2>&1 && ! wv_auto_commit_enabled "$PWD"; then
+        return 1
+    fi
+    command -v wv_stage_graph_state >/dev/null 2>&1 || return 1
+    [ "${WV_CHECKPOINT_ALL:-0}" != "1" ] || return 0
+    # A failed listing is not "nothing staged" (wv-9c6ae1).
+    prestaged=$(wv_staged_non_graph_state "$PWD") || return 1
+    [ -z "$prestaged" ]
+}
+
+# _le_checkpoint_write <subject> [--no-verify] -- commit what is staged,
+# amending HEAD under the shared rule (wv-checkpoint-ci.sh): an unpushed
+# weave-only checkpoint that no in-flight push is publishing (wv-13db30).
+# Without the helper, never amend. A failed amend falls back to a new commit.
+_le_checkpoint_write() {
+    local subject="$1" no_verify="${2:-}"
+    if command -v wv_checkpoint_amendable >/dev/null 2>&1 && wv_checkpoint_amendable "$PWD"; then
+        # HEAD is an unpushed weave-only checkpoint -- safe to amend.
+        WV_AUTO_CHECKPOINT_ACTIVE=1 git commit --amend --no-edit ${no_verify:+"$no_verify"} >/dev/null 2>&1 && return 0
+    fi
+    WV_AUTO_CHECKPOINT_ACTIVE=1 git commit -m "$subject" ${no_verify:+"$no_verify"} >/dev/null 2>&1 || true
+}
+
+# _sc_inflight <self> -- one line naming work in flight on this checkout that
+# an open node may be waiting on, or nothing (wv-e229c8): this identity's live
+# gate holder (wv_gate_hold_status, wv-c5500d), else a running git commit or
+# git push whose working directory is this checkout (a gate before it takes
+# the lock, or a push's network phase after it). An empty <self> (identity
+# unverifiable) never matches a holder.
+_sc_inflight() {
+    local out
+    out=$(_sc_inflight_holder "$1")
+    [ -n "$out" ] || out=$(_sc_inflight_git)
+    [ -n "$out" ] && printf '%s\n' "$out"
+    return 0
+}
+
+# _sc_inflight_holder <self> -- this checkout's live gate holder when <self> holds it.
+_sc_inflight_holder() {
+    local holder
+    [ -n "$1" ] || return 0
+    _le_source wv-gate-hold && declare -F wv_gate_hold_status >/dev/null || return 0
+    holder=$(wv_gate_hold_status 2>/dev/null)
+    [ -n "$holder" ] && [ "$(jq -r '.agent_id // ""' <<< "$holder" 2>/dev/null)" = "$1" ] || return 0
+    jq -r '"\(.kind // "gate") gate pid \(.pid) since \(.started_at // "?")\(if (.subject // "") == "" then "" else " (\(.subject))" end)"' <<< "$holder" 2>/dev/null
+}
+
+# _sc_inflight_git -- a running git commit or push whose cwd is this checkout.
+_sc_inflight_git() {
+    local top pid args cwd
+    top=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+    for pid in $(pgrep -x git 2>/dev/null); do
+        args=$(ps -o args= -p "$pid" 2>/dev/null) || continue
+        case " $args " in *" push "*|*" commit "*) ;; *) continue ;; esac
+        cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+        [ "$cwd" = "$top" ] || continue
+        printf 'git pid %s: %s\n' "$pid" "$args"
+        return 0
+    done
 }
 
 # wv_stop_guard <input> -- the session-end guard.
@@ -91,8 +160,9 @@ _le_checkpoint_commit() {
 # Soft warn (stderr, never blocks): uncommitted changes, unsaved weave state,
 #   unpushed commits.
 #
-# No network calls -- wv sync / git push run in SessionEnd or by hand.
-# Auto-push was removed (wv-52bf05): wv sync --gh has no timeout, causing
+# No network calls -- wv sync --gh and git push run by hand (SessionEnd does
+# neither since wv-a32e69). Auto-push was removed (wv-52bf05): wv sync --gh
+# has no timeout, causing
 # indefinite stalls on every response when the network is slow.
 wv_stop_guard() (
     set -e; set +u
@@ -105,7 +175,9 @@ wv_stop_guard() (
 
     _le_source wv-resolve-project || exit 0
     _le_source wv-hook-common || true
+    declare -F wv_adopt_hook_session_id >/dev/null && wv_adopt_hook_session_id "${1:-}"
     declare -F _hc_refresh >/dev/null && _hc_refresh
+    declare -F wv_hook_run_begin >/dev/null && wv_hook_run_begin Stop
     cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
     _WV="${WV:-wv}"
     [ -x "$_WV" ] || command -v "$_WV" >/dev/null 2>&1 || _WV=""
@@ -120,6 +192,8 @@ wv_stop_guard() (
         local rc=$?
         [ -d "${_HC_HOT_ZONE:-}" ] && printf '%s %s\n' "$(date +%s)" \
             "$([ "$_SC_BLOCKED" = true ] && echo blocked || echo stopped)" > "${_HC_HOT_ZONE}/.session_laststop" 2>/dev/null
+        # This trap replaces the completion stamp's (wv-ca3ffe): stamp here.
+        declare -F wv_hook_run_end >/dev/null && wv_hook_run_end "$rc"
         return "$rc"
     }
     trap _sc_record_stop EXIT
@@ -160,8 +234,10 @@ wv_stop_guard() (
     # Unclaimed nodes still count (defensive default).
     if [ -n "$_WV" ]; then
         _SC_SELF=""
-        if command -v resolve_agent_id >/dev/null 2>&1; then
-            _SC_SELF=$(resolve_agent_id 2>/dev/null || echo "")
+        # An unverifiable session identity leaves _SC_SELF empty, so the guard
+        # counts every active node (fail closed, wv-99978b).
+        if command -v require_agent_id >/dev/null 2>&1; then
+            _SC_SELF=$(require_agent_id 2>/dev/null) || _SC_SELF=""
         fi
         if [ -n "$_SC_SELF" ]; then
             ACTIVE_COUNT=$("$_WV" query status=active --format=json 2>/dev/null \
@@ -170,7 +246,15 @@ wv_stop_guard() (
             # Agent identity unavailable -- fall back to the global count.
             ACTIVE_COUNT=$("$_WV" query status=active --format=json 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
         fi
-        if [ "${ACTIVE_COUNT:-0}" -gt 0 ]; then
+        # A node held open while its own gate or push runs is waiting on work
+        # this hook can see: allow the stop with a note naming it, and arm no
+        # cooldown (wv-e229c8). The 120s cooldown is shorter than any gate, so
+        # blocking here re-blocked every turn of the wait.
+        _SC_INFLIGHT=""
+        [ "${ACTIVE_COUNT:-0}" -gt 0 ] && _SC_INFLIGHT=$(_sc_inflight "$_SC_SELF")
+        if [ -n "$_SC_INFLIGHT" ]; then
+            echo "Note: $ACTIVE_COUNT active node(s) left open while work runs on this checkout: $_SC_INFLIGHT. Close with wv done once it finishes." >&2
+        elif [ "${ACTIVE_COUNT:-0}" -gt 0 ]; then
             if [ "$_SC_IN_COOLDOWN" = true ]; then
                 echo "Note: $ACTIVE_COUNT active node(s) — close with wv done before ending session (cooldown active)." >&2
             else
@@ -189,7 +273,10 @@ wv_stop_guard() (
 
     # Uncommitted changes (excluding .weave/ -- infrastructure files
     # auto-committed by auto_checkpoint/SessionEnd, not user work).
-    UNCOMMITTED=$(git status --porcelain 2>/dev/null | grep -vc '\.weave/' || true)
+    # One status walk serves both checks (wv-3125a9); printf '%s' adds no
+    # newline, so a clean tree counts 0, not one empty line.
+    PORCELAIN=$(git status --porcelain 2>/dev/null || true)
+    UNCOMMITTED=$(printf '%s' "$PORCELAIN" | grep -vc '\.weave/' || true)
     if [ "$UNCOMMITTED" -gt 0 ]; then
         echo "Note: $UNCOMMITTED uncommitted change(s). Commit and push before ending your session." >&2
         exit 0
@@ -198,7 +285,7 @@ wv_stop_guard() (
     # Dirty .weave/ state (sync not yet run). Excludes .weave/deltas/ -- delta
     # files are auto-committed by auto_checkpoint and would otherwise trigger
     # the weave-dirty warning on every response.
-    WEAVE_DIRTY=$(git status --porcelain 2>/dev/null | grep '\.weave/' | grep -vc '\.weave/deltas/' || true)
+    WEAVE_DIRTY=$(printf '%s' "$PORCELAIN" | grep '\.weave/' | grep -vc '\.weave/deltas/' || true)
     # shellcheck disable=SC1083  # @{u} is a git refspec, not a literal brace
     AHEAD=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
 
@@ -242,58 +329,57 @@ wv_stop_guard() (
     exit 0
 )
 
-# wv_session_end_sync <input> -- final sync before exit: prune, sync, commit
-# graph state, push, and clear the crash sentinel (v1.16.0).
+# wv_session_end_sync <input> -- the local steps before exit: prune, flush
+# state.sql, commit graph state, and clear the crash sentinel (v1.16.0).
+#
+# Only steps that finish in seconds run here (wv-a32e69, owner ruling
+# 2026-11-05). The routine stopped completing: .claude/session.log, written by
+# its last step, has no entry after 2026-03-10 for any end reason (/exit,
+# /clear or other), the GitHub sync that ran here finished in 2 of 13 recorded
+# ends and left a half-finished sync journal behind the rest, and the push ran
+# the pre-push gate, which takes minutes. SessionEnd also fires on /clear, in
+# the middle of a session. Syncing GitHub (wv sync --gh) and pushing belong to
+# the session's own work or the operator; the graph state stays committed
+# locally until then.
 wv_session_end_sync() (
     set -e; set +u
     _le_tag_hook
     INPUT="$1"
     _le_source wv-resolve-project || exit 0
     _le_source wv-hook-common || true
+    declare -F wv_adopt_hook_session_id >/dev/null && wv_adopt_hook_session_id "${1:-}"
     declare -F _hc_refresh >/dev/null && _hc_refresh
+    declare -F wv_hook_run_begin >/dev/null && wv_hook_run_begin SessionEnd
     declare -F wv_stage_graph_state >/dev/null || _le_source wv-checkpoint-ci || true
     REASON=$(printf '%s' "$INPUT" | jq -r '.reason // "unknown"' 2>/dev/null || echo unknown)
     cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
 
-    # Prune before sync so the baseline captures prune state. Without this
-    # ordering, pruned nodes reappear on next load (state.sql is dumped
-    # pre-prune, and prune DELETEs are suppressed from deltas).
-    if [ -x "$WV" ]; then
-        "$WV" prune --age=48h >/dev/null 2>&1 || true
-    fi
+    # No prune here (owner ruling 2026-11-09, wv-68c882). A session end used to
+    # run 'wv prune --age=48h' unattended (added 2026-02-03 as housekeeping,
+    # wv-1748); on 2026-11-09 it removed a 615-node backlog, including nodes live
+    # work still cited, and its tombstones were lost, so every fresh load failed
+    # (wv-5e5f18). It prevented no independent mistake: its only fix (wv-902612,
+    # prune before sync) repaired a resurrection it caused itself. Prune is an
+    # explicit command; 'wv prune' writes its tombstones and re-dumps state.sql.
 
-    # Sync Weave state to the git layer + GitHub issue state (best effort).
-    # Fast mode is bounded to the union of impacted sets for active nodes; run
-    # `wv sync --gh --mode=full` for an exhaustive reconcile.
+    # Local state flush: a plain wv sync force-dumps the full DB, so wv load
+    # on the next session (including post-reboot) does not restore stale
+    # active-node status. WV_CHECKPOINT_PULL=0: the sync's auto-checkpoint
+    # otherwise pulls with up to five retries and ~34 s of backoff, which an
+    # unreachable remote spent in full (33 s measured), past the hook budget,
+    # killing the sync inside its journal (wv-a32e69). Nothing is pushed here,
+    # so nothing needs pulling.
     if [ -x "$WV" ]; then
-        "$WV" sync --gh --mode=fast >/dev/null 2>&1 || true
-    fi
-
-    # Local state flush: state.sql reflects the current DB whatever the GH sync
-    # did. wv sync --gh may skip nodes outside the fast-mode impacted set; a
-    # plain wv sync force-dumps the full DB so wv load on the next session
-    # (including post-reboot) does not restore stale active-node status.
-    if [ -x "$WV" ]; then
-        "$WV" sync >/dev/null 2>&1 || true
+        WV_CHECKPOINT_PULL=0 "$WV" sync >/dev/null 2>&1 || true
     fi
 
     # Commit .weave/ state to break the drift cycle (prevents stop-check
     # warning on dirty .weave/ from the sync/prune above).
     _le_checkpoint_commit "chore(weave): auto-checkpoint"
 
-    # Push with exponential backoff (multi-agent contention). Skip when no
-    # remote is configured (test environments, local-only repos).
-    if git remote get-url origin >/dev/null 2>&1; then
-        for _se_attempt in 1 2 3 4 5; do
-            git push >/dev/null 2>&1 && break
-            [ "$_se_attempt" -lt 5 ] && sleep $(( (2 ** _se_attempt) + RANDOM % 3 ))
-            git pull --rebase --autostash --quiet >/dev/null 2>&1 || true
-        done
-    fi
-
     echo "[$(date -Iseconds)] Session ended: $REASON" >> .claude/session.log 2>/dev/null || true
 
-    # Clear the crash sentinel on clean shutdown. LAST: if sync or push failed
+    # Clear the crash sentinel on clean shutdown. LAST: if a step above failed
     # and the stop guard blocked exit, the sentinel persists for next session.
     rm -f "${_HC_HOT_ZONE}/.session_sentinel"
     exit 0
@@ -306,7 +392,9 @@ wv_pre_compact_context() (
     _le_tag_hook
     _le_source wv-resolve-project || exit 0
     _le_source wv-hook-common || true
+    declare -F wv_adopt_hook_session_id >/dev/null && wv_adopt_hook_session_id "${1:-}"
     declare -F _hc_refresh >/dev/null && _hc_refresh
+    declare -F wv_hook_run_begin >/dev/null && wv_hook_run_begin PreCompact
     declare -F wv_stage_graph_state >/dev/null || _le_source wv-checkpoint-ci || true
     cd "$WV_PROJECT_DIR" 2>/dev/null || exit 0
     [ -x "$WV" ] || exit 0

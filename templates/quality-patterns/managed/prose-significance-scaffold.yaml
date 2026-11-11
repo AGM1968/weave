@@ -9,7 +9,7 @@ provenance: >-
   not support HTTPS natively." merged into one clause in
   gnss_ppp_pipeline_scoping.md). Extended 2026-07-28 -- "the historical-
   coverage / live-endpoint follow-up below answers the two questions that
-  matter" in docs/Samarco/site_scoping.md, a second surface form of the same
+  matter" in a site-scoping document, a second surface form of the same
   move: a noun phrase flagging its own importance ("questions that matter")
   rather than the sentence announcing it outright. User-flagged as the same
   family as the original catch. Repaired wv-9a62ef 2026-07-30: this field was

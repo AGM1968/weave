@@ -41,7 +41,7 @@ copies() {
     awk -v fn="$1" '$0 ~ "^"fn"\\(\\) \\{" {f=1; n++} f {print n": "$0} f && /^}/ {f=0}' "$INSTALL"
 }
 echo "=== one definition, two copies ==="
-for fn in resolve_git_hook_dir set_hook_dir_or_report install_git_hook_from_repo remove_retired_git_hook; do
+for fn in resolve_git_hook_dir set_hook_dir_or_report install_git_hook_from_repo install_git_hook_module_from_repo remove_retired_git_hook; do
     all=$(copies "$fn")
     one=$(grep '^1: ' <<<"$all" | sed 's/^1: //' || true)
     two=$(grep '^2: ' <<<"$all" | sed 's/^2: //' || true)
@@ -53,6 +53,9 @@ for fn in resolve_git_hook_dir set_hook_dir_or_report install_git_hook_from_repo
     fi
 done
 
+# The installer functions ask this checkout's signature library (wv-3a7368).
+# shellcheck source=scripts/lib/wv-git-hook-signature.sh
+source "$PROJECT_ROOT/scripts/lib/wv-git-hook-signature.sh"
 # shellcheck disable=SC2034  # read by the sourced install.sh functions
 YELLOW="" GREEN="" NC=""
 eval "$(copies resolve_git_hook_dir | grep '^1: ' | sed 's/^1: //')"

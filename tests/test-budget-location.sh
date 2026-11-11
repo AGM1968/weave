@@ -38,7 +38,7 @@ as_runtime() {
     local -a marker=()
     [ "$rt" = sandboxed ] && marker=(CLAUDE_CODE_SSE_PORT=1)
     (cd "$R" && env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u WEAVE_DIR -u WV_BUDGET_DIR \
-        -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE \
+        -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT \
         WV_TEST_MODE=1 WV_TEST_HOT_ZONE_ROOT="$T/zone-root" \
         WV_CONFIG_DIR="$T/cfg-$rt" WV_AUTO_CHECKPOINT=0 WV_NONINTERACTIVE=1 "${marker[@]}" "$@")
 }

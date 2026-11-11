@@ -1,7 +1,8 @@
 #!/bin/bash
-# SessionEnd hook: Claude Code adapter for the final sync before exit -- prune,
-# sync, the graph-state checkpoint commit, push, and clearing the crash sentinel
-# (v1.16.0). The implementation is wv_session_end_sync in
+# SessionEnd hook: Claude Code adapter for the local steps before exit -- prune,
+# a local state.sql flush, the graph-state checkpoint commit, and clearing the
+# crash sentinel (v1.16.0). No GitHub sync and no push: with them the routine
+# stopped completing (wv-a32e69). The implementation is wv_session_end_sync in
 # scripts/lib/wv-lifecycle-end.sh; Codex reaches the same function through wv
 # hook dispatch --event=SessionEnd --format=host (wv-25903d). It runs in-process
 # here, as stop-check.sh does, so the wv it resolves is the one the hook pairs

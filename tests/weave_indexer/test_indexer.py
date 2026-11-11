@@ -336,7 +336,7 @@ class TestGitFileSet:
 def test_candidates_outside_git_name_an_unlistable_directory(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from weave_indexer.__main__ import _candidates  # pylint: disable=import-outside-toplevel
+    from weave_indexer.__main__ import _candidates  # pylint: disable=import-outside-toplevel  # noqa: PLC0415
     (tmp_path / "open").mkdir()
     (tmp_path / "open" / "a.py").write_text("x = 1\n")
     (tmp_path / "shut").mkdir()

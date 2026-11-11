@@ -380,6 +380,41 @@ print(json.dumps(items))
     return 0
 }
 
+# _add_claim_identity <status> — the claimant of an active add (require_agent_id,
+# which fails closed on an unverifiable session); prints nothing otherwise.
+_add_claim_identity() {
+    [ "$1" = "active" ] || return 0
+    require_agent_id
+}
+
+# _add_parse_args <args...> — cmd_add's option parser, apart so cmd_add stays
+# under the close limit (wv-481b9c). It sets cmd_add's locals (text, status,
+# metadata, ...) through bash's dynamic scope; an unknown --flag is rejected.
+_add_parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --status=*) status="${1#*=}" ;;
+            --metadata=*) metadata="${1#*=}" ;;
+            --alias=*) alias="${1#*=}" ;;
+            --parent=*) parent="${1#*=}" ;;
+            --gh) create_gh=true ;;
+            --force) force=true ;;
+            --standalone) force=true; standalone=true ;;
+            --json) format="json" ;;
+            # A repeated --criteria accumulates: the flag used to overwrite, so
+            # every occurrence but the last was dropped silently (wv-776e45).
+            --criteria=*) criteria="${criteria:+$criteria|}${1#*=}" ;;
+            --risks=*) risks_flag="${1#*=}" ;;
+            --verification-plan=*) verification_plan="${1#*=}" ;;
+            --kind=*) kind_flag="${1#*=}" ;;
+            --id=*) reconstruct_id="${1#*=}" ;;
+            --*) _wv_reject_arg add "$1"; return 1 ;;
+            *) text="$text $1" ;;
+        esac
+        shift
+    done
+}
+
 cmd_add() {
     local text="$1"
     local status="todo"
@@ -400,26 +435,7 @@ cmd_add() {
     local reconstruct_id=""
 
     shift || true
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --status=*) status="${1#*=}" ;;
-            --metadata=*) metadata="${1#*=}" ;;
-            --alias=*) alias="${1#*=}" ;;
-            --parent=*) parent="${1#*=}" ;;
-            --gh) create_gh=true ;;
-            --force) force=true ;;
-            --standalone) force=true; standalone=true ;;
-            --json) format="json" ;;
-            --criteria=*) criteria="${1#*=}" ;;
-            --risks=*) risks_flag="${1#*=}" ;;
-            --verification-plan=*) verification_plan="${1#*=}" ;;
-            --kind=*) kind_flag="${1#*=}" ;;
-            --id=*) reconstruct_id="${1#*=}" ;;
-            --*) _wv_reject_arg add "$1"; return 1 ;;
-            *) text="$text $1" ;;
-        esac
-        shift
-    done
+    _add_parse_args "$@" || return 1
 
     if [ -z "$text" ]; then
         echo -e "${RED}Error: text required${NC}" >&2
@@ -428,6 +444,11 @@ cmd_add() {
     fi
 
     validate_status "$status" || return 1
+
+    # An active add is a claim: refuse before creating anything when the session
+    # identity cannot be verified (wv-99978b), rather than leave an unclaimed node.
+    local add_agent_id
+    add_agent_id=$(_add_claim_identity "$status") || return 1
 
     # The supplied --metadata is validated before the flags merge into it:
     # null + {done_criteria: ...} is an object, so validating only the merged
@@ -637,8 +658,7 @@ cmd_add() {
     # Creating a node directly in active status IS a claim (Pattern B: WorkClaimed
     # event) — mirror cmd_work so the first edit is not hard-blocked in discover phase.
     if [ "$status" = "active" ]; then
-        local add_agent_id
-        add_agent_id="$(sql_escape "$(resolve_agent_id)")"
+        add_agent_id="$(sql_escape "$add_agent_id")"
         db_query "UPDATE nodes
             SET metadata = json_set(COALESCE(metadata,'{}'), '\$.claimed_by', '$add_agent_id')
             WHERE id = '$id';" 2>/dev/null || true
@@ -671,6 +691,15 @@ cmd_add() {
         echo -e "${GREEN}✓${NC} $id: $original_text" >&2
     fi
     [ -n "$parent" ] && echo -e "${GREEN}✓${NC} $id implements parent $parent" >&2
+    # Report the criteria count read back from the stored node, so a criterion
+    # lost between the flags and the row shows where it happens (wv-776e45).
+    local stored_criteria
+    stored_criteria=$(db_query "SELECT CASE json_type(metadata, '\$.done_criteria')
+        WHEN 'array' THEN json_array_length(metadata, '\$.done_criteria')
+        WHEN 'text' THEN 1 ELSE 0 END FROM nodes WHERE id='$(sql_escape "$id")';" 2>/dev/null)
+    if [ -n "$criteria" ] || [ "${stored_criteria:-0}" != 0 ]; then
+        echo -e "${GREEN}✓${NC} $id: ${stored_criteria:-0} done criteria stored" >&2
+    fi
 
     if [ "$format" = "json" ]; then
         jq -n --arg id "$id" --arg text "$original_text" --arg status "$status" \
@@ -1162,23 +1191,27 @@ _memory_supersede_earlier() {
 # row. They are kept as JSON lines in files and read back with --slurpfile,
 # never passed as an --argjson payload, which fails with E2BIG past 128 KiB
 # (tests/test-argjson-payload.sh).
+# Returns 1 when any source was refused for holding a credential (wv-320587).
 _memory_import_report() {
     local acc="$1" format="$2" unit="$3"
+    [ -f "$acc/refused" ] || : > "$acc/refused"
     if [ "$format" = "json" ]; then
         jq -n --slurpfile imported "$acc/imported" --slurpfile skipped "$acc/skipped" --slurpfile superseded "$acc/superseded" \
+            --slurpfile refused "$acc/refused" \
             '{imported: $imported, count: ($imported | length),
               skipped: ([$skipped[] | select(.reason != "index")] | length),
               skipped_index: ([$skipped[] | select(.reason == "index")] | length),
               reshaped: [$skipped[] | .reshaped // empty],
-              superseded: $superseded}'
+              superseded: $superseded, refused: $refused}'
     else
+        jq -r '"✗ Refused \(.source_path): holds a credential-shaped string"' "$acc/refused"
         jq -r '"✓ Imported \(.source_path) -> \(.id)"' "$acc/imported"
         jq -r '"↻ Superseded earlier import \(.id) -> \(.superseded_by) (source changed)"' "$acc/superseded"
         jq -r 'select(.reshaped) | "↻ Reshaped legacy import \(.reshaped) (frontmatter moved to the hook)"' "$acc/skipped"
         local n_skipped; n_skipped=$(jq -s '[.[] | select(.reason != "index")] | length' "$acc/skipped")
         [ "$n_skipped" -gt 0 ] && echo "⏭  Skipped $n_skipped already-imported $unit (source_hash match)"
     fi
-    return 0
+    [ ! -s "$acc/refused" ]
 }
 
 # A Claude memory file is YAML frontmatter (name, description, metadata) and a
@@ -1228,7 +1261,7 @@ _memory_import_claude_dir() {
 
     local acc file parts text id hash metadata text_sql metadata_sql earlier reshaped
     acc=$(mktemp -d) || return 1
-    : > "$acc/imported"; : > "$acc/skipped"; : > "$acc/superseded"
+    : > "$acc/imported"; : > "$acc/skipped"; : > "$acc/superseded"; : > "$acc/refused"
     while IFS= read -r file; do
         [ -f "$file" ] || continue
         # MEMORY.md is Claude's index of the memory files, one line per file,
@@ -1236,6 +1269,12 @@ _memory_import_claude_dir() {
         # (wv-99990b).
         if [ "$(basename "$file")" = MEMORY.md ]; then
             jq -nc --arg path "$file" '{source_path: $path, reason: "index"}' >> "$acc/skipped"
+            continue
+        fi
+        # A file holding a credential is refused, not imported (wv-320587);
+        # the others still import and the command exits non-zero.
+        if ! wv_credential_refuse_file "memory file $file" "$file"; then
+            jq -nc --arg path "$file" '{source_path: $path}' >> "$acc/refused"
             continue
         fi
         parts=$(_memory_claude_file_parts "$file")
@@ -1282,8 +1321,10 @@ _memory_import_claude_dir() {
     done < <(find "$path" -maxdepth 1 -type f -name "*.md" -print 2>/dev/null | sort)
 
     _memory_import_report "$acc" "$format" "file(s)"
+    local rc=$?
     rm -rf "$acc"
     auto_sync_or_warn
+    return "$rc"
 }
 
 _memory_import_codex() {
@@ -1299,12 +1340,16 @@ _memory_import_codex() {
 
     local acc obs text source_path source_session hash id metadata text_sql metadata_sql earlier
     acc=$(mktemp -d) || return 1
-    : > "$acc/imported"; : > "$acc/skipped"; : > "$acc/superseded"
+    : > "$acc/imported"; : > "$acc/skipped"; : > "$acc/superseded"; : > "$acc/refused"
     while IFS= read -r obs; do
         [ -n "$obs" ] || continue
         text=$(printf '%s\n' "$obs" | jq -r '.excerpt // empty' | head -20 | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')
         [ -n "$text" ] || continue
         source_path=$(printf '%s\n' "$obs" | jq -r '.source_path // ""')
+        if ! wv_credential_refuse "codex memory row $source_path" "$obs"; then  # wv-320587
+            jq -nc --arg path "$source_path" '{source_path: $path}' >> "$acc/refused"
+            continue
+        fi
         source_session=$(printf '%s\n' "$obs" | jq -r '.source_session // ""')
         hash=$(printf '%s' "$repo_root|$source_path|$source_session|$text" | sha256sum | awk '{print $1}')
         # Idempotency: skip if a memory node with this source_hash already exists.
@@ -1345,8 +1390,10 @@ _memory_import_codex() {
     done < <(printf '%s\n' "$observations" | jq -c '.[] | select(.source_agent == "codex" and .source_kind == "memory_db")')
 
     _memory_import_report "$acc" "$format" "row(s)"
+    local rc=$?
     rm -rf "$acc"
     auto_sync_or_warn
+    return "$rc"
 }
 
 # ── S4 crystallization ───────────────────────────────────────────────────────
@@ -2243,6 +2290,23 @@ _node_commit_shas() {
     printf '%b%b' "$regular_shas" "$checkpoint_shas" | sed '/^$/d'
 }
 
+# _commits_merge_live <refs_json> <metadata_json> — <refs_json> followed by the
+# refs <metadata_json> already records under .commits that it lacks, with the
+# whole list passed through the liveness filter (wv-3c1663). Recorded refs come
+# from metadata, not from git log over HEAD, which is the one way a stale SHA
+# enters a node's list: a child ref amended, reset or gc'd since its close was
+# re-acquired by its epic on every sync (wv-fc4ac2; wv-99893f kept re-acquiring
+# 61b9fcab from wv-f1aec5). Fails open when git cannot answer; `wv commit-refs`
+# reports what survives.
+_commits_merge_live() {
+    local refs_json="$1" meta_json="$2" merged
+    merged=$(jq -c --slurpfile r <(printf '%s' "$refs_json") \
+        '$r[0] + (((.commits // []) | if type == "array" then . else [] end) - $r[0])' \
+        <<< "$meta_json" 2>/dev/null || printf '%s' "$refs_json")
+    declare -f _commit_refs_keep_live >/dev/null 2>&1 || { printf '%s' "$merged"; return 0; }
+    _commit_refs_keep_live "$merged"
+}
+
 _store_node_commits() {
     local id="$1"
     local shas shas_json primary_sha
@@ -2261,6 +2325,9 @@ _store_node_commits() {
     shas=$(printf '%s\n%s\n' "$primary_sha" "$shas" | awk 'NF && !seen[$0]++')
     shas_json=$(printf '%s\n' "$shas" | jq -R . | jq -s . 2>/dev/null || echo "[]")
     [ "$shas_json" = "[]" ] && return 0
+    # Refs already recorded (an epic's child union, refs older than git log's
+    # 90-day window) are kept, not replaced (wv-3c1663).
+    shas_json=$(_commits_merge_live "$shas_json" "$cur_meta")
 
     local patch_json
     patch_json=$(jq -cn --arg primary "$primary_sha" --slurpfile s <(printf '%s' "$shas_json") '{commit: $primary, commits: $s[0]}' 2>/dev/null || echo "")
@@ -2281,22 +2348,14 @@ _aggregate_epic_commits() {
         if . and . != "" then (. | fromjson | .commits // []) else [] end | .[]
     ] | unique | sort' 2>/dev/null || echo "[]")
     [ "$all_shas" = "[]" ] && return 0
-    # Prevention (wv-fc4ac2): the union is copied out of CHILD metadata, which is
-    # the one place a stale SHA can enter an aggregate — a child ref that was
-    # amended, reset or gc'd since its close would otherwise be re-acquired by
-    # the epic on every sync, which is why hand-removing it from the epic alone
-    # never held (wv-99893f kept re-acquiring 61b9fcab from wv-f1aec5).
-    # _store_node_commits needs no such filter: its SHAs come straight from
-    # `git log` over HEAD, so they are live by construction.
-    # Fails open when git cannot answer; `wv commit-refs` reports what survives.
-    if declare -f _commit_refs_keep_live >/dev/null 2>&1; then
-        all_shas=$(_commit_refs_keep_live "$all_shas")
-    fi
-    { [ -z "$all_shas" ] || [ "$all_shas" = "[]" ]; } && return 0
     local epic_meta_raw epic_meta updated
     epic_meta_raw=$(db_query_json "SELECT metadata FROM nodes WHERE id='$(sql_escape "$epic_id")';" 2>/dev/null || echo "[]")
     epic_meta=$(echo "$epic_meta_raw" | jq -r '.[0].metadata // "{}"' 2>/dev/null || echo "{}")
     [[ "$epic_meta" != "{"* ]] && epic_meta="{}"
+    # The epic's own direct commits join the union; replacing them with the
+    # children's alone dropped them (wv-ece542 lost 13 refs, wv-3c1663).
+    all_shas=$(_commits_merge_live "$all_shas" "$epic_meta")
+    { [ -z "$all_shas" ] || [ "$all_shas" = "[]" ]; } && return 0
     # An epic's union of child commits grows with the epic (wv-200d36).
     updated=$(echo "$epic_meta" | jq --slurpfile s <(printf '%s' "$all_shas") '. + {commits: $s[0]}' 2>/dev/null || echo "$epic_meta")
     updated="${updated//\'/\'\'}"
@@ -2382,9 +2441,7 @@ _done_quality_ensure_fresh() {
     fi
     [ -z "$stale" ] && return 0
     echo -e "${YELLOW}quality: $(wc -l <<< "$stale" | tr -d ' ') node file(s) changed since the last scan; rescanning${NC}" >&2
-    local -a scan_args=(--hot-zone "$WV_HOT_ZONE" scan)
-    [ -n "${REPO_ROOT:-}" ] && scan_args+=("$REPO_ROOT")
-    _wv_quality_python "${scan_args[@]}" --json >/dev/null 2>&1 || true
+    _done_quality_scan
     if ! stale=$(_done_quality_stale_paths "$paths_raw") || [ -n "$stale" ]; then
         wv_policy_verdict close_requires_quality_evidence deny yes "" "the quality scan does not describe this node's files"
         echo -e "${RED}Error: the quality scan is not current for:${NC}" >&2
@@ -2392,6 +2449,15 @@ _done_quality_ensure_fresh() {
         echo -e "  Run 'wv quality scan' and retry; WV_REQUIRE_QUALITY=0 bypasses (test/legacy only)." >&2
         return 1
     fi
+}
+
+# _done_quality_scan -- the one scan a close runs for itself: a rescan of stale
+# node files, or the first scan of a hot zone a reboot emptied. Its own failure
+# is not judged here; the caller re-reads quality.db and refuses on what it finds.
+_done_quality_scan() {
+    local -a scan_args=(--hot-zone "$WV_HOT_ZONE" scan)
+    [ -n "${REPO_ROOT:-}" ] && scan_args+=("$REPO_ROOT")
+    _wv_quality_python "${scan_args[@]}" --json >/dev/null 2>&1 || true
 }
 
 _done_refresh_file_metrics() {
@@ -2414,24 +2480,22 @@ _done_refresh_file_metrics() {
         return 0
     fi
 
-    # quality.db must exist when node_files is non-empty
-    local quality_db="$WV_HOT_ZONE/quality.db"
-    if [ ! -f "$quality_db" ]; then
-        wv_policy_verdict close_requires_quality_evidence deny yes "" "no quality database to judge the close"
-        echo -e "${RED}Error: quality.db not found at $quality_db${NC}" >&2
-        echo -e "  Run 'wv quality scan' before closing nodes that touch tracked files." >&2
-        echo -e "  Set WV_REQUIRE_QUALITY=0 to bypass (test/legacy environments only)." >&2
-        return 1
+    # quality.db lives in the tmpfs hot zone, so a reboot leaves it missing or
+    # empty. The close scans in place rather than refusing (owner ruling on
+    # wv-f4f431, 2026-11-08: scan data stays an ephemeral cache until the Rust
+    # port is in scope), and refuses only when that scan produced nothing.
+    local quality_db="$WV_HOT_ZONE/quality.db" latest_scan=""
+    local latest_sql="SELECT id FROM scan_meta ORDER BY id DESC LIMIT 1;"
+    [ -f "$quality_db" ] && latest_scan=$(sqlite3 -batch -cmd ".timeout 3000" "$quality_db" "$latest_sql" 2>/dev/null || echo "")
+    if [ -z "$latest_scan" ]; then
+        echo -e "${YELLOW}quality: no scan data in this hot zone (a reboot clears it); scanning now${NC}" >&2
+        _done_quality_scan
+        [ -f "$quality_db" ] && latest_scan=$(sqlite3 -batch -cmd ".timeout 3000" "$quality_db" "$latest_sql" 2>/dev/null || echo "")
     fi
-
-    # Must have at least one scan
-    local latest_scan
-    latest_scan=$(sqlite3 -batch -cmd ".timeout 3000" "$quality_db" \
-        "SELECT id FROM scan_meta ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
     if [ -z "$latest_scan" ]; then
         wv_policy_verdict close_requires_quality_evidence deny yes "" "no quality scan to judge the close"
-        echo -e "${RED}Error: quality.db has no scan data — run 'wv quality scan' first${NC}" >&2
-        echo -e "  Set WV_REQUIRE_QUALITY=0 to bypass (test/legacy environments only)." >&2
+        echo -e "${RED}Error: the quality scan produced no data at $quality_db${NC}" >&2
+        echo -e "  Run 'wv quality scan' to see why; WV_REQUIRE_QUALITY=0 bypasses (test/legacy only)." >&2
         return 1
     fi
 
@@ -3001,8 +3065,12 @@ _done_close_gh_issue() {
         return 0
     fi
 
-    local repo
-    repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
+    # One gh call per question (wv-481b9c): each costs 0.6-1.7 s, and this
+    # path made six before the parent refresh. Repo name and URL in one view.
+    local repo repo_url repo_json
+    repo_json=$(gh repo view --json nameWithOwner,url 2>/dev/null || echo "")
+    repo=$(jq -r '.nameWithOwner // empty' <<< "$repo_json" 2>/dev/null)
+    repo_url=$(jq -r '.url // empty' <<< "$repo_json" 2>/dev/null)
     if [ -z "$repo" ]; then
         return 0
     fi
@@ -3036,8 +3104,6 @@ _done_close_gh_issue() {
         shas=$(git log --format="%H" --grep="$id" --since="90 days ago" 2>/dev/null | head -10)
     fi
     if [ -n "$shas" ]; then
-        local repo_url
-        repo_url=$(gh repo view --json url -q '.url' 2>/dev/null || echo "")
         comment="$comment
 
 **Commits:**"
@@ -3055,12 +3121,16 @@ _done_close_gh_issue() {
         done
     fi
 
-    # Remove stale status labels before closing
-    gh issue edit "$gh_num" --repo "$repo" --remove-label "weave:active" >/dev/null 2>&1 || true
-    gh issue edit "$gh_num" --repo "$repo" --remove-label "weave:blocked" >/dev/null 2>&1 || true
-
-    local gh_state
-    gh_state=$(gh issue view "$gh_num" --repo "$repo" --json state -q '.state' 2>/dev/null || echo "")
+    # State and labels in one view; remove only the stale status labels the
+    # issue carries, in one edit (none when it carries neither).
+    local issue_json gh_state stale_labels
+    issue_json=$(gh issue view "$gh_num" --repo "$repo" --json state,labels 2>/dev/null || echo "")
+    gh_state=$(jq -r '.state // empty' <<< "$issue_json" 2>/dev/null)
+    stale_labels=$(jq -r '[.labels[]?.name | select(. == "weave:active" or . == "weave:blocked")] | join(",")' \
+        <<< "$issue_json" 2>/dev/null)
+    if [ -n "$stale_labels" ]; then
+        gh issue edit "$gh_num" --repo "$repo" --remove-label "$stale_labels" >/dev/null 2>&1 || true
+    fi
     if [ "$gh_state" = "OPEN" ]; then
         if gh issue close "$gh_num" --repo "$repo" --comment "$comment" >/dev/null 2>&1; then
             echo -e "${GREEN}✓${NC} Closed GitHub issue #$gh_num" >&2
@@ -3367,12 +3437,34 @@ _done_parse_args() {
             --verification-evidence=*) verification_evidence="${1#*=}" ;;
             --verification-evidence-file=*) verification_evidence_file="${1#*=}" ;;
             --no-gh) no_gh=1 ;;
+            --force) force=1 ;;
             --allowed-tools=*) allowed_tools_raw="${1#--allowed-tools=}" ;;
             --completion-files=*) completion_files_raw="${1#*=}"; completion_files_set=1 ;;
             *) _wv_reject_arg "done" "$1"; return 1 ;;
         esac
         shift
     done
+}
+
+# _done_refuse_staged_work — no close over staged, uncommitted work (wv-b026bb).
+# A refused commit leaves its files staged. Closing then left the next commit
+# with no active claim, and wv update --status=active could not undo it. The
+# node stays active here, claim kept, so the retried commit passes. --force
+# closes anyway, as GitHub sync does for an issue closed outside this checkout.
+_done_refuse_staged_work() {
+    local root staged
+    [ "$force" = 1 ] && return 0
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+    staged=$(wv_staged_non_graph_state "$root") || staged="(the staged files could not be listed)"
+    [ -n "$staged" ] || return 0
+    {
+        echo -e "${RED}Error: not closing $id: files outside graph state are staged but not committed:${NC}"
+        printf '%s\n' "$staged" | sed 's/^/  /'
+        echo "  Commit them first (a refused commit leaves its files staged); $id stays active, so the commit's claim check passes."
+        echo "  To close anyway: wv done $id --force"
+        echo "  A node already closed over staged work is restored with: wv work <id> --reopen"
+    } >&2
+    return 1
 }
 
 # _done_resolve_learning — read the option files and compose the structured
@@ -3772,6 +3864,7 @@ cmd_done() {
     local allowed_tools_raw=""
     local completion_files_raw=""
     local completion_files_set=0
+    local force=0
 
     shift || true
     _done_parse_args "$@" || return 1
@@ -3795,6 +3888,7 @@ cmd_done() {
 
     local node_status
     _done_check_node || return 1
+    _done_refuse_staged_work || return 1
 
     # Before anything below writes to the node: a refused finding close leaves
     # it as it was, less this agent's claim (wv-61e8ca). This ran after
@@ -3950,6 +4044,7 @@ USAGE
         echo "Usage: echo '[{\"id\":\"wv-xxxxxx\",\"alias\":\"test\"}]' | wv bulk-update" >&2
         return 1
     fi
+    wv_credential_refuse "wv bulk-update stdin" "$input" || return 1  # wv-320587
 
     # Validate JSON array
     if ! echo "$input" | jq 'if type == "array" then . else error("not an array") end' >/dev/null 2>&1; then
@@ -4116,12 +4211,71 @@ _work_claim_failed() {
     fi
 }
 
+# _work_claim_held_by_other <id> <format> <agent_id-escaped> <force> <continue>
+# The claim CAS lost: another identity holds the node. --force takes it over and
+# --continue adopts this actor's own pre-session coarse claim; both are policy
+# events appended to metadata.claim_history. Otherwise the loss is a conflict.
+_work_claim_held_by_other() {
+    local id="$1" format="$2" agent_id="$3" force="$4" continue_claim="$5"
+    # Claim lost — another agent holds it
+    local holder coarse_id legacy_id
+    holder=$(db_query "SELECT json_extract(metadata, '$.claimed_by') FROM nodes WHERE id='$id';")
+    coarse_id=$(resolve_agent_coarse_id)
+    legacy_id=$(resolve_agent_legacy_session_id)
+    if [ "$continue_claim" = true ] && [ "$holder" != "$coarse_id" ] \
+        && { [ -z "$legacy_id" ] || [ "$holder" != "$legacy_id" ]; }; then
+        # --continue adopts only this actor's own pre-session claim (wv-99978b)
+        # or this session's own pre-digest -s<sid12> claim (wv-24d57b); anyone
+        # else's needs --force, recorded as a takeover.
+        wv_policy_verdict claim_ownership deny yes --continue "holder is not this actor's coarse identity or this session's legacy identity"
+        echo -e "${RED}✗ $id is claimed by $holder, not by $coarse_id${legacy_id:+ or $legacy_id}: --continue cannot adopt it${NC}" >&2
+        echo "  Take it over explicitly (recorded): wv work $id --force" >&2
+        return 1
+    fi
+    if [ "$force" = true ] || [ "$continue_claim" = true ]; then
+        local claim_kind="takeover" bypass="--force"
+        [ "$continue_claim" = true ] && { claim_kind="continuation"; bypass="--continue"; }
+        wv_policy_verdict claim_ownership allow yes "$bypass" "$claim_kind of a claim held by $holder"
+        [ "$format" != "json" ] && echo -e "${YELLOW}⚠ Claim ${claim_kind}: was held by $holder${NC}" >&2
+        # The history entry keeps provenance: who held it, who took it, how.
+        # The UPDATE is a CAS on the holder read above, so a claim that moved
+        # in between is not overwritten.
+        local claim_changes2
+        if ! claim_changes2=$(db_query "UPDATE nodes
+            SET metadata = json_set(
+                    json_set(COALESCE(metadata,'{}'), '$.claimed_by', '$agent_id'),
+                    '$.claim_history[#]',
+                    json_object('from', '$(sql_escape "$holder")', 'to', '$agent_id',
+                                'kind', '$claim_kind', 'at', strftime('%Y-%m-%dT%H:%M:%SZ','now'))),
+                status = 'active',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = '$id'
+              AND COALESCE(json_extract(metadata, '$.claimed_by'), '') = '$(sql_escape "$holder")';
+            SELECT changes();") || [ "$claim_changes2" != "1" ]; then
+            _work_claim_failed "$id" "$format" "the $claim_kind write failed or the claim moved"
+            return 1
+        fi
+    else
+        # The CAS cannot tell a live holder from a race this call just lost,
+        # so the refusal is a conflict, not a counterweight decision.
+        wv_policy_refusal expected_conflict "claim lost: another agent holds the node"
+        if [ "$format" = "json" ]; then
+            jq -n --arg id "$id" --arg holder "$holder" \
+                '{"ok": false, "error": "claimed_by_other", "holder": $holder, "id": $id}' >&2
+        else
+            echo -e "${RED}✗ $id is claimed by $holder${NC}" >&2
+            echo "  Use --force to override a stale claim." >&2
+        fi
+        return 1
+    fi
+}
+
 cmd_work() {
     # Check for incomplete operations before claiming new work
     # Auto-clear if the stale operation is >30 minutes old (likely a failed sync from a prior session)
     if journal_has_incomplete 2>/dev/null; then
         if journal_clear_stale 2>/dev/null; then
-            echo -e "${CYAN}ℹ Cleared stale operation marker (>30 min old)${NC}" >&2
+            echo -e "${YELLOW}⚠ Cleared an unfinished operation older than 30 min: ${_WV_CLEARED_OP:-unknown}. It did not complete; rerun it if its result matters (wv doctor counts these).${NC}" >&2
         else
             echo -e "${YELLOW}⚠ Incomplete operation detected — run 'wv recover' first${NC}" >&2
         fi
@@ -4130,6 +4284,7 @@ cmd_work() {
     local id="${1:-}"
     local quiet=false
     local force=false
+    local continue_claim=false
     local reopen=false
     local format="text"
     local allowed_tools_raw=""
@@ -4139,6 +4294,7 @@ cmd_work() {
         case "$1" in
             --quiet|-q) quiet=true ;;
             --force|-f) force=true ;;
+            --continue) continue_claim=true ;;
             --reopen)   reopen=true ;;
             --json)     format="json" ;;
             --allowed-tools=*) allowed_tools_raw="${1#--allowed-tools=}" ;;
@@ -4150,10 +4306,10 @@ cmd_work() {
     if [ -z "$id" ]; then
         wv_policy_refusal input_validation "claim names no node"
         echo -e "${RED}Error: node ID required${NC}" >&2
-        echo "Usage: wv work <id> [--quiet] [--force] [--reopen] [--json] [--allowed-tools=t1,t2,...]" >&2
+        echo "Usage: wv work <id> [--quiet] [--force] [--continue] [--reopen] [--json] [--allowed-tools=t1,t2,...]" >&2
         echo "" >&2
         echo "Claims a node and sets WV_ACTIVE for subagent context inheritance." >&2
-        echo "Use --force to override a stale claim from another agent." >&2
+        echo "Use --force to take over another agent's claim, --continue to resume your own pre-session claim (both recorded)." >&2
         echo "Use --reopen to explicitly move a done node back to active tracked work." >&2
         echo "Run the export command to enable subagent context:" >&2
         echo "  eval \"\$(wv work <id> --quiet)\"" >&2
@@ -4215,9 +4371,15 @@ cmd_work() {
         wv_policy_verdict reopen_requires_explicit_intent allow no "" "not a done node"
     fi
 
-    # Resolve agent identity (strip quotes for SQL safety)
-    local agent_id
-    agent_id="$(sql_escape "$(resolve_agent_id)")"
+    # Resolve agent identity (strip quotes for SQL safety). A claim is an
+    # ownership change: an unverifiable session identity is refused here rather
+    # than claiming under an id the session may not keep (wv-99978b).
+    local agent_raw agent_id
+    if ! agent_raw=$(require_agent_id); then
+        wv_policy_verdict claim_ownership deny yes "" "session identity cannot be verified"
+        return 1
+    fi
+    agent_id="$(sql_escape "$agent_raw")"
 
     # Atomic CAS claim: succeeds only if unclaimed or already claimed by this agent.
     # A write that fails or rolls back (an FTS trigger error, a locked database)
@@ -4241,33 +4403,7 @@ cmd_work() {
     if [ "$claim_changes" != "0" ]; then
         wv_policy_verdict claim_ownership allow no "" "unclaimed, or already this agent's"
     else
-        # Claim lost — another agent holds it
-        local holder
-        holder=$(db_query "SELECT json_extract(metadata, '$.claimed_by') FROM nodes WHERE id='$id';")
-        if [ "$force" = true ]; then
-            wv_policy_verdict claim_ownership allow yes --force "took over a claim held by another agent"
-            [ "$format" != "json" ] && echo -e "${YELLOW}⚠ Overriding stale claim held by: $holder${NC}" >&2
-            if ! db_query "UPDATE nodes
-                SET metadata = json_set(COALESCE(metadata,'{}'), '$.claimed_by', '$agent_id'),
-                    status = 'active',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = '$id';"; then
-                _work_claim_failed "$id" "$format" "the forced claim write failed"
-                return 1
-            fi
-        else
-            # The CAS cannot tell a live holder from a race this call just lost,
-            # so the refusal is a conflict, not a counterweight decision.
-            wv_policy_refusal expected_conflict "claim lost: another agent holds the node"
-            if [ "$format" = "json" ]; then
-                jq -n --arg id "$id" --arg holder "$holder" \
-                    '{"ok": false, "error": "claimed_by_other", "holder": $holder, "id": $id}' >&2
-            else
-                echo -e "${RED}✗ $id is claimed by $holder${NC}" >&2
-                echo "  Use --force to override a stale claim." >&2
-            fi
-            return 1
-        fi
+        _work_claim_held_by_other "$id" "$format" "$agent_id" "$force" "$continue_claim" || return 1
     fi
 
     # Report a claim only once the row says so.
@@ -4305,6 +4441,15 @@ cmd_work() {
         fi
     fi
 
+    # Publish the claim, as every other mutating command publishes its change.
+    # Lineage is stamped only when a change is published, so an unpublished
+    # claim left the live row behind its own reload until some later command,
+    # or a hook's reload, published it (wv-61e13b; owner ruling 2026-11-05,
+    # about +2 s per claim). --force: a claim usually follows another write
+    # within WV_SYNC_INTERVAL, and the throttle would skip it. Its output goes
+    # to stderr: --json and --quiet print machine-read stdout below.
+    auto_sync_or_warn --force >&2
+
     if [ "$format" = "json" ]; then
         # Structured output for runtime consumption
         local text
@@ -4312,7 +4457,9 @@ cmd_work() {
         local reopened_json=false
         [ "$current_status" = "done" ] && reopened_json=true
         jq -n --arg id "$id" --arg text "$text" --arg status "active" --argjson reopened "$reopened_json" \
-            '{"id": $id, "text": $text, "status": $status, "reopened": $reopened}'
+            --arg owner "$(resolve_agent_id)" --arg ownership "$(agent_ownership_mode)" \
+            '{"id": $id, "text": $text, "status": $status, "reopened": $reopened,
+              "claimed_by": $owner, "ownership": $ownership}'
         return 0
     fi
 
@@ -4329,6 +4476,11 @@ cmd_work() {
             echo -e "${GREEN}✓${NC} Claimed: $id"
         fi
         echo "  $text"
+        # An actor-owned claim is shared by every session of this actor: say
+        # so, instead of implying the isolation session identity gives (wv-b2996f).
+        if [ "$(agent_ownership_mode)" = actor ]; then
+            echo -e "  ${YELLOW}Owner: $(resolve_agent_id) (actor-owned, not session-isolated: every session of this actor shares this claim)${NC}"
+        fi
 
         # Show last commit touching node's files for context
         if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree &>/dev/null; then
@@ -4670,34 +4822,68 @@ cmd_ready() {
 # cmd_list — List nodes with filtering
 # ═══════════════════════════════════════════════════════════════════════════
 
-cmd_list() {
-    local status_filter=""
-    local priority_filter=""
-    local type_filter=""
-    local claimed_by_filter=""
-    local claimed_by_set=false
-    local format="text"
-    local all=false
-    local limit_val=""
-    local mode_arg=""
-
+# _list_parse_args <args...> — cmd_list's option parser, apart so cmd_list stays
+# under the close limit (wv-26fd0b). It sets cmd_list's locals through bash's
+# dynamic scope; an unknown flag is rejected (wv-016983).
+_list_parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --status=*) status_filter="${1#*=}" ;;
             --priority=*) priority_filter="${1#*=}" ;;
             --type=*) type_filter="${1#*=}" ;;
             --claimed-by=*) claimed_by_filter="${1#*=}"; claimed_by_set=true ;;
+            --ids=*) ids_filter="${1#*=}"; ids_set=true ;;
             --limit=*) limit_val="${1#*=}" ;;
             --json)    format="json" ;;
             --json-v2) format="json-v2" ;;
             --all) all=true ;;
             --mode=*) mode_arg="${1#*=}" ;;
-            -*) _wv_reject_arg list "$1"; return 1 ;;  # wv-016983
+            -*) _wv_reject_arg list "$1"; return 1 ;;
         esac
         shift
     done
+}
+
+# _list_ids_sql <id,...> — the quoted SQL list for --ids, or an error for an
+# empty list or any entry that is not a node id (aliases are not resolved here:
+# a caller with an alias has `wv show`).
+_list_ids_sql() {
+    local raw="$1" id out=""
+    local -a ids=()
+    IFS=',' read -r -a ids <<< "$raw"
+    [ "${#ids[@]}" -gt 0 ] || { echo -e "${RED}Error: --ids needs at least one node id${NC}" >&2; return 1; }
+    for id in "${ids[@]}"; do
+        if ! [[ "$id" =~ ^wv-[a-f0-9]{4,6}$ ]]; then
+            echo -e "${RED}Error: --ids takes node ids (wv-xxxxxx), not '$id'${NC}" >&2
+            return 1
+        fi
+        out="${out:+$out,}'$id'"
+    done
+    printf '%s' "$out"
+}
+
+cmd_list() {
+    local status_filter=""
+    local priority_filter=""
+    local type_filter=""
+    local claimed_by_filter=""
+    local claimed_by_set=false
+    local ids_filter=""
+    local ids_set=false
+    local format="text"
+    local all=false
+    local limit_val=""
+    local mode_arg=""
+
+    _list_parse_args "$@" || return 1
     local mode
     mode=$(wv_resolve_mode "$mode_arg")
+
+    # --ids (wv-26fd0b): exactly the named nodes, whatever their status, uncapped.
+    local ids_sql=""
+    if [ "$ids_set" = true ]; then
+        ids_sql=$(_list_ids_sql "$ids_filter") || return 1
+    fi
 
     # Validate limit (must be a positive integer)
     if [ -n "$limit_val" ]; then
@@ -4736,7 +4922,9 @@ cmd_list() {
     fi
 
     if [ "$claimed_by_filter" = "current" ]; then
-        claimed_by_filter=$(resolve_agent_id)
+        # Commit admission reads this listing: an unverifiable session identity
+        # fails it, and admission reads a failed listing as no claim (wv-99978b).
+        claimed_by_filter=$(require_agent_id) || return 1
     elif [ "$claimed_by_set" = true ] && [ -z "$claimed_by_filter" ]; then
         echo -e "${RED}Error: --claimed-by requires an agent ID or 'current'${NC}" >&2
         return 1
@@ -4746,7 +4934,10 @@ cmd_list() {
     local where_clause=""
     local filters=""
 
-    if [ "$all" != true ] && [ -z "$status_filter" ]; then
+    if [ -n "$ids_sql" ]; then
+        filters="id IN ($ids_sql)"
+        [ -z "$status_filter" ] || filters="$filters AND status = '$status_filter'"
+    elif [ "$all" != true ] && [ -z "$status_filter" ]; then
         filters="status != 'done'"
     elif [ -n "$status_filter" ]; then
         filters="status = '$status_filter'"
@@ -4793,7 +4984,7 @@ cmd_list() {
     local capped=false
     if [ -n "$limit_val" ]; then
         limit_clause="LIMIT $limit_val"
-    elif [ "$all" = true ]; then
+    elif [ "$all" = true ] || [ -n "$ids_sql" ]; then
         limit_clause=""
     elif [ "$status_filter" = "done" ]; then
         limit_clause="LIMIT $_LIST_DONE_LIMIT"
@@ -4829,7 +5020,7 @@ cmd_list() {
 
     if [ "$format" = "json-v2" ]; then
         local results
-        results=$(db_query_json_v2 "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;") || return 1
+        results=$(db_query_json_v2 "SELECT id, text, status, metadata, alias FROM nodes $where_clause ORDER BY COALESCE(priority, 2) ASC, created_at DESC, id ASC $limit_clause;") || return 1
         [ -z "$results" ] && echo "[]" || echo "$results"
         local json_count cap_n="$_LIST_DEFAULT_LIMIT"
         [ "$status_filter" = "done" ] && cap_n="$_LIST_DONE_LIMIT"
@@ -4839,7 +5030,7 @@ cmd_list() {
         _list_footer "$json_count" "$hit_cap" "$cap_n"
     elif [ "$format" = "json" ]; then
         local results
-        results=$(db_query_json "SELECT id, text, status, metadata, alias, created_at, updated_at FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;") || return 1
+        results=$(db_query_json "SELECT id, text, status, metadata, alias, created_at, updated_at FROM nodes $where_clause ORDER BY COALESCE(priority, 2) ASC, created_at DESC, id ASC $limit_clause;") || return 1
         [ -z "$results" ] && echo "[]" || echo "$results"
         local json_count cap_n="$_LIST_DEFAULT_LIMIT"
         [ "$status_filter" = "done" ] && cap_n="$_LIST_DONE_LIMIT"
@@ -4850,7 +5041,7 @@ cmd_list() {
     else
         # Text mode: exclude metadata to avoid multiline JSON breaking pipe-delimited parsing
         local row_count=0 results
-        results=$(db_query "SELECT id, text, status FROM nodes $where_clause ORDER BY priority DESC, created_at DESC, id ASC $limit_clause;") || return 1
+        results=$(db_query "SELECT id, text, status FROM nodes $where_clause ORDER BY COALESCE(priority, 2) ASC, created_at DESC, id ASC $limit_clause;") || return 1
         while IFS='|' read -r id text status; do
             [ -n "$id" ] || continue
             local color="$NC"
@@ -5157,16 +5348,20 @@ cmd_status() {
     # graph that could not be read printed blank counts, or zeros as JSON, and
     # exited 0.
     wv_require_graph || return 1
-    local active ready blocked pending_close stale
-    if ! { active=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active';") \
-        && ready=$(cmd_ready --count) \
-        && blocked=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='blocked';") \
-        && pending_close=$(db_query "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '$.needs_human_verification') = 1;") \
-        && stale=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND datetime(updated_at) < datetime('now', '-24 hours');"); }; then
+    # The four plain counts come from one read (wv-3125a9), joined into one
+    # column so the shell's own separator settings cannot change the split.
+    local counts active ready blocked pending_close stale
+    if ! { counts=$(db_query "SELECT
+            (SELECT COUNT(*) FROM nodes WHERE status='active') || ' ' ||
+            (SELECT COUNT(*) FROM nodes WHERE status='blocked') || ' ' ||
+            (SELECT COUNT(*) FROM nodes WHERE json_extract(metadata, '$.needs_human_verification') = 1) || ' ' ||
+            (SELECT COUNT(*) FROM nodes WHERE status='active' AND datetime(updated_at) < datetime('now', '-24 hours'));") \
+        && read -r active blocked pending_close stale <<< "$counts" \
+        && [[ "$active $blocked $pending_close $stale" =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]] \
+        && ready=$(cmd_ready --count); }; then
         echo -e "${RED}Error: could not read the graph's counts from $WV_DB${NC}" >&2
         return 1
     fi
-    : "${stale:=0}"
 
     # Sync-state: compare DB mtime vs last successful `wv sync --gh` timestamp
     local needs_sync="false"
@@ -5196,31 +5391,22 @@ cmd_status() {
         needs_sync="true"
     fi
 
-    local git_pending_json git_sync_pending git_sync_state git_sync_action git_sync_reason git_sync_hint
+    local git_pending_json git_fields git_sync_pending git_sync_state git_sync_action git_sync_reason git_sync_hint
     git_pending_json=$(_detect_git_pending 2>/dev/null || echo '{}')
-    git_sync_pending=$(echo "$git_pending_json" | jq -r '.pending // false' 2>/dev/null || echo "false")
-    git_sync_state=$(echo "$git_pending_json" | jq -r '.state // "clean"' 2>/dev/null || echo "clean")
-    git_sync_action=$(echo "$git_pending_json" | jq -r '.action // "none"' 2>/dev/null || echo "none")
-    git_sync_reason=$(echo "$git_pending_json" | jq -r '.reason // "clean"' 2>/dev/null || echo "clean")
-    git_sync_hint=$(echo "$git_pending_json" | jq -r '.hint // "no action required"' 2>/dev/null || echo "no action required")
+    # One jq for all five fields (wv-3125a9); the unit separator is not
+    # whitespace to read, so an empty field keeps its place.
+    git_fields=$(jq -r '[(.pending // false), (.state // "clean"), (.action // "none"),
+                         (.reason // "clean"), (.hint // "no action required")]
+                        | map(tostring) | join("\u001f")' <<< "$git_pending_json" 2>/dev/null) \
+        || git_fields=$'false\x1fclean\x1fnone\x1fclean\x1fno action required'
+    IFS=$'\x1f' read -r git_sync_pending git_sync_state git_sync_action git_sync_reason git_sync_hint <<< "$git_fields"
 
     if [ "$format" = "json" ]; then
         local primary_id="" primary_text=""
         if [ "${active:-0}" -gt 0 ]; then
-            primary_id=$(get_primary_node 2>/dev/null || true)
-            if [ -n "$primary_id" ]; then
-                local pstatus
-                pstatus=$(db_query "SELECT status FROM nodes WHERE id='$primary_id';" 2>/dev/null)
-                if [ "$pstatus" = "active" ]; then
-                    primary_text=$(db_query "SELECT text FROM nodes WHERE id='$primary_id';")
-                else
-                    primary_id=""
-                fi
-            fi
-            if [ -z "$primary_id" ]; then
-                primary_id=$(db_query "SELECT id FROM nodes WHERE status='active' LIMIT 1;")
-                primary_text=$(db_query "SELECT text FROM nodes WHERE status='active' LIMIT 1;")
-            fi
+            # This owner's claim only (wv-43d6be, wv-1caf6c).
+            primary_id=$(resolve_active_primary "$WV_DB" "$WV_HOT_ZONE")
+            [ -z "$primary_id" ] || primary_text=$(db_query "SELECT text FROM nodes WHERE id='$primary_id';")
         fi
         jq -n \
             --argjson active "${active:-0}" \
@@ -5268,25 +5454,21 @@ cmd_status() {
     fi
 
     if [ "$active" -gt 0 ]; then
-        local primary
+        # This owner's primary, else its newest claim; never another session's
+        # active node (wv-43d6be, wv-1caf6c). resolve_active_primary clears a
+        # primary that is no longer this owner's active claim.
+        local primary current ptext
         primary=$(get_primary_node)
-        if [ -n "$primary" ]; then
-            # Verify primary is still active
-            local pstatus
-            pstatus=$(db_query "SELECT status FROM nodes WHERE id='$primary';" 2>/dev/null)
-            if [ "$pstatus" = "active" ]; then
-                local ptext
-                ptext=$(db_query "SELECT text FROM nodes WHERE id='$primary';")
-                echo "Primary: $primary: $ptext"
+        current=$(resolve_active_primary "$WV_DB" "$WV_HOT_ZONE")
+        if [ -n "$current" ]; then
+            ptext=$(db_query "SELECT text FROM nodes WHERE id='$current';")
+            if [ "$current" = "$primary" ]; then
+                echo "Primary: $current: $ptext"
             else
-                # Primary is no longer active — clear and fall back
-                clear_primary_node
-                local current=$(db_query "SELECT id || ': ' || text FROM nodes WHERE status='active' LIMIT 1;")
-                echo "Current: $current"
+                echo "Current: $current: $ptext"
             fi
         else
-            local current=$(db_query "SELECT id || ': ' || text FROM nodes WHERE status='active' LIMIT 1;")
-            echo "Current: $current"
+            echo "Current: none claimed by this session ($active active, held by other sessions)"
         fi
     fi
 
@@ -5398,20 +5580,21 @@ EOF
 }
 
 read_update_metadata_source() {
-    local source_path="$1"
+    local source_path="$1" content
 
     if [ "$source_path" = "-" ]; then
-        cat
-        return $?
-    fi
-
-    if [ ! -f "$source_path" ]; then
+        content=$(cat) || return 1
+    elif [ ! -f "$source_path" ]; then
         echo -e "${RED}Error: metadata file not found: $source_path${NC}" >&2
         echo "Hint: use --metadata '{\"key\":\"value\"}' for inline JSON or point --metadata-file at an existing file." >&2
         return 1
+    else
+        content=$(cat -- "$source_path") || return 1
     fi
-
-    cat -- "$source_path"
+    # A payload read from a file or stdin never passed the dispatcher's argv
+    # scan (wv-320587).
+    wv_credential_refuse "--metadata-file $source_path" "$content" || return 1
+    printf '%s\n' "$content"
 }
 
 # validate_metadata_object <json> <source> — metadata is exactly one JSON

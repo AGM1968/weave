@@ -7,11 +7,24 @@ identities cannot be reused, then drains children adopted when those exit.
 macOS instead signals a private process group, keeping its leader unreaped to
 pin its identity. Descendants that leave that group are outside that boundary.
 This is process lifecycle containment, not a sandbox against hostile code.
+
+Shared slots (wv-428a92): when WV_GATE_SLOTS names a directory of slot files
+and WV_GATE_SLOT_STAMP names where to report, the command launches only once
+this process holds an exclusive flock on one of those files. Every candidate
+lane's suites draw from the same directory, so the gate as a whole runs at
+most as many suites as there are files, and a slot one lane frees goes to a
+suite waiting in any lane. The lock lives on a close-on-exec descriptor of
+this process: the command does not inherit it, and the kernel releases it
+when this process exits for any reason, a SIGKILL included. While waiting,
+WV_GATE_SLOT_STOP appearing means the pool has its verdict: exit 125 without
+launching. None of the three reaches the command, so a gate the command runs
+starts a budget of its own rather than waiting on this one.
 """
 
 import argparse
 from collections.abc import Callable
 import ctypes
+import fcntl
 import os
 from pathlib import Path
 import signal
@@ -218,8 +231,48 @@ def watch_group(root: int, label: str, bound: int, cancelled: Callable[[], int])
     return status if status is not None else (code if code >= 0 else 128 - code)
 
 
+NOT_STARTED = 125  # stopped while waiting for a slot; the command never ran
+SLOT_POLL_S = 0.05
+
+
+def acquire_slot(
+    slots: Path, stamp: Path, stop: Path | None, cancelled: Callable[[], int]
+) -> int | None:
+    """Hold one free slot file; return its descriptor, or None if told to stop.
+
+    The descriptor is close-on-exec (PEP 446) and is never closed here: the
+    slot is held until this process exits. Polls rather than blocking on one
+    file so that whichever slot frees first is taken. The stamp records the
+    slot and the epoch-ns moment it was taken, so the worker measures the
+    suite from then, not from when it started waiting.
+    """
+    paths = sorted(p for p in slots.iterdir() if p.is_file())
+    if not paths:
+        raise OSError(f"slot directory {slots} holds no slot files")
+    while True:
+        if cancelled():
+            return None
+        if stop is not None and stop.exists():
+            return None
+        for path in paths:
+            fd = os.open(path, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                continue
+            tmp = stamp.with_name(stamp.name + ".tmp")
+            tmp.write_text(f"{path.name} {time.time_ns()}\n", encoding="utf-8")
+            tmp.replace(stamp)
+            return fd
+        time.sleep(SLOT_POLL_S)
+
+
 def run(label: str, bound: int, command: list[str]) -> int:
     """Launch only after ownership is available; return after fully draining."""
+    slots = os.environ.pop("WV_GATE_SLOTS", "")
+    stamp = os.environ.pop("WV_GATE_SLOT_STAMP", "")
+    stop = os.environ.pop("WV_GATE_SLOT_STOP", "")
     if sys.platform == "linux":
         libc = ctypes.CDLL(None, use_errno=True)
         if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
@@ -246,6 +299,13 @@ def run(label: str, bound: int, command: list[str]) -> int:
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)  # Retain the direct child's exit status/PID.
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, cancel)
+    if slots and stamp:
+        held = acquire_slot(
+            Path(slots), Path(stamp), Path(stop) if stop else None, lambda: cancelled
+        )
+        if held is None:
+            return 128 + cancelled if cancelled else NOT_STARTED
+    # The deadline bounds the command, so it starts once a slot is held.
     start = time.monotonic()
     root = os.fork()
     if root == 0:

@@ -91,7 +91,7 @@ class TestFnName:
 class TestFallback:
     def test_missing_rule_files_returns_none(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """When rule files are absent, returns None (graceful degradation)."""
-        import weave_quality.typescript_parser as mod  # pylint: disable=import-outside-toplevel
+        import weave_quality.typescript_parser as mod  # pylint: disable=import-outside-toplevel  # noqa: PLC0415
         monkeypatch.setattr(mod, "_CC_RULE", tmp_path / "nonexistent_cc.yaml")
         monkeypatch.setattr(mod, "_FN_RULE", tmp_path / "nonexistent_fn.yaml")
         p = tmp_path / "f.ts"

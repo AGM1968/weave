@@ -11,7 +11,11 @@
 # Read version from VERSION file (next to this script)
 _WV_LIB_DIR="${WV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 if [ -f "$_WV_LIB_DIR/lib/VERSION" ]; then
-    WV_VERSION=$(cat "$_WV_LIB_DIR/lib/VERSION" | tr -d '[:space:]')
+    # Builtins only (wv-2ddb44): the whole file with every whitespace character
+    # removed, as cat | tr -d '[:space:]' gave, without a fork and two execs.
+    WV_VERSION=""
+    IFS= read -r -d '' WV_VERSION < "$_WV_LIB_DIR/lib/VERSION" || true
+    WV_VERSION="${WV_VERSION//[[:space:]]/}"
 else
     WV_VERSION="1.0.0"  # Fallback
 fi
@@ -108,6 +112,14 @@ WV_MAX_DB_SIZE=${WV_MAX_DB_SIZE:-52428800}
 # WV_CONFIG_DIR as a plain variable, and a suite that sources this file twice
 # in one shell (test-durability.sh does) would otherwise read its own default
 # back as a choice and let the user's config.env in on the second pass.
+#
+# An inherited WV_CALL_LOG is not always a suite's choice (wv-37c458): a hook or
+# a gate that loaded the user's config.env exports its WV_CALL_LOG (set -a
+# below) to every child, the suites it runs among them. Under the rule above
+# such a suite kept it and wrote into the user's durable log. An environment
+# WV_CALL_LOG is therefore kept only when it is neither what the user's
+# config.env sets nor the default user log path; a suite that names its own
+# scratch log still logs there.
 _wv_cfg_from_env=""
 [ -n "${WV_CONFIG_DIR:-}" ] && [[ "$(declare -p WV_CONFIG_DIR 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]] &&
     _wv_cfg_from_env=1
@@ -115,20 +127,50 @@ _wv_env_call_log_set="${WV_CALL_LOG+1}"
 _wv_env_call_log="${WV_CALL_LOG-}"
 WV_CONFIG_DIR="${WV_CONFIG_DIR:-$HOME/.config/weave}"
 _wv_env_file="$WV_CONFIG_DIR/config.env"
+_wv_cfg_call_log=""
 if [ -f "$_wv_env_file" ]; then
+    unset WV_CALL_LOG
     set -a
     # shellcheck disable=SC1090  # path is user config, resolved at runtime
     . "$_wv_env_file" 2>/dev/null || true
     set +a
+    _wv_cfg_call_log="${WV_CALL_LOG-}"
+    # Outside a suite the config still wins over the environment, as before.
+    [ -z "${WV_CALL_LOG+1}" ] && [ -n "$_wv_env_call_log_set" ] && WV_CALL_LOG="$_wv_env_call_log"
 fi
-if [ "${WV_TEST_SUITE:-}" = "1" ] && [ -z "$_wv_cfg_from_env" ]; then
-    if [ -n "$_wv_env_call_log_set" ]; then
-        WV_CALL_LOG="$_wv_env_call_log"
-    else
+# _wv_is_user_call_log PATH — PATH is the user's own durable log: the default
+# path, or what the user's own config.env (under HOME, whatever WV_CONFIG_DIR
+# names) sets. Read in a subshell so nothing it sets leaks into this one.
+_wv_is_user_call_log() {
+    [ -n "$1" ] || return 1
+    [ "$1" = "$HOME/.local/share/weave/wv_calls.jsonl" ] && return 0
+    local home_cfg="$HOME/.config/weave/config.env" theirs
+    [ -f "$home_cfg" ] || return 1
+    # shellcheck disable=SC1090  # path is user config, resolved at runtime
+    theirs=$(unset WV_CALL_LOG; . "$home_cfg" >/dev/null 2>&1; printf '%s' "${WV_CALL_LOG-}")
+    [ -n "$theirs" ] && [ "$1" = "$theirs" ]
+}
+if [ "${WV_TEST_SUITE:-}" = "1" ]; then
+    if [ -z "$_wv_cfg_from_env" ]; then
+        # No chosen config dir: the user's config.env cannot turn the log on,
+        # and an inherited user log is not the suite's choice.
+        if [ -n "$_wv_env_call_log_set" ] \
+            && [ "$_wv_env_call_log" != "$_wv_cfg_call_log" ] \
+            && ! _wv_is_user_call_log "$_wv_env_call_log"; then
+            WV_CALL_LOG="$_wv_env_call_log"
+        else
+            unset WV_CALL_LOG
+        fi
+    elif [ -z "$_wv_cfg_call_log" ] && [ -n "$_wv_env_call_log_set" ] \
+        && _wv_is_user_call_log "$_wv_env_call_log"; then
+        # A chosen config dir whose config.env sets no log: an inherited user
+        # log still does not apply (the parity checker's scratch config, run by
+        # a hook that loaded the user's config.env).
         unset WV_CALL_LOG
     fi
 fi
-unset _wv_env_file _wv_cfg_from_env _wv_env_call_log_set _wv_env_call_log
+unset -f _wv_is_user_call_log
+unset _wv_env_file _wv_cfg_from_env _wv_env_call_log_set _wv_env_call_log _wv_cfg_call_log
 
 # Canonical default path for the opt-in session-analysis call log. Shared by the
 # `wv analyze sessions` reader and `wv config enable session-analysis` so the
@@ -190,7 +232,10 @@ _WV_BASE_HOT_ZONE=$(resolve_hot_zone "$REPO_ROOT") || _WV_PLACEMENT_CONFLICT=1
 WV_HOT_ZONE="${WV_HOT_ZONE:-$(resolve_repo_hot_zone "$_WV_BASE_HOT_ZONE" "$REPO_ROOT")}"
 WV_DB_CUSTOM="${WV_DB:+1}"
 WV_DB="${WV_DB:-$(resolve_db "$WV_HOT_ZONE")}"
-WV_PRIMARY_FILE="${WV_PRIMARY_FILE:-$(resolve_primary_file "$WV_HOT_ZONE")}"
+# WV_PRIMARY_FILE stays an explicit override only: the default is resolved per
+# call from this owner's directory (wv-43d6be), after a hook has adopted its
+# payload's session id.
+WV_PRIMARY_FILE="${WV_PRIMARY_FILE:-}"
 
 # Fails closed before any use (wv-80be32): a hot zone inside a shared-parent
 # base another user could have created first is refused, never chmodded.
@@ -202,19 +247,24 @@ if [ -n "$_WV_PLACEMENT_CONFLICT" ] && [ -z "$_WV_ENV_OVERRIDE_HOT_ZONE" ]; then
 fi
 
 # Primary active node helpers
-# The "primary" node is the most recently claimed via `wv work`.
-# Stored in $WV_HOT_ZONE/primary (tmpfs, session-scoped).
+# The "primary" node is the one this owner most recently claimed via `wv work`.
+# Stored in this owner's hot-zone directory (resolve_owner_dir), so another
+# session's claim never becomes this session's primary (wv-43d6be).
 set_primary_node() {
-    local id="$1"
-    echo "$id" > "$WV_PRIMARY_FILE"
+    local id="$1" file
+    file=$(resolve_primary_file "$WV_HOT_ZONE") || return 0
+    (umask 077 && mkdir -p "${file%/*}") 2>/dev/null || true
+    echo "$id" > "$file"
 }
 
 get_primary_node() {
-    [ -f "$WV_PRIMARY_FILE" ] && cat "$WV_PRIMARY_FILE" 2>/dev/null || echo ""
+    local file
+    file=$(resolve_primary_file "$WV_HOT_ZONE") || { echo ""; return 0; }
+    [ -f "$file" ] && cat "$file" 2>/dev/null || echo ""
 }
 
 clear_primary_node() {
-    rm -f "$WV_PRIMARY_FILE" 2>/dev/null || true
+    rm -f "$(resolve_primary_file "$WV_HOT_ZONE")" 2>/dev/null || true
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -310,10 +360,12 @@ validate_hot_size() {
     fi
 }
 
-# wv_set_phase — write .session_phase atomically with enum validation.
+# wv_set_phase — write this owner's .session_phase with enum validation.
 # Usage: wv_set_phase <phase> [<hot-zone-dir>]
-# Valid values sourced from PHASE_VALUES in wv-validate.sh.
-# Falls back to no-op if hot zone unavailable.
+# Valid values sourced from PHASE_VALUES in wv-validate.sh. The file lives in
+# the owner's directory (resolve_phase_file), never the shared hot-zone root
+# (wv-43d6be). No-op if the hot zone is unavailable or the session cannot be
+# verified.
 wv_set_phase() {
     local phase="$1"
     local hot_zone="${2:-${WV_HOT_ZONE:-}}"
@@ -326,7 +378,11 @@ wv_set_phase() {
         echo "wv_set_phase: invalid phase '$phase' (valid: ${PHASE_VALUES:-discover execute closing})" >&2
         return 1
     fi
-    [ -n "$hot_zone" ] && printf '%s' "$phase" > "${hot_zone}/.session_phase" 2>/dev/null || true
+    [ -n "$hot_zone" ] || return 0
+    local file
+    file=$(resolve_phase_file "$hot_zone") || return 0
+    (umask 077 && mkdir -p "${file%/*}") 2>/dev/null || true
+    printf '%s' "$phase" > "$file" 2>/dev/null || true
 }
 
 # _wv_source_drift — fast, cross-agent check: do edited Weave source files
@@ -418,11 +474,15 @@ _wv_concurrent_session() {
         # Match the executable name (/proc/<pid>/comm), not the full cmdline —
         # cmdline substring matching false-positived on an unrelated bash
         # subprocess whose command referenced a ~/.claude/ path. comm is
-        # truncated to 15 chars by the kernel, so match by prefix.
+        # truncated to 15 chars by the kernel, so match by prefix. pi and amp
+        # are exact (observed comm `pi`, `amp` on 2026-11-04, wv-d09cee): a
+        # prefix would catch pip/ping/pipewire. AI_AGENT in environ is not a
+        # usable signal — the harness sets it for its children, not itself,
+        # so it would flag this session's own non-ancestor shells.
         comm=$(cat "$pid_dir/comm" 2>/dev/null)
         [ -n "$comm" ] || continue
         case "$comm" in
-            codex*|claude*|copilot*) ;;
+            codex*|claude*|copilot*|pi|amp) ;;
             *) continue ;;
         esac
         cmd=$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null)

@@ -909,7 +909,8 @@ test_discover() {
     ctx=$("$WV" context "$seed" --json --mode=discover 2>&1)
     assert_jq_true "$ctx" '.discovery.schema == "weave.discovery.v1" and (.discovery.unknown_unknown_candidates | length >= 1)' "context discover-mode: embeds bounded discovery report"
 
-    "$WV" update "$seed" --status=active >/dev/null 2>&1
+    # Claimed, not just activated: only the owner's claim is its active context (wv-43d6be).
+    "$WV" work "$seed" >/dev/null 2>&1
     boot=$("$WV" bootstrap --json 2>/dev/null)
     assert_jq_true "$boot" '.context.discovery.schema == "weave.discovery.v1" and (.context.discovery.unknown_unknown_candidates | length >= 1)' "bootstrap JSON: active context includes bounded discovery report"
 
@@ -1050,7 +1051,6 @@ test_unified_blocking() {
         source '$PROJECT_ROOT/scripts/lib/wv-db.sh'
         source '$PROJECT_ROOT/scripts/lib/wv-attempt-journal.sh'
         source '$PROJECT_ROOT/scripts/cmd/wv-cmd-graph.sh'
-        source '$PROJECT_ROOT/scripts/cmd/wv-cmd-ops.sh'
         source '$PROJECT_ROOT/scripts/cmd/wv-cmd-core.sh'
         _done_write_trail '$closer'
     ")

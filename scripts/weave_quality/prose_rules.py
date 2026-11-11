@@ -727,6 +727,35 @@ def _find_all(haystack: str, needle: str) -> Iterator[int]:
         pos = haystack.find(needle, pos + 1)
 
 
+_EXEMPT_SEPARATOR_RE = re.compile(r"(?:-|\s+)")
+
+
+def _exempt_regexes(rule: dict[str, object]) -> list[re.Pattern[str]]:
+    """Compile a rule's `exempt:` terms as case-insensitive substring
+    matchers in which a hyphen and a run of whitespace are interchangeable
+    (wv-fa7684): an entry "surface soil moisture" also exempts
+    "surface-soil moisture" and "surface-soil-moisture", so a hyphenated
+    variant no longer needs its own entry."""
+    out: list[re.Pattern[str]] = []
+    for item in _string_list(rule, "exempt"):
+        parts = [part for part in _EXEMPT_SEPARATOR_RE.split(item) if part]
+        if parts:
+            out.append(re.compile(r"(?:-|\s+)".join(re.escape(part) for part in parts), re.I))
+    return out
+
+
+def _exempt_spans(line: str, exemptions: list[re.Pattern[str]]) -> list[tuple[int, int]]:
+    """Every (start, end) span in line covered by an exempt term, overlapping
+    occurrences included (same coverage _find_all gave the literal match)."""
+    spans: list[tuple[int, int]] = []
+    for rx in exemptions:
+        pos = 0
+        while (match := rx.search(line, pos)) is not None:
+            spans.append(match.span())
+            pos = match.start() + 1
+    return spans
+
+
 def _string_list(rule: dict[str, object], key: str) -> list[str]:
     value = rule.get(key)
     if not isinstance(value, list):
@@ -3439,19 +3468,14 @@ def _scan_lines(text: str, rule: dict[str, object]) -> list[_ScanLine]:
 
 def _lexicon_findings(text: str, rule: dict[str, object]) -> list[_Span]:
     terms = _string_list(rule, "terms")
-    exempt = [item.lower() for item in _string_list(rule, "exempt")]
+    exempt = _exempt_regexes(rule)
     if not terms:
         return []
     rx = _word_regex(terms)
     out: list[_Span] = []
     for scan_line in _scan_lines(text, rule):
         line = scan_line.text
-        lowered = line.lower()
-        spans = [
-            (pos, pos + len(exemption))
-            for exemption in exempt
-            for pos in _find_all(lowered, exemption)
-        ]
+        spans = _exempt_spans(line, exempt)
         for match in rx.finditer(line):
             if any(start <= match.start() and match.end() <= end for start, end in spans):
                 continue
@@ -3540,21 +3564,39 @@ def _density_findings(text: str, rule: dict[str, object]) -> list[_Span]:
     return out
 
 
+def _regex_scan_lines(text: str, rule: dict[str, object]) -> list[_ScanLine]:
+    """Scan units for a regex rule, minus the References section (wv-c557db).
+
+    Citation entries and quoted titles are someone else's wording, so a
+    prose rule firing there reports nothing the author can change. The
+    section is the one _citation_findings resolves against (heading
+    included). Markup rules (violation_type `markdown:*`) still scan it:
+    a malformed construct is the author's own wherever it sits.
+    """
+    units = _scan_lines(text, rule)
+    if str(rule.get("violation_type", "")).startswith("markdown:"):
+        return units
+    references_start, references_end = _locate_references_section(text.splitlines())
+    # starts carry 1-based line numbers; the section spans 0-based indices
+    # references_start (the heading) up to, not including, references_end.
+    return [
+        unit
+        for unit in units
+        if not references_start < unit.starts[0][1] <= references_end
+    ]
+
+
 def _regex_findings(text: str, rule: dict[str, object]) -> list[_Span]:
     out: list[_Span] = []
-    exemptions = [item.lower() for item in _string_list(rule, "exempt")]
+    exemptions = _exempt_regexes(rule)
     min_count = int(str(rule.get("min_count", 1)))
+    scan_lines = _regex_scan_lines(text, rule)
     for pattern in _string_list(rule, "patterns"):
         rx = re.compile(pattern, re.IGNORECASE)
         hits: list[tuple[_ScanLine, re.Match[str]]] = []
-        for scan_line in _scan_lines(text, rule):
+        for scan_line in scan_lines:
             line = scan_line.text
-            lowered = line.lower()
-            exempt_spans = [
-                (pos, pos + len(exemption))
-                for exemption in exemptions
-                for pos in _find_all(lowered, exemption)
-            ]
+            exempt_spans = _exempt_spans(line, exemptions)
             for match in rx.finditer(line):
                 if any(start <= match.start() and match.end() <= end for start, end in exempt_spans):
                     continue

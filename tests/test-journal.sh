@@ -388,14 +388,16 @@ mkdir -p "$_sync_repo" "$TEST_DIR/sync-hot" "$TEST_DIR/sync-cfg"
 _sync() {
     (cd "$_sync_repo" && env -u WV_AUTO_CHECKPOINT_ACTIVE WV_HOT_ZONE="$TEST_DIR/sync-hot" \
         WV_DB="$TEST_DIR/sync-hot/brain.db" WV_CONFIG_DIR="$TEST_DIR/sync-cfg" \
-        WV_PROJECT_DIR="$_sync_repo" WV_AUTO_SYNC=0 WV_AUTO_CHECKPOINT=0 "$WV" "$@")
+        WV_PROJECT_DIR="$_sync_repo" WV_AUTO_SYNC=0 WV_AUTO_CHECKPOINT="${_sync_cp:-0}" "$WV" "$@")
 }
 _sync init >/dev/null 2>&1 || true
 _sync add "staged-sync probe" --standalone --force --criteria="a" --risks=low >/dev/null 2>&1 || true
 printf 'y\n' > "$_sync_repo/a"
 git -C "$_sync_repo" add a
 _sync_rc=0
-_sync_out=$(_sync sync 2>&1) || _sync_rc=$?
+# WV_AUTO_CHECKPOINT=0 now stops sync's final commit too (wv-fbbdff), so this
+# call turns it on to reach the staged-caller branch under test.
+_sync_out=$(_sync_cp=1 _sync sync 2>&1) || _sync_rc=$?
 assert_equals "0" "$_sync_rc" "wv sync with a caller file staged exits 0"
 assert_equals "1" "$(grep -c 'staged-sync probe' "$_sync_repo/.weave/nodes.jsonl" 2>/dev/null || echo 0)" \
     "...after dumping the graph"

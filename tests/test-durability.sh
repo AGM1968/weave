@@ -882,6 +882,36 @@ recover_json=$("$WV" recover --json 2>/dev/null)
 assert_contains "$recover_json" '"status": "git_unresolvable"' "recover surfaces unresolvable source-4 state"
 assert_contains "$recover_json" '"reason": "no_upstream"' "recover reports no_upstream reason"
 
+# ─── source-4 paths classified by their real names (wv-3125a9) ─────────
+# One NUL-separated status walk replaced two text ones. The text form quoted
+# unusual names and wrote renames as "old -> new", so a .weave/ file git
+# quoted, or one whose name held " -> ", read as a change outside .weave/.
+
+echo ""
+echo -e "${CYAN}--- source-4 path classification ---${NC}"
+setup_source4_env
+setup_remote_tracking
+
+echo "q" > ".weave/quoted\"name"
+git add -A .weave >/dev/null 2>&1
+git commit -m "quoted weave name" -q --no-verify >/dev/null 2>&1
+status_json=$("$WV" status --json 2>/dev/null)
+assert_contains "$status_json" '"git_sync_reason": "ahead_weave"' "a commit of a quoted .weave/ name is a .weave/ commit"
+git push -q >/dev/null 2>&1
+
+# .weave/ now holds a tracked file, so git lists its untracked files one by
+# one instead of collapsing them into a single ".weave/" entry.
+echo "q" > ".weave/also\"quoted"
+echo "a" > ".weave/p -> q"
+status_json=$("$WV" status --json 2>/dev/null)
+assert_contains "$status_json" '"git_sync_reason": "dirty_weave"' "a .weave/ name git quotes, or holding ' -> ', is .weave/ work"
+rm -f ".weave/also\"quoted" ".weave/p -> q"
+
+git mv README.md .weave/README.md >/dev/null 2>&1
+status_json=$("$WV" status --json 2>/dev/null)
+assert_contains "$status_json" '"git_sync_reason": "dirty_outside_weave"' "a rename into .weave/ still dirties the tree outside it"
+git mv .weave/README.md README.md >/dev/null 2>&1
+
 # ─── wv doctor journal check ───────────────────────────────────────────
 
 echo ""

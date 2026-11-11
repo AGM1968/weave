@@ -93,6 +93,48 @@ shadow=$(
 )
 check "a heredoc line naming db_ensure does not shadow it" "shadow probe" "$shadow"
 
+# wv-2ddb44: one awk pass writes every stub. It must define exactly what the
+# per-name loop it replaced defined, over the real libraries and modules: the
+# libraries are sourced as scripts/wv sources them, each generator runs in its
+# own shell, and the two function tables are compared whole.
+stub_table() {  # stub_table <loop|awk>: declare -f after the stubs are made
+    WV_LIB_DIR="$LIB" bash -c '
+        eval "$(grep -E "^source \"\\\$WV_LIB_DIR/lib/" "$WV_LIB_DIR/wv")" >/dev/null 2>&1
+        if [ "$1" = loop ]; then
+            while IFS=: read -r f fn; do
+                fn="${fn%()}"; m="${f#wv-cmd-}"; m="${m%.sh}"
+                declare -F "$fn" >/dev/null && continue
+                eval "$fn() { _wv_autoload_call $m $fn \"\$@\"; }"
+            done < <(cd "$WV_LIB_DIR/cmd" && grep -oE "^[a-zA-Z_][a-zA-Z0-9_]*\(\)" wv-cmd-*.sh)
+        else
+            block=$(sed -n "/^    eval \"\\\$(declare -F | {/,/^        }. - wv-cmd-\\*\\.sh; })\"\$/p" "$WV_LIB_DIR/wv")
+            [ -n "$block" ] || { echo "stub block not found in scripts/wv"; exit 1; }
+            eval "$block"
+        fi
+        declare -f' _ "$1" 2>&1
+}
+loop_table=$(stub_table loop); awk_table=$(stub_table awk)
+check "the stub generator defines the same functions as the per-name loop" "same" \
+    "$([ "$loop_table" = "$awk_table" ] && echo same || echo differs)"
+check "...and the comparison saw the stubs" "yes" \
+    "$([ "$(grep -c '_wv_autoload_call ' <<< "$awk_table")" -gt 100 ] && echo yes || echo no)"
+
+# wv-2ddb44: a node-id command ensures the graph once, in the dispatching
+# shell. The memo db_ensure sets inside $(db_query ...) dies with that
+# subshell, and context --json ran the full stamp check nine times.
+full_ensures() { WV_LIB_DIR="$LIB" PS4='+ ' bash -x "$LIB/wv" "$@" 2>&1 >/dev/null | grep -c '^+* _wv_db_stamp_current$'; }
+check "wv show <id> runs the full graph check once" "1" "$(full_ensures show "$id")"
+check "wv context <id> --json runs the full graph check once" "1" "$(full_ensures context "$id" --json)"
+# A graph that cannot be opened is reported as that, not as a missing node.
+unopenable=$(
+    export WV_HOT_ZONE="$T/hot4" WV_DB="$T/hot4/brain.db"
+    (umask 077 && mkdir -p "$T/hot4")
+    head -c 4096 /dev/urandom > "$WV_DB"
+    out=$(wvx "$LIB" show wv-abcdef 2>&1); rc=$?
+    printf '%s %s' "$rc" "$(grep -c 'cannot open the graph database' <<< "$out")"
+)
+check "a node-id command on an unopenable graph fails naming the graph" "1 1" "$unopenable"
+
 # wv-c153c4: load and done loaded all of wv-cmd-ops.sh for six shared helpers,
 # and hotzone lived there, so every suite running them was routed from ops.
 # The helpers moved to their callers' modules (python helpers to their own),
@@ -143,11 +185,29 @@ for pair in validate_on_done:wv-cmd-core.sh score_learning:wv-cmd-core.sh \
             cmd_recover:wv-cmd-recover.sh _recover_run:wv-cmd-recover.sh _recover_ship:wv-cmd-recover.sh \
             _recover_sync:wv-cmd-recover.sh _recover_delete:wv-cmd-recover.sh _recover_session:wv-cmd-recover.sh \
             _detect_git_pending:wv-cmd-gitstate.sh _git_pending_hint:wv-cmd-gitstate.sh \
-            _git_commit_weave_ownership:wv-cmd-gitstate.sh _git_status_has_outside_weave_changes:wv-cmd-gitstate.sh \
+            _git_commit_weave_ownership:wv-cmd-gitstate.sh _git_status_weave_split:wv-cmd-gitstate.sh \
             _wv_repo_procedure_file:wv-cmd-procedures.sh _doctor_repo_procedures:wv-cmd-procedures.sh \
             _memory_graduate_target:wv-cmd-graduate.sh _doctor_memory_budget:wv-cmd-graduate.sh; do
     check "${pair%%:*} is defined in ${pair#*:}, not wv-cmd-ops.sh" "${pair#*:}" "$(owner "${pair%%:*}")"
 done
+# wv-71933b: the ops family split, so a change routes along module boundaries.
+# Each command and the helpers shared inside a family live in that family's module.
+for pair in cmd_doctor:wv-cmd-doctor.sh cmd_pattern_audit:wv-cmd-doctor.sh \
+            _doctor_record:wv-cmd-doctor.sh _hook_common_unwired:wv-cmd-doctor.sh \
+            cmd_health:wv-cmd-health.sh cmd_selftest:wv-cmd-health.sh _health_cache_summary:wv-cmd-health.sh \
+            cmd_help:wv-cmd-help.sh cmd_help_topic:wv-cmd-help.sh cmd_guide:wv-cmd-help.sh \
+            print_command_help:wv-cmd-help.sh \
+            cmd_bootstrap:wv-cmd-orient.sh cmd_preflight:wv-cmd-orient.sh cmd_digest:wv-cmd-orient.sh \
+            cmd_overview:wv-cmd-orient.sh cmd_session_summary:wv-cmd-orient.sh cmd_context_policy:wv-cmd-orient.sh \
+            cmd_audit_pitfalls:wv-cmd-orient.sh cmd_repo_class:wv-cmd-orient.sh \
+            _bootstrap_agent_tools_json:wv-cmd-orient.sh _preflight_policy_readiness:wv-cmd-orient.sh \
+            cmd_mcp_status:wv-cmd-ops.sh cmd_cache:wv-cmd-ops.sh cmd_edge_types:wv-cmd-ops.sh \
+            cmd_init_repo:wv-cmd-ops.sh; do
+    check "${pair%%:*} is defined in ${pair#*:}" "${pair#*:}" "$(owner "${pair%%:*}")"
+done
+# print_command_help serves only cmd_help_topic, so a help topic loads help alone.
+l=$(loads_of help add); check "wv help <topic> loads help and neither ops nor orient" \
+    "help yes, ops no, orient no" "help $(has "$l" help), ops $(has "$l" ops), orient $(has "$l" orient)"
 
 echo ""
 echo "Results: $pass/$run passed"

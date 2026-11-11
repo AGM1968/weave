@@ -42,6 +42,9 @@ export WV_DB="$TEST_DIR/brain.db"
 export WV_REQUIRE_LEARNING=0
 export WV_RUN_CACHE=0
 export WV_PROJECT_DIR="$TEST_DIR"
+# The phase is per owner (wv-43d6be): pin one owner, whatever session runs this.
+export WV_AGENT_ID=phase-fsm-test
+PHASE_FILE="$TEST_DIR/owners/$WV_AGENT_ID/.session_phase"
 
 cleanup() { cd /tmp && rm -rf "$TEST_DIR"; }
 trap cleanup EXIT
@@ -53,6 +56,7 @@ setup_test_env() {
     cd "$TEST_DIR"
     git init -q
     "$WV" init -q 2>/dev/null || true
+    mkdir -p "${PHASE_FILE%/*}"
 }
 
 assert_equals() {
@@ -145,7 +149,7 @@ test_set_phase_valid_values() {
             type wv_set_phase >/dev/null 2>&1 && wv_set_phase '$phase'
         " || rc=$?
         local written
-        written=$(cat "$TEST_DIR/.session_phase" 2>/dev/null || echo "")
+        written=$(cat "$PHASE_FILE" 2>/dev/null || echo "")
         if [ "$written" = "$phase" ]; then
             echo -e "  ${GREEN}[PASS]${NC} wv_set_phase writes '$phase'"
             TESTS_RUN=$((TESTS_RUN + 1))
@@ -169,7 +173,7 @@ test_set_phase_rejects_invalid() {
     " 2>/dev/null || rc=$?
     # Expect nonzero exit; file should not be written with invalid value
     local written
-    written=$(cat "$TEST_DIR/.session_phase" 2>/dev/null || echo "")
+    written=$(cat "$PHASE_FILE" 2>/dev/null || echo "")
     if [ "$written" = "invalid-phase" ] || [ -z "$written" ] && [ "$rc" -eq 0 ]; then
         echo -e "  ${RED}[FAIL]${NC} wv_set_phase accepted invalid phase value"
         TESTS_RUN=$((TESTS_RUN + 1))
@@ -184,10 +188,10 @@ test_set_phase_rejects_invalid() {
 test_default_phase_is_execute() {
     echo "-- missing .session_phase defaults to execute (both hooks)"
     setup_test_env
-    rm -f "$TEST_DIR/.session_phase"
+    rm -f "$PHASE_FILE"
     local phase
     # Both hook readers do: cat .session_phase 2>/dev/null || echo "execute"
-    phase=$(cat "$TEST_DIR/.session_phase" 2>/dev/null || echo "execute")
+    phase=$(cat "$PHASE_FILE" 2>/dev/null || echo "execute")
     assert_equals "execute" "$phase" "missing .session_phase defaults to execute"
 }
 
@@ -198,10 +202,10 @@ test_work_transition_sets_execute() {
     id=$("$WV" add "test task" 2>/dev/null | tail -1)
     "$WV" update "$id" --alias=phase-test 2>/dev/null
     # Pre-set to discover so we can detect the change
-    echo "discover" > "$TEST_DIR/.session_phase"
+    echo "discover" > "$PHASE_FILE"
     WV_SKIP_PRECOMMIT=1 "$WV" work "$id" 2>/dev/null || true
     local phase
-    phase=$(cat "$TEST_DIR/.session_phase" 2>/dev/null || echo "")
+    phase=$(cat "$PHASE_FILE" 2>/dev/null || echo "")
     # Transition already works (raw echo in cmd_work); assert_equals now.
     # After wv-b7813e: this same test verifies wv_set_phase is being used.
     assert_equals "execute" "$phase" "wv work sets .session_phase to execute"
@@ -210,21 +214,21 @@ test_work_transition_sets_execute() {
 test_add_active_transition_sets_execute() {
     echo "-- wv add --status=active sets phase to execute (WorkClaimed event)"
     setup_test_env
-    echo "discover" > "$TEST_DIR/.session_phase"
+    echo "discover" > "$PHASE_FILE"
     "$WV" add "active-on-create task" --status=active --standalone \
         --criteria="c1" --risks=low --alias=add-active-test 2>/dev/null >/dev/null || true
     local phase
-    phase=$(cat "$TEST_DIR/.session_phase" 2>/dev/null || echo "")
+    phase=$(cat "$PHASE_FILE" 2>/dev/null || echo "")
     assert_equals "execute" "$phase" "wv add --status=active sets .session_phase to execute"
 }
 
 test_add_todo_does_not_change_phase() {
     echo "-- wv add (todo) leaves phase unchanged"
     setup_test_env
-    echo "discover" > "$TEST_DIR/.session_phase"
+    echo "discover" > "$PHASE_FILE"
     "$WV" add "plain todo task" --standalone --alias=add-todo-test 2>/dev/null >/dev/null || true
     local phase
-    phase=$(cat "$TEST_DIR/.session_phase" 2>/dev/null || echo "")
+    phase=$(cat "$PHASE_FILE" 2>/dev/null || echo "")
     assert_equals "discover" "$phase" "wv add without --status=active leaves phase at discover"
 }
 
@@ -237,7 +241,7 @@ test_done_transition_sets_closing() {
     WV_SKIP_PRECOMMIT=1 "$WV" work "$id" 2>/dev/null || true
     WV_SKIP_PRECOMMIT=1 "$WV" "done" "$id" --skip-verification 2>/dev/null || true
     local phase
-    phase=$(cat "$TEST_DIR/.session_phase" 2>/dev/null || echo "")
+    phase=$(cat "$PHASE_FILE" 2>/dev/null || echo "")
     # Transition already works (raw echo in cmd_done); assert_equals now.
     # After wv-b7813e: this same test verifies wv_set_phase is being used.
     assert_equals "closing" "$phase" "wv done sets .session_phase to closing"
@@ -247,7 +251,7 @@ test_doctor_flags_invalid_phase() {
     echo "-- wv doctor flags invalid .session_phase"
     setup_test_env
     "$WV" init -q 2>/dev/null || true
-    echo "bogus-xphase" > "$TEST_DIR/.session_phase"
+    echo "bogus-xphase" > "$PHASE_FILE"
     local output rc=0
     output=$("$WV" doctor 2>&1) || rc=$?
     # Check for the invalid value itself (not "phase" which may appear in path names)

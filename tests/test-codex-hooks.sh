@@ -23,6 +23,11 @@ export WV_HOT_ZONE="$HOT"
 export WV_DB="$HOT/brain.db"
 export WV_REQUIRE_LEARNING=0
 export WV_RUN_CACHE=0
+# Session-local state is per owner (wv-43d6be): pin one owner, whatever
+# session runs this suite.
+export WV_AGENT_ID=test-codex-hooks-agent
+OWN="$HOT/owners/$WV_AGENT_ID"
+mkdir -p "$OWN"
 
 pass=0
 total=0
@@ -102,7 +107,7 @@ check "SessionStart returns stable active-node JSON" _jq_ok "$session_output" \
 # ── PreToolUse: installed-path guard blocks edits to ~/.local/bin or ~/.local/lib/weave,
 # parity with Claude's pre-action.sh (_hc_check_installed_path). apply_patch headers have
 # no file_path/filePath field, so this scans every path _hook_input_paths can extract.
-printf 'execute' > "$HOT/.session_phase"
+printf 'execute' > "$OWN/.session_phase"
 set +e
 installed_output=$(printf '%s' '{"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n*** Update File: /fake/.local/lib/weave/cmd/wv-cmd-hook.sh\n*** End Patch"}}' \
     | "$WV" hook dispatch --event=PreToolUse --json)
@@ -127,7 +132,7 @@ check "the legacy patchText shape still meets the installed-copy guard" test "$l
 "$WV" hook dispatch --event=SessionStart --json <<<'{}' >/dev/null
 check "SessionStart writes .session_epoch" test -f "$HOT/.session_epoch"
 check "SessionStart resets phase to discover" \
-    test "$(cat "$HOT/.session_phase" 2>/dev/null)" = "discover"
+    test "$(cat "$OWN/.session_phase" 2>/dev/null)" = "discover"
 
 # ── SessionStart parity (wv-a523de): the command .codex/hooks.json runs and the
 # Claude adapter run one session start and emit the same hookSpecificOutput. A
@@ -171,7 +176,7 @@ check "discover-phase decision names the phase" _jq_ok "$discover_output" \
 
 # ── PreToolUse: an active node that predates this session (session_epoch) is
 # rejected until re-claimed — the wv-cd13b5 orphan-node scenario.
-printf 'execute' > "$HOT/.session_phase"
+printf 'execute' > "$OWN/.session_phase"
 sqlite3 "$WV_DB" "UPDATE nodes SET updated_at = datetime('now', '-1 hour') WHERE id='$node_id';"
 set +e
 stale_reclaim_output=$(printf '%s' '{"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n*** Update File: src/d.py\n*** End Patch"}}' \
@@ -251,7 +256,7 @@ primary_blocker_node=$("$WV" add "Primary blocking prerequisite fixture" --statu
 primary_clean_node=$("$WV" add "Secondary clean Codex hook fixture" --status=active \
     --criteria="clean secondary must not mask primary" --risks=low --force --json \
     | jq -r '.id')
-printf '%s' "$primary_blocked_node" > "$HOT/primary"
+printf '%s' "$primary_blocked_node" > "$OWN/primary"
 set +e
 primary_blocked_output=$(printf '%s' '{"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n*** Update File: src/primary-blocked.py\n*** End Patch"}}' \
     | "$WV" hook dispatch --event=PreToolUse --json)
@@ -274,8 +279,8 @@ stamped_node=$("$WV" add "Stamped Codex hook fixture" --status=active \
 stamped_blocker_node=$("$WV" add "Stamped blocking prerequisite fixture" --status=todo \
     --criteria="late blocker remains open" --risks=low --force --json \
     | jq -r '.id')
-printf '%s' "$stamped_node" > "$HOT/primary"
-touch "$HOT/.context_checked_${stamped_node}"
+printf '%s' "$stamped_node" > "$OWN/primary"
+touch "$OWN/.context_checked_${stamped_node}"
 "$WV" link "$stamped_blocker_node" "$stamped_node" --type=blocks >/dev/null
 set +e
 stamped_output=$(printf '%s' '{"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n*** Update File: src/stamped.py\n*** End Patch"}}' \
@@ -346,8 +351,8 @@ _parity() {  # _parity <label> <hook> <payload> <expected exit>; sets PARITY_OUT
     check "$label: same stderr" cmp -s "$TEST_DIR/claude.err" "$TEST_DIR/codex.err"
 }
 _bash_payload() { jq -cn --arg c "$1" --arg cwd "$REPO" '{tool_name:"Bash",tool_input:{command:$c},cwd:$cwd}'; }
-printf 'execute' > "$HOT/.session_phase"
-rm -f "$HOT/.session_epoch" "$HOT/primary"
+printf 'execute' > "$OWN/.session_phase"
+rm -f "$HOT/.session_epoch" "$OWN/primary"
 
 _parity "edit with no active node" pre-action.sh \
     '{"tool_name":"Edit","tool_input":{"file_path":"src/p.py","old_string":"a","new_string":"b"}}' 2

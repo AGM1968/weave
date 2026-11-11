@@ -112,7 +112,7 @@ class TestAnalyzeBashFileBest:
     def test_regex_fallback_when_ast_grep_unavailable(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import weave_quality.bash_ast_grep as mod  # pylint: disable=import-outside-toplevel
+        import weave_quality.bash_ast_grep as mod  # pylint: disable=import-outside-toplevel  # noqa: PLC0415
         monkeypatch.setattr(mod, "ast_grep_bin", lambda: None)
         fp = _write_sh(tmp_path, "x=1\n")
         _, _, backend = analyze_bash_file_best(fp)
@@ -128,7 +128,7 @@ class TestAstGrepUnavailable:
     def test_returns_none_when_no_binary(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import weave_quality.bash_ast_grep as mod  # pylint: disable=import-outside-toplevel
+        import weave_quality.bash_ast_grep as mod  # pylint: disable=import-outside-toplevel  # noqa: PLC0415
         monkeypatch.setattr(mod, "ast_grep_bin", lambda: None)
         fp = _write_sh(tmp_path, "echo hello\n")
         source = Path(fp).read_text(encoding="utf-8")
@@ -137,7 +137,7 @@ class TestAstGrepUnavailable:
     def test_returns_none_when_rule_missing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import weave_quality.bash_ast_grep as mod  # pylint: disable=import-outside-toplevel
+        import weave_quality.bash_ast_grep as mod  # pylint: disable=import-outside-toplevel  # noqa: PLC0415
         monkeypatch.setattr(mod, "_RULE_FILE", tmp_path / "nonexistent.yaml")
         fp = _write_sh(tmp_path, "echo hello\n")
         source = Path(fp).read_text(encoding="utf-8")

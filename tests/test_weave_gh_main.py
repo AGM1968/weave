@@ -633,7 +633,7 @@ class TestCheckHotZone:  # pylint: disable=too-few-public-methods
 
         writes: list[str] = []
         with _full_sync_patches(
-            _check_hot_zone=entry._check_hot_zone,  # pylint: disable=protected-access
+            _check_hot_zone=entry._check_hot_zone,  # pylint: disable=protected-access  # noqa: SLF001
             get_github_issues=_positional_callback(entry.get_github_issues, lambda *_a: _logged(writes, "fetch", [])),
             ensure_labels=_callback(entry.ensure_labels, lambda *_a, **_k: writes.append("labels")),
         ), patch(

@@ -67,6 +67,13 @@ _WV_ATTEMPT_POLICY_SCHEMA=""
 
 wv_json_escape() {
     local value="${1:-}" result="" char escaped index code
+    # Nothing to escape: no backslash, no quote, no control character (every
+    # code below 32 is [:cntrl:] in every locale). The loop below would copy
+    # such a value unchanged one character at a time (wv-2ddb44).
+    case "$value" in
+        *[\\\"[:cntrl:]]*) ;;
+        *) printf '%s' "$value"; return 0 ;;
+    esac
     for ((index = 0; index < ${#value}; index++)); do
         char="${value:index:1}"
         case "$char" in

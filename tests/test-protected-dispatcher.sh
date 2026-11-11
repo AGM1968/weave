@@ -90,8 +90,12 @@ printf '#!/bin/sh\necho a\n' > src/a.sh
 printf '#!/bin/sh\necho b\n' > src/b.sh
 git add -A && git -c core.hooksPath=/dev/null commit -q -m fixture
 wv add "protected dispatcher fixture node" --status=active --force --criteria="c1|c2" --risks=low >/dev/null 2>&1
-# The installed copy, as install.sh writes it: the entry point git runs.
+# The installed copy, as install.sh writes it: the entry point git runs, and
+# the recovery module beside it where this checkout has one (wv-669900; the
+# name is assembled because the release strips that file).
 install -m 755 "$ROOT/scripts/hooks/pre-commit-weave.sh" .git/hooks/pre-commit
+_pd_rec=pre-commit-"recovery.sh"
+[ ! -f "$ROOT/scripts/hooks/$_pd_rec" ] || install -m 644 "$ROOT/scripts/hooks/$_pd_rec" ".git/hooks/$_pd_rec"
 
 commit_nohook() { git add -A && git -c core.hooksPath=/dev/null commit -q -m "$1"; }
 runs() { if [ -f "$MARK/$1" ]; then wc -l < "$MARK/$1" | tr -d ' '; else echo 0; fi; }
@@ -258,6 +262,49 @@ OUT=$(git push -q origin main 2>&1); RC=$?
 check "(control) the push passes once the suite does" "0" "$RC"
 rm -f .git/hooks/pre-push
 
+echo "the recovery module beside the installed copy (wv-669900)"
+# A fixture module, so these cases hold where this checkout has none (the
+# release strips it): it says when it is read and defines the entry point the
+# dispatcher calls. Recovery itself is covered by the recovery suite.
+_pd_base=$(git rev-parse HEAD)
+_pd_mod=scripts/hooks/$_pd_rec
+_pd_beside=.git/hooks/$_pd_rec
+_pd_saved=0; if [ -f "$_pd_beside" ]; then cp "$_pd_beside" "$T/beside.saved"; _pd_saved=1; fi
+printf '# shellcheck shell=bash\n_pcr_main() { echo "fixture recovery read" >&2; return 0; }\n' > "$_pd_mod"
+commit_nohook "fixture recovery module"
+install -m 644 "$_pd_mod" "$_pd_beside"
+reset_marks; stage_src; gate
+check "(control) HEAD tracks the module and the copy beside the hook matches: admitted" "0" "$RC"
+has "...after the dispatcher read the module" "$OUT" "fixture recovery read"
+hasnt "...without a stale-copy notice" "$OUT" "this copy differs from it"
+rm -f "$_pd_beside"; reset_marks; stage_src; gate
+check "a missing module beside the hook is refused where HEAD tracks it" "1" "$RC"
+has "...naming the missing module" "$OUT" "the recovery module is missing beside this hook"
+check "...before any suite ran" "0" "$(runs probe)"
+printf '# no entry point\n' > "$_pd_beside"; stage_src; gate
+check "a module without the recovery entry point is refused" "1" "$RC"
+has "...as one that could not be loaded" "$OUT" "could not load the recovery module"
+has "...with the stale-copy notice" "$OUT" "this copy differs from it"
+cp "$_pd_mod" "$_pd_beside"; printf '# local edit\n' >> "$_pd_beside"; reset_marks; stage_src; gate
+check "a module differing from HEAD's still loads: admitted" "0" "$RC"
+has "...with the stale-copy notice" "$OUT" "this copy differs from it"
+# A release build: the module and its role are gone, as build-release.sh
+# projects them.
+git rm -q "$_pd_mod"
+jq --arg m "$_pd_mod" '.invoking -= [$m] | del(.entry_points[$m])' scripts/hooks/gate-roles.json > "$T/norec-roles" \
+    && cat "$T/norec-roles" > scripts/hooks/gate-roles.json
+commit_nohook "no recovery module"
+printf '# shellcheck shell=bash\n_pcr_main() { echo "fixture recovery read" >&2; return 0; }\n' > "$_pd_beside"
+reset_marks; stage_src; gate
+check "where HEAD has no module (a release build), the commit is admitted" "0" "$RC"
+hasnt "...and the copy beside the hook is never read" "$OUT" "fixture recovery read"
+rm -f "$_pd_beside"; reset_marks; stage_src; gate
+check "...nor is its absence refused" "0" "$RC"
+git checkout -q "$_pd_base" -- scripts; commit_nohook "restore the fixture's scripts"
+if [ "$_pd_saved" = 1 ]; then cp "$T/beside.saved" "$_pd_beside"; fi
+reset_marks; stage_src; gate
+check "(control) restored, the commit is admitted" "0" "$RC"
+
 echo "declared enforcement outside scripts/ runs from the protected copy"
 # These are fixture files, not dependencies on the dev-only source suites.
 # Assemble their names so the release closure scan does not mistake them for
@@ -269,13 +316,20 @@ mkdir -p tests/lib
 printf 'release-policy\n' > build-release.sh
 printf 'memory-policy\n' > "$_pd_memory"
 printf 'reject-policy\n' > "$_pd_pattern"
+# The hook's real release caller hands the checker a private copy of its own
+# policy (R-a, wv-a75d98): HEAD's bytes, never the working tree's, and not the
+# parity checker, which belongs to another check.
 cat > "$_pd_refs" <<'EXTERNAL_EOF'
 #!/usr/bin/env bash
 set -eu
-root=$(cd "$(dirname "$0")/.." && pwd)
-grep -qx release-policy "$root/build-release.sh"
-grep -qx memory-policy "$root/tests/test-memory-projection-"parity.sh
-grep -qx reject-policy "$root/tests/lib/release-leak-"pattern.ere
+[ "${1:-}" = --scan ] || exit 0
+policy=$4
+grep -qx release-policy "$policy/build-release.sh"
+grep -qx reject-policy "$policy/tests/lib/release-leak-"pattern.ere
+if [ -e "$policy/tests/test-memory-projection-"parity.sh ]; then
+    echo 'external fixture saw another check'"'"'s file' >&2
+    exit 1
+fi
 subject=$(git show "$WV_GATE_TREE:src/a.sh")
 if grep -q BUG <<< "$subject"; then
     echo 'external fixture rejected defect' >&2
@@ -287,13 +341,11 @@ jq --arg m "$_pd_memory" --arg c "$_pd_refs" --arg p "$_pd_pattern" \
     '.enforcement += ["build-release.sh", $m, $c, $p]' \
     scripts/hooks/gate-roles.json > "$T/external-roles"
 mv "$T/external-roles" scripts/hooks/gate-roles.json
-awk -v checker="$_pd_refs" '/^# _pc_git_pid / && !done {
-    print "bash \"$_PC_SCRIPTS/../" checker "\" || exit 1"; done=1
-} {print}' scripts/hooks/pre-commit-weave.sh > "$T/external-hook"
-cat "$T/external-hook" > scripts/hooks/pre-commit-weave.sh
 commit_nohook "external enforcement fixture"
-reset_marks; stage_src; gate
-check "all four declared external files are available to the gate" "0" "$RC"
+# A staged tests/ path switches the release leak guard on.
+stage_leak() { stage_src; printf '%s\n' "$n" > tests/leak-trigger.txt; git add tests/leak-trigger.txt; }
+reset_marks; stage_leak; gate
+check "the declared external files reach the check that reads them" "0" "$RC"
 has "...and its external checker ran" "$OUT" "external fixture accepted subject"
 # Both the checker and its policy dependencies are weakened in the worktree.
 # The staged subject still has to meet HEAD's policy, not those weaker bytes.
@@ -301,11 +353,12 @@ printf '#!/bin/sh\nexit 0\n' > "$_pd_refs"
 printf 'weakened\n' > build-release.sh
 printf 'weakened\n' > "$_pd_memory"
 printf 'weakened\n' > "$_pd_pattern"
-stage_src; printf '# BUG\n' >> src/a.sh; git add src/a.sh; gate
+stage_leak; printf '# BUG\n' >> src/a.sh; git add src/a.sh; gate
 check "unstaged external checker and policy edits cannot admit a defect" "1" "$RC"
 has "...refused by the protected external checker" "$OUT" "external fixture rejected defect"
-stage_src; gate
+stage_leak; gate
 check "those unstaged edits do not break a healthy staged subject" "0" "$RC"
+git reset -q -- tests/leak-trigger.txt; rm -f tests/leak-trigger.txt
 restore
 ln -sf ../../src/a.sh "$_pd_refs"
 commit_nohook "external enforcement link (bypassed)"
@@ -384,6 +437,27 @@ OUT=$(HOME="$T/no-install" ./.git/hooks/pre-commit 2>&1); RC=$?
 check "a consumer with no installed libraries is refused" "1" "$RC"
 has "...and told the consumer's refresh" "$OUT" "refresh with wv self-update, then wv init-repo --update"
 hasnt "...not ./install.sh" "$OUT" "./install.sh"
+git reset -q -- src/v.sh
+
+# wv-ec7b2b (rc.15 consumer rollout): a hook installed before wv-9da519 built a
+# lane from a HEAD that tracked the hook sources without scripts/wv and refused
+# with a message naming neither cause nor remedy. The current dispatcher never
+# builds that lane; the refusal is reached only from such a lane, so it is
+# exercised here by hand: the hook run from a lane copy with no scripts/wv.
+echo "a lane copy without scripts/wv says why and what to run"
+LANE="$T/stale-lane"; mkdir -p "$LANE/tree/scripts/hooks"
+printf '%s\n' "$(git rev-parse HEAD)" > "$LANE/weave-gate-lane"
+install -m 755 "$ROOT/scripts/hooks/pre-commit-weave.sh" "$LANE/tree/scripts/hooks/pre-commit-weave.sh"
+install -m 755 "$ROOT/scripts/hooks/pre-push-weave.sh" "$LANE/tree/scripts/hooks/pre-push-weave.sh"
+printf '#!/bin/sh\necho v5\n' > src/v.sh; git add src/v.sh
+OUT=$(bash "$LANE/tree/scripts/hooks/pre-commit-weave.sh" 2>&1); RC=$?
+check "pre-commit from such a lane refuses" "1" "$RC"
+has "...naming the missing scripts/wv" "$OUT" "no scripts/wv beside its hook"
+has "...the cause" "$OUT" "installed hook predates the fix"
+has "...and the remedy" "$OUT" "wv init-repo --update"
+OUT=$(bash "$LANE/tree/scripts/hooks/pre-push-weave.sh" origin "$T/vendoring.git" </dev/null 2>&1); RC=$?
+check "pre-push from such a lane refuses" "1" "$RC"
+has "...with the same remedy" "$OUT" "wv init-repo --update"
 git reset -q -- src/v.sh
 
 echo

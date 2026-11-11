@@ -26,6 +26,9 @@ import sys
 import tempfile
 from typing import Any
 
+# The paths that make a tree Weave's own source, as both hooks test them.
+SELF_HOST_MARKERS = frozenset({"scripts/hooks/pre-commit-weave.sh", "scripts/wv"})
+
 
 class SuiteError(Exception):
     """Required snapshot or provisioning input could not be established."""
@@ -395,7 +398,10 @@ exit "$rc"
         if checked.returncode:
             raise SuiteError(retirement_refusal(checked.returncode, sorted(removed) if candidate else [],
                                                 checked.stdout.strip()))
-    legacy = old is None and "scripts/hooks/pre-commit-weave.sh" in tree_entries(repo, baseline, env)
+    # Weave's own tree, by the hooks' K1 test (wv-9da519): the hook AND
+    # scripts/wv. A consumer that vendors the hook sources has no scripts/wv
+    # and runs its suites in checkout mode (wv-981f92).
+    legacy = old is None and SELF_HOST_MARKERS <= tree_entries(repo, baseline, env).keys()
     if legacy and run(["git", "log", "-1", "--format=%H", baseline, "--", ".weave/gate-provision.json"],
                       repo, env, capture=True):
         legacy = False  # A retired declaration must not resurrect installed defaults.

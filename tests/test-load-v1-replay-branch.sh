@@ -51,6 +51,7 @@ text_of() { sqlite3 "$WV_DB" "SELECT text FROM nodes WHERE id='$1';" 2>/dev/null
 
 "$WV" init >/dev/null 2>&1
 id=$("$WV" add "original text" 2>/dev/null | grep -oE 'wv-[0-9a-f]{6}' | head -1)
+id2=$("$WV" add "second node" 2>/dev/null | grep -oE 'wv-[0-9a-f]{6}' | head -1)  # wv-12dce0 checks
 "$WV" sync >/dev/null 2>&1   # state.sql carries the node; cmd_load replays only when it exists
 [ -n "$id" ] && ok "fixture node created ($id)" || bad "fixture node created"
 mkdir -p "$D"
@@ -78,6 +79,38 @@ grep -qxF -- "$good" "$MANIFEST" 2>/dev/null \
 pending=$(sqlite3 "$WV_DB" "SELECT count(*) FROM _warp_changes;" 2>/dev/null)
 [ "$pending" = "0" ] && ok "the change tracker is drained after the replay" \
     || bad "the change tracker is drained after the replay" "_warp_changes rows: $pending"
+
+echo "wv load: every delta classified in one pass (wv-12dce0)"
+# The per-file greps became one awk read; these are the decisions they made.
+lower="9999999996-000000-000-zz-3.sql"          # statements match in any case
+eq="9999999995-000000-000-zz=eq-4.sql"          # "=" in a name is not an awk assignment
+noop="9999999994-000000-000-zz-5.sql"           # comment-only: skipped, silently
+corrupt="9999999993-000000-000-zz-6.sql"        # neither SQL nor comment: warned
+legacy="1000000000-000000-000-zz-7.sql"         # old unguarded node replace: skipped
+{ echo "/* weave-lineage seq=996 actor=zz */"
+  echo "update nodes set alias='lc-probe' where id='$id';"; } > "$D/$lower"
+{ echo "/* weave-lineage seq=995 actor=zz */"
+  echo "UPDATE nodes SET alias='eq-probe' WHERE id='$id2';"; } > "$D/$eq"
+printf -- "-- no-op UPDATE on node '%s'\n" "$id" > "$D/$noop"
+printf 'this is not sql\n' > "$D/$corrupt"
+printf "insert or replace into nodes (id, text, status) values ('%s', 'legacy text', 'todo');\n" "$id2" > "$D/$legacy"
+out=$(reload)
+alias_of() { sqlite3 "$WV_DB" "SELECT alias FROM nodes WHERE id='$1';" 2>/dev/null; }
+[ "$(alias_of "$id")" = "lc-probe" ] && ok "a lowercase statement replays" \
+    || bad "a lowercase statement replays" "alias=$(alias_of "$id")"
+[ "$(alias_of "$id2")" = "eq-probe" ] && ok "a delta whose name holds '=' replays" \
+    || bad "a delta whose name holds '=' replays" "alias=$(alias_of "$id2")"
+grep -qxF -- "$noop" "$MANIFEST" 2>/dev/null && bad "a comment-only delta is not replayed" \
+    || ok "a comment-only delta is not replayed"
+case "$out" in *"$noop"*) bad "a comment-only delta is skipped silently" "stderr: $out" ;;
+    *) ok "a comment-only delta is skipped silently" ;; esac
+case "$out" in *"Skipped corrupt delta: $corrupt"*) ok "a corrupt delta is warned about" ;;
+    *) bad "a corrupt delta is warned about" "stderr: $out" ;; esac
+[ "$(text_of "$id2")" = "second node" ] && ok "a lowercase legacy node replace is skipped" \
+    || bad "a lowercase legacy node replace is skipped" "text=$(text_of "$id2")"
+case "$out" in *"legacy pre-checkpoint"*) ok "load counts the legacy skip" ;;
+    *) bad "load counts the legacy skip" "stderr: $out" ;; esac
+rm -f "$D/$lower" "$D/$eq" "$D/$noop" "$D/$corrupt" "$D/$legacy"
 
 echo "wv load: a v1 replay that fails"
 # The first statement is valid; the second fails, so .bail must roll back both.

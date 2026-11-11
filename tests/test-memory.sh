@@ -199,7 +199,7 @@ test_remember_recall_ready_and_render() {
     # claimed_by uses, so the two agree when markers collide; it kept its own
     # codex-first copy until wv-50640a. CLAUDECODE=1 alone is Claude Code.
     local _no_agent=(-u WV_OPERATING_AGENT -u WV_AGENT_NAME -u WV_AGENT_ID -u CLAUDE_PROJECT_DIR
-        -u CLAUDECODE -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT)
+        -u CLAUDECODE -u AI_AGENT -u CLAUDE_CODE_SSE_PORT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT)
     local tie_agent tie_claim
     tie_agent=$(env "${_no_agent[@]}" CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1 \
         "$WV" remember "Marker tie provenance" --json 2>/dev/null | jq -r '.metadata.source_agent')
@@ -548,6 +548,14 @@ test_memory_doctor_authority() {
     HOME="$fake_home" "$WV" memory import --source=claude --path="$memdir" --repo-root="$TEST_DIR" --json >/dev/null 2>&1
     after=$(HOME="$fake_home" "$WV" doctor 2>&1 | grep -i "memory authority" || true)
     assert_contains "$after" "all represented in graph" "doctor passes once the memory file is imported"
+
+    # wv-d737f9: one query answers for every file. A copy of an imported file
+    # is represented by the same hash; a new file is not; the count is per file.
+    cp "$memdir/note.md" "$memdir/note-copy.md"
+    printf '%s\n' "# Memory" "A second fact, not imported." > "$memdir/other.md"
+    local mixed
+    mixed=$(HOME="$fake_home" "$WV" doctor 2>&1 | grep -i "memory authority" || true)
+    assert_contains "$mixed" "1/3 Claude memory file" "doctor counts un-imported memory files one by one"
 }
 
 test_memory_doctor_authority_policy() {
@@ -809,7 +817,9 @@ test_memory_supersede() {
     assert_equals "1" "$("$WV" remember "second successor" --supersedes="$old" >/dev/null 2>&1; echo $?)" \
         "a superseded memory cannot be superseded again (one live head per chain)"
     local task
-    task=$("$WV" add "not a memory" --standalone --force 2>&1 | sed -nE 's/^✓ (wv-[0-9a-f]{6}): .*/\1/p')
+    local add_out
+    add_out=$("$WV" add "not a memory" --standalone --force 2>&1)
+    task=$(sed -nE 's/^✓ (wv-[0-9a-f]{6}): .*/\1/;T;p;q' <<< "$add_out")
     assert_equals "1" "$("$WV" remember "x" --supersedes="$task" >/dev/null 2>&1; echo $?)" \
         "a non-memory node cannot be superseded"
     assert_equals "1" "$("$WV" remember "x" --supersedes=not-an-id >/dev/null 2>&1; echo $?)" \

@@ -65,7 +65,7 @@ This table is generated from `templates/workflow-classes.conf`. The pre-action h
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | `wv ready`                 | List unblocked work                                                                                                    | `--json`, `--count`                                                                                            |
 | `wv work <id>`             | Claim node (sets active); use `--reopen` for done nodes                                                                | `[--reopen]` to explicitly reopen a done node back to tracked work                                             |
-| `wv add "<text>"`          | Create node                                                                                                            | `--gh`, `--status=`, `--parent=`, `--kind=`, `--alias=`, `--standalone`                                                   |
+| `wv add "<text>"`          | Create node                                                                                                            | `--gh`, `--status=`, `--parent=`, `--kind=`, `--alias=`, `--standalone`                                        |
 | `wv done <id>`             | Complete node (auto-closes linked GH issue)                                                                            | `--learning="..."`, `--no-overlap-check`, `--no-gh`                                                            |
 | `wv ship <id>`             | Done + sync in one step; pending Git sync is surfaced separately                                                       | `--learning="..."`, `--no-gh`, `--no-overlap-check`                                                            |
 | `wv update <id>`           | Modify node                                                                                                            | `--status=`, `--text=`, `--alias=`, `--metadata=`, `--metadata-file=`, `--echo`                                |
@@ -171,20 +171,23 @@ is projected into each harness's native surface (Claude skill, `.codex/weave.jso
 instructions). Every procedure resolves anywhere via its fallback command, which serves the
 installed canonical body — so a pointer never breaks after `wv init-repo`.
 
-| Procedure           | Description                                                              | Fallback                                 |
-| ------------------- | ------------------------------------------------------------------------ | ---------------------------------------- |
-| `session`           | Session-context management — 5-option framework, rewind, compact, phases | `wv guide --procedure=session`           |
-| `agent-memory`      | Agent memory model and per-agent memory surfaces                         | `wv guide --procedure=agent-memory`      |
-| `repair`            | Turn workflow defects into tracked remediation                           | `wv guide --procedure=repair`            |
-| `subagents`         | Delegate bounded work with inherited graph context                       | `wv guide --procedure=subagents`         |
-| `rules`             | Advisory workflow discipline                                             | `wv guide --procedure=rules`             |
-| `epic-decompose`    | Break an epic into features and tasks with parent edges and blocking     | `wv guide --procedure=epic-decompose`    |
-| `quality-gate`      | Recover from a GraphPolicyViolation (CC threshold) blocking `wv done`    | `wv guide --procedure=quality-gate`      |
-| `graph-hygiene`     | Health checks, pruning, orphan classification, stale-node cleanup        | `wv guide --procedure=graph-hygiene`     |
-| `precommit-gate`    | Impact-scoped pre-commit test gate + CI `.weave/` hygiene                | `wv guide --procedure=precommit-gate`    |
-| `code-search`       | Two-surface code/graph search and `wv ready` re-ranking                  | `wv guide --procedure=code-search`       |
-| `discovery-routing` | Conditional graph, code, impact, and inspection routing                  | `wv guide --procedure=discovery-routing` |
-| `blindspot-pass`    | Unknown-taxonomy pass before implementation with release and MCP probes  | `wv guide --procedure=blindspot-pass`    |
+| Procedure             | Description                                                              | Fallback                                   |
+| --------------------- | ------------------------------------------------------------------------ | ------------------------------------------ |
+| `session`             | Session-context management — 5-option framework, rewind, compact, phases | `wv guide --procedure=session`             |
+| `agent-memory`        | Agent memory model and per-agent memory surfaces                         | `wv guide --procedure=agent-memory`        |
+| `repair`              | Turn workflow defects into tracked remediation                           | `wv guide --procedure=repair`              |
+| `subagents`           | Delegate bounded work with inherited graph context                       | `wv guide --procedure=subagents`           |
+| `rules`               | Advisory workflow discipline                                             | `wv guide --procedure=rules`               |
+| `epic-decompose`      | Break an epic into features and tasks with parent edges and blocking     | `wv guide --procedure=epic-decompose`      |
+| `quality-gate`        | Recover from a GraphPolicyViolation (CC threshold) blocking `wv done`    | `wv guide --procedure=quality-gate`        |
+| `graph-hygiene`       | Health checks, pruning, orphan classification, stale-node cleanup        | `wv guide --procedure=graph-hygiene`       |
+| `precommit-gate`      | Impact-scoped pre-commit test gate + CI `.weave/` hygiene                | `wv guide --procedure=precommit-gate`      |
+| `code-search`         | Two-surface code/graph search and `wv ready` re-ranking                  | `wv guide --procedure=code-search`         |
+| `discovery-routing`   | Conditional graph, code, impact, and inspection routing                  | `wv guide --procedure=discovery-routing`   |
+| `blindspot-pass`      | Unknown-taxonomy pass before implementation with release and MCP probes  | `wv guide --procedure=blindspot-pass`      |
+| `design-audits`       | Five audits before committing: outcomes, dimensions, facts, mechanisms   | `wv guide --procedure=design-audits`       |
+| `verify-before-fixed` | Show a fix holds: the test failing without it, the expected failures     | `wv guide --procedure=verify-before-fixed` |
+| `cutover`             | Migrate a repository to causal delta ordering with `wv cutover`          | `wv guide --procedure=cutover`             |
 
 All procedure bodies live only in their canonical file and are reachable through their fallback.
 
@@ -211,7 +214,7 @@ Always use `--gh` when work should be visible in GitHub. `wv done` auto-closes l
 
 | Mode     | When                                                                 | Behaviour                                                                                                             |
 | -------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `fast`   | Default for `wv ship` and `session-end-sync.sh`                      | Bounded to focus node + parent + children + blockers; skips Phase 2/3                                                 |
+| `fast`   | Default for `wv ship`                                                | Bounded to focus node + parent + children + blockers; skips Phase 2/3                                                 |
 | `full`   | Manual exhaustive reconcile; suspected drift; bulk import            | Walks every node and issue (slowest, most thorough)                                                                   |
 | `repair` | After a timeout/Ctrl-C/crash mid-sync — `wv recover` recommends this | Same scope as `full` but resumes from `.weave/repair-checkpoint.json`; SIGINT/SIGTERM print the resume hint to stderr |
 
@@ -277,6 +280,26 @@ a missing guardrail), turn the defect into tracked remediation rather than fixin
 For a GitHub sync interrupted by a timeout, Ctrl-C, or crash, resume with
 `wv sync --gh --mode=repair` (see Sync modes above).
 
+### Untrack runtime files once after upgrading
+
+Repositories scaffolded before rc.16 may have committed machine-local runtime files under `.weave/`,
+most often `.weave/.applied_deltas`, which every `wv load` rewrites. While they stay tracked, a
+read-only `wv` call leaves `git status` dirty, and a clone that is behind cannot
+`git pull --ff-only` until the file is restored. `wv init-repo --update` adds them to `.gitignore`,
+but git keeps tracking a file that was committed before it was ignored. The update names those files
+and prints the command:
+
+```bash
+git rm --cached -- .weave/.applied_deltas && git commit -m 'chore(weave): untrack runtime files'
+```
+
+Run the printed command once per repository, with the file list it shows; the files stay on disk.
+After that commit, hydrating and read-only calls leave the tree clean and pulls fast-forward. Other
+clones pick the untrack up on their next pull; until then a local `.applied_deltas` change blocks
+that pull; restore it first with `git checkout -- .weave/.applied_deltas`. That pull removes the
+clone's copy, which is safe: the file is a record of the last replay, never trusted to skip one, and
+the next `wv load` writes it again.
+
 ### Resumable close (`needs_human_verification`)
 
 When `wv done` cannot auto-verify a close, the node is not lost: it is captured in a `pending_close`
@@ -295,6 +318,11 @@ The stop hook has one hard block; everything else soft-warns:
 No network calls in the hook (wv sync / git push belong in `/close-session`, not stop hook). The
 `/close-session` skill handles the full protocol (sync, commit, push). Only invoke it when you're
 actually done — a soft warning is not a signal to stop working.
+
+The session-end hook (`wv hook dispatch --event=SessionEnd`, on hosts that register it) runs only
+fast local steps: prune, a local `wv sync`, a `.weave/` checkpoint commit and clearing the crash
+sentinel. It never runs `wv sync --gh` or `git push`. Before you end a session, run
+`wv sync --gh && git push` on any host, or `make wv-close` where the Weave Makefile is installed.
 
 ## Skills
 

@@ -22,6 +22,19 @@
 _WV_POST_TOOL_USE_LOADED=1
 _POTU_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# _potu_install_wait -- once per process, wait (up to 10 s) while an
+# ./install.sh holds $CONFIG_DIR/.install-in-progress (wv-f854f6; the lock is
+# described in install.sh). The installer's own children skip it.
+_potu_install_wait() {
+    [ -z "${WV_INSTALLING:-}" ] && [ -z "${_WV_INSTALL_WAITED:-}" ] || return 0
+    _WV_INSTALL_WAITED=1
+    local lock="${WV_CONFIG_DIR:-${HOME}/.config/weave}/.install-in-progress" i=0
+    while [ "$i" -lt 100 ] && [ -f "$lock" ] && kill -0 "$(cat "$lock" 2>/dev/null)" 2>/dev/null; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+}
+
 # _potu_source <lib> -- load a library from beside this file, then from the
 # installed locations, falling through a copy that fails to load. Libraries
 # load with nounset off: two guards run under the `set -u` their hooks had,
@@ -31,6 +44,7 @@ _POTU_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _potu_source() {
     local lib="$1" dir guard nounset=false rc
     [[ $- == *u* ]] && nounset=true
+    _potu_install_wait
     for dir in "$_POTU_LIB_DIR" "${HOME}/.config/weave/lib" "${HOME}/.local/lib/weave/lib"; do
         [ -r "$dir/$lib.sh" ] || continue
         set +u
@@ -236,6 +250,7 @@ wv_potu_touched_guard() (
     _potu_source wv-hook-common || true
     _potu_source wv-resolve-runtime || exit 0
     _potu_source wv-attribution || exit 0
+    declare -F wv_adopt_hook_session_id >/dev/null && wv_adopt_hook_session_id "${1:-}"
     _hc_refresh
 
     TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
@@ -449,6 +464,34 @@ _restore_generated_regions() {
     ' "$1" "$2"
 }
 
+# _potu_route_advisory <file> -- an edited suite under a measured route
+# retirement (wv-c153c4) whose bytes no longer match the recorded sha256 will
+# be refused by test-map-coverage.sh mid-gate; say so at edit time, with the
+# procedure (wv-99c9f8). Silent where the repository has no route evidence.
+_potu_route_advisory() {
+    local root rel conf sha node ev stale=""
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+    rel=${1#"$root"/}
+    conf="$root/.weave/test-map-retired.conf"
+    [ -f "$conf" ] || return 0
+    [ -f "$1" ] || return 0
+    sha=$(sha256sum "$1" 2>/dev/null) || return 0
+    sha=${sha%% *}
+    while read -r node; do
+        ev="$root/.weave/route-evidence/$node.json"
+        [ -f "$ev" ] || continue
+        # Every recorded sha256 for the suite, in either evidence shape.
+        if jq -e --arg s "$rel" --arg h "$sha" \
+            '[.. | objects | select(has("suites")) | .suites[$s].sha256 // empty] | any(. != $h)' \
+            "$ev" >/dev/null 2>&1; then
+            stale="${stale:+$stale }$node"
+        fi
+    done < <(awk -v s="$rel" '$2 == s { print $1 }' "$conf" | sort -u)
+    [ -n "$stale" ] || return 0
+    printf '%s carries a measured route retirement (%s) and no longer matches its recorded sha256, so test-map-coverage.sh will refuse the commit. Re-measure it (tests/lib/route-reach-measure.sh, then route-reach-classify.py) and update .weave/route-evidence/<node>.json, or route it again; docs/DEVELOPMENT.md, Route Evidence. make preflight reports it in seconds.\n' \
+        "$rel" "$stale"
+}
+
 # _potu_lint_one <file> -- lint or format one edited file; prints an advisory
 # message (plain text) when there is something to say.
 _potu_lint_one() (
@@ -518,6 +561,10 @@ _potu_lint_one() (
     # proactive L2 reminder (the cross-agent net is the pre-commit self-heal + the
     # bootstrap advisory; this is the cheap side win where the path is free).
     case "$FILE_PATH" in
+        */tests/*.sh)
+            _potu_route_advisory "$FILE_PATH" || true
+            exit 0
+            ;;
         */scripts/*.sh|*/scripts/wv|*/.claude/hooks/*.sh)
             REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
             if [ -n "$REPO_ROOT" ] && [ -x "$REPO_ROOT/install.sh" ]; then
@@ -629,10 +676,16 @@ wv_potu_memory_guard() (
     # Default is dry: record an advisory the agent/operator can act on, no graph
     # write. Opt in with WV_MEMORY_CAPTURE=1 to import as candidate.
     if [ "${WV_MEMORY_CAPTURE:-0}" != "1" ]; then
-        ADVISORY_DIR="${_HC_HOT_ZONE:-${WV_HOT_ZONE:-/tmp}}"
-        hot_zone_ensure "$ADVISORY_DIR" 2>/dev/null || exit 0
-        printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MEMORY_DIR" \
-            >> "$ADVISORY_DIR/memory-capture-pending.tsv" 2>/dev/null || true
+        # The advisory file belongs to this repository's hot zone. With no zone
+        # resolved the file is skipped rather than appended to a shared,
+        # predictable /tmp path, where >> would follow a planted symlink
+        # (wv-1b2a92 widening); the agent still gets the advisory below.
+        ADVISORY_DIR="${_HC_HOT_ZONE:-${WV_HOT_ZONE:-}}"
+        if [ -n "$ADVISORY_DIR" ]; then
+            hot_zone_ensure "$ADVISORY_DIR" 2>/dev/null || exit 0
+            printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MEMORY_DIR" \
+                >> "$ADVISORY_DIR/memory-capture-pending.tsv" 2>/dev/null || true
+        fi
         _potu_context "Repo-scoped Claude memory write detected ($MEMORY_DIR). Graph is the durable authority — import with: wv memory import --source=claude --path='$MEMORY_DIR'. Set WV_MEMORY_CAPTURE=1 to auto-import as candidates."
         exit 0
     fi

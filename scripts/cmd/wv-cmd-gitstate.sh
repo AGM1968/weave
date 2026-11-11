@@ -8,41 +8,47 @@
 # Moved unchanged from wv-cmd-ops.sh (wv-c153c4). wv status reached wv-cmd-ops.sh only
 # through _detect_git_pending, so every suite running it was routed from ops.
 
-_git_status_has_outside_weave_changes() {
-    local status_lines="$1"
-    local raw_path old_path new_path
-
-    while IFS= read -r raw_path; do
-        [ -z "$raw_path" ] && continue
-        raw_path="${raw_path:3}"
-        if [[ "$raw_path" == *" -> "* ]]; then
-            old_path="${raw_path%% -> *}"
-            new_path="${raw_path##* -> }"
-            if [[ "$old_path" != .weave/* ]] || [[ "$new_path" != .weave/* ]]; then
-                return 0
-            fi
-        elif [[ "$raw_path" != .weave/* ]]; then
-            return 0
-        fi
-    done <<< "$status_lines"
-
-    return 1
+# _git_status_weave_split <git_root> — prints "<weave_dirty> <outside_dirty>"
+# (true/false) from ONE `git status` walk (wv-3125a9). A second walk limited
+# to .weave/ cost as much as the full one, since git still reads the whole
+# index. -z gives each path unquoted and a rename's or copy's source as its own
+# field: the text form quoted unusual names, so a .weave/ path git quoted read
+# as outside .weave/, and a name holding " -> " split as a rename. Each side of
+# a rename counts on its own: touching .weave/ makes .weave/ dirty, as the
+# limited walk listed it (as an add or a delete), and a side outside makes the
+# rest of the tree dirty.
+_git_status_weave_split() {
+    local -a fields
+    local i=0 width path weave=false outside=false
+    mapfile -d '' -t fields < <(git -C "$1" status --porcelain -z 2>/dev/null || true)
+    while [ "$i" -lt "${#fields[@]}" ]; do
+        # A rename or copy record is "XY <dest>" then "<source>" as the next field.
+        case "${fields[i]:0:2}" in *R*|*C*) width=2 ;; *) width=1 ;; esac
+        fields[i]="${fields[i]:3}"
+        for path in "${fields[@]:i:width}"; do
+            if [[ "$path" == .weave/* ]]; then weave=true; else outside=true; fi
+        done
+        i=$((i + width))
+    done
+    echo "$weave $outside"
 }
 
 _git_commit_weave_ownership() {
     local git_root="$1"
     local sha="$2"
-    local paths path
+    local -a paths
+    local path
 
-    paths=$(git -C "$git_root" diff-tree --no-commit-id --name-only -r -m "$sha" 2>/dev/null || true)
-    [ -n "$paths" ] || return 2
+    # -z for the reason above: a quoted .weave/ name read as a non-.weave commit.
+    mapfile -d '' -t paths < <(git -C "$git_root" diff-tree -z --no-commit-id --name-only -r -m "$sha" 2>/dev/null || true)
+    [ "${#paths[@]}" -gt 0 ] || return 2
 
-    while IFS= read -r path; do
+    for path in "${paths[@]}"; do
         [ -z "$path" ] && continue
         if [[ "$path" != .weave/* ]]; then
             return 1
         fi
-    done <<< "$paths"
+    done
 
     return 0
 }
@@ -77,7 +83,7 @@ _git_pending_hint() {
 }
 
 _detect_git_pending() {
-    local git_root upstream="" weave_dirty="" all_status="" ahead_shas=""
+    local git_root upstream="" ahead_shas=""
     local pending=false weave_dirty_bool=false outside_dirty=false
     local state="clean" action="none" reason="clean" hint="no action required"
     local ahead_count=0 has_non_weave=false has_ambiguous_empty=false sha
@@ -100,13 +106,7 @@ _detect_git_pending() {
         return 0
     fi
 
-    weave_dirty=$(git -C "$git_root" status --porcelain -- .weave/ 2>/dev/null || true)
-    [ -n "$weave_dirty" ] && weave_dirty_bool=true
-
-    all_status=$(git -C "$git_root" status --porcelain 2>/dev/null || true)
-    if [ -n "$all_status" ] && _git_status_has_outside_weave_changes "$all_status"; then
-        outside_dirty=true
-    fi
+    read -r weave_dirty_bool outside_dirty <<< "$(_git_status_weave_split "$git_root")"
 
     upstream=$(git -C "$git_root" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo "")
     if [ -n "$upstream" ]; then

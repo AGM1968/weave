@@ -68,7 +68,7 @@ def _stats(path: str, churn: int = 50) -> GitStats:
 
 def _populate_scan(
     conn: sqlite3.Connection,
-    scan_id: int,  # pylint: disable=unused-argument
+    scan_id: int,  # pylint: disable=unused-argument  # noqa: ARG001
     entries: list[FileEntry],
     stats: list[GitStats],
 ) -> None:

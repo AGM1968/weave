@@ -75,15 +75,20 @@ check "--json yields a JSON array" "true" "$out"
 mkdir -p "$T/refuse-bin"
 export FINDINGS_REAL_SQLITE
 FINDINGS_REAL_SQLITE=$(command -v sqlite3)
+# db_query sends SQL on stdin (wv-aec7de): when the last argument is the DB file
+# the SQL is read from stdin, matched, and passed on; otherwise it is an argument.
 cat > "$T/refuse-bin/sqlite3" <<'EOF'
 #!/bin/bash
-for arg in "$@"; do
+sql=""; from_stdin=0
+if [ "$#" -gt 0 ] && [ -f "${!#}" ]; then sql=$(cat); from_stdin=1; fi
+for arg in "$@" "$sql"; do
     if [[ "$arg" == *"SELECT n.id, n.text, n.status, n.metadata FROM nodes n"* ]] ||
        [[ "$arg" == *"AS age_days,"* && "$arg" == *"FROM nodes n"* ]]; then
         echo 'test: required findings row query refused' >&2
         exit 73
     fi
 done
+[ "$from_stdin" = 1 ] && exec "$FINDINGS_REAL_SQLITE" "$@" <<< "$sql"
 exec "$FINDINGS_REAL_SQLITE" "$@"
 EOF
 chmod +x "$T/refuse-bin/sqlite3"
@@ -161,6 +166,38 @@ EOF
 chmod +x "$B/gh"
 PATH="$B:$PATH" module wv-cmd-recover.sh "_recover_delete '{\"gh_issue\":7,\"id\":\"wv-000001\"}' gh_close true" >/dev/null
 check "issue #7 is closed in the named repository" "issue close 7 --repo owner/repo" "$(cat "$T/gh.log" 2>/dev/null)"
+
+echo "_done_close_gh_issue: one gh call per question (wv-481b9c)"
+# A gh that logs every call; the issue's labels come from GH_LABELS.
+cat > "$B/gh" <<EOF
+#!/bin/sh
+echo "\$*" >> "$T/ghdone.log"
+case "\$1 \$2" in
+    "repo view") echo '{"nameWithOwner":"owner/repo","url":"https://example.invalid/owner/repo"}' ;;
+    "issue view") echo "{\"state\":\"OPEN\",\"labels\":[\$GH_LABELS]}" ;;
+esac
+EOF
+chmod +x "$B/gh"
+# done_close <labels-json>: run the close for a node whose metadata names issue #7.
+done_close() {
+    : > "$T/ghdone.log"
+    PATH="$B:$PATH" GH_LABELS="$1" module wv-cmd-core.sh '
+db_query_json() { echo "[{\"metadata\":\"{\\\"gh_issue\\\":7}\"}]"; }
+_refresh_parent_gh() { :; }
+_done_close_gh_issue wv-000001' >/dev/null
+}
+done_close '{"name":"weave:active"},{"name":"bug"}'
+check "the repository is viewed once, for its name and URL" "1" "$(grep -c '^repo view' "$T/ghdone.log")"
+check "the issue is viewed once, for its state and labels" "1" "$(grep -c '^issue view 7 --repo owner/repo --json state,labels' "$T/ghdone.log")"
+check "only the stale status label it carries is removed, in one edit" "issue edit 7 --repo owner/repo --remove-label weave:active" \
+    "$(grep '^issue edit' "$T/ghdone.log")"
+check "and the open issue is closed" "1" "$(grep -c '^issue close 7 --repo owner/repo' "$T/ghdone.log")"
+done_close '{"name":"weave:active"},{"name":"weave:blocked"}'
+check "both status labels go in the same edit" "issue edit 7 --repo owner/repo --remove-label weave:active,weave:blocked" \
+    "$(grep '^issue edit' "$T/ghdone.log")"
+done_close '{"name":"bug"}'
+check "an issue carrying neither status label gets no edit" "0" "$(grep -c '^issue edit' "$T/ghdone.log")"
+check "...and the close takes three gh calls" "3" "$(wc -l < "$T/ghdone.log" | tr -d ' ')"
 
 echo "wv init: a database it cannot create is a failure, not '✓ Initialized' (wv-b98794)"
 R2="$T/repo-unopenable"; mkdir -p "$R2"; (cd "$R2" && git init -q)

@@ -55,7 +55,8 @@ is_codex_runtime() {
 # Canonical implementation — see docs/AGENT-IDENTITY-CONTRACT.md for the full
 # contract (precedence rule, identity format, and the python/MCP parity obligations).
 #
-# Returns one of: claude | codex | copilot | human
+# Returns claude | codex | copilot | human, or the label AI_AGENT names
+# (_wv_ai_agent_label: pi, amp, any future harness that sets it).
 # Memoized per process (_WV_AGENT_HARNESS) so the ambiguity diagnostic warns once.
 #
 # Ambiguity: a harness that launches another (e.g. a Codex shell spawned from a
@@ -72,19 +73,30 @@ is_codex_runtime() {
 # nor Codex and has no known leak vector, so it keeps top precedence.
 #
 # Claude Code's marker is CLAUDECODE=1, which it sets in every process it starts.
-# CLAUDE_CODE_SSE_PORT, the marker before wv-50640a, is set only when an IDE is
-# attached, so a session started from a plain terminal resolved human; it stays
-# accepted as an alias. is_sandboxed_runtime reads both (wv-21698b).
+# CLAUDE_CODE_SSE_PORT is NOT an identity marker (wv-08d7f9): a terminal with the
+# Claude IDE integration exports it to everything it starts, so Codex, pi and
+# Amp launched there carried it and resolved as an unverified claude session,
+# refused every ownership change. A real Claude Code process always has
+# CLAUDECODE=1. is_sandboxed_runtime (placement class) still reads it.
+#
+# AI_AGENT is the neutral marker (wv-08d7f9, owner decision 2026-11-04): the
+# innermost agent sets it (Claude Code, pi and Amp observed; Codex does not),
+# overwriting an inherited value, so in a tie it ranks above claude and codex,
+# whose markers leak to children. copilot keeps top precedence.
 resolve_agent_harness() {
     if [ -n "${_WV_AGENT_HARNESS:-}" ]; then
         printf '%s\n' "$_WV_AGENT_HARNESS"
         return 0
     fi
 
-    local present=""
-    { [ "${CLAUDECODE:-}" = "1" ] || [ -n "${CLAUDE_CODE_SSE_PORT:-}" ]; } && present="${present} claude"
-    { [ -n "${CODEX_THREAD_ID:-}" ] || [ "${CODEX_CI:-}" = "1" ]; } && present="${present} codex"
+    local present="" ai
+    ai=$(_wv_ai_agent_label)
     [ "${COPILOT_AGENT:-}" = "1" ] && present="${present} copilot"
+    case " $present " in *" $ai "*) ;; *) [ -z "$ai" ] || present="${present} ${ai}" ;; esac
+    case " $present " in *" claude "*) ;; *)
+        [ "${CLAUDECODE:-}" = "1" ] && present="${present} claude" ;; esac
+    case " $present " in *" codex "*) ;; *)
+        { [ -n "${CODEX_THREAD_ID:-}" ] || [ "${CODEX_CI:-}" = "1" ]; } && present="${present} codex" ;; esac
     present="${present# }"
 
     local result
@@ -95,11 +107,9 @@ resolve_agent_harness() {
     elif [ "$n" -eq 1 ]; then
         result="$present"
     else
-        local h host user suggested
+        # present is built in precedence order: copilot > AI_AGENT > claude > codex.
+        local host user suggested
         result="${present%% *}"
-        for h in copilot claude codex; do
-            case " $present " in *" $h "*) result="$h"; break ;; esac
-        done
         host=$(hostname 2>/dev/null || echo "host")
         user=$(whoami 2>/dev/null || echo "user")
         suggested="${result}-${host}-${user}"
@@ -110,12 +120,70 @@ resolve_agent_harness() {
     printf '%s\n' "$result"
 }
 
-# Resolve a stable per-agent identity for claimed_by and delta filenames.
-# Precedence:
-#   1. explicit WV_AGENT_ID                  (operator/harness override always wins)
-#   2. <harness>-<host>-<user> from resolve_agent_harness, where harness is
-#      claude|codex|copilot for agents and human for a plain shell — so a human
-#      shell can no longer collapse onto an agent that also left WV_AGENT_ID unset.
+# _wv_ai_agent_label — the harness label AI_AGENT names, or nothing. Claude
+# Code's versioned value (claude-code_<version>_agent) keeps its existing label
+# claude; any other value is lowercased and reduced to [a-z0-9], at most 24
+# characters, so it is filename- and claimed_by-safe (pi, amp). A value that
+# reduces to nothing, or to human, names no harness.
+_wv_ai_agent_label() {
+    # C locale: lowercase ASCII only and match ranges byte by byte, so a
+    # non-ASCII character is dropped exactly as the MCP mirror drops it.
+    local LC_ALL=C v="${AI_AGENT:-}"
+    v="${v,,}"
+    case "$v" in
+        claude-code*) printf 'claude\n'; return 0 ;;
+    esac
+    v="${v//[^a-z0-9]/}"
+    v="${v:0:24}"
+    case "$v" in ""|human) return 0 ;; esac
+    printf '%s\n' "$v"
+}
+
+# Built-in defaults: the session-id variable of a harness observed to carry one
+# in its shell and hook processes (S0 probe, wv-280f9e; hook probe on
+# wv-99978b; pi and Amp tool processes, docs/findings/harness-env-probe-2026-11-04).
+# Prints the variable NAME or nothing. This table is a convenience,
+# not the contract: any host supplies a session through WV_SESSION_ID.
+_wv_session_var_for() {
+    case "$1" in
+        claude) printf 'CLAUDE_CODE_SESSION_ID\n' ;;
+        codex)  printf 'CODEX_THREAD_ID\n' ;;
+        pi)     printf 'PI_SESSION_ID\n' ;;
+        amp)    printf 'AMP_CURRENT_THREAD_ID\n' ;;
+    esac
+}
+
+# _wv_session_source — the variable that carries this process's session id:
+# WV_SESSION_ID when it is set (the harness-agnostic channel: Amp, Copilot, a
+# wrapper or a script exports it, no Weave change needed), else the harness's
+# built-in default. Prints nothing when no session channel applies, so the
+# identity stays actor-owned. A set-but-empty WV_SESSION_ID still names the
+# channel: the session is declared and unverifiable, which fails closed.
+_wv_session_source() {
+    if [ -n "${WV_SESSION_ID+x}" ]; then
+        printf 'WV_SESSION_ID\n'
+    else
+        _wv_session_var_for "$(resolve_agent_harness)"
+    fi
+}
+
+# Resolve a stable identity for claimed_by and delta filenames
+# (docs/AGENT-IDENTITY-CONTRACT.md §3):
+#   1. explicit WV_AGENT_ID, verbatim         (always wins)
+#   2. <harness>-<host>-<user>-h<digest16>    when a session channel applies
+#      (_wv_session_source: WV_SESSION_ID, else the harness default) and
+#      WV_SESSION_IDENTITY is not 0 (owner ruling 2026-11-03, wv-99978b):
+#      digest16 is the first 16 hex of sha256 over the WHOLE verbatim session
+#      id (owner ruling 2026-11-04, wv-24d57b): a prefix of the id is never
+#      used, since a UUIDv7's prefix is its timestamp. Bounded and
+#      filename-safe, and its prefix is the coarse id below.
+#   3. <harness>-<host>-<user>                otherwise (no session channel, or
+#      WV_SESSION_IDENTITY=0), so a human shell never collapses onto an agent.
+# A session channel that applies but is unset or empty gets the coarse id
+# here, for provenance only, and
+# agent_identity_unverified succeeds; ownership changes go through
+# require_agent_id, which refuses it. Always returns 0: callers assign it under
+# set -e, and a nonzero status would abort sync or the cache key.
 resolve_agent_id() {
     # Memoized per process (_WV_AGENT_ID_RESOLVED): identity is constant within a
     # process and this sits on the run-cache key hot path.
@@ -123,18 +191,146 @@ resolve_agent_id() {
         printf '%s\n' "$_WV_AGENT_ID_RESOLVED"
         return 0
     fi
-    local id
+    local id sid
     if [ -n "${WV_AGENT_ID:-}" ]; then
         id="$WV_AGENT_ID"
     else
-        local host user harness
+        local host user
         host=$(hostname 2>/dev/null || echo "host")
         user=$(whoami 2>/dev/null || echo "user")
-        harness=$(resolve_agent_harness)
-        id="${harness}-${host}-${user}"
+        id="$(resolve_agent_harness)-${host}-${user}"
+        _wv_session_sid_compute
+        sid="$_WV_SESSION_SID"
+        [ -z "$sid" ] || id="${id}-h${sid}"
     fi
     _WV_AGENT_ID_RESOLVED="$id"
     printf '%s\n' "$id"
+}
+
+# _wv_session_sid_compute — sets _WV_SESSION_RAW (the verbatim session id, or
+# empty when session identity does not apply, the channel carries none, or the
+# id has no [A-Za-z0-9] character) and
+# _WV_SESSION_SID (first 16 hex of sha256 over that whole id, owner ruling
+# 2026-11-04, wv-24d57b: a prefix is never used, since a UUIDv7's prefix is its
+# timestamp). With an id but no hasher, _WV_SESSION_SID stays empty and
+# _WV_SESSION_NOHASH=1: the identity is unverified and ownership is refused,
+# never a truncation fallback. Runs in the caller's shell (no command
+# substitution) so the result is memoized on the raw id, which a hook may change
+# by adopting its payload's.
+_wv_session_sid_compute() {
+    _WV_SESSION_RAW=""
+    if [ -z "${WV_AGENT_ID:-}" ] && [ "${WV_SESSION_IDENTITY:-1}" != "0" ]; then
+        local var
+        if [ -n "${WV_SESSION_ID+x}" ]; then var=WV_SESSION_ID
+        else var=$(_wv_session_var_for "$(resolve_agent_harness)"); fi
+        [ -z "$var" ] || _WV_SESSION_RAW="${!var:-}"
+        # An id with no [A-Za-z0-9] at all (empty, or only punctuation) is
+        # malformed: unverified, as before the digest (wv-24d57b).
+        [[ "$_WV_SESSION_RAW" =~ [A-Za-z0-9] ]] || _WV_SESSION_RAW=""
+    fi
+    [ "${_WV_SESSION_SID_FOR-x}" != "$_WV_SESSION_RAW" ] || return 0
+    _WV_SESSION_SID_FOR="$_WV_SESSION_RAW"; _WV_SESSION_SID=""; _WV_SESSION_NOHASH=0
+    [ -n "$_WV_SESSION_RAW" ] || return 0
+    local out=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        out=$(printf '%s' "$_WV_SESSION_RAW" | sha256sum 2>/dev/null) || out=""
+    elif command -v shasum >/dev/null 2>&1; then
+        out=$(printf '%s' "$_WV_SESSION_RAW" | shasum -a 256 2>/dev/null) || out=""
+    fi
+    out="${out%% *}"
+    if [[ "$out" =~ ^[0-9a-f]{64}$ ]]; then _WV_SESSION_SID="${out:0:16}"; else _WV_SESSION_NOHASH=1; fi
+}
+
+# _wv_agent_session_sid — prints the session part (digest16), or nothing.
+_wv_agent_session_sid() {
+    _wv_session_sid_compute
+    [ -z "$_WV_SESSION_SID" ] || printf '%s\n' "$_WV_SESSION_SID"
+}
+
+# resolve_agent_legacy_session_id — the -s<sid12> identity this session had
+# before wv-24d57b (the id reduced to [A-Za-z0-9], first 12). Used only so an
+# explicit `wv work --continue` can adopt this session's own pre-change claim,
+# never to admit anything. Prints nothing when session identity does not apply.
+resolve_agent_legacy_session_id() {
+    _wv_session_sid_compute
+    local raw="${_WV_SESSION_RAW//[^A-Za-z0-9]/}"
+    [ -n "$raw" ] || return 0
+    printf '%s-s%s\n' "$(resolve_agent_coarse_id)" "${raw:0:12}"
+}
+
+# agent_identity_unverified — succeeds when session identity applies (no
+# WV_AGENT_ID, WV_SESSION_IDENTITY not 0, a session channel) but the channel's
+# variable is unset or empty, or no sha256 hasher can digest it.
+agent_identity_unverified() {
+    [ -z "${WV_AGENT_ID:-}" ] && [ "${WV_SESSION_IDENTITY:-1}" != "0" ] || return 1
+    [ -n "$(_wv_session_source)" ] || return 1
+    _wv_session_sid_compute
+    [ -z "$_WV_SESSION_SID" ]
+}
+
+# agent_ownership_mode — "session" when the identity carries a verified session
+# part, else "actor": WV_AGENT_ID, WV_SESSION_IDENTITY=0, or no session channel
+# (a human shell, a host that exports nothing). An actor-owned claim is shared
+# by every session of that actor, so output labels it rather than implying
+# isolation (wv-b2996f).
+agent_ownership_mode() {
+    _wv_session_sid_compute
+    if [ -n "$_WV_SESSION_SID" ]; then printf 'session\n'; else printf 'actor\n'; fi
+}
+
+# The coarse actor id (<harness>-<host>-<user>, or WV_AGENT_ID) — what claims
+# written before session identity hold. Used only to recognise them for an
+# explicit `wv work --continue`, never to adopt them automatically.
+resolve_agent_coarse_id() {
+    if [ -n "${WV_AGENT_ID:-}" ]; then
+        printf '%s\n' "$WV_AGENT_ID"
+        return 0
+    fi
+    printf '%s-%s-%s\n' "$(resolve_agent_harness)" \
+        "$(hostname 2>/dev/null || echo host)" "$(whoami 2>/dev/null || echo user)"
+}
+
+# wv_adopt_hook_session_id <payload> — when the harness has a built-in session
+# variable but the hook process lacks it, and WV_SESSION_ID is unset, export
+# the payload's session_id (Claude Code) or thread_id (Codex) as WV_SESSION_ID,
+# the neutral channel, so a hook resolves the same owner as the shell (owner
+# ruling 2026-11-04, wv-43d6be). Every hook entry calls it before it resolves
+# an owner. An id already in the environment always wins.
+# A harness with no built-in variable is left alone: its shell is
+# session-qualified only through an exported WV_SESSION_ID, which its hooks
+# inherit, and adopting here would make the hook a different owner.
+wv_adopt_hook_session_id() {
+    [ -z "${WV_SESSION_ID+x}" ] || return 0
+    local var sid
+    var=$(_wv_session_var_for "$(resolve_agent_harness 2>/dev/null)")
+    [ -n "$var" ] || return 0
+    [ -z "${!var:-}" ] || return 0
+    sid=$(printf '%s' "$1" | jq -r '(.session_id // .thread_id // empty) | strings' 2>/dev/null) || return 0
+    [ -n "$sid" ] || return 0
+    export WV_SESSION_ID="$sid"
+    _WV_AGENT_ID_RESOLVED=""
+}
+
+# require_agent_id — the identity for an OWNERSHIP change (claim, active add,
+# commit admission, claim-scoped stop guard). Fails closed (rc 1, nothing on
+# stdout) when resolve_agent_id cannot verify the session, instead of letting a
+# session become a different owner mid-work (wv-99978b).
+require_agent_id() {
+    if agent_identity_unverified; then
+        local harness var
+        harness=$(resolve_agent_harness)
+        var=$(_wv_session_source)
+        if [ "${_WV_SESSION_NOHASH:-0}" = 1 ]; then
+            printf 'wv: cannot verify this %s session: no sha256 hasher (sha256sum or shasum) can digest %s, so ownership is refused.\n' \
+                "$harness" "${var:-its session id}" >&2
+        else
+            printf 'wv: cannot verify this %s session: %s is unset or empty, so ownership is refused.\n' \
+                "$harness" "${var:-its session id}" >&2
+        fi
+        printf '  Fix: export the session id as WV_SESSION_ID, set WV_AGENT_ID=<stable id>, or WV_SESSION_IDENTITY=0 for actor-owned identity.\n' >&2
+        return 1
+    fi
+    resolve_agent_id
 }
 
 resolve_runtime_label() {
@@ -770,17 +966,59 @@ resolve_db() {
     echo "${hot_zone}/brain.db"
 }
 
-resolve_primary_file() {
-    if [ -n "${WV_PRIMARY_FILE:-}" ]; then
-        echo "$WV_PRIMARY_FILE"
-        return
-    fi
-
-    local hot_zone="${1:-}"
+# resolve_owner_dir — the hot-zone directory for this owner's session-local
+# state: primary node, phase and context stamps (owner ruling 2026-11-04,
+# wv-43d6be). Two sessions in one checkout share the hot zone and its database
+# but never this directory. Keyed by the resolved agent id made filename-safe,
+# so WV_AGENT_ID, session identity and actor-owned identity all key it. When
+# the session cannot be verified it prints a directory no verified owner uses
+# and returns 1: readers find nothing there and writers skip it.
+resolve_owner_dir() {
+    local hot_zone="${1:-}" key
     if [ -z "$hot_zone" ]; then
         hot_zone=$(resolve_repo_hot_zone)
     fi
-    echo "${hot_zone}/primary"
+    if agent_identity_unverified; then
+        printf '%s/owners/_unverified\n' "$hot_zone"
+        return 1
+    fi
+    key=$(resolve_agent_id)
+    key="${key//[^A-Za-z0-9._-]/_}"
+    case "$key" in "" | . | .. | _unverified) key="_${key}" ;; esac
+    printf '%s/owners/%s\n' "$hot_zone" "$key"
+}
+
+# The three session-local files below print their path and return 1 when the
+# session cannot be verified (the path is then under owners/_unverified, never
+# written). Callers create the parent directory before writing.
+
+resolve_primary_file() {
+    if [ -n "${WV_PRIMARY_FILE:-}" ]; then
+        echo "$WV_PRIMARY_FILE"
+        return 0
+    fi
+    local dir rc=0
+    dir=$(resolve_owner_dir "${1:-}") || rc=1
+    echo "${dir}/primary"
+    return "$rc"
+}
+
+# resolve_phase_file — this owner's session phase file (never the hot-zone
+# root, which every session shares).
+resolve_phase_file() {
+    local dir rc=0
+    dir=$(resolve_owner_dir "${1:-}") || rc=1
+    echo "${dir}/.session_phase"
+    return "$rc"
+}
+
+# resolve_context_stamp <node-id> [hot-zone] — this owner's first-call stamp for
+# a node's Context Pack; another session's stamp never satisfies it.
+resolve_context_stamp() {
+    local dir rc=0
+    dir=$(resolve_owner_dir "${2:-}") || rc=1
+    echo "${dir}/.context_checked_${1}"
+    return "$rc"
 }
 
 resolve_active_primary() {
@@ -800,6 +1038,11 @@ resolve_active_primary() {
         primary_file=$(resolve_primary_file "$hot_zone")
     fi
     [ -f "$db_path" ] || return 0
+    # Only this owner's claims count (wv-43d6be): an unverifiable session has
+    # no primary, and another session's active node is never this one's.
+    local owner
+    owner=$(require_agent_id 2>/dev/null) || return 0
+    owner=${owner//\'/\'\'}
 
     if [ -f "$primary_file" ]; then
         primary_id=$(cat "$primary_file" 2>/dev/null || echo "")
@@ -807,7 +1050,7 @@ resolve_active_primary() {
             local escaped_primary
             escaped_primary=${primary_id//\'/\'\'}
             local primary_status
-            primary_status=$(sqlite3 "$db_path" "SELECT status FROM nodes WHERE id='${escaped_primary}' LIMIT 1;" 2>/dev/null || echo "")
+            primary_status=$(sqlite3 "$db_path" "SELECT status FROM nodes WHERE id='${escaped_primary}' AND json_extract(metadata, '\$.claimed_by')='${owner}' LIMIT 1;" 2>/dev/null || echo "")
             if [ "$primary_status" = "active" ]; then
                 echo "$primary_id"
                 return 0
@@ -816,7 +1059,8 @@ resolve_active_primary() {
         fi
     fi
 
-    fallback_id=$(sqlite3 "$db_path" "SELECT id FROM nodes WHERE status='active' ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null || echo "")
+    # The fallback is this owner's newest claim, never another session's.
+    fallback_id=$(sqlite3 "$db_path" "SELECT id FROM nodes WHERE status='active' AND json_extract(metadata, '\$.claimed_by')='${owner}' ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null || echo "")
     [ -n "$fallback_id" ] && echo "$fallback_id"
     return 0
 }

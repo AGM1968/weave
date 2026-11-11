@@ -4,6 +4,126 @@
 
 ## Unreleased
 
+## [1.71.0-rc.16] - 2026-11-10
+
+### Upgrading
+
+- Run `wv init-repo --update` in each repository. It now lists every file it adds beyond refreshing
+  what the repository already had, and it picks up the new hook timeouts.
+- If the update prints a `git rm --cached -- <files>` command, run it and commit once. The files are
+  machine-local state that `wv` rewrites on every load; they stay on disk, and a clone that is
+  behind can `git pull --ff-only` again. A committed `.weave/gate-provision.proposed.json` is among
+  them.
+- End each session with `wv sync --gh && git push`. Session end no longer syncs GitHub or pushes.
+- Claims now belong to a session. Resume a claim made before the upgrade with
+  `wv work <id> --continue`.
+- Run `wv load` once and read `wv bootstrap`, which now puts a failed last load first, with its
+  reason. A node you pruned before this release may come back as a live done node: those prunes
+  removed it from `.weave/state.sql` without a deletion record, and replay restores it. Run
+  `wv prune --dry-run`, then `wv prune`; each prune now writes a deletion record, and replay cannot
+  bring the node back.
+
+### Added
+
+- **Graph text refuses credentials.** Node text, metadata, learnings and memories are committed to
+  `.weave/` and mirrored to GitHub issues. Every command that writes them, the MCP server included,
+  now refuses ten token shapes: GitHub tokens, Anthropic and OpenAI keys, AWS access keys, PEM
+  private keys, Slack tokens, Google API keys, URL credentials and bearer tokens. The refusal names
+  the shape, never the value, and the command does not write. `wv doctor` names any node already
+  holding one.
+- **A prune policy.** `wv prune` runs only when you type it: it refuses from a hook, and session end
+  no longer prunes. Its default age is 30 days. It keeps findings, memories, epics, plans,
+  decisions, nodes with an unresolved pitfall, nodes a live node references (by an edge into it, or
+  by id in its text or metadata) and nodes whose GitHub issue is open or cannot be checked.
+  `--dry-run` lists what each rule kept. `wv guide --procedure=prune-policy` gives the policy.
+  `WV_AUTO_PRUNE` is retired: a graph over its size limit draws a warning that advises the prune,
+  and the switch announces that it does not prune.
+- **One gate at a time per checkout.** The pre-commit and pre-push hooks take a per-checkout lock; a
+  second gate on the same checkout is refused, and the refusal names the holder. `wv bootstrap`
+  reports a gate in flight and how the last push ended.
+- **Lifecycle hooks record whether they finished.** A session-start, stop, pre-compact or
+  session-end run that did not finish is counted by `wv doctor`, and session start reports it for 7
+  days.
+- **Every Weave hook has an explicit timeout.** `wv doctor --agent` lists each agent host on `PATH`
+  with its version and hook timeouts, and warns when a host version changes.
+- **`wv search --code` finds a definition first.** `wv index` records where each shell function and
+  Python definition is defined, and an exact name returns its definition ahead of the ranked
+  results. Session start rebuilds an empty or stale code index in the background.
+- **`wv list --ids=<id,...>`** lists exactly the named nodes, whatever their status. The MCP
+  `weave_list` tool takes `ids`.
+- **Two procedures.** `canary-before-theory`: test a theory in a throwaway clone at the current,
+  last good and suspect revisions before reasoning further from code. `design-audits`: five checks
+  for a design change, each with a trigger. `verify-before-fixed` and `blindspot-pass` now ask you
+  to run the steps a long-standing failure hid before closing its fix.
+- **For operators: groundwork for delta retention.** `wv compact --pre-cutover` retires the old
+  delta files the loader no longer reads, with a manifest and `--restore`. A load is acknowledged
+  only when every change applied. Clones are declared in `.weave/clones/<name>.roster`, and
+  `wv prune --compact-tombstones` drops deletion records that every declared clone has seen. It is
+  off unless `WV_TOMBSTONE_COMPACTION=1`.
+
+### Changed
+
+- **Claims and workflow state belong to a session.** When the harness supplies a session id (or
+  `WV_SESSION_ID` is set), claims, commit admission, the primary node and the session phase are per
+  session. Two sessions in one checkout no longer admit each other's commits or edit under each
+  other's claims. `WV_AGENT_ID` still wins, and `WV_SESSION_IDENTITY=0` restores the old identity.
+  `wv work <id> --force` takes over any claim; the claim history records both.
+- **Session end no longer syncs GitHub or pushes.** It runs a local sync, commits the graph
+  checkpoint and stops. Hosts were killing the old routine before its push.
+- **A GitHub sync creates fewer issues, and says how many first.** A sync does not create an issue
+  for a memory node, or for a done node that never had one; either may still adopt an existing issue
+  with its title. Every sync prints how many issues it may create and refuses above 25 unless you
+  pass `--yes` or raise `WV_GH_CREATE_LIMIT`. A dry run never refuses.
+- **The gate-provisioning proposal is machine-local.** `wv init-repo` writes
+  `.weave/gate-provision.proposed.json` for review, and git ignores it. Adopt it by renaming it to
+  `.weave/gate-provision.json`; decline it by committing `.weave/gate-provision.declined` with your
+  reason, which stops the proposal being written again.
+- **`wv done` refuses to close over staged, uncommitted work.** A refused commit leaves its files
+  staged; closing then made the retry fail for want of a claim. The node stays active and the
+  refusal names `--force` and `wv work <id> --reopen`.
+- **`wv done` scans an empty quality cache itself** after a reboot, instead of refusing until you
+  ran `wv quality scan`.
+- **Every command that changes the graph publishes before it returns.** The live graph then always
+  equals what a reload builds from `.weave/`. A claim takes about 2 s longer.
+- **`WV_AUTO_CHECKPOINT=0` stops every commit Weave makes for you**: the checkpoint, the sync's
+  final commit, the session-end checkpoint and the session-start snapshot. The checkpoint pull no
+  longer autostashes your unstaged edits.
+- **The edit guard blocks when it cannot run** on a file in a Weave checkout, and judges an edit by
+  the graph of the checkout the file is in.
+- **Faster everyday commands.** Measured on a large repository: a cold `wv load` from 83 s to 19 s,
+  `wv doctor` from 26 s to 16.5 s, `wv status` from 963 ms to 853 ms and `wv show` from 609 ms to
+  505 ms. A GitHub sync no longer creates its labels on every run (8.6 s to 0.7 s), and `wv done`
+  closes an issue in 1.3–1.5 s instead of 5.4–6.4 s.
+
+### Fixed
+
+- **A large prune keeps its deletion records.** Under rc.15 a prune's deletion records could exceed
+  the operating system's limit on one command-line argument; the write failed unseen, and every
+  fresh load then brought the pruned nodes back and failed. Large data now travels on stdin or
+  through a file, and the records land in the same transaction as the deletes.
+- **A load that does not finish says so.** `wv load` names the change that stopped it, and
+  `wv bootstrap` puts a failed last load first. A deletion record now holds during the whole replay.
+- **A load names a write that lost a conflict** when two graphs (linked worktrees, two machines)
+  changed the same field.
+- **A consumer that tracks Weave's hook sources runs its suites in its own checkout**, as intended,
+  not in the frozen mode meant for Weave's own repository.
+- **Gate refusals say why.** A suite refused in frozen mode names why it ran frozen and prints the
+  command that repeats that run. A hook too old for a repository that tracks Weave's hook sources
+  names the cause and `wv init-repo --update`. `wv doctor` and `wv init-repo` warn when your
+  `.gitignore` hides `.weave/gate-provision.json`, naming the rule and the exception to add.
+- **`wv doctor` recognises every Weave git hook the installers recognise.**
+- **A node's recorded commits are kept** when it or its epic closes, instead of being replaced.
+- **`wv add` keeps every `--criteria`** when the option is repeated.
+- **`wv list` sorts by priority correctly:** P0 first, then nodes with no priority, then P4.
+- **Prose rules skip the References section**, and an `exempt` entry treats a hyphen and a space
+  alike.
+- **The Stop hook blocks once when its guard cannot load**, instead of passing silently, and it
+  allows a stop while your own gate or push is running.
+- **Installing Weave replaces each file by rename, under a lock.** A running hook reads the old file
+  or the new one, never a mix of both.
+- **The working-tree guard sees live pi and Amp sessions**, and a terminal opened from an IDE no
+  longer makes another agent look like Claude Code.
+
 ## [1.71.0-rc.15] - 2026-11-01
 
 ### Upgrading

@@ -220,6 +220,9 @@ while IFS= read -r f; do SOURCES+=("$f"); done < <(
         find "$REPO_ROOT/scripts/weave_quality" "$REPO_ROOT/scripts/weave_gh" \
              "$REPO_ROOT/scripts/weave_search" "$REPO_ROOT/scripts/weave_indexer" \
              -name '*.py' 2>/dev/null
+        # The Python helpers beside the shell libraries declare tables the shell
+        # reads (wv-load-ack.py's _weave_load_attempt, wv-2f55dd).
+        find "$REPO_ROOT/scripts/lib" -maxdepth 1 -name '*.py' 2>/dev/null
         find "$REPO_ROOT/mcp/src" -name '*.ts' ! -name '*.test.ts' 2>/dev/null
     } | sort
 )

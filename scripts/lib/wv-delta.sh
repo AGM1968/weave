@@ -287,13 +287,22 @@ wv_delta_reset() {
 #     filename prefix IS the actor_sequence. This closes the residual where an
 #     actor reloads from a state.sql that lags its own already-committed ops
 #     (PROPOSAL-delta-causality.md "Residual").
+#   - the deletion tombstones' lineage_seq (Stage B prereq 2, wv-5575bb). When
+#     the newest op deleted an entity, no row keeps its seq; without this term
+#     the base rested on that op's sidecar name alone, and removing the sidecar
+#     dropped the base below a tombstone (PROPOSAL-delta-retention.md "Clock").
+#     Tombstones travel in state.sql. A DB without the table contributes 0.
+#   - the committed seq floor (wv_lineage_seq_floor): every compaction that
+#     deletes sidecars records the highest seq it deleted, so the base never
+#     falls when the catalog shrinks, whatever kind of op held that seq.
 #
 # Callers add 1 to get the next sequence to emit. DELTAS_ROOT defaults to the
 # conventional .weave/deltas under the DB's hot zone parent, which is usually
 # wrong for a hot-zone DB — pass it explicitly from auto_sync ($WEAVE_DIR/deltas).
 wv_lineage_seq_base() {
     local db="$1" deltas_root="${2:-}"
-    local graph_max=0 catalog_max=0 f base name
+    local graph_max=0 tomb_max=0 catalog_max=0 floor=0 base
+    local -a sidecars
 
     graph_max=$(sqlite3 -cmd ".timeout 5000" "$db" "
         SELECT COALESCE(MAX(m), 0) FROM (
@@ -302,23 +311,198 @@ wv_lineage_seq_base() {
         );" 2>/dev/null || echo 0)
     case "$graph_max" in ''|*[!0-9]*) graph_max=0 ;; esac
 
+    # A separate query, so a DB predating the tombstones table still yields
+    # the rows' high-water above instead of failing the whole read to 0.
+    tomb_max=$(sqlite3 -cmd ".timeout 5000" "$db" "
+        SELECT COALESCE(MAX(lineage_seq), 0) FROM tombstones;" 2>/dev/null || echo 0)
+    case "$tomb_max" in ''|*[!0-9]*) tomb_max=0 ;; esac
+    [ "$tomb_max" -gt "$graph_max" ] && graph_max="$tomb_max"
+
     if [ -n "$deltas_root" ] && [ -d "$deltas_root" ]; then
-        # Nullglob-free: the loop body guards on existence.
-        for f in "$deltas_root"/*/v2/*.json; do
-            [ -e "$f" ] || continue
-            name=${f##*/}
-            name=${name%%-*}
-            case "$name" in
-                ''|*[!0-9]*) continue ;;
-            esac
-            # 10# forces base-10 so a zero-padded "000000000012" is not read as octal.
-            [ "$((10#$name))" -gt "$catalog_max" ] && catalog_max=$((10#$name))
-        done
+        # The sequence is each sidecar name's prefix before its first "-".
+        # One awk picks the largest, where a shell test and two arithmetic
+        # expansions per file cost ~0.45 s over 9,000 sidecars (wv-5c1223);
+        # this costs ~0.1 s. The C locale only makes the glob's sort cheap
+        # (order does not matter here) and matches any name bytes.
+        # A newline in a path becomes "x", so the record stays one non-number,
+        # as the shell test read it. An unmatched glob stays the literal
+        # pattern, which is no number either. awk compares digit strings by
+        # length after dropping leading zeros, so no width overflows. Unlike
+        # the old [ -e ] test, a dangling symlink's number counts: a base too
+        # high only skips sequence numbers, while one too low could hand out
+        # a number already used.
+        local LC_ALL=C
+        sidecars=("$deltas_root"/*/v2/*.json)
+        sidecars=("${sidecars[@]//$'\n'/x}")
+        catalog_max=$(IFS=$'\n'; LC_ALL=C awk -F/ '
+            { n = $NF; sub(/-.*/, "", n) }
+            n ~ /^[0-9]+$/ {
+                sub(/^0+/, "", n)
+                if (length(n) > length(best) || (length(n) == length(best) && n > best)) best = n
+            }
+            END { print (best == "" ? 0 : best) }' <<< "${sidecars[*]}") || {
+            # No fallback to 0: a base too low reuses sequence numbers.
+            echo "wv: could not read the Delta v2 catalog's sequence high-water" >&2
+            return 1
+        }
+        floor=$(wv_lineage_seq_floor "$deltas_root") || return 1
     fi
 
     if [ "$graph_max" -ge "$catalog_max" ]; then base="$graph_max"; else base="$catalog_max"; fi
+    [ "$floor" -gt "$base" ] && base="$floor"
     printf '%s\n' "$base"
 }
+
+# wv_lineage_seq_floor DELTAS_ROOT — the committed clock floor (wv-5575bb): the
+# largest seq any compaction deleted from the catalog. Each compaction writes
+# its own record, DELTAS_ROOT/../compaction/<stamp>.seq-floor holding one
+# decimal integer, so two clones that compact concurrently add two files and
+# merge without conflict; the floor is the max over them. 0 when none exist.
+# An unreadable or malformed record fails: a floor read too low could hand out
+# a sequence already spent, and the caller must not emit on a guess.
+wv_lineage_seq_floor() {
+    local dir="${1%/}/../compaction" f v best=0
+    local -a recs
+    [ -d "$dir" ] || { printf '0\n'; return 0; }
+    local LC_ALL=C
+    shopt -q nullglob && local had_ng=1 || local had_ng=0
+    shopt -s nullglob
+    recs=("$dir"/*.seq-floor)
+    [ "$had_ng" -eq 1 ] || shopt -u nullglob
+    for f in "${recs[@]}"; do
+        if ! v=$(<"$f"); then
+            echo "wv: could not read the lineage seq floor record $f" >&2
+            return 1
+        fi
+        v="${v%$'\n'}"
+        case "$v" in
+            ''|*[!0-9]*)
+                echo "wv: malformed lineage seq floor record $f: '$v'" >&2
+                return 1 ;;
+        esac
+        v="${v#"${v%%[!0]*}"}"; v="${v:-0}"
+        if [ "${#v}" -gt 18 ]; then
+            echo "wv: lineage seq floor record $f is out of range: '$v'" >&2
+            return 1
+        fi
+        [ "$v" -gt "$best" ] && best="$v"
+    done
+    printf '%s\n' "$best"
+}
+
+# wv_lineage_seq_floor_record WEAVE_DIR STAMP SEQ — the write half of the floor
+# contract. A compaction that deletes Delta v2 sidecars calls this BEFORE it
+# removes them, with SEQ = the largest seq among the files it deletes, and
+# commits the record in the same commit as the deletions. The record is written
+# to a temp name and renamed, so a reader never sees a partial number. Raising
+# the floor too high only skips sequence numbers; too low would reuse them.
+wv_lineage_seq_floor_record() {
+    local weave_dir="$1" stamp="$2" seq="$3" dir tmp
+    case "$seq" in ''|*[!0-9]*) echo "wv: seq floor must be a number, got '$seq'" >&2; return 1 ;; esac
+    case "$stamp" in ''|*/*|.*) echo "wv: bad seq floor stamp '$stamp'" >&2; return 1 ;; esac
+    dir="$weave_dir/compaction"
+    mkdir -p "$dir" || return 1
+    tmp=$(mktemp "$dir/.seq-floor.XXXXXX") || return 1
+    if ! printf '%s\n' "$seq" > "$tmp" || ! mv -f "$tmp" "$dir/$stamp.seq-floor"; then
+        rm -f "$tmp"
+        echo "wv: could not write the lineage seq floor record in $dir" >&2
+        return 1
+    fi
+}
+
+# ── Writer fence (Stage B prereq 5, wv-aac412) ──────────────────────────────
+# A compaction that deletes replayable files leaves a seq-floor record (above),
+# so the set of records in the tree names every such compaction. A database
+# loaded before one of them may lack changes whose only other carrier was a
+# deleted file; dumping it to state.sql would publish that loss. Each load
+# records the set it loaded under, in a local table dump_state_sql never
+# exports (it dumps WV_DURABLE_TABLES only), and every state.sql writer asks
+# wv_compaction_fence first.
+
+# wv_compaction_epochs WEAVE_DIR — the compaction records in the tree, one
+# name (without .seq-floor) per line, sorted bytewise.
+wv_compaction_epochs() {
+    local dir="$1/compaction" f
+    [ -d "$dir" ] || return 0
+    for f in "$dir"/*.seq-floor; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        f="${f##*/}"; printf '%s\n' "${f%.seq-floor}"
+    done | LC_ALL=C sort
+}
+
+# wv_compaction_mark_absorbed DB EPOCHS — record EPOCHS (wv_compaction_epochs
+# output, captured BEFORE state.sql was read, so a compaction pulled in the
+# meantime stays unrecorded and fences) as the set DB was loaded under. Called
+# by cmd_load after a load, and by a compaction for its own clone's database,
+# which held every deleted change when it compacted.
+wv_compaction_mark_absorbed() {
+    local db="$1" epochs="$2" sql name
+    sql="BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS _weave_absorbed_compactions (name TEXT PRIMARY KEY);
+DELETE FROM _weave_absorbed_compactions;"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        sql+=$'\n'"INSERT OR IGNORE INTO _weave_absorbed_compactions VALUES ('${name//\'/\'\'}');"
+    done <<< "$epochs"
+    sql+=$'\nCOMMIT;'
+    # On stdin: one INSERT per compaction epoch grows without bound (wv-a05dcd).
+    printf '%s\n' "$sql" | sqlite3 -bail -cmd ".timeout 5000" "$db" >/dev/null || {
+        echo "wv: could not record the compactions $db was loaded under" >&2
+        return 1
+    }
+}
+
+# wv_compaction_fence DB WEAVE_DIR — 0 when DB was loaded under every
+# compaction record in the tree. Otherwise prints the records it lacks, one per
+# line, and returns 1. A database that cannot be read, or one with no record
+# table while the tree has records (it predates them, or this fence), is
+# fenced: the unsafe direction is writing state.sql, never refusing to.
+wv_compaction_fence() {
+    local db="$1" weave_dir="$2" tree absorbed out
+    tree=$(wv_compaction_epochs "$weave_dir") || return 1
+    [ -n "$tree" ] || return 0
+    if ! out=$(sqlite3 -readonly -cmd ".timeout 5000" "$db" \
+        "SELECT name FROM _weave_absorbed_compactions;" 2>&1); then
+        printf '%s\n' "$tree"
+        return 1
+    fi
+    absorbed=$(printf '%s\n' "$out" | LC_ALL=C sort)
+    out=$(LC_ALL=C comm -23 <(printf '%s\n' "$tree") <(printf '%s\n' "$absorbed"))
+    [ -z "$out" ] && return 0
+    printf '%s\n' "$out"
+    return 1
+}
+
+# ── Load acknowledgement (Stage B prereq 1, wv-4e35c0) ──────────────────────
+# A load is an attempt with a terminal state (wv-25e832 lesson 1): begun once
+# the new database is installed, then complete or failed. Only a complete
+# attempt writes an acknowledgement, naming the checkpoint it absorbed: the git
+# tree id of state.sql plus deltas/. cmd_load collects the reasons an attempt
+# failed with wv_load_gap. The work is in wv-load-ack.py; tables are local
+# (never in WV_DURABLE_TABLES, so never in state.sql).
+
+_WV_LOAD_ACK_PY="$(dirname "${BASH_SOURCE[0]}")/wv-load-ack.py"
+WV_LOAD_GAPS=()
+
+# wv_load_gap REASON — record why this load is not a full absorption.
+wv_load_gap() { WV_LOAD_GAPS+=("$1"); }
+
+# wv_load_catalog_digest WEAVE_DIR — digest of the load's inputs, or nonzero.
+wv_load_catalog_digest() { python3 "$_WV_LOAD_ACK_PY" digest "$1"; }
+
+# wv_load_attempt_begin DB — mark the attempt begun and drop any ack.
+wv_load_attempt_begin() { python3 "$_WV_LOAD_ACK_PY" begin "$1"; }
+
+# wv_load_attempt_finish DB WEAVE_DIR BEFORE_DIGEST — complete (prints the
+# checkpoint, returns 0) when no gap was recorded and the catalog still has
+# BEFORE_DIGEST; otherwise failed (prints the reasons on stderr, returns 3).
+wv_load_attempt_finish() {
+    python3 "$_WV_LOAD_ACK_PY" finish "$1" "$2" "${3:-}" ${WV_LOAD_GAPS[@]+"${WV_LOAD_GAPS[@]}"}
+}
+
+# wv_load_ack DB — the checkpoint DB acknowledged, or return 1 when the last
+# load attempt did not complete.
+wv_load_ack() { python3 "$_WV_LOAD_ACK_PY" show "$1"; }
 
 # wv_lineage_stamp DB ACTOR_ID SEQ [MAX_ID] — record (SEQ, ACTOR_ID) as the last
 # writer on every node and edge that changed since the last reset (wv-cdb45a).
@@ -364,6 +548,24 @@ UPDATE edges SET lineage_seq=$seq, lineage_actor='$actor_q'
        json_extract(old_data,'\$.context') IS NOT json_extract(new_data,'\$.context')
      ))
    ));
+-- Every row this emission deleted is published as a delete op carrying this
+-- seq, and replay (_apply_delete) writes that op's tombstone: it raises one the
+-- delete already wrote at the row's own lineage (wv delete), and creates one a
+-- delete never wrote (wv unlink, wv resolve). Do the same here, upward only like
+-- ON CONFLICT, so the live graph equals its own reload (wv-61e13b, wv-851fb4).
+-- 'WHERE true' lets SQLite parse the upsert after a compound SELECT.
+INSERT INTO tombstones(kind, id, lineage_seq, lineage_actor)
+SELECT kind, id, $seq, '$actor_q' FROM (
+   SELECT 'node' AS kind, row_id AS id FROM _warp_changes
+    WHERE table_name='nodes'$bound AND operation='DELETE'
+   UNION
+   SELECT 'edge', row_id FROM _warp_changes
+    WHERE table_name='edges'$bound AND operation='DELETE') WHERE true
+ON CONFLICT(kind, id) DO UPDATE SET
+   lineage_seq = excluded.lineage_seq,
+   lineage_actor = excluded.lineage_actor
+ WHERE (excluded.lineage_seq, excluded.lineage_actor)
+     > (tombstones.lineage_seq, tombstones.lineage_actor);
 " 2>&1
 }
 
@@ -1053,7 +1255,7 @@ wv_delta_v2_write_operations() {
     # one number by construction and skips a second O(catalog) base scan that a
     # concurrent writer could move between the two calls (wv-99c85a).
     case "$lineage_seq" in
-        ''|*[!0-9]*|0) base=$(wv_lineage_seq_base "$db" "$deltas_root") ;;
+        ''|*[!0-9]*|0) base=$(wv_lineage_seq_base "$db" "$deltas_root") || return 1 ;;
         *) base=$((lineage_seq - 1)) ;;
     esac
     python3 - "$db" "$out_dir" "$actor_id" "$base" "$max_id" "$manifest" <<'PY'

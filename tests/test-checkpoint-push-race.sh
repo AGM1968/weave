@@ -71,10 +71,13 @@ sync_checkpoint() { WV_AUTO_CHECKPOINT=1 WV_CHECKPOINT_INTERVAL=0 wv sync >/dev/
 echo "=== a checkpoint during a push leaves main on the pushed commit ==="
 printf '#!/bin/sh\necho a2\n' > src/a.sh
 git add -A && git -c core.hooksPath=/dev/null commit -q -m "work owing the heavy tier"
-graph_write; wv sync >/dev/null 2>&1   # the unpushed graph-only checkpoint the push will carry
+# The unpushed graph-only checkpoint the push will carry. WV_AUTO_CHECKPOINT=0
+# (exported above) now stops sync's own commit too (wv-fbbdff), so this goes
+# through sync_checkpoint; either checkpoint writer's subject is the same kind.
+graph_write; sync_checkpoint
 pushed=$(git rev-parse HEAD)
 # Without these the race below would pass vacuously: no checkpoint, nothing to amend.
-check "the push carries a graph-only checkpoint at its tip" "$(git log -1 --format=%s | grep -c 'sync state')" "1"
+check "the push carries a graph-only checkpoint at its tip" "$(git log -1 --format=%s | grep -cE 'sync state|auto-checkpoint')" "1"
 check "and that checkpoint holds the dumped graph" "$(git ls-files .weave/nodes.jsonl)" ".weave/nodes.jsonl"
 rm -f "$MARK/started" "$MARK/release"
 git push -q origin main > "$T/push.log" 2>&1 &

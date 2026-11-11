@@ -248,7 +248,9 @@ assert_xfail_exit() {
 # silently (wv-f5a3be). A failed add now fails here, with its output.
 get_id() {
     local id
-    id=$(sed -nE 's/^✓ (wv-[a-f0-9]{6}): .*/\1/p' <<< "$1")
+    # The first such line: an add with --criteria prints a second
+    # "✓ wv-xxxxxx: N done criteria stored" line (8081bbf46).
+    id=$(sed -nE 's/^✓ (wv-[a-f0-9]{6}): .*/\1/;T;p;q' <<< "$1")
     if [ -z "$id" ]; then
         echo "get_id: wv add created no node:" >&2
         sed 's/^/    /' <<< "$1" >&2

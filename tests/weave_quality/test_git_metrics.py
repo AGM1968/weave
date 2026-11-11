@@ -8,6 +8,7 @@ API convention: all functions take (repo, filepath) positional args.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections import Counter
 from pathlib import Path
@@ -16,6 +17,7 @@ from unittest.mock import patch
 import pytest
 
 from weave_quality.git_metrics import (
+    _GRAPH_STATE_PATHS,
     _batch_git_stats,
     _co_change_cache,
     _compute_ownership_from_counts,
@@ -401,12 +403,79 @@ class TestFileCoChangesFallback:
 
     def test_fallback_parses_git_output(self, tmp_path: Path) -> None:
         _co_change_cache.clear()
-        log_out = "COMMIT_SEP\nfoo.py\nbar.py\nCOMMIT_SEP\nfoo.py\nbaz.py\n"
+        log_out = "/COMMIT/\nfoo.py\0bar.py\0\0/COMMIT/\nfoo.py\0baz.py\0\0"
         with patch("weave_quality.git_metrics._git", return_value=log_out):
             result = file_co_changes(tmp_path, "foo.py", top_n=5)
         assert "bar.py" in result
         assert "baz.py" in result
         assert "foo.py" not in result
+
+
+# ---------------------------------------------------------------------------
+# compute_co_changes — what counts as changing together (wv-552b86)
+# ---------------------------------------------------------------------------
+
+
+def _commit(repo: Path, files: list[str], env: dict[str, str]) -> None:
+    for rel in files:
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write("x\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, env=env, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--no-verify", "-m", "c"], cwd=repo, env=env, check=True
+    )
+
+
+@need_git
+class TestCoChangeScope:
+    @pytest.fixture()
+    def repo(self, tmp_path: Path) -> Path:
+        # Unset GIT_*: an inherited GIT_DIR would point every call at another repo.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        subprocess.run(["git", "init", "-q", str(tmp_path)], env=env, check=True)
+        for _ in range(2):
+            _commit(tmp_path, ["a.py", "b.py"], env)
+        for _ in range(3):  # graph syncs beside a source edit
+            _commit(tmp_path, ["a.py", ".weave/state.sql", ".weave/nodes.jsonl",
+                               ".weave/deltas/2026-01-01/1-x.sql"], env)
+        _commit(tmp_path, [".weave/test-map.conf", "src.sh"], env)  # configuration
+        bulk = [f"fixtures/f{i:02}.json" for i in range(31)]
+        for _ in range(3):  # one file over the cap: left out whole
+            _commit(tmp_path, bulk, env)
+        at_cap = [f"gen/g{i:02}.py" for i in range(30)]
+        _commit(tmp_path, at_cap, env)  # at the cap: counted
+        _commit(tmp_path, ['odd "name".py', "b.py"], env)
+        return tmp_path
+
+    def test_graph_paths_and_bulk_commits_are_left_out(self, repo: Path) -> None:
+        _co_change_cache.clear()
+        pairs = compute_co_changes(repo, top_n=1000)
+        paths = {p for cc in pairs for p in (cc.path_a, cc.path_b)}
+        assert not paths & {".weave/state.sql", ".weave/nodes.jsonl",
+                            ".weave/deltas/2026-01-01/1-x.sql"}
+        assert any(cc.path_a == ".weave/test-map.conf" and cc.path_b == "src.sh"
+                   for cc in pairs)
+        assert not any(p.startswith("fixtures/") for p in paths)
+        assert pairs[0].path_a == "a.py" and pairs[0].path_b == "b.py"
+        assert pairs[0].count == 2
+        # 30 files at the cap give 435 pairs; the 31-file commits give none.
+        assert sum(1 for cc in pairs if cc.path_a.startswith("gen/")) == 435
+
+    def test_names_are_read_exactly(self, repo: Path) -> None:
+        _co_change_cache.clear()
+        pairs = compute_co_changes(repo, top_n=1000)
+        assert any(cc.path_a == "b.py" and cc.path_b == 'odd "name".py' for cc in pairs)
+
+    def test_per_file_matches_the_pairs(self, repo: Path) -> None:
+        _co_change_cache.clear()
+        compute_co_changes(repo)
+        assert file_co_changes(repo, "a.py") == ["b.py"]
+        assert set(file_co_changes(repo, "b.py")) == {"a.py", 'odd "name".py'}
+        assert file_co_changes(repo, ".weave/state.sql") == []
 
 
 # ---------------------------------------------------------------------------
@@ -486,3 +555,8 @@ class TestEnrichAllGitStats:
         assert len(result) == 1
         assert result[0].path == "install.sh"
         assert result[0].churn > 0
+
+    def test_graph_state_list_matches_the_checkpoint_allowlist(self) -> None:
+        text = (Path(REPO) / "scripts/lib/wv-checkpoint-ci.sh").read_text(encoding="utf-8")
+        body = text.split("WV_GRAPH_STATE_PATHS=(", 1)[1].split(")", 1)[0]
+        assert tuple(body.split()) == _GRAPH_STATE_PATHS

@@ -291,12 +291,56 @@ class TestReopenGuard:
         assert stats.reopened_gh == 1
         assert issue.state == "OPEN"  # mutated by reopen
 
-    def test_closed_issue_body_still_updated(self) -> None:
-        """A closed issue whose body changed should still get updated.
+    def _body_sync(
+        self, node: WeaveNode, issue: GitHubIssue, done: set[int]
+    ) -> tuple[SyncStats, list[tuple[object, ...]]]:
+        """Run _handle_existing_issue with a render that always differs."""
+        stats = SyncStats()
+        gh_calls: list[tuple[object, ...]] = []
 
-        Scenario: wv done closes the GH issue directly, then wv sync --gh
-        runs. The body (checkboxes, Mermaid) should be refreshed even though
-        the issue is already closed.
+        def mock_gh_cli(*args: object, **_kwargs: object) -> str:
+            gh_calls.append(args)
+            return ""
+
+        with self._with_patches(
+            render_issue_body=(
+                _callback(
+                    phases.render_issue_body,
+                    lambda *_a, **_k: "<!-- WEAVE:BEGIN hash=abc123 -->\nnew\n<!-- WEAVE:END -->",
+                )
+            ),
+            should_update_body=_positional_callback(phases.should_update_body, lambda *_a: True),
+            extract_human_content=_positional_callback(phases.extract_human_content, lambda _: ""),
+            compose_issue_body=_positional_callback(phases.compose_issue_body, lambda h, w: w),
+            _was_closed_by_weave=_callback(_was_closed_by_weave, lambda *_a, **_k: False),
+            gh_cli=mock_gh_cli,
+        ):
+            _handle_existing_issue(
+                node, issue.number, {issue.number: issue}, {node.id: node},
+                "owner/repo", "https://github.com/owner/repo", stats, done_gh_issues=done,
+            )
+        return stats, gh_calls
+
+    def test_closing_in_this_pass_writes_the_final_body_then_closes(self) -> None:
+        """A done node whose issue is still OPEN gets its final body, then the close."""
+        node = _node("wv-gggh", status="done", gh_issue=701)
+        stats, gh_calls = self._body_sync(node, _issue(701, state="OPEN", body="old"), {701})
+        verbs = [c[1] for c in gh_calls if len(c) > 1]
+        assert verbs == ["edit", "close"]
+        assert stats.updated_gh == 1 and stats.closed_gh == 1
+
+    def test_a_node_that_is_not_done_still_updates_a_closed_issue(self) -> None:
+        """A reopen path: the node is open, the issue closed, so the body updates."""
+        node = _node("wv-gggi", status="todo", gh_issue=702)
+        stats, gh_calls = self._body_sync(node, _issue(702, state="CLOSED", body="old"), set())
+        assert stats.updated_gh == 1
+        assert any(c[1] == "edit" for c in gh_calls if len(c) > 1)
+
+    def test_closed_issue_of_a_done_node_is_history(self) -> None:
+        """A CLOSED issue of a done node is never rewritten (owner decision
+        2026-11-10, wv-092ea6): after the 2026-11-09 prune a full sync would
+        have rewritten 698 bodies, 632 closed, only to drop links to pruned
+        relatives whose issues still exist.
         """
         node = _node("wv-gggg", status="done", gh_issue=700)
         issue = _issue(700, state="CLOSED", body="old body")
@@ -333,10 +377,10 @@ class TestReopenGuard:
                 done_gh_issues={700},
             )
 
-        # Body should have been updated even though issue was closed
-        assert stats.updated_gh == 1
+        # The closed issue's body is history: no edit, no render counted
+        assert stats.updated_gh == 0
         edit_calls = [c for c in gh_calls if "edit" in c]
-        assert len(edit_calls) == 1
+        assert edit_calls == []
         # Should NOT try to close again (already closed)
         assert stats.closed_gh == 0
 
@@ -776,6 +820,30 @@ class TestDesiredAssigneeForNode:
                     claimed_by=f"{harness}-debian-alistair",
                 )
                 assert _desired_assignee_for_node(node) == "octocat"
+
+    def test_session_qualified_local_claim_maps_to_authenticated_login(self) -> None:
+        """<harness>-host-user-h<digest16> (wv-24d57b) and the legacy
+        -s<sid12> (wv-99978b) are local claims; a lookalike with a bad suffix
+        or another host stays a literal login."""
+        ok = subprocess.CompletedProcess([], returncode=0, stdout="octocat\n", stderr="")
+        with patch("weave_gh.phases.socket.gethostname", return_value="debian"), patch(
+            "weave_gh.phases.getpass.getuser", return_value="alistair"
+        ), patch("weave_gh.phases._run", return_value=ok):
+            for claimed_by, expected in (
+                ("claude-debian-alistair-h61eef8f68895bbdc", "octocat"),
+                ("codex-debian-alistair-h1681eb11627cc40f", "octocat"),
+                ("claude-debian-alistair-se2bbbaf2606c", "octocat"),
+                ("codex-debian-alistair-s019abc1234", "octocat"),
+                ("claude-debian-alistair-s", "claude-debian-alistair-s"),
+                ("claude-debian-alistair-h61eef8f68895bbd", "claude-debian-alistair-h61eef8f68895bbd"),
+                ("claude-debian-alistair-h61EEF8F68895BBDC", "claude-debian-alistair-h61EEF8F68895BBDC"),
+                ("claude-debian-alistair-se2bbbaf2606cX", "claude-debian-alistair-se2bbbaf2606cX"),
+                ("claude-other-alistair-h61eef8f68895bbdc", "claude-other-alistair-h61eef8f68895bbdc"),
+                ("claude-debian-alistair-s../x", "claude-debian-alistair-s../x"),
+            ):
+                _current_gh_login.cache_clear()
+                node = _node("wv-local-session", status="active", claimed_by=claimed_by)
+                assert _desired_assignee_for_node(node) == expected, claimed_by
 
 
 # ---------------------------------------------------------------------------
@@ -1328,8 +1396,12 @@ class TestHandleNewIssuePaths:
         assert len(sync_calls) == 1             # assignee synced post-creation
 
     def test_done_node_closes_issue_after_create(self) -> None:
-        """If node is done, the newly created issue is immediately closed."""
-        node = _node("wv-done", status="done")
+        """If node is done, the newly created issue is immediately closed.
+
+        Only a done node that HAD an issue (a stale mapping, issue 41 gone)
+        reaches the create since wv-cb8268; an issueless done node gets none.
+        """
+        node = _node("wv-done", status="done", gh_issue=41)
         gh_calls: list[tuple[object, ...]] = []
         stats = SyncStats()
 
@@ -1634,6 +1706,7 @@ class TestSyncClosedToWeave:
         assert stats.closed_wv == 1
         mock_wv.assert_called_once_with(
             "done", "wv-todc", "--skip-verification", "--acknowledge-overlap",
+            "--force",  # staged files here are not this node's commit (wv-b026bb)
             "--learning=closed via GH issue sync (Phase 3)",
             check=False,
         )
@@ -1935,16 +2008,21 @@ class TestSharedTextConvergence:
 
     @pytest.mark.parametrize("text", ["shared short text", "task(E6 recapture): " + "x" * 300])
     def test_one_full_sync_gives_each_node_its_issue(self, text: str) -> None:
-        nodes = [_node(f"wv-00000{i}", text=text, status="done") for i in range(3)]
+        # Open nodes: an issueless done node gets no issue since wv-cb8268.
+        nodes = [_node(f"wv-00000{i}", text=text, status="todo") for i in range(3)]
         first, issues = self._sync(nodes, [])
         assert first.created_gh == 3
-        assert first.closed_gh == 3
         assert sorted(n.gh_issue or 0 for n in nodes) == [100, 101, 102]
 
         second, after = self._sync(nodes, issues)
         assert second.created_gh == 0
-        assert second.closed_gh == 0
         assert len(after) == 3
+
+    def test_issueless_done_nodes_sharing_a_title_get_no_issue(self) -> None:
+        nodes = [_node(f"wv-00001{i}", text="shared", status="done") for i in range(3)]
+        first, issues = self._sync(nodes, [])
+        assert first.created_gh == 0
+        assert issues == []
 
     def test_unmapped_node_takes_unmarked_title_match(self) -> None:
         """A weave-synced issue with no Weave ID marker (legacy body) is still
@@ -2190,3 +2268,73 @@ class TestPhaseDRepairCheckpoint:
             )
 
         assert stats.resumed_from == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue creation policy (wv-cb8268, owner ruling 2026-11-10)
+# ---------------------------------------------------------------------------
+
+
+class TestCreationPolicy:
+    """Memory nodes and done nodes with no issue never get one; a sync that
+    would create more than the limit refuses before any write unless --yes."""
+
+    def test_memory_and_issueless_done_nodes_are_not_created(self) -> None:
+        memory = _node("wv-mem001", "a memory", status="todo", node_kind="memory")
+        done = _node("wv-done01", "long done", status="done")
+        live = _node("wv-live01", "open work", status="todo")
+        assert phases.creation_skip_reason(memory) == "memory node"
+        assert phases.creation_skip_reason(done) == "done node with no issue"
+        assert phases.creation_skip_reason(live) is None
+        planned = phases.planned_creations([memory, done, live], [])
+        assert [n.id for n in planned] == ["wv-live01"]
+
+    def test_handle_new_issue_skips_a_memory_node_without_calling_gh(self) -> None:
+        stats = SyncStats()
+        memory = _node("wv-mem002", "a memory", status="done", node_kind="memory")
+        with patch("weave_gh.phases.gh_cli") as gh:
+            _handle_new_issue(
+                memory, {memory.id: memory}, [], {}, {}, "o/r", "https://x", stats
+            )
+        gh.assert_not_called()
+        assert stats.skipped == 1 and stats.created_gh == 0
+
+    def test_a_node_already_mapped_or_named_in_a_body_is_not_planned(self) -> None:
+        mapped = _node("wv-map001", "mapped", gh_issue=7)
+        named = _node("wv-nam001", "named in a body")
+        issues = [_issue(7), _issue(8, body="<!-- weave:wv-nam001 --> wv-nam001")]
+        planned = phases.planned_creations([mapped, named], issues)
+        assert mapped not in planned
+
+    def test_above_the_limit_refuses_before_any_write(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("WV_GH_CREATE_LIMIT", "3")
+        nodes = [_node(f"wv-new{i:03d}", f"new {i}") for i in range(4)]
+        with patch("weave_gh.phases.gh_cli") as gh, pytest.raises(phases.CreationLimitExceeded) as exc:
+            phases.sync_weave_to_github(
+                nodes, [], "o/r", "https://x", {n.id: n for n in nodes}, SyncStats(),
+                mode=Mode.FULL,
+            )
+        gh.assert_not_called()
+        assert len(exc.value.planned) == 4 and exc.value.limit == 3
+
+    def test_yes_and_dry_run_pass_the_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("WV_GH_CREATE_LIMIT", "3")
+        nodes = [_node(f"wv-yes{i:03d}", f"new {i}") for i in range(4)]
+        with patch("weave_gh.phases._traverse_candidates", return_value=[]) as walk:
+            phases.sync_weave_to_github(
+                nodes, [], "o/r", "https://x", {n.id: n for n in nodes}, SyncStats(),
+                mode=Mode.FULL, assume_yes=True,
+            )
+            phases.sync_weave_to_github(
+                nodes, [], "o/r", "https://x", {n.id: n for n in nodes}, SyncStats(),
+                mode=Mode.FULL, dry_run=True,
+            )
+        assert walk.call_count == 2
+
+    def test_limit_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("WV_GH_CREATE_LIMIT", "5")
+        assert phases.create_limit_from_env() == 5
+        monkeypatch.setenv("WV_GH_CREATE_LIMIT", "lots")
+        assert phases.create_limit_from_env() == phases.DEFAULT_CREATE_LIMIT
+        monkeypatch.delenv("WV_GH_CREATE_LIMIT")
+        assert phases.create_limit_from_env() == phases.DEFAULT_CREATE_LIMIT

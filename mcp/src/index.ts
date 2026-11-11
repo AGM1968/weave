@@ -44,6 +44,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { execFileSync, spawnSync } from "child_process";
+import { createHash } from "crypto";
 import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, statSync } from "fs";
 import { hostname, userInfo } from "os";
 import { dirname, join, resolve } from "path";
@@ -294,22 +295,38 @@ function resolveProjectRoot(): string {
 // self-set with no known leak vector; CODEX_THREAD_ID/CODEX_CI can be
 // co-present with a genuine top-level Claude Code session and must not win
 // (wv-4d4c96 — that direction previously mislabeled real Claude sessions codex).
-// Claude's marker is CLAUDECODE=1, set in every process Claude Code starts;
-// CLAUDE_CODE_SSE_PORT is set only with an IDE attached and stays an alias
-// (wv-50640a).
-const AGENT_HARNESS_PRECEDENCE = ["copilot", "claude", "codex"] as const;
-type AgentHarness = (typeof AGENT_HARNESS_PRECEDENCE)[number] | "human";
+// Claude's marker is CLAUDECODE=1, set in every process Claude Code starts.
+// CLAUDE_CODE_SSE_PORT is not an identity marker (wv-08d7f9): an IDE-enabled
+// terminal exports it to every harness it starts.
+// AI_AGENT is the neutral marker (wv-08d7f9): set by the innermost agent, it
+// ranks below copilot and above claude and codex. See aiAgentLabel.
+type AgentHarness = string;
+
+// Mirrors _wv_ai_agent_label (bash): claude-code_* keeps the label claude; any
+// other value is ASCII-lowercased and reduced to [a-z0-9], at most 24
+// characters; empty or "human" names no harness.
+export function aiAgentLabel(): string | undefined {
+  const lowered = (process.env.AI_AGENT ?? "").replace(/[A-Z]/g, (c) => c.toLowerCase());
+  if (lowered.startsWith("claude-code")) return "claude";
+  const label = lowered.replace(/[^a-z0-9]/g, "").slice(0, 24);
+  return label === "" || label === "human" ? undefined : label;
+}
 
 export function resolveAgentHarness(): AgentHarness {
-  const present: Array<(typeof AGENT_HARNESS_PRECEDENCE)[number]> = [];
-  if (process.env.CLAUDECODE === "1" || process.env.CLAUDE_CODE_SSE_PORT) present.push("claude");
-  if (process.env.CODEX_THREAD_ID || process.env.CODEX_CI === "1") present.push("codex");
-  if (process.env.COPILOT_AGENT === "1") present.push("copilot");
+  // Built in precedence order: copilot > AI_AGENT > claude > codex.
+  const present: string[] = [];
+  const add = (h: string | undefined) => {
+    if (h && !present.includes(h)) present.push(h);
+  };
+  if (process.env.COPILOT_AGENT === "1") add("copilot");
+  add(aiAgentLabel());
+  if (process.env.CLAUDECODE === "1") add("claude");
+  if (process.env.CODEX_THREAD_ID || process.env.CODEX_CI === "1") add("codex");
 
   if (present.length === 0) return "human";
   if (present.length === 1) return present[0];
 
-  const winner = AGENT_HARNESS_PRECEDENCE.find((h) => present.includes(h)) ?? present[0];
+  const winner = present[0];
   console.error(
     `wv-mcp: ambiguous agent markers (${present.join(" ")}); using ${winner} precedence. ` +
       `Set WV_AGENT_ID to make identity explicit.`
@@ -317,10 +334,60 @@ export function resolveAgentHarness(): AgentHarness {
   return winner;
 }
 
+// Mirrors _wv_session_var_for (bash): built-in defaults for harnesses observed
+// to carry a session id in shell and hook processes (S0 probe wv-280f9e; pi
+// and Amp, docs/findings/harness-env-probe-2026-11-04). A convenience, not the
+// contract: any host supplies one through WV_SESSION_ID.
+const SESSION_ID_VARS: Partial<Record<AgentHarness, string>> = {
+  claude: "CLAUDE_CODE_SESSION_ID",
+  codex: "CODEX_THREAD_ID",
+  pi: "PI_SESSION_ID",
+  amp: "AMP_CURRENT_THREAD_ID",
+};
+
+// Mirrors _wv_session_source (bash): WV_SESSION_ID when set (even empty: a
+// declared, unverifiable session), else the harness default, else undefined.
+function sessionSource(): string | undefined {
+  if (process.env.WV_SESSION_ID !== undefined) return "WV_SESSION_ID";
+  // Own keys only: an AI_AGENT label such as "constructor" must not reach the
+  // object prototype.
+  const harness = resolveAgentHarness();
+  return Object.prototype.hasOwnProperty.call(SESSION_ID_VARS, harness) ? SESSION_ID_VARS[harness] : undefined;
+}
+
+// True when session identity applies (wv-99978b): no explicit WV_AGENT_ID,
+// WV_SESSION_IDENTITY is not "0", and a session channel exists.
+export function sessionIdentityApplies(): boolean {
+  if (process.env.WV_AGENT_ID) return false;
+  if (process.env.WV_SESSION_IDENTITY === "0") return false;
+  return sessionSource() !== undefined;
+}
+
+// Mirrors _wv_session_sid_compute (bash): the first 16 hex of sha256 over the
+// WHOLE verbatim session id (owner ruling 2026-11-04, wv-24d57b; a prefix is
+// never used, since a UUIDv7's prefix is its timestamp), or "" when session
+// identity does not apply or the channel carries no id.
+export function agentSessionSid(): string {
+  if (!sessionIdentityApplies()) return "";
+  const v = sessionSource();
+  const raw = (v && process.env[v]) || "";
+  // An id with no [A-Za-z0-9] (empty or only punctuation) is malformed: unverified.
+  return /[A-Za-z0-9]/.test(raw) ? createHash("sha256").update(raw, "utf8").digest("hex").slice(0, 16) : "";
+}
+
 // Mirrors resolve_agent_id() (bash): explicit WV_AGENT_ID always wins; otherwise
-// <harness>-<host>-<user>, matching the format scripts/weave_gh/phases.py
-// recognizes as a local (non-GH-login) claim.
+// <harness>-<host>-<user>, with -h<digest16> appended when session identity
+// applies and the harness supplied one (docs/AGENT-IDENTITY-CONTRACT.md §3).
+// In the MCP server this is REPORTED only: S0 showed the server's startup
+// environment carries a wrong session id (Claude --continue) or none (Codex),
+// so in session mode the ownership tools refuse (refuseOwnershipInSessionMode).
 export function resolveAgentId(): string {
+  if (process.env.WV_AGENT_ID) return process.env.WV_AGENT_ID;
+  const sid = agentSessionSid();
+  return sid ? `${resolveAgentCoarseId()}-h${sid}` : resolveAgentCoarseId();
+}
+
+function resolveAgentCoarseId(): string {
   if (process.env.WV_AGENT_ID) return process.env.WV_AGENT_ID;
   let host = "host";
   let user = "user";
@@ -1153,6 +1220,13 @@ const TOOLS: Tool[] = [
           description:
             "Filter by claim owner. Use 'current' for the nodes this agent holds, or an explicit agent id. Excludes another agent's claims.",
         },
+        ids: {
+          type: "array",
+          items: { type: "string", pattern: "^wv-[a-f0-9]{4,6}$" },
+          minItems: 1,
+          description:
+            "List exactly these node ids (any status, no row cap), instead of reading every node to find a few.",
+        },
         mode: {
           type: "string",
           enum: ["bootstrap", "discover", "execute", "full"],
@@ -1968,7 +2042,8 @@ const TOOLS: Tool[] = [
         },
         procedure: {
           type: "string",
-          description: "Procedure id: the repository's own (.weave/procedures/<id>.md, which replaces a package procedure of the same id) or an installed one. Mutually exclusive with topic; returns the procedure body.",
+          description:
+            "Procedure id: the repository's own (.weave/procedures/<id>.md, which replaces a package procedure of the same id) or an installed one. Mutually exclusive with topic; returns the procedure body.",
         },
       },
       required: [],
@@ -2620,11 +2695,13 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     const claimedBy = args.claimed_by as string | undefined;
     const mode = args.mode as ReadMode | undefined;
     const limit = args.limit as number | undefined;
+    const ids = args.ids as string[] | undefined;
     const cmd = ["list", "--json-v2"];
     if (status) cmd.push(`--status=${status}`);
     if (all) cmd.push("--all");
     if (limit !== undefined) cmd.push(`--limit=${limit}`);
     if (claimedBy) cmd.push(`--claimed-by=${claimedBy}`);
+    if (ids && ids.length > 0) cmd.push(`--ids=${ids.join(",")}`);
     result = wvRead(cmd, WV_TIMEOUT, mode);
     return result;
   },
@@ -3431,11 +3508,55 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
 // switch — same handler, two tool names.
 TOOL_HANDLERS.weave_trails = TOOL_HANDLERS.weave_breadcrumbs;
 
+// MCP is read-only for ownership in session mode (owner ruling on wv-116cbd,
+// 2026-11-03): the server cannot see or verify the calling session, so a claim
+// made here could not match the shell's session-qualified identity. These calls
+// change ownership; everything else stays available.
+const OWNERSHIP_TOOLS = new Set([
+  "weave_work",
+  "weave_done",
+  "weave_batch_done",
+  "weave_ship",
+  "weave_quick",
+  "weave_close_session",
+]);
+
+export function isOwnershipCall(name: string, args: Record<string, unknown>): boolean {
+  if (OWNERSHIP_TOOLS.has(name)) return true;
+  if (name === "weave_add") return normalizeStatus(args.status as string | undefined) === "active";
+  if (name === "weave_update") {
+    if (args.status !== undefined && args.status !== null && args.status !== "") return true;
+    const md = args.metadata as Record<string, unknown> | undefined;
+    return !!md && typeof md === "object" && "claimed_by" in md;
+  }
+  return false;
+}
+
+export function refuseOwnershipInSessionMode(name: string, args: Record<string, unknown>): ToolResponse | null {
+  if (!sessionIdentityApplies() || !isOwnershipCall(name, args)) return null;
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          `Error: ${name} changes ownership, and this MCP server cannot verify the calling session ` +
+          `(session identity, wv-99978b; MCP read-only for ownership, wv-116cbd). ` +
+          `Run the equivalent wv command from the shell instead (e.g. wv work <id>, wv done <id>). ` +
+          `Read-only tools are unaffected. To make MCP ownership actor-owned, set WV_AGENT_ID ` +
+          `or WV_SESSION_IDENTITY=0 for the whole workflow, shell and MCP alike.`,
+      },
+    ],
+    isError: true,
+  };
+}
+
 function handleTool(name: string, args: Record<string, unknown>): ToolResponse {
   const handler = TOOL_HANDLERS[name];
   if (!handler) {
     throw new Error(`Unknown tool: ${name}`);
   }
+  const refused = refuseOwnershipInSessionMode(name, args);
+  if (refused) return refused;
   const result = handler(args);
   if (typeof result === "string") {
     return { content: [{ type: "text", text: result }] };

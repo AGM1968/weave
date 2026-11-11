@@ -162,6 +162,39 @@ check "an untracked working-tree rc is not configuration" "1" "$RC"
 has "...the finding is refused" "$OUT" "SC2046"
 rm -f .shellcheckrc; clean
 
+# wv-cb632d: candidate lanes run this hook at once, and shellcheck on a large
+# suite peaks at 1.6 GB, so lanes take turns through the lock gate_lanes_run
+# names. Each lane still lints in full; a finding is still refused.
+echo "lanes take turns at shellcheck (wv-cb632d)"
+if command -v flock >/dev/null 2>&1; then
+    L="$T/sc.lock"
+    real_sc=$(command -v shellcheck)
+    # A shellcheck that records whether the lock variable reached it.
+    printf '#!/bin/sh\necho "${WV_GATE_SC_LOCK-unset}" >> %q\nexec %q "$@"\n' "$T/sc-env" "$real_sc" > "$T/bin/shellcheck"
+    chmod +x "$T/bin/shellcheck"
+    elapsed_ms() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }
+    printf '#!/bin/bash\necho ok2\n' > scripts/x.sh; git add scripts/x.sh
+    t0=$(date +%s%N); precommit WV_GATE_SC_LOCK="$L"; free_ms=$(elapsed_ms "$t0")
+    check "(control) with the lock free the lane's shellcheck passes" "0" "$RC"
+    flock "$L" sleep 4 & holder=$!
+    sleep 0.3
+    t0=$(date +%s%N); precommit WV_GATE_SC_LOCK="$L"; held_ms=$(elapsed_ms "$t0")
+    wait "$holder"
+    check "with the lock held by another lane, the shellcheck waits for it, then passes" "0 yes" \
+        "$RC $([ $((held_ms - free_ms)) -ge 2500 ] && echo yes || echo "no (free ${free_ms}ms, held ${held_ms}ms)")"
+    : > "$T/sc-env"
+    precommit WV_GATE_SC_LOCK="$L"
+    check "...and the lock variable reaches no process the hook starts" "unset" "$(sort -u "$T/sc-env")"
+    clean
+    plant scripts/x.sh; precommit WV_GATE_SC_LOCK="$L"
+    check "a finding is still refused under the lock" "1" "$RC"
+    has "...by shellcheck" "$OUT" "SC2046"
+    clean
+    rm -f "$T/bin/shellcheck"
+else
+    echo "  (flock unavailable: the hook runs shellcheck unserialised, as before)"
+fi
+
 echo ""
 echo "test-shellcheck-gate: $pass/$run passed"
 [ "$pass" -eq "$run" ]

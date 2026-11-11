@@ -3,9 +3,10 @@
 export WV_CALL_SOURCE=test
 # The database size guard judges the graph, not the file (wv-dc5486). The
 # code-search index (wv index) can be most of brain.db; wv prune cannot shrink
-# it, so it must neither trigger the warning nor make WV_AUTO_PRUNE=1 delete
-# graph nodes. When the graph itself is over the limit, auto-prune runs wv prune,
-# which keeps findings, memories and unaddressed pitfalls.
+# it, so it must not trigger the warning. When the graph itself is over the
+# limit the check warns and advises the explicit prune. WV_AUTO_PRUNE=1 is
+# retired (prune policy, owner ruling 2026-11-10, wv-ee5690): it announces
+# that it does not prune.
 set -uo pipefail
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 export WV_RUN_CACHE=0
@@ -43,9 +44,7 @@ chunks=$(sq "SELECT COUNT(*) FROM chunks;")
 err=$(w 2>&1 >/dev/null)
 [[ "$err" != *"MB (limit"* ]] && ok "an index-heavy DB under the graph limit draws no size warning" ||
     bad "an index-heavy DB under the graph limit draws no size warning" "$err"
-w WV_AUTO_PRUNE=1 >/dev/null 2>&1
-check "auto-prune leaves the graph alone when only the index is large" "$(exists "$task")" "1"
-check "and leaves the index alone" "$(sq "SELECT COUNT(*) FROM chunks;")" "$chunks"
+XX
 
 echo "=== a large graph is still caught ==="
 big=$(add "a live node carrying a large text")
@@ -53,13 +52,15 @@ sq "UPDATE nodes SET text = hex(randomblob(700000)) WHERE id='$big';"
 err=$(w 2>&1 >/dev/null)
 [[ "$err" == *"graph data is"*"MB (limit 1MB)"* ]] && ok "a graph over the limit is warned about" ||
     bad "a graph over the limit is warned about" "$err"
-w WV_AUTO_PRUNE=1 >/dev/null 2>&1
-check "auto-prune removes an old done task" "$(exists "$task")" "0"
-check "auto-prune keeps an old done memory, as wv prune does" "$(exists "$memory")" "1"
-check "auto-prune keeps an old done finding, as wv prune does" "$(exists "$finding")" "1"
-check "auto-prune keeps the live node" "$(exists "$big")" "1"
-check "auto-prune never evicts the code index" "$(sq "SELECT COUNT(*) FROM chunks;")" "$chunks"
-[ -n "$(find "$R/.weave/archive" -name '*.jsonl' 2>/dev/null)" ] && ok "the pruned node is archived" || bad "the pruned node is archived"
+[[ "$err" == *"wv prune --dry-run"* ]] && ok "...advising the explicit prune" || bad "...advising the explicit prune" "$err"
+[[ "$err" != *"--age=7d"* && "$err" != *"WV_AUTO_PRUNE=1 to"* ]] && ok "...not a shorter age or the retired switch" ||
+    bad "...not a shorter age or the retired switch" "$err"
+err=$(w WV_AUTO_PRUNE=1 2>&1 >/dev/null)
+[[ "$err" == *"WV_AUTO_PRUNE is retired"* ]] && ok "WV_AUTO_PRUNE=1 says it is retired" || bad "WV_AUTO_PRUNE=1 says it is retired" "$err"
+check "...and the old done task stays" "$(exists "$task")" "1"
+check "...as do the memory, the finding and the live node" "$(exists "$memory")$(exists "$finding")$(exists "$big")" "111"
+check "...and the code index" "$(sq "SELECT COUNT(*) FROM chunks;")" "$chunks"
+[ -z "$(find "$R/.weave/archive" -name '*.jsonl' 2>/dev/null)" ] && ok "...and nothing is archived" || bad "...and nothing is archived"
 
 echo "=== a dot-command never swallows the SQL after it ==="
 # The guard's old auto-prune passed ".timeout 5000<newline>DELETE ..." as one

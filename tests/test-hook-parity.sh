@@ -12,6 +12,9 @@ set -uo pipefail
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 export WV_CALL_SOURCE=test
+# Session-local state is per owner (wv-43d6be): pin one owner, whatever
+# session runs this suite, so both hosts resolve the same owner directory.
+export WV_AGENT_ID=test-hook-parity-agent
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WV="$ROOT/scripts/wv"
@@ -161,8 +164,9 @@ BARE_ID=$(_wv_in "$BASE" add "Parity claim probe" --force --json 2>/dev/null | j
 ADVISED_ID=$(_wv_in "$BASE" add "Parity advisory probe" --alias=parity-advised --criteria="c1" --force --json 2>/dev/null | jq -r '.id')
 CLOSE_ID=$(_wv_in "$BASE" add "Parity close probe" --criteria="c1" --risks=low --force \
     --metadata='{"commit":"0000000"}' --json 2>/dev/null | jq -r '.id')
-printf 'execute' > "$BASE/hot/.session_phase"
-rm -f "$BASE/hot/.session_epoch" "$BASE/hot/primary"
+mkdir -p "$BASE/hot/owners/$WV_AGENT_ID"
+printf 'execute' > "$BASE/hot/owners/$WV_AGENT_ID/.session_phase"
+rm -f "$BASE/hot/.session_epoch" "$BASE/hot/owners/$WV_AGENT_ID/primary"
 check "the fixture has its nodes" test -n "$ACTIVE_ID" -a -n "$BARE_ID" -a -n "$ADVISED_ID" -a -n "$CLOSE_ID"
 
 # _copy <setup> -- a fresh copy of the fixture, with <setup> run in it; prints
@@ -263,7 +267,7 @@ _state() {
         echo "locks: $(ls "$(_locks "$dir")" 2>/dev/null | tr '\n' ',')"
         echo "laststop: $(cut -d' ' -f2 "$dir/hot/.session_laststop" 2>/dev/null)"
         echo "head: $(git -C "$dir/repo" log -1 --format=%s 2>/dev/null | sed -e 's/ [0-9][0-9]:[0-9][0-9]//')"
-        echo "phase: $(cat "$dir/hot/.session_phase" 2>/dev/null)"
+        echo "phase: $(cat "$dir/hot/owners/$WV_AGENT_ID/.session_phase" 2>/dev/null)"
     } | sed -e "s#$dir#<COPY>#g"
 }
 
@@ -297,7 +301,7 @@ parity "an edit of the installed copy" PreToolUse "$(edit_of "$HOME/.local/bin/w
 check "an edit of the installed copy is denied" grep -q '^decision=deny' <<<"$PARITY_CLAUDE"
 parity "a write in the discover phase" PreToolUse \
     "$(jq -cn '{tool_name:"Write",tool_input:{file_path:"src/n.py",content:"x"},cwd:"@REPO@"}')" \
-    "printf discover > \"\$C/hot/.session_phase\""
+    "printf discover > \"\$C/hot/owners/$WV_AGENT_ID/.session_phase\""
 check "a write in the discover phase is denied" grep -q '^decision=deny.*discover' <<<"$PARITY_CLAUDE"
 parity "a claim of an unplanned node" PreToolUse "$(bash_of "wv work $BARE_ID")"
 check "a claim of an unplanned node is denied by the claim preflight" grep -qF -- "decision=deny|json|Claim preflight for $BARE_ID" <<<"$PARITY_CLAUDE"

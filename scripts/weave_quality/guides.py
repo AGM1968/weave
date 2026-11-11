@@ -716,8 +716,8 @@ def default_catalog() -> Path:
 
 def _main(argv: list[str]) -> int:
     """`python3 -m weave_quality.guides doctor [--catalog F] [--project-root D] [--package-dir D]`."""
-    import argparse  # pylint: disable=import-outside-toplevel
-    import json  # pylint: disable=import-outside-toplevel
+    import argparse  # pylint: disable=import-outside-toplevel  # noqa: PLC0415
+    import json  # pylint: disable=import-outside-toplevel  # noqa: PLC0415
 
     parser = argparse.ArgumentParser(prog="weave_quality.guides")
     sub = parser.add_subparsers(dest="command", required=True)

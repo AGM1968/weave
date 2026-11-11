@@ -124,8 +124,12 @@ cell "WV_REQUIRE_LEARNING=0 records the learning bypass" close_requires_learning
     we WV_REQUIRE_LEARNING=0 "$WV" done "$n"
 n=$(active "quality evidence probe")
 sq_in "$R" "INSERT OR REPLACE INTO node_files(node_id,path) VALUES('$n','src/unscanned.py');"
-cell "a close with no quality scan is denied" close_requires_quality_evidence deny - \
+# A close scans an empty hot zone in place (wv-f4f431); it is denied only when
+# that scan cannot produce data, here a directory where quality.db belongs.
+rm -f "$R/hot/quality.db" "$R/hot/quality.db-wal" "$R/hot/quality.db-shm"; mkdir "$R/hot/quality.db"
+cell "a close whose in-place quality scan yields nothing is denied" close_requires_quality_evidence deny - \
     we WV_REQUIRE_QUALITY=1 "$WV" done "$n" --skip-verification
+rmdir "$R/hot/quality.db"
 n=$(active "finding probe" '{"type":"finding"}')
 cell "a finding without a violation type is denied" finding_close_requires_violation_type deny - \
     w done "$n" --skip-verification

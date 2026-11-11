@@ -26,8 +26,9 @@ _hook_decision_json() {
 }
 
 _hook_active_id() {
-    "${WV:-${WV_CLI:-$SCRIPT_DIR/wv}}" list --status=active --json-v2 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null
+    "${WV:-${WV_CLI:-$SCRIPT_DIR/wv}}" list --status=active --claimed-by=current --json-v2 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null
 }
+
 
 _hook_input_paths() { _ptu_input_paths "$@"; }
 
@@ -154,6 +155,7 @@ cmd_hook_dispatch() {
         raw_input_empty=true
         input='{}'
     fi
+    wv_adopt_hook_session_id "$input"
     if [ "$event" = "PreToolUse" ]; then
         if [ "$raw_input_empty" = true ]; then
             [ "$format" = "host" ] || _hook_decision_json allow "$event"

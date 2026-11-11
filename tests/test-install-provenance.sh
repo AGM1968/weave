@@ -306,7 +306,71 @@ STUB
 }
 
 echo "=== install provenance regression tests ==="
+test_install_under_live_sessions() {
+    # wv-f854f6: ./install.sh rewrote the hooks' files in place with cp while
+    # other sessions' hooks ran them, and nothing told a running session an
+    # install was half done. Files now arrive by rename, and an install lock
+    # holds wv and the hook loaders back until the install has finished.
+    echo "-- install replaces hook files by rename and holds an install lock"
+    run_install
+    local hook="$CONFIG_DIR/hooks/stop-check.sh" lib="$CONFIG_DIR/lib/wv-hook-common.sh"
+    local hook_ino lib_ino
+    hook_ino=$(stat -c %i "$hook") lib_ino=$(stat -c %i "$lib")
+    run_install
+    assert_equals "renamed" "$([ "$(stat -c %i "$hook")" != "$hook_ino" ] && echo renamed || echo in-place)" \
+        "a reinstall replaces an installed hook by rename, not by rewriting it in place"
+    assert_equals "renamed" "$([ "$(stat -c %i "$lib")" != "$lib_ino" ] && echo renamed || echo in-place)" \
+        "a reinstall replaces an installed hook library by rename"
+    assert_equals "absent" "$([ -e "$CONFIG_DIR/.install-in-progress" ] && echo present || echo absent)" \
+        "the install lock is gone once the install finishes"
+
+    # The wait, driven directly: a live PID in the lock holds wv until the
+    # lock goes; a dead PID, or the installer's own child, does not wait.
+    _wv_elapsed_ms() {  # _wv_elapsed_ms [env assignments...] -> ms a cheap wv call took
+        local t0 t1
+        t0=$(date +%s%N)
+        env HOME="$HOME_DIR" WV_LIB_DIR="$LIB_DIR" WV_CONFIG_DIR="$CONFIG_DIR" "$@" \
+            bash "$BIN_DIR/wv" --version >/dev/null 2>&1 || true
+        t1=$(date +%s%N)
+        echo $(( (t1 - t0) / 1000000 ))
+    }
+    local holder ms
+    sleep 30 & holder=$!
+    echo "$holder" > "$CONFIG_DIR/.install-in-progress"
+    ( sleep 1.5; rm -f "$CONFIG_DIR/.install-in-progress" ) &
+    ms=$(_wv_elapsed_ms)
+    assert_equals "waited" "$([ "$ms" -ge 1200 ] && echo waited || echo "did not wait (${ms} ms)")" \
+        "wv waits while a live installer holds the lock"
+    echo "$holder" > "$CONFIG_DIR/.install-in-progress"
+    ms=$(_wv_elapsed_ms WV_INSTALLING="$holder")
+    assert_equals "no wait" "$([ "$ms" -lt 1000 ] && echo "no wait" || echo "waited ${ms} ms")" \
+        "the installer's own children (WV_INSTALLING) do not wait"
+    # The hooks' library loaders wait on the same lock before their first load.
+    local pair lib_file fn t0 t1 clearer
+    for pair in wv-pre-tool-use.sh:_ptu_install_wait wv-post-tool-use.sh:_potu_install_wait \
+                wv-lifecycle-end.sh:_le_install_wait; do
+        lib_file=${pair%%:*} fn=${pair##*:}
+        echo "$holder" > "$CONFIG_DIR/.install-in-progress"
+        ( sleep 1.5; rm -f "$CONFIG_DIR/.install-in-progress" ) & clearer=$!
+        t0=$(date +%s%N)
+        env -u WV_INSTALLING WV_CONFIG_DIR="$CONFIG_DIR" \
+            bash -c '. "$1" >/dev/null 2>&1; "$2"' _ "$SRC/scripts/lib/$lib_file" "$fn" || true
+        t1=$(date +%s%N)
+        ms=$(( (t1 - t0) / 1000000 ))
+        assert_equals "waited" "$([ "$ms" -ge 1200 ] && echo waited || echo "did not wait (${ms} ms)")" \
+            "the $lib_file loader waits while a live installer holds the lock"
+        wait "$clearer" 2>/dev/null || true  # never a bare wait: it would reap the holder too
+    done
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    ms=$(_wv_elapsed_ms)
+    assert_equals "no wait" "$([ "$ms" -lt 1000 ] && echo "no wait" || echo "waited ${ms} ms")" \
+        "a lock left by a dead installer is not waited on"
+    rm -f "$CONFIG_DIR/.install-in-progress"
+}
+
 test_clean_source_records_clean_install
+test_install_under_live_sessions
 test_untracked_files_count_as_dirty
 test_dirty_install_warns
 test_doctor_honours_wv_lib_dir

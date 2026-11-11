@@ -470,6 +470,38 @@ check "and the same call id" \
   "$(jq -r '.call_id' < "$PARITY_LOG" | tail -1)" \
   "$(jq -r 'select(.event=="call_started") | .call_id' < "$JOURNAL" | tail -1)"
 
+echo "== a wall clock that steps back mid-call (wv-4eba65)"
+# A shim date whose +%s%3N goes backwards on every call, as a runner clock
+# stepped back by NTP did on ubuntu-26.04: the old wall-clock duration came out
+# negative and the attempt-journal schema refused it.
+SHIM="$(mktemp -d)"
+cat > "$SHIM/date" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "+%s%3N" ]; then
+    f="$(dirname "$0")/counter"
+    n=$(cat "$f" 2>/dev/null || echo 5000000000000)
+    echo $((n - 60000)) > "$f"
+    echo "$n"
+    exit 0
+fi
+exec /usr/bin/date "$@"
+SH
+chmod +x "$SHIM/date"
+: > "$JOURNAL"
+PATH="$SHIM:$PATH" WV_ATTEMPT_JOURNAL="$JOURNAL" "$WV" add "clock step probe" --standalone >/dev/null 2>&1
+el=$(jq -r 'select(.event=="call_completed") | .elapsed_ms' < "$JOURNAL" | tail -1)
+check "elapsed_ms is not negative when the wall clock steps back" "yes" "$([ -n "$el" ] && [ "$el" -ge 0 ] && echo yes || echo "no ($el)")"
+check "...and the journal still validates" "0" "$(python3 "$ROOT/tests/lib/journal-validate.py" "$JOURNAL" >/dev/null 2>&1; echo $?)"
+rm -rf "$SHIM"
+: > "$JOURNAL"
+read -r u0 _ < /proc/uptime
+WV_ATTEMPT_JOURNAL="$JOURNAL" "$WV" add "duration probe" --standalone >/dev/null 2>&1
+read -r u1 _ < /proc/uptime
+outer=$(( (${u1/./} - ${u0/./}) * 10 + 20 ))
+el=$(jq -r 'select(.event=="call_completed") | .elapsed_ms' < "$JOURNAL" | tail -1)
+check "elapsed_ms measures the call: positive and within the outer measurement" "yes" \
+    "$([ -n "$el" ] && [ "$el" -gt 0 ] && [ "$el" -le "$outer" ] && echo yes || echo "no ($el vs $outer)")"
+
 echo ""
 echo "Results: $pass/$run passed"
 [ "$pass" -eq "$run" ]

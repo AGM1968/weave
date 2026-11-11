@@ -60,7 +60,9 @@ GLOBAL_IGNORE='^--(help|json)$'
 #                     WV_MCP_ALLOW_NETWORK (gh hangs on Codex sandbox network
 #                     denial — the timeout that defines the lite/no-network
 #                     contract). Never expose to callers.
-#   safety-bypass     deliberate: verification/claim bypasses stay CLI-only.
+#   safety-bypass     deliberate: verification/claim bypasses stay CLI-only
+#                     (work --continue too: MCP is read-only for ownership
+#                     under session identity, wv-116cbd).
 #   renamed           equivalent exists under a different property name.
 #   inline-equiv      *-file flag; MCP takes the content inline instead.
 #   tool-split        covered by a dedicated MCP tool.
@@ -87,8 +89,10 @@ weave_findings --parent
 weave_findings --top
 # --- safety-bypass ---
 weave_done --skip-verification
+weave_done --force
 weave_ship --skip-verification
 weave_work --force
+weave_work --continue
 # --- renamed: no_overlap_check / from_id+to_id / mode / limit / work.reopen ---
 weave_done --acknowledge-overlap
 weave_block --by

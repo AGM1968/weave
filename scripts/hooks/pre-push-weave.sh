@@ -115,7 +115,10 @@ _pp_refresh_cmd() {
 if [ -n "$_PP_LANE_BASE" ]; then
     _PP_SCRIPTS=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd) || _PP_SCRIPTS=""
     if [ -z "$_PP_SCRIPTS" ] || [ ! -x "$_PP_SCRIPTS/wv" ]; then
-        echo "✗ Weave pre-push: the committed gate has no scripts/wv beside its hook — refusing" >&2
+        # Cause and remedy in the message (wv-ec7b2b); pre-commit-weave.sh says why.
+        echo "✗ Weave pre-push: the committed gate has no scripts/wv beside its hook (lane from $_PP_LANE_BASE) — refusing" >&2
+        echo "  cause: HEAD tracks scripts/hooks/*-weave.sh without scripts/wv, and the installed hook predates the fix that runs such a repository on the installed gate" >&2
+        echo "  remedy: wv self-update, then wv init-repo --update (refreshes .git/hooks), then retry the push" >&2
         exit 1
     fi
     _pp_lib_cands=("$_PP_SCRIPTS/lib")
@@ -166,7 +169,7 @@ fi
 # Libraries beside this hook first (scripts/hooks/../lib, the source a checkout
 # runs), then the repository's, then the installed ones: the gate never mixes
 # this hook with libraries of another version when its own are at hand.
-for _pp_lib in wv-checkpoint-ci.sh wv-gate-pool.sh; do
+for _pp_lib in wv-checkpoint-ci.sh wv-gate-pool.sh wv-gate-hold.sh; do
     for _pp_cand in "${_pp_lib_cands[@]}"; do
         if [ -f "$_pp_cand/$_pp_lib" ]; then
             # shellcheck source=/dev/null
@@ -182,6 +185,29 @@ if ! command -v run_hook_suites >/dev/null 2>&1 || ! command -v gate_pool_estima
     echo "✗ Weave pre-push: the gate libraries (wv-gate-pool.sh, wv-checkpoint-ci.sh) were not found — refresh with $(_pp_refresh_cmd)" >&2
     exit 1
 fi
+
+# ── One gate at a time per checkout (wv-c5500d) ── A push restarted by a new
+# session ran a second heavy tier beside the first (2026-11-08). The outcome is
+# recorded for the next session to read: running now, passed or failed (with
+# the suites that failed) when this shell exits, whichever path it takes.
+if ! command -v wv_gate_hold_acquire >/dev/null 2>&1; then
+    echo "✗ Weave pre-push: the gate lock library (wv-gate-hold.sh) was not found — refresh with $(_pp_refresh_cmd)" >&2
+    exit 1
+fi
+_pp_subject=$(awk 'NF >= 2 { printf "%s%s %.9s", (n++ ? ", " : ""), $1, $2 }' <<< "$_pp_stdin")
+wv_gate_hold_acquire pre-push "$_pp_subject" || exit 1
+_pp_hold_finish() {
+    local rc="$1"
+    if [ "$rc" = 0 ]; then
+        wv_gate_push_outcome passed "" 0
+    else
+        wv_gate_push_outcome failed "${_GATE_POOL_FAILED:-}" "$rc"
+    fi
+    wv_gate_hold_release
+    return "$rc"
+}
+wv_gate_push_outcome running "$_pp_subject"
+trap '_pp_hold_finish $?' EXIT
 
 # ── What is being pushed ──────────────────────────────────────────────────────
 # stdin: "<local ref> <local sha> <remote ref> <remote sha>" per ref. $1 is the
@@ -382,14 +408,18 @@ export WV_GATE_PHASE=pre-push
 WV_GATE_ID="pp-$(date +%s%N 2>/dev/null || date +%s)-$$"
 export WV_GATE_ID
 _pp_gate_t0=$(date +%s%N 2>/dev/null || echo 0)
+_pp_gate_pressure0=$(gate_pressure_totals 2>/dev/null)
 _pp_gate_finish() {
     local rc=$? suites
     suites=$(jq -r '[.[].name] | join(",")' <<< "$_pp_heavy_json" 2>/dev/null)
     "$WV" test-record gate --gate --exit="$rc" --duration="$(hook_duration_ms "$_pp_gate_t0")" \
         --execution-mode="${WV_GATE_EXECUTION_MODE:-}" \
         --suite-modes="$(gate_pool_suite_modes "$suites")" \
-        --suites="$suites" >/dev/null 2>&1 || true
-    return "$rc"
+        --suites="$suites" \
+        --started-ms="$(_pc_ns_to_ms "$_pp_gate_t0" 2>/dev/null)" \
+        --pressure-start="$_pp_gate_pressure0" --pressure-end="$(gate_pressure_totals 2>/dev/null)" \
+        >/dev/null 2>&1 || true
+    _pp_hold_finish "$rc"
 }
 trap _pp_gate_finish EXIT
 

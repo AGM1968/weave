@@ -97,6 +97,11 @@ if [ -n "$_PC_LANE_BASE" ] && [ -f "$_wv_cand_file" ]; then
         exit 1
     fi
 fi
+# The lanes' shellcheck lock (wv-cb632d), read once and kept from every
+# process this hook starts, so a gate a suite runs never inherits it
+# (nested boundary, wv-6900e1).
+_PC_SC_LOCK="${WV_GATE_SC_LOCK:-}"
+unset WV_GATE_SC_LOCK
 # A recovery run (S2c, wv-0af8f0) is a protected lane whose code comes from a
 # recorded replacement tree, named by a weave-gate-exec mark beside the lane
 # mark. The lane mark still names HEAD's commit: history (record consumption, E6
@@ -113,45 +118,11 @@ if [ -n "$_PC_LANE_BASE" ] && [ -f "$_wv_exec_file" ]; then
     fi
 fi
 
-# RECOVERY (S2c, wv-0af8f0; docs/findings/gate-s2c-recovery-2026-10-14). When
-# HEAD's committed gate refuses every commit, nothing committed can repair it:
-# HEAD's gate judges the repair, the record that would admit it and the E6
-# obligation alike. Only the installed copy runs this, before HEAD's gate is
-# fetched, and it uses nothing from HEAD's scripts/ or the working tree.
-#   R1  a commit adding one recovery record (and graph state besides) that
-#       HEAD's gate refuses is admitted once this code has checked the record;
-#   R2  a commit making exactly a live record's transitions that HEAD's gate
-#       refuses is judged by the recorded replacement tree, run in full after a
-#       negative control; its verdict binds.
-# Both run HEAD's gate first, bounded and in its own process group, and act only
-# on its refusal. The override is traceability, not approval (D3a): a prior
-# record can override a healthy HEAD refusing a weakened replacement. Every
-# admission is frozen, checked stable, logged (the row must be written) and
-# bound to the committing git process here, never by a gate this code ran.
-_PCR_TIMEOUT=${WV_GATE_RECOVERY_TIMEOUT:-900}
-case "$_PCR_TIMEOUT" in ''|*[!0-9]*|0) _PCR_TIMEOUT=900 ;; esac
-_PCR_GRACE=10
-_PCR_DIR=".weave/gate-repairs"
-# A copy of WV_GRAPH_STATE_PATHS (scripts/lib/wv-checkpoint-ci.sh): the
-# installed copy loads no library. tests/test-gate-recovery.sh holds them equal.
-_PCR_GRAPH_STATE=(.weave/state.sql .weave/nodes.jsonl .weave/edges.jsonl .weave/deltas
-    .weave/trails.md .weave/breadcrumbs.md .weave/runtime.md .weave/quality-adjudications.jsonl)
-_PCR_PGID="" _PCR_WHY="" _PCR_SHAPE="" _PCR_REC="" _PCR_JSON="" _PCR_TREE="" _PCR_BASE_TREE=""
-_PCR_GITPID=""
-_PCR_ROWS=()
 # Supported external execution paths (wv-732b60). Copying a path does not
 # assign its role: the frozen authority's contract still decides enforcement.
 # This installed envelope must remain usable when HEAD's role file is broken.
 _PC_GATE_EXTERNAL=(tests/test-memory-projection-parity.sh tests/test-shipped-test-refs.sh
     tests/lib/release-leak-pattern.ere build-release.sh)
-
-_pcr_graph_state() {
-    local p
-    for p in "${_PCR_GRAPH_STATE[@]}"; do
-        if [ "$1" = "$p" ] || [[ "$1" == "$p"/* ]]; then return 0; fi
-    done
-    return 1
-}
 
 # _pc_gate_path_ok <path> — canonical repository-relative path, without any
 # empty, . or .. component, backslash or control character. Spaces are valid.
@@ -169,10 +140,11 @@ _pc_gate_path_ok() {
 }
 
 # _pc_gate_archive <tree-ish> <tar> — the common execution envelope for the
-# dispatcher, recovery and (once their caller is updated) candidate lanes.
-# It copies the supported files from objects, never from the worktree or a
-# contract that might need recovery. Missing external files are not invented;
-# the role check must refuse declared enforcement that the authority lacks.
+# dispatcher, recovery and candidate lanes: scripts/ only, from objects, never
+# from the worktree or a contract that might need recovery. The external files
+# are not in it (R-a of the lane review, wv-a75d98): each is copied for the
+# one check that reads it (_pc_external_dir), so no other stage can depend on
+# its bytes. An external path that is not a regular file is still refused.
 _pc_gate_archive() {
     local tree=$1 out=$2 p entry listing
     local -a paths=(scripts)
@@ -180,7 +152,7 @@ _pc_gate_archive() {
         entry=$(git --literal-pathspecs ls-tree --full-tree "$tree" -- "$p" 2>/dev/null) || return 1
         [ -n "$entry" ] || continue
         case "$entry" in
-            '100644 blob '*|'100755 blob '*) paths+=("$p") ;;
+            '100644 blob '*|'100755 blob '*) ;;
             *) echo "✗ Weave pre-commit: external gate path $p is not a regular file — refusing" >&2; return 1 ;;
         esac
     done
@@ -190,517 +162,6 @@ _pc_gate_archive() {
         return 1
     fi
     git --literal-pathspecs archive --format=tar -o "$out" "$tree" -- "${paths[@]}" 2>/dev/null
-}
-
-# Recovery's admission scope is installed code, not a broken HEAD's roles.
-# The external paths are the F3/F4 enforcement boundary (wv-732b60); this does
-# not permit recording arbitrary product changes as gate recovery.
-_pcr_path_ok() {
-    local p=$1 external
-    _pc_gate_path_ok "$p" || return 1
-    case "$p" in scripts/?*) return 0 ;; esac
-    for external in "${_PC_GATE_EXTERNAL[@]}"; do
-        [ "$p" = "$external" ] && return 0
-    done
-    return 1
-}
-
-# _pcr_entry <tree-ish> <path> — "<mode> <blob>" of a regular file listed at
-# exactly <path>; 1 when absent or anything else (a link, a submodule, a tree).
-_pcr_entry() {
-    local line="" meta path mode type oid
-    IFS= read -r -d '' line < <(git --literal-pathspecs ls-tree -z --full-tree "$1" -- "$2" 2>/dev/null) || true
-    [ -n "$line" ] || return 1
-    meta=${line%%$'\t'*}; path=${line#*$'\t'}
-    read -r mode type oid <<< "$meta"
-    [ "$path" = "$2" ] && [ "$type" = blob ] || return 1
-    case "$mode" in 100644|100755) ;; *) return 1 ;; esac
-    printf '%s %s\n' "$mode" "$oid"
-}
-
-# _pcr_record_rows <json> — validates a recovery record and fills _PCR_ROWS with
-# "path<TAB>baseline_mode<TAB>baseline<TAB>replacement_mode<TAB>replacement".
-# Checks against the trees are the caller's. 1 with _PCR_WHY on refusal.
-_pcr_record_rows() {
-    local hl rows line p bm bo rm ro
-    _PCR_ROWS=()
-    case "$(git rev-parse --show-object-format 2>/dev/null || echo sha1)" in
-        sha256) hl=64 ;; *) hl=40 ;;
-    esac
-    if ! jq -e --argjson hl "$hl" '
-        def oid: type == "string" and test("^[0-9a-f]{\($hl)}$");
-        def mode: type == "string" and IN("100644", "100755");
-        .version == 1 and .kind == "recovery"
-        and (.reason | type == "string" and length > 0)
-        and (.verification | type == "string" and length > 0)
-        and (.paths | type == "object" and length > 0)
-        and all(.paths[]; type == "object"
-            and (.baseline_mode | mode) and (.replacement_mode | mode)
-            and (.baseline | oid) and (.replacement | oid)
-            and ([.baseline_mode, .baseline] != [.replacement_mode, .replacement]))' \
-        >/dev/null 2>&1 <<< "$1"; then
-        _PCR_WHY="the record is not a valid recovery record (version 1, kind recovery, non-empty reason and verification, and per path a baseline and replacement blob id with mode 100644 or 100755 that differ)"
-        return 1
-    fi
-    rows=$(jq -r '.paths | to_entries[] | [.key, .value.baseline_mode, .value.baseline,
-        .value.replacement_mode, .value.replacement] | @tsv' <<< "$1" 2>/dev/null) || {
-        _PCR_WHY="could not read the record's paths"; return 1; }
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        IFS=$'\t' read -r p bm bo rm ro <<< "$line"
-        if ! _pcr_path_ok "$p"; then
-            _PCR_WHY="the record names $p, which is not a canonical path under scripts/ or an installed F3/F4 enforcement path"
-            return 1
-        fi
-        if [ "$(git cat-file -t "$bo" 2>/dev/null)" != blob ] || [ "$(git cat-file -t "$ro" 2>/dev/null)" != blob ]; then
-            _PCR_WHY="the record's baseline or replacement for $p does not name a blob in this repository"
-            return 1
-        fi
-        _PCR_ROWS+=("$line")
-    done <<< "$rows"
-}
-
-# _pcr_changes <from> <to> — "status<TAB>new mode<TAB>new blob<TAB>path" per
-# changed path, renames off.
-_pcr_changes() {
-    local meta path nm no st
-    while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
-        read -r _ nm _ no st <<< "${meta#:}"
-        printf '%s\t%s\t%s\t%s\n' "$st" "$nm" "$no" "$path"
-    done < <(git diff-tree -r -z --no-renames --raw "$1" "$2" 2>/dev/null)
-}
-
-_pcr_kind() { git cat-file blob "$1" 2>/dev/null | jq -r 'if type == "object" then (.kind // "") else "" end' 2>/dev/null; }
-
-# _pcr_shape — classifies the frozen transition: _PCR_SHAPE record (R1) or
-# repair (R2) with _PCR_REC and _PCR_JSON, else empty. A transition that comes
-# near (it touches a recovery record, or a record names some of its paths)
-# leaves _PCR_WHY, shown if HEAD's gate refuses it.
-_pcr_shape() {
-    local changes line st nm no p n_rec=0 other="" all_gate=1 rec_kind
-    local -a recs=() changed=()
-    local -A want=()
-    _PCR_SHAPE="" _PCR_REC="" _PCR_JSON="" _PCR_WHY=""
-    changes=$(_pcr_changes "$_PCR_BASE_TREE" "$_PCR_TREE") || return 0
-    [ -n "$changes" ] || return 0
-    while IFS= read -r line; do
-        IFS=$'\t' read -r st nm no p <<< "$line"
-        changed+=("$p")
-        want[$p]="$st $nm $no"
-        _pcr_path_ok "$p" || all_gate=0
-        case "$p" in
-            "$_PCR_DIR"/*)
-                n_rec=$((n_rec + 1)); recs+=("$p") ;;
-            *) _pcr_graph_state "$p" || other=$p ;;
-        esac
-    done <<< "$changes"
-    if [ "$n_rec" -gt 0 ]; then
-        rec_kind=""
-        for p in "${recs[@]}"; do
-            read -r st nm no <<< "${want[$p]}"
-            if [ "$st" != D ] && [ "$(_pcr_kind "$no")" = recovery ]; then rec_kind=1; fi
-            no=$(git rev-parse -q --verify "$_PCR_BASE_TREE:$p" 2>/dev/null) || no=""
-            if [ -n "$no" ] && [ "$(_pcr_kind "$no")" = recovery ]; then rec_kind=1; fi
-        done
-        [ -n "$rec_kind" ] || return 0
-        read -r st nm no <<< "${want[${recs[0]}]}"
-        if [ -n "$other" ]; then
-            _PCR_WHY="a recovery record commit carries only the record and graph state, and this one also changes $other"
-        elif [ "$n_rec" -ne 1 ]; then
-            _PCR_WHY="a recovery record commit adds exactly one record, and this one changes $n_rec under $_PCR_DIR/"
-        elif [ "$st" != A ]; then
-            _PCR_WHY="a recovery record commit adds a new record; this one modifies or deletes ${recs[0]}"
-        elif [ "$nm" != 100644 ] || [[ "${recs[0]}" != *.json ]] || [[ "${recs[0]#"$_PCR_DIR"/}" == */* ]]; then
-            _PCR_WHY="a recovery record is a regular .json file directly under $_PCR_DIR/ (mode 100644), and ${recs[0]} is not"
-        else
-            _PCR_SHAPE=record _PCR_REC=${recs[0]}
-            _PCR_JSON=$(git cat-file blob "$no" 2>/dev/null)
-        fi
-        return 0
-    fi
-    [ "$all_gate" = 1 ] || return 0
-    # R2: a recovery record at HEAD naming exactly the changed paths, each at
-    # the record's replacement mode and blob.
-    local mode type oid rpath json names line2 bm bo rm ro ok
-    while IFS= read -r -d '' line; do
-        rpath=${line#*$'\t'}
-        read -r mode type oid <<< "${line%%$'\t'*}"
-        [ "$mode $type" = "100644 blob" ] && [[ "$rpath" == *.json ]] || continue
-        json=$(git cat-file blob "$oid" 2>/dev/null) || continue
-        [ "$(jq -r 'if type == "object" then (.kind // "") else "" end' <<< "$json" 2>/dev/null)" = recovery ] || continue
-        names=$(jq -r '.paths | if type == "object" then keys[] else empty end' <<< "$json" 2>/dev/null) || continue
-        ok=1
-        for p in "${changed[@]}"; do grep -qxF -- "$p" <<< "$names" || ok=0; done
-        while IFS= read -r p; do [ -n "${want[$p]+x}" ] || ok=0; done <<< "$names"
-        if [ "$ok" = 1 ]; then
-            while IFS= read -r line2; do
-                IFS=$'\t' read -r p bm bo rm ro <<< "$line2"
-                [ "${want[$p]}" = "M $rm $ro" ] || ok=0
-            done < <(jq -r '.paths | to_entries[] | [.key, .value.baseline_mode, .value.baseline,
-                .value.replacement_mode, .value.replacement] | map(tostring) | @tsv' <<< "$json" 2>/dev/null)
-            if [ "$ok" = 1 ]; then
-                _PCR_SHAPE=repair _PCR_REC=$rpath _PCR_JSON=$json _PCR_WHY=""
-                return 0
-            fi
-            _PCR_WHY="the recovery record $rpath names this commit's paths, but not these modes and blobs"
-        else
-            for p in "${changed[@]}"; do
-                if grep -qxF -- "$p" <<< "$names"; then
-                    _PCR_WHY="the recovery record $rpath names $(paste -sd ' ' <<< "$names"), and this commit changes ${changed[*]}: a repair commit makes exactly the record's transitions"
-                    break
-                fi
-            done
-        fi
-    done < <(git ls-tree -r -z --full-tree "$_PCR_BASE_TREE" -- "$_PCR_DIR" 2>/dev/null)
-    return 0
-}
-
-# _pcr_consumed <since> <path> <bm> <bo> <rm> <ro> — rule 5's walk, comparing
-# (mode, blob): some commit reachable from HEAD and not from the record's
-# commit went from exactly the baseline pair to exactly the replacement pair
-# against one of its parents. A commit leaving the pair unchanged is no
-# transition, which a blob-only comparison misreads for a mode-only record.
-# 0 consumed, 1 not, 2 could not tell.
-_pcr_consumed() {
-    local since=$1 path=$2 bm=$3 bo=$4 rm=$5 ro=$6 line c p i cm pm rc history objects
-    local -a pairs=() objs=()
-    # Acquire synchronously: Bash 5.2 can reap a process substitution and then
-    # return -1 from its explicit wait (wv-5a776d; recovery wv-d3eb18).
-    history=$(git --no-replace-objects rev-list --parents "$_wv_base" --not "$since" 2>/dev/null) || return 2
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        c=${line%% *}
-        for p in ${line#"$c"}; do pairs+=("$c" "$p"); done
-    done <<< "$history"
-    [ "${#pairs[@]}" -gt 0 ] || return 1
-    # The status is cat-file's and awk's, read from PIPESTATUS: this hook
-    # does not run under pipefail.
-    objects=$(
-        for c in "${pairs[@]}"; do printf '%s:%s\n' "$c" "$path"; done \
-            | git --no-replace-objects cat-file --batch-check='%(objectname)' 2>/dev/null \
-            | awk '/^[0-9a-f]+$/ { print; next } { print "missing" }'
-        st=("${PIPESTATUS[@]}"); [ "${st[1]}" = 0 ] && [ "${st[2]}" = 0 ]) || return 2
-    mapfile -t objs <<< "$objects"
-    [ "${#objs[@]}" -eq "${#pairs[@]}" ] || return 2
-    for ((i = 0; i < ${#objs[@]}; i += 2)); do
-        # batch-check answers "missing" both for a path the commit lacks and
-        # for an object it cannot read; only the first is "no transition". A
-        # found object prints its bare name; anything else (git echoes the
-        # requested "<commit>:<path> missing", and a path may hold spaces) is
-        # taken as missing and confirmed below.
-        for c in "${pairs[i]}" "${pairs[i+1]}"; do
-            [ "${objs[i]}" = missing ] || [ "${objs[i+1]}" = missing ] || break
-            rc=0; _pcr_mode "$c" "$path" >/dev/null || rc=$?
-            [ "$rc" -ne 2 ] || return 2
-        done
-        [ "${objs[i]}" = "$ro" ] && [ "${objs[i+1]}" = "$bo" ] || continue
-        # Both sides hold the path (the blobs above say so), so a mode read
-        # that fails or comes back empty is an unreadable history, never "not
-        # this transition": that would revive a consumed record.
-        rc=0; cm=$(_pcr_mode "${pairs[i]}" "$path") || rc=$?
-        [ "$rc" -eq 0 ] || return 2
-        rc=0; pm=$(_pcr_mode "${pairs[i+1]}" "$path") || rc=$?
-        [ "$rc" -eq 0 ] || return 2
-        [ "$cm" = "$rm" ] && [ "$pm" = "$bm" ] && return 0
-    done
-    return 1
-}
-
-# _pcr_mode <commit> <path> — the mode git lists for <path> in <commit>. 0
-# printed, 1 absent, 2 git failed.
-_pcr_mode() {
-    local out
-    out=$(git --no-replace-objects --literal-pathspecs ls-tree --full-tree "$1" -- "$2" 2>/dev/null) || return 2
-    [ -n "$out" ] || return 1
-    printf '%s\n' "${out%% *}"
-}
-
-# _pcr_stable — git still commits the frozen tree onto the frozen HEAD.
-_pcr_stable() {
-    [ "$(git write-tree 2>/dev/null)" = "$_PCR_TREE" ] \
-        && [ "$(git rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" = "$_wv_base" ]
-}
-
-_pcr_kill() {
-    [ -n "$_PCR_PGID" ] || return 0
-    kill -KILL -- "-$_PCR_PGID" 2>/dev/null || true
-    _PCR_PGID=""
-}
-
-# _pcr_run <out> <command...> — runs the command in its own session and process
-# group, its output shown and kept in <out>. At the bound: TERM to the group,
-# the grace, KILL, reap. The group is killed after a normal exit too, so nothing
-# it left behind runs on; a child that left the group (its own setsid) is not
-# contained. 124 at the bound.
-_pcr_run() {
-    local out=$1 pid ticks=0 g=0 rc
-    shift
-    setsid bash -c 'out=$1; shift; "$@" 2>&1 | tee "$out" >&2; exit "${PIPESTATUS[0]}"' _ "$out" "$@" &
-    pid=$!
-    _PCR_PGID=$pid
-    while kill -0 "$pid" 2>/dev/null; do
-        if [ "$ticks" -ge $((_PCR_TIMEOUT * 5)) ]; then
-            echo "✗ Weave pre-commit: the run did not finish within ${_PCR_TIMEOUT}s (WV_GATE_RECOVERY_TIMEOUT); stopping its process group" >&2
-            kill -TERM -- "-$pid" 2>/dev/null || true
-            while kill -0 -- "-$pid" 2>/dev/null && [ "$g" -lt $((_PCR_GRACE * 5)) ]; do sleep 0.2; g=$((g + 1)); done
-            kill -KILL -- "-$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null
-            _PCR_PGID=""
-            return 124
-        fi
-        sleep 0.2
-        ticks=$((ticks + 1))
-    done
-    wait "$pid"; rc=$?
-    _pcr_kill
-    return "$rc"
-}
-
-# _pcr_git_pid — as _pc_git_pid below: the git process running this hook.
-_pcr_git_pid() {
-    local pid=$PPID comm i
-    for i in 1 2 3 4 5; do
-        case "$pid" in ''|*[!0-9]*|0|1) return 1 ;; esac
-        comm=$(ps -o comm= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//')
-        case "$comm" in git|*/git) printf '%s\n' "$pid"; return 0 ;; esac
-        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-    done
-    return 1
-}
-
-# _pcr_prereqs — what recovery cannot admit without: jq, setsid, the Weave
-# reference-transaction hook (git 2.28+) to bind the commit, and the git
-# process to bind it to. The ordinary path continues check-then-use without a
-# binding; recovery refuses.
-_pcr_prereqs() {
-    local v major minor hooks
-    command -v jq >/dev/null 2>&1 || { _PCR_WHY="recovery needs jq"; return 1; }
-    command -v setsid >/dev/null 2>&1 || { _PCR_WHY="recovery needs setsid (util-linux) to bound HEAD's gate"; return 1; }
-    v=$(git version 2>/dev/null); v=${v#git version }
-    major=${v%%.*}; minor=${v#*.}; minor=${minor%%.*}
-    case "$major$minor" in ''|*[!0-9]*) _PCR_WHY="could not read the git version"; return 1 ;; esac
-    if ! { [ "$major" -gt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -ge 28 ]; }; }; then
-        _PCR_WHY="recovery binds the commit through the reference-transaction hook, which needs git 2.28+"
-        return 1
-    fi
-    hooks=$(git rev-parse --git-path hooks 2>/dev/null) || hooks=""
-    if [ -z "$hooks" ] || [ ! -x "$hooks/reference-transaction" ] \
-        || ! grep -q "Weave reference-transaction" "$hooks/reference-transaction" 2>/dev/null; then
-        _PCR_WHY="recovery binds the commit through the Weave reference-transaction hook, which is not installed (./install.sh)"
-        return 1
-    fi
-    _PCR_GITPID=$(_pcr_git_pid) || { _PCR_WHY="no git process to bind the commit to (recovery runs only under git commit)"; return 1; }
-}
-
-# _pcr_log <trigger> <head status> [exec tree] [control] [verdict] — the
-# durable gate-log row recording this admission decision (not a publication:
-# the reference-transaction hook can still abort it). Where wv writes gate rows:
-# WV_GATE_LOG, else beside WV_SUITE_LOG, config.env winning as it does for wv.
-# Unlike wv's writer it fails, and the admission with it.
-_pcr_log() {
-    local cfg log suite repo
-    cfg="${WV_CONFIG_DIR:-$HOME/.config/weave}/config.env"
-    if [ "${WV_CALL_SOURCE:-}" = test ] && [ -z "${WV_SUITE_LOG:-}" ] && [ -z "${WV_GATE_LOG:-}" ]; then
-        _PCR_WHY="a test run with no WV_GATE_LOG or WV_SUITE_LOG of its own has no durable gate log to record a recovery in"
-        return 1
-    fi
-    # shellcheck source=/dev/null
-    log=$( { [ -f "$cfg" ] && { set -a; . "$cfg"; set +a; }; } >/dev/null 2>&1
-        suite=${WV_SUITE_LOG:-${WV_SUITE_LOG_DEFAULT:-$HOME/.local/share/weave/suite_runs.jsonl}}
-        printf '%s\n' "${WV_GATE_LOG:-$(dirname "$suite")/gate_runs.jsonl}")
-    repo=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")
-    if [ -z "$log" ] || ! mkdir -p "$(dirname "$log")" 2>/dev/null \
-        || ! jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg repo "$repo" \
-            --arg trigger "$1" --arg record "$_PCR_REC" --arg tree "$_PCR_TREE" --arg base "$_wv_base" \
-            --arg head "$2" --arg exec "${3:-}" --arg control "${4:-}" --arg verdict "${5:-}" \
-            '{ts: $ts, repo: $repo, phase: "recovery", trigger: $trigger, decision: "admit",
-              record: $record, tree: $tree, base: $base, head_status: $head,
-              exit: 0, duration_ms: 0, estimate_ms: null, suites: [], sha: $base}
-             + (if $exec != "" then {exec_tree: $exec, control: $control, verdict: $verdict} else {} end)' \
-            >> "$log" 2>/dev/null; then
-        _PCR_WHY="could not write the recovery row to the gate log (${log:-unresolved}); a recovery is admitted only once it is recorded"
-        return 1
-    fi
-}
-
-# _pcr_bind — as _pc_bind below, written by this code for the frozen tree, last.
-_pcr_bind() {
-    local started dir
-    started=$(ps -o lstart= -p "$_PCR_GITPID" 2>/dev/null | sed 's/^ *//; s/ *$//')
-    dir=$(git rev-parse --git-path weave-gate 2>/dev/null)
-    [ -n "$started" ] && [ -n "$dir" ] && mkdir -p "$dir" 2>/dev/null \
-        && printf 'tree=%s\nstart=%s\nlanes=\n' "$_PCR_TREE" "$started" > "$dir/admitted-$_PCR_GITPID.tmp" 2>/dev/null \
-        && mv -f "$dir/admitted-$_PCR_GITPID.tmp" "$dir/admitted-$_PCR_GITPID" 2>/dev/null
-}
-
-_pcr_unbind() {
-    local dir
-    [ -n "$_PCR_GITPID" ] || return 0
-    dir=$(git rev-parse --git-path weave-gate 2>/dev/null) && rm -f "$dir/admitted-$_PCR_GITPID" 2>/dev/null
-    return 0
-}
-
-# _pcr_refuse <message> <rc> — recovery does not admit: HEAD's refusal stands.
-_pcr_refuse() {
-    local rc=$2
-    case "$rc" in ''|*[!0-9]*|0) rc=1 ;; esac
-    _pcr_unbind
-    echo "✗ Weave pre-commit: recovery does not admit this commit: $1 — refusing" >&2
-    exit "$rc"
-}
-
-# _pcr_admit <notice> — stable, recorded, bound, in that order.
-_pcr_admit() {
-    _pcr_stable || _pcr_refuse "the index or HEAD changed during recovery, so git would commit something other than what was judged; re-run the commit" 1
-    _pcr_bind || _pcr_refuse "could not bind this commit to the judged tree" 1
-    echo "⚠ Weave pre-commit: $1 Records give traceability, not approval." >&2
-    exit 0
-}
-
-# _pcr_validate — the shaped record, checked by this code before any gate
-# runs (D4): well formed, canonical paths, blob objects, regular-file modes,
-# and the trees hold exactly those modes and blobs: HEAD the baselines, and for
-# R2 the frozen index the replacements. On failure the shape is dropped and
-# _PCR_WHY says why; HEAD's gate then decides alone.
-_pcr_validate() {
-    local line p bm bo rm ro
-    if ! _pcr_record_rows "$_PCR_JSON"; then
-        _PCR_WHY="$_PCR_REC: $_PCR_WHY"; return 1
-    fi
-    for line in "${_PCR_ROWS[@]}"; do
-        IFS=$'\t' read -r p bm bo rm ro <<< "$line"
-        if [ "$(_pcr_entry "$_PCR_BASE_TREE" "$p")" != "$bm $bo" ]; then
-            _PCR_WHY="$_PCR_REC names $p at $bm $bo, which is not HEAD's regular file there (a recovery record binds HEAD's current mode and bytes)"
-            return 1
-        fi
-        if [ "$_PCR_SHAPE" = repair ] && [ "$(_pcr_entry "$_PCR_TREE" "$p")" != "$rm $ro" ]; then
-            _PCR_WHY="the staged $p is not $_PCR_REC's replacement ($rm $ro)"
-            return 1
-        fi
-    done
-}
-
-# _pcr_record_r1 <head rc> — R1 once HEAD's gate refused the record commit.
-_pcr_record_r1() {
-    local head=$1
-    _pcr_stable || _pcr_refuse "the index or HEAD changed during recovery; re-run the commit" 1
-    _pcr_log recovery-record "$head" || _pcr_refuse "$_PCR_WHY" 1
-    _pcr_admit "HEAD's gate refused this commit (status $head); it is admitted by the recovery record $_PCR_REC it adds, which changes no gate and takes effect only on a later commit making exactly its transitions."
-}
-
-# _pcr_record_r2 <head rc> — R2 once HEAD's gate refused the repair commit.
-_pcr_record_r2() {
-    local head=$1 line p bm bo rm ro since rc idx exec d ctl blob ctl_res
-    [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = false ] \
-        && [ -z "$(git config --get-regexp '^(extensions\.partialclone|remote\..*\.promisor)$' 2>/dev/null)" ] \
-        || _pcr_refuse "this clone's history is shallow or partial, so whether $_PCR_REC was already used cannot be established. Fetch the full history (git fetch --unshallow, or --refetch for a partial clone), then commit again" "$head"
-    since=$(git --no-replace-objects log -1 --full-history --diff-filter=AM --format=%H "$_wv_base" -- "$_PCR_REC" 2>/dev/null)
-    [ -n "$since" ] || _pcr_refuse "could not find the commit that recorded $_PCR_REC" 1
-    for line in "${_PCR_ROWS[@]}"; do
-        IFS=$'\t' read -r p bm bo rm ro <<< "$line"
-        rc=0; _pcr_consumed "$since" "$p" "$bm" "$bo" "$rm" "$ro" || rc=$?
-        case "$rc" in
-            0) _pcr_refuse "$_PCR_REC was already used: a commit since it made its transition of $p, and a record admits once" "$head" ;;
-            1) ;;
-            *) _pcr_refuse "could not read the history that shows whether $_PCR_REC was used" 1 ;;
-        esac
-    done
-    # The execution tree, built from objects: HEAD's tree with every recorded
-    # path at its replacement. By the R2 shape it is the frozen tree itself.
-    d=$_wv_d/recovery
-    mkdir -p "$d/tmp" || _pcr_refuse "could not prepare the recovery run" 1
-    idx=$d/exec.index
-    GIT_INDEX_FILE=$idx git read-tree "$_PCR_BASE_TREE" 2>/dev/null || _pcr_refuse "could not build the execution tree" 1
-    for line in "${_PCR_ROWS[@]}"; do
-        IFS=$'\t' read -r p bm bo rm ro <<< "$line"
-        GIT_INDEX_FILE=$idx git update-index --add --cacheinfo "$rm,$ro,$p" 2>/dev/null || _pcr_refuse "could not build the execution tree" 1
-    done
-    exec=$(GIT_INDEX_FILE=$idx git write-tree 2>/dev/null) || exec=""
-    [ -n "$exec" ] && [ "$exec" = "$_PCR_TREE" ] || _pcr_refuse "the execution tree (${exec:-none}) is not the frozen tree" 1
-    line=$(git ls-tree -r "$exec" -- scripts 2>/dev/null) || _pcr_refuse "could not list the execution tree's scripts/" 1
-    if [ -n "$(grep -v -e '^100644 ' -e '^100755 ' <<< "$line")" ]; then
-        _pcr_refuse "the execution tree's scripts/ holds a link or submodule, which the gate does not follow" "$head"
-    fi
-    if ! _pc_gate_archive "$exec" "$d/exec.tar" || ! mkdir "$d/run" "$d/run/tree" \
-        || ! tar -xf "$d/exec.tar" -C "$d/run/tree" 2>/dev/null || [ ! -f "$d/run/tree/scripts/hooks/pre-commit-weave.sh" ] \
-        || ! printf '%s\n' "$_wv_base" > "$d/run/weave-gate-lane" || ! printf '%s\n' "$exec" > "$d/run/weave-gate-exec"; then
-        _pcr_refuse "could not copy the execution tree" 1
-    fi
-    _pcr_stable || _pcr_refuse "the index or HEAD changed during recovery; re-run the commit" 1
-    # D3c, the negative control: the replacement run once on the frozen tree
-    # with an invalid role contract must refuse with the invalid-role
-    # diagnostic. It rules out a replacement that admits everything, nothing
-    # more. It runs isolated: a private index, TMPDIR, an empty private hot
-    # zone and database (so a replacement that writes the graph or the suite
-    # ledger before refusing writes nothing shared), and private suite, gate
-    # and call logs. Not isolated: git's object store (any object it writes is
-    # unreferenced) and the binding record, which is cleared after it.
-    ctl=$d/control
-    mkdir -p "$ctl/tmp" "$ctl/zone" && chmod 700 "$ctl/zone" || _pcr_refuse "could not prepare the negative control" 1
-    blob=$(printf '{"version": 0}\n' | git hash-object -w --stdin 2>/dev/null) || blob=""
-    if [ -z "$blob" ] || ! GIT_INDEX_FILE=$ctl/index git read-tree "$_PCR_TREE" 2>/dev/null \
-        || ! GIT_INDEX_FILE=$ctl/index git update-index --add --cacheinfo "100644,$blob,scripts/hooks/gate-roles.json" 2>/dev/null; then
-        _pcr_refuse "could not prepare the negative control" 1
-    fi
-    echo "Weave pre-commit: recovery negative control: the replacement must refuse an invalid role contract" >&2
-    rc=0
-    _pcr_run "$ctl/out" env -u WV_LIB_DIR -u WV_CLI -u WV_PRECOMMIT_RUNNING -u WV_SKIP_PRECOMMIT \
-        GIT_INDEX_FILE="$ctl/index" TMPDIR="$ctl/tmp" WV_HOT_ZONE="$ctl/zone" WV_DB="$ctl/zone/brain.db" \
-        WV_SUITE_LOG="$ctl/suite_runs.jsonl" WV_GATE_LOG="$ctl/gate_runs.jsonl" WV_CALL_LOG="$ctl/wv_calls.jsonl" \
-        WV_HOOK_REEXEC=1 \
-        bash "$d/run/tree/scripts/hooks/pre-commit-weave.sh" "$@" || rc=$?
-    _pcr_unbind
-    if [ "$rc" -eq 0 ] || ! grep -qF "the staged gate role contract (scripts/hooks/gate-roles.json) is not valid" "$ctl/out" 2>/dev/null; then
-        _pcr_refuse "the replacement did not refuse the negative control with the invalid-role diagnostic (status $rc)" "$head"
-    fi
-    ctl_res="refused (status $rc, invalid-role diagnostic)"
-    _pcr_stable || _pcr_refuse "the index or HEAD changed during recovery; re-run the commit" 1
-    echo "Weave pre-commit: recovery: running the replacement gate from execution tree ${exec:0:12} on this commit, suites rerun" >&2
-    rc=0
-    _pcr_run "$d/out" env -u WV_LIB_DIR -u WV_CLI WV_HOOK_REEXEC=1 \
-        bash "$d/run/tree/scripts/hooks/pre-commit-weave.sh" "$@" || rc=$?
-    _pcr_unbind
-    [ "$rc" -eq 0 ] || _pcr_refuse "the replacement gate refused this commit (status $rc); its verdict binds" "$rc"
-    grep -qxF -- "Weave pre-commit: recovery execution tree $exec acknowledged" "$d/out" 2>/dev/null \
-        || _pcr_refuse "the replacement gate did not acknowledge the execution tree mark, so it may have judged other code" 1
-    _pcr_stable || _pcr_refuse "the index or HEAD changed during recovery; re-run the commit" 1
-    _pcr_log recovery-repair "$head" "$exec" "$ctl_res" admitted || _pcr_refuse "$_PCR_WHY" 1
-    _pcr_admit "HEAD's gate refused this commit (status $head); it is admitted by the recovery record $_PCR_REC, judged by the replacement gate (execution tree ${exec:0:12}: negative control $ctl_res, verdict admitted)."
-}
-
-# _pcr_main <hook args...> — returns for every commit recovery does not shape;
-# otherwise decides and exits.
-_pcr_main() {
-    local head_rc=0 out
-    command -v jq >/dev/null 2>&1 || return 0
-    _PCR_TREE=$(git write-tree 2>/dev/null) || return 0
-    [ "$(git rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" = "$_wv_base" ] || return 0
-    _PCR_BASE_TREE=$(git rev-parse --verify --quiet "$_wv_base^{tree}" 2>/dev/null) || return 0
-    _pcr_shape
-    if [ -n "$_PCR_SHAPE" ] && ! _pcr_validate; then _PCR_SHAPE=""; fi
-    [ -n "$_PCR_SHAPE" ] || [ -n "$_PCR_WHY" ] || return 0
-    if [ -z "$_PCR_SHAPE" ]; then
-        # Near a recovery shape: HEAD's gate decides, unbounded, as for any
-        # commit; if it refuses, say why recovery did not apply.
-        env -u WV_LIB_DIR -u WV_CLI WV_HOOK_REEXEC=1 bash "$_wv_d/tree/scripts/hooks/pre-commit-weave.sh" "$@" || head_rc=$?
-        [ "$head_rc" -eq 0 ] && exit 0
-        echo "✗ Weave pre-commit: recovery does not apply: $_PCR_WHY" >&2
-        exit "$head_rc"
-    fi
-    trap '_pcr_kill; exit 130' INT TERM HUP
-    out=$_wv_d/head.out
-    echo "Weave pre-commit: this commit has the recovery $([ "$_PCR_SHAPE" = record ] && echo "record (R1)" || echo "repair (R2)") shape ($_PCR_REC): running HEAD's gate first, bounded at ${_PCR_TIMEOUT}s" >&2
-    _pcr_run "$out" env -u WV_LIB_DIR -u WV_CLI WV_HOOK_REEXEC=1 \
-        bash "$_wv_d/tree/scripts/hooks/pre-commit-weave.sh" "$@" || head_rc=$?
-    [ "$head_rc" -eq 0 ] && exit 0
-    [ "$head_rc" -eq 124 ] && head_rc=timeout
-    _pcr_prereqs || _pcr_refuse "$_PCR_WHY" 1
-    _pcr_unbind
-    if [ "$_PCR_SHAPE" = record ]; then
-        _pcr_record_r1 "$head_rc" "$@"
-    else
-        _pcr_record_r2 "$head_rc" "$@"
-    fi
 }
 
 if [ -z "$_PC_LANE_BASE" ]; then
@@ -739,16 +200,36 @@ if [ -z "$_PC_LANE_BASE" ]; then
             echo "✗ Weave pre-commit: could not copy HEAD's committed gate (scripts/ at ${_wv_base:0:12}) — refusing" >&2
             exit 1
         fi
+        # Recovery (S2c) is a module installed beside this file (wv-669900),
+        # read here and nowhere else. Where HEAD tracks it, a copy missing or
+        # without its entry point refuses: running on without recovery would
+        # hide the broken install. A tree without it (a public release build)
+        # has no recovery, and HEAD's gate judges every commit.
+        _wv_rec=$(dirname -- "$0")/pre-commit-recovery.sh
+        _wv_rec_head=$_wv_d/tree/scripts/hooks/pre-commit-recovery.sh
+        if [ -f "$_wv_rec_head" ] && [ ! -f "$_wv_rec" ]; then
+            echo "✗ Weave pre-commit: the recovery module is missing beside this hook ($_wv_rec) — refusing (refresh with ./install.sh)" >&2
+            exit 1
+        fi
         # The stale-copy guard's notice (wv-98f12b), kept: a copy that differs
-        # from HEAD's still runs this fetch, so it should be refreshed.
-        if ! cmp -s "$_wv_d/tree/scripts/hooks/pre-commit-weave.sh" "$0"; then
+        # from HEAD's still runs this fetch, so it should be refreshed. The
+        # recovery module beside it is part of the copy.
+        if ! cmp -s "$_wv_d/tree/scripts/hooks/pre-commit-weave.sh" "$0" \
+            || { [ -f "$_wv_rec_head" ] && ! cmp -s "$_wv_rec_head" "$_wv_rec"; }; then
             echo "Weave pre-commit: running HEAD's committed gate (scripts/ at ${_wv_base:0:12}); this copy differs from it (refresh with ./install.sh)" >&2
         fi
         if ! printf '%s\n' "$_wv_base" > "$_wv_d/weave-gate-lane" 2>/dev/null; then
             echo "✗ Weave pre-commit: could not mark the copy of HEAD's committed gate — refusing" >&2
             exit 1
         fi
-        _pc_preflight || _pcr_main "$@"
+        if [ -f "$_wv_rec_head" ]; then
+            # shellcheck source=scripts/hooks/pre-commit-recovery.sh
+            if ! . "$_wv_rec" || ! declare -F _pcr_main >/dev/null; then
+                echo "✗ Weave pre-commit: could not load the recovery module ($_wv_rec) — refusing (refresh with ./install.sh)" >&2
+                exit 1
+            fi
+            _pc_preflight || _pcr_main "$@"
+        fi
         WV_HOOK_REEXEC=1 WV_GATE_PREFLIGHT="$_PC_PREFLIGHT" WV_GATE_PREFLIGHT_SUITES="$_PC_PREFLIGHT_SUITES" \
             WV_GATE_PREFLIGHT_FAST_S="$_PC_PREFLIGHT_FAST_S" \
             env -u WV_LIB_DIR -u WV_CLI bash "$_wv_d/tree/scripts/hooks/pre-commit-weave.sh" "$@"
@@ -775,7 +256,14 @@ _pc_refresh_cmd() {
 if [ -n "$_PC_LANE_BASE" ]; then
     _PC_SCRIPTS=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd) || _PC_SCRIPTS=""
     if [ -z "$_PC_SCRIPTS" ] || [ ! -x "$_PC_SCRIPTS/wv" ]; then
-        echo "✗ Weave pre-commit: the committed gate has no scripts/wv beside its hook — refusing" >&2
+        # Cause and remedy in the message (wv-ec7b2b): this shape is a lane built
+        # from a HEAD that tracks scripts/hooks/*-weave.sh without scripts/wv, as a
+        # hook seeded before rc.15 left consumers; the current dispatcher sends
+        # that shape down the consumer lane (wv-9da519), so reaching here means
+        # the installed hook predates it.
+        echo "✗ Weave pre-commit: the committed gate has no scripts/wv beside its hook (lane from $_PC_LANE_BASE) — refusing" >&2
+        echo "  cause: HEAD tracks scripts/hooks/*-weave.sh without scripts/wv, and the installed hook predates the fix that runs such a repository on the installed gate" >&2
+        echo "  remedy: wv self-update, then wv init-repo --update (refreshes .git/hooks), then retry the commit" >&2
         exit 1
     fi
     # The committed wv runs without the caller's python import environment.
@@ -788,6 +276,17 @@ if [ -n "$_PC_LANE_BASE" ]; then
         exit 1
     fi
     _pc_lib_cands=("$_PC_SCRIPTS/lib")
+    # An older builder (an installed dispatcher from before wv-a75d98) put the
+    # external files in the envelope. Remove them before anything runs, so the
+    # envelope holds scripts/ whoever built it. A gate copy is extracted from
+    # objects and has no .git; anything else is not this hook's to edit.
+    for _wv_ext in "${_PC_GATE_EXTERNAL[@]}"; do
+        [ ! -e "$_PC_SCRIPTS/../.git" ] || break
+        if ! rm -f "$_PC_SCRIPTS/../$_wv_ext"; then
+            echo "✗ Weave pre-commit: could not remove $_wv_ext from the committed gate's copy — refusing" >&2
+            exit 1
+        fi
+    done
 else
     # HEAD has no committed gate (a consumer, or an unborn branch): the gate is
     # the one this hook ships with, beside it, never the repository's working
@@ -846,11 +345,15 @@ for _pc_cand in "${_pc_lib_cands[@]}"; do
 done
 # The frozen candidate (wv-8e34cd), found the same way and required the same
 # way: without it the gate would read whatever the index holds at each step.
-for _pc_cand in "${_pc_lib_cands[@]}"; do
-    if [ -n "$_pc_cand" ] && [ -f "$_pc_cand/wv-gate-snapshot.sh" ]; then
-        source "$_pc_cand/wv-gate-snapshot.sh"
-        break
-    fi
+# The per-checkout gate lock (wv-c5500d) likewise.
+for _pc_lib in wv-gate-snapshot.sh wv-gate-hold.sh; do
+    for _pc_cand in "${_pc_lib_cands[@]}"; do
+        if [ -n "$_pc_cand" ] && [ -f "$_pc_cand/$_pc_lib" ]; then
+            # shellcheck source=/dev/null
+            source "$_pc_cand/$_pc_lib"
+            break
+        fi
+    done
 done
 
 # Check what's being committed — ordinary graph state skips the code gate
@@ -1024,6 +527,45 @@ _pc_tracked_at_head_or_index() {  # <path>
     return 1
 }
 
+# _pc_external_dir <path>... — R-a of the lane review (wv-a75d98): a private
+# directory holding exactly these external gate files as this lane runs them
+# (HEAD's, or the execution tree's in recovery; a candidate lane's own file as
+# frozen), with scripts/ beside them. It exists only while the one check that
+# declares them runs, and no exported variable names it. Outside a protected
+# lane there is no envelope: the files beside this hook, as before. Sets
+# _PC_EXT_DIR; 1 when a copy cannot be made, and the caller refuses.
+_PC_EXT_DIR=""
+_pc_external_dir() {
+    local p side blob rc tree mode
+    _PC_EXT_DIR=""
+    if [ -z "$_PC_LANE_BASE" ]; then
+        _PC_EXT_DIR="$_PC_SCRIPTS/.."
+        return 0
+    fi
+    _PC_EXT_DIR=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/wv-gate-ext.XXXXXX" 2>/dev/null) || _PC_EXT_DIR=""
+    [ -n "$_PC_EXT_DIR" ] && [ -d "$_PC_EXT_DIR" ] || { _PC_EXT_DIR=""; return 1; }
+    ln -s "$_PC_SCRIPTS" "$_PC_EXT_DIR/scripts" || return 1
+    for p; do
+        side=auth
+        [ "$p" = "$_PC_CAND_PATH" ] && side=index
+        rc=0; blob=$(gate_blob "$side" "$p") || rc=$?
+        case "$rc" in
+            0) ;;
+            1) continue ;;
+            *) return 1 ;;
+        esac
+        tree=$(gate_side_tree "$side") || return 1
+        mode=$(git ls-tree --full-tree "$tree" -- "$p" 2>/dev/null) || return 1
+        mkdir -p "$_PC_EXT_DIR/$(dirname "$p")" || return 1
+        git cat-file blob "$blob" > "$_PC_EXT_DIR/$p" || return 1
+        chmod "$([ "${mode%% *}" = 100755 ] && echo 700 || echo 600)" "$_PC_EXT_DIR/$p" || return 1
+    done
+}
+_pc_external_drop() {
+    if [ -n "$_PC_LANE_BASE" ] && [ -n "$_PC_EXT_DIR" ]; then rm -rf "$_PC_EXT_DIR"; fi
+    _PC_EXT_DIR=""
+}
+
 # Active-memory changes also change generated instructions (wv-ff0419).
 # Run the configured parity check before graph-only/checkpoint exits, against
 # the index: an unstaged render cannot make a stale committed projection pass.
@@ -1077,8 +619,14 @@ if grep -Fxq '.weave/nodes.jsonl' <<< "$STAGED_FILES" \
             echo "✗ memory parity: could not materialise the frozen graph and projections — refusing" >&2
             exit 1
         fi
+        if ! _pc_external_dir tests/test-memory-projection-parity.sh; then
+            _pc_external_drop; rm -rf "$_pc_memory_dir"
+            echo "✗ memory parity: could not copy the parity checker for this check — refusing" >&2
+            exit 1
+        fi
         _pc_memory_rc=0
-        bash "$_PC_SCRIPTS/../tests/test-memory-projection-parity.sh" --subject "$_pc_memory_dir" || _pc_memory_rc=$?
+        bash "$_PC_EXT_DIR/tests/test-memory-projection-parity.sh" --subject "$_pc_memory_dir" || _pc_memory_rc=$?
+        _pc_external_drop
         rm -rf "$_pc_memory_dir"
         if [ "$_pc_memory_rc" -ne 0 ]; then
             exit 1
@@ -1134,6 +682,7 @@ export WV_GATE_PHASE=pre-commit
 WV_GATE_ID="pc-$(date +%s%N 2>/dev/null || date +%s)-$$"
 export WV_GATE_ID
 _pc_gate_t0=$(date +%s%N 2>/dev/null || echo 0)
+_pc_gate_pressure0=$(gate_pressure_totals 2>/dev/null)
 _pc_gate_suites=""
 _pc_gate_estimate_ms=""
 _pc_gate_finish() {
@@ -1142,10 +691,27 @@ _pc_gate_finish() {
         --execution-mode="${WV_GATE_EXECUTION_MODE:-}" \
         --suite-modes="$(gate_pool_suite_modes "$_pc_gate_suites")" \
         --estimate="$_pc_gate_estimate_ms" --suites="$_pc_gate_suites" \
-        --started-ms="$(_pc_ns_to_ms "$_pc_gate_t0" 2>/dev/null)" >/dev/null 2>&1 || true
+        --started-ms="$(_pc_ns_to_ms "$_pc_gate_t0" 2>/dev/null)" \
+        --lanes="${_GATE_LANES_RUNS:-}" --lanes-ms="${_GATE_LANES_MS:-}" \
+        --lanes-started-ms="$([ -z "${_GATE_LANES_T0:-}" ] || _pc_ns_to_ms "$_GATE_LANES_T0" 2>/dev/null)" \
+        --pressure-start="$_pc_gate_pressure0" --pressure-end="$(gate_pressure_totals 2>/dev/null)" \
+        >/dev/null 2>&1 || true
+    wv_gate_hold_release 2>/dev/null || true
     return "$rc"
 }
 [ -n "$_PC_CAND_PATH" ] || _pc_preflight || trap _pc_gate_finish EXIT
+
+# ── One gate at a time per checkout (wv-c5500d) ── Past the .weave-only and
+# checkpoint exits, so graph-state commits still pass while a push gate runs,
+# and never in a candidate lane, which this gate starts itself. A preflight
+# takes it too: it runs the same suites on the same scratch.
+if [ -z "$_PC_CAND_PATH" ]; then
+    if ! command -v wv_gate_hold_acquire >/dev/null 2>&1; then
+        echo "✗ Weave pre-commit: the gate lock library (wv-gate-hold.sh) was not found — refresh with $(_pc_refresh_cmd)" >&2
+        exit 1
+    fi
+    wv_gate_hold_acquire pre-commit "commit on $(git rev-parse --short HEAD 2>/dev/null || echo 'no HEAD')" || exit 1
+fi
 
 # Admission (execute phase only): an active node CLAIMED BY THE COMMITTING
 # ACTOR. Counting every active node let one agent's claim admit another
@@ -1156,9 +722,11 @@ _pc_gate_finish() {
 # queries, not one transaction. Taking over someone else's node is
 # `wv work <id> --force`, which the claim_ownership rule records.
 # A failed listing reads as no claim: admission fails closed.
-# The guarantee is ACTOR-owned admission, not session isolation: sessions that
-# resolve the same identity (one harness, host and user) admit each other's
-# commits until each sets its own WV_AGENT_ID (wv-d7f53e).
+# Admission is SESSION-owned where the harness carries a session id (Claude
+# Code, Codex): the identity is <harness>-<host>-<user>-s<sid12>, so two sessions
+# of one harness no longer admit each other's commits, and a harness session
+# whose id is missing fails the listing (wv-99978b). A human shell, Copilot, or
+# WV_SESSION_IDENTITY=0 stays actor-owned; WV_AGENT_ID always wins.
 # _pc_require_claim <when> — exits 1 unless the committing actor holds a
 # claim. Called just before the suite pool, so a missing claim is not reported
 # after the protected pass (wv-c909ff), and again at admission, which decides:
@@ -1511,8 +1079,12 @@ if [ "${#STAGED_PY_FILES[@]}" -gt 0 ] || [ -n "$STAGED_QUALITY_RULES" ]; then
             _pc_pytest_command=(python3 -I "$_PC_LIB_DIR/wv-gate-suite.py" "${_pc_pytest_args[@]}"
                 tests/lib/run-pytest.sh "${_pc_pytest_dirs[@]}")
         fi
-        if ! gate_run_bounded "focused pytest" "${WV_GATE_TIMEOUT:-1800}" \
-            env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_SCRATCH_ROOT \
+        # In a candidate lane it takes one of the gate's shared slots like a
+        # suite (wv-428a92); outside a lane WV_GATE_SLOTS is unset and the stamp
+        # is ignored.
+        if ! WV_GATE_SLOT_STAMP="$_pc_pytest_work/slot" \
+            gate_run_bounded "focused pytest" "${WV_GATE_TIMEOUT:-1800}" \
+            env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_GATE_SLOTS -u WV_GATE_SLOT_STAMP -u WV_GATE_SLOT_STOP -u WV_SCRATCH_ROOT \
             -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE -u GIT_PREFIX -u GIT_COMMON_DIR \
             -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE \
             "${_pc_pytest_command[@]}"; then
@@ -1733,6 +1305,17 @@ if command -v shellcheck >/dev/null 2>&1; then
             || _pc_sc_refuse "could not materialise the staged index"
         _pc_sc_rc=0
         _pc_sc_out=""
+        # Candidate lanes run this hook at the same time, each linting every
+        # staged shell file in full; shellcheck on tests/test-hooks.sh alone
+        # peaks at 1.6 GB, so two lanes took an 8 GB host to 2.6 GB free
+        # (wv-cb632d). gate_lanes_run names one lock for its lanes in
+        # WV_GATE_SC_LOCK (read as _PC_SC_LOCK): each lane still runs all of
+        # its shellcheck runs itself, one lane at a time. Without the lock (the
+        # protected pass, which ends before lanes start, or a host without
+        # flock) the run is as before.
+        _pc_sc_lock=()
+        [ -n "$_PC_SC_LOCK" ] && command -v flock >/dev/null 2>&1 \
+            && _pc_sc_lock=(flock "$_PC_SC_LOCK")
         for _pc_sc_n in "${!_pc_sc_keys[@]}"; do
             _pc_sc_k=${_pc_sc_keys[$_pc_sc_n]}
             _pc_sc_group=()
@@ -1747,7 +1330,8 @@ if command -v shellcheck >/dev/null 2>&1; then
                 git cat-file blob "$_pc_sc_k" > "$_pc_sc_lint/.shellcheckrc" 2>/dev/null \
                     || _pc_sc_refuse "could not read a shellcheck configuration from git"
             fi
-            _pc_sc_one=$( cd "$_pc_sc_lint" && env -u SHELLCHECK_OPTS shellcheck --severity=warning -- "${_pc_sc_group[@]}" 2>&1 ) && continue
+            _pc_sc_one=$( cd "$_pc_sc_lint" && ${_pc_sc_lock[@]+"${_pc_sc_lock[@]}"} \
+                env -u SHELLCHECK_OPTS shellcheck --severity=warning -- "${_pc_sc_group[@]}" 2>&1 ) && continue
             _pc_sc_rc=1
             _pc_sc_out="$_pc_sc_one"
             [ "${_pc_sc_key_head_only[$_pc_sc_n]}" = 1 ] \
@@ -1869,9 +1453,15 @@ if [ "$_pc_leak_hit" = true ] && _pc_tracked_at_head_or_index build-release.sh \
         echo "✗ release leak guard: could not materialise the staged index — refusing to commit unchecked tests" >&2
         exit 1
     fi
+    if ! _pc_external_dir build-release.sh tests/lib/release-leak-pattern.ere tests/test-shipped-test-refs.sh; then
+        _pc_external_drop; rm -rf "$_pc_leak_dir"
+        echo "✗ release leak guard: could not copy the release policy for this check — refusing to commit unchecked tests" >&2
+        exit 1
+    fi
     _pc_leak_rc=0
-    bash "$_PC_SCRIPTS/../tests/test-shipped-test-refs.sh" --scan "$_pc_leak_dir" \
-        --policy "$_PC_SCRIPTS/.." || _pc_leak_rc=$?
+    bash "$_PC_EXT_DIR/tests/test-shipped-test-refs.sh" --scan "$_pc_leak_dir" \
+        --policy "$_PC_EXT_DIR" || _pc_leak_rc=$?
+    _pc_external_drop
     rm -rf "$_pc_leak_dir"
     if [ "$_pc_leak_rc" -ne 0 ]; then
         exit 1
@@ -2023,11 +1613,13 @@ fi
 # which the phase returns to discover. It is NOT an admission exemption
 # (wv-68aeff): the graph commit that closing exists for is graph state and
 # exited above, so what reaches here is substantive and needs a claim in every
-# phase -- the phase is repository-shared, and another session's closing must
-# not waive ownership.
+# phase -- another session's closing must not waive ownership.
 _PC_REPO_HASH=$(echo "$REPO_ROOT" | md5sum | cut -c1-8)
 _PC_HOT_ZONE="${WV_HOT_ZONE:-/dev/shm/weave/${_PC_REPO_HASH}}"
-_PC_PHASE=$(cat "${_PC_HOT_ZONE}/.session_phase" 2>/dev/null || echo "execute")
+# The phase is this owner's (wv-43d6be); the root file is never read.
+_PC_PHASE_FILE=""
+if command -v resolve_phase_file >/dev/null 2>&1; then _PC_PHASE_FILE=$(resolve_phase_file "$_PC_HOT_ZONE") || true; fi
+_PC_PHASE=$( [ -n "$_PC_PHASE_FILE" ] && cat "$_PC_PHASE_FILE" 2>/dev/null || echo "execute")
 
 if [ "$_PC_PHASE" = "closing" ] && [ -z "$_PC_CAND_PATH" ] && ! _pc_preflight; then
     command -v wv_set_phase >/dev/null 2>&1 && { wv_set_phase "discover" "$_PC_HOT_ZONE" || true; }

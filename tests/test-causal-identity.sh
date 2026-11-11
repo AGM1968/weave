@@ -153,6 +153,41 @@ printf '%s %s\n' "$delta_sig" "$delta_digest" > "$cache"
 check "a two-field entry is recomputed to the same identity" "$catalog_identity" "$(identity)"
 check "and rewritten with its count" "$delta_sig $delta_digest $delta_count" "$(cat "$cache")"
 
+# ONE FRONTIER WALK FOR A CALL THAT CANNOT WRITE (wv-1b2a92). The walk stats
+# every published delta and ran on both sides of every call. An observation
+# command (status, show, list ...) never writes, so its after-identity reuses
+# the frontier its before-identity saw; a mutation still walks on both sides,
+# because its own write is what the after-identity must see. Counted from an
+# xtrace of the wrapper: each call of the walk function is one walk.
+walks() { PS4='+ ' bash -x "$WV" "$@" 2>&1 >/dev/null | grep -c '^+* _wv_identity_delta_frontier_line '; }
+check "an observation command walks the delta catalog once" "1" "$(walks status)"
+check "a mutation command walks it on both sides" "2" "$(walks add "frontier walk probe")"
+# wv-2ddb44: the version tokens only echo, so they walk once; help still twice.
+check "wv --version walks the delta catalog once" "1" "$(walks --version)"
+check "wv help still walks it on both sides" "2" "$(walks help)"
+truth=$(identity)
+_WV_FRONTIER_LINE=$'delta_catalog_frontier\tpresent\t0\tsha256:planted' "$WV" status >/dev/null 2>&1
+check "a frontier handed in through the environment is ignored" "$truth" \
+  "$(tail -1 "$WV_CALL_LOG" | jq -r '.graph_identity_after.value')"
+probe_reuse="$WEAVE_DIR/deltas/2026-01-02/1700000001-000000-reuse.sql"
+mkdir -p "$(dirname "$probe_reuse")"; printf -- '-- reuse probe\n' > "$probe_reuse"
+differs "the next observation call still sees a delta that arrived after the last one" "$truth" "$(identity)"
+rm -f "$probe_reuse"
+
+# AN IDENTITY CACHE NEVER CREATES THE HOT ZONE (wv-1b2a92). The delta-catalog
+# cache once ran mkdir -p on its own directory, so under a 002 umask the first
+# call to reach it made a group-writable zone that the hot-zone guard then
+# refused for every later call. No directory a call creates may be writable by
+# group or others, whatever the caller's umask. (Files inside take the umask;
+# the zone directory's mode 700 is what keeps others out of them.)
+fresh_zone="$TEST_DIR/fresh-zone/zone"
+mkdir -p "$TEST_DIR/fresh-zone" && chmod 700 "$TEST_DIR/fresh-zone"
+# The database stays where it is, so the identity is computed and its caches
+# are written while the zone directory does not exist yet.
+( umask 002; WV_HOT_ZONE="$fresh_zone" WV_DB="$db" "$WV" status >/dev/null 2>&1 )
+loose=$(find "$TEST_DIR/fresh-zone" -type d -perm /022 -printf '%m %P\n' 2>/dev/null)
+check "a call under umask 002 creates no group- or world-writable directory in its zone" "" "$loose"
+
 # GRAPH-ROWS CACHE (wv-78e154). The row dump is reused while the database file
 # is unchanged. A planted digest under a matching key shows that a hit serves
 # the entry, so the write after it is what has to move the value back.

@@ -338,19 +338,19 @@ class _EssentialComplexityVisitor(ast.NodeVisitor):
     visit_AsyncFor = visit_For  # type: ignore[assignment]
 
     @override
-    def visit_Break(self, node: ast.Break) -> None:  # noqa: N802
+    def visit_Break(self, node: ast.Break) -> None:  # noqa: N802, ARG002
         """Count break as non-reducible when inside a loop."""
         if self._in_loop:
             self._non_reducible += 1
 
     @override
-    def visit_Continue(self, node: ast.Continue) -> None:  # noqa: N802
+    def visit_Continue(self, node: ast.Continue) -> None:  # noqa: N802, ARG002
         """Count continue as non-reducible when inside a nested loop."""
         if self._in_loop and self._depth > 1:
             self._non_reducible += 1
 
     @override
-    def visit_Return(self, node: ast.Return) -> None:  # noqa: N802
+    def visit_Return(self, node: ast.Return) -> None:  # noqa: N802, ARG002
         """Record current depth for multi-return unstructured-flow analysis."""
         self._return_depths.append(self._depth)
 

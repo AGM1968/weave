@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 from typing import Any
 
 from weave_gh import log
@@ -62,9 +64,50 @@ ENSURE_LABELS: list[tuple[str, str, str]] = [
 # ---------------------------------------------------------------------------
 
 
-def ensure_labels(repo: str) -> None:
-    """Create all required labels on the repo (idempotent)."""
+_LABEL_LIST_LIMIT = 1000
+
+
+def _existing_label_names(repo: str) -> set[str] | None:
+    """Lower-cased names of the repo's labels, or None if the list is not trustworthy.
+
+    GitHub label names are unique regardless of case, so a create for "Bug"
+    fails when "bug" exists; the comparison is case-blind for the same reason.
+    A failed, malformed or limit-filling listing returns None, and the caller
+    then attempts every create as it always did.
+    """
+    try:
+        raw = gh_cli(
+            "label", "list", "--repo", repo,
+            "--limit", str(_LABEL_LIST_LIMIT), "--json", "name",
+        )
+        data: object = json.loads(raw) if raw else []
+    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, list) or len(data) >= _LABEL_LIST_LIMIT:
+        return None
+    names: set[str] = set()
+    for row in data:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+            return None
+        names.add(row["name"].lower())
+    return names
+
+
+def ensure_labels(repo: str, *, dry_run: bool = False) -> None:
+    """Create the required labels the repo lacks (idempotent).
+
+    One listing replaces a create attempt per label on every sync (13 calls,
+    ~8.6 s here; wv-5c1223). A create still never touches an existing label:
+    `gh label create` without --force refused those before too. A dry run
+    writes nothing; it used to create any missing label.
+    """
+    existing = _existing_label_names(repo)
     for name, color, desc in ENSURE_LABELS:
+        if existing is not None and name.lower() in existing:
+            continue
+        if dry_run:
+            log.info("  [dry-run] Would create label '%s'", name)
+            continue
         gh_cli(
             "label",
             "create",

@@ -22,6 +22,8 @@ import sys
 from pathlib import Path
 from typing import Iterator
 
+from weave_indexer import symbols
+
 _DEFAULT_EXTS = frozenset({
     ".py", ".ts", ".tsx", ".js", ".jsx",
     ".sh", ".bash",
@@ -200,6 +202,27 @@ def _upsert_chunks(
     return evicted
 
 
+def _file_symbols(path: Path, rel: str) -> list[tuple[str, str, int, str]]:
+    """(name, file, line, kind) rows for the definitions in one walked file."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return [(name, rel, line, kind) for name, line, kind in symbols.extract(_index_ext(path), text)]
+
+
+def _write_symbols(
+    db_path: str, rows: list[tuple[str, str, int, str]], walked: set[str], scope: str
+) -> None:
+    """Rewrite the definition table for this walk (wv-35b5bd), in one transaction."""
+    conn = sqlite3.connect(db_path)
+    try:
+        symbols.replace_symbols(conn, rows, walked, scope)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse CLI args, chunk files, embed, and upsert into brain.db."""
     parser = argparse.ArgumentParser(prog="wv index")
@@ -227,10 +250,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # Collect and chunk
     all_chunks: list[tuple[str, int, int, str]] = []
+    walked: set[str] = set()
+    defs: list[tuple[str, str, int, str]] = []
     for fpath in _walk_files(root, exts, base):
         rel = fpath.relative_to(base).as_posix()
+        walked.add(rel)
         for ls, le, content in _chunk_file(fpath, args.chunk_size, args.overlap):
             all_chunks.append((rel, ls, le, content))
+        defs.extend(_file_symbols(fpath, rel))
+    _write_symbols(db_path, defs, walked, scope)
 
     if not all_chunks:
         # An empty walk still proves its subtree holds nothing: evict it.
