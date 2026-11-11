@@ -284,7 +284,7 @@
     },
     {
       "rule_id": "active_add_requires_claim_readiness",
-      "summary": "A node created directly as active must already carry done criteria and a risk assessment.",
+      "summary": "A node created directly as active must already carry done criteria and a risk assessment, and is refused while another live session in the same checkout holds a claim.",
       "basis": "invariant",
       "decisions": [
         "allow",
@@ -309,7 +309,7 @@
           "path": "scripts/cmd/wv-cmd-core.sh",
           "function": "cmd_add",
           "anchor": "wv_policy_verdict active_add_requires_claim_readiness",
-          "occurrences": 4
+          "occurrences": 5
         }
       ]
     },
@@ -709,7 +709,7 @@
     },
     {
       "rule_id": "claim_ownership",
-      "summary": "Taking over a node another agent has claimed requires an explicit override, which is recorded; a claim under an unverifiable session identity is refused.",
+      "summary": "Taking over a node another agent has claimed requires an explicit override, which is recorded; a claim under an unverifiable session identity is refused, and so is a new claim while another live session in the same checkout holds one.",
       "basis": "invariant",
       "decisions": [
         "allow",
@@ -737,7 +737,7 @@
           "path": "scripts/cmd/wv-cmd-core.sh",
           "function": "cmd_work",
           "anchor": "wv_policy_verdict claim_ownership",
-          "occurrences": 2
+          "occurrences": 3
         },
         {
           "owner": "command_gate",
@@ -747,7 +747,7 @@
           "occurrences": 2
         }
       ],
-      "notes": "The takeover (--force) and the continuation of this actor's own pre-session coarse claim (--continue) are policy events, each appended to metadata.claim_history; --continue on anyone else's claim is denied, and so is any claim when a harness that carries a session id did not supply it (wv-99978b). A claim refused because another agent holds the node is recorded as expected_conflict: the atomic claim cannot tell a live holder from a race this call just lost."
+      "notes": "The takeover (--force) and the continuation of this actor's own pre-session coarse claim (--continue) are policy events, each appended to metadata.claim_history; --continue on anyone else's claim is denied, and so is any claim when a harness that carries a session id did not supply it (wv-99978b). A claim refused because another agent holds the node is recorded as expected_conflict: the atomic claim cannot tell a live holder from a race this call just lost. wv work and wv add --status=active refuse a new claim while another session of this host and user holds an active claim in this graph and a live agent process has its working directory in this checkout (wv-1da341, wv-24ab9d); a crashed peer, a claimless live peer, another host's claim and a linked worktree each admit, and the refusal gives the git worktree add command."
     },
     {
       "rule_id": "delete_preserves_children",

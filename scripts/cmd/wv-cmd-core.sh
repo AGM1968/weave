@@ -387,6 +387,50 @@ _add_claim_identity() {
     require_agent_id
 }
 
+# _claim_shared_checkout_peer <agent-id> [node-id] — refuse a new claim while
+# another LIVE agent session in this checkout holds one (wv-1da341, owner ruling
+# 2026-11-11 on wv-24ab9d). Two sessions that each hold a claim in one checkout
+# can overwrite each other's uncommitted edits: the edit guard checks the claim,
+# not whose change a file holds. Both conditions must hold, so neither alone
+# refuses: an active node claimed by another session of this host and user (a
+# crashed peer leaves the claim and no process), and a live agent process with
+# its working directory in this checkout (a claimless peer cannot edit anyway).
+# Claims synced from another host never count, nor this session's coarse or
+# pre-digest ids, nor a node it already holds. A linked worktree has its own hot
+# zone, so its sessions' claims are not in this graph. Cost: one query, and the
+# /proc scan only when a peer claim exists. The caller records the verdict under
+# its own rule (claim_ownership for wv work, active_add_requires_claim_readiness
+# for an active add), so a plain add gains no rule that never speaks.
+_claim_shared_checkout_peer() {
+    local agent="$1" node="${2:-}" root hu coarse legacy peers live
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+    if [ -n "$node" ] && [ "$(db_query "SELECT COALESCE(json_extract(metadata,'$.claimed_by'),'')
+            FROM nodes WHERE id='$node';" 2>/dev/null)" = "$agent" ]; then
+        return 0
+    fi
+    hu="$(hostname 2>/dev/null || echo host)-$(whoami 2>/dev/null || echo user)"
+    coarse=$(resolve_agent_coarse_id 2>/dev/null) || coarse=""
+    legacy=$(resolve_agent_legacy_session_id 2>/dev/null) || legacy=""
+    peers=$(db_query "SELECT id || ' (' || c || ')' FROM (
+            SELECT id, json_extract(metadata,'$.claimed_by') AS c FROM nodes WHERE status='active')
+        WHERE c IS NOT NULL AND c NOT IN ('$(sql_escape "$agent")','$(sql_escape "$coarse")','$(sql_escape "$legacy")')
+          AND (substr(c, -length('-$(sql_escape "$hu")')) = '-$(sql_escape "$hu")'
+               OR instr(c, '-$(sql_escape "$hu")-h') > 0)
+        ORDER BY id LIMIT 3;" 2>/dev/null) || return 0
+    [ -n "$peers" ] || return 0
+    live=$(_wv_concurrent_session "$root" 2>/dev/null) || return 0
+    {
+        echo -e "${RED}✗ Not claiming: another live agent session works in this checkout and holds a claim.${NC}"
+        printf '%s\n' "$peers" | sed 's/^/  claimed: /'
+        echo "  live: $live"
+        echo "  Two claimed sessions in one checkout overwrite each other's uncommitted edits (wv-24ab9d)."
+        echo "  Work in a linked worktree instead, which has its own graph zone and index:"
+        echo "    git worktree add -b <branch> ../$(basename "$root")-<name> HEAD   # then start the session there"
+        echo "  Or end the other session's claim there (wv done, or wv update <id> --status=todo) or stop that session."
+    } >&2
+    return 1
+}
+
 # _add_parse_args <args...> — cmd_add's option parser, apart so cmd_add stays
 # under the close limit (wv-481b9c). It sets cmd_add's locals (text, status,
 # metadata, ...) through bash's dynamic scope; an unknown --flag is rejected.
@@ -449,6 +493,11 @@ cmd_add() {
     # identity cannot be verified (wv-99978b), rather than leave an unclaimed node.
     local add_agent_id
     add_agent_id=$(_add_claim_identity "$status") || return 1
+    if [ "$status" = "active" ] && ! _claim_shared_checkout_peer "$add_agent_id"; then
+        wv_policy_verdict active_add_requires_claim_readiness deny yes "" \
+            "another live session in this checkout holds a claim"
+        return 1
+    fi
 
     # The supplied --metadata is validated before the flags merge into it:
     # null + {done_criteria: ...} is an object, so validating only the merged
@@ -4380,6 +4429,12 @@ cmd_work() {
         return 1
     fi
     agent_id="$(sql_escape "$agent_raw")"
+    # A takeover (--force) names its node and is recorded; the peer check
+    # still applies, since the takeover does not end the peer's other claims.
+    if ! _claim_shared_checkout_peer "$agent_raw" "$id"; then
+        wv_policy_verdict claim_ownership deny yes "" "another live session in this checkout holds a claim"
+        return 1
+    fi
 
     # Atomic CAS claim: succeeds only if unclaimed or already claimed by this agent.
     # A write that fails or rolls back (an FTS trigger error, a locked database)

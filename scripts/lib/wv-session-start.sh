@@ -247,8 +247,14 @@ wv_session_start_context() {
         '{ts: $ts, active: [], pid: $pid, phase: "loading"}' \
         > "$sentinel" 2>/dev/null || rm -f "$sentinel"
 
-    # Ensure DB is loaded
-    "$WV" load >/dev/null 2>&1 || true
+    # Ensure DB is loaded. Another session writing this hot zone holds its write
+    # lock (wv-8f2df1); its graph is live and current, so the load is skipped
+    # after a short wait rather than holding session start behind, say, a
+    # minutes-long wv sync --gh. Exit 75 is that skip.
+    local load_note="" load_rc=0
+    WV_ZONE_LOCK_TIMEOUT="${WV_SESSION_START_LOAD_WAIT:-5}" "$WV" load >/dev/null 2>&1 || load_rc=$?
+    [ "$load_rc" -ne 75 ] \
+        || load_note="wv load skipped at session start: another wv process is writing this hot zone, so the live graph is current. Two sessions share this checkout; a second session belongs in a linked worktree (git worktree add)."
 
     # ── Guard: never commit a session-start snapshot that SHRINKS the committed graph ──
     # `wv load` above re-dumps .weave/ from the live hot-zone DB. If that DB is stale or
@@ -361,6 +367,10 @@ $(_ss_code_index_refresh "$project_dir" "$hot_zone")"
     context="${context%$'\n'}"
     context="${context#$'\n'}"
 
+    if [ -n "$load_note" ]; then
+        context="${load_note}
+${context}"
+    fi
     # Graph-regression warning if the shrink guard fired
     if [ -n "$regression" ]; then
         context="${regression}

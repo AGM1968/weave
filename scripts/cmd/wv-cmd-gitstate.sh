@@ -102,6 +102,7 @@ _detect_git_pending() {
             --argjson outside_dirty false \
             '{pending:$pending, state:$state, action:$action, reason:$reason, hint:$hint,
               upstream:$upstream, ahead_count:$ahead_count,
+              recorded_pushed:0, ref_maybe_stale:false,
               weave_dirty:$weave_dirty, outside_dirty:$outside_dirty}'
         return 0
     fi
@@ -159,6 +160,23 @@ _detect_git_pending() {
     fi
 
     hint=$(_git_pending_hint "$reason")
+    # A replica whose tracking ref is stale (a refused fetch, a push to a URL)
+    # counts published commits as ahead (wv-d235b6). The state stands: a failed
+    # push leaves the same record, so the doubt is reported, not resolved.
+    local recorded_pushed=0 ref_maybe_stale=false
+    if [ "$ahead_count" -gt 0 ] 2>/dev/null && command -v wv_push_recorded_ahead >/dev/null 2>&1; then
+        recorded_pushed=$(wv_push_recorded_ahead "$git_root")
+        [[ "$recorded_pushed" =~ ^[0-9]+$ ]] || recorded_pushed=0
+    fi
+    if [ "$recorded_pushed" -gt 0 ]; then
+        ref_maybe_stale=true
+        local refresh="git fetch, or after a push to a URL: git fetch <url> ${upstream#*/}:refs/remotes/$upstream"
+        if [ "$recorded_pushed" -ge "$ahead_count" ]; then
+            hint="the $ahead_count commit(s) ahead of $upstream were sent by a recorded push, so $upstream may be stale; refresh it before acting: $refresh"
+        else
+            hint="$hint; $recorded_pushed of the $ahead_count commit(s) ahead were sent by a recorded push, so $upstream may be stale: $refresh"
+        fi
+    fi
     jq -n \
         --argjson pending "$pending" \
         --arg state "$state" \
@@ -167,9 +185,12 @@ _detect_git_pending() {
         --arg hint "$hint" \
         --arg upstream "$upstream" \
         --argjson ahead_count "$ahead_count" \
+        --argjson recorded_pushed "$recorded_pushed" \
+        --argjson ref_maybe_stale "$ref_maybe_stale" \
         --argjson weave_dirty "$weave_dirty_bool" \
         --argjson outside_dirty "$outside_dirty" \
         '{pending:$pending, state:$state, action:$action, reason:$reason, hint:$hint,
           upstream:$upstream, ahead_count:$ahead_count,
+          recorded_pushed:$recorded_pushed, ref_maybe_stale:$ref_maybe_stale,
           weave_dirty:$weave_dirty, outside_dirty:$outside_dirty}'
 }

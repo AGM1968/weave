@@ -3,7 +3,8 @@
 # shellcheck disable=SC1010
 # Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
 export WV_CALL_SOURCE=test
-# A checkpoint never rewrites a commit a push is publishing (wv-13db30).
+# A checkpoint never rewrites a commit a push is publishing (wv-13db30) or
+# published while the tracking ref fell behind (wv-8258e5).
 #
 # The checkpoint writers amend HEAD when it is an unpushed graph-only
 # checkpoint, judged against origin/<branch>, which moves only when a push
@@ -31,7 +32,7 @@ export PATH="$T/bin:$PATH" WV_LIB_DIR="$ROOT/scripts"
 export WV_HOT_ZONE="$T/hot" WV_DB="$T/hot/brain.db" WV_CONFIG_DIR="$T/cfg" WV_PROJECT_DIR="$T/work"
 export WV_SUITE_LOG="$T/suite_runs.jsonl" WV_GATE_LOG="$T/gate_runs.jsonl"
 export WV_AUTO_SYNC=0 WV_AUTO_CHECKPOINT=0 WV_REQUIRE_LEARNING=0 WV_RUN_CACHE=0
-unset WV_GATE_PHASE WV_GATE_ID WV_GATE_CONTEXT WV_HOOK_REEXEC WV_PUSH_INFLIGHT_TTL
+unset WV_GATE_PHASE WV_GATE_ID WV_GATE_CONTEXT WV_HOOK_REEXEC WV_PUSH_RECORD_KEEP
 # The commit gate injects core.hooksPath=/dev/null through GIT_CONFIG_*; this
 # suite's subject is a hook, so the fixture states its own git config.
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
@@ -108,17 +109,66 @@ check "after a completed push a new checkpoint builds on the pushed commit" \
 nodes_before=$(wc -l < .weave/nodes.jsonl)
 check "every graph node survives the checkpoints" "$(wv list --json 2>/dev/null | jq 'length')" "$nodes_before"
 
-echo "=== a failed push's record ages out ==="
-checkpoint "auto-checkpoint 11:00"; stuck=$(git rev-parse HEAD)
 . "$ROOT/scripts/lib/wv-checkpoint-ci.sh"
+REC=$(wv_push_inflight_file "$PWD")
+# age_record — every recorded push becomes ten days old, as on the gpu clone
+age_record() { sed -i -E 's/^[0-9]+ /'"$(( $(date +%s) - 864000 ))"' /' "$REC"; }
+
+echo "=== a failed push's record never ages out (wv-8258e5) ==="
+checkpoint "auto-checkpoint 11:00"; stuck=$(git rev-parse HEAD)
 wv_push_inflight_record "$PWD" "$stuck"     # as a push that never completed leaves it
+age_record
 graph_write; sync_checkpoint
-check "while it counts, a checkpoint adds a commit instead of amending" \
+check "a ten-day-old record still stops the amend" \
     "$(git merge-base --is-ancestor "$stuck" HEAD && echo kept || echo rewritten)" "kept"
-checkpoint "auto-checkpoint 11:30"; before=$(git rev-parse HEAD^)
-wv_push_inflight_record "$PWD" "$(git rev-parse HEAD)"
-graph_write; WV_PUSH_INFLIGHT_TTL=0 sync_checkpoint
-check "once it ages out, amending resumes" "$(git rev-parse HEAD^)" "$before"
+
+echo "=== a push to a URL leaves the tracking ref behind (wv-8258e5) ==="
+# The gpu case: origin's URL cannot be reached (an SSH remote the host refuses),
+# so the checkpoint's own fetch fails quietly; the push names a URL that works,
+# so origin/main never moves; the next checkpoint, days later, met a published
+# 'sync state' at HEAD and amended it.
+git -c core.hooksPath=/dev/null push -q origin main 2>/dev/null
+behind=$(git rev-parse origin/main)
+git remote set-url origin "$T/unreachable.git"
+checkpoint "sync state"; url_pushed=$(git rev-parse HEAD)
+git push -q "$T/remote.git" main > "$T/url-push.log" 2>&1
+check "the URL push publishes the checkpoint" "$(git --git-dir="$T/remote.git" rev-parse main)" "$url_pushed"
+check "and leaves origin/main behind" "$(git rev-parse origin/main)" "$behind"
+# The reports read the same stale ref (wv-d235b6): git_sync still counts the
+# published checkpoint as ahead, and must say a recorded push sent it rather
+# than only "run: git push" to a remote this replica cannot reach.
+st=$(wv status --json 2>/dev/null)
+check "git_sync keeps its state on a stale ref" "$(jq -r .git_sync_state <<< "$st")" "recoverable"
+check "git_sync names the recorded push and the stale ref" \
+    "$(jq -r .git_sync_hint <<< "$st" | grep -c 'sent by a recorded push, so origin/main may be stale')" "1"
+age_record
+graph_write; sync_checkpoint
+check "the next checkpoint keeps the published commit" \
+    "$(git merge-base --is-ancestor "$url_pushed" HEAD && echo kept || echo rewritten)" "kept"
+check "and the next push is a fast-forward" \
+    "$(git -c core.hooksPath=/dev/null push -q "$T/remote.git" main >/dev/null 2>&1 && echo pushed || echo refused)" "pushed"
+git remote set-url origin "$T/remote.git"; git fetch -q origin 2>/dev/null
+
+echo "=== a HEAD behind its tracking ref is published (wv-8258e5) ==="
+# No push record at all: only containment in origin/main can say so.
+rm -f "$REC"
+checkpoint "sync state"; contained=$(git rev-parse HEAD)
+git -c core.hooksPath=/dev/null push -q origin main 2>/dev/null
+git clone -q -b main "$T/remote.git" "$T/other" > "$T/other.log" 2>&1
+( cd "$T/other" && git -c user.name=o -c user.email=o@example.com -c core.hooksPath=/dev/null \
+    commit -q --allow-empty -m "elsewhere" && git -c core.hooksPath=/dev/null push -q origin main ) >> "$T/other.log" 2>&1
+git fetch -q origin 2>/dev/null
+check "origin/main is ahead of HEAD" \
+    "$(git merge-base --is-ancestor "$contained" origin/main && [ "$(git rev-parse origin/main)" != "$contained" ] && echo ahead || echo not-ahead)" "ahead"
+check "a contained HEAD is not amendable" "$(wv_checkpoint_amendable "$PWD" && echo amendable || echo refused)" "refused"
+
+echo "=== the record keeps more than the last push ==="
+rm -f "$REC"
+WV_PUSH_RECORD_KEEP=2 wv_push_inflight_record "$PWD" aaa
+WV_PUSH_RECORD_KEEP=2 wv_push_inflight_record "$PWD" bbb
+check "a second push appends" "$(wc -l < "$REC" | tr -d ' ')" "2"
+WV_PUSH_RECORD_KEEP=2 wv_push_inflight_record "$PWD" ccc
+check "the oldest line goes past the cap" "$(awk '{print $2}' "$REC" | tr '\n' ' ')" "bbb ccc "
 
 echo ""
 echo "Results: $pass/$run passed"

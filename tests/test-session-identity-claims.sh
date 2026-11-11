@@ -141,5 +141,37 @@ out=$( (cd "$R" && env "${IDVARS[@]}" "${A[@]}" WEAVE_DIR="$R/.weave" WV_HOT_ZON
 [ "$rc" != 0 ] && [[ "$out" == *"no sha256 hasher"* ]] && [[ "$out" != *"-s"aaaaaaaa* ]] \
     && ok "a failing hasher makes the session unverified, with the cause named" || bad "no-hasher refusal" "rc=$rc $out"
 
+# The original symptoms were between two sessions of ONE harness (wv-3932e5:
+# the stop hook blocked on the other session's claim; wv-1caf6c: a shared
+# Primary and misattributed Weave-ID trailers). The hook suites' peers are other
+# harnesses, so this pins the same-harness case (wv-33647d, closing wv-d7f53e).
+echo "=== two sessions of one harness: Primary, stop guard and trailers ==="
+hook_as() {
+    local envs=()
+    while [ "$1" != "--" ]; do envs+=("$1"); shift; done
+    shift
+    (cd "$R" && env "${IDVARS[@]}" "${envs[@]}" WEAVE_DIR="$R/.weave" WV_HOT_ZONE="$TMP/hot" WV_CONFIG_DIR="$TMP/cfg" \
+        WV_PROJECT_DIR="$R" "$@")
+}
+sq "UPDATE nodes SET status='todo', metadata=json_remove(metadata,'\$.claimed_by') WHERE status='active';"
+na=$(as "${A[@]}" -- add "A's work" --status=active --criteria=c --risks=low --standalone --force 2>/dev/null | tail -1)
+nb=$(as "${B[@]}" -- add "B's work" --status=active --criteria=c --risks=low --standalone --force 2>/dev/null | tail -1)
+[ "$(as "${A[@]}" -- status --json 2>/dev/null | jq -r '.current.id')" = "$na" ] \
+    && [ "$(as "${B[@]}" -- status --json 2>/dev/null | jq -r '.current.id')" = "$nb" ] \
+    && ok "each session's Primary is its own node" || bad "per-session Primary" "a=$na b=$nb"
+sq "UPDATE nodes SET status='todo', metadata=json_remove(metadata,'\$.claimed_by') WHERE id='$nb';"
+out=$(echo '{}' | hook_as "${B[@]}" -- bash "$ROOT/.claude/hooks/stop-check.sh" 2>/dev/null)
+[ "$(jq -r '.decision // empty' <<< "$out" 2>/dev/null)" != "block" ] \
+    && ok "B's stop check does not block on A's claim" || bad "B stop blocked by A" "$out"
+out=$(echo '{}' | hook_as "${A[@]}" -- bash "$ROOT/.claude/hooks/stop-check.sh" 2>/dev/null)
+[ "$(jq -r '.decision // empty' <<< "$out" 2>/dev/null)" = "block" ] \
+    && ok "A's stop check still blocks on A's own claim" || bad "A stop not blocked" "$out"
+as "${B[@]}" -- work "$nb" >/dev/null 2>&1
+printf 'probe\n' > "$TMP/msg"
+hook_as "${B[@]}" -- sh "$ROOT/scripts/hooks/prepare-commit-msg-weave.sh" "$TMP/msg" >/dev/null 2>&1
+trailers=$(grep 'Weave-ID:' "$TMP/msg" | tr '\n' ' ')
+[ "$trailers" = "Weave-ID: $nb " ] \
+    && ok "B's commit carries B's trailer only, not A's" || bad "trailer attribution" "[$trailers] a=$na b=$nb"
+
 echo "Results: $pass/$run passed"
 [ "$pass" = "$run" ]

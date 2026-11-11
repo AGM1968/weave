@@ -16,6 +16,8 @@ TMP=$(mktemp -d /tmp/wv-run-all-counts-XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/tests" "$TMP/.weave"
 cp "$ROOT/tests/run-all.sh" "$TMP/tests/run-all.sh"
+mkdir -p "$TMP/tests/lib"
+cp "$ROOT/tests/lib/errexit-report.sh" "$TMP/tests/lib/errexit-report.sh"
 mkdir -p "$TMP/scripts/lib"
 cp "$ROOT/scripts/lib/wv-scratch.sh" "$TMP/scripts/lib/wv-scratch.sh"
 printf '#!/bin/bash\necho "Results: 3/3 passed"\n' > "$TMP/tests/test-policy-cells.sh"
@@ -46,6 +48,31 @@ for mode in --serial --parallel; do
     else
         bad "$mode: a suite with no parseable count is named, never counted as 0/0" \
             "$(grep -E 'Contract|Total|uncounted|Not in' <<< "$out")"
+    fi
+done
+
+# A suite that errexit ends names where (wv-f03855). The rc.16 publish's first
+# verify stopped on a suite whose setup sent a failing command's output to
+# /dev/null, and run-all could say only "no test count". The stub's child bash
+# fails under its own set -e first and must not report: only the suite does,
+# so the output holds exactly one report.
+cat > "$TMP/tests/test-policy-cells.sh" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+out=$(bash -c 'set -e; false' 2>&1) || true
+echo "child:[$out]"
+id=$(printf 'none\n' | grep wv-)
+echo "Results: 1/1 passed"
+STUB
+for mode in --serial --parallel; do
+    out=$(run_one "$mode" test-policy-cells)
+    # One report: a child that inherited the trap would add its own line.
+    if [[ "$out" == *"Error: test-policy-cells.sh stopped at line 5 (exit 1): id="* ]] &&
+        [ "$(grep -c 'Error: .* stopped at line' <<< "$out")" = 1 ]; then
+        ok "$mode: a suite errexit ends names its file, line, exit code and command"
+    else
+        bad "$mode: a suite errexit ends names its file, line, exit code and command" \
+            "$(grep -E 'Cells|Error|child' <<< "$out")"
     fi
 done
 

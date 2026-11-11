@@ -45,14 +45,18 @@
 # skipping it — a spuriously-run CI check costs nothing but a bit of compute,
 # a spuriously-skipped one silently hides a real regression from review.
 
-# ── A checkpoint never rewrites a commit a push is publishing (wv-13db30) ──
+# ── A checkpoint never rewrites a commit a push published (wv-13db30, wv-8258e5) ──
 # The three checkpoint writers (auto_checkpoint, wv sync, the session-end
 # checkpoint) collapse consecutive graph-only checkpoints by amending HEAD when
-# it is not yet on the upstream ref. That ref moves only when a push completes,
-# and the pre-push gate runs for minutes first: a checkpoint in that window
-# amended the very commit being pushed, and main was left diverged from what
-# had just been published. The pre-push hook now records what it publishes, and
-# HEAD is not amendable while a recorded push may still be publishing it.
+# it is not yet published. The upstream ref alone cannot say so. It moves only
+# when a push completes, and the pre-push gate runs for minutes first: a
+# checkpoint in that window amended the very commit being pushed (wv-13db30).
+# It also never moves when the push names a URL instead of the remote, so it can
+# sit commits behind what is published: a checkpoint ten days after such a push
+# amended a published commit and diverged a consumer's main from GitHub
+# (wv-8258e5). The pre-push hook runs for every push, so it records what each
+# push publishes, and a recorded commit is never amended, however old the
+# record.
 
 # wv_push_inflight_file <git-root> — where that record lives: the git common
 # dir, shared by worktrees and never part of a tree.
@@ -63,60 +67,100 @@ wv_push_inflight_file() {
 }
 
 # wv_push_inflight_record <git-root> <commit>... — the pre-push hook records
-# the commits it is about to publish, before its gate runs. One line,
-# "<epoch> <commit>...", replaced by the next push. Never fails the push.
+# the commits it is about to publish, before its gate runs. One line per push,
+# "<epoch> <commit>...", appended; the file keeps the newest
+# WV_PUSH_RECORD_KEEP lines (default 50), so a push of another branch does not
+# erase this branch's record. Never fails the push.
 wv_push_inflight_record() {
-    local root=$1 file
+    local root=$1 file keep=${WV_PUSH_RECORD_KEEP:-50}
     shift
     [ "$#" -gt 0 ] || return 0
+    [[ "$keep" =~ ^[1-9][0-9]*$ ]] || keep=50
     file=$(wv_push_inflight_file "$root") || return 0
-    { printf '%s' "$(date +%s)"; printf ' %s' "$@"; printf '\n'; } > "$file.$$" 2>/dev/null \
-        && mv -f "$file.$$" "$file" 2>/dev/null || rm -f "$file.$$" 2>/dev/null
+    if {
+        [ -f "$file" ] && tail -n "$((keep - 1))" "$file" 2>/dev/null
+        printf '%s' "$(date +%s)"; printf ' %s' "$@"; printf '\n'
+    } > "$file.$$" 2>/dev/null; then
+        mv -f "$file.$$" "$file" 2>/dev/null || rm -f "$file.$$" 2>/dev/null
+    else
+        rm -f "$file.$$" 2>/dev/null
+    fi
     return 0
 }
 
-# wv_push_publishing <git-root> <commit> — 0 while a recorded push may still be
-# publishing <commit>: the record is younger than WV_PUSH_INFLIGHT_TTL seconds
-# (default 3600, longer than any heavy tier), it names <commit> or a descendant
-# of it, and the upstream ref does not yet contain that pushed commit. A push
-# that completed moved the upstream, so its record stops counting; one that
-# failed leaves the record, and checkpoints then add commits instead of
-# amending until it ages out, which costs a commit and never a rewrite.
+# wv_push_publishing <git-root> <commit> — 0 when a recorded push published or
+# may still be publishing <commit>: a record names <commit> or a descendant of
+# it, and the upstream ref does not contain that pushed commit (when it does,
+# the ancestry test in wv_checkpoint_amendable already refuses). A record
+# never ages out. A push that failed leaves its record, and checkpoints then add
+# commits instead of amending until the next push, which costs a commit and
+# never a rewrite.
 wv_push_publishing() {
-    local root=$1 commit=$2 file stamp pushed upstream
+    local root=$1 commit=$2 file stamp pushed upstream line
     file=$(wv_push_inflight_file "$root") || return 1
     [ -f "$file" ] || return 1
-    read -r stamp pushed < "$file" 2>/dev/null || return 1
-    [[ "$stamp" =~ ^[0-9]+$ ]] || return 1
-    [ $(( $(date +%s) - stamp )) -lt "${WV_PUSH_INFLIGHT_TTL:-3600}" ] || return 1
     upstream=$(git -C "$root" rev-parse -q --verify '@{u}' 2>/dev/null) || upstream=""
     local p
-    for p in $pushed; do
-        [ "$commit" = "$p" ] || git -C "$root" merge-base --is-ancestor "$commit" "$p" 2>/dev/null || continue
-        [ -n "$upstream" ] && git -C "$root" merge-base --is-ancestor "$p" "$upstream" 2>/dev/null && continue
-        return 0
-    done
+    while IFS= read -r line; do
+        read -r stamp pushed <<< "$line"
+        [[ "$stamp" =~ ^[0-9]+$ ]] || continue
+        for p in $pushed; do
+            [ "$commit" = "$p" ] || git -C "$root" merge-base --is-ancestor "$commit" "$p" 2>/dev/null || continue
+            [ -n "$upstream" ] && git -C "$root" merge-base --is-ancestor "$p" "$upstream" 2>/dev/null && continue
+            return 0
+        done
+    done < "$file"
     return 1
 }
 
+# wv_push_recorded_ahead <git-root> — how many commits ahead of the upstream a
+# recorded push already sent: 0 when there is no upstream or no record. The
+# reports that count "unpushed" commits against the tracking ref read this, so
+# a replica whose ref is stale (a refused fetch, a push to a URL) says so rather
+# than telling the operator to push what is published (wv-d235b6). A failed push
+# also leaves a record, so this is a doubt to report, never a reason to count
+# the commits as pushed. Local only: no fetch, no network.
+wv_push_recorded_ahead() {
+    local root=$1 file upstream stamp pushed line p mb n best=0
+    file=$(wv_push_inflight_file "$root") || { echo 0; return 0; }
+    [ -f "$file" ] || { echo 0; return 0; }
+    upstream=$(git -C "$root" rev-parse -q --verify '@{u}' 2>/dev/null) || { echo 0; return 0; }
+    while IFS= read -r line; do
+        read -r stamp pushed <<< "$line"
+        [[ "$stamp" =~ ^[0-9]+$ ]] || continue
+        for p in $pushed; do
+            git -C "$root" merge-base --is-ancestor "$p" "$upstream" 2>/dev/null && continue
+            mb=$(git -C "$root" merge-base HEAD "$p" 2>/dev/null) || continue
+            n=$(git -C "$root" rev-list --count "$upstream..$mb" 2>/dev/null) || continue
+            [ "$n" -gt "$best" ] && best=$n
+        done
+    done < "$file"
+    echo "$best"
+}
+
 # wv_checkpoint_amendable <git-root> — 0 when HEAD may be amended by the next
-# checkpoint: it is not on origin/<branch>, it is a weave checkpoint commit,
-# it changes only .weave/, and no recorded push may be publishing it. The one
-# rule all three checkpoint writers apply; they each carried a copy, and only
-# one of the copies listed renames correctly (wv-b60cd5).
+# checkpoint: neither origin/<branch> nor the upstream contains it, it is a
+# weave checkpoint commit, it changes only .weave/, and no recorded push
+# published or may be publishing it. The one rule all three checkpoint writers
+# apply; they each carried a copy, and only one of the copies listed renames
+# correctly (wv-b60cd5).
 wv_checkpoint_amendable() {
-    local root=$1 branch head remote msg nw
+    local root=$1 branch head ref msg nw
     branch=$(git -C "$root" branch --show-current 2>/dev/null) || branch=""
     [ -n "$branch" ] || branch=main
     head=$(git -C "$root" rev-parse HEAD 2>/dev/null) || return 1
-    remote=$(git -C "$root" rev-parse "origin/$branch" 2>/dev/null) || remote=none
-    [ "$head" != "$remote" ] || return 1
+    # Containment, not equality: a HEAD behind its tracking ref is published too.
+    for ref in "origin/$branch" '@{u}'; do
+        git -C "$root" rev-parse -q --verify "$ref" >/dev/null 2>&1 || continue
+        ! git -C "$root" merge-base --is-ancestor "$head" "$ref" 2>/dev/null || return 1
+    done
     msg=$(git -C "$root" log -1 --format='%s' 2>/dev/null) || return 1
     [[ "$msg" =~ auto-checkpoint|sync\ state|session-start\ state|pre-compact\ checkpoint ]] || return 1
     # --no-renames: a file moved into .weave/ would otherwise list only under
     # its new path, and the commit would read as .weave-only (wv-b60cd5).
     nw=$(git -C "$root" diff --no-renames HEAD~1 HEAD --name-only 2>/dev/null) || return 1
-    [ -z "$(grep -v '^\.weave/' <<< "$nw" | grep -v '^$')" ] || return 1
+    # One grep, no pipe: under pipefail a grep -q leaving early fails the pipe.
+    ! grep -qv -e '^\.weave/' -e '^$' <<< "$nw" || return 1
     ! wv_push_publishing "$root" "$head"
 }
 

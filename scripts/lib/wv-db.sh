@@ -309,6 +309,10 @@ EOF
     # without the lineage columns cannot sync, and a caller that runs with -e
     # disabled would otherwise carry on with one that reported failure.
     db_migrate_lineage || return 1
+    # The learning index, like the policy trigger above, is created here too, so
+    # a fresh database has it before any db_ensure pass: wv doctor run straight
+    # after wv init reported it corrupt or missing (wv-673027).
+    db_migrate_fts5_learning
     # Tighten perms on the DB file in case it predates the umask change.
     [ -f "$WV_DB" ] && chmod 600 "$WV_DB" 2>/dev/null || true
 }

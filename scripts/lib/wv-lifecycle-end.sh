@@ -302,7 +302,17 @@ wv_stop_guard() (
 
     # Unpushed commits -- soft warn only, no network calls in the hook.
     if [ "$AHEAD" -gt 0 ]; then
-        if [ "$WEAVE_DIRTY" -gt 0 ]; then
+        # Counted against the tracking ref, which a refused fetch or a push to
+        # a URL leaves stale: commits a recorded push sent are named as such,
+        # not as work to push (wv-d235b6).
+        local _sc_recorded=0
+        if command -v wv_push_recorded_ahead >/dev/null 2>&1; then
+            _sc_recorded=$(wv_push_recorded_ahead "$PWD")
+            [[ "$_sc_recorded" =~ ^[0-9]+$ ]] || _sc_recorded=0
+        fi
+        if [ "$_sc_recorded" -ge "$AHEAD" ] && [ "$WEAVE_DIRTY" -eq 0 ]; then
+            echo "Note: the $AHEAD commit(s) ahead of the tracking ref were sent by a recorded push; the ref may be stale. Run: git fetch (after a push to a URL: git fetch <url> <branch>:refs/remotes/<remote>/<branch>)" >&2
+        elif [ "$WEAVE_DIRTY" -gt 0 ]; then
             echo "Note: $AHEAD unpushed commit(s) + unsaved weave state. Run: /close-session (or wv sync --gh && git add .weave/ && git commit && git push)" >&2
         else
             echo "Note: $AHEAD unpushed commit(s). Run: git push (or /close-session)" >&2

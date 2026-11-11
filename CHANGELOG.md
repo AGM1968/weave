@@ -4,6 +4,53 @@
 
 ## Unreleased
 
+## [1.71.0-rc.17] - 2026-11-11
+
+### Upgrading
+
+- Run `wv init-repo --update` in each repository to pick up the updated session procedure.
+- If you run two agent sessions in one checkout and both claim work, move one to a linked worktree:
+  `git worktree add -b <branch>../<repo>-<name> HEAD`, then start that session there. A second
+  claim in one checkout is now refused.
+- If you set `WV_PUSH_INFLIGHT_TTL`, remove it. It has no effect any more.
+
+### Added
+
+- **One claimed session per checkout.** `wv work` and `wv add --status=active` refuse a new claim
+  when another live agent session in the same checkout already holds one. Two claimed sessions in
+  one working tree can overwrite each other's uncommitted edits. The refusal names the other
+  session's claim and process and prints the `git worktree add` command. A crashed session (a claim
+  with no live process), a live session with no claim, a claim synced from another machine and a
+  session in a linked worktree do not cause a refusal, and a node you already hold is never refused.
+  The session procedure (`wv guide --procedure=session`) now says what sessions in one checkout
+  share and what Weave does and does not guard there.
+
+### Fixed
+
+- **A second session's start no longer discards the first session's writes.** Two sessions in one
+  checkout share one live graph. Session start runs `wv load`, which rebuilds that graph from
+  `.weave/`. A write the other session made during the rebuild could be lost even though it reported
+  success: 0 to 3 writes in 40 in our measurements. Commands that write the graph and `wv load` now
+  take turns on a lock. A command that waits longer than `WV_ZONE_LOCK_TIMEOUT` (default 300 s)
+  fails and says to retry. Session start waits up to 5 s (`WV_SESSION_START_LOAD_WAIT`); if the
+  other session is still writing, it skips the load, since that session keeps the graph live, and
+  says so.
+- **An automatic checkpoint never rewrites a pushed commit.** A clone whose remote-tracking ref had
+  fallen behind (its fetch fails, or it pushes to a URL, which does not move the ref) could have a
+  checkpoint amend a commit already on the remote, and the next push was then refused. A commit the
+  tracking ref contains, or that any recorded push sent, is now never amended, however old the
+  record. The pre-push record keeps the last 50 pushes (`WV_PUSH_RECORD_KEEP`); a push from another
+  branch no longer erases it.
+- **Reports say when the tracking ref may be stale.** On a clone that cannot fetch, `wv bootstrap`'s
+  git state and the Stop hook's note could report published commits as unpushed and advise a push.
+  When a recorded push already sent the commits ahead of the ref, they now say the ref may be out of
+  date and how to refresh it.
+- **`install.sh` installs every library file.** rc.16 installs lacked the clone roster: `wv doctor`
+  reported `lib modules: 38/39` and opt-in tombstone compaction refused with the wrong reason.
+  Installs over the network also lacked two files that `wv load` reads.
+- **`wv doctor` passes straight after `wv init`.** A freshly initialised repository reported
+  `FTS5 learning index: corrupt or missing` until the first node was added.
+
 ## [1.71.0-rc.16] - 2026-11-10
 
 ### Upgrading

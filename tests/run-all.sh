@@ -91,6 +91,8 @@ declare -a FAST_SUITES=(
     "test-install-file.sh:Install File Atomic-Replace Tests"
     "test-install-provenance.sh:Install Provenance Tests"
     "test-concurrent-session.sh:Concurrent Session Detection Tests"
+    "test-shared-checkout-claim.sh:Shared Checkout Claim Tests"
+    "test-zone-write-lock.sh:Zone Write Lock Tests"
     "test-mcp-status-scopes.sh:MCP Status Scope Tests"
     "test-crash-sentinel.sh:Crash Sentinel Tests"
     "test-multi-agent.sh:Multi-Agent Tests"
@@ -315,11 +317,11 @@ run_suite() {
     if [ "$VERBOSE" = true ]; then
         echo -e "${CYAN}Running: $name${NC}"
         echo "─────────────────────────────────────────────────────────────────────────────"
-        output=$(bash "$SCRIPT_DIR/$script" 2>&1) && exit_code=0 || exit_code=$?
+        output=$(BASH_ENV="$SUITE_BASH_ENV" bash "$SCRIPT_DIR/$script" 2>&1) && exit_code=0 || exit_code=$?
         echo "$output"
         echo ""
     else
-        output=$(bash "$SCRIPT_DIR/$script" 2>&1) && exit_code=0 || exit_code=$?
+        output=$(BASH_ENV="$SUITE_BASH_ENV" bash "$SCRIPT_DIR/$script" 2>&1) && exit_code=0 || exit_code=$?
     fi
     EXECUTED_SUITES+=("$script")
 
@@ -375,6 +377,11 @@ if [ -n "$SUITE_FILTER" ]; then
     SUITES=("${FILTERED_SUITES[@]}")
 fi
 
+# Each suite starts with tests/lib/errexit-report.sh sourced, so one that
+# errexit ends names its file, line, exit code and command (wv-f03855).
+SUITE_BASH_ENV="$SCRIPT_DIR/lib/errexit-report.sh"
+[ -f "$SUITE_BASH_ENV" ] || { echo -e "${RED}Error: $SUITE_BASH_ENV is missing${NC}" >&2; exit 2; }
+
 # Run suites
 RUN_SCRATCH=$(bash "$SCRIPT_DIR/../scripts/lib/wv-scratch.sh")
 trap 'rm -rf "$RUN_SCRATCH"' EXIT
@@ -405,7 +412,7 @@ if [ "$PARALLEL" = true ]; then
 
         for ((i=batch_start; i<batch_end; i++)); do
             script="${SUITES[$i]%%:*}"
-            (bash "$SCRIPT_DIR/$script" > "$RUN_SCRATCH/wv-test-${run_id}-$script.out" 2>&1) &
+            (BASH_ENV="$SUITE_BASH_ENV" bash "$SCRIPT_DIR/$script" > "$RUN_SCRATCH/wv-test-${run_id}-$script.out" 2>&1) &
             PIDS+=($!)
         done
 

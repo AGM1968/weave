@@ -379,6 +379,46 @@ _wv_resolve_call_source() {
     fi
 }
 
+# _wv_zone_lock <cmd> — writers and wv load exclude each other on one hot zone
+# (wv-8f2df1, owner ruling 2026-11-11). wv load flushes the live graph, builds a
+# new one from .weave/ and installs it; a write from another session between
+# the flush and the install was overwritten, its delta published too late or
+# not at all (measured: 0-3 of 40 reported writes lost). A command that writes
+# the graph (_wv_cap_invalidate) holds a shared flock on <zone>/.write.lock;
+# load and init, which replace the database, hold it exclusively. The lock is
+# released when the process exits, after the EXIT-trap publish. One session
+# never waits on itself: its load and its writes are sequential, and a child
+# whose ancestor already holds the zone (WV_ZONE_LOCK_HELD) takes nothing.
+# hook takes nothing: it dispatches wv children that lock for themselves, and
+# session start's load is one of them. Waits up to WV_ZONE_LOCK_TIMEOUT seconds
+# (default 300), then fails loudly. No flock (macOS without util-linux) or no
+# zone directory yet: no lock, as before.
+_wv_zone_lock() {
+    local cmd="$1" mode=-s lockfile fd
+    [ "$cmd" != "hook" ] || return 0
+    case "$cmd" in
+        load|init) mode=-x ;;
+        *) _wv_cap_invalidate "$cmd" "" || return 0 ;;
+    esac
+    command -v flock >/dev/null 2>&1 || return 0
+    [ -n "${WV_HOT_ZONE:-}" ] && [ -d "$WV_HOT_ZONE" ] || return 0
+    lockfile="$WV_HOT_ZONE/.write.lock"
+    [ "${WV_ZONE_LOCK_HELD:-}" != "$lockfile" ] || return 0
+    # Braced: on a bare exec, 2>/dev/null would silence this process's stderr
+    # for the rest of the call.
+    { exec {fd}>>"$lockfile"; } 2>/dev/null || return 0
+    if ! flock "$mode" -w "${WV_ZONE_LOCK_TIMEOUT:-300}" "$fd"; then
+        exec {fd}>&-
+        if [ "$mode" = -x ]; then
+            echo "wv: the hot zone is in use by another wv process (${WV_ZONE_LOCK_TIMEOUT:-300}s); $cmd did not run. Retry once it finishes." >&2
+            return 75
+        fi
+        echo "wv: wv load or init held the hot zone past ${WV_ZONE_LOCK_TIMEOUT:-300}s; $cmd did not run. Retry it." >&2
+        return 1
+    fi
+    export WV_ZONE_LOCK_HELD="$lockfile"
+}
+
 main() {
     local cmd="${1:-help}"
 
@@ -394,6 +434,9 @@ main() {
         wv_run_cache_wrap _wv_dispatch "$@"
         return $?
     fi
+
+    # Writers and wv load exclude each other on the hot zone (wv-8f2df1).
+    _wv_zone_lock "$cmd" || return $?
 
     # Attribution queued during an E5 capture window lands in the agent's next
     # mutation-class call, after the call log recorded graph_identity_before, so

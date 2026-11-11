@@ -410,6 +410,25 @@ test_doctor_cold_start_hydrates() {
     export WV_DB="$TEST_DIR/brain.db"
 }
 
+# wv-673027: wv init left the database without the learning index, which only
+# the next command's db_ensure created, so a doctor run straight after init
+# reported it corrupt or missing on the first doctor a new user runs.
+test_doctor_fresh_init_learning_index() {
+    echo ""
+    echo "=== Doctor straight after init ==="
+
+    setup_test_env
+    git init -q
+    "$WV" init >/dev/null 2>&1
+    local missing
+    missing=$(bash -c 'source "$1/scripts/lib/wv-db.sh" && _wv_db_schema_missing' _ "$PROJECT_ROOT" 2>&1)
+    assert_equals "" "$missing" "a fresh init has every object the migrations create"
+    local doctor_out learning_status
+    doctor_out=$("$WV" doctor --json 2>/dev/null) || true
+    learning_status=$(jq -r '.checks[] | select(.check=="FTS5 learning index") | .status' <<<"$doctor_out" 2>/dev/null)
+    assert_equals "pass" "$learning_status" "doctor straight after init passes the learning index"
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Test: Learnings filters (--category, --grep, --recent)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -710,6 +729,7 @@ main() {
     test_digest
     test_breadcrumbs
     test_doctor_cold_start_hydrates
+    test_doctor_fresh_init_learning_index
     test_doctor_claim_ownership
     test_learnings_filters
     test_learnings_modes

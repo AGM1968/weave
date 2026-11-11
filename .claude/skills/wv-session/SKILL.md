@@ -66,6 +66,23 @@ The enforcement layer has three phases:
 The phase is stored in the hot zone. A node inherited from a prior session must be explicitly
 re-claimed; stale-node checks prevent accidental continuation of abandoned work.
 
+## Two Sessions in One Repository
+
+Sessions in one checkout share its hot zone, its git index and its working tree. Weave guards the
+graph: each session's claims, Primary node and commit trailers are its own, and `wv load` and
+another session's writes wait for each other. Nothing guards the working tree. Two sessions that
+each hold a claim there can overwrite each other's uncommitted edits, and Weave refuses that
+second claim. `wv work` names the other session's claim and prints the command for a linked
+worktree:
+
+```bash
+git worktree add -b <branch> ../<repo>-<name> HEAD
+```
+
+Start the second session inside the worktree. It has its own hot zone, index and working tree, and
+its commits reach the main branch like any other branch's. Worktrees share the repository's git
+hooks: upgrade Weave only when no session's commit or push gate is running.
+
 ## Session Scope and Token Awareness
 
 Keep a session to roughly 4–5 related tasks. Start fresh when work is independent, the context has
